@@ -374,7 +374,11 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
   # decref; caller strips the __perceus_dup on args in borrowed slots).
   let bmap = pcs_build_borrow_map(decls, [])
-  map(decls, (d) => perceus_decl_b(d, fns, bmap))
+  # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
+  # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
+  # callee like regexp nb_add_transition) must keep the caller's ref.
+  let cmap = pcs_build_consume_map(decls, [])
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap))
 }
 
 pub type BorrowEntry = BE(String, [Int])
@@ -427,7 +431,7 @@ fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
 
 # Back-compat: tests call the 2-arg form with no borrow map.
 fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console =
-  perceus_decl_b(d, fns, [])
+  perceus_decl_b(d, fns, [], [])
 
 # Callee side: wrap `match p { ... }` as `match __perceus_borrow(p) {...}`
 # for each borrowed param `p` whose scrutinee is the bare param —
@@ -545,6 +549,257 @@ pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames
   [h, ...rest] -> {
     let rest_b = pcs_borrow_params(rest, body)
     if pcs_name_only_inspected(h, body) { [h, ...rest_b] } else { rest_b }
+  }
+}
+
+# ---------- Consume-map (Koka Borrowed dual: which params a fn CONSUMES) ---
+#
+# A param is CONSUMED by its fn iff the fn deconstructs it (match scrutinee
+# whose arm binds children) or stores it (ctor/record/list slot) — i.e. the fn
+# takes ownership and the cell is reclaimed/reused inside. A param that is
+# only FIELD-READ (`b.states`, `b.next_id`) or passed to another fn that does
+# not consume it (the stdlib/regexp `nb_add_transition`/`nb_set_transitions`
+# field-read chain) is NOT consumed — the caller keeps the obligation. This is
+# the bit a caller needs to decide whether MOVING a binder into `f(binder)` is
+# sound: move only into CONSUMING slots; a non-consuming slot must keep the
+# caller's ref (dup), else the value's life after the call reads freed memory
+# (the regexp UAF). Keyed per fn (qualified + bare, like the borrow map).
+pub type ConsumeEntry = CE(String, [Int])
+
+fn pcs_build_consume_map(decls: [Decl], acc: [ConsumeEntry]) : [ConsumeEntry] = match decls {
+  []           -> acc
+  [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc))
+}
+
+fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d {
+  DFn(_, name, _, params, _, _, body, _, _, mo) -> {
+    let pnames = map(params, (p) => p.pname)
+    let positions = pcs_consumed_positions(pnames, body, 0)
+    let qual = [CE(pcs_borrow_key(name, mo), positions), ...acc]
+    match mo {
+      None    -> qual
+      Some(_) -> [CE(name, positions), ...qual]
+    }
+  }
+  _ -> acc
+}
+
+fn pcs_consumed_positions(pnames: [String], body: Expr, i: Int) : [Int] = match pnames {
+  []           -> []
+  [p, ...rest] ->
+    if pcs_param_consumes(p, body) { [i, ...pcs_consumed_positions(rest, body, i + 1)] }
+    else { pcs_consumed_positions(rest, body, i + 1) }
+}
+
+# A param p is CONSUMED iff it appears as a deconstructing match scrutinee
+# (arm binds a child = ownership taken) OR in a ctor/record/list slot (stored).
+# A field-read-only param (regexp nb_*) is NOT consumed.
+fn pcs_param_consumes(p: String, body: Expr) : Bool = pcs_consumes_kind(p, body.kind)
+
+fn pcs_consumes_kind(p: String, k: ExprKind) : Bool = match k {
+  EMatch(s, arms) -> {
+    let scr_consumes = match s.kind {
+      EVar(nm) -> nm == p and pcs_arms_bind_children(arms)
+      _        -> pcs_consumes_kind(p, s.kind)
+    }
+    scr_consumes or pcs_consumes_arms(p, arms)
+  }
+  ECall(f, xs) -> match f.kind {
+    EVar(c)        -> if pcs_name_is_ctor(c) { pcs_any_bare_var(p, xs) or pcs_consumes_seq(p, xs) }
+                      else { pcs_consumes_kind(p, f.kind) or pcs_consumes_seq(p, xs) }
+    EModCall(_, c) -> if pcs_name_is_ctor(c) { pcs_any_bare_var(p, xs) or pcs_consumes_seq(p, xs) }
+                      else { pcs_consumes_seq(p, xs) }
+    _              -> pcs_consumes_kind(p, f.kind) or pcs_consumes_seq(p, xs)
+  }
+  ERecordLit(_, fis) -> pcs_consumes_fields(p, fis)
+  EList(els)         -> pcs_consumes_elems(p, els)
+  EIf(c, t, opt_e)   -> pcs_consumes_kind(p, c.kind) or pcs_consumes_kind(p, t.kind) or
+                         (match opt_e { None -> false Some(e2) -> pcs_consumes_kind(p, e2.kind) })
+  EBlock(stmts, tail)-> pcs_consumes_stmts(p, stmts) or
+                         (match tail { None -> false Some(e) -> pcs_consumes_kind(p, e.kind) })
+  EBinop(_, a, b)    -> pcs_consumes_kind(p, a.kind) or pcs_consumes_kind(p, b.kind)
+  EUnop(_, x)        -> pcs_consumes_kind(p, x.kind)
+  EField(x, _)       -> match x.kind { EVar(_) -> false _ -> pcs_consumes_kind(p, x.kind) }
+  EIndex(a, b)       -> (match a.kind { EVar(_) -> false _ -> pcs_consumes_kind(p, a.kind) }) or
+                         pcs_consumes_kind(p, b.kind)
+  EPipe(a, b)        -> pcs_consumes_kind(p, a.kind) or pcs_consumes_kind(p, b.kind)
+  EBang(x)           -> pcs_consumes_kind(p, x.kind)
+  _ -> false
+}
+
+fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(pat, _, _) -> match prc_pat_binders(pat, []) { [] -> pcs_arms_bind_children(rest) _ -> true }
+  }
+}
+
+fn pcs_consumes_arms(p: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, b) ->
+      (match opt_g { None -> false Some(g) -> pcs_consumes_kind(p, g.kind) }) or
+      pcs_consumes_kind(p, b.kind) or pcs_consumes_arms(p, rest)
+  }
+}
+
+fn pcs_consumes_seq(p: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_consumes_kind(p, h.kind) or pcs_consumes_seq(p, rest)
+}
+
+fn pcs_any_bare_var(p: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> (match h.kind { EVar(nm) -> nm == p _ -> false }) or pcs_any_bare_var(p, rest)
+}
+
+fn pcs_consumes_fields(p: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [h, ...rest] -> match h {
+    FI(_, e) -> (match e.kind { EVar(nm) -> nm == p _ -> pcs_consumes_kind(p, e.kind) }) or
+                pcs_consumes_fields(p, rest)
+  }
+}
+
+fn pcs_consumes_elems(p: String, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let here = match h {
+      ElPlain(e)  -> match e.kind { EVar(nm) -> nm == p _ -> pcs_consumes_kind(p, e.kind) }
+      ElSpread(e) -> pcs_consumes_kind(p, e.kind)
+    }
+    here or pcs_consumes_elems(p, rest)
+  }
+}
+
+fn pcs_consumes_stmts(p: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_consumes_kind(p, e.kind)
+      SVar(_, _, e, _, _) -> pcs_consumes_kind(p, e.kind)
+      SExprStmt(e)        -> pcs_consumes_kind(p, e.kind)
+      _                   -> false
+    }
+    here or pcs_consumes_stmts(p, rest)
+  }
+}
+
+fn pcs_consume_lookup(cmap: [ConsumeEntry], key: String) : [Int] = match cmap {
+  []           -> []
+  [e, ...rest] -> match e { CE(k, ps) -> if k == key { ps } else { pcs_consume_lookup(rest, key) } }
+}
+
+# True iff every arg-slot use of `nm` in `e` lands in a CONSUMING param slot
+# of the callee (per cmap). ctor slots / match scrutinees / returns consume by
+# construction. A user-fn call whose slot for nm is NOT in the callee's
+# consume set → false (the callee borrows nm; moving it is unsound).
+fn pcs_uses_only_consuming_slots(nm: String, e: Expr, cmap: [ConsumeEntry]) : Bool =
+  pcs_consuming_slots_kind(nm, e.kind, cmap)
+
+fn pcs_any_arg_is_lambda(xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> match h.kind { ELambda(_, _) -> true _ -> pcs_any_arg_is_lambda(rest) }
+}
+
+fn pcs_name_in_expr(nm: String, e: Expr) : Bool = pcs_max_paths_in_expr(nm, e) > 0
+
+fn pcs_name_in_exprs(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_name_in_expr(nm, h) or pcs_name_in_exprs(nm, rest)
+}
+
+fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Bool = match k {
+  ECall(f, xs) -> {
+    # Higher-order conservatism: if ANY arg is a lambda, the call is a
+    # higher-order combinator (map/filter/fold). The lambda may FIELD-READ
+    # nm's elements (e.g. `map(args, (a) => desugar_interp_expr(a))` field-
+    # reads each a), which the per-callee consume-map does not model — the
+    # consume bit is about the LIST param, not its elements. Moving nm into
+    # such a call corrupts the AST (the desugar_interp self-host infinite
+    # recursion). Treat nm as non-consuming-safe whenever the call carries a
+    # lambda arg, OR nm itself appears inside a lambda.
+    if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
+      false
+    } else {
+      let key = pcs_callee_key(f)
+      let consumed = pcs_consume_lookup(cmap, key)
+      let is_ctor = match f.kind {
+        EVar(c)        -> pcs_name_is_ctor(c)
+        EModCall(_, c) -> pcs_name_is_ctor(c)
+        _              -> false
+      }
+      pcs_consuming_slots_kind(nm, f.kind, cmap) and
+        pcs_consuming_args(nm, xs, consumed, is_ctor, 0, cmap)
+    }
+  }
+  ELambda(_, _) -> false   # nm captured under a lambda = not move-safe
+  EMatch(s, arms) -> {
+    let s_ok = match s.kind { EVar(_) -> true _ -> pcs_uses_only_consuming_slots(nm, s, cmap) }
+    s_ok and pcs_consuming_arms(nm, arms, cmap)
+  }
+  EIf(c, t, opt_e) -> pcs_uses_only_consuming_slots(nm, c, cmap) and
+                       pcs_uses_only_consuming_slots(nm, t, cmap) and
+                       (match opt_e { None -> true Some(e2) -> pcs_uses_only_consuming_slots(nm, e2, cmap) })
+  EBlock(stmts, tail) -> pcs_consuming_stmts(nm, stmts, cmap) and
+                          (match tail { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) })
+  EBinop(_, a, b) -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
+  EUnop(_, x)     -> pcs_uses_only_consuming_slots(nm, x, cmap)
+  EField(x, _)    -> match x.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, x, cmap) }
+  EIndex(a, b)    -> (match a.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, a, cmap) }) and
+                      pcs_uses_only_consuming_slots(nm, b, cmap)
+  ERecordLit(_, fis) -> pcs_consuming_fields(nm, fis, cmap)
+  EList(els)      -> pcs_consuming_elems(nm, els, cmap)
+  EPipe(a, b)     -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
+  EBang(x)        -> pcs_uses_only_consuming_slots(nm, x, cmap)
+  _ -> true
+}
+
+fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> {
+    let here = match h.kind {
+      EVar(uname) -> if uname == nm { is_ctor or pcs_has_int(consumed, i) } else { true }
+      _ -> pcs_uses_only_consuming_slots(nm, h, cmap)
+    }
+    here and pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap)
+  }
+}
+
+fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: [ConsumeEntry]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, b) ->
+      (match opt_g { None -> true Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap) }) and
+      pcs_uses_only_consuming_slots(nm, b, cmap) and pcs_consuming_arms(nm, rest, cmap)
+  }
+}
+
+fn pcs_consuming_stmts(nm: String, stmts: [Stmt], cmap: [ConsumeEntry]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_uses_only_consuming_slots(nm, e, cmap)
+      SVar(_, _, e, _, _) -> pcs_uses_only_consuming_slots(nm, e, cmap)
+      SExprStmt(e)        -> pcs_uses_only_consuming_slots(nm, e, cmap)
+      _                   -> true
+    }
+    here and pcs_consuming_stmts(nm, rest, cmap)
+  }
+}
+
+fn pcs_consuming_fields(nm: String, fis: [FieldInit], cmap: [ConsumeEntry]) : Bool = match fis {
+  []           -> true
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_uses_only_consuming_slots(nm, e, cmap) and pcs_consuming_fields(nm, rest, cmap)
+  }
+}
+
+fn pcs_consuming_elems(nm: String, els: [ListElem], cmap: [ConsumeEntry]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_uses_only_consuming_slots(nm, inner, cmap) and pcs_consuming_elems(nm, rest, cmap)
   }
 }
 
@@ -688,7 +943,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
   }
 }
 
-fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
+fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -751,7 +1006,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry]) : Decl / Console {
         # emit and moving its binders would double-free (the regexp UAF). This
         # is the half that lets insert_loop's Black arm move l/r instead of
         # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
-        let arm_moves = pcs_collect_arm_skip_binders(name, body, bmap)
+        let arm_moves = pcs_collect_arm_skip_binders(name, true, body, bmap, cmap)
         let skip_set = pcs_list_union(
           pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
           arm_moves)
@@ -2135,21 +2390,27 @@ fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
 
 #[doc("Arm-level pattern binders that pass the branch-aware safety check over the arm body (max-path<=1, consumed-on-every-path, all-consumers-linear). Pub: emit_c's arm-top reuse consults it so the shared-branch dup set matches exactly the binders perceus moves — the two must agree or RC double-counts.")]
 pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] =
-  pcs_branch_aware_skip_locals_b(binders, body, [])
+  pcs_branch_aware_skip_locals_b(binders, body, [], [])
 
 # Borrow-aware variant: the max-path count discounts uses of a binder that
 # land in a borrowed callee slot (is_red(l) does not consume l). This is
 # what lets the rb-tree Black arm's l/r pass `mp <= 1` — without it, the
 # is_red(l) + insert_loop(l) uses sum to 2 on the descent path. `bmap` is
 # the global borrow map; pass [] for the borrow-unaware behaviour.
-pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [BorrowEntry]) : [String] = match binders {
+pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match binders {
   []           -> []
   [h, ...rest] -> {
     let mp = pcs_max_paths_b_expr(h, body, bmap)
     let cv = pcs_consumed_on_every_path(h, body)
     let ln = pcs_all_consumers_linear(h, body)
-    let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap)
-    if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
+    # Consume-aware (Koka Borrowed dual): every arg-slot use of h must land in
+    # a CONSUMING callee slot. A use in a NON-consuming slot (field-read callee
+    # — regexp nb_add_transition(b)) means the callee borrows h; moving h there
+    # frees it under the callee → UAF. ctor slots / match scrutinees / returns
+    # consume by construction.
+    let cons_ok = pcs_uses_only_consuming_slots(h, body, cmap)
+    let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap, cmap)
+    if mp <= 1 and cv and ln and cons_ok { [h, ...rest_skip] } else { rest_skip }
   }
 }
 
@@ -2161,108 +2422,116 @@ pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [Borr
 # it passes the check in its own arm body (max-path<=1 borrow-aware,
 # consumed-on-every-path, all-consumers-linear); the three conditions ARE
 # Koka's per-branch ownership reconcile and are sound on their own.
-pub fn pcs_collect_arm_skip_binders(self_name: String, e: Expr, bmap: [BorrowEntry]) : [String] =
-  pcs_collect_arm_skip_kind(self_name, e.kind, bmap)
+pub fn pcs_collect_arm_skip_binders(self_name: String, tl: Bool, e: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] =
+  pcs_collect_arm_skip_kind(self_name, tl, e.kind, bmap, cmap)
 
-fn pcs_collect_arm_skip_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry]) : [String] = match k {
+fn pcs_collect_arm_skip_kind(self_name: String, tl: Bool, k: ExprKind, bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match k {
   EMatch(s, arms) ->
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, s, bmap),
-                   pcs_collect_arm_skip_arms(self_name, arms, bmap))
+    # The scrutinee descends as NON-toplevel (its own matches are nested).
+    # The arms keep `tl`: arms of the fn-body's first match are toplevel; arms
+    # reached after descending through a nested match are not.
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, false, s, bmap, cmap),
+                   pcs_collect_arm_skip_arms(self_name, tl, arms, bmap, cmap))
   ECall(f, xs) ->
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, f, bmap),
-                   pcs_collect_arm_skip_seq(self_name, xs, bmap))
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, f, bmap, cmap),
+                   pcs_collect_arm_skip_seq(self_name, tl, xs, bmap, cmap))
   EIf(c, t, opt_e) ->
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, c, bmap),
-      pcs_list_union(pcs_collect_arm_skip_binders(self_name, t, bmap),
-                     match opt_e { None -> [] Some(e2) -> pcs_collect_arm_skip_binders(self_name, e2, bmap) }))
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap),
+      pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, t, bmap, cmap),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_arm_skip_binders(self_name, tl, e2, bmap, cmap) }))
   EBlock(stmts, tail) ->
-    pcs_list_union(pcs_collect_arm_skip_stmts(self_name, stmts, bmap),
-                   match tail { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, e, bmap) })
-  EBinop(_, a, b)    -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  EUnop(_, x)        -> pcs_collect_arm_skip_binders(self_name, x, bmap)
-  EField(x, _)       -> pcs_collect_arm_skip_binders(self_name, x, bmap)
-  EIndex(a, b)       -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  ELambda(_, body)   -> pcs_collect_arm_skip_binders(self_name, body, bmap)
-  ERecordLit(_, fis) -> pcs_collect_arm_skip_field_inits(self_name, fis, bmap)
-  EList(els)         -> pcs_collect_arm_skip_list_elems(self_name, els, bmap)
-  ERange(a, b, opt)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap),
-                          pcs_list_union(pcs_collect_arm_skip_binders(self_name, b, bmap),
-                            match opt { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, e, bmap) }))
-  EPipe(a, b)        -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  EMapPipe(a, b)     -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  EFlatMapPipe(a, b) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  EFilterPipe(a, b)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap), pcs_collect_arm_skip_binders(self_name, b, bmap))
-  EBang(x)           -> pcs_collect_arm_skip_binders(self_name, x, bmap)
-  ELitUnit(x, _)     -> pcs_collect_arm_skip_binders(self_name, x, bmap)
+    pcs_list_union(pcs_collect_arm_skip_stmts(self_name, tl, stmts, bmap, cmap),
+                   match tail { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap) })
+  EBinop(_, a, b)    -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  EUnop(_, x)        -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap)
+  EField(x, _)       -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap)
+  EIndex(a, b)       -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  ELambda(_, body)   -> pcs_collect_arm_skip_binders(self_name, tl, body, bmap, cmap)
+  ERecordLit(_, fis) -> pcs_collect_arm_skip_field_inits(self_name, tl, fis, bmap, cmap)
+  EList(els)         -> pcs_collect_arm_skip_list_elems(self_name, tl, els, bmap, cmap)
+  ERange(a, b, opt)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap),
+                          pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap),
+                            match opt { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap) }))
+  EPipe(a, b)        -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  EMapPipe(a, b)     -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  EFlatMapPipe(a, b) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  EFilterPipe(a, b)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap))
+  EBang(x)           -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap)
+  ELitUnit(x, _)     -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap)
   _ -> []
 }
 
-fn pcs_collect_arm_skip_seq(self_name: String, es: [Expr], bmap: [BorrowEntry]) : [String] = match es {
+fn pcs_collect_arm_skip_seq(self_name: String, tl: Bool, es: [Expr], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match es {
   []           -> []
-  [h, ...rest] -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, h, bmap),
-                                 pcs_collect_arm_skip_seq(self_name, rest, bmap))
+  [h, ...rest] -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, h, bmap, cmap),
+                                 pcs_collect_arm_skip_seq(self_name, tl, rest, bmap, cmap))
 }
 
-fn pcs_collect_arm_skip_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry]) : [String] = match stmts {
+fn pcs_collect_arm_skip_stmts(self_name: String, tl: Bool, stmts: [Stmt], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match stmts {
   []           -> []
   [s, ...rest] -> {
     let here = match s {
-      SLet(_, _, e)               -> pcs_collect_arm_skip_binders(self_name, e, bmap)
-      SVar(_, _, e, _, _)         -> pcs_collect_arm_skip_binders(self_name, e, bmap)
-      SExprStmt(e)                -> pcs_collect_arm_skip_binders(self_name, e, bmap)
-      SAssert(e, opt_m)           -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, e, bmap),
-                                       match opt_m { None -> [] Some(m) -> pcs_collect_arm_skip_binders(self_name, m, bmap) })
-      SIndexAssign(a, b, c, _, _) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, a, bmap),
-                                       pcs_list_union(pcs_collect_arm_skip_binders(self_name, b, bmap),
-                                                      pcs_collect_arm_skip_binders(self_name, c, bmap)))
+      SLet(_, _, e)               -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap)
+      SVar(_, _, e, _, _)         -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap)
+      SExprStmt(e)                -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap)
+      SAssert(e, opt_m)           -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap),
+                                       match opt_m { None -> [] Some(m) -> pcs_collect_arm_skip_binders(self_name, tl, m, bmap, cmap) })
+      SIndexAssign(a, b, c, _, _) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap),
+                                       pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap),
+                                                      pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap)))
       _                           -> []
     }
-    pcs_list_union(here, pcs_collect_arm_skip_stmts(self_name, rest, bmap))
+    pcs_list_union(here, pcs_collect_arm_skip_stmts(self_name, tl, rest, bmap, cmap))
   }
 }
 
-fn pcs_collect_arm_skip_field_inits(self_name: String, fis: [FieldInit], bmap: [BorrowEntry]) : [String] = match fis {
+fn pcs_collect_arm_skip_field_inits(self_name: String, tl: Bool, fis: [FieldInit], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match fis {
   []           -> []
   [h, ...rest] -> match h {
-    FI(_, e) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, e, bmap),
-                               pcs_collect_arm_skip_field_inits(self_name, rest, bmap))
+    FI(_, e) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap),
+                               pcs_collect_arm_skip_field_inits(self_name, tl, rest, bmap, cmap))
   }
 }
 
-fn pcs_collect_arm_skip_list_elems(self_name: String, els: [ListElem], bmap: [BorrowEntry]) : [String] = match els {
+fn pcs_collect_arm_skip_list_elems(self_name: String, tl: Bool, els: [ListElem], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match els {
   []           -> []
   [h, ...rest] -> {
     let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, inner, bmap),
-                   pcs_collect_arm_skip_list_elems(self_name, rest, bmap))
+    pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, inner, bmap, cmap),
+                   pcs_collect_arm_skip_list_elems(self_name, tl, rest, bmap, cmap))
   }
 }
 
-fn pcs_collect_arm_skip_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry]) : [String] = match arms {
+fn pcs_collect_arm_skip_arms(self_name: String, tl: Bool, arms: [Arm], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
-      # Recurse into the body for nested matches regardless.
-      let nested = pcs_collect_arm_skip_binders(self_name, body, bmap)
-      # Collect THIS arm's movable binders ONLY when the arm is self-recursive
-      # modulo-cons (`self_name(...)` sits in a constructor-rebuild slot) — the
-      # shape tcrec turns into a TRMC step, which emit disposes via the
-      # borrow-model (arm-top reuse: borrow binds + is_unique-gated shell
-      # dispose that does NOT cascade into the moved child). A NON-self-rec
-      # arm (the stdlib/regexp `compile_repeat_optional` arm, whose body calls
-      # nb_add_transition) keeps the legacy emit (incref bind + recursive
-      # decref(_scr)); moving a binder there double-disposes it → UAF. The
-      # self-rec-modulo-cons gate is the pre-tcrec proxy that keeps perceus
-      # (move) and emit (borrow-model) in lock-step.
+      # Descend into the body for NESTED matches — those are never toplevel.
+      let nested = pcs_collect_arm_skip_binders(self_name, false, body, bmap, cmap)
+      # Move this arm's binders when emit disposes the scrutinee via a reuse-
+      # model that does NOT cascade into the moved child:
+      #  (1) self-rec modulo-cons (`self(...)` in a ctor slot) → TRMC arm-top
+      #      reuse (insert_loop). Sound at ANY depth: the arm-top steals the
+      #      matched cell, which IS the cell the TRMC step rebuilds.
+      #  (2) cons-overwrite — reconstructs the SAME ctor it matched in tail
+      #      position → emit's try_reuse_variant_arm overwrites _scr in place.
+      #      Sound ONLY at the fn-body's TOP-LEVEL match (`tl`): there the
+      #      reused cell IS the cell the result replaces. In a NESTED match over
+      #      a binder (gap3's `match l { Node(ll,..) -> match ll { ... } }`) the
+      #      reused cell is the INNER scrutinee (ll) but the result replaces the
+      #      OUTER node (l) — the in-place overwrite builds a self-referential
+      #      cycle (gap3 stack-overflows in `size`). Hence the `tl` gate.
+      let reuse_shape = pcs_arm_self_modulo_cons(self_name, body) or
+                        (tl and pcs_arm_cons_overwrite(pat, body))
       let here = match opt_g {
         None    ->
-          if pcs_arm_self_modulo_cons(self_name, body) {
-            pcs_branch_aware_skip_locals_b(prc_pat_binders(pat, []), body, bmap)
+          if reuse_shape {
+            pcs_branch_aware_skip_locals_b(prc_pat_binders(pat, []), body, bmap, cmap)
           } else { [] }
         Some(_) -> []
       }
       pcs_list_union(pcs_list_union(here, nested),
-                     pcs_collect_arm_skip_arms(self_name, rest, bmap))
+                     pcs_collect_arm_skip_arms(self_name, tl, rest, bmap, cmap))
     }
   }
 }
@@ -2274,6 +2543,91 @@ fn pcs_collect_arm_skip_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry]
 # shell dispose; only there is moving a deconstructed child sound.
 fn pcs_arm_self_modulo_cons(self_name: String, e: Expr) : Bool =
   pcs_smc_kind(self_name, e.kind)
+
+# True iff the arm matched `PVariant(C, ...)` and reconstructs the SAME ctor C
+# in every tail position — the cons-overwrite reuse shape emit's
+# try_reuse_variant_arm fires on (overwrites _scr in place via kai_check_unique,
+# which does NOT cascade into moved children). This is balance_left/right: it
+# matches `RBNode(...)` and rebuilds `RBNode(...)` in each tail. Moving the
+# arm's binders is sound because emit reuses the matched cell rather than
+# decref-ing it recursively. A tail that rebuilds a DIFFERENT ctor (or calls a
+# non-reuse fn) fails, keeping regexp's NB_Frag arms out.
+fn pcs_arm_cons_overwrite(pat: Pattern, body: Expr) : Bool = match pat.pkind {
+  PVariant(cname, _) -> pcs_arm_tails_rebuild_ctor(cname, body)
+  _                  -> false
+}
+
+# Every tail leaf of `body` is an ECall to ctor `cname` (bare or resolved).
+fn pcs_arm_tails_rebuild_ctor(cname: String, e: Expr) : Bool = pcs_tails_ctor_kind(cname, e.kind)
+
+fn pcs_tails_ctor_kind(cname: String, k: ExprKind) : Bool = match k {
+  EIf(_, t, opt_e) ->
+    pcs_arm_tails_rebuild_ctor(cname, t) and
+    (match opt_e { None -> false Some(e2) -> pcs_arm_tails_rebuild_ctor(cname, e2) })
+  EBlock(_, opt_tail) -> match opt_tail { None -> false Some(e) -> pcs_arm_tails_rebuild_ctor(cname, e) }
+  EMatch(_, arms) -> pcs_tails_ctor_arms(cname, arms)
+  ECall(f, xs) -> match f.kind {
+    # Rebuild of the same ctor AND every slot is "simple" — a bare binder, a
+    # scalar, or a NESTED ctor of simples — NEVER a fn call that derives a slot
+    # from a binder (`desugar_interp_expr(c)`). emit's try_reuse_variant_arm
+    # overwrites _scr's slots IN PLACE; if a new slot is computed FROM an old
+    # slot (the desugar shape), the overwrite corrupts the binder before the
+    # call reads it → a self-referential cycle (the desugar_interp self-host
+    # infinite recursion). balance's slots are direct ctors of binders, so they
+    # are safe. Restricting to simple slots keeps cons-overwrite to the
+    # balance-shaped arms only.
+    EVar(c)        -> c == cname and pcs_all_slots_simple(xs)
+    EModCall(_, c) -> c == cname and pcs_all_slots_simple(xs)
+    _              -> false
+  }
+  _ -> false
+}
+
+# A slot is "simple" if writing it in place cannot read a binder that an
+# earlier in-place write already clobbered: bare EVar, scalar literal, dup of a
+# binder, or a ctor whose own slots are all simple. A non-ctor fn call is NOT
+# simple (it may read a binder that derives the donor's slots).
+fn pcs_all_slots_simple(xs: [Expr]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> pcs_slot_simple(h) and pcs_all_slots_simple(rest)
+}
+
+# A slot of a cons-overwrite rebuild is "simple" iff it is a bare binder, a
+# scalar, or a dup of a binder — NOT a NESTED ctor that embeds a pointer
+# binder. A nested ctor (`Node(Node(lll,...), lk, Node(lr,...))`) makes the
+# rebuild NON-BIJECTIVE: the in-place overwrite (kai_check_unique) writes the
+# donor's slot 0 to a NEW node that borrows the donor's OLD children, and emit
+# does not dup those borrowed children → over-decref → a corrupted (cyclic)
+# tree (gap3_balance_minimal stack-overflows in `size`). The rb-tree's balance
+# rotations have exactly this nested shape and CORRECTLY fall to fresh-alloc
+# (emit emits no kai_check_unique there); the RSS win comes from the FLAT
+# rebuilds (recolor / the 3-arm `kai_check_unique` case) + the TRMC arm-top
+# reuse of insert_loop, not the rotations. Restricting cons-overwrite to flat
+# rebuilds keeps gap3 correct and loses nothing the rotations gave.
+fn pcs_slot_simple(e: Expr) : Bool = match e.kind {
+  EVar(_)        -> true
+  EInt(_)        -> true
+  EReal(_)       -> true
+  EBool(_)       -> true
+  EChar(_)       -> true
+  EUnit          -> true
+  EStr(_, _)     -> true
+  ECall(f, xs)   -> match f.kind {
+    # A dup of a binder is flat. A NULLARY ctor (Red/Black/Leaf, no slots) is
+    # flat. A ctor WITH slots embeds children → non-bijective → NOT simple.
+    EVar(c)        -> if c == "__perceus_dup" { true } else { pcs_name_is_ctor(c) and pcs_all_slots_simple(xs) }
+    EModCall(_, c) -> pcs_name_is_ctor(c) and pcs_all_slots_simple(xs)
+    _              -> false
+  }
+  _ -> false
+}
+
+fn pcs_is_empty_list(xs: [Expr]) : Bool = match xs { [] -> true _ -> false }
+
+fn pcs_tails_ctor_arms(cname: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a { Arm(_, _, b) -> pcs_arm_tails_rebuild_ctor(cname, b) and pcs_tails_ctor_arms(cname, rest) }
+}
 
 fn pcs_smc_kind(self_name: String, k: ExprKind) : Bool = match k {
   # ONLY the modulo-cons shape: a CONSTRUCTOR rebuild one of whose slots is a
