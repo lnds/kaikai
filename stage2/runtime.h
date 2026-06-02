@@ -305,12 +305,17 @@ typedef union {
  *   0 = pointer (KaiValue *) — legacy
  *   1 = Int (int64_t, .i64)
  *   2 = Real (double, .r)
- *   3 = reserved
+ *   3 = Enum (int64_t variant_tag, .i64) — a nullary ctor of an
+ *       all-nullary sum type stored as its immediate tag instead of a
+ *       pointer to its interned singleton. Distinct from INT so the
+ *       read-back path knows the i64 is a variant tag to re-intern
+ *       (kai_enum_slot_box), not a raw integer to box (kai_int).
  * Variants with >16 slots fall back to mask=0 (all pointer) since the
  * encoding exhausts the 32-bit mask. */
 #define KAI_VAR_SLOT_PTR  0u
 #define KAI_VAR_SLOT_INT  1u
 #define KAI_VAR_SLOT_REAL 2u
+#define KAI_VAR_SLOT_ENUM 3u
 
 static inline uint32_t kai_var_slot_kind(uint32_t mask, int i) {
     return (mask >> (2 * (uint32_t) i)) & 3u;
@@ -2756,7 +2761,19 @@ static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
     return NULL;
 }
 
+/* Enum-slot fast path (KAI_VAR_SLOT_ENUM): a tag->singleton map so a
+ * variant slot holding only the immediate `variant_tag` of an
+ * all-nullary sum type can be re-boxed back into its interned
+ * KaiValue* without knowing the ctor name at the read site. Tags are
+ * dense small ints (>= 11 for user ctors); a flat array indexed by tag
+ * is the cheapest lookup. Populated lazily by kai_nullary_install as
+ * each nullary ctor is first constructed. Singletons are immortal
+ * (rc == INT32_MAX), so the stored pointer never dangles. */
+#define KAI_ENUM_TAG_MAX 1024
+static KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
+
 static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) kai_enum_by_tag[tag] = v;
     size_t i = kai_nullary_hash(tag, name);
     for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
         KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
@@ -2771,6 +2788,20 @@ static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
     /* Table full — fall back to non-singleton behaviour. With 64
      * buckets and a known cap of ~30 distinct nullary variants
      * this branch is unreachable in practice. */
+}
+
+/* Re-box an enum-slot's immediate tag into its interned singleton
+ * KaiValue*. The singleton is created the first time the ctor is
+ * constructed anywhere in the program (kai_variant_u nullary path,
+ * which calls kai_nullary_install). For the slot to have been written
+ * with this tag, that construction already happened, so the lookup
+ * hits; the fallback (defensive) returns unit rather than dangle. */
+static inline KaiValue *kai_enum_slot_box(int64_t tag) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
+        KaiValue *v = kai_enum_by_tag[(int) tag];
+        if (v) return v;
+    }
+    return kai_unit();
 }
 
 /* Issue #293 next-tier — variants whose every arg is itself an
@@ -3131,6 +3162,7 @@ static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
     if (k == KAI_VAR_SLOT_PTR)  return v->as.var.slots[i].ptr;
     if (k == KAI_VAR_SLOT_INT)  return kai_int(v->as.var.slots[i].i64);
     if (k == KAI_VAR_SLOT_REAL) return kai_real(v->as.var.slots[i].r);
+    if (k == KAI_VAR_SLOT_ENUM) return kai_enum_slot_box(v->as.var.slots[i].i64);
     return v->as.var.slots[i].ptr;
 }
 
@@ -3151,6 +3183,17 @@ static inline double kai_take_real(KaiValue *v) {
     double x = v->as.r;
     kai_decref(v);
     return x;
+}
+/* Enum-slot pack: read the variant_tag of a (nullary, interned) sum
+ * value and release the box. The box is an immortal singleton
+ * (rc == INT32_MAX), so the decref is a no-op; we keep it for symmetry
+ * with kai_take_int and to stay correct if a non-interned enum value
+ * ever reaches here. Defensive on non-variant input (returns 0). */
+static inline int64_t kai_take_enum(KaiValue *v) {
+    int64_t tag = (v && kai_is_ptr(v) && v->tag == KAI_VARIANT)
+                      ? (int64_t) v->as.var.variant_tag : 0;
+    kai_decref(v);
+    return tag;
 }
 
 /* ---------- Perceus reuse-in-place (issue #118 / Anga Roa wave) ----------
@@ -3678,7 +3721,9 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
                     uint32_t k = kai_var_slot_kind(a->as.var.slot_mask, i);
                     if (k == KAI_VAR_SLOT_PTR) {
                         if (!kai_op_eq(a->as.var.slots[i].ptr, b->as.var.slots[i].ptr)) return 0;
-                    } else if (k == KAI_VAR_SLOT_INT) {
+                    } else if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_ENUM) {
+                        /* ENUM compares its immediate variant_tag like a raw
+                         * Int; two enum slots are equal iff same tag. */
                         if (a->as.var.slots[i].i64 != b->as.var.slots[i].i64) return 0;
                     } else if (k == KAI_VAR_SLOT_REAL) {
                         if (a->as.var.slots[i].r != b->as.var.slots[i].r) return 0;
