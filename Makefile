@@ -493,6 +493,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
 	@$(MAKE) -C stage2 test-perceus-issue703-asan
 	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
+	@$(MAKE) -C stage2 test-perceus-enum-slot-asan
+	@echo "tier1-asan OK — enum-slot fixture passes under ASAN+UBSan (enum-as-int extract/re-intern soundness gate)"
 	@$(MAKE) -C stage2 test-perceus-int-cache-asan
 	@echo "tier1-asan OK — Phase 1.A fixture passes under ASAN+UBSan (widened small-int cache pinned-slot gate)"
 	@$(MAKE) -C stage2 test-match-pbind-catchall-asan

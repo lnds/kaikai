@@ -1,0 +1,89 @@
+# Enum-as-int slot representation (#210 follow-up, Koka-style).
+#
+# A sum type whose every constructor is nullary (`Color = Red | Black`)
+# is "enum-like": its values carry no payload, only identity. When such
+# a value is stored as a CONSTRUCTOR SLOT of another variant, the
+# emitter packs it as the immediate `variant_tag` (KAI_VAR_SLOT_ENUM,
+# an i64) instead of a pointer to the interned singleton. This removes
+# one heap dereference from every read of that field — the load-bearing
+# win on `is_red`-shaped guards over an RBNode's Color field.
+#
+# Standalone enum values (`let c = Red`) stay boxed singletons; only the
+# slot representation changes. This fixture is the soundness gate asu
+# called for: it does not just READ an enum slot inline (the cheap
+# path), it EXTRACTS the enum value out of a node into a binding and
+# passes it to other functions (color_name, equality) — the path where
+# a forgotten re-intern would hand an i64 where a KaiValue* is expected
+# (UAF). Run under ASAN to confirm no dangle.
+
+type Color = Red | Black
+type Dir   = North | South | East | West
+type Node  = Leaf | Branch(Color, Int, Node)
+
+# Inline read of the enum slot — compiles to `slot[0].i64 == tag`.
+fn is_red(n: Node) : Bool = match n {
+  Branch(Red, _, _) -> true
+  _                 -> false
+}
+
+# Extraction: bind the enum slot to a name, then USE it elsewhere. This
+# forces the re-intern path (kai_enum_slot_box) — the value must become
+# a usable KaiValue* again.
+fn root_color(n: Node) : Color = match n {
+  Branch(c, _, _) -> c
+  Leaf            -> Black
+}
+
+fn color_name(c: Color) : String = match c {
+  Red   -> "red"
+  Black -> "black"
+}
+
+fn dir_name(d: Dir) : String = match d {
+  North -> "N"
+  South -> "S"
+  East  -> "E"
+  West  -> "W"
+}
+
+# Equality over enum values extracted from slots — exercises kai_op_eq
+# on the i64 slot comparison path.
+fn same_color(a: Node, b: Node) : Bool =
+  match root_color(a) {
+    Red   -> match root_color(b) { Red -> true   Black -> false }
+    Black -> match root_color(b) { Red -> false  Black -> true }
+  }
+
+# Rebuild a node flipping its color — exercises constructing a Branch
+# with an enum slot from an extracted-then-rebound enum value, plus the
+# nested Branch slot (recursive, stays a pointer).
+fn flip(n: Node) : Node = match n {
+  Branch(Red, k, sub)   -> Branch(Black, k, sub)
+  Branch(Black, k, sub) -> Branch(Red, k, sub)
+  Leaf                  -> Leaf
+}
+
+fn main() = {
+  let t = Branch(Red, 42, Branch(Black, 7, Leaf))
+
+  # inline guard read
+  print(if is_red(t) { "root red" } else { "root black" })
+
+  # extract + pass to another fn
+  print(color_name(root_color(t)))
+
+  # extract from a deeper node
+  let inner = match t { Branch(_, _, sub) -> sub  Leaf -> Leaf }
+  print(color_name(root_color(inner)))
+
+  # equality of extracted enums
+  print(if same_color(t, t) { "same" } else { "diff" })
+  print(if same_color(t, inner) { "same" } else { "diff" })
+
+  # rebuild flipping the enum slot
+  let f = flip(t)
+  print(color_name(root_color(f)))
+
+  # a second enum type, standalone + via dir_name
+  print(dir_name(East))
+}
