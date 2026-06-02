@@ -225,7 +225,7 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
    AST nodes that slip past `evar_find_tag_opt`). The fast path is
    `kaix_is_variant_tag` below. */
 int kaix_is_variant(KaiValue *v, const char *name) {
-    return v && v->tag == KAI_VARIANT && strcmp(v->as.var.variant_name, name) == 0;
+    return v && v->tag == KAI_VARIANT && strcmp(kai_variant_name_of(v->variant_tag), name) == 0;
 }
 
 /* 1 iff `v` is a KAI_VARIANT whose variant_tag equals `tag`. The
@@ -235,7 +235,7 @@ int kaix_is_variant(KaiValue *v, const char *name) {
    a single i32 compare under -O2, eliminating the strcmp call that
    the legacy `kaix_is_variant` path retains for fallback. */
 int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
-    return v && v->tag == KAI_VARIANT && v->as.var.variant_tag == tag;
+    return v && v->tag == KAI_VARIANT && v->variant_tag == tag;
 }
 
 /* Read the i-th argument of a variant. incref so the caller owns it;
@@ -261,11 +261,11 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
      * for typed slots. The LLVM path keeps ownership uniform (caller
      * owns the returned cell), so incref only the borrowed pointer-slot
      * case; the typed-slot temporary already arrives owned. */
-    uint32_t k = kai_var_slot_kind(v->as.var.slot_mask, i);
+    uint32_t k = kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i);
     if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_REAL) {
         return kai_variant_slot_box(v, i);
     }
-    return kai_incref(v->as.var.slots[i].ptr);
+    return kai_incref(v->as.var_slots[i].ptr);
 }
 
 /* kai_op_eq returns an int; wrap for direct use from the IR in match
