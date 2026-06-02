@@ -419,6 +419,17 @@ struct KaiValue {
          * scope exits). */
         struct KaiMailbox *mb;
     } as;
+    /* FAM lane (#210 follow-up): a variant's payload slots live INLINE,
+     * trailing this header in one contiguous block, instead of in a
+     * separately-malloc'd array. `kai_alloc_var(tag, n)` allocates
+     * `sizeof(KaiValue) + n * sizeof(KaiVarSlot)` and points
+     * `as.var.slots` at `inline_slots` — so the emitted codegen
+     * (`v->as.var.slots[i]`) is byte-identical, but the header and its
+     * payload share one cache line and one (size-classed) free-list.
+     * A flexible array member adds 0 to sizeof(KaiValue), so non-variant
+     * tags (cons / int / str / closure) allocated at the base size pay
+     * nothing for it. C99 §6.7.2.1p18. */
+    KaiVarSlot inline_slots[];
 };
 
 /* ---------- Koka-style tagged-value Int representation ----------
@@ -1455,6 +1466,19 @@ static int kai_cell_pool_n = 0;
 static KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
 static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 
+/* FAM lane: free-list for whole variant BLOCKS (header + n inline slots
+ * in one allocation), keyed by arity. Replaces the cell_pool + slot_pool
+ * pair for variants — one push/pop instead of two, one cache line per
+ * node instead of a header here and a slots[] array somewhere else.
+ * Arity 0..8 covers every variant the functional rebuild churns; larger
+ * arities fall through to malloc/free. A pooled block already has the
+ * right byte size for its arity, so reuse is size-matched by
+ * construction (the reuse recognisers only ever rewrite same-arity). */
+#define KAI_VAR_BLOCK_POOL_MAXN 8
+#define KAI_VAR_BLOCK_POOL_CAP  1048576
+static KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+
 static KaiVarSlot *kai_slots_alloc(int n) {
 #ifndef KAI_NO_SLOT_POOL
     if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] > 0) {
@@ -1527,6 +1551,72 @@ static KaiValue *kai_alloc(KaiTag tag) {
  * KAI_RC_NOINLINE for this to point at the right frame. */
 #define kai_alloc(tag) kai_alloc_traced((tag), __builtin_return_address(0))
 #endif
+
+/* FAM lane: byte size of a variant block holding `n` inline slots. */
+static inline size_t kai_var_block_size(int n) {
+    return sizeof(KaiValue) + (size_t) n * sizeof(KaiVarSlot);
+}
+
+/* FAM lane: allocate a KAI_VARIANT block with `n` payload slots stored
+ * inline (one contiguous allocation). Mirrors kai_alloc's bookkeeping
+ * but draws from / returns to the per-arity block pool instead of the
+ * size-uniform cell pool, and never touches the separate slot pool.
+ * The trace epilogue is shared with kai_alloc via the same counters. */
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_var_traced(int n, void *site) {
+#else
+static KaiValue *kai_alloc_var(int n) {
+#endif
+    KAI_PROF_ENTER();
+    KaiValue *v;
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
+        v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
+        memset(v, 0, kai_var_block_size(n));
+    } else {
+        v = (KaiValue *) calloc(1, kai_var_block_size(n));
+    }
+#else
+    v = (KaiValue *) calloc(1, kai_var_block_size(n));
+#endif
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->rc = 1;
+    v->tag = (int32_t) KAI_VARIANT;
+    kai_rc_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    kai_rc_alloc_by_tag[(int) KAI_VARIANT]++;
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
+    kai_leaksite_register_once();
+#endif
+    KAI_PROF_EXIT(alloc);
+    return v;
+}
+#ifdef KAI_TRACE_RC
+#define kai_alloc_var(n) kai_alloc_var_traced((n), __builtin_return_address(0))
+#endif
+
+/* FAM lane: return a variant block (header + inline slots) to its
+ * per-arity pool, or free it. Used by kai_free_value's VARIANT case
+ * in place of (kai_slots_free + cell-pool return). */
+static void kai_var_block_free(KaiValue *v, int n) {
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
+        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP) {
+        kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
+        return;
+    }
+#endif
+    free(v);
+}
 
 /* m5 #7: constant pool for nullary primitives.
  *
@@ -2324,7 +2414,9 @@ static void kai_free_value(KaiValue *v) {
                     }
                 }
             }
-            kai_slots_free(v->as.var.slots, v->as.var.n_args);
+            /* FAM: payload slots are inline in this block — no separate
+             * array to free. The whole block returns to the per-arity
+             * variant pool at the recycle step below (keyed on tag). */
             break;
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
@@ -2444,10 +2536,19 @@ static void kai_free_value(KaiValue *v) {
     }
 #endif
 #ifdef KAI_CELL_POOL_ACTIVE
-    /* Recycle the fixed-size cell instead of returning it to libc, so
-     * the next same-size allocation skips malloc. Bounded; overflow
-     * falls through to a real free. */
-    if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {
+    /* Recycle the cell instead of returning it to libc, so the next
+     * same-size allocation skips malloc. Bounded; overflow falls
+     * through to a real free. A FAM variant block is sized by its arity
+     * and goes to the per-arity block pool (its header+slots are one
+     * allocation); every other tag is the uniform sizeof(KaiValue) cell
+     * and goes to the size-uniform cell pool. (Under KAI_TRACE_RC this
+     * whole branch is compiled out — the poison stamp above has already
+     * run, but the pool is disabled in trace mode, so tag/n_args reads
+     * here are only reached in the untraced production build where the
+     * struct is still intact.) */
+    if (v->tag == (int32_t) KAI_VARIANT) {
+        kai_var_block_free(v, v->as.var.n_args);
+    } else if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {
         kai_cell_pool[kai_cell_pool_n++] = v;
     } else {
         free(v);
@@ -2996,27 +3097,29 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
         KaiValue *cached = kai_immortal_slot_lookup(tag, name, n, slots);
         if (cached) return cached;
         KAI_VAR_NAME_REAL_ALLOC(name);
-        KaiValue *v = kai_alloc(KAI_VARIANT);
+        KaiValue *v = kai_alloc_var(n);
         v->as.var.variant_tag = tag;
         v->as.var.variant_name = name;
         v->as.var.n_args = n;
         v->as.var.slot_mask = 0;
-        v->as.var.slots = (KaiVarSlot *) malloc(n * sizeof(KaiVarSlot));
+        v->as.var.slots = v->inline_slots;
         for (int i = 0; i < n; ++i) v->as.var.slots[i] = slots[i];
         v->rc = INT32_MAX;
         kai_immortal_slot_install(tag, name, n, slots, v);
         return v;
     }
 
-    /* Cold path — fresh alloc, no caching. */
+    /* Cold path — fresh alloc, no caching. FAM: header + n inline slots
+     * in one block; `slots` aliases the trailing inline_slots so the
+     * emitted codegen reads payload identically. */
     KAI_VAR_NAME_REAL_ALLOC(name);
-    KaiValue *v = kai_alloc(KAI_VARIANT);
+    KaiValue *v = kai_alloc_var(n);
     v->as.var.variant_tag = tag;
     v->as.var.variant_name = name;
     v->as.var.n_args = n;
     v->as.var.slot_mask = mask;
     if (n > 0) {
-        v->as.var.slots = kai_slots_alloc(n);
+        v->as.var.slots = v->inline_slots;
         for (int i = 0; i < n; ++i) v->as.var.slots[i] = slots[i];
     } else {
         v->as.var.slots = NULL;
@@ -3487,7 +3590,20 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
 static inline void kai_reuse_free(KaiReuse at) {
     if (at == NULL) return;
     if (kai_is_value(at) || at->tag != KAI_VARIANT) return;
-    at->as.var.n_args = 0;     /* children already moved: do NOT cascade */
+    /* Children already MOVED out — must NOT cascade-decref them. Set
+     * slot_mask so the decref loop sees no PTR slots (every slot reads
+     * as a non-pointer kind), then n_args stays its REAL arity so the
+     * FAM block returns to its correct per-arity pool. KAI_VAR_SLOT_INT
+     * (kind 1) on every slot makes kai_free_value's VARIANT case skip
+     * the decref loop without losing the arity the recycle needs. */
+    int real_n = at->as.var.n_args;
+    if (real_n > 0 && real_n <= 16) {
+        /* every slot kind = INT (1): no PTR slot → no cascade decref.
+         * Bit pair at 2*i set to 01 for each slot. */
+        uint32_t no_ptr_mask = 0;
+        for (int i = 0; i < real_n; ++i) no_ptr_mask |= (KAI_VAR_SLOT_INT << (2 * (uint32_t) i));
+        at->as.var.slot_mask = no_ptr_mask;
+    }
     kai_free_value(at);
 }
 
