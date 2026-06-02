@@ -319,6 +319,42 @@ fn prc_is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
   }
 }
 
+# True iff the fn is a UFn whose EVERY param lowers raw (all mask bits
+# true). Only these take the simplified empty-param-scope Perceus path;
+# a mixed signature (some boxed param) needs the full borrow/move/exit
+# discipline and falls through to the boxed branch.
+fn prc_is_all_raw_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
+  match lookup_ufn_sig(fns, name, mo) {
+    Some(US(_, _, mask)) -> prc_mask_all_true(mask)
+    None                 -> false
+  }
+}
+
+fn prc_mask_all_true(mask: [Bool]) : Bool = match mask {
+  []           -> true
+  [m, ...rest] -> if m { prc_mask_all_true(rest) } else { false }
+}
+
+# The names of the RAW params of a (mixed-sig) fn — those whose mask bit
+# is true. They carry no rc, so they go in the Perceus skip-set and are
+# excluded from unused-param drops. Non-UFn fns return [] (no raw param).
+fn prc_raw_param_names(fns: [EFn], name: String, mo: Option[String], params: [Param]) : [String] {
+  match lookup_ufn_sig(fns, name, mo) {
+    Some(US(_, _, mask)) -> prc_raw_names_zip(params, mask)
+    None                 -> []
+  }
+}
+
+fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [String] = match params {
+  [] -> []
+  [p, ...prest] -> match mask {
+    [] -> []
+    [m, ...mrest] ->
+      if m { [p.pname, ...prc_raw_names_zip(prest, mrest)] }
+      else { prc_raw_names_zip(prest, mrest) }
+  }
+}
+
 # ==================================================================
 # Perceus pass (extracted body — issue #677 phase 1n4)
 # ==================================================================
@@ -974,7 +1010,10 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
       # dups + exit drops, while the raw params stay untouched and
       # `pcs_prepend_unused_drops` is skipped (no boxed params to
       # reclaim).
-      else if prc_is_ufn_decl(fns, name, mo) {
+      else if prc_is_all_raw_ufn_decl(fns, name, mo) {
+        # ALL-raw UFn: every param is a raw C scalar with no rc, so the
+        # body rewrite runs with an EMPTY param scope (issue #703) — no
+        # boxed param to dup/drop, no borrow, no arm-move analysis.
         let uses = pcs_collect_uses_expr(body, [], false, [])
         let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
@@ -982,6 +1021,16 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
       }
       else {
+        # Boxed and MIXED-signature fns share this path. A mixed-sig fn
+        # (e.g. `insert_loop(t: RBTree, k: Int, v: Int)`) has BOXED params
+        # (the tree `t`) that need the full borrow + arm-top-move + exit-
+        # drop discipline — skipping it (the old all-UFn branch) left the
+        # boxed children un-dup'd in the shared branch and un-dropped at
+        # exit, leaking the spine (rb-tree: reuse 19.6M→6.2M, 19.3M
+        # leaked). The RAW params carry no rc and must NOT be dup'd/dropped
+        # (#709 corruption), so they join the skip-set and are excluded
+        # from the unused-param drops below — exactly like a borrowed param.
+        let raw_pnames = prc_raw_param_names(fns, name, mo, params)
         let pnames = map(params, (p) => p.pname)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
         # Borrow inference (Koka). A borrowed param is inspect-only:
@@ -1008,14 +1057,17 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
         let arm_moves = pcs_collect_arm_skip_binders(name, true, body, bmap, cmap)
         let skip_set = pcs_list_union(
-          pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
-          arm_moves)
+          pcs_list_union(
+            pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
+            arm_moves),
+          raw_pnames)
         let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         # Borrowed params carry no exit obligation — exclude from the
-        # unused-param drop.
-        let drop_params = pcs_params_minus(params, borrowed)
+        # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
+        # so they must not receive an unused-param drop either.
+        let drop_params = pcs_params_minus(pcs_params_minus(params, borrowed), raw_pnames)
         let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set)
         # Callee flip: wrap borrowed scrutinees so emit_match skips the
         # decref. Caller flip: strip __perceus_dup on borrowed-slot args.
