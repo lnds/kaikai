@@ -1568,20 +1568,45 @@ pub fn variant_has_primitive_slot(tys: [TypeExpr], enums: [String]) : Bool = mat
 # ephemeral box (e.g. a freshly-allocated `kai_int(7)`) gets
 # released, and the raw scalar lands in the typed slot. Singleton
 # Ints survive the decref because their rc is pinned at INT32_MAX.
+# If `e` is a nullary-constructor literal (`Red`, `Black`, …), return its
+# immediate variant tag. A nullary ctor surfaces either as a bare `EVar`
+# or as a zero-arg `ECall(EVar(ctor), [])` depending on whether the
+# resolver wrapped it. Both resolve through `evar_find_tag_opt`, which
+# returns None for anything that is not a known ctor name.
+fn nullary_ctor_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
+  EVar(nm) -> evar_find_tag_opt(cx.variants, nm)
+  ECall(callee, args_) -> match args_ {
+    [] -> match callee.kind {
+      EVar(nm) -> evar_find_tag_opt(cx.variants, nm)
+      _        -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
 fn emit_variant_slot_init(src: String, e: Expr, te: TypeExpr,
                           cx: EmitCtx) : String / Console {
   let k = variant_slot_kind(te, cx.enums)
-  let boxed = emit_expr(src, e, cx)
   if k == 1 {
-    concat_all(["{.i64 = kai_take_int(", boxed, ")}"])
+    concat_all(["{.i64 = kai_take_int(", emit_expr(src, e, cx), ")}"])
   } else if k == 2 {
-    concat_all(["{.r = kai_take_real(", boxed, ")}"])
+    concat_all(["{.r = kai_take_real(", emit_expr(src, e, cx), ")}"])
   } else if k == 3 {
-    # Enum slot: store the immediate variant_tag. kai_take_enum reads
-    # the boxed singleton's tag and releases the (immortal) box.
-    concat_all(["{.i64 = kai_take_enum(", boxed, ")}"])
+    # Enum slot: store the immediate variant_tag. When `e` is a nullary
+    # ctor literal (`Red`/`Black`), emit the tag DIRECTLY — skip the
+    # `kai_take_enum(kai_variant_u(tag,"Red",0,0,NULL))` round-trip that
+    # allocates the singleton box only to read its tag and release it.
+    # This is the enum analogue of the tagged-Int direct read (#741): the
+    # field IS the tag, so a literal ctor is a plain integer store. A
+    # non-literal enum expr (a bound variable of enum type) still routes
+    # through kai_take_enum to read whatever tag it carries.
+    match nullary_ctor_tag(e, cx) {
+      Some(tag) -> concat_all(["{.i64 = ", int_to_string(tag), "}"])
+      None      -> concat_all(["{.i64 = kai_take_enum(", emit_expr(src, e, cx), ")}"])
+    }
   } else {
-    concat_all(["{.ptr = ", boxed, "}"])
+    concat_all(["{.ptr = ", emit_expr(src, e, cx), "}"])
   }
 }
 
@@ -4843,6 +4868,34 @@ fn is_int_order_cmp(op: String, a: Expr, b: Expr) : Bool {
   is_cmp and ty_opt_is_int(a.ty) and ty_opt_is_int(b.ty)
 }
 
+# Is `e` itself a direct Int order-comparison (`k < kx`, …)? Used by the
+# `if`/match-guard lowering to emit a RAW C bool predicate and use the C
+# ternary directly, instead of `kai_op_truthy(kai_bool(...))` — the box and
+# the un-box cancel. General over every `if cmp { }` where both sides are
+# statically Int, the rb-tree descent being the load-bearing case (3 such
+# comparisons per node visited).
+fn expr_is_int_order_cmp(e: Expr) : Bool = match e.kind {
+  EBinop(op, a, b) -> is_int_order_cmp(op, a, b)
+  _ -> false
+}
+
+# Emit a direct Int order-comparison as a RAW C bool (no `kai_bool` box).
+# Caller has already gated on `expr_is_int_order_cmp(e)`. Mirrors the boxed
+# path's operand reads (emit_expr_raw, non-consuming) but yields the bare
+# `(_la <op> _lb)` predicate the C `if`/`?:` consumes with no RC traffic.
+fn emit_int_order_cmp_raw(src: String, e: Expr, cx: EmitCtx) : String / Console =
+  match e.kind {
+    EBinop(op, a, b) -> {
+      let c_op = match int_cmp_c_op(op) { Some(o) -> o None -> "<" }
+      concat_all([
+        "({ int64_t _la = ", emit_expr_raw(src, a, cx),
+        "; int64_t _lb = ", emit_expr_raw(src, b, cx),
+        "; (_la ", c_op, " _lb); })"
+      ])
+    }
+    _ -> "0 /* emit_int_order_cmp_raw: not a comparison */"
+  }
+
 fn unbox_field_for(opt_ty: Option[Ty]) : String {
   match opt_ty {
     Some(t) -> match t {
@@ -5269,7 +5322,21 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       # branches return either the then- or else-arm fresh value —
       # never `_c` itself — so dropping `_c` after the ternary is
       # safe and balances the fresh allocation that fed it.
-      match c.mode {
+      # A direct Int order-comparison condition (`if k < kx { }`) is a raw
+      # C bool — emit it inline and use the C ternary, skipping the
+      # `kai_op_truthy(kai_bool(...))` box/un-box round-trip. This fires
+      # even though the comparison's `.mode` is MBoxed (the typer pins its
+      # result type to Bool but does not unbox the node), so it must be
+      # checked before the mode split. Load-bearing on the rb-tree descent.
+      if expr_is_int_order_cmp(c) {
+        let cc = emit_int_order_cmp_raw(src, c, cx)
+        let tc = emit_expr(src, a, cx)
+        let ec = match opt_b {
+          Some(eb) -> emit_expr(src, eb, cx)
+          None -> "kai_unit()"
+        }
+        concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
+      } else { match c.mode {
         MUnboxed -> {
           let cc = emit_expr_raw(src, c, cx)
           let tc = emit_expr(src, a, cx)
@@ -5292,7 +5359,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
             "; kai_decref(_c); _r; })"
           ])
         }
-      }
+      } }
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, cx)
     ELambda(_, _) -> emit_lambda_ref(x, cx)
@@ -7697,9 +7764,34 @@ fn emit_shim_arg_list_masked(pts: [Ty], mask: [Bool], i: Int) : String {
   }
 }
 
+# Eager-seed every nullary constructor's singleton into the runtime's
+# tag->singleton table (kai_enum_by_tag, via kai_nullary_install inside
+# kai_variant_u). The enum-as-int slot store (`{.i64 = tag}`, emitted by
+# emit_variant_slot_init / the TRMC rebuild for a literal nullary ctor)
+# writes only the tag — it does NOT build the singleton — so a later
+# `kai_enum_slot_box(slot.i64)` READ depends on the table already holding
+# that tag. Lazy population was fine when the FIRST touch of a ctor was a
+# kai_variant_u construction, but the direct-tag store can now be the
+# first touch (rb-tree Red/Black), and a self-hosted-compiler enum could
+# be slot-read before any construction — kai_enum_by_tag[tag] would be
+# NULL and the read would return kai_unit(), corrupting behaviour (the
+# selfhost is_digit divergence). Seeding all nullary ctors at main entry
+# makes the direct store sound regardless of construction order. Building
+# each singleton is one cached kai_variant_u; immortal, so no leak.
+fn emit_nullary_enum_seed(variants: [EVar]) : String = match variants {
+  [] -> ""
+  [EV(nm, ar, _, tag), ...rest] ->
+    if ar == 0 {
+      concat_all([
+        "    kai_variant_u(", int_to_string(tag), ", \"", nm, "\", 0, 0, NULL);\n",
+        emit_nullary_enum_seed(rest)
+      ])
+    } else { emit_nullary_enum_seed(rest) }
+}
+
 fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EFn]) : String {
   let proto_tables = emit_proto_runtime_tables(decls, variants, fns)
-  let proto_init   = "    _kai_register_proto_tables();\n"
+  let proto_init   = concat_all(["    _kai_register_proto_tables();\n", emit_nullary_enum_seed(variants)])
   match bmode {
     BMTest -> {
       let n = test_count(decls)
@@ -12304,8 +12396,14 @@ fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]]
             concat_all(["{.r = ", emit_trmc_real_slot(src, a, cx), "}"])
           } else if kind == 3 {
             # Enum slot in a TRMC rebuild: store the immediate tag,
-            # matching emit_variant_slot_init's enum path.
-            concat_all(["{.i64 = kai_take_enum(", emit_expr(src, a, cx), ")}"])
+            # matching emit_variant_slot_init's enum path. A nullary ctor
+            # literal (`Red`/`Black`) stores its tag directly, skipping the
+            # kai_take_enum(kai_variant_u(...)) singleton round-trip — this
+            # is the hot path for the rb-tree descent's node rebuilds.
+            match nullary_ctor_tag(a, cx) {
+              Some(tag) -> concat_all(["{.i64 = ", int_to_string(tag), "}"])
+              None      -> concat_all(["{.i64 = kai_take_enum(", emit_expr(src, a, cx), ")}"])
+            }
           } else {
             concat_all(["{.ptr = ", emit_expr(src, a, cx), "}"])
           }
