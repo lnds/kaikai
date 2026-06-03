@@ -551,6 +551,24 @@ static int64_t kai_arena_free_total  = 0;
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 static int64_t kai_rc_reuse_total = 0;
+/* #2 parity probe — reuse-token DISPOSAL counter. Bumped by every
+ * kai_reuse_free, i.e. every arm-top token captured (UNIQUE scrutinee
+ * shell stolen) that the arm body could NOT donate to an in-frame
+ * kai_variant_at and therefore had to free. In the rb-tree this is the
+ * Black balance arm: `balance_left(insert_loop(l,...), ..., r)` allocates
+ * its rebuilt node inside balance_left's own frame, so the stolen Black
+ * cell crosses a function boundary the token cannot. This counter is the
+ * exact upper bound on what an interprocedural token-pass would recover —
+ * if it is small relative to alloc_total, #2 is not worth the ABI cost. */
+static int64_t kai_rc_reuse_free_total = 0;
+/* #2 parity probe — kai_drop_reuse_token outcome split. unique = shell
+ * handed back (donatable); null_shared = rc>1 so cannot steal; null_mismatch
+ * = wrong tag/arity (e.g. RBLeaf scrutinee). Tells whether the wasted fresh
+ * allocs are a sharing problem (would need a different fix) or genuinely the
+ * inter-frame balance case (token-pass). */
+static int64_t kai_rc_tok_unique = 0;
+static int64_t kai_rc_tok_null_shared = 0;
+static int64_t kai_rc_tok_null_mismatch = 0;
 /* Phase 1.B.1 — incref/decref call counters (the ones that actually
  * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
  * borrow optimisation that elides incref/decref pairs show its effect
@@ -599,6 +617,21 @@ static void kai_rc_report(void) {
     if (kai_rc_reuse_total > 0) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
                 (long long) kai_rc_reuse_total);
+    }
+    /* #2 parity probe — tokens captured but freed (could not donate in
+     * frame). Upper bound on interprocedural-token-pass recovery. */
+    if (kai_rc_reuse_free_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   reuse_freed=%lld\n",
+                (long long) kai_rc_reuse_free_total);
+    }
+    /* #2 parity probe — token-drop outcome split. */
+    if (kai_rc_tok_unique > 0 || kai_rc_tok_null_shared > 0 ||
+        kai_rc_tok_null_mismatch > 0) {
+        fprintf(stderr,
+            "[KAI_TRACE_RC]   tok_unique=%lld tok_null_shared=%lld tok_null_mismatch=%lld\n",
+            (long long) kai_rc_tok_unique,
+            (long long) kai_rc_tok_null_shared,
+            (long long) kai_rc_tok_null_mismatch);
     }
     /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
     fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
@@ -3592,15 +3625,24 @@ static inline KaiReuse kai_drop_reuse_token(KaiValue *v, int n) {
             v->rc != INT32_MAX) {
             v->rc -= 1;   /* non-recursive: children are borrow-bound, not ours */
         }
+#ifdef KAI_TRACE_RC
+        kai_rc_tok_null_mismatch++;
+#endif
         return kai_reuse_null;
     }
     if (kai_check_unique(v)) {
         /* sole owner: hand back the shell. Children MOVE into the rebuild
          * (borrow binds become the owners). kai_variant_at overwrites next. */
+#ifdef KAI_TRACE_RC
+        kai_rc_tok_unique++;
+#endif
         return v;
     }
     /* shared: non-recursive refcount decrement. */
     if (v->rc != INT32_MAX) v->rc -= 1;
+#ifdef KAI_TRACE_RC
+    kai_rc_tok_null_shared++;
+#endif
     return kai_reuse_null;
 }
 
@@ -3657,6 +3699,9 @@ static inline void kai_reuse_free(KaiReuse at) {
     kai_var_block_free(at, at->var_n_args);
     kai_rc_free_total++;
     kai_rc_live_now--;
+#ifdef KAI_TRACE_RC
+    kai_rc_reuse_free_total++;
+#endif
 }
 
 /* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
