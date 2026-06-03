@@ -1613,8 +1613,20 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
 # share it.
 fn llvm_emit_call_raw_or_box(e: LlvmEmit, x: Expr, callee: Expr, args_: [Expr]) : LlvmRaw / Console {
   match llvm_raw_call_ufn_sig(e.locals, e.fns, callee) {
-    Some(US(pts, rt, _)) ->
+    # The raw-return fast path applies ONLY when the callee's RETURN is
+    # unboxable. A mixed-signature UFn with a boxed return (`describe : Int
+    # -> String`) is now defined as `%KaiValue* @kai_describe(i64)`, so a
+    # raw call-site (`call i64 @kai_describe`) was a return-type mismatch
+    # that printed the String pointer as an int. When `rt` is boxed, fall to
+    # the boxed path: emit the call boxed and unbox per `x.ty` (a no-op when
+    # x.ty is itself boxed). Mirror of C, where a boxed-return UFn call is
+    # never routed through the raw-return emitter.
+    Some(US(pts, rt, _)) -> if ty_is_unboxable_t(rt) {
       llvm_emit_ufn_call_raw(e, llvm_raw_call_sym(e.fns, callee), pts, rt, args_)
+    } else {
+      let eb = llvm_emit_expr_boxed(e, x)
+      llvm_unbox_value(eb, eb.last_val, x.ty)
+    }
     None -> {
       let eb = llvm_emit_expr_boxed(e, x)
       llvm_unbox_value(eb, eb.last_val, x.ty)
@@ -1889,17 +1901,32 @@ fn llvm_emit_expr_boxed(e: LlvmEmit, x: Expr) : LlvmEmit / Console {
     ERecordLit(nm, fis) -> llvm_emit_record_lit(e, nm, fis)
     EVar(nm) -> match llvm_local_find(e.locals, nm) {
       Some(reg) -> llvm_set_last(e, reg)
-      None -> match evar_find(e.vars_, nm) {
-        Some(ar) -> if ar == 0 {
-          llvm_emit_variant_ctor(e, nm, [])
-        } else {
-          # Non-nullary ctor referenced as a value — would need a
-          # closure wrapping the constructor. Out of scope for M3d
-          # (interp.kai doesn't hit this).
-          eprint("llvm: non-nullary variant ctor as value not supported: #{nm}")
-          llvm_set_last(e, "undef")
+      # A boxed-context read of a binder the boxed lookup missed may be a
+      # RAW local (a param unboxed by the mixed-sig/signature unboxing pass,
+      # `e763432`). The boxed lookup deliberately skips raw entries, so a
+      # raw param read in value position (e.g. captured by a lambda, or
+      # passed where a `%KaiValue*` is wanted) fell through to the fn-value
+      # path and reported "cannot build closure" — the LLVM mirror of the C
+      # `kai_n`-undeclared bug. Re-box the raw register (`kaix_int`/`_real`/
+      # `_bool`/`_char` per its source ty), the symmetric move to
+      # llvm_emit_expr_raw's unbox of a boxed binding read in raw context.
+      None -> match llvm_raw_local_find(e.locals, nm) {
+        Some(lr) -> match lr {
+          LRaw(_, reg, t) -> llvm_box_wrap_value(e, reg, Some(t))
+          _               -> llvm_emit_fn_value(e, nm, x.line, x.col)
         }
-        None -> llvm_emit_fn_value(e, nm, x.line, x.col)
+        None -> match evar_find(e.vars_, nm) {
+          Some(ar) -> if ar == 0 {
+            llvm_emit_variant_ctor(e, nm, [])
+          } else {
+            # Non-nullary ctor referenced as a value — would need a
+            # closure wrapping the constructor. Out of scope for M3d
+            # (interp.kai doesn't hit this).
+            eprint("llvm: non-nullary variant ctor as value not supported: #{nm}")
+            llvm_set_last(e, "undef")
+          }
+          None -> llvm_emit_fn_value(e, nm, x.line, x.col)
+        }
       }
     }
     ECall(callee, xs) -> llvm_emit_call(e, callee, xs)
@@ -2775,8 +2802,22 @@ fn llvm_format_args_raw(regs: [String], pts: [Ty]) : String {
 # still sees a `%KaiValue*`. Mirror of C's `emit_ufn_boxed_call`
 # (`box_wrap(rt, kai_<sym>(raw_args))`).
 fn llvm_emit_ufn_call_boxed(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Expr]) : LlvmEmit / Console {
-  let raw = llvm_emit_ufn_call_raw(e, sym, pts, rt, xs)
-  llvm_box_wrap_value(raw.e, raw.reg, Some(rt))
+  # Raw-args call. When `rt` is unboxable the entry returns a raw scalar
+  # that we box; when `rt` is boxed (`describe : Int -> String`) the entry
+  # already returns `%KaiValue*` — call it with that return type and use it
+  # directly. Re-boxing the boxed return (`kaix_int(<String ptr>)`) printed
+  # the pointer as an int. Mirror of C's emit_ufn_boxed_call, which only
+  # box-wraps an unboxable return.
+  if ty_is_unboxable_t(rt) {
+    let raw = llvm_emit_ufn_call_raw(e, sym, pts, rt, xs)
+    llvm_box_wrap_value(raw.e, raw.reg, Some(rt))
+  } else {
+    let ra = llvm_emit_args_raw(e, xs, pts, [])
+    let r = llvm_fresh_reg(ra.st)
+    let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                            llvm_format_args_raw(ra.regs, pts), ")\n"])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  }
 }
 
 # Issue #718 — emit a UFn call in a RAW context: evaluate args raw,
@@ -5413,18 +5454,36 @@ fn llvm_emit_thunk(nm: String, arity: Int, opt_sig: Option[UFnSig]) : String {
     Some(US(pts, rt, _)) -> {
       let unbox_lines = llvm_thunk_unbox_args(0, pts, "")
       let raw_args = llvm_thunk_raw_call_args(0, pts, "")
-      let ret_ir = llvm_raw_ir_type_t(rt)
-      let box_ctor = llvm_box_ctor_t(rt)
-      let box_arg_ir = llvm_box_arg_ir_t(rt)
-      concat_all([
-        "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
-        load_lines,
-        unbox_lines,
-        "  %rraw = call ", ret_ir, " ", target_sym, "(", raw_args, ")\n",
-        "  %r = call %KaiValue* ", box_ctor, "(", box_arg_ir, " %rraw)\n",
-        "  ret %KaiValue* %r\n",
-        "}\n"
-      ])
+      # The mixed-signature C entry (`@kai_<nm>`) returns a RAW scalar only
+      # when `rt` is unboxable; for a boxed return type (String, list,
+      # variant — e.g. `fizzbuzz : Int -> String`) it already returns a
+      # `%KaiValue*`. Re-boxing that with `kaix_int` read a String pointer
+      # as an i64 and produced garbage (`1 1 4 1 4...` instead of fizzbuzz).
+      # Mirror C's emit_fn_thunk: box the return ONLY when it is unboxable.
+      if ty_is_unboxable_t(rt) {
+        let ret_ir = llvm_raw_ir_type_t(rt)
+        let box_ctor = llvm_box_ctor_t(rt)
+        let box_arg_ir = llvm_box_arg_ir_t(rt)
+        concat_all([
+          "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
+          load_lines,
+          unbox_lines,
+          "  %rraw = call ", ret_ir, " ", target_sym, "(", raw_args, ")\n",
+          "  %r = call %KaiValue* ", box_ctor, "(", box_arg_ir, " %rraw)\n",
+          "  ret %KaiValue* %r\n",
+          "}\n"
+        ])
+      } else {
+        # Boxed return: the raw-arg entry already yields a %KaiValue*.
+        concat_all([
+          "\ndefine %KaiValue* ", thunk_sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
+          load_lines,
+          unbox_lines,
+          "  %r = call %KaiValue* ", target_sym, "(", raw_args, ")\n",
+          "  ret %KaiValue* %r\n",
+          "}\n"
+        ])
+      }
     }
     None -> {
       let call_args = llvm_thunk_call_args(0, arity, "")
@@ -5577,24 +5636,44 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
             let e_slots = llvm_emit_tcrec_slots_raw(e0, ps, pts)
             llvm_emit_tcrec_loop_header_raw(e_slots, ps, pts)
           } else { e0 }
-          # The body is MUnboxed (the unbox pass marks a UFn body raw);
-          # emit it raw so the return is a native scalar, not a boxed
-          # `%KaiValue*`. Mirror of C `emit_fn_body`'s `emit_expr_raw`.
-          let rret = llvm_emit_expr_raw(e_pro, body)
-          let e1 = rret.e
-          let ret_ir = llvm_raw_ir_type_t(rt)
+          # A mixed signature has RAW params but the RETURN may be boxed
+          # (`fizzbuzz : Int -> String`). When `rt` is unboxable, emit the
+          # body raw and return a native scalar (the fast path). When `rt`
+          # is a boxed type (String/list/variant), emit the body BOXED and
+          # return `%KaiValue*` — emitting it raw defined `@kai_fizzbuzz` as
+          # `i64` while the thunk called it as `%KaiValue*`, a type mismatch
+          # that segfaulted. Mirror of C: the entry's C return type follows
+          # `rt`, only the params are unboxed.
           let param_list = if has_sentinel { llvm_param_list_unboxed_tcrec(ps, pts) }
                            else { llvm_param_list_unboxed(ps, pts) }
-          let text = concat_all([
-            e1.globals, "\n",
-            "define ", ret_ir, " ", sym, "(", param_list, ") {\n",
-            "entry:\n",
-            e1.body,
-            "  ret ", ret_ir, " ", rret.reg, "\n",
-            "}\n",
-            thunk
-          ])
-          LlvmDeclOut { text: text, next_id: e1.ids.next }
+          if ty_is_unboxable_t(rt) {
+            let rret = llvm_emit_expr_raw(e_pro, body)
+            let e1 = rret.e
+            let ret_ir = llvm_raw_ir_type_t(rt)
+            let text = concat_all([
+              e1.globals, "\n",
+              "define ", ret_ir, " ", sym, "(", param_list, ") {\n",
+              "entry:\n",
+              e1.body,
+              "  ret ", ret_ir, " ", rret.reg, "\n",
+              "}\n",
+              thunk
+            ])
+            LlvmDeclOut { text: text, next_id: e1.ids.next }
+          } else {
+            # Raw params, boxed return: body lowers to a `%KaiValue*`.
+            let e1 = llvm_emit_expr(e_pro, body)
+            let text = concat_all([
+              e1.globals, "\n",
+              "define %KaiValue* ", sym, "(", param_list, ") {\n",
+              "entry:\n",
+              e1.body,
+              "  ret %KaiValue* ", e1.last_val, "\n",
+              "}\n",
+              thunk
+            ])
+            LlvmDeclOut { text: text, next_id: e1.ids.next }
+          }
         }
         # --- boxed `%KaiValue*` calling convention (unchanged) ---
         None -> {
