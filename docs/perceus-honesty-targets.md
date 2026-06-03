@@ -172,11 +172,13 @@ Caveats that survive:
   programs*, not the bootstrap chain.
 - Mutual tail-recursion (`f → g → f`) is out of scope — v1 rewrites
   self-recursive calls only.
-- **The LLVM backend still emits a normal call for the sentinel** — TCO
-  via the LLVM `tail` marker is a separate, unstarted lane. A `String`
-  parameter threaded through a self-tail-call is currently miscompiled
-  by the LLVM backend (read as a raw integer); this is the open
-  "TCO in LLVM" work, tracked separately from this doc.
+- **The LLVM backend lowers the sentinel to a real loop** (`br
+  %tcrec.loop` back-edge, issue #706), including for mixed raw/boxed
+  param signatures: a `String` (or any boxed) accumulator threaded
+  through a self-tail-call round-trips as `%KaiValue*`, matching the C
+  backend. (Earlier the LLVM UFn convention read a boxed param as a raw
+  `i64`; fixed by threading the per-param raw mask through every UFn
+  lowering site — see `docs/lane-experience-llvm-tco-mixed-param.md`.)
 - Fns with any `LUUnused` parameter keep the normal-call shape (the
   entry drops would re-fire each goto iteration). Hoisting entry drops
   above the label is a follow-up.
