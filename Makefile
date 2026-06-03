@@ -497,6 +497,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — enum-slot fixture passes under ASAN+UBSan (enum-as-int extract/re-intern soundness gate)"
 	@$(MAKE) -C stage2 test-perceus-int-cache-asan
 	@echo "tier1-asan OK — Phase 1.A fixture passes under ASAN+UBSan (widened small-int cache pinned-slot gate)"
+	@$(MAKE) -C stage2 test-perceus-nested-reuse-asan
+	@echo "tier1-asan OK — nested-pattern reuse fixture passes under ASAN+UBSan (balance rotation outer+inner cell reuse gate)"
 	@$(MAKE) -C stage2 test-match-pbind-catchall-asan
 	@echo "tier1-asan OK — issue #91 fixture passes under ASAN+UBSan (PBind catch-all fast-path raw-local gate)"
 	@$(MAKE) -C stage2 test-http-client-asan

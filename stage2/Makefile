@@ -71,7 +71,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-trace test-trace-asan test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-packages
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-trace test-trace-asan test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-packages
 
 all: $(TARGET)
 
@@ -4095,6 +4095,50 @@ test-perceus-issue350-asan: $(TARGET) build
 	    || { echo "perceus-issue350-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
+# Nested-pattern reuse-in-place (rb-tree balance rotations). Guards the
+# lane that taught the 1:1 variant reuse to fire on arms with a one-level
+# nested sub-pattern (`Node(_, Node(Red, lx,..), ..)`), reusing BOTH the
+# outer matched cell and the inner deconstructed cell (Koka 2-of-3
+# rotation reuse). Unlike gap3_balance_minimal (color dropped), this keeps
+# the color slot — the slot that makes the sub-pattern nested, i.e. the
+# exact shape `pcs_sub_is_flat` now admits. The golden is the post-insert
+# node count: a token used by the rebuild AND freed afterward (the
+# double-use bug the lane hit) drops a subtree, so size comes out SHORT.
+PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance
+
+test-perceus-nested-reuse: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
+	  ./build/$$name > build/$$name.out; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
+	    && echo "perceus-nested-reuse OK $$name (outer+inner cell reuse, all keys kept)" \
+	    || { echo "perceus-nested-reuse DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
+
+# ASAN+UBSan sibling: the inner-cell reuse moves grand-children (borrow)
+# into a donated cell; ASan catches a double-use (token reused AND freed),
+# UBSan catches a missed dup that lets a freed grand-child escape.
+test-perceus-nested-reuse-asan: $(TARGET) build
+	@set -e; \
+	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
+	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c $(LDLIBS_M); \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    echo "perceus-nested-reuse-asan FAIL $$name — sanitizer diagnostic:"; \
+	    cat build/$$name-asan.err; exit 1; \
+	  fi; \
+	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
+	    && echo "perceus-nested-reuse-asan OK $$name" \
+	    || { echo "perceus-nested-reuse-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
 # Phase 1.A (perceus-int-cache) — widened small-int cache. The
 # canonical reuse-in-place `bump` shape: cons cells reused in place
 # (zero new cons across passes), and every `h + 1` value falls in the
@@ -4729,7 +4773,7 @@ COSTLY_JOBS ?= 5
 test-costly-parallel: $(TARGET) build
 	@$(MAKE) -j$(COSTLY_JOBS) test-tokens test-ast test-types test-env test-check
 
-test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
