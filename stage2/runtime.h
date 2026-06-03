@@ -50,6 +50,7 @@
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1649,7 +1650,11 @@ static inline size_t kai_var_block_size(int n) {
      * 56 (or 48 with tight packing) vs the old 80. Guard: at least
      * sizeof(KaiValue) so a node with few slots still has a valid base
      * for the generic header reads. */
-    size_t base = (size_t) ((char *) &((KaiValue *) 1)->as.var_slots[0] - (char *) 1);
+    /* `offsetof` (stddef.h) is the UB-free spelling: the old
+     * `(char *)&((KaiValue *)1)->as.var_slots[0] - (char *)1` trick forms a
+     * member access on a misaligned bogus pointer, which -fsanitize=undefined
+     * flags (misaligned-address) on every variant alloc under the ASAN tier. */
+    size_t base = offsetof(KaiValue, as.var_slots);
     size_t need = base + (size_t) n * sizeof(KaiVarSlot);
     return need < sizeof(KaiValue) ? sizeof(KaiValue) : need;
 }
