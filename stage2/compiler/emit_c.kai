@@ -3505,8 +3505,8 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # instead of aliasing. A bijective (flat) rebuild keeps the cheap borrow
       # binds. Detected structurally: any carg is a ctor-call with >0 args.
       let nonbij = rv_any_nested_ctor(cargs)
-      let borrow_binds = rv_slot_binds(subs, tys, 0, not nonbij, cx)
-      let owned_binds  = rv_slot_binds(subs, tys, 0, false, cx)
+      let borrow_binds = rv_slot_binds(src, subs, tys, 0, not nonbij, cx)
+      let owned_binds  = rv_slot_binds(src, subs, tys, 0, false, cx)
       # The new-ctor-arg expressions reference the pattern binders
       # (`kai_<nm>`), so they MUST be emitted under `arm_cx` (lcs
       # extended with the binder names). Emitting under the bare `cx`
@@ -3522,7 +3522,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # The temps are computed first (they read the now-owned children), so the
       # decref is safe to emit before the overwrites. A bijective rebuild
       # transfers (borrow binds) and must NOT decref.
-      let old_drops = if nonbij { rv_old_slot_drops(tys, 0, cx.enums) } else { "" }
+      let old_drops = if nonbij { rv_old_slot_drops(subs, tys, 0, cx.enums) } else { "" }
       concat_all([
         "if (kai_check_unique(_scr)) { ",
         borrow_binds, new_temps, old_drops, overwrites,
@@ -3541,7 +3541,19 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
 }
 
 # Bind each slot for a reuse arm. borrow=true → unique branch.
-fn rv_slot_binds(subs: [Pattern], tys: [TypeExpr], i: Int, borrow: Bool, cx: EmitCtx) : String {
+#
+# Nested sub-pattern slots (the rb-tree balance rotation shape:
+# `RBNode(_, RBNode(Red, lx, ..), ..)`) deconstruct an INNER cell. We
+# bind the inner cell's children via `emit_pat_binds` (is_alias=true →
+# each grand-child is incref'd, the Koka `dup` of the kept children),
+# then DECREF the inner cell itself — it has been fully deconstructed
+# and the rebuild does not reuse it (Koka's `kk_datatype_ptr_decref
+# (_pat_1)`). This is non-bijective by construction; the rebuild's
+# arg expressions own their children, so the outer `_scr` cell can be
+# donated in place safely. Mirrors Koka ParcReuse's local reuse where
+# only the outermost matched cell becomes the reuse token while the
+# inner deconstructed cell is dropped.
+fn rv_slot_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int, borrow: Bool, cx: EmitCtx) : String {
   match subs {
     [] -> ""
     [sp, ...rest] -> {
@@ -3556,9 +3568,18 @@ fn rv_slot_binds(subs: [Pattern], tys: [TypeExpr], i: Int, borrow: Bool, cx: Emi
           else if k == 3 { concat_all(["KaiValue *kai_", nm, " = kai_enum_slot_box(", slot, ".i64); "]) }
           else if borrow { concat_all(["KaiValue *kai_", nm, " = ", slot, ".ptr; "]) }
           else { concat_all(["KaiValue *kai_", nm, " = kai_incref(", slot, ".ptr); "]) }
-        _ -> ""
+        # Nested ctor / record / list sub-pattern in a boxed slot: bind
+        # its inner names off the inner cell (alias → grand-children
+        # incref'd), then drop the now-deconstructed inner cell. Only
+        # boxed slots (k == 0) can hold a nested cell.
+        _ ->
+          if k == 0 {
+            let inner = concat_all([slot, ".ptr"])
+            cat2(emit_pat_binds(src, sp, inner, true, cx),
+                 concat_all(["kai_decref(", inner, "); "]))
+          } else { "" }
       }
-      cat2(here, rv_slot_binds(rest, tys, i + 1, borrow, cx))
+      cat2(here, rv_slot_binds(src, rest, tys, i + 1, borrow, cx))
     }
   }
 }
@@ -3617,14 +3638,27 @@ fn rv_nonempty(xs: [Expr]) : Bool = match xs { [] -> false _ -> true }
 # Decref every OLD pointer slot of `_scr` before the non-bijective overwrite
 # (the unique branch owns/incref'd its children, so the old refs must be
 # released). Primitive slots (tagged Int / Real) carry no RC → skipped.
-fn rv_old_slot_drops(tys: [TypeExpr], i: Int, enums: [String]) : String = match tys {
+#
+# A slot whose sub-pattern is a NESTED ctor was already deconstructed and
+# its inner cell decref'd inside `rv_slot_binds` (the balance rotation
+# shape). Decref-ing it again here would double-free it, so such slots
+# are skipped — `subs` lets us recognise them positionally.
+fn rv_old_slot_drops(subs: [Pattern], tys: [TypeExpr], i: Int, enums: [String]) : String = match tys {
   []          -> ""
   [t, ...rest] -> {
     let k = variant_slot_kind(t, enums)
-    let here = if k == 0 {
+    let sub_nested = match subs {
+      [sp, ..._] -> match sp.pkind { PBind(_) -> false PWild -> false _ -> true }
+      []         -> false
+    }
+    let srest = match subs {
+      [_, ...sr] -> sr
+      []         -> []
+    }
+    let here = if k == 0 and not sub_nested {
       concat_all(["kai_decref(_scr->as.var_slots[", int_to_string(i), "].ptr); "])
     } else { "" }
-    cat2(here, rv_old_slot_drops(rest, i + 1, enums))
+    cat2(here, rv_old_slot_drops(srest, rest, i + 1, enums))
   }
 }
 
