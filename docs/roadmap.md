@@ -342,29 +342,15 @@ Hanga Roa closure.
        for variants). Acceptance benchmark: red-black tree
        (`examples/perceus/rb_tree_bench.kai`).
 
-   Empirical evidence motivating the bifurcation:
-   `docs/benchmarks/rb_tree_2026-05-08.md` (re-measure on 0.44.1
-   post-#342) records 9.94×–11.90× C on the red-black tree
-   benchmark under the original single-number target; PR #305
-   (closed) is the prior measurement that originally surfaced the
-   gap. Locals-unboxed/storage-edges-boxed split formalised in
-   `docs/unboxing-phase2-design.md`. Issue #350 (RC discipline in
-   tail-recursive helpers) closed via PR #368 and contributes to
-   gate 3b: post-#368 RB tree has leaked 21.96M → 3.58M (−83.7%),
-   live_peak −80.2%, RSS 1929 MB → 325 MB. **v1 status
-   (2026-05-09):** gate 3b is **explicitly v1.0-trajectory, not
-   v0.45.0**. Empirical lane on #371 (closed not-planned) showed
-   the dup chain has three accumulating sources, not one as the
-   original Phase A diagnosis assumed; full fix needs #383
-   (`Int`-unboxing pass, 5-7 days) AND #384 (variant-reuse
-   borrowed-binds, 5-10 days, conditional on #383 data). The math
-   does not fit before 2026-05-21 (release date). v0.45.0 ships
-   with the current 9.94× C documented honestly; #383 targets
-   v0.45.x or v0.46.0 with day-5 go/no-go; #384 targets v0.46.0
-   conditional on post-#383 baseline. RB-tree benchmark stays in
-   `docs/benchmarks/` but is **not featured** in v0.45.0 launch
-   surface (kaikai-book, brew landing). Closing #371 details:
-   https://github.com/lnds/kaikai/issues/371#issuecomment-4411080979.
+   The locals-unboxed/storage-edges-boxed split (Phase 2) and the
+   call-boundary split (Phase 3, #383) both landed; the
+   reuse-in-place cascade (2026-06) followed. Current measured
+   state: the red-black tree benchmark runs at **2.64× C wall /
+   1.17× C RSS / garbage-free** — see `docs/benchmarks/rb_tree_2026-06-02.md`
+   for the apples-to-apples Koka/C/C++ comparison and
+   `docs/perceus-honesty-targets.md` for the honesty-tier breakdown.
+   The single remaining large lever is value-immediate `Int`
+   (post-MVP).
 5. ✅ **MET.** Diagnostic quality at the m11 bar — type
    mismatch (#445), non-exhaustive match (#445), unbound name
    with Levenshtein did-you-mean (#445), wrong arity (#479),
