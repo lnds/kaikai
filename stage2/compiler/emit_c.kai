@@ -4875,13 +4875,49 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
 # forms (literal, raw EVar, raw arith). When `x.mode` is `MBoxed`
 # we fall back to emitting boxed and tacking on the unbox field —
 # the boundary tactic from `docs/unboxing-phase2-design.md` §3.
+
+# Borrow-read for raw scalar extraction. When a boxed operand is wrapped in
+# `__perceus_dup(inner)` (perceus added an incref assuming an owned read) but
+# the only thing we do with it is extract its raw scalar — `kai_intf(...)`
+# reads the value and keeps no reference — the incref/decref pair cancels.
+# This is exactly Koka's `_borrow` read of a node field in a comparison:
+# `kk_integer_lt_borrow(kx, ky)` reads `ky` from the node without touching RC.
+# Strip the dup so the field read on the rb-tree descent (`kx < kx_node`) is a
+# bare `kai_intf(kai_kx)` instead of `kai_intf(kai_internal_dup(kai_kx))`.
+#
+# Sound for any unboxable scalar: extraction never retains the pointer, so the
+# borrowing read leaves the original owner's count unchanged, and the owner's
+# own drop (arm exit / structural decref) still fires exactly once. The dup
+# would have been net-zero against a matching decref the consumer never issued
+# on a raw scalar — removing both halves is the identity transform Koka makes.
+fn unwrap_perceus_dup_for_borrow(x: Expr) : Expr = match x.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(nm) ->
+      if nm == "__perceus_dup" {
+        match args_ {
+          [inner] -> inner
+          _       -> x
+        }
+      } else { x }
+    _ -> x
+  }
+  _ -> x
+}
+
 fn emit_expr_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
-  match x.mode {
-    MUnboxed -> emit_kind_raw(src, x, cx)
+  # Borrow the scalar: a `__perceus_dup` wrapper around the operand is a
+  # redundant incref for a value we only read-and-extract. Strip it BEFORE the
+  # mode split so it is borrowed whether the dup'd call landed as MUnboxed
+  # (→ emit_kind_raw's ECall fallback) or MBoxed (→ boxed-then-unbox). The
+  # stripped inner keeps the original `.ty`, so the unbox path is unchanged.
+  let xb = unwrap_perceus_dup_for_borrow(x)
+
+  match xb.mode {
+    MUnboxed -> emit_kind_raw(src, xb, cx)
     _ -> {
-      let boxed = emit_expr_boxed(src, x, cx)
-      unbox_boxed_scalar(boxed, x.ty)
+      let boxed = emit_expr_boxed(src, xb, cx)
+      unbox_boxed_scalar(boxed, xb.ty)
     }
   }
 }
