@@ -3482,6 +3482,82 @@ fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVa
   }
 }
 
+# True iff every binder bound by the arm pattern is used EXACTLY ONCE
+# across the rebuild's ctor args — the linearity that makes a borrow-pure
+# (move, no incref) unique branch sound for a non-bijective rebuild. If a
+# binder is used twice, moving it without an incref leaves one use
+# dangling (UAF); if zero times, it leaks. The rb-tree balance rotations
+# are linear (each of lx,kx,vx,rx,ky,vy,ry appears once in the result), so
+# the outer + inner cells move with zero RC traffic — Koka's borrow model.
+# A non-linear arm falls back to the incref-then-old-drop path (correct,
+# just an incref/decref pair per kept child).
+fn rv_arm_is_linear(subs: [Pattern], cargs: [Expr]) : Bool = {
+  let binders = pat_binders_list_local(subs, [])
+  rv_all_used_once(binders, cargs)
+}
+
+fn pat_binders_list_local(ps: [Pattern], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> pat_binders_list_local(rest, pat_binders(p, acc))
+}
+
+fn rv_all_used_once(binders: [String], cargs: [Expr]) : Bool = match binders {
+  [] -> true
+  [nm, ...rest] ->
+    if name_is_unused(nm) { rv_all_used_once(rest, cargs) }
+    else if rv_count_uses_args(nm, cargs, 0) == 1 { rv_all_used_once(rest, cargs) }
+    else { false }
+}
+
+# Count bare `EVar(nm)` uses of `nm` across a list of expressions.
+fn rv_count_uses_args(nm: String, es: [Expr], acc: Int) : Int = match es {
+  []          -> acc
+  [e, ...rest] -> rv_count_uses_args(nm, rest, acc + rv_count_uses(nm, e))
+}
+
+fn rv_count_uses(nm: String, e: Expr) : Int = match e.kind {
+  EVar(u)            -> if u == nm { 1 } else { 0 }
+  ECall(f, xs)       -> rv_count_uses(nm, f) + rv_count_uses_args(nm, xs, 0)
+  EIf(c, t, oe)      -> rv_count_uses(nm, c) + rv_count_uses(nm, t) +
+                        (match oe { None -> 0 Some(x) -> rv_count_uses(nm, x) })
+  EMatch(s, arms)    -> rv_count_uses(nm, s) + rv_count_uses_arms(nm, arms, 0)
+  EBlock(stmts, tl)  -> rv_count_uses_stmts(nm, stmts, 0) +
+                        (match tl { None -> 0 Some(x) -> rv_count_uses(nm, x) })
+  EBinop(_, a, b)    -> rv_count_uses(nm, a) + rv_count_uses(nm, b)
+  EUnop(_, x)        -> rv_count_uses(nm, x)
+  EField(x, _)       -> rv_count_uses(nm, x)
+  EIndex(a, b)       -> rv_count_uses(nm, a) + rv_count_uses(nm, b)
+  ERecordLit(_, fis) -> rv_count_uses_fields(nm, fis, 0)
+  EList(els)         -> rv_count_uses_elems(nm, els, 0)
+  _                  -> 0
+}
+fn rv_count_uses_arms(nm: String, arms: [Arm], acc: Int) : Int = match arms {
+  []          -> acc
+  [a, ...rest] -> match a { Arm(_, _, b) -> rv_count_uses_arms(nm, rest, acc + rv_count_uses(nm, b)) }
+}
+fn rv_count_uses_stmts(nm: String, ss: [Stmt], acc: Int) : Int = match ss {
+  []          -> acc
+  [s, ...rest] -> rv_count_uses_stmts(nm, rest, acc + rv_count_uses_stmt(nm, s))
+}
+fn rv_count_uses_stmt(nm: String, s: Stmt) : Int = match s {
+  SLet(_, _, e)       -> rv_count_uses(nm, e)
+  SVar(_, _, e, _, _) -> rv_count_uses(nm, e)
+  SExprStmt(e)        -> rv_count_uses(nm, e)
+  _                   -> 0
+}
+fn rv_count_uses_fields(nm: String, fis: [FieldInit], acc: Int) : Int = match fis {
+  []          -> acc
+  [fi, ...rest] -> match fi { FI(_, v) -> rv_count_uses_fields(nm, rest, acc + rv_count_uses(nm, v)) }
+}
+fn rv_count_uses_elems(nm: String, els: [ListElem], acc: Int) : Int = match els {
+  []          -> acc
+  [el, ...rest] -> rv_count_uses_elems(nm, rest, acc + rv_count_uses_elem(nm, el))
+}
+fn rv_count_uses_elem(nm: String, el: ListElem) : Int = match el {
+  ElPlain(e)  -> rv_count_uses(nm, e)
+  ElSpread(e) -> rv_count_uses(nm, e)
+}
+
 # Emit the 1:1 variant reuse arm, mirroring emit_match_arm_reuse_cons.
 # Unique branch: borrow-bind each slot (ptr: no incref; prim: raw .i64/.r
 # copy), eval the new ctor args (which consume the borrowed binds via the
@@ -3505,7 +3581,18 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # instead of aliasing. A bijective (flat) rebuild keeps the cheap borrow
       # binds. Detected structurally: any carg is a ctor-call with >0 args.
       let nonbij = rv_any_nested_ctor(cargs)
-      let borrow_binds = rv_slot_binds(src, subs, tys, 0, not nonbij, cx)
+      # Borrow-pure unique branch (Koka move model): when the rebuild is
+      # LINEAR — every bound child used exactly once in the result — the
+      # flat children of the outer cell MOVE (no incref) and the outer
+      # cell's old slots are NOT decref'd (transferred). This elides the
+      # incref/decref pair per kept child that the non-linear path needs.
+      # A non-linear non-bijective rebuild keeps the safe owned path
+      # (incref the kept children, decref the old slots before overwrite).
+      let lin = rv_arm_is_linear(subs, cargs)
+      let borrow_pure = nonbij and lin
+      # unique-branch binds: borrow (move) when bijective OR borrow-pure;
+      # owned (incref) only on the non-linear non-bijective path.
+      let borrow_binds = rv_slot_binds(src, subs, tys, 0, (not nonbij) or borrow_pure, cx)
       let owned_binds  = rv_slot_binds(src, subs, tys, 0, false, cx)
       # The new-ctor-arg expressions reference the pattern binders
       # (`kai_<nm>`), so they MUST be emitted under `arm_cx` (lcs
@@ -3522,7 +3609,11 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # The temps are computed first (they read the now-owned children), so the
       # decref is safe to emit before the overwrites. A bijective rebuild
       # transfers (borrow binds) and must NOT decref.
-      let old_drops = if nonbij { rv_old_slot_drops(subs, tys, 0, cx.enums) } else { "" }
+      # Borrow-pure: every flat child MOVED, so the outer cell's old ptr
+      # slots are transferred, not owned — NO decref (else double-free).
+      # Non-linear non-bijective: children were incref'd, so the old slots
+      # must be decref'd before overwrite. Bijective: borrow-transfer, no drop.
+      let old_drops = if nonbij and not borrow_pure { rv_old_slot_drops(subs, tys, 0, cx.enums) } else { "" }
       # Second reuse token (Koka ParcReuse 2-of-3 rotation reuse): the
       # first nested-pattern slot deconstructs an INNER cell. If it is
       # unique, donate it to the first same-arity sub-ctor of the rebuilt
