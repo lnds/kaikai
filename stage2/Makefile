@@ -71,7 +71,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-trace test-trace-asan test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-packages
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-trace test-trace-asan test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-packages
 
 all: $(TARGET)
 
@@ -1055,6 +1055,34 @@ test-issue-501: $(TARGET) build
 	    && echo "issue-501 OK $$name" \
 	    || { echo "issue-501 DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
+
+# Issue #743 — a generic effect op's return payload must bind to its
+# row's concrete ty_args. Positive: `b.id` on a `Repo[Box,_]` payload
+# type-checks against Box and runs `found`. Negative (the Tier 1
+# escape): `b.zzz` (nonexistent field) must now be REJECTED at compile
+# time on Box, instead of compiling silently with a free tyvar.
+test-issue-743: $(TARGET) build
+	@set -e; \
+	pos=issue_743_generic_effect_payload_field; \
+	./$(TARGET) ../examples/effects/$$pos.kai > build/$$pos.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.c -o build/$$pos-c $(LDLIBS_M); \
+	./build/$$pos-c > build/$$pos.out; \
+	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
+	  && echo "issue-743 OK $$pos (C)" \
+	  || { echo "issue-743 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
+	./$(TARGET) --emit=llvm ../examples/effects/$$pos.kai > build/$$pos.ll; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.ll ../stage0/runtime_llvm.c -o build/$$pos-llvm 2>/dev/null $(LDLIBS_M); \
+	./build/$$pos-llvm > build/$$pos-llvm.out; \
+	diff -q ../examples/effects/$$pos.out.expected build/$$pos-llvm.out > /dev/null \
+	  && echo "issue-743 OK $$pos (LLVM)" \
+	  || { echo "issue-743 DIFF $$pos (LLVM)"; diff ../examples/effects/$$pos.out.expected build/$$pos-llvm.out; exit 1; }; \
+	neg=issue_743_generic_effect_payload_bad_field; \
+	./$(TARGET) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
+	  { echo "issue-743 FAIL $$neg (Tier 1 escape: bad field accepted)"; exit 1; } \
+	  || true; \
+	grep -qF "$$(cat ../examples/effects/$$neg.err.expected)" build/$$neg.err \
+	  && echo "issue-743 OK $$neg (rejected on Box)" \
+	  || { echo "issue-743 FAIL $$neg (wrong diagnostic)"; cat build/$$neg.err; exit 1; }
 
 # Issue #107 — ASAN+UBSan sibling for the Signal trap fixture. The
 # Signal handler manipulates a sigset_t static, allocates a Sig
@@ -4773,7 +4801,7 @@ COSTLY_JOBS ?= 5
 test-costly-parallel: $(TARGET) build
 	@$(MAKE) -j$(COSTLY_JOBS) test-tokens test-ast test-types test-env test-check
 
-test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
