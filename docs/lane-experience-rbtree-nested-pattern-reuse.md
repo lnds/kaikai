@@ -1,7 +1,34 @@
 # Lane retro — nested-pattern reuse-in-place (rb-tree balance, Koka 2-of-3)
 
 Commits (on `main`): `f92110f` (outer cell), `f7e5bd6` (RC trace counters),
-`5ef831a` (inner cell). Base: `83f5705` (Koka-packed 8B header, node 48B).
+`5ef831a` (inner cell), `093ebf4` (this retro), `8770140` (offsetof UB fix),
+`8fbd207` (regression fixture), `e345393` (borrow-pure unique branch).
+Base: `83f5705` (Koka-packed 8B header, node 48B).
+
+## Final state (all follow-ups from the first draft closed)
+
+The first draft of this retro listed three follow-ups; two are now closed
+in the same lane:
+
+- **Borrow-pure on the outer cell (was follow-up #1) — DONE (`e345393`).**
+  The unique branch now MOVES linear children (no incref) instead of
+  incref-then-old-drop. Gated on `rv_arm_is_linear` (every binder used
+  exactly once in the rebuild — true for rb-tree rotations, false-safe
+  otherwise). Measured: incref 23.4M → 13.3M (−43%), wall 0.63s → 0.54s.
+  This is Koka's move model; a non-linear rebuild keeps the safe owned path.
+- **Tiered regression fixture (was follow-up #2) — DONE (`8fbd207`).**
+  `nested_pattern_reuse_balance.kai` (balance rotation WITH color, golden =
+  post-insert node count) wired into `test-perceus-nested-reuse` + ASAN.
+- **Offsetof UB (surfaced while wiring the ASAN fixture) — DONE (`8770140`).**
+  `kai_var_block_size` used `(KaiValue*)1` member access (UBSan
+  misaligned-address on every variant alloc, introduced by base `83f5705`);
+  replaced with `offsetof(KaiValue, as.var_slots)`. Was blocking the ASAN
+  tier for ALL variant fixtures (gap3 included), not just this lane's.
+
+Cumulative result: variant allocs 7.61M → 6.30M (−17%), incref 22.7M →
+13.3M (−43%), wall best-of-5 0.70s → 0.54s (−23%). All gates green
+(tier0 selfhost-deterministic, full 1M + 500-insert stress clean under
+ASAN+UBSan, demos 34/34).
 
 ## Scope as planned vs as shipped
 
