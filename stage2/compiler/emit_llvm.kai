@@ -1621,8 +1621,8 @@ fn llvm_emit_call_raw_or_box(e: LlvmEmit, x: Expr, callee: Expr, args_: [Expr]) 
     # the boxed path: emit the call boxed and unbox per `x.ty` (a no-op when
     # x.ty is itself boxed). Mirror of C, where a boxed-return UFn call is
     # never routed through the raw-return emitter.
-    Some(US(pts, rt, _)) -> if ty_is_unboxable_t(rt) {
-      llvm_emit_ufn_call_raw(e, llvm_raw_call_sym(e.fns, callee), pts, rt, args_)
+    Some(US(pts, rt, mask)) -> if ty_is_unboxable_t(rt) {
+      llvm_emit_ufn_call_raw(e, llvm_raw_call_sym(e.fns, callee), pts, rt, mask, args_)
     } else {
       let eb = llvm_emit_expr_boxed(e, x)
       llvm_unbox_value(eb, eb.last_val, x.ty)
@@ -2796,26 +2796,49 @@ fn llvm_format_args_raw(regs: [String], pts: [Ty]) : String {
   }
 }
 
+# issue #706/#718 mixed-param fix — format a UFn call's argument list
+# per the raw `mask`: a raw param's arg is typed `iN`/`double`, a boxed
+# param's arg is typed `%KaiValue*`. The callee's signature is mixed
+# (`@kai_rep(i64, i64, %KaiValue*)`), so the call types must match it
+# per-param; formatting every arg `iN` (the old all-raw path) passed a
+# String pointer as `i64` and segfaulted the callee.
+fn llvm_format_args_masked(regs: [String], pts: [Ty], mask: [Bool]) : String {
+  match regs {
+    [] -> ""
+    [x] -> concat_all([llvm_arg_ir_masked(pts, mask), " ", x])
+    [x, ...rest] -> {
+      let trest = pts_tail(pts)
+      let mrest = mask_tail(mask)
+      concat_all([llvm_arg_ir_masked(pts, mask), " ", x, ", ",
+                  llvm_format_args_masked(rest, trest, mrest)])
+    }
+  }
+}
+
+fn llvm_arg_ir_masked(pts: [Ty], mask: [Bool]) : String =
+  if mask_head_or_true(mask) { pts_head_ir(pts) } else { "%KaiValue*" }
+
 # Issue #718 — emit a UFn call in a BOXED context: evaluate args as raw
 # scalars coerced to the callee's slot tys, call the raw scalar entry
 # (`call iN @kai_<sym>(iN ...)`), then box the raw result so the caller
 # still sees a `%KaiValue*`. Mirror of C's `emit_ufn_boxed_call`
 # (`box_wrap(rt, kai_<sym>(raw_args))`).
-fn llvm_emit_ufn_call_boxed(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Expr]) : LlvmEmit / Console {
-  # Raw-args call. When `rt` is unboxable the entry returns a raw scalar
+fn llvm_emit_ufn_call_boxed(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, mask: [Bool], xs: [Expr]) : LlvmEmit / Console {
+  # Mixed-args call. When `rt` is unboxable the entry returns a raw scalar
   # that we box; when `rt` is boxed (`describe : Int -> String`) the entry
   # already returns `%KaiValue*` — call it with that return type and use it
   # directly. Re-boxing the boxed return (`kaix_int(<String ptr>)`) printed
   # the pointer as an int. Mirror of C's emit_ufn_boxed_call, which only
-  # box-wraps an unboxable return.
+  # box-wraps an unboxable return. Args are evaluated + typed per `mask`
+  # so a boxed param (mixed UFn) is passed `%KaiValue*`, not a coerced i64.
   if ty_is_unboxable_t(rt) {
-    let raw = llvm_emit_ufn_call_raw(e, sym, pts, rt, xs)
+    let raw = llvm_emit_ufn_call_raw(e, sym, pts, rt, mask, xs)
     llvm_box_wrap_value(raw.e, raw.reg, Some(rt))
   } else {
-    let ra = llvm_emit_args_raw(e, xs, pts, [])
+    let ra = llvm_emit_args_mixed(e, xs, pts, mask, [])
     let r = llvm_fresh_reg(ra.st)
     let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                            llvm_format_args_raw(ra.regs, pts), ")\n"])
+                            llvm_format_args_masked(ra.regs, pts, mask), ")\n"])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
   }
 }
@@ -2826,12 +2849,12 @@ fn llvm_emit_ufn_call_boxed(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Ex
 # on top) and by the raw-context ECall arm in `llvm_emit_kind_raw`,
 # where the consumer already wants a raw scalar (no round-trip through
 # `kaix_int` / `kaix_to_int`). Mirror of C's `emit_expr_raw` ECall arm.
-fn llvm_emit_ufn_call_raw(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, xs: [Expr]) : LlvmRaw / Console {
-  let ra = llvm_emit_args_raw(e, xs, pts, [])
+fn llvm_emit_ufn_call_raw(e: LlvmEmit, sym: String, pts: [Ty], rt: Ty, mask: [Bool], xs: [Expr]) : LlvmRaw / Console {
+  let ra = llvm_emit_args_mixed(e, xs, pts, mask, [])
   let ret_ir = llvm_raw_ir_type_t(rt)
   let r = llvm_fresh_reg(ra.st)
   let instr = concat_all(["  ", r.reg, " = call ", ret_ir, " ", sym, "(",
-                          llvm_format_args_raw(ra.regs, pts), ")\n"])
+                          llvm_format_args_masked(ra.regs, pts, mask), ")\n"])
   let e1 = llvm_append_body(r.e, instr)
   LlvmRaw { e: e1, reg: r.reg, ty: Some(rt) }
 }
@@ -3050,8 +3073,8 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
                   # find returned None), so this only fires for top-level
                   # user UFns.
                   match llvm_ufn_sig_of_callee(e.fns, nm) {
-                    Some(US(pts, rt, _)) ->
-                      llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym_of_callee(e.fns, nm)), pts, rt, xs)
+                    Some(US(pts, rt, mask)) ->
+                      llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym_of_callee(e.fns, nm)), pts, rt, mask, xs)
                     None -> {
                       let ra = llvm_emit_args(e, xs, [])
                       # m6.2 v2: route the bare-name callee through the
@@ -3090,8 +3113,8 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
           # Issue #718 — qualified UFn call: raw args + box the result.
           # Mirror of C's `emit_ufn_boxed_call` EModCall arm.
           match lookup_ufn_sig(e.fns, fname, Some(mod)) {
-            Some(US(pts, rt, _)) ->
-              llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym(fname, Some(mod))), pts, rt, xs)
+            Some(US(pts, rt, mask)) ->
+              llvm_emit_ufn_call_boxed(e, string_concat("@kai_", c_sym(fname, Some(mod))), pts, rt, mask, xs)
             None -> {
               let ra = llvm_emit_args(e, xs, [])
               # m6.2 v2: qualified call `mod.fname(args)`. Mint the prefixed
@@ -4507,40 +4530,79 @@ fn llvm_init_locals_from_params(ps: [Param]) : [LlvmLocal] {
 # `emit_param_list_unboxed`. `ps` and `pts` are co-indexed (the
 # classifier guarantees `len(pts) == len(params)`); a short `pts`
 # defensively falls back to the param's own declared ty.
-fn llvm_param_list_unboxed_loop(ps: [Param], pts: [Ty], acc: String) : String {
+# issue #706/#718 mixed-param fix — a UFn signature can mix raw and
+# boxed params (`rep(i: Int, n: Int, acc: String)`). The `mask` (from
+# `US(pts, rt, mask)`) says which params lower raw. A raw param emits
+# `<scalar> %kair_<p>`; a boxed param emits `%KaiValue* %p_<p>`, exactly
+# as the C backend's `emit_param_list_masked` splits `kair_` vs `kai_`.
+# Without this every param took `llvm_raw_ir_type_t`, which returns
+# `i64` for a boxed type (String/list/variant) — the function then
+# received a `%KaiValue*` argument typed as `i64` and read it as a raw
+# scalar (issue: `rep` printing the String pointer as the int `2`).
+fn llvm_param_list_unboxed_loop(ps: [Param], pts: [Ty], mask: [Bool], acc: String) : String {
   match ps {
     [] -> acc
     [p, ...rest] -> {
       let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
       let trest = pts_tail(pts)
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
       let sep = if string_length(acc) == 0 { "" } else { ", " }
-      let piece = concat_all([sep, llvm_raw_ir_type_t(pty), " %kair_", p.pname])
-      llvm_param_list_unboxed_loop(rest, trest, string_concat(acc, piece))
+      let piece = if is_raw {
+        concat_all([sep, llvm_raw_ir_type_t(pty), " %kair_", p.pname])
+      } else {
+        concat_all([sep, "%KaiValue* %p_", p.pname])
+      }
+      llvm_param_list_unboxed_loop(rest, trest, mrest, string_concat(acc, piece))
     }
   }
 }
 
-fn llvm_param_list_unboxed(ps: [Param], pts: [Ty]) : String = llvm_param_list_unboxed_loop(ps, pts, "")
+fn llvm_param_list_unboxed(ps: [Param], pts: [Ty], mask: [Bool]) : String = llvm_param_list_unboxed_loop(ps, pts, mask, "")
+
+# Head/tail accessors for the raw mask, co-indexed with `ps`/`pts`.
+# Default `true` (raw) when the mask runs short — preserves the
+# all-raw behaviour for callers that pass `[]`.
+fn mask_head_or_true(mask: [Bool]) : Bool {
+  match mask {
+    [m, ..._] -> m
+    []        -> true
+  }
+}
+fn mask_tail(mask: [Bool]) : [Bool] {
+  match mask {
+    [_, ...r] -> r
+    []        -> []
+  }
+}
 
 # Issue #718 — TCO raw param list for a UFn body that carries a
 # self-tail-call sentinel. Names the incoming args `%pargr_<name>`;
 # the per-iteration reload at the loop head re-mints `%kair_<name>`
 # (the register the body reads), mirroring the boxed TCO path's
 # `%parg_<name>` / `%p_<name>` split.
-fn llvm_param_list_unboxed_tcrec_loop(ps: [Param], pts: [Ty], acc: String) : String {
+fn llvm_param_list_unboxed_tcrec_loop(ps: [Param], pts: [Ty], mask: [Bool], acc: String) : String {
   match ps {
     [] -> acc
     [p, ...rest] -> {
       let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
       let trest = pts_tail(pts)
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
       let sep = if string_length(acc) == 0 { "" } else { ", " }
-      let piece = concat_all([sep, llvm_raw_ir_type_t(pty), " %pargr_", p.pname])
-      llvm_param_list_unboxed_tcrec_loop(rest, trest, string_concat(acc, piece))
+      # Mixed-param: raw incoming arg is `iN %pargr_<p>`, boxed incoming
+      # arg is `%KaiValue* %parg_<p>` (the boxed TCO prologue's name).
+      let piece = if is_raw {
+        concat_all([sep, llvm_raw_ir_type_t(pty), " %pargr_", p.pname])
+      } else {
+        concat_all([sep, "%KaiValue* %parg_", p.pname])
+      }
+      llvm_param_list_unboxed_tcrec_loop(rest, trest, mrest, string_concat(acc, piece))
     }
   }
 }
 
-fn llvm_param_list_unboxed_tcrec(ps: [Param], pts: [Ty]) : String = llvm_param_list_unboxed_tcrec_loop(ps, pts, "")
+fn llvm_param_list_unboxed_tcrec(ps: [Param], pts: [Ty], mask: [Bool]) : String = llvm_param_list_unboxed_tcrec_loop(ps, pts, mask, "")
 
 # Issue #718 — seed the local-name scope of a UFn body with each
 # param as an `LRaw(name, "%kair_<name>", ty)`. The body's `EVar`
@@ -4548,14 +4610,22 @@ fn llvm_param_list_unboxed_tcrec(ps: [Param], pts: [Ty]) : String = llvm_param_l
 # `llvm_raw_local_find` (issue #87's raw-local mechanism) rather than
 # to a boxed `%p_<name>`. Mirror of C's `ufn_param_env` seeding the
 # raw `kair_<name>` aliases.
-fn llvm_init_raw_locals_from_params(ps: [Param], pts: [Ty]) : [LlvmLocal] {
+fn llvm_init_raw_locals_from_params(ps: [Param], pts: [Ty], mask: [Bool]) : [LlvmLocal] {
   match ps {
     [] -> []
     [p, ...rest] -> {
       let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
       let trest = pts_tail(pts)
-      [LRaw(p.pname, string_concat("%kair_", p.pname), pty),
-       ...llvm_init_raw_locals_from_params(rest, trest)]
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      # issue #706/#718 mixed-param fix — a boxed param in a UFn (the
+      # `acc: String` in `rep(i, n, acc)`) seeds as a normal boxed local
+      # (`%p_<p>`), NOT an LRaw. Seeding it raw made the body read the
+      # `%KaiValue*` argument as an `i64` scalar. Mirror of the C
+      # backend's `kair_` (raw) vs `kai_` (boxed) param-name split.
+      let here = if is_raw { LRaw(p.pname, string_concat("%kair_", p.pname), pty) }
+                 else { LL(p.pname, string_concat("%p_", p.pname)) }
+      [here, ...llvm_init_raw_locals_from_params(rest, trest, mrest)]
     }
   }
 }
@@ -5451,9 +5521,9 @@ fn llvm_emit_thunk(nm: String, arity: Int, opt_sig: Option[UFnSig]) : String {
     # `%ar<i>` scalar (and decref the boxed slot, mirroring C's
     # `kai_decref(args[i])`), call the raw entry, box the raw result.
     # Mirror of C's `emit_fn_thunk` `Some(US(pts, rt, _))` branch.
-    Some(US(pts, rt, _)) -> {
-      let unbox_lines = llvm_thunk_unbox_args(0, pts, "")
-      let raw_args = llvm_thunk_raw_call_args(0, pts, "")
+    Some(US(pts, rt, mask)) -> {
+      let unbox_lines = llvm_thunk_unbox_args_masked(0, pts, mask, "")
+      let raw_args = llvm_thunk_raw_call_args_masked(0, pts, mask, "")
       # The mixed-signature C entry (`@kai_<nm>`) returns a RAW scalar only
       # when `rt` is unboxable; for a boxed return type (String, list,
       # variant — e.g. `fizzbuzz : Int -> String`) it already returns a
@@ -5504,30 +5574,52 @@ fn llvm_emit_thunk(nm: String, arity: Int, opt_sig: Option[UFnSig]) : String {
 # thunk takes ownership of each arg, mirroring C's
 # `kai_decref(args[i])`). The decref result register is discarded
 # (`%adrop<i>` keeps the SSA name unique).
-fn llvm_thunk_unbox_args(i: Int, pts: [Ty], acc: String) : String {
+fn llvm_thunk_unbox_args(i: Int, pts: [Ty], acc: String) : String =
+  llvm_thunk_unbox_args_masked(i, pts, [], acc)
+
+# issue #706/#718 mixed-param fix — a raw param unboxes `%a<i>` into
+# `%ar<i>` and decrefs the boxed slot (thunk takes ownership); a BOXED
+# param (mixed UFn, the `acc: String` in `rep`) is left as the loaded
+# `%a<i>` and is NOT decreffed — ownership passes to the callee, exactly
+# as the C thunk does (`KaiValue *kai_acc = args[2];` with no decref).
+fn llvm_thunk_unbox_args_masked(i: Int, pts: [Ty], mask: [Bool], acc: String) : String {
   match pts {
     [] -> acc
     [t, ...rest] -> {
       let ix = int_to_string(i)
-      let unbox_sym = llvm_unbox_helper_t(t)
-      let raw_ir = llvm_raw_ir_type_t(t)
-      let line = concat_all([
-        "  %ar", ix, " = call ", raw_ir, " ", unbox_sym, "(%KaiValue* %a", ix, ")\n",
-        "  %adrop", ix, " = call %KaiValue* @kaix_internal_drop(%KaiValue* %a", ix, ")\n"
-      ])
-      llvm_thunk_unbox_args(i + 1, rest, string_concat(acc, line))
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      let line = if is_raw {
+        let unbox_sym = llvm_unbox_helper_t(t)
+        let raw_ir = llvm_raw_ir_type_t(t)
+        concat_all([
+          "  %ar", ix, " = call ", raw_ir, " ", unbox_sym, "(%KaiValue* %a", ix, ")\n",
+          "  %adrop", ix, " = call %KaiValue* @kaix_internal_drop(%KaiValue* %a", ix, ")\n"
+        ])
+      } else { "" }
+      llvm_thunk_unbox_args_masked(i + 1, rest, mrest, string_concat(acc, line))
     }
   }
 }
 
-fn llvm_thunk_raw_call_args(i: Int, pts: [Ty], acc: String) : String {
+fn llvm_thunk_raw_call_args(i: Int, pts: [Ty], acc: String) : String =
+  llvm_thunk_raw_call_args_masked(i, pts, [], acc)
+
+# Mixed-param: a raw param is passed `<scalar> %ar<i>`, a boxed param is
+# passed `%KaiValue* %a<i>` (the still-boxed loaded arg).
+fn llvm_thunk_raw_call_args_masked(i: Int, pts: [Ty], mask: [Bool], acc: String) : String {
   match pts {
     [] -> acc
     [t, ...rest] -> {
       let sep = if i == 0 { "" } else { ", " }
-      let raw_ir = llvm_raw_ir_type_t(t)
-      let piece = concat_all([sep, raw_ir, " %ar", int_to_string(i)])
-      llvm_thunk_raw_call_args(i + 1, rest, string_concat(acc, piece))
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      let piece = if is_raw {
+        concat_all([sep, llvm_raw_ir_type_t(t), " %ar", int_to_string(i)])
+      } else {
+        concat_all([sep, "%KaiValue* %a", int_to_string(i)])
+      }
+      llvm_thunk_raw_call_args_masked(i + 1, rest, mrest, string_concat(acc, piece))
     }
   }
 }
@@ -5616,25 +5708,24 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
       let has_sentinel = llvm_body_has_sentinel(body)
       match opt_sig {
         # --- UFn: raw scalar calling convention (issue #718) ---
-        Some(US(pts, rt, _)) -> {
-          # Params seed the body's scope as raw `LRaw(name, %kair_<n>, ty)`
-          # so EVar reads lower to the raw SSA register, not a boxed
-          # `%p_<n>`. Mirror of C's `ufn_param_env`.
-          let locals0 = llvm_init_raw_locals_from_params(ps, pts)
+        Some(US(pts, rt, mask)) -> {
+          # Params seed the body's scope per the raw `mask`: a raw param
+          # is `LRaw(name, %kair_<n>, ty)`, a boxed param (mixed UFn, e.g.
+          # `acc: String` in `rep(i, n, acc)`) is a normal boxed `LL`.
+          # Mirror of C's `ufn_param_env` / `emit_param_list_masked`.
+          let locals0 = llvm_init_raw_locals_from_params(ps, pts, mask)
           let first_label = if has_sentinel { "tcrec.loop" } else { "entry" }
           let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                               globals: "", body: "",
                               last_val: "", cur_label: first_label,
                               locals: locals0, fns: body_fns, vars_: vs, lams: lams,
                               op_offsets: oo, cls: cls, regions: regions, in_region: false }
-          # TCO raw prologue: alloca `iN` slot per param, store the
-          # incoming `%pargr_<n>`, branch into the loop header, reload as
-          # `%kair_<n>`. No box, no RC — raw scalars carry no reference
-          # count (mirror of C `tcrec_emit_goto`'s `Some(US(...))` branch,
-          # which emits zero drops).
+          # TCO prologue: a raw param allocas an `iN` slot fed by
+          # `%pargr_<n>` (no RC); a boxed param allocas a `%KaiValue*`
+          # slot fed by `%parg_<n>`. The back-edge mirrors the split.
           let e_pro = if has_sentinel {
-            let e_slots = llvm_emit_tcrec_slots_raw(e0, ps, pts)
-            llvm_emit_tcrec_loop_header_raw(e_slots, ps, pts)
+            let e_slots = llvm_emit_tcrec_slots_raw(e0, ps, pts, mask)
+            llvm_emit_tcrec_loop_header_raw(e_slots, ps, pts, mask)
           } else { e0 }
           # A mixed signature has RAW params but the RETURN may be boxed
           # (`fizzbuzz : Int -> String`). When `rt` is unboxable, emit the
@@ -5644,8 +5735,8 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
           # `i64` while the thunk called it as `%KaiValue*`, a type mismatch
           # that segfaulted. Mirror of C: the entry's C return type follows
           # `rt`, only the params are unboxed.
-          let param_list = if has_sentinel { llvm_param_list_unboxed_tcrec(ps, pts) }
-                           else { llvm_param_list_unboxed(ps, pts) }
+          let param_list = if has_sentinel { llvm_param_list_unboxed_tcrec(ps, pts, mask) }
+                           else { llvm_param_list_unboxed(ps, pts, mask) }
           if ty_is_unboxable_t(rt) {
             let rret = llvm_emit_expr_raw(e_pro, body)
             let e1 = rret.e
@@ -6611,20 +6702,30 @@ fn llvm_emit_tcrec_slots(e: LlvmEmit, ps: [Param]) : LlvmEmit {
 # Issue #718 — TCO raw prologue for a UFn. Each slot is an `alloca iN`
 # storing the incoming `%pargr_<name>` scalar; no box, no RC. Mirror
 # of `llvm_emit_tcrec_slots` but for the raw calling convention.
-fn llvm_emit_tcrec_slots_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+fn llvm_emit_tcrec_slots_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) : LlvmEmit {
   match ps {
     [] -> llvm_append_body(e, "  br label %tcrec.loop\n")
     [p, ...rest] -> {
       let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
       let trest = pts_tail(pts)
-      let ir = llvm_raw_ir_type_t(pty)
-      let slot = string_concat("%pslotr_", p.pname)
-      let arg  = string_concat("%pargr_", p.pname)
-      let e1 = llvm_append_body(e, concat_all([
-        "  ", slot, " = alloca ", ir, "\n",
-        "  store ", ir, " ", arg, ", ", ir, "* ", slot, "\n"
-      ]))
-      llvm_emit_tcrec_slots_raw(e1, rest, trest)
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      # Mixed-param: a raw slot is `alloca iN` fed by `%pargr_<p>`; a
+      # boxed slot is `alloca %KaiValue*` fed by `%parg_<p>` (the boxed
+      # prologue's names), so the boxed param round-trips as a pointer.
+      let e1 = if is_raw {
+        let ir = llvm_raw_ir_type_t(pty)
+        llvm_append_body(e, concat_all([
+          "  %pslotr_", p.pname, " = alloca ", ir, "\n",
+          "  store ", ir, " %pargr_", p.pname, ", ", ir, "* %pslotr_", p.pname, "\n"
+        ]))
+      } else {
+        llvm_append_body(e, concat_all([
+          "  %pslot_", p.pname, " = alloca %KaiValue*\n",
+          "  store %KaiValue* %parg_", p.pname, ", %KaiValue** %pslot_", p.pname, "\n"
+        ]))
+      }
+      llvm_emit_tcrec_slots_raw(e1, rest, trest, mrest)
     }
   }
 }
@@ -6658,24 +6759,33 @@ fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
 # Issue #718 — TCO raw loop header for a UFn. Reloads each param slot
 # as `%kair_<name>` (the raw register the body reads). Mirror of
 # `llvm_emit_tcrec_loop_header` for the raw calling convention.
-fn llvm_emit_tcrec_loop_header_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+fn llvm_emit_tcrec_loop_header_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) : LlvmEmit {
   let e0 = llvm_open_block(e, "tcrec.loop")
-  llvm_emit_tcrec_reloads_raw(e0, ps, pts)
+  llvm_emit_tcrec_reloads_raw(e0, ps, pts, mask)
 }
 
-fn llvm_emit_tcrec_reloads_raw(e: LlvmEmit, ps: [Param], pts: [Ty]) : LlvmEmit {
+fn llvm_emit_tcrec_reloads_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) : LlvmEmit {
   match ps {
     [] -> e
     [p, ...rest] -> {
       let pty = pts_head_or(pts, llvm_param_ty_or_int(p))
       let trest = pts_tail(pts)
-      let ir = llvm_raw_ir_type_t(pty)
-      let slot = string_concat("%pslotr_", p.pname)
-      let reg  = string_concat("%kair_", p.pname)
-      let e1 = llvm_append_body(e, concat_all([
-        "  ", reg, " = load ", ir, ", ", ir, "* ", slot, "\n"
-      ]))
-      llvm_emit_tcrec_reloads_raw(e1, rest, trest)
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      # Mixed-param: a raw param reloads into `%kair_<p>` (iN); a boxed
+      # param reloads into `%p_<p>` (%KaiValue*) — the exact registers
+      # the seeded LRaw / LL locals point the body's EVar reads at.
+      let e1 = if is_raw {
+        let ir = llvm_raw_ir_type_t(pty)
+        llvm_append_body(e, concat_all([
+          "  %kair_", p.pname, " = load ", ir, ", ", ir, "* %pslotr_", p.pname, "\n"
+        ]))
+      } else {
+        llvm_append_body(e, concat_all([
+          "  %p_", p.pname, " = load %KaiValue*, %KaiValue** %pslot_", p.pname, "\n"
+        ]))
+      }
+      llvm_emit_tcrec_reloads_raw(e1, rest, trest, mrest)
     }
   }
 }
@@ -6717,7 +6827,7 @@ fn llvm_emit_tcrec_goto(e: LlvmEmit, c_sym: String, dropmask: Int,
   # branch (emit_c.kai:9770), which likewise discards the dropmask and
   # rebinds raw. The boxed back-edge (`None` below) is unchanged.
   match llvm_lookup_ufn_by_csym(e.fns, c_sym) {
-    Some(US(pts, _, _)) -> llvm_emit_tcrec_goto_raw(e, pnames, pts, xs)
+    Some(US(pts, _, mask)) -> llvm_emit_tcrec_goto_raw(e, pnames, pts, mask, dropmask, xs)
     None -> {
       # 1. evaluate every new arg into a temp register (in order).
       let ra = llvm_emit_args(e, xs, [])
@@ -6738,17 +6848,23 @@ fn llvm_emit_tcrec_goto(e: LlvmEmit, c_sym: String, dropmask: Int,
   }
 }
 
-# Issue #718 — raw back-edge for a UFn self-tail-call. Evaluates each
-# new arg as a raw scalar (`llvm_emit_expr_raw`, coercing the slot's
-# `iN` ty), stores into the `%pslotr_<name>` slots, and branches back.
-# No drops: raw scalars have no reference count, exactly as C emits
-# zero drops for a UFn back-edge. Args are evaluated into temps BEFORE
-# any store fires so a new arg that reads an old param value (e.g.
-# `loop(n-1, acc+1)`) sees the pre-iteration value (mirror of C's
-# `tcrec_emit_arg_lets_raw` decoupling).
-fn llvm_emit_tcrec_goto_raw(e: LlvmEmit, pnames: [String], pts: [Ty], xs: [Expr]) : LlvmEmit / Console {
-  let ra = llvm_emit_args_raw(e, xs, pts, [])
-  let e_stores = llvm_emit_tcrec_stores_raw(ra.st, pnames, pts, ra.regs, 0)
+# Issue #706/#718 — back-edge for a UFn self-tail-call, now handling a
+# MIXED param signature (raw `i,n` + boxed `acc`). Each new arg is
+# evaluated into a temp BEFORE any store fires (so an arg reading an
+# old param value sees the pre-iteration value), then:
+#   - raw param  → store the `iN` temp into `%pslotr_<p>`, no RC.
+#   - boxed param → drop the outgoing slot value per the C dropmask
+#     (the body's borrow-reads did not consume it; the dropmask was
+#     computed on the boxed Perceus model and correctly covers the
+#     boxed params of a mixed UFn — exactly the `None` boxed back-edge's
+#     rule), then store the `%KaiValue*` temp into `%pslot_<p>`.
+# This is the per-param union of the old all-raw `goto_raw` and the
+# all-boxed `None` back-edge, dispatched by `mask`.
+fn llvm_emit_tcrec_goto_raw(e: LlvmEmit, pnames: [String], pts: [Ty],
+                            mask: [Bool], dropmask: Int, xs: [Expr]) : LlvmEmit / Console {
+  let ra = llvm_emit_args_mixed(e, xs, pts, mask, [])
+  let e_drops = llvm_emit_tcrec_drops_masked(ra.st, pnames, mask, dropmask, 0)
+  let e_stores = llvm_emit_tcrec_stores_mixed(e_drops, pnames, pts, mask, ra.regs, 0)
   let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
   let dead = llvm_fresh_label(e_br, "tcrec.dead.")
   let e_dead = llvm_open_block(dead.e, dead.reg)
@@ -6756,9 +6872,9 @@ fn llvm_emit_tcrec_goto_raw(e: LlvmEmit, pnames: [String], pts: [Ty], xs: [Expr]
 }
 
 # Issue #718 — evaluate each arg as a raw scalar coerced to the
-# matching UFn slot ty (`pts`). The slot ty drives the IR type the
-# store expects, so the raw register must already be that width. The
-# `LlvmRaw.reg` produced by `llvm_emit_expr_raw` is the native scalar.
+# matching slot ty (`pts`). Used by the UFn call sites
+# (`llvm_emit_ufn_call_raw` / boxed) where every arg is raw. The
+# mixed-param back-edge uses `llvm_emit_args_mixed` instead.
 fn llvm_emit_args_raw(e: LlvmEmit, xs: [Expr], pts: [Ty], acc: [String]) : LlvmArgs / Console {
   match xs {
     [] -> LlvmArgs { st: e, regs: list_reverse(acc) }
@@ -6770,7 +6886,53 @@ fn llvm_emit_args_raw(e: LlvmEmit, xs: [Expr], pts: [Ty], acc: [String]) : LlvmA
   }
 }
 
-fn llvm_emit_tcrec_stores_raw(e: LlvmEmit, pnames: [String], pts: [Ty], regs: [String], i: Int) : LlvmEmit {
+# Evaluate each arg per the param mask: a raw param's arg via
+# `llvm_emit_expr_raw` (native scalar), a boxed param's arg via
+# `llvm_emit_expr` (a `%KaiValue*`). The returned reg list is
+# co-indexed with `pnames`/`pts`/`mask`.
+fn llvm_emit_args_mixed(e: LlvmEmit, xs: [Expr], pts: [Ty], mask: [Bool], acc: [String]) : LlvmArgs / Console {
+  match xs {
+    [] -> LlvmArgs { st: e, regs: list_reverse(acc) }
+    [x0, ...rest] -> {
+      let trest = pts_tail(pts)
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      if is_raw {
+        let r = llvm_emit_expr_raw(e, x0)
+        llvm_emit_args_mixed(r.e, rest, trest, mrest, [r.reg, ...acc])
+      } else {
+        let e1 = llvm_emit_expr(e, x0)
+        llvm_emit_args_mixed(e1, rest, trest, mrest, [e1.last_val, ...acc])
+      }
+    }
+  }
+}
+
+# Drop the outgoing slot value only for BOXED params whose dropmask bit
+# is set (raw params carry no RC and are skipped). Reads the current
+# loaded `%p_<p>` boxed register — the same value `llvm_emit_tcrec_drops`
+# drops in the all-boxed back-edge.
+fn llvm_emit_tcrec_drops_masked(e: LlvmEmit, pnames: [String], mask: [Bool],
+                                 dropmask: Int, i: Int) : LlvmEmit / Console {
+  match pnames {
+    [] -> e
+    [p, ...rest] -> {
+      let is_raw = mask_head_or_true(mask)
+      let mrest = mask_tail(mask)
+      let bit = llvm_tcrec_pow2(i)
+      let e1 = if (not is_raw) and (dropmask / bit) % 2 == 1 {
+        let d = llvm_fresh_reg(e)
+        llvm_append_body(d.e, concat_all([
+          "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* %p_", p, ")\n"
+        ]))
+      } else { e }
+      llvm_emit_tcrec_drops_masked(e1, rest, mrest, dropmask, i + 1)
+    }
+  }
+}
+
+fn llvm_emit_tcrec_stores_mixed(e: LlvmEmit, pnames: [String], pts: [Ty],
+                                 mask: [Bool], regs: [String], i: Int) : LlvmEmit {
   match pnames {
     [] -> e
     [p, ...rest] -> match regs {
@@ -6778,12 +6940,19 @@ fn llvm_emit_tcrec_stores_raw(e: LlvmEmit, pnames: [String], pts: [Ty], regs: [S
       [r, ...rrest] -> {
         let pty = pts_head_or(pts, TyInt)
         let trest = pts_tail(pts)
-        let ir = llvm_raw_ir_type_t(pty)
-        let slot = string_concat("%pslotr_", p)
-        let e1 = llvm_append_body(e, concat_all([
-          "  store ", ir, " ", r, ", ", ir, "* ", slot, "\n"
-        ]))
-        llvm_emit_tcrec_stores_raw(e1, rest, trest, rrest, i + 1)
+        let is_raw = mask_head_or_true(mask)
+        let mrest = mask_tail(mask)
+        let e1 = if is_raw {
+          let ir = llvm_raw_ir_type_t(pty)
+          llvm_append_body(e, concat_all([
+            "  store ", ir, " ", r, ", ", ir, "* %pslotr_", p, "\n"
+          ]))
+        } else {
+          llvm_append_body(e, concat_all([
+            "  store %KaiValue* ", r, ", %KaiValue** %pslot_", p, "\n"
+          ]))
+        }
+        llvm_emit_tcrec_stores_mixed(e1, rest, trest, mrest, rrest, i + 1)
       }
     }
   }
