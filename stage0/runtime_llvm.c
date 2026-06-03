@@ -265,7 +265,7 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_REAL) {
         return kai_variant_slot_box(v, i);
     }
-    return kai_incref(v->as.var_slots[i].ptr);
+    return kai_incref(v->as.var.var_slots[i].ptr);
 }
 
 /* kai_op_eq returns an int; wrap for direct use from the IR in match

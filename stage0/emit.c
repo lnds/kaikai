@@ -1127,7 +1127,7 @@ static void emit_pat_test(E *e, Node *pat, const char *scr) {
             for (size_t i = 0; i < pat->n_children; ++i) {
                 fputs(" && ", e->out);
                 char sub[512];
-                snprintf(sub, sizeof(sub), "%s->as.var_slots[%zu].ptr", scr, i);
+                snprintf(sub, sizeof(sub), "%s->as.var.var_slots[%zu].ptr", scr, i);
                 emit_pat_test(e, pat->children[i], sub);
             }
             fputs(")", e->out);
@@ -1205,7 +1205,7 @@ static void emit_pat_binds(E *e, Node *pat, const char *scr, int is_alias) {
                 char sub[512];
                 /* Issue #440 — variant slot. Phase 1: pointer-only,
                  * mask=0, so `.ptr` is the boxed child as before. */
-                snprintf(sub, sizeof(sub), "%s->as.var_slots[%zu].ptr", scr, i);
+                snprintf(sub, sizeof(sub), "%s->as.var.var_slots[%zu].ptr", scr, i);
                 /* variant arg slot is alias of scr's storage. */
                 emit_pat_binds(e, pat->children[i], sub, 1);
             }
