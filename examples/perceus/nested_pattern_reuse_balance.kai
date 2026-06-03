@@ -1,0 +1,100 @@
+# Nested-pattern reuse-in-place regression (rb-tree balance rotations).
+#
+# Pins the lane that taught the 1:1 variant reuse to fire on arms with a
+# one-level nested sub-pattern — the rb-tree `balance_left`/`balance_right`
+# rotation shape `RBNode(_, RBNode(Red, lx, kx, vx, rx), ..)`. The emit
+# reuses BOTH the outer matched cell AND the inner deconstructed cell
+# (Koka ParcReuse's 2-of-3 rotation reuse), so this fixture exercises:
+#   - the nested-pattern grand-child borrow binds (rv_nested_binds),
+#   - the inner-cell uniqueness decision (rv_inner_decision),
+#   - the second reuse token donated via kai_variant_at.
+#
+# The bug this guards against (the corruption caught during the lane): a
+# token used by the rebuild AND freed afterward (double-use) dropped a
+# whole subtree, so `size` came out SHORT of the inserted-key count. A
+# correct rebuild keeps every key. The golden is the exact node count
+# after a sequence of inserts that forces both the LL rotation
+# (balance_left arm 1) and the RR rotation (balance_right arm 2), plus
+# the recolor/default arms.
+#
+# Color is KEPT (unlike gap3_balance_minimal, which dropped it) because
+# the color slot is what makes the sub-pattern `RBNode(Red, ..)` nested —
+# the exact shape `pcs_sub_is_flat` now admits.
+
+type Color = Red | Black
+type Tree = Leaf | Node(Color, Tree, Int, Int, Tree)
+
+fn is_red(t: Tree) : Bool = match t {
+  Node(Red, _, _, _, _) -> true
+  _                     -> false
+}
+
+fn balance_left(l: Tree, k: Int, v: Int, r: Tree) : Tree = match l {
+  Node(_, Node(Red, lx, kx, vx, rx), ky, vy, ry) ->
+    Node(Red, Node(Black, lx, kx, vx, rx), ky, vy, Node(Black, ry, k, v, r))
+  Node(_, ly, ky, vy, Node(Red, lx, kx, vx, rx)) ->
+    Node(Red, Node(Black, ly, ky, vy, lx), kx, vx, Node(Black, rx, k, v, r))
+  Node(_, lx, kx, vx, rx) ->
+    Node(Black, Node(Red, lx, kx, vx, rx), k, v, r)
+  Leaf -> Leaf
+}
+
+fn balance_right(l: Tree, k: Int, v: Int, r: Tree) : Tree = match r {
+  Node(_, Node(Red, lx, kx, vx, rx), ky, vy, ry) ->
+    Node(Red, Node(Black, l, k, v, lx), kx, vx, Node(Black, rx, ky, vy, ry))
+  Node(_, lx, kx, vx, Node(Red, ly, ky, vy, ry)) ->
+    Node(Red, Node(Black, l, k, v, lx), kx, vx, Node(Black, ly, ky, vy, ry))
+  Node(_, lx, kx, vx, rx) ->
+    Node(Black, l, k, v, Node(Red, lx, kx, vx, rx))
+  Leaf -> Leaf
+}
+
+fn insert_loop(t: Tree, k: Int, v: Int) : Tree = match t {
+  Node(Red, l, kx, vx, r) ->
+    if k < kx      { Node(Red, insert_loop(l, k, v), kx, vx, r) }
+    else if k > kx { Node(Red, l, kx, vx, insert_loop(r, k, v)) }
+    else           { Node(Red, l, k, v, r) }
+  Node(Black, l, kx, vx, r) ->
+    if k < kx {
+      if is_red(l) { balance_left(insert_loop(l, k, v), kx, vx, r) }
+      else         { Node(Black, insert_loop(l, k, v), kx, vx, r) }
+    }
+    else if k > kx {
+      if is_red(r) { balance_right(l, kx, vx, insert_loop(r, k, v)) }
+      else         { Node(Black, l, kx, vx, insert_loop(r, k, v)) }
+    }
+    else { Node(Black, l, k, v, r) }
+  Leaf -> Node(Red, Leaf, k, v, Leaf)
+}
+
+fn rb_insert(t: Tree, k: Int, v: Int) : Tree = match insert_loop(t, k, v) {
+  Node(_, l, k0, v0, r) -> Node(Black, l, k0, v0, r)
+  Leaf                  -> Leaf
+}
+
+fn size(t: Tree) : Int = match t {
+  Leaf                 -> 0
+  Node(_, l, _, _, r)  -> 1 + size(l) + size(r)
+}
+
+# Insert keys via an LCG keystream (same generator family as the bench)
+# so the sequence forces many rotations of both leanings. Every drawn
+# key is distinct mod the range used here, so the final size equals the
+# number of inserts — any lost subtree shows up as a short count.
+fn lcg_next(s: Int) : Int = (s * 1103515245 + 12345) % 32768
+
+fn fill(t: Tree, seed: Int, n: Int) : Tree =
+  if n <= 0 { t }
+  else {
+    let s = lcg_next(seed)
+    fill(rb_insert(t, s, n), s, n - 1)
+  }
+
+fn main() : Int / Console = {
+  # 200 inserts: enough to drive deep rebalancing (height > 8) through
+  # both balance_left and balance_right rotation arms. The LCG range
+  # (32768) >> 200, so keys are distinct and size == inserts.
+  let t = fill(Leaf, 1, 200)
+  print(int_to_string(size(t)))
+  0
+}
