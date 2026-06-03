@@ -913,7 +913,8 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
         # Complex` produce the same impl-fn name.
         let mangled = proto_impl_mangled_with_args(pname, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
-        let entry = PIR(pname, tname, op_name, mangled, arg_names)
+        let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
+        let entry = PIR(pname, tname, op_name, mangled, arg_names, ret_head)
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
@@ -3367,10 +3368,59 @@ pub fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg,
 }
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg,
-                                 local_arities: [OpAr]) : Expr =
-  Expr { kind: resolve_protocol_calls_kind(e.kind, reg, local_arities,
-                                              e.ty, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+                                 local_arities: [OpAr]) : Expr {
+  let new_kind = resolve_protocol_calls_kind(e.kind, reg, local_arities,
+                                               e.ty, e.line, e.col)
+  # Issue #180: a `Real + Complex` binop was typed by the generic
+  # dispatcher as `Self` (the LHS head, Real) — wrong, the heterogeneous
+  # `impl Add[Complex] for Real` returns `Complex`. The rewrite above
+  # has now redirected the call to that impl's `__pimpl_*` symbol; read
+  # the impl's declared return head and, when it differs from the node's
+  # dispatcher-derived type, correct it. This runs before unboxing, so
+  # the unbox pass then sees `Complex` (boxed) instead of `Real`
+  # (unboxed) and emits a `KaiValue*` record load rather than reading
+  # the Complex record as a raw `double`. The impl's return IS the
+  # promotion target (Int -> Real -> Complex); no type hierarchy is
+  # needed beyond what the impl already declares.
+  let new_ty = proto_rewrite_corrected_ty(new_kind, e.ty, reg)
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: new_ty, mode: e.mode }
+}
+
+# When `kind` is a rewritten `ECall(EVar("__pimpl_..."), _)` whose impl
+# declares a return head differing from `cur_ty`, return the corrected
+# `Some(TyCon(None, ret_head, []))`. Otherwise return `cur_ty` unchanged.
+fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolReg) : Option[Ty] {
+  match kind {
+    ECall(callee, _) -> match callee.kind {
+      EVar(sym) -> {
+        let rh = impl_ret_head_by_sym(reg.impls, sym)
+        if rh == "" { cur_ty }
+        else {
+          let cur_head = match cur_ty {
+            Some(t) -> match ty_head_name(t) { Some(n) -> n  None -> "" }
+            None    -> ""
+          }
+          if rh == cur_head { cur_ty }
+          else { Some(TyCon(None, rh, [])) }
+        }
+      }
+      _ -> cur_ty
+    }
+    _ -> cur_ty
+  }
+}
+
+# Find the registered impl whose mangled fn name is `sym` and return
+# its declared return head; "" when `sym` is not an impl symbol.
+fn impl_ret_head_by_sym(impls: [ProtoImplReg], sym: String) : String {
+  match impls {
+    [] -> ""
+    [it, ...rest] -> match it {
+      PIR(_, _, _, mg, _, rh) ->
+        if mg == sym { rh } else { impl_ret_head_by_sym(rest, sym) }
+    }
+  }
+}
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
                                 local_arities: [OpAr],
@@ -3487,7 +3537,7 @@ fn prc_impls_has(impls: [ProtoImplReg], proto: String, head: String) : Bool {
   match impls {
     [] -> false
     [pir, ...rest] -> match pir {
-      PIR(p, t, _, _, _) ->
+      PIR(p, t, _, _, _, _) ->
         if p == proto and t == head { true }
         else { prc_impls_has(rest, proto, head) }
     }
@@ -4359,7 +4409,7 @@ fn find_impl_homogeneous(impls: [ProtoImplReg], pname: String,
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, fn_name, ans) ->
+      PIR(p, t, o, fn_name, ans, _) ->
         if p == pname and t == recv and o == opname and is_homogeneous_args(ans, recv) {
           Some(fn_name)
         } else {
@@ -4409,7 +4459,7 @@ fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, fn_name, ans) ->
+      PIR(p, t, o, fn_name, ans, _) ->
         if p == pname and t == recv and o == opname and arg_names_match(ans, recv, args) {
           Some(fn_name)
         } else {
@@ -4485,7 +4535,7 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, op, fn_name, _) ->
+      PIR(p, t, op, fn_name, _, _) ->
         if p == pname and t == tname and op == opname { Some(fn_name) }
         else { find_impl_for(rest, pname, tname, opname) }
     }
