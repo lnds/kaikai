@@ -3513,7 +3513,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # resolved a binder named like a stdlib fn (e.g. `tail`) to the
       # GLOBAL fn closure instead of the local bind — the latent
       # corruption the cell free-list surfaced.
-      let new_temps    = rv_new_temps(src, cargs, tys, 0, arm_cx)
+      let new_temps0   = rv_new_temps(src, cargs, tys, 0, arm_cx)
       let overwrites   = rv_overwrites(cargs, tys, 0, cx.enums)
       let fresh_slots  = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
       # Non-bijective unique branch owns (incref'd) its children, so the OLD
@@ -3523,15 +3523,59 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # decref is safe to emit before the overwrites. A bijective rebuild
       # transfers (borrow binds) and must NOT decref.
       let old_drops = if nonbij { rv_old_slot_drops(subs, tys, 0, cx.enums) } else { "" }
+      # Second reuse token (Koka ParcReuse 2-of-3 rotation reuse): the
+      # first nested-pattern slot deconstructs an INNER cell. If it is
+      # unique, donate it to the first same-arity sub-ctor of the rebuilt
+      # body via kai_variant_at (the Koka `_ru_x98 = reuse(_pat_1)` →
+      # `new_Node(_ru_x98, ..)` move). When non-unique (or unconsumed) it
+      # is dropped. The outer cell (`_scr`) is the first token (overwrite
+      # in place below); the inner cell is the second. Only the unique
+      # branch carries the inner cell; the shared branch fresh-allocs.
+      let nslot = if nonbij { rv_first_nested_slot(subs, 0) } else { 0 - 1 }
+      let has_inner = nslot >= 0
+      let inner_ptr = concat_all(["_scr->as.var_slots[", int_to_string(nslot), "].ptr"])
+      let nested_sp = list_nth(subs, nslot)
+      # Koka nested-uniqueness decision: move grand-children + capture
+      # `_ru_inner` when the inner cell is unique, else dup + decref.
+      let inner_decision = if has_inner { rv_inner_decision(nested_sp, inner_ptr, cx) } else { "" }
+      # Donate the captured inner token to the first same-arity sub-ctor of
+      # the body. `new_temps` references `kai_variant_u(tag,"C",n,` for the
+      # nested rebuild slots; rewrite the first such occurrence to consume
+      # `_ru_inner` via kai_variant_at (falls back to a fresh alloc when the
+      # token is null, so a non-unique inner is still correct).
+      # Consume the token atomically: the donated kai_variant_at reads
+      # `_ru_inner` and NULLs it in the same comma-expression, so the
+      # post-rebuild `inner_drop` does NOT free a cell that was reused
+      # (the double-use that corrupts the tree). `_ru_tmp` is declared
+      # alongside `_ru_inner` (rv_inner_decision). When the token was null
+      # (inner shared) kai_variant_at fresh-allocs and the NULL is a no-op.
+      let donate_needle = concat_all(["kai_variant_u(", tag_str, ", \"", cname,
+                                       "\", ", int_to_string(n), ","])
+      let donate_repl = concat_all(["kai_variant_at((_ru_tmp = _ru_inner, ",
+                                    "_ru_inner = kai_reuse_null, _ru_tmp), ", tag_str,
+                                    ", \"", cname, "\", ", int_to_string(n), ","])
+      let new_temps = if has_inner { replace_first(new_temps0, donate_needle, donate_repl) }
+                      else { new_temps0 }
+      # If the inner token was captured but no sub-ctor consumed it (the
+      # rebuild had no same-arity nested ctor), free the cell so it does
+      # not leak (Koka drops an unconsumed Available token). After a
+      # successful donation `_ru_inner` is already null, so this is a no-op.
+      let inner_drop = if has_inner {
+        "if (_ru_inner != kai_reuse_null) { kai_reuse_free(_ru_inner); } "
+      } else { "" }
       concat_all([
         "if (kai_check_unique(_scr)) { ",
-        borrow_binds, new_temps, old_drops, overwrites,
+        borrow_binds, inner_decision, new_temps, old_drops, overwrites,
         "_scr->variant_tag = ", tag_str, "; ",
         "_scr->var_n_args = ", int_to_string(list_length(tys)), "; ",
         "kai_slotmask_register(_scr->variant_tag, ", int_to_string(mask), "); ",
+        inner_drop,
         "kai_rc_reuse_total++; _r = kai_incref(_scr); ",
         "} else { ",
         owned_binds,
+        # Shared branch: the nested inner cell was bound (grand-children
+        # incref'd by owned_binds) but not reused — drop it here.
+        if has_inner { concat_all(["kai_decref(", inner_ptr, "); "]) } else { "" },
         "_r = kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
         ", ", int_to_string(mask), ", (KaiVarSlot[]){", fresh_slots, "}); ",
         "}"
@@ -3568,18 +3612,98 @@ fn rv_slot_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int, borrow: 
           else if k == 3 { concat_all(["KaiValue *kai_", nm, " = kai_enum_slot_box(", slot, ".i64); "]) }
           else if borrow { concat_all(["KaiValue *kai_", nm, " = ", slot, ".ptr; "]) }
           else { concat_all(["KaiValue *kai_", nm, " = kai_incref(", slot, ".ptr); "]) }
-        # Nested ctor / record / list sub-pattern in a boxed slot: bind
-        # its inner names off the inner cell (alias → grand-children
-        # incref'd), then drop the now-deconstructed inner cell. Only
-        # boxed slots (k == 0) can hold a nested cell.
+# Nested PVariant sub-pattern in a boxed slot: bind its grand-children
+        # by BORROW (no incref) off the inner cell. The caller emits the
+        # Koka nested-uniqueness decision (`rv_inner_decision`): if the
+        # inner cell is unique its children MOVE (these borrow binds are
+        # the owners) and the cell becomes the second reuse token; if
+        # shared, each grand-child is dup'd and the inner cell decref'd.
+        # Declaring the binds here (outside that if/else) keeps them in
+        # scope for the whole rebuilt body. Only boxed slots (k == 0) hold
+        # a nested cell.
         _ ->
           if k == 0 {
             let inner = concat_all([slot, ".ptr"])
-            cat2(emit_pat_binds(src, sp, inner, true, cx),
-                 concat_all(["kai_decref(", inner, "); "]))
+            rv_nested_binds(sp, inner, cx)
           } else { "" }
       }
       cat2(here, rv_slot_binds(src, rest, tys, i + 1, borrow, cx))
+    }
+  }
+}
+
+# Borrow-bind the grand-children of a one-level nested PVariant sub-pattern
+# `sp` whose inner cell is at C expr `inner`. Each slot binder reads the
+# inner cell's slot WITHOUT incref (Koka borrow); primitive slots box a
+# fresh value (no RC concern). The inner cell's own uniqueness decision
+# (move vs dup+drop) is emitted by `rv_inner_decision`.
+fn rv_nested_binds(sp: Pattern, inner: String, cx: EmitCtx) : String {
+  match sp.pkind {
+    PVariant(vname, isubs) -> {
+      let itys = match evar_payload_tys(cx.variants, vname) { Some(ts) -> ts None -> [] }
+      rv_nested_binds_loop(isubs, itys, inner, 0, cx)
+    }
+    _ -> ""
+  }
+}
+
+fn rv_nested_binds_loop(isubs: [Pattern], itys: [TypeExpr], inner: String,
+                        j: Int, cx: EmitCtx) : String {
+  match isubs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let k = match list_nth_ty(itys, j) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+      let slot = concat_all([inner, "->as.var_slots[", int_to_string(j), "]"])
+      let here = match sp.pkind {
+        PWild -> ""
+        PBind(nm) ->
+          if name_is_unused(nm) { "" }
+          else if k == 1 { concat_all(["KaiValue *kai_", nm, " = kai_int(", slot, ".i64); "]) }
+          else if k == 2 { concat_all(["KaiValue *kai_", nm, " = kai_real(", slot, ".r); "]) }
+          else if k == 3 { concat_all(["KaiValue *kai_", nm, " = kai_enum_slot_box(", slot, ".i64); "]) }
+          else           { concat_all(["KaiValue *kai_", nm, " = ", slot, ".ptr; "]) }
+        _ -> ""
+      }
+      cat2(here, rv_nested_binds_loop(rest, itys, inner, j + 1, cx))
+    }
+  }
+}
+
+# Koka nested-uniqueness decision for the inner cell of a rotation arm:
+#   if (unique(inner)) { _ru_inner = reuse(inner); }   // children MOVE
+#   else { dup each kept ptr grand-child; decref(inner); _ru_inner = null; }
+# The borrow binds (rv_nested_binds) become the owners on the move path;
+# on the shared path the dups give each kept child its own ref before the
+# inner cell is dropped (Koka `kk_..._dup(kx); ...; decref(_pat_1)`).
+fn rv_inner_decision(sp: Pattern, inner: String, cx: EmitCtx) : String {
+  match sp.pkind {
+    PVariant(vname, isubs) -> {
+      let itys = match evar_payload_tys(cx.variants, vname) { Some(ts) -> ts None -> [] }
+      let dups = rv_nested_dups_loop(isubs, itys, 0, cx)
+      concat_all([
+        "KaiReuse _ru_inner; KaiReuse _ru_tmp; (void) _ru_tmp; ",
+        "if (kai_check_unique(", inner, ")) { _ru_inner = kai_ptr_reuse(", inner, "); } ",
+        "else { ", dups, "kai_decref(", inner, "); _ru_inner = kai_reuse_null; } "
+      ])
+    }
+    _ -> "KaiReuse _ru_inner = kai_reuse_null; "
+  }
+}
+
+# Dup each kept BOXED grand-child binder (the shared-inner path). Primitive
+# / enum slots carry no RC and are skipped; unused binders are skipped.
+fn rv_nested_dups_loop(isubs: [Pattern], itys: [TypeExpr], j: Int, cx: EmitCtx) : String {
+  match isubs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let k = match list_nth_ty(itys, j) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+      let here = match sp.pkind {
+        PBind(nm) -> if k == 0 and not name_is_unused(nm) {
+                       concat_all(["kai_incref(kai_", nm, "); "])
+                     } else { "" }
+        _ -> ""
+      }
+      cat2(here, rv_nested_dups_loop(rest, itys, j + 1, cx))
     }
   }
 }
@@ -3634,6 +3758,35 @@ fn rv_any_nested_ctor(cargs: [Expr]) : Bool = match cargs {
 }
 
 fn rv_nonempty(xs: [Expr]) : Bool = match xs { [] -> false _ -> true }
+
+# Index of the first slot whose sub-pattern is a nested ctor (the
+# deconstructed inner cell of a rotation arm), else -1. Only such a
+# slot yields a second reuse token (the inner `RBNode` of balance).
+fn rv_first_nested_slot(subs: [Pattern], i: Int) : Int = match subs {
+  []          -> 0 - 1
+  [sp, ...rest] -> match sp.pkind {
+    PBind(_) -> rv_first_nested_slot(rest, i + 1)
+    PWild    -> rv_first_nested_slot(rest, i + 1)
+    _        -> i
+  }
+}
+
+# Replace the FIRST textual occurrence of `needle` in `hay` with `repl`.
+# Used to donate the inner reuse token to the first matching sub-ctor of
+# the rebuilt body (`kai_variant_u(tag,"C",n,` → `kai_variant_at(tok,
+# tag,"C",n,`). Any cell of the same arity is a valid Koka reuse target,
+# so the first textual match is sound. Returns `hay` unchanged when the
+# needle is absent (token then stays unconsumed and is dropped).
+fn replace_first(hay: String, needle: String, repl: String) : String {
+  let at = find_substring(hay, needle, 0)
+  let hn = string_length(hay)
+  if at >= hn { hay }
+  else {
+    let nn = string_length(needle)
+    concat_all([string_slice(hay, 0, at), repl,
+                string_slice(hay, at + nn, hn - (at + nn))])
+  }
+}
 
 # Decref every OLD pointer slot of `_scr` before the non-bijective overwrite
 # (the unique branch owns/incref'd its children, so the old refs must be
