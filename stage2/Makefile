@@ -2782,6 +2782,19 @@ test-effects: $(TARGET) build
 	  done < $$exp_err; \
 	  echo "effects OK $$name (issue #251 parameter-mutation rejected)"; \
 	done; \
+	for f in ../examples/effects/prelude_effect_via_scheme.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (prelude builtin effect propagates via scheme row, not name table)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/issue_308_user_log_effect.kai \
 	         ../examples/effects/issue_308_stdlib_log_unchanged.kai; do \
 	  name=$$(basename $$f .kai); \
