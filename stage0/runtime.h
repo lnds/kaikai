@@ -100,6 +100,33 @@
 #  define KAI_PATH_BUF 4096
 #endif
 
+/* Stack buffer for environment-variable *names* (get_var/set_var/unset_var).
+ * 1024 was copy-pasted across the three env entry points; named here so the
+ * three stay in lock-step. POSIX does not bound env name length, but 1024 is
+ * far past any real variable name; over-long names are truncated, matching
+ * the prior behaviour. */
+#define KAI_ENV_NAME_BUF 1024
+
+/* Stack buffer for network host strings passed to getaddrinfo (connect and
+ * listen sites). NI_MAXHOST is 1025 on most platforms; 256 is the historical
+ * pragmatic bound shared by both call sites — kept as-is, just named. */
+#define KAI_NET_HOST_BUF 256
+
+/* Initial heap capacity for the grow-by-doubling stdin read buffers
+ * (read_line and the stdin event loop). The buffer doubles via realloc, so
+ * this is only the starting point, not a ceiling; 128 covers a typical line
+ * without a first reallocation. */
+#define KAI_READ_BUF_INIT 128
+
+/* listen(2) backlog for server sockets. Linux caps the effective value at
+ * net.core.somaxconn regardless; 128 is the conservative v1 bound shared by
+ * every listen site. */
+#define KAI_LISTEN_BACKLOG 128
+
+/* Default permission bits for directories created by dir_create (rwxr-xr-x,
+ * umask-masked by the kernel). Named to document intent; value unchanged. */
+#define KAI_DIR_MODE 0755
+
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
  * prototypes triggers -Wdeprecated-declarations, which the local
@@ -5159,7 +5186,7 @@ static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
-        if (mkdir(pbuf, 0755) == 0) {
+        if (mkdir(pbuf, KAI_DIR_MODE) == 0) {
             KaiValue *u = kai_unit();
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
         } else {
@@ -5316,7 +5343,7 @@ static KaiValue *kai_prelude_dir_walk(KaiValue *root) {
 }
 
 static KaiValue *kai_prelude_read_line(void) {
-    size_t cap = 128, n = 0;
+    size_t cap = KAI_READ_BUF_INIT, n = 0;
     char *buf = (char *) malloc(cap);
     if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     int ch;
@@ -6501,7 +6528,7 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
     kai_reactor_init();
     kai_reactor_stdin_set_nonblocking();
 
-    size_t cap = 128, n = 0;
+    size_t cap = KAI_READ_BUF_INIT, n = 0;
     char *buf = (char *) malloc(cap);
     if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
 
@@ -6619,7 +6646,7 @@ static KaiValue *kai_default_env_var(void *self, KaiValue *name, KaiCont *k) {
     if (!name || name->tag != KAI_STR) {
         return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
     }
-    char nbuf[1024];
+    char nbuf[KAI_ENV_NAME_BUF];
     size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
@@ -6648,7 +6675,7 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
         KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
         return kai_cont_resume(k, err);
     }
-    char nbuf[1024];
+    char nbuf[KAI_ENV_NAME_BUF];
     size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
@@ -6685,7 +6712,7 @@ static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *
         KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
         return kai_cont_resume(k, err);
     }
-    char nbuf[1024];
+    char nbuf[KAI_ENV_NAME_BUF];
     size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
@@ -7041,7 +7068,7 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
     if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
         return _kai_net_err_msg(k, "connect: bad arguments");
     }
-    char host_buf[256];
+    char host_buf[KAI_NET_HOST_BUF];
     size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
     memcpy(host_buf, host->as.s.bytes, hlen);
     host_buf[hlen] = '\0';
@@ -7116,7 +7143,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
         return _kai_net_err_msg(k, "listen: bad arguments");
     }
-    char host_buf[256];
+    char host_buf[KAI_NET_HOST_BUF];
     size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
     memcpy(host_buf, host->as.s.bytes, hlen);
     host_buf[hlen] = '\0';
@@ -7159,7 +7186,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         int e = errno; close(fd); return _kai_net_err(k, e);
     }
-    if (listen(fd, 128) < 0) {
+    if (listen(fd, KAI_LISTEN_BACKLOG) < 0) {
         int e = errno; close(fd); return _kai_net_err(k, e);
     }
     /* Issue #630 — Phase R2: the listener fd must be non-blocking so
