@@ -245,16 +245,19 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     /* Issue #126 / #622 (Cluster F) — variant slot must honor the
      * `slot_mask`. The LLVM emitter always *builds* variants with
      * mask==0 (all boxed pointers, see `kaix_variant` above), so for
-     * everything the codegen mints `.ptr` is correct. But the C
-     * *runtime* mints some variants with typed slots — notably
-     * `Exited(Int)` / `Signaled(Int)` from the Process default handler
-     * (runtime.h §`_kai_process_make_exit_exited`), which store the
-     * raw scalar in `slots[i].i64` with KAI_VAR_SLOT_INT. Reading
-     * those via `.ptr` reinterprets the raw int as a pointer and feeds
-     * garbage into the match arm. `kai_variant_slot_box` is exactly
-     * the boxed-view accessor the C backend uses (`slot_read_for_test`
-     * in emit_c.kai); route through it so both backends agree on any
-     * runtime-minted typed-slot variant.
+     * everything the codegen mints `.ptr` is correct. Since #741 moved
+     * Int variant slots to the tagged-`kai_int` boxed representation,
+     * the C runtime's own constructors (notably `Exited(Int)` /
+     * `Signaled(Int)` from the Process default handler,
+     * runtime.h §`_kai_process_make_exit_exited`) also mint boxed
+     * slots with mask==0, so this accessor's `.ptr` path covers them
+     * directly. The mask-honoring branch below stays as a defensive
+     * accessor for any future runtime-minted typed slot (mask!=0):
+     * reading a typed slot via `.ptr` would reinterpret the raw scalar
+     * as a pointer and feed garbage into the match arm.
+     * `kai_variant_slot_box` is exactly the boxed-view accessor the C
+     * backend uses (`slot_read_for_test` in emit_c.kai); route through
+     * it so both backends agree on any runtime-minted typed-slot variant.
      *
      * Ownership: `kai_variant_slot_box` returns a borrowed pointer for
      * pointer slots and a freshly-allocated boxed temporary (rc==1)
