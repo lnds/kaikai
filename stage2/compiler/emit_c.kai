@@ -10812,7 +10812,8 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # `tcrec_rewrite_decls` into the pipeline yet, so selfhost stays
 # byte-identical until M3 connects the pieces.
 #[doc("---- m37 / TCO — self-tail-call rewrite (M2) ---------------------- Runs after `perceus_pass`. For every fn whose body contains at least one self-tail-call (per M1), the callee…")]
-pub fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] / Console = map(decls, tcrec_rewrite_decl)
+pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool) : [Decl] / Console =
+  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc))
 
 # Pipeline reorder (Eric review 2026-05-06):
 # tcrec runs AFTER perceus_pass, so the body it receives may be
@@ -10839,7 +10840,7 @@ pub fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] / Console = map(decls, tcrec_
 # already descends through `EBlock(_, Some(tail))`. Only the exit-
 # drops shape needs special handling because its tail is
 # `EVar(__pcs_ret)` instead of the original body.
-fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
+fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -10849,7 +10850,7 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
           EBlock(stmts, _) ->
             tcrec_rewrite_pcs_ret_wrap(d, is_pub, name, tparams, params,
                                         opt_ret, row, body, stmts, ln, cl, mo,
-                                        arity)
+                                        arity, allow_trmc)
           _ -> d
         }
       } else {
@@ -10889,8 +10890,14 @@ fn tcrec_rewrite_decl(d: Decl) : Decl / Console {
             # constructor-context path instead of the plain goto. The
             # ordinary tcrec rewrite handles fns whose tail is a direct
             # self-call; TRMC handles fns whose tail is `Ctor(.., self,..)`.
+            # `allow_trmc` is false on the LLVM backend: it lowers the
+            # `__kai_tcrec|` sentinel (issue #706) but not the `__kai_trmc|`
+            # cctx sentinel, so a TRMC-rewritten body would emit the raw
+            # sentinel as a function name with illegal `|` chars. On LLVM
+            # the fn falls back to ordinary recursion (correct, just
+            # without the modulo-cons reuse-in-place the C backend gets).
             let new_body =
-              if trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity, mo) {
+              if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity, mo) {
                 trmc_rewrite_body(body, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [])
               } else {
@@ -10986,7 +10993,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                               opt_ret: Option[TypeExpr], row: RowExpr,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],
-                              arity: Int) : Decl / Console {
+                              arity: Int, allow_trmc: Bool) : Decl / Console {
 
   match tcrec_find_pcs_ret_let(stmts, []) {
     None -> d
@@ -10994,7 +11001,10 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
       TcrecPcsTriple(before, inner, after) -> {
         # TRMC eligibility (modulo-cons through arm-wraps) OR an ordinary
         # direct tail self-call qualifies the inner for rewrite.
-        let is_trmc_inner = trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo)
+        # `allow_trmc` is false on the LLVM backend (it cannot lower the
+        # `__kai_trmc|` cctx sentinel — see the direct-branch note); a
+        # TRMC-only inner then falls back to ordinary recursion.
+        let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo)
         let has_direct = tcrec_has_tail_self_call(inner, name, arity, mo)
         if not has_direct and not is_trmc_inner { d }
         else {
@@ -11017,7 +11027,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             # and non-modulo-cons leaves `cctx_apply_linear`. Re-wrapping
             # would double-handle RC on the apply leaves.
             let new_body =
-              if trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo) {
+              if is_trmc_inner {
                 trmc_rewrite_body(inner, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [])
               } else {
