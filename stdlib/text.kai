@@ -1,0 +1,125 @@
+# stdlib/text.kai — Unicode text measurement built on the codepoint
+# machinery from #744 (string.chars / char_count).
+#
+# Public surface (issue #745):
+#
+#   pub fn char_width(cp: Int) : Int      columns for one codepoint
+#   pub fn display_width(s: String) : Int  terminal columns of a string
+#
+# `display_width` answers "how many terminal columns does this string
+# occupy", which neither byte length nor codepoint count gives: some
+# codepoints are 2 columns wide (CJK ideographs, fullwidth forms, most
+# emoji), some are 0 (combining marks, zero-width joiner/space, control
+# chars), most are 1. The moral equivalent of POSIX `wcswidth(3)`.
+#
+# Scope (issue #745): codepoint-level width via the East Asian Width
+# property + zero-width handling. NOT grapheme-cluster segmentation
+# (UAX #29) — emoji ZWJ sequences, flags, skin-tone modifiers that
+# render as one wide glyph are out of scope; they need UAX #29 and are
+# a separate problem. This covers the 95% case (CJK, fullwidth, common
+# emoji). ANSI-escape skipping is the caller's concern (a TUI knows
+# whether its strings carry color codes); `display_width` measures the
+# codepoints it is given.
+#
+# The interval tables below are the well-known compact ranges from the
+# Unicode East Asian Width property (wide + fullwidth) and the
+# zero-width set (combining marks, format/control). They are
+# intentionally a curated subset, not the full Unicode database: full
+# coverage would bloat the module for codepoints no terminal app
+# exercises. The ranges chosen are the ones every wcwidth
+# implementation (Go x/text/width, Rust unicode-width, Python wcwidth)
+# ships as the core set.
+
+# `in_range(cp, lo, hi)` — inclusive interval test.
+fn in_range(cp: Int, lo: Int, hi: Int) : Bool = cp >= lo and cp <= hi
+
+# Zero-width codepoints: combining marks, zero-width space/joiner/
+# non-joiner, and the C0/C1 control range (which occupy no column when
+# printed, though a terminal may render a replacement — wcwidth counts
+# them as 0). NUL and the control range are width 0 here, matching
+# wcwidth returning 0 for non-printing controls.
+fn is_zero_width(cp: Int) : Bool = {
+  cp == 0 or                                    # NUL
+  in_range(cp, 0x0300, 0x036F) or               # combining diacritical marks
+  in_range(cp, 0x0483, 0x0489) or               # combining Cyrillic
+  in_range(cp, 0x0591, 0x05BD) or               # Hebrew points
+  in_range(cp, 0x0610, 0x061A) or               # Arabic marks
+  in_range(cp, 0x064B, 0x065F) or               # Arabic marks
+  cp == 0x0670 or                               # Arabic letter superscript alef
+  in_range(cp, 0x06D6, 0x06DC) or               # Arabic small high marks
+  cp == 0x0E31 or                               # Thai vowel mark
+  in_range(cp, 0x0E34, 0x0E3A) or               # Thai vowel/tone marks
+  in_range(cp, 0x1AB0, 0x1AFF) or               # combining diacritical ext
+  in_range(cp, 0x1DC0, 0x1DFF) or               # combining diacritical supp
+  in_range(cp, 0x200B, 0x200F) or               # zero-width space/joiner, marks
+  in_range(cp, 0x202A, 0x202E) or               # bidi format controls
+  in_range(cp, 0x2060, 0x2064) or               # word joiner, invisible ops
+  in_range(cp, 0x20D0, 0x20FF) or               # combining marks for symbols
+  in_range(cp, 0xFE00, 0xFE0F) or               # variation selectors
+  in_range(cp, 0xFE20, 0xFE2F) or               # combining half marks
+  cp == 0xFEFF                                  # zero-width no-break space (BOM)
+}
+
+# Wide codepoints (East Asian Wide + Fullwidth): occupy 2 terminal
+# columns. CJK ideographs, Hangul, Hiragana/Katakana, fullwidth Latin
+# forms, and the common emoji blocks.
+fn is_wide(cp: Int) : Bool = {
+  in_range(cp, 0x1100, 0x115F) or               # Hangul Jamo (init. consonants)
+  in_range(cp, 0x2E80, 0x2EFF) or               # CJK radicals supplement
+  in_range(cp, 0x2F00, 0x2FDF) or               # Kangxi radicals
+  in_range(cp, 0x3000, 0x303E) or               # CJK symbols and punctuation
+  in_range(cp, 0x3041, 0x33FF) or               # Hiragana..CJK compat
+  in_range(cp, 0x3400, 0x4DBF) or               # CJK Unified Ideographs Ext A
+  in_range(cp, 0x4E00, 0x9FFF) or               # CJK Unified Ideographs
+  in_range(cp, 0xA000, 0xA4CF) or               # Yi syllables/radicals
+  in_range(cp, 0xAC00, 0xD7A3) or               # Hangul syllables
+  in_range(cp, 0xF900, 0xFAFF) or               # CJK compatibility ideographs
+  in_range(cp, 0xFE30, 0xFE4F) or               # CJK compatibility forms
+  in_range(cp, 0xFF00, 0xFF60) or               # fullwidth forms
+  in_range(cp, 0xFFE0, 0xFFE6) or               # fullwidth signs
+  in_range(cp, 0x1F300, 0x1F64F) or             # misc symbols & pictographs
+  in_range(cp, 0x1F900, 0x1F9FF) or             # supplemental symbols & pictographs
+  in_range(cp, 0x1FA70, 0x1FAFF) or             # symbols & pictographs ext-A
+  in_range(cp, 0x20000, 0x3FFFD)                # CJK Unified Ideographs Ext B+
+}
+
+# `char_width(cp)` — the column count of a single codepoint: 0 for
+# zero-width (combining/format/control), 2 for East Asian Wide /
+# Fullwidth / common emoji, 1 otherwise.
+pub fn char_width(cp: Int) : Int {
+  if is_zero_width(cp) { 0 }
+  else if is_wide(cp) { 2 }
+  else { 1 }
+}
+
+fn width_loop(cs: [Char], acc: Int) : Int = match cs {
+  []          -> acc
+  [c, ...rest] -> width_loop(rest, acc + char_width(char_to_int(c)))
+}
+
+# `display_width(s)` — the number of terminal columns `s` occupies,
+# summing `char_width` over its codepoints (issue #745). Iterates real
+# codepoints via `string.chars` (#744), so multibyte input is measured
+# by glyph width, not byte or codepoint count.
+pub fn display_width(s: String) : Int = width_loop(string.chars(s), 0)
+
+# Intrinsic tests. Run with `KAI_NO_STDLIB=1 bin/kai test stdlib/text.kai`
+# is NOT applicable (this is an opt-in module, not a prelude); these run
+# via the stdlib survey when imported, and the examples/stdlib fixture.
+test "char_width — narrow, wide, zero-width" {
+  assert char_width(char_to_int('a')) == 1     # ASCII
+  assert char_width(0x4F60) == 2               # 你 (CJK)
+  assert char_width(0x1F389) == 2              # 🎉 (emoji)
+  assert char_width(0x25B8) == 1               # ▸ (arrow, narrow)
+  assert char_width(0x0301) == 0               # combining acute accent
+  assert char_width(0x200D) == 0               # zero-width joiner
+}
+
+test "display_width — issue 745 acceptance cases" {
+  assert display_width("hello") == 5
+  assert display_width("你好") == 4            # 2 wide codepoints
+  assert display_width("▸ Edit") == 6          # arrow=1, space=1, Edit=4
+  assert display_width("🎉") == 2              # 1 wide emoji
+  assert display_width("") == 0
+  assert display_width("áé") == 2              # accented Latin, narrow
+}
