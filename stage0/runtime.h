@@ -85,6 +85,21 @@
 #include <poll.h>
 #include <pthread.h>
 
+/* Stack buffer size for filesystem path operations (realpath, dirname,
+ * join, etc.). Replaces the bare 4096 literal that was copy-pasted across
+ * ~14 path sites. Floors at 4096 to preserve the historical buffer size
+ * on every platform: darwin defines PATH_MAX as 1024 and Linux as 4096,
+ * so a plain `PATH_MAX` would have *shrunk* the macOS buffer and started
+ * truncating paths in [1024, 4096). The max() keeps the old behaviour
+ * everywhere and only grows on systems with a larger PATH_MAX. POSIX lets
+ * PATH_MAX be undefined when the max is unbounded (GNU/Hurd); the floor
+ * covers that case too. */
+#if defined(PATH_MAX) && PATH_MAX > 4096
+#  define KAI_PATH_BUF PATH_MAX
+#else
+#  define KAI_PATH_BUF 4096
+#endif
+
 /* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
  * The functions still work; the deprecation attribute on the
  * prototypes triggers -Wdeprecated-declarations, which the local
@@ -4713,11 +4728,11 @@ static KaiValue *kai_prelude_abspath(KaiValue *path) {
     if (!path || path->tag != KAI_STR) {
         return path;
     }
-    char pbuf[4096];
+    char pbuf[KAI_PATH_BUF];
     size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
     memcpy(pbuf, path->as.s.bytes, plen);
     pbuf[plen] = '\0';
-    char resolved[4096];
+    char resolved[KAI_PATH_BUF];
     if (realpath(pbuf, resolved) == NULL) {
         return path;
     }
@@ -4820,7 +4835,7 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -4868,7 +4883,7 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
         KaiValue *msg = kai_str("write_file: content is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -4900,7 +4915,7 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
 static KaiValue *kai_prelude_file_exists(KaiValue *path) {
     int present = 0;
     if (path && path->tag == KAI_STR) {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -4916,7 +4931,7 @@ static KaiValue *kai_prelude_file_delete(KaiValue *path) {
         KaiValue *msg = kai_str("file_delete: path is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -4941,8 +4956,8 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
         KaiValue *msg = kai_str("file_rename: to is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char fbuf[4096];
-        char tbuf[4096];
+        char fbuf[KAI_PATH_BUF];
+        char tbuf[KAI_PATH_BUF];
         size_t flen = from->as.s.len < sizeof(fbuf) - 1 ? from->as.s.len : sizeof(fbuf) - 1;
         size_t tlen = to->as.s.len   < sizeof(tbuf) - 1 ? to->as.s.len   : sizeof(tbuf) - 1;
         memcpy(fbuf, from->as.s.bytes, flen); fbuf[flen] = '\0';
@@ -4973,7 +4988,7 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
         KaiValue *msg = kai_str("file_read_bytes: argument is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -5030,7 +5045,7 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
         KaiValue *msg = kai_str("file_write_bytes: buffer is not an Array");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -5093,7 +5108,7 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
 static KaiValue *kai_prelude_dir_list_dir(KaiValue *path) {
     KaiValue *acc = kai_nil();
     if (path && path->tag == KAI_STR) {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -5140,7 +5155,7 @@ static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
         KaiValue *msg = kai_str("dir_create_dir: path is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -5162,7 +5177,7 @@ static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
         KaiValue *msg = kai_str("dir_remove_dir: path is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     } else {
-        char pbuf[4096];
+        char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
@@ -5194,7 +5209,7 @@ static KaiValue *kai_prelude_dir_walk(KaiValue *root) {
     char **stack = (char **) malloc(cap * sizeof(char *));
     if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
 
-    char rbuf[4096];
+    char rbuf[KAI_PATH_BUF];
     size_t rlen = root->as.s.len < sizeof(rbuf) - 1 ? root->as.s.len : sizeof(rbuf) - 1;
     memcpy(rbuf, root->as.s.bytes, rlen);
     rbuf[rlen] = '\0';
