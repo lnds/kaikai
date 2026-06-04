@@ -3768,9 +3768,20 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
     if (at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n) {
         for (int i = 0; i < n; ++i) kai_var_slots(at)[i] = slots[i];
         at->variant_tag = tag;
-        kai_slotmask_register(at->variant_tag, mask);
+        /* The tag→mask register is NOT repeated here: a reuse target is,
+         * by construction, a cell the program already built fresh (via
+         * kai_variant_u / kai_variant_u_fast), so its mask is registered.
+         * The slotmask table read by the drop walker is keyed on tag, not
+         * on this cell, so the steady-state register was pure redundant
+         * work (kai_slotmask_register's _seen guard already no-op'd it).
+         * Dropping it removes a call from every in-place rebuild — the
+         * rb-tree reuse arm fires ~20M times. The reuse counter only
+         * exists under tracing; gate it so the steady path is store-only. */
         at->rc = 1;
+#ifdef KAI_TRACE_RC
         kai_rc_reuse_total++;
+#endif
+        (void) mask; (void) name;
         return at;
     }
     return kai_variant_u(tag, name, n, mask, slots);
