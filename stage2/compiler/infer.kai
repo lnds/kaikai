@@ -2971,6 +2971,17 @@ fn tv(n: Int) : Ty = TyVarT(n)
 
 fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, inf_row_empty())
 
+# Like `fn_ty` but stamps a closed effect row onto the function type, so a
+# prelude builtin carries its own effect in its scheme instead of having it
+# attributed by a name-keyed side table at the call site. The labels are
+# non-parametric builtin effects (Stdout, File, Mutable, …) — no ty_args, no
+# tail — so the standard call-inference path (`collect_call_labels` /
+# `st_propagate_capability_labels`) propagates them into the caller's row,
+# exactly as for a stdlib fn written `: T / Stdout`. Empty `effs` degrades to
+# `fn_ty`. See issues #251/#345/#447/#453/#482/#537 for the per-effect history.
+fn fn_ty_eff(ps: [Ty], ret: Ty, effs: [String]) : Ty =
+  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [] })))
+
 # m12.8.x phase 4 (Bug 6): open-tail Row for row-polymorphic
 # prelude signatures (each/map/filter/reduce). The row var id
 # `rid` matches the scheme's bound rvar; at instantiation time the
@@ -2993,53 +3004,59 @@ fn list_ty(t: Ty) : Ty = TyListT(t)
 pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
   let es = [
     # IO
-    TyEntry { name: "print",          scheme: mono(fn_ty([TyString], TyUnit)) },
-    TyEntry { name: "eprint",         scheme: mono(fn_ty([TyString], TyUnit)) },
+    TyEntry { name: "print",          scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stdout"])) },
+    TyEntry { name: "eprint",         scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stderr"])) },
     # Issue #447 (LSP framing): write_stdout writes a String to stdout
     # verbatim with no trailing newline and flushes. Required by the
     # LSP JSON-RPC framer where the body is exactly Content-Length bytes.
-    TyEntry { name: "write_stdout",   scheme: mono(fn_ty([TyString], TyUnit)) },
-    TyEntry { name: "args",           scheme: mono(fn_ty([], list_ty(TyString))) },
+    TyEntry { name: "write_stdout",   scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stdout"])) },
+    # issue #537: bare `args()` reads the process command-line snapshot;
+    # per docs/effects-stdlib.md §`Env` the op lives on `Env`. (program_name
+    # below is deliberately effect-free — issue #127 routes argv[0] through
+    # the kai_g_argv snapshot as a pure read of process-wide constant state.)
+    TyEntry { name: "args",           scheme: mono(fn_ty_eff([], list_ty(TyString), ["Env"])) },
     # Issue #127: argv[0] as a flat prelude. Total — empty string
     # when the runtime hasn't seen `kai_set_args` yet.
     TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "stdlib_path",    scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "abspath",        scheme: mono(fn_ty([TyString], TyString)) },
-    TyEntry { name: "read_file",      scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyString]))) },
-    TyEntry { name: "write_file",     scheme: mono(fn_ty([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString]))) },
+    TyEntry { name: "read_file",      scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyString]), ["File"])) },
+    TyEntry { name: "write_file",     scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
     # Issue #345: fs/file expansion. `file_exists` returns Bool;
     # `file_delete` / `file_rename` return Result[String, Unit] (Err
     # message first per kaikai's Result[e, a] convention). All three
-    # carry the `File` effect via prelude_effect_for.
-    TyEntry { name: "file_exists",    scheme: mono(fn_ty([TyString], TyBool)) },
-    TyEntry { name: "file_delete",    scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyUnit]))) },
-    TyEntry { name: "file_rename",    scheme: mono(fn_ty([TyString, TyString], TyCon(None, "Result", [TyString, TyUnit]))) },
+    # carry the `File` effect in their scheme row.
+    TyEntry { name: "file_exists",    scheme: mono(fn_ty_eff([TyString], TyBool, ["File"])) },
+    TyEntry { name: "file_delete",    scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyUnit]), ["File"])) },
+    TyEntry { name: "file_rename",    scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyString, TyUnit]), ["File"])) },
     # Issue #482 + Array[Byte] refactor (prereq for #452): binary
-    # file IO. Both ride the `File` effect via prelude_effect_for.
+    # file IO. Both ride the `File` effect in their scheme row.
     # `file_read_bytes` returns Result[String, Array[Byte]] so the
     # buffer surface lines up with BinSerialize post-#488 — cache
     # layers and crypto consumers round-trip bytes (including 0x00)
     # without paying a list-to-array conversion at the boundary.
     # `file_write_bytes` is the symmetric write.
-    TyEntry { name: "file_read_bytes",  scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyCon(None, "Array", [TyByte])]))) },
-    TyEntry { name: "file_write_bytes", scheme: mono(fn_ty([TyString, TyCon(None, "Array", [TyByte])], TyCon(None, "Result", [TyString, TyUnit]))) },
+    TyEntry { name: "file_read_bytes",  scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyCon(None, "Array", [TyByte])]), ["File"])) },
+    TyEntry { name: "file_write_bytes", scheme: mono(fn_ty_eff([TyString, TyCon(None, "Array", [TyByte])], TyCon(None, "Result", [TyString, TyUnit]), ["File"])) },
     # Issue #344: fs/dir surface. list_dir / walk return [String]
     # (cons-list); create_dir / remove_dir return Result[String, Unit]
     # (Err first per kaikai's Result[e, a] convention). All four carry
-    # the `File` effect via prelude_effect_for.
-    TyEntry { name: "dir_list_dir",   scheme: mono(fn_ty([TyString], list_ty(TyString))) },
-    TyEntry { name: "dir_create_dir", scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyUnit]))) },
-    TyEntry { name: "dir_remove_dir", scheme: mono(fn_ty([TyString], TyCon(None, "Result", [TyString, TyUnit]))) },
-    TyEntry { name: "dir_walk",       scheme: mono(fn_ty([TyString], list_ty(TyString))) },
-    TyEntry { name: "read_line",      scheme: mono(fn_ty([], TyCon(None, "Result", [TyString, TyString]))) },
+    # the `File` effect in their scheme row.
+    TyEntry { name: "dir_list_dir",   scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
+    TyEntry { name: "dir_create_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyUnit]), ["File"])) },
+    TyEntry { name: "dir_remove_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyUnit]), ["File"])) },
+    TyEntry { name: "dir_walk",       scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
+    TyEntry { name: "read_line",      scheme: mono(fn_ty_eff([], TyCon(None, "Result", [TyString, TyString]), ["Stdin"])) },
     # Issue #453: byte-oriented stdin read. Returns a String of at
     # most `n` bytes; on EOF the result is shorter (possibly empty).
     # No Result wrapper — the LSP framing use case treats a short
     # read as end-of-stream.
-    TyEntry { name: "read_bytes",     scheme: mono(fn_ty([TyInt], TyString)) },
+    TyEntry { name: "read_bytes",     scheme: mono(fn_ty_eff([TyInt], TyString, ["Stdin"])) },
     # `exit` and `panic` never return — give them a polymorphic result so
-    # they unify with any context.
-    TyEntry { name: "exit",           scheme: scheme([0], fn_ty([TyInt],    tv(0))) },
+    # they unify with any context. `exit` rides `Process` (issue #537);
+    # `panic` is an audited runtime escape, not a Process op, so it stays
+    # effect-free in its scheme.
+    TyEntry { name: "exit",           scheme: scheme([0], fn_ty_eff([TyInt], tv(0), ["Process"])) },
     TyEntry { name: "panic",          scheme: scheme([0], fn_ty([TyString], tv(0))) },
 
     # Conversions
@@ -3149,8 +3166,15 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon(None, "Array", [tv(0)]))) },
     TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)])],                      TyInt)) },
     TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)]), TyInt],               tv(0))) },
-    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)],        TyCon(None, "Array", [tv(0)]))) },
-    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)],        TyCon(None, "Array", [tv(0)]))) },
+    # issue #251: bare `array_set` / `array_grow` (the desugar of `a[i] := v`)
+    # raise the `Mutable` demand on the caller's row via their scheme. The
+    # provenance-masking pass (`mask_local_mutable_demand`, #252) still drops
+    # `Mutable` again when every demand targets a locally-constructed Array —
+    # it gates on the label being present and walks the AST by name, so it is
+    # agnostic to how the label entered the row. `array_make` / `array_length`
+    # / `array_get` stay effect-free (constructor and reads).
+    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)], TyCon(None, "Array", [tv(0)]), ["Mutable"])) },
+    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)], TyCon(None, "Array", [tv(0)]), ["Mutable"])) },
     # m8 #7: mailbox runtime — type-erased entries (Msg flows
     # through TyAny). The polymorphic surface is in stdlib/actor.kai
     # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
@@ -8830,14 +8854,15 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList / Console + File {
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File {
 
 
-  # m12.8.x phase 4 (Bug 6): when the callee is a syntactically-bare
-  # prelude IO builtin (`print`, `eprint`, `read_line`, `read_file`,
-  # `write_file`), accumulate the matching effect label on the
-  # caller's row. The op-call pathway already adds labels for
-  # explicit `Eff.op(...)` calls; this shim closes the gap for the
-  # sugar prelude form so `check_body_row` enforces row declaration
+  # The bare prelude IO builtins (`print`, `read_file`, `array_set`, …)
+  # carry their effect in their own scheme row (`add_prelude_sigs` via
+  # `fn_ty_eff`), so the standard call-inference path below — the open-row
+  # unification of the callee's `TyFnT` plus `st_propagate_capability_labels`
+  # — raises the label on the caller's row, exactly as for an explicit
+  # `Eff.op(...)` call or a stdlib fn written `: T / Stdout`. No name-keyed
+  # side table is needed; `check_body_row` still enforces row declaration
   # uniformly per CLAUDE.md Tier 1 #1.
-  let st_p = add_prelude_effect_label(st, callee, line, col)
+  let st_p = st
   match try_resume_call(st_p, callee, args_, line, col) {
     Some(inf) -> inf
     None ->
@@ -10968,66 +10993,11 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 
   synth_pipe_dispatch(st, "filter", lhs, rhs, line, col)
 
-# m12.8.x phase 4 (Bug 6): for the syntactically-bare prelude IO
-# builtins, accumulate the matching effect label on the caller's
-# row. Effect names follow Doc B's catalog: Console covers print
-# and eprint, Stdin owns read_line, File owns read_file and
-# write_file. The op-call pathway already handles explicit
-# `Eff.op(...)` calls; this shim closes the sugar-prelude gap.
-fn add_prelude_effect_label(st: InferState, callee: Expr,
-                              line: Int, col: Int) : InferState {
-  match callee.kind {
-    EVar(name) -> match prelude_effect_for(name) {
-      Some(eff) -> st_add_effect(st, eff, line, col)
-      None      -> st
-    }
-    _ -> st
-  }
-}
-
-fn prelude_effect_for(name: String) : Option[String] {
-  if name == "print" { Some("Stdout") }
-  else if name == "eprint" { Some("Stderr") }
-  # Issue #447: raw stdout writer for LSP framing rides Stdout too.
-  else if name == "write_stdout" { Some("Stdout") }
-  else if name == "read_line" { Some("Stdin") }
-  # Issue #453: byte-oriented stdin (LSP framing precursor).
-  else if name == "read_bytes" { Some("Stdin") }
-  else if name == "read_file" or name == "write_file" { Some("File") }
-  # Issue #345: fs/file expansion — exists/delete/rename also raise File.
-  else if name == "file_exists" or name == "file_delete" or name == "file_rename" { Some("File") }
-  # Issue #482: binary file IO raises File.
-  else if name == "file_read_bytes" or name == "file_write_bytes" { Some("File") }
-  # Issue #344: fs/dir ops ride the same File capability — no new effect.
-  else if name == "dir_list_dir" or name == "dir_create_dir" or name == "dir_remove_dir" or name == "dir_walk" { Some("File") }
-  # issue #251: bare prelude `array_set` / `array_grow` raise the
-  # `Mutable` demand on the caller's row. Provenance masking
-  # (issue #252) — implemented in `mask_local_mutable_demand`,
-  # invoked at the end of `infer_decl` — drops `Mutable` again when
-  # every demand targets a locally-constructed Array. `array_make`,
-  # `array_length`, `array_get` stay bare (constructors and reads).
-  else if name == "array_set" or name == "array_grow" { Some("Mutable") }
-  # issue #537: bare `args()` reads the process command-line
-  # snapshot; per docs/effects-stdlib.md §`Env` the op lives on
-  # `Env`, so the bare-sugar surface must raise the same demand
-  # the qualified `Env.args()` form does. `program_name()` is
-  # deliberately NOT in this table — issue #127 routed argv[0]
-  # through the `kai_g_argv` runtime snapshot (not handler-
-  # mediated), and `stdlib/os/args.kai` line 14-19 pins the
-  # wrapper as a pure read of process-wide constant state.
-  else if name == "args" { Some("Env") }
-  # issue #537: bare `exit(code)` terminates the process; per
-  # docs/effects-stdlib.md §`Process` the op lives on `Process`,
-  # so the bare-sugar surface must raise the same demand that
-  # `Process.exit(code)` does.
-  else if name == "exit" { Some("Process") }
-  else { None }
-}
-
 # issue #251 + #252 — Mutable provenance / masking pass.
 #
-# `add_prelude_effect_label` raises `Mutable` whenever the body
-# calls bare `array_set` / `array_grow` (the desugar of
+# The bare `array_set` / `array_grow` builtins raise `Mutable` on the
+# caller's row through their scheme (`add_prelude_sigs` via `fn_ty_eff`)
+# when the body calls them (the desugar of
 # `a[i] := v`). That over-approximates: a function that
 # constructs an Array locally, mutates it before returning, and
 # never lets the caller observe the act of mutation is
