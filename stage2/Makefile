@@ -360,7 +360,7 @@ test-llvm-coverage: $(TARGET) build
 	    fi; \
 	    rc=0; ./$(TARGET) $$f > build/cov-$$d-$$name.c 2>/dev/null || rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
-	      echo "coverage SKIP $$tag (kaic2 rejects without --prelude)"; \
+	      echo "coverage SKIP $$tag (kaic2 errored — likely an opt-in stdlib module used without import)"; \
 	      skip=$$((skip+1)); continue; \
 	    fi; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/cov-$$d-$$name.c -o build/cov-$$d-$$name-c 2>/dev/null $(LDLIBS_M) \
@@ -509,7 +509,7 @@ test-modules-derive-export: $(TARGET) build
 	for d in $(DERIVE_EXPORT_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.out.expected; \
-	  ./$(TARGET) --path ../examples/modules/$$d --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$src > build/mde-$$d.c \
+	  ./$(TARGET) --path ../examples/modules/$$d --path ../stdlib $$src > build/mde-$$d.c \
 	    || { echo "modules-derive-export FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mde-$$d.c -o build/mde-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-derive-export FAIL $$d (cc)"; exit 1; }; \
@@ -828,15 +828,15 @@ test-ffi-extern-c-asan: $(TARGET) build
 	  && echo "ffi-extern-c-asan OK (C backend, ASAN+UBSan clean)" \
 	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.out; exit 1; }
 
-# Issue #216 regression — qualified-call resolver inside a
-# `--prelude`-loaded file. The helper `qualified_call_in_prelude_lib`
-# defines bodies like `list.nth(xs, 1)`; before the fix the prelude
-# parse tree skipped the EField->EModCall rewrite and the typer
-# rejected the call as "undefined name `list`". Compiled with the
-# core stdlib preludes plus the helper file as an extra `--prelude`.
+# Issue #216 regression — qualified-call resolver inside a stdlib file.
+# The helper `qualified_call_in_prelude_lib` defines bodies like
+# `list.nth(xs, 1)`; before the fix the parse tree skipped the
+# EField->EModCall rewrite and the typer rejected the call as
+# "undefined name `list`". Compiled against the auto-loaded core plus
+# the helper file (resolved via `--path ../stdlib`).
 test-prelude-qualified-call: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	            ../examples/stdlib/qualified_call_in_prelude.kai \
 	            > build/qualified_call_in_prelude.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/qualified_call_in_prelude.c -o build/qualified_call_in_prelude $(LDLIBS_M) ; \
@@ -855,7 +855,7 @@ test-prelude-qualified-call: $(TARGET) build
 # (Int, Int) -> ?t`.
 test-issue-219-modcall: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	            ../examples/stdlib/issue_219_typer_modcall.kai \
 	            > build/issue_219_typer_modcall.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_219_typer_modcall.c -o build/issue_219_typer_modcall $(LDLIBS_M) ; \
@@ -874,7 +874,7 @@ test-issue-219-modcall: $(TARGET) build
 # count drifts as new stdlib tests land).
 test-issue-318: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	            --test ../examples/stdlib/issue_318_kai_test_prelude_scope.kai \
 	            > build/issue_318_kai_test_prelude_scope.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_318_kai_test_prelude_scope.c -o build/issue_318_kai_test_prelude_scope $(LDLIBS_M) ; \
@@ -895,7 +895,7 @@ test-issue-318: $(TARGET) build
 # `.out.expected` golden the C side uses.
 test-issue-524: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --emit=llvm --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --emit=llvm --path ../stdlib \
 	            ../examples/stdlib/fs_file_bytes_qualified.kai \
 	            > build/fs_file_bytes_qualified.ll; \
 	clang -w -I ../stage0 build/fs_file_bytes_qualified.ll \
@@ -915,7 +915,7 @@ test-issue-524: $(TARGET) build
 # pass too.
 test-issue-318-include: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	            --include-prelude-tests --test ../examples/stdlib/issue_318_kai_test_prelude_scope.kai \
 	            > build/issue_318_include.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_318_include.c -o build/issue_318_include $(LDLIBS_M) ; \
@@ -938,7 +938,7 @@ test-issue-318-include: $(TARGET) build
 # which avoids an unrelated prelude-test runtime panic under the flag).
 test-issue-746: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	            --include-prelude-tests --test ../examples/stdlib/issue_746_tuple_spread.kai \
 	            > build/issue_746.c 2> build/issue_746.err \
 	  || { echo "issue-746 FAIL (kaic2 errored — tuple-in-spread regressed)"; \
@@ -1213,7 +1213,7 @@ SECURERANDOM_FIXTURES := random_secure_basic
 test-securerandom-asan: $(TARGET) build
 	@set -e; \
 	for name in $(SECURERANDOM_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	  ./$(TARGET) --path ../stdlib \
 	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -1387,27 +1387,17 @@ test-unused-bindings: $(TARGET) build
 	    || { echo "unused-bindings DIFF $$name"; diff $$exp build/typer-$$name.err; exit 1; }; \
 	done
 
-# m14-pre — stdlib/core/*.kai list-op smoke tests. Each fixture under
-# examples/stdlib/ is compiled with kaic2 + the full split core
-# preludes and its stdout is diffed against `<name>.out.expected`.
-# One fixture per group of related ops: list_basic, list_*-by,
-# list_sort, …
+# stdlib smoke tests. Each fixture under examples/stdlib/ is compiled
+# with kaic2 and its stdout diffed against `<name>.out.expected`. One
+# fixture per group of related ops: list_basic, list_*-by, list_sort, …
 #
-# Routes through kaic2 to match bin/kai's actual prelude chain
-# (multiple --prelude flags, one per stdlib/core/*.kai file). The
-# earlier kaic1-only routing was retired when bin/kai migrated to
-# kaic2 + when the kaic2 typer learned to bind polymorphic prelude
-# calls. The naming-convention migration to `list.map` etc. is m14
-# proper (see stage2-design.md §m14).
-# Hanga Roa: the core module set is hard-coded into the compiler
-# via -DKAI_STDLIB_PATH and loaded automatically. The two legacy
-# `--prelude` aggregator variables now expand to empty so the
-# existing recipe call sites keep working without modification.
-# Fixtures that rely on optional stdlib modules (base64, hex, json,
-# collections, encoding/math/crypto, decimal/money/fx, uuid, regexp,
-# path, random*) must declare `import` themselves.
-CORE_PRELUDE_FLAGS :=
-EXTRA_PRELUDE_FLAGS :=
+# Hanga Roa: the core module set (core/*, math/numeric, math/complex,
+# protocols, effects, array) is loaded automatically by the compiler
+# from the compile-time KAI_STDLIB_PATH — there is no "prelude" and no
+# `--prelude` flag (both retired in 7c1bb4b). Fixtures that use an
+# opt-in stdlib module (base64, hex, json, collections, encoding/math/
+# crypto, decimal/money/fx, uuid, regexp, path, random*) must `import`
+# it themselves.
 
 # Cartography variant of `test-stdlib`: same fixture set, same
 # compilation+run pipeline, but does NOT abort on the first failure.
@@ -1421,7 +1411,7 @@ test-stdlib-survey: $(TARGET) build
 	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
 	  exp_err=../examples/stdlib/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    rc=0; ./$(TARGET) --path ../stdlib $$f \
 	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "stdlib FAIL $$name (expected error, got success)"; fail=$$((fail+1)); continue; \
@@ -1437,7 +1427,7 @@ test-stdlib-survey: $(TARGET) build
 	    fi; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c 2> build/stdlib-$$name.kaic2err; \
+	  ./$(TARGET) --path ../stdlib $$f > build/stdlib-$$name.c 2> build/stdlib-$$name.kaic2err; \
 	  rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "stdlib FAIL $$name (kaic2 errored)"; fail=$$((fail+1)); continue; \
@@ -1473,7 +1463,7 @@ test-stdlib: $(TARGET) build
 	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
 	  exp_err=../examples/stdlib/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    rc=0; ./$(TARGET) --path ../stdlib $$f \
 	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "stdlib FAIL $$name (expected error, got success)"; exit 1; \
@@ -1486,7 +1476,7 @@ test-stdlib: $(TARGET) build
 	    echo "stdlib OK $$name (rejected as expected)"; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f > build/stdlib-$$name.c \
+	  ./$(TARGET) --path ../stdlib $$f > build/stdlib-$$name.c \
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
@@ -1559,7 +1549,7 @@ test-stdlib: $(TARGET) build
 test-stdlib-crypto-asan: $(TARGET) build
 	@set -e; \
 	name=crypto_hash_basic; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	  || { echo "stdlib-crypto-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -1596,7 +1586,7 @@ test-stdlib-crypto-asan: $(TARGET) build
 test-stdlib-regex-predicate-asan: $(TARGET) build
 	@set -e; \
 	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	  ./$(TARGET) --path ../stdlib \
 	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -3060,7 +3050,7 @@ test-string: $(TARGET) build
 	  exp_out=../examples/string/$$name.out.expected; \
 	  exp_err=../examples/string/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    rc=0; ./$(TARGET) --path ../stdlib $$f \
 	      > /dev/null 2> build/str-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "string FAIL $$name (expected error, got success)"; exit 1; \
@@ -3072,7 +3062,7 @@ test-string: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "string OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    ./$(TARGET) --path ../stdlib $$f \
 	      > build/str-$$name.c \
 	      || { echo "string FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/str-$$name.c -o build/str-$$name $(LDLIBS_M) \
@@ -3932,7 +3922,7 @@ test-issue-678-stdout-buffered: $(TARGET) build
 # fix the sleeper would block for 60 seconds.
 test-issue-679-cancel-parked: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	  ../examples/effects/issue_679_cancel_reaches_parked.kai > build/iss679.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss679.c -o build/iss679 $(LDLIBS_M); \
 	./build/iss679 > build/iss679.out; \
@@ -3961,7 +3951,7 @@ test-issue-679-cancel-parked: $(TARGET) build
 # the test timed out.
 test-issue-682-cancel-sibling-handler: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) \
+	./$(TARGET) --path ../stdlib \
 	  ../examples/effects/issue_682_cancel_sibling_handler.kai > build/iss682.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss682.c -o build/iss682 $(LDLIBS_M); \
 	./build/iss682 > build/iss682.out; \
@@ -4426,7 +4416,7 @@ HTTP_CLIENT_FIXTURES := http_client_basic
 test-http-client-asan: $(TARGET) build
 	@set -e; \
 	for name in $(HTTP_CLIENT_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	  ./$(TARGET) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "http-client-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -4459,7 +4449,7 @@ ENV_MUTATE_FIXTURES := os_env_mutate
 test-env-mutate-asan: $(TARGET) build
 	@set -e; \
 	for name in $(ENV_MUTATE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	  ./$(TARGET) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "env-mutate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -4591,7 +4581,7 @@ test-ufcs: $(TARGET) build
 	  exp_out=../examples/ufcs/$$name.out.expected; \
 	  exp_err=../examples/ufcs/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $$f \
+	    rc=0; ./$(TARGET) --path ../stdlib $$f \
 	      > /dev/null 2> build/ufcs-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "ufcs FAIL $$name (expected error, got success)"; exit 1; \
@@ -4603,7 +4593,7 @@ test-ufcs: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "ufcs OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $$f > build/ufcs-$$name.c \
+	    ./$(TARGET) --path ../stdlib $$f > build/ufcs-$$name.c \
 	      || { echo "ufcs FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/ufcs-$$name.c -o build/ufcs-$$name $(LDLIBS_M) \
 	      || { echo "ufcs FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4831,7 +4821,7 @@ test-shadowing: $(TARGET) build
 	  exp_out=../examples/shadowing/$$name.out.expected; \
 	  exp_err=../examples/shadowing/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    rc=0; ./$(TARGET) --path ../stdlib $$f \
 	      > /dev/null 2> build/shadowing-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "shadowing FAIL $$name (expected error, got success)"; exit 1; \
@@ -4843,7 +4833,7 @@ test-shadowing: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "shadowing OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) --path ../stdlib $(CORE_PRELUDE_FLAGS) $(EXTRA_PRELUDE_FLAGS) $$f \
+	    ./$(TARGET) --path ../stdlib $$f \
 	      > build/shadowing-$$name.c \
 	      || { echo "shadowing FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/shadowing-$$name.c -o build/shadowing-$$name $(LDLIBS_M) \
