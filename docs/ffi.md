@@ -153,7 +153,12 @@ Three things are happening:
 - `Int`  → `int64_t`
 - `Real` → `double`
 - `Bool` → `int8_t` (0 / 1)
-- `Char` → `int32_t` (Unicode codepoint)
+- `Char` → `int32_t` (Unicode scalar value: `0..0x10FFFF` excluding
+  the surrogate range `0xD800..0xDFFF`). A `Char` produced inside
+  kaikai always satisfies this invariant; an `int32_t` crossing back
+  from C that is not a scalar value is undefined at the type level —
+  validate on the C side, or route through `int_to_char` (which panics
+  on a non-scalar-value argument). See issue #744.
 - `String` → `const char *` (NUL-terminated, kaikai-allocated;
   caller-side lifetime, do not free from C)
 - `Unit` → `void` (return only)
