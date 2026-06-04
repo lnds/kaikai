@@ -307,12 +307,23 @@ pub fn min_by(xs: [a], key: (a) -> Int) : Option[a] {
 # intermediate lists in declaration order without the explicit
 # concat traversal at the end. Empty input yields `[]`; an `f`
 # that always returns `[]` also yields `[]`.
-pub fn flat_map(xs: [a], f: (a) -> [b]) : [b] {
+#
+# Tail-recursive: prepend each `f(h)` reversed onto the accumulator,
+# then reverse once at the end. `list_append(f(h), flat_map(t, f))`
+# is not in tail position and grows the fiber stack per element
+# (issue #668); this form is a self-tail-call the backend TCOs.
+# `reverse_loop(f(h), acc)` pushes `f(h)`'s elements onto `acc` in
+# reverse, so after the whole walk `acc` is the full result reversed;
+# the final `reverse` restores declaration order. `f` is still
+# applied left-to-right.
+fn flat_map_loop[a, b](xs: [a], f: (a) -> [b], acc: [b]) : [b] {
   match xs {
-    [] -> []
-    [h, ...t] -> list_append(f(h), flat_map(t, f))
+    [] -> acc
+    [h, ...t] -> flat_map_loop(t, f, reverse_loop(f(h), acc))
   }
 }
+
+pub fn flat_map(xs: [a], f: (a) -> [b]) : [b] = reverse(flat_map_loop(xs, f, []))
 
 # Zips `xs` and `ys` element-wise through `f`. Terminates at the
 # shorter list — the leftover suffix of the longer one is
@@ -447,21 +458,37 @@ pub fn reverse(xs: [a]) : [a] = reverse_loop(xs, [])
 # Maps `f` over `xs`, propagating any effects in `f` through the
 # row variable `e`. Empty input yields `[]`; `f` is invoked exactly
 # once per element, in left-to-right order.
-pub fn map[a, b, e](xs: [a], f: (a) -> b / e) : [b] / e {
+#
+# Tail-recursive over an accumulator (then one `reverse`) rather than
+# the natural `[f(h), ...map(t, f)]`: the latter is NOT in tail
+# position (the recursive call sits inside the cons), so it grows one
+# C frame per element and overflows the 64 KiB fiber stack on large
+# lists (issue #668). The accumulator form is a self-tail-call the
+# backend TCOs into a goto-loop, so it runs in O(1) stack. `f` is
+# still applied left-to-right (the accumulator prepends in input
+# order, the final `reverse` restores it), so the effect order is
+# unchanged.
+fn map_loop[a, b, e](xs: [a], f: (a) -> b / e, acc: [b]) : [b] / e {
   match xs {
-    [] -> []
-    [h, ...t] -> [f(h), ...map(t, f)]
+    [] -> acc
+    [h, ...t] -> map_loop(t, f, [f(h), ...acc])
   }
 }
 
+pub fn map[a, b, e](xs: [a], f: (a) -> b / e) : [b] / e = reverse(map_loop(xs, f, []))
+
 # Returns the elements of `xs` for which `p` returns true,
 # preserving order. `p` is invoked exactly once per element.
-pub fn filter[a, e](xs: [a], p: (a) -> Bool / e) : [a] / e {
+# Tail-recursive + reverse for the same O(1)-stack reason as `map`
+# (issue #668): `[h, ...filter(t, p)]` is not in tail position.
+fn filter_loop[a, e](xs: [a], p: (a) -> Bool / e, acc: [a]) : [a] / e {
   match xs {
-    [] -> []
-    [h, ...t] -> if p(h) { [h, ...filter(t, p)] } else { filter(t, p) }
+    [] -> acc
+    [h, ...t] -> if p(h) { filter_loop(t, p, [h, ...acc]) } else { filter_loop(t, p, acc) }
   }
 }
+
+pub fn filter[a, e](xs: [a], p: (a) -> Bool / e) : [a] / e = reverse(filter_loop(xs, p, []))
 
 # Tail-recursive left fold. `f` is invoked once per element with
 # the running accumulator on the left and the element on the
