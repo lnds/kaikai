@@ -3372,18 +3372,34 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
  * pointers. A missing mask would make it treat a raw i64 key as a
  * pointer and decref garbage. The `_seen` guard makes the steady-state
  * cost a single predictable branch. */
-static inline KaiValue *kai_variant_u_fast(int32_t tag, const char *name,
-                                           int n, uint32_t mask,
+static inline KaiValue *kai_variant_u_fast(int32_t tag, int n,
                                            KaiVarSlot *slots) {
-    kai_varname_register(tag, name);
-    kai_slotmask_register(tag, mask);
-    /* No-zero alloc: the loop below writes all n slots, so the
-     * allocator's zero-init is dead work (Koka kk_alloc shape). */
+    /* No tag→name/mask register here: every payload ctor's name+mask is
+     * stamped ONCE at startup by kai_register_payload_ctors (emitted in
+     * _kai_register_proto_tables). Keeping the registers in the body made
+     * the fn too large for the inliner — at -O3 it stayed a separate
+     * 31.8M-instruction function (callgrind). Reduced to alloc+stores it
+     * inlines into the call site, the Koka kk_alloc + field-stores shape.
+     * No-zero alloc: the loop writes all n slots, so the allocator's
+     * zero-init is dead work. */
     KaiValue *v = kai_alloc_var_nz(n);
     v->variant_tag = tag;
     v->var_n_args = (uint8_t) n;
     for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
     return v;
+}
+
+/* Stamp the tag→name and tag→mask tables for every payload-carrying
+ * constructor at startup, so kai_variant_u_fast needs no per-call
+ * register (and stays small enough to inline). The emitter generates the
+ * (tag, name, mask) triples table and one call to this in
+ * _kai_register_proto_tables, beside kai_register_reusable_tags. */
+typedef struct { int32_t tag; const char *name; uint32_t mask; } KaiPayloadCtor;
+static void kai_register_payload_ctors(const KaiPayloadCtor *ctors, int n) {
+    for (int i = 0; i < n; ++i) {
+        kai_varname_register(ctors[i].tag, ctors[i].name);
+        kai_slotmask_register(ctors[i].tag, ctors[i].mask);
+    }
 }
 
 /* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
