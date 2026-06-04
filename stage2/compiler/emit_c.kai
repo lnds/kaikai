@@ -1670,20 +1670,25 @@ fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
     let mask = variant_slot_mask(tys, cx.enums)
     let slot_inits = emit_variant_slot_init_list(src, args_e, tys, cx)
     let tag_str = int_to_string(evar_find_tag(cx.variants, name))
-    # Piece 1 — outside a region, a primitive-slot ctor goes through the
-    # inlined `kai_variant_u_fast`: it skips the NOINLINE preamble and the
-    # two cache probes (both inapplicable to a primitive-slot cell — the
-    # nullary cache needs n==0, the immortal-args cache skips primitive
-    # slots) and keeps only the idempotent tag→name/mask registers the
-    # generic drop walker needs. In a region the arena ctor still owns the
-    # alloc (its cells die with the arena, not via RC), so that path is
-    # unchanged. Same (tag,name,n,mask,slots) call shape either way.
-    let ctor = if cx.in_region { emit_variant_ctor(cx) } else { "kai_variant_u_fast(" }
-    Some(concat_all([
-      ctor, tag_str, ", \"", name, "\", ", int_to_string(n),
-      ", ", int_to_string(mask),
-      ", (KaiVarSlot[]){", slot_inits, "})"
-    ]))
+    # Outside a region, a primitive-slot ctor goes through the inlined
+    # `kai_variant_u_fast(tag, n, slots)`: alloc + slot stores only. Its
+    # tag→name/mask is registered once at startup (kai_register_payload_
+    # ctors), so the body carries no register and the inliner folds it
+    # into the caller — the Koka kk_alloc + field-stores shape. In a
+    # region the arena ctor owns the alloc (cells die with the arena, not
+    # via RC) and keeps the full (tag,name,n,mask,slots) call shape.
+    if cx.in_region {
+      Some(concat_all([
+        emit_variant_ctor(cx), tag_str, ", \"", name, "\", ", int_to_string(n),
+        ", ", int_to_string(mask),
+        ", (KaiVarSlot[]){", slot_inits, "})"
+      ]))
+    } else {
+      Some(concat_all([
+        "kai_variant_u_fast(", tag_str, ", ", int_to_string(n),
+        ", (KaiVarSlot[]){", slot_inits, "})"
+      ]))
+    }
   } else {
     None
   }
@@ -7486,10 +7491,32 @@ fn has_main_decl(decls: [Decl]) : Bool {
 # emit an `-1` slot that the runtime hashmap ignores; v1 supports the
 # stdlib heads/protos pinned in `docs/variant-tags.md`.
 #
+# Emit `{tag, "name", mask}` rows for every constructor that carries a
+# primitive slot — exactly the ctors the emitter lowers to
+# `kai_variant_u_fast`, which no longer registers its own tag→name/mask.
+# Walks the whole EVar table so the startup registration covers every
+# such ctor regardless of where it is constructed. A ctor with no
+# primitive slot is skipped (it goes through kai_variant_u, which still
+# self-registers). The mask matches the construction site exactly
+# (variant_slot_mask over the same payload tys).
+fn emit_payload_ctor_rows(variants: [EVar], enums: [String]) : String = match variants {
+  []           -> ""
+  [v, ...rest] -> match v {
+    EV(nm, tag, tys, _) ->
+      if variant_has_primitive_slot(tys, enums) {
+        concat_all([
+          "{", int_to_string(tag), ", \"", nm, "\", ",
+          int_to_string(variant_slot_mask(tys, enums)), "}, ",
+          emit_payload_ctor_rows(rest, enums)
+        ])
+      } else { emit_payload_ctor_rows(rest, enums) }
+  }
+}
+
 # `kai_variant_to_head` is rebuilt the same way: every entry in
 # `variants` (the global EVar table) gets its head tag derived from
 # the constructor->sum mapping in the user's declarations.
-fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn]) : String {
+fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn], enums: [String]) : String {
   let impl_rows = collect_pimpl_rows(decls, fns, [])
   let v2h       = collect_variant_to_head(variants, decls)
   let n_impl    = list_length(impl_rows)
@@ -7509,6 +7536,12 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn]) : Stri
   let reuse_tags  = reuse_ctor_tags(reuse_ctors, variants, [])
   let n_reuse     = list_length(reuse_tags)
   let reuse_arr   = emit_reuse_tag_array(reuse_tags)
+  # Payload-ctor startup registration — name+mask for every primitive-slot
+  # ctor, so kai_variant_u_fast carries no per-call register and inlines.
+  let pctor_vars = filter_primitive_slot_ctors(variants, enums)
+  let n_pctor    = list_length(pctor_vars)
+  let pctor_rows = emit_payload_ctor_rows(variants, enums)
+  let pctor_arr  = if n_pctor == 0 { "{-1, \"\", 0}" } else { pctor_rows }
   concat_all([
     fwds,
     "static const int32_t _kai_variant_to_head_tbl[] = {",
@@ -7520,6 +7553,9 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn]) : Stri
     "static const int32_t _kai_reusable_tags_tbl[] = {",
     reuse_arr,
     "};\n",
+    "static const KaiPayloadCtor _kai_payload_ctors_tbl[] = {",
+    pctor_arr,
+    "};\n",
     "static void _kai_register_proto_tables(void) {\n",
     "    kai_register_variant_heads(_kai_variant_to_head_tbl, ",
     int_to_string(n_v2h), ");\n",
@@ -7527,8 +7563,22 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn]) : Stri
     int_to_string(n_impl), ");\n",
     "    kai_register_reusable_tags(_kai_reusable_tags_tbl, ",
     int_to_string(n_reuse), ");\n",
+    "    kai_register_payload_ctors(_kai_payload_ctors_tbl, ",
+    int_to_string(n_pctor), ");\n",
     "}\n\n"
   ])
+}
+
+# Filter the EVar table to ctors carrying a primitive slot — the ones
+# lowered to kai_variant_u_fast and needing startup name/mask registration.
+fn filter_primitive_slot_ctors(variants: [EVar], enums: [String]) : [EVar] = match variants {
+  []           -> []
+  [v, ...rest] -> match v {
+    EV(_, _, tys, _) ->
+      if variant_has_primitive_slot(tys, enums) {
+        [v, ...filter_primitive_slot_ctors(rest, enums)]
+      } else { filter_primitive_slot_ctors(rest, enums) }
+  }
 }
 
 # Map reuse-target ctor names to their integer tags via the global
@@ -7833,8 +7883,8 @@ fn emit_nullary_enum_seed(variants: [EVar]) : String = match variants {
     } else { emit_nullary_enum_seed(rest) }
 }
 
-fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EFn]) : String {
-  let proto_tables = emit_proto_runtime_tables(decls, variants, fns)
+fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EFn], enums: [String]) : String {
+  let proto_tables = emit_proto_runtime_tables(decls, variants, fns, enums)
   let proto_init   = concat_all(["    _kai_register_proto_tables();\n", emit_nullary_enum_seed(variants)])
   match bmode {
     BMTest -> {
@@ -8573,7 +8623,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
-  let main_wr = emit_main_wrapper(decls, bmode, variants, fns)
+  let main_wr = emit_main_wrapper(decls, bmode, variants, fns, enum_names)
   concat_all([header, mono_structs, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
