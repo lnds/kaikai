@@ -1755,6 +1755,62 @@ static KaiValue *kai_alloc_var(int n) {
 #define kai_alloc_var(n) kai_alloc_var_traced((n), __builtin_return_address(0))
 #endif
 
+/* No-zero variant block allocator. Identical to kai_alloc_var except it
+ * skips the calloc/memset zero-init: the caller (kai_variant_u_fast)
+ * writes all n payload slots immediately after, so zeroing them is dead
+ * work — measured 22M instructions (6%) of the rb-tree bench sat in
+ * _int_malloc+calloc, the zero pass over 6.96M × 48 B nodes. malloc
+ * leaves the slots indeterminate, which is sound ONLY because every slot
+ * is overwritten before any read; the drop walker never sees an
+ * unwritten slot. This is Koka's kk_alloc (raw malloc, no zero) — the
+ * cell is fully initialised by the constructor, not by the allocator.
+ *
+ * The header fields the generic runtime reads (rc, tag, var_n_args,
+ * variant_tag) are all written here or by the caller, so none rely on
+ * the zero. Under tracing the alloc_site / scope_fn fields are written
+ * explicitly too. */
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_var_nz_traced(int n, void *site) {
+#else
+static KaiValue *kai_alloc_var_nz(int n) {
+#endif
+    KAI_PROF_ENTER();
+    KaiValue *v;
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
+        v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
+        /* pool block: no memset — caller overwrites every slot */
+    } else {
+        v = (KaiValue *) malloc(kai_var_block_size(n));
+    }
+#else
+    v = (KaiValue *) malloc(kai_var_block_size(n));
+#endif
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->rc = 1;
+    v->tag = (uint8_t) KAI_VARIANT;
+    kai_rc_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    kai_rc_alloc_by_tag[(int) KAI_VARIANT]++;
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
+    kai_leaksite_register_once();
+#endif
+    KAI_PROF_EXIT(alloc);
+    return v;
+}
+#ifdef KAI_TRACE_RC
+#define kai_alloc_var_nz(n) kai_alloc_var_nz_traced((n), __builtin_return_address(0))
+#endif
+
 /* FAM lane: return a variant block (header + inline slots) to its
  * per-arity pool, or free it. Used by kai_free_value's VARIANT case
  * in place of (kai_slots_free + cell-pool return). */
@@ -3321,7 +3377,9 @@ static inline KaiValue *kai_variant_u_fast(int32_t tag, const char *name,
                                            KaiVarSlot *slots) {
     kai_varname_register(tag, name);
     kai_slotmask_register(tag, mask);
-    KaiValue *v = kai_alloc_var(n);
+    /* No-zero alloc: the loop below writes all n slots, so the
+     * allocator's zero-init is dead work (Koka kk_alloc shape). */
+    KaiValue *v = kai_alloc_var_nz(n);
     v->variant_tag = tag;
     v->var_n_args = (uint8_t) n;
     for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
