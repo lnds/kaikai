@@ -2803,12 +2803,26 @@ static void kai_char_cache_warm(void) {
 /* Koka kk_integer_from_small (integer.h:211-215): a small Int is an
  * immediate value — no heap, no RC. Only out-of-range Ints (Koka's
  * bigint path) heap-allocate a KAI_INT fallback. The 5 MB int cache is
- * gone; immediacy makes it pointless. */
-static KAI_RC_NOINLINE KaiValue *kai_int(int64_t i) {
-    if (kai_int_fits_immediate(i)) return kai_tagged_int(i);
+ * gone; immediacy makes it pointless.
+ *
+ * `kai_int` is the inline fast path: a 63-bit-fitting value (the
+ * overwhelming common case — every loop counter, key, index) becomes a
+ * tagged immediate with one shift and no call. Only the out-of-range
+ * bignum tail detours to the NOINLINE heap-alloc helper. Before this
+ * split `kai_int` was wholly NOINLINE, so reading an Int back from a
+ * KAI_VAR_SLOT_INT slot (`kai_int(slot.i64)`) was a real call at every
+ * field touch — the round-trip that made the raw-i64 slot kind look
+ * slower than the tagged-ptr slot. With the fast path inlined the slot
+ * read is a shift, the slot stays KAI_VAR_SLOT_INT (so the generic drop
+ * walker skips it — no decref on keys), and both wins compose. */
+static KAI_RC_NOINLINE KaiValue *kai_int_big(int64_t i) {
     KaiValue *v = kai_alloc(KAI_INT);
     v->as.i = i;
     return v;
+}
+static inline KaiValue *kai_int(int64_t i) {
+    if (kai_int_fits_immediate(i)) return kai_tagged_int(i);
+    return kai_int_big(i);
 }
 
 /* Uniform Int accessors — understand BOTH the immediate and the heap
