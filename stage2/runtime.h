@@ -3274,6 +3274,46 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
     return v;
 }
 
+/* Fast typed constructor for a payload-carrying variant with at least
+ * one PRIMITIVE slot (the only case the emitter routes here).
+ *
+ * `kai_variant_u` runs a per-call preamble before the actual
+ * alloc+stores: KAI_VAR_NAME_ALLOC, kai_varname_register,
+ * kai_slotmask_register, then a nullary-singleton probe and an
+ * immortal-args cache probe (262144-bucket hash + linear scan). It is
+ * also KAI_RC_NOINLINE — a real call with argument spill at every one of
+ * millions of construction sites (perfil: kai_variant_u = 43 samples,
+ * second only to the loop body itself).
+ *
+ * For a cell with a primitive slot NONE of that preamble can help: the
+ * nullary cache needs n == 0, and the immortal-args cache explicitly
+ * skips cells with primitive slots ("their identity is the bit pattern,
+ * which the cache shape does not key on"). So the only preamble work
+ * that matters is registering tag→name and tag→mask — and both
+ * registers are already idempotent (`kai_slotmask_seen[tag]` /
+ * `kai_varname_table[tag]` guard the first write). This fast path keeps
+ * exactly those two idempotent registers (so the generic drop walker
+ * reads the correct mask) and drops everything else, inlined so the C
+ * compiler folds the alloc + the fixed-bound store loop into the caller
+ * — Koka's `kk_alloc(sizeof) + field stores` shape.
+ *
+ * Mask MUST be registered here (not assumed pre-stamped): the walker in
+ * kai_free_value reads kai_slot_mask_of(tag) to decide which slots are
+ * pointers. A missing mask would make it treat a raw i64 key as a
+ * pointer and decref garbage. The `_seen` guard makes the steady-state
+ * cost a single predictable branch. */
+static inline KaiValue *kai_variant_u_fast(int32_t tag, const char *name,
+                                           int n, uint32_t mask,
+                                           KaiVarSlot *slots) {
+    kai_varname_register(tag, name);
+    kai_slotmask_register(tag, mask);
+    KaiValue *v = kai_alloc_var(n);
+    v->variant_tag = tag;
+    v->var_n_args = (uint8_t) n;
+    for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+    return v;
+}
+
 /* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
  * constructors. Mirror kai_cons / kai_record / kai_variant_u but
  * bump-allocate the header (and interior arrays) into the current
