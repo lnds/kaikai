@@ -5810,6 +5810,80 @@ static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
 
+/* UTF-8 codepoint decode primitives (issue #744). `string.chars()`,
+ * `char_count`, `char_indices` are written in kaikai over these two:
+ * walk the byte buffer advancing `off += string_cp_len(s, off)` and
+ * read the codepoint with `string_cp_at(s, off)`. Keeping the decode
+ * in C (one lead-byte classification per call) avoids a kaikai byte
+ * loop that would box an Int per byte. Lenient at the value level: a
+ * malformed lead byte decodes to its raw byte value so a corrupt
+ * buffer never traps here (the scalar-value invariant is enforced at
+ * `int_to_char` / char-literal lexing, not on every decode). */
+static int kai_utf8_seq_len(unsigned char b0) {
+    if (b0 < 0x80)            return 1;
+    if ((b0 & 0xE0) == 0xC0)  return 2;
+    if ((b0 & 0xF0) == 0xE0)  return 3;
+    if ((b0 & 0xF8) == 0xF0)  return 4;
+    return 1;  /* malformed lead byte: consume one byte */
+}
+
+/* Byte-width (1..4) of the UTF-8 sequence starting at byte index `off`.
+ * Returns 0 on out-of-range / wrong type so a kaikai walk terminates. */
+static KaiValue *kai_prelude_string_cp_len(KaiValue *s, KaiValue *off) {
+    int64_t w = 0;
+    if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
+        int64_t i = kai_intf(off);
+        if (i >= 0 && (size_t) i < s->as.s.len) {
+            int seq = kai_utf8_seq_len((unsigned char) s->as.s.bytes[i]);
+            size_t avail = s->as.s.len - (size_t) i;
+            w = ((size_t) seq > avail) ? (int64_t) avail : (int64_t) seq;
+        }
+    }
+    if (s)   kai_decref(s);
+    if (off) kai_decref(off);
+    return kai_int(w);
+}
+
+/* Decode the codepoint of the UTF-8 sequence starting at byte index
+ * `off`. Returns -1 on out-of-range / wrong type. Continuation bytes
+ * beyond the buffer are skipped (lenient, matches the clamp above). */
+static KaiValue *kai_prelude_string_cp_at(KaiValue *s, KaiValue *off) {
+    int64_t cp = -1;
+    if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
+        int64_t i = kai_intf(off);
+        if (i >= 0 && (size_t) i < s->as.s.len) {
+            const unsigned char *b = (const unsigned char *) s->as.s.bytes;
+            size_t len = s->as.s.len;
+            unsigned char b0 = b[i];
+            if (b0 < 0x80) {
+                cp = b0;
+            } else {
+                uint32_t v;
+                int extra;
+                if      ((b0 & 0xE0) == 0xC0) { v = b0 & 0x1F; extra = 1; }
+                else if ((b0 & 0xF0) == 0xE0) { v = b0 & 0x0F; extra = 2; }
+                else if ((b0 & 0xF8) == 0xF0) { v = b0 & 0x07; extra = 3; }
+                else                          { v = b0; extra = 0; }
+                size_t j = (size_t) i + 1;
+                while (extra-- > 0 && j < len) {
+                    v = (v << 6) | (b[j] & 0x3F);
+                    j++;
+                }
+                /* Malformed input can decode above U+10FFFF or into the
+                 * surrogate range; map such non-scalar values to U+FFFD
+                 * (replacement char) so a `chars()` walk never feeds a
+                 * non-codepoint to `int_to_char` (which would panic).
+                 * Well-formed UTF-8 never hits this. */
+                if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) v = 0xFFFD;
+                cp = (int64_t) v;
+            }
+        }
+    }
+    if (s)   kai_decref(s);
+    if (off) kai_decref(off);
+    return kai_int(cp);
+}
+
 static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
     KaiValue *acc;
     if (!s || s->tag != KAI_STR) {
@@ -5881,10 +5955,27 @@ static KaiValue *kai_prelude_char_to_int(KaiValue *c) {
     return kai_int(value);
 }
 
+/* Issue #744: `int_to_char` carries the `Char` scalar-value invariant.
+ * An argument outside the Unicode scalar-value range — negative, above
+ * U+10FFFF, or in the surrogate range U+D800..U+DFFF — is not a
+ * codepoint; constructing a `Char` from it is a programming error, so
+ * we panic (an audited runtime escape per Tier 1 #1, the same class as
+ * array out-of-bounds) rather than silently producing garbage. This
+ * keeps every `Char` in a running program a valid scalar value while
+ * leaving `int_to_char` total in its type. Byte values 0..255 (the
+ * common "build a byte" idiom) are all valid scalar values and pass
+ * unchanged. */
 static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
-    uint32_t value = (kai_is_int(n)) ? (uint32_t) kai_intf(n) : 0;
+    int64_t cp = (kai_is_int(n)) ? kai_intf(n) : 0;
     if (n) kai_decref(n);
-    return kai_char(value);
+    if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        char msg[96];
+        snprintf(msg, sizeof msg,
+                 "int_to_char: %lld is not a Unicode scalar value "
+                 "(0..0x10FFFF excluding surrogates)", (long long) cp);
+        kai_prelude_panic(kai_str(msg));
+    }
+    return kai_char((uint32_t) cp);
 }
 
 /* Build a 1-byte String holding the low 8 bits of `n`. Unlike
@@ -6064,6 +6155,8 @@ static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
 static KaiValue *_kai_prelude_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_int_to_byte_string(a[0]); }
 static KaiValue *_kai_prelude_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_byte_at_int(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_cp_at(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_cp_len(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_hash(a[0]); }
 static KaiValue *_kai_prelude_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_bits(a[0]); }
 static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }

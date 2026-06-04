@@ -174,7 +174,9 @@ Empty row means pure.
 fn main() : Unit / Stdout = {
   let n = 42 + 0xFF + 0b1010                   # numbers
   let r = 3.14 + 2.5e-2                        # reals
-  let c = 'A'                                  # chars
+  let c = 'A'                                  # chars (Unicode scalar
+  let acc = 'á'                                #   value; 'á' '▸'
+  let emo = '\u{1F389}'                        #   '\u{1F389}' all lex)
   let s = "hello, #{int_to_string(n)}"         # interpolation
   let xs = [1, 2, 3]                           # list
   let r1 = [1..10]                             # range

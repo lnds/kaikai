@@ -49,6 +49,18 @@
 # the file-local candidate win for callers inside `core/list.kai`
 # and external callers must qualify (`string.concat` /
 # `list.concat`) when both are in scope.
+# `CharIndex` pairs a Unicode codepoint with the byte offset at which it
+# begins in the buffer — the element type of `char_indices` (issue #744).
+# A nominal record rather than a sugared `(Int, Char)` tuple: `.off`/`.cp`
+# read clearer than `.fst`/`.snd` at the call sites #745 `display_width`
+# and TUI consumers build on.
+pub type CharIndex = { off: Int, cp: Char }
+
+# `length(s)` is the byte count (O(1)) — the cheap substrate length,
+# matching the byte-indexed `slice`/`char_at` family it sits with. For
+# the Unicode codepoint count use `char_count`; `byte_length` is an
+# explicit synonym of this when the unit needs to be unambiguous at a
+# call site (issue #744).
 pub fn length(s: String) : Int = string_length(s)
 pub fn slice(s: String, from: Int, len: Int) : String = string_slice(s, from, len)
 pub fn to_int(s: String) : Option[Int] = string_to_int(s)
@@ -214,20 +226,78 @@ fn lines_drop_trailing_empty(xs: [String]) : [String] {
 
 pub fn lines(s: String) : [String] = lines_drop_trailing_empty(string_split(s, "\n"))
 
-# `chars(s)` returns the list of bytes in `s` as `Char`s. The list
-# preserves source order. ASCII semantics — multibyte sequences are
-# split into their constituent bytes.
-fn string_chars_loop(s: String, i: Int, acc: [Char]) : [Char] {
+# `bytes(s)` returns the list of bytes in `s` as `Char`s, one element
+# per byte. The list preserves source order. A multibyte UTF-8 sequence
+# is split into its constituent bytes (so `bytes("á")` is two elements:
+# 0xC3, 0xA1). This is the byte-level view; for Unicode codepoints use
+# `chars`. (Issue #744: this is the former `chars`, renamed to stop the
+# name lying about what it returns.)
+fn string_bytes_loop(s: String, i: Int, acc: [Char]) : [Char] {
   if i < 0 { acc }
   else {
     match char_at(s, i) {
-      Some(c) -> string_chars_loop(s, i - 1, [c, ...acc])
-      None    -> string_chars_loop(s, i - 1, acc)
+      Some(c) -> string_bytes_loop(s, i - 1, [c, ...acc])
+      None    -> string_bytes_loop(s, i - 1, acc)
     }
   }
 }
 
-pub fn chars(s: String) : [Char] = string_chars_loop(s, string_length(s) - 1, [])
+pub fn bytes(s: String) : [Char] = string_bytes_loop(s, string_length(s) - 1, [])
+
+# `chars(s)` returns the list of Unicode codepoints in `s`, decoding
+# the UTF-8 buffer. `chars("áé▸")` is three elements (0xE1, 0xE9,
+# 0x25B8), unlike `bytes` which would give seven. This is the
+# codepoint-level view a TUI/i18n consumer wants (issue #744). O(n) and
+# materialized — kaikai has no lazy sequence type yet, matching Python 3
+# `list(s)`. For just the count without building the list use
+# `char_count`; for codepoints with their byte offsets use `char_indices`.
+fn string_chars_loop(s: String, off: Int, n: Int) : [Char] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [int_to_char(cp), ...string_chars_loop(s, off + step, n)]
+  }
+}
+
+pub fn chars(s: String) : [Char] = string_chars_loop(s, 0, string_length(s))
+
+# `char_count(s)` is the number of Unicode codepoints in `s` — the
+# honest codepoint length, distinct from `length`/`byte_length` (bytes).
+# Walks the buffer without materializing a list (issue #744).
+fn string_char_count_loop(s: String, off: Int, n: Int, acc: Int) : Int {
+  if off >= n { acc }
+  else {
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    string_char_count_loop(s, off + step, n, acc + 1)
+  }
+}
+
+pub fn char_count(s: String) : Int = string_char_count_loop(s, 0, string_length(s), 0)
+
+# `byte_length(s)` is the explicit byte count — a synonym of `length`,
+# spelled to make the unit unambiguous at the call site next to
+# `char_count` (issue #744).
+pub fn byte_length(s: String) : Int = string_length(s)
+
+# `char_indices(s)` pairs each codepoint with the byte offset at which
+# it begins: `char_indices("á!")` is `[{off:0, cp:0xE1}, {off:2, cp:0x21}]`
+# (the `!` starts at byte 2 because `á` is two UTF-8 bytes). For consumers
+# that need both the codepoint and where it sits in the byte buffer in a
+# single pass (issue #744; the shape #745 `display_width` builds on).
+fn string_char_indices_loop(s: String, off: Int, n: Int) : [CharIndex] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [CharIndex { off: off, cp: int_to_char(cp) }, ...string_char_indices_loop(s, off + step, n)]
+  }
+}
+
+pub fn char_indices(s: String) : [CharIndex] = string_char_indices_loop(s, 0, string_length(s))
 
 # `is_blank(s)` is `true` for the empty string and for any string
 # whose bytes are all whitespace per the same rule used by `trim`
@@ -331,11 +401,38 @@ test "lines — basic, trailing newline, embedded blanks, empty" {
   assert lines("hello") == ["hello"]
 }
 
-test "chars — empty, single, multi" {
+test "chars — empty, single, multi (ASCII: byte == codepoint)" {
   assert chars("") == []
   assert chars("a") == ['a']
   assert chars("abc") == ['a', 'b', 'c']
   assert chars("ab\n") == ['a', 'b', '\n']
+}
+
+test "bytes — byte-level view, multibyte splits into bytes" {
+  assert bytes("") == []
+  assert bytes("abc") == ['a', 'b', 'c']
+  # "á" is 0xC3 0xA1 in UTF-8 — two bytes, two elements.
+  assert bytes("á") == [int_to_char(195), int_to_char(161)]
+}
+
+test "chars — codepoint-level view, multibyte decodes to one codepoint" {
+  # "áé▸" is 7 bytes, 3 codepoints (issue #744): á=0xE1, é=0xE9, ▸=0x25B8.
+  assert chars("áé▸") == [int_to_char(225), int_to_char(233), int_to_char(9656)]
+}
+
+test "char_count / byte_length — codepoints vs bytes" {
+  assert char_count("") == 0
+  assert char_count("abc") == 3
+  assert char_count("áé▸") == 3
+  assert byte_length("áé▸") == 7
+  assert length("áé▸") == 7        # length is bytes, same as byte_length
+}
+
+test "char_indices — codepoint with its starting byte offset" {
+  # "á!" — á at byte 0 (2 bytes), '!' at byte 2.
+  assert char_indices("á!") ==
+    [CharIndex { off: 0, cp: int_to_char(225) },
+     CharIndex { off: 2, cp: int_to_char(33) }]
 }
 
 test "is_blank — empty/spaces/tabs/newlines true; with content false" {

@@ -500,6 +500,8 @@ static const struct {
     { "int_to_char",    "kai_prelude_int_to_char",    1 },
     { "int_to_byte_string", "kai_prelude_int_to_byte_string", 1 },
     { "string_byte_at_int", "kai_prelude_string_byte_at_int", 2 },
+    { "string_cp_at",   "kai_prelude_string_cp_at",   2 },
+    { "string_cp_len",  "kai_prelude_string_cp_len",  2 },
     { "array_make",     "kai_prelude_array_make",     2 },
     { "array_length",   "kai_prelude_array_length",   1 },
     { "array_get",      "kai_prelude_array_get",      2 },
