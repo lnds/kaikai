@@ -12665,18 +12665,26 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
     Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
     None                  -> tcrec_emit_rebinds(pnames, 0)
   }
+  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", args_e, tys_opt, holeslot, 0, cx)
   concat_all([
-    "({ KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
     # captured from the consumed scrutinee when it was unique) — Koka
-    # uniform reuse. kai_variant_at overwrites the donated cell in place
-    # when `_arm_ru` is non-null, else fresh-allocs. `_arm_ru` is declared
-    # fn-wide and null by default (emit_fn_body), so a TRMC step outside an
-    # arm-top-reuse arm fresh-allocs exactly as before. Consume the token:
-    # reset to null so a later step in the same descent fresh-allocs (the
-    # cctx loop produces one node per level; the donated cell is used once).
-    "KaiValue *_trmc_node = kai_variant_at(_arm_ru, ", tag_str, ", \"", cname, "\", ",
-    int_to_string(n), ", ", int_to_string(mask), ", _trmc_sl); _arm_ru = kai_reuse_null; ",
+    # uniform reuse. When the donated cell matches tag/arity, write the
+    # rebuilt slots DIRECTLY into it (`_con->field = ...`, Koka's shape)
+    # instead of building a stack KaiVarSlot[] and having kai_variant_at
+    # copy it — the array build + copy was ~10 stores per descent level;
+    # direct stores are ~5. The fresh-alloc fallback (token null / arity
+    # mismatch) keeps the array path via kai_variant_u_fast. `_arm_ru` is
+    # null by default (emit_fn_body), so a TRMC step outside an arm-top-
+    # reuse arm fresh-allocs exactly as before. Consume the token: reset
+    # to null so a later step in the same descent fresh-allocs.
+    "({ KaiValue *_trmc_node; ",
+    "if (_arm_ru != NULL && _arm_ru->tag == KAI_VARIANT && _arm_ru->var_n_args == ", int_to_string(n), ") { ",
+    "_trmc_node = _arm_ru; ", slot_stores,
+    "_trmc_node->variant_tag = ", tag_str, "; _trmc_node->rc = 1; ",
+    "} else { KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
+    "_trmc_node = kai_variant_u_fast(", tag_str, ", ", int_to_string(n), ", _trmc_sl); } ",
+    "_arm_ru = kai_reuse_null; ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
     "kai_field_addr_create(&kai_var_slots(_trmc_node)[", int_to_string(holeslot), "].ptr)); ",
     arg_lets, drops, rebinds,
@@ -12735,6 +12743,51 @@ fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]]
         }
       let sep = match rest { [] -> "" _ -> ", " }
       concat_all([head, sep, emit_trmc_slot_inits(src, rest, tys_opt, holeslot, i + 1, cx)])
+    }
+  }
+}
+
+# Like emit_trmc_slot_inits, but emit direct stores into `node`'s slots
+# (`kai_var_slots(node)[i].FIELD = VALUE;`) instead of a slot-array
+# initialiser. Used by the in-place-reuse branch of a TRMC step: when a
+# reuse token is donated, write the rebuilt slots straight into the
+# donated cell — Koka's `_con->field = ...` shape — instead of building a
+# stack `KaiVarSlot[]` and having kai_variant_at copy it (the array build
+# + copy was ~10 stores per descent level; direct stores are ~5). The
+# hole slot is zeroed (the cctx fills it next).
+fn emit_trmc_slot_stores(src: String, node: String, args_e: [Expr], tys_opt: Option[[TypeExpr]],
+                         holeslot: Int, i: Int, cx: EmitCtx) : String / Console {
+  match args_e {
+    [] -> ""
+    [a, ...rest] -> {
+      let head =
+        if i == holeslot {
+          concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "].ptr = (KaiValue *)0; "])
+        } else {
+          let kind = match tys_opt {
+            Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+            None     -> 0
+          }
+          let slotpfx = concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "]"])
+          if kind == 1 {
+            concat_all([slotpfx, ".i64 = ", emit_trmc_int_slot(src, a, cx), "; "])
+          } else if kind == 2 {
+            concat_all([slotpfx, ".r = ", emit_trmc_real_slot(src, a, cx), "; "])
+          } else if kind == 3 {
+            match nullary_ctor_tag(a, cx) {
+              Some(tag) -> concat_all([slotpfx, ".i64 = ", int_to_string(tag), "; "])
+              None      -> concat_all([slotpfx, ".i64 = kai_take_enum(", emit_expr(src, a, cx), "); "])
+            }
+          } else {
+            let is_int_slot = match tys_opt {
+              Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
+              None     -> false
+            }
+            let av = if is_int_slot { unwrap_perceus_dup_for_borrow(a) } else { a }
+            concat_all([slotpfx, ".ptr = ", emit_expr(src, av, cx), "; "])
+          }
+        }
+      concat_all([head, emit_trmc_slot_stores(src, node, rest, tys_opt, holeslot, i + 1, cx)])
     }
   }
 }
