@@ -549,6 +549,20 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_reuse_or_alloc_cons(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_reuse_or_alloc_record(%KaiValue*, i32, %KaiValue**, i8**)\n",
     "declare %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue*, i32, i8*, i32, %KaiValue**)\n",
+    # Issue #668 — TRMC constructor-context shims (stage0/runtime_llvm.c).
+    "declare %KaiValue** @kaix_field_addr(%KaiValue*, i32)\n",
+    "declare %KaiValue* @kaix_cctx_apply(%KaiValue*, %KaiValue**, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_cctx_extend(%KaiValue*, %KaiValue**, %KaiValue*)\n",
+    # Issue #668 — stack save/restore for per-iteration allocas in a TCO
+    # loop. An `alloca` in the tcrec.loop body (e.g. a kaix_apply arg
+    # buffer, a variant/cons slot buffer) executes once PER ITERATION and
+    # is not reclaimed until the function returns; on a 40K-element list
+    # that accumulates ~25 B/iteration and overflows the 64 KiB fiber
+    # stack. Bracketing the loop body with stacksave/stackrestore reclaims
+    # each iteration's allocas at the back-edge. The C backend never hit
+    # this because it emits block-scoped C compound-literal arrays.
+    "declare i8* @llvm.stacksave()\n",
+    "declare void @llvm.stackrestore(i8*)\n",
     "declare %KaiValue* @kaix_incref(%KaiValue*)\n",
     "declare void         @kaix_decref(%KaiValue*)\n",
     "declare %KaiValue* @kaix_nil()\n",
@@ -2884,6 +2898,35 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit / Console {
           }
           _ -> {
             eprint("llvm: malformed tcrec sentinel: #{nm}")
+            llvm_set_last(e, "undef")
+          }
+        }
+      }
+      # Issue #668 — TRMC step sentinel `__kai_trmc|<sym>|<holeslot>|<cname>
+      # |<dropmask>|<p0>|...`; `xs` are the ORIGINAL ctor args, one of
+      # which (at holeslot) is the recursive self-call. Lower to: build the
+      # node with a NULL hole, extend the cctx, rebind loop params from the
+      # self-call's args, `br %tcrec.loop`.
+      else if es_trmc_is_step_sentinel(nm) {
+        match es_tcrec_split_pipe(nm) {
+          [_, sym_str, holeslot_str, cname_str, dropmask_str, ...pnames] -> {
+            let holeslot = es_tcrec_parse_decimal(holeslot_str)
+            let dropmask = es_tcrec_parse_decimal(dropmask_str)
+            llvm_emit_trmc_goto(e, sym_str, holeslot, cname_str, dropmask, pnames, xs)
+          }
+          _ -> {
+            eprint("llvm: malformed trmc step sentinel: #{nm}")
+            llvm_set_last(e, "undef")
+          }
+        }
+      }
+      # Issue #668 — TRMC terminal-leaf sentinel: plug the leaf expr into
+      # the cctx's open hole (`kaix_cctx_apply`) and return the spine root.
+      else if es_trmc_is_apply_sentinel(nm) {
+        match xs {
+          [leaf] -> llvm_emit_trmc_apply(e, leaf)
+          _ -> {
+            eprint("llvm: malformed trmc apply sentinel: #{nm}")
             llvm_set_last(e, "undef")
           }
         }
@@ -5729,7 +5772,10 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
           # `%pargr_<n>` (no RC); a boxed param allocas a `%KaiValue*`
           # slot fed by `%parg_<n>`. The back-edge mirrors the split.
           let e_pro = if has_sentinel {
-            let e_slots = llvm_emit_tcrec_slots_raw(e0, ps, pts, mask)
+            # Issue #668 — a TRMC body needs the cctx accumulator allocas
+            # in entry, before the param slots' `br %tcrec.loop`.
+            let e_cctx = if llvm_body_has_trmc(body) { llvm_emit_cctx_allocas(e0) } else { e0 }
+            let e_slots = llvm_emit_tcrec_slots_raw(e_cctx, ps, pts, mask)
             llvm_emit_tcrec_loop_header_raw(e_slots, ps, pts, mask)
           } else { e0 }
           # A mixed signature has RAW params but the RETURN may be boxed
@@ -5785,7 +5831,10 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
           # precedes the real body's IR; `cur_label` is already
           # `tcrec.loop` so the body's first instructions land there.
           let e_pro = if has_sentinel {
-            let e_slots = llvm_emit_tcrec_slots(e0, ps)
+            # Issue #668 — cctx accumulator allocas precede the param slots'
+            # `br %tcrec.loop` so they live in entry, visible loop-wide.
+            let e_cctx = if llvm_body_has_trmc(body) { llvm_emit_cctx_allocas(e0) } else { e0 }
+            let e_slots = llvm_emit_tcrec_slots(e_cctx, ps)
             llvm_emit_tcrec_loop_header(e_slots, ps)
           } else { e0 }
           let e1 = llvm_emit_expr(e_pro, body)
@@ -6613,7 +6662,15 @@ fn llvm_sentinel_scan_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
-        if es_tcrec_is_sentinel(callee) { true } else { llvm_sentinel_scan_exprs(xs) }
+        # Issue #668 — a TRMC-rewritten body carries the modulo-cons step
+        # sentinel (`__kai_trmc|...`) and/or the terminal apply sentinel
+        # (`__kai_trmc_apply`) in addition to the plain self-tail sentinel.
+        # Any of the three triggers the loop prologue (cctx allocas + slots
+        # + tcrec.loop header).
+        if es_tcrec_is_sentinel(callee) { true }
+        else if es_trmc_is_step_sentinel(callee) { true }
+        else if es_trmc_is_apply_sentinel(callee) { true }
+        else { llvm_sentinel_scan_exprs(xs) }
       _ -> if llvm_body_has_sentinel(f) { true } else { llvm_sentinel_scan_exprs(xs) }
     }
     EIf(c, t, opt_e) ->
@@ -6687,6 +6744,95 @@ fn llvm_sentinel_scan_stmts(stmts: [Stmt]) : Bool {
   }
 }
 
+# Issue #668 — True when the body carries a TRMC sentinel (step
+# `__kai_trmc|...` or terminal `__kai_trmc_apply`). A plain self-tail
+# sentinel (`__kai_tcrec|`) does NOT count: only TRMC bodies need the
+# cctx accumulator allocas in the prologue. Mirrors the descent of
+# `llvm_sentinel_scan_kind` but matches only the two TRMC markers.
+fn llvm_body_has_trmc(body: Expr) : Bool = llvm_trmc_scan_kind(body.kind)
+
+fn llvm_trmc_scan_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if es_trmc_is_step_sentinel(callee) { true }
+        else if es_trmc_is_apply_sentinel(callee) { true }
+        else { llvm_trmc_scan_exprs(xs) }
+      _ -> if llvm_body_has_trmc(f) { true } else { llvm_trmc_scan_exprs(xs) }
+    }
+    EIf(c, t, opt_e) ->
+      if llvm_body_has_trmc(c) { true }
+      else if llvm_body_has_trmc(t) { true }
+      else { match opt_e { None -> false  Some(e2) -> llvm_body_has_trmc(e2) } }
+    EMatch(s, arms) ->
+      if llvm_body_has_trmc(s) { true } else { llvm_trmc_scan_arms(arms) }
+    EBlock(stmts, opt_tail) ->
+      if llvm_trmc_scan_stmts(stmts) { true }
+      else { match opt_tail { None -> false  Some(e) -> llvm_body_has_trmc(e) } }
+    EBinop(_, l, r) -> if llvm_body_has_trmc(l) { true } else { llvm_body_has_trmc(r) }
+    EUnop(_, x)     -> llvm_body_has_trmc(x)
+    EField(x, _)    -> llvm_body_has_trmc(x)
+    EIndex(x, i)    -> if llvm_body_has_trmc(x) { true } else { llvm_body_has_trmc(i) }
+    EPipe(l, r)        -> if llvm_body_has_trmc(l) { true } else { llvm_body_has_trmc(r) }
+    EMapPipe(l, r)     -> if llvm_body_has_trmc(l) { true } else { llvm_body_has_trmc(r) }
+    EFlatMapPipe(l, r) -> if llvm_body_has_trmc(l) { true } else { llvm_body_has_trmc(r) }
+    EFilterPipe(l, r)  -> if llvm_body_has_trmc(l) { true } else { llvm_body_has_trmc(r) }
+    _ -> false
+  }
+}
+
+fn llvm_trmc_scan_exprs(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if llvm_body_has_trmc(h) { true } else { llvm_trmc_scan_exprs(rest) }
+  }
+}
+
+fn llvm_trmc_scan_arms(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, b) -> if llvm_body_has_trmc(b) { true } else { llvm_trmc_scan_arms(rest) }
+    }
+  }
+}
+
+fn llvm_trmc_scan_stmts(stmts: [Stmt]) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs)              -> llvm_body_has_trmc(rhs)
+        SAssert(c, _)                -> llvm_body_has_trmc(c)
+        SExprStmt(ex)                -> llvm_body_has_trmc(ex)
+        SVar(_, _, rhs, _, _)        -> llvm_body_has_trmc(rhs)
+        SIndexAssign(t, ix, v, _, _) ->
+          if llvm_body_has_trmc(t) { true }
+          else if llvm_body_has_trmc(ix) { true }
+          else { llvm_body_has_trmc(v) }
+        SUse(_, _, _)                -> false
+      }
+      if here { true } else { llvm_trmc_scan_stmts(rest) }
+    }
+  }
+}
+
+# Issue #668 — emit the TRMC constructor-context accumulator in the
+# entry block, BEFORE the `br %tcrec.loop` the param slots plant. Two
+# allocas hold the cctx by reference across the back-edge:
+#   %_kai_acc.res  : %KaiValue**   (the partially-built spine root)
+#   %_kai_acc.hole : %KaiValue***  (addr of the open recursive slot)
+# Both seed NULL (empty cctx). Memory allocas in entry are visible
+# loop-wide, so unlike params they need no per-iteration reload. The
+# step/apply lowerings load+store them directly.
+fn llvm_emit_cctx_allocas(e: LlvmEmit) : LlvmEmit =
+  llvm_append_body(e, concat_all([
+    "  %_kai_acc.res = alloca %KaiValue*\n",
+    "  store %KaiValue* null, %KaiValue** %_kai_acc.res\n",
+    "  %_kai_acc.hole = alloca %KaiValue**\n",
+    "  store %KaiValue** null, %KaiValue*** %_kai_acc.hole\n"
+  ]))
+
 # Emit the per-param alloca slots in the entry block, store the
 # incoming `%parg_<name>` arguments, and branch into `%tcrec.loop`.
 fn llvm_emit_tcrec_slots(e: LlvmEmit, ps: [Param]) : LlvmEmit {
@@ -6744,8 +6890,23 @@ fn llvm_emit_tcrec_slots_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) 
 # loop body).
 fn llvm_emit_tcrec_loop_header(e: LlvmEmit, ps: [Param]) : LlvmEmit {
   let e0 = llvm_open_block(e, "tcrec.loop")
-  llvm_emit_tcrec_reloads(e0, ps)
+  let e1 = llvm_emit_tcrec_reloads(e0, ps)
+  llvm_emit_tcrec_stacksave(e1)
 }
+
+# Issue #668 — capture the stack pointer at the top of each loop
+# iteration so the back-edge can restore it, reclaiming any alloca the
+# iteration made (kaix_apply arg buffers, variant/cons slot buffers).
+# `%tcrec.sp` is defined in the loop header, which dominates every
+# back-edge; the back-edge's `@llvm.stackrestore(%tcrec.sp)` rewinds the
+# SP to this point before branching back. Without it, a per-iteration
+# alloca accumulates for the whole loop and overflows the fiber stack.
+fn llvm_emit_tcrec_stacksave(e: LlvmEmit) : LlvmEmit =
+  llvm_append_body(e, "  %tcrec.sp = call i8* @llvm.stacksave()\n")
+
+# Emit the stackrestore that must precede every `br label %tcrec.loop`.
+fn llvm_emit_tcrec_stackrestore(e: LlvmEmit) : LlvmEmit =
+  llvm_append_body(e, "  call void @llvm.stackrestore(i8* %tcrec.sp)\n")
 
 fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
   match ps {
@@ -6766,7 +6927,8 @@ fn llvm_emit_tcrec_reloads(e: LlvmEmit, ps: [Param]) : LlvmEmit {
 # `llvm_emit_tcrec_loop_header` for the raw calling convention.
 fn llvm_emit_tcrec_loop_header_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) : LlvmEmit {
   let e0 = llvm_open_block(e, "tcrec.loop")
-  llvm_emit_tcrec_reloads_raw(e0, ps, pts, mask)
+  let e1 = llvm_emit_tcrec_reloads_raw(e0, ps, pts, mask)
+  llvm_emit_tcrec_stacksave(e1)
 }
 
 fn llvm_emit_tcrec_reloads_raw(e: LlvmEmit, ps: [Param], pts: [Ty], mask: [Bool]) : LlvmEmit {
@@ -6842,8 +7004,9 @@ fn llvm_emit_tcrec_goto(e: LlvmEmit, c_sym: String, dropmask: Int,
       let e_drops = llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
       # 3. store each temp into its param slot (declaration order).
       let e_stores = llvm_emit_tcrec_stores(e_drops, pnames, ra.regs, 0)
-      # 4. branch back to the loop header.
-      let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
+      # 4. reclaim this iteration's allocas (issue #668), then branch back.
+      let e_rst = llvm_emit_tcrec_stackrestore(e_stores)
+      let e_br = llvm_append_body(e_rst, "  br label %tcrec.loop\n")
       # 5. open a fresh dead block; the surrounding tail handling appends a
       #    terminator here that will never execute.
       let dead = llvm_fresh_label(e_br, "tcrec.dead.")
@@ -6870,10 +7033,177 @@ fn llvm_emit_tcrec_goto_raw(e: LlvmEmit, pnames: [String], pts: [Ty],
   let ra = llvm_emit_args_mixed(e, xs, pts, mask, [])
   let e_drops = llvm_emit_tcrec_drops_masked(ra.st, pnames, mask, dropmask, 0)
   let e_stores = llvm_emit_tcrec_stores_mixed(e_drops, pnames, pts, mask, ra.regs, 0)
-  let e_br = llvm_append_body(e_stores, "  br label %tcrec.loop\n")
+  let e_rst = llvm_emit_tcrec_stackrestore(e_stores)
+  let e_br = llvm_append_body(e_rst, "  br label %tcrec.loop\n")
   let dead = llvm_fresh_label(e_br, "tcrec.dead.")
   let e_dead = llvm_open_block(dead.e, dead.reg)
   llvm_set_last(e_dead, "undef")
+}
+
+# ====================================================================
+#                TRMC step / apply lowering (issue #668)
+# ====================================================================
+#
+# Mirror of the C backend's `emit_trmc_step` (emit_c.kai:12886) for one
+# modulo-cons loop step:
+#   1. Build the spine node from the ORIGINAL ctor args, with a NULL
+#      pointer in the recursive `holeslot` (the open hole).
+#   2. `new_res = kaix_cctx_extend(old_res, old_hole, node)` plugs the
+#      node into the previous open hole and returns the new spine root;
+#      `new_hole = kaix_field_addr(node, holeslot)` is the address of
+#      this node's open slot. Store both back into the accumulator
+#      allocas (`%_kai_acc.res` / `%_kai_acc.hole`).
+#   3. Rebind the loop params from the self-call's args (extracted from
+#      the ECall at `holeslot`), with the same dropmask machinery as
+#      `llvm_emit_tcrec_goto` — drop the outgoing slot value, store the
+#      new arg temp.
+#   4. `br %tcrec.loop`, then open a dead block.
+#
+# v1 fresh-allocs the node (no `_arm_ru` reuse-token donate; the C
+# backend's v1 did the same — emit_c.kai:12877 "v1 allocates the node
+# FRESH"). Reuse-in-place is an orthogonal increment.
+fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
+                       dropmask: Int, pnames: [String], xs: [Expr]) : LlvmEmit / Console {
+  # --- 1. build the node with a NULL hole at holeslot ---
+  let tag = evar_find_tag(e.vars_, cname)
+  let n = list_length(xs)
+  let name_label_id = llvm_fresh_label(e, "var.")
+  let name_label = name_label_id.reg
+  let name_len = string_length(cname) + 1
+  let e_g = llvm_append_global(name_label_id.e, llvm_emit_string_const(name_label, cname))
+  # Evaluate every non-hole arg; the hole arg (the self-call) is NOT
+  # evaluated as a value — it is the recursion, deferred to the loop.
+  let ev = llvm_emit_trmc_node_args(e_g, xs, holeslot, 0, [])
+  let buf = llvm_fresh_reg(ev.st)
+  let alloc_instr = concat_all([
+    "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+  ])
+  let e_buf = llvm_append_body(buf.e, alloc_instr)
+  let e_st = llvm_emit_trmc_slot_stores(e_buf, buf.reg, ev.regs, 0)
+  let node = llvm_fresh_reg(e_st)
+  let build_instr = concat_all([
+    "  ", node.reg, " = call %KaiValue* ", llvm_variant_target(e),
+    "(i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
+    ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
+  ])
+  let e_node = llvm_append_body(node.e, build_instr)
+  # --- 2. extend the cctx ---
+  let old_res = llvm_fresh_reg(e_node)
+  let e_lr = llvm_append_body(old_res.e,
+    concat_all(["  ", old_res.reg, " = load %KaiValue*, %KaiValue** %_kai_acc.res\n"]))
+  let old_hole = llvm_fresh_reg(e_lr)
+  let e_lh = llvm_append_body(old_hole.e,
+    concat_all(["  ", old_hole.reg, " = load %KaiValue**, %KaiValue*** %_kai_acc.hole\n"]))
+  let new_res = llvm_fresh_reg(e_lh)
+  let e_ext = llvm_append_body(new_res.e, concat_all([
+    "  ", new_res.reg, " = call %KaiValue* @kaix_cctx_extend(%KaiValue* ", old_res.reg,
+    ", %KaiValue** ", old_hole.reg, ", %KaiValue* ", node.reg, ")\n"
+  ]))
+  let new_hole = llvm_fresh_reg(e_ext)
+  let e_fa = llvm_append_body(new_hole.e, concat_all([
+    "  ", new_hole.reg, " = call %KaiValue** @kaix_field_addr(%KaiValue* ", node.reg,
+    ", i32 ", int_to_string(holeslot), ")\n"
+  ]))
+  let e_sr = llvm_append_body(e_fa, concat_all([
+    "  store %KaiValue* ", new_res.reg, ", %KaiValue** %_kai_acc.res\n",
+    "  store %KaiValue** ", new_hole.reg, ", %KaiValue*** %_kai_acc.hole\n"
+  ]))
+  # --- 3. rebind loop params from the self-call's args ---
+  let self_args = match llvm_list_nth_expr(xs, holeslot) {
+    Some(se) -> match se.kind { ECall(_, sa) -> sa  _ -> [] }
+    None     -> []
+  }
+  let e_back = match llvm_lookup_ufn_by_csym(e_sr.fns, sym) {
+    Some(US(pts, _, mask)) -> {
+      let ra = llvm_emit_args_mixed(e_sr, self_args, pts, mask, [])
+      let e_d = llvm_emit_tcrec_drops_masked(ra.st, pnames, mask, dropmask, 0)
+      llvm_emit_tcrec_stores_mixed(e_d, pnames, pts, mask, ra.regs, 0)
+    }
+    None -> {
+      let ra = llvm_emit_args(e_sr, self_args, [])
+      let e_d = llvm_emit_tcrec_drops(ra.st, pnames, dropmask, 0)
+      llvm_emit_tcrec_stores(e_d, pnames, ra.regs, 0)
+    }
+  }
+  # --- 4. reclaim the iteration's node buffer alloca, branch back ---
+  # The node's slot buffer was an alloca consumed by kaix_variant (which
+  # copied it into the heap cell), so it is safe to rewind the SP here —
+  # the live node lives on the heap, only the transient buffer is freed.
+  let e_rst = llvm_emit_tcrec_stackrestore(e_back)
+  let e_br = llvm_append_body(e_rst, "  br label %tcrec.loop\n")
+  let dead = llvm_fresh_label(e_br, "tcrec.dead.")
+  let e_dead = llvm_open_block(dead.e, dead.reg)
+  llvm_set_last(e_dead, "undef")
+}
+
+# Evaluate the ctor args for a TRMC node build. The hole arg (the
+# recursive self-call at `holeslot`) emits the NULL pointer literal —
+# the loop fills it on the next step (or kaix_cctx_apply plugs it at the
+# terminal leaf). Every other arg emits its boxed value normally.
+fn llvm_emit_trmc_node_args(e: LlvmEmit, xs: [Expr], holeslot: Int, i: Int,
+                            acc: [String]) : LlvmArgs / Console {
+  match xs {
+    [] -> LlvmArgs { st: e, regs: list_reverse(acc) }
+    [x0, ...rest] ->
+      if i == holeslot {
+        llvm_emit_trmc_node_args(e, rest, holeslot, i + 1, ["null", ...acc])
+      } else {
+        let e1 = llvm_emit_expr(e, x0)
+        llvm_emit_trmc_node_args(e1, rest, holeslot, i + 1, [e1.last_val, ...acc])
+      }
+  }
+}
+
+# Store each evaluated node arg (or the literal `null` hole) into the
+# variant buffer. Same shape as `llvm_emit_variant_stores`, but the reg
+# list already contains the literal "null" at the hole position.
+fn llvm_emit_trmc_slot_stores(e: LlvmEmit, buf_reg: String, regs: [String], i: Int) : LlvmEmit {
+  match regs {
+    [] -> e
+    [v, ...rest] -> {
+      let gep = llvm_fresh_reg(e)
+      let e1 = llvm_append_body(gep.e, concat_all([
+        "  ", gep.reg, " = getelementptr inbounds %KaiValue*, %KaiValue** ", buf_reg,
+        ", i32 ", int_to_string(i), "\n"
+      ]))
+      let e2 = llvm_append_body(e1, concat_all([
+        "  store %KaiValue* ", v, ", %KaiValue** ", gep.reg, "\n"
+      ]))
+      llvm_emit_trmc_slot_stores(e2, buf_reg, rest, i + 1)
+    }
+  }
+}
+
+# Look up the nth element of an [Expr] (declaration-order arg access for
+# the TRMC hole slot). Returns None if out of range.
+fn llvm_list_nth_expr(xs: [Expr], n: Int) : Option[Expr] {
+  if n < 0 { None }
+  else { match xs {
+    [] -> None
+    [h, ...rest] -> if n == 0 { Some(h) } else { llvm_list_nth_expr(rest, n - 1) }
+  } }
+}
+
+# Issue #668 — TRMC terminal leaf. The tail is a non-modulo-cons value
+# (the base case, e.g. `[]` / `Nil`, or any non-recursive expression):
+# plug it into the cctx's open hole and return the spine root. An empty
+# cctx (hole == NULL, a fn that hit the base case immediately) returns
+# the leaf itself. Mirror of C's `kai_cctx_apply_linear(_kai_acc, leaf)`.
+fn llvm_emit_trmc_apply(e: LlvmEmit, leaf: Expr) : LlvmEmit / Console {
+  let e_leaf = llvm_emit_expr(e, leaf)
+  let child = e_leaf.last_val
+  let res = llvm_fresh_reg(e_leaf)
+  let e_lr = llvm_append_body(res.e,
+    concat_all(["  ", res.reg, " = load %KaiValue*, %KaiValue** %_kai_acc.res\n"]))
+  let hole = llvm_fresh_reg(e_lr)
+  let e_lh = llvm_append_body(hole.e,
+    concat_all(["  ", hole.reg, " = load %KaiValue**, %KaiValue*** %_kai_acc.hole\n"]))
+  let out = llvm_fresh_reg(e_lh)
+  let e_ap = llvm_append_body(out.e, concat_all([
+    "  ", out.reg, " = call %KaiValue* @kaix_cctx_apply(%KaiValue* ", res.reg,
+    ", %KaiValue** ", hole.reg, ", %KaiValue* ", child, ")\n"
+  ]))
+  llvm_set_last(e_ap, out.reg)
 }
 
 # Issue #718 — evaluate each arg as a raw scalar coerced to the
