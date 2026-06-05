@@ -1,0 +1,122 @@
+# Soundness battery for the i64-inline lever (variant Int fields read raw).
+# Exercises every shape that the per-route attempts broke on, so a wrong
+# kair_/kai_ bind or a desync shows up as a wrong number or a crash, not a
+# silent perf change. Each line is a deterministic golden.
+
+# --- 1. Explicit Int field, used raw in comparison + arithmetic (rb-tree
+#        descent shape: the field is compared AND re-stored). ---
+type Box = Box(Int, Int)
+
+fn box_sum(b: Box) : Int = match b {
+  Box(lo, hi) -> lo + hi
+}
+
+fn box_cmp(b: Box, k: Int) : Int = match b {
+  # lo used raw (comparison) AND re-stored boxed in the rebuild
+  Box(lo, hi) -> if k < lo { 0 - 1 } else { if k > hi { 1 } else { 0 } }
+}
+
+# field used raw in comparison, then the SAME field re-stored in a rebuild
+fn box_widen(b: Box, k: Int) : Box = match b {
+  Box(lo, hi) ->
+    if k < lo { Box(k, hi) }
+    else { if k > hi { Box(lo, k) } else { Box(lo, hi) } }
+}
+
+# --- 2. Generic field (Option[Int] / Result) — the field type is a type
+#        var in the ctor, Int only after monomorphisation. MUST stay sound
+#        (the intent-1 break). ---
+fn opt_unwrap_or(o: Option[Int], d: Int) : Int = match o {
+  Some(n) -> n + 1
+  None    -> d
+}
+
+# kaikai's Result is `Result[e, a]` — error first, value second.
+fn res_or(r: Result[String, Int], d: Int) : Int = match r {
+  Ok(n)  -> n * 2
+  Err(_) -> d
+}
+
+# --- 3. Field used raw as an argument to a raw-param fn, inside a nested
+#        match (the intent-3 break: CIP(n, p2) used in f(buf, p2)). ---
+fn dbl(x: Int) : Int = x * 2
+
+type Pair = Pair(Int, Int)
+
+fn pair_via_call(p: Pair) : Int = match p {
+  # p1 used raw as arg to dbl, then in a nested match on the result
+  Pair(a, b) -> match dbl(a) {
+    d -> d + b
+  }
+}
+
+# --- 4. Reuse-variant rebuild shape (intervals Ival add/sub): the unique
+#        cell is rebuilt in place, fields used raw in the new slots. ---
+type Iv = Iv(Int, Int)
+
+fn iv_shift(v: Iv, d: Int) : Iv = match v {
+  Iv(lo, hi) -> Iv(lo + d, hi + d)
+}
+
+fn iv_lo(v: Iv) : Int = match v {
+  Iv(lo, _) -> lo
+}
+
+# --- 5. Mixed: a variant with an Int field AND a pointer field, the Int
+#        raw and the pointer boxed in the same arm. ---
+type Tagged = Tagged(Int, Box)
+
+fn tagged_lo(t: Tagged) : Int = match t {
+  Tagged(tag, inner) -> tag + box_sum(inner)
+}
+
+# --- 6. Other primitive fields MUST stay sound (PBindRaw is Int-only;
+#        Real=kind 2 `.r`, Char/Bool=kind 3 `.i64` go untouched). A wrong
+#        bind here would read the wrong union member → garbage. ---
+# Real field: returns Int (avoids Real->String dependency) but exercises
+# the kind-2 `.r` slot bind that PBindRaw must NOT disturb.
+type RBox = RBox(Real, Real)
+fn rbox_cmp(b: RBox) : Int = match b {
+  RBox(lo, hi) -> if lo < hi { 1 } else { 0 }
+}
+
+type CBox = CBox(Char, Int)
+fn cbox_code(b: CBox) : Int = match b {
+  CBox(c, n) -> char_to_int(c) + n
+}
+
+type BBox = BBox(Bool, Int)
+fn bbox_pick(b: BBox) : Int = match b {
+  BBox(flag, n) -> if flag { n } else { 0 - n }
+}
+
+# --- 7. Same Int field used BOTH raw (comparison) AND boxed (passed to a
+#        boxed-param consumer / re-stored) in one arm — the dual-binder
+#        must satisfy both reads. ---
+fn box_mixed_use(b: Box) : Int = match b {
+  # lo used raw in `<`, AND boxed-rebuilt into a new Box returned via sum
+  Box(lo, hi) -> if lo < hi { box_sum(Box(lo, hi)) } else { lo }
+}
+
+fn main() : Int {
+  let b = Box(3, 10)
+  print(int_to_string(box_sum(b)))            # 13
+  print(int_to_string(box_cmp(Box(3, 10), 5)))    # 0
+  print(int_to_string(box_cmp(Box(3, 10), 1)))    # -1
+  print(int_to_string(box_cmp(Box(3, 10), 99)))   # 1
+  print(int_to_string(box_sum(box_widen(Box(3, 10), 1))))   # widen lo -> Box(1,10) -> 11
+  print(int_to_string(box_sum(box_widen(Box(3, 10), 20))))  # widen hi -> Box(3,20) -> 23
+  print(int_to_string(opt_unwrap_or(Some(41), 0)))   # 42
+  print(int_to_string(opt_unwrap_or(None, 7)))       # 7
+  print(int_to_string(res_or(Ok(21), 0)))            # 42
+  print(int_to_string(res_or(Err("x"), 9)))          # 9
+  print(int_to_string(pair_via_call(Pair(5, 3))))    # dbl(5)=10 +3 = 13
+  print(int_to_string(iv_lo(iv_shift(Iv(2, 8), 100))))  # 102
+  print(int_to_string(tagged_lo(Tagged(1000, Box(3, 10)))))  # 1000 + 13 = 1013
+  print(int_to_string(rbox_cmp(RBox(1.5, 2.5))))     # 1
+  print(int_to_string(cbox_code(CBox('A', 5))))      # 65 + 5 = 70
+  print(int_to_string(bbox_pick(BBox(true, 9))))     # 9
+  print(int_to_string(bbox_pick(BBox(false, 9))))    # -9
+  print(int_to_string(box_mixed_use(Box(3, 10))))    # 3<10 -> sum = 13
+  0
+}
