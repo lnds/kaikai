@@ -2768,22 +2768,35 @@ static void kai_free_value(KaiValue *v) {
     KAI_PROF_EXIT(free);
 }
 
-static void kai_decref(KaiValue *v) {
-    if (kai_is_value(v)) return;   /* immediate Int: no header — drop is a no-op (Koka kk_box_drop) */
-    if (!v) return;
-    if (v->rc == INT32_MAX) return;   /* m5 #7 — singleton, saturated */
-    KAI_PROF_ENTER();
+/* Out-of-line drop-to-zero path: the cell reached rc==0, reclaim it.
+ * Split out of kai_decref so the common case (decrement, still live)
+ * stays a small inlinable body and only the rare free crosses a call.
+ * Idea adapted from Koka's kk_block_decref / kk_block_drop split: the
+ * drop fast path is inline at the call site, the free is a cold helper.
+ * kaikai keeps its own counters + kai_free_value walker, not kklib's
+ * free-list shape — the split is the idea, the body stays ours. */
+static void kai_decref_free(KaiValue *v) {
+#ifdef KAI_PROFILE_RC
+    kai_prof_decref_to_zero_n++;
+#endif
+    kai_free_value(v);
+}
+
+/* Decrement a reference. The fast path — immediate Int / null /
+ * saturated singleton / still-shared after decrement — is branch-only
+ * and inlines into the caller; only a cell hitting rc==0 calls out to
+ * kai_decref_free. Previously kai_decref was a non-inline `static void`
+ * (callgrind: 48M instructions on the rb-tree bench, a real call at
+ * every drop). Under tracing the counters still fire for full fidelity.
+ * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
+ * helper now, and the inline body must stay small to be inlined. */
+static inline void kai_decref(KaiValue *v) {
+    if (kai_is_value(v) || !v || v->rc == INT32_MAX) return;
 #ifdef KAI_TRACE_RC
     kai_rc_decref_total++;
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
-    if (--v->rc == 0) {
-#ifdef KAI_PROFILE_RC
-        kai_prof_decref_to_zero_n++;
-#endif
-        kai_free_value(v);
-    }
-    KAI_PROF_EXIT(decref);
+    if (--v->rc == 0) kai_decref_free(v);
 }
 
 /* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
