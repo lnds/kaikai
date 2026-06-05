@@ -3721,13 +3721,17 @@ static inline int64_t kai_take_enum(KaiValue *v) {
  * The trace counter `kai_rc_reuse_total` increments on every
  * successful in-place rewrite (see top of file).
  */
-static int kai_check_unique(KaiValue *v) {
-    /* Singletons (rc == INT32_MAX) are NEVER unique — they are
-     * shared, immutable, and live in .data. The recogniser only
-     * fires on KAI_CONS / KAI_RECORD / KAI_VARIANT, none of which
-     * are pooled today, so the singleton check is defensive but
-     * cheap and keeps the predicate honest. */
-    return v != NULL && !kai_is_value(v) && v->rc == 1 && v->rc != INT32_MAX;
+static inline int kai_check_unique(KaiValue *v) {
+    /* `rc == 1` already implies `rc != INT32_MAX` (a singleton's rc is
+     * saturated at INT32_MAX, never 1), so the explicit singleton guard
+     * the old code carried was a dead check executed on every call —
+     * and check_unique runs at every descent level + twice per nested
+     * balance arm. One `rc == 1` test suffices; an immediate (kai_is_
+     * value) has no header so it is excluded first. Koka's
+     * kk_datatype_ptr_is_unique is likewise a single refcount test.
+     * Also marked inline (was a plain `static int` — a real call on the
+     * hot path). */
+    return v != NULL && !kai_is_value(v) && v->rc == 1;
 }
 
 static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
