@@ -2007,21 +2007,24 @@ static void kai_arena_pop(void) {
     kai_arena_free(&kai_arena_stack[--kai_arena_sp]);
 }
 
-static KaiValue *kai_incref(KaiValue *v) {
-    if (kai_is_value(v)) return v;   /* immediate Int: no header — dup is a no-op (Koka kk_box_dup) */
-    if (!v || v->rc == INT32_MAX) {
+/* Increment a reference. Pure fast path — no free, no out-of-line case
+ * — so the whole body is inlined into the caller. Previously a non-inline
+ * `static KaiValue *` (a real call at every dup, the symmetric cost to
+ * the old non-inline kai_decref). KAI_PROF_ENTER/EXIT dropped: they
+ * bracketed a single increment and blocked the inline. Under tracing the
+ * counters still fire. Koka's kk_block_dup is likewise inline. */
+static inline KaiValue *kai_incref(KaiValue *v) {
+    if (kai_is_value(v) || !v || v->rc == INT32_MAX) {
 #ifdef KAI_TRACE_RC
-        if (v) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+        if (v && !kai_is_value(v)) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
         return v;
     }
-    KAI_PROF_ENTER();
     v->rc++;
 #ifdef KAI_TRACE_RC
     kai_rc_incref_total++;
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
-    KAI_PROF_EXIT(incref);
     return v;
 }
 static void       kai_decref(KaiValue *v);
