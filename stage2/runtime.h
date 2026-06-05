@@ -3190,6 +3190,28 @@ static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
 #define KAI_ENUM_TAG_MAX 1024
 static KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
 
+/* Fast nullary-ctor construction: read the interned singleton straight
+ * from kai_enum_by_tag[tag] — an array load — instead of kai_variant_u's
+ * NOINLINE call + nullary-cache hash+probe. Every nullary is seeded into
+ * kai_enum_by_tag at startup (emit_nullary_enum_seed in
+ * _kai_register_proto_tables, before main's body), so the load always
+ * hits in steady state; the fallback covers a nullary built before the
+ * seed (it self-installs, so later loads hit). On the rb-tree bench the
+ * RBLeaf leaves were 13M instructions via the kai_variant_u path — every
+ * insert-into-leaf mints two RBLeaf singletons through the hash probe
+ * just to read back a pointer the seed already cached. Koka shape: a
+ * nullary is kk_datatype_from_tag, an immediate, never a table lookup. */
+static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+                                               int n, uint32_t mask,
+                                               KaiVarSlot *slots);
+static inline KaiValue *kai_nullary_fast(int32_t tag, const char *name) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
+        KaiValue *v = kai_enum_by_tag[tag];
+        if (v) return v;
+    }
+    return kai_variant_u(tag, name, 0, 0, NULL);
+}
+
 static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
     if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) kai_enum_by_tag[tag] = v;
     size_t i = kai_nullary_hash(tag, name);
