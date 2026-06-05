@@ -2684,20 +2684,26 @@ static void kai_free_value(KaiValue *v) {
             free(v->as.rec.fields);
             free((void *) v->as.rec.names);
             break;
-        case KAI_VARIANT:
+        case KAI_VARIANT: {
             /* Issue #440 — only pointer slots cascade through decref.
              * Phase 2: primitive slots (mask kind != PTR) carry raw
              * scalars and need no RC. The mask==0 hot path skips the
-             * kind branch entirely. */
-            if (kai_slot_mask_of(v->variant_tag) == 0) {
-                for (int i = 0; i < v->var_n_args; ++i) kai_decref(kai_var_slots(v)[i].ptr);
+             * kind branch entirely. The mask lookup is hoisted out of the
+             * slot loop — it was re-read per slot (5× for an RBNode), a
+             * table lookup each time; the tag is fixed across the loop so
+             * one read suffices. (The whole tree's free walks this.) */
+            uint32_t fmask = kai_slot_mask_of(v->variant_tag);
+            int fn_args = v->var_n_args;
+            if (fmask == 0) {
+                for (int i = 0; i < fn_args; ++i) kai_decref(kai_var_slots(v)[i].ptr);
             } else {
-                for (int i = 0; i < v->var_n_args; ++i) {
-                    if (kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i) == KAI_VAR_SLOT_PTR) {
+                for (int i = 0; i < fn_args; ++i) {
+                    if (kai_var_slot_kind(fmask, i) == KAI_VAR_SLOT_PTR) {
                         kai_decref(kai_var_slots(v)[i].ptr);
                     }
                 }
             }
+        }
             /* FAM: payload slots are inline in this block — no separate
              * array to free. The whole block returns to the per-arity
              * variant pool at the recycle step below (keyed on tag). */
