@@ -2987,7 +2987,16 @@ static inline int kai_is_int(KaiValue *v) {
     return kai_is_value(v) || (v != NULL && v->tag == KAI_INT);
 }
 static inline int64_t kai_intf(KaiValue *v) {
-    return kai_is_value(v) ? kai_untag_int(v) : v->as.i;
+    /* The immediate (tagged) form is the overwhelming common case — every
+     * loop counter, key, index. Only the 63-bit-overflow bignum tail
+     * (|n| > 2^62) detours to the heap `v->as.i` load, which cannot be
+     * speculated (immediate `v` is not a valid address). We keep the branch
+     * (soundness: heap bignums are real) but hint it so the predictor and
+     * layout favour the immediate path. The heap load stays off the hot
+     * path. */
+    intptr_t iv = (intptr_t) v;
+    if (__builtin_expect((iv & KAI_INT_TAG_BIT) != 0, 1)) return iv >> 1;
+    return v->as.i;
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
