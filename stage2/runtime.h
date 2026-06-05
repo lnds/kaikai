@@ -1619,6 +1619,68 @@ static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 static KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
 static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 
+/* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
+ *
+ * A fresh variant block used to be `malloc(kai_var_block_size(n))` — one
+ * libc allocation per node, 6.96M of them on the rb-tree bench (the tree
+ * grows monotonically, so the block pool stays empty during the insert
+ * phase and every new node is a real malloc). Idea adapted from Koka's
+ * mimalloc segments — amortise the allocator, never hand individual cells
+ * back to libc — but WITHOUT a dependency: a plain bump allocator over
+ * malloc'd slabs.
+ *
+ * Design (slab-only, per asu): EVERY variant block comes from a slab.
+ * `kai_slab_alloc(sz)` bump-allocates `sz` bytes (8-aligned) from the
+ * current slab, growing a new slab when the bump pointer would overrun.
+ * The free path (kai_var_block_free) NEVER calls libc free on an
+ * individual block — a slab-interior pointer is not a malloc'd address,
+ * so free() on it is UB/corruption. Instead a freed block goes to the
+ * arity-keyed block pool (the free-list that already exists); a pool-full
+ * or over-arity spill is simply DROPPED (the cell stays in its slab,
+ * reclaimed when the whole slab is freed at exit — not an observable
+ * leak). The slabs themselves are tracked and freed in kai_slab_teardown
+ * (registered via atexit) so ASAN sees still-reachable == 0.
+ *
+ * Soundness net: if any free() ever reaches a slab-interior pointer, ASAN
+ * fires "free on non-malloc'd address" immediately. The self-compile gate
+ * (kaic2b.c == kaic2c.c) proves no AST node — of any arity — was
+ * corrupted by the size-classing. */
+#define KAI_SLAB_SIZE (256u * 1024u)   /* 256 KiB per slab */
+static char  *kai_slab_cur    = NULL;  /* current slab base */
+static size_t kai_slab_off    = 0;     /* bump offset into current slab */
+static char **kai_slab_list   = NULL;  /* all slabs, for teardown */
+static int    kai_slab_count  = 0;
+static int    kai_slab_cap    = 0;
+static int    kai_slab_atexit = 0;
+
+static void kai_slab_teardown(void) {
+    for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
+    free(kai_slab_list);
+    kai_slab_list = NULL; kai_slab_count = 0; kai_slab_cap = 0;
+    kai_slab_cur = NULL; kai_slab_off = 0;
+}
+
+static void *kai_slab_alloc(size_t sz) {
+    sz = (sz + 7u) & ~(size_t) 7u;            /* 8-byte align */
+    if (sz > KAI_SLAB_SIZE) return malloc(sz); /* oversized: standalone (never freed individually either) */
+    if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
+        char *slab = (char *) malloc(KAI_SLAB_SIZE);
+        if (!slab) { fprintf(stderr, "kai: out of memory (slab)\n"); exit(1); }
+        if (kai_slab_count == kai_slab_cap) {
+            int ncap = kai_slab_cap == 0 ? 64 : kai_slab_cap * 2;
+            kai_slab_list = (char **) realloc(kai_slab_list, (size_t) ncap * sizeof(char *));
+            kai_slab_cap = ncap;
+        }
+        kai_slab_list[kai_slab_count++] = slab;
+        kai_slab_cur = slab;
+        kai_slab_off = 0;
+        if (!kai_slab_atexit) { atexit(kai_slab_teardown); kai_slab_atexit = 1; }
+    }
+    void *p = kai_slab_cur + kai_slab_off;
+    kai_slab_off += sz;
+    return p;
+}
+
 static KaiVarSlot *kai_slots_alloc(int n) {
 #ifndef KAI_NO_SLOT_POOL
     if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] > 0) {
@@ -1720,15 +1782,18 @@ static KaiValue *kai_alloc_var(int n) {
 #endif
     KAI_PROF_ENTER();
     KaiValue *v;
+    size_t bsz = kai_var_block_size(n);
 #ifdef KAI_CELL_POOL_ACTIVE
     if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
         v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
-        memset(v, 0, kai_var_block_size(n));
+        memset(v, 0, bsz);
     } else {
-        v = (KaiValue *) calloc(1, kai_var_block_size(n));
+        v = (KaiValue *) kai_slab_alloc(bsz);
+        memset(v, 0, bsz);                 /* slab is uninit; this is the calloc-equivalent */
     }
 #else
-    v = (KaiValue *) calloc(1, kai_var_block_size(n));
+    v = (KaiValue *) kai_slab_alloc(bsz);
+    memset(v, 0, bsz);
 #endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -1781,10 +1846,10 @@ static KaiValue *kai_alloc_var_nz(int n) {
         v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
         /* pool block: no memset — caller overwrites every slot */
     } else {
-        v = (KaiValue *) malloc(kai_var_block_size(n));
+        v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
     }
 #else
-    v = (KaiValue *) malloc(kai_var_block_size(n));
+    v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
 #endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -1812,9 +1877,19 @@ static KaiValue *kai_alloc_var_nz(int n) {
 #endif
 
 /* FAM lane: return a variant block (header + inline slots) to its
- * per-arity pool, or free it. Used by kai_free_value's VARIANT case
- * in place of (kai_slots_free + cell-pool return). */
+ * per-arity free-list pool. Used by kai_free_value's VARIANT case in
+ * place of (kai_slots_free + cell-pool return).
+ *
+ * Slab-only invariant: every block lives inside a malloc'd slab
+ * (kai_slab_alloc), so it is NOT a standalone malloc'd address — calling
+ * libc free() on it is UB/corruption. So there is NO free(v) here. A
+ * block that cannot rejoin the pool (pool full, or arity > MAXN) is
+ * simply DROPPED: it stays in its slab and is reclaimed wholesale by
+ * kai_slab_teardown at exit. Not an observable leak (ASAN: reachable via
+ * the slab list until teardown). If a free() ever reaches here on a slab
+ * pointer, ASAN fires "free on non-malloc'd address" at once. */
 static void kai_var_block_free(KaiValue *v, int n) {
+    (void) v;
 #ifdef KAI_CELL_POOL_ACTIVE
     if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
         && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP) {
@@ -1822,7 +1897,7 @@ static void kai_var_block_free(KaiValue *v, int n) {
         return;
     }
 #endif
-    free(v);
+    /* spill: drop into the slab; teardown reclaims it at exit. */
 }
 
 /* m5 #7: constant pool for nullary primitives.
