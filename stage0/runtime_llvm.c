@@ -940,6 +940,47 @@ void kaix_panic_no_impl(const char *proto, const char *op, int32_t head) {
     exit(1);
 }
 
+/* ---------- TRMC constructor-context (issue #668, LLVM backend) ----------
+ *
+ * The C backend lowers a modulo-cons tail leaf with the inline
+ * `kai_cctx_*` helpers (runtime.h §TRMC), carrying the `KaiCctx`
+ * { res, holeptr } struct by value across its goto-loop. The LLVM
+ * backend keeps the accumulator as two SSA-stable allocas in the
+ * function prologue (`%_kai_acc.res` : %KaiValue*, `%_kai_acc.hole` :
+ * %KaiValue**) and calls these non-inline `kaix_*` shims so the
+ * `KaiCctx` struct never has to round-trip through LLVM IR by value.
+ *
+ * `kaix_field_addr(node, holeslot)` returns the address of the boxed
+ * recursive slot inside `node` — the open hole the next loop step
+ * attaches to. Mirrors `kai_field_addr_create(&kai_var_slots(node)
+ * [holeslot].ptr)`.
+ *
+ * `kaix_cctx_apply(res, hole, child)` plugs `child` into the open hole
+ * and returns the spine root. An empty cctx (hole == NULL, first
+ * level) returns `child` itself. This is the terminal-leaf lowering
+ * (`__kai_trmc_apply`) AND the apply half of extend; identical to
+ * `kai_cctx_apply_linear`.
+ *
+ * `kaix_cctx_extend(res, hole, child)` plugs `child` into the old hole
+ * and returns the NEW spine root. The caller then computes the new
+ * hole separately via `kaix_field_addr(child, holeslot)` and stores
+ * both back into the accumulator allocas. Splitting the result from
+ * the new-hole keeps each shim a single C expression with no struct
+ * return, which the LLVM emitter consumes as one `call` + two stores.
+ */
+KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot) {
+    return &kai_var_slots(node)[holeslot].ptr;
+}
+
+KaiValue *kaix_cctx_apply(KaiValue *res, KaiValue **hole, KaiValue *child) {
+    if (hole != NULL) { *hole = child; return res; }
+    return child;
+}
+
+KaiValue *kaix_cctx_extend(KaiValue *res, KaiValue **hole, KaiValue *child) {
+    return kaix_cctx_apply(res, hole, child);
+}
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
