@@ -4170,7 +4170,7 @@ test-perceus-issue350: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE350_FIXTURES); do \
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "perceus-issue350 OK $$name (arm-bound multi-use drop emitted)" \
