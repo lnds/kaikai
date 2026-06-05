@@ -5172,6 +5172,13 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
 # own drop (arm exit / structural decref) still fires exactly once. The dup
 # would have been net-zero against a matching decref the consumer never issued
 # on a raw scalar — removing both halves is the identity transform Koka makes.
+# True when a payload TypeExpr is `Int` — a tagged immediate, so
+# dup/drop on its slot value is a runtime no-op and can be elided.
+fn ty_te_is_int(te: TypeExpr) : Bool = match te.tkind {
+  TyName(n, args) -> n == "Int" and list_length(args) == 0
+  _ -> false
+}
+
 fn unwrap_perceus_dup_for_borrow(x: Expr) : Expr = match x.kind {
   ECall(callee, args_) -> match callee.kind {
     EVar(nm) ->
@@ -12702,7 +12709,22 @@ fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]]
               None      -> concat_all(["{.i64 = kai_take_enum(", emit_expr(src, a, cx), ")}"])
             }
           } else {
-            concat_all(["{.ptr = ", emit_expr(src, a, cx), "}"])
+            # Int lives in a pointer slot (kind 0) as a tagged immediate
+            # (the c221cee decision: a tagged Int IS a valid KaiValue*).
+            # perceus wraps the slot value in __perceus_dup, but dup/drop
+            # on a tagged Int is a no-op (kai_incref short-circuits on
+            # kai_is_value) — the call is still emitted and run, ~2 per
+            # node rebuild on the rb-tree descent. Strip the dup when the
+            # slot's declared type is Int: copy the tagged word directly,
+            # no kai_internal_dup call. Safe because no ref is taken (the
+            # immediate has no header) and none is owed (the old node's
+            # slot is overwritten/freed, not the value).
+            let is_int_slot = match tys_opt {
+              Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
+              None     -> false
+            }
+            let av = if is_int_slot { unwrap_perceus_dup_for_borrow(a) } else { a }
+            concat_all(["{.ptr = ", emit_expr(src, av, cx), "}"])
           }
         }
       let sep = match rest { [] -> "" _ -> ", " }
