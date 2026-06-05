@@ -4203,6 +4203,27 @@ fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
   _ -> None
 }
 
+# True when the arm list ends in an unconditional catch-all (a PWild or
+# PBind pattern with no guard): the match can never fall through, so the
+# trailing `non-exhaustive match` panic is dead code. Emitting it anyway
+# leaves a call to a noreturn cold fn in the body, which can inhibit the C
+# compiler from inlining small predicates (is_red: `match t { RBNode(Red,
+# ...) -> true; _ -> false }` stayed a non-inline `static int`, 10.9M
+# instructions / 4.6% of the rb-tree bench called 2× per Black node).
+# Dropping the dead panic lets clang fold it into insert_loop's dispatch.
+fn arms_have_catchall(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a]          -> match a { Arm(p, g, _) -> match g {
+                    Some(_) -> false   # guarded: can fall through
+                    None    -> match p.pkind { PWild -> true PBind(_) -> true _ -> false }
+                  } }
+  [_, ...rest] -> arms_have_catchall(rest)
+}
+
+fn match_tail_panic(arms: [Arm]) : String =
+  if arms_have_catchall(arms) { "" }
+  else { "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n" }
+
 fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
   # Borrowed scrutinee: emit the inner value and SKIP the exit decref —
@@ -4216,7 +4237,7 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
       concat_all([
         "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
         emit_match_arms(src, arms, cx),
-    "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
+        match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
     }
@@ -4237,7 +4258,7 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
   concat_all([
     "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
     emit_match_arms(src, arms, cx),
-    "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
+    match_tail_panic(arms),
     "} while (0); kai_decref(_scr); _r; })"
   ])
 }
