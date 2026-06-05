@@ -91,22 +91,41 @@ pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 # arm-top took ownership of the shell and the children move into the rebuild;
 # the redundant dup is what kept the descent tree shared (rc>=2) and the
 # reuse inert. Empty in every non-arm-top context → no behaviour change.
+# `hoisted` carries, during emission of one match's arms, the set of
+# `_scr` slot indices whose `.ptr` sub-deref has been hoisted to a C
+# local `_hs<i>` at the top of the match's `do {}`. emit_pat_test /
+# emit_pat_binds read it: when the sub-scrutinee of slot i off `_scr`
+# is requested and i is hoisted, they spell `_hs<i>` instead of
+# re-emitting `kai_var_slots(_scr)[i].ptr`. This shares the dependent
+# load `slot[i].ptr->...` across the separate `if`-arms of a nested
+# match (balance_left/right's rotations), which clang cannot CSE across
+# branches. Empty outside a hoisting match. See emit_hoist_subderefs.
 type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
-                 regions: [RegionMark], in_region: Bool, borrowed: [String], enums: [String] }
+                 regions: [RegionMark], in_region: Bool, borrowed: [String], enums: [String],
+                 hoisted: [Int] }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums }
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: cx.hoisted }
 
 # issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-            regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums }
+            regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: cx.hoisted }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-            regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums }
+            regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums,
+            hoisted: cx.hoisted }
+
+# Set/clear the hoisted-slot set (entering/leaving a match that hoists).
+fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: h }
 
 # True when a block at (line, col) is a recorded `region { }`.
 fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
@@ -2748,6 +2767,17 @@ fn list_nth_ty(xs: [TypeExpr], i: Int) : Option[TypeExpr] = match xs {
   [h, ...rest] -> if i == 0 { Some(h) } else { list_nth_ty(rest, i - 1) }
 }
 
+# The C expression for the pointer sub-cell at slot `i` off `scr`. When
+# `scr` is the match scrutinee `_scr` and slot i has been hoisted to a
+# local (cx.hoisted), spell the local `_hs<i>` — sharing the dependent
+# load across the separate `if`-arms. Otherwise the inline slot deref.
+fn sub_scr_expr(scr: String, i: Int, cx: EmitCtx) : String =
+  if scr == "_scr" and hoist_slot_member(cx.hoisted, i) {
+    concat_all(["_hs", int_to_string(i)])
+  } else {
+    concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
+  }
+
 fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [TypeExpr], scr: String, i: Int,
                               cx: EmitCtx) : String / Console {
 
@@ -2771,7 +2801,7 @@ fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [TypeExpr], scr
         } else {
           let sub_scr =
             if k == 0 {
-              concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
+              sub_scr_expr(scr, i, cx)
             } else {
               slot_read_for_test(scr, i, tys, cx.enums)
             }
@@ -2930,7 +2960,7 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [TypeExpr], scr: St
       # decref needed at arm exit because no extra ref was taken.
       let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
       if k == 0 {
-        let sub_scr = concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
+        let sub_scr = sub_scr_expr(scr, i, cx)
         # variant arg slot is alias of scr's storage.
         cat2(emit_pat_binds(src, sp, sub_scr, true, cx),
              emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx))
@@ -4203,6 +4233,112 @@ fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
   _ -> None
 }
 
+# ====================================================================
+# Sub-deref hoisting (cross-arm CSE) — the match decision-tree lever
+# ====================================================================
+#
+# A nested match like balance_left/right's rotations emits each arm as a
+# separate `if (...)`, and every arm re-dereferences the same sub-cell
+# off `_scr` from scratch: `kai_var_slots(_scr)[1].ptr->variant_tag`,
+# `kai_var_slots(kai_var_slots(_scr)[1].ptr)[k].ptr`, ... The dependent
+# pointer loads cannot be CSE'd by clang across the separate branches
+# (measured: -O3 does not share them; 18 double-indirections in the
+# rb-tree insert_loop). Koka emits a decision tree that reads each
+# sub-cell once. We get the same effect with a minimal, single-pass
+# peephole (no column selection — Tier 1 fast-compile stays intact):
+# hoist `_scr`'s nested-deref slots to C locals `_hs<i>` at the top of
+# the match, then have the per-arm tests/binds read `_hs<i>`.
+#
+# SOUNDNESS GATE (load-bearing): a hoisted `kai_var_slots(_scr)[i].ptr`
+# is an unconditional load. It is only sound when `_scr` is *known* to
+# be a variant whose slot i exists and is a pointer at the point of the
+# hoist. We require EVERY arm to be a PVariant of the SAME outer ctor
+# (so `_scr` is that ctor on entry — the match would not have been
+# reached otherwise for a well-typed exhaustive set), and we only hoist
+# slot i when some arm's sub-pattern at i is itself a PVariant (a nested
+# deref worth sharing) and slot i is a pointer slot. The hoist is a
+# borrow (read, no incref) — RC balance is unchanged.
+
+# The outer ctor name shared by all arms, if they are all PVariant of
+# one ctor with no guard. None otherwise (mixed ctors, wildcard arms,
+# guards) — in which case we do not hoist.
+fn arms_shared_ctor(arms: [Arm]) : Option[String] =
+  arms_shared_ctor_loop(arms, None)
+
+# Fold the arms, tracking the one ctor shared by all PAYLOAD-carrying
+# arms. A nullary PVariant (RBLeaf) or a PWild/PBind catch-all does NOT
+# constrain the ctor: it never reads a hoisted slot, and each deref-arm's
+# own outer-tag test short-circuits (`_scr->variant_tag==CTOR && _hs<i>->
+# ...`) so a hoisted slot-i load is never USED when `_scr` is the nullary
+# ctor. The load itself is a borrow read within the cell's own block (a
+# nullary singleton is sizeof(KaiValue), slot i is inside it), not OOB.
+# Any guard disables hoisting (a guard could reject after a slot read).
+fn arms_shared_ctor_loop(arms: [Arm], acc: Option[String]) : Option[String] = match arms {
+  [] -> acc
+  [a, ...rest] -> match a { Arm(p, g, _) -> match g {
+    Some(_) -> None
+    None    -> match p.pkind {
+      PVariant(nm, subs) ->
+        if list_length(subs) == 0 {
+          arms_shared_ctor_loop(rest, acc)
+        } else {
+          match acc {
+            None      -> arms_shared_ctor_loop(rest, Some(nm))
+            Some(nm0) -> if nm == nm0 { arms_shared_ctor_loop(rest, acc) } else { None }
+          }
+        }
+      PWild    -> arms_shared_ctor_loop(rest, acc)
+      PBind(_) -> arms_shared_ctor_loop(rest, acc)
+      _        -> None
+    }
+  } }
+}
+
+# Slots (positions in the shared-ctor payload) that some arm derefs with
+# a nested PVariant sub-pattern AND that are pointer slots. Those are the
+# ones worth hoisting. Walks all arms, unions the positions.
+fn nested_deref_slots(arms: [Arm], tys: [TypeExpr], enums: [String]) : [Int] =
+  nested_deref_slots_loop(arms, tys, enums, [])
+
+fn nested_deref_slots_loop(arms: [Arm], tys: [TypeExpr], enums: [String], acc: [Int]) : [Int] =
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a { Arm(p, _, _) -> match p.pkind {
+      PVariant(_, subs) -> nested_deref_slots_loop(rest, tys, enums,
+                             arm_nested_slots(subs, tys, enums, 0, acc))
+      _ -> nested_deref_slots_loop(rest, tys, enums, acc)
+    } }
+  }
+
+fn arm_nested_slots(subs: [Pattern], tys: [TypeExpr], enums: [String], i: Int, acc: [Int]) : [Int] =
+  match subs {
+    [] -> acc
+    [sp, ...rest] -> {
+      let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, enums) None -> 0 }
+      let acc2 = match sp.pkind {
+        # nested PVariant on a pointer slot (k==0): worth hoisting.
+        PVariant(_, _) -> if k == 0 and not hoist_slot_member(acc, i) { [i, ...acc] } else { acc }
+        _ -> acc
+      }
+      arm_nested_slots(rest, tys, enums, i + 1, acc2)
+    }
+  }
+
+fn hoist_slot_member(xs: [Int], n: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == n { true } else { hoist_slot_member(rest, n) }
+}
+
+# Emit the `KaiValue *_hs<i> = kai_var_slots(_scr)[i].ptr;` declarations
+# for each hoisted slot, at the top of the match `do {}`.
+fn emit_hoist_decls(slots: [Int]) : String = match slots {
+  [] -> ""
+  [i, ...rest] -> concat_all([
+    "KaiValue *_hs", int_to_string(i), " = kai_var_slots(_scr)[", int_to_string(i), "].ptr; ",
+    emit_hoist_decls(rest)
+  ])
+}
+
 # True when the arm list ends in an unconditional catch-all (a PWild or
 # PBind pattern with no guard): the match can never fall through, so the
 # trailing `non-exhaustive match` panic is dead code. Emitting it anyway
@@ -4224,6 +4360,19 @@ fn match_tail_panic(arms: [Arm]) : String =
   if arms_have_catchall(arms) { "" }
   else { "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n" }
 
+# Compute the hoistable slot set for a match, applying the soundness
+# gate. Returns [] unless every arm is a PVariant of one shared ctor
+# (no guards / wildcards), in which case it returns that ctor's nested-
+# deref pointer slots. Empty → no hoisting, cx unchanged downstream.
+fn match_hoist_slots(arms: [Arm], cx: EmitCtx) : [Int] =
+  match arms_shared_ctor(arms) {
+    None      -> []
+    Some(nm)  -> match evar_payload_tys(cx.variants, nm) {
+      Some(tys) -> nested_deref_slots(arms, tys, cx.enums)
+      None      -> []
+    }
+  }
+
 fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
   # Borrowed scrutinee: emit the inner value and SKIP the exit decref —
@@ -4234,9 +4383,12 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
   match match_borrow_inner(scrut) {
     Some(inner) -> {
       let sc = emit_expr(src, inner, cx)
+      let hs = match_hoist_slots(arms, cx)
+      let arm_cx = emit_ctx_with_hoisted(cx, hs)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-        emit_match_arms(src, arms, cx),
+        emit_hoist_decls(hs),
+        emit_match_arms(src, arms, arm_cx),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
@@ -4255,9 +4407,12 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
   # AST rewrite, so a bare read of the binding is single-use by the
   # time the match sees it; the match decref consumes the ref it owns
   # without touching the producer's slot.
+  let hs = match_hoist_slots(arms, cx)
+  let arm_cx = emit_ctx_with_hoisted(cx, hs)
   concat_all([
     "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-    emit_match_arms(src, arms, cx),
+    emit_hoist_decls(hs),
+    emit_match_arms(src, arms, arm_cx),
     match_tail_panic(arms),
     "} while (0); kai_decref(_scr); _r; })"
   ])
@@ -4562,7 +4717,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo], enums: [String]) : String / Console =
 
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], enums: enums })))
+                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [] })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
@@ -6367,7 +6522,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         # Body sees the extended lexical scope and the module-rotated
         # EFn table; the other three context fields are unchanged.
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums }
+                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -6961,7 +7116,7 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # `emit_fn_body` already does for DFn bodies.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -7048,7 +7203,7 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -7397,7 +7552,7 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -8654,7 +8809,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # recursing, so the entry `lcs` is `[]`.
   let enum_names = collect_enum_type_names(decls)
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [] }
   let bodies = fn_bodies(src, decls, cx)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
