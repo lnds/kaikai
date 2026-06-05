@@ -1792,8 +1792,11 @@ static KaiValue *kai_alloc_var(int n) {
         memset(v, 0, bsz);                 /* slab is uninit; this is the calloc-equivalent */
     }
 #else
-    v = (KaiValue *) kai_slab_alloc(bsz);
-    memset(v, 0, bsz);
+    /* No cell pool (KAI_TRACE_RC / KAI_PROFILE_RC / KAI_NO_CELL_POOL):
+     * the slab allocator lives inside the cell-pool block, so fall back
+     * to a plain libc allocation. kai_var_block_free's matching #else
+     * calls free() on it. */
+    v = (KaiValue *) calloc(1, bsz);
 #endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -1849,7 +1852,9 @@ static KaiValue *kai_alloc_var_nz(int n) {
         v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
     }
 #else
-    v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
+    /* No cell pool: plain libc malloc (no-zero — caller fills slots);
+     * kai_var_block_free's #else frees it. */
+    v = (KaiValue *) malloc(kai_var_block_size(n));
 #endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -1896,8 +1901,14 @@ static void kai_var_block_free(KaiValue *v, int n) {
         kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
         return;
     }
-#endif
     /* spill: drop into the slab; teardown reclaims it at exit. */
+#else
+    /* No cell pool: blocks come from plain malloc/calloc (kai_alloc_var
+     * #else), so free them individually — no slab to reclaim them, and
+     * dropping here would leak (visible under the KAI_TRACE_RC tier). */
+    (void) n;
+    free(v);
+#endif
 }
 
 /* m5 #7: constant pool for nullary primitives.
