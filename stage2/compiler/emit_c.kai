@@ -100,32 +100,50 @@ pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 # load `slot[i].ptr->...` across the separate `if`-arms of a nested
 # match (balance_left/right's rotations), which clang cannot CSE across
 # branches. Empty outside a hoisting match. See emit_hoist_subderefs.
+# `reuse_donor` carries, while emitting an arm-top-reuse body, the donor
+# cell's ctor name and its positional sub-pattern binder names (`""` for a
+# slot with no usable PBind). A TRMC step that rebuilds the SAME ctor into
+# `_arm_ru` (the donated scrutinee shell) can then SKIP the store of slot i
+# when its rebuild arg is exactly the binder bound off slot i of the donor:
+# the value is already in the cell (kai_drop_reuse_token hands back the
+# shell intact). Writes only the changed slots (the TRMC hole + any
+# permuted/transformed slot) — Koka's `_con->field = ...` single-store
+# shape. None outside an arm-top-reuse body → every slot is written, the
+# prior behaviour.
+type ReuseDonor = ReuseDonor(String, [String])
+
 type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
                  regions: [RegionMark], in_region: Bool, borrowed: [String], enums: [String],
-                 hoisted: [Int] }
+                 hoisted: [Int], reuse_donor: Option[ReuseDonor] }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor }
 
 # issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums,
-            hoisted: cx.hoisted }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: h }
+            hoisted: h, reuse_donor: cx.reuse_donor }
+
+# Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
+fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: cx.hoisted, reuse_donor: d }
 
 # True when a block at (line, col) is a recorded `region { }`.
 fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
@@ -3461,7 +3479,7 @@ fn arm_moved_binders(binders: [String], body: Expr) : [String] = match binders {
 fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
                       arm_cx: EmitCtx, cx: EmitCtx) : String / Console {
   match atr {
-    ArmTopReuse(_cname, subs, tys, ptr_binders, n) -> {
+    ArmTopReuse(atr_cname, subs, tys, ptr_binders, n) -> {
       # Transcribe perceus's signature: dup in the shared branch EXACTLY the
       # ptr binders perceus MOVED (bare use in the body, no __perceus_dup).
       # Reading the decision off the AST (not recomputing the branch-aware
@@ -3469,7 +3487,15 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
       let moved = arm_moved_binders(ptr_binders, body)
       let borrow_binds = emit_arm_borrow_binds(src, subs, tys, 0, cx)
       let shared_dups  = arm_shared_dups(moved)
-      let body_c = emit_expr(src, body, arm_cx)
+      # Single-store TRMC reuse: record the donor cell's ctor + positional
+      # binder names so a TRMC step rebuilding the SAME ctor into `_arm_ru`
+      # can skip the store of a slot whose value is already in the donated
+      # shell (Koka's `_con->field = ...` single-store). The donor IS `_scr`
+      # (kai_drop_reuse_token hands back the shell intact when unique), so a
+      # slot bound off `_scr[i]` and re-placed at position i in the rebuild
+      # needs no write. Set only for the body emission of THIS arm.
+      let donor_cx = emit_ctx_with_reuse_donor(arm_cx, Some(ReuseDonor(atr_cname, arm_donor_binders(subs, 0))))
+      let body_c = emit_expr(src, body, donor_cx)
       # Linear reuse-token disposal (Koka ParcReuse): the token captured
       # at the arm top is consumed by a `kai_variant_at(_arm_ru, ...)`
       # TRMC step (which resets `_arm_ru = kai_reuse_null` then `goto`s out,
@@ -3500,6 +3526,19 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
         "if (_arm_ru != kai_reuse_null) { kai_reuse_free(_arm_ru); _arm_ru = kai_reuse_null; } "
       ])
     }
+  }
+}
+
+# The positional binder name of each donor sub-pattern: a PBind's name
+# (the C local `kai_<nm>` it binds off slot i), or `""` for any other
+# sub-pattern (PWild, nested PVariant, literal) — those have no plain
+# binder a rebuild arg could name, so their slot is never skipped. Used by
+# the single-store TRMC reuse to recognise `arg i == binder i`.
+fn arm_donor_binders(subs: [Pattern], i: Int) : [String] = match subs {
+  []            -> []
+  [sp, ...rest] -> {
+    let here = match sp.pkind { PBind(nm) -> if name_is_unused(nm) { "" } else { nm } _ -> "" }
+    [here, ...arm_donor_binders(rest, i + 1)]
   }
 }
 
@@ -4735,7 +4774,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo], enums: [String]) : String / Console =
 
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [] })))
+                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
@@ -6547,7 +6586,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         # Body sees the extended lexical scope and the module-rotated
         # EFn table; the other three context fields are unchanged.
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
+                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -7141,7 +7180,7 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # `emit_fn_body` already does for DFn bodies.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -7228,7 +7267,7 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -7577,7 +7616,7 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -8834,7 +8873,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # recursing, so the entry `lcs` is `[]`.
   let enum_names = collect_enum_type_names(decls)
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [] }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None }
   let bodies = fn_bodies(src, decls, cx)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
@@ -12677,7 +12716,7 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
     Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
     None                  -> tcrec_emit_rebinds(pnames, 0)
   }
-  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", args_e, tys_opt, holeslot, 0, cx)
+  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", cname, args_e, tys_opt, holeslot, 0, cx)
   concat_all([
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
     # captured from the consumed scrutinee when it was unique) — Koka
@@ -12767,7 +12806,8 @@ fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]]
 # stack `KaiVarSlot[]` and having kai_variant_at copy it (the array build
 # + copy was ~10 stores per descent level; direct stores are ~5). The
 # hole slot is zeroed (the cctx fills it next).
-fn emit_trmc_slot_stores(src: String, node: String, args_e: [Expr], tys_opt: Option[[TypeExpr]],
+fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr],
+                         tys_opt: Option[[TypeExpr]],
                          holeslot: Int, i: Int, cx: EmitCtx) : String / Console {
   match args_e {
     [] -> ""
@@ -12775,6 +12815,15 @@ fn emit_trmc_slot_stores(src: String, node: String, args_e: [Expr], tys_opt: Opt
       let head =
         if i == holeslot {
           concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "].ptr = (KaiValue *)0; "])
+        } else if trmc_slot_is_donor_identity(cname, a, i, cx) {
+          # Single-store reuse: this slot's value is already in the donated
+          # shell (`_arm_ru` IS the consumed `_scr`, handed back intact), and
+          # the rebuild re-places the same binder at the same position of the
+          # same ctor. The store is redundant — skip it (Koka writes only the
+          # changed fields). Only the TRMC hole + permuted/transformed slots
+          # are written. Guarded by trmc_slot_is_donor_identity (same ctor,
+          # arg is the positional binder bound off `_scr[i]`).
+          ""
         } else {
           let kind = match tys_opt {
             Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
@@ -12799,10 +12848,43 @@ fn emit_trmc_slot_stores(src: String, node: String, args_e: [Expr], tys_opt: Opt
             concat_all([slotpfx, ".ptr = ", emit_expr(src, av, cx), "; "])
           }
         }
-      concat_all([head, emit_trmc_slot_stores(src, node, rest, tys_opt, holeslot, i + 1, cx)])
+      concat_all([head, emit_trmc_slot_stores(src, node, cname, rest, tys_opt, holeslot, i + 1, cx)])
     }
   }
 }
+
+# True when slot i of the rebuild can skip its store because the value is
+# already in the donated reuse cell. SOUND only when (1) we are inside an
+# arm-top-reuse body whose donor is the cell being rebuilt (`reuse_donor`
+# set), (2) the rebuilt ctor is the SAME as the donor's (so slot layouts
+# coincide — the cell keeps its ctor), and (3) the rebuild arg, stripped of
+# a Perceus dup wrapper, is exactly `EVar(nm)` where `nm` is the donor's
+# positional binder for slot i (same value, same position — not permuted,
+# not transformed). The binder was bound borrow off `_scr[i]` at the arm
+# top; `kai_drop_reuse_token` returned the shell with slot i untouched, so
+# the value is already there. Any mismatch (different ctor, permutation,
+# transformed arg, non-binder slot) keeps the explicit store.
+fn trmc_slot_is_donor_identity(cname: String, a: Expr, i: Int, cx: EmitCtx) : Bool =
+  match cx.reuse_donor {
+    None -> false
+    Some(ReuseDonor(dcname, binders)) ->
+      if dcname != cname { false }
+      else {
+        let bn = trmc_donor_binder_nth(binders, i)
+        if bn == "" { false }
+        else { match (unwrap_perceus_dup_for_borrow(a)).kind {
+          EVar(nm) -> nm == bn
+          _        -> false
+        } }
+      }
+  }
+
+fn trmc_donor_binder_nth(binders: [String], i: Int) : String =
+  if i < 0 { "" }
+  else { match binders {
+    []           -> ""
+    [b, ...rest] -> if i == 0 { b } else { trmc_donor_binder_nth(rest, i - 1) }
+  } }
 
 fn trmc_ty_nth(ts: [TypeExpr], i: Int) : Option[TypeExpr] =
   if i < 0 { None }
