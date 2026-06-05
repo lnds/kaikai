@@ -599,10 +599,61 @@ fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: [EFn], c
             [LB(nm, MUnboxed), ...env]
           } else { env }
         }
+        # i64-inline (Lane B): a variant pattern whose sub-PBind binders
+        # read kind-1 Int slots. Seed each such binder MUnboxed so its
+        # EVar reads resolve to the raw `kair_<nm>` alias the emitter
+        # plants for a kind-1 slot — no kai_int/kai_take_int round-trip.
+        # The SAME interp / lambda-capture guards as the scalar PBind
+        # case apply: a `#{nm}` interp slot or a captured lambda body
+        # bypasses this pass's alias map, so those binders must stay
+        # boxed. The seeding is recursive: a nested PVariant sub-pattern
+        # carries its own kind-1 binders (rb-tree balance rotation shape).
+        PVariant(ctor, subs) -> seed_variant_int_binders(ctor, subs, b, cis, env)
         _ -> env
       }
       Arm(p, unbox_opt_aware(g, env, fns, cis), unbox_expr_aware(b, env_b, fns, cis))
     }
+  }
+}
+
+# Seed MUnboxed for every sub-PBind of `ctor` that binds a kind-1 Int
+# slot (per `cis`) and is safe to read raw in `body` (no interp / lambda
+# use). Recurses into nested PVariant sub-patterns. Slot order matches
+# the ctor's payload order, so the i-th sub-pattern reads the i-th flag.
+fn seed_variant_int_binders(ctor: String, subs: [Pattern], body: Expr,
+                            cis: [CtorIntSlots], env: [LocBind]) : [LocBind] / Console {
+  let flags = match ctor_int_slots_lookup(cis, ctor) {
+    Some(fl) -> fl
+    None     -> []
+  }
+  seed_variant_int_loop(subs, flags, 0, body, cis, env)
+}
+
+fn seed_variant_int_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr,
+                         cis: [CtorIntSlots], env: [LocBind]) : [LocBind] / Console {
+  match subs {
+    [] -> env
+    [sp, ...rest] -> {
+      let slot_is_int = match list_nth_bool(flags, i) { Some(b) -> b None -> false }
+      let env1 = match sp.pkind {
+        PBind(nm) ->
+          if slot_is_int and not expr_has_interp_use(body, nm) and not uses_have_in_lam(scan_uses_expr(body, false), nm) {
+            [LB(nm, MUnboxed), ...env]
+          } else { env }
+        # Nested variant: its own sub-PBind binders may read kind-1 slots.
+        PVariant(inner_ctor, inner_subs) ->
+          seed_variant_int_binders(inner_ctor, inner_subs, body, cis, env)
+        _ -> env
+      }
+      seed_variant_int_loop(rest, flags, i + 1, body, cis, env1)
+    }
+  }
+}
+
+fn list_nth_bool(xs: [Bool], i: Int) : Option[Bool] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> if i == 0 { Some(h) } else { list_nth_bool(rest, i - 1) }
   }
 }
 
