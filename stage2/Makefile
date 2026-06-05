@@ -4918,7 +4918,33 @@ COSTLY_JOBS ?= 5
 test-costly-parallel: $(TARGET) build
 	@$(MAKE) -j$(COSTLY_JOBS) test-tokens test-ast test-types test-env test-check
 
-test: test-costly-parallel test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+# tier1 wall-time reduction (2026-06-05). The ~90 light subtargets below
+# each run kaic2 over SMALL fixtures (kaic2 -> C/LLVM -> run -> diff),
+# not the whole compiler, so they are CPU-bound with modest RSS — unlike
+# the five `test-costly-parallel` ones (4 GB each, capped at -j5). The
+# light group used to run serially as plain `test:` prerequisites, which
+# left a 16-core Linux runner idle one fixture at a time and pushed the
+# battery past the 25-min timeout once the LLVM lanes made every fixture
+# actually run. Fan them out with `$(MAKE) -jN`.
+#
+# Race-safety (verified): every target depends on `$(TARGET) build` (a
+# common prereq, so kaic2 is cooked ONCE before the fan-out — children
+# never race to rebuild it); none rebuilds kaic2 or runs `selfhost` in
+# its recipe (selfhost lives in test-stage2, not here); each writes
+# build/ files under a target-specific prefix (s2-/u2-/viol-/...), so
+# outputs are disjoint. The asan targets are NOT in this list. TEST_JOBS
+# is the cap — memory contention (not build/ races) is the only flakiness
+# axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
+# the old serial behaviour.
+TEST_JOBS ?= 8
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing
+
+test-light-parallel: $(TARGET) build
+	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
+
+test: $(TARGET) build
+	@$(MAKE) test-costly-parallel
+	@$(MAKE) test-light-parallel
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
