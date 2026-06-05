@@ -7660,24 +7660,31 @@ static int _kai_process_record_pid(KaiValue *v) {
 
 /* Mint Exited(code) / Signaled(signo) — variant *names* are the
  * runtime contract with `builtin_exit_decl`. The typer-declared
- * shape is `Exited(Int)` / `Signaled(Int)`. Issue #741 moved Int
- * variant slots to the tagged-`kai_int` representation: a payload
- * Int is now stored BOXED in a pointer slot (`{.ptr = kai_int(n)}`,
- * slot_mask = 0), which is the only convention stage 1's emitter
- * reads (it binds every variant slot via `.ptr`). The runtime
- * constructors must mint the cell the same way — the old
- * `KAI_VAR_SLOT_INT` raw-scalar path (the #440 Phase 2 convention)
- * now mismatches the emitted match read, which reads the raw 0 as a
- * NULL pointer and segfaults on the first `Exited(0)` (i.e. every
- * successful child). Mirror the emitter: boxed slot, mask 0. */
+ * shape is `Exited(Int)` / `Signaled(Int)`. The emitter's slot
+ * representation for a variant Int field has flipped twice; this
+ * runtime constructor must track whichever convention the emitter
+ * reads, because the cell it mints is matched by emitter-generated
+ * code:
+ *   - #440 Phase 2: raw scalar in `.i64`, slot_mask kind-1.
+ *   - #741: re-boxed to a tagged pointer (`{.ptr = kai_int(n)}`,
+ *     slot_mask 0) when stage 1's emitter bound every slot via `.ptr`.
+ *   - i64-inline Lane B (#741 / commit 1f4f66f): back to raw int64 in
+ *     `.i64` with slot_mask kind-1. `variant_slot_kind(Int) == 1`, so
+ *     the emitter constructs `Exited` as
+ *     `kai_variant_u_fast(9, 1, {{.i64 = code}})` (mask 1) and the
+ *     match reads `kai_var_slots(_scr)[0].i64` raw. With the old boxed
+ *     mask-0 cell the match read the pointer bits as the exit code, so
+ *     every `Exited(0)` looked non-zero (process_basic #741 went red).
+ * Mirror the emitter exactly: raw `.i64`, mask 1. mask 1 also keeps
+ * the drop walker from decref-ing a raw int as if it were a pointer. */
 static KaiValue *_kai_process_make_exit_exited(int code) {
-    KaiVarSlot s; s.ptr = kai_int((int64_t) code);
-    return kai_variant_u(9, "Exited", 1, 0, &s);
+    KaiVarSlot s; s.i64 = (int64_t) code;
+    return kai_variant_u(9, "Exited", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_make_exit_signaled(int signo) {
-    KaiVarSlot s; s.ptr = kai_int((int64_t) signo);
-    return kai_variant_u(10, "Signaled", 1, 0, &s);
+    KaiVarSlot s; s.i64 = (int64_t) signo;
+    return kai_variant_u(10, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
 }
 
 static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
