@@ -1,0 +1,116 @@
+# net-dns-v1 (issue #352) — end-to-end smoke for the NetDns default
+# handler. Spec: docs/effects-stdlib.md §`NetDns`. One op (`resolve`),
+# mapped by the v1 handler to getaddrinfo(3) restricted to AF_INET
+# (stage0/runtime.h §*NetDns effect*).
+#
+# Determinism discipline (mirrors net_tcp_localhost): the golden
+# output is a fixed sequence of "ok" lines, never the resolved IP
+# strings or the platform-specific getaddrinfo error message — both
+# vary across libc / resolver config and would break the C<->LLVM
+# backend-parity diff. We assert on SHAPE instead:
+#
+#   1. resolve("localhost")     — the IPv4 loopback 127.0.0.1 is a
+#      member of the result list (every sane resolver maps localhost
+#      to it). Asserted by membership, not by list equality, so a host
+#      that also returns extra addresses still passes.
+#   2. resolve_first("localhost") — Ok(_): at least one address.
+#   3. with_dns(empty resolver)  — resolve_first over an Ok([]) handler
+#      yields Err: the "no addresses" case is shaped in the stdlib, not
+#      the runtime. Uses a fixed in-process resolver so the empty path
+#      is deterministic without depending on a host that resolves to
+#      nothing.
+#   4. resolve("kaikai.invalid.") — Err: `.invalid` is the RFC 6761
+#      reserved TLD guaranteed to NXDOMAIN, so getaddrinfo fails and
+#      the op returns Err on every platform.
+
+import net.dns
+
+# Walk a [IpAddr] looking for a textual match on `.addr`.
+fn list_has_addr(addrs: [IpAddr], want: String) : Bool = match addrs {
+  []           -> false
+  [a, ...rest] -> if a.addr == want { true } else { list_has_addr(rest, want) }
+}
+
+# Empty resolver for the with_dns override path — every host maps to
+# no addresses, so resolve_first must report Err.
+fn no_addrs(host: String) : Result[String, [IpAddr]] = {
+  let _ = host
+  Ok([])
+}
+
+fn check_localhost() : Int / NetDns + Stdout = match resolve("localhost") {
+  Err(_) -> { Stdout.print("resolve localhost FAIL: err"); 1 }
+  Ok(addrs) ->
+    if list_has_addr(addrs, "127.0.0.1") {
+      Stdout.print("resolve localhost ok"); 0
+    } else {
+      Stdout.print("resolve localhost FAIL: no 127.0.0.1"); 1
+    }
+}
+
+fn check_first() : Int / NetDns + Stdout = match resolve_first("localhost") {
+  Err(_) -> { Stdout.print("resolve_first FAIL: err"); 1 }
+  Ok(_)  -> { Stdout.print("resolve_first ok"); 0 }
+}
+
+# resolve_first over a handler that resolves every host to [] must Err.
+fn check_empty() : Int / Stdout = {
+  let r = with_dns(no_addrs, () => resolve_first("anything"))
+  match r {
+    Err(_) -> { Stdout.print("resolve_first empty ok"); 0 }
+    Ok(_)  -> { Stdout.print("resolve_first empty FAIL: ok"); 1 }
+  }
+}
+
+fn check_bogus() : Int / NetDns + Stdout = match resolve("kaikai.invalid.") {
+  Err(_) -> { Stdout.print("resolve bogus ok"); 0 }
+  Ok(_)  -> { Stdout.print("resolve bogus FAIL: ok"); 1 }
+}
+
+fn main() : Int / NetDns + Stdout = {
+  Stdout.print("net_dns_resolve start")
+  let r1 = check_localhost()
+  let r2 = check_first()
+  let r3 = check_empty()
+  let r4 = check_bogus()
+  let rc = r1 + r2 + r3 + r4
+  if rc == 0 { Stdout.print("done"); 0 }
+  else { Stdout.print("done with errors"); rc }
+}
+
+# Deterministic resolver for the test blocks: maps every host to a
+# fixed two-address list so the assertions never touch the network
+# (and so `kai test` stays hermetic in CI).
+fn fixed_addrs(host: String) : Result[String, [IpAddr]] = {
+  let _ = host
+  Ok([IpAddr { addr: "10.0.0.1" }, IpAddr { addr: "10.0.0.2" }])
+}
+
+test "resolve passes the handler's address list through" {
+  let r = with_dns(fixed_addrs, () => resolve("db.internal"))
+  let addrs = match r {
+    Err(_)    -> []
+    Ok(addrs) -> addrs
+  }
+  assert list_has_addr(addrs, "10.0.0.1")
+  assert list_has_addr(addrs, "10.0.0.2")
+  assert not list_has_addr(addrs, "10.0.0.3")
+}
+
+test "resolve_first returns the first address of a non-empty result" {
+  let r = with_dns(fixed_addrs, () => resolve_first("db.internal"))
+  let got = match r {
+    Err(_) -> "err"
+    Ok(a)  -> a.addr
+  }
+  assert got == "10.0.0.1"
+}
+
+test "resolve_first reports Err when the host resolves to no addresses" {
+  let r = with_dns(no_addrs, () => resolve_first("ghost.internal"))
+  let is_err = match r {
+    Err(_) -> true
+    Ok(_)  -> false
+  }
+  assert is_err
+}
