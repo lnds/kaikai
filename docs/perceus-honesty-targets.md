@@ -25,6 +25,21 @@ The honesty claims are all met for emitted user programs:
   backend; see the TCO section below for the bootstrap-chain and LLVM
   caveats that survive).
 
+> **Backend note (LLVM RC, 2026-06-06, #747):** the numbers above are the
+> **C backend** (the primary, behind the honesty claims). The **LLVM
+> backend** (`--emit=llvm`) had never implemented the Perceus match RC
+> discipline at all — it leaked every scrutinee and boxed slot in every
+> match (rb-tree: `frees=0`, 3.7 GB RSS). #747 ported the C protocol to
+> the LLVM emitter (borrow slot reads, kind-1 raw Int binders, survivor
+> incref at bind, match-exit + TRMC-step scrutinee drop, two-pass
+> test/bind pattern lowering). The LLVM rb-tree is now **garbage-free**
+> (`free_total == alloc_total - live tree`; RSS 3.7 GB → 205 MB) and
+> ASan-clean, gated by `stage2` `test-issue-747`. It still trails the C
+> backend ~3.5× on wall/RSS because it does NOT yet do reuse-in-place
+> (fresh-alloc + drop, the C v1 shape) and links the older
+> `stage0/runtime.h` (no slab) — both **Tier-2 perf follow-ups**,
+> orthogonal to this Tier-1 RC-correctness fix.
+
 The 2026-05 doc generation cited the rb-tree at **12.6×–15.9× C**.
 **Those numbers are dead.** The reuse-in-place cascade of 2026-06-01/02
 (four perf commits, below) moved the wall ~5.4× and the RSS ~5.3×. Do

@@ -591,6 +591,7 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_arena_record(i32, %KaiValue**, i8**)\n",
     "declare %KaiValue* @kaix_arena_variant(i32, i8*, i32, %KaiValue**)\n",
     "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_field_borrow(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_prelude_args()\n",
     "declare %KaiValue* @kaix_prelude_program_name()\n",
     "declare %KaiValue* @kaix_prelude_stdlib_path()\n",
@@ -834,6 +835,27 @@ fn llvm_raw_local_find_loop(ls: [LlvmLocal], target: String) : Option[LlvmLocal]
 }
 
 fn llvm_raw_local_find(ls: [LlvmLocal], target: String) : Option[LlvmLocal] = llvm_raw_local_find_loop(ls, target)
+
+# #747 — is `x` an `EVar(nm)` whose NEAREST binding on the locals stack is
+# an `LRaw` (a kind-1 raw `i64` binder), not a boxed `LL`? Used to decide
+# whether `__perceus_dup(x)` / `__perceus_borrow(x)` in raw context can be
+# lowered to a MOVE (read the raw register directly, drop the dup). We walk
+# the stack and stop at the FIRST binding for `nm`: if it is LRaw the move
+# is sound; if it is a boxed LL (a shadowing boxed rebind) it is not, so we
+# leave the dup to the boxed path. Mirrors emit_c's `cx.kind1_raw` membership
+# check, which is likewise scoped to the innermost arm binding.
+fn llvm_raw_inner_is_raw_local(ls: [LlvmLocal], x: Expr) : Bool = match x.kind {
+  EVar(nm) -> llvm_nearest_local_is_raw(ls, nm)
+  _        -> false
+}
+
+fn llvm_nearest_local_is_raw(ls: [LlvmLocal], target: String) : Bool = match ls {
+  [] -> false
+  [l, ...rest] -> match l {
+    LRaw(nm, _, _) -> if nm == target { true } else { llvm_nearest_local_is_raw(rest, target) }
+    LL(nm, _)      -> if nm == target { false } else { llvm_nearest_local_is_raw(rest, target) }
+  }
+}
 
 # ---- the emit state carried through expressions ----
 #
@@ -1511,16 +1533,61 @@ fn llvm_emit_expr_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
   match x.mode {
     MUnboxed -> llvm_emit_kind_raw(e, x)
     _ -> {
-      # MBoxed → MUnboxed boundary: force the boxed path (must not
-      # re-enter the mode dispatcher, otherwise an MBoxed expression
-      # whose kind handler internally calls `llvm_emit_expr` is
-      # safe — but a defensive fallback that ends up here for an
-      # MUnboxed kind would loop. `llvm_emit_expr_boxed` always
-      # emits the kind-based boxed lowering regardless of mode.
-      let eb = llvm_emit_expr_boxed(e, x)
-      llvm_unbox_value(eb, eb.last_val, x.ty)
+      # #747 — a kind-1 raw binder (`LRaw`) read in raw context must read
+      # its `i64` register directly, even when the NODE'S mode is MBoxed.
+      # The typer pins a comparison's operands and result to Bool/Int but
+      # does not unbox the EVar, so a binder read inside `k < kx` arrives
+      # MBoxed; the boxed boundary below would re-box it (`kaix_int`) and
+      # immediately unbox (`kaix_to_int`) — an identity round-trip that
+      # leaks the freshly-allocated box (kaix_to_int borrows, never
+      # decrefs). emit_c never hits this: it reads `kair_<nm>` raw via the
+      # `cx.kind1_raw` set regardless of mode. We mirror that by routing a
+      # raw-local read (bare EVar, or `__perceus_dup`/`__perceus_borrow`
+      # over one — a MOVE on an RC-free raw binder) through the kind-raw
+      # emitter, which reads the register with no box round-trip.
+      if llvm_expr_reads_raw_local(e.locals, x) {
+        llvm_emit_kind_raw(e, llvm_strip_dup_borrow(x))
+      } else {
+        # MBoxed → MUnboxed boundary: force the boxed path (must not
+        # re-enter the mode dispatcher, otherwise an MBoxed expression
+        # whose kind handler internally calls `llvm_emit_expr` is
+        # safe — but a defensive fallback that ends up here for an
+        # MUnboxed kind would loop. `llvm_emit_expr_boxed` always
+        # emits the kind-based boxed lowering regardless of mode.
+        let eb = llvm_emit_expr_boxed(e, x)
+        llvm_unbox_value(eb, eb.last_val, x.ty)
+      }
     }
   }
+}
+
+# #747 — does `x` (in raw context) ultimately read a kind-1 raw binder?
+# True for a bare `EVar(nm)` bound as `LRaw`, or a `__perceus_dup(inner)` /
+# `__perceus_borrow(inner)` wrapping such an EVar (perceus's incref over a
+# raw RC-free binder is a no-op MOVE). Used to short-circuit the boxed
+# round-trip in `llvm_emit_expr_raw`.
+fn llvm_expr_reads_raw_local(ls: [LlvmLocal], x: Expr) : Bool = match x.kind {
+  EVar(nm) -> llvm_nearest_local_is_raw(ls, nm)
+  ECall(callee, args_) -> match callee.kind {
+    EVar(cnm) -> if cnm == "__perceus_dup" or cnm == "__perceus_borrow" {
+      match args_ { [a] -> llvm_expr_reads_raw_local(ls, a) _ -> false }
+    } else { false }
+    _ -> false
+  }
+  _ -> false
+}
+
+# Peel `__perceus_dup` / `__perceus_borrow` wrappers down to the inner
+# expr. Only called once `llvm_expr_reads_raw_local` confirmed the inner
+# is a raw-local EVar, so the dup/borrow is a MOVE (no incref needed).
+fn llvm_strip_dup_borrow(x: Expr) : Expr = match x.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(cnm) -> if cnm == "__perceus_dup" or cnm == "__perceus_borrow" {
+      match args_ { [a] -> llvm_strip_dup_borrow(a) _ -> x }
+    } else { x }
+    _ -> x
+  }
+  _ -> x
 }
 
 fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
@@ -1586,7 +1653,25 @@ fn llvm_emit_kind_raw(e: LlvmEmit, x: Expr) : LlvmRaw / Console {
         EVar(cnm) -> if es_tcrec_is_sentinel(cnm) {
           let ec = llvm_emit_call(e, callee, args_)
           LlvmRaw { e: ec, reg: "undef", ty: x.ty }
-        } else { llvm_emit_call_raw_or_box(e, x, callee, args_) }
+        }
+        # #747 — `__perceus_dup` / `__perceus_borrow` over a kind-1 raw
+        # binder in RAW context is a MOVE: emit the inner expr raw and
+        # drop the dup. perceus inserts the dup assuming an owned boxed
+        # read, but a kind-1 Int binder is raw `i64` with NO refcount —
+        # re-boxing it (`kaix_int`) just to `__perceus_dup` (+1) and then
+        # `kaix_to_int` (borrow, no decref) leaked the +1 (the exact
+        # dup→to_int shape #747 traced). Reading the inner raw skips the
+        # whole round-trip. Mirror of emit_c, where dup of a kind1_raw
+        # name lowers to the bare `kair_<nm>`. Non-raw inners fall through
+        # the boxed boundary, unchanged.
+        else if (cnm == "__perceus_dup" or cnm == "__perceus_borrow") and (match args_ {
+                   [a] -> llvm_raw_inner_is_raw_local(e.locals, a)
+                   _   -> false
+                 }) {
+          match args_ { [a] -> llvm_emit_expr_raw(e, a)
+                        _   -> llvm_emit_call_raw_or_box(e, x, callee, args_) }
+        }
+        else { llvm_emit_call_raw_or_box(e, x, callee, args_) }
         _ -> llvm_emit_call_raw_or_box(e, x, callee, args_)
       }
     # Issue #718 — `if cond { a } else { b }` with raw arms lowers to a
@@ -3430,15 +3515,64 @@ fn llvm_emit_unop(e: LlvmEmit, op: String, inner: Expr) : LlvmEmit / Console {
 # is dead in both arms (neither references `cv`), so a single
 # `kaix_decref` between the truthy probe and the conditional branch
 # balances the fresh allocation that fed it.
+# #747 — LLVM mirror of emit_c's `ty_opt_is_int` / `is_int_order_cmp`.
+# Local copies so the int-order-cmp fast path below does not depend on
+# cross-module visibility of those non-`pub` emit_c helpers when kaic2
+# self-hosts with real modules. `op_is_raw_cmp` is already `pub`, but it
+# also covers `==` / `!=`, which keep structural Eq semantics; the order
+# fast path is restricted to the four `< > <= >=` comparisons.
+fn llvm_ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt -> true
+    TyDimT(inner, _)    -> match inner { TyInt -> true _ -> false }
+    TyRefineT(inner, _) -> match inner { TyInt -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+fn llvm_op_is_int_order_cmp(op: String) : Bool =
+  op == "<" or op == ">" or op == "<=" or op == ">="
+
+# Is `c` a direct Int order-comparison (`if k < kx { }`)? Such a cond is a
+# raw i1 — emit it inline and branch on it, skipping the
+# `kaix_truthy(kaix_bool(...))` box/un-box round-trip that re-boxed the
+# kind-1 raw binders and reintroduced the dup+to_int leak (#747). Fires
+# even though the comparison's `.mode` may be MBoxed (the typer pins the
+# result to Bool but does not unbox the node). Load-bearing on the
+# rb-tree descent; mirror of emit_c `expr_is_int_order_cmp`.
+fn llvm_expr_is_int_order_cmp(e: Expr) : Bool = match e.kind {
+  EBinop(op, a, b) -> llvm_op_is_int_order_cmp(op) and llvm_ty_opt_is_int(a.ty) and llvm_ty_opt_is_int(b.ty)
+  _ -> false
+}
+
 fn llvm_emit_if(e: LlvmEmit, c: Expr, t: Expr, eo: Option[Expr]) : LlvmEmit / Console {
 
-  let ec = llvm_emit_expr(e, c)
-  let cv = ec.last_val
-  let tri = llvm_fresh_reg(ec)
-  let e1 = llvm_append_body(tri.e, concat_all(["  ", tri.reg, " = call i32 @kaix_truthy(%KaiValue* ", cv, ")\n"]))
-  let e1d = llvm_append_body(e1, concat_all(["  call void @kaix_decref(%KaiValue* ", cv, ")\n"]))
-  let cond = llvm_fresh_reg(e1d)
-  let e2 = llvm_append_body(cond.e, concat_all(["  ", cond.reg, " = icmp ne i32 ", tri.reg, ", 0\n"]))
+  # #747 fast path: an Int order-comparison condition lowers to a raw
+  # `icmp` + `br i1`, no boxed bool / truthy / decref round-trip. This is
+  # what keeps kind-1 raw binders (`kx`, `vx`) reading raw on the descent
+  # instead of re-boxing through `kaix_int` → `__perceus_dup` → `kaix_to_int`.
+  let cres = if llvm_expr_is_int_order_cmp(c) {
+    let raw = llvm_emit_binop_raw(e, match c.kind { EBinop(op, _, _) -> op _ -> "<" },
+                                  match c.kind { EBinop(_, a, _) -> a _ -> c },
+                                  match c.kind { EBinop(_, _, b) -> b _ -> c },
+                                  Some(TyBool))
+    # `raw.reg` is the i32 zext of the i1 compare; renormalise to i1.
+    let cond = llvm_fresh_reg(raw.e)
+    let e_c = llvm_append_body(cond.e, concat_all(["  ", cond.reg, " = icmp ne i32 ", raw.reg, ", 0\n"]))
+    LlvmReg { e: e_c, reg: cond.reg }
+  } else {
+    let ec = llvm_emit_expr(e, c)
+    let cv = ec.last_val
+    let tri = llvm_fresh_reg(ec)
+    let e1 = llvm_append_body(tri.e, concat_all(["  ", tri.reg, " = call i32 @kaix_truthy(%KaiValue* ", cv, ")\n"]))
+    let e1d = llvm_append_body(e1, concat_all(["  call void @kaix_decref(%KaiValue* ", cv, ")\n"]))
+    let cond = llvm_fresh_reg(e1d)
+    let e_c = llvm_append_body(cond.e, concat_all(["  ", cond.reg, " = icmp ne i32 ", tri.reg, ", 0\n"]))
+    LlvmReg { e: e_c, reg: cond.reg }
+  }
+  let cond = cres
+  let e2 = cond.e
   let th  = llvm_fresh_label(e2, "if.then.")
   let el  = llvm_fresh_label(th.e, "if.else.")
   let jn  = llvm_fresh_label(el.e, "if.end.")
@@ -4929,13 +5063,20 @@ fn llvm_emit_truthy_br(e: LlvmEmit, scr_val: String, fail_lbl: String, prefix: S
   llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, prefix)
 }
 
-# Pattern test. Adds locals for PBind, branches to `fail_lbl` on any
-# non-matching leaf. Falls through into the current block on success;
-# the caller then emits the arm body.
+# Pattern test — #747 TEST-ONLY pass. Emits ONLY the discriminator
+# checks (tag / literal / nil / cons) and branches to `fail_lbl` on any
+# mismatch. It binds NOTHING and increfs NOTHING — every slot read is a
+# borrow. The binding pass `llvm_emit_pattern_binds` runs AFTER the whole
+# pattern has matched, so a survivor incref can never be stranded on a
+# mid-pattern fail edge (the leak #747's two-nested-arm shape exposed:
+# a `bind_survivor` incref emitted before a nested sub-test that branched
+# to the next arm leaked the +1). Mirror of emit_c's split between
+# `emit_pat_test` (borrows, may fail) and `emit_pat_binds` (binds, after
+# the match is confirmed).
 fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: String) : LlvmEmit / Console {
   match pat.pkind {
     PWild -> e
-    PBind(nm) -> llvm_push_local(e, nm, scr)
+    PBind(_) -> e
     PLit(lit) -> {
       let el = llvm_emit_expr(e, lit)
       let lv = el.last_val
@@ -4977,16 +5118,16 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk_res.reg, ", 0\n"])
       let e2 = llvm_append_body(cond.e, cond_i)
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.var.ok.")
-      llvm_emit_pat_subpats(e3, subpats, scr, fail_lbl, 0)
+      # #747 TEST-ONLY: recurse into sub-patterns for their discriminator
+      # checks only (no binds). The bind pass re-reads the slots as borrows
+      # and binds after the whole pattern matched.
+      llvm_emit_pat_subpats_test(e3, subpats, scr, fail_lbl, 0)
     }
     PList(sub_pats, opt_rest) -> llvm_emit_pat_list(e, sub_pats, opt_rest, scr, fail_lbl)
     PHole(_) -> e
-    # m7d §14: bind the as-name to the whole scrutinee, then test +
-    # bind the inner pattern on the same scrutinee.
-    PAs(nm, sub) -> {
-      let e1 = llvm_push_local(e, nm, scr)
-      llvm_emit_pattern_test(e1, sub, scr, fail_lbl)
-    }
+    # m7d §14 — TEST-ONLY: the as-name binds nothing here; test the inner
+    # pattern on the same scrutinee. The bind pass binds the as-name.
+    PAs(_, sub) -> llvm_emit_pattern_test(e, sub, scr, fail_lbl)
     # Variant with record-style destructuring (`RxParseError { msg, pos }`).
     # Check the variant tag first, then bind each named field via
     # @kaix_field. Mirrors emit_pat_test_variant_record in the C path.
@@ -5016,13 +5157,13 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk_res.reg, ", 0\n"])
       let e2 = llvm_append_body(cond.e, cond_i)
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.vrec.ok.")
-      llvm_emit_pat_record_fields(e3, fields, scr, fail_lbl)
+      llvm_emit_pat_record_fields_test(e3, fields, scr, fail_lbl)
     }
-    # Bare record pattern (no variant tag). Just bind fields.
-    PRecord(fields) -> llvm_emit_pat_record_fields(e, fields, scr, fail_lbl)
+    # Bare record pattern (no variant tag) — TEST-ONLY: test sub-patterns.
+    PRecord(fields) -> llvm_emit_pat_record_fields_test(e, fields, scr, fail_lbl)
     # issue #187 phase 3: PNarrow is normally rewritten to PAs+PVariant
-    # before codegen; this arm is defensive. Bind the name like PBind.
-    PNarrow(nm, _) -> llvm_push_local(e, nm, scr)
+    # before codegen; this arm is defensive. TEST-ONLY: binds nothing.
+    PNarrow(_, _) -> e
     _ -> {
       eprint("llvm: pattern kind not supported at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       e
@@ -5035,21 +5176,96 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
 # Mirrors emit_pat_binds_record + emit_pat_test_record_fields in the C
 # path (~line 12835), simplified because llvm_emit_pattern_test handles
 # the test+bind in one pass.
-fn llvm_emit_pat_record_fields(e: LlvmEmit, fields: [PField], scr: String,
+# #747 TEST-ONLY record-field walk: project each field with the BORROWING
+# accessor (`kaix_field_borrow`, no incref) and test its sub-pattern.
+# Binds nothing. Using the incref-ing `kaix_field` here would leak one ref
+# per field tested on a failing arm (the same leak the PVariant two-pass
+# split fixes) — mirror of emit_c which uses `kai_op_field_borrow` in the
+# test pass for exactly this reason. A PWild / PBind / PHole sub-pattern
+# matches unconditionally, so its field needs no read at all (skip it).
+fn llvm_emit_pat_record_fields_test(e: LlvmEmit, fields: [PField], scr: String,
                                 fail_lbl: String) : LlvmEmit / Console {
   match fields {
     [] -> e
     [pf, ...rest] -> match pf {
       PField(name, sub, _) -> {
-        let nameinfo = llvm_emit_name_constant(e, name, "fld.")
-        let r = llvm_fresh_reg(nameinfo.e)
-        let instr = concat_all([
-          "  ", r.reg, " = call %KaiValue* @kaix_field(%KaiValue* ", scr,
-          ", i8* ", nameinfo.gep, ")\n"
-        ])
-        let e1 = llvm_append_body(r.e, instr)
-        let e2 = llvm_emit_pattern_test(e1, sub, r.reg, fail_lbl)
-        llvm_emit_pat_record_fields(e2, rest, scr, fail_lbl)
+        let needs_test = match sub.pkind {
+          PBind(_) -> false
+          PWild    -> false
+          PHole(_) -> false
+          _        -> true
+        }
+        if needs_test {
+          let nameinfo = llvm_emit_name_constant(e, name, "fld.")
+          let r = llvm_fresh_reg(nameinfo.e)
+          let instr = concat_all([
+            "  ", r.reg, " = call %KaiValue* @kaix_field_borrow(%KaiValue* ", scr,
+            ", i8* ", nameinfo.gep, ")\n"
+          ])
+          let e1 = llvm_append_body(r.e, instr)
+          let e2 = llvm_emit_pattern_test(e1, sub, r.reg, fail_lbl)
+          llvm_emit_pat_record_fields_test(e2, rest, scr, fail_lbl)
+        } else {
+          llvm_emit_pat_record_fields_test(e, rest, scr, fail_lbl)
+        }
+      }
+    }
+  }
+}
+
+# #747 BIND-ONLY record-field walk. Projects each field with the
+# BORROWING accessor (`kaix_field_borrow`, no incref) and binds its
+# sub-pattern. A field whose sub-pattern is a named PBind is a survivor →
+# borrow + ONE incref (its own +1 to outlive the match-exit cascade).
+# Nested sub-patterns recurse on the borrow. Runs after the match is
+# confirmed; never fails. Mirror of emit_c's record bind path.
+fn llvm_emit_pat_record_fields_binds(e: LlvmEmit, fields: [PField], scr: String) : LlvmEmit / Console {
+  match fields {
+    [] -> e
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let bind_survivor = match sub.pkind {
+          PBind(nm) -> not llvm_name_is_unused(nm)
+          _         -> false
+        }
+        let needs_descend = match sub.pkind {
+          PVariant(_, _)        -> true
+          PVariantRecord(_, _)  -> true
+          PRecord(_)            -> true
+          PList(_, _)           -> true
+          PAs(_, _)             -> true
+          _                     -> false
+        }
+        if bind_survivor {
+          let nm = match sub.pkind { PBind(n) -> n _ -> "" }
+          let nameinfo = llvm_emit_name_constant(e, name, "fld.")
+          let r = llvm_fresh_reg(nameinfo.e)
+          let instr = concat_all([
+            "  ", r.reg, " = call %KaiValue* @kaix_field_borrow(%KaiValue* ", scr,
+            ", i8* ", nameinfo.gep, ")\n"
+          ])
+          let e1 = llvm_append_body(r.e, instr)
+          let dup = llvm_fresh_reg(e1)
+          let dup_i = concat_all([
+            "  ", dup.reg, " = call %KaiValue* @kaix_incref(%KaiValue* ", r.reg, ")\n"
+          ])
+          let e2 = llvm_append_body(dup.e, dup_i)
+          let e3 = llvm_push_local(e2, nm, dup.reg)
+          llvm_emit_pat_record_fields_binds(e3, rest, scr)
+        } else if needs_descend {
+          let nameinfo = llvm_emit_name_constant(e, name, "fld.")
+          let r = llvm_fresh_reg(nameinfo.e)
+          let instr = concat_all([
+            "  ", r.reg, " = call %KaiValue* @kaix_field_borrow(%KaiValue* ", scr,
+            ", i8* ", nameinfo.gep, ")\n"
+          ])
+          let e1 = llvm_append_body(r.e, instr)
+          let e2 = llvm_emit_pattern_binds(e1, sub, r.reg)
+          llvm_emit_pat_record_fields_binds(e2, rest, scr)
+        } else {
+          # PWild / PLit / `_`-unused field: binds nothing, no projection.
+          llvm_emit_pat_record_fields_binds(e, rest, scr)
+        }
       }
     }
   }
@@ -5066,7 +5282,11 @@ fn llvm_emit_pat_list(e: LlvmEmit, sub_pats: [Pattern], opt_rest: Option[String]
   let has_rest = match opt_rest { Some(_) -> true None -> false }
   if n_fixed == 0 {
     if has_rest {
-      # [..rest] — any list; bind rest = scr.
+      # [..rest] — any list; bind rest = scr. #747: list patterns keep the
+      # original test+bind-in-one-pass shape (the split is applied only to
+      # PVariant, the rb-tree shape; lists/records don't hit the stranded-
+      # incref window in the leak repro and `kaix_cons_head/tail` keep
+      # their incref convention, so the binder takes that owned ref).
       match opt_rest {
         Some(nm) -> llvm_push_local(e, nm, scr)
         None     -> e
@@ -5093,8 +5313,8 @@ fn llvm_emit_pat_list_loop(e: LlvmEmit, sub_pats: [Pattern], has_rest: Bool,
 
   match sub_pats {
     [] -> {
-      # End of fixed prefix: either rest-binder gets the tail, or we
-      # require the tail to be nil.
+      # End of fixed prefix: with a rest binder, bind rest = tail; without,
+      # require nil. (#747: list keeps test+bind-in-one-pass — see above.)
       if has_rest {
         match opt_rest {
           Some(nm) -> llvm_push_local(e, nm, scr)
@@ -5132,26 +5352,225 @@ fn llvm_emit_pat_list_loop(e: LlvmEmit, sub_pats: [Pattern], has_rest: Bool,
         "  ", tail.reg, " = call %KaiValue* @kaix_cons_tail(%KaiValue* ", scr, ")\n"
       ])
       let e5 = llvm_append_body(tail.e, tail_i)
-      let e6 = llvm_emit_pattern_test(e5, p, head.reg, fail_lbl)
+      # #747: list element keeps test+bind-in-one-pass (legacy). The head
+      # arrives OWNED from `kaix_cons_head` (it increfs), so a PBind takes
+      # that ref directly (push, no extra incref); nested sub-patterns
+      # test then bind on the owned head. This is the pre-#747 shape,
+      # confined to lists (the split is PVariant-only).
+      let e6 = llvm_emit_list_elem_test_bind(e5, p, head.reg, fail_lbl)
       llvm_emit_pat_list_loop(e6, rest, has_rest, opt_rest, tail.reg, fail_lbl)
     }
   }
 }
 
-fn llvm_emit_pat_subpats(e: LlvmEmit, ps: [Pattern], scr: String, fail_lbl: String, i: Int) : LlvmEmit / Console {
+# #747 — legacy test+bind-in-one-pass for a list element (the head of a
+# cons cell, already owned from `kaix_cons_head`). Lists are not in the
+# leak repro and keep their original single-pass shape; only PVariant got
+# the test/bind split. A PBind takes the owned head directly; a nested
+# sub-pattern tests then binds on it.
+fn llvm_emit_list_elem_test_bind(e: LlvmEmit, p: Pattern, elem: String, fail_lbl: String) : LlvmEmit / Console {
+  match p.pkind {
+    PWild     -> e
+    PBind(nm) -> llvm_push_local(e, nm, elem)
+    _ -> {
+      let e1 = llvm_emit_pattern_test(e, p, elem, fail_lbl)
+      llvm_emit_pattern_binds(e1, p, elem)
+    }
+  }
+}
 
+# Local nth on a TypeExpr list (the payload-type list of a ctor). The
+# C backend's `list_nth_ty` is module-private; we keep an emit_llvm copy
+# so the kind-1 probe does not depend on cross-module visibility of a
+# non-`pub` helper when kaic2 self-hosts with real modules.
+fn llvm_list_nth_ty(xs: [TypeExpr], i: Int) : Option[TypeExpr] = match xs {
+  []            -> None
+  [h, ...rest]  -> if i == 0 { Some(h) } else { llvm_list_nth_ty(rest, i - 1) }
+}
+
+# i64-inline (Lane B) read-side, LLVM mirror of emit_c's
+# `emit_pat_binds_variant` k==1 PBind arm (#747). A `_`-prefixed name
+# signals "unused" by convention; such a binder is never read, so there
+# is nothing to seed raw (and seeding it would push a dead LRaw). Mirrors
+# emit_c `name_is_unused` (compiler-internal `__`-prefixed names are NOT
+# unused — they are read by perceus/desugar rewrites).
+fn llvm_name_is_unused(name: String) : Bool =
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_' and match char_at(name, 1) {
+      Some(c1) -> c1 != '_'
+      None     -> true
+    }
+    None -> false
+  }
+
+# #747 TEST-ONLY sub-pattern walk. For each slot, read it as a BORROW
+# and recurse the sub-pattern's discriminator test. A kind-1 Int slot
+# whose sub-pattern is a PLit is a literal test on the raw scalar; any
+# other sub-pattern (PBind/PWild/nested) binds nothing here. No reads
+# for slots whose sub-pattern is a pure binder/wild (no test needed) —
+# but we still must descend into nested destructuring sub-patterns.
+fn llvm_emit_pat_subpats_test(e: LlvmEmit, ps: [Pattern], scr: String, fail_lbl: String,
+                               i: Int) : LlvmEmit / Console {
   match ps {
     [] -> e
     [p, ...rest] -> {
-      let arg = llvm_fresh_reg(e)
-      let instr = concat_all([
-        "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
-        ", i32 ", int_to_string(i), ")\n"
-      ])
-      let e1 = llvm_append_body(arg.e, instr)
-      let e2 = llvm_emit_pattern_test(e1, p, arg.reg, fail_lbl)
-      llvm_emit_pat_subpats(e2, rest, scr, fail_lbl, i + 1)
+      # Only sub-patterns that can FAIL need a slot read here: nested
+      # PVariant/PVariantRecord/PRecord/PList, or a PLit. PBind/PWild/PHole
+      # match unconditionally — skip the read entirely (no test, no bind).
+      let needs_test = match p.pkind {
+        PBind(_) -> false
+        PWild    -> false
+        PHole(_) -> false
+        _        -> true
+      }
+      if needs_test {
+        let arg = llvm_fresh_reg(e)
+        let instr = concat_all([
+          "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
+          ", i32 ", int_to_string(i), ")\n"
+        ])
+        let e1 = llvm_append_body(arg.e, instr)
+        let e2 = llvm_emit_pattern_test(e1, p, arg.reg, fail_lbl)
+        llvm_emit_pat_subpats_test(e2, rest, scr, fail_lbl, i + 1)
+      } else {
+        llvm_emit_pat_subpats_test(e, rest, scr, fail_lbl, i + 1)
+      }
     }
+  }
+}
+
+# #747 BIND-ONLY sub-pattern walk. Runs AFTER the whole pattern matched,
+# so it CANNOT fail — every read is safe and every survivor incref lands
+# only on the taken arm. Mirror of emit_c's `emit_pat_binds_variant`:
+#   - kind-1 Int slot + named PBind → read raw i64 (no box, no dup), push LRaw.
+#   - kind-1 Int slot + PWild/`_`-unused → bind nothing, no read.
+#   - kind-0 pointer slot + named PBind → borrow + incref (survivor +1).
+#   - kind-0 pointer slot + nested sub-pattern → borrow + recurse binds.
+#   - kind-0 pointer slot + PWild/`_`-unused → bind nothing, no read (the
+#     match-exit cascade reclaims the slot).
+fn llvm_emit_pat_subpats_binds(e: LlvmEmit, ps: [Pattern], scr: String, i: Int,
+                                tys: [TypeExpr]) : LlvmEmit / Console {
+  match ps {
+    [] -> e
+    [p, ...rest] -> {
+      let slot_kind = match llvm_list_nth_ty(tys, i) {
+        Some(t) -> variant_slot_kind(t, [])
+        None    -> 0
+      }
+      let bind_raw = match p.pkind {
+        PBind(nm) -> slot_kind == 1 and not llvm_name_is_unused(nm)
+        _         -> false
+      }
+      let skip_read = slot_kind == 1 and (match p.pkind {
+        PWild     -> true
+        PBind(nm) -> llvm_name_is_unused(nm)
+        _         -> false
+      })
+      # #747 — a named PBind on ANY boxed-pointer slot is a survivor that
+      # takes +1 to outlive the match-exit cascade. The LLVM backend lays
+      # every non-kind-1 slot out as a boxed `%KaiValue*` (mask==0): kind-0
+      # pointers, kind-2 boxed Real (`kaix_real`), kind-3 enum singletons.
+      # Only kind-1 (raw i64) is the LRaw exception handled by `bind_raw`.
+      # (Pre-#747 single-pass this was implicit — `kaix_variant_arg`'s old
+      # incref + PBind push bound the Real/enum; the json_real_scientific
+      # parity fixture caught the regression when the split dropped kind-2.)
+      let bind_survivor = slot_kind != 1 and (match p.pkind {
+        PBind(nm) -> not llvm_name_is_unused(nm)
+        _         -> false
+      })
+      # #747: PList sub-patterns bind in the TEST pass (lists are exempt
+      # from the PVariant split), so they are NOT descended here.
+      let needs_descend = match p.pkind {
+        PVariant(_, _)        -> true
+        PVariantRecord(_, _)  -> true
+        PRecord(_)            -> true
+        PAs(_, _)             -> true
+        _                     -> false
+      }
+      if bind_raw {
+        let nm = match p.pkind { PBind(n) -> n _ -> "" }
+        let arg = llvm_fresh_reg(e)
+        let arg_i = concat_all([
+          "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
+          ", i32 ", int_to_string(i), ")\n"
+        ])
+        let e_arg = llvm_append_body(arg.e, arg_i)
+        let raw = llvm_fresh_reg(e_arg)
+        let raw_i = concat_all([
+          "  ", raw.reg, " = call i64 @kaix_to_int(%KaiValue* ", arg.reg, ")\n"
+        ])
+        let e_raw = llvm_append_body(raw.e, raw_i)
+        let e_pushed = llvm_push_raw_local(e_raw, nm, raw.reg, TyInt)
+        llvm_emit_pat_subpats_binds(e_pushed, rest, scr, i + 1, tys)
+      } else if skip_read {
+        llvm_emit_pat_subpats_binds(e, rest, scr, i + 1, tys)
+      } else if bind_survivor {
+        let nm = match p.pkind { PBind(n) -> n _ -> "" }
+        let arg = llvm_fresh_reg(e)
+        let arg_i = concat_all([
+          "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
+          ", i32 ", int_to_string(i), ")\n"
+        ])
+        let e_arg = llvm_append_body(arg.e, arg_i)
+        let dup = llvm_fresh_reg(e_arg)
+        let dup_i = concat_all([
+          "  ", dup.reg, " = call %KaiValue* @kaix_incref(%KaiValue* ", arg.reg, ")\n"
+        ])
+        let e_dup = llvm_append_body(dup.e, dup_i)
+        let e_pushed = llvm_push_local(e_dup, nm, dup.reg)
+        llvm_emit_pat_subpats_binds(e_pushed, rest, scr, i + 1, tys)
+      } else if needs_descend {
+        # Nested destructuring sub-pattern: read the sub-node as a borrow
+        # and recurse the BIND walk (its leaf survivors take their own +1).
+        # The match-exit cascade reclaims the borrowed sub-node.
+        let arg = llvm_fresh_reg(e)
+        let arg_i = concat_all([
+          "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
+          ", i32 ", int_to_string(i), ")\n"
+        ])
+        let e_arg = llvm_append_body(arg.e, arg_i)
+        let e_b = llvm_emit_pattern_binds(e_arg, p, arg.reg)
+        llvm_emit_pat_subpats_binds(e_b, rest, scr, i + 1, tys)
+      } else {
+        # PWild / PLit / `_`-unused on a kind-0 slot: binds nothing, no read.
+        llvm_emit_pat_subpats_binds(e, rest, scr, i + 1, tys)
+      }
+    }
+  }
+}
+
+# #747 BIND-ONLY pattern walk. Called after `llvm_emit_pattern_test`
+# confirmed the whole pattern matched. Binds names + increfs survivors;
+# never fails. Mirror of emit_c's `emit_pat_binds`.
+fn llvm_emit_pattern_binds(e: LlvmEmit, pat: Pattern, scr: String) : LlvmEmit / Console {
+  match pat.pkind {
+    PWild     -> e
+    PHole(_)  -> e
+    PLit(_)   -> e
+    # A bare top-level PBind / PNarrow binds the whole scrutinee. The
+    # scrutinee is already owned by the match (the survivor incref for
+    # variant SLOTS happens in the slot walk); a whole-value bind takes
+    # the scrutinee's own ref, balanced by the match-exit drop being
+    # SKIPPED is not how this works — instead the bound name carries the
+    # scrutinee ref and the match-exit drop is what the binder consumes.
+    # Match emitter binds the scrutinee reg directly (no incref) because
+    # the scrutinee is consumed by this single binder.
+    PBind(nm)    -> llvm_push_local(e, nm, scr)
+    PNarrow(nm, _) -> llvm_push_local(e, nm, scr)
+    PAs(nm, sub) -> {
+      let e1 = llvm_push_local(e, nm, scr)
+      llvm_emit_pattern_binds(e1, sub, scr)
+    }
+    PVariant(cname, subpats) -> {
+      let payload_tys = match evar_payload_tys(e.vars_, cname) { Some(t) -> t None -> [] }
+      llvm_emit_pat_subpats_binds(e, subpats, scr, 0, payload_tys)
+    }
+    PVariantRecord(_, fields) -> llvm_emit_pat_record_fields_binds(e, fields, scr)
+    PRecord(fields)           -> llvm_emit_pat_record_fields_binds(e, fields, scr)
+    # #747: PList binds in the TEST pass (legacy single-pass, lists are
+    # PVariant-split-exempt), so the bind pass is a no-op for it.
+    PList(_, _) -> e
+    _ -> e
   }
 }
 
@@ -5163,7 +5582,7 @@ fn llvm_emit_guard_test(e: LlvmEmit, gx: Expr, fail_lbl: String) : LlvmEmit / Co
 }
 
 fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: String,
-                         acc: [LlvmArmEntry]) : LlvmArmCollect / Console {
+                         acc: [LlvmArmEntry], scr_owned: Bool) : LlvmArmCollect / Console {
 
   match arms {
     [] -> LlvmArmCollect { e: e, entries: list_reverse(acc) }
@@ -5171,10 +5590,19 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
       Arm(pat, guard, body) -> {
         let outer_locals = e.locals
         let next_try = llvm_fresh_label(e, "match.next.")
+        # #747 — two-pass pattern lowering: TEST first (borrows only, may
+        # br to `next_try`), then BIND (survivor increfs + raw kind-1 reads,
+        # on the taken arm only). Splitting these is the leak fix: the old
+        # single pass emitted a survivor incref BEFORE a nested sub-test
+        # that could fail, stranding the +1 on the fail edge (the two-
+        # nested-arm shape that kept the rb-tree leaking). The guard runs
+        # after the binds (it reads the bound names); a guard that fails
+        # after binds is a known narrow gap (no guards in the rb-tree path).
         let e_test = llvm_emit_pattern_test(next_try.e, pat, scr_reg, next_try.reg)
+        let e_bound = llvm_emit_pattern_binds(e_test, pat, scr_reg)
         let e_guarded = match guard {
-          None -> e_test
-          Some(gx) -> llvm_emit_guard_test(e_test, gx, next_try.reg)
+          None -> e_bound
+          Some(gx) -> llvm_emit_guard_test(e_bound, gx, next_try.reg)
         }
         # issue #118 — bind the synthetic `__pcs_scr` local to the
         # match scrutinee register so the recogniser-emitted
@@ -5183,7 +5611,18 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
         # local is dropped on arm-scope exit by the `outer_locals`
         # restore below.
         let e_with_scr = llvm_push_local(e_guarded, "__pcs_scr", scr_reg)
-        let eb = llvm_emit_expr(e_with_scr, body)
+        # #747 — a TRMC arm br's to `tcrec.loop` and never reaches
+        # `match.end`, so the match-exit decref of the owned scrutinee
+        # cannot reclaim it there. Bind a synthetic `__pcs_scr_drop` local
+        # (only when the scrutinee is OWNED) so `llvm_emit_trmc_goto` can
+        # drop the old subtree-root node inside the loop step, after the
+        # rebind reads its survivor children. Borrowed scrutinees get no
+        # such local → the TRMC step skips the drop (symmetric with the
+        # match-exit borrow gate).
+        let e_with_drop = if scr_owned {
+          llvm_push_local(e_with_scr, "__pcs_scr_drop", scr_reg)
+        } else { e_with_scr }
+        let eb = llvm_emit_expr(e_with_drop, body)
         let body_val = eb.last_val
         let body_end = eb.cur_label
         let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl, "\n"]))
@@ -5196,7 +5635,7 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
         llvm_emit_match_arms(e_next, rest, scr_reg, end_lbl,
-                             [AE(body_val, body_end), ...acc])
+                             [AE(body_val, body_end), ...acc], scr_owned)
       }
     }
   }
@@ -5229,10 +5668,25 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
 }
 
 fn llvm_emit_match_default(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : LlvmEmit / Console {
+  # #747 — borrow inference: a `__perceus_borrow(p)` scrutinee is NOT owned
+  # by the match (Koka borrow). Emit the inner value and SKIP the match-exit
+  # decref — the caller still owns `p`, and the matching `__perceus_dup` was
+  # stripped caller-side so no incref is paid either (net-zero RC on the
+  # inspected param). Mirror of emit_c `emit_match_default` borrowed path.
+  # An owned scrutinee gets the exit decref that reclaims its cell and
+  # cascades a decref into its pointer slots (the survivors were incref'd at
+  # bind, so they outlive this).
+  let scr_owned = match scr.kind {
+    ECall(callee, _) -> match callee.kind {
+      EVar(nm) -> not (nm == "__perceus_borrow")
+      _        -> true
+    }
+    _ -> true
+  }
   let es = llvm_emit_expr(e, scr)
   let scr_reg = es.last_val
   let end_lbl = llvm_fresh_label(es, "match.end.")
-  let arm_res = llvm_emit_match_arms(end_lbl.e, arms, scr_reg, end_lbl.reg, [])
+  let arm_res = llvm_emit_match_arms(end_lbl.e, arms, scr_reg, end_lbl.reg, [], scr_owned)
   # Trailing fall-through block (the last `match.next.N`) panics.
   let msg = concat_all([
     "non-exhaustive match at ", int_to_string(line), ":", int_to_string(col)
@@ -5260,7 +5714,23 @@ fn llvm_emit_match_default(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: 
       let phi_instr = concat_all([
         "  ", phi.reg, " = phi %KaiValue* ", llvm_format_phi(arm_res.entries), "\n"
       ])
-      llvm_set_last(llvm_append_body(phi.e, phi_instr), phi.reg)
+      let e_phi = llvm_append_body(phi.e, phi_instr)
+      # #747 — match-exit decref of the owned scrutinee. Runs in match.end
+      # after the phi, so `scr_reg` is live through every arm's exit edge.
+      # Arms that consumed the scrutinee via reuse-in-place
+      # (`kaix_reuse_or_alloc_*`) are balanced: the runtime helper increfs
+      # `scr` on reuse precisely to survive this drop. TRMC arms br back to
+      # `tcrec.loop` and never reach match.end, so they are unaffected
+      # (the scrutinee is consumed in the loop). The phi result is never
+      # `scr_reg` without an intervening dup (perceus dups any arm read that
+      # aliases the scrutinee), so dropping `scr_reg` cannot free the result.
+      let e_drop = if scr_owned {
+        let d = llvm_fresh_reg(e_phi)
+        llvm_append_body(d.e, concat_all([
+          "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", scr_reg, ")\n"
+        ]))
+      } else { e_phi }
+      llvm_set_last(e_drop, phi.reg)
     }
   }
 }
@@ -7138,11 +7608,30 @@ fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
       llvm_emit_tcrec_stores(e_d, pnames, ra.regs, 0)
     }
   }
+  # --- 3b. #747 — drop the OLD scrutinee (this iteration's subtree-root
+  # node) now that (a) the fresh node captured the incref'd survivor
+  # children and (b) the rebind stores above read those children for the
+  # next iteration. `__pcs_scr_drop` is bound by `llvm_emit_match_arms`
+  # ONLY when the match scrutinee is owned (borrowed scrutinees leave it
+  # unbound → no drop, symmetric with the match-exit borrow gate). Without
+  # this, every loop step abandoned its old root cell → the ~depth×inserts
+  # variant leak that kept the LLVM rb-tree at 3.6 GB RSS. v1 stays fresh-
+  # alloc + drop (NOT reuse-in-place; that is the orthogonal ParcReuse
+  # perf increment, which must not touch the slot stores here).
+  let e_scrdrop = match llvm_local_find(e_back.locals, "__pcs_scr_drop") {
+    Some(sreg) -> {
+      let d = llvm_fresh_reg(e_back)
+      llvm_append_body(d.e, concat_all([
+        "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", sreg, ")\n"
+      ]))
+    }
+    None -> e_back
+  }
   # --- 4. reclaim the iteration's node buffer alloca, branch back ---
   # The node's slot buffer was an alloca consumed by kaix_variant (which
   # copied it into the heap cell), so it is safe to rewind the SP here —
   # the live node lives on the heap, only the transient buffer is freed.
-  let e_rst = llvm_emit_tcrec_stackrestore(e_back)
+  let e_rst = llvm_emit_tcrec_stackrestore(e_scrdrop)
   let e_br = llvm_append_body(e_rst, "  br label %tcrec.loop\n")
   let dead = llvm_fresh_label(e_br, "tcrec.dead.")
   let e_dead = llvm_open_block(dead.e, dead.reg)
