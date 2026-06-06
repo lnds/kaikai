@@ -71,7 +71,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-trace test-trace-asan test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-668 test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-modular-build test-packages
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-trace test-trace-asan test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-747 test-issue-668 test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-modular-build test-packages
 
 all: $(TARGET)
 
@@ -4576,6 +4576,46 @@ test-unbox-llvm-bench: $(TARGET) build
 	       diff build/unbox-bench-c.out build/unbox-bench-llvm.out; exit 1; }
 	@echo "unbox-llvm-bench OK (pure_chain raw i64; C == LLVM output; IR links + runs cleanly)"
 
+# issue #747 — LLVM backend Perceus RC. The LLVM emitter used to leak
+# every scrutinee + boxed Int in a match (3.7 GB RSS on the rb-tree); the
+# fix ported the C backend's protocol (borrow slot reads, kind-1 raw Int
+# binders, survivor incref at bind, match-exit + TRMC-step scrutinee drop,
+# two-pass test/bind pattern lowering). This fixture is a self-contained
+# red-black insert whose balance arms nest a sub-node in BOTH slot 1 and
+# slot 4 (the two-nested-arm shape that stranded a survivor incref) and
+# whose insert is TRMC modulo-cons. Gate: (1) LLVM output == C output ==
+# golden, (2) under KAI_TRACE_RC the LIVE variant count is ~= the final
+# tree size (garbage-free churn), NOT the alloc total (the pre-fix leak).
+test-issue-747: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib --emit=llvm ../examples/perceus/llvm_rc_nested_match.kai > build/issue747.ll \
+	  || { echo "issue-747 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
+	clang -w -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-llvm $(LDLIBS_M) \
+	  || { echo "issue-747 FAIL (clang errored — IR ill-formed?)"; exit 1; }; \
+	./build/issue747-llvm > build/issue747-llvm.out \
+	  || { echo "issue-747 FAIL (LLVM binary errored at runtime)"; exit 1; }; \
+	diff -q ../examples/perceus/llvm_rc_nested_match.out.expected build/issue747-llvm.out > /dev/null \
+	  || { echo "issue-747 FAIL (LLVM output != golden):"; \
+	       diff ../examples/perceus/llvm_rc_nested_match.out.expected build/issue747-llvm.out; exit 1; }; \
+	./$(TARGET) --path ../stdlib --emit=c ../examples/perceus/llvm_rc_nested_match.kai > build/issue747.c \
+	  && cc -std=c99 -w -I ../stage2 -I ../stage0 build/issue747.c -o build/issue747-c $(LDLIBS_M) \
+	  && ./build/issue747-c > build/issue747-c.out \
+	  || { echo "issue-747 FAIL (C backend build/run errored)"; exit 1; }; \
+	diff -q build/issue747-c.out build/issue747-llvm.out > /dev/null \
+	  || { echo "issue-747 FAIL (C vs LLVM output diverged):"; \
+	       diff build/issue747-c.out build/issue747-llvm.out; exit 1; }; \
+	clang -w -DKAI_TRACE_RC=1 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-trace $(LDLIBS_M) \
+	  || { echo "issue-747 FAIL (trace build errored)"; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/issue747-trace 2> build/issue747-trace.err > /dev/null; \
+	live=$$(grep 'tag=variant allocs' build/issue747-trace.err | grep -oE 'live=[0-9]+' | grep -oE '[0-9]+'); \
+	allocs=$$(grep 'tag=variant allocs' build/issue747-trace.err | grep -oE 'allocs=[0-9]+' | grep -oE '[0-9]+'); \
+	if [ -z "$$live" ]; then echo "issue-747 FAIL (no KAI_TRACE_RC variant summary)"; cat build/issue747-trace.err; exit 1; fi; \
+	if [ "$$live" -ge 25000 ]; then \
+	  echo "issue-747 FAIL (LLVM leaks: live=$$live variants, allocs=$$allocs — expected ~20003 live tree, churn reclaimed)"; \
+	  exit 1; \
+	fi; \
+	echo "issue-747 OK (LLVM rb-tree garbage-free: live=$$live of allocs=$$allocs; C == LLVM == golden)"
+
 # issue #187 phase 2 — fixtures for unified-algebraic-types resolver.
 # Each .kai under `examples/unions/` either compiles + runs to a known
 # stdout (positive cases — diffed against `<name>.out.expected`) or
@@ -4994,7 +5034,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing test-modular-build
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-747 test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing test-modular-build
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
@@ -5010,7 +5050,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-668 test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-318-include test-issue-746 test-issue-747 test-issue-668 test-issue-524 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category

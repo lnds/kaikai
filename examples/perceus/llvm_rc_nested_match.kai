@@ -1,0 +1,99 @@
+# Regression fixture for #747 — LLVM backend Perceus RC.
+#
+# Before #747 the LLVM backend never implemented the match RC discipline:
+# it leaked every scrutinee and every boxed Int (3.7 GB RSS on the
+# rb-tree). The fix ported the C backend's protocol to the LLVM emitter:
+#   - variant-slot reads are BORROWS (`kaix_variant_arg` no longer increfs)
+#   - kind-1 Int slots bind raw i64 (no kaix_int box, no dup+to_int leak)
+#   - a kind-0 pointer-slot survivor is incref'd at bind
+#   - the owned scrutinee is dropped at match-exit (and inside the TRMC
+#     loop step for tail-recursive-modulo-cons arms)
+#   - pattern lowering is TWO passes (test-only borrows, then bind) so a
+#     survivor incref is never stranded on a mid-pattern fail edge — the
+#     shape that two nested-pattern arms (balance_left/right) exposed.
+#
+# This fixture exercises ALL of those at once: a red-black insert with
+# colour + value fields, balance rotations whose arms nest a sub-node in
+# slot 1 AND slot 4, a TRMC spine rebuild, and a recolor wrapper match.
+# Linked against stage0/runtime_llvm.c under ASan with leak detection ON,
+# it must report ZERO leaks (the spine is fully reclaimed) and the right
+# size/height. The C backend has been garbage-free here since #741; this
+# pins the LLVM backend to the same bar.
+
+type Color = R | B
+type Tree = Node(Color, Tree, Int, Int, Tree) | Leaf
+
+fn is_red(t: Tree) : Bool = match t {
+  Node(R, _, _, _, _) -> true
+  _                   -> false
+}
+
+fn balance_left(l: Tree, k: Int, v: Int, r: Tree) : Tree = match l {
+  Node(_, Node(R, lx, kx, vx, rx), ky, vy, ry) ->
+    Node(R, Node(B, lx, kx, vx, rx), ky, vy, Node(B, ry, k, v, r))
+  Node(_, ly, ky, vy, Node(R, lx, kx, vx, rx)) ->
+    Node(R, Node(B, ly, ky, vy, lx), kx, vx, Node(B, rx, k, v, r))
+  Node(_, lx, kx, vx, rx) ->
+    Node(B, Node(R, lx, kx, vx, rx), k, v, r)
+  Leaf -> Leaf
+}
+
+fn balance_right(l: Tree, k: Int, v: Int, r: Tree) : Tree = match r {
+  Node(_, Node(R, lx, kx, vx, rx), ky, vy, ry) ->
+    Node(R, Node(B, l, k, v, lx), kx, vx, Node(B, rx, ky, vy, ry))
+  Node(_, lx, kx, vx, Node(R, ly, ky, vy, ry)) ->
+    Node(R, Node(B, l, k, v, lx), kx, vx, Node(B, ly, ky, vy, ry))
+  Node(_, lx, kx, vx, rx) ->
+    Node(B, l, k, v, Node(R, lx, kx, vx, rx))
+  Leaf -> Leaf
+}
+
+fn ins(t: Tree, k: Int, v: Int) : Tree = match t {
+  Node(R, l, kx, vx, r) ->
+    if k < kx      { Node(R, ins(l, k, v), kx, vx, r) }
+    else if k > kx { Node(R, l, kx, vx, ins(r, k, v)) }
+    else           { Node(R, l, k, v, r) }
+  Node(B, l, kx, vx, r) ->
+    if k < kx {
+      if is_red(l) { balance_left(ins(l, k, v), kx, vx, r) }
+      else         { Node(B, ins(l, k, v), kx, vx, r) }
+    }
+    else if k > kx {
+      if is_red(r) { balance_right(l, kx, vx, ins(r, k, v)) }
+      else         { Node(B, l, kx, vx, ins(r, k, v)) }
+    }
+    else { Node(B, l, k, v, r) }
+  Leaf -> Node(R, Leaf, k, v, Leaf)
+}
+
+fn rb_insert(t: Tree, k: Int, v: Int) : Tree = match ins(t, k, v) {
+  Node(_, l, k0, v0, r) -> Node(B, l, k0, v0, r)
+  Leaf                  -> Leaf
+}
+
+fn lcg_next(s: Int) : Int = (s * 1664525 + 1013904223) % 2147483647
+
+fn fill(t: Tree, seed: Int, n: Int) : Tree =
+  if n <= 0 { t }
+  else {
+    let s = lcg_next(seed)
+    fill(rb_insert(t, s, n), s, n - 1)
+  }
+
+fn size(t: Tree) : Int = match t {
+  Leaf -> 0
+  Node(_, l, _, _, r) -> 1 + size(l) + size(r)
+}
+
+fn max(a: Int, b: Int) : Int = if a > b { a } else { b }
+
+fn height(t: Tree) : Int = match t {
+  Leaf -> 0
+  Node(_, l, _, _, r) -> 1 + max(height(l), height(r))
+}
+
+fn main() = {
+  let t = fill(Leaf, 1, 20000)
+  print("size: " ++ int_to_string(size(t)))
+  print("height: " ++ int_to_string(height(t)))
+}
