@@ -11,10 +11,12 @@ families:
    decision on concrete-syntax consolidation, not for opening new
    ones.
 
-**Closed extensions** (whether landed or rejected) are documented
-in their corresponding milestone retrospectives, fixtures under
-`examples/`, and CHANGELOG entries — not here. This file tracks
-only what is still open.
+This file tracks only what is still open. Once an extension lands
+(or is formally rejected), it leaves this file — its record lives
+in the milestone retrospectives, fixtures under `examples/`, and
+CHANGELOG entries. The one exception is *Deliberately not on this
+list* below: a standing guardrail of forms rejected on principle,
+kept so they are not re-proposed.
 
 Each entry states what it buys, what it costs, and what it depends
 on.
@@ -35,26 +37,10 @@ on.
 |--------------------------------------------|----------|-------------------------|
 | Sum types with constant attributes         | proposed | parser + resolution     |
 | `?.` optional chaining                     | proposed | parser + type checker   |
-| `Map[K, V]` + `m["key"]` indexing          | landed v1 (read-only sugar; tree carrier) — write sugar deferred to v2 alongside HAMT | — |
 | Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
-| Multi-arg `match` sugar — `match a, b { ... }` | landed v1 — N ≤ 4, column-aware diagnostics deferred | parser |
-| `\|\|` flat-map pipe + naming-convention dispatch (revised 2026-05-03) | proposed | parser + head-type-to-module map in typer |
-
-### Closed (for reference; details in commits / CHANGELOG)
-
-- **Landed**: `todo!`, `axiom`, `kai effects --json` (`--effects-json`),
-  `?e` effect holes, `import ?name`, record punning, `variants[T]()`,
-  `!` postfix, `@` as-pattern, bit ops (flat + dotted), pipeline `_`
-  placeholder, `++` operator, `main()` row inference, `use Effect`,
-  protocols (single-dispatch m12.8), units of measure m12.5,
-  `const NAME` (2026-04-28), method references via `.field`
-  placeholder lambda (v1; receiver-bound `obj.method` deferred),
-  record destructuring in `let`.
-- **Rejected**: tuples as a second product form (m8.5 measurement
-  gate, 2026-04-27 — see *Tuples — REJECTED* below for the
-  retrospective).
+| `f.field` is always field access; UFCS needs `f.method()` | proposed (edition-boundary) | resolver + edition bump |
 
 ## 1. `kai type <pos> --json` — queryable type-at-position
 
@@ -131,107 +117,6 @@ scaffold for that standard, not an optional plugin.
 output pipeline is trivial once the rules exist.
 **Depends on**: a canonical-form style guide (cultural design work,
 not technical).
-
-## Tuples — REJECTED (2026-04-27)
-
-This decision is preserved here because future contributors will
-ask "why no tuples?" and need to find the answer rather than
-re-debate it.
-
-**Verdict**: tuples do **not** earn a slot as a second product form
-in kaikai. Records cover anonymous-product use cases at the same
-or smaller signature length once `Pair[a, b]` exists in stdlib.
-
-### How the gate ran
-
-After m8 closed (fibers + actors + nurseries shipped), a measurement
-protocol picked a representative effect-heavy program and rewrote
-it under each posture. Decision rule:
-
-- **≥10% line-count savings** OR **≥30% reduction in average
-  signature length on multi-return functions** → accept.
-- Below those thresholds → reject formally.
-
-The gate ran against a parser combinator suite (an arithmetic
-calculator with two-level precedence and parens) — 7 multi-return
-parsers `p_*` returning the "value + rest of input" shape, the
-densest plausible exercise of multi-return.
-
-**Methodology adjustment.** The natural strawman (one record per
-parser shape: `ParsedExpr`, `ParsedInt`, etc.) was rejected as
-unfair — it inflates the pro-tuples case. The honest baseline uses
-one *generic* record `Parsed[a] = { value: a, rest: [Token] }`,
-which kaikai already supports.
-
-**Metrics (n = 7 multi-return parsers)**:
-
-| Metric                              | Generic record | Tuples     | Δ      |
-|-------------------------------------|---------------:|-----------:|-------:|
-| Lines (non-blank, non-comment)      |            135 |        132 | −2.2%  |
-| Avg signature length (chars)        |          51.43 |      54.43 | +5.8%  |
-
-Both gates fail. Tuples save 3 lines (one for the `Parsed[a]`
-declaration, two for collapsed constructions) — far short of 10%.
-Signatures with tuples are *longer* than with generic records:
-`Parsed[Expr]` is 12 chars; `(Expr, [Token])` is 15.
-
-### Where tuples still win, and how kaikai answers without them
-
-After the verdict, a stress test surveyed the canonical use cases
-of tuples in other languages and found three honest gaps; **none
-required tuples-as-a-type**.
-
-1. **`Pair[a, b]` in stdlib** — a single generic record collapses
-   the pattern of ad-hoc `type StmtsRewrite = { ... }` declarations.
-   ```kai
-   pub type Pair[a, b] = { fst: a, snd: b }
-   ```
-2. **Multi-arg `match` sugar** — `match a, b { PatA, PatB -> ... }`
-   desugaring to a nested match. The `(a, b)` is *transient*: never
-   escapes the arm. Tracked as the only pending language-surface
-   item this gate produced; see proposal 9 below.
-3. **Record destructuring in `let` + record punning** — together,
-   `let { fst, snd } = transfer(a, b)` matches the ergonomics of
-   tuple destructuring. Both shipped in m7d.
-
-**Why the gate's verdict generalises**: tuples in other languages
-excel where the host has weak records (Haskell pre-RecordDotSyntax,
-OCaml's nominal-only records) or no generics over records. Kaikai
-has neither deficit — `{ fst: a, snd: b }` is as terse as `(a, b)`,
-and `Pair[a, b]` (10 chars) competes with `(a, b)` (5 chars) only
-in the smallest cases.
-
-The places tuples win unambiguously (transient pattern matching)
-are not tuple-as-type; they are syntactic sugar over multi-arg
-match.
-
-### Follow-up — n-tuple parser sugar shipped (2026-05-03, issue #154)
-
-The 2026-04-27 verdict rejected **tuples-as-a-type** (a new TyCtor
-distinct from `Pair[a, b]`). It did **not** measure parser-only
-sugar that desugars to existing record types. Issue #154 reopened
-that narrower question and shipped the sugar:
-
-- `(a, b)` ≡ `Pair { fst: a, snd: b }`
-- `(a, b, c)` ≡ `Triple { fst: a, snd: b, trd: c }`
-- `(a, b, c, d)` ≡ `Quad { fst: a, snd: b, trd: c, frt: d }`
-- `(A, B)` ≡ `Pair[A, B]` in type position; same for arity 3 / 4.
-- `let (a, b) = pair` ≡ `let Pair { fst: a, snd: b } = pair`.
-
-**Why both decisions are consistent**: the rejected proposal
-introduced a second product form (a TyCtor with cost on every
-signature, monomorphisation, RC, and printer). The sugar adds
-**zero** typer or runtime cost — the inferred type is still
-`Pair[Expr, [Token]]`, only the literal/pattern shape is shorter.
-The 2026-04-27 metrics measured a different artifact than the one
-that shipped.
-
-**Cap and accessors**: arity 2..4 (covers the 99% transient
-multi-return case; wider products use named records). Field
-accessors stay nominal — `.fst / .snd / .trd / .frt` — to keep
-consistency with the existing `Pair` and avoid a lexer rule for
-`.0 / .1` numeric field names. See `docs/syntax-sugars.md` §
-"n-tuples" for the canonical surface.
 
 ## 4. Sum types with constant attributes
 
@@ -381,126 +266,7 @@ complexity — re-evaluate then.
 pass (to nested `opt_and_then`).
 **Depends on**: parser + type checker.
 
-## 6. `Map[K, V]` — landed v1 (issue #128, 2026-05-02)
-
-`Map[K, V]` shipped as a v1 with the read-side indexing sugar.
-The retrospective lives at the end of this section; the original
-proposal text below stays for context. Write-side `m[k] := v`
-and HAMT are deferred to v2 (out of scope for v1).
-
-```kai
-let scores: Map[String, Int] = map_empty()
-    |> map_put("alice", 10)
-    |> map_put("bob",   7)
-
-# Read indexing sugar (v1):
-let n = scores["alice"]            # Option[Int]
-
-# Write indexing sugar — DEFERRED. The typer rejects this with
-# a diagnostic pointing at map_put. v2 (alongside HAMT) brings
-# it back with the right semantics over a persistent container.
-# scores["charlie"] := 42         # error in v1
-```
-
-kaikai has no general-purpose associative container in v1 —
-users compose with pairs and `list_*` helpers, or reach for
-`Array[T]` when keys are integer-shaped. A `Map[K, V]` type
-closes the gap.
-
-### What it buys
-
-- An idiomatic container for lookup-by-key, which is the second
-  most common shape after sequences. Today the workaround is
-  `[(K, V)]` with linear scans — fine for tiny maps, abysmal
-  at scale.
-- The natural place for the already-reserved `m["key"]` and
-  `m["key"] := v` indexing, which `docs/syntax-sugars.md` §4.3
-  notes but intentionally leaves undefined until `Map` lands.
-
-### What it costs
-
-- A new stdlib type plus its algorithms (insertion, lookup,
-  iteration, deletion). HAMT-style persistent or mutation-with-
-  `Mutable` — that decision is the hardest part of this
-  proposal.
-- A second indexing shape in the grammar (non-integer keys),
-  which the checker must disambiguate from `Array` indexing.
-  Only a problem if the decision is to make `Map` indexable
-  with the same `[]`; if the decision is a distinct operator
-  (`m#["key"]` or similar), the cost collapses.
-- Equality and hashing: the language needs a story for what
-  types can be map keys. `String` / `Int` are obvious; records
-  less so.
-
-### Decision axes
-
-Three coupled decisions to close this:
-
-1. **Persistent vs ephemeral.** `Map[K, V]` as a persistent
-   structure with structural sharing (no `Mutable` in the row)
-   vs a mutable hash table (paying `Mutable`). Persistent
-   matches the functional-first slant of kaikai; ephemeral is
-   typically faster.
-2. **Indexing syntax.** Same `a[i]` as `Array`, a distinct
-   operator, or method-only (no indexing sugar).
-3. **Key constraints.** Any type, types with derived `Eq` /
-   `Hash`, or a hand-curated set (`String`, `Int`, …).
-
-None is obviously right; each pushes the design in a different
-direction. This entry exists so the decisions can be made
-together rather than drifting independently.
-
-**Cost**: medium-to-high. A new type plus semantic design;
-several days of type-system and stdlib work.
-**Depends on**: a collection-design pass that also closes
-`Vector[T]` (see Doc B §`Mutable` *Known gap*).
-
-### Retrospective — v1 landed 2026-05-02 (issue #128)
-
-The three coupled axes resolved as:
-
-1. **Persistent vs ephemeral**: persistent. The carrier is a
-   height-balanced AVL tree keyed by `<` (`O(log n)` lookup,
-   insert, remove). HAMT was deferred to v2 — it wants a
-   `Hashable` protocol kaikai does not have today.
-2. **Indexing syntax**: same `[]` as `Array`, **read-only**.
-   The typer dispatches `e1[e2]` by inspecting the inferred
-   container type at the index site:
-   - `Array[T]` keeps lowering to `array_get(e1, e2)`.
-   - `Map[K, V]` lowers to `map_get(e1, e2) : Option[V]`.
-   - Unresolved type variables default to `Array[T]` so
-     existing diagnostics stay intact.
-   `m[k] := v` is **rejected** with a typed error pointing at
-   `map_put(m, k, v)`. The write semantics over a persistent
-   container needs its own design; that lane lands alongside
-   the HAMT carrier in v2.
-3. **Key constraints**: any type for which the runtime's `<` /
-   `==` operators are total — `Int`, `Real`, `Char`, `String`
-   in the v1 runtime. Records and sum types as keys panic at
-   runtime on the first comparison; lifting them to a primitive
-   key is the recommended workaround until v2 introduces an
-   `Ord` protocol. `Hashable` was not pulled into v1.
-
-What lives where after the lane:
-- Carrier + public surface — `stdlib/collections/map.kai`.
-- Typer dispatch — `stage2/compiler.kai` `synth_index` /
-  `SIndexAssign` arm.
-- Sugar specification — `docs/syntax-sugars.md` §4.
-- Regression fixtures — `examples/stdlib/map_tree_basic.kai`
-  (positive, includes a 1000-element round-trip) and
-  `examples/stdlib/map_assign_error.kai` (negative — typer
-  must reject `m[k] := v`).
-- Insert order is **no longer preserved**. `map_keys`,
-  `map_values`, and `map_to_pairs` walk the tree in key order.
-  Callers that needed insert order moved to a `[Pair[K, V]]`
-  list (or stayed where they were — see the JWT encoder demo
-  for an example that adapted to sorted output).
-
-The unblock target was `ahu`'s Registry primitive (named-actor
-lookup at production scale). v1 closes that block; v2 follows
-when HAMT and a `Hashable` protocol come together.
-
-## 7. Slice syntax `a[i..j]`
+## 6. Slice syntax `a[i..j]`
 
 ```kai
 let prefix = xs[0..5]        # first five elements
@@ -551,7 +317,7 @@ view-based slices with region tracking.
 **Depends on**: `Vector[T]` landing; range-literal `..`
 confirmed in the grammar.
 
-## 8. `Range[T]` as a first-class iterable
+## 7. `Range[T]` as a first-class iterable
 
 ```kai
 # Today (only as list literal):
@@ -606,116 +372,7 @@ notion of an iterable?".
 parser. Coupled with the iterable-abstraction question.
 **Depends on**: collection design (`Vector[T]`, `Map[K, V]`).
 
-## 9. Multi-arg `match` sugar — `match a, b { PatA, PatB -> ... }`
-
-```kai
-# Today (synthesises a transient tuple-shaped pattern):
-fn count_toques(guess: [Int], target: [Int]) : Int = match (guess, target) {
-  ([], _)                  -> 0
-  (_, [])                  -> 0
-  ([g, ...gs], [t, ...ts]) -> {
-    let here = if g == t { 1 } else { 0 }
-    here + count_toques(gs, ts)
-  }
-}
-
-# Proposed (no synthetic tuple, no nested match):
-fn count_toques(guess: [Int], target: [Int]) : Int = match guess, target {
-  [], _                    -> 0
-  _, []                    -> 0
-  [g, ...gs], [t, ...ts]   -> {
-    let here = if g == t { 1 } else { 0 }
-    here + count_toques(gs, ts)
-  }
-}
-```
-
-A **scheduled mini-lane** that surfaced from the m8.5 stress test
-(see *Tuples — REJECTED* above). Four `demos/*` files (`forth`,
-`toquefama`, `9d9l/huffman`, `9d9l/toquefama`) use the
-`match (a, b) { (PatA, PatB) -> ... }` shape today, where the
-`(a, b)` is *transient*: it never escapes the match arm and no
-signature returns it. With tuples rejected as a type, a parser
-sugar that scrutinises N expressions and matches N patterns per arm
-gives every demo a clean form without introducing tuples-as-a-type
-through the back door.
-
-### Semantics
-
-The desugaring is mechanical: `match e1, ..., eN { p1, ..., pN -> body | ... }`
-lowers to a nested `match e1 { p1 -> match e2 { p2 -> ... pN -> body } | ... }`
-form. Wildcards in any column behave the same; guards on an arm
-attach to the innermost branch. The compiler emits the same
-exhaustiveness check it already runs on multi-arity sum types.
-
-The N is constrained at parse time (probably ≤ 4 to keep the
-diagnostics readable; revisit if a use case wants 5+). N must equal
-across every arm; mismatched arities are a parse-time error.
-
-### What it buys
-
-- **No transient tuple type** to support a transient pattern shape.
-  The four affected demos drop their synthesised `(a, b)` and read
-  their two scrutinees positionally.
-- **Same surface area as the existing `match`** for diagnostics
-  and codegen. The desugaring runs in the parser; downstream passes
-  see only nested matches.
-
-### What it costs
-
-- **Parser bookkeeping**: a comma-separated scrutinee list before
-  `{`, plus a comma-separated pattern list per arm. Ambiguity vs
-  function-call args is local to the parser's match-head state.
-- **Diagnostics**: a per-column "missing pattern" message is
-  doable but more work than today's single-scrutinee form. A v1
-  can defer column-aware diagnostics to a follow-up.
-
-### Constraints
-
-1. **Same N across all arms.** Mixed-arity arms are rejected at
-   parse time.
-2. **No defaults / "rest" columns.** A wildcard `_` covers any
-   single column; there is no syntax for "any number of remaining
-   columns".
-3. **Sugar only.** No new ExprKind, no new type, no Pattern node.
-   Desugars to nested matches in the parser.
-
-### Decision posture
-
-**Landed v1** in PR #129 (parser-only sugar, no typer impact, no
-new AST nodes). The desugar emits a block of `let __mm_s_i = e_i`
-bindings followed by a chain of nested `EMatch` calls; each arm
-references the same fall-through subtree at the column-1 wildcard
-branch, so an outer-pattern match whose inner pattern fails falls
-through to the *next outer arm* rather than aborting. The terminal
-"no arm matched" branch is `todo!("non-exhaustive multi-arg match")`
-(panic at runtime, any-type at inference, no `/ Fail` row pollution).
-
-Constraints in v1:
-- `2 ≤ N ≤ 4` — single-scrutinee form unchanged at N=1; N≥5 is a
-  parse-time error (`multi-arg \`match\` supports up to 4 scrutinees`).
-- Same N across every arm — mismatched arities are a parse error.
-- Wildcards behave per column; no syntax for "any number of
-  remaining columns".
-- Diagnostics report against the desugared nested form. A
-  column-aware "missing pattern in column 2" message is deferred;
-  open a follow-up issue if it bites in practice.
-
-The four demos that motivated the lane shed their synthetic tuple /
-`Pair[a, b]` workaround:
-- `demos/forth/main.kai` — `step(stack, tk)` matches `tk, stack`.
-- `demos/toquefama/main.kai` — `count_toques(guess, target)` drops
-  the `Pair { fst, snd }` wrapper.
-- `demos/9d9l/toquefama/main.kai` — `count_famas` matches
-  `guess, target` directly.
-- `demos/9d9l/huffman/main.kai` — `decode_step` matches
-  `cur, bits`.
-
-**Cost paid**: 4-line parser cap + a `test-match` fixture target
-(`examples/match/`). No selfhost regression; demo baseline holds.
-**Depends on**: nothing structural.
-
-## 10. Binary pattern matching `<<...>>`
+## 8. Binary pattern matching `<<...>>`
 
 ```kai
 # parse a length-prefixed packet
@@ -797,247 +454,123 @@ prior art, 25 years of production use), Elixir bitstrings
 (a recent re-implementation in a typed setting — closest fit
 to what kaikai would adopt).
 
-## 11. `||` flat-map pipe + naming-convention dispatch for `|` and `||`
-
-> **Revision note (2026-05-03)**: the original proposal in this section
-> targeted a `protocol Sequence[F[_]]` with higher-kinded type
-> parameter. Empirical verification confirmed that **HKT is rejected
-> by Tier 1 #3** (`docs/protocols.md` *No higher-kinded types*) and
-> the protocol form does not parse. The proposal has been rewritten
-> below to use **naming-convention dispatch** — a built-in compiler
-> mechanism that resolves `|` and `||` by looking up `map` /
-> `flat_map` in the module canonically associated with the LHS's
-> head type. No HKT, no protocol changes, no Tier 1 #3 revision.
+## 9. `f.field` is always field access; UFCS of a function requires `f.method()`
 
 ```kai
-# map (today, hardcoded for [T]):
-[1, 2, 3] | { x -> x * 2 }                    # [2, 4, 6]
+type Account = { id: String, balance: Int }
 
-# flat-map (proposed):
-[1, 2, 3] || { x -> [x, x * 10] }             # [1, 10, 2, 20, 3, 30]
+fn label(a: Account) : String = a.id        # always field access — unambiguous
+fn ndigits(a: Account) : Int  = a.id.len()  # UFCS of `len` — parens required
 
-# parser tokens out of CSV-shaped input, one token per line:
-read_lines(input) || split_csv | trim
+# Today `a.id` is ambiguous: if a function `id` is in scope, the
+# resolver may read `a.id` as bare UFCS (`id(a)`) instead of the
+# field. This proposal removes that overload: a bare `.name` is
+# *only* field access; calling a free function method-style *always*
+# carries parens.
 ```
 
-A second pipe operator `||` for **flat-map**, paired with a unified
-**naming-convention dispatch** mechanism that drives both `|` (map)
-and `||` (flat-map). The compiler resolves `xs | f` and `xs || f` by
-looking up `map` and `flat_map` in the module canonically associated
-with the head type of `xs`. This unifies eager collections (`[T]`
-today) with lazy / streaming containers (`Stream[T]` when ahu
-introduces it) under one uniform surface, **without HKT**.
+Today kaikai allows **paren-less UFCS**: `xs.length` reads as
+`length(xs)` when `length` is a free function and `xs` has no
+`length` field. That overloads the `.name` syntax — it means "field
+access" OR "function applied method-style", and the resolver
+disambiguates by a heuristic (is `name` a field of the receiver's
+type? else, is there a free function `name` in scope?). When the
+receiver's type is not yet resolved (e.g. issue #743, a generic
+effect payload), the heuristic misfires and a legitimate field
+access is reported as `` `name` is a function in scope, not a
+field ``.
 
-### Surface
+This proposal makes the rule mechanical: **`f.name` is always field
+access. UFCS of a free function is always written `f.name(args)`,
+with parens, even when `args` is empty (`f.name()`).** The `.name`
+syntax stops meaning two things.
 
-| Operator | Today                          | Proposed                              |
-|----------|--------------------------------|---------------------------------------|
-| `\|>`    | apply-pipe (first-arg threading) | unchanged — still the general pipe  |
-| `\|`     | map-pipe, hardcoded for `[T]`  | `Sequence.map` dispatched by the inferred LHS type |
-| `\|\|`   | (unused; available — `or` covers boolean OR) | `Sequence.flat_map` dispatched by the inferred LHS type |
+### Semantics
 
-`||` is free in kaikai's surface because boolean OR is spelled
-`or` (Python-style). No collision with the existing grammar.
-
-### Naming-convention dispatch
-
-The compiler does not introduce a new protocol. Instead, both
-operators desugar via a built-in dispatch rule:
-
-```
-xs | f  ≡ <module-of-head(xs)>.map(xs, f)
-xs || f ≡ <module-of-head(xs)>.flat_map(xs, f)
-```
-
-Where `module-of-head(xs)` is the module that declares the head
-type of `xs`. For `[T]`, the head type is `List` (already tracked
-by `ty_head_name` in stage 2), declared in `stdlib/core/list.kai`,
-exposing `pub fn map` and `pub fn flat_map`. For a user type
-`MyContainer[T]`, the head module is the file declaring
-`MyContainer`.
-
-ahu's future `Stream[T]` participates without compiler changes:
-
-```kai
-# ahu/stream.kai (future):
-pub type Stream[T] = ...
-pub fn map(s: Stream[a], f: (a) -> b) : Stream[b] = ...
-pub fn flat_map(s: Stream[a], f: (a) -> Stream[b]) : Stream[b] = ...
-```
-
-`s : Stream[Int]` then makes `s | f` and `s || f` work transparently.
-
-A single dispatch mechanism covers both methods because every type
-that sensibly implements one implements the other in this ecosystem
-(`[T]`, future `Stream[T]`, future `Vector[T]`). Splitting `map`
-and `flat_map` apart pays the cost of two lookups today for a
-hypothetical `Validation`-style accumulator that is **not** on
-the roadmap. If such a type ever lands, it lives outside
-`Sequence` with its own surface — same posture as `Option` /
-`Result` keeping `!` instead of joining `Sequence`.
-
-The mechanism is **single-dispatch by head type** with module
-lookup. The vtable is the module table itself — `O(1)` lookup, no
-HKT, no constraint resolution. It composes cleanly with kaikai's
-Tier 1 #3 commitment.
-
-### Why `||` doubles `|`
-
-The visual family reads top-to-bottom: `|>` apply, `|` map (one
-level), `||` flat-map (one level deeper, hence "doubled"). The
-mental rule is one sentence: *one bar maps, two bars flatten*.
-
-This is **not** the same flow as the rejected `<-` monadic bind
-(see *Deliberately not on this list*). `<-` proposed a generic
-binding form for `Option` / `Result` / effects with do-notation
-semantics; `||` is a binary pipe over sequence-shaped containers,
-with `Option` / `Result` *explicitly outside* the dispatch table.
-The `!` postfix continues to cover propagation; `||` covers in-pipe
-flat-map over sequences. Different problems, different surface.
+- `f.name` — field access, unconditionally. If `name` is not a
+  field of `f`'s type, it is a field error on that type. The
+  resolver never falls back to "maybe `name` is a free function".
+- `f.name(args)` — method-style call. Resolves to a field-of-function
+  type if `name` is a function-typed field, otherwise to UFCS
+  `name(f, args)`. Parens are the marker that a *call* is intended.
+- `f.name()` — UFCS of a zero-extra-arg function (`name(f)`).
+  Previously spelled `f.name`; now requires the parens.
 
 ### What it buys
 
-- **Fills the gap that `|` leaves**: today, flat-map over a list
-  inside a pipeline forces a break in the chain
-  (`xs |> list.flat_map { x -> ... }`), which reads worse than
-  the `|`-style code around it. `||` keeps the pipeline visually
-  uniform.
-- **Strategic alignment with ahu**: ahu is the natural home for
-  `Stream[T]` (lazy, possibly infinite, with backpressure —
-  Elixir GenStage / Flow analogue). The day ahu introduces
-  `Stream[T]`, it adds the type and exports `pub fn map` /
-  `pub fn flat_map` in the same module — and the pipe surface
-  works without changes to the compiler. No retrofit, no breaking
-  change.
-- **No HKT, no Tier 1 #3 revision.** The dispatch is by head type
-  (kind `*` on the type level), not by type constructor (kind
-  `* -> *`). The lookup is in a module table the compiler already
-  maintains, not in a synthesized higher-kinded protocol.
-- **LLM benefit (Tier 3)**: the dispatch rule is local, public, and
-  discoverable. An LLM that wants to add `||` support to a new
-  type sees that it must (a) declare the type in a module, (b)
-  export `pub fn map` and `pub fn flat_map` with the canonical
-  signatures, (c) ensure the head type matches `ty_head_name`'s
-  output. All visible in JSON via `--holes-json`.
+- **Removes a syntactic ambiguity.** `.name` has one meaning, not
+  two. Aligned with Tier 2 #5 *few forms, each with clear intent* —
+  field access and function application stop competing for the same
+  surface.
+- **Eliminates an entire class of resolver misfires**, including the
+  misleading half of issue #743 (Bug B). The field-access resolver
+  no longer needs a "is there a homonymous function?" fallback, so
+  it cannot blame UFCS for what is actually an unresolved-type
+  problem. (#743's Tier 1 escape — the typer accepting `b.field`
+  without checking it when the receiver type is free — is a separate
+  typer fix; this proposal removes the *confusing diagnostic*, not
+  the underlying typer bug. Both are wanted.)
+- **More LLM-authorable.** A model never has to infer whether `.id`
+  is a field or a call; the rule is positional. The compiler-tells-
+  the-model bet (Tier 3) is stronger when the surface is
+  unambiguous.
+- **Better errors generally.** A missing field is reported as a
+  missing field on a concrete type, not as a UFCS hint.
 
 ### What it costs
 
-- **Typer dispatch for `|` migrates from hardcoded to module-lookup.**
-  Today `EMapPipe` is hardcoded to `list.map`; the typer learns to
-  call `<module>.map(xs, f)` where `<module>` is the head type's
-  declaring module. For `[T]` this is `stdlib/core/list.kai` —
-  codegen produces the same call, runtime cost unchanged.
-- **Type-to-module mapping infrastructure.** Today the typer has
-  `ty_head_name` returning the head type's name (`"List"`, `"Stream"`,
-  user-defined `TyCon` names). It does **not** have a "head name →
-  declaring module" map. The lane adds this map (populated during
-  resolve) and exposes lookup to the typer's pipe-dispatch path.
-  Estimated: ~50 additional lines.
-- **Operator ergonomics on shift-less keyboards.** `||` is
-  shift-bar twice; some non-US layouts make it awkward. Same
-  cost as boolean `||` in C-family languages; not a blocker.
-- **Parser**: `||` is two `|` tokens with no whitespace between.
-  LL(1)-friendly: the lexer tokenises `||` as a single `BARBAR`
-  token; same precedence as `|`, left-associative.
+- **Breaking change to the language surface.** Paren-less property-
+  style UFCS (`xs.length`, `r.is_ok`, `pid.self`) stops resolving;
+  it must become `xs.length()`, `r.is_ok()`. This is a Tier 1 #4
+  *stability* concern: it changes code a user wrote against. It
+  therefore requires an **edition bump** (Tongariki → Hanga Roa →
+  Orongo …), the deliberate public commitment editions exist for —
+  not an incidental minor. A migration is mechanical (`kai fix`
+  could add the parens), which keeps it inside the "never dread
+  upgrading" contract: the upgrade has a migration path.
+- **An audit of how much stdlib + compiler code uses paren-less
+  property UFCS** is a prerequisite to sizing the break. If the
+  idiom is rare (most call sites already write `()`), the break is
+  small; if pervasive, the `kai fix` migration carries more weight.
+- It removes a small ergonomic affordance some users like (reading
+  `xs.length` as a property). The trade is paid in keystrokes, not
+  in expressive power.
 
-### Constraints (explicit, to keep the surface tight)
+### Constraints
 
-1. **`Option` / `Result` do NOT participate in pipe dispatch.** They
-   keep `!` for propagation. The compiler rejects `opt | f` with a
-   typed error pointing at `opt_and_then` / `!`. This prevents the
-   pipe operators from drifting into a generic monadic bind.
-2. **A type opts in by exporting both `map` and `flat_map` from
-   its declaring module.** Half-impls (only `map`) cause `||` to
-   fail at the call site with "missing `flat_map` in module
-   `<module>`". The diagnostic suggests adding the function or not
-   using `||` for that type.
-3. **Canonical signatures are enforced.** The typer checks that
-   `<module>.map` has signature `(<HeadType>[a], (a) -> b) ->
-   <HeadType>[b]` and `<module>.flat_map` has `(<HeadType>[a],
-   (a) -> <HeadType>[b]) -> <HeadType>[b]`. Off-shape signatures
-   are rejected (the function is fine for direct call, just not
-   pipe-eligible).
-4. **One module per head type.** The "head type → module" map is
-   one-to-one. The typer rejects ambiguity at registration time
-   if two modules try to claim the same head type.
-5. **Same-line attachment rule applies.** `xs || { x -> ... }`
-   parses as flat-map only when `||` and `{` are on the same
-   line, mirroring the existing rule for `|` (see
-   `docs/syntax-sugars.md` §1).
+- Method references via the `.field` placeholder lambda and
+  receiver-bound `obj.method` (the deferred item in §*Closed*) must
+  be reconciled with this rule — `obj.method` as a *value* (not a
+  call) would still be field-access-only under this proposal, so a
+  method reference needs its own spelling decided alongside.
+- Does not change protocol dispatch or `|`/`||`/`|?` pipe
+  convention dispatch — those are call sites with explicit operators,
+  not `.name` accesses.
 
 ### Decision posture
 
-Land as a single lane that bundles:
-1. Lexer tokenisation of `||` as `BARBAR`.
-2. Parser entry for the `||` binop at the same precedence as
-   `|`, left-associative.
-3. Resolver: build the head-type-to-module map from each module's
-   exported types.
-4. Typer: extend pipe-dispatch (`EMapPipe` and new `EFlatMapPipe`)
-   to look up `<module>.map` / `<module>.flat_map` by the LHS's
-   head type. Validate signatures match the canonical shape.
-5. Migration of `|` from hardcoded `list.map` to module lookup.
-   For `[T]`, the resolved module is `stdlib/core/list`, and
-   `list.map` is what gets called — same as today.
-6. Codegen unchanged for `[T]` (same `list.map` / `list.flat_map`
-   calls). New head types lower to their respective modules'
-   functions.
-7. Regression fixtures in `examples/sequence/` (positive: round
-   trips over `[T]`; negative: `Option` rejected with a typed
-   error pointing at `!` and `opt_and_then`; negative: type with
-   only `map` rejected when `||` is used).
+This is the language owner's call: it trades a liked ergonomic
+affordance (paren-less property UFCS) for the removal of a
+syntactic ambiguity and a class of resolver misfires. The case
+*for* is strongest under kaikai's own principles — *few forms with
+clear intent*, LLM authorability, and "safety/clarity beats
+ergonomics" — and the migration is mechanical. The case *against*
+is the breakage and the lost affordance.
 
-The lane is independent of any milestone in flight (m12.6
-refinement waves, Hanga Roa Perceus, unions milestone #184). It can
-land any time after m12.8 protocols (already closed). Recommended
-to land **after unions (#184)** so the typer changes from unions
-have stabilized — the head-type-to-module map can reuse the same
-module-tracking infrastructure if useful.
+Sequencing: it is an **edition-boundary** change, so it lands with
+an edition bump, not a minor. Pair the decision with the §*What it
+costs* audit (measure paren-less property UFCS usage across stdlib +
+compiler) so the break is sized before committing. It is independent
+of — and complementary to — the typer fix in issue #743: that fix
+closes the Tier 1 escape; this proposal closes the ambiguity that
+makes #743's diagnostic misleading. Land the typer fix regardless;
+land this when an edition window opens and the audit says the break
+is affordable.
 
-**Cost**: medium. Parser + lexer (small), typer dispatch
-migration + head-to-module map infrastructure (the bulk of the
-work). No new stdlib types — `[T]`'s existing `list.map` /
-`list.flat_map` are sufficient for v1.
-**Depends on**: nothing structural; protocols (m12.8) already
-landed.
-
-**Reference**: Go method dispatch (resolves `xs.method(...)` by
-looking in the package of the receiver type — the closest mainstream
-analog to naming-convention dispatch). Clojure protocols dispatch
-by type tag with a similar single-arg lookup model, though they
-add an explicit `defprotocol`. The kaikai approach is **dispatch
-without protocol declaration** — the module is the protocol
-implicit registry.
-
-### What was rejected (HKT-based design)
-
-The original proposal in this section (PR #169) targeted
-`protocol Sequence[F[_]]` with higher-kinded type parameter:
-
-```kai
-# Originally proposed (REJECTED 2026-05-03):
-protocol Sequence[F[_]] {
-  fn map[A, B](self: F[A], f: A -> B) : F[B]
-  fn flat_map[A, B](self: F[A], f: A -> F[B]) : F[B]
-}
-```
-
-This form was rejected after empirical verification that:
-
-1. `protocol Foo[F[_]]` does **not parse** in stage 2 — kaikai
-   commits to "no HKT" per Tier 1 #3 and `docs/protocols.md`
-   §*What protocols cannot do*.
-2. Implementing HKT would require higher-order pattern unification
-   in the typer (Miller pattern unification: ~300-500 lines plus
-   diagnostics) and would revise Tier 1 #3 — a strategic-level
-   change, not a feature.
-3. The risk of incremental drift toward typeclasses (constraint
-   propagation, functional dependencies, type families) makes the
-   reopening costly even if technically scoped.
-
-The naming-convention dispatch above achieves the same user-facing
-goal (transparent `||` over `[T]` and future `Stream[T]`) without
-introducing HKT or modifying any Tier 1 commit.
+**Cost**: medium. Resolver change is small; the edition bump,
+migration tooling (`kai fix`), and usage audit are the real work.
+**Depends on**: resolver + edition bump (+ optional `kai fix`
+migration).
 
 ## Deliberately not on this list
 
@@ -1069,26 +602,22 @@ rejected elsewhere in the design:
   an otherwise expression-oriented surface.
 - **`&&` / `||` for Bool**: duplicate `and` / `or` without distinct
   intent. `and` / `or` stay as the canonical boolean operators.
-  Note: `||` is *not* unused — it is reserved for the flat-map pipe
-  proposal (§11). The point here is only that it does **not** duplicate
-  boolean `or`.
+  Note: `||` is *not* unused — it is the flat-map pipe (shipped).
+  The point here is only that it does **not** duplicate boolean `or`.
 - **`<-` as monadic bind / effect shorthand**: `!` (already landed)
   covers the propagation pattern for `Option` / `Result`; kaikai's
   direct-style effects do not need a bind operator. Adding `<-`
   would be a second mechanism for the same flow. The flat-map pipe
-  `||` (§11) is **not** the same proposal: `||` is a binary pipe
-  over containers in the `Sequence` family (`[T]`, future `Stream[T]`),
-  with `Option` / `Result` explicitly outside the protocol. Different
-  problems, different surface.
+  `||` is **not** the same proposal: `||` is a binary pipe over
+  containers in the `Sequence` family (`[T]`, future `Stream[T]`),
+  with `Option` / `Result` explicitly outside the dispatch table.
+  Different problems, different surface.
 - **`$` low-precedence apply (Haskell-style)**: `|>` and `|` already
   avoid paren pyramids. `$` would be a third way to write the same
   chain.
 - **`::` path or type ascription**: `.` already separates module
   paths (`math.vector.dot`) and `:` annotates types. `::` would
   collide with one of them without adding intent.
-- **Tuples as a second product form**: see the *Tuples — REJECTED*
-  retrospective above. The 2026-04-27 measurement gate failed both
-  thresholds (line count and signature length).
 
 ## Adoption criteria
 
@@ -1106,7 +635,7 @@ Each extension lands only when:
 3. The feature fits in ≤500 lines on top of the stage-2 checker.
    Anything larger gets its own design doc first.
 
-### For language-surface features (sections 4–11)
+### For language-surface features
 
 These land only alongside the closing of *"Concrete syntax
 consolidation"* in `design.md`. Any decision should be made as part
@@ -1122,11 +651,6 @@ of that one conversation — not drip-fed.
   been used enough to confirm the two do not overlap in practice.
   `?.` is local; `!` propagates. If the code base mostly wants
   propagation, `?.` may not be worth the complexity.
-- **`Map[K, V]` + indexing**: **landed v1** (issue #128,
-  2026-05-02) — see §6's retrospective for what shipped and
-  what stayed deferred. v2 (HAMT carrier + `Hashable` protocol +
-  write-side `m[k] := v` sugar) is still tied to the broader
-  collection-design pass alongside `Vector[T]`.
 - **Slice syntax `a[i..j]`**: lands *after* `Vector[T]` ships.
   Copying semantics over `Array[T]` is the first-approximation
   implementation; view-based slices with region tracking wait
@@ -1135,21 +659,9 @@ of that one conversation — not drip-fed.
   with the collection design pass (`Vector[T]`, `Map[K, V]`).
   Designing iterability across these three types in one go
   avoids retrofitting helpers later.
-- **Multi-arg `match` sugar**: the only language-surface item with
-  a clear scheduled landing window. Parser-only, ~1 day. Lands
-  when no other lane is touching the parser's match-head state.
 - **Binary pattern matching `<<...>>`**: a milestone in its own
   right (m13–m14 range). Bring forward only if a fintech-toolkit
   binding (FIX 4.4 likely first) becomes a concrete priority.
-- **`||` flat-map pipe + `Sequence` protocol**: lands as a single
-  bundled lane (protocol + `[T]` impl + `|` migration to protocol
-  dispatch + lexer/parser + fixtures). Independent of milestones in
-  flight; depends only on m12.8 protocols (already closed). Natural
-  window is the language-surface consolidation pass that closes
-  `design.md`'s open decision. Defer if no concrete pipeline pain
-  has surfaced — but the strategic case (ahu `Stream[T]` arriving
-  without a retrofit) is the main reason to land it before ahu
-  needs it.
 
 The goal is to keep the surface small. A handful of orthogonal,
 well-integrated extensions is worth more than a pile of clever
