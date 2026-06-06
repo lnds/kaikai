@@ -238,9 +238,23 @@ int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
     return v && v->tag == KAI_VARIANT && v->variant_tag == tag;
 }
 
-/* Read the i-th argument of a variant. incref so the caller owns it;
-   the C backend passes variant args as borrowed references, but the
-   LLVM path keeps ownership uniform. */
+/* Read the i-th argument of a variant. #747 — return a BORROWED
+   reference for pointer slots, matching the C backend's
+   `_scr->slot[i].ptr` read (emit_c `sub_scr_expr`). The LLVM emitter
+   now owns the full Perceus RC discipline: it increfs a survivor binder
+   at bind-site exactly when it outlives the arm's match-exit
+   `kaix_internal_drop(scr)` cascade, and the match-exit drop reclaims
+   the scrutinee (cascading a decref into every pointer slot). Before
+   #747 this accessor incref'd every read ("uniform ownership"), which
+   forced per-destination accounting the bind-site could not do (a
+   ctor-bound survivor needs +1 over the cascade, a TRMC recursive-child
+   that br's to the loop needs a bare move) and leaked. Borrow collapses
+   both to one rule, identical to the C backend.
+
+   Typed slots (Int/Real, mask!=0 — runtime-minted only; the LLVM
+   codegen now reads kind-1 Int slots raw via kaix_to_int) still return
+   the freshly-boxed OWNING temporary: the bind consumes it like the C
+   `is_alias=false` path, no extra ref to balance. */
 KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     /* Issue #126 / #622 (Cluster F) — variant slot must honor the
      * `slot_mask`. The LLVM emitter always *builds* variants with
@@ -268,7 +282,7 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_REAL) {
         return kai_variant_slot_box(v, i);
     }
-    return kai_incref(kai_var_slots(v)[i].ptr);
+    return kai_var_slots(v)[i].ptr;   /* #747 — borrow (no incref) */
 }
 
 /* kai_op_eq returns an int; wrap for direct use from the IR in match
