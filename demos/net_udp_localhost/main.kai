@@ -1,0 +1,88 @@
+# net-udp-v1 (issue #354) — end-to-end smoke for the NetUdp default
+# handler. Spec: docs/effects-stdlib.md §`NetUdp`. Four ops, all
+# blocking in v1; each maps to a POSIX SOCK_DGRAM call
+# (stage0/runtime.h §*NetUdp default handler*).
+#
+# UDP needs no connection: one socket bound to 127.0.0.1:0 can send a
+# datagram to its own kernel-assigned port and read it straight back.
+# The loopback datagram is delivered synchronously, so the single
+# blocking recv returns it without a reactor wired in.
+#
+# Flow:
+#   1. bind 127.0.0.1:0     — kernel picks an ephemeral port
+#   2. local_port(s)        — read it back via getsockname
+#   3. send PING -> self     — datagram to 127.0.0.1:<port>
+#   4. recv(s)              — reads PING + the source SocketAddr
+#   5. close(s)
+#
+# `[Byte]` from the spec lands as `[Int]` in v1: kaikai has no
+# first-class Byte type yet. Values are expected in [0, 255]; the
+# runtime truncates higher bits before writing. recv returns the
+# source address paired with the bytes (kaikai has no tuples, so the
+# pair is a Pair[SocketAddr, [Int]] with `fst` / `snd` slots).
+# Pinned in stdlib/effects.kai's NetUdp catalog note.
+
+import net.udp
+
+# ASCII codepoints — keeps the golden output deterministic without
+# pulling in encoding/utf8 helpers. PING = 80, 73, 78, 71.
+fn ping_bytes() : [Int] = [80, 73, 78, 71]
+
+# Tiny matcher so the golden output stays a fixed sequence of "ok"
+# lines instead of dumping byte values. Pins the assertion to length
+# + first byte, which is enough to prove the datagram round-tripped.
+fn check_payload(label: String, got: [Int], expect_first: Int, expect_len: Int) : Int / Stdout = {
+  let n = list_length(got)
+  match got {
+    []        -> { Stdout.print(string_concat(label, " FAIL: empty")); 1 }
+    [h, ...tail] ->
+      if n == expect_len and h == expect_first {
+        Stdout.print(string_concat(label, " ok"))
+        0
+      } else {
+        Stdout.print(string_concat(label, " FAIL: wrong shape"))
+        1
+      }
+  }
+}
+
+fn run_session(s: UdpSocket) : Int / NetUdp + Stdout = {
+  let port = local_port(s)
+  let dst = SocketAddr { host: "127.0.0.1", port: port }
+  match NetUdp.send(s, dst, ping_bytes()) {
+    Err(e) -> { NetUdp.close(s); Stdout.print(string_concat("send FAIL: ", e)); 1 }
+    Ok(_n_sent) ->
+      match NetUdp.recv(s, 64) {
+        Err(e) -> { NetUdp.close(s); Stdout.print(string_concat("recv FAIL: ", e)); 1 }
+        Ok(p) -> {
+          let src = p.fst
+          let bytes = p.snd
+          let rc = check_payload("recv PING", bytes, 80, 4)
+          # The datagram came from 127.0.0.1 — the loopback source.
+          let src_rc = if src.host == "127.0.0.1" {
+            Stdout.print("src ok")
+            0
+          } else {
+            Stdout.print(string_concat("src FAIL: ", src.host))
+            1
+          }
+          NetUdp.close(s)
+          Stdout.print("close ok")
+          rc + src_rc
+        }
+      }
+  }
+}
+
+fn main() : Int / NetUdp + Stdout = {
+  Stdout.print("net_udp_localhost start")
+  match NetUdp.bind("127.0.0.1", 0) {
+    Err(e) -> { Stdout.print(string_concat("bind FAIL: ", e)); 1 }
+    Ok(s) -> {
+      Stdout.print("bind ok")
+      let rc = run_session(s)
+      if rc == 0 { Stdout.print("done"); 0 }
+      else { Stdout.print("done with errors"); rc }
+    }
+  }
+}

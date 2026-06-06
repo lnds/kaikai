@@ -867,9 +867,21 @@ state visible to user code.
 > `with_dns`). Unlike the four `NetTcp` ops above, `resolve` does
 > **not** park the fiber on the reactor yet: getaddrinfo is a
 > blocking libc call that runs on the OS thread for v1 (same floor
-> as `Signal.await`). `NetUdp` is still not installed — its runtime
-> handler, compiler builtin, and `stdlib/net/udp.kai` module are
-> post-MVP.
+> as `Signal.await`).
+>
+> **NetUdp (issue #354, 2026-06-06):** `NetUdp` now ships as a
+> compiler builtin (`builtin_netudp_decl` + the `UdpSocket` /
+> `SocketAddr` companion types), a runtime default handler
+> (`kai_default_netudp_*` in `stage0/runtime.h` + `stage2/runtime.h`,
+> LLVM forwarders in `runtime_llvm.c`), and the `stdlib/net/udp.kai`
+> module. The four ops (`bind` / `send` / `recv` / `close`) map to
+> POSIX `SOCK_DGRAM` sockets and are **blocking in v1** — datagram
+> sockets do not yet ride the R2 reactor; the m8.x reactor lifts
+> NetTcp and NetUdp together. `recv` returns the source address
+> paired with the bytes (`Pair[SocketAddr, [Int]]`). With NetTcp,
+> NetUdp, and NetDns all installed, the `Net = NetTcp + NetUdp +
+> NetDns` alias is now definable; a follow-up lane can add the row
+> alias to `stdlib/effects.kai`.
 
 ### Stdlib helper
 
