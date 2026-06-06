@@ -728,6 +728,23 @@ KaiValue *kaix_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
     return kai_default_netdns_resolve(self, host, k);
 }
 
+/* issue #354 — LLVM-visible wrappers around the static NetUdp
+ * default handlers in runtime.h. The LLVM emitter installs these by
+ * name from `kai_main_install_defaults` when `NetUdp` appears in
+ * main's row. */
+KaiValue *kaix_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    return kai_default_netudp_bind(self, host, port, k);
+}
+KaiValue *kaix_default_netudp_send(void *self, KaiValue *sock, KaiValue *dst, KaiValue *data, KaiCont *k) {
+    return kai_default_netudp_send(self, sock, dst, data, k);
+}
+KaiValue *kaix_default_netudp_recv(void *self, KaiValue *sock, KaiValue *max, KaiCont *k) {
+    return kai_default_netudp_recv(self, sock, max, k);
+}
+KaiValue *kaix_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
+    return kai_default_netudp_close(self, sock, k);
+}
+
 /* Issue #141 — LLVM-visible wrappers around the static Log default
  * handlers in runtime.h. The LLVM emitter installs these by name
  * from `kai_main_install_defaults` when `Log` appears in main's
