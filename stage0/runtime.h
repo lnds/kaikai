@@ -7397,6 +7397,76 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
 }
 
 /* =================================================================
+ * NetDns effect — issue #352. getaddrinfo(3) exposed as a standalone
+ * capability so a component can resolve names without earning the
+ * right to open sockets (NetTcp). The syscall shape is identical to
+ * the one embedded in `kai_default_nettcp_connect`; the duplication
+ * is small and intentional (sharing a helper is the out-of-scope
+ * follow-up the issue names). AF_INET / SOCK_STREAM hints match the
+ * TCP path so the address set resolve returns is the same set connect
+ * would have walked — IPv4-only in v1, same limitation as NetTcp.
+ * ================================================================= */
+
+/* Build an IpAddr record `{ addr }` from an addrinfo node. The field
+ * name "addr" is the runtime contract with the kaikai-side builtin
+ * `type IpAddr = { addr: String }` (driver.kai builtin_ipaddr_decl);
+ * kai_op_field reads it by strcmp, so the static cstring is enough. */
+static KaiValue *_kai_net_make_ipaddr(struct addrinfo *p) {
+    char ip_buf[INET_ADDRSTRLEN];
+    struct sockaddr_in *sin = (struct sockaddr_in *) p->ai_addr;
+    const char *txt = inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf));
+    KaiValue *addr_kv = kai_str(txt ? txt : "");
+    KaiValue *fields[1] = { addr_kv };
+    static const char *names[1] = { "addr" };
+    return kai_record(1, fields, names);
+}
+
+/* Build a `[IpAddr]` from the getaddrinfo result list, preserving the
+ * order getaddrinfo returned (recursing tail-first keeps the cons
+ * chain in source order without a reverse pass). Non-AF_INET nodes
+ * are skipped — v1 is IPv4-only and the hints already filter, but
+ * the guard keeps the inet_ntop above honest. */
+static KaiValue *_kai_net_ipaddr_list(struct addrinfo *p) {
+    if (!p) return kai_nil();
+    KaiValue *tail = _kai_net_ipaddr_list(p->ai_next);
+    if (p->ai_family != AF_INET || !p->ai_addr) return tail;
+    return kai_cons(_kai_net_make_ipaddr(p), tail);
+}
+
+/* resolve(host) -> Result[String, [IpAddr]] (Err-first). host is a
+ * hostname or IPv4 dotted-quad; getaddrinfo handles both. An empty
+ * result list (no AF_INET addresses) still resolves to `Ok([])` —
+ * the stdlib `resolve_first` turns that into its own Err so the
+ * runtime stays a thin getaddrinfo shim. */
+static KaiValue *kai_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR) {
+        return _kai_net_err_msg(k, "resolve: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+    if (gai != 0) {
+        const char *msg = gai_strerror(gai);
+        return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+    }
+    KaiValue *list = _kai_net_ipaddr_list(res);
+    freeaddrinfo(res);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = list}});
+    return kai_cont_resume(k, ok);
+}
+
+/* =================================================================
  * Signal effect — issue #107. POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
  * SIGUSR2 trap for graceful shutdown.
  *

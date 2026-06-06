@@ -100,7 +100,7 @@ What's still open (planned-but-not-shipped):
 | Module                          | Issue   | Notes                                                                                            |
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
 | `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
-| `net/udp`, `net/dns`            | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
+| `net/udp`                       | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
 | `net/http` server-side primitives | #605  | minimal `#[unstable]` helpers (`http_parse_request`, `http_serialize_response`, `http_status_reason`, `http_read_request`) shipped in `stdlib/net/http.kai`. A full server framework (router, middleware, graceful shutdown) remains a `manutara` concern. |
 
 ## Tier plan
@@ -153,8 +153,9 @@ parallel with each other and with Hanga Roa's compiler-side work.
      outbound HTTP calls (auth providers, webhooks, downstream
      APIs).
    - Dependency: `NetTcp` shipped (v1 limitations: IPv4 only,
-     blocking ops). DNS uses libc `getaddrinfo` via FFI until
-     `net.dns` lands in S3.
+     blocking ops). `net.dns` shipped (issue #352) — `net.http`
+     still uses `NetTcp.connect`'s implicit `getaddrinfo` path;
+     splitting resolve→connect onto `NetDns` is the #352 follow-up.
    - Acceptance: `examples/stdlib/http_client_basic.kai`
      issues a GET against an in-test localhost server (spawned
      via `nc -l` or a small kaikai listener) and asserts on the
@@ -214,8 +215,11 @@ Defer until after Orongo (1.0.0) ships. Each is significant
 design surface on its own.
 
 - `net/udp` — `NetUdp` effect; `bind`, `send`, `recv`.
-- `net/dns` — replaces the libc `getaddrinfo` shim used by
-  S1 `net.http`; explicit `NetDns` effect.
+- ~~`net/dns`~~ — shipped pre-1.0 (issue #352): `NetDns` effect
+  (`resolve` / `resolve_first` / `with_dns`). The libc
+  `getaddrinfo` shim inside `net.http` still stands; migrating
+  `net.http` to split resolve→connect onto `NetDns` is the
+  remaining #352 follow-up.
 - `net/http2`, `net/http3` — over the same `NetTcp` (and
   `NetUdp` for QUIC). API shaped in S1 to avoid H1-specific
   types leaking into the public surface.
