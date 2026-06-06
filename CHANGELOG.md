@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.88.0 (2026-06-06)
+
+### Added
+
+- **stdlib**: HAMT-backed HashMap[k, v] in collections (#374)
+- NetUdp v1 — byte-level datagram UDP networking effect
+- **stdlib**: net.dns — NetDns effect + resolve op (#352)
+
+### Fixed
+
+- **release**: ship stage2/runtime.h, not stage0's, in the tarball
+- **emit**: LLVM backend implements Perceus match RC — garbage-free (#747)
+
 ## v0.87.0 (2026-06-06)
 
 ### BREAKING CHANGE
