@@ -3,7 +3,7 @@
 ## Scope as planned vs scope as shipped — a carrier redesign mid-lane
 
 The issue body pinned a **pure persistent HAMT** (Hash Array Mapped
-Trie) and 12 flat `hashmap_*` functions with pure signatures
+Trie) and 12 functions named `hashmap_*` with pure signatures
 (`put : HashMap`). I built exactly that first. Then the benchmark
 showed it was *slower than the AVL `Map` it was meant to replace*, the
 maintainer's call was to make HashMap a **mutable hash table behind the
@@ -26,7 +26,7 @@ maintainer's call was to make HashMap a **mutable hash table behind the
 - **Docs** `stdlib-layout.md` + `stdlib-roadmap.md`.
 - **`m[key]` indexing sugar** — one additive arm in the typer's
   `synth_index` (`stage2/compiler/infer.kai`) so `m[key]` lowers to
-  `hashmap.hashmap_get(m, key)` when `m : HashMap`, exactly as `Map`
+  `hashmap.get(m, key)` when `m : HashMap`, exactly as `Map`
   lowers to `map.get`. The `/ Mutable` effect propagates from the
   lowered callee automatically (the sugar adds no row of its own).
 
@@ -99,6 +99,17 @@ shipped a slower default collection with a confident retro.
 - **Size accounting.** Chain `put`/`remove` return `(chain, changed?)`
   so `count` stays exact in one walk without a separate membership
   probe.
+- **Short module-relative names, NO `hashmap_*`.** The issue pinned
+  flat `hashmap_*` names; the first cut used them and they read
+  `hashmap.hashmap_put(...)` under `import collections.hashmap` —
+  redundant and ugly. The maintainer rejected it outright ("horrible
+  que tenga que escribir hashmap.hashmap_*"). Switched to short
+  module-relative names (`hashmap.put`, `hashmap.get`, `hashmap.empty`,
+  …) exactly as `map`/`set`/`queue` do — no `hashmap_*` aliases at all.
+  This diverges from the issue's pinned names, a deliberate surface call
+  on the maintainer's instruction. Combined with the `m[key]` read
+  sugar, the day-to-day surface is `let m = hashmap.empty();
+  hashmap.put(m, k, v); let x = m[k]`.
 
 ## Findings surfaced (not fixed — out of the stdlib lane's scope)
 
@@ -108,11 +119,11 @@ Initially deferred: the dispatch lives in the typer (`synth_index` in
 brief said to surface typer changes as findings, not make them. The
 maintainer then asked for the usability directly ("¿no se puede usar
 `[]`?"), so the arm was added: `m[key]` lowers to
-`hashmap.hashmap_get(m, key)` when `m : HashMap`. Three things made it
+`hashmap.get(m, key)` when `m : HashMap`. Three things made it
 low-risk: (1) it is a single additive arm that only fires for the
 `HashMap` head — existing `Map`/`Array` indexing is untouched; (2) the
 `/ Mutable` effect propagates for free because `synth_index` re-walks
-the constructed `ECall`, so the lowered `hashmap_get`'s row flows into
+the constructed `ECall`, so the lowered `hashmap.get`'s row flows into
 the call site — no special-casing the effect; (3) **selfhost stays
 byte-identical** (verified `kaic2b.c == kaic2c.c`), because the arm
 changes emission only for programs that actually index a `HashMap`,
