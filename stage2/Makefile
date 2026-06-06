@@ -270,27 +270,27 @@ test-llvm: $(TARGET) build
 	@set -e; \
 	for name in $(LLVM_MIN_EXAMPLES); do \
 	  f=../examples/minimal/$$name.kai; \
-	  ./$(TARGET) --emit=llvm $$f > build/$$name.ll; \
-	  clang -w -I ../stage0 build/$$name.ll ../stage0/runtime_llvm.c -o build/$$name-llvm $(LDLIBS_M) ; \
-	  ./build/$$name-llvm > build/$$name-llvm.out; \
-	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
-	  ./build/$$name-c > build/$$name-c.out; \
-	  diff -q build/$$name-llvm.out build/$$name-c.out > /dev/null \
+	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
+	  clang -w -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
+	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
+	  ./$(TARGET) $$f > build/llvm-$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
+	  ./build/llvm-$$name-c > build/llvm-$$name-c.out; \
+	  diff -q build/llvm-$$name-llvm.out build/llvm-$$name-c.out > /dev/null \
 	    && echo "llvm OK $$name" \
-	    || { echo "llvm DIFF $$name"; diff build/$$name-llvm.out build/$$name-c.out | head; exit 1; }; \
+	    || { echo "llvm DIFF $$name"; diff build/llvm-$$name-llvm.out build/llvm-$$name-c.out | head; exit 1; }; \
 	done; \
 	for name in $(LLVM_EXAMPLES); do \
 	  f=../examples/llvm/$$name.kai; \
-	  ./$(TARGET) --emit=llvm $$f > build/$$name.ll; \
-	  clang -w -I ../stage0 build/$$name.ll ../stage0/runtime_llvm.c -o build/$$name-llvm $(LDLIBS_M) ; \
-	  ./build/$$name-llvm > build/$$name-llvm.out; \
-	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
-	  ./build/$$name-c > build/$$name-c.out; \
-	  diff -q build/$$name-llvm.out build/$$name-c.out > /dev/null \
+	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
+	  clang -w -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
+	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
+	  ./$(TARGET) $$f > build/llvm-$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
+	  ./build/llvm-$$name-c > build/llvm-$$name-c.out; \
+	  diff -q build/llvm-$$name-llvm.out build/llvm-$$name-c.out > /dev/null \
 	    && echo "llvm OK $$name" \
-	    || { echo "llvm DIFF $$name"; diff build/$$name-llvm.out build/$$name-c.out | head; exit 1; }; \
+	    || { echo "llvm DIFF $$name"; diff build/llvm-$$name-llvm.out build/llvm-$$name-c.out | head; exit 1; }; \
 	done
 
 # End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
@@ -298,13 +298,13 @@ test-run: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
-	  ./build/$$name > build/$$name.out; \
-	  ../stage1/kaic1 $$f > build/$$name-s1.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name-s1.c -o build/$$name-s1 $(LDLIBS_M) ; \
-	  ./build/$$name-s1 > build/$$name-s1.out; \
-	  diff -q build/$$name.out build/$$name-s1.out > /dev/null \
+	  ./$(TARGET) $$f > build/run-$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/run-$$name.c -o build/run-$$name $(LDLIBS_M) ; \
+	  ./build/run-$$name > build/run-$$name.out; \
+	  ../stage1/kaic1 $$f > build/run-$$name-s1.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/run-$$name-s1.c -o build/run-$$name-s1 $(LDLIBS_M) ; \
+	  ./build/run-$$name-s1 > build/run-$$name-s1.out; \
+	  diff -q build/run-$$name.out build/run-$$name-s1.out > /dev/null \
 	    && echo "run OK $$name" \
 	    || { echo "run DIFF $$name"; exit 1; }; \
 	done
