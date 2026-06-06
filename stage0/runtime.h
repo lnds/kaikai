@@ -7467,6 +7467,288 @@ static KaiValue *kai_default_netdns_resolve(void *self, KaiValue *host, KaiCont 
 }
 
 /* =================================================================
+ * NetUdp default handler (issue #354)
+ * =================================================================
+ *
+ * Spec: docs/effects-stdlib.md §`NetUdp`. Four ops, all blocking in
+ * v1 — datagram sockets do not park the fiber the way the NetTcp R2
+ * reactor (issue #630) does; the readiness reactor lifts both at
+ * once in a follow-up (m8.x). Maps directly to POSIX `SOCK_DGRAM`
+ * sockets via libc, the same FFI-to-libc pattern as NetTcp above.
+ * Errors return `Err(strerror(errno))`; success wraps the handle /
+ * payload in records matching the surface types the compiler
+ * declares (stage2/compiler/driver.kai):
+ *
+ *   UdpSocket  = { fd: Int, port: Int }
+ *   SocketAddr = { host: String, port: Int }
+ *
+ * The `port` slot on UdpSocket carries the kernel-assigned port back
+ * to the caller (the `bind(port=0)` use case) via getsockname, the
+ * same trick `kai_default_nettcp_listen` uses for Listener.
+ *
+ * v1 keeps to AF_INET (IPv4). `[Byte]` lands as `[Int]` (no
+ * first-class Byte), each element truncated to a byte before
+ * sendto. recv reformats the source address back into a SocketAddr
+ * record via inet_ntop / ntohs. SocketAddr.host is a textual IPv4
+ * dotted-quad — same v1 simplification documented for the TLS lane.
+ */
+
+/* Build a UdpSocket record `{ fd, port }`. Field names are the
+ * runtime contract — the kaikai-side `type UdpSocket = { fd: Int,
+ * port: Int }` (builtin_udpsocket_decl) and the _kai_net_record_fd
+ * reader below match on these strings. */
+static KaiValue *_kai_net_make_udpsocket(int fd, int port) {
+    KaiValue *fd_kv   = kai_int((int64_t) fd);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { fd_kv, port_kv };
+    static const char *names[2] = { "fd", "port" };
+    return kai_record(2, fields, names);
+}
+
+/* Build a SocketAddr record `{ host, port }`. Mirrors the kaikai
+ * `type SocketAddr = { host: String, port: Int }` declaration. The
+ * `host` slot is a textual IPv4 address; `recv` fills it from the
+ * datagram source via inet_ntop. */
+static KaiValue *_kai_net_make_sockaddr(const char *host, int port) {
+    KaiValue *host_kv = kai_str(host);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { host_kv, port_kv };
+    static const char *names[2] = { "host", "port" };
+    return kai_record(2, fields, names);
+}
+
+/* Pull the textual `host` slot out of a SocketAddr record into
+ * `out` (NUL-terminated, truncated to `cap-1`). Returns 0 on
+ * success, -1 if the value is the wrong shape. */
+static int _kai_net_sockaddr_host(KaiValue *v, char *out, size_t cap) {
+    if (!v || v->tag != KAI_RECORD || cap == 0) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "host") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_STR) return -1;
+            size_t n = f->as.s.len < cap - 1 ? f->as.s.len : cap - 1;
+            memcpy(out, f->as.s.bytes, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Pull the `port` slot out of a SocketAddr / UdpSocket record.
+ * Returns -1 if the value is the wrong shape. */
+static int _kai_net_record_port(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "port") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_INT) return -1;
+            return (int) f->as.i;
+        }
+    }
+    return -1;
+}
+
+/* bind(host, port) -> Result[UdpSocket, String]. host = "" or
+ * "0.0.0.0" binds INADDR_ANY; a specific IPv4 dotted-quad also
+ * works. port = 0 asks the kernel for an ephemeral port; we read it
+ * back via getsockname so callers don't need a separate op. The
+ * socket is left blocking in v1 (no reactor wiring). */
+static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR || !port || port->tag != KAI_INT) {
+        return _kai_net_err_msg(k, "bind: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return _kai_net_err(k, errno);
+
+    /* SO_REUSEADDR mirrors the NetTcp listen convention — a probe
+     * that crashed seconds ago can rebind without waiting out the
+     * kernel's hold on the port. */
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) port->as.i);
+    if (host_buf[0] == '\0') {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
+        /* Fall back to getaddrinfo for hostnames (e.g. "localhost"). */
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        struct addrinfo *res = NULL;
+        int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+        if (gai != 0) {
+            close(fd);
+            const char *msg = gai_strerror(gai);
+            return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *) res->ai_addr;
+        addr.sin_addr = sin->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+
+    /* Read back the assigned port (kernel may have picked one when
+     * the caller passed 0). */
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    int actual_port = (int) port->as.i;
+    if (getsockname(fd, (struct sockaddr *) &bound, &blen) == 0) {
+        actual_port = (int) ntohs(bound.sin_port);
+    }
+
+    KaiValue *s  = _kai_net_make_udpsocket(fd, actual_port);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+    return kai_cont_resume(k, ok);
+}
+
+/* send(s, dst, data) -> Result[Int, String]. data is a [Int] each
+ * element truncated to a byte. dst is a SocketAddr `{ host, port }`;
+ * host is parsed as an IPv4 dotted-quad via inet_pton. Returns the
+ * byte count sent. A single sendto either delivers the whole
+ * datagram or fails — no partial-write loop (unlike the TCP stream
+ * send). */
+static KaiValue *kai_default_netudp_send(void *self, KaiValue *sock, KaiValue *dst, KaiValue *data, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd < 0) return _kai_net_err_msg(k, "send: invalid socket");
+    if (!data) return _kai_net_err_msg(k, "send: null data");
+
+    char dst_host[KAI_NET_HOST_BUF];
+    if (_kai_net_sockaddr_host(dst, dst_host, sizeof(dst_host)) != 0) {
+        return _kai_net_err_msg(k, "send: invalid destination address");
+    }
+    int dst_port = _kai_net_record_port(dst);
+    if (dst_port < 0) return _kai_net_err_msg(k, "send: invalid destination port");
+
+    struct sockaddr_in dst_addr;
+    memset(&dst_addr, 0, sizeof(dst_addr));
+    dst_addr.sin_family = AF_INET;
+    dst_addr.sin_port   = htons((uint16_t) dst_port);
+    if (inet_pton(AF_INET, dst_host, &dst_addr.sin_addr) != 1) {
+        return _kai_net_err_msg(k, "send: destination host is not an IPv4 address");
+    }
+
+    /* Materialise the [Int] payload into a byte buffer. A datagram
+     * over the 64 KiB IPv4 ceiling is out of scope for v1; sendto
+     * will reject it with EMSGSIZE and we surface that. */
+    size_t n = 0;
+    for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    unsigned char *buf = NULL;
+    if (n > 0) {
+        buf = (unsigned char *) malloc(n);
+        if (!buf) return _kai_net_err_msg(k, "send: out of memory");
+        size_t i = 0;
+        for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+            KaiValue *h = p->as.cons.head;
+            int64_t b = (h && h->tag == KAI_INT) ? h->as.i : 0;
+            buf[i++] = (unsigned char) (b & 0xff);
+        }
+    }
+
+    ssize_t w;
+    for (;;) {
+#ifdef MSG_NOSIGNAL
+        w = sendto(fd, buf, n, MSG_NOSIGNAL, (struct sockaddr *) &dst_addr, sizeof(dst_addr));
+#else
+        w = sendto(fd, buf, n, 0, (struct sockaddr *) &dst_addr, sizeof(dst_addr));
+#endif
+        if (w < 0 && errno == EINTR) continue;
+        break;
+    }
+    int saved_errno = (w < 0) ? errno : 0;
+    free(buf);
+    if (w < 0) return _kai_net_err(k, saved_errno);
+
+    KaiValue *cnt = kai_int((int64_t) w);
+    KaiValue *ok  = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = cnt}});
+    return kai_cont_resume(k, ok);
+}
+
+/* recv(s, max) -> Result[Pair[SocketAddr, [Int]], String]. Reads one
+ * datagram of at most `max` bytes via recvfrom; the source address
+ * is reformatted into a SocketAddr `{ host, port }` and returned as
+ * the first half of the pair, the bytes as the second. max <= 0
+ * panics per spec (no useful "read zero bytes"). A zero-length
+ * datagram is legal and surfaces as `Ok(Pair { fst: src, snd: [] })`
+ * — distinct from the TCP peer-close empty list because UDP has no
+ * connection to close. */
+static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *max, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd < 0) return _kai_net_err_msg(k, "recv: invalid socket");
+    int64_t cap = (max && max->tag == KAI_INT) ? max->as.i : 0;
+    if (cap <= 0) {
+        fputs("kai: NetUdp.recv: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 16)) cap = 1 << 16;  /* IPv4 datagram ceiling */
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
+
+    struct sockaddr_in src;
+    socklen_t srclen = sizeof(src);
+    ssize_t got;
+    for (;;) {
+        memset(&src, 0, sizeof(src));
+        srclen = sizeof(src);
+        got = recvfrom(fd, buf, (size_t) cap, 0, (struct sockaddr *) &src, &srclen);
+        if (got >= 0) break;
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        free(buf);
+        return _kai_net_err(k, saved_errno);
+    }
+
+    /* Format the source address back into a textual SocketAddr. */
+    char src_host[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &src.sin_addr, src_host, sizeof(src_host))) {
+        src_host[0] = '\0';
+    }
+    int src_port = (int) ntohs(src.sin_port);
+    KaiValue *addr = _kai_net_make_sockaddr(src_host, src_port);
+
+    /* Build the [Int] payload tail-first so the head is byte 0. */
+    KaiValue *bytes = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; bytes = kai_cons(kai_int((int64_t) buf[i]), bytes); }
+    free(buf);
+
+    KaiValue *pfields[2] = { addr, bytes };
+    static const char *pnames[2] = { "fst", "snd" };
+    KaiValue *pair = kai_record(2, pfields, pnames);
+    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = pair}});
+    return kai_cont_resume(k, ok);
+}
+
+/* close(s) -> Unit. Errors from close(2) are logged and swallowed,
+ * matching the NetTcp.close convention — the user can do nothing
+ * useful with the value. Returns kai_unit(). */
+static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd >= 0) {
+        if (close(fd) < 0) {
+            fprintf(stderr, "kai: NetUdp.close: %s\n", strerror(errno));
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+
+/* =================================================================
  * Signal effect — issue #107. POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
  * SIGUSR2 trap for graceful shutdown.
  *

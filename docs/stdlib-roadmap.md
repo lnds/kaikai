@@ -95,14 +95,18 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `collections/map` round-out + qualified migration + pipes | shipped (closes #613): `stdlib/collections/map.kai` rounds out the public surface with `update`, `fold`, `merge`, `filter`, `transform_values`; migrates the 11 flat-prefix exports (`map_put`, `map_get`, …) to qualified canonical form (`map.put`, `map.get`, …) per the m14 audit's Option E. Flat-prefix aliases retained as one-liners for the tongariki edition, scheduled to drop at the Orongo boundary. Adds `map`/`flat_map`/`filter` pair-shaped exports so `Map[k, v]` participates in the `|`/`||`/`|?` pipe convention introduced by #594. Selfhost byte-identical (only stage2 reference is the `"map_get"` callee string synthesised by the indexing-sugar lowering, kept resolvable through the alias). |
 | `net/http` automatic redirect following  | shipped (closes #357): `stdlib/net/http.kai` gains `RedirectPolicy` (4 fields: `max_redirects`, `follow_3xx`, `rewrite_post_to_get_on_303`, `preserve_method_307_308`), `default_redirect_policy`, `http_follow`, plus 4 convenience wrappers (`http_get_follow`, `http_post_follow`, `http_put_follow`, `http_delete_follow`). RFC 9110 §15.4 method-rewrite rules baked in; bare `http_request` and the existing `http_get`/`http_post`/`http_put`/`http_delete` keep their single-call semantics (no breaking change). Cookie persistence + cross-origin Authorization stripping stay deferred to the cookie-policy lane. Selfhost byte-identical. |
 | m14 follow-up — 21 modules qualified-call surface | shipped (closes #614): pins the canonical user-facing surface for the 21 stdlib modules outside `stdlib/core/*` (`fs/file`, `spawn`, `log`, `math/int`, `math/real`, `decimal`, `money`, `fx`, `array`, `collections/{set,queue,stack}`, `path`, `encoding/{base64,hex,toml}`, `uuid`, `regexp`, `random_secure`, `net/http`, `protocols`). Each module exposes its qualified form (`file.read`, `spawn.spawn`, `int.min`, `decimal.zero`, `queue.push`, `regexp.compile`, …) via the qualified-call resolver's prefix fallback (`me_lookup_export` in stage2/compiler.kai) plus, for `regexp`, a second prefix table (`module_legacy_prefix_alt`) so both `regexp.match` (→ `regex_match`) and `regexp.parse_pattern` (→ `rx_parse_pattern`) resolve. `queue` / `stack` / `random_secure` join the existing `char` / `regexp` / `decimal` entries in `module_legacy_prefix`. Definitions stay flat-prefix; lane retro `docs/lane-experience-issue-614-m14-followup.md` documents the departure from issue #614's stated Option E (kaikai has no top-level pub fn overloading; renames collide with sibling modules and shadow user-defined fns). Where bare canonical names are safe (no shadow, no top-level clash), the lane added both forms — `file.read/write/append`, `spawn.spawn/await/select/cancel/yield/set_trap_exit`, `log.debug/info/warn/error`, `real.trunc/floor/ceil/round_half_even`, `decimal.from_int/from_parts`. Selfhost byte-identical. |
+| `net/udp` datagram UDP                   | shipped (closes #354): `NetUdp` effect (`builtin_netudp_decl` in `stage2/compiler/driver.kai`) — `bind`/`send`/`recv`/`close` over POSIX `SOCK_DGRAM` — plus companion types `UdpSocket` / `SocketAddr` and the `stdlib/net/udp.kai` module (`local_port`, `bind`, `send`, `recv`, `close`, `addr`). Runtime default handlers `kai_default_netudp_*` in `stage0/runtime.h` + `stage2/runtime.h`, LLVM forwarders in `runtime_llvm.c`. v1: IPv4 only, blocking (no reactor — m8.x lifts NetTcp + NetUdp together), `[Byte]`→`[Int]`, `recv` returns `Pair[SocketAddr, [Int]]`. No `with_udp` (the default handler is the install path; a kaikai-bodied installer needs `$extern_handler` outside `default {}`, which is Stage C of #533). The `Net = NetTcp + NetUdp + NetDns` alias still waits on `net/dns` (#352). Selfhost byte-identical (C + LLVM). |
 
 What's still open (planned-but-not-shipped):
 
 | Module                          | Issue   | Notes                                                                                            |
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
 | `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
-| `net/udp`                       | (none)  | Tier S3 — no compiler builtin, no runtime handler, no module file                                |
 | `net/http` server-side primitives | #605  | minimal `#[unstable]` helpers (`http_parse_request`, `http_serialize_response`, `http_status_reason`, `http_read_request`) shipped in `stdlib/net/http.kai`. A full server framework (router, middleware, graceful shutdown) remains a `manutara` concern. |
+
+(`net/udp` shipped via #354 and `net/dns` via #352 — both moved out of
+this open list into *Current inventory*. The `Net` alias follow-up is
+the only net-surface item left.)
 
 ## Tier plan
 
@@ -215,7 +219,11 @@ critical path but needed for production-quality services.
 Defer until after Orongo (1.0.0) ships. Each is significant
 design surface on its own.
 
-- `net/udp` — `NetUdp` effect; `bind`, `send`, `recv`.
+- ~~`net/udp` — `NetUdp` effect; `bind`, `send`, `recv`.~~
+  **Shipped early via #354** — pulled forward out of S3 because the
+  `Net` alias was undefinable until UDP landed (see *Current
+  inventory*). v1 is blocking + IPv4-only; the reactor + IPv6 are the
+  remaining S3-era follow-ups.
 - ~~`net/dns`~~ — shipped pre-1.0 (issue #352): `NetDns` effect
   (`resolve` / `resolve_first` / `with_dns`). The libc
   `getaddrinfo` shim inside `net.http` still stands; migrating

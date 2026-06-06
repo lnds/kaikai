@@ -2029,6 +2029,14 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # namespace separation as Conn / Listener.
   let netdns_d   = inject_unconditional(existing,       "NetDns",   builtin_netdns_decl())
   let ipaddr_d   = inject_unconditional(existing_types, "IpAddr",   builtin_ipaddr_decl())
+  # Issue #354: NetUdp ships with two companion type decls — UdpSocket
+  # and SocketAddr the effect signatures carry in their parameter /
+  # return positions. Same DType / DEffect namespace separation as
+  # Conn / Listener: the effect name is gated on `existing`, the
+  # types on `existing_types`.
+  let netudp_d    = inject_unconditional(existing,       "NetUdp",     builtin_netudp_decl())
+  let udpsocket_d = inject_unconditional(existing_types, "UdpSocket",  builtin_udpsocket_decl())
+  let sockaddr_d  = inject_unconditional(existing_types, "SocketAddr", builtin_sockaddr_decl())
   # Issue #107: Signal + Sig. Sig is a DType; Signal is a DEffect that
   # references Sig in its op signatures, so the Sig decl must reach the
   # typer alongside the effect decl. Same gating discipline as Conn /
@@ -2080,6 +2088,9 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                         list_append(nettcp_d,
                                           list_append(ipaddr_d,
                                             list_append(netdns_d,
+                                          list_append(udpsocket_d,
+                                            list_append(sockaddr_d,
+                                              list_append(netudp_d,
                                           list_append(sig_d,
                                             list_append(signal_d,
                                               list_append(child_d,
@@ -2087,7 +2098,7 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                                   list_append(process_d,
                                                     list_append(log_d,
                                                       list_append(securerandom_d,
-                                                        list_append(ffi_d, decls))))))))))))))))))))))))))))))
+                                                        list_append(ffi_d, decls)))))))))))))))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -2195,7 +2206,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # still mention Console because the resolver routes through
 # `cand_ns` for aliases.
 fn builtin_effect_names() : [String] =
-  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor", "Ffi"]
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Random", "SecureRandom", "NetTcp", "NetUdp", "NetDns", "Signal", "Process", "Log", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor", "Ffi"]
 
 # m12.8 Phase 4b: `Console` is now an alias `type Console = Stdout +
 # Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
@@ -2457,6 +2468,84 @@ fn builtin_conn_decl() : Decl =
 fn builtin_listener_decl() : Decl =
   DType(false, "Listener", [],
     TBRecord([FD(true, "fd",   ty_name_zero("Int")),
+              FD(true, "port", ty_name_zero("Int"))]), 0, 0, None)
+
+# Issue #354: NetUdp effect — four datagram UDP ops. Spec:
+# docs/effects-stdlib.md §`NetUdp`. Default handler in stage0/runtime.h
+# (`kai_default_netudp_*`); the auto-generated `default { }` block
+# (builtin_default_block_for) bridges each op to its C symbol, and the
+# install/teardown wiring rides the `user_effects_in_row` path in both
+# emit backends (NetUdp is intentionally NOT pinned into
+# builtin_default_install_order, so no emit_c.kai / emit_llvm.kai edit
+# is needed for this lane — the shim + setup fall out of the AST walk).
+#
+# Same two divergences from the spec as NetTcp, pinned in
+# stdlib/effects.kai's NetUdp note:
+#
+#   1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet
+#      and resolve_ty does not substitute non-effect aliases, so a
+#      `type Byte = Int` would stay a distinct nominal. `[Int]`
+#      directly keeps user code compiling. Matches NetTcp / crypto.
+#
+#   2. Result type-arg order. kaikai's `Result[e, a]` is Err-first /
+#      Ok-second, so the decl flips the spec's `Result[UdpSocket,
+#      String]` to `Result[String, UdpSocket]` — user code matches
+#      `Ok(s)` / `Err(msg)` with `s: UdpSocket` and `msg: String`.
+#      `recv` returns `Result[String, Pair[SocketAddr, [Int]]]`: the
+#      datagram's source address paired with its bytes (kaikai has no
+#      tuples, so the spec's `(SocketAddr, [Byte])` materialises as a
+#      Pair record with `fst` / `snd` slots — same as Env.vars).
+fn builtin_netudp_ops() : [EffectOp] =
+  [EOp("bind", [],
+       [param_string_zero("host"),
+        Param { pname: "port", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("UdpSocket")]),
+       0, 0),
+   EOp("send", [],
+       [param_typed_zero("s", ty_name_zero("UdpSocket")),
+        param_typed_zero("dst", ty_name_zero("SocketAddr")),
+        param_typed_zero("data", ty_list_zero(ty_name_zero("Int")))],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("Int")]),
+       0, 0),
+   EOp("recv", [],
+       [param_typed_zero("s", ty_name_zero("UdpSocket")),
+        Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_named_zero("Result", [ty_name_zero("String"),
+                                 ty_named_zero("Pair",
+                                   [ty_name_zero("SocketAddr"),
+                                    ty_list_zero(ty_name_zero("Int"))])]),
+       0, 0),
+   EOp("close", [],
+       [param_typed_zero("s", ty_name_zero("UdpSocket"))],
+       ty_name_zero("Unit"), 0, 0)]
+
+fn builtin_netudp_decl() : Decl =
+  DEffect(false, "NetUdp", [], builtin_netudp_ops(),
+    Some(builtin_default_block_for("NetUdp", builtin_netudp_ops())), 0, 0)
+
+# Issue #354: opaque UDP socket handle. Two slots — `fd` for the
+# datagram socket descriptor (same `_kai_net_record_fd` contract as
+# Conn / Listener), `port` for the kernel-assigned port read back via
+# getsockname at bind time. `port` is what `net.udp.local_port`
+# exposes so a probe bound to `port = 0` can discover the ephemeral
+# port the kernel picked. Field names are load-bearing — the runtime
+# reads them by string (stage0/runtime.h `_kai_net_make_udpsocket`).
+fn builtin_udpsocket_decl() : Decl =
+  DType(false, "UdpSocket", [],
+    TBRecord([FD(true, "fd",   ty_name_zero("Int")),
+              FD(true, "port", ty_name_zero("Int"))]), 0, 0, None)
+
+# Issue #354: SocketAddr handle — a textual IPv4 address plus a port.
+# Used both as the `dst` argument to `NetUdp.send` and as the source
+# half of the `NetUdp.recv` pair. v1 stores `host` as a dotted-quad
+# string (e.g. "127.0.0.1") — same simplification as the TLS lane
+# (#351). Field names match stage0/runtime.h `_kai_net_make_sockaddr`
+# / `_kai_net_sockaddr_host`.
+fn builtin_sockaddr_decl() : Decl =
+  DType(false, "SocketAddr", [],
+    TBRecord([FD(true, "host", ty_name_zero("String")),
               FD(true, "port", ty_name_zero("Int"))]), 0, 0, None)
 
 # Issue #107: Signal effect — POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
