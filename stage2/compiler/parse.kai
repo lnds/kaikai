@@ -2434,41 +2434,65 @@ type LamParams = { p: Parser, params: [Param] }
 
 fn try_parse_lambda_params(p: Parser) : Option[LamParams] / Console {
 
-  try_parse_lambda_params_loop(p, [])
+  try_parse_lambda_params_loop(p, [], [])
 }
 
-fn try_parse_lambda_params_loop(p: Parser, acc: [Param]) : Option[LamParams] / Console {
+# Close an unannotated group: every pending name becomes a `ptype: None`
+# Param. Lambda params may go unannotated (the typer infers them); `fn`
+# params may not — that path errors instead (see parse_fn_params_group).
+fn close_param_group_untyped(names: [PendName], acc: [Param]) : [Param] {
+  match names {
+    [] -> acc
+    [pn, ...rest] ->
+      close_param_group_untyped(rest,
+        [Param { pname: pn.nm, ptype: None, pline: pn.nline, pcol: pn.ncol }, ...acc])
+  }
+}
+
+# `acc` holds already-closed params (reverse order); `pending` holds names
+# of the current type group awaiting a `:` (reverse reading order). A `:`
+# closes the group with a shared type back-filled onto every name (Go/Pony
+# grouping); a closing `)` with pending names and no `:` closes them
+# unannotated (lambda params may be inferred) but only when `=>` follows —
+# otherwise the scan fails (None) and `(a, b)` falls back to n-tuple sugar.
+# Annotated params now emit `Some(te)` (previously discarded — the typer
+# honours the slot).
+fn try_parse_lambda_params_loop(p: Parser, pending: [PendName], acc: [Param]) : Option[LamParams] / Console {
 
   let t = p_peek(p)
   if not tk_is(t.kind, TkIdent) { None }
   else {
     let name = tok_source(p.src, t)
     let p1 = p_advance(p)
-    # Optional `: Type`
-    let p2_opt =
-      if p_at(p1, TkColon) {
-        let r = parse_type(p_advance(p1))
-        match r.r {
-          None -> None
-          Some(_) -> Some(r.p)
-        }
-      } else {
-        Some(p1)
-      }
-    match p2_opt {
-      None -> None
-      Some(p2) -> {
-        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
-        let acc1 = [param, ...acc]
-        if p_at(p2, TkComma) {
-          try_parse_lambda_params_loop(p_skip_newlines(p_advance(p2)), acc1)
-        } else if p_at(p2, TkRparen) {
-          let p3 = p_advance(p2)
-          if p_at(p3, TkFatArrow) {
-            Some(LamParams { p: p_advance(p3), params: list_reverse(acc1) })
+    let pending1 = [PendName { nm: name, nline: t.line, ncol: t.col }, ...pending]
+    if p_at(p1, TkComma) {
+      try_parse_lambda_params_loop(p_skip_newlines(p_advance(p1)), pending1, acc)
+    } else if p_at(p1, TkColon) {
+      let r = parse_type(p_advance(p1))
+      match r.r {
+        None -> None
+        Some(te) -> {
+          let acc1 = close_param_group(list_reverse(pending1), te, acc)
+          if p_at(r.p, TkComma) {
+            try_parse_lambda_params_loop(p_skip_newlines(p_advance(r.p)), [], acc1)
+          } else if p_at(r.p, TkRparen) {
+            let p3 = p_advance(r.p)
+            if p_at(p3, TkFatArrow) {
+              Some(LamParams { p: p_advance(p3), params: list_reverse(acc1) })
+            } else { None }
           } else { None }
-        } else { None }
+        }
       }
+    } else if p_at(p1, TkRparen) {
+      # No `:` for this group; close it unannotated. A lambda only if `=>`
+      # follows the `)` — otherwise fail so `(a, b)` falls back to a tuple.
+      let acc1 = close_param_group_untyped(list_reverse(pending1), acc)
+      let p3 = p_advance(p1)
+      if p_at(p3, TkFatArrow) {
+        Some(LamParams { p: p_advance(p3), params: list_reverse(acc1) })
+      } else { None }
+    } else {
+      None
     }
   }
 }
@@ -5247,35 +5271,66 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
 
 type PParams = { p: Parser, r: Option[[Param]] }
 
+# A pending parameter name awaiting the group's shared type annotation.
+type PendName = { nm: String, nline: Int, ncol: Int }
+
+# Back-fill `ty` onto every pending name in a type group (Go/Pony-style
+# grouping: `fn foo(a, b: Int)` ≡ `fn foo(a: Int, b: Int)`). `names` is in
+# left-to-right reading order; prepending each yields the group in
+# reverse-reading order on top of `acc`, matching the caller's invariant
+# (acc is reversed once at the end). Every emitted Param is `Some(ty)`, so
+# the public-signature-fully-annotated invariant holds.
+fn close_param_group(names: [PendName], ty: TypeExpr, acc: [Param]) : [Param] {
+  match names {
+    [] -> acc
+    [pn, ...rest] ->
+      close_param_group(rest, ty,
+        [Param { pname: pn.nm, ptype: Some(ty), pline: pn.nline, pcol: pn.ncol }, ...acc])
+  }
+}
+
 fn parse_fn_params(p: Parser, acc: [Param]) : PParams / Console {
 
   if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
-  else {
-    let t = p_peek(p)
-    if not tk_is(t.kind, TkIdent) {
-      PParams { p: p_error(p, t, "expected parameter name"), r: None }
-    } else {
-      let name = tok_source(p.src, t)
-      let p1 = p_advance(p)
-      if not p_at(p1, TkColon) {
-        PParams { p: p_error_here(p1, "expected `:` after parameter name"), r: None }
-      } else {
-        let rt = parse_type(p_advance(p1))
-        match rt.r {
-          None -> PParams { p: rt.p, r: None }
-          Some(ty) -> {
-            let param = Param { pname: name, ptype: Some(ty), pline: t.line, pcol: t.col }
-            let p2 = p_skip_newlines(rt.p)
-            if p_at(p2, TkComma) {
-              parse_fn_params(p_skip_newlines(p_advance(p2)), [param, ...acc])
-            } else if p_at(p2, TkRparen) {
-              PParams { p: p_advance(p2), r: Some(list_reverse([param, ...acc])) }
-            } else {
-              PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
-            }
+  else { parse_fn_params_group(p, [], acc) }
+}
+
+# Accumulate names of the current type group in `pending` (reverse reading
+# order) until a `:` closes the group; then parse the shared type and
+# back-fill it onto every name. LL(1): one token of lookahead at each step —
+# `,` keeps the group open, `:` closes it.
+fn parse_fn_params_group(p: Parser, pending: [PendName], acc: [Param]) : PParams / Console {
+
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PParams { p: p_error(p, t, "expected parameter name"), r: None }
+  } else {
+    let name = tok_source(p.src, t)
+    let p1 = p_advance(p)
+    let pending1 = [PendName { nm: name, nline: t.line, ncol: t.col }, ...pending]
+    if p_at(p1, TkComma) {
+      parse_fn_params_group(p_skip_newlines(p_advance(p1)), pending1, acc)
+    } else if p_at(p1, TkColon) {
+      let rt = parse_type(p_advance(p1))
+      match rt.r {
+        None -> PParams { p: rt.p, r: None }
+        Some(ty) -> {
+          let acc1 = close_param_group(list_reverse(pending1), ty, acc)
+          let p2 = p_skip_newlines(rt.p)
+          if p_at(p2, TkComma) {
+            parse_fn_params(p_skip_newlines(p_advance(p2)), acc1)
+          } else if p_at(p2, TkRparen) {
+            PParams { p: p_advance(p2), r: Some(list_reverse(acc1)) }
+          } else {
+            PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
           }
         }
       }
+    } else if p_at(p1, TkRparen) {
+      # A trailing group with no `:` — public signatures must be annotated.
+      PParams { p: p_error_here(p1, "parameter group has no type annotation"), r: None }
+    } else {
+      PParams { p: p_error_here(p1, "expected `,`, `:` or `)` in parameter list"), r: None }
     }
   }
 }
