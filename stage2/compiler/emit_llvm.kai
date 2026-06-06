@@ -549,6 +549,11 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_reuse_or_alloc_cons(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_reuse_or_alloc_record(%KaiValue*, i32, %KaiValue**, i8**)\n",
     "declare %KaiValue* @kaix_reuse_or_alloc_variant(%KaiValue*, i32, i8*, i32, %KaiValue**)\n",
+    # llvm-c-parity lane — arm-top reuse (ParcReuse / token model).
+    "declare %KaiValue* @kaix_drop_reuse_token(%KaiValue*, i32)\n",
+    "declare void @kaix_reuse_free(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_variant_arg_borrow(%KaiValue*, i32)\n",
+    "declare %KaiValue* @kaix_variant_at(%KaiValue*, i32, i8*, i32, %KaiValue**)\n",
     # Issue #668 — TRMC constructor-context shims (stage0/runtime_llvm.c).
     "declare %KaiValue** @kaix_field_addr(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_cctx_apply(%KaiValue*, %KaiValue**, %KaiValue*)\n",
@@ -5581,8 +5586,170 @@ fn llvm_emit_guard_test(e: LlvmEmit, gx: Expr, fail_lbl: String) : LlvmEmit / Co
   llvm_emit_truthy_br(eg, eg.last_val, fail_lbl, "match.guard.ok.")
 }
 
-fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: String,
-                         acc: [LlvmArmEntry], scr_owned: Bool) : LlvmArmCollect / Console {
+# ---- arm-top reuse (ParcReuse / Koka borrow-bind) — llvm-c-parity lane ----
+#
+# Plan for a match arm whose pattern is a PVariant the arm consumes and
+# whose body hosts a TRMC step (the hot insert_loop shape): the ctor name,
+# its declared payload tys, and the pointer-slot binders that need a dup in
+# the SHARED branch. Mirror of emit_c's `ArmTopReuse` / `try_arm_top_reuse`,
+# but resolved against the LLVM emit's `vars_` registry.
+type LlvmArmTopReuse = LlvmArmTopReuse(String, [Pattern], [TypeExpr], [String], Int)
+
+# Eligible iff: TRMC body (the `%_arm_ru` slot + the donate in
+# `llvm_emit_trmc_goto` only exist there), pattern is a PVariant whose
+# declared arity matches the sub-patterns, AND it has ≥1 pointer binder
+# (otherwise there is nothing to keep alive and the owned path is fine).
+# `arm_ptr_binders` / `arm_moved_binders` / `trmc_body_has_step` are pure
+# AST fns shared with emit_c — the LLVM backend reuses them verbatim, so
+# the move/dup decision stays in lock-step with perceus (no recompute).
+fn llvm_try_arm_top_reuse(pat: Pattern, body: Expr, e: LlvmEmit) : Option[LlvmArmTopReuse] {
+  if not trmc_body_has_step(body) { None }
+  else {
+    match pat.pkind {
+      PVariant(cname, subs) -> match evar_payload_tys(e.vars_, cname) {
+        Some(tys) ->
+          if list_length(tys) == list_length(subs) {
+            # enums=[] — the LLVM backend lays every non-kind-1 slot out as
+            # a boxed %KaiValue* (mask==0), so the ptr-binder probe must see
+            # only Int (kind 1) as non-pointer, matching its own layout.
+            let ptr_binders = arm_ptr_binders(subs, tys, 0, [])
+            # Eligible only when perceus actually MOVED ≥1 pointer binder in
+            # THIS arm (a bare EVar use, not __perceus_dup-wrapped). The
+            # move/dup decision lives in perceus's `pcs_arm_all_tails_ctor`
+            # gate: an arm with a non-ctor tail (e.g. `balance_left(ins(l),…)`)
+            # is NOT moved — its children keep their own __perceus_dup incref,
+            # and stealing the shell as a token there would free a cell those
+            # dup'd children still reference (the #747 nested-match leak). So
+            # the LLVM arm-top reuse fires in lock-step with perceus's
+            # signature: borrow + token-steal ONLY where perceus moved.
+            let moved = arm_moved_binders(ptr_binders, body)
+            match moved {
+              [] -> None
+              _  -> Some(LlvmArmTopReuse(cname, subs, tys, ptr_binders, list_length(subs)))
+            }
+          } else { None }
+        None -> None
+      }
+      _ -> None
+    }
+  }
+}
+
+# Borrow binds for the arm-top model: a pointer slot (kind 0) is aliased
+# WITHOUT incref via `kaix_variant_arg_borrow` (the move/dup decision is
+# taken at the arm top, not here); a kind-1 Int slot reads raw i64 and
+# pushes LRaw (no box, no RC — same as the owned slot walk); kind 2/3
+# (boxed Real / enum) box a fresh owning value like the owned path. PWild /
+# unused slots bind nothing. Mirror of emit_c's `emit_arm_borrow_binds`.
+fn llvm_emit_arm_borrow_binds(e: LlvmEmit, subs: [Pattern], tys: [TypeExpr],
+                              scr: String, i: Int) : LlvmEmit / Console {
+  match subs {
+    [] -> e
+    [sp, ...rest] -> {
+      let k = match llvm_list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, []) None -> 0 }
+      let e_here = match sp.pkind {
+        PBind(nm) ->
+          if llvm_name_is_unused(nm) { e }
+          else if k == 1 {
+            # kind-1 Int: raw i64 read, push LRaw (matches the owned walk).
+            let arg = llvm_fresh_reg(e)
+            let e_a = llvm_append_body(arg.e, concat_all([
+              "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg_borrow(%KaiValue* ", scr,
+              ", i32 ", int_to_string(i), ")\n"]))
+            let raw = llvm_fresh_reg(e_a)
+            let e_r = llvm_append_body(raw.e, concat_all([
+              "  ", raw.reg, " = call i64 @kaix_to_int(%KaiValue* ", arg.reg, ")\n"]))
+            llvm_push_raw_local(e_r, nm, raw.reg, TyInt)
+          } else {
+            # kind 0/2/3: borrow the pointer slot, no incref. Under the
+            # unified runtime a tagged-Int or boxed Real/enum is itself a
+            # valid %KaiValue*, so the raw `.ptr` borrow is correct for all.
+            let arg = llvm_fresh_reg(e)
+            let e_a = llvm_append_body(arg.e, concat_all([
+              "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg_borrow(%KaiValue* ", scr,
+              ", i32 ", int_to_string(i), ")\n"]))
+            llvm_push_local(e_a, nm, arg.reg)
+          }
+        _ -> e
+      }
+      llvm_emit_arm_borrow_binds(e_here, rest, tys, scr, i + 1)
+    }
+  }
+}
+
+# Shared-branch dups: incref each kept pointer child perceus MOVED, so it
+# has an owning ref independent of the (non-recursively decref'd) shell.
+# Koka's `else { dup(l); dup(r); … }`. Each name resolves to its borrow
+# binding (a %KaiValue* reg); incref in place — the local keeps the same
+# reg (incref returns its arg), it just now carries an owning ref.
+fn llvm_emit_arm_shared_dups(e: LlvmEmit, names: [String]) : LlvmEmit / Console {
+  match names {
+    [] -> e
+    [nm, ...rest] -> match llvm_local_find(e.locals, nm) {
+      Some(reg) -> {
+        let d = llvm_fresh_reg(e)
+        let e_d = llvm_append_body(d.e, concat_all([
+          "  ", d.reg, " = call %KaiValue* @kaix_incref(%KaiValue* ", reg, ")\n"]))
+        llvm_emit_arm_shared_dups(e_d, rest)
+      }
+      None -> llvm_emit_arm_shared_dups(e, rest)
+    }
+  }
+}
+
+# Emit the arm-top reuse preamble (borrow binds + token capture + shared
+# dups) and return the updated emit. The TRMC step in the body then donates
+# `%_arm_ru` via `kaix_variant_at`; an unconsumed token is freed after the
+# body. Mirror of emit_c's `emit_arm_top_reuse`, adapted to the SSA/alloca
+# shape: `%_arm_ru` is the function-prologue alloca (llvm_emit_cctx_allocas).
+fn llvm_emit_arm_top_reuse(e: LlvmEmit, atr: LlvmArmTopReuse, body: Expr,
+                           scr: String) : LlvmEmit / Console {
+  match atr {
+    LlvmArmTopReuse(_, subs, tys, ptr_binders, n) -> {
+      # 1. borrow-bind the children (no incref).
+      let e_borrow = llvm_emit_arm_borrow_binds(e, subs, tys, scr, 0)
+      # 2. capture the token: %tok = kaix_drop_reuse_token(scr, n). UNIQUE
+      #    hands back the shell (children already moved into the borrows);
+      #    SHARED/MISMATCH decrefs non-recursively and returns null.
+      let tok = llvm_fresh_reg(e_borrow)
+      let e_tok = llvm_append_body(tok.e, concat_all([
+        "  ", tok.reg, " = call %KaiValue* @kaix_drop_reuse_token(%KaiValue* ", scr,
+        ", i32 ", int_to_string(n), ")\n",
+        "  store %KaiValue* ", tok.reg, ", %KaiValue** %_arm_ru\n"]))
+      # 3. SHARED branch: if the token is null, dup the kept (moved) children
+      #    so they outlive the shell's non-recursive decref. `arm_moved_binders`
+      #    reads perceus's signature off `body` (bare use = moved), in
+      #    lock-step with the C backend (no recompute).
+      let moved = arm_moved_binders(ptr_binders, body)
+      llvm_emit_arm_top_shared_guard(e_tok, tok.reg, moved)
+    }
+  }
+}
+
+# The shared-dup guard: `if (tok == null) { dups… }`. Emitted as an LLVM
+# branch around the dup block. Skipped entirely (no branch) when there are
+# no moved binders to dup.
+fn llvm_emit_arm_top_shared_guard(e: LlvmEmit, tok_reg: String, moved: [String]) : LlvmEmit / Console {
+  match moved {
+    [] -> e
+    _  -> {
+      let isnull = llvm_fresh_reg(e)
+      let dup_lbl = llvm_fresh_label(isnull.e, "armtop.shared.")
+      let cont_lbl = llvm_fresh_label(dup_lbl.e, "armtop.cont.")
+      let e_br = llvm_append_body(cont_lbl.e, concat_all([
+        "  ", isnull.reg, " = icmp eq %KaiValue* ", tok_reg, ", null\n",
+        "  br i1 ", isnull.reg, ", label %", dup_lbl.reg, ", label %", cont_lbl.reg, "\n"]))
+      let e_dup_open = llvm_open_block(e_br, dup_lbl.reg)
+      let e_dups = llvm_emit_arm_shared_dups(e_dup_open, moved)
+      let e_dup_br = llvm_append_body(e_dups, concat_all(["  br label %", cont_lbl.reg, "\n"]))
+      llvm_open_block(e_dup_br, cont_lbl.reg)
+    }
+  }
+}
+
+fn llvm_emit_match_arms_slot(e: LlvmEmit, arms: [Arm], scr_reg: String, scr_slot: String,
+                             end_lbl: String, acc: [LlvmArmEntry],
+                             scr_owned: Bool) : LlvmArmCollect / Console {
 
   match arms {
     [] -> LlvmArmCollect { e: e, entries: list_reverse(acc) }
@@ -5599,10 +5766,29 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
         # after the binds (it reads the bound names); a guard that fails
         # after binds is a known narrow gap (no guards in the rb-tree path).
         let e_test = llvm_emit_pattern_test(next_try.e, pat, scr_reg, next_try.reg)
-        let e_bound = llvm_emit_pattern_binds(e_test, pat, scr_reg)
+        # llvm-c-parity lane — arm-top reuse (ParcReuse). When the scrutinee
+        # is OWNED and this arm is the hot insert_loop shape (TRMC body +
+        # consumed PVariant with ptr binders), capture its shell as a reuse
+        # token instead of binding survivors owned + fresh-allocating. The
+        # token is donated by the TRMC step (`kaix_variant_at`) and any
+        # unconsumed token is freed after the body. When ineligible, the
+        # legacy owned-bind path runs unchanged.
+        let atr_opt = if scr_owned { llvm_try_arm_top_reuse(pat, body, e_test) } else { None }
+        let e_armtop = match atr_opt {
+          Some(atr) -> {
+            let e_at = llvm_emit_arm_top_reuse(e_test, atr, body, scr_reg)
+            # Neutralise the match-exit drop: the scrutinee shell is now a
+            # reuse token (consumed by the TRMC step, or freed bare by
+            # kaix_reuse_free on a non-consuming tail), so it must NOT also be
+            # cascade-dropped at match.end. Mirror of the C `_scr = NULL`.
+            llvm_append_body(e_at, concat_all([
+              "  store %KaiValue* null, %KaiValue** ", scr_slot, "\n"]))
+          }
+          None      -> llvm_emit_pattern_binds(e_test, pat, scr_reg)
+        }
         let e_guarded = match guard {
-          None -> e_bound
-          Some(gx) -> llvm_emit_guard_test(e_bound, gx, next_try.reg)
+          None -> e_armtop
+          Some(gx) -> llvm_emit_guard_test(e_armtop, gx, next_try.reg)
         }
         # issue #118 — bind the synthetic `__pcs_scr` local to the
         # match scrutinee register so the recogniser-emitted
@@ -5619,10 +5805,32 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
         # rebind reads its survivor children. Borrowed scrutinees get no
         # such local → the TRMC step skips the drop (symmetric with the
         # match-exit borrow gate).
-        let e_with_drop = if scr_owned {
+        #
+        # Arm-top reuse changes the contract: the token-steal already
+        # consumed the shell's ownership (kaix_drop_reuse_token UNIQUE hands
+        # the cell back as a token, SHARED rc--'d it), so the TRMC step must
+        # NOT also drop the old scrutinee — it donates the token via
+        # kaix_variant_at instead. Bind `__pcs_scr_drop` ONLY when the arm is
+        # NOT arm-top-reuse (symmetric with the C backend nulling `_scr`).
+        let e_with_drop = if scr_owned and (match atr_opt { None -> true Some(_) -> false }) {
           llvm_push_local(e_with_scr, "__pcs_scr_drop", scr_reg)
         } else { e_with_scr }
-        let eb = llvm_emit_expr(e_with_drop, body)
+        let eb0 = llvm_emit_expr(e_with_drop, body)
+        # Free an unconsumed reuse token: a tail that did not host a same-ctor
+        # `kaix_variant_at` rebuild (e.g. `balance_left(insert_loop(l,…),…,r)`)
+        # leaves `%_arm_ru` non-null. `kaix_reuse_free` frees the bare shell
+        # only (children already moved into owned binders the body still
+        # uses). A null token (consumed, or shared) is a no-op.
+        let eb = match atr_opt {
+          Some(_) -> {
+            let ld = llvm_fresh_reg(eb0)
+            llvm_append_body(ld.e, concat_all([
+              "  ", ld.reg, " = load %KaiValue*, %KaiValue** %_arm_ru\n",
+              "  call void @kaix_reuse_free(%KaiValue* ", ld.reg, ")\n",
+              "  store %KaiValue* null, %KaiValue** %_arm_ru\n"]))
+          }
+          None -> eb0
+        }
         let body_val = eb.last_val
         let body_end = eb.cur_label
         let e_br = llvm_append_body(eb, concat_all(["  br label %", end_lbl, "\n"]))
@@ -5634,8 +5842,8 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
           regions: e_br.regions, in_region: e_br.in_region
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
-        llvm_emit_match_arms(e_next, rest, scr_reg, end_lbl,
-                             [AE(body_val, body_end), ...acc], scr_owned)
+        llvm_emit_match_arms_slot(e_next, rest, scr_reg, scr_slot, end_lbl,
+                                  [AE(body_val, body_end), ...acc], scr_owned)
       }
     }
   }
@@ -5685,8 +5893,23 @@ fn llvm_emit_match_default(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: 
   }
   let es = llvm_emit_expr(e, scr)
   let scr_reg = es.last_val
-  let end_lbl = llvm_fresh_label(es, "match.end.")
-  let arm_res = llvm_emit_match_arms(end_lbl.e, arms, scr_reg, end_lbl.reg, [], scr_owned)
+  # llvm-c-parity lane — `%_pcs_scr_live` mirrors the C backend's mutable
+  # `_scr`. The match-exit decref reads THROUGH it so an arm that stole the
+  # scrutinee as a reuse token (arm-top reuse) can neutralise the exit drop
+  # by storing null — exactly the C `_scr = NULL`. Without it the exit's
+  # `kaix_internal_drop(scr_reg)` would cascade a decref into the children
+  # the arm-top MOVED into the rebuild / into balance's args (use-after-
+  # free). A fresh alloca per match keeps nested matches independent; only
+  # emitted for an owned scrutinee (a borrow has no exit drop to gate).
+  let scr_slot = llvm_fresh_reg(es)
+  let es2 = if scr_owned {
+    llvm_append_body(scr_slot.e, concat_all([
+      "  ", scr_slot.reg, " = alloca %KaiValue*\n",
+      "  store %KaiValue* ", scr_reg, ", %KaiValue** ", scr_slot.reg, "\n"]))
+  } else { es }
+  let end_lbl = llvm_fresh_label(es2, "match.end.")
+  let arm_res = llvm_emit_match_arms_slot(end_lbl.e, arms, scr_reg, scr_slot.reg,
+                                          end_lbl.reg, [], scr_owned)
   # Trailing fall-through block (the last `match.next.N`) panics.
   let msg = concat_all([
     "non-exhaustive match at ", int_to_string(line), ":", int_to_string(col)
@@ -5716,18 +5939,21 @@ fn llvm_emit_match_default(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: 
       ])
       let e_phi = llvm_append_body(phi.e, phi_instr)
       # #747 — match-exit decref of the owned scrutinee. Runs in match.end
-      # after the phi, so `scr_reg` is live through every arm's exit edge.
-      # Arms that consumed the scrutinee via reuse-in-place
-      # (`kaix_reuse_or_alloc_*`) are balanced: the runtime helper increfs
-      # `scr` on reuse precisely to survive this drop. TRMC arms br back to
-      # `tcrec.loop` and never reach match.end, so they are unaffected
-      # (the scrutinee is consumed in the loop). The phi result is never
-      # `scr_reg` without an intervening dup (perceus dups any arm read that
-      # aliases the scrutinee), so dropping `scr_reg` cannot free the result.
+      # after the phi. Read THROUGH `%_pcs_scr_live` (seeded `scr_reg`) so an
+      # arm-top reuse that stole the scrutinee as a token could have stored
+      # null there to neutralise this drop (the C `_scr = NULL`); a non-stolen
+      # scrutinee still drops normally. `kaix_internal_drop(null)` is a no-op.
+      # Arms that consumed the scrutinee via reuse-in-place are balanced; TRMC
+      # arms br back to `tcrec.loop` and never reach match.end. The phi result
+      # is never `scr_reg` without an intervening dup (perceus dups any arm
+      # read aliasing the scrutinee), so this drop cannot free the result.
       let e_drop = if scr_owned {
-        let d = llvm_fresh_reg(e_phi)
+        let ld = llvm_fresh_reg(e_phi)
+        let e_l = llvm_append_body(ld.e, concat_all([
+          "  ", ld.reg, " = load %KaiValue*, %KaiValue** ", scr_slot.reg, "\n"]))
+        let d = llvm_fresh_reg(e_l)
         llvm_append_body(d.e, concat_all([
-          "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", scr_reg, ")\n"
+          "  ", d.reg, " = call %KaiValue* @kaix_internal_drop(%KaiValue* ", ld.reg, ")\n"
         ]))
       } else { e_phi }
       llvm_set_last(e_drop, phi.reg)
@@ -7337,7 +7563,17 @@ fn llvm_emit_cctx_allocas(e: LlvmEmit) : LlvmEmit =
     "  %_kai_acc.res = alloca %KaiValue*\n",
     "  store %KaiValue* null, %KaiValue** %_kai_acc.res\n",
     "  %_kai_acc.hole = alloca %KaiValue**\n",
-    "  store %KaiValue** null, %KaiValue*** %_kai_acc.hole\n"
+    "  store %KaiValue** null, %KaiValue*** %_kai_acc.hole\n",
+    # llvm-c-parity lane — arm-top reuse token (ParcReuse). When a match
+    # arm with a TRMC body consumes a UNIQUE variant scrutinee, the arm
+    # top captures the shell as `%_arm_ru` (kaix_drop_reuse_token) and the
+    # TRMC step rebuilds INTO it (kaix_variant_at) instead of fresh-
+    # allocating. Seeded NULL each step (the arm-top block restamps it);
+    # a NULL token makes kaix_variant_at fall back to a fresh alloc, so a
+    # non-eligible loop iteration is unaffected. Lives in the entry block
+    # next to the cctx so it is visible loop-wide like `%_kai_acc.*`.
+    "  %_arm_ru = alloca %KaiValue*\n",
+    "  store %KaiValue* null, %KaiValue** %_arm_ru\n"
   ]))
 
 # Emit the per-param alloca slots in the entry block, store the
@@ -7587,13 +7823,36 @@ fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
   ])
   let e_buf = llvm_append_body(buf.e, alloc_instr)
   let e_st = llvm_emit_trmc_slot_stores(e_buf, buf.reg, ev.regs, 0)
-  let node = llvm_fresh_reg(e_st)
-  let build_instr = concat_all([
-    "  ", node.reg, " = call %KaiValue* ", llvm_variant_target(e),
-    "(i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
-    ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
-  ])
-  let e_node = llvm_append_body(node.e, build_instr)
+  # llvm-c-parity lane — donate the arm-top reuse token. `%_arm_ru` holds
+  # the UNIQUE scrutinee shell captured at the arm top (or null when the arm
+  # was not eligible / the scrutinee was shared). `kaix_variant_at(token,…)`
+  # rebuilds the new ctor INTO the donated cell in place (move semantics, no
+  # malloc), or falls back to a fresh alloc when the token is null — so a
+  # non-eligible iteration is unchanged. Consuming the token zeroes `%_arm_ru`
+  # so the post-body `kaix_reuse_free` does not free a cell we reused.
+  # Region allocation keeps the arena ctor (the arena owns the cell, not RC).
+  let node_res = if e_st.in_region {
+    let node = llvm_fresh_reg(e_st)
+    let e_node = llvm_append_body(node.e, concat_all([
+      "  ", node.reg, " = call %KaiValue* ", llvm_variant_target(e),
+      "(i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
+    ]))
+    LlvmReg { reg: node.reg, e: e_node }
+  } else {
+    let tokld = llvm_fresh_reg(e_st)
+    let e_tl = llvm_append_body(tokld.e, concat_all([
+      "  ", tokld.reg, " = load %KaiValue*, %KaiValue** %_arm_ru\n"]))
+    let node = llvm_fresh_reg(e_tl)
+    let e_b = llvm_append_body(node.e, concat_all([
+      "  ", node.reg, " = call %KaiValue* @kaix_variant_at(%KaiValue* ", tokld.reg,
+      ", i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
+      ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"]))
+    let e_z = llvm_append_body(e_b, "  store %KaiValue* null, %KaiValue** %_arm_ru\n")
+    LlvmReg { reg: node.reg, e: e_z }
+  }
+  let node = node_res
+  let e_node = node_res.e
   # --- 2. extend the cctx ---
   let old_res = llvm_fresh_reg(e_node)
   let e_lr = llvm_append_body(old_res.e,
