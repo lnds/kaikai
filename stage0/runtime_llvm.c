@@ -433,6 +433,60 @@ KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
   return r;
 }
 
+/* ---------- token-model reuse-in-place (llvm-c-parity lane) ----------
+ *
+ * The simple `kaix_reuse_or_alloc_variant` above eager-decrefs each old
+ * slot 1:1, which double-frees on a non-bijective rebuild (a recolor /
+ * rotation that moves a subtree between slots). The C backend reaches the
+ * rb-tree's reuse via a DIFFERENT, Koka-faithful protocol — the drop-
+ * reuse-token model — which the LLVM bind-site now mirrors:
+ *
+ *   1. bind the consumed variant's pointer children BORROW (no incref)
+ *      via `kaix_variant_arg_borrow`,
+ *   2. capture a reuse token once at the arm top with
+ *      `kaix_drop_reuse_token(scr, n)` — UNIQUE hands back the shell (its
+ *      children having MOVED into the borrow binds), SHARED/MISMATCH
+ *      decrefs non-recursively and returns NULL,
+ *   3. rebuild with `kaix_variant_at(token, …)` — writes the new ctor
+ *      into the donated cell IN PLACE (move semantics, no slot decref) or
+ *      falls back to a fresh alloc when the token is NULL,
+ *   4. on a tail that never consumes the token, free the bare shell with
+ *      `kaix_reuse_free(token)` (no cascade into the moved children).
+ *
+ * These are thin forwarders over the stage2 statics; all the RC subtlety
+ * lives there. `KaiReuse` is `KaiValue*` (runtime.h §reuse-token). */
+KaiReuse  kaix_drop_reuse_token(KaiValue *v, int n)      { return kai_drop_reuse_token(v, n); }
+void      kaix_reuse_free(KaiReuse at)                   { kai_reuse_free(at); }
+
+/* Borrow read of a variant pointer slot — the bind-site uses this in the
+ * UNIQUE branch so the child is moved (not duplicated) into the rebuild.
+ * Unlike `kaix_variant_arg` (which boxes typed slots and is borrow for
+ * pointer slots per #747), this is the plain pointer-slot borrow the
+ * token model needs; the LLVM backend only ever lays mask==0 pointer
+ * slots, so the raw `.ptr` read is the borrow. */
+KaiValue *kaix_variant_arg_borrow(KaiValue *v, int i)   { return kai_var_slots(v)[i].ptr; }
+
+/* Rebuild-in-place over a donated token. Same boxed-args bridge as
+ * `kaix_variant`: the LLVM emit hands KaiValue** for boxed args (Ints are
+ * tagged immediates stored straight into mask==0 `.ptr` slots), stamp the
+ * slot-mask shape with mask==0 and forward. A NULL token falls through to
+ * a fresh `kai_variant_u` inside `kai_variant_at`. */
+KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name,
+                          int n, KaiValue **args) {
+  if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
+  KaiVarSlot stack_slots[16];
+  KaiVarSlot *slots = stack_slots;
+  KaiVarSlot *heap = NULL;
+  if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+    heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    slots = heap;
+  }
+  for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+  KaiValue *r = kai_variant_at(at, tag, name, n, 0, slots);
+  if (heap) free(heap);
+  return r;
+}
+
 /* Used by lambda thunks to read their captured values from the
    closure's self parameter. i is the capture's index. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
