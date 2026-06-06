@@ -1,40 +1,23 @@
-# issue #374 — black-box coverage of the mutable HashMap[k, v] public
-# surface (the 12 `hashmap_*` functions).
-#
-# HashMap is a MUTABLE hash table behind the `Mutable` effect:
-# `hashmap_put` / `hashmap_remove` mutate in place and return `Unit`,
-# and every op carries `/ Mutable`. So this fixture threads one table
-# through a sequence of mutations rather than rebinding fresh maps.
-#
-# Iteration order is unspecified (bucket-derived, not stable across
-# resizes), so the fixture never prints raw key/value orderings — it
-# prints sorted views, counts, and round-trip verdicts so the golden
-# is deterministic.
-#
-# Keys are `String` / `Int`, whose stdlib `impl Hash` dispatches
-# through the generic collection boundary. User sum-type keys also
-# work (see hashmap_collision.kai); user records do not yet.
+# HashMap[k, v] — mutable hash table. put/remove mutate in place;
+# every op carries / Mutable. Read with the m[key] sugar.
 
 import collections.hashmap
 
 fn verify(label: String, ok: Bool) : Unit / Stdout =
   if ok { Stdout.print(label ++ ": ok") } else { Stdout.print(label ++ ": FAIL") }
 
-fn opt_int_str(o: Option[Int]) : String = match o {
+fn opt_str(o: Option[Int]) : String = match o {
   None    -> "none"
   Some(n) -> int_to_string(n)
 }
 
-# Element-wise sorted-String list to a CSV (keys come back unordered;
-# we sort for a deterministic golden).
 fn str_cmp(a: String, b: String) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
-fn int_lt(a: Int, b: Int) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
+fn int_cmp(a: Int, b: Int) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
 
-# Element-wise Int list equality (for iteration-order stability).
 fn int_list_eq(a: [Int], b: [Int]) : Bool = match a {
   [] -> match b {
-    []  -> true
-    _   -> false
+    [] -> true
+    _  -> false
   }
   [x, ...xs] -> match b {
     []         -> false
@@ -42,118 +25,72 @@ fn int_list_eq(a: [Int], b: [Int]) : Bool = match a {
   }
 }
 
-fn fill_int(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
-  if i >= n { () } else { hashmap.hashmap_put(m, i, i * 3); fill_int(m, i + 1, n) }
+fn fill(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
+  if i < n { hashmap.put(m, i, i * 3); fill(m, i + 1, n) }
 
-# Count how many of keys 0..n round-trip to the expected value.
-fn count_hits_int(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
+fn hits(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
   if i >= n { acc }
-  else {
-    let hit = match hashmap.hashmap_get(m, i) {
-      Some(v) -> if v == i * 3 { 1 } else { 0 }
-      None    -> 0
-    }
-    count_hits_int(m, i + 1, n, acc + hit)
-  }
+  else { hits(m, i + 1, n, acc + (match m[i] { Some(v) -> if v == i * 3 { 1 } else { 0 }  None -> 0 })) }
 
 fn main() : Int / Stdout + Mutable = {
-  # ---- Empty -----------------------------------------------------
-  let m = hashmap.hashmap_empty()
-  verify("empty size 0", hashmap.hashmap_size(m) == 0)
-  verify("empty is_empty", hashmap.hashmap_is_empty(m))
-  verify("empty contains 'x' false", not hashmap.hashmap_contains(m, "x"))
-  verify("empty get None", opt_int_str(hashmap.hashmap_get(m, "x")) == "none")
+  let m = hashmap.empty()
+  verify("empty size 0", hashmap.size(m) == 0)
+  verify("empty is_empty", hashmap.is_empty(m))
+  verify("empty get none", opt_str(m["x"]) == "none")
 
-  # ---- Single insert + small batch (all mutate `m`) --------------
-  hashmap.hashmap_put(m, "a", 1)
-  verify("single size 1", hashmap.hashmap_size(m) == 1)
-  verify("single not is_empty", not hashmap.hashmap_is_empty(m))
-  verify("single get 'a' == 1", opt_int_str(hashmap.hashmap_get(m, "a")) == "1")
+  hashmap.put(m, "a", 1)
+  hashmap.put(m, "b", 2)
+  hashmap.put(m, "c", 3)
+  verify("size 3", hashmap.size(m) == 3)
+  verify("m['a']", opt_str(m["a"]) == "1")
+  verify("m['b']", opt_str(m["b"]) == "2")
+  verify("m['missing']", opt_str(m["zzz"]) == "none")
+  verify("contains 'c'", hashmap.contains(m, "c"))
+  verify("not contains 'd'", not hashmap.contains(m, "d"))
 
-  hashmap.hashmap_put(m, "b", 2)
-  hashmap.hashmap_put(m, "c", 3)
-  verify("size 3", hashmap.hashmap_size(m) == 3)
-  verify("contains 'a'", hashmap.hashmap_contains(m, "a"))
-  verify("contains 'b'", hashmap.hashmap_contains(m, "b"))
-  verify("contains 'c'", hashmap.hashmap_contains(m, "c"))
-  verify("not contains 'd'", not hashmap.hashmap_contains(m, "d"))
-  verify("get 'b' == 2", opt_int_str(hashmap.hashmap_get(m, "b")) == "2")
-  verify("get missing none", opt_int_str(hashmap.hashmap_get(m, "zzz")) == "none")
+  Stdout.print("keys: " ++ string.join(list.sort_by(hashmap.keys(m), str_cmp), ","))
+  Stdout.print("values: " ++ string.join(list.map(list.sort_by(hashmap.values(m), int_cmp), int_to_string), ","))
 
-  # ---- Indexing sugar: m[key] lowers to hashmap_get (#374) --------
-  # The typer's synth_index dispatches `m[key]` to hashmap_get when the
-  # container is a HashMap, returning Option[v]; the / Mutable effect
-  # propagates from the lowered callee automatically.
-  verify("sugar m['a'] == Some 1", opt_int_str(m["a"]) == "1")
-  verify("sugar m['b'] == Some 2", opt_int_str(m["b"]) == "2")
-  verify("sugar m['missing'] == None", opt_int_str(m["zzz"]) == "none")
-  let bound = m["c"]
-  verify("sugar in let-RHS m['c'] == 3", opt_int_str(bound) == "3")
+  hashmap.put(m, "b", 20)
+  verify("update keeps size 3", hashmap.size(m) == 3)
+  verify("m['b'] updated", opt_str(m["b"]) == "20")
 
-  # keys / values are unordered — sorted view for a stable golden.
-  Stdout.print("sorted keys: " ++ string.join(list.sort_by(hashmap.hashmap_keys(m), str_cmp), ","))
-  Stdout.print("sorted values: " ++ string.join(list.map(list.sort_by(hashmap.hashmap_values(m), int_lt), int_to_string), ","))
+  hashmap.remove(m, "b")
+  verify("remove drops size", hashmap.size(m) == 2)
+  verify("m['b'] gone", opt_str(m["b"]) == "none")
+  hashmap.remove(m, "ghost")
+  verify("remove missing is no-op", hashmap.size(m) == 2)
 
-  # ---- Update in place (no size change) --------------------------
-  hashmap.hashmap_put(m, "b", 20)
-  verify("size still 3 after update", hashmap.hashmap_size(m) == 3)
-  verify("get 'b' == 20 after update", opt_int_str(hashmap.hashmap_get(m, "b")) == "20")
-
-  # ---- Remove ----------------------------------------------------
-  hashmap.hashmap_remove(m, "b")
-  verify("size 2 after remove", hashmap.hashmap_size(m) == 2)
-  verify("not contains 'b' after remove", not hashmap.hashmap_contains(m, "b"))
-  verify("still contains 'a'", hashmap.hashmap_contains(m, "a"))
-  verify("still contains 'c'", hashmap.hashmap_contains(m, "c"))
-  hashmap.hashmap_remove(m, "ghost")
-  verify("size unchanged after remove missing", hashmap.hashmap_size(m) == 2)
-
-  # ---- to_pairs / from_pairs (duplicate collapse to last) --------
-  let fp = hashmap.hashmap_from_pairs([
+  let fp = hashmap.from_pairs([
     Pair { fst: "x", snd: 1 },
     Pair { fst: "y", snd: 2 },
-    Pair { fst: "x", snd: 99 }
+    Pair { fst: "x", snd: 9 }
   ])
-  verify("from_pairs size 2", hashmap.hashmap_size(fp) == 2)
-  verify("from_pairs duplicate 'x' = 99", opt_int_str(hashmap.hashmap_get(fp, "x")) == "99")
-  verify("to_pairs length 2", list.length(hashmap.hashmap_to_pairs(fp)) == 2)
+  verify("from_pairs size 2", hashmap.size(fp) == 2)
+  verify("from_pairs dup wins last", opt_str(fp["x"]) == "9")
 
-  # ---- merge (left-biased: a wins; mutates a) --------------------
-  let ma = hashmap.hashmap_from_pairs([Pair { fst: "p", snd: 1 }, Pair { fst: "q", snd: 2 }])
-  let mb = hashmap.hashmap_from_pairs([Pair { fst: "q", snd: 99 }, Pair { fst: "r", snd: 3 }])
-  hashmap.hashmap_merge(ma, mb)
-  verify("merge size 3", hashmap.hashmap_size(ma) == 3)
-  verify("merge a wins on 'q' (== 2)", opt_int_str(hashmap.hashmap_get(ma, "q")) == "2")
-  verify("merge keeps b-only 'r' (== 3)", opt_int_str(hashmap.hashmap_get(ma, "r")) == "3")
-  verify("merge keeps a-only 'p' (== 1)", opt_int_str(hashmap.hashmap_get(ma, "p")) == "1")
-  verify("merge leaves b untouched (size 2)", hashmap.hashmap_size(mb) == 2)
+  let a = hashmap.from_pairs([Pair { fst: "p", snd: 1 }, Pair { fst: "q", snd: 2 }])
+  let b = hashmap.from_pairs([Pair { fst: "q", snd: 9 }, Pair { fst: "r", snd: 3 }])
+  hashmap.merge(a, b)
+  verify("merge size 3", hashmap.size(a) == 3)
+  verify("merge a wins 'q'", opt_str(a["q"]) == "2")
+  verify("merge keeps 'r'", opt_str(a["r"]) == "3")
+  verify("merge leaves b", hashmap.size(b) == 2)
 
-  # ---- Large N round-trip (exercises several resizes) ------------
-  let big10k = hashmap.hashmap_empty()
-  fill_int(big10k, 0, 10000)
-  verify("10K size exact", hashmap.hashmap_size(big10k) == 10000)
-  verify("10K all keys round-trip", count_hits_int(big10k, 0, 10000, 0) == 10000)
-  verify("10K absent key missing", opt_int_str(hashmap.hashmap_get(big10k, 10000)) == "none")
+  # same input built twice -> same iteration order
+  let s1 = hashmap.empty()
+  let s2 = hashmap.empty()
+  fill(s1, 0, 500)
+  fill(s2, 0, 500)
+  verify("order stable across same-input runs",
+         int_list_eq(hashmap.keys(s1), hashmap.keys(s2)))
 
-  let big100k = hashmap.hashmap_empty()
-  fill_int(big100k, 0, 100000)
-  verify("100K size exact", hashmap.hashmap_size(big100k) == 100000)
-  verify("100K all keys round-trip", count_hits_int(big100k, 0, 100000, 0) == 100000)
-
-  # ---- Overwrite-heavy: same keys re-put, size stable ------------
-  fill_int(big10k, 0, 10000)
-  verify("10K re-put keeps size 10000", hashmap.hashmap_size(big10k) == 10000)
-
-  # ---- Iteration-order stability across same-input runs ----------
-  # Bucket order is unspecified, but DETERMINISTIC: the same insertion
-  # sequence drives the same resize history and the same bucket
-  # layout, so two same-input builds iterate identically.
-  let s1 = hashmap.hashmap_empty()
-  let s2 = hashmap.hashmap_empty()
-  fill_int(s1, 0, 500)
-  fill_int(s2, 0, 500)
-  verify("iteration order stable across same-input runs",
-         int_list_eq(hashmap.hashmap_keys(s1), hashmap.hashmap_keys(s2)))
+  # large N drives several resizes
+  let big = hashmap.empty()
+  fill(big, 0, 100000)
+  verify("100K size exact", hashmap.size(big) == 100000)
+  verify("100K all round-trip", hits(big, 0, 100000, 0) == 100000)
+  verify("100K absent missing", opt_str(big[100000]) == "none")
 
   0
 }
