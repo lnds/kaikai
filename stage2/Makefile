@@ -271,7 +271,7 @@ test-llvm: $(TARGET) build
 	for name in $(LLVM_MIN_EXAMPLES); do \
 	  f=../examples/minimal/$$name.kai; \
 	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
-	  clang -w -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
+	  clang -w -I ../stage2 -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
 	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
 	  ./$(TARGET) $$f > build/llvm-$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
@@ -283,7 +283,7 @@ test-llvm: $(TARGET) build
 	for name in $(LLVM_EXAMPLES); do \
 	  f=../examples/llvm/$$name.kai; \
 	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
-	  clang -w -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
+	  clang -w -I ../stage2 -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
 	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
 	  ./$(TARGET) $$f > build/llvm-$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
@@ -369,7 +369,7 @@ test-llvm-coverage: $(TARGET) build
 	      || { echo "coverage SKIP $$tag (C run errored)"; skip=$$((skip+1)); continue; }; \
 	    ./$(TARGET) --emit=llvm $$f > build/cov-$$d-$$name.ll 2>/dev/null \
 	      || { echo "coverage SKIP $$tag (kaic2 --emit=llvm errored)"; skip=$$((skip+1)); continue; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/cov-$$d-$$name.ll ../stage0/runtime_llvm.c -o build/cov-$$d-$$name-llvm 2>/dev/null $(LDLIBS_M) \
+	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/cov-$$d-$$name.ll ../stage0/runtime_llvm.c -o build/cov-$$d-$$name-llvm 2>/dev/null $(LDLIBS_M) \
 	      || { echo "coverage SKIP $$tag (LLVM compile failed)"; skip=$$((skip+1)); continue; }; \
 	    ./build/cov-$$d-$$name-llvm > build/cov-$$d-$$name-llvm.out 2>/dev/null \
 	      || { echo "coverage SKIP $$tag (LLVM run errored)"; skip=$$((skip+1)); continue; }; \
@@ -399,7 +399,7 @@ test-modules: $(TARGET) build
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules.c -o build/modules-c $(LDLIBS_M) ; \
 	./build/modules-c > build/modules-c.out; \
 	./$(TARGET) --emit=llvm ../examples/modules/main.kai > build/modules.ll; \
-	clang -w -I ../stage0 build/modules.ll ../stage0/runtime_llvm.c -o build/modules-llvm $(LDLIBS_M) ; \
+	clang -w -I ../stage2 -I ../stage0 build/modules.ll ../stage0/runtime_llvm.c -o build/modules-llvm $(LDLIBS_M) ; \
 	./build/modules-llvm > build/modules-llvm.out; \
 	diff -q build/modules-c.out build/modules-llvm.out > /dev/null \
 	  && echo "modules OK" \
@@ -434,7 +434,7 @@ test-modules-qualified: $(TARGET) build
 	    || { echo "modules-qualified FAIL $$d (run C)"; exit 1; }; \
 	  ./$(TARGET) --emit=llvm $$src > build/mq-$$d.ll \
 	    || { echo "modules-qualified FAIL $$d (kaic2 --emit=llvm)"; exit 1; }; \
-	  clang -w -I ../stage0 build/mq-$$d.ll ../stage0/runtime_llvm.c -o build/mq-$$d-llvm $(LDLIBS_M) \
+	  clang -w -I ../stage2 -I ../stage0 build/mq-$$d.ll ../stage0/runtime_llvm.c -o build/mq-$$d-llvm $(LDLIBS_M) \
 	    || { echo "modules-qualified FAIL $$d (clang)"; exit 1; }; \
 	  ./build/mq-$$d-llvm > build/mq-$$d-llvm.out \
 	    || { echo "modules-qualified FAIL $$d (run LLVM)"; exit 1; }; \
@@ -606,7 +606,7 @@ test-modules-path: $(TARGET) build
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules-path.c -o build/modules-path-c $(LDLIBS_M) ; \
 	./build/modules-path-c > build/modules-path-c.out; \
 	./$(TARGET) --path $$LIB --emit=llvm $$MAIN > build/modules-path.ll; \
-	clang -w -I ../stage0 build/modules-path.ll ../stage0/runtime_llvm.c -o build/modules-path-llvm $(LDLIBS_M) ; \
+	clang -w -I ../stage2 -I ../stage0 build/modules-path.ll ../stage0/runtime_llvm.c -o build/modules-path-llvm $(LDLIBS_M) ; \
 	./build/modules-path-llvm > build/modules-path-llvm.out; \
 	diff -q build/modules-path-c.out build/modules-path-llvm.out > /dev/null \
 	  || { echo "modules-path DIFF"; diff build/modules-path-c.out build/modules-path-llvm.out; exit 1; }; \
@@ -695,7 +695,7 @@ test-ffi-extern-c: $(TARGET) build
 	  && echo "ffi-extern-c OK (C backend)" \
 	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }; \
 	./$(TARGET) --emit=llvm ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.ll; \
-	clang -w -I ../stage0 build/ffi_extern_c_basic.ll ../stage0/runtime_llvm.c -o build/ffi_extern_c_basic-llvm $(LDLIBS_M) ; \
+	clang -w -I ../stage2 -I ../stage0 build/ffi_extern_c_basic.ll ../stage0/runtime_llvm.c -o build/ffi_extern_c_basic-llvm $(LDLIBS_M) ; \
 	./build/ffi_extern_c_basic-llvm > build/ffi_extern_c_basic-llvm.out; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out > /dev/null \
 	  && echo "ffi-extern-c OK (LLVM backend)" \
@@ -736,7 +736,7 @@ test-issue-260-261-extern-c-fn: $(TARGET) build
 	    && echo "$$f OK (C backend)" \
 	    || { echo "$$f DIFF (C backend)"; diff $$exp build/$$f.out; exit 1; }; \
 	  ./$(TARGET) --emit=llvm $$src > build/$$f.ll; \
-	  clang -w -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-llvm $(LDLIBS_M) ; \
+	  clang -w -I ../stage2 -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-llvm $(LDLIBS_M) ; \
 	  ./build/$$f-llvm > build/$$f.out.llvm; \
 	  diff -q $$exp build/$$f.out.llvm > /dev/null \
 	    && echo "$$f OK (LLVM backend)" \
@@ -775,7 +775,7 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 	./$(TARGET) --emit=llvm --path ../examples/effects/ffi_pub_axiom_cross_module \
 	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
 	  > build/ffi_pub_axiom_cross_module.ll; \
-	clang -w -I ../stage0 build/ffi_pub_axiom_cross_module.ll \
+	clang -w -I ../stage2 -I ../stage0 build/ffi_pub_axiom_cross_module.ll \
 	  ../stage0/runtime_llvm.c -o build/ffi_pub_axiom_cross_module-llvm $(LDLIBS_M); \
 	./build/ffi_pub_axiom_cross_module-llvm > build/ffi_pub_axiom_cross_module-llvm.out; \
 	diff -q ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
@@ -898,7 +898,7 @@ test-issue-524: $(TARGET) build
 	./$(TARGET) --emit=llvm --path ../stdlib \
 	            ../examples/stdlib/fs_file_bytes_qualified.kai \
 	            > build/fs_file_bytes_qualified.ll; \
-	clang -w -I ../stage0 build/fs_file_bytes_qualified.ll \
+	clang -w -I ../stage2 -I ../stage0 build/fs_file_bytes_qualified.ll \
 	      ../stage0/runtime_llvm.c -o build/fs_file_bytes_qualified-llvm $(LDLIBS_M); \
 	./build/fs_file_bytes_qualified-llvm > build/fs_file_bytes_qualified-llvm.out; \
 	diff -q ../examples/stdlib/fs_file_bytes_qualified.out.expected \
@@ -1118,7 +1118,7 @@ test-issue-743: $(TARGET) build
 	  && echo "issue-743 OK $$pos (C)" \
 	  || { echo "issue-743 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
 	./$(TARGET) --emit=llvm ../examples/effects/$$pos.kai > build/$$pos.ll; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.ll ../stage0/runtime_llvm.c -o build/$$pos-llvm 2>/dev/null $(LDLIBS_M); \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/$$pos.ll ../stage0/runtime_llvm.c -o build/$$pos-llvm 2>/dev/null $(LDLIBS_M); \
 	./build/$$pos-llvm > build/$$pos-llvm.out; \
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos-llvm.out > /dev/null \
 	  && echo "issue-743 OK $$pos (LLVM)" \
@@ -1634,7 +1634,7 @@ test-holes: $(TARGET) build
 	    echo "holes FAIL $$name (C backend aborted without hole message)"; cat build/$$name-holes-c.out; exit 1; \
 	  fi; \
 	  ./$(TARGET) --emit=llvm $$f > build/$$name-holes.ll; \
-	  clang -w -I ../stage0 build/$$name-holes.ll ../stage0/runtime_llvm.c -o build/$$name-holes-llvm $(LDLIBS_M) ; \
+	  clang -w -I ../stage2 -I ../stage0 build/$$name-holes.ll ../stage0/runtime_llvm.c -o build/$$name-holes-llvm $(LDLIBS_M) ; \
 	  lrc=0; ./build/$$name-holes-llvm > build/$$name-holes-llvm.out 2>&1 || lrc=$$?; \
 	  if [ $$lrc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-llvm.out; then \
 	    echo "holes FAIL $$name (LLVM backend aborted without hole message)"; cat build/$$name-holes-llvm.out; exit 1; \
@@ -2599,7 +2599,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (LLVM in_dispatch_enter missing — bug #12 LLVM mirror regressed?)"; exit 1; }; \
 	  test "$$enter_count" = "$$leave_count" \
 	    || { echo "effects FAIL $$name (LLVM in_dispatch invariant broken: $$enter_count enter vs $$leave_count leave)"; exit 1; }; \
-	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
+	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (LLVM link failed)"; exit 1; }; \
 	  ./build/s2-$$name-llvm \
 	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C+LLVM))" \
@@ -2665,7 +2665,7 @@ test-effects: $(TARGET) build
 	        || { echo "effects DIFF $$name (C)"; diff $$exp_out build/s2-$$name.out; exit 1; }; \
 	      ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll \
 	        || { echo "effects FAIL $$name (LLVM errored)"; exit 1; }; \
-	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
+	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
 	        || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	      ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
 	        || { echo "effects FAIL $$name (LLVM run errored)"; exit 1; }; \
@@ -2810,7 +2810,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	  ./$(TARGET) --emit=llvm --path ../stdlib $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
 	    || { echo "effects FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
-	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
+	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out 2>&1 \
 	    || { echo "effects FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
@@ -3170,7 +3170,7 @@ test-protocols: $(TARGET) build
 	        || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
 	      ./$(TARGET) --emit=llvm $$f > build/p2-$$name.ll \
 	        || { echo "protocols FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/p2-$$name.ll ../stage0/runtime_llvm.c -o build/p2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
+	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/p2-$$name.ll ../stage0/runtime_llvm.c -o build/p2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
 	        || { echo "protocols FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	      ./build/p2-$$name-llvm > build/p2-$$name-llvm.out \
 	        || { echo "protocols FAIL $$name (LLVM run errored)"; cat build/p2-$$name-llvm.out; exit 1; }; \
@@ -3276,7 +3276,7 @@ test-m4c: $(TARGET) build
 	    || { echo "m4c FAIL $$name (C binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
 	    || { echo "m4c FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
-	  clang -w -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
+	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
 	    || { echo "m4c FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
 	    || { echo "m4c FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
@@ -3342,7 +3342,7 @@ selfhost: $(TARGET) build
 selfhost-llvm: $(TARGET) build
 	@$(STACK) set -e; \
 	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
-	clang -w $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
+	clang -w $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
 	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
 	diff -q build/kaic2-s1.ll build/kaic2-s2.ll > /dev/null \
 	  && echo "llvm selfhost determinism: OK (s1.ll == s2.ll)" \
@@ -3382,7 +3382,7 @@ test-demos-core: $(TARGET) build
 	    || { echo "demos-core DIFF $$name (C)"; diff $$exp build/demo-$$name.out; exit 1; }; \
 	  ./$(TARGET) --emit=llvm $$preludes $$src > build/demo-$$name.ll \
 	    || { echo "demos-core FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/demo-$$name.ll ../stage0/runtime_llvm.c -o build/demo-$$name-llvm 2>/dev/null $(LDLIBS_M) \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/demo-$$name.ll ../stage0/runtime_llvm.c -o build/demo-$$name-llvm 2>/dev/null $(LDLIBS_M) \
 	    || { echo "demos-core FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	  if [ -f $$in ]; then \
 	    ./build/demo-$$name-llvm < $$in > build/demo-$$name-llvm.out \
@@ -3423,7 +3423,7 @@ test-aspirational: $(TARGET) build
 	    || { echo "aspirational DIFF $$name (C)"; diff $$exp build/asp-$$name.out; exit 1; }; \
 	  ./$(TARGET) --emit=llvm $$preludes $$src > build/asp-$$name.ll \
 	    || { echo "aspirational FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/asp-$$name.ll ../stage0/runtime_llvm.c -o build/asp-$$name-llvm 2>/dev/null $(LDLIBS_M) \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/asp-$$name.ll ../stage0/runtime_llvm.c -o build/asp-$$name-llvm 2>/dev/null $(LDLIBS_M) \
 	    || { echo "aspirational FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	  ./build/asp-$$name-llvm > build/asp-$$name-llvm.out \
 	    || { echo "aspirational FAIL $$name (LLVM run errored)"; cat build/asp-$$name-llvm.out; exit 1; }; \
@@ -3774,7 +3774,7 @@ test-tco-llvm-706: $(TARGET) build
 	  || { echo "tco-llvm-706 FAIL (no tcrec.loop header in @kai_loop IR — sentinel not lowered)"; cat build/tco-706.loop; exit 1; }; \
 	grep -F -q 'br label %tcrec.loop' build/tco-706.loop \
 	  || { echo "tco-llvm-706 FAIL (no back-edge br to %tcrec.loop)"; cat build/tco-706.loop; exit 1; }; \
-	clang -w -I ../stage0 build/tco-706.ll ../stage0/runtime_llvm.c -o build/tco-706-llvm $(LDLIBS_M) \
+	clang -w -I ../stage2 -I ../stage0 build/tco-706.ll ../stage0/runtime_llvm.c -o build/tco-706-llvm $(LDLIBS_M) \
 	  || { echo "tco-llvm-706 FAIL (clang rejected the IR)"; exit 1; }; \
 	./build/tco-706-llvm > build/tco-706-llvm.out; lrc=$$?; \
 	[ "$$lrc" = "0" ] || { echo "tco-llvm-706 FAIL (LLVM binary exit $$lrc — stack overflow regressed?)"; exit 1; }; \
@@ -3804,7 +3804,7 @@ test-tco-llvm-709: $(TARGET) build
 	exp=../examples/perceus/tco_accumulator_no_leak.out.expected; \
 	./$(TARGET) --emit=llvm $$src > build/tco-709.ll \
 	  || { echo "tco-llvm-709 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage0 build/tco-709.ll ../stage0/runtime_llvm.c -o build/tco-709-llvm $(LDLIBS_M) \
+	clang -w -I ../stage2 -I ../stage0 build/tco-709.ll ../stage0/runtime_llvm.c -o build/tco-709-llvm $(LDLIBS_M) \
 	  || { echo "tco-llvm-709 FAIL (clang rejected the IR)"; exit 1; }; \
 	./build/tco-709-llvm > build/tco-709-llvm.out; \
 	diff -q $$exp build/tco-709-llvm.out > /dev/null \
@@ -3812,7 +3812,7 @@ test-tco-llvm-709: $(TARGET) build
 	for N in 1000 100000; do \
 	  sed "s/loop(1000, 0)/loop($$N, 0)/" $$src > build/tco-709-$$N.kai; \
 	  ./$(TARGET) --emit=llvm build/tco-709-$$N.kai > build/tco-709-$$N.ll; \
-	  clang -w -I ../stage0 build/tco-709-$$N.ll ../stage0/runtime_llvm.c -o build/tco-709-$$N-llvm $(LDLIBS_M); \
+	  clang -w -I ../stage2 -I ../stage0 build/tco-709-$$N.ll ../stage0/runtime_llvm.c -o build/tco-709-$$N-llvm $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 ./build/tco-709-$$N-llvm > /dev/null 2> build/tco-709-$$N.rc; \
 	  eval "leaked_$$N=$$(grep -oE 'leaked=[0-9]+' build/tco-709-$$N.rc | head -1 | cut -d= -f2)"; \
 	done; \
@@ -3838,7 +3838,7 @@ test-tco-llvm-mixed: $(TARGET) build
 	  || { echo "tco-llvm-mixed FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
 	grep -F -q 'define %KaiValue* @kai_build(i64 %pargr_i, i64 %pargr_n, %KaiValue* %parg_acc)' build/tco-mixed.ll \
 	  || { echo "tco-llvm-mixed FAIL (boxed acc param not %KaiValue* in signature — mask ignored)"; grep 'define.*@kai_build' build/tco-mixed.ll; exit 1; }; \
-	clang -w -I ../stage0 build/tco-mixed.ll ../stage0/runtime_llvm.c -o build/tco-mixed-llvm $(LDLIBS_M) \
+	clang -w -I ../stage2 -I ../stage0 build/tco-mixed.ll ../stage0/runtime_llvm.c -o build/tco-mixed-llvm $(LDLIBS_M) \
 	  || { echo "tco-llvm-mixed FAIL (clang rejected the IR)"; exit 1; }; \
 	./build/tco-mixed-llvm > build/tco-mixed-llvm.out; \
 	diff -q $$exp build/tco-mixed-llvm.out > /dev/null \
@@ -4540,7 +4540,7 @@ test-unbox-llvm-bench: $(TARGET) build
 	@set -e; \
 	./$(TARGET) --emit=llvm ../examples/perceus/unbox_bench.kai > build/unbox-bench.ll \
 	  || { echo "unbox-llvm-bench FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage0 build/unbox-bench.ll ../stage0/runtime_llvm.c -o build/unbox-bench-llvm $(LDLIBS_M) \
+	clang -w -I ../stage2 -I ../stage0 build/unbox-bench.ll ../stage0/runtime_llvm.c -o build/unbox-bench-llvm $(LDLIBS_M) \
 	  || { echo "unbox-llvm-bench FAIL (clang errored — IR ill-formed?)"; exit 1; }
 	@# Acceptance grep — `pure_chain` body must contain raw IR
 	@# arithmetic and must NOT contain boxed `kaix_*` arithmetic
@@ -4590,7 +4590,7 @@ test-issue-747: $(TARGET) build
 	@set -e; \
 	./$(TARGET) --path ../stdlib --emit=llvm ../examples/perceus/llvm_rc_nested_match.kai > build/issue747.ll \
 	  || { echo "issue-747 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-llvm $(LDLIBS_M) \
+	clang -w -I ../stage2 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-llvm $(LDLIBS_M) \
 	  || { echo "issue-747 FAIL (clang errored — IR ill-formed?)"; exit 1; }; \
 	./build/issue747-llvm > build/issue747-llvm.out \
 	  || { echo "issue-747 FAIL (LLVM binary errored at runtime)"; exit 1; }; \
@@ -4604,7 +4604,7 @@ test-issue-747: $(TARGET) build
 	diff -q build/issue747-c.out build/issue747-llvm.out > /dev/null \
 	  || { echo "issue-747 FAIL (C vs LLVM output diverged):"; \
 	       diff build/issue747-c.out build/issue747-llvm.out; exit 1; }; \
-	clang -w -DKAI_TRACE_RC=1 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-trace $(LDLIBS_M) \
+	clang -w -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-trace $(LDLIBS_M) \
 	  || { echo "issue-747 FAIL (trace build errored)"; exit 1; }; \
 	KAI_TRACE_RC=1 ./build/issue747-trace 2> build/issue747-trace.err > /dev/null; \
 	live=$$(grep 'tag=variant allocs' build/issue747-trace.err | grep -oE 'live=[0-9]+' | grep -oE '[0-9]+'); \
@@ -4826,7 +4826,7 @@ test-violations: $(TARGET) build
 	  rc=0; ./build/viol-$$name > build/viol-$$name.out 2> build/viol-$$name.err || rc=$$?; \
 	  ./$(TARGET) --emit=llvm $$f > build/viol-$$name.ll \
 	    || { echo "violations FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  clang -w -I ../stage0 build/viol-$$name.ll ../stage0/runtime_llvm.c -o build/viol-$$name-llvm $(LDLIBS_M) \
+	  clang -w -I ../stage2 -I ../stage0 build/viol-$$name.ll ../stage0/runtime_llvm.c -o build/viol-$$name-llvm $(LDLIBS_M) \
 	    || { echo "violations FAIL $$name (LLVM compile failed)"; exit 1; }; \
 	  lrc=0; ./build/viol-$$name-llvm > build/viol-$$name-llvm.out 2> build/viol-$$name-llvm.err || lrc=$$?; \
 	  if [ -f $$exp_run_err ]; then \
