@@ -118,7 +118,16 @@ chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
 
 # Runtime header + LLVM-path runtime shim (L1+ LLVM-direct).
-cp stage0/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
+# The shipped compiler is stage2/kaic2, whose emitted C calls kai_intf,
+# kai_is_int and the reuse-token helpers that ONLY live in
+# stage2/runtime.h (the tagged-Int Koka runtime). bin/kai documents the
+# installed layout as carrying "a single runtime.h (the stage 2 one)".
+# Shipping stage0/runtime.h here was a latent bug from the script's first
+# commit: the C smoke test passes whenever the smoke source never touches
+# the tagged-Int path, and fails (undeclared kai_intf) the moment a
+# kai.toml project pulls in stdlib that does — which is why releases have
+# failed intermittently since stage2 became the compiler.
+cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 
 # Metadata.
