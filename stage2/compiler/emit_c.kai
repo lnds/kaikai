@@ -6783,9 +6783,13 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         let body_lcs = list_append(cx.lcs, fn_param_names(params))
         # Same-module preference: when this DFn lives in a module,
         # rotate the EFn table so entries from that same module come
-        # first. `efn_resolve`'s ambiguous-fallback returns the first
-        # match, so a recursive call inside `loop.repeat` resolves
-        # to `loop.repeat` even when `list.repeat` is also in scope.
+        # first AND prune any root-file shadow of a name the module
+        # redefines (#748). The rotation lets a recursive call inside
+        # `loop.repeat` resolve to `loop.repeat` over a sibling
+        # `list.repeat`; the prune is what stops `efn_pick_root` from
+        # grabbing the USER's `fn sum` shadow for `list.sum`'s internal
+        # `sum(t)` — so the self-call mangles to `kai_list__sum`, the
+        # user's stays `kai_sum`, and the two link cleanly.
         let body_fns = fns_prefer_module(cx.fns, mo)
         # Body sees the extended lexical scope and the module-rotated
         # EFn table; the other three context fields are unchanged.
@@ -9023,6 +9027,219 @@ fn interp_part_to_expr(p: IPart, op_names: [String], op_arities: [OpAr],
               line, col)
     }
   }
+}
+
+# ====================================================================
+# Separate compilation (issue #748): per-module .h/.c emission.
+# ====================================================================
+#
+# `emit_program` (below) is the single-translation-unit path — the
+# default, and the ONLY path the bootstrap / selfhost chain exercises,
+# so it stays byte-identical. `emit_program_modular` is the additive
+# opt-in path used by `kai build` on USER programs (driver flag
+# `--emit=c-modular`). It reuses every section emitter unchanged but
+# PARTITIONS `decls` by module-origin (`mo`) and emits, per module, a
+# `.c` translation unit; plus two shared headers every `.c` includes:
+#
+#   kai_types.h  — `#include "runtime.h"` + ALL struct/typedef/effect-
+#                  env definitions. Shared because a monomorphic spec of
+#                  a stdlib generic instantiated at a USER type
+#                  references both modules' structs — types cannot be
+#                  partitioned (GHC/Koka precedent).
+#   kai_decls.h  — ALL function/thunk/lambda/clause prototypes, for the
+#                  whole program. Shared so any cross-module call
+#                  (`kai_list__sum` from root) resolves at compile time.
+#                  Per-module prototype headers are a deferred
+#                  refinement — recompilation granularity is given by
+#                  the `.o`, not the `.h`, and a body change touches no
+#                  header.
+#
+# Each `<mod>.c` carries only ITS module's fn bodies (mo-filtered).
+# Lambdas, clause bodies, tests, benches, checks and the `main`
+# wrapper all land in the root TU (`__root__.c`): LamInfo/ClauseInfo
+# carry no `mo` (collect_decls flattens away the parent decl's origin),
+# so routing them to root is the link-safe choice (no duplicate symbol,
+# no missing definition). Sealing the real parent-mo into LamInfo /
+# ClauseInfo is a follow-up with its own fixture.
+#
+# Output is one String with file markers the `bin/kai` wrapper splits:
+#   //KAIDELIM:<nonce>        (line 1 — declares the marker nonce)
+#   //KAIFILE:<nonce>::<name> (column 0 — starts file <name>)
+# The nonce is derived per compile from the program text length so the
+# marker cannot collide with emitted C by construction.
+
+# Module-origin of a decl for TU partitioning. Only DFn / DType carry an
+# `mo` slot at emit time. Every OTHER decl kind reports None and so rides
+# the root TU — which is correct because by the time the emitter runs, the
+# pipeline has already LOWERED the decl kinds that have a module home into
+# DFns tagged with their `mo`: DImpl methods, DAxiom FFI shims, DConst
+# accessors and DEffect default-handler clauses are all DFn (or clause)
+# forms with `mo = Some(...)` here, partitioned by those arms. What is
+# left reporting None — DTest / DBench / DCheck / DUse and any
+# not-yet-lowered wrapper — genuinely belongs in root (tests/benches/
+# checks run from the root `main` wrapper; DUse is a compile-time
+# directive with no emitted body). A NEW top-level decl kind that carries
+# real emitted code AND a module home would need its own arm here; absent
+# that arm it silently rides root (link-safe but coarse) — add the arm
+# when introducing such a kind.
+#[doc("Bare module-origin of a decl: Some(m) for a module DFn/DType, None for a root decl or a decl kind without an mo slot (which rides the root TU).")]
+fn decl_origin(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  DType(_, _, _, _, _, _, mo)         -> mo
+  _ -> None
+}
+
+#[doc("Collect the distinct module names (Some(m)) appearing across decls, root excluded. Order: first-seen.")]
+fn distinct_module_origins(decls: [Decl]) : [String] =
+  distinct_module_origins_loop(decls, [])
+
+fn distinct_module_origins_loop(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match decl_origin(d) {
+    Some(m) -> if list_has(acc, m) { distinct_module_origins_loop(rest, acc) }
+               else                { distinct_module_origins_loop(rest, [m, ...acc]) }
+    None    -> distinct_module_origins_loop(rest, acc)
+  }
+}
+
+#[doc("Keep only the decls whose module-origin equals `mo` (Some(m) for a module TU, None for the root TU).")]
+fn decls_of_origin(decls: [Decl], mo: Option[String]) : [Decl] =
+  decls_of_origin_loop(decls, mo, [])
+
+fn decls_of_origin_loop(decls: [Decl], mo: Option[String], acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> if origin_eq(decl_origin(d), mo) { decls_of_origin_loop(rest, mo, [d, ...acc]) }
+                  else                              { decls_of_origin_loop(rest, mo, acc) }
+}
+
+fn origin_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { None -> false Some(y) -> x == y }
+}
+
+#[doc("Sanitise a module-origin into a C-source filename stem. Root -> `__root__`; a module `m` -> `m` with dots replaced by `_` (e.g. `geo.shapes` -> `geo_shapes`).")]
+fn tu_stem(mo: Option[String]) : String = match mo {
+  None    -> "__root__"
+  Some(m) -> dots_to_underscores(m)
+}
+
+fn dots_to_underscores(s: String) : String = dots_to_underscores_loop(s, 0, string_length(s), "")
+fn dots_to_underscores_loop(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else {
+    let c = string_slice(s, i, 1)
+    let c2 = if c == "." { "_" } else { c }
+    dots_to_underscores_loop(s, i + 1, n, string_concat(acc, c2))
+  }
+
+#[doc("A per-module C translation unit: filename stem + the `.c` text (without the shared-header includes, which the wrapper-level assembly prepends).")]
+type CModuleTU = { stem: String, body: String }
+
+#[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
+pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console {
+
+  let alias_resolved = rewrite_alias_decls(raw_decls)
+  let eff_names = collect_effect_names(alias_resolved)
+  let decls = desugar_op_calls_decls(alias_resolved, eff_names)
+  let fns = register_fn_decls(decls)
+  let variants = register_variants(decls)
+  let op_quals = collect_op_qualified_names(decls)
+  let globals = build_globals(fns, variants, eff_names, op_quals)
+  let st0 = lc_new(globals)
+  let st = collect_decls(decls, st0)
+  let lams = st.lams
+  let clauses_info = st.clauses
+  let enum_names = collect_enum_type_names(decls)
+
+  # ---- kai_types.h : runtime + every struct/typedef (shared) --------
+  let mono_structs = mono_sum_decls(decls, enum_names)
+  let eff_structs = effect_struct_decls(decls)
+  let env_structs = emit_handle_env_typedefs(clauses_info)
+  let types_h = concat_all([
+    "/* generated by kaikai stage 2 — shared types header */\n",
+    "#ifndef KAI_TYPES_H\n#define KAI_TYPES_H\n",
+    "#include \"runtime.h\"\n\n",
+    mono_structs, eff_structs, env_structs,
+    "\n#endif /* KAI_TYPES_H */\n"
+  ])
+
+  # ---- kai_decls.h : every prototype, whole program (shared) ---------
+  let clause_fwd = emit_clause_forwards(clauses_info)
+  let fwd = fn_forward_decls(decls, fns)
+  let thunk_fwd = thunk_forward_decls(decls)
+  let lam_fwd = emit_lam_forward_decls(lams)
+  let decls_h = concat_all([
+    "/* generated by kaikai stage 2 — shared declarations header */\n",
+    "#ifndef KAI_DECLS_H\n#define KAI_DECLS_H\n",
+    "#include \"kai_types.h\"\n\n",
+    clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n",
+    "\n#endif /* KAI_DECLS_H */\n"
+  ])
+
+  # ---- per-module .c translation units ------------------------------
+  let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: clauses_info,
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [] }
+  # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
+  # checks + the main wrapper. Lambdas and clauses have no mo, so they
+  # ride root — link-safe and complete.
+  let root_decls = decls_of_origin(decls, None)
+  let root_bodies = fn_bodies(src, root_decls, cx)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, variants, clauses_info, enum_names)
+  let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
+  let tests = emit_all_tests(src, decls, cx, target_origin)
+  let benches = emit_all_benches(src, decls, cx, target_origin)
+  let checks = emit_all_checks(src, decls, cx, target_origin)
+  let main_wr = emit_main_wrapper(decls, bmode, variants, fns, enum_names)
+  let root_tu = CModuleTU { stem: "__root__",
+    body: concat_all([root_bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr]) }
+  # Module TUs: one per distinct module-origin, carrying only that
+  # module's fn bodies. `fn_bodies` carries the `Console` effect, so we
+  # fold with an explicit loop rather than `map` (which is pure).
+  let mod_names = distinct_module_origins(decls)
+  let mod_tus = emit_module_tus_loop(src, decls, mod_names, cx, [])
+  let all_tus = [root_tu, ...mod_tus]
+
+  # ---- assemble the marker-delimited multi-file stream --------------
+  let nonce = modular_marker_nonce(src)
+  assemble_modular_output(nonce, types_h, decls_h, all_tus)
+}
+
+#[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
+fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, acc: [CModuleTU]) : [CModuleTU] / Console = match mod_names {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> {
+    let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx)
+    let tu = CModuleTU { stem: tu_stem(Some(m)), body: body }
+    emit_module_tus_loop(src, decls, rest, cx, [tu, ...acc])
+  }
+}
+
+# Per-compile marker nonce embedded in the `//KAIFILE:` split markers.
+# The real anti-collision guarantee is the COLUMN-0 anchor the wrapper's
+# awk uses (`index($0, pfx) == 1`): emitted C lines start with
+# indentation or a C token, never with `//KAIFILE:<nonce>::` at column 0,
+# so a stream line is a marker iff it begins exactly with the prefix. The
+# nonce (a per-compile digit string from the source length) is a second
+# layer that makes an accidental column-0 `//KAIFILE:` in a multi-line
+# string literal astronomically unlikely to also carry this compile's
+# nonce — it is NOT a cryptographic guarantee, just defence in depth on
+# top of the column-0 anchor.
+#[doc("Per-compile marker nonce for the `//KAIFILE:` split markers; defence-in-depth on top of the column-0 anchor the wrapper relies on.")]
+fn modular_marker_nonce(src: String) : String =
+  string_concat("k748x", int_to_string(string_length(src)))
+
+#[doc("Join the shared headers + per-module .c TUs into one marker-delimited String. Line 1 declares the nonce; each file is introduced by a column-0 `//KAIFILE:<nonce>::<name>` line. Every .c #includes kai_decls.h (which pulls in kai_types.h).")]
+fn assemble_modular_output(nonce: String, types_h: String, decls_h: String, tus: [CModuleTU]) : String {
+  let head = concat_all(["//KAIDELIM:", nonce, "\n"])
+  let types_part = concat_all(["//KAIFILE:", nonce, "::kai_types.h\n", types_h])
+  let decls_part = concat_all(["//KAIFILE:", nonce, "::kai_decls.h\n", decls_h])
+  let c_parts = concat_all(map(tus, (tu) => concat_all([
+    "//KAIFILE:", nonce, "::", tu.stem, ".c\n",
+    "/* generated by kaikai stage 2 */\n",
+    "#include \"kai_decls.h\"\n\n",
+    tu.body, "\n"
+  ])))
+  concat_all([head, types_part, decls_part, c_parts])
 }
 
 #[doc("Emit-layer entry point emit_program")]
