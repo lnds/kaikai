@@ -84,6 +84,126 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.87.0 (2026-06-06)
+
+### BREAKING CHANGE
+
+- string.chars() now returns Unicode codepoints, not
+bytes; the byte-wise behaviour moved to string.bytes(). Code that
+relied on chars() yielding bytes must switch to bytes(). ASCII-only
+callers are unaffected (byte == codepoint).
+
+### Added
+
+- **emit**: separate compilation — per-module .c/.h linked as objects (#748)
+- **stdlib**: text.display_width — wcwidth-style terminal column count
+- **stdlib**: String/Char codepoint model — chars() returns codepoints, bytes() is the byte view
+- **perceus**: wire borrow inference flip (Koka pure borrow)
+- **perceus**: borrow inference analysis (Koka B1, inference only)
+- **perceus**: TRMC emission — cctx goto-loop (fresh-alloc, pre-donate)
+- **perceus**: TRMC modulo-cons recognition (inert)
+- **perceus**: TRMC scaffolding — Koka ins-shape rb-tree + cctx runtime
+- **emit**: region{} LLVM arena lowering + deep-copy-out + ctor routing (refs #120)
+- **emit**: region{} LLVM backend ctx threading (refs #120)
+- **emit**: route region{} variant constructors to bump-arena (refs #120)
+- **emit**: route region{} record constructors to bump-arena (refs #120)
+- **emit**: route region{} list constructors to bump-arena (refs #120)
+- **emit**: region{} block lowers to bump-arena scope + deep-copy-out (refs #120)
+- **runtime**: deep-copy-out + arena constructors for region lowering (refs #120)
+- **typer**: region{} surface + side-table on normal-alloc lowering (refs #120)
+- **runtime**: bump-arena primitive + sentinel decref-no-op for opt-in regions (refs #120)
+- **refinements**: contract violation panic shows the offending value (#737)
+- **refinements**: contract violation panic shows the offending value
+
+### Fixed
+
+- **ci**: namespace test-llvm/test-run build artifacts to kill a -j race
+- **typer**: let a root fn shadow a same-signature stdlib export (#748)
+- **emit**: resolve module-body self-calls to their own module (#748)
+- **runtime**: non-cell-pool variant alloc uses libc malloc, not the slab
+- **build**: link -lm in test-perceus-issue350 (fmod, Linux)
+- **emit**: LLVM proto-impl shim honours the per-param unbox mask
+- **emit**: O(1) stack for TCO loops + TRMC lowering on LLVM backend
+- **emit**: collect kind-1 binders inside record sub-patterns
+- **runtime**: mint Exited/Signaled as kind-1 raw i64 slots
+- **emit**: payload-ctor table read tag from wrong EV field
+- **stdlib**: use string_length in string.kai char_count test to avoid list.length collision
+- **stdlib**: make list.map/filter/flat_map tail-recursive so they don't overflow the fiber stack
+- **typer**: attribute prelude test blocks to their module in modular-typecheck partition
+- **emit**: gate TRMC rewrite to C backend; LLVM falls back to recursion
+- **runtime**: variant slots via kai_var_slots macro, not FAM-in-union
+- **fnreg**: classify arity-0 scalar-return fns as unboxed candidates
+- **runtime**: mint Process Exited/Signaled with boxed Int slot
+- **emit**: module-qualify mono node struct names to avoid C collision
+- **parse**: multi-arg match drops dead wildcard on irrefutable column
+- **typer**: heterogeneous binop result takes the impl's return, not Self
+- **emit**: LLVM backend threads per-param raw mask through the UFn convention
+- **typer**: defer field access on an unresolved receiver instead of guessing UFCS
+- **typer**: bind generic effect op payload to declared row's ty_args
+- **emit**: LLVM backend handles mixed raw-param / boxed-return signatures
+- **fnreg**: disqualify any lambda-bearing body from param unboxing
+- **emit**: borrow-unwrap must use outer ty — Real read as Int produced garbage
+- **runtime**: wrap variant FAM in a struct — C99 forbids a bare FAM in a union
+- **runtime**: UB-free node-size via offsetof, not (KaiValue*)1 trick
+- **emit**: mixed-sig thunk tagged-Int read + switch-default boxed alias
+- **perceus**: tagged-Int safety across runtime + test harness paths
+- **emit**: route all Int unbox sites through kai_intf (tagged-Int)
+- **perceus**: gate variant reuse on flat + diagonal slots
+
+### Changed
+
+- **emit**: i64-inline variant Int slots (kind-1) with raw binders
+- **unbox**: thread CtorIntSlots map through the unbox pass (no-op)
+- **runtime**: hint kai_intf immediate path, keep bignum branch sound
+- **emit**: single-store TRMC reuse — skip donor-identity slots
+- **emit**: fix nested reuse-token donate needle (Koka 2-of-3 rotation reuse)
+- **emit**: direct slot stores into reused cell in TRMC step (Koka shape)
+- **runtime**: inline kai_check_unique, drop redundant singleton guard
+- **emit**: reuse-variant arm binds read hoisted sub-deref local
+- **emit**: elide kai_internal_dup on Int slots in TRMC rebuild
+- **emit**: hoist shared nested sub-derefs across match arms (decision-tree CSE)
+- **emit**: drop dead non-exhaustive panic when match has a catch-all
+- **emit,runtime**: nullary ctor ident via kai_enum_by_tag array load
+- **runtime**: hoist slot-mask lookup out of kai_free_value loop
+- **fnreg**: unbox scalar-return fns regardless of param boxedness
+- **runtime**: slab-allocate variant blocks, never free individually
+- **runtime**: inline kai_incref, symmetric with the decref split
+- **runtime**: inline kai_decref fast path, out-of-line the free
+- **emit**: drop redundant slotmask register from in-place reuse arm
+- **emit,runtime**: register payload-ctor name/mask at startup, inline kai_variant_u_fast
+- **runtime**: no-zero variant alloc in kai_variant_u_fast
+- **runtime**: drop redundant slotmask register from kai_variant_at
+- **emit**: direct enum tag in reuse rebuild, skip singleton round-trip
+- **runtime**: inline kai_int fast path, NOINLINE only the bignum tail
+- **emit**: inline kai_variant_u_fast for primitive-slot ctors
+- **typer**: consolidate Reader.get->ask remap; document index dispatch
+- **typer**: attribute prelude builtin effects via scheme row, drop name table
+- **runtime**: name copy-pasted IO/net buffer and limit literals
+- **runtime**: replace copy-pasted 4096 path buffers with KAI_PATH_BUF
+- **stage2**: pipe main's CLI entry instead of nested calls
+- **emit**: direct enum-tag store + raw-bool if-condition (kill primitive boxing)
+- **emit**: borrow node-field Int in direct comparison, strip redundant dup
+- **perceus**: borrow-pure unique branch for linear rebuilds (Koka move model)
+- **perceus**: reuse inner cell too in balance rotations (Koka 2-of-3)
+- **perceus**: reuse outer cell in nested-pattern rebuilds (rb-tree balance)
+- **runtime**: Koka-packed 8-byte header — variant node 80B to 48B
+- **emit**: direct Int comparison reads operands raw, no box round-trip
+- **emit**: store variant Int slots as tagged values, not raw int64
+- **perceus**: full RC discipline for mixed-signature fns (reuse + wall win)
+- **unbox**: mixed boxed/raw signature unboxing, composed with TRMC+reuse (WIP)
+- **emit**: emit flat per-ctor structs for sum types (Koka mould, additive)
+- **emit**: direct Int order-comparison (skip boxed kai_op_lt/gt/le/ge)
+- **runtime**: FAM variant blocks — inline payload slots (Koka mould)
+- **emit**: enum-as-int slot representation (Koka enum, C backend)
+- **perceus**: consume-map + tl-gated cons-overwrite (rb-tree RSS 38.6xC -> 2.29xC)
+- **perceus**: Koka arm-binder move + linear reuse-token (rb-tree 6.2xC->4.4xC wall)
+- **perceus**: Koka bind-borrow + arm-top reuse for pure modulo-cons arms (rb-tree incref 96M->86M)
+- **perceus**: Koka tagged-Int + reuse-token + borrow (rb-tree 14.78xC -> ~5xC) (#741)
+- **perceus**: reuse-token for typed cells + drop the diagonal gate
+- **perceus**: Koka reuse-token in TRMC step (drop_reuse + alloc_at)
+- **perceus**: Koka tagged-Int value representation in stage2 runtime
+- **runtime**: rb-tree 16.6x -> ~10x C via allocator free-list + 1:1 variant reuse
+
 ## v0.86.1 (2026-05-30)
 
 ### Fixed
