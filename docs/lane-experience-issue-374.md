@@ -24,9 +24,16 @@ maintainer's call was to make HashMap a **mutable hash table behind the
   `test-stdlib`.
 - **Benchmark** `benchmarks/hashmap/` (Clock-timed program + README).
 - **Docs** `stdlib-layout.md` + `stdlib-roadmap.md`.
+- **`m[key]` indexing sugar** — one additive arm in the typer's
+  `synth_index` (`stage2/compiler/infer.kai`) so `m[key]` lowers to
+  `hashmap.hashmap_get(m, key)` when `m : HashMap`, exactly as `Map`
+  lowers to `map.get`. The `/ Mutable` effect propagates from the
+  lowered callee automatically (the sugar adds no row of its own).
 
-Pure stdlib lane throughout: no stage1, typer/resolver, codegen, or
-`bin/kai` edits.
+Almost a pure stdlib lane: the one compiler touch is the additive
+`synth_index` arm above (see Finding 1) — added on the maintainer's
+explicit request for usability. It does not touch the parallel #747
+codegen lane (`emit_llvm.kai`), and selfhost stays byte-identical.
 
 ## The pivot: why HAMT lost and mutable won
 
@@ -95,12 +102,25 @@ shipped a slower default collection with a confident retro.
 
 ## Findings surfaced (not fixed — out of the stdlib lane's scope)
 
-### Finding 1 — `m[key]` sugar does NOT dispatch to HashMap (deferred)
-The dispatch lives in the typer (`synth_index` in
-`stage2/compiler/infer.kai`, the hardcoded `name == "Map"` arm). Adding
-a `HashMap` arm is one line but a typer edit; per the brief I stopped
-and surfaced it. (Note: with the mutable model, `m[key]` would need to
-lower to a `/ Mutable` call — a small extra wrinkle for that follow-up.)
+### Finding 1 — `m[key]` sugar (deferred, then SHIPPED on request)
+Initially deferred: the dispatch lives in the typer (`synth_index` in
+`stage2/compiler/infer.kai`, the closed `name == "Map"` arm) and the
+brief said to surface typer changes as findings, not make them. The
+maintainer then asked for the usability directly ("¿no se puede usar
+`[]`?"), so the arm was added: `m[key]` lowers to
+`hashmap.hashmap_get(m, key)` when `m : HashMap`. Three things made it
+low-risk: (1) it is a single additive arm that only fires for the
+`HashMap` head — existing `Map`/`Array` indexing is untouched; (2) the
+`/ Mutable` effect propagates for free because `synth_index` re-walks
+the constructed `ECall`, so the lowered `hashmap_get`'s row flows into
+the call site — no special-casing the effect; (3) **selfhost stays
+byte-identical** (verified `kaic2b.c == kaic2c.c`), because the arm
+changes emission only for programs that actually index a `HashMap`,
+and the compiler does not. The design note above `synth_index` (which
+predicted "revisit only if a third indexable container appears") was
+updated from a 2-case to a 3-case dispatch — HashMap is that third
+container, and the closed dispatch is still the right shape (no `Index`
+protocol). The write-side `m[key] := v` is NOT provided.
 
 ### Finding 2 — `[k: Hashable]` is not expressible; `Hash` is the protocol
 #373 shipped `Hash` (method `hash`), not "Hashable". kaikai has no
@@ -156,11 +176,13 @@ privacy-vs-test-drop ordering is itself a latent compiler quirk.
 Both golden-gated by `make -C stage2 test-stdlib` and import-checked by
 `tools/test-stdlib-modules.sh`. No Makefile edit needed.
 
+`hashmap_basic.kai` also covers the `m[key]` indexing sugar (4 asserts:
+present/absent keys, let-RHS position) now that it ships.
+
 **Coverage gaps (deliberate):** record keys (don't work, Finding 3);
 full primitive-key hash collision (unreachable by hand — sum-type
-constant-hash is the deterministic substitute); `m[key]` sugar
-(deferred, Finding 1); `kai bench` HashMap timing (segfaults, Finding 4
-— Clock workaround used).
+constant-hash is the deterministic substitute); `kai bench` HashMap
+timing (segfaults, Finding 4 — Clock workaround used).
 
 ## Cost vs estimate
 
@@ -182,13 +204,13 @@ verified main clean.
 
 1. **#375 (HashSet)** — now unblocked. Build `HashSet[T]` on
    `HashMap[T, Unit]`; it inherits the mutable + `/ Mutable` model.
-2. **`m[key]` sugar for HashMap** — add the `HashMap` arm to
-   `synth_index`, lowering to the `/ Mutable` `hashmap_get` (typer lane,
-   Finding 1).
-3. **Record keys through generic protocol dispatch** — head-tag-0 gap
+2. **Record keys through generic protocol dispatch** — head-tag-0 gap
    (Finding 3); fixes HashMap- and Map-over-records.
-4. **`kai bench` + `Mutable` segfault** (Finding 4) — bench/effect
+3. **`kai bench` + `Mutable` segfault** (Finding 4) — bench/effect
    runtime bug; blocks benchmarking any mutable structure.
+
+(The `m[key]` sugar from Finding 1 shipped in this lane — no longer a
+follow-up.)
 
 ## Gate
 
