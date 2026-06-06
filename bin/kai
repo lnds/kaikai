@@ -1024,6 +1024,62 @@ compile_to_binary() {
     # signatures, type-tag bitcasts) that we silence to keep the
     # driver output clean. `-lm` parity with the C path (issue #343).
     $CLANG $CLANGFLAGS -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
+  elif [ "${KAI_MODULAR:-0}" = "1" ]; then
+    # Issue #748: separate compilation. kaic2 emits a marker-delimited
+    # stream of per-module `.c` files + two shared headers
+    # (kai_types.h, kai_decls.h). We split the stream into files, compile
+    # each `.c` to its own `.o`, and link the `.o` files. Each module is
+    # its own translation unit with its own C symbol space; cross-module
+    # calls resolve at link time through the shared kai_decls.h
+    # prototypes. Opt-in via KAI_MODULAR=1 while the path is validated;
+    # the default C path below stays single-TU (and selfhost-identical).
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=c-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/modular.stream"
+    moddir="$tmp/mod"
+    mkdir -p "$moddir"
+    # Split the stream on the column-0 `//KAIFILE:<nonce>::<name>`
+    # markers. Line 1 is `//KAIDELIM:<nonce>`; we read the nonce from it
+    # so the awk match is exact and cannot fire on emitted C. Each marker
+    # opens a new output file under $moddir.
+    nonce="$(sed -n '1s/^\/\/KAIDELIM://p' "$tmp/modular.stream")"
+    if [ -z "$nonce" ]; then
+      die "internal: --emit=c-modular produced no //KAIDELIM marker"
+    fi
+    # While splitting, drop the leading `static ` from every emitted
+    # top-level definition/prototype so cross-module symbols get EXTERNAL
+    # linkage (separate compilation: a `static` symbol is invisible
+    # across `.o` files). The strip is anchored to column 0 AND gated on
+    # a closed whitelist of emitted return types (KaiValue *, int64_t,
+    # double, int, uint32_t) so it never touches runtime.h's intentional
+    # statics (those live in runtime.h, not this stream) nor a `static`
+    # local variable inside a body (always indented). Names are uniquely
+    # mangled, so external linkage cannot clash between two emitted
+    # symbols (that was the #748 mangling fix).
+    awk -v dir="$moddir" -v pfx="//KAIFILE:$nonce::" '
+      index($0, pfx) == 1 { fn = substr($0, length(pfx) + 1); out = dir "/" fn; next }
+      out {
+        if ($0 ~ /^static (KaiValue \*|int64_t |double |int |uint32_t )/) {
+          sub(/^static /, "", $0)
+        }
+        print > out
+      }
+    ' "$tmp/modular.stream"
+    # Copy the runtime header next to the generated sources so the
+    # emitted `#include "runtime.h"` resolves without an -I race against
+    # a stale system copy. (kai_types.h includes runtime.h by name.)
+    cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
+    # Compile each generated .c to its own .o, then link.
+    objs=""
+    for cfile in "$moddir"/*.c; do
+      ofile="${cfile%.c}.o"
+      # shellcheck disable=SC2086
+      $CC $CFLAGS -I "$moddir" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$ofile" \
+        || die "modular compile failed for $(basename "$cfile")"
+      objs="$objs $ofile"
+    done
+    # shellcheck disable=SC2086
+    $CC $CFLAGS $objs -o "$out" -lm \
+      || die "modular link failed"
   else
     # shellcheck disable=SC2086
     (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/out.c"
