@@ -1,31 +1,19 @@
-# issue #374 — black-box coverage of the HAMT-backed HashMap[k, v]
-# public surface (the 12 `hashmap_*` functions).
+# issue #374 — black-box coverage of the mutable HashMap[k, v] public
+# surface (the 12 `hashmap_*` functions).
 #
-# Iteration order is hash-derived and therefore unspecified, so this
-# fixture never prints raw key/value orderings — it prints sorted
-# views, counts, and round-trip verdicts so the golden is stable
-# across platforms. Two properties get explicit checks the issue
-# calls out:
+# HashMap is a MUTABLE hash table behind the `Mutable` effect:
+# `hashmap_put` / `hashmap_remove` mutate in place and return `Unit`,
+# and every op carries `/ Mutable`. So this fixture threads one table
+# through a sequence of mutations rather than rebinding fresh maps.
 #
-#   - Large N (10K and 100K): every inserted key round-trips to its
-#     value, and size is exact. A carrier that lost entries on a
-#     branch split or miscounted size would surface as a wrong hit
-#     count, not a slowdown.
-#   - Iteration-order stability across same-input runs: the same
-#     insertion sequence, built twice, yields byte-identical
-#     `hashmap_keys`. Different sequences may differ (the trie shape
-#     depends on the insertion path) — that is documented, not
-#     tested here.
+# Iteration order is unspecified (bucket-derived, not stable across
+# resizes), so the fixture never prints raw key/value orderings — it
+# prints sorted views, counts, and round-trip verdicts so the golden
+# is deterministic.
 #
 # Keys are `String` / `Int`, whose stdlib `impl Hash` dispatches
-# correctly through the generic collection boundary. User-defined
-# key types do not yet dispatch there (the same limitation the AVL
-# `Map` has with `<`); see docs/lane-experience-issue-374.md.
-#
-# Collision-node (`HCollision`) coverage lives in the white-box
-# `test` blocks inside `stdlib/collections/hashmap.kai` — a full
-# 64-bit hash collision between two distinct primitive keys is not
-# reachable by hand through this public API.
+# through the generic collection boundary. User sum-type keys also
+# work (see hashmap_collision.kai); user records do not yet.
 
 import collections.hashmap
 
@@ -37,26 +25,28 @@ fn opt_int_str(o: Option[Int]) : String = match o {
   Some(n) -> int_to_string(n)
 }
 
-# Element-wise String list equality (used for iteration-order
-# stability — we compare two key listings without printing either).
-fn str_list_eq(a: [String], b: [String]) : Bool = match a {
-  [] -> match b { [] -> true  _ -> false }
+# Element-wise sorted-String list to a CSV (keys come back unordered;
+# we sort for a deterministic golden).
+fn str_cmp(a: String, b: String) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
+fn int_lt(a: Int, b: Int) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
+
+# Element-wise Int list equality (for iteration-order stability).
+fn int_list_eq(a: [Int], b: [Int]) : Bool = match a {
+  [] -> match b {
+    []  -> true
+    _   -> false
+  }
   [x, ...xs] -> match b {
-    []          -> false
-    [y, ...ys]  -> if x == y { str_list_eq(xs, ys) } else { false }
+    []         -> false
+    [y, ...ys] -> if x == y { int_list_eq(xs, ys) } else { false }
   }
 }
 
-fn fill_str(m: HashMap[String, Int], i: Int, n: Int) : HashMap[String, Int] =
-  if i >= n { m }
-  else      { fill_str(hashmap.hashmap_put(m, int_to_string(i), i * 2), i + 1, n) }
-
-fn fill_int(m: HashMap[Int, Int], i: Int, n: Int) : HashMap[Int, Int] =
-  if i >= n { m }
-  else      { fill_int(hashmap.hashmap_put(m, i, i * 3), i + 1, n) }
+fn fill_int(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
+  if i >= n { () } else { hashmap.hashmap_put(m, i, i * 3); fill_int(m, i + 1, n) }
 
 # Count how many of keys 0..n round-trip to the expected value.
-fn count_hits_int(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int =
+fn count_hits_int(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
   if i >= n { acc }
   else {
     let hit = match hashmap.hashmap_get(m, i) {
@@ -66,47 +56,47 @@ fn count_hits_int(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int =
     count_hits_int(m, i + 1, n, acc + hit)
   }
 
-fn main() : Int / Stdout = {
+fn main() : Int / Stdout + Mutable = {
   # ---- Empty -----------------------------------------------------
-  let m0 = hashmap.hashmap_empty()
-  verify("empty size 0", hashmap.hashmap_size(m0) == 0)
-  verify("empty is_empty", hashmap.hashmap_is_empty(m0))
-  verify("empty contains 'x' false", not hashmap.hashmap_contains(m0, "x"))
-  verify("empty get None", opt_int_str(hashmap.hashmap_get(m0, "x")) == "none")
+  let m = hashmap.hashmap_empty()
+  verify("empty size 0", hashmap.hashmap_size(m) == 0)
+  verify("empty is_empty", hashmap.hashmap_is_empty(m))
+  verify("empty contains 'x' false", not hashmap.hashmap_contains(m, "x"))
+  verify("empty get None", opt_int_str(hashmap.hashmap_get(m, "x")) == "none")
 
-  # ---- Single insert + small batch -------------------------------
-  let m1 = hashmap.hashmap_put(m0, "a", 1)
-  verify("single size 1", hashmap.hashmap_size(m1) == 1)
-  verify("single not is_empty", not hashmap.hashmap_is_empty(m1))
-  verify("single get 'a' == 1", opt_int_str(hashmap.hashmap_get(m1, "a")) == "1")
+  # ---- Single insert + small batch (all mutate `m`) --------------
+  hashmap.hashmap_put(m, "a", 1)
+  verify("single size 1", hashmap.hashmap_size(m) == 1)
+  verify("single not is_empty", not hashmap.hashmap_is_empty(m))
+  verify("single get 'a' == 1", opt_int_str(hashmap.hashmap_get(m, "a")) == "1")
 
-  let m3 = hashmap.hashmap_put(hashmap.hashmap_put(m1, "b", 2), "c", 3)
-  verify("size 3", hashmap.hashmap_size(m3) == 3)
-  verify("contains 'a'", hashmap.hashmap_contains(m3, "a"))
-  verify("contains 'b'", hashmap.hashmap_contains(m3, "b"))
-  verify("contains 'c'", hashmap.hashmap_contains(m3, "c"))
-  verify("not contains 'd'", not hashmap.hashmap_contains(m3, "d"))
-  verify("get 'b' == 2", opt_int_str(hashmap.hashmap_get(m3, "b")) == "2")
-  verify("get missing none", opt_int_str(hashmap.hashmap_get(m3, "zzz")) == "none")
+  hashmap.hashmap_put(m, "b", 2)
+  hashmap.hashmap_put(m, "c", 3)
+  verify("size 3", hashmap.hashmap_size(m) == 3)
+  verify("contains 'a'", hashmap.hashmap_contains(m, "a"))
+  verify("contains 'b'", hashmap.hashmap_contains(m, "b"))
+  verify("contains 'c'", hashmap.hashmap_contains(m, "c"))
+  verify("not contains 'd'", not hashmap.hashmap_contains(m, "d"))
+  verify("get 'b' == 2", opt_int_str(hashmap.hashmap_get(m, "b")) == "2")
+  verify("get missing none", opt_int_str(hashmap.hashmap_get(m, "zzz")) == "none")
 
-  # keys / values are unordered — compare the SORTED view so the
-  # golden is deterministic.
-  Stdout.print("sorted keys: " ++ string.join(list.sort_by(hashmap.hashmap_keys(m3), (a, b) => if a == b { 0 } else if a < b { 0 - 1 } else { 1 }), ","))
-  Stdout.print("sorted values: " ++ string.join(list.map(list.sort(hashmap.hashmap_values(m3)), int_to_string), ","))
+  # keys / values are unordered — sorted view for a stable golden.
+  Stdout.print("sorted keys: " ++ string.join(list.sort_by(hashmap.hashmap_keys(m), str_cmp), ","))
+  Stdout.print("sorted values: " ++ string.join(list.map(list.sort_by(hashmap.hashmap_values(m), int_lt), int_to_string), ","))
 
-  # ---- Update (no size change) -----------------------------------
-  let m4 = hashmap.hashmap_put(m3, "b", 20)
-  verify("size still 3 after update", hashmap.hashmap_size(m4) == 3)
-  verify("get 'b' == 20 after update", opt_int_str(hashmap.hashmap_get(m4, "b")) == "20")
+  # ---- Update in place (no size change) --------------------------
+  hashmap.hashmap_put(m, "b", 20)
+  verify("size still 3 after update", hashmap.hashmap_size(m) == 3)
+  verify("get 'b' == 20 after update", opt_int_str(hashmap.hashmap_get(m, "b")) == "20")
 
   # ---- Remove ----------------------------------------------------
-  let m5 = hashmap.hashmap_remove(m4, "b")
-  verify("size 2 after remove", hashmap.hashmap_size(m5) == 2)
-  verify("not contains 'b' after remove", not hashmap.hashmap_contains(m5, "b"))
-  verify("still contains 'a'", hashmap.hashmap_contains(m5, "a"))
-  verify("still contains 'c'", hashmap.hashmap_contains(m5, "c"))
-  let m6 = hashmap.hashmap_remove(m5, "ghost")
-  verify("size unchanged after remove missing", hashmap.hashmap_size(m6) == 2)
+  hashmap.hashmap_remove(m, "b")
+  verify("size 2 after remove", hashmap.hashmap_size(m) == 2)
+  verify("not contains 'b' after remove", not hashmap.hashmap_contains(m, "b"))
+  verify("still contains 'a'", hashmap.hashmap_contains(m, "a"))
+  verify("still contains 'c'", hashmap.hashmap_contains(m, "c"))
+  hashmap.hashmap_remove(m, "ghost")
+  verify("size unchanged after remove missing", hashmap.hashmap_size(m) == 2)
 
   # ---- to_pairs / from_pairs (duplicate collapse to last) --------
   let fp = hashmap.hashmap_from_pairs([
@@ -118,31 +108,42 @@ fn main() : Int / Stdout = {
   verify("from_pairs duplicate 'x' = 99", opt_int_str(hashmap.hashmap_get(fp, "x")) == "99")
   verify("to_pairs length 2", list.length(hashmap.hashmap_to_pairs(fp)) == 2)
 
-  # ---- merge (left-biased: a wins) -------------------------------
+  # ---- merge (left-biased: a wins; mutates a) --------------------
   let ma = hashmap.hashmap_from_pairs([Pair { fst: "p", snd: 1 }, Pair { fst: "q", snd: 2 }])
   let mb = hashmap.hashmap_from_pairs([Pair { fst: "q", snd: 99 }, Pair { fst: "r", snd: 3 }])
-  let mg = hashmap.hashmap_merge(ma, mb)
-  verify("merge size 3", hashmap.hashmap_size(mg) == 3)
-  verify("merge a wins on 'q' (== 2)", opt_int_str(hashmap.hashmap_get(mg, "q")) == "2")
-  verify("merge keeps b-only 'r' (== 3)", opt_int_str(hashmap.hashmap_get(mg, "r")) == "3")
-  verify("merge keeps a-only 'p' (== 1)", opt_int_str(hashmap.hashmap_get(mg, "p")) == "1")
+  hashmap.hashmap_merge(ma, mb)
+  verify("merge size 3", hashmap.hashmap_size(ma) == 3)
+  verify("merge a wins on 'q' (== 2)", opt_int_str(hashmap.hashmap_get(ma, "q")) == "2")
+  verify("merge keeps b-only 'r' (== 3)", opt_int_str(hashmap.hashmap_get(ma, "r")) == "3")
+  verify("merge keeps a-only 'p' (== 1)", opt_int_str(hashmap.hashmap_get(ma, "p")) == "1")
+  verify("merge leaves b untouched (size 2)", hashmap.hashmap_size(mb) == 2)
 
-  # ---- Iteration-order stability across same-input runs ----------
-  # Same insertion sequence, built twice -> identical key listing.
-  let s1 = fill_str(hashmap.hashmap_empty(), 0, 256)
-  let s2 = fill_str(hashmap.hashmap_empty(), 0, 256)
-  verify("iteration order stable across same-input runs",
-         str_list_eq(hashmap.hashmap_keys(s1), hashmap.hashmap_keys(s2)))
-
-  # ---- Large N round-trip ----------------------------------------
-  let big10k = fill_int(hashmap.hashmap_empty(), 0, 10000)
+  # ---- Large N round-trip (exercises several resizes) ------------
+  let big10k = hashmap.hashmap_empty()
+  fill_int(big10k, 0, 10000)
   verify("10K size exact", hashmap.hashmap_size(big10k) == 10000)
   verify("10K all keys round-trip", count_hits_int(big10k, 0, 10000, 0) == 10000)
   verify("10K absent key missing", opt_int_str(hashmap.hashmap_get(big10k, 10000)) == "none")
 
-  let big100k = fill_int(hashmap.hashmap_empty(), 0, 100000)
+  let big100k = hashmap.hashmap_empty()
+  fill_int(big100k, 0, 100000)
   verify("100K size exact", hashmap.hashmap_size(big100k) == 100000)
   verify("100K all keys round-trip", count_hits_int(big100k, 0, 100000, 0) == 100000)
+
+  # ---- Overwrite-heavy: same keys re-put, size stable ------------
+  fill_int(big10k, 0, 10000)
+  verify("10K re-put keeps size 10000", hashmap.hashmap_size(big10k) == 10000)
+
+  # ---- Iteration-order stability across same-input runs ----------
+  # Bucket order is unspecified, but DETERMINISTIC: the same insertion
+  # sequence drives the same resize history and the same bucket
+  # layout, so two same-input builds iterate identically.
+  let s1 = hashmap.hashmap_empty()
+  let s2 = hashmap.hashmap_empty()
+  fill_int(s1, 0, 500)
+  fill_int(s2, 0, 500)
+  verify("iteration order stable across same-input runs",
+         int_list_eq(hashmap.hashmap_keys(s1), hashmap.hashmap_keys(s2)))
 
   0
 }

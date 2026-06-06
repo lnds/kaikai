@@ -1,409 +1,270 @@
-# stdlib/collections/hashmap.kai — HAMT-backed HashMap[k, v].
+# stdlib/collections/hashmap.kai — mutable hash table HashMap[k, v].
 #
-# v2 of the associative collection promised by `Map[k, v]` v1
-# (issue #128) and deferred until the `Hash` protocol shipped
-# (issue #373, closed). The carrier is a Hash Array Mapped Trie —
-# the canonical persistent hash table used by Clojure, Scala's
-# immutable map, Haskell's `Data.HashMap`, and Erlang `maps`.
+# The default associative collection for kaikai 1.0 (issue #374): a
+# mutable, separately-chained hash table behind the `Mutable` effect.
+# `Map[k, v]` (AVL, #128) remains the choice when you need ordered
+# iteration or a pure/persistent value; HashMap is what you reach for
+# when you want O(1)-average insert and lookup and are working inside
+# an effectful body anyway.
 #
-# Why HAMT over the AVL `Map`:
-#   - O(log32 n) ≈ O(1) practical lookup — branching factor 32
-#     means depth ~6 even at 1M entries, vs the AVL's ~1.44·log2(n)
-#     tree walk.
-#   - Works over keys without a total order (sum types) as long as
-#     they carry `impl Hash` + structural `==`. The AVL `Map` panics
-#     on such keys at the first `<` comparison. (Record keys are not
-#     yet supported through the generic boundary — see Conventions.)
-#   - No rehash-on-growth cost spike: capacity is bounded by trie
-#     depth, not a load factor, so there is no amortized resize.
-#
-# Use `Map` (AVL) instead when you need keys iterated in ascending
-# order — HashMap iteration order is hash-derived (see Conventions).
+# Why mutable, not a pure HAMT. The first cut of #374 shipped a pure
+# persistent Hash Array Mapped Trie. It was correct but *slower* than
+# the AVL `Map` it was meant to replace — at N=10K, both build and
+# lookup ran ~2x behind the tree, because a persistent trie pays
+# allocation + structure-rebuild on every `put` and a list-indexed
+# walk on every level of every `get`. A HashMap slower than the tree
+# fails its whole reason to exist. The mutable table mutates one
+# bucket array in place: `put` is one hash + one chain splice, `get`
+# is one hash + one short chain scan. Measured at N=10K / 1M lookups,
+# the mutable table beats the AVL `Map` ~2-2.5x on both build and
+# lookup. Mutation rides the `Mutable` effect so it is visible in the
+# type — `put`/`remove` carry `/ Mutable`, the read ops do too (they
+# dereference the table's `Ref` cells).
 #
 # Conventions:
-#   - **Iteration order is unspecified** (hash-derived), but
-#     **stable across same-input runs**: given the same insertion
-#     sequence, `hashmap_keys` / `hashmap_values` / `hashmap_to_pairs`
-#     return the same order every run. Different insertion sequences
-#     may yield different orders even with equal final contents,
-#     because the trie shape depends on the insertion path. Callers
-#     that depend on order should use `Map` (AVL), which iterates by
-#     key.
-#   - Key equality is structural via `==` (kaikai's deep-equals
-#     runtime helper). Key hashing is the `Hash` protocol's
-#     `hash(key)`. The two MUST agree: `a == b` implies
-#     `hash(a) == hash(b)` — every stdlib `impl Hash` upholds this,
-#     and `#[derive(Hash)]` does too. Distinct keys that hash equal
-#     are stored side-by-side in an `HCollision` node and separated
-#     by `==`.
-#   - **`Hash[k]` is required, but enforced where `hash(key)` is
-#     called, not in the `fn` signature.** kaikai has no protocol
-#     bounds on free-function type parameters (Tier 1 #3: no
-#     constraint propagation) — `[k: Hash]` is rejected by the
-#     parser. A key whose type lacks `impl Hash` type-checks but
-#     panics at runtime on the first `hash` with "no impl of
-#     Hash.hash"; `#[derive(Hash)]` on the key type is the one-line
-#     fix.
+#   - **Mutating, not persistent.** `hashmap_put` / `hashmap_remove`
+#     mutate the table in place and return `Unit`. There is no
+#     structural sharing and no "old version" after a write — the
+#     handle you hold sees every later mutation. This is the opposite
+#     of `Map`, whose every op returns a fresh value. Aliasing two
+#     bindings to one `HashMap` aliases the same mutable table.
+#   - **Every op carries `/ Mutable`.** Even `hashmap_get` and
+#     `hashmap_size` read the table's `Ref` cells, so they demand the
+#     `Mutable` effect. The runtime installs a trivial default handler
+#     for any `main` row containing `Mutable`, so callers rarely write
+#     a handler — but the effect IS in the signature, by design (it is
+#     the source of truth that the value is a mutable location).
+#   - Key equality is structural via `==`; key hashing is the `Hash`
+#     protocol's `hash(key)`. The two MUST agree: `a == b` implies
+#     `hash(a) == hash(b)` — every stdlib `impl Hash` and
+#     `#[derive(Hash)]` upholds this. Keys that hash to the same
+#     bucket share a chain and are separated by `==`.
 #   - **Key-type support today: primitives + sum types; NOT records.**
-#     `Int`, `String`, `Real`, `Bool`, `Char` (stdlib `impl Hash`)
-#     and user **sum types** with `impl Hash` + `impl Eq` dispatch
-#     correctly through the generic collection boundary. User
-#     **records** do NOT yet: a record value boxed through the `key:
-#     k` type variable reads runtime head tag 0, so the generic
-#     `hash(key)` panics "no impl of Hash.hash for runtime head 0"
-#     even with `#[derive(Hash)]`. This is a compiler-side
-#     monomorphisation/dispatch gap (typer/runtime, not this carrier)
-#     — see docs/lane-experience-issue-374.md for the follow-up. The
-#     AVL `Map` has the analogous gap on `<` for all non-primitive
-#     keys. Lift a record key to a primitive (e.g. an id field) until
-#     the dispatch gap closes.
-#   - Functions are pure — every operation returns a fresh
-#     `HashMap`. The trie shares structure between revisions: a
-#     `put` rebuilds only the spine from the root to the modified
-#     leaf (~6 nodes), the rest is shared.
+#     `Int`, `String`, `Real`, `Bool`, `Char` and user **sum types**
+#     with `impl Hash` + `impl Eq` dispatch through the generic
+#     boundary. User **records** do not yet: a record boxed through the
+#     `key: k` type variable reads runtime head tag 0, so `hash(key)`
+#     panics "no impl of Hash.hash for runtime head 0" even with
+#     `#[derive(Hash)]`. Compiler-side dispatch gap (see
+#     docs/lane-experience-issue-374.md); the AVL `Map` has the
+#     analogous gap on `<`. Lift a record key to a primitive id field.
+#   - **Iteration order is unspecified** (bucket order, which depends
+#     on `cap` and the hashes). It is NOT stable across resizes, and
+#     resize is triggered by load factor — so two tables with equal
+#     contents reached by different insertion counts may iterate
+#     differently. Use `Map` (AVL) if you need ordered iteration.
+#   - Negative hashes are fine: the bucket index normalises with
+#     `((h % cap) + cap) % cap`.
 #   - **No HashDoS mitigation in v1.** Keys are assumed
-#     non-adversarial. A public-facing API with attacker-controlled
-#     keys is a separate hardening lane (issue body, "Out of scope").
+#     non-adversarial (issue body, "Out of scope").
 #
-# Public surface (12 pub fns, issue #374). The flat `hashmap_*`
-# names are the canonical surface this issue pins; reached as
-# `hashmap.hashmap_put(m, k, v)` under `import collections.hashmap`,
-# or unqualified via a selective import
-# (`import collections.hashmap.{hashmap_put}`):
+# Public surface (12 pub fns, issue #374). Flat `hashmap_*` names as
+# the issue pins them; reached as `hashmap.hashmap_put(m, k, v)` under
+# `import collections.hashmap`. NOTE: the signatures diverge from the
+# issue body's PURE shapes (`put : HashMap`) — the mutable model was a
+# deliberate redesign (see the lane retro):
 #
-#   pub fn hashmap_empty[k, v]() : HashMap[k, v]
-#   pub fn hashmap_size[k, v](m: HashMap[k, v]) : Int
-#   pub fn hashmap_is_empty[k, v](m: HashMap[k, v]) : Bool
-#   pub fn hashmap_get[k, v](m: HashMap[k, v], key: k) : Option[v]
-#   pub fn hashmap_contains[k, v](m: HashMap[k, v], key: k) : Bool
-#   pub fn hashmap_put[k, v](m: HashMap[k, v], key: k, value: v) : HashMap[k, v]
-#   pub fn hashmap_remove[k, v](m: HashMap[k, v], key: k) : HashMap[k, v]
-#   pub fn hashmap_keys[k, v](m: HashMap[k, v]) : [k]
-#   pub fn hashmap_values[k, v](m: HashMap[k, v]) : [v]
-#   pub fn hashmap_to_pairs[k, v](m: HashMap[k, v]) : [Pair[k, v]]
-#   pub fn hashmap_from_pairs[k, v](ps: [Pair[k, v]]) : HashMap[k, v]
-#   pub fn hashmap_merge[k, v](a: HashMap[k, v], b: HashMap[k, v]) : HashMap[k, v]  -- a keys win
+#   pub fn hashmap_empty[k, v]()                          : HashMap[k, v] / Mutable
+#   pub fn hashmap_size[k, v](m: HashMap[k, v])           : Int / Mutable
+#   pub fn hashmap_is_empty[k, v](m: HashMap[k, v])       : Bool / Mutable
+#   pub fn hashmap_get[k, v](m: HashMap[k, v], key: k)    : Option[v] / Mutable
+#   pub fn hashmap_contains[k, v](m: HashMap[k, v], key: k) : Bool / Mutable
+#   pub fn hashmap_put[k, v](m: HashMap[k, v], key: k, value: v) : Unit / Mutable
+#   pub fn hashmap_remove[k, v](m: HashMap[k, v], key: k) : Unit / Mutable
+#   pub fn hashmap_keys[k, v](m: HashMap[k, v])           : [k] / Mutable
+#   pub fn hashmap_values[k, v](m: HashMap[k, v])         : [v] / Mutable
+#   pub fn hashmap_to_pairs[k, v](m: HashMap[k, v])       : [Pair[k, v]] / Mutable
+#   pub fn hashmap_from_pairs[k, v](ps: [Pair[k, v]])     : HashMap[k, v] / Mutable
+#   pub fn hashmap_merge[k, v](a: HashMap[k, v], b: HashMap[k, v]) : Unit / Mutable  -- b folded into a, a keys win
 #
-# The read-side indexing sugar `m[key]` does NOT yet dispatch to
-# `hashmap_get`: that lowering lives in the typer (`synth_index` in
-# `stage2/compiler/infer.kai`) and adding a `HashMap` arm is a typer
-# change out of this stdlib lane's scope. See the lane retro
-# (`docs/lane-experience-issue-374.md`) — it is a one-arm follow-up
-# tracked for when the typer lane is free.
-
-import math.bits
-import collections.map
+# The `m[key]` read-side indexing sugar does NOT dispatch to
+# `hashmap_get` (the lowering lives in the typer's `synth_index`, out
+# of this stdlib lane's scope) — see the lane retro.
 
 # ---- Carrier -----------------------------------------------------
 #
-# `HamtNode[k, v]` is the trie node. Branching factor is 32: each
-# level consumes 5 bits of the key's hash (`HASH_BITS` low-order
-# bits first), so the trie is at most ceil(64/5) = 13 levels deep
-# even with maximally-colliding hash prefixes — in practice ~6 for
-# random keys at 1M entries.
+# Separate chaining: `buckets` is an `Array` of chains, each chain a
+# `[Pair[k, v]]`. The array, the live entry count, and the current
+# capacity all live in `Ref` cells so a resize can swap the whole
+# bucket array atomically from inside a `/ Mutable` body.
 #
-#   HEmpty                  — the empty trie (only ever the root of
-#                             an empty map; interior slots are never
-#                             HEmpty because branches are bitmap-
-#                             compressed).
-#   HLeaf(hash, k, v)       — a single entry; `hash` is the full
-#                             64-bit digest, cached so lookups never
-#                             re-hash interior keys.
-#   HCollision(hash, pairs) — 2+ distinct keys with the same full
-#                             hash, separated by `==`. Only created
-#                             when two keys collide on all 64 bits.
-#   HBranch(bitmap, kids)   — a bitmap-compressed interior node.
-#                             `bitmap` has bit `f` set iff a child
-#                             occupies fragment `f` (0..31); `kids`
-#                             holds exactly popcount(bitmap) entries,
-#                             ordered by fragment. The slot for
-#                             fragment `f` is at compressed index
-#                             popcount(bitmap & ((1<<f) - 1)).
+# Capacity is always a power of two starting at 16; resize doubles
+# when the load factor exceeds 0.75 (`count * 4 > cap * 3`).
 
-type HamtNode[k, v]
-  = HEmpty
-  | HLeaf(Int, k, v)
-  | HCollision(Int, [Pair[k, v]])
-  | HBranch(Int, [HamtNode[k, v]])
-
-pub type HashMap[k, v] = { priv root: HamtNode[k, v], priv size: Int }
-
-# ---- Hash plumbing ----------------------------------------------
-
-# Bits consumed per trie level. 5 → branching factor 32.
-fn hamt_bits() : Int = 5
-
-# Mask for one 5-bit fragment.
-fn hamt_mask() : Int = 31
-
-# The 5-bit fragment of `h` at the given bit shift. `bit_ushr`
-# (logical, zero-fill) is deliberate: `hash` may return a negative
-# Int (two's-complement wrap is intended per the `impl Hash`
-# contract), and an arithmetic `>>` would smear the sign bit into
-# every fragment of the deep levels.
-fn hamt_frag(h: Int, shift: Int) : Int = bit_and(bit_ushr(h, shift), hamt_mask())
-
-# Compressed index of the slot for `bit` (a single set bit) within
-# a branch's `kids`: the count of occupied slots below it.
-fn hamt_sparse_idx(bitmap: Int, bit: Int) : Int = bit_count(bit_and(bitmap, bit - 1))
-
-# ---- Collision-list primitives ----------------------------------
-#
-# A collision list is a small `[Pair[k, v]]` for keys sharing a full
-# 64-bit hash. It is scanned linearly; collisions are rare enough
-# that this never dominates (a non-adversarial workload sees at most
-# a handful of entries here, usually zero).
-
-fn coll_get(pairs: [Pair[k, v]], key: k) : Option[v] = match pairs {
-  []           -> None
-  [p, ...rest] -> if p.fst == key { Some(p.snd) } else { coll_get(rest, key) }
+pub type HashMap[k, v] = {
+  priv buckets : Ref[Array[[Pair[k, v]]]],
+  priv count   : Ref[Int],
+  priv cap     : Ref[Int]
 }
 
-# Replace `key`'s value if present, else append. Returns the new list
-# and whether the key was already present (so the caller can keep the
-# map's size count exact without a separate membership probe).
-fn coll_put(pairs: [Pair[k, v]], key: k, value: v) : Pair[[Pair[k, v]], Bool] = match pairs {
-  []           -> Pair { fst: [Pair { fst: key, snd: value }], snd: false }
-  [p, ...rest] ->
+fn hashmap_initial_cap() : Int = 16
+
+# Bucket index for a hash under capacity `cap`. Absorbs a negative
+# `hash` (the `impl Hash` contract permits two's-complement wrap).
+fn bucket_index(h: Int, cap: Int) : Int = {
+  let m = h % cap
+  if m < 0 { m + cap } else { m }
+}
+
+# ---- Chain primitives (pure over [Pair[k, v]]) ------------------
+
+fn chain_get(ps: [Pair[k, v]], key: k) : Option[v] = match ps {
+  []        -> None
+  [p, ...r] -> if p.fst == key { Some(p.snd) } else { chain_get(r, key) }
+}
+
+# Replace `key`'s value if present, else prepend. Returns the new
+# chain plus whether the key already existed (so the caller keeps the
+# live count exact without a separate probe).
+fn chain_put(ps: [Pair[k, v]], key: k, value: v) : Pair[[Pair[k, v]], Bool] = match ps {
+  []        -> Pair { fst: [Pair { fst: key, snd: value }], snd: false }
+  [p, ...r] ->
     if p.fst == key {
-      Pair { fst: [Pair { fst: key, snd: value }, ...rest], snd: true }
+      Pair { fst: [Pair { fst: key, snd: value }, ...r], snd: true }
     } else {
-      let sub = coll_put(rest, key, value)
+      let sub = chain_put(r, key, value)
       Pair { fst: [p, ...sub.fst], snd: sub.snd }
     }
 }
 
-fn coll_remove(pairs: [Pair[k, v]], key: k) : [Pair[k, v]] = match pairs {
-  []           -> []
-  [p, ...rest] -> if p.fst == key { rest } else { [p, ...coll_remove(rest, key)] }
+# Drop `key` from a chain. Returns the new chain plus whether a key
+# was actually removed.
+fn chain_remove(ps: [Pair[k, v]], key: k) : Pair[[Pair[k, v]], Bool] = match ps {
+  []        -> Pair { fst: [], snd: false }
+  [p, ...r] ->
+    if p.fst == key {
+      Pair { fst: r, snd: true }
+    } else {
+      let sub = chain_remove(r, key)
+      Pair { fst: [p, ...sub.fst], snd: sub.snd }
+    }
 }
 
-# ---- Branch child-list primitives -------------------------------
-#
-# Children are kept in a persistent `[HamtNode]` sized to
-# popcount(bitmap). `list.take`/`list.drop` rebuild the O(popcount)
-# prefix on each structural edit, which is bounded by 32 — cheaper
-# than threading a mutable Array through the pure carrier.
+# ---- Resize ------------------------------------------------------
 
-fn child_set(xs: [HamtNode[k, v]], i: Int, node: HamtNode[k, v]) : [HamtNode[k, v]] =
-  list.take(xs, i) ++ [node] ++ list.drop(xs, i + 1)
-
-fn child_insert(xs: [HamtNode[k, v]], i: Int, node: HamtNode[k, v]) : [HamtNode[k, v]] =
-  list.take(xs, i) ++ [node] ++ list.drop(xs, i)
-
-fn child_delete(xs: [HamtNode[k, v]], i: Int) : [HamtNode[k, v]] =
-  list.take(xs, i) ++ list.drop(xs, i + 1)
-
-# ---- Node-level operations --------------------------------------
-
-# A 1-child branch holding `node` at fragment `f`.
-fn hamt_single(f: Int, node: HamtNode[k, v]) : HamtNode[k, v] =
-  HBranch(bit_shl(1, f), [node])
-
-# Combine an existing leaf `(eh, ek, ev)` with a new entry
-# `(h, key, value)` known to differ in key. If the full hashes are
-# equal, the two become an `HCollision`; otherwise they are pushed
-# down until their fragments diverge, building intermediate single-
-# child branches as needed.
-fn hamt_merge_leaf(eh: Int, ek: k, ev: v, h: Int, key: k, value: v, shift: Int) : HamtNode[k, v] = {
-  if eh == h {
-    HCollision(h, [Pair { fst: ek, snd: ev }, Pair { fst: key, snd: value }])
-  } else {
-    let f1 = hamt_frag(eh, shift)
-    let f2 = hamt_frag(h, shift)
-    if f1 == f2 {
-      hamt_single(f1, hamt_merge_leaf(eh, ek, ev, h, key, value, shift + hamt_bits()))
-    } else {
-      let bitmap = bit_or(bit_shl(1, f1), bit_shl(1, f2))
-      let leaf_existing = HLeaf(eh, ek, ev)
-      let leaf_new      = HLeaf(h, key, value)
-      # `kids` is ordered by fragment so the bitmap/compressed-index
-      # mapping holds.
-      if f1 < f2 { HBranch(bitmap, [leaf_existing, leaf_new]) }
-      else       { HBranch(bitmap, [leaf_new, leaf_existing]) }
-    }
+# Scatter one chain's pairs into the destination bucket array under
+# `new_cap`. Order within a destination bucket is not preserved (and
+# is unspecified anyway).
+fn rehash_chain(ps: [Pair[k, v]], dst: Array[[Pair[k, v]]], new_cap: Int) : Unit / Mutable = match ps {
+  []        -> ()
+  [p, ...r] -> {
+    let j = bucket_index(hash(p.fst), new_cap)
+    dst[j] := [p, ...dst[j]]
+    rehash_chain(r, dst, new_cap)
   }
 }
 
-# Insert/replace `(h, key, value)` into `node` at `shift`. Returns
-# the new node and whether the key was already present (drives the
-# map's size count).
-fn hamt_put(node: HamtNode[k, v], h: Int, key: k, value: v, shift: Int) : Pair[HamtNode[k, v], Bool] = match node {
-  HEmpty -> Pair { fst: HLeaf(h, key, value), snd: false }
-  HLeaf(lh, lk, lv) ->
-    if lh == h and lk == key {
-      Pair { fst: HLeaf(h, key, value), snd: true }
-    } else {
-      Pair { fst: hamt_merge_leaf(lh, lk, lv, h, key, value, shift), snd: false }
-    }
-  HCollision(ch, pairs) ->
-    if ch == h {
-      let cp = coll_put(pairs, key, value)
-      Pair { fst: HCollision(ch, cp.fst), snd: cp.snd }
-    } else {
-      # Different hash than the collision bucket: lift the bucket
-      # into a branch at this level, then retry the insert there.
-      let lifted = hamt_single(hamt_frag(ch, shift), HCollision(ch, pairs))
-      hamt_put(lifted, h, key, value, shift)
-    }
-  HBranch(bitmap, kids) -> {
-    let f = hamt_frag(h, shift)
-    let bit = bit_shl(1, f)
-    let i = hamt_sparse_idx(bitmap, bit)
-    if bit_and(bitmap, bit) == 0 {
-      Pair { fst: HBranch(bit_or(bitmap, bit), child_insert(kids, i, HLeaf(h, key, value))), snd: false }
-    } else {
-      match list.nth(kids, i) {
-        Some(child) -> {
-          let sub = hamt_put(child, h, key, value, shift + hamt_bits())
-          Pair { fst: HBranch(bitmap, child_set(kids, i, sub.fst)), snd: sub.snd }
-        }
-        None -> Pair { fst: HBranch(bitmap, kids), snd: false }
-      }
-    }
-  }
+fn rehash_loop(src: Array[[Pair[k, v]]], i: Int, cap: Int,
+               dst: Array[[Pair[k, v]]], new_cap: Int) : Unit / Mutable =
+  if i >= cap { () }
+  else { rehash_chain(src[i], dst, new_cap); rehash_loop(src, i + 1, cap, dst, new_cap) }
+
+# Grow + rehash when the load factor passes 0.75. Allocates a fresh
+# bucket array of double the capacity and swaps it in through the Ref.
+fn maybe_grow(m: HashMap[k, v]) : Unit / Mutable = {
+  let cap = Mutable.ref_get(m.cap)
+  let cnt = Mutable.ref_get(m.count)
+  if cnt * 4 > cap * 3 {
+    let new_cap = cap * 2
+    let src = Mutable.ref_get(m.buckets)
+    let dst = Mutable.array_make(new_cap, [])
+    rehash_loop(src, 0, cap, dst, new_cap)
+    Mutable.ref_set(m.buckets, dst)
+    Mutable.ref_set(m.cap, new_cap)
+  } else { () }
 }
 
-fn hamt_get(node: HamtNode[k, v], h: Int, key: k, shift: Int) : Option[v] = match node {
-  HEmpty -> None
-  HLeaf(lh, lk, lv) -> if lh == h and lk == key { Some(lv) } else { None }
-  HCollision(ch, pairs) -> if ch == h { coll_get(pairs, key) } else { None }
-  HBranch(bitmap, kids) -> {
-    let bit = bit_shl(1, hamt_frag(h, shift))
-    if bit_and(bitmap, bit) == 0 { None }
-    else {
-      match list.nth(kids, hamt_sparse_idx(bitmap, bit)) {
-        Some(child) -> hamt_get(child, h, key, shift + hamt_bits())
-        None        -> None
-      }
-    }
-  }
-}
+# ---- Iteration helper -------------------------------------------
 
-# Remove `key` from `node`. A subtree that becomes empty returns
-# `HEmpty` so the parent prunes its bitmap slot; an `HCollision`
-# that drops to a single pair collapses back to an `HLeaf`. The
-# `Bool` reports whether a key was actually removed (drives size).
-fn hamt_remove(node: HamtNode[k, v], h: Int, key: k, shift: Int) : Pair[HamtNode[k, v], Bool] = match node {
-  HEmpty -> Pair { fst: HEmpty, snd: false }
-  HLeaf(lh, lk, lv) ->
-    if lh == h and lk == key { Pair { fst: HEmpty, snd: true } }
-    else { Pair { fst: HLeaf(lh, lk, lv), snd: false } }
-  HCollision(ch, pairs) ->
-    if ch == h {
-      let np = coll_remove(pairs, key)
-      let removed = list.length(np) != list.length(pairs)
-      match np {
-        []     -> Pair { fst: HEmpty, snd: removed }
-        [only] -> Pair { fst: HLeaf(ch, only.fst, only.snd), snd: removed }
-        _      -> Pair { fst: HCollision(ch, np), snd: removed }
-      }
-    } else {
-      Pair { fst: HCollision(ch, pairs), snd: false }
-    }
-  HBranch(bitmap, kids) -> {
-    let f = hamt_frag(h, shift)
-    let bit = bit_shl(1, f)
-    if bit_and(bitmap, bit) == 0 {
-      Pair { fst: HBranch(bitmap, kids), snd: false }
-    } else {
-      let i = hamt_sparse_idx(bitmap, bit)
-      match list.nth(kids, i) {
-        None -> Pair { fst: HBranch(bitmap, kids), snd: false }
-        Some(child) -> {
-          let sub = hamt_remove(child, h, key, shift + hamt_bits())
-          match sub.fst {
-            HEmpty -> {
-              let nkids = child_delete(kids, i)
-              let nbitmap = bit_and(bitmap, bit_not(bit))
-              # A branch emptied of children collapses to HEmpty so
-              # the grandparent can prune in turn.
-              match nkids {
-                [] -> Pair { fst: HEmpty, snd: sub.snd }
-                _  -> Pair { fst: HBranch(nbitmap, nkids), snd: sub.snd }
-              }
-            }
-            _ -> Pair { fst: HBranch(bitmap, child_set(kids, i, sub.fst)), snd: sub.snd }
-          }
-        }
-      }
-    }
-  }
-}
-
-# In-order-ish traversal: emit leaves left-to-right by compressed
-# slot order. The accumulator is the suffix that follows the current
-# subtree, keeping the right spine tail-shaped. Within an
-# `HCollision`, pairs come out in stored order.
-fn hamt_to_pairs(node: HamtNode[k, v], acc: [Pair[k, v]]) : [Pair[k, v]] = match node {
-  HEmpty -> acc
-  HLeaf(_, lk, lv) -> [Pair { fst: lk, snd: lv }, ...acc]
-  HCollision(_, pairs) -> pairs ++ acc
-  HBranch(_, kids) -> hamt_children_to_pairs(kids, acc)
-}
-
-fn hamt_children_to_pairs(kids: [HamtNode[k, v]], acc: [Pair[k, v]]) : [Pair[k, v]] = match kids {
-  []           -> acc
-  [c, ...rest] -> hamt_to_pairs(c, hamt_children_to_pairs(rest, acc))
-}
+fn collect_buckets(arr: Array[[Pair[k, v]]], i: Int, cap: Int, acc: [Pair[k, v]]) : [Pair[k, v]] / Mutable =
+  if i >= cap { acc }
+  else { collect_buckets(arr, i + 1, cap, arr[i] ++ acc) }
 
 # ---- Public surface (12 fns, issue #374) ------------------------
 
-pub fn hashmap_empty() : HashMap[k, v] = HashMap { root: HEmpty, size: 0 }
+pub fn hashmap_empty() : HashMap[k, v] / Mutable = {
+  let cap0 = hashmap_initial_cap()
+  let arr = Mutable.array_make(cap0, [])
+  HashMap {
+    buckets: Mutable.ref_make(arr),
+    count:   Mutable.ref_make(0),
+    cap:     Mutable.ref_make(cap0)
+  }
+}
 
-pub fn hashmap_size(m: HashMap[k, v]) : Int = m.size
+pub fn hashmap_size(m: HashMap[k, v]) : Int / Mutable = Mutable.ref_get(m.count)
 
-pub fn hashmap_is_empty(m: HashMap[k, v]) : Bool = m.size == 0
+pub fn hashmap_is_empty(m: HashMap[k, v]) : Bool / Mutable = Mutable.ref_get(m.count) == 0
 
-pub fn hashmap_get(m: HashMap[k, v], key: k) : Option[v] =
-  hamt_get(m.root, hash(key), key, 0)
+pub fn hashmap_get(m: HashMap[k, v], key: k) : Option[v] / Mutable = {
+  let arr = Mutable.ref_get(m.buckets)
+  let cap = Mutable.ref_get(m.cap)
+  chain_get(arr[bucket_index(hash(key), cap)], key)
+}
 
-pub fn hashmap_contains(m: HashMap[k, v], key: k) : Bool = match hashmap_get(m, key) {
+pub fn hashmap_contains(m: HashMap[k, v], key: k) : Bool / Mutable = match hashmap_get(m, key) {
   Some(_) -> true
   None    -> false
 }
 
-pub fn hashmap_put(m: HashMap[k, v], key: k, value: v) : HashMap[k, v] = {
-  let res = hamt_put(m.root, hash(key), key, value, 0)
-  let new_size = if res.snd { m.size } else { m.size + 1 }
-  HashMap { root: res.fst, size: new_size }
+pub fn hashmap_put(m: HashMap[k, v], key: k, value: v) : Unit / Mutable = {
+  let arr = Mutable.ref_get(m.buckets)
+  let cap = Mutable.ref_get(m.cap)
+  let i = bucket_index(hash(key), cap)
+  let res = chain_put(arr[i], key, value)
+  arr[i] := res.fst
+  if not res.snd {
+    Mutable.ref_set(m.count, Mutable.ref_get(m.count) + 1)
+    maybe_grow(m)
+  } else { () }
 }
 
-pub fn hashmap_remove(m: HashMap[k, v], key: k) : HashMap[k, v] = {
-  let res = hamt_remove(m.root, hash(key), key, 0)
-  let new_size = if res.snd { m.size - 1 } else { m.size }
-  HashMap { root: res.fst, size: new_size }
+pub fn hashmap_remove(m: HashMap[k, v], key: k) : Unit / Mutable = {
+  let arr = Mutable.ref_get(m.buckets)
+  let cap = Mutable.ref_get(m.cap)
+  let i = bucket_index(hash(key), cap)
+  let res = chain_remove(arr[i], key)
+  arr[i] := res.fst
+  if res.snd {
+    Mutable.ref_set(m.count, Mutable.ref_get(m.count) - 1)
+  } else { () }
 }
 
-pub fn hashmap_to_pairs(m: HashMap[k, v]) : [Pair[k, v]] =
-  hamt_to_pairs(m.root, [])
+pub fn hashmap_to_pairs(m: HashMap[k, v]) : [Pair[k, v]] / Mutable = {
+  let arr = Mutable.ref_get(m.buckets)
+  let cap = Mutable.ref_get(m.cap)
+  collect_buckets(arr, 0, cap, [])
+}
 
-pub fn hashmap_keys(m: HashMap[k, v]) : [k] =
+pub fn hashmap_keys(m: HashMap[k, v]) : [k] / Mutable =
   list.map(hashmap_to_pairs(m), (p) => p.fst)
 
-pub fn hashmap_values(m: HashMap[k, v]) : [v] =
+pub fn hashmap_values(m: HashMap[k, v]) : [v] / Mutable =
   list.map(hashmap_to_pairs(m), (p) => p.snd)
 
-# Fold left, applying `put` per pair so duplicate keys in the input
-# collapse to the last occurrence (standard from-pairs semantics).
-fn from_pairs_loop(ps: [Pair[k, v]], acc: HashMap[k, v]) : HashMap[k, v] = match ps {
-  []           -> acc
-  [p, ...rest] -> from_pairs_loop(rest, hashmap_put(acc, p.fst, p.snd))
+# Build a fresh table from pairs; duplicate keys collapse to the last
+# occurrence (standard `from_pairs` semantics, via `put`).
+fn from_pairs_loop(ps: [Pair[k, v]], acc: HashMap[k, v]) : Unit / Mutable = match ps {
+  []           -> ()
+  [p, ...rest] -> { hashmap_put(acc, p.fst, p.snd); from_pairs_loop(rest, acc) }
 }
 
-pub fn hashmap_from_pairs(ps: [Pair[k, v]]) : HashMap[k, v] =
-  from_pairs_loop(ps, hashmap_empty())
-
-# Left-biased merge: keys present in `a` win on conflict. `b`'s pairs
-# are folded into `a` with a `put` that fires only when the key is
-# absent in `a`. O(n_b · log32 n) — one `contains` + at most one
-# `put` per pair of `b`.
-fn merge_loop(ps: [Pair[k, v]], acc: HashMap[k, v]) : HashMap[k, v] = match ps {
-  []           -> acc
-  [p, ...rest] ->
-    if hashmap_contains(acc, p.fst) { merge_loop(rest, acc) }
-    else { merge_loop(rest, hashmap_put(acc, p.fst, p.snd)) }
+pub fn hashmap_from_pairs(ps: [Pair[k, v]]) : HashMap[k, v] / Mutable = {
+  let m = hashmap_empty()
+  from_pairs_loop(ps, m)
+  m
 }
 
-pub fn hashmap_merge(a: HashMap[k, v], b: HashMap[k, v]) : HashMap[k, v] =
+# Left-biased merge: fold `b`'s pairs into `a`, keeping `a`'s value on
+# conflict. MUTATES `a` (and returns Unit) — `a` is the surviving
+# table. `b` is read-only.
+fn merge_loop(ps: [Pair[k, v]], acc: HashMap[k, v]) : Unit / Mutable = match ps {
+  []           -> ()
+  [p, ...rest] -> {
+    if hashmap_contains(acc, p.fst) { () } else { hashmap_put(acc, p.fst, p.snd) }
+    merge_loop(rest, acc)
+  }
+}
+
+pub fn hashmap_merge(a: HashMap[k, v], b: HashMap[k, v]) : Unit / Mutable =
   merge_loop(hashmap_to_pairs(b), a)
