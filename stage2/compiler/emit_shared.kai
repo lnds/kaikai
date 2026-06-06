@@ -67,10 +67,44 @@ import compiler.unbox
 pub type EVar = EV(String, Int, [TypeExpr], Int)
 
 #[doc("EFn-table filter/selector: prefer module.")]
+# Issue #748: when lowering the body of module `m`, rotate the EFn table
+# so `m`'s own entries come first AND prune any root-file (`mo = None`)
+# entry whose bare name `m` ALSO defines. The prune is the load-bearing
+# half: without it, `efn_resolve` -> `efn_pick_root` grabs the user's
+# root shadow (`kai_sum`) for a bare self-call inside `list.sum`, so the
+# stdlib body links against the user's 2-arg `fn sum` (`#748`). After the
+# prune, the only `sum` left visible to `list`'s body is `list`'s own, so
+# the recursive call mangles to `kai_list__sum`. The user's root `sum`
+# survives in every OTHER body's table (root bodies pass `mo = None`,
+# which returns `fns` untouched — the user shadow still wins there). The
+# prune keys on `mo = None`, so its soundness rests on one invariant:
+# every `mo = None` EFn in the table originates in the USER's root file
+# (the only None-tagged source — imports are stamped `Some(<mod>)` by
+# `tag_decls_module_origin`, prelude segments by the loader, and the root
+# file's own pub fns by `tag_target_decl`). Under that invariant a
+# same-name `mo = None` entry in a module body's scope is always the user
+# shadow we must hide, never a wanted target (a module body cannot call a
+# user fn by bare name — it never saw the user's decls). If a future pass
+# ever injects a program-level `mo = None` DFn from somewhere OTHER than
+# the root file, this invariant breaks and the prune could hide a real
+# dependency; such synthetics must carry a module tag. This single
+# rotation+prune fixes both backends at once — every call site reads the
+# rotated table — without threading a `cur_mo` through the
+# (44-constructor) LlvmEmit / EmitCtx records.
 pub fn fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
   None    -> fns
-  Some(m) -> list_append(fns_filter_same_module(fns, m, []),
-                          fns_filter_other_module(fns, m, []))
+  Some(m) -> {
+    let same = fns_filter_same_module(fns, m, [])
+    let shadowed = efn_names_of(same, [])
+    list_append(same,
+                fns_filter_other_module_pruned(fns, m, shadowed, []))
+  }
+}
+
+#[doc("Collect the bare names present in an EFn list (used to prune colliding root shadows, #748).")]
+pub fn efn_names_of(fns: [EFn], acc: [String]) : [String] = match fns {
+  [] -> list_reverse(acc)
+  [h, ...rest] -> match h { EFn(n, _, _, _) -> efn_names_of(rest, [n, ...acc]) }
 }
 
 #[doc("EFn-table filter/selector: filter same module.")]
@@ -95,6 +129,27 @@ pub fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
         if em == m { fns_filter_other_module(rest, m, acc) }
         else       { fns_filter_other_module(rest, m, [h, ...acc]) }
       _ -> fns_filter_other_module(rest, m, [h, ...acc])
+    }
+  }
+}
+
+#[doc("EFn-table filter/selector: like fns_filter_other_module, but drop root-file (mo=None) entries whose name is in `shadowed` — the same-module names that must not be shadowed by the user's root decls (#748).")]
+pub fn fns_filter_other_module_pruned(fns: [EFn], m: String, shadowed: [String], acc: [EFn]) : [EFn] {
+  match fns {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      # Same module as the body: already emitted first by fns_filter_same_module.
+      EFn(_, _, Some(em), _) ->
+        if em == m { fns_filter_other_module_pruned(rest, m, shadowed, acc) }
+        else       { fns_filter_other_module_pruned(rest, m, shadowed, [h, ...acc]) }
+      # Root-file entry: drop it when the body's module redefines the
+      # same bare name, so `efn_pick_root` cannot pick the user shadow
+      # for a bare self-call inside the module body (#748). A root entry
+      # whose name the module does NOT redefine stays — the module body
+      # might legitimately reference it (rare, but preserves old behaviour).
+      EFn(n, _, None, _) ->
+        if list_has(shadowed, n) { fns_filter_other_module_pruned(rest, m, shadowed, acc) }
+        else                     { fns_filter_other_module_pruned(rest, m, shadowed, [h, ...acc]) }
     }
   }
 }
