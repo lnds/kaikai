@@ -252,7 +252,8 @@ stdlib/
     tuple.kai
     ordering.kai
   collections/   pure, stage 2
-    map.kai
+    map.kai      (AVL-tree ordered map — #128)
+    hashmap.kai  (HAMT hash map — shipped via #374)
     set.kai
   math/          pure, stage 2
     int.kai      (shipped; `log2` + `div_mod` shipped via #347; `abs`, `signum`, `clamp`, `pow` provided by `Numeric for Int` — #347 closed)
@@ -322,6 +323,7 @@ land in each module's own spec when implemented.
 ### collections (pure, stage 2)
 
 - `collections.map` — AVL-tree-backed ordered map (canonical qualified-call style as of #613): `empty`, `size`, `is_empty`, `get`, `contains`, `put`, `remove`, `keys`, `values`, `to_pairs`, `from_pairs`, `update`, `fold`, `merge`, `filter`, `transform_values` (16 pub fns); `map`, `flat_map`, `filter` exported with `Pair[k, v]` element shape so `Map[k, v]` participates in `|`, `||`, `|?` per #594. Legacy flat-prefix aliases (`map_empty`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_put`, `map_remove`, `map_to_pairs`, `map_keys`, `map_values`, `map_from_pairs` — 11 one-liners) retained for the tongariki edition and scheduled to drop at the Orongo edition boundary.
+- `collections.hashmap` — HAMT-backed (Hash Array Mapped Trie) hash map, shipped via #374. Flat `hashmap_*` surface (the names pinned by the issue): `hashmap_empty`, `hashmap_size`, `hashmap_is_empty`, `hashmap_get`, `hashmap_contains`, `hashmap_put`, `hashmap_remove`, `hashmap_keys`, `hashmap_values`, `hashmap_to_pairs`, `hashmap_from_pairs`, `hashmap_merge` (12 pub fns). Pure / persistent; branching factor 32 (5 bits/level), bitmap-compressed children. Iteration order is hash-derived (unspecified) but stable across same-input runs — use `collections.map` (AVL) for ordered iteration. Keys need `impl Hash` + structural `==`; primitives and user **sum types** dispatch through the generic boundary, user **records** do not yet (compiler dispatch gap, see lane retro). The `m[key]` read-side sugar does NOT yet dispatch to `hashmap_get` — a typer follow-up (out of the stdlib lane's scope). No HashDoS mitigation in v1. Benchmark vs AVL `Map` lives in `benchmarks/hashmap/`.
 - `collections.set` — ordered set: empty, insert, remove, contains, union, intersection
 
 ### math (pure, stage 2)
