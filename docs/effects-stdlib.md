@@ -745,7 +745,7 @@ cannot run if the OS cannot provide it.
   is fine through MVP-scale use cases.
 
 ## `NetTcp`, `NetUdp`, `NetDns` (alias `Net`)
-<!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
+<!-- coverage: skip --> NetTcp shipped (examples/effects/net_tcp_localhost.kai), NetDns shipped #352 (examples/effects/net_dns_resolve.kai); NetUdp still post-MVP — remove this marker when the NetUdp fixture lands
 
 ### Declaration
 
@@ -767,7 +767,7 @@ effect NetUdp {
 }
 
 effect NetDns {
-  resolve(host: String)                         : Result[[IpAddr], String]
+  resolve(host: String)                         : Result[String, [IpAddr]]
 }
 
 type Net = NetTcp + NetUdp + NetDns
@@ -785,9 +785,14 @@ new effects of their own. An HTTP client uses `/ NetTcp + NetDns`;
 a UDP-only DNS-over-UDP probe uses `/ NetUdp + NetDns`.
 
 `Conn`, `Listener`, `UdpSocket`, `IpAddr`, and `SocketAddr` are
-opaque types declared by the `net.tcp` / `net.udp` / `net.dns`
-modules. v1 treats them as nominal handles; their internal
-representation is implementation-defined.
+opaque companion types injected by the compiler alongside their
+effect (e.g. `Conn` / `Listener` with `NetTcp`, `IpAddr` with
+`NetDns`), not declared in the `net.*` stdlib modules — the effect
+op signatures reference them, so the typer must know them at
+injection time. v1 treats them as nominal handles; `IpAddr` carries
+the textual IPv4 form (`{ addr: String }`) so it round-trips through
+logging without a second decoder, while the rest stay
+representation-opaque.
 
 ### Why three effects with an alias
 
@@ -852,9 +857,19 @@ state visible to user code.
 > cooperative (`docs/structured-concurrency.md` §"Non-goals"): a
 > fiber parked in `recv` / `accept` / `connect` is interrupted at
 > the park boundary, not mid-syscall. Issue #630 closes the reactor
-> for Hanga Roa; `NetUdp` and `NetDns` are still not installed —
-> their runtime handlers, compiler builtins, and
-> `stdlib/net/{udp,dns}.kai` modules are post-MVP.
+> for Hanga Roa.
+>
+> **NetDns (issue #352, 2026-06-06):** `NetDns.resolve` is now
+> installed — runtime handler (`kai_default_netdns_resolve`, a
+> `getaddrinfo(3)` shim restricted to `AF_INET`), compiler builtin
+> (`builtin_netdns_decl` + the `IpAddr` companion type), and the
+> `stdlib/net/dns.kai` module (`resolve` / `resolve_first` /
+> `with_dns`). Unlike the four `NetTcp` ops above, `resolve` does
+> **not** park the fiber on the reactor yet: getaddrinfo is a
+> blocking libc call that runs on the OS thread for v1 (same floor
+> as `Signal.await`). `NetUdp` is still not installed — its runtime
+> handler, compiler builtin, and `stdlib/net/udp.kai` module are
+> post-MVP.
 
 ### Stdlib helper
 
@@ -868,6 +883,21 @@ pub fn tcp_connect_or_fail(host: String, port: Int) : Conn / NetTcp + Fail {
     Err(m) -> Fail.fail("connect #{host}:#{port}: #{m}")
   }
 }
+```
+
+`stdlib/net/dns.kai` (issue #352) ships the `NetDns` surface:
+`resolve(host) : Result[String, [IpAddr]] / NetDns` (thin pass-
+through to the op), `resolve_first(host) : Result[String, IpAddr] /
+NetDns` (first address, or `Err` when the host resolves to none),
+and `with_dns(resolver, body)` — a handler installer that runs
+`body` against a caller-supplied resolver instead of the
+getaddrinfo default, so a test or an allow-list resolver can
+intercept name resolution without touching the network:
+
+```kai
+let stub = (h) => Ok([IpAddr { addr: "127.0.0.1" }])
+let r = with_dns(stub, () => resolve_first("anything"))
+# r == Ok(IpAddr { addr: "127.0.0.1" })
 ```
 
 ### What's not in v1 (planned extensions)
