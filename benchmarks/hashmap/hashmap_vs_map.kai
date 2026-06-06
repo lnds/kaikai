@@ -1,90 +1,117 @@
-# benchmarks/hashmap/hashmap_vs_map.kai — AVL Map vs HAMT HashMap.
+# benchmarks/hashmap/hashmap_vs_map.kai — mutable HashMap vs AVL Map.
 #
-# Issue #374: document the crossover between the ordered AVL `Map`
-# (O(log n) tree walk) and the HAMT `HashMap` (O(log32 n) ≈ O(1)
-# practical) across N = 100, 1K, 10K, 100K.
+# Issue #374: compare the mutable hash table `HashMap` against the
+# ordered AVL `Map` across N = 100, 1K, 10K, 100K, and document the
+# crossover.
 #
 # Run with:
 #
-#   bin/kai bench benchmarks/hashmap/hashmap_vs_map.kai
-#   KAI_BENCH_ITERS=200 KAI_BENCH_WARMUP=20 bin/kai bench \
-#       benchmarks/hashmap/hashmap_vs_map.kai
+#   bin/kai run benchmarks/hashmap/hashmap_vs_map.kai
 #
-# Each `bench` block reports median ns / MAD / mean / range. The
-# numbers vary per run and machine; the comparison of interest is
-# Map-vs-HashMap at the same N, and how the ratio shifts as N grows.
-# See README.md for the crossover analysis and a sample run.
+# This is a `main` + `Clock` timing program, NOT a `kai bench` fixture:
+# `kai bench` currently segfaults on any block body carrying the
+# `Mutable` effect (a trivial `Mutable.ref_make` body crashes it too),
+# so the HashMap blocks cannot run under the bench harness. That is a
+# pre-existing bench/effect-runtime bug, unrelated to this carrier —
+# documented in docs/lane-experience-issue-374.md. We time with the
+# monotonic clock instead, which works fine under `Mutable`.
 #
-# `kai bench` has no setup hook — the whole block body is the timed
-# region — so we cannot pre-build a map once and time only lookups.
-# Instead each block measures one of two honest end-to-end workloads,
-# identical between the two structures so the ratio is fair:
+# Two workloads, identical between the structures:
+#   build      — N puts from empty (HashMap mutates in place + resizes;
+#                Map threads a fresh value per put).
+#   lookup     — N gets over a pre-built map.
 #
-#   build_*  — N puts from empty. Allocation + spine-rebuild cost.
-#              This is where the O(log n) vs O(log32 n) depth gap and
-#              the AVL rebalance constant show up most directly.
-#   roundtrip_* — N puts from empty, then N gets back. The populate-
-#              and-query workload a registry / dedup table actually
-#              runs. Build dominates, but the lookup tail is included
-#              for both, so the comparison stays apples-to-apples.
-#
-# Keys are `Int` (Map's `<` and HashMap's `hash` both dispatch on the
-# stdlib primitive impls). Values are `Int`.
+# Keys are `Int`.
 
 import collections.map
 import collections.hashmap
+import time
 
-# ---- builders ----------------------------------------------------
+# ---- AVL Map (pure) ----------------------------------------------
 
 fn build_map(i: Int, n: Int, m: Map[Int, Int]) : Map[Int, Int] =
   if i >= n { m } else { build_map(i + 1, n, map.put(m, i, i * 2)) }
 
-fn build_hashmap(i: Int, n: Int, m: HashMap[Int, Int]) : HashMap[Int, Int] =
-  if i >= n { m } else { build_hashmap(i + 1, n, hashmap.hashmap_put(m, i, i * 2)) }
-
-# ---- lookup loops (sum the hits so the work is not dead-code) -----
-
-fn lookup_map(i: Int, n: Int, m: Map[Int, Int], acc: Int) : Int =
+fn lookup_map(m: Map[Int, Int], i: Int, n: Int, acc: Int) : Int =
   if i >= n { acc }
   else {
     let v = match map.get(m, i) { Some(x) -> x  None -> 0 }
-    lookup_map(i + 1, n, m, acc + v)
+    lookup_map(m, i + 1, n, acc + v)
   }
 
-fn lookup_hashmap(i: Int, n: Int, m: HashMap[Int, Int], acc: Int) : Int =
+# ---- mutable HashMap ---------------------------------------------
+
+fn build_hashmap(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
+  if i >= n { () } else { hashmap.put(m, i, i * 2); build_hashmap(m, i + 1, n) }
+
+fn lookup_hashmap(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
   if i >= n { acc }
   else {
-    let v = match hashmap.hashmap_get(m, i) { Some(x) -> x  None -> 0 }
-    lookup_hashmap(i + 1, n, m, acc + v)
+    let v = match hashmap.get(m, i) { Some(x) -> x  None -> 0 }
+    lookup_hashmap(m, i + 1, n, acc + v)
   }
 
-fn roundtrip_map(n: Int) : Int = lookup_map(0, n, build_map(0, n, map.empty()), 0)
-fn roundtrip_hashmap(n: Int) : Int = lookup_hashmap(0, n, build_hashmap(0, n, hashmap.hashmap_empty()), 0)
+# ---- timing ------------------------------------------------------
 
-# ---- build benchmarks (N puts from empty) ------------------------
+fn elapsed_ms(a: Instant, b: Instant) : Int =
+  ((b.secs - a.secs) * 1000000000 + (b.nanos - a.nanos)) / 1000000
 
-bench "build map      N=100"    { build_map(0, 100, map.empty()) }
-bench "build hashmap  N=100"    { build_hashmap(0, 100, hashmap.hashmap_empty()) }
+fn bench_n(n: Int) : Unit / Stdout + Mutable + Clock = {
+  # Map build
+  let tm0 = Clock.monotonic_now()
+  let bm = build_map(0, n, map.empty())
+  let tm1 = Clock.monotonic_now()
+  let rm = lookup_map(bm, 0, n, 0)
+  let tm2 = Clock.monotonic_now()
+  # HashMap build
+  let hm = hashmap.empty()
+  let th0 = Clock.monotonic_now()
+  build_hashmap(hm, 0, n)
+  let th1 = Clock.monotonic_now()
+  let rh = lookup_hashmap(hm, 0, n, 0)
+  let th2 = Clock.monotonic_now()
+  let line = "N=" ++ int_to_string(n) ++
+    "  | map build " ++ int_to_string(elapsed_ms(tm0, tm1)) ++ "ms lookup " ++ int_to_string(elapsed_ms(tm1, tm2)) ++ "ms" ++
+    "  | hashmap build " ++ int_to_string(elapsed_ms(th0, th1)) ++ "ms lookup " ++ int_to_string(elapsed_ms(th1, th2)) ++ "ms" ++
+    "  (checksums " ++ int_to_string(rm) ++ "/" ++ int_to_string(rh) ++ ")"
+  Stdout.print(line)
+}
 
-bench "build map      N=1000"   { build_map(0, 1000, map.empty()) }
-bench "build hashmap  N=1000"   { build_hashmap(0, 1000, hashmap.hashmap_empty()) }
+# Hammer lookups: REPS gets cycling over keys 0..N-1 on a pre-built
+# map, so the pure walk cost dominates (build excluded from timing).
+fn hammer_map(m: Map[Int, Int], i: Int, reps: Int, n: Int, acc: Int) : Int =
+  if i >= reps { acc }
+  else {
+    let v = match map.get(m, i % n) { Some(x) -> x  None -> 0 }
+    hammer_map(m, i + 1, reps, n, acc + v)
+  }
+fn hammer_hashmap(m: HashMap[Int, Int], i: Int, reps: Int, n: Int, acc: Int) : Int / Mutable =
+  if i >= reps { acc }
+  else {
+    let v = match hashmap.get(m, i % n) { Some(x) -> x  None -> 0 }
+    hammer_hashmap(m, i + 1, reps, n, acc + v)
+  }
 
-bench "build map      N=10000"  { build_map(0, 10000, map.empty()) }
-bench "build hashmap  N=10000"  { build_hashmap(0, 10000, hashmap.hashmap_empty()) }
+fn lookup_bench(n: Int, reps: Int) : Unit / Stdout + Mutable + Clock = {
+  let bm = build_map(0, n, map.empty())
+  let hm = hashmap.empty()
+  build_hashmap(hm, 0, n)
+  let tm0 = Clock.monotonic_now()
+  let rm = hammer_map(bm, 0, reps, n, 0)
+  let tm1 = Clock.monotonic_now()
+  let rh = hammer_hashmap(hm, 0, reps, n, 0)
+  let tm2 = Clock.monotonic_now()
+  let line = "lookup-hammer N=" ++ int_to_string(n) ++ " reps=" ++ int_to_string(reps) ++
+    "  | map " ++ int_to_string(elapsed_ms(tm0, tm1)) ++ "ms" ++
+    "  | hashmap " ++ int_to_string(elapsed_ms(tm1, tm2)) ++ "ms" ++
+    "  (checksums " ++ int_to_string(rm) ++ "/" ++ int_to_string(rh) ++ ")"
+  Stdout.print(line)
+}
 
-bench "build map      N=100000" { build_map(0, 100000, map.empty()) }
-bench "build hashmap  N=100000" { build_hashmap(0, 100000, hashmap.hashmap_empty()) }
-
-# ---- round-trip benchmarks (N puts then N gets) ------------------
-
-bench "roundtrip map      N=100"    { roundtrip_map(100) }
-bench "roundtrip hashmap  N=100"    { roundtrip_hashmap(100) }
-
-bench "roundtrip map      N=1000"   { roundtrip_map(1000) }
-bench "roundtrip hashmap  N=1000"   { roundtrip_hashmap(1000) }
-
-bench "roundtrip map      N=10000"  { roundtrip_map(10000) }
-bench "roundtrip hashmap  N=10000"  { roundtrip_hashmap(10000) }
-
-bench "roundtrip map      N=100000" { roundtrip_map(100000) }
-bench "roundtrip hashmap  N=100000" { roundtrip_hashmap(100000) }
+fn main() : Unit / Stdout + Mutable + Clock = {
+  bench_n(100)
+  bench_n(1000)
+  bench_n(10000)
+  bench_n(100000)
+  lookup_bench(10000, 1000000)
+}
