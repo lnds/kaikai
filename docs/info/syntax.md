@@ -27,6 +27,7 @@ unit m                                         # unit of measure
 unit s
 
 fn add(a: Int, b: Int) : Int = a + b           # short body
+fn add3(a, b, c: Int) : Int = a + b + c        # grouped: a, b, c all Int
 fn double(n: Int) : Int { n * 2 }              # block body
 fn greet(name: String) : Unit / Logger {       # with effect row
   Logger.log("hi #{name}")
