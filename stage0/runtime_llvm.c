@@ -721,6 +721,13 @@ KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     return kai_default_nettcp_close(self, c, k);
 }
 
+/* Issue #352 — LLVM-visible forwarder for the NetDns default handler
+ * (getaddrinfo shim in runtime.h). Installed by name from
+ * `kai_main_install_defaults` when `NetDns` appears in main's row. */
+KaiValue *kaix_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
+    return kai_default_netdns_resolve(self, host, k);
+}
+
 /* Issue #141 — LLVM-visible wrappers around the static Log default
  * handlers in runtime.h. The LLVM emitter installs these by name
  * from `kai_main_install_defaults` when `Log` appears in main's
