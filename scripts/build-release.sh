@@ -127,6 +127,11 @@ chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
 # the tagged-Int path, and fails (undeclared kai_intf) the moment a
 # kai.toml project pulls in stdlib that does — which is why releases have
 # failed intermittently since stage2 became the compiler.
+#
+# The llvm-c-parity lane unified the LLVM shim (runtime_llvm.c) onto the
+# same stage2 runtime.h, so this one header now serves BOTH backends when
+# installed: bin/kai points RUNTIME_INC (LLVM) and RUNTIME_INC_C (C) at
+# share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 

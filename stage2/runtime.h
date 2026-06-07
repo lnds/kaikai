@@ -4037,6 +4037,15 @@ static inline void kai_reuse_free(KaiReuse at) {
     kai_rc_live_now--;
 #ifdef KAI_TRACE_RC
     kai_rc_reuse_free_total++;
+    /* Per-tag free accounting (issue #296 table). `kai_var_block_free`
+     * recycles the block directly, bypassing `kai_free_value`, so the
+     * per-tag `frees` counter would otherwise stay flat while `allocs`
+     * climbed — inflating the reported `live=allocs-frees` by exactly the
+     * reuse_free count even though the cells are genuinely reclaimed (RSS
+     * flat). Mirror kai_free_value's bump so `live` reflects real liveness
+     * under arm-top reuse (this surfaced as a false LEAK in the #747 trace
+     * once the LLVM backend began freeing unconsumed reuse tokens). */
+    kai_rc_free_by_tag[(int) KAI_VARIANT]++;
 #endif
 }
 
