@@ -122,36 +122,56 @@ type ReuseDonor = ReuseDonor(String, [String])
 # and not inherited by sibling arms.
 type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], cls: [ClauseInfo],
                  regions: [RegionMark], in_region: Bool, borrowed: [String], enums: [String],
-                 hoisted: [Int], reuse_donor: Option[ReuseDonor], kind1_raw: [String] }
+                 hoisted: [Int], reuse_donor: Option[ReuseDonor], kind1_raw: [String],
+                 # A const is a literal with a name. The emit catalogue
+                 # carries every top-level const so `emit_ident_value`
+                 # materialises a const read as its literal body inline —
+                 # no global, no boxing, no call. Same role `fns` /
+                 # `variants` play for their idents.
+                 consts: [Decl],
+                 # The post-monomorph, module-mangled symbol of the fn /
+                 # lambda whose body is currently being emitted. Passed to
+                 # `find_lam` so a nested ELambda resolves to ITS module's
+                 # LamInfo, not a same-(line,col) lambda from another module
+                 # (the multi-module emit puts both in one `lams` list).
+                 cur_enc_fn: String }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
+
+# Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
+# keys on this + (line, col) so a nested ELambda resolves to its own
+# module's LamInfo, never a same-position lambda from another module.
+fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: ef }
 
 # issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw }
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
 
 # Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
 fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw }
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
 
 # i64-inline (Lane B): set the kind-1 raw-bound binder name set for an arm
 # body. Entering a match arm whose pattern binds kind-1 Int slots, the
@@ -161,10 +181,32 @@ fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
 fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, cur_enc_fn: cx.cur_enc_fn }
 
 # True when `nm` is a kind-1 raw-bound binder in the current arm scope.
 fn emit_ctx_kind1_raw_has(cx: EmitCtx, nm: String) : Bool = list_has(cx.kind1_raw, nm)
+
+# The top-level consts of a program, kept for `EmitCtx.consts` so a
+# const read materialises as its literal body inline.
+fn const_decls_only(decls: [Decl]) : [Decl] = match decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DConst(_, _, _, _, _, _, _) -> [d, ...const_decls_only(rest)]
+    _ -> const_decls_only(rest)
+  }
+}
+
+# Find a const decl's literal body by name in the emit catalogue.
+# None when `name` is not a top-level const (then it is a fn /
+# variant / local and `emit_ident_value` falls through as before).
+fn const_body_of(consts: [Decl], name: String) : Option[Expr] = match consts {
+  [] -> None
+  [d, ...rest] -> match d {
+    DConst(_, cn, _, body, _, _, _) ->
+      if cn == name { Some(body) } else { const_body_of(rest, name) }
+    _ -> const_body_of(rest, name)
+  }
+}
 
 # True when a block at (line, col) is a recorded `region { }`.
 fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
@@ -4939,13 +4981,16 @@ fn emit_lam_cap_reads(caps: [String], i: Int) : String {
 fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 
   match l {
-    LamInfo(id, _, _, params, caps, body) -> {
+    LamInfo(id, _, _, _, params, caps, body) -> {
       let arg_reads = emit_lam_arg_reads(params, 0)
       let cap_reads = emit_lam_cap_reads(caps, 0)
       # Lambda body sees its params + captures as locals — same
-      # contract as `emit_fn_body` for top-level fn params.
+      # contract as `emit_fn_body` for top-level fn params. Its enc_fn
+      # is `_kai_lam_<id>` (the same key the collector stamped), so an
+      # ELambda nested inside this body resolves to its own LamInfo.
       let body_lcs = list_append(list_append(cx.lcs, fn_param_names(params)), caps)
-      let body_c = emit_expr(src,body, emit_ctx_with_lcs(cx, body_lcs))
+      let lam_cx = emit_ctx_with_lcs(cx, body_lcs)
+      let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, concat_all(["_kai_lam_", int_to_string(id)])))
       concat_all([
         "static KaiValue *_kai_lam_", int_to_string(id),
         "(KaiValue *self, KaiValue **args, int n) {\n",
@@ -4957,14 +5002,14 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
   }
 }
 
-fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo], enums: [String]) : String / Console =
+fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo], enums: [String], consts: [Decl]) : String / Console =
 
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [] })))
+                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, cur_enc_fn: "" })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
-    LamInfo(id, _, _, _, _, _) ->
+    LamInfo(id, _, _, _, _, _, _) ->
       concat_all(["static KaiValue *_kai_lam_", int_to_string(id), "(KaiValue *, KaiValue **, int);\n"])
   }
 
@@ -5223,10 +5268,10 @@ fn emit_closure_caps(caps: [String]) : String =
   join_with(map(caps, emit_one_closure_cap), ", ")
 
 fn emit_lambda_ref(x: Expr, cx: EmitCtx) : String {
-  match find_lam(cx.lams, x.line, x.col) {
+  match find_lam(cx.lams, cx.cur_enc_fn, x.line, x.col) {
     None -> "kai_unit() /* lambda: missing info */"
     Some(l) -> match l {
-      LamInfo(id, _, _, params, caps, _) -> {
+      LamInfo(id, _, _, _, params, caps, _) -> {
         let arity = list_length(params)
         let n_caps = list_length(caps)
         if n_caps == 0 {
@@ -5737,6 +5782,17 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       # by emit_kind_raw (MUnboxed uses). Box-on-use means the kai_int is
       # only emitted where a boxed consumer exists — no dead box.
       if emit_ctx_kind1_raw_has(cx, name) { cat3("kai_int(kair_", name, ")") }
+      # A const is a literal with a name: materialise its body inline at
+      # the use site (no global, no boxing, no call) so the unbox pass
+      # treats it exactly like the literal it stands for. A same-named
+      # local shadows the const (locals are in `lcs`), so only consult
+      # the const catalogue when `name` is not lexically bound.
+      else if not list_has(cx.lcs, name) {
+        match const_body_of(cx.consts, name) {
+          Some(body) -> emit_expr(src, body, cx)
+          None       -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants)
+        }
+      }
       else { emit_ident_value(name, cx.lcs, cx.fns, cx.variants) }
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
@@ -6799,8 +6855,10 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         let body_fns = fns_prefer_module(cx.fns, mo)
         # Body sees the extended lexical scope and the module-rotated
         # EFn table; the other three context fields are unchanged.
+        # `cur_enc_fn` becomes THIS fn's mangled symbol so a nested
+        # ELambda in the body resolves to its own module's LamInfo.
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, cur_enc_fn: c_sym(name, mo) }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -7381,7 +7439,7 @@ fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx) : String / Console =
 
 fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
                 cx: EmitCtx,
-                target_origin: Option[String]) : String / Console {
+                target_origin: Option[String], test_line: Int, test_col: Int) : String / Console {
 
   # desc_span is the raw source of the description including its quotes,
   # so it's already a valid C string literal. We wrap the body in
@@ -7393,8 +7451,12 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # rather than a sibling prelude's clashing export. Mirrors the rotate
   # `emit_fn_body` already does for DFn bodies.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
+  # enc_fn matches the `__test__<line>_<col>` key the collector stamped
+  # on this test's lambdas, so `find_lam` resolves them (a test body's
+  # lambda otherwise looked up under the wrong enc_fn → "non-callable").
+  let test_enc = concat_all(["__test__", int_to_string(test_line), "_", int_to_string(test_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, cur_enc_fn: test_enc }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -7420,7 +7482,7 @@ fn emit_one_test(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DTest(desc_span, body, _, _) -> emit_test_fn(src, id, desc_span, body, cx, target_origin)
+      DTest(desc_span, body, tl, tc) -> emit_test_fn(src, id, desc_span, body, cx, target_origin, tl, tc)
       _ -> ""
     }
   }
@@ -7476,12 +7538,15 @@ fn test_call_list(n: Int, i: Int) : String {
 
 fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
                  cx: EmitCtx,
-                 target_origin: Option[String]) : String / Console {
+                 target_origin: Option[String], bench_line: Int, bench_col: Int) : String / Console {
 
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
+  # enc_fn matches the collector's `__bench__<line>_<col>` so lambdas
+  # inside a bench body resolve in `find_lam`.
+  let bench_enc = concat_all(["__bench__", int_to_string(bench_line), "_", int_to_string(bench_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, cur_enc_fn: bench_enc }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -7516,7 +7581,7 @@ fn emit_one_bench(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DBench(desc_span, body, _, _) -> emit_bench_fn(src, id, desc_span, body, cx, target_origin)
+      DBench(desc_span, body, bl, bc) -> emit_bench_fn(src, id, desc_span, body, cx, target_origin, bl, bc)
       _ -> ""
     }
   }
@@ -7824,13 +7889,16 @@ fn emit_check_param_inits_assign(params: [Param]) : String {
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
                  cx: EmitCtx,
-                 target_origin: Option[String]) : String / Console {
+                 target_origin: Option[String], check_line: Int, check_col: Int) : String / Console {
 
   let lcs2 = list_append(check_param_names(params), cx.lcs)
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
+  # enc_fn matches the collector's `__check__<line>_<col>` so lambdas
+  # inside a check body resolve in `find_lam`.
+  let check_enc = concat_all(["__check__", int_to_string(check_line), "_", int_to_string(check_col)])
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, cur_enc_fn: check_enc }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -7885,7 +7953,7 @@ fn emit_one_check(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DCheck(desc_span, ps, body, _, _) -> emit_check_fn(src, id, desc_span, ps, body, cx, target_origin)
+      DCheck(desc_span, ps, body, cl, cc) -> emit_check_fn(src, id, desc_span, ps, body, cx, target_origin, cl, cc)
       _ -> ""
     }
   }
@@ -9184,13 +9252,13 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
 
   # ---- per-module .c translation units ------------------------------
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), cur_enc_fn: "" }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
   let root_decls = decls_of_origin(decls, None)
   let root_bodies = fn_bodies(src, root_decls, cx)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, variants, clauses_info, enum_names)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, variants, clauses_info, enum_names, const_decls_only(decls))
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
@@ -9300,9 +9368,9 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # recursing, so the entry `lcs` is `[]`.
   let enum_names = collect_enum_type_names(decls)
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [] }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), cur_enc_fn: "" }
   let bodies = fn_bodies(src, decls, cx)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names, const_decls_only(decls))
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
@@ -10089,14 +10157,12 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], fuel: Int) : Decl {
       DDerive(ps, expand_ta_decl(inner, table, fuel), l, c)
     DUnstable(inner, l, c) ->
       DUnstable(expand_ta_decl(inner, table, fuel), l, c)
-    DAttribPure(inner, l, c) ->
-      DAttribPure(expand_ta_decl(inner, table, fuel), l, c)
     DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
       DAxiom(p, sm, n, cso, tps, expand_ta_params(ps, table, fuel),
              expand_ta_te(ret, table, fuel), row, l, c)
-    DConst(p, n, ty, body, l, c) ->
+    DConst(p, n, ty, body, mo, l, c) ->
       DConst(p, n, expand_ta_te(ty, table, fuel),
-              expand_ta_expr(body, table, fuel), l, c)
+              expand_ta_expr(body, table, fuel), mo, l, c)
     DTest(n, body, l, c) -> DTest(n, expand_ta_expr(body, table, fuel), l, c)
     DBench(n, body, l, c) -> DBench(n, expand_ta_expr(body, table, fuel), l, c)
     DCheck(n, ps, body, l, c) ->
@@ -10528,9 +10594,9 @@ fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
     DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
       DAxiom(p, sm, n, cso, tps, mangle_params(ps, entries, home_mod),
              mangle_te(ret, entries, home_mod), row, l, c)
-    DConst(p, n, ty, body, l, c) ->
+    DConst(p, n, ty, body, mo, l, c) ->
       DConst(p, n, mangle_te(ty, entries, home_mod),
-              mangle_expr(body, entries, home_mod), l, c)
+              mangle_expr(body, entries, home_mod), mo, l, c)
     DEffect(p, n, tps, ops, defblk, l, c) ->
       DEffect(p, n, tps, mangle_eops(ops, entries, home_mod), defblk, l, c)
     DProtocol(p, n, tps, ops, l, c) ->
@@ -10544,8 +10610,6 @@ fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
       DDerive(ps, mangle_one_decl(inner, entries, home_mod), l, c)
     DUnstable(inner, l, c) ->
       DUnstable(mangle_one_decl(inner, entries, home_mod), l, c)
-    DAttribPure(inner, l, c) ->
-      DAttribPure(mangle_one_decl(inner, entries, home_mod), l, c)
     DTest(n, body, l, c) ->
       DTest(n, mangle_expr(body, entries, home_mod), l, c)
     DBench(n, body, l, c) ->
@@ -11141,8 +11205,7 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         None -> print("#{pub_s}axiom #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DAttribPure(inner, _, _) -> dump_decl_type(inner)  # m12.6.x #5(a)
-    DConst(is_pub, name, ty, _, line, col) -> {        # issue #269
+    DConst(is_pub, name, ty, _, _, line, col) -> {        # issue #269
       let pub_s = if is_pub { "pub " } else { "" }
       print("#{pub_s}const #{name} : #{ty_to_string(resolve_ty(ty))} @#{int_to_string(line)}:#{int_to_string(col)}")
     }

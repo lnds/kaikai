@@ -4397,7 +4397,7 @@ pub fn validate_effect_name_collisions_decls(root_decls: [Decl],
 # prepend pattern; shares `validate_name_collisions_walk`.
 
 fn extract_const_site(d: Decl) : Option[NameSite] = match d {
-  DConst(_, name, _, _, line, col) -> Some(NS(name, line, col))
+  DConst(_, name, _, _, _, line, col) -> Some(NS(name, line, col))
   _ -> None
 }
 
@@ -4919,6 +4919,21 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
           # m7b #2: merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
+        }
+        # A const binds its NAME to its declared type T monomorphically
+        # — `name : T`, NOT `() -> T`. So `EVar(name)` reads as a value
+        # of type T (no call, no instantiation). Registered bare and,
+        # when it carries a home module, under the qualified key too —
+        # the same dual registration `DFn` uses, so cross-module const
+        # reads (`real.real_pi`) resolve through the qualified env.
+        DConst(_, cname, cte, _, mo, _, _) -> {
+          let csc = mono(resolve_ty_with_binds(cte, [], []))
+          let env1 = ty_env_add(env, cname, csc)
+          let env2 = match mo {
+            Some(m) -> ty_env_add_qualified(env1, m, cname, csc)
+            None    -> env1
+          }
+          EnvWithArities { env: env2, arities: ar_acc }
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
@@ -15577,7 +15592,6 @@ fn collect_declared_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DUnit(_, name, _, _, _) -> collect_declared_unit_names_loop(rest, [name, ...acc])
-      DAttribPure(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       DDerive(_, inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       _ -> collect_declared_unit_names_loop(rest, acc)
@@ -15598,7 +15612,6 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DUnit(true, name, _, _, _) -> collect_pub_unit_names_loop(rest, [name, ...acc])
-      DAttribPure(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       DDerive(_, inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       _ -> collect_pub_unit_names_loop(rest, acc)
@@ -15661,7 +15674,6 @@ fn validate_unit_refs_decl(d: Decl, declared: [String], file: String) : Int / Co
   DEffect(_, _, _, ops, _, _, _) -> validate_unit_refs_eops(ops, declared, file, 0)
   DImpl(_, _, _, sub_decls, _, _) ->
     validate_unit_refs_decls_loop(sub_decls, declared, file, 0)
-  DAttribPure(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
   DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
   _ -> 0
@@ -16009,7 +16021,6 @@ fn pub_leak_priv_one(d: Decl, home: String,
     if p { acc } else { [PLPriv(home, name, "protocol"), ...acc] }
   DUnit(p, name, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "unit"), ...acc] }
-  DAttribPure(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   DDerive(_, inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   DUnstable(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   _ -> acc
@@ -16060,7 +16071,7 @@ fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
     if is_pub {
       vmps_fn_sig(name, "axiom", ps, Some(ret), row, home, priv_table, file, line, col)
     } else { 0 }
-  DConst(is_pub, name, te, _, line, col) ->
+  DConst(is_pub, name, te, _, _, line, col) ->
     if is_pub {
       vmps_te(te, name, "const", home, priv_table, file, line, col)
     } else { 0 }
@@ -16085,7 +16096,6 @@ fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
     # `validate_pub_access`'s signature walker (step 2) when the
     # types are referenced by name from another module.
     0
-  DAttribPure(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
   DDerive(_, inner, _, _) -> vmps_decl(inner, home, priv_table, file)
   DUnstable(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
   _ -> 0
@@ -16367,16 +16377,13 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     # m12.6.x #5(a): DAttribPure unwraps before this pass runs in
     # the driver; case kept for `--ast` and other early-pipeline
     # callers that work on the raw decl stream.
-    DAttribPure(inner, l, c) -> DAttribPure(expand_unit_aliases_decl(inner, aliases), l, c)
-    # Issue #269: DConst is lowered to DAttribPure(DFn) by
-    # `lower_consts` before this pass runs in the driver; arm kept
-    # for completeness so any early-pipeline caller (e.g. `--ast`)
-    # does not panic. Walks the type expression for unit aliases and
-    # the body for any nested literals; consts always have literal
-    # bodies today but the recursion is harmless.
-    DConst(p, n, ty, body, l, c) ->
+    # DConst survives as DConst through the whole pipeline (no longer
+    # lowered to a disguised zero-arg fn). Walks the type expression
+    # for unit aliases and the body for any nested literals; consts
+    # always have literal bodies today but the recursion is harmless.
+    DConst(p, n, ty, body, mo, l, c) ->
       DConst(p, n, expand_aliases_typeexpr(ty, aliases),
-              expand_aliases_expr(body, aliases), l, c)
+              expand_aliases_expr(body, aliases), mo, l, c)
   }
 }
 
@@ -17108,7 +17115,6 @@ fn decide_partition_home(d: Decl, target_mod: String,
   DTest(_, _, _, _)                    -> anchor
   DBench(_, _, _, _)                   -> anchor
   DCheck(_, _, _, _, _)                -> anchor
-  DAttribPure(inner, _, _)             -> decide_partition_home(inner, target_mod, anchor)
   DDerive(_, inner, _, _)              -> decide_partition_home(inner, target_mod, anchor)
   DUnstable(inner, _, _)               -> decide_partition_home(inner, target_mod, anchor)
   DImpl(_, _, _, sub, _, _)            -> match sub {
@@ -17126,7 +17132,6 @@ fn decide_partition_home(d: Decl, target_mod: String,
 fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
   DType(_, _, _, _, _, _, mo)        -> mo
-  DAttribPure(inner, _, _)        -> decl_explicit_module_origin(inner)
   DDerive(_, inner, _, _)         -> decl_explicit_module_origin(inner)
   DUnstable(inner, _, _)          -> decl_explicit_module_origin(inner)
   DImpl(_, _, _, sub, _, _)       -> match sub {
@@ -17149,7 +17154,6 @@ fn opt_str_is_some(o: Option[String]) : Bool = match o {
 fn partition_home_for(d: Decl, target_mod: String) : String = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> home_or_target(mo, target_mod)
   DType(_, _, _, _, _, _, mo)        -> home_or_target(mo, target_mod)
-  DAttribPure(inner, _, _)        -> partition_home_for(inner, target_mod)
   DDerive(_, inner, _, _)         -> partition_home_for(inner, target_mod)
   DUnstable(inner, _, _)          -> partition_home_for(inner, target_mod)
   DImpl(_, _, _, sub, _, _)       -> match sub {

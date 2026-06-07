@@ -27,13 +27,12 @@
 #   record literals against the record table (`[RecInfo]`). Entry:
 #   `desugar_pos_records_decls`. The `dpr_*` walkers recurse the AST.
 # - B. The `var` rewriter (m7b #5b) + the lowering helpers that ride
-#   alongside it: `desugar_var_decls` (var -> Ref-cell), the const
-#   thunk lowering (`lower_consts` / `lower_const_one`), axiom
-#   lowering (`lower_axioms` / `lower_axiom_one`), const-ref forcing
-#   (`desugar_const_refs_decls`), refinement pred-fn synthesis
-#   (`synthesize_refine_pred_fns`), pattern-narrow lowering
+#   alongside it: `desugar_var_decls` (var -> Ref-cell), axiom
+#   lowering (`lower_axioms` / `lower_axiom_one`), refinement pred-fn
+#   synthesis (`synthesize_refine_pred_fns`), pattern-narrow lowering
 #   (`lower_pattern_narrow_decls`), and contract-predicate validation
-#   (`validate_contract_predicates_decls`).
+#   (`validate_contract_predicates_decls`). Consts are NOT lowered —
+#   `DConst` survives intact as a value through the whole pipeline.
 # - C. `use Effect` desugar (m7e §25): strip file-level `use` decls
 #   and rewrite bare op references in their scope to qualified
 #   `Eff.op` calls. Entry: `desugar_use_decls`.
@@ -82,13 +81,12 @@
 # Public surface (18): the pass entry points the driver invokes
 # (`desugar_pos_records_decls`, `desugar_var_decls`,
 # `validate_var_uses_decls`, `desugar_use_decls`,
-# `desugar_const_refs_decls`, `collect_const_names_decls`,
 # `synthesize_refine_pred_fns`, `collect_refine_alias_names`,
-# `lower_pattern_narrow_decls`, `extract_pure_names_decls`,
+# `lower_pattern_narrow_decls`,
 # `validate_contract_predicates_decls`, `rewrite_nursery_caps_decls`,
-# `check_nursery_brand_mismatch_decls`, `dump_brands`, `lower_axioms`,
-# `lower_consts`) plus `lower_axiom_one` / `lower_const_one` which the
-# module-origin tagging in main (`tag_decl_module_origin`) invokes.
+# `check_nursery_brand_mismatch_decls`, `dump_brands`, `lower_axioms`)
+# plus `lower_axiom_one` which the module-origin tagging in main
+# (`tag_decl_module_origin`) invokes.
 
 import compiler.util
 import compiler.diag
@@ -983,29 +981,116 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 #[doc("m12.7: rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function.")]
 pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
-# Issue #269: lower every `DConst(is_pub, name, ty, body, l, c)` to
-# the legacy `DAttribPure(DFn arity-0)` shape so the rest of the
-# pipeline (typer, monomorphiser, emitters) keeps seeing the form
-# it was already wired for. The dedicated `DConst` variant exists at
-# the parser surface to give consts a structural identity (the
-# downstream typer/emitter integration that drops the function-call
-# indirection is intentionally deferred — see the variant's comment
-# in the Decl enum). Runs early in the driver, alongside `lower_axioms`.
-#[doc("Rewrite every `DConst` decl into a zero-arg `DFn` thunk that the const-ref desugar then forces at use sites.")]
-pub fn lower_consts(ds: [Decl]) : [Decl] = map(ds, lower_const_one)
-
-#[doc("Lower a single `DConst` to a zero-arg `DFn` thunk.")]
-pub fn lower_const_one(d: Decl) : Decl {
-  match d {
-    DConst(is_pub, name, ty, body, l, c) -> {
-      let dfn = DFn(is_pub, name, [], [], Some(ty), REmpty, body, l, c, None)
-      DAttribPure(dfn, l, c)
-    }
-    _ -> d
+# §29 v3 — const references in MATCH PATTERNS. A bare uppercase const
+# name in pattern position parses as `PVariant(NAME, [])` (lex-time
+# uppercase rule); a lowercase one as `PBind(name)`. Neither is a real
+# constructor / binder when the name is a declared const — it means
+# "match the scrutinee against this const's value". We rewrite such an
+# arm `NAME -> body` into `__cv_NAME if __cv_NAME == NAME -> body`: a
+# fresh bind plus an equality guard against the const, AND-combined
+# with any explicit guard. The `== NAME` reads the const as a value
+# (the emit inlines its literal) — no disguised `NAME()` call.
+#
+# This is the ONLY const desugar left: value-position const reads need
+# no rewrite (a const IS a value, so `EVar(NAME)` resolves directly in
+# the typer + emit). Pattern position is the lone case the surface
+# syntax makes ambiguous, so it gets this targeted pass.
+#[doc("§29 v3: rewrite const names used in match patterns into an equality-guard arm.")]
+pub fn desugar_const_patterns_decls(decls: [Decl]) : [Decl] {
+  let names = const_pat_names(decls, [])
+  match names {
+    [] -> decls                                   # no consts: nothing to rewrite
+    _  -> map(decls, (d) => dcp_decl(d, names))
   }
 }
 
-#[doc("Lower a single `DAxiom` to a `DFn`, tagging the body as an FFI shim when the axiom carries an `extern` form.")]
+fn const_pat_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DConst(_, name, _, _, _, _, _) -> const_pat_names(rest, [name, ...acc])
+    _ -> const_pat_names(rest, acc)
+  }
+}
+
+fn dcp_decl(d: Decl, names: [String]) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, dcp_expr(body, names), l, c, mo)
+  DTest(n, body, l, c) -> DTest(n, dcp_expr(body, names), l, c)
+  DBench(n, body, l, c) -> DBench(n, dcp_expr(body, names), l, c)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, dcp_expr(body, names), mo, l, c)
+  _ -> d
+}
+
+# Walk an expression, rewriting const patterns inside every EMatch.
+# Only structural recursion — value-position EVar(const) is left alone
+# (it is already a value).
+fn dcp_expr(e: Expr, names: [String]) : Expr {
+  let k2 = match e.kind {
+    EMatch(scr, arms) -> EMatch(dcp_expr(scr, names), map(arms, (a) => dcp_arm(a, names)))
+    EBlock(stmts, tail) -> EBlock(map(stmts, (s) => dcp_stmt(s, names)),
+                                   match tail { Some(t) -> Some(dcp_expr(t, names)) None -> None })
+    EIf(cnd, th, el) -> EIf(dcp_expr(cnd, names), dcp_expr(th, names),
+                             match el { Some(eb) -> Some(dcp_expr(eb, names)) None -> None })
+    ECall(f, as_) -> ECall(dcp_expr(f, names), map(as_, (a) => dcp_expr(a, names)))
+    EField(b, fn_) -> EField(dcp_expr(b, names), fn_)
+    EIndex(a, b) -> EIndex(dcp_expr(a, names), dcp_expr(b, names))
+    EBinop(op, a, b) -> EBinop(op, dcp_expr(a, names), dcp_expr(b, names))
+    EUnop(op, x) -> EUnop(op, dcp_expr(x, names))
+    ELambda(ps, b) -> ELambda(ps, dcp_expr(b, names))
+    EPipe(a, b) -> EPipe(dcp_expr(a, names), dcp_expr(b, names))
+    _ -> e.kind
+  }
+  Expr { kind: k2, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn dcp_stmt(s: Stmt, names: [String]) : Stmt = match s {
+  SLet(pat, ty, rhs) -> SLet(pat, ty, dcp_expr(rhs, names))
+  SExprStmt(x) -> SExprStmt(dcp_expr(x, names))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(dcp_expr(b, names), dcp_expr(i, names), dcp_expr(v, names), l, c)
+  _ -> s
+}
+
+fn dcp_arm(a: Arm, names: [String]) : Arm = match a {
+  Arm(pat, opt_g, body) -> {
+    # A pattern binder shadows a const inside this arm's body/guard, so
+    # subtract the binders before recursing into them. The equality
+    # rewrite itself inspects the pre-shadow names (the synthesised
+    # `__cv_NAME` binder is not user-visible and never collides).
+    let inner = list_minus(names, pat_binders(pat, []))
+    let body2 = dcp_expr(body, inner)
+    let g2 = match opt_g { Some(g) -> Some(dcp_expr(g, inner)) None -> None }
+    dcp_arm_pat(pat, g2, body2, names)
+  }
+}
+
+fn dcp_arm_pat(pat: Pattern, opt_g: Option[Expr], body: Expr, names: [String]) : Arm =
+  match pat.pkind {
+    PBind(name) -> dcp_arm_eq_or_pass(pat, name, opt_g, body, names)
+    PVariant(name, subs) ->
+      if subs == [] { dcp_arm_eq_or_pass(pat, name, opt_g, body, names) }
+      else { Arm(pat, opt_g, body) }
+    _ -> Arm(pat, opt_g, body)
+  }
+
+fn dcp_arm_eq_or_pass(pat: Pattern, name: String, opt_g: Option[Expr],
+                       body: Expr, names: [String]) : Arm {
+  if not list_has(names, name) { Arm(pat, opt_g, body) }
+  else {
+    let cv_name = string_concat("__cv_", name)
+    let new_pat = mk_pat(PBind(cv_name), pat.line, pat.col)
+    let cv_var = mk_expr(EVar(cv_name), pat.line, pat.col)
+    # `EVar(name)` (the const) reads as a value — the emit inlines its
+    # literal. No `NAME()` call (consts are no longer disguised fns).
+    let const_ref = mk_expr(EVar(name), pat.line, pat.col)
+    let extra_guard = mk_expr(EBinop("==", cv_var, const_ref), pat.line, pat.col)
+    let combined = match opt_g {
+      None -> Some(extra_guard)
+      Some(ug) -> Some(mk_expr(EBinop("and", extra_guard, ug), pat.line, pat.col))
+    }
+    Arm(new_pat, combined, body)
+  }
+}
+
 pub fn lower_axiom_one(d: Decl) : Decl {
   match d {
     DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, l, c) -> {
@@ -1035,349 +1120,13 @@ pub fn lower_axiom_one(d: Decl) : Decl {
   }
 }
 
-#[doc("Collect the names of `#[pure]`-wrapped zero-arg fns (the const set) that `desugar_const_refs_decls` later forces.")]
-pub fn collect_const_names_decls(decls: [Decl]) : [String] =
-  collect_const_names_loop(decls, [])
-
-fn collect_const_names_loop(decls: [Decl], acc: [String]) : [String] {
-  match decls {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> match d {
-      DAttribPure(inner, _, _) -> match inner {
-        DFn(_, name, _, [], _, _, _, _, _, _) ->
-          collect_const_names_loop(rest, [name, ...acc])
-        _ -> collect_const_names_loop(rest, acc)
-      }
-      _ -> collect_const_names_loop(rest, acc)
-    }
-  }
-}
-
-# §29 const desugar: rewrite every `EVar(name)` reference in any
-# Expr position (fn body, type-refinement predicate, contract
-# predicate via SAssert in body, match-arm guard) where `name`
-# matches a declared const into `ECall(EVar(name), [])` so the
-# resolver/typer treats it as a zero-arg fn call. Operates on the
-# whole decl stream after collect_const_names_decls produces the
-# const-name list.
-#[doc("§29 const desugar: rewrite every `EVar(NAME)` reference to a zero-arg const into `ECall(EVar(NAME), [])` so it forces the thunk.")]
-pub fn desugar_const_refs_decls(decls: [Decl], const_names: [String]) : [Decl] =
-  map(decls, (d) => desugar_const_refs_decl(d, const_names))
-
-fn desugar_const_refs_decl(d: Decl, const_names: [String]) : Decl {
-  match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo) -> {
-      let ps2 = map(ps, (pm) => desugar_const_refs_param(pm, const_names))
-      let ret2 = match ret {
-        Some(t) -> Some(desugar_const_refs_typeexpr(t, const_names))
-        None -> None
-      }
-      # Issue #269: a fn parameter `x` shadows any `const x` in scope.
-      # Subtract param names from `const_names` before walking the body
-      # so `EVar(x)` in the body resolves to the parameter, not a
-      # zero-arg call to the const. Without this filter, `repeat(x: a, ...)`
-      # in stdlib breaks any program that declares `const x`.
-      let body_names = list_minus_names(const_names, fn_param_names(ps))
-      DFn(p, n, tps, ps2, ret2, row,
-          desugar_const_refs_expr(body, body_names), l, c, mo)
-    }
-    DTest(desc, body, l, c) -> DTest(desc, desugar_const_refs_expr(body, const_names), l, c)
-    DBench(desc, body, l, c) -> DBench(desc, desugar_const_refs_expr(body, const_names), l, c)
-    DCheck(desc, params, body, l, c) -> {
-      let body_names = list_minus_names(const_names, fn_param_names(params))
-      DCheck(desc, params, desugar_const_refs_expr(body, body_names), l, c)
-    }
-    DType(p, n, tps, body, l, c, mo) -> DType(p, n, tps,
-                                            desugar_const_refs_typebody(body, const_names),
-                                            l, c, mo)
-    DAttribPure(inner, l, c) -> DAttribPure(desugar_const_refs_decl(inner, const_names), l, c)
-    _ -> d
-  }
-}
-
-# Issue #269: subtract `removed` from `names`. Used to drop locally-
-# bound names from the const-rewrite list when entering a binding
-# scope (fn params, lambda params, SLet binders, match-arm pattern
-# binders). Linear in `names * removed`; the lists stay tiny so a
-# more-clever set is not worth the complexity.
-fn list_minus_names(names: [String], removed: [String]) : [String] {
-  match names {
-    [] -> []
-    [h, ...rest] ->
-      if list_has(removed, h) { list_minus_names(rest, removed) }
-      else { [h, ...list_minus_names(rest, removed)] }
-  }
-}
-
-fn desugar_const_refs_param(pm: Param, const_names: [String]) : Param {
-  match pm.ptype {
-    Some(t) -> Param { pname: pm.pname,
-                        ptype: Some(desugar_const_refs_typeexpr(t, const_names)),
-                        pline: pm.pline, pcol: pm.pcol }
-    None -> pm
-  }
-}
-
-fn desugar_const_refs_typebody(b: TypeBody, const_names: [String]) : TypeBody {
-  match b {
-    TBAlias(t) -> TBAlias(desugar_const_refs_typeexpr(t, const_names))
-    TBRecord(fields) -> TBRecord(map(fields, (fd) => desugar_const_refs_field(fd, const_names)))
-    _ -> b
-  }
-}
-
-fn desugar_const_refs_field(fd: FieldDecl, const_names: [String]) : FieldDecl {
-  match fd {
-    FD(is_pub, name, ty) -> FD(is_pub, name, desugar_const_refs_typeexpr(ty, const_names))
-  }
-}
-
-fn desugar_const_refs_typeexpr(t: TypeExpr, const_names: [String]) : TypeExpr {
-  match t.tkind {
-    TyRefine(base, pred) ->
-      mk_ty(TyRefine(desugar_const_refs_typeexpr(base, const_names),
-                      desugar_const_refs_expr(pred, const_names)),
-            t.line, t.col)
-    TyDim(base, u) ->
-      mk_ty(TyDim(desugar_const_refs_typeexpr(base, const_names), u), t.line, t.col)
-    TyList(inner) ->
-      mk_ty(TyList(desugar_const_refs_typeexpr(inner, const_names)), t.line, t.col)
-    TyName(n, tas) ->
-      mk_ty(TyName(n, map(tas, (a) => desugar_const_refs_typeexpr(a, const_names))),
-            t.line, t.col)
-    TyFn(ps, ret, row) ->
-      mk_ty(TyFn(map(ps, (p) => desugar_const_refs_typeexpr(p, const_names)),
-                  desugar_const_refs_typeexpr(ret, const_names), row),
-            t.line, t.col)
-  }
-}
-
-fn desugar_const_refs_expr(e: Expr, const_names: [String]) : Expr {
-  let new_kind = match e.kind {
-    EVar(name) ->
-      if list_has(const_names, name) {
-        ECall(mk_expr(EVar(name), e.line, e.col), [])
-      } else { e.kind }
-    # §29 v2: rewrite identifiers inside `#{...}` interpolation
-    # spans textually so the legacy emit-time path that re-parses
-    # the EStr span sees `NAME()` instead of `NAME`.
-    EStr(span, is_triple) ->
-      EStr(rewrite_const_refs_in_span(span, const_names), is_triple)
-    # §29 v3 pattern-side: rewrite a match arm whose pattern is a
-    # bare `PBind(name)` matching a const into a wildcard bind plus
-    # a synthesised guard `__cv == NAME()`. AND-combines with any
-    # explicit `if user_pred`. This makes `match n { ZERO -> ... }`
-    # work as comparison instead of silently binding. Pattern binders
-    # are subtracted from `const_names` before walking the arm body
-    # / guard so a parameter-like binder shadows the const correctly
-    # (issue #269).
-    EMatch(scr, arms) ->
-      EMatch(desugar_const_refs_expr(scr, const_names),
-              map(arms, (a) => desugar_const_refs_arm(a, const_names)))
-    # Issue #269: lambda params shadow consts in the body. Subtract
-    # before recursing.
-    ELambda(ps, body) -> {
-      let inner_names = list_minus_names(const_names, fn_param_names(ps))
-      ELambda(ps, desugar_const_refs_expr(body, inner_names))
-    }
-    # Issue #269: walk a block left-to-right, growing the shadow set
-    # as we encounter `let pat = rhs` / `var name = init` / `use Eff`
-    # binders. The RHS of an SLet/SVar is evaluated BEFORE the bind
-    # takes effect, so it sees the pre-binding name set; subsequent
-    # statements (and the tail expression) see the post-binding set.
-    EBlock(stmts, tail) -> {
-      let r = desugar_const_refs_block_stmts(stmts, const_names, [])
-      let final_names = r.names
-      let tail2 = match tail {
-        None -> None
-        Some(te) -> Some(desugar_const_refs_expr(te, final_names))
-      }
-      EBlock(r.stmts, tail2)
-    }
-    _ -> dsg_map_expr_kind(e.kind, (sub) => desugar_const_refs_expr(sub, const_names))
-  }
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-}
-
-# Issue #269: scope-aware traversal of a block's statement list.
-# Returns the rewritten statements plus the (post-block) const-name
-# set that the block's tail expression should see. Each binding
-# statement narrows the set going forward.
-type ConstStmtsRes = { stmts: [Stmt], names: [String] }
-
-fn desugar_const_refs_block_stmts(stmts: [Stmt], names: [String],
-                                    acc: [Stmt]) : ConstStmtsRes {
-  match stmts {
-    [] -> ConstStmtsRes { stmts: list_reverse(acc), names: names }
-    [s, ...rest] -> {
-      let s2 = desugar_const_refs_stmt(s, names)
-      let names2 = match s {
-        SLet(pat, _, _) -> list_minus_names(names, pat_binders(pat, []))
-        SVar(n, _, _, _, _) -> list_minus_names(names, [n])
-        _ -> names
-      }
-      desugar_const_refs_block_stmts(rest, names2, [s2, ...acc])
-    }
-  }
-}
-
-fn desugar_const_refs_stmt(s: Stmt, names: [String]) : Stmt {
-  match s {
-    SLet(pat, ann, rhs) ->
-      SLet(pat, ann, desugar_const_refs_expr(rhs, names))
-    SAssert(c, om) ->
-      SAssert(desugar_const_refs_expr(c, names),
-               match om { None -> None Some(m) -> Some(desugar_const_refs_expr(m, names)) })
-    SExprStmt(e) -> SExprStmt(desugar_const_refs_expr(e, names))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(desugar_const_refs_expr(b, names),
-                    desugar_const_refs_expr(i, names),
-                    desugar_const_refs_expr(v, names), l, c)
-    SVar(n, ty, rhs, l, c) ->
-      SVar(n, ty, desugar_const_refs_expr(rhs, names), l, c)
-    SUse(n, l, c) -> SUse(n, l, c)
-  }
-}
-
-fn desugar_const_refs_arm(a: Arm, const_names: [String]) : Arm {
-  match a {
-    Arm(pat, opt_g, body) -> {
-      # Issue #269: pattern binders shadow consts in the arm body
-      # and guard. Subtract before recursing. The const-comparison
-      # rewrite (`arm_for_const_or_pass`) still inspects the
-      # pre-shadow `const_names` so a `match n { ZERO -> ... }` arm
-      # whose pattern matches a const name still synthesises the
-      # equality guard — the synthesised binder (`__cv_NAME`) is
-      # not a kaikai-visible name and never collides with a
-      # parameter shadow.
-      let inner_names = list_minus_names(const_names, pat_binders(pat, []))
-      let body2 = desugar_const_refs_expr(body, inner_names)
-      let g2_orig = match opt_g {
-        Some(g) -> Some(desugar_const_refs_expr(g, inner_names))
-        None -> None
-      }
-      desugar_const_refs_arm_pat(pat, g2_orig, body2, const_names)
-    }
-  }
-}
-
-fn desugar_const_refs_arm_pat(pat: Pattern, opt_g: Option[Expr], body: Expr,
-                                const_names: [String]) : Arm {
-  # Both PBind(name) (lowercase pattern bind) and PVariant(name, [])
-  # (uppercase parsed as zero-arg variant) participate. The user
-  # writes `MAX_PORT` and the parser's lex-time uppercase rule
-  # produces a PVariant; for const semantics we treat it like a
-  # bind that compares.
-  match pat.pkind {
-    PBind(name) -> arm_for_const_or_pass(pat, name, [], opt_g, body, const_names)
-    PVariant(name, subs) ->
-      if subs == [] {
-        arm_for_const_or_pass(pat, name, [], opt_g, body, const_names)
-      } else { Arm(pat, opt_g, body) }
-    _ -> Arm(pat, opt_g, body)
-  }
-}
-
-fn arm_for_const_or_pass(pat: Pattern, name: String, _ignored: [Pattern],
-                           opt_g: Option[Expr], body: Expr,
-                           const_names: [String]) : Arm {
-  if not list_has(const_names, name) { Arm(pat, opt_g, body) }
-  else {
-    let cv_name = string_concat("__cv_", name)
-    let new_pat = mk_pat(PBind(cv_name), pat.line, pat.col)
-    let cv_var = mk_expr(EVar(cv_name), pat.line, pat.col)
-    let const_call = mk_expr(ECall(mk_expr(EVar(name), pat.line, pat.col), []),
-                              pat.line, pat.col)
-    let extra_guard = mk_expr(EBinop("==", cv_var, const_call), pat.line, pat.col)
-    let combined = match opt_g {
-      None -> Some(extra_guard)
-      Some(ug) -> Some(mk_expr(EBinop("and", extra_guard, ug),
-                                 pat.line, pat.col))
-    }
-    Arm(new_pat, combined, body)
-  }
-}
-
-# §29 v2 textual rewrite. Walks the span byte-by-byte. State is
-# the index `i` and a Bool `inside` (true while we're between `#{`
-# and the matching `}`). Inside a segment we look for identifiers;
-# every identifier whose lexeme matches a const name gets a `()`
-# suffix appended. Outside segments the bytes are copied verbatim.
-fn rewrite_const_refs_in_span(span: String, names: [String]) : String {
-  let n = string_length(span)
-  rcr_main(span, names, n, 0, "", false)
-}
-
-fn rcr_main(span: String, names: [String], n: Int, i: Int, acc: String, inside: Bool) : String {
-  if i >= n { acc } else { rcr_step(span, names, n, i, acc, inside) }
-}
-
-fn rcr_step(span: String, names: [String], n: Int, i: Int, acc: String, inside: Bool) : String {
-  let c = char_at_or_zero(span, i)
-  if not inside { rcr_outside(span, names, n, i, acc, c) }
-  else { rcr_inn(span, names, n, i, acc, c) }
-}
-
-# char_at_or_zero moved to compiler/util.kai (issue #677 phase 1h H1a).
-
-fn rcr_outside(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
-  if char_to_int(c) == 35 { rcr_after_hash(span, names, n, i, acc) }
-  else { rcr_main(span, names, n, i + 1, append_char(acc, c), false) }
-}
-
-# Char `#` at position i. Check if next char is `{` to switch into
-# interp mode; otherwise copy the `#` literally.
-fn rcr_after_hash(span: String, names: [String], n: Int, i: Int, acc: String) : String {
-  let nxt = char_at_or_zero(span, i + 1)
-  if char_to_int(nxt) == 123 {
-    rcr_main(span, names, n, i + 2, cat2(cat2(acc, "#"), "{"), true)
-  } else {
-    rcr_main(span, names, n, i + 1, append_char(acc, '#'), false)
-  }
-}
-
-fn rcr_inn(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
-  if char_to_int(c) == 125 {
-    rcr_main(span, names, n, i + 1, cat2(acc, "}"), false)
-  } else {
-    rcr_innc(span, names, n, i, acc, c)
-  }
-}
-
-fn rcr_innc(span: String, names: [String], n: Int, i: Int, acc: String, c: Char) : String {
-  if ch_is_alpha(c) {
-    rcr_inid(span, names, n, i, acc)
-  } else {
-    rcr_main(span, names, n, i + 1, append_char(acc, c), true)
-  }
-}
-
-fn rcr_inid(span: String, names: [String], n: Int, i: Int, acc: String) : String {
-  let id_end = scan_ident_end(span, n, i + 1)
-  let ident = string_slice(span, i, id_end - i)
-  let has = list_has(names, ident)
-  let suffix = if has { "()" } else { "" }
-  rcr_main(span, names, n, id_end, cat2(acc, cat2(ident, suffix)), true)
-}
-
-fn scan_ident_end(span: String, n: Int, i: Int) : Int {
-  if i >= n { i } else { scan_ident_step(span, n, i) }
-}
-
-fn scan_ident_step(span: String, n: Int, i: Int) : Int {
-  let c = char_at_or_zero(span, i)
-  if ch_is_alnum(c) { scan_ident_end(span, n, i + 1) }
-  else { i }
-}
-
-# append_char moved to compiler/util.kai (issue #677 phase 1h H1a).
 
 # m12.6.x #3 v2: synthesise a refinement-predicate fn for every
 # `type X = Base where pred` alias. The fn is named
 # `__ref_pred_X(self: Base) : Bool` and carries the same predicate
-# expression the user wrote. Wrapped in `DAttribPure` so the
-# refinement-pure validator admits calls to it inside contract
-# predicates. parse_optional_arm_refine references this name when
+# expression the user wrote. It has an empty effect row, so the
+# contract-predicate validator admits calls to it (purity is read off
+# the row). parse_optional_arm_refine references this name when
 # it sees `match { p : X -> ... }`; the resolver later binds the
 # call to this synthesised fn.
 # Issue #597 boundary tagging: thread `target_mod` so each synthesised
@@ -1427,9 +1176,10 @@ fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
   let self_param = Param { pname: "self", ptype: Some(base),
                             pline: l, pcol: c }
   let ret_ty = mk_ty(TyName("Bool", []), l, c)
-  let dfn = DFn(false, fn_name, [], [self_param], Some(ret_ty),
-                 REmpty, pred, l, c, mo)
-  DAttribPure(dfn, l, c)
+  # Empty effect row marks the synthesised predicate fn as pure, so a
+  # refinement-alias narrow used in a contract resolves as effect-pure.
+  DFn(false, fn_name, [], [self_param], Some(ret_ty),
+       REmpty, pred, l, c, mo)
 }
 
 # issue #187 phase 3: lower `PNarrow(name, TyName(t, []))` whose
@@ -1471,7 +1221,6 @@ fn lower_narrow_decl(d: Decl, aliases: [String]) : Decl {
     DTest(desc, body, l, c) -> DTest(desc, lower_narrow_expr(body, aliases), l, c)
     DBench(desc, body, l, c) -> DBench(desc, lower_narrow_expr(body, aliases), l, c)
     DCheck(desc, params, body, l, c) -> DCheck(desc, params, lower_narrow_expr(body, aliases), l, c)
-    DAttribPure(inner, l, c) -> DAttribPure(lower_narrow_decl(inner, aliases), l, c)
     _ -> d
   }
 }
@@ -1523,164 +1272,140 @@ fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
   }
 }
 
-# m12.6.x #5(a) result: extracted refinement-pure fn names + the
-# decls list with every DAttribPure unwrapped to its inner DFn so
-# downstream passes see ordinary fns.
-#[doc("Result of pure-name extraction: the user-declared pure fn names plus the decls they were taken from.")]
-pub type PureExtract = { names: [String], decls: [Decl] }
-
-#[doc("m12.6 contracts: extract user-declared `#[pure]` fn names so contract-predicate validation can check purity.")]
-pub fn extract_pure_names_decls(decls: [Decl]) : PureExtract =
-  extract_pure_names_loop(decls, [], [])
-
-fn extract_pure_names_loop(decls: [Decl], names_acc: [String],
-                            decls_acc: [Decl]) : PureExtract {
-  match decls {
-    [] -> PureExtract { names: list_reverse(names_acc),
-                        decls: list_reverse(decls_acc) }
-    [d, ...rest] -> match d {
-      DAttribPure(inner, _, _) -> match inner {
-        DFn(_, n, _, _, _, _, _, _, _, _) ->
-          extract_pure_names_loop(rest, [n, ...names_acc], [inner, ...decls_acc])
-        _ -> extract_pure_names_loop(rest, names_acc, [inner, ...decls_acc])
-      }
-      _ -> extract_pure_names_loop(rest, names_acc, [d, ...decls_acc])
-    }
-  }
-}
-
-# m12.6.x #5(a): post-parse validation of contract predicates.
+# post-parse validation of contract predicates.
 # Walks every DFn body looking for SAsserts whose msg span tags
 # them as contract-derived (`"requires violated at ..."` or
 # `"ensures violated at ..."`) and runs find_impure_call on each
 # cond using `closed_pure_names ++ user_pure_names`. Returns the
 # error count; the driver folds it into the program's exit code.
-#[doc("m12.6 contracts: reject `requires`/`ensures` predicates that call non-pure functions; returns the error count.")]
-pub fn validate_contract_predicates_decls(decls: [Decl], user_pure: [String],
+#[doc("m12.6 contracts: reject `requires`/`ensures` predicates that call effectful functions; returns the error count.")]
+pub fn validate_contract_predicates_decls(decls: [Decl],
                                        file: String) : Int / Console {
 
-  let combined = list_append(refinement_pure_names(), user_pure)
-  validate_contract_decls_loop(decls, combined, file, 0)
+  # `decls` is both the traversal target and the purity-resolution
+  # context: it includes the prelude + every imported module (built
+  # in driver.kai as `prelude ++ user`), so a predicate calling
+  # `money.is_zero` resolves the callee's row cross-module.
+  validate_contract_decls_loop(decls, decls, file, 0)
 }
 
-fn validate_contract_decls_loop(decls: [Decl], pure_names: [String],
+fn validate_contract_decls_loop(ds: [Decl], ctx: [Decl],
                                  file: String, errs: Int) : Int / Console {
 
-  match decls {
+  match ds {
     [] -> errs
     [d, ...rest] -> match d {
       DFn(_, _, _, _, _, _, body, _, _, _) -> {
-        let de = validate_contract_expr(body, pure_names, file)
-        validate_contract_decls_loop(rest, pure_names, file, errs + de)
+        let de = validate_contract_expr(body, ctx, file)
+        validate_contract_decls_loop(rest, ctx, file, errs + de)
       }
-      _ -> validate_contract_decls_loop(rest, pure_names, file, errs)
+      _ -> validate_contract_decls_loop(rest, ctx, file, errs)
     }
   }
 }
 
-fn validate_contract_expr(e: Expr, pure_names: [String], file: String) : Int / Console {
+fn validate_contract_expr(e: Expr, ctx: [Decl], file: String) : Int / Console {
 
   match e.kind {
     EBlock(stmts, opt_tail) -> {
-      let s_errs = validate_contract_stmts(stmts, pure_names, file, 0)
+      let s_errs = validate_contract_stmts(stmts, ctx, file, 0)
       let t_errs = match opt_tail {
-        Some(t) -> validate_contract_expr(t, pure_names, file)
+        Some(t) -> validate_contract_expr(t, ctx, file)
         None -> 0
       }
       s_errs + t_errs
     }
     EIf(c, t_, eo) -> {
-      let c_e = validate_contract_expr(c, pure_names, file)
-      let t_e = validate_contract_expr(t_, pure_names, file)
+      let c_e = validate_contract_expr(c, ctx, file)
+      let t_e = validate_contract_expr(t_, ctx, file)
       let e_e = match eo {
-        Some(eb) -> validate_contract_expr(eb, pure_names, file)
+        Some(eb) -> validate_contract_expr(eb, ctx, file)
         None -> 0
       }
       c_e + t_e + e_e
     }
     EMatch(scr, arms) -> {
-      let scr_e = validate_contract_expr(scr, pure_names, file)
-      validate_contract_arms(arms, pure_names, file, scr_e)
+      let scr_e = validate_contract_expr(scr, ctx, file)
+      validate_contract_arms(arms, ctx, file, scr_e)
     }
     ECall(f, args_) -> {
-      let fe = validate_contract_expr(f, pure_names, file)
-      validate_contract_exprs(args_, pure_names, file, fe)
+      let fe = validate_contract_expr(f, ctx, file)
+      validate_contract_exprs(args_, ctx, file, fe)
     }
-    ELambda(_, body) -> validate_contract_expr(body, pure_names, file)
-    EBinop(_, a, b) -> validate_contract_expr(a, pure_names, file) +
-                        validate_contract_expr(b, pure_names, file)
-    EUnop(_, x) -> validate_contract_expr(x, pure_names, file)
-    EField(b, _) -> validate_contract_expr(b, pure_names, file)
+    ELambda(_, body) -> validate_contract_expr(body, ctx, file)
+    EBinop(_, a, b) -> validate_contract_expr(a, ctx, file) +
+                        validate_contract_expr(b, ctx, file)
+    EUnop(_, x) -> validate_contract_expr(x, ctx, file)
+    EField(b, _) -> validate_contract_expr(b, ctx, file)
     _ -> 0
   }
 }
 
-fn validate_contract_exprs(es: [Expr], pure_names: [String], file: String, acc: Int) : Int / Console {
+fn validate_contract_exprs(es: [Expr], ctx: [Decl], file: String, acc: Int) : Int / Console {
 
   match es {
     [] -> acc
-    [e, ...rest] -> validate_contract_exprs(rest, pure_names, file,
-                                             acc + validate_contract_expr(e, pure_names, file))
+    [e, ...rest] -> validate_contract_exprs(rest, ctx, file,
+                                             acc + validate_contract_expr(e, ctx, file))
   }
 }
 
-fn validate_contract_arms(arms: [Arm], pure_names: [String], file: String, acc: Int) : Int / Console {
+fn validate_contract_arms(arms: [Arm], ctx: [Decl], file: String, acc: Int) : Int / Console {
 
   match arms {
     [] -> acc
     [a, ...rest] -> match a {
       Arm(_, opt_g, body) -> {
         let g_e = match opt_g {
-          Some(g) -> validate_contract_expr(g, pure_names, file)
+          Some(g) -> validate_contract_expr(g, ctx, file)
           None -> 0
         }
-        let b_e = validate_contract_expr(body, pure_names, file)
-        validate_contract_arms(rest, pure_names, file, acc + g_e + b_e)
+        let b_e = validate_contract_expr(body, ctx, file)
+        validate_contract_arms(rest, ctx, file, acc + g_e + b_e)
       }
     }
   }
 }
 
-fn validate_contract_stmts(stmts: [Stmt], pure_names: [String], file: String, acc: Int) : Int / Console {
+fn validate_contract_stmts(stmts: [Stmt], ctx: [Decl], file: String, acc: Int) : Int / Console {
 
   match stmts {
     [] -> acc
     [s, ...rest] -> {
-      let se = validate_contract_stmt(s, pure_names, file)
-      validate_contract_stmts(rest, pure_names, file, acc + se)
+      let se = validate_contract_stmt(s, ctx, file)
+      validate_contract_stmts(rest, ctx, file, acc + se)
     }
   }
 }
 
-fn validate_contract_stmt(s: Stmt, pure_names: [String], file: String) : Int / Console {
+fn validate_contract_stmt(s: Stmt, ctx: [Decl], file: String) : Int / Console {
 
   match s {
     SAssert(cond, opt_msg) -> {
       let kind_opt = contract_assert_kind(opt_msg)
-      let body_e = validate_contract_expr(cond, pure_names, file)
+      let body_e = validate_contract_expr(cond, ctx, file)
       match kind_opt {
         None -> body_e
-        Some(kind) -> match find_impure_call(cond, pure_names) {
+        Some(kind) -> match find_impure_call(cond, ctx) {
           None -> body_e
           Some(name) -> {
             diag_error_from_src(file, "", cond.line, cond.col,
               concat_all([
-                "`", kind, "` predicate calls non-pure function `", name,
+                "`", kind, "` predicate calls effectful function `", name,
                 "`. Refinement / contract predicates may only call ",
-                "the closed pure-prelude set or fns marked ",
-                "`[<refinement_pure>]`."
+                "effect-pure functions (those with an empty effect row)."
               ]))
             body_e + 1
           }
         }
       }
     }
-    SLet(_, _, rhs) -> validate_contract_expr(rhs, pure_names, file)
-    SExprStmt(x) -> validate_contract_expr(x, pure_names, file)
+    SLet(_, _, rhs) -> validate_contract_expr(rhs, ctx, file)
+    SExprStmt(x) -> validate_contract_expr(x, ctx, file)
     SIndexAssign(b, i, v, _, _) ->
-      validate_contract_expr(b, pure_names, file) +
-      validate_contract_expr(i, pure_names, file) +
-      validate_contract_expr(v, pure_names, file)
+      validate_contract_expr(b, ctx, file) +
+      validate_contract_expr(i, ctx, file) +
+      validate_contract_expr(v, ctx, file)
     _ -> 0
   }
 }

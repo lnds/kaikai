@@ -530,10 +530,10 @@ tier1-backend-parity: kaic2
 daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget tier1-asan tier1-backend-parity
 	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget + tier1-asan + tier1-backend-parity"
 
-# Stress fixtures: programs that exercise patterns the per-feature
-# suite does not. Some are aspirational (expected to fail until a
-# specific lane lands); the daily run reports them and the maintainer
-# decides if a green flip is unexpected.
+# Stress fixtures: closed regressions that exercise patterns the
+# per-feature suite does not — R3 scrutinee-reuse RC
+# (interp_recursive_walk) and m4c Phase 3 polymorphic flow-through
+# (m4c_flow_through). Hard gates: a failure here fails the daily.
 stress-fixtures: kaic2
 	@set -e; \
 	for f in examples/effects/interp_recursive_walk.kai \
