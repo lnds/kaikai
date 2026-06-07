@@ -25,20 +25,37 @@ The honesty claims are all met for emitted user programs:
   backend; see the TCO section below for the bootstrap-chain and LLVM
   caveats that survive).
 
-> **Backend note (LLVM RC, 2026-06-06, #747):** the numbers above are the
-> **C backend** (the primary, behind the honesty claims). The **LLVM
-> backend** (`--emit=llvm`) had never implemented the Perceus match RC
-> discipline at all — it leaked every scrutinee and boxed slot in every
-> match (rb-tree: `frees=0`, 3.7 GB RSS). #747 ported the C protocol to
-> the LLVM emitter (borrow slot reads, kind-1 raw Int binders, survivor
-> incref at bind, match-exit + TRMC-step scrutinee drop, two-pass
-> test/bind pattern lowering). The LLVM rb-tree is now **garbage-free**
-> (`free_total == alloc_total - live tree`; RSS 3.7 GB → 205 MB) and
-> ASan-clean, gated by `stage2` `test-issue-747`. It still trails the C
-> backend ~3.5× on wall/RSS because it does NOT yet do reuse-in-place
-> (fresh-alloc + drop, the C v1 shape) and links the older
-> `stage0/runtime.h` (no slab) — both **Tier-2 perf follow-ups**,
-> orthogonal to this Tier-1 RC-correctness fix.
+> **Backend note (LLVM RC, 2026-06-07, #747 CLOSED):** the numbers above
+> are the **C backend** (the primary, behind the honesty claims). The
+> **LLVM backend** (`--emit=llvm`) had never implemented the Perceus match
+> RC discipline at all — it leaked every scrutinee and boxed slot in every
+> match (rb-tree: `frees=0`, 3.7 GB RSS). PASO 1 (PR #756) ported the C RC
+> protocol + the unified stage2 runtime (slab + tagged-Int); the rb-tree
+> went garbage-free and RSS reached parity (55.4 vs 55.2 MB @ 1M). #747
+> then ported the **i64-inline representation**: Int variant slots ride
+> raw `i64` (construction `kaix_variant_masked` + `[n x i64]` buffer +
+> int-only `slot_mask`; read `kaix_variant_arg_i64` straight from `.i64`;
+> reuse-in-place `kaix_variant_at_masked`; literal-Int pattern test via
+> `icmp eq i64`), plus the **fast ctor paths** (`kai_variant_u_fast` with
+> startup payload-ctor registration, and `kaix_nullary_fast` array-load
+> with a startup nullary seed). Result (callgrind @ 100K): LLVM
+> **1,331.93M → 897.15M (4.87× C)** in the production separate-compile path,
+> **534.87M (2.90× C)** with the shim module merged (`llvm-link` / `-flto`);
+> −60% from baseline. Correctness exact (height == C), RSS in parity,
+> selfhost byte-id on both backends, ASan-clean. Gated by `test-issue-747`
+> (asserts the raw representation) and `test-issue-747-mixed-slots` (the
+> `k == 1` Int-only coherence gate vs Real/enum/ptr slots).
+>
+> The residual gap (2.90×–4.87× depending on link) is the `kaix_*` shim
+> **call boundary** (the LLVM backend keeps `%KaiValue` opaque and routes
+> every cell access through an external shim, where the C backend inlines
+> the whole runtime in one TU) plus the structurally heavier `insert_loop`
+> codegen. Closing it needs the production link to merge the shim module
+> (`-flto` / `llvm-link`) — a **build-chain Tier-2 lane**, measured on
+> Linux (the wall is cache-bound on Mac and does not move with LTO there) —
+> not a codegen change. The design ceiling is ~1.5× C (the same the C
+> backend hits vs hand-written C), not 1.0×: the opaque-IR / one-runtime /
+> two-ABI invariant forbids inlining cell-interior access into the IR.
 
 The 2026-05 doc generation cited the rb-tree at **12.6×–15.9× C**.
 **Those numbers are dead.** The reuse-in-place cascade of 2026-06-01/02

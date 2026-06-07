@@ -64,7 +64,7 @@ if command -v "$CLANG" >/dev/null 2>&1; then
     if [[ "$N" != "1000000" ]]; then
       sed -i.bak "s/@kai_fill_loop(\(.*\)i64 1000000)/@kai_fill_loop(\1i64 ${N})/" "$WORK/rb_kaikai.ll"
     fi
-    if "$CLANG" -O2 -w -I "$REPO_ROOT/stage0" "$WORK/rb_kaikai.ll" \
+    if "$CLANG" -O2 -w -I "$REPO_ROOT/stage2" -I "$REPO_ROOT/stage0" "$WORK/rb_kaikai.ll" \
          "$REPO_ROOT/stage0/runtime_llvm.c" -o "$WORK/rb_kaikai_llvm" -lm 2>>"$WORK/llvm.err"; then
       HAVE_LLVM=1
     else
