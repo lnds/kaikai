@@ -284,7 +284,7 @@ fn lvm_clause_cap_bind(e: LlvmEmit, c: String, reg: String) : LlvmEmit {
 
 fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           oo: [OpOffset], cls: [ClauseInfo],
-                          regions: [RegionMark],
+                          regions: [RegionMark], enums: [String],
                           start_id: Int) : LlvmDeclOut / Console {
 
   match c {
@@ -305,7 +305,7 @@ fn llvm_emit_clause_body(c: ClauseInfo, fns: [EFn], vs: [EVar], lams: [LamInfo],
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
                           locals: locals0, fns: fns, vars_: vs, lams: lams,
-                          op_offsets: oo, cls: cls, regions: regions, in_region: false }
+                          op_offsets: oo, cls: cls, regions: regions, in_region: false, enums: enums }
       # R9 env prologue: rebind each capture from `self->env` so the
       # body's `EVar(name)` reads resolve to a local. The env-struct
       # named type is keyed by the same (enc_fn, line, col) triple the
@@ -364,14 +364,14 @@ fn llvm_clause_locals(ps: [Param]) : [LlvmLocal] {
 
 fn llvm_emit_clause_bodies(cs: [ClauseInfo], fns: [EFn], vs: [EVar],
                             lams: [LamInfo], oo: [OpOffset],
-                            cls_all: [ClauseInfo], regions: [RegionMark],
+                            cls_all: [ClauseInfo], regions: [RegionMark], enums: [String],
                             start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match cs {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [c, ...rest] -> {
-      let out = llvm_emit_clause_body(c, fns, vs, lams, oo, cls_all, regions, start_id)
-      llvm_emit_clause_bodies(rest, fns, vs, lams, oo, cls_all, regions,
+      let out = llvm_emit_clause_body(c, fns, vs, lams, oo, cls_all, regions, enums, start_id)
+      llvm_emit_clause_bodies(rest, fns, vs, lams, oo, cls_all, regions, enums,
                               out.next_id, string_concat(acc, out.text))
     }
   }
@@ -540,9 +540,19 @@ pub fn llvm_header() : String =
     "declare %KaiValue* @kaix_write_stdout_thunk(%KaiValue*, %KaiValue**, i32)\n",
     "declare %KaiValue* @kaix_int_to_string_thunk(%KaiValue*, %KaiValue**, i32)\n",
     "declare %KaiValue* @kaix_variant(i32, i8*, i32, %KaiValue**)\n",
+    # i64-inline parity (#747): fast nullary ctor — array load from
+    # kai_enum_by_tag instead of the cold kai_variant_u nullary probe.
+    "declare %KaiValue* @kaix_nullary_fast(i32, i8*)\n",
+    # i64-inline parity (#747): typed-slot construction with a `slot_mask`.
+    # The buffer is the IR's `[n x i64]` reinterpreted as KaiVarSlot* (one
+    # word per slot): raw i64 for Int slots, ptrtoint(ptr) for the rest.
+    "declare %KaiValue* @kaix_variant_masked(i32, i8*, i32, i32, %KaiValue**)\n",
     "declare i32           @kaix_is_variant(%KaiValue*, i8*)\n",
     "declare i32           @kaix_is_variant_tag(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_variant_arg(%KaiValue*, i32)\n",
+    # i64-inline parity (#747): read a kind-1 Int slot as a raw i64 word,
+    # no box round-trip. Construction stores the bare scalar in `.i64`.
+    "declare i64 @kaix_variant_arg_i64(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_eq_raw(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
     "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
@@ -554,6 +564,10 @@ pub fn llvm_header() : String =
     "declare void @kaix_reuse_free(%KaiValue*)\n",
     "declare %KaiValue* @kaix_variant_arg_borrow(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_variant_at(%KaiValue*, i32, i8*, i32, %KaiValue**)\n",
+    # i64-inline parity (#747): reuse-in-place rebuild with a `slot_mask`,
+    # so a token-donated TRMC step writes the same word kinds as fresh
+    # construction (raw i64 for Int slots).
+    "declare %KaiValue* @kaix_variant_at_masked(%KaiValue*, i32, i8*, i32, i32, %KaiValue**)\n",
     # Issue #668 — TRMC constructor-context shims (stage0/runtime_llvm.c).
     "declare %KaiValue** @kaix_field_addr(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_cctx_apply(%KaiValue*, %KaiValue**, %KaiValue*)\n",
@@ -898,7 +912,12 @@ type LlvmEmit = {
   # (`llvm_cons_target` etc.) bump-allocate into the arena. Mirror of
   # the C backend's `EmitCtx.regions` / `EmitCtx.in_region`.
   regions: [RegionMark],
-  in_region: Bool
+  in_region: Bool,
+  # i64-inline parity (#747): enum-like type names, so the variant
+  # construction/match-read path calls `variant_slot_kind` with the SAME
+  # `enums` the C backend uses. Immutable for the whole emit; seeded once
+  # in `emit_program_llvm` and threaded like `regions`.
+  enums: [String]
 }
 
 type OpOffset = OO(String, Int)
@@ -906,17 +925,17 @@ type OpOffset = OO(String, Int)
 fn llvm_emit_new() : LlvmEmit =
   LlvmEmit { ids: llvm_id_new(), globals: "", body: "", last_val: "",
              cur_label: "entry", locals: [], fns: [], vars_: [], lams: [],
-             op_offsets: [], cls: [], regions: [], in_region: false }
+             op_offsets: [], cls: [], regions: [], in_region: false, enums: [] }
 
 fn llvm_append_body(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: string_concat(e.body, s),
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: v, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 # issue #120 — set the lexical `in_region` flag (mirror of llvm_set_last).
 # The EBlock arm flips it to true inside a recorded `region { }` so the
@@ -925,7 +944,7 @@ fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
 fn llvm_set_in_region(e: LlvmEmit, b: Bool) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: b }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: b, enums: e.enums }
 
 # issue #120 — ctor target selection. Inside a `region { }` the cons /
 # record / variant constructors route to the bump-arena runtime entries
@@ -959,22 +978,22 @@ fn llvm_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
 fn llvm_set_label(e: LlvmEmit, lbl: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: lbl,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 fn llvm_append_global(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: string_concat(e.globals, s), body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 fn llvm_fresh_id(e: LlvmEmit) : LlvmEmit =
   LlvmEmit { ids: llvm_id_bump(e.ids), globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 # Issue #87 — Phase 2 unbox LLVM mirror. A let-bound name whose
 # rhs is `MUnboxed` becomes a raw SSA register. Stored alongside
@@ -983,7 +1002,7 @@ fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
 fn llvm_push_raw_local(e: LlvmEmit, nm: String, reg: String, t: Ty) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LRaw(nm, reg, t), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region }
+             locals: [LRaw(nm, reg, t), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams, op_offsets: e.op_offsets, cls: e.cls, regions: e.regions, in_region: e.in_region, enums: e.enums }
 
 # Open a new LLVM basic block: emit the `<label>:` header and
 # record `label` as the active one so downstream phi nodes can
@@ -3334,30 +3353,177 @@ fn llvm_emit_variant_ctor(e: LlvmEmit, cname: String, xs: [Expr]) : LlvmEmit / C
   let name_len = string_length(name_body) + 1
   let e1 = llvm_append_global(name_label_id.e, llvm_emit_string_const(name_label, name_body))
   if n == 0 {
+    # i64-inline parity (#747): a nullary ctor reads its interned singleton
+    # straight from `kai_enum_by_tag[tag]` via `kaix_nullary_fast` — an array
+    # load — instead of the cold NOINLINE `kai_variant_u` + nullary-cache
+    # hash probe `kaix_variant` routed to. Every nullary is seeded at startup
+    # (`kaix_seed_nullary` in `_kai_proto_init_llvm`), so the load always
+    # hits. Mirror of the C backend's `kai_nullary_fast` (emit_c
+    # `emit_ident_value`). On the rb-tree this was ~23% of all instructions
+    # (Red/Black/RBLeaf minted through the cold path every insert).
     let r = llvm_fresh_reg(e1)
     let instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* @kaix_variant(i32 ", tag_str, ", i8* ",
-      llvm_gep_str(name_label, name_len), ", i32 0, %KaiValue** null)\n"
+      "  ", r.reg, " = call %KaiValue* @kaix_nullary_fast(i32 ", tag_str, ", i8* ",
+      llvm_gep_str(name_label, name_len), ")\n"
     ])
     llvm_set_last(llvm_append_body(r.e, instr), r.reg)
   } else {
-    # Evaluate every arg, emit an alloca for the KaiValue*[] buffer,
-    # store each value, then call kaix_variant with a pointer to the
-    # first slot.
-    let ra = llvm_emit_args(e1, xs, [])
-    let buf = llvm_fresh_reg(ra.st)
-    let alloc_instr = concat_all([
-      "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
-    ])
-    let e2 = llvm_append_body(buf.e, alloc_instr)
-    let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
-    let r = llvm_fresh_reg(e3)
-    let call_instr = concat_all([
-      "  ", r.reg, " = call %KaiValue* ", llvm_variant_target(e), "(i32 ", tag_str, ", i8* ",
-      llvm_gep_str(name_label, name_len),
-      ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
-    ])
-    llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
+    # i64-inline parity (#747): a ctor with ≥1 kind-1 Int slot takes the
+    # TYPED construction path — store the raw `i64` word for each Int slot,
+    # a boxed pointer word for the rest, and pass the int-only `slot_mask`
+    # so the runtime drop walker keeps the Int slots unboxed. SCOPE
+    # (Option A): ONLY kind-1 (Int) rides raw; kind-2 (Real) / kind-3 (enum)
+    # stay boxed pointers exactly as the legacy path laid them out, so
+    # construction and the match-read walk agree by construction (both gate
+    # on `llvm_is_int_slot`). Enum singletons are interned/immortal — raw
+    # packing them buys no measurable wall. Outside a region only (an arena
+    # ctor keeps the legacy boxed path). Ctors with no Int slot keep the
+    # legacy boxed `kaix_variant` path unchanged.
+    let tys_opt = evar_payload_tys(e.vars_, cname)
+    let use_typed = match tys_opt {
+      Some(ts) -> variant_has_int_slot(ts) and (not e.in_region)
+      None     -> false
+    }
+    if use_typed {
+      match tys_opt {
+        Some(ts) -> llvm_emit_variant_ctor_typed(e1, tag_str, name_label, name_len, xs, ts, n)
+        None     -> e1   # unreachable: use_typed implies Some
+      }
+    } else {
+      # Evaluate every arg, emit an alloca for the KaiValue*[] buffer,
+      # store each value, then call kaix_variant with a pointer to the
+      # first slot.
+      let ra = llvm_emit_args(e1, xs, [])
+      let buf = llvm_fresh_reg(ra.st)
+      let alloc_instr = concat_all([
+        "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+      ])
+      let e2 = llvm_append_body(buf.e, alloc_instr)
+      let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
+      let r = llvm_fresh_reg(e3)
+      let call_instr = concat_all([
+        "  ", r.reg, " = call %KaiValue* ", llvm_variant_target(e), "(i32 ", tag_str, ", i8* ",
+        llvm_gep_str(name_label, name_len),
+        ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
+      ])
+      llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
+    }
+  }
+}
+
+# i64-inline parity (#747) — THE single source of truth for "is this payload
+# slot a raw-i64 Int slot?". Mirrors the unbox pass's criterion
+# (`ctor_int_slots_of` = `variant_slot_kind(te, []) == 1`) EXACTLY, so the
+# match-arm binder seeding (MUnboxed), the construction word kind, and the
+# match-read accessor all agree. Pass `[]` for enums on purpose: Int does
+# not depend on the enum list, and a Bool/Char/enum field is kind-3 (must
+# NOT ride raw-int). Never spell the condition inline — every site routes
+# through this one predicate so construction and read can never diverge.
+fn llvm_is_int_slot(t: TypeExpr) : Bool = variant_slot_kind(t, []) == 1
+
+# True iff `tys` has ≥1 kind-1 Int slot — the gate for the typed
+# construction path. (Real/enum slots alone keep the legacy boxed path.)
+fn variant_has_int_slot(tys: [TypeExpr]) : Bool = match tys {
+  []           -> false
+  [t, ...rest] -> if llvm_is_int_slot(t) { true } else { variant_has_int_slot(rest) }
+}
+
+# The slot_mask marking ONLY kind-1 Int slots (kind value 1 at each Int
+# slot's 2-bit window). Real/enum slots stay 0 (pointer): Option A
+# constructs them boxed, so the runtime drop walker must see them as
+# pointers. We build the mask from `llvm_is_int_slot`, NOT
+# `variant_slot_mask(tys, [])` (which would set bit-pair 2 for a Real slot
+# we are not packing raw).
+fn llvm_int_slot_mask_loop(tys: [TypeExpr], i: Int, acc: Int) : Int = match tys {
+  []           -> acc
+  [t, ...rest] ->
+    if i >= 16 { 0 }
+    else {
+      let bit = if llvm_is_int_slot(t) { variant_slot_pos(i) } else { 0 }
+      llvm_int_slot_mask_loop(rest, i + 1, acc + bit)
+    }
+}
+fn llvm_int_slot_mask(tys: [TypeExpr]) : Int = llvm_int_slot_mask_loop(tys, 0, 0)
+
+# i64-inline parity (#747): typed variant construction. Builds an
+# `[n x i64]` slot buffer — one machine word per slot — and routes through
+# `kaix_variant_masked` with the int-only `slot_mask`. A `KaiVarSlot` is one
+# word (union of `KaiValue*`/`i64`), so the homogeneous `i64` buffer aliases
+# it exactly: a kind-1 Int slot stores the raw `i64` scalar, every other
+# slot stores `ptrtoint`(boxed ptr). A HOMOGENEOUS i64 buffer with
+# `ptrtoint` at the boundary (not per-slot `bitcast %KaiValue** -> i64*`)
+# keeps the opaque-pointer IR from aliasing a cell interior across two
+# element types — TBAA-safe under -O2.
+fn llvm_emit_variant_ctor_typed(e: LlvmEmit, tag_str: String,
+                                name_label: String, name_len: Int,
+                                xs: [Expr], tys: [TypeExpr], n: Int) : LlvmEmit / Console {
+  let mask = llvm_int_slot_mask(tys)
+  let buf = llvm_fresh_reg(e)
+  let alloc_instr = concat_all([
+    "  ", buf.reg, " = alloca i64, i32 ", int_to_string(n), "\n"
+  ])
+  let e2 = llvm_append_body(buf.e, alloc_instr)
+  let e3 = llvm_emit_variant_slot_stores_typed(e2, buf.reg, xs, tys, 0)
+  # Reinterpret the i64 buffer as KaiVarSlot* (== KaiValue** word-wise) for
+  # the call. `bitcast` of the alloca pointer is a no-op address cast.
+  let cast = llvm_fresh_reg(e3)
+  let cast_instr = concat_all([
+    "  ", cast.reg, " = bitcast i64* ", buf.reg, " to %KaiValue**\n"
+  ])
+  let e4 = llvm_append_body(cast.e, cast_instr)
+  let r = llvm_fresh_reg(e4)
+  let call_instr = concat_all([
+    "  ", r.reg, " = call %KaiValue* @kaix_variant_masked(i32 ", tag_str, ", i8* ",
+    llvm_gep_str(name_label, name_len),
+    ", i32 ", int_to_string(n), ", i32 ", int_to_string(mask),
+    ", %KaiValue** ", cast.reg, ")\n"
+  ])
+  llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
+}
+
+# Store each ctor arg into the `[n x i64]` buffer. A kind-1 Int slot →
+# the raw `i64` scalar straight into the word. Every other slot (kind 0
+# pointer, kind 2 Real, kind 3 enum) → the boxed `%KaiValue*` reinterpreted
+# to i64 via `ptrtoint`, matching the mask (which marks ONLY Int slots).
+fn llvm_emit_variant_slot_stores_typed(e: LlvmEmit, buf_reg: String,
+                                       xs: [Expr], tys: [TypeExpr], i: Int) : LlvmEmit / Console {
+  match xs {
+    [] -> e
+    [x, ...rest_x] -> match tys {
+      [] -> e   # arity mismatch — typer would have rejected
+      [t, ...rest_t] -> {
+        let gep = llvm_fresh_reg(e)
+        let gep_instr = concat_all([
+          "  ", gep.reg, " = getelementptr inbounds i64, i64* ", buf_reg,
+          ", i32 ", int_to_string(i), "\n"
+        ])
+        let e_g = llvm_append_body(gep.e, gep_instr)
+        let e_stored = if llvm_is_int_slot(t) {
+          # kind-1 Int: raw i64 scalar straight into the word.
+          # `llvm_emit_expr_raw` reads a kind-1 raw binder directly and
+          # unwraps any MBoxed Int at the boundary (kaix_to_int), the LLVM
+          # mirror of emit_c's `store_raw_int`.
+          let rr = llvm_emit_expr_raw(e_g, x)
+          llvm_append_body(rr.e, concat_all([
+            "  store i64 ", rr.reg, ", i64* ", gep.reg, "\n"
+          ]))
+        } else {
+          # kind 0/2/3: emit boxed, ptrtoint to i64, store the word. The
+          # mask leaves these at 0 (pointer), so the runtime reads `.ptr`
+          # back — `inttoptr` of these bits is the original pointer.
+          let eb = llvm_emit_expr(e_g, x)
+          let pti = llvm_fresh_reg(eb)
+          let pti_instr = concat_all([
+            "  ", pti.reg, " = ptrtoint %KaiValue* ", eb.last_val, " to i64\n"
+          ])
+          let e_p = llvm_append_body(pti.e, pti_instr)
+          llvm_append_body(e_p, concat_all([
+            "  store i64 ", pti.reg, ", i64* ", gep.reg, "\n"
+          ]))
+        }
+        llvm_emit_variant_slot_stores_typed(e_stored, buf_reg, rest_x, rest_t, i + 1)
+      }
+    }
   }
 }
 
@@ -4411,7 +4577,7 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr], bline: Int, b
   # hands the flag back to the enclosing context here.
   LlvmEmit { ids: closed.ids, globals: closed.globals, body: closed.body,
              last_val: closed.last_val, cur_label: closed.cur_label,
-             locals: outer_locals, fns: closed.fns, vars_: closed.vars_, lams: closed.lams, op_offsets: closed.op_offsets, cls: closed.cls, regions: closed.regions, in_region: e.in_region }
+             locals: outer_locals, fns: closed.fns, vars_: closed.vars_, lams: closed.lams, op_offsets: closed.op_offsets, cls: closed.cls, regions: closed.regions, in_region: e.in_region, enums: closed.enums }
 }
 
 fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit / Console {
@@ -5125,8 +5291,12 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.var.ok.")
       # #747 TEST-ONLY: recurse into sub-patterns for their discriminator
       # checks only (no binds). The bind pass re-reads the slots as borrows
-      # and binds after the whole pattern matched.
-      llvm_emit_pat_subpats_test(e3, subpats, scr, fail_lbl, 0)
+      # and binds after the whole pattern matched. Thread the payload tys so
+      # a PLit Int over a kind-1 slot reads the raw `.i64` word and compares
+      # with a native `icmp` — never `kaix_variant_arg` (which would re-box
+      # the raw slot into a leaked owning temporary) + `kaix_eq_raw`.
+      let subpat_tys = match evar_payload_tys(e.vars_, cname) { Some(t) -> t None -> [] }
+      llvm_emit_pat_subpats_test(e3, subpats, scr, fail_lbl, 0, subpat_tys)
     }
     PList(sub_pats, opt_rest) -> llvm_emit_pat_list(e, sub_pats, opt_rest, scr, fail_lbl)
     PHole(_) -> e
@@ -5415,7 +5585,7 @@ fn llvm_name_is_unused(name: String) : Bool =
 # for slots whose sub-pattern is a pure binder/wild (no test needed) —
 # but we still must descend into nested destructuring sub-patterns.
 fn llvm_emit_pat_subpats_test(e: LlvmEmit, ps: [Pattern], scr: String, fail_lbl: String,
-                               i: Int) : LlvmEmit / Console {
+                               i: Int, tys: [TypeExpr]) : LlvmEmit / Console {
   match ps {
     [] -> e
     [p, ...rest] -> {
@@ -5428,7 +5598,47 @@ fn llvm_emit_pat_subpats_test(e: LlvmEmit, ps: [Pattern], scr: String, fail_lbl:
         PHole(_) -> false
         _        -> true
       }
-      if needs_test {
+      let is_int = match llvm_list_nth_ty(tys, i) { Some(t) -> llvm_is_int_slot(t) None -> false }
+      if needs_test and is_int {
+        # i64-inline parity (#747): a kind-1 Int slot test (`match k { 5 -> }`)
+        # reads the raw `.i64` word and compares with native `icmp eq i64`
+        # against the literal — never `kaix_variant_arg` (re-boxes the raw
+        # slot into a leaked owning temporary) + `kaix_eq_raw`. Mirror of
+        # emit_c's `slot_read_for_test` kind-1 path, but comparing raw
+        # scalars instead of re-boxing through `kai_int`. A non-PLit test on
+        # a kind-1 slot is impossible (Int has no nested ctor pattern), so
+        # the only failing sub-pattern here is a PLit.
+        match p.pkind {
+          PLit(lit) -> {
+            let raw = llvm_fresh_reg(e)
+            let raw_i = concat_all([
+              "  ", raw.reg, " = call i64 @kaix_variant_arg_i64(%KaiValue* ", scr,
+              ", i32 ", int_to_string(i), ")\n"
+            ])
+            let e_raw = llvm_append_body(raw.e, raw_i)
+            let lr = llvm_emit_expr_raw(e_raw, lit)
+            let cmp = llvm_fresh_reg(lr.e)
+            let cmp_i = concat_all([
+              "  ", cmp.reg, " = icmp eq i64 ", raw.reg, ", ", lr.reg, "\n"
+            ])
+            let e_cmp = llvm_append_body(cmp.e, cmp_i)
+            let e_br = llvm_emit_cond_br_fail(e_cmp, cmp.reg, fail_lbl, "pat.lit.ok.")
+            llvm_emit_pat_subpats_test(e_br, rest, scr, fail_lbl, i + 1, tys)
+          }
+          # Defensive: any other testable sub-pattern on an Int slot is a
+          # type error the typer rejects; fall back to the boxed read.
+          _ -> {
+            let arg = llvm_fresh_reg(e)
+            let instr = concat_all([
+              "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
+              ", i32 ", int_to_string(i), ")\n"
+            ])
+            let e1 = llvm_append_body(arg.e, instr)
+            let e2 = llvm_emit_pattern_test(e1, p, arg.reg, fail_lbl)
+            llvm_emit_pat_subpats_test(e2, rest, scr, fail_lbl, i + 1, tys)
+          }
+        }
+      } else if needs_test {
         let arg = llvm_fresh_reg(e)
         let instr = concat_all([
           "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
@@ -5436,9 +5646,9 @@ fn llvm_emit_pat_subpats_test(e: LlvmEmit, ps: [Pattern], scr: String, fail_lbl:
         ])
         let e1 = llvm_append_body(arg.e, instr)
         let e2 = llvm_emit_pattern_test(e1, p, arg.reg, fail_lbl)
-        llvm_emit_pat_subpats_test(e2, rest, scr, fail_lbl, i + 1)
+        llvm_emit_pat_subpats_test(e2, rest, scr, fail_lbl, i + 1, tys)
       } else {
-        llvm_emit_pat_subpats_test(e, rest, scr, fail_lbl, i + 1)
+        llvm_emit_pat_subpats_test(e, rest, scr, fail_lbl, i + 1, tys)
       }
     }
   }
@@ -5493,16 +5703,17 @@ fn llvm_emit_pat_subpats_binds(e: LlvmEmit, ps: [Pattern], scr: String, i: Int,
         _                     -> false
       }
       if bind_raw {
+        # i64-inline parity (#747): read the kind-1 Int slot as a RAW i64
+        # word, directly from `.i64` — no `kaix_variant_arg` (which re-boxes
+        # the typed slot into a fresh owning temporary) + `kaix_to_int`
+        # round-trip. Construction stores the bare scalar (kaix_variant_masked),
+        # so this is the LLVM mirror of emit_c's
+        # `int64_t kair = kai_var_slots(_scr)[i].i64`.
         let nm = match p.pkind { PBind(n) -> n _ -> "" }
-        let arg = llvm_fresh_reg(e)
-        let arg_i = concat_all([
-          "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg(%KaiValue* ", scr,
-          ", i32 ", int_to_string(i), ")\n"
-        ])
-        let e_arg = llvm_append_body(arg.e, arg_i)
-        let raw = llvm_fresh_reg(e_arg)
+        let raw = llvm_fresh_reg(e)
         let raw_i = concat_all([
-          "  ", raw.reg, " = call i64 @kaix_to_int(%KaiValue* ", arg.reg, ")\n"
+          "  ", raw.reg, " = call i64 @kaix_variant_arg_i64(%KaiValue* ", scr,
+          ", i32 ", int_to_string(i), ")\n"
         ])
         let e_raw = llvm_append_body(raw.e, raw_i)
         let e_pushed = llvm_push_raw_local(e_raw, nm, raw.reg, TyInt)
@@ -5651,14 +5862,13 @@ fn llvm_emit_arm_borrow_binds(e: LlvmEmit, subs: [Pattern], tys: [TypeExpr],
         PBind(nm) ->
           if llvm_name_is_unused(nm) { e }
           else if k == 1 {
-            # kind-1 Int: raw i64 read, push LRaw (matches the owned walk).
-            let arg = llvm_fresh_reg(e)
-            let e_a = llvm_append_body(arg.e, concat_all([
-              "  ", arg.reg, " = call %KaiValue* @kaix_variant_arg_borrow(%KaiValue* ", scr,
-              ", i32 ", int_to_string(i), ")\n"]))
-            let raw = llvm_fresh_reg(e_a)
+            # kind-1 Int: raw i64 read direct from `.i64` (#747), push LRaw —
+            # matches the owned walk. No borrow+to_int round-trip now that the
+            # slot holds the bare scalar word (kaix_variant_masked construction).
+            let raw = llvm_fresh_reg(e)
             let e_r = llvm_append_body(raw.e, concat_all([
-              "  ", raw.reg, " = call i64 @kaix_to_int(%KaiValue* ", arg.reg, ")\n"]))
+              "  ", raw.reg, " = call i64 @kaix_variant_arg_i64(%KaiValue* ", scr,
+              ", i32 ", int_to_string(i), ")\n"]))
             llvm_push_raw_local(e_r, nm, raw.reg, TyInt)
           } else {
             # kind 0/2/3: borrow the pointer slot, no incref. Under the
@@ -5839,7 +6049,7 @@ fn llvm_emit_match_arms_slot(e: LlvmEmit, arms: [Arm], scr_reg: String, scr_slot
           last_val: e_br.last_val, cur_label: e_br.cur_label,
           locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
           lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
-          regions: e_br.regions, in_region: e_br.in_region
+          regions: e_br.regions, in_region: e_br.in_region, enums: e_br.enums
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
         llvm_emit_match_arms_slot(e_next, rest, scr_reg, scr_slot, end_lbl,
@@ -6016,7 +6226,7 @@ fn llvm_emit_match_switch(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: I
         last_val: e_br.last_val, cur_label: e_br.cur_label,
         locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
         lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
-        regions: e_br.regions, in_region: e_br.in_region
+        regions: e_br.regions, in_region: e_br.in_region, enums: e_br.enums
       }
       LlvmSD { st: e_scoped, entries: [AE(body_val, body_end), ...case_emit.entries] }
     } }
@@ -6148,7 +6358,7 @@ fn llvm_emit_switch_case_bodies(e: LlvmEmit, cases: [SwCase], end_lbl: String,
           last_val: e_br.last_val, cur_label: e_br.cur_label,
           locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
           lams: e_br.lams, op_offsets: e_br.op_offsets, cls: e_br.cls,
-          regions: e_br.regions, in_region: e_br.in_region
+          regions: e_br.regions, in_region: e_br.in_region, enums: e_br.enums
         }
         llvm_emit_switch_case_bodies(e_scoped, rest, end_lbl,
                                        [AE(body_val, body_end), ...acc])
@@ -6397,7 +6607,7 @@ fn llvm_thunk_call_args(i: Int, arity: Int, acc: String) : String {
 # through all decls.
 type LlvmDeclOut = { text: String, next_id: Int }
 
-fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], enums: [String], start_id: Int) : LlvmDeclOut / Console {
 
   match d {
     DFn(_, nm, _, ps, ret_ty_opt, _, body, _, _, mo) -> {
@@ -6463,7 +6673,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
                               globals: "", body: "",
                               last_val: "", cur_label: first_label,
                               locals: locals0, fns: body_fns, vars_: vs, lams: lams,
-                              op_offsets: oo, cls: cls, regions: regions, in_region: false }
+                              op_offsets: oo, cls: cls, regions: regions, in_region: false, enums: enums }
           # TCO prologue: a raw param allocas an `iN` slot fed by
           # `%pargr_<n>` (no RC); a boxed param allocas a `%KaiValue*`
           # slot fed by `%parg_<n>`. The back-edge mirrors the split.
@@ -6521,7 +6731,7 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset]
                               globals: "", body: "",
                               last_val: "", cur_label: first_label,
                               locals: locals0, fns: body_fns, vars_: vs, lams: lams,
-                              op_offsets: oo, cls: cls, regions: regions, in_region: false }
+                              op_offsets: oo, cls: cls, regions: regions, in_region: false, enums: enums }
           # Prologue (TCO only): alloca + store the incoming args, branch
           # into the loop header, reload params. Emitted into the body so it
           # precedes the real body's IR; `cur_label` is already
@@ -6862,13 +7072,13 @@ fn llvm_ffi_param_decrefs(params: [Param], i: Int) : String {
   }
 }
 
-fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], enums: [String], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match ds {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [d, ...rest] -> {
-      let out = llvm_emit_fn(d, fns, vs, lams, oo, cls, regions, start_id)
-      llvm_emit_decls_loop(rest, fns, vs, lams, oo, cls, regions, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_fn(d, fns, vs, lams, oo, cls, regions, enums, start_id)
+      llvm_emit_decls_loop(rest, fns, vs, lams, oo, cls, regions, enums, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -6878,7 +7088,7 @@ fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], oo:
 # has thunk signature `(self, args, n)` — args[i] reads the i-th
 # param, `kaix_capture(self, i)` reads the i-th captured local. The
 # body is then emitted under an env that pushes both as named regs.
-fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], enums: [String], start_id: Int) : LlvmDeclOut / Console {
 
   match l {
     LamInfo(id, _, _, params, caps, body) -> {
@@ -6886,7 +7096,7 @@ fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], oo
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
                           locals: [], fns: fns, vars_: vs, lams: lams,
-                          op_offsets: oo, cls: cls, regions: regions, in_region: false }
+                          op_offsets: oo, cls: cls, regions: regions, in_region: false, enums: enums }
       let e1 = llvm_emit_lambda_param_loads(e0, params, 0)
       let e2 = llvm_emit_lambda_capture_loads(e1, caps, 0)
       let e3 = llvm_emit_expr(e2, body)
@@ -6948,9 +7158,9 @@ fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmi
 # lambda's body was emitted; `find_lam` then failed at the inner
 # `ELambda` use site and the emitter substituted `undef` for the
 # closure pointer (visible as the "lambda info missing" stderr line).
-fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], enums: [String], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
-  llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, regions, start_id, acc)
+  llvm_emit_lambda_bodies_loop(lams, lams, fns, vs, oo, cls, regions, enums, start_id, acc)
 }
 
 # Returns LlvmDeclOut (not just the text) so the id counter survives
@@ -6958,13 +7168,13 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffse
 # otherwise both phases mint globals from the same `decls_out.next_id`
 # base and collide (e.g. two `@eff.disp.name.N` for distinct effects,
 # issue #622 — clang rejects the redefinition).
-fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], start_id: Int, acc: String) : LlvmDeclOut / Console {
+fn llvm_emit_lambda_bodies_loop(remaining: [LamInfo], all_lams: [LamInfo], fns: [EFn], vs: [EVar], oo: [OpOffset], cls: [ClauseInfo], regions: [RegionMark], enums: [String], start_id: Int, acc: String) : LlvmDeclOut / Console {
 
   match remaining {
     [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [l, ...rest] -> {
-      let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, regions, start_id)
-      llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, regions, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_lambda_body(l, fns, vs, all_lams, oo, cls, regions, enums, start_id)
+      llvm_emit_lambda_bodies_loop(rest, all_lams, fns, vs, oo, cls, regions, enums, out.next_id, string_concat(acc, out.text))
     }
   }
 }
@@ -7006,14 +7216,18 @@ pub fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], regions: 
   # through every emit step so install code in `llvm_emit_handle` can
   # mint the same prefixed clause symbols that the bodies emit.
   let cls = lc.clauses
-  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, cls, regions, 0, "")
-  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, cls, regions, decls_out.next_id, "")
+  # i64-inline parity (#747): the SAME enum-like names the C backend computes
+  # (`collect_enum_type_names(decls)`), threaded through every body-emit step
+  # so `variant_slot_kind` agrees across backends.
+  let enums = collect_enum_type_names(decls)
+  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, oo, cls, regions, enums, 0, "")
+  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, oo, cls, regions, enums, decls_out.next_id, "")
   # m7c-d: emit each handler clause as a top-level LLVM function;
   # the handle prologue stores function pointers to these into
   # the matching `%EvX` field.
   let clauses_info = lc.clauses
   let clauses_out = llvm_emit_clause_bodies(clauses_info, fns, vs, lams, oo,
-                                              clauses_info, regions,
+                                              clauses_info, regions, enums,
                                               lam_bodies.next_id, "")
   # m7c-d: emit the install/teardown wrappers the LLVM runtime's
   # `int main` calls. They push/pop default-handler evidence
@@ -7067,13 +7281,25 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar], fns: [EFn]) : String {
   let reuse_ctors = collect_reuse_ctors(decls, [])
   let reuse_tags  = reuse_ctor_tags(reuse_ctors, variants, [])
   let reuse_calls = llvm_emit_reusable_tag_calls(reuse_tags, "")
+  # i64-inline parity (#747): startup tag→name/mask registration for the
+  # fast variant ctor path. Globals at module scope, one register call each.
+  let pctor_globals = llvm_emit_payload_ctor_globals(variants, "")
+  let pctor_calls   = llvm_emit_payload_ctor_calls(variants, "")
+  # i64-inline parity (#747): startup seed of every nullary singleton, so
+  # `kaix_nullary_fast` is a pure array load.
+  let nullary_globals = llvm_emit_nullary_seed_globals(variants, "")
+  let nullary_calls   = llvm_emit_nullary_seed_calls(variants, "")
   concat_all([
     "\ndeclare void @kaix_register_one_impl(i32, i32, i8*)\n",
     "declare void @kaix_register_one_variant_head(i32, i32)\n",
     "declare void @kaix_register_one_reusable_tag(i32)\n",
+    "declare void @kaix_register_one_payload_ctor(i32, i8*, i32)\n",
+    "declare void @kaix_seed_nullary(i32, i8*)\n",
     "declare i32 @kaix_head_tag(%KaiValue*)\n",
     "declare i8* @kaix_lookup_impl(i32, i32)\n",
     "declare void @kaix_panic_no_impl(i8*, i8*, i32)\n",
+    pctor_globals,
+    nullary_globals,
     fn_declares,
     shim_defs,
     "\ndefine void @_kai_proto_init_llvm() {\n",
@@ -7081,6 +7307,8 @@ fn llvm_emit_proto_init(decls: [Decl], variants: [EVar], fns: [EFn]) : String {
     variant_calls,
     impl_calls,
     reuse_calls,
+    pctor_calls,
+    nullary_calls,
     "  ret void\n",
     "}\n"
   ])
@@ -7194,6 +7422,88 @@ fn llvm_emit_reusable_tag_calls(tags: [Int], acc: String) : String {
       ])
       llvm_emit_reusable_tag_calls(rest, concat_all([acc, line]))
     }
+  }
+}
+
+# i64-inline parity (#747): module-level string globals for every payload
+# ctor's name, named deterministically by tag (`@pctor.name.<tag>`) so they
+# never collide with the body's `@var.N` labels. Emitted before
+# `_kai_proto_init_llvm`. Only ctors with ≥1 kind-1 Int slot are stamped —
+# those are the only ones `kaix_variant_masked` constructs via the fast
+# path, and the only ones whose mask must be pre-registered for the drop
+# walker. Mirror of the C backend's `_kai_payload_ctors_tbl`.
+fn llvm_emit_payload_ctor_globals(variants: [EVar], acc: String) : String = match variants {
+  []           -> acc
+  [v, ...rest] -> match v {
+    EV(nm, _, tys, tag) ->
+      if variant_has_int_slot(tys) {
+        let g = llvm_emit_string_const(concat_all(["pctor.name.", int_to_string(tag)]), nm)
+        llvm_emit_payload_ctor_globals(rest, concat_all([acc, g]))
+      } else {
+        llvm_emit_payload_ctor_globals(rest, acc)
+      }
+  }
+}
+
+# i64-inline parity (#747): one `kaix_register_one_payload_ctor(tag, name,
+# mask)` call per Int-slot ctor, stamping tag→name and tag→mask at startup
+# so `kaix_variant_masked` / `kaix_variant_at_masked` can take the
+# register-free fast path. The mask is the int-only mask (matches what the
+# construction site passes). Mirror of the C backend's
+# `kai_register_payload_ctors`.
+fn llvm_emit_payload_ctor_calls(variants: [EVar], acc: String) : String = match variants {
+  []           -> acc
+  [v, ...rest] -> match v {
+    EV(nm, _, tys, tag) ->
+      if variant_has_int_slot(tys) {
+        let name_len = string_length(nm) + 1
+        let line = concat_all([
+          "  call void @kaix_register_one_payload_ctor(i32 ", int_to_string(tag),
+          ", i8* ", llvm_gep_str(concat_all(["pctor.name.", int_to_string(tag)]), name_len),
+          ", i32 ", int_to_string(llvm_int_slot_mask(tys)), ")\n"
+        ])
+        llvm_emit_payload_ctor_calls(rest, concat_all([acc, line]))
+      } else {
+        llvm_emit_payload_ctor_calls(rest, acc)
+      }
+  }
+}
+
+# i64-inline parity (#747): module-level string globals + startup seed calls
+# for every NULLARY ctor (arity 0), so `kaix_nullary_fast` reads the interned
+# singleton from `kai_enum_by_tag[tag]` (array load) instead of the cold
+# `kai_variant_u`. `kaix_seed_nullary` builds+interns each one once at
+# startup (immortal). Globals named `@nullary.name.<tag>` so they never
+# collide with `@pctor.name.<tag>` or the body's `@var.N`. Mirror of the C
+# backend's `emit_nullary_enum_seed`.
+fn llvm_emit_nullary_seed_globals(variants: [EVar], acc: String) : String = match variants {
+  []           -> acc
+  [v, ...rest] -> match v {
+    EV(nm, ar, _, tag) ->
+      if ar == 0 {
+        let g = llvm_emit_string_const(concat_all(["nullary.name.", int_to_string(tag)]), nm)
+        llvm_emit_nullary_seed_globals(rest, concat_all([acc, g]))
+      } else {
+        llvm_emit_nullary_seed_globals(rest, acc)
+      }
+  }
+}
+
+fn llvm_emit_nullary_seed_calls(variants: [EVar], acc: String) : String = match variants {
+  []           -> acc
+  [v, ...rest] -> match v {
+    EV(nm, ar, _, tag) ->
+      if ar == 0 {
+        let name_len = string_length(nm) + 1
+        let line = concat_all([
+          "  call void @kaix_seed_nullary(i32 ", int_to_string(tag),
+          ", i8* ", llvm_gep_str(concat_all(["nullary.name.", int_to_string(tag)]), name_len),
+          ")\n"
+        ])
+        llvm_emit_nullary_seed_calls(rest, concat_all([acc, line]))
+      } else {
+        llvm_emit_nullary_seed_calls(rest, acc)
+      }
   }
 }
 
@@ -7814,6 +8124,55 @@ fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
   let name_label = name_label_id.reg
   let name_len = string_length(cname) + 1
   let e_g = llvm_append_global(name_label_id.e, llvm_emit_string_const(name_label, cname))
+  # i64-inline parity (#747): the rebuilt node MUST carry the same word
+  # kinds the typed construction path wrote, else a kind-1 Int slot the read
+  # side fetches via `kaix_variant_arg_i64` would hold a boxed pointer
+  # (corruption — the rb-tree `height` diverged from C until this landed).
+  # When the ctor has ≥1 Int slot, build the `[n x i64]` buffer with raw i64
+  # words for Int slots, ptrtoint(ptr) for the rest, the hole slot a null
+  # word, and the int-only `slot_mask`. Otherwise keep the legacy boxed
+  # buffer + mask-0 path.
+  let tys = match evar_payload_tys(e.vars_, cname) { Some(t) -> t None -> [] }
+  let use_typed = variant_has_int_slot(tys)
+  let node_res = if use_typed {
+    let int_mask = llvm_int_slot_mask(tys)
+    let st0 = llvm_emit_trmc_slot_stores_typed_alloc(e_g, n)
+    let e_st = llvm_emit_trmc_slot_stores_typed(st0.e, st0.reg, xs, tys, holeslot, 0)
+    let buf_i64 = st0.reg
+    # Reinterpret [n x i64] as KaiVarSlot* (== KaiValue** word-wise).
+    let cast = llvm_fresh_reg(e_st)
+    let e_cast = llvm_append_body(cast.e, concat_all([
+      "  ", cast.reg, " = bitcast i64* ", buf_i64, " to %KaiValue**\n"]))
+    if e_cast.in_region {
+      # Region: arena ctor owns the cell. kaix_arena_variant has no mask
+      # entry point yet, so fall back to a fresh boxed buffer for regions
+      # (arena cells die with the arena; this lane targets the non-region
+      # hot path). Re-evaluate boxed to keep the arena path unchanged.
+      let ev = llvm_emit_trmc_node_args(e_g, xs, holeslot, 0, [])
+      let bufb = llvm_fresh_reg(ev.st)
+      let e_bufb = llvm_append_body(bufb.e, concat_all([
+        "  ", bufb.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"]))
+      let e_stb = llvm_emit_trmc_slot_stores(e_bufb, bufb.reg, ev.regs, 0)
+      let node = llvm_fresh_reg(e_stb)
+      let e_node = llvm_append_body(node.e, concat_all([
+        "  ", node.reg, " = call %KaiValue* ", llvm_variant_target(e),
+        "(i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
+        ", i32 ", int_to_string(n), ", %KaiValue** ", bufb.reg, ")\n"]))
+      LlvmReg { reg: node.reg, e: e_node }
+    } else {
+      let tokld = llvm_fresh_reg(e_cast)
+      let e_tl = llvm_append_body(tokld.e, concat_all([
+        "  ", tokld.reg, " = load %KaiValue*, %KaiValue** %_arm_ru\n"]))
+      let node = llvm_fresh_reg(e_tl)
+      let e_b = llvm_append_body(node.e, concat_all([
+        "  ", node.reg, " = call %KaiValue* @kaix_variant_at_masked(%KaiValue* ", tokld.reg,
+        ", i32 ", int_to_string(tag), ", i8* ", llvm_gep_str(name_label, name_len),
+        ", i32 ", int_to_string(n), ", i32 ", int_to_string(int_mask),
+        ", %KaiValue** ", cast.reg, ")\n"]))
+      let e_z = llvm_append_body(e_b, "  store %KaiValue* null, %KaiValue** %_arm_ru\n")
+      LlvmReg { reg: node.reg, e: e_z }
+    }
+  } else {
   # Evaluate every non-hole arg; the hole arg (the self-call) is NOT
   # evaluated as a value — it is the recursion, deferred to the loop.
   let ev = llvm_emit_trmc_node_args(e_g, xs, holeslot, 0, [])
@@ -7831,7 +8190,7 @@ fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
   # non-eligible iteration is unchanged. Consuming the token zeroes `%_arm_ru`
   # so the post-body `kaix_reuse_free` does not free a cell we reused.
   # Region allocation keeps the arena ctor (the arena owns the cell, not RC).
-  let node_res = if e_st.in_region {
+  if e_st.in_region {
     let node = llvm_fresh_reg(e_st)
     let e_node = llvm_append_body(node.e, concat_all([
       "  ", node.reg, " = call %KaiValue* ", llvm_variant_target(e),
@@ -7850,6 +8209,7 @@ fn llvm_emit_trmc_goto(e: LlvmEmit, sym: String, holeslot: Int, cname: String,
       ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"]))
     let e_z = llvm_append_body(e_b, "  store %KaiValue* null, %KaiValue** %_arm_ru\n")
     LlvmReg { reg: node.reg, e: e_z }
+  }
   }
   let node = node_res
   let e_node = node_res.e
@@ -7936,6 +8296,54 @@ fn llvm_emit_trmc_node_args(e: LlvmEmit, xs: [Expr], holeslot: Int, i: Int,
         let e1 = llvm_emit_expr(e, x0)
         llvm_emit_trmc_node_args(e1, rest, holeslot, i + 1, [e1.last_val, ...acc])
       }
+  }
+}
+
+# i64-inline parity (#747): alloca the `[n x i64]` slot buffer for a typed
+# TRMC node rebuild. Returns the buffer's i64* register.
+fn llvm_emit_trmc_slot_stores_typed_alloc(e: LlvmEmit, n: Int) : LlvmReg {
+  let buf = llvm_fresh_reg(e)
+  let e_buf = llvm_append_body(buf.e, concat_all([
+    "  ", buf.reg, " = alloca i64, i32 ", int_to_string(n), "\n"]))
+  LlvmReg { reg: buf.reg, e: e_buf }
+}
+
+# i64-inline parity (#747): store each TRMC node arg into the `[n x i64]`
+# buffer per its slot kind. The hole slot (the recursive self-call) stores
+# a null word (i64 0) — the loop / cctx fills it later. A kind-1 Int slot
+# stores the raw i64 scalar; every other slot stores ptrtoint(boxed ptr).
+# Mirror of `llvm_emit_variant_slot_stores_typed` + the TRMC hole rule.
+fn llvm_emit_trmc_slot_stores_typed(e: LlvmEmit, buf_reg: String, xs: [Expr],
+                                    tys: [TypeExpr], holeslot: Int, i: Int) : LlvmEmit / Console {
+  match xs {
+    [] -> e
+    [x, ...rest_x] -> match tys {
+      [] -> e
+      [t, ...rest_t] -> {
+        let gep = llvm_fresh_reg(e)
+        let e_g = llvm_append_body(gep.e, concat_all([
+          "  ", gep.reg, " = getelementptr inbounds i64, i64* ", buf_reg,
+          ", i32 ", int_to_string(i), "\n"]))
+        let e_stored = if i == holeslot {
+          # The recursive self-call hole: a null pointer word (i64 0). The
+          # cctx plugs the child here on the next step / at the leaf.
+          llvm_append_body(e_g, concat_all([
+            "  store i64 0, i64* ", gep.reg, "\n"]))
+        } else if llvm_is_int_slot(t) {
+          let rr = llvm_emit_expr_raw(e_g, x)
+          llvm_append_body(rr.e, concat_all([
+            "  store i64 ", rr.reg, ", i64* ", gep.reg, "\n"]))
+        } else {
+          let eb = llvm_emit_expr(e_g, x)
+          let pti = llvm_fresh_reg(eb)
+          let e_p = llvm_append_body(pti.e, concat_all([
+            "  ", pti.reg, " = ptrtoint %KaiValue* ", eb.last_val, " to i64\n"]))
+          llvm_append_body(e_p, concat_all([
+            "  store i64 ", pti.reg, ", i64* ", gep.reg, "\n"]))
+        }
+        llvm_emit_trmc_slot_stores_typed(e_stored, buf_reg, rest_x, rest_t, holeslot, i + 1)
+      }
+    }
   }
 }
 
