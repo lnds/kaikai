@@ -90,6 +90,21 @@ Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI in `.github/wor
 - **Tier 2** — `make daily`: maintainer / cron only, ~10–20 min. Tier 1 + stress + coverage probe + RC budget. Failures are diagnostics, not blockers — `main` already gated by Tier 1.
 - **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI via `paths-ignore`. Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, `VERSION`, build scripts) always trigger tiers.
 
+## Code-quality bar — the differential is A− at least, B at worst
+
+**Every new file a lane authors scores `km score` A− or better. B is the absolute floor; below B does not land.** This is the *differential* standard: it applies to code the lane writes from scratch, not to pre-existing files it merely edits. The existing F monoliths (`stage2/compiler/infer.kai`, `emit_c.kai`, `cache.kai`) are debt being paid down, NOT the baseline — never calibrate a new file's acceptable quality against them. "We're already at F" is never a reason to relax; new code is debt-free and has no excuse.
+
+The bar is real and met daily in this repo: all of `stdlib/` scores A+/A++, and even inside the compiler `chars.kai`/`diag.kai` are A, `intervals.kai`/`region.kai` A−. That is the example to follow.
+
+Concrete gate, measured with `km` on each file the lane adds (cross-check `km score` with `km cogcom`):
+
+- **`km score`: A− or better; B is the hard floor.**
+- **File size: < 400 LOC of code target, < 800 hard cap.** A file nearing the cap is split *before* it grows, not after — ship a cluster of A-grade files, never one monolith. (`km score` discriminates correctly at < ~400 LOC; the "everything scores F" effect is an artefact of measuring 2–3K-LOC files.)
+- **Cognitive complexity (`km cogcom`): average < 5/fn, max < 25/fn.** A high number is a *design smell* — usually logic that belongs in a shared/earlier layer leaked into a leaf — fix the design, don't accept the cost.
+- **No new duplicate groups** (`km dups`) the lane authored.
+
+Binary, like CI-green and selfhost byte-id: a lane that ships a sub-B file does not close until it is split or simplified. Editing an existing F file does not *raise* its grade obligation (that's separate refactor work), but it must not *lower* it either — don't grow a monolith.
+
 ## Lane discipline
 
 - **One worktree fixes one thing.** If you find a bug outside your lane, open a GitHub Issue with repro + hypothesis (label `regression` plus topic labels: `runtime`, `compiler`, `perceus`, `typer`, `stdlib`, `unboxing`, `refinements`). Do not fix it inline.
