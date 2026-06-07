@@ -17,7 +17,41 @@
  *   clang -I stage0 foo.ll stage0/runtime_llvm.c -o foo
  */
 
-#include "runtime.h"
+/* Unified runtime (llvm-c-parity lane). The LLVM backend used to link
+ * the stage0 heap-everything runtime (one malloc per Int, no slab, no
+ * reuse-in-place), which left rb-tree at ~8x C wall / 4x C RSS while
+ * the production C backend rides stage2/runtime.h (tagged-Int
+ * immediates + Koka slab + reuse tokens). The two backends share the
+ * SAME front-end (one perceus pass, identical RC/reuse decisions), so
+ * the only asymmetry was the runtime each linked. We unify on ONE
+ * runtime: this shim now resolves `runtime.h` to stage2/runtime.h,
+ * inheriting Int tagging + slab + slab-reuse for free.
+ *
+ * Resolution mirrors the C backend exactly: the link lines put the
+ * stage2 include dir AHEAD of stage0's (`-I ../stage2 -I ../stage0`
+ * in stage2/Makefile; `-I "$RUNTIME_INC_C" -I "$RUNTIME_INC"` in
+ * bin/kai; a single stage2 `runtime.h` under share/kaikai/include in
+ * the installed tarball), so `#include "runtime.h"` below binds to the
+ * Koka runtime while the trailing stage0 dir still supplies any header
+ * the shim needs that stage2 lacks.
+ *
+ * Soundness: the emitted IR declares `%KaiValue = type opaque` and
+ * every `getelementptr` is over `%KaiValue**` arrays (arg/capture/
+ * buffer), NEVER over a cell's `as.*`/`tag`/`rc` interior — verified
+ * across the rb-tree IR (1056 GEPs, all `%KaiValue*`, zero
+ * inttoptr/ptrtoint). One runtime behind two ABIs is therefore sound:
+ * the IR cannot observe the value representation. The only place that
+ * reads a cell's Int payload is this shim, and every such read now
+ * goes through `kai_intf` (tagged-immediate-safe), not raw `->as.i`.
+ *
+ * Angle brackets, not quotes: this file LIVES in stage0/, next to the
+ * old stage0/runtime.h. A quoted `#include "runtime.h"` searches the
+ * including file's own directory FIRST, so it would always bind to the
+ * sibling stage0 runtime regardless of `-I` order. `<runtime.h>` skips
+ * the file's directory and obeys the `-I` search path, where the link
+ * lines place stage2 ahead of stage0 — exactly the resolution the
+ * C-backend already relies on. */
+#include <runtime.h>
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
@@ -54,71 +88,77 @@ int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 /* ---------- m13 bit ops ----------
  * The C backend (stage2/compiler.kai emit_call_expr ~line 12151)
  * lowers `bit_and(a, b)` etc. to an inline GNU statement-expression
- * that reads `_a->as.i & _b->as.i`, boxes via `kai_int`, and decrefs
- * the operands. The LLVM backend cannot use statement-expressions,
- * so these mirror wrappers do the same operation in a stable
- * external symbol callable from IR. Caller hands us owned refs and
- * must release them exactly once — we do that here, matching the C
- * path's refcount discipline. */
+ * that reads the operands' int payload, boxes via `kai_int`, and
+ * decrefs the operands. The LLVM backend cannot use statement-
+ * expressions, so these mirror wrappers do the same operation in a
+ * stable external symbol callable from IR. Caller hands us owned refs
+ * and must release them exactly once — we do that here, matching the C
+ * path's refcount discipline.
+ *
+ * Reads go through `kai_intf` (not raw `->as.i`): under the unified
+ * stage2 runtime an Int is a tagged immediate, so `->as.i` would
+ * dereference the tag bits. `kai_intf` returns the payload for both
+ * tagged and boxed Ints. `kai_decref` on a tagged immediate is a
+ * no-op (it checks `kai_is_value` first), so the discipline holds. */
 KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i & b->as.i);
+    KaiValue *r = kai_int(kai_intf(a) & kai_intf(b));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_or(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i | b->as.i);
+    KaiValue *r = kai_int(kai_intf(a) | kai_intf(b));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i ^ b->as.i);
+    KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_not(KaiValue *a) {
-    KaiValue *r = kai_int(~ a->as.i);
+    KaiValue *r = kai_int(~ kai_intf(a));
     kai_decref(a);
     return r;
 }
 KaiValue *kaix_bit_shl(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i << b->as.i);
+    KaiValue *r = kai_int(kai_intf(a) << kai_intf(b));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_shr(KaiValue *a, KaiValue *b) {
     /* Arithmetic shift: signed `>>` preserves the sign bit. */
-    KaiValue *r = kai_int(a->as.i >> b->as.i);
+    KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_ushr(KaiValue *a, KaiValue *b) {
     /* Logical shift: cast through uint64_t to zero-fill. */
-    KaiValue *r = kai_int((int64_t)(((uint64_t) a->as.i) >> b->as.i));
+    KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_count(KaiValue *a) {
-    KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) a->as.i));
+    KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a)));
     kai_decref(a);
     return r;
 }
 KaiValue *kaix_bit_test(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_bool(((a->as.i >> b->as.i) & 1) != 0);
+    KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0);
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_set(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i | ((int64_t)1 << b->as.i));
+    KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_clear(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i & ~((int64_t)1 << b->as.i));
+    KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(a->as.i ^ ((int64_t)1 << b->as.i));
+    KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b)));
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -131,7 +171,7 @@ KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
  * a borrow. Caller is responsible for the boxed value's lifetime.
  * Used at the MBoxed → MUnboxed boundary inside the LLVM emitter
  * (raw operand of an MUnboxed binop, raw scrutinee of a switch). */
-int64_t  kaix_to_int(KaiValue *v)              { return v->as.i; }
+int64_t  kaix_to_int(KaiValue *v)              { return kai_intf(v); }
 int      kaix_to_bool(KaiValue *v)             { return v->as.b; }
 double   kaix_to_real(KaiValue *v)             { return v->as.r; }
 /* m12.7.x FFI v1: read the raw C-string pointer out of a boxed
@@ -389,6 +429,60 @@ KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
   }
   for (int i = 0; i < n; i++) slots[i].ptr = args[i];
   KaiValue *r = kai_reuse_or_alloc_variant(scr, tag, name, n, 0, slots);
+  if (heap) free(heap);
+  return r;
+}
+
+/* ---------- token-model reuse-in-place (llvm-c-parity lane) ----------
+ *
+ * The simple `kaix_reuse_or_alloc_variant` above eager-decrefs each old
+ * slot 1:1, which double-frees on a non-bijective rebuild (a recolor /
+ * rotation that moves a subtree between slots). The C backend reaches the
+ * rb-tree's reuse via a DIFFERENT, Koka-faithful protocol — the drop-
+ * reuse-token model — which the LLVM bind-site now mirrors:
+ *
+ *   1. bind the consumed variant's pointer children BORROW (no incref)
+ *      via `kaix_variant_arg_borrow`,
+ *   2. capture a reuse token once at the arm top with
+ *      `kaix_drop_reuse_token(scr, n)` — UNIQUE hands back the shell (its
+ *      children having MOVED into the borrow binds), SHARED/MISMATCH
+ *      decrefs non-recursively and returns NULL,
+ *   3. rebuild with `kaix_variant_at(token, …)` — writes the new ctor
+ *      into the donated cell IN PLACE (move semantics, no slot decref) or
+ *      falls back to a fresh alloc when the token is NULL,
+ *   4. on a tail that never consumes the token, free the bare shell with
+ *      `kaix_reuse_free(token)` (no cascade into the moved children).
+ *
+ * These are thin forwarders over the stage2 statics; all the RC subtlety
+ * lives there. `KaiReuse` is `KaiValue*` (runtime.h §reuse-token). */
+KaiReuse  kaix_drop_reuse_token(KaiValue *v, int n)      { return kai_drop_reuse_token(v, n); }
+void      kaix_reuse_free(KaiReuse at)                   { kai_reuse_free(at); }
+
+/* Borrow read of a variant pointer slot — the bind-site uses this in the
+ * UNIQUE branch so the child is moved (not duplicated) into the rebuild.
+ * Unlike `kaix_variant_arg` (which boxes typed slots and is borrow for
+ * pointer slots per #747), this is the plain pointer-slot borrow the
+ * token model needs; the LLVM backend only ever lays mask==0 pointer
+ * slots, so the raw `.ptr` read is the borrow. */
+KaiValue *kaix_variant_arg_borrow(KaiValue *v, int i)   { return kai_var_slots(v)[i].ptr; }
+
+/* Rebuild-in-place over a donated token. Same boxed-args bridge as
+ * `kaix_variant`: the LLVM emit hands KaiValue** for boxed args (Ints are
+ * tagged immediates stored straight into mask==0 `.ptr` slots), stamp the
+ * slot-mask shape with mask==0 and forward. A NULL token falls through to
+ * a fresh `kai_variant_u` inside `kai_variant_at`. */
+KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name,
+                          int n, KaiValue **args) {
+  if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
+  KaiVarSlot stack_slots[16];
+  KaiVarSlot *slots = stack_slots;
+  KaiVarSlot *heap = NULL;
+  if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+    heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    slots = heap;
+  }
+  for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+  KaiValue *r = kai_variant_at(at, tag, name, n, 0, slots);
   if (heap) free(heap);
   return r;
 }
