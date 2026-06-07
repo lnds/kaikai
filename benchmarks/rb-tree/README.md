@@ -75,16 +75,36 @@ RC traffic. Quote whichever you mean, and say which.
 
 | column | wall (median) | vs C | vs Koka | RSS (MB) |
 |---|---:|---:|---:|---:|
-| C        | 0.27s | 1.00x | 0.93x | 47.4 |
-| Koka     | 0.29s | 1.07x | 1.00x | 48.1 |
-| **kaikai** | **0.43s** | **1.59x** | **1.48x** | **55.2** |
+| C            | 0.26s | 1.00x | 1.04x | 47.4 |
+| Koka         | 0.25s | 0.96x | 1.00x | 48.1 |
+| kaikai-c     | 0.41s | 1.58x | 1.64x | 55.2 |
+| **kaikai-llvm** | **0.79s** | **3.04x** | **3.16x** | **55.4** |
+
+`kaikai-llvm` is the `--emit=llvm` backend (clang -O2 + `runtime_llvm.c`),
+`kaikai-c` the default C backend. The two share the front-end; the gap is
+pure code-generation.
 
 **Instruction count, Docker callgrind, N=100,000 (the perf-lane truth):**
 
-| column | instructions @ 100K | vs Koka |
-|---|---:|---:|
-| Koka     | 130.38M | 1.00x |
-| **kaikai** | **184.27M** | **1.41x** |
+| column | instructions @ 100K | vs kaikai-c | vs Koka |
+|---|---:|---:|---:|
+| Koka         | 130.38M | 0.71x | 1.00x |
+| kaikai-c     | 184.27M | 1.00x | 1.41x |
+| **kaikai-llvm (separate `-c` compile, production)** | **897.15M** | **4.87x** | **6.88x** |
+| kaikai-llvm (`llvm-link` merged module) | 534.87M | 2.90x | 4.10x |
+
+The LLVM column at #747-close: i64-inline (Int variant slots ride raw
+`i64`), the fast variant ctor path (`kai_variant_u_fast` + startup
+payload-ctor / nullary seed), and reuse-in-place all ported. That took the
+LLVM backend from **1,331.93M (7.23x C)** to **897.15M (4.87x C)** in the
+production separate-compile path, and to **534.87M (2.90x C)** when the
+shim TU is merged with the program IR (`llvm-link` / `-flto`). The residual
+gap is the `kaix_*` shim call boundary (the LLVM backend keeps `%KaiValue`
+opaque and routes every cell access through an external shim, where the C
+backend has the whole runtime inlined in one TU) plus the structurally
+heavier codegen of the hot `insert_loop` body. Closing it needs the
+production link to merge the shim module (`-flto` / `llvm-link`) — a
+build-chain lane, not a codegen change — and is tracked separately.
 
 Recorded at **kaikai `8ea608c`** (Lane B i64-inline shipped, 2026-06-05).
 History: the rb-tree started this perf arc at ~404M instructions

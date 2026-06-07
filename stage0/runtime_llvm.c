@@ -259,6 +259,84 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
     return r;
 }
 
+/* i64-inline parity (#747) — typed-slot variant construction.
+ *
+ * The LLVM backend's all-boxed `kaix_variant` (above) round-trips every
+ * `Int` field through `kaix_int` (box) at construction and `kaix_to_int`
+ * (unbox) at every read, while the C backend keeps `Int` fields as raw
+ * `int64_t` words inside the cell (Lane B i64-inline, kind-1 raw binders).
+ * On the rb-tree that round-trip was the whole LLVM-vs-C wall gap
+ * (`balance_left`: C emits 0 `kai_int`, LLVM emitted 21 `kaix_int` + 10
+ * `kaix_to_int`).
+ *
+ * This entry mirrors the C backend's typed construction path: the IR
+ * builds a `KaiVarSlot[]` (one machine word per slot) directly — raw
+ * `i64`/`double`/enum-tag words for primitive slots, pointer words for
+ * boxed slots — and the `slot_mask` (2 bits per slot, from the SAME
+ * `variant_slot_kind` the C backend uses) tells the runtime which is
+ * which. `kai_variant_u` registers tag→mask in its preamble
+ * (runtime.h §kai_variant_u, `kai_slotmask_register(tag, mask)`), so the
+ * generic drop walker reads the correct mask and skips RC on raw slots —
+ * no separate payload-ctor startup table needed for correctness (that is
+ * a `kai_variant_u_fast` perf optimisation, layered later if the wall
+ * still lags).
+ *
+ * `slots` aliases the IR's `[n x i64]` buffer: `KaiVarSlot` is a union of
+ * one word, binary-compatible with `i64`/`KaiValue *`, so the emitter's
+ * `store i64` (raw) and `store i64 ptrtoint(ptr)` (boxed) land the right
+ * bits in either slot kind. */
+KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n,
+                              int32_t mask, KaiVarSlot *slots) {
+    if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
+    /* Fast path (matches the C backend's `kai_variant_u_fast`): alloc +
+     * slot stores only, NO per-call name/mask register or cache probe. The
+     * tag→name and tag→mask tables are stamped ONCE at startup by
+     * `_kai_proto_init_llvm` (one `kaix_register_one_payload_ctor` per
+     * primitive-slot ctor), so the generic drop walker still reads the
+     * right mask. Before this, the masked ctor went through the cold
+     * `kai_variant_u` whose preamble (varname/slotmask register + nullary
+     * probe + immortal-args 262144-bucket hash scan) dominated the rb-tree
+     * profile at 34.8% of all instructions — the bulk of the LLVM-vs-C gap
+     * remaining after i64-inline. */
+    return kai_variant_u_fast(tag, n, slots);
+}
+
+/* Startup registration for the fast path: stamp tag→name and tag→mask so
+ * `kaix_variant_masked` / `kaix_variant_at_masked` can skip the per-call
+ * register. The LLVM `_kai_proto_init_llvm` emits one call per primitive-
+ * slot ctor. Mirror of the C backend's `kai_register_payload_ctors` (run
+ * from `_kai_register_proto_tables`), but one-at-a-time like the reusable-
+ * tag registry. */
+void kaix_register_one_payload_ctor(int32_t tag, const char *name, int32_t mask) {
+    kai_varname_register(tag, name);
+    kai_slotmask_register(tag, (uint32_t) mask);
+}
+
+/* i64-inline parity (#747) — fast nullary-ctor construction. Reads the
+ * interned singleton straight from `kai_enum_by_tag[tag]` (an array load)
+ * instead of `kai_variant_u`'s NOINLINE call + nullary-cache hash probe.
+ * The LLVM backend emitted `kaix_variant(tag, name, 0, NULL)` for every
+ * nullary ctor (Red / Black / RBLeaf on the rb-tree), each a cold
+ * `kai_variant_u` — that path was ~23% of all instructions on the bench
+ * (the RBLeaf-as-RBNode-arg site mints two singletons per insert just to
+ * read back a cached pointer). Mirror of the C backend's `kai_nullary_fast`
+ * (emit_c `emit_ident_value`). Every nullary is seeded into `kai_enum_by_tag`
+ * at startup by `kaix_seed_nullary` (below), so the load always hits in
+ * steady state; the `kai_nullary_fast` fallback self-installs otherwise. */
+KaiValue *kaix_nullary_fast(int32_t tag, const char *name) {
+    return kai_nullary_fast(tag, name);
+}
+
+/* Startup seed for `kaix_nullary_fast`: build + intern each nullary ctor's
+ * singleton once (immortal, rc==INT32_MAX), so the steady-state array load
+ * hits. Also makes a direct enum-slot tag store sound regardless of
+ * construction order (the `kai_enum_slot_box` read needs the table
+ * populated). Mirror of the C backend's `emit_nullary_enum_seed` (run at
+ * main entry). The LLVM `_kai_proto_init_llvm` emits one call per nullary. */
+void kaix_seed_nullary(int32_t tag, const char *name) {
+    (void) kai_variant_u(tag, name, 0, 0, NULL);
+}
+
 /* 1 iff `v` is a KAI_VARIANT whose tag name matches `name`. Legacy
    match discriminator — kept as a fallback for emit paths that do
    not resolve a constructor name to a tag at compile time (synthetic
@@ -323,6 +401,27 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
         return kai_variant_slot_box(v, i);
     }
     return kai_var_slots(v)[i].ptr;   /* #747 — borrow (no incref) */
+}
+
+/* i64-inline parity (#747) — read a kind-1 Int (or kind-3 enum) slot as a
+ * RAW `int64_t` word, with NO box round-trip. Mirrors the C backend's
+ * `int64_t kair_<nm> = kai_var_slots(_scr)[i].i64;` field read. Used by the
+ * LLVM match-arm bind walk for kind-1 slots now that the construction path
+ * (`kaix_variant_masked`) stores the bare scalar in `.i64`. The pre-#747
+ * read went `kaix_variant_arg` (which re-boxed the typed slot into a fresh
+ * owning temporary via `kai_variant_slot_box`) then `kaix_to_int` to unbox
+ * it — an alloc + free per read. Reading `.i64` straight kills that
+ * round-trip, the last piece of the LLVM-vs-C wall gap on the rb-tree. No
+ * RC: a raw word carries no refcount, exactly like the C backend's raw
+ * binder. */
+int64_t kaix_variant_arg_i64(KaiValue *v, int i) {
+    return kai_var_slots(v)[i].i64;
+}
+
+/* i64-inline parity (#747) — read a kind-2 Real slot as a raw `double`.
+ * Same rationale as `kaix_variant_arg_i64` for the `.r` word. */
+double kaix_variant_arg_f64(KaiValue *v, int i) {
+    return kai_var_slots(v)[i].r;
 }
 
 /* kai_op_eq returns an int; wrap for direct use from the IR in match
@@ -485,6 +584,22 @@ KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name,
   KaiValue *r = kai_variant_at(at, tag, name, n, 0, slots);
   if (heap) free(heap);
   return r;
+}
+
+/* i64-inline parity (#747) — reuse-in-place rebuild with a `slot_mask`.
+ * The TRMC step (`llvm_emit_trmc_goto`) rebuilds a ctor INTO the donated
+ * unique cell. It must write the SAME word kinds the typed construction
+ * path (`kaix_variant_masked`) wrote, else a kind-1 Int slot the read side
+ * fetches via `kaix_variant_arg_i64` (`.i64`) would hold a boxed pointer
+ * (corruption: the LLVM rb-tree's `height` diverged from C until this
+ * landed). `slots` aliases the IR's `[n x i64]` buffer: raw i64 for Int
+ * slots, ptrtoint(ptr) for the rest. `kai_variant_at` re-registers
+ * tag→mask, so a token-donated rebuild and a fresh alloc carry the same
+ * mask. */
+KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name,
+                                 int n, int32_t mask, KaiVarSlot *slots) {
+  if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
+  return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
 }
 
 /* Used by lambda thunks to read their captured values from the
