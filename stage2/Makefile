@@ -649,9 +649,9 @@ test-writer: $(TARGET) build
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
 
-# Issue #80 regression — polymorphic prelude calls from a foreign file.
-# Loads `examples/effects/foreign_prelude_lib.kai` via `--prelude` and
-# compiles + runs `examples/effects/foreign_prelude.kai` against the
+# Issue #80 regression — polymorphic calls across an imported module.
+# `examples/effects/foreign_prelude.kai` imports `foreign_prelude_lib`;
+# this target compiles + runs it against the
 # golden. The fixture exercises every scheme shape that historically
 # tripped cross-file instantiation (implicit lowercase tparams, row
 # polymorphism on a callback, parametric Reader[T]). A regression of
