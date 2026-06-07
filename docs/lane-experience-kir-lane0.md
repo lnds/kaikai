@@ -138,6 +138,29 @@ went to the bundle-vs-selfhost gap (name collisions, privacy, the import
 cycle restructure) and the two shadowing traps — all now in memory so the
 next KIR lane pays none of it.
 
+## Post-lane review (Linus) — fidelity fixes applied before Lane 1
+
+A read-only review after the first commit surfaced three fidelity traps
+for Lane 1 (none broke Lane 0, since the dumper is the only consumer).
+Fixed in a follow-up commit on the same lane:
+
+1. **Join register now materialised with `KLet` before the fork.** `if`/
+   `match` joins were `KStore`d to a name no `KLet` declared, forcing a
+   translator to *infer* the alloca. Now `lower_if_blocks`/
+   `lower_match_blocks` emit `KLet(join, …, KLitOp(KUnitV))` before the
+   condbr/switch, so the slot is explicit. The dump shows `t1: box = ()`
+   ahead of the branch.
+2. **`match` default block is `KUnreachable`, not a unit store.** kaikai
+   matches are exhaustive; the old `KStore(join, ())` in the default would
+   silently make a non-exhaustive program return `()` instead of trapping.
+   The dump shows `L1: unreachable`.
+3. **Ordinal-index invariant documented** in `lower_tcrec`/`lower_trmc_step`:
+   cargs order == loop-param slot order (guaranteed by `tcrec_rewrite_decls`),
+   so the pipe's `_pnames` are deliberately unused; the dropmask bitfield
+   shares the same ordering. Plus the `"Cons"` reuse fallback invariant.
+
+All goldens regenerated; test-kir + selfhost byte-id + km grades hold.
+
 ## Follow-ups for next lanes
 
 - Lane 1 (KIR→LLVM translator): the node set + dumper are the contract.
