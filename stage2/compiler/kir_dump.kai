@@ -1,0 +1,226 @@
+# compiler/kir_dump.kai — `--emit=kir` textual dumper.
+#
+# Lane 0's verifiable gate (design §7): `--emit=kir` prints KIR in a
+# stable, deterministic form so the lowering is exercised over the whole
+# `examples/` corpus and pinned by `.kir.expected` goldens. Two runs of
+# the dumper on the same input must be byte-identical (Risk 2) — the
+# printer is a pure structural walk with no set iteration or hashing.
+#
+# `emit_kir` reproduces the emitters' shared preamble (alias-resolve →
+# op-call desugar → register fns/variants) so the KIR it lowers is the
+# SAME post-perceus AST the C/LLVM emitters consume — no separate path.
+#
+# Every function here is `kir_`-prefixed: the compiler bundle is a flat
+# namespace and bare `dump_*` names already belong to the AST dumper in
+# driver.kai / emit_c.kai.
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.region
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_walk
+
+# Entry point wired to `--emit=kir` in the driver. `decls` is the
+# post-perceus / post-tcrec AST; `regions` the region marks.
+pub fn emit_kir(decls: [Decl], regions: [RegionMark]) : String / Console {
+  # `decls` is already post-perceus / post-tcrec — alias-resolve and
+  # op-call desugar ran far upstream in the pipeline. Re-running them here
+  # would double-desugar; only the symbol/variant tables must be rebuilt
+  # (the emitters rebuild them too, from their own `raw_decls`).
+  let fns = register_fn_decls(decls)
+  let variants = register_variants(decls)
+  let kp = lower_to_kir(decls, regions, fns, variants)
+  kir_dump_program(kp)
+}
+
+# --- Program ------------------------------------------------------------
+
+fn kir_dump_program(kp: KProgram) : String =
+  concat_all([
+    "; kaikai KIR dump\n",
+    kir_dump_types(kp.types, ""),
+    kir_dump_regions(kp.regions, ""),
+    kir_dump_fns(kp.fns, "")
+  ])
+
+fn kir_dump_types(ts: [KTypeDecl], acc: String) : String = match ts {
+  [] -> acc
+  [t, ...rest] -> kir_dump_types(rest, cat2(acc, kir_dump_type(t)))
+}
+
+fn kir_dump_type(t: KTypeDecl) : String = match t {
+  KSumT(nm, ctors)  -> cat4("type ", nm, " = sum\n", kir_dump_ctors(ctors, ""))
+  KRecordT(nm, fs)  -> cat4("type ", nm, " = record\n", kir_dump_kfields(fs, ""))
+}
+
+fn kir_dump_ctors(cs: [KCtor], acc: String) : String = match cs {
+  [] -> acc
+  [c, ...rest] -> kir_dump_ctors(rest,
+    concat_all([acc, "  ctor ", c.name, " #", int_to_string(c.tag),
+                " [", kir_dump_slots(c.slots, ""), "]\n"]))
+}
+
+fn kir_dump_kfields(fs: [KField], acc: String) : String = match fs {
+  [] -> acc
+  [f, ...rest] -> kir_dump_kfields(rest,
+    concat_all([acc, "  field ", f.fname, " : ", kir_slot_name(f.fslot), "\n"]))
+}
+
+fn kir_dump_slots(ss: [KSlot], acc: String) : String = match ss {
+  [] -> acc
+  [s, ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_slots(rest, concat_all([acc, sep, kir_slot_name(s)]))
+  }
+}
+
+fn kir_slot_name(s: KSlot) : String = match s {
+  SBoxed -> "box"  SInt64 -> "i64"  SReal -> "f64"  SBool -> "i1"
+}
+
+fn kir_dump_regions(rs: [KRegion], acc: String) : String = match rs {
+  [] -> acc
+  [KRgn(id, nm), ...rest] -> kir_dump_regions(rest,
+    concat_all([acc, "region ", int_to_string(id), " ", nm, "\n"]))
+}
+
+# --- Functions and blocks -----------------------------------------------
+
+fn kir_dump_fns(fns: [KFn], acc: String) : String = match fns {
+  [] -> acc
+  [f, ...rest] -> kir_dump_fns(rest, cat2(acc, kir_dump_fn(f)))
+}
+
+fn kir_dump_fn(f: KFn) : String =
+  concat_all([
+    "\nfn ", f.sym, "(", kir_dump_params(f.params, ""), ") : ", kir_slot_name(f.ret), " {\n",
+    kir_dump_blocks(f.blocks, ""),
+    "}\n"
+  ])
+
+fn kir_dump_params(ps: [KParam], acc: String) : String = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    let m = match p.mode { KOwn -> "" KBorrow -> "&" }
+    kir_dump_params(rest, concat_all([acc, sep, m, p.name, ": ", kir_slot_name(p.slot)]))
+  }
+}
+
+fn kir_dump_blocks(bs: [KBlock], acc: String) : String = match bs {
+  [] -> acc
+  [b, ...rest] -> kir_dump_blocks(rest,
+    concat_all([acc, "  ", b.label, ":\n", kir_dump_stmts(b.stmts, ""),
+                "    ", kir_dump_term(b.term), "\n"]))
+}
+
+fn kir_dump_stmts(ss: [KStmt], acc: String) : String = match ss {
+  [] -> acc
+  [s, ...rest] -> kir_dump_stmts(rest, concat_all([acc, "    ", kir_dump_stmt(s), "\n"]))
+}
+
+fn kir_dump_stmt(s: KStmt) : String = match s {
+  KLet(n, slot, op, _) -> concat_all([n, ": ", kir_slot_name(slot), " = ", kir_dump_op(op)])
+  KDo(op, _)           -> cat2("do ", kir_dump_op(op))
+  KRC(rc, _)           -> kir_dump_rc(rc)
+  KStore(t, v, _)      -> concat_all([t, " <- ", kir_dump_val(v)])
+}
+
+fn kir_dump_rc(rc: KRCOp) : String = match rc {
+  KDup(v)       -> cat2("dup ", kir_dump_val(v))
+  KDrop(v)      -> cat2("drop ", kir_dump_val(v))
+  KDropReuse(v) -> cat2("drop-reuse ", kir_dump_val(v))
+  KFreeToken(v) -> cat2("free-token ", kir_dump_val(v))
+}
+
+# --- Ops ----------------------------------------------------------------
+
+fn kir_dump_op(op: KOp) : String = match op {
+  KCall(sym, cargs)        -> concat_all([sym, "(", kir_dump_vals(cargs, ""), ")"])
+  KCallIndirect(fv, cargs) -> concat_all(["call_ind ", kir_dump_val(fv), "(", kir_dump_vals(cargs, ""), ")"])
+  KPrim(nm, cargs)         -> concat_all(["prim ", nm, "(", kir_dump_vals(cargs, ""), ")"])
+  KCon(nm, tag, inits)    -> concat_all(["con ", nm, " #", int_to_string(tag), " {", kir_dump_inits(inits, ""), "}"])
+  KConReuse(d, nm, tag, inits) ->
+    concat_all(["con-reuse ", kir_dump_val(d), " ", nm, " #", int_to_string(tag), " {", kir_dump_inits(inits, ""), "}"])
+  KProj(v, i)             -> concat_all(["proj ", kir_dump_val(v), ".", int_to_string(i)])
+  KTagOf(v)               -> cat2("tagof ", kir_dump_val(v))
+  KClosure(sym, caps)     -> concat_all(["closure ", sym, " [", kir_dump_vals(caps, ""), "]"])
+  KPerform(eff, op2, cargs) -> concat_all(["perform ", eff, ".", op2, "(", kir_dump_vals(cargs, ""), ")"])
+  KInstallHandler(eff, h, b) -> concat_all(["install ", eff, " ", h, " ", b])
+  KLitOp(v)               -> kir_dump_val(v)
+}
+
+fn kir_dump_inits(xs: [KSlotInit], acc: String) : String = match xs {
+  [] -> acc
+  [i, ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_inits(rest, concat_all([acc, sep, kir_dump_init(i)]))
+  }
+}
+
+fn kir_dump_init(i: KSlotInit) : String = match i {
+  SIBoxed(v) -> kir_dump_val(v)
+  SIInt64(v) -> cat2("i64:", kir_dump_val(v))
+  SIReal(v)  -> cat2("f64:", kir_dump_val(v))
+}
+
+# --- Terminators --------------------------------------------------------
+
+fn kir_dump_term(t: KTerm) : String = match t {
+  KRet(v, _)            -> cat2("ret ", kir_dump_val(v))
+  KBr(l, _)             -> cat2("br ", l)
+  KCondBr(c, tl, el, _) -> concat_all(["condbr ", kir_dump_val(c), " ? ", tl, " : ", el])
+  KSwitch(v, cs, def, _) -> concat_all(["switch ", kir_dump_val(v), " [", kir_dump_cases(cs, ""), "] default ", def])
+  KTailCall(sym, cargs, _) -> concat_all(["tailcall ", sym, "(", kir_dump_vals(cargs, ""), ")"])
+  KTcrecGoto(l, asg, dm, _) ->
+    concat_all(["tcrec-goto ", l, " {", kir_dump_assigns(asg, ""), "} dropmask=", int_to_string(dm)])
+  KTrmcStep(l, hole, cn, dm, asg, _) ->
+    concat_all(["trmc-step ", l, " hole=", int_to_string(hole), " ", cn,
+                " {", kir_dump_assigns(asg, ""), "} dropmask=", int_to_string(dm)])
+  KTrmcApply(v, _)      -> cat2("trmc-apply ", kir_dump_val(v))
+  KResume(c, a, tl, _)  -> concat_all(["resume", kir_tail_mark(tl), " ", kir_dump_val(c), " ", kir_dump_val(a)])
+  KResume2(c, a, s, tl, _) ->
+    concat_all(["resume2", kir_tail_mark(tl), " ", kir_dump_val(c), " ", kir_dump_val(a), " ", kir_dump_val(s)])
+  KUnreachable(_)       -> "unreachable"
+}
+
+fn kir_tail_mark(tl: Bool) : String = if tl { "[tail]" } else { "" }
+
+fn kir_dump_cases(cs: [KCase], acc: String) : String = match cs {
+  [] -> acc
+  [KC(tag, lbl), ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_cases(rest, concat_all([acc, sep, int_to_string(tag), " -> ", lbl]))
+  }
+}
+
+fn kir_dump_assigns(asg: [KAssign], acc: String) : String = match asg {
+  [] -> acc
+  [KAsg(i, v), ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_assigns(rest, concat_all([acc, sep, "p", int_to_string(i), " <- ", kir_dump_val(v)]))
+  }
+}
+
+# --- Atoms --------------------------------------------------------------
+
+fn kir_dump_vals(vs: [KVal], acc: String) : String = match vs {
+  [] -> acc
+  [v, ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_vals(rest, concat_all([acc, sep, kir_dump_val(v)]))
+  }
+}
+
+fn kir_dump_val(v: KVal) : String = match v {
+  KVar(n)   -> n
+  KIntV(n)  -> int_to_string(n)
+  KRealV(r) -> real_to_string(r)
+  KBoolV(b) -> if b { "true" } else { "false" }
+  KCharV(c) -> cat3("'", "#{c}", "'")
+  KStrV(s)  -> s
+  KUnitV    -> "()"
+}
