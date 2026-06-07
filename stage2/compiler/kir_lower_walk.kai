@@ -165,14 +165,19 @@ fn lower_if(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes 
   match lower_expr(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, st1) }
 }
 
+# The `join` register is materialised with a `KLet` BEFORE the condbr so a
+# translator reads it as a mutable slot (alloca) each branch's `KStore`
+# writes — not an undeclared name to infer (Linus review #1).
 fn lower_if_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(join, st2) ->
-    match three_labels(st2) { LSL3(lt, le, lcont, st3) -> {
+  match ls_fresh_reg(st) { LSReg(join, st2) -> {
+    let st_decl = ls_emit(st2, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+    match three_labels(st_decl) { LSL3(lt, le, lcont, st3) -> {
       let st4 = ls_seal(st3, KCondBr(cv, lt, le, kpos_of(x)), lt)
       let st5 = lower_branch_into(t, join, lcont, st4)
       let st6 = lower_else_into(e_opt, join, lcont, le, st5)
       LRes(KVar(join), st6)
-    } } }
+    } }
+  } }
 
 # Lower one branch into the join register and branch to the continuation.
 fn lower_branch_into(e: Expr, join: String, lcont: String, st: LowerSt) : LowerSt / Console =
@@ -199,16 +204,24 @@ fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
 }
 
 # Build the switch + per-arm blocks + default + continuation, given the
-# already-lowered scrutinee atom and tag register. Flat sequence of `let`s.
+# already-lowered scrutinee atom and tag register. The `join` register is
+# materialised with a `KLet` BEFORE the fork so a translator reads it as a
+# mutable slot (alloca) that each arm's `KStore` writes — not an undeclared
+# name it must infer (Linus review #1). The default block is `KUnreachable`:
+# kaikai matches are exhaustive, so the switch never falls through; emitting
+# a unit store there would silently make a non-exhaustive program return ()
+# instead of trapping (Linus review #3).
 fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(join, st3) ->
-    match two_labels(st3) { LSL2(lcont, ldef, st4) ->
+  match ls_fresh_reg(st) { LSReg(join, st3) -> {
+    let st_decl = ls_emit(st3, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+    match two_labels(st_decl) { LSL2(lcont, ldef, st4) ->
       match plan_arms(arms, st4, []) { ArmPlan(cases, st5) -> {
         let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
-        let st7 = ls_seal(ls_emit(st6, KStore(join, KUnitV, KNoPos)), KBr(lcont, KNoPos), lcont)
+        let st7 = ls_seal(st6, KUnreachable(KNoPos), lcont)
         let st8 = lower_arm_bodies(arms, cases, scrv, join, lcont, st7)
         LRes(KVar(join), reopen(st8, lcont))
-      } } } }
+      } } }
+  } }
 
 # One block label per arm paired with the arm's tag, deterministically.
 fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match arms {
@@ -320,6 +333,11 @@ fn lower_reuse(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match car
   _ -> LRes(KUnitV, st)
 }
 
+# A single-element rebuild whose head is an `EVar`/`EModCall` constructor is
+# a variant/record reuse; otherwise it is a cons reuse (`reuse_cons` passes
+# head+tail directly). The `"Cons"` fallback only fires for the cons shape —
+# perceus never emits a reuse over a non-ctor `ECall`, so the fallback's tag
+# is correct for cons and unreachable for anything else (Linus review nit).
 fn lower_reuse_rebuild(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
   [one] -> match one.kind {
     ECall(cf, cas) -> match cf.kind {
@@ -362,9 +380,15 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
 }
 
 # `__kai_tcrec|<sym>|<dropmask>|<p0>|...` → KTcrecGoto (seals the block).
+# Invariant (Linus review #2): `tcrec_rewrite_decls` plants the call args
+# in the SAME order as the loop params `p0..pN`, so the ordinal index from
+# `assigns_of(avs, 0, …)` IS the slot index — the pipe's `_pnames` are
+# redundant here and deliberately unused. If that producer ever reorders,
+# this assumption breaks silently; the dropmask is a bitfield over the same
+# p0..pN ordering, so the two must stay aligned.
 fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match es_tcrec_split_pipe(callee) {
-    [_, sym, dropmask_str, ...pnames] -> match lower_exprs(cargs, st, []) {
+    [_, sym, dropmask_str, ..._pnames] -> match lower_exprs(cargs, st, []) {
       LResMany(avs, st1) ->
         seal_tail(st1, KTcrecGoto(cat3("_kai_", sym, "_entry"), assigns_of(avs, 0, []),
                                   es_tcrec_parse_decimal(dropmask_str), kpos_of(x)))
@@ -373,9 +397,11 @@ fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Con
   }
 
 # `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...` → KTrmcStep.
+# Same ordinal-index invariant as `lower_tcrec` (Linus review #2): `_pnames`
+# are unused; cargs order == slot order, guaranteed by the rewrite producer.
 fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match es_tcrec_split_pipe(callee) {
-    [_, sym, hole_str, cname, dropmask_str, ...pnames] -> match lower_exprs(cargs, st, []) {
+    [_, sym, hole_str, cname, dropmask_str, ..._pnames] -> match lower_exprs(cargs, st, []) {
       LResMany(avs, st1) ->
         seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), es_tcrec_parse_decimal(hole_str),
                                  cname, es_tcrec_parse_decimal(dropmask_str),
