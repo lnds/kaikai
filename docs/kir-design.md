@@ -1,0 +1,597 @@
+# KIR — kaikai Intermediate Representation (design)
+
+**Status:** proposal / lane prep. Not yet implemented.
+**Scope:** stage 2 only. Does not touch the bootstrap contract (stages 0–1 keep
+emitting portable C from any `cc`).
+**Motivation:** unify the two AST→target lowerings (`emit_c.kai`, `emit_llvm.kai`)
+under one intermediate representation, killing the structural duplication and the
+double-paid bug harvest measured between the two backends.
+
+**This is NOT a performance change.** KIR is a maintainability/correctness
+refactor. The C-from-KIR output is byte-identical to today's C (a hard gate, §7
+Lane 3 / 4) → same binary → same runtime speed. The path to lower the Koka gap
+lives in the runtime and the data-structure/zipper algorithm (per the rb-tree
+perf memories), not in how code is emitted — KIR neither helps nor hurts there
+directly. What KIR *does* for performance is indirect: a codegen optimisation
+(reuse-in-place, i64-inline, TRMC) is written **once** in the AST→KIR lowering
+instead of twice, so improvements reach both backends without re-paying bugs. KIR
+makes chasing 1×C *sustainable in one place*; it does not itself close the gap. Do
+not read this doc as a route to native parity.
+
+---
+
+## 1. Why this exists
+
+Stage 2 has two emitters that walk the **same** post-perceus `[Decl]`
+independently:
+
+- `emit_program(...)` → C (default backend, `--emit=c` / `c-modular`).
+- `emit_program_llvm(path, src, raw_decls, regions)` → LLVM IR (`--emit=llvm`,
+  opt-in today).
+
+`emit_shared.kai` (~160 fns) shares **analysis**, not **lowering**: symbol
+resolution (`c_sym`, `efn_resolve`, `fns_filter_*`), variant tags
+(`evar_find_tag`, `register_variants`, `user_variant_tag_base()=11`), closure
+free-variables (`fv_expr`/`fv_arms`/`fv_stmts_scoped`/`fv_interp`), pattern
+bindings (`pat_bindings`), lambda collection (`find_lam`, `lc_*`). The frontier
+where the duplication lives — the actual AST→target lowering — is **not** shared.
+
+Measured consequences (from the repo-history defect analysis and the LLVM-parity
+lane retros/memories):
+
+- The LLVM backend carries the **highest defect density in the project**
+  (~2.78 fix/KLOC, above the typer at 2.53). The mature C backend sits at 1.78.
+- Roughly 16 LLVM fixes re-paid bugs the C backend had already closed: installing
+  default handlers for Spawn/Cancel/Link/Monitor/File/Stdin/Process, continuation
+  marshalling, invalid IR, i64-inline slot repr, TRMC/TCO sentinel decoding.
+- Project duplication is 8.6%, concentrated in `emit_c ↔ emit_llvm`.
+- This is the **only** place in the repo where Conway's residual reappears inside
+  a process (ELP) designed to neutralise it: two lanes built the same thing in
+  parallel with only *static* shared context (`emit_shared`), and produced
+  divergence plus a second harvest of the same defects.
+
+## 2. The reframing finding (lowers the risk)
+
+perceus does **not** add any new `ExprKind`. It reuses the AST as its own IR:
+
+- RC marks are magic-name calls: `ECall(EVar("__perceus_dup"), ...)`,
+  `__perceus_drop`, `__perceus_borrow`, `__perceus_reuse_variant/cons/record`
+  (injection sites e.g. `perceus.kai:1737` dup, `:3635` drop, `:486` borrow;
+  line numbers drift — grep `EVar("__perceus_` for the current set).
+- TCO/TRMC marks are **pipe-encoded strings planted as the callee**:
+  `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...` and
+  `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`.
+
+And each backend **decodes them separately**: `tcrec_split_pipe` in C
+(`emit_c.kai:1982`), `es_tcrec_split_pipe` in LLVM (`emit_llvm.kai:3036,3053`).
+That duplicated decoding of a semantic string is, literally, the lowering
+duplication frontier.
+
+So KIR is **not** "add an IR where there was none." It is **promoting to typed
+structure what is already a clandestine IR encoded as strings over the AST**.
+The risk is therefore dominated by byte-id discipline, not by semantic
+uncertainty — we are not inventing semantics, we are materialising them.
+
+---
+
+## 3. Abstraction level
+
+**KIR is ANF (A-Normal Form) over named virtual registers, with explicit basic
+blocks, but NO SSA and NO materialised CFG edges.** A mid-low point — not full
+Cmm/MIR.
+
+- **Flat (ANF / three-address):** every non-trivial subexpression is named.
+  `f(g(x))` becomes `let t0 = g(x); f(t0)`. The justification is internal to
+  kaikai: drops, resumes, and suspension points all attach to sequencing points,
+  and ANF makes every sequencing point an explicit binder. perceus already names
+  the hard cases; ANF generalises that. (Other effectful languages converge on
+  flat IRs for the same reason — see §3.1 — but the choice stands on kaikai's own
+  needs, not on theirs.)
+- **Named virtual registers, NOT SSA.** A KIR binder may be reassigned (TCO/TRMC
+  slots need it: the goto-loop rewrites `p0..pn`). SSA would force phi-nodes on
+  the tcrec back-edge — pure work, no payoff: the only consumers are two target
+  translators, and both C (mutable locals) and LLVM (alloca+store, which the
+  tcrec.loop already emits) prefer mutable registers to phi. SSA is the right form
+  for an optimiser; KIR does not optimise, it lowers.
+- **Explicit basic blocks, but light.** A function body is a list of blocks; each
+  block is `(label, [KStmt], KTerminator)`. This is what kills the
+  TCO/TRMC/match duplication: today both emitters reconstruct control-flow from
+  `EMatch`/`EIf`/sentinel-strings; with explicit blocks, AST→KIR does it **once**
+  and the translators only print `goto`/`br`.
+- **CFG implicit via terminators, NOT a materialised graph.** No edge lists, no
+  dominators. Terminators name their successors; that suffices to emit. A CFG
+  object is only justified for dataflow analysis over KIR — and we do none,
+  because perceus already ran before.
+- **Values are atoms; ops take only atoms.** Strict ANF.
+
+**Against the principles:**
+
+- *Fast compilation (Tier 1.3):* ANF is a single flattening pass over the
+  post-perceus AST; basic blocks are generated in the same walk. No fixpoint, no
+  iteration-to-convergence. Cheaper than SSA (no dominator computation),
+  comparable to the existing `tcrec_rewrite_decls`.
+- *Do not degrade runtime (Tier 1.2):* the flat form is exactly what codegen
+  wants; no extra indirection. ANF `let t0 = ...` collapse to C locals / LLVM
+  registers that clang/LLVM eliminate trivially. self-host byte-id is preserved
+  because ANF is deterministic (fixed left-to-right evaluation order, as today).
+
+**Why this level and not lower (no machine layout, no CFG object):** kaikai
+delegates optimisation and instruction selection to clang and LLVM. Any KIR detail
+below "what the target translator needs to print" (machine registers, stack
+layout, dominators) is work clang/LLVM redo — it buys nothing and costs
+compile-time (Tier 1.3) and risk. KIR stops exactly at the level where the
+remaining step is mechanical target syntax. That ceiling is set by kaikai's
+delegation choice, not by matching any external IR.
+
+### 3.1 Comparative evidence (NOT a template)
+
+Other languages are cited here only as evidence that "one shared low IR + thin
+per-target translators" scales — they are reference points, not a design to copy.
+kaikai's target is LLVM directly; its constraints (post-perceus RC, one native
+target, bootstrap-C-as-oracle) are its own. The differences matter as much as the
+similarities:
+
+- **Zig (AIR):** typed, flat, structured control-flow, translated to C *or* LLVM by
+  thin backends. Closest in *shape* to KIR. Difference: AIR is post-typecheck and
+  *pre*-RC (Zig is manually memory-managed); KIR is *post*-perceus and carries
+  explicit RC nodes (§4.7). We do not adopt AIR's machine-level details.
+- **GHC (Cmm), Rust (MIR):** materialise a CFG object plus low-level types because
+  they feed custom optimisers/instruction-selectors. kaikai does **not** — so KIR
+  deliberately stays above that. Cited as the level NOT to reach, not the one to
+  match.
+- **Koka (Core + Parc):** see §5.1. Evidence that a single IR scales to multiple
+  targets (Koka has C/JS/C#), with the explicit caveat that Koka's *form* is not
+  KIR's form.
+
+---
+
+## 4. KIR node set
+
+### 4.1 Top-level
+```
+KProgram = { types: [KTypeDecl], fns: [KFn], handlers: [KHandlerDecl],
+             install_order: [String], regions: [KRegion] }
+KTypeDecl = KSum(name, [KCtor]) | KRecord(name, [KField])
+KCtor     = { name, tag: Int, slots: [KSlot] }
+KSlot     = SBoxed | SInt64 | SReal | SBool     # i64-inline → SInt64 first-class
+KFn       = { sym: String, params: [KParam], ret: KSlot, blocks: [KBlock],
+              is_handler_thunk: Bool }
+KParam    = { name, slot: KSlot, mode: KOwn | KBorrow }   # borrow is a param property, not a wrap
+```
+
+The TRMC sentinel's `dropmask` / `holeslot` / `cname` stop being a string and
+become typed fields of the relevant terminator. That removes both `*_split_pipe`
+parsers.
+
+### 4.2 Blocks and terminators
+```
+KBlock = { label: String, stmts: [KStmt], term: KTerm }
+KTerm
+  = KRet(KVal)
+  | KBr(label)
+  | KCondBr(KVal, then_label, else_label)
+  | KSwitch(KVal, scrut_tag_source, [(Int, label)], default_label)   # match on variant tag
+  | KTailCall(callee_sym, [KVal])                                    # non-recursive tail call
+  | KTcrecGoto(loop_label, [KAssign(slot_idx, KVal)], dropmask: Int) # ex __kai_tcrec
+  | KTrmcGoto(loop_label, hole_slot: Int, cname: String,
+              dropmask: Int, [KAssign(slot_idx, KVal)])              # ex __kai_trmc
+  | KResume(cont: KVal, arg: KVal, tail: Bool)                       # ex resume → kai_cont_resume
+  | KUnreachable
+```
+
+### 4.3 Statements (ordered, inside a block)
+```
+KStmt
+  = KLet(name, slot, KOp)         # bind the result of an op
+  | KDo(KOp)                      # effectful op, result discarded
+  | KRC(KRCOp)                    # explicit Perceus op — KRCOp defined in §4.7
+  | KStore(slot_target, KVal)     # slot mutation (TCO loop assigns, Array writes / Mutable)
+```
+
+### 4.4 Ops (RHS, all take atoms)
+```
+KOp
+  = KCall(callee_sym, [KVal])                       # direct call to a known fn
+  | KCallIndirect(KVal, [KVal])                     # closure / function value
+  | KPrim(prim_name, [KVal])                        # +,-,==, kai_intf, ... (inline builtins)
+  | KCon(ctor_name, tag, [KSlotInit])               # constructor: variant/record/cons
+  | KConReuse(donor: KVal, ctor, tag, [KSlotInit])  # ex __perceus_reuse_*
+  | KProj(KVal, slot_idx)                           # destructure: read slot i (= kai_variant_at)
+  | KTagOf(KVal)                                    # read the tag (for KSwitch)
+  | KClosure(thunk_sym, [KVal] captures)            # captures = what fv_* computes today, resolved
+  | KPerform(eff, op, [KVal])                       # invoke an effect op (raises to installed handler)
+  | KInstallHandler(eff, handler_sym, body_thunk)   # install a handler over a body
+  | KLit(literal)
+```
+
+### 4.5 Values (atoms)
+```
+KVal = KVar(name) | KInt | KReal | KBool | KChar | KStr | KUnit
+```
+
+### 4.6 Slot-init (constructor field repr — boxed vs i64-inline)
+```
+KSlotInit = SIBoxed(KVal) | SIInt64(KVal) | SIReal(KVal)
+```
+The AST-level `ValueMode` string dies here: boxed/i64 is the **slot-init variant**,
+decided once in AST→KIR from `CtorIntSlots` + `mode`. C emits `{.i64 = v}` for
+`SIInt64`; LLVM emits the i64 store. Neither translator re-derives unboxability.
+This makes the #741/#747 class (runtime-mint-i64 vs emitter-read-ptr desync)
+structurally impossible: one place decides the slot repr.
+
+### 4.7 The transversal decision: Perceus as first-class nodes, NOT annotations
+
+**Recommendation: first-class `KRC` nodes.** Deliberately the opposite of today's
+magic-name ECalls.
+
+```
+KRCOp
+  = KDup(KVal)             # incref — ex __perceus_dup
+  | KDrop(KVal)            # decref — ex __perceus_drop / kai_decref
+  | KDropReuse(KVal) -> token   # uniqueness-conditional decref producing a reuse token
+  | KFreeToken(token)     # release an unused token
+```
+
+`borrow` stops being a wrap (`__perceus_borrow`) and becomes the `mode: KBorrow`
+of the `KParam` plus the *absence* of a `KDrop` at the match exit. Borrow info is
+a structural property, not a node the emitter must recognise.
+
+Arguments (the core of the design):
+
+1. **They are already nodes today, just mistyped.** `__perceus_dup(x)` is an
+   `ECall` indistinguishable from a real call until you compare the callee string
+   — and each backend does that comparison on its own, in multiple sites. A typed
+   `KDup` is matched structurally once.
+2. **As annotations on other nodes you lose the ordering again.** The delicate
+   part of Perceus is the **relative order** of dup/drop vs calls and resumes. As
+   ordered `KStmt`s in the block list, the order *is* the list position; the
+   translator prints in order. Zero reconstruction. As a `drops_after: [KVal]`
+   field on a `KCall`, the translator would have to reconstruct where to emit each
+   decref relative to the resume and the tail-call — exactly the duplicated
+   reconstruction we want gone.
+3. **It keeps RC checkable in the lowering.** With `KDup`/`KDrop` as typed nodes,
+   the invariant "no RC op over a non-boxed slot" (§6 Risk 5) is a structural
+   check in AST→KIR — a compiler error, not a runtime segfault. Magic-name ECalls
+   cannot be checked that way. (Reference points, not the reason: Koka and Rust MIR
+   both carry RC/storage ops as explicit block statements rather than annotations —
+   §5.1. Cited as corroboration; the argument above stands on kaikai alone.)
+4. **`KConReuse`/`KDropReuse` capture reuse-in-place without strings.** The donor
+   is `KConReuse`'s first typed field; the `KDropReuse` that produced the token and
+   the `KConReuse` that consumes it sit in the same statement list, linked by token
+   name. Dynamic uniqueness (the runtime `kai_check_unique` branch) **stays in the
+   runtime** — KIR only says "reuse this donor for this ctor," as today.
+
+**The one thing that does NOT become a first-class node: the region.** Regions
+(arena) are a lexical/scope axis, not a sequencing one. `KRegion` stays as
+program-level metadata plus `region_id: Option[Int]` on `KFn`/`KBlock` that the
+translator consults to pick the allocator. This mirrors that perceus is
+region-unaware today (issue #120: arena-switch is an emit concern); KIR preserves
+the separation rather than forcing unification.
+
+---
+
+## 5. What is shared, what diverges
+
+### Single AST→KIR lowering (the hard semantics, written ONCE)
+- ANF flattening + basic-block construction. All "EMatch → switch on tag +
+  per-arm blocks", "EIf → condbr", "EBlock → statement sequence" lives here.
+  Today duplicated across `emit_expr`/`emit_kind` (C) and `llvm_emit_expr` (LLVM).
+- TCO/TRMC sentinel decode → typed `KTcrecGoto`/`KTrmcGoto`. The current
+  `tcrec_rewrite_decls` plants nodes, not strings. Both `*_split_pipe` disappear.
+- Default-handler installation + `install_order`. The `builtin_default_install_order`
+  + install loop (`emit_c.kai:8416-8637`) produce `KInstallHandler` nodes + the
+  `KProgram.install_order` field. Today C-only — the #1 reason effects diverge.
+- Continuation marshalling. `resume` → `KResume(cont, arg, tail)`; one-shot
+  semantics (the continuation is consumed on resume) is a property of `KResume`,
+  not a per-translator decision.
+- Symbol/tag resolution. `c_sym`, `evar_find_tag`, etc. (already in emit_shared)
+  run in the lowering and leave symbols/tags **already resolved** inside KIR. The
+  translator resolves nothing.
+- Closure captures. `fv_expr`/`fv_arms` run here; `KClosure` carries the
+  precomputed capture list. Today both emitters re-call `fv_*`.
+- Perceus drops. Already marked by perceus; the lowering translates them to
+  `KDrop`/`KDropReuse` in position. Tail-position care (§6) is resolved here, once.
+
+### Dumb KIR→C / KIR→LLVM translators (target syntax only)
+Each KIR node has **one** print rule per target. Examples:
+- `KSwitch` → C `switch (tag) { case N: goto L; ... }` / LLVM `switch i32 %t, ...`.
+- `KDup(v)` → C `kai_incref(v);` / LLVM `call void @kaix_incref(...)`.
+- `KConReuse(donor, ctor, tag, inits)` → C `kai_reuse_or_alloc_variant(...)` /
+  LLVM `call @kaix_reuse_or_alloc_variant(...)`. No parsing, no recogniser.
+- `KSlotInit::SIInt64(v)` → C `{.i64 = v}` / LLVM store i64.
+
+The translator is `kir_stmt -> String` (or `-> [LLVMInstr]`) with an exhaustive
+match over the ~28 KIR nodes (9 terminators + 4 statements + 11 ops + 4 RC ops;
+atoms are leaves). No analysis state, no `fv_*`, no `evar_find_tag`, no
+`*_split_pipe`. **Success metric:** the translator imports nothing from
+emit_shared except possibly the target name mangle (genuine target syntax).
+
+### Mapping against the 16 LLVM fixes that re-paid C bugs
+
+| Fix class | Prevented by KIR? | Why |
+|---|---|---|
+| i64-inline / kind-1 (#747, #741) | **Yes, eliminated by construction** | Slot repr (`SInt64` vs `SBoxed`) decided once in AST→KIR. |
+| TRMC/TCO lowering (#668, #706, scrutinee drop) | **Yes** | holeslot/dropmask/cname no longer a twice-decoded string. |
+| Token-model / arm-top reuse / borrow (regexp UAF) | **Yes** | `KDropReuse`→token→`KConReuse` is one structure, written once. |
+| Boxed-Int read-side leak (#747 Option B) | **Yes** | Slot binder is `KProj` with typed `SInt64` → not boxed, not duped. |
+| Shim-call boundary / -flto / llvm-link | **No** | Linking / LLVM codegen shape, not lowering. KIR neither fixes nor worsens. |
+| Runtime-unify / RSS / single runtime.h | **No (orthogonal)** | Runtime convergence, not IR. A desirable precondition, not a dependency. |
+
+~12–13 of the 16 belong to classes KIR makes structurally impossible (the decision
+is made once and materialised typed). The remaining 3–4 are linking/runtime
+problems orthogonal to the IR. That is the quantitative justification for the lane.
+
+### 5.1 Koka as comparative evidence (NOT a template)
+
+Koka is a reference point that corroborates the "one IR, thin per-target
+translators" shape — it is **not** a design to imitate. kaikai's situation and
+target differ, and the differences are the point:
+
+- **What Koka confirms:** a single typed Core IR feeds multiple backends (C,
+  JavaScript, C#) via thin per-target code generators. Evidence the pattern scales
+  to several targets; nothing more.
+- **Where Koka's form differs from KIR (do NOT copy):**
+  - Koka's reuse/RC analysis (Perceus + reuse specialization) is tied to its C
+    backend, because for Koka C *is* the native target while JS/C# rely on host GC
+    and insert no dup/drop. kaikai's native target is **LLVM directly**; RC is not
+    C-specific here. So KIR carries the RC nodes (§4.7) as a *target-neutral*
+    layer, not bolted to one backend. This is a deliberate divergence from Koka,
+    justified by kaikai's LLVM-direct goal.
+  - Koka's Core is a full typed lambda calculus with many optimisation passes
+    (inlining, specialization, monadic translation, ...). KIR is intentionally
+    lower and dumber: flat ANF post-perceus, no optimiser. We do not want Koka's IR
+    surface; we want the minimum that makes the two translators thin.
+  - Koka's multi-backend model includes GC targets (JS/C#). kaikai has one native
+    RC target; the second "backend" (C) is bootstrap + differential oracle, not a
+    distinct product target. Koka simply does not have kaikai's
+    two-paths-to-the-same-native-target anti-pattern — which is the problem KIR
+    removes.
+- **Net:** Koka shows the destination shape is viable for a serious language;
+  KIR's specific form is derived from kaikai's code (perceus-as-string-IR, the
+  duplicated `*_split_pipe`), not from Koka's layout.
+
+---
+
+## 6. Soundness risks (concrete)
+
+**Risk 1 — Tail-position. KIR RESOLVES it structurally.** perceus deliberately
+does NOT place drops in tail position (it would drop *after* the tail via a
+`__pcs_block_ret` wrap, hiding the self-tail-call from `tcrec_rewrite_decls`;
+`perceus.kai:1770-1780`). In KIR this becomes structurally sound: the tail-call is
+a *terminator* (`KTcrecGoto`/`KTailCall`/`KRet`), drops are *statements* that go
+**before** the terminator in the block list. "Drop after the tail" cannot exist
+because the tail IS the terminator and nothing follows a terminator by
+construction. Invariant the lowering must keep: end-of-scope drops perceus marked
+emit as `KStmt` before the `KTerm`; the `KTcrecGoto`/`KTrmcGoto` dropmask carries
+the drops that must happen INSIDE the re-loop (old params). That is exactly what
+the dropmask string encodes today — we only type it. **Gate:** TCO fixture +
+KAI_TRACE_RC balanced pass identically.
+
+**Risk 2 — self-host byte-id (hardest gate).** KIR is deterministic only if:
+(a) ANF flattening uses fixed left-to-right evaluation order, (b) virtual-register
+names are generated deterministically (monotonic counter **per function**, reset
+per function — not global, or function processing order would shift names),
+(c) block output order is deterministic (generation order, not hash-set). The C
+translator must produce **byte-identical** output to today during migration —
+forcing care with temporary names / spacing. Achievable because ANF→C is
+mechanical. **Binary gate: selfhost byte-id. One byte differs → lane does not
+close.**
+
+**Risk 3 — one-shot effects.** `KResume(cont, arg, tail)` must preserve that the
+continuation is consumed on resume (one-shot = zero-cost default, Tier 1.2). Risk:
+the lowering duplicating a `KResume` over the same continuation (via inlining or an
+arm on two paths) silently violates one-shot → use-after-free. Mitigation: the
+lowering does NOT inline; it copies structure 1:1 from the post-perceus AST, where
+the resume is already unique. **Gate:** `examples/effects/` fixtures + ASAN. This
+is where the C backend as oracle is most valuable: the mature C has correct
+`kai_cont_resume` semantics; KIR→C must reproduce it; `test-backend-parity.sh`
+verifies against LLVM.
+
+**Risk 4 — reuse-in-place is local to the nested pattern.** kaikai's reuse lever is
+local to the nested pattern (per the rb-tree reuse-lever memory: the reuse window
+is the match arm, not interprocedural).
+`KDropReuse`→`KConReuse` linked by token must stay in the same block (or blocks the
+runtime uniqueness check covers). Risk: ANF flattening separating `KDropReuse`
+(arm-top) from `KConReuse` (arm body) across a block boundary that breaks the
+linkage → token lost or freed wrong. Mitigation: the token is a named binder; its
+`KFreeToken` emits if no `KConReuse` consumes it in scope (the "shell-dispose if no
+downstream Con" shape). Uniqueness stays dynamic (runtime); KIR only carries
+intent. **Gate:** leaked==0 on rbtree + regexp, KAI_TRACE_RC reuse≈1M, selfhost
+byte-id.
+
+**Risk 5 — kind-1 i64 in patterns.** `KProj` over an `SInt64` slot yields a raw
+i64, not boxed. Risk: a `KDup`/`KDrop` applied to a raw i64 (not an RC pointer).
+Structural mitigation: `KDup`/`KDrop` are valid only over `KVal` whose slot is
+`SBoxed`. The lowering emits no RC op over raw i64 — checkable: an assert "no KRC
+over non-boxed slot" turns it into a compiler error, not a segfault. This would
+have caught #747 read-side at compile time.
+
+**Risk 6 — compile-time regression.** An extra IR is one more pass and structure.
+Risk: AST→KIR + KIR→target slower than direct AST→target. Mitigation: ANF is a
+single linear pass; KIR is transient (discarded after emit). Net cost should be
+near zero because we delete the double analysis walk each emitter does today
+(each re-calls `fv_*`, `evar_find_tag`, re-parses sentinels). **Gate:** measure
+self-compile time before/after; must not rise materially (baseline ~31s).
+
+**Risk 7 — source-position loss across the lowering.** The AST carries
+`line`/`col` on every node. Today both emitters read those positions straight off
+the AST. KIR sits between AST and target, so any position not threaded through the
+lowering is lost to everything downstream. Two consumers depend on it: (a) runtime
+panic / contract-violation messages with source locations, which must stay
+byte-identical (covered by the byte-id gate — if positions drift, byte-id fails,
+so this is self-policing for the C path); (b) future DWARF/debuginfo emission
+(#500 builds DWARF "from the source positions already tracked in the AST" via
+`LLVMDIBuilder` — if KIR drops them, #500 becomes impossible). Mitigation: KIR
+nodes carry an optional `pos: SrcPos` (line, col) populated from the AST node they
+lower from; the translator emits it where the target wants it (C `#line` /
+comments, LLVM `!dbg` metadata). This is metadata, not a node — it does not affect
+the ~28-node match. **Gate:** panic-location fixtures pass byte-identical; the KIR
+dump (`--emit=kir`) shows positions so #500's lane can rely on them. *This
+requirement is not optional: omitting it silently blocks #500.*
+
+---
+
+## 7. Lane plan (ELP)
+
+**Strategy: parallel layer + LLVM first, C as differential oracle, byte-id
+preserved at every step.**
+
+Why **LLVM first**: the C backend is the mature differential oracle (1.78
+fix/KLOC) and the default. Migrating C first risks the default path and loses the
+oracle during transition. Migrating LLVM first means KIR→LLVM validates against
+C-direct (untouched) via `test-backend-parity.sh` at every step. The backend that
+benefits most is LLVM (it re-pays bugs) and it has a stable oracle to validate
+against. Once LLVM is fully on KIR and in parity, C migrates with LLVM-on-KIR as a
+second oracle.
+
+**Parallel layer, NOT big-bang.** Big-bang over ~22K LOC of emitters with no
+safety net is the anti-pattern. KIR enters as `--emit=kir` (dumpable between
+passes, Tier 1) plus a new translator, leaving both direct emitters intact until
+their replacement is in parity.
+
+**Every lane below also carries the §7.1 code-quality gate** (each new file scores
+`km` **A− or better**, < 400 LOC target / 800 hard cap, avg cognitive < 5/fn, max
+< 25/fn, zero new duplication) in addition to its listed soundness gates. The bar
+is the repo's own A/A+ files, not its F monoliths. New files are split before they
+grow, not after.
+
+### Lane 0 — Define KIR + dumper (no emitter touched)
+- **Brief:** Create `stage2/compiler/kir.kai` with the §4 types. Write
+  `lower_to_kir(decls: [Decl], regions) : KProgram` producing KIR from the
+  post-perceus/post-tcrec AST. Add `--emit=kir` printing readable KIR. No emitter
+  changes.
+- **Gate:** `--emit=kir` is deterministic (run twice = byte-id); the dump covers
+  every §4 node over the `examples/` corpus; selfhost byte-id trivially (codegen
+  untouched). Fixture: `.kir.expected` goldens for 3–4 representative programs
+  (rbtree, an effect, a closure, a TRMC).
+- **Deps:** none. Foundation.
+
+### Lane 1 — KIR→LLVM translator behind a flag, in parity
+- **Brief:** Write `emit_llvm_from_kir(kp: KProgram) : String`, dumb translator.
+  Flag `KAI_BACKEND=llvm-kir`. Direct `emit_program_llvm` still exists.
+- **Gate:** `test-backend-parity.sh` extended to three ways: C-direct (oracle) ==
+  LLVM-direct == LLVM-from-KIR over the 388 parity fixtures. ASAN clean.
+  KAI_TRACE_RC balanced. Does not require selfhost byte-id of LLVM output (LLVM is
+  not the default; behaviour parity is what matters), but the LLVM-from-KIR binary
+  must pass the same suite as LLVM-direct.
+- **Deps:** Lane 0.
+
+### Lane 2 — LLVM-from-KIR becomes the only LLVM
+- **Brief:** Delete direct `emit_program_llvm` and its private `es_*` /
+  `*_split_pipe` helpers. `KAI_BACKEND=llvm` now routes through KIR.
+- **Gate:** parity 388 C-vs-LLVM(KIR), ASAN, KAI_TRACE_RC, all effects/perceus
+  fixtures. Measure compile-time (Risk 6). Mandatory retro (non-trivial lane).
+- **Deps:** Lane 1 green and stable. Partial point-of-no-return: LLVM has no direct
+  path, but C-direct stays the intact oracle.
+
+### Lane 3 — KIR→C translator behind a flag, byte-id vs C-direct
+- **Brief:** Write `emit_c_from_kir(kp) : String`. Flag `--emit=c-kir`. Direct
+  `emit_program` stays the default.
+- **Gate (strictest in the plan):** **selfhost byte-id** — C-from-KIR produces
+  output textually identical to C-direct over the compiler itself. Risk 2
+  discipline (temporary names, spacing) is paid here. If not byte-id, the lane
+  iterates on the same branch until it is. ASAN, parity, KAI_TRACE_RC.
+- **Deps:** Lane 0 (does not need 1/2, but best after them to reuse the LLVM
+  translator learning). This is where byte-id is genuinely hard and most valuable.
+
+### Lane 4 — C-from-KIR becomes the only C; delete direct emitters
+- **Brief:** `--emit=c` routes through KIR. Delete direct
+  `emit_program`/`emit_program_modular` and the duplicated lowering helpers of
+  emit_c. emit_shared shrinks to what AST→KIR uses (genuine analysis) + target
+  mangle.
+- **Gate:** selfhost byte-id (default now via KIR), parity 388, ASAN,
+  KAI_TRACE_RC, full suite, #748 modular intact. Mandatory retro. Final
+  compile-time measurement.
+- **Deps:** Lane 3 byte-id green + Lane 2.
+
+### Lane 5 (optional, post-unification) — effects on KIR as verification
+- **Brief:** With both backends on KIR, `KPerform`/`KInstallHandler`/`KResume` are
+  the single definition of effect semantics. Audit that install_order and one-shot
+  resume are identical across backends (previously divergent). Close any LLVM
+  effect issue left open by the prior immaturity.
+- **Gate:** effects fixtures pass identically on both backends; ASAN.
+- **Deps:** Lanes 2 + 4.
+
+**Dependency summary:** `0 → 1 → 2` (LLVM) and `0 → 3 → 4` (C) are two chains
+sharing foundation 0; 3 can start as soon as 0 closes but is best sequenced after
+2 to reuse the translator; 5 closes last.
+
+### 7.1 Code-quality gate (every lane) — new code must be genuinely good
+
+The standard is **absolute, not relative to the existing compiler.** The repo's F
+files (`infer.kai` 11.7K LOC, `emit_c.kai` 8.4K, `cache.kai` avg cognitive 18.6/fn)
+are the disease, not the baseline — calibrating against them would just relax. The
+proof that kaikai code can score well is in the repo itself: the entire `stdlib/`
+is full of **A++/A+** files (`result.kai` A+, `queue.kai` A++, `set.kai` A+), and
+even inside the compiler `chars.kai` and `diag.kai` score **A**, `intervals.kai`
+and `region.kai` **A−**. That is the bar. KIR is new code written from scratch with
+none of the historical debt — it has no excuse to land at F.
+
+| Metric (`km`, per file the lane adds/grows) | Gate | Bar (from the repo's A/A+ files) |
+|---|---|---|
+| **`km score`** (per file) | **A− or better; never below B+** | stdlib modules are A+/A++; `diag.kai`/`chars.kai` are A; `intervals.kai` A− at 231 LOC |
+| File size (LOC of code) | **target < 400; hard cap < 800** | A/A+ files are 9–300 LOC; A− `intervals.kai` is 231; nothing good is over ~300 |
+| Cognitive complexity, **average per function** | **< 5; target ≤ 3** | `queue.kai` 0.8, `result.kai` low; only F files climb past 8 |
+| Cognitive complexity, **max single function** | **< 25** | A files keep max well under 25; F monsters hit 103–430 |
+| Duplication introduced (`km dups`) | **zero new duplicate groups** the lane authored | the point of KIR is to *remove* duplication, not add any |
+
+Notes on measuring:
+
+- **`km score` is the headline gate here** — and it *does* discriminate when the
+  file is well-sized: small, well-decomposed files score A, monolocks score F. The
+  earlier worry that "km score lands at F even for healthy modules" was an artefact
+  of measuring 2–3K-LOC modules; at < 400 LOC the score reflects real quality.
+  Cross-check with `km cogcom` avg/max per function.
+- A file approaching the size cap is split **before** it grows, not after. KIR's
+  natural seams: `kir.kai` (types only), `kir_lower.kai` (AST→KIR), and per-target
+  translators each split by node family (terminators / ops / RC / types) if one
+  approaches 400 LOC. Aim for several A-grade files, not one big one.
+- The dumb-translator design makes this easy, not hard: a translator that is one
+  exhaustive `match` over ~28 nodes with one print rule each is naturally
+  low-complexity. If a translator's avg cognitive climbs past 5, logic leaked from
+  the lowering into the translator — move it back into AST→KIR (also the correctness
+  goal). High km numbers here are a *design smell*, not an accepted cost.
+
+**Binary gate, like byte-id:** a lane that ships a file scoring below B+ (or over
+the size cap) does not close until it is split or simplified. The new subsystem
+lands as a cluster of A-grade files or it does not land. We do not inherit the
+monolith's F; we set the example the monolith failed to.
+
+---
+
+## 8. Anchors in the current code
+
+- `stage2/compiler/ast.kai` — ExprKind + ValueMode (what KIR replaces/types).
+- `stage2/compiler/perceus.kai:1770-1780` — tail-position rationale (Risk 1);
+  `__perceus_*` injectors at `:1737` (dup), `:3635` (drop), `:486` (borrow) — grep
+  `EVar("__perceus_` for the current set, line numbers drift.
+- `stage2/compiler/emit_c.kai:1820+` — reuse lowering; `:8416-8637` — effect
+  install; `:1982+` — TRMC sentinel decode (`tcrec_split_pipe`).
+- `stage2/compiler/emit_llvm.kai:2527+` — reuse; `:3030-3053,7701+,7745+,7827+` —
+  tcrec/trmc sentinel decode (`es_tcrec_split_pipe`) — the duplicated mirror.
+- `stage2/compiler/emit_shared.kai` — the shared *analysis* (stays); the shared
+  *lowering* is what KIR creates.
+- `stage2/compiler/driver.kai:1343-1358` — `--emit=` dispatch (where `--emit=kir`
+  and the `-kir` backend flags hook in); `:5232-5268` — pipeline order.
+- `tools/test-backend-parity.sh` — the existing C-vs-LLVM differential harness the
+  gates extend.
+
+---
+
+## 9. Bottom line
+
+KIR is ANF + basic blocks + named registers (no SSA, no materialised CFG), with
+Perceus as first-class `KRC` nodes and the TCO/TRMC sentinels promoted from strings
+to typed terminators. It does not invent new semantics — it materialises the
+clandestine IR perceus already encodes as strings over the AST. Migration is a
+parallel layer, LLVM first using C-direct as the oracle, with byte-id as a hard
+gate on every lane that touches the default. The single AST→KIR lowering carries
+the hard semantics (effects, continuations, drops, TCO/TRMC, reuse) once; the two
+translators become dumb target-syntax printers. That closes the project's only
+residual Conway effect — the duplicated AST→target lowering between `emit_c` and
+`emit_llvm`.
+
+And it lands as **A-grade code** (§7.1): new, debt-free, written to the standard
+the repo's `stdlib` and `chars`/`diag` modules already meet — not to the F of the
+monoliths it replaces. We do not inherit the monolith's metrics; KIR is the chance
+to set the example they failed to.
