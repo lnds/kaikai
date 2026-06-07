@@ -4213,7 +4213,7 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
             match re.r {
               None -> err_d(re.p)
               Some(body) -> {
-                ok_d(re.p, DConst(is_pub, name, ty, body, t.line, t.col))
+                ok_d(re.p, DConst(is_pub, name, ty, body, None, t.line, t.col))
               }
             }
           }
@@ -4761,10 +4761,11 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
           else {
             # Optional effect-row suffix: `T / Io + Fail`. m7a #3b.
             let row_r = parse_row_suffix(ret_r.p)
-            # m12.6.x #5(a): optional `[<refinement_pure>]` attribute
-            # between the signature/row and the contract clauses. The
-            # parser uses peek-2 lookahead so a bare `[` (e.g. the
-            # rare list-type follow-up) doesn't trigger.
+            # Catch a now-removed `[<...>]` fn attribute between the
+            # signature/row and the contract clauses and emit a
+            # migration error. Peek-2 lookahead so a bare `[` (e.g. the
+            # rare list-type follow-up) doesn't trigger. Its parser
+            # (with any error attached) threads on into the clauses.
             let attr = parse_optional_pure_attribute(p_skip_newlines(row_r.p))
             # m12.6.b: optional `requires` / `ensures` clauses between
             # the signature and the body. They desugar to asserts in
@@ -4780,7 +4781,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                   let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                  ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+                  ok_d(rb.p, dfn)
                 }
               }
             } else if p_at(p4, TkLbrace) {
@@ -4798,7 +4799,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   Some(body) -> {
                     let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+                    ok_d(rb.p, dfn)
                   }
                 }
               } else {
@@ -4808,7 +4809,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   Some(body) -> {
                     let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d(rb.p, maybe_wrap_pure(attr.is_pure, dfn, t.line, t.col))
+                    ok_d(rb.p, dfn)
                   }
                 }
               }
@@ -5000,63 +5001,37 @@ fn parse_case_multi_arm(p: Parser, n: Int) : PMArm / Console {
   }
 }
 
-# m12.6.x #5(a): result of attempting to parse the optional
-# `[<refinement_pure>]` attribute after a fn signature / row. When
-# the bracket is absent (or doesn't open with `<`), `is_pure` stays
-# false and the parser is returned unchanged (peek-2 lookahead so a
-# bare `[` doesn't trigger).
-type PureAttr = { p: Parser, is_pure: Bool }
+# Detect a now-removed `[<...>]` fn attribute after a signature / row.
+# The `[<refinement_pure>]` attribute is gone: contract-predicate
+# purity is read directly off a fn's declared effect row (`REmpty`),
+# so the opt-in marker is redundant. The parser still recognises the
+# `[<ident>]` shape (peek-2 lookahead so a bare `[` index doesn't
+# trigger) only to emit a clear migration error rather than a generic
+# syntax failure. `ok` stays true when no such bracket is present.
+type PureAttr = { p: Parser, ok: Bool }
 
 fn parse_optional_pure_attribute(p: Parser) : PureAttr / Console {
 
-  if not p_at(p, TkLbracket) { PureAttr { p: p, is_pure: false } }
+  if not p_at(p, TkLbracket) { PureAttr { p: p, ok: true } }
   else if not tk_is(p_peek1(p).kind, TkLt) {
-    PureAttr { p: p, is_pure: false }
+    PureAttr { p: p, ok: true }
   } else {
+    # `[<` opens a removed fn attribute. Consume through `>]` if we
+    # can, then error — emitting at the attribute keeps the span tight.
     let p1 = p_skip_newlines(p_advance(p))
     let p2 = p_skip_newlines(p_advance(p1))
     let id = p_peek(p2)
-    if not tk_is(id.kind, TkIdent) {
-      PureAttr {
-        p: p_error(p2, id, "expected attribute name after `[<`"),
-        is_pure: false
-      }
-    } else {
-      let attr_name = tok_source(p2.src, id)
-      let p3 = p_skip_newlines(p_advance(p2))
-      if not p_at(p3, TkGt) {
-        PureAttr {
-          p: p_error_here(p3, "expected `>` to close fn attribute"),
-          is_pure: false
-        }
-      } else {
-        let p4 = p_skip_newlines(p_advance(p3))
-        if not p_at(p4, TkRbracket) {
-          PureAttr {
-            p: p_error_here(p4, "expected `]` to close fn attribute"),
-            is_pure: false
-          }
-        } else {
-          let p5 = p_advance(p4)
-          if attr_name == "refinement_pure" {
-            PureAttr { p: p5, is_pure: true }
-          } else {
-            PureAttr {
-              p: p_error(p5, id, concat_all([
-                "unknown fn attribute `", attr_name,
-                "` — only `refinement_pure` is recognised in m12.6.x v1"
-              ])),
-              is_pure: false
-            }
-          }
-        }
-      }
+    let attr_name = if tk_is(id.kind, TkIdent) { tok_source(p2.src, id) } else { "" }
+    PureAttr {
+      p: p_error(p2, id, concat_all([
+        "`[<", attr_name, ">]` fn attributes are not supported — ",
+        "contract-predicate purity is derived from the effect row ",
+        "(a fn with an empty row is pure); remove the attribute"
+      ])),
+      ok: false
     }
   }
 }
-
-fn maybe_wrap_pure(is_pure: Bool, dfn: Decl, line: Int, col: Int) : Decl =
-  if is_pure { DAttribPure(dfn, line, col) } else { dfn }
 
 # m12.6.b: contract-clause result. Carries the parser advanced past
 # all `requires` / `ensures` clauses plus the accumulated predicates.

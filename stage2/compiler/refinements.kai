@@ -61,48 +61,64 @@ import compiler.intervals
 pub fn synth_refine_pred_fn_name(tyname: String) : String =
   string_concat("__ref_pred_", tyname)
 
-# m12.6.x #5 (v1): enforce that a contract predicate calls only into
-# the closed refinement-pure prelude set + the standard subset
-# operators. Walks the Expr tree once; the first illegal call lands
-# as a parse-time error pointing at the offending span.
+# Enforce that a contract predicate (`requires` / `ensures`) calls
+# only effect-pure functions. Walks the Expr tree once; the first
+# call to a function whose declared effect row is non-empty lands as
+# an error pointing at the offending span.
+#
+# Purity is NOT a hand-maintained name list: a function is pure iff
+# its declared effect row is `REmpty` (the `: T` form with no `/ e`).
+# That fact lives on the function's type, computed and checked by the
+# effect system — the typer already rejects a `REmpty` signature whose
+# body performs an effect. So we read the row off the callee's `DFn`
+# in `decls` (which by construction includes the prelude + every
+# imported module, so cross-module calls resolve) and admit the call
+# when the row is empty. A callee that resolves to no `DFn` (operator
+# desugar, compiler builtin) carries no effect row and is admitted:
+# effects only ever enter through a fn with a non-empty row.
 #
 # What is allowed:
 #  - Literals (Int, Real, Bool, Char, String, EUnit)
-#  - EVar (parameter / `self` / `result` / outer locals — the typer
-#    later checks the binding actually exists in scope)
+#  - EVar (parameter / `self` / `result` / outer locals)
 #  - EField, EIndex (read-only access)
 #  - EBinop, EUnop (the standard arithmetic / boolean operators)
 #  - EIf (allowed for short-circuiting)
-#  - ECall whose callee is one of the closed pure prelude names
-#  - EBlock (allowed only when every stmt + tail is pure — m12.6.x
-#    leaves this conservative for now and rejects EBlock outright;
-#    the spec does not show predicates with let bindings).
-#
-# Pre-existing limitation: this pass does not parse the
-# `[<refinement-pure>]` attribute on user fn signatures, so user fns
-# that *would* be marked pure are rejected today. The closed
-# prelude list below is the entirety of the allowed call surface.
-#[doc("The closed allow-list of pure call names a contract predicate may invoke.")]
-pub fn refinement_pure_names() : [String] = [
-  "is_some", "is_none", "is_finite", "is_nan",
-  "string_length", "list_length",
-  # m12.6.x #7: `matches` is the refinement-side regex predicate;
-  # `compile_or_panic` is the runtime carrier the parser desugars
-  # `~r/.../` sigils into (`regexp.compile_or_panic(pat)`, an
-  # EModCall — the op name lands here without the module prefix).
-  # `regex_compile_or_panic` is the legacy bare alias kept for
-  # callers that have not migrated to the sigil. Both forms are
-  # predicate-pure: the compile is deterministic in the pattern,
-  # and a parse-failure panics rather than returning, so the
-  # refinement either evaluates or aborts the program — never
-  # observes a half-state.
-  "matches", "regex_compile_or_panic", "compile_or_panic"
-]
+#  - ECall / EModCall whose callee is an effect-pure fn (row `REmpty`)
 
-# Walk an Expr looking for the first ECall whose callee is an EVar
-# not in `pure_names`. Returns the offending name, or None.
-#[doc("Find the first call in an Expr to a name outside pure_names; None when the expression is pure.")]
-pub fn find_impure_call(e: Expr, pure_names: [String]) : Option[String] {
+# True when `name` resolves to a `DFn` whose declared effect row is
+# empty, or to no `DFn` at all (operator / builtin — no row to carry
+# an effect). Threads `decls` as the resolution context; matches on
+# the bare fn name (qualified calls land here with the op name only,
+# the same key the typer's qualified env uses).
+#[doc("True when a callee name is effect-pure: its DFn row is REmpty, or it resolves to no DFn.")]
+pub fn callee_is_effect_pure(name: String, decls: [Decl]) : Bool =
+  match decl_row_of_fn(name, decls) {
+    None       -> true        # not a DFn — operator / builtin, no effect row
+    Some(row)  -> match row {
+      REmpty -> true
+      _      -> false
+    }
+  }
+
+# Find the declared effect row of the `DFn` named `name` in `decls`.
+# `None` when no such `DFn` exists. Unwraps the decl wrappers
+# (`DAttribPure` is gone, but `DDerive` / origin-tagged fns still
+# nest a DFn) so a wrapped pure fn still resolves.
+fn decl_row_of_fn(name: String, decls: [Decl]) : Option[RowExpr] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DFn(_, dn, _, _, _, row, _, _, _, _) ->
+        if dn == name { Some(row) } else { decl_row_of_fn(name, rest) }
+      _ -> decl_row_of_fn(name, rest)
+    }
+  }
+}
+
+# Walk an Expr looking for the first call whose callee is not
+# effect-pure. Returns the offending name, or None when pure.
+#[doc("Find the first call in an Expr to a non-effect-pure fn; None when the expression is pure.")]
+pub fn find_impure_call(e: Expr, decls: [Decl]) : Option[String] {
   match e.kind {
     EInt(_) -> None
     EReal(_) -> None
@@ -111,22 +127,22 @@ pub fn find_impure_call(e: Expr, pure_names: [String]) : Option[String] {
     EStr(_, _) -> None
     EUnit -> None
     EVar(_) -> None
-    EField(b, _) -> find_impure_call(b, pure_names)
-    EIndex(a, b) -> match find_impure_call(a, pure_names) {
+    EField(b, _) -> find_impure_call(b, decls)
+    EIndex(a, b) -> match find_impure_call(a, decls) {
       Some(n) -> Some(n)
-      None -> find_impure_call(b, pure_names)
+      None -> find_impure_call(b, decls)
     }
-    EBinop(_, a, b) -> match find_impure_call(a, pure_names) {
+    EBinop(_, a, b) -> match find_impure_call(a, decls) {
       Some(n) -> Some(n)
-      None -> find_impure_call(b, pure_names)
+      None -> find_impure_call(b, decls)
     }
-    EUnop(_, x) -> find_impure_call(x, pure_names)
-    EIf(c, t_, eo) -> match find_impure_call(c, pure_names) {
+    EUnop(_, x) -> find_impure_call(x, decls)
+    EIf(c, t_, eo) -> match find_impure_call(c, decls) {
       Some(n) -> Some(n)
-      None -> match find_impure_call(t_, pure_names) {
+      None -> match find_impure_call(t_, decls) {
         Some(n) -> Some(n)
         None -> match eo {
-          Some(eb) -> find_impure_call(eb, pure_names)
+          Some(eb) -> find_impure_call(eb, decls)
           None -> None
         }
       }
@@ -134,33 +150,30 @@ pub fn find_impure_call(e: Expr, pure_names: [String]) : Option[String] {
     ECall(callee, args_) -> {
       let callee_check = match callee.kind {
         EVar(name) ->
-          if list_has(pure_names, name) { None }
+          if callee_is_effect_pure(name, decls) { None }
           else { Some(name) }
-        # Hanga Roa: the `~r/.../` regex sigil desugars to
-        # `regexp.compile_or_panic(pat)` — an EModCall, not an EVar.
-        # Accept EModCall when its op name lives in the pure set so
-        # refinement predicates can still use the sigil after the
-        # stdlib reorganisation.
+        # Qualified calls (`module.op(...)`) land as EModCall carrying
+        # the bare op name — the same key `decls` is indexed by.
         EModCall(_, name) ->
-          if list_has(pure_names, name) { None }
+          if callee_is_effect_pure(name, decls) { None }
           else { Some(name) }
         _ -> Some("<expression>")
       }
       match callee_check {
         Some(n) -> Some(n)
-        None -> find_impure_call_args(args_, pure_names)
+        None -> find_impure_call_args(args_, decls)
       }
     }
     _ -> Some("<unsupported>")
   }
 }
 
-fn find_impure_call_args(args_: [Expr], pure_names: [String]) : Option[String] {
+fn find_impure_call_args(args_: [Expr], decls: [Decl]) : Option[String] {
   match args_ {
     [] -> None
-    [a, ...rest] -> match find_impure_call(a, pure_names) {
+    [a, ...rest] -> match find_impure_call(a, decls) {
       Some(n) -> Some(n)
-      None -> find_impure_call_args(rest, pure_names)
+      None -> find_impure_call_args(rest, decls)
     }
   }
 }
