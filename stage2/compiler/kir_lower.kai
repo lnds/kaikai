@@ -18,16 +18,22 @@ import compiler.ast
 import compiler.util
 import compiler.fnreg
 import compiler.emit_shared
+import compiler.resolve
 import compiler.region
 import compiler.kir
 
 # --- Lowering state -----------------------------------------------------
 
-# Threaded immutably through the lowering, mirroring `EmitCtx`. Fields:
-# reg counter, block-label counter, finished blocks (generation order),
-# current block label, current block's reversed statement list, the EFn
-# symbol table, and the variant→tag table.
-pub type LowerSt = LS(Int, Int, [KBlock], String, [KStmt], [EFn], [EVar])
+# Threaded immutably through the lowering, mirroring `EmitCtx`. A record
+# (not a positional tuple) so adding a field — lams / enc_fn for closure
+# lowering — does not touch every destructure site. Fields: per-function
+# reg + block-label counters, finished blocks (generation order), current
+# block label, current block's reversed statement list, the EFn symbol
+# table, the variant→tag table, the lifted-lambda table (`find_lam`), and
+# the enclosing-fn key the lambda lookup is scoped by.
+pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
+                     fns: [EFn], vs: [EVar], lams: [LamInfo], enc_fn: String,
+                     effs: [String] }
 
 # Result of lowering one expression: its value atom + threaded state.
 pub type LRes = LRes(KVal, LowerSt)
@@ -39,61 +45,97 @@ pub type LSLabel = LSLabel(String, LowerSt)
 pub type LSL3 = LSL3(String, String, String, LowerSt)
 pub type LSL2 = LSL2(String, String, LowerSt)
 pub type ArmPlan = ArmPlan([KCase], LowerSt)
+pub type RecPlan = RecPlan([KFieldInit], LowerSt)
+# An optional lowered value (handler state init) + threaded state.
+pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
-pub fn ls_new(fns: [EFn], variants: [EVar]) : LowerSt =
-  LS(0, 0, [], "entry", [], fns, variants)
+pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String]) : LowerSt =
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
+            lams: lams, enc_fn: "", effs: effs }
 
-# Reset the per-function counters and block buffers, preserving the
-# shared tables. Called at the head of every KFn lowering (Risk 2b).
-pub fn ls_enter_fn(st: LowerSt) : LowerSt = match st {
-  LS(_, _, _, _, _, fns, vs) -> LS(0, 0, [], "entry", [], fns, vs)
-}
+# Reset the per-function counters and block buffers, preserving the shared
+# tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
+# scoped by (`find_lam` keys on it). Called at the head of every KFn
+# lowering (Risk 2b).
+pub fn ls_enter_fn(st: LowerSt, enc_fn: String) : LowerSt =
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs }
 
 # A fresh virtual-register name, deterministic per function: `t0`, `t1`, …
-pub fn ls_fresh_reg(st: LowerSt) : LSReg = match st {
-  LS(rc, bc, bs, cl, ss, fns, vs) ->
-    LSReg(cat2("t", int_to_string(rc)), LS(rc + 1, bc, bs, cl, ss, fns, vs))
-}
+pub fn ls_fresh_reg(st: LowerSt) : LSReg =
+  LSReg(cat2("t", int_to_string(st.rc)), ls_with_rc(st, st.rc + 1))
 
 # A fresh block label, deterministic per function: `L0`, `L1`, …
-pub fn ls_fresh_label(st: LowerSt) : LSLabel = match st {
-  LS(rc, bc, bs, cl, ss, fns, vs) ->
-    LSLabel(cat2("L", int_to_string(bc)), LS(rc, bc + 1, bs, cl, ss, fns, vs))
-}
+pub fn ls_fresh_label(st: LowerSt) : LSLabel =
+  LSLabel(cat2("L", int_to_string(st.bc)), ls_with_bc(st, st.bc + 1))
+
+# --- Field updaters (record copy-with) ----------------------------------
+
+fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
 
 # --- Block accumulation -------------------------------------------------
 
 # Append one statement to the block under construction (stored reversed).
-pub fn ls_emit(st: LowerSt, s: KStmt) : LowerSt = match st {
-  LS(rc, bc, bs, cl, ss, fns, vs) -> LS(rc, bc, bs, cl, [s, ...ss], fns, vs)
-}
+pub fn ls_emit(st: LowerSt, s: KStmt) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
-pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt = match st {
-  LS(rc, bc, bs, cl, ss, fns, vs) ->
-    LS(rc, bc, list_append(bs, [KBlock { label: cl, stmts: list_reverse(ss),
-                                         term: term, region_id: None }]),
-       next_label, [], fns, vs)
-}
+pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc,
+            bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
 
 # Seal the final block without opening a successor (function exit).
-pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] = match st {
-  LS(_, _, bs, cl, ss, _, _) ->
-    list_append(bs, [KBlock { label: cl, stmts: list_reverse(ss),
-                              term: term, region_id: None }])
-}
+pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
+  list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }])
 
 # The variant tag for a constructor name. `evar_find_tag` returns 0 for an
 # unregistered name, so this is total.
-pub fn ls_variant_tag(st: LowerSt, name: String) : Int = match st {
-  LS(_, _, _, _, _, _, vs) -> evar_find_tag(vs, name)
-}
+pub fn ls_variant_tag(st: LowerSt, name: String) : Int = evar_find_tag(st.vs, name)
 
 # Resolve a bare callee name to its mangled symbol via the EFn table; an
 # unresolved name (builtin / prim) keeps its bare name for the translator.
-pub fn c_sym_of_callee_st(st: LowerSt, name: String) : String = match st {
-  LS(_, _, _, _, _, fns, _) -> c_sym_of_callee(fns, name)
+pub fn c_sym_of_callee_st(st: LowerSt, name: String) : String = c_sym_of_callee(st.fns, name)
+
+# A first-class function value: an `EVar(nm)` that names a top-level fn
+# (not a local binder) lowers to a closure over the fn's thunk symbol.
+# Returns the closure descriptor (thunk-with-`@`, arity) or None when
+# `nm` is a local binder. Params / let-binders are never in the EFn
+# table, so an `efn_resolve` hit means a genuine fn reference (the
+# fn-vs-local-shadow case is a pre-existing resolver bug, out of scope).
+pub type FnValue = FV(String, Int)
+
+pub fn ls_fn_value(st: LowerSt, nm: String) : Option[FnValue] = match efn_resolve(st.fns, nm) {
+  Some(EFn(_, arity, mo, _)) -> Some(FV(cat3("_kai_", c_sym(nm, mo), "_thunk"), arity))
+  None                       -> None
+}
+
+# A qualified reference (`mod.fn`) as a fn-value: mint the prefixed thunk
+# symbol from the module + name (emit_c's EModCall value arm), resolving
+# the arity from the EFn table. Falls back to arity 0 when unresolved
+# (matches emit_c's `kai_<fname>` degenerate path — rare, surfaced here
+# rather than silently wrong).
+pub fn ls_fn_value_qualified(st: LowerSt, modn: String, name: String) : FnValue = match efn_resolve(st.fns, name) {
+  Some(EFn(_, arity, _, _)) -> FV(cat3("_kai_", c_sym(name, Some(modn)), "_thunk"), arity)
+  None                      -> FV(cat3("_kai_", c_sym(name, Some(modn)), "_thunk"), 0)
+}
+
+# A bare-name call is DIRECT when the callee is a known top-level fn or a
+# prelude builtin; otherwise it is a local binder holding a function
+# value (called indirectly). `prelude_names()` (resolve, target-neutral)
+# is the shared prelude list — no backend table is consulted here.
+pub fn callee_is_direct(st: LowerSt, callee: String) : Bool = match efn_resolve(st.fns, callee) {
+  Some(_) -> true
+  None    -> name_in_list(prelude_names(), callee)
+}
+
+fn name_in_list(xs: [String], target: String) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == target { true } else { name_in_list(rest, target) }
 }
 
 # --- Pure helpers (no recursion through lower_expr) ----------------------
@@ -155,9 +197,8 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
-pub fn reopen(st: LowerSt, label: String) : LowerSt = match st {
-  LS(rc, bc, bs, _, _, fns, vs) -> LS(rc, bc, bs, label, [], fns, vs)
-}
+pub fn reopen(st: LowerSt, label: String) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
 
 # --- Type declarations --------------------------------------------------
 
@@ -210,12 +251,138 @@ pub fn lower_regions(rs: [RegionMark], acc: [KRegion]) : [KRegion] = match rs {
   [_, ...rest] -> lower_regions(rest, list_append(acc, [KRgn(list_length(acc), "region")]))
 }
 
-pub fn lower_params(ps: [Param], acc: [KParam]) : [KParam] = match ps {
+# Lower a fn / lambda parameter list. Each param is a `PDirect(i)` — the
+# i-th argument under whichever calling kind the enclosing `KFn` carries
+# (a normal fn's direct param, or a lambda/clause's `args[i]`).
+pub fn lower_params(ps: [Param], acc: [KParam]) : [KParam] =
+  lower_params_idx(ps, list_length(acc), acc)
+
+fn lower_params_idx(ps: [Param], i: Int, acc: [KParam]) : [KParam] = match ps {
   [] -> acc
   [p, ...rest] ->
-    lower_params(rest, list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: KOwn }]))
+    lower_params_idx(rest, i + 1,
+      list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: KOwn, origin: PDirect(i) }]))
 }
+
+# Build a capture param: the j-th closure capture, read from `self`.
+pub fn capture_param(name: String, j: Int) : KParam =
+  KParam { name: name, slot: SBoxed, mode: KOwn, origin: PCapture(j) }
 
 # A return / param slot from a type annotation. Conservative boxed until
 # the lowering consults the unbox classification.
 pub fn slot_of_ty(t: Option[TypeExpr]) : KSlot = SBoxed
+
+# Resolve a binary operator to its prim name. Arithmetic / comparison ops
+# map 1:1 to a runtime helper the translator knows (`+` → `kai_add`,
+# etc.), so the raw op string passes through. `++` is overloaded on the
+# operand type (string concat vs list append): resolve it HERE, in the
+# lowering, from the typed AST — the translator must not re-derive types
+# (§5). The operand `a` carries the typer-stamped `ty`.
+pub fn binop_prim(op: String, a: Expr) : String =
+  if op == "++" {
+    match a.ty { Some(TyListT(_)) -> "kai_prelude_list_append" _ -> "kai_string_concat" }
+  } else { op }
+
+# --- Callee classification (sentinel / perceus mark / ctor / direct) ----
+
+# How a named-call callee lowers. The dense `if/else if` chain over
+# sentinel + magic-name strings was a dispatch TABLE disguised as control
+# flow; promoting it to an enum + one pure classifier keeps the walk's
+# `lower_named_call` a flat `match` (cognitive-complexity discipline).
+pub type CalleeKind
+  = CkDup | CkDrop | CkBorrow | CkReuse
+  | CkTrmcStep | CkTrmcApply | CkTcrec | CkResume
+  | CkStripUnit
+  | CkCtor | CkDirect
+
+# Classify a bare callee name. Pure (no re-entry into `lower_expr`), so it
+# lives in the base. The order mirrors the old chain exactly: perceus
+# marks first, then the TRMC/tcrec sentinels, then resume, then the
+# uppercase-initial constructor heuristic, then an ordinary direct call.
+pub fn classify_callee(callee: String) : CalleeKind =
+  if callee == "__perceus_dup" { CkDup }
+  else if callee == "__perceus_drop" { CkDrop }
+  else if callee == "__perceus_borrow" { CkBorrow }
+  else if is_reuse_mark(callee) { CkReuse }
+  else if string_starts_with_q(callee, "__kai_trmc|") { CkTrmcStep }
+  else if callee == "__kai_trmc_apply" { CkTrmcApply }
+  else if es_tcrec_is_sentinel(callee) { CkTcrec }
+  else if callee == "resume" { CkResume }
+  else if callee == "__strip_unit" { CkStripUnit }
+  else if kir_name_is_ctor(callee) { CkCtor }
+  else { CkDirect }
+
+fn is_reuse_mark(callee: String) : Bool =
+  callee == "__perceus_reuse_variant" or callee == "__perceus_reuse_cons" or callee == "__perceus_reuse_record"
+
+# An effect op call `Eff.op` (the flat `EVar("Eff.op")` the op-call
+# desugar produces). Splits to (eff, op) iff the prefix before the first
+# `.` is a declared effect name; otherwise None (an ordinary call or a
+# qualified ctor like `Some.x`).
+pub type EffOp = EffOp(String, String)
+
+pub fn split_eff_op(callee: String, effs: [String]) : Option[EffOp] =
+  match dot_index(callee, 0, string_length(callee)) {
+    Some(i) -> {
+      let eff = string_slice(callee, 0, i)
+      if name_in_list(effs, eff) {
+        Some(EffOp(eff, string_slice(callee, i + 1, string_length(callee) - i - 1)))
+      } else { None }
+    }
+    None -> None
+  }
+
+# Index of the first `.` in `s`, or None. Local scan (the compiler's flat
+# namespace has no generic `string_index_of`).
+fn dot_index(s: String, i: Int, n: Int) : Option[Int] =
+  if i >= n { None }
+  else { match char_at(s, i) { Some('.') -> Some(i) _ -> dot_index(s, i + 1, n) } }
+
+# --- Effect default-handler install order (design §5) -------------------
+
+# The canonical install order for the built-in default handlers. The
+# single source of truth both backends must agree on (the C and LLVM
+# copies of this list drifting was the #1 effect divergence the KIR
+# closes — design §5). Reproduced here (a target-neutral list, not
+# analysis) so `KProgram.install_order` carries it once.
+pub fn kir_builtin_install_order() : [String] =
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Clock",
+   "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log",
+   "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
+
+# User-declared effects in main's row that are NOT builtin defaults go
+# after the builtins (so pop order mirrors reverse-declaration). Mirror of
+# emit_c's `user_effects_in_row`.
+pub fn kir_user_effects_in_row(main_row: [String]) : [String] = match main_row {
+  [] -> []
+  [x, ...rest] ->
+    if name_in_list(kir_builtin_install_order(), x) { kir_user_effects_in_row(rest) }
+    else { [x, ...kir_user_effects_in_row(rest)] }
+}
+
+# The full install order: builtins first, then main-row user effects.
+# `main_row_labels` (emit_shared) extracts main's effect row.
+pub fn kir_install_order(decls: [Decl]) : [String] =
+  list_append(kir_builtin_install_order(), kir_user_effects_in_row(main_row_labels(decls)))
+
+# --- Diagnostics --------------------------------------------------------
+
+# The surface name of an AST expression kind, for the loud "unhandled
+# node" trap (the Lane 0 silent-catch-all replacement). A local copy so
+# the lowering does not import `emit_llvm` (which would create a
+# lowering → emitter cycle — the emitter consumes KIR, never the other
+# way). Only the kinds that can plausibly reach a post-perceus AST need a
+# real name; the rest share a generic label.
+pub fn kir_expr_kind_name(k: ExprKind) : String = match k {
+  ELambda(_, _)     -> "ELambda"
+  EHandle(_, _, _, _, _, _, _) -> "EHandle"
+  ERecordLit(_, _)  -> "ERecordLit"
+  ERange(_, _, _)   -> "ERange"
+  EVariantsOf(_, _) -> "EVariantsOf"
+  EModCall(_, _)    -> "EModCall"
+  EBang(_)          -> "EBang"
+  EHole(_)          -> "EHole"
+  ETodo(_)          -> "ETodo"
+  EIntrinsic(_, _)  -> "EIntrinsic"
+  _                 -> "other"
+}

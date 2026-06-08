@@ -1,88 +1,90 @@
-# stdlib/collections/hashmap.kai — mutable hash table HashMap[k, v].
-#
-# The default associative collection for kaikai 1.0 (issue #374): a
-# mutable, separately-chained hash table behind the `Mutable` effect.
-# `Map[k, v]` (AVL, #128) remains the choice when you need ordered
-# iteration or a pure/persistent value; HashMap is what you reach for
-# when you want O(1)-average insert and lookup and are working inside
-# an effectful body anyway.
-#
-# Why mutable, not a pure HAMT. The first cut of #374 shipped a pure
-# persistent Hash Array Mapped Trie. It was correct but *slower* than
-# the AVL `Map` it was meant to replace — at N=10K, both build and
-# lookup ran ~2x behind the tree, because a persistent trie pays
-# allocation + structure-rebuild on every `put` and a list-indexed
-# walk on every level of every `get`. A HashMap slower than the tree
-# fails its whole reason to exist. The mutable table mutates one
-# bucket array in place: `put` is one hash + one chain splice, `get`
-# is one hash + one short chain scan. Measured at N=10K / 1M lookups,
-# the mutable table beats the AVL `Map` ~2-2.5x on both build and
-# lookup. Mutation rides the `Mutable` effect so it is visible in the
-# type — `put`/`remove` carry `/ Mutable`, the read ops do too (they
-# dereference the table's `Ref` cells).
-#
-# Conventions:
-#   - **Mutating, not persistent.** `hashmap_put` / `hashmap_remove`
-#     mutate the table in place and return `Unit`. There is no
-#     structural sharing and no "old version" after a write — the
-#     handle you hold sees every later mutation. This is the opposite
-#     of `Map`, whose every op returns a fresh value. Aliasing two
-#     bindings to one `HashMap` aliases the same mutable table.
-#   - **Every op carries `/ Mutable`.** Even `hashmap_get` and
-#     `hashmap_size` read the table's `Ref` cells, so they demand the
-#     `Mutable` effect. The runtime installs a trivial default handler
-#     for any `main` row containing `Mutable`, so callers rarely write
-#     a handler — but the effect IS in the signature, by design (it is
-#     the source of truth that the value is a mutable location).
-#   - Key equality is structural via `==`; key hashing is the `Hash`
-#     protocol's `hash(key)`. The two MUST agree: `a == b` implies
-#     `hash(a) == hash(b)` — every stdlib `impl Hash` and
-#     `#[derive(Hash)]` upholds this. Keys that hash to the same
-#     bucket share a chain and are separated by `==`.
-#   - **Key-type support today: primitives + sum types; NOT records.**
-#     `Int`, `String`, `Real`, `Bool`, `Char` and user **sum types**
-#     with `impl Hash` + `impl Eq` dispatch through the generic
-#     boundary. User **records** do not yet: a record boxed through the
-#     `key: k` type variable reads runtime head tag 0, so `hash(key)`
-#     panics "no impl of Hash.hash for runtime head 0" even with
-#     `#[derive(Hash)]`. Compiler-side dispatch gap (see
-#     docs/lane-experience-issue-374.md); the AVL `Map` has the
-#     analogous gap on `<`. Lift a record key to a primitive id field.
-#   - **Iteration order is unspecified** (bucket order, which depends
-#     on `cap` and the hashes). It is NOT stable across resizes, and
-#     resize is triggered by load factor — so two tables with equal
-#     contents reached by different insertion counts may iterate
-#     differently. Use `Map` (AVL) if you need ordered iteration.
-#   - Negative hashes are fine: the bucket index normalises with
-#     `((h % cap) + cap) % cap`.
-#   - **No HashDoS mitigation in v1.** Keys are assumed
-#     non-adversarial (issue body, "Out of scope").
-#
-# Public surface (12 pub fns). Short module-relative names —
-# `hashmap.put(m, k, v)` under `import collections.hashmap`, the same
-# convention as `map`/`set`/`queue` (no redundant `hashmap.hashmap_*`,
-# no flat `hashmap_*` aliases). NOTE: the signatures diverge from the
-# issue body's PURE shapes (`put : HashMap`) — the mutable model is a
-# deliberate redesign (see the lane retro):
-#
-#   pub fn empty[k, v]()                          : HashMap[k, v] / Mutable
-#   pub fn size[k, v](m)                          : Int / Mutable
-#   pub fn is_empty[k, v](m)                      : Bool / Mutable
-#   pub fn get[k, v](m, key)                      : Option[v] / Mutable
-#   pub fn contains[k, v](m, key)                 : Bool / Mutable
-#   pub fn put[k, v](m, key, value)              : Unit / Mutable
-#   pub fn remove[k, v](m, key)                   : Unit / Mutable
-#   pub fn keys[k, v](m)                          : [k] / Mutable
-#   pub fn values[k, v](m)                        : [v] / Mutable
-#   pub fn to_pairs[k, v](m)                      : [Pair[k, v]] / Mutable
-#   pub fn from_pairs[k, v](ps)                   : HashMap[k, v] / Mutable
-#   pub fn merge[k, v](a, b)                      : Unit / Mutable  -- b folded into a, a wins
-#
-# The `m[key]` read-side indexing sugar dispatches to `hashmap.get`
-# (returns `Option[v]`, carries `/ Mutable`): the typer's `synth_index`
-# lowers `m[key]` to `hashmap.get(m, key)` when `m`'s inferred type is
-# `HashMap`, exactly as it does `map.get` for `Map`. The write-side
-# `m[key] := v` is NOT provided — use `hashmap.put`.
+#[doc("""
+stdlib/collections/hashmap.kai — mutable hash table HashMap[k, v].
+
+The default associative collection for kaikai 1.0 (issue #374): a
+mutable, separately-chained hash table behind the `Mutable` effect.
+`Map[k, v]` (AVL, #128) remains the choice when you need ordered
+iteration or a pure/persistent value; HashMap is what you reach for
+when you want O(1)-average insert and lookup and are working inside
+an effectful body anyway.
+
+Why mutable, not a pure HAMT. The first cut of #374 shipped a pure
+persistent Hash Array Mapped Trie. It was correct but *slower* than
+the AVL `Map` it was meant to replace — at N=10K, both build and
+lookup ran ~2x behind the tree, because a persistent trie pays
+allocation + structure-rebuild on every `put` and a list-indexed
+walk on every level of every `get`. A HashMap slower than the tree
+fails its whole reason to exist. The mutable table mutates one
+bucket array in place: `put` is one hash + one chain splice, `get`
+is one hash + one short chain scan. Measured at N=10K / 1M lookups,
+the mutable table beats the AVL `Map` ~2-2.5x on both build and
+lookup. Mutation rides the `Mutable` effect so it is visible in the
+type — `put`/`remove` carry `/ Mutable`, the read ops do too (they
+dereference the table's `Ref` cells).
+
+Conventions:
+  - **Mutating, not persistent.** `hashmap_put` / `hashmap_remove`
+    mutate the table in place and return `Unit`. There is no
+    structural sharing and no "old version" after a write — the
+    handle you hold sees every later mutation. This is the opposite
+    of `Map`, whose every op returns a fresh value. Aliasing two
+    bindings to one `HashMap` aliases the same mutable table.
+  - **Every op carries `/ Mutable`.** Even `hashmap_get` and
+    `hashmap_size` read the table's `Ref` cells, so they demand the
+    `Mutable` effect. The runtime installs a trivial default handler
+    for any `main` row containing `Mutable`, so callers rarely write
+    a handler — but the effect IS in the signature, by design (it is
+    the source of truth that the value is a mutable location).
+  - Key equality is structural via `==`; key hashing is the `Hash`
+    protocol's `hash(key)`. The two MUST agree: `a == b` implies
+    `hash(a) == hash(b)` — every stdlib `impl Hash` and
+    `#[derive(Hash)]` upholds this. Keys that hash to the same
+    bucket share a chain and are separated by `==`.
+  - **Key-type support today: primitives + sum types; NOT records.**
+    `Int`, `String`, `Real`, `Bool`, `Char` and user **sum types**
+    with `impl Hash` + `impl Eq` dispatch through the generic
+    boundary. User **records** do not yet: a record boxed through the
+    `key: k` type variable reads runtime head tag 0, so `hash(key)`
+    panics "no impl of Hash.hash for runtime head 0" even with
+    `#[derive(Hash)]`. Compiler-side dispatch gap (see
+    docs/lane-experience-issue-374.md); the AVL `Map` has the
+    analogous gap on `<`. Lift a record key to a primitive id field.
+  - **Iteration order is unspecified** (bucket order, which depends
+    on `cap` and the hashes). It is NOT stable across resizes, and
+    resize is triggered by load factor — so two tables with equal
+    contents reached by different insertion counts may iterate
+    differently. Use `Map` (AVL) if you need ordered iteration.
+  - Negative hashes are fine: the bucket index normalises with
+    `((h % cap) + cap) % cap`.
+  - **No HashDoS mitigation in v1.** Keys are assumed
+    non-adversarial (issue body, "Out of scope").
+
+Public surface (12 pub fns). Short module-relative names —
+`hashmap.put(m, k, v)` under `import collections.hashmap`, the same
+convention as `map`/`set`/`queue` (no redundant `hashmap.hashmap_*`,
+no flat `hashmap_*` aliases). NOTE: the signatures diverge from the
+issue body's PURE shapes (`put : HashMap`) — the mutable model is a
+deliberate redesign (see the lane retro):
+
+  pub fn empty[k, v]()                          : HashMap[k, v] / Mutable
+  pub fn size[k, v](m)                          : Int / Mutable
+  pub fn is_empty[k, v](m)                      : Bool / Mutable
+  pub fn get[k, v](m, key)                      : Option[v] / Mutable
+  pub fn contains[k, v](m, key)                 : Bool / Mutable
+  pub fn put[k, v](m, key, value)              : Unit / Mutable
+  pub fn remove[k, v](m, key)                   : Unit / Mutable
+  pub fn keys[k, v](m)                          : [k] / Mutable
+  pub fn values[k, v](m)                        : [v] / Mutable
+  pub fn to_pairs[k, v](m)                      : [Pair[k, v]] / Mutable
+  pub fn from_pairs[k, v](ps)                   : HashMap[k, v] / Mutable
+  pub fn merge[k, v](a, b)                      : Unit / Mutable  -- b folded into a, a wins
+
+The `m[key]` read-side indexing sugar dispatches to `hashmap.get`
+(returns `Option[v]`, carries `/ Mutable`): the typer's `synth_index`
+lowers `m[key]` to `hashmap.get(m, key)` when `m`'s inferred type is
+`HashMap`, exactly as it does `map.get` for `Map`. The write-side
+`m[key] := v` is NOT provided — use `hashmap.put`.
+""")]
 
 # ---- Carrier -----------------------------------------------------
 #

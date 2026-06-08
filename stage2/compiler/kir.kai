@@ -76,6 +76,10 @@ pub type KVal
 # `SIInt64`; LLVM emits the i64 store. Neither translator re-derives it.
 pub type KSlotInit = SIBoxed(KVal) | SIInt64(KVal) | SIReal(KVal)
 
+# One record-literal field: its name + the value atom. The translator
+# emits the parallel value/name buffers `kai_record` consumes.
+pub type KFieldInit = KFI(String, KVal)
+
 # --- Ops: the RHS of a binding; all operands are atoms (design §4.4) ----
 
 pub type KOp
@@ -83,12 +87,13 @@ pub type KOp
   | KCallIndirect(KVal, [KVal])                 # closure / function value
   | KPrim(String, [KVal])                       # inline builtins (+, -, ==, kai_intf, ...)
   | KCon(String, Int, [KSlotInit])              # constructor: ctor name, tag, slot inits
+  | KRecord([KFieldInit])                       # record literal: (field name, value) pairs
   | KConReuse(KVal, String, Int, [KSlotInit])   # reuse-in-place: donor, ctor, tag, inits (ex __perceus_reuse_*)
   | KProj(KVal, Int)                            # read slot i of a value (= kai_variant_at)
   | KTagOf(KVal)                                # read the variant tag (scrutinee for KSwitch)
-  | KClosure(String, [KVal])                    # thunk sym + precomputed captures (what fv_* resolves today)
+  | KClosure(String, Int, [KVal])               # thunk sym + arity + precomputed captures (what fv_* resolves today)
   | KPerform(String, String, [KVal])            # invoke an effect op: effect, op, args (raises to handler)
-  | KInstallHandler(String, String, String)     # install a handler: effect, handler sym, body-thunk sym
+  | KSetjmp(String)                             # set a handler landing pad; yields i32 (0 = body path, !=0 = longjmp return)
   | KLitOp(KVal)                                 # a bare atom as an op RHS (e.g. `let t = 3`)
 
 # --- Perceus RC ops (design §4.7) — first-class, NOT annotations --------
@@ -112,6 +117,14 @@ pub type KStmt
   | KDo(KOp, KPos)                   # effectful op, result discarded
   | KRC(KRCOp, KPos)                 # explicit Perceus op
   | KStore(String, KVal, KPos)       # slot mutation (TCO/TRMC loop assigns, Array writes / Mutable)
+  # Effect handler frame markers (design §4.7 effects). `KInstall` pushes
+  # the evidence for `eff` (handler decl `sym`, optional state `init` /
+  # `as`-alias) before the handle body runs; `KPop` pops it on the normal
+  # exit path. They are EXPLICIT markers (not folded into one opaque node)
+  # so the setjmp split lives as an ordinary `KCondBr` both backends read
+  # identically (asu review — the frontier-bug the KIR exists to kill).
+  | KInstall(String, String, Option[KVal], Option[String], KPos)
+  | KPop(String, KPos)               # pop the evidence for `eff`
 
 # --- Terminators: end a block, name successors (design §4.2) ------------
 
@@ -151,14 +164,33 @@ pub type KCase = KC(Int, String)   # tag value → target label
 pub type KBlock = { label: String, stmts: [KStmt], term: KTerm,
                     region_id: Option[Int] }
 
-pub type KParam = { name: String, slot: KSlot, mode: KMode }
+# How a function is called, a structural property of the symbol (NOT a
+# prologue the backend re-recognises). A normal fn takes its params
+# directly; a lambda and a clause take the thunk ABI `(self, args, n[, k])`
+# and read params/captures/evidence/resume by index. The per-kind print
+# rule materialises the frame; the block bodies are identical in shape
+# across kinds (asu review: calling convention = proc metadata).
+pub type KFnKind = KFnNormal | KFnLambda | KFnClause
 
-# A lowered function: resolved symbol, params, return slot, the block
-# list (entry block first), and whether it is a handler thunk (effect
-# clause body) so the translator can pick the right frame shape.
-pub type KFn = { sym: String, params: [KParam], ret: KSlot,
-                 blocks: [KBlock], is_handler_thunk: Bool,
-                 region_id: Option[Int] }
+# Where a param's value comes from under the thunk ABI. `PDirect(i)` is
+# the ordinary i-th argument (also used by lambda/clause `args[i]`);
+# `PCapture(i)` reads the i-th closure capture from `self`; `PEvidence(i)`
+# reads a handler-evidence field; `PResume` is the one-shot continuation a
+# clause receives. The index is resolved ONCE in the lowering (from
+# `LamInfo.caps` / the clause shape) so no backend re-derives it (§5).
+pub type KParamOrigin = PDirect(Int) | PCapture(Int) | PEvidence(Int) | PResume
+
+# `self` / `args` / `n` are artefacts of the thunk convention the `kind`
+# print-rule emits — never KIR params or atoms. `resume` IS a param
+# (`PResume`): the clause body uses it, so it must enter Perceus's use
+# analysis to stay one-shot.
+pub type KParam = { name: String, slot: KSlot, mode: KMode, origin: KParamOrigin }
+
+# A lowered function: resolved symbol, calling kind, params, return slot,
+# the block list (entry block first). The `kind` tells the backend which
+# frame ABI to emit; `KFnClause` subsumes the old `is_handler_thunk`.
+pub type KFn = { sym: String, kind: KFnKind, params: [KParam], ret: KSlot,
+                 blocks: [KBlock], region_id: Option[Int] }
 
 # --- Type declarations (design §4.1) -----------------------------------
 

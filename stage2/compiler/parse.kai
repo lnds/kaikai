@@ -72,6 +72,7 @@ import compiler.diag
 import compiler.lex
 import compiler.ast
 import compiler.refinements
+import compiler.doc_attr
 
 # ====================================================================
 # parser state
@@ -5563,9 +5564,10 @@ fn parse_impl_methods(p: Parser, acc: [Decl]) : PImplMethods / Console {
 # emits `TkHashOpen` and the caller has advanced past it. Reads the
 # identifier inside the brackets, expects the matching `]`, and routes
 # to the appropriate inner-decl parser. Known attributes today: `derive`
-# (with parenthesised protocol list) and `unstable` (flag form). Unknown
-# attributes parse cleanly (forward-compat for future `#[doc(...)]`,
-# `#[deprecated]`, custom user attributes) and are dropped from the AST.
+# (with parenthesised protocol list), `unstable` (flag form), and `doc`
+# (string argument, issue #681). Unknown attributes parse cleanly
+# (forward-compat for `#[deprecated]`, custom user attributes) and are
+# dropped from the AST.
 fn parse_attribute_decl(p: Parser, hash_tok: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
@@ -5579,6 +5581,8 @@ fn parse_attribute_decl(p: Parser, hash_tok: Token) : PDecl / Console {
       parse_attr_derive_body(p1, hash_tok)
     } else if name == "unstable" {
       parse_attr_unstable_body(p1, hash_tok)
+    } else if name == "doc" {
+      parse_attr_doc_body(p1, hash_tok)
     } else {
       parse_attr_unknown_body(p1, name, hash_tok)
     }
@@ -5636,11 +5640,98 @@ fn parse_attr_unstable_body(p: Parser, hash_tok: Token) : PDecl / Console {
   }
 }
 
-# Forward-compat: unknown attributes (`#[doc("...")]`, `#[deprecated]`,
+# Issue #681: `#[doc("...")]` / `#[doc("""...""")]`. The ident and
+# TkHashOpen have already been consumed; `p` points at the `(`. Only
+# the string-argument forms are accepted — bare-flag (`hidden`) and
+# key-value (`alias = "..."`, `since = "..."`) forms are Phase 3.
+# The doc body is captured verbatim from the literal (no escape
+# decoding — it is CommonMark, not a kaikai string), with surrounding
+# whitespace stripped; the full `#[doc(...)]` byte span rides along
+# so `kai fmt` can re-emit it byte-identical.
+fn parse_attr_doc_body(p: Parser, hash_tok: Token) : PDecl / Console {
+
+  if not p_at(p, TkLparen) {
+    err_d(p_error_here(p, "expected `(` after `#[doc` — the doc attribute takes one string argument"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    let st = p_peek(p1)
+    if not tk_is(st.kind, TkString) {
+      err_d(p_error(p1, st, "expected a string literal in `#[doc(...)]` — bare-flag and key-value forms (`hidden`, `alias = ...`, `since = ...`) are not supported yet"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      if not p_at(p2, TkRparen) {
+        err_d(p_error_here(p2, "expected `)` to close `#[doc(...)]` — the doc attribute takes exactly one string argument"))
+      } else {
+        let p3 = p_advance(p2)
+        if not p_at(p3, TkRbracket) {
+          err_d(p_error_here(p3, "expected `]` to close `#[doc(...)]`"))
+        } else {
+          let close = p_peek(p3)
+          let p4 = p_advance(p3)
+          let raw = string_slice(p.src, hash_tok.start,
+                                 (close.start + close.length) - hash_tok.start)
+          let text = doc_text_normalize(doc_unquote(tok_source(p.src, st)))
+          finish_doc_attr(p4, raw, text, hash_tok)
+        }
+      }
+    }
+  }
+}
+
+# Module-vs-item resolution for a just-parsed `#[doc(...)]`. The rule
+# (issue #681): the doc documents the declaration that starts on the
+# next line (or the same line) — at most one intervening newline and a
+# declaration-head token. Anything else (blank line, `import`, EOF,
+# a non-decl token) makes it the module doc. A second module-position
+# doc is rejected later by `doc_strip_collect`, which also strips the
+# wrappers built here into the doc side table.
+fn finish_doc_attr(p: Parser, raw: String, text: String, t: Token) : PDecl / Console {
+
+  let nl = p_count_newlines(p, 0)
+  let ph = p_skip_newlines(p)
+  if nl <= 1 and doc_head_starts_decl(p_peek(ph).kind) {
+    let inner = parse_decl(ph)
+    match inner.r {
+      None -> err_d(inner.p)
+      Some(d) -> match d {
+        DDoc(_, _, _, il, ic) -> {
+          diag_error_from_src(ph.file, ph.src, il, ic,
+            "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute")
+          err_d(p_mark_err(inner.p))
+        }
+        _ -> ok_d(inner.p, DDoc(raw, text, d, t.line, t.col))
+      }
+    }
+  } else {
+    ok_d(p, DModuleDoc(raw, text, t.line, t.col))
+  }
+}
+
+fn p_count_newlines(p: Parser, acc: Int) : Int {
+  if p_at(p, TkNewline) { p_count_newlines(p_advance(p), acc + 1) } else { acc }
+}
+
+fn doc_head_starts_decl(k: TokKind) : Bool {
+  match k {
+    TkPub -> true
+    TkFn -> true
+    TkType -> true
+    TkConst -> true
+    TkEffect -> true
+    TkProtocol -> true
+    TkAxiom -> true
+    TkImpl -> true
+    TkExtern -> true
+    TkHashOpen -> true
+    _ -> false
+  }
+}
+
+# Forward-compat: unknown attributes (`#[deprecated]`,
 # `#[cfg(...)]`, custom user attributes). Consume the optional argument
 # list and the closing `]`, then return whatever decl follows untouched.
-# The attribute itself is dropped — only `derive` and `unstable` have
-# downstream semantics in this lane.
+# The attribute itself is dropped — only `derive`, `unstable`, and
+# `doc` have downstream semantics.
 fn parse_attr_unknown_body(p: Parser, name: String, hash_tok: Token) : PDecl / Console {
 
   let p_args = if p_at(p, TkLparen) {

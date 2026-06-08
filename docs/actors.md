@@ -704,10 +704,17 @@ worker so a crash is observable via `MonitorDown`.
 The v1 surface specified above is **shipped** as of 2026-04-30
 (R2 scheduler v0.4.0 + Monitor / spawn_actor / trap-exit Tier 2
 retrofit at v0.5.0). `stdlib/actor.kai` exposes `spawn_actor`,
-`spawn_actor_default`, and `with_mailbox` against the m8.x
-runtime; `examples/effects/m8_monitor.kai`, `m8_trap_exit.kai`,
-`m8x_4_recv_blocking.kai`, and `demos/ping_pong/` exercise the
-full mailbox + supervision surface.
+`spawn_actor_policy` (explicit `MailboxPolicy` on the spawned
+actor's mailbox — issue #763), `with_mailbox`, and
+`with_mailbox_policy` against the m8.x runtime;
+`examples/effects/m8_monitor.kai`, `m8_trap_exit.kai`,
+`m8x_4_recv_blocking.kai`,
+`issue_763_spawn_actor_policy_block_sender.kai`, and
+`demos/ping_pong/` exercise the full mailbox + supervision
+surface. (`spawn_actor_default` and the nursery-parameter
+signature specified above remain open — today's stdlib shape is
+`spawn_actor[_policy]([policy,] body)` without the `n:`
+argument or the `ActorCap` as-binding.)
 
 Open work after v1:
 

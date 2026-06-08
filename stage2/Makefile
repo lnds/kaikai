@@ -46,7 +46,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_walk.kai compiler/kir_dump.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/doc_attr.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -71,7 +71,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-trace test-trace-asan test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-shadowing test-modular-build test-packages test-kir
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-trace test-trace-asan test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir
 
 all: $(TARGET)
 
@@ -2243,6 +2243,20 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Bounded(_, BlockSender) parks sender on full; receiver wakeup unblocks)" \
 	    || { echo "effects FAIL $$name (block-sender output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/issue_763_spawn_actor_policy_block_sender.kai \
+	         ../examples/effects/issue_763_spawn_actor_policy_drop_oldest.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (spawn_actor_policy: explicit MailboxPolicy reaches the spawned actor's mailbox)" \
+	    || { echo "effects FAIL $$name (issue #763 spawn_actor_policy output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_trap_exit.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -4948,6 +4962,29 @@ test-attributes: $(TARGET) build
 	  fi; \
 	done
 
+# Issue #681 — #[doc(...)] attribute JSON surfaces. Three checks:
+#  (a) --doc-json golden: module_doc + per-item docs of the fixture
+#      (pinned byte-exact against doc_json_basic.doc.expected);
+#  (b) --holes-json carries the surrounding declaration's doc text;
+#  (c) --builtins-doc-json emits the core-module-set array.
+# The duplicate-doc / second-module-doc rejections live in
+# examples/negative/doc/ under tools/test-negative.sh.
+test-doc-attr: $(TARGET) build
+	@$(STACK) set -e; \
+	./$(TARGET) --doc-json ../examples/doc/doc_json_basic.kai > build/doc-json-basic.out; \
+	diff ../examples/doc/doc_json_basic.doc.expected build/doc-json-basic.out > /dev/null \
+	  && echo "doc-attr OK doc-json golden" \
+	  || { echo "doc-attr DIFF doc-json golden"; \
+	       diff ../examples/doc/doc_json_basic.doc.expected build/doc-json-basic.out; exit 1; }; \
+	./$(TARGET) --holes-json ../examples/doc/doc_holes.kai > build/doc-holes.json; \
+	grep -qF '"doc": "Documented holder of the probe hole."' build/doc-holes.json \
+	  && echo "doc-attr OK holes-json doc field" \
+	  || { echo "doc-attr FAIL holes-json doc field"; cat build/doc-holes.json; exit 1; }; \
+	./$(TARGET) --builtins-doc-json > build/builtins-doc.json; \
+	grep -qF '"module": "core/list"' build/builtins-doc.json \
+	  && echo "doc-attr OK builtins-doc-json" \
+	  || { echo "doc-attr FAIL builtins-doc-json"; exit 1; }
+
 # Issue #644 — ctor-overloading regression fixtures. Each .kai under
 # `examples/shadowing/` either compiles + runs to a known stdout
 # (positive cases — diffed against `<name>.out.expected`) or fails
@@ -5086,7 +5123,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-shadowing test-modular-build test-kir
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-kir
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
@@ -5127,7 +5164,7 @@ test-kir: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  fns=$$(cat ../examples/kir/$$name.kir.fns); \
 	  ./$(TARGET) --path ../stdlib --emit=kir $$f 2>/dev/null \
-	    | awk -v fns="$$fns" 'BEGIN{n=split(fns,a," ");for(i=1;i<=n;i++)w[a[i]]=1} /^fn /{nm=$$2;sub(/\(.*/,"",nm);cur=(nm in w)} cur{print} /^}/{if(cur){print "";cur=0}}' \
+	    | awk -v fns="$$fns" 'BEGIN{n=split(fns,a," ");for(i=1;i<=n;i++)w[a[i]]=1} /^fn |^lambda fn |^clause fn /{nm="";for(i=1;i<=NF;i++)if($$i ~ /\(/){nm=$$i;sub(/\(.*/,"",nm);break} cur=(nm in w)} cur{print} /^}/{if(cur){print "";cur=0}}' \
 	    > build/$$name.kir; \
 	  diff -q ../examples/kir/$$name.kir.expected build/$$name.kir > /dev/null \
 	    || { echo "kir DIFF $$name"; diff ../examples/kir/$$name.kir.expected build/$$name.kir; exit 1; }; \

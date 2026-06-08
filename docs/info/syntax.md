@@ -39,6 +39,35 @@ extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
 fn main() : Int = 0
 ```
 
+## Attributes
+
+Three `#[...]` meta-instructions exist: `#[derive(...)]`,
+`#[unstable]`, and `#[doc("...")]`. Attributes come BEFORE `pub`.
+
+```kaikai
+#[doc("Adds one to its argument.")]            # item doc, single line
+pub fn addone(x: Int) : Int = x + 1
+
+#[doc("""
+Multi-line doc. The body is CommonMark.
+""")]
+pub fn double(x: Int) : Int = x * 2
+
+#[derive(Eq, Show)]                            # structural impls
+pub type Color = Red | Green | Blue
+
+#[unstable]                                    # outside edition stability
+pub fn experimental() : Int = 0
+
+fn main() : Int = addone(double(20)) + experimental()
+```
+
+A `#[doc(...)]` at file top, separated from the first declaration by a
+blank line, is the **module doc** — at most one per file. One doc per
+item; `#[doc(hidden)]` / `alias` / `since` forms do not exist yet
+(post-1.0). Doc text is extracted by `kai info builtins --json`,
+`kaic2 --doc-json`, and rides typed-hole reports (`--holes-json`).
+
 ## Bindings
 
 ```kaikai
@@ -471,6 +500,11 @@ type Foo<T> = T                                # angle generics
 ```
 
 ```kaikai-neg
+/// Rust-style doc comment                     # no /// or //! docs
+pub fn documented() : Int = 1                  # (use #[doc("...")])
+```
+
+```kaikai-neg
 fn pick() : Int = null                         # no null
 ```
 
@@ -499,6 +533,7 @@ Use instead:
 - `do { ... }` → block body
 - `where x = ...` → `let` inside block
 - angle generics `Foo<T>` → bracket generics `Foo[T]` (angles are reserved for `Real<m>`)
+- `/// doc` / `//! doc` / `#: doc` → `#[doc("...")]` above the declaration
 - `null` / `undefined` / `nil` → `Option[T]`
 - `throw` / `try-catch` → `Fail` effect or `Result[e, a]` (with `expr!`)
 - `async` / `await` → `Spawn` effect (see `kai info fibers`)
