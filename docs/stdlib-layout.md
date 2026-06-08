@@ -268,7 +268,7 @@ stdlib/
     args.kai     (shipped via PR #131 + PR #143)
     process.kai  (shipped — closes #346; 4 public fns: `start`, `wait`, `kill`, `exit`)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
-  date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped, closes #767)
+  date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
   array.kai      pure (Array[T] / [T] bridge — shipped via #366)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
@@ -462,7 +462,7 @@ the only effectful fn is `today()`.
   deliberately non-reversible); `eq`/`cmp`/`lt`; ISO-8601
   `to_string` / strict `parse` (`YYYY-MM-DD`); bridge
   `from_walltime(t)` (UTC interpretation, documented not
-  configurable) and `today()` `/ Clock` *(shipped — closes #767)*.
+  configurable) and `today()` `/ Clock` *(shipped via PR #770 — closes #767)*.
   Out of scope v1: tzdata/DST, civil time-of-day, locales, ISO week
   dates, non-Gregorian calendars.
 
