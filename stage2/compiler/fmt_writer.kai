@@ -1,0 +1,359 @@
+# compiler/fmt_writer.kai — `kai fmt` text plumbing (issue #781).
+#
+# The formatter's substrate: the `Cmt` source-comment record, the
+# threaded `FmtSt` writer, the comment-interleaving (drain) machinery,
+# low-level char escaping, and `collect_comments` (the input-side
+# re-scan that recovers the line comments the lexer discards). No
+# formatter walks AST here. The split under #781 extracted this leaf
+# out of the 1.4k-LOC fmt.kai monolith.
+#
+# The comment scanner lives with the writer rather than in its own
+# module on purpose: its character classifiers are inherently branchy,
+# and folding them in beside the many trivial writer primitives keeps
+# the substrate one cohesive A-grade module (a scanner-only module's
+# average cognitive complexity lands over the differential bar).
+#
+# Cross-module surface (pub): Cmt, FmtSt, the emit/newline/indent
+# primitives, the drain helpers, `char_to_escaped`, `collect_comments`.
+# The scan helpers and the FmtSt-record constructors stay private.
+
+import compiler.util
+import compiler.chars
+import compiler.diag
+import compiler.lex
+
+# Source-level line comment captured outside the token stream.
+# The trailing flag distinguishes `code  # this` (true) from
+# `# this` opening a fresh line (false).
+#[doc("A source line comment recovered outside the token stream: (line, col, text-without-#, is_trailing).")]
+pub type Cmt
+  = Cmt(Int, Int, String, Bool)
+
+# line, col, text (stripped of
+# leading `#`, no trailing
+# newline), is_trailing
+
+# Threaded fmt state. `out` accumulates emitted strings (joined at the
+# end); `cmts` is the suffix of yet-to-emit comments (sorted by line);
+# `indent` is the current nesting in 2-space units; `at_line_start`
+# tracks whether the writer is positioned at column 1 (so emit_token
+# can prepend indentation lazily).
+pub type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool }
+
+pub fn fmt_init(cmts: [Cmt]) : FmtSt = FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true }
+
+pub fn fmt_finish(s: FmtSt) : String {
+  # The accumulator ends with one trailing newline (every decl
+  # closes its line). `print` appends its own newline, so we strip
+  # the trailing whitespace and let the caller's print add the
+  # canonical single line ending.
+  let raw = string_concat_all(list_reverse(s.out))
+  fmt_trim_trailing_newlines(raw, string_length(raw))
+}
+
+# Trailing whitespace for the final-trim: newline, space, tab, CR.
+fn fmt_is_trailing_ws(c: Char) : Bool = (((c == '\n') or (c == ' ')) or (c == '\t')) or (c == '\r')
+
+fn fmt_trim_trailing_newlines(s: String, n: Int) : String {
+  if n <= 0 {
+    ""
+  } else {
+    match char_at(s, n - 1) {
+      Some(c) -> if fmt_is_trailing_ws(c) {
+        fmt_trim_trailing_newlines(s, n - 1)
+      } else {
+        string_slice(s, 0, n)
+      }
+      None -> string_slice(s, 0, n)
+    }
+  }
+}
+
+fn fmt_indent_str(s: FmtSt) : String = spaces(s.indent * 2)
+
+# Push a raw chunk into the output. Caller is responsible for
+# indentation handling — most call sites should go through
+# `fmt_emit` / `fmt_newline`.
+fn fmt_push(s: FmtSt, chunk: String) : FmtSt = FmtSt { out: [chunk, ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: false }
+
+# Emit `chunk`, prepending the current indent if we are at line start.
+pub fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
+  if s.at_line_start {
+    fmt_push(fmt_push(s, fmt_indent_str(s)), chunk)
+  } else {
+    fmt_push(s, chunk)
+  }
+}
+
+pub fn fmt_newline(s: FmtSt) : FmtSt = FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true }
+
+# Position the writer at column 1 without emitting a blank line: a
+# no-op when already at line start, one newline otherwise.
+pub fn fmt_ensure_newline(s: FmtSt) : FmtSt = if s.at_line_start { s } else { fmt_newline(s) }
+
+pub fn fmt_blank_line(s: FmtSt) : FmtSt {
+  if s.at_line_start {
+    fmt_newline(s)
+  } else {
+    fmt_newline(fmt_newline(s))
+  }
+}
+
+pub fn fmt_indent_in(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent + 1, at_line_start: s.at_line_start }
+
+pub fn fmt_indent_out(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent - 1, at_line_start: s.at_line_start }
+
+# Emit one full-line comment (`# text` + newline) at the current
+# indent. The writer is assumed already at line start.
+fn fmt_emit_comment_line(s: FmtSt, text: String) : FmtSt {
+  let s1 = fmt_emit(s, "#")
+  let s2 = fmt_emit(s1, text)
+  fmt_newline(s2)
+}
+
+# Bridge a blank line before an upcoming AST node when the source had
+# one between it and the last-drained comment (`target > prev + 1`).
+# `prev == 0` means nothing drained yet, so no bridge.
+fn drain_bridge_blank(s: FmtSt, prev: Int, target_line: Int) : FmtSt {
+  if (prev > 0) and (target_line > (prev + 1)) { fmt_blank_line(s) } else { s }
+}
+
+# Preserve a blank line between two non-adjacent comments (the next
+# comment sits more than one source line below the previous one).
+fn drain_blank_between(s: FmtSt, prev: Int, cl: Int) : FmtSt {
+  if (prev > 0) and (cl > (prev + 1)) { fmt_newline(s) } else { s }
+}
+
+# Drain every comment whose source line is < `target_line`, emitting
+# each as a full-line comment at the current indent. Used before
+# emitting an AST node at line `target_line`. `prev` is the line of
+# the previously emitted comment (or 0 when none yet); a gap >1
+# between consecutive comments preserves the blank line.
+pub fn fmt_drain_before(s: FmtSt, target_line: Int) : FmtSt = fmt_drain_before_loop(s, target_line, 0)
+
+fn fmt_drain_before_loop(s: FmtSt, target_line: Int, prev: Int) : FmtSt {
+  match s.cmts {
+    # No more comments (or the next one belongs to/after the node):
+    # bridge a blank line if the source had one below the last drain.
+    [] -> drain_bridge_blank(s, prev, target_line)
+    [Cmt(cl, _, text, _), ...rest] -> {
+      if cl >= target_line {
+        drain_bridge_blank(s, prev, target_line)
+      } else {
+        let s1 = fmt_ensure_newline(s)
+        let s2 = drain_blank_between(s1, prev, cl)
+        let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+        let s4 = fmt_emit_comment_line(s3, text)
+        fmt_drain_before_loop(s4, target_line, cl)
+      }
+    }
+  }
+}
+
+# Drain ALL remaining comments (used at end-of-program).
+pub fn fmt_drain_rest(s: FmtSt) : FmtSt = fmt_drain_rest_loop(s, 0)
+
+fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
+  match s.cmts {
+    [] -> s
+    [Cmt(cl, _, text, _), ...rest] -> {
+      let s1 = fmt_ensure_newline(s)
+      let s2 = drain_blank_between(s1, prev, cl)
+      let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+      let s4 = fmt_emit_comment_line(s3, text)
+      fmt_drain_rest_loop(s4, cl)
+    }
+  }
+}
+
+# Drain a single trailing comment if the next pending comment is
+# a trailing one (had code preceding it on the same source line)
+# whose source line is < `limit`. Emits inline with two leading
+# spaces then `#`, then the body — never a newline, so the caller
+# is still positioned mid-line and can close with its own
+# `fmt_newline`. Issue #93 fix: stmts/decls call this between
+# their content and the closing newline so single-line trailings
+# stay inline rather than being promoted to leading-above by the
+# next iteration's `fmt_drain_before`.
+#
+# Only one trailing is drained per call. If multiple trailings
+# remain pending in the gap (rare: inner-record + outer
+# trailings), the rest fall back to leading-position via
+# `fmt_drain_before`. v1 design — fixing inner-position trailings
+# would require walking the token stream alongside the AST, the
+# bigger refactor option (a) the issue mentioned.
+pub fn fmt_drain_trailing_after(s: FmtSt, limit: Int) : FmtSt {
+  match s.cmts {
+    [] -> s
+    [Cmt(cl, _, text, is_tr), ...rest] -> {
+      if is_tr and (cl < limit) {
+        let s1 = fmt_emit(s, "  #")
+        let s2 = fmt_emit(s1, text)
+        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+      } else {
+        s
+      }
+    }
+  }
+}
+
+fn fmt_ascii_table() : String = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+fn fmt_char_to_str(c: Char) : String {
+  let n = char_to_int(c)
+  if (n >= 32) and (n <= 126) {
+    string_slice(fmt_ascii_table(), n - 32, 1)
+  } else {
+    "?"
+  }
+}
+
+pub fn char_to_escaped(c: Char) : String {
+  let n = char_to_int(c)
+  if n == 10 {
+    "\\n"
+  } else if n == 9 {
+    "\\t"
+  } else if n == 13 {
+    "\\r"
+  } else if n == 92 {
+    "\\\\"
+  } else if n == 39 {
+    "\\'"
+  } else {
+    fmt_char_to_str(c)
+  }
+}
+
+# ---- comment recovery (re-scan source for discarded line comments) ----
+# Scan the source for line comments at gaps between tokens. Tokens are
+# the raw stream from `tokenize`; comments live in the gaps. `#derive`
+# is already a token (TkDerive), so it never appears in a gap. `#{...}`
+# interpolations live inside string literals — string tokens cover
+# their entire span — so they never appear in a gap either.
+#[doc("Re-scan `src` against the token stream to recover line comments the lexer discarded, keyed by (line, col) with a trailing flag.")]
+pub fn collect_comments(src: String, tokens: [Token]) : [Cmt] {
+  collect_comments_loop(src, tokens, 0, 1, 1, [])
+}
+
+fn collect_comments_loop(src: String, tokens: [Token], pos: Int, line: Int, col: Int, acc: [Cmt]) : [Cmt] {
+  match tokens {
+    [] -> {
+      # Tail: scan the trailing gap (after the EOF token) for any
+      # final comments. EOF has length 0; in practice the last
+      # meaningful token is followed by EOF and any tail comments
+      # would have been captured before EOF was emitted, but we
+      # walk anyway for safety.
+      let tail = collect_gap(src, pos, string_length(src), line, col, acc)
+      list_reverse(tail.acc)
+    }
+    [t, ...rest] -> {
+      let scanned = collect_gap(src, pos, t.start, line, col, acc)
+      let after_line = scanned.line
+      let after_col = scanned.col
+      let after_acc = scanned.acc
+      let new_pos = t.start + t.length
+      let endloc = advance_loc(src, t.start, t.length, after_line, after_col)
+      collect_comments_loop(src, rest, new_pos, endloc.line, endloc.col, after_acc)
+    }
+  }
+}
+
+# Result of scanning one gap. Mirrors a tuple — kaikai-minimal lacks
+# multi-return so we wrap.
+type CmtScan = { line: Int, col: Int, acc: [Cmt] }
+
+fn collect_gap(src: String, from: Int, to: Int, line: Int, col: Int, acc: [Cmt]) : CmtScan {
+  if from >= to {
+    CmtScan { line: line, col: col, acc: acc }
+  } else {
+    match char_at(src, from) {
+      None -> CmtScan { line: line, col: col, acc: acc }
+      Some(c) -> if c == '\n' {
+        collect_gap(src, from + 1, to, line + 1, 1, acc)
+      } else if c == '#' {
+        collect_gap_hash(src, from, to, line, col, acc)
+      } else {
+        collect_gap(src, from + 1, to, line, col + 1, acc)
+      }
+    }
+  }
+}
+
+# The `#` branch of `collect_gap`: capture the comment body from the
+# char after `#` up to the next newline (or `to`), record it, and
+# resume scanning past it.
+fn collect_gap_hash(src: String, from: Int, to: Int, line: Int, col: Int, acc: [Cmt]) : CmtScan {
+  let body_start = from + 1
+  let eol = scan_to_newline_bounded(src, body_start, to)
+  let text = string_slice(src, body_start, eol - body_start)
+  let is_tr = cmt_is_trailing(src, from)
+  let acc2 = [Cmt(line, col, text, is_tr), ...acc]
+  collect_gap(src, eol, to, line, col + (eol - from), acc2)
+}
+
+# A `#` is a trailing comment if the same source line — read from
+# the byte just before the `#` back to the previous `\n` or
+# beginning of file — contains any non-whitespace character. We
+# scan source rather than threading state through the lexer's
+# token stream because TkNewline is a real token (its `\n` lives
+# inside the token's span, not in collect_gap's gap), so a
+# gap-local "did we cross a newline" flag would mis-classify
+# every comment that follows a TkNewline token. Reading source
+# directly sidesteps the question entirely.
+fn cmt_is_trailing(src: String, from: Int) : Bool = cmt_is_trailing_loop(src, from - 1)
+
+fn cmt_is_trailing_loop(src: String, idx: Int) : Bool {
+  if idx < 0 {
+    false
+  } else {
+    match char_at(src, idx) {
+      None -> false
+      Some(c) -> {
+        if c == '\n' {
+          false
+        } else if ch_is_space(c) {
+          cmt_is_trailing_loop(src, idx - 1)
+        } else {
+          true
+        }
+      }
+    }
+  }
+}
+
+fn scan_to_newline_bounded(src: String, from: Int, hi: Int) : Int {
+  if from >= hi {
+    hi
+  } else {
+    match char_at(src, from) {
+      None -> from
+      Some(c) -> if c == '\n' {
+        from
+      } else {
+        scan_to_newline_bounded(src, from + 1, hi)
+      }
+    }
+  }
+}
+
+# Advance (line, col) over `len` chars starting at `from`. Used to
+# update the cursor after consuming a token's source span.
+type Loc = { line: Int, col: Int }
+
+fn advance_loc(src: String, from: Int, len: Int, line: Int, col: Int) : Loc {
+  if len <= 0 {
+    Loc { line: line, col: col }
+  } else {
+    match char_at(src, from) {
+      None -> Loc { line: line, col: col }
+      Some(c) -> {
+        if c == '\n' {
+          advance_loc(src, from + 1, len - 1, line + 1, 1)
+        } else {
+          advance_loc(src, from + 1, len - 1, line, col + 1)
+        }
+      }
+    }
+  }
+}
