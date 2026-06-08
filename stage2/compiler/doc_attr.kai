@@ -1,0 +1,244 @@
+# compiler/doc_attr.kai — `#[doc("...")]` documentation attribute
+# support (issue #681, Phase 1).
+#
+# The parser wraps a documented declaration in `DDoc` and a
+# module-position doc in `DModuleDoc` (see compiler/ast.kai). This
+# module owns everything that happens to those wrappers after parse:
+#
+# - doc_unquote / doc_text_normalize — turn the raw string-literal
+#   span into the canonical doc text (quotes off, surrounding
+#   whitespace stripped, internal newlines preserved, escapes kept
+#   verbatim — doc bodies are CommonMark, not kaikai strings).
+# - doc_strip_collect / doc_strip_all — single post-parse walk that
+#   strips `DDoc` wrappers into a `DocItem` side table, resolves the
+#   module doc, and rejects a second module-position `#[doc(...)]`
+#   with a typed error at the second occurrence. After this pass no
+#   pipeline stage beyond the formatter ever sees a doc wrapper.
+# - doc_module_doc_text / doc_drop_module_doc — the two helpers the
+#   typer entry points use to lift the root file's module doc into
+#   `TypedProgram.module_doc` and drop the carrier decl.
+# - doc_for_line — "surrounding declaration" lookup for --holes-json:
+#   the closest item at or above a source line.
+# - doc_item_json / doc_module_json / doc_builtins_json — stable JSON
+#   rendering for `--doc-json` and `kai info builtins --json`.
+#
+# Cross-module dependencies: ast (Decl shapes), diag (typed errors),
+# util (string helpers + JSON escaping). No parse / infer import —
+# parse.kai and infer.kai both import THIS module, so it stays a leaf.
+#
+# Single-line `#[doc(...)]` only in this file — kaic1 consumes the
+# concatenated bundle and treats `#[...]` as a line comment, so
+# triple-quoted attribute bodies are off-limits inside stage2/.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+
+# ---- doc text helpers ----
+
+#[doc("Strip the surrounding quotes from a raw string-literal span (single or triple).")]
+pub fn doc_unquote(span: String) : String {
+  let n = string_length(span)
+  if n >= 6 and string_slice(span, 0, 3) == "\"\"\"" {
+    string_slice(span, 3, n - 6)
+  } else if n >= 2 {
+    string_slice(span, 1, n - 2)
+  } else { span }
+}
+
+fn doc_is_ws(c: Char) : Bool {
+  match c {
+    ' '  -> true
+    '\t' -> true
+    '\n' -> true
+    '\r' -> true
+    _    -> false
+  }
+}
+
+fn doc_trim_start(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if doc_is_ws(c) { doc_trim_start(s, i + 1, n) } else { i }
+      None -> i
+    }
+  }
+}
+
+fn doc_trim_end(s: String, j: Int) : Int {
+  if j <= 0 { j }
+  else {
+    match char_at(s, j - 1) {
+      Some(c) -> if doc_is_ws(c) { doc_trim_end(s, j - 1) } else { j }
+      None -> j
+    }
+  }
+}
+
+#[doc("Normalise a doc body: strip surrounding whitespace, preserve internal newlines.")]
+pub fn doc_text_normalize(s: String) : String {
+  let n = string_length(s)
+  let i = doc_trim_start(s, 0, n)
+  let j = doc_trim_end(s, n)
+  if i >= j { "" } else { string_slice(s, i, j - i) }
+}
+
+# ---- side table ----
+
+# One top-level named declaration, documented or not. Undocumented
+# items still get an entry (doc: None) so doc_for_line can use them
+# as boundaries and the JSON dumps can report coverage.
+pub type DocItem = { kind: String, name: String, line: Int, is_pub: Bool, doc: Option[String] }
+
+# Result of the post-parse strip walk.
+pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int }
+
+#[doc("DocItem for a named declaration, seeing through DUnstable / DDerive / DDoc wrappers. None for unnamed decls (tests, imports, impls...).")]
+pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
+  match d {
+    DFn(p, nm, _, _, _, _, _, ln, _, _)    -> Some(doc_item(p, "fn", nm, ln, doc))
+    DType(p, nm, _, _, ln, _, _)           -> Some(doc_item(p, "type", nm, ln, doc))
+    DEffect(p, nm, _, _, _, ln, _)         -> Some(doc_item(p, "effect", nm, ln, doc))
+    DProtocol(p, nm, _, _, ln, _)          -> Some(doc_item(p, "protocol", nm, ln, doc))
+    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", nm, ln, doc))
+    DConst(p, nm, _, _, _, ln, _)          -> Some(doc_item(p, "const", nm, ln, doc))
+    DUnstable(inner, _, _)                 -> doc_item_of(inner, doc)
+    DDerive(_, inner, _, _)                -> doc_item_of(inner, doc)
+    DDoc(_, _, inner, _, _)                -> doc_item_of(inner, doc)
+    _ -> None
+  }
+}
+
+fn doc_item(is_pub: Bool, kind: String, name: String, line: Int, doc: Option[String]) : DocItem =
+  DocItem { kind: kind, name: name, line: line, is_pub: is_pub, doc: doc }
+
+#[doc("Post-parse strip for the root file: unwrap DDoc into the side table, keep the first DModuleDoc decl in the stream for the typer.")]
+pub fn doc_strip_collect(file: String, src: String, decls: [Decl]) : DocStrip / Console =
+  dsc_loop(file, src, decls, true, [], [], None, 0)
+
+#[doc("Post-parse strip for imported / prelude modules: same walk, but module docs are dropped from the stream too (Phase 2 will collect them).")]
+pub fn doc_strip_all(file: String, src: String, decls: [Decl]) : DocStrip / Console =
+  dsc_loop(file, src, decls, false, [], [], None, 0)
+
+fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
+            acc: [Decl], items: [DocItem], module_doc: Option[String],
+            errs: Int) : DocStrip / Console {
+  match ds {
+    [] -> DocStrip { decls: list_reverse(acc), module_doc: module_doc,
+                     items: list_reverse(items), errs: errs }
+    [d, ...rest] -> match d {
+      DDoc(_, text, inner, _, _) ->
+        dsc_loop(file, src, rest, keep_mod, [inner, ...acc],
+                 dsc_push_item(items, inner, Some(text)), module_doc, errs)
+      DModuleDoc(_, text, ln, col) ->
+        dsc_module_arm(file, src, d, text, ln, col, rest, keep_mod,
+                       acc, items, module_doc, errs)
+      _ ->
+        dsc_loop(file, src, rest, keep_mod, [d, ...acc],
+                 dsc_push_item(items, d, None), module_doc, errs)
+    }
+  }
+}
+
+# The DModuleDoc arm of dsc_loop: the first module doc is recorded
+# (and its carrier decl kept only on the root path); a second one is
+# a typed error at the second occurrence, and the carrier is dropped.
+fn dsc_module_arm(file: String, src: String, d: Decl, text: String,
+                  ln: Int, col: Int, rest: [Decl], keep_mod: Bool,
+                  acc: [Decl], items: [DocItem], module_doc: Option[String],
+                  errs: Int) : DocStrip / Console {
+  match module_doc {
+    None ->
+      dsc_loop(file, src, rest, keep_mod,
+               if keep_mod { [d, ...acc] } else { acc },
+               items, Some(text), errs)
+    Some(_) -> {
+      diag_error_from_src(file, src, ln, col,
+        "second module-level `#[doc(...)]` — a file has at most one module doc (a `#[doc(...)]` not directly above a declaration is the module doc)")
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
+    }
+  }
+}
+
+fn dsc_push_item(items: [DocItem], d: Decl, doc: Option[String]) : [DocItem] {
+  match doc_item_of(d, doc) {
+    Some(it) -> [it, ...items]
+    None -> items
+  }
+}
+
+# ---- queries ----
+
+#[doc("First module-level doc text in the decl stream, if any.")]
+pub fn doc_module_doc_text(decls: [Decl]) : Option[String] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DModuleDoc(_, text, _, _) -> Some(text)
+      _ -> doc_module_doc_text(rest)
+    }
+  }
+}
+
+#[doc("Drop every DModuleDoc carrier from the decl stream.")]
+pub fn doc_drop_module_doc(decls: [Decl]) : [Decl] =
+  ddm_loop(decls, [])
+
+fn ddm_loop(ds: [Decl], acc: [Decl]) : [Decl] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DModuleDoc(_, _, _, _) -> ddm_loop(rest, acc)
+      _ -> ddm_loop(rest, [d, ...acc])
+    }
+  }
+}
+
+#[doc("Doc of the closest item declared at or above `line` — the hole's surrounding declaration. Items must be in source order.")]
+pub fn doc_for_line(items: [DocItem], line: Int) : Option[String] =
+  dfl_loop(items, line, None)
+
+fn dfl_loop(items: [DocItem], line: Int, best: Option[String]) : Option[String] {
+  match items {
+    [] -> best
+    [it, ...rest] ->
+      if it.line <= line { dfl_loop(rest, line, it.doc) }
+      else { best }
+  }
+}
+
+# ---- JSON rendering ----
+
+fn json_opt_str(o: Option[String]) : String {
+  match o {
+    Some(s) -> json_quote(s)
+    None -> "null"
+  }
+}
+
+fn json_bool(b: Bool) : String = if b { "true" } else { "false" }
+
+#[doc("One DocItem as a stable JSON object: kind, name, line, pub, doc (null when undocumented).")]
+pub fn doc_item_json(it: DocItem) : String =
+  concat_all([
+    "{\"kind\": ", json_quote(it.kind),
+    ", \"name\": ", json_quote(it.name),
+    ", \"line\": ", int_to_string(it.line),
+    ", \"pub\": ", json_bool(it.is_pub),
+    ", \"doc\": ", json_opt_str(it.doc),
+    "}"
+  ])
+
+#[doc("One module's doc tree as JSON: module name, module_doc, items array.")]
+pub fn doc_module_json(module: String, module_doc: Option[String], items: [DocItem]) : String =
+  concat_all([
+    "{\"module\": ", json_quote(module),
+    ", \"module_doc\": ", json_opt_str(module_doc),
+    ", \"items\": [", join_with(map(items, doc_item_json), ", "), "]",
+    "}"
+  ])
+
+#[doc("Assemble per-module JSON objects into the final builtins array.")]
+pub fn doc_builtins_json(mods: [String]) : String =
+  concat_all(["[", join_with(mods, ", "), "]"])
