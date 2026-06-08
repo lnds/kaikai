@@ -4,8 +4,11 @@
 main; lowering-completion (interp/closures/effects) in progress. Lane 1
 (in-process libLLVM backend) is the destination, not yet started.
 **Scope:** stage 2 only. Does not touch the bootstrap contract (stages 0–1 keep
-emitting portable C from any `cc`); the in-process libLLVM backend is opt-in and
-never enters the bootstrap chain.
+emitting portable C from any `cc`). The in-process libLLVM backend is the
+destination DEFAULT for users (native binary, no external toolchain); it enters
+opt-in for validation and a later lane flips the default. libLLVM never enters the
+bootstrap chain — bootstrap stays on the C path, which also remains the
+differential oracle.
 **Motivation:** (1) strategic — KIR is the launch platform for a native, in-process
 libLLVM backend (§7.2): native code via the LLVM C API, no `.ll` text, no `clang`
 subprocess, serving the fast-compiler and native-codegen goals. (2) structural —
@@ -476,11 +479,25 @@ and stays untouched as the oracle. Everything else is off the critical path.**
 >   give — the one question it could answer ("does KIR map to SSA/registers, not
 >   just to C?") is a design question answered by reading the C API, not a
 >   continuous test to maintain.
-> - The **C-text backend stays as the permanent pure-bootstrap default and
->   oracle.** Migrating it under KIR (the old Lanes 3–4) is deferrable cleanup,
->   not critical path: it buys the duplication reduction §1 measured, but it does
->   not advance the in-process goal. Do it later, or not at all, once the
->   in-process backend is the production path.
+> - The **in-process native backend is the destination DEFAULT** — native binary
+>   compilation is what users get (the goal: fast compiler, native code, no
+>   external toolchain). The **C-text backend is demoted to two roles: the
+>   pure-bootstrap path** (stage 0-1 + bring-up from any `cc`) **and the
+>   differential oracle** (validate the native backend's behaviour). It is NOT
+>   the long-term user-facing default.
+> - **Transition is staged, not a flag-day.** The native backend is built as an
+>   OPT-IN first (Lane 1) so it can be validated against C-direct without touching
+>   the default or the selfhost byte-id gate. A LATER lane flips the default to
+>   native once it is in full parity. Building-opt-in-then-flipping is the safe
+>   route to the same destination; do not make the first native lane the default.
+> - **selfhost byte-id stays on the C-text/bootstrap path.** A native backend does
+>   not emit text, so textual selfhost byte-id does not apply to it. The bootstrap
+>   (stage 0-1 → C) keeps textual byte-id as the deterministic scaffold; the native
+>   backend is validated by behavioural parity vs C-direct (+ reproducible object),
+>   not by textual byte-id. Two gates, two roles.
+> - Migrating the C-text backend itself under KIR (the old Lanes 3–4) is
+>   deferrable cleanup, off the critical path — the C-text backend already works as
+>   bootstrap+oracle whether or not it is ever moved under KIR.
 
 **Parallel layer, NOT big-bang.** KIR enters as `--emit=kir` (dumpable between
 passes, Tier 1) plus a new consumer, leaving the existing direct emitters intact
@@ -521,8 +538,11 @@ grow, not after.
   file directly — **no `.ll` text, no `clang` subprocess, one process.** Wired
   through the Path-1 prelude-primitive mechanism (§7.2): ~30–60 forwarders to the
   C API in `stage2/runtime.h`, with stage2 linked against `libLLVM` (discovered
-  via `llvm-config`). Opt-in flag (e.g. `KAI_BACKEND=llvm`); the C-text backend
-  stays the default and the bootstrap path.
+  via `llvm-config`, static-linked into the binary so brew users need no LLVM —
+  the Rust/Zig/Julia model). Enters behind an opt-in flag (e.g.
+  `KAI_BACKEND=native`) for VALIDATION; the C-text backend remains the default
+  *during this lane only*. The native backend is the destination default (the flip
+  is Lane 1.5); C-text's permanent role is bootstrap + oracle, not user default.
 - **Build incrementally for isolation** (this replaces the "third oracle" the old
   plan leaned on): bring it up one construct at a time — a `main` returning a
   constant, then arithmetic, then calls, then control flow, then ctors/match,
@@ -538,6 +558,27 @@ grow, not after.
   **Measure compile-time end-to-end — this is where the "fast compiler" goal is
   won** (no fork/exec, no text serialization, no re-parse). Mandatory retro.
 - **Deps:** Lane 0 (complete lowering). Does NOT depend on any text-backend lane.
+
+### Lane 1.5 — flip the default to native
+- **Brief:** Once Lane 1 is in full parity, make the native backend the DEFAULT
+  (`kai build` emits a native binary in-process; no flag). The C-text backend
+  stays reachable as bootstrap + `--emit=c` oracle, but is no longer what a user
+  gets by default. Release distribution: the release tarball/brew formula now
+  ships the native compiler with libLLVM static-linked (no `depends_on llvm`,
+  Rust/Zig/Julia model); release CI builds against libLLVM, the USER does not need
+  it.
+- **CI move:** the native backend's parity-vs-C gate becomes the PRIMARY PR gate
+  (it now protects the default), the way `tier1` protects C today. While native is
+  still opt-in (Lane 1), its gate is a path-gated workflow (`tier1-native.yml`,
+  same pattern as the existing `tier1-asan` / `tier1-backend-parity`); at the flip
+  it is promoted to the always-on PR gate.
+- **selfhost byte-id:** stays on the bootstrap/C path (textual determinism of the
+  scaffold). The native default is gated by behavioural parity vs C + a
+  reproducible-object check, NOT textual byte-id (a native backend emits no text).
+- **Gate:** native parity 388 stays green as the PR gate; bootstrap-from-`cc` still
+  works (C path intact); brew install on a clean machine (no LLVM) produces a
+  working native-emitting `kai`. Mandatory retro.
+- **Deps:** Lane 1 green + in full parity.
 
 ### Lane 2 (deferrable cleanup, OFF critical path) — migrate C-text under KIR
 - **Brief:** Only if/when reducing the emit_c↔emit_llvm duplication (§1) is worth
@@ -654,10 +695,13 @@ stated goal.
 
 2. **Bootstrap: preserved by the three-stage architecture.** Linking libLLVM in
    stage2 does NOT break "bootstrap from any machine with `cc`" — stages 0–1 and
-   the C backend touch no libLLVM, and the in-process backend is opt-in. The C-text
-   backend remains the **permanent pure-bootstrap path and differential oracle**.
-   Tier 1.3's "no deps in stage 0" is intact (only stage2 links libLLVM). This is
-   the escape Zig and Crystal did not have: they became non-bootstrappable on fresh
+   the C backend touch no libLLVM, and bootstrap always uses the C path even after
+   native becomes the user default. The C-text backend remains the **permanent
+   pure-bootstrap path and differential oracle** (it stops being the user-facing
+   default but never the bootstrap). Tier 1.3's "no deps in stage 0" is intact
+   (only stage2 links libLLVM, and the distributed binary static-links it so users
+   need no LLVM). This is the escape Zig and Crystal did not have: they became
+   non-bootstrappable on fresh
    machines precisely by putting libLLVM in the arrival path. kaikai's stage split
    is the structural defence.
 
