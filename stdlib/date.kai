@@ -1,0 +1,210 @@
+# stdlib/date.kai — civil calendar dates (proleptic Gregorian).
+#
+# Pure functional, following the decimal/money precedent: plain data
+# carrier, fallible constructors return `Option`, no panics. The one
+# effectful entry point is `today()`, which rides `Clock` (issue #767).
+#
+# Calendar model:
+#   - Proleptic Gregorian — the Gregorian leap rule extends backwards
+#     before 1582 (and before year 1). Historians beware; computers
+#     rejoice.
+#   - Timezone-naive. A `Date` is a calendar position, not a moment.
+#     The `from_walltime` bridge interprets the `WallTime` as **UTC**;
+#     that interpretation is documented, not configurable (v1).
+#   - Epoch conversions use Howard Hinnant's era-based civil
+#     algorithms (days_from_civil / civil_from_days): exact integer
+#     math over the whole proleptic range, no lookup tables.
+#     Epoch day 0 = 1970-01-01; negative days reach pre-1970 dates.
+#
+# v1 limits (out of scope, tracked in #767):
+#   - no time zones / tzdata / DST, no civil time-of-day type,
+#     no locales, no ISO week dates, no non-Gregorian calendars.
+#   - `parse` accepts strict `YYYY-MM-DD` with years 0000–9999 only;
+#     `make` / `from_epoch_days` cover the full proleptic range.
+#
+# End-of-month clamping: `add_months` clamps the day to the last
+# valid day of the target month (2026-01-31 + 1 month = 2026-02-28;
+# 2024-01-31 + 1 month = 2024-02-29). Clamping is lossy on purpose —
+# `add_months(add_months(d, 1), -1)` may not return `d`.
+
+import time
+
+# ---- Carrier -----------------------------------------------------
+
+pub type Date = { year: Int, month: Int, day: Int }
+
+# ---- Internal helpers --------------------------------------------
+
+# Floor division for positive divisors. kaikai `/` truncates toward
+# zero; calendar math below year 1 (and before 1970) needs flooring.
+fn date_floor_div(a: Int, b: Int) : Int = {
+  let q = a / b
+  if a - q * b < 0 { q - 1 } else { q }
+}
+
+fn date_floor_mod(a: Int, b: Int) : Int = a - date_floor_div(a, b) * b
+
+# ---- Calendar queries --------------------------------------------
+
+# Gregorian leap rule: divisible by 4, except centuries unless
+# divisible by 400. 1900 → false, 2000 → true, 2024 → true.
+pub fn is_leap_year(y: Int) : Bool =
+  y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
+# Days in `m` of year `y`. Contract: `m` in 1..12 (checked by `make`;
+# out-of-range months are the caller's bug, not a runtime branch).
+pub fn days_in_month(y: Int, m: Int) : Int =
+  if m == 2 { if is_leap_year(y) { 29 } else { 28 } }
+  else if m == 4 or m == 6 or m == 9 or m == 11 { 30 }
+  else { 31 }
+
+# ISO-8601 weekday numbering: 1 = Monday … 7 = Sunday.
+# Epoch day 0 (1970-01-01) was a Thursday → 4.
+pub fn day_of_week(d: Date) : Int =
+  date_floor_mod(to_epoch_days(d) + 3, 7) + 1
+
+# 1-based ordinal day within the year: Jan 1 → 1, Dec 31 → 365/366.
+pub fn day_of_year(d: Date) : Int =
+  date_days_before_month(d.year, 1, d.month, 0) + d.day
+
+fn date_days_before_month(y: Int, m: Int, stop: Int, acc: Int) : Int =
+  if m >= stop { acc }
+  else { date_days_before_month(y, m + 1, stop, acc + days_in_month(y, m)) }
+
+# ---- Constructors / validation -----------------------------------
+
+# Validating constructor. `None` when the month is outside 1..12 or
+# the day is outside 1..days_in_month(y, m). Any `Int` year is legal
+# (proleptic range).
+pub fn make(y: Int, m: Int, d: Int) : Option[Date] =
+  if m < 1 or m > 12 { None }
+  else if d < 1 or d > days_in_month(y, m) { None }
+  else { Some(Date { year: y, month: m, day: d }) }
+
+# Date → days since 1970-01-01 (Hinnant's days_from_civil). The
+# shifted year starts in March so the leap day lands at the end of
+# the internal year; `era` is a 400-year Gregorian cycle (146097
+# days) and `doy`/`doe` are day-of-year / day-of-era offsets.
+pub fn to_epoch_days(d: Date) : Int = {
+  let y = if d.month <= 2 { d.year - 1 } else { d.year }
+  let era = date_floor_div(y, 400)
+  let yoe = y - era * 400
+  let mp = if d.month > 2 { d.month - 3 } else { d.month + 9 }
+  let doy = (153 * mp + 2) / 5 + d.day - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468
+}
+
+# Days since 1970-01-01 → Date (Hinnant's civil_from_days). Inverse
+# of `to_epoch_days` over the whole proleptic range; `yoe`/`doy`/`mp`
+# are non-negative by construction, so truncating `/` is exact there.
+pub fn from_epoch_days(n: Int) : Date = {
+  let z = n + 719468
+  let era = date_floor_div(z, 146097)
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let day = doy - (153 * mp + 2) / 5 + 1
+  let month = if mp < 10 { mp + 3 } else { mp - 9 }
+  let year = if month <= 2 { y + 1 } else { y }
+  Date { year: year, month: month, day: day }
+}
+
+# ---- Arithmetic ---------------------------------------------------
+
+# Shift by `n` civil days (negative goes backwards). Total: every
+# input maps to a valid date.
+pub fn add_days(d: Date, n: Int) : Date = from_epoch_days(to_epoch_days(d) + n)
+
+# Signed distance `a - b` in days. Zero iff `eq(a, b)`.
+pub fn diff_days(a: Date, b: Date) : Int = to_epoch_days(a) - to_epoch_days(b)
+
+# Shift by `n` calendar months, clamping the day to the last valid
+# day of the target month (see the module header for the rule and
+# its deliberate non-reversibility).
+pub fn add_months(d: Date, n: Int) : Date = {
+  let months0 = d.year * 12 + (d.month - 1) + n
+  let y = date_floor_div(months0, 12)
+  let m = date_floor_mod(months0, 12) + 1
+  let dim = days_in_month(y, m)
+  Date { year: y, month: m, day: if d.day > dim { dim } else { d.day } }
+}
+
+# ---- Comparison ---------------------------------------------------
+
+pub fn eq(a: Date, b: Date) : Bool =
+  a.year == b.year and a.month == b.month and a.day == b.day
+
+# Three-way compare in chronological order: -1 / 0 / 1.
+pub fn cmp(a: Date, b: Date) : Int =
+  if a.year != b.year { if a.year < b.year { 0 - 1 } else { 1 } }
+  else if a.month != b.month { if a.month < b.month { 0 - 1 } else { 1 } }
+  else if a.day != b.day { if a.day < b.day { 0 - 1 } else { 1 } }
+  else { 0 }
+
+pub fn lt(a: Date, b: Date) : Bool = cmp(a, b) < 0
+
+# ---- ISO-8601 string I/O ------------------------------------------
+
+# `YYYY-MM-DD`, zero-padded (year to 4 digits, month/day to 2).
+# Negative years emit a leading `-` over the 4-digit magnitude
+# (`-0001-03-01`); years beyond 9999 print all their digits.
+pub fn to_string(d: Date) : String = {
+  let neg = d.year < 0
+  let ymag = if neg { 0 - d.year } else { d.year }
+  let sign = if neg { "-" } else { "" }
+  sign ++ string.pad_left(int_to_string(ymag), 4, '0') ++
+    "-" ++ string.pad_left(int_to_string(d.month), 2, '0') ++
+    "-" ++ string.pad_left(int_to_string(d.day), 2, '0')
+}
+
+# Strict ISO-8601 `YYYY-MM-DD`: exactly 10 chars, ASCII digits in the
+# three fields, `-` separators. Anything else — wrong length, signs,
+# spaces, `2026/01/02`, `2026-1-2` — is `None`, as is a well-formed
+# string naming an invalid date (`2026-02-30`, `2026-13-01`).
+pub fn parse(s: String) : Option[Date] = {
+  if string_length(s) != 10 { None }
+  else if not (date_sep_at(s, 4) and date_sep_at(s, 7)) { None }
+  else {
+    let y = date_parse_digits(s, 0, 4)!
+    let m = date_parse_digits(s, 5, 7)!
+    let d = date_parse_digits(s, 8, 10)!
+    make(y, m, d)
+  }
+}
+
+fn date_sep_at(s: String, i: Int) : Bool = match char_at(s, i) {
+  Some(c) -> c == '-'
+  None    -> false
+}
+
+# Parse the ASCII digits in `[i, stop)` as a base-10 Int. `None` on
+# any non-digit — no signs, no spaces, no early termination.
+fn date_parse_digits(s: String, i: Int, stop: Int) : Option[Int] =
+  date_parse_digits_loop(s, i, stop, 0)
+
+fn date_parse_digits_loop(s: String, i: Int, stop: Int, acc: Int) : Option[Int] =
+  if i >= stop { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) ->
+      if char.is_digit(c) {
+        date_parse_digits_loop(s, i + 1, stop,
+                               acc * 10 + (char_to_int(c) - char_to_int('0')))
+      } else { None }
+  } }
+
+# ---- Bridge from time.kai -----------------------------------------
+
+# Civil date of a `WallTime`, read as UTC. Floor-divides the epoch
+# seconds by 86 400, so pre-1970 instants land on the correct civil
+# day (`secs = -1` → 1969-12-31). The sub-day remainder (and the
+# nanos field) is discarded — `Date` has no time-of-day.
+pub fn from_walltime(t: WallTime) : Date =
+  from_epoch_days(date_floor_div(t.secs, 86400))
+
+# Today's civil date in UTC. The only effectful fn in this module —
+# everything else is pure calendar math on the caller's values.
+pub fn today() : Date / Clock = from_walltime(now())

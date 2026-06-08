@@ -124,53 +124,43 @@ the explicit module qualifier instead of doing a flat
 in a mechanical follow-up. The `opt_or` survivor is independent
 — it is blocked by parser-level keyword reservation, not by #219.
 
-### Migration status (m14 follow-up, #614)
+### Qualified surface (canonical-only)
 
-The 21 modules outside `stdlib/core/*` listed in issue #614 keep
-their flat-prefix definitions and surface the canonical qualified
-form (`<module>.<op>`) through the qualified-call resolver's
-prefix fallback (`me_lookup_export` in `stage2/compiler.kai`).
-Closed by the m14 follow-up lane (`docs/lane-experience-issue-614-m14-followup.md`).
+Since the 2026-05-17 canonical-only migration, stdlib modules define
+their operations under **bare canonical names** (`pub fn make`,
+`pub fn parse`, `pub fn push`, …) and callers reach them qualified
+(`money.make`, `date.parse`, `queue.push`) or bare where the call
+site is unambiguous. Three mechanisms make this work:
 
-| Module                          | Legacy prefix | Canonical surface                              | Notes                                                          |
-| ------------------------------- | ------------- | ---------------------------------------------- | -------------------------------------------------------------- |
-| `stdlib/fs/file.kai`            | `file`        | `file.read`, `file.write`, `file.append`, ...  | 3 ops gained bare aliases (`read`/`write`/`append`); 5 already bare |
-| `stdlib/spawn.kai`              | `fiber`       | `spawn.spawn`, `spawn.await`, ...              | 6 ops gained bare aliases (`spawn`, `await`, `select`, `cancel`, `yield`, `set_trap_exit`); `nursery` already bare |
-| `stdlib/log.kai`                | `log`         | `log.debug`, `log.info`, `log.warn`, `log.error` | 4 ops gained bare aliases                                       |
-| `stdlib/math/int.kai`           | `int`         | `int.min`, `int.max`, `int.gcd`, ...           | All defs stay flat (`gcd`/`fib`/`factorial` widely shadowed by fixtures + demos) |
-| `stdlib/math/real.kai`          | `real`        | `real.min`, `real.floor`, `real.ceil`, ...     | 4 ops gained bare aliases (`trunc`/`floor`/`ceil`/`round_half_even`); `round` stays flat (fixture shadow) |
-| `stdlib/decimal.kai`            | `dec`         | `decimal.zero`, `decimal.add`, `decimal.eq`, ... | 2 ops gained bare aliases (`from_int`/`from_parts`); rest collide with complex.kai or protocol methods |
-| `stdlib/money.kai`              | `money`       | `money.make`, `money.zero`, `money.add`, ...   | All defs stay flat (collide with decimal/complex/protocol methods) |
-| `stdlib/fx.kai`                 | `fx`          | `fx.pair`, `fx.rate_make`, `fx.convert`, ...   | All defs stay flat (`pair`/`lookup`/`convert` shadowed by fixtures) |
-| `stdlib/array.kai`              | `array`       | `array.from_list`, `array.to_list`, `array.copy` | All defs stay flat (`from_list`/`to_list` collide with collections) |
-| `stdlib/collections/set.kai`    | `set`         | `set.empty`, `set.insert`, `set.union`, ...    | All defs stay flat (clash with map / queue / stack / list)     |
-| `stdlib/collections/queue.kai`  | `q`           | `queue.push`, `queue.pop`, `queue.peek`, ...   | All defs stay flat (clash with stack)                          |
-| `stdlib/collections/stack.kai`  | `stk`         | `stack.push`, `stack.pop`, `stack.peek`, ...   | All defs stay flat (clash with queue)                          |
-| `stdlib/path.kai`               | `path`        | `path.basename`, `path.dirname`, `path.join`, ... | All defs stay flat (`join`/`split` clash with `string.join`/`split`) |
-| `stdlib/encoding/base64.kai`    | `base64`      | `base64.encode`, `base64.decode`, ...          | All defs stay flat (`encode` clashes with hex.encode)          |
-| `stdlib/encoding/hex.kai`       | `hex`         | `hex.encode`, `hex.decode`, ...                | All defs stay flat (`decode` shadowed by demos)                |
-| `stdlib/encoding/toml.kai`      | `toml`        | `toml.decode`, `toml.encode`, ...              | All defs stay flat                                             |
-| `stdlib/uuid.kai`               | `uuid`        | `uuid.v4`, `uuid.format`, `uuid.is_valid`, ... | All defs stay flat (`parse` shadowed by demos)                 |
-| `stdlib/text.kai`               | `text`        | `text.display_width`, `text.char_width`        | wcwidth-style terminal column width over codepoints (#745); East Asian Width + zero-width tables. Built on #744 `string.chars`. Codepoint-level (NOT grapheme/UAX#29) |
-| `stdlib/regexp.kai`             | `regex` + `rx` (alt) | `regexp.compile`, `regexp.find_all`, `regexp.parse_pattern` | Resolver carries TWO legacy prefixes via `module_legacy_prefix_alt`; `regexp.match` unreachable (`match` is a keyword) |
-| `stdlib/random_secure.kai`      | `random_secure` | `random_secure.int`, `random_secure.bytes`   | All defs stay flat                                              |
-| `stdlib/net/http.kai`           | `http`        | `http.parse_url`, `http.get`, `http.post`, ... | All defs stay flat (`get`/`put`/`delete` clash with map/env/file) |
-| `stdlib/protocols.kai`          | `bin`         | `bin_*` helpers — NOT a module surface today   | A dedicated `stdlib/bin.kai` split is tracked as follow-up     |
+- **The qualified-call resolver consults the module's actual
+  exports** (`me_lookup_export` in `stage2/compiler/modules.kai`) —
+  a verbatim lookup. The m14-era legacy-prefix fallback
+  (`module_legacy_prefix` / `module_legacy_prefix_alt`) was removed
+  when the migration landed (commits fe02f1e + 4ba4e01, 2026-05-17);
+  there is no silent `module.fn` → `module_fn` rewriting anymore.
+- **Codegen mints per-module C symbols** (`kai_<module>__<name>`;
+  separate compilation, #748), so same-named exports across modules
+  coexist at link time: `decimal.parse`, `money.parse`, `uuid.parse`
+  and `date.parse` are four distinct symbols.
+- **Bare call sites disambiguate by argument type/arity** (the
+  typer's first-arg narrowing). Names that are ambiguous bare or
+  commonly shadowed by local defs (`get`, `push`, `min`, `decode`,
+  a fixture's own `fn gcd`) should use the qualified form.
 
-**Departure from issue #614's stated Option E ("each flat-prefix
-pub fn duplicated to a bare canonical + alias"):** kaikai does not
-overload `pub fn` by signature at the top level. Adding bare
-canonical defs collides with sibling modules (`min(Int, Int)` vs
-`min(xs: [Int])`, `from_list(xs, def): Array` vs `from_list(xs):
-Set`, `push(q): Queue` vs `push(s): Stack`) and shadows user-defined
-fns in fixtures and demos (`fn round`, `fn fib`, `fn factorial`,
-`fn gcd`, `fn pair`, `fn lookup`, `fn convert`, `fn decode`,
-`fn parse`). The compiler's `emit_ident_value` shadow path
-(documented in `docs/lane-experience-m14-v1.md` §Finding 2) trips
-the codegen when a user-defined local shares a name with a global
-pub fn. Where the bare canonical is safe (no shadow, no top-level
-clash), the lane added both forms; otherwise the qualified-call
-resolver's prefix fallback alone supplies the canonical surface.
+Surviving flat-prefix names are *compound* names, not legacy debt:
+`time.kai`'s `duration_*` / `instant_*` / `walltime_*` (three
+carriers in one module), `fx.kai`'s `money_*_via_fx`, and
+`protocols.kai`'s `bin_*` implementation home (re-exposed bare by
+`stdlib/bin.kai`'s one-line wrappers).
+
+The migration history — which batch renamed which module, and why
+issue #614's Option E was first rejected (pre-#748 there was no
+per-module symbol minting, so bare names genuinely collided) and
+later implemented for real — is bitácora:
+`docs/lane-experience-issue-614-m14-followup.md` plus the
+canonical-only commit series of 2026-05-17. Those documents describe
+the path, not the present; this section is the authoritative
+description of how the qualified surface works today (#769).
 
 The 5 `list_*` survivors documented in the m14 Phase 1 retro
 (`docs/lane-experience-issue-203-phase1-list.md`) were retired
@@ -278,6 +268,7 @@ stdlib/
     args.kai     (shipped via PR #131 + PR #143)
     process.kai  (shipped — closes #346; 4 public fns: `start`, `wait`, `kill`, `exit`)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
+  date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
   array.kai      pure (Array[T] / [T] bridge — shipped via #366)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
@@ -454,6 +445,26 @@ Single top-level module. Contains both the types (`Instant`,
   `monotonic()`, comparison/subtraction on instants, duration
   arithmetic (millis, seconds, minutes, …), `sleep(d)`,
   `deadline_in(d)` — integrates with `Cancel`
+
+### date (pure; `today()` rides `/ Clock`)
+
+Single top-level module: civil calendar dates, proleptic Gregorian,
+timezone-naive. Pure data + algorithms following the decimal/money
+precedent (`Option` for fallible constructors/parsers, no panics);
+the only effectful fn is `today()`.
+
+- `date` — `Date { year, month, day }`; validating `make` returns
+  `Option[Date]`; `from_epoch_days` / `to_epoch_days` (Hinnant's
+  era-based civil algorithms, epoch day 0 = 1970-01-01, negative
+  days reach pre-1970); `is_leap_year`, `days_in_month`,
+  `day_of_week` (ISO: 1 = Mon … 7 = Sun), `day_of_year`;
+  `add_days`, `diff_days`, `add_months` (end-of-month clamping,
+  deliberately non-reversible); `eq`/`cmp`/`lt`; ISO-8601
+  `to_string` / strict `parse` (`YYYY-MM-DD`); bridge
+  `from_walltime(t)` (UTC interpretation, documented not
+  configurable) and `today()` `/ Clock` *(shipped via PR #770 — closes #767)*.
+  Out of scope v1: tzdata/DST, civil time-of-day, locales, ISO week
+  dates, non-Gregorian calendars.
 
 ### random (`/ Random`) and random_secure (`/ SecureRandom`)
 
