@@ -2901,7 +2901,23 @@ fn prelude_names() : [String] {
     # Listing them here keeps the resolver from rejecting them as
     # undefined and keeps the closure-capture analyser from treating
     # them as free vars to capture inside lambda bodies.
-    "__perceus_dup", "__perceus_drop"
+    "__perceus_dup", "__perceus_drop",
+    # KIR Lane 1 (docs/kir-design.md §7.2): the in-process libLLVM
+    # C-API prim names. The stage 2 compiler's `emit_native` module
+    # names these; listing them here keeps stage 1's resolver from
+    # rejecting them as undefined while it compiles the stage 2 bundle.
+    # Stage 1 emits each as a plain `kai_<name>` call (its non-EP
+    # fallback), which is the correct forwarder symbol. Stage 1 links
+    # NO libLLVM and never executes these — the bootstrap chain
+    # (cc-only) is untouched; the forwarders live behind `#ifdef
+    # KAI_LLVM` in stage2/runtime.h and the kaic2 that USES the native
+    # backend is the one built with `KAI_LLVM=1`.
+    "llvm_module_new", "llvm_int64_type", "llvm_int32_type",
+    "llvm_ptr_type", "llvm_void_type", "llvm_fn_type_0", "llvm_fn_type_1",
+    "llvm_add_function", "llvm_append_block", "llvm_builder_new",
+    "llvm_position_at_end", "llvm_const_int", "llvm_build_call_0",
+    "llvm_build_call_1", "llvm_build_ret", "llvm_build_ret_void",
+    "llvm_emit_object"
   ]
 }
 
@@ -3438,6 +3454,129 @@ fn prelude_find_loop(table: [EPrelude], target: String) : Option[EPrelude] {
   }
 }
 
+# ---- raw-prelude prims: in-process libLLVM C-API (KIR Lane 1.2) ----
+#
+# Stage 2 carries `TyHandle` + `emit_rprelude_call` and marshals each
+# native-prim arg by its static type. Stage 1 has no types, so it
+# can NOT recover the raw/boxed shape from the AST. But the prim
+# signatures ARE known statically (they mirror the C forwarders under
+# `#ifdef KAI_LLVM` in stage2/runtime.h), so this table hard-codes the
+# per-arg marshalling that stage 2 derives from `ty_is_unboxable_t`.
+#
+# Without this, stage 1's `emit_named_call_lookup` fell through to its
+# `kai_apply(kai_llvm_xxx, …)` closure path — the forwarder is a raw C
+# fn, not a callable `KaiValue`, so the kaic2 built by kaic1 panicked
+# at runtime ("attempted to call a non-callable value"). The prim names
+# were registered in `prelude_names()` (resolver only) but never given
+# a real emit path. This table is that path.
+#
+# An arg's marshalling kind:
+#   AHandle — a raw LLVM C-API pointer (`void *`). It rides through a
+#             stage-1 `KaiValue *` variable as an opaque pointer; pass
+#             it to the forwarder VERBATIM (no box, no unbox). A handle
+#             is also kept out of the Perceus dup/drop scope (it is not
+#             RC-managed — see `pcs_is_rprelude_call` / `param_is_handle`).
+#   AInt    — a raw `int64_t`. Stage 1 renders an Int boxed (`kai_int(…)`),
+#             so unbox it at the call site with `kai_intf(…)`.
+#   ABoxed  — a `KaiValue *` the forwarder reads directly (a `String`,
+#             read via `->as.s.bytes`). Pass it boxed, unchanged.
+type RArg = AHandle | AInt | ABoxed
+
+# A native prim's result shape:
+#   RHandle — a raw LLVM C-API pointer (or `kai_unit()` for the
+#             unit-returning ops). It flows through a stage-1
+#             `KaiValue *` binding kept OUT of Perceus, so it is never
+#             RC-touched. Most prims.
+#   RInt    — a raw `int64_t` the forwarder returns (only `emit_object`,
+#             a 0/1 status). Stage 1 has no types, so unlike stage 2 it
+#             does NOT box at the return boundary of `build_native_object`
+#             — and the result crosses into a USER fn (`build_native_object
+#             : Int`) whose `let rc = …` binding IS in Perceus scope. A
+#             raw `1` parked in a `KaiValue *` would crash `kai_decref`
+#             (deref of 0x1). So box it AT THE CALL SITE with `kai_int(…)`,
+#             making it a real RC-free singleton Int — exactly what every
+#             other `Int`-returning callee yields. (Stage 2 boxes via
+#             `ufn_call_result` at the fn boundary; this is the stage-1
+#             equivalent, pushed to the prim call site.)
+type RRet = RHandle | RInt
+
+# kai name, C forwarder symbol, per-arg marshalling kinds, result shape.
+type RPrelude = RP(String, String, [RArg], RRet)
+
+fn rprelude_table() : [RPrelude] {
+  [
+    RP("llvm_module_new",   "kai_llvm_module_new",   [ABoxed], RHandle),
+    RP("llvm_int64_type",   "kai_llvm_int64_type",   [AHandle], RHandle),
+    RP("llvm_int32_type",   "kai_llvm_int32_type",   [AHandle], RHandle),
+    RP("llvm_ptr_type",     "kai_llvm_ptr_type",     [AHandle], RHandle),
+    RP("llvm_void_type",    "kai_llvm_void_type",    [AHandle], RHandle),
+    RP("llvm_fn_type_0",    "kai_llvm_fn_type_0",    [AHandle], RHandle),
+    RP("llvm_fn_type_1",    "kai_llvm_fn_type_1",    [AHandle, AHandle], RHandle),
+    RP("llvm_add_function", "kai_llvm_add_function", [AHandle, ABoxed, AHandle], RHandle),
+    RP("llvm_append_block", "kai_llvm_append_block", [AHandle, AHandle, ABoxed], RHandle),
+    RP("llvm_builder_new",  "kai_llvm_builder_new",  [AHandle], RHandle),
+    RP("llvm_position_at_end", "kai_llvm_position_at_end", [AHandle, AHandle], RHandle),
+    RP("llvm_const_int",    "kai_llvm_const_int",    [AHandle, AInt], RHandle),
+    RP("llvm_build_call_0", "kai_llvm_build_call_0", [AHandle, AHandle, AHandle], RHandle),
+    RP("llvm_build_call_1", "kai_llvm_build_call_1", [AHandle, AHandle, AHandle, AHandle], RHandle),
+    RP("llvm_build_ret",    "kai_llvm_build_ret",    [AHandle, AHandle], RHandle),
+    RP("llvm_build_ret_void", "kai_llvm_build_ret_void", [AHandle], RHandle),
+    RP("llvm_emit_object",  "kai_llvm_emit_object",  [AHandle, ABoxed], RInt)
+  ]
+}
+
+fn rprelude_find(target: String) : Option[RPrelude] =
+  rprelude_find_loop(rprelude_table(), target)
+
+fn rprelude_find_loop(table: [RPrelude], target: String) : Option[RPrelude] {
+  match table {
+    [] -> None
+    [rp, ...rest] -> match rp {
+      RP(name, _, _, _) -> if name == target { Some(rp) } else { rprelude_find_loop(rest, target) }
+    }
+  }
+}
+
+# Emit a raw-prelude call `cname(<marshalled args>)`. Each arg is
+# rendered boxed first (the normal stage-1 path), then wrapped per its
+# `RArg`: an `AInt` is unboxed with `kai_intf`, an `AHandle`/`ABoxed`
+# passes through. An `RHandle` result is consumed raw (no box) — the
+# binding it flows into is kept out of Perceus; an `RInt` result is
+# boxed with `kai_int` so it becomes a real RC-free singleton Int.
+fn emit_rprelude_call(src: String, cname: String, kinds: [RArg], ret: RRet, args_e: [Expr],
+                      fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : String {
+  let raw_call = concat_all([cname, "(",
+    join_with(emit_rprelude_args(src, args_e, kinds, fns, variants, lams, locals), ", "), ")"])
+  match ret {
+    RInt    -> cat3("kai_int(", raw_call, ")")
+    RHandle -> raw_call
+  }
+}
+
+fn emit_rprelude_args(src: String, args_e: [Expr], kinds: [RArg],
+                      fns: [EFn], variants: [EVar], lams: [LamInfo], locals: [String]) : [String] {
+  match args_e {
+    [] -> []
+    [a, ...rest] -> {
+      let kind = match kinds {
+        [k, ...__] -> k
+        [] -> ABoxed
+      }
+      let krest = match kinds {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let boxed = emit_expr(src, a, fns, variants, lams, locals)
+      let marshalled = match kind {
+        AInt   -> cat3("kai_intf(", boxed, ")")
+        AHandle -> boxed
+        ABoxed  -> boxed
+      }
+      [marshalled, ...emit_rprelude_args(src, rest, krest, fns, variants, lams, locals)]
+    }
+  }
+}
+
 # ---- expression emission ----
 
 fn emit_ident_callee(name: String) : String {
@@ -3556,7 +3695,14 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
     Some(_) -> emit_variant_call(callee, list_length(args_e),
                                  emit_call_args_slots(src, args_e, fns, variants, lams, locals),
                                  variants)
-    None -> match prelude_find(callee) {
+    # KIR Lane 1.2: a native-backend C-API prim is checked BEFORE the
+    # boxed `prelude_find`. Its args marshal per the static `RArg` mask
+    # (a handle / String passes through, an Int is unboxed); the result
+    # is consumed raw. This replaces the broken `kai_apply` closure path.
+    None -> match rprelude_find(callee) {
+      Some(RP(_, cname, kinds, ret)) ->
+        emit_rprelude_call(src, cname, kinds, ret, args_e, fns, variants, lams, locals)
+      None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
@@ -3567,6 +3713,7 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
           ", (KaiValue *[]){", call_args, "})"
         ])
       }
+    }
     }
   } }
 
@@ -3589,7 +3736,28 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
       let slots_all = if list_length(args_e) == 0 { lhs_slot } else { cat3(lhs_slot, ", ", rest_slots) }
       emit_variant_call(callee, arity, slots_all, variants)
     }
-    None -> match prelude_find(callee) {
+    # KIR Lane 1.2: a native-backend prim piped into. The LHS (`lhs_c`,
+    # already rendered) is the first arg; marshal it by the first `RArg`
+    # and the remaining `args_e` by the rest. Handles pass through, an
+    # Int LHS is unboxed. (No native prim is piped in the current walk;
+    # this keeps the path sound if Parte B introduces one.)
+    None -> match rprelude_find(callee) {
+      Some(RP(_, cname, kinds, ret)) -> {
+        let first_kind = match kinds {
+          [k, ...__] -> k
+          [] -> ABoxed
+        }
+        let rest_kinds = match kinds {
+          [_, ...r] -> r
+          [] -> []
+        }
+        let lhs_m = match first_kind { AInt -> cat3("kai_intf(", lhs_c, ")")  _ -> lhs_c }
+        let rest_m = emit_rprelude_args(src, args_e, rest_kinds, fns, variants, lams, locals)
+        let all_m = if list_length(args_e) == 0 { lhs_m } else { cat3(lhs_m, ", ", join_with(rest_m, ", ")) }
+        let raw_call = concat_all([cname, "(", all_m, ")"])
+        match ret { RInt -> cat3("kai_int(", raw_call, ")")  RHandle -> raw_call }
+      }
+      None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
       }
@@ -3600,6 +3768,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
           ", (KaiValue *[]){", args_all, "})"
         ])
       }
+    }
     }
   } }
 
@@ -5047,13 +5216,64 @@ type LU
 
 fn perceus_pass(decls: [Decl]) : [Decl] = map(decls, perceus_decl)
 
+# KIR Lane 1.2: a binding holding an LLVM C-API handle (`TyHandle` in
+# stage 2) is NOT RC-managed — it parks a raw `void *` in a stage-1
+# `KaiValue *` slot, and `kai_incref`/`kai_decref` on it would deref a
+# raw LLVM pointer (corruption). Stage 2 keeps handles out of Perceus
+# via `rhs.mode == MUnboxed`; stage 1 has no modes, so it recovers the
+# same set SYNTACTICALLY: a param annotated `: Handle`, or a `let` whose
+# RHS is a call to a handle-returning native prim. Such names never
+# enter the Perceus scope, so they are never wrapped in `__perceus_dup`
+# nor dropped — exactly the non-RC discipline a handle needs.
+#
+# `RInt`-returning prims (only `emit_object`) are NOT excluded: their
+# result is boxed at the call site (`kai_int(…)`), so it is a real Int
+# and rides the normal RC path.
+#
+# CAUTION (the dangerous edge): this recovers handle-ness from SYNTAX,
+# not types. A handle that flows through an unannotated intermediate
+# `let h = some_user_fn()` (where the user fn returns `Handle`) would be
+# MISSED — it would re-enter Perceus and corrupt. The current native
+# walk (`emit_native.kai`, `main -> 42`) has NO such case: every handle
+# is either a `: Handle` param or a direct native-prim `let`. Parte B
+# must extend this to track user fns returning `Handle` before any such
+# flow is introduced; until then this is sound by construction here.
+fn param_is_handle(p: Param) : Bool = match p.ptype {
+  Some(te) -> match te.tkind {
+    TyName(n, args) -> n == "Handle" and list_length(args) == 0
+    _ -> false
+  }
+  None -> false
+}
+
+# True iff `rhs` is a direct call to a handle-returning native prim.
+# A `let` whose RHS is this — and a `: Handle` param — are the two
+# handle binders excluded from Perceus (see `perceus_decl`). The walk
+# (`pcs_block_loop` / `pcs_rewrite_block`) consults this at each `SLet`
+# so the bound name never enters scope.
+fn pcs_rhs_is_handle_prim(rhs: Expr) : Bool = match rhs.kind {
+  ECall(f, _) -> match f.kind {
+    EVar(callee) -> match rprelude_find(callee) {
+      Some(RP(_, _, _, RHandle)) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
 fn perceus_decl(d: Decl) : Decl {
   match d {
     DFn(is_pub, name, params, opt_ret, body, ln, cl) -> {
-      let pnames = map(params, (p) => p.pname)
+      # KIR Lane 1.2: a `: Handle` param is a raw non-RC pointer, so keep
+      # it out of the Perceus scope (never dup'd, never dropped). Handle
+      # *lets* are excluded inside the walk at their `SLet` (see
+      # `pcs_block_loop` / `pcs_rewrite_block`); params are excluded here.
+      let rc_params = filter(params, (p) => not param_is_handle(p))
+      let pnames = map(rc_params, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let new_body = pcs_rewrite_expr(body, pnames, uses, false)
-      let body_with_drops = pcs_prepend_unused_drops(new_body, params, uses)
+      let body_with_drops = pcs_prepend_unused_drops(new_body, rc_params, uses)
       DFn(is_pub, name, params, opt_ret, body_with_drops, ln, cl)
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
@@ -5187,7 +5407,10 @@ fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
       let nxt = match s {
         SLet(pat, _, rhs) -> {
           let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
-          PcsBlockState { scope: pat_bindings(pat, scope), acc: acc1 }
+          # KIR Lane 1.2: a `let h = <handle prim>(…)` binds a raw non-RC
+          # handle — keep `h` out of scope so its reads are never dup'd.
+          let new_scope = if pcs_rhs_is_handle_prim(rhs) { scope } else { pat_bindings(pat, scope) }
+          PcsBlockState { scope: new_scope, acc: acc1 }
         }
         SAssert(c, opt_m) -> {
           let a1 = pcs_collect_uses_expr(c, scope, in_lam, acc)
@@ -5379,7 +5602,11 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool) : PcsRw
   match s {
     SLet(pat, ty_opt, rhs) -> {
       let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam)
-      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1), scope: pat_bindings(pat, scope) }
+      # KIR Lane 1.2: keep a handle-prim `let` binder out of scope (must
+      # match `pcs_block_loop`'s collect side, or the dup decision and
+      # the scope would disagree).
+      let new_scope = if pcs_rhs_is_handle_prim(rhs) { scope } else { pat_bindings(pat, scope) }
+      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1), scope: new_scope }
     }
     SAssert(c, opt_m) -> {
       let c1 = pcs_rewrite_expr(c, scope, uses, in_lam)

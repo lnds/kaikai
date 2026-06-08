@@ -79,6 +79,7 @@ import compiler.resolve
 import compiler.modules
 import compiler.desugar
 import compiler.doc_attr
+import compiler.native_prims
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -505,6 +506,7 @@ fn inf_mangle_ty(t: Ty) : String {
     TyChar   -> "Char"
     TyUnit   -> "Unit"
     TyByte     -> "Byte"
+    TyHandle   -> "Handle"
     TyListT(inner) -> concat_all(["L_", inf_mangle_ty(inner), "_E"])
     TyFnT(ps, ret, _) -> concat_all([
       "F_", inf_join_with(map(ps, inf_mangle_ty), "_"),
@@ -868,6 +870,9 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
       else if name == "Char" { TyChar }
       else if name == "Unit" { TyUnit }
       else if name == "Byte" { TyByte }
+      # KIR Lane 1: `Handle` is the surface name for the opaque LLVM
+      # C-API scalar (`TyHandle`). Only the native backend writes it.
+      else if name == "Handle" { TyHandle }
       # m7a #7: `Nothing` is the uninhabited type used by `Fail.fail`
       # (Doc B §`Fail`). The typer can't witness uninhabitedness, so
       # we treat it as TyAny — a call producing Nothing unifies with
@@ -1294,6 +1299,7 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
     TyString -> match b { TyString -> true _ -> false }
     TyUnit -> match b { TyUnit -> true _ -> false }
     TyByte -> match b { TyByte -> true _ -> false }
+    TyHandle -> match b { TyHandle -> true _ -> false }
     TyAny -> match b { TyAny -> true _ -> false }
     TyVarT(ai) -> match b { TyVarT(bi) -> ai == bi _ -> false }
     TyListT(ai) -> match b { TyListT(bi) -> inf_ty_eq(ai, bi) _ -> false }
@@ -1330,6 +1336,7 @@ fn inf_ty_head_name(t: Ty) : Option[String] {
     TyString       -> Some("String")
     TyUnit         -> Some("Unit")
     TyByte           -> Some("Byte")
+    TyHandle         -> Some("Handle")
     TyListT(_)     -> Some("List")
     TyCon(_, name, _) -> Some(name)
     # m12.5: a dimensioned value dispatches on the underlying base
@@ -1379,6 +1386,7 @@ fn inf_ty_to_string(t: Ty) : String {
     TyChar   -> "Char"
     TyUnit   -> "Unit"
     TyByte     -> "Byte"
+    TyHandle   -> "Handle"
     TyListT(inner) -> cat3("[", inf_ty_to_string(inner), "]")
     # m7b #11k: render the function type's effect row alongside the
     # arrow when non-empty, with each label printed as `Eff` or
@@ -3229,7 +3237,21 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "bit_clear",  scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
     TyEntry { name: "bit_toggle", scheme: mono(fn_ty([TyInt, TyInt], TyInt)) }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+  # KIR Lane 1: the in-process libLLVM C-API prims (TyHandle-bearing,
+  # native-backend only). Generated from `rprelude_table` so the typer
+  # scheme cannot drift from the C forwarder + emit dispatch. Dead on
+  # any program that does not use the native backend.
+  let native_es = native_prim_ty_entries(rprelude_table())
+  TyEnv { entries: list_append(list_append(es, native_es), env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+}
+
+# Map each raw prelude prim to its typer entry: a monomorphic function
+# scheme over the prim's raw param/return types. The native backend's
+# C-API surface is thus typed straight from `rprelude_table`.
+fn native_prim_ty_entries(table: [RPrelude]) : [TyEntry] = match table {
+  [] -> []
+  [RP(name, _, ptys, rty), ...rest] ->
+    [TyEntry { name: name, scheme: mono(fn_ty(ptys, rty)) }, ...native_prim_ty_entries(rest)]
 }
 
 # ---- built-in variant constructors ----
@@ -3385,6 +3407,7 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyString -> t
     TyUnit   -> t
     TyByte     -> t
+    TyHandle   -> t
     TyAny    -> t
     TyVarT(_) -> t
     TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
@@ -3445,6 +3468,7 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyString -> t
     TyUnit   -> t
     TyByte     -> t
+    TyHandle   -> t
     TyAny    -> t
     TyVarT(n) -> match intpair_lookup(m, n) {
       Some(b) -> TyVarT(b)
@@ -3530,6 +3554,7 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
           else if name == "Byte"     { TyByte }
+          else if name == "Handle"   { TyHandle }
           # m7a #7 / m8 #3: Nothing is the bottom type (used by
           # Fail.fail and Spawn's type-erased ops); the typer treats
           # it as TyAny because it can't witness uninhabitedness.
@@ -4549,6 +4574,7 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
           else if name == "Byte"     { TyByte }
+          else if name == "Handle"   { TyHandle }
           else if name == "Nothing" { TyAny }
           # Hanga Roa: the module_origin slot stays `None` here.
           # `resolve_ty_with_binds` runs at scheme-build time when
@@ -5683,6 +5709,7 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     TyChar   -> t
     TyUnit   -> t
     TyByte     -> t
+    TyHandle   -> t
     TyAny    -> t
     TyVarT(n) -> match subst_lookup(s, n) {
       Some(t2) -> apply_ty(s, t2)
@@ -6342,6 +6369,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
     # Lane 4 (#473): Byte is nominal — distinct from Int. Only unifies
     # with itself. Conversions use `int_to_u8` / `u8_to_int`.
     TyByte     -> match b { TyByte     -> Some(s) _ -> None }
+    TyHandle   -> match b { TyHandle   -> Some(s) _ -> None }
     # TyAny unifies with anything until typed holes and error reporting
     # land; it's the "I don't know yet" placeholder.
     TyAny    -> Some(s)
@@ -7149,6 +7177,7 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
     TyChar   -> match bx { TyChar -> true _ -> false }
     TyUnit   -> match bx { TyUnit -> true _ -> false }
     TyByte     -> match bx { TyByte -> true _ -> false }
+    TyHandle   -> match bx { TyHandle -> true _ -> false }
     TyListT(ai) -> match bx { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
     TyFnT(ap, ar, _) -> match bx {
       TyFnT(bp, br, _) -> ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)

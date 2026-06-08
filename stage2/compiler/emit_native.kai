@@ -1,0 +1,99 @@
+# compiler/emit_native.kai — KIR → in-process libLLVM backend
+# (KIR Lane 1, docs/kir-design.md §7.2).
+#
+# `build_native_object` consumes a `KProgram` and constructs the LLVM
+# module IN MEMORY by calling the libLLVM C API (via the raw-prelude
+# prims in `native_prims.kai` / `runtime.h`), runs verify + codegen, and
+# emits a native object file — one process, no `.ll` text, no `clang`.
+# The driver then links that object against the effects runtime to
+# produce the executable.
+#
+# Native is opt-in this lane (`KAI_BACKEND=native`); the C-text backend
+# stays the default + bootstrap + the differential oracle every step is
+# validated against. The flip to native-default is Lane 1.5.
+#
+# STEP 1 SCOPE (`main -> 42`): this builds the spine end-to-end — a
+# `kai_main` that returns a boxed constant via `kaix_int`, the three
+# runtime-entry no-ops `int main` calls, and object emission. It does
+# NOT yet walk arbitrary KIR (arithmetic/let/calls/control flow are
+# steps 2+). The `KProgram` is threaded so the signature is final; the
+# generic per-node walk grows one step at a time, each validated against
+# C-direct.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+
+# Build the LLVM module for `kp` in memory and emit it as an object at
+# `out_path`. Returns 0 on success, non-zero on a verify / codegen
+# failure (the driver surfaces it). Opt-in entry for `KAI_BACKEND=native`.
+pub fn build_native_object(kp: KProgram, out_path: String) : Int = {
+  let m = llvm_module_new("kai_native")
+  let ptr_t = llvm_ptr_type(m)
+  let i64_t = llvm_int64_type(m)
+
+  # The runtime constructor the module calls: `%KaiValue* @kaix_int(i64)`.
+  # Declared (no body) so the linker resolves it against the effects
+  # runtime; its function type is needed by `LLVMBuildCall2` under
+  # opaque pointers.
+  let kaix_int_ty = llvm_fn_type_1(ptr_t, i64_t)
+  let kaix_int_fn = llvm_add_function(m, "kaix_int", kaix_int_ty)
+
+  native_build_main(m, ptr_t, i64_t, kaix_int_fn, kaix_int_ty)
+  native_build_runtime_noops(m, ptr_t)
+
+  llvm_emit_object(m, out_path)
+}
+
+# `kai_main : %KaiValue* ()` — the entry the runtime's `int main` calls.
+# STEP 1: returns `kaix_int(42)`, the boxed answer, matching the KIR
+# `fn main() : box { entry: ret 42 }` and the C-direct oracle
+# (`return kai_int(42)`).
+fn native_build_main(m: Handle, ptr_t: Handle, i64_t: Handle,
+                     kaix_int_fn: Handle, kaix_int_ty: Handle) : Unit = {
+  let main_ty = llvm_fn_type_0(ptr_t)
+  let main_fn = llvm_add_function(m, "kai_main", main_ty)
+  let entry = llvm_append_block(m, main_fn, "entry")
+  let b = llvm_builder_new(m)
+  llvm_position_at_end(b, entry)
+  let c42 = llvm_const_int(i64_t, 42)
+  let boxed = llvm_build_call_1(b, kaix_int_fn, kaix_int_ty, c42)
+  llvm_build_ret(b, boxed)
+}
+
+# The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls
+# before/after `kai_main`: `kai_main_install_defaults`,
+# `kai_main_teardown_defaults`, `_kai_proto_init_llvm`. STEP 1 has no
+# effects and no protocols, so each is an empty `void ()` returning
+# void — exactly what the out-of-process LLVM backend emits for a
+# program with an empty effect row / no protocols.
+fn native_build_runtime_noops(m: Handle, ptr_t: Handle) : Unit = {
+  let void_t = llvm_void_type(m)
+  let void_fn_ty = llvm_fn_type_0(void_t)
+  native_build_void_noop(m, void_fn_ty, "kai_main_install_defaults")
+  native_build_void_noop(m, void_fn_ty, "kai_main_teardown_defaults")
+  native_build_void_noop(m, void_fn_ty, "_kai_proto_init_llvm")
+}
+
+# Define one empty `void name()` — a single block returning void.
+fn native_build_void_noop(m: Handle, void_fn_ty: Handle, name: String) : Unit = {
+  let func = llvm_add_function(m, name, void_fn_ty)
+  let entry = llvm_append_block(m, func, "entry")
+  let b = llvm_builder_new(m)
+  llvm_position_at_end(b, entry)
+  llvm_build_ret_void(b)
+}
+
+# Derive the object-file path from the source path: `foo.kai` -> `foo.o`.
+# A path not ending in `.kai` just gets `.o` appended. The `bin/kai`
+# wrapper (or the test harness) links this object against the effects
+# runtime to the final executable.
+pub fn native_object_path(src_path: String) : String = {
+  let n = string_length(src_path)
+  if n > 4 and string_slice(src_path, n - 4, 4) == ".kai" {
+    cat2(string_slice(src_path, 0, n - 4), ".o")
+  } else {
+    cat2(src_path, ".o")
+  }
+}
