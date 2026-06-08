@@ -78,6 +78,7 @@ import compiler.parse
 import compiler.resolve
 import compiler.modules
 import compiler.desugar
+import compiler.doc_attr
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -350,27 +351,6 @@ fn inf_finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] {
   }
 }
 
-
-fn inf_hex_digit(d: Int) : String {
-  match d {
-    0 -> "0"
-    1 -> "1"
-    2 -> "2"
-    3 -> "3"
-    4 -> "4"
-    5 -> "5"
-    6 -> "6"
-    7 -> "7"
-    8 -> "8"
-    9 -> "9"
-    10 -> "A"
-    11 -> "B"
-    12 -> "C"
-    13 -> "D"
-    14 -> "E"
-    _ -> "F"
-  }
-}
 
 # Emit an LLVM global string constant and return both the textual
 # declaration and the total byte count (including null terminator),
@@ -15475,6 +15455,11 @@ pub fn label_to_string(l: Label) : String {
 pub type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
                       holes: [ResolvedHole], row_holes: [ResolvedRowHole],
                       prelude_len: Int,
+                      # Issue #681: the root file's module-level
+                      # `#[doc(...)]` text, lifted from the DModuleDoc
+                      # carrier decl that rides the stream into the
+                      # typer. None when the file has no module doc.
+                      module_doc: Option[String],
                       # Issue #487: structured collected diagnostics for
                       # m11 templates T1, T2, T4, T5. The T3 unbound-
                       # name diagnostic lives on `Env` and is folded in
@@ -15502,6 +15487,7 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
       prelude_len: prelude_len,
+      module_doc: doc_module_doc_text(all_decls),
       diags: list_reverse(acc_diags)
     }
     [d, ...rest] -> {
@@ -16387,6 +16373,11 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DConst(p, n, ty, body, mo, l, c) ->
       DConst(p, n, expand_aliases_typeexpr(ty, aliases),
               expand_aliases_expr(body, aliases), mo, l, c)
+    # Issue #681: doc wrappers — the item wrapper recurses (pre-strip
+    # callers like --ast), the module-doc carrier has no types.
+    DDoc(raw, text, inner, l, c) ->
+      DDoc(raw, text, expand_unit_aliases_decl(inner, aliases), l, c)
+    DModuleDoc(_, _, _, _) -> d
   }
 }
 
@@ -16844,7 +16835,8 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   let typed = TypedProgram {
     decls: tp.decls, errs: tp.errs + cov_errs + priv_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
-    prelude_len: tp.prelude_len, diags: tp.diags
+    prelude_len: tp.prelude_len, module_doc: tp.module_doc,
+    diags: tp.diags
   }
   # Issue #574 — the returned delta carries ONLY this module's
   # contribution (i.e. the slice of working-table state that
@@ -16964,6 +16956,7 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
       prelude_len: prelude_len_acc,
+      module_doc: doc_module_doc_text(all_program_decls),
       diags: list_reverse(acc_diags)
     }
     [m, ...rest] -> {
@@ -17754,43 +17747,11 @@ pub fn dump_holes(file: String, decls: [Decl]) : Int / Console + File {
 # in a follow-up pass, but the array is always present so the schema
 # stays stable across feature rollouts.
 
-fn json_escape_char(c: Char) : String {
-  match c {
-    '"' -> "\\\""
-    '\\' -> "\\\\"
-    '\n' -> "\\n"
-    '\r' -> "\\r"
-    '\t' -> "\\t"
-    _ -> {
-      if char_to_int(c) < 32 {
-        # Control byte → \u00XX. We only ever feed ASCII into this path,
-        # so two hex digits suffice.
-        let n = char_to_int(c)
-        let hi = n / 16
-        let lo = n % 16
-        concat_all(["\\u00", inf_hex_digit(hi), inf_hex_digit(lo)])
-      }
-      else { "#{c}" }
-    }
-  }
-}
-
-fn json_escape_loop(s: String, i: Int, n: Int, acc: String) : String {
-  if i >= n { acc }
-  else {
-    match char_at(s, i) {
-      Some(c) -> json_escape_loop(s, i + 1, n, string_concat(acc, json_escape_char(c)))
-      None    -> acc
-    }
-  }
-}
-
-fn json_escape(s: String) : String =
-  json_escape_loop(s, 0, string_length(s), "")
-
+# Issue #681: the JSON string escaper moved to compiler/util.kai
+# (json_escape / json_quote) so doc_attr.kai can share it without
+# importing the typer. json_str stays as the typer-side alias.
 #[doc("infer: `json_str` — typer entry point invoked by the driver.")]
-pub fn json_str(s: String) : String =
-  concat_all(["\"", json_escape(s), "\""])
+pub fn json_str(s: String) : String = json_quote(s)
 
 #[doc("infer: `json_null` — typer entry point invoked by the driver.")]
 pub fn json_null() : String = "null"
@@ -17810,11 +17771,18 @@ fn json_candidate(expr: String) : String =
 fn json_candidates(cs: [String]) : String =
   concat_all(["[", inf_join_with(map(cs, json_candidate), ", "), "]"])
 
-fn json_hole_report(file: String, rh: ResolvedHole) : String {
+fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole) : String {
   match rh {
     RH(kind, line, col, ty, scope, env_fresh) -> {
       let kj = hole_kind_json(kind)
       let cands = synth_candidates(scope, ty, env_fresh)
+      # Issue #681: the surrounding declaration's `#[doc(...)]` text,
+      # resolved by source position against the root file's doc side
+      # table. null when the surrounding decl is undocumented.
+      let doc_field = match doc_for_line(doc_items, line) {
+        Some(s) -> json_str(s)
+        None    -> json_null()
+      }
       concat_all([
         "{",
         "\"file\": ", json_str(file),
@@ -17826,6 +17794,7 @@ fn json_hole_report(file: String, rh: ResolvedHole) : String {
         ", \"expected_type\": ", json_str(inf_ty_to_string(ty)),
         ", \"in_scope\": ", json_scope_entries(scope),
         ", \"candidates\": ", json_candidates(cands),
+        ", \"doc\": ", doc_field,
         "}"
       ])
     }
@@ -17851,11 +17820,11 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
   }
 }
 
-#[doc("infer: --holes-json structured typed-hole report.")]
-pub fn dump_holes_json(file: String, decls: [Decl]) : Int / Console + File {
+#[doc("infer: --holes-json structured typed-hole report. doc_items is the root file's doc side table (issue #681).")]
+pub fn dump_holes_json(file: String, decls: [Decl], doc_items: [DocItem]) : Int / Console + File {
 
   let r = infer_program(file, decls, false)
-  let body = inf_join_with(map(r.holes, (h) => json_hole_report(file, h)), ", ")
+  let body = inf_join_with(map(r.holes, (h) => json_hole_report(file, doc_items, h)), ", ")
   print(concat_all(["[", body, "]"]))
   r.errs
 }

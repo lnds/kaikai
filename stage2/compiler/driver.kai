@@ -631,6 +631,14 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
     }
     DUse(name, line, col) ->
       emit_line(depth, "use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    # Issue #681: doc wrappers. The item wrapper recurses into the
+    # documented decl; the module-doc carrier prints its position.
+    DDoc(_, _, inner, line, col) -> {
+      emit_line(depth, "doc @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(inner, depth + 1)
+    }
+    DModuleDoc(_, _, line, col) ->
+      emit_line(depth, "module_doc @#{int_to_string(line)}:#{int_to_string(col)}")
   }
 }
 
@@ -964,8 +972,15 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
               let parsed = parse_program(abs_path, src, tokens)
               match parsed.decls {
                 None -> rs_in
-                Some(decls) -> {
-                  let rs2 = process_imports(base_dir, decls, search_paths, rs_in)
+                Some(decls_raw) -> {
+                  # Issue #681: imported modules join the global decl
+                  # stream doc-free — strip wrappers + module doc at
+                  # load time, bumping the resolver error counter on a
+                  # duplicate module doc.
+                  let im_docs = doc_strip_all(abs_path, src, decls_raw)
+                  let rs_doc = if im_docs.errs > 0 { rs_bump_errs_by(rs_in, im_docs.errs) } else { rs_in }
+                  let decls = im_docs.decls
+                  let rs2 = process_imports(base_dir, decls, search_paths, rs_doc)
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
                   # imported module's decls join the global stream.
@@ -1111,6 +1126,13 @@ pub type Mode
   | MHolesJson
   | MEffectsJson
   | MEffectHolesJson
+  # Issue #681: `--doc-json` — dump the root file's `#[doc(...)]`
+  # side table (module_doc + per-item docs) as one JSON object.
+  | MDocJson
+  # Issue #681: `--builtins-doc-json` — file-less mode dumping the
+  # doc attributes of the auto-loaded core module set as a JSON
+  # array. Consumed by `kai info builtins --json`.
+  | MBuiltinsDocJson
   | MEmitLlvm
   # KIR Lane 0: dump the kaikai Intermediate Representation (ANF + basic
   # blocks + first-class Perceus RC nodes, design `docs/kir-design.md`)
@@ -1348,6 +1370,10 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MEffectsJson))
       } else if a == "--effect-holes-json" {
         parse_cli_loop(more, cli_with_mode(opts, MEffectHolesJson))
+      } else if a == "--doc-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MDocJson))
+      } else if a == "--builtins-doc-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MBuiltinsDocJson))
       } else if a == "--strict-holes" {
         parse_cli_loop(more, cli_with_strict_holes(opts))
       } else if a == "--emit=llvm" {
@@ -1485,6 +1511,8 @@ fn usage() : Unit / Console {
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --effects-json     report per-fn effects + handlers as JSON")
   eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
+  eprint("  --doc-json         dump the file's #[doc(...)] attributes (module_doc + items) as JSON")
+  eprint("  --builtins-doc-json  dump the core module set's #[doc(...)] attributes as JSON (no input file)")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
@@ -1543,7 +1571,14 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
         let parsed = parse_program(path, src, tokens)
         match parsed.decls {
           None -> None
-          Some(ds) -> {
+          Some(ds_raw) -> {
+            # Issue #681: strip `#[doc(...)]` wrappers (and the module
+            # doc) at load time — prelude decls join the global stream
+            # doc-free. Phase 2 (`kai doc`) collects prelude docs on
+            # its own dedicated path.
+            let pre_docs = doc_strip_all(path, src, ds_raw)
+            if pre_docs.errs > 0 { None } else {
+            let ds = pre_docs.decls
             let mod_name = prelude_module_name(path)
             let kept = strip_prelude_tests(ds, [])
             # Validate same-module name collisions before the module's
@@ -1563,6 +1598,7 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
               # in the root file keep `None` (set by the parser).
               let tagged = tag_decls_module_origin(kept, mod_name)
               Some(PL(tagged, ME(mod_name, exports, path, unstable_exports)))
+            }
             }
           }
         }
@@ -1832,6 +1868,45 @@ fn core_module_paths_loop(rels: [String], root: String, acc: [String]) : [String
   [] -> list_reverse(acc)
   [r, ...rest] -> core_module_paths_loop(rest, root,
                     [string_concat(root, string_concat("/", r)), ...acc])
+}
+
+# Issue #681: `--builtins-doc-json`. Dump the `#[doc(...)]`
+# attributes of the auto-loaded core module set as one JSON array,
+# one object per module. Parses each core file fresh — docs are
+# stripped from cached decl streams, so the cache is bypassed on
+# purpose. The JSON rendering lives in compiler/doc_attr.kai.
+fn dump_builtins_doc_json() : Int / Console + File =
+  builtins_doc_loop(core_module_files(), core_module_paths(), [])
+
+fn builtins_doc_loop(rels: [String], paths: [String],
+                       acc: [String]) : Int / Console + File {
+  match rels {
+    [] -> { print(doc_builtins_json(list_reverse(acc))); 0 }
+    [r, ...rrest] -> match paths {
+      [] -> { print(doc_builtins_json(list_reverse(acc))); 0 }
+      [p, ...prest] -> match read_file(p) {
+        Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
+        Ok(src) -> {
+          let toks = tokenize(src)
+          let lex_errs = report_errors(p, src, toks)
+          if lex_errs != 0 { 1 }
+          else {
+            let parsed = parse_program(p, src, toks)
+            match parsed.decls {
+              None -> 1
+              Some(ds) -> {
+                let docs = doc_strip_all(p, src, ds)
+                # "core/list.kai" -> "core/list" for the module field.
+                let mod_name = string_slice(r, 0, string_length(r) - 4)
+                builtins_doc_loop(rrest, prest,
+                  [doc_module_json(mod_name, docs.module_doc, docs.items), ...acc])
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 # Load the core module set. Replaces the legacy `--prelude`-driven
@@ -3171,6 +3246,13 @@ fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
       let a1 = enc_better(acc, line, col, "DAxiom", None, ql, qc)
       find_enc_params(params, ql, qc, a1)
     }
+    # Issue #681: recurse into the documented decl; the module-doc
+    # carrier owns no expressions or params to probe.
+    DDoc(_, _, inner, line, col) -> {
+      let a1 = enc_better(acc, line, col, "DDoc", None, ql, qc)
+      find_enc_decl(inner, ql, qc, a1)
+    }
+    DModuleDoc(_, _, line, col) -> enc_better(acc, line, col, "DModuleDoc", None, ql, qc)
   }
 }
 
@@ -4537,15 +4619,24 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               if formatted == src { 0 } else { print(formatted); 1 }
             }
             _ -> {
+            # Issue #681: strip `#[doc(...)]` wrappers into the doc
+            # side table right after parse — only `kai fmt` (above)
+            # sees them downstream. The root file's single module doc
+            # stays in the stream so the typer can lift it into
+            # `TypedProgram.module_doc`; a second module-position doc
+            # is a typed error counted in the aggregator below.
+            let docs = doc_strip_collect(path, src, own_decls)
+            let doc_errs = docs.errs
+            let doc_decls = docs.decls
             # m7f §7: report any `import ?name` holes BEFORE
             # expand_imports walks the decls. The hole is inert
             # for module loading (process_imports treats IkHole as
             # a no-op), but we want the diagnostic to fire even
             # when the hole is the only import-related issue.
-            let import_hole_errs = report_import_holes(path, own_decls,
+            let import_hole_errs = report_import_holes(path, doc_decls,
                                                          dir_of(path),
                                                          search_paths)
-            let own_decls_no_holes = strip_import_holes(own_decls, [])
+            let own_decls_no_holes = strip_import_holes(doc_decls, [])
             # m6.2 Phase 2.2/2.3: expand_imports returns both the
             # flat decl list (M6.1 behaviour) and the module table;
             # rqc_decls then walks every body and rewrites
@@ -4935,7 +5026,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               all_decls, path, brand_calls, brand_registry)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
-            if import_resolve_errs > 0 { import_resolve_errs }
+            if doc_errs > 0 { doc_errs }
+            else if import_resolve_errs > 0 { import_resolve_errs }
             else if alias_res.errs > 0 { alias_res.errs }
             else if use_errs > 0 { use_errs }
             else if proto_errs > 0 { proto_errs }
@@ -4955,7 +5047,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             else {
             match mode {
               MAst -> { dump_program(raw_decls); 0 }
-              MTypes -> { dump_types(own_decls); 0 }
+              MTypes -> { dump_types(doc_decls); 0 }
               MEnv -> { dump_env(build_ty_env(all_decls).env); 0 }
               MInfer -> dump_infer(path, all_decls)
               MCheck -> {
@@ -5007,7 +5099,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               }
               MHolesJson -> {
                 let chk = check_program(path, all_decls)
-                if chk != 0 { chk } else { dump_holes_json(path, all_decls) }
+                if chk != 0 { chk } else { dump_holes_json(path, all_decls, docs.items) }
               }
               MEffectsJson -> {
                 let chk = check_program(path, all_decls)
@@ -5016,6 +5108,12 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MEffectHolesJson -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_effect_holes_json(path, all_decls) }
+              }
+              MDocJson -> {
+                # Issue #681: docs are syntactic — dump the side table
+                # collected at parse time, no typecheck needed.
+                print(doc_module_json(path, docs.module_doc, docs.items))
+                0
               }
               MLibraryMode -> {
                 # Issue #454. Library mode reuses the typer through
@@ -5256,6 +5354,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
   match opts.mode {
     MHelp -> { usage(); 0 }
     MVersion -> { print("kaic2 stage 2 (self-hosted)"); 0 }
+    MBuiltinsDocJson -> dump_builtins_doc_json()
     MCacheRoundtrip -> {
       let r = cache_roundtrip_self_test()
       print(r)
@@ -5311,7 +5410,13 @@ fn emit_prelude_cache_for(source_path: String, sha_arg: String) : Int / Console 
         let parsed = parse_program(source_path, src, tokens)
         match parsed.decls {
           None -> 1
-          Some(ds) -> {
+          Some(ds_raw) -> {
+            # Issue #681: cache blobs never carry doc wrappers — strip
+            # them exactly like the non-cached `load_prelude` path so
+            # both loaders produce the same decl stream.
+            let pre_docs = doc_strip_all(source_path, src, ds_raw)
+            if pre_docs.errs > 0 { 1 } else {
+            let ds = pre_docs.decls
             let mod_name = prelude_module_name(source_path)
             let kept = strip_prelude_tests(ds, [])
             let tagged = tag_decls_module_origin(kept, mod_name)
@@ -5323,6 +5428,7 @@ fn emit_prelude_cache_for(source_path: String, sha_arg: String) : Int / Console 
             let blob = cache_serialize_module(tagged, sha)
             print(blob)
             0
+            }
           }
         }
       }
