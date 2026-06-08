@@ -3525,6 +3525,18 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-unbox_phase2_match.c; then \
 	  echo "unbox FAIL match (boxed _scr alias survived)"; exit 1; \
 	fi
+	@# match-raw unboxing (asu): a `match` whose RESULT is a raw scalar
+	@# (boxed variant scrutinee, Int arms) lowers `_r` as a raw int64_t —
+	@# no `_r = kai_unit()` boxed accumulator, no per-arm `kai_int(`
+	@# round-trip on the match result. This fixture is the ONLY thing
+	@# exercising the path: the compiler source has no match→scalar, so
+	@# selfhost byte-id stays green even if emit_match_raw regresses.
+	@# Without this grep the byte-id lies.
+	@grep -F -q 'int64_t _r = 0' build/perceus-unbox_phase2_match_scalar.c \
+	  || { echo "unbox FAIL match_scalar (match result not raw — _r not int64_t)"; exit 1; }
+	@if grep -E 'kai_area\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	  echo "unbox FAIL match_scalar (boxed _r accumulator survived in area)"; exit 1; \
+	fi
 	@# Tongariki Real-unboxing — arith fixture. The chain must lower
 	@# to raw `double kair_*` locals with no `kai_op_add(` / `kai_op_mul(` /
 	@# `kai_op_sub(` / `kai_op_div(` survival inside the body. The single
