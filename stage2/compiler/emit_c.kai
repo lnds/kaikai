@@ -4710,6 +4710,104 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
   }
 }
 
+# match-raw unboxing (asu design). Lower a `match` whose result is a
+# raw scalar — `_r` has the native C type (`raw_c_type(ty)`), each arm
+# assigns the raw body directly (no `kai_int`/`kai_intf` round-trip).
+# The scrutinee stays boxed (a variant) and is consumed (decref) on the
+# owned path, BORROWED (no decref) when perceus wrapped it. Soundness:
+# `_r` is initialised to a raw zero so a non-exhaustive match (which
+# also emits a `panic` tail) never reads an uninitialised scalar (C UB).
+# Reuse/RC arm paths do NOT apply here — a scalar arm body builds no
+# constructor — so the arm shape is the simple `if (test) { binds; _r =
+# <raw body>; break; }`.
+fn emit_match_raw(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx: EmitCtx) : String / Console {
+  # Scrutinee-raw fast path takes precedence: when the SCRUTINEE is a
+  # raw integral and the arms are literal/wildcard, the existing
+  # `emit_match_switch` lowers to a C `switch (_scr)` (a separate, older
+  # optimisation on a DIFFERENT axis — see `emit_match_expr`). Its `_r`
+  # is boxed, so unbox it back to the raw result the caller wants — this
+  # reproduces the pre-match-raw behaviour exactly (preserving the
+  # `unbox_phase2_match` switch fixture). Only a BOXED scrutinee (a
+  # variant) routes through the result-raw arms below.
+  match scrut.mode {
+    MUnboxed ->
+      if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
+        unbox_boxed_scalar(emit_match_switch(src, scrut, arms, cx), ty)
+      } else {
+        emit_match_raw_arms(src, scrut, arms, ty, cx)
+      }
+    _ -> emit_match_raw_arms(src, scrut, arms, ty, cx)
+  }
+}
+
+# The result-raw match body: each arm assigns the raw scalar into a raw
+# `_r`. Used when the scrutinee is boxed (a variant) or a non-fast-path
+# raw scrutinee.
+fn emit_match_raw_arms(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx: EmitCtx) : String / Console {
+  let rty = raw_c_type(ty)
+  match match_borrow_inner(scrut) {
+    Some(inner) -> {
+      let sc = emit_expr(src, inner, cx)
+      concat_all([
+        "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
+        emit_match_arms_raw(src, arms, cx),
+        match_tail_panic(arms),
+        "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
+      ])
+    }
+    None -> {
+      let sc = emit_expr(src, scrut, cx)
+      concat_all([
+        "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
+        emit_match_arms_raw(src, arms, cx),
+        match_tail_panic(arms),
+        "} while (0); kai_decref(_scr); _r; })"
+      ])
+    }
+  }
+}
+
+# A raw zero of the match's result type — the safe initialiser for `_r`
+# (the exhaustivity tail-panic makes it unreachable, but C must see an
+# init to avoid UB on a hypothetically-incomplete match).
+fn raw_zero(ty: Option[Ty]) : String = match ty {
+  Some(t) -> match t {
+    TyReal -> "0.0"
+    TyDimT(inner, _)    -> raw_zero(Some(inner))
+    TyRefineT(inner, _) -> raw_zero(Some(inner))
+    _ -> "0"
+  }
+  None -> "0"
+}
+
+fn emit_match_arms_raw(src: String, arms: [Arm], cx: EmitCtx) : String / Console = match arms {
+  [] -> ""
+  [a, ...rest] -> cat2(emit_match_arm_raw(src, a, cx), emit_match_arms_raw(src, rest, cx))
+}
+
+# One raw arm: `if (test) { binds; _r = <raw body>; break; }`, plus the
+# guarded variant. Mirrors the no-reuse path of `emit_match_arm` but
+# emits the body via `emit_expr_raw` into a raw `_r`. Pattern binders
+# (incl. kind-1 raw Int slots) are bound exactly as the boxed path does,
+# so an arm reading a payload sees the same `kair_<n>` / `kai_<n>` locals.
+fn emit_match_arm_raw(src: String, a: Arm, cx: EmitCtx) : String / Console = match a {
+  Arm(pat, opt_guard, body) -> {
+    let pt = emit_pat_test(src, pat, "_scr", cx)
+    let arm_lcs = list_append(cx.lcs, pat_binders(pat, []))
+    let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
+                                         list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, [])))
+    let binds = emit_pat_binds(src, pat, "_scr", true, cx)
+    let body_c = emit_expr_raw(src, body, arm_cx)
+    match opt_guard {
+      None    -> concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+      Some(g) -> {
+        let gc = emit_expr_raw(src, g, arm_cx)
+        concat_all(["    if (", pt, ") { ", binds, "if (", gc, ") { _r = ", body_c, "; break; } }\n"])
+      }
+    }
+  }
+}
+
 fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
   let sc = emit_expr(src,scrut, cx)
@@ -5734,6 +5832,13 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         unbox_boxed_scalar(boxed, x.ty)
       }
     }
+    # match-raw unboxing (asu design): a `match` whose result is
+    # unboxable and whose every arm body is raw (marked MUnboxed by the
+    # unbox pass) lowers with a RAW `_r` — each arm assigns the native
+    # scalar directly, no `kai_int(...)` box then `kai_intf(...)` unbox.
+    # The scrutinee axis is orthogonal (typically a boxed variant); only
+    # the result is raw.
+    EMatch(scr, arms) -> emit_match_raw(src, scr, arms, x.ty, cx)
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
