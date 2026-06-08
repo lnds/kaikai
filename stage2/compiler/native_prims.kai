@@ -1,0 +1,106 @@
+# compiler/native_prims.kai — registry of the in-process libLLVM C-API
+# primitives the native backend calls (KIR Lane 1, docs/kir-design.md
+# §7.2).
+#
+# A "raw prelude prim" is a compiler-internal binding to a C forwarder
+# in `stage2/runtime.h` (under `#ifdef KAI_LLVM`) that takes/returns
+# RAW scalars — in particular `TyHandle` (an LLVM C-API object pointer)
+# crossing as an unboxed `void *`, NEVER boxed and NEVER through the
+# tagged-Int runtime. The spike (lane retro) showed neither the boxed
+# prelude-EP path (always `KaiValue *` args) nor the extern-C/FFI shim
+# (always reboxes the result via `kai_int`) can carry a handle without
+# corruption; this registry is the third, exact vehicle.
+#
+# The emit-C dispatch (`emit_c.kai`) consults `rprelude_find` BEFORE the
+# boxed `prelude_find`: a match emits a raw call (args via the existing
+# `emit_call_args_raw`, result consumed raw — no `box_wrap`). The typer
+# learns each prim's scheme from `native_prim_ty_entries` (seeded into
+# the prelude env) and the resolver pre-binds the names via
+# `native_prim_names`. All three stay in lockstep with the C forwarders.
+#
+# This is dead weight on any program that does not use the native
+# backend: no user program names these, and a TyHandle never appears
+# off the native path — so selfhost byte-id of the C path is preserved.
+
+import compiler.ast
+
+# A raw prelude prim: kaikai name, C forwarder symbol, param types,
+# return type. The types drive both the typer scheme and the raw call
+# emission (every param/return is raw; a `TyHandle` is a `void *`).
+pub type RPrelude = RP(String, String, [Ty], Ty)
+
+# The C-API primitives the native backend needs for the current step.
+# Step 1 (`main -> 42`) needs: build a module, the i64 / opaque-ptr
+# types, declare an external runtime fn, define a fn + entry block,
+# position a builder, emit a constant + a call + a return, define the
+# three runtime-entry no-ops, and emit the object file. The set grows
+# one step at a time (arithmetic, control flow, …); each addition keeps
+# the C forwarder + this entry + the typer scheme + the resolver name
+# in lockstep.
+pub fn rprelude_table() : [RPrelude] {
+  [
+    # --- module / context lifecycle ---
+    # Create a fresh context + module named `name`; returns the module
+    # handle (the context is owned by the module for the backend's
+    # lifetime). One-shot per compilation unit.
+    RP("llvm_module_new", "kai_llvm_module_new", [TyString], TyHandle),
+
+    # --- types ---
+    RP("llvm_int64_type", "kai_llvm_int64_type", [TyHandle], TyHandle),
+    RP("llvm_int32_type", "kai_llvm_int32_type", [TyHandle], TyHandle),
+    RP("llvm_ptr_type",   "kai_llvm_ptr_type",   [TyHandle], TyHandle),
+    RP("llvm_void_type",  "kai_llvm_void_type",  [TyHandle], TyHandle),
+    # Function types, by arity (the array-passing generalisation lands
+    # when calls with >1 fixed arg arrive). `fn_type_0` : ret (); a
+    # nullary fn. `fn_type_1` : ret (p0).
+    RP("llvm_fn_type_0",  "kai_llvm_fn_type_0",  [TyHandle], TyHandle),
+    RP("llvm_fn_type_1",  "kai_llvm_fn_type_1",  [TyHandle, TyHandle], TyHandle),
+
+    # --- functions / blocks / builder ---
+    # Add a function `name` of type `fnty` to module `m`; returns the
+    # function value handle.
+    RP("llvm_add_function", "kai_llvm_add_function", [TyHandle, TyString, TyHandle], TyHandle),
+    # Append a basic block named `name` to function `fn` (in module
+    # `m`'s context); returns the block handle.
+    RP("llvm_append_block", "kai_llvm_append_block", [TyHandle, TyHandle, TyString], TyHandle),
+    RP("llvm_builder_new",  "kai_llvm_builder_new",  [TyHandle], TyHandle),
+    RP("llvm_position_at_end", "kai_llvm_position_at_end", [TyHandle, TyHandle], TyUnit),
+
+    # --- values / instructions ---
+    # An i64 constant.
+    RP("llvm_const_int", "kai_llvm_const_int", [TyHandle, TyInt], TyHandle),
+    # A 0/1-argument call to a known function value. `call_0(b, fn,
+    # fnty)` / `call_1(b, fn, fnty, a0)` — `fnty` is the callee's
+    # function type (LLVMBuildCall2 needs it for opaque pointers).
+    RP("llvm_build_call_0", "kai_llvm_build_call_0", [TyHandle, TyHandle, TyHandle], TyHandle),
+    RP("llvm_build_call_1", "kai_llvm_build_call_1", [TyHandle, TyHandle, TyHandle, TyHandle], TyHandle),
+    RP("llvm_build_ret",    "kai_llvm_build_ret",    [TyHandle, TyHandle], TyUnit),
+    RP("llvm_build_ret_void", "kai_llvm_build_ret_void", [TyHandle], TyUnit),
+
+    # --- object emission ---
+    # Verify + emit `m` as an object file at `path`. Returns 0 on
+    # success, non-zero on failure (the driver surfaces the error).
+    RP("llvm_emit_object", "kai_llvm_emit_object", [TyHandle, TyString], TyInt)
+  ]
+}
+
+# Find a raw prelude prim by kaikai name. Consulted before the boxed
+# `prelude_find` in the emit-C call dispatch.
+pub fn rprelude_find(target: String) : Option[RPrelude] =
+  rprelude_find_loop(rprelude_table(), target)
+
+fn rprelude_find_loop(table: [RPrelude], target: String) : Option[RPrelude] = match table {
+  [] -> None
+  [rp, ...rest] -> match rp {
+    RP(name, _, _, _) -> if name == target { Some(rp) } else { rprelude_find_loop(rest, target) }
+  }
+}
+
+# The resolver pre-binds these names so the typer accepts a call to a
+# C-API prim as a known identifier (mirrors `prelude_names`).
+pub fn native_prim_names() : [String] = native_prim_names_loop(rprelude_table())
+
+fn native_prim_names_loop(table: [RPrelude]) : [String] = match table {
+  [] -> []
+  [RP(name, _, _, _), ...rest] -> [name, ...native_prim_names_loop(rest)]
+}

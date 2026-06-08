@@ -21,6 +21,30 @@ endif
 # of every $(CC) compile-and-link line that consumes runtime.h.
 LDLIBS_M := -lm
 
+# KIR Lane 1 (docs/kir-design.md §7.2) — in-process libLLVM backend.
+# OPT-IN ONLY: `make KAI_LLVM=1 kaic2` links stage2 against libLLVM so
+# the native backend can build the module via the LLVM C API in one
+# process (no `.ll` text, no clang subprocess). The DEFAULT build does
+# NOT link libLLVM — the C-text backend and the whole bootstrap chain
+# (stages 0–1 + C) never touch LLVM, so `bootstrap from any cc` is
+# intact. Discovery is via `llvm-config` (never a hardcoded version):
+# the LLVM C API is stable across major versions, so the binding
+# survives version bumps and the build stays off Apple clang.
+#
+# Dev-local links DYNAMIC (Homebrew `-lLLVM`); the release path links
+# STATIC (Rust/Zig/Julia model) so the shipped binary has no libLLVM
+# runtime dep and the brew formula needs no `depends_on llvm`. The
+# static-link release wiring rides Lane 1.5 (the default flip); this
+# lane sets up the dev link and the `#ifdef KAI_LLVM` runtime guard.
+LLVM_CONFIG ?= llvm-config
+ifeq ($(KAI_LLVM),1)
+LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs core analysis target native bitwriter) $(shell $(LLVM_CONFIG) --system-libs)
+else
+LLVM_CPPFLAGS :=
+LLVM_LDFLAGS  :=
+endif
+
 KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 
@@ -46,7 +70,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/doc_attr.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -102,7 +126,7 @@ build/stage2.c: build/bundle.kai $(KAIC1) | build
 	$(STACK) $(KAIC1) build/bundle.kai > $@
 
 $(TARGET): build/stage2.c
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M)
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build
@@ -3500,6 +3524,24 @@ test-unbox-phase2: $(TARGET) build
 	fi
 	@if grep -E 'kai_classify_raw\(void\) \{[^}]*kai_decref\(_scr\)' build/perceus-unbox_phase2_match.c; then \
 	  echo "unbox FAIL match (boxed _scr alias survived)"; exit 1; \
+	fi
+	@# match-raw unboxing (asu): a `match` whose RESULT is a raw scalar
+	@# (boxed variant scrutinee, Int arms) lowers `_r` as a raw int64_t —
+	@# no `_r = kai_unit()` boxed accumulator, no per-arm `kai_int(`
+	@# round-trip on the match result. This fixture is the ONLY thing
+	@# exercising the path: the compiler source has no match→scalar, so
+	@# selfhost byte-id stays green even if emit_match_raw regresses.
+	@# Without this grep the byte-id lies.
+	@grep -F -q 'int64_t _r = 0' build/perceus-unbox_phase2_match_scalar.c \
+	  || { echo "unbox FAIL match_scalar (match result not raw — _r not int64_t)"; exit 1; }
+	@if grep -E 'kai_area\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	  echo "unbox FAIL match_scalar (boxed _r accumulator survived in area)"; exit 1; \
+	fi
+	@# divergence: a `_ -> panic(...)` catch-all arm must NOT block raw
+	@# promotion — `sides` lowers `_r` raw and the panic arm emits the
+	@# call + break with no `_r =` (the common native-backend shape).
+	@if grep -E 'kai_sides\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	  echo "unbox FAIL match_scalar (panic catch-all blocked raw promotion in sides)"; exit 1; \
 	fi
 	@# Tongariki Real-unboxing — arith fixture. The chain must lower
 	@# to raw `double kair_*` locals with no `kai_op_add(` / `kai_op_mul(` /
