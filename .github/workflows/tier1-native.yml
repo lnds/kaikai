@@ -1,0 +1,113 @@
+name: tier1-native
+
+# tier1-native (KIR Lane 1.2, docs/kir-design.md §"Lane 1.2") gates the
+# in-process libLLVM NATIVE backend (`kaic2 --emit=native`,
+# docs/kir-design.md §7.2): it builds kaic2 with `KAI_LLVM=1`, then for
+# every examples/native/*.kai fixture emits a native object IN MEMORY
+# via the LLVM C API, links it against the effects runtime, runs it,
+# and diffs stdout + exit code against the C-direct backend (the
+# oracle). See tools/test-native-parity.sh.
+#
+# Why this is a SEPARATE path-gated workflow (not tier1): the native
+# backend is opt-in (Lane 1.5 flips the default). An opt-in backend is
+# invisible to tier1 unless something exercises it — and PR #780 proved
+# the cost: the native `main -> 42` spine was validated by hand, the
+# rebase silently re-broke the native prim dispatch in kaic1 (a
+# non-callable forwarder => runtime panic), and CI stayed green. This
+# workflow closes that hole. At the flip (Lane 1.5) it is promoted to
+# an always-on PR gate, the way tier1 protects the C default today.
+#
+# Path-gated like tier1-asan / tier1-backend-parity: only diffs to the
+# native backend, its prims, the runtime forwarders, the KIR lowering,
+# or the Makefile that builds it trigger this workflow.
+on:
+  pull_request:
+    paths:
+      - 'stage1/compiler.kai'
+      - 'stage2/compiler/emit_native.kai'
+      - 'stage2/compiler/native_prims.kai'
+      - 'stage2/compiler/kir.kai'
+      - 'stage2/compiler/kir_lower.kai'
+      - 'stage2/compiler/kir_lower_fns.kai'
+      - 'stage2/compiler/kir_lower_walk.kai'
+      - 'stage2/compiler/driver.kai'
+      - 'stage2/runtime.h'
+      - 'stage2/Makefile'
+      - 'stage0/runtime_llvm.c'
+      - 'examples/native/**'
+      - 'tools/test-native-parity.sh'
+      - '.github/workflows/tier1-native.yml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: tier1-native-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tier1-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Doc-only PRs short-circuit with SUCCESS (mirrors tier1-asan).
+      # The path filter above already excludes pure-doc PRs, but a PR
+      # that mixes a path-trigger file with doc edits would still spend
+      # a runner without this guard.
+      - name: Detect doc-only diff
+        id: doc-only
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if [ -z "$CHANGED" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Doc-only PR; skipping tier1-native build."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The native backend links against libLLVM (discovered via
+      # llvm-config). Ubuntu's llvm-dev ships a versioned llvm-config
+      # (e.g. llvm-config-18); resolve whichever the runner provides and
+      # export it for the stage2 Makefile + the harness.
+      - name: Install toolchain (clang + libLLVM)
+        if: steps.doc-only.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$LLVM_CONFIG" ]; then
+            echo "::error::no llvm-config found after installing llvm-dev"
+            exit 1
+          fi
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+          echo "using $LLVM_CONFIG ($($LLVM_CONFIG --version))"
+
+      - name: "tier1-native (every native fixture: emit -> link -> run -> diff vs C-direct)"
+        if: steps.doc-only.outputs.skip != 'true'
+        run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-parity.sh
+
+      - name: Working tree clean check
+        if: steps.doc-only.outputs.skip != 'true'
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-native; build artifacts leaked into tracked paths"
+            git status
+            exit 1
+          fi
