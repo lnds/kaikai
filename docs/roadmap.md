@@ -103,6 +103,12 @@ sweep plus the residual typer-side items.
 #### Wave 1 (`0.24.0`, shipped 2026-05-01) — `kai fmt` + TCO stage 1
 
 - `kai fmt` — gofmt-style deterministic formatter, no options.
+  Formats the full language surface — generics, effects, handlers,
+  protocols, impls, units, refinements — and round-trips all of
+  `stdlib/` + `stage2/compiler/` idempotently (issue #781 split the
+  formatter into A-grade modules and closed the last real gaps: real
+  literals now carry their raw span, typed single-lambda params keep
+  their parens; one documented trailing-comment edge remains).
 - TCO stage 1 mirror (issue #42) and precise per-call-site
   dropmask cons-cell case (issue #43). Housekeeping from 0.23.0.
 
