@@ -1,0 +1,218 @@
+# compiler/kir_lower_fns.kai — function/program-level lowering: the
+# entry point `lower_to_kir`, the per-decl fn walk, and the lifted
+# `KFnLambda` / `KFnClause` generation (+ handler decls, install order).
+#
+# These drive ON `lower_expr` (in `kir_lower_walk.kai`) but `lower_expr`
+# never calls back into them, so the import graph stays acyclic
+# (`kir_lower_fns → kir_lower_walk → kir_lower`). Splitting them out of
+# the Expr-SCC walk keeps each file within the quality-gate size cap
+# (the walk is the mutual-recursion core; this file is the orchestration
+# layer around it).
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.resolve
+import compiler.region
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_walk
+
+# --- Top-level: lower the whole program --------------------------------
+
+# Entry point (design §7 Lane 0). `raw_decls` is the post-perceus /
+# post-tcrec `[Decl]`; `regions` the region-mark metadata. Produces a
+# `KProgram` with everything resolved, so the translators resolve nothing
+# (design §5).
+pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
+                    fns: [EFn], variants: [EVar]) : KProgram / Console {
+  let types = lower_types(raw_decls, variants, [])
+  # The lifted-lambda table is the SAME analysis the emitters run
+  # (`collect_decls` over the global-name set) — reused, not re-derived.
+  let lc      = collect_lams(raw_decls, fns, variants)
+  let st0     = ls_new(fns, variants, lc.lams, collect_effect_names(raw_decls))
+  let kfns    = lower_fns(raw_decls, st0, [])
+  # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
+  # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
+  # `emit_clause_bodies`), appended after the ordinary fns.
+  let lamfns  = lower_lam_fns(lc.lams, st0, [])
+  let clsfns  = lower_clause_fns(lc.clauses, st0, [])
+  KProgram { types: types, fns: list_append(kfns, list_append(lamfns, clsfns)),
+             handlers: lower_handler_decls(lc.clauses, []),
+             install_order: kir_install_order(raw_decls),
+             regions: lower_regions(regions, []) }
+}
+
+# Run the shared lambda-collection pass (`collect_decls`) — the SAME
+# analysis the emitters run — to build the lifted-lambda + clause tables.
+# Mirror of the emitters' preamble: build the global-name set, walk decls.
+fn collect_lams(decls: [Decl], fns: [EFn], variants: [EVar]) : LamCollect / Console {
+  let globals = build_globals(fns, variants, collect_effect_names(decls), collect_op_qualified_names(decls))
+  collect_decls(decls, lc_new(globals))
+}
+
+# --- Ordinary functions -------------------------------------------------
+
+fn lower_fns(ds: [Decl], st: LowerSt, acc: [KFn]) : [KFn] / Console = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, params, ret_ty, _, body, _, _, mo) -> {
+      let kfn = lower_fn(name, params, ret_ty, body, mo, st)
+      lower_fns(rest, st, list_append(acc, [kfn]))
+    }
+    _ -> lower_fns(rest, st, acc)
+  }
+}
+
+# Lower one function to a KFn. Counters reset (Risk 2b); the enclosing-fn
+# key is the fn's own symbol so nested lambdas resolve to their LamInfo.
+# The body lowers into the entry block and whatever blocks the control
+# flow forks off; the final value seals the last block with `KRet`.
+fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
+            body: Expr, mo: Option[String], st0: LowerSt) : KFn / Console {
+  let sym = c_sym(name, mo)
+  let st = ls_enter_fn(st0, sym)
+  let kparams = lower_params(params, [])
+  let r = lower_expr(body, st)
+  match r {
+    LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
+                            ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
+                            region_id: None }
+  }
+}
+
+# --- Lambdas: lifted bodies as top-level `KFnLambda`s -------------------
+
+# One `KFnLambda` per lifted lambda. Its params are the lambda's own
+# params (`PDirect`) plus its captures (`PCapture`, read from `self`);
+# the body lowers with the lambda's id as the enclosing-fn key so a
+# nested lambda resolves to ITS LamInfo (mirror of emit_c's
+# `_kai_lam_<id>` enc_fn). Same body shape as a normal fn — only the
+# `kind` + param origins differ (asu review).
+fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match lams {
+  [] -> acc
+  [l, ...rest] -> lower_lam_fns(rest, st0, list_append(acc, [lower_lam_fn(l, st0)]))
+}
+
+fn lower_lam_fn(l: LamInfo, st0: LowerSt) : KFn / Console = match l {
+  LamInfo(id, _, _, _, params, caps, body) -> {
+    let sym = cat2("_kai_lam_", int_to_string(id))
+    let st = ls_enter_fn(st0, sym)
+    let kparams = list_append(lower_params(params, []), lower_captures(caps, 0, []))
+    match lower_expr(body, st) { LRes(val, st1) ->
+      KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
+            blocks: ls_finish(st1, KRet(val, kpos_of(body))), region_id: None } }
+  }
+}
+
+# Each capture name becomes a `PCapture(j)` param read from `self` at the
+# matching index (the order the collector recorded in the caps list).
+fn lower_captures(caps: [String], j: Int, acc: [KParam]) : [KParam] = match caps {
+  [] -> acc
+  [c, ...rest] -> lower_captures(rest, j + 1, list_append(acc, [capture_param(c, j)]))
+}
+
+# --- Clauses: lifted bodies as top-level `KFnClause`s -------------------
+
+# One `KFnClause` per handler clause. Params = the clause's args
+# (`PDirect`), the trailing `resume` continuation (`PResume`, used by the
+# body so it enters Perceus one-shot analysis), and the captures
+# (`PCapture`, read from the evidence env). The body lowers with the
+# clause's enc_fn as the lambda-scoping key.
+fn lower_clause_fns(clauses: [ClauseInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match clauses {
+  [] -> acc
+  [c, ...rest] -> lower_clause_fns(rest, st0, list_append(acc, [lower_clause_fn(c, st0)]))
+}
+
+fn lower_clause_fn(c: ClauseInfo, st0: LowerSt) : KFn / Console = match c {
+  CI(line, col, _, op, params, body, _, enc_fn, caps) -> {
+    let sym = clause_sym(line, col, op)
+    let st = ls_enter_fn(st0, enc_fn)
+    let kparams = list_append(lower_clause_params(params), lower_captures(caps, 0, []))
+    match lower_expr(body, st) { LRes(val, st1) -> {
+      let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
+      check_resume_one_shot(sym, blocks)
+      KFn { sym: sym, kind: KFnClause, params: kparams, ret: SBoxed,
+            blocks: blocks, region_id: None }
+    } }
+  }
+}
+
+# A clause's surface params: all but the last are ordinary args
+# (`PDirect`); the last is the `resume` continuation (`PResume`).
+fn lower_clause_params(params: [Param]) : [KParam] = {
+  let n = list_length(params)
+  lower_clause_params_idx(params, 0, n, [])
+}
+
+fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KParam] = match params {
+  [] -> acc
+  [p, ...rest] -> {
+    let origin = if i == n - 1 { PResume } else { PDirect(i) }
+    lower_clause_params_idx(rest, i + 1, n, list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: KOwn, origin: origin }]))
+  }
+}
+
+# --- Handler decls + one-shot resume check ------------------------------
+
+# One `KHandlerDecl` per (effect, handler-site) the clauses belong to.
+# Groups clauses by their (line, col) handler key, mapping each op to its
+# clause-thunk symbol so a `KInstall` resolves the right clause set.
+fn lower_handler_decls(clauses: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
+  [] -> acc
+  [CI(line, col, eff, op, _, _, _, _, _), ...rest] -> {
+    let sym = cat3("_kai_handler_", int_to_string(line), cat2("_", int_to_string(col)))
+    let ot  = KOT(op, clause_sym(line, col, op))
+    lower_handler_decls(rest, hdecl_add(acc, eff, sym, ot))
+  }
+}
+
+# Add an op-thunk to the matching handler decl, or create the decl.
+fn hdecl_add(acc: [KHandlerDecl], eff: String, sym: String, ot: KOpThunk) : [KHandlerDecl] = match acc {
+  [] -> [KHandlerDecl { eff: eff, sym: sym, op_thunks: [ot], ret_thunk: None }]
+  [h, ...rest] ->
+    if h.sym == sym { [KHandlerDecl { eff: h.eff, sym: h.sym, op_thunks: list_append(h.op_thunks, [ot]), ret_thunk: h.ret_thunk }, ...rest] }
+    else { [h, ...hdecl_add(rest, eff, sym, ot)] }
+}
+
+# The clause-thunk symbol for an op clause (mirror of emit_c's
+# `_kai_clause_<line>_<col>_<op>`). `pub` so the handle site
+# (`kir_lower_walk`) mints the matching `KInstall` handler symbol.
+pub fn clause_sym(line: Int, col: Int, op: String) : String =
+  concat_all(["_kai_clause_", int_to_string(line), "_", int_to_string(col), "_", op])
+
+# One-shot resume is PINNED (design decision): a clause must not resume
+# the continuation more than once on any path. `KResume` is a terminator,
+# so two resumes cannot sit in one block; the only multi-shot shape is a
+# back-edge (goto) into a block that already resumed. Flag a clause that
+# has BOTH a resume and a loop-forming terminator as a one-shot violation
+# (loud, not silent) — turning the runtime "resumed twice" error into a
+# compile-time structural check.
+fn check_resume_one_shot(sym: String, blocks: [KBlock]) : Unit / Console =
+  if resume_count(blocks, 0) > 1 and blocks_have_backedge(blocks) {
+    eprint(concat_all(["kir: one-shot resume violation in clause ", sym,
+                       " (resume reachable more than once)"]))
+  } else { () }
+
+fn resume_count(blocks: [KBlock], acc: Int) : Int = match blocks {
+  [] -> acc
+  [b, ...rest] -> resume_count(rest, acc + term_is_resume(b.term))
+}
+
+fn term_is_resume(t: KTerm) : Int = match t {
+  KResume(_, _, _, _)     -> 1
+  KResume2(_, _, _, _, _) -> 1
+  _                       -> 0
+}
+
+# A back-edge is a tcrec/trmc goto (the only loop-forming terminators the
+# lowering emits); a plain `KBr` always targets a forward continuation.
+fn blocks_have_backedge(blocks: [KBlock]) : Bool = match blocks {
+  [] -> false
+  [b, ...rest] -> match b.term {
+    KTcrecGoto(_, _, _, _)      -> true
+    KTrmcStep(_, _, _, _, _, _) -> true
+    _                           -> blocks_have_backedge(rest)
+  }
+}
