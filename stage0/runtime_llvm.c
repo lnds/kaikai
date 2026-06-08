@@ -709,6 +709,7 @@ KaiValue *kaix_prelude_real_atan2(KaiValue *a, KaiValue *b)              { retur
 KaiValue *kaix_prelude_mailbox_alloc(void)                               { return kai_prelude_mailbox_alloc(); }
 KaiValue *kaix_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { return kai_prelude_mailbox_alloc_bounded(cap, overflow); }
 KaiValue *kaix_prelude_mailbox_alloc_unowned(void)                       { return kai_prelude_mailbox_alloc_unowned(); }
+KaiValue *kaix_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) { return kai_prelude_mailbox_alloc_bounded_unowned(cap, overflow); }
 KaiValue *kaix_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_prelude_mailbox_assign_owner(pid, fiber); }
 KaiValue *kaix_prelude_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_prelude_mailbox_send(pid, msg); }
 KaiValue *kaix_prelude_mailbox_recv(KaiValue *pid)                       { return kai_prelude_mailbox_recv(pid); }
