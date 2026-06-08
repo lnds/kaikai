@@ -588,6 +588,20 @@ grow, not after.
 - **Deps:** Lane 1. **Hard prerequisite of Lane 1.5** — the default cannot flip to
   native until the native backend emits every program in full parity, which needs
   this lane. Do NOT treat the ad-hoc `main → 42` as "done".
+- **Status (2026-06-08, Parte A shipped):** piece 2 (reproducibility) is done. The
+  `--emit=native` panic was diagnosed to TWO coupled stage1 bugs — the production
+  kaic2 is compiled by kaic1 (type-blind), which (a) emitted the `llvm_*` prims
+  through the generic `kai_apply` closure path (a non-callable forwarder → runtime
+  panic) and (b) ran Perceus dup/drop over raw handles (RC corruption). Fixed by a
+  stage1 `rprelude_table` (per-arg marshalling + result-box) and a syntactic
+  Perceus exclusion of handle params + handle-prim lets. `main → 42` now emits →
+  links → runs reproducibly (exit code + stdout == C-direct; both 0 — the return
+  value is NOT an exit code, the brief's "exit 42" was a wrong observable). Wired
+  `examples/native/`, `tools/test-native-parity.sh`, and the path-gated
+  `tier1-native.yml`. Gates green: selfhost byte-id, tier0, ASAN+UBSan on the
+  native binary (handles proven out of the RC regime). Piece 1 (#779 EBlock-raw +
+  the generic walk) is **Parte B**, next in this lane. Retro:
+  `docs/lane-experience-kir-native-fix.md`.
 
 ### Lane 1.5 — flip the default to native
 - **Brief:** Once Lane 1 is in full parity, make the native backend the DEFAULT
