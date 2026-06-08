@@ -19,49 +19,14 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 
-# --- Top-level: lower the whole program --------------------------------
-
-# Entry point (design §7 Lane 0). `raw_decls` is the post-perceus /
-# post-tcrec `[Decl]`; `regions` the region-mark metadata. Produces a
-# `KProgram` with everything resolved, so the translators resolve nothing
-# (design §5).
-pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
-                    fns: [EFn], variants: [EVar]) : KProgram / Console {
-  let types = lower_types(raw_decls, variants, [])
-  let kfns  = lower_fns(raw_decls, ls_new(fns, variants), [])
-  KProgram { types: types, fns: kfns, handlers: [],
-             install_order: [], regions: lower_regions(regions, []) }
-}
-
-# --- Functions ----------------------------------------------------------
-
-fn lower_fns(ds: [Decl], st: LowerSt, acc: [KFn]) : [KFn] / Console = match ds {
-  [] -> acc
-  [d, ...rest] -> match d {
-    DFn(_, name, _, params, ret_ty, _, body, _, _, mo) -> {
-      let kfn = lower_fn(name, params, ret_ty, body, mo, st)
-      lower_fns(rest, st, list_append(acc, [kfn]))
-    }
-    _ -> lower_fns(rest, st, acc)
-  }
-}
-
-# Lower one function to a KFn. Counters reset (Risk 2b); the body lowers
-# into the entry block and whatever blocks the control flow forks off; the
-# final value seals the last block with `KRet`.
-fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
-            body: Expr, mo: Option[String], st0: LowerSt) : KFn / Console {
-  let st = ls_enter_fn(st0)
-  let kparams = lower_params(params, [])
-  let r = lower_expr(body, st)
-  match r {
-    LRes(val, st1) -> KFn { sym: c_sym(name, mo), params: kparams,
-                            ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                            is_handler_thunk: false, region_id: None }
-  }
-}
-
 # --- The Expr walk ------------------------------------------------------
+#
+# The program/fn-level orchestration (`lower_to_kir`, the per-decl walk,
+# and the lifted `KFnLambda` / `KFnClause` generation) lives in
+# `kir_lower_fns.kai` — it drives ON `lower_expr` but `lower_expr` never
+# calls back, so the split keeps the import graph acyclic and each file
+# within the size cap. This module is the Expr-SCC: the mutual recursion
+# `lower_expr ↔ lower_call ↔ lower_if/match/handle/list/...`.
 
 pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # Atoms: no statement, the literal IS the value.
@@ -73,7 +38,7 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EUnit              -> LRes(KUnitV, st)
   EUnder             -> LRes(KUnitV, st)
   EPlaceholder       -> LRes(KUnitV, st)
-  EVar(name)         -> LRes(KVar(name), st)
+  EVar(name)         -> lower_var(name, st)
 
   # A call / constructor / perceus mark / sentinel — the dense dispatch.
   ECall(f, cargs)    -> lower_call(x, f, cargs, st)
@@ -92,7 +57,7 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
     let ra = lower_expr(a, st)
     match ra { LRes(av, st1) -> {
       let rbv = lower_expr(b, st1)
-      match rbv { LRes(bv, st2) -> bind_op(st2, KPrim(op, [av, bv]), kpos_of(x)) }
+      match rbv { LRes(bv, st2) -> bind_op(st2, KPrim(binop_prim(op, a), [av, bv]), kpos_of(x)) }
     } }
   }
   EUnop(op, a)       -> {
@@ -104,10 +69,89 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EMatch(scr, arms)  -> lower_match(x, scr, arms, st)
   EBlock(stmts, tail) -> lower_block(x, stmts, tail, st)
 
-  # Forms the resolve/desugar/typer passes rewrite away before codegen
-  # never reach a post-perceus AST; lower to unit defensively (mirrors the
-  # emitters' dead arms) to keep the match exhaustive.
-  _ -> LRes(KUnitV, st)
+  # `[e0, e1, ..., ...spread]` → a cons/nil/append spine, reproducing the
+  # C emitter's `emit_list_tail` shape (the oracle). Interpolation
+  # desugars to `string_concat_all([parts])` long upstream, so closing
+  # EList closes interpolation too.
+  EList(elems)       -> lower_list(elems, kpos_of(x), st)
+
+  # Unit-annotated literal (`1.0<USD>`) is codegen-erased to its inner.
+  ELitUnit(inner, _) -> lower_expr(inner, st)
+
+  # An unfilled hole / `todo!(msg)` lowers to a loud runtime panic stub
+  # (mirror of the emitters: a binary with holes is runnable but aborts
+  # on first reach). The message bundles the location like emit_c does.
+  EHole(nm_opt)      -> lower_panic_stub(kir_hole_message(nm_opt, x), st)
+  ETodo(msg)         -> lower_panic_stub(kir_quote(cat2("todo: ", msg)), st)
+
+  # `variants[T]()` — the typer baked the resolved nullary-ctor names in;
+  # materialise them as a cons spine of nullary constructors (emit_c
+  # `emit_variants_of_list`). Reuses the list lowering over synthetic
+  # ctor-call elems.
+  EVariantsOf(_, names) -> lower_variants_of(names, kpos_of(x), st)
+
+  # A record literal `T { f: v, ... }` → a `kai_record(n, fields, names)`
+  # allocation. Lower each field value (left-to-right), pairing with its
+  # name; the translator builds the parallel value/name buffers.
+  ERecordLit(_, fis) -> lower_record_lit(fis, kpos_of(x), st)
+
+  # A range `lo..hi` / `lo..hi:step` → the runtime range builder.
+  ERange(lo, hi, stp) -> lower_range(lo, hi, stp, kpos_of(x), st)
+
+  # A qualified name in value position (`let f = mod.fn`) → a fn-value
+  # closure or a nullary-ctor value (emit_c's EModCall value arm).
+  EModCall(modn, name) -> lower_modcall_value(modn, name, kpos_of(x), st)
+
+  # An inline lambda → a `KClosure` over its lifted-body thunk symbol
+  # (`_kai_lam_<id>`), carrying its captures as atoms. The lifted body
+  # itself is a separate `KFnLambda` (generated in `lower_to_kir`); here
+  # we only build the closure value. The `LamInfo` is found by
+  # (enclosing-fn, line, col) — the key the collector stamped.
+  ELambda(_, _)      -> lower_lambda_ref(x, st)
+
+  # An effect handler. Materialises the handler frame as a double fork
+  # (install + setjmp-split + inline body + return clause), the same
+  # block-building discipline as if/match (asu review). The clause bodies
+  # are separate `KFnClause`s generated in `lower_to_kir`.
+  EHandle(body, eff, _, init_opt, alias_opt, _, ret_opt) ->
+    lower_handle(x, body, eff, init_opt, alias_opt, ret_opt, st)
+
+  # Forms the resolve / desugar / typer passes rewrite away before codegen
+  # (`EMapPipe`/`EFlatMapPipe`/`EFilterPipe` → ECall, `EPipe` desugared,
+  # `EIndex` → call, `EUnder`/`EPlaceholder` pattern-only). These never
+  # reach a post-perceus AST; lowering to unit keeps the match exhaustive
+  # and mirrors the emitters' dead arms.
+  EPipe(_, _)        -> LRes(KUnitV, st)
+  EMapPipe(_, _)     -> LRes(KUnitV, st)
+  EFlatMapPipe(_, _) -> LRes(KUnitV, st)
+  EFilterPipe(_, _)  -> LRes(KUnitV, st)
+  EIndex(_, _)       -> LRes(KUnitV, st)
+
+  # Anything else reaching here is a node codegen DOES handle that the
+  # lowering has not yet covered — a silent unit would mis-lower it (the
+  # Lane 0 gap class). Trap it loudly during development so the next
+  # unhandled family cannot slip through unnoticed (lane discipline).
+  _ -> lower_unhandled(x, st)
+}
+
+# Loud trap for an AST node the lowering does not yet cover but codegen
+# does. Prints the kind + position to stderr and lowers to unit so the
+# dump still completes; the parity gate (not "no panic") is what catches
+# the divergence. Replaces the old silent catch-all (Lane 0 gap).
+fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
+  eprint(concat_all(["kir: unhandled expr kind ", kir_expr_kind_name(x.kind),
+                     " at ", int_to_string(x.line), ":", int_to_string(x.col)]))
+  LRes(KUnitV, st)
+}
+
+# An `EVar` is either a local binder (→ a `KVar` atom read) or a
+# first-class reference to a top-level fn (→ a `KClosure` over the fn's
+# thunk, arity from the EFn table). The latter is how `sort_by(xs, cmp)`
+# passes `cmp` by value. Local binders are not in the EFn table, so a
+# resolve miss means a genuine local.
+fn lower_var(name: String, st: LowerSt) : LRes / Console = match ls_fn_value(st, name) {
+  Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
+  None                   -> LRes(KVar(name), st)
 }
 
 # Lower a list of expressions left-to-right (Risk 2a), collecting atoms.
@@ -116,6 +160,140 @@ pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = 
   [e, ...rest] -> match lower_expr(e, st) {
     LRes(v, st1) -> lower_exprs(rest, st1, list_append(acc, [v]))
   }
+}
+
+# --- List literals (and interpolation, which desugars to a list) --------
+
+# `[e0, ..., ...spread]` → a cons/nil/append spine. Reproduces the C
+# emitter's `emit_list_tail` (the byte-id oracle): nil for the empty
+# tail, `kai_cons(h, t)` for a plain head, `kai_prelude_list_append(h, t)`
+# for a mid-list spread, and a `kai_incref(h)` fast-path for a trailing
+# spread (O(1) ownership transfer, not an O(n) spine copy). Head is
+# lowered before the tail to keep left-to-right evaluation order.
+# Region-arena cons (`kai_arena_cons`) is a later milestone (#120): the
+# block carries no region_id yet, so the default (RC) allocator is used.
+fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = match elems {
+  [] -> bind_op(st, KPrim("kai_nil", []), pos)
+  [el] -> lower_list_last(el, pos, st)
+  [el, ...rest] -> match el {
+    ElPlain(x)  -> lower_list_cons(x, rest, "kai_cons", pos, st)
+    ElSpread(x) -> lower_list_cons(x, rest, "kai_prelude_list_append", pos, st)
+  }
+}
+
+# The final element: a plain head conses onto `nil`; a trailing spread is
+# `kai_incref(xs)` — unless `xs` is a `__perceus_dup(...)` (already owned;
+# an outer incref would double-bump, issue #212), in which case the dup's
+# own lowering is the result.
+fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = match el {
+  ElPlain(x) -> match lower_expr(x, st) { LRes(hdv, st1) ->
+    match bind_op(st1, KPrim("kai_nil", []), pos) { LRes(nilv, st2) ->
+      bind_op(st2, KPrim("kai_cons", [hdv, nilv]), pos) } }
+  ElSpread(x) -> if is_perceus_dup_expr(x) { lower_expr(x, st) }
+    else { match lower_expr(x, st) { LRes(spv, st1) ->
+      bind_op(st1, KPrim("kai_incref", [spv]), pos) } }
+}
+
+# A head (plain or spread) joined to the lowered rest by `prim`
+# (`kai_cons` for a plain head, `kai_prelude_list_append` for a spread).
+fn lower_list_cons(x: Expr, rest: [ListElem], prim: String, pos: KPos, st: LowerSt) : LRes / Console =
+  match lower_expr(x, st) { LRes(hdv, st1) ->
+    match lower_list(rest, pos, st1) { LRes(tlv, st2) ->
+      bind_op(st2, KPrim(prim, [hdv, tlv]), pos) } }
+
+# Is `x` a `__perceus_dup(arg)` call? (Issue #212: a spread over a dup is
+# already owned, so the list spine must not re-incref it.) The callee name
+# is compared with `==` (not a literal pattern — kaikai patterns do not
+# bind string literals nested inside a constructor pattern).
+fn is_perceus_dup_expr(x: Expr) : Bool = match x.kind {
+  ECall(f, _) -> match f.kind { EVar(nm) -> nm == "__perceus_dup" _ -> false }
+  _ -> false
+}
+
+# --- Holes / todo! → panic stub -----------------------------------------
+
+# A runtime panic over a message string (the hole / todo lowering, and
+# the match-non-exhaustive fallback shape). `msg` is an ALREADY-QUOTED
+# source span (so `KStrV` round-trips it like a literal).
+fn lower_panic_stub(msg: String, st: LowerSt) : LRes / Console =
+  bind_op(st, KPrim("kai_prelude_panic", [KStrV(msg)]), KNoPos)
+
+# Wrap a plain string in source-span quotes so `KStrV` treats it as a
+# literal (the dumper / translator strip the quotes back off).
+fn kir_quote(s: String) : String = cat3("\"", s, "\"")
+
+# The hole panic message, bundling label + location like emit_c does.
+fn kir_hole_message(nm_opt: Option[String], x: Expr) : String {
+  let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+  kir_quote(concat_all(["unfilled hole: ", label, " at line ",
+                        int_to_string(x.line), " col ", int_to_string(x.col)]))
+}
+
+# --- variants[T]() / record literal / range / modcall-value -------------
+
+# `variants[T]()` → a cons spine of nullary constructors, one `KCon` per
+# resolved name. Built tail-first so evaluation order matches emit_c.
+fn lower_variants_of(names: [String], pos: KPos, st: LowerSt) : LRes / Console = match names {
+  [] -> bind_op(st, KPrim("kai_nil", []), pos)
+  [n, ...rest] -> {
+    let tag = ls_variant_tag(st, n)
+    match bind_op(st, KCon(n, tag, []), pos) { LRes(hdv, st1) ->
+      match lower_variants_of(rest, pos, st1) { LRes(tlv, st2) ->
+        bind_op(st2, KPrim("kai_cons", [hdv, tlv]), pos) } }
+  }
+}
+
+# `T { f0: v0, ... }` → a `KRecord` op carrying each (name, value-atom).
+# Field values lower left-to-right; the translator emits the parallel
+# value/name buffers `kai_record` takes.
+fn lower_record_lit(fis: [FieldInit], pos: KPos, st: LowerSt) : LRes / Console =
+  match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
+    bind_op(st1, KRecord(pairs), pos) }
+
+fn lower_field_inits(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match fis {
+  [] -> RecPlan(acc, st)
+  [FI(fname, fe), ...rest] -> match lower_expr(fe, st) { LRes(v, st1) ->
+    lower_field_inits(rest, st1, list_append(acc, [KFI(fname, v)])) }
+}
+
+# `lo..hi` / `lo..hi:step` → the runtime range builder prim.
+fn lower_range(lo: Expr, hi: Expr, stp: Option[Expr], pos: KPos, st: LowerSt) : LRes / Console =
+  match lower_expr(lo, st) { LRes(lov, st1) -> match lower_expr(hi, st1) { LRes(hiv, st2) ->
+    match stp {
+      None -> bind_op(st2, KPrim("kai_range", [lov, hiv]), pos)
+      Some(se) -> match lower_expr(se, st2) { LRes(sv, st3) ->
+        bind_op(st3, KPrim("kai_range_step", [lov, hiv, sv]), pos) }
+    } } }
+
+# A qualified name as a value: a nullary ctor → the ctor value; otherwise
+# a fn-value closure over the qualified thunk (emit_c's EModCall arm).
+fn lower_modcall_value(modn: String, name: String, pos: KPos, st: LowerSt) : LRes / Console =
+  if kir_name_is_ctor(name) { bind_op(st, KCon(name, ls_variant_tag(st, name), []), pos) }
+  else { match ls_fn_value_qualified(st, modn, name) {
+    FV(thunk, arity) -> bind_op(st, KClosure(thunk, arity, []), pos) } }
+
+# An inline lambda use-site → a `KClosure` over `_kai_lam_<id>` with the
+# captures lowered as atoms (each a read of the captured binder in the
+# current scope). The `LamInfo` (id, params, caps) is looked up by
+# (enclosing-fn, line, col). A miss means the collector and lowering
+# disagree on the key — surface it loudly rather than emit a bad closure.
+fn lower_lambda_ref(x: Expr, st: LowerSt) : LRes / Console =
+  match find_lam(st.lams, st.enc_fn, x.line, x.col) {
+    Some(LamInfo(id, _, _, _, params, caps, _)) ->
+      match lower_capture_atoms(caps, st, []) { LResMany(capvs, st1) ->
+        bind_op(st1, KClosure(cat2("_kai_lam_", int_to_string(id)),
+                              list_length(params), capvs), kpos_of(x)) }
+    None -> { eprint(concat_all(["kir: lambda info missing at ",
+                                 int_to_string(x.line), ":", int_to_string(x.col)]));
+              LRes(KUnitV, st) }
+  }
+
+# Lower each capture NAME to an atom (a read of that binder). Captures are
+# surface identifiers free in the lambda body — `KVar` reads in the
+# enclosing scope.
+fn lower_capture_atoms(caps: [String], st: LowerSt, acc: [KVal]) : LResMany / Console = match caps {
+  [] -> LResMany(acc, st)
+  [c, ...rest] -> lower_capture_atoms(rest, st, list_append(acc, [KVar(c)]))
 }
 
 # --- Blocks -------------------------------------------------------------
@@ -195,8 +373,10 @@ fn lower_else_into(e_opt: Option[Expr], join: String, lcont: String,
 
 # `match scr { arms }`: switch on the scrutinee tag, one block per arm,
 # each storing its body into a shared join and branching to a continuation.
-# The scrutinee + tag read live here; the block-building (flat) is
-# delegated to `lower_match_blocks` to keep each function's nesting low.
+# `match scr { arms }`: read the scrutinee tag (`KTagOf`) and switch on
+# it (design §4.2 `KSwitch` over the tag atom). The scrutinee atom flows
+# to the arm bodies for `KProj` field reads; the tag atom drives the
+# switch terminator.
 fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
   match lower_expr(scr, st) { LRes(scrv, st1) ->
     match bind_op(st1, KTagOf(scrv), kpos_of(x)) { LRes(tagv, st2) ->
@@ -213,48 +393,92 @@ fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
 # instead of trapping (Linus review #3).
 fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(join, st3) -> {
-    let st_decl = ls_emit(st3, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+    # perceus's reuse recogniser refers to the scrutinee through the
+    # synthetic `__pcs_scr` / `__pcs_scr_drop` names (the donor of a
+    # `KConReuse`). Alias both to the lowered scrutinee here so those
+    # reads resolve — without the binding the reuse donor is a free
+    # variable in the KIR (a correctness gap, not a backend concern);
+    # the direct emitters bind the same locals in their match-arm prologue
+    # (emit_c / emit_llvm `push_local("__pcs_scr", scr)`).
+    let st_scr = ls_emit(ls_emit(st3, KLet("__pcs_scr", SBoxed, KLitOp(scrv), kpos_of(x))),
+                         KLet("__pcs_scr_drop", SBoxed, KLitOp(scrv), kpos_of(x)))
+    let st_decl = ls_emit(st_scr, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
     match two_labels(st_decl) { LSL2(lcont, ldef, st4) ->
       match plan_arms(arms, st4, []) { ArmPlan(cases, st5) -> {
         let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
-        let st7 = ls_seal(st6, KUnreachable(KNoPos), lcont)
+        # The default block holds the catch-all arm's body (a `_` or other
+        # non-variant pattern → tag -1, routed here rather than to a
+        # duplicate switch case). With no catch-all the match is variant-
+        # exhaustive, so the default is `KUnreachable` (Linus review #3).
+        let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, st6)
         let st8 = lower_arm_bodies(arms, cases, scrv, join, lcont, st7)
         LRes(KVar(join), reopen(st8, lcont))
       } } }
   } }
 
-# One block label per arm paired with the arm's tag, deterministically.
+# A block label per VARIANT arm paired with its tag. Non-variant arms
+# (tag -1, e.g. a wildcard `_`) get NO switch case — they are the default
+# block (`lower_default_arm`); emitting them as cases would create
+# duplicate `i64 -1` switch entries (invalid IR).
 fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match arms {
   [] -> ArmPlan(acc, st)
-  [Arm(p, _, _), ...rest] -> match ls_fresh_label(st) { LSLabel(lbl, st1) -> {
-    let tag = arm_tag(p, st1)
-    plan_arms(rest, st1, list_append(acc, [KC(tag, lbl)]))
-  } }
+  [Arm(p, _, _), ...rest] -> {
+    let tag = arm_tag(p, st)
+    if tag < 0 { plan_arms(rest, st, acc) }
+    else { match ls_fresh_label(st) { LSLabel(lbl, st1) ->
+      plan_arms(rest, st1, list_append(acc, [KC(tag, lbl)])) } }
+  }
 }
 
-# The variant tag an arm matches. Non-variant patterns carry tag -1 so the
-# switch routes them via the default path (exact literal dispatch is a
-# later refinement).
+# Lower the catch-all arm's body into the default block, or seal it
+# `KUnreachable` when the match is variant-exhaustive. Exact literal
+# dispatch (`match n { 0 -> ...; 1 -> ... }`) is a later refinement:
+# multiple non-variant arms collapse to one default here (only the first
+# catch-all body is lowered), so a literal-discriminated match is a known
+# gap, tracked separately from the wildcard case this handles.
+fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
+                     ldef: String, st: LowerSt) : LowerSt / Console =
+  match first_default_arm(arms) {
+    Some(body) -> lower_branch_into(body, join, lcont, reopen(st, ldef))
+    None       -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
+  }
+
+fn first_default_arm(arms: [Arm]) : Option[Expr] = match arms {
+  [] -> None
+  [Arm(p, _, body), ...rest] -> if arm_is_default(p) { Some(body) } else { first_default_arm(rest) }
+}
+
+fn arm_is_default(p: Pattern) : Bool = match p.pkind {
+  PVariant(_, _)       -> false
+  PVariantRecord(_, _) -> false
+  _                    -> true
+}
+
+# The variant tag an arm matches. Non-variant patterns carry tag -1 so
+# `plan_arms` routes them to the default path instead of a switch case.
 fn arm_tag(p: Pattern, st: LowerSt) : Int = match p.pkind {
   PVariant(name, _)       -> ls_variant_tag(st, name)
   PVariantRecord(name, _) -> ls_variant_tag(st, name)
   _                       -> 0 - 1
 }
 
-# Lower each arm body into its block, binding the pattern's sub-fields from
-# the scrutinee (via KProj) first; each block stores into join + branches.
+# Lower each VARIANT arm body into its case block (default arm handled
+# separately). `cases` and the variant arms line up positionally because
+# `plan_arms` skipped the non-variant arms in the same order.
 fn lower_arm_bodies(arms: [Arm], cases: [KCase], scrv: KVal, join: String,
                     lcont: String, st: LowerSt) : LowerSt / Console = match arms {
   [] -> st
-  [Arm(p, _, body), ...rest] -> match cases {
-    [KC(_, lbl), ...crest] -> {
-      let st_arm = reopen(st, lbl)
-      let st_bound = bind_pattern_fields(p, scrv, st_arm)
-      let st_body = lower_branch_into(body, join, lcont, st_bound)
-      lower_arm_bodies(rest, crest, scrv, join, lcont, st_body)
-    }
-    [] -> st
-  }
+  [Arm(p, _, body), ...rest] ->
+    if arm_is_default(p) { lower_arm_bodies(rest, cases, scrv, join, lcont, st) }
+    else { match cases {
+      [KC(_, lbl), ...crest] -> {
+        let st_arm = reopen(st, lbl)
+        let st_bound = bind_pattern_fields(p, scrv, st_arm)
+        let st_body = lower_branch_into(body, join, lcont, st_bound)
+        lower_arm_bodies(rest, crest, scrv, join, lcont, st_body)
+      }
+      [] -> st
+    } }
 }
 
 # Bind a variant pattern's positional sub-binders from the scrutinee by
@@ -274,6 +498,76 @@ fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerS
   }
 }
 
+# --- Effect handlers ----------------------------------------------------
+
+# Materialise an effect handler as a double fork (asu review): a join
+# `result` slot, then `install eff` + `setjmp eff` + `condbr` splitting
+# the normal body path from the longjmp-discard path. The body lowers
+# INLINE (it runs in the handle's frame, capturing the whole scope), pops
+# the evidence on its normal exit, and stores into `result`; the discard
+# path stores the discarded value. The return clause (if any) lowers
+# inline over `result` at the merge. The clause bodies are separate
+# `KFnClause`s (generated in `lower_to_kir`).
+fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
+                alias_opt: Option[String], ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
+  let sym = cat3("_kai_handler_", int_to_string(x.line), cat2("_", int_to_string(x.col)))
+  match lower_init_opt(init_opt, st) { LResOpt(initv, st1) ->
+    match ls_fresh_reg(st1) { LSReg(result, st2) -> {
+      let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+      let st4 = ls_emit(st3, KInstall(eff, sym, initv, alias_opt, kpos_of(x)))
+      lower_handle_fork(x, body, eff, result, ret_opt, st4)
+    } } }
+}
+
+# The setjmp split: `condbr (setjmp eff) ? Ldiscard : Lbody`. Lbody runs
+# the body inline, pops, stores; Ldiscard stores the longjmp-returned
+# value; both branch to Lret, where the return clause lowers over result.
+fn lower_handle_fork(x: Expr, body: Expr, eff: String, result: String,
+                     ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
+  match bind_op(st, KSetjmp(eff), kpos_of(x)) { LRes(jmpv, st1) ->
+    match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
+      let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
+      let st4 = lower_handle_body(body, eff, result, lret, st3)
+      let st5 = lower_handle_discard(result, lret, ldisc, st4)
+      lower_handle_ret(result, ret_opt, lret, st5)
+    } } }
+
+# Lbody: lower the body inline, store it into result, pop the evidence,
+# branch to the merge. The pop sits on the NORMAL exit only — the
+# discard path's longjmp already unwound past it (asu soundness note).
+fn lower_handle_body(body: Expr, eff: String, result: String, lret: String, st: LowerSt) : LowerSt / Console =
+  match lower_expr(body, st) { LRes(bv, st1) -> {
+    let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
+    let st3 = ls_emit(st2, KPop(eff, kpos_of(body)))
+    ls_seal(st3, KBr(lret, kpos_of(body)), lret)
+  } }
+
+# Ldiscard: the value the longjmp landed with becomes the result (the
+# clause already produced it and popped the evidence). The runtime hands
+# it back through the handler's discard slot — modelled as a unit store
+# placeholder the backend fills from the landing pad.
+fn lower_handle_discard(result: String, lret: String, ldisc: String, st: LowerSt) : LowerSt / Console {
+  let st1 = ls_emit(reopen(st, ldisc), KStore(result, KVar("__kai_discard"), KNoPos))
+  ls_seal(st1, KBr(lret, KNoPos), lret)
+}
+
+# Lret: apply the return clause (if any) inline over `result`, binding its
+# param to the body result; the clause body's value is the handle's
+# value. With no return clause the result passes through unchanged.
+fn lower_handle_ret(result: String, ret_opt: Option[HReturn], lret: String, st: LowerSt) : LRes / Console =
+  match ret_opt {
+    None -> LRes(KVar(result), reopen(st, lret))
+    Some(HR(pname, rexpr, _, _)) -> {
+      let st1 = ls_emit(reopen(st, lret), KLet(pname, SBoxed, KLitOp(KVar(result)), KNoPos))
+      lower_expr(rexpr, st1)
+    }
+  }
+
+fn lower_init_opt(init_opt: Option[Expr], st: LowerSt) : LResOpt / Console = match init_opt {
+  None    -> LResOpt(None, st)
+  Some(e) -> match lower_expr(e, st) { LRes(v, st1) -> LResOpt(Some(v), st1) }
+}
+
 # --- Calls: dispatch by callee shape -----------------------------------
 
 fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match f.kind {
@@ -289,21 +583,44 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = m
 }
 
 # The dense dispatch: perceus marks → KRC; sentinels → terminators;
-# resume → resume terminator; constructor / ordinary call otherwise.
-fn lower_named_call(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console {
-  if callee == "__perceus_dup"  { lower_rc_unary(cargs, KDupMk, st) }
-  else if callee == "__perceus_drop" { lower_rc_unary(cargs, KDropMk, st) }
-  else if callee == "__perceus_borrow" { lower_borrow_through(cargs, st) }
-  else if callee == "__perceus_reuse_variant" { lower_reuse(x, cargs, st) }
-  else if callee == "__perceus_reuse_cons"    { lower_reuse(x, cargs, st) }
-  else if callee == "__perceus_reuse_record"  { lower_reuse(x, cargs, st) }
-  else if string_starts_with_q(callee, "__kai_trmc|") { lower_trmc_step(x, callee, cargs, st) }
-  else if callee == "__kai_trmc_apply"               { lower_trmc_apply(x, cargs, st) }
-  else if es_tcrec_is_sentinel(callee)               { lower_tcrec(x, callee, cargs, st) }
-  else if callee == "resume" { lower_resume(x, cargs, st) }
-  else if kir_name_is_ctor(callee) { lower_ctor_call(x, callee, cargs, st) }
-  else { lower_direct_call(x, c_sym_of_callee_st(st, callee), cargs, st) }
-}
+# resume → resume terminator; constructor / ordinary call otherwise. The
+# string-matching lives in the pure `classify_callee` (base); the walk
+# only routes the resulting `CalleeKind` to its lowering.
+fn lower_named_call(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match split_eff_op(callee, st.effs) {
+    Some(EffOp(eff, op)) -> lower_perform(x, eff, op, cargs, st)
+    None                 -> lower_named_call_kind(x, callee, cargs, st)
+  }
+
+# Dispatch a non-effect-op bare call by its `CalleeKind`.
+fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match classify_callee(callee) {
+    CkDup       -> lower_rc_unary(cargs, KDupMk, st)
+    CkDrop      -> lower_rc_unary(cargs, KDropMk, st)
+    CkBorrow    -> lower_borrow_through(cargs, st)
+    CkReuse     -> lower_reuse(x, cargs, st)
+    CkTrmcStep  -> lower_trmc_step(x, callee, cargs, st)
+    CkTrmcApply -> lower_trmc_apply(x, cargs, st)
+    CkTcrec     -> lower_tcrec(x, callee, cargs, st)
+    CkResume    -> lower_resume(x, cargs, st)
+    # `__strip_unit(e)` is a compile-time unit erasure — identity at
+    # runtime, so lower the inner expr directly (like `__perceus_borrow`).
+    CkStripUnit -> lower_borrow_through(cargs, st)
+    CkCtor      -> lower_ctor_call(x, callee, cargs, st)
+    # A bare callee that resolves to a top-level fn is a direct call; one
+    # that does not is a LOCAL binder holding a function value (a param /
+    # let-bound closure like `dec` in `dec(buf, pos)`) → call it through
+    # `kaix_apply`. The same EFn-table test as `lower_var` (locals are
+    # never in the table).
+    CkDirect    -> lower_callee_dispatch(x, callee, cargs, st)
+  }
+
+# An effect op call `Eff.op(args)` → a `KPerform`. The dispatch (evidence
+# lookup + clause call) is the backend's; `KPerform` carries the effect,
+# op, and args, plus the non-local-discard semantics (asu review).
+fn lower_perform(x: Expr, eff: String, op: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
+    bind_op(st1, KPerform(eff, op, avs), kpos_of(x)) }
 
 # --- Perceus RC marks → first-class KRC statements (§4.7) ---------------
 
@@ -368,6 +685,17 @@ fn lower_ctor_call(x: Expr, name: String, cargs: [Expr], st: LowerSt) : LRes / C
 fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
     bind_op(st1, KCall(sym, avs), kpos_of(x)) }
+
+# Route a bare-name call: a top-level fn or a prelude builtin is a direct
+# `KCall`; anything else is a local binder holding a function value, so
+# call it indirectly through `KCallIndirect` (a `kaix_apply`).
+fn lower_callee_dispatch(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+  if callee_is_direct(st, callee) {
+    lower_direct_call(x, c_sym_of_callee_st(st, callee), cargs, st)
+  } else {
+    match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
+      bind_op(st1, KCallIndirect(KVar(callee), avs), kpos_of(x)) }
+  }
 
 # --- Resume / sentinels → typed terminators ----------------------------
 
