@@ -621,10 +621,12 @@ the same as `Console`: panic with a banner on stderr.
 
 ### What's not in v1 (planned extensions)
 
-- Calendar arithmetic (years, months, time zones, DST). v1 keeps
-  `Instant` and `Duration` opaque and timezone-agnostic; calendar
-  types and conversions land in a future `time.calendar`
-  extension.
+- Time zones and DST. `Instant` and `Duration` stay opaque and
+  timezone-agnostic. Civil calendar types and arithmetic (dates,
+  months, leap years) shipped as the top-level `stdlib/date.kai`
+  module (#767) — pure, timezone-naive, with a UTC-interpreting
+  `from_walltime` bridge and `today() / Clock`. tzdata/DST-aware
+  conversions remain future work.
 - Named timers (cancellable via handle): `at(deadline: Instant) :
   Timer`, `cancel(t: Timer) : Unit`. The `sleep`-via-`Cancel`
   pattern covers most needs; named timers are for cases where
