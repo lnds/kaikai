@@ -1,22 +1,29 @@
 # KIR — kaikai Intermediate Representation (design)
 
-**Status:** proposal / lane prep. Not yet implemented.
+**Status:** Lane 0 (KIR types + AST→KIR lowering + `--emit=kir` dumper) shipped on
+main; lowering-completion (interp/closures/effects) in progress. Lane 1
+(in-process libLLVM backend) is the destination, not yet started.
 **Scope:** stage 2 only. Does not touch the bootstrap contract (stages 0–1 keep
-emitting portable C from any `cc`).
-**Motivation:** unify the two AST→target lowerings (`emit_c.kai`, `emit_llvm.kai`)
-under one intermediate representation, killing the structural duplication and the
-double-paid bug harvest measured between the two backends.
+emitting portable C from any `cc`); the in-process libLLVM backend is opt-in and
+never enters the bootstrap chain.
+**Motivation:** (1) strategic — KIR is the launch platform for a native, in-process
+libLLVM backend (§7.2): native code via the LLVM C API, no `.ll` text, no `clang`
+subprocess, serving the fast-compiler and native-codegen goals. (2) structural —
+one AST→target lowering instead of the duplicated `emit_c.kai` / `emit_llvm.kai`
+pair (§1), with C-direct staying the mature oracle and bootstrap path.
 
-**This is NOT a performance change.** KIR is a maintainability/correctness
-refactor. The C-from-KIR output is byte-identical to today's C (a hard gate, §7
-Lane 3 / 4) → same binary → same runtime speed. The path to lower the Koka gap
-lives in the runtime and the data-structure/zipper algorithm (per the rb-tree
-perf memories), not in how code is emitted — KIR neither helps nor hurts there
-directly. What KIR *does* for performance is indirect: a codegen optimisation
-(reuse-in-place, i64-inline, TRMC) is written **once** in the AST→KIR lowering
-instead of twice, so improvements reach both backends without re-paying bugs. KIR
-makes chasing 1×C *sustainable in one place*; it does not itself close the gap. Do
-not read this doc as a route to native parity.
+**The near-term framing is a maintainability/correctness refactor; the strategic
+goal is a native backend (§7.2).** As a refactor, KIR unifies the AST→target
+lowering so it is written once. As a strategy, KIR is the launch platform for an
+**in-process libLLVM backend** (Lane 1) — native code via the LLVM C API, no `.ll`
+text, no `clang` subprocess — which serves both the "fast compiler" and "native
+codegen without an external toolchain" goals. IF the C-text backend is later moved
+under KIR (Lane 2, deferrable cleanup), its output is byte-identical to today's C
+as a migration proof. The path to lower the Koka gap lives in the runtime and the
+data-structure/zipper algorithm (per the rb-tree perf memories), not in how code is
+emitted; what KIR does for performance is to let a codegen optimisation
+(reuse-in-place, i64-inline, TRMC) be written **once** in the AST→KIR lowering and
+reach every consumer.
 
 ---
 
@@ -354,6 +361,20 @@ target differ, and the differences are the point:
 
 ## 6. Soundness risks (concrete)
 
+**Risk 0 — Silent catch-all swallows a live AST family (ALREADY HIT, 2026-06-08).**
+The lowering `lower_expr` ends with a `_ -> <unit>` catch-all "for forms desugared
+before codegen." A first cut of Lane 0 let that arm silently swallow THREE families
+the emitters DO handle — string interpolation (`#{x}` → `string_concat_all(())`,
+parts lost), closures (`ELambda` → no `KClosure`), effect bodies (`handle`/`resume`
+→ `ret ()`). It passed a "304/304 lower without panic" gate because
+unit-instead-of-correct does not crash; it would have produced wrong binaries.
+**Mitigation, now mandatory:** the lowering gate measures CORRECTNESS, not absence
+of panic — behavioural faithfulness checked against C-direct (the oracle), with a
+golden per family. During development the catch-all should `panic`/log the
+unhandled `ExprKind` so a missing family is loud, not silent. Any `ExprKind` the
+mature emitter handles reaching the catch-all is a bug. (This is why Lane 0's brief
+now says "COMPLETE lowering" and lists interp/closures/effects explicitly.)
+
 **Risk 1 — Tail-position. KIR RESOLVES it structurally.** perceus deliberately
 does NOT place drops in tail position (it would drop *after* the tail via a
 `__pcs_block_ret` wrap, hiding the self-tail-call from `tcrec_rewrite_decls`;
@@ -433,21 +454,37 @@ requirement is not optional: omitting it silently blocks #500.*
 
 ## 7. Lane plan (ELP)
 
-**Strategy: parallel layer + LLVM first, C as differential oracle, byte-id
-preserved at every step.**
+**Strategy: the destination is the in-process libLLVM backend (§7.2). The
+critical path to it is short — `Lane 0 (KIR + lowering) → Lane 1 (in-process
+libLLVM)` — validated against C-direct, the mature backend that already exists
+and stays untouched as the oracle. Everything else is off the critical path.**
 
-Why **LLVM first**: the C backend is the mature differential oracle (1.78
-fix/KLOC) and the default. Migrating C first risks the default path and loses the
-oracle during transition. Migrating LLVM first means KIR→LLVM validates against
-C-direct (untouched) via `test-backend-parity.sh` at every step. The backend that
-benefits most is LLVM (it re-pays bugs) and it has a stable oracle to validate
-against. Once LLVM is fully on KIR and in parity, C migrates with LLVM-on-KIR as a
-second oracle.
+> **This plan was reweighted on 2026-06-08.** The original plan migrated BOTH
+> text emitters (`.c` via `cc`, `.ll` via `clang`) under KIR and treated the
+> in-process backend as a final, optional lane. That ordering was wrong for the
+> project's actual goal. **Decision (2026-06-08):**
+>
+> - The **LLVM-text** backend is NOT being polished to parity and NOT becoming a
+>   KIR consumer. Pursuing a `.ll`-text translator to 388-fixture parity is work
+>   on a throwaway artifact — the destination is in-process libLLVM, which does
+>   not emit `.ll` text at all. The existing `--emit=llvm` text path is left AS
+>   IS (untouched), useful only as a *read-only reference* for which LLVM
+>   instructions each construct produces while writing the C-API binding.
+> - **C-direct is the sufficient oracle.** It is mature (1.78 fix/KLOC), already
+>   the differential safety net, and validates behaviour ("same program, same
+>   output"). A second LLVM-text oracle adds nothing C-direct doesn't already
+>   give — the one question it could answer ("does KIR map to SSA/registers, not
+>   just to C?") is a design question answered by reading the C API, not a
+>   continuous test to maintain.
+> - The **C-text backend stays as the permanent pure-bootstrap default and
+>   oracle.** Migrating it under KIR (the old Lanes 3–4) is deferrable cleanup,
+>   not critical path: it buys the duplication reduction §1 measured, but it does
+>   not advance the in-process goal. Do it later, or not at all, once the
+>   in-process backend is the production path.
 
-**Parallel layer, NOT big-bang.** Big-bang over ~22K LOC of emitters with no
-safety net is the anti-pattern. KIR enters as `--emit=kir` (dumpable between
-passes, Tier 1) plus a new translator, leaving both direct emitters intact until
-their replacement is in parity.
+**Parallel layer, NOT big-bang.** KIR enters as `--emit=kir` (dumpable between
+passes, Tier 1) plus a new consumer, leaving the existing direct emitters intact
+until a KIR-driven replacement is validated against C-direct.
 
 **Every lane below also carries the §7.1 code-quality gate** (each new file scores
 `km` **A− or better**, < 400 LOC target / 800 hard cap, avg cognitive < 5/fn, max
@@ -455,66 +492,89 @@ their replacement is in parity.
 is the repo's own A/A+ files, not its F monoliths. New files are split before they
 grow, not after.
 
-### Lane 0 — Define KIR + dumper (no emitter touched)
+### Lane 0 — Define KIR + dumper + COMPLETE lowering
 - **Brief:** Create `stage2/compiler/kir.kai` with the §4 types. Write
-  `lower_to_kir(decls: [Decl], regions) : KProgram` producing KIR from the
-  post-perceus/post-tcrec AST. Add `--emit=kir` printing readable KIR. No emitter
-  changes.
-- **Gate:** `--emit=kir` is deterministic (run twice = byte-id); the dump covers
-  every §4 node over the `examples/` corpus; selfhost byte-id trivially (codegen
-  untouched). Fixture: `.kir.expected` goldens for 3–4 representative programs
-  (rbtree, an effect, a closure, a TRMC).
+  `lower_to_kir(decls, regions) : KProgram` producing KIR from the
+  post-perceus/post-tcrec AST, **lowering every AST family the emitters handle —
+  including string interpolation, closures, and effect handler bodies.** Add
+  `--emit=kir` printing readable KIR. No emitter changes.
+- **Status (2026-06-08):** the types + dumper + the core lowering shipped on main
+  (commits aa53a74, f4ee072). A first cut left three AST families lowered to unit
+  by a silent catch-all — interpolation (`#{x}` → `string_concat_all(())`),
+  closures (`ELambda` → no `KClosure`), and effect bodies (`handle`/`resume` →
+  `ret ()`). The completion lane (interp/closures/effects + bare-name fn-vs-local
+  call dispatch) closes those; that work is what made the gap visible.
+- **Gate (corrected per the §6 lesson):** the gate is **lowering CORRECTNESS, not
+  "no panic."** `--emit=kir` is deterministic; the dump is behaviourally faithful
+  for interpolation, closures, and effects (e.g. `print("x is #{x}")` lowers to a
+  concat of the parts, NOT `()`); selfhost byte-id (codegen untouched);
+  `.kir.expected` goldens for representative programs incl. one each of interp,
+  closure, effect, TRMC. A silent catch-all arm that swallows a live AST family is
+  a bug (see §6 Risk 0 below).
 - **Deps:** none. Foundation.
 
-### Lane 1 — KIR→LLVM translator behind a flag, in parity
-- **Brief:** Write `emit_llvm_from_kir(kp: KProgram) : String`, dumb translator.
-  Flag `KAI_BACKEND=llvm-kir`. Direct `emit_program_llvm` still exists.
-- **Gate:** `test-backend-parity.sh` extended to three ways: C-direct (oracle) ==
-  LLVM-direct == LLVM-from-KIR over the 388 parity fixtures. ASAN clean.
-  KAI_TRACE_RC balanced. Does not require selfhost byte-id of LLVM output (LLVM is
-  not the default; behaviour parity is what matters), but the LLVM-from-KIR binary
-  must pass the same suite as LLVM-direct.
-- **Deps:** Lane 0.
+### Lane 1 — KIR → in-process libLLVM (THE DESTINATION)
+- **Brief:** Build `build_llvm_module(kp: KProgram)` — a KIR consumer that walks
+  KIR calling the **LLVM C API** (`LLVMModuleCreateWithName`, `LLVMBuildAdd`,
+  `LLVMBuildCall2`, `LLVMBuildBr`, `LLVMBuildCondBr`, the switch/phi builders, …)
+  to construct the module IN MEMORY, runs the pass pipeline, and emits the object
+  file directly — **no `.ll` text, no `clang` subprocess, one process.** Wired
+  through the Path-1 prelude-primitive mechanism (§7.2): ~30–60 forwarders to the
+  C API in `stage2/runtime.h`, with stage2 linked against `libLLVM` (discovered
+  via `llvm-config`). Opt-in flag (e.g. `KAI_BACKEND=llvm`); the C-text backend
+  stays the default and the bootstrap path.
+- **Build incrementally for isolation** (this replaces the "third oracle" the old
+  plan leaned on): bring it up one construct at a time — a `main` returning a
+  constant, then arithmetic, then calls, then control flow, then ctors/match,
+  then RC, then effects — each step validated against C-direct. Isolation comes
+  from build granularity, not from a parallel LLVM-text backend (a text path does
+  not even exercise the FFI/ABI, so it could not isolate a binding bug anyway).
+- **Critical reprs (§7.2):** LLVM handles (`LLVMValueRef`, `LLVMModuleRef`,
+  `LLVMBuilderRef`, `LLVMTypeRef`, `LLVMBasicBlockRef`) cross as a **non-RC opaque
+  scalar newtype, NOT `Int`** — the tagged-Int runtime would corrupt a pointer.
+- **Gate:** behavioural parity vs C-direct over the 388 fixtures (the ONLY oracle
+  needed); ASAN; `KAI_TRACE_RC` shows ZERO refs carrying the handle newtype repr
+  (proves handles never enter the RC regime); object emits + links + runs.
+  **Measure compile-time end-to-end — this is where the "fast compiler" goal is
+  won** (no fork/exec, no text serialization, no re-parse). Mandatory retro.
+- **Deps:** Lane 0 (complete lowering). Does NOT depend on any text-backend lane.
 
-### Lane 2 — LLVM-from-KIR becomes the only LLVM
-- **Brief:** Delete direct `emit_program_llvm` and its private `es_*` /
-  `*_split_pipe` helpers. `KAI_BACKEND=llvm` now routes through KIR.
-- **Gate:** parity 388 C-vs-LLVM(KIR), ASAN, KAI_TRACE_RC, all effects/perceus
-  fixtures. Measure compile-time (Risk 6). Mandatory retro (non-trivial lane).
-- **Deps:** Lane 1 green and stable. Partial point-of-no-return: LLVM has no direct
-  path, but C-direct stays the intact oracle.
+### Lane 2 (deferrable cleanup, OFF critical path) — migrate C-text under KIR
+- **Brief:** Only if/when reducing the emit_c↔emit_llvm duplication (§1) is worth
+  it on its own. Write a KIR→C consumer; route `--emit=c` through KIR; delete the
+  direct `emit_program`/`emit_program_modular` and the duplicated lowering helpers.
+- **Gate (strictest, IF this lane is done):** **selfhost byte-id** — C-from-KIR
+  textually identical to C-direct over the compiler itself, as a *migration proof*
+  (then a follow-up normalization commit may diverge toward cleaner C, validated
+  by behaviour + selfhost-determinism, not against the retired path). ASAN,
+  parity, KAI_TRACE_RC, #748 modular intact.
+- **Deps:** Lane 0. Independent of Lane 1. **Explicitly optional / later** — the
+  in-process backend is the production target; the C-text backend already works
+  and stays as bootstrap+oracle whether or not it is ever moved under KIR.
 
-### Lane 3 — KIR→C translator behind a flag, byte-id vs C-direct
-- **Brief:** Write `emit_c_from_kir(kp) : String`. Flag `--emit=c-kir`. Direct
-  `emit_program` stays the default.
-- **Gate (strictest in the plan):** **selfhost byte-id** — C-from-KIR produces
-  output textually identical to C-direct over the compiler itself. Risk 2
-  discipline (temporary names, spacing) is paid here. If not byte-id, the lane
-  iterates on the same branch until it is. ASAN, parity, KAI_TRACE_RC.
-- **Deps:** Lane 0 (does not need 1/2, but best after them to reuse the LLVM
-  translator learning). This is where byte-id is genuinely hard and most valuable.
+### Lane 3 (optional) — effects-on-KIR audit
+- **Brief:** With the in-process backend live, audit that `install_order` and
+  one-shot resume semantics are correct and that effects behave identically to
+  C-direct. Close any effect issue the prior LLVM-text immaturity left open.
+- **Gate:** effects fixtures pass identically vs C-direct; ASAN.
+- **Deps:** Lane 1.
 
-### Lane 4 — C-from-KIR becomes the only C; delete direct emitters
-- **Brief:** `--emit=c` routes through KIR. Delete direct
-  `emit_program`/`emit_program_modular` and the duplicated lowering helpers of
-  emit_c. emit_shared shrinks to what AST→KIR uses (genuine analysis) + target
-  mangle.
-- **Gate:** selfhost byte-id (default now via KIR), parity 388, ASAN,
-  KAI_TRACE_RC, full suite, #748 modular intact. Mandatory retro. Final
-  compile-time measurement.
-- **Deps:** Lane 3 byte-id green + Lane 2.
+> **Note — there is deliberately no KIR → LLVM-text lane.** An earlier draft had
+> one (a `.ll`-text translator to 388-fixture parity, used as a third oracle).
+> It was cut on 2026-06-08: the destination (Lane 1) emits native code via the
+> libLLVM C API in-process and never produces `.ll` text, so a text translator
+> would be a polished throwaway, and C-direct already gives the only oracle the
+> in-process backend needs. The existing `--emit=llvm` text path stays untouched
+> as a read-only reference (it shows which LLVM instructions a construct maps to)
+> — it is not migrated under KIR and not maintained to parity.
 
-### Lane 5 (optional, post-unification) — effects on KIR as verification
-- **Brief:** With both backends on KIR, `KPerform`/`KInstallHandler`/`KResume` are
-  the single definition of effect semantics. Audit that install_order and one-shot
-  resume are identical across backends (previously divergent). Close any LLVM
-  effect issue left open by the prior immaturity.
-- **Gate:** effects fixtures pass identically on both backends; ASAN.
-- **Deps:** Lanes 2 + 4.
-
-**Dependency summary:** `0 → 1 → 2` (LLVM) and `0 → 3 → 4` (C) are two chains
-sharing foundation 0; 3 can start as soon as 0 closes but is best sequenced after
-2 to reuse the translator; 5 closes last.
+**Dependency summary.** The critical path is short: **`Lane 0 → Lane 1`** — the
+complete KIR lowering, then the in-process libLLVM backend, validated against the
+untouched C-direct oracle. Lane 0 is the only hard prerequisite for Lane 1. The
+two remaining lanes are off the critical path: **Lane 2** (migrate C-text under
+KIR) is deferrable duplication-cleanup that does not advance the in-process goal;
+**Lane 3** (effects audit) follows Lane 1. C-direct stays the permanent
+bootstrap+oracle throughout, whether or not Lane 2 is ever done.
 
 ### 7.1 Code-quality gate (every lane) — new code must be genuinely good
 
@@ -557,6 +617,81 @@ the size cap) does not close until it is split or simplified. The new subsystem
 lands as a cluster of A-grade files or it does not land. We do not inherit the
 monolith's F; we set the example the monolith failed to.
 
+### 7.2 The horizon — KIR → in-process libLLVM (strategic target)
+
+The project's real codegen goal is NOT "two text emitters under one IR." It is a
+**fast self-hosted compiler that emits native code without invoking an external
+toolchain**, while reusing LLVM's optimiser / register allocator / instruction
+selection / object emission (and, later, WASM) **as a library**. Today both
+backends are out-of-process: the C backend writes `.c` and forks `cc`; the LLVM
+backend writes `.ll` text and invokes `clang`. Each is `fork+exec` + disk write +
+re-parse — the exact overhead that fights the "fast compiler" goal. The horizon
+removes it: kaikai **links libLLVM**, builds the module via the C API in memory,
+and emits the object in one process.
+
+KIR is the launch platform for this. ANF + explicit basic blocks + typed
+terminators + Perceus as first-class `KRC` nodes is *precisely* the shape the LLVM
+`IRBuilder` consumes — each KIR node maps to one or two `LLVMBuild*` calls. **This
+retroactively validates KIR's core decisions:** a string-encoded sentinel
+(`__kai_tcrec|…`) is trivial to print to text but hostile to translate into C-API
+calls; promoting TCO/TRMC/Perceus to typed nodes (§2, §4.7) is what makes the
+in-process path tractable. KIR was built for this destination without it being the
+stated goal.
+
+**Feasibility verdict (asu review, 2026-06-08): viable today, with one repr fix.**
+
+1. **Vehicle: Path-1 prelude primitives — but handles are a non-RC newtype, NOT
+   `Int`.** The compiler-internal prelude mechanism (`docs/ffi.md` Path 1: runtime
+   forwarder + thunk + typer registration, the 3-site pattern stdlib already uses
+   for libm/POSIX) is the right vehicle, and the wiring does not explode — the LLVM
+   C API surface KIR needs is ~30–60 functions, not hundreds. **But** passing an
+   `LLVMValueRef` as `Int` is a soundness trap: stage2's tagged-Int runtime boxes
+   small Ints with a tag bit (see `project_kaikai_two_runtimes_int_tagging_trap`),
+   and a 48-bit pointer that loses a bit to tagging is silent IR corruption — the
+   worst bug class. The fix (as Zig/Crystal/Julia do in their C-API bindings): a
+   **non-RC opaque scalar newtype** for handles, carried unboxed, never through the
+   `Int` repr. This is the one new repr piece the horizon needs.
+
+2. **Bootstrap: preserved by the three-stage architecture.** Linking libLLVM in
+   stage2 does NOT break "bootstrap from any machine with `cc`" — stages 0–1 and
+   the C backend touch no libLLVM, and the in-process backend is opt-in. The C-text
+   backend remains the **permanent pure-bootstrap path and differential oracle**.
+   Tier 1.3's "no deps in stage 0" is intact (only stage2 links libLLVM). This is
+   the escape Zig and Crystal did not have: they became non-bootstrappable on fresh
+   machines precisely by putting libLLVM in the arrival path. kaikai's stage split
+   is the structural defence.
+
+3. **Perceus: a non-issue once handles are unboxed non-RC.** The translator runs
+   under Perceus (it is self-hosted compiler code, and must stay so). The defence is
+   representational — the newtype of trap #1 carries no RC — not "run outside
+   Perceus." An LLVM handle is a raw pointer whose lifetime the `LLVMContext` /
+   `Module` owns, never Perceus. Gate: `KAI_TRACE_RC` over the translator must show
+   zero refs carrying the handle newtype's repr.
+
+4. **Ordering: go straight from KIR to in-process; no LLVM-text lane.** An earlier
+   draft proposed building a KIR→LLVM-**text** translator to parity first, as a
+   third differential oracle, then pivoting. That was cut (2026-06-08): a text
+   translator emits `.ll` the destination never produces, so it is a polished
+   throwaway, and it would not even isolate the failure modes that worry us — a
+   text path exercises no FFI and no link/codegen, so it cannot catch a C-API
+   binding or ABI bug. **C-direct is the sufficient oracle** (it validates
+   behaviour). Isolation against the four error sources (KIR lowering, C-API
+   binding, FFI ABI, link/codegen) comes from **building the in-process backend
+   incrementally** — constant `main`, then arithmetic, calls, control flow,
+   ctors/match, RC, effects — each step diffed against C-direct. The existing
+   `--emit=llvm` text path is kept untouched only as a read-only reference for
+   which LLVM instruction each construct maps to while writing the binding.
+
+**LLVM version policy.** Use the latest stable LLVM that ships a linkable
+`libLLVM` + `llvm-config` — today Homebrew `llvm` (22.x). Apple's bundled clang
+(clang-2100 / "21") does NOT expose `libLLVM.dylib` or `llvm-config`, so it cannot
+be linked in-process; it stays fine for the pure-bootstrap C path. Discover the
+LLVM location via `llvm-config --version/--libdir/--cflags` at build time rather
+than hardcoding a version — the LLVM **C API is stable across major versions**
+(far more so than the C++ API), so the binding survives version bumps, and
+discovery keeps the build off Apple clang and portable to Linux/CI. The in-process
+backend's libLLVM dependency is opt-in; it never enters the bootstrap chain.
+
 ---
 
 ## 8. Anchors in the current code
@@ -576,6 +711,16 @@ monolith's F; we set the example the monolith failed to.
 - `tools/test-backend-parity.sh` — the existing C-vs-LLVM differential harness the
   gates extend.
 
+For the §7.2 in-process backend (Lane 1):
+- `docs/ffi.md` Path 1 — the compiler-internal prelude-primitive mechanism (runtime
+  forwarder + thunk + typer registration) that the libLLVM C-API binding rides.
+- `stage0/runtime_llvm.c` (1243 LOC) — the current LLVM-text backend's C forwarders;
+  the in-process backend's C-API forwarders are the same shape (now calling
+  `LLVMBuild*` instead of emitting `.ll` snippets) but live in `stage2/runtime.h`.
+- `stage2/Makefile:262-286` — the current out-of-process round-trip (`clang` on
+  emitted `.ll`); the in-process backend replaces this with an `llvm-config`-driven
+  `-lLLVM` link of stage2, opt-in.
+
 ---
 
 ## 9. Bottom line
@@ -583,15 +728,29 @@ monolith's F; we set the example the monolith failed to.
 KIR is ANF + basic blocks + named registers (no SSA, no materialised CFG), with
 Perceus as first-class `KRC` nodes and the TCO/TRMC sentinels promoted from strings
 to typed terminators. It does not invent new semantics — it materialises the
-clandestine IR perceus already encodes as strings over the AST. Migration is a
-parallel layer, LLVM first using C-direct as the oracle, with byte-id as a hard
-gate on every lane that touches the default. The single AST→KIR lowering carries
-the hard semantics (effects, continuations, drops, TCO/TRMC, reuse) once; the two
-translators become dumb target-syntax printers. That closes the project's only
-residual Conway effect — the duplicated AST→target lowering between `emit_c` and
-`emit_llvm`.
+clandestine IR perceus already encodes as strings over the AST. The single AST→KIR
+lowering carries the hard semantics (effects, continuations, drops, TCO/TRMC,
+reuse) once, validated for correctness against C-direct, the mature backend that
+stays the untouched oracle and bootstrap path. From that one lowering, the
+in-process libLLVM backend (Lane 1) is the destination consumer. Closing the
+duplicated AST→target lowering between `emit_c` and `emit_llvm` (by migrating
+C-text under KIR, Lane 2) is a deferrable second prize, not the goal.
 
 And it lands as **A-grade code** (§7.1): new, debt-free, written to the standard
 the repo's `stdlib` and `chars`/`diag` modules already meet — not to the F of the
 monoliths it replaces. We do not inherit the monolith's metrics; KIR is the chance
 to set the example they failed to.
+
+**Beyond unification — the horizon (§7.2).** Closing the Conway duplication is the
+near-term payoff, but it is not the endgame. The endgame is a fast self-hosted
+compiler that emits native code **in-process** via libLLVM-as-a-library — no `.ll`
+text, no `clang` subprocess — reusing LLVM's optimiser and codegen (and WASM later)
+while owning the fast inner dev loop. KIR is the launch platform for that backend
+(Lane 1): its typed, ANF, basic-block shape maps directly onto the LLVM C API. The
+critical path is short — complete the KIR lowering (Lane 0), then build the
+in-process backend (Lane 1), validated against C-direct, which stays the permanent
+pure-bootstrap oracle. There is deliberately no KIR→LLVM-**text** translator: it
+would emit `.ll` the destination never produces and C-direct is the only oracle the
+in-process backend needs. Migrating the C-text backend under KIR (Lane 2) is
+deferrable duplication-cleanup, off the critical path. Read the whole plan with
+that ordering of importance.
