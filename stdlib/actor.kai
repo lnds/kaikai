@@ -44,6 +44,17 @@ fn alloc_for_policy(p: MailboxPolicy) : Pid[Nothing] = match p {
   Bounded(cap, on_full) -> mailbox_alloc_bounded(cap, overflow_code(on_full))
 }
 
+# Same per-policy dispatch over the *unowned* alloc variants —
+# `spawn_actor_policy`'s side of the owner-reassign protocol (issue
+# #763). The owned allocs above would stamp the mailbox onto the
+# *parent* fiber's `mailbox` slot, corrupting its monitor / link /
+# trap-exit lookups; the unowned variants leave ownership to a later
+# `mailbox_assign_owner` on the spawned fiber.
+fn alloc_unowned_for_policy(p: MailboxPolicy) : Pid[Nothing] = match p {
+  Unbounded             -> mailbox_alloc_unowned()
+  Bounded(cap, on_full) -> mailbox_alloc_bounded_unowned(cap, overflow_code(on_full))
+}
+
 # Install an Actor[Msg] handler in the current fiber and run `body`
 # under it. The mailbox is allocated on entry and freed on exit;
 # the body talks to it via the standard Actor.self() / Actor.send()
@@ -92,12 +103,36 @@ pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
 # handler, drains it on exit, and returns Unit (the user-supplied
 # `body` returns `R` but spawn_actor's caller only sees the pid).
 #
-# v1 simplification: `spawn_actor` ships only the unbounded-mailbox
-# default. `spawn_actor_policy(policy, body)` for an explicit policy
-# is the obvious follow-up; deferred until a fixture demands it.
+# `spawn_actor` uses the unbounded-mailbox default; for an explicit
+# policy (back-pressure scenarios) use `spawn_actor_policy` below.
 # Spec: `docs/actors.md` §*Spawning actors* §*spawn_actor*.
 pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn + e = {
   let mb = mailbox_alloc_unowned()
+  let f  = spawn.spawn(() => {
+    let _ = handle { body() } with Actor[Msg](mb) {
+      self(resume)        -> resume(state)
+      send(p, m, resume)  -> { mailbox_send(p, m); resume(()) }
+      receive(resume)     -> resume(mailbox_recv(state))
+      return(x)           -> x
+    }
+    let _ = mailbox_free(mb)
+    ()
+  })
+  let _ = mailbox_assign_owner(mb, f)
+  let _ = f
+  mb
+}
+
+# Same as `spawn_actor` but the spawned actor's mailbox honours an
+# explicit `MailboxPolicy` (issue #763). This is the spawned-fiber
+# counterpart of `with_mailbox_policy`: `Bounded(c, BlockSender)`
+# gives bounded-mailbox back-pressure — a full mailbox parks senders
+# until the actor drains a slot — while the Drop policies shed load
+# instead. Allocation rides the same unowned-alloc + owner-reassign
+# protocol as `spawn_actor` (see the comment above).
+pub fn spawn_actor_policy[Msg, e](policy: MailboxPolicy,
+                                   body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn + e = {
+  let mb = alloc_unowned_for_policy(policy)
   let f  = spawn.spawn(() => {
     let _ = handle { body() } with Actor[Msg](mb) {
       self(resume)        -> resume(state)

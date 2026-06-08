@@ -542,7 +542,7 @@ spec lands, it is added to this header.
 > **Physical layout note.** No `stdlib/concurrent/` directory exists. The catalog uses the `concurrent.*` namespace as the **target** shape; the actual `pub fn` lives at the top level today.
 
 - `concurrent.nursery` — scoped `spawn` / `await` / `select` with cancel-on-failure *(shipped — `pub fn nursery[T, e]` lives at `stdlib/spawn.kai:95`, not at `stdlib/concurrent/nursery.kai`)*. Policy detailed in its own spec; restart policies live in `ahu.supervisor`.
-- `concurrent.actor` — mailbox primitive: `send`, `receive`, `self` *(shipped — `stdlib/actor.kai`, not `stdlib/concurrent/actor.kai`)*. Spec detail lives in `docs/actors.md`.
+- `concurrent.actor` — mailbox primitive: `send`, `receive`, `self` *(shipped — `stdlib/actor.kai`, not `stdlib/concurrent/actor.kai`)*; spawn surface `spawn_actor` (unbounded default) + `spawn_actor_policy` (explicit `MailboxPolicy` — shipped, closes #763) and current-fiber installers `with_mailbox` / `with_mailbox_policy`. Spec detail lives in `docs/actors.md`.
 
 ### testing
 
