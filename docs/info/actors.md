@@ -13,7 +13,10 @@ not in the op call site).
 Each actor has a private heap (BEAM-style isolation). Messages are
 COPIED across the boundary; references do not alias.
 
-Mailbox is unbounded by default. `receive()` is selective: future
+Mailbox is unbounded by default; an explicit `MailboxPolicy`
+(`Unbounded` or `Bounded(cap, DropOldest | DropNewest | BlockSender)`)
+can be set per actor — `BlockSender` parks the sender on a full
+mailbox (backpressure). `receive()` is selective: future
 `receive_match { }` selects on pattern (deferred to Orongo).
 
 ## Example
@@ -42,7 +45,16 @@ fn main() : Int / Spawn + Stdout = with_mailbox {
 ```
 
 `with_mailbox` is the stdlib helper that installs an `Actor[Msg]`
-handler over the current fiber (see `stdlib/actor.kai`).
+handler over the current fiber (see `stdlib/actor.kai`). The full
+spawn/install surface:
+
+- `with_mailbox(body)` / `with_mailbox_policy(policy, body)` —
+  mailbox for the *current* fiber.
+- `spawn_actor(body)` / `spawn_actor_policy(policy, body)` — spawn
+  a fresh actor fiber (returns its `Pid[Msg]`); the `_policy` form
+  sets an explicit `MailboxPolicy` on the spawned mailbox, e.g.
+  `spawn_actor_policy(Bounded(1, BlockSender), () => consumer())`
+  for sender-side backpressure.
 
 ## Monitoring
 
@@ -58,8 +70,6 @@ handler over the current fiber (see `stdlib/actor.kai`).
   helper that wraps `Actor[Msg]` handles.
 - Distributed actors. Single-node only.
 - `receive_match { ... }` selective receive. Deferred to Orongo.
-- Mailbox bounds / backpressure as primitive. Implement in the
-  actor's `receive` loop.
 
 ## See also
 
