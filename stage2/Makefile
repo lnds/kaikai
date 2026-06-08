@@ -21,6 +21,30 @@ endif
 # of every $(CC) compile-and-link line that consumes runtime.h.
 LDLIBS_M := -lm
 
+# KIR Lane 1 (docs/kir-design.md §7.2) — in-process libLLVM backend.
+# OPT-IN ONLY: `make KAI_LLVM=1 kaic2` links stage2 against libLLVM so
+# the native backend can build the module via the LLVM C API in one
+# process (no `.ll` text, no clang subprocess). The DEFAULT build does
+# NOT link libLLVM — the C-text backend and the whole bootstrap chain
+# (stages 0–1 + C) never touch LLVM, so `bootstrap from any cc` is
+# intact. Discovery is via `llvm-config` (never a hardcoded version):
+# the LLVM C API is stable across major versions, so the binding
+# survives version bumps and the build stays off Apple clang.
+#
+# Dev-local links DYNAMIC (Homebrew `-lLLVM`); the release path links
+# STATIC (Rust/Zig/Julia model) so the shipped binary has no libLLVM
+# runtime dep and the brew formula needs no `depends_on llvm`. The
+# static-link release wiring rides Lane 1.5 (the default flip); this
+# lane sets up the dev link and the `#ifdef KAI_LLVM` runtime guard.
+LLVM_CONFIG ?= llvm-config
+ifeq ($(KAI_LLVM),1)
+LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs core analysis target native bitwriter) $(shell $(LLVM_CONFIG) --system-libs)
+else
+LLVM_CPPFLAGS :=
+LLVM_LDFLAGS  :=
+endif
+
 KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 
@@ -102,7 +126,7 @@ build/stage2.c: build/bundle.kai $(KAIC1) | build
 	$(STACK) $(KAIC1) build/bundle.kai > $@
 
 $(TARGET): build/stage2.c
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M)
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build
