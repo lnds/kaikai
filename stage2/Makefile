@@ -3537,6 +3537,12 @@ test-unbox-phase2: $(TARGET) build
 	@if grep -E 'kai_area\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
 	  echo "unbox FAIL match_scalar (boxed _r accumulator survived in area)"; exit 1; \
 	fi
+	@# divergence: a `_ -> panic(...)` catch-all arm must NOT block raw
+	@# promotion — `sides` lowers `_r` raw and the panic arm emits the
+	@# call + break with no `_r =` (the common native-backend shape).
+	@if grep -E 'kai_sides\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	  echo "unbox FAIL match_scalar (panic catch-all blocked raw promotion in sides)"; exit 1; \
+	fi
 	@# Tongariki Real-unboxing — arith fixture. The chain must lower
 	@# to raw `double kair_*` locals with no `kai_op_add(` / `kai_op_mul(` /
 	@# `kai_op_sub(` / `kai_op_div(` survival inside the body. The single
