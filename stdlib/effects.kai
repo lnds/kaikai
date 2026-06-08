@@ -1,255 +1,257 @@
-# stdlib/effects.kai — proposed atomic effect catalog (forward-compat).
-#
-# **Status (m12.8.x phase 4 — 2026-04-26): documentation only.** This
-# file is intentionally inert — no `effect` or `type` declarations are
-# emitted. The compiler auto-loads it as part of the core stdlib set,
-# but parses it as comments.
-#
-# The proposed catalog below documents the target shape of the
-# follow-up lane (call it Phase 4b / m12.8.z) that completes the
-# effects-row enforcement and splits `Console` into its
-# component streams. Until then:
-#
-#   - `print(s)`    is a flat core builtin (typer does not require
-#                   the caller to declare `/ Stdout` or `/ Console`).
-#   - `eprint(s)`   ditto.
-#   - `read_line()` ditto for `/ Stdin`.
-#   - `read_file`/`write_file` ditto for `/ File`.
-#   - `Console`     is a single combined effect with `print` + `eprint`
-#                   in the runtime ABI.
-#
-# CLAUDE.md Tier 1 #1 ("every effect a function uses appears in its
-# row") is therefore violated by user code that calls `print`
-# directly without declaring a row. The follow-up lane closes that
-# gap. The blocker for landing it inside m12.8.x phase 4 was the
-# selfhost path: stage 1 (kaikai-minimal) cannot parse row syntax on
-# fn signatures, so adding rows to `stage2/compiler.kai`'s
-# print/eprint helpers breaks the bootstrap. See
-# `docs/m12.8-followup.md` Bug 6 for the full scoping note and the
-# two paths forward (extend stage 1's parser to accept-and-ignore row
-# annotations, or gate the row enforcement on an opt-in marker).
-#
-# ----------------------------------------------------------------------
-# Proposed (Phase 4b) shape
-# ----------------------------------------------------------------------
-#
-# effect Stdin {
-#   read_line()        : Result[String, String]
-#   read_bytes(n: Int) : String          # issue #453
-# }
-#
-# `read_bytes(n)` reads up to `n` raw bytes (including '\n') and
-# returns them as a String. On EOF the result is shorter than `n`
-# — possibly empty. Used by LSP-style framed protocols where the
-# body length is known up front and may contain newlines. The
-# default handler reuses the flat `read_bytes` builtin; no
-# Result wrapper, since a short read is the LSP framing protocol's
-# own end-of-stream signal.
-#
-# effect Stdout {
-#   print(s: String) : Unit
-# }
-#
-# effect Stderr {
-#   eprint(s: String) : Unit
-# }
-#
-# effect File {
-#   read_file(path: String)                   : Result[String, String]
-#   write_file(path: String, content: String) : Result[Unit, String]
-# }
-#
-# effect Env {
-#   env_get(key: String) : Option[String]
-# }
-#
-# type Console = Stdout + Stderr + Stdin
-# type Io      = Console + Env + File
-#
-# ----------------------------------------------------------------------
-#
-# NetTcp (net-tcp-v1 lane, 2026-05-02)
-#
-# The byte-level TCP networking effect. Six ops, declared in the
-# compiler's `builtin_nettcp_decl` (stage2/compiler.kai) so the typer
-# always sees them; the matching default handler is installed around
-# `main` when its row mentions `/ NetTcp`. Spec: docs/effects-stdlib.md
-# §`NetTcp`. Catalog row ships in this file as documentation only,
-# matching the rest of the v1 effects catalog.
-#
-# effect NetTcp {
-#   connect(host: String, port: Int)              : Result[String, Conn]
-#   listen(host: String, port: Int)               : Result[String, Listener]
-#   accept(l: Listener)                           : Result[String, Conn]
-#   send(c: Conn, data: [Int])                    : Result[String, Int]
-#   recv(c: Conn, max: Int)                       : Result[String, [Int]]
-#   close(c: Conn)                                : Unit
-# }
-#
-# Two divergences from the spec in docs/effects-stdlib.md:
-#
-#   1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet.
-#      `type Byte = Int` was attempted but the stage 2 typer's
-#      `resolve_ty` does not substitute non-effect type aliases — a
-#      Byte alias would leave Byte a distinct nominal that does not
-#      unify with Int. Switching to `[Int]` keeps the surface honest
-#      until a real Byte lands. Each element is expected to be in
-#      [0, 255]; the runtime truncates higher bits.
-#
-#   2. Result type-arg order. The spec writes `Result[Conn, String]`
-#      Rust-style (Ok first), but kaikai's `Result[e, a]` is
-#      Err-first / Ok-second (see add_builtin_variant_sigs in
-#      stage2/compiler.kai — the `Ok` constructor takes the second
-#      type parameter). The catalog above flips the order so user
-#      code can write `match NetTcp.connect(...) { Ok(c) -> ...
-#      Err(msg) -> ... }` with `c: Conn` and `msg: String`.
-#
-# # Opaque handles. v1 keeps them as records with implementation-
-# # defined fields. The `port` slot on Listener exists so a server
-# # bound to port 0 can read back the kernel-assigned port via
-# # `net.tcp.local_port` without needing a separate effect op.
-# type Conn      = { fd: Int }
-# type Listener  = { fd: Int, port: Int }
-#
-# v1 limitations vs the pinned spec:
-#   - IPv4 only (AF_INET). The handler does not try AF_INET6.
-#   - All ops are blocking on the OS thread: the m8.x cooperative
-#     scheduler (landed v0.4.0) suspends fibers on mailbox / await /
-#     yield, but socket calls have no readiness reactor wired in
-#     yet. kqueue / epoll integration is a Tier 2 follow-up tracked
-#     in docs/fibers-honesty-targets.md §Reactor.
-#   - `Listener` has no close op. The kernel reclaims the listening
-#     socket at process exit; long-running servers are out of scope
-#     for this lane.
-#   - The full `Net` alias (`type Net = NetTcp + NetUdp + NetDns`)
-#     is now definable: all three leaves ship — NetTcp (#68), NetDns
-#     (#352), NetUdp (#354). A follow-up lane can add the row alias to
-#     this file now that no leaf dangles.
-#
-# ----------------------------------------------------------------------
-#
-# NetDns (issue #352, 2026-06-06)
-#
-# DNS name resolution as a standalone capability — getaddrinfo(3)
-# exposed without the right to open sockets (that is NetTcp). One op,
-# declared in the compiler's `builtin_netdns_decl` (driver.kai) so the
-# typer always sees it; the default handler (`kai_default_netdns_resolve`,
-# a getaddrinfo shim) is installed around `main` when its row mentions
-# `/ NetDns`. Surface helpers (`resolve` / `resolve_first` / `with_dns`)
-# live in stdlib/net/dns.kai. Spec: docs/effects-stdlib.md §`NetDns`.
-#
-# effect NetDns {
-#   resolve(host: String)                         : Result[String, [IpAddr]]
-# }
-#
-# Same Err-first Result order as NetTcp (Ok carries the second tparam),
-# so user code matches `Ok(addrs)` / `Err(msg)`.
-#
-# # Opaque handle, compiler-injected alongside the effect (the op
-# # signature references it). Carries the textual IPv4 form so it
-# # round-trips through logging without a second decoder.
-# type IpAddr = { addr: String }
-#
-# v1 limitations:
-#   - IPv4 only (AF_INET), matching NetTcp.
-#   - `resolve` blocks on the OS thread (getaddrinfo is a blocking
-#     libc call); not parked on the reactor in v1.
-#   - No reverse DNS (getnameinfo), no caching/TTL — both out of
-#     scope per issue #352.
-#
-# ----------------------------------------------------------------------
-#
-# NetUdp (net-udp-v1 lane, issue #354, 2026-06-06)
-#
-# The byte-level datagram UDP effect. Four ops, declared in the
-# compiler's `builtin_netudp_decl` (stage2/compiler/driver.kai) so the
-# typer always sees them; the matching default handler is installed
-# around `main` when its row mentions `/ NetUdp`. Spec:
-# docs/effects-stdlib.md §`NetUdp`. Catalog row ships here as
-# documentation only, matching the rest of the v1 effects catalog.
-#
-# effect NetUdp {
-#   bind(host: String, port: Int)                  : Result[String, UdpSocket]
-#   send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[String, Int]
-#   recv(s: UdpSocket, max: Int)                   : Result[String, Pair[SocketAddr, [Int]]]
-#   close(s: UdpSocket)                            : Unit
-# }
-#
-# Two divergences from the spec in docs/effects-stdlib.md, identical
-# to NetTcp's:
-#
-#   1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet;
-#      resolve_ty does not substitute non-effect aliases, so a Byte
-#      alias would stay a distinct nominal. `[Int]` keeps user code
-#      compiling. Each element is expected to be in [0, 255]; the
-#      runtime truncates higher bits before writing.
-#
-#   2. Result type-arg order. kaikai's `Result[e, a]` is Err-first /
-#      Ok-second, so the catalog flips the spec's Ok-first order. User
-#      code matches `Ok(s)` / `Err(msg)`. `recv` returns the datagram
-#      source address paired with its bytes (kaikai has no tuples, so
-#      the spec's `(SocketAddr, [Byte])` materialises as
-#      `Pair[SocketAddr, [Int]]` with `fst` / `snd` slots).
-#
-# # Opaque handles. v1 keeps them as records with implementation-
-# # defined fields. The `port` slot on UdpSocket lets a probe bound to
-# # port 0 read back the kernel-assigned port via `net.udp.local_port`
-# # without a separate effect op. SocketAddr stores the host as a
-# # textual IPv4 dotted-quad (e.g. "127.0.0.1") — the same v1
-# # simplification the TLS lane (#351) takes.
-# type UdpSocket  = { fd: Int, port: Int }
-# type SocketAddr = { host: String, port: Int }
-#
-# v1 limitations vs the pinned spec:
-#   - IPv4 only (AF_INET). The handler does not try AF_INET6.
-#   - All ops are blocking on the OS thread: no readiness reactor is
-#     wired in for datagram sockets yet. The m8.x reactor lifts NetTcp
-#     and NetUdp together (docs/fibers-honesty-targets.md §Reactor).
-#   - Multicast / broadcast (extra setsockopt flags) and connected UDP
-#     (connect() on a datagram fd) are out of scope.
-#   - No `with_udp` installer ships: the default handler is the only
-#     install path (same as NetTcp — there is no `with_tcp`). A
-#     kaikai-bodied `with_udp` would need `$extern_handler` inside a
-#     `handle ... with NetUdp { ... }` block, which the codegen rejects
-#     outside an effect `default { }` block (Stage C of #533).
-#
-# ----------------------------------------------------------------------
-#
-# Signal (issue #107, 2026-05-02)
-#
-# POSIX signal trap for graceful shutdown — the upstream gap that
-# blocked lnds/ahu's `run_app` Tongariki lane and lnds/manutara's
-# Ctrl-C drain story. Three ops in v1, modelled on/off/await
-# rather than the BEAM-faithful on_cancel(sig) shape sketched in
-# the issue: v1 cannot honour user-installed Cancel handlers on
-# runtime-triggered cancellation (see `kai_default_cancel_raise`
-# in stage0/runtime.h), so on_cancel would degrade to exit(0) for
-# main without ever running the user's cleanup. on/off/await
-# implements the trap synchronously via sigwait — the BEAM-style
-# variant is queued for the m8.x scheduler lane, alongside Cancel
-# delivery from runtime origin.
-#
-# Catalog row ships in the compiler's `builtin_signal_decl`
-# (stage2/compiler.kai); the matching default handler is installed
-# around `main` when its row mentions `/ Signal`. Spec:
-# docs/effects-stdlib.md §`Signal`. Sig variant names are the
-# runtime contract — adding a new variant requires a paired entry
-# in stage0/runtime.h's `kai_signal_entries[]`.
-#
-# type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2
-#
-# effect Signal {
-#   on(sig: Sig)  : Unit
-#   off(sig: Sig) : Unit
-#   await()       : Sig
-# }
-#
-# v1 limitations:
-#   - Posix only. Windows / WASM mapping deferred to the same lane
-#     as non-Posix I/O backends.
-#   - `await()` blocks the OS thread; reactor-driven non-blocking
-#     integration with Spawn is m8.x scope.
-#   - SIGCHLD intentionally absent (Process.wait reaps).
-#   - Real-time signals (SIGRTMIN+n) and siginfo_t out of scope.
-#
-# ----------------------------------------------------------------------
+#[doc("""
+stdlib/effects.kai — proposed atomic effect catalog (forward-compat).
+
+**Status (m12.8.x phase 4 — 2026-04-26): documentation only.** This
+file is intentionally inert — no `effect` or `type` declarations are
+emitted. The compiler auto-loads it as part of the core stdlib set,
+but parses it as comments.
+
+The proposed catalog below documents the target shape of the
+follow-up lane (call it Phase 4b / m12.8.z) that completes the
+effects-row enforcement and splits `Console` into its
+component streams. Until then:
+
+  - `print(s)`    is a flat core builtin (typer does not require
+                  the caller to declare `/ Stdout` or `/ Console`).
+  - `eprint(s)`   ditto.
+  - `read_line()` ditto for `/ Stdin`.
+  - `read_file`/`write_file` ditto for `/ File`.
+  - `Console`     is a single combined effect with `print` + `eprint`
+                  in the runtime ABI.
+
+CLAUDE.md Tier 1 #1 ("every effect a function uses appears in its
+row") is therefore violated by user code that calls `print`
+directly without declaring a row. The follow-up lane closes that
+gap. The blocker for landing it inside m12.8.x phase 4 was the
+selfhost path: stage 1 (kaikai-minimal) cannot parse row syntax on
+fn signatures, so adding rows to `stage2/compiler.kai`'s
+print/eprint helpers breaks the bootstrap. See
+`docs/m12.8-followup.md` Bug 6 for the full scoping note and the
+two paths forward (extend stage 1's parser to accept-and-ignore row
+annotations, or gate the row enforcement on an opt-in marker).
+
+----------------------------------------------------------------------
+Proposed (Phase 4b) shape
+----------------------------------------------------------------------
+
+effect Stdin {
+  read_line()        : Result[String, String]
+  read_bytes(n: Int) : String          # issue #453
+}
+
+`read_bytes(n)` reads up to `n` raw bytes (including '\n') and
+returns them as a String. On EOF the result is shorter than `n`
+— possibly empty. Used by LSP-style framed protocols where the
+body length is known up front and may contain newlines. The
+default handler reuses the flat `read_bytes` builtin; no
+Result wrapper, since a short read is the LSP framing protocol's
+own end-of-stream signal.
+
+effect Stdout {
+  print(s: String) : Unit
+}
+
+effect Stderr {
+  eprint(s: String) : Unit
+}
+
+effect File {
+  read_file(path: String)                   : Result[String, String]
+  write_file(path: String, content: String) : Result[Unit, String]
+}
+
+effect Env {
+  env_get(key: String) : Option[String]
+}
+
+type Console = Stdout + Stderr + Stdin
+type Io      = Console + Env + File
+
+----------------------------------------------------------------------
+
+NetTcp (net-tcp-v1 lane, 2026-05-02)
+
+The byte-level TCP networking effect. Six ops, declared in the
+compiler's `builtin_nettcp_decl` (stage2/compiler.kai) so the typer
+always sees them; the matching default handler is installed around
+`main` when its row mentions `/ NetTcp`. Spec: docs/effects-stdlib.md
+§`NetTcp`. Catalog row ships in this file as documentation only,
+matching the rest of the v1 effects catalog.
+
+effect NetTcp {
+  connect(host: String, port: Int)              : Result[String, Conn]
+  listen(host: String, port: Int)               : Result[String, Listener]
+  accept(l: Listener)                           : Result[String, Conn]
+  send(c: Conn, data: [Int])                    : Result[String, Int]
+  recv(c: Conn, max: Int)                       : Result[String, [Int]]
+  close(c: Conn)                                : Unit
+}
+
+Two divergences from the spec in docs/effects-stdlib.md:
+
+  1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet.
+     `type Byte = Int` was attempted but the stage 2 typer's
+     `resolve_ty` does not substitute non-effect type aliases — a
+     Byte alias would leave Byte a distinct nominal that does not
+     unify with Int. Switching to `[Int]` keeps the surface honest
+     until a real Byte lands. Each element is expected to be in
+     [0, 255]; the runtime truncates higher bits.
+
+  2. Result type-arg order. The spec writes `Result[Conn, String]`
+     Rust-style (Ok first), but kaikai's `Result[e, a]` is
+     Err-first / Ok-second (see add_builtin_variant_sigs in
+     stage2/compiler.kai — the `Ok` constructor takes the second
+     type parameter). The catalog above flips the order so user
+     code can write `match NetTcp.connect(...) { Ok(c) -> ...
+     Err(msg) -> ... }` with `c: Conn` and `msg: String`.
+
+# Opaque handles. v1 keeps them as records with implementation-
+# defined fields. The `port` slot on Listener exists so a server
+# bound to port 0 can read back the kernel-assigned port via
+# `net.tcp.local_port` without needing a separate effect op.
+type Conn      = { fd: Int }
+type Listener  = { fd: Int, port: Int }
+
+v1 limitations vs the pinned spec:
+  - IPv4 only (AF_INET). The handler does not try AF_INET6.
+  - All ops are blocking on the OS thread: the m8.x cooperative
+    scheduler (landed v0.4.0) suspends fibers on mailbox / await /
+    yield, but socket calls have no readiness reactor wired in
+    yet. kqueue / epoll integration is a Tier 2 follow-up tracked
+    in docs/fibers-honesty-targets.md §Reactor.
+  - `Listener` has no close op. The kernel reclaims the listening
+    socket at process exit; long-running servers are out of scope
+    for this lane.
+  - The full `Net` alias (`type Net = NetTcp + NetUdp + NetDns`)
+    is now definable: all three leaves ship — NetTcp (#68), NetDns
+    (#352), NetUdp (#354). A follow-up lane can add the row alias to
+    this file now that no leaf dangles.
+
+----------------------------------------------------------------------
+
+NetDns (issue #352, 2026-06-06)
+
+DNS name resolution as a standalone capability — getaddrinfo(3)
+exposed without the right to open sockets (that is NetTcp). One op,
+declared in the compiler's `builtin_netdns_decl` (driver.kai) so the
+typer always sees it; the default handler (`kai_default_netdns_resolve`,
+a getaddrinfo shim) is installed around `main` when its row mentions
+`/ NetDns`. Surface helpers (`resolve` / `resolve_first` / `with_dns`)
+live in stdlib/net/dns.kai. Spec: docs/effects-stdlib.md §`NetDns`.
+
+effect NetDns {
+  resolve(host: String)                         : Result[String, [IpAddr]]
+}
+
+Same Err-first Result order as NetTcp (Ok carries the second tparam),
+so user code matches `Ok(addrs)` / `Err(msg)`.
+
+# Opaque handle, compiler-injected alongside the effect (the op
+# signature references it). Carries the textual IPv4 form so it
+# round-trips through logging without a second decoder.
+type IpAddr = { addr: String }
+
+v1 limitations:
+  - IPv4 only (AF_INET), matching NetTcp.
+  - `resolve` blocks on the OS thread (getaddrinfo is a blocking
+    libc call); not parked on the reactor in v1.
+  - No reverse DNS (getnameinfo), no caching/TTL — both out of
+    scope per issue #352.
+
+----------------------------------------------------------------------
+
+NetUdp (net-udp-v1 lane, issue #354, 2026-06-06)
+
+The byte-level datagram UDP effect. Four ops, declared in the
+compiler's `builtin_netudp_decl` (stage2/compiler/driver.kai) so the
+typer always sees them; the matching default handler is installed
+around `main` when its row mentions `/ NetUdp`. Spec:
+docs/effects-stdlib.md §`NetUdp`. Catalog row ships here as
+documentation only, matching the rest of the v1 effects catalog.
+
+effect NetUdp {
+  bind(host: String, port: Int)                  : Result[String, UdpSocket]
+  send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[String, Int]
+  recv(s: UdpSocket, max: Int)                   : Result[String, Pair[SocketAddr, [Int]]]
+  close(s: UdpSocket)                            : Unit
+}
+
+Two divergences from the spec in docs/effects-stdlib.md, identical
+to NetTcp's:
+
+  1. `[Byte]` -> `[Int]`. Kaikai has no first-class Byte type yet;
+     resolve_ty does not substitute non-effect aliases, so a Byte
+     alias would stay a distinct nominal. `[Int]` keeps user code
+     compiling. Each element is expected to be in [0, 255]; the
+     runtime truncates higher bits before writing.
+
+  2. Result type-arg order. kaikai's `Result[e, a]` is Err-first /
+     Ok-second, so the catalog flips the spec's Ok-first order. User
+     code matches `Ok(s)` / `Err(msg)`. `recv` returns the datagram
+     source address paired with its bytes (kaikai has no tuples, so
+     the spec's `(SocketAddr, [Byte])` materialises as
+     `Pair[SocketAddr, [Int]]` with `fst` / `snd` slots).
+
+# Opaque handles. v1 keeps them as records with implementation-
+# defined fields. The `port` slot on UdpSocket lets a probe bound to
+# port 0 read back the kernel-assigned port via `net.udp.local_port`
+# without a separate effect op. SocketAddr stores the host as a
+# textual IPv4 dotted-quad (e.g. "127.0.0.1") — the same v1
+# simplification the TLS lane (#351) takes.
+type UdpSocket  = { fd: Int, port: Int }
+type SocketAddr = { host: String, port: Int }
+
+v1 limitations vs the pinned spec:
+  - IPv4 only (AF_INET). The handler does not try AF_INET6.
+  - All ops are blocking on the OS thread: no readiness reactor is
+    wired in for datagram sockets yet. The m8.x reactor lifts NetTcp
+    and NetUdp together (docs/fibers-honesty-targets.md §Reactor).
+  - Multicast / broadcast (extra setsockopt flags) and connected UDP
+    (connect() on a datagram fd) are out of scope.
+  - No `with_udp` installer ships: the default handler is the only
+    install path (same as NetTcp — there is no `with_tcp`). A
+    kaikai-bodied `with_udp` would need `$extern_handler` inside a
+    `handle ... with NetUdp { ... }` block, which the codegen rejects
+    outside an effect `default { }` block (Stage C of #533).
+
+----------------------------------------------------------------------
+
+Signal (issue #107, 2026-05-02)
+
+POSIX signal trap for graceful shutdown — the upstream gap that
+blocked lnds/ahu's `run_app` Tongariki lane and lnds/manutara's
+Ctrl-C drain story. Three ops in v1, modelled on/off/await
+rather than the BEAM-faithful on_cancel(sig) shape sketched in
+the issue: v1 cannot honour user-installed Cancel handlers on
+runtime-triggered cancellation (see `kai_default_cancel_raise`
+in stage0/runtime.h), so on_cancel would degrade to exit(0) for
+main without ever running the user's cleanup. on/off/await
+implements the trap synchronously via sigwait — the BEAM-style
+variant is queued for the m8.x scheduler lane, alongside Cancel
+delivery from runtime origin.
+
+Catalog row ships in the compiler's `builtin_signal_decl`
+(stage2/compiler.kai); the matching default handler is installed
+around `main` when its row mentions `/ Signal`. Spec:
+docs/effects-stdlib.md §`Signal`. Sig variant names are the
+runtime contract — adding a new variant requires a paired entry
+in stage0/runtime.h's `kai_signal_entries[]`.
+
+type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2
+
+effect Signal {
+  on(sig: Sig)  : Unit
+  off(sig: Sig) : Unit
+  await()       : Sig
+}
+
+v1 limitations:
+  - Posix only. Windows / WASM mapping deferred to the same lane
+    as non-Posix I/O backends.
+  - `await()` blocks the OS thread; reactor-driven non-blocking
+    integration with Spawn is m8.x scope.
+  - SIGCHLD intentionally absent (Process.wait reaps).
+  - Real-time signals (SIGRTMIN+n) and siginfo_t out of scope.
+
+----------------------------------------------------------------------
+""")]
