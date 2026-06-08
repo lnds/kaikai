@@ -22,6 +22,7 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_walk
+import compiler.kir_lower_fns
 
 # Entry point wired to `--emit=kir` in the driver. `decls` is the
 # post-perceus / post-tcrec AST; `regions` the region marks.
@@ -41,10 +42,42 @@ pub fn emit_kir(decls: [Decl], regions: [RegionMark]) : String / Console {
 fn kir_dump_program(kp: KProgram) : String =
   concat_all([
     "; kaikai KIR dump\n",
+    kir_dump_install_order(kp.install_order),
     kir_dump_types(kp.types, ""),
     kir_dump_regions(kp.regions, ""),
+    kir_dump_handlers(kp.handlers, ""),
     kir_dump_fns(kp.fns, "")
   ])
+
+# The default-handler install order (one `install-order` line) — the
+# single source both backends read (design §5). Omitted when empty.
+fn kir_dump_install_order(order: [String]) : String = match order {
+  [] -> ""
+  _  -> concat_all(["install-order [", kir_join_names(order, ""), "]\n"])
+}
+
+fn kir_join_names(xs: [String], acc: String) : String = match xs {
+  [] -> acc
+  [n, ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_join_names(rest, concat_all([acc, sep, n]))
+  }
+}
+
+# Handler declarations: effect, clause-thunk symbols, optional return.
+fn kir_dump_handlers(hs: [KHandlerDecl], acc: String) : String = match hs {
+  [] -> acc
+  [h, ...rest] -> kir_dump_handlers(rest, concat_all([
+    acc, "handler ", h.eff, " ", h.sym, " [", kir_dump_op_thunks(h.op_thunks, ""), "]\n"]))
+}
+
+fn kir_dump_op_thunks(ts: [KOpThunk], acc: String) : String = match ts {
+  [] -> acc
+  [KOT(op, sym), ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_op_thunks(rest, concat_all([acc, sep, op, "->", sym]))
+  }
+}
 
 fn kir_dump_types(ts: [KTypeDecl], acc: String) : String = match ts {
   [] -> acc
@@ -94,20 +127,37 @@ fn kir_dump_fns(fns: [KFn], acc: String) : String = match fns {
   [f, ...rest] -> kir_dump_fns(rest, cat2(acc, kir_dump_fn(f)))
 }
 
+# A `KFnLambda` / `KFnClause` prints a `kind` keyword before `fn` so the
+# thunk-ABI shape is visible; a normal fn prints just `fn` (preserves the
+# Lane 0 golden shape).
 fn kir_dump_fn(f: KFn) : String =
   concat_all([
-    "\nfn ", f.sym, "(", kir_dump_params(f.params, ""), ") : ", kir_slot_name(f.ret), " {\n",
+    "\n", kir_fn_kind_kw(f.kind), "fn ", f.sym, "(", kir_dump_params(f.params, ""), ") : ",
+    kir_slot_name(f.ret), " {\n",
     kir_dump_blocks(f.blocks, ""),
     "}\n"
   ])
+
+fn kir_fn_kind_kw(k: KFnKind) : String = match k {
+  KFnNormal -> ""  KFnLambda -> "lambda "  KFnClause -> "clause "
+}
 
 fn kir_dump_params(ps: [KParam], acc: String) : String = match ps {
   [] -> acc
   [p, ...rest] -> {
     let sep = if acc == "" { "" } else { ", " }
     let m = match p.mode { KOwn -> "" KBorrow -> "&" }
-    kir_dump_params(rest, concat_all([acc, sep, m, p.name, ": ", kir_slot_name(p.slot)]))
+    kir_dump_params(rest, concat_all([acc, sep, m, p.name, ": ", kir_slot_name(p.slot), kir_origin_mark(p.origin)]))
   }
+}
+
+# A capture / evidence / resume param shows its origin; a plain direct
+# param shows nothing (keeps normal-fn signatures clean).
+fn kir_origin_mark(o: KParamOrigin) : String = match o {
+  PDirect(_)   -> ""
+  PCapture(i)  -> cat2(" @cap", int_to_string(i))
+  PEvidence(i) -> cat2(" @ev", int_to_string(i))
+  PResume      -> " @resume"
 }
 
 fn kir_dump_blocks(bs: [KBlock], acc: String) : String = match bs {
@@ -127,6 +177,17 @@ fn kir_dump_stmt(s: KStmt) : String = match s {
   KDo(op, _)           -> cat2("do ", kir_dump_op(op))
   KRC(rc, _)           -> kir_dump_rc(rc)
   KStore(t, v, _)      -> concat_all([t, " <- ", kir_dump_val(v)])
+  KInstall(eff, sym, init, alias, _) ->
+    concat_all(["install ", eff, " ", sym, kir_dump_init_opt(init), kir_dump_alias_opt(alias)])
+  KPop(eff, _)         -> cat2("pop ", eff)
+}
+
+fn kir_dump_init_opt(init: Option[KVal]) : String = match init {
+  Some(v) -> cat2(" state=", kir_dump_val(v))  None -> ""
+}
+
+fn kir_dump_alias_opt(a: Option[String]) : String = match a {
+  Some(nm) -> cat2(" as ", nm)  None -> ""
 }
 
 fn kir_dump_rc(rc: KRCOp) : String = match rc {
@@ -143,13 +204,14 @@ fn kir_dump_op(op: KOp) : String = match op {
   KCallIndirect(fv, cargs) -> concat_all(["call_ind ", kir_dump_val(fv), "(", kir_dump_vals(cargs, ""), ")"])
   KPrim(nm, cargs)         -> concat_all(["prim ", nm, "(", kir_dump_vals(cargs, ""), ")"])
   KCon(nm, tag, inits)    -> concat_all(["con ", nm, " #", int_to_string(tag), " {", kir_dump_inits(inits, ""), "}"])
+  KRecord(fields)         -> concat_all(["record {", kir_dump_finits(fields, ""), "}"])
   KConReuse(d, nm, tag, inits) ->
     concat_all(["con-reuse ", kir_dump_val(d), " ", nm, " #", int_to_string(tag), " {", kir_dump_inits(inits, ""), "}"])
   KProj(v, i)             -> concat_all(["proj ", kir_dump_val(v), ".", int_to_string(i)])
   KTagOf(v)               -> cat2("tagof ", kir_dump_val(v))
-  KClosure(sym, caps)     -> concat_all(["closure ", sym, " [", kir_dump_vals(caps, ""), "]"])
+  KClosure(sym, ar, caps) -> concat_all(["closure ", sym, "/", int_to_string(ar), " [", kir_dump_vals(caps, ""), "]"])
   KPerform(eff, op2, cargs) -> concat_all(["perform ", eff, ".", op2, "(", kir_dump_vals(cargs, ""), ")"])
-  KInstallHandler(eff, h, b) -> concat_all(["install ", eff, " ", h, " ", b])
+  KSetjmp(eff)            -> cat2("setjmp ", eff)
   KLitOp(v)               -> kir_dump_val(v)
 }
 
@@ -165,6 +227,14 @@ fn kir_dump_init(i: KSlotInit) : String = match i {
   SIBoxed(v) -> kir_dump_val(v)
   SIInt64(v) -> cat2("i64:", kir_dump_val(v))
   SIReal(v)  -> cat2("f64:", kir_dump_val(v))
+}
+
+fn kir_dump_finits(fs: [KFieldInit], acc: String) : String = match fs {
+  [] -> acc
+  [KFI(nm, v), ...rest] -> {
+    let sep = if acc == "" { "" } else { ", " }
+    kir_dump_finits(rest, concat_all([acc, sep, nm, ": ", kir_dump_val(v)]))
+  }
 }
 
 # --- Terminators --------------------------------------------------------
