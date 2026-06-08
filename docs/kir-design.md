@@ -558,6 +558,50 @@ grow, not after.
   **Measure compile-time end-to-end — this is where the "fast compiler" goal is
   won** (no fork/exec, no text serialization, no re-parse). Mandatory retro.
 - **Deps:** Lane 0 (complete lowering). Does NOT depend on any text-backend lane.
+- **Status (2026-06-08, PR #780):** Lane 1 shipped the bring-up only — `TyHandle`,
+  opt-in libLLVM link, `--emit=native`, `main → 42` end-to-end, and `match-raw`
+  (the unbox-pass promotion the walk needed, valuable on its own). The generic KIR
+  walk is NOT shipped (staged in `git stash kir-step2-wip`); it is blocked on the
+  EBlock-raw issue below. The `main → 42` spine was validated AD-HOC, not by a
+  reproducible fixture — see Lane 1.2.
+
+### Lane 1.2 — complete the native walk + make it reproducible (PREREQUISITE of 1.5)
+- **Brief:** Two coupled pieces that together make the native backend actually
+  emit every program, reproducibly:
+  1. **Unblock #779 — EBlock-multi-stmt-returns-raw.** Same bug-class as match-raw
+     but at the `EBlock` frontier: a block `{ s1; s2; handle }` boxes its raw tail.
+     asu deliberately isolated this from match-raw because promoting it threads the
+     Perceus dup/drop discipline through the block — an error here is a LEAK or
+     use-after-free (silent), not a compile mismatch. **This is the single most
+     dangerous change in the whole KIR effort** — the Perceus-boxing-hell in pure
+     form. It gets its own lane, maximum discipline.
+  2. **Make `main → 42` (and the walk) reproducible.** Lane 1 validated the native
+     spine by hand. Wire a real fixture + the `tier1-native.yml` path-gated
+     workflow: emit object in-process → link → run → diff vs C-direct, by one
+     command. NB (2026-06-08): the post-rebase `--emit=native` did not reproduce
+     in a fresh check (`attempted to call a non-callable value`); confirm whether
+     the rebase regressed a prim registration or the spine was always fragile.
+- **Gate:** selfhost byte-id (the C/default path) green; **a fixture that EXERCISES
+  the EBlock-raw and native paths** (byte-id is false-green without it — the
+  recurring lesson); `KAI_TRACE_RC` balanced + ASAN (RC is the failure mode here,
+  not compilation); native parity vs C-direct over the 388 once the walk lands.
+- **Deps:** Lane 1. **Hard prerequisite of Lane 1.5** — the default cannot flip to
+  native until the native backend emits every program in full parity, which needs
+  this lane. Do NOT treat the ad-hoc `main → 42` as "done".
+- **Status (2026-06-08, Parte A shipped):** piece 2 (reproducibility) is done. The
+  `--emit=native` panic was diagnosed to TWO coupled stage1 bugs — the production
+  kaic2 is compiled by kaic1 (type-blind), which (a) emitted the `llvm_*` prims
+  through the generic `kai_apply` closure path (a non-callable forwarder → runtime
+  panic) and (b) ran Perceus dup/drop over raw handles (RC corruption). Fixed by a
+  stage1 `rprelude_table` (per-arg marshalling + result-box) and a syntactic
+  Perceus exclusion of handle params + handle-prim lets. `main → 42` now emits →
+  links → runs reproducibly (exit code + stdout == C-direct; both 0 — the return
+  value is NOT an exit code, the brief's "exit 42" was a wrong observable). Wired
+  `examples/native/`, `tools/test-native-parity.sh`, and the path-gated
+  `tier1-native.yml`. Gates green: selfhost byte-id, tier0, ASAN+UBSan on the
+  native binary (handles proven out of the RC regime). Piece 1 (#779 EBlock-raw +
+  the generic walk) is **Parte B**, next in this lane. Retro:
+  `docs/lane-experience-kir-native-fix.md`.
 
 ### Lane 1.5 — flip the default to native
 - **Brief:** Once Lane 1 is in full parity, make the native backend the DEFAULT
@@ -578,7 +622,8 @@ grow, not after.
 - **Gate:** native parity 388 stays green as the PR gate; bootstrap-from-`cc` still
   works (C path intact); brew install on a clean machine (no LLVM) produces a
   working native-emitting `kai`. Mandatory retro.
-- **Deps:** Lane 1 green + in full parity.
+- **Deps:** Lane 1.2 (complete native walk + reproducible + in full parity vs
+  C-direct over the 388). The flip cannot happen on the Lane 1 bring-up alone.
 
 ### Lane 2 (deferrable cleanup, OFF critical path) — migrate C-text under KIR
 - **Brief:** Only if/when reducing the emit_c↔emit_llvm duplication (§1) is worth
