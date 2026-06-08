@@ -2563,6 +2563,22 @@ static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
     return mb;
 }
 
+/* Issue #763 spawn_actor_policy — bounded counterpart of
+ * kai_mailbox_alloc_unowned. No owner stamp and the parent fiber's
+ * `mailbox` slot stays untouched; ownership is wired to the spawned
+ * fiber afterwards via kai_mailbox_assign_owner. Routing through
+ * kai_mailbox_alloc_bounded instead would overwrite the parent's
+ * `mailbox` slot, corrupting its monitor / link / trap-exit lookups
+ * whenever the parent already owns a mailbox. */
+static KaiMailbox *kai_mailbox_alloc_bounded_unowned(int cap, int overflow) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    mb->cap         = cap;
+    mb->overflow    = overflow;
+    mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
+    return mb;
+}
+
 /* Phase 4 helper: link a fiber into a waiter chain at the tail. */
 static void kai_mailbox_waiter_enqueue(KaiFiber **head, KaiFiber **tail, KaiFiber *f) {
     f->awaiters_next = NULL;
@@ -5473,6 +5489,19 @@ static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *over
     int o = (kai_is_int(overflow)) ? (int) kai_intf(overflow) : 0;
     KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded(c, o));
     /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
+    if (cap)      kai_decref(cap);
+    if (overflow) kai_decref(overflow);
+    return r;
+}
+
+/* Issue #763 spawn_actor_policy — bounded alloc without stamping an
+ * owner. Pair with kai_prelude_mailbox_assign_owner, same protocol
+ * as kai_prelude_mailbox_alloc_unowned. */
+static KaiValue *kai_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) {
+    int c = (kai_is_int(cap)) ? (int) kai_intf(cap) : 0;
+    int o = (kai_is_int(overflow)) ? (int) kai_intf(overflow) : 0;
+    KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded_unowned(c, o));
+    /* Consume input refs — callee-consumes discipline (issue #82). */
     if (cap)      kai_decref(cap);
     if (overflow) kai_decref(overflow);
     return r;
