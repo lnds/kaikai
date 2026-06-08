@@ -54,6 +54,7 @@ import compiler.refinements
 import compiler.infer
 import compiler.fnreg
 import compiler.modules
+import compiler.native_prims
 import compiler.unbox
 import compiler.perceus
 import compiler.protos
@@ -1406,6 +1407,22 @@ fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], cx: Emi
 fn ufn_call_result(rt: Ty, raw_call: String) : String =
   if ty_is_unboxable_t(rt) { box_wrap(Some(rt), raw_call) } else { raw_call }
 
+# KIR Lane 1: marshal a raw-prelude C-API call's arguments per the
+# prim's declared param types. An unboxable param (`TyHandle` → raw
+# `void *`, Int/Bool/Char/Real → raw scalar) crosses raw; a boxed param
+# (notably `String`) crosses as a `KaiValue *` (the C forwarder reads it
+# with `kai_str_data`). This mirrors `param_raw_mask` for UFns but reads
+# the RP's static type list rather than an EFn signature.
+fn rp_arg_mask(ptys: [Ty]) : [Bool] = match ptys {
+  [] -> []
+  [t, ...rest] -> [ty_is_unboxable_t(t), ...rp_arg_mask(rest)]
+}
+
+# Emit a raw-prelude call: `cname(<marshalled args>)`. The result is a
+# raw scalar consumed in MUnboxed context (no `box_wrap`).
+fn emit_rprelude_call(src: String, cname: String, ptys: [Ty], args_e: [Expr], cx: EmitCtx) : String / Console =
+  cat4(cname, "(", emit_call_args_masked(src, args_e, rp_arg_mask(ptys), cx), ")")
+
 # Emit a single pipe LHS / arg at mask position `i`: raw or boxed.
 fn pipe_arg_masked(src: String, a: Expr, mask: [Bool], i: Int, cx: EmitCtx) : String / Console {
   let is_raw = match mask {
@@ -2513,7 +2530,15 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
     Some(_) -> emit_variant_call(callee, list_length(args_e),
                                  emit_call_args_slots(src, args_e, cx),
                                  cx)
-    None -> match prelude_find(callee) {
+    # KIR Lane 1: a raw prelude prim (in-process libLLVM C-API) is
+    # checked BEFORE the boxed `prelude_find`. Its args are raw scalars
+    # (a `TyHandle` is a `void *`), so they marshal through
+    # `emit_call_args_raw`, never the boxed `call_args`; the result is
+    # consumed raw (no `box_wrap`), the call site sitting in MUnboxed
+    # context. This is the vehicle that carries a handle unboxed.
+    None -> match rprelude_find(callee) {
+      Some(RP(_, cname, ptys, _)) -> emit_rprelude_call(src, cname, ptys, args_e, cx)
+      None -> match prelude_find(callee) {
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
@@ -2524,6 +2549,7 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
           ", (KaiValue *[]){", call_args, "})"
         ])
       }
+    }
     }
   } }
 
@@ -5307,6 +5333,8 @@ fn raw_c_type(opt_ty: Option[Ty]) : String {
       TyReal -> "double"
       TyBool -> "int"
       TyChar -> "uint32_t"
+      # KIR Lane 1: an LLVM C-API handle is a raw opaque pointer.
+      TyHandle -> "void *"
       TyDimT(inner, _)    -> raw_c_type(Some(inner))
       TyRefineT(inner, _) -> raw_c_type(Some(inner))
       _ -> "int64_t /* raw_c_type: unexpected ty */"
@@ -5650,13 +5678,20 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
             }
             _ -> "0 /* tcrec: malformed sentinel */"
           }
-        } else { match emit_ufn_raw_call(src, callee_e, args_e, cx) {
+        } else { match rprelude_find(callee) {
+          # KIR Lane 1: a raw-prelude C-API call already yields a raw
+          # scalar (a `void *` handle / `int64_t` / unit), so emit it
+          # inline with per-param-marshalled args — no boxed-then-unbox
+          # round-trip (which would `(...)->as.i` a `void *`, corrupting
+          # the pointer).
+          Some(RP(_, cname, ptys, _)) -> emit_rprelude_call(src, cname, ptys, args_e, cx)
+          None -> match emit_ufn_raw_call(src, callee_e, args_e, cx) {
           Some(s) -> s
           None    -> {
             let boxed = emit_expr_boxed(src, x, cx)
             unbox_boxed_scalar(boxed, x.ty)
           }
-        } }
+        } } }
       _ -> match emit_ufn_raw_call(src, callee_e, args_e, cx) {
         Some(s) -> s
         None    -> {
@@ -7262,12 +7297,25 @@ fn emit_param_reads(params: [Param], start: Int) : String {
 
 fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
   match d {
-    DFn(_, name, _, params, _, _, _, _, _, mo) -> {
+    DFn(_, name, _, params, opt_ret, _, _, _, _, mo) -> {
       let sym = c_sym(name, mo)
       let hdr = concat_all([
         "static KaiValue *_kai_", sym,
         "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
       ])
+      # KIR Lane 1: a fn whose signature mentions `TyHandle` is a
+      # native-backend internal (it threads raw LLVM C-API pointers).
+      # A handle cannot ride the boxed thunk ABI (`KaiValue **args`)
+      # without `->as.i`-corrupting the pointer, and such a fn is never
+      # a first-class value (no `kai_apply` / closure over it). Emit a
+      # panic stub so the symbol still resolves but an accidental
+      # indirect call is loud, not silent corruption.
+      if sig_has_handle(params, opt_ret) {
+        concat_all([hdr,
+          "    (void) args;\n",
+          "    kai_prelude_panic(kai_str(\"native-backend fn called indirectly (handle thunk)\"));\n",
+          "    return kai_unit();\n}\n\n"])
+      } else {
       # Phase 3 unboxing — when the named fn is a UFn, the thunk
       # marshals each boxed `args[i]` into the matching raw scalar
       # via `->as.X` and wraps the raw return in `kai_<T>` so the
@@ -7297,9 +7345,29 @@ fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
           concat_all([hdr, param_reads, call])
         }
       }
+      }
     }
     _ -> ""
   }
+}
+
+# KIR Lane 1: true when a fn signature mentions `TyHandle` in any param
+# or the return. Such a fn is native-backend internal and gets a panic
+# thunk (a handle cannot ride the boxed thunk ABI).
+fn sig_has_handle(params: [Param], opt_ret: Option[TypeExpr]) : Bool =
+  params_have_handle(params) or match opt_ret {
+    Some(rty) -> ty_is_handle(resolve_ty(rty))
+    None      -> false
+  }
+
+fn params_have_handle(params: [Param]) : Bool = match params {
+  [] -> false
+  [p, ...rest] -> if ty_is_handle(param_ty(p)) { true } else { params_have_handle(rest) }
+}
+
+fn ty_is_handle(t: Ty) : Bool = match t {
+  TyHandle -> true
+  _        -> false
 }
 
 # Phase 3 unboxing — emit per-param `<raw_ty> kair_<name> = args[i]->as.X;`
