@@ -1,29 +1,33 @@
-# stdlib/actor.kai — typed wrappers + helpers for Actor[Msg].
-#
-# Doc B / docs/actors.md is the surface spec. The runtime is the
-# m8.x cooperative scheduler (`stage0/runtime.h` §m8.x cooperative
-# scheduler primitives, landed v0.4.0): a fiber suspends on every
-# effect-op call site through `swapcontext`. `with_mailbox` (Doc B
-# §`Actor` *with_mailbox — mailbox for the current fiber*) installs
-# an `Actor[Msg]` handler over the current fiber; `spawn_actor`
-# (below) spawns a fresh fiber with its own mailbox.
-#
-# `receive()` on an empty mailbox parks the caller on the mailbox's
-# `recv_waiter` chain and yields to the scheduler; a subsequent
-# `send` from any fiber wakes the head waiter (FIFO). Coverage:
-# `examples/effects/m8x_4_recv_blocking.kai` and
-# `examples/effects/m8x_4_request_reply.kai`.
+#[doc("""
+stdlib/actor.kai — typed wrappers + helpers for Actor[Msg].
+
+Doc B / docs/actors.md is the surface spec. The runtime is the
+m8.x cooperative scheduler (`stage0/runtime.h` §m8.x cooperative
+scheduler primitives, landed v0.4.0): a fiber suspends on every
+effect-op call site through `swapcontext`. `with_mailbox` (Doc B
+§`Actor` *with_mailbox — mailbox for the current fiber*) installs
+an `Actor[Msg]` handler over the current fiber; `spawn_actor`
+(below) spawns a fresh fiber with its own mailbox.
+
+`receive()` on an empty mailbox parks the caller on the mailbox's
+`recv_waiter` chain and yields to the scheduler; a subsequent
+`send` from any fiber wakes the head waiter (FIFO). Coverage:
+`examples/effects/m8x_4_recv_blocking.kai` and
+`examples/effects/m8x_4_request_reply.kai`.
+""")]
 
 # `spawn_actor` reaches the cooperative scheduler through
 # `spawn.spawn` from `stdlib/spawn.kai`.
 import spawn
 
-# Mailbox overflow policies. Doc B / actors.md §*Mailbox policies*
-# spec. All four policies reach the runtime: `Unbounded`, `Bounded(c,
-# DropOldest)`, `Bounded(c, DropNewest)`, and `Bounded(c, BlockSender)`.
-# `BlockSender` parks the sender on the per-mailbox `send_waiter`
-# chain when the mailbox is full and resumes when a receiver pops a
-# slot. Coverage: `examples/effects/m8x_4_block_sender.kai`.
+#[doc("""
+Mailbox overflow policies. Doc B / actors.md §*Mailbox policies*
+spec. All four policies reach the runtime: `Unbounded`, `Bounded(c,
+DropOldest)`, `Bounded(c, DropNewest)`, and `Bounded(c, BlockSender)`.
+`BlockSender` parks the sender on the per-mailbox `send_waiter`
+chain when the mailbox is full and resumes when a receiver pops a
+slot. Coverage: `examples/effects/m8x_4_block_sender.kai`.
+""")]
 pub type Overflow = DropOldest | DropNewest | BlockSender
 
 pub type MailboxPolicy = Unbounded | Bounded(Int, Overflow)
@@ -44,10 +48,23 @@ fn alloc_for_policy(p: MailboxPolicy) : Pid[Nothing] = match p {
   Bounded(cap, on_full) -> mailbox_alloc_bounded(cap, overflow_code(on_full))
 }
 
-# Install an Actor[Msg] handler in the current fiber and run `body`
-# under it. The mailbox is allocated on entry and freed on exit;
-# the body talks to it via the standard Actor.self() / Actor.send()
-# / Actor.receive() ops. Default policy is `Unbounded`.
+# Same per-policy dispatch over the *unowned* alloc variants —
+# `spawn_actor_policy`'s side of the owner-reassign protocol (issue
+# #763). The owned allocs above would stamp the mailbox onto the
+# *parent* fiber's `mailbox` slot, corrupting its monitor / link /
+# trap-exit lookups; the unowned variants leave ownership to a later
+# `mailbox_assign_owner` on the spawned fiber.
+fn alloc_unowned_for_policy(p: MailboxPolicy) : Pid[Nothing] = match p {
+  Unbounded             -> mailbox_alloc_unowned()
+  Bounded(cap, on_full) -> mailbox_alloc_bounded_unowned(cap, overflow_code(on_full))
+}
+
+#[doc("""
+Install an Actor[Msg] handler in the current fiber and run `body`
+under it. The mailbox is allocated on entry and freed on exit;
+the body talks to it via the standard Actor.self() / Actor.send()
+/ Actor.receive() ops. Default policy is `Unbounded`.
+""")]
 pub fn with_mailbox[Msg, R, e](body: () -> R / Actor[Msg] + e) : R / e = {
   let mb = mailbox_alloc()
   let r = handle { body() } with Actor[Msg](mb) {
@@ -60,9 +77,11 @@ pub fn with_mailbox[Msg, R, e](body: () -> R / Actor[Msg] + e) : R / e = {
   r
 }
 
-# Same as `with_mailbox` but takes an explicit policy. Use this
-# when the default Unbounded mailbox is not appropriate (e.g.
-# back-pressure scenarios where DropOldest / DropNewest matters).
+#[doc("""
+Same as `with_mailbox` but takes an explicit policy. Use this
+when the default Unbounded mailbox is not appropriate (e.g.
+back-pressure scenarios where DropOldest / DropNewest matters).
+""")]
 pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
                                        body: () -> R / Actor[Msg] + e) : R / e = {
   let mb = alloc_for_policy(policy)
@@ -76,28 +95,56 @@ pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
   r
 }
 
-# Spawn a fiber that runs `body` under an `Actor[Msg]` handler.
-# Returns the spawned fiber's `Pid[Msg]` to the caller — the parent
-# can pass it to `Spawn.send`, `Monitor.monitor`, `Link.link`, etc.
-# without waiting for the child's first action.
-#
-# The mailbox is allocated via `mailbox_alloc_unowned` so the parent
-# fiber's own `mailbox` slot stays untouched, then re-stamped to
-# the spawned fiber via `mailbox_assign_owner` *after* `spawn.spawn`
-# allocates the child but *before* the child runs (the cooperative
-# scheduler does not yield inside `Spawn.spawn`, so the assign call
-# is observed by the child's first action). The spawned body then
-# routes `Actor.self()` / `Actor.send(...)` / `Actor.receive()`
-# through that mailbox via the standard `with_mailbox`-shaped
-# handler, drains it on exit, and returns Unit (the user-supplied
-# `body` returns `R` but spawn_actor's caller only sees the pid).
-#
-# v1 simplification: `spawn_actor` ships only the unbounded-mailbox
-# default. `spawn_actor_policy(policy, body)` for an explicit policy
-# is the obvious follow-up; deferred until a fixture demands it.
-# Spec: `docs/actors.md` §*Spawning actors* §*spawn_actor*.
+#[doc("""
+Spawn a fiber that runs `body` under an `Actor[Msg]` handler.
+Returns the spawned fiber's `Pid[Msg]` to the caller — the parent
+can pass it to `Spawn.send`, `Monitor.monitor`, `Link.link`, etc.
+without waiting for the child's first action.
+
+The mailbox is allocated via `mailbox_alloc_unowned` so the parent
+fiber's own `mailbox` slot stays untouched, then re-stamped to
+the spawned fiber via `mailbox_assign_owner` *after* `spawn.spawn`
+allocates the child but *before* the child runs (the cooperative
+scheduler does not yield inside `Spawn.spawn`, so the assign call
+is observed by the child's first action). The spawned body then
+routes `Actor.self()` / `Actor.send(...)` / `Actor.receive()`
+through that mailbox via the standard `with_mailbox`-shaped
+handler, drains it on exit, and returns Unit (the user-supplied
+`body` returns `R` but spawn_actor's caller only sees the pid).
+
+`spawn_actor` uses the unbounded-mailbox default; for an explicit
+policy (back-pressure scenarios) use `spawn_actor_policy` below.
+Spec: `docs/actors.md` §*Spawning actors* §*spawn_actor*.
+""")]
 pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn + e = {
   let mb = mailbox_alloc_unowned()
+  let f  = spawn.spawn(() => {
+    let _ = handle { body() } with Actor[Msg](mb) {
+      self(resume)        -> resume(state)
+      send(p, m, resume)  -> { mailbox_send(p, m); resume(()) }
+      receive(resume)     -> resume(mailbox_recv(state))
+      return(x)           -> x
+    }
+    let _ = mailbox_free(mb)
+    ()
+  })
+  let _ = mailbox_assign_owner(mb, f)
+  let _ = f
+  mb
+}
+
+#[doc("""
+Same as `spawn_actor` but the spawned actor's mailbox honours an
+explicit `MailboxPolicy` (issue #763). This is the spawned-fiber
+counterpart of `with_mailbox_policy`: `Bounded(c, BlockSender)`
+gives bounded-mailbox back-pressure — a full mailbox parks senders
+until the actor drains a slot — while the Drop policies shed load
+instead. Allocation rides the same unowned-alloc + owner-reassign
+protocol as `spawn_actor` (see the comment above).
+""")]
+pub fn spawn_actor_policy[Msg, e](policy: MailboxPolicy,
+                                   body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn + e = {
+  let mb = alloc_unowned_for_policy(policy)
   let f  = spawn.spawn(() => {
     let _ = handle { body() } with Actor[Msg](mb) {
       self(resume)        -> resume(state)

@@ -375,12 +375,14 @@ The compiler generates the obvious structural impls:
   values judged equal by the derived `Eq` produce the same `Int` from
   the derived `Hash`.
 
-The annotation is one of two `#`-prefixed meta-instructions
-currently recognised by the parser. The other is `#[unstable]`
+The annotation is one of three `#`-prefixed meta-instructions
+currently recognised by the parser. The others are `#[unstable]`
 (issue #602), which marks a `pub` declaration as outside the
 edition stability contract — see `docs/editions.md` for the
-opt-in workflow. Other annotations (`#deprecated`, etc.) live in
-their own whitelist per `proposed-extensions.md §27`.
+opt-in workflow — and `#[doc("...")]` (issue #681), which attaches
+documentation text to a declaration (or, in module position, to the
+file). Other annotations (`#deprecated`, etc.) live in their own
+whitelist per `proposed-extensions.md §27`.
 
 `#[derive(...)]` is **opt-in**: if the user does not write the annotation, no
 impl is generated. This avoids surprising user-defined `impl Show for
