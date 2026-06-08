@@ -43,6 +43,8 @@ import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_walk
 import compiler.kir_dump
+import compiler.native_prims
+import compiler.emit_native
 
 
 # ====================================================================
@@ -1140,6 +1142,16 @@ pub type Mode
   # binary is emitted. Used to pin the lowering against `.kir.expected`
   # goldens and to feed the future KIR→target translators.
   | MEmitKir
+  # KIR Lane 1 (docs/kir-design.md §7.2): the in-process libLLVM native
+  # backend. Lowers to KIR, builds the LLVM module via the C API in
+  # memory (`build_native_object`), emits a native object, and links it
+  # against the effects runtime — one process, no `.ll` text, no `clang`.
+  # Opt-in (`--emit=native` / `KAI_BACKEND=native`) for VALIDATION
+  # against C-direct this lane; the C-text backend stays the default +
+  # bootstrap + oracle (the flip to native-default is Lane 1.5). The
+  # forwarders are only compiled under `-DKAI_LLVM`, so a default kaic2
+  # rejects this mode at the dispatch with a clear error.
+  | MEmitNative
   # Issue #748: separate compilation. Emit the program as N per-module
   # `.c` translation units + two shared headers (`kai_types.h`,
   # `kai_decls.h`), joined into one marker-delimited stream the
@@ -1380,6 +1392,9 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--emit=kir" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitKir))
+      } else if a == "--emit=native" {
+        # KIR Lane 1: in-process libLLVM native backend (opt-in).
+        parse_cli_loop(more, cli_with_mode(opts, MEmitNative))
       } else if a == "--emit=c-modular" {
         # Issue #748: separate compilation — per-module .c/.h + link.
         parse_cli_loop(more, cli_with_mode(opts, MEmitCModular))
@@ -5247,6 +5262,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       # KIR Lane 0: read-only KIR dump (no binary emitted).
                       let use_kir = match mode { MEmitKir -> true _ -> false }
+                      # KIR Lane 1: in-process libLLVM native backend (opt-in).
+                      let use_native = match mode { MEmitNative -> true _ -> false }
                       # Issue #748: separate-compilation C path (per-module .c/.h).
                       let use_modular = match mode { MEmitCModular -> true _ -> false }
                       # Issue #37 — self-tail-call rewrite. Runs
@@ -5318,6 +5335,23 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true)
                       if mono_inv_errs != 0 { mono_inv_errs }
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
+                      else if use_native {
+                        # KIR Lane 1: in-process libLLVM native backend.
+                        # Lower to KIR (same preamble as the KIR dumper:
+                        # the decls are post-perceus / post-tcrec; only
+                        # the symbol/variant tables are rebuilt), build
+                        # the module via the C API in memory, and emit a
+                        # native object. The output path is `<source>.o`;
+                        # the `bin/kai` wrapper (or the test harness)
+                        # links it against the effects runtime to the
+                        # final executable. Validated against C-direct.
+                        let nfns = register_fn_decls(perceus_decls)
+                        let nvariants = register_variants(perceus_decls)
+                        let kp = lower_to_kir(perceus_decls, region_marks, nfns, nvariants)
+                        let obj_path = native_object_path(path)
+                        let rc = build_native_object(kp, obj_path)
+                        if rc == 0 { print(obj_path); 0 } else { rc }
+                      }
                       else {
                         let out = if use_kir {
                           # KIR Lane 0: dump the lowering, emit no binary.
