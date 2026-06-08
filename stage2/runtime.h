@@ -11077,4 +11077,190 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #  pragma GCC diagnostic pop
 #endif
 
+/* ===================================================================
+ * KIR Lane 1 — in-process libLLVM C-API forwarders (docs/kir-design.md
+ * §7.2). OPT-IN ONLY: compiled only under `-DKAI_LLVM` (set by
+ * `make KAI_LLVM=1`). The default build and the whole bootstrap chain
+ * never see these — no libLLVM header, no libLLVM link.
+ *
+ * ABI: a forwarder is a plain C function whose handle params/returns
+ * are raw `void *` (an LLVM C-API object pointer). On the kaikai side
+ * these are typed `TyHandle` (raw, MUnboxed, non-RC); the C path emits
+ * a raw UFn call with `void *` args and a `void *` result, so a handle
+ * NEVER passes through `kai_int` / the tagged-Int boxing (which would
+ * corrupt the pointer). This is the spike that confirms UFn-raw is the
+ * right vehicle over the extern-C/FFI shim (which always reboxes the
+ * result to `KaiValue *`).
+ * =================================================================== */
+#ifdef KAI_LLVM
+#include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Analysis.h>
+#include <stdlib.h>
+
+/* The native backend keeps one context + builder per compilation unit.
+ * `kai_llvm_module_new` creates them; the module owns the context for
+ * the backend's lifetime (disposed by the process exit, like the
+ * out-of-process backends). A handle crosses to kaikai as a raw
+ * `void *` (`TyHandle`, never boxed, never RC). */
+static LLVMContextRef kai_llvm_ctx = NULL;
+
+/* Create a fresh context + module named `name`. Returns the module
+ * handle. `name` is a kaikai `String` (a boxed `KaiValue *`); read its
+ * bytes with `->as.s.bytes` (the canonical String payload accessor). */
+static void *kai_llvm_module_new(KaiValue *name) {
+    kai_llvm_ctx = LLVMContextCreate();
+    LLVMModuleRef m = LLVMModuleCreateWithNameInContext(name->as.s.bytes, kai_llvm_ctx);
+    if (name) kai_decref(name);
+    return (void *) m;
+}
+
+/* --- types (in the module's context) --- */
+static void *kai_llvm_int64_type(void *m) {
+    return (void *) LLVMInt64TypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static void *kai_llvm_int32_type(void *m) {
+    return (void *) LLVMInt32TypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static void *kai_llvm_ptr_type(void *m) {
+    /* Opaque pointer (LLVM ≥ 15): one `ptr` type, address space 0.
+     * Models `%KaiValue*` without a pointee — exactly the opaque-ptr
+     * world stage2/runtime_llvm.c already relies on. */
+    return (void *) LLVMPointerTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m), 0);
+}
+static void *kai_llvm_void_type(void *m) {
+    return (void *) LLVMVoidTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static void *kai_llvm_fn_type_0(void *ret) {
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret, NULL, 0, 0);
+}
+static void *kai_llvm_fn_type_1(void *ret, void *p0) {
+    LLVMTypeRef params[1]; params[0] = (LLVMTypeRef) p0;
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret, params, 1, 0);
+}
+
+/* --- functions / blocks / builder --- */
+static void *kai_llvm_add_function(void *m, KaiValue *name, void *fnty) {
+    LLVMValueRef fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    if (name) kai_decref(name);
+    return (void *) fn;
+}
+static void *kai_llvm_append_block(void *m, void *fn, KaiValue *name) {
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(
+        LLVMGetModuleContext((LLVMModuleRef) m), (LLVMValueRef) fn, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) bb;
+}
+static void *kai_llvm_builder_new(void *m) {
+    return (void *) LLVMCreateBuilderInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static KaiValue *kai_llvm_position_at_end(void *b, void *bb) {
+    LLVMPositionBuilderAtEnd((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+
+/* --- values / instructions --- */
+static void *kai_llvm_const_int(void *i64ty, int64_t v) {
+    return (void *) LLVMConstInt((LLVMTypeRef) i64ty, (unsigned long long) v, 1);
+}
+static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) {
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, NULL, 0, "");
+}
+static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) {
+    LLVMValueRef args[1]; args[0] = (LLVMValueRef) a0;
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, args, 1, "");
+}
+static KaiValue *kai_llvm_build_ret(void *b, void *v) {
+    LLVMBuildRet((LLVMBuilderRef) b, (LLVMValueRef) v);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_ret_void(void *b) {
+    LLVMBuildRetVoid((LLVMBuilderRef) b);
+    return kai_unit();
+}
+
+/* --- object emission --- */
+/* Verify the module, then emit it as a native object file at `path`
+ * using the host target machine. Returns 0 on success, non-zero on a
+ * verify or codegen failure (the driver surfaces the error and aborts).
+ * One process: no `.ll` text, no `clang` subprocess. */
+static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
+    const char *out = path->as.s.bytes;
+    int64_t rc = 0;
+    char *err = NULL;
+
+    if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
+        fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        if (path) kai_decref(path);
+        return 1;
+    }
+    if (err) { LLVMDisposeMessage(err); err = NULL; }
+
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+
+    char *triple = LLVMGetDefaultTargetTriple();
+    LLVMTargetRef target = NULL;
+    if (LLVMGetTargetFromTriple(triple, &target, &err)) {
+        fprintf(stderr, "kai: native target lookup failed: %s\n", err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
+        target, triple, "", "",
+        LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
+    LLVMSetTarget((LLVMModuleRef) m, triple);
+    LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
+
+    if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, out, LLVMObjectFile, &err)) {
+        fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        rc = 1;
+    }
+
+    LLVMDisposeTargetMachine(tm);
+    LLVMDisposeMessage(triple);
+    if (path) kai_decref(path);
+    return rc;
+}
+#else /* !KAI_LLVM */
+/* Default / bootstrap build: libLLVM is not linked, so the C-API
+ * forwarders are stubs. They exist only so the emitted compiler (which
+ * always contains the `emit_native` code path) LINKS; calling
+ * `--emit=native` on a kaic2 built without `KAI_LLVM=1` aborts here with
+ * a clear message instead of a link error. The default backend never
+ * reaches these (it dispatches to the C-text emitter). */
+static void *kai_llvm_native_unavailable(void) {
+    fprintf(stderr,
+        "kai: the native (in-process libLLVM) backend is not built into this "
+        "compiler.\n     Rebuild stage2 with `make KAI_LLVM=1` to enable "
+        "`--emit=native`.\n");
+    exit(1);
+    return NULL;
+}
+static void *kai_llvm_module_new(KaiValue *name) { (void) name; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int64_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int32_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_ptr_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_void_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_0(void *ret) { (void) ret; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_1(void *ret, void *p0) { (void) ret; (void) p0; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_function(void *m, KaiValue *name, void *fnty) { (void) m; (void) name; (void) fnty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_append_block(void *m, void *fn, KaiValue *name) { (void) m; (void) fn; (void) name; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_builder_new(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_position_at_end(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_const_int(void *i64ty, int64_t v) { (void) i64ty; (void) v; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) { (void) b; (void) fn; (void) fnty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) { (void) b; (void) fn; (void) fnty; (void) a0; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_ret(void *b, void *v) { (void) b; (void) v; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_ret_void(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+#endif /* KAI_LLVM */
+
 #endif /* KAI_RUNTIME_H */
