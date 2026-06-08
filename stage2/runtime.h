@@ -11077,4 +11077,37 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #  pragma GCC diagnostic pop
 #endif
 
+/* ===================================================================
+ * KIR Lane 1 — in-process libLLVM C-API forwarders (docs/kir-design.md
+ * §7.2). OPT-IN ONLY: compiled only under `-DKAI_LLVM` (set by
+ * `make KAI_LLVM=1`). The default build and the whole bootstrap chain
+ * never see these — no libLLVM header, no libLLVM link.
+ *
+ * ABI: a forwarder is a plain C function whose handle params/returns
+ * are raw `void *` (an LLVM C-API object pointer). On the kaikai side
+ * these are typed `TyHandle` (raw, MUnboxed, non-RC); the C path emits
+ * a raw UFn call with `void *` args and a `void *` result, so a handle
+ * NEVER passes through `kai_int` / the tagged-Int boxing (which would
+ * corrupt the pointer). This is the spike that confirms UFn-raw is the
+ * right vehicle over the extern-C/FFI shim (which always reboxes the
+ * result to `KaiValue *`).
+ * =================================================================== */
+#ifdef KAI_LLVM
+#include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Analysis.h>
+
+/* SPIKE forwarders — exercise handle-out and handle-in to measure the
+ * emitted C against the UFn-raw path. Replaced by the real minimal set
+ * in step 1. */
+static void *kai_llvm_context_create(void) {
+    return (void *) LLVMContextCreate();
+}
+
+static void kai_llvm_context_dispose(void *ctx) {
+    LLVMContextDispose((LLVMContextRef) ctx);
+}
+#endif /* KAI_LLVM */
+
 #endif /* KAI_RUNTIME_H */
