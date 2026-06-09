@@ -35,6 +35,7 @@ import compiler.native_prims
 import compiler.emit_native_fn
 import compiler.emit_native_ops
 import compiler.emit_native_term
+import compiler.emit_native_def
 
 # Build the LLVM module for `kp` in memory and emit it as an object at
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
@@ -50,13 +51,19 @@ pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
   # `kp.handlers` threads the effect handler decls so a `KInstall`/
   # `KPerform` resolves its op→clause-thunk map (effects subset 2a).
   nemit_declare_fns(ctx, kp.fns)
-  nemit_walk_fns(ctx, kp.fns, kp.handlers)
+  # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one
+  # per installed default so `nemit_perform` resolves the op's field index
+  # for the builtin-dispatch path (the op fn-ptr itself is loaded at runtime
+  # from the Ev `kai_main_install_defaults` pushed). User handlers come
+  # first so a user `handle` shadows a same-effect default in scope.
+  let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.defaults))
+  nemit_walk_fns(ctx, kp.fns, all_handlers)
   # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
   # passed as a first-class value (a `KClosure` over a named fn references
   # this symbol). The KIR does NOT model these — they are synthetic, like
   # the C-direct emitter's `emit_fn_thunk`.
   nemit_fn_thunks(ctx, kp.fns)
-  native_build_runtime_noops(m, native_ctx_ptrt(ctx))
+  native_build_runtime_hooks(ctx, kp.defaults)
   if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
   else {
     eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
@@ -101,16 +108,23 @@ fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl]) : Unit / Co
 
 # The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls around
 # `kai_main`: `kai_main_install_defaults`, `kai_main_teardown_defaults`,
-# `_kai_proto_init_llvm`. Subset 1 has no effects + no protocol dispatch
-# in the observable path, so each is an empty `void ()` — exactly what the
-# out-of-process backend emits for an empty effect row / no protocols.
-# (Effects subset 2 fills `install_defaults` from `kp.install_order`.)
-fn native_build_runtime_noops(m: Handle, ptr_t: Handle) : Unit = {
-  let void_t = llvm_void_type(m)
-  let void_fn_ty = llvm_fn_type_0(void_t)
-  native_build_void_noop(m, void_fn_ty, "kai_main_install_defaults")
-  native_build_void_noop(m, void_fn_ty, "kai_main_teardown_defaults")
-  native_build_void_noop(m, void_fn_ty, "_kai_proto_init_llvm")
+# `_kai_proto_init_llvm`.
+#
+# `install_defaults` / `teardown_defaults` carry REAL bodies now (effects
+# subset 2c): one push/pop per default in `kp.defaults` (main's row ∩ the
+# builtin install order ++ user effects with a `default { }` block, in
+# install order). With an empty `defaults` they emit just `ret void`, so a
+# pure (effect-free) program is byte-equivalent to the old no-op. The
+# C-direct oracle builds the same two functions from `default_setups_for` /
+# `default_pops_for`.
+#
+# `_kai_proto_init_llvm` stays an empty `void ()`: native protocol dispatch
+# is not observable in this subset (a later lane fills it).
+fn native_build_runtime_hooks(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
+  nemit_build_install_defaults(ctx, defaults)
+  nemit_build_teardown_defaults(ctx, defaults)
+  let m = native_ctx_m(ctx)
+  native_build_void_noop(m, llvm_fn_type_0(llvm_void_type(m)), "_kai_proto_init_llvm")
 }
 
 # Define one empty `void name()` — a single block returning void.
