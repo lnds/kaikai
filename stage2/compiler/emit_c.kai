@@ -11569,8 +11569,8 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 #
 # M1 lands the walker only; no caller wires it into the pipeline,
 # so selfhost stays byte-identical until M3 flips emission.
-fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  tcrec_walk_tail(body.kind, nm, arity, own_mod, [])
+fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int, own_mod: Option[String], cons_ok: Bool) : Bool =
+  tcrec_walk_tail(body.kind, nm, arity, own_mod, [], cons_ok)
 
 # ---- TRMC (tail-recursion-modulo-cons) recognition -----------------
 #
@@ -11620,6 +11620,62 @@ fn tcrec_ctor_modcons_scan(xs: [Expr], nm: String, arity: Int, own_mod: Option[S
     }
   }
 }
+
+# ---- TRMC for the BUILTIN cons (`[h, ...self(t)]`) ------------------
+#
+# The dominant list-build idiom is the cons literal, not a user ctor:
+#   - `if .. { [] } else { [h, ...recur(t)] }`   (raw EList; no match)
+#   - `match xs { .. [h, ...t] -> [g(h), ...recur(t)] }`  (cons arm)
+# Both desugar to a tail-position cons whose CDR is a single self-call.
+# `tcrec_ctor_modcons_slot` only recognises a USER ctor (`name_first_is_
+# upper`), so neither fired and these loops grew the C stack per element
+# (Tier-1 TCO violation). These helpers recognise the two shapes and
+# return the cons args `[head, self_call]`; the hole is always the tail
+# (slot 1), so the recursion plugs into the open cdr. The marker
+# `trmc_cons_cname` flows through the step sentinel so the lowering
+# builds a `kai_cons` cell (not a `kai_variant_u`) — see `emit_trmc_step`.
+#
+# Reuse-in-place (the variant path's `_arm_ru` donation) is NOT applied
+# here: `try_arm_top_reuse` only captures a token for PVariant arms, so a
+# cons step always FRESH-allocs the new cell. Correctness of the consumed
+# input is the step's job (NOT the match exit, which the goto skips):
+#   - raw EList (`build`, no scrutinee): nothing to free, the cons cells
+#     it builds are owned by the result; marker `__kai_cons`.
+#   - reuse-cons arm (`map_inc`): the consumed scrutinee cons `_scr` would
+#     leak because the goto jumps over the arm's exit `kai_decref(_scr)`,
+#     so the step decref's `_scr` itself before looping; marker
+#     `__kai_cons_s` (s = has a scrutinee to drop).
+# Donating the cons cell to the step (reuse-in-place, zero alloc per level)
+# is a follow-up perf lane, not a correctness gap.
+fn trmc_cons_cname() : String = "__kai_cons"
+fn trmc_cons_scr_cname() : String = "__kai_cons_s"
+
+# Shape 1 — a raw cons literal `[head, ...self_call]` in tail position.
+# Returns the cons args `[head, self_call]` when the spread cdr is a clean
+# single self-call and the head carries no self-call; else None.
+fn trmc_list_cons_modcons(els: [ListElem], nm: String, arity: Int, own_mod: Option[String]) : Option[[Expr]] =
+  match els {
+    [ElPlain(head), ElSpread(tail)] -> {
+      let clean = tcrec_is_direct_self_call(tail, nm, arity, own_mod) and not tcrec_expr_has_self_call(head, nm, arity, own_mod)
+      if clean { Some([head, tail]) } else { None }
+    }
+    _ -> None
+  }
+
+# Shape 2 — the perceus reuse-cons rewrite of a cons arm:
+# `__perceus_reuse_cons(__pcs_scr, head, self_call)`. The first arg is the
+# scrutinee handle that lowers to the match emitter's `_scr`; the step
+# decref's it so the consumed input spine is freed level by level. Returns
+# the cons args `[head, self_call]` under the clean-single-site discipline.
+fn trmc_reuse_cons_modcons(callee: String, xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Option[[Expr]] =
+  if callee != "__perceus_reuse_cons" { None }
+  else { match xs {
+    [_scr, head, tail] -> {
+      let clean = tcrec_is_direct_self_call(tail, nm, arity, own_mod) and not tcrec_expr_has_self_call(head, nm, arity, own_mod)
+      if clean { Some([head, tail]) } else { None }
+    }
+    _ -> None
+  } }
 
 # A self-call is `nm(...)` with matching arity. The qualified form
 # `EModCall(mod, nm)` is a self-call ONLY when `mod` names the
@@ -11701,7 +11757,7 @@ fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int, own_mod: Optio
     [Arm(_, _, body), ...rest] -> tcrec_expr_has_self_call(body, nm, arity, own_mod) or tcrec_arms_have_self_call(rest, nm, arity, own_mod)
   }
 
-fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
+fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
@@ -11711,6 +11767,9 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
           # TRMC: a constructor application in tail position with a
           # self-call in exactly one slot is modulo-cons-eligible.
           match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
+        } else if cons_ok and not list_has(scope, nm) {
+          # Builtin cons via perceus's reuse-cons rewrite.
+          match trmc_reuse_cons_modcons(callee, xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       EModCall(_, callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
@@ -11719,14 +11778,17 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
         } else { false }
       _ -> false
     }
+    EList(els) ->
+      if cons_ok { match trmc_list_cons_modcons(els, nm, arity, own_mod) { Some(_) -> true None -> false } }
+      else { false }
     EIf(_, t, opt_e) -> {
-      if tcrec_walk_tail(t.kind, nm, arity, own_mod, scope) { true }
+      if tcrec_walk_tail(t.kind, nm, arity, own_mod, scope, cons_ok) { true }
       else { match opt_e {
         None -> false
-        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, own_mod, scope)
+        Some(e2) -> tcrec_walk_tail(e2.kind, nm, arity, own_mod, scope, cons_ok)
       } }
     }
-    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, own_mod, scope)
+    EMatch(_, arms) -> tcrec_walk_arms(arms, nm, arity, own_mod, scope, cons_ok)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
@@ -11744,11 +11806,11 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
           EVar(tn) ->
             if tn == "__pcs_arm_ret" or tn == "__pcs_block_ret" {
               match trmc_find_ret_let_rhs(stmts, tn) {
-                Some(inner) -> tcrec_walk_tail(inner.kind, nm, arity, own_mod, scope1)
+                Some(inner) -> tcrec_walk_tail(inner.kind, nm, arity, own_mod, scope1, cons_ok)
                 None        -> false
               }
             } else { false }
-          _ -> tcrec_walk_tail(e.kind, nm, arity, own_mod, scope1)
+          _ -> tcrec_walk_tail(e.kind, nm, arity, own_mod, scope1, cons_ok)
         }
       }
     }
@@ -11756,14 +11818,14 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
   }
 }
 
-fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
+fn tcrec_walk_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
       Arm(pat, _, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        if tcrec_walk_tail(body.kind, nm, arity, own_mod, scope1) { true }
-        else { tcrec_walk_arms(rest, nm, arity, own_mod, scope) }
+        if tcrec_walk_tail(body.kind, nm, arity, own_mod, scope1, cons_ok) { true }
+        else { tcrec_walk_arms(rest, nm, arity, own_mod, scope, cons_ok) }
       }
     }
   }
@@ -11849,8 +11911,8 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # `tcrec_rewrite_decls` into the pipeline yet, so selfhost stays
 # byte-identical until M3 connects the pieces.
 #[doc("---- m37 / TCO — self-tail-call rewrite (M2) ---------------------- Runs after `perceus_pass`. For every fn whose body contains at least one self-tail-call (per M1), the callee…")]
-pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool) : [Decl] / Console =
-  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc))
+pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool) : [Decl] / Console =
+  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok))
 
 # Pipeline reorder (Eric review 2026-05-06):
 # tcrec runs AFTER perceus_pass, so the body it receives may be
@@ -11877,7 +11939,7 @@ pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool) : [Decl] / Console =
 # already descends through `EBlock(_, Some(tail))`. Only the exit-
 # drops shape needs special handling because its tail is
 # `EVar(__pcs_ret)` instead of the original body.
-fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool) : Decl / Console {
+fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -11887,11 +11949,11 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool) : Decl / Console {
           EBlock(stmts, _) ->
             tcrec_rewrite_pcs_ret_wrap(d, is_pub, name, tparams, params,
                                         opt_ret, row, body, stmts, ln, cl, mo,
-                                        arity, allow_trmc)
+                                        arity, allow_trmc, cons_ok)
           _ -> d
         }
       } else {
-        if not tcrec_has_tail_self_call(body, name, arity, mo) { d }
+        if not tcrec_has_tail_self_call(body, name, arity, mo, cons_ok) { d }
         else {
           let pnames = map(params, (p) => p.pname)
           let uses = pcs_collect_uses_expr(body, pnames, false, [])
@@ -11934,9 +11996,9 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool) : Decl / Console {
             # the fn falls back to ordinary recursion (correct, just
             # without the modulo-cons reuse-in-place the C backend gets).
             let new_body =
-              if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity, mo) {
+              if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, name, arity, mo, cons_ok) {
                 trmc_rewrite_body(body, name, arity, mo, c_sym_str,
-                                  params, pnames, uses, dm_table, skip_set, [])
+                                  params, pnames, uses, dm_table, skip_set, [], cons_ok)
               } else {
                 tcrec_rewrite_body(body, name, arity, c_sym_str,
                                    params, pnames, uses, dm_table, skip_set, [])
@@ -11963,16 +12025,22 @@ fn trmc_row_is_affine(row: RowExpr) : Bool = match row {
 
 # Does the body have at least one modulo-cons tail leaf? (a ctor in
 # tail position with a self-call slot). Distinguishes a TRMC fn from a
-# direct-tail-self-call fn so the right rewrite fires.
-fn trmc_body_has_modcons(body: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, [])
+# direct-tail-self-call fn so the right rewrite fires. `cons_ok` enables
+# the builtin-cons shapes (`[h, ...self(t)]` / reuse-cons); it is false on
+# the LLVM/KIR/native backends, whose step lowering builds a variant node
+# and has no cons cell path yet (those fns fall back to ordinary recursion
+# there — correct, just stack-growing; native cons-TRMC is a follow-up).
+fn trmc_body_has_modcons(body: Expr, nm: String, arity: Int, own_mod: Option[String], cons_ok: Bool) : Bool =
+  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, [], cons_ok)
 
-fn trmc_walk_modcons(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
+fn trmc_walk_modcons(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
           match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
+        } else if cons_ok and not list_has(scope, nm) {
+          match trmc_reuse_cons_modcons(callee, xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
       EModCall(_, callee) ->
         if name_first_is_upper(callee) and not list_has(scope, nm) {
@@ -11980,25 +12048,28 @@ fn trmc_walk_modcons(k: ExprKind, nm: String, arity: Int, own_mod: Option[String
         } else { false }
       _ -> false
     }
+    EList(els) ->
+      if cons_ok { match trmc_list_cons_modcons(els, nm, arity, own_mod) { Some(_) -> true None -> false } }
+      else { false }
     EIf(_, t, opt_e) ->
-      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, nm, arity, own_mod, scope) { true }
-      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, nm, arity, own_mod, scope) } }
-    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, nm, arity, own_mod, scope)
+      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, nm, arity, own_mod, scope, cons_ok) { true }
+      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, nm, arity, own_mod, scope, cons_ok) } }
+    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, nm, arity, own_mod, scope, cons_ok)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
-      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, nm, arity, own_mod, scope1) }
+      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, nm, arity, own_mod, scope1, cons_ok) }
     }
     _ -> false
   }
 }
 
-fn trmc_walk_modcons_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String]) : Bool {
+fn trmc_walk_modcons_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match arms {
     [] -> false
     [Arm(pat, _, body), ...rest] -> {
       let scope1 = pat_bindings(pat, scope)
-      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, scope1) { true }
-      else { trmc_walk_modcons_arms(rest, nm, arity, own_mod, scope) }
+      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, nm, arity, own_mod, scope1, cons_ok) { true }
+      else { trmc_walk_modcons_arms(rest, nm, arity, own_mod, scope, cons_ok) }
     }
   }
 }
@@ -12030,7 +12101,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                               opt_ret: Option[TypeExpr], row: RowExpr,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],
-                              arity: Int, allow_trmc: Bool) : Decl / Console {
+                              arity: Int, allow_trmc: Bool, cons_ok: Bool) : Decl / Console {
 
   match tcrec_find_pcs_ret_let(stmts, []) {
     None -> d
@@ -12041,8 +12112,8 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
         # `allow_trmc` is false on the LLVM backend (it cannot lower the
         # `__kai_trmc|` cctx sentinel — see the direct-branch note); a
         # TRMC-only inner then falls back to ordinary recursion.
-        let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo)
-        let has_direct = tcrec_has_tail_self_call(inner, name, arity, mo)
+        let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, name, arity, mo, cons_ok)
+        let has_direct = tcrec_has_tail_self_call(inner, name, arity, mo, cons_ok)
         if not has_direct and not is_trmc_inner { d }
         else {
           let pnames = map(params, (p) => p.pname)
@@ -12066,7 +12137,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let new_body =
               if is_trmc_inner {
                 trmc_rewrite_body(inner, name, arity, mo, c_sym_str,
-                                  params, pnames, uses, dm_table, skip_set, [])
+                                  params, pnames, uses, dm_table, skip_set, [], cons_ok)
               } else {
                 let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
                                                     params, pnames, uses, dm_table, skip_set, [])
@@ -12952,38 +13023,66 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
 # Perceus's exit-drops that the goto skips.
 fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                      params: [Param], pnames: [String], uses: [Use],
-                     dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr {
+                     dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : Expr {
   # Peel a Perceus arm/block-ret wrap so the modulo-cons ctor (or the
   # tail leaf) is visible; the cctx replaces the wrap's exit drops.
   let body = trmc_unwrap_ret(body0)
   Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
-                                  c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
+                                  c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+}
+
+# Build the step-sentinel `ECall` for a modulo-cons leaf: compute the
+# per-site dropmask (base + rule-3), make the sentinel callee, and apply
+# it to the ctor args (`args` carries the self-call at slot `h`). Shared
+# by the user-ctor, builtin-cons-literal, and reuse-cons leaves so the
+# dropmask discipline stays single-sourced.
+fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
+                       c_sym_str: String, params: [Param], pnames: [String],
+                       uses: [Use], dm_table: [TcrDm], skip_set: [String]) : ExprKind {
+  let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
+  let self_e = trmc_expr_nth(args, h)
+  let rule3_mask = match self_e {
+    Some(se) -> tcrec_lookup_dm(dm_table, se.line, se.col)
+    None     -> 0
+  }
+  let dropmask = base_mask + rule3_mask
+  let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
+  ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: None, mode: MBoxed }, args)
 }
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, own_mod: Option[String],
                      c_sym_str: String, params: [Param], pnames: [String],
-                     uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
+                     uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : ExprKind {
   match k {
     EIf(c, t, opt_e) -> {
-      let t1 = trmc_rewrite_body(t, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
+      let t1 = trmc_rewrite_body(t, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(trmc_rewrite_body(e2, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope))
+        Some(e2) -> Some(trmc_rewrite_body(e2, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, trmc_rewrite_arms(arms, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, []))
+      EMatch(s, trmc_rewrite_arms(arms, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [], cons_ok))
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
-        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)))
+        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1, cons_ok)))
       }
     }
+    # Builtin cons literal `[head, ...self(t)]` in tail position. The
+    # cons args are `[head, self_call]`; the hole is the cdr (slot 1).
+    EList(els) ->
+      if cons_ok { match trmc_list_cons_modcons(els, nm, arity, own_mod) {
+        Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), cargs, 1, line, col,
+                                           c_sym_str, params, pnames, uses, dm_table, skip_set)
+        None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+      } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed }) }
     ECall(f, xs) -> {
-      # Tail-position ctor application: is it modulo-cons?
+      # Tail-position ctor application: is it modulo-cons (user ctor or,
+      # via perceus's reuse-cons rewrite, the builtin cons)?
       let modslot = match f.kind {
         EVar(callee)        -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) } else { None }
         EModCall(_, callee) -> if name_first_is_upper(callee) and not list_has(scope, nm) { tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) } else { None }
@@ -13009,7 +13108,18 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, o
           let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
           ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode }, xs)
         }
-        None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+        None -> {
+          # Reuse-cons leaf: `__perceus_reuse_cons(__pcs_scr, head, self)`.
+          let reuse = match f.kind {
+            EVar(callee) -> if cons_ok and not list_has(scope, nm) { trmc_reuse_cons_modcons(callee, xs, nm, arity, own_mod) } else { None }
+            _            -> None
+          }
+          match reuse {
+            Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), cargs, 1, line, col,
+                                               c_sym_str, params, pnames, uses, dm_table, skip_set)
+            None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+          }
+        }
       }
     }
     _ -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
@@ -13022,14 +13132,14 @@ fn trmc_wrap_apply(leaf: Expr) : ExprKind =
 
 fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                      params: [Param], pnames: [String], uses: [Use],
-                     dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
+                     dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm], cons_ok: Bool) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let new_body = trmc_rewrite_body(body, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1)
-        trmc_rewrite_arms(rest, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
+        let new_body = trmc_rewrite_body(body, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1, cons_ok)
+        trmc_rewrite_arms(rest, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc], cons_ok)
       }
     }
   }
@@ -13385,6 +13495,68 @@ fn tcrec_parse_decimal(s: String) : Int = es_tcrec_parse_decimal(s)
 # rebind from `self_args` using the same dropmask machinery as
 # tcrec_emit_goto (reconciling the exit-drops the goto skips).
 fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
+                  dropmask: Int, pnames: [String], args_e: [Expr],
+                  cx: EmitCtx) : String / Console {
+  # Builtin cons modulo-cons step — the markers `__kai_cons` / `__kai_cons_s`
+  # mean the node is a `kai_cons` cell, not a registered variant, so it takes
+  # the cons-specific build path (hole at the cdr). The `_s` variant also
+  # decref's the consumed scrutinee `_scr` (the reuse-cons arm shape; see
+  # `trmc_reuse_cons_modcons`).
+  if cname == trmc_cons_cname()     { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, false, cx) }
+  else if cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, true, cx) }
+  else { emit_trmc_variant_step(src, sym, holeslot, cname, dropmask, pnames, args_e, cx) }
+}
+
+# Cons modulo-cons loop step (`[head, ...self(t)]`). The cons args are
+# `args_e = [head, self_call]`; the hole is the cdr (slot 1). Builds a
+# fresh `kai_cons(head, NULL)` cell, extends the cctx so the next step
+# attaches at `&node->as.cons.tail`, rebinds the loop params from the
+# self-call args, and loops — O(1) stack. Mirrors `emit_trmc_variant_step`
+# but for the cons layout; no `_arm_ru` donation (cons arms never capture a
+# reuse token — see `try_arm_top_reuse`), so the cell is fresh-allocated.
+#
+# `drop_scr` is set for the reuse-cons arm shape: the goto jumps over the
+# match's exit `kai_decref(_scr)`, so without it the consumed input cons
+# would leak one cell per level. The decref runs AFTER `head`/`self_args`
+# are read (they alias incref'd copies `kai_h`/`kai_t`, independent of
+# `_scr`'s own slots), dropping `_scr`'s head+tail refs and freeing the
+# cell. The raw-EList shape (`build`) has no scrutinee and never sets it.
+fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String],
+                       args_e: [Expr], drop_scr: Bool, cx: EmitCtx) : String / Console {
+  let head_c = match args_e { [h, _] -> emit_expr(src, h, cx) _ -> "kai_unit() /* trmc cons: bad args */" }
+  let self_args = match args_e {
+    [_, t] -> match t.kind { ECall(_, sa) -> sa _ -> [] }
+    _      -> []
+  }
+  let sig_opt  = lookup_ufn_by_csym(cx.fns, sym)
+  let arg_lets = match sig_opt {
+    Some(US(pts, _, pmask)) -> tcrec_emit_arg_lets_masked(src, self_args, pts, pmask, 0, cx)
+    None                    -> tcrec_emit_arg_lets(src, self_args, 0, cx)
+  }
+  let drops    = match sig_opt {
+    Some(US(_, _, pmask)) -> tcrec_emit_drops_masked(pnames, pmask, dropmask, 0)
+    None                  -> tcrec_emit_drops(pnames, dropmask, 0)
+  }
+  let rebinds  = match sig_opt {
+    Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
+    None                  -> tcrec_emit_rebinds(pnames, 0)
+  }
+  # The goto leaves before the match-exit `kai_decref(_scr)`, so the drop
+  # is planted here (the goto-skip is why the leak existed). `_scr`'s head
+  # and tail are dropped + the cell freed; the incref'd `kai_h`/`kai_t`
+  # copies the rebuild already captured survive.
+  let scr_drop = if drop_scr { "kai_decref(_scr); " } else { "" }
+  let cons_c = emit_cons_ctor(cx)
+  concat_all([
+    "({ KaiValue *_trmc_node = ", cons_c, head_c, ", (KaiValue *)0); ",
+    "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
+    "kai_field_addr_create(&_trmc_node->as.cons.tail)); ",
+    arg_lets, scr_drop, drops, rebinds,
+    "goto _kai_", sym, "_entry; (KaiValue *)0; })"
+  ])
+}
+
+fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String,
                   dropmask: Int, pnames: [String], args_e: [Expr],
                   cx: EmitCtx) : String / Console {
   let n = list_length(args_e)
