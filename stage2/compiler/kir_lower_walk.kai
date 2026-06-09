@@ -144,15 +144,22 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
   LRes(KUnitV, st)
 }
 
-# An `EVar` is either a local binder (→ a `KVar` atom read) or a
-# first-class reference to a top-level fn (→ a `KClosure` over the fn's
-# thunk, arity from the EFn table). The latter is how `sort_by(xs, cmp)`
-# passes `cmp` by value. Local binders are not in the EFn table, so a
-# resolve miss means a genuine local.
-fn lower_var(name: String, st: LowerSt) : LRes / Console = match ls_fn_value(st, name) {
-  Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
-  None                   -> LRes(KVar(name), st)
-}
+# An `EVar` is either a nullary constructor used as a value (→ a `KCon`,
+# e.g. `None` / `Red` in `record { value: None }`), a first-class
+# reference to a top-level fn (→ a `KClosure` over the fn's thunk), or a
+# local binder (→ a `KVar` atom read). The nullary-ctor case must come
+# FIRST: an uppercase-initial name registered as a variant is a ctor, not
+# a local — leaving it a bare `KVar` makes a backend look up a register
+# that was never bound (the C emitter materialises it via `kai_nullary`).
+# Local binders are not in the EFn/variant tables, so a miss on both is a
+# genuine local.
+fn lower_var(name: String, st: LowerSt) : LRes / Console =
+  if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
+    bind_op(st, KCon(name, ls_variant_tag(st, name), []), KNoPos)
+  } else { match ls_fn_value(st, name) {
+    Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
+    None                   -> LRes(KVar(name), st)
+  } }
 
 # Lower a list of expressions left-to-right (Risk 2a), collecting atoms.
 pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
@@ -379,7 +386,11 @@ fn lower_else_into(e_opt: Option[Expr], join: String, lcont: String,
 # switch terminator.
 fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
   match lower_expr(scr, st) { LRes(scrv, st1) ->
-    match bind_op(st1, KTagOf(scrv), kpos_of(x)) { LRes(tagv, st2) ->
+    # The tag register carries `SInt32` (the raw `variant_tag` word), NOT
+    # `SBoxed`: a `KSwitch` scrutinee must be an integer so the native
+    # backend emits a real LLVM `switch`. The repr is decided here, in the
+    # lowering, never re-derived by a backend (asu review).
+    match bind_op_slot(st1, KTagOf(scrv), SInt32, kpos_of(x)) { LRes(tagv, st2) ->
       lower_match_blocks(x, arms, scrv, tagv, st2) } }
 }
 

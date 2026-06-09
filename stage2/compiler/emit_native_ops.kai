@@ -1,0 +1,316 @@
+# compiler/emit_native_ops.kai — KIR ops + statements → LLVM IR via the
+# C-API (KIR Lane 1.2 Parte B, docs/kir-design.md §7.2).
+#
+# `emit_native_fn.kai` = ctx state + atoms + pass-1 helpers;
+# `emit_native_term.kai` = the fn driver + terminators. THIS file lowers
+# the value-bearing layer: an `KOp` to an LLVM value handle (`nemit_op`)
+# and a `KStmt` into the current block (`nemit_stmt`). The walk is
+# imperative over `ctx: Handle` (no threaded state, no kaikai records — a
+# handle never enters the RC regime).
+#
+# Symbol resolution mirrors the mature emitters (NOT reinvented): a binop
+# `KPrim` maps through the same `+`→`kaix_add` table as `emit_llvm`'s
+# `llvm_binop_helper`; a `kai_*` prim maps to its `kaix_*` runtime export;
+# a bare `KCall` callee that is a prelude builtin (`prelude_names`, the
+# target-neutral list) becomes `kaix_prelude_<nm>`, else a user fn the
+# module defines under that exact symbol. All boxed (KIR is all-boxed).
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.resolve
+import compiler.emit_native_fn
+
+# --- KPrim / KCall symbol resolution -----------------------------------
+
+# The runtime symbol a binary/unary operator prim calls. Mirror of
+# emit_llvm's `llvm_binop_helper`. None → not an operator (a `kai_*` prim).
+fn nprim_op_sym(op: String) : Option[String] =
+  if op == "+" { Some("kaix_add") }
+  else if op == "-" { Some("kaix_sub") }
+  else if op == "*" { Some("kaix_mul") }
+  else if op == "/" { Some("kaix_div") }
+  else if op == "%" { Some("kaix_mod") }
+  else if op == "^" { Some("kaix_pow_int") }
+  else if op == "==" { Some("kaix_eq") }
+  else if op == "!=" { Some("kaix_ne") }
+  else if op == "<" { Some("kaix_lt") }
+  else if op == ">" { Some("kaix_gt") }
+  else if op == "<=" { Some("kaix_le") }
+  else if op == ">=" { Some("kaix_ge") }
+  else if op == "and" { Some("kaix_and") }
+  else if op == "or" { Some("kaix_or") }
+  else if op == "not" { Some("kaix_not") }
+  else { None }
+
+# A `kai_*` prim's `kaix_*` runtime export. The lowering plants a handful
+# of prims with their C-runtime `kai_` name (list spine, field read,
+# panic, incref); the linkable symbol is the `kaix_` shim. `kai_op_field`
+# → `kaix_field` is the one rename; otherwise `kai_` → `kaix_`. An unknown
+# prim is returned verbatim (a missing symbol surfaces at link).
+fn nprim_runtime_sym(nm: String) : String =
+  if nm == "kai_op_field" { "kaix_field" }
+  else if string_starts_with_q(nm, "kai_") { cat2("kaix_", string_slice(nm, 4, string_length(nm) - 4)) }
+  else { nm }
+
+# The C symbol a `KCall` callee resolves to. A prelude builtin (the
+# target-neutral `prelude_names` list) becomes `kaix_prelude_<nm>`; a
+# `kai_*` callee is a runtime prim; any other name is a user fn the module
+# defines under that exact symbol (already mangled by the lowering).
+# A prelude builtin maps to `kaix_prelude_<nm>` — the NON-static shim
+# `runtime_llvm.c` exports (the linkable symbol a separately-compiled
+# native object can reference). The underlying `kai_prelude_*` bodies in
+# `runtime.h` are `static`, so the object cannot call them directly. Any
+# builtin the walk emits must have a `kaix_prelude_*` shim (runtime_llvm.c);
+# the few that lacked one (e.g. `unit_name`) were added in this lane.
+fn ncall_sym(callee: String) : String =
+  if ncall_is_prelude(callee) { cat2("kaix_prelude_", callee) }
+  else if string_starts_with_q(callee, "kai_") { nprim_runtime_sym(callee) }
+  else { callee }
+
+fn ncall_is_prelude(callee: String) : Bool = nname_in(prelude_names(), callee)
+
+fn nname_in(xs: [String], t: String) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == t { true } else { nname_in(rest, t) }
+}
+
+# --- KOp → an LLVM value handle ----------------------------------------
+
+# Lower one op to a value handle. All results are boxed `ptr` except
+# `KTagOf` (raw i32). Effects (KPerform/KSetjmp) are later subsets — they
+# abort loudly and yield a null placeholder.
+pub fn nemit_op(ctx: Handle, op: KOp) : Handle / Console = match op {
+  KLitOp(v)            -> nemit_atom(ctx, v)
+  KPrim(nm, cargs)     -> nemit_prim(ctx, nm, cargs)
+  KCall(sym, cargs)    -> nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs))
+  KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
+  KCon(nm, tag, inits) -> nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits))
+  KRecord(fields)      -> nemit_record(ctx, fields)
+  KProj(v, i)          -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
+  KTagOf(v)            -> nemit_tagof(ctx, v)
+  KClosure(sym, ar, caps) -> nemit_closure_call(ctx, sym, ar, nemit_atoms_buf(ctx, caps))
+  KConReuse(d, nm, tag, inits) -> nemit_reuse_variant_call(ctx, nemit_atom(ctx, d), tag, nm, nemit_init_buf(ctx, inits))
+  KPerform(_, _, _)    -> { nemit_unsupported(ctx, "KPerform (effects = subset 2)"); nemit_null(ctx) }
+  KSetjmp(_)           -> { nemit_unsupported(ctx, "KSetjmp (effects = subset 2)"); nemit_null(ctx) }
+}
+
+# Call `sym` (boxed sig) over `argbuf`, then free the buffer. The funnel
+# for every boxed call whose args were just materialised into a fresh buf.
+fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
+  let r = nemit_call_boxed(ctx, sym, argbuf); llvm_buf_free(argbuf); r
+}
+
+# A fresh 2-element buffer (handles never ride a kaikai list).
+fn nbuf2(a: Handle, b: Handle) : Handle = {
+  let buf = llvm_buf_new(); llvm_buf_push(buf, a); llvm_buf_push(buf, b); buf
+}
+fn nbuf1(a: Handle) : Handle = { let buf = llvm_buf_new(); llvm_buf_push(buf, a); buf }
+
+# A binop/unop prim, or a `kai_*` runtime prim. Operators route through
+# `nprim_op_sym`; everything else is a direct runtime call by name. Note
+# on `and`/`or`: the KIR lowering already flattened them to a STRICT
+# `prim and(a, b)` with both operands materialised (the short-circuit
+# was lowered away upstream). `kaix_and`/`kaix_or` are the strict boxed
+# form — behaviourally identical to the C-direct oracle whenever both
+# operands are pure (the core's uses: `c >= '0' and c <= '9'` etc.). A
+# divergence would only show if the RHS had observable effects, which is
+# a property of the KIR lowering, not this backend.
+fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
+  # `kai_op_field(rec, "name")` is NOT a uniform boxed call: the runtime
+  # `kaix_field(KaiValue* rec, const char* name)` takes the field name as
+  # a raw `i8*` (a global string), not a boxed String — the C-direct
+  # oracle emits `kai_op_field(rec, "name")` with a C string literal.
+  # Lower the record boxed, the name as a global string, mixed signature.
+  if nm == "kai_op_field" { nemit_field_read(ctx, cargs) }
+  else {
+    let buf = nemit_atoms_buf(ctx, cargs)
+    match nprim_op_sym(nm) {
+      Some(sym) -> nemit_call_freeing(ctx, sym, buf)
+      None      -> nemit_call_freeing(ctx, nprim_runtime_sym(nm), buf)
+    }
+  }
+
+# `kaix_field(ptr rec, i8* name) -> ptr`. The name KVal is a `KStrV` the
+# field-read lowering planted; materialise it as a global string, not a
+# boxed `kaix_str`. Args + param-types go through C buffers (no [Handle]).
+fn nemit_field_read(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [rec, KStrV(name)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let rh = nemit_atom(ctx, rec)
+    let gname = llvm_build_global_string(native_ctx_b(ctx), name)
+    ncall_sig2(ctx, "kaix_field", p, p, p, rh, gname)
+  }
+  _ -> { nemit_unsupported(ctx, "kai_op_field with non-literal field name"); nemit_null(ctx) }
+}
+
+# `KTagOf` reads the raw `i32` variant tag (SInt32). The result feeds a
+# `KSwitch`; NOT boxed. `kaix_variant_tag_of : i32 (ptr)`.
+fn nemit_tagof(ctx: Handle, v: KVal) : Handle / Console =
+  ncall_sig1(ctx, "kaix_variant_tag_of", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, v))
+
+# Push each boxed slot-init atom into a fresh buffer (all SIBoxed today;
+# the i64-inline raw-scalar shapes are a later subset).
+fn nemit_init_buf(ctx: Handle, inits: [KSlotInit]) : Handle / Console = {
+  let buf = llvm_buf_new(); nemit_push_inits(ctx, buf, inits); buf
+}
+fn nemit_push_inits(ctx: Handle, buf: Handle, inits: [KSlotInit]) : Unit / Console = match inits {
+  [] -> ()
+  [SIBoxed(v), ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
+  [SIInt64(v), ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
+  [SIReal(v), ...rest]  -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
+}
+
+# A record literal: `kaix_record(n, fieldbuf, namebuf)` — parallel C
+# buffers, names as `i8*` globals (no [Handle] lists).
+fn nemit_record(ctx: Handle, fields: [KFieldInit]) : Handle / Console = {
+  let vals = llvm_buf_new()
+  let names = llvm_buf_new()
+  nemit_push_fields(ctx, vals, names, fields)
+  nemit_record_call(ctx, vals, names)
+}
+fn nemit_push_fields(ctx: Handle, vals: Handle, names: Handle, fs: [KFieldInit]) : Unit / Console = match fs {
+  [] -> ()
+  [KFI(nm, v), ...rest] -> {
+    # Capture each handle in a `let` (the handle-binder exclusion) before
+    # pushing: a handle passed inline as a call ARGUMENT is RC-managed by
+    # the type-blind kaic1 (incref/decref around the call), and a decref
+    # of an LLVM `Value*`/`GlobalVariable*` corrupts it — surviving the IR
+    # printer but crashing the AsmPrinter (`isNullOrUndef` on a clobbered
+    # initializer). `nemit_atom`/`llvm_build_global_string` are
+    # handle-returning, so the `let` keeps each out of Perceus.
+    let fv = nemit_atom(ctx, v)
+    let nv = llvm_build_global_string(native_ctx_b(ctx), nm)
+    llvm_buf_push(vals, fv)
+    llvm_buf_push(names, nv)
+    nemit_push_fields(ctx, vals, names, rest)
+  }
+}
+
+# An indirect call to a closure value: `kaix_apply(clo, n, argbuf)`.
+fn nemit_call_indirect(ctx: Handle, fv: KVal, cargs: [KVal]) : Handle / Console =
+  nemit_apply_call(ctx, nemit_atom(ctx, fv), nemit_atoms_buf(ctx, cargs))
+
+# --- mixed-signature runtime calls -------------------------------------
+#
+# The constructor / closure / apply runtime entries take a mix of `i32`,
+# `i8*`, and `KaiValue**` — under opaque pointers `i8*` and `KaiValue**`
+# are both `ptr`. The signature param-types and the call args both go
+# through C buffers (NEVER a `[Handle]` list — handles in a kaikai list
+# are RC-tagged + corrupted; asu "risk #1"). The fixed-arity helpers
+# (`ncall_sig1`/`2`/...) build both buffers inline.
+
+# `sym : ret (p0)` over one arg.
+pub fn ncall_sig1(ctx: Handle, sym: String, ret: Handle, p0: Handle, a0: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# `sym : ret (p0, p1)` over two args.
+pub fn ncall_sig2(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, a0: Handle, a1: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# Build the fn type from `ptb`, declare `sym`, call over `ab`, free both.
+pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Handle) : Handle = {
+  let fnty = llvm_fn_type_n(ret, ptb)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
+  let r = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, ab)
+  llvm_buf_free(ptb); llvm_buf_free(ab); r
+}
+
+# `kaix_variant(i32 tag, i8* name, i32 n, ptr* args) -> ptr`. The `args`
+# arrive in a C buffer `argvalbuf` (the materialised field atoms); they
+# become a stack `ptr[]` the runtime ctor reads.
+fn nemit_variant_call(ctx: Handle, sym: String, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let n = llvm_buf_len(argvalbuf)
+  let argarr = nemit_ptr_array(ctx, argvalbuf)
+  llvm_buf_free(argvalbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
+  ncall_finish(ctx, sym, p, ptb, ab)
+}
+
+# `kaix_reuse_or_alloc_variant(ptr scr, i32 tag, i8* name, i32 n, ptr* args) -> ptr`.
+fn nemit_reuse_variant_call(ctx: Handle, scr: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let n = llvm_buf_len(argvalbuf)
+  let argarr = nemit_ptr_array(ctx, argvalbuf)
+  llvm_buf_free(argvalbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
+  ncall_finish(ctx, "kaix_reuse_or_alloc_variant", p, ptb, ab)
+}
+
+# `kaix_record(i32 n, ptr* fields, ptr* names) -> ptr`. `vals`/`names` are
+# the parallel C buffers of field atoms / name globals.
+fn nemit_record_call(ctx: Handle, vals: Handle, names: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let n = llvm_buf_len(vals)
+  let farr = nemit_ptr_array(ctx, vals)
+  let narr = nemit_ptr_array(ctx, names)
+  llvm_buf_free(vals); llvm_buf_free(names)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, farr); llvm_buf_push(ab, narr)
+  ncall_finish(ctx, "kaix_record", p, ptb, ab)
+}
+
+# `kaix_apply(ptr clo, i32 n, ptr* args) -> ptr`. `argvalbuf` carries the
+# materialised call args.
+fn nemit_apply_call(ctx: Handle, clo: Handle, argvalbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let n = llvm_buf_len(argvalbuf)
+  let argarr = nemit_ptr_array(ctx, argvalbuf)
+  llvm_buf_free(argvalbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, clo); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
+  ncall_finish(ctx, "kaix_apply", p, ptb, ab)
+}
+
+# `kaix_closure(ptr thunk, i32 arity, i32 ncaps, ptr* caps) -> ptr`. The
+# thunk's address is the lifted-lambda fn (thunk ABI `ptr (ptr, ptr*,
+# i32)`), declared on demand. `capbuf` carries the materialised captures.
+fn nemit_closure_call(ctx: Handle, sym: String, ar: Int, capbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let tptb = llvm_buf_new(); llvm_buf_push(tptb, p); llvm_buf_push(tptb, p); llvm_buf_push(tptb, i32t)
+  let thunkty = llvm_fn_type_n(p, tptb); llvm_buf_free(tptb)
+  let thunk = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, thunkty)
+  let n = llvm_buf_len(capbuf)
+  let caparr = nemit_ptr_array(ctx, capbuf)
+  llvm_buf_free(capbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, thunk); llvm_buf_push(ab, llvm_const_i32(i32t, ar)); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, caparr)
+  ncall_finish(ctx, "kaix_closure", p, ptb, ab)
+}
+
+# Materialise a `KaiValue*[]` on the stack from the handles in the C
+# buffer `hbuf`: `alloca [n x ptr]`, store each, return the array base
+# pointer. n==0 yields a null `ptr` (the ctors take n==0 as "no args"
+# and never deref). `hbuf` is read here but NOT freed (the caller owns it).
+fn nemit_ptr_array(ctx: Handle, hbuf: Handle) : Handle / Console = {
+  let n = llvm_buf_len(hbuf)
+  if n == 0 { llvm_const_null(native_ctx_ptrt(ctx)) }
+  else {
+    let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
+    let arr = llvm_build_alloca(native_ctx_b(ctx), arrty, "args")
+    nemit_store_array(ctx, arr, arrty, hbuf, 0, n); arr
+  }
+}
+
+fn nemit_store_array(ctx: Handle, arr: Handle, arrty: Handle, hbuf: Handle, i: Int, n: Int) : Unit / Console =
+  if i >= n { () }
+  else {
+    let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i))
+    llvm_build_store(native_ctx_b(ctx), llvm_buf_get(hbuf, i), slot)
+    nemit_store_array(ctx, arr, arrty, hbuf, i + 1, n)
+  }
