@@ -11626,6 +11626,18 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
     int64_t rc = 0;
     char *err = NULL;
 
+    /* Debug hook (KIR native walk): dump the in-memory module IR to the
+     * path in KAI_NATIVE_DUMP_IR before verify, so a malformed module can
+     * be inspected. Off by default; never affects the emitted object. */
+    {
+        const char *ir_path = getenv("KAI_NATIVE_DUMP_IR");
+        if (ir_path && ir_path[0]) {
+            char *ir_err = NULL;
+            LLVMPrintModuleToFile((LLVMModuleRef) m, ir_path, &ir_err);
+            if (ir_err) LLVMDisposeMessage(ir_err);
+        }
+    }
+
     if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
         fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
