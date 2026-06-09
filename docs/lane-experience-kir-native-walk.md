@@ -164,3 +164,136 @@ distinguishing "module corrupt" from "codegen-side issue".
   KAI_TRACE_RC + ASAN (the failure mode is RC, byte-id is false-green).
 - Retire the manual `native_handle_fns()` list (see SOUNDNESS RISK #1).
 - Native-default flip (Lane 1.5) + `bin/kai` wiring stay out of scope.
+
+---
+
+# Lane experience — KIR native walk, effects subset (2a)
+
+Closes the second vertical slice: algebraic effects in the in-process
+libLLVM native walk. Covers `KInstall` / `KSetjmp` / `KPop` / `KPerform` /
+`KResume` / `KFnClause` for **one-shot user handlers, no state, no
+`as`-alias, no builtin defaults** (those are subset 2b). Two new fixtures,
+both in native parity vs C-direct: `effect_handle.kai` (resume-tail, exit
+42) and `effect_discard.kai` (a `Cancel.raise()` clause that discards
+`resume`, longjmping out of the handle, exit 7).
+
+## Scope as planned vs as shipped
+
+**Planned:** the design memo (asu consult) resolved the one load-bearing
+question — how to emit `setjmp` in libLLVM without mem2reg corrupting a
+local that crosses a longjmp — as **Camino 3: do not run mem2reg on a fn
+containing a setjmp.** It is sound by construction (no SSA promotion → the
+post-longjmp load reads fresh memory, the LLVM analogue of C99 §7.13.2.1
+`volatile`), and it is *already* the default: the native backend runs no
+mem2reg today, so the effects subset is sound from the start with zero
+pipeline work. The remaining work was a mechanical port of the validated
+`emit_llvm.kai` (the abandoned LLVM-text backend) effect emission to C-API
+calls — the same string-`.ll`→`kai_llvm_build_*` translation the pure walk
+used. The runtime effect contract (`kaix_evidence_*`, `kaix_cont_*`,
+`kai_jmpbuf_size`, the discard-unwind triple) already shipped in
+`runtime_llvm.c` (refs #622); only the `setjmp` itself the backend emits.
+
+**Shipped:** exactly that, plus three runtime helpers the C-API path needed
+(`kaix_ev_op_at`/`kaix_ev_set_op`/`kaix_ev_handler_id` for Ev-struct field
+access without a struct-nominal type in IR; `kaix_op_finish` folding the
+discard test + unwind into one straight-line call so a `KPerform` stays one
+KIR block = one LLVM block; `kaix_bool_of_i32`), and the
+`kai_llvm_build_array_alloca` C-API forwarder for the runtime-sized
+`jmp_buf`. Two new modules, `emit_native_fx.kai` (pass-1 alloca reservation
++ handler lookup, A++) and `emit_native_fx2.kai` (pass-2 emitters, A+).
+
+## The discard fixture earns its keep (asu's warning, vindicated)
+
+The design memo flagged that a resume-tail-only fixture would **false-green
+the very hazard the setjmp pad guards** — the mem2reg-corrupts-a-live-local
+case only manifests when the longjmp actually lands and a body-path local is
+read after. So the discard fixture (`effect_discard.kai`, exit 7) was
+written *first*, validated under the C-direct oracle before any emitter
+code. It is the only fixture that exercises the longjmp landing; without it
+the whole subset would have shipped green on the resume path alone.
+
+## Five bugs, five distinct failure modes
+
+1. **SOUNDNESS RISK #1 — the load-bearing one.** Every new walk fn that
+   returns a `Handle` (an LLVM `Value*`/`Function*`) must be listed in
+   stage 1's `native_handle_fns()`, or the type-blind kaic1 Perceus
+   `kai_decref`s its result, clobbering the LLVM object's C++ type-id. Ten
+   new fns (led by `nemit_declare_for_abi`, whose discarded `Function*` is
+   the fn being defined) were unlisted. Symptom: **344 fns processed, 0
+   bodies emitted** — the module *verified clean and linked* (a body-less
+   declaration is valid IR), then segfaulted/link-failed on the missing
+   bodies. The diagnostic that cracked it: `nm` showed every user fn `U`
+   (undefined), only thunks `T`. This is precisely the manual-list
+   fragility the subset-1 retro flagged as the lane's remaining risk; it
+   bit on the very next lane, exactly as predicted. The follow-up to
+   retire the list is now load-bearing, not nice-to-have.
+
+2. **setjmp boxed as Int → segfault.** The `KSetjmp` i32 result, boxed via
+   `kaix_int`, is a tagged immediate (`0x1` for 0); the boxed `condbr`
+   reads it through `kai_op_truthy`, which does `v->tag` and dereferences
+   `0x1`. Fix: box as a Bool (`kaix_bool_of_i32` = `kai_bool(i != 0)`) —
+   the truthy predicate checks `tag == KAI_BOOL`, and a Bool is never a
+   tagged immediate. The C-direct oracle sidesteps this by comparing the
+   i32 directly (`setjmp(...) == 0`); the KIR models the split as a boxed
+   `condbr`, so the native walk must produce a boxed value the predicate
+   accepts.
+
+3. **`k` vs `resume` register naming.** The translator names the `PResume`
+   clause param after its surface name (`resume`), but `lower_resume`
+   emits `KResume(KVar("k"), …)` with the fixed `k` (mirroring emit_llvm's
+   `%k`). The clause body's `resume(...)` therefore reads register `k`,
+   which `collect_fn_specs` never created. Fix: seed the clause's PResume
+   param into a register named `"k"`, and reserve a matching `k` alloca for
+   clause fns in the entry head (`nfx_reserve_k`).
+
+4. **Module privacy, invisible until selfhost.** The bundle-concat build
+   (kaic1) ignores `import`/visibility, so cross-module calls to the new
+   `nfx_*` helpers and `nemit_declare_clause` compiled fine — and only
+   `make selfhost` (real imports) surfaced the missing `pub`. The standing
+   "always selfhost before done" rule caught it.
+
+5. **Stale build masquerading as a code bug.** `make kaic1` does not
+   rebuild on a `stage1/compiler.kai` edit alone (it keys on
+   `build/stage1.c`'s mtime), so a freshly-registered prim (`array_alloca`)
+   was absent from the running kaic1, and a stale kaic2 silently kept
+   compiling an *old* bundle. Hours of the "0 bodies" hunt were spent
+   before `rm -f stage1/kaic1 stage1/build/stage1.c` forced the rebuild and
+   the real bug (#1) surfaced. Lesson: when a compiler-source edit seems to
+   have no effect, force-clean the bootstrap binary before trusting any
+   diagnosis.
+
+## Ev struct layout (the one place IR meets C layout)
+
+The C-direct emit's `struct EvX` is `{ KaiHandlerId handler_id; void *env;
+KaiValue *state; <op fn-ptrs…>; }` — a **three-field header**, ops starting
+at field index 3 (the first design note assumed two — `state` is always
+present, even for stateless handlers). The native walk builds the Ev as a
+`[3 + nops x ptr]` alloca and reaches fields by index through the
+`kaix_ev_*` helpers, never as a struct-nominal type in IR (opaque pointers
+make that unnecessary, and the C-API has no struct-type builder). This
+keeps the layout knowledge in C, mirroring the `kai_jmpbuf_size` /
+`kaix_handle_discard_unwind` discipline established for #622.
+
+## Gate (every item green at close)
+
+- Native parity vs C-direct: 5/5 (3 pure + 2 effects, incl. the discard
+  longjmp path).
+- ASAN on the linked native effect executables: 0 errors.
+- Selfhost byte-id (default C path): `kaic2b.c == kaic2c.c` — the TyHandle
+  / stage1 RP / runtime additions are off the C path, byte-id preserved.
+- tier0 OK.
+- `km`: emit_native_fx A++ (97.6), emit_native_fx2 A+ (96.9), both
+  < 400 LOC; every edited file held its grade.
+
+## Follow-ups for next subsets
+
+- Effects 2b: stateful handlers (`State`, the `state` field + 2-arg
+  `KResume2` + `kaix_clause_state_set`), `as`-alias dispatch
+  (`kaix_evidence_lookup_node_by_id` + the `__alias_id__` sentinel),
+  builtin-default install (`kp.install_order` → `kai_main_install_defaults`,
+  today an empty no-op).
+- Richer effect fixture that *returns* a handler value (the current pair
+  only observes the exit code; a fixture printing a clause result would
+  tighten the behavioural check).
+- Retire `native_handle_fns()` (now urgent — see bug #1).
+- TRMC + KTailCall, #779 EBlock-raw still pending from the pure-walk retro.

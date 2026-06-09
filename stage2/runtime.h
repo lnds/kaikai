@@ -11450,6 +11450,15 @@ static void *kai_llvm_build_alloca(void *b, void *ty, KaiValue *name) {
     if (name) kai_decref(name);
     return (void *) a;
 }
+/* `alloca elem, count` — a runtime-sized stack buffer (the handle frame's
+ * `jmp_buf`, whose `sizeof` is a runtime value via `kai_jmpbuf_size` rather
+ * than a platform-specific N baked into the IR). `count` is an i64 Value. */
+static void *kai_llvm_build_array_alloca(void *b, void *elemty, void *count, KaiValue *name) {
+    LLVMValueRef a = LLVMBuildArrayAlloca((LLVMBuilderRef) b, (LLVMTypeRef) elemty,
+                                          (LLVMValueRef) count, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
 static KaiValue *kai_llvm_build_store(void *b, void *val, void *ptr) {
     LLVMBuildStore((LLVMBuilderRef) b, (LLVMValueRef) val, (LLVMValueRef) ptr);
     return kai_unit();
@@ -11716,6 +11725,7 @@ static void *kai_llvm_const_null(void *t) { (void) t; return kai_llvm_native_una
 static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_load(void *b, void *t, void *p) { (void) b; (void) t; (void) p; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_br(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }

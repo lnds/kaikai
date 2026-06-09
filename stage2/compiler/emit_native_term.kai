@@ -21,40 +21,114 @@ import compiler.kir
 import compiler.native_prims
 import compiler.emit_native_fn
 import compiler.emit_native_ops
+import compiler.emit_native_fx
+import compiler.emit_native_fx2
 
 # --- one KFn → an LLVM function ----------------------------------------
 
 # Lower `f` into the module. The fn was declared up front (forward refs);
 # re-resolve by symbol. `begin_fn` resets the per-fn reg/block tables
 # (arena). Pass 1 creates the KIR blocks + allocas; the alloca-entry
-# branches to the first KIR block; pass 2 fills each block. A
-# `KFnLambda`/`KFnClause` (thunk ABI) is a later subset — abort loudly.
-pub fn nemit_fn(ctx: Handle, f: KFn) : Unit / Console = match f.kind {
-  KFnNormal -> nemit_fn_with(ctx, f, false)
-  KFnLambda -> nemit_fn_with(ctx, f, true)
-  # A handler clause rides the effects ABI (resume continuation) — a
-  # later subset; abort loudly.
-  KFnClause -> nemit_unsupported(ctx, cat2("clause fn (effects = subset 2): ", f.sym))
+# branches to the first KIR block; pass 2 fills each block. `handlers`
+# threads the program's handler decls so a `KInstall`/`KPerform` resolves
+# its op→clause-thunk map (effects subset 2a). A `KFnClause` rides the
+# effects clause ABI `ptr (ptr self, <args>, ptr k)`.
+pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl]) : Unit / Console = match f.kind {
+  KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers)
+  KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers)
+  KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers)
 }
 
-# Lower one fn. A normal fn takes its params directly (`ptr (ptr × n)`);
-# a lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)` and
-# reads params/captures by index. The block-building + alloca prologue
-# are identical; only the LLVM signature and the param-seed differ.
-fn nemit_fn_with(ctx: Handle, f: KFn, is_thunk: Bool) : Unit / Console = {
-  let fnval = if is_thunk { nemit_declare_thunk(ctx, f.sym) }
-              else { llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params))) }
+# The native frame ABI a KFn emits — distinct from `KFnKind` so this file
+# carries the backend's three concrete signatures (normal / lambda-thunk /
+# clause) without re-matching the KIR kind everywhere.
+pub type NFnAbi = NFnNormal | NFnLambda | NFnClause
+
+# Lower one fn. A normal fn takes its params directly (`ptr (ptr × n)`); a
+# lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)`; a clause
+# takes `ptr (ptr self, <args ptr>, ptr k)`. The block-building + alloca
+# prologue are identical; only the LLVM signature + the param seed differ.
+fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl]) : Unit / Console = {
+  let fnval = nemit_declare_for_abi(ctx, f, abi)
   native_ctx_begin_fn(ctx, fnval)
   let aentry = llvm_append_block(native_ctx_m(ctx), fnval, "alloca.entry")
   nemit_make_blocks(ctx, fnval, f.blocks)
   let first_kblock = native_ctx_first_block(ctx)
   llvm_position_at_end(native_ctx_b(ctx), aentry)
   nemit_allocas(ctx, collect_fn_specs(f))
-  if is_thunk { nemit_seed_thunk_params(ctx, f.params, fnval) }
-  else { nemit_seed_params(ctx, f.params, fnval) }
+  # Reserve the effect-frame allocas (Ev / node / jmp_buf / discard / cont)
+  # in the entry head too, before the param seed branches away.
+  nemit_fx_allocas(ctx, f)
+  nemit_seed_for_abi(ctx, f, abi, fnval)
   llvm_build_br(native_ctx_b(ctx), first_kblock)
-  nemit_fill_blocks(ctx, f.blocks)
+  nemit_fill_blocks(ctx, f.blocks, handlers)
   native_ctx_end_fn(ctx)
+}
+
+# Declare the fn with the signature its ABI needs. Normal = all-boxed
+# `ptr (ptr × n)`; lambda + clause = the thunk-shaped declarer (a clause's
+# precise arity is materialised at the call site through the loaded op
+# fn-ptr, so the declaration only needs a stable address).
+fn nemit_declare_for_abi(ctx: Handle, f: KFn, abi: NFnAbi) : Handle = match abi {
+  NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+  NFnLambda -> nemit_declare_thunk(ctx, f.sym)
+  NFnClause -> nemit_declare_clause(ctx, f.sym, f.params)
+}
+
+# Seed the params for the ABI: normal stores each arg into its alloca;
+# lambda reads `args[i]` / captures; clause reads `args[i]` directly +
+# `k` (the last LLVM param) for `PResume` + captures/evidence from `self`.
+fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / Console = match abi {
+  NFnNormal -> nemit_seed_params(ctx, f.params, fnval)
+  NFnLambda -> nemit_seed_thunk_params(ctx, f.params, fnval)
+  NFnClause -> nemit_seed_clause_params(ctx, f.params, fnval)
+}
+
+# A clause `ptr (ptr self, <PDirect args ptr>, ptr k)`: self + one ptr per
+# direct op-arg + the trailing continuation. Param count = 1 (self) +
+# direct-arg count + 1 (k).
+pub fn nemit_declare_clause(ctx: Handle, sym: String, ps: [KParam]) : Handle = {
+  let p = native_ctx_ptrt(ctx)
+  let n = nclause_direct_count(ps, 0)
+  llvm_get_or_declare_fn(native_ctx_m(ctx), sym, llvm_fn_type_boxed(p, n + 2))
+}
+
+fn nclause_direct_count(ps: [KParam], acc: Int) : Int = match ps {
+  [] -> acc
+  [pp, ...rest] -> match pp.origin {
+    PDirect(_) -> nclause_direct_count(rest, acc + 1)
+    _          -> nclause_direct_count(rest, acc)
+  }
+}
+
+# Seed clause params. `self` is LLVM param 0; the direct op-args are LLVM
+# params 1..d; `k` (PResume) is the last LLVM param (d+1). A PDirect(i)
+# reads LLVM param `1 + i` (after self); PResume reads the last param.
+# PCapture/PEvidence (state/aliased handlers) are subset 2b — abort loud.
+#
+# The continuation param is registered under the FIXED name `k`, NOT its
+# surface name: the translator names the `PResume` param after the surface
+# `resume` (`p.pname`) but `lower_resume` emits `KResume(KVar("k"), …)`
+# with the fixed `k` (mirroring emit_llvm's `%k`). Binding the alloca under
+# `k` is what lets the clause body's `resume(...)` resolve. The matching
+# `k` alloca is reserved in the entry head by `nfx_reserve_k` (called from
+# `nemit_fx_allocas` for a clause fn).
+fn nemit_seed_clause_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = {
+  let d = nclause_direct_count(ps, 0)
+  nemit_seed_clause_loop(ctx, ps, fnval, d)
+}
+fn nemit_seed_clause_loop(ctx: Handle, ps: [KParam], fnval: Handle, d: Int) : Unit / Console = match ps {
+  [] -> ()
+  [pp, ...rest] -> {
+    match pp.origin {
+      # LLVM param 0 is self; direct op-arg `i` is LLVM param `1 + i`.
+      PDirect(i) -> nemit_store_reg(ctx, pp.name, llvm_get_param(fnval, 1 + i))
+      # `k` is the trailing LLVM param: index = 1 (self) + d (args).
+      PResume    -> nemit_store_reg(ctx, "k", llvm_get_param(fnval, 1 + d))
+      _          -> nemit_unsupported(ctx, "clause param origin (state/alias = subset 2b)")
+    }
+    nemit_seed_clause_loop(ctx, rest, fnval, d)
+  }
 }
 
 # Declare a lambda thunk `ptr (ptr self, ptr* args, i32 n)`.
@@ -101,19 +175,19 @@ fn nemit_make_blocks(ctx: Handle, fnval: Handle, bs: [KBlock]) : Unit = match bs
 
 # --- pass 2: fill each block's statements + terminator -----------------
 
-fn nemit_fill_blocks(ctx: Handle, bs: [KBlock]) : Unit / Console = match bs {
+fn nemit_fill_blocks(ctx: Handle, bs: [KBlock], handlers: [KHandlerDecl]) : Unit / Console = match bs {
   [] -> ()
   [b, ...rest] -> {
     llvm_position_at_end(native_ctx_b(ctx), native_ctx_find_block(ctx, b.label))
-    nemit_stmts(ctx, b.stmts)
+    nemit_stmts(ctx, b.stmts, handlers)
     nemit_term(ctx, b.term)
-    nemit_fill_blocks(ctx, rest)
+    nemit_fill_blocks(ctx, rest, handlers)
   }
 }
 
-fn nemit_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
+fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl]) : Unit / Console = match ss {
   [] -> ()
-  [s, ...rest] -> { nemit_stmt(ctx, s); nemit_stmts(ctx, rest) }
+  [s, ...rest] -> { nemit_stmt(ctx, s, handlers); nemit_stmts(ctx, rest, handlers) }
 }
 
 # --- statements ---------------------------------------------------------
@@ -130,19 +204,27 @@ fn nemit_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
 # use-after-free the LLVM verifier hits as a phantom-`phi` crash). The
 # `let h = ...` form rides the handle-binder exclusion (`pcs_rhs_is_handle`
 # in stage1), so `h` never enters Perceus and is never dropped.
-fn nemit_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
+fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl]) : Unit / Console = match s {
   # Capture the op/atom handle in a `let` (handle-binder exclusion) before
   # passing it on: a handle passed inline as a call ARGUMENT is RC-managed
   # by the type-blind kaic1, and a drop of an LLVM `Value*` clobbers its
   # use-list (a UAF the AsmPrinter hits during codegen). `nemit_op` /
   # `nemit_atom` are handle-returning, so the `let` keeps each out of
   # Perceus. (See the KDo / nemit_rc / nemit_push_fields notes.)
-  KLet(n, _, op, _) -> { let h = nemit_op(ctx, op); nemit_store_reg(ctx, n, h) }
-  KDo(op, _)        -> { let _h = nemit_op(ctx, op); () }
+  KLet(n, _, op, _) -> { let h = nemit_op_fx(ctx, op, handlers); nemit_store_reg(ctx, n, h) }
+  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, op, handlers); () }
   KStore(n, v, _)   -> { let h = nemit_atom(ctx, v); nemit_store_reg(ctx, n, h) }
   KRC(rc, _)        -> nemit_rc(ctx, rc)
-  KInstall(_, _, _, _, _) -> nemit_unsupported(ctx, "KInstall (effects = subset 2)")
-  KPop(_, _)        -> nemit_unsupported(ctx, "KPop (effects = subset 2)")
+  KInstall(eff, sym, _, _, _) -> nemit_install(ctx, eff, sym, handlers)
+  KPop(_, _)        -> nemit_pop(ctx)
+}
+
+# `nemit_op` covers the pure-walk ops; a `KPerform` needs the handler map,
+# so route it through `nemit_perform` here (the only op that needs
+# `handlers`). Everything else delegates to the pure `nemit_op`.
+fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl]) : Handle / Console = match op {
+  KPerform(eff, o, cargs) -> nemit_perform(ctx, eff, o, cargs, handlers)
+  _                       -> nemit_op(ctx, op)
 }
 
 # A Perceus RC op → the runtime dup/drop. The call result is captured in a
@@ -171,8 +253,8 @@ fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
   KTailCall(_, _, _)    -> nemit_unsupported(ctx, "KTailCall (later subset)")
   KTrmcStep(_, _, _, _, _, _) -> nemit_unsupported(ctx, "KTrmcStep (TRMC = later subset)")
   KTrmcApply(_, _)      -> nemit_unsupported(ctx, "KTrmcApply (TRMC = later subset)")
-  KResume(_, _, _, _)   -> nemit_unsupported(ctx, "KResume (effects = subset 2)")
-  KResume2(_, _, _, _, _) -> nemit_unsupported(ctx, "KResume2 (effects = subset 2)")
+  KResume(k, v, _, _)   -> nemit_resume(ctx, k, v)
+  KResume2(_, _, _, _, _) -> nemit_unsupported(ctx, "KResume2 (stateful resume = subset 2b)")
 }
 
 # `condbr`: the cond is a boxed Bool; `kaix_truthy` lowers it to i32 0/1,

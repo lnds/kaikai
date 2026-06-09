@@ -1,0 +1,175 @@
+# compiler/emit_native_fx2.kai — the pass-2 effect-node emitters (the
+# install / setjmp / pop / perform / resume sequences) of the native
+# backend's effects subset. `emit_native_fx.kai` holds the pass-1 alloca
+# reservation + the handler-lookup helpers this module drives on.
+#
+# Each emitter is a flat sequence of `kai_llvm_build_*` calls mirroring
+# the validated `emit_llvm.kai` shape (parity lane #622), but reading the
+# handle-frame allocas the pass-1 reservation registered (Ev / node /
+# jmp_buf / discard / cont) instead of emitting them inline — the walk's
+# "allocas only in entry" rule. All handles are captured in `let` bindings
+# (the handle-binder exclusion, `pcs_rhs_is_handle`) so the type-blind
+# kaic1 Perceus never drops a raw LLVM `Value*`.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+import compiler.emit_native_fx
+
+# --- KInstall: build the Ev blob + push the evidence -------------------
+#
+# Mirrors `emit_llvm.kai`'s install side: stamp `handler_id` (field 0) and
+# each op fn-ptr (field 3 + i) into the Ev blob the pass-1 reservation
+# alloca'd, then `kaix_evidence_push_with_jmp(node, eff, ev, jmp, discard)`
+# so the op site can find the landing pad on a discard. `handlers` threads
+# the program's handler decls so the op→clause-thunk map resolves.
+pub fn nemit_install(ctx: Handle, eff: String, sym: String, handlers: [KHandlerDecl]) : Unit / Console =
+  match nfx_find_handler(handlers, sym) {
+    None -> nemit_unsupported(ctx, cat2("KInstall: no handler decl for ", sym))
+    Some(h) -> nemit_install_with(ctx, eff, h)
+  }
+
+fn nemit_install_with(ctx: Handle, eff: String, h: KHandlerDecl) : Unit / Console = {
+  let ev = native_ctx_find_reg(ctx, nfx_ev_reg(eff))
+  # handler_id = kaix_fresh_handler_id() : i64; store into Ev field 0.
+  # (i64-returning — NOT the all-boxed `ptr()` `nemit_call0` assumes.)
+  let hid = ncall_sig0(ctx, "kaix_fresh_handler_id", native_ctx_i64t(ctx))
+  let _h0 = ncall_sig2(ctx, "kaix_ev_set_handler_id", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_i64t(ctx), ev, hid)
+  # Each op fn-ptr at field (nfx_op_base + i): declare the clause thunk,
+  # store its address with kaix_ev_set_op(ev, field, fn).
+  nemit_install_ops(ctx, ev, h.op_thunks, 0)
+  # Push the evidence with the jmp_buf + discard slot: the runtime stamps
+  # node->handle_jmp / node->discard_slot so the op site can unwind.
+  let node = native_ctx_find_reg(ctx, nfx_node_reg(eff))
+  let jmpbuf = native_ctx_find_reg(ctx, nfx_jmpbuf_reg(eff))
+  let disc = native_ctx_find_reg(ctx, nfx_discard_reg())
+  let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+  nemit_push_with_jmp(ctx, node, effname, ev, jmpbuf, disc)
+}
+
+# Store each op's clause-thunk address into the Ev blob at its field index.
+# A clause thunk has ABI `ptr (ptr self, <args>, ptr k)`; declare it with a
+# generic boxed-ish signature (the address is all we need — the call goes
+# through the loaded fn-ptr at the perform site, which builds the precise
+# fn type). Reuse the lambda-thunk declarer shape but the clause arity is
+# unknown here; declare as `ptr ()` varargs-free placeholder — only the
+# address is stored, never called through THIS declaration.
+fn nemit_install_ops(ctx: Handle, ev: Handle, thunks: [KOpThunk], i: Int) : Unit / Console = match thunks {
+  [] -> ()
+  [KOT(_, thunk_sym), ...rest] -> {
+    let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), thunk_sym, llvm_fn_type_0(native_ctx_ptrt(ctx)))
+    let field = nfx_op_base() + i
+    let _s = nemit_ev_set_op(ctx, ev, field, fnv)
+    nemit_install_ops(ctx, ev, rest, i + 1)
+  }
+}
+
+# `kaix_ev_set_op(ptr ev, i64 idx, ptr fn) -> void`.
+fn nemit_ev_set_op(ctx: Handle, ev: Handle, field: Int, fnv: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, native_ctx_i64t(ctx)); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, ev); llvm_buf_push(ab, llvm_const_int(native_ctx_i64t(ctx), field)); llvm_buf_push(ab, fnv)
+  ncall_finish(ctx, "kaix_ev_set_op", native_ctx_voidt(ctx), ptb, ab)
+}
+
+# `kaix_evidence_push_with_jmp(ptr node, i8* eff, ptr ev, ptr jmp, ptr discard) -> void`.
+fn nemit_push_with_jmp(ctx: Handle, node: Handle, effname: Handle, ev: Handle, jmpbuf: Handle, disc: Handle) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new()
+  llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new()
+  llvm_buf_push(ab, node); llvm_buf_push(ab, effname); llvm_buf_push(ab, ev); llvm_buf_push(ab, jmpbuf); llvm_buf_push(ab, disc)
+  let _r = ncall_finish(ctx, "kaix_evidence_push_with_jmp", native_ctx_voidt(ctx), ptb, ab)
+  ()
+}
+
+# --- KPop: pop the evidence on the normal exit path --------------------
+pub fn nemit_pop(ctx: Handle) : Unit / Console = {
+  let _r = nemit_call0(ctx, "kaix_evidence_pop"); ()
+}
+
+# --- KPerform: dispatch an op to its handler clause --------------------
+#
+# Mirrors `llvm_emit_op_dispatch`: lookup the evidence node, read its
+# handler (the Ev blob), init a one-shot KaiCont, set the in_dispatch
+# guard, indirect-call the op fn-ptr at its field index, restore the
+# guard, then `kaix_op_finish` (the folded discard test + unwind — on a
+# discard it longjmps and does not return; otherwise yields the op result).
+pub fn nemit_perform(ctx: Handle, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console =
+  match nfx_find_handler_by_eff(handlers, eff) {
+    None -> { nemit_unsupported(ctx, cat2("KPerform: no handler for effect ", eff)); nemit_null(ctx) }
+    Some(h) -> nemit_perform_with(ctx, eff, op, cargs, h)
+  }
+
+fn nemit_perform_with(ctx: Handle, eff: String, op: String, cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let field = nfx_op_field(h.op_thunks, op, 0)
+  # 1. node = lookup_node(eff); handler = node_handler(node).
+  let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+  let node = ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+  let handler = nemit_call1(ctx, "kaix_evidence_node_handler", node)
+  # 2. cont = the reserved KaiCont alloca; init identity with handler_id.
+  # `kaix_ev_handler_id(ptr) -> i64` (NOT a boxed ptr); `cont_init_identity`
+  # takes the i64 hid as its second arg.
+  let cont = native_ctx_find_reg(ctx, nfx_cont_reg())
+  let hid = ncall_sig1(ctx, "kaix_ev_handler_id", native_ctx_i64t(ctx), p, handler)
+  let _ci = ncall_sig2(ctx, "kaix_cont_init_identity", native_ctx_voidt(ctx), p, native_ctx_i64t(ctx), cont, hid)
+  # 3. evaluate args BEFORE the in_dispatch flag (they may invoke the op).
+  let argbuf = nemit_perform_argbuf(ctx, handler, cargs, cont)
+  # 4. in_dispatch_enter(node) -> prev; load the op fn-ptr; indirect call.
+  let prev = nemit_call1(ctx, "kaix_in_dispatch_enter", node)
+  let opfn = ncall_sig2(ctx, "kaix_ev_op_at", p, p, native_ctx_i64t(ctx), handler, llvm_const_int(native_ctx_i64t(ctx), field))
+  let r = nemit_perform_indirect(ctx, opfn, argbuf, list_length(cargs))
+  let _il = nemit_call1(ctx, "kaix_in_dispatch_leave", prev)
+  # 5. op_finish(node, cont, r): on a discard it longjmps (no return);
+  # otherwise yields `r`. Folds the C-direct discard test + unwind so the
+  # KIR block stays 1:1 with an LLVM block (no fresh op.cont/op.discard).
+  nemit_op_finish(ctx, node, cont, r)
+}
+
+# Build the op-clause arg buffer: `self` (the Ev handler) first, then each
+# materialised op arg, then the cont pointer last — the clause ABI
+# `ptr (ptr self, <args>, ptr k)`.
+fn nemit_perform_argbuf(ctx: Handle, handler: Handle, cargs: [KVal], cont: Handle) : Handle / Console = {
+  let buf = llvm_buf_new()
+  llvm_buf_push(buf, handler)
+  nemit_perform_push_args(ctx, buf, cargs)
+  llvm_buf_push(buf, cont)
+  buf
+}
+fn nemit_perform_push_args(ctx: Handle, buf: Handle, cargs: [KVal]) : Unit / Console = match cargs {
+  [] -> ()
+  [a, ...rest] -> { let av = nemit_atom(ctx, a); llvm_buf_push(buf, av); nemit_perform_push_args(ctx, buf, rest) }
+}
+
+# Indirect call to the loaded op fn-ptr over the arg buffer. The fn type is
+# `ptr (ptr self, <n args ptr>, ptr k)`: n+2 ptr params, ptr return. Built
+# from a param-type buffer matching the arg buffer length.
+fn nemit_perform_indirect(ctx: Handle, opfn: Handle, argbuf: Handle, nargs: Int) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let fnty = llvm_fn_type_boxed(p, nargs + 2)
+  llvm_build_call_n(native_ctx_b(ctx), opfn, fnty, argbuf)
+}
+
+# `kaix_op_finish(ptr node, ptr cont, ptr op_r) -> ptr`.
+fn nemit_op_finish(ctx: Handle, node: Handle, cont: Handle, r: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, node); llvm_buf_push(ab, cont); llvm_buf_push(ab, r)
+  ncall_finish(ctx, "kaix_op_finish", p, ptb, ab)
+}
+
+# --- KResume: one-shot resume the continuation -------------------------
+#
+# `resume[tail] k v` -> `kaix_cont_resume(k, v)`, then `ret` the result
+# (the clause body's value IS the resume result for a tail resume).
+pub fn nemit_resume(ctx: Handle, k: KVal, v: KVal) : Unit / Console = {
+  let kv = nemit_atom(ctx, k)
+  let vv = nemit_atom(ctx, v)
+  let r = ncall_sig2(ctx, "kaix_cont_resume", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), kv, vv)
+  let _ret = llvm_build_ret(native_ctx_b(ctx), r)
+  ()
+}
