@@ -1,0 +1,345 @@
+# compiler/fmt_decl.kai — top-level declaration dispatch for
+# `kai fmt` (issue #781 split).
+#
+# `fmt_decl` matches every Decl variant and delegates: fn / type /
+# test / bench / check / const / axiom / import / impl here, effect
+# and protocol to fmt_effect, expression bodies to fmt_expr. The
+# attribute wrappers (`#[derive]`, `#[unstable]`, `#[doc]`) and the
+# `unit` / `use` decls render inline. `fmt_impl_methods` recurses
+# back into `fmt_decl` for impl-body methods.
+
+import compiler.util
+import compiler.chars
+import compiler.ast
+import compiler.parse
+import compiler.fmt_writer
+import compiler.fmt_expr
+import compiler.fmt_effect
+
+# Emit a single decl. Unsupported variants `panic` with a clear
+# `kai fmt:` message — `panic` calls C's exit(1), so the partial
+# accumulator built into FmtSt never reaches stdout. Refusing
+# rather than dumping placeholders keeps the contract honest:
+# either kai fmt prints byte-correct kaikai source, or it errors out.
+pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
+  match d {
+    DImport(ik, _, _) -> fmt_import(ik, s)
+    DFn(is_pub, name, tparams, params, ret, row, body, _, _, _) ->
+      fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
+    DType(is_pub, name, tparams, body, _, _, _) ->
+      fmt_type_decl(is_pub, name, tparams, body, s)
+    DTest(label, body, _, _) -> fmt_test(label, body, s)
+    DBench(label, body, _, _) -> fmt_bench(label, body, s)
+    DCheck(label, ps, body, _, _) -> fmt_check(label, ps, body, s)
+    DEffect(is_pub, name, tparams, ops, default_opt, _, _) ->
+      fmt_effect_decl(is_pub, name, tparams, ops, default_opt, s)
+    DProtocol(is_pub, name, tparams, ops, _, _) ->
+      fmt_protocol_decl(is_pub, name, tparams, ops, s)
+    DImpl(pname, proto_args, target_ty, methods, _, _) ->
+      fmt_impl_decl(pname, proto_args, target_ty, methods, s)
+    # `#[derive(P, ...)] <inner_type_decl>` — emit the annotation on
+    # its own line, then the wrapped decl. Issue #608: the short
+    # `#derive(...)` form was deprecated; only `#[derive(...)]` is
+    # accepted by the parser.
+    DDerive(names, inner, _, _) -> {
+      let s1 = fmt_emit(s, string_concat_all(["#[derive(", string_join(names, ", "), ")]"]))
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    # `#[unstable]` attribute wrapping a `pub fn / pub type / pub const`.
+    DUnstable(inner, _, _) -> {
+      let s1 = fmt_emit(s, "#[unstable]")
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    # `#[doc("...")]` wrapping a documented declaration (issue #681).
+    # The raw byte span is re-emitted verbatim — no re-quoting, no
+    # auto-wrapping — so `kai fmt` is byte-identical on doc attributes.
+    DDoc(raw, _, inner, _, _) -> {
+      let s1 = fmt_emit(s, raw)
+      let s2 = fmt_newline(s1)
+      fmt_decl(inner, s2)
+    }
+    # Module-position `#[doc(...)]` — verbatim, stands alone (the
+    # program walker adds the blank line separating decls).
+    DModuleDoc(raw, _, _, _) ->
+      fmt_emit(s, raw)
+    # `[pub] unit NAME [= unit_expr]` — m12.5.
+    DUnit(is_pub, name, alias_opt, _, _) -> {
+      let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
+      let s2 = fmt_emit(s1, "unit ")
+      let s3 = fmt_emit(s2, name)
+      match alias_opt {
+        None      -> s3
+        Some(u)   -> {
+          let a = fmt_emit(s3, " = ")
+          fmt_emit(a, fmt_unit_expr_str(u))
+        }
+      }
+    }
+    # `use Effect` at file scope — m7e §25.
+    DUse(eff_name, _, _) ->
+      fmt_emit(s, string_concat("use ", eff_name))
+    # `[pub] axiom name[tparams](params) : T / row` (m12.7) or
+    # `extern "C" [pub] fn name[...](...) : T / Ffi` when extern_c.
+    # When c_sym_over is non-empty, the override sits between the
+    # ABI string and `pub` / `fn` per issue #261.
+    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, _, _) ->
+      fmt_axiom_decl(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, s)
+    # Issue #269: dedicated fmt arm matching the parser surface.
+    # Round-trips `[pub] const NAME : T = body`. The body is emitted
+    # via `fmt_expr` (the same printer used by `let pat = expr`
+    # initialisers) so the produced source survives a re-parse.
+    DConst(is_pub, name, ty, body, _, _, _) -> fmt_const_decl(is_pub, name, ty, body, s)
+  }
+}
+
+# Issue #269: format a `[pub] const NAME : T = body` declaration.
+pub fn fmt_const_decl(is_pub: Bool, name: String, ty: TypeExpr, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let s2 = fmt_emit(s1, "const ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = fmt_emit(s3, " : ")
+  let s5 = fmt_type(ty, s4)
+  let s6 = fmt_emit(s5, " = ")
+  let s7 = fmt_expr(body, s6)
+  fmt_newline(s7)
+}
+
+# m12.7: `[pub] axiom name[tparams](params) : T / row` or
+# `extern "C"["symbol_override"] [pub] fn name[tparams](params) : T / row`
+# when extern_c is true. Issue #260 introduced the extern shape;
+# issue #261 added the `("real_symbol")` override placed immediately
+# after the ABI literal (no space, no newline).
+pub fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: String, tparams: [String], params: [Param], ret_ty: TypeExpr, row: RowExpr, s: FmtSt) : FmtSt {
+  let s_pre = if extern_c {
+    let a = fmt_emit(s, "extern \"C\"")
+    let b = if string_length(c_sym_over) > 0 {
+      fmt_emit(a, string_concat_all(["(\"", c_sym_over, "\")"]))
+    } else { a }
+    fmt_emit(b, " ")
+  } else { s }
+  let s_pub = if is_pub { fmt_emit(s_pre, "pub ") } else { s_pre }
+  let s_kw  = fmt_emit(s_pub, if extern_c { "fn " } else { "axiom " })
+  let s_n   = fmt_emit(s_kw, name)
+  let s_tp  = fmt_tparams(tparams, s_n)
+  let s_op  = fmt_emit(s_tp, "(")
+  let s_ps  = fmt_params(params, s_op)
+  let s_cp  = fmt_emit(s_ps, ") : ")
+  let s_rt  = fmt_type(ret_ty, s_cp)
+  fmt_row(row, s_rt)
+}
+
+# m12.8: `impl Pname[proto_args] for Target { method_decls... }`.
+# When `proto_args` is empty, the surface form drops the `[...]`.
+# Issue #180.
+pub fn fmt_impl_decl(pname: String, proto_args: [TypeExpr], target_ty: TypeExpr, methods: [Decl], s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "impl ")
+  let s2 = fmt_emit(s1, pname)
+  let s3 = if list_is_empty(proto_args) { s2 }
+    else {
+      let a = fmt_emit(s2, "[")
+      let b = fmt_type_args(proto_args, a)
+      fmt_emit(b, "]")
+    }
+  let s4 = fmt_emit(s3, " for ")
+  let s5 = fmt_type(target_ty, s4)
+  let s6 = fmt_emit(s5, " {")
+  let s7 = fmt_newline(s6)
+  let s8 = fmt_indent_in(s7)
+  let s9 = fmt_impl_methods(methods, s8)
+  let s10 = fmt_indent_out(s9)
+  fmt_emit(s10, "}")
+}
+
+pub fn fmt_impl_methods(methods: [Decl], s: FmtSt) : FmtSt = match methods {
+  []           -> s
+  [m, ...rest] -> {
+    let s1 = fmt_decl(m, s)
+    let s2 = fmt_newline(s1)
+    fmt_impl_methods(rest, s2)
+  }
+}
+
+pub fn fmt_panic_unsupported(what: String, line: Int) : a = panic(string_concat_all(["kai fmt: ", what, " not yet supported (line ", int_to_string(line), ")"]))
+
+# ---- imports --------------------------------------------------------
+
+pub fn fmt_import(ik: ImportKind, s: FmtSt) : FmtSt {
+  match ik {
+    IkPath(p) -> fmt_emit(s, string_concat_all(["import ", p]))
+    IkAlias(p, alias) -> fmt_emit(s, string_concat_all(["import ", p, " as ", alias]))
+    IkSelective(p, names) -> fmt_emit(s, string_concat_all(["import ", p, ".{", string_join(names, ", "), "}"]))
+    IkHole(name) -> fmt_emit(s, string_concat_all(["import ?", name]))
+  }
+}
+
+pub fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: Option[TypeExpr], row: RowExpr, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = if is_pub {
+    fmt_emit(s, "pub ")
+  } else {
+    s
+  }
+  let s2 = fmt_emit(s1, "fn ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = fmt_tparams(tparams, s3)
+  let s5 = fmt_emit(s4, "(")
+  let s6 = fmt_params(params, s5)
+  let s7 = fmt_emit(s6, ")")
+  let s8 = match ret {
+    None -> s7
+    Some(t) -> {
+      let a = fmt_emit(s7, " : ")
+      fmt_type(t, a)
+    }
+  }
+  let s9 = fmt_row(row, s8)
+  fmt_fn_body(body, s9)
+}
+
+# Function body: prefer `= expr` when the body is a single non-block
+# expression (literal, var, simple call, etc.); use `{ ... }` block
+# form when the body is an EBlock or contains multi-line constructs.
+pub fn fmt_fn_body(body: Expr, s: FmtSt) : FmtSt {
+  match body.kind {
+    EBlock(stmts, tail) -> {
+      let s1 = fmt_emit(s, " {")
+      let s2 = fmt_newline(s1)
+      let s3 = fmt_indent_in(s2)
+      let s4 = fmt_block_inner(stmts, tail, s3)
+      let s5 = fmt_indent_out(s4)
+      fmt_emit(s5, "}")
+    }
+    _ -> {
+      let s1 = fmt_emit(s, " = ")
+      fmt_expr(body, s1)
+    }
+  }
+}
+
+# ---- type decls -----------------------------------------------------
+
+pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBody, s: FmtSt) : FmtSt {
+  let s1 = if is_pub {
+    fmt_emit(s, "pub ")
+  } else {
+    s
+  }
+  let s2 = fmt_emit(s1, "type ")
+  let s3 = fmt_emit(s2, name)
+  let s4 = fmt_tparams(tparams, s3)
+  match body {
+    TBAlias(t) -> {
+      let a = fmt_emit(s4, " = ")
+      fmt_type(t, a)
+    }
+    TBRecord(fields) -> {
+      let a = fmt_emit(s4, " = { ")
+      let b = fmt_field_decls(fields, a)
+      fmt_emit(b, " }")
+    }
+    TBSum(variants) -> fmt_sum_variants(variants, s4)
+    TBEffectAlias(labels) -> {
+      let a = fmt_emit(s4, " = ")
+      fmt_emit(a, string_join(labels, " + "))
+    }
+  }
+}
+
+pub fn fmt_field_decls(fs: [FieldDecl], s: FmtSt) : FmtSt {
+  match fs {
+    [] -> s
+    [f] -> fmt_field_decl(f, s)
+    [f, ...rest] -> {
+      let s1 = fmt_field_decl(f, s)
+      let s2 = fmt_emit(s1, ", ")
+      fmt_field_decls(rest, s2)
+    }
+  }
+}
+
+pub fn fmt_field_decl(fd: FieldDecl, s: FmtSt) : FmtSt {
+  match fd {
+    FD(is_pub, name, t) -> {
+      # Round-trip `priv` qualifier when present so `kai fmt` does
+      # not silently flip a field's visibility. Public is the default
+      # — no `pub` prefix is emitted, matching the surface syntax.
+      let s_v = if is_pub { s } else { fmt_emit(s, "priv ") }
+      let s1 = fmt_emit(s_v, name)
+      let s2 = fmt_emit(s1, ": ")
+      fmt_type(t, s2)
+    }
+  }
+}
+
+pub fn fmt_sum_variants(vs: [Variant], s: FmtSt) : FmtSt {
+  let s0 = fmt_newline(s)
+  let s1 = fmt_indent_in(s0)
+  let s2 = fmt_emit(s1, "= ")
+  let s3 = fmt_sum_variants_loop(vs, s2, true)
+  fmt_indent_out(s3)
+}
+
+pub fn fmt_sum_variants_loop(vs: [Variant], s: FmtSt, first: Bool) : FmtSt {
+  match vs {
+    [] -> s
+    [v, ...rest] -> {
+      let s1 = if first {
+        s
+      } else {
+        let n = fmt_newline(s)
+        fmt_emit(n, "| ")
+      }
+      let s2 = fmt_variant(v, s1)
+      fmt_sum_variants_loop(rest, s2, false)
+    }
+  }
+}
+
+pub fn fmt_variant(v: Variant, s: FmtSt) : FmtSt {
+  match v {
+    Var(name, ty_args) -> {
+      let s1 = fmt_emit(s, name)
+      if list_is_empty(ty_args) {
+        s1
+      } else {
+        let s2 = fmt_emit(s1, "(")
+        let s3 = fmt_type_args(ty_args, s2)
+        fmt_emit(s3, ")")
+      }
+    }
+  }
+}
+
+# ---- tests ----------------------------------------------------------
+
+pub fn fmt_test(label: String, body: Expr, s: FmtSt) : FmtSt {
+  # `label` is the raw source span of the string literal (quotes
+  # included), so it round-trips verbatim — single, triple, escaped
+  # quotes all preserved.
+  let s1 = fmt_emit(s, "test ")
+  let s2 = fmt_emit(s1, label)
+  fmt_fn_body(body, s2)
+}
+
+pub fn fmt_bench(label: String, body: Expr, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "bench ")
+  let s2 = fmt_emit(s1, label)
+  fmt_fn_body(body, s2)
+}
+
+# check v1 (issue #44): formats `check "label" [with p1: T, ...] { body }`.
+# The `with` clause prints only when params are non-empty so a check
+# without params round-trips identically to a parameterless test/bench.
+pub fn fmt_check(label: String, ps: [Param], body: Expr, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, "check ")
+  let s2 = fmt_emit(s1, label)
+  let s3 = match ps {
+    [] -> s2
+    _ -> {
+      let a = fmt_emit(s2, " with ")
+      fmt_params(ps, a)
+    }
+  }
+  fmt_fn_body(body, s3)
+}
