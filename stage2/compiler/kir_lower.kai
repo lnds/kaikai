@@ -374,6 +374,95 @@ pub fn kir_user_effects_in_row(main_row: [String]) : [String] = match main_row {
 pub fn kir_install_order(decls: [Decl]) : [String] =
   list_append(kir_builtin_install_order(), kir_user_effects_in_row(main_row_labels(decls)))
 
+# --- Default-handler op→runtime-symbol resolution (native install) ------
+#
+# For each effect in `install_order` carrying an all-`$extern_handler`
+# default block, resolve its ops to the `kaix_default_<eff>_<op>`
+# forwarders. The synthetic builtins (Stdout/Stderr/Fail/…) and any
+# user effect with a `default { }` block (Clock in stdlib/time.kai) go
+# through the SAME `find_effect_default_block` path — the compiler
+# injects the builtins as real `DEffect` decls with default blocks
+# (driver.kai `builtin_stdout_decl` &c.), so there is no second class.
+# Mirror of emit_llvm's `lvm_default_install_for_effect` op walk, but
+# producing target-neutral `KDefault` data the native translator reads.
+
+# Map the C symbol `kai_default_<eff>_<op>` carried by `$extern_handler`
+# to the LLVM-visible non-static forwarder `kaix_default_<eff>_<op>`
+# (issue #115: the static runtime handler is `kai_*`; only the `kaix_*`
+# mirror is callable from emitted code). Mirror of `lvm_kaix_symbol`.
+pub fn kir_kaix_symbol(c_sym: String) : String =
+  if string_starts_with_q(c_sym, "kai_") {
+    string_concat("kaix_", string_slice(c_sym, 4, string_length(c_sym) - 4))
+  } else { c_sym }
+
+# Recognise a `$extern_handler("c_symbol")` clause body and return the
+# bridged C symbol, or "" when the body is not such a bridge.
+#
+# Returns a plain `String`, NOT the `Option[String]` that emit_shared's
+# `extern_handler_c_symbol` returns — load-bearing, not style. The Option
+# form trips a kaic1 codegen bug that silently empties the bound value
+# (`Some("")` even though a direct strip returns the symbol); a plain
+# String in one SSA slot guarded on `== ""` sidesteps it. This is the same
+# fix `lvm_extern_handler_c_symbol` (emit_llvm) applies for the same reason
+# — see docs/lane-experience-llvm-parity-B.md. The native lowering runs in
+# the kaic1-built KAI_LLVM kaic2, so the bug bites here too.
+fn kir_extern_handler_c_symbol(body: Expr) : String = match body.kind {
+  EIntrinsic(name, args_) ->
+    if name == "extern_handler" {
+      match args_ {
+        [a] -> match a.kind {
+          EStr(span, is_triple) -> if is_triple { "" } else { strip_string_quotes(span) }
+          _ -> ""
+        }
+        _ -> ""
+      }
+    } else { "" }
+  _ -> ""
+}
+
+# The op→symbol pairs of one default block's clauses, in clause order
+# (= op declaration order, so the position is the Ev field offset). A
+# clause that does not bridge via `$extern_handler` (empty symbol) is skipped.
+fn kir_default_ops(cs: [HClause]) : [KDefOp] = match cs {
+  [] -> []
+  [HC(op_name, _, body, _, _), ...rest] -> {
+    let c_sym = kir_extern_handler_c_symbol(body)
+    if c_sym == "" { kir_default_ops(rest) }
+    else { [KDOp(op_name, kir_kaix_symbol(c_sym)), ...kir_default_ops(rest)] }
+  }
+}
+
+# The `KDefault` for one effect, or None when it carries no default block.
+fn kir_default_for_effect(eff: String, decls: [Decl]) : Option[KDefault] =
+  match find_effect_default_block(eff, decls) {
+    None         -> None
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> Some(KDef(eff, kir_default_ops(clauses)))
+    }
+  }
+
+# Resolve each effect that main ACTUALLY uses to its `KDefault`. The set is
+# `install_order ∩ main_row` (only effects in main's inferred row get a
+# default installed — exactly the C-direct `if list_has(main_row, eff)`
+# filter in `default_setups_for`); `install_order` itself is the full
+# builtin ORDER, not the install set. An effect with no default block (e.g.
+# a parametric `State[T]`) drops out via `find_effect_default_block`. The
+# result is in install order so native push/pop stays LIFO.
+pub fn kir_default_handlers(decls: [Decl]) : [KDefault] =
+  kir_default_handlers_loop(kir_install_order(decls), main_row_labels(decls), decls)
+
+fn kir_default_handlers_loop(order: [String], main_row: [String],
+                             decls: [Decl]) : [KDefault] = match order {
+  [] -> []
+  [eff, ...rest] ->
+    if name_in_list(main_row, eff) {
+      match kir_default_for_effect(eff, decls) {
+        None    -> kir_default_handlers_loop(rest, main_row, decls)
+        Some(d) -> [d, ...kir_default_handlers_loop(rest, main_row, decls)]
+      }
+    } else { kir_default_handlers_loop(rest, main_row, decls) }
+}
+
 # --- Diagnostics --------------------------------------------------------
 
 # The surface name of an AST expression kind, for the loud "unhandled

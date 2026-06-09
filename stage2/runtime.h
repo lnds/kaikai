@@ -11595,6 +11595,22 @@ static void *kai_llvm_build_string_span(void *b, KaiValue *s) {
     return (void *) g;
 }
 
+/* A module-level zero-initialised internal global of type `ty`, returning
+ * its address. The native default-handler install needs the `EvX` blob and
+ * the `KaiEvidence` node to OUTLIVE `kai_main_install_defaults`'s frame (the
+ * evidence stays pushed for the whole program), so they are module globals,
+ * not entry-block allocas — the C-direct oracle emits `static EvStdout
+ * _kai_default_ev_stdout;` for exactly this reason. Internal linkage + a
+ * zero initialiser match the C `static` (file-scope, zero-init). The type
+ * comes from the module's context so nothing is cross-context. */
+static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetInitializer(g, LLVMConstNull((LLVMTypeRef) ty));
+    LLVMSetLinkage(g, LLVMInternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
 /* (The `i32 variant_tag` reader the emitted object calls for a `KTagOf`
  * — `kaix_variant_tag_of` — is a RUNTIME symbol in stage0/runtime_llvm.c
  * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
@@ -11724,6 +11740,7 @@ static void *kai_llvm_const_i32(void *t, int64_t v) { (void) t; (void) v; return
 static void *kai_llvm_const_null(void *t) { (void) t; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_zeroed(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
