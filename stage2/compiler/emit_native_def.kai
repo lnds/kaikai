@@ -1,0 +1,192 @@
+# compiler/emit_native_def.kai — builtin/default effect-handler install
+# for the in-process libLLVM native backend (KIR Lane 1.2, effects subset
+# 2c). The pure walk + the user-handler subset (2a) left
+# `kai_main_install_defaults` / `kai_main_teardown_defaults` as empty
+# no-ops; this module fills them, so a program that performs a BUILTIN
+# effect (`Stdout.print`, the most common one) finds its default handler
+# at `main` and runs to parity with the C-direct oracle.
+#
+# There is ONE class of default at emit time. The compiler injects the
+# synthetic builtins (Stdout/Stderr/Fail/Stdin/…) as real `DEffect` decls
+# carrying an all-`$extern_handler` `default { }` block (driver.kai
+# `builtin_stdout_decl` &c.), and a user effect with a source `default { }`
+# block (Clock in stdlib/time.kai) is the same shape — so `kir_default_handlers`
+# (kir_lower) resolves both through `find_effect_default_block`. The
+# resulting `[KDefault]` reaches us on `KProgram.defaults`, already in
+# install order; we never re-walk the AST.
+#
+# The IR mirrors the C-direct emit (`default_setups_from_block`,
+# emit_c.kai) and the LLVM-text emit (`lvm_default_install_for_effect`,
+# emit_llvm.kai), translated to C-API `kai_llvm_build_*`. Per effect:
+#   - a MODULE-LEVEL Ev blob + KaiEvidence node (NOT entry-block allocas:
+#     the evidence stays pushed for the whole program, so it must outlive
+#     this fn's frame — the C-direct oracle uses `static EvStdout` for the
+#     same reason);
+#   - `kaix_fresh_handler_id()` stamped into the Ev header (field 0);
+#   - each op's `kaix_default_<eff>_<op>` forwarder stored at its field
+#     (`nfx_op_base` + position) via `kaix_ev_set_op`;
+#   - a 3-arg `kaix_evidence_push(node, name, ev)` — NO jmp_buf, because a
+#     default ALWAYS resumes (no discard landing pad, unlike the user
+#     handler's `kaix_evidence_push_with_jmp` in emit_native_fx2).
+# Teardown pops in reverse install order so the evidence stack drains LIFO.
+#
+# SOUNDNESS (handle discipline, asu "risk #1"): every helper here that
+# returns a `Handle` (an LLVM `Value*`/`GlobalVariable*`) is listed in
+# stage1's `native_handle_fns()`. The module globals built by
+# `llvm_add_global_zeroed` are handles too; they are captured in `let`
+# bindings (the handle-binder exclusion) so kaic1's type-blind Perceus
+# never `kai_decref`s a raw LLVM pointer.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+import compiler.emit_native_fx
+
+# Size of the module-level Ev blob, in pointer slots: a 3-field header
+# (`handler_id` / `env` / `state`) then one op fn-ptr per op. `[16 x ptr]`
+# is generous (no core builtin declares > 13 ops); the unused tail is
+# never read (the install writes only the header + the real op slots).
+# Matches the entry-block reservation in `nfx_reserve_install`.
+fn ndef_ev_slots() : Int = 16
+# The KaiEvidence node buffer. `[8 x ptr]` = 64 bytes ≥ sizeof(KaiEvidence)
+# (~48 bytes: handler / handler_id / next / handle_jmp / discard_slot /
+# label), matching the C-direct `static KaiEvidence` + the LLVM-text
+# `[48 x i8]` node. The default path leaves `handle_jmp` / `discard_slot`
+# NULL (a zero-init global), which is exactly what a never-discarding
+# default needs.
+fn ndef_node_slots() : Int = 8
+
+# --- install: build the runtime-entry hook + per-effect push -----------
+
+# Build `void kai_main_install_defaults()` with a real body: open the fn
+# (a positioned ctx builder), push every default in install order, then
+# `ret void`.
+pub fn nemit_build_install_defaults(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
+  ndef_open_void_fn(ctx, "kai_main_install_defaults")
+  ndef_install_each(ctx, defaults)
+  llvm_build_ret_void(native_ctx_b(ctx))
+  ()
+}
+
+# Build `void kai_main_teardown_defaults()`: pop once per installed
+# default, in REVERSE install order (LIFO drain). Only the effects pushed
+# by the install are popped, so the reverse of the same `defaults` list is
+# exactly the matching pop set.
+pub fn nemit_build_teardown_defaults(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
+  ndef_open_void_fn(ctx, "kai_main_teardown_defaults")
+  ndef_pop_n(ctx, list_length(defaults))
+  llvm_build_ret_void(native_ctx_b(ctx))
+  ()
+}
+
+# Open a `void name()`: add the fn + an entry block, then position the ctx
+# builder at its end. Mirrors `nemit_one_fn_thunk` (NOT `nemit_fn_with`):
+# these hooks need NO register/block table, so they do NOT `begin_fn` —
+# they only need the ctx builder positioned, which the shared `ncall_*`
+# helpers (reading `native_ctx_b` / `native_ctx_m`) emit through. Calling
+# `begin_fn` here frees the prior fn's reg/block tables out from under the
+# walk, which is both unnecessary and unsafe.
+fn ndef_open_void_fn(ctx: Handle, name: String) : Unit = {
+  let m = native_ctx_m(ctx)
+  let void_fn_ty = llvm_fn_type_0(native_ctx_voidt(ctx))
+  let fnval = llvm_add_function(m, name, void_fn_ty)
+  let entry = llvm_append_block(m, fnval, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+}
+
+fn ndef_install_each(ctx: Handle, defaults: [KDefault]) : Unit / Console = match defaults {
+  [] -> ()
+  [d, ...rest] -> { ndef_install_one(ctx, d); ndef_install_each(ctx, rest) }
+}
+
+# Install one default handler: module globals, handler_id, op fn-ptrs, push.
+fn ndef_install_one(ctx: Handle, d: KDefault) : Unit / Console = match d {
+  KDef(eff, ops) -> {
+    let p = native_ctx_ptrt(ctx)
+    let ev = ndef_ev_global(ctx, eff)
+    let node = ndef_node_global(ctx, eff)
+    # handler_id (field 0) = kaix_fresh_handler_id() : i64.
+    let hid = ncall_sig0(ctx, "kaix_fresh_handler_id", native_ctx_i64t(ctx))
+    let _h0 = ncall_sig2(ctx, "kaix_ev_set_handler_id", native_ctx_voidt(ctx),
+                         p, native_ctx_i64t(ctx), ev, hid)
+    ndef_store_ops(ctx, ev, ops, 0)
+    # 3-arg push (no jmp_buf): a default always resumes.
+    let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+    ndef_push(ctx, node, effname, ev)
+  }
+}
+
+# The module-level Ev blob for `eff` (`[16 x ptr]`, internal, zero-init).
+# A handle (the global's address) — captured in a `let` by every caller.
+fn ndef_ev_global(ctx: Handle, eff: String) : Handle = {
+  let evty = llvm_array_type(native_ctx_ptrt(ctx), ndef_ev_slots())
+  llvm_add_global_zeroed(native_ctx_m(ctx), evty, cat2("_kai_default_ev_", eff))
+}
+
+# The module-level KaiEvidence node for `eff` (`[8 x ptr]`, internal,
+# zero-init — so handle_jmp / discard_slot start NULL).
+fn ndef_node_global(ctx: Handle, eff: String) : Handle = {
+  let ndty = llvm_array_type(native_ctx_ptrt(ctx), ndef_node_slots())
+  llvm_add_global_zeroed(native_ctx_m(ctx), ndty, cat2("_kai_default_node_", eff))
+}
+
+# Store each op's `kaix_default_<eff>_<op>` forwarder address into the Ev
+# blob at field (`nfx_op_base` + position). Reuses the effects-2a
+# `nemit_ev_set_op` (`kaix_ev_set_op(ev, idx, fn) -> void`). The forwarder
+# is declared with a placeholder `ptr ()` type — only its address is
+# stored, never called through THIS declaration (the perform site loads it
+# from the Ev and builds the precise fn type).
+fn ndef_store_ops(ctx: Handle, ev: Handle, ops: [KDefOp], i: Int) : Unit / Console = match ops {
+  [] -> ()
+  [KDOp(_, sym), ...rest] -> {
+    let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, llvm_fn_type_0(native_ctx_ptrt(ctx)))
+    let _s = nemit_ev_set_op(ctx, ev, nfx_op_base() + i, fnv)
+    ndef_store_ops(ctx, ev, rest, i + 1)
+  }
+}
+
+# `kaix_evidence_push(ptr node, i8* eff, ptr ev) -> void` — the 3-arg form
+# (NO jmp_buf / discard slot). The user-handler install in emit_native_fx2
+# uses `kaix_evidence_push_with_jmp`; a default never discards, so it omits
+# the landing pad and rides this lighter push.
+fn ndef_push(ctx: Handle, node: Handle, effname: Handle, ev: Handle) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, node); llvm_buf_push(ab, effname); llvm_buf_push(ab, ev)
+  let _r = ncall_finish(ctx, "kaix_evidence_push", native_ctx_voidt(ctx), ptb, ab)
+  ()
+}
+
+# Emit `n` `kaix_evidence_pop()` calls (the teardown). The pop is argless
+# and void; one per installed default drains the stack LIFO.
+fn ndef_pop_n(ctx: Handle, n: Int) : Unit / Console =
+  if n <= 0 { () }
+  else { let _r = nemit_call0(ctx, "kaix_evidence_pop"); ndef_pop_n(ctx, n - 1) }
+
+# --- perform side: synthetic handler decls for builtin dispatch --------
+#
+# A BUILTIN effect (Stdout) has NO user `KHandlerDecl`, so `nemit_perform`
+# (emit_native_fx2) would abort on its `nfx_find_handler_by_eff` miss. But
+# the dispatch is IDENTICAL once a handler exists: lookup_node → node_handler
+# → ev_op_at(field) → indirect call → op_finish, with the op fn-ptr loaded
+# from the Ev WE installed above. `nemit_perform` only needs the op's FIELD
+# INDEX from `op_thunks`; the thunk symbol it records is never called
+# (the runtime resolves the op fn-ptr from the installed Ev). So we hand
+# `nemit_perform` a SYNTHETIC `KHandlerDecl` per default whose `op_thunks`
+# carry the op names in declaration order — that alone makes the existing
+# dispatch correct for builtins, with zero change to `nemit_perform`.
+pub fn ndef_synth_handlers(defaults: [KDefault]) : [KHandlerDecl] = match defaults {
+  [] -> []
+  [KDef(eff, ops), ...rest] ->
+    [KHandlerDecl { eff: eff, sym: cat2("__default_", eff),
+                    op_thunks: ndef_op_thunks(ops), ret_thunk: None },
+     ...ndef_synth_handlers(rest)]
+}
+
+fn ndef_op_thunks(ops: [KDefOp]) : [KOpThunk] = match ops {
+  [] -> []
+  [KDOp(op, sym), ...rest] -> [KOT(op, sym), ...ndef_op_thunks(rest)]
+}
