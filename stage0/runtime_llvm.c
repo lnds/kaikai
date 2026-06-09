@@ -534,6 +534,17 @@ KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t)
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }
 int       kaix_is_cons(KaiValue *v)                       { return v && v->tag == KAI_CONS; }
 int       kaix_is_nil(KaiValue *v)                        { return !v || v->tag == KAI_NIL; }
+/* Boxed-Bool list-cell predicates for the in-process native walk's
+ * KIR list-match decision tree. The walk lowers a `kai_is_cons_b` /
+ * `kai_is_nil_b` prim through its uniform boxed-prim path (a
+ * `%KaiValue* (%KaiValue*)` call) and feeds the result to `KCondBr`'s
+ * `kaix_truthy`, so the predicate must return a boxed Bool — unlike the
+ * `i32` `kaix_is_cons`/`kaix_is_nil` the .ll-text emitter compares
+ * inline. Reads the runtime `->tag` (the cons/nil discriminant); the
+ * variant `variant_tag` field is meaningless for a list cell. Borrowing
+ * (no incref/decref of `v`). */
+KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(v && v->tag == KAI_CONS); }
+KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!v || v->tag == KAI_NIL); }
 KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(v->as.cons.head); }
 KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(v->as.cons.tail); }
 
