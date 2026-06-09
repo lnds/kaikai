@@ -134,11 +134,13 @@ invisible to the selfhost byte-id.
 ## Follow-ups for next lanes
 
 - **Record-pattern discrimination** (`match p { { x: 0, y } -> ...; { x, y }
-  -> ... }`) is the next gap of this family: a `PRecord` with a literal
-  field still routes through the variant tag-switch and would mis-lower.
-  The fix shape is the analogue of this lane — a decision tree of field
-  reads + equality tests — but it needs `KProj`-by-field-name (records are
-  name-keyed, not slot-keyed) and is genuinely separate work.
+  -> ... }`) — FIXED in the kir-record-match lane (`kir_lower_rec.kai`, see
+  `docs/lane-experience-kir-record-match.md`). It was the analogue of this
+  lane: a field-test decision tree. The field read uses the existing
+  `kai_op_field` / `kai_op_field_borrow` prims (name-keyed, NOT a
+  `KProj`-by-index — records are name-keyed; the foreseen new node was
+  unnecessary), exactly as the C-direct `emit_pat_test_record` /
+  `emit_pat_binds_record` oracle does.
 - **Guards** (`k if k < 0 -> ...`) are still dropped by every match path in
   the KIR lowering (the `Arm(p, _, body)` destructure discards the
   `Option[Expr]` guard slot, the same as the variant path). The literal
