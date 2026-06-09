@@ -1,0 +1,177 @@
+# compiler/emit_native_fx.kai — effect-node emitters for the in-process
+# libLLVM native backend (KIR Lane 1.2 Parte B, effects subset 2a).
+#
+# The pure walk (subset 1) aborted KInstall / KSetjmp / KPop / KPerform /
+# KResume / KFnClause via `nemit_unsupported`. This module fills them for
+# ONE-SHOT user handlers (no state, no `as`-alias, no builtin defaults yet).
+#
+# The semantics are NOT invented here — they are PORTED from the
+# abandoned LLVM-text backend (`emit_llvm.kai`, parity lane #622), whose
+# `llvm_emit_handle` / `llvm_emit_op_dispatch` / `llvm_emit_clause_body`
+# are validated against the C-direct oracle. The translation is
+# string-`.ll` → C-API `kai_llvm_build_*`, the same mechanical shape the
+# pure walk used. The runtime contract (`kaix_evidence_*` / `kaix_cont_*`
+# / `kai_jmpbuf_size` / `kaix_op_finish`) already ships in
+# `stage0/runtime_llvm.c`; only the `setjmp` itself the backend emits.
+#
+# THE setjmp soundness rule (asu review): mem2reg must NOT run on a fn
+# containing a `setjmp` — a local written in the body path then read after
+# a longjmp would be register-promoted to a stale value (the LLVM analogue
+# of C99 §7.13.2.1 `volatile`). The native backend does NOT run mem2reg
+# today, so this is satisfied by construction. A future mem2reg lane MUST
+# exclude setjmp-bearing fns (the `examples/native/effect_discard.kai`
+# fixture is the regression guard — a resume-only fixture would false-green
+# the hazard since it never lands on the longjmp block).
+#
+# Ev<Eff> layout (from the C-direct emit's `struct EvX`): a 3-field header
+# `{ handler_id (i64), env (ptr), state (ptr) }` then one op fn-ptr per op
+# in effect-declaration order, starting at field index 3. The walk builds
+# the Ev as a `[3 + nops x ptr]` alloca; the layout knowledge lives in the
+# `kaix_ev_*` runtime helpers, never as a struct-nominal type in IR.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+
+# Field index of the first op fn-ptr in an Ev blob (after the 3-field
+# header handler_id / env / state).
+pub fn nfx_op_base() : Int = 3
+
+# --- handler lookup: op → clause-thunk symbol + field index ------------
+#
+# `KInstall(eff, sym, …)` names the handler decl; `KPerform(eff, op, …)`
+# names the op. Both resolve through the program's `[KHandlerDecl]`: the
+# handler whose `sym` matches gives the op→thunk list (install side), and
+# the op's position in that list gives its Ev field index (both sides).
+
+pub fn nfx_find_handler(handlers: [KHandlerDecl], sym: String) : Option[KHandlerDecl] = match handlers {
+  [] -> None
+  [h, ...rest] -> if h.sym == sym { Some(h) } else { nfx_find_handler(rest, sym) }
+}
+
+pub fn nfx_find_handler_by_eff(handlers: [KHandlerDecl], eff: String) : Option[KHandlerDecl] = match handlers {
+  [] -> None
+  [h, ...rest] -> if h.eff == eff { Some(h) } else { nfx_find_handler_by_eff(rest, eff) }
+}
+
+# The Ev field index of op `op` in `op_thunks` (nfx_op_base + position),
+# or -1 if absent.
+pub fn nfx_op_field(thunks: [KOpThunk], op: String, i: Int) : Int = match thunks {
+  [] -> -1
+  [KOT(nm, _), ...rest] -> if nm == op { nfx_op_base() + i } else { nfx_op_field(rest, op, i + 1) }
+}
+
+# --- register names for the install-frame allocas ----------------------
+#
+# KInstall reserves four allocas in the entry block (the walk's "allocas
+# only in entry" rule): the Ev blob, the KaiEvidence node, the jmp_buf,
+# and the discard slot. Each is registered in the ctx table under a name
+# derived from the effect so KSetjmp / __kai_discard resolve it.
+
+pub fn nfx_ev_reg(eff: String) : String = cat2("__ev_", eff)
+pub fn nfx_node_reg(eff: String) : String = cat2("__node_", eff)
+pub fn nfx_jmpbuf_reg(eff: String) : String = cat2("__jmpbuf_", eff)
+# The discard slot is the value the longjmp lands with; the KIR discard
+# block reads it as `KVar("__kai_discard")` (kir_lower_walk.kai), so the
+# name is fixed (one handle frame is live at a time in this subset).
+pub fn nfx_discard_reg() : String = "__kai_discard"
+# The KaiCont a KPerform allocates (one per fn body; this subset has a
+# single perform per effectful fn).
+pub fn nfx_cont_reg() : String = "__kai_cont"
+
+# --- pass 1: reserve the install/perform allocas in the entry block ----
+#
+# `nemit_allocas` (emit_native_fn) covers the ordinary KIR registers
+# (KLet/KStore binders). The effect frames need extra allocas the KIR does
+# not name as registers; reserve them here, positioned at the entry head
+# alongside the register allocas. Called from `nemit_fn_with` after
+# `nemit_allocas`, before the param seed.
+
+pub fn nemit_fx_allocas(ctx: Handle, f: KFn) : Unit / Console = {
+  nfx_alloca_blocks(ctx, f.blocks)
+  # A clause's continuation is referenced as `KVar("k")` (the translator's
+  # fixed resume name), but the `PResume` param is collected under its
+  # surface name (`resume`), so no `k` alloca exists from `collect_fn_specs`.
+  # Reserve it here for a clause fn; the seed stores the LLVM `k` param into
+  # it (see `nemit_seed_clause_params`).
+  match f.kind { KFnClause -> nfx_reserve_k(ctx)  _ -> () }
+}
+
+# Reserve the `k` (continuation) register alloca for a clause body — a
+# single boxed `ptr` cell the seed fills from the trailing LLVM param.
+fn nfx_reserve_k(ctx: Handle) : Unit / Console = {
+  if native_ctx_reg_slot(ctx, "k") < 0 {
+    let ka = llvm_build_alloca(native_ctx_b(ctx), native_ctx_ptrt(ctx), "k.addr")
+    native_ctx_add_reg(ctx, "k", ka, 0)
+    ()
+  } else { () }
+}
+
+fn nfx_alloca_blocks(ctx: Handle, bs: [KBlock]) : Unit / Console = match bs {
+  [] -> ()
+  [b, ...rest] -> { nfx_alloca_stmts(ctx, b.stmts); nfx_alloca_blocks(ctx, rest) }
+}
+
+fn nfx_alloca_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
+  [] -> ()
+  [s, ...rest] -> { nfx_alloca_stmt(ctx, s); nfx_alloca_stmts(ctx, rest) }
+}
+
+# A KInstall reserves the Ev blob + node + jmp_buf + discard slot; a
+# KLet/KDo whose op is a KPerform reserves the KaiCont. Everything else is
+# a no-op for the alloca pass.
+fn nfx_alloca_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
+  KInstall(eff, sym, _, _, _) -> nfx_reserve_install(ctx, eff)
+  KLet(_, _, op, _) -> nfx_alloca_op(ctx, op)
+  KDo(op, _)        -> nfx_alloca_op(ctx, op)
+  _                 -> ()
+}
+
+fn nfx_alloca_op(ctx: Handle, op: KOp) : Unit / Console = match op {
+  KPerform(_, _, _) -> nfx_reserve_cont(ctx)
+  _                 -> ()
+}
+
+# Reserve the four install-frame allocas, registered under effect-derived
+# names. The Ev blob is `[3 + nops x ptr]`; nops is unknown here (the
+# handler decl is not threaded into the alloca pass), so reserve a generous
+# fixed `[16 x ptr]` — larger than any single effect's op count in the
+# core, and the unused tail is never read (the install writes only the
+# header + the real op slots). The jmp_buf is runtime-sized via
+# `kai_jmpbuf_size`. Each alloca is a `let` (handle-binder exclusion).
+fn nfx_reserve_install(ctx: Handle, eff: String) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let evty = llvm_array_type(p, 16)
+  let ev = llvm_build_alloca(native_ctx_b(ctx), evty, cat2(nfx_ev_reg(eff), ".addr"))
+  native_ctx_add_reg(ctx, nfx_ev_reg(eff), ev, -1)
+  let node = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, 8), cat2(nfx_node_reg(eff), ".addr"))
+  native_ctx_add_reg(ctx, nfx_node_reg(eff), node, -1)
+  # `kai_jmpbuf_size() -> i64`: declare it i64-returning (NOT the all-boxed
+  # `ptr()` `nemit_call0` assumes), then `alloca i8, i64 %size` — the array
+  # count MUST be an integer, never a `ptr`.
+  let jmpsz = ncall_sig0(ctx, "kai_jmpbuf_size", native_ctx_i64t(ctx))
+  let jmpbuf = llvm_build_array_alloca(native_ctx_b(ctx), native_ctx_i32t(ctx), jmpsz, cat2(nfx_jmpbuf_reg(eff), ".addr"))
+  native_ctx_add_reg(ctx, nfx_jmpbuf_reg(eff), jmpbuf, -1)
+  # The discard slot is a single `ptr` cell, init NULL (the body path may
+  # never longjmp; the discard block only loads it on the landing path).
+  let disc = llvm_build_alloca(native_ctx_b(ctx), p, cat2(nfx_discard_reg(), ".addr"))
+  native_ctx_add_reg(ctx, nfx_discard_reg(), disc, 0)
+  let _s = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), disc)
+  ()
+}
+
+# Reserve the KaiCont an op dispatch initialises on the stack (`[8 x i32]`
+# = 32 bytes = sizeof(KaiCont): status + env + fn + handler_id). One cont
+# per fn body suffices for this one-shot subset (a second perform reuses
+# it sequentially), so reserve at most once — `reg_slot` returns -1 when
+# the register is absent (slot 0 marks it present).
+fn nfx_reserve_cont(ctx: Handle) : Unit / Console = {
+  if native_ctx_reg_slot(ctx, nfx_cont_reg()) < 0 {
+    let cont = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(native_ctx_i32t(ctx), 8), cat2(nfx_cont_reg(), ".addr"))
+    native_ctx_add_reg(ctx, nfx_cont_reg(), cont, 0)
+    ()
+  } else { () }
+}

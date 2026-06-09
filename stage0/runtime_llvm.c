@@ -56,6 +56,15 @@
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
 KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
+/* Box a `setjmp` i32 return (0 = body path, !=0 = longjmp landing) as a
+ * BOOL the native walk's `KSetjmp` register feeds the boxed `condbr` —
+ * which reads it through `kaix_truthy`/`kai_op_truthy`. A Bool is correct
+ * (the truthy predicate checks `tag == KAI_BOOL`); boxing as an Int would
+ * hand `kai_op_truthy` a tagged-immediate `0x1` it dereferences as a
+ * pointer and segfaults on. `false` (setjmp==0) → condbr takes the body
+ * arm; `true` (longjmp) → the discard arm, matching the C-direct
+ * `setjmp(_jmp) == 0 ? body : landing`. */
+KaiValue *kaix_bool_of_i32(int32_t i)          { return kai_bool(i != 0); }
 /* Lane 4 (#473) Byte literal constructor. Mirrors `kaix_int` but
  * for the nominal `Byte` (KAI_BYTE) tag — needed when the LLVM
  * EInt emit targets `[Byte]` literal context (`let bs: [Byte] =
@@ -842,6 +851,45 @@ KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {
     return kai_cont_resume(k, v);
 }
 
+/* ---------- Ev<Eff> struct field access (KIR native walk) ----------
+ *
+ * Every Ev<Eff> begins with a THREE-field header — `KaiHandlerId handler_id`
+ * (field 0), `void *env` (field 1), `KaiValue *state` (field 2) — then one
+ * `KaiValue *(*op)(...)` fn-ptr per op, starting at field index 3 (byte
+ * offset 24), in effect-declaration order. See the C-direct emit's
+ * `struct EvX` typedef (e.g. `EvCancel { handler_id; env; state; raise; }`).
+ * The native walk builds the Ev as an `[K x ptr]` alloca (K = 3 + nops) on
+ * the handle frame and reaches the fields by field index (each slot is one
+ * pointer-sized cell), so the layout knowledge lives HERE in C, never as a
+ * struct-nominal type baked into the IR (opaque pointers make those
+ * unnecessary, and the C-API has no struct-type builder). This mirrors the
+ * `kai_jmpbuf_size` / `kaix_handle_discard_unwind` discipline (the subtle
+ * layout bits stay on the C side). The op at KIR index `i` lives at field
+ * `3 + i`; the `state` slot stays NULL for stateless handlers. */
+
+/* Read the op fn-ptr at field index `idx` of the `*Ev<Eff>` blob the
+ * dispatch resolved (`handler` = the looked-up node's `->handler`). */
+void *kaix_ev_op_at(void *ev, int64_t idx) {
+    return ((void **) ev)[idx];
+}
+
+/* Write the op fn-ptr at field index `idx` of an Ev blob under
+ * construction (the install side stamps each clause-thunk address). */
+void kaix_ev_set_op(void *ev, int64_t idx, void *fn) {
+    ((void **) ev)[idx] = fn;
+}
+
+/* Read the `handler_id` (field 0, an i64) of an Ev blob — the dispatch
+ * passes it to `kaix_cont_init_identity`. */
+KaiHandlerId kaix_ev_handler_id(void *ev) {
+    return ((KaiHandlerId *) ev)[0];
+}
+
+/* Write the `handler_id` (field 0) when constructing an Ev blob. */
+void kaix_ev_set_handler_id(void *ev, KaiHandlerId hid) {
+    ((KaiHandlerId *) ev)[0] = hid;
+}
+
 /* ---------- continuation-discard unwind (parity lane, refs #622) ----------
  *
  * The C backend's `handle` lowering (emit_c.kai ~4025) wraps the body
@@ -898,6 +946,25 @@ void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
     *node->discard_slot = op_r;
     kai_evidence_pop();
     longjmp(*node->handle_jmp, 1);
+}
+
+/* Op-site finish, combining `kaix_op_discarded` + `kaix_handle_discard_unwind`
+ * into ONE straight-line call (KIR native walk). The C-direct emit and the
+ * LLVM-text backend split this into an `if (...) { unwind } op_r;` with a
+ * fresh basic block; the native walk keeps each KIR block 1:1 with an LLVM
+ * block, so folding the test + the no-return unwind here lets `KPerform`
+ * stay a flat sequence of calls. On the resume path it simply returns
+ * `op_r`; on the discard path it longjmps (does not return). */
+KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    KaiCont *k = (KaiCont *) k_v;
+    if (node != NULL && k != NULL &&
+        k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) {
+        *node->discard_slot = op_r;
+        kai_evidence_pop();
+        longjmp(*node->handle_jmp, 1);
+    }
+    return op_r;
 }
 
 /* m7c-d — clause-body helper for the 2-arg `resume(v, ns)` form.
