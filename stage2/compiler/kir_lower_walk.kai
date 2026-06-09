@@ -862,16 +862,63 @@ fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Con
 # `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...` → KTrmcStep.
 # Same ordinal-index invariant as `lower_tcrec` (Linus review #2): `_pnames`
 # are unused; cargs order == slot order, guaranteed by the rewrite producer.
+#
+# CRITICAL — the self-call is the back-edge, NEVER a value (mirror the C
+# oracle `emit_trmc_cons_step`/`emit_trmc_variant_step`). The ctor-args are
+# `[..non-hole.., self_call, ..non-hole..]` with the self-call `ECall(_, sa)`
+# at index `hole_slot`. Lowering ALL cargs (the old bug) emits the recursion
+# `t = sym(t)` into the KIR, defeating TRMC. Instead:
+#   - the NON-hole args (the real head value(s)) lower as values → `head_vals`;
+#     the backend builds the cell from them with NULL at the hole slot.
+#   - the hole-slot arg's `ECall(_, sa)` args lower → loop-param rebinds
+#     (`assigns`), exactly as `lower_tcrec` does for an ordinary self-tail-call.
+# The dropmask threads identically to `KTcrecGoto` (it reconciles the
+# exit-drops the goto skips); the hole-slot arg is never materialised, so it
+# carries no ref to drop.
 fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match es_tcrec_split_pipe(callee) {
-    [_, sym, hole_str, cname, dropmask_str, ..._pnames] -> match lower_exprs(cargs, st, []) {
-      LResMany(avs, st1) ->
-        seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), es_tcrec_parse_decimal(hole_str),
-                                 cname, es_tcrec_parse_decimal(dropmask_str),
-                                 assigns_of(avs, 0, []), kpos_of(x)))
+    [_, sym, hole_str, cname, dropmask_str, ..._pnames] -> {
+      let hole = es_tcrec_parse_decimal(hole_str)
+      # Lower the non-hole ctor args (head value(s)) left-to-right, then the
+      # self-call's args (the rebinds) — preserving evaluation order.
+      match lower_exprs(trmc_drop_nth(cargs, hole, 0, []), st, []) {
+        LResMany(heads, st1) ->
+          lower_trmc_seal(x, sym, hole, cname, es_tcrec_parse_decimal(dropmask_str),
+                          heads, trmc_self_args(cargs, hole), st1)
+      }
     }
     _ -> LRes(KUnitV, st)
   }
+
+# Lower the self-call's args into the loop-param rebinds and seal the step.
+# Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
+# nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
+fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
+                   heads: [KVal], self_args: [Expr], st: LowerSt) : LRes / Console =
+  match lower_exprs(self_args, st, []) {
+    LResMany(reb, st1) ->
+      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, dropmask,
+                               heads, assigns_of(reb, 0, []), kpos_of(x)))
+  }
+
+# The ctor args minus the hole slot, in slot order — the real head value(s)
+# the backend uses to build the spine cell (NULL plugged at the hole).
+fn trmc_drop_nth(xs: [Expr], hole: Int, i: Int, acc: [Expr]) : [Expr] = match xs {
+  [] -> acc
+  [a, ...rest] ->
+    if i == hole { trmc_drop_nth(rest, hole, i + 1, acc) }
+    else         { trmc_drop_nth(rest, hole, i + 1, list_append(acc, [a])) }
+}
+
+# The self-call's arguments, read from the hole-slot ctor arg. The producer
+# always plants `ECall(EVar(sym), self_args)` there; any other shape (or an
+# out-of-range hole) yields no rebinds, matching the C oracle's `_ -> []`.
+fn trmc_self_args(xs: [Expr], hole: Int) : [Expr] = match xs {
+  [] -> []
+  [a, ...rest] ->
+    if hole == 0 { match a.kind { ECall(_, sa) -> sa _ -> [] } }
+    else         { trmc_self_args(rest, hole - 1) }
+}
 
 # `__kai_trmc_apply(leaf)` → KTrmcApply (plug leaf into the open hole).
 fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
