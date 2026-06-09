@@ -92,8 +92,32 @@ pub fn nemit_op(ctx: Handle, op: KOp) : Handle / Console = match op {
   KTagOf(v)            -> nemit_tagof(ctx, v)
   KClosure(sym, ar, caps) -> nemit_closure_call(ctx, sym, ar, nemit_atoms_buf(ctx, caps))
   KConReuse(d, nm, tag, inits) -> nemit_reuse_variant_call(ctx, nemit_atom(ctx, d), tag, nm, nemit_init_buf(ctx, inits))
-  KPerform(_, _, _)    -> { nemit_unsupported(ctx, "KPerform (effects = subset 2)"); nemit_null(ctx) }
-  KSetjmp(_)           -> { nemit_unsupported(ctx, "KSetjmp (effects = subset 2)"); nemit_null(ctx) }
+  # A KPerform reaching `nemit_op` (rather than the handler-aware
+  # `nemit_op_fx`) is one the walk did not route through `nemit_stmt` — a
+  # KPerform only appears as a KLet/KDo RHS, which DOES route through
+  # `nemit_op_fx`, so this arm is unreachable in practice; keep it loud.
+  KPerform(_, _, _)    -> { nemit_unsupported(ctx, "KPerform reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
+  KSetjmp(eff)         -> nemit_setjmp_op(ctx, eff)
+}
+
+# `KSetjmp(eff)` → `setjmp(jmpbuf) : i32`, boxed as an Int so the boxed
+# `condbr` register reads it through `kaix_truthy`. The jmp_buf alloca was
+# reserved in the entry head by the install (pass 1), registered under
+# `__jmpbuf_<eff>`. `setjmp` runs IN the handle frame directly (a longjmp
+# into a returned frame is UB); it's declared external (libc provides it at
+# link). i32 0 (body) is falsy → the KIR `condbr ? Ldiscard : Lbody` takes
+# Lbody; i32 !=0 (longjmp landing) is truthy → Ldiscard — matching the
+# C-direct `setjmp(_jmp) == 0 ? body : landing`. Lives here (not in
+# `emit_native_fx`) to avoid an import cycle (fx imports ops for `ncall_*`).
+fn nemit_setjmp_op(ctx: Handle, eff: String) : Handle / Console = {
+  let jmpbuf = native_ctx_find_reg(ctx, cat2("__jmpbuf_", eff))
+  let i32t = native_ctx_i32t(ctx)
+  let raw = ncall_sig1(ctx, "setjmp", i32t, native_ctx_ptrt(ctx), jmpbuf)
+  # Box the i32 as a BOOL (not an Int): the boxed `condbr` reads it via
+  # `kaix_truthy`/`kai_op_truthy`, which checks `tag == KAI_BOOL`. A tagged
+  # Int immediate (`0x1` for 0) would be dereferenced as a pointer and
+  # segfault. `kaix_bool_of_i32` does `kai_bool(i != 0)`.
+  ncall_sig1(ctx, "kaix_bool_of_i32", native_ctx_ptrt(ctx), i32t, raw)
 }
 
 # Call `sym` (boxed sig) over `argbuf`, then free the buffer. The funnel
@@ -201,6 +225,14 @@ fn nemit_call_indirect(ctx: Handle, fv: KVal, cargs: [KVal]) : Handle / Console 
 # are RC-tagged + corrupted; asu "risk #1"). The fixed-arity helpers
 # (`ncall_sig1`/`2`/...) build both buffers inline.
 
+# `sym : ret ()` over no args — a non-boxed return type (e.g. an `i64`
+# runtime entry like `kai_jmpbuf_size`) the all-boxed `nemit_call0` cannot
+# express.
+pub fn ncall_sig0(ctx: Handle, sym: String, ret: Handle) : Handle = {
+  let ptb = llvm_buf_new()
+  let ab  = llvm_buf_new()
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
 # `sym : ret (p0)` over one arg.
 pub fn ncall_sig1(ctx: Handle, sym: String, ret: Handle, p0: Handle, a0: Handle) : Handle = {
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0)

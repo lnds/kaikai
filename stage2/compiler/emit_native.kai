@@ -47,8 +47,10 @@ pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
   # ever enters a kaikai record/list (would RC-corrupt under kaic1).
   let ctx = native_ctx_new(m)
   # Declare every user fn first (forward references), then walk each.
+  # `kp.handlers` threads the effect handler decls so a `KInstall`/
+  # `KPerform` resolves its op→clause-thunk map (effects subset 2a).
   nemit_declare_fns(ctx, kp.fns)
-  nemit_walk_fns(ctx, kp.fns)
+  nemit_walk_fns(ctx, kp.fns, kp.handlers)
   # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
   # passed as a first-class value (a `KClosure` over a named fn references
   # this symbol). The KIR does NOT model these — they are synthetic, like
@@ -62,9 +64,9 @@ pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
   }
 }
 
-# Declare every `KFnNormal` with its all-boxed signature so a call site
-# resolves the symbol even when the definition comes later in the list.
-# (Lambda/clause thunks are a later subset — not declared here.)
+# Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
+# front so a call/install site resolves the symbol even when the definition
+# comes later in the list. (Lambda thunks declare lazily at their use.)
 fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
   [] -> ()
   [f, ...rest] -> match f.kind {
@@ -80,14 +82,21 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
       let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
       nemit_declare_fns(ctx, rest)
     }
+    # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
+    # its address) before its own definition is walked, so forward-declare
+    # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
+    KFnClause -> {
+      let _c = nemit_declare_clause(ctx, f.sym, f.params)
+      nemit_declare_fns(ctx, rest)
+    }
     _ -> nemit_declare_fns(ctx, rest)
   }
 }
 
 # Walk each fn (imperative over `ctx`; an uncovered node flips `ctx.ok`).
-fn nemit_walk_fns(ctx: Handle, fns: [KFn]) : Unit / Console = match fns {
+fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl]) : Unit / Console = match fns {
   [] -> ()
-  [f, ...rest] -> { nemit_fn(ctx, f); nemit_walk_fns(ctx, rest) }
+  [f, ...rest] -> { nemit_fn(ctx, f, handlers); nemit_walk_fns(ctx, rest, handlers) }
 }
 
 # The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls around
