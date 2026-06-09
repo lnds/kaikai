@@ -96,8 +96,14 @@ pub fn nemit_fx_allocas(ctx: Handle, f: KFn) : Unit / Console = {
   # fixed resume name), but the `PResume` param is collected under its
   # surface name (`resume`), so no `k` alloca exists from `collect_fn_specs`.
   # Reserve it here for a clause fn; the seed stores the LLVM `k` param into
-  # it (see `nemit_seed_clause_params`).
-  match f.kind { KFnClause -> nfx_reserve_k(ctx)  _ -> () }
+  # it (see `nemit_seed_clause_params`). A stateful clause additionally
+  # needs `__self` (the dispatched Ev, for KResume2's state write) plus the
+  # `state` / `log` state-prologue binds — all introduced by the seed, none
+  # named as KIR registers, so reserve their allocas here too.
+  match f.kind {
+    KFnClause -> { nfx_reserve_k(ctx); nfx_reserve_clause_state(ctx, f.stateful) }
+    _ -> ()
+  }
 }
 
 # Reserve the `k` (continuation) register alloca for a clause body — a
@@ -106,6 +112,24 @@ fn nfx_reserve_k(ctx: Handle) : Unit / Console = {
   if native_ctx_reg_slot(ctx, "k") < 0 {
     let ka = llvm_build_alloca(native_ctx_b(ctx), native_ctx_ptrt(ctx), "k.addr")
     native_ctx_add_reg(ctx, "k", ka, 0)
+    ()
+  } else { () }
+}
+
+# Reserve the clause-self + state-prologue register allocas. `__self`
+# (always, for KResume2's `kaix_clause_state_set`) and `state` / `log`
+# (stateful only, the prologue binds) are introduced by
+# `nemit_seed_clause_params`; the walk's "allocas in entry only" rule needs
+# them reserved in pass 1 so the seed's `store` lands on a known register.
+fn nfx_reserve_clause_state(ctx: Handle, stateful: Bool) : Unit / Console = {
+  nfx_reserve_named(ctx, "__self")
+  if stateful { nfx_reserve_named(ctx, "state"); nfx_reserve_named(ctx, "log") } else { () }
+}
+
+fn nfx_reserve_named(ctx: Handle, name: String) : Unit / Console = {
+  if native_ctx_reg_slot(ctx, name) < 0 {
+    let a = llvm_build_alloca(native_ctx_b(ctx), native_ctx_ptrt(ctx), cat2(name, ".addr"))
+    native_ctx_add_reg(ctx, name, a, 0)
     ()
   } else { () }
 }
@@ -124,7 +148,7 @@ fn nfx_alloca_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
 # KLet/KDo whose op is a KPerform reserves the KaiCont. Everything else is
 # a no-op for the alloca pass.
 fn nfx_alloca_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
-  KInstall(eff, sym, _, _, _) -> nfx_reserve_install(ctx, eff)
+  KInstall(eff, sym, _, alias, _) -> { nfx_reserve_install(ctx, eff); nfx_reserve_alias(ctx, alias) }
   KLet(_, _, op, _) -> nfx_alloca_op(ctx, op)
   KDo(op, _)        -> nfx_alloca_op(ctx, op)
   _                 -> ()
@@ -162,6 +186,25 @@ fn nfx_reserve_install(ctx: Handle, eff: String) : Unit / Console = {
   let _s = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), disc)
   ()
 }
+
+# Reserve the `__alias_id__<a>` register for an aliased install (`with Eff
+# as a`). It holds the freshly-minted handler_id (boxed) so an `op@a`
+# perform resolves to THIS instance by id, not the innermost-by-name.
+fn nfx_reserve_alias(ctx: Handle, alias: Option[String]) : Unit / Console = match alias {
+  None -> ()
+  Some(a) -> {
+    let nm = nfx_alias_reg(a)
+    if native_ctx_reg_slot(ctx, nm) < 0 {
+      let al = llvm_build_alloca(native_ctx_b(ctx), native_ctx_ptrt(ctx), cat2(nm, ".addr"))
+      native_ctx_add_reg(ctx, nm, al, 0)
+      ()
+    } else { () }
+  }
+}
+
+# The register name an aliased install stashes its handler_id under, and
+# an aliased perform reads back. Mirrors emit_llvm's `__alias_id__<a>`.
+pub fn nfx_alias_reg(a: String) : String = cat2("__alias_id__", a)
 
 # Reserve the KaiCont an op dispatch initialises on the stack (`[8 x i32]`
 # = 32 bytes = sizeof(KaiCont): status + env + fn + handler_id). One cont
