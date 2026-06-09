@@ -18,6 +18,7 @@ import compiler.emit_shared
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_lower_match
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -386,34 +387,73 @@ fn lower_else_into(e_opt: Option[Expr], join: String, lcont: String,
 # switch terminator.
 fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
   match lower_expr(scr, st) { LRes(scrv, st1) ->
-    # The tag register carries `SInt32` (the raw `variant_tag` word), NOT
-    # `SBoxed`: a `KSwitch` scrutinee must be an integer so the native
-    # backend emits a real LLVM `switch`. The repr is decided here, in the
-    # lowering, never re-derived by a backend (asu review).
-    match bind_op_slot(st1, KTagOf(scrv), SInt32, kpos_of(x)) { LRes(tagv, st2) ->
-      lower_match_blocks(x, arms, scrv, tagv, st2) } }
+    # List patterns (`[]`, `[h, ...t]`, `[a, b, ...rest]`) need a length-
+    # aware decision tree, not the variant tag-switch: cons arms of
+    # different lengths share the `KAI_CONS` tag (kir_lower_match.kai).
+    if match_is_list(arms) { lower_list_match(x, arms, scrv, st1) }
+    # The variant tag register carries `SInt32` (the raw `variant_tag`
+    # word), NOT `SBoxed`: a `KSwitch` scrutinee must be an integer so the
+    # native backend emits a real LLVM `switch`. The repr is decided here,
+    # in the lowering, never re-derived by a backend (asu review).
+    else { match bind_op_slot(st1, KTagOf(scrv), SInt32, kpos_of(x)) { LRes(tagv, st2) ->
+      lower_match_blocks(x, arms, scrv, tagv, st2) } } }
+}
+
+# `match scr { [list patterns] }`: a fail-chain decision tree mirroring the
+# C-direct (`emit_pat_test_list`) / LLVM (`llvm_emit_pat_list`) emitters.
+# Each arm emits its cons/nil + length test into a block that branches to
+# the arm body on success and to the next arm on failure; the head/tail
+# `KProj` binds land in the matched-body block. A shared `join` register
+# (materialised before the chain, like `lower_if`) collects each body's
+# value. The chain ends `KUnreachable` — kaikai matches are exhaustive, so
+# the final fail is dead (Linus review #3, as `lower_default_arm`).
+fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, st: LowerSt) : LRes / Console =
+  match match_preamble(x, scrv, st) { LSReg(join, st1) ->
+    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
+      let st3 = lower_list_arms(arms, scrv, join, lcont, st2)
+      LRes(KVar(join), reopen(st3, lcont))
+    } } }
+
+# The match prologue shared by the variant-switch and list-decision-tree
+# paths: allocate the join slot, then alias the scrutinee under the
+# synthetic `__pcs_scr` / `__pcs_scr_drop` names perceus's reuse recogniser
+# refers to (the donor of a `KConReuse`). Without the alias the reuse donor
+# is a free variable in the KIR (a correctness gap, not a backend concern);
+# the direct emitters bind the same locals in their match-arm prologue
+# (emit_c / emit_llvm `push_local("__pcs_scr", scr)`). The join register is
+# materialised BEFORE the fork so a translator reads it as a mutable slot
+# (alloca) each arm's `KStore` writes — not a name to infer (Linus #1).
+fn match_preamble(x: Expr, scrv: KVal, st: LowerSt) : LSReg =
+  match ls_fresh_reg(st) { LSReg(join, st1) -> {
+    let st_scr = ls_emit(ls_emit(st1, KLet("__pcs_scr", SBoxed, KLitOp(scrv), kpos_of(x))),
+                         KLet("__pcs_scr_drop", SBoxed, KLitOp(scrv), kpos_of(x)))
+    LSReg(join, ls_emit(st_scr, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x))))
+  } }
+
+# Lower each list arm in order. The arm's test seals the current block into
+# a condbr (body vs the fresh fail label); the body lowers into the join +
+# branches to `lcont`; the next arm reopens the fail label. A catch-all arm
+# matches unconditionally and ends the chain (later arms are dead). With no
+# catch-all the last fail label is sealed `KUnreachable`.
+fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
+                   st: LowerSt) : LowerSt / Console = match arms {
+  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
+    match lm_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
+      let st_done = lower_branch_into(body, join, lcont, st_body)
+      if list_arm_is_catchall(p) { st_done }
+      else { lower_list_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+    } } }
 }
 
 # Build the switch + per-arm blocks + default + continuation, given the
-# already-lowered scrutinee atom and tag register. The `join` register is
-# materialised with a `KLet` BEFORE the fork so a translator reads it as a
-# mutable slot (alloca) that each arm's `KStore` writes — not an undeclared
-# name it must infer (Linus review #1). The default block is `KUnreachable`:
+# already-lowered scrutinee atom and tag register (`match_preamble` set up
+# the join slot + `__pcs_scr` alias). The default block is `KUnreachable`:
 # kaikai matches are exhaustive, so the switch never falls through; emitting
 # a unit store there would silently make a non-exhaustive program return ()
 # instead of trapping (Linus review #3).
 fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(join, st3) -> {
-    # perceus's reuse recogniser refers to the scrutinee through the
-    # synthetic `__pcs_scr` / `__pcs_scr_drop` names (the donor of a
-    # `KConReuse`). Alias both to the lowered scrutinee here so those
-    # reads resolve — without the binding the reuse donor is a free
-    # variable in the KIR (a correctness gap, not a backend concern);
-    # the direct emitters bind the same locals in their match-arm prologue
-    # (emit_c / emit_llvm `push_local("__pcs_scr", scr)`).
-    let st_scr = ls_emit(ls_emit(st3, KLet("__pcs_scr", SBoxed, KLitOp(scrv), kpos_of(x))),
-                         KLet("__pcs_scr_drop", SBoxed, KLitOp(scrv), kpos_of(x)))
-    let st_decl = ls_emit(st_scr, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+  match match_preamble(x, scrv, st) { LSReg(join, st_decl) ->
     match two_labels(st_decl) { LSL2(lcont, ldef, st4) ->
       match plan_arms(arms, st4, []) { ArmPlan(cases, st5) -> {
         let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
@@ -424,8 +464,7 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, st: LowerSt)
         let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, st6)
         let st8 = lower_arm_bodies(arms, cases, scrv, join, lcont, st7)
         LRes(KVar(join), reopen(st8, lcont))
-      } } }
-  } }
+      } } } }
 
 # A block label per VARIANT arm paired with its tag. Non-variant arms
 # (tag -1, e.g. a wildcard `_`) get NO switch case — they are the default
