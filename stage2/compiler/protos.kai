@@ -4179,10 +4179,126 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
   }
 }
 
+# Issue #341 Form 1: recover the concrete dispatch head from a
+# return-typed op against the inferred return `Ty`. Three cases by how
+# many times `Self` occurs in the declared return:
+#
+#   0 — the op's declared return is a concrete type (`op() : Int` for a
+#       `protocol P { op() : Int }` whose impl target is keyed by that
+#       head). The dispatch head is the inferred return's head directly,
+#       preserving the pre-#341 `ty_head_name(ret_ty)` behaviour.
+#   1 — `Self` appears once, possibly NESTED: `default() : Self` reads
+#       the inferred head; `from_string(s) : Result[String, Self]` aligns
+#       `Result[String, Self]` against `Result[String, Int]` and reads
+#       the head at Self's position (`Int`).
+#   >1 — a multi-Self return (`(Self, Self)`) has no single dispatch
+#       head, so we decline and leave the runtime dispatcher in place.
+#
+# Returns None when the shapes do not align (the inferred return is
+# still a tyvar, or a structural mismatch the unifier would have
+# already rejected).
+fn self_head_in_ret(declared: TypeExpr, inferred: Ty) : Option[String] {
+  let n = te_self_count(declared)
+  if n == 0 { ty_head_name(inferred) }
+  else if n == 1 { align_self_head(declared, inferred) }
+  else { None }
+}
+
+# Count the `Self` mentions in a declared return TypeExpr. Used to gate
+# `self_head_in_ret` to the single-Self case.
+fn te_self_count(te: TypeExpr) : Int = te_kind_self_count(te.tkind)
+
+fn te_kind_self_count(k: TyKind) : Int {
+  match k {
+    TyName(name, targs) ->
+      (if name == "Self" { 1 } else { 0 }) + te_list_self_count(targs)
+    TyList(inner) -> te_self_count(inner)
+    TyFn(ps, r, _) -> te_list_self_count(ps) + te_self_count(r)
+    TyDim(base, _) -> te_self_count(base)
+    TyRefine(base, _) -> te_self_count(base)
+  }
+}
+
+fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
+  [] -> 0
+  [t, ...rest] -> te_self_count(t) + te_list_self_count(rest)
+}
+
+# Parallel walk of a declared TypeExpr (carrying `Self`) against the
+# inferred concrete Ty, returning `ty_head_name` of the inferred type
+# at the position the declared shape names `Self`. The two shapes are
+# the same constructor at every step (the typer already unified them),
+# so the walk pairs children positionally and recurses until it lands
+# on the `Self` leaf.
+fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[String] {
+  match declared.tkind {
+    TyName(name, targs) ->
+      if name == "Self" { ty_head_name(inferred) }
+      else { align_self_in_args(targs, ty_con_args(inferred)) }
+    TyList(inner) -> {
+      match inferred {
+        TyListT(elem) -> align_self_head(inner, elem)
+        _             -> None
+      }
+    }
+    TyDim(base, _)    -> align_self_head(base, ty_strip_dim(inferred))
+    TyRefine(base, _) -> align_self_head(base, ty_strip_refine(inferred))
+    TyFn(_, _, _)     -> None
+  }
+}
+
+# Walk paired declared/inferred argument lists; the one carrying `Self`
+# (guaranteed unique by the `te_self_count == 1` gate) yields the head.
+fn align_self_in_args(decls: [TypeExpr], infs: [Ty]) : Option[String] {
+  match decls {
+    [] -> None
+    [d, ...drest] -> {
+      match infs {
+        []           -> None
+        [i, ...irest] ->
+          if te_self_count(d) == 1 { align_self_head(d, i) }
+          else { align_self_in_args(drest, irest) }
+      }
+    }
+  }
+}
+
+# The type arguments of a constructor-headed inferred Ty, in the same
+# positional order the declared `TyName(_, targs)` enumerates them.
+# Non-constructor types (a still-unresolved tyvar) yield `[]`, so the
+# paired walk runs dry and the caller declines.
+# `tas` (not `args`): a binding named `args` resolves to the prelude
+# `args()` CLI-arguments builtin, not the bound pattern variable
+# (the param-shadow trap), silently returning a closure here.
+fn ty_con_args(t: Ty) : [Ty] {
+  match t {
+    TyCon(_, _, tas)   -> tas
+    TyListT(elem)      -> [elem]
+    TyDimT(base, _)    -> ty_con_args(base)
+    TyRefineT(base, _) -> ty_con_args(base)
+    _                  -> []
+  }
+}
+
+fn ty_strip_dim(t: Ty) : Ty = match t {
+  TyDimT(base, _) -> base
+  _               -> t
+}
+
+fn ty_strip_refine(t: Ty) : Ty = match t {
+  TyRefineT(base, _) -> base
+  _                  -> t
+}
+
 # Issue #180: variant accepting the call's surrounding return type so
 # `from(x) : Self`-style ops can resolve Self via the expected type
 # rather than the (absent) Self argument. Falls back to the legacy
 # arg-driven dispatch when ret_ty is None or Self is informed by args.
+#
+# Issue #341 Form 1: Self may sit NESTED in the return type
+# (`from_string(s) : Result[String, Self]`), so the candidate-specific
+# Self head is recovered per op via `self_head_in_ret` rather than from
+# the outermost `ty_head_name(ret_ty)` (which would read `Result`).
 fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
                                      reg: ProtocolReg,
                                      local_arities: [OpAr],
@@ -4190,39 +4306,37 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
   match try_rewrite_proto_call(callee, args_, reg, local_arities) {
     Some(rk) -> Some(rk)
     None -> {
-      # Last-ditch: try the return type as Self.
+      # Last-ditch: recover Self from the return type's Self position.
       match ret_ty {
         None -> None
-        Some(ty) -> match ty_head_name(ty) {
-          None -> None
-          Some(self_name) -> match callee.kind {
-            EVar(name) -> {
-              let opname = strip_proto_dispatcher_prefix(name)
-              if not list_has(reg.op_names, opname) { None }
-              # Hanga Roa shadow guard: a bare call to a name that
-              # also names a top-level fn of matching arity must
-              # resolve to that fn, not to the protocol impl.
-              # Prefixed callees (`__proto_<op>`) bypass this check
-              # — they were synthesised specifically to land on the
-              # impl-table dispatch.
-              else if proto_call_is_shadowed(name, list_length(args_), local_arities) {
-                None
-              }
-              else {
-                # Issue #546: a return-typed op (`from(x) : Self`) may
-                # also be declared by more than one protocol. Try each
-                # candidate against the return-derived Self type.
-                match args_head_names(args_) {
-                  None -> None
-                  Some(arg_names) ->
-                    try_rewrite_ret_candidates(proto_ops_lookup_all(reg, opname),
-                                               callee, args_, reg, opname,
-                                               self_name, arg_names)
-                }
+        Some(ty) -> match callee.kind {
+          EVar(name) -> {
+            let opname = strip_proto_dispatcher_prefix(name)
+            if not list_has(reg.op_names, opname) { None }
+            # Hanga Roa shadow guard: a bare call to a name that
+            # also names a top-level fn of matching arity must
+            # resolve to that fn, not to the protocol impl.
+            # Prefixed callees (`__proto_<op>`) bypass this check
+            # — they were synthesised specifically to land on the
+            # impl-table dispatch.
+            else if proto_call_is_shadowed(name, list_length(args_), local_arities) {
+              None
+            }
+            else {
+              # Issue #546: a return-typed op (`from(x) : Self`) may
+              # also be declared by more than one protocol. Try each
+              # candidate against its own return-derived Self type.
+              # Decline while any argument's type is still unresolved
+              # (no head) — dispatching then would be premature.
+              match args_head_names(args_) {
+                None -> None
+                Some(_) ->
+                  try_rewrite_ret_candidates(proto_ops_lookup_all(reg, opname),
+                                             callee, args_, reg, opname, ty)
               }
             }
-            _ -> None
           }
+          _ -> None
         }
       }
     }
@@ -4232,23 +4346,41 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
 # Issue #546: the return-typed-Self counterpart of
 # `try_rewrite_proto_candidates`. Walks every protocol declaring
 # `opname` and returns the first whose impl table matches the
-# return-derived `self_name` + the other args. `None` when no
-# candidate matches, preserving the prior behaviour.
+# return-derived Self + the other args. Each candidate recovers its own
+# Self head from its declared return type aligned against `ret_ty`
+# (issue #341 Form 1), so a nested-Self return (`Result[String, Self]`)
+# dispatches correctly. `None` when no candidate matches, preserving
+# the prior behaviour.
 fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
                                args_: [Expr], reg: ProtocolReg,
-                               opname: String, self_name: String,
-                               arg_names: [String]) : Option[ExprKind] {
+                               opname: String, ret_ty: Ty) : Option[ExprKind] {
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, _, _, _, _) ->
-        match find_impl_with_args(reg.impls, pname, opname, self_name, arg_names) {
-          Some(impl_fn) -> {
-            let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-            Some(ECall(new_callee, args_))
+      POR(pname, _, params, ret_te, _, _) ->
+        # Only ops whose Self is informed SOLELY by the return position
+        # are dispatched here. When Self also appears in a parameter
+        # (`show(x: Self) : String`), arg-driven dispatch in
+        # `try_rewrite_proto_call` owns it; second-guessing via the
+        # return head would misroute a no-impl receiver (e.g. `Bare`
+        # with no `impl Show`) onto an unrelated impl whose head happens
+        # to equal the concrete return head (`String`).
+        if not proto_op_self_only_in_return(params, ret_te) {
+          try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
+        } else {
+          match self_head_in_ret(ret_te, ret_ty) {
+            None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
+                                               opname, ret_ty)
+            Some(self_name) ->
+              match find_impl_by_recv(reg.impls, pname, opname, self_name) {
+                Some(impl_fn) -> {
+                  let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
+                  Some(ECall(new_callee, args_))
+                }
+                None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
+                                                   opname, ret_ty)
+              }
           }
-          None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
-                                             opname, self_name, arg_names)
         }
     }
   }
@@ -4466,6 +4598,26 @@ fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
         } else {
           find_impl_with_args(rest, pname, opname, recv, args)
         }
+    }
+  }
+}
+
+# Issue #341 Form 1: receiver-only impl lookup for a return-typed op
+# whose Self lives in the return position (`from_string(s) : Result[
+# String, Self]`). `find_impl_with_args` cannot serve here — its
+# `arg_names_match` treats the lone non-Self argument as the receiver
+# (so `["String"]` would have to equal recv `"Int"`, which never
+# holds). The op's params are genuine non-Self arguments already
+# unified by the typer; single-dispatch v1 keys each impl uniquely on
+# `(protocol, op, Self-type)`, so matching on those three is sound.
+fn find_impl_by_recv(impls: [ProtoImplReg], pname: String, opname: String,
+                      recv: String) : Option[String] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, fn_name, _, _) ->
+        if p == pname and t == recv and o == opname { Some(fn_name) }
+        else { find_impl_by_recv(rest, pname, opname, recv) }
     }
   }
 }
