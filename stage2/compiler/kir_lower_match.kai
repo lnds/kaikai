@@ -1,0 +1,140 @@
+# compiler/kir_lower_match.kai — list-pattern lowering for `match`.
+#
+# A `match` whose arms are list patterns (`[]`, `[h, ...t]`,
+# `[a, b, ...rest]`) cannot ride the variant tag-switch the rest of
+# `lower_match` uses: cons-shaped arms of different lengths all share the
+# `KAI_CONS` runtime tag, so a single `KSwitch` keyed on that tag cannot
+# tell `[h, ...t]` from `[a, b, ...rest]`. They need a length-aware
+# DECISION TREE — exactly the fail-chain the C-direct (`emit_pat_test_list`)
+# and LLVM (`llvm_emit_pat_list`) emitters build.
+#
+# This module owns the PURE half of that lowering: emitting the cons/nil
+# discrimination + the head/tail `KProj` binds for one arm into the block
+# under construction, returning the fail label the next arm reopens. It
+# never recurses into `lower_expr` (the arm BODY is lowered by the walk's
+# `lower_list_match` driver, which sits in the Expr-SCC `kir_lower_walk`).
+# Keeping the test+bind emission here keeps the recursion cycle — and the
+# file sizes — contained.
+
+import compiler.ast
+import compiler.kir
+import compiler.kir_lower
+
+# Cons/nil discrimination prims. Each is a boxed-Bool predicate over the
+# scrutinee's runtime `->tag` (the cons/nil discriminant — a list cell's
+# `variant_tag` is meaningless, so `KTagOf`, which reads `variant_tag`,
+# does NOT work here). The result feeds a `KCondBr` exactly like the
+# boolean `lower_if` produces, and mirrors the C-direct emitter's
+# `->tag == KAI_CONS/KAI_NIL` discriminant. The native walk lowers a
+# `kai_*` prim through its uniform boxed-prim path (`kaix_is_cons_b` /
+# `kaix_is_nil_b`, runtime_llvm.c); the bool singleton is immortal, so the
+# ephemeral test value needs no drop (same as the `==` prim's result).
+fn prim_is_cons() : String = "kai_is_cons_b"
+fn prim_is_nil() : String = "kai_is_nil_b"
+
+# A `match` is a list match iff any arm pattern is a `PList`. The typer
+# guarantees a homogeneous scrutinee, so list arms never mix with variant
+# arms; a trailing `_`/binder catch-all may still follow (handled as an
+# unconditional arm in the fail chain).
+pub fn match_is_list(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(p, _, _), ...rest] -> match p.pkind {
+    PList(_, _) -> true
+    _           -> match_is_list(rest)
+  }
+}
+
+# A non-list arm in a list match (a trailing `_`, a whole-list binder, a
+# hole, or an as-pattern). It matches unconditionally, so it terminates the
+# chain — no test, just bind-the-whole-scrutinee where a name is present.
+pub fn list_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
+  PList(_, _) -> false
+  _           -> true
+}
+
+# Result of emitting one arm's test+binds: the state positioned at the
+# arm's matched body block, plus the fail label the NEXT arm reopens.
+pub type LMArm = LMArm(LowerSt, String)
+
+# Emit the discrimination + binds for one list arm against `scrv`, sealing
+# the chain so a match flows to `body_lbl` and a mismatch to a fresh fail
+# label. The returned state is reopened at `body_lbl` (ready for the body);
+# the returned fail label is where the caller lowers the next arm. A
+# catch-all arm emits no test (binds the whole scrutinee, branches straight
+# to the body) and its "fail" label is unreachable.
+pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
+                   st: LowerSt) : LMArm / Console = match p.pkind {
+  PList(pats, opt_rest) -> match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
+    let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, st1)
+    LMArm(reopen(st2, body_lbl), fail_lbl)
+  } }
+  _ -> {
+    let st1 = lm_bind_whole(p, scrv, st)
+    let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+    LMArm(reopen(st2, body_lbl), body_lbl)
+  }
+}
+
+# Bind a catch-all arm's name (a whole-list binder or as-pattern) to the
+# scrutinee. PWild / PHole bind nothing.
+fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind {
+  PBind(name)  -> lm_bind_name(name, KLitOp(scrv), p, st)
+  PAs(name, _) -> lm_bind_name(name, KLitOp(scrv), p, st)
+  _            -> st
+}
+
+# Walk the N fixed cons cells of a list arm, then close on the tail. Each
+# cell: `is_cons cur` → bind the head sub-pattern from slot 0 and recurse on
+# the tail (slot 1); mismatch → `fail_lbl`. After the fixed heads,
+# `lm_close_tail` handles nil-exactness vs the rest binder.
+fn lm_emit_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
+                 body_lbl: String, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match pats {
+    [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, st)
+    [hp, ...rest] -> match lm_emit_cell_test(cur, prim_is_cons(), fail_lbl, st) {
+      LMArm(st1, _) -> {
+        let st2 = lm_bind_head(hp, cur, st1)
+        match bind_op(st2, KProj(cur, 1), KAt(hp.line, hp.col)) { LRes(tailv, st3) ->
+          lm_emit_cells(rest, opt_rest, tailv, body_lbl, fail_lbl, st3) }
+      }
+    }
+  }
+
+# After the fixed heads: a rest binder accepts any tail (bind it, branch to
+# the body); no rest binder demands the tail be `KAI_NIL` (exact length).
+fn lm_close_tail(opt_rest: Option[String], cur: KVal, body_lbl: String,
+                 fail_lbl: String, st: LowerSt) : LowerSt / Console = match opt_rest {
+  Some(name) -> {
+    let st1 = lm_bind_name(name, KLitOp(cur), mk_pat(PWild, 0, 0), st)
+    ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
+  }
+  None -> match lm_emit_cell_test(cur, prim_is_nil(), fail_lbl, st) {
+    LMArm(st1, _) -> ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
+  }
+}
+
+# `condbr (<prim> cur) ? <continue> : fail_lbl`, opening a fresh block for
+# the success path. `prim` is the boxed-Bool cons/nil predicate. Reuses
+# `LMArm` to carry the continued state (the second field is the fresh
+# continue label, not consumed by callers).
+fn lm_emit_cell_test(cur: KVal, prim: String, fail_lbl: String, st: LowerSt) : LMArm / Console =
+  match bind_op(st, KPrim(prim, [cur]), KNoPos) { LRes(cond, st1) ->
+    match ls_fresh_label(st1) { LSLabel(cont, st2) ->
+      LMArm(reopen(ls_seal(st2, KCondBr(cond, cont, fail_lbl, KNoPos), cont), cont), cont) } }
+
+# Bind one head sub-pattern from the current cons cell's slot 0. PBind
+# aliases the head; PWild / PHole read nothing (the head slot is an alias,
+# not an owned read). Nested destructuring of a head (`[Some(x), ...]`) is
+# a later refinement — the in-scope shapes bind plain names.
+fn lm_bind_head(hp: Pattern, cur: KVal, st: LowerSt) : LowerSt = match hp.pkind {
+  PBind(name) -> lm_bind_name(name, KProj(cur, 0), hp, st)
+  _           -> st
+}
+
+# Emit `KLet name = op` — a pure slot alias. Bound for every PBind / rest
+# binder (including `_`-prefixed discards and `__list_rest_*__` sentinels),
+# exactly the set `pat_ubinds` collected, so perceus's already-placed KRC
+# nodes stay balanced. The variant `bind_sub_binders` binds unconditionally
+# for the same reason; KIR `KLet` never increfs (refcounting is KRC nodes).
+fn lm_bind_name(name: String, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
+  ls_emit(st, KLet(name, SBoxed, op, KAt(p.line, p.col)))
