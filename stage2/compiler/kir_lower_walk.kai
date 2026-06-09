@@ -19,6 +19,7 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_match
+import compiler.kir_lower_lit
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -391,6 +392,13 @@ fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
     # aware decision tree, not the variant tag-switch: cons arms of
     # different lengths share the `KAI_CONS` tag (kir_lower_match.kai).
     if match_is_list(arms) { lower_list_match(x, arms, scrv, st1) }
+    # Literal patterns (`0`/`'c'`/`"s"`/`true`) need an EQUALITY decision
+    # tree, not the variant tag-switch: a `PLit` is not a variant, so its
+    # `arm_tag` is -1 and every literal arm would collapse into one default
+    # block — an empty `KSwitch` that segfaults the native backend
+    # (kir_lower_lit.kai). Dispatched after the list test so a `PList` never
+    # reaches the literal chain.
+    else if match_is_literal(arms) { lower_lit_match(x, arms, scrv, st1) }
     # The variant tag register carries `SInt32` (the raw `variant_tag`
     # word), NOT `SBoxed`: a `KSwitch` scrutinee must be an integer so the
     # native backend emits a real LLVM `switch`. The repr is decided here,
@@ -446,6 +454,38 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
     } } }
 }
 
+# `match scr { <literal patterns> }`: an equality-test fail-chain mirroring
+# the C-direct oracle's boxed-scrutinee path (`emit_pat_test`'s `kai_op_eq`
+# arm) and structurally identical to `lower_list_match`. Each literal arm
+# emits `condbr (kai_eq_raw scr lit) ? body : next`; the catch-all binds the
+# whole scrutinee and ends the chain. The join slot + `__pcs_scr` alias come
+# from the shared `match_preamble`; the chain ends `KUnreachable` when no
+# catch-all is present (the typer made the match exhaustive — e.g.
+# `true`/`false` — so the final fail is dead, Linus review #3).
+fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, st: LowerSt) : LRes / Console =
+  match match_preamble(x, scrv, st) { LSReg(join, st1) ->
+    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
+      let st3 = lower_lit_arms(arms, scrv, join, lcont, st2)
+      LRes(KVar(join), reopen(st3, lcont))
+    } } }
+
+# Lower each literal arm in order, exactly like `lower_list_arms`: the arm's
+# test seals the current block into a condbr (body vs a fresh fail label);
+# the body lowers into the join + branches to `lcont`; the next arm reopens
+# the fail label. A catch-all arm matches unconditionally and ends the chain
+# (later arms are dead). With no catch-all the last fail label is sealed
+# `KUnreachable`.
+fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
+                  st: LowerSt) : LowerSt / Console = match arms {
+  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
+    match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
+      let st_done = lower_branch_into(body, join, lcont, st_body)
+      if lit_arm_is_catchall(p) { st_done }
+      else { lower_lit_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+    } } }
+}
+
 # Build the switch + per-arm blocks + default + continuation, given the
 # already-lowered scrutinee atom and tag register (`match_preamble` set up
 # the join slot + `__pcs_scr` alias). The default block is `KUnreachable`:
@@ -481,11 +521,11 @@ fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match
 }
 
 # Lower the catch-all arm's body into the default block, or seal it
-# `KUnreachable` when the match is variant-exhaustive. Exact literal
-# dispatch (`match n { 0 -> ...; 1 -> ... }`) is a later refinement:
-# multiple non-variant arms collapse to one default here (only the first
-# catch-all body is lowered), so a literal-discriminated match is a known
-# gap, tracked separately from the wildcard case this handles.
+# `KUnreachable` when the match is variant-exhaustive. This path now only
+# runs for a VARIANT match with a single wildcard/binder default arm:
+# literal-discriminated dispatch (`match n { 0 -> ...; 1 -> ... }`) is
+# diverted to `lower_lit_match` (kir_lower_lit.kai) BEFORE this switch is
+# built, so multiple non-variant arms no longer collapse into one default.
 fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
                      ldef: String, st: LowerSt) : LowerSt / Console =
   match first_default_arm(arms) {

@@ -172,12 +172,13 @@ The walk's own docstring already names `list` as part of this SCC, so the
   a nested PVariant/PLit head would need recursion into the variant test
   (and, on native, the matching variant-tag discrimination). None of the
   in-scope fixtures (perceus + the compiler's own sources) use that shape.
-- **Literal-discriminated matches** (`match n { 0 -> ...; 1 -> ... }`) and
-  **record-pattern discrimination** still emit empty switches in the KIR
-  (5 perceus fixtures: `match_pbind_catchall_raw`, `unbox_phase2_match`,
-  etc.). These are SEPARATE, pre-existing gaps the code already flags
-  (the `lower_default_arm` comment: "exact literal dispatch is a later
-  refinement"); out of scope for this list-pattern lane.
+- **Literal-discriminated matches** (`match n { 0 -> ...; 1 -> ... }`) —
+  FIXED in the kir-literal-match lane (`kir_lower_lit.kai`, equality
+  decision tree over `kai_eq_raw`); see `docs/lane-experience-kir-literal-match.md`.
+  The two perceus fixtures that exercised the shape
+  (`match_pbind_catchall_raw`, `unbox_phase2_match`) now run on the native
+  path. **Record-pattern discrimination** (`{ x: 0, y } -> ...`) is still a
+  pre-existing gap — the literal lane left it as the next refinement.
 
 ## Cost note
 
