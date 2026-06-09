@@ -82,6 +82,26 @@ KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_op_pow_int(a, b); 
  * C backend's `!` operator: same type-check + consuming semantics. */
 KaiValue *kaix_not(KaiValue *a)                { return kai_op_boolnot(a); }
 
+/* KIR Lane 1.2 Parte B — STRICT boolean and/or. The KIR lowering
+ * flattens `a and b` / `a or b` to `prim and(a, b)` / `prim or(a, b)`
+ * with BOTH operands already evaluated (the short-circuit is lowered
+ * away upstream), so the native backend needs a strict boxed form. Both
+ * consume their args (mirroring the boxed-op refcount discipline) and
+ * return a fresh `Bool`. Behaviourally identical to the C-direct oracle
+ * whenever both operands are pure — which is every use in the core
+ * (`c >= '0' and c <= '9'`, …). `kai_op_truthy` is non-consuming, so we
+ * decref each operand explicitly after testing it. */
+KaiValue *kaix_and(KaiValue *a, KaiValue *b) {
+    int r = kai_op_truthy(a) && kai_op_truthy(b);
+    kai_decref(a); kai_decref(b);
+    return kai_bool(r);
+}
+KaiValue *kaix_or(KaiValue *a, KaiValue *b) {
+    int r = kai_op_truthy(a) || kai_op_truthy(b);
+    kai_decref(a); kai_decref(b);
+    return kai_bool(r);
+}
+
 /* ---------- control helpers ---------- */
 int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 
@@ -354,6 +374,17 @@ int kaix_is_variant(KaiValue *v, const char *name) {
    the legacy `kaix_is_variant` path retains for fallback. */
 int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
     return v && v->tag == KAI_VARIANT && v->variant_tag == tag;
+}
+
+/* KIR Lane 1.2 Parte B — the raw `i32 variant_tag` word a `KTagOf` reads
+ * (the SInt32 slot). The native backend's `KSwitch` switches on this
+ * integer, so it emits a real LLVM `switch` (one i32 compare / a jump
+ * table under -O2) instead of the legacy `is_variant_tag` compare chain.
+ * Borrowing: does NOT touch `v`'s refcount (the scrutinee's lifetime is
+ * the match arm's, dropped at the arm exit), mirroring the C-direct
+ * oracle's borrowing `scr->variant_tag` field read. */
+int32_t kaix_variant_tag_of(KaiValue *v) {
+    return v ? v->variant_tag : -1;
 }
 
 /* Read the i-th argument of a variant. #747 — return a BORROWED
@@ -728,6 +759,14 @@ KaiValue *kaix_prelude_byte_to_string(KaiValue *v)                       { retur
 KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
 KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
 KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
+/* `unit_name(x)` is a COMPILE-TIME intrinsic in the C-direct backend
+ * (emit_c resolves it to the value's unit-of-measure name as a string
+ * literal). The native backend lowers it as a plain call, so it needs a
+ * runtime symbol. A value without a unit-of-measure (the only shape the
+ * current native subset reaches — e.g. `Show[Real]`) yields the empty
+ * string, matching the C-direct constant. A UoM-carrying value would need
+ * the static resolution; that lands when the native walk grows UoM. */
+KaiValue *kaix_prelude_unit_name(KaiValue *x)                            { if (x) kai_decref(x); return kai_str(""); }
 
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
  * helpers in runtime.h. The LLVM IR can only see externally-

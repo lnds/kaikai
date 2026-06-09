@@ -1,5 +1,5 @@
-# compiler/emit_native.kai — KIR → in-process libLLVM backend
-# (KIR Lane 1, docs/kir-design.md §7.2).
+# compiler/emit_native.kai — KIR → in-process libLLVM backend, the
+# orchestration layer (KIR Lane 1, docs/kir-design.md §7.2).
 #
 # `build_native_object` consumes a `KProgram` and constructs the LLVM
 # module IN MEMORY by calling the libLLVM C API (via the raw-prelude
@@ -8,66 +8,94 @@
 # The driver then links that object against the effects runtime to
 # produce the executable.
 #
-# Native is opt-in this lane (`KAI_BACKEND=native`); the C-text backend
-# stays the default + bootstrap + the differential oracle every step is
-# validated against. The flip to native-default is Lane 1.5.
+# Native is opt-in this lane (`KAI_BACKEND=native` / `--emit=native`); the
+# C-text backend stays the default + bootstrap + the differential oracle
+# every construct is validated against. The flip to native-default is
+# Lane 1.5.
 #
-# STEP 1 SCOPE (`main -> 42`): this builds the spine end-to-end — a
-# `kai_main` that returns a boxed constant via `kaix_int`, the three
-# runtime-entry no-ops `int main` calls, and object emission. It does
-# NOT yet walk arbitrary KIR (arithmetic/let/calls/control flow are
-# steps 2+). The `KProgram` is threaded so the signature is final; the
-# generic per-node walk grows one step at a time, each validated against
-# C-direct.
+# This file is the orchestration: cache the LLVM types, declare every
+# user function up front (so a call can forward-reference a fn defined
+# later), walk each `KFn` (the per-fn walk lives in `emit_native_fn` /
+# `emit_native_ops` / `emit_native_term`), emit the runtime-entry hooks,
+# and — IFF every node lowered (`e.ok`) — verify + emit the object. A
+# node the current subset does not cover flips `e.ok` false (a loud
+# `nemit_unsupported`), and `build_native_object` returns non-zero rather
+# than emit a half-built module (the parity gate, not "no panic", is what
+# proves correctness).
+#
+# Subset 1 (this lane): the pure walk — arithmetic / let / calls /
+# control flow / ctors / match / proj / RC / TCO — validated against
+# C-direct by exit code + stdout. Effects (perform / install / resume),
+# TRMC, and explicit tail calls are later subsets; they abort loudly.
 
 import compiler.util
 import compiler.ast
 import compiler.kir
 import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+import compiler.emit_native_term
 
 # Build the LLVM module for `kp` in memory and emit it as an object at
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
-# failure (the driver surfaces it). Opt-in entry for `KAI_BACKEND=native`.
-pub fn build_native_object(kp: KProgram, out_path: String) : Int = {
+# failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
+# `--emit=native`.
+pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
   let m = llvm_module_new("kai_native")
-  let ptr_t = llvm_ptr_type(m)
-  let i64_t = llvm_int64_type(m)
-
-  # The runtime constructor the module calls: `%KaiValue* @kaix_int(i64)`.
-  # Declared (no body) so the linker resolves it against the effects
-  # runtime; its function type is needed by `LLVMBuildCall2` under
-  # opaque pointers.
-  let kaix_int_ty = llvm_fn_type_1(ptr_t, i64_t)
-  let kaix_int_fn = llvm_add_function(m, "kaix_int", kaix_int_ty)
-
-  native_build_main(m, ptr_t, i64_t, kaix_int_fn, kaix_int_ty)
-  native_build_runtime_noops(m, ptr_t)
-
-  llvm_emit_object(m, out_path)
+  # ALL backend state (module, builder, types, fn, reg/block tables) lives
+  # in the C-side `ctx` reached through this opaque Handle — no handle
+  # ever enters a kaikai record/list (would RC-corrupt under kaic1).
+  let ctx = native_ctx_new(m)
+  # Declare every user fn first (forward references), then walk each.
+  nemit_declare_fns(ctx, kp.fns)
+  nemit_walk_fns(ctx, kp.fns)
+  # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
+  # passed as a first-class value (a `KClosure` over a named fn references
+  # this symbol). The KIR does NOT model these — they are synthetic, like
+  # the C-direct emitter's `emit_fn_thunk`.
+  nemit_fn_thunks(ctx, kp.fns)
+  native_build_runtime_noops(m, native_ctx_ptrt(ctx))
+  if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
+  else {
+    eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
+    1
+  }
 }
 
-# `kai_main : %KaiValue* ()` — the entry the runtime's `int main` calls.
-# STEP 1: returns `kaix_int(42)`, the boxed answer, matching the KIR
-# `fn main() : box { entry: ret 42 }` and the C-direct oracle
-# (`return kai_int(42)`).
-fn native_build_main(m: Handle, ptr_t: Handle, i64_t: Handle,
-                     kaix_int_fn: Handle, kaix_int_ty: Handle) : Unit = {
-  let main_ty = llvm_fn_type_0(ptr_t)
-  let main_fn = llvm_add_function(m, "kai_main", main_ty)
-  let entry = llvm_append_block(m, main_fn, "entry")
-  let b = llvm_builder_new(m)
-  llvm_position_at_end(b, entry)
-  let c42 = llvm_const_int(i64_t, 42)
-  let boxed = llvm_build_call_1(b, kaix_int_fn, kaix_int_ty, c42)
-  llvm_build_ret(b, boxed)
+# Declare every `KFnNormal` with its all-boxed signature so a call site
+# resolves the symbol even when the definition comes later in the list.
+# (Lambda/clause thunks are a later subset — not declared here.)
+fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
+  [] -> ()
+  [f, ...rest] -> match f.kind {
+    KFnNormal -> {
+      # Bind the declaration handle in a `let` (the handle-binder
+      # exclusion) — NOT a discarded statement. A bare
+      # `llvm_get_or_declare_fn(...)` leaves the returned `Function*` handle
+      # in statement position, where the type-blind kaic1 Perceus
+      # `kai_decref`s the unused value, dereferencing the raw LLVM pointer
+      # and clobbering the just-declared function's object (its type-id
+      # flipped Function->ConstantVector, crashing the AsmPrinter). The
+      # `let _d = <handle-fn>` form keeps it out of Perceus.
+      let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+      nemit_declare_fns(ctx, rest)
+    }
+    _ -> nemit_declare_fns(ctx, rest)
+  }
 }
 
-# The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls
-# before/after `kai_main`: `kai_main_install_defaults`,
-# `kai_main_teardown_defaults`, `_kai_proto_init_llvm`. STEP 1 has no
-# effects and no protocols, so each is an empty `void ()` returning
-# void — exactly what the out-of-process LLVM backend emits for a
-# program with an empty effect row / no protocols.
+# Walk each fn (imperative over `ctx`; an uncovered node flips `ctx.ok`).
+fn nemit_walk_fns(ctx: Handle, fns: [KFn]) : Unit / Console = match fns {
+  [] -> ()
+  [f, ...rest] -> { nemit_fn(ctx, f); nemit_walk_fns(ctx, rest) }
+}
+
+# The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls around
+# `kai_main`: `kai_main_install_defaults`, `kai_main_teardown_defaults`,
+# `_kai_proto_init_llvm`. Subset 1 has no effects + no protocol dispatch
+# in the observable path, so each is an empty `void ()` — exactly what the
+# out-of-process backend emits for an empty effect row / no protocols.
+# (Effects subset 2 fills `install_defaults` from `kp.install_order`.)
 fn native_build_runtime_noops(m: Handle, ptr_t: Handle) : Unit = {
   let void_t = llvm_void_type(m)
   let void_fn_ty = llvm_fn_type_0(void_t)

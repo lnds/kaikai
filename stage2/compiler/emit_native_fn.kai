@@ -1,0 +1,251 @@
+# compiler/emit_native_fn.kai — the per-KFn walk of the in-process
+# libLLVM native backend (KIR Lane 1.2 Parte B, docs/kir-design.md §7.2).
+#
+# `emit_native.kai` is the orchestration; THIS file + `emit_native_ops` +
+# `emit_native_term` walk ONE `KFn` into LLVM IR via the C-API prims in
+# `native_prims.kai`.
+#
+# ALL backend state lives in a C struct reached through one opaque
+# `ctx: Handle` (the `native_ctx_*` prims). NO LLVM handle ever enters a
+# kaikai record or list: the production kaic2 is compiled by the
+# type-blind kaic1, whose record/list constructors `kai_incref` every
+# field, which on a raw LLVM pointer corrupts memory (asu "risk #1"). So
+# the walk is imperative over `ctx` — the IRBuilder IS mutable state — and
+# threads nothing but `ctx`, which is excluded from Perceus as a `:Handle`
+# param. The register / block tables (`String -> handle`) live in C too.
+#
+# The model (asu review): every named KIR register is an entry-block
+# `alloca`; `KLet` stores into it, a `KVar` read loads from it, `KStore`
+# stores again, and `mem2reg` promotes the lot to SSA+phi — so the
+# deliberately non-SSA KIR translates without the backend reasoning about
+# dominance.
+#
+# Two passes over a fn's blocks (in `emit_native_term`): pass 1 creates
+# every basic block + collects every named register into one alloca batch
+# at the entry head (allocas must precede other instructions to stay
+# promotable + static — a lazy alloca inside a loop would grow the fiber
+# stack per iteration); pass 2 fills each block's statements + terminator.
+#
+# Subset 1 (this lane): the pure walk — arithmetic / let / calls / control
+# flow / ctors / match / proj / RC / TCO. Effects (KPerform/KInstall/
+# KSetjmp/KResume), TRMC, and explicit tail calls abort LOUDLY via
+# `nemit_unsupported` (not silently) until a later subset covers them.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+
+# --- fn symbol -----------------------------------------------------------
+
+# The emitted symbol for a KFn: `main` becomes `kai_main` (the runtime's
+# `int main` calls `kai_main()` directly); every other fn keeps its
+# already-mangled `sym`. Mirrors emit_llvm's `if nm == "main"` rename.
+# Declaration, definition, and any call must agree, so this is the one
+# source they all route through.
+pub fn nfn_sym(sym: String) : String = if sym == "main" { "kai_main" } else { sym }
+
+# --- slot tag <-> KSlot -------------------------------------------------
+
+# The C-side reg table stores a slot as an Int tag; these map both ways.
+# KSlot is the SINGLE source of a register's type (asu review): the walk
+# loads/stores at this type, never re-derives it from the op.
+pub fn nslot_tag(s: KSlot) : Int = match s {
+  SBoxed -> 0  SInt64 -> 1  SReal -> 2  SBool -> 3  SInt32 -> 4
+}
+
+# The LLVM element type for a slot tag (read back from the ctx table).
+pub fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
+  if tag == 1 { native_ctx_i64t(ctx) }
+  else if tag == 2 { native_ctx_i64t(ctx) }
+  else if tag == 3 { native_ctx_i32t(ctx) }
+  else if tag == 4 { native_ctx_i32t(ctx) }
+  else { native_ctx_ptrt(ctx) }
+
+pub fn nslot_type(ctx: Handle, s: KSlot) : Handle = nslot_type_of_tag(ctx, nslot_tag(s))
+
+# Loud abort: an unsupported node mis-lowered would be worse than a clear
+# error (the Lane 0 silent-catch-all class). Print kind + flip the ctx's
+# `ok` flag; the walk runs to completion (coherent verify error) but
+# `emit_object` refuses the module.
+pub fn nemit_unsupported(ctx: Handle, what: String) : Unit / Console = {
+  eprint(cat2("native: unsupported KIR node (subset gap): ", what))
+  native_ctx_fail(ctx)
+}
+
+# A valid null `ptr` LLVM VALUE (not a type) — the placeholder an op
+# returns after `nemit_unsupported` so the still-building module stays
+# well-typed (an `LLVMTypeRef` used where a value is wanted is invalid IR
+# and crashes later C-API calls). The module is refused at emit anyway
+# (ctx.ok is false), but it must not segfault mid-walk.
+pub fn nemit_null(ctx: Handle) : Handle = llvm_const_null(native_ctx_ptrt(ctx))
+
+# --- runtime fn declare-and-call ---------------------------------------
+
+# Build a call to a known boxed fn `sym` (signature `ptr (ptr × arity)`)
+# over the already-materialised arg buffer `argbuf` (a C-side
+# `KaiLlvmBuf` — handles NEVER ride a kaikai `[Handle]` list or a
+# record, which would RC-corrupt them, asu "risk #1"). `fnty`/`fnv` are
+# direct handle-prim `let`s (each excluded from Perceus), never wrapped
+# in a kaikai tuple/record. Returns the result handle; the caller owns
+# `argbuf` (frees it after). Every `kaix_*` runtime entry has this boxed
+# shape; `get_or_declare_fn` reuses an existing declaration.
+pub fn nemit_call_boxed(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
+  let fnty = llvm_fn_type_boxed(native_ctx_ptrt(ctx), llvm_buf_len(argbuf))
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
+  llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, argbuf)
+}
+
+# --- atoms: a KVal → an LLVM value handle ------------------------------
+
+# Materialise an atom. A `KVar` loads from the register's alloca at its
+# slot type (read from the ctx table — KSlot is the type source). A
+# literal boxes through the matching runtime constructor (`kaix_int` /
+# `kaix_bool` / ...), the same shape the C-direct oracle emits.
+# The literal constructors take a SCALAR, not a boxed `ptr`: `kaix_int`
+# rides `i64`, `kaix_bool`/`kaix_char` ride `i32`, `kaix_real` rides `f64`.
+# So they declare a MIXED signature (`ncall_sig1` with the scalar param
+# type) — NOT `nemit_call1` (which would declare an all-boxed `ptr(ptr)`
+# and the verifier rejects the `i32`/`i64`/`f64` arg). `kaix_str` takes a
+# `ptr` (the i8* global), so it stays a boxed-shaped one-arg call.
+# Each literal arm delegates to a per-kind helper. Keeping the scalar
+# payload (`n: Int`, `c: Char`, `r: Real`) inside its own `fn` body — not
+# inline in this `match` — stops the C-direct unbox pass from raw-promoting
+# the whole arm (which would `->as.i`-unbox the `ctx` Handle, breaking
+# selfhost). Each helper returns a boxed `ptr`.
+pub fn nemit_atom(ctx: Handle, v: KVal) : Handle / Console = match v {
+  KVar(n)   -> nemit_load_reg(ctx, n)
+  KIntV(n)  -> nemit_int_lit(ctx, n)
+  KBoolV(b) -> nemit_bool_lit(ctx, nbool_to_int(b))
+  KCharV(c) -> nemit_char_lit(ctx, char_to_int(c))
+  KStrV(s)  -> nemit_str_lit(ctx, s)
+  KUnitV    -> nemit_call0(ctx, "kaix_unit")
+  KRealV(r) -> nemit_real_lit(ctx, r)
+}
+
+# `kaix_int(i64)` — box an Int literal.
+fn nemit_int_lit(ctx: Handle, n: Int) : Handle / Console =
+  ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), llvm_const_int(native_ctx_i64t(ctx), n))
+# `kaix_bool(i32)` — box a Bool literal (0/1).
+fn nemit_bool_lit(ctx: Handle, b: Int) : Handle / Console =
+  ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), llvm_const_i32(native_ctx_i32t(ctx), b))
+# `kaix_char(i32)` — box a Char literal (its codepoint).
+fn nemit_char_lit(ctx: Handle, c: Int) : Handle / Console =
+  ncall_sig1(ctx, "kaix_char", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), llvm_const_i32(native_ctx_i32t(ctx), c))
+# `kaix_real(f64)` — box a Real literal.
+fn nemit_real_lit(ctx: Handle, r: Real) : Handle / Console =
+  ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), llvm_const_real(native_ctx_f64t(ctx), r))
+# `kaix_str(ptr)` — box a String literal via its i8* global.
+fn nemit_str_lit(ctx: Handle, s: String) : Handle / Console =
+  ncall_sig1(ctx, "kaix_str", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), llvm_build_string_span(native_ctx_b(ctx), s))
+
+# Boxed call over 0 / 1 arg, building + freeing the C buffer (handles
+# never ride a kaikai list). `nemit_call_boxed` does NOT free its buffer
+# (the caller owns it), so these wrappers own the fresh one they make.
+pub fn nemit_call0(ctx: Handle, sym: String) : Handle = {
+  let buf = llvm_buf_new()
+  let r = nemit_call_boxed(ctx, sym, buf); llvm_buf_free(buf); r
+}
+pub fn nemit_call1(ctx: Handle, sym: String, a0: Handle) : Handle = {
+  let buf = llvm_buf_new(); llvm_buf_push(buf, a0)
+  let r = nemit_call_boxed(ctx, sym, buf); llvm_buf_free(buf); r
+}
+
+# Load a named register from its alloca at its declared slot type.
+fn nemit_load_reg(ctx: Handle, n: String) : Handle / Console = {
+  let alloca = native_ctx_find_reg(ctx, n)
+  let slot = native_ctx_reg_slot(ctx, n)
+  if slot < 0 { nemit_unsupported(ctx, cat2("unbound register ", n)); nemit_null(ctx) }
+  else { llvm_build_load(native_ctx_b(ctx), nslot_type_of_tag(ctx, slot), alloca) }
+}
+
+fn nbool_to_int(b: Bool) : Int = if b { 1 } else { 0 }
+
+# Materialise a list of atoms left-to-right into a FRESH C arg buffer
+# (handles never enter a kaikai `[Handle]` list — asu "risk #1"). The
+# caller owns the returned buffer (frees it after the call). `vs` is a
+# `[KVal]` (KIR atoms, ordinary KaiValues — safe in a list); only the
+# materialised LLVM handles must stay off the RC regime, so they go
+# straight into the buffer.
+pub fn nemit_atoms_buf(ctx: Handle, vs: [KVal]) : Handle / Console = {
+  let buf = llvm_buf_new()
+  nemit_push_atoms(ctx, buf, vs); buf
+}
+
+fn nemit_push_atoms(ctx: Handle, buf: Handle, vs: [KVal]) : Unit / Console = match vs {
+  [] -> ()
+  [v, ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_atoms(ctx, buf, rest) }
+}
+
+# --- register collection + allocas (pass 1) ----------------------------
+#
+# Collect every NAMED register a fn body binds (params, `KLet` binders,
+# `KStore` destinations), emit each as an alloca at the entry head, and
+# record (name, alloca, slot) in the ctx table. Params are collected
+# FIRST (so a tcrec reloop's `pN` selects the N-th register by index) and
+# their alloca is seeded from the incoming arg.
+
+pub type RSpec = RS(String, KSlot)
+
+pub fn collect_fn_specs(f: KFn) : [RSpec] =
+  collect_block_specs(f.blocks, collect_param_specs(f.params, []))
+
+fn rspec_add(acc: [RSpec], name: String, slot: KSlot) : [RSpec] =
+  if rspec_has(acc, name) { acc } else { list_append(acc, [RS(name, slot)]) }
+
+fn rspec_has(acc: [RSpec], name: String) : Bool = match acc {
+  [] -> false
+  [RS(n, _), ...rest] -> if n == name { true } else { rspec_has(rest, name) }
+}
+
+fn collect_param_specs(ps: [KParam], acc: [RSpec]) : [RSpec] = match ps {
+  [] -> acc
+  [p, ...rest] -> collect_param_specs(rest, rspec_add(acc, p.name, p.slot))
+}
+
+fn collect_block_specs(bs: [KBlock], acc: [RSpec]) : [RSpec] = match bs {
+  [] -> acc
+  [b, ...rest] -> collect_block_specs(rest, collect_stmt_specs(b.stmts, acc))
+}
+
+fn collect_stmt_specs(ss: [KStmt], acc: [RSpec]) : [RSpec] = match ss {
+  [] -> acc
+  [s, ...rest] -> collect_stmt_specs(rest, match s {
+    KLet(n, slot, _, _) -> rspec_add(acc, n, slot)
+    KStore(n, _, _)     -> rspec_add(acc, n, SBoxed)
+    _                   -> acc
+  })
+}
+
+# Emit every register's alloca at the entry head (the builder must be
+# positioned there) and record it in the ctx table.
+pub fn nemit_allocas(ctx: Handle, specs: [RSpec]) : Unit / Console = match specs {
+  [] -> ()
+  [RS(name, slot), ...rest] -> {
+    let a = llvm_build_alloca(native_ctx_b(ctx), nslot_type(ctx, slot), cat2(name, ".addr"))
+    native_ctx_add_reg(ctx, name, a, nslot_tag(slot))
+    nemit_allocas(ctx, rest)
+  }
+}
+
+# Seed a normal fn's params: `store (param i) -> alloca(name)`, in order.
+# (Lambda/clause thunk ABI — args[i] / capture reads — is a later subset;
+# `PDirect` only here.)
+pub fn nemit_seed_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = match ps {
+  [] -> ()
+  [p, ...rest] -> match p.origin {
+    PDirect(i) -> {
+      llvm_build_store(native_ctx_b(ctx), llvm_get_param(fnval, i), native_ctx_find_reg(ctx, p.name))
+      nemit_seed_params(ctx, rest, fnval)
+    }
+    _ -> { nemit_unsupported(ctx, "non-direct param origin (thunk ABI = later subset)"); () }
+  }
+}
+
+# Store a value into a named register's alloca.
+pub fn nemit_store_reg(ctx: Handle, name: String, h: Handle) : Unit / Console = {
+  let alloca = native_ctx_find_reg(ctx, name)
+  let slot = native_ctx_reg_slot(ctx, name)
+  if slot < 0 { eprint(cat2("native: store to unbound register ", name)); () }
+  else { llvm_build_store(native_ctx_b(ctx), h, alloca); () }
+}
