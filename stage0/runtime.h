@@ -4964,6 +4964,172 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
     return r;
 }
 
+/* ---------- prelude: chunked / streaming file io (issue #771) ----------
+ *
+ * Five primitives behind the new `File` ops `open_read` / `read_chunk` /
+ * `open_write` / `write_chunk` / `close_file`. Unlike the bulk
+ * `read_file` / `write_file` pair these keep an OS file descriptor open
+ * across calls, so the carrier (line surface, #801) can pull a large
+ * file chunk-by-chunk without materialising it. The handle is an opaque
+ * `FileHandle` record `{ fd: Int }` — same shape as the net `Conn`.
+ *
+ * Error register is `Result[String, _]` (Err message first), mirroring
+ * `read_file`. `read_chunk` returns `Ok("")` at EOF (the spec'd
+ * sentinel), never an error. Each primitive consumes its KaiValue *
+ * args linearly, decref'ing before building the result. */
+
+/* Build a FileHandle record `{ fd }`. Field-name string matches the
+ * kaikai-side `type FileHandle = { fd: Int }` decl
+ * (builtin_filehandle_decl) — kai_op_field reads by strcmp, so any
+ * pointer to a matching cstring works. */
+static KaiValue *_kai_file_make_handle(int fd) {
+    KaiValue *fd_kv = kai_int((int64_t) fd);
+    KaiValue *fields[1] = { fd_kv };
+    static const char *names[1] = { "fd" };
+    return kai_record(1, fields, names);
+}
+
+/* Pull the `fd` slot out of a FileHandle record. Returns -1 when the
+ * value is the wrong shape (caller returns an Err); v1 trusts the typer
+ * to keep this honest. */
+static int _kai_file_handle_fd(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_INT) return -1;
+            return (int) f->as.i;
+        }
+    }
+    return -1;
+}
+
+static KaiValue *_kai_file_err(const char *msg) {
+    KaiValue *m = kai_str(msg);
+    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+}
+
+static KaiValue *_kai_file_ok(KaiValue *payload) {
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = payload}});
+}
+
+/* open_read(path) -> Result[String, FileHandle]. Opens `path` read-only
+ * and hands back an owning FileHandle. */
+static KaiValue *kai_prelude_file_open_read(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        r = _kai_file_err("open_read: argument is not a String");
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        int fd = open(pbuf, O_RDONLY);
+        if (fd < 0) r = _kai_file_err("open_read: cannot open file");
+        else        r = _kai_file_ok(_kai_file_make_handle(fd));
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* read_chunk(h, max) -> Result[String, String]. Reads up to `max` bytes
+ * from the handle's fd into a fresh String. `Ok("")` signals EOF. A
+ * short read (fewer than `max` bytes, but more than zero) is normal and
+ * returned as-is; the caller loops until it sees the empty string. */
+static KaiValue *kai_prelude_file_read_chunk(KaiValue *h, KaiValue *max) {
+    KaiValue *r = NULL;
+    int fd = _kai_file_handle_fd(h);
+    int64_t cap = (max && max->tag == KAI_INT) ? max->as.i : -1;
+    if (fd < 0) {
+        r = _kai_file_err("read_chunk: bad handle");
+    } else if (cap < 0) {
+        r = _kai_file_err("read_chunk: max is not a non-negative Int");
+    } else if (cap == 0) {
+        r = _kai_file_ok(kai_str(""));
+    } else {
+        char *buf = (char *) malloc((size_t) cap);
+        if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        ssize_t got;
+        do { got = read(fd, buf, (size_t) cap); } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            free(buf);
+            r = _kai_file_err("read_chunk: read failed");
+        } else {
+            KaiValue *v = kai_alloc(KAI_STR);
+            v->as.s.len = (size_t) got;
+            v->as.s.bytes = (char *) malloc((size_t) got + 1);
+            if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            memcpy(v->as.s.bytes, buf, (size_t) got);
+            v->as.s.bytes[got] = '\0';
+            free(buf);
+            r = _kai_file_ok(v);
+        }
+    }
+    if (h)   kai_decref(h);
+    if (max) kai_decref(max);
+    return r;
+}
+
+/* open_write(path) -> Result[String, FileHandle]. Opens `path` for
+ * writing, creating it (mode 0644) and truncating any existing
+ * contents, then hands back an owning FileHandle. */
+static KaiValue *kai_prelude_file_open_write(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        r = _kai_file_err("open_write: argument is not a String");
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        int fd = open(pbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) r = _kai_file_err("open_write: cannot open file");
+        else        r = _kai_file_ok(_kai_file_make_handle(fd));
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* write_chunk(h, data) -> Result[String, Unit]. Writes every byte of
+ * `data` to the handle's fd, looping over partial writes. */
+static KaiValue *kai_prelude_file_write_chunk(KaiValue *h, KaiValue *data) {
+    KaiValue *r = NULL;
+    int fd = _kai_file_handle_fd(h);
+    if (fd < 0) {
+        r = _kai_file_err("write_chunk: bad handle");
+    } else if (!data || data->tag != KAI_STR) {
+        r = _kai_file_err("write_chunk: data is not a String");
+    } else {
+        size_t total = data->as.s.len;
+        size_t off = 0;
+        int failed = 0;
+        while (off < total) {
+            ssize_t w = write(fd, data->as.s.bytes + off, total - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                failed = 1;
+                break;
+            }
+            off += (size_t) w;
+        }
+        if (failed) r = _kai_file_err("write_chunk: write failed");
+        else        r = _kai_file_ok(kai_unit());
+    }
+    if (h)    kai_decref(h);
+    if (data) kai_decref(data);
+    return r;
+}
+
+/* close_file(h) -> Unit. Closes the underlying fd; a bad handle or a
+ * close error is swallowed (there is no Result register on close — the
+ * fd is gone either way). */
+static KaiValue *kai_prelude_file_close(KaiValue *h) {
+    int fd = _kai_file_handle_fd(h);
+    if (fd >= 0) close(fd);
+    if (h) kai_decref(h);
+    return kai_unit();
+}
+
 /* Issue #345: file_exists / file_delete / file_rename. Each consumes
  * its String args linearly (kai_decref before allocating the result),
  * matching the prelude convention used by read_file/write_file above. */
@@ -6823,6 +6989,73 @@ static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
     kai_reactor_init();
     KaiFileWriteFileArg a = { path, contents };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+
+/* Issue #771 Phase 1: default handlers for the five chunked `File`
+ * ops. Each offloads its blocking syscall to the R1 pool worker and
+ * parks the fiber, identical to read_file/write_file above — regular
+ * files are not epoll-pollable, so the pool is the readiness path. The
+ * `_arg` struct lives on the fiber stack for the duration of the work;
+ * the `_thunk` runs on a pool thread and returns the prelude's value. */
+typedef struct { KaiValue *path; } KaiFileOpenArg;
+static KaiValue *_kai_file_open_read_thunk(void *arg) {
+    return kai_prelude_file_open_read(((KaiFileOpenArg *) arg)->path);
+}
+static KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont *k) {
+    (void) self;
+    kai_reactor_init();
+    KaiFileOpenArg a = { path };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_read_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+
+typedef struct { KaiValue *h; KaiValue *max; } KaiFileReadChunkArg;
+static KaiValue *_kai_file_read_chunk_thunk(void *arg) {
+    KaiFileReadChunkArg *a = (KaiFileReadChunkArg *) arg;
+    return kai_prelude_file_read_chunk(a->h, a->max);
+}
+static KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k) {
+    (void) self;
+    kai_reactor_init();
+    KaiFileReadChunkArg a = { h, max };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_chunk_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+
+static KaiValue *_kai_file_open_write_thunk(void *arg) {
+    return kai_prelude_file_open_write(((KaiFileOpenArg *) arg)->path);
+}
+static KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont *k) {
+    (void) self;
+    kai_reactor_init();
+    KaiFileOpenArg a = { path };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_write_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+
+typedef struct { KaiValue *h; KaiValue *data; } KaiFileWriteChunkArg;
+static KaiValue *_kai_file_write_chunk_thunk(void *arg) {
+    KaiFileWriteChunkArg *a = (KaiFileWriteChunkArg *) arg;
+    return kai_prelude_file_write_chunk(a->h, a->data);
+}
+static KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k) {
+    (void) self;
+    kai_reactor_init();
+    KaiFileWriteChunkArg a = { h, data };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_chunk_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+
+typedef struct { KaiValue *h; } KaiFileCloseArg;
+static KaiValue *_kai_file_close_thunk(void *arg) {
+    return kai_prelude_file_close(((KaiFileCloseArg *) arg)->h);
+}
+static KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
+    (void) self;
+    kai_reactor_init();
+    KaiFileCloseArg a = { h };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_close_thunk, &a);
     return kai_cont_resume(k, r);
 }
 
