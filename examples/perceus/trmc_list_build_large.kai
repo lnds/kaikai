@@ -1,0 +1,47 @@
+# Issue: TRMC (tail-recursion-modulo-cons) for the BUILTIN cons idiom
+# `[h, ...recur(t)]`. Building a list this way recurses INSIDE the cons,
+# so the call is tail-modulo the constructor — not strict tail position.
+# The compiler rewrites it into a constructor-context (cctx) goto-loop:
+# each step builds one cons with a hole in the cdr, extends the cctx, and
+# loops — O(1) C stack. Before the fix the TRMC rewrite only recognised a
+# USER constructor (`Cons(h, rec)`), never the builtin cons, so every
+# `[h, ...recur(t)]` loop grew one C frame per element and overran an 8 MB
+# stack well under 100K elements (Tier-1 mandatory-TCO violation).
+#
+# `build` exercises the raw EList shape (`if .. { [] } else { [n, ...build
+# (n-1)] }`); `map_inc` exercises the perceus reuse-cons shape (a cons-
+# pattern arm rebuilding `[g(h), ...recur(t)]`). Both must build a 1M-deep
+# list without overflowing. The result is consumed by `last` (a tail-
+# recursive descent that frees each cell as it goes, O(1) stack), so the
+# fixture isolates the CONSTRUCTION TCO under test from the (separate)
+# recursive whole-spine free path.
+#
+# Backend note: the cons step sentinel is lowered only by the C-text
+# emitter today; on the LLVM/native backends the cons-modulo-cons fn falls
+# back to ordinary recursion (correct values, stack-growing). This fixture
+# is C-path; backend-parity asserts the printed values match regardless.
+
+fn build(n: Int) : [Int] =
+  if n == 0 { [] }
+  else { [n, ...build(n - 1)] }
+
+fn map_inc(xs: [Int]) : [Int] =
+  match xs {
+    [] -> []
+    [h, ...t] -> [h + 1, ...map_inc(t)]
+  }
+
+# Tail-recursive descent to the last element. Consumes `xs` one cell at a
+# time (each step moves the tail out, then drops the head cell), so the
+# 1M-deep spine is walked AND freed in O(1) stack.
+fn last(xs: [Int], d: Int) : Int =
+  match xs {
+    [] -> d
+    [h, ...t] -> last(t, h)
+  }
+
+fn main() : Unit / Stdout = {
+  let big = build(1000000)        # raw-EList TRMC: 1M cons, O(1) stack
+  let inc = map_inc(big)          # reuse-cons TRMC: rebuild 1M, O(1) stack
+  Stdout.print(int_to_string(last(inc, 0)))   # last of inc = 1+1 = 2
+}
