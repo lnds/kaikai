@@ -459,6 +459,12 @@ timing decided when the first real use case pushes them:
 effect File {
   read_file(path: String)                       : Result[String, String]
   write_file(path: String, content: String)     : Result[Unit, String]
+  # Issue #771 Phase 1 — chunked / streaming IO (shipped).
+  open_read(path: String)                       : Result[String, FileHandle]
+  read_chunk(h: FileHandle, max: Int)           : Result[String, String]
+  open_write(path: String)                      : Result[String, FileHandle]
+  write_chunk(h: FileHandle, data: String)      : Result[String, Unit]
+  close_file(h: FileHandle)                     : Unit
 }
 ```
 
@@ -516,6 +522,48 @@ as data, not as `Fail`.
 
 Because the default is installed automatically, `main` does not
 need to write `handle { ... } with File { ... }` itself.
+
+### Chunked / streaming IO (issue #771 Phase 1)
+
+The bulk `read_file` / `write_file` pair materialises a whole file
+as one `String`. For unbounded input (logs, data files) the five
+chunked ops keep an OS file descriptor open across calls so a
+consumer can pull a large file piece-by-piece without holding it
+all in memory:
+
+- `open_read(path) : Result[String, FileHandle]` — open read-only.
+- `read_chunk(h, max) : Result[String, String]` — read up to `max`
+  bytes. `Ok("")` is the **EOF sentinel** (never an `Err`); a short
+  read (fewer than `max` bytes but more than zero) is normal — the
+  caller loops until it sees the empty string.
+- `open_write(path) : Result[String, FileHandle]` — open for
+  writing, creating (mode 0644) and truncating any existing file.
+- `write_chunk(h, data) : Result[String, Unit]` — write every byte
+  of `data`, looping over partial writes.
+- `close_file(h) : Unit` — close the descriptor. Single error
+  channel collapses to none: the fd is gone either way.
+
+`FileHandle` is an opaque runtime handle — a record `{ fd: Int }`,
+the same shape as the net `Conn`. It is single-owner: sharing a
+`FileHandle` across fibers is undefined in v1, the same stance as
+the stdin singleton.
+
+The error register is `Result[String, _]` (Err message first),
+mirroring `read_file` — callers branch on the motive (missing /
+permission / mid-stream fault). The ergonomic line surface
+(`with_lines` / `fold_lines` / `each_line`, the `Fail`/`Option`
+registers) is **not** part of this phase: it is tracked in #801 and
+layers on top of these primitives, replacing the originally-planned
+Phase 2 bracket surface (superseded by the stream-carrier design).
+
+> **v1 status (issue #771, 2026-06-09):** the five chunked ops park
+> the *fiber* and offload their blocking `open`/`read`/`write`/
+> `close` syscall to the same 4-worker R1 thread pool as
+> `read_file` — regular files are not `epoll`-pollable, so the pool
+> is the portable readiness path. Cancel-safety of an open handle
+> (an fd leaks if a fiber is cancelled between `open_*` and
+> `close_file`) is a known limitation, same honesty treatment as
+> the non-atomic `append`; the cancel-aware bracket is post-MVP.
 
 ### Overwrite semantics for `write_file`
 

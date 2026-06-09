@@ -2895,6 +2895,48 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "actors OK $$name (issue #472 missing parametric label still diagnosed)"; \
+	done; \
+	for f in ../examples/effects/file_stream_roundtrip.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_file_open_write" build/s2-$$name.c \
+	    && grep -q "kai_default_file_write_chunk" build/s2-$$name.c \
+	    && grep -q "kai_default_file_open_read"  build/s2-$$name.c \
+	    && grep -q "kai_default_file_read_chunk" build/s2-$$name.c \
+	    && grep -q "kai_default_file_close_file" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (chunked-File wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^hello streaming world$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (#771 chunked write+read roundtrip)" \
+	    || { echo "effects FAIL $$name (roundtrip output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/file_stream_mock.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^mock: ababab$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (#771 chunked ops interceptable via handle)" \
+	    || { echo "effects FAIL $$name (mock output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/file_stream_open_missing.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^open_read failed: open_read: cannot open file$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (#771 open_read missing -> inspectable Err)" \
+	    || { echo "effects FAIL $$name (negative output wrong)"; cat build/s2-$$name.out; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
