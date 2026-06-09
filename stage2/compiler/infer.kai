@@ -14882,7 +14882,76 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
         diags: finalize_diags(st2.diags)
       }
     }
+    # Issue #758: `test` / `bench` / `check` bodies were previously
+    # returned untyped (the catch-all below), so `try_bare_call_narrow`
+    # (#235 first-arg narrowing) and the protocol-call rewrite — both of
+    # which depend on a typed body — never fired inside them. A bare
+    # cross-module name (`repeat("x", 3)` with both `string.repeat` and
+    # `list.repeat` in scope) then resolved to the wrong candidate. Run
+    # the same body walk a paramless `fn` gets so the typed AST carries
+    # resolved `EModCall` callees. `check` blocks bind their `with`
+    # params first. The body is run like `main`'s REmpty row (the test
+    # harness installs the identical builtin default handlers), so
+    # `print`/`assert` and effecting helpers type without a declared row.
+    DTest(_, body, line, col) -> infer_test_body(file, env, prelude_len, recs,
+      op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
+      [], body, d, line, col)
+    DBench(_, body, line, col) -> infer_test_body(file, env, prelude_len, recs,
+      op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
+      [], body, d, line, col)
+    DCheck(_, ps, body, line, col) -> infer_test_body(file, env, prelude_len, recs,
+      op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
+      ps, body, d, line, col)
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [] }
+  }
+}
+
+# Issue #758: type-check a `test` / `bench` / `check` body so the typed
+# AST it produces carries resolved callees (`EModCall`) for downstream
+# passes. Mirrors the paramless-`fn` slice of `infer_decl`'s DFn arm:
+# install the proto-impl + sum registries, add any `check` params to
+# scope, `synth` the body, then absorb the body's builtin effects the
+# way `main` does (the test runner installs those defaults). The decl
+# shape itself is returned unchanged with its now-typed body.
+fn infer_test_body(file: String, env: TyEnv, prelude_len: Int,
+                   recs: [RecInfo], op_eff_arities: [OpEffArity],
+                   type_aliases: [AliasResult], op_to_eff: [OpToEff],
+                   sums: [SumInfo], proto_impls: [ProtoImplReg],
+                   all_decls: [Decl], ps: [Param], body: Expr,
+                   d: Decl, line: Int, col: Int) : TypedDecl / Console + File {
+  let st_init0 = infer_state_new_full_aliases(file, env, prelude_len, recs,
+                                                op_eff_arities, type_aliases, op_to_eff)
+  let st_init1 = st_set_proto_impls(st_init0, proto_impls)
+  let st_init = st_set_sums(st_init1, sums)
+  let added = add_infer_params_with_binds(st_init, ps, [], [])
+  let rb = synth(added.st, body)
+  # A test/bench/check body has no declared row; absorb the builtin
+  # effects it performs exactly as `main` does (the runner installs the
+  # same default handlers). `check_body_row`'s REmpty branch keys this
+  # absorption on `fname == "main"`.
+  let st2 = check_body_row(rb.st, "main", REmpty, line, col, all_decls)
+  let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
+  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
+  let final_body = finalise_typed_expr(st2.sub, rb.expr)
+  TypedDecl {
+    decl: test_decl_with_body(d, final_body),
+    errs: st2.errs,
+    insts: resolved,
+    holes: hole_reports,
+    row_holes: [],
+    diags: finalize_diags(st2.diags)
+  }
+}
+
+# Rebuild a DTest / DBench / DCheck decl with its body replaced by the
+# typed one. Other decl shapes are returned unchanged (never reached —
+# `infer_test_body` is only called on the three test-like shapes).
+fn test_decl_with_body(d: Decl, body: Expr) : Decl {
+  match d {
+    DTest(desc, _, l, c)      -> DTest(desc, body, l, c)
+    DBench(desc, _, l, c)     -> DBench(desc, body, l, c)
+    DCheck(desc, ps, _, l, c) -> DCheck(desc, ps, body, l, c)
+    _                         -> d
   }
 }
 
