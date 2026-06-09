@@ -11116,6 +11116,146 @@ static void *kai_llvm_module_new(KaiValue *name) {
     return (void *) m;
 }
 
+/* === Parte B — the native backend context (handles live OUTSIDE the RC
+ * regime). ===========================================================
+ *
+ * The walk threads a lot of LLVM handles (module, builder, the cached
+ * types, the current function, and per-function register / basic-block
+ * tables). A handle is a raw LLVM pointer, NOT a `KaiValue *`: it carries
+ * no refcount. The production kaic2 is compiled by the type-BLIND kaic1,
+ * whose `kai_record` / list constructors `kai_incref` every field — which
+ * on a handle dereferences an LLVM pointer's non-existent `->rc` and
+ * corrupts it (the asu-reviewed "risk #1"). The defence is
+ * representational: NO handle ever enters a kaikai record or list. ALL
+ * backend state lives in THIS C struct, reached through one opaque
+ * `:Handle` the kaikai walk passes around (excluded from Perceus as a
+ * `:Handle` param). The register / block tables — `String -> handle` —
+ * therefore live here in C (the same off-RC vehicle as the arg buffer),
+ * with names `strdup`'d (never a borrowed kaikai pointer kept past the
+ * statement) and reset per function (arena-style). The tables store + return
+ * handles (stable LLVM pointers), never pointers into the table itself. */
+typedef struct { char *name; void *alloca; int slot; } KaiNReg;
+typedef struct { char *label; void *bb; } KaiNBlk;
+typedef struct {
+    void *m, *b, *ptrt, *i64t, *i32t, *voidt, *f64t, *fnval;
+    KaiNReg *regs; int nregs, regcap;
+    KaiNBlk *blks; int nblks, blkcap;
+    int ok;
+    int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
+} KaiNativeCtx;
+
+static void *kai_native_ctx_new(void *m) {
+    KaiNativeCtx *c = (KaiNativeCtx *) calloc(1, sizeof(KaiNativeCtx));
+    c->m = m;
+    c->b = LLVMCreateBuilderInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) m);
+    c->ptrt = LLVMPointerTypeInContext(ctx, 0);
+    c->i64t = LLVMInt64TypeInContext(ctx);
+    c->i32t = LLVMInt32TypeInContext(ctx);
+    c->voidt = LLVMVoidTypeInContext(ctx);
+    c->f64t = LLVMDoubleTypeInContext(ctx);
+    c->fnval = NULL;
+    c->regs = NULL; c->nregs = 0; c->regcap = 0;
+    c->blks = NULL; c->nblks = 0; c->blkcap = 0;
+    c->ok = 1; c->in_fn = 0;
+    return (void *) c;
+}
+static void *kai_native_ctx_b(void *c)     { return ((KaiNativeCtx *) c)->b; }
+static void *kai_native_ctx_m(void *c)     { return ((KaiNativeCtx *) c)->m; }
+static void *kai_native_ctx_ptrt(void *c)  { return ((KaiNativeCtx *) c)->ptrt; }
+static void *kai_native_ctx_i64t(void *c)  { return ((KaiNativeCtx *) c)->i64t; }
+static void *kai_native_ctx_i32t(void *c)  { return ((KaiNativeCtx *) c)->i32t; }
+static void *kai_native_ctx_voidt(void *c) { return ((KaiNativeCtx *) c)->voidt; }
+static void *kai_native_ctx_f64t(void *c) { return ((KaiNativeCtx *) c)->f64t; }
+/* An f64 constant from a raw `double` (the caller unboxes the `KRealV`
+ * payload — `->as.r` — so the prim takes the scalar directly, matching the
+ * unbox-pass / stage-1 `AReal` marshalling. Avoids a boxed-Real param that
+ * the C-direct unbox pass would `->as.r` anyway, mismatching the type). */
+static void *kai_llvm_const_real(void *f64ty, double d) {
+    return (void *) LLVMConstReal((LLVMTypeRef) f64ty, d);
+}
+static void *kai_native_ctx_fnval(void *c) { return ((KaiNativeCtx *) c)->fnval; }
+static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { ((KaiNativeCtx *) c)->fnval = fn; return kai_unit(); }
+static int64_t kai_native_ctx_ok(void *c)  { return ((KaiNativeCtx *) c)->ok ? 1 : 0; }
+static KaiValue *kai_native_ctx_fail(void *c) { ((KaiNativeCtx *) c)->ok = 0; return kai_unit(); }
+
+/* Reset the per-function register + block tables (arena: free the strdup'd
+ * names, keep the buffers for reuse). `in_fn` guards against compiling a
+ * function inside another (would clobber `fnval`/tables) — fail loud. */
+static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->in_fn) { fprintf(stderr, "kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
+    for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
+    for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
+    c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1;
+    return kai_unit();
+}
+static KaiValue *kai_native_ctx_end_fn(void *cv) { ((KaiNativeCtx *) cv)->in_fn = 0; return kai_unit(); }
+
+static KaiValue *kai_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, int64_t slot) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->nregs == c->regcap) {
+        c->regcap = c->regcap ? c->regcap * 2 : 16;
+        c->regs = (KaiNReg *) realloc(c->regs, (size_t) c->regcap * sizeof(KaiNReg));
+    }
+    c->regs[c->nregs].name = strdup(name->as.s.bytes);
+    c->regs[c->nregs].alloca = alloca;
+    c->regs[c->nregs].slot = (int) slot;
+    c->nregs++;
+    if (name) kai_decref(name);
+    return kai_unit();
+}
+/* Returns the alloca handle, or NULL if absent. The slot is read
+ * separately (`reg_slot`) so the two stay one source. */
+static void *kai_native_ctx_find_reg(void *cv, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    void *r = NULL;
+    for (int i = 0; i < c->nregs; i++)
+        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { r = c->regs[i].alloca; break; }
+    if (name) kai_decref(name);
+    return r;
+}
+static int64_t kai_native_ctx_reg_slot(void *cv, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    int64_t s = -1;
+    for (int i = 0; i < c->nregs; i++)
+        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { s = c->regs[i].slot; break; }
+    if (name) kai_decref(name);
+    return s;
+}
+/* The alloca of the i-th register (params are collected first, in order,
+ * so `pN` of a tcrec reloop selects the N-th register). NULL if out of
+ * range. */
+static void *kai_native_ctx_reg_at(void *cv, int64_t i) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return (i >= 0 && i < c->nregs) ? c->regs[i].alloca : NULL;
+}
+static KaiValue *kai_native_ctx_add_block(void *cv, KaiValue *label, void *bb) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->nblks == c->blkcap) {
+        c->blkcap = c->blkcap ? c->blkcap * 2 : 16;
+        c->blks = (KaiNBlk *) realloc(c->blks, (size_t) c->blkcap * sizeof(KaiNBlk));
+    }
+    c->blks[c->nblks].label = strdup(label->as.s.bytes);
+    c->blks[c->nblks].bb = bb;
+    c->nblks++;
+    if (label) kai_decref(label);
+    return kai_unit();
+}
+static void *kai_native_ctx_find_block(void *cv, KaiValue *label) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    void *r = NULL;
+    for (int i = 0; i < c->nblks; i++)
+        if (strcmp(c->blks[i].label, label->as.s.bytes) == 0) { r = c->blks[i].bb; break; }
+    if (label) kai_decref(label);
+    return r;
+}
+/* The first block (the loop header a tcrec back-edge branches to). */
+static void *kai_native_ctx_first_block(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return c->nblks > 0 ? c->blks[0].bb : NULL;
+}
+
 /* --- types (in the module's context) --- */
 static void *kai_llvm_int64_type(void *m) {
     return (void *) LLVMInt64TypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
@@ -11182,6 +11322,275 @@ static KaiValue *kai_llvm_build_ret_void(void *b) {
     return kai_unit();
 }
 
+/* === Parte B: the generic KIR walk's C-API surface ===================
+ * The spine (above) builds `main -> 42`. The generic walk needs the rest
+ * of the IRBuilder surface: N-ary fn types + calls, the alloca/load/store
+ * model (every named KIR register is an entry-block alloca, mem2reg
+ * promotes it — asu review), the control terminators (br/condbr/switch),
+ * constants, globals, and a few raw readers. Handles stay raw `void *`,
+ * never boxed, never RC. */
+
+/* --- N-ary function types ---
+ * An arg buffer is a heap `void *[]` of LLVM handles the kaikai side
+ * fills push-by-push (a `[Handle]` list cannot carry non-RC handles —
+ * the list would dup/drop them — so the buffer lives in C, off the RC
+ * regime). `cap` grows geometrically; `n` is the live count. */
+typedef struct { void **xs; int64_t n; int64_t cap; } KaiLlvmBuf;
+static void *kai_llvm_buf_new(void) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) malloc(sizeof(KaiLlvmBuf));
+    bf->cap = 8; bf->n = 0;
+    bf->xs = (void **) malloc((size_t) bf->cap * sizeof(void *));
+    return (void *) bf;
+}
+static KaiValue *kai_llvm_buf_push(void *buf, void *h) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    if (bf->n == bf->cap) {
+        bf->cap *= 2;
+        bf->xs = (void **) realloc(bf->xs, (size_t) bf->cap * sizeof(void *));
+    }
+    bf->xs[bf->n++] = h;
+    return kai_unit();
+}
+static KaiValue *kai_llvm_buf_free(void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    free(bf->xs); free(bf);
+    return kai_unit();
+}
+/* The live count + the i-th handle of a buffer (the off-RC replacement
+ * for `list_length` / indexing on a `[Handle]` list). */
+static int64_t kai_llvm_buf_len(void *buf) { return ((KaiLlvmBuf *) buf)->n; }
+static void *kai_llvm_buf_get(void *buf, int64_t i) { return ((KaiLlvmBuf *) buf)->xs[i]; }
+/* A function type `ret (params...)` whose param-type handles are in `buf`. */
+static void *kai_llvm_fn_type_n(void *ret, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret,
+                                     (LLVMTypeRef *) bf->xs, (unsigned) bf->n, 0);
+}
+/* `n` copies of one pointer type, for the all-boxed fn signatures the
+ * KIR lowers (every param/return is `ptr`). */
+static void *kai_llvm_fn_type_boxed(void *ptr_t, int64_t n) {
+    LLVMTypeRef stack[16];
+    LLVMTypeRef *ps = stack;
+    LLVMTypeRef *heap = NULL;
+    if (n > 16) { heap = (LLVMTypeRef *) malloc((size_t) n * sizeof(LLVMTypeRef)); ps = heap; }
+    for (int64_t i = 0; i < n; i++) ps[i] = (LLVMTypeRef) ptr_t;
+    LLVMTypeRef t = LLVMFunctionType((LLVMTypeRef) ptr_t, ps, (unsigned) n, 0);
+    if (heap) free(heap);
+    return (void *) t;
+}
+/* An N-ary call to a known function value (the args are in `buf`). */
+static void *kai_llvm_build_call_n(void *b, void *fn, void *fnty, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, (LLVMValueRef *) bf->xs,
+                                   (unsigned) bf->n, "");
+}
+
+/* --- function lookup / declaration ---
+ * Resolve a function by name; declare it (no body) if absent. The walk
+ * uses this for runtime externs (`kaix_*`) and forward references to
+ * user fns the module defines later. `LLVMGetNamedFunction` returns NULL
+ * when absent, so a miss adds the declaration with the given type. */
+static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *name, void *fnty) {
+    LLVMValueRef fn = LLVMGetNamedFunction((LLVMModuleRef) m, name->as.s.bytes);
+    /* LLVMGetNamedFunction consults the module's ValueSymbolTable, which on
+     * LLVM 22 does NOT reliably index functions created earlier in this same
+     * walk (it returned NULL for a function the GetFirst/GetNext iterator
+     * still found in the module — the VST lazily de-syncs after many adds).
+     * Fall back to a linear scan (the iterator IS authoritative) so a
+     * forward-declared fn is reused, not re-added under a `.N` suffix. */
+    if (fn == NULL) {
+        for (LLVMValueRef g = LLVMGetFirstFunction((LLVMModuleRef) m); g; g = LLVMGetNextFunction(g)) {
+            if (strcmp(LLVMGetValueName(g), name->as.s.bytes) == 0) { fn = g; break; }
+        }
+    }
+    if (fn == NULL) fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    if (name) kai_decref(name);
+    return (void *) fn;
+}
+/* The i-th parameter value of a function (PDirect param reads). */
+static void *kai_llvm_get_param(void *fn, int64_t i) {
+    return (void *) LLVMGetParam((LLVMValueRef) fn, (unsigned) i);
+}
+/* An `[n x elem]` array type — the stack buffer a runtime ctor reads
+ * `args[i]` from (a `KaiValue*[]`, so `elem` is `ptr`). */
+static void *kai_llvm_array_type(void *elem, int64_t n) {
+    return (void *) LLVMArrayType((LLVMTypeRef) elem, (unsigned) n);
+}
+/* `getelementptr [n x elem], ptr arr, i32 0, i32 idx` — the address of
+ * the idx-th element of an alloca'd array. Two indices: the leading 0
+ * steps through the array pointer, `idx` selects the element. */
+static void *kai_llvm_build_array_gep(void *b, void *arrty, void *arr, void *idx) {
+    LLVMValueRef ixs[2];
+    /* The leading 0 index must be an i32 in the SAME context as the
+     * module — `LLVMInt32Type()` is the global context, which on a
+     * private-context module yields a cross-context Value* the verifier
+     * crashes on. Derive the context from the array type. */
+    LLVMContextRef ctx = LLVMGetTypeContext((LLVMTypeRef) arrty);
+    ixs[0] = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0);
+    ixs[1] = (LLVMValueRef) idx;
+    return (void *) LLVMBuildGEP2((LLVMBuilderRef) b, (LLVMTypeRef) arrty,
+                                  (LLVMValueRef) arr, ixs, 2, "");
+}
+/* `args[i]` of a thunk's `KaiValue** args` param: `getelementptr ptr,
+ * ptr args, i64 i` then `load ptr`. One index (a plain pointer, not an
+ * array alloca), so a single-index GEP over the element type `ptrt`. */
+static void *kai_llvm_build_load_arg(void *b, void *args, void *ptrt, int64_t i) {
+    LLVMContextRef ctx = LLVMGetTypeContext((LLVMTypeRef) ptrt);
+    LLVMValueRef idx = LLVMConstInt(LLVMInt64TypeInContext(ctx), (unsigned long long) i, 0);
+    LLVMValueRef slot = LLVMBuildGEP2((LLVMBuilderRef) b, (LLVMTypeRef) ptrt,
+                                      (LLVMValueRef) args, &idx, 1, "");
+    return (void *) LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ptrt, slot, "");
+}
+
+/* --- the alloca / load / store model (asu review: every named register
+ * is an entry-block alloca; mem2reg promotes it to SSA+phi). --- */
+static void *kai_llvm_build_alloca(void *b, void *ty, KaiValue *name) {
+    LLVMValueRef a = LLVMBuildAlloca((LLVMBuilderRef) b, (LLVMTypeRef) ty, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
+static KaiValue *kai_llvm_build_store(void *b, void *val, void *ptr) {
+    LLVMBuildStore((LLVMBuilderRef) b, (LLVMValueRef) val, (LLVMValueRef) ptr);
+    return kai_unit();
+}
+static void *kai_llvm_build_load(void *b, void *ty, void *ptr) {
+    return (void *) LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ty, (LLVMValueRef) ptr, "");
+}
+/* Position the builder at the START of a block (allocas must precede the
+ * block's other instructions to stay promotable + static). */
+static KaiValue *kai_llvm_position_at_start(void *b, void *bb) {
+    LLVMValueRef first = LLVMGetFirstInstruction((LLVMBasicBlockRef) bb);
+    if (first) LLVMPositionBuilderBefore((LLVMBuilderRef) b, first);
+    else LLVMPositionBuilderAtEnd((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+
+/* --- control terminators --- */
+static KaiValue *kai_llvm_build_br(void *b, void *bb) {
+    LLVMBuildBr((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_cond_br(void *b, void *cond, void *then_bb, void *else_bb) {
+    LLVMBuildCondBr((LLVMBuilderRef) b, (LLVMValueRef) cond,
+                    (LLVMBasicBlockRef) then_bb, (LLVMBasicBlockRef) else_bb);
+    return kai_unit();
+}
+static void *kai_llvm_build_switch(void *b, void *val, void *default_bb, int64_t ncases) {
+    return (void *) LLVMBuildSwitch((LLVMBuilderRef) b, (LLVMValueRef) val,
+                                    (LLVMBasicBlockRef) default_bb, (unsigned) ncases);
+}
+static KaiValue *kai_llvm_add_case(void *sw, void *onval, void *bb) {
+    LLVMAddCase((LLVMValueRef) sw, (LLVMValueRef) onval, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_unreachable(void *b) {
+    LLVMBuildUnreachable((LLVMBuilderRef) b);
+    return kai_unit();
+}
+/* `icmp ne i32 %v, 0` → i1 — turn a `kaix_truthy` i32 result (0/1) into
+ * the i1 a `condbr` needs. */
+static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *i32ty) {
+    LLVMValueRef zero = LLVMConstInt((LLVMTypeRef) i32ty, 0, 0);
+    return (void *) LLVMBuildICmp((LLVMBuilderRef) b, LLVMIntNE, (LLVMValueRef) v, zero, "");
+}
+
+/* --- constants + globals --- */
+static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
+    return (void *) LLVMConstInt((LLVMTypeRef) i32ty, (unsigned long long) v, 1);
+}
+/* A null `ptr` — the boxed unit/placeholder a join slot starts at before
+ * a branch stores into it (it is always overwritten before a read). */
+static void *kai_llvm_const_null(void *ptr_t) {
+    return (void *) LLVMConstNull((LLVMTypeRef) ptr_t);
+}
+/* An `i8*` to a private global string constant. Two callers, two shapes:
+ *  - a constructor / record-field NAME (a bare identifier, no quotes) —
+ *    used as the `const char *name` a runtime ctor takes;
+ *  - a `KStrV` source SPAN (quote-wrapped, with `\n`/`\t`/`\"`/`\\`/`\r`
+ *    escapes) — the literal a `kaix_str(...)` boxes.
+ * `kai_llvm_build_global_string` takes the bare form verbatim;
+ * `kai_llvm_build_string_span` strips the outer quotes and decodes the
+ * escapes (the C-direct oracle leans on the C compiler to do this for
+ * `kai_str("...")`; we replicate that decode here, since the in-process
+ * path has no intermediate C compiler). The builder must be positioned
+ * in a block; the global is module-level + private. */
+static void *kai_llvm_build_global_string(void *b, KaiValue *s) {
+    /* A module-level private `[N x i8] c"..."` constant, NOT a builder
+     * instruction. `LLVMBuildGlobalStringPtr` inserts a GEP into the
+     * current block and, on LLVM 22 with opaque pointers + a private
+     * context, produced an unserialisable value (the module crashed in
+     * the printer/verifier). Mirror the mature LLVM-text emitter: add the
+     * global directly to the module and hand back its pointer — the i8
+     * array type comes from the builder's context so nothing is
+     * cross-context. The runtime ctor reads the bytes as `const char *`. */
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock((LLVMBuilderRef) b);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
+    LLVMModuleRef m = LLVMGetGlobalParent(fn);
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    const char *bytes = s->as.s.bytes;
+    unsigned len = (unsigned) strlen(bytes);
+    LLVMValueRef init = LLVMConstStringInContext(ctx, bytes, len, 0); /* NUL-terminated */
+    LLVMValueRef g = LLVMAddGlobal(m, LLVMTypeOf(init), "str");
+    LLVMSetInitializer(g, init);
+    LLVMSetGlobalConstant(g, 1);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddr(g, 1);
+    if (s) kai_decref(s);
+    return (void *) g;
+}
+static void *kai_llvm_build_string_span(void *b, KaiValue *s) {
+    const char *raw = s->as.s.bytes;
+    size_t rn = strlen(raw);
+    /* Strip a single pair of outer quotes if present (a KStrV span is
+     * `"..."`; a triple-quoted span is `"""..."""` — handle both). */
+    size_t lo = 0, hi = rn;
+    if (rn >= 6 && raw[0] == '"' && raw[1] == '"' && raw[2] == '"' &&
+        raw[rn-1] == '"' && raw[rn-2] == '"' && raw[rn-3] == '"') { lo = 3; hi = rn - 3; }
+    else if (rn >= 2 && raw[0] == '"' && raw[rn-1] == '"') { lo = 1; hi = rn - 1; }
+    char *buf = (char *) malloc(hi - lo + 1);
+    size_t w = 0;
+    for (size_t i = lo; i < hi; i++) {
+        if (raw[i] == '\\' && i + 1 < hi) {
+            char c = raw[++i];
+            switch (c) {
+                case 'n': buf[w++] = '\n'; break;
+                case 't': buf[w++] = '\t'; break;
+                case 'r': buf[w++] = '\r'; break;
+                case '0': buf[w++] = '\0'; break;
+                case '"': buf[w++] = '"';  break;
+                case '\\': buf[w++] = '\\'; break;
+                default: buf[w++] = c; break;   /* unknown escape: keep the char */
+            }
+        } else {
+            buf[w++] = raw[i];
+        }
+    }
+    buf[w] = '\0';
+    /* Module-level private constant (NOT a builder instruction) — same
+     * fix as `kai_llvm_build_global_string`: `LLVMBuildGlobalStringPtr`
+     * yields an unserialisable value on LLVM 22 opaque-ptr + private
+     * context. `w` is the de-escaped length (an embedded `\0` is kept). */
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock((LLVMBuilderRef) b);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
+    LLVMModuleRef m = LLVMGetGlobalParent(fn);
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    LLVMValueRef init = LLVMConstStringInContext(ctx, buf, (unsigned) w, 0);
+    LLVMValueRef g = LLVMAddGlobal(m, LLVMTypeOf(init), "str");
+    LLVMSetInitializer(g, init);
+    LLVMSetGlobalConstant(g, 1);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddr(g, 1);
+    free(buf);
+    if (s) kai_decref(s);
+    return (void *) g;
+}
+
+/* (The `i32 variant_tag` reader the emitted object calls for a `KTagOf`
+ * — `kaix_variant_tag_of` — is a RUNTIME symbol in stage0/runtime_llvm.c
+ * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
+ * object links it, the compiler does not call it.) */
+
 /* --- object emission --- */
 /* Verify the module, then emit it as a native object file at `path`
  * using the host target machine. Returns 0 on success, non-zero on a
@@ -11212,9 +11621,13 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
         if (path) kai_decref(path);
         return 1;
     }
+    char *cpu = LLVMGetHostCPUName();
+    char *features = LLVMGetHostCPUFeatures();
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
-        target, triple, "", "",
+        target, triple, cpu ? cpu : "", features ? features : "",
         LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
+    if (cpu) LLVMDisposeMessage(cpu);
+    if (features) LLVMDisposeMessage(features);
     LLVMSetTarget((LLVMModuleRef) m, triple);
     LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
 
@@ -11245,6 +11658,29 @@ static void *kai_llvm_native_unavailable(void) {
     return NULL;
 }
 static void *kai_llvm_module_new(KaiValue *name) { (void) name; return kai_llvm_native_unavailable(); }
+/* Parte B native-context stubs. */
+static void *kai_native_ctx_new(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_b(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_m(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_ptrt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i32t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_voidt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_f64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_real(void *t, double d) { (void) t; (void) d; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_fnval(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_ctx_fail(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_begin_fn(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_end_fn(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_add_reg(void *c, KaiValue *n, void *a, int64_t s) { (void) c; (void) n; (void) a; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_native_ctx_find_reg(void *c, KaiValue *n) { (void) c; (void) n; return kai_llvm_native_unavailable(); }
+static int64_t kai_native_ctx_reg_slot(void *c, KaiValue *n) { (void) c; (void) n; kai_llvm_native_unavailable(); return -1; }
+static void *kai_native_ctx_reg_at(void *c, int64_t i) { (void) c; (void) i; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_native_ctx_add_block(void *c, KaiValue *l, void *bb) { (void) c; (void) l; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_native_ctx_find_block(void *c, KaiValue *l) { (void) c; (void) l; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_first_block(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_int64_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_int32_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_ptr_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
@@ -11260,6 +11696,34 @@ static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) { (void) b; (v
 static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) { (void) b; (void) fn; (void) fnty; (void) a0; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_ret(void *b, void *v) { (void) b; (void) v; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_build_ret_void(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
+/* Parte B generic-walk stubs (same contract: link, then abort on use). */
+static void *kai_llvm_fn_type_boxed(void *p, int64_t n) { (void) p; (void) n; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_n(void *r, void *buf) { (void) r; (void) buf; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_n(void *b, void *fn, void *t, void *buf) { (void) b; (void) fn; (void) t; (void) buf; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_position_at_start(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *nm, void *t) { (void) m; (void) nm; (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_param(void *fn, int64_t i) { (void) fn; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_array_type(void *el, int64_t n) { (void) el; (void) n; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_array_gep(void *b, void *t, void *a, void *i) { (void) b; (void) t; (void) a; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_load_arg(void *b, void *a, void *t, int64_t i) { (void) b; (void) a; (void) t; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_buf_new(void) { return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_buf_push(void *buf, void *h) { (void) buf; (void) h; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_buf_free(void *buf) { (void) buf; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_llvm_buf_len(void *buf) { (void) buf; kai_llvm_native_unavailable(); return 0; }
+static void *kai_llvm_buf_get(void *buf, int64_t i) { (void) buf; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_i32(void *t, int64_t v) { (void) t; (void) v; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_null(void *t) { (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_load(void *b, void *t, void *p) { (void) b; (void) t; (void) p; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_br(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_cond_br(void *b, void *c, void *t, void *e) { (void) b; (void) c; (void) t; (void) e; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_switch(void *b, void *v, void *d, int64_t n) { (void) b; (void) v; (void) d; (void) n; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_add_case(void *sw, void *on, void *bb) { (void) sw; (void) on; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_unreachable(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
 #endif /* KAI_LLVM */
 

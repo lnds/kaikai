@@ -1,0 +1,293 @@
+# compiler/emit_native_term.kai — the KFn driver + terminators of the
+# in-process libLLVM native backend (KIR Lane 1.2 Parte B).
+#
+# `emit_native_fn.kai` = ctx state + atoms + pass-1 helpers;
+# `emit_native_ops.kai` = ops + symbol resolution. THIS file ties them
+# together: `nemit_fn` drives one KFn (two passes), `nemit_fill_blocks`
+# runs pass 2, `nemit_stmt` lowers a statement, `nemit_term` lowers a
+# terminator. All imperative over `ctx: Handle`.
+#
+# The TCO subtlety (asu "allocas in entry only" rule, concrete): the
+# alloca-entry block holds ONLY allocas + param seeds + a branch to the
+# first KIR block; the KIR blocks live in their own LLVM blocks. So a
+# `KTcrecGoto` back-edge re-stores the param allocas and branches to the
+# FIRST KIR block (the loop header) — never re-running the allocas (which
+# would grow the fiber stack per iteration). The synthetic
+# `_kai_<sym>_entry` label the tcrec names resolves to that first block.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+
+# --- one KFn → an LLVM function ----------------------------------------
+
+# Lower `f` into the module. The fn was declared up front (forward refs);
+# re-resolve by symbol. `begin_fn` resets the per-fn reg/block tables
+# (arena). Pass 1 creates the KIR blocks + allocas; the alloca-entry
+# branches to the first KIR block; pass 2 fills each block. A
+# `KFnLambda`/`KFnClause` (thunk ABI) is a later subset — abort loudly.
+pub fn nemit_fn(ctx: Handle, f: KFn) : Unit / Console = match f.kind {
+  KFnNormal -> nemit_fn_with(ctx, f, false)
+  KFnLambda -> nemit_fn_with(ctx, f, true)
+  # A handler clause rides the effects ABI (resume continuation) — a
+  # later subset; abort loudly.
+  KFnClause -> nemit_unsupported(ctx, cat2("clause fn (effects = subset 2): ", f.sym))
+}
+
+# Lower one fn. A normal fn takes its params directly (`ptr (ptr × n)`);
+# a lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)` and
+# reads params/captures by index. The block-building + alloca prologue
+# are identical; only the LLVM signature and the param-seed differ.
+fn nemit_fn_with(ctx: Handle, f: KFn, is_thunk: Bool) : Unit / Console = {
+  let fnval = if is_thunk { nemit_declare_thunk(ctx, f.sym) }
+              else { llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params))) }
+  native_ctx_begin_fn(ctx, fnval)
+  let aentry = llvm_append_block(native_ctx_m(ctx), fnval, "alloca.entry")
+  nemit_make_blocks(ctx, fnval, f.blocks)
+  let first_kblock = native_ctx_first_block(ctx)
+  llvm_position_at_end(native_ctx_b(ctx), aentry)
+  nemit_allocas(ctx, collect_fn_specs(f))
+  if is_thunk { nemit_seed_thunk_params(ctx, f.params, fnval) }
+  else { nemit_seed_params(ctx, f.params, fnval) }
+  llvm_build_br(native_ctx_b(ctx), first_kblock)
+  nemit_fill_blocks(ctx, f.blocks)
+  native_ctx_end_fn(ctx)
+}
+
+# Declare a lambda thunk `ptr (ptr self, ptr* args, i32 n)`.
+fn nemit_declare_thunk(ctx: Handle, sym: String) : Handle = {
+  let p = native_ctx_ptrt(ctx)
+  let tb = llvm_buf_new(); llvm_buf_push(tb, p); llvm_buf_push(tb, p); llvm_buf_push(tb, native_ctx_i32t(ctx))
+  let fnty = llvm_fn_type_n(p, tb); llvm_buf_free(tb)
+  llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
+}
+
+# Seed a thunk's params: a `PDirect(i)` reads `args[i]`; a `PCapture(j)`
+# reads `kaix_capture(self, j)`. `self` is param 0, `args` is param 1.
+# (A `PResume`/`PEvidence` is clause-only — a later subset, abort.)
+fn nemit_seed_thunk_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = {
+  let self_v = llvm_get_param(fnval, 0)
+  let args_v = llvm_get_param(fnval, 1)
+  nemit_seed_thunk_loop(ctx, ps, self_v, args_v)
+}
+fn nemit_seed_thunk_loop(ctx: Handle, ps: [KParam], self_v: Handle, args_v: Handle) : Unit / Console = match ps {
+  [] -> ()
+  [p, ...rest] -> {
+    match p.origin {
+      PDirect(i)  -> nemit_store_reg(ctx, p.name, llvm_build_load_arg(native_ctx_b(ctx), args_v, native_ctx_ptrt(ctx), i))
+      # `kaix_capture(ptr self, i32 j) -> ptr` reads the j-th capture.
+      PCapture(j) -> nemit_store_reg(ctx, p.name,
+        ncall_sig2(ctx, "kaix_capture", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx),
+                   self_v, llvm_const_i32(native_ctx_i32t(ctx), j)))
+      _ -> nemit_unsupported(ctx, "thunk param origin (resume/evidence = subset 2)")
+    }
+    nemit_seed_thunk_loop(ctx, rest, self_v, args_v)
+  }
+}
+
+# Create one LLVM basic block per KIR block (so a terminator can name a
+# not-yet-filled successor), recording each in the ctx block table.
+fn nemit_make_blocks(ctx: Handle, fnval: Handle, bs: [KBlock]) : Unit = match bs {
+  [] -> ()
+  [b, ...rest] -> {
+    let bb = llvm_append_block(native_ctx_m(ctx), fnval, b.label)
+    native_ctx_add_block(ctx, b.label, bb)
+    nemit_make_blocks(ctx, fnval, rest)
+  }
+}
+
+# --- pass 2: fill each block's statements + terminator -----------------
+
+fn nemit_fill_blocks(ctx: Handle, bs: [KBlock]) : Unit / Console = match bs {
+  [] -> ()
+  [b, ...rest] -> {
+    llvm_position_at_end(native_ctx_b(ctx), native_ctx_find_block(ctx, b.label))
+    nemit_stmts(ctx, b.stmts)
+    nemit_term(ctx, b.term)
+    nemit_fill_blocks(ctx, rest)
+  }
+}
+
+fn nemit_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
+  [] -> ()
+  [s, ...rest] -> { nemit_stmt(ctx, s); nemit_stmts(ctx, rest) }
+}
+
+# --- statements ---------------------------------------------------------
+
+# `KLet` evaluates its op and stores the result; `KDo` evaluates for
+# effect; `KStore` writes a slot; `KRC` is a dup/drop runtime call.
+# Effect frame markers (`KInstall`/`KPop`) are a later subset.
+# A value emitted purely for effect (`KDo`, an RC op) yields a result
+# Handle the walk discards. It MUST be captured in a `let h = <handle-fn>`
+# binding — a bare `nemit_op(ctx, op); ()` leaves the Handle (an LLVM
+# `Value*`) in statement position, where the type-blind kaic1 Perceus
+# would `kai_decref` the discarded value, dereferencing the raw LLVM
+# pointer's non-existent `->rc` and freeing the live instruction (a
+# use-after-free the LLVM verifier hits as a phantom-`phi` crash). The
+# `let h = ...` form rides the handle-binder exclusion (`pcs_rhs_is_handle`
+# in stage1), so `h` never enters Perceus and is never dropped.
+fn nemit_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
+  # Capture the op/atom handle in a `let` (handle-binder exclusion) before
+  # passing it on: a handle passed inline as a call ARGUMENT is RC-managed
+  # by the type-blind kaic1, and a drop of an LLVM `Value*` clobbers its
+  # use-list (a UAF the AsmPrinter hits during codegen). `nemit_op` /
+  # `nemit_atom` are handle-returning, so the `let` keeps each out of
+  # Perceus. (See the KDo / nemit_rc / nemit_push_fields notes.)
+  KLet(n, _, op, _) -> { let h = nemit_op(ctx, op); nemit_store_reg(ctx, n, h) }
+  KDo(op, _)        -> { let _h = nemit_op(ctx, op); () }
+  KStore(n, v, _)   -> { let h = nemit_atom(ctx, v); nemit_store_reg(ctx, n, h) }
+  KRC(rc, _)        -> nemit_rc(ctx, rc)
+  KInstall(_, _, _, _, _) -> nemit_unsupported(ctx, "KInstall (effects = subset 2)")
+  KPop(_, _)        -> nemit_unsupported(ctx, "KPop (effects = subset 2)")
+}
+
+# A Perceus RC op → the runtime dup/drop. The call result is captured in a
+# `let` (see `nemit_stmt`'s KDo note) so the discarded Handle is not
+# Perceus-dropped. Reuse tokens (`KDropReuse`/`KFreeToken`) ride the
+# token-model runtime — a later subset (they arrive with rb-tree reuse).
+fn nemit_rc(ctx: Handle, rc: KRCOp) : Unit / Console = match rc {
+  KDup(v)  -> { let _d = nemit_call1(ctx, "kaix_internal_dup", nemit_atom(ctx, v)); () }
+  KDrop(v) -> { let _d = nemit_call1(ctx, "kaix_internal_drop", nemit_atom(ctx, v)); () }
+  KDropReuse(_) -> nemit_unsupported(ctx, "KDropReuse (reuse tokens = later subset)")
+  KFreeToken(_) -> nemit_unsupported(ctx, "KFreeToken (reuse tokens = later subset)")
+}
+
+# --- terminators --------------------------------------------------------
+
+# Pure control flow (ret/br/condbr/switch/unreachable) + the TCO back-edge
+# (`KTcrecGoto`) are subset 1; effect resume + TRMC + explicit tail calls
+# are later subsets.
+fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
+  KRet(v, _)            -> { llvm_build_ret(native_ctx_b(ctx), nemit_atom(ctx, v)); () }
+  KBr(l, _)             -> { llvm_build_br(native_ctx_b(ctx), native_ctx_find_block(ctx, l)); () }
+  KCondBr(c, tl, el, _) -> nemit_condbr(ctx, c, tl, el)
+  KSwitch(v, cs, def, _) -> nemit_switch(ctx, v, cs, def)
+  KUnreachable(_)       -> { llvm_build_unreachable(native_ctx_b(ctx)); () }
+  KTcrecGoto(l, asg, _, _) -> nemit_tcrec(ctx, l, asg)
+  KTailCall(_, _, _)    -> nemit_unsupported(ctx, "KTailCall (later subset)")
+  KTrmcStep(_, _, _, _, _, _) -> nemit_unsupported(ctx, "KTrmcStep (TRMC = later subset)")
+  KTrmcApply(_, _)      -> nemit_unsupported(ctx, "KTrmcApply (TRMC = later subset)")
+  KResume(_, _, _, _)   -> nemit_unsupported(ctx, "KResume (effects = subset 2)")
+  KResume2(_, _, _, _, _) -> nemit_unsupported(ctx, "KResume2 (effects = subset 2)")
+}
+
+# `condbr`: the cond is a boxed Bool; `kaix_truthy` lowers it to i32 0/1,
+# then `icmp ne 0` to the i1 LLVM wants.
+fn nemit_condbr(ctx: Handle, c: KVal, tl: String, el: String) : Unit / Console = {
+  let cv = nemit_atom(ctx, c)
+  let truthy = nemit_truthy_i32(ctx, cv)
+  let i1 = llvm_build_icmp_ne_zero(native_ctx_b(ctx), truthy, native_ctx_i32t(ctx))
+  llvm_build_cond_br(native_ctx_b(ctx), i1, native_ctx_find_block(ctx, tl), native_ctx_find_block(ctx, el))
+  ()
+}
+
+# `kaix_truthy(ptr) -> i32` — the non-consuming truthiness predicate.
+fn nemit_truthy_i32(ctx: Handle, cv: Handle) : Handle = {
+  let pb = llvm_buf_new(); llvm_buf_push(pb, native_ctx_ptrt(ctx))
+  let fnty = llvm_fn_type_n(native_ctx_i32t(ctx), pb); llvm_buf_free(pb)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), "kaix_truthy", fnty)
+  let buf = llvm_buf_new(); llvm_buf_push(buf, cv)
+  let r = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, buf); llvm_buf_free(buf); r
+}
+
+# `switch` on the raw i32 tag (the KSwitch scrutinee carries SInt32). One
+# case per `KC(tag, label)`; the default block holds the catch-all arm or
+# is unreachable (the lowering decided this).
+fn nemit_switch(ctx: Handle, v: KVal, cs: [KCase], def: String) : Unit / Console = {
+  let tag = nemit_atom(ctx, v)
+  let sw = llvm_build_switch(native_ctx_b(ctx), tag, native_ctx_find_block(ctx, def), list_length(cs))
+  nemit_switch_cases(ctx, sw, cs)
+}
+
+fn nemit_switch_cases(ctx: Handle, sw: Handle, cs: [KCase]) : Unit / Console = match cs {
+  [] -> ()
+  [KC(tag, lbl), ...rest] -> {
+    llvm_add_case(sw, llvm_const_i32(native_ctx_i32t(ctx), tag), native_ctx_find_block(ctx, lbl))
+    nemit_switch_cases(ctx, sw, rest)
+  }
+}
+
+# `KTcrecGoto`: re-store each param alloca from its reloop value, then
+# branch to the first KIR block (the loop header). The synthetic
+# `_kai_<sym>_entry` label always means "the loop header" = the first KIR
+# block. Values are evaluated BEFORE the stores (they read the OLD param
+# values), so collect handles first. The dropmask's RC drops are deferred:
+# subset-1 fixtures are arithmetic loops over already-boxed Ints (tagged
+# immediates, RC no-ops), so the dropmask is a no-op here; a heap-param
+# loop would need the drops (a later subset, flagged).
+fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign]) : Unit / Console = {
+  # Evaluate ALL reloop values FIRST (they read the OLD param values),
+  # into a C buffer — handles never ride a kaikai list (asu "risk #1").
+  # The `[KAssign]` carries the param indices (plain Ints, safe in a
+  # list); the materialised value handles go into `valbuf` in parallel.
+  let valbuf = llvm_buf_new()
+  nemit_eval_assigns(ctx, asg, valbuf)
+  nemit_store_assigns(ctx, asg, valbuf, 0)
+  llvm_buf_free(valbuf)
+  llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
+  ()
+}
+
+# Push each reloop value handle into `valbuf` (left-to-right, reading the
+# OLD param allocas).
+fn nemit_eval_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle) : Unit / Console = match asg {
+  [] -> ()
+  [KAsg(_, v), ...rest] -> { llvm_buf_push(valbuf, nemit_atom(ctx, v)); nemit_eval_assigns(ctx, rest, valbuf) }
+}
+
+# Store each evaluated value into its param alloca. `pN` selects the N-th
+# register (params collected first, in order — see `collect_fn_specs`);
+# `valbuf[i]` is the i-th assign's value, parallel to `asg`.
+fn nemit_store_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle, i: Int) : Unit / Console = match asg {
+  [] -> ()
+  [KAsg(idx, _), ...rest] -> {
+    llvm_build_store(native_ctx_b(ctx), llvm_buf_get(valbuf, i), native_ctx_reg_at(ctx, idx))
+    nemit_store_assigns(ctx, rest, valbuf, i + 1)
+  }
+}
+
+# --- first-class-fn thunks ---------------------------------------------
+#
+# A named fn `S` of arity `k` is referenced as a VALUE (a `KClosure` over
+# it) through a synthetic `_kai_S_thunk(ptr self, ptr* args, i32 n)` that
+# unpacks `args[0..k]` and tail-forwards to the boxed `S(args[0], …)`.
+# The KIR does not model these — they are emitted here, the native mirror
+# of `emit_c.kai`'s `emit_fn_thunk`. (All-boxed: no unboxing, so the body
+# is a plain load-each-arg + call + ret.)
+pub fn nemit_fn_thunks(ctx: Handle, fns: [KFn]) : Unit / Console = match fns {
+  [] -> ()
+  [f, ...rest] -> { match f.kind {
+    KFnNormal -> nemit_one_fn_thunk(ctx, f.sym, list_length(f.params))
+    _ -> ()
+  }; nemit_fn_thunks(ctx, rest) }
+}
+
+# Emit `_kai_<sym>_thunk`: a thunk-ABI forwarder to the boxed fn `sym`.
+fn nemit_one_fn_thunk(ctx: Handle, sym: String, arity: Int) : Unit / Console = {
+  let tsym = cat3("_kai_", sym, "_thunk")
+  let thunkv = nemit_declare_thunk(ctx, tsym)
+  let entry = llvm_append_block(native_ctx_m(ctx), thunkv, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+  let args_v = llvm_get_param(thunkv, 1)
+  let argbuf = llvm_buf_new()
+  nemit_thunk_load_args(ctx, args_v, argbuf, 0, arity)
+  let fnty = llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(sym), fnty)
+  let r = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, argbuf)
+  llvm_buf_free(argbuf)
+  llvm_build_ret(native_ctx_b(ctx), r)
+  ()
+}
+
+# Load `args[0..arity]` into `argbuf` (each a boxed `ptr`).
+fn nemit_thunk_load_args(ctx: Handle, args_v: Handle, argbuf: Handle, i: Int, arity: Int) : Unit / Console =
+  if i >= arity { () }
+  else {
+    let a = llvm_build_load_arg(native_ctx_b(ctx), args_v, native_ctx_ptrt(ctx), i)
+    llvm_buf_push(argbuf, a)
+    nemit_thunk_load_args(ctx, args_v, argbuf, i + 1, arity)
+  }
