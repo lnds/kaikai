@@ -20,6 +20,7 @@ import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
+import compiler.kir_lower_rec
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -399,6 +400,15 @@ fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
     # (kir_lower_lit.kai). Dispatched after the list test so a `PList` never
     # reaches the literal chain.
     else if match_is_literal(arms) { lower_lit_match(x, arms, scrv, st1) }
+    # Record patterns (`{ x: 0, y }`, `{ x, y }`) need a FIELD-TEST decision
+    # tree, not the variant tag-switch: a `PRecord` is not a variant, so its
+    # `arm_tag` is -1 and every record arm would collapse into one default
+    # block with its field binds never projected — an empty `KSwitch` plus a
+    # free `unbound register` the native backend aborts on (kir_lower_rec.kai).
+    # Dispatched after list + literal (a `PRecord` is neither) and before the
+    # variant fallback; a `PVariantRecord` (`Some { x }`) is NOT a `PRecord`,
+    # so it stays on the variant path below.
+    else if match_is_record(arms) { lower_record_match(x, arms, scrv, st1) }
     # The variant tag register carries `SInt32` (the raw `variant_tag`
     # word), NOT `SBoxed`: a `KSwitch` scrutinee must be an integer so the
     # native backend emits a real LLVM `switch`. The repr is decided here,
@@ -483,6 +493,41 @@ fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
       let st_done = lower_branch_into(body, join, lcont, st_body)
       if lit_arm_is_catchall(p) { st_done }
       else { lower_lit_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+    } } }
+}
+
+# `match scr { <record patterns> }`: a field-test fail-chain mirroring the
+# C-direct oracle's `emit_pat_test_record` (a `kai_op_field_borrow` +
+# `kai_op_eq` conjunction per arm) and structurally identical to
+# `lower_lit_match`. Each arm with literal fields emits a conjunction of
+# `condbr (kai_eq_raw (field_borrow scr name) lit)` tests, projects its
+# binding fields on the success path, then lowers its body; an arm with no
+# literal fields is a catch-all that binds its fields and ends the chain.
+# The join slot + `__pcs_scr` alias come from the shared `match_preamble`;
+# the chain ends `KUnreachable` when no catch-all is present (the typer made
+# the match exhaustive, so the final fail is dead, Linus review #3).
+fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, st: LowerSt) : LRes / Console =
+  match match_preamble(x, scrv, st) { LSReg(join, st1) ->
+    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
+      let st3 = lower_record_arms(arms, scrv, join, lcont, st2)
+      LRes(KVar(join), reopen(st3, lcont))
+    } } }
+
+# Lower each record arm in order, exactly like `lower_lit_arms`: the arm's
+# field tests seal the current block into a condbr chain (body vs a fresh
+# fail label); the body lowers into the join + branches to `lcont`; the next
+# arm reopens the fail label. A catch-all arm (a record with no literal
+# fields, or a non-record pattern) matches unconditionally and ends the
+# chain (later arms are dead). With no catch-all the last fail label is
+# sealed `KUnreachable`.
+fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
+                     st: LowerSt) : LowerSt / Console = match arms {
+  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
+    match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
+      let st_done = lower_branch_into(body, join, lcont, st_body)
+      if rec_arm_is_catchall(p) { st_done }
+      else { lower_record_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
     } } }
 }
 
