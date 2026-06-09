@@ -81,7 +81,7 @@ fn nemit_declare_for_abi(ctx: Handle, f: KFn, abi: NFnAbi) : Handle = match abi 
 fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / Console = match abi {
   NFnNormal -> nemit_seed_params(ctx, f.params, fnval)
   NFnLambda -> nemit_seed_thunk_params(ctx, f.params, fnval)
-  NFnClause -> nemit_seed_clause_params(ctx, f.params, fnval)
+  NFnClause -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
 }
 
 # A clause `ptr (ptr self, <PDirect args ptr>, ptr k)`: self + one ptr per
@@ -113,10 +113,28 @@ fn nclause_direct_count(ps: [KParam], acc: Int) : Int = match ps {
 # `k` is what lets the clause body's `resume(...)` resolve. The matching
 # `k` alloca is reserved in the entry head by `nfx_reserve_k` (called from
 # `nemit_fx_allocas` for a clause fn).
-fn nemit_seed_clause_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = {
+fn nemit_seed_clause_params(ctx: Handle, ps: [KParam], stateful: Bool, fnval: Handle) : Unit / Console = {
   let d = nclause_direct_count(ps, 0)
+  # `self` (LLVM param 0) is the dispatched Ev blob. Register it under the
+  # fixed name `__self` so `KResume2` can write the state slot; a stateful
+  # clause also reads the slot into `state` / `log` (the C-direct
+  # `clause_state_prologue` shape) so the body's free `state` resolves.
+  let self_v = llvm_get_param(fnval, 0)
+  nemit_store_reg(ctx, "__self", self_v)
+  nemit_seed_clause_state(ctx, stateful, self_v)
   nemit_seed_clause_loop(ctx, ps, fnval, d)
 }
+
+# Read `self->state` once and bind it under both `state` and the legacy
+# alias `log` (m7b #11) — identical to emit_c's `clause_state_prologue`
+# and emit_llvm's stateful prologue. Stateless clauses skip it entirely.
+fn nemit_seed_clause_state(ctx: Handle, stateful: Bool, self_v: Handle) : Unit / Console =
+  if stateful {
+    let st = ncall_sig1(ctx, "kaix_clause_state_get", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), self_v)
+    nemit_store_reg(ctx, "state", st)
+    nemit_store_reg(ctx, "log", st)
+  } else { () }
+
 fn nemit_seed_clause_loop(ctx: Handle, ps: [KParam], fnval: Handle, d: Int) : Unit / Console = match ps {
   [] -> ()
   [pp, ...rest] -> {
@@ -125,7 +143,7 @@ fn nemit_seed_clause_loop(ctx: Handle, ps: [KParam], fnval: Handle, d: Int) : Un
       PDirect(i) -> nemit_store_reg(ctx, pp.name, llvm_get_param(fnval, 1 + i))
       # `k` is the trailing LLVM param: index = 1 (self) + d (args).
       PResume    -> nemit_store_reg(ctx, "k", llvm_get_param(fnval, 1 + d))
-      _          -> nemit_unsupported(ctx, "clause param origin (state/alias = subset 2b)")
+      _          -> nemit_unsupported(ctx, "clause param origin (alias = subset 2b alias dispatch)")
     }
     nemit_seed_clause_loop(ctx, rest, fnval, d)
   }
@@ -215,7 +233,7 @@ fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl]) : Unit / Console 
   KDo(op, _)        -> { let _h = nemit_op_fx(ctx, op, handlers); () }
   KStore(n, v, _)   -> { let h = nemit_atom(ctx, v); nemit_store_reg(ctx, n, h) }
   KRC(rc, _)        -> nemit_rc(ctx, rc)
-  KInstall(eff, sym, _, _, _) -> nemit_install(ctx, eff, sym, handlers)
+  KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
   KPop(_, _)        -> nemit_pop(ctx)
 }
 
@@ -254,7 +272,7 @@ fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
   KTrmcStep(_, _, _, _, _, _) -> nemit_unsupported(ctx, "KTrmcStep (TRMC = later subset)")
   KTrmcApply(_, _)      -> nemit_unsupported(ctx, "KTrmcApply (TRMC = later subset)")
   KResume(k, v, _, _)   -> nemit_resume(ctx, k, v)
-  KResume2(_, _, _, _, _) -> nemit_unsupported(ctx, "KResume2 (stateful resume = subset 2b)")
+  KResume2(k, v, ns, _, _) -> nemit_resume2(ctx, k, v, ns)
 }
 
 # `condbr`: the cond is a boxed Bool; `kaix_truthy` lowers it to i32 0/1,

@@ -26,18 +26,27 @@ import compiler.emit_native_fx
 # alloca'd, then `kaix_evidence_push_with_jmp(node, eff, ev, jmp, discard)`
 # so the op site can find the landing pad on a discard. `handlers` threads
 # the program's handler decls so the op→clause-thunk map resolves.
-pub fn nemit_install(ctx: Handle, eff: String, sym: String, handlers: [KHandlerDecl]) : Unit / Console =
+pub fn nemit_install(ctx: Handle, eff: String, sym: String, init: Option[KVal], alias: Option[String], handlers: [KHandlerDecl]) : Unit / Console =
   match nfx_find_handler(handlers, sym) {
     None -> nemit_unsupported(ctx, cat2("KInstall: no handler decl for ", sym))
-    Some(h) -> nemit_install_with(ctx, eff, h)
+    Some(h) -> nemit_install_with(ctx, eff, init, alias, h)
   }
 
-fn nemit_install_with(ctx: Handle, eff: String, h: KHandlerDecl) : Unit / Console = {
+fn nemit_install_with(ctx: Handle, eff: String, init: Option[KVal], alias: Option[String], h: KHandlerDecl) : Unit / Console = {
   let ev = native_ctx_find_reg(ctx, nfx_ev_reg(eff))
   # handler_id = kaix_fresh_handler_id() : i64; store into Ev field 0.
   # (i64-returning — NOT the all-boxed `ptr()` `nemit_call0` assumes.)
   let hid = ncall_sig0(ctx, "kaix_fresh_handler_id", native_ctx_i64t(ctx))
   let _h0 = ncall_sig2(ctx, "kaix_ev_set_handler_id", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_i64t(ctx), ev, hid)
+  # Aliased install (`with Eff as a`): box the handler_id and stash it
+  # under `__alias_id__<a>` so an `op@a` perform resolves to THIS instance
+  # by id. Mirrors emit_llvm's sentinel local + the C `kai_alias_<a>_id`.
+  nemit_install_alias(ctx, alias, hid)
+  # Stateful handler: seed the `state` slot (Ev field 2, byte 16) with the
+  # `with Eff(init)` value. `kaix_clause_state_set(ev, init)` writes the
+  # same offset a clause's `resume(v, ns)` later updates. Stateless
+  # handlers carry no `init` — the slot stays NULL (subset 2a unchanged).
+  nemit_install_state(ctx, ev, init)
   # Each op fn-ptr at field (nfx_op_base + i): declare the clause thunk,
   # store its address with kaix_ev_set_op(ev, field, fn).
   nemit_install_ops(ctx, ev, h.op_thunks, 0)
@@ -48,6 +57,29 @@ fn nemit_install_with(ctx: Handle, eff: String, h: KHandlerDecl) : Unit / Consol
   let disc = native_ctx_find_reg(ctx, nfx_discard_reg())
   let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
   nemit_push_with_jmp(ctx, node, effname, ev, jmpbuf, disc)
+}
+
+# Seed the Ev `state` slot from the `with Eff(init)` value (stateful
+# handlers only). `kaix_clause_state_set(ev, init)` writes byte 16 — the
+# same slot the clauses' `resume(v, ns)` later updates. No init = no write.
+fn nemit_install_state(ctx: Handle, ev: Handle, init: Option[KVal]) : Unit / Console = match init {
+  None -> ()
+  Some(iv) -> {
+    let v = nemit_atom(ctx, iv)
+    let _s = ncall_sig2(ctx, "kaix_clause_state_set", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), ev, v)
+    ()
+  }
+}
+
+# Box the freshly-minted handler_id and store it under `__alias_id__<a>`
+# (the alloca reserved by `nfx_reserve_alias`) for an aliased install. An
+# `op@a` perform unboxes it to resolve THIS instance by id. No alias = skip.
+fn nemit_install_alias(ctx: Handle, alias: Option[String], hid: Handle) : Unit / Console = match alias {
+  None -> ()
+  Some(a) -> {
+    let boxed = ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), hid)
+    nemit_store_reg(ctx, nfx_alias_reg(a), boxed)
+  }
 }
 
 # Store each op's clause-thunk address into the Ev blob at its field index.
@@ -93,6 +125,43 @@ pub fn nemit_pop(ctx: Handle) : Unit / Console = {
   let _r = nemit_call0(ctx, "kaix_evidence_pop"); ()
 }
 
+# Split an `<op>@<alias>` tag (the resolver's per-instance dispatch
+# marker). `nfx_op_before_at` returns the bare op; `nfx_op_alias` returns
+# the alias as `Some` when tagged. A local `@`-scan keeps this off the
+# infer module (`string_index_of_at` lives there — importing it would
+# cycle); mirrors emit_c's split semantics (emit_c.kai:2333).
+fn nfx_at_index(s: String) : Int = nfx_at_loop(s, 0, string_length(s))
+fn nfx_at_loop(s: String, i: Int, n: Int) : Int =
+  if i >= n { 0 - 1 }
+  else { if char_at_or_zero(s, i) == '@' { i } else { nfx_at_loop(s, i + 1, n) } }
+fn nfx_op_before_at(op: String) : String = {
+  let at = nfx_at_index(op)
+  if at >= 0 { string_slice(op, 0, at) } else { op }
+}
+fn nfx_op_alias(op: String) : Option[String] = {
+  let at = nfx_at_index(op)
+  if at >= 0 { Some(string_slice(op, at + 1, string_length(op))) } else { None }
+}
+
+# The evidence node a perform dispatches through: by-id for an aliased op
+# (resolve THIS handler instance via the `__alias_id__<a>` sentinel) — the
+# `kaix_evidence_lookup_node` by-name walk would otherwise pick the
+# innermost same-effect handler — else the ordinary by-name lookup.
+fn nemit_perform_node(ctx: Handle, eff: String, alias: Option[String]) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  match alias {
+    Some(a) -> {
+      let boxed = nemit_load_reg(ctx, nfx_alias_reg(a))
+      let id = ncall_sig1(ctx, "kaix_to_int", native_ctx_i64t(ctx), p, boxed)
+      ncall_sig1(ctx, "kaix_evidence_lookup_node_by_id", p, native_ctx_i64t(ctx), id)
+    }
+    None -> {
+      let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+      ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+    }
+  }
+}
+
 # --- KPerform: dispatch an op to its handler clause --------------------
 #
 # Mirrors `llvm_emit_op_dispatch`: lookup the evidence node, read its
@@ -100,18 +169,24 @@ pub fn nemit_pop(ctx: Handle) : Unit / Console = {
 # guard, indirect-call the op fn-ptr at its field index, restore the
 # guard, then `kaix_op_finish` (the folded discard test + unwind — on a
 # discard it longjmps and does not return; otherwise yields the op result).
-pub fn nemit_perform(ctx: Handle, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console =
+pub fn nemit_perform(ctx: Handle, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
+  # An aliased op is spelled `<op>@<alias>` (the resolver's per-instance
+  # dispatch tag). Split it: the bare op resolves the clause field; the
+  # alias (if any) switches the node lookup from by-name to by-id.
+  let bare = nfx_op_before_at(op)
+  let alias = nfx_op_alias(op)
   match nfx_find_handler_by_eff(handlers, eff) {
     None -> { nemit_unsupported(ctx, cat2("KPerform: no handler for effect ", eff)); nemit_null(ctx) }
-    Some(h) -> nemit_perform_with(ctx, eff, op, cargs, h)
+    Some(h) -> nemit_perform_with(ctx, eff, bare, alias, cargs, h)
   }
+}
 
-fn nemit_perform_with(ctx: Handle, eff: String, op: String, cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
+fn nemit_perform_with(ctx: Handle, eff: String, op: String, alias: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let field = nfx_op_field(h.op_thunks, op, 0)
-  # 1. node = lookup_node(eff); handler = node_handler(node).
-  let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
-  let node = ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+  # 1. node = by-id lookup for an aliased op (resolve THIS instance), else
+  # the innermost-by-effect-name lookup; handler = node_handler(node).
+  let node = nemit_perform_node(ctx, eff, alias)
   let handler = nemit_call1(ctx, "kaix_evidence_node_handler", node)
   # 2. cont = the reserved KaiCont alloca; init identity with handler_id.
   # `kaix_ev_handler_id(ptr) -> i64` (NOT a boxed ptr); `cont_init_identity`
@@ -169,6 +244,26 @@ fn nemit_op_finish(ctx: Handle, node: Handle, cont: Handle, r: Handle) : Handle 
 # `resume[tail] k v` -> `kaix_cont_resume(k, v)`, then `ret` the result
 # (the clause body's value IS the resume result for a tail resume).
 pub fn nemit_resume(ctx: Handle, k: KVal, v: KVal) : Unit / Console = {
+  let kv = nemit_atom(ctx, k)
+  let vv = nemit_atom(ctx, v)
+  let r = ncall_sig2(ctx, "kaix_cont_resume", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), kv, vv)
+  let _ret = llvm_build_ret(native_ctx_b(ctx), r)
+  ()
+}
+
+# --- KResume2: stateful 2-arg resume `resume(v, new_state)` -------------
+#
+# `resume2[tail] k v ns` -> write the new state into `self->state`
+# (`kaix_clause_state_set(__self, ns)`) then `kaix_cont_resume(k, v)` and
+# `ret`. Mirrors emit_c's `self->state = ns; kai_cont_resume(k, v)`. The
+# `__self` reg was registered by `nemit_seed_clause_params` (LLVM param 0).
+pub fn nemit_resume2(ctx: Handle, k: KVal, v: KVal, ns: KVal) : Unit / Console = {
+  # LOAD the Ev value from the `__self` alloca (NOT the alloca address —
+  # `kaix_clause_state_set` writes `(char*)self + 16`, so passing the
+  # alloca slot would clobber this frame instead of the Ev's state).
+  let self_v = nemit_load_reg(ctx, "__self")
+  let nsv = nemit_atom(ctx, ns)
+  let _s = ncall_sig2(ctx, "kaix_clause_state_set", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), self_v, nsv)
   let kv = nemit_atom(ctx, k)
   let vv = nemit_atom(ctx, v)
   let r = ncall_sig2(ctx, "kaix_cont_resume", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), kv, vv)

@@ -985,6 +985,17 @@ void kaix_clause_state_set(void *self, KaiValue *v) {
     *((KaiValue **)((char *) self + 16)) = v;
 }
 
+/* Stateful-clause prologue helper (native walk, subset 2b): read the
+ * `state` slot of the clause's `self` (the dispatched Ev blob) so the
+ * body's free `state` / `log` registers resolve. Same byte-16 offset as
+ * `kaix_clause_state_set` — the layout's KaiHandlerId(8) + void*env(8)
+ * prefix is invariant across every Ev<Eff>. The native backend binds the
+ * result under `state` (and the legacy alias `log`) in the entry block,
+ * mirroring emit_c's `clause_state_prologue`. */
+KaiValue *kaix_clause_state_get(void *self) {
+    return *((KaiValue **)((char *) self + 16));
+}
+
 /* m7c-d — non-static wrappers for the default-handler clause
  * functions defined static in runtime.h. The LLVM emit's
  * `kai_main_install_defaults` references these. Untyped i8*
