@@ -1,0 +1,148 @@
+# compiler/kir_lower_bind.kai — pattern-binder lowering for `match` arms
+# and destructuring `let`s.
+#
+# When a `match` arm or a `let` pattern binds names from the scrutinee, the
+# binders must become real KIR registers (`KLet name = <slot read>`) or the
+# arm body's `EVar(name)` lowers to an unbound register the native backend
+# aborts on. This module owns that bind emission, recursing into NESTED
+# sub-patterns so `let { p: { x, y } } = b` and `Some(x)` bind their inner
+# names against the EXTRACTED inner value. Mirror of emit_c's
+# `emit_pat_binds` / `emit_pat_binds_variant` / `emit_pat_binds_record`
+# (the boxed `k==0` arm — the KIR keeps every slot boxed today, so there is
+# no kind-split here). A bare `KLet`/`KProj` never increfs: Perceus's
+# already-placed KRC nodes own the refcounting (`lm_bind_name` note).
+#
+# It drives ON the lowering base (`bind_op`, `ls_emit`, `KProj`,
+# `KPrim`) but NEVER recurses into `lower_expr`, so the import graph stays
+# acyclic (`kir_lower ← kir_lower_bind ← kir_lower_walk`) — the same split
+# `kir_lower_match.kai` / `kir_lower_rec.kai` use for the list / record
+# decision trees.
+#
+# SOUNDNESS — the test/bind split (asu review). A `KSwitch` (or the
+# list/record decision tree) discriminates the tag of the TOP-LEVEL arm
+# pattern before this module's binds run, so binding the direct sub-slots
+# of that arm is safe. A NESTED `PVariant` / `PVariantRecord` sub-pattern
+# (`Node(_, .., Node(R, ..))`, `Some(JReal(r))`) carries its OWN tag
+# discriminant that NO test has emitted yet — binding its inner names
+# without that test would be a silent miscompile (a false-green build that
+# diverges at runtime). So a nested variant sub-pattern is NOT a mechanical
+# bind: it routes to `bind_unsupported_nested`, which traps loud and leaves
+# the binder unbound (the backend then refuses the module). A nested plain
+# `PRecord` is safe — a record has a single shape, no tag to test — so it
+# binds. This keeps the mechanical unbound-register family cleanly split
+# from the nested-variant-test family (a separate burn-down gap).
+
+import compiler.ast
+import compiler.util
+import compiler.kir
+import compiler.kir_lower
+
+# --- top-level arm binds (the switch already tested the tag) ------------
+
+# Bind a TOP-LEVEL variant arm's sub-binders from the scrutinee. The
+# `KSwitch` already matched the arm's tag, so the direct sub-slots are safe
+# to bind. `PVariant` reads positional slots (`KProj scrv idx`);
+# `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
+pub fn bind_pattern_fields(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(_, subs)         -> bind_sub_binders(subs, scrv, 0, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, st)
+  _                         -> st
+}
+
+fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match subs {
+  [] -> st
+  [sp, ...rest] -> bind_sub_binders(rest, scrv, idx + 1, bind_slot_pattern(sp, scrv, idx, st))
+}
+
+# Bind ONE positional slot's sub-pattern. A `PBind` aliases the slot; a
+# nested plain record projects the slot and recurses; an as-pattern binds
+# then descends; a nested VARIANT traps loud (see the soundness note).
+# `PWild`/`PLit`/`PHole` bind nothing (a `PLit` was a test on the switch
+# path).
+fn bind_slot_pattern(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
+  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KProj(scrv, idx), KAt(sp.line, sp.col)))
+  PRecord(_)           -> bind_nested_slot(sp, scrv, idx, st)
+  PAs(name, _)         -> bind_nested_as(sp, name, scrv, idx, st)
+  PVariant(_, _)       -> bind_unsupported_nested(sp, st)
+  PVariantRecord(_, _) -> bind_unsupported_nested(sp, st)
+  _                    -> st
+}
+
+# Project slot `idx` into a fresh register, then bind the nested plain
+# record sub-pattern against it.
+fn bind_nested_slot(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
+    bind_pattern_fields_any(sp, sub, st1) }
+
+# An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
+# the inner pattern against the SAME projected value.
+fn bind_nested_as(sp: Pattern, name: String, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
+    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
+    bind_pattern_fields_any(as_inner(sp), sub, st2)
+  } }
+
+# --- bind against an already-extracted value ----------------------------
+
+# Bind a destructuring pattern against an already-extracted value (a `let`
+# RHS, a projected slot, a read field). A nested plain `PRecord` /
+# `PVariantRecord` payload binds its fields; a top-level-shaped `PVariant`
+# here arrives only from a context whose tag is settled (the let-bind of a
+# single-ctor type, an as-pattern inner), so its direct subs bind.
+pub fn bind_pattern_fields_any(p: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(_, subs)         -> bind_sub_binders(subs, v, 0, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, v, st)
+  PRecord(fields)           -> bind_record_subfields(fields, v, st)
+  _                         -> st
+}
+
+# Bind the named binding fields of a record / variant-record payload by
+# `kai_op_field` read, recursing into nested sub-patterns. Literal /
+# wildcard fields bind nothing. Mirror of emit_c's `emit_pat_binds_record`.
+fn bind_record_subfields(fields: [PField], v: KVal, st: LowerSt) : LowerSt / Console = match fields {
+  [] -> st
+  [PField(fname, sub, _), ...rest] ->
+    bind_record_subfields(rest, v, bind_field_pattern(fname, sub, v, st))
+}
+
+fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match sub.pkind {
+  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
+  PRecord(_)           -> bind_field_nested(fname, sub, v, st)
+  PAs(name, _)         -> bind_field_as(fname, name, sub, v, st)
+  PVariant(_, _)       -> bind_unsupported_nested(sub, st)
+  PVariantRecord(_, _) -> bind_unsupported_nested(sub, st)
+  _                    -> st
+}
+
+# A nested plain-record field: read the field into a fresh register, then
+# bind the sub-pattern against it.
+fn bind_field_nested(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) ->
+    bind_pattern_fields_any(sub, fv, st1) }
+
+# An as-pattern field (`f: name @ inner`): bind the field to `name`, then
+# the inner pattern against the same field value.
+fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) -> {
+    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
+    bind_pattern_fields_any(as_inner(sub), fv, st2)
+  } }
+
+# --- soundness guard ----------------------------------------------------
+
+# A nested VARIANT sub-pattern needs a tag TEST this module does not emit
+# (the nested-variant-test family). Trap LOUD and bind nothing: the binder
+# stays unbound, so the backend refuses the module rather than silently
+# miscompiling. NEVER bind a nested variant's inner names against an
+# untested value (the false-green a `bind_sub_binders` recursion would be).
+fn bind_unsupported_nested(p: Pattern, st: LowerSt) : LowerSt / Console = {
+  eprint(concat_all(["kir: nested variant sub-pattern needs a tag test (subset gap: nested-variant-test) at ",
+                     int_to_string(p.line), ":", int_to_string(p.col)]))
+  st
+}
+
+# The inner pattern of a `PAs(name, inner)`.
+pub fn as_inner(p: Pattern) : Pattern = match p.pkind {
+  PAs(_, inner) -> inner
+  _             -> p
+}
