@@ -4844,6 +4844,30 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
   ])
 }
 
+# issue #779 — multi-statement EBlock with a raw tail. The sibling of
+# `emit_match_raw`: the unbox pass (`decide_mode_aware` EBlock arm) marks
+# `EBlock(stmts != [], Some(tail))` MUnboxed when the tail is raw and the
+# interleaved statements are RC-only (SLet / SExprStmt — the post-perceus
+# `__pcs_ret` wrap shape). Here we emit the statements through the SAME
+# path the boxed EBlock arm uses (`emit_block_stmts` — drops/dups threaded
+# byte-for-byte) and emit only the TAIL raw, into the statement-expression
+# value slot. No `kai_int(...)` box on the result, no `(...)->as.i` unwrap
+# — which for a `TyHandle` (raw `void *`) would corrupt the pointer.
+#
+# The statements run for their effects only (the block's value is the
+# tail); making the tail raw never moves a drop, so the Perceus RC
+# discipline is unchanged. A region block (deep-copy-out) is a different
+# lowering — the caller already excludes it, but the unbox pass never
+# marks one raw.
+fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String / Console {
+  let drops = block_unused_lets(stmts, Some(tail))
+  let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
+  let stmt_out = match stmt_acc { EBSA(_, t) -> t }
+  let block_lcs = match stmt_acc { EBSA(l, _) -> l }
+  let tail_c = emit_expr_raw(src, tail, emit_ctx_with_lcs(cx, block_lcs))
+  cat4("({ ", stmt_out, tail_c, "; })")
+}
+
 # ---- string interpolation ----
 #
 # The raw span includes quotes: either 1 quote on each side for single-
@@ -5856,9 +5880,24 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
           unbox_boxed_scalar(boxed, x.ty)
         }
       }
-      _ -> {
-        let boxed = emit_expr_boxed(src, x, cx)
-        unbox_boxed_scalar(boxed, x.ty)
+      # issue #779 — a multi-statement block with a raw tail (the unbox
+      # pass marked it MUnboxed). Emit the statements then the raw tail
+      # directly via `emit_block_raw`, dropping the box-then-unbox round-
+      # trip. A region block (deep-copy-out) routes through the boxed
+      # fallback — the unbox pass never marks one raw, so this is purely
+      # defensive.
+      _ -> match opt_tail {
+        Some(t) ->
+          if emit_block_is_region(cx, x.line, x.col) {
+            let boxed = emit_expr_boxed(src, x, cx)
+            unbox_boxed_scalar(boxed, x.ty)
+          } else {
+            emit_block_raw(src, stmts, t, cx)
+          }
+        None -> {
+          let boxed = emit_expr_boxed(src, x, cx)
+          unbox_boxed_scalar(boxed, x.ty)
+        }
       }
     }
     # match-raw unboxing (asu design): a `match` whose result is
