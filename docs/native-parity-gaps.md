@@ -13,6 +13,18 @@
 > that locks the count is `tools/native-parity-baseline.txt` (gated in
 > `tier1-native`).
 >
+> **Corpus growth (2026-06-10, issue #801 — stream carrier):** the lazy
+> `Stream` lane added 6 new fixtures the native walk does not yet cover —
+> **143 fail** now, not a regression. They fall into existing families:
+> `stream_early_stop` / `stream_mock_disk` / `stream_skip_policy` /
+> `stream_abort_leak` are `no-effect-handler` (`File`/`ReadFault` ops the
+> native walk has no handler for); `demos/wc.kai` is `exit-code-mismatch`
+> (same root cause, surfaced at runtime instead of build); `ctor_field_effect_row`
+> is `clause-param-origin` (subset 2b alias dispatch). All six compile and
+> run correctly under the C-direct oracle — they are backend gaps, not
+> source bugs. Note: `stream_shout_roundtrip` (the read→map→write_lines
+> gallery program) already PASSES native and is intentionally not listed.
+>
 > **Burn-down 1 lesson (see the retro):** closing a mechanical bug UNMASKS
 > the next bug on the same fixture. The unbound-register slice that did NOT
 > close mostly advanced to *other* families now visible behind the abort —
@@ -49,13 +61,13 @@
 | build-failed-other | ~23 | native build fails with a signature not in the buckets above. |
 | output-mismatch | ~24 | same exit code, divergent stdout — codegen produces wrong values/ordering. Grew in burn-down 1: fixtures that link now (assert fix) but compute wrong (collatz, factorials, …). |
 | SIGSEGV/SIGABRT | ~12 | `native=138/139` — a crash in emitted code (bad pointer, RC double-free, ABI). |
-| exit-code-mismatch | ~11 | `c=0, native=1` (or similar) — native exits non-zero where C succeeds. |
-| no-effect-handler | 10 | `KPerform: no handler for effect <Spawn/Clock/NetTcp>` — effect ops the native walk does not install handlers for (Spawn 7, Clock 2, NetTcp 1). |
+| exit-code-mismatch | ~12 | `c=0, native=1` (or similar) — native exits non-zero where C succeeds. Includes `demos/wc.kai` (#801: `read_lines` over `File + ReadFault`, no native handler → diverges on exit). |
+| no-effect-handler | 14 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File/ReadFault>` — effect ops the native walk does not install handlers for (Spawn 7, Clock 2, NetTcp 1, + #801's `File`/`ReadFault` line-stream stages: `stream_early_stop`, `stream_mock_disk`, `stream_skip_policy`, `stream_abort_leak`). |
 | switch-duplicate | ~7 | `native module verify failed: Duplicate integer as switch case` — variant arms sharing a top tag but discriminating on a NESTED sub-variant (`Node(_, Node(R,..), ..)`, regex `subsume_*`) need a nested decision tree, not one `KSwitch`. Unmasked by burn-down 1's binder fix. |
 | nested-variant-test | ~5 | `unbound register` (loud trap) — a nested variant/list sub-pattern in a match arm (`Some(JReal(r))`, `Some([x,y])`) needs a tag/length TEST the bind lowering deliberately does NOT emit (`bind_unsupported_nested`; oracle = emit_c `emit_pat_test_list`). |
 | unbound-register (handler-state) | 2 | `unbound register log` — a handler's state free name (`Writer` `tell`/`return`) is not bound on the native walk. Effects family. |
 | timeout | 2 | `native=124` — runs forever; a TCO/TRMC sentinel the native lowering misfires on. |
-| clause-param-origin | 2 | handler clause param shape the native walk rejects. |
+| clause-param-origin | 3 | handler clause param shape the native walk rejects (subset 2b alias dispatch). Includes `ctor_field_effect_row` (#801 typer-regression fixture — a ctor field with an effect row; the native walk hits the alias-dispatch clause-param gap). |
 | multi-scrutinee | 1 | `match a, b` desugars to nested EMatch with duplicated fall-through arms; native lowering diverges (`demos/forth`). |
 
 ## Failing fixtures
