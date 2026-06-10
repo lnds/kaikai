@@ -33,7 +33,23 @@ import compiler.kir
 # the enclosing-fn key the lambda lookup is scoped by.
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      fns: [EFn], vs: [EVar], lams: [LamInfo], enc_fn: String,
-                     effs: [String], consts: [Decl] }
+                     effs: [String], consts: [Decl],
+                     # `locals` is the set of names BOUND in the current fn
+                     # body (params + captures + every `let`/match binder).
+                     # It is the KIR mirror of emit_c's `EmitCtx.lcs`
+                     # (lexical-scope names): an `EVar(nm)` whose `nm` is in
+                     # `locals` is a genuine local read, and MUST win over a
+                     # same-name top-level fn / stdlib `pub fn` / prelude
+                     # builtin (the locals-shadow-imports rule, #748/#749).
+                     # Without it, a param named like a stdlib fn (e.g.
+                     # `init` vs `list.init`, `foldl`'s `init`) lowered to a
+                     # closure over the stdlib thunk instead of the local —
+                     # the closure then reached an arithmetic op as a
+                     # non-Int operand (the runtime-type-mismatch family).
+                     # Seeded at fn entry with params/captures; extended at
+                     # each binder. Forward-visible (a `let` is in scope
+                     # only after its definition), matching lexical order.
+                     locals: [String] }
 
 # Result of lowering one expression: its value atom + threaded state.
 pub type LRes = LRes(KVal, LowerSt)
@@ -52,15 +68,32 @@ pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
               consts: [Decl]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [] }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
-# scoped by (`find_lam` keys on it). Called at the head of every KFn
-# lowering (Risk 2b).
-pub fn ls_enter_fn(st: LowerSt, enc_fn: String) : LowerSt =
+# scoped by (`find_lam` keys on it). `locals` is seeded with the fn's
+# bound names (params + captures) so a same-name top-level fn does not
+# shadow a local read in the body (#748/#749). Called at the head of
+# every KFn lowering (Risk 2b).
+pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals }
+
+# Extend the lexical scope with one bound name (a `let` / match binder).
+# Forward-visible: a binder is in scope only after its definition. Idempotent
+# on duplicate names (a re-bind of the same name in a nested scope is a no-op
+# for the shadow test — the name is already known-local).
+pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
+  if ls_is_local(st, name) { st }
+  else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
+                   vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
+                   consts: st.consts, locals: [name, ...st.locals] } }
+
+# Is `name` a name bound locally in the current fn body? (param / capture /
+# let / match binder). The shadow test `lower_var` consults before treating
+# a name as a top-level fn-value.
+pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, name)
 
 # A fresh virtual-register name, deterministic per function: `t0`, `t1`, …
 pub fn ls_fresh_reg(st: LowerSt) : LSReg =
@@ -73,22 +106,37 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
 
 # --- Block accumulation -------------------------------------------------
 
 # Append one statement to the block under construction (stored reversed).
+# A binder statement (`KLet` / `KStore`) also EXTENDS `locals` with its
+# destination name — the single chokepoint every match/let/record/variant
+# binder funnels through, so the lexical-scope set stays complete without
+# threading a bind callback through each binding site. Forward-visible: the
+# name enters scope at the statement that binds it (lexical order).
 pub fn ls_emit(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
+  ls_emit_raw(ls_bind_local_of(st, s), s)
+
+# The name a binder statement introduces, if any (`KLet`/`KStore` dest).
+fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
+  KLet(name, _, _, _) -> ls_bind_local(st, name)
+  KStore(name, _, _)  -> ls_bind_local(st, name)
+  _                   -> st
+}
+
+fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -252,7 +300,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
 
 # --- Type declarations --------------------------------------------------
 
@@ -336,6 +384,16 @@ pub fn binop_prim(op: String, a: Expr) : String =
   if op == "++" {
     match a.ty { Some(TyListT(_)) -> "kai_prelude_list_append" _ -> "kai_string_concat" }
   } else { op }
+
+# Resolve a UNARY operator to its prim name. The unary `-` must NOT reuse
+# the binary `-` string: the binary maps to the two-operand `kaix_sub`, so
+# an `EUnop("-", a)` lowered as `KPrim("-", [a])` would emit a one-arg call
+# to a two-arg helper — the second operand reads an uninitialised register
+# (the mismatch the C-direct oracle never had, since `emit_c`'s
+# `unop_cname` maps unary `-` → `kai_op_neg`, a distinct symbol). Mirror
+# that split here: `-` → `neg` (the translator routes it to `kaix_neg`),
+# `not` keeps its own string (already a one-arg `kaix_not`).
+pub fn unop_prim(op: String) : String = if op == "-" { "neg" } else { op }
 
 # --- Callee classification (sentinel / perceus mark / ctor / direct) ----
 
