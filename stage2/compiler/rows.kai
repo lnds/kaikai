@@ -1,0 +1,152 @@
+# compiler/rows.kai — row-as-type-argument fusion (issue #772).
+#
+# Transparent type aliases may be parameterised by an effect row:
+#
+#   pub type Stream[t, e] = () -> Option[t] / Mutable + e
+#
+# Issue #624 made a *single* row argument work (one uppercase label or
+# one row variable) by lifting it at substitution time. This module is
+# the #624 follow-up: it accepts a *compound* row argument at the use
+# site — `Stream[Int, Stdout + Fail]`, `Stream[Int, Stdout + f]` — by
+# fusing the argument's labels and tail into the alias row in place of
+# the substituted row variable.
+#
+# The argument row arrives as a `TyRow(RowExpr)` node, produced by the
+# parser only when a `+`-joined row follows the first label inside a
+# type-argument list (see `parse.kai`). `TyRow` is short-lived: it is
+# consumed here, folded into a plain `RClosed`/`ROpen`, and never
+# survives into a resolved `Ty` or reaches the emitters.
+#
+# Soundness: a kaikai row carries at most one open tail (`ROpen` has a
+# single tail-var slot). The alias side is always `ROpen(rv, labels)`
+# with `rv` the substitution point, and the argument has at most one
+# tail. Fusing them yields at most one tail — the argument's, when
+# present — so the one-open-tail invariant is preserved by
+# construction; no double-tail row can be formed here.
+
+import compiler.ast
+import compiler.util
+import compiler.infer
+
+#[doc("Fuse a compound row argument into an alias row at the substitution point. `prefix` are the alias-side labels that precede the substituted row variable; `arg` is the row the type argument supplied (`TyRow`'s payload). The argument's tail, if any, becomes the result's tail; otherwise the result is closed.")]
+pub fn fuse_row_arg(prefix: [RowLabel], arg: RowExpr) : RowExpr {
+  match arg {
+    REmpty -> RClosed(prefix)
+    RClosed(arg_labels) -> RClosed(row_labels_concat(prefix, arg_labels))
+    ROpen(tail, arg_labels) -> ROpen(tail, row_labels_concat(prefix, arg_labels))
+  }
+}
+
+#[doc("Append two row-label lists, preserving order (alias-side labels first, then the argument's).")]
+pub fn row_labels_concat(a: [RowLabel], b: [RowLabel]) : [RowLabel] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...row_labels_concat(rest, b)]
+  }
+}
+
+#[doc("True when a type expression is a `TyRow` carrier — a compound row in type-argument position awaiting fusion.")]
+pub fn ty_is_row_arg(te: TypeExpr) : Bool = match te.tkind {
+  TyRow(_) -> true
+  _        -> false
+}
+
+# === issue #772: effect-alias expansion inside nested rows ===
+#
+# Instantiating a row-parameterised alias (`Stream[Int, Console]`,
+# `Stream[Int, Stdout + Console]`) lifts a row argument that may name
+# an effect alias. The lifted label lands in a *nested* row inside the
+# instantiated TypeExpr (a `TyFn` row, a parameter/return type, a
+# `let` annotation) — positions the program-level effect-alias pass
+# (`expand_aliases_in_decl`, which only rewrites a `DFn`'s own row)
+# never reaches. `expand_row_aliases_in_te` walks the instantiated
+# TypeExpr and expands those labels in every nested row.
+#
+# `AliasResult` is flat (the alias resolver pre-expands alias-of-alias
+# into base labels), so a single pass over each row suffices. The walk
+# is a pure post-process applied at the alias-instantiation chokepoint
+# in `expand_ta_te`; it does not re-enter the transparent-alias
+# expansion, so the two passes stay sequenced and order-independent.
+
+#[doc("Walk a TypeExpr produced by alias instantiation and expand effect-alias labels (e.g. `Console` → `Stdout + Stderr + Stdin`) in every nested row.")]
+pub fn expand_row_aliases_in_te(te: TypeExpr, aliases: [AliasResult]) : TypeExpr {
+  match te.tkind {
+    TyName(name, targs) ->
+      TypeExpr { tkind: TyName(name, expand_row_aliases_in_tes(targs, aliases)),
+                  line: te.line, col: te.col }
+    TyList(inner) ->
+      TypeExpr { tkind: TyList(expand_row_aliases_in_te(inner, aliases)),
+                  line: te.line, col: te.col }
+    TyFn(ps, ret, row) ->
+      TypeExpr { tkind: TyFn(expand_row_aliases_in_tes(ps, aliases),
+                              expand_row_aliases_in_te(ret, aliases),
+                              expand_aliases_in_row_local(row, aliases)),
+                  line: te.line, col: te.col }
+    TyDim(base, u) ->
+      TypeExpr { tkind: TyDim(expand_row_aliases_in_te(base, aliases), u),
+                  line: te.line, col: te.col }
+    TyRefine(base, p) ->
+      TypeExpr { tkind: TyRefine(expand_row_aliases_in_te(base, aliases), p),
+                  line: te.line, col: te.col }
+    TyRow(row) ->
+      TypeExpr { tkind: TyRow(expand_aliases_in_row_local(row, aliases)),
+                  line: te.line, col: te.col }
+  }
+}
+
+fn expand_row_aliases_in_tes(tes: [TypeExpr], aliases: [AliasResult]) : [TypeExpr] {
+  match tes {
+    [] -> []
+    [t, ...rest] -> [expand_row_aliases_in_te(t, aliases),
+                     ...expand_row_aliases_in_tes(rest, aliases)]
+  }
+}
+
+# Expand effect-alias labels in one row. Bare labels (`Console`) whose
+# name matches an alias are replaced by the alias's base labels; every
+# other label passes through. Duplicates introduced by expansion are
+# folded by name. The row tail (a row variable) is never an alias.
+fn expand_aliases_in_row_local(re: RowExpr, aliases: [AliasResult]) : RowExpr {
+  match re {
+    REmpty -> REmpty
+    RClosed(labels) -> RClosed(dedup_labels_by_name(expand_label_aliases(labels, aliases)))
+    ROpen(rv, labels) -> ROpen(rv, dedup_labels_by_name(expand_label_aliases(labels, aliases)))
+  }
+}
+
+fn expand_label_aliases(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
+  match ls {
+    [] -> []
+    [RL(name, []), ...rest] -> {
+      let here = match alias_lookup(aliases, name) {
+        Some(expanded) -> map(expanded, (n) => RL(n, []))
+        None           -> [RL(name, [])]
+      }
+      list_append(here, expand_label_aliases(rest, aliases))
+    }
+    # A parameterised label (`Reader[Int]`) is never an effect alias.
+    [l, ...rest] -> [l, ...expand_label_aliases(rest, aliases)]
+  }
+}
+
+fn alias_lookup(aliases: [AliasResult], name: String) : Option[[String]] {
+  match aliases {
+    [] -> None
+    [AR(n, labels), ...rest] -> if n == name { Some(labels) } else { alias_lookup(rest, name) }
+  }
+}
+
+fn dedup_labels_by_name(ls: [RowLabel]) : [RowLabel] = dedup_labels_loop(ls, [], [])
+
+fn dedup_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] {
+  match ls {
+    [] -> list_reverse(acc)
+    [RL(n, targs), ...rest] -> {
+      # Key parametric labels by name+arg-arity so distinct
+      # instantiations survive; bare labels key on the name alone.
+      let key = match targs { [] -> n _ -> concat_all([n, "/", int_to_string(list_length(targs))]) }
+      if list_has(seen, key) { dedup_labels_loop(rest, seen, acc) }
+      else { dedup_labels_loop(rest, [key, ...seen], [RL(n, targs), ...acc]) }
+    }
+  }
+}
