@@ -181,7 +181,12 @@ fn ufn_promote_calls(e: Expr, fns: [EFn]) : Expr {
     EBlock(stmts, Some(tail)) -> {
       match stmts {
         [] -> if ty_is_unboxable(e.ty) and child_is_raw(tail) { MUnboxed } else { e.mode }
-        _ -> e.mode
+        # issue #779 — mirror the main-walk `decide_mode_aware` rule: a
+        # multi-statement block with a raw tail and RC-only statements
+        # forwards the raw tail. (This post-pass is currently unwired,
+        # but kept consistent so a future re-wire behaves identically.)
+        _ -> if ty_is_unboxable(e.ty) and child_is_raw(tail) and block_stmts_rc_safe(stmts) { MUnboxed }
+             else { e.mode }
       }
     }
     # Promote a `match` whose result is unboxable and whose every arm
@@ -573,14 +578,20 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]
       EIf(cnd, ath, Some(eth)) ->
         if child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth) { MUnboxed }
         else { MBoxed }
-      # Phase 3 unboxing — single-tail EBlock (no preceding stmts)
-      # forwards its tail's mode. Multi-stmt blocks stay boxed; the
-      # interleaved drops/dups would interact with raw locals in
-      # ways v1 does not yet model.
+      # Phase 3 unboxing — a single-tail EBlock (no preceding stmts)
+      # forwards its tail's mode. Issue #779: a multi-statement block
+      # whose tail is raw and whose statements are RC-only (SLet /
+      # SExprStmt — the post-perceus `__pcs_ret` wrap shape) also
+      # forwards the raw tail. The statements run for effects only (the
+      # block's value is the tail), so the emitter (`emit_block_raw`)
+      # threads the Perceus drops unchanged and emits only the tail raw.
+      # Any other statement form (SAssert / dead SVar/SUse/SIndexAssign)
+      # keeps the block boxed — conservative.
       EBlock(stmts, Some(tail)) ->
         match stmts {
           [] -> tail.mode
-          _  -> MBoxed
+          _  -> if child_is_raw(tail) and block_stmts_rc_safe(stmts) { MUnboxed }
+                else { MBoxed }
         }
       # match-raw unboxing (asu design): a `match` whose result is
       # unboxable (guaranteed by the `ty_is_unboxable(opt_ty)` gate
@@ -599,6 +610,25 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]
 
 fn child_is_raw(e: Expr) : Bool {
   match e.mode { MUnboxed -> true _ -> false }
+}
+
+# issue #779 — a multi-statement block is safe to lower with a raw tail
+# only when every interleaved statement is RC-only: a `SLet` (its binding
+# carries its own RC discipline — the emitter drops unused bindings and
+# threads dup/drops) or a `SExprStmt` (a value-producing statement whose
+# result is decref'd in place, including the Perceus `__perceus_drop`
+# exit drops of the `__pcs_ret` wrap). The block's VALUE is the tail
+# alone, so these statements never contribute to it; making the tail raw
+# moves no drop. `SAssert` and the dead `SVar` / `SUse` / `SIndexAssign`
+# forms (which should have desugared away) keep the block boxed —
+# conservative, correctness over the optimisation.
+fn block_stmts_rc_safe(stmts: [Stmt]) : Bool = match stmts {
+  [] -> true
+  [s, ...rest] -> match s {
+    SLet(_, _, _) -> block_stmts_rc_safe(rest)
+    SExprStmt(_)  -> block_stmts_rc_safe(rest)
+    _             -> false
+  }
 }
 
 # Issue #90 — `^` raw-inline gate. The C / LLVM emitters unroll
