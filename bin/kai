@@ -628,9 +628,14 @@ Environment:
   CLANG            clang binary used by --backend=llvm (default: clang).
   CLANGFLAGS       Extra flags passed to clang on --backend=llvm
                    (default: -w -O2).
-  KAI_BACKEND      Default backend (c|llvm) when --backend is not
-                   passed. Overridden by --backend; defaults to `c`
-                   (the LLVM backend is opt-in until Orongo).
+  KAI_BACKEND      Default backend (c|native|llvm) for `kai build` /
+                   `kai run` when --backend is not passed. Overridden by
+                   --backend; defaults to `c` (the portable C-text path,
+                   supported across the whole corpus). `native` is the
+                   in-process libLLVM backend (no clang, no .ll text) —
+                   wired and opt-in, but not yet the default (Lane 1.5
+                   parity is incomplete). `llvm` is the legacy LLVM-text
+                   path (emits .ll, links with clang).
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
                    stdlib/ if running from a dev checkout).
@@ -644,7 +649,7 @@ EOF
 
 usage_build() {
   cat <<EOF
-usage: kai build [<spec>] [-o <out>] [--backend=<c|llvm>]
+usage: kai build [<spec>] [-o <out>] [--backend=<c|native|llvm>]
        kai build --holes [<spec>]
        kai build --holes-json [<spec>]
        kai build --diags-json [<spec>]
@@ -663,21 +668,29 @@ of:
                    the binary lands inside that sub-directory.
 
 The default backend is \`c\` (portable C linked with cc) — supported
-across every Hanga Roa fixture. The LLVM backend is opt-in via
-\`--backend=llvm\` or \`KAI_BACKEND=llvm\`: it is faster and has fewer
-external deps when it works, but has known M3b gaps that fail on
-tuple-pattern let-bindings and several closure shapes. Those gaps
-close in Orongo. The llvm backend emits LLVM IR via \`kaic2
---emit=llvm\` and links it with clang against stage0/runtime_llvm.c
-(L1 of the LLVM-direct refactor).
+across the whole corpus, the bootstrap path and the parity oracle.
+
+\`--backend=native\` selects the in-process libLLVM backend
+(docs/kir-design.md §7.2): it lowers to KIR, builds the LLVM module via
+the C API in one process, and emits a native object — no \`.ll\` text,
+no \`clang\` subprocess. It is the project's intended default destination,
+but is opt-in until its corpus parity is complete (Lane 1.5). A kaic2
+built without libLLVM rejects it with an actionable error; build it with
+\`make -C stage2 KAI_LLVM=1\`.
+
+\`--backend=llvm\` selects the legacy LLVM-TEXT path: it emits \`.ll\` via
+\`kaic2 --emit=llvm\` and links it with clang against
+stage0/runtime_llvm.c (kept for the C<->LLVM-text parity gate; not the
+in-process native path).
 
 Options:
   -o <out>             Output binary path (default: basename of input
                        without .kai).
-  --backend=<c|llvm>   Codegen backend (default: c — the LLVM backend
-                       is opt-in until Orongo). KAI_BACKEND env var
-                       overrides the default; this flag overrides
-                       both.
+  --backend=<c|native|llvm>
+                       Codegen backend (default: c). \`native\` is the
+                       in-process libLLVM path (opt-in until Lane 1.5
+                       parity completes). KAI_BACKEND env var overrides
+                       the default; this flag overrides both.
   --holes              Report every typed hole (\`?\` / \`?name\`) with
                        expected type, in-scope bindings, and candidate
                        fillers, then exit. No binary is produced. See
@@ -710,7 +723,8 @@ Examples:
   kai build ./sub                           # sibling sub-package
   kai build hello.kai                       # produces ./hello (C backend)
   kai build src/app.kai -o build/app        # produces ./build/app
-  kai build --backend=llvm hello.kai        # produces ./hello via clang
+  kai build --backend=native hello.kai      # produces ./hello via in-process libLLVM
+  kai build --backend=llvm hello.kai        # produces ./hello via clang (LLVM text)
   kai build --holes draft.kai               # human-readable hole report
   kai build --holes-json draft.kai          # machine-readable hole report
   kai build --diags-json draft.kai          # structured diagnostics (JSON)
@@ -724,20 +738,20 @@ EOF
 
 usage_run() {
   cat <<EOF
-usage: kai run [--backend=<c|llvm>] [<spec>] [args...]
+usage: kai run [--backend=<c|native|llvm>] [<spec>] [args...]
 
 Compile and immediately execute a kaikai program. <spec> follows the
 same rules as \`kai build\` (a .kai file, '.', '<sub>', or omitted for
 the cwd package). Any arguments after the spec are forwarded to the
 compiled binary. Backend selection follows the same rule as
-\`kai build\`: --backend > KAI_BACKEND > default (\`c\` — the LLVM
-backend is opt-in until Orongo).
+\`kai build\`: --backend > KAI_BACKEND > default (\`c\`). \`native\` (the
+in-process libLLVM path) is opt-in until Lane 1.5 parity completes.
 
 Options:
-  --backend=<c|llvm>   Codegen backend (default: c — the LLVM backend
-                       is opt-in until Orongo). KAI_BACKEND env var
-                       overrides the default; this flag overrides
-                       both.
+  --backend=<c|native|llvm>
+                       Codegen backend (default: c). \`native\` is the
+                       in-process libLLVM path (opt-in). KAI_BACKEND env
+                       var overrides the default; this flag overrides both.
   -h, --help           Show this help.
 
 Examples:
@@ -927,15 +941,26 @@ EOF
 
 # Resolve the active backend. Precedence (highest first):
 #   1. Caller-supplied value (the --backend CLI flag, already parsed).
-#   2. $KAI_BACKEND environment variable (c|llvm).
+#   2. $KAI_BACKEND environment variable (c|llvm|native).
 #   3. Hard-coded default: `c`.
 #
-# The LLVM backend used to be auto-selected when clang was in PATH,
-# but the M3b gaps (tuple-pattern let-bindings, several closure
-# shapes) fail on idiomatic stdlib-using programs. Until Orongo
-# closes those gaps, the Hanga Roa edition ships with `c` as the
-# sole default — users who want LLVM opt in explicitly. Stages 0/1
-# are bootstrapped with the system cc and never see this logic.
+# `c` is the portable C-text backend — the bootstrap path and the parity
+# oracle, the one supported across the whole corpus. It is the default.
+#
+# `native` is the in-process libLLVM backend (the project's intended
+# default destination, docs/kir-design.md §7.2): it builds the LLVM
+# module via the C API in one process and emits a native object — no
+# `.ll` text, no `clang`. It is wired and reachable via `--backend=native`
+# / `KAI_BACKEND=native`, but is NOT yet the default: Lane 1.5 measured
+# native-vs-C parity at 250/167/96 over the corpus (~60%), so the flip
+# does NOT proceed until the backend reaches full parity. A kaic2 built
+# without libLLVM rejects `native` with an actionable error
+# (compile_to_binary) — it never silently downgrades to C.
+#
+# `llvm` is the legacy LLVM-TEXT backend (emits `.ll`, links with clang);
+# kept reachable for the C<->LLVM-text parity gate (#575).
+#
+# Stages 0/1 are bootstrapped with the system cc and never see this logic.
 resolve_backend() {
   cli_choice="$1"
   if [ -n "$cli_choice" ]; then
@@ -944,16 +969,12 @@ resolve_backend() {
   fi
   if [ -n "${KAI_BACKEND:-}" ]; then
     case "$KAI_BACKEND" in
-      c|llvm) printf '%s' "$KAI_BACKEND"; return 0 ;;
-      *) die "KAI_BACKEND must be 'c' or 'llvm' (got: $KAI_BACKEND)" ;;
+      c|llvm|native) printf '%s' "$KAI_BACKEND"; return 0 ;;
+      *) die "KAI_BACKEND must be 'c', 'llvm', or 'native' (got: $KAI_BACKEND)" ;;
     esac
   fi
-  # Default backend for the Hanga Roa edition is `c`. The LLVM
-  # backend has known M3b gaps (tuple-pattern let-bindings, several
-  # closure shapes) that fail on idiomatic stdlib-using programs;
-  # the C backend is the supported path until those gaps close in
-  # Orongo. Users with LLVM-shaped fixtures opt in explicitly via
-  # `--backend=llvm` or `KAI_BACKEND=llvm`.
+  # Default stays `c` until the native backend reaches full corpus
+  # parity (Lane 1.5 is BLOCKED on parity — see docs/kir-design.md).
   printf 'c'
 }
 
@@ -970,7 +991,14 @@ ensure_clang() {
 
 compile_to_binary() {
   # Two leading flags carry the backend across the wrapper boundary.
-  # `--backend <c|llvm>` is consumed here, never forwarded to kaic2.
+  # `--backend <c|native|llvm>` is consumed here, never forwarded to
+  # kaic2. `kai build` / `kai run` always pass an explicit `--backend`
+  # resolved through resolve_backend() (default: `c` — the native flip
+  # is BLOCKED on corpus parity, Lane 1.5). The dev-loop subcommands
+  # (`kai test` / `bench` / `check` / watch) call without `--backend`
+  # and so use this `c` fallback directly. The native backend is wired
+  # and reachable here via `--backend=native`; it becomes the default
+  # only once Lane 1.5 parity completes.
   backend="c"
   while [ "${1:-}" = "--backend" ]; do
     shift
@@ -1011,7 +1039,55 @@ compile_to_binary() {
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
-  if [ "$backend" = "llvm" ]; then
+  if [ "$backend" = "native" ]; then
+    # KIR Lane 1.5: the in-process libLLVM native backend is the default.
+    # `kaic2 --emit=native` lowers to KIR, builds the LLVM module via the
+    # C API IN MEMORY, and writes a native OBJECT — no `.ll` text, no
+    # `clang` subprocess. We then link that object against the effects
+    # runtime shim (runtime_llvm.c) with `cc`. The native backend needs
+    # no clang at runtime: libLLVM is linked INTO kaic2 (statically in a
+    # release), so the user needs neither clang nor a system LLVM.
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      die "native backend: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
+    fi
+    # kaic2 derives the object path from the SOURCE path (foo.kai ->
+    # foo.o), so compiling the user's file in place would drop a `.o`
+    # into their tree (and race the parity fan-out / break a read-only
+    # checkout). Compile a copy under $tmp instead, and point the module
+    # resolver back at the real source dir with --path so relative
+    # imports still resolve. (bin/kai already passes --path "$src_dir"
+    # on every backend; here it is load-bearing because the entry file
+    # itself moved to $tmp.)
+    src_base="$(basename "$src")"
+    cp "$src" "$tmp/$src_base"
+    obj="$tmp/${src_base%.kai}.o"
+    nerr="$tmp/native.err"
+    # shellcheck disable=SC2086
+    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+      # Distinguish "this kaic2 has no native backend" (actionable: the
+      # build was C-only) from a real compile error in the user program.
+      # The C-only stub aborts with a known sentinel string; anything
+      # else is the user's compile error and propagates verbatim. We do
+      # NOT silently fall back to the C backend — that would mask a real
+      # native codegen failure as success (the rejected hot-fallback).
+      if grep -q "not built into this compiler" "$nerr" 2>/dev/null; then
+        echo "kai: error: the native backend is not built into this kaic2." >&2
+        echo "       Rebuild with 'make -C stage2 KAI_LLVM=1 kaic2', or pass --backend=c." >&2
+        cat "$nerr" >&2
+        exit 2
+      fi
+      cat "$nerr" >&2
+      exit 1
+    fi
+    if [ ! -f "$obj" ]; then
+      die "native backend: no object produced (expected $obj)"
+    fi
+    # shellcheck disable=SC2086
+    # Same runtime-include precedence as the C / LLVM-text paths: the
+    # shim's `#include "runtime.h"` must bind to stage2's Koka runtime
+    # (tagged Int, slab, reuse-token), so $RUNTIME_INC_C leads.
+    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm
+  elif [ "$backend" = "llvm" ]; then
     ensure_clang
     if [ -z "$RUNTIME_LLVM_C" ]; then
       die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
@@ -1285,15 +1361,15 @@ cmd_build() {
       --backend=*)
         backend_cli="${1#--backend=}"; shift
         case "$backend_cli" in
-          c|llvm) ;;
-          *) die "--backend must be 'c' or 'llvm' (got: $backend_cli)" ;;
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
         esac ;;
       --backend)
         shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
         backend_cli="$1"; shift
         case "$backend_cli" in
-          c|llvm) ;;
-          *) die "--backend must be 'c' or 'llvm' (got: $backend_cli)" ;;
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
         esac ;;
       -*) die "unknown flag: $1 (see 'kai build --help')" ;;
       *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
@@ -1347,15 +1423,15 @@ cmd_run() {
       --backend=*)
         backend_cli="${1#--backend=}"; shift
         case "$backend_cli" in
-          c|llvm) ;;
-          *) die "--backend must be 'c' or 'llvm' (got: $backend_cli)" ;;
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
         esac ;;
       --backend)
         shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
         backend_cli="$1"; shift
         case "$backend_cli" in
-          c|llvm) ;;
-          *) die "--backend must be 'c' or 'llvm' (got: $backend_cli)" ;;
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
         esac ;;
       --) shift; break ;;
       *) break ;;

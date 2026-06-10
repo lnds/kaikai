@@ -22,21 +22,43 @@ endif
 LDLIBS_M := -lm
 
 # KIR Lane 1 (docs/kir-design.md §7.2) — in-process libLLVM backend.
-# OPT-IN ONLY: `make KAI_LLVM=1 kaic2` links stage2 against libLLVM so
-# the native backend can build the module via the LLVM C API in one
-# process (no `.ll` text, no clang subprocess). The DEFAULT build does
-# NOT link libLLVM — the C-text backend and the whole bootstrap chain
-# (stages 0–1 + C) never touch LLVM, so `bootstrap from any cc` is
-# intact. Discovery is via `llvm-config` (never a hardcoded version):
-# the LLVM C API is stable across major versions, so the binding
-# survives version bumps and the build stays off Apple clang.
+# The native backend builds the LLVM module via the C API in one
+# process (no `.ll` text, no clang subprocess); it is the default
+# `kai build` destination since Lane 1.5 (the flip). Whether a given
+# kaic2 carries the native backend is a BUILD-CAPABILITY decision made
+# here; whether `kai build` *invokes* it is a runtime decision made in
+# `bin/kai resolve_backend()`. The two are deliberately separate: the
+# Makefile decides what is compiled in, the wrapper decides what runs.
+#
+# Capability auto-detection (Lane 1.5):
+#   - `make kaic2` with NO KAI_LLVM override probes `llvm-config`. Found
+#     → link libLLVM (native-capable). Absent → C-only build. This keeps
+#     the bootstrap chain (stages 0–1 + C) and the selfhost byte-id /
+#     tier0 / tier1 gates green on a runner WITHOUT LLVM — they build a
+#     C-only kaic2 and never need a toolchain beyond `cc`. A dev WITH
+#     llvm-config gets native automatically, no flag.
+#   - `make KAI_LLVM=1 kaic2` FORCES native-capable: if llvm-config is
+#     missing the link line fails loudly (used by the release job, where
+#     a missing libLLVM MUST break, not silently ship a C-only binary).
+#   - `make KAI_LLVM=0 kaic2` forces C-only even where llvm-config exists
+#     (the C oracle build, e.g. for selfhost determinism in isolation).
+#
+# The Makefile NEVER changes the runtime default and NEVER degrades it
+# silently: a C-only kaic2 simply lacks the native backend, and the
+# wrapper reports an actionable error if asked for native — it does not
+# fall back to C. Discovery is via `llvm-config` (never a hardcoded
+# version): the LLVM C API is stable across major versions, so the
+# binding survives version bumps and the build stays off Apple clang.
 #
 # Dev-local links DYNAMIC (Homebrew `-lLLVM`); the release path links
 # STATIC (Rust/Zig/Julia model) so the shipped binary has no libLLVM
-# runtime dep and the brew formula needs no `depends_on llvm`. The
-# static-link release wiring rides Lane 1.5 (the default flip); this
-# lane sets up the dev link and the `#ifdef KAI_LLVM` runtime guard.
+# runtime dep and the brew formula needs no `depends_on llvm`.
 LLVM_CONFIG ?= llvm-config
+# KAI_LLVM unset → auto-detect; =1 → force on (fail if absent); =0 → off.
+ifeq ($(origin KAI_LLVM),undefined)
+KAI_LLVM := $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),1,0)
+KAI_LLVM_AUTO := 1
+endif
 ifeq ($(KAI_LLVM),1)
 LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs core analysis target native bitwriter) $(shell $(LLVM_CONFIG) --system-libs)
@@ -125,7 +147,15 @@ build/bundle.kai: $(BUNDLE_SRCS) | build
 build/stage2.c: build/bundle.kai $(KAIC1) | build
 	$(STACK) $(KAIC1) build/bundle.kai > $@
 
+# Announce which backend capability got compiled in, so a dev never has
+# to guess why `kai build` behaves differently across two checkouts (the
+# answer is always: llvm-config in PATH or not). Lane 1.5 capability line.
 $(TARGET): build/stage2.c
+ifeq ($(KAI_LLVM),1)
+	@echo "building stage2: native backend ENABLED ($(LLVM_CONFIG) found)"
+else
+	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
+endif
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 
 # Token stream must match stage 1 (which already matches stage 0).
