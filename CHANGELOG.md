@@ -84,6 +84,73 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.89.0 (2026-06-10)
+
+### BREAKING CHANGE
+
+- the `[<refinement_pure>]` fn attribute is removed.
+Contract-predicate purity is now derived from the effect row, so the
+opt-in marker is redundant; remove it from any signature that carries it.
+
+### Added
+
+- **stdlib**: lazy Stream[t, e] push carrier with pipe-canonical combinators
+- **build**: wire the native backend opt-in + a parity ratchet (Lane 1.5 infra)
+- **parser**: accept compound row arguments at alias instantiation
+- **emit**: lower TRMC to a cctx goto-loop in the native libLLVM backend
+- **stdlib**: add chunked streaming ops to the File effect
+- **runtime**: add chunked file IO primitives + pool-parking handlers
+- **emit**: walk stateful handlers and alias dispatch in the native libLLVM backend
+- **kir**: carry the stateful flag on clause KFn
+- **emit**: install builtin effect default-handlers in the native libLLVM walk
+- **emit**: lower algebraic effects in the native libLLVM walk
+- **emit**: generic KIR walk for the in-process libLLVM native backend
+- **kir**: in-process libLLVM native backend — main->42 end-to-end
+- **kir**: add TyHandle — non-RC opaque scalar for LLVM C-API handles
+- **compiler**: #[doc("...")] documentation attribute — parser, AST, side table, JSON surfaces
+- **kir**: complete AST→KIR lowering for interpolation, closures, effects
+- **stdlib**: spawn_actor_policy — spawn an actor with an explicit MailboxPolicy
+- **stdlib**: civil date module — proleptic Gregorian, ISO-8601, calendar arithmetic
+- **kir**: KIR Lane 0 — node set, AST→KIR lowering, --emit=kir dumper
+- **stdlib**: string index_of/to_upper/to_lower/is_empty/reverse + drop --include-prelude-tests (closes #396)
+- **stdlib**: HashSet[t] over HashMap[t, Unit] (closes #375)
+- **parser**: Go/Pony-style parameter type grouping
+- **typer**: m[key] indexing sugar dispatches to HashMap (#374)
+
+### Fixed
+
+- **native-parity**: keep list_helpers + list_zip3_scan as Linux-only SIGSEGV gaps
+- **kir**: close native-parity unary-minus + locals-shadow-imports (burn-down 2)
+- **desugar**: make the #[unstable] wrapper transparent to pre-lowering passes
+- **kir**: close native-parity missing-symbols + unbound-register slice (burn-down 1)
+- **emit**: emit a raw tail in multi-statement blocks without a box round-trip
+- **kir**: defer the self-call in TRMC step lowering
+- **typer**: anchor return-typed and test-block bare calls beyond let-bindings
+- **kir**: lower record-pattern match to a field-test decision tree
+- **kir**: lower literal-discriminated match to a condbr equality chain
+- **kir**: lower list-pattern match to a cons/nil decision tree
+- **tco**: fire TRMC for the builtin cons `[h, ...recur(t)]`
+- **fmt**: keep a last-line trailing comment inline on re-format
+- **fmt**: round-trip real literals and typed lambda params
+- **emit**: make the native main->42 spine reproducible (stage1 handle ABI)
+- **cli**: kai fmt no longer prints 'building package'
+- **build**: compile kaic2-emitted C against stage2/runtime.h
+
+### Changed
+
+- **stdlib**: drop #[unstable] from http server helpers
+- **fmt**: split formatter into A-grade modules
+- **unbox**: a divergent match arm does not block raw promotion
+- **unbox**: lower a match with an unboxable result to a raw _r
+- **stdlib**: migrate doc comments to #[doc(...)] attributes
+- **kir**: materialise if/match join slots, KUnreachable match default
+- **typer**: const as a first-class value; contract purity from the effect row
+- **emit**: port i64-inline + fast variant ctor paths to the LLVM backend (closes #747)
+- **emit**: LLVM backend reuses the match scrutinee in place (arm-top token)
+- **emit**: LLVM backend links the unified stage2 runtime
+- **stdlib**: short module-relative names for HashMap (#374)
+- **stdlib**: redesign HashMap as a mutable hash table (#374)
+
 ## v0.88.0 (2026-06-06)
 
 ### Added
