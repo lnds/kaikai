@@ -66,7 +66,7 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   }
   EUnop(op, a)       -> {
     let ra = lower_expr(a, st)
-    match ra { LRes(av, st1) -> bind_op(st1, KPrim(op, [av]), kpos_of(x)) }
+    match ra { LRes(av, st1) -> bind_op(st1, KPrim(unop_prim(op), [av]), kpos_of(x)) }
   }
 
   EIf(c, t, e_opt)   -> lower_if(x, c, t, e_opt, st)
@@ -125,6 +125,23 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # `EIndex` → call, `EUnder`/`EPlaceholder` pattern-only). These never
   # reach a post-perceus AST; lowering to unit keeps the match exhaustive
   # and mirrors the emitters' dead arms.
+  #
+  # KNOWN GAP (native-parity burn-down 3, docs/native-parity-gaps.md
+  # §"pipe-lowering"): `EPipe` actually DOES survive to codegen — the typer
+  # (`infer.kai`'s `synth_pipe`) rebuilds `EPipe(lhs, ECall(f, args))`
+  # rather than desugaring to `ECall`, leaving each emitter its own pipe
+  # desugaring (emit_c has `emit_pipe_expr`). The native KIR lowering has
+  # none yet, so `ys |> each(print)` / `xs |> filter(p)` lower to a no-op
+  # unit — the call vanishes (output-mismatch / wrong-value family). A first
+  # cut (rewrite to `ECall(f, [lhs, ...args])` + delegate to `lower_call`)
+  # closed the single-candidate + `each(print)` cases but TRAPPED the
+  # multi-candidate combinator path (`filter`/`map`/`reduce`): the typer
+  # resolves those to an `EModCall` callee whose `ECall` arg list reaches
+  # `lower_exprs` in a shape it rejects (`non-exhaustive match` at build).
+  # Lowering pipes is net-positive but the multi-candidate arg shape needs
+  # its own diagnosis (the corrupt-`args` source is upstream of the KIR);
+  # shipping the partial cut would turn an output-mismatch into a louder
+  # build panic with no parity gain. Deferred to burn-down 3.
   EPipe(_, _)        -> LRes(KUnitV, st)
   EMapPipe(_, _)     -> LRes(KUnitV, st)
   EFlatMapPipe(_, _) -> LRes(KUnitV, st)
@@ -155,19 +172,30 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
 #      uppercase-initial registered variant is a ctor, not a local —
 #      leaving it a bare `KVar` makes a backend look up a register never
 #      bound (the C emitter materialises it via `kai_nullary`).
-#   2. top-level `const` (`ANSWER`, `real_pi`) → materialise its literal
+#   2. a LOCAL binder (param / capture / `let` / match binder) → a `KVar`
+#      atom read. This is checked BEFORE const/fn-value so a local name
+#      that collides with a top-level `const` / stdlib `pub fn` / prelude
+#      builtin SHADOWS it (the locals-shadow-imports rule, #748/#749 — the
+#      same rule emit_c applies via its `EmitCtx.lcs`). Without it, a param
+#      named `init` (vs stdlib `list.init`), `foldl`'s `init`, etc. lowered
+#      to a closure over the stdlib thunk; that closure then reached an
+#      arithmetic op as a non-Int operand (the runtime-type-mismatch family).
+#   3. top-level `const` (`ANSWER`, `real_pi`) → materialise its literal
 #      body INLINE (a const is a literal with a name, not a function;
 #      mirror of emit_c's `const_body_of` → `emit_expr(body)`). This needs
 #      the recursion into `lower_expr`, so it lives here, not in the base.
-#   3. first-class fn value — a top-level fn OR a prelude builtin with a
+#   4. first-class fn value — a top-level fn OR a prelude builtin with a
 #      runtime thunk (`int_to_string` passed to `map`) → a `KClosure`
 #      (`ls_fn_value`).
-#   4. otherwise a genuine local binder → a `KVar` atom read.
+#   5. otherwise a genuine local binder not yet recorded → a `KVar` atom
+#      read (the conservative fall-through).
 # Before this, a const / prelude-value `EVar` fell through to a bare
 # `KVar` the native walk aborted on as `unbound register`.
 fn lower_var(name: String, st: LowerSt) : LRes / Console =
   if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
     bind_op(st, KCon(name, ls_variant_tag(st, name), []), KNoPos)
+  } else if ls_is_local(st, name) {
+    LRes(KVar(name), st)
   } else { match kir_const_body(st.consts, name) {
     Some(body) -> lower_expr(body, st)
     None       -> match ls_fn_value(st, name) {
@@ -877,8 +905,12 @@ fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / 
 # Route a bare-name call: a top-level fn or a prelude builtin is a direct
 # `KCall`; anything else is a local binder holding a function value, so
 # call it indirectly through `KCallIndirect` (a `kaix_apply`).
+# A LOCAL binder used as a callee (`let f = ...; f(x)`, a param `f(...)`)
+# is an indirect `kaix_apply`, even when its name collides with a
+# top-level fn — the local shadows the global (#748/#749). Checked before
+# `callee_is_direct` so the shadow is honoured (same rule as `lower_var`).
 fn lower_callee_dispatch(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  if callee_is_direct(st, callee) {
+  if not ls_is_local(st, callee) and callee_is_direct(st, callee) {
     lower_direct_call(x, c_sym_of_callee_st(st, callee), cargs, st)
   } else {
     match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
