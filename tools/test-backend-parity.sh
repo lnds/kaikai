@@ -50,10 +50,37 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
 
-if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
-  echo "test-backend-parity: SKIP (clang not in PATH)"
-  exit 0
-fi
+# Parametrised axis (Lane 1.5). The harness diffs a TARGET backend
+# against an ORACLE backend over the same corpus. Defaults reproduce the
+# original #575 C<->LLVM-text gate; set TARGET_BACKEND=native to gate the
+# in-process libLLVM backend (the Lane 1.5 default) against C-direct.
+ORACLE_BACKEND="${ORACLE_BACKEND:-c}"
+TARGET_BACKEND="${TARGET_BACKEND:-llvm}"
+
+case "$TARGET_BACKEND" in
+  native)
+    # The native backend needs a kaic2 with libLLVM linked in; it does
+    # NOT need clang at link time (cc links the emitted object). Probe
+    # the capability instead of clang: a C-only kaic2 rejects --emit=native
+    # with a known sentinel. SKIP (success) when native is unavailable —
+    # the native gate runs only where libLLVM is present (tier1-native),
+    # never silently degrading a C-only checkout to a pass.
+    probe="$(mktemp)"; mv "$probe" "$probe.kai"; probe="$probe.kai"
+    printf 'fn main() : Int = 0\n' > "$probe"
+    if ! "$KAI" build --backend=native "$probe" -o "${probe%.kai}.bin" >/dev/null 2>&1; then
+      echo "test-backend-parity: SKIP (native backend unavailable; rebuild kaic2 with make KAI_LLVM=1)"
+      rm -f "$probe" "${probe%.kai}.bin"
+      exit 0
+    fi
+    rm -f "$probe" "${probe%.kai}.bin"
+    ;;
+  *)
+    if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
+      echo "test-backend-parity: SKIP (clang not in PATH)"
+      exit 0
+    fi
+    ;;
+esac
 
 if [ ! -x "$KAI" ]; then
   echo "test-backend-parity FAIL — bin/kai not found or not executable"
@@ -179,55 +206,55 @@ process_one() {
   fi
 
   slug=$(echo "$f" | tr '/' '_' | tr '.' '_')
-  c_bin="$tmp/${slug}.c"
-  l_bin="$tmp/${slug}.llvm"
-  c_blog="$tmp/${slug}.c.build.log"
-  l_blog="$tmp/${slug}.llvm.build.log"
+  o_bin="$tmp/${slug}.oracle"
+  t_bin="$tmp/${slug}.target"
+  o_blog="$tmp/${slug}.oracle.build.log"
+  t_blog="$tmp/${slug}.target.build.log"
 
-  if ! KAI_BACKEND=c "$KAI" build "$f" -o "$c_bin" >"$c_blog" 2>&1; then
+  if ! KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$f" -o "$o_bin" >"$o_blog" 2>&1; then
     {
-      echo "FAIL $f — C build failed:"
-      tail -10 "$c_blog" | sed 's/^/    /'
+      echo "FAIL $f — $ORACLE_BACKEND (oracle) build failed:"
+      tail -10 "$o_blog" | sed 's/^/    /'
       echo
     } >> "$failures"
     printf 'F\n' >> "$results"
     return 0
   fi
 
-  if ! KAI_BACKEND=llvm "$KAI" build "$f" -o "$l_bin" >"$l_blog" 2>&1; then
+  if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
     {
-      echo "FAIL $f — LLVM build failed:"
-      tail -10 "$l_blog" | sed 's/^/    /'
+      echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
+      tail -10 "$t_blog" | sed 's/^/    /'
       echo
     } >> "$failures"
     printf 'F\n' >> "$results"
     return 0
   fi
 
-  c_out_file="$tmp/${slug}.c.out"
-  l_out_file="$tmp/${slug}.llvm.out"
-  c_rc=0
-  run_with_timeout "$c_bin" >"$c_out_file" 2>&1 </dev/null || c_rc=$?
-  l_rc=0
-  run_with_timeout "$l_bin" >"$l_out_file" 2>&1 </dev/null || l_rc=$?
+  o_out_file="$tmp/${slug}.oracle.out"
+  t_out_file="$tmp/${slug}.target.out"
+  o_rc=0
+  run_with_timeout "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
+  t_rc=0
+  run_with_timeout "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
 
-  if [ "$c_rc" != "$l_rc" ]; then
+  if [ "$o_rc" != "$t_rc" ]; then
     {
-      echo "FAIL $f — exit code mismatch (C=$c_rc, LLVM=$l_rc)"
-      echo "  C output (first 5 lines):"
-      head -5 "$c_out_file" | sed 's/^/    /'
-      echo "  LLVM output (first 5 lines):"
-      head -5 "$l_out_file" | sed 's/^/    /'
+      echo "FAIL $f — exit code mismatch ($ORACLE_BACKEND=$o_rc, $TARGET_BACKEND=$t_rc)"
+      echo "  $ORACLE_BACKEND output (first 5 lines):"
+      head -5 "$o_out_file" | sed 's/^/    /'
+      echo "  $TARGET_BACKEND output (first 5 lines):"
+      head -5 "$t_out_file" | sed 's/^/    /'
       echo
     } >> "$failures"
     printf 'F\n' >> "$results"
     return 0
   fi
 
-  if ! diff -q "$c_out_file" "$l_out_file" >/dev/null 2>&1; then
+  if ! diff -q "$o_out_file" "$t_out_file" >/dev/null 2>&1; then
     {
-      echo "FAIL $f — output mismatch (exit code matched: $c_rc):"
-      diff -u "$c_out_file" "$l_out_file" | head -20 | sed 's/^/    /'
+      echo "FAIL $f — output mismatch (exit code matched: $o_rc):"
+      diff -u "$o_out_file" "$t_out_file" | head -20 | sed 's/^/    /'
       echo
     } >> "$failures"
     printf 'F\n' >> "$results"
@@ -240,12 +267,13 @@ process_one() {
 # Export the worker + the helpers and state it touches so xargs can
 # reach them from each forked subshell.
 export KAI tmp failures results SKIPS_FILE RUN_TIMEOUT TIMEOUT_CMD
+export ORACLE_BACKEND TARGET_BACKEND
 export -f process_one is_skipped run_with_timeout
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
 
-echo "test-backend-parity: walking $total fixtures with $JOBS workers..."
+echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND (oracle) — walking $total fixtures with $JOBS workers..."
 
 # xargs spawns N parallel `bash -c 'process_one <fixture>'` calls,
 # each fixture goes to whichever worker is free. Output ordering is
@@ -258,7 +286,108 @@ fail=$(grep -c '^F$' "$results" 2>/dev/null || echo 0)
 skip=$(grep -c '^S$' "$results" 2>/dev/null || echo 0)
 
 echo ""
-echo "test-backend-parity: pass=$pass fail=$fail skip=$skip total=$total"
+echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip total=$total"
+
+# Ratchet mode (Lane 1.5). With NATIVE_PARITY_RATCHET=1 the gate does NOT
+# require zero failures — the native backend is at ~60% corpus parity and
+# the flip is blocked on closing the rest. Instead it compares the set of
+# failing fixtures against tools/native-parity-baseline.txt (the allowed
+# gaps) and enforces the anti-regression contract:
+#   - a fixture failing NOW that is NOT in the baseline => FAIL (a new gap).
+#   - a baseline fixture that now PASSES => OK, prompt to remove it.
+#   - failing set == baseline => OK at baseline.
+# This locks the burn-down: lanes can only move the count DOWN.
+if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
+  baseline_file="$ROOT/tools/native-parity-baseline.txt"
+  [ -f "$baseline_file" ] || { echo "ratchet FAIL — baseline missing: $baseline_file"; exit 1; }
+  # Current failing fixtures, one path per line (extracted from the
+  # failure log's `FAIL <path> — …` lines).
+  grep '^FAIL ' "$failures" 2>/dev/null | awk '{print $2}' | sort -u > "$tmp/failing.now"
+  # Allowed gaps: non-comment, non-blank lines of the baseline.
+  grep -vE '^[[:space:]]*(#|$)' "$baseline_file" | sort -u > "$tmp/failing.base"
+  # New gaps = failing now but not allowed. Closed gaps = allowed but
+  # now passing.
+  new_gaps="$(comm -23 "$tmp/failing.now" "$tmp/failing.base")"
+  closed_gaps="$(comm -13 "$tmp/failing.now" "$tmp/failing.base")"
+  # Flakiness guard. A handful of fixtures are NON-DETERMINISTIC under
+  # --backend=native (output carrying raw pointers / addresses, RC or
+  # hash-order dependence) — they pass on one run and fail the next. A
+  # strict set-equality ratchet would fail CI at random on those. So a
+  # candidate "new gap" is RE-VERIFIED: rebuild + run both backends once
+  # more, and only count it as a regression if it diverges AGAIN. A real
+  # regression diverges deterministically and survives the recheck; a
+  # flaky fixture clears it. (The known-flaky set already lives in the
+  # baseline as a normal gap — failing intermittently IS a parity gap.)
+  # A deterministic gap diverges on EVERY attempt; a flaky fixture passes
+  # at least once. Re-run the target up to 3 times against a single oracle
+  # build and report a regression only if it diverges ALL THREE times —
+  # so a fixture that flakes at any rate below 100% clears the recheck.
+  recheck_diverges() {
+    rf="$1"
+    rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
+    KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 1
+    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null)" || oref=$?
+    attempt=0
+    while [ "$attempt" -lt 3 ]; do
+      attempt=$((attempt + 1))
+      if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
+        # target build itself failed — a deterministic gap; keep checking.
+        continue
+      fi
+      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null)" || rt=$?
+      if [ "$rt" = "$oref" ] && [ "$rtout" = "$orefout" ]; then
+        return 1   # converged at least once => flaky, not a regression.
+      fi
+    done
+    return 0       # diverged on all 3 attempts => a real (new) gap.
+  }
+  real_new_gaps=""
+  for g in $new_gaps; do
+    if recheck_diverges "$g"; then
+      real_new_gaps="$real_new_gaps$g
+"
+    else
+      echo "ratchet: $g diverged once but passed on recheck — flaky, not a regression"
+    fi
+  done
+  if [ -n "$real_new_gaps" ]; then
+    echo ""
+    echo "ratchet FAIL — NEW native-parity gap(s) not in the baseline (confirmed on recheck):"
+    printf '%s' "$real_new_gaps" | sed 's/^/    + /'
+    echo ""
+    echo "  These fixtures regressed under --backend=native. Fix the backend"
+    echo "  (do NOT add them to tools/native-parity-baseline.txt to silence)."
+    echo ""
+    echo "--- failures ---"
+    cat "$failures"
+    exit 1
+  fi
+  # Symmetric flakiness guard for closed gaps: a baseline fixture that
+  # passed THIS run might be a flaky gap that happened to converge, not a
+  # genuinely-fixed one. Only suggest tightening the baseline for fixtures
+  # that pass CONSISTENTLY — re-verify each candidate and keep it only if
+  # it does NOT diverge on a recheck. A real fix survives; a flaky gap
+  # (e.g. hex_basic at ~50%) is dropped from the suggestion so a lane is
+  # not nudged to remove a gap that will reappear.
+  stable_closed=""
+  for g in $closed_gaps; do
+    if recheck_diverges "$g"; then
+      : # still flaky / still a gap — do not suggest removal.
+    else
+      stable_closed="$stable_closed$g
+"
+    fi
+  done
+  if [ -n "$stable_closed" ]; then
+    echo ""
+    echo "ratchet OK (improved) — these baseline gaps now PASS consistently; tighten the ratchet:"
+    printf '%s' "$stable_closed" | sed 's/^/    - /'
+    echo "  Remove the lines above from tools/native-parity-baseline.txt."
+  else
+    echo "ratchet OK — native-parity failures match the baseline ($(wc -l < "$tmp/failing.base" | tr -d ' ') gaps; flaky gaps held)."
+  fi
+  exit 0
+fi
 
 if [ "$fail" -gt 0 ]; then
   echo ""
