@@ -137,11 +137,22 @@ shadows a top-level fn is an indirect `kaix_apply`, not a direct call).
   light targets run sequentially keep-going: **0 fail**. test-effects /
   test-kir / test-runtime-shadow / rawsafe / borrowsafe / m4c isolated:
   **all OK**.
-- KAI_TRACE_RC: native on the new fixture leaks NO MORE than the C-direct
-  oracle (native 9 vs C 15 at-exit live set — `free_total=0` is the
-  process-exit set on both, not an RC imbalance). Consistent discipline.
-- native-parity ratchet: **pass=339 fail=82, 0 new gaps**, baseline lowered
-  137 → 82 in the same change.
+- RC discipline (CAVEAT — issue #812): `KAI_TRACE_RC`'s incref/decref
+  balance is BROKEN on main (it reports `incref_total=0 decref_total=0` and
+  `free_total=0` regardless of actual RC traffic), so the naive "balanced"
+  gate passes vacuously (0==0). The usable signals from the same tracer are
+  the per-tag ALLOC counters; the leak oracle is RSS via `/usr/bin/time -l`.
+  Validated against those: across the new fixture and the RC-heavy closed
+  fixtures (math_int_basic, list_basic, binserialize_recursive), native's
+  `alloc_total` is ≤ the C-direct oracle's (119≤125, 50≤55, 647≤664 — the
+  locals-shadow fix REMOVES the spurious stdlib-thunk closures the bug used
+  to materialise, so it allocates *fewer*), and native RSS is bounded
+  (~1.7–1.9 MB, ~10% over C's base — a constant runtime-link overhead that
+  does NOT scale with alloc count, the signature of no leak). A leak would
+  show RSS scaling with work; it does not.
+- native-parity ratchet: **pass=343 fail=89, 0 new gaps**, baseline lowered
+  137 → 82 by this lane (then 89 after rebasing onto #801/#810 corpus
+  growth, preserving their entries).
 
 ## Known issue surfaced (not this lane's fix)
 
