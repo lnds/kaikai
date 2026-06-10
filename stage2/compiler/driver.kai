@@ -2079,6 +2079,11 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # from `collect_effect_names` only catches DEffect names, while
   # these are DType.
   let existing_types = collect_type_names(decls)
+  # Issue #771 Phase 1: FileHandle is the opaque handle the chunked
+  # `File` ops carry. Same DType / DEffect namespace separation as
+  # Conn / Listener — the effect (`File`) is gated on `existing`, the
+  # companion type on `existing_types`.
+  let filehandle_d = inject_unconditional(existing_types, "FileHandle", builtin_filehandle_decl())
   let nettcp_d   = inject_unconditional(existing,       "NetTcp",   builtin_nettcp_decl())
   let conn_d     = inject_unconditional(existing_types, "Conn",     builtin_conn_decl())
   let listener_d = inject_unconditional(existing_types, "Listener", builtin_listener_decl())
@@ -2131,6 +2136,7 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
           list_append(stdin_d,
             list_append(env_d,
               list_append(file_d,
+                list_append(filehandle_d,
                 list_append(random_d,
                   list_append(state_d,
                     list_append(reader_d,
@@ -2156,7 +2162,7 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                                                   list_append(process_d,
                                                     list_append(log_d,
                                                       list_append(securerandom_d,
-                                                        list_append(ffi_d, decls)))))))))))))))))))))))))))))))))
+                                                        list_append(ffi_d, decls))))))))))))))))))))))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -2392,17 +2398,61 @@ fn builtin_env_decl() : Decl =
   DEffect(false, "Env", [], builtin_env_ops(),
     Some(builtin_default_block_for("Env", builtin_env_ops())), 0, 0)
 
+# Issue #771 Phase 1 (chunked streaming IO). Five new ops sit
+# alongside `read_file` / `write_file`, sharing the `File` effect so
+# `handle ... with File` can mock disk IO and the runtime default
+# handler routes each through the R1 thread pool with fiber parking,
+# identical to `read_file` (docs/effects-stdlib.md §`File`). The
+# error register is `Result`, the same inspectable raw register the
+# bulk ops use; the line surface (`#801`) layers `Fail`/`Option` on
+# top. `open_read` / `open_write` hand back a `FileHandle` (opaque
+# `{ fd: Int }`); `read_chunk` returns `""` at EOF. `write_chunk`
+# uses `Result[String, Unit]` (Err-first per kaikai's `Result[e, a]`
+# convention — the typer-correct shape for Ok=Unit/Err=String, NOT
+# the inverted `ty_result_unit_string_zero` the legacy `write_file`
+# decl carries; see that helper's note).
 fn builtin_file_ops() : [EffectOp] =
   [EOp("read_file", [],
        [param_string_zero("path")],
        ty_result_string_string_zero(), 0, 0),
    EOp("write_file", [],
        [param_string_zero("path"), param_string_zero("contents")],
-       ty_result_unit_string_zero(), 0, 0)]
+       ty_result_unit_string_zero(), 0, 0),
+   EOp("open_read", [],
+       [param_string_zero("path")],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("FileHandle")]),
+       0, 0),
+   EOp("read_chunk", [],
+       [param_typed_zero("h", ty_name_zero("FileHandle")),
+        Param { pname: "max", ptype: Some(ty_name_zero("Int")),
+                pline: 0, pcol: 0 }],
+       ty_result_string_string_zero(), 0, 0),
+   EOp("open_write", [],
+       [param_string_zero("path")],
+       ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("FileHandle")]),
+       0, 0),
+   EOp("write_chunk", [],
+       [param_typed_zero("h", ty_name_zero("FileHandle")),
+        param_string_zero("data")],
+       ty_result_string_unit_zero(), 0, 0),
+   EOp("close_file", [],
+       [param_typed_zero("h", ty_name_zero("FileHandle"))],
+       ty_name_zero("Unit"), 0, 0)]
 
 fn builtin_file_decl() : Decl =
   DEffect(false, "File", [], builtin_file_ops(),
     Some(builtin_default_block_for("File", builtin_file_ops())), 0, 0)
+
+# Issue #771 Phase 1: opaque file handle the chunked `File` ops
+# return / consume. Single-field record carrying the OS file
+# descriptor; the runtime's `_kai_file_handle_fd` reads the slot by
+# name, so the field name is load-bearing — must stay "fd" in
+# lockstep with stage0/runtime.h's `_kai_file_make_handle`. Same
+# opaque-DType discipline as Conn / Listener (gated on
+# existing_types, referenced by the effect op signatures).
+fn builtin_filehandle_decl() : Decl =
+  DType(false, "FileHandle", [],
+    TBRecord([FD(true, "fd", ty_name_zero("Int"))]), 0, 0, None)
 
 # Random effect — Doc B §`Random`. v1 ships only `int_range`; the
 # pinned catalog also lists `float()` and `bytes(n)` but those are

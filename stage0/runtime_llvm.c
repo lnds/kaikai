@@ -1191,6 +1191,22 @@ KaiValue *kaix_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
 KaiValue *kaix_default_file_write_file(void *self, KaiValue *path, KaiValue *contents, KaiCont *k) {
     return kai_default_file_write_file(self, path, contents, k);
 }
+/* Issue #771 Phase 1: chunked File ops — same forwarder shape. */
+KaiValue *kaix_default_file_open_read(void *self, KaiValue *path, KaiCont *k) {
+    return kai_default_file_open_read(self, path, k);
+}
+KaiValue *kaix_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k) {
+    return kai_default_file_read_chunk(self, h, max, k);
+}
+KaiValue *kaix_default_file_open_write(void *self, KaiValue *path, KaiCont *k) {
+    return kai_default_file_open_write(self, path, k);
+}
+KaiValue *kaix_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k) {
+    return kai_default_file_write_chunk(self, h, data, k);
+}
+KaiValue *kaix_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
+    return kai_default_file_close_file(self, h, k);
+}
 KaiValue *kaix_default_stdin_read_line(void *self, KaiCont *k) {
     return kai_default_stdin_read_line(self, k);
 }
