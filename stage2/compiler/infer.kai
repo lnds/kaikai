@@ -891,6 +891,10 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
     # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
     # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
     TyRefine(base, p) -> TyRefineT(inf_resolve_ty(base), p)
+    # issue #772: a compound row reaching *type* position (not dissolved
+    # by alias substitution) — resolve to an undeclared name so the
+    # natural "unknown type" cascade reports it.
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
   }
 }
 
@@ -1434,6 +1438,29 @@ fn inf_type_expr_display(t: TypeExpr) : String {
     ])
     TyDim(base, u) -> concat_all([inf_type_expr_display(base), "<", inf_unit_expr_display(u), ">"])
     TyRefine(base, _) -> concat_all([inf_type_expr_display(base), " where <pred>"])
+    # issue #772: compound row as a type argument — render bare labels.
+    TyRow(row) -> inf_row_expr_display(row)
+  }
+}
+
+# issue #772: render a row's labels/tail as a bare `A + B + tail`
+# string — the shape a compound row takes inside a `[...]` type
+# argument list.
+fn inf_row_expr_display(r: RowExpr) : String {
+  match r {
+    REmpty -> ""
+    RClosed(labels) -> inf_row_labels_display(labels)
+    ROpen(tail, labels) ->
+      if labels == [] { tail }
+      else { concat_all([inf_row_labels_display(labels), " + ", tail]) }
+  }
+}
+
+fn inf_row_labels_display(ls: [RowLabel]) : String {
+  match ls {
+    [] -> ""
+    [RL(n, _)] -> n
+    [RL(n, _), ...rest] -> concat_all([n, " + ", inf_row_labels_display(rest)])
   }
 }
 
@@ -3576,6 +3603,10 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
     TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds), unit_canon(u))
     # m12.6.x #1: preserve refinement on the semantic side.
     TyRefine(base, p) -> TyRefineT(resolve_ty_with_tparams(base, binds), p)
+    # issue #772: a compound row reaching *type* position (not dissolved
+    # by alias substitution) — resolve to an undeclared name so the
+    # natural "unknown type" cascade reports it.
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
   }
 }
 
@@ -4526,6 +4557,10 @@ fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
     # m12.6.a: refinement predicates are pure (no effects, no rows);
     # only the base type can contribute row variables.
     TyRefine(base, _) -> collect_rvars_in_typeexpr(base, acc)
+    # issue #772: a compound row as a type argument can carry an open
+    # tail (`Stream[Int, Stdout + f]`); collect `f` as a row variable
+    # so the scheme binds it before alias substitution folds the row in.
+    TyRow(row) -> collect_rvars_in_row(row, acc)
   }
 }
 
@@ -4602,6 +4637,10 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
     # m12.6.x #1: preserve refinement on the semantic side.
     TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds(base, tpbinds, rbinds), p)
+    # issue #772: a compound row reaching *type* position (not dissolved
+    # by alias substitution). Resolve to an undeclared name so the
+    # natural "unknown type" cascade reports it.
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
   }
 }
 
@@ -4838,6 +4877,9 @@ fn collect_implicit_in_typeexpr(t: TypeExpr, declared: [String], acc: [String]) 
     # m12.6.a: refinements stay transparent; only the base type
     # contributes implicit type parameters.
     TyRefine(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
+    # issue #772: a compound row as a type argument — recurse into any
+    # parameterised labels it carries (`Reader[t]`) for implicit tparams.
+    TyRow(row) -> collect_implicit_in_row(row, declared, acc)
   }
 }
 
@@ -15150,6 +15192,9 @@ fn ty_expr_find_handle(hname: String, t: TypeExpr,
     # m12.6.a: refinement predicates cannot mention Fiber/Pid (predicate
     # subset is data-only); only the base type matters.
     TyRefine(base, _) -> ty_expr_find_handle(hname, base, sums, visited)
+    # issue #772: a compound row carries effect labels, never a
+    # Fiber/Pid handle type — no breach to find.
+    TyRow(_) -> None
   }
 }
 
@@ -15245,6 +15290,10 @@ fn subst_tparams_te(t: TypeExpr, mapping: [TParamMapEntry]) : TypeExpr {
       mk_ty(TyDim(subst_tparams_te(base, mapping), u), t.line, t.col)
     TyRefine(base, p) ->
       mk_ty(TyRefine(subst_tparams_te(base, mapping), p), t.line, t.col)
+    # issue #772: a compound-row payload is passed through unchanged,
+    # matching the `TyFn` arm above (which leaves its row untouched).
+    # The carrier is dissolved by alias substitution, not here.
+    TyRow(_) -> t
   }
 }
 
@@ -15845,6 +15894,25 @@ fn validate_unit_refs_te(te: TypeExpr, declared: [String], file: String) : Int /
   TyDim(base, u) -> validate_unit_refs_te(base, declared, file) +
                      validate_unit_expr(u, declared, file, te.line, te.col)
   TyRefine(base, _) -> validate_unit_refs_te(base, declared, file)
+  # issue #772: a compound row as a type argument — validate units
+  # inside any parameterised labels it carries (`Reader[Int<m>]`).
+  TyRow(row) -> validate_unit_refs_row(row, declared, file)
+}
+
+fn validate_unit_refs_row(row: RowExpr, declared: [String], file: String) : Int / Console + File =
+  match row {
+    REmpty -> 0
+    RClosed(labels) -> validate_unit_refs_rls(labels, declared, file, 0)
+    ROpen(_, labels) -> validate_unit_refs_rls(labels, declared, file, 0)
+  }
+
+fn validate_unit_refs_rls(ls: [RowLabel], declared: [String], file: String,
+                             acc: Int) : Int / Console + File = match ls {
+  [] -> acc
+  [RL(_, ts), ...rest] -> {
+    let e1 = acc + validate_unit_refs_te_list(ts, declared, file, 0)
+    validate_unit_refs_rls(rest, declared, file, e1)
+  }
 }
 
 fn validate_unit_refs_te_list(ts: [TypeExpr], declared: [String], file: String,
@@ -16347,6 +16415,11 @@ fn vmps_te(te: TypeExpr, decl_name: String, decl_kind: String,
   }
   TyRefine(base, _) -> vmps_te(base, decl_name, decl_kind, home, priv_table, file,
                                   te.line, te.col)
+  # issue #772: a compound row as a type argument — validate the
+  # privacy of any labels it carries before alias substitution
+  # dissolves the carrier.
+  TyRow(row) -> vmps_row(row, decl_name, decl_kind, home, priv_table, file,
+                            te.line, te.col)
 }
 
 fn vmps_uexpr(u: UnitExprT, decl_name: String, decl_kind: String,
@@ -16552,6 +16625,11 @@ fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
     # is preserved verbatim — no unit aliases live inside it.
     TyRefine(base, p) ->
       mk_ty(TyRefine(expand_aliases_typeexpr(base, aliases), p), t.line, t.col)
+    # issue #772: a compound-row carrier is passed through this unit-alias
+    # expansion unchanged, matching the `TyFn` arm (which leaves its row
+    # untouched). Effect-alias labels are expanded on the row-expression
+    # side, not here.
+    TyRow(_) -> t
   }
 }
 

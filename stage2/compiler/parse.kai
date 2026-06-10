@@ -4017,7 +4017,29 @@ fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PT
     None -> err_t(r.p)
     Some(arg) -> {
       let p1 = p_skip_newlines(r.p)
-      if p_at(p1, TkComma) {
+      # issue #772: a compound effect row as a type argument —
+      # `Stream[Int, Stdout + Fail]`. A `+` after the first label means
+      # this argument is a row, not a plain type. Re-read it as a row
+      # (seeding the labels with what we already parsed) and wrap it in
+      # a `TyRow` carrier that alias substitution folds into the alias
+      # row. Single-label and named-row-alias arguments keep the
+      # ordinary `parse_type` path (`Stdout`, `SB`).
+      if p_at(p1, TkPlus) {
+        let rr = parse_row_type_arg(p_advance(p1), arg)
+        match rr.r {
+          None -> err_t(rr.p)
+          Some(row_te) -> {
+            let p2 = p_skip_newlines(rr.p)
+            if p_at(p2, TkComma) {
+              parse_type_args_loop(p_skip_newlines(p_advance(p2)), [row_te, ...acc], name, t)
+            } else if p_at(p2, TkRbracket) {
+              ok_t(p_advance(p2), mk_ty(TyName(name, list_reverse([row_te, ...acc])), t.line, t.col))
+            } else {
+              err_t(p_error_here(p2, "expected `,` or `]` after type arguments"))
+            }
+          }
+        }
+      } else if p_at(p1, TkComma) {
         parse_type_args_loop(p_skip_newlines(p_advance(p1)), [arg, ...acc], name, t)
       } else if p_at(p1, TkRbracket) {
         ok_t(p_advance(p1), mk_ty(TyName(name, list_reverse([arg, ...acc])), t.line, t.col))
@@ -4026,6 +4048,43 @@ fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PT
       }
     }
   }
+}
+
+# issue #772: parse the remainder of a compound row argument. `first`
+# is the label already parsed before the `+`; `p` is positioned just
+# after that `+`. Reuses `parse_row_labels` to read the rest of the
+# row, then prepends `first`, yielding a `TyRow` carrier. The first
+# label must be a plain (possibly parameterised) name — a function or
+# list type in row-argument position is rejected.
+fn parse_row_type_arg(p: Parser, first: TypeExpr) : PTy / Console {
+  match te_as_row_label(first) {
+    None -> err_t(p_error(p, p_peek(p),
+      "expected an effect label before `+` in a row type argument"))
+    Some(rl) -> {
+      let pr = parse_row_labels(p, [rl])
+      match pr.r {
+        REmpty -> err_t(pr.p)
+        _      -> ok_t(pr.p, mk_ty(TyRow(pr.r), first.line, first.col))
+      }
+    }
+  }
+}
+
+# A row label is a plain *uppercase* name (`Stdout`) or a parameterised
+# effect (`Reader[Int]`). Convert the parsed `TypeExpr` form into the
+# `RowLabel` the row carries. A lowercase name is a row *variable*,
+# which may only be the last item in a row — so it is rejected as the
+# leading label of a compound row argument (`a + Stdout` is malformed,
+# matching the `parse_row_labels` discipline). A function/list/dim/
+# refine type in label position is also rejected.
+fn te_as_row_label(te: TypeExpr) : Option[RowLabel] = match te.tkind {
+  TyName(nm, targs) -> if row_label_name_is_upper(nm) { Some(RL(nm, targs)) } else { None }
+  _                 -> None
+}
+
+fn row_label_name_is_upper(s: String) : Bool = match char_at(s, 0) {
+  Some(c) -> ch_is_upper(c)
+  None    -> false
 }
 
 fn parse_fn_type(p: Parser, t: Token) : PTy / Console {
@@ -4418,6 +4477,28 @@ fn type_surface(t: TypeExpr) : String {
     TyFn(_, _, _) -> "fn(...)"
     TyDim(base, _) -> concat_all([type_surface(base), "<...>"])
     TyRefine(base, _) -> concat_all([type_surface(base), " where ..."])
+    # issue #772: compound row as a type argument — render bare labels.
+    TyRow(row) -> row_surface(row)
+  }
+}
+
+# Render a row's labels/tail as a bare `A + B + tail` string (issue
+# #772) for diagnostic surfaces.
+fn row_surface(r: RowExpr) : String {
+  match r {
+    REmpty -> ""
+    RClosed(labels) -> row_labels_surface(labels)
+    ROpen(tail, labels) ->
+      if labels == [] { tail }
+      else { concat_all([row_labels_surface(labels), " + ", tail]) }
+  }
+}
+
+fn row_labels_surface(ls: [RowLabel]) : String {
+  match ls {
+    [] -> ""
+    [RL(n, _)] -> n
+    [RL(n, _), ...rest] -> concat_all([n, " + ", row_labels_surface(rest)])
   }
 }
 
