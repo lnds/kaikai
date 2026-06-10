@@ -18,6 +18,7 @@ import compiler.emit_shared
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
 import compiler.kir_lower_rec
@@ -147,21 +148,32 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
   LRes(KUnitV, st)
 }
 
-# An `EVar` is either a nullary constructor used as a value (→ a `KCon`,
-# e.g. `None` / `Red` in `record { value: None }`), a first-class
-# reference to a top-level fn (→ a `KClosure` over the fn's thunk), or a
-# local binder (→ a `KVar` atom read). The nullary-ctor case must come
-# FIRST: an uppercase-initial name registered as a variant is a ctor, not
-# a local — leaving it a bare `KVar` makes a backend look up a register
-# that was never bound (the C emitter materialises it via `kai_nullary`).
-# Local binders are not in the EFn/variant tables, so a miss on both is a
-# genuine local.
+# An `EVar` in value position resolves through the SAME cascade the
+# C-direct oracle's `emit_ident_value` / const arm walks (and emit_llvm's
+# `llvm_emit_fn_value`), in this order:
+#   1. nullary constructor (`None` / `Red`) → a `KCon`. Must come FIRST: an
+#      uppercase-initial registered variant is a ctor, not a local —
+#      leaving it a bare `KVar` makes a backend look up a register never
+#      bound (the C emitter materialises it via `kai_nullary`).
+#   2. top-level `const` (`ANSWER`, `real_pi`) → materialise its literal
+#      body INLINE (a const is a literal with a name, not a function;
+#      mirror of emit_c's `const_body_of` → `emit_expr(body)`). This needs
+#      the recursion into `lower_expr`, so it lives here, not in the base.
+#   3. first-class fn value — a top-level fn OR a prelude builtin with a
+#      runtime thunk (`int_to_string` passed to `map`) → a `KClosure`
+#      (`ls_fn_value`).
+#   4. otherwise a genuine local binder → a `KVar` atom read.
+# Before this, a const / prelude-value `EVar` fell through to a bare
+# `KVar` the native walk aborted on as `unbound register`.
 fn lower_var(name: String, st: LowerSt) : LRes / Console =
   if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
     bind_op(st, KCon(name, ls_variant_tag(st, name), []), KNoPos)
-  } else { match ls_fn_value(st, name) {
-    Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
-    None                   -> LRes(KVar(name), st)
+  } else { match kir_const_body(st.consts, name) {
+    Some(body) -> lower_expr(body, st)
+    None       -> match ls_fn_value(st, name) {
+      Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
+      None                   -> LRes(KVar(name), st)
+    }
   } }
 
 # Lower a list of expressions left-to-right (Risk 2a), collecting atoms.
@@ -328,20 +340,54 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
   SExprStmt(x) -> match lower_expr(x, st) {
     LRes(v, st1) -> ls_emit(st1, KDo(KLitOp(v), kpos_of(x)))
   }
-  SAssert(cond, _) -> match lower_expr(cond, st) {
-    LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert", [v]), KNoPos))
+  # `assert cond` / `assert cond, "msg"` → `kai_assert_check(cond, msg)`,
+  # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits
+  # (it consults `kai_test_in_progress` at runtime — abort outside a test,
+  # longjmp to the harness inside one). The earlier `kai_assert(cond)`
+  # one-arg form had no runtime symbol on the native path (`kaix_assert`
+  # is undefined; only `kaix_assert_check` exists), so the object failed
+  # to link — the whole missing-symbols family. The message is the literal
+  # span when present, else `"assertion failed"` (mirror of the oracle's
+  # `msg_lit`); the issue-#86 value-carrying form is a later refinement.
+  SAssert(cond, opt_msg) -> match lower_expr(cond, st) {
+    LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
   }
   _ -> st
 }
 
-# Bind a pattern to an already-lowered value. The common case is a plain
-# `PBind(name)`: alias the value into `name` via a KLet. Destructuring
-# patterns inside a `SLet` are rare in the post-perceus core (match handles
-# them); model the simple binder now (covered, not silently wrong).
-fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt = match pat.pkind {
-  PBind(name) -> ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
-  PWild       -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
-  _           -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+# The assert message span (quote-wrapped, as `KStrV` carries it): a plain
+# string-literal message keeps its source span; anything else (or no
+# message) falls back to the generic `"assertion failed"`. Mirror of
+# emit_c's `msg_lit`.
+fn kir_assert_msg(opt_msg: Option[Expr]) : String = match opt_msg {
+  Some(m) -> match m.kind {
+    EStr(span, false) -> span
+    _                 -> kir_quote("assertion failed")
+  }
+  None -> kir_quote("assertion failed")
+}
+
+# Bind a pattern to an already-lowered value. A plain `PBind(name)` aliases
+# the value into `name`; a DESTRUCTURING pattern (`let { p: { x, y } } = b`,
+# `let Some(x) = o`) reads each field/slot and recurses into nested
+# sub-patterns — the SAME `bind_pattern_fields_any` path the variant match
+# arms use. Before this, a record/variant `SLet` fell through to the
+# value-discarding `KDo`, binding NOTHING, so the body's `EVar(x)` was an
+# unbound register. Mirror of emit_c's `emit_pat_binds` over a let-bind.
+fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match pat.pkind {
+  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
+  PRecord(_)           -> bind_pattern_fields_any(pat, v, st)
+  PVariant(_, _)       -> bind_pattern_fields_any(pat, v, st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(pat, v, st)
+  PAs(name, _)         -> bind_let_as(pat, name, v, st)
+  _                    -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+}
+
+# A `let name @ pat = v`: alias `name` to the whole value, then bind the
+# inner pattern against it.
+fn bind_let_as(pat: Pattern, name: String, v: KVal, st: LowerSt) : LowerSt / Console = {
+  let st1 = ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
+  bind_pattern_fields_any(as_inner(pat), v, st1)
 }
 
 # --- if -----------------------------------------------------------------
@@ -571,16 +617,40 @@ fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match
 # literal-discriminated dispatch (`match n { 0 -> ...; 1 -> ... }`) is
 # diverted to `lower_lit_match` (kir_lower_lit.kai) BEFORE this switch is
 # built, so multiple non-variant arms no longer collapse into one default.
+# The default arm runs when no variant case matched. Its PATTERN may bind
+# the whole scrutinee: a `PBind(s)` whole-value binder, a `PNarrow(x, T)`
+# refinement-narrowed binder (`x : LowerSlug -> shout(x)` — the typer's
+# `where`-predicate match arm), or a `PAs(name, sub)`. Before binding the
+# name to `scrv`, the body's `EVar(x)`/`EVar(s)` was an unbound register.
+# A `PWild`/`PLit` default binds nothing. Destructuring (variant / record)
+# default patterns also bind via `bind_pattern_fields_any`.
 fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
                      ldef: String, st: LowerSt) : LowerSt / Console =
   match first_default_arm(arms) {
-    Some(body) -> lower_branch_into(body, join, lcont, reopen(st, ldef))
-    None       -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
+    Some(Arm(p, _, body)) -> {
+      let st_def = bind_default_pattern(p, scrv, reopen(st, ldef))
+      lower_branch_into(body, join, lcont, st_def)
+    }
+    None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
   }
 
-fn first_default_arm(arms: [Arm]) : Option[Expr] = match arms {
+# Bind the default arm's pattern to the whole scrutinee. A plain / narrowed
+# binder aliases `scrv`; an as-pattern aliases then descends; a
+# destructuring pattern reuses the field-bind path; wildcard/literal bind
+# nothing.
+fn bind_default_pattern(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
+  PNarrow(name, _)     -> ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
+  PAs(name, _)         -> bind_let_as(p, name, scrv, st)
+  PVariant(_, _)       -> bind_pattern_fields_any(p, scrv, st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(p, scrv, st)
+  PRecord(_)           -> bind_pattern_fields_any(p, scrv, st)
+  _                    -> st
+}
+
+fn first_default_arm(arms: [Arm]) : Option[Arm] = match arms {
   [] -> None
-  [Arm(p, _, body), ...rest] -> if arm_is_default(p) { Some(body) } else { first_default_arm(rest) }
+  [a, ...rest] -> match a { Arm(p, _, _) -> if arm_is_default(p) { Some(a) } else { first_default_arm(rest) } }
 }
 
 fn arm_is_default(p: Pattern) : Bool = match p.pkind {
@@ -614,23 +684,6 @@ fn lower_arm_bodies(arms: [Arm], cases: [KCase], scrv: KVal, join: String,
       }
       [] -> st
     } }
-}
-
-# Bind a variant pattern's positional sub-binders from the scrutinee by
-# slot index. One level covers the rb-tree / option shapes; nested
-# destructuring is a later refinement.
-fn bind_pattern_fields(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, subs) -> bind_sub_binders(subs, scrv, 0, st)
-  _                 -> st
-}
-
-fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match subs {
-  [] -> st
-  [sp, ...rest] -> match sp.pkind {
-    PBind(name) -> bind_sub_binders(rest, scrv, idx + 1,
-                     ls_emit(st, KLet(name, SBoxed, KProj(scrv, idx), KAt(sp.line, sp.col))))
-    _ -> bind_sub_binders(rest, scrv, idx + 1, st)
-  }
 }
 
 # --- Effect handlers ----------------------------------------------------
