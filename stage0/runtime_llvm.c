@@ -1364,6 +1364,17 @@ KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot) {
     return &kai_var_slots(node)[holeslot].ptr;
 }
 
+/* Builtin-cons TRMC hole (native walk): the address of a `kai_cons`
+ * cell's tail slot — the open hole the next loop step attaches to. The
+ * cons cell is NOT a registered variant, so its tail lives at
+ * `node->as.cons.tail`, NOT in `kai_var_slots[holeslot]` (which
+ * `kaix_field_addr` indexes). Mirrors the C-direct oracle's
+ * `kai_field_addr_create(&_trmc_node->as.cons.tail)` in
+ * `emit_trmc_cons_step`. */
+KaiValue **kaix_cons_tail_addr(KaiValue *node) {
+    return &node->as.cons.tail;
+}
+
 KaiValue *kaix_cctx_apply(KaiValue *res, KaiValue **hole, KaiValue *child) {
     if (hole != NULL) { *hole = child; return res; }
     return child;

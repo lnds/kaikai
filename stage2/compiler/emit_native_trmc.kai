@@ -1,0 +1,134 @@
+# compiler/emit_native_trmc.kai — TRMC (tail-recursion-modulo-cons)
+# lowering for the in-process libLLVM native backend (KIR Lane 1.2 Parte B).
+#
+# A modulo-cons recursion like `[h+1, ...map_inc(t)]` is rewritten by the
+# frontend into a `KTrmcStep` (the cons site) + a `KTrmcApply` (the
+# terminal leaf). The native walk lowers them to a constructor-context
+# (cctx) goto-loop — the same O(1)-stack shape the C-direct backend emits
+# in `emit_trmc_cons_step` (emit_c.kai), carried through the shared
+# `kaix_cctx_*` runtime shims:
+#
+#   `_kai_acc_res`  (ptr)       — the spine root, NULL before the first step
+#   `_kai_acc_hole` (ptr-to-ptr) — address of the open tail slot, NULL first
+#
+# Each step builds `kai_cons(head, NULL)`, extends the cctx to point its
+# hole at the new cell's tail, rebinds the loop params from the deferred
+# self-call's args, and branches to the loop header — NEVER making the
+# recursive call. The terminal `KTrmcApply` plugs the leaf into the open
+# hole and returns the spine root.
+#
+# Soundness (the four risks, per the TRMC design):
+#  1. Hole aliasing — the hole address is recomputed against THIS step's
+#     cell (`kaix_cons_tail_addr`) and stored back, never hoisted.
+#  2. Dropmask — carried on `KTrmcStep`; the rebind honors it like
+#     `KTcrecGoto` (subset-1 arithmetic loops are RC no-ops; a heap-param
+#     drop is the same deferred-drop case the tcrec path flags).
+#  3. Terminal leaf — `KTrmcApply` always emits `kaix_cctx_apply`, so the
+#     list never ends with a NULL hole (the easy-to-forget edge).
+#  4. i64-inline — N/A: the native walk is all-boxed; the cons cell is a
+#     real `kai_cons` with boxed head/tail, no kind-1 slot layout.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+
+# The two cctx accumulator register names (entry-block allocas).
+pub fn ntrmc_res_reg() : String = "_kai_acc_res"
+pub fn ntrmc_hole_reg() : String = "_kai_acc_hole"
+
+# Reserve the cctx accumulator allocas for a fn whose body contains a
+# `KTrmcStep` (the walk's allocas-in-entry rule). `_kai_acc_res` is a
+# boxed `ptr` seeded NULL; `_kai_acc_hole` is a `ptr` cell holding a
+# `KaiValue**` (the open tail address), also seeded NULL. Both live in the
+# entry block so they are visible loop-wide.
+pub fn nemit_trmc_allocas(ctx: Handle, blocks: [KBlock]) : Unit / Console =
+  if ntrmc_blocks_have_step(blocks) {
+    let p = native_ctx_ptrt(ctx)
+    let res = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ntrmc_res_reg(), ".addr"))
+    native_ctx_add_reg(ctx, ntrmc_res_reg(), res, 0)
+    let _z0 = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), res)
+    let hole = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ntrmc_hole_reg(), ".addr"))
+    native_ctx_add_reg(ctx, ntrmc_hole_reg(), hole, 0)
+    let _z1 = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), hole)
+    ()
+  } else { () }
+
+fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
+  [] -> false
+  [b, ...rest] -> if ntrmc_term_is_step(b.term) { true } else { ntrmc_blocks_have_step(rest) }
+}
+fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
+  KTrmcStep(_, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+# `KTrmcStep`: build the cons cell with a NULL hole at the tail, extend the
+# cctx to point at it, recompute the new hole, rebind the loop params from
+# the deferred self-call's args, then branch to the loop header. The
+# `head_vals` are the non-hole ctor args (the cons head); `assigns` are the
+# self-call's args (the back-edge rebinds).
+pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String,
+                       head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  # 1. node = kai_cons(head, NULL). The builtin cons holds head at
+  #    `as.cons.head` and the open hole at `as.cons.tail` (hole_slot is the
+  #    cdr; `kaix_cons_tail_addr` finds it, NOT the variant-slot path).
+  let head = ntrmc_head_val(ctx, head_vals)
+  let node = ncall_sig2(ctx, "kaix_cons", p, p, p, head, llvm_const_null(p))
+  # 2. extend the cctx: plug `node` into the OLD hole, get the new root.
+  #    res' = kaix_cctx_extend(res, hole, node); store res' back.
+  let res_old = nemit_load_reg(ctx, ntrmc_res_reg())
+  let hole_old = nemit_load_reg(ctx, ntrmc_hole_reg())
+  let res_new = ncall_sig3(ctx, "kaix_cctx_extend", p, p, p, p, res_old, hole_old, node)
+  nemit_store_reg(ctx, ntrmc_res_reg(), res_new)
+  # 3. new hole = &node->as.cons.tail; store it back.
+  let hole_new = ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node)
+  nemit_store_reg(ctx, ntrmc_hole_reg(), hole_new)
+  # 4. rebind the loop params from the self-call's args (evaluate ALL
+  #    first — they read the OLD param allocas — then store), then branch
+  #    to the first KIR block (the loop header). Same discipline as
+  #    `nemit_tcrec` (the dropmask's deferred drops follow the same path).
+  let valbuf = llvm_buf_new()
+  ntrmc_eval_assigns(ctx, asg, valbuf)
+  ntrmc_store_assigns(ctx, asg, valbuf, 0)
+  llvm_buf_free(valbuf)
+  llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
+  ()
+}
+
+# The cons head is the single non-hole ctor arg (builtin cons is binary:
+# head + the hole tail). Materialise it; a malformed `head_vals` (not
+# exactly one) is a frontend invariant violation — fall back to unit.
+fn ntrmc_head_val(ctx: Handle, head_vals: [KVal]) : Handle / Console = match head_vals {
+  [h] -> nemit_atom(ctx, h)
+  _   -> nemit_null(ctx)
+}
+
+fn ntrmc_eval_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle) : Unit / Console = match asg {
+  [] -> ()
+  [KAsg(_, v), ...rest] -> { llvm_buf_push(valbuf, nemit_atom(ctx, v)); ntrmc_eval_assigns(ctx, rest, valbuf) }
+}
+fn ntrmc_store_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle, i: Int) : Unit / Console = match asg {
+  [] -> ()
+  [KAsg(idx, _), ...rest] -> {
+    llvm_build_store(native_ctx_b(ctx), llvm_buf_get(valbuf, i), native_ctx_reg_at(ctx, idx))
+    ntrmc_store_assigns(ctx, rest, valbuf, i + 1)
+  }
+}
+
+# `KTrmcApply`: plug the terminal leaf into the open cctx hole and return
+# the spine root. `out = kaix_cctx_apply(res, hole, leaf)`. An empty cctx
+# (first level, hole NULL) returns the leaf itself. This is the loop exit
+# (the recursion bottomed out), so it `ret`s the assembled spine.
+pub fn nemit_trmc_apply(ctx: Handle, leaf: KVal) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let leafv = nemit_atom(ctx, leaf)
+  let res = nemit_load_reg(ctx, ntrmc_res_reg())
+  let hole = nemit_load_reg(ctx, ntrmc_hole_reg())
+  let out = ncall_sig3(ctx, "kaix_cctx_apply", p, p, p, p, res, hole, leafv)
+  let _r = llvm_build_ret(native_ctx_b(ctx), out)
+  ()
+}
