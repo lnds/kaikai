@@ -2967,7 +2967,35 @@ test-effects: $(TARGET) build
 	  grep -q "^open_read failed: open_read: cannot open file$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (#771 open_read missing -> inspectable Err)" \
 	    || { echo "effects FAIL $$name (negative output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done
+	done; \
+	for spec in \
+	  "stream_early_stop|^early_stop count=3$$|#801 push carrier early-stop via take" \
+	  "stream_mock_disk|^mock errors=2$$|#801 read_lines mocked via handle...with File" \
+	  "stream_skip_policy|^skip count=3$$|#801 ReadFault.bad_chunk resume = skip and continue" \
+	  "stream_shout_roundtrip|^shout: HELLO$$|#801 read map write_lines in one expression" \
+	  "stream_abort_leak|^abort result=aborted closes=0$$|#801 abort policy skips producer close (documented fd leak)" \
+	  "ctor_field_effect_row|^boom x2$$|#801 typer: ctor field's effect row survives instantiation"; do \
+	  name=$${spec%%|*}; rest=$${spec#*|}; pat=$${rest%%|*}; desc=$${rest#*|}; \
+	  f=../examples/effects/$$name.kai; \
+	  ./$(TARGET) --edition hanga-roa --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "$$pat" build/s2-$$name.out \
+	    && echo "effects OK $$name ($$desc)" \
+	    || { echo "effects FAIL $$name (output mismatch; want /$$pat/)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	./$(TARGET) --edition hanga-roa --path ../stdlib ../demos/wc.kai > build/s2-wc.c 2> build/s2-wc.err \
+	  || { echo "effects FAIL wc (kaic2 errored)"; cat build/s2-wc.err; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-wc.c -o build/s2-wc $(LDLIBS_M) \
+	  || { echo "effects FAIL wc (C compile failed)"; exit 1; }; \
+	./build/s2-wc ../examples/effects/stream_wc_input.txt > build/s2-wc.out 2>&1 \
+	  || { echo "effects FAIL wc (binary exit non-zero)"; cat build/s2-wc.out; exit 1; }; \
+	grep -q "^2 9 44 " build/s2-wc.out \
+	  && echo "effects OK wc (#801 demo: lines/words/chars in one fold over read_lines)" \
+	  || { echo "effects FAIL wc (output mismatch; want '2 9 44 <path>')"; cat build/s2-wc.out; exit 1; }
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
 # lambda-block as expression, double trailing lambdas) and m7b #6

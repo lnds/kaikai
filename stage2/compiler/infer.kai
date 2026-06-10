@@ -3655,15 +3655,63 @@ fn append_ints(a: [Int], b: [Int]) : [Int] {
 fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
   match v {
     Var(_ctor_name, vargs) -> {
+      # A tparam that appears in *row* position inside a ctor field
+      # (e.g. `Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)`)
+      # must be resolved as a row variable, not a type variable —
+      # otherwise the field's effect row is dropped and any effectful
+      # producer fails to unify (the bug behind the nominal Stream
+      # carrier). We split the declared tparams: those used in row
+      # position become `rbinds` (resolved via `resolve_ty_with_binds`,
+      # which preserves `TyFn` rows); the rest stay type-level `binds`.
+      let rvar_names = collect_rvars_in_typeexprs(vargs, [])
+      let tvar_names = names_excluding(tparams, rvar_names)
       let binds = mk_tpbinds(tparams)
+      # The row-var binds REUSE the ids `mk_tpbinds` already assigned to
+      # each name (rather than re-numbering from zero with `mk_rvbinds`):
+      # if `e` is the second tparam it has tpbind id 1, and the rbind for
+      # `e` must carry that same 1. Otherwise a stray `e` in *type*
+      # position would resolve via `binds` to `tv(1)` — an id that is in
+      # neither `vars` nor `rvars`, leaving an ungeneralised free type-var
+      # in the scheme. Type-var ids (for `tvar_names`) and row-var ids
+      # (for `rvar_names`) are disjoint by construction, so the
+      # type-pool / row-pool substitutions never collide.
+      let rbinds = map(rvar_names, (n) => RVB(n, tpbind_id_of(binds, n)))
+      let arg_tys = map(vargs, (a) => resolve_ty_with_binds(a, binds, rbinds))
+      # The result `TyCon` carries one type-arg slot per declared tparam,
+      # in declaration order, so use-site unification lines up positionally.
+      # Row-kind tparams still occupy their slot as a `tv` placeholder —
+      # the row machinery substitutes through it the same way the alias
+      # path does (issue #772 `rows.kai`).
       let ids = tparam_ids(tparams)
-      let arg_tys = map(vargs, (a) => resolve_ty_with_tparams(a, binds))
       let result = TyCon(None, type_name, map(ids, tv))
+      let tvar_ids = map(tvar_names, (n) => tpbind_id_of(binds, n))
+      let rvar_ids = map(rvar_names, (n) => tpbind_id_of(binds, n))
       match vargs {
         [] -> scheme(ids, result)
-        _  -> scheme(ids, fn_ty(arg_tys, result))
+        _  -> scheme_full(tvar_ids, rvar_ids, fn_ty(arg_tys, result))
       }
     }
+  }
+}
+
+# Look up the type-var id assigned to a tparam name in its TPBind list.
+# A miss is a compiler bug: every name passed here comes from `tparams`,
+# which `mk_tpbinds` binds in full — so panic rather than fabricate a
+# bogus id that would leak an ungeneralised type-var into the scheme.
+fn tpbind_id_of(binds: [TPBind], name: String) : Int =
+  match tpbind_lookup(binds, name) {
+    Some(i) -> i
+    None    -> panic("tpbind_id_of: tparam not in binds: #{name}")
+  }
+
+# Return the names in `xs` that are not present in `drop` (order-preserving).
+# Used to separate a ctor's type-kind tparams from its row-kind ones.
+fn names_excluding(xs: [String], drop: [String]) : [String] {
+  match xs {
+    [] -> []
+    [h, ...rest] ->
+      if list_has(drop, h) { names_excluding(rest, drop) }
+      else { [h, ...names_excluding(rest, drop)] }
   }
 }
 
