@@ -83,13 +83,21 @@ kai build examples/phase4/euler1.kai -o euler1
 #  sum = 233168
 ```
 
-`kai` picks the backend automatically: LLVM when `clang` is on `PATH`
-(faster, fewer external deps), otherwise the portable C path linked
-with `cc`. Override the default with `KAI_BACKEND=c|llvm` or, per
-invocation, `--backend=c|llvm`. The L2 lane (2026-05-11) closed the
-emitter gaps (`bit_*` intrinsics, variant-record / record / narrow
-patterns) that previously required `KAI_NO_STDLIB=1` on the LLVM path,
-so the full stdlib now compiles under either backend.
+The default backend is the portable C path (`kaic2` emits C, linked
+with `cc`) — supported across the whole corpus. Two LLVM backends are
+opt-in:
+
+- `--backend=native` / `KAI_BACKEND=native` — the in-process libLLVM
+  backend (builds the module via the LLVM C API and emits a native
+  object directly; no `.ll` text, no `clang`). This is the project's
+  intended default destination (docs/kir-design.md §7.2); it is opt-in
+  until its full-corpus parity with the C oracle is complete
+  (KIR Lane 1.5).
+- `--backend=llvm` / `KAI_BACKEND=llvm` — the legacy LLVM-text path
+  (emits `.ll` via `kaic2 --emit=llvm`, links with `clang`).
+
+The `--backend` flag overrides `KAI_BACKEND`, which overrides the `c`
+default.
 
 Run the inline test blocks in a file:
 

@@ -624,6 +624,36 @@ grow, not after.
   working native-emitting `kai`. Mandatory retro.
 - **Deps:** Lane 1.2 (complete native walk + reproducible + in full parity vs
   C-direct over the 388). The flip cannot happen on the Lane 1 bring-up alone.
+- **Status (2026-06-09): BLOCKED on parity — the flip did NOT proceed.** The
+  premise that the native backend "emits the whole language" held for the 14
+  curated `examples/native/` fixtures but FAILED on the corpus. Measured
+  native-vs-C-direct over the full corpus (513 fixtures, grown from 388):
+  **~250 pass / 168 fail / 96 skip (~60%)** (167 stable + 1 intermittent —
+  some native gaps are flaky, e.g. an intermittent SIGSEGV). The gaps are
+  real codegen work, not documentation — families: unbound-register 35,
+  runtime-type-mismatch 27, missing-symbols 24, build-failed-other 24,
+  output-mismatch 20, SIGSEGV/SIGABRT 12+, exit-code-mismatch 11,
+  no-effect-handler 10 (Spawn/Clock/NetTcp), timeout 2, clause-param-origin 2.
+  ALL 11 `demos/` core programs fail. Full list: `docs/native-parity-gaps.md`;
+  retro: `docs/lane-experience-native-default-flip.md`.
+
+  What shipped is the **infrastructure** the flip needs, with the default
+  left at `c`:
+  - `stage2/Makefile` capability auto-detection (`llvm-config` present →
+    native-capable; absent → C-only) + announce line — `tier0`/`tier1` stay
+    green without LLVM.
+  - `bin/kai` `native` backend wired and reachable opt-in
+    (`--backend=native` / `KAI_BACKEND=native`); a C-only kaic2 rejects it
+    with an actionable error (no silent fallback to C).
+  - `tools/test-backend-parity.sh` parametrised (`TARGET_BACKEND`/
+    `ORACLE_BACKEND`) — one harness for both the #575 C↔LLVM-text gate and
+    native-vs-C; plus a `NATIVE_PARITY_RATCHET=1` mode.
+  - `tools/native-parity-baseline.txt` — the 167-gap anti-regression
+    ratchet (a new gap fails CI; the baseline only tightens). The flip
+    re-runs when this file is empty.
+
+  The deferred flip steps (default flip, `tier1-native` → always-on,
+  release static-link) are wired-but-dormant; they land when parity closes.
 
 ### Lane 2 (deferrable cleanup, OFF critical path) — migrate C-text under KIR
 - **Brief:** Only if/when reducing the emit_c↔emit_llvm duplication (§1) is worth
