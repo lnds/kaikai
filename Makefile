@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -501,6 +501,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
 	@$(MAKE) -C stage2 test-perceus-issue703-asan
 	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
+	@$(MAKE) -C stage2 test-issue-779-asan
+	@echo "tier1-asan OK — issue #779 fixture passes under ASAN+UBSan (multi-stmt block raw-tail drop-threading gate)"
 	@$(MAKE) -C stage2 test-perceus-enum-slot-asan
 	@echo "tier1-asan OK — enum-slot fixture passes under ASAN+UBSan (enum-as-int extract/re-intern soundness gate)"
 	@$(MAKE) -C stage2 test-perceus-int-cache-asan
