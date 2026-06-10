@@ -2,9 +2,9 @@
 
 > **Status (2026-06-10, after burn-down 2 + #801/#810 corpus growth):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **~343 pass / 89 fail / 96 skip** over 528
-> fixtures vs the C-direct oracle (~80% corpus parity, up from ~60% at
-> first measure). The flip to native-default (Lane 1.5) is **BLOCKED** on
+> docs/kir-design.md §7.2) is at **342 pass / 91 fail / 96 skip** over 528
+> fixtures vs the C-direct oracle on Linux/CI (~80% corpus parity, up from
+> ~60% at first measure). The flip to native-default (Lane 1.5) is **BLOCKED** on
 > closing these gaps. This file is the burn-down input: every failing
 > fixture, grouped by root-cause family. The anti-regression ratchet that
 > locks the count is `tools/native-parity-baseline.txt` (gated in
@@ -20,7 +20,11 @@
 > `File`/`ReadFault`), `demos/wc.kai` (exit-code-mismatch, same root cause
 > at runtime), `ctor_field_effect_row` (clause-param-origin). → 88. Issue
 > #810 (`#[unstable]` transparency) then added `attr_unstable_refine_narrow`
-> (native SIGSEGV, C clean — a backend gap, not a regression). → 89.
+> (native SIGSEGV, C clean — a backend gap, not a regression). → 89. Finally,
+> `list_helpers` + `list_zip3_scan` PASS native on macOS but SIGSEGV on
+> Linux/CI (the merge oracle), so they stay listed despite closing locally
+> in burn-down 2 — the cross-platform lesson burn-down 1's retro flagged.
+> → 91.
 >
 > **Flakiness:** a few native gaps were non-deterministic (intermittent
 > SIGSEGV / pointer-bearing output) — e.g. `examples/stdlib/hex_basic.kai`
@@ -32,13 +36,13 @@
 > Reproduce: `TARGET_BACKEND=native ORACLE_BACKEND=c tools/test-backend-parity.sh`
 > (needs a kaic2 built with libLLVM — `make -C stage2 KAI_LLVM=1`).
 
-## Root-cause families (89 remaining)
+## Root-cause families (91 remaining)
 
 | Family | Count | Signature / likely cause |
 |---|---:|---|
 | build-failed-other | 25 | native build fails with a signature not in the buckets below (regex / json / map / http — large stdlib modules that pull in an unhandled lowering shape). |
 | no-effect-handler | 14 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File/ReadFault>` — effect ops the native walk installs no handler for (Spawn 7, Clock 2, NetTcp 1, + #801's `File`/`ReadFault` line-stream stages: `stream_early_stop`, `stream_mock_disk`, `stream_skip_policy`, `stream_abort_leak`). |
-| exit-code-mismatch / SIGSEGV | 16 | `c=0, native=1` (or 138/139 — a crash counts as a non-zero exit): native exits non-zero / crashes where C succeeds (hashmap/hashset, quicksort, deep recursion). Includes `demos/wc.kai` (#801 `read_lines` over `File`+`ReadFault`, no native handler → diverges on exit) and `attr_unstable_refine_narrow` (#810 — native SIGSEGV). |
+| exit-code-mismatch / SIGSEGV | 18 | `c=0, native=1` (or 138/139 — a crash counts as a non-zero exit): native exits non-zero / crashes where C succeeds (hashmap/hashset, quicksort, deep recursion). Includes `demos/wc.kai` (#801 `read_lines` over `File`+`ReadFault`, no native handler → diverges on exit), `attr_unstable_refine_narrow` (#810 — native SIGSEGV), and `list_helpers` / `list_zip3_scan` (native SIGSEGV on Linux only — pass on macOS). |
 | unbound-register | 13 | `native: unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test / writer-state slice. The mechanical binds closed in burn-down 1; these need a nested decision tree. |
 | output-mismatch | 13 | same exit code, divergent stdout. Two sub-causes: **pipe-lowering** (`EPipe` lowers to unit, the call vanishes) and **Real-arithmetic** (`9.88131e-324` ≈ a raw i64 read as a double). See below. |
 | missing-symbols | 3 | `Undefined symbols for architecture arm64` at link — `bits` / `crypto_hash` runtime entries the native object references but never defines. |
@@ -48,8 +52,8 @@
 > Several fixtures show more than one signature (e.g. `free_fall` and
 > `math_real_basic` show both a `^` type-mismatch and an exit-diff); each
 > is listed once below under its primary root cause. The per-family lists
-> below total 89 (matching `tools/native-parity-baseline.txt`); the count
-> column above sums to 89.
+> below total 91 (matching `tools/native-parity-baseline.txt`); the count
+> column above sums to 91.
 
 ## Burn-down 2 root causes (CLOSED — do not re-open)
 
@@ -155,7 +159,7 @@ examples/llvm/nested_lambda_with_mailbox.kai
 examples/stdlib/date_basic.kai
 examples/stdlib/date_iso.kai
 examples/stdlib/http_server_book_ch17.kai
-# exit-code-mismatch / SIGSEGV (16)
+# exit-code-mismatch / SIGSEGV (18)
 demos/forth/main.kai
 demos/quicksort/main.kai
 demos/wc.kai
@@ -172,6 +176,8 @@ examples/stdlib/hashmap_basic.kai
 examples/stdlib/hashmap_collision.kai
 examples/stdlib/hashset_basic.kai
 examples/stdlib/hashset_ops.kai
+examples/stdlib/list_helpers.kai
+examples/stdlib/list_zip3_scan.kai
 # unbound-register — nested-variant-test slice (13)
 examples/effects/m7b_11_writer_basic.kai
 examples/effects/m7b_14_writer_helper.kai

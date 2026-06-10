@@ -12,11 +12,14 @@ reaches an op boxed where raw is expected, or vice-versa).
 
 **Shipped:** the box/unbox hypothesis was HALF right — but the actual root
 causes were sharper and more transverse than "box discipline". Two
-KIR-lowering bugs, neither one a box/unbox slot mismatch, closed **55**
-gaps (137 → 82) — far beyond the three target families' ~58 fixtures,
+KIR-lowering bugs, neither one a box/unbox slot mismatch, closed **53**
+gaps cross-platform (137 → 84 on Linux/CI; 55 closed on macOS but 2 of
+those — `list_helpers`, `list_zip3_scan` — SIGSEGV on Linux only, so they
+stay listed). Still far beyond the three target families' ~58 fixtures,
 because both bugs are triggered by a *surface pattern* that appears all
-over the corpus, not by a family-specific shape. The full-corpus ratchet
-run measured pass=339 (was ~249), fail=82, 0 regressions.
+over the corpus, not by a family-specific shape. The CI ratchet (Linux)
+measured pass=342, fail=91 (84 burn-down-2 + 7 #801/#810 corpus growth),
+0 regressions.
 
 ## Root causes found and fixed
 
@@ -105,6 +108,20 @@ shadows a top-level fn is an indirect `kaix_apply`, not a direct call).
    output-mismatch for a louder build panic with no parity gain, so it was
    REVERTED and documented as a burn-down-3 item with the exact failing
    shape. Discipline call: a partial pipe fix is a false-green hazard.
+
+5. **The ratchet is a LINUX gate — a macOS-only pass is not a closed gap.**
+   I removed 55 fixtures from the baseline after they passed native-vs-C on
+   my macOS dev box (3× each, deterministic). CI (Linux) then re-flagged 2
+   of them — `list_helpers`, `list_zip3_scan` — as NEW gaps: they SIGSEGV
+   (139) under native on Linux while passing on macOS, deterministically on
+   each platform. This is the exact cross-platform risk burn-down 1's retro
+   flagged. The native backend has a latent bug (uninitialised-memory /
+   stack shape) that macOS tolerates and Linux faults on. Fix: the 2 stay
+   listed (net 53 closed, not 55); the gap doc + baseline carry a
+   cross-platform note. Lesson load-bearing for burn-down 3: validate the
+   ratchet delta on Linux (or run the corpus under ASan locally) BEFORE
+   trusting a macOS green — a local pass that CI rejects costs a full
+   ~21-minute tier1-native round-trip per miss.
 
 ## Fixtures added / coverage gaps
 
