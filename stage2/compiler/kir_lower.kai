@@ -33,7 +33,7 @@ import compiler.kir
 # the enclosing-fn key the lambda lookup is scoped by.
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      fns: [EFn], vs: [EVar], lams: [LamInfo], enc_fn: String,
-                     effs: [String] }
+                     effs: [String], consts: [Decl] }
 
 # Result of lowering one expression: its value atom + threaded state.
 pub type LRes = LRes(KVal, LowerSt)
@@ -49,9 +49,10 @@ pub type RecPlan = RecPlan([KFieldInit], LowerSt)
 # An optional lowered value (handler state init) + threaded state.
 pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
-pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String]) : LowerSt =
+pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
+              consts: [Decl]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs }
+            lams: lams, enc_fn: "", effs: effs, consts: consts }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -59,7 +60,7 @@ pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String]) : L
 # lowering (Risk 2b).
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts }
 
 # A fresh virtual-register name, deterministic per function: `t0`, `t1`, …
 pub fn ls_fresh_reg(st: LowerSt) : LSReg =
@@ -72,22 +73,22 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
 
 # --- Block accumulation -------------------------------------------------
 
 # Append one statement to the block under construction (stored reversed).
 pub fn ls_emit(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -111,8 +112,24 @@ pub type FnValue = FV(String, Int)
 
 pub fn ls_fn_value(st: LowerSt, nm: String) : Option[FnValue] = match efn_resolve(st.fns, nm) {
   Some(EFn(_, arity, mo, _)) -> Some(FV(cat3("_kai_", c_sym(nm, mo), "_thunk"), arity))
-  None                       -> None
+  None                       -> kir_prelude_fn_value(nm)
 }
+
+# A PRELUDE builtin used as a first-class value (`map(xs, int_to_string)`):
+# the closure rides the runtime's pre-defined `kaix_<name>_thunk` (defined
+# in `stage0/runtime_llvm.c`). Mirror of emit_llvm's `llvm_prelude_find` →
+# `LP(_, arity, Some(thunk))` arm and emit_c's `prelude_find` → `EP` arm:
+# only the builtins with a `Some(thunk)` entry can be a value (most prims
+# are call-only). The native `nemit_closure_call` declares `sym` directly,
+# so it carries the bare runtime symbol (no `@`, no `&`). The set MUST stay
+# in lockstep with the runtime thunks; an unlisted name falls through to a
+# local-binder `KVar` (the genuine-local case `lower_var` ends on).
+fn kir_prelude_fn_value(nm: String) : Option[FnValue] =
+  if nm == "print"        { Some(FV("kaix_print_thunk", 1)) }
+  else if nm == "eprint"        { Some(FV("kaix_eprint_thunk", 1)) }
+  else if nm == "write_stdout"  { Some(FV("kaix_write_stdout_thunk", 1)) }
+  else if nm == "int_to_string" { Some(FV("kaix_int_to_string_thunk", 1)) }
+  else { None }
 
 # A qualified reference (`mod.fn`) as a fn-value: mint the prefixed thunk
 # symbol from the module + name (emit_c's EModCall value arm), resolving
@@ -136,6 +153,34 @@ pub fn callee_is_direct(st: LowerSt, callee: String) : Bool = match efn_resolve(
 fn name_in_list(xs: [String], target: String) : Bool = match xs {
   [] -> false
   [h, ...rest] -> if h == target { true } else { name_in_list(rest, target) }
+}
+
+# --- Top-level consts (inlined at their use site) -----------------------
+
+# The top-level `DConst` decls of a program, kept in `LowerSt.consts` so
+# `lower_var` materialises a const read as its literal body inline — the
+# same modelling as the C-direct oracle's `EmitCtx.consts` /
+# `const_body_of` (emit_c) and the LLVM-text backend's `llvm_const_body_of`
+# (a const is a literal with a name, not a function). Mirror of
+# emit_c's `const_decls_only`.
+pub fn kir_const_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DConst(_, _, _, _, _, _, _) -> kir_const_decls(rest, list_append(acc, [d]))
+    _                           -> kir_const_decls(rest, acc)
+  }
+}
+
+# A const decl's literal body by name, or None when `name` is not a
+# top-level const (then it is a fn / prelude builtin / local binder).
+# Mirror of emit_c's `const_body_of`.
+pub fn kir_const_body(consts: [Decl], name: String) : Option[Expr] = match consts {
+  [] -> None
+  [d, ...rest] -> match d {
+    DConst(_, cn, _, body, _, _, _) ->
+      if cn == name { Some(body) } else { kir_const_body(rest, name) }
+    _ -> kir_const_body(rest, name)
+  }
 }
 
 # --- Pure helpers (no recursion through lower_expr) ----------------------
@@ -207,7 +252,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts }
 
 # --- Type declarations --------------------------------------------------
 
