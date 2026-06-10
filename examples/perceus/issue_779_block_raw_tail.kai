@@ -1,0 +1,54 @@
+# Issue #779 — a multi-statement EBlock with a raw tail must emit the
+# tail RAW, without a `kai_int(...)` box + `(...)->as.i` unbox round-trip.
+#
+# Before the fix `emit_kind_raw`'s EBlock arm only handled the empty-stmts
+# case raw; a block WITH statements (the Perceus `__pcs_ret` wrap, or a
+# plain `let`-then-tail body) fell to the boxed-then-unbox fallback. For an
+# `Int` tail that round-trip was merely wasteful; for a raw `Handle`
+# (`void *`) it would CORRUPT the pointer. This fixture is the RC-shaped
+# regression: each fn returns a raw scalar through a block whose statements
+# include a heap value (a String param read twice, forcing a Perceus exit
+# DROP) — a drop skipped by the raw-tail promotion leaks; a drop run
+# against the raw scalar is a UAF. The ASAN sibling and the `KAI_TRACE_RC`
+# gate catch either failure.
+
+# A raw UFn helper: returns an `int64_t` from a heap String. Calls of this
+# in a block tail keep the tail raw (the unbox pass marks the call
+# MUnboxed), so a block whose tail is `len(s)` arithmetic stays raw.
+fn slen(s: String) : Int = string_length(s)
+
+# `pick` — the issue's repro shape: a `let` then a raw `if` tail. `x` is a
+# raw Int (raw arith on params), so the ternary `if x > 0 { x } else { b }`
+# is a raw C ternary; the surrounding block must NOT re-box it.
+fn pick(a: Int, b: Int) : Int = {
+  let x = a + 1
+  if x > 0 { x } else { b }
+}
+
+# `scan` — the leak-shaped case: the String param `s` is read twice, so
+# Perceus wraps the body in
+# `EBlock([SLet(__pcs_ret, inner), __perceus_drop(s)], Some(__pcs_ret))`.
+# `slen` is a raw UFn, so `n`/`m` are raw and the inner tail `n + m` is raw
+# arith — BOTH the inner block and the __pcs_ret wrap lower raw, and the
+# exit drop of `s` must thread unchanged before the raw tail.
+fn scan(s: String) : Int = {
+  let n = slen(s)
+  let m = slen(s)
+  n + m
+}
+
+# `mix` — mixed raw/heap: a raw Int param `a` plus a heap String param `s`
+# read twice (exit drop). Tail is raw arith over raw helper results.
+fn mix(a: Int, s: String) : Int = {
+  let n = slen(s)
+  let m = slen(s)
+  a + n + m
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(int_to_string(pick(5, 9)))       # x = 6 > 0 -> 6
+  Stdout.print(int_to_string(pick(0 - 4, 9)))   # x = -3, not > 0 -> 9
+  Stdout.print(int_to_string(scan("hello")))    # 5 + 5 = 10
+  Stdout.print(int_to_string(scan("")))         # 0 + 0 = 0
+  Stdout.print(int_to_string(mix(100, "abc")))  # 100 + 3 + 3 = 106
+}
