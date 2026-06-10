@@ -88,8 +88,10 @@ pub fn doc_text_normalize(s: String) : String {
 
 # One top-level named declaration, documented or not. Undocumented
 # items still get an entry (doc: None) so doc_for_line can use them
-# as boundaries and the JSON dumps can report coverage.
-pub type DocItem = { kind: String, name: String, line: Int, is_pub: Bool, doc: Option[String] }
+# as boundaries and the JSON dumps can report coverage. `sig` is the
+# rendered surface signature — `(p: T, ...) -> R / Eff` for a `fn`,
+# None for the other kinds (issue #774 follow-up: `kai doc` shows it).
+pub type DocItem = { kind: String, name: String, line: Int, is_pub: Bool, doc: Option[String], sig: Option[String] }
 
 # Result of the post-parse strip walk.
 pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int }
@@ -97,12 +99,12 @@ pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem
 #[doc("DocItem for a named declaration, seeing through DUnstable / DDerive / DDoc wrappers. None for unnamed decls (tests, imports, impls...).")]
 pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
   match d {
-    DFn(p, nm, _, _, _, _, _, ln, _, _)    -> Some(doc_item(p, "fn", nm, ln, doc))
-    DType(p, nm, _, _, ln, _, _)           -> Some(doc_item(p, "type", nm, ln, doc))
-    DEffect(p, nm, _, _, _, ln, _)         -> Some(doc_item(p, "effect", nm, ln, doc))
-    DProtocol(p, nm, _, _, ln, _)          -> Some(doc_item(p, "protocol", nm, ln, doc))
-    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", nm, ln, doc))
-    DConst(p, nm, _, _, _, ln, _)          -> Some(doc_item(p, "const", nm, ln, doc))
+    DFn(p, nm, _, ps, rt, ef, _, ln, _, _) -> Some(doc_item(p, "fn", nm, ln, doc, Some(doc_sig(ps, rt, ef))))
+    DType(p, nm, _, _, ln, _, _)           -> Some(doc_item(p, "type", nm, ln, doc, None))
+    DEffect(p, nm, _, _, _, ln, _)         -> Some(doc_item(p, "effect", nm, ln, doc, None))
+    DProtocol(p, nm, _, _, ln, _)          -> Some(doc_item(p, "protocol", nm, ln, doc, None))
+    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", nm, ln, doc, None))
+    DConst(p, nm, _, _, _, ln, _)          -> Some(doc_item(p, "const", nm, ln, doc, None))
     DUnstable(inner, _, _)                 -> doc_item_of(inner, doc)
     DDerive(_, inner, _, _)                -> doc_item_of(inner, doc)
     DDoc(_, _, inner, _, _)                -> doc_item_of(inner, doc)
@@ -110,8 +112,68 @@ pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
   }
 }
 
-fn doc_item(is_pub: Bool, kind: String, name: String, line: Int, doc: Option[String]) : DocItem =
-  DocItem { kind: kind, name: name, line: line, is_pub: is_pub, doc: doc }
+fn doc_item(is_pub: Bool, kind: String, name: String, line: Int,
+            doc: Option[String], sig: Option[String]) : DocItem =
+  DocItem { kind: kind, name: name, line: line, is_pub: is_pub, doc: doc, sig: sig }
+
+# ---- signature rendering ----
+#
+# Best-effort surface signature for a `fn`: `(p: T, ...) -> R / Eff`.
+# Mirrors `te_to_string` / `fn_detail` in driver.kai, kept here so
+# doc_attr stays a leaf (parse.kai + infer.kai import it). The text is
+# a hint for `kai doc`, not a faithful pretty-print.
+
+#[doc("Render a fn's params, return type and effect row as `(p: T, ...) -> R / Eff`.")]
+pub fn doc_sig(params: [Param], ret: Option[TypeExpr], eff: RowExpr) : String =
+  concat_all(["(", join_with(map(params, doc_param), ", "), ")",
+              doc_ret(ret), doc_eff(eff)])
+
+fn doc_param(p: Param) : String =
+  match p.ptype {
+    None    -> p.pname
+    Some(t) -> concat_all([p.pname, ": ", doc_te(t)])
+  }
+
+fn doc_ret(ret: Option[TypeExpr]) : String =
+  match ret {
+    None    -> ""
+    Some(t) -> concat_all([" -> ", doc_te(t)])
+  }
+
+fn doc_eff(eff: RowExpr) : String =
+  match eff {
+    REmpty       -> ""
+    RClosed([])  -> ""
+    _            -> concat_all([" / ", doc_row(eff)])
+  }
+
+fn doc_te(t: TypeExpr) : String =
+  match t.tkind {
+    TyName(n, args) ->
+      if list_length(args) == 0 { n }
+      else { concat_all([n, "[", join_with(map(args, doc_te), ", "), "]"]) }
+    TyList(inner)   -> concat_all(["[", doc_te(inner), "]"])
+    TyFn(ps, r, _)  -> concat_all(["(", join_with(map(ps, doc_te), ", "), ") -> ", doc_te(r)])
+    TyDim(base, _)   -> doc_te(base)
+    TyRefine(base, _) -> doc_te(base)
+    TyRow(row)       -> doc_row(row)
+  }
+
+fn doc_row(r: RowExpr) : String =
+  match r {
+    REmpty            -> ""
+    RClosed(labels)   -> join_with(map(labels, doc_label), " + ")
+    ROpen(tail, labels) ->
+      if list_length(labels) == 0 { tail }
+      else { concat_all([join_with(map(labels, doc_label), " + "), " + ", tail]) }
+  }
+
+fn doc_label(l: RowLabel) : String =
+  match l {
+    RL(n, args) ->
+      if list_length(args) == 0 { n }
+      else { concat_all([n, "[", join_with(map(args, doc_te), ", "), "]"]) }
+  }
 
 #[doc("Post-parse strip for the root file: unwrap DDoc into the side table, keep the first DModuleDoc decl in the stream for the typer.")]
 pub fn doc_strip_collect(file: String, src: String, decls: [Decl]) : DocStrip / Console =
@@ -219,13 +281,14 @@ fn json_opt_str(o: Option[String]) : String {
 
 fn json_bool(b: Bool) : String = if b { "true" } else { "false" }
 
-#[doc("One DocItem as a stable JSON object: kind, name, line, pub, doc (null when undocumented).")]
+#[doc("One DocItem as a stable JSON object: kind, name, line, pub, sig, doc (sig/doc null when absent).")]
 pub fn doc_item_json(it: DocItem) : String =
   concat_all([
     "{\"kind\": ", json_quote(it.kind),
     ", \"name\": ", json_quote(it.name),
     ", \"line\": ", int_to_string(it.line),
     ", \"pub\": ", json_bool(it.is_pub),
+    ", \"sig\": ", json_opt_str(it.sig),
     ", \"doc\": ", json_opt_str(it.doc),
     "}"
   ])

@@ -613,6 +613,10 @@ Commands:
                                 'kai info' for the topic list, or
                                 'kai info syntax' for the one-page
                                 cheat sheet of forms kaikai has.
+  doc  [<module>[.<symbol>]]    Read stdlib docs. 'kai doc' lists
+                                modules; 'kai doc <module>' lists its
+                                items; 'kai doc <module>.<symbol>'
+                                shows a symbol's signature + doc.
   help                          Show this help.
   --version                     Print version and demo baseline.
 
@@ -1928,6 +1932,331 @@ EOF
   exec "$KAILSP_BIN" "$@"
 }
 
+# ---- kai doc — human reader for the #[doc(...)] attributes ----
+#
+# `kai info builtins` exposes the auto-loaded core module set as JSON;
+# `kai doc` is the human surface over ALL of stdlib. It builds on the
+# existing extractor (`kaic2 --doc-json <file>`, issue #681) — no new
+# parser. The doc bodies are CommonMark; we render a TTY-friendly
+# subset (headers, fenced/indented code, bullet lists) with awk only,
+# zero new dependencies.
+
+# Map a user-facing module name (`string`, `stream`, `map`) to its
+# stdlib-relative path. core/* and the collections/encoding/... trees
+# are addressed by their basename; a top-level file wins over a nested
+# one of the same name (`path` -> path.kai, not fs/path.kai).
+doc_resolve_module() {
+  name="$1"
+  # Exact relative path (with or without .kai) takes precedence so
+  # `kai doc core/string` and `kai doc fs/path` stay addressable.
+  for cand in "$name" "$name.kai"; do
+    if [ -f "$STDLIB_ROOT/$cand" ]; then
+      printf '%s\n' "${cand%.kai}.kai"
+      return 0
+    fi
+  done
+  # Otherwise resolve by basename. Top-level match first, then nested.
+  if [ -f "$STDLIB_ROOT/$name.kai" ]; then
+    printf '%s\n' "$name.kai"
+    return 0
+  fi
+  match="$(cd "$STDLIB_ROOT" && find . -name "$name.kai" 2>/dev/null \
+            | sed 's|^\./||' | sort | head -1)"
+  if [ -n "$match" ]; then
+    printf '%s\n' "$match"
+    return 0
+  fi
+  return 1
+}
+
+# The CommonMark -> TTY renderer, shared by the symbol view. Reads the
+# raw doc body (with literal newlines already unescaped) on stdin and
+# reflows it under a two-space margin: ATX headers drop their `#` and
+# get a blank line above, fenced code keeps its shape under a deeper
+# indent, `- `/`* ` bullets align. Deliberately small — full CommonMark
+# (tables, nested lists, inline emphasis) is out of scope.
+doc_render_body() {
+  awk '
+    BEGIN { in_fence = 0 }
+    {
+      line = $0
+      # Fenced code blocks: the ``` marker becomes a blank separator;
+      # the body passes through verbatim under a deeper indent.
+      if (line ~ /^[[:space:]]*```/) { in_fence = !in_fence; print ""; next }
+      if (in_fence) { print "      " line; next }
+      # ATX headers (## Foo) drop the markers, gain a blank line above.
+      if (line ~ /^#+[[:space:]]/) {
+        sub(/^#+[[:space:]]+/, "", line)
+        print ""; print "  " line; next
+      }
+      # Bullet list items keep a normalised marker, indented one level.
+      if (line ~ /^[[:space:]]*[-*][[:space:]]/) {
+        sub(/^[[:space:]]*[-*][[:space:]]/, "", line)
+        print "    - " line; next
+      }
+      print "  " line
+    }'
+}
+
+# Extract one field (sig/doc) of the item named $sym from a --doc-json
+# stream on stdin, unescaping JSON string escapes. Prints the raw
+# value (empty if the field is null or the symbol is absent). The JSON
+# is a single line; objects are split on the stable `{"kind": ` prefix.
+doc_field() {
+  sym="$1"; field="$2"
+  awk -v sym="$sym" -v field="$field" '
+    function unescape(s,    out, i, c, n) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          i++; c = substr(s, i, 1)
+          if      (c == "n") out = out "\n"
+          else if (c == "t") out = out "\t"
+          else if (c == "r") out = out "\r"
+          else               out = out c
+        } else out = out c
+      }
+      return out
+    }
+    # Scan one JSON string value starting just after the opening quote
+    # at position p; honour \" escapes. Sets gval, returns the index
+    # just past the closing quote.
+    function scan_str(s, p,    out, c) {
+      out = ""
+      while (p <= length(s)) {
+        c = substr(s, p, 1)
+        if (c == "\\") { out = out substr(s, p, 2); p += 2; continue }
+        if (c == "\"") { gval = out; return p + 1 }
+        out = out c; p++
+      }
+      gval = out; return p
+    }
+    {
+      s = $0; n = split(s, parts, /\{"kind": /)
+      for (i = 2; i <= n; i++) {
+        obj = parts[i]
+        # name value
+        np = index(obj, "\"name\": \"")
+        if (np == 0) continue
+        scan_str(obj, np + 9)
+        nm = gval
+        if (nm != sym) continue
+        key = "\"" field "\": "
+        kp = index(obj, key)
+        if (kp == 0) { exit }
+        rest = substr(obj, kp + length(key))
+        if (substr(rest, 1, 4) == "null") { exit }
+        # value is a quoted string
+        scan_str(rest, 2)
+        printf "%s", unescape(gval)
+        exit
+      }
+    }'
+}
+
+# One-line synopsis = the first non-empty line of a doc body.
+doc_synopsis() {
+  awk 'NF { print; exit }'
+}
+
+# Extract the top-level `module_doc` value from a --doc-json stream,
+# unescaping it. Empty when the module carries no module doc.
+doc_module_doc() {
+  awk '
+    function unescape(s,    out, i, c, n) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          i++; c = substr(s, i, 1)
+          if      (c == "n") out = out "\n"
+          else if (c == "t") out = out "\t"
+          else if (c == "r") out = out "\r"
+          else               out = out c
+        } else out = out c
+      }
+      return out
+    }
+    function scan_str(s, p,    out, c) {
+      out = ""
+      while (p <= length(s)) {
+        c = substr(s, p, 1)
+        if (c == "\\") { out = out substr(s, p, 2); p += 2; continue }
+        if (c == "\"") { gval = out; return p + 1 }
+        out = out c; p++
+      }
+      gval = out; return p
+    }
+    {
+      kp = index($0, "\"module_doc\": ")
+      if (kp == 0) exit
+      rest = substr($0, kp + length("\"module_doc\": "))
+      if (substr(rest, 1, 4) == "null") exit
+      scan_str(rest, 2)
+      printf "%s", unescape(gval)
+      exit
+    }'
+}
+
+cmd_doc() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai doc                       List stdlib modules with a synopsis.
+       kai doc <module>              List a module's pub items + synopses.
+       kai doc <module>.<symbol>     Show a symbol's signature + full doc.
+
+Examples:
+  kai doc string.split
+  kai doc stream.fold
+  kai doc stream
+  kai doc
+
+Docs come from the #[doc(...)] attributes in stdlib source, extracted
+by the compiler (kaic2 --doc-json). A <module> is a stdlib file by its
+basename (string, stream, map) or relative path (core/string, fs/path).
+EOF
+      return 0 ;;
+  esac
+
+  ensure_built
+
+  # No args: list every stdlib module with its one-line synopsis.
+  if [ "${1:-}" = "" ]; then
+    echo "kai doc — stdlib reference, by module."
+    echo
+    echo "Modules:"
+    ( cd "$STDLIB_ROOT" && find . -name '*.kai' | sed 's|^\./||' | sort ) \
+      | while read -r rel; do
+          mod="${rel%.kai}"
+          syn="$("$KAIC2" --doc-json "$STDLIB_ROOT/$rel" 2>/dev/null \
+                  | doc_module_doc | doc_synopsis)"
+          printf '  %-20s %s\n' "$mod" "$syn"
+        done
+    echo
+    echo "Usage:"
+    echo "  kai doc <module>            List a module's items"
+    echo "  kai doc <module>.<symbol>   Show one symbol's doc"
+    return 0
+  fi
+
+  arg="$1"
+  # Split on the LAST dot: everything before is the module, after is
+  # the symbol. `string.split` -> mod=string sym=split. A bare module
+  # name (`stream`) has no dot and lists the module.
+  case "$arg" in
+    *.*) mod="${arg%.*}"; sym="${arg##*.}" ;;
+    *)   mod="$arg";      sym="" ;;
+  esac
+
+  rel="$(doc_resolve_module "$mod")" || {
+    echo "kai: error: no stdlib module '$mod'" >&2
+    echo "  run 'kai doc' to list available modules." >&2
+    exit 1
+  }
+  file="$STDLIB_ROOT/$rel"
+  json="$("$KAIC2" --doc-json "$file" 2>/dev/null)"
+
+  # Module view: list the pub items with their synopsis.
+  if [ -z "$sym" ]; then
+    echo "# $mod   ($rel)"
+    mdoc="$(printf '%s' "$json" | doc_module_doc | doc_synopsis)"
+    [ -n "$mdoc" ] && { echo; echo "  $mdoc"; }
+    echo
+    # Emit `name<TAB>kind<TAB>synopsis` per pub item, then format.
+    printf '%s' "$json" | awk '
+      function scan_str(s, p,    out, c) {
+        out = ""
+        while (p <= length(s)) {
+          c = substr(s, p, 1)
+          if (c == "\\") { out = out substr(s, p, 2); p += 2; continue }
+          if (c == "\"") { gval = out; return p + 1 }
+          out = out c; p++
+        }
+        gval = out; return p
+      }
+      function field_str(obj, key,    kp, rest) {
+        kp = index(obj, "\"" key "\": ")
+        if (kp == 0) return ""
+        rest = substr(obj, kp + length("\"" key "\": "))
+        if (substr(rest, 1, 4) == "null") return ""
+        scan_str(rest, 2); return gval
+      }
+      function field_bool(obj, key,    kp, rest) {
+        kp = index(obj, "\"" key "\": ")
+        if (kp == 0) return ""
+        rest = substr(obj, kp + length("\"" key "\": "))
+        if (substr(rest, 1, 4) == "true") return "true"
+        return ""
+      }
+      function synopsis(d,    p) {
+        gsub(/\\n/, "\n", d); p = index(d, "\n")
+        return (p > 0) ? substr(d, 1, p - 1) : d
+      }
+      {
+        n = split($0, parts, /\{"kind": /)
+        for (i = 2; i <= n; i++) {
+          obj = parts[i]
+          kp = index(obj, ", \"name\":"); kind = substr(obj, 2, kp - 3)
+          name = field_str(obj, "name")
+          if (field_bool(obj, "pub") == "") continue
+          doc = field_str(obj, "doc")
+          printf "%s\t%s\t%s\n", name, kind, synopsis(doc)
+        }
+      }' | sort | while IFS="$(printf '\t')" read -r name kind syn; do
+        printf '  %-22s %s\n' "$name" "$syn"
+      done
+    echo
+    echo "Run 'kai doc $mod.<symbol>' for a symbol's signature and full doc."
+    return 0
+  fi
+
+  # Symbol view: signature + full doc body. Confirm the symbol exists
+  # first so "no such symbol" is distinct from "documented but empty".
+  if ! printf '%s' "$json" | doc_names | grep -qx -- "$sym"; then
+    echo "kai: error: no symbol '$sym' in module '$mod'" >&2
+    near="$(printf '%s' "$json" | doc_names | grep -i -- "$sym" | head -3 | paste -sd' ' -)"
+    [ -n "$near" ] && echo "  did you mean: $near" >&2
+    echo "  run 'kai doc $mod' to list the module's items." >&2
+    exit 1
+  fi
+  sig="$(printf '%s' "$json" | doc_field "$sym" sig)"
+  body="$(printf '%s' "$json" | doc_field "$sym" doc)"
+
+  echo "# $mod.$sym   ($rel)"
+  [ -n "$sig" ] && { echo; echo "  $sym$sig"; }
+  if [ -n "$body" ]; then
+    echo
+    printf '%s\n' "$body" | doc_render_body
+  fi
+  return 0
+}
+
+# Print every item name in a --doc-json stream (for near-miss hints).
+doc_names() {
+  awk '
+    function scan_str(s, p,    out, c) {
+      out = ""
+      while (p <= length(s)) {
+        c = substr(s, p, 1)
+        if (c == "\\") { out = out substr(s, p, 2); p += 2; continue }
+        if (c == "\"") { gval = out; return p + 1 }
+        out = out c; p++
+      }
+      gval = out; return p
+    }
+    {
+      n = split($0, parts, /\{"kind": /)
+      for (i = 2; i <= n; i++) {
+        np = index(parts[i], "\"name\": \"")
+        if (np == 0) continue
+        scan_str(parts[i], np + 9)
+        print gval
+      }
+    }'
+}
+
 cmd_info() {
   # kai info                    list topics
   # kai info <topic>            print topic page
@@ -2158,6 +2487,7 @@ case "${1:-}" in
   show)      shift; cmd_show_pkg "$@" ;;
   lsp)       shift; cmd_lsp     "$@" ;;
   info)      shift; cmd_info    "$@" ;;
+  doc)       shift; cmd_doc     "$@" ;;
   help|-h|--help) usage ;;
   --version|-V) print_version ;;
   "")        usage >&2; exit 2 ;;
