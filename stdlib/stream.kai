@@ -1,0 +1,200 @@
+#[doc("""
+stdlib/stream.kai — lazy streams with a **push** carrier (internal
+iteration), the constant-memory backbone for line-oriented file
+processing. Issue #801; design `docs/stream-design.md`.
+
+A `Stream[t, e]` is a recipe, not a cursor: it wraps a function that,
+given a `yield` callback, drives the elements through it one at a time.
+The producer owns its resource — `read_lines` opens the file, loops
+`read_chunk`, and closes on normal end and early stop. The caller writes
+no bracket; cleanup is by construction (Go `iter.Seq` / Rust drop).
+
+`yield` returns `Bool`: `false` means "stop early", and a well-behaved
+producer honours it and unwinds. Because a `Stream` is a recipe,
+consuming it twice re-runs the producer from the start (re-opens the
+file) — re-runnable, never a shared-cursor corruption.
+
+The carrier is a single-constructor variant `Stream(run)` rather than a
+bare function-type alias: the `|`, `||`, `|?` pipes dispatch by head
+type, and only a nominal `TyCon` head (here `Stream`) participates — a
+function-type alias has no head type, so the pipes would decline. The
+wrapper is one field, the same constructor through every stage, so
+Perceus reuses it in place; the residual cost is a tag-match per stage.
+
+Surface:
+  - sources : from_list, read_lines
+  - stages  : map, flat_map, filter, take, take_while
+  - sinks   : fold, each, count, to_list, write_lines
+
+The stages carry the canonical `map` / `flat_map` / `filter` signatures,
+so `|`, `||`, `|?` dispatch on `Stream` by convention (`kai info pipes`).
+
+Errors travel in the row, never in the element type — an element is
+always a clean `String`. The recoverable per-chunk fault is `ReadFault`
+(`kai info effects`): `bad_chunk(msg)` is resumable, so a consumer-side
+`handle` resumes to skip the bad chunk or abandons to abort; `open_fault`
+returns `Nothing` (abort only). `import stream`.
+""")]
+
+# A stream wraps a function that runs the consumer: `run` calls `yield`
+# once per element, and `yield` returns false to stop early. The nominal
+# wrapper (not a bare function alias) is what lets the pipes dispatch.
+#[doc("A lazy push stream of `t` whose production may perform effects `e`; a re-runnable recipe, not a cursor.")]
+pub type Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)
+
+#[doc("""
+The recoverable IO fault for streamed reads. `bad_chunk(msg)` returns
+`Unit`, so a handler can **resume** to skip the bad chunk and continue,
+or abandon the continuation to abort. `open_fault(msg)` returns `Nothing`
+— a stream whose source cannot be opened has nothing to resume into, so
+it is abort-only by construction (one effect for both faults keeps the
+row to `File + ReadFault`).
+""")]
+pub effect ReadFault {
+  bad_chunk(msg: String) : Unit
+  open_fault(msg: String) : Nothing
+}
+
+# Drive a stream's run function with `yield` — the single point that
+# unwraps the carrier, so the combinators below read as one-liners.
+fn run_with[t, e](s: Stream[t, e], yield: (t) -> Bool / e) : Unit / e =
+  match s { Stream(run) -> run(yield) }
+
+# -- sources -----------------------------------------------------------
+
+# Drive a list element by element, honouring early stop.
+fn feed_list[t, e](xs: [t], yield: (t) -> Bool / e) : Unit / e = match xs {
+  []        -> ()
+  [h, ...t] -> if yield(h) { feed_list(t, yield) } else { () }
+}
+
+#[doc("A stream over the elements of `xs`, in order. Pure — its row is empty.")]
+pub fn from_list[t, e](xs: [t]) : Stream[t, e] = Stream((yield) => feed_list(xs, yield))
+
+# Split `buf` at newlines: emit each completed line through `yield`,
+# return the unterminated remainder (the bytes after the last '\n').
+# Honouring early stop, a `false` from `yield` returns the empty
+# remainder paired with `false` so the producer knows to stop.
+fn drain_lines[e](buf: String, yield: (String) -> Bool / e) : (String, Bool) / e =
+  match string.index_of(buf, "\n") {
+    None    -> (buf, true)
+    Some(i) -> {
+      let line = string.slice(buf, 0, i)
+      let rest = string.slice(buf, i + 1, string.length(buf) - i - 1)
+      if yield(line) { drain_lines(rest, yield) } else { ("", false) }
+    }
+  }
+
+# Read loop: pull a chunk, append to the carry buffer, emit completed
+# lines, recurse. At EOF (`Ok("")`) emit the final unterminated line (if
+# any) and stop. A `read_chunk` error performs `bad_chunk`; resuming
+# drops the failed read and continues, abandoning aborts. The handle is
+# closed on every exit path the loop controls.
+fn pump_lines[e](h: FileHandle, carry: String, yield: (String) -> Bool / e)
+  : Unit / File + ReadFault + e =
+  match File.read_chunk(h, 4096) {
+    Ok(chunk) ->
+      if string.length(chunk) == 0 {
+        if string.length(carry) > 0 { let _ = yield(carry); () } else { () }
+      } else {
+        let pair = drain_lines(string.concat(carry, chunk), yield)
+        if pair.snd { pump_lines(h, pair.fst, yield) } else { () }
+      }
+    Err(msg) -> { ReadFault.bad_chunk(msg); pump_lines(h, carry, yield) }
+  }
+
+#[doc("""
+A stream of the lines of the file at `path`, read in constant memory.
+Opens on demand, loops `read_chunk`, splits on `'\\n'` (the newline is
+stripped; a final line without a trailing newline is still yielded; an
+empty file yields zero lines), and closes the handle on normal end and
+early stop. A failed open performs `ReadFault.open_fault` (abort); a
+failed chunk read performs `ReadFault.bad_chunk` — resume to skip, or
+abandon to abort.
+""")]
+pub fn read_lines(path: String) : Stream[String, File + ReadFault] =
+  Stream((yield) => match File.open_read(path) {
+    Err(msg) -> { ReadFault.open_fault(msg); () }
+    Ok(h)    -> { pump_lines(h, "", yield); File.close_file(h) }
+  })
+
+# -- stages (pipe-canonical: `|` `||` `|?` dispatch on these) ----------
+
+#[doc("Maps `f` over every element, lazily. Canonical `map` — participates in the `|` pipe.")]
+pub fn map[a, b, e](s: Stream[a, e], f: (a) -> b / e) : Stream[b, e] =
+  Stream((yield) => run_with(s, (x) => yield(f(x))))
+
+#[doc("Maps `f` to a sub-stream per element and concatenates them, lazily. Canonical `flat_map` — participates in the `||` pipe.")]
+pub fn flat_map[a, b, e](s: Stream[a, e], f: (a) -> Stream[b, e] / e) : Stream[b, e] =
+  Stream((yield) => {
+    var alive = true
+    run_with(s, (x) => {
+      run_with(f(x), (y) => { let go = yield(y); if go { true } else { alive := false; false } })
+      @alive
+    })
+  })
+
+#[doc("Keeps only elements satisfying `p`, lazily. Canonical `filter` — participates in the `|?` pipe.")]
+pub fn filter[t, e](s: Stream[t, e], p: (t) -> Bool / e) : Stream[t, e] =
+  Stream((yield) => run_with(s, (x) => if p(x) { yield(x) } else { true }))
+
+#[doc("Yields at most the first `n` elements, then stops the producer early (no further reads).")]
+pub fn take[t, e](s: Stream[t, e], n: Int) : Stream[t, e] =
+  Stream((yield) => {
+    var seen = 0
+    run_with(s, (x) => if @seen >= n { false } else { seen := @seen + 1; yield(x) })
+  })
+
+#[doc("Yields elements while `p` holds, stopping at (and excluding) the first that fails — no further reads.")]
+pub fn take_while[t, e](s: Stream[t, e], p: (t) -> Bool / e) : Stream[t, e] =
+  Stream((yield) => run_with(s, (x) => if p(x) { yield(x) } else { false }))
+
+# -- sinks (force the pipeline) ----------------------------------------
+
+#[doc("Folds `f` over every element left-to-right from `init`, forcing the pipeline.")]
+pub fn fold[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e = {
+  var acc = init
+  run_with(s, (x) => { acc := f(@acc, x); true })
+  @acc
+}
+
+#[doc("Runs `f` for its effect on every element, forcing the pipeline.")]
+pub fn each[t, e](s: Stream[t, e], f: (t) -> Unit / e) : Unit / e =
+  run_with(s, (x) => { f(x); true })
+
+#[doc("Counts the elements, forcing the pipeline in constant memory.")]
+pub fn count[t, e](s: Stream[t, e]) : Int / e = {
+  var c = 0
+  run_with(s, (_x) => { c := @c + 1; true })
+  @c
+}
+
+#[doc("Materialises the stream into a list — **not** constant memory; use a streaming sink when you can.")]
+pub fn to_list[t, e](s: Stream[t, e]) : [t] / e = {
+  var acc = []
+  run_with(s, (x) => { acc := [x, ...@acc]; true })
+  list.reverse(@acc)
+}
+
+# Write loop: drain the stream through `h`, one line per element with a
+# trailing newline, performing `bad_chunk` on a failed write (resume to
+# skip the line, abandon to abort).
+fn drain_to[e](s: Stream[String, e], h: FileHandle) : Unit / File + ReadFault + e =
+  run_with(s, (line) => match File.write_chunk(h, string.concat(line, "\n")) {
+    Ok(_)    -> true
+    Err(msg) -> { ReadFault.bad_chunk(msg); true }
+  })
+
+#[doc("""
+Writes every element as a line (one trailing `'\\n'` each) to the file at
+`path`, streaming in constant memory. Opens for writing on entry, drains
+the stream, and closes the handle on exit. A failed open performs
+`ReadFault.open_fault` (abort); a failed write performs
+`ReadFault.bad_chunk`. This is the sink twin of `read_lines`: the writer
+is one more stage, not a loop the caller hand-rolls.
+""")]
+pub fn write_lines[e](s: Stream[String, e], path: String) : Unit / File + ReadFault + e =
+  match File.open_write(path) {
+    Err(msg) -> { ReadFault.open_fault(msg); () }
+    Ok(h)    -> { drain_to(s, h); File.close_file(h) }
+  }
