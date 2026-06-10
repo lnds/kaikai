@@ -550,11 +550,45 @@ the stdin singleton.
 
 The error register is `Result[String, _]` (Err message first),
 mirroring `read_file` — callers branch on the motive (missing /
-permission / mid-stream fault). The ergonomic line surface
-(`with_lines` / `fold_lines` / `each_line`, the `Fail`/`Option`
-registers) is **not** part of this phase: it is tracked in #801 and
-layers on top of these primitives, replacing the originally-planned
-Phase 2 bracket surface (superseded by the stream-carrier design).
+permission / mid-stream fault). The ergonomic line surface layers on
+top of these primitives in `stdlib/stream.kai` (issue #801, shipped):
+the lazy push carrier `Stream[t, e]` with `read_lines` / `write_lines`
+and the pipe-canonical combinators, replacing the originally-planned
+Phase 2 bracket surface.
+
+### ReadFault (issue #801)
+
+The recoverable per-element fault for streamed reads, declared in
+`stdlib/stream.kai`. It exists because `read_lines` keeps the element
+type a clean `String` and routes faults through the row instead, so a
+consumer-side `handle` decides the per-element policy:
+
+```kaikai
+effect ReadFault {
+  bad_chunk(msg: String) : Unit      # resumable → resume = skip the chunk, continue
+  open_fault(msg: String) : Nothing  # Nothing → abort-only (cannot resume)
+}
+```
+
+`bad_chunk` returns `Unit`, so a handler that resumes drops the failed
+chunk and continues (skip policy); a handler that abandons the
+continuation aborts. `open_fault` returns `Nothing`: a stream whose
+source cannot open has nothing to resume into, so it is abort-only by
+construction. This is why `read_lines` carries `File + ReadFault` rather
+than `File + Fail` — stdlib `Fail.fail : Nothing` is non-resumable, so
+it cannot express the skip policy (spike S2). `ReadFault` is a stdlib
+user effect (no runtime default handler): a forcing consumer must
+`handle ... with ReadFault` to choose a policy, or the typer reports
+`effect not handled: ReadFault`.
+
+> **v1 limitation (issue #801, 2026-06-10):** on the abort path (a
+> `bad_chunk` handler that does not resume), the producer's
+> `close_file` — which runs after the read loop the fault unwound — is
+> skipped, so the fd leaks. Same honesty class as #771's cancel-safety
+> note; there is no `finally`, and producer-side interception would
+> shadow the consumer's skip handler. Closed later by cancel-aware
+> bracket work. `examples/effects/stream_abort_leak.kai` documents it as
+> a measured fact.
 
 > **v1 status (issue #771, 2026-06-09):** the five chunked ops park
 > the *fiber* and offload their blocking `open`/`read`/`write`/
