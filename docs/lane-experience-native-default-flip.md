@@ -124,7 +124,7 @@ box/unbox-discipline and builtin-emission frontiers respectively.
 
 ## Fixtures added / coverage gaps
 
-- `tools/native-parity-baseline.txt` — the 167-fixture ratchet, gated by
+- `tools/native-parity-baseline.txt` — the 168-fixture ratchet, gated by
   `tier1-native` in `NATIVE_PARITY_RATCHET=1` mode. This IS the regression
   fixture for this lane: it locks the gap set so no lane can regress it.
 - `docs/native-parity-gaps.md` — categorized burn-down list.
@@ -155,3 +155,13 @@ the object-output path — solved instead by compiling a `$tmp` copy so the
   point the deferred steps land: flip the default in `resolve_backend`,
   promote `tier1-native` to always-on, static-link libLLVM in the release.
   All three are wired-but-dormant in this lane's diff comments.
+- **Cross-platform baseline risk.** The baseline was generated on
+  macOS / Homebrew LLVM 22; CI runs `tier1-native` on Ubuntu / LLVM 18. The
+  gap families that dominate (unbound-register, missing-symbols) are
+  KIR-walk / symbol-emission logic — platform-independent — so the set
+  should match. If the codegen-crash / flaky families differ by platform,
+  the ratchet's first CI run will surface it as a "new gap"; if so, the
+  baseline becomes the cross-platform union (regenerate on the CI platform
+  and merge), not a per-host snapshot. The 3× recheck already absorbs flaky
+  divergence; only a deterministic Linux-only gap would need a baseline
+  update.
