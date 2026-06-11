@@ -1,0 +1,180 @@
+# compiler/kir_lower_variant.kai — shared-tag sub-discrimination for the
+# variant `match` decision.
+#
+# The variant path of `lower_match` (kir_lower_walk.kai) switches on the
+# scrutinee's top-level tag (`KTagOf` → `KSwitch`). That tag-switch is the
+# O(1) jump table for the common case — every arm a DISTINCT constructor
+# (`Ok`/`Err`, `Some`/`None`, the AST node tags). It breaks the moment two
+# arms SHARE a top-level tag but discriminate on a sub-pattern of the
+# payload:
+#
+#     match e { Exited(0) -> A   Exited(_) -> B   Signaled(_) -> C }
+#     match n { Branch(Red, _) -> A   Branch(Black, _) -> B   Leaf -> C }
+#
+# `plan_arms` would emit two `KC(Exited_tag, ..)` cases — a duplicate i32
+# switch case LLVM rejects (`module verify failed: Duplicate integer as
+# switch case`) — AND, even were it accepted, the second arm would be dead:
+# nothing TESTS the payload, so the first `Exited(..)` captures every
+# `Exited`. This is the largest native-parity gap family.
+#
+# The fix mirrors the C-direct oracle (`emit_pat_test_variant_subs`) WITHOUT
+# losing the switch: group the arms by tag (kir_lower_walk's `plan_arms`),
+# emit ONE switch case per tag, and for a tag shared by N>1 arms route that
+# case to a GROUP block holding a sub-fail-chain — a `condbr` per arm over
+# the conjunction of its payload sub-tests, exactly the record-match
+# fail-chain (kir_lower_rec.kai) but reading positional slots and testing
+# the variant_tag of a nullary sub-constructor. The unique-tag cases keep
+# the bare switch jump.
+#
+# This module owns the PURE half: the per-arm payload sub-test conjunction
+# (`var_emit_subtests`) and the catch-all classification + tag grouping. It
+# NEVER recurses into `lower_expr` — the arm BODY is lowered by the walk's
+# `lower_variant_groups` driver in the Expr-SCC `kir_lower_walk`, the same
+# split list / literal / record decision trees use.
+#
+# SCOPE (asu review): the sub-tests cover the load-bearing shapes — a
+# LITERAL slot (`Exited(0)`: `kai_eq_raw slot lit`) and a NULLARY ctor /
+# enum slot (`Branch(Red, ..)`: `kai_tag_eq slot ctor_tag`). A sub-pattern
+# that BINDS under a tag test (`Some(Node(x))` — a nested variant whose
+# inner names also need projecting) stays the nested-variant-test gap and
+# keeps trapping loud via `bind_pattern_fields`'s `bind_unsupported_nested`;
+# it is a documented follow-up, not a silent miscompile.
+
+import compiler.ast
+import compiler.kir
+import compiler.kir_lower
+
+# A positional sub-pattern that DISCRIMINATES (carries a test the switch
+# tag does not): a literal field, or a nullary constructor in the slot. A
+# `PWild`/`PBind`/`PHole` carries no test (it only binds). `PAs` discriminates
+# iff its inner pattern does. Drives both `var_arm_is_tag_catchall` (an arm
+# with no discriminating sub-pattern is the tag's catch-all) and the
+# per-slot test emission.
+pub fn psub_is_discriminating(p: Pattern) : Bool = match p.pkind {
+  PLit(_)              -> true
+  PVariant(_, subs)    -> nullary_ctor(subs)
+  PVariantRecord(_, _) -> true
+  PAs(_, inner)        -> psub_is_discriminating(inner)
+  _                    -> false
+}
+
+# A constructor with no payload (`Red`, `None`) — the enum-slot shape the
+# sub-test handles. A ctor WITH payload (`Node(x)`) in a slot needs a tag
+# test AND a recursive sub-bind, which stays the nested-variant-test gap.
+fn nullary_ctor(subs: [Pattern]) : Bool = match subs {
+  [] -> true
+  _  -> false
+}
+
+# Does a variant arm DISCRIMINATE within its tag (any payload sub-pattern
+# carries a test), or is it the tag's catch-all (`Exited(_)`, `Branch(c, k)`
+# — all binders/wilds)? A catch-all arm ends its group's sub-chain
+# unconditionally, so it must come LAST in source among its tag's arms — the
+# typer guarantees this (an `Exited(_)` before `Exited(0)` makes `Exited(0)`
+# unreachable, which the exhaustiveness/redundancy check rejects).
+pub fn var_arm_is_tag_catchall(p: Pattern) : Bool = match p.pkind {
+  PVariant(_, subs)         -> not any_discriminating(subs)
+  PVariantRecord(_, fields) -> not any_field_discriminating(fields)
+  _                         -> true
+}
+
+fn any_discriminating(subs: [Pattern]) : Bool = match subs {
+  [] -> false
+  [sp, ...rest] -> if psub_is_discriminating(sp) { true } else { any_discriminating(rest) }
+}
+
+fn any_field_discriminating(fields: [PField]) : Bool = match fields {
+  [] -> false
+  [PField(_, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) { true } else { any_field_discriminating(rest) }
+}
+
+# Emit the conjunction of payload sub-tests for ONE discriminating arm
+# against `scrv`, sealing the current block so a full match flows to
+# `body_lbl` and any mismatch to `fail_lbl`. The scrutinee tag is ALREADY
+# matched (the switch case routed here), so this only tests the payload
+# slots. Returns the state REOPENED at `body_lbl`, ready for the field
+# binds + body (the test seals leave the cursor on a fresh fail/cont block,
+# so the explicit reopen positions the next statements correctly — mirror
+# of the record path's `reopen(st2, body_lbl)`). Reading positional slots
+# (`KProj`) instead of named fields is the only difference from `rec_emit_tests`.
+pub fn var_emit_subtests(p: Pattern, scrv: KVal, body_lbl: String,
+                         fail_lbl: String, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(_, subs) -> reopen(var_emit_slot_tests(subs, scrv, 0, body_lbl, fail_lbl, st), body_lbl)
+  _                 -> reopen(ls_seal(st, KBr(body_lbl, KNoPos), body_lbl), body_lbl)
+}
+
+# Walk the positional payload slots, emitting a test for each discriminating
+# sub-pattern and chaining them through fresh continue blocks (all must
+# pass). A non-discriminating slot (binder/wild) carries no test. The last
+# test branches to `body_lbl`; with no discriminating slot left the block
+# branches unconditionally to `body_lbl` (its caller only reaches here for a
+# discriminating arm, so at least one test was emitted before).
+fn var_emit_slot_tests(subs: [Pattern], scrv: KVal, idx: Int, body_lbl: String,
+                       fail_lbl: String, st: LowerSt) : LowerSt / Console = match subs {
+  [] -> ls_seal(st, KBr(body_lbl, KNoPos), body_lbl)
+  [sp, ...rest] ->
+    if psub_is_discriminating(sp) {
+      var_emit_one_test(sp, scrv, idx, rest, body_lbl, fail_lbl, st)
+    } else {
+      var_emit_slot_tests(rest, scrv, idx + 1, body_lbl, fail_lbl, st)
+    }
+}
+
+# One discriminating slot's test. If more discriminating slots follow, open a
+# fresh continue block for the success path and recurse; otherwise the
+# success path is `body_lbl` directly. The slot value is read with the
+# borrowing `KProj` (the native `kaix_variant_arg` borrows pointer slots, so
+# a failing test leaks no ref); the immortal Bool result needs no drop.
+fn var_emit_one_test(sp: Pattern, scrv: KVal, idx: Int, rest: [Pattern], body_lbl: String,
+                     fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  if any_discriminating(rest) {
+    match ls_fresh_label(st) { LSLabel(cont, st1) -> {
+      let st2 = var_seal_test(sp, scrv, idx, cont, fail_lbl, st1)
+      var_emit_slot_tests(rest, scrv, idx + 1, body_lbl, fail_lbl, reopen(st2, cont))
+    } }
+  } else { var_seal_test(sp, scrv, idx, body_lbl, fail_lbl, st) }
+
+# `condbr <test> ? ok_lbl : fail_lbl` for slot `idx`'s sub-pattern. A
+# LITERAL slot reads the slot and compares with the non-consuming
+# `kai_eq_raw` (mirror of the literal/record paths); a NULLARY ctor slot
+# reads the slot and tests its variant_tag with `kai_tag_eq` (mirror of the
+# oracle's `emit_enum_slot_test` / `emit_variant_tag_test`). An as-pattern
+# tests its inner sub-pattern.
+fn var_seal_test(sp: Pattern, scrv: KVal, idx: Int, ok_lbl: String,
+                 fail_lbl: String, st: LowerSt) : LowerSt / Console = match sp.pkind {
+  PLit(lit)        -> var_seal_eq(idx, var_lit_atom(lit), scrv, ok_lbl, fail_lbl, sp, st)
+  PVariant(cn, _)  -> var_seal_tag(idx, cn, scrv, ok_lbl, fail_lbl, sp, st)
+  PAs(_, inner)    -> var_seal_test(inner, scrv, idx, ok_lbl, fail_lbl, st)
+  _                -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
+}
+
+# `condbr (kai_eq_raw (proj scr idx) lit) ? ok : fail` — a literal slot.
+fn var_seal_eq(idx: Int, lit: KVal, scrv: KVal, ok_lbl: String, fail_lbl: String,
+               sp: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+    match bind_op(st1, KPrim("kai_eq_raw", [sv, lit]), KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+      ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
+
+# `condbr (kai_tag_eq (proj scr idx) ctor_tag) ? ok : fail` — a nullary ctor
+# slot. The ctor tag is materialised as a `KIntV` the native prim reads as
+# the i32 operand of the mixed `kaix_tag_eq(ptr, i32) -> ptr` shim.
+fn var_seal_tag(idx: Int, cname: String, scrv: KVal, ok_lbl: String, fail_lbl: String,
+                sp: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+    match bind_op(st1, KPrim("kai_tag_eq", [sv, KIntV(ls_variant_tag(st1, cname))]),
+                  KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+      ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
+
+# The KIR atom for a literal slot pattern's expression (Int / Bool / Char /
+# String / Real). A non-literal is a typer invariant violation — lower to
+# unit so the equality is well-formed but always false (loud divergence vs
+# the oracle, never a silent miscompile). Mirror of `lit_atom` / `rec_lit_atom`.
+fn var_lit_atom(lit: Expr) : KVal = match lit.kind {
+  EInt(n)       -> KIntV(n)
+  EBool(b)      -> KBoolV(b)
+  EChar(c)      -> KCharV(c)
+  EStr(span, _) -> KStrV(span)
+  EReal(r, _)   -> KRealV(r)
+  _             -> KUnitV
+}
