@@ -321,18 +321,13 @@ examples/stdlib/json_real_decimal.kai
 examples/stdlib/json_real_int_regression.kai
 examples/stdlib/json_real_negative.kai
 examples/stdlib/json_real_scientific.kai
-# no-effect-handler — Spawn 7 / Clock 2 / NetTcp 1 / File 1 (11)
-examples/actors/dual_actor_receive_only.kai
-examples/actors/dual_actor_request_reply.kai
-examples/actors/dual_actor_send_only.kai
-examples/effects/m8_7_actor_self_send.kai
-examples/effects/m8_8_mailbox_drop_newest.kai
-examples/effects/m8_8_mailbox_drop_oldest.kai
+# no-effect-handler — mostly CLOSED by burn-down 4. The builtin-default
+# op-field synth (KProgram.all_builtin_defaults) closed the Spawn 6 +
+# NetTcp 1; the EBang lowering + the same synth closed Clock 2 (date_*).
+# Only File/ReadFault remains — `stream_early_stop`'s ReadFault is a
+# stream-INTERNAL effect, not a builtin with a default block, so the synth
+# does not cover it (a stream-carrier follow-up).
 examples/effects/stream_early_stop.kai
-examples/llvm/nested_lambda_with_mailbox.kai
-examples/stdlib/date_basic.kai
-examples/stdlib/date_iso.kai
-examples/stdlib/http_server_book_ch17.kai
 # clause-param-origin — subset-2b alias dispatch (7)
 examples/effects/ctor_field_effect_row.kai
 examples/effects/net_dns_resolve.kai

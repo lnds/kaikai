@@ -114,6 +114,13 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # (enclosing-fn, line, col) — the key the collector stamped.
   ELambda(_, _)      -> lower_lambda_ref(x, st)
 
+  # `e!` — the early-return unwrap on `Option`/`Result` (`kai info syntax`).
+  # Mirrors emit_c's `emit_bang`: if `e` is the success variant (`Some`/`Ok`)
+  # yield its slot-0 payload, else RETURN the failure value from the
+  # enclosing fn. Lowered as a tag-test fork: a `KRet` on the failure path,
+  # the unwrapped slot on the success path (`lower_bang`).
+  EBang(inner)       -> lower_bang(x, inner, st)
+
   # An effect handler. Materialises the handler frame as a double fork
   # (install + setjmp-split + inline body + return clause), the same
   # block-building discipline as if/match (asu review). The clause bodies
@@ -427,6 +434,47 @@ fn bind_let_as(pat: Pattern, name: String, v: KVal, st: LowerSt) : LowerSt / Con
   let st1 = ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
   bind_pattern_fields_any(as_inner(pat), v, st1)
 }
+
+# --- bang (`!` early-return unwrap) -------------------------------------
+
+# `e!` on `Option[T]` / `Result[T, E]`: lower `inner`, test its tag against
+# the success ctor (`Some` / `Ok`), and FORK — the failure path returns
+# `inner` from the enclosing fn (`KRet`), the success path projects slot 0.
+# Mirror of emit_c's `emit_bang`: `if (!success(_b)) return _b; slot0(_b)`.
+# The success ctor comes from the inner's static type (`bang_success_variant`,
+# emit_shared); a non-Option/Result inner is a typer invariant violation —
+# lower to a loud panic so it diverges from the oracle rather than silently
+# unwrapping (mirror of emit_bang's `None` arm).
+fn lower_bang(x: Expr, inner: Expr, st: LowerSt) : LRes / Console =
+  match lower_expr(inner, st) { LRes(iv, st1) ->
+    match bang_success_variant(inner.ty) {
+      Some(ctor) -> lower_bang_fork(x, iv, ctor, st1)
+      None       -> lower_panic_stub(kir_quote("internal: `!` on non-Option/Result reached lowering"), st1)
+    } }
+
+# The fork: `cond = kai_tag_eq(iv, success_tag)`; `condbr cond ? ok : fail`.
+# `fail` returns `iv` (the failure value flows out of the fn). `ok` projects
+# slot 0 into the `join` register and branches to the continuation. The join
+# is materialised before the fork so a translator reads it as a mutable slot
+# (the `lower_if` discipline). `iv` is borrowed for the tag test (kai_tag_eq
+# is RC-free); the success path's `KProj` is the value, the failure path's
+# `KRet` moves `iv` out — perceus's already-placed marks own the balance.
+fn lower_bang_fork(x: Expr, iv: KVal, ctor: String, st: LowerSt) : LRes / Console =
+  match bind_op(st, KPrim("kai_tag_eq", [iv, KIntV(ls_variant_tag(st, ctor))]), kpos_of(x)) { LRes(cond, st1) ->
+    match ls_fresh_reg(st1) { LSReg(join, st2) -> {
+      let st_decl = ls_emit(st2, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+      match three_labels(st_decl) { LSL3(lok, lfail, lcont, st3) -> {
+        # condbr ? lok : lfail — seal the current block, open lfail.
+        let st4 = ls_seal(st3, KCondBr(cond, lok, lfail, kpos_of(x)), lfail)
+        # lfail: return the failure value; the seal opens lok next.
+        let st5 = ls_seal(st4, KRet(iv, kpos_of(x)), lok)
+        # lok: unwrap slot 0 into the join, branch to the continuation.
+        match bind_op(st5, KProj(iv, 0), kpos_of(x)) { LRes(slot0, st6) -> {
+          let st7 = ls_seal(ls_emit(st6, KStore(join, slot0, kpos_of(x))), KBr(lcont, kpos_of(x)), lcont)
+          LRes(KVar(join), st7)
+        } }
+      } }
+    } } }
 
 # --- if -----------------------------------------------------------------
 
