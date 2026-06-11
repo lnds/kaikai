@@ -5960,6 +5960,52 @@ fn union_dedup_sorted(ts: [Ty]) : [Ty] {
 # m7a #2 only ever receives empty label lists, so we do not enforce
 # the invariant here; m7a #3 will revisit when labels start flowing.
 
+# Issue #802 — row-level cell identity for parametric effects.
+#
+# Two `var` cells (`var i`, `var go`) each desugar to `with State[T](init)
+# as <name>`; semantically they are two independent State handlers, but
+# their row labels were both `State[?T]` — structurally indistinguishable
+# once the cell `<name>` was dropped. When the two cells reach a
+# row-unification partition with their `T`s still unresolved (the
+# `while`-in-lambda shape), the partition fused them and cross-bound their
+# `T`s (`Int := Bool`), corrupting downstream types. The alias `<name>`
+# already exists at the op-call site (`lookup_alias`) and at the handler
+# (`alias_opt`); we thread it into the LABEL's `eff` string as a
+# `"State@i"` suffix so distinct cells are distinct labels and never fuse.
+# The suffix is confined to the typer: every cell label is discharged by
+# its own `with State as <name>` handler (the discharge is made symmetric
+# in `filter_labels_matching_res`), so a `"State@i"` label never escapes
+# to a function signature, `main`'s row, or the emitters — which keep
+# seeing bare effect names. `label_to_string` strips it for diagnostics.
+#
+# Unlike the codegen `@<alias>` dispatch tag, this suffix is stamped
+# whenever the alias resolves, independent of taggability: the dispatch
+# tag is disabled across a lambda boundary (the C local is out of scope),
+# but row identity must hold inside lambdas too — that is exactly where
+# the `while` thunks live.
+fn label_eff_with_alias(eff: String, alias_opt: Option[String]) : String {
+  match alias_opt {
+    None    -> eff
+    Some(a) -> string_concat(eff, string_concat("@", a))
+  }
+}
+
+# Strip a `@<alias>` cell-identity suffix from a label eff for display.
+# `"State@i"` → `"State"`; `"Stdout"` → `"Stdout"`. Diagnostics and any
+# user-facing rendering must show the effect, not the internal cell tag.
+fn strip_label_alias(eff: String) : String =
+  strip_label_alias_loop(eff, 0, string_length(eff))
+
+fn strip_label_alias_loop(eff: String, i: Int, n: Int) : String {
+  if i >= n { eff }
+  else {
+    match char_at(eff, i) {
+      Some(c) -> if c == '@' { string_slice(eff, 0, i) } else { strip_label_alias_loop(eff, i + 1, n) }
+      None    -> eff
+    }
+  }
+}
+
 fn label_concat(a: [Label], b: [Label]) : [Label] {
   match a {
     [] -> b
@@ -6019,45 +6065,18 @@ type LabelPartition = {
   only_right: [Label]
 }
 
-# Find a label in `ls` whose eff matches `target.eff`; return the
-# label plus the list with it removed (preserving relative order).
-#
-# Issue #532 — when multiple candidates share the eff name (e.g. two
-# parametric `Actor[T]` instantiations on the same row), prefer the
-# candidate whose ty_args are concretely unifiable with `target.ty_args`
-# under `s` over a candidate with TyVar-trivial unifiability. This
-# makes nested `with_mailbox` handlers absorb the right `Actor[T]`
-# instantiation rather than picking by row position. When no concrete
-# match exists, fall back to the first eff-name match (older `s`
-# semantics; preserves behavior for non-parametric labels).
+# A label-removal result: the matched `Label` plus the candidate list
+# with that label removed (relative order of the rest preserved).
 type FindRemove = { found: Label, remain: [Label] }
-
-fn find_remove_label(eff: String, ls: [Label]) : Option[FindRemove] {
-  find_remove_label_loop(eff, ls, [])
-}
-
-fn find_remove_label_loop(eff: String, ls: [Label], seen: [Label]) : Option[FindRemove] {
-  match ls {
-    [] -> None
-    [h, ...rest] -> {
-      if h.eff == eff {
-        Some(FindRemove { found: h, remain: label_concat(seen, rest) })
-      } else {
-        find_remove_label_loop(eff, rest, label_concat(seen, [h]))
-      }
-    }
-  }
-}
 
 # Issue #532 — best-match label lookup for nested parametric effects.
 #
 # When two `with_mailbox` blocks are nested and the body's row carries
 # both `Actor[Request]` and `Actor[Reply]`, the partition step has to
 # decide which one absorbs into the handler's `Actor[Msg]`. Naïve
-# first-eff-name match (`find_remove_label`) picks by row position,
-# which depends on insertion order — that order varies with how the
-# stdlib loads (`--prelude` vs `--path`) and is not what the user
-# wrote.
+# eff-name-only matching picks by row position, which depends on
+# insertion order — that order varies with how the stdlib loads
+# (`--prelude` vs `--path`) and is not what the user wrote.
 #
 # Preference order (each tier falls through to the next when no match
 # survives):
@@ -6076,15 +6095,52 @@ fn find_remove_label_loop(eff: String, ls: [Label], seen: [Label]) : Option[Find
 #      `Actor[Request]` propagated transitively from `dual_send`) get
 #      deprioritised, leaving them to flow up to the enclosing handler.
 #
-#   3. First eff-name match. The original behaviour — preserves the
-#      semantics for non-parametric labels (`Stdout`, `Console`, …)
-#      where the eff name uniquely identifies the label.
+#   3. Eff-name match with unifiable args. The fallback for labels
+#      tiers 1–2 did not claim — bare effects (`Stdout`, `Console`, …)
+#      whose empty arg list trivially unifies, and parametric labels
+#      where one side is still a flex `?t` (`State[?t]` vs `State[Int]`
+#      → pair, then `unify_label_pairs` binds `?t := Int`). Issue #802:
+#      this tier used to match on eff-name ALONE, ignoring ty_args, so
+#      two *distinct* instantiations of one parametric effect
+#      (`State[Bool]` from a condition thunk vs `State[Int]` from a
+#      body thunk) were paired and then forced through
+#      `unify_label_pairs`, which failed on `Bool` ≢ `Int`. A row is a
+#      multiset keyed by (eff, ty_args): `State[Bool]` and `State[Int]`
+#      are different labels and must coexist (only_left / only_right),
+#      not collapse. Requiring `labels_args_unify` keeps the legitimate
+#      flex-vs-concrete pairing while rejecting the concrete-vs-concrete
+#      non-unifiable collision — the args check is pure (`ty_eq_shape`
+#      for concrete-concrete, flex for any TyVar side), so no spurious
+#      bindings escape the partition decision.
 fn find_remove_label_best(target: Label, ls: [Label], s: Subst) : Option[FindRemove] {
   match find_remove_label_concrete(target, ls, s, []) {
     Some(fr) -> Some(fr)
     None -> match find_remove_label_tyvar_args(target, ls, s, []) {
       Some(fr) -> Some(fr)
-      None     -> find_remove_label(target.eff, ls)
+      None     -> find_remove_label_unifiable(target, ls, s, [])
+    }
+  }
+}
+
+# Issue #802 — tier-3 of `find_remove_label_best`. Pair `target` with a
+# same-eff candidate ONLY when their ty_args are unifiable under `s`
+# (`labels_args_unify`: concrete-concrete via `ty_eq_shape`, flexible
+# whenever either side is a TyVar). Bare effects with empty arg lists
+# unify trivially, so `Stdout`/`Console` keep their single-candidate
+# semantics. Two concrete-but-disjoint instantiations of one parametric
+# effect (`State[Bool]` vs `State[Int]`) no longer pair, so the row
+# partition leaves them as distinct only_left / only_right labels
+# instead of forcing `Bool ≡ Int`.
+fn find_remove_label_unifiable(target: Label, ls: [Label], s: Subst,
+                               seen: [Label]) : Option[FindRemove] {
+  match ls {
+    [] -> None
+    [h, ...rest] -> {
+      if h.eff == target.eff and labels_args_unify(h.ty_args, target.ty_args, s) {
+        Some(FindRemove { found: h, remain: label_concat(seen, rest) })
+      } else {
+        find_remove_label_unifiable(target, rest, s, label_concat(seen, [h]))
+      }
     }
   }
 }
@@ -6108,12 +6164,25 @@ fn find_remove_label_concrete(target: Label, ls: [Label], s: Subst,
 # from-`Actor.self()`" mate the handler's instantiation is reaching
 # for. See `find_remove_label_best`'s doc-comment for the ordering
 # rationale.
+#
+# Issue #802 — the raw-TyVar test alone over-matches. A `var b = true`
+# / `var i = 0` pair desugars to two `State[?t]` labels whose row args
+# stay raw `TyVarT`s even after `?t` is bound (the labels carry literal
+# tyvars per the `apply_ty_keep_row_labels` discipline). Both look like
+# tyvar-args candidates, so a condition thunk's `State[?t→Bool]` and a
+# body thunk's `State[?u→Int]` would pair here and then fail in
+# `unify_label_pairs` on `Bool ≢ Int`. Gate the match on
+# `labels_args_unify` as well: a genuinely-free tyvar (the `Actor.self`
+# case) stays flexibly unifiable against the target, but a tyvar already
+# resolved to a conflicting concrete is rejected, leaving the two
+# `State[_]` labels to coexist as distinct row entries.
 fn find_remove_label_tyvar_args(target: Label, ls: [Label], s: Subst,
                                   seen: [Label]) : Option[FindRemove] {
   match ls {
     [] -> None
     [h, ...rest] -> {
-      if h.eff == target.eff and label_args_have_tyvar(h.ty_args, s) {
+      let tyvar_mate = h.eff == target.eff and label_args_have_tyvar(h.ty_args, s) and labels_args_unify(h.ty_args, target.ty_args, s)
+      if tyvar_mate {
         Some(FindRemove { found: h, remain: label_concat(seen, rest) })
       } else {
         find_remove_label_tyvar_args(target, rest, s, label_concat(seen, [h]))
@@ -8378,10 +8447,20 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File {
       # the handler's instantiation. Labels with the same eff name but
       # non-unifiable ty_args remain and propagate to the outer row —
       # they need their own enclosing handler.
-      let body_row_minus = filter_labels_matching(rb.st.row, eff_name,
-                                                    resolved_eff_tyargs, rb.st.sub)
-      let merged = merge_label_lists(prev_row, body_row_minus, rb.st.sub)
-      let st_out0 = st_set_row(rb.st, merged)
+      # Issue #802 — a `with State as i` handler discharges `State@i`
+      # labels symmetrically with `label_eff_with_alias`, leaving a
+      # sibling `State@go` cell for its own handler; an unaliased handler
+      # (`alias_opt = None`) discharges bare `State`, unchanged. The
+      # discharge binds the cell's type via `unify_list`, so thread the
+      # resulting substitution into the handler's output state (all reads
+      # of the cell converge on the handler's instantiation).
+      let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
+      let filt = filter_labels_matching_res(rb.st.row, discharge_eff,
+                                              resolved_eff_tyargs, rb.st.sub)
+      let body_row_minus = filt.kept
+      let rb_st1 = st_set_sub(rb.st, filt.sub)
+      let merged = merge_label_lists(prev_row, body_row_minus, rb_st1.sub)
+      let st_out0 = st_set_row(rb_st1, merged)
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # Issue #517 — verify `with <Eff>` names a known effect. When
       # `Eff` is unknown the body's labels still flow up via the
@@ -8730,16 +8809,108 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
 # the labels matching the handler's instantiation are dropped from the
 # body's row. A handler `with Reader[Int]` does NOT remove a body's
 # `Reader[String]` label.
-fn filter_labels_matching(xs: [Label], eff_name: String, tyargs: [Ty],
-                           sub: Subst) : [Label] {
+#
+# Issue #802 — the handler is the AUTHORITY on the type of the cell it
+# discharges, so a matching label's ty_args are UNIFIED against the
+# handler's `tyargs` (binding into the substitution), not merely
+# shape-checked. Two reads of one cell that the row partition no longer
+# cross-pairs (now that distinct cells carry distinct `@<alias>` tags)
+# converge here instead: the first read pins the element type, the
+# handler's `[?t0]` binds the label's `[?t15]`, and the threaded subst
+# carries the binding to the next read so all reads of the cell agree.
+# Match is a two-step "guard then bind": `label_args_dischargeable` is a
+# pure, tyvar-permissive predicate (accepts a TyVar at any depth, rejects
+# only a concrete-vs-concrete leaf clash) that DECIDES whether to
+# discharge; only on a positive decision do we run the real `unify` that
+# BINDS — so a non-matching label (`Reader[Int]` body under a
+# `Reader[String]` handler) never leaves a partial binding behind.
+type FilterResult = { kept: [Label], sub: Subst }
+
+fn filter_labels_matching_res(xs: [Label], eff_name: String, tyargs: [Ty],
+                               sub: Subst) : FilterResult {
   match xs {
-    [] -> []
-    [h, ...rest] ->
-      if h.eff == eff_name and labels_args_unify(h.ty_args, tyargs, sub) {
-        filter_labels_matching(rest, eff_name, tyargs, sub)
+    [] -> FilterResult { kept: [], sub: sub }
+    [h, ...rest] -> {
+      if h.eff == eff_name and label_args_dischargeable(h.ty_args, tyargs, sub) {
+        # Guard passed — bind the cell's element type via the real unify.
+        # `unify_list` cannot widen the row, only resolve the shared
+        # tyvars; on the rare structural-mismatch the guard let through
+        # (it should not, being a superset check) we keep the old subst
+        # and still discharge, preserving the prior shallow semantics.
+        let sub1 = match unify_list(ty_env_empty(), h.ty_args, tyargs, sub) {
+          Some(s) -> s
+          None    -> sub
+        }
+        filter_labels_matching_res(rest, eff_name, tyargs, sub1)
       } else {
-        [h, ...filter_labels_matching(rest, eff_name, tyargs, sub)]
+        let r = filter_labels_matching_res(rest, eff_name, tyargs, sub)
+        FilterResult { kept: [h, ...r.kept], sub: r.sub }
       }
+    }
+  }
+}
+
+# Pure discharge guard: every arg position must be either flexibly
+# unifiable (a TyVar on either side, at any nesting depth) or a
+# structurally-equal concrete shape. Rejects a concrete-vs-concrete leaf
+# clash (`Int` vs `String`) so a `Reader[Int]` handler still refuses a
+# `Reader[String]` label. Unlike `labels_args_unify`, a TyVar nested
+# inside a `[T]` / `Foo[T]` does NOT block the match — the binding is
+# done afterward by the real unify.
+fn label_args_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] ->
+        if ty_dischargeable(apply_ty(s, ah), apply_ty(s, bh), s) {
+          label_args_dischargeable(arest, brest, s)
+        } else { false }
+    }
+  }
+}
+
+# Structural compatibility allowing a TyVar at any depth. Recurses
+# through list / con / fn / union / dim shapes; a TyVar on either side
+# at any node short-circuits to compatible (it will be bound by unify).
+fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
+  let ax = unwrap_refines(a)
+  let bx = unwrap_refines(b)
+  match ax {
+    TyVarT(_) -> true
+    TyAny     -> true
+    _ -> match bx {
+      TyVarT(_) -> true
+      TyAny     -> true
+      _ -> match ax {
+        TyListT(ai) -> match bx { TyListT(bi) -> ty_dischargeable(ai, bi, s) _ -> false }
+        TyCon(am, an, aas) -> match bx {
+          TyCon(bm, bn, bas) ->
+            module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
+          _ -> false
+        }
+        TyFnT(aps, ar, _) -> match bx {
+          TyFnT(bps, br, _) -> ty_list_dischargeable(aps, bps, s) and ty_dischargeable(ar, br, s)
+          _ -> false
+        }
+        TyUnion(aps) -> match bx {
+          TyUnion(bps) -> ty_list_dischargeable(aps, bps, s)
+          _ -> false
+        }
+        TyDimT(ab, _) -> match bx { TyDimT(bb, _) -> ty_dischargeable(ab, bb, s) _ -> ty_eq_shape(ax, bx) }
+        _ -> ty_eq_shape(ax, bx)
+      }
+    }
+  }
+}
+
+fn ty_list_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> ty_dischargeable(apply_ty(s, ah), apply_ty(s, bh), s) and ty_list_dischargeable(arest, brest, s)
+    }
   }
 }
 
@@ -9272,8 +9443,16 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                   } else {
                     lookup_key
                   }
+                  # Issue #802 — this is the confirmed-alias branch, so
+                  # `name` is a `with <eff> as <name>` cell. Tag the row
+                  # label with the cell identity (`State@i`) so two
+                  # distinct cells (`var i`, `var go`) stay distinct
+                  # labels under row unification. Independent of
+                  # `taggable`: the codegen dispatch tag is suppressed
+                  # inside a lambda, but row identity must hold there too
+                  # (the `while` thunks are lambdas).
                   match ty_env_lookup(st.env, lookup_key) {
-                    Some(sc) -> Some(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, line, col))
+                    Some(sc) -> Some(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), line, col))
                     None ->
                       if is_effect_in_env(st.env, eff) {
                         Some(synth_op_call_unknown_op(st, eff, real_op, line, col))
@@ -9712,12 +9891,15 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
 
 
   # m7b #15: most call sites pass a single key — both the type
-  # lookup key and the codegen dispatch key are the same.
-  synth_op_call_with_scheme_keys(st, sc, args_, key, key, line, col)
+  # lookup key and the codegen dispatch key are the same. No alias:
+  # a direct `Eff.op(...)` call is not a `with ... as <name>` cell, so
+  # its row label keeps the bare effect name (issue #802).
+  synth_op_call_with_scheme_keys(st, sc, args_, key, key, None, line, col)
 }
 
 fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
                                    lookup_key: String, dispatch_key: String,
+                                   row_alias: Option[String],
                                    line: Int, col: Int) : Inferred / Console + File {
 
 
@@ -9742,7 +9924,11 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   let eff_arity = lookup_op_eff_arity(st2.op_eff_arities, lookup_key)
   let eff_fresh = take_first(inst.fresh, eff_arity)
   let row_args = resolve_fresh_ids(eff_fresh, st2.sub)
-  let lab = Label { eff: eff_n, ty_args: row_args }
+  # Issue #802 — tag the row label with the cell alias so two distinct
+  # `with <eff> as <name>` cells stay distinct labels (see
+  # `label_eff_with_alias`). The suffix is discharged symmetrically by
+  # the cell's own handler and stripped for display.
+  let lab = Label { eff: label_eff_with_alias(eff_n, row_alias), ty_args: row_args }
   let st3 = st_add_label(st2, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(dispatch_key, line, col), ra.exprs), line, col), ty)
@@ -10595,8 +10781,22 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   # a row-position lottery; `find_remove_label_best`'s
   # `find_remove_label_tyvar_args` branch needs the raw shape to
   # prefer body-local labels over callee-propagated concrete labels.
-  let lambda_row_labels = rb.st.row
-  let st_after = st_set_row(rb.st, prev_row)
+  #
+  # Issue #802 — apply the #251/#252 Mutable-masking pass to the lambda
+  # body too. `infer_decl` masks `Mutable` for a top-level fn whose
+  # body only mutates locally-constructed Arrays (the `var i = 0`
+  # desugar lowers to a `let i__slot = array_make(1, 0)` slot the
+  # caller never observes), but a lambda body went through `synth`
+  # alone and never reached that pass — so a `var` inside a thunk
+  # leaked `Mutable` into the lambda's row. The thunk
+  # `() => { var i = 0  i := @i + 1 }` would surface as
+  # `() -> Unit / Mutable + ?e`, which then refused to unify against a
+  # higher-order slot declared `() -> Unit / Stdout`. Masking here is
+  # scoped to the lambda's own params + body and is a no-op when
+  # `Mutable` is not in the body row, mirroring the fn-decl call site.
+  let rb_masked = mask_local_mutable_demand(rb.st, ps, rb.expr)
+  let lambda_row_labels = rb_masked.row
+  let st_after = st_set_row(rb_masked, prev_row)
   let st2 = st_restore_entries(outer, st_after)
   # m12.8.x phase 4 followup: lambdas carry an *open* row with a
   # fresh tail var. Closed rows pinned row-polymorphic call sites
@@ -15638,10 +15838,13 @@ fn unify_label_args_into(a: [Ty], b: [Ty], st: InferState) : InferState / Consol
 # `?tN`.
 #[doc("infer: `label_to_string` — exposed for the driver (pub-audit).")]
 pub fn label_to_string(l: Label) : String {
+  # Issue #802 — strip the internal `@<cell>` identity suffix so a
+  # `State@i` label renders as `State` in diagnostics.
+  let eff = strip_label_alias(l.eff)
   match l.ty_args {
-    [] -> l.eff
+    [] -> eff
     _ -> concat_all([
-      l.eff, "[", inf_join_with(map(l.ty_args, inf_ty_to_string), ", "), "]"
+      eff, "[", inf_join_with(map(l.ty_args, inf_ty_to_string), ", "), "]"
     ])
   }
 }
