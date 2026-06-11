@@ -850,7 +850,10 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 # candidate. Output diffed against the golden.
 test-issue-248-loop-sugars: $(TARGET) build
 	@set -e; \
-	for f in m7b_5_until_basic m7b_5_while_var m7b_5_repeat_basic; do \
+	for f in m7b_5_until_basic m7b_5_while_var m7b_5_repeat_basic \
+	         issue_802_while_disjoint_state_cells \
+	         issue_802_lambda_yield_var_state \
+	         issue_802_stream_alias_var_state; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
 	  ./$(TARGET) --path ../stdlib $$src > build/$$f.c \
