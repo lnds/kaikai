@@ -624,7 +624,10 @@ static int64_t kai_rc_tok_null_mismatch = 0;
  * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
  * borrow optimisation that elides incref/decref pairs show its effect
  * directly (alloc_total is unchanged by a borrow — the head is never
- * allocated, only refcounted). Only compiled under -DKAI_TRACE_RC. */
+ * allocated, only refcounted). #812 — the increments are ALWAYS compiled
+ * (parallel to kai_rc_alloc_total), gated only by the KAI_TRACE_RC env var
+ * at report time; previously they sat behind -DKAI_TRACE_RC, so any binary
+ * built without that define (every `kai build` output) reported 0. */
 static int64_t kai_rc_incref_total = 0;
 static int64_t kai_rc_decref_total = 0;
 
@@ -2107,8 +2110,13 @@ static inline KaiValue *kai_incref(KaiValue *v) {
         return v;
     }
     v->rc++;
-#ifdef KAI_TRACE_RC
+    /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
+     * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
+     * KAI_TRACE_RC` it stayed 0 in every `kai build` binary (the wrapper
+     * does not pass -DKAI_TRACE_RC), so each "RC balanced" gate that read
+     * incref_total passed vacuously on 0 == 0. */
     kai_rc_incref_total++;
+#ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
     return v;
@@ -2903,8 +2911,9 @@ static void kai_decref_free(KaiValue *v) {
  * helper now, and the inline body must stay small to be inlined. */
 static inline void kai_decref(KaiValue *v) {
     if (kai_is_value(v) || !v || v->rc == INT32_MAX) return;
-#ifdef KAI_TRACE_RC
+    /* #812 — always-compiled counter (see kai_incref). */
     kai_rc_decref_total++;
+#ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
     if (--v->rc == 0) kai_decref_free(v);
