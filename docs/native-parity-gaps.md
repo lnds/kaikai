@@ -132,6 +132,56 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
 3 minimal fixtures (literal-slot, enum-slot, multi-literal pick-correct-arm)
 + selfhost byte-id + tier0 + zero parity regressions across the full corpus.
 
+## Burn-down 4 root cause (CLOSED — do not re-open)
+
+**synthetic-register namespace collision.** `ls_fresh_reg` (kir_lower.kai)
+minted virtual-register temps `t0`, `t1`, … in the SAME namespace as
+user-source value binders. A program is free to name a `let` binder or a
+`match` field binder `t1`/`t2`/`t3`:
+
+    fn tree_rotate_left(t) = match t {
+      TNode(_, _, _, t1, rt) -> match rt {
+        TNode(_, _, _, t2, t3) -> tree_node(..., t2, t3)   # binders t2/t3
+    ...
+    let t0 = fx.table_empty()   # fx_basic.kai
+
+In `tree_rotate_left`'s KIR the inner match plants a synthetic
+`t2: i32 = tagof rt` (the `KTagOf` switch scrutinee, slot SInt32) under
+the SAME name as the user binder `t2: box = proj rt.3` (slot SBoxed). The
+native backend's model is one alloca per register name, KSlot the single
+type source (`collect_fn_specs` keeps the FIRST slot it sees for a name),
+so the two FUSED into one `%t2.addr` alloca typed `i32`. The user binder's
+boxed store + the `tree_node(..., t2, ...)` boxed read then disagreed with
+the alloca type, and the call passed an `i32` where the callee (every
+user fn is declared all-boxed `ptr (ptr × n)`) wanted a `ptr` →
+`module verify failed: Call parameter type does not match function
+signature`.
+
+Fix (one line, kir_lower.kai): prefix synthetic registers `__t<N>`,
+keeping the synthetic namespace DISJOINT from user binders — the same
+reserved-synthetic convention the lowering already uses (`__pcs_scr`,
+`_kai_acc_res`, `__self`). Native-path-only: the C oracle lowers AST→C
+directly (`emit_c`, never `lower_to_kir`), so `ls_fresh_reg` does not run
+on the C path and selfhost byte-id is unaffected (verified: kaic2b.c ==
+kaic2c.c).
+
+The whole `Call parameter type does not match function signature` family
+(6) is gone: 5 close outright (`map_basic`/`map_pipes`/`map_round_out`/
+`map_tree_basic` + `fx_basic`); `jwt_encoder` now BUILDS + RUNS but its
+base64/JSON decode round-trip DIVERGES (`decode failed`) — a pre-existing
+bug the verify error masked, reclassified to output-mismatch. The two
+Linux-only SIGSEGV gaps (`list_helpers`/`list_zip3_scan`) PASS native on
+macOS post-fix; they stay listed because the ratchet is validated on
+Linux/CI and this lane cannot verify there.
+
+Soundness gates: parity byte-id vs C-direct on the 5 closed fixtures +
+`examples/minimal/match_binder_name_collision.kai` (a minimal nested
+`match` whose binders are named `t1`/`t2`/`t3` alongside `let t0`/`t1`) +
+selfhost byte-id + zero parity regressions across the full corpus +
+macOS `leaks` no worse than the C oracle (the residual leak is the known
+native-RC debt, not introduced — the fixtures did not build natively
+before). → 82 → 77 gaps.
+
 ## Diagnosed for burn-down 4
 
 - **regex/json reclassified (burn-down 3 unmasked).** The 9
@@ -203,6 +253,7 @@ examples/stdlib/hex_escape_literal.kai
 examples/stdlib/json_basic.kai
 examples/stdlib/json_surrogate_decode.kai
 examples/stdlib/json_surrogate_encode.kai
+examples/stdlib/jwt_encoder.kai
 examples/stdlib/regex_predicate_basic.kai
 examples/stdlib/regex_subsume_alpha.kai
 examples/stdlib/regex_subsume_basic.kai
@@ -263,13 +314,10 @@ examples/effects/stream_abort_leak.kai
 examples/effects/stream_mock_disk.kai
 examples/effects/stream_skip_policy.kai
 examples/packages/cross_package_effects/consumer/main.kai
-# Call-param-mismatch — map / jwt / fx modules (6)
-examples/stdlib/fx_basic.kai
-examples/stdlib/jwt_encoder.kai
-examples/stdlib/map_basic.kai
-examples/stdlib/map_pipes/main.kai
-examples/stdlib/map_round_out.kai
-examples/stdlib/map_tree_basic.kai
+# Call-param-mismatch — CLOSED by burn-down 4 (synthetic-register
+# namespace collision, kir_lower.kai). 5 of 6 close outright; jwt_encoder
+# now BUILDS + RUNS but DIVERGES on a pre-existing decode bug (moved to
+# output-mismatch above). See "Burn-down 4 root cause" below.
 # missing-symbols — bits / crypto (3)
 examples/stdlib/bits_basic.kai
 examples/stdlib/bits_dotted.kai
