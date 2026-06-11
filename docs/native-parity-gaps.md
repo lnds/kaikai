@@ -198,20 +198,39 @@ before). → 82 → 77 gaps.
   not match function signature!` — one root cause: a generated call passes an
   operand whose LLVM type disagrees with the callee. Likely a monomorph /
   boxing shape (Map's comparator closure?) the native walk types wrong.
-- **pipe-lowering** (euler1, fizzbuzz×2, capture, imc). `EPipe` is NOT
-  desugared to `ECall` by any pre-codegen pass: the typer (`infer.kai`
+- **pipe-lowering** (collatz, euler1, fizzbuzz×2, capture, imc). `EPipe` is
+  NOT desugared to `ECall` by any pre-codegen pass: the typer (`infer.kai`
   `synth_pipe`) rebuilds `EPipe(lhs, ECall(f, args))`, leaving each emitter
   its own pipe desugaring (emit_c has `emit_pipe_expr`). The native KIR
   lowering has none — `EPipe` lowers to a no-op `KUnitV`, so the call
-  vanishes and the output is empty/wrong. A first cut (rewrite to
-  `ECall(f, [lhs, ...args])` + delegate to `lower_call`) closed the
-  single-candidate + `each(print)` cases but TRAPPED the multi-candidate
-  combinator path (`filter`/`map`/`reduce`): the typer resolves those to an
-  `EModCall` callee whose `ECall` arg list reaches `lower_exprs` in a shape
-  it rejects (`non-exhaustive match` at build — a corrupt `args` whose
-  source is upstream of the KIR). Shipping the partial cut trades an
-  output-mismatch for a louder build panic with no parity gain, so it was
-  reverted; the multi-candidate arg shape needs its own diagnosis first.
+  vanishes and the output is empty/wrong.
+
+  > **Root cause nailed (burn-down 4, lldb + instrumented trace).** A first
+  > cut (rewrite `EPipe(lhs, rhs)` to `ECall(f, [lhs, ...args])` + delegate
+  > to `lower_call`) panics `non-exhaustive match` at BUILD for ANY pipe
+  > whose RHS call carries non-trivial args — and NOT only the
+  > multi-candidate path: `[1,2,3] |> applyf(dbl)` (single-candidate user fn
+  > + fn-value arg) panics, while the IDENTICAL non-pipe `applyf([1,2,3],
+  > dbl)` builds + runs. The lldb backtrace + a `lower_exprs`/`lower_list`
+  > trace pinpoint the panic to lowering the piped **LHS** after the rewrite.
+  > The reason (asu): `synth_pipe`'s `ECall(f, args)` holds ONLY the trailing
+  > args — the piped LHS is NOT inside it (the emitter prepends it as param 0
+  > at codegen). Fusing the LHS into arg-slot-0 and re-dispatching through
+  > `lower_call` builds a call whose arg COUNT disagrees with the callee's
+  > original-arity signature; a downstream match traps. (The earlier
+  > "corrupt args upstream of the KIR / perceus RC marks" framing was wrong —
+  > it is the LHS-fusion shape, not displaced RC marks.)
+  >
+  > **The clean fix** mirrors `emit_pipe_expr` at the KVal-operand level:
+  > lower `lhs` + each `arg` to atoms SEPARATELY, then assemble the call op
+  > `[lhs_v, ...arg_vs]` directly (per-callee mask-marshalling like emit_c),
+  > moving no AST node — perceus's already-placed RC marks stay put.
+  > Desugaring `EPipe → ECall` pre-perceus is REJECTED: perceus runs on the
+  > AST shared by both backends, so it would change the C-path selfhost
+  > byte-id and cannot be gated to the KIR branch alone. Needs a dedicated
+  > lane (gate: parity vs C-direct on the 5 fixtures + selfhost byte-id
+  > UNCHANGED + ASAN). Reverted in burn-down 4 — the rewrite trades a silent
+  > output-mismatch for a noisy build panic with zero parity gain.
 - **Real box/unbox** (unbox_bench_real, unbox_phase2_cond_real,
   complex_basic, complex_heterogeneous). Native prints `9.88131e-324` (a
   raw i64 bit-pattern read as a `double`) where C prints the real value —
