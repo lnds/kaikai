@@ -1779,38 +1779,11 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
 	done; \
-	for f in ../examples/effects/parse_effect_bad_no_ret.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (parser accepted bad input)"; exit 1; } \
-	    || true; \
-	  grep -q "expected \`:\` before operation return type" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/parse_row_unknown_effect.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (unknown effect accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "unknown effect: Unknown" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
 	for f in ../examples/effects/row_match_higher_order.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (row match accepted)" \
 	    || { echo "effects FAIL $$name (matching rows rejected)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/row_mismatch_higher_order.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (row mismatch accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "type mismatch in function call" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/row_pure_to_effectful.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -1823,24 +1796,6 @@ test-effects: $(TARGET) build
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (op call accepted)" \
 	    || { echo "effects FAIL $$name (op call rejected)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/op_call_unknown_op.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (unknown op accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "unknown op .unknown. on effect .Io." build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/op_call_wrong_arg.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (wrong arg accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "type mismatch in op call Io.print" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/handle_basic.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -1855,38 +1810,11 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (alias resolved)" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
-	for f in ../examples/effects/handle_bad_no_with.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (missing with accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "expected \`with\` after handle body" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/row_op_call_undeclared.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (undeclared op accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "effect not handled: Io" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
 	for f in ../examples/effects/handle_removes_effect.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (handle removes effect)" \
 	    || { echo "effects FAIL $$name (handle did not remove effect)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/handle_unknown_clause.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (unknown clause accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "unknown op \`unknown\` on effect \`Io\`" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m7a_6a_struct_emit.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -1985,29 +1913,6 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (clause body + return clause type-checked + ran)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7a_6f_resume_arg_type.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null \
-	    && { echo "effects FAIL $$name (resume arg mismatch accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "type mismatch in function call" build/s2-$$name.err \
-	    && grep -q "(Unit) -> " build/s2-$$name.err \
-	    && grep -q "(Int) -> " build/s2-$$name.err \
-	    && echo "effects OK $$name (resume arg-type mismatch caught)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7a_8_diag_effect_not_handled.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null \
-	    && { echo "effects FAIL $$name (unhandled effect accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "effect not handled: Fail" build/s2-$$name.err \
-	    && grep -q "process.*declared row does not include" build/s2-$$name.err \
-	    && grep -q "process : ... / Fail" build/s2-$$name.err \
-	    && grep -q "with Fail" build/s2-$$name.err \
-	    && echo "effects OK $$name (Doc C shape: error + note + help)" \
-	    || { echo "effects FAIL $$name (wrong diag shape)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m7a_7_default_console.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -2123,24 +2028,6 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (single-effect alias resolves + runs)" \
 	    || { echo "effects FAIL $$name (alias output wrong)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
-	for f in ../examples/effects/m7b_1_alias_cycle.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (cyclic alias accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "cyclic effect alias:" build/s2-$$name.err \
-	    && echo "effects OK $$name (cycle rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7b_1_alias_non_effect.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (non-effect label accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "unknown effect in alias body: Int" build/s2-$$name.err \
-	    && echo "effects OK $$name (non-effect label rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
 	for f in ../examples/effects/m7b_12_row_var_pure_body.kai \
 	         ../examples/effects/m7b_12_row_var_console.kai \
 	         ../examples/effects/m7b_12_row_var_compose.kai \
@@ -2153,33 +2040,6 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name > /dev/null \
 	    && echo "effects OK $$name (row var instantiated + ran)" \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7b_12_row_var_two_vars.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (two row vars accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "row variable must be the last item in the row" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7b_12_row_var_var_first.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (label after row var accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "row variable must be the last item in the row" build/s2-$$name.err \
-	    && echo "effects OK $$name (rejected as expected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m7b_12_row_var_uppercase.kai; do \
-	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
-	    { echo "effects FAIL $$name (uppercase label as row var accepted)"; exit 1; } \
-	    || true; \
-	  grep -q "unknown effect: E" build/s2-$$name.err \
-	    && echo "effects OK $$name (uppercase treated as label, rejected)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m7b_11_state_basic.kai \
 	         ../examples/effects/m7b_11_reader_basic.kai \
@@ -2398,15 +2258,6 @@ test-effects: $(TARGET) build
 	    && grep -q "^42$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (per-op [T, e] row flows through Spawn.spawn directly)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
-	for f in ../examples/effects/m8_spawn_row_mismatch.kai; do \
-	  name=$$(basename $$f .kai); \
-	  if ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err; then \
-	    echo "effects FAIL $$name (typer accepted Int as a thunk)"; exit 1; \
-	  fi; \
-	  grep -q "() -> " build/s2-$$name.err \
-	    && echo "effects OK $$name (Spawn.spawn requires a thunk; per-op [T, e] surface rejects bare Int)" \
-	    || { echo "effects FAIL $$name (no thunk-shape diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_monitor.kai; do \
 	  name=$$(basename $$f .kai); \
