@@ -301,14 +301,21 @@ examples/stdlib/math_real_basic.kai
 examples/stdlib/regex_anchors_repetition.kai
 examples/stdlib/regex_basic.kai
 examples/stdlib/regex_subsume_unsupported.kai
-# unbound-register — nested-variant-test (payload-bearing) + writer-state (12)
+# unbound-register / nested-variant-test (10) — burn-down 4 closed the
+# POSITIONAL payload-bearing case (int_field_inline + reuse_nested_subpattern,
+# via var_seal_nested + the kaix_tag_eq runtime guard). REMAINING:
+#   - reuse-in-place divergers: now BUILD but diverge on a reuse-donor
+#     interaction (llvm_rc_nested_match/llvm_arm_top_reuse_shared/
+#     nested_pattern_reuse_balance) — output-mismatch, not unbound.
+#   - record-field nested path: `[Pair { snd: JReal(r) }]` (json_real_*) +
+#     binserialize need the same var_seal_nested extension in kir_lower_rec.kai.
+#   - writer-state `log` (m7b_11/m7b_14) — a stateful-handler slice, NOT
+#     nested-variant (separate family, KFn.stateful / KResume2).
 examples/effects/m7b_11_writer_basic.kai
 examples/effects/m7b_14_writer_helper.kai
-examples/perceus/int_field_inline.kai
 examples/perceus/llvm_arm_top_reuse_shared.kai
 examples/perceus/llvm_rc_nested_match.kai
 examples/perceus/nested_pattern_reuse_balance.kai
-examples/perceus/reuse_nested_subpattern.kai
 examples/stdlib/binserialize_derive_nested.kai
 examples/stdlib/json_real_decimal.kai
 examples/stdlib/json_real_int_regression.kai

@@ -393,7 +393,14 @@ int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
  * the match arm's, dropped at the arm exit), mirroring the C-direct
  * oracle's borrowing `scr->variant_tag` field read. */
 int32_t kaix_variant_tag_of(KaiValue *v) {
-    return v ? v->variant_tag : -1;
+    /* A tagged immediate (small Int) or a non-variant box is never a
+       variant; reading `v->variant_tag` on a tagged immediate would
+       dereference the tag bits and segfault. Guard with `kai_is_ptr`
+       (rejects tagged immediates and NULL) then the KAI_VARIANT tag,
+       mirroring the C oracle's `scr->tag == KAI_VARIANT` guard
+       (emit_variant_tag_test). A non-variant yields -1 (no tag matches),
+       so a `KSwitch`/`kai_tag_eq` over it falls through correctly. */
+    return (kai_is_ptr(v) && v->tag == KAI_VARIANT) ? v->variant_tag : -1;
 }
 
 /* Read the i-th argument of a variant. #747 — return a BORROWED
@@ -480,7 +487,15 @@ KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_op_eq(a, b
    whose Eq is an unimplemented proto-dispatch). Borrowing — does NOT
    touch `v`'s refcount; the immortal Bool singleton needs no drop. */
 KaiValue *kaix_tag_eq(KaiValue *v, int32_t tag) {
-    return kai_bool(v && v->variant_tag == tag);
+    /* Guard tagged immediates + non-variant boxes: a small Int is stored
+       as a tagged pointer, so `v->variant_tag` would dereference the tag
+       bits and segfault. A nested sub-pattern test (`Node(Node(..),..)`)
+       can reach `kai_tag_eq` over an Int slot, so the guard is
+       load-bearing, not defensive. `kai_is_ptr` rejects tagged immediates
+       and NULL; the KAI_VARIANT check mirrors the C oracle's
+       `slot->tag == KAI_VARIANT && slot->variant_tag == t`. A non-variant
+       is never the tested ctor → false (the arm's fail path). */
+    return kai_bool(kai_is_ptr(v) && v->tag == KAI_VARIANT && v->variant_tag == tag);
 }
 
 /* Panic with a message. The LLVM match lowering calls this in the
