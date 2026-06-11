@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -179,8 +179,8 @@ test-arena:
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke"
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke + kai doc smoke"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -194,6 +194,13 @@ test-info: kaic2
 	@tools/test-info.sh
 	@tools/test-info-blocks.sh
 	@tools/test-grammar-blocks.sh
+
+# `kai doc` smoke (pure shell + awk + python3 for JSON validation).
+# Guards the human reader over the stdlib #[doc(...)] attributes and
+# the `kai --help` heredoc against the #807 unescaped-backtick
+# regression. Needs kaic2 (the extractor) and bin/kai (the wrapper).
+test-doc: kaic2
+	@tools/test-doc.sh
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every
