@@ -231,13 +231,35 @@ before). → 82 → 77 gaps.
   > lane (gate: parity vs C-direct on the 5 fixtures + selfhost byte-id
   > UNCHANGED + ASAN). Reverted in burn-down 4 — the rewrite trades a silent
   > output-mismatch for a noisy build panic with zero parity gain.
-- **Real box/unbox** (unbox_bench_real, unbox_phase2_cond_real,
-  complex_basic, complex_heterogeneous). Native prints `9.88131e-324` (a
-  raw i64 bit-pattern read as a `double`) where C prints the real value —
-  a Real (`SReal`) slot reaches an op raw where boxed is expected, or
-  vice-versa. Same class as the burn-down-2 box discipline, on the Real slot.
-- **`^` on Real** (free_fall, math_real_basic). `Real ^ Int` runtime
-  type-mismatch; the base reaches `kaix_pow_int` boxed wrong.
+- **Real family — burn-down 4 found it is THREE distinct sub-causes, not
+  one box/unbox bug:**
+  1. **Real-literal PRECISION (oracle is lossy).** `real_pi * 2.0` →
+     C prints `6.28318`, native `6.28319`. Root: emit_c emits a Real
+     literal as `kai_real(<real_to_string(r)>)` and `real_to_string` uses
+     `%g` (6 sig digits), so the C path TRUNCATES `real_pi`
+     (`3.141592653589793` → `3.14159`) and the C compiler re-parses the
+     truncated text; the native path passes the FULL f64 to
+     `llvm_const_real`. Native is MORE accurate but DIVERGES from the lossy
+     oracle. For parity the native literal emit must replicate the
+     `real_to_string`-round-trip (parse `%g`-truncated text back to f64),
+     OR — the deeper fix — emit_c should stop truncating (use the `EReal`
+     raw source span, which round-trips decimals exactly) but that changes
+     the C-path output + selfhost byte-id, a bigger lane. (math_real_basic's
+     `tau == 2*pi` check.)
+  2. **Real box/unbox** (unbox_bench_real, unbox_phase2_cond_real,
+     complex_basic). Native prints `1` / `9.88131e-324` (a raw i64
+     bit-pattern read as a `double`) where C prints the real value — a Real
+     (`SReal`) slot reaches an op raw where boxed is expected. Entangled
+     with the unbox pass (unbox_bench_real is literally the Real-unboxing
+     benchmark). Same class as the burn-down-2 box discipline, on the Real
+     slot.
+  3. **`^` / `-` on Real PANICS** (free_fall `^`, math_real_basic `-`).
+     `kai: type mismatch in -`/`^` — a Real operand reaches `kai_op_sub` /
+     `kaix_pow_int` as a non-Real box (one operand Int-tagged), so the
+     runtime's `both-Real` branch misses. Likely a Real slot stored as an
+     Int box in a constructor / accumulator.
+  Each sub-cause needs its own diagnosis + fix; they were conflated as one
+  "box/unbox" gap before burn-down 4 split them.
 - **stream effect handlers** (#801 — 4 `stream_*` + `demos/wc.kai`). The
   lazy `Stream` line-IO carrier performs `File` / `ReadFault` ops the
   native walk installs no handler for. Same no-effect-handler subset as
