@@ -127,6 +127,19 @@ the supported dependency forms (string shorthand, inline table,
 local path), and the v1 status (local-path deps are live; git-based
 deps are deferred to a follow-up).
 
+Two on-CLI references travel with the binary:
+
+```sh
+kai info syntax          # one-page cheat sheet of every form kaikai has
+kai doc string.split     # a stdlib symbol's signature + documentation
+kai doc stream           # a module's pub items, each with a synopsis
+kai doc                  # every stdlib module, one synopsis each
+```
+
+`kai info` covers language semantics (effects, match, protocols,
+units, pipes); `kai doc` reads the `#[doc(...)]` attributes carried by
+stdlib source, so it stays in sync with the code it documents.
+
 ## Layout
 
 ```
