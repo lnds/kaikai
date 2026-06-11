@@ -292,6 +292,7 @@ examples/effects/multi_var_state_index.kai
 examples/minimal/quicksort.kai
 examples/perceus/reuse_record_basic.kai
 examples/perceus/scalar_fn_sig_deep_recursion.kai
+examples/stdlib/crypto_hash_basic.kai
 examples/stdlib/hashmap_basic.kai
 examples/stdlib/hashmap_collision.kai
 examples/stdlib/hashset_basic.kai
@@ -337,10 +338,9 @@ examples/packages/cross_package_effects/consumer/main.kai
 # namespace collision, kir_lower.kai). 5 of 6 close outright; jwt_encoder
 # now BUILDS + RUNS but DIVERGES on a pre-existing decode bug (moved to
 # output-mismatch above). See "Burn-down 4 root cause" below.
-# missing-symbols — bits / crypto (3)
-examples/stdlib/bits_basic.kai
-examples/stdlib/bits_dotted.kai
-examples/stdlib/crypto_hash_basic.kai
+# missing-symbols — CLOSED by burn-down 4 (bit-op intrinsic symbol,
+# emit_native_ops.kai). bits_basic/bits_dotted close; crypto_hash_basic
+# now LINKS + runs sha256 but SIGSEGVs in sha512 (moved to exit-sigsegv).
 # cross-platform Linux-only SIGSEGV (pass on macOS) (2)
 examples/stdlib/list_helpers.kai
 examples/stdlib/list_zip3_scan.kai
