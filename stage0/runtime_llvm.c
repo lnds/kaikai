@@ -468,6 +468,21 @@ double kaix_variant_arg_f64(KaiValue *v, int i) {
    guards or literal patterns that want a KaiValue* Bool. */
 KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_op_eq(a, b)); }
 
+/* Variant-tag equality test for the native match decision tree
+   (kir_lower_variant.kai). A `match` arm that shares its top-level tag
+   with a sibling but discriminates on a nullary CONSTRUCTOR sub-pattern
+   (`Branch(Red, ..)` vs `Branch(Black, ..)`, `Some(None)` vs `Some(_)`)
+   tests the sub-slot's variant_tag against the expected ctor tag — the
+   mirror of the C-direct oracle's `emit_enum_slot_test` /
+   `emit_variant_tag_test` (`slot->variant_tag == t`). It compares ONLY
+   the immediate tag: unlike `kaix_eq_raw` it never recurses into fields
+   nor routes through a custom `Eq` impl (which would panic on a type
+   whose Eq is an unimplemented proto-dispatch). Borrowing — does NOT
+   touch `v`'s refcount; the immortal Bool singleton needs no drop. */
+KaiValue *kaix_tag_eq(KaiValue *v, int32_t tag) {
+    return kai_bool(v && v->variant_tag == tag);
+}
+
 /* Panic with a message. The LLVM match lowering calls this in the
    fall-through block of the last arm when no pattern matches, so the
    generated IR then drops into `unreachable`. Named distinctly from

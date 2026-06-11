@@ -22,6 +22,7 @@ import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
 import compiler.kir_lower_rec
+import compiler.kir_lower_variant
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -621,22 +622,37 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, st: LowerSt)
         # duplicate switch case). With no catch-all the match is variant-
         # exhaustive, so the default is `KUnreachable` (Linus review #3).
         let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, st6)
-        let st8 = lower_arm_bodies(arms, cases, scrv, join, lcont, st7)
+        # One switch case per DISTINCT tag (plan_arms dedups). A tag matched
+        # by one arm lowers its body directly in the case block; a tag SHARED
+        # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
+        # case block that discriminates on the payload (kir_lower_variant).
+        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, st7)
         LRes(KVar(join), reopen(st8, lcont))
       } } } }
 
-# A block label per VARIANT arm paired with its tag. Non-variant arms
-# (tag -1, e.g. a wildcard `_`) get NO switch case — they are the default
-# block (`lower_default_arm`); emitting them as cases would create
-# duplicate `i64 -1` switch entries (invalid IR).
+# One switch case per DISTINCT variant tag, in first-appearance order.
+# Non-variant arms (tag -1, e.g. a wildcard `_`) get NO case — they are the
+# default block (`lower_default_arm`). A tag SHARED by several arms
+# (`Exited(0)` / `Exited(_)`) gets ONE case whose block holds a sub-fail-
+# chain (`lower_variant_groups`); emitting a case per arm would create the
+# duplicate i32 switch entry LLVM rejects (the `Duplicate integer as switch
+# case` native-parity family). The case label is the GROUP block; each
+# group's arms are recovered by tag in `lower_variant_groups`.
 fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match arms {
   [] -> ArmPlan(acc, st)
   [Arm(p, _, _), ...rest] -> {
     let tag = arm_tag(p, st)
     if tag < 0 { plan_arms(rest, st, acc) }
+    else if kcase_has_tag(acc, tag) { plan_arms(rest, st, acc) }
     else { match ls_fresh_label(st) { LSLabel(lbl, st1) ->
       plan_arms(rest, st1, list_append(acc, [KC(tag, lbl)])) } }
   }
+}
+
+# Has a switch case for `tag` already been planned? (dedup of a shared tag).
+fn kcase_has_tag(cases: [KCase], tag: Int) : Bool = match cases {
+  [] -> false
+  [KC(t, _), ...rest] -> if t == tag { true } else { kcase_has_tag(rest, tag) }
 }
 
 # Lower the catch-all arm's body into the default block, or seal it
@@ -695,22 +711,70 @@ fn arm_tag(p: Pattern, st: LowerSt) : Int = match p.pkind {
   _                       -> 0 - 1
 }
 
-# Lower each VARIANT arm body into its case block (default arm handled
-# separately). `cases` and the variant arms line up positionally because
-# `plan_arms` skipped the non-variant arms in the same order.
-fn lower_arm_bodies(arms: [Arm], cases: [KCase], scrv: KVal, join: String,
-                    lcont: String, st: LowerSt) : LowerSt / Console = match arms {
+# Lower the body block(s) for each switch case. One case per distinct tag
+# (plan_arms dedups); its arms are recovered from `arms` by tag, preserving
+# source order. A tag matched by ONE arm lowers that arm's binds + body
+# directly in the case block. A tag SHARED by N arms opens a sub-fail-chain
+# in the case block: each discriminating arm tests its payload
+# (`var_emit_subtests`) and branches to its own body on success / the next
+# arm on failure; the tag's catch-all arm (`Exited(_)`) ends the chain
+# unconditionally. The chain's final fail routes to `ldef` (the switch
+# default): "no arm of this tag matched" is exactly "fell through the
+# switch" — `ldef` carries the global `_` body or is `KUnreachable` when the
+# match is exhaustive (Linus review #3, mirror of `lower_default_arm`).
+fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
+                        lcont: String, ldef: String, st: LowerSt) : LowerSt / Console = match cases {
   [] -> st
-  [Arm(p, _, body), ...rest] ->
-    if arm_is_default(p) { lower_arm_bodies(rest, cases, scrv, join, lcont, st) }
-    else { match cases {
-      [KC(_, lbl), ...crest] -> {
-        let st_arm = reopen(st, lbl)
-        let st_bound = bind_pattern_fields(p, scrv, st_arm)
-        let st_body = lower_branch_into(body, join, lcont, st_bound)
-        lower_arm_bodies(rest, crest, scrv, join, lcont, st_body)
-      }
-      [] -> st
+  [KC(tag, lbl), ...crest] -> {
+    let group = arms_with_tag(arms, tag, st)
+    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, st)
+    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, st1)
+  }
+}
+
+# The VARIANT arms whose top-level tag is `tag`, in source order.
+fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
+  [] -> []
+  [a, ...rest] -> match a { Arm(p, _, _) ->
+    if arm_is_default(p) or arm_tag(p, st) != tag { arms_with_tag(rest, tag, st) }
+    else { [a, ...arms_with_tag(rest, tag, st)] } }
+}
+
+# Lower one tag group into its case block `lbl`. A lone arm binds its fields
+# and lowers its body directly (the common case — keeps the switch O(1)
+# with no extra branch). A shared tag opens a sub-fail-chain.
+fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
+                   lbl: String, ldef: String, st: LowerSt) : LowerSt / Console = match group {
+  [Arm(p, _, body)] -> {
+    let st_arm = reopen(st, lbl)
+    let st_bound = bind_pattern_fields(p, scrv, st_arm)
+    lower_branch_into(body, join, lcont, st_bound)
+  }
+  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, reopen(st, lbl))
+}
+
+# The sub-fail-chain for a tag shared by N>1 arms. Each arm: if it
+# discriminates on its payload, test it (`condbr` to its body on match / a
+# fresh fail label on mismatch); if it is the tag's catch-all, branch
+# unconditionally to its body (ending the chain — later arms are dead, which
+# the typer's redundancy check forbids). After binding its fields, the arm's
+# body lowers into the shared join. The last fail label routes to `ldef`.
+fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
+                     fail_lbl: String, ldef: String, st: LowerSt) : LowerSt / Console = match group {
+  [] -> ls_seal(reopen(st, fail_lbl), KBr(ldef, KNoPos), ldef)
+  [Arm(p, _, body), ...rest] -> match ls_fresh_label(reopen(st, fail_lbl)) { LSLabel(body_lbl, st1) ->
+    if var_arm_is_tag_catchall(p) {
+      # Catch-all of this tag: branch straight to the body; later arms dead.
+      let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
+      let st3 = bind_pattern_fields(p, scrv, reopen(st2, body_lbl))
+      lower_branch_into(body, join, lcont, st3)
+    } else {
+      match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
+        let st3 = var_emit_subtests(p, scrv, body_lbl, next_fail, st2)
+        let st4 = bind_pattern_fields(p, scrv, st3)
+        let st5 = lower_branch_into(body, join, lcont, st4)
+        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, st5)
+      } }
     } }
 }
 
