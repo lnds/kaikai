@@ -1,9 +1,9 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-10, after burn-down 2 + #801/#810 corpus growth):**
+> **Status (2026-06-10, after burn-down 3):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **342 pass / 91 fail / 96 skip** over 528
-> fixtures vs the C-direct oracle on Linux/CI (~80% corpus parity, up from
+> docs/kir-design.md §7.2) is at **351 pass / 82 fail / 96 skip** over 529
+> fixtures vs the C-direct oracle on Linux/CI (~81% corpus parity, up from
 > ~60% at first measure). The flip to native-default (Lane 1.5) is **BLOCKED** on
 > closing these gaps. This file is the burn-down input: every failing
 > fixture, grouped by root-cause family. The anti-regression ratchet that
@@ -14,17 +14,19 @@
 > 31 (missing-symbols `kai_assert_check` symbol + an unbound-register
 > slice) → 137. Burn-down 2 closed 55 (two KIR-lowering root causes —
 > unary-minus aliasing the binary `-`, and locals-shadow-imports in
-> `lower_var`; see the retro) → 82. Issue #801 (stream carrier, PR #809)
-> then ADDED 6 new corpus fixtures as gaps (NOT a regression — new programs
-> the native walk does not yet cover): 4 `stream_*` (no-effect-handler on
-> `File`/`ReadFault`), `demos/wc.kai` (exit-code-mismatch, same root cause
-> at runtime), `ctor_field_effect_row` (clause-param-origin). → 88. Issue
-> #810 (`#[unstable]` transparency) then added `attr_unstable_refine_narrow`
-> (native SIGSEGV, C clean — a backend gap, not a regression). → 89. Finally,
-> `list_helpers` + `list_zip3_scan` PASS native on macOS but SIGSEGV on
-> Linux/CI (the merge oracle), so they stay listed despite closing locally
-> in burn-down 2 — the cross-platform lesson burn-down 1's retro flagged.
-> → 91.
+> `lower_var`; see the retro) → 82, then #801/#810 corpus growth + the two
+> cross-platform Linux-only SIGSEGV gaps (`list_helpers`, `list_zip3_scan`)
+> brought it to 91. Burn-down 3 closed 9 (91 → 82), ONE KIR-lowering root
+> cause — **shared-tag sub-discrimination**: a `match` arm sharing a
+> top-level tag with a sibling but discriminating on a payload sub-pattern
+> (`Exited(0)`/`Exited(_)`, `Branch(Red,_)`/`Branch(Black,_)`) lowered to a
+> `KSwitch` with a duplicate i32 case (`Duplicate integer as switch case`,
+> LLVM-rejected) and a dead second arm. The fix groups arms by tag and
+> opens a payload sub-fail-chain for shared tags (kir_lower_variant.kai; see
+> the retro). The whole `Duplicate integer as switch case` family (18) is
+> GONE: 9 close; the other 9 now BUILD + RUN but diverge on a PRE-EXISTING
+> bug the build error masked (regex char-class parse, json `\uXXXX` decode,
+> Call-param-mismatch), reclassified below.
 >
 > **Flakiness:** a few native gaps were non-deterministic (intermittent
 > SIGSEGV / pointer-bearing output) — e.g. `examples/stdlib/hex_basic.kai`
@@ -36,24 +38,28 @@
 > Reproduce: `TARGET_BACKEND=native ORACLE_BACKEND=c tools/test-backend-parity.sh`
 > (needs a kaic2 built with libLLVM — `make -C stage2 KAI_LLVM=1`).
 
-## Root-cause families (91 remaining)
+## Root-cause families (82 remaining)
+
+The counts below are re-measured post-burn-down-3 by build/run signature
+(`Duplicate integer as switch case` is now **0**). The `output-mismatch`
+and `exit-code-mismatch` families GREW as the 9 reclassified regex/json
+fixtures surfaced their masked runtime bug.
 
 | Family | Count | Signature / likely cause |
 |---|---:|---|
-| build-failed-other | 25 | native build fails with a signature not in the buckets below (regex / json / map / http — large stdlib modules that pull in an unhandled lowering shape). |
-| no-effect-handler | 14 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File/ReadFault>` — effect ops the native walk installs no handler for (Spawn 7, Clock 2, NetTcp 1, + #801's `File`/`ReadFault` line-stream stages: `stream_early_stop`, `stream_mock_disk`, `stream_skip_policy`, `stream_abort_leak`). |
-| exit-code-mismatch / SIGSEGV | 18 | `c=0, native=1` (or 138/139 — a crash counts as a non-zero exit): native exits non-zero / crashes where C succeeds (hashmap/hashset, quicksort, deep recursion). Includes `demos/wc.kai` (#801 `read_lines` over `File`+`ReadFault`, no native handler → diverges on exit), `attr_unstable_refine_narrow` (#810 — native SIGSEGV), and `list_helpers` / `list_zip3_scan` (native SIGSEGV on Linux only — pass on macOS). |
-| unbound-register | 13 | `native: unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test / writer-state slice. The mechanical binds closed in burn-down 1; these need a nested decision tree. |
-| output-mismatch | 13 | same exit code, divergent stdout. Two sub-causes: **pipe-lowering** (`EPipe` lowers to unit, the call vanishes) and **Real-arithmetic** (`9.88131e-324` ≈ a raw i64 read as a double). See below. |
+| output-mismatch | 19 | same exit code, divergent stdout. Sub-causes: **pipe-lowering** (`EPipe` lowers to unit, the call vanishes — collatz/euler1/fizzbuzz/imc/capture), **Real box/unbox** (`9.88131e-324` ≈ a raw i64 read as a double — complex/unbox_*), and the **regex/json reclassified** (regex predicate/subsume wrong output, json `\uXXXX` decode `MISMATCH got='1' want='A'` — a char/hex decode the build error masked). |
+| exit-code-mismatch / SIGSEGV / timeout | 22 | `c=0, native=1/124/138/139`. Sub-causes: `nat=1` panics (hashmap/hashset `Hash:hash` proto-dispatch todo, math_real `-`/`^`, regex parse `unterminated character class`, `requires violated`), `nat=139` SIGSEGV (quicksort×2, deep recursion, attr_unstable), `nat=124` timeout (spiral, m7b_15/m8_12 nested-alias, multi_var_state), `nat=138` (issue_668 map-in-fiber). Includes the Linux-only `list_helpers`/`list_zip3_scan`. |
+| unbound-register | 12 | `unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test slice: a nested variant sub-pattern WITH payload (`Some(JReal(r))`) needs a tag TEST + recursive sub-bind. Burn-down 3's `kai_tag_eq` test covers NULLARY nested ctors (enum slots); the payload-bearing nested ctor is the remaining gap (`bind_unsupported_nested`). Plus the writer-state `log` slice. |
+| no-effect-handler | 11 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File>` — effect ops the native walk installs no handler for (Spawn 7, Clock 2, NetTcp 1, File 1: `stream_early_stop`). |
+| clause-param-origin | 7 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801) and the remaining `stream_*` (`stream_abort_leak`/`stream_mock_disk`/`stream_skip_policy`) whose carrier hits the alias-dispatch clause. |
+| Call-param-mismatch | 6 | `module verify failed: Call parameter type does not match function signature!` — the `map` modules (map_basic/map_pipes/map_round_out/map_tree_basic) + jwt_encoder + fx_basic: a generated call passes an operand whose LLVM type disagrees with the callee signature (a monomorph/boxing shape the native walk emits wrong). One root cause across all 6. |
 | missing-symbols | 3 | `Undefined symbols for architecture arm64` at link — `bits` / `crypto_hash` runtime entries the native object references but never defines. |
-| clause-param-origin | 3 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801: a ctor field with an effect row hits the alias-dispatch clause-param gap). |
-| type-mismatch (`^`) | 2 | `kai: type mismatch in ^` at runtime — `Real ^ Int` (free_fall / math_real_basic): the base reaches `kaix_pow_int` boxed wrong. Distinct from the burn-down-2 unary/locals causes. |
 
-> Several fixtures show more than one signature (e.g. `free_fall` and
-> `math_real_basic` show both a `^` type-mismatch and an exit-diff); each
-> is listed once below under its primary root cause. The per-family lists
-> below total 91 (matching `tools/native-parity-baseline.txt`); the count
-> column above sums to 91.
+> Several fixtures show more than one signature (e.g. `free_fall` shows
+> both a `^` type-mismatch and an exit-diff); each is listed once below
+> under its primary root cause. The per-family lists below total 82
+> (matching `tools/native-parity-baseline.txt`); the count column above
+> sums to 82.
 
 ## Burn-down 2 root causes (CLOSED — do not re-open)
 
@@ -81,8 +87,67 @@ that appears all over the corpus.
    `lower_callee_dispatch` — the #748/#749 locals-shadow-imports rule, the
    KIR mirror of emit_c's `EmitCtx.lcs`.
 
-## Diagnosed for burn-down 3
+## Burn-down 3 root cause (CLOSED — do not re-open)
 
+**shared-tag sub-discrimination.** The variant path of `lower_match`
+(kir_lower_walk.kai) switches on the scrutinee's top-level tag
+(`KTagOf` → `KSwitch`) — the O(1) jump table for the common case (every
+arm a distinct constructor). It broke when two arms SHARED a top-level tag
+but discriminated on a payload sub-pattern:
+
+    match e { Exited(0) -> A   Exited(_) -> B   Signaled(_) -> C }
+    match n { Branch(Red, _) -> A   Branch(Black, _) -> B   Leaf -> C }
+
+`plan_arms` emitted two `KC(Exited_tag, ..)` cases — a duplicate i32 switch
+case LLVM rejects (`module verify failed: Duplicate integer as switch
+case`) — and even were it accepted the second arm was dead (nothing tested
+the payload). This was the largest single native-parity family (18).
+
+Fix (mirror of the oracle's `emit_pat_test_variant_subs`, WITHOUT losing
+the switch):
+
+1. `plan_arms` (kir_lower_walk.kai) now emits ONE switch case per DISTINCT
+   tag (`kcase_has_tag` dedup), in first-appearance order. A unique tag
+   keeps its bare O(1) switch jump.
+2. A tag SHARED by N>1 arms routes its case to a GROUP block holding a
+   sub-fail-chain (`lower_variant_groups` / `lower_group_chain`): each arm
+   tests its payload (`var_emit_subtests`, kir_lower_variant.kai), branching
+   to its body on match / the next arm on mismatch; the tag's catch-all arm
+   (`Exited(_)`) ends the chain unconditionally (source order guarantees it
+   comes last — the typer rejects an unreachable arm). The chain's final
+   fail routes to the switch `default` (`ldef`), which carries the global
+   `_` body or is `KUnreachable` when the match is exhaustive.
+3. The per-slot test: a LITERAL slot → `kai_eq_raw (KProj scr i) lit`; a
+   NULLARY ctor / enum slot → `kai_tag_eq (KProj scr i) ctor_tag`, an
+   additive runtime shim (`kaix_tag_eq`, runtime_llvm.c) that compares ONLY
+   the immediate variant_tag (never recurses into fields nor routes through
+   a custom `Eq` impl — that would panic on a proto-dispatch-todo type).
+4. `bind_slot_pattern` (kir_lower_bind.kai) now treats a NULLARY nested
+   ctor (`Red`) as a bind no-op (it carries no inner name, only a tag the
+   sub-chain tested) instead of trapping `bind_unsupported_nested`. A
+   payload-bearing nested ctor (`Some(Node(x))`) still traps loud — the
+   remaining nested-variant-test gap.
+
+Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
+3 minimal fixtures (literal-slot, enum-slot, multi-literal pick-correct-arm)
++ selfhost byte-id + tier0 + zero parity regressions across the full corpus.
+
+## Diagnosed for burn-down 4
+
+- **regex/json reclassified (burn-down 3 unmasked).** The 9
+  `Duplicate integer as switch case` fixtures that now build+run but diverge
+  share a likely common root: a char/hex decode in the native path. `regex_basic`
+  / `regex_anchors_repetition` panic `unterminated character class` (the regex
+  parser's `Some(']')` char-match never fires — though a minimal `Some(']')`
+  match passes parity, so the bug is in how the real parser reads the char,
+  not the match lowering); `json_basic` decodes `A` to `'1'` not `'A'`
+  (a hex-nibble read). `regex_subsume_*` / `regex_predicate_basic` produce
+  wrong output. Diagnose the char/string-index read on the native path first.
+- **Call-param-mismatch** (6: map_basic/map_pipes/map_round_out/map_tree_basic
+  + jwt_encoder + fx_basic). `module verify failed: Call parameter type does
+  not match function signature!` — one root cause: a generated call passes an
+  operand whose LLVM type disagrees with the callee. Likely a monomorph /
+  boxing shape (Map's comparator closure?) the native walk types wrong.
 - **pipe-lowering** (euler1, fizzbuzz×2, capture, imc). `EPipe` is NOT
   desugared to `ECall` by any pre-codegen pass: the typer (`infer.kai`
   `synth_pipe`) rebuilds `EPipe(lhs, ECall(f, args))`, leaving each emitter
@@ -118,50 +183,35 @@ that appears all over the corpus.
 
 ## Failing fixtures by family
 
-# build-failed-other (25)
-demos/spiral/main.kai
-examples/effects/process_basic.kai
-examples/perceus/enum_slot_repr.kai
-examples/perceus/next_tier_rc_fix.kai
-examples/stdlib/fx_basic.kai
-examples/stdlib/http_redirect_follow_basic.kai
-examples/stdlib/http_redirect_policy_custom.kai
-examples/stdlib/http_redirect_too_many.kai
-examples/stdlib/http_server_basic.kai
+> Re-measured post-burn-down-3 (82 total, matching the ratchet). The
+> `Duplicate integer as switch case` family is gone; the 9 reclassified
+> regex/json fixtures now sit under `output-mismatch` / `exit-sigsegv-timeout`.
+
+# output-mismatch — pipe-lowering + Real box/unbox + reclassified regex/json (19)
+demos/collatz/main.kai
+demos/euler1/main.kai
+demos/factorials/main.kai
+demos/fizzbuzz/main.kai
+demos/imc/main.kai
+examples/minimal/capture.kai
+examples/minimal/fizzbuzz.kai
+examples/perceus/unbox_bench_real.kai
+examples/perceus/unbox_phase2_cond_real.kai
+examples/stdlib/complex_basic.kai
+examples/stdlib/complex_heterogeneous.kai
+examples/stdlib/hex_escape_literal.kai
 examples/stdlib/json_basic.kai
-examples/stdlib/json_real_invalid.kai
 examples/stdlib/json_surrogate_decode.kai
 examples/stdlib/json_surrogate_encode.kai
-examples/stdlib/json_surrogate_invalid.kai
-examples/stdlib/jwt_encoder.kai
-examples/stdlib/map_basic.kai
-examples/stdlib/map_pipes/main.kai
-examples/stdlib/map_round_out.kai
-examples/stdlib/map_tree_basic.kai
-examples/stdlib/regex_anchors_repetition.kai
-examples/stdlib/regex_basic.kai
 examples/stdlib/regex_predicate_basic.kai
 examples/stdlib/regex_subsume_alpha.kai
 examples/stdlib/regex_subsume_basic.kai
-examples/stdlib/regex_subsume_unsupported.kai
-# no-effect-handler — Spawn 7 / Clock 2 / NetTcp 1 / File-ReadFault 4 (14)
-examples/actors/dual_actor_receive_only.kai
-examples/actors/dual_actor_request_reply.kai
-examples/actors/dual_actor_send_only.kai
-examples/effects/m8_7_actor_self_send.kai
-examples/effects/m8_8_mailbox_drop_newest.kai
-examples/effects/m8_8_mailbox_drop_oldest.kai
-examples/effects/stream_abort_leak.kai
-examples/effects/stream_early_stop.kai
-examples/effects/stream_mock_disk.kai
-examples/effects/stream_skip_policy.kai
-examples/llvm/nested_lambda_with_mailbox.kai
-examples/stdlib/date_basic.kai
-examples/stdlib/date_iso.kai
-examples/stdlib/http_server_book_ch17.kai
-# exit-code-mismatch / SIGSEGV (18)
+examples/stdlib/string_lines_chars.kai
+# exit-code-mismatch / SIGSEGV / timeout (22)
 demos/forth/main.kai
+demos/free_fall/main.kai
 demos/quicksort/main.kai
+demos/spiral/main.kai
 demos/wc.kai
 examples/attributes/attr_unstable_refine_narrow.kai
 examples/effects/issue_668_map_large_in_fiber.kai
@@ -176,12 +226,13 @@ examples/stdlib/hashmap_basic.kai
 examples/stdlib/hashmap_collision.kai
 examples/stdlib/hashset_basic.kai
 examples/stdlib/hashset_ops.kai
-examples/stdlib/list_helpers.kai
-examples/stdlib/list_zip3_scan.kai
-# unbound-register — nested-variant-test slice (13)
+examples/stdlib/math_real_basic.kai
+examples/stdlib/regex_anchors_repetition.kai
+examples/stdlib/regex_basic.kai
+examples/stdlib/regex_subsume_unsupported.kai
+# unbound-register — nested-variant-test (payload-bearing) + writer-state (12)
 examples/effects/m7b_11_writer_basic.kai
 examples/effects/m7b_14_writer_helper.kai
-examples/effects/net_dns_resolve.kai
 examples/perceus/int_field_inline.kai
 examples/perceus/llvm_arm_top_reuse_shared.kai
 examples/perceus/llvm_rc_nested_match.kai
@@ -192,28 +243,37 @@ examples/stdlib/json_real_decimal.kai
 examples/stdlib/json_real_int_regression.kai
 examples/stdlib/json_real_negative.kai
 examples/stdlib/json_real_scientific.kai
-# output-mismatch — pipe-lowering + Real box/unbox (13)
-demos/collatz/main.kai
-demos/euler1/main.kai
-demos/factorials/main.kai
-demos/fizzbuzz/main.kai
-demos/imc/main.kai
-examples/minimal/capture.kai
-examples/minimal/fizzbuzz.kai
-examples/perceus/unbox_bench_real.kai
-examples/perceus/unbox_phase2_cond_real.kai
-examples/stdlib/complex_basic.kai
-examples/stdlib/complex_heterogeneous.kai
-examples/stdlib/hex_escape_literal.kai
-examples/stdlib/string_lines_chars.kai
-# missing-symbols (3)
+# no-effect-handler — Spawn 7 / Clock 2 / NetTcp 1 / File 1 (11)
+examples/actors/dual_actor_receive_only.kai
+examples/actors/dual_actor_request_reply.kai
+examples/actors/dual_actor_send_only.kai
+examples/effects/m8_7_actor_self_send.kai
+examples/effects/m8_8_mailbox_drop_newest.kai
+examples/effects/m8_8_mailbox_drop_oldest.kai
+examples/effects/stream_early_stop.kai
+examples/llvm/nested_lambda_with_mailbox.kai
+examples/stdlib/date_basic.kai
+examples/stdlib/date_iso.kai
+examples/stdlib/http_server_book_ch17.kai
+# clause-param-origin — subset-2b alias dispatch (7)
+examples/effects/ctor_field_effect_row.kai
+examples/effects/net_dns_resolve.kai
+examples/effects/r9_clause_capture.kai
+examples/effects/stream_abort_leak.kai
+examples/effects/stream_mock_disk.kai
+examples/effects/stream_skip_policy.kai
+examples/packages/cross_package_effects/consumer/main.kai
+# Call-param-mismatch — map / jwt / fx modules (6)
+examples/stdlib/fx_basic.kai
+examples/stdlib/jwt_encoder.kai
+examples/stdlib/map_basic.kai
+examples/stdlib/map_pipes/main.kai
+examples/stdlib/map_round_out.kai
+examples/stdlib/map_tree_basic.kai
+# missing-symbols — bits / crypto (3)
 examples/stdlib/bits_basic.kai
 examples/stdlib/bits_dotted.kai
 examples/stdlib/crypto_hash_basic.kai
-# clause-param-origin — subset-2b alias dispatch (3)
-examples/effects/ctor_field_effect_row.kai
-examples/effects/r9_clause_capture.kai
-examples/packages/cross_package_effects/consumer/main.kai
-# type-mismatch `^` on Real (2)
-demos/free_fall/main.kai
-examples/stdlib/math_real_basic.kai
+# cross-platform Linux-only SIGSEGV (pass on macOS) (2)
+examples/stdlib/list_helpers.kai
+examples/stdlib/list_zip3_scan.kai
