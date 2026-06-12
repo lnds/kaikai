@@ -1,32 +1,48 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-10, after burn-down 3):**
+> **Status (2026-06-11, after burn-down 5):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **351 pass / 82 fail / 96 skip** over 529
-> fixtures vs the C-direct oracle on Linux/CI (~81% corpus parity, up from
-> ~60% at first measure). The flip to native-default (Lane 1.5) is **BLOCKED** on
-> closing these gaps. This file is the burn-down input: every failing
-> fixture, grouped by root-cause family. The anti-regression ratchet that
-> locks the count is `tools/native-parity-baseline.txt` (gated in
+> docs/kir-design.md §7.2) is at **81 fail** on the Linux/CI ratchet (73 this
+> lane diagnosed + 8 corpus-growth gaps main added during the rebase — see
+> below; macOS dev measures 79). The flip to native-default (Lane 1.5) is
+> **BLOCKED** on closing these gaps. This file is the burn-down input: every
+> failing fixture, grouped by root-cause family. The anti-regression ratchet
+> that locks the count is `tools/native-parity-baseline.txt` (gated in
 > `tier1-native`).
 >
 > **History:** 168 gaps at first measure (2026-06-09). Burn-down 1 closed
-> 31 (missing-symbols `kai_assert_check` symbol + an unbound-register
-> slice) → 137. Burn-down 2 closed 55 (two KIR-lowering root causes —
-> unary-minus aliasing the binary `-`, and locals-shadow-imports in
-> `lower_var`; see the retro) → 82, then #801/#810 corpus growth + the two
-> cross-platform Linux-only SIGSEGV gaps (`list_helpers`, `list_zip3_scan`)
-> brought it to 91. Burn-down 3 closed 9 (91 → 82), ONE KIR-lowering root
-> cause — **shared-tag sub-discrimination**: a `match` arm sharing a
-> top-level tag with a sibling but discriminating on a payload sub-pattern
-> (`Exited(0)`/`Exited(_)`, `Branch(Red,_)`/`Branch(Black,_)`) lowered to a
-> `KSwitch` with a duplicate i32 case (`Duplicate integer as switch case`,
-> LLVM-rejected) and a dead second arm. The fix groups arms by tag and
-> opens a payload sub-fail-chain for shared tags (kir_lower_variant.kai; see
-> the retro). The whole `Duplicate integer as switch case` family (18) is
-> GONE: 9 close; the other 9 now BUILD + RUN but diverge on a PRE-EXISTING
-> bug the build error masked (regex char-class parse, json `\uXXXX` decode,
-> Call-param-mismatch), reclassified below.
+> 31 → 137. Burn-down 2 closed 55 (unary-minus aliasing the binary `-` +
+> locals-shadow-imports) → 82, then #801/#810 corpus growth + the two
+> cross-platform Linux-only SIGSEGV gaps → 91. Burn-down 3 closed 9 (91 →
+> 82), shared-tag sub-discrimination — the whole `Duplicate integer as
+> switch case` family (18) GONE (9 close, 9 reclassified to regex/json).
+> Burn-down 4 NEVER MERGED (stale-golden KIR regression). Burn-down 5
+> (2026-06-11) closed 9 cross-platform (82 → 81 NET — main added 8
+> corpus-growth gaps during the rebase, listed but out of this lane's zone),
+> THREE root causes:
+>   - **KIR temp-register / surface-binder namespace collision**
+>     (Call-param-mismatch, 5 closed: fx_basic + map_basic/pipes/round_out/
+>     tree_basic). `ls_fresh_reg`'s `t<rc>` temporaries aliased surface
+>     binders named `t0`/`t1`/`t2` (fx_basic's variables; map.kai's
+>     `tree_rotate` binders) → the alloca took the first slot seen (i32 from
+>     a `tagof`), a boxed store + i32 load disagreed at the call →
+>     `Call parameter type does not match function signature`. Fix:
+>     `ls_fresh_reg` acuña `.t<rc>` (`.` is lexer-rejected in a surface
+>     ident, so no collision is possible) + `rspec_add` widens to box on a
+>     slot conflict (soundness floor). jwt_encoder reclassified (char/hex).
+>   - **bit-op prelude shims** (missing-symbols, 2 closed: bits_basic,
+>     bits_dotted). The native runtime never defined `kaix_prelude_bit_*`;
+>     12 additive shims in runtime_llvm.c reproduce the C oracle's inline
+>     operator + refcount exactly. crypto_hash reclassified (flaky SIGSEGV).
+>   - **stateful return-clause `state`/`log` bind** (unbound-register
+>     writer-state, 2 closed: m7b_11/m7b_14). `lower_handle_ret` never bound
+>     the handler's final state for a stateful return clause. Fix: a new
+>     `KStmt` `KBindEvState(eff)` the native walk reads from the handle
+>     frame's Ev (shared `nemit_bind_ev_state` with the clause prologue).
+> All 7 `examples/kir/*.kir.expected` goldens were regenerated (the dump
+> changed: `.t` prefix + `bind-ev-state` line) and the `.kir.fns` filter
+> re-verified (no stdlib spill — the burn-down-4 failure mode). selfhost
+> byte-id OK; 3-way parity + ASAN clean on the closed fixtures.
 >
 > **Flakiness:** a few native gaps were non-deterministic (intermittent
 > SIGSEGV / pointer-bearing output) — e.g. `examples/stdlib/hex_basic.kai`
@@ -49,17 +65,22 @@ fixtures surfaced their masked runtime bug.
 |---|---:|---|
 | output-mismatch | 19 | same exit code, divergent stdout. Sub-causes: **pipe-lowering** (`EPipe` lowers to unit, the call vanishes — collatz/euler1/fizzbuzz/imc/capture), **Real box/unbox** (`9.88131e-324` ≈ a raw i64 read as a double — complex/unbox_*), and the **regex/json reclassified** (regex predicate/subsume wrong output, json `\uXXXX` decode `MISMATCH got='1' want='A'` — a char/hex decode the build error masked). |
 | exit-code-mismatch / SIGSEGV / timeout | 22 | `c=0, native=1/124/138/139`. Sub-causes: `nat=1` panics (hashmap/hashset `Hash:hash` proto-dispatch todo, math_real `-`/`^`, regex parse `unterminated character class`, `requires violated`), `nat=139` SIGSEGV (quicksort×2, deep recursion, attr_unstable), `nat=124` timeout (spiral, m7b_15/m8_12 nested-alias, multi_var_state), `nat=138` (issue_668 map-in-fiber). Includes the Linux-only `list_helpers`/`list_zip3_scan`. |
-| unbound-register | 12 | `unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test slice: a nested variant sub-pattern WITH payload (`Some(JReal(r))`) needs a tag TEST + recursive sub-bind. Burn-down 3's `kai_tag_eq` test covers NULLARY nested ctors (enum slots); the payload-bearing nested ctor is the remaining gap (`bind_unsupported_nested`). Plus the writer-state `log` slice. |
+| unbound-register | 10 | `unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test slice: a nested variant sub-pattern WITH payload (`Some(JReal(r))`) needs a tag TEST + recursive sub-bind. Burn-down 3's `kai_tag_eq` test covers NULLARY nested ctors (enum slots); the payload-bearing nested ctor is the remaining gap (`bind_unsupported_nested`). [Burn-down 5 closed the writer-state `log` slice via `KBindEvState`.] |
 | no-effect-handler | 11 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File>` — effect ops the native walk installs no handler for (Spawn 7, Clock 2, NetTcp 1, File 1: `stream_early_stop`). |
 | clause-param-origin | 7 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801) and the remaining `stream_*` (`stream_abort_leak`/`stream_mock_disk`/`stream_skip_policy`) whose carrier hits the alias-dispatch clause. |
-| Call-param-mismatch | 6 | `module verify failed: Call parameter type does not match function signature!` — the `map` modules (map_basic/map_pipes/map_round_out/map_tree_basic) + jwt_encoder + fx_basic: a generated call passes an operand whose LLVM type disagrees with the callee signature (a monomorph/boxing shape the native walk emits wrong). One root cause across all 6. |
-| missing-symbols | 3 | `Undefined symbols for architecture arm64` at link — `bits` / `crypto_hash` runtime entries the native object references but never defines. |
+| jwt char/hex decode | 1 | (reclassified from Call-param-mismatch) `jwt_encoder` now BUILDS + RUNS after burn-down 5 closed the namespace-collision root cause for the 5 map/fx modules; its decode diverges (char/hex, the regex/json family). |
+| crypto flaky SIGSEGV | 1 | (reclassified from missing-symbols) `crypto_hash_basic` LINKS after burn-down 5's `kaix_prelude_bit_*` shims closed bits_basic/bits_dotted; it SIGSEGVs intermittently (a flaky native memory bug). |
 
 > Several fixtures show more than one signature (e.g. `free_fall` shows
 > both a `^` type-mismatch and an exit-diff); each is listed once below
-> under its primary root cause. The per-family lists below total 82
-> (matching `tools/native-parity-baseline.txt`); the count column above
-> sums to 82.
+> under its primary root cause. The per-family lists below total 73 — the
+> set this lane diagnosed. The count column sums to 71 (the macOS dev box's
+> failing set); the two `list_*` Linux-only SIGSEGV gaps pass on macOS but
+> stay listed (→ 73). The 8 corpus-growth gaps main added during the rebase
+> (weather/vs demos, FFI, perceus leak audit) are in
+> `tools/native-parity-baseline.txt` (→ 81 total) but are NOT broken out by
+> family here — they are pre-existing divergences outside this lane's zone
+> (Spawn handler, extern-C symbols, pipe-lowering), for a later burn-down.
 
 ## Burn-down 2 root causes (CLOSED — do not re-open)
 
@@ -230,9 +251,9 @@ examples/stdlib/math_real_basic.kai
 examples/stdlib/regex_anchors_repetition.kai
 examples/stdlib/regex_basic.kai
 examples/stdlib/regex_subsume_unsupported.kai
-# unbound-register — nested-variant-test (payload-bearing) + writer-state (12)
-examples/effects/m7b_11_writer_basic.kai
-examples/effects/m7b_14_writer_helper.kai
+# unbound-register — nested-variant-test (payload-bearing) (10)
+# [burn-down 5 closed the writer-state slice: m7b_11_writer_basic +
+#  m7b_14_writer_helper via the KBindEvState stateful return-clause bind]
 examples/perceus/int_field_inline.kai
 examples/perceus/llvm_arm_top_reuse_shared.kai
 examples/perceus/llvm_rc_nested_match.kai
@@ -263,16 +284,15 @@ examples/effects/stream_abort_leak.kai
 examples/effects/stream_mock_disk.kai
 examples/effects/stream_skip_policy.kai
 examples/packages/cross_package_effects/consumer/main.kai
-# Call-param-mismatch — map / jwt / fx modules (6)
-examples/stdlib/fx_basic.kai
+# jwt char/hex decode (reclassified from Call-param-mismatch) (1)
+# [burn-down 5 closed the Call-param-mismatch root cause — namespace
+#  collision — for fx_basic + map_basic/map_pipes/map_round_out/
+#  map_tree_basic; jwt_encoder now builds+runs but its decode diverges
+#  (char/hex, the regex/json family)]
 examples/stdlib/jwt_encoder.kai
-examples/stdlib/map_basic.kai
-examples/stdlib/map_pipes/main.kai
-examples/stdlib/map_round_out.kai
-examples/stdlib/map_tree_basic.kai
-# missing-symbols — bits / crypto (3)
-examples/stdlib/bits_basic.kai
-examples/stdlib/bits_dotted.kai
+# crypto flaky SIGSEGV (reclassified from missing-symbols) (1)
+# [burn-down 5 added the kaix_prelude_bit_* shims, closing bits_basic +
+#  bits_dotted; crypto_hash_basic now links but SIGSEGVs intermittently]
 examples/stdlib/crypto_hash_basic.kai
 # cross-platform Linux-only SIGSEGV (pass on macOS) (2)
 examples/stdlib/list_helpers.kai

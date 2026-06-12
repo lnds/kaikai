@@ -193,13 +193,37 @@ pub type RSpec = RS(String, KSlot)
 pub fn collect_fn_specs(f: KFn) : [RSpec] =
   collect_block_specs(f.blocks, collect_param_specs(f.params, []))
 
-fn rspec_add(acc: [RSpec], name: String, slot: KSlot) : [RSpec] =
-  if rspec_has(acc, name) { acc } else { list_append(acc, [RS(name, slot)]) }
-
-fn rspec_has(acc: [RSpec], name: String) : Bool = match acc {
-  [] -> false
-  [RS(n, _), ...rest] -> if n == name { true } else { rspec_has(rest, name) }
+# Register `name` at `slot`, merging on a name already present. A name that
+# legitimately reappears with a DIFFERENT slot (a `KLet n: i32` then a
+# `KStore n` of a boxed value, or two lowering paths reusing a join name)
+# must NOT keep the first slot seen: that under-sizes the alloca (an `i32`
+# alloca taking an 8-byte `ptr` store truncates / mis-types the load). The
+# widening rule promotes the conflicting register to `SBoxed` — the
+# universal slot every value fits — so the alloca is `ptr`-wide and the
+# walk's boxed store/load agree. A same-slot reappearance is a no-op. (The
+# `.t`-prefixed temporaries `ls_fresh_reg` now emit can no longer ALIAS a
+# surface binder, which was the common trigger; this stays as the soundness
+# floor for any other path that reassigns a name across slots.)
+fn rspec_add(acc: [RSpec], name: String, slot: KSlot) : [RSpec] = match rspec_slot(acc, name) {
+  None      -> list_append(acc, [RS(name, slot)])
+  Some(cur) -> if kslot_eq(cur, slot) { acc } else { rspec_set_boxed(acc, name) }
 }
+
+fn rspec_slot(acc: [RSpec], name: String) : Option[KSlot] = match acc {
+  [] -> None
+  [RS(n, s), ...rest] -> if n == name { Some(s) } else { rspec_slot(rest, name) }
+}
+
+# Re-register `name` as `SBoxed` (the slot-widening on a conflict), keeping
+# list order so the alloca-emit order — and the dump — stay deterministic.
+fn rspec_set_boxed(acc: [RSpec], name: String) : [RSpec] = match acc {
+  [] -> []
+  [RS(n, s), ...rest] ->
+    if n == name { [RS(n, SBoxed), ...rest] }
+    else { [RS(n, s), ...rspec_set_boxed(rest, name)] }
+}
+
+fn kslot_eq(a: KSlot, b: KSlot) : Bool = nslot_tag(a) == nslot_tag(b)
 
 fn collect_param_specs(ps: [KParam], acc: [RSpec]) : [RSpec] = match ps {
   [] -> acc
@@ -216,6 +240,10 @@ fn collect_stmt_specs(ss: [KStmt], acc: [RSpec]) : [RSpec] = match ss {
   [s, ...rest] -> collect_stmt_specs(rest, match s {
     KLet(n, slot, _, _) -> rspec_add(acc, n, slot)
     KStore(n, _, _)     -> rspec_add(acc, n, SBoxed)
+    # A stateful return clause's `KBindEvState` stores the Ev state into the
+    # `state` / `log` registers — they need entry-block allocas like any
+    # other binder, but the node names them implicitly, so register both here.
+    KBindEvState(_, _)  -> rspec_add(rspec_add(acc, "state", SBoxed), "log", SBoxed)
     _                   -> acc
   })
 }
