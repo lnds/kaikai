@@ -2362,6 +2362,81 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     return v;
 }
 
+/* Issue #817 — recycle-this-cell tail shared by kai_free_value's
+ * non-cons cases and kai_free_cons_spine's per-cell reclaim. (stage0
+ * has no FAM variant block pool, so the recycle is the uniform
+ * cell-pool-or-free.) Reads `_kc->tag` before the poison stamp. */
+#define KAI_RECYCLE_CELL(cell) do {                                          \
+    KaiValue *_kc = (cell);                                                  \
+    KAI_RC_RECYCLE_TRACE(_kc);                                               \
+    KAI_RC_RECYCLE_POOL(_kc);                                                \
+    kai_rc_free_total++;                                                     \
+    kai_rc_live_now--;                                                       \
+} while (0)
+
+#ifdef KAI_TRACE_RC
+#define KAI_RC_RECYCLE_TRACE(_kc) do {                                       \
+    int32_t freed_tag = (_kc)->tag;                                          \
+    if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;   \
+    kai_rc_site_record_free((_kc)->alloc_site);                              \
+    kai_rc_history_log((_kc), /* op=free */ 3, freed_tag);                   \
+    KAI_RC_RECYCLE_LEAKSITE(_kc, freed_tag);                                 \
+    { uint64_t *p64 = (uint64_t *) (_kc);                                    \
+      size_t nq = sizeof(KaiValue) / sizeof(uint64_t);                       \
+      for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64; }        \
+} while (0)
+#ifdef KAI_TRACE_RC_LEAKSITE
+#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) kai_leaksite_record_free((_kc)->scope_fn, (ft))
+#else
+#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) ((void) 0)
+#endif
+#else
+#define KAI_RC_RECYCLE_TRACE(_kc) ((void) 0)
+#endif
+
+#ifdef KAI_CELL_POOL_ACTIVE
+#define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
+    if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {                              \
+        kai_cell_pool[kai_cell_pool_n++] = (_kc);                            \
+    } else {                                                                 \
+        free(_kc);                                                           \
+    }                                                                        \
+} while (0)
+#else
+#define KAI_RC_RECYCLE_POOL(_kc) free(_kc)
+#endif
+
+/* Issue #817 — iterative unique-cons-spine free; O(1) stack for a long
+ * list (the recursive `kai_decref(tail)` overflowed a 64 KiB fiber stack
+ * once filter/map stopped leaking the spine). Precondition: `v` is a
+ * KAI_CONS cell whose rc just hit 0. Heads and shared/non-cons tails go
+ * through `kai_decref` (counters + cascade intact); the unique spine is
+ * consumed by the loop, each cell reclaimed via KAI_RECYCLE_CELL. */
+static void kai_free_cons_spine(KaiValue *v) {
+    for (;;) {
+        KaiValue *head = v->as.cons.head;
+        KaiValue *tail = v->as.cons.tail;   /* capture BEFORE recycle poisons v */
+        kai_decref(head);
+        KAI_RECYCLE_CELL(v);
+        /* stage0 does not tag immediates, so no kai_is_value guard; a
+         * null / saturated-singleton / non-cons / shared tail hands off
+         * to kai_decref. */
+        if (!tail ||
+            tail->rc == INT32_MAX ||
+            tail->tag != (int32_t) KAI_CONS ||
+            tail->rc != 1) {
+            kai_decref(tail);
+            return;
+        }
+        kai_rc_decref_total++;
+#ifdef KAI_TRACE_RC
+        kai_rc_history_log(tail, /* op=decref */ 2, tail->tag);
+#endif
+        tail->rc = 0;
+        v = tail;
+    }
+}
+
 static void kai_free_value(KaiValue *v) {
     KAI_PROF_ENTER();
     switch ((KaiTag) v->tag) {
@@ -2369,9 +2444,12 @@ static void kai_free_value(KaiValue *v) {
             free(v->as.s.bytes);
             break;
         case KAI_CONS:
-            kai_decref(v->as.cons.head);
-            kai_decref(v->as.cons.tail);
-            break;
+            /* Issue #817 — iterative spine free (reclaims v + the unique
+             * tail spine, then returns; must NOT fall to the post-switch
+             * tail, which would double-free v). */
+            kai_free_cons_spine(v);
+            KAI_PROF_EXIT(free);
+            return;
         case KAI_RECORD:
             for (int i = 0; i < v->as.rec.n_fields; ++i) kai_decref(v->as.rec.fields[i]);
             free(v->as.rec.fields);
@@ -2488,44 +2566,9 @@ static void kai_free_value(KaiValue *v) {
             break;
         default: break;
     }
-#ifdef KAI_TRACE_RC
-    {
-        int32_t freed_tag = v->tag;
-        if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;
-        /* issue #296 — credit the matching alloc site. */
-        kai_rc_site_record_free(v->alloc_site);
-        kai_rc_history_log(v, /* op=free */ 3, freed_tag);
-#ifdef KAI_TRACE_RC_LEAKSITE
-        /* Lane DIAG (#293) — credit the matching scope_fn. Read
-         * before the poison stamp below so we don't read back
-         * 0xDEADBEEF as the scope pointer. */
-        kai_leaksite_record_free(v->scope_fn, freed_tag);
-#endif
-        /* Stamp poison over the whole struct so a stale read after
-         * free surfaces the recognizable 0xDEADBEEF... pattern on
-         * macOS instead of stale-but-plausible content. We touch
-         * sizeof(KaiValue) bytes; safe because we still own the
-         * chunk until the free(v) below. */
-        uint64_t *p64 = (uint64_t *) v;
-        size_t   nq   = sizeof(KaiValue) / sizeof(uint64_t);
-        for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64;
-    }
-#endif
-#ifdef KAI_CELL_POOL_ACTIVE
-    /* Recycle the fixed-size cell instead of returning it to libc, so
-     * the next same-size allocation skips malloc. Bounded; overflow
-     * falls through to a real free. */
-    if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {
-        kai_cell_pool[kai_cell_pool_n++] = v;
-    } else {
-        free(v);
-    }
-#else
-    free(v);
-#endif
-    /* trace */
-    kai_rc_free_total++;
-    kai_rc_live_now--;
+    /* Issue #817 — recycle this cell (trace+poison+pool+counters); the
+     * same path kai_free_cons_spine uses per spine cell. */
+    KAI_RECYCLE_CELL(v);
     KAI_PROF_EXIT(free);
 }
 
