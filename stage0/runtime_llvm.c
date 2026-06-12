@@ -691,6 +691,31 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
 KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
 KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
 
+/* ---------- m13: bit operations (compiler intrinsics) ----------
+   The C-direct oracle (emit_c.kai) lowers each `bit_*` call INLINE to
+   the matching C operator. The native backend routes a prelude callee
+   to `kaix_prelude_<nm>`, so it needs a linkable shim per bit op — there
+   is no `kai_prelude_bit_*` static body to forward to (the oracle never
+   created one). These reproduce the oracle's operator + refcount shape
+   exactly: read both KaiInts (`kai_intf`), apply the operator, box the
+   result, then decref each input once (the caller hands us values we own,
+   mirroring `kai_op_add` in runtime.h). Slot/repr identical to the oracle
+   keeps native byte-identical with the C path. */
+KaiValue *kaix_prelude_bit_and(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_or(KaiValue *a, KaiValue *b)   { KaiValue *r = kai_int(kai_intf(a) | kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_xor(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_not(KaiValue *a)               { KaiValue *r = kai_int(~ kai_intf(a)); kai_decref(a); return r; }
+KaiValue *kaix_prelude_bit_shl(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) << kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+/* Arithmetic shift: signed `>>` preserves the sign bit. */
+KaiValue *kaix_prelude_bit_shr(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+/* Logical shift: cast through uint64_t to zero-fill, back to int64_t. */
+KaiValue *kaix_prelude_bit_ushr(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_count(KaiValue *a)             { KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a))); kai_decref(a); return r; }
+KaiValue *kaix_prelude_bit_test(KaiValue *a, KaiValue *b) { KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_set(KaiValue *a, KaiValue *b)    { KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_clear(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_prelude_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+
 /* Full prelude set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */
 KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
