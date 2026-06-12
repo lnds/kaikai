@@ -62,26 +62,34 @@ fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerS
 # shared-tag decision tree (kir_lower_variant) already tested, so it is a
 # safe no-op here, not the nested-variant-test gap. `PWild`/`PLit`/`PHole`
 # bind nothing (a `PLit` was a test on the switch / sub-chain path).
+# A nested VARIANT sub-pattern is now SOUND to bind: the decision tree's
+# `var_seal_variant` (kir_lower_variant) tested its tag (and recursed into
+# its own discriminating sub-slots) before this bind runs, so projecting the
+# slot and binding the payload's inner names is dominated by a passed tag
+# test — no false-green. A NULLARY ctor (`Red`, `None`) carries no inner
+# name, so it stays a no-op. The payload-bearing case projects the slot and
+# recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
+# direct sub-binders), the SAME shared bind recursion the record path uses.
 fn bind_slot_pattern(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
   PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KProj(scrv, idx), KAt(sp.line, sp.col)))
   PRecord(_)           -> bind_nested_slot(sp, scrv, idx, st)
   PAs(name, _)         -> bind_nested_as(sp, name, scrv, idx, st)
-  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_unsupported_nested(sp, st) }
-  PVariantRecord(_, _) -> bind_unsupported_nested(sp, st)
+  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(sp, scrv, idx, st) }
+  PVariantRecord(_, _) -> bind_nested_slot(sp, scrv, idx, st)
   _                    -> st
 }
 
 # A nested ctor with no payload (`Red`, `None`) binds no inner name — the
 # shared-tag decision tree tested its tag, so binding is a no-op. A ctor
-# WITH payload still needs a recursive tag-test + sub-bind (the
-# nested-variant-test gap), so it stays at `bind_unsupported_nested`.
+# WITH payload is bound by `bind_nested_slot` (its sub-binders need
+# projecting), gated by the tag test the decision tree emitted.
 fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
   [] -> true
   _  -> false
 }
 
-# Project slot `idx` into a fresh register, then bind the nested plain
-# record sub-pattern against it.
+# Project slot `idx` into a fresh register, then bind the nested sub-pattern
+# (plain record OR a tag-tested variant payload) against it.
 fn bind_nested_slot(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
     bind_pattern_fields_any(sp, sub, st1) }
@@ -117,17 +125,24 @@ fn bind_record_subfields(fields: [PField], v: KVal, st: LowerSt) : LowerSt / Con
     bind_record_subfields(rest, v, bind_field_pattern(fname, sub, v, st))
 }
 
+# A field whose sub-pattern is a nested VARIANT / VARIANT-RECORD
+# (`snd: JReal(r)`) is now SOUND to bind: the decision tree (`lm_field_tests`
+# / `rec_emit_tests`) tested the field's tag before this bind runs, so
+# reading the field and binding the payload's inner names is dominated by a
+# passed tag test. The variant/record/as cases all read the field into a
+# fresh register and recurse through `bind_pattern_fields_any`.
 fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match sub.pkind {
   PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
   PRecord(_)           -> bind_field_nested(fname, sub, v, st)
   PAs(name, _)         -> bind_field_as(fname, name, sub, v, st)
-  PVariant(_, _)       -> bind_unsupported_nested(sub, st)
-  PVariantRecord(_, _) -> bind_unsupported_nested(sub, st)
+  PVariant(_, _)       -> bind_field_nested(fname, sub, v, st)
+  PVariantRecord(_, _) -> bind_field_nested(fname, sub, v, st)
   _                    -> st
 }
 
-# A nested plain-record field: read the field into a fresh register, then
-# bind the sub-pattern against it.
+# A nested-record / tag-tested-variant field: read the field into a fresh
+# register (owned `kai_op_field`), then bind the sub-pattern against it
+# through the shared `bind_pattern_fields_any` recursion.
 fn bind_field_nested(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) ->
     bind_pattern_fields_any(sub, fv, st1) }
