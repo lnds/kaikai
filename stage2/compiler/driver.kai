@@ -28,6 +28,7 @@ import compiler.fmt
 import compiler.fmt_writer
 import compiler.cache
 import compiler.modules
+import compiler.user_cache
 import compiler.desugar
 import compiler.region
 import compiler.infer
@@ -929,7 +930,46 @@ fn non_import_decls(ds: [Decl]) : [Decl] {
   }
 }
 
-fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], rs: ResolveState) : ResolveState / Console + File {
+# Issue #455 Phase B: the post-doc-strip decls for a module plus the
+# count of doc errors the strip surfaced (always 0 on a cache hit, since
+# the cached stream is already doc-stripped). Carries exactly what
+# resolve_module needs downstream so the cache hit and miss paths
+# converge on one continuation.
+type UcResolvedDecls = UCDcls([Decl], Int)
+
+# Resolve a module's decls either from the user cache (hit) or by
+# parsing + doc-stripping the source (miss). On a miss with the cache
+# enabled, the freshly stripped decls are written back keyed by the
+# composite key the lookup computed. Returns None when the source fails
+# to parse (the caller treats it as a load with no decls, matching the
+# pre-cache behaviour). The KAB2 codec round-trips decls structurally,
+# so a hit yields the same [Decl] the miss path would (the cold-vs-warm
+# differential fixture is the gate on that equivalence).
+fn uc_resolve_decls(cache_res: UcLookup, abs_path: String, src: String,
+                    tokens: [Token], cache_on: Bool)
+                    : Option[UcResolvedDecls] / Console + File =
+  match cache_res {
+    UcHit(decls) -> Some(UCDcls(decls, 0))
+    UcMiss(content_hex, dep_hex) -> {
+      let parsed = parse_program(abs_path, src, tokens)
+      match parsed.decls {
+        None -> None
+        Some(decls_raw) -> {
+          # Issue #681: imported modules join the global decl stream
+          # doc-free - strip wrappers + module doc at load time, bumping
+          # the resolver error counter on a duplicate module doc.
+          let im_docs = doc_strip_all(abs_path, src, decls_raw)
+          let decls = im_docs.decls
+          let _w = if cache_on and content_hex != "" {
+            uc_write(abs_path, content_hex, dep_hex, decls)
+          } else { () }
+          Some(UCDcls(decls, im_docs.errs))
+        }
+      }
+    }
+  }
+
+fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
@@ -979,18 +1019,21 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
             let lex_errs = report_errors(abs_path, src, tokens)
             if lex_errs != 0 { rs_in }
             else {
-              let parsed = parse_program(abs_path, src, tokens)
-              match parsed.decls {
+              # Issue #455 Phase B: when the user cache is on, look the
+              # module up by its composite (content + transitive-dep)
+              # key. A hit hands back the post-doc-strip decls the
+              # parse+doc_strip path below would produce, so the parse
+              # is skipped; process_imports still runs over the cached
+              # decls (their DImport nodes are preserved) so transitive
+              # loads happen exactly as on a miss.
+              let cache_res = if cache_on {
+                uc_lookup(abs_path, src, tokens, search_paths)
+              } else { UcMiss("", "") }
+              match uc_resolve_decls(cache_res, abs_path, src, tokens, cache_on) {
                 None -> rs_in
-                Some(decls_raw) -> {
-                  # Issue #681: imported modules join the global decl
-                  # stream doc-free — strip wrappers + module doc at
-                  # load time, bumping the resolver error counter on a
-                  # duplicate module doc.
-                  let im_docs = doc_strip_all(abs_path, src, decls_raw)
-                  let rs_doc = if im_docs.errs > 0 { rs_bump_errs_by(rs_in, im_docs.errs) } else { rs_in }
-                  let decls = im_docs.decls
-                  let rs2 = process_imports(base_dir, decls, search_paths, rs_doc)
+                Some(ucd) -> match ucd { UCDcls(decls, doc_errs) -> {
+                  let rs_doc = if doc_errs > 0 { rs_bump_errs_by(rs_in, doc_errs) } else { rs_in }
+                  let rs2 = process_imports(base_dir, decls, search_paths, cache_on, rs_doc)
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
                   # imported module's decls join the global stream.
@@ -1019,7 +1062,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                     let unstable_exports = collect_unstable_exports(kept, [])
                     rs_add_module(rs3, ME(import_name, exports, abs_path, unstable_exports))
                   }
-                }
+                } }
               }
             }
           }
@@ -1030,7 +1073,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
   }
 }
 
-fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: ResolveState) : ResolveState / Console + File {
+fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
 
 
   match decls {
@@ -1039,13 +1082,13 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
       let rs1 = match d {
         DImport(ik, _, _) -> match ik {
           # m6.2: surface name = last segment of dotted path.
-          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), search_paths, rs)
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), search_paths, cache_on, rs)
           # m6.2: surface name = alias.
-          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, search_paths, rs)
+          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, search_paths, cache_on, rs)
           # m6.2: surface name = last segment (selective imports keep
           # the prefix surface binding, same as IkPath; the named-list
           # affects unqualified scope, not the qualified surface).
-          IkSelective(p, _) -> resolve_module(base_dir, p, last_segment(p), search_paths, rs)
+          IkSelective(p, _) -> resolve_module(base_dir, p, last_segment(p), search_paths, cache_on, rs)
           # m7f §7: import holes are not module loads — they are
           # diagnostic-only. The symbol-index pass runs separately
           # after process_imports completes.
@@ -1053,7 +1096,7 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: 
         }
         _ -> rs
       }
-      process_imports(base_dir, rest, search_paths, rs1)
+      process_imports(base_dir, rest, search_paths, cache_on, rs1)
     }
   }
 }
@@ -1086,7 +1129,7 @@ type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Int)
 # concatenating the same module a second time and producing a
 # duplicate-symbol C output (`import encoding.toml` against the
 # prelude-loaded `stdlib/encoding/toml.kai` was the trigger).
-fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl], prelude_paths: [String]) : ExpandedProgram / Console + File {
+fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl], prelude_paths: [String], cache_on: Bool) : ExpandedProgram / Console + File {
 
 
   let base_dir = dir_of(root_path)
@@ -1101,7 +1144,7 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
   let canon_root = abspath(root_path)
   let canon_preludes = canon_paths(prelude_paths)
   let rs0 = ResolveState { visited: [canon_root, ...canon_preludes], in_progress: [canon_root], decls: [], modules: [], errs: 0 }
-  let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
+  let rs1 = process_imports(base_dir, root_decls, search_paths, cache_on, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
   let all_decls = list_append(imports, non_import_decls(root_decls))
@@ -1254,19 +1297,36 @@ pub type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     # the flag (legacy call site). The typer gates
                     # feature branches on this (e.g. #594 convention
                     # pipe dispatch is active only for >= hanga-roa).
-                    edition: String }
+                    edition: String,
+                    # Issue #455 Phase B: opt-in user-file incremental
+                    # cache. `bin/kai` passes `--user-cache` (and creates
+                    # `<project>/.kai-cache/`) only under `KAI_CACHE=1`,
+                    # so the default build path is byte-for-byte
+                    # unchanged and pays no lookup cost. When true,
+                    # resolve_module + compile_source consult
+                    # compiler.user_cache before lexing each file.
+                    user_cache: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+
+# Issue #455 Phase B: enable the user-file incremental cache for this
+# invocation. Set by `--user-cache`, which `bin/kai` passes only under
+# `KAI_CACHE=1` after creating `<project>/.kai-cache/`.
+fn cli_with_user_cache(opts: CliOptions) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: true }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -1274,7 +1334,7 @@ fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
                prelude_caches: list_append(opts.prelude_caches, [""]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path,
@@ -1282,26 +1342,26 @@ fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOpt
                prelude_caches: list_append(opts.prelude_caches, [cache]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 # Issue #602: set the consumer-package name parsed from kai.toml. The
 # value flows through to the qualified-call rewriter so self-imports
@@ -1310,7 +1370,7 @@ fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
   CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition }
+               package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 # Issue #603: set the consumer-declared edition (parsed from
 # `--edition <name>` which `bin/kai` derives from kai.toml's
@@ -1323,7 +1383,7 @@ fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins,
-               edition: n }
+               edition: n, user_cache: opts.user_cache }
 
 # Issue #603: the canonical lowercase set of edition names the
 # compiler accepts. Adding a new edition (Orongo) flips this list
@@ -1346,7 +1406,7 @@ fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name,
                unstable_optins: list_append(opts.unstable_optins, [pkg]),
-               edition: opts.edition }
+               edition: opts.edition, user_cache: opts.user_cache }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
@@ -1396,6 +1456,9 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MBuiltinsDocJson))
       } else if a == "--strict-holes" {
         parse_cli_loop(more, cli_with_strict_holes(opts))
+      } else if a == "--user-cache" {
+        # Issue #455 Phase B: opt-in user-file incremental cache.
+        parse_cli_loop(more, cli_with_user_cache(opts))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--emit=kir" {
@@ -1510,7 +1573,7 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
                                     prelude_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
-                                    edition: "" })
+                                    edition: "", user_cache: false })
 }
 
 fn usage() : Unit / Console {
@@ -4671,7 +4734,7 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -4733,7 +4796,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # (or any other prelude-loaded module) does not load the
             # same file twice.
             let prelude_paths = collect_module_origins(prelude_mods, [])
-            let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths)
+            let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths, user_cache)
             let expanded_decls_raw = match expanded { EP_Mod(ds, _, _, _) -> ds }
             let n_imports_raw = match expanded { EP_Mod(_, _, n, _) -> n }
             # Issue #538 shape 3: count of import-resolution failures
@@ -5503,7 +5566,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition)
+              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }

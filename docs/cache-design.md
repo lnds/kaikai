@@ -186,7 +186,7 @@ semantic refactor will likely change the delta's shape.
 | Layer | What it caches | Where it lives | When it invalidates |
 |---|---|---|---|
 | **Phase A** | Stdlib preludes (immutable from user POV) | `~/.cache/kaikai/preludes-v<N>/<sha>.kab` | stdlib file changes OR kaikai version bump OR cache format bump |
-| **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<sha>.kab` | source changes OR any transitive import changes OR kaikai version bump OR cache format bump |
+| **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<content_hash>-<dep_hash>.kab` | source changes OR any transitive import changes OR kaikai version bump OR cache format bump |
 
 Both use the same on-disk format (KAB1, defined below). What
 varies across the three sub-phases is the *payload schema*:
@@ -492,6 +492,52 @@ are gates for every sub-phase.
   hand-rolled impls (parametric Result is currently not derived;
   the dispatcher's whitelist is `binser_collection_head = List or
   Option`).
+
+### Phase B — user-file post-parse cache — **SHIPPED 2026-06-11 (#455)**
+
+The user-file analogue of A.0: a per-project, content-addressable cache
+of post-parse `[Decl]` for user modules, with correct transitive
+invalidation. New module `stage2/compiler/user_cache.kai`; the driver's
+import resolver consults it before lexing each imported module; opt-in
+via `KAI_CACHE=1` (the `bin/kai` wrapper creates `<project>/.kai-cache/`
+and passes `--user-cache`).
+
+- **Composite key materialised as the blob filename**
+  (`<content_hex>-<dep_hex>.kab`). Invalidation is a property of the
+  key, not a sweep: an edit anywhere in a module's transitive closure
+  changes its dep hash, so its filename changes and the old blob is
+  never read. Hashing uses the `string_hash` runtime prim (FNV-1a 64),
+  not sha256 — content-change detection, not cryptography.
+- **Dep discovery by token scan, not parse**, so computing the key does
+  not defeat the cache.
+- **Atomicity + mkdir live in `bin/kai`** — the stage1 bootstrap
+  compiler that builds the kaic2 bundle lacks `file_rename` /
+  `dir_create_dir` (and `bit_*`); a content-addressed name makes a torn
+  write self-correcting (next build recomputes the key, rejects the
+  header-invalid blob, overwrites).
+- Invalidation gated by **six fixtures** (`examples/cache/userb_*.sh`,
+  `make test-user-cache`): edit source / edit import / edit transitive
+  import / version bump / corrupt blob, plus a **positive differential**
+  (cold-cache == warm-cache == no-cache oracle, byte-identical C). The
+  differential is the correctness gate selfhost byte-id cannot give —
+  the compiler is built with the cache off, so selfhost never exercises
+  a hit.
+
+> **Honesty note (2026-06-11):** Phase B does **not** meet the issue's
+> ≤ 150 ms cold-trivial target, and A.0-on-user-files cannot. On a
+> trivial user file ~100 % of the wall is the prelude
+> (lex+parse+**typecheck**), which is loaded with `caches=[]` and
+> re-processed every build; A.0 skips only the user-file *parse*, which
+> is ~0 ms. Measured: 8 trivial modules 0.21 s warm vs 0.21 s no-cache;
+> one 2000-LOC module 1.28 s warm vs 1.22 s no-cache (deserialize ≈
+> parse for kaikai modules, the same wash that killed the token-cache
+> variant above). **The Phase B deliverable is correct transitive-
+> invalidation infrastructure** — the durable piece #447 (LSP) builds
+> on and A.1 reuses — **not** a wall-time win. The ≤ 150 ms target lives
+> in A.1 (cache the prelude *post-typecheck*); see below. Phase A's
+> prelude cache is also currently dead on the `kai build` path (loaded
+> with `caches=[]`); wiring it in or retiring `--emit-prelude-cache` is
+> a separate follow-up, deliberately not coupled to #455.
 
 ### Phase A.1 — post-typecheck cache
 

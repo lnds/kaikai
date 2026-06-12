@@ -32,4 +32,40 @@ Run individually:
 
 Or in a batch:
 
-    for f in examples/cache/*.sh; do sh "$f" || exit 1; done
+    for f in examples/cache/magic_mismatch.sh \
+             examples/cache/format_version_mismatch.sh \
+             examples/cache/kaikai_version_hash_mismatch.sh \
+             examples/cache/source_content_change.sh; do sh "$f" || exit 1; done
+
+# Phase B user-file incremental cache fixtures (#455)
+
+Six `userb_*.sh` fixtures pin the invalidation contract of the per-
+project user cache (`<project>/.kai-cache/<content>-<dep>.kab`, written
+by `stage2/compiler/user_cache.kai`). Unlike the Phase A fixtures, the
+Phase B cache is wired end-to-end: each fixture builds a throwaway
+multi-module project under `/tmp` with `KAI_CACHE=1` (the opt-in the
+`bin/kai` wrapper reads to create the cache dir and pass
+`--user-cache`).
+
+Five are negative — they edit something and assert the build does NOT
+serve stale decls:
+
+- `userb_edit_source.sh` — edit the file's own bytes (content hash).
+- `userb_edit_import.sh` — edit a direct import (consumer dep hash).
+- `userb_edit_transitive.sh` — edit a two-hop import (cascade).
+- `userb_version_bump.sh` — flip the blob's kaikai-version byte.
+- `userb_corrupt_blob.sh` — truncate the blob past the header.
+
+One is positive and is the load-bearing correctness gate:
+
+- `userb_cold_warm_identical.sh` — the emitted C must be byte-identical
+  across cold-cache, warm-cache (hit path), and no-cache (oracle)
+  builds. selfhost byte-identity does not cover the cache (the compiler
+  is built with it off), so this differential is what proves a cache
+  hit reconstructs exactly the decls a fresh parse would.
+
+These run in CI via `make test` (the `test-user-cache` target, also in
+`test-fast`). Run them alone with:
+
+    make -C stage2 test-user-cache
+    # or: for f in examples/cache/userb_*.sh; do sh "$f" || exit 1; done
