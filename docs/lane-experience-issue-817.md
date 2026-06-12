@@ -212,6 +212,28 @@ iterative free was an unplanned but mandatory follow-on.
   false move impossible; worst case is a missed move) rather than
   restructured per-arm — proportional to the bounded risk.
 
+## CI surprises (post-open)
+
+- **tier1 (required) caught the lambda-param wrap via `test-kir closures`.**
+  Local selfhost was byte-id-deterministic, but the KIR golden changed
+  (`ret t0` → the `__pcs_ret` wrap). That, plus tier1-native's parity
+  ratchet flagging native gaps, confirmed the wrap was native-coupled —
+  reverted (see fix #2 above). After the revert tier1 + tier0 + tier1-asan
+  are green.
+- **tier1-native / tier1-backend-parity are INFORMATIONAL, not the merge
+  gate** (the only required check is `tier1`). tier1-native is already red
+  on `main` (since #818/#819); its 8 gaps reproduce identically on `main`'s
+  last run (`183c21d2`) and none touch the filter/arm-binder path.
+- **A `c=139` parity flake on the Map fixtures.** `map_basic`/`map_pipes`/
+  `map_round_out` showed `c=139` (SIGSEGV) vs `llvm=0` — but `map_basic`
+  runs `exit=0` on macOS (clang/gcc/ASAN/UBSan), Linux gcc/clang `-O2`
+  (×10), AND the faithful Linux repro (kaic2 rebuilt via Makefile +
+  `bin/kai build`, ×5). The AVL-tree `l`/`r` move is pre-existing (emitted
+  with this PR's `#4` disabled). It is the documented `-j` parity-harness
+  race, not a regression. The leak fixture is exempted from native parity
+  (`backend-parity-skips.txt`) since the native backend has a pre-existing
+  filter-over-heap gap (`type mismatch in +`, same class as weather/main).
+
 ## Follow-ups left for next lanes
 
 1. The orthogonal `demos/wc.kai` stream leaks (still listed open in #817's
