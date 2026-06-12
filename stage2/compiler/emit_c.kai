@@ -4365,7 +4365,6 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
             # this arm may consume the binding (e.g. const-pattern desugar's
             # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
             let binds = emit_pat_binds(src, pat, "_scr", true, cx)
-            let body_c = emit_expr(src, body, arm_cx)
             # Issue #309 — when every tail leaf of `body` is a tcrec
             # sentinel call, the goto leaves the enclosing
             # statement-expression and the post-do-while
@@ -4374,6 +4373,7 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
             # before the goto fires. Safe because the predicate
             # guarantees control NEVER reaches the post-do-while
             # decref via this arm — no double-decref is possible.
+            let body_c = emit_expr(src, body, arm_cx)
             if tcrec_tail_always_sentinel(body) {
               concat_all([
                 "    if (", pt, ") { ", binds,
@@ -4751,7 +4751,7 @@ fn emit_match_raw_arms(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx
       let sc = emit_expr(src, inner, cx)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
-        emit_match_arms_raw(src, arms, cx),
+        emit_match_arms_raw(src, arms, false, cx),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
@@ -4760,7 +4760,7 @@ fn emit_match_raw_arms(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx
       let sc = emit_expr(src, scrut, cx)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
-        emit_match_arms_raw(src, arms, cx),
+        emit_match_arms_raw(src, arms, true, cx),
         match_tail_panic(arms),
         "} while (0); kai_decref(_scr); _r; })"
       ])
@@ -4781,9 +4781,16 @@ fn raw_zero(ty: Option[Ty]) : String = match ty {
   None -> "0"
 }
 
-fn emit_match_arms_raw(src: String, arms: [Arm], cx: EmitCtx) : String / Console = match arms {
+# `scr_owned` records whether the enclosing `emit_match_raw_arms` owns
+# `_scr` (its `None`/non-borrow branch emits the post-`do/while`
+# `kai_decref(_scr)`). Threaded so a self-tail-recursive arm whose `goto`
+# leaves the statement-expression can pre-inject that drop before the
+# goto fires — the raw mirror of the boxed #309 fix. The borrowed branch
+# passes `false`: there is no post-loop decref to mirror, and injecting
+# one would free a value the match does not own (UAF).
+fn emit_match_arms_raw(src: String, arms: [Arm], scr_owned: Bool, cx: EmitCtx) : String / Console = match arms {
   [] -> ""
-  [a, ...rest] -> cat2(emit_match_arm_raw(src, a, cx), emit_match_arms_raw(src, rest, cx))
+  [a, ...rest] -> cat2(emit_match_arm_raw(src, a, scr_owned, cx), emit_match_arms_raw(src, rest, scr_owned, cx))
 }
 
 # One raw arm: `if (test) { binds; _r = <raw body>; break; }`, plus the
@@ -4791,7 +4798,7 @@ fn emit_match_arms_raw(src: String, arms: [Arm], cx: EmitCtx) : String / Console
 # emits the body via `emit_expr_raw` into a raw `_r`. Pattern binders
 # (incl. kind-1 raw Int slots) are bound exactly as the boxed path does,
 # so an arm reading a payload sees the same `kair_<n>` / `kai_<n>` locals.
-fn emit_match_arm_raw(src: String, a: Arm, cx: EmitCtx) : String / Console = match a {
+fn emit_match_arm_raw(src: String, a: Arm, scr_owned: Bool, cx: EmitCtx) : String / Console = match a {
   Arm(pat, opt_guard, body) -> {
     let pt = emit_pat_test(src, pat, "_scr", cx)
     let arm_lcs = list_append(cx.lcs, pat_binders(pat, []))
@@ -4814,7 +4821,21 @@ fn emit_match_arm_raw(src: String, a: Arm, cx: EmitCtx) : String / Console = mat
     } else {
       let body_c = emit_expr_raw(src, body, arm_cx)
       match opt_guard {
-        None    -> concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+        # Issue #309 (raw mirror) — when the scrutinee is owned and every
+        # tail leaf of `body` is a tcrec sentinel call, the `goto` leaves
+        # the enclosing statement-expression and the post-`do/while`
+        # `kai_decref(_scr)` is unreachable: the consumed cons cell leaks
+        # one per loop iteration. Pre-inject the drop inside the body's
+        # statement-expression so it runs before the goto fires. The
+        # boxed `emit_match_arm` does the same; gated to `scr_owned`
+        # because the borrowed branch emits no post-loop decref to mirror
+        # (injecting one would free a borrow → UAF).
+        None    ->
+          if scr_owned and tcrec_tail_always_sentinel(body) {
+            concat_all(["    if (", pt, ") { ", binds, "_r = ({ kai_decref(_scr); ", body_c, "; }); break; }\n"])
+          } else {
+            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+          }
         Some(g) -> {
           let gc = emit_expr_raw(src, g, arm_cx)
           concat_all(["    if (", pt, ") { ", binds, "if (", gc, ") { _r = ", body_c, "; break; } }\n"])
