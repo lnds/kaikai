@@ -10,10 +10,12 @@ four-cause cluster that "cannot ship frontend-alone" because the
 lambda-param exit-drop reshape breaks the native/KIR backend (the
 "coupled reshape lands with its consumer" rule).
 
-**Shipped:** the leak is closed, and — contrary to the issue's framing —
-the dominant causes turned out to be **emit_c + perceus pure**, separable
-from the native-coupled lambda-body wrap. Three coordinated fixes plus a
-runtime fix the leak fix exposed:
+**Shipped:** the DOMINANT causes are closed, native-safe — the issue's
+"inseparable cluster" framing was wrong about the bulk: the arm-binder and
+scrutinee leaks are emit_c/perceus-pure and ship alone. The issue WAS
+right about one residual piece (the lambda-param wrap) being
+native-coupled — that one is deferred. Two coordinated frontend fixes plus
+a runtime fix the leak fix exposed:
 
 1. **#3 — raw self-tail-recursive `match` scrutinee drop** (emit_c).
    `emit_match_arm_raw` lacked the #309 `tcrec_tail_always_sentinel →
@@ -21,15 +23,21 @@ runtime fix the leak fix exposed:
    GATED to the owned branch (`scr_owned`) so the borrowed branch never
    double-frees. Closes the `split + length`-shaped leak (`free_total=1`
    → fully bounded). Dominates the str-leak.
-2. **lambda-param exit-drop** (perceus, `ELambda` branch). The lambda's
-   own params got the same entry/exit-drop discipline a top-level `fn`
-   gets in `perceus_decl_b`. The enclosing `uses` only tracked captures,
-   so params were dup'd-and-never-dropped: `(w) => not is_empty(w)` leaked
-   one `w` per call. NOT the AST-reshape the issue feared — done via the
-   existing `pcs_prepend_unused_drops`, which produces the `__pcs_ret`
-   wrap the native backend already lowers for `fn` bodies. (Verified the
-   leak is identical with a named `fn` predicate, so this is a residual,
-   not the dominant slice.)
+2. **lambda-param exit-drop — ATTEMPTED, then DEFERRED to the native
+   lane.** The lambda's own params leak (dup'd-and-never-dropped:
+   `(w) => not is_empty(w)` leaks one `w` per call). The fix gives them
+   the `pcs_prepend_unused_drops` discipline a top-level `fn` gets — but
+   that produces the `EBlock([SLet(__pcs_ret, body), drop], __pcs_ret)`
+   wrap, and tier1-native CONFIRMED the issue's warning: the native/KIR
+   backend lowers that wrap for `fn` bodies but NOT for CLOSURE bodies. It
+   added native-parity gaps (huffman/weather/go/python/scala/ffi) and the
+   `test-kir closures` golden changed (`ret t0` → the `__pcs_ret` wrap).
+   This is the exact "coupled reshape lands with its consumer" piece. The
+   attempt was reverted; the lambda-param residual goes to the native/KIR
+   lane WITH the closure-body drop lowering. The leak is identical with a
+   NAMED `fn` predicate (no lambda), so this is a residual, not the
+   dominant slice — the #3 + #4 fixes (the dominant slices) ship here and
+   are native-safe (tier1-native passes). The fixture uses a named `fn`.
 3. **#4 — the arm-binder MOVE-at-last-use** (perceus). The root cause was
    NOT a missing drop but a SPURIOUS dup: `pcs_max_paths_b_expr` for `EIf`
    is `cond + max(then, else)`, so `filter_loop`'s `h` (read in `p(h)` +
