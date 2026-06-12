@@ -840,6 +840,214 @@ fn pcs_consuming_elems(nm: String, els: [ListElem], cmap: [ConsumeEntry]) : Bool
   }
 }
 
+# Issue #817 — like `pcs_uses_only_consuming_slots`, but the slot-consume
+# constraint is applied ONLY to the read of `nm` at `(lu_line, lu_col)` —
+# its last use. Every other read of `nm` (e.g. an earlier `p(h)` whose
+# closure could retain `h`) is ignored (returns `true`), because those
+# reads keep their conservative dup; only the last read transfers
+# ownership raw. The walker structure mirrors `pcs_consuming_slots_kind`,
+# diverging at the `EVar` arg slot (the move point) where it gates on the
+# position match. Returns `true` iff the last read consumes (so moving it
+# is sound).
+fn pcs_last_use_consuming(nm: String, lu_line: Int, lu_col: Int, e: Expr, cmap: [ConsumeEntry]) : Bool =
+  pcs_lu_consuming_kind(nm, lu_line, lu_col, e.kind, cmap)
+
+fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [ConsumeEntry]) : Bool = match k {
+  ECall(f, xs) ->
+    if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
+      # The last use sits in / under a higher-order combinator's lambda
+      # arg — not a modelled consuming slot; do not move.
+      false
+    } else {
+      let key = pcs_callee_key(f)
+      let consumed = pcs_consume_lookup(cmap, key)
+      let is_ctor = match f.kind {
+        EVar(c)        -> pcs_name_is_ctor(c)
+        EModCall(_, c) -> pcs_name_is_ctor(c)
+        _              -> false
+      }
+      pcs_lu_consuming_kind(nm, ll, lc, f.kind, cmap) and
+        pcs_lu_consuming_args(nm, ll, lc, xs, consumed, is_ctor, 0, cmap)
+    }
+  ELambda(_, _) -> false
+  EMatch(s, arms) -> pcs_lu_consuming_kind(nm, ll, lc, s.kind, cmap) and pcs_lu_consuming_arms(nm, ll, lc, arms, cmap)
+  EIf(c, t, opt_e) -> pcs_last_use_consuming(nm, ll, lc, c, cmap) and
+                       pcs_last_use_consuming(nm, ll, lc, t, cmap) and
+                       (match opt_e { None -> true Some(e2) -> pcs_last_use_consuming(nm, ll, lc, e2, cmap) })
+  EBlock(stmts, tail) -> pcs_lu_consuming_stmts(nm, ll, lc, stmts, cmap) and
+                          (match tail { None -> true Some(e) -> pcs_last_use_consuming(nm, ll, lc, e, cmap) })
+  EBinop(_, a, b) -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
+  EUnop(_, x)     -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
+  ERecordLit(_, fis) -> pcs_lu_consuming_fields(nm, ll, lc, fis, cmap)
+  EList(els)      -> pcs_lu_consuming_elems(nm, ll, lc, els, cmap)
+  EPipe(a, b)     -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
+  EBang(x)        -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
+  _ -> true
+}
+
+fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> {
+    let here = match h.kind {
+      # The move point: a bare `nm` arg AT the last-use position must sit
+      # in a consuming slot. A bare `nm` arg elsewhere is some other (not
+      # last) read — it keeps its dup, so impose no constraint.
+      EVar(uname) -> if uname == nm {
+        if h.line == ll and h.col == lc { is_ctor or pcs_has_int(consumed, i) } else { true }
+      } else { true }
+      _ -> pcs_last_use_consuming(nm, ll, lc, h, cmap)
+    }
+    here and pcs_lu_consuming_args(nm, ll, lc, rest, consumed, is_ctor, i + 1, cmap)
+  }
+}
+
+fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: [ConsumeEntry]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and pcs_lu_consuming_arms(nm, ll, lc, rest, cmap)
+  }
+}
+
+fn pcs_lu_consuming_stmts(nm: String, ll: Int, lc: Int, stmts: [Stmt], cmap: [ConsumeEntry]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
+      SVar(_, _, e, _, _) -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
+      SExprStmt(e)        -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
+      _                   -> true
+    }
+    here and pcs_lu_consuming_stmts(nm, ll, lc, rest, cmap)
+  }
+}
+
+fn pcs_lu_consuming_fields(nm: String, ll: Int, lc: Int, fis: [FieldInit], cmap: [ConsumeEntry]) : Bool = match fis {
+  []           -> true
+  [FI(_, e), ...rest] -> pcs_last_use_consuming(nm, ll, lc, e, cmap) and pcs_lu_consuming_fields(nm, ll, lc, rest, cmap)
+}
+
+fn pcs_lu_consuming_elems(nm: String, ll: Int, lc: Int, els: [ListElem], cmap: [ConsumeEntry]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_last_use_consuming(nm, ll, lc, inner, cmap) and pcs_lu_consuming_elems(nm, ll, lc, rest, cmap)
+  }
+}
+
+# Issue #817 — the arm-binders whose LAST use lands in a consuming slot,
+# safe to move-at-last-use (`pcs_is_non_last` consults this set). For each
+# such binder the cons/ctor at its last read takes its birth ref instead
+# of a dup, closing the `list.filter`-over-heap leak. Computed here (body
+# + cmap + uses in scope) and threaded into the rewrite as `move_last_set`.
+# Restricted to binders with >= 2 non-lam uses: a single-use binder
+# already transfers raw via the `count >= 2` fallback being false, so it
+# needs no entry; the leak is specific to the multi-use shape (predicate
+# read + cons read) where the conservative dup orphans the birth ref.
+# Names in `xs` not present in `ys`.
+fn pcs_strs_minus(xs: [String], ys: [String]) : [String] = match xs {
+  []           -> []
+  [h, ...rest] -> if list_has(ys, h) { pcs_strs_minus(rest, ys) } else { [h, ...pcs_strs_minus(rest, ys)] }
+}
+
+fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: [ConsumeEntry], acc: [String]) : [String] = match binders {
+  []           -> list_reverse(acc)
+  [nm, ...rest] -> {
+    let acc1 = match last_use_for(nm, uses) {
+      LUAt(_, ll, lc) ->
+        if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and pcs_last_use_consuming(nm, ll, lc, body, cmap) {
+          [nm, ...acc]
+        } else { acc }
+      _ -> acc
+    }
+    pcs_collect_move_last_set(rest, body, uses, cmap, acc1)
+  }
+}
+
+# Issue #817 — every match-arm pattern binder bound anywhere in `body`,
+# the candidate set for `pcs_collect_move_last_set`. (Params are excluded
+# — they ride `skip_set` / the goto dropmask, not the move-at-last-use
+# path; a param's last use being a move would already be handled by the
+# branch-aware skip-set.)
+fn pcs_all_arm_binders(e: Expr, acc: [String]) : [String] = pcs_all_arm_binders_kind(e.kind, acc)
+
+fn pcs_all_arm_binders_kind(k: ExprKind, acc: [String]) : [String] = match k {
+  EMatch(s, arms)     -> pcs_all_arm_binders_arms(arms, pcs_all_arm_binders(s, acc))
+  EIf(c, t, oe)       -> {
+    let a1 = pcs_all_arm_binders(t, pcs_all_arm_binders(c, acc))
+    match oe { None -> a1 Some(e2) -> pcs_all_arm_binders(e2, a1) }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = pcs_all_arm_binders_stmts(stmts, acc)
+    match tail { None -> a1 Some(e) -> pcs_all_arm_binders(e, a1) }
+  }
+  ELambda(_, body)    -> pcs_all_arm_binders(body, acc)
+  ECall(f, xs)        -> pcs_all_arm_binders_list(xs, pcs_all_arm_binders(f, acc))
+  EIntrinsic(_, xs)   -> pcs_all_arm_binders_list(xs, acc)
+  EBinop(_, a, b)     -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  EUnop(_, x)         -> pcs_all_arm_binders(x, acc)
+  EField(x, _)        -> pcs_all_arm_binders(x, acc)
+  EIndex(a, b)        -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  ERecordLit(_, fis)  -> pcs_all_arm_binders_fields(fis, acc)
+  EList(els)          -> pcs_all_arm_binders_elems(els, acc)
+  EPipe(a, b)         -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  EMapPipe(a, b)      -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  EFlatMapPipe(a, b)  -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  EFilterPipe(a, b)   -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
+  EBang(x)            -> pcs_all_arm_binders(x, acc)
+  ELitUnit(x, _)      -> pcs_all_arm_binders(x, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = pcs_all_arm_binders(body, acc)
+    let a2 = match init_opt { None -> a1 Some(e) -> pcs_all_arm_binders(e, a1) }
+    let a3 = pcs_all_arm_binders_clauses(clauses, a2)
+    match ret_opt { None -> a3 Some(hr) -> match hr { HR(_, b, _, _) -> pcs_all_arm_binders(b, a3) } }
+  }
+  _ -> acc
+}
+
+fn pcs_all_arm_binders_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [Arm(pat, _, body), ...rest] ->
+    pcs_all_arm_binders_arms(rest, pcs_all_arm_binders(body, prc_pat_binders(pat, acc)))
+}
+
+fn pcs_all_arm_binders_list(xs: [Expr], acc: [String]) : [String] = match xs {
+  []           -> acc
+  [h, ...rest] -> pcs_all_arm_binders_list(rest, pcs_all_arm_binders(h, acc))
+}
+
+fn pcs_all_arm_binders_stmts(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(_, _, e)       -> pcs_all_arm_binders(e, acc)
+      SVar(_, _, e, _, _) -> pcs_all_arm_binders(e, acc)
+      SExprStmt(e)        -> pcs_all_arm_binders(e, acc)
+      SAssert(e, om)      -> match om { None -> pcs_all_arm_binders(e, acc) Some(m) -> pcs_all_arm_binders(m, pcs_all_arm_binders(e, acc)) }
+      SIndexAssign(a, b, c, _, _) -> pcs_all_arm_binders(c, pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc)))
+      _                   -> acc
+    }
+    pcs_all_arm_binders_stmts(rest, a1)
+  }
+}
+
+fn pcs_all_arm_binders_fields(fis: [FieldInit], acc: [String]) : [String] = match fis {
+  []           -> acc
+  [FI(_, e), ...rest] -> pcs_all_arm_binders_fields(rest, pcs_all_arm_binders(e, acc))
+}
+
+fn pcs_all_arm_binders_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []           -> acc
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_all_arm_binders_elems(rest, pcs_all_arm_binders(inner, acc))
+  }
+}
+
+fn pcs_all_arm_binders_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [HC(_, _, body, _, _), ...rest] -> pcs_all_arm_binders_clauses(rest, pcs_all_arm_binders(body, acc))
+}
+
 # True iff every read of `nm` in `e` is an inspect-only position: the
 # bare scrutinee of a match whose arms escape nothing. A use anywhere
 # else (arg to a call, ctor slot, field, return, etc.) is NOT
@@ -1016,7 +1224,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # body rewrite runs with an EMPTY param scope (issue #703) — no
         # boxed param to dup/drop, no borrow, no arm-move analysis.
         let uses = pcs_collect_uses_expr(body, [], false, [])
-        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
+        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
@@ -1057,12 +1265,50 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # is the half that lets insert_loop's Black arm move l/r instead of
         # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
         let arm_moves = pcs_collect_arm_skip_binders(name, true, body, bmap, cmap)
+        # Issue #817 — goto-tail arm-binders (read once per branch, consumed
+        # on every path, consuming slot): moved on EVERY use, the
+        # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
+        # (reuse-in-place); this is the free-cell-then-goto model.
+        let goto_moves = pcs_collect_goto_tail_moves(name, body, bmap, cmap)
         let skip_set = pcs_list_union(
           pcs_list_union(
-            pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
-            arm_moves),
+            pcs_list_union(
+              pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
+              arm_moves),
+            goto_moves),
           raw_pnames)
-        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap)
+        # Issue #817 — arm-binders whose LAST use lands in a consuming slot
+        # but which are NOT in `skip_set` (so the conservative dup orphans
+        # the birth ref: the `list.filter`-over-heap leak). `pcs_is_non_last`
+        # moves the last read of these, keeping earlier reads dup'd.
+        # Excluded from `skip_set` (which moves ALL reads); this set moves
+        # only the last one.
+        # Issue #817 — move-at-last-use candidates. RESTRICTED to binders
+        # that live in a goto-tail arm whose cons cascade is SAFE (the
+        # `filter` `h` shape: a guard-less `[h, ...t] -> if p(h) { recur }`
+        # with no leading SLet / inner-match consuming a sibling). Only
+        # there does the #3 `kai_decref(_scr)` shallow-decref guarantee no
+        # cascade double-consume. A binder outside such an arm is left to
+        # its conservative dup (no leak win lost beyond filter/map/flat_map,
+        # which all have this shape). Then minus `skip_set` (already
+        # moved on every use).
+        # `safe_arm_binders` ⊆ `pcs_all_arm_binders` (both walk the same
+        # tree; the safe set only adds the cascade gate), so the inter
+        # never drops a safe binder the candidate set lacks. The candidate
+        # set is computed over the whole-body `uses`: a binder name shared
+        # by two arms picks the lexically-last use across both, so its move
+        # only fires if THAT exact `(line,col)` recurs in the binder's own
+        # arm (the `pcs_is_non_last` position gate) — a cross-arm name
+        # collision simply leaves the dup in place (benign: a missed move,
+        # never a wrong one). The `(line,col)` identity of AST nodes makes
+        # a false move impossible.
+        let safe_arm_binders = pcs_collect_safe_arm_binders(name, body, bmap)
+        let move_last_set = pcs_strs_minus(
+          pcs_strs_inter(
+            pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
+            safe_arm_binders),
+          skip_set)
+        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap, move_last_set)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         # Borrowed params carry no exit obligation — exclude from the
@@ -1085,13 +1331,13 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
     # bindings.
     DTest(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DTest(desc, reused_body, ln, cl)
     }
     DBench(desc, body, ln, cl) -> {
       let uses = pcs_collect_uses_expr(body, [], false, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap)
+      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DBench(desc, reused_body, ln, cl)
     }
@@ -1116,7 +1362,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let skip_set = pcs_branch_aware_skip_params(pnames, body)
-      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames, bmap)
+      let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames, bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DCheck(desc, ps, reused_body, ln, cl)
     }
@@ -1722,18 +1968,18 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
 
 # ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
 
-fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Expr / Console =
+fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : Expr / Console =
 
-  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set, bmap),
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
-                    uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : ExprKind / Console {
+                    uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : ExprKind / Console {
 
   match k {
     # The actual rewrite: wrap a non-last `EVar` use in `__perceus_dup`.
     EVar(nm) -> {
-      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set, bmap) {
+      if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set, bmap, move_last_set) {
         ECall(
           Expr { kind: EVar("__perceus_dup"), line: line, col: col,
                  ty: None, mode: MUnknown },
@@ -1748,7 +1994,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # the parsed Expr, then surgically rewrite the source by replacing
     # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
     # back through the parser at emit time as a normal ECall(__perceus_dup).
-    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set, bmap), is_triple)
+    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), is_triple)
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
@@ -1756,13 +2002,30 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.pname)
-      ELambda(ps, pcs_rewrite_expr(body, list_append(scope, pn), uses, true, skip_set, force_set, bmap))
+      # Issue #817 — give the lambda's OWN params the entry/exit-drop
+      # discipline a top-level `fn` gets in `perceus_decl_b`. The
+      # enclosing `uses` only tracks the lambda's CAPTURES (the container
+      # collected its uses before the params entered scope), so the params
+      # default to dup'd-and-never-dropped: the predicate `(w) => not
+      # is_empty(w)` leaks one `w` per call (the dominant `list.filter`-
+      # with-lambda slice). Collect the params' own uses + their
+      # branch-aware raw skip-set, rewrite the body with both unioned in,
+      # then prepend the unused/exit drops. Captures keep the container's
+      # discipline (the closure object owns them; freed with it, never
+      # per-call) — they are not in `ps`, so the drops leave them alone.
+      # The params' uses use `in_lam=false`: relative to THIS body they are
+      # direct reads, not reads captured by a further-nested lambda.
+      let lam_param_uses = pcs_collect_uses_expr(body, pn, false, [])
+      let all_uses = list_append(uses, lam_param_uses)
+      let lam_skip = list_append(skip_set, pcs_branch_aware_skip_params(pn, body))
+      let new_body = pcs_rewrite_expr(body, list_append(scope, pn), all_uses, true, lam_skip, force_set, bmap, [])
+      ELambda(ps, pcs_prepend_unused_drops(new_body, ps, all_uses, lam_skip))
     }
     EBlock(stmts, opt_tail) -> {
-      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set, bmap)
+      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set, bmap, move_last_set)
       let new_tail = match opt_tail {
         None -> None
-        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap))
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
       # Issue #297 (partial) — block-scope exit drops for SLet PBind
       # bindings that took a `__perceus_dup` per non-last read above.
@@ -1788,21 +2051,21 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                                                          opt_tail, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set, bmap))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set, bmap)
+      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set, bmap, [])
       let init1 = match init_opt {
         None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set, bmap))
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
-      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set, force_set, bmap)
+      let cls1 = pcs_rewrite_clauses(clauses, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
           HR(pname, body2, hl, hc) ->
             Some(HR(pname,
-                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set, force_set, bmap),
+                    pcs_rewrite_expr(body2, [pname, ...scope], uses, in_lam, skip_set, force_set, bmap, []),
                     hl, hc))
         }
       }
@@ -1824,70 +2087,70 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap))
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
     ECall(callee, args_) ->
-      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set, bmap),
-            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap))
-    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set, bmap), nm)
-    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap))
-    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap),
-                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set, bmap),
-                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set, bmap))
-    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set, bmap))
-    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set, bmap))
-    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap),
-                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set, bmap))
-    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap),
-                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap), u)
-    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap))
+      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), nm)
+    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    ERecordLit(name, fs) -> ERecordLit(name, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EMapPipe(a, b)       -> EMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                            pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EFilterPipe(a, b)    -> EFilterPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                                           pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), u)
+    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
   }
 }
 
-fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Option[Expr] / Console = match opt {
+fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : Option[Expr] / Console = match opt {
   None    -> None
-  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap))
+  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [Expr] / Console = match es {
+fn pcs_rewrite_expr_list(es: [Expr], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [Expr] / Console = match es {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set, bmap),
-                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [FieldInit] / Console = match fs {
+fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [FieldInit] / Console = match fs {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set, bmap),
-                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
+fn pcs_rewrite_field_init(fi: FieldInit, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : FieldInit / Console = match fi {
+  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [ListElem] / Console = match els {
+fn pcs_rewrite_list_elems(els: [ListElem], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [ListElem] / Console = match els {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set, bmap),
-                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
-  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap))
+fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : ListElem / Console = match el {
+  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [Arm] / Console {
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [Arm] / Console {
 
   match arms {
     [] -> []
@@ -1902,10 +2165,10 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
         let body_skip = skip_set
         let g1 = match opt_g {
           None -> None
-          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set, bmap))
+          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set, bmap, move_last_set))
         }
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, body_skip, force_set, bmap)
-        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, body_skip, force_set, bmap, move_last_set)
+        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
       }
     }
   }
@@ -1914,24 +2177,24 @@ fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, ski
 type PcsRwBlock = { stmts: [Stmt], scope: [String] }
 
 fn pcs_rewrite_block(stmts: [Stmt], scope: [String], uses: [Use], in_lam: Bool,
-                     acc: [Stmt], skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : PcsRwBlock / Console {
+                     acc: [Stmt], skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : PcsRwBlock / Console {
 
   match stmts {
     [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
     [s, ...rest] -> {
-      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set, bmap)
-      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set, bmap)
+      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set, bmap, move_last_set)
     }
   }
 }
 
 type PcsRwStmt = { stmt: Stmt, scope: [String] }
 
-fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : PcsRwStmt / Console {
+fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : PcsRwStmt / Console {
 
   match s {
     SLet(pat, ty_opt, rhs) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       # See `pcs_collect_uses_in_block` SLet — raw locals stay
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
@@ -1940,25 +2203,25 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
                   scope: prc_pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
     }
     SAssert(c, opt_m) -> {
-      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap)
+      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       let m1 = match opt_m {
         None -> None
-        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set, bmap))
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
       PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
     }
     SExprStmt(e) -> {
-      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap)
+      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
     }
     SIndexAssign(b, i, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap)
-      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set, bmap)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap)
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
@@ -1967,7 +2230,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
 }
 
 fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
-                        in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [HClause] / Console {
+                        in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [HClause] / Console {
 
   match cs {
     [] -> []
@@ -1975,8 +2238,8 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
       HC(op, params, body, ln, cl) -> {
         let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
         let scope1 = list_append(scope, ["state", "log", ...pn])
-        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap)
-        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+        let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap, [])
+        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
       }
     }
   }
@@ -2026,7 +2289,7 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
 # (issues #77–#82). Closed R10 and R11 (issue #61).
 
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
-                   in_lam_here: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : Bool {
+                   in_lam_here: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : Bool {
   # Issue #697 — `force_set` carries the names that must dup on EVERY
   # read, last-use included, because the body does not own them: it
   # borrows them. The sole populator is the `DCheck` branch, whose
@@ -2041,15 +2304,27 @@ fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
   else if in_lam_here { true }
   else {
     match last_use_for(nm, uses) {
-      LUAt(_, _, _) -> {
+      LUAt(_, lu_line, lu_col) -> {
         # Issue #599 — branch-aware dup elimination. If the binding
         # appears in `skip_set` (built once from the body via
         # `pcs_max_paths_*`, populated only for top-level fn params
         # whose max non-lam reads across any execution path is <= 1),
         # skip the dup wrap entirely: the single read on the executed
-        # path can transfer ownership raw. Otherwise fall back to the
-        # conservative "≥ 2 non-lam uses" check.
+        # path can transfer ownership raw.
         if list_has(skip_set, nm) { false }
+        # Issue #817 — move-at-last-use. `move_last_set` holds the
+        # arm-binders whose LAST use lands in a consuming slot (computed
+        # in `perceus_decl_b` with the body + cmap in scope). When the
+        # CURRENT read is that last use, transfer ownership raw (no dup):
+        # the consuming slot takes the binder's birth ref, leaving no
+        # orphan. Earlier reads (e.g. a predicate `p(h)` whose closure
+        # could retain `h`) keep their conservative dup, since `(line,col)`
+        # does not match the last-use position. This is what stops
+        # `list.filter`/`map`/`flat_map` over heap elements leaking the
+        # extracted head: the cons in `[h, ...acc]` moves `h` instead of
+        # dup'ing-and-orphaning it. NOT a skip-set entry (which would move
+        # the predicate read too → UAF if `p` retains `h`).
+        else if list_has(move_last_set, nm) and line == lu_line and col == lu_col { false }
         else { pcs_count_non_lam_uses(nm, uses, 0) >= 2 }
       }
       LUBlocked(_) -> true
@@ -2469,6 +2744,359 @@ pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [Borr
     let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap, cmap)
     if mp <= 1 and cv and ln and cons_ok { [h, ...rest_skip] } else { rest_skip }
   }
+}
+
+# Issue #817 — cons-cascade safety for a goto-tail arm whose binders are
+# candidates to move. The #3 `kai_decref(_scr)` frees the matched cons
+# cell when its rc reaches 1 and cascades `decref` to every slot. Moving a
+# binder strips the dup that held the cell's rc above 1, so the cascade
+# fires; if a SIBLING binder is then consumed (moved) somewhere OTHER than
+# inside the self-tail-call's args, the cascade double-consumes it — and a
+# read-after (an inner `match p.ptype`) is a use-after-free. `filter`'s
+# head `h` is consumed only inside the cons that IS a self-call arg → safe;
+# `vpa_sig_params`'s `p` is consumed by `match p.ptype` outside the call →
+# unsafe. A binder's last use being inside a self-call arg (a move there,
+# balanced by the cascade) is safe; outside it is not. Borrow-only reads
+# never consume, so they do not block (a `field_read` that dups, or a use
+# that is not the binder's last use, leaves the birth ref for the cascade).
+fn pcs_cons_cascade_safe(binders: [String], body: Expr, self_name: String, bmap: [BorrowEntry]) : Bool / Console = {
+  let uses = pcs_collect_uses_expr(body, binders, false, [])
+  pcs_ccs_all(binders, body, self_name, uses)
+}
+
+fn pcs_ccs_all(binders: [String], body: Expr, self_name: String, uses: [Use]) : Bool / Console = match binders {
+  []           -> true
+  [nm, ...rest] -> {
+    let ok = match last_use_for(nm, uses) {
+      # The binder's last (ownership-transferring) read. Safe iff it sits
+      # inside a self-tail-call's args (moved there, the cascade balances)
+      # OR the binder is read at most once total AND that read is a borrow
+      # the cascade reclaims. Conservative: require the last use to be
+      # inside the self-call.
+      LUAt(_, ll, lc) -> pcs_pos_in_self_call(self_name, ll, lc, body)
+      LUUnused(_)     -> true   # never read → cascade reclaims, no extra consume
+      LUBlocked(_)    -> false  # captured in a lambda → opaque, do not move
+    }
+    if ok { pcs_ccs_all(rest, body, self_name, uses) } else { false }
+  }
+}
+
+# True iff `(ll, lc)` lands inside an argument of a `self_name(...)` call
+# in `body`. Descends through the whole body; when it enters an
+# `ECall(EVar(self_name), args)` it checks whether the position is within
+# any arg's span (any sub-expression carrying that exact line/col).
+fn pcs_pos_in_self_call(self_name: String, ll: Int, lc: Int, e: Expr) : Bool =
+  pcs_pisc_kind(self_name, ll, lc, e.kind)
+
+fn pcs_pisc_kind(self_name: String, ll: Int, lc: Int, k: ExprKind) : Bool = match k {
+  ECall(f, xs) -> match f.kind {
+    EVar(c)        -> if c == self_name { pcs_pos_in_exprs(ll, lc, xs) }
+                      else { pcs_pisc_kind(self_name, ll, lc, f.kind) or pcs_pisc_exprs(self_name, ll, lc, xs) }
+    EModCall(_, c) -> if c == self_name { pcs_pos_in_exprs(ll, lc, xs) }
+                      else { pcs_pisc_exprs(self_name, ll, lc, xs) }
+    _              -> pcs_pisc_kind(self_name, ll, lc, f.kind) or pcs_pisc_exprs(self_name, ll, lc, xs)
+  }
+  EIf(c, t, oe)       -> pcs_pisc_kind(self_name, ll, lc, c.kind) or pcs_pisc_kind(self_name, ll, lc, t.kind) or
+                         (match oe { None -> false Some(e2) -> pcs_pisc_kind(self_name, ll, lc, e2.kind) })
+  EMatch(s, arms)     -> pcs_pisc_kind(self_name, ll, lc, s.kind) or pcs_pisc_arms(self_name, ll, lc, arms)
+  EBlock(stmts, tail) -> pcs_pisc_stmts(self_name, ll, lc, stmts) or
+                         (match tail { None -> false Some(e) -> pcs_pisc_kind(self_name, ll, lc, e.kind) })
+  EBinop(_, a, b)     -> pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
+  EUnop(_, x)         -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  EField(x, _)        -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  EIndex(a, b)        -> pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
+  ERecordLit(_, fis)  -> pcs_pisc_fields(self_name, ll, lc, fis)
+  EList(els)          -> pcs_pisc_elems(self_name, ll, lc, els)
+  EBang(x)            -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  ELitUnit(x, _)      -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  _ -> false
+}
+
+# True iff `(ll, lc)` appears anywhere within `xs` (the self-call's args).
+fn pcs_pos_in_exprs(ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_pos_in_expr(ll, lc, h) or pcs_pos_in_exprs(ll, lc, rest)
+}
+
+fn pcs_pos_in_expr(ll: Int, lc: Int, e: Expr) : Bool =
+  (e.line == ll and e.col == lc) or pcs_pos_in_kind(ll, lc, e.kind)
+
+fn pcs_pos_in_kind(ll: Int, lc: Int, k: ExprKind) : Bool = match k {
+  ECall(f, xs)        -> pcs_pos_in_expr(ll, lc, f) or pcs_pos_in_exprs(ll, lc, xs)
+  EIf(c, t, oe)       -> pcs_pos_in_expr(ll, lc, c) or pcs_pos_in_expr(ll, lc, t) or
+                         (match oe { None -> false Some(e) -> pcs_pos_in_expr(ll, lc, e) })
+  EMatch(s, arms)     -> pcs_pos_in_expr(ll, lc, s) or pcs_pos_in_arms(ll, lc, arms)
+  EBlock(stmts, tail) -> pcs_pos_in_stmts(ll, lc, stmts) or (match tail { None -> false Some(e) -> pcs_pos_in_expr(ll, lc, e) })
+  EBinop(_, a, b)     -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  EUnop(_, x)         -> pcs_pos_in_expr(ll, lc, x)
+  EField(x, _)        -> pcs_pos_in_expr(ll, lc, x)
+  EIndex(a, b)        -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  ERecordLit(_, fis)  -> pcs_pos_in_fields(ll, lc, fis)
+  EList(els)          -> pcs_pos_in_elems(ll, lc, els)
+  EBang(x)            -> pcs_pos_in_expr(ll, lc, x)
+  ELitUnit(x, _)      -> pcs_pos_in_expr(ll, lc, x)
+  _ -> false
+}
+
+fn pcs_pos_in_arms(ll: Int, lc: Int, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] -> pcs_pos_in_expr(ll, lc, b) or pcs_pos_in_arms(ll, lc, rest)
+}
+
+fn pcs_pos_in_stmts(ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_pos_in_expr(ll, lc, e)
+      SVar(_, _, e, _, _) -> pcs_pos_in_expr(ll, lc, e)
+      SExprStmt(e)        -> pcs_pos_in_expr(ll, lc, e)
+      _ -> false
+    }
+    here or pcs_pos_in_stmts(ll, lc, rest)
+  }
+}
+
+fn pcs_pos_in_fields(ll: Int, lc: Int, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [FI(_, e), ...rest] -> pcs_pos_in_expr(ll, lc, e) or pcs_pos_in_fields(ll, lc, rest)
+}
+
+fn pcs_pos_in_elems(ll: Int, lc: Int, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_pos_in_expr(ll, lc, inner) or pcs_pos_in_elems(ll, lc, rest)
+  }
+}
+
+fn pcs_pisc_exprs(self_name: String, ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_pisc_kind(self_name, ll, lc, h.kind) or pcs_pisc_exprs(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_arms(self_name: String, ll: Int, lc: Int, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] -> pcs_pisc_kind(self_name, ll, lc, b.kind) or pcs_pisc_arms(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_stmts(self_name: String, ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      SVar(_, _, e, _, _) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      SExprStmt(e)        -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      _ -> false
+    }
+    here or pcs_pisc_stmts(self_name, ll, lc, rest)
+  }
+}
+
+fn pcs_pisc_fields(self_name: String, ll: Int, lc: Int, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [FI(_, e), ...rest] -> pcs_pisc_kind(self_name, ll, lc, e.kind) or pcs_pisc_fields(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_elems(self_name: String, ll: Int, lc: Int, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_pisc_kind(self_name, ll, lc, inner.kind) or pcs_pisc_elems(self_name, ll, lc, rest)
+  }
+}
+
+# Issue #817 — every tail leaf of `e` is a DIRECT self-tail-call
+# `self_name(...)` (recurses through EIf / EMatch / EBlock tails). This is
+# the goto-lowered shape (tcrec): the arm's `kai_decref(_scr)` is
+# pre-injected SHALLOW before the body (issue #309/#817), so the matched
+# cons cell is freed before the body reads the deconstructed binders, and
+# moving a binder transfers a ref the cell no longer cascades into. The
+# mirror of emit_c's `tcrec_tail_always_sentinel`; duplicated here to keep
+# the perceus pass free of an emit dependency. A non-self call, a normal
+# value tail, or a ctor-rebuild fails — keeping regexp's NB_Frag arms
+# (legacy match-exit, recursive decref) and balance's ctor-rebuild
+# (cons-overwrite reuse) out of this set.
+fn pcs_arm_all_tails_self_call(self_name: String, e: Expr) : Bool = pcs_atsc_kind(self_name, e.kind)
+
+fn pcs_atsc_kind(self_name: String, k: ExprKind) : Bool = match k {
+  # A direct self-call by bare name (pre-resolution) OR by module-
+  # qualified name (`EModCall("list", "filter_loop")`, after the resolver
+  # qualifies stdlib fns) — mirror of emit_c's `tcrec_tail_always_sentinel`
+  # which handles both. Without the EModCall arm, a resolved fn's self-
+  # call falls through and the goto-tail-move never fires for it.
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> c == self_name
+    EModCall(_, c) -> c == self_name
+    _              -> false
+  }
+  EIf(_, t, opt_e) ->
+    pcs_arm_all_tails_self_call(self_name, t) and
+    (match opt_e { None -> false Some(e2) -> pcs_arm_all_tails_self_call(self_name, e2) })
+  EMatch(_, arms) -> pcs_atsc_arms(self_name, arms)
+  # Issue #817 — a block with NO leading statements: `{ recur(...) }`. A
+  # block WITH statements (`{ let e1 = match p.ptype; recur(...) }`, the
+  # `vpa_sig_params` shape) is rejected — a leading `SLet` / inner-match
+  # may CONSUME a sibling binder before the goto, and the #3
+  # `kai_decref(_scr)` cascade then double-consumes it (UAF). Only a body
+  # that flows STRAIGHT to the self-call (no intervening consume) is
+  # goto-tail-move safe. `filter`'s `if p(h) { recur } else { recur }` has
+  # no such block; `map`/`flat_map`/`reverse` likewise.
+  EBlock(stmts, opt_tail) -> match stmts {
+    [] -> match opt_tail { None -> false Some(t) -> pcs_arm_all_tails_self_call(self_name, t) }
+    _  -> false
+  }
+  _ -> false
+}
+
+# A non-empty `match` whose every arm tail is a direct self-call. Empty
+# arms (degenerate) → false (no tail is a self-call to guard).
+fn pcs_atsc_arms(self_name: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] ->
+    pcs_arm_all_tails_self_call(self_name, b) and pcs_atsc_arms_rest(self_name, rest)
+}
+
+fn pcs_atsc_arms_rest(self_name: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [Arm(_, _, b), ...rest] ->
+    pcs_arm_all_tails_self_call(self_name, b) and pcs_atsc_arms_rest(self_name, rest)
+}
+
+# Issue #817 — arm-binders of goto-tail (`pcs_arm_all_tails_self_call`)
+# guard-less arms that pass the borrow-aware move check. These are moved
+# on EVERY use (skip_set), the `list.filter`/`map`/`flat_map` `kai_t`
+# (tail) case: read once per branch (max-path 1), consumed on every path,
+# in a consuming slot. Separate from `pcs_collect_arm_skip_binders`'
+# `reuse_shape` set (which governs the orthogonal reuse-in-place model);
+# this set governs the free-the-cell-then-goto model. Same 4 gates.
+fn pcs_collect_goto_tail_moves(self_name: String, e: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] / Console =
+  pcs_gtm_kind(self_name, e.kind, bmap, cmap)
+
+fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] / Console = match k {
+  EMatch(s, arms) ->
+    pcs_list_union(pcs_collect_goto_tail_moves(self_name, s, bmap, cmap),
+                   pcs_gtm_arms(self_name, arms, bmap, cmap))
+  EIf(c, t, opt_e) ->
+    pcs_list_union(pcs_collect_goto_tail_moves(self_name, c, bmap, cmap),
+      pcs_list_union(pcs_collect_goto_tail_moves(self_name, t, bmap, cmap),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_goto_tail_moves(self_name, e2, bmap, cmap) }))
+  EBlock(stmts, tail) ->
+    pcs_list_union(pcs_gtm_stmts(self_name, stmts, bmap, cmap),
+                   match tail { None -> [] Some(e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap) })
+  # A lambda body is a different call frame — a self-tail-call inside it
+  # is NOT a goto-tail of the enclosing fn (`pcs_atsc_kind` returns false
+  # at ELambda for the same reason). The rewriter also zeroes
+  # `move_last_set` on lambda entry. Do NOT descend; the binders here are
+  # captures, not goto-tail arm-binders of `self_name`.
+  ELambda(_, _) -> []
+  _ -> []
+}
+
+fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] / Console = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> {
+      let nested = pcs_collect_goto_tail_moves(self_name, body, bmap, cmap)
+      let pb = prc_pat_binders(pat, [])
+      let here = match opt_g {
+        # Issue #817 — additionally require cons-cascade safety: the #3
+        # `kai_decref(_scr)` frees the matched cons cell when its rc hits
+        # 1 and CASCADES `decref` to ALL its slots. Moving a binder strips
+        # the dup that kept the cell's rc above 1, so the cascade fires —
+        # and if ANY sibling binder is CONSUMED outside the self-tail-call
+        # (e.g. `vpa_sig_params`'s `match p.ptype` consumes `p`), the
+        # cascade double-consumes it (and the inner-match reads it after)
+        # → UAF. Block the whole pattern's move when that holds.
+        None    -> {
+          let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
+          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, bmap)
+          if safe { pcs_branch_aware_skip_locals_b(pb, body, bmap, cmap) } else { [] }
+        }
+        Some(_) -> []
+      }
+      pcs_list_union(pcs_list_union(here, nested),
+                     pcs_gtm_arms(self_name, rest, bmap, cmap))
+    }
+  }
+}
+
+fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] / Console = match stmts {
+  []           -> []
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap)
+      SVar(_, _, e, _, _) -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap)
+      SExprStmt(e)        -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap)
+      _                   -> []
+    }
+    pcs_list_union(here, pcs_gtm_stmts(self_name, rest, bmap, cmap))
+  }
+}
+
+# Issue #817 — pattern binders of goto-tail arms that ARE cons-cascade
+# safe (`pcs_arm_all_tails_self_call` + `pcs_cons_cascade_safe`): the
+# `filter` `[h, ...t] -> if p(h) { recur }` shape. `move_last_set` is
+# intersected with this set, so move-at-last-use only fires for binders
+# whose arm guarantees the #3 shallow-decref cannot cascade into a sibling
+# (the `vpa_sig_params` UAF is excluded — its arm has a leading SLet /
+# inner-match, so it fails `pcs_arm_all_tails_self_call`).
+fn pcs_collect_safe_arm_binders(self_name: String, e: Expr, bmap: [BorrowEntry]) : [String] / Console =
+  pcs_sab_kind(self_name, e.kind, bmap)
+
+fn pcs_sab_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry]) : [String] / Console = match k {
+  EMatch(s, arms) ->
+    pcs_list_union(pcs_collect_safe_arm_binders(self_name, s, bmap),
+                   pcs_sab_arms(self_name, arms, bmap))
+  EIf(c, t, opt_e) ->
+    pcs_list_union(pcs_collect_safe_arm_binders(self_name, c, bmap),
+      pcs_list_union(pcs_collect_safe_arm_binders(self_name, t, bmap),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_safe_arm_binders(self_name, e2, bmap) }))
+  EBlock(stmts, tail) ->
+    pcs_list_union(pcs_sab_stmts(self_name, stmts, bmap),
+                   match tail { None -> [] Some(e) -> pcs_collect_safe_arm_binders(self_name, e, bmap) })
+  # Lambda body = different frame; do not descend (mirror of
+  # `pcs_gtm_kind` / `pcs_atsc_kind`).
+  ELambda(_, _) -> []
+  _ -> []
+}
+
+fn pcs_sab_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry]) : [String] / Console = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> {
+      let nested = pcs_collect_safe_arm_binders(self_name, body, bmap)
+      let pb = prc_pat_binders(pat, [])
+      let here = match opt_g {
+        None -> {
+          let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
+          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, bmap)
+          if safe { pb } else { [] }
+        }
+        Some(_) -> []
+      }
+      pcs_list_union(pcs_list_union(here, nested),
+                     pcs_sab_arms(self_name, rest, bmap))
+    }
+  }
+}
+
+fn pcs_sab_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry]) : [String] / Console = match stmts {
+  []           -> []
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_collect_safe_arm_binders(self_name, e, bmap)
+      SVar(_, _, e, _, _) -> pcs_collect_safe_arm_binders(self_name, e, bmap)
+      SExprStmt(e)        -> pcs_collect_safe_arm_binders(self_name, e, bmap)
+      _                   -> []
+    }
+    pcs_list_union(here, pcs_sab_stmts(self_name, rest, bmap))
+  }
+}
+
+# Names present in BOTH lists.
+fn pcs_strs_inter(xs: [String], ys: [String]) : [String] = match xs {
+  []           -> []
+  [h, ...rest] -> if list_has(ys, h) { [h, ...pcs_strs_inter(rest, ys)] } else { pcs_strs_inter(rest, ys) }
 }
 
 # Walk a fn body, collecting EVERY guard-less match arm's pattern binders
@@ -3162,7 +3790,7 @@ fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
 type DupMark = DM(Int, Int)   # line, col of an EVar that needs wrapping
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
-                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : String / Console {
+                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : String / Console {
 
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
@@ -3218,7 +3846,7 @@ fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
   match parse_interp_expr(esrc) {
     None -> esrc
     Some(parsed) -> {
-      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set, bmap)
+      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set, bmap, [])
       let marks = pcs_dup_marks_expr(rewritten, [])
       match marks {
         [] -> esrc
@@ -3952,7 +4580,20 @@ fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
       Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
              line: body.line, col: body.col, ty: body.ty, mode: body.mode }
     _ -> {
-      if pcs_is_self_tail_call(body, fn_name) { body }
+      if pcs_is_self_tail_call(body, fn_name) {
+        # Issue #817 — the body is (or hosts in its tail-leaves) a
+        # self-tail-call; the `__pcs_arm_ret` wrap would hide it from the
+        # TCO rewrite (#342), so we cannot wrap. Instead push each drop
+        # DOWN into the self-tail-call leaves where its binder is DEAD
+        # (not consumed). For `list.filter`'s `kai_h`: it is moved (and so
+        # consumed) into the cons on the keep leaf, but DEAD on the drop
+        # leaf (`filter_loop(t,p,acc)`, no `h`) → the drop lands only in
+        # the else leaf, before its goto, in trivial order (h absent from
+        # the args). A leaf that consumes the binder keeps it (no double-
+        # free); a binder moved on every leaf (`kai_t`) is consumed on
+        # both, so its drop is dropped everywhere — correct.
+        pcs_distribute_dead_drops(body, drops, fn_name)
+      }
       else {
         let ret_name = "__pcs_arm_ret"
         let ret_let = SLet(
@@ -3968,6 +4609,76 @@ fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
       }
     }
   }
+}
+
+# Issue #817 — distribute `drops` into the self-tail-call tail-leaves where
+# the dropped binder is DEAD (`not pcs_consumed_on_every_path`). A binder
+# consumed on a leaf (moved into a cons / passed to the recursion) keeps
+# its ref there; one absent on a leaf is orphaned and dropped before that
+# leaf's goto. Bare-call leaves are wrapped `EBlock([drop], Some(leaf))`
+# so the self-call stays in tail position (TCO preserved). Only self-tail-
+# call leaves are touched; a normal-return leaf is left to the surrounding
+# exit-drop machinery.
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr =
+  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name),
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+
+fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String) : ExprKind {
+  match k {
+    EIf(c, t, opt_e) ->
+      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name),
+          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name)) })
+    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name))
+    EBlock(stmts, opt_tail) -> match opt_tail {
+      Some(t) -> EBlock(stmts, Some(pcs_distribute_dead_drops(t, drops, fn_name)))
+      None    -> k
+    }
+    _ -> {
+      let leaf = Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode }
+      if pcs_is_self_tail_call(leaf, fn_name) {
+        let dead = pcs_drops_dead_in(drops, leaf)
+        match dead {
+          [] -> k
+          [_, ...__] -> EBlock(dead, Some(leaf))
+        }
+      } else { k }
+    }
+  }
+}
+
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) ->
+      [Arm(pat, opt_g, pcs_distribute_dead_drops(body, drops, fn_name)),
+       ...pcs_dd_arms(rest, drops, fn_name)]
+  }
+}
+
+# Drops whose binder is NOT consumed in `leaf` (dead there → must drop).
+fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] = match drops {
+  [] -> []
+  [d, ...rest] -> {
+    let tl = pcs_drops_dead_in(rest, leaf)
+    match pcs_drop_stmt_name(d) {
+      Some(nm) -> if pcs_consumed_on_every_path(nm, leaf) { tl } else { [d, ...tl] }
+      None     -> tl
+    }
+  }
+}
+
+# The binder of a `pcs_make_drop_stmt` (`SExprStmt(ECall(EVar("__perceus_drop"), [EVar(nm)]))`).
+fn pcs_drop_stmt_name(d: Stmt) : Option[String] = match d {
+  SExprStmt(e) -> match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(cn) -> if cn == "__perceus_drop" {
+        match args_ { [a] -> match a.kind { EVar(nm) -> Some(nm) _ -> None } _ -> None }
+      } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
 }
 
 fn pcs_is_self_tail_call(e: Expr, fn_name: String) : Bool {
