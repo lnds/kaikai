@@ -1,14 +1,48 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-11, after burn-down 5):**
+> **Status (2026-06-12, after burn-down 6):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **81 fail** on the Linux/CI ratchet (73 this
-> lane diagnosed + 8 corpus-growth gaps main added during the rebase — see
-> below; macOS dev measures 79). The flip to native-default (Lane 1.5) is
-> **BLOCKED** on closing these gaps. This file is the burn-down input: every
-> failing fixture, grouped by root-cause family. The anti-regression ratchet
-> that locks the count is `tools/native-parity-baseline.txt` (gated in
-> `tier1-native`).
+> docs/kir-design.md §7.2) is at **67 listed gaps** on the ratchet after
+> burn-down 6 closed 14 (81 → 67): the Clock dead-code slice (+ the
+> actor/Spawn/NetTcp dispatch shape the synth-handler superset resolved), the
+> nested-variant Form B/A unbound-register slice, and the EBang transversal
+> node. The flip to native-default (Lane 1.5) remains **BLOCKED** on the
+> residue (now mostly DESIGN-bearing: json/regex array-decode, rb-tree
+> reuse-token model, the remaining File/stream handlers, pipe-lowering,
+> Real box/unbox, clause-param-origin). This file is the burn-down input:
+> every failing fixture, grouped by root-cause family. The anti-regression
+> ratchet that locks the count is `tools/native-parity-baseline.txt` (gated
+> in `tier1-native`). NOTE: the 14 removed are deterministic macOS closes;
+> `list_helpers`/`list_zip3_scan` stay listed (macOS-pass/Linux-SIGSEGV), so
+> the Linux/CI count may differ by the handful that need Linux re-validation.
+>
+> **Burn-down 6 (2026-06-12)** closed FOUR root causes (see
+> `docs/lane-experience-native-parity-burndown-6.md`):
+>   - **EBang (postfix `!`)** was unhandled in `lower_expr` → fell to
+>     `lower_unhandled` (silent unit). Added `lower_bang` (kir_lower_walk.kai),
+>     a control-flow fork mirroring emit_c's `emit_bang`: test the success tag,
+>     `KProj 0` on match, `KRet` (early-return) on miss. Transversal (any
+>     `expr!`); unblocked date_basic/date_iso.
+>   - **Clock dead-code synth-handler.** Native aborted on a `KPerform Clock`
+>     in a dead fn (`today : Date / Clock`) main never installs. Added
+>     `kir_synth_handler_effects` — a SUPERSET of `defaults` (every
+>     default-block effect, no main_row filter) exposed as
+>     `KProgram.synth_defaults`, fed ONLY to the dispatch (`ndef_synth_handlers`);
+>     install/teardown stay on `defaults`. Byte-id failure-mode parity with C.
+>     Closed date_basic + date_iso.
+>   - **nested-variant Form B (variant-slot).** `Node(_, Node(Red, a, ..), ..)`
+>     trapped `bind_unsupported_nested`. Three atomic changes:
+>     `psub_is_discriminating` admits any `PVariant`, `var_seal_variant` tests
+>     the tag then recurses into payload sub-slots, `bind_slot_pattern` recurses
+>     the bind. Closed reuse_nested_subpattern.
+>   - **nested-variant Form A (list-head record-field-variant).**
+>     `[Pair { snd: JReal(r) }]` — `lm_emit_head` (kir_lower_match.kai) tests +
+>     binds a nested head. Closed the unbound-register for json_real ×4 (they
+>     now diverge on a SEPARATE json-array decode bug, reclassified to
+>     regex/json).
+> selfhost byte-id OK (after a `PHole(_)` arity fix kaic1 tolerated but selfhost
+> caught); `make test-kir` GREEN (goldens unchanged — the simple-head path was
+> kept direct, no churn); full-corpus parity ZERO regressions.
 >
 > **History:** 168 gaps at first measure (2026-06-09). Burn-down 1 closed
 > 31 → 137. Burn-down 2 closed 55 (unary-minus aliasing the binary `-` +
@@ -65,8 +99,9 @@ fixtures surfaced their masked runtime bug.
 |---|---:|---|
 | output-mismatch | 19 | same exit code, divergent stdout. Sub-causes: **pipe-lowering** (`EPipe` lowers to unit, the call vanishes — collatz/euler1/fizzbuzz/imc/capture), **Real box/unbox** (`9.88131e-324` ≈ a raw i64 read as a double — complex/unbox_*), and the **regex/json reclassified** (regex predicate/subsume wrong output, json `\uXXXX` decode `MISMATCH got='1' want='A'` — a char/hex decode the build error masked). |
 | exit-code-mismatch / SIGSEGV / timeout | 22 | `c=0, native=1/124/138/139`. Sub-causes: `nat=1` panics (hashmap/hashset `Hash:hash` proto-dispatch todo, math_real `-`/`^`, regex parse `unterminated character class`, `requires violated`), `nat=139` SIGSEGV (quicksort×2, deep recursion, attr_unstable), `nat=124` timeout (spiral, m7b_15/m8_12 nested-alias, multi_var_state), `nat=138` (issue_668 map-in-fiber). Includes the Linux-only `list_helpers`/`list_zip3_scan`. |
-| unbound-register | 10 | `unsupported KIR node (subset gap): unbound register <r>` — the residual nested-variant-test slice: a nested variant sub-pattern WITH payload (`Some(JReal(r))`) needs a tag TEST + recursive sub-bind. Burn-down 3's `kai_tag_eq` test covers NULLARY nested ctors (enum slots); the payload-bearing nested ctor is the remaining gap (`bind_unsupported_nested`). [Burn-down 5 closed the writer-state `log` slice via `KBindEvState`.] |
-| no-effect-handler | 11 | `KPerform: no handler for effect <Spawn/Clock/NetTcp/File>` — effect ops the native walk installs no handler for (Spawn 7, Clock 2, NetTcp 1, File 1: `stream_early_stop`). |
+| unbound-register | ~1 | **Burn-down 6 closed the nested-variant payload-bearing slice** (Form B variant-slot `Node(_, Node(Red, ..), ..)` via `var_seal_variant`+`bind_slot_pattern`; Form A list-head record-field-variant `[Pair { snd: JReal(r) }]` via `lm_emit_head`). json_real ×4 now BUILD+RUN (diverge on the json-array decode bug, reclassified to regex/json). The rb-tree perceus fixtures (nested_pattern_reuse_balance, llvm_rc_nested_match, llvm_arm_top_reuse_shared, int_field_inline) now BUILD but diverge on the **reuse-token model gap** (see below). Residual: `binserialize_derive_nested` (`Some([x, y])` — a list-pattern inside a variant slot, not yet recursed). |
+| reuse-token model (rb-tree) | 4 | (reclassified from unbound-register, burn-down 6) — `nested_pattern_reuse_balance`/`llvm_rc_nested_match`/`llvm_arm_top_reuse_shared`/`int_field_inline` BUILD after the nested-variant fix but diverge (`size: 0` / SIGSEGV): the simple `KConReuse` → `kaix_reuse_or_alloc_variant` eager-decrefs slots 1:1, DOUBLE-FREEING on a non-bijective rb-tree rotation. The C oracle uses the Koka drop-reuse-token protocol; the native EMIT traps `KDropReuse`/`KFreeToken` (`nemit_unsupported`, emit_native_term.kai). The runtime forwarders exist; wiring the emit is the next lane's DESIGN-bearing work. |
+| no-effect-handler | 9 | `KPerform: no handler for effect <Spawn/NetTcp/File>` — effect ops with NO default block, so no synth handler resolves them; they need a real scheduler/syscall runtime (Spawn 7, NetTcp 1, File 1: `stream_early_stop`). **Burn-down 6 closed the Clock slice (2: date_basic/date_iso)** via `kir_synth_handler_effects` — Clock has a default block, so the synth-handler superset gives its dead-code perform a dispatch shape (byte-id failure-mode parity with C). |
 | clause-param-origin | 7 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801) and the remaining `stream_*` (`stream_abort_leak`/`stream_mock_disk`/`stream_skip_policy`) whose carrier hits the alias-dispatch clause. |
 | jwt char/hex decode | 1 | (reclassified from Call-param-mismatch) `jwt_encoder` now BUILDS + RUNS after burn-down 5 closed the namespace-collision root cause for the 5 map/fx modules; its decode diverges (char/hex, the regex/json family). |
 | crypto flaky SIGSEGV | 1 | (reclassified from missing-symbols) `crypto_hash_basic` LINKS after burn-down 5's `kaix_prelude_bit_*` shims closed bits_basic/bits_dotted; it SIGSEGVs intermittently (a flaky native memory bug). |

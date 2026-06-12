@@ -19,6 +19,8 @@
 import compiler.ast
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_lower_variant
+import compiler.kir_lower_bind
 
 # Cons/nil discrimination prims. Each is a boxed-Bool predicate over the
 # scrutinee's runtime `->tag` (the cons/nil discriminant — a list cell's
@@ -84,21 +86,130 @@ fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind 
 }
 
 # Walk the N fixed cons cells of a list arm, then close on the tail. Each
-# cell: `is_cons cur` → bind the head sub-pattern from slot 0 and recurse on
-# the tail (slot 1); mismatch → `fail_lbl`. After the fixed heads,
-# `lm_close_tail` handles nil-exactness vs the rest binder.
+# cell: `is_cons cur` → handle the head sub-pattern, then recurse on the tail
+# (slot 1). After the fixed heads, `lm_close_tail` handles nil-exactness vs
+# the rest binder. A SIMPLE head (`PBind`/`PWild`) keeps the direct
+# `KProj(cur, 0)` bind (the common case — no extra register). A NESTED head
+# (record / variant, `Pair { snd: JReal(r) }`) projects the head once, TESTS
+# its discriminating sub-patterns (mismatch → `fail_lbl`), then BINDS — the
+# head test runs BEFORE the bind (the oracle's `emit_pat_test` precedes
+# `emit_pat_binds`), so `r` only binds once `snd` is confirmed `JReal`.
 fn lm_emit_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
                  body_lbl: String, fail_lbl: String, st: LowerSt) : LowerSt / Console =
   match pats {
     [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, st)
     [hp, ...rest] -> match lm_emit_cell_test(cur, prim_is_cons(), fail_lbl, st) {
       LMArm(st1, _) -> {
-        let st2 = lm_bind_head(hp, cur, st1)
+        let st2 = lm_emit_head(hp, cur, fail_lbl, st1)
         match bind_op(st2, KProj(cur, 1), KAt(hp.line, hp.col)) { LRes(tailv, st3) ->
           lm_emit_cells(rest, opt_rest, tailv, body_lbl, fail_lbl, st3) }
       }
     }
   }
+
+# Handle one head cell. A simple binder keeps the direct slot-0 bind; a nested
+# record / variant head projects the slot once, then tests + binds it.
+fn lm_emit_head(hp: Pattern, cur: KVal, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match hp.pkind {
+    PBind(_)             -> lm_bind_head(hp, cur, st)
+    PWild                -> st
+    PHole(_)             -> st
+    _ ->
+      match bind_op(st, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st1) -> {
+        let st2 = lm_emit_head_test(hp, headv, fail_lbl, st1)
+        lm_bind_head_value(hp, headv, st2)
+      } }
+  }
+
+# Emit the discriminating test(s) for a head sub-pattern against the already-
+# projected head value `headv`, routing any mismatch to `fail_lbl`. A
+# non-discriminating head (PBind / PWild) emits no test. A nested VARIANT
+# head (`Some(x)`) tests its tag; a RECORD / VARIANT-RECORD head with a
+# discriminating field (`Pair { snd: JReal(r) }`) tests that field. The
+# success path falls straight through to the binds (the seals open a fresh
+# block each, so the cursor is positioned for the next statement). Mirror of
+# the oracle's recursive `emit_pat_test` over a list head.
+fn lm_emit_head_test(hp: Pattern, headv: KVal, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  if psub_is_discriminating(hp) {
+    match ls_fresh_label(st) { LSLabel(ok_lbl, st1) -> {
+      let st2 = lm_head_seal_test(hp, headv, ok_lbl, fail_lbl, st1)
+      reopen(st2, ok_lbl)
+    } }
+  } else { lm_head_test_fields(hp, headv, fail_lbl, st) }
+
+# A discriminating head: a nested VARIANT tests its tag (then any payload
+# sub-slots); a RECORD / VARIANT-RECORD with a discriminating field is tested
+# field-by-field. `psub_is_discriminating` already classified `hp`.
+fn lm_head_seal_test(hp: Pattern, headv: KVal, ok_lbl: String, fail_lbl: String,
+                     st: LowerSt) : LowerSt / Console = match hp.pkind {
+  PVariant(cn, _)           -> var_seal_tag_of(headv, cn, ok_lbl, fail_lbl, hp, st)
+  PVariantRecord(cn, _)     -> var_seal_tag_of(headv, cn, ok_lbl, fail_lbl, hp, st)
+  _                         -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
+}
+
+# A record-shaped head whose own tag does not discriminate (a single-ctor
+# record like `Pair`) but a FIELD does (`snd: JReal(r)`): test each
+# discriminating field by `kai_op_field_borrow` read + tag/eq test, routing a
+# miss to `fail_lbl`. A `PVariant`/`PVariantRecord` already discriminated on
+# its tag in `lm_head_seal_test`, so this only handles the plain-record /
+# variant-record FIELD tests.
+fn lm_head_test_fields(hp: Pattern, headv: KVal, fail_lbl: String,
+                       st: LowerSt) : LowerSt / Console = match hp.pkind {
+  PRecord(fields)         -> lm_field_tests(fields, headv, fail_lbl, st)
+  PVariantRecord(_, flds) -> lm_field_tests(flds, headv, fail_lbl, st)
+  _                       -> st
+}
+
+# Test each discriminating field of a record head, chaining the success
+# paths through fresh continue blocks (all must pass). A non-discriminating
+# field carries no test (its name is projected by the bind pass).
+fn lm_field_tests(fields: [PField], headv: KVal, fail_lbl: String,
+                  st: LowerSt) : LowerSt / Console = match fields {
+  [] -> st
+  [PField(fname, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) {
+      match ls_fresh_label(st) { LSLabel(cont, st1) -> {
+        let st2 = lm_field_seal_test(fname, sub, headv, cont, fail_lbl, st1)
+        lm_field_tests(rest, headv, fail_lbl, reopen(st2, cont))
+      } }
+    } else { lm_field_tests(rest, headv, fail_lbl, st) }
+}
+
+# `condbr <field test> ? cont : fail` for one discriminating record field. A
+# LITERAL field reads it borrow + `kai_eq_raw`; a VARIANT field reads it
+# borrow + `kai_tag_eq` on the ctor tag. Mirror of the record path's
+# `rec_seal_test` + the variant path's tag test, on a `kai_op_field_borrow`
+# read (non-consuming — the head is shared across the arm chain).
+fn lm_field_seal_test(fname: String, sub: Pattern, headv: KVal, ok_lbl: String,
+                      fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_op_field_borrow", [headv, KStrV(fname)]), KAt(sub.line, sub.col)) {
+    LRes(fv, st1) -> lm_field_test_on(sub, fv, ok_lbl, fail_lbl, st1) }
+
+fn lm_field_test_on(sub: Pattern, fv: KVal, ok_lbl: String, fail_lbl: String,
+                    st: LowerSt) : LowerSt / Console = match sub.pkind {
+  PLit(lit)             -> lm_field_eq(fv, lm_lit_atom(lit), ok_lbl, fail_lbl, sub, st)
+  PVariant(cn, _)       -> var_seal_tag_of(fv, cn, ok_lbl, fail_lbl, sub, st)
+  PVariantRecord(cn, _) -> var_seal_tag_of(fv, cn, ok_lbl, fail_lbl, sub, st)
+  _                     -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
+}
+
+# `condbr (kai_eq_raw fv lit) ? ok : fail` — a literal field.
+fn lm_field_eq(fv: KVal, lit: KVal, ok_lbl: String, fail_lbl: String,
+               sub: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_eq_raw", [fv, lit]), KAt(sub.line, sub.col)) { LRes(cond, st1) ->
+    ls_seal(st1, KCondBr(cond, ok_lbl, fail_lbl, KAt(sub.line, sub.col)), fail_lbl) }
+
+# The KIR atom for a literal field/head pattern (Int / Bool / Char / String /
+# Real). A non-literal is a typer-invariant violation → unit (loud divergence
+# vs the oracle, never a silent miscompile). Mirror of `var_lit_atom`.
+fn lm_lit_atom(lit: Expr) : KVal = match lit.kind {
+  EInt(n)       -> KIntV(n)
+  EBool(b)      -> KBoolV(b)
+  EChar(c)      -> KCharV(c)
+  EStr(span, _) -> KStrV(span)
+  EReal(r, _)   -> KRealV(r)
+  _             -> KUnitV
+}
 
 # After the fixed heads: a rest binder accepts any tail (bind it, branch to
 # the body); no rest binder demands the tail be `KAI_NIL` (exact length).
@@ -122,13 +233,33 @@ fn lm_emit_cell_test(cur: KVal, prim: String, fail_lbl: String, st: LowerSt) : L
     match ls_fresh_label(st1) { LSLabel(cont, st2) ->
       LMArm(reopen(ls_seal(st2, KCondBr(cond, cont, fail_lbl, KNoPos), cont), cont), cont) } }
 
-# Bind one head sub-pattern from the current cons cell's slot 0. PBind
-# aliases the head; PWild / PHole read nothing (the head slot is an alias,
-# not an owned read). Nested destructuring of a head (`[Some(x), ...]`) is
-# a later refinement — the in-scope shapes bind plain names.
+# Bind a head sub-pattern from the already-projected head value `headv`. A
+# `PBind` aliases the head; a nested RECORD / VARIANT / VARIANT-RECORD head
+# (`Pair { snd: JReal(r) }`, `Some(x)`) recurses through the shared
+# `bind_pattern_fields_any` (which binds a variant's sub-binders and a
+# record's named fields), now safe because `lm_emit_head_test` tested every
+# discriminating tag first. PWild / PHole / PLit bind nothing.
+fn lm_bind_head_value(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = match hp.pkind {
+  PBind(name)          -> lm_bind_name(name, KLitOp(headv), hp, st)
+  PAs(name, _)         -> lm_bind_head_as(hp, name, headv, st)
+  PRecord(_)           -> bind_pattern_fields_any(hp, headv, st)
+  PVariant(_, _)       -> bind_pattern_fields_any(hp, headv, st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(hp, headv, st)
+  _                    -> st
+}
+
+# The common case: a simple head binder reads slot 0 directly (`KLet name =
+# proj cur 0`), no intermediate register. PWild / PHole read nothing.
 fn lm_bind_head(hp: Pattern, cur: KVal, st: LowerSt) : LowerSt = match hp.pkind {
   PBind(name) -> lm_bind_name(name, KProj(cur, 0), hp, st)
   _           -> st
+}
+
+# An as-pattern head (`name @ inner`): bind the whole head to `name`, then
+# bind the inner pattern against the same head value.
+fn lm_bind_head_as(hp: Pattern, name: String, headv: KVal, st: LowerSt) : LowerSt / Console = {
+  let st1 = lm_bind_name(name, KLitOp(headv), hp, st)
+  lm_bind_head_value(as_inner(hp), headv, st1)
 }
 
 # Emit `KLet name = op` — a pure slot alias. Bound for every PBind / rest
