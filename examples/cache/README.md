@@ -69,3 +69,31 @@ These run in CI via `make test` (the `test-user-cache` target, also in
 
     make -C stage2 test-user-cache
     # or: for f in examples/cache/userb_*.sh; do sh "$f" || exit 1; done
+
+## Phase A.1 — core (auto-loaded stdlib) cache (issue #825)
+
+Four `corec_*.sh` fixtures pin the invalidation contract of the
+**core** post-parse cache (`<project>/.kai-cache/core-<content>.kab`,
+written by `stage2/compiler/core_cache.kai`). This is the lever that
+actually crosses the ≤150 ms cold-trivial target: a warm build
+deserialises the 12 auto-loaded core modules instead of re-lexing and
+re-parsing their 4401 LOC (the lex, not the typecheck, was the cost).
+It shares the `--user-cache` opt-in (`KAI_CACHE=1`) and the
+`.kai-cache` directory with the Phase B user cache. (Post-parse, not
+post-typecheck — see `docs/lane-experience-issue-825.md` for the
+measurement and the soundness reasoning.)
+
+- `corec_cold_warm_identical.sh` — the load-bearing positive gate:
+  emitted C is byte-identical across no-cache (oracle), cold-cache, and
+  warm-cache builds, and the cold run wrote 12 core blobs.
+- `corec_edit_core_file.sh` — edit a copied `core/list.kai` and assert
+  the build matches a fresh no-cache build of the edited stdlib (the
+  stale-core guard — serving a stale core would typecheck every program
+  against old stdlib symbols).
+- `corec_version_bump.sh` — flip a core blob's kaikai-version byte.
+- `corec_corrupt_blob.sh` — truncate a core blob past the header.
+
+Run alone with:
+
+    make -C stage2 test-core-cache
+    # or: for f in examples/cache/corec_*.sh; do sh "$f" || exit 1; done
