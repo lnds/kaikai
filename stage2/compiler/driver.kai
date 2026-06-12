@@ -29,6 +29,7 @@ import compiler.fmt_writer
 import compiler.cache
 import compiler.modules
 import compiler.user_cache
+import compiler.core_cache
 import compiler.desugar
 import compiler.region
 import compiler.infer
@@ -2000,8 +2001,82 @@ fn builtins_doc_loop(rels: [String], paths: [String],
 # effects + array, no negotiation. Mirrors load_preludes' return
 # shape so downstream callers (`PLS`, segments, module entries)
 # do not change.
-fn load_core() : Option[PreludesLoaded] / Console + File =
-  load_preludes(core_module_paths(), [], [], [], [])
+#
+# Issue #825: when `cache_on` is set (opt-in `--user-cache` under
+# `KAI_CACHE=1`) and a writable project dir is known, route the load
+# through the per-module post-parse cache (core_cache.kai). On a warm
+# build every core module deserialises from its blob instead of being
+# re-lexed and re-parsed - the lever for the sub-150ms target. When the
+# cache is off the default path is byte-for-byte unchanged: it goes
+# through the original `load_preludes` with no cache lookup.
+fn load_core(proj_dir: String, cache_on: Bool)
+             : Option[PreludesLoaded] / Console + File =
+  if cache_on and proj_dir != "" {
+    load_core_cached(core_module_paths(), proj_dir, [], [], [])
+  } else {
+    load_preludes(core_module_paths(), [], [], [], [])
+  }
+
+# Issue #825: the cached core loader. Per module: read the source,
+# try the post-parse cache (cc_lookup), and on a hit reconstruct the
+# ModuleEntry from the deserialised decls - exactly as
+# load_prelude_cached does for the legacy Phase A path. On a miss,
+# parse via load_prelude and write the resulting decls to the cache
+# (write-on-miss self-populates the blob the next build hits). The
+# accumulators mirror load_preludes so the PLS return shape and the
+# downstream cascade are identical to the non-cached path.
+fn load_core_cached(paths: [String], proj_dir: String,
+                    acc_decls: [Decl], acc_mods: [ModuleEntry],
+                    acc_segs: [PreludeSegment])
+                    : Option[PreludesLoaded] / Console + File = match paths {
+  [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
+  [p, ...rest] -> match load_core_module(p, proj_dir) {
+    None -> None
+    Some(pl) -> match pl {
+      PL(ds, me) -> {
+        let mod_name = match me { ME(m, _, _, _) -> m }
+        load_core_cached(rest, proj_dir,
+                          list_append(acc_decls, ds),
+                          list_append(acc_mods, [me]),
+                          list_append(acc_segs, [PSeg(mod_name, ds)]))
+      }
+    }
+  }
+}
+
+# Load one core module through the post-parse cache. A header-valid
+# blob whose name matches the source content hash is deserialised
+# (skipping lex+parse); any miss (absent blob, version/format drift,
+# corruption, or a content edit that changed the hash) falls back to
+# a full parse and writes the fresh blob. The decls a hit reconstructs
+# and the decls a miss parses are identical (the write stores exactly
+# load_prelude's post-parse output), so the merged stream - and the C
+# the cascade+typer emit from it - is byte-identical warm vs cold.
+fn load_core_module(path: String, proj_dir: String)
+                    : Option[PreludeLoaded] / Console + File =
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
+    Ok(src) -> match cc_lookup(proj_dir, src) {
+      CcHit(decls) -> {
+        # Reconstruct the ModuleEntry from the cached decls. The blob
+        # already holds the doc- and test-stripped, origin-tagged decls
+        # load_prelude produces, so only the export tables are rebuilt.
+        let mod_name = prelude_module_name(path)
+        let exports = collect_pub_exports(decls, [])
+        let unstable_exports = collect_unstable_exports(decls, [])
+        Some(PL(decls, ME(mod_name, exports, path, unstable_exports)))
+      }
+      CcMiss(content_hex) -> match load_prelude(path) {
+        None -> None
+        Some(pl) -> match pl {
+          PL(ds, _) -> {
+            let _w = cc_write(proj_dir, content_hex, ds)
+            Some(pl)
+          }
+        }
+      }
+    }
+  }
 
 fn load_preludes(paths: [String], caches: [String], acc_decls: [Decl],
                    acc_mods: [ModuleEntry], acc_segs: [PreludeSegment])
@@ -5561,7 +5636,10 @@ pub fn run(opts: CliOptions) : Int / Console + File {
         # `stdlib_path()`. No `--prelude` flag, no driver assistance:
         # every program receives core. To swap which stdlib feeds the
         # compiler, rebuild with a different KAI_STDLIB_PATH macro.
-        let prelude_loaded = load_core()
+        # Issue #825: the core cache lives in the same per-project
+        # .kai-cache directory the #455 user cache uses (the user
+        # file's directory), under the same `--user-cache` opt-in.
+        let prelude_loaded = load_core(dir_of(p), opts.user_cache)
         match prelude_loaded {
           None -> 1
           Some(pls) -> match pls {
