@@ -795,21 +795,26 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
     match ls_fresh_reg(st1) { LSReg(result, st2) -> {
       let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
       let st4 = ls_emit(st3, KInstall(eff, sym, initv, alias_opt, kpos_of(x)))
-      lower_handle_fork(x, body, eff, result, ret_opt, st4)
+      # A handle carrying `init` state is stateful — its return clause sees
+      # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
+      let stateful = match initv { Some(_) -> true None -> false }
+      lower_handle_fork(x, body, eff, result, stateful, ret_opt, st4)
     } } }
 }
 
 # The setjmp split: `condbr (setjmp eff) ? Ldiscard : Lbody`. Lbody runs
 # the body inline, pops, stores; Ldiscard stores the longjmp-returned
 # value; both branch to Lret, where the return clause lowers over result.
+# `stateful` (the handle carries `init` state) gates the return clause's
+# `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
 fn lower_handle_fork(x: Expr, body: Expr, eff: String, result: String,
-                     ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
+                     stateful: Bool, ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
   match bind_op(st, KSetjmp(eff), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
       let st4 = lower_handle_body(body, eff, result, lret, st3)
       let st5 = lower_handle_discard(result, lret, ldisc, st4)
-      lower_handle_ret(result, ret_opt, lret, st5)
+      lower_handle_ret(eff, result, stateful, ret_opt, lret, st5)
     } } }
 
 # Lbody: lower the body inline, store it into result, pop the evidence,
@@ -833,13 +838,20 @@ fn lower_handle_discard(result: String, lret: String, ldisc: String, st: LowerSt
 
 # Lret: apply the return clause (if any) inline over `result`, binding its
 # param to the body result; the clause body's value is the handle's
-# value. With no return clause the result passes through unchanged.
-fn lower_handle_ret(result: String, ret_opt: Option[HReturn], lret: String, st: LowerSt) : LRes / Console =
+# value. With no return clause the result passes through unchanged. A
+# STATEFUL handle's return clause body may reference `state`/`log` (the
+# handler's final state) — emit `KBindEvState(eff)` BEFORE lowering rexpr so
+# those registers resolve (mirror of emit_c's `kai_state = _ev.state` /
+# emit_llvm's GEP-load-push prologue). Stateless / no-return handles skip it.
+fn lower_handle_ret(eff: String, result: String, stateful: Bool,
+                    ret_opt: Option[HReturn], lret: String, st: LowerSt) : LRes / Console =
   match ret_opt {
     None -> LRes(KVar(result), reopen(st, lret))
     Some(HR(pname, rexpr, _, _)) -> {
-      let st1 = ls_emit(reopen(st, lret), KLet(pname, SBoxed, KLitOp(KVar(result)), KNoPos))
-      lower_expr(rexpr, st1)
+      let st0 = reopen(st, lret)
+      let st1 = if stateful { ls_emit(st0, KBindEvState(eff, KNoPos)) } else { st0 }
+      let st2 = ls_emit(st1, KLet(pname, SBoxed, KLitOp(KVar(result)), KNoPos))
+      lower_expr(rexpr, st2)
     }
   }
 
