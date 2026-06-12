@@ -1,0 +1,261 @@
+# compiler/user_cache.kai - Phase B user-file incremental cache (#455).
+#
+# Extends Phase A's KAB2 post-parse [Decl] codec (compiler.cache) to
+# *user* source files so an unchanged module is deserialised instead of
+# re-lexed and re-parsed. The deliverable is incremental multi-module
+# rebuild: editing one of N user modules re-parses only that module and
+# its transitive consumers, not the N-1 untouched modules. The codec is
+# reused verbatim from compiler.cache; this module owns the *cache key*
+# (content-addressable, with transitive dependency invalidation), the
+# hit/miss decision, and the atomic on-disk write.
+#
+# Cache key is content-addressable, NOT mtime-based (per
+# docs/cache-design.md): two checkouts with identical content hit the
+# same entry. The composite key is
+#
+#   content_hash = string_hash(source_bytes)
+#   dep_hash     = string_hash(concat of each transitive import's content_hash)
+#
+# materialised as the blob filename "<content_hex>-<dep_hex>.kab" under
+# "<project>/.kai-cache/". Any edit to a source, a direct import, or a
+# transitive import changes either content_hash or dep_hash, so the
+# filename changes and the old entry is never read - invalidation is a
+# property of the key, not an imperative sweep. Version/format drift and
+# corruption are rejected by the KAB2 header (cache_read_header), so a
+# stale blob is never deserialised into wrong decls.
+#
+# Scope boundary: this is the A.0 (post-parse) layer applied to user
+# files. It does NOT skip typechecking - the typer still runs over the
+# merged prelude++user decl stream. The cold-trivial sub-150ms target
+# lives in A.1 (post-typecheck prelude cache), a separate lane.
+#
+# string_hash is the runtime FNV-1a 64-bit digest over the raw bytes
+# (issue #373), cast to a signed Int64, so it may be negative; the hex
+# conversion below normalises the sign with arithmetic only (see the
+# note at uc_hash_hex16). The digest is not cryptographic - it only
+# needs to change when content changes, which FNV-1a guarantees for
+# any byte edit.
+
+#[doc("Bump on any change to the user-cache key derivation or blob naming so old entries miss after an upgrade. Distinct from the KAB2 codec format_version.")]
+pub fn uc_key_version() : Int = 1
+
+#[doc("The per-project cache directory name, created on first write under the project root (the root file's directory).")]
+pub fn uc_cache_dir_name() : String = ".kai-cache"
+
+# ---- hex encoding of a 64-bit hash -----------------------------------
+#
+# Bit operators (bit_and / bit_ushr) are deliberately avoided: the
+# stage1 bootstrap compiler that builds this module's bundle does not
+# know them. Nibbles are extracted with arithmetic only (% and /),
+# which stage1 supports. The result is not the canonical unsigned bit
+# pattern of the digest, but it is a deterministic, injective-per-value
+# encoding - all the cache key needs. The digest is a signed Int64
+# (string_hash casts FNV-1a's uint64 through int64_t), so the low
+# nibble uses ((h % 16) + 16) % 16 to stay in [0,15] for negatives,
+# and / 16 truncates toward zero each step; 16 steps cover the range.
+
+# One lowercase hex digit for a nibble in [0,15]. Built with
+# int_to_byte_string so the byte is exact and never routes through
+# Show for Char escaping.
+fn uc_nibble_hex(n: Int) : String {
+  let d = if n < 0 { 0 } else if n > 15 { 15 } else { n }
+  if d < 10 { int_to_byte_string(48 + d) }   # '0'..'9'
+  else { int_to_byte_string(87 + d) }        # 'a'..'f' (97 - 10)
+}
+
+# 16 lowercase hex chars (least-significant nibble last) for a 64-bit
+# hash. Deterministic across runs and machines for the same digest.
+fn uc_hash_hex16(h: Int) : String = uc_hash_hex16_loop(h, 16, "")
+
+fn uc_hash_hex16_loop(h: Int, steps: Int, acc: String) : String {
+  if steps <= 0 { acc }
+  else {
+    let nib = ((h % 16) + 16) % 16
+    let rest = h / 16
+    uc_hash_hex16_loop(rest, steps - 1, string_concat(uc_nibble_hex(nib), acc))
+  }
+}
+
+#[doc("Content hash of a source string as 16 lowercase hex chars. Changes on any single-byte edit.")]
+pub fn uc_content_hex(src: String) : String = uc_hash_hex16(string_hash(src))
+
+# ---- composite key + blob path ---------------------------------------
+
+# The 64-char source_sha field the KAB2 header validates by length. We
+# pack both halves of the composite key into it (content ++ dep ++
+# zero-padding) so the header is a second line of defense: a blob whose
+# filename was renamed onto a different key still fails this check.
+fn uc_header_sha(content_hex: String, dep_hex: String) : String =
+  concat_all([content_hex, dep_hex,
+              "00000000000000000000000000000000"])   # 32 zeros -> 64 total
+
+# Blob filename for a composite key: "<content>-<dep>.kab".
+fn uc_blob_name(content_hex: String, dep_hex: String) : String =
+  concat_all([content_hex, "-", dep_hex, ".kab"])
+
+#[doc("Absolute path of the cache blob for a root file given its content and dependency hex hashes. Lives in the project's .kai-cache directory.")]
+pub fn uc_blob_path(root_dir: String, content_hex: String, dep_hex: String) : String =
+  concat_all([root_dir, "/", uc_cache_dir_name(), "/",
+              uc_blob_name(content_hex, dep_hex)])
+
+# ---- transitive dependency hashing -----------------------------------
+
+# State threaded through the dependency walk: paths already hashed
+# (cycle + diamond dedup, mirroring the driver's ResolveState.visited)
+# and the accumulated content hashes in discovery order.
+type UcDepState = UDS([String], [String])
+#                     visited   dep_content_hexes
+
+fn uds_seen(st: UcDepState, p: String) : Bool = match st {
+  UDS(v, _) -> list_has(v, p)
+}
+
+fn uds_push(st: UcDepState, p: String, hex: String) : UcDepState = match st {
+  UDS(v, hexes) -> UDS([p, ...v], list_append(hexes, [hex]))
+}
+
+# Module paths a source imports, as dotted strings, recovered by
+# scanning the token stream rather than a full parse. tokenize is what
+# the cache exists to amortise the *parse* on top of, so dep discovery
+# must not itself parse. The scan reproduces the import grammar's path
+# shape only (TkImport then TkIdent (TkDot TkIdent)*, stopping at `as`,
+# `{`, `?`, or newline): aliases and selective lists do not change which
+# file is loaded, and `import ?hole` loads no file at all - matching how
+# process_imports treats IkHole.
+fn uc_import_paths(src: String, toks: [Token]) : [String] =
+  uc_scan_imports(src, toks, [])
+
+fn uc_scan_imports(src: String, toks: [Token], acc: [String]) : [String] = match toks {
+  [] -> list_reverse(acc)
+  [t, ...rest] -> match t.kind {
+    TkImport -> uc_scan_one_import(src, rest, acc)
+    _        -> uc_scan_imports(src, rest, acc)
+  }
+}
+
+# Continue an import scan past one `import` keyword: read the dotted
+# path, record it (unless empty), and resume scanning from the tokens
+# after the path.
+fn uc_scan_one_import(src: String, toks: [Token], acc: [String]) : [String] = {
+  let dp = uc_scan_path(src, toks, "")
+  match dp { UDP(path, after) ->
+    uc_scan_imports(src, after, if path == "" { acc } else { [path, ...acc] })
+  }
+}
+
+# A dotted path accumulated mid-scan plus the tokens left after it.
+type UcDottedPath = UDP(String, [Token])
+
+# Consume `ident (. ident)*` from the head of `toks`, building the
+# dotted path. Stops before `as` / `{` / `?` / newline / anything that
+# is not a continuing `.ident`. An `import` whose first token is not an
+# identifier (e.g. `import ?hole`) yields the empty path.
+fn uc_scan_path(src: String, toks: [Token], acc: String) : UcDottedPath = match toks {
+  [] -> UDP(acc, [])
+  [t, ...rest] -> match t.kind {
+    TkIdent -> uc_scan_path_seg(src, t, rest, acc)
+    _       -> UDP(acc, toks)
+  }
+}
+
+# Append one identifier segment to the dotted path and continue past an
+# optional `.`.
+fn uc_scan_path_seg(src: String, t: Token, rest: [Token], acc: String) : UcDottedPath = {
+  let seg = string_slice(src, t.start, t.length)
+  let next = if acc == "" { seg } else { concat_all([acc, ".", seg]) }
+  uc_scan_dot(src, rest, next)
+}
+
+# After an identifier segment: a `.` continues the path, anything else
+# ends it.
+fn uc_scan_dot(src: String, toks: [Token], acc: String) : UcDottedPath = match toks {
+  [] -> UDP(acc, [])
+  [t, ...rest] -> match t.kind {
+    TkDot -> uc_scan_path(src, rest, acc)
+    _     -> UDP(acc, toks)
+  }
+}
+
+# Hash one dependency file (and recurse into its own imports) into st.
+# Reuses find_module_file for search-path resolution and abspath for the
+# visited-set canonicalisation the driver's resolver also does, so cache
+# invalidation tracks exactly the files the compiler loads.
+fn uc_hash_dep(base_dir: String, mod_path: String,
+               search_paths: [String], st: UcDepState)
+               : UcDepState / Console + File =
+  match find_module_file(base_dir, mod_path, search_paths) {
+    CF(raw_path, opt_src) -> {
+      let abs = abspath(raw_path)
+      if uds_seen(st, abs) { st }
+      else { match opt_src {
+        # A missing dep hashes to empty but is still recorded distinct
+        # from a present one, so its later appearance reinvalidates.
+        None -> uds_push(st, abs, "")
+        Some(src) -> {
+          let st1 = uds_push(st, abs, uc_content_hex(src))
+          let imports = uc_import_paths(src, tokenize(src))
+          uc_hash_deps(dir_of(abs), imports, search_paths, st1)
+        }
+      } }
+    }
+  }
+
+fn uc_hash_deps(base_dir: String, mods: [String],
+                search_paths: [String], st: UcDepState)
+                : UcDepState / Console + File = match mods {
+  [] -> st
+  [m, ...rest] -> uc_hash_deps(base_dir, rest, search_paths,
+                                uc_hash_dep(base_dir, m, search_paths, st))
+}
+
+#[doc("Transitive dependency hash for a file: string_hash over the concatenated content hashes of every import reachable from it, in stable discovery order, as 16 hex chars. Imports are recovered by token scan, so this never parses. Changes when any transitive import changes.")]
+pub fn uc_dep_hex(root_path: String, src: String, toks: [Token],
+                  search_paths: [String]) : String / Console + File = {
+  let st = uc_hash_deps(dir_of(root_path), uc_import_paths(src, toks),
+                         search_paths, UDS([], []))
+  match st { UDS(_, hexes) ->
+    uc_hash_hex16(string_hash(concat_all(hexes)))
+  }
+}
+
+# ---- lookup + atomic write -------------------------------------------
+
+#[doc("Result of a cache lookup: a hit carries the deserialised decls; a miss carries the composite key (content_hex, dep_hex) so the caller can write the blob after parsing.")]
+pub type UcLookup
+  = UcHit([Decl])
+  | UcMiss(String, String)   # content_hex, dep_hex
+
+#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over src, dep over the imports the tokens name), reads the matching blob, and returns UcHit(decls) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise.")]
+pub fn uc_lookup(root_path: String, src: String, toks: [Token],
+                 search_paths: [String]) : UcLookup / Console + File = {
+  let content_hex = uc_content_hex(src)
+  let dep_hex = uc_dep_hex(root_path, src, toks, search_paths)
+  let blob_path = uc_blob_path(dir_of(root_path), content_hex, dep_hex)
+  match read_file(blob_path) {
+    Err(_) -> UcMiss(content_hex, dep_hex)
+    Ok(blob) -> match cache_deserialize_module(blob) {
+      None -> UcMiss(content_hex, dep_hex)
+      Some(cds) -> match cds { CDs(decls, _) -> UcHit(decls) }
+    }
+  }
+}
+
+#[doc("Write decls to the cache for the given composite key: serialise via the reused KAB2 codec and write_file the blob to its content-addressed path. The .kai-cache directory must already exist (bin/kai creates it once with mkdir -p before invoking kaic2). Any IO failure is swallowed - a cache that cannot be written is a performance loss, never a correctness one.")]
+pub fn uc_write(root_path: String, content_hex: String, dep_hex: String,
+                decls: [Decl]) : Unit / Console + File = {
+  # The stage1 bootstrap compiler that builds this bundle knows only
+  # read_file / write_file / abspath among FS prims - not file_rename,
+  # file_delete, or dir_create_dir. So directory creation and the
+  # atomic temp+rename live in bin/kai (the shell wrapper, which has
+  # mkdir -p and mv); kaic2 writes the blob to its final path directly.
+  # A content-addressed name makes a torn write self-correcting: the
+  # next build recomputes the same key, sees a header-invalid blob
+  # (uc_lookup rejects it), and overwrites. Stale data is impossible
+  # because the key changes whenever content or deps change.
+  let blob = cache_serialize_module(decls, uc_header_sha(content_hex, dep_hex))
+  let final_path = uc_blob_path(dir_of(root_path), content_hex, dep_hex)
+  match write_file(final_path, blob) {
+    Err(_) -> ()
+    Ok(_) -> ()
+  }
+}
