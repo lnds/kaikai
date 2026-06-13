@@ -55,9 +55,14 @@ pub fn nslot_tag(s: KSlot) : Int = match s {
 }
 
 # The LLVM element type for a slot tag (read back from the ctx table).
+# Tag 2 (SReal) is `f64`: a raw Real register stores/loads a `double`, NOT
+# an `i64` bit-pattern. Reading it as `i64` is exactly the `9.88131e-324`
+# corruption (an `f64` alloca read at the wrong type). `SReal` (`f64`)
+# matches `kir_dump`'s `"f64"` spelling and the C-direct oracle's raw
+# `double kair_<nm>`.
 pub fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
   if tag == 1 { native_ctx_i64t(ctx) }
-  else if tag == 2 { native_ctx_i64t(ctx) }
+  else if tag == 2 { native_ctx_f64t(ctx) }
   else if tag == 3 { native_ctx_i32t(ctx) }
   else if tag == 4 { native_ctx_i32t(ctx) }
   else { native_ctx_ptrt(ctx) }
@@ -114,7 +119,7 @@ pub fn nemit_call_boxed(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
 # the whole arm (which would `->as.i`-unbox the `ctx` Handle, breaking
 # selfhost). Each helper returns a boxed `ptr`.
 pub fn nemit_atom(ctx: Handle, v: KVal) : Handle / Console = match v {
-  KVar(n)   -> nemit_load_reg(ctx, n)
+  KVar(n)   -> nemit_load_reg_boxed(ctx, n)
   KIntV(n)  -> nemit_int_lit(ctx, n)
   KBoolV(b) -> nemit_bool_lit(ctx, nbool_to_int(b))
   KCharV(c) -> nemit_char_lit(ctx, char_to_int(c))
@@ -138,6 +143,60 @@ fn nemit_real_lit(ctx: Handle, r: Real) : Handle / Console =
 # `kaix_str(ptr)` — box a String literal via its i8* global.
 fn nemit_str_lit(ctx: Handle, s: String) : Handle / Console =
   ncall_sig1(ctx, "kaix_str", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), llvm_build_string_span(native_ctx_b(ctx), s))
+
+# Materialise an atom at a known RAW slot (`SReal`/`SBool`). A raw `f64`
+# literal becomes an `f64` const, a raw Bool literal a raw i32 0/1 — NOT a
+# boxed `kaix_real`/`kaix_bool` (the default `nemit_atom`). A `KVar` is the
+# box→raw BORDER decision: the lowering plants `KVar(nm)` uniformly, so the
+# emitter — which alone knows the register's slot — adapts. A RAW register
+# (a `let x` the unbox pass promoted, slot `SReal`/`SBool`) loads directly;
+# a BOXED register (a param the KIR keeps boxed, slot `SBoxed`) unbox-borrows
+# its payload (`kaix_real_field` reads `as.r`, no decref — the oracle's
+# `(boxed)->as.r`). Deciding the border in the emitter (where the slot is
+# known) avoids threading a raw-name set through the lowering's `LowerSt`.
+pub fn nemit_atom_raw(ctx: Handle, v: KVal, slot: KSlot) : Handle / Console = match slot {
+  SReal -> match v {
+    KRealV(r) -> llvm_const_real(native_ctx_f64t(ctx), r)
+    KVar(n)   -> nemit_load_reg_as_real(ctx, n)
+    _         -> nemit_atom(ctx, v)
+  }
+  SBool -> match v {
+    KBoolV(b) -> llvm_const_i32(native_ctx_i32t(ctx), nbool_to_int(b))
+    KVar(n)   -> nemit_load_reg_as_bool(ctx, n)
+    _         -> nemit_atom(ctx, v)
+  }
+  _ -> nemit_atom(ctx, v)
+}
+
+# Load register `n` as a raw `f64`. A raw `SReal` register loads directly;
+# a boxed register unbox-borrows its `as.r` payload (`kaix_real_field`, no
+# decref). Slot tag 2 is `SReal` (see `nslot_tag`).
+fn nemit_load_reg_as_real(ctx: Handle, n: String) : Handle / Console =
+  if native_ctx_reg_slot(ctx, n) == 2 { nemit_load_reg(ctx, n) }
+  else { ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
+
+# Load register `n` as a raw i32 boolean (0/1). A raw `SBool` register
+# (tag 3) loads directly; a boxed register unbox-borrows via `kaix_take_bool`
+# (reads `as.b` widened to i32). Slot tag 3 is `SBool`.
+fn nemit_load_reg_as_bool(ctx: Handle, n: String) : Handle / Console =
+  if native_ctx_reg_slot(ctx, n) == 3 { nemit_load_reg(ctx, n) }
+  else { ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
+
+# Load register `n` in BOXED position — the symmetric border to
+# `nemit_load_reg_as_real`/`_bool`. A boxed register loads directly (a
+# `ptr`); a RAW register (`SReal` f64 / `SBool` i32, a binder the unbox
+# pass promoted) BOXES on read (`kaix_real(f64)` / `kaix_bool(i32)`) so a
+# boxed consumer (a call arg, a `kaix_and`, a `condbr`'s `kaix_truthy`) gets
+# the `ptr` it expects. The lowering plants `KVar(n)` uniformly; the
+# emitter — which alone knows the register's slot — adapts both directions,
+# keeping a raw-name set out of the lowering's `LowerSt`. Mirror of the
+# oracle's `box_wrap` at a boxed use of a raw binder.
+fn nemit_load_reg_boxed(ctx: Handle, n: String) : Handle / Console = {
+  let slot = native_ctx_reg_slot(ctx, n)
+  if slot == 2 { ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), nemit_load_reg(ctx, n)) }
+  else if slot == 3 { ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_load_reg(ctx, n)) }
+  else { nemit_load_reg(ctx, n) }
+}
 
 # Boxed call over 0 / 1 arg, building + freeing the C buffer (handles
 # never ride a kaikai list). `nemit_call_boxed` does NOT free its buffer
