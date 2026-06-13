@@ -1,20 +1,26 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-12, after char/hex decode):**
+> **Status (2026-06-13, after char/hex decode + np-handlers):**
 > the in-process libLLVM native backend (`--backend=native`,
 > docs/kir-design.md §7.2) is at **65 listed gaps** on the ratchet after the
 > char/hex-decode lane closed 2 (67 → 65): `kai_llvm_build_string_span`
 > (stage2/runtime.h) now decodes string-literal escapes C99-exactly (it
 > previously dropped `\a \b \f \v`, hex `\xHH`, and octal `\ooo`, corrupting
 > the JSON byte-table and every literal carrying such an escape), closing
-> `hex_escape_literal` + `json_surrogate_decode`. Before that, burn-down 6
-> closed 14 (81 → 67): the Clock dead-code slice (+ the
-> actor/Spawn/NetTcp dispatch shape the synth-handler superset resolved), the
-> nested-variant Form B/A unbound-register slice, and the EBang transversal
-> node. The flip to native-default (Lane 1.5) remains **BLOCKED** on the
+> `hex_escape_literal` + `json_surrogate_decode`. The np-handlers lane then
+> closed the **no-effect-handler family entirely** (no net baseline change —
+> its one residual baseline fixture, `stream_early_stop`, is blocked by a
+> SECOND cause, pipe-lowering): it extended the synth-handler superset to
+> no-default-block effects (`ReadFault`/File/Spawn performed in dead code),
+> eliminating the last whole-corpus `no handler for effect` build abort.
+> Before those, burn-down 6 closed 14 (81 → 67): the Clock dead-code slice
+> (+ the actor/Spawn/NetTcp dispatch shape the synth-handler superset
+> resolved), the nested-variant Form B/A unbound-register slice, and the
+> EBang transversal node. The flip to native-default (Lane 1.5) remains
+> **BLOCKED** on the
 > residue (now mostly DESIGN-bearing: json/regex array-decode, rb-tree
-> reuse-token model, the remaining File/stream handlers, pipe-lowering,
-> Real box/unbox, clause-param-origin). This file is the burn-down input:
+> reuse-token model, pipe-lowering, Real box/unbox, clause-param-origin).
+> This file is the burn-down input:
 > every failing fixture, grouped by root-cause family. The anti-regression
 > ratchet that locks the count is `tools/native-parity-baseline.txt` (gated
 > in `tier1-native`). NOTE: the 14 removed are deterministic macOS closes;
@@ -106,7 +112,7 @@ fixtures surfaced their masked runtime bug.
 | exit-code-mismatch / SIGSEGV / timeout | 22 | `c=0, native=1/124/138/139`. Sub-causes: `nat=1` panics (hashmap/hashset `Hash:hash` proto-dispatch todo, math_real `-`/`^`, regex parse `unterminated character class`, `requires violated`), `nat=139` SIGSEGV (quicksort×2, deep recursion, attr_unstable), `nat=124` timeout (spiral, m7b_15/m8_12 nested-alias, multi_var_state), `nat=138` (issue_668 map-in-fiber). Includes the Linux-only `list_helpers`/`list_zip3_scan`. |
 | unbound-register | ~1 | **Burn-down 6 closed the nested-variant payload-bearing slice** (Form B variant-slot `Node(_, Node(Red, ..), ..)` via `var_seal_variant`+`bind_slot_pattern`; Form A list-head record-field-variant `[Pair { snd: JReal(r) }]` via `lm_emit_head`). json_real ×4 now BUILD+RUN (diverge on the json-array decode bug, reclassified to regex/json). The rb-tree perceus fixtures (nested_pattern_reuse_balance, llvm_rc_nested_match, llvm_arm_top_reuse_shared, int_field_inline) now BUILD but diverge on the **reuse-token model gap** (see below). Residual: `binserialize_derive_nested` (`Some([x, y])` — a list-pattern inside a variant slot, not yet recursed). |
 | reuse-token model (rb-tree) | 4 | (reclassified from unbound-register, burn-down 6) — `nested_pattern_reuse_balance`/`llvm_rc_nested_match`/`llvm_arm_top_reuse_shared`/`int_field_inline` BUILD after the nested-variant fix but diverge (`size: 0` / SIGSEGV): the simple `KConReuse` → `kaix_reuse_or_alloc_variant` eager-decrefs slots 1:1, DOUBLE-FREEING on a non-bijective rb-tree rotation. The C oracle uses the Koka drop-reuse-token protocol; the native EMIT traps `KDropReuse`/`KFreeToken` (`nemit_unsupported`, emit_native_term.kai). The runtime forwarders exist; wiring the emit is the next lane's DESIGN-bearing work. |
-| no-effect-handler | 9 | `KPerform: no handler for effect <Spawn/NetTcp/File>` — effect ops with NO default block, so no synth handler resolves them; they need a real scheduler/syscall runtime (Spawn 7, NetTcp 1, File 1: `stream_early_stop`). **Burn-down 6 closed the Clock slice (2: date_basic/date_iso)** via `kir_synth_handler_effects` — Clock has a default block, so the synth-handler superset gives its dead-code perform a dispatch shape (byte-id failure-mode parity with C). |
+| no-effect-handler | 0 | **CLOSED (burn-down 6 + np-handlers).** Burn-down 6 closed the Spawn/Clock/NetTcp slice (actors/mailbox/http_server/date) — those effects carry a default block, so the synth-handler superset (`kir_synth_handler_effects`) gave their dead-code perform a dispatch shape. The np-handlers lane closed the last residual: `ReadFault` (NO default block, dragged into a `from_list`-only stream program via `stdlib/stream.kai`'s dead `pump_lines : … / File + ReadFault`) — `kir_synth_handler_effects` now iterates DECLARED effects (not `install_order`) and synthesises an op→field-index map straight from the `effect` decl for a no-default-block effect, so the dead `KPerform` lowers to the C-direct dispatch shape instead of aborting the build. The whole-corpus no-handler abort count is now 0. `stream_early_stop` itself stays a gap, RECLASSIFIED to **pipe-lowering** (its `|?`/`|`/`|>` lower to no-op unit → `count=0`); the handler abort that masked it is gone. |
 | clause-param-origin | 7 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801) and the remaining `stream_*` (`stream_abort_leak`/`stream_mock_disk`/`stream_skip_policy`) whose carrier hits the alias-dispatch clause. |
 | jwt char/hex decode | 1 | (reclassified from Call-param-mismatch) `jwt_encoder` now BUILDS + RUNS after burn-down 5 closed the namespace-collision root cause for the 5 map/fx modules; its decode diverges (char/hex, the regex/json family). |
 | crypto flaky SIGSEGV | 1 | (reclassified from missing-symbols) `crypto_hash_basic` LINKS after burn-down 5's `kaix_prelude_bit_*` shims closed bits_basic/bits_dotted; it SIGSEGVs intermittently (a flaky native memory bug). |
@@ -230,7 +236,13 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
   not match function signature!` — one root cause: a generated call passes an
   operand whose LLVM type disagrees with the callee. Likely a monomorph /
   boxing shape (Map's comparator closure?) the native walk types wrong.
-- **pipe-lowering** (euler1, fizzbuzz×2, capture, imc). `EPipe` is NOT
+- **pipe-lowering** (euler1, fizzbuzz×2, capture, imc, `stream_early_stop`).
+  `stream_early_stop` joined this family from no-effect-handler: once the
+  np-handlers lane stopped the dead-`ReadFault`-perform build abort, the
+  fixture builds + runs but prints `count=0` — `from_list(...) |> count`
+  pipes through `EPipe`/`|?`/`|`, all of which lower to no-op unit, so the
+  carrier is never driven. `count(from_list(...))` (no pipe) is correct.
+  `EPipe` is NOT
   desugared to `ECall` by any pre-codegen pass: the typer (`infer.kai`
   `synth_pipe`) rebuilds `EPipe(lhs, ECall(f, args))`, leaving each emitter
   its own pipe desugaring (emit_c has `emit_pipe_expr`). The native KIR
@@ -253,15 +265,19 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
   type-mismatch; the base reaches `kaix_pow_int` boxed wrong.
 - **stream effect handlers** (#801 — 4 `stream_*` + `demos/wc.kai`). The
   lazy `Stream` line-IO carrier performs `File` / `ReadFault` ops the
-  native walk installs no handler for. Same no-effect-handler subset as
-  Spawn/Clock/NetTcp.
+  native walk installs no handler for. The np-handlers lane closed the
+  no-default-block ABORT half of this (the build no longer aborts on a dead
+  `ReadFault` perform); what remains is the per-fixture divergence: the
+  `stream_*` carriers reach the **clause-param-origin** subset, and
+  `stream_early_stop` reaches **pipe-lowering** (`count=0`).
 - **nested-variant-test unbound-register** (json `r`/`n`, binserialize
   nested, writer-state) — carried over from burn-down 1's follow-ups; a
   nested variant/list sub-pattern in a match arm needs a tag/length TEST
   in the decision tree (oracle = emit_c's `emit_pat_test_list`).
-- **no-effect-handler** (Spawn / Clock / NetTcp), **clause-param-origin**,
-  **missing-symbols** (bits / crypto), **build-failed-other** (regex /
-  json / map / http modules) — each its own subset, as before.
+- **clause-param-origin**, **missing-symbols** (bits / crypto),
+  **build-failed-other** (regex / json / map / http modules) — each its own
+  subset, as before. (**no-effect-handler is CLOSED** — burn-down 6 +
+  np-handlers; see the family table above.)
 
 ## Failing fixtures by family
 
@@ -325,18 +341,14 @@ examples/stdlib/json_real_decimal.kai
 examples/stdlib/json_real_int_regression.kai
 examples/stdlib/json_real_negative.kai
 examples/stdlib/json_real_scientific.kai
-# no-effect-handler — Spawn 7 / Clock 2 / NetTcp 1 / File 1 (11)
-examples/actors/dual_actor_receive_only.kai
-examples/actors/dual_actor_request_reply.kai
-examples/actors/dual_actor_send_only.kai
-examples/effects/m8_7_actor_self_send.kai
-examples/effects/m8_8_mailbox_drop_newest.kai
-examples/effects/m8_8_mailbox_drop_oldest.kai
-examples/effects/stream_early_stop.kai
-examples/llvm/nested_lambda_with_mailbox.kai
-examples/stdlib/date_basic.kai
-examples/stdlib/date_iso.kai
-examples/stdlib/http_server_book_ch17.kai
+# no-effect-handler — CLOSED (burn-down 6 + np-handlers). The Spawn/Clock/
+# NetTcp slice (dual_actor ×3, m8_7_actor_self_send, m8_8_mailbox ×2,
+# nested_lambda_with_mailbox, date_basic, date_iso, http_server_book_ch17)
+# all pass parity after burn-down 6's synth-handler superset; np-handlers
+# extended that superset to no-default-block effects, closing the last
+# whole-corpus no-handler abort (ReadFault). `stream_early_stop` is the only
+# residual fixture and is now listed under pipe-lowering (its `count=0` is
+# the EPipe→unit gap, not a missing handler).
 # clause-param-origin — subset-2b alias dispatch (7)
 examples/effects/ctor_field_effect_row.kai
 examples/effects/net_dns_resolve.kai
