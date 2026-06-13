@@ -1,45 +1,32 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-13, after the Real box/unbox lane):**
+> **Status (2026-06-13, re-measured against main after the parallel-lane merges):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **60 listed gaps** on the ratchet after the
-> Real box/unbox lane closed 5 (65 → 60): the KIR is now MODE-SLAVE to the
-> unbox pass for Real — a `MUnboxed` Real lowers to a raw `f64` register +
-> native `fadd`/`fmul`/`fcmp` (`kir_lower_raw.kai`), boxing only at the
-> raw↔boxed border, so the multi-use-Real double-free (`9.88131e-324`) is
-> structurally impossible. Closed unbox_bench_real / unbox_phase2_cond_real
-> / complex_basic / complex_heterogeneous + the `^`-on-Real fixture
-> math_real_basic. Prior: the char/hex-decode lane closed 2 (67 → 65)
-> (`kai_llvm_build_string_span` now decodes string-literal escapes
-> C99-exactly, closing `hex_escape_literal` + `json_surrogate_decode`); the
-> np-handlers lane then closed the no-effect-handler family entirely (no net
-> baseline change — its residual fixture `stream_early_stop` is blocked by a
-> second cause, pipe-lowering) by extending the synth-handler superset to
-> no-default-block effects in dead code; and burn-down 6 closed 14 (81 → 67).
-> The flip to native-default (Lane 1.5) remains **BLOCKED** on the residue
-> (now mostly DESIGN-bearing: json/regex array-decode, rb-tree reuse-token
-> model, the remaining File/stream handlers, pipe-lowering,
-> clause-param-origin). This file is the burn-down input:
-> every failing fixture, grouped by root-cause family. The anti-regression
-> ratchet that locks the count is `tools/native-parity-baseline.txt` (gated
-> in `tier1-native`). NOTE: the 14 removed are deterministic macOS closes;
-> `list_helpers`/`list_zip3_scan` stay listed (macOS-pass/Linux-SIGSEGV), so
-> the Linux/CI count may differ by the handful that need Linux re-validation.
-> **Status (2026-06-13, after burn-down 7 / `np-crash`):**
-> the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **51 listed gaps** on the ratchet after
-> burn-down 7 closed 14 (65 → 51), TWO mechanical root causes in the KIR
-> lowering — see `docs/lane-experience-np-crash.md`. (Two preceding lanes
-> took the ratchet to 65: `np-decode` closed 2, 67 → 65
-> (`kai_llvm_build_string_span` now decodes string-literal escapes
-> C99-exactly, closing `hex_escape_literal` + `json_surrogate_decode`); and
-> `np-handlers` closed the **no-effect-handler family entirely** with no net
-> baseline change — it extended the synth-handler superset to
-> no-default-block effects (`ReadFault`/File/Spawn performed in dead code),
-> eliminating the last whole-corpus `no handler for effect` build abort; its
-> one residual baseline fixture, `stream_early_stop`, is blocked by a SECOND
-> cause, pipe-lowering. All three lanes are disjoint from burn-down 7's
-> pipe/guard set.)
+> docs/kir-design.md §7.2) is at **65 listed gaps** — 63 measured failing on
+> macOS by `tools/test-backend-parity.sh` (native vs C-direct: pass=399
+> fail=63 skip=55) plus the 2 Linux-only SIGSEGV gaps (`list_helpers`,
+> `list_zip3_scan`) that pass on macOS but fail on Linux/CI, so they stay
+> listed.
+>
+> **Bookkeeping correction.** Four burn-down lanes (np-handlers, np-real,
+> np-decode, np-crash) ran in parallel and were merged resolving baseline
+> conflicts by "accept both sides". That left the ratchet and this doc
+> claiming numbers (46 in the file, 60 and 51 in two stacked status blocks)
+> that did not match reality: 19 fixtures still failing had been dropped from
+> the baseline, because each lane removed *its* closed fixtures and the
+> merges union'd the removals without re-checking. Re-measured from the live
+> corpus and the baseline rebuilt to the 63 real macOS failures + the 2
+> Linux-only — purely additive vs the corrupted file (no dead entries; the
+> "closes" some lanes narrated for collatz/euler1/fizzbuzz/imc/quicksort/wc
+> and the Real/complex fixtures did not survive to main). The per-lane
+> narratives below are kept as *attempted* root-cause analysis, not as
+> confirmed-closed state — trust the baseline file and a fresh parity run,
+> not the prose.
+>
+> The flip to native-default (Lane 1.5) remains **BLOCKED** on these 65.
+> This file is the burn-down input: every failing fixture, grouped by
+> root-cause family. The anti-regression ratchet that locks the count is
+> `tools/native-parity-baseline.txt` (gated in `tier1-native`).
 >   - **pipe-lowering** (`EPipe` → unit). `lower_pipe` (kir_lower_walk.kai)
 >     rewrites `lhs |> rhs` to the equivalent `ECall` with `lhs` spliced in
 >     as the first arg, then delegates to `lower_call` — the exact desugar
@@ -186,7 +173,7 @@
 > Reproduce: `TARGET_BACKEND=native ORACLE_BACKEND=c tools/test-backend-parity.sh`
 > (needs a kaic2 built with libLLVM — `make -C stage2 KAI_LLVM=1`).
 
-## Root-cause families (82 remaining)
+## Root-cause families
 
 The counts below are re-measured post-burn-down-3 by build/run signature
 (`Duplicate integer as switch case` is now **0**). The `output-mismatch`
