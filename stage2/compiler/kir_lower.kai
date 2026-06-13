@@ -579,27 +579,63 @@ fn kir_default_handlers_loop(order: [String], main_row: [String],
     } else { kir_default_handlers_loop(rest, main_row, decls) }
 }
 
-# Resolve EVERY effect in `install_order` that carries a default block to
-# its `KDefault`, WITHOUT the `main_row` filter — a deliberate SUPERSET of
-# `kir_default_handlers`. The native backend emits a body for every fn,
-# so a dead fn's `KPerform <eff>` (e.g. `today : Date / Clock`, never
-# called from a Clock-free main) needs a synth `KHandlerDecl` for its op
-# field index, or `nemit_perform` aborts the build. The actual handler
-# resolves from the evidence stack at runtime (the C-direct oracle never
-# aborts; it null-derefs only if the dead fn runs — it does not). This set
-# feeds ONLY `ndef_synth_handlers` (dispatch shape); `kir_default_handlers`
-# stays the install/teardown set (LIFO push/pop). An effect with no default
-# block (Spawn / File / NetTcp) still drops out via `kir_default_for_effect`,
-# so it keeps aborting loud — those need a real runtime handler.
+# Synthesise a `KDefault` (op→field-index map) for EVERY effect DECLARED in
+# the program — a deliberate SUPERSET of `kir_default_handlers`. The native
+# backend emits a body for every fn, so a dead fn's `KPerform <eff>` needs a
+# synth `KHandlerDecl` for its op field index, or `nemit_perform` aborts the
+# build. The actual handler resolves from the evidence stack at runtime (the
+# C-direct oracle never aborts; it null-derefs only if the dead fn runs — it
+# does not). This set feeds ONLY `ndef_synth_handlers` (dispatch shape);
+# `kir_default_handlers` stays the install/teardown set (LIFO push/pop).
+#
+# Two shapes of dead-code perform reach here:
+#   - `today : Date / Clock`, never called from a Clock-free main. `Clock`
+#     carries a `default { }` block, so its `KDefault` is the default-op map.
+#   - `pump_lines : … / File + ReadFault`, dragged into a stream program
+#     that only calls `from_list`/`take`/`count`. `ReadFault` has NO default
+#     block, so we synthesise its op→field map straight from the `effect`
+#     decl (op names in declaration order = the Ev field offset, identical to
+#     the C-direct `Ev<eff>` struct layout). The recorded thunk symbol is
+#     never called — `nemit_perform` reads only the field index — so a
+#     never-installed effect is inert; the field map merely lets the build
+#     emit the dead `KPerform` as the oracle does. This drives `from_list`-
+#     only stream programs (`stream_early_stop`) and any dead File/Net perform
+#     to C-direct byte-id parity. Iterating DECLARED effects (not
+#     `install_order`, which is builtins ∪ main_row only) is what reaches a
+#     non-main-row effect like `ReadFault`.
 pub fn kir_synth_handler_effects(decls: [Decl]) : [KDefault] =
-  kir_synth_handlers_loop(kir_install_order(decls), decls)
+  kir_synth_handlers_loop(decls, decls)
 
-fn kir_synth_handlers_loop(order: [String], decls: [Decl]) : [KDefault] = match order {
+fn kir_synth_handlers_loop(rem: [Decl], decls: [Decl]) : [KDefault] = match rem {
   [] -> []
-  [eff, ...rest] -> match kir_default_for_effect(eff, decls) {
-    None    -> kir_synth_handlers_loop(rest, decls)
-    Some(d) -> [d, ...kir_synth_handlers_loop(rest, decls)]
+  [d, ...rest] -> match d {
+    DEffect(_, eff, _, ops, defblk, _, _) ->
+      [kir_synth_default_for_effect(eff, ops, defblk),
+       ...kir_synth_handlers_loop(rest, decls)]
+    _ -> kir_synth_handlers_loop(rest, decls)
   }
+}
+
+# The synth `KDefault` for one declared effect: its default-block op→symbol
+# map when a `default { }` block exists (the `$extern_handler` forwarders),
+# else the op names straight from the `effect` decl (no default block —
+# `ReadFault`/`File`/`Spawn`). The per-op symbol is a placeholder
+# (`kaix_synth_<eff>_<op>`) the runtime never invokes: a synth handler is
+# the field-index map for a dead-code perform, never an installed handler.
+fn kir_synth_default_for_effect(eff: String, ops: [EffectOp],
+                                defblk: Option[DefaultBlock]) : KDefault =
+  match defblk {
+    Some(DBlk(clauses, _, _, _)) -> KDef(eff, kir_default_ops(clauses))
+    None                         -> KDef(eff, kir_synth_ops(eff, ops))
+  }
+
+# Op→placeholder-symbol pairs in declaration order (the field offset). The
+# symbol is inert (never called); the position is the load-bearing datum.
+fn kir_synth_ops(eff: String, ops: [EffectOp]) : [KDefOp] = match ops {
+  [] -> []
+  [EOp(op_name, _, _, _, _, _), ...rest] ->
+    [KDOp(op_name, string_concat("kaix_synth_", string_concat(eff,
+       string_concat("_", op_name)))), ...kir_synth_ops(eff, rest)]
 }
 
 # --- Diagnostics --------------------------------------------------------
