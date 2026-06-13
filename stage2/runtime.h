@@ -11799,6 +11799,66 @@ static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *i32ty) {
     LLVMValueRef zero = LLVMConstInt((LLVMTypeRef) i32ty, 0, 0);
     return (void *) LLVMBuildICmp((LLVMBuilderRef) b, LLVMIntNE, (LLVMValueRef) v, zero, "");
 }
+/* Raw `double` arithmetic for the unboxed-Real path (KIR mode-slave to the
+ * unbox pass). `op` selects the operator: 0=`fadd`, 1=`fsub`, 2=`fmul`,
+ * 3=`fdiv` — matching the C-direct oracle's `kair_a + kair_b` on a raw
+ * `double`. Operands + result are `f64` LLVM values, NOT boxed Reals: no
+ * RC, no `kaix_mul` consume, so the use-after-free the boxed path hit on a
+ * multi-use raw operand cannot arise. */
+static void *kai_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    switch (op) {
+        case 0:  return (void *) LLVMBuildFAdd(bld, la, lc, "");
+        case 1:  return (void *) LLVMBuildFSub(bld, la, lc, "");
+        case 2:  return (void *) LLVMBuildFMul(bld, la, lc, "");
+        default: return (void *) LLVMBuildFDiv(bld, la, lc, "");
+    }
+}
+/* Raw `double` ordered comparison → an `i1`. `pred` selects the predicate:
+ * 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — the ordered (`O*`) family,
+ * matching the C `<`/`==` on a raw `double` (NaN compares false, as C does).
+ * The result is the `i1` a `condbr` consumes directly, or the caller boxes
+ * via `kaix_bool` at a raw→boxed border. */
+static void *kai_llvm_build_fcmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMRealPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMRealOLT; break;
+        case 1:  p = LLVMRealOGT; break;
+        case 2:  p = LLVMRealOLE; break;
+        case 3:  p = LLVMRealOGE; break;
+        case 4:  p = LLVMRealOEQ; break;
+        default: p = LLVMRealONE; break;
+    }
+    return (void *) LLVMBuildFCmp(bld, p, la, lc, "");
+}
+/* Negate a raw `double` (`-x`) — the unary-minus raw form (`(-kair_x)`). */
+static void *kai_llvm_build_fneg(void *b, void *a) {
+    return (void *) LLVMBuildFNeg((LLVMBuilderRef) b, (LLVMValueRef) a, "");
+}
+/* Raw `i1` short-circuit boolean (`a && c` / `a || c`) for the unboxed-Bool
+ * path. `op`: 1=and, 0=or. Both operands are already evaluated (the unbox
+ * pass only marks the node raw when both children are raw), so a STRICT
+ * bitwise `and`/`or` on two `i1` values reproduces the C `&&`/`||` result —
+ * the oracle's raw `int` logical. */
+static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    return op ? (void *) LLVMBuildAnd(bld, la, lc, "")
+              : (void *) LLVMBuildOr(bld, la, lc, "");
+}
+/* Logical NOT of a raw `i1` (`!x`). */
+static void *kai_llvm_build_lnot(void *b, void *a) {
+    return (void *) LLVMBuildNot((LLVMBuilderRef) b, (LLVMValueRef) a, "");
+}
+/* Widen an `i1` (an `fcmp`/`icmp` result) to the `i32` a `kaix_bool` box
+ * takes (its param is `i32` 0/1). Mirror of how the C-direct oracle's raw
+ * bool (`0`/`1`) feeds `kai_bool`. */
+static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) {
+    return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) i32ty, "");
+}
 
 /* --- constants + globals --- */
 static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
@@ -12048,6 +12108,12 @@ static void *kai_native_ctx_i32t(void *c) { (void) c; return kai_llvm_native_una
 static void *kai_native_ctx_voidt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_f64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_const_real(void *t, double d) { (void) t; (void) d; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fcmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fneg(void *b, void *a) { (void) b; (void) a; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_lnot(void *b, void *a) { (void) b; (void) a; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_fnval(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }

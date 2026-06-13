@@ -691,6 +691,21 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
 KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
 KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
 
+/* Raw-Real box/unbox borders for the unboxed-Real native path (KIR
+   mode-slave to the unbox pass). `kaix_real` (above) is the raw→boxed box.
+   `kaix_real_field` is the box→raw BORROW: read the `double` payload of a
+   boxed Real WITHOUT decref'ing it, mirroring the C-direct oracle's bare
+   `(boxed)->as.r` in `unbox_boxed_scalar` (the box stays live for its
+   owner's later drop). `kaix_take_real` is the box→raw CONSUME (last use):
+   read the payload and decref, mirroring `kai_take_real`. The lowering
+   picks borrow vs take from perceus's ownership verdict, exactly as the C
+   oracle does. */
+double kaix_real_field(KaiValue *v) { return v->as.r; }
+double kaix_take_real(KaiValue *v)  { return kai_take_real(v); }
+/* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
+   the box→raw border for a boxed Bool reaching the raw i1 path. */
+int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
+
 /* ---------- m13: bit operations (compiler intrinsics) ----------
    The C-direct oracle (emit_c.kai) lowers each `bit_*` call INLINE to
    the matching C operator. The native backend routes a prelude callee
