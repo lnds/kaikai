@@ -18,6 +18,7 @@ import compiler.emit_shared
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_lower_raw
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
@@ -33,7 +34,27 @@ import compiler.kir_lower_variant
 # within the size cap. This module is the Expr-SCC: the mutual recursion
 # `lower_expr ↔ lower_call ↔ lower_if/match/handle/list/...`.
 
-pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
+# Lower an expression in BOXED position (the default — every value-bearing
+# slot a call/record/list/return wants is a boxed `ptr`). MODE-SLAVE to the
+# unbox pass (asu, Camino A): a `MUnboxed` Real node is a raw `f64` in a
+# boxed context, so lower it RAW (`lower_expr_raw`) and BOX at the border
+# (`real.box` → `kaix_real`). The boxed `KLet` carries `SBoxed`, identical
+# to the oracle's `box_wrap(x.ty, raw)`. Int/Bool/Char `MUnboxed` nodes are
+# NOT raw-promoted (see kir_lower_raw SCOPE) — they fall straight to the
+# boxed dispatch, where the tagged-immediate cache masks the RC the raw
+# path would otherwise have to manage. Non-`MUnboxed` nodes (the boxed
+# families other lanes own) never enter the raw branch: purely additive.
+pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console =
+  if kir_node_is_raw(x) {
+    match lower_expr_raw(x, st) {
+      LRes(rawv, st1) -> bind_op(st1, KPrim(kir_raw_box_prim(x.ty), [rawv]), kpos_of(x))
+    }
+  } else { lower_expr_boxed(x, st) }
+
+# The boxed-position dispatch (the original `lower_expr` body). Reached
+# either directly (non-raw node) or as the boxed fallback inside the raw
+# path (`lower_expr_raw`'s box→raw border lowers boxed here then unboxes).
+fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # Atoms: no statement, the literal IS the value.
   EInt(n)            -> LRes(KIntV(n), st)
   EReal(r, _)           -> LRes(KRealV(r), st)
@@ -171,6 +192,85 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
                      " at ", int_to_string(x.line), ":", int_to_string(x.col)]))
   LRes(KUnitV, st)
 }
+
+# --- raw (unboxed) Real lowering (asu, Camino A) -----------------------
+#
+# Lower `x` in RAW position: the result is a raw `f64` value (an `SReal`
+# register or a `KRealV` literal the emitter materialises with
+# `llvm_const_real`), NOT a boxed `ptr`. Mirror of the C-direct oracle's
+# `emit_expr_raw` / `emit_kind_raw`, restricted to Real (kir_lower_raw
+# SCOPE). Two cases by `.mode`:
+#   - `MUnboxed` node → it IS a natively-raw form (literal / raw EVar / raw
+#     arith / raw cmp / raw neg): emit the raw op directly, no boxing.
+#   - any other node in raw position → a BOXED value read raw (the box→raw
+#     border, e.g. `self.re` field access): lower boxed then unbox-borrow
+#     (`real.unbox` → `kaix_real_field`, non-consuming, the oracle's bare
+#     `(boxed)->as.r`).
+# The mutual recursion `lower_expr ↔ lower_expr_raw` is why this lives in
+# the Expr-SCC (not the pure `kir_lower_raw` helper module).
+fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console =
+  match x.mode {
+    MUnboxed -> lower_expr_raw_kind(x, st)
+    _        -> lower_real_unbox_border(x, st)
+  }
+
+# A boxed Real read in raw position: lower it boxed, then unbox-borrow the
+# `f64` payload (`real.unbox`). NON-consuming — the box stays owned by its
+# binding for the normal drop, exactly like the oracle's `(boxed)->as.r`.
+fn lower_real_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
+  match lower_expr_boxed(x, st) {
+    LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x))
+  }
+
+# The natively-raw forms (the `MUnboxed` kinds the unbox pass produces).
+# Arithmetic / neg yield `SReal`; comparison / logical yield `SBool`.
+# Anything else falls back to the box→raw border (a defensive unbox of its
+# boxed form) — never a silent miscompile.
+fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
+  EReal(r, _) -> LRes(KRealV(r), st)
+  EBool(b)    -> LRes(KBoolV(b), st)
+  EVar(name)  -> lower_var(name, st)
+  ELitUnit(inner, _) -> lower_expr_raw(inner, st)
+  EBinop(op, a, b) ->
+    if kir_op_is_raw_freal_arith(op) { lower_raw_binop(x, kir_raw_arith_prim(op), SReal, a, b, st) }
+    else if kir_op_is_raw_cmp(op) { lower_raw_binop(x, kir_raw_cmp_prim(op), SBool, a, b, st) }
+    else if kir_op_is_raw_logical(op) { lower_raw_binop(x, kir_raw_logical_prim(op), SBool, a, b, st) }
+    else { lower_real_unbox_border(x, st) }
+  EUnop(op, a) ->
+    if op == "-" {
+      match lower_expr_raw(a, st) {
+        LRes(av, st1) -> bind_op_slot(st1, KPrim("fneg", [av]), SReal, kpos_of(x))
+      }
+    } else if op == "not" {
+      match lower_expr_raw(a, st) {
+        LRes(av, st1) -> bind_op_slot(st1, KPrim("bnot", [av]), SBool, kpos_of(x))
+      }
+    } else { lower_real_unbox_border(x, st) }
+  # A single-tail block transparently wraps its raw tail (no preceding
+  # statements). A multi-statement block, or any other shape, is not a
+  # natively-raw form: lower it boxed then unbox-borrow at the border.
+  EBlock(stmts, tail) ->
+    match stmts {
+      [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_real_unbox_border(x, st) }
+      _  -> lower_real_unbox_border(x, st)
+    }
+  # The guard (`kir_node_is_raw`) only admits the FORMS above, so this arm is
+  # reached only via internal recursion on a sub-operand the unbox pass left
+  # boxed — lower it boxed and unbox-borrow its f64 (the box→raw border).
+  _ -> lower_real_unbox_border(x, st)
+}
+
+# `a <op> b` raw binary op → one native instruction over two raw operands.
+# Both operands lower raw (recursing through `lower_expr_raw`); the result
+# register carries `slot` (SReal for arith, SBool for cmp/logical). No
+# boxed `kaix_*` consume, so a multi-use operand never double-frees (the
+# family's root bug).
+fn lower_raw_binop(x: Expr, prim: String, slot: KSlot, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
+  match lower_expr_raw(a, st) { LRes(av, st1) ->
+    match lower_expr_raw(b, st1) { LRes(bv, st2) ->
+      bind_op_slot(st2, KPrim(prim, [av, bv]), slot, kpos_of(x))
+    }
+  }
 
 # An `EVar` in value position resolves through the SAME cascade the
 # C-direct oracle's `emit_ident_value` / const arm walks (and emit_llvm's
@@ -369,8 +469,20 @@ fn lower_stmts(stmts: [Stmt], st: LowerSt) : LowerSt / Console = match stmts {
 }
 
 fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
-  SLet(pat, _, rhs) -> match lower_expr(rhs, st) {
-    LRes(v, st1) -> lower_let_bind(pat, v, st1)
+  # A `let x = <raw rhs>` where the rhs is `MUnboxed` (Real/Bool) binds a
+  # RAW register (SReal/SBool) — mode-slave to the unbox pass, which marked
+  # the binder raw and perceus skipped its RC. Lower the rhs raw and bind it
+  # at its raw slot; the body's `EVar(x)` reads it raw (a sibling boxed use
+  # boxes at its own border via `lower_expr`'s guard). A non-`PBind` raw
+  # binder (destructure) cannot occur — a raw scalar has no fields — so only
+  # the `PBind` shape takes the raw path; everything else stays boxed.
+  SLet(pat, _, rhs) -> match raw_let_slot(pat, rhs) {
+    Some(slot) -> match lower_expr_raw(rhs, st) {
+      LRes(v, st1) -> lower_let_bind_raw(pat, v, slot, st1)
+    }
+    None -> match lower_expr(rhs, st) {
+      LRes(v, st1) -> lower_let_bind(pat, v, st1)
+    }
   }
   SExprStmt(x) -> match lower_expr(x, st) {
     LRes(v, st1) -> ls_emit(st1, KDo(KLitOp(v), kpos_of(x)))
@@ -400,6 +512,27 @@ fn kir_assert_msg(opt_msg: Option[Expr]) : String = match opt_msg {
     _                 -> kir_quote("assertion failed")
   }
   None -> kir_quote("assertion failed")
+}
+
+# A `let x = rhs` takes the RAW path when `rhs` is a raw node (Real arith or
+# a Real-comparison/logical) AND a plain `PBind` (a raw scalar has no fields
+# to destructure). Returns the raw slot (SReal for a Real result, SBool for
+# a comparison/logical result), or None to keep the boxed path. Mirror of
+# perceus's `prc_pat_bindings_skip_raw` gate (a raw binder skips RC).
+fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
+  PBind(_) ->
+    if kir_node_is_raw(rhs) {
+      if kir_ty_is_real(rhs.ty) { Some(SReal) } else { Some(SBool) }
+    } else { None }
+  _ -> None
+}
+
+# Bind a `PBind` name to an already-lowered RAW value at its raw slot. The
+# `KLet` carries `slot` (SReal/SBool), so pass-1 allocates an `f64`/`i32`
+# alloca and `EVar(name)` loads it raw. No RC: a raw scalar is not tracked.
+fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt / Console = match pat.pkind {
+  PBind(name) -> ls_emit(st, KLet(name, slot, KLitOp(v), KAt(pat.line, pat.col)))
+  _           -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
 }
 
 # Bind a pattern to an already-lowered value. A plain `PBind(name)` aliases
