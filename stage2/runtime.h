@@ -11853,18 +11853,65 @@ static void *kai_llvm_build_string_span(void *b, KaiValue *s) {
     if (rn >= 6 && raw[0] == '"' && raw[1] == '"' && raw[2] == '"' &&
         raw[rn-1] == '"' && raw[rn-2] == '"' && raw[rn-3] == '"') { lo = 3; hi = rn - 3; }
     else if (rn >= 2 && raw[0] == '"' && raw[rn-1] == '"') { lo = 1; hi = rn - 1; }
+    /* `raw` is the verbatim source span, so an N-char escape decodes to
+     * at most N bytes — `hi - lo` is a safe upper bound for the writer. */
     char *buf = (char *) malloc(hi - lo + 1);
     size_t w = 0;
     for (size_t i = lo; i < hi; i++) {
         if (raw[i] == '\\' && i + 1 < hi) {
             char c = raw[++i];
+            /* Decode C99 string-literal escapes EXACTLY as the C-direct
+             * oracle does: the C backend emits the span verbatim into
+             * `kai_str("...")` and lets the C compiler decode it, so this
+             * must match cc's interpretation byte-for-byte (simple escapes
+             * + `\xH...` hex + `\ooo` octal). A divergence here is a
+             * char/hex parity bug (json `\uXXXX`, regex, jwt). */
             switch (c) {
-                case 'n': buf[w++] = '\n'; break;
-                case 't': buf[w++] = '\t'; break;
-                case 'r': buf[w++] = '\r'; break;
-                case '0': buf[w++] = '\0'; break;
-                case '"': buf[w++] = '"';  break;
+                case 'n':  buf[w++] = '\n'; break;
+                case 't':  buf[w++] = '\t'; break;
+                case 'r':  buf[w++] = '\r'; break;
+                case 'a':  buf[w++] = '\a'; break;
+                case 'b':  buf[w++] = '\b'; break;
+                case 'f':  buf[w++] = '\f'; break;
+                case 'v':  buf[w++] = '\v'; break;
+                case '"':  buf[w++] = '"';  break;
+                case '\'': buf[w++] = '\''; break;
+                case '?':  buf[w++] = '?';  break;
                 case '\\': buf[w++] = '\\'; break;
+                case 'x': {
+                    /* `\xH...`: consume every following hex digit, exactly
+                     * like cc (one byte, low 8 bits of the accumulated
+                     * value). A bare `\x` with no hex digit keeps `x`. */
+                    int got = 0;
+                    unsigned v = 0;
+                    while (i + 1 < hi) {
+                        char d = raw[i + 1];
+                        unsigned dv;
+                        if (d >= '0' && d <= '9')      dv = (unsigned)(d - '0');
+                        else if (d >= 'a' && d <= 'f') dv = (unsigned)(d - 'a' + 10);
+                        else if (d >= 'A' && d <= 'F') dv = (unsigned)(d - 'A' + 10);
+                        else break;
+                        v = (v << 4) | dv;
+                        i++;
+                        got = 1;
+                    }
+                    buf[w++] = got ? (char)(v & 0xFF) : 'x';
+                    break;
+                }
+                case '0': case '1': case '2': case '3':
+                case '4': case '5': case '6': case '7': {
+                    /* `\ooo`: 1–3 octal digits, low 8 bits — cc semantics.
+                     * `\0` alone (no further octal digit) is the NUL byte. */
+                    unsigned v = (unsigned)(c - '0');
+                    int n = 1;
+                    while (n < 3 && i + 1 < hi && raw[i + 1] >= '0' && raw[i + 1] <= '7') {
+                        v = (v << 3) | (unsigned)(raw[i + 1] - '0');
+                        i++;
+                        n++;
+                    }
+                    buf[w++] = (char)(v & 0xFF);
+                    break;
+                }
                 default: buf[w++] = c; break;   /* unknown escape: keep the char */
             }
         } else {
