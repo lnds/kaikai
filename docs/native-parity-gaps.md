@@ -1,26 +1,25 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-13, after char/hex decode + np-handlers):**
+> **Status (2026-06-13, after the Real box/unbox lane):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **65 listed gaps** on the ratchet after the
-> char/hex-decode lane closed 2 (67 → 65): `kai_llvm_build_string_span`
-> (stage2/runtime.h) now decodes string-literal escapes C99-exactly (it
-> previously dropped `\a \b \f \v`, hex `\xHH`, and octal `\ooo`, corrupting
-> the JSON byte-table and every literal carrying such an escape), closing
-> `hex_escape_literal` + `json_surrogate_decode`. The np-handlers lane then
-> closed the **no-effect-handler family entirely** (no net baseline change —
-> its one residual baseline fixture, `stream_early_stop`, is blocked by a
-> SECOND cause, pipe-lowering): it extended the synth-handler superset to
-> no-default-block effects (`ReadFault`/File/Spawn performed in dead code),
-> eliminating the last whole-corpus `no handler for effect` build abort.
-> Before those, burn-down 6 closed 14 (81 → 67): the Clock dead-code slice
-> (+ the actor/Spawn/NetTcp dispatch shape the synth-handler superset
-> resolved), the nested-variant Form B/A unbound-register slice, and the
-> EBang transversal node. The flip to native-default (Lane 1.5) remains
-> **BLOCKED** on the
-> residue (now mostly DESIGN-bearing: json/regex array-decode, rb-tree
-> reuse-token model, pipe-lowering, Real box/unbox, clause-param-origin).
-> This file is the burn-down input:
+> docs/kir-design.md §7.2) is at **60 listed gaps** on the ratchet after the
+> Real box/unbox lane closed 5 (65 → 60): the KIR is now MODE-SLAVE to the
+> unbox pass for Real — a `MUnboxed` Real lowers to a raw `f64` register +
+> native `fadd`/`fmul`/`fcmp` (`kir_lower_raw.kai`), boxing only at the
+> raw↔boxed border, so the multi-use-Real double-free (`9.88131e-324`) is
+> structurally impossible. Closed unbox_bench_real / unbox_phase2_cond_real
+> / complex_basic / complex_heterogeneous + the `^`-on-Real fixture
+> math_real_basic. Prior: the char/hex-decode lane closed 2 (67 → 65)
+> (`kai_llvm_build_string_span` now decodes string-literal escapes
+> C99-exactly, closing `hex_escape_literal` + `json_surrogate_decode`); the
+> np-handlers lane then closed the no-effect-handler family entirely (no net
+> baseline change — its residual fixture `stream_early_stop` is blocked by a
+> second cause, pipe-lowering) by extending the synth-handler superset to
+> no-default-block effects in dead code; and burn-down 6 closed 14 (81 → 67).
+> The flip to native-default (Lane 1.5) remains **BLOCKED** on the residue
+> (now mostly DESIGN-bearing: json/regex array-decode, rb-tree reuse-token
+> model, the remaining File/stream handlers, pipe-lowering,
+> clause-param-origin). This file is the burn-down input:
 > every failing fixture, grouped by root-cause family. The anti-regression
 > ratchet that locks the count is `tools/native-parity-baseline.txt` (gated
 > in `tier1-native`). NOTE: the 14 removed are deterministic macOS closes;
@@ -257,12 +256,22 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
   output-mismatch for a louder build panic with no parity gain, so it was
   reverted; the multi-candidate arg shape needs its own diagnosis first.
 - **Real box/unbox** (unbox_bench_real, unbox_phase2_cond_real,
-  complex_basic, complex_heterogeneous). Native prints `9.88131e-324` (a
-  raw i64 bit-pattern read as a `double`) where C prints the real value —
-  a Real (`SReal`) slot reaches an op raw where boxed is expected, or
-  vice-versa. Same class as the burn-down-2 box discipline, on the Real slot.
-- **`^` on Real** (free_fall, math_real_basic). `Real ^ Int` runtime
-  type-mismatch; the base reaches `kaix_pow_int` boxed wrong.
+  complex_basic, complex_heterogeneous) — **CLOSED 2026-06-13.** The root
+  was NOT a slot reaching an op in the wrong shape: the KIR was all-boxed
+  (`slot_of_ty`→SBoxed) and IGNORED the unbox pass's `.mode`, re-boxing every
+  Real and lowering `a*7.0` to the CONSUMING `kaix_mul`, but it inherited
+  perceus's RC-plan, which SKIPS the dup/drop of unbox-promoted-raw vars
+  (`prc_pat_bindings_skip_raw`). A multi-use raw Real thus double-freed; the
+  reused slab read as a `double` is the `9.88131e-324`. Fix (asu, Camino A):
+  the KIR is MODE-SLAVE like the C emitter — a `MUnboxed` Real lowers to a
+  raw `f64` register (`SReal`) + native `fadd`/`fmul`/`fcmp`
+  (`kir_lower_raw.kai` + `llvm_build_fbinop`/`fcmp`/`logical`), boxing only
+  at the raw↔boxed border (`kaix_real` box-on-read / `kaix_real_field`
+  unbox-borrow). No RC on a raw value → no double-free. See
+  `docs/lane-experience-np-real.md`.
+- **`^` on Real** (free_fall) — math_real_basic CLOSED 2026-06-13 by the same
+  raw-Real lane (its raw base reached `kaix_pow_int` correctly once the
+  operand was raw). `free_fall` (a package fixture) still listed.
 - **stream effect handlers** (#801 — 4 `stream_*` + `demos/wc.kai`). The
   lazy `Stream` line-IO carrier performs `File` / `ReadFault` ops the
   native walk installs no handler for. The np-handlers lane closed the
@@ -285,7 +294,9 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
 > `Duplicate integer as switch case` family is gone; the 9 reclassified
 > regex/json fixtures now sit under `output-mismatch` / `exit-sigsegv-timeout`.
 
-# output-mismatch — pipe-lowering + Real box/unbox + reclassified regex/json (19)
+# output-mismatch — pipe-lowering + reclassified regex/json (15)
+# [Real box/unbox CLOSED 2026-06-13: unbox_bench_real / unbox_phase2_cond_real
+#  / complex_basic / complex_heterogeneous — see docs/lane-experience-np-real.md]
 demos/collatz/main.kai
 demos/euler1/main.kai
 demos/factorials/main.kai
@@ -293,10 +304,6 @@ demos/fizzbuzz/main.kai
 demos/imc/main.kai
 examples/minimal/capture.kai
 examples/minimal/fizzbuzz.kai
-examples/perceus/unbox_bench_real.kai
-examples/perceus/unbox_phase2_cond_real.kai
-examples/stdlib/complex_basic.kai
-examples/stdlib/complex_heterogeneous.kai
 examples/stdlib/hex_escape_literal.kai
 examples/stdlib/json_basic.kai
 examples/stdlib/json_surrogate_decode.kai
@@ -324,7 +331,7 @@ examples/stdlib/hashmap_basic.kai
 examples/stdlib/hashmap_collision.kai
 examples/stdlib/hashset_basic.kai
 examples/stdlib/hashset_ops.kai
-examples/stdlib/math_real_basic.kai
+# math_real_basic CLOSED 2026-06-13 (raw-Real lane, ^-on-Real)
 examples/stdlib/regex_anchors_repetition.kai
 examples/stdlib/regex_basic.kai
 examples/stdlib/regex_subsume_unsupported.kai
