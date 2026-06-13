@@ -25,6 +25,94 @@
 > in `tier1-native`). NOTE: the 14 removed are deterministic macOS closes;
 > `list_helpers`/`list_zip3_scan` stay listed (macOS-pass/Linux-SIGSEGV), so
 > the Linux/CI count may differ by the handful that need Linux re-validation.
+> **Status (2026-06-13, after burn-down 7 / `np-crash`):**
+> the in-process libLLVM native backend (`--backend=native`,
+> docs/kir-design.md §7.2) is at **51 listed gaps** on the ratchet after
+> burn-down 7 closed 14 (65 → 51), TWO mechanical root causes in the KIR
+> lowering — see `docs/lane-experience-np-crash.md`. (Two preceding lanes
+> took the ratchet to 65: `np-decode` closed 2, 67 → 65
+> (`kai_llvm_build_string_span` now decodes string-literal escapes
+> C99-exactly, closing `hex_escape_literal` + `json_surrogate_decode`); and
+> `np-handlers` closed the **no-effect-handler family entirely** with no net
+> baseline change — it extended the synth-handler superset to
+> no-default-block effects (`ReadFault`/File/Spawn performed in dead code),
+> eliminating the last whole-corpus `no handler for effect` build abort; its
+> one residual baseline fixture, `stream_early_stop`, is blocked by a SECOND
+> cause, pipe-lowering. All three lanes are disjoint from burn-down 7's
+> pipe/guard set.)
+>   - **pipe-lowering** (`EPipe` → unit). `lower_pipe` (kir_lower_walk.kai)
+>     rewrites `lhs |> rhs` to the equivalent `ECall` with `lhs` spliced in
+>     as the first arg, then delegates to `lower_call` — the exact desugar
+>     the C-direct oracle's `emit_pipe_expr` does at codegen. The earlier
+>     burn-down-3 partial cut "trapped" only because it hand-built the callee;
+>     routing through `lower_call` makes the multi-candidate combinators
+>     (`filter`/`map`/`each`) fall out for free. Closed collatz / euler1 /
+>     factorials / forth / wc / demos-vs / capture / minimal-fizzbuzz + the
+>     two **quicksort** SIGSEGVs (a lost `filter` left `sort(unit)` recursing
+>     on a non-shrinking input → infinite recursion → stack overflow).
+>   - **match guards + all-binder dispatch** (`X if cond -> …` ignored;
+>     all-binder `match` over a scalar hit `KTagOf` → SIGSEGV). The lowering
+>     dropped EVERY arm guard (`Arm(p, _, body)`) AND routed an all-binder
+>     match to the variant tag-switch, which `kaix_variant_tag_of`-faults on a
+>     tagged Int. `lower_guard_chain` (kir_lower_walk.kai) is a linear
+>     fail-chain mirroring the oracle's `emit_match_arm`: per arm,
+>     pattern-test → bind → guard-test → body | next-arm, in source order, no
+>     `KTagOf`. The detector `match_has_any_guard(arms) OR not
+>     match_has_discriminating_pattern(arms)` diverts to it before the
+>     specialised paths (asu review: the O(1) switch is sound only when the
+>     tag alone decides the winner; a guard or all-binder arms break that, and
+>     the typer — not the switch — owns exhaustivity, so degrading to linear is
+>     always sound). Closed fizzbuzz / imc / collatz + attr_unstable_refine_narrow
+>     (a `p : Pos`-narrow over a scalar) + int_field_inline.
+> selfhost byte-id OK; `make test-kir` GREEN (no golden churned — no
+> `examples/kir/*` fixture uses a match guard); ASAN clean on every closed
+> crash fixture; ratchet OK (improved), zero parity regressions.
+>
+> Two DESIGN-bearing causes were diagnosed to a clean cause and documented,
+> NOT forced (the brief's "a gap that needs a design decision is not
+> improvised") — see the *Design-bearing residue* section:
+>   - **Real-arith RC use-after-free** (math_real_basic, free_fall, complex_*,
+>     unbox_*). `pcs_ty_is_unboxed` treats `TyReal`/`TyInt` as unboxed, so
+>     Perceus inserts NO dup/drop for a Real used >1×; emit_c genuinely unboxes
+>     Real to a C `double` (no RC), but the native backend is all-boxed and the
+>     shared `kaix_lt`/`kaix_sub` CONSUME their operands → a Real param used
+>     twice (`if x < 0.0 { 0.0 - x }`) is double-decref'd → its slab is reused
+>     as the next alloc → `type mismatch`. asu verdict: this is the KIR
+>     unboxing milestone (native mode-slave + raw Real never entering RC), a
+>     dedicated lane, NOT a crash-lane patch (a runtime-side dodge swaps a
+>     crash for a leak or re-introduces the pinned second-source-of-RC bug).
+>   - **multi/nested same-effect alias-dispatch** (spiral, m7b_15_nested_alias,
+>     m8_12_self_delegating_handler, multi_var_state_index). Two `var`/`with …
+>     as a` handlers of the same effect (State/Inc) where an op through the
+>     OUTER alias is performed from inside the INNER body / a while-body
+>     closure. Codegen is CORRECT (per-alias `kaix_evidence_lookup_node_by_id`
+>     via the captured `__alias_id__<a>`) and the runtime lookup is correct;
+>     the bug is the evidence-frame/alias model across closures-in-loops
+>     (the subset-2b clause-param-origin family, refs #622). DESIGN-bearing.
+>   - **Hash proto-dispatch** (hashmap/hashset ×4). The native `____proto_hash`
+>     emits a panic stub; the oracle does runtime dispatch
+>     (`kai_head_tag` + `kai_lookup_impl` + indirect call). The dispatch shims
+>     (`kaix_proto_dispatchN`) + lowering were spiked and WORK — but
+>     `kai_lookup_impl` returns NULL because the native backend NEVER registers
+>     the impl table (`_kai_register_proto_tables` is C-only; native emits no
+>     impl-table / variant-to-head startup registration). Building that
+>     registration subsystem (materialise an fn-ptr table via the C-API +
+>     startup hook, mirror emit_c's `collect_pimpl_rows`/`emit_impl_table_array`)
+>     is its own infra lane; the spike was reverted.
+>   - **issue_668 map-in-fiber** (nat=138). `list.map` over 40K elements ALONE
+>     passes native (TRMC/TCO applies); the crash is only INSIDE the spawned
+>     fiber → the no-effect-handler Spawn family (native has no real fiber
+>     scheduler runtime). DESIGN-bearing.
+>
+> The flip to native-default (Lane 1.5) remains **BLOCKED** on the residue
+> (json/regex array-decode, rb-tree reuse-token, File/stream handlers, Real
+> box/unbox, clause-param-origin, Spawn/NetTcp runtime, proto-dispatch table
+> registration). This file is the burn-down input: every failing fixture,
+> grouped by root-cause family. The anti-regression ratchet that locks the
+> count is `tools/native-parity-baseline.txt` (gated in `tier1-native`).
+> NOTE: `list_helpers`/`list_zip3_scan` stay listed (macOS-pass/Linux-SIGSEGV)
+> even though they now pass on the macOS dev box — the burn-down 1/2/3 lesson:
+> the ratchet is validated on Linux/CI, so a macOS pass is not a closed gap.
 >
 > **Burn-down 6 (2026-06-12)** closed FOUR root causes (see
 > `docs/lane-experience-native-parity-burndown-6.md`):
