@@ -133,23 +133,28 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # reach a post-perceus AST; lowering to unit keeps the match exhaustive
   # and mirrors the emitters' dead arms.
   #
-  # KNOWN GAP (native-parity burn-down 3, docs/native-parity-gaps.md
-  # §"pipe-lowering"): `EPipe` actually DOES survive to codegen — the typer
-  # (`infer.kai`'s `synth_pipe`) rebuilds `EPipe(lhs, ECall(f, args))`
+  # `EPipe` SURVIVES to codegen: the typer (`infer.kai`'s `synth_pipe`)
+  # rebuilds `EPipe(lhs, ECall(f, args))` / `EPipe(lhs, EModCall(m, f))`
   # rather than desugaring to `ECall`, leaving each emitter its own pipe
-  # desugaring (emit_c has `emit_pipe_expr`). The native KIR lowering has
-  # none yet, so `ys |> each(print)` / `xs |> filter(p)` lower to a no-op
-  # unit — the call vanishes (output-mismatch / wrong-value family). A first
-  # cut (rewrite to `ECall(f, [lhs, ...args])` + delegate to `lower_call`)
-  # closed the single-candidate + `each(print)` cases but TRAPPED the
-  # multi-candidate combinator path (`filter`/`map`/`reduce`): the typer
-  # resolves those to an `EModCall` callee whose `ECall` arg list reaches
-  # `lower_exprs` in a shape it rejects (`non-exhaustive match` at build).
-  # Lowering pipes is net-positive but the multi-candidate arg shape needs
-  # its own diagnosis (the corrupt-`args` source is upstream of the KIR);
-  # shipping the partial cut would turn an output-mismatch into a louder
-  # build panic with no parity gain. Deferred to burn-down 3.
-  EPipe(_, _)        -> LRes(KUnitV, st)
+  # desugaring (emit_c has `emit_pipe_expr`, the byte-id oracle). `lower_pipe`
+  # mirrors it: rewrite the pipe to the equivalent `ECall` with `lhs`
+  # spliced in as the FIRST argument, then delegate to `lower_call` — so the
+  # full named-call dispatch (ctor / prelude / efn / variant / kaix_apply)
+  # is reused unchanged. The earlier burn-down-3 partial cut "trapped" only
+  # because it built the `ECall` callee/args by hand and reached an unhandled
+  # shape; routing through `lower_call` (the same path a non-piped call
+  # takes) makes the multi-candidate combinators (`filter`/`map`/`each`)
+  # fall out for free. Closes the pipe-lowering family (collatz / euler1 /
+  # fizzbuzz / imc / capture output-mismatch + quicksort's infinite-recursion
+  # SIGSEGV, where a lost `filter` left `sort(unit)` recursing on a non-
+  # shrinking input).
+  EPipe(lhs, rhs)    -> lower_pipe(x, lhs, rhs, st)
+
+  # Forms the resolve / desugar / typer passes rewrite away before codegen
+  # (`EMapPipe`/`EFlatMapPipe`/`EFilterPipe` → ECall, `EIndex` → call,
+  # `EUnder`/`EPlaceholder` pattern-only). These never reach a post-perceus
+  # AST; lowering to unit keeps the match exhaustive and mirrors the
+  # emitters' dead arms.
   EMapPipe(_, _)     -> LRes(KUnitV, st)
   EFlatMapPipe(_, _) -> LRes(KUnitV, st)
   EFilterPipe(_, _)  -> LRes(KUnitV, st)
@@ -512,10 +517,28 @@ fn lower_bang_split(x: Expr, bv: KVal, ctor: String, st: LowerSt) : LRes / Conso
 # switch terminator.
 fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
   match lower_expr(scr, st) { LRes(scrv, st1) ->
+    # GUARDS / all-binder dispatch (FIRST — overrides every specialised
+    # path). A `match` arm carries an optional guard (`X if cond -> body`);
+    # any backend's tag-switch / equality-tree assumes the matched arm is
+    # the WINNER, but a guard can REJECT an arm AFTER its pattern matched,
+    # so control must fall to the NEXT arm in source order — exactly the
+    # C-direct oracle's linear `if (pat) { binds; if (truthy(g)) { … } }`
+    # fail-chain (`emit_match_arm`). The O(1) switch is sound ONLY when the
+    # tag alone decides the winner; a guard breaks that invariant. Likewise,
+    # a `match` whose arms ALL bind (no discriminating pattern — `n if … ->`
+    # / `n -> …`) has no tag to switch on: the variant path would emit
+    # `KTagOf` over a scalar scrutinee (an Int / Real), which the native
+    # backend deref-faults (`kaix_variant_tag_of` on a tagged Int → SIGSEGV).
+    # Both cases route to the linear `lower_guard_chain` (asu review: the KIR
+    # never needs to be cleverer than its oracle; exhaustivity is the typer's
+    # job, so degrading to a linear chain is always sound).
+    if match_has_any_guard(arms) or not match_has_discriminating_pattern(arms) {
+      lower_guard_chain(x, arms, scrv, st1)
+    }
     # List patterns (`[]`, `[h, ...t]`, `[a, b, ...rest]`) need a length-
     # aware decision tree, not the variant tag-switch: cons arms of
     # different lengths share the `KAI_CONS` tag (kir_lower_match.kai).
-    if match_is_list(arms) { lower_list_match(x, arms, scrv, st1) }
+    else if match_is_list(arms) { lower_list_match(x, arms, scrv, st1) }
     # Literal patterns (`0`/`'c'`/`"s"`/`true`) need an EQUALITY decision
     # tree, not the variant tag-switch: a `PLit` is not a variant, so its
     # `arm_tag` is -1 and every literal arm would collapse into one default
@@ -826,6 +849,184 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
     } }
 }
 
+# --- Guarded / all-binder match: the linear fail-chain ------------------
+#
+# The general decision tree for a `match` that carries ANY arm guard, or
+# whose arms all bind (no tag to switch on). Mirrors the C-direct oracle's
+# `emit_match_arm` exactly: a linear chain, in source order, of
+#   pattern-test → bind → [guard-test] → body | next-arm
+# No `KTagOf` / `KSwitch`: the scrutinee may be a scalar (Int / Real) whose
+# `variant_tag` word is meaningless. Each arm:
+#   1. tests its pattern (`guard_emit_pat_test`); a non-discriminating
+#      pattern (PBind / PWild / PNarrow / PAs / PHole) always matches, so
+#      its "fail" label IS its body label (no branch);
+#   2. binds the pattern's names (`bind_pattern_fields`) — BEFORE the guard,
+#      which reads them (`n if n % 2 == 0`);
+#   3. if guarded, evaluates the guard and `condbr`s to the body on truthy /
+#      the next arm's fail label on falsy (the guard can reject post-match);
+#   4. lowers its body into the shared `join`, then branches to `lcont`.
+# The chain's final fail seals `KUnreachable` — the typer guarantees the
+# match is exhaustive, so the last arm (unguarded or a catch-all) always
+# matches and the trailing fail is dead (Linus review #3, as the other
+# chains). The binds are pure slot aliases (`KLitOp(scrv)` / `KProj`), so a
+# rejected guard's unused binder owns nothing — no drop is owed (the oracle
+# emits none either; byte-id parity by construction).
+fn lower_guard_chain(x: Expr, arms: [Arm], scrv: KVal, st: LowerSt) : LRes / Console =
+  match match_preamble(x, scrv, st) { LSReg(join, st1) ->
+    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
+      let st3 = lower_guard_arms(arms, scrv, join, lcont, st2)
+      LRes(KVar(join), reopen(st3, lcont))
+    } } }
+
+# Each arm pre-allocates `next_fail`, the block where the REST of the chain
+# starts. Both the pattern test (mismatch) AND the guard (falsy) route there,
+# so a rejected arm — for either reason — falls to the next in source order
+# (the oracle's `if (pat) { binds; if (truthy(g)) {…} }` fall-through). The
+# terminal arm (the typer guarantees one matches) seals `next_fail`
+# `KUnreachable`. Keeping `next_fail` distinct from the body label is what
+# lets a guarded BINDER arm (`n if … ->`) fail to the next arm rather than
+# loop back onto its own body.
+fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
+                    st: LowerSt) : LowerSt / Console = match arms {
+  # No arms left: control reaches here only through the previous arm's
+  # `next_fail` (the block currently open, `st.cl`). The typer guarantees
+  # the match is exhaustive, so this fall-through is dead — seal it
+  # `KUnreachable` (the LLVM verifier rejects an open block with no
+  # terminator). A fresh dead successor is opened and immediately discarded
+  # by the caller's `reopen(lcont)`.
+  [] -> match ls_fresh_label(st) { LSLabel(dead, st1) ->
+    ls_seal(st1, KUnreachable(KNoPos), dead) }
+  [Arm(p, opt_guard, body), ...rest] -> match ls_fresh_label(st) { LSLabel(next_fail, st0) ->
+    match guard_emit_pat_test(p, scrv, next_fail, st0) {
+      LMArm(st_body, _) -> {
+        let st_bound = bind_default_pattern(p, scrv, st_body)
+        let st_done = match opt_guard {
+          None -> lower_branch_into(body, join, lcont, st_bound)
+          Some(g) -> match ls_fresh_label(st_bound) { LSLabel(run_lbl, stg) ->
+            match lower_expr(g, stg) { LRes(gv, stg1) -> {
+              # Guard truthy → run the body; falsy → `next_fail` (next arm).
+              # `KCondBr` takes the boxed guard value directly (the backend's
+              # condbr lowering reads it through `kaix_truthy`, as `lower_if`).
+              let st_fork = ls_seal(stg1, KCondBr(gv, run_lbl, next_fail, kpos_of(g)), run_lbl)
+              lower_branch_into(body, join, lcont, reopen(st_fork, run_lbl))
+            } } }
+        }
+        # The next arm continues at `next_fail`. If this arm always matched
+        # (a binder with NO guard), control never falls through — `next_fail`
+        # is dead, sealed `KUnreachable` (the typer forbids a reachable arm
+        # after an unconditional one). Otherwise the rest of the chain lowers
+        # starting at `next_fail`.
+        let arm_is_terminal = guard_pat_always_matches(p) and match opt_guard { None -> true Some(_) -> false }
+        if arm_is_terminal {
+          ls_seal(reopen(st_done, next_fail), KUnreachable(KNoPos), next_fail)
+        } else {
+          lower_guard_arms(rest, scrv, join, lcont, reopen(st_done, next_fail))
+        }
+      } } }
+}
+
+# Emit ONLY the pattern test for a guard-chain arm, routing a MISMATCH to
+# the caller-supplied `fail_lbl` (the next arm's start). The bind + guard are
+# threaded by the caller after this returns. Opens a FRESH body label, seals
+# a `condbr (test) ? body : fail_lbl`, and returns `LMArm(st_at_body, _)` (the
+# fail label is the caller's, echoed back unused). A non-discriminating
+# pattern (always matches) just branches to its fresh body — its mismatch
+# edge is dead, so `fail_lbl` stays live for the guard / the next arm.
+fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
+                       st: LowerSt) : LMArm / Console =
+  match p.pkind {
+    PLit(lit) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
+      let st2 = guard_lit_test(lit, scrv, body_lbl, fail_lbl, st1)
+      LMArm(reopen(st2, body_lbl), fail_lbl)
+    } }
+    # Top-level variant: test the constructor tag, then (when a sub-pattern
+    # discriminates — `Some(0) if g`) the payload sub-slots, all routing a
+    # miss to `fail_lbl`. A plain `Some(n)` (no discriminating sub) reduces
+    # to the bare tag test.
+    PVariant(cname, subs) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
+      let st2 = guard_emit_variant_test(cname, subs, scrv, body_lbl, fail_lbl, p, st1)
+      LMArm(reopen(st2, body_lbl), fail_lbl)
+    } }
+    PVariantRecord(cname, _) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
+      let st2 = var_seal_tag_of(scrv, cname, body_lbl, fail_lbl, p, st1)
+      LMArm(reopen(st2, body_lbl), fail_lbl)
+    } }
+    # Non-discriminating: always matches — branch straight to a fresh body.
+    PWild        -> guard_pat_passthrough(p, fail_lbl, st)
+    PBind(_)     -> guard_pat_passthrough(p, fail_lbl, st)
+    PNarrow(_, _) -> guard_pat_passthrough(p, fail_lbl, st)
+    PAs(_, _)    -> guard_pat_passthrough(p, fail_lbl, st)
+    PHole(_)     -> guard_pat_passthrough(p, fail_lbl, st)
+    # PList / PRecord guarded arms are not yet covered by the linear chain
+    # (their test machinery owns its own fail label, which does not compose
+    # with the chain's `fail_lbl` without a block-reopen hazard). Trap loud
+    # rather than miscompile — the families this lane closes (Int/Real binder
+    # guards, variant guards) do not hit this; if one appears, it surfaces
+    # here instead of silently diverging (lane discipline).
+    PList(_, _) -> { eprint("kir: guarded list-pattern arm not yet lowered"); guard_pat_passthrough(p, fail_lbl, st) }
+    PRecord(_)  -> { eprint("kir: guarded record-pattern arm not yet lowered"); guard_pat_passthrough(p, fail_lbl, st) }
+    _ -> guard_pat_passthrough(p, fail_lbl, st)
+  }
+
+# `kai_eq_raw scr lit` → condbr body/fail. The literal-slot equality test,
+# inlined here (kir_lower_lit's `lit_emit_test` is module-private). Mirror
+# of `var_seal_eq` for the whole scrutinee.
+fn guard_lit_test(lit: Expr, scrv: KVal, body_lbl: String, fail_lbl: String,
+                  st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_eq_raw", [scrv, lit_atom(lit)]), KAt(lit.line, lit.col)) {
+    LRes(cond, st1) -> ls_seal(st1, KCondBr(cond, body_lbl, fail_lbl, KAt(lit.line, lit.col)), fail_lbl)
+  }
+
+# Test a top-level variant pattern: its constructor tag, then (when a
+# sub-pattern discriminates — `Some(0)`) the payload sub-slots, all routing
+# a miss to `fail_lbl`. A plain `Some(n)` (no discriminating sub) is just
+# the tag test. Mirrors `var_seal_variant`'s top-level shape but tests the
+# scrutinee directly (no enclosing slot to project).
+fn guard_emit_variant_test(cname: String, subs: [Pattern], scrv: KVal,
+                           body_lbl: String, fail_lbl: String, p: Pattern,
+                           st: LowerSt) : LowerSt / Console =
+  if any_discriminating(subs) {
+    match ls_fresh_label(st) { LSLabel(sub_lbl, st1) -> {
+      let st2 = var_seal_tag_of(scrv, cname, sub_lbl, fail_lbl, p, st1)
+      var_emit_slot_tests(subs, scrv, 0, body_lbl, fail_lbl, reopen(st2, sub_lbl))
+    } }
+  } else { var_seal_tag_of(scrv, cname, body_lbl, fail_lbl, p, st) }
+
+# A pattern that always matches: open one fresh body label, branch to it.
+# `fail_lbl` (the next arm's start) is echoed back untouched — the binder's
+# mismatch edge is dead, but the GUARD (if any) still routes there.
+fn guard_pat_passthrough(p: Pattern, fail_lbl: String, st: LowerSt) : LMArm / Console =
+  match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
+    LMArm(reopen(ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl), body_lbl), fail_lbl) }
+
+# Does this pattern match every value (no test needed)?
+fn guard_pat_always_matches(p: Pattern) : Bool = match p.pkind {
+  PWild        -> true
+  PBind(_)     -> true
+  PNarrow(_, _) -> true
+  PAs(_, _)    -> true
+  PHole(_)     -> true
+  _            -> false
+}
+
+# Does `arms` carry any arm guard (`X if cond -> …`)?
+fn match_has_any_guard(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(_, Some(_), _), ..._] -> true
+  [Arm(_, None, _), ...rest] -> match_has_any_guard(rest)
+}
+
+# Does any arm discriminate by a real pattern (tag / literal / structure)?
+# A `match` with NONE — every arm a binder / wildcard — has no tag to
+# switch on (its scrutinee may be a scalar), so it routes to the linear
+# chain rather than the `KTagOf` path that would deref-fault on an Int.
+fn match_has_discriminating_pattern(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(p, _, _), ...rest] ->
+    if guard_pat_always_matches(p) { match_has_discriminating_pattern(rest) }
+    else { true }
+}
+
 # --- Effect handlers ----------------------------------------------------
 
 # Materialise an effect handler as a double fork (asu review): a join
@@ -919,6 +1120,30 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = m
     let rf = lower_expr(f, st)
     match rf { LRes(fv, st1) -> match lower_exprs(cargs, st1, []) {
       LResMany(avs, st2) -> bind_op(st2, KCallIndirect(fv, avs), kpos_of(x)) } }
+  }
+}
+
+# `lhs |> rhs` — splice `lhs` in as the FIRST argument of the call `rhs`
+# names, then delegate to `lower_call`. This is the post-perceus desugar
+# the C-direct oracle (`emit_pipe_expr`) does at codegen, reproduced node-
+# for-node so the two backends agree:
+#   - `lhs |> f(a, b)`        → `f(lhs, a, b)`        (ECall callee splice)
+#   - `lhs |> mod.g(a)`       → `mod.g(lhs, a)`       (EModCall callee splice)
+#   - `lhs |> f`  / `mod.g`   → `f(lhs)` / `mod.g(lhs)` (bare callee)
+#   - `lhs |> <expr>`         → `(<expr>)(lhs)`        (indirect, kaix_apply)
+# A spliced `ECall` carries the SAME callee `Expr` the typer resolved
+# (variant / prelude / efn / local), so `lower_call`'s dispatch picks the
+# right shape with no special-casing — the burn-down-3 lesson: route through
+# `lower_call`, do not hand-build the callee. The synthetic `ECall` reuses
+# `rhs`'s position so a lowering error still points at the user's call.
+fn lower_pipe(x: Expr, lhs: Expr, rhs: Expr, st: LowerSt) : LRes / Console = match rhs.kind {
+  ECall(f, cargs) -> lower_call(x, f, [lhs, ...cargs], st)
+  EVar(_)         -> lower_call(x, rhs, [lhs], st)
+  EModCall(_, _)  -> lower_call(x, rhs, [lhs], st)
+  _ -> {
+    let rf = lower_expr(rhs, st)
+    match rf { LRes(fv, st1) -> match lower_expr(lhs, st1) {
+      LRes(av, st2) -> bind_op(st2, KCallIndirect(fv, [av]), kpos_of(x)) } }
   }
 }
 
