@@ -172,6 +172,13 @@ fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   # takes a RAW i32 ctor tag (the `KIntV` operand the lowering planted),
   # not a boxed Int — same mixed (ptr, i32) shape as `kaix_variant`.
   else if nm == "kai_tag_eq" { nemit_tag_eq(ctx, cargs) }
+  # Raw (unboxed) Real/Bool ops (KIR mode-slave, kir_lower_raw). These are
+  # native LLVM instructions, NOT boxed `kaix_*` calls: an `f`-prefixed
+  # arith/cmp maps to `fbinop`/`fcmp`, a `b`-prefixed logical to the i1
+  # `logical`/`lnot`, `fneg` to `fneg`, and the box/unbox borders to the
+  # scalar constructor / `as.r` borrow. No RC: a raw operand is never
+  # decref'd, so a multi-use Real never double-frees (the family's bug).
+  else if nprim_is_raw(nm) { nemit_raw_prim(ctx, nm, cargs) }
   else {
     let buf = nemit_atoms_buf(ctx, cargs)
     match nprim_op_sym(nm) {
@@ -179,6 +186,92 @@ fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
       None      -> nemit_call_freeing(ctx, nprim_runtime_sym(nm), buf)
     }
   }
+
+# A KIR raw-op prim name (the `f`/`b` family kir_lower_raw plants). These
+# never reach the boxed `kaix_*` dispatch — they emit native instructions.
+fn nprim_is_raw(nm: String) : Bool =
+  nm == "real.box" or nm == "bool.box" or nm == "real.unbox" or
+  nm == "fneg" or nm == "bnot" or nm == "band" or nm == "bor" or
+  nprim_raw_fbinop_op(nm) >= 0 or nprim_raw_fcmp_pred(nm) >= 0
+
+# The `fbinop` opcode for a raw-Real arith prim (`f+`/`f-`/`f*`/`f/`), or -1.
+fn nprim_raw_fbinop_op(nm: String) : Int =
+  if nm == "f+" { 0 } else if nm == "f-" { 1 } else if nm == "f*" { 2 }
+  else if nm == "f/" { 3 } else { -1 }
+
+# The `fcmp` predicate for a raw-Real comparison prim, or -1.
+fn nprim_raw_fcmp_pred(nm: String) : Int =
+  if nm == "f<" { 0 } else if nm == "f>" { 1 } else if nm == "f<=" { 2 }
+  else if nm == "f>=" { 3 } else if nm == "f==" { 4 } else if nm == "f!=" { 5 }
+  else { -1 }
+
+# Emit one raw op. Arith yields an `f64`; cmp yields a raw i32 (the `fcmp`
+# i1 widened, so it stores in the i32 `SBool` register); logical operates on
+# the i32 0/1 form; the borders box/unbox the scalar.
+fn nemit_raw_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
+  if nm == "real.box" { nemit_raw_box(ctx, "kaix_real", native_ctx_f64t(ctx), cargs) }
+  else if nm == "bool.box" { nemit_raw_box(ctx, "kaix_bool", native_ctx_i32t(ctx), cargs) }
+  else if nm == "real.unbox" { nemit_raw_unbox(ctx, cargs) }
+  else if nm == "fneg" { nemit_raw_unary(ctx, "fneg", cargs) }
+  else if nm == "bnot" { nemit_raw_unary(ctx, "lnot", cargs) }
+  else if nm == "band" { nemit_raw_logical(ctx, 1, cargs) }
+  else if nm == "bor" { nemit_raw_logical(ctx, 0, cargs) }
+  else {
+    let fop = nprim_raw_fbinop_op(nm)
+    if fop >= 0 { nemit_raw_fbinop(ctx, fop, cargs) }
+    else { nemit_raw_fcmp(ctx, nprim_raw_fcmp_pred(nm), cargs) }
+  }
+
+# `<op>(a, b)` raw `f64` arithmetic → one `fbinop` instruction. Both atoms
+# load raw (the registers are `f64`). No buffer, no call, no RC.
+fn nemit_raw_fbinop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> llvm_build_fbinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SReal), nemit_atom_raw(ctx, b, SReal))
+  _      -> { nemit_unsupported(ctx, "raw fbinop arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` raw `f64` comparison → `fcmp` (i1) widened to i32, so the
+# result stores in the i32 `SBool` register and feeds `kaix_bool` / a
+# logical op uniformly.
+fn nemit_raw_fcmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_fcmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, SReal), nemit_atom_raw(ctx, b, SReal))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw fcmp arity"); nemit_null(ctx) }
+}
+
+# `and`/`or` over two raw i32 0/1 booleans → the i1-domain `logical`
+# builder (op 1=and, 0=or). Operands + result are i32 0/1.
+fn nemit_raw_logical(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> llvm_build_logical(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SBool), nemit_atom_raw(ctx, b, SBool))
+  _      -> { nemit_unsupported(ctx, "raw logical arity"); nemit_null(ctx) }
+}
+
+# A raw unary instruction (`fneg` over f64, `lnot` over i32).
+fn nemit_raw_unary(ctx: Handle, which: String, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> if which == "fneg" { llvm_build_fneg(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SReal)) }
+         else { llvm_build_lnot(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SBool)) }
+  _   -> { nemit_unsupported(ctx, "raw unary arity"); nemit_null(ctx) }
+}
+
+# Box a raw scalar: `kaix_real(f64)` / `kaix_bool(i32)`. The raw→boxed
+# border the `lower_expr` guard inserts (`box_wrap` in the oracle). The
+# param type is the raw scalar's (`f64`/`i32`); result is a boxed `ptr`.
+fn nemit_raw_box(ctx: Handle, sym: String, pty: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> {
+    let bslot = if sym == "kaix_real" { SReal } else { SBool }
+    ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), pty, nemit_atom_raw(ctx, a, bslot))
+  }
+  _   -> { nemit_unsupported(ctx, "raw box arity"); nemit_null(ctx) }
+}
+
+# Unbox-borrow a boxed Real to its raw `f64` (`kaix_real_field` — reads
+# `as.r`, NO decref). The box→raw border (`(boxed)->as.r` in the oracle):
+# non-consuming, so the box stays owned by its binding for the normal drop.
+fn nemit_raw_unbox(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, a))
+  _   -> { nemit_unsupported(ctx, "raw unbox arity"); nemit_null(ctx) }
+}
 
 # `<sym>(ptr rec, i8* name) -> ptr` (`kaix_field` owned / `kaix_field_borrow`
 # non-consuming). The name KVal is a `KStrV` the field-read lowering planted;
