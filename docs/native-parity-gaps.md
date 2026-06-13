@@ -1,9 +1,14 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-12, after burn-down 6):**
+> **Status (2026-06-12, after char/hex decode):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **67 listed gaps** on the ratchet after
-> burn-down 6 closed 14 (81 → 67): the Clock dead-code slice (+ the
+> docs/kir-design.md §7.2) is at **65 listed gaps** on the ratchet after the
+> char/hex-decode lane closed 2 (67 → 65): `kai_llvm_build_string_span`
+> (stage2/runtime.h) now decodes string-literal escapes C99-exactly (it
+> previously dropped `\a \b \f \v`, hex `\xHH`, and octal `\ooo`, corrupting
+> the JSON byte-table and every literal carrying such an escape), closing
+> `hex_escape_literal` + `json_surrogate_decode`. Before that, burn-down 6
+> closed 14 (81 → 67): the Clock dead-code slice (+ the
 > actor/Spawn/NetTcp dispatch shape the synth-handler superset resolved), the
 > nested-variant Form B/A unbound-register slice, and the EBang transversal
 > node. The flip to native-default (Lane 1.5) remains **BLOCKED** on the
@@ -192,13 +197,34 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
 
 - **regex/json reclassified (burn-down 3 unmasked).** The 9
   `Duplicate integer as switch case` fixtures that now build+run but diverge
-  share a likely common root: a char/hex decode in the native path. `regex_basic`
-  / `regex_anchors_repetition` panic `unterminated character class` (the regex
-  parser's `Some(']')` char-match never fires — though a minimal `Some(']')`
-  match passes parity, so the bug is in how the real parser reads the char,
-  not the match lowering); `json_basic` decodes `A` to `'1'` not `'A'`
-  (a hex-nibble read). `regex_subsume_*` / `regex_predicate_basic` produce
-  wrong output. Diagnose the char/string-index read on the native path first.
+  were hypothesised to share a char/hex-decode root. That hypothesis was
+  **half right** and is now resolved into TWO distinct causes:
+  - **char/hex escape decode — CLOSED (2026-06-12, np-decode lane).** The
+    native backend decodes string-literal escapes in
+    `kai_llvm_build_string_span` (stage2/runtime.h), and its hand-rolled
+    switch dropped `\a \b \f \v`, hex `\xHH`, and octal `\ooo`, so the JSON
+    byte-table (`"\x01..\xff"`) and every literal carrying such an escape was
+    corrupted — `json_basic` `dec esc 3` decoded `A` to `'1'` not `'A'`
+    (the `string_slice(byte_table, …)` landed on a garbage byte). Now decodes
+    C99-exactly. Closed `hex_escape_literal` + `json_surrogate_decode`.
+  - **json-array nested-variant decode — STILL OPEN, NOT char/hex.** With the
+    escape fix in, `json_basic` / `json_real_*` / `json_surrogate_encode` /
+    `jwt_encoder` STILL diverge: a non-empty array/object decode (`[1]`,
+    `{"a":1}`) returns `None` under native. The `json_loop` driver
+    (json.kai) pushes `JFrame` variants with payload (`ArrFrame([JsonValue])`,
+    `ObjFrame([…], Option[String])`), conses them with list spreads
+    (`[ArrFrame(acc1), ...rest]`), and matches the top frame with nested
+    variant + list sub-patterns — the same nested-variant / list-match KIR
+    lowering family burn-down 6 partly closed (residual
+    `binserialize_derive_nested`). `[]` / `{}` (empty) decode fine; only
+    non-empty containers fail. This is a list-in-variant-slot decision-tree
+    gap, not a char read.
+  - **regex matcher logic — STILL OPEN, NOT char/hex.** `regex_basic` /
+    `regex_anchors_repetition` panic `unterminated character class` and
+    `regex_subsume_*` / `regex_predicate_basic` produce wrong output (e.g.
+    `slug`/`other` classification inverted) — the regex engine's matching
+    logic diverges under native, independent of the (now-fixed) literal
+    decode. Diagnose the matcher's decision-tree lowering, not the char read.
 - **Call-param-mismatch** (6: map_basic/map_pipes/map_round_out/map_tree_basic
   + jwt_encoder + fx_basic). `module verify failed: Call parameter type does
   not match function signature!` — one root cause: a generated call passes an
