@@ -47,6 +47,11 @@ fn nemit_install_with(ctx: Handle, eff: String, init: Option[KVal], alias: Optio
   # same offset a clause's `resume(v, ns)` later updates. Stateless
   # handlers carry no `init` — the slot stays NULL (subset 2a unchanged).
   nemit_install_state(ctx, ev, init)
+  # Clause-capture env: fill the env array (one slot per handle-union
+  # capture, loaded by surface name from the install frame's locals) and
+  # point Ev field 1 (byte 8) at it. No captures => leave env NULL, the
+  # clause prologue never reads it (mirror of emit_c's empty-env path).
+  nemit_install_env(ctx, eff, ev, h.env_caps)
   # Each op fn-ptr at field (nfx_op_base + i): declare the clause thunk,
   # store its address with kaix_ev_set_op(ev, field, fn).
   nemit_install_ops(ctx, ev, h.op_thunks, 0)
@@ -68,6 +73,51 @@ fn nemit_install_state(ctx: Handle, ev: Handle, init: Option[KVal]) : Unit / Con
     let v = nemit_atom(ctx, iv)
     let _s = ncall_sig2(ctx, "kaix_clause_state_set", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), ev, v)
     ()
+  }
+}
+
+# Fill the clause-capture env array and point Ev field 1 at it. One slot
+# per handle-union capture (`env_caps`, the order the clause prologue's
+# `PEnvCapture(j)` indexes), each loaded by surface NAME from the install
+# frame's locals. The slot index MUST stay 1:1 with the union position the
+# clause reads, so we iterate the FULL union with an incrementing index and
+# write a slot for EVERY entry — a NULL for a name not in scope at the
+# install (the emit_c parity: its env struct's typedef carries the whole
+# union, the install's `{0}` zero-init leaves an out-of-scope field NULL,
+# and the read side never observes the gap because no clause that omits the
+# capture reads that slot). Bounds: abort loud if the union exceeds the
+# alloca's fixed capacity rather than overrun the stack. No captures =>
+# leave Ev field 1 NULL (the clause prologue never reads it).
+fn nemit_install_env(ctx: Handle, eff: String, ev: Handle, env_caps: [String]) : Unit / Console = match env_caps {
+  [] -> ()
+  _  ->
+    if list_length(env_caps) > nfx_env_cap() {
+      nemit_unsupported(ctx, cat2("clause-capture env exceeds fixed capacity for effect ", eff))
+    } else {
+      let env = native_ctx_find_reg(ctx, nfx_env_reg(eff))
+      nemit_install_env_fill(ctx, env, env_caps, 0)
+      # `kaix_ev_set_env(ev, env)` writes byte 8 (Ev field 1).
+      let _s = ncall_sig2(ctx, "kaix_ev_set_env", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), ev, env)
+      ()
+    }
+}
+
+# Stamp each union capture into env slot `j` (j = its union position, so
+# install and the clause `PEnvCapture(j)` read agree by index). The value
+# is the install frame's local register for that surface name — a BORROW
+# (no dup here; emit_c's `_env.kai_<c> = kai_<c>` is likewise a plain field
+# copy, the dup lives on the clause read). A name NOT bound at the install
+# (out of scope here — emit_c filters it via `list_filter_in(.., lcs)` and
+# leaves the env field zero) gets a NULL slot, keeping the index aligned
+# without emitting a load from a non-existent register.
+fn nemit_install_env_fill(ctx: Handle, env: Handle, caps: [String], j: Int) : Unit / Console = match caps {
+  [] -> ()
+  [c, ...rest] -> {
+    let v = if native_ctx_reg_slot(ctx, c) < 0 { llvm_const_null(native_ctx_ptrt(ctx)) } else { nemit_load_reg(ctx, c) }
+    let _s = ncall_sig3(ctx, "kaix_env_set", native_ctx_voidt(ctx),
+                        native_ctx_ptrt(ctx), native_ctx_i64t(ctx), native_ctx_ptrt(ctx),
+                        env, llvm_const_int(native_ctx_i64t(ctx), j), v)
+    nemit_install_env_fill(ctx, env, rest, j + 1)
   }
 }
 

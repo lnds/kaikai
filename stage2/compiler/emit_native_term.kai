@@ -109,7 +109,9 @@ fn nclause_direct_count(ps: [KParam], acc: Int) : Int = match ps {
 # Seed clause params. `self` is LLVM param 0; the direct op-args are LLVM
 # params 1..d; `k` (PResume) is the last LLVM param (d+1). A PDirect(i)
 # reads LLVM param `1 + i` (after self); PResume reads the last param.
-# PCapture/PEvidence (state/aliased handlers) are subset 2b — abort loud.
+# A PEnvCapture(j) reads the j-th slot of the Ev `env` array (byte 8) via
+# `kaix_clause_env_get`. PEvidence (aliased-by-id handlers) is still a
+# later subset — abort loud.
 #
 # The continuation param is registered under the FIXED name `k`, NOT its
 # surface name: the translator names the `PResume` param after the surface
@@ -156,10 +158,32 @@ fn nemit_seed_clause_loop(ctx: Handle, ps: [KParam], fnval: Handle, d: Int) : Un
       PDirect(i) -> nemit_store_reg(ctx, pp.name, llvm_get_param(fnval, 1 + i))
       # `k` is the trailing LLVM param: index = 1 (self) + d (args).
       PResume    -> nemit_store_reg(ctx, "k", llvm_get_param(fnval, 1 + d))
-      _          -> nemit_unsupported(ctx, "clause param origin (alias = subset 2b alias dispatch)")
+      # `self->env[j]` (the install filled it in handle-union order), dup'd
+      # for perceus's per-clause isolation. `__self` (LLVM param 0) is the
+      # dispatched Ev; `kaix_clause_env_get` reads byte-8 then indexes.
+      PEnvCapture(j) -> nemit_seed_clause_envcap(ctx, pp.name, j)
+      _          -> nemit_unsupported(ctx, "clause param origin (PEvidence = subset 2b by-id alias dispatch)")
     }
     nemit_seed_clause_loop(ctx, rest, fnval, d)
   }
+}
+
+# Bind a clause's `PEnvCapture(j)` register from the Ev `env` array.
+# `kaix_clause_env_get(ptr self, i32 j) -> ptr` reads the env pointer at
+# byte 8 of `self`, indexes slot `j`, and returns it dup'd (the read side
+# of emit_c's `kai_internal_dup(_env->kai_<name>)`): perceus analyses each
+# clause body in isolation and assumes a private reference it may consume,
+# while the env holds a single borrow scoped to the install stmt-expr.
+fn nemit_seed_clause_envcap(ctx: Handle, name: String, j: Int) : Unit / Console = {
+  # Load the Ev from the `__self` alloca, not raw LLVM param 0 — the same
+  # source `nemit_resume2`'s state write reads, so the clause prologue stays
+  # consistent if the seed order ever changes. `__self` was stored by
+  # `nemit_seed_clause_params` before this loop runs.
+  let self_v = nemit_load_reg(ctx, "__self")
+  let v = ncall_sig2(ctx, "kaix_clause_env_get", native_ctx_ptrt(ctx),
+                     native_ctx_ptrt(ctx), native_ctx_i32t(ctx),
+                     self_v, llvm_const_i32(native_ctx_i32t(ctx), j))
+  nemit_store_reg(ctx, name, v)
 }
 
 # Declare a lambda thunk `ptr (ptr self, ptr* args, i32 n)`.
