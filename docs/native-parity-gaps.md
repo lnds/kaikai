@@ -1,10 +1,21 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
 > **Status (2026-06-14, measured against a STATIC-LLVM-18 kaic2):** the
-> in-process libLLVM native backend is at **26 listed gaps** — 24 measured
+> in-process libLLVM native backend is at **24 listed gaps** — 22 measured
 > failing on macOS by `tools/test-backend-parity.sh` (native vs C-direct:
-> pass=439 fail=24 skip=55 of 518) plus the 2 Linux-only SIGSEGV gaps
+> pass=442 fail=22 skip=55 of 519) plus the 2 Linux-only SIGSEGV gaps
 > (`list_helpers`, `list_zip3_scan`).
+>
+> **list-in-variant-slot CLOSED** (lane native-list-in-slot): a list pattern
+> as a sub-pattern of a variant slot (`Some([x, y])`) lowered no length test +
+> no binds (native aborted `unbound register`). Fixed by reusing the list
+> decision-tree (`lm_emit_cells`) against the projected slot, the seam in the
+> walk. Closed binserialize_derive_nested + net_dns_resolve. KNOWN RESIDUAL
+> (separate native gap, no fixture yet): a list pattern whose HEAD is itself a
+> list (`[[a, b], ..._]`) still aborts native `unbound register` —
+> `lm_emit_head` (kir_lower_match.kai) does not recurse into a `PList` head;
+> C-direct is correct. Same mechanical shape (re-enter `lm_emit_cells` from a
+> head cell), a follow-up.
 >
 > **First measurement against the VENDORED STATIC LLVM 18.1.8** (not Homebrew
 > dynamic v22): the shipped compiler links libLLVM statically (Rust/Zig/Julia
