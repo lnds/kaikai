@@ -13,6 +13,22 @@
 > `unit_name` as `CkUnitName` and inlining the canonical unit symbol as a
 > `KStrV` constant. Closed free_fall.
 >
+> **huffman DIAGNOSED (reuse/aliasing, DESIGN-bearing — NOT forced):**
+> `demos/9d9l/huffman` hangs native (timeout 124) in `encode_chars`'s
+> `list_append(code, more)` where `code` is a list SHARED with the lookup
+> table and `more` is the recursive result. Minimal repro (~25 lines, no
+> records): a 3+-deep `list_append` chain where each left operand is a list
+> read out of a shared `[[Int]]` table via a recursive `lookup` hangs native,
+> works in C. 1–2 deep is fine; the 3rd composition cycles. Literals (no
+> shared source) never hang. This is the **reuse-token / shared-list aliasing
+> model** (the same family as the rb-tree perceus gaps): the KIR reuses the
+> shared list cell in `list_append` instead of copying, forming a cycle, so
+> `list.length` never terminates. A dedicated reuse lane, not a singleton —
+> the brief's "a gap that needs a design decision is not improvised". The
+> `weather` demo (NetTcp/Spawn fiber runtime) and `m7a_6d_double_resume` (a
+> missing one-shot-continuation runtime check) are likewise DESIGN-bearing
+> singletons, not closed here.
+>
 > **literal-list-head CLOSED** (lane native-literal-list-head): a literal head
 > in a list pattern (`[""]`, `[0, ...rest]`) was not tested
 > (`lm_head_seal_test` handled variant heads only), so `[""]` matched any
