@@ -108,18 +108,41 @@ pub fn lm_emit_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
   }
 
 # Handle one head cell. A simple binder keeps the direct slot-0 bind; a nested
-# record / variant head projects the slot once, then tests + binds it.
+# record / variant head projects the slot once, then tests + binds it. A head
+# that is ITSELF a list (`[[a, b], ..._]`, `[[a], [b]]`) projects the slot once
+# and RE-ENTERS the cell walk against the projected head value, so the nested
+# list's own length test + element binds are emitted by the same machinery — the
+# Maranget column decomposition the oracle's `emit_pat_test`/`emit_pat_binds`
+# perform when a list head recurses into `emit_pat_test_list`. No import cycle:
+# `lm_emit_cells` lives in this module, so the head list lowers in place (the
+# variant-slot sibling, 242e33eb, had to seam through `kir_lower_walk`).
 fn lm_emit_head(hp: Pattern, cur: KVal, fail_lbl: String, st: LowerSt) : LowerSt / Console =
   match hp.pkind {
     PBind(_)             -> lm_bind_head(hp, cur, st)
     PWild                -> st
     PHole(_)             -> st
+    PList(pats, opt_rest) ->
+      match bind_op(st, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st1) ->
+        lm_emit_head_list(pats, opt_rest, headv, fail_lbl, st1) }
     _ ->
       match bind_op(st, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st1) -> {
         let st2 = lm_emit_head_test(hp, headv, fail_lbl, st1)
         lm_bind_head_value(hp, headv, st2)
       } }
   }
+
+# Re-enter the cell walk for a list head against the already-projected (borrowed)
+# head value. `lm_emit_cells` needs a `body_lbl` to branch to once the nested
+# list matches; here a match must FALL THROUGH to the enclosing arm's remaining
+# cells, not exit the arm — so we hand it a fresh `cont` label and reopen there,
+# the same `ls_fresh_label` + `reopen` shape `lm_emit_head_test` uses for a
+# discriminating variant head. A mismatch routes to the shared `fail_lbl`.
+fn lm_emit_head_list(pats: [Pattern], opt_rest: Option[String], headv: KVal,
+                     fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match ls_fresh_label(st) { LSLabel(cont, st1) -> {
+    let st2 = lm_emit_cells(pats, opt_rest, headv, cont, fail_lbl, st1)
+    reopen(st2, cont)
+  } }
 
 # Emit the discriminating test(s) for a head sub-pattern against the already-
 # projected head value `headv`, routing any mismatch to `fail_lbl`. A
