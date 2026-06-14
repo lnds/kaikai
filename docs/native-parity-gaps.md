@@ -1,12 +1,34 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-13, re-measured against main with a CLEAN-built kaic2):**
-> the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **45 listed gaps** — 43 measured failing on
-> macOS by `tools/test-backend-parity.sh` (native vs C-direct: pass=419
-> fail=43 skip=55) plus the 2 Linux-only SIGSEGV gaps (`list_helpers`,
-> `list_zip3_scan`) that pass on macOS but fail on Linux/CI, so they stay
-> listed.
+> **Status (2026-06-14, measured against a STATIC-LLVM-18 kaic2):** the
+> in-process libLLVM native backend is at **26 listed gaps** — 24 measured
+> failing on macOS by `tools/test-backend-parity.sh` (native vs C-direct:
+> pass=439 fail=24 skip=55 of 518) plus the 2 Linux-only SIGSEGV gaps
+> (`list_helpers`, `list_zip3_scan`).
+>
+> **First measurement against the VENDORED STATIC LLVM 18.1.8** (not Homebrew
+> dynamic v22): the shipped compiler links libLLVM statically (Rust/Zig/Julia
+> model — `make llvm-build` then `make KAI_LLVM=1 LLVM_CONFIG=stage0/third_party/llvm/build/bin/llvm-config kaic2`),
+> so parity is now measured against the LLVM the release actually uses. The
+> macOS gap SET was identical to the v22-dynamic set (no version-induced
+> drift), but the build path is now the correct one. Build-infra fixes this
+> required (none had ever been exercised): the `cmake-18.1.8.src` sibling
+> tarball must be extracted to `stage0/third_party/cmake` (llvm-fetch did not
+> fetch it); the stage2 Makefile links `nativecodegen` not `native` (the
+> latter drags in Disassembler libs the narrow static build omits) under
+> `--link-static` plus `-lc++` (a static LLVM link needs the C++ runtime `cc`
+> does not add).
+>
+> **The "json-real-in-object" + "char/hex decode" + "regex matcher logic"
+> clusters were ONE bug, now CLOSED** (lane native-lone-arm-subtest): the KIR
+> `lower_one_group` lone-arm fast-path skipped the payload sub-test of a lone
+> variant arm that discriminates on its slot (`Some(91)` matched `Some(49)`).
+> Closed 13 (json ×6, jwt, regex ×6); see the baseline header. The prose
+> below that calls these three SEPARATE families is now stale (bitácora).
+>
+> **Prior status (2026-06-13, Homebrew dynamic v22):** 45 listed gaps — 43
+> measured failing on macOS (`tools/test-backend-parity.sh`: pass=419 fail=43
+> skip=55) plus the 2 Linux-only SIGSEGV gaps.
 >
 > **Bookkeeping correction (two layers).** (1) Four burn-down lanes
 > (np-handlers, np-real, np-decode, np-crash) ran in parallel and were
