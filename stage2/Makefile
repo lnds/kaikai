@@ -14,6 +14,20 @@ else
 LDFLAGS_STACK :=
 endif
 
+# C++ runtime for the native (libLLVM) link. LLVM is C++, so the static
+# link needs the C++ runtime explicitly (`cc` does not add it). The library
+# is platform-specific: macOS ships libc++ (`-lc++`), but a Linux libLLVM —
+# whether the apt `llvm-dev` package or a stock build — is compiled against
+# libstdc++ (`-lstdc++`); linking `-lc++` there either fails to find the lib
+# or drags in a second, ABI-incompatible C++ runtime (`libstdc++.so: DSO
+# missing` / `__once_callable` undefined). Pick per platform; #834 caught
+# the hardcoded `-lc++` breaking tier1-native on Linux.
+ifeq ($(UNAME_S),Darwin)
+LLVM_CXXLIB := -lc++
+else
+LLVM_CXXLIB := -lstdc++
+endif
+
 # issue #343 — math/real libm bindings (sqrt, sin, log, …) live in
 # stage0/runtime.h. Linux glibc requires explicit `-lm` AFTER the
 # .c/.o inputs (strict-order ld); macOS libSystem already exposes
@@ -68,10 +82,12 @@ LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # aborting on those absent components in the static build (it is a harmless
 # no-op against a dynamic Homebrew llvm-config, which has every lib). LLVM
 # is C++, so a static link needs the C++ runtime explicitly (`cc` does not
-# add it; a dynamic `-lLLVM.dylib` carried it implicitly) — `-lc++` is the
-# macOS spelling. The release-static path (Rust/Zig/Julia model) thus links
-# with no libLLVM runtime dep; the dev-dynamic path is unchanged.
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) -lc++
+# add it; a dynamic `-lLLVM.dylib` carried it implicitly) — `$(LLVM_CXXLIB)`
+# resolves to `-lc++` on macOS and `-lstdc++` on Linux (the apt libLLVM is
+# libstdc++-built). The release-static path (Rust/Zig/Julia model) thus links
+# with no libLLVM runtime dep; the dev-dynamic path links the right C++ lib
+# for the host.
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) $(LLVM_CXXLIB)
 else
 LLVM_CPPFLAGS :=
 LLVM_LDFLAGS  :=
