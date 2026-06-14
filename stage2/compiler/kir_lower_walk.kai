@@ -1217,7 +1217,11 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # A handle carrying `init` state is stateful — its return clause sees
       # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
       let stateful = match initv { Some(_) -> true None -> false }
-      lower_handle_fork(x, body, eff, result, stateful, ret_opt, st4)
+      # `sym` (the install-site id) threads into the setjmp/pop so each site's
+      # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
+      # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
+      # the second push self-cycles the parent chain (refs #789).
+      lower_handle_fork(x, body, eff, sym, result, stateful, ret_opt, st4)
     } } }
 }
 
@@ -1226,23 +1230,23 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
 # value; both branch to Lret, where the return clause lowers over result.
 # `stateful` (the handle carries `init` state) gates the return clause's
 # `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
-fn lower_handle_fork(x: Expr, body: Expr, eff: String, result: String,
+fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
                      stateful: Bool, ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
-  match bind_op(st, KSetjmp(eff), kpos_of(x)) { LRes(jmpv, st1) ->
+  match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, result, lret, st3)
-      let st5 = lower_handle_discard(result, lret, ldisc, st4)
-      lower_handle_ret(eff, result, stateful, ret_opt, lret, st5)
+      let st4 = lower_handle_body(body, eff, sym, result, lret, st3)
+      let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
+      lower_handle_ret(eff, sym, result, stateful, ret_opt, lret, st5)
     } } }
 
 # Lbody: lower the body inline, store it into result, pop the evidence,
 # branch to the merge. The pop sits on the NORMAL exit only — the
 # discard path's longjmp already unwound past it (asu soundness note).
-fn lower_handle_body(body: Expr, eff: String, result: String, lret: String, st: LowerSt) : LowerSt / Console =
+fn lower_handle_body(body: Expr, eff: String, sym: String, result: String, lret: String, st: LowerSt) : LowerSt / Console =
   match lower_expr(body, st) { LRes(bv, st1) -> {
     let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
-    let st3 = ls_emit(st2, KPop(eff, kpos_of(body)))
+    let st3 = ls_emit(st2, KPop(eff, sym, kpos_of(body)))
     ls_seal(st3, KBr(lret, kpos_of(body)), lret)
   } }
 
@@ -1250,8 +1254,13 @@ fn lower_handle_body(body: Expr, eff: String, result: String, lret: String, st: 
 # clause already produced it and popped the evidence). The runtime hands
 # it back through the handler's discard slot — modelled as a unit store
 # placeholder the backend fills from the landing pad.
-fn lower_handle_discard(result: String, lret: String, ldisc: String, st: LowerSt) : LowerSt / Console {
-  let st1 = ls_emit(reopen(st, ldisc), KStore(result, KVar("__kai_discard"), KNoPos))
+# The discard slot is per install-SITE (`__kai_discard_<sym>`), not a single
+# `__kai_discard`: nested same-effect handles each own a jmp_buf+discard slot,
+# and the landing pad (setjmp != 0) of site N must read SITE N's discarded
+# value. The name MUST agree with `nfx_discard_reg(sym)` in emit_native_fx.kai
+# (the alloca the install reserves under the same string).
+fn lower_handle_discard(sym: String, result: String, lret: String, ldisc: String, st: LowerSt) : LowerSt / Console {
+  let st1 = ls_emit(reopen(st, ldisc), KStore(result, KVar(cat2("__kai_discard_", sym)), KNoPos))
   ls_seal(st1, KBr(lret, KNoPos), lret)
 }
 
@@ -1259,16 +1268,16 @@ fn lower_handle_discard(result: String, lret: String, ldisc: String, st: LowerSt
 # param to the body result; the clause body's value is the handle's
 # value. With no return clause the result passes through unchanged. A
 # STATEFUL handle's return clause body may reference `state`/`log` (the
-# handler's final state) — emit `KBindEvState(eff)` BEFORE lowering rexpr so
+# handler's final state) — emit `KBindEvState(eff, sym)` BEFORE lowering rexpr so
 # those registers resolve (mirror of emit_c's `kai_state = _ev.state` /
 # emit_llvm's GEP-load-push prologue). Stateless / no-return handles skip it.
-fn lower_handle_ret(eff: String, result: String, stateful: Bool,
+fn lower_handle_ret(eff: String, sym: String, result: String, stateful: Bool,
                     ret_opt: Option[HReturn], lret: String, st: LowerSt) : LRes / Console =
   match ret_opt {
     None -> LRes(KVar(result), reopen(st, lret))
     Some(HR(pname, rexpr, _, _)) -> {
       let st0 = reopen(st, lret)
-      let st1 = if stateful { ls_emit(st0, KBindEvState(eff, KNoPos)) } else { st0 }
+      let st1 = if stateful { ls_emit(st0, KBindEvState(eff, sym, KNoPos)) } else { st0 }
       let st2 = ls_emit(st1, KLet(pname, SBoxed, KLitOp(KVar(result)), KNoPos))
       lower_expr(rexpr, st2)
     }
