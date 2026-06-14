@@ -1,10 +1,16 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
 > **Status (2026-06-14, measured against a STATIC-LLVM-18 kaic2):** the
-> in-process libLLVM native backend is at **24 listed gaps** — 22 measured
+> in-process libLLVM native backend is at **23 listed gaps** — 21 measured
 > failing on macOS by `tools/test-backend-parity.sh` (native vs C-direct:
-> pass=442 fail=22 skip=55 of 519) plus the 2 Linux-only SIGSEGV gaps
+> pass=444 fail=21 skip=55 of 520) plus the 2 Linux-only SIGSEGV gaps
 > (`list_helpers`, `list_zip3_scan`).
+>
+> **literal-list-head CLOSED** (lane native-literal-list-head): a literal head
+> in a list pattern (`[""]`, `[0, ...rest]`) was not tested
+> (`lm_head_seal_test` handled variant heads only), so `[""]` matched any
+> one-element list — silently breaking `string.lines`. Fixed by emitting
+> `kai_eq_raw headv lit` for a literal head. Closed string_lines_chars.
 >
 > **list-in-variant-slot CLOSED** (lane native-list-in-slot): a list pattern
 > as a sub-pattern of a variant slot (`Some([x, y])`) lowered no length test +
