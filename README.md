@@ -212,6 +212,25 @@ by topic:
 - [`docs/proposed-extensions.md`](docs/proposed-extensions.md) —
   catalog of post-MVP language and tooling proposals.
 
+## Contributing
+
+kaikai does not yet have a defined process for incorporating improvements
+to the language or the standard library. **If you have an idea, open an
+issue in the official repository
+([kaikailang-org/kaikai](https://github.com/kaikailang-org/kaikai)) first**
+to discuss its validity with the team building the language and the standard
+packages — please do not start with a pull request for a new feature.
+
+kaikai is **pre-1.0 and unstable until the Orongo edition lands**: each
+edition pins a stable surface *within itself* (see [docs/editions.md](docs/editions.md)),
+but the project is still maturing, so treat the language and stdlib as
+unstable for building on top of. Pin your edition in `kai.toml`.
+
+If your idea is a library, you can **build and publish your own package**
+and depend on it from `kai.toml` today — no change to kaikai required. That
+is the fastest path to using your idea, and it keeps the standard library
+small. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guidance.
+
 ## License
 
 Licensed under either of
