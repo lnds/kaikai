@@ -47,6 +47,16 @@ header comment. Read them in order — each one introduces one new
 concept (sum types, then recursion + match, then algebraic effects,
 then fibers).
 
+## Prerequisites
+
+- **C compiler** (cc/gcc/clang)
+- **LLVM 21** development headers and libraries:
+  ```sh
+  sudo apt install llvm-21-dev libzstd-dev
+  ```
+  Other distributions: install `llvm21-devel` (Fedora) or the equivalent
+  package for your distro. The build uses `llvm-config` to locate LLVM.
+
 ## Build
 
 Everything builds from the repo root with `make`:
