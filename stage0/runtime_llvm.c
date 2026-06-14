@@ -1051,6 +1051,43 @@ KaiValue *kaix_clause_state_get(void *self) {
     return *((KaiValue **)((char *) self + 16));
 }
 
+/* ---------- clause-capture env (native walk, clause-capture ABI) ----------
+ *
+ * Enclosing-scope captures of a handler clause travel through the Ev `env`
+ * slot (byte 8), the C-direct backend's `EvE.env` channel. The install
+ * site allocates a stack env array — one `KaiValue*` slot per cross-clause
+ * capture, in `handle_captures_at` (= KHandlerDecl.env_caps) order — fills
+ * it from its in-scope locals, and points `self->env` at it. Each clause
+ * body indexes that array by the capture's union position (`PEnvCapture(j)`,
+ * resolved once at lowering). These helpers keep the byte-8 offset + the
+ * dup discipline on the C side, the same way the byte-16 state helpers do.
+ *
+ * The whole channel is stack-local to the install stmt-expr and sound only
+ * under one-shot resume: the clauses run inside the handle's frame, which
+ * does not return until the body unwinds. A multi-shot or fiber-escaping
+ * resume would dangle `env`; the compile-time `check_resume_one_shot`
+ * (kir_lower_fns.kai) is the structural guard that keeps that impossible. */
+
+/* Write the env array pointer into Ev field 1 (byte 8) during install. */
+void kaix_ev_set_env(void *ev, void *env) {
+    *((void **)((char *) ev + 8)) = env;
+}
+
+/* Stamp one capture into the install's env array at union slot `j`. */
+void kaix_env_set(void *env, int64_t j, KaiValue *v) {
+    ((KaiValue **) env)[j] = v;
+}
+
+/* Clause prologue read: fetch capture `j` from `self->env` (byte 8) and
+ * return it dup'd — perceus analyses each clause body in isolation and
+ * assumes a private reference it may consume; the env holds one borrow
+ * scoped to the install stmt-expr (mirror of emit_c's
+ * `kai_internal_dup(_env->kai_<name>)`). */
+KaiValue *kaix_clause_env_get(void *self, int j) {
+    KaiValue **env = *((KaiValue ***)((char *) self + 8));
+    return kai_internal_dup(env[j]);
+}
+
 /* m7c-d — non-static wrappers for the default-handler clause
  * functions defined static in runtime.h. The LLVM emit's
  * `kai_main_install_defaults` references these. Untyped i8*
