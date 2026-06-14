@@ -75,14 +75,60 @@ fn lower_fns(ds: [Decl], st: LowerSt, acc: [KFn]) : [KFn] / Console = match ds {
 fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
             body: Expr, mo: Option[String], st0: LowerSt) : KFn / Console {
   let sym = c_sym(name, mo)
-  let st = ls_enter_fn(st0, sym, param_local_names(params, []))
+  # Enter WITH the EFn table rotated to prefer `mo` (this fn's module), so a
+  # bare call inside the body resolves to a same-module definition over an
+  # imported homonym — the C / LLVM emitters do the same via
+  # `fns_prefer_module` before each body. (`hashset.from_list`'s `empty()`
+  # resolved to the imported `hashmap.empty` without this — `no such field`.)
+  let st = ls_enter_fn_in(st0, sym, param_local_names(params, []), mo)
   let kparams = lower_params(params, [])
-  let r = lower_expr(body, st)
+  # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
+  # lowering would otherwise reduce to a panic stub (the native path then
+  # aborts every protocol call). C / LLVM-text re-emit the dispatcher's body
+  # from the AST (`body_is_proto_dispatch`); the native path consumes KIR, so
+  # we lower the marker to a real dispatch HERE — a boxed call to the runtime
+  # `kaix_proto_dispatch<N>` shim, which derives the head tag, resolves the
+  # impl table, and indirect-calls (one ABI source of truth, shared with the
+  # oracle). C / LLVM never reach this branch (they intercept upstream).
+  let r = if body_is_proto_dispatch(body) {
+    lower_proto_dispatch(proto_dispatch_parts(body), params, kpos_of(body), st)
+  } else { lower_expr(body, st) }
   match r {
     LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
                             ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
                             region_id: None, stateful: false }
   }
+}
+
+# Lower a protocol dispatcher body to a boxed call to the runtime dispatch
+# shim. The shim takes the proto id (boxed Int), the proto + op names (boxed
+# Strings, for the no-impl panic message) and the op's args; it derives the
+# receiver's head tag, resolves `kai_lookup_impl`, and indirect-calls the
+# impl (mirror of `emit_proto_dispatch_shim_c`). An arity-0 op (`Default.
+# default`) has no receiver to dispatch on — the monomorphiser is meant to
+# have pinned `Self`; reaching the body is an unresolved-call bug, so we keep
+# the loud panic stub the oracle also emits.
+fn lower_proto_dispatch(parts: ProtoDispatchParts, params: [Param],
+                        pos: KPos, st: LowerSt) : LRes / Console = match parts {
+  PDP(pname, opname) -> {
+    let arity = list_length(params)
+    if arity == 0 {
+      lower_panic_stub(kir_quote(concat_all(["no impl of ", pname, ".", opname,
+        " for runtime head (arity 0 op: caller must annotate Self)"])), st)
+    } else {
+      let shim = cat2("kaix_proto_dispatch", int_to_string(arity))
+      let args = [KIntV(stdlib_proto_id_int(pname)), KStrV(kir_quote(pname)),
+                  KStrV(kir_quote(opname)), ...proto_dispatch_arg_vals(params)]
+      bind_op(st, KCall(shim, args), pos)
+    }
+  }
+}
+
+# The dispatcher's params as `KVar` atoms in declaration order (the op's
+# receiver first), the boxed args the shim forwards to the resolved impl.
+fn proto_dispatch_arg_vals(params: [Param]) : [KVal] = match params {
+  []           -> []
+  [p, ...rest] -> [KVar(p.pname), ...proto_dispatch_arg_vals(rest)]
 }
 
 # --- Lambdas: lifted bodies as top-level `KFnLambda`s -------------------

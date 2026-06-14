@@ -33,6 +33,8 @@ import compiler.ast
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_match
+import compiler.kir_lower_variant
+import compiler.kir_lower_bind
 
 # A `match` is a record match iff any arm pattern is a `PRecord`. The typer
 # guarantees a homogeneous scrutinee, so record arms never mix with
@@ -49,21 +51,23 @@ pub fn match_is_record(arms: [Arm]) : Bool = match arms {
   }
 }
 
-# A record arm with NO literal-valued field (`{ x, y }`, `{ _ }`) always
+# A record arm with NO DISCRIMINATING field (`{ x, y }`, `{ _ }`) always
 # matches — it is a catch-all that ends the chain. A non-record pattern in a
 # record match (a trailing `_`, a whole-value binder, a hole) is likewise
-# unconditional. An arm with at least one literal field IS conditional.
+# unconditional. A field DISCRIMINATES when it carries a test: a literal
+# (`{ x: 0 }`), a variant (`(K1, _)` = `{ fst: PVariant(K1) }`), a nested
+# record / list (`psub_is_discriminating`). The old check counted ONLY
+# literal fields, so a tuple-of-sums arm `(K1, K2)` — all-variant fields —
+# read as a catch-all and matched everything (hashmap_collision miscompile).
 pub fn rec_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
-  PRecord(fields) -> not rec_has_literal_field(fields)
+  PRecord(fields) -> not rec_has_discriminating_field(fields)
   _               -> true
 }
 
-fn rec_has_literal_field(fields: [PField]) : Bool = match fields {
+fn rec_has_discriminating_field(fields: [PField]) : Bool = match fields {
   [] -> false
-  [PField(_, sub, _), ...rest] -> match sub.pkind {
-    PLit(_) -> true
-    _       -> rec_has_literal_field(rest)
-  }
+  [PField(_, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) { true } else { rec_has_discriminating_field(rest) }
 }
 
 # Emit the field-test conjunction + field binds for one record arm against
@@ -84,86 +88,27 @@ pub fn rec_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
   }
 }
 
-# A record arm: if it has literal fields, build their conjunction of
-# equality tests into a fresh fail label, then reopen the matched body and
-# project the binding fields. A catch-all record arm (all binds/wild)
-# branches unconditionally to the body — its "fail" is the body label.
+# A record arm: if it has discriminating fields (literal OR variant OR nested
+# structure), build their conjunction of tests into a fresh fail label via
+# the SHARED `lm_field_tests` (which dispatches `kai_eq_raw` for a literal
+# field and `kai_tag_eq` for a variant field — the same discrimination the
+# variant head-test path uses), then reopen the matched body and bind every
+# field via `bind_pattern_fields_any` (which projects a plain binder AND
+# recurses into a variant field's sub-binders / a nested record's fields).
+# A catch-all record arm (all binds/wild) branches unconditionally.
 fn rec_emit_record_arm(fields: [PField], p: Pattern, scrv: KVal,
                        body_lbl: String, st: LowerSt) : LMArm / Console =
-  if rec_has_literal_field(fields) {
+  if rec_has_discriminating_field(fields) {
     match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
-      let st2 = rec_emit_tests(fields, scrv, body_lbl, fail_lbl, st1)
-      let st3 = rec_bind_fields(fields, scrv, reopen(st2, body_lbl))
-      LMArm(st3, fail_lbl)
+      let st2 = lm_field_tests(fields, scrv, fail_lbl, st1)
+      let st3 = ls_seal(st2, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+      let st4 = bind_pattern_fields_any(p, scrv, reopen(st3, body_lbl))
+      LMArm(st4, fail_lbl)
     } }
   } else {
     let st1 = ls_seal(st, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
-    LMArm(rec_bind_fields(fields, scrv, reopen(st1, body_lbl)), body_lbl)
+    LMArm(bind_pattern_fields_any(p, scrv, reopen(st1, body_lbl)), body_lbl)
   }
-
-# Emit the conjunction of literal-field equality tests, sealing each into a
-# `condbr (kai_eq_raw (field_borrow scr name) lit) ? cont : fail_lbl`.
-# Successive literal fields chain through fresh continue blocks (all must
-# pass); the last test branches to `body_lbl`. Non-literal fields carry no
-# test (they are projected later by `rec_bind_fields`). With exactly one
-# literal field this is a single `condbr`.
-fn rec_emit_tests(fields: [PField], scrv: KVal, body_lbl: String,
-                  fail_lbl: String, st: LowerSt) : LowerSt / Console = match fields {
-  [] -> ls_seal(st, KBr(body_lbl, KNoPos), body_lbl)
-  [PField(name, sub, _), ...rest] -> match sub.pkind {
-    PLit(lit) -> rec_emit_one_test(name, lit, rest, scrv, body_lbl, fail_lbl, sub, st)
-    _         -> rec_emit_tests(rest, scrv, body_lbl, fail_lbl, st)
-  }
-}
-
-# One literal field's equality test. If more literal fields follow, open a
-# fresh continue block for the success path and recurse; otherwise the
-# success path is `body_lbl` directly (avoids an empty trailing block).
-fn rec_emit_one_test(name: String, lit: Expr, rest: [PField], scrv: KVal,
-                     body_lbl: String, fail_lbl: String, sub: Pattern,
-                     st: LowerSt) : LowerSt / Console =
-  if rec_has_literal_field(rest) {
-    match ls_fresh_label(st) { LSLabel(cont, st1) -> {
-      let st2 = rec_seal_test(name, lit, scrv, cont, fail_lbl, sub, st1)
-      rec_emit_tests(rest, scrv, body_lbl, fail_lbl, reopen(st2, cont))
-    } }
-  } else { rec_seal_test(name, lit, scrv, body_lbl, fail_lbl, sub, st) }
-
-# `condbr (kai_eq_raw (field_borrow scr name) lit) ? ok_lbl : fail_lbl`. The
-# field is read through the NON-consuming `kai_op_field_borrow` prim (no
-# incref — the scrutinee is shared across the whole arm chain; the owning
-# `kai_op_field` is reserved for the bind path), and the equality through
-# the non-consuming `kai_eq_raw` shim — exactly the C-direct oracle's
-# `kai_op_field_borrow` + `kai_op_eq` test pair. Neither prim consumes its
-# operands, so no field or scrutinee ref leaks across a failing test, and
-# the immortal Bool result needs no drop.
-fn rec_seal_test(name: String, lit: Expr, scrv: KVal, ok_lbl: String,
-                 fail_lbl: String, sub: Pattern, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, KPrim("kai_op_field_borrow", [scrv, KStrV(name)]),
-                KAt(sub.line, sub.col)) { LRes(fv, st1) ->
-    match bind_op(st1, KPrim("kai_eq_raw", [fv, rec_lit_atom(lit)]), KAt(lit.line, lit.col)) {
-      LRes(cond, st2) -> ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(lit.line, lit.col)), fail_lbl)
-    } }
-
-# Project every BINDING field of the arm into its name via the OWNING
-# `kai_op_field` (incref'd, so the body owns its bindings — perceus's
-# already-placed KRC nodes drop them). Literal / wildcard fields bind
-# nothing. Mirror of `emit_pat_binds_record`'s non-destructuring arm; nested
-# destructuring inside a field (`{ x: Some(n) }`) is a follow-up.
-fn rec_bind_fields(fields: [PField], scrv: KVal, st: LowerSt) : LowerSt / Console = match fields {
-  [] -> st
-  [PField(name, sub, _), ...rest] -> match sub.pkind {
-    PBind(bnd) -> rec_bind_fields(rest, scrv, rec_emit_bind(bnd, name, scrv, sub, st))
-    _          -> rec_bind_fields(rest, scrv, st)
-  }
-}
-
-# `KLet bnd = kai_op_field(scr, "name")` — an owned field read. The KIR
-# `KLet` aliases the result register; the prim itself increfs (the C-direct
-# `kai_op_field` does too), so the binding owns its ref.
-fn rec_emit_bind(bnd: String, name: String, scrv: KVal, sub: Pattern, st: LowerSt) : LowerSt =
-  ls_emit(st, KLet(bnd, SBoxed, KPrim("kai_op_field", [scrv, KStrV(name)]),
-                   KAt(sub.line, sub.col)))
 
 # Bind a non-record catch-all arm's name (a whole-value binder or
 # as-pattern) to the scrutinee. PWild / PHole bind nothing. Mirror of
@@ -176,17 +121,3 @@ fn rec_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind
 
 fn rec_bind_name(name: String, scrv: KVal, p: Pattern, st: LowerSt) : LowerSt =
   ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
-
-# The KIR atom for a literal field pattern's expression (Int / Bool / Char /
-# String / Real). A non-literal here is a typer invariant violation —
-# lower it to unit so the equality is well-formed but always false (loud
-# divergence vs the oracle catches it, never a silent miscompile). Mirror
-# of `lit_atom`.
-fn rec_lit_atom(lit: Expr) : KVal = match lit.kind {
-  EInt(n)       -> KIntV(n)
-  EBool(b)      -> KBoolV(b)
-  EChar(c)      -> KCharV(c)
-  EStr(span, _) -> KStrV(span)
-  EReal(r, _)   -> KRealV(r)
-  _             -> KUnitV
-}
