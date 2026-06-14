@@ -31,17 +31,21 @@
 import compiler.util
 import compiler.ast
 import compiler.kir
+import compiler.fnreg
+import compiler.emit_shared
 import compiler.native_prims
 import compiler.emit_native_fn
 import compiler.emit_native_ops
 import compiler.emit_native_term
 import compiler.emit_native_def
+import compiler.emit_native_proto
 
 # Build the LLVM module for `kp` in memory and emit it as an object at
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
 # failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
 # `--emit=native`.
-pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
+pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [EVar],
+                           fns: [EFn], out_path: String) : Int / Console = {
   let m = llvm_module_new("kai_native")
   # ALL backend state (module, builder, types, fn, reg/block tables) lives
   # in the C-side `ctx` reached through this opaque Handle — no handle
@@ -73,7 +77,7 @@ pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
   # this symbol). The KIR does NOT model these — they are synthetic, like
   # the C-direct emitter's `emit_fn_thunk`.
   nemit_fn_thunks(ctx, kp.fns)
-  native_build_runtime_hooks(ctx, kp.defaults)
+  native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns)
   if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
   else {
     eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
@@ -128,22 +132,18 @@ fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl]) : Unit / Co
 # C-direct oracle builds the same two functions from `default_setups_for` /
 # `default_pops_for`.
 #
-# `_kai_proto_init_llvm` stays an empty `void ()`: native protocol dispatch
-# is not observable in this subset (a later lane fills it).
-fn native_build_runtime_hooks(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
+# `_kai_proto_init_llvm` now carries a REAL body: the protocol impl-table
+# registration (`nproto_build_init`, emit_native_proto), mirroring the
+# C-direct `_kai_register_proto_tables` and the LLVM-text `_kai_proto_init_
+# llvm`. Without it `kai_lookup_impl` stayed NULL and every `hash`/`==`/`<`
+# dispatch panicked "no impl" (hashmap/hashset/crypto). The `decls`/
+# `variants`/`fns` are the post-perceus AST tables the driver already
+# builds for the KIR lowering; the pure collectors live in `emit_shared`.
+fn native_build_runtime_hooks(ctx: Handle, defaults: [KDefault], decls: [Decl],
+                              variants: [EVar], fns: [EFn]) : Unit / Console = {
   nemit_build_install_defaults(ctx, defaults)
   nemit_build_teardown_defaults(ctx, defaults)
-  let m = native_ctx_m(ctx)
-  native_build_void_noop(m, llvm_fn_type_0(llvm_void_type(m)), "_kai_proto_init_llvm")
-}
-
-# Define one empty `void name()` — a single block returning void.
-fn native_build_void_noop(m: Handle, void_fn_ty: Handle, name: String) : Unit = {
-  let func = llvm_add_function(m, name, void_fn_ty)
-  let entry = llvm_append_block(m, func, "entry")
-  let b = llvm_builder_new(m)
-  llvm_position_at_end(b, entry)
-  llvm_build_ret_void(b)
+  nproto_build_init(ctx, decls, variants, fns)
 }
 
 # Derive the object-file path from the source path: `foo.kai` -> `foo.o`.
