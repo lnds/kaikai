@@ -69,11 +69,16 @@ pub fn nfx_op_field(thunks: [KOpThunk], op: String, i: Int) : Int = match thunks
 # KInstall reserves four allocas in the entry block (the walk's "allocas
 # only in entry" rule): the Ev blob, the KaiEvidence node, the jmp_buf,
 # and the discard slot. Each is registered in the ctx table under a name
-# derived from the effect so KSetjmp / __kai_discard resolve it.
+# derived from the install-site SYM (`_kai_handler_<line>_<col>`), NOT the
+# effect name: two nested handles of the SAME effect each own a distinct
+# frame, so a per-effect name would dedup them onto one alloca and the
+# second `kaix_evidence_push_with_jmp` would self-cycle the parent chain
+# (`node->parent == node` → infinite lookup loop; refs #789). The `sym`
+# mirrors emit_c's per-`({})` lexical `_node`/`_ev`/`_jmp`/`_discard`.
 
-pub fn nfx_ev_reg(eff: String) : String = cat2("__ev_", eff)
-pub fn nfx_node_reg(eff: String) : String = cat2("__node_", eff)
-pub fn nfx_jmpbuf_reg(eff: String) : String = cat2("__jmpbuf_", eff)
+pub fn nfx_ev_reg(sym: String) : String = cat2("__ev_", sym)
+pub fn nfx_node_reg(sym: String) : String = cat2("__node_", sym)
+pub fn nfx_jmpbuf_reg(sym: String) : String = cat2("__jmpbuf_", sym)
 # The clause-capture env array (mirror of emit_c's stack `_env` struct):
 # one `ptr` slot per handle-union capture, filled by the install and
 # pointed-to from Ev field 1. Stack-local to the install frame — sound
@@ -81,7 +86,7 @@ pub fn nfx_jmpbuf_reg(eff: String) : String = cat2("__jmpbuf_", eff)
 # which does not return until the body unwinds). A multi-shot / fiber-
 # escaping resume would dangle this; the one-shot check in `kir_lower_fns`
 # (`check_resume_one_shot`) is the structural guard that keeps it safe.
-pub fn nfx_env_reg(eff: String) : String = cat2("__env_", eff)
+pub fn nfx_env_reg(sym: String) : String = cat2("__env_", sym)
 # Fixed capacity of the env array (and the Ev blob). The alloca pass can
 # not see the per-handle capture count, so it over-reserves; the install
 # must NOT write past this, and `nemit_install_env` aborts loud if a
@@ -89,9 +94,11 @@ pub fn nfx_env_reg(eff: String) : String = cat2("__env_", eff)
 # but a silent stack overwrite is unacceptable — fail at compile time).
 pub fn nfx_env_cap() : Int = 16
 # The discard slot is the value the longjmp lands with; the KIR discard
-# block reads it as `KVar("__kai_discard")` (kir_lower_walk.kai), so the
-# name is fixed (one handle frame is live at a time in this subset).
-pub fn nfx_discard_reg() : String = "__kai_discard"
+# block reads it as `KVar("__kai_discard_<sym>")` (kir_lower_walk.kai's
+# `lower_handle_discard`), per install-SITE so nested same-effect handles
+# do not clobber each other's landing value. This string MUST agree with
+# that `KVar` name byte-for-byte.
+pub fn nfx_discard_reg(sym: String) : String = cat2("__kai_discard_", sym)
 # The KaiCont a KPerform allocates (one per fn body; this subset has a
 # single perform per effectful fn).
 pub fn nfx_cont_reg() : String = "__kai_cont"
@@ -162,7 +169,7 @@ fn nfx_alloca_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
 # KLet/KDo whose op is a KPerform reserves the KaiCont. Everything else is
 # a no-op for the alloca pass.
 fn nfx_alloca_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
-  KInstall(eff, sym, _, alias, _) -> { nfx_reserve_install(ctx, eff); nfx_reserve_alias(ctx, alias) }
+  KInstall(_, sym, _, alias, _) -> { nfx_reserve_install(ctx, sym); nfx_reserve_alias(ctx, alias) }
   KLet(_, _, op, _) -> nfx_alloca_op(ctx, op)
   KDo(op, _)        -> nfx_alloca_op(ctx, op)
   _                 -> ()
@@ -173,37 +180,40 @@ fn nfx_alloca_op(ctx: Handle, op: KOp) : Unit / Console = match op {
   _                 -> ()
 }
 
-# Reserve the four install-frame allocas, registered under effect-derived
-# names. The Ev blob is `[3 + nops x ptr]`; nops is unknown here (the
+# Reserve the four install-frame allocas, registered under per-install-SITE
+# names (derived from `sym`, the handler-decl symbol — unique per `handle`
+# site). The Ev blob is `[3 + nops x ptr]`; nops is unknown here (the
 # handler decl is not threaded into the alloca pass), so reserve a generous
 # fixed `[16 x ptr]` — larger than any single effect's op count in the
 # core, and the unused tail is never read (the install writes only the
 # header + the real op slots). The jmp_buf is runtime-sized via
 # `kai_jmpbuf_size`. Each alloca is a `let` (handle-binder exclusion).
-fn nfx_reserve_install(ctx: Handle, eff: String) : Unit / Console = {
+# Two nested handles of the same effect get distinct `sym`s → distinct
+# allocas → distinct KaiEvidence nodes (no parent-chain self-cycle, #789).
+fn nfx_reserve_install(ctx: Handle, sym: String) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let evty = llvm_array_type(p, 16)
-  let ev = llvm_build_alloca(native_ctx_b(ctx), evty, cat2(nfx_ev_reg(eff), ".addr"))
-  native_ctx_add_reg(ctx, nfx_ev_reg(eff), ev, -1)
-  let node = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, 8), cat2(nfx_node_reg(eff), ".addr"))
-  native_ctx_add_reg(ctx, nfx_node_reg(eff), node, -1)
+  let ev = llvm_build_alloca(native_ctx_b(ctx), evty, cat2(nfx_ev_reg(sym), ".addr"))
+  native_ctx_add_reg(ctx, nfx_ev_reg(sym), ev, -1)
+  let node = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, 8), cat2(nfx_node_reg(sym), ".addr"))
+  native_ctx_add_reg(ctx, nfx_node_reg(sym), node, -1)
   # Clause-capture env array — `[nfx_env_cap x ptr]` like the Ev blob
   # (op-count and capture-count are both unknown in the alloca pass; the cap
   # over-covers any core handle, and the unused tail is never read — the
   # install fills only the real capture slots, the clause prologue indexes
   # only those). Slot -1: a raw `Value*`, never an RC binder.
-  let env = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, nfx_env_cap()), cat2(nfx_env_reg(eff), ".addr"))
-  native_ctx_add_reg(ctx, nfx_env_reg(eff), env, -1)
+  let env = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, nfx_env_cap()), cat2(nfx_env_reg(sym), ".addr"))
+  native_ctx_add_reg(ctx, nfx_env_reg(sym), env, -1)
   # `kai_jmpbuf_size() -> i64`: declare it i64-returning (NOT the all-boxed
   # `ptr()` `nemit_call0` assumes), then `alloca i8, i64 %size` — the array
   # count MUST be an integer, never a `ptr`.
   let jmpsz = ncall_sig0(ctx, "kai_jmpbuf_size", native_ctx_i64t(ctx))
-  let jmpbuf = llvm_build_array_alloca(native_ctx_b(ctx), native_ctx_i32t(ctx), jmpsz, cat2(nfx_jmpbuf_reg(eff), ".addr"))
-  native_ctx_add_reg(ctx, nfx_jmpbuf_reg(eff), jmpbuf, -1)
+  let jmpbuf = llvm_build_array_alloca(native_ctx_b(ctx), native_ctx_i32t(ctx), jmpsz, cat2(nfx_jmpbuf_reg(sym), ".addr"))
+  native_ctx_add_reg(ctx, nfx_jmpbuf_reg(sym), jmpbuf, -1)
   # The discard slot is a single `ptr` cell, init NULL (the body path may
   # never longjmp; the discard block only loads it on the landing path).
-  let disc = llvm_build_alloca(native_ctx_b(ctx), p, cat2(nfx_discard_reg(), ".addr"))
-  native_ctx_add_reg(ctx, nfx_discard_reg(), disc, 0)
+  let disc = llvm_build_alloca(native_ctx_b(ctx), p, cat2(nfx_discard_reg(sym), ".addr"))
+  native_ctx_add_reg(ctx, nfx_discard_reg(sym), disc, 0)
   let _s = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), disc)
   ()
 }
