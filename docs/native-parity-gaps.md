@@ -1,29 +1,28 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
-> **Status (2026-06-13, re-measured against main after the parallel-lane merges):**
+> **Status (2026-06-13, re-measured against main with a CLEAN-built kaic2):**
 > the in-process libLLVM native backend (`--backend=native`,
-> docs/kir-design.md §7.2) is at **65 listed gaps** — 63 measured failing on
-> macOS by `tools/test-backend-parity.sh` (native vs C-direct: pass=399
-> fail=63 skip=55) plus the 2 Linux-only SIGSEGV gaps (`list_helpers`,
+> docs/kir-design.md §7.2) is at **45 listed gaps** — 43 measured failing on
+> macOS by `tools/test-backend-parity.sh` (native vs C-direct: pass=419
+> fail=43 skip=55) plus the 2 Linux-only SIGSEGV gaps (`list_helpers`,
 > `list_zip3_scan`) that pass on macOS but fail on Linux/CI, so they stay
 > listed.
 >
-> **Bookkeeping correction.** Four burn-down lanes (np-handlers, np-real,
-> np-decode, np-crash) ran in parallel and were merged resolving baseline
-> conflicts by "accept both sides". That left the ratchet and this doc
-> claiming numbers (46 in the file, 60 and 51 in two stacked status blocks)
-> that did not match reality: 19 fixtures still failing had been dropped from
-> the baseline, because each lane removed *its* closed fixtures and the
-> merges union'd the removals without re-checking. Re-measured from the live
-> corpus and the baseline rebuilt to the 63 real macOS failures + the 2
-> Linux-only — purely additive vs the corrupted file (no dead entries; the
-> "closes" some lanes narrated for collatz/euler1/fizzbuzz/imc/quicksort/wc
-> and the Real/complex fixtures did not survive to main). The per-lane
-> narratives below are kept as *attempted* root-cause analysis, not as
-> confirmed-closed state — trust the baseline file and a fresh parity run,
-> not the prose.
+> **Bookkeeping correction (two layers).** (1) Four burn-down lanes
+> (np-handlers, np-real, np-decode, np-crash) ran in parallel and were
+> merged "accept both sides", leaving the file and doc claiming several
+> mutually-inconsistent numbers (46 / 60 / 51). (2) The first reconciliation
+> attempt measured against a STALE kaic2 binary and reported 63 — ~20
+> fixtures inflated, because the measuring compiler predated its own source
+> (the recurring "clean-build before you trust a measurement" lesson). The
+> clean-built re-measure is **43**; the lanes actually closed far more than
+> the bookkeeping showed (collatz/euler1/fizzbuzz/imc/quicksort/wc and the
+> pipe/Real/handler families largely PASS on native now). The baseline is
+> rebuilt from this clean run; the per-lane narratives below are *attempted*
+> root-cause analysis — trust the baseline file and a fresh CLEAN-built
+> parity run, not the prose.
 >
-> The flip to native-default (Lane 1.5) remains **BLOCKED** on these 65.
+> The flip to native-default (Lane 1.5) remains **BLOCKED** on these 45.
 > This file is the burn-down input: every failing fixture, grouped by
 > root-cause family. The anti-regression ratchet that locks the count is
 > `tools/native-parity-baseline.txt` (gated in `tier1-native`).
