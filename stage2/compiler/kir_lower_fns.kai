@@ -38,9 +38,9 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
   let lamfns  = lower_lam_fns(lc.lams, st0, [])
-  let clsfns  = lower_clause_fns(lc.clauses, st0, [])
+  let clsfns  = lower_clause_fns(lc.clauses, lc.clauses, st0, [])
   KProgram { types: types, fns: list_append(kfns, list_append(lamfns, clsfns)),
-             handlers: lower_handler_decls(lc.clauses, []),
+             handlers: lower_handler_decls(lc.clauses, lc.clauses, []),
              install_order: kir_install_order(raw_decls),
              defaults: kir_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls),
@@ -110,11 +110,74 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt) : KFn / Console = match l {
   }
 }
 
-# Each capture name becomes a `PCapture(j)` param read from `self` at the
-# matching index (the order the collector recorded in the caps list).
+# Each capture name becomes a `PCapture(j)` param read from `self->as.clo`
+# at the matching index (the order the collector recorded in the lambda's
+# own caps list). Lambda-only — a clause uses `lower_env_captures`.
 fn lower_captures(caps: [String], j: Int, acc: [KParam]) : [KParam] = match caps {
   [] -> acc
   [c, ...rest] -> lower_captures(rest, j + 1, list_append(acc, [capture_param(c, j)]))
+}
+
+# A clause's captures become `PEnvCapture(j)` params, where `j` is the
+# capture's index in the HANDLE's cross-clause union (`env_caps`), NOT in
+# the clause's own caps list. The Ev `env` array the install fills is
+# laid out in union order, shared by every clause of the handle, so a
+# clause that captures a subset must still index by the union position
+# (mirror of emit_c, which keys env-struct fields by surface NAME — the
+# union order is that name's fixed slot). `caps` is the clause's own
+# capture list (preserved for the binder NAME); `env_caps` the handle
+# union (resolved for the INDEX).
+fn lower_env_captures(caps: [String], env_caps: [String], acc: [KParam]) : [KParam] / Console = match caps {
+  [] -> acc
+  [c, ...rest] -> {
+    let j = list_index_of_str(env_caps, c, 0)
+    # The clause's caps are a subset of the handle union by construction
+    # (`kir_merge_str_set` unions every clause's caps), so a miss is a
+    # lowering invariant break — fail loud rather than emit `PEnvCapture(-1)`
+    # (an out-of-bounds env read the backend would silently corrupt on).
+    let _ = if j < 0 { eprint(cat2("kir: clause capture not in handle union: ", c)) } else { () }
+    lower_env_captures(rest, env_caps, list_append(acc, [env_capture_param(c, j)]))
+  }
+}
+
+# A `PEnvCapture(j)` param: a boxed, owned cell the clause prologue fills
+# from `self->env[j]` (with a dup — perceus analyses the clause body in
+# isolation, same contract as a lambda capture).
+fn env_capture_param(name: String, j: Int) : KParam =
+  KParam { name: name, slot: SBoxed, mode: KOwn, origin: PEnvCapture(j) }
+
+# Index of `s` in `xs`, or -1 if absent. Local mirror to keep this off
+# the util import surface (the clause caps are always a subset of the
+# handle union, so the -1 is a should-not-happen defensive fallback).
+fn list_index_of_str(xs: [String], s: String, i: Int) : Int = match xs {
+  [] -> 0 - 1
+  [h, ...rest] -> if h == s { i } else { list_index_of_str(rest, s, i + 1) }
+}
+
+# The cross-clause union of every clause's captures for the handle pinned
+# at (hline, hcol) — mirror of emit_c's `handle_captures_at`. Stable
+# "first-occurrence-wins" order, shared by the install (env fill) and the
+# clause prologue (env index) so both agree by construction.
+fn kir_handle_captures_at(cls: [ClauseInfo], hline: Int, hcol: Int) : [String] = match cls {
+  [] -> []
+  [c, ...rest] -> match c {
+    CI(line, col, _, _, _, _, _, _, caps) ->
+      if line == hline and col == hcol {
+        kir_merge_str_set(caps, kir_handle_captures_at(rest, hline, hcol))
+      } else {
+        kir_handle_captures_at(rest, hline, hcol)
+      }
+  }
+}
+
+# Stable-order union of two string lists (mirror of emit_c's
+# `merge_string_set`): every element of `a` not already in `b`, prepended
+# in order, then `b`. Field order MUST match across install/read.
+fn kir_merge_str_set(a: [String], b: [String]) : [String] = match a {
+  [] -> b
+  [h, ...rest] ->
+    if list_has(b, h) { kir_merge_str_set(rest, b) }
+    else { [h, ...kir_merge_str_set(rest, b)] }
 }
 
 # The bound names a fn/lambda/clause introduces at entry — its params plus
@@ -132,18 +195,22 @@ fn param_local_names(params: [Param], acc: [String]) : [String] = match params {
 # One `KFnClause` per handler clause. Params = the clause's args
 # (`PDirect`), the trailing `resume` continuation (`PResume`, used by the
 # body so it enters Perceus one-shot analysis), and the captures
-# (`PCapture`, read from the evidence env). The body lowers with the
-# clause's enc_fn as the lambda-scoping key.
-fn lower_clause_fns(clauses: [ClauseInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match clauses {
+# (`PEnvCapture`, read from the Ev `env` array at the handle-union index).
+# The body lowers with the clause's enc_fn as the lambda-scoping key.
+# `all_cls` is the whole program's clause list (threaded so each clause
+# can resolve its handle's cross-clause capture union).
+fn lower_clause_fns(clauses: [ClauseInfo], all_cls: [ClauseInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match clauses {
   [] -> acc
-  [c, ...rest] -> lower_clause_fns(rest, st0, list_append(acc, [lower_clause_fn(c, st0)]))
+  [c, ...rest] -> lower_clause_fns(rest, all_cls, st0, list_append(acc, [lower_clause_fn(c, all_cls, st0)]))
 }
 
-fn lower_clause_fn(c: ClauseInfo, st0: LowerSt) : KFn / Console = match c {
+fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt) : KFn / Console = match c {
   CI(line, col, _, op, params, body, stateful, enc_fn, caps) -> {
     let sym = clause_sym(line, col, op)
     let st = ls_enter_fn(st0, enc_fn, param_local_names(params, caps))
-    let kparams = list_append(lower_clause_params(params), lower_captures(caps, 0, []))
+    # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
+    let env_caps = kir_handle_captures_at(all_cls, line, col)
+    let kparams = list_append(lower_clause_params(params), lower_env_captures(caps, env_caps, []))
     match lower_expr(body, st) { LRes(val, st1) -> {
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
@@ -172,22 +239,29 @@ fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KP
 
 # One `KHandlerDecl` per (effect, handler-site) the clauses belong to.
 # Groups clauses by their (line, col) handler key, mapping each op to its
-# clause-thunk symbol so a `KInstall` resolves the right clause set.
-fn lower_handler_decls(clauses: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
+# clause-thunk symbol so a `KInstall` resolves the right clause set. Each
+# decl carries `env_caps` (the handle's cross-clause capture union) so the
+# native install fills the Ev `env` array in the order the clause prologue
+# (`PEnvCapture`) indexes. `all_cls` is the whole program's clause list
+# (the union must see every clause of the handle, not just the head).
+fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
   [] -> acc
   [CI(line, col, eff, op, _, _, _, _, _), ...rest] -> {
     let sym = cat3("_kai_handler_", int_to_string(line), cat2("_", int_to_string(col)))
     let ot  = KOT(op, clause_sym(line, col, op))
-    lower_handler_decls(rest, hdecl_add(acc, eff, sym, ot))
+    let ecaps = kir_handle_captures_at(all_cls, line, col)
+    lower_handler_decls(rest, all_cls, hdecl_add(acc, eff, sym, ot, ecaps))
   }
 }
 
-# Add an op-thunk to the matching handler decl, or create the decl.
-fn hdecl_add(acc: [KHandlerDecl], eff: String, sym: String, ot: KOpThunk) : [KHandlerDecl] = match acc {
-  [] -> [KHandlerDecl { eff: eff, sym: sym, op_thunks: [ot], ret_thunk: None }]
+# Add an op-thunk to the matching handler decl, or create the decl. The
+# `env_caps` of the first clause that opens the decl wins (all clauses of
+# one handle resolve the same union, so later ops carry the same list).
+fn hdecl_add(acc: [KHandlerDecl], eff: String, sym: String, ot: KOpThunk, ecaps: [String]) : [KHandlerDecl] = match acc {
+  [] -> [KHandlerDecl { eff: eff, sym: sym, op_thunks: [ot], ret_thunk: None, env_caps: ecaps }]
   [h, ...rest] ->
-    if h.sym == sym { [KHandlerDecl { eff: h.eff, sym: h.sym, op_thunks: list_append(h.op_thunks, [ot]), ret_thunk: h.ret_thunk }, ...rest] }
-    else { [h, ...hdecl_add(rest, eff, sym, ot)] }
+    if h.sym == sym { [KHandlerDecl { eff: h.eff, sym: h.sym, op_thunks: list_append(h.op_thunks, [ot]), ret_thunk: h.ret_thunk, env_caps: h.env_caps }, ...rest] }
+    else { [h, ...hdecl_add(rest, eff, sym, ot, ecaps)] }
 }
 
 # The clause-thunk symbol for an op clause (mirror of emit_c's
