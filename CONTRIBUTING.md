@@ -55,6 +55,12 @@ the purpose of building on top of them. Pin your edition in `kai.toml`, and
 expect that what you build against today may need migration as kaikai moves
 toward a stable 1.0.
 
+When Orongo ships, **active development will move to the official
+organisation repository
+([kaikailang-org/kaikai](https://github.com/kaikailang-org/kaikai))**, and a
+defined contribution process will be published alongside it. Opening a
+proposal issue there now is the right first step regardless.
+
 ## Build your own packages
 
 You do **not** have to wait for the core team to add something to the
