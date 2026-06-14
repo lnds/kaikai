@@ -84,6 +84,46 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.90.0 (2026-06-14)
+
+### Added
+
+- **emit**: native protocol dispatch + record-match and module-preference fixes
+- **emit**: emit raw f64/i1 ops + box/unbox borders in the native backend
+- **emit**: add raw f64/i1 LLVM-builder prims + Real box/unbox borrow shims
+- **kir**: lower payload-bearing nested-variant sub-patterns
+- **kir**: synthesise dispatch handlers for default-block effects in dead code
+- **kir**: lower EBang (postfix `!`) to the Option/Result propagation fork
+- **cache**: cache the core post-parse to cross the sub-150ms recompile target (#825)
+- **cache**: user-file incremental cache with transitive invalidation (#455)
+- **cli**: add kai doc — human reader for stdlib #[doc] attributes
+
+### Fixed
+
+- **typer**: never mask Mutable demanded through effect dispatch
+- **emit**: key native evidence frames per install-site, not per effect
+- **kir**: lower a list pattern as the head of a list ([[a, b], ..._])
+- **kir**: inline unit_name as a compile-time constant
+- **kir**: test a literal head in a list pattern ([""], [0, ...])
+- **kir**: lower a list pattern in a variant slot (Some([x, y]))
+- **kir**: test a lone variant arm's discriminating payload sub-pattern
+- **emit**: native handler-clause capture ABI via Ev env channel
+- **kir**: lower pipes and match guards in the native KIR path
+- **kir**: lower MUnboxed Real raw (mode-slave) instead of re-boxing
+- **emit**: synth dispatch shape for no-default-block dead-code performs
+- **emit**: decode all C99 string-literal escapes in the native backend
+- **perceus**: defer the lambda-param drop to the native lane (#817)
+- **runtime**: free the unique cons spine iteratively (#817)
+- **perceus**: move arm-binders at last use + drop lambda params (#817)
+- **emit**: drop raw self-tail match scrutinee on the goto edge (#817)
+- **kir**: bind state/log in a stateful handler's return clause
+- **emit**: add native bit-op prelude shims
+- **kir**: separate temp-register namespace from surface binders
+- **typer**: distinct parametric effect cells in row unification (#802)
+- **runtime**: always-compile incref/decref counters (#812 Finding B)
+- **kir**: native-parity shared-tag sub-discrimination (burn-down 3)
+- **cli**: escape backticks in kai --help heredoc
+
 ## v0.89.0 (2026-06-10)
 
 ### BREAKING CHANGE
