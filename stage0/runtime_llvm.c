@@ -1424,6 +1424,45 @@ void kaix_panic_no_impl(const char *proto, const char *op, int32_t head) {
     exit(1);
 }
 
+/* Single-dispatch protocol shims, one per impl arity. The in-process
+ * native backend lowers each `__proto_<op>` dispatcher to a boxed call to
+ * the matching `kaix_proto_dispatch<N>`: the head tag derives from the
+ * receiver `a0`, the impl resolves through the runtime table populated at
+ * startup by `_kai_proto_init_llvm`, and a NULL lookup panics with the
+ * SAME message the C-direct oracle emits (`emit_proto_dispatch_shim_c`).
+ * `pid` / `pname` / `opname` arrive boxed (an Int and two Strings) so the
+ * native lowering can pass them as ordinary boxed call args — no raw-arg
+ * marshalling in the IR. The cast-per-arity lives HERE, compiled and
+ * verified by the C compiler, NOT reconstructed in the C-API builder:
+ * one source of truth for the dispatch ABI, shared with the oracle. */
+static void *kaix_proto_resolve(KaiValue *pid, KaiValue *pname, KaiValue *opname, KaiValue *recv) {
+    int32_t proto_id = (int32_t) kai_intf(pid);
+    int32_t head = kai_head_tag(recv);
+    void *fn = kai_lookup_impl(proto_id, head);
+    if (fn == NULL) {
+        kaix_panic_no_impl(pname->as.s.bytes, opname->as.s.bytes, head);
+    }
+    return fn;
+}
+
+KaiValue *kaix_proto_dispatch1(KaiValue *pid, KaiValue *pname, KaiValue *opname,
+                               KaiValue *a0) {
+    void *fn = kaix_proto_resolve(pid, pname, opname, a0);
+    return ((KaiValue *(*)(KaiValue *)) fn)(a0);
+}
+
+KaiValue *kaix_proto_dispatch2(KaiValue *pid, KaiValue *pname, KaiValue *opname,
+                               KaiValue *a0, KaiValue *a1) {
+    void *fn = kaix_proto_resolve(pid, pname, opname, a0);
+    return ((KaiValue *(*)(KaiValue *, KaiValue *)) fn)(a0, a1);
+}
+
+KaiValue *kaix_proto_dispatch3(KaiValue *pid, KaiValue *pname, KaiValue *opname,
+                               KaiValue *a0, KaiValue *a1, KaiValue *a2) {
+    void *fn = kaix_proto_resolve(pid, pname, opname, a0);
+    return ((KaiValue *(*)(KaiValue *, KaiValue *, KaiValue *)) fn)(a0, a1, a2);
+}
+
 /* ---------- TRMC constructor-context (issue #668, LLVM backend) ----------
  *
  * The C backend lowers a modulo-cons tail leaf with the inline
