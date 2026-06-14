@@ -632,6 +632,13 @@ LLVM_SRC_DIR := stage0/third_party/llvm
 LLVM_BUILD_DIR := $(LLVM_SRC_DIR)/build
 LLVM_TARBALL := stage0/third_party/llvm-$(LLVM_VERSION).src.tar.xz
 LLVM_TARBALL_URL := https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/llvm-$(LLVM_VERSION).src.tar.xz
+# The llvm source tree's configure step `include`s shared CMake modules
+# (ExtendPath, FindPrefixFromConfig) from `../cmake/Modules` — these ship in
+# a SEPARATE sibling tarball since the monorepo split, not in llvm-*.src. We
+# extract it to stage0/third_party/cmake so `../cmake` resolves at configure.
+LLVM_CMAKE_DIR := stage0/third_party/cmake
+LLVM_CMAKE_TARBALL := stage0/third_party/cmake-$(LLVM_VERSION).src.tar.xz
+LLVM_CMAKE_TARBALL_URL := https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/cmake-$(LLVM_VERSION).src.tar.xz
 # CMake targets we actually need (parse text IR + emit x86-64 + arm64
 # objects). Kept narrow on purpose; expanding this list expands the
 # final static-link footprint roughly linearly.
@@ -672,21 +679,35 @@ llvm-info:
 # commit LLVM source. Re-running is a no-op when the source is present.
 llvm-fetch:
 	@mkdir -p stage0/third_party
-	@if [ -d "$(LLVM_SRC_DIR)" ] && [ -f "$(LLVM_SRC_DIR)/CMakeLists.txt" ]; then \
-	  echo "llvm-fetch: $(LLVM_SRC_DIR) already populated, skipping"; \
+	@if [ -f "$(LLVM_SRC_DIR)/CMakeLists.txt" ] && [ -f "$(LLVM_CMAKE_DIR)/Modules/ExtendPath.cmake" ]; then \
+	  echo "llvm-fetch: $(LLVM_SRC_DIR) + $(LLVM_CMAKE_DIR) already populated, skipping"; \
 	  exit 0; \
 	fi; \
-	if [ ! -f "$(LLVM_TARBALL)" ]; then \
-	  echo "llvm-fetch: downloading $(LLVM_TARBALL_URL)"; \
-	  curl -fL -o "$(LLVM_TARBALL).part" "$(LLVM_TARBALL_URL)" \
-	    && mv "$(LLVM_TARBALL).part" "$(LLVM_TARBALL)" \
-	    || { echo "llvm-fetch FAIL — download error"; rm -f "$(LLVM_TARBALL).part"; exit 1; }; \
+	if [ ! -f "$(LLVM_SRC_DIR)/CMakeLists.txt" ]; then \
+	  if [ ! -f "$(LLVM_TARBALL)" ]; then \
+	    echo "llvm-fetch: downloading $(LLVM_TARBALL_URL)"; \
+	    curl -fL -o "$(LLVM_TARBALL).part" "$(LLVM_TARBALL_URL)" \
+	      && mv "$(LLVM_TARBALL).part" "$(LLVM_TARBALL)" \
+	      || { echo "llvm-fetch FAIL — download error"; rm -f "$(LLVM_TARBALL).part"; exit 1; }; \
+	  fi; \
+	  echo "llvm-fetch: extracting tarball into $(LLVM_SRC_DIR)"; \
+	  mkdir -p "$(LLVM_SRC_DIR)"; \
+	  tar -xJf "$(LLVM_TARBALL)" --strip-components=1 -C "$(LLVM_SRC_DIR)" \
+	    || { echo "llvm-fetch FAIL — extract error"; exit 1; }; \
 	fi; \
-	echo "llvm-fetch: extracting tarball into $(LLVM_SRC_DIR)"; \
-	mkdir -p "$(LLVM_SRC_DIR)"; \
-	tar -xJf "$(LLVM_TARBALL)" --strip-components=1 -C "$(LLVM_SRC_DIR)" \
-	  || { echo "llvm-fetch FAIL — extract error"; exit 1; }; \
-	echo "llvm-fetch OK — source at $(LLVM_SRC_DIR)"
+	if [ ! -f "$(LLVM_CMAKE_DIR)/Modules/ExtendPath.cmake" ]; then \
+	  if [ ! -f "$(LLVM_CMAKE_TARBALL)" ]; then \
+	    echo "llvm-fetch: downloading $(LLVM_CMAKE_TARBALL_URL)"; \
+	    curl -fL -o "$(LLVM_CMAKE_TARBALL).part" "$(LLVM_CMAKE_TARBALL_URL)" \
+	      && mv "$(LLVM_CMAKE_TARBALL).part" "$(LLVM_CMAKE_TARBALL)" \
+	      || { echo "llvm-fetch FAIL — cmake-module download error"; rm -f "$(LLVM_CMAKE_TARBALL).part"; exit 1; }; \
+	  fi; \
+	  echo "llvm-fetch: extracting cmake modules into $(LLVM_CMAKE_DIR)"; \
+	  mkdir -p "$(LLVM_CMAKE_DIR)"; \
+	  tar -xJf "$(LLVM_CMAKE_TARBALL)" --strip-components=1 -C "$(LLVM_CMAKE_DIR)" \
+	    || { echo "llvm-fetch FAIL — cmake-module extract error"; exit 1; }; \
+	fi; \
+	echo "llvm-fetch OK — source at $(LLVM_SRC_DIR), cmake modules at $(LLVM_CMAKE_DIR)"
 
 # llvm-configure: run cmake. MinSizeRel + only X86 + AArch64 targets +
 # disable optional features that bloat the static link (zlib, zstd,

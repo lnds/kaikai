@@ -61,7 +61,17 @@ KAI_LLVM_AUTO := 1
 endif
 ifeq ($(KAI_LLVM),1)
 LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs core analysis target native bitwriter) $(shell $(LLVM_CONFIG) --system-libs)
+# Component set is `nativecodegen` (NOT `native`): the backend EMITS code,
+# never disassembles, so it must not drag in the AArch64/X86 Disassembler
+# libs that a narrow static vendored build (Makefile §LLVM_CMAKE_TARGETS)
+# deliberately omits. `--link-static` keeps `--libs`/`--system-libs` from
+# aborting on those absent components in the static build (it is a harmless
+# no-op against a dynamic Homebrew llvm-config, which has every lib). LLVM
+# is C++, so a static link needs the C++ runtime explicitly (`cc` does not
+# add it; a dynamic `-lLLVM.dylib` carried it implicitly) — `-lc++` is the
+# macOS spelling. The release-static path (Rust/Zig/Julia model) thus links
+# with no libLLVM runtime dep; the dev-dynamic path is unchanged.
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) -lc++
 else
 LLVM_CPPFLAGS :=
 LLVM_LDFLAGS  :=
