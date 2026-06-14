@@ -29,6 +29,23 @@
 > missing one-shot-continuation runtime check) are likewise DESIGN-bearing
 > singletons, not closed here.
 >
+> **nested-alias cluster NARROWED (DESIGN-bearing — NOT forced):** the four
+> hangs `multi_var_state_index` / `m7b_15_nested_alias` /
+> `m8_12_self_delegating_handler` / `spiral` (all native exit 124, refs #622)
+> bisect to ONE trigger: a closure that captures TWO OR MORE `__alias_id__<a>`
+> handler-id sentinels hangs the native fiber dispatch BEFORE its body runs.
+> Minimal repro (~10 lines): two `var` cells + a `loop.while` whose body writes
+> BOTH (`other := @other+1; i := @i+1`) hangs; the body-closure then captures
+> `[__alias_id__other, __alias_id__i]`. With ONE alias capture (body writes only
+> `i`) it runs; with TWO non-alias captures (`() => a + b` over two `let`s) it
+> also runs — the failure is specific to MULTIPLE handler-id captures in one
+> closure. The KIR is correct (two distinct handlers, the closure captures both
+> alias-ids in order, the body performs `State.get@i` / `State.set@other`
+> distinctly); `kaix_capture` / `kaix_closure` are correct in isolation. The
+> bug is the interaction of multi-alias capture with the fiber/evidence dispatch
+> (the subset-2b alias-dispatch / clause-capture ABI) — its own lane, not a
+> lowering one-liner.
+>
 > **literal-list-head CLOSED** (lane native-literal-list-head): a literal head
 > in a list pattern (`[""]`, `[0, ...rest]`) was not tested
 > (`lm_head_seal_test` handled variant heads only), so `[""]` matched any
