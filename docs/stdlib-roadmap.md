@@ -54,7 +54,7 @@ What ships in `stdlib/` today:
 ```
 core/   list.kai string.kai option.kai result.kai char.kai tuple.kai io.kai
 collections/  map.kai hashmap.kai set.kai hashset.kai stack.kai queue.kai
-math/  int.kai real.kai numeric.kai bits.kai complex.kai
+math/  int.kai real.kai numeric.kai bits.kai complex.kai vector.kai
 crypto/  hash.kai mac.kai
 encoding/  json.kai base64.kai hex.kai
 fs/  file.kai dir.kai path.kai
