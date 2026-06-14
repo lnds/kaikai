@@ -174,6 +174,28 @@
 
 ## Root-cause families
 
+> **Fresh diagnosis (2026-06-14, clean-built kaic2) — the 43 macOS gaps by
+> signature:** 14 output-mismatch, 12 panic (native=1), 8 build-failed,
+> 6 timeout (124), 3 singletons (one-resume, SIGSEGV, map-in-fiber).
+> Two single-cause clusters worth a dedicated lane each:
+> - **build-failed: 7 of 8 are one cause** — `clause param origin (alias =
+>   subset 2b alias dispatch)`: `nemit_seed_clause_loop`
+>   (emit_native_term.kai) aborts on `PCapture`/`PEvidence` clause params
+>   (ctor_field_effect_row, the 3 `stream_*`, r9_clause_capture,
+>   net_dns_resolve, cross_package_effects). A naive fix reusing the
+>   lambda-thunk `kaix_capture(self, j)` makes them BUILD but produce wrong
+>   output (the clause `self` blob's capture layout differs from a lambda
+>   thunk's) — so this needs the clause-self capture ABI, not a one-arm
+>   patch. Attempted + reverted 2026-06-14 (don't turn build-fail into
+>   silent-wrong). The 8th is `binserialize_derive_nested` (`unbound
+>   register x/y`, a separate nested-bind gap).
+> - **6 of the 14 output-mismatch are JSON-real-in-object** — `json_decode`
+>   of a bare decimal (`"19.99"`) PASSES native, but a real nested in an
+>   object (`{"k": 19.99}`) returns `None` (C returns `Some(JObj[JReal])`).
+>   Repro: `json_decode("{\"k\": 19.99}")`. The recursive object-value
+>   parse mishandles a `Real` on the native path. Covers json_basic-real
+>   /decimal/negative/scientific/int_regression/surrogate_encode.
+
 The counts below are re-measured post-burn-down-3 by build/run signature
 (`Duplicate integer as switch case` is now **0**). The `output-mismatch`
 and `exit-code-mismatch` families GREW as the 9 reclassified regex/json
