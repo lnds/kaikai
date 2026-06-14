@@ -11440,7 +11440,12 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
     let local_set = collect_local_arrays(body_resolved, [])
     let param_names = mut_collect_param_names(params, [])
     let escaped_set = collect_escaped_names(body_resolved, [])
-    if all_demands_local(body_resolved, local_set, escaped_set, param_names) {
+    # The dispatch-mutable type names (`Ref` + every Ref-backed record) come
+    # from the program's records: an argument of such a type is never a
+    # maskable demand (its op dispatches through the evidence stack and needs
+    # the handler installed).
+    let dmut = dispatch_mutable_type_names(st.recs)
+    if all_demands_local(body_resolved, local_set, escaped_set, param_names, dmut) {
       st_drop_label(st, "Mutable")
     } else { st }
   }
@@ -11887,12 +11892,75 @@ fn labels_contain_mutable(labels: [Label]) : Bool = match labels {
   [h, ...rest] -> if h.eff == "Mutable" { true } else { labels_contain_mutable(rest) }
 }
 
-# Issue #528 — true iff `t` is `Array[_]` or `Ref[_]`. Those are the
-# observable mutable references whose provenance the masking pass
-# tracks.
+# True iff `t` is `Array[_]` or `Ref[_]`. Those are the observable mutable
+# references whose provenance the masking pass tracks. `Array` mutation is a
+# direct C call (maskable when local); `Ref` mutation flows through dispatch.
 fn ty_is_mutable_ref(t: Ty) : Bool = match t {
   TyCon(_, name, _) -> if name == "Array" { true } else if name == "Ref" { true } else { false }
   _              -> false
+}
+
+# The names of types whose mutation flows through EFFECT DISPATCH (a `Ref`
+# op resolved on the evidence stack), not a direct C call. `Ref` itself, plus
+# every record type carrying a `Ref` field transitively (`HashMap`'s `buckets
+# : Ref[..]`, `HashSet`'s `inner : HashMap`). Such a value can NEVER mask
+# `Mutable` even when local — the handler must stay installed. Computed once
+# over the program's records (`st.recs`) so the masking pass needs no
+# hard-coded container list (a new Ref-backed user type is picked up for free).
+fn dispatch_mutable_type_names(recs: [RecInfo]) : [String] =
+  dmut_fixpoint(recs, ["Ref"], 0)
+
+# Closure: a record is dispatch-mutable iff a field's type names `Ref` or an
+# already-known dispatch-mutable type. Iterate to a fixpoint so a type that
+# only embeds another dispatch-mutable record (HashSet → HashMap → Ref) is
+# caught. Bounded by `length(recs)` passes (each adds ≥1 name or stops).
+fn dmut_fixpoint(recs: [RecInfo], known: [String], passes: Int) : [String] =
+  if passes > list_length(recs) { known }
+  else {
+    let next = dmut_scan(recs, known, known)
+    if list_length(next) == list_length(known) { known }
+    else { dmut_fixpoint(recs, next, passes + 1) }
+  }
+
+fn dmut_scan(recs: [RecInfo], known: [String], acc: [String]) : [String] = match recs {
+  []           -> acc
+  [r, ...rest] -> match r {
+    RI(name, _, fields, _) ->
+      if list_has(acc, name) { dmut_scan(rest, known, acc) }
+      else if rec_fields_name_dispatch_mutable(fields, known) {
+        dmut_scan(rest, known, [name, ...acc])
+      } else { dmut_scan(rest, known, acc) }
+  }
+}
+
+fn rec_fields_name_dispatch_mutable(fields: [FieldDecl], known: [String]) : Bool = match fields {
+  []           -> false
+  [f, ...rest] -> match f {
+    FD(_, _, te) ->
+      if te_names_dispatch_mutable(te, known) { true }
+      else { rec_fields_name_dispatch_mutable(rest, known) }
+  }
+}
+
+# Does a field's type-expression NAME a dispatch-mutable type (a known name
+# at its head, or nested in a type argument / list element)?
+fn te_names_dispatch_mutable(te: TypeExpr, known: [String]) : Bool = match te.tkind {
+  TyName(name, targs) ->
+    if list_has(known, name) { true } else { te_list_names_dispatch_mutable(targs, known) }
+  TyList(elem) -> te_names_dispatch_mutable(elem, known)
+  _ -> false
+}
+
+fn te_list_names_dispatch_mutable(tes: [TypeExpr], known: [String]) : Bool = match tes {
+  []           -> false
+  [t, ...rest] -> if te_names_dispatch_mutable(t, known) { true }
+                  else { te_list_names_dispatch_mutable(rest, known) }
+}
+
+# True iff `t`'s head constructor names a dispatch-mutable type.
+fn ty_is_dispatch_mutable(t: Ty, dmut: [String]) : Bool = match t {
+  TyCon(_, name, _) -> list_has(dmut, name)
+  _                 -> false
 }
 
 # Issue #528 — for a callee declared `/ Mutable`, decide whether the
@@ -11901,29 +11969,36 @@ fn ty_is_mutable_ref(t: Ty) : Bool = match t {
 # caller's local set and not in the escaped set and not a parameter
 # name. Args of other types are ignored (they cannot carry mutation).
 fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
-                                  escaped: [String], params: [String]) : Bool = match args_ {
+                                  escaped: [String], params: [String], dmut: [String]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
-    if ty_is_mutable_ref(arg_ty) {
+    # An argument whose type mutates through DISPATCH (`Ref`, or a Ref-backed
+    # container like `HashMap`) can never be masked: even a local instance
+    # needs the `Mutable` handler installed at the dispatch site. So ANY such
+    # argument makes the demand non-local, regardless of escape. A plain
+    # `Array`/`Ref` direct argument keeps the existing local-or-not check
+    # (a local Array's `array_set` is a direct C call, maskable).
+    if ty_is_dispatch_mutable(arg_ty, dmut) { false }
+    else if ty_is_mutable_ref(arg_ty) {
       match h.kind {
         EVar(n) ->
           if list_has(escaped, n) { false }
           else if list_has(params, n) { false }
           else if not list_has(locals, n) { false }
-          else { mutable_callee_args_all_local(rest, locals, escaped, params) }
+          else { mutable_callee_args_all_local(rest, locals, escaped, params, dmut) }
         _ -> false
       }
-    } else { mutable_callee_args_all_local(rest, locals, escaped, params) }
+    } else { mutable_callee_args_all_local(rest, locals, escaped, params, dmut) }
   }
 }
 
 fn all_demands_local(body: Expr, locals: [String], escaped: [String],
-                     params: [String]) : Bool =
-  all_demands_local_kind(body.kind, locals, escaped, params)
+                     params: [String], dmut: [String]) : Bool =
+  all_demands_local_kind(body.kind, locals, escaped, params, dmut)
 
 fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
-                           params: [String]) : Bool {
+                           params: [String], dmut: [String]) : Bool {
   match k {
     ECall(callee, args_) -> {
       # Issue #516 — recognise both the bare prelude form and the
@@ -11946,77 +12021,96 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
           if is_mutable_array_write_name(name) {
             demand_is_local(args_, locals, escaped, params)
           } else if ty_callee_has_mutable(callee_ty) {
-            mutable_callee_args_all_local(args_, locals, escaped, params)
+            mutable_callee_args_all_local(args_, locals, escaped, params, dmut)
+          } else { true }
+        # A QUALIFIED module op (`EModCall`, e.g. `hashmap.get`) whose type
+        # carries `/ Mutable` contributes a demand exactly like a user fn
+        # `/ Mutable` does (the `EVar` arm above) — its locality is decided
+        # by `mutable_callee_args_all_local`: the demand is local iff every
+        # mutable-reference argument (`Array` / `Ref` / a Ref-backed
+        # container like `HashMap` / `HashSet`) is a locally-constructed,
+        # non-escaping value. A HashMap PARAMETER is never local, so the
+        # demand is non-local and `Mutable` stays on the row (no SEGV from a
+        # masked dispatch op). This must NOT be a blanket `false`: a
+        # higher-order combinator like `list.foldl(xs, init, fn)` carries
+        # `Mutable` transitively from its `fn` callback, has no Ref-backed
+        # argument, and IS maskable (its real mutation is a local `Array`
+        # via the direct-C-call `array_set`) — a blanket reject would break
+        # `array.from_list` and every core module that builds a local array
+        # through a folded write.
+        EModCall(_, _) ->
+          if ty_callee_has_mutable(callee_ty) {
+            mutable_callee_args_all_local(args_, locals, escaped, params, dmut)
           } else { true }
         _ -> true
       }
       if not here { false }
-      else if not all_demands_local(callee, locals, escaped, params) { false }
-      else { all_demands_local_in_exprs(args_, locals, escaped, params) }
+      else if not all_demands_local(callee, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_exprs(args_, locals, escaped, params, dmut) }
     }
     EBlock(stmts, tail) -> {
-      if not all_demands_local_in_stmts(stmts, locals, escaped, params) { false }
+      if not all_demands_local_in_stmts(stmts, locals, escaped, params, dmut) { false }
       else { match tail {
-        Some(t) -> all_demands_local(t, locals, escaped, params)
+        Some(t) -> all_demands_local(t, locals, escaped, params, dmut)
         None    -> true
       } }
     }
     EIf(c, t_, eo) -> {
-      if not all_demands_local(c, locals, escaped, params) { false }
-      else if not all_demands_local(t_, locals, escaped, params) { false }
+      if not all_demands_local(c, locals, escaped, params, dmut) { false }
+      else if not all_demands_local(t_, locals, escaped, params, dmut) { false }
       else { match eo {
-        Some(e2) -> all_demands_local(e2, locals, escaped, params)
+        Some(e2) -> all_demands_local(e2, locals, escaped, params, dmut)
         None     -> true
       } }
     }
     EMatch(scr, arms) ->
-      if not all_demands_local(scr, locals, escaped, params) { false }
-      else { all_demands_local_in_arms(arms, locals, escaped, params) }
+      if not all_demands_local(scr, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_arms(arms, locals, escaped, params, dmut) }
     EBinop(_, a, b)   ->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
-    EUnop(_, x)       -> all_demands_local(x, locals, escaped, params)
-    EField(b, _)      -> all_demands_local(b, locals, escaped, params)
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
+    EUnop(_, x)       -> all_demands_local(x, locals, escaped, params, dmut)
+    EField(b, _)      -> all_demands_local(b, locals, escaped, params, dmut)
     EIndex(a, b)      ->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
     EPipe(a, b)       ->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
     EMapPipe(a, b)    ->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
     EFlatMapPipe(a, b)->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
     EFilterPipe(a, b) ->
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else { all_demands_local(b, locals, escaped, params) }
-    ELambda(_, b)     -> all_demands_local(b, locals, escaped, params)
-    ERecordLit(_, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, params)
-    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, params)
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else { all_demands_local(b, locals, escaped, params, dmut) }
+    ELambda(_, b)     -> all_demands_local(b, locals, escaped, params, dmut)
+    ERecordLit(_, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, params, dmut)
+    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, params, dmut)
     ERange(a, b, oc)  -> {
-      if not all_demands_local(a, locals, escaped, params) { false }
-      else if not all_demands_local(b, locals, escaped, params) { false }
+      if not all_demands_local(a, locals, escaped, params, dmut) { false }
+      else if not all_demands_local(b, locals, escaped, params, dmut) { false }
       else { match oc {
-        Some(c) -> all_demands_local(c, locals, escaped, params)
+        Some(c) -> all_demands_local(c, locals, escaped, params, dmut)
         None    -> true
       } }
     }
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      if not all_demands_local(body, locals, escaped, params) { false }
+      if not all_demands_local(body, locals, escaped, params, dmut) { false }
       else if not (match init_opt {
-        Some(i) -> all_demands_local(i, locals, escaped, params)
+        Some(i) -> all_demands_local(i, locals, escaped, params, dmut)
         None    -> true
       }) { false }
-      else if not all_demands_local_in_hclauses(clauses, locals, escaped, params) { false }
+      else if not all_demands_local_in_hclauses(clauses, locals, escaped, params, dmut) { false }
       else { match ret_opt {
-        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, params)
+        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, params, dmut)
         None           -> true
       } }
     }
-    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, params)
-    EBang(inner)       -> all_demands_local(inner, locals, escaped, params)
+    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, params, dmut)
+    EBang(inner)       -> all_demands_local(inner, locals, escaped, params, dmut)
     _ -> true
   }
 }
@@ -12040,88 +12134,88 @@ fn demand_is_local(args_: [Expr], locals: [String], escaped: [String],
 }
 
 fn all_demands_local_in_exprs(es: [Expr], locals: [String], escaped: [String],
-                              params: [String]) : Bool = match es {
+                              params: [String], dmut: [String]) : Bool = match es {
   []           -> true
   [h, ...rest] ->
-    if not all_demands_local(h, locals, escaped, params) { false }
-    else { all_demands_local_in_exprs(rest, locals, escaped, params) }
+    if not all_demands_local(h, locals, escaped, params, dmut) { false }
+    else { all_demands_local_in_exprs(rest, locals, escaped, params, dmut) }
 }
 
 fn all_demands_local_in_stmts(stmts: [Stmt], locals: [String],
-                              escaped: [String], params: [String]) : Bool = match stmts {
+                              escaped: [String], params: [String], dmut: [String]) : Bool = match stmts {
   []           -> true
   [s, ...rest] ->
-    if not all_demands_local_in_stmt(s, locals, escaped, params) { false }
-    else { all_demands_local_in_stmts(rest, locals, escaped, params) }
+    if not all_demands_local_in_stmt(s, locals, escaped, params, dmut) { false }
+    else { all_demands_local_in_stmts(rest, locals, escaped, params, dmut) }
 }
 
 fn all_demands_local_in_stmt(s: Stmt, locals: [String], escaped: [String],
-                              params: [String]) : Bool {
+                              params: [String], dmut: [String]) : Bool {
   match s {
-    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, params)
+    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, params, dmut)
     SAssert(c, m) -> {
-      if not all_demands_local(c, locals, escaped, params) { false }
+      if not all_demands_local(c, locals, escaped, params, dmut) { false }
       else { match m {
-        Some(mx) -> all_demands_local(mx, locals, escaped, params)
+        Some(mx) -> all_demands_local(mx, locals, escaped, params, dmut)
         None     -> true
       } }
     }
-    SExprStmt(x)                -> all_demands_local(x, locals, escaped, params)
+    SExprStmt(x)                -> all_demands_local(x, locals, escaped, params, dmut)
     SIndexAssign(b, i, v, _, _) ->
-      if not all_demands_local(b, locals, escaped, params) { false }
-      else if not all_demands_local(i, locals, escaped, params) { false }
-      else { all_demands_local(v, locals, escaped, params) }
-    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, params)
+      if not all_demands_local(b, locals, escaped, params, dmut) { false }
+      else if not all_demands_local(i, locals, escaped, params, dmut) { false }
+      else { all_demands_local(v, locals, escaped, params, dmut) }
+    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, params, dmut)
     SUse(_, _, _)               -> true
   }
 }
 
 fn all_demands_local_in_arms(arms: [Arm], locals: [String], escaped: [String],
-                              params: [String]) : Bool = match arms {
+                              params: [String], dmut: [String]) : Bool = match arms {
   []           -> true
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
       let g_ok = match g {
-        Some(gx) -> all_demands_local(gx, locals, escaped, params)
+        Some(gx) -> all_demands_local(gx, locals, escaped, params, dmut)
         None     -> true
       }
       if not g_ok { false }
-      else if not all_demands_local(b, locals, escaped, params) { false }
-      else { all_demands_local_in_arms(rest, locals, escaped, params) }
+      else if not all_demands_local(b, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_arms(rest, locals, escaped, params, dmut) }
     }
   }
 }
 
 fn all_demands_local_in_hclauses(cs: [HClause], locals: [String],
-                                  escaped: [String], params: [String]) : Bool = match cs {
+                                  escaped: [String], params: [String], dmut: [String]) : Bool = match cs {
   []           -> true
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) ->
-      if not all_demands_local(b, locals, escaped, params) { false }
-      else { all_demands_local_in_hclauses(rest, locals, escaped, params) }
+      if not all_demands_local(b, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_hclauses(rest, locals, escaped, params, dmut) }
   }
 }
 
 fn all_demands_local_in_field_inits(fs: [FieldInit], locals: [String],
-                                     escaped: [String], params: [String]) : Bool = match fs {
+                                     escaped: [String], params: [String], dmut: [String]) : Bool = match fs {
   []           -> true
   [h, ...rest] -> match h {
     FI(_, v) ->
-      if not all_demands_local(v, locals, escaped, params) { false }
-      else { all_demands_local_in_field_inits(rest, locals, escaped, params) }
+      if not all_demands_local(v, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_field_inits(rest, locals, escaped, params, dmut) }
   }
 }
 
 fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
-                                    escaped: [String], params: [String]) : Bool = match els {
+                                    escaped: [String], params: [String], dmut: [String]) : Bool = match els {
   []           -> true
   [h, ...rest] -> match h {
     ElPlain(x) ->
-      if not all_demands_local(x, locals, escaped, params) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, params) }
+      if not all_demands_local(x, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, params, dmut) }
     ElSpread(x) ->
-      if not all_demands_local(x, locals, escaped, params) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, params) }
+      if not all_demands_local(x, locals, escaped, params, dmut) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, params, dmut) }
   }
 }
 
