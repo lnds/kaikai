@@ -1,10 +1,17 @@
 # Native-backend parity gaps — Lane 1.5 burn-down list
 
 > **Status (2026-06-14, measured against a STATIC-LLVM-18 kaic2):** the
-> in-process libLLVM native backend is at **23 listed gaps** — 21 measured
+> in-process libLLVM native backend is at **22 listed gaps** — 20 measured
 > failing on macOS by `tools/test-backend-parity.sh` (native vs C-direct:
-> pass=444 fail=21 skip=55 of 520) plus the 2 Linux-only SIGSEGV gaps
+> pass=446 fail=20 skip=55 of 521) plus the 2 Linux-only SIGSEGV gaps
 > (`list_helpers`, `list_zip3_scan`).
+>
+> **unit_name compile-time reflection CLOSED** (lane native-unit-name):
+> `unit_name(x)` on a `Real<u>` is compile-time reflection (the unit is
+> phantom), but the KIR fell it to a runtime call returning the empty string,
+> so `#{Real<u>}` interpolation dropped its unit suffix. Fixed by classifying
+> `unit_name` as `CkUnitName` and inlining the canonical unit symbol as a
+> `KStrV` constant. Closed free_fall.
 >
 > **literal-list-head CLOSED** (lane native-literal-list-head): a literal head
 > in a list pattern (`[""]`, `[0, ...rest]`) was not tested
