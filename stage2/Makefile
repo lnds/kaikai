@@ -1058,7 +1058,16 @@ test-trmc-list-build: $(TARGET) build
 # `pcs_is_non_last` so every read pays a `__perceus_dup`. Both
 # fixtures are listed so a regression caught only via one effect-name
 # arm still fails this gate. See `docs/lane-diagnostic-r10-r11.md`.
-TRACE_FIXTURES := trace_basic trace_prefix r9_clause_capture r10_repro r11_repro \
+# `clause_capture_subset_order` is the clause-capture ABI's env-INDEX-ORDER
+# guard (lane native-clause-capture-abi): two clauses of one handle capture
+# DIFFERENT subsets of the enclosing scope, so a per-clause capture index
+# diverges from the handle-union index the Ev `env` array is keyed on. r9
+# above is false-green for that ordering bug (both its clauses capture the
+# same name at union slot 0); this fixture forces them apart, and the C
+# golden is the oracle native parity diffs against. RC + ASAN gated for free
+# by sharing the trace suite.
+TRACE_FIXTURES := trace_basic trace_prefix r9_clause_capture \
+                  clause_capture_subset_order r10_repro r11_repro \
                   m8x_9_nested_mailbox_under_trap_exit \
                   issue_115_default_handler_typed_dispatch
 
