@@ -54,6 +54,14 @@ pub fn psub_is_discriminating(p: Pattern) : Bool = match p.pkind {
   PLit(_)              -> true
   PVariant(_, _)       -> true
   PVariantRecord(_, _) -> true
+  # A list pattern in a slot imposes a length constraint (`[x, y]` demands
+  # exactly two elements; `[x, ...t]` at least one), so it ALWAYS discriminates
+  # — the arm must NOT be treated as its tag's catch-all. The walk's
+  # `emit_arm_subtests_and_binds` lowers the slot's length test + binds via
+  # `lm_emit_cells`; `var_seal_test` below traps loud if a list slot ever
+  # reaches the per-slot test path directly (it should not — the walk diverts
+  # the whole arm first).
+  PList(_, _)          -> true
   PAs(_, inner)        -> psub_is_discriminating(inner)
   _                    -> false
 }
@@ -141,7 +149,24 @@ fn var_seal_test(sp: Pattern, scrv: KVal, idx: Int, ok_lbl: String,
   PLit(lit)           -> var_seal_eq(idx, var_lit_atom(lit), scrv, ok_lbl, fail_lbl, sp, st)
   PVariant(cn, subs)  -> var_seal_variant(idx, cn, subs, scrv, ok_lbl, fail_lbl, sp, st)
   PAs(_, inner)       -> var_seal_test(inner, scrv, idx, ok_lbl, fail_lbl, st)
+  # A list slot must be lowered by the walk's `emit_arm_subtests_and_binds`
+  # (length test + binds interleaved via `lm_emit_cells`), which diverts the
+  # whole arm BEFORE this per-slot path. Reaching here means a list slot the
+  # lone-list detector did not catch (a mixed multi-discriminating-slot
+  # payload). Trap loud — never seal `KBr(ok_lbl)` (a length-less pass that
+  # would match any list, the false-green the lone-arm bug taught us to avoid).
+  PList(_, _)         -> var_seal_list_unsupported(sp, ok_lbl, st)
   _                   -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
+}
+
+# A list slot reached the per-slot test path (a mixed payload the lone-list
+# detector rejected). Emit nothing testable and report the subset gap; the
+# binders stay unbound, so the backend refuses the module rather than matching
+# every list. Mirror of `bind_unsupported_nested`'s loud-trap discipline.
+fn var_seal_list_unsupported(sp: Pattern, ok_lbl: String, st: LowerSt) : LowerSt / Console = {
+  eprint(concat_all(["kir: list pattern in a mixed variant slot needs interleaved test+bind ",
+                     "(subset gap: list-in-multi-slot) at ", int_to_string(sp.line), ":", int_to_string(sp.col)]))
+  ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
 }
 
 # A nested ctor slot: a NULLARY ctor (`Red`) is a bare tag test; a PAYLOAD-
@@ -201,3 +226,41 @@ fn var_lit_atom(lit: Expr) : KVal = match lit.kind {
   EReal(r, _)   -> KRealV(r)
   _             -> KUnitV
 }
+
+# A variant arm whose SOLE discriminating payload slot is a LIST PATTERN
+# (`Some([x, y])`, `Ok([h, ...t])`). The list pattern interleaves its length
+# test with its head/tail binds, so it cannot be split into the test-then-bind
+# the rest of this module uses — the walk lowers it with `lm_emit_cells`
+# against the projected slot (see `emit_arm_subtests_and_binds`). Carries the
+# slot index, the fixed element sub-patterns, and the optional rest binder.
+pub type VListSlot = VLSlot(Int, [Pattern], Option[String])
+
+# Detect the sole-list-slot shape. The arm must be a `PVariant` whose ONLY
+# discriminating slot is a `PList`; every other slot is a binder / wildcard
+# (which the post-test `bind_pattern_fields` reads). A multi-slot payload that
+# mixes a list with ANOTHER discriminating slot stays the documented subset
+# gap (`bind_unsupported_nested` traps loud), not silently mis-lowered here.
+pub fn var_arm_lone_list_slot(p: Pattern) : Option[VListSlot] = match p.pkind {
+  PVariant(_, subs) -> vls_scan(subs, 0, None)
+  _                 -> None
+}
+
+# Walk the slots: the first PList found becomes the candidate; a SECOND
+# discriminating slot (or a second list) disqualifies the shape (return None).
+fn vls_scan(subs: [Pattern], idx: Int, found: Option[VListSlot]) : Option[VListSlot] = match subs {
+  [] -> found
+  [sp, ...rest] -> match sp.pkind {
+    PList(pats, opt_rest) -> match found {
+      None    -> vls_scan(rest, idx + 1, Some(VLSlot(idx, pats, opt_rest)))
+      Some(_) -> None
+    }
+    _ -> if psub_is_discriminating(sp) { None } else { vls_scan(rest, idx + 1, found) }
+  }
+}
+
+# Project payload slot `idx` of a variant into a fresh register, borrowing
+# (the native `kaix_variant_arg` borrows pointer slots, so a failing list test
+# leaks no ref — the same projection `var_seal_variant` uses). The walk feeds
+# the result to `lm_emit_cells` as the list cursor.
+pub fn var_proj_slot(scrv: KVal, idx: Int, sp: Pattern, st: LowerSt) : LRes / Console =
+  bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col))
