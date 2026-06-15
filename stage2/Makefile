@@ -2736,6 +2736,30 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (issue #251 + #252 Mutable provenance + masking)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/local_ref_masks_mutable.kai \
+	         ../examples/effects/local_hashmap_masks_mutable.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (issue #531 local Ref/HashMap masks Mutable, unconditional default install)" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/mutable_user_handler_over_default.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    && echo "effects OK $$name (issue #531 user Mutable handler wins over base default, LIFO)" \
+	    || { echo "effects FAIL $$name (user handler did not shadow base default)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/array_mutable_required.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=$${f%.kai}.err.expected; \
