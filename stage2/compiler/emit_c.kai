@@ -6661,11 +6661,20 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       MUnboxed -> {
         let raw = emit_expr_raw(src, rhs, cx)
         let cty = raw_c_type(rhs.ty)
-        concat_all([cty, " kair_", name, " = ", raw, "; "])
+        # #846 companion (C oracle): break the C declarator self-scope when
+        # this binder shadows an outer same-name `let` whose RHS reads it
+        # (`let x = f(x)`). See `emit_let_stmt`'s MUnboxed arm.
+        if list_has(cx.lcs, name) {
+          let tmp = shadow_tmp(name, pat)
+          concat_all([cty, " ", tmp, " = ", raw, "; ", cty, " kair_", name, " = ", tmp, "; "])
+        } else { concat_all([cty, " kair_", name, " = ", raw, "; "]) }
       }
       _ -> {
         let rhs_c = emit_expr(src, rhs, cx)
-        let bind = concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+        let bind = if list_has(cx.lcs, name) {
+          let tmp = shadow_tmp(name, pat)
+          concat_all(["KaiValue *", tmp, " = ", rhs_c, "; KaiValue *kai_", name, " = ", tmp, "; "])
+        } else { concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "]) }
         if list_has(drops, name) {
           cat2(bind, concat_all(["kai_decref(kai_", name, "); "]))
         } else {
@@ -6697,6 +6706,13 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
   }
 }
 
+# A unique C temp for a shadowing `let`'s RHS — the (line, col) suffix
+# disambiguates nested shadows, the same scheme the destructuring-let temp
+# (`_letv_<line>_<col>`) uses. The leading `_shadow_` cannot collide with a
+# surface binder's `kair_`/`kai_` name.
+fn shadow_tmp(name: String, pat: Pattern) : String =
+  concat_all(["_shadow_", name, "_", int_to_string(pat.line), "_", int_to_string(pat.col)])
+
 fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, cx: EmitCtx) : String / Console {
 
   match pat.pkind {
@@ -6704,11 +6720,28 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, cx: EmitCtx) : String / C
       MUnboxed -> {
         let raw = emit_expr_raw(src, rhs, cx)
         let cty = raw_c_type(rhs.ty)
-        concat_all([cty, " kair_", name, " = ", raw, "; "])
+        # A `let x` that shadows an outer `let x` whose RHS reads the outer
+        # `x` (`let x = f(x)`): the C declarator `<cty> kair_x = <raw>`
+        # puts the NEW `kair_x` in scope inside its own initializer, so
+        # `raw`'s read of `kair_x` binds to the just-declared, uninitialised
+        # inner one — garbage. (C's block `{ }` scoping already protects a
+        # read of the OUTER `x` AFTER the inner block; only the
+        # self-referential initialiser breaks.) Break the C self-scope by
+        # evaluating `raw` into a uniquely-named temp BEFORE the shadowing
+        # declaration, so the read still resolves to the outer `kair_x`.
+        if list_has(cx.lcs, name) {
+          let tmp = shadow_tmp(name, pat)
+          concat_all([cty, " ", tmp, " = ", raw, "; ", cty, " kair_", name, " = ", tmp, "; "])
+        } else { concat_all([cty, " kair_", name, " = ", raw, "; "]) }
       }
       _ -> {
         let rhs_c = emit_expr(src, rhs, cx)
-        concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+        # Same self-scope hazard for a boxed shadowing binder (see the
+        # MUnboxed arm): `KaiValue *kai_x = <rhs reading kai_x>` self-binds.
+        if list_has(cx.lcs, name) {
+          let tmp = shadow_tmp(name, pat)
+          concat_all(["KaiValue *", tmp, " = ", rhs_c, "; KaiValue *kai_", name, " = ", tmp, "; "])
+        } else { concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "]) }
       }
     }
     PWild -> {
