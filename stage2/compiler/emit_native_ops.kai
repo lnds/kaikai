@@ -95,7 +95,8 @@ pub fn nemit_op(ctx: Handle, op: KOp) : Handle / Console = match op {
   KProj(v, i)          -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
   KTagOf(v)            -> nemit_tagof(ctx, v)
   KClosure(sym, ar, caps) -> nemit_closure_call(ctx, sym, ar, nemit_atoms_buf(ctx, caps))
-  KConReuse(d, nm, tag, inits) -> nemit_reuse_variant_call(ctx, nemit_atom(ctx, d), tag, nm, nemit_init_buf(ctx, inits))
+  KConReuse(rk, d, nm, tag, inits) -> nemit_con_reuse(ctx, rk, d, tag, nm, inits)
+  KRecordReuse(d, fields) -> nemit_record_reuse(ctx, nemit_atom(ctx, d), fields)
   # A KPerform reaching `nemit_op` (rather than the handler-aware
   # `nemit_op_fx`) is one the walk did not route through `nemit_stmt` — a
   # KPerform only appears as a KLet/KDo RHS, which DOES route through
@@ -415,8 +416,10 @@ pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Hand
 
 # `kaix_variant(i32 tag, i8* name, i32 n, ptr* args) -> ptr`. The `args`
 # arrive in a C buffer `argvalbuf` (the materialised field atoms); they
-# become a stack `ptr[]` the runtime ctor reads.
-fn nemit_variant_call(ctx: Handle, sym: String, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+# become a stack `ptr[]` the runtime ctor reads. `pub` so the variant-TRMC
+# spine build (`emit_native_trmc`'s `ntrmc_variant_step`) builds its open-hole
+# `Node` cell through it (selfhost catches the privacy; bundle-concat hides it).
+pub fn nemit_variant_call(ctx: Handle, sym: String, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
@@ -428,8 +431,26 @@ fn nemit_variant_call(ctx: Handle, sym: String, tag: Int, nm: String, argvalbuf:
   ncall_finish(ctx, sym, p, ptb, ab)
 }
 
-# `kaix_reuse_or_alloc_variant(ptr scr, i32 tag, i8* name, i32 n, ptr* args) -> ptr`.
-fn nemit_reuse_variant_call(ctx: Handle, scr: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+# Route a `KConReuse` by its kind. The donor atom + slot inits are shared;
+# only the runtime entry differs. Variant reuse uses MOVE semantics
+# (`kaix_variant_reuse_at`): the unique donor's slots are overwritten WITHOUT
+# decref'ing its old children — the deconstructing arm already owns them and
+# perceus balanced the RC for a move, so the eager-1:1-decref helper
+# (`kaix_reuse_or_alloc_variant`) double-frees a non-bijective rb-tree
+# rotation (a child migrating cross-slot is decref'd while it stays live in
+# the rebuilt node). Cons reuse rides the binary-cons helper (head + tail).
+fn nemit_con_reuse(ctx: Handle, rk: KReuseKind, d: KVal, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console =
+  match rk {
+    RkVariant -> nemit_variant_reuse_call(ctx, nemit_atom(ctx, d), tag, nm, nemit_init_buf(ctx, inits))
+    RkCons    -> nemit_cons_reuse_call(ctx, nemit_atom(ctx, d), nemit_init_buf(ctx, inits))
+  }
+
+# `kaix_variant_reuse_at(ptr scr, i32 tag, i8* name, i32 n, ptr* args) -> ptr`
+# — the Koka move-semantics variant reuse (donate unique cell, write slots,
+# NO donor-child decref; fall back to a fresh alloc when the donor is
+# shared/wrong-arity). Same arg layout as `kaix_reuse_or_alloc_variant`; the
+# entry point is the only difference.
+fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
@@ -438,7 +459,39 @@ fn nemit_reuse_variant_call(ctx: Handle, scr: Handle, tag: Int, nm: String, argv
   llvm_buf_free(argvalbuf)
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
   let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
-  ncall_finish(ctx, "kaix_reuse_or_alloc_variant", p, ptb, ab)
+  ncall_finish(ctx, "kaix_variant_reuse_at", p, ptb, ab)
+}
+
+# `kaix_reuse_or_alloc_cons(ptr scr, ptr head, ptr tail) -> ptr`. The cons
+# reuse inits are exactly [head, tail]; pull them off the materialised buffer.
+fn nemit_cons_reuse_call(ctx: Handle, scr: Handle, argvalbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let head = llvm_buf_get(argvalbuf, 0)
+  let tail = llvm_buf_get(argvalbuf, 1)
+  llvm_buf_free(argvalbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, head); llvm_buf_push(ab, tail)
+  ncall_finish(ctx, "kaix_reuse_or_alloc_cons", p, ptb, ab)
+}
+
+# `kaix_reuse_or_alloc_record(ptr scr, i32 n, ptr* fields, i8** names) -> ptr`
+# — record reuse-in-place. Donate the unique scrutinee cell, overwrite its
+# fields (decref'ing the old field values only where they differ — records
+# are bijective by field index, so the 1:1 decref is sound here, unlike the
+# permuting variant rotation), else allocate fresh.
+fn nemit_record_reuse(ctx: Handle, scr: Handle, fields: [KFieldInit]) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let vals = llvm_buf_new()
+  let names = llvm_buf_new()
+  nemit_push_fields(ctx, vals, names, fields)
+  let n = llvm_buf_len(vals)
+  let farr = nemit_ptr_array(ctx, vals)
+  let narr = nemit_ptr_array(ctx, names)
+  llvm_buf_free(vals); llvm_buf_free(names)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, farr); llvm_buf_push(ab, narr)
+  ncall_finish(ctx, "kaix_reuse_or_alloc_record", p, ptb, ab)
 }
 
 # `kaix_record(i32 n, ptr* fields, ptr* names) -> ptr`. `vals`/`names` are
