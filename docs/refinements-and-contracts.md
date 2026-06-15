@@ -379,29 +379,46 @@ Neither participates in effect inference.
 specialised messages with the predicate text, the offending
 value, and the call site.
 
-> **v2 status (2026-05-30, refs #86):** the runtime panic now
+> **v3 status (2026-06-15, refs #86 / #750):** the runtime panic now
 > emits clause kind, function name, rendered predicate, decl-site
-> line/col, **and the runtime value of the offending binding** for
-> `requires` predicates of the simple `<ident> <cmp> <literal>`
-> shape (the predicate-aware piece-1 context plus the piece-2
-> value line). Both backends (C and LLVM) produce identical output.
+> line/col, **the runtime value of the offending binding**, **and a
+> `help: narrow` suggestion** for `requires` predicates of the simple
+> `<ident> <cmp> <literal>` shape (piece-1 context + piece-2 value +
+> piece-3 help). Both backends (C and LLVM) produce identical output.
 > Concretely, today's output is:
 >
 > ```
 > panic: requires violated in `divide`
 > required: b != 0
 > declared at line 15, col 14
+>   = help: narrow `b` to `Real where != 0`
 > argument b was: 0
 > ```
 >
-> Still pending (the aspirational form below): the call-site
-> `--> file:line:col` caret and the `help: narrow b to ...`
-> suggestion. The help line needs the binding's *base* type from
-> the typer, which is not available at the assert-insertion site;
-> the caller-span caret needs the call-site span threaded into the
-> assert. Issue #86 stays open to track those two pieces.
+> The help line's base type (`Real`) comes from the offending
+> parameter's *declared* annotation, not the comparison literal: an
+> `n != 0` over `n: Int` reads `Int where != 0`. A declared type is the
+> right source for an edit suggestion — it is the spelling the user
+> rewrites — and it is already present at the assert-insertion site
+> (`wrap_with_contracts` runs in `parse_decl`), so no typer thread is
+> needed. The help renders only for the single-ident shape piece-2
+> covers; other shapes (multi-conjunct, non-scalar, `ensures`) fall
+> through to piece-1 with no help.
+>
+> The help precedes the runtime `argument` line rather than closing the
+> message as the aspirational form below shows: the help is static
+> (it lives in the parse-time C string literal), the value is appended
+> at runtime, so the static help comes first. Reordering to put help
+> last would mean threading a separate `help` argument through both
+> emitters and both `runtime.h` copies purely to permute two lines —
+> not worth the blast radius (the help content is what matters, not its
+> position). Still pending: the call-site `--> file:line:col` caret
+> (needs the call-site span threaded into the assert) and the
+> `or wrap in ensure(b) where != 0.0` half of the help (a return-type
+> refinement, deferred). Issue #86 stays open to track those.
 
-Aspirational target (call-site caret + narrowing help, tracked under #86):
+Aspirational target (call-site caret + the `ensure` half of the help,
+tracked under #86):
 
 ```
 error: precondition violated in `divide`
