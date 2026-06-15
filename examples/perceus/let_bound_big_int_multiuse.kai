@@ -1,0 +1,44 @@
+# Native-parity regression — a `let`-bound out-of-cache Int used more than
+# once by a consuming op (`bit_*` / arith) must not double-free.
+#
+# Root cause (closed by the native-sha512-hang lane): the unbox pass marks
+# every Int literal `MUnboxed`, so a `let x = <Int literal>` binder is raw.
+# Perceus skips the RC of a raw binder (`prc_pat_bindings_skip_raw` sees
+# `MUnboxed`), but the all-boxed KIR re-boxed the binder into ONE shared
+# cell and read it twice. The consuming prims (`kaix_add` / `kaix_bit_*`)
+# decref their args, so the first use freed the cell (an out-of-cache Int,
+# `|n| > 65535`, has a real refcount — only `[-65536, 65535]` is the
+# immortal cache) and the second read garbage. SHA-512 hung on it: its
+# 64-bit constants are all out-of-cache and reused across the schedule.
+#
+# Fix: the KIR lowers a `MUnboxed` Int `let`-binder RAW (`SInt64`) and boxes
+# a FRESH `kaix_int` at each read — the C-direct oracle's `int64_t kair_x`
+# + `kai_int(kair_x)` per use. The C-direct backend was always correct, so
+# this fixture is the native==C gate (selfhost byte-id is false-green here:
+# the compiler itself has no such hot multi-use big-Int `let`).
+#
+# Coverage:
+#   - `big` (out-of-cache, > 65535): two bit-op uses + one arith use.
+#   - `once`: a single-use big-Int let (still raw, must print correctly).
+#   - `small` (in-cache): two uses — was always fine (immortal slot), guards
+#     against the fix mis-handling the cache range.
+
+fn main() = {
+  let big = 5840696475078001361
+  let a = bit_ushr(big, 14)
+  let b = bit_shl(big, 1)
+  let c = big + 7
+  print_int(a)
+  print_int(b)
+  print_int(c)
+
+  let once = 9223372036854775807
+  print_int(bit_ushr(once, 1))
+
+  let small = 60000
+  print_int(small + small)
+  print_int(bit_and(small, 255))
+  0
+}
+
+fn print_int(n: Int) : Unit / Stdout = Stdout.print(int_to_string(n))

@@ -44,6 +44,30 @@ fn kir_ty_is_real_t(t: Ty) : Bool = match t {
   _                   -> false
 }
 
+# True when an optional type is `Int` (stripping Refinement wrappers). The
+# second scalar this module raw-promotes — but ONLY for a `let`-binder's
+# RHS / its EVar reads (a literal or a var), NEVER Int arith / bit-ops. A
+# boxed Int that escapes `let`-scope (a fn param) already rides perceus's
+# RC correctly; the gap is the `let` binding, which perceus skip-raws
+# (`prc_pat_bindings_skip_raw` sees `MUnboxed`) yet the all-boxed KIR
+# re-boxed with a SHARED cell — a use-after-free on any out-of-cache Int
+# (|n| > 65535) used twice by a consuming prim (`kaix_add` / `kaix_bit_*`
+# decref their args). Lowering the binder RAW (`SInt64`) + boxing a FRESH
+# `kaix_int` at each read (`nemit_load_reg_boxed`) matches the C-direct
+# oracle's `int64_t kair_x` + `kai_int(kair_x)` per use — no shared cell,
+# no RC, no double-free. Mirror of the Real raw path (the np-real lane),
+# extended to the Int `let`-binder FORM only.
+pub fn kir_ty_is_int(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_int_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_int_t(t: Ty) : Bool = match t {
+  TyInt               -> true
+  TyRefineT(inner, _) -> kir_ty_is_int_t(inner)
+  _                   -> false
+}
+
 # An Expr the KIR raw path handles. ONLY the natively-raw FORMS — a Real
 # literal, a Real var, Real arith (`+ - * /`), unary `-`, a Real comparison,
 # or a logical / `not` over raw-Real comparisons. A Real-typed `MUnboxed`
@@ -56,9 +80,19 @@ fn kir_ty_is_real_t(t: Ty) : Bool = match t {
 pub fn kir_node_is_raw(x: Expr) : Bool =
   match x.mode { MUnboxed -> kir_kind_is_raw(x) _ -> false }
 
+# Int raw promotion FORMS: a literal (`EInt`) and a var (`EVar`). The
+# `let`-binder gate (`raw_let_slot`) uses these to bind a `MUnboxed` Int
+# raw `SInt64`, so the all-boxed KIR stops sharing one consuming cell across
+# N reads (the out-of-cache multi-use double-free that hung SHA-512). Int
+# arith / bit-ops are NOT a raw FORM (no native `i+`/`ishl` lowering); an Int
+# `EVar` / `EInt` reaching a BOXED consumer (a call arg, a `+`) crosses back
+# at the slot-driven border (`nemit_load_reg_boxed` → a fresh `kaix_int`),
+# the round-trip the C oracle's `kai_int(kair_x)` also pays. Real keeps its
+# full raw arith / cmp / logical set.
 fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EReal(_, _) -> kir_ty_is_real(x.ty)
-  EVar(_)     -> kir_ty_is_real(x.ty)
+  EInt(_)     -> kir_ty_is_int(x.ty)
+  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty)
   ELitUnit(inner, _) -> kir_node_is_raw(inner)
   EBinop(op, a, b) ->
     if kir_op_is_raw_freal_arith(op) { kir_ty_is_real(x.ty) }
@@ -76,7 +110,9 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
 # `real.box` (→ `kaix_real`) for a Real, `bool.box` (→ `kaix_bool`) for the
 # raw-Bool result of a Real comparison / logical. Mirror of `box_wrap`.
 pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
-  if kir_ty_is_real(opt_t) { "real.box" } else { "bool.box" }
+  if kir_ty_is_real(opt_t) { "real.box" }
+  else if kir_ty_is_int(opt_t) { "int.box" }
+  else { "bool.box" }
 
 # The `fbinop` opcode for a raw-Real arithmetic operator (matches the
 # runtime `kai_llvm_build_fbinop` switch: 0=fadd 1=fsub 2=fmul 3=fdiv).
