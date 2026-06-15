@@ -61,36 +61,69 @@ fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
   [b, ...rest] -> if ntrmc_term_is_step(b.term) { true } else { ntrmc_blocks_have_step(rest) }
 }
 fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
-  KTrmcStep(_, _, _, _, _, _, _) -> true
+  KTrmcStep(_, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
-# `KTrmcStep`: build the cons cell with a NULL hole at the tail, extend the
-# cctx to point at it, recompute the new hole, rebind the loop params from
-# the deferred self-call's args, then branch to the loop header. The
-# `head_vals` are the non-hole ctor args (the cons head); `assigns` are the
-# self-call's args (the back-edge rebinds).
-pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String,
+# `KTrmcStep`: build the spine cell with an OPEN hole, extend the cctx to
+# point at it, recompute the new hole, drop the consumed params, rebind the
+# loop params, then branch to the loop header. A builtin-cons spine (cname
+# `__kai_cons*`) and an n-ary user variant (the rb-tree `Node`) differ ONLY
+# in the cell-build + hole-address calls, so the step splits into two full
+# Unit-returning bodies dispatched by `match` on the cname. (The shared
+# middle — cctx extend, drop, rebind, branch — cannot be factored back into
+# a Handle-returning `match` arm: kaic1 stage1 lowers a `match` whose arms
+# return a value into an LLVM `select` that EVALUATES BOTH arms, emitting two
+# ctor calls + an invalid `select ptr %c, null, @kaix_cons`. Keeping each
+# whole step on its own path is what avoids that.)
+# The `dropmask` (the lowering's per-param "dead after this back-edge"
+# bitfield) is accepted and IGNORED, identically to `nemit_tcrec`: reuse
+# correctness rides the move-semantics reuse + variant-TRMC build, verified
+# result-correct + ASAN-clean without a back-edge param drop; a naive
+# per-index drop over-drops a live heap param in the `list_*` parse loops
+# (the jwt fixture) for want of the C oracle's pmask raw/boxed distinction.
+# Skipping it only leaks more in the already-non-freeing all-boxed backend.
+pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, dropmask: Int,
                        head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
+  let _ignored_dropmask = dropmask
+  match ntrmc_cname_is_cons(cname) {
+    true  -> ntrmc_cons_step(ctx, head_vals, asg)
+    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg)
+  }
+}
+
+# Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr.
+fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
-  # 1. node = kai_cons(head, NULL). The builtin cons holds head at
-  #    `as.cons.head` and the open hole at `as.cons.tail` (hole_slot is the
-  #    cdr; `kaix_cons_tail_addr` finds it, NOT the variant-slot path).
-  let head = ntrmc_head_val(ctx, head_vals)
-  let node = ncall_sig2(ctx, "kaix_cons", p, p, p, head, llvm_const_null(p))
-  # 2. extend the cctx: plug `node` into the OLD hole, get the new root.
-  #    res' = kaix_cctx_extend(res, hole, node); store res' back.
+  let node = ncall_sig2(ctx, "kaix_cons", p, p, p, ntrmc_head_val(ctx, head_vals), llvm_const_null(p))
+  ntrmc_extend_and_loop(ctx, node, ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node), asg)
+}
+
+# n-ary user-variant spine step: fill every non-hole slot from `head_vals`
+# (slot order) plus a NULL placeholder at `hole_slot`, build `kaix_variant`
+# (mask==0), hole at slot `hole_slot`.
+fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int,
+                      head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let argbuf = ntrmc_variant_slots(ctx, head_vals, hole_slot, 0)
+  let node = nemit_variant_call(ctx, "kaix_variant", tag, cname, argbuf)
+  let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node, llvm_const_i32(i32t, hole_slot))
+  ntrmc_extend_and_loop(ctx, node, hole, asg)
+}
+
+# The shared spine-step tail (both cons and variant): extend the cctx with
+# `node` (plug it into the OLD hole, get the new root), store the new hole,
+# rebind the loop params from the self-call args, then loop. Takes the node +
+# its open-hole address (the only cons/variant difference) ready-built so
+# this body never branches on the cell shape.
+fn ntrmc_extend_and_loop(ctx: Handle, node: Handle, hole_new: Handle, asg: [KAssign]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
   let res_old = nemit_load_reg(ctx, ntrmc_res_reg())
   let hole_old = nemit_load_reg(ctx, ntrmc_hole_reg())
   let res_new = ncall_sig3(ctx, "kaix_cctx_extend", p, p, p, p, res_old, hole_old, node)
   nemit_store_reg(ctx, ntrmc_res_reg(), res_new)
-  # 3. new hole = &node->as.cons.tail; store it back.
-  let hole_new = ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node)
   nemit_store_reg(ctx, ntrmc_hole_reg(), hole_new)
-  # 4. rebind the loop params from the self-call's args (evaluate ALL
-  #    first — they read the OLD param allocas — then store), then branch
-  #    to the first KIR block (the loop header). Same discipline as
-  #    `nemit_tcrec` (the dropmask's deferred drops follow the same path).
   let valbuf = llvm_buf_new()
   ntrmc_eval_assigns(ctx, asg, valbuf)
   ntrmc_store_assigns(ctx, asg, valbuf, 0)
@@ -98,6 +131,36 @@ pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String,
   llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
   ()
 }
+
+# True for the two builtin-cons spine markers (the lowering tags them with
+# tag -1; the cname is the authoritative discriminant, mirroring the C
+# oracle's `trmc_cons_cname` / `trmc_cons_scr_cname`).
+fn ntrmc_cname_is_cons(cname: String) : Bool =
+  cname == "__kai_cons" or cname == "__kai_cons_s"
+
+# Materialise the variant slot buffer in ctor slot order: each non-hole
+# slot takes the next `head_vals` atom; `hole_slot` takes a NULL placeholder
+# (the cctx fills it next). `i` is the slot index being emitted.
+fn ntrmc_variant_slots(ctx: Handle, head_vals: [KVal], hole_slot: Int, i: Int) : Handle / Console = {
+  let buf = llvm_buf_new()
+  ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, i)
+  buf
+}
+fn ntrmc_push_variant_slots(ctx: Handle, buf: Handle, head_vals: [KVal], hole_slot: Int, i: Int) : Unit / Console =
+  match i == hole_slot {
+    true -> {
+      llvm_buf_push(buf, llvm_const_null(native_ctx_ptrt(ctx)))
+      ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, i + 1)
+    }
+    false -> match head_vals {
+      [] -> ()
+      [h, ...rest] -> {
+        let hv = nemit_atom(ctx, h)
+        llvm_buf_push(buf, hv)
+        ntrmc_push_variant_slots(ctx, buf, rest, hole_slot, i + 1)
+      }
+    }
+  }
 
 # The cons head is the single non-hole ctor arg (builtin cons is binary:
 # head + the hole tail). Materialise it; a malformed `head_vals` (not
