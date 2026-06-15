@@ -2006,6 +2006,33 @@ doc_resolve_module() {
   return 1
 }
 
+# Resolve a (possibly dotted) module name to a .kai FILE inside the
+# current package's search roots — the manifest dir, its parent, and every
+# dependency `manifest_path_flags` exposes. Mirrors kaic2's `module_to_path`
+# (`a.b -> a/b.kai`) so `kai doc <m>` finds exactly the module an
+# `import <m>` in the same package would. Echoes the absolute file path on
+# success; returns 1 when there is no manifest or no matching file (the
+# caller then reports a combined stdlib+package miss). This is what makes
+# `kai doc` work for a module `m` declared in kai.toml, not just stdlib.
+doc_resolve_pkg_module() {
+  name="$1"
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  [ -n "$manifest_dir" ] || return 1
+  # `a.b.c` -> `a/b/c` (kaic2's dotted-path-to-dir convention).
+  rel="$(printf '%s' "$name" | tr '.' '/')"
+  # The search roots are exactly the `--path` dirs run/build would inject,
+  # captured once (`manifest_path_flags` may auto-install, so avoid
+  # re-running it). The flags interleave as `--path <dir> --path <dir> …`.
+  flags="$(manifest_path_flags "$manifest_dir" 2>/dev/null)"
+  for root in $flags; do
+    case "$root" in --path) continue ;; esac
+    for cand in "$root/$rel.kai" "$root/$name.kai"; do
+      if [ -f "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
+    done
+  done
+  return 1
+}
+
 # The CommonMark -> TTY renderer, shared by the symbol view. Reads the
 # raw doc body (with literal newlines already unescaped) on stdin and
 # reflows it under a two-space margin: ATX headers drop their `#` and
@@ -2149,10 +2176,15 @@ Examples:
   kai doc stream.fold
   kai doc stream
   kai doc
+  kai doc geo                        A package module (declared in kai.toml).
+  kai doc geo.area
 
-Docs come from the #[doc(...)] attributes in stdlib source, extracted
-by the compiler (kaic2 --doc-json). A <module> is a stdlib file by its
-basename (string, stream, map) or relative path (core/string, fs/path).
+Docs come from the #[doc(...)] attributes in the source, extracted by the
+compiler (kaic2 --doc-json). A <module> is resolved against the stdlib
+first (string, stream, map, or a relative path like core/string, fs/path),
+then — when a kai.toml is in scope — against the current package and its
+dependencies, so a module you import via kai.toml is documentable the same
+way. The bare-no-args list shows stdlib modules only.
 EOF
       return 0 ;;
   esac
@@ -2187,13 +2219,26 @@ EOF
     *)   mod="$arg";      sym="" ;;
   esac
 
-  rel="$(doc_resolve_module "$mod")" || {
-    echo "kai: error: no stdlib module '$mod'" >&2
-    echo "  run 'kai doc' to list available modules." >&2
+  # Resolve `mod` against the stdlib first, then — when a kai.toml is in
+  # scope — against the current package and its dependencies, so a module
+  # `m` declared in kai.toml is documentable via `kai doc m` exactly like a
+  # stdlib module. `doc_path_flags` carries the package's --path roots into
+  # `--doc-json` so a package module that imports siblings/deps still
+  # type-checks for doc extraction (empty for a stdlib hit).
+  doc_path_flags=""
+  if rel="$(doc_resolve_module "$mod" 2>/dev/null)"; then
+    file="$STDLIB_ROOT/$rel"
+  elif file="$(doc_resolve_pkg_module "$mod" 2>/dev/null)" && [ -n "$file" ]; then
+    rel="$file"
+    pkg_manifest_dir="$(find_manifest_dir "$(pwd)")"
+    doc_path_flags="$(manifest_path_flags "$pkg_manifest_dir" 2>/dev/null)"
+  else
+    echo "kai: error: no module '$mod' in the stdlib or the current package" >&2
+    echo "  run 'kai doc' to list stdlib modules; for a package module," >&2
+    echo "  check it is declared in kai.toml and the name matches an import." >&2
     exit 1
-  }
-  file="$STDLIB_ROOT/$rel"
-  json="$("$KAIC2" --doc-json "$file" 2>/dev/null)"
+  fi
+  json="$("$KAIC2" $doc_path_flags --doc-json "$file" 2>/dev/null)"
 
   # Module view: list the pub items with their synopsis.
   if [ -z "$sym" ]; then
