@@ -1342,7 +1342,7 @@ fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : 
     CkDup       -> lower_rc_unary(cargs, KDupMk, st)
     CkDrop      -> lower_rc_unary(cargs, KDropMk, st)
     CkBorrow    -> lower_borrow_through(cargs, st)
-    CkReuse     -> lower_reuse(x, cargs, st)
+    CkReuse     -> lower_reuse(x, callee, cargs, st)
     CkTrmcStep  -> lower_trmc_step(x, callee, cargs, st)
     CkTrmcApply -> lower_trmc_apply(x, cargs, st)
     CkTcrec     -> lower_tcrec(x, callee, cargs, st)
@@ -1405,36 +1405,60 @@ fn lower_unit_name(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   _   -> LRes(KUnitV, st)
 }
 
-# `__perceus_reuse_*(scr, rbld...)`: donor scrutinee + rebuild; decode the
-# rebuild into a KConReuse over the donor (§4.7 arg 4).
-fn lower_reuse(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
+# `__perceus_reuse_*(scr, rbld...)`: donor scrutinee + rebuild. The `callee`
+# (`__perceus_reuse_{variant,cons,record}`) is the authoritative reuse-kind
+# tag — perceus stamped it from the pattern shape — so each reuse routes to
+# its own move-semantics runtime helper. The record form needs its rebuild's
+# field NAMES, so it decodes the `ERecordLit` into a `KRecordReuse`; the
+# variant/cons forms share the slot-init `KConReuse`. (The original native
+# bug routed every reuse — record included — through the variant helper.)
+fn lower_reuse(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [scr, ...rbld] -> match lower_expr(scr, st) { LRes(donor, st1) ->
-    lower_reuse_rebuild(x, donor, rbld, st1) }
+    if callee == "__perceus_reuse_record" { lower_reuse_record(x, donor, rbld, st1) }
+    else { lower_reuse_rebuild(x, reuse_kind_of(callee), donor, rbld, st1) } }
   _ -> LRes(KUnitV, st)
 }
 
+fn reuse_kind_of(callee: String) : KReuseKind =
+  if callee == "__perceus_reuse_cons" { RkCons } else { RkVariant }
+
 # A single-element rebuild whose head is an `EVar`/`EModCall` constructor is
-# a variant/record reuse; otherwise it is a cons reuse (`reuse_cons` passes
+# a variant reuse; otherwise it is a cons reuse (`reuse_cons` passes
 # head+tail directly). The `"Cons"` fallback only fires for the cons shape —
 # perceus never emits a reuse over a non-ctor `ECall`, so the fallback's tag
 # is correct for cons and unreachable for anything else (Linus review nit).
-fn lower_reuse_rebuild(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
+fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
   [one] -> match one.kind {
     ECall(cf, cas) -> match cf.kind {
-      EVar(cn)         -> lower_reuse_con(x, donor, cn, cas, st)
-      EModCall(_m, cn) -> lower_reuse_con(x, donor, cn, cas, st)
-      _ -> lower_reuse_con(x, donor, "Cons", rbld, st)
+      EVar(cn)         -> lower_reuse_con(x, rk, donor, cn, cas, st)
+      EModCall(_m, cn) -> lower_reuse_con(x, rk, donor, cn, cas, st)
+      _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
     }
-    _ -> lower_reuse_con(x, donor, "Cons", rbld, st)
+    _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
   }
-  _ -> lower_reuse_con(x, donor, "Cons", rbld, st)
+  _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
 }
 
-fn lower_reuse_con(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match lower_exprs(cargs, st, []) { LResMany(avs, st1) -> {
     let tag = ls_variant_tag(st1, cn)
-    bind_op(st1, KConReuse(donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
+    bind_op(st1, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
   } }
+
+# The record-reuse rebuild is an `ERecordLit` (perceus wraps it directly);
+# decode its (name, value) field inits into a `KRecordReuse` so the backend
+# donates the unique scrutinee cell via `kaix_reuse_or_alloc_record` (which
+# carries the parallel name array `kai_record` needs). A malformed rebuild
+# (not an `ERecordLit`) cannot arise — perceus only wraps record literals —
+# so fall back to unit defensively.
+fn lower_reuse_record(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
+  [one] -> match one.kind {
+    ERecordLit(_, fis) -> match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
+      bind_op(st1, KRecordReuse(donor, pairs), kpos_of(x)) }
+    _ -> LRes(KUnitV, st)
+  }
+  _ -> LRes(KUnitV, st)
+}
 
 # --- Constructors / direct calls ---------------------------------------
 
@@ -1528,10 +1552,19 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
 fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
                    heads: [KVal], self_args: [Expr], st: LowerSt) : LRes / Console =
   match lower_exprs(self_args, st, []) {
-    LResMany(reb, st1) ->
-      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, dropmask,
+    LResMany(reb, st1) -> {
+      # The variant ctor tag is resolved here (as `KCon` resolves it), so the
+      # backend builds the spine cell without a name→tag table. The builtin-
+      # cons spine (`__kai_cons` / `__kai_cons_s`) is not a registered variant
+      # → tag -1 (its backend path is cons-specific and ignores the tag).
+      let tag = if trmc_cname_is_cons(cname) { 0 - 1 } else { ls_variant_tag(st1, cname) }
+      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, dropmask,
                                heads, assigns_of(reb, 0, []), kpos_of(x)))
+    }
   }
+
+fn trmc_cname_is_cons(cname: String) : Bool =
+  cname == "__kai_cons" or cname == "__kai_cons_s"
 
 # The ctor args minus the hole slot, in slot order — the real head value(s)
 # the backend uses to build the spine cell (NULL plugged at the hole).
