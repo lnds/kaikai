@@ -1,0 +1,134 @@
+# compiler/refine_help.kai — issue #750 (piece-3 of #86): render the
+# "help: narrow" suggestion line for a contract-violation panic.
+#
+# When a `requires <ident> <cmp> <literal>` predicate fails, the panic
+# already prints `required: <pred>` (piece-1) and `argument <ident>
+# was: <value>` (piece-2). This module produces the third, static line:
+#
+#   = help: narrow `b` to `Real where != 0.0`
+#
+# The base type (Real vs Int vs ...) is read from the offending
+# parameter's *declared* `ptype` — the annotation the user wrote, which
+# is already present in parse (`wrap_with_contracts` runs in
+# `parse_decl`), so no typer thread is needed. A declared type is the
+# right source for an *edit suggestion*: it is the spelling the user
+# will rewrite, not an inferred/normalised type they never typed. A
+# parameter with no annotation (`ptype = None`) or a non-atomic base
+# (generic, function, list) yields no help and the panic falls back to
+# piece-1 with no regression.
+#
+# The rendered predicate uses the `self`-elided refinement spelling
+# (`Real where != 0.0`, the form docs/refinements-and-contracts.md and
+# the #86 spec use): the ident is dropped from the comparison's LHS,
+# leaving `<cmp> <literal>`, which the parser accepts (it re-inserts
+# `self` for a leading comparator).
+#
+# Single-line `#[doc(...)]` only, no backticks inside attribute strings:
+# kaic1 consumes the concatenated bundle and rejects triple-quoted
+# strings and backticks inside attributes (same constraint as
+# refinements.kai). The C string the renderer emits is pre-escaped for
+# embedding in the contract-violation literal.
+
+import compiler.util
+import compiler.ast
+
+# Build the help suffix for a single-ident requires predicate, or the
+# empty string when no base type can be rendered. `ident` is the
+# offending binding's name (already recovered by the single-ident
+# detector); `pred` is the comparison Expr; `params` the fn's declared
+# parameters. The result is appended to the contract-violation C string
+# literal, so it is pre-escaped (newline as the two bytes backslash-n).
+#[doc("Render the help-narrow suffix for a single-ident requires violation; empty string when the declared base type is not renderable.")]
+pub fn requires_help_line(ident: String, pred: Expr, params: [Param]) : String {
+  match param_base_type_name(ident, params) {
+    None -> ""
+    Some(base) -> match elide_pred_lhs(pred, ident) {
+      None -> ""
+      Some(rhs_text) -> concat_all([
+        "\\n  = help: narrow `", escape_str_body_for_c(ident),
+        "` to `", escape_str_body_for_c(base),
+        " where ", escape_str_body_for_c(rhs_text), "`"
+      ])
+    }
+  }
+}
+
+# Find the parameter named `ident` and return its declared base type
+# name, unwrapping a refined annotation to the underlying base. None
+# when the param is unannotated or its base is not an atomic named type
+# (the single-ident scalar shape never refers to a generic/fn/list base,
+# so anything else falls through to piece-1).
+fn param_base_type_name(ident: String, params: [Param]) : Option[String] {
+  match params {
+    [] -> None
+    [p, ...rest] ->
+      if p.pname == ident {
+        match p.ptype {
+          None -> None
+          Some(t) -> base_ty_name(t)
+        }
+      } else { param_base_type_name(ident, rest) }
+  }
+}
+
+# The base type name of a declared TypeExpr: the head of a TyName, or
+# the base of a TyRefine (so a refined param still yields its base).
+# Other shapes return None — they are not the atomic base the help line
+# renders.
+fn base_ty_name(t: TypeExpr) : Option[String] = match t.tkind {
+  TyName(name, _) -> Some(name)
+  TyRefine(base, _) -> base_ty_name(base)
+  _ -> None
+}
+
+# Drop the ident from the LHS of an `<ident> <cmp> <literal>` comparison
+# and render the remaining `<cmp> <literal>` text (the self-elided
+# refinement predicate). Handles either operand order. None when the
+# shape is not the single-ident comparison this lane covers.
+fn elide_pred_lhs(pred: Expr, ident: String) : Option[String] = match pred.kind {
+  EBinop(op, a, b) ->
+    if expr_is_var(a, ident) and is_scalar_lit(b) {
+      Some(concat_all([op, " ", scalar_lit_text(b)]))
+    } else if expr_is_var(b, ident) and is_scalar_lit(a) {
+      # Mirror so the elided form keeps the literal on the right:
+      # a `0.0 != b` predicate renders as `!= 0.0` under the flipped op.
+      Some(concat_all([flip_cmp(op), " ", scalar_lit_text(a)]))
+    } else { None }
+  _ -> None
+}
+
+fn expr_is_var(e: Expr, name: String) : Bool = match e.kind {
+  EVar(s) -> s == name
+  _ -> false
+}
+
+fn is_scalar_lit(e: Expr) : Bool = match e.kind {
+  EInt(_) -> true
+  EReal(_, _) -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  _ -> false
+}
+
+fn scalar_lit_text(e: Expr) : String = match e.kind {
+  EInt(n) -> int_to_string(n)
+  EReal(r, _) -> real_to_string(r)
+  EBool(b) -> if b { "true" } else { "false" }
+  EChar(c) -> char_lit_text(c)
+  _ -> "<lit>"
+}
+
+# A char literal rendered with its surrounding single quotes, mirroring
+# `expr_show_pred`'s EChar arm in refinements.kai.
+fn char_lit_text(c: Char) : String = concat_all(["'", "#{c}", "'"])
+
+# Flip a comparator so `<literal> OP <ident>` re-renders as
+# `<ident> FLIP(OP) <literal>` — keeping the literal on the right of the
+# elided predicate. `==` / `!=` are symmetric.
+fn flip_cmp(op: String) : String {
+  if op == "<" { ">" }
+  else if op == "<=" { ">=" }
+  else if op == ">" { "<" }
+  else if op == ">=" { "<=" }
+  else { op }
+}

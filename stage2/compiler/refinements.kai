@@ -53,6 +53,7 @@ import compiler.util
 import compiler.chars
 import compiler.ast
 import compiler.intervals
+import compiler.refine_help
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -193,7 +194,7 @@ pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
                        line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
     let pp = collect_param_preds(params, [])
-    let req_stmts = preds_to_asserts(reqs, [], "requires", pp, fn_name)
+    let req_stmts = preds_to_asserts(reqs, [], "requires", pp, fn_name, params)
     if enss == [] {
       if req_stmts == [] { body }
       else { mk_expr(EBlock(req_stmts, Some(body)), line, col) }
@@ -203,7 +204,7 @@ pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
       #   { req_asserts; let result = body; ens_asserts; result }
       let bind_pat = mk_pat(PBind("result"), line, col)
       let bind = SLet(bind_pat, None, body)
-      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp, fn_name)
+      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp, fn_name, params)
       if req_stmts == [] and ens_stmts == [] { body }
       else {
         let res_var = mk_expr(EVar("result"), line, col)
@@ -215,7 +216,8 @@ pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
 }
 
 fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
-                     param_preds: [ParamPred], fn_name: String) : [Stmt] {
+                     param_preds: [ParamPred], fn_name: String,
+                     params: [Param]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
     # m12.6.d: drop trivially-true predicates at parse time.
@@ -232,13 +234,13 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
     # follow-up (see docs/refinements-and-contracts.md v2 sidebar).
     [p, ...rest] -> {
       if pred_entailed_by_params(p, param_preds) {
-        preds_to_asserts(rest, acc, kind, param_preds, fn_name)
+        preds_to_asserts(rest, acc, kind, param_preds, fn_name, params)
       } else { match try_eval_pred(p) {
-        Some(true) -> preds_to_asserts(rest, acc, kind, param_preds, fn_name)
+        Some(true) -> preds_to_asserts(rest, acc, kind, param_preds, fn_name, params)
         _          -> {
-          let msg_span = build_violation_msg_span(kind, fn_name, p)
+          let msg_span = build_violation_msg_span(kind, fn_name, p, params)
           let msg = mk_expr(EStr(msg_span, false), p.line, p.col)
-          preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind, param_preds, fn_name)
+          preds_to_asserts(rest, [SAssert(p, Some(msg)), ...acc], kind, param_preds, fn_name, params)
         }
       } }
     }
@@ -257,15 +259,32 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
 # `"requires violated` / `"ensures violated` prefix is kept so the
 # detectors at extract_requires_asserts / contract_assert_kind still
 # classify the assert as contract-derived.
-fn build_violation_msg_span(kind: String, fn_name: String, p: Expr) : String {
+fn build_violation_msg_span(kind: String, fn_name: String, p: Expr,
+                            params: [Param]) : String {
   let pred_text = escape_str_body_for_c(expr_show_pred(p))
   let fn_text = escape_str_body_for_c(fn_name)
   concat_all([
     "\"", kind, " violated in `", fn_text, "`",
     "\\nrequired: ", pred_text,
     "\\ndeclared at line ", int_to_string(p.line),
-    ", col ", int_to_string(p.col), "\""
+    ", col ", int_to_string(p.col),
+    violation_help_suffix(kind, p, params), "\""
   ])
+}
+
+# Issue #750 (piece-3 of #86): the `help: narrow` suggestion. Only a
+# `requires` clause whose predicate is the single-ident `<ident> <cmp>
+# <literal>` shape (the same shape piece-2 attaches a runtime value to)
+# carries a help line; `ensures` clauses reference `result`, not a
+# param, so they never match and fall through to "". The base type comes
+# from the offending param's declared annotation (see refine_help.kai),
+# so an unannotated param also yields "" — piece-1 with no regression.
+fn violation_help_suffix(kind: String, p: Expr, params: [Param]) : String {
+  if kind != "requires" { "" }
+  else { match contract_single_ident(p) {
+    None -> ""
+    Some(ident) -> requires_help_line(ident, p, params)
+  } }
 }
 
 # m12.6.x #2: collect every refinement predicate that appears on a
