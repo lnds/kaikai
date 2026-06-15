@@ -11393,6 +11393,8 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Analysis.h>
+#include <llvm-c/Error.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 #include <stdlib.h>
 
 /* The native backend keeps one context + builder per compilation unit.
@@ -12019,6 +12021,51 @@ static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
  * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
  * object links it, the compiler does not call it.) */
 
+/* --- optimisation pass pipeline (L4, issue #498) ---
+ * Run the LLVM New-PM pipeline in-process on the module before codegen,
+ * matching the `-O2` the out-of-process C/LLVM-text paths get from
+ * `clang -O2`. Two profiles selected by `KAI_NATIVE_OPT`:
+ *   release (default / "2") — `default<O2>`: the per-module pipeline
+ *     `clang -O2` builds (inlining, vectorisation, unrolling); same
+ *     pass set, so native matches the C path's runtime perf.
+ *   debug ("0") — `default<O0>`: minimum legalisation, no inlining,
+ *     fast compile, symbols kept. Selected by `bin/kai --debug`.
+ * Levels "1"/"3"/"s"/"z" map straight to `default<O1|O3|Os|Oz>`; any
+ * other value falls back to O2. The pipeline string format is the same
+ * as `opt -passes=` and stable across the LLVM 18.x series.
+ *
+ * Runs AFTER verify (a pass set assumes verified IR; verify catches a
+ * codegen bug with a clear message before a pass turns it into an opaque
+ * LLVM crash) and reuses the SAME TargetMachine the emit step builds, so
+ * the pipeline's TargetTransformInfo cost model matches the emission
+ * target exactly (asu review). Returns 0 on success, non-zero on a pass
+ * error (surfaced like a verify failure). */
+static const char *kai_llvm_pass_pipeline(void) {
+    const char *lvl = getenv("KAI_NATIVE_OPT");
+    if (!lvl || !lvl[0]) return "default<O2>";   /* default: release */
+    if (strcmp(lvl, "0") == 0) return "default<O0>";
+    if (strcmp(lvl, "1") == 0) return "default<O1>";
+    if (strcmp(lvl, "3") == 0) return "default<O3>";
+    if (strcmp(lvl, "s") == 0) return "default<Os>";
+    if (strcmp(lvl, "z") == 0) return "default<Oz>";
+    return "default<O2>";                         /* "2" and unknowns */
+}
+
+static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm) {
+    const char *pipeline = kai_llvm_pass_pipeline();
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMErrorRef e = LLVMRunPasses(m, pipeline, tm, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    if (e) {
+        char *msg = LLVMGetErrorMessage(e);   /* consumes e + allocates msg */
+        fprintf(stderr, "kai: native opt pass pipeline (%s) failed: %s\n",
+                pipeline, msg ? msg : "?");
+        LLVMDisposeErrorMessage(msg);         /* frees msg; do NOT ConsumeError(e) */
+        return 1;
+    }
+    return 0;
+}
+
 /* --- object emission --- */
 /* Verify the module, then emit it as a native object file at `path`
  * using the host target machine. Returns 0 on success, non-zero on a
@@ -12070,6 +12117,17 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
     if (features) LLVMDisposeMessage(features);
     LLVMSetTarget((LLVMModuleRef) m, triple);
     LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
+
+    /* L4 (issue #498): optimise the module in-process before codegen.
+     * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-
+     * text paths get; `KAI_NATIVE_OPT=0` (bin/kai --debug) drops to O0.
+     * A pass error aborts before EmitToFile (no half-optimised object). */
+    if (kai_llvm_run_passes((LLVMModuleRef) m, tm)) {
+        LLVMDisposeTargetMachine(tm);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
 
     if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, out, LLVMObjectFile, &err)) {
         fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
