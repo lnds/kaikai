@@ -61,7 +61,27 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # travels here (the C / LLVM-text oracles dodge this by
                      # `kai_`-prefixing ALL user symbols; the native backend
                      # does not, so FFI is the one place a clash can arise).
-                     ffi: [String] }
+                     ffi: [String],
+                     # `renames` maps a shadowed surface binder name to the
+                     # fresh `.tN` register it was alpha-renamed to inside the
+                     # current block. The register table is string-keyed by
+                     # surface name (see `ls_fresh_reg`), so a `let x` that
+                     # shadows an outer `let x` would otherwise reuse the same
+                     # alloca and a read of the OUTER `x` after the inner block
+                     # would load the inner value (#846 — soundness). When a
+                     # binder name is already in `locals`, `lower_let_bind`
+                     # mints a fresh reg and records `name -> fresh` here;
+                     # `lower_var` consults it so reads inside the inner block
+                     # hit the fresh reg. `lower_block` snapshots `renames` on
+                     # entry and restores it on exit, so the outer read after
+                     # the block resolves back to the outer reg. The `rc`
+                     # counter is NOT restored (monotone), so sibling blocks
+                     # shadowing the same name get distinct `.tN`.
+                     renames: [Rename] }
+
+# #846 — a shadowed surface binder name paired with the fresh register it
+# was alpha-renamed to inside the current block (`Rn(surface, reg)`).
+pub type Rename = Rn(String, String)
 
 # Result of lowering one expression: its value atom + threaded state.
 pub type LRes = LRes(KVal, LowerSt)
@@ -80,7 +100,7 @@ pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
               consts: [Decl], ffi: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [] }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -90,7 +110,7 @@ pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
 # every KFn lowering (Risk 2b).
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [] }
 
 # Rotate the EFn table so entries from module `mo` resolve FIRST, then enter
 # the fn. Mirror of the C / LLVM emitters, which call `fns_prefer_module(fns,
@@ -104,7 +124,7 @@ pub fn ls_enter_fn_in(st: LowerSt, enc_fn: String, locals: [String],
                       mo: Option[String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns_prefer_module(st.fns, mo),
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
-            locals: locals, ffi: st.ffi }
+            locals: locals, ffi: st.ffi, renames: [] }
 
 # Extend the lexical scope with one bound name (a `let` / match binder).
 # Forward-visible: a binder is in scope only after its definition. Idempotent
@@ -114,12 +134,45 @@ pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
   if ls_is_local(st, name) { st }
   else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
                    vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi } }
+                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames } }
 
 # Is `name` a name bound locally in the current fn body? (param / capture /
 # let / match binder). The shadow test `lower_var` consults before treating
 # a name as a top-level fn-value.
 pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, name)
+
+# --- Shadow alpha-renaming (#846) ---------------------------------------
+
+# Record `name -> reg`: inside the current block, reads of the surface
+# binder `name` resolve to the fresh register `reg` rather than the
+# string-keyed `name` alloca an outer same-name binder owns. A new entry
+# is prepended so the innermost shadow wins `ls_lookup_rename`'s first
+# match. `lower_block` restores the prior list on exit, so the mapping is
+# block-scoped.
+pub fn ls_push_rename(st: LowerSt, name: String, reg: String) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
+            vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
+            consts: st.consts, locals: st.locals, ffi: st.ffi,
+            renames: [Rn(name, reg), ...st.renames] }
+
+# Resolve a surface name to its active shadow register, if any. First match
+# (innermost shadow) wins. No entry → the name is not shadowed; the caller
+# uses the surface name verbatim.
+pub fn ls_lookup_rename(st: LowerSt, name: String) : Option[String] =
+  ls_lookup_rename_loop(st.renames, name)
+
+fn ls_lookup_rename_loop(rs: [Rename], name: String) : Option[String] = match rs {
+  []                -> None
+  [Rn(n, r), ...rest] -> if n == name { Some(r) } else { ls_lookup_rename_loop(rest, name) }
+}
+
+# Restore `renames` to a snapshot taken at block entry. `rc` (the fresh-reg
+# counter) is intentionally NOT restored — it stays monotone so sibling
+# blocks that shadow the same name receive distinct `.tN` registers.
+pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
+            vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap }
 
 # A fresh virtual-register name, deterministic per function: `.t0`, `.t1`, …
 # The leading `.` is load-bearing, NOT cosmetic: a temporary shares the
@@ -145,9 +198,9 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames }
 
 # --- Block accumulation -------------------------------------------------
 
@@ -168,14 +221,14 @@ fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -369,7 +422,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames }
 
 # --- Type declarations --------------------------------------------------
 

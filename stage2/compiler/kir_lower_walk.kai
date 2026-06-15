@@ -308,7 +308,13 @@ fn lower_var(name: String, st: LowerSt) : LRes / Console =
   if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
     bind_op(st, KCon(name, ls_variant_tag(st, name), []), KNoPos)
   } else if ls_is_local(st, name) {
-    LRes(KVar(name), st)
+    # #846 — a read inside a block that shadowed `name` resolves to the
+    # fresh register the shadowing `let` was alpha-renamed to; outside any
+    # active shadow it is the surface name verbatim.
+    match ls_lookup_rename(st, name) {
+      Some(reg) -> LRes(KVar(reg), st)
+      None      -> LRes(KVar(name), st)
+    }
   } else { match kir_const_body(st.consts, name) {
     Some(body) -> lower_expr(body, st)
     None       -> match ls_fn_value(st, name) {
@@ -461,11 +467,18 @@ fn lower_capture_atoms(caps: [String], st: LowerSt, acc: [KVal]) : LResMany / Co
 
 # --- Blocks -------------------------------------------------------------
 
+# A block opens a lexical scope. Snapshot the shadow-rename map on entry
+# and restore it on exit (#846): a `let x` inside the block that shadows an
+# outer `let x` records `x -> .tN` in `renames` so reads inside the block
+# hit the fresh reg; restoring the snapshot on exit makes a read of the
+# OUTER `x` after the block resolve back to the outer reg. `rc` is not
+# restored (see `ls_set_renames`), so sibling blocks get distinct `.tN`.
 fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
+  let snap = st.renames
   let st1 = lower_stmts(stmts, st)
   match tail {
-    Some(e) -> lower_expr(e, st1)
-    None    -> LRes(KUnitV, st1)
+    Some(e) -> match lower_expr(e, st1) { LRes(v, st2) -> LRes(v, ls_set_renames(st2, snap)) }
+    None    -> LRes(KUnitV, ls_set_renames(st1, snap))
   }
 }
 
@@ -539,7 +552,7 @@ fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
 # `KLet` carries `slot` (SReal/SBool), so pass-1 allocates an `f64`/`i32`
 # alloca and `EVar(name)` loads it raw. No RC: a raw scalar is not tracked.
 fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt / Console = match pat.pkind {
-  PBind(name) -> ls_emit(st, KLet(name, slot, KLitOp(v), KAt(pat.line, pat.col)))
+  PBind(name) -> lower_let_pbind(name, slot, v, pat, st)
   _           -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
 }
 
@@ -550,8 +563,27 @@ fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt
 # arms use. Before this, a record/variant `SLet` fell through to the
 # value-discarding `KDo`, binding NOTHING, so the body's `EVar(x)` was an
 # unbound register. Mirror of emit_c's `emit_pat_binds` over a let-bind.
+# Bind a `PBind` name to an already-lowered value at `slot`. #846: when
+# `name` already names a binder in scope, this `let` SHADOWS it. Binding a
+# second `KLet(name, ...)` would reuse the outer binder's string-keyed
+# alloca and clobber it; instead mint a fresh `.tN` register, bind the
+# value there, and record `name -> .tN` in `renames` so reads inside the
+# block resolve to the fresh reg. `lower_block` restores `renames` on exit
+# so the outer `name` read afterwards still hits the outer reg. The rename
+# is pushed AFTER `v` is lowered by the caller (the RHS reads the OUTER
+# `name`, e.g. `let x = f(x)`), so no ordering hazard.
+fn lower_let_pbind(name: String, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt) : LowerSt / Console =
+  if ls_is_local(st, name) {
+    match ls_fresh_reg(st) {
+      LSReg(reg, st1) -> {
+        let st2 = ls_emit(st1, KLet(reg, slot, KLitOp(v), KAt(pat.line, pat.col)))
+        ls_push_rename(st2, name, reg)
+      }
+    }
+  } else { ls_emit(st, KLet(name, slot, KLitOp(v), KAt(pat.line, pat.col))) }
+
 fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match pat.pkind {
-  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
+  PBind(name)          -> lower_let_pbind(name, SBoxed, v, pat, st)
   PRecord(_)           -> bind_pattern_fields_any(pat, v, st)
   PVariant(_, _)       -> bind_pattern_fields_any(pat, v, st)
   PVariantRecord(_, _) -> bind_pattern_fields_any(pat, v, st)
