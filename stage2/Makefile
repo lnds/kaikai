@@ -78,16 +78,20 @@ LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # Component set is `nativecodegen` (NOT `native`): the backend EMITS code,
 # never disassembles, so it must not drag in the AArch64/X86 Disassembler
 # libs that a narrow static vendored build (Makefile §LLVM_CMAKE_TARGETS)
-# deliberately omits. `--link-static` keeps `--libs`/`--system-libs` from
-# aborting on those absent components in the static build (it is a harmless
-# no-op against a dynamic Homebrew llvm-config, which has every lib). LLVM
-# is C++, so a static link needs the C++ runtime explicitly (`cc` does not
-# add it; a dynamic `-lLLVM.dylib` carried it implicitly) — `$(LLVM_CXXLIB)`
-# resolves to `-lc++` on macOS and `-lstdc++` on Linux (the apt libLLVM is
-# libstdc++-built). The release-static path (Rust/Zig/Julia model) thus links
-# with no libLLVM runtime dep; the dev-dynamic path links the right C++ lib
-# for the host.
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) $(LLVM_CXXLIB)
+# deliberately omits. `passes` (L4, issue #498) pulls in LLVMPasses — the
+# New-PM PassBuilder behind `LLVMRunPasses` / `LLVMCreatePassBuilderOptions`
+# the in-process opt pipeline calls; llvm-config expands its transitive
+# closure (ipo / vectorize / scalaropts / instcombine …), so the explicit
+# `core analysis target codegen` deps below stay covered. `--link-static`
+# keeps `--libs`/`--system-libs` from aborting on absent components in the
+# static build (a harmless no-op against a dynamic Homebrew llvm-config,
+# which has every lib). LLVM is C++, so a static link needs the C++ runtime
+# explicitly (`cc` does not add it; a dynamic `-lLLVM.dylib` carried it
+# implicitly) — `$(LLVM_CXXLIB)` resolves to `-lc++` on macOS and `-lstdc++`
+# on Linux (the apt libLLVM is libstdc++-built). The release-static path
+# (Rust/Zig/Julia model) thus links with no libLLVM runtime dep; the
+# dev-dynamic path links the right C++ lib for the host.
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) $(LLVM_CXXLIB)
 else
 LLVM_CPPFLAGS :=
 LLVM_LDFLAGS  :=
