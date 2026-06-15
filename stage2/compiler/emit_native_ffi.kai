@@ -1,0 +1,147 @@
+# compiler/emit_native_ffi.kai — `extern "C" fn` shim synthesis for the
+# in-process libLLVM native backend (FFI v1, issue #260).
+#
+# A `KFnFfi(c_symbol, param_kinds, ret_kind)` carries NO lowered body: the
+# native shim is synthesised here, the mirror of `llvm_emit_ffi_shim`
+# (emit_llvm.kai) and `emit_ffi_shim_body` (emit_c.kai). The KIR already
+# resolved `c_symbol` (the issue #261 override carved out of the magic tag),
+# so this module never re-reads the tag — one resolver, not three (asu).
+#
+# Shape (per param, then the call):
+#   1. unbox each boxed wrapper arg to its raw C scalar (`kaix_int_field`,
+#      `kaix_real_field`, `kaix_bool_field`, `kaix_str_bytes` — box→raw
+#      BORROWS, no decref);
+#   2. call the raw extern symbol over the scalars;
+#   3. decref each boxed input (mirror of emit_c's `ffi_emit_arg_decrefs`);
+#   4. re-box the raw return into a fresh `KaiValue *` (`kaix_int` / … /
+#      `kaix_unit`), then `ret` it.
+#
+# RC discipline (asu, load-bearing): the input decref runs AFTER the extern
+# call returns. A String arg unboxes to a borrowed `char *` aliasing inside
+# the boxed cell; decref'ing before the call finishes reading it is a
+# use-after-free. The raw return has no RC (a C `int`/`double`/`char *`); the
+# re-box mints the single owner, so there is nothing to decref on the return.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+
+# Synthesise the whole `kai_<name>` wrapper for an `extern "C" fn`. The
+# wrapper has the all-boxed signature its callers invoke (`ptr (ptr × n)`),
+# declared up front by `nemit_declare_fns`; here we open its entry block,
+# fill it, and seal with `ret`.
+pub fn nemit_ffi_fn(ctx: Handle, f: KFn, c_symbol: String,
+                    param_kinds: [KFfiKind], ret_kind: KFfiKind) : Unit / Console = {
+  let arity = list_length(f.params)
+  let wrapper = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym),
+                                       llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity))
+  let entry = llvm_append_block(native_ctx_m(ctx), wrapper, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+  if ffi_any_unknown(param_kinds, ret_kind) {
+    nemit_unsupported(ctx, cat2("FFI: unsupported marshalling type in ", c_symbol))
+    llvm_build_ret(native_ctx_b(ctx), nemit_call0(ctx, "kaix_unit")); ()
+  } else {
+    # The boxed wrapper params (LLVM 0..n-1) feed two buffers in one walk: the
+    # raw scalar arg list (unboxed) and the boxed-input list (decref'd after).
+    let argbuf = llvm_buf_new()      # raw extern args
+    let ptbuf  = llvm_buf_new()      # raw extern param types
+    let boxbuf = llvm_buf_new()      # boxed inputs to decref post-call
+    ffi_unbox_params(ctx, wrapper, param_kinds, 0, argbuf, ptbuf, boxbuf)
+    let raw = ncall_finish(ctx, c_symbol, ffi_ret_type(ctx, ret_kind), ptbuf, argbuf)
+    ffi_decref_inputs(ctx, boxbuf, 0)
+    llvm_buf_free(boxbuf)
+    llvm_build_ret(native_ctx_b(ctx), ffi_rebox_ret(ctx, ret_kind, raw)); ()
+  }
+}
+
+# Unbox each wrapper param into `argbuf` (raw scalar) + `ptbuf` (its raw
+# LLVM type), recording the boxed input in `boxbuf` for the post-call decref.
+# A `KFfiUnit` param carries no runtime value (the C oracle elides it), so it
+# contributes nothing to any buffer.
+fn ffi_unbox_params(ctx: Handle, wrapper: Handle, kinds: [KFfiKind], i: Int,
+                    argbuf: Handle, ptbuf: Handle, boxbuf: Handle) : Unit / Console = match kinds {
+  [] -> ()
+  [k, ...rest] -> {
+    match k {
+      KFfiUnit -> ()
+      _ -> {
+        let boxed = llvm_get_param(wrapper, i)
+        llvm_buf_push(boxbuf, boxed)
+        llvm_buf_push(argbuf, ffi_unbox_one(ctx, k, boxed))
+        llvm_buf_push(ptbuf, ffi_arg_type(ctx, k))
+      }
+    }
+    ffi_unbox_params(ctx, wrapper, rest, i + 1, argbuf, ptbuf, boxbuf)
+  }
+}
+
+# Box→raw borrow of one boxed param at its FFI kind (no decref — the
+# trailing `ffi_decref_inputs` releases the box once the extern has read it).
+fn ffi_unbox_one(ctx: Handle, k: KFfiKind, boxed: Handle) : Handle / Console = match k {
+  KFfiInt    -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
+  KFfiReal   -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
+  KFfiBool   -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  KFfiString -> ncall_sig1(ctx, "kaix_str_bytes", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), boxed)
+  _          -> nemit_null(ctx)   # KFfiUnit never reaches here; KFfiUnknown gated upstream
+}
+
+# The raw LLVM type the extern symbol takes for one arg kind.
+fn ffi_arg_type(ctx: Handle, k: KFfiKind) : Handle = match k {
+  KFfiInt    -> native_ctx_i64t(ctx)
+  KFfiReal   -> native_ctx_f64t(ctx)
+  KFfiBool   -> native_ctx_i32t(ctx)
+  KFfiString -> native_ctx_ptrt(ctx)
+  _          -> native_ctx_ptrt(ctx)
+}
+
+# The raw LLVM return type of the extern symbol.
+fn ffi_ret_type(ctx: Handle, k: KFfiKind) : Handle = match k {
+  KFfiUnit   -> native_ctx_voidt(ctx)
+  KFfiInt    -> native_ctx_i64t(ctx)
+  KFfiReal   -> native_ctx_f64t(ctx)
+  KFfiBool   -> native_ctx_i32t(ctx)
+  KFfiString -> native_ctx_ptrt(ctx)
+  _          -> native_ctx_voidt(ctx)
+}
+
+# Re-box the raw extern return into a fresh boxed `KaiValue *`. A `void`
+# extern (`KFfiUnit`) discards `raw` and returns the canonical unit; the
+# scalar kinds box through the matching runtime constructor.
+fn ffi_rebox_ret(ctx: Handle, k: KFfiKind, raw: Handle) : Handle / Console = match k {
+  KFfiUnit   -> nemit_call0(ctx, "kaix_unit")
+  KFfiInt    -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw)
+  KFfiReal   -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), raw)
+  KFfiBool   -> ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), raw)
+  KFfiString -> ncall_sig1(ctx, "kaix_str", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), raw)
+  _          -> nemit_call0(ctx, "kaix_unit")
+}
+
+# Decref each boxed input recorded during unboxing (one `kaix_decref` per
+# input, post-call — mirror of emit_c's `ffi_emit_arg_decrefs`).
+fn ffi_decref_inputs(ctx: Handle, boxbuf: Handle, i: Int) : Unit / Console =
+  if i >= llvm_buf_len(boxbuf) { () }
+  else {
+    let _r = ncall_sig1(ctx, "kaix_decref", native_ctx_voidt(ctx),
+                        native_ctx_ptrt(ctx), llvm_buf_get(boxbuf, i))
+    ffi_decref_inputs(ctx, boxbuf, i + 1)
+  }
+
+# True when any param kind OR the return kind is `KFfiUnknown` — the typer
+# rejects unsupported FFI types upstream, so this is a defensive belt that
+# keeps the still-building module well-typed (emit a unit-returning stub
+# rather than malformed IR).
+fn ffi_any_unknown(param_kinds: [KFfiKind], ret_kind: KFfiKind) : Bool =
+  ffi_is_unknown(ret_kind) or ffi_params_any_unknown(param_kinds)
+
+fn ffi_params_any_unknown(ks: [KFfiKind]) : Bool = match ks {
+  []           -> false
+  [k, ...rest] -> if ffi_is_unknown(k) { true } else { ffi_params_any_unknown(rest) }
+}
+
+fn ffi_is_unknown(k: KFfiKind) : Bool = match k {
+  KFfiUnknown(_) -> true
+  _              -> false
+}
