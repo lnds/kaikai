@@ -49,7 +49,19 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # Seeded at fn entry with params/captures; extended at
                      # each binder. Forward-visible (a `let` is in scope
                      # only after its definition), matching lexical order.
-                     locals: [String] }
+                     locals: [String],
+                     # `ffi` is the set of `extern "C" fn` names (issue #260).
+                     # An FFI wrapper's kaikai-visible symbol is mangled to
+                     # `kai_<c_sym>` (via `ffi_wrapper_sym`) so it does NOT
+                     # collide with the bare C symbol it calls (`puts`, `abs`)
+                     # in the same module — the native backend emits both, and
+                     # a shared `@abs` made the wrapper call ITSELF (infinite
+                     # recursion → SIGSEGV). Both the wrapper def and EVERY
+                     # call site must mint the same mangled name, so the set
+                     # travels here (the C / LLVM-text oracles dodge this by
+                     # `kai_`-prefixing ALL user symbols; the native backend
+                     # does not, so FFI is the one place a clash can arise).
+                     ffi: [String] }
 
 # Result of lowering one expression: its value atom + threaded state.
 pub type LRes = LRes(KVal, LowerSt)
@@ -66,9 +78,9 @@ pub type RecPlan = RecPlan([KFieldInit], LowerSt)
 pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
 pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
-              consts: [Decl]) : LowerSt =
+              consts: [Decl], ffi: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [] }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -78,7 +90,7 @@ pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
 # every KFn lowering (Risk 2b).
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi }
 
 # Rotate the EFn table so entries from module `mo` resolve FIRST, then enter
 # the fn. Mirror of the C / LLVM emitters, which call `fns_prefer_module(fns,
@@ -92,7 +104,7 @@ pub fn ls_enter_fn_in(st: LowerSt, enc_fn: String, locals: [String],
                       mo: Option[String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns_prefer_module(st.fns, mo),
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
-            locals: locals }
+            locals: locals, ffi: st.ffi }
 
 # Extend the lexical scope with one bound name (a `let` / match binder).
 # Forward-visible: a binder is in scope only after its definition. Idempotent
@@ -102,7 +114,7 @@ pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
   if ls_is_local(st, name) { st }
   else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
                    vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-                   consts: st.consts, locals: [name, ...st.locals] } }
+                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi } }
 
 # Is `name` a name bound locally in the current fn body? (param / capture /
 # let / match binder). The shadow test `lower_var` consults before treating
@@ -133,9 +145,9 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
 
 # --- Block accumulation -------------------------------------------------
 
@@ -156,14 +168,14 @@ fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -175,7 +187,37 @@ pub fn ls_variant_tag(st: LowerSt, name: String) : Int = evar_find_tag(st.vs, na
 
 # Resolve a bare callee name to its mangled symbol via the EFn table; an
 # unresolved name (builtin / prim) keeps its bare name for the translator.
-pub fn c_sym_of_callee_st(st: LowerSt, name: String) : String = c_sym_of_callee(st.fns, name)
+# An `extern "C" fn` callee resolves to its `kai_<c_sym>` wrapper (NOT the
+# bare extern symbol) — see `LowerSt.ffi`. The EFn table carries the callee's
+# resolved module, so the wrapper name matches the def minted in `lower_fn`.
+pub fn c_sym_of_callee_st(st: LowerSt, name: String) : String =
+  if name_in_list(st.ffi, name) { ffi_wrapper_sym(name, efn_module_of(st.fns, name)) }
+  else { c_sym_of_callee(st.fns, name) }
+
+# The resolved module of a callee name via the EFn table (None when the name
+# is root-level or unresolved). Used to mint the FFI wrapper symbol so the
+# call site and the def agree on the `kai_<module>__<name>` mangling.
+fn efn_module_of(fns: [EFn], name: String) : Option[String] = match efn_resolve(fns, name) {
+  Some(EFn(_, _, mo, _)) -> mo
+  None                   -> None
+}
+
+# The kaikai-visible wrapper symbol for an `extern "C" fn`: `__ffi_<c_sym>`.
+# Minted identically at the wrapper DEF (`lower_fn`) and at EVERY call site
+# (bare via `c_sym_of_callee_st`, cross-module via the `EModCall` arm), so a
+# call to `abs()` resolves to the wrapper `@__ffi_abs`, never the bare extern
+# `@abs` the shim itself calls. Lives in this base module (not kir_lower_fns)
+# so both the def and the call-site resolvers reach it without an import cycle.
+#
+# The prefix is `__ffi_`, NOT `kai_`: the native callee resolver
+# (`ncall_sym`) maps any `kai_`-prefixed symbol to a `kaix_<rest>` runtime
+# prim (`kai_op_field` → `kaix_field`), so `kai_abs` would mis-resolve to the
+# nonexistent `kaix_abs` (an undefined-symbol link error). `__ffi_` is neither
+# a prelude name nor `kai_`-prefixed, so it stays a literal user-fn symbol.
+# The C / LLVM-text oracles can use `kai_` because their resolvers never run
+# the `kai_`→`kaix_` rewrite — that rewrite is native-only.
+pub fn ffi_wrapper_sym(name: String, mo: Option[String]) : String =
+  cat2("__ffi_", c_sym(name, mo))
 
 # A first-class function value: an `EVar(nm)` that names a top-level fn
 # (not a local binder) lowers to a closure over the fn's thunk symbol.
@@ -225,7 +267,7 @@ pub fn callee_is_direct(st: LowerSt, callee: String) : Bool = match efn_resolve(
   None    -> name_in_list(prelude_names(), callee)
 }
 
-fn name_in_list(xs: [String], target: String) : Bool = match xs {
+pub fn name_in_list(xs: [String], target: String) : Bool = match xs {
   [] -> false
   [h, ...rest] -> if h == target { true } else { name_in_list(rest, target) }
 }
@@ -327,7 +369,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi }
 
 # --- Type declarations --------------------------------------------------
 

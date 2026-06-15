@@ -32,7 +32,7 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # (`collect_decls` over the global-name set) — reused, not re-derived.
   let lc      = collect_lams(raw_decls, fns, variants)
   let st0     = ls_new(fns, variants, lc.lams, collect_effect_names(raw_decls),
-                       kir_const_decls(raw_decls, []))
+                       kir_const_decls(raw_decls, []), ffi_extern_names(raw_decls, []))
   let kfns    = lower_fns(raw_decls, st0, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
@@ -82,21 +82,87 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
   # resolved to the imported `hashmap.empty` without this — `no such field`.)
   let st = ls_enter_fn_in(st0, sym, param_local_names(params, []), mo)
   let kparams = lower_params(params, [])
-  # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
-  # lowering would otherwise reduce to a panic stub (the native path then
-  # aborts every protocol call). C / LLVM-text re-emit the dispatcher's body
-  # from the AST (`body_is_proto_dispatch`); the native path consumes KIR, so
-  # we lower the marker to a real dispatch HERE — a boxed call to the runtime
-  # `kaix_proto_dispatch<N>` shim, which derives the head tag, resolves the
-  # impl table, and indirect-calls (one ABI source of truth, shared with the
-  # oracle). C / LLVM never reach this branch (they intercept upstream).
-  let r = if body_is_proto_dispatch(body) {
-    lower_proto_dispatch(proto_dispatch_parts(body), params, kpos_of(body), st)
-  } else { lower_expr(body, st) }
-  match r {
-    LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
-                            ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                            region_id: None, stateful: false }
+  # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
+  # `ETodo("__kai_ffi__"[:override])` tag. C / LLVM-text intercept it in
+  # `emit_fn_body` and synthesise an unbox→extern-call→re-box shim from the
+  # params + ret type — NOT from the body expr. The native path consumes
+  # KIR, so the body would reach `lower_expr` and become a panic stub
+  # (`panic: todo: __kai_ffi__`). Classify it HERE into a body-less
+  # `KFnFfi`: the C-side symbol is resolved now (the issue #261 override
+  # carved out of the tag via `ffi_extern_symbol_of`) and the marshalling
+  # kinds are read from the AST types, so the native backend synthesises the
+  # shim without re-parsing the tag (one resolver, not three — asu review).
+  if body_is_ffi_extern(body) {
+    # The kaikai-visible wrapper symbol is `kai_<c_sym>` (NOT the bare
+    # `c_sym`): it must differ from the bare C symbol the shim calls, which
+    # IS the kaikai identifier verbatim (`puts`, `abs`). The native backend
+    # emits both into one module; sharing `@abs` made the wrapper recurse
+    # into itself. The C / LLVM-text oracles `kai_`-prefix every symbol, so
+    # they never clashed — this mangling brings the FFI wrapper into line
+    # WITHOUT prefixing the whole native backend (a separate concern).
+    let c_symbol = ffi_extern_symbol_of(body, name)
+    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params), kffi_kind_of_ret(ret_ty)),
+          params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
+          region_id: None, stateful: false }
+  } else {
+    # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
+    # lowering would otherwise reduce to a panic stub (the native path then
+    # aborts every protocol call). C / LLVM-text re-emit the dispatcher's body
+    # from the AST (`body_is_proto_dispatch`); the native path consumes KIR, so
+    # we lower the marker to a real dispatch HERE — a boxed call to the runtime
+    # `kaix_proto_dispatch<N>` shim, which derives the head tag, resolves the
+    # impl table, and indirect-calls (one ABI source of truth, shared with the
+    # oracle). C / LLVM never reach this branch (they intercept upstream).
+    let r = if body_is_proto_dispatch(body) {
+      lower_proto_dispatch(proto_dispatch_parts(body), params, kpos_of(body), st)
+    } else { lower_expr(body, st) }
+    match r {
+      LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
+                              ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
+                              region_id: None, stateful: false }
+    }
+  }
+}
+
+# The KIR FFI marshalling kind of each `extern "C" fn` param, in
+# declaration order — the unbox direction the native shim applies before
+# the raw call. Reuses emit_shared's type→`FfiRetKind` classifier (the
+# typer's supported-FFI-type gate) and translates into the KIR's own
+# `KFfiKind`, so kir.kai stays free of an emit_shared dependency (Lane 0).
+fn ffi_param_kinds(params: [Param]) : [KFfiKind] = match params {
+  []           -> []
+  [p, ...rest] -> [kffi_kind_of_param(p), ...ffi_param_kinds(rest)]
+}
+
+fn kffi_kind_of_param(p: Param) : KFfiKind = match p.ptype {
+  None    -> KFfiUnknown("missing")
+  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty(t))
+}
+
+fn kffi_kind_of_ret(ret_ty: Option[TypeExpr]) : KFfiKind =
+  kffi_of_ret_kind(ffi_ret_kind_of(ret_ty))
+
+# Translate emit_shared's `FfiRetKind` to the KIR-local `KFfiKind`.
+fn kffi_of_ret_kind(k: FfiRetKind) : KFfiKind = match k {
+  FfiRetUnit       -> KFfiUnit
+  FfiRetInt        -> KFfiInt
+  FfiRetReal       -> KFfiReal
+  FfiRetBool       -> KFfiBool
+  FfiRetString     -> KFfiString
+  FfiRetUnknown(t) -> KFfiUnknown(t)
+}
+
+# Collect the bare kaikai names of every `extern "C" fn` (DFn whose body is
+# the magic FFI tag). Seeds `LowerSt.ffi`, the set a call site consults to
+# decide whether to mangle the callee. Names (not c_syms) — the call site
+# sees the surface identifier before mangling.
+pub fn ffi_extern_names(ds: [Decl], acc: [String]) : [String] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, body, _, _, _) ->
+      if body_is_ffi_extern(body) { ffi_extern_names(rest, [name, ...acc]) }
+      else { ffi_extern_names(rest, acc) }
+    _ -> ffi_extern_names(rest, acc)
   }
 }
 

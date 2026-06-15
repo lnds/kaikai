@@ -737,6 +737,21 @@ double kaix_take_real(KaiValue *v)  { return kai_take_real(v); }
    the box→raw border for a boxed Bool reaching the raw i1 path. */
 int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
 
+/* FFI v1 (issue #260) box→raw borrows for the native `extern "C" fn`
+   shim. A shim unboxes each boxed param to its raw C scalar, calls the
+   extern symbol, then decref's the boxed inputs — mirror of emit_c's
+   `ffi_emit_arg_setup` + `ffi_emit_arg_decrefs`. These are BORROWS (no
+   decref here): the shim's trailing `kaix_decref` releases the input.
+   `kaix_int_field` reads the (possibly tagged/bignum) Int payload via the
+   canonical `kai_intf`; `kaix_str_bytes` borrows the NUL-terminated byte
+   buffer (`kai_str_from_bytes` always allocates `len + 1` and writes the
+   terminator, so the `char *` is a valid C string for the extern). The
+   pointer aliases inside the boxed String cell — load-bearing ordering:
+   the shim must read it AND finish the extern call BEFORE the input decref,
+   or the buffer is freed under the extern. */
+int64_t     kaix_int_field(KaiValue *v) { return kai_intf(v); }
+const char *kaix_str_bytes(KaiValue *v) { return v->as.s.bytes; }
+
 /* ---------- m13: bit operations (compiler intrinsics) ----------
    The C-direct oracle (emit_c.kai) lowers each `bit_*` call INLINE to
    the matching C operator. The native backend routes a prelude callee
