@@ -7074,7 +7074,24 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # receiver, drained by `infer_decl` after the body's
                     # tyvars settle (post `check_body_row`). See
                     # `DeferredField`.
-                    deferred_fields: [DeferredField] }
+                    deferred_fields: [DeferredField],
+                    # issue #842: for every parametric effect op call, the
+                    # effect name plus the LIVE tyvar ids of its row
+                    # ty_args (`eff_fresh`), captured at the op-call. NOT
+                    # the resolved `Ty`s — a frozen `Ty` snapshot taken at
+                    # op-call time predates the `match` binder that unifies
+                    # the receiver with the op's return payload, so it
+                    # would carry a dead representative. Keeping the ids
+                    # lets the deferred-field drain resolve them under the
+                    # FINAL substitution: a receiver still free after the
+                    # body settled is pinned by finding the op whose
+                    # payload id shares the receiver's final representative
+                    # (the body genuinely connected them) and unifying that
+                    # op's label against the enclosing DECLARED row — the
+                    # authoritative source of `User`. Read-only after the
+                    # body walk; never feeds row-subset checking, so it
+                    # cannot perturb the m7b_11 row-mismatch diagnostic.
+                    op_payload_labels: [OpPayloadVars] }
 
 #[doc("infer: `OpEffArity` — exposed for the driver (pub-audit).")]
 pub type OpEffArity = OEA(String, Int)
@@ -7094,6 +7111,15 @@ pub type OpEffArity = OEA(String, Int)
 # the bug was a timing problem, not an effect-propagation one.
 #[doc("infer: `DeferredField` — a field access on a not-yet-resolved receiver.")]
 pub type DeferredField = DF(Int, String, Int, Int, Int)  # recv tyvar id, field name, result tyvar id, line, col
+
+# issue #842 — a parametric effect op call's row identity: the effect
+# name (with #802's `@cell` suffix if any) and the LIVE tyvar ids of its
+# row ty_args, in declaration order. Stashed at the op-call before
+# `st_add_label` dedup can drop the label; resolved under the final sub
+# at drain time so the receiver-to-payload link the `match` binder made
+# is visible.
+#[doc("infer: `OpPayloadVars` — a parametric op call's effect name + live row-arg tyvar ids.")]
+pub type OpPayloadVars = OPV(String, [Int])  # eff name, row ty_arg tyvar ids
 
 # m7b #11l — answer type + handler-state type for the currently-walked
 # clause body of a stateful handler.
@@ -7157,7 +7183,7 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, prelude_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [] }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], op_payload_labels: [] }
 
 fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
@@ -7165,7 +7191,7 @@ fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
-               proto_impls: pis, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               proto_impls: pis, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_set_sums(st: InferState, ss: [SumInfo]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
@@ -7173,28 +7199,28 @@ fn st_set_sums(st: InferState, ss: [SumInfo]) : InferState =
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
-               proto_impls: st.proto_impls, sums: ss, diags: st.diags, deferred_fields: st.deferred_fields }
+               proto_impls: st.proto_impls, sums: ss, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # Issue #487: push a Diagnostic onto the InferState accumulator.
 # Used by the T1, T2, T4, T5 emit sites in parallel with their stderr
@@ -7204,7 +7230,7 @@ fn st_push_diag(st: InferState, d: Diagnostic) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: [d, ...st.diags], deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: [d, ...st.diags], deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -7220,7 +7246,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
   }
 }
 
@@ -7378,7 +7404,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 # m7b #15: a freshly-pushed alias starts taggable; descending into a
@@ -7392,7 +7418,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -7402,7 +7428,7 @@ fn st_pop_alias(st: InferState) : InferState {
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
                    clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
   }
 }
 
@@ -7412,7 +7438,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: rb, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # m7e §13: stash/clear/restore the enclosing function's declared
 # return type for `e!` propagation. Set by `infer_decl` before walking
@@ -7423,7 +7449,7 @@ fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # issue #743 — register a deferred field-access constraint (see
 # `DeferredField`). Pushed by `synth_field` when the receiver type is
@@ -7433,7 +7459,20 @@ fn st_push_deferred_field(st: InferState, df: DeferredField) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: [df, ...st.deferred_fields] }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: [df, ...st.deferred_fields], op_payload_labels: st.op_payload_labels }
+
+# issue #842 — record an op call's effect name + live row-arg tyvar ids
+# BEFORE `st_add_label`'s dedup can drop the label. Only parametric ops
+# (non-empty id list) carry a payload tyvar a deferred field could need.
+fn st_push_op_payload_vars(st: InferState, eff: String, ids: [Int]) : InferState =
+  match ids {
+    [] -> st
+    _  -> InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+                       recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+                       row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+                       clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: [OPV(eff, ids), ...st.op_payload_labels] }
+  }
 
 #[doc("infer: `lookup_alias` — typer entry point invoked by the driver.")]
 pub fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
@@ -7471,21 +7510,21 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -8051,7 +8090,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     proto_impls: outer.proto_impls,
     sums: outer.sums,
     diags: inner.diags,
-    deferred_fields: inner.deferred_fields
+    deferred_fields: inner.deferred_fields,
+    op_payload_labels: inner.op_payload_labels
   }
 
 # ---- parameter typing ----
@@ -9929,7 +9969,13 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   # `label_eff_with_alias`). The suffix is discharged symmetrically by
   # the cell's own handler and stripped for display.
   let lab = Label { eff: label_eff_with_alias(eff_n, row_alias), ty_args: row_args }
-  let st3 = st_add_label(st2, lab, line, col)
+  # issue #842 — stash the effect name + live payload tyvar ids before
+  # `st_add_label`, whose dedup may drop this label against a sibling op's
+  # concrete label of the same effect. The deferred-field drain reads it
+  # to pin a receiver the dropped label was the only carrier for, under
+  # the final sub so the `match` binder's receiver-to-payload link shows.
+  let st2p = st_push_op_payload_vars(st2, label_eff_with_alias(eff_n, row_alias), eff_fresh)
+  let st3 = st_add_label(st2p, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(dispatch_key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
@@ -10131,16 +10177,95 @@ fn ty_var_id(t: Ty) : Int = match t { TyVarT(n) -> n  _ -> -1 }
 #     non-record value.
 #   - still an unbound tyvar                    -> "type annotation needed"
 #     (the body never pins the receiver; mirrors OCaml's warning 18).
-fn drain_deferred_fields(st: InferState, dfs: [DeferredField]) : InferState / Console + File {
+fn drain_deferred_fields(st: InferState, dfs: [DeferredField],
+                          declared: [Label]) : InferState / Console + File {
   match dfs {
     [] -> st
     [df, ...rest] -> match df {
       DF(recv_id, fnm, res_id, line, col) -> {
-        let recv = apply_ty(st.sub, TyVarT(recv_id))
-        let st1 = drain_one_deferred_field(st, recv, fnm, res_id, line, col)
-        drain_deferred_fields(st1, rest)
+        # issue #842 — a receiver still free here had its only carrier
+        # (`Repo.find`'s `Repo[?a, Int]` label) dropped by `st_add_label`
+        # dedup against a sibling op's concrete label. Pin it from the
+        # DECLARED row — the authoritative source — by unifying the
+        # stashed op label that carries `recv_id` against its declared
+        # counterpart. A no-op when the receiver is already concrete
+        # (every other op's payload, pinned by usage) or no stashed label
+        # carries it; never touches the row partition, so it cannot
+        # perturb the row-mismatch diagnostic (m7b_11).
+        let stp = pin_free_receiver_from_decl(st, recv_id, declared)
+        let recv = apply_ty(stp.sub, TyVarT(recv_id))
+        let st1 = drain_one_deferred_field(stp, recv, fnm, res_id, line, col)
+        drain_deferred_fields(st1, rest, declared)
       }
     }
+  }
+}
+
+# issue #842 — if `recv_id` is still a free tyvar after the body settled,
+# find a stashed op whose payload shares the receiver's final
+# representative — i.e. the body genuinely connected the receiver to that
+# op's payload (the `match` binder did so) — and unify that op's label,
+# resolved under the FINAL sub, against the declared row. That binds the
+# receiver from the signature, the only sound source. An already-concrete
+# receiver, no co-class op, or no matching declared label → `st`
+# unchanged. The co-class precondition is what makes this sound for a
+# discarded payload-free op (`let _ = self()` in a multi-instance row):
+# its payload never joins the receiver's class, so no arbitrary binding.
+fn pin_free_receiver_from_decl(st: InferState, recv_id: Int,
+                                declared: [Label]) : InferState / Console + File {
+  match apply_ty(st.sub, TyVarT(recv_id)) {
+    TyVarT(rrep) -> pin_via_op_vars(st, rrep, st.op_payload_labels, declared)
+    _            -> st
+  }
+}
+
+fn pin_via_op_vars(st: InferState, rrep: Int, ops: [OpPayloadVars],
+                    declared: [Label]) : InferState / Console + File {
+  match ops {
+    [] -> st
+    [op, ...rest] -> match op {
+      OPV(eff, ids) ->
+        if ids_share_rep(ids, rrep, st.sub) {
+          # The receiver is in this op's payload class. Rebuild the op's
+          # label with ty_args resolved under the FINAL sub, then unify
+          # it against its declared counterpart — pinning the receiver's
+          # still-free class members (the payload position) to the
+          # declared concrete type.
+          let lab = Label { eff: eff, ty_args: resolve_fresh_ids(ids, st.sub) }
+          match find_matching_declared(declared, lab, st) {
+            Some(st1) -> st1
+            None      -> pin_via_op_vars(st, rrep, rest, declared)
+          }
+        } else {
+          pin_via_op_vars(st, rrep, rest, declared)
+        }
+    }
+  }
+}
+
+# True iff some id resolves, under the final sub, to the receiver's final
+# representative `rrep`. This is the co-class test: the body unified that
+# payload position with the receiver. A position that resolved to a
+# concrete type (already pinned by usage) is not a free `TyVarT(rrep)`
+# and so does not match — correctly, it needs no pinning.
+fn ids_share_rep(ids: [Int], rrep: Int, s: Subst) : Bool {
+  match ids {
+    [] -> false
+    [i, ...rest] -> match apply_ty(s, TyVarT(i)) {
+      TyVarT(n) -> if n == rrep { true } else { ids_share_rep(rest, rrep, s) }
+      _         -> ids_share_rep(rest, rrep, s)
+    }
+  }
+}
+
+# issue #842 — declared-row labels with their ty_args resolved to Ty,
+# for the deferred-field pinning step. Bare-name (stateless) labels and
+# open / absent rows contribute nothing a payload tyvar could bind to.
+fn decl_row_concrete_labels(row: RowExpr) : [Label] {
+  match row {
+    RClosed(lbs)  -> inf_row_labels_of_rls(lbs)
+    ROpen(_, lbs) -> inf_row_labels_of_rls(lbs)
+    REmpty        -> []
   }
 }
 
@@ -11463,7 +11588,7 @@ fn st_drop_label(st: InferState, eff: String) : InferState {
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: row1, eff_uses: uses1, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels }
 }
 
 fn drop_labels_named(row: [Label], eff: String) : [Label] {
@@ -15255,7 +15380,8 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # is independent and only extends the substitution / reports an
       # error). Recurses on its own sub so a field whose result type is
       # itself the receiver of a later deferred field resolves too.
-      let st2 = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields))
+      let st2 = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
+                                       decl_row_concrete_labels(row))
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
