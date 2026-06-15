@@ -11401,50 +11401,48 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 #     witnessable mutation). Per #251's "out of scope for v1"
 #     note, passing a local Array to ANOTHER function that may
 #     mutate it is conservatively treated as escape.
-#   Pass 2 — demand classification. Walks every
-#     `array_set(first, ...)` / `array_grow(first, ...)` call
-#     site. The demand is "local" iff `first` is `EVar(n)`,
-#     `n` is in the local set, and `n` is not in the escaped
-#     set. Otherwise the demand is "external".
+#   Pass 2 — demand classification. Walks every call to a callee
+#     declared `/ Mutable` (the prelude `array_set`/`array_grow`,
+#     the qualified `Mutable.array_set`/`ref_set`, a Ref-backed
+#     container op like `hashmap.put`, or any user fn `/ Mutable`).
+#     The demand is "local" iff every argument that CARRIES MUTATION
+#     (head `Array`/`Ref`, or a record with a transitive `Array`/`Ref`
+#     field) is an `EVar(n)` with `n` local-constructed, not a
+#     parameter, and not escaped. Otherwise the demand is "external".
 #   If every demand is local, `Mutable` is removed from
 #   `st.row` (and from `st.eff_uses` to keep diagnostics
 #   consistent). Otherwise the row is left untouched.
-# Issue #516 — the bare prelude form (`array_set`/`array_grow`) and
-# the qualified `Mutable.array_set`/`Mutable.array_grow` form both
-# raise the `Mutable` demand. `synth_op_call_with_scheme_keys`
-# rewrites the qualified call site's callee to `EVar(<dispatch key>)`
-# where the key is the dotted form, so the local-Array masking walker
-# must recognise either spelling — otherwise it strips `Mutable` on
-# qualified writes whose target is a parameter array.
-fn is_mutable_array_write_name(name: String) : Bool {
-  if name == "array_set" { true }
-  else if name == "array_grow" { true }
-  else if name == "Mutable.array_set" { true }
-  else if name == "Mutable.array_grow" { true }
-  # Issue: `Mutable.ref_set(r, v)` is an observable write to the cell
-  # `r`, exactly like `array_set`. The demand pass must recognise it
-  # so a write to a *parameter* Ref keeps `Mutable` on the row
-  # (mutation observable by the caller), while a write to a Ref
-  # constructed locally (`let r = Mutable.ref_make(...)`) masks. Both
-  # arrive here as the qualified dispatch key `Mutable.ref_set`
-  # (synth_op_call_with_scheme_keys) — there is no bare prelude
-  # `ref_set` surface, so only the dotted form is reachable.
-  else if name == "Mutable.ref_set" { true }
-  else { false }
-}
+#
+# Issue #531 — this used to split mutable values into DIRECT (`Array`,
+# mutated by a bare C call, maskable when local) and DISPATCH (`Ref` /
+# Ref-backed containers, mutated through the evidence stack, NEVER
+# maskable even when local because the masked row dropped the handler
+# install). The default handler for `Mutable` is now installed
+# UNCONDITIONALLY at the base of the evidence stack (see
+# `ensure_unconditional_defaults`, emit_shared), so a local Ref/HashMap
+# whose row drops `Mutable` still finds a handler at the dispatch site.
+# The direct/dispatch distinction is gone: a value carries mutation or
+# it does not, and the only question is whether it escapes. The masking
+# invariant: a callee `/ Mutable` is masked iff every mutation-carrying
+# argument is a local, non-parameter, non-escaping `EVar`; an argument
+# that carries mutation and is a parameter or escapes keeps `Mutable`.
 
 fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
   if not list_has_label(st.row, "Mutable") { st }
   else {
     let body_resolved = finalise_typed_expr(st.sub, body)
-    let local_set = collect_local_arrays(body_resolved, [])
+    # The mutation-carrying record names (`Ref` + every record with a
+    # transitive `Array`/`Ref` field, e.g. `HashMap` / `HashSet`) come from
+    # the program's records. An argument of such a type carries mutation, so
+    # passing it to a `/ Mutable` callee is observable iff that argument is a
+    # parameter or escapes — exactly the `Array`/`Ref` rule, no longer a
+    # dispatch-vs-direct special case (the default handler is now always
+    # installed, issue #531). Computed up front: both the local-set scan and
+    # the demand classifier consult it.
+    let dmut = mutating_record_type_names(st.recs)
+    let local_set = collect_local_arrays(body_resolved, [], dmut)
     let param_names = mut_collect_param_names(params, [])
     let escaped_set = collect_escaped_names(body_resolved, [])
-    # The dispatch-mutable type names (`Ref` + every Ref-backed record) come
-    # from the program's records: an argument of such a type is never a
-    # maskable demand (its op dispatches through the evidence stack and needs
-    # the handler installed).
-    let dmut = dispatch_mutable_type_names(st.recs)
     if all_demands_local(body_resolved, local_set, escaped_set, param_names, dmut) {
       st_drop_label(st, "Mutable")
     } else { st }
@@ -11495,173 +11493,228 @@ fn mut_collect_param_names(ps: [Param], acc: [String]) : [String] {
   }
 }
 
-# Walk the typed body and accumulate names bound by
-# `let n = array_make(...)` (or rebindings via array_set / array_grow
-# of already-local names). Recurses through every sub-expression so
-# locals introduced inside if/match/block branches are caught.
-fn collect_local_arrays(e: Expr, acc: [String]) : [String] =
-  collect_local_arrays_kind(e.kind, acc)
+# Walk the typed body and accumulate names bound to a locally-
+# constructed mutable value (an Array, a Ref, or a Ref-backed
+# container — `dmut` lists the mutating record names). Recurses
+# through every sub-expression so locals introduced inside
+# if/match/block branches are caught.
+fn collect_local_arrays(e: Expr, acc: [String], dmut: [String]) : [String] =
+  collect_local_arrays_kind(e.kind, acc, dmut)
 
-fn collect_local_arrays_kind(k: ExprKind, acc: [String]) : [String] {
+fn collect_local_arrays_kind(k: ExprKind, acc: [String], dmut: [String]) : [String] {
   match k {
     EBlock(stmts, tail) -> {
-      let acc1 = collect_local_in_stmts(stmts, acc)
+      let acc1 = collect_local_in_stmts(stmts, acc, dmut)
       match tail {
-        Some(t) -> collect_local_arrays(t, acc1)
+        Some(t) -> collect_local_arrays(t, acc1, dmut)
         None    -> acc1
       }
     }
     EIf(c, t_, eo) -> {
-      let a1 = collect_local_arrays(c, acc)
-      let a2 = collect_local_arrays(t_, a1)
+      let a1 = collect_local_arrays(c, acc, dmut)
+      let a2 = collect_local_arrays(t_, a1, dmut)
       match eo {
-        Some(e2) -> collect_local_arrays(e2, a2)
+        Some(e2) -> collect_local_arrays(e2, a2, dmut)
         None     -> a2
       }
     }
     EMatch(scr, arms) -> {
-      let a1 = collect_local_arrays(scr, acc)
-      collect_local_in_arms(arms, a1)
+      let a1 = collect_local_arrays(scr, acc, dmut)
+      collect_local_in_arms(arms, a1, dmut)
     }
     ECall(callee, args_) -> {
-      let a1 = collect_local_arrays(callee, acc)
-      collect_local_in_exprs(args_, a1)
+      let a1 = collect_local_arrays(callee, acc, dmut)
+      collect_local_in_exprs(args_, a1, dmut)
     }
-    EBinop(_, a, b)   -> collect_local_arrays(b, collect_local_arrays(a, acc))
-    EUnop(_, x)       -> collect_local_arrays(x, acc)
-    EField(b, _)      -> collect_local_arrays(b, acc)
-    EIndex(a, b)      -> collect_local_arrays(b, collect_local_arrays(a, acc))
-    EPipe(a, b)       -> collect_local_arrays(b, collect_local_arrays(a, acc))
-    EMapPipe(a, b)    -> collect_local_arrays(b, collect_local_arrays(a, acc))
-    EFlatMapPipe(a, b)-> collect_local_arrays(b, collect_local_arrays(a, acc))
-    EFilterPipe(a, b) -> collect_local_arrays(b, collect_local_arrays(a, acc))
-    ELambda(_, b)     -> collect_local_arrays(b, acc)
-    ERecordLit(_, fs) -> collect_local_in_field_inits(fs, acc)
-    EList(els)        -> collect_local_in_list_elems(els, acc)
+    EBinop(_, a, b)   -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EUnop(_, x)       -> collect_local_arrays(x, acc, dmut)
+    EField(b, _)      -> collect_local_arrays(b, acc, dmut)
+    EIndex(a, b)      -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EPipe(a, b)       -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EMapPipe(a, b)    -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EFlatMapPipe(a, b)-> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EFilterPipe(a, b) -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    ELambda(_, b)     -> collect_local_arrays(b, acc, dmut)
+    ERecordLit(_, fs) -> collect_local_in_field_inits(fs, acc, dmut)
+    EList(els)        -> collect_local_in_list_elems(els, acc, dmut)
     ERange(a, b, oc)  -> {
-      let a1 = collect_local_arrays(b, collect_local_arrays(a, acc))
-      match oc { Some(c) -> collect_local_arrays(c, a1) None -> a1 }
+      let a1 = collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+      match oc { Some(c) -> collect_local_arrays(c, a1, dmut) None -> a1 }
     }
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let a1 = collect_local_arrays(body, acc)
-      let a2 = match init_opt { Some(i) -> collect_local_arrays(i, a1) None -> a1 }
-      let a3 = collect_local_in_hclauses(clauses, a2)
+      let a1 = collect_local_arrays(body, acc, dmut)
+      let a2 = match init_opt { Some(i) -> collect_local_arrays(i, a1, dmut) None -> a1 }
+      let a3 = collect_local_in_hclauses(clauses, a2, dmut)
       match ret_opt {
-        Some(HR(_, body, _, _)) -> collect_local_arrays(body, a3)
+        Some(HR(_, body, _, _)) -> collect_local_arrays(body, a3, dmut)
         None              -> a3
       }
     }
-    ELitUnit(inner, _) -> collect_local_arrays(inner, acc)
-    EBang(inner)       -> collect_local_arrays(inner, acc)
+    ELitUnit(inner, _) -> collect_local_arrays(inner, acc, dmut)
+    EBang(inner)       -> collect_local_arrays(inner, acc, dmut)
     _ -> acc
   }
 }
 
-fn collect_local_in_exprs(es: [Expr], acc: [String]) : [String] = match es {
+fn collect_local_in_exprs(es: [Expr], acc: [String], dmut: [String]) : [String] = match es {
   []           -> acc
-  [h, ...rest] -> collect_local_in_exprs(rest, collect_local_arrays(h, acc))
+  [h, ...rest] -> collect_local_in_exprs(rest, collect_local_arrays(h, acc, dmut), dmut)
 }
 
-fn collect_local_in_field_inits(fs: [FieldInit], acc: [String]) : [String] = match fs {
+fn collect_local_in_field_inits(fs: [FieldInit], acc: [String], dmut: [String]) : [String] = match fs {
   []           -> acc
   [h, ...rest] -> match h {
-    FI(_, v) -> collect_local_in_field_inits(rest, collect_local_arrays(v, acc))
+    FI(_, v) -> collect_local_in_field_inits(rest, collect_local_arrays(v, acc, dmut), dmut)
   }
 }
 
-fn collect_local_in_list_elems(els: [ListElem], acc: [String]) : [String] = match els {
+fn collect_local_in_list_elems(els: [ListElem], acc: [String], dmut: [String]) : [String] = match els {
   []           -> acc
   [h, ...rest] -> match h {
-    ElPlain(x)  -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc))
-    ElSpread(x) -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc))
+    ElPlain(x)  -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc, dmut), dmut)
+    ElSpread(x) -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc, dmut), dmut)
   }
 }
 
-fn collect_local_in_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+fn collect_local_in_arms(arms: [Arm], acc: [String], dmut: [String]) : [String] = match arms {
   []           -> acc
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
-      let a1 = match g { Some(gx) -> collect_local_arrays(gx, acc) None -> acc }
-      collect_local_in_arms(rest, collect_local_arrays(b, a1))
+      let a1 = match g { Some(gx) -> collect_local_arrays(gx, acc, dmut) None -> acc }
+      collect_local_in_arms(rest, collect_local_arrays(b, a1, dmut), dmut)
     }
   }
 }
 
-fn collect_local_in_hclauses(cs: [HClause], acc: [String]) : [String] = match cs {
+fn collect_local_in_hclauses(cs: [HClause], acc: [String], dmut: [String]) : [String] = match cs {
   []           -> acc
   [h, ...rest] -> match h {
-    HC(_, _, b, _, _) -> collect_local_in_hclauses(rest, collect_local_arrays(b, acc))
+    HC(_, _, b, _, _) -> collect_local_in_hclauses(rest, collect_local_arrays(b, acc, dmut), dmut)
   }
 }
 
-fn collect_local_in_stmts(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+fn collect_local_in_stmts(stmts: [Stmt], acc: [String], dmut: [String]) : [String] = match stmts {
   []           -> acc
-  [s, ...rest] -> collect_local_in_stmts(rest, collect_local_in_stmt(s, acc))
+  [s, ...rest] -> collect_local_in_stmts(rest, collect_local_in_stmt(s, acc, dmut), dmut)
 }
 
-fn collect_local_in_stmt(s: Stmt, acc: [String]) : [String] {
+fn collect_local_in_stmt(s: Stmt, acc: [String], dmut: [String]) : [String] {
   match s {
     SLet(p, _, rhs) -> {
       # Recurse into rhs first (a let RHS may itself contain nested
-      # array_make bindings inside an if/match branch with sub-lets).
-      let acc1 = collect_local_arrays(rhs, acc)
+      # local-construction bindings inside an if/match branch).
+      let acc1 = collect_local_arrays(rhs, acc, dmut)
       match p.pkind {
         PBind(name) ->
-          if rhs_is_local_array_origin(rhs.kind, acc1) {
+          if rhs_is_local_origin(rhs, acc1, dmut) {
             [name, ...acc1]
           } else { acc1 }
         _ -> acc1
       }
     }
     SAssert(c, m) -> {
-      let a1 = collect_local_arrays(c, acc)
-      match m { Some(mx) -> collect_local_arrays(mx, a1) None -> a1 }
+      let a1 = collect_local_arrays(c, acc, dmut)
+      match m { Some(mx) -> collect_local_arrays(mx, a1, dmut) None -> a1 }
     }
-    SExprStmt(x)                -> collect_local_arrays(x, acc)
+    SExprStmt(x)                -> collect_local_arrays(x, acc, dmut)
     SIndexAssign(b, i, v, _, _) ->
-      collect_local_arrays(v, collect_local_arrays(i, collect_local_arrays(b, acc)))
-    SVar(_, _, rhs, _, _)       -> collect_local_arrays(rhs, acc)
+      collect_local_arrays(v, collect_local_arrays(i, collect_local_arrays(b, acc, dmut), dmut), dmut)
+    SVar(_, _, rhs, _, _)       -> collect_local_arrays(rhs, acc, dmut)
     SUse(_, _, _)               -> acc
   }
 }
 
-# True iff `rhs` originates a fresh local Array reference. Three
-# shapes count: a direct `array_make(...)` call, an `array_set`
-# of an already-local Array (in-place mutation + return), or an
-# `array_grow` of an already-local Array. `local_so_far` carries
-# names recorded earlier in this scan, so chained `let xs2 =
-# array_set(xs1, ...)` continues to track xs2 as local when xs1
-# was local.
-fn rhs_is_local_array_origin(k: ExprKind, local_so_far: [String]) : Bool {
-  match k {
-    ECall(callee, args_) -> match callee.kind {
-      EVar(name) ->
-        if name == "array_make" { true }
-        else if name == "array_set" or name == "array_grow" or name == "Mutable.array_set" or name == "Mutable.array_grow" {
-          match args_ {
-            [first, ..._ignore] -> match first.kind {
-              EVar(n) -> list_has(local_so_far, n)
-              _       -> false
-            }
-            [] -> false
-          }
-        } else { false }
-      # NOTE: `Mutable.ref_make` is deliberately NOT treated as a
-      # local-cell origin here. Unlike `array_set` (which has the
-      # bare-builtin bypass and runs without a handler installed),
-      # `Mutable.ref_*` ops route through the handler-dispatch path,
-      # which requires `Mutable`'s default handler to be installed —
-      # and that only happens when `Mutable` is on the function/main
-      # row. If we masked `Mutable` for a locally-constructed Ref, the
-      # row would lose `Mutable`, the handler would not be installed,
-      # and the dispatched `ref_*` op would segfault on a NULL handler.
-      # So Ref writes are conservatively never masked: a body that
-      # mutates any Ref must declare `/ Mutable`. The Ref-local masking
-      # becomes safe to enable once `ref_*` gains a direct (handler-
-      # free) lowering — tracked with the KAI_REF first-class rework.
-      _ -> false
+# True iff `rhs` ORIGINATES a fresh local mutable value the caller never
+# observes. Issue #531 generalised this from "Array only" to every mutable
+# kind, using the fresh-vs-borrowed distinction of region inference
+# (Tofte-Talpin) / JVM escape analysis (Choi et al. 1999): a value whose
+# identity did not come in from a parameter is local.
+#
+#   * an alias `EVar(n)` is local iff `n` is already local (propagate —
+#     never decide by type, so `let m2 = param_map` stays non-local);
+#   * an `if`/`match`/block-tail is local iff EVERY tail branch is local
+#     (so `if c { local_a } else { param_ref }` is correctly non-local);
+#   * an in-place op (`array_set` / `array_grow` of an already-local first
+#     arg) returns the same cell — local iff that arg is local;
+#   * any OTHER call is a constructor of a local value iff its result type
+#     carries mutation AND no argument carries mutation. A call that takes
+#     no mutable argument cannot return an alias of one — it can only build
+#     a fresh value (`array_make`, `Mutable.ref_make`, `hashmap.empty`,
+#     `from_pairs`). A call that DOES take a mutable argument (a user helper
+#     that might return it) is conservatively non-local.
+fn rhs_is_local_origin(rhs: Expr, local_so_far: [String], dmut: [String]) : Bool =
+  match rhs.kind {
+    EVar(n)            -> list_has(local_so_far, n)
+    EBlock(_, tail)    -> {
+      match tail {
+        Some(t) -> rhs_is_local_origin(t, local_so_far, dmut)
+        None    -> false
+      }
+    }
+    EIf(_, t_, eo)     -> {
+      match eo {
+        Some(e2) -> both_local_origin(t_, e2, local_so_far, dmut)
+        None     -> false
+      }
+    }
+    EMatch(_, arms)    -> arms_all_local_origin(arms, local_so_far, dmut)
+    ECall(callee, args_) -> {
+      if rhs_is_inplace_local(callee, args_, local_so_far) { true }
+      else { rhs_is_constructor(rhs.ty, args_, dmut) }
     }
     _ -> false
+  }
+
+fn both_local_origin(a: Expr, b: Expr, local_so_far: [String], dmut: [String]) : Bool =
+  if rhs_is_local_origin(a, local_so_far, dmut) { rhs_is_local_origin(b, local_so_far, dmut) }
+  else { false }
+
+fn arms_all_local_origin(arms: [Arm], local_so_far: [String], dmut: [String]) : Bool = match arms {
+  []           -> true
+  [h, ...rest] -> match h {
+    Arm(_, _, b) ->
+      if rhs_is_local_origin(b, local_so_far, dmut) { arms_all_local_origin(rest, local_so_far, dmut) }
+      else { false }
+  }
+}
+
+# In-place ops (`array_set` / `array_grow`, bare or qualified) return the
+# SAME cell they were given, so the binding is local iff the first arg is
+# already a local name. Checked BEFORE the constructor rule because these
+# DO take a mutable first arg (which the constructor rule would reject).
+fn rhs_is_inplace_local(callee: Expr, args_: [Expr], local_so_far: [String]) : Bool =
+  match callee.kind {
+    EVar(name) ->
+      if is_inplace_array_op(name) {
+        match args_ {
+          [first, ..._ignore] -> match first.kind {
+            EVar(n) -> list_has(local_so_far, n)
+            _       -> false
+          }
+          [] -> false
+        }
+      } else { false }
+    _ -> false
+  }
+
+fn is_inplace_array_op(name: String) : Bool =
+  name == "array_set" or name == "array_grow" or name == "Mutable.array_set" or name == "Mutable.array_grow"
+
+# A call is a fresh-value constructor iff its result type carries mutation
+# and NO argument carries mutation (it cannot alias a mutable value it never
+# received). The result-type guard also rejects pure non-mutable calls.
+fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [String]) : Bool =
+  match ret_ty {
+    None    -> false
+    Some(t) -> ty_carries_mutation(t, dmut) and not any_arg_carries_mutation(args_, dmut)
+  }
+
+fn any_arg_carries_mutation(args_: [Expr], dmut: [String]) : Bool = match args_ {
+  []           -> false
+  [h, ...rest] -> {
+    let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
+    if ty_carries_mutation(arg_ty, dmut) { true }
+    else { any_arg_carries_mutation(rest, dmut) }
   }
 }
 
@@ -11700,9 +11753,18 @@ fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
       # callee `/ Mutable` is observable mutation. For non-Mutable
       # callees the question doesn't arise. Non-EVar callees (lambdas,
       # field accesses, etc.) remain conservative.
+      # Issue #531 — a callee whose row carries `/ Mutable` (a module op
+      # like `hashmap.put`, or any user fn `/ Mutable`) is NOT an escape:
+      # the masking demand-check (`mutable_callee_args_all_local`) is the
+      # sole authority on whether passing a local mutable value to it is
+      # observable. Treating it as escape here would mark a locally-built
+      # `HashMap` as escaped the moment it is read or written through its
+      # own module ops, defeating the masking entirely. A named `EVar`
+      # callee stays safe as before; a `/ Mutable` `EModCall` now joins it.
+      let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let safe = match callee.kind {
         EVar(_) -> true
-        _       -> false
+        _       -> ty_callee_has_mutable(callee_ty)
       }
       let a0 = collect_escaped_names(callee, acc)
       if safe { collect_escaped_in_exprs_safe(args_, a0) }
@@ -11892,95 +11954,129 @@ fn labels_contain_mutable(labels: [Label]) : Bool = match labels {
   [h, ...rest] -> if h.eff == "Mutable" { true } else { labels_contain_mutable(rest) }
 }
 
-# True iff `t` is `Array[_]` or `Ref[_]`. Those are the observable mutable
-# references whose provenance the masking pass tracks. `Array` mutation is a
-# direct C call (maskable when local); `Ref` mutation flows through dispatch.
+# True iff the call's callee is a qualified op of the `Mutable` effect —
+# `EVar("Mutable.<op>")` (possibly `Mutable.<op>@<alias>`). Its `.ty` is the
+# op's result type, so `ty_callee_has_mutable` cannot see the demand; the
+# dispatch-key prefix is the effect-level signal. This is NOT a per-op
+# whitelist — `array_set`, `ref_set`, `ref_get`, `ref_make`, and any future
+# `Mutable` op all match. Issue #531 replaced the old name list with this.
+fn callee_is_mutable_op(callee: Expr) : Bool = match callee.kind {
+  EVar(name) -> dotted_prefix(strip_alias_suffix(name)) == "Mutable"
+  _          -> false
+}
+
+# True iff `t` is `Array[_]` or `Ref[_]` — the two head constructors that
+# directly carry a mutable cell. Records that EMBED one (HashMap / HashSet)
+# are caught by `mutating_record_type_names` instead.
 fn ty_is_mutable_ref(t: Ty) : Bool = match t {
   TyCon(_, name, _) -> if name == "Array" { true } else if name == "Ref" { true } else { false }
   _              -> false
 }
 
-# The names of types whose mutation flows through EFFECT DISPATCH (a `Ref`
-# op resolved on the evidence stack), not a direct C call. `Ref` itself, plus
-# every record type carrying a `Ref` field transitively (`HashMap`'s `buckets
-# : Ref[..]`, `HashSet`'s `inner : HashMap`). Such a value can NEVER mask
-# `Mutable` even when local — the handler must stay installed. Computed once
-# over the program's records (`st.recs`) so the masking pass needs no
-# hard-coded container list (a new Ref-backed user type is picked up for free).
-fn dispatch_mutable_type_names(recs: [RecInfo]) : [String] =
-  dmut_fixpoint(recs, ["Ref"], 0)
+# The names of record types whose mutation is OBSERVABLE through a `Ref`
+# CELL: every record with a transitive `Ref` field (`HashMap`'s
+# `buckets : Ref[..]`, `HashSet`'s `inner : HashMap`). `Ref` itself seeds
+# the set. Computed once over the program's records (`st.recs`) so the
+# masking pass needs no hard-coded container list — a new Ref-backed user
+# type is picked up for free.
+#
+# A record that embeds only an `Array` (no `Ref`) is deliberately NOT here:
+# such a value is an opaque, linearly-used buffer (the compiler's own
+# `Subst { slots: Array[..] }` is the canonical case), and the caller does
+# not observe its in-place array mutation the way it observes a shared
+# `Ref` cell. This mirrors the pre-#531 behaviour exactly; widening it to
+# Array-backed records would (soundly but over-conservatively) force
+# `/ Mutable` on every helper threading a `Subst`, breaking selfhost. The
+# direct `Array[_]` / `Ref[_]` argument case is still covered by
+# `ty_is_mutable_ref` — only the transitive record closure is Ref-gated.
+#
+# Issue #531 — this was `dispatch_mutable_type_names`, whose result fed a
+# blanket REJECT (a dispatch-mutable arg could never mask, even when local).
+# With the `Mutable` default handler now always installed, the set instead
+# answers a uniform "does this argument carry mutation?" — local instances
+# are maskable exactly like a local `Array`/`Ref`.
+fn mutating_record_type_names(recs: [RecInfo]) : [String] =
+  mutrec_fixpoint(recs, ["Ref"], 0)
 
-# Closure: a record is dispatch-mutable iff a field's type names `Ref` or an
-# already-known dispatch-mutable type. Iterate to a fixpoint so a type that
-# only embeds another dispatch-mutable record (HashSet → HashMap → Ref) is
-# caught. Bounded by `length(recs)` passes (each adds ≥1 name or stops).
-fn dmut_fixpoint(recs: [RecInfo], known: [String], passes: Int) : [String] =
+# Closure: a record carries mutation iff a field's type names `Array`/`Ref`
+# or an already-known mutating type. Iterate to a fixpoint so a type that
+# only embeds another mutating record (HashSet → HashMap → Ref) is caught.
+# Bounded by `length(recs)` passes (each adds ≥1 name or stops).
+fn mutrec_fixpoint(recs: [RecInfo], known: [String], passes: Int) : [String] =
   if passes > list_length(recs) { known }
   else {
-    let next = dmut_scan(recs, known, known)
+    let next = mutrec_scan(recs, known, known)
     if list_length(next) == list_length(known) { known }
-    else { dmut_fixpoint(recs, next, passes + 1) }
+    else { mutrec_fixpoint(recs, next, passes + 1) }
   }
 
-fn dmut_scan(recs: [RecInfo], known: [String], acc: [String]) : [String] = match recs {
+fn mutrec_scan(recs: [RecInfo], known: [String], acc: [String]) : [String] = match recs {
   []           -> acc
   [r, ...rest] -> match r {
     RI(name, _, fields, _) ->
-      if list_has(acc, name) { dmut_scan(rest, known, acc) }
-      else if rec_fields_name_dispatch_mutable(fields, known) {
-        dmut_scan(rest, known, [name, ...acc])
-      } else { dmut_scan(rest, known, acc) }
+      if list_has(acc, name) { mutrec_scan(rest, known, acc) }
+      else if rec_fields_name_mutating(fields, known) {
+        mutrec_scan(rest, known, [name, ...acc])
+      } else { mutrec_scan(rest, known, acc) }
   }
 }
 
-fn rec_fields_name_dispatch_mutable(fields: [FieldDecl], known: [String]) : Bool = match fields {
+fn rec_fields_name_mutating(fields: [FieldDecl], known: [String]) : Bool = match fields {
   []           -> false
   [f, ...rest] -> match f {
     FD(_, _, te) ->
-      if te_names_dispatch_mutable(te, known) { true }
-      else { rec_fields_name_dispatch_mutable(rest, known) }
+      if te_names_mutating(te, known) { true }
+      else { rec_fields_name_mutating(rest, known) }
   }
 }
 
-# Does a field's type-expression NAME a dispatch-mutable type (a known name
-# at its head, or nested in a type argument / list element)?
-fn te_names_dispatch_mutable(te: TypeExpr, known: [String]) : Bool = match te.tkind {
+# Does a field's type-expression NAME a `Ref` cell (the observable mutation
+# carrier) or a known Ref-backed record — at its head or nested in a type
+# argument / list element? `Array` is NOT a trigger here (see
+# `mutating_record_type_names`): an Array-only record is an opaque buffer,
+# not an observable cell.
+fn te_names_mutating(te: TypeExpr, known: [String]) : Bool = match te.tkind {
   TyName(name, targs) ->
-    if list_has(known, name) { true } else { te_list_names_dispatch_mutable(targs, known) }
-  TyList(elem) -> te_names_dispatch_mutable(elem, known)
+    if list_has(known, name) { true }
+    else { te_list_names_mutating(targs, known) }
+  TyList(elem) -> te_names_mutating(elem, known)
   _ -> false
 }
 
-fn te_list_names_dispatch_mutable(tes: [TypeExpr], known: [String]) : Bool = match tes {
+fn te_list_names_mutating(tes: [TypeExpr], known: [String]) : Bool = match tes {
   []           -> false
-  [t, ...rest] -> if te_names_dispatch_mutable(t, known) { true }
-                  else { te_list_names_dispatch_mutable(rest, known) }
+  [t, ...rest] -> if te_names_mutating(t, known) { true }
+                  else { te_list_names_mutating(rest, known) }
 }
 
-# True iff `t`'s head constructor names a dispatch-mutable type.
-fn ty_is_dispatch_mutable(t: Ty, dmut: [String]) : Bool = match t {
-  TyCon(_, name, _) -> list_has(dmut, name)
-  _                 -> false
-}
+# True iff `t` CARRIES MUTATION: head is `Array`/`Ref`, or names a mutating
+# record (`HashMap` / `HashSet` / any user record with a transitive cell).
+# This is the single uniform predicate the escape check consults — issue #531
+# collapsed the old direct-vs-dispatch split into it.
+fn ty_carries_mutation(t: Ty, dmut: [String]) : Bool =
+  if ty_is_mutable_ref(t) { true }
+  else { match t {
+    TyCon(_, name, _) -> list_has(dmut, name)
+    _                 -> false
+  } }
 
-# Issue #528 — for a callee declared `/ Mutable`, decide whether the
-# mutation it performs is local to the caller. Each argument whose
-# type is `Array[_]` or `Ref[_]` must be `EVar(n)` with `n` in the
-# caller's local set and not in the escaped set and not a parameter
-# name. Args of other types are ignored (they cannot carry mutation).
+# For a callee declared `/ Mutable`, decide whether the mutation it performs
+# is local to the caller. Each argument that CARRIES MUTATION must be an
+# `EVar(n)` that is local-constructed, not a parameter, and not escaped; an
+# argument of any other type cannot carry mutation and is ignored. An
+# escaping or parameter mutable argument makes the demand observable, so
+# `Mutable` stays on the row.
+#
+# Issue #531 — a single escape check now governs EVERY mutable argument
+# (`Array`, `Ref`, or a Ref-backed container). The former `Ref`/container
+# blanket reject is gone: the always-installed default handler makes a local
+# dispatch-mutable value as safe to mask as a local `Array`.
 fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
                                   escaped: [String], params: [String], dmut: [String]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
-    # An argument whose type mutates through DISPATCH (`Ref`, or a Ref-backed
-    # container like `HashMap`) can never be masked: even a local instance
-    # needs the `Mutable` handler installed at the dispatch site. So ANY such
-    # argument makes the demand non-local, regardless of escape. A plain
-    # `Array`/`Ref` direct argument keeps the existing local-or-not check
-    # (a local Array's `array_set` is a direct C call, maskable).
-    if ty_is_dispatch_mutable(arg_ty, dmut) { false }
-    else if ty_is_mutable_ref(arg_ty) {
+    if ty_carries_mutation(arg_ty, dmut) {
       match h.kind {
         EVar(n) ->
           if list_has(escaped, n) { false }
@@ -12001,49 +12097,41 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
                            params: [String], dmut: [String]) : Bool {
   match k {
     ECall(callee, args_) -> {
-      # Issue #516 — recognise both the bare prelude form and the
-      # qualified `Mutable.array_set` / `Mutable.array_grow` form.
-      # `synth_op_call_with_scheme_keys` rewrites the qualified call
-      # site's callee to `EVar("Mutable.array_set")` (the dispatch key),
-      # so without the dotted check this branch falls through to
-      # `here = true` and the surrounding `mask_local_mutable_demand`
-      # strips `Mutable` even when the write targets a parameter array.
-      #
-      # Issue #528 — also recognise calls to user-defined callees
-      # declared `/ Mutable` (e.g. `bin_write_len4`). The demand they
-      # contribute is local iff every Array/Ref argument the caller
-      # passes is a locally-constructed reference that does not
-      # escape. This generalises `is_array_safe_callee` from a static
-      # whitelist into a typed property of the callee's signature.
+      # Issue #531 — every Mutable demand now flows through ONE rule: a
+      # callee whose type carries `/ Mutable` contributes a demand that is
+      # local iff every mutation-carrying argument is a locally-constructed,
+      # non-escaping value (`mutable_callee_args_all_local`). This is uniform
+      # across all the spellings that reach here:
+      #   * the prelude `array_set` / `array_grow` (their scheme carries
+      #     `/ Mutable`, so the first `Array` arg is the mutation carrier);
+      #   * the qualified `Mutable.array_set` / `Mutable.ref_set` dispatch
+      #     keys (rewritten to `EVar("Mutable.…")` by
+      #     `synth_op_call_with_scheme_keys`, type also `/ Mutable`);
+      #   * a Ref-backed container op (`hashmap.put`, an `EModCall` whose
+      #     type is `/ Mutable`);
+      #   * any user fn declared `/ Mutable`.
+      # A mutable PARAMETER or escaping value is never local, so `Mutable`
+      # stays on the row. A higher-order combinator like `list.foldl(xs,
+      # init, fn)` carries `Mutable` transitively from its callback with no
+      # mutation-carrying argument of its own, so it is maskable when its
+      # real mutation is a local cell — the per-argument check, not a blanket
+      # decision, is what keeps `array.from_list` and friends maskable.
+      # A qualified `Mutable.<op>` op-call has its callee rewritten to
+      # `EVar("Mutable.<op>")` (`synth_op_call_with_scheme_keys` →
+      # `callee_expr_for_op`), and that `EVar`'s `.ty` is the op's RESULT
+      # type, not a `/ Mutable` fn type — the effect lives on the caller's
+      # row, not the callee node. So `ty_callee_has_mutable` alone misses
+      # the dispatched-op spelling. Recognising the callee by its `Mutable.`
+      # dispatch prefix is the effect-level check (NOT a per-op whitelist):
+      # every op of `Mutable` — `array_set`, `ref_set`, `ref_get`,
+      # `ref_make`, and any future op — flows through the same escape rule.
       let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
-      let here = match callee.kind {
-        EVar(name) ->
-          if is_mutable_array_write_name(name) {
-            demand_is_local(args_, locals, escaped, params)
-          } else if ty_callee_has_mutable(callee_ty) {
-            mutable_callee_args_all_local(args_, locals, escaped, params, dmut)
-          } else { true }
-        # A QUALIFIED module op (`EModCall`, e.g. `hashmap.get`) whose type
-        # carries `/ Mutable` contributes a demand exactly like a user fn
-        # `/ Mutable` does (the `EVar` arm above) — its locality is decided
-        # by `mutable_callee_args_all_local`: the demand is local iff every
-        # mutable-reference argument (`Array` / `Ref` / a Ref-backed
-        # container like `HashMap` / `HashSet`) is a locally-constructed,
-        # non-escaping value. A HashMap PARAMETER is never local, so the
-        # demand is non-local and `Mutable` stays on the row (no SEGV from a
-        # masked dispatch op). This must NOT be a blanket `false`: a
-        # higher-order combinator like `list.foldl(xs, init, fn)` carries
-        # `Mutable` transitively from its `fn` callback, has no Ref-backed
-        # argument, and IS maskable (its real mutation is a local `Array`
-        # via the direct-C-call `array_set`) — a blanket reject would break
-        # `array.from_list` and every core module that builds a local array
-        # through a folded write.
-        EModCall(_, _) ->
-          if ty_callee_has_mutable(callee_ty) {
-            mutable_callee_args_all_local(args_, locals, escaped, params, dmut)
-          } else { true }
-        _ -> true
-      }
+      let demands_mutable =
+        ty_callee_has_mutable(callee_ty) or callee_is_mutable_op(callee)
+      let here =
+        if demands_mutable {
+          mutable_callee_args_all_local(args_, locals, escaped, params, dmut)
+        } else { true }
       if not here { false }
       else if not all_demands_local(callee, locals, escaped, params, dmut) { false }
       else { all_demands_local_in_exprs(args_, locals, escaped, params, dmut) }
@@ -12112,24 +12200,6 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
     ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, params, dmut)
     EBang(inner)       -> all_demands_local(inner, locals, escaped, params, dmut)
     _ -> true
-  }
-}
-
-fn demand_is_local(args_: [Expr], locals: [String], escaped: [String],
-                   params: [String]) : Bool {
-  match args_ {
-    [first, ..._ignore] -> match first.kind {
-      EVar(n) ->
-        # Parameter mutation is observable by definition. Even if the
-        # name happens to alias a local-construction binding (which
-        # can't happen given lexical scoping, but be explicit),
-        # parameters always count as external.
-        if list_has(params, n) { false }
-        else if list_has(escaped, n) { false }
-        else { list_has(locals, n) }
-      _ -> false
-    }
-    [] -> false
   }
 }
 
