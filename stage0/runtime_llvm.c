@@ -598,6 +598,37 @@ KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
   return r;
 }
 
+/* native-reuse-token lane — the MOVE-semantics variant reuse, mirroring
+ * the C backend's `kai_variant_reuse_at` (the helper emit_c emits for a
+ * `__perceus_reuse_variant`). Unlike `kaix_reuse_or_alloc_variant` above
+ * — which eager-decrefs each old slot 1:1 and so DOUBLE-FREES on a
+ * non-bijective rb-tree rotation (a child migrating cross-slot is decref'd
+ * here while it stays live in the rebuilt node) — this writes the new slot
+ * words WITHOUT decref'ing the donor's old children. Perceus already
+ * balanced the RC assuming move semantics (the deconstructing arm extracted
+ * /owns the children; the reuse constructor consumes the donor shell), so
+ * the eager decref is a double count. The uniqueness gate is INTACT: a
+ * shared donor falls through to a fresh `kai_variant_u`, leaving the cell
+ * for the match exit to reclaim — only the spurious child-decref is dropped.
+ * Same boxed-args bridge as the wrapper above (mask==0, the native backend
+ * lays every variant slot as a boxed `.ptr`; tagged-Int immediates ride a
+ * `.ptr` slot untouched by move semantics). */
+KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag,
+                                const char *name, int n, KaiValue **args) {
+  if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
+  KaiVarSlot stack_slots[16];
+  KaiVarSlot *slots = stack_slots;
+  KaiVarSlot *heap = NULL;
+  if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+    heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    slots = heap;
+  }
+  for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+  KaiValue *r = kai_variant_reuse_at(scr, tag, name, n, 0, slots);
+  if (heap) free(heap);
+  return r;
+}
+
 /* ---------- token-model reuse-in-place (llvm-c-parity lane) ----------
  *
  * The simple `kaix_reuse_or_alloc_variant` above eager-decrefs each old
@@ -1504,6 +1535,19 @@ KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot) {
  * `emit_trmc_cons_step`. */
 KaiValue **kaix_cons_tail_addr(KaiValue *node) {
     return &node->as.cons.tail;
+}
+
+/* native-reuse-token lane — the variant-TRMC analogue of
+ * `kaix_cons_tail_addr`. An n-ary user variant (the rb-tree `Node`) plugs
+ * the next spine step into a SLOT of the cell, not the cons cdr. The hole
+ * lives at `kai_var_slots(node)[slot].ptr` (the separate slots[] array —
+ * stable for the node's lifetime, so the address never dangles, same
+ * invariant the TRMC cctx already relies on). Mirrors the C-direct oracle's
+ * `kai_field_addr_create(&kai_var_slots(_trmc_node)[holeslot].ptr)`. The
+ * node is built mask==0 (the LLVM backend lays every variant slot boxed),
+ * so the hole is always a `.ptr` word. */
+KaiValue **kaix_variant_slot_addr(KaiValue *node, int slot) {
+    return &kai_var_slots(node)[slot].ptr;
 }
 
 KaiValue *kaix_cctx_apply(KaiValue *res, KaiValue **hole, KaiValue *child) {
