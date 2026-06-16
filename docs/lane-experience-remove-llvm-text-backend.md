@@ -88,6 +88,16 @@ retargeted gate is green.
   doc that still listed `--backend=llvm` as the clang-autodetected default — the
   most stale doc in the tree). A whole-repo grep at close caught these; the
   initial recon (scoped to the brief's file list) did not.
+- **`tools/test-packages.sh` owned a second, package-mode backend-parity pass**
+  (`run_parity`, decided 2026-05-27) that the file-mode `test-backend-parity.sh`
+  comment pointed at but the recon under-weighted. It built every package fixture
+  with `KAI_BACKEND=llvm`; with `llvm` rejected, the build went empty and tier1
+  went red with 9 stdout DIFFs (the grep saw it as a string match, not a live
+  gate). Fixed by retargeting `run_parity` to `KAI_BACKEND=native` with a
+  one-time native-availability probe so it SKIPs on a C-only kaic2 (tier1) and
+  runs for real on a libLLVM kaic2 (tier1-native). Lesson: a `KAI_BACKEND=llvm`
+  string in a harness is a live invocation, not a doc mention — both parity
+  harnesses had to flip, not just the file-mode one.
 - Several "dual (C)+(LLVM)" Makefile targets were in fact **LLVM-only by
   construction** — their C side existed only as the diff partner, with the real
   C coverage living elsewhere (`test-perceus-*`, `test-stdlib`). Those were
