@@ -71,13 +71,46 @@ mkdir -p "$STAGE/bin" \
          "$STAGE/share/kaikai/demos" \
          "$STAGE/share/kaikai/info"
 
+# Static libLLVM for the in-process native backend (Lane 1.5 flip: native
+# is the DEFAULT `kai build` destination, so the shipped kaic2 MUST carry
+# it). The release links libLLVM STATICALLY (Rust/Zig/Julia model) — the
+# distributed binary runs `kai build` out-of-the-box with no system LLVM
+# and the brew formula needs no `depends_on llvm`. The vendored build is
+# produced on-demand by the top-level Makefile (`make llvm-build`:
+# download + cmake MinSizeRel + compile the narrow X86+AArch64 static
+# archive set, gitignored under stage0/third_party/llvm). It is
+# idempotent — a populated build/ is a no-op, so a cached tree (the CI
+# llvm cache, see release.yml) skips the long cold compile.
+#
+# LLVM_CONFIG points at the vendored STATIC llvm-config so the stage2
+# link resolves --link-static --libs against the archives we built, not a
+# system/Homebrew dynamic libLLVM. The stage2 Makefile already picks
+# -lc++ (macOS) vs -lstdc++ (Linux) per UNAME_S and threads --link-static
+# through; this just aims it at the vendored prefix.
+echo "==> building vendored static libLLVM (idempotent; cached build/ is a no-op)"
+make llvm-build >&2
+LLVM_CONFIG="$ROOT/stage0/third_party/llvm/build/bin/llvm-config"
+if [ ! -x "$LLVM_CONFIG" ]; then
+  echo "build-release.sh: vendored llvm-config missing at $LLVM_CONFIG after make llvm-build" >&2
+  exit 2
+fi
+export LLVM_CONFIG
+echo "    using $LLVM_CONFIG ($("$LLVM_CONFIG" --version))"
+
 # Bootstrap chain. kaic0 (C) → kaic1 (kaikai-from-C) → kaic2 (self-hosted).
-echo "==> bootstrapping kaic0 → kaic1 → kaic2"
+# kaic0/kaic1 stay cc-only (Tier 1: the bootstrap never couples to
+# libLLVM). Only kaic2 is built KAI_LLVM=1 — FORCE native-capable so a
+# missing/broken vendored libLLVM breaks the release loudly instead of
+# silently shipping a C-only binary that cannot honour the native default.
+echo "==> bootstrapping kaic0 → kaic1 → kaic2 (kaic2: KAI_LLVM=1, static libLLVM)"
 make -C stage0 kaic0 >&2
 make -C stage1 kaic1 >&2
-make -C stage2 kaic2 >&2
+make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >&2
 
 # Verify byte-identical selfhost before packaging — mandatory per CLAUDE.md.
+# selfhost goes through the C path (the bootstrap oracle), so it is
+# unaffected by the native link; build the selfhost-comparison kaic2 the
+# same way the gate does (default Makefile rules).
 echo "==> verifying selfhost byte-identical"
 make -C stage1 selfhost >&2
 make -C stage2 selfhost >&2
@@ -155,6 +188,27 @@ fi
 cp README.md           "$STAGE/README.md"
 cp LICENSE             "$STAGE/LICENSE" 2>/dev/null || true
 
+# Assert the staged kaic2 actually carries the native backend (static
+# libLLVM linked IN). The whole point of the L3 static link is that the
+# shipped binary runs the native DEFAULT with no system LLVM; a kaic2
+# that silently fell back to C-only would pass the C smoke below and ship
+# a binary that degrades on every user's first `kai build`. Probe the
+# capability directly: `--emit=native` on a C-only kaic2 aborts with the
+# known sentinel, on a native-capable one it lowers (and fails only for a
+# missing input, which we don't hit since we pass none → usage error, not
+# the sentinel). We grep for the sentinel and FAIL if present.
+echo "==> verifying staged kaic2 carries the native backend (static libLLVM)"
+CAP_OUT="$(printf 'fn main():Unit=()\n' > "$DIST/.cap.kai"; \
+  "$STAGE/libexec/kaikai/kaic2" --emit=native "$DIST/.cap.kai" 2>&1 || true)"
+rm -f "$DIST/.cap.kai" "$DIST/.cap.o" 2>/dev/null || true
+if printf '%s' "$CAP_OUT" | grep -q "not built into this compiler"; then
+  echo "build-release.sh: staged kaic2 is C-only — static libLLVM did NOT link in." >&2
+  echo "  The release must ship a native-capable kaic2 (native is the default backend)." >&2
+  echo "  Check 'make llvm-build' produced the vendored archives and KAI_LLVM=1 was honoured." >&2
+  exit 2
+fi
+echo "    staged kaic2: native backend present"
+
 # Smoke test: assert the staged tree resolves itself correctly without
 # falling back to the dev checkout.
 echo "==> smoke test: hello.kai through staged bin/kai"
@@ -165,12 +219,13 @@ fn main() : Unit / Console = print("hola installed mode")
 HEREDOC
 # Run the staged kai with KAI_NO_STDLIB unset and PATH pointing nowhere
 # else, to make sure the script's own auto-detection logic works.
-# We exercise BOTH backends explicitly: C (always available, baseline)
-# and LLVM (the default per #506 when clang is in PATH — what real
-# users will hit on their first run). If LLVM is broken in the staged
-# layout, the release must fail; we will not ship a binary that breaks
-# on its advertised default. The `|| true` lets us always log the
-# staged kai output before deciding pass/fail.
+# We exercise BOTH backends explicitly: `native` (the DEFAULT since the
+# Lane 1.5 flip — what real users hit on their first `kai build`, served
+# by the static libLLVM linked into the staged kaic2) and `c` (the
+# portable oracle, always available). If the native default is broken in
+# the staged layout, the release must fail; we will not ship a binary
+# that breaks on its advertised default. The `|| true` lets us always log
+# the staged kai output before deciding pass/fail.
 run_smoke() {
   backend="$1"
   out="$SMOKE_DIR/out.$backend"
@@ -189,8 +244,8 @@ run_smoke() {
   fi
 }
 smoke_failed=0
-run_smoke c    || smoke_failed=1
-run_smoke llvm || smoke_failed=1
+run_smoke native || smoke_failed=1
+run_smoke c      || smoke_failed=1
 
 # Smoke test #2 — kai.toml project (issue #512). A release that ships
 # without kai-pkg breaks every multi-file project; the previous smoke
