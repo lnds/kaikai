@@ -7,12 +7,13 @@
 # (and, for kaikai, the backend) differs. See README.md for the method
 # and the last recorded result.
 #
-# kaikai ships two native backends from the same front-end:
-#   kaikai-c    kaic2 -> C   -> $CC -O2   (default backend)
-#   kaikai-llvm kaic2 -> .ll -> clang -O2 (--emit=llvm + runtime_llvm.c)
+# kaikai ships two backends from the same front-end:
+#   kaikai-c      kaic2 -> C            -> $CC -O2 (default backend)
+#   kaikai-native in-process libLLVM    -> native object (--backend=native)
 # Both rows come from the identical .kai source; the only difference is
 # the code-generation path, so the gap between them is a pure backend
-# measurement.
+# measurement. (The native column needs a kaic2 built with libLLVM:
+# `make -C stage2 KAI_LLVM=1`.)
 #
 # Usage:
 #   ./run.sh            # wall-clock (median of 5) + peak RSS on this host
@@ -34,7 +35,6 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 CC="${CC:-cc}"
-CLANG="${CLANG:-clang}"
 RUNS=5
 
 say() { printf '%s\n' "$*" >&2; }
@@ -51,30 +51,23 @@ if [[ "$N" != "1000000" ]]; then
 fi
 "$CC" -O2 -I "$REPO_ROOT/stage2" -I "$REPO_ROOT/stage0" "$WORK/rb_kaikai.c" -o "$WORK/rb_kaikai" -lm
 
-# --- build kaikai (LLVM backend) column (optional) -------------------------
-# Same .kai, same front-end; only --emit=llvm + clang differs. The LLVM IR
-# links against stage0/runtime_llvm.c (the kaix_* shim), not the C runtime.
-HAVE_LLVM=0
-if command -v "$CLANG" >/dev/null 2>&1; then
-  say "building kaikai-llvm column (kaic2 --emit=llvm -> $CLANG -O2) ..."
-  if "$KAIC2" --path "$REPO_ROOT/stdlib" --path "$REPO_ROOT/examples/perceus" \
-       --emit=llvm "$KAI_SRC" > "$WORK/rb_kaikai.ll" 2>"$WORK/llvm.err"; then
-    # Override N in the emitted IR (the fill_loop upper bound is the only
-    # call-site N; the .kai hardcodes 1,000,000).
-    if [[ "$N" != "1000000" ]]; then
-      sed -i.bak "s/@kai_fill_loop(\(.*\)i64 1000000)/@kai_fill_loop(\1i64 ${N})/" "$WORK/rb_kaikai.ll"
-    fi
-    if "$CLANG" -O2 -w -I "$REPO_ROOT/stage2" -I "$REPO_ROOT/stage0" "$WORK/rb_kaikai.ll" \
-         "$REPO_ROOT/stage0/runtime_llvm.c" -o "$WORK/rb_kaikai_llvm" -lm 2>>"$WORK/llvm.err"; then
-      HAVE_LLVM=1
-    else
-      say "clang link of LLVM IR failed — skipping kaikai-llvm column"; head -5 "$WORK/llvm.err" >&2
-    fi
-  else
-    say "kaic2 --emit=llvm errored — skipping kaikai-llvm column"; head -5 "$WORK/llvm.err" >&2
-  fi
+# --- build kaikai (native backend) column (optional) -----------------------
+# Same .kai, same front-end; only the code-generation path differs. The
+# native backend builds the LLVM module in-process via the C API and emits a
+# native object (no .ll text, no clang), linked against runtime_llvm.c. Needs
+# a kaic2 built with libLLVM (`make -C stage2 KAI_LLVM=1`); skipped otherwise.
+# N override: the native path has no text IR to sed, so we run the default N
+# (1,000,000) for this column and skip it when a custom N is requested.
+HAVE_NATIVE=0
+KAI_BIN="$REPO_ROOT/bin/kai"
+if [[ "$N" == "1000000" ]] && "$KAI_BIN" build --backend=native "$KAI_SRC" \
+     -o "$WORK/rb_kaikai_native" >"$WORK/native.err" 2>&1; then
+  say "building kaikai-native column (in-process libLLVM -> native object) ..."
+  HAVE_NATIVE=1
+elif [[ "$N" != "1000000" ]]; then
+  say "skipping kaikai-native column (custom N has no text IR to rewrite)"
 else
-  say "$CLANG not on PATH — skipping kaikai-llvm column"
+  say "kaikai-native unavailable — skipping column (build kaic2 with make KAI_LLVM=1)"; head -5 "$WORK/native.err" >&2
 fi
 
 # --- build C column --------------------------------------------------------
@@ -121,8 +114,8 @@ peak_rss_mb() {
 say "measuring (median of $RUNS wall runs + peak RSS) ..."
 C_W=$(median_wall "$WORK/rb_c");        C_R=$(peak_rss_mb "$WORK/rb_c")
 KAI_W=$(median_wall "$WORK/rb_kaikai"); KAI_R=$(peak_rss_mb "$WORK/rb_kaikai")
-if [[ "$HAVE_LLVM" == 1 ]]; then
-  KLL_W=$(median_wall "$WORK/rb_kaikai_llvm"); KLL_R=$(peak_rss_mb "$WORK/rb_kaikai_llvm")
+if [[ "$HAVE_NATIVE" == 1 ]]; then
+  KNT_W=$(median_wall "$WORK/rb_kaikai_native"); KNT_R=$(peak_rss_mb "$WORK/rb_kaikai_native")
 fi
 if [[ "$HAVE_KOKA" == 1 ]]; then
   KK_W=$(median_wall "$WORK/rb_koka");  KK_R=$(peak_rss_mb "$WORK/rb_koka")
@@ -139,8 +132,8 @@ if [[ "$HAVE_KOKA" == 1 ]]; then
 printf "%-12s  %9ss  %8s  %8s  %10s\n" "Koka"        "$KK_W"  "$(ratio "$KK_W" "$C_W")" "1.00x" "$KK_R"
 fi
 printf "%-12s  %9ss  %8s  %8s  %10s\n" "kaikai-c"    "$KAI_W" "$(ratio "$KAI_W" "$C_W")" "$( [[ $HAVE_KOKA == 1 ]] && ratio "$KAI_W" "$KK_W" || echo '—')" "$KAI_R"
-if [[ "$HAVE_LLVM" == 1 ]]; then
-printf "%-12s  %9ss  %8s  %8s  %10s\n" "kaikai-llvm" "$KLL_W" "$(ratio "$KLL_W" "$C_W")" "$( [[ $HAVE_KOKA == 1 ]] && ratio "$KLL_W" "$KK_W" || echo '—')" "$KLL_R"
+if [[ "$HAVE_NATIVE" == 1 ]]; then
+printf "%-12s  %9ss  %8s  %8s  %10s\n" "kaikai-native" "$KNT_W" "$(ratio "$KNT_W" "$C_W")" "$( [[ $HAVE_KOKA == 1 ]] && ratio "$KNT_W" "$KK_W" || echo '—')" "$KNT_R"
 fi
 echo
 echo "kaikai @ $(git -C "$REPO_ROOT" rev-parse --short HEAD)"

@@ -1982,14 +1982,16 @@ case.
 ### m7c — LLVM effects port
 
 Replicate the m7a/m7b effects codegen in the LLVM backend. The
-C and LLVM backends must round-trip identically: every
-`m7a_*.kai` / `m7b_*.kai` fixture compiled with `--emit=llvm`
-behaves the same as `--emit=c`. Doc B's open question OQ #6
-(C vs LLVM perf ratio for trivial-clause ops) gets re-measured
-after this lands.
+C and native backends must round-trip identically: every
+`m7a_*.kai` / `m7b_*.kai` fixture compiled with `--backend=native`
+behaves the same as `--emit=c` (validated by the backend-parity
+ratchet `tools/test-backend-parity.sh` with `TARGET_BACKEND=native`).
+Doc B's open question OQ #6 (C vs native perf ratio for
+trivial-clause ops) gets re-measured after this lands.
 
 Split into four sub-tasks, landed in order, each its own branch
-+ FF merge with selfhost-llvm gate:
++ FF merge gated on the backend-parity ratchet (the original
+`selfhost-llvm` gate was retired with the llvm-text backend):
 
 1. **m7c-a — Effect-struct emission**. Emit `%EvX = type { i64,
    i8*, %KaiValue*, fn-ptrs... }` per declared effect; declare
@@ -2051,8 +2053,10 @@ Split into four sub-tasks, landed in order, each its own branch
 
    Verified end-to-end: `Console.print("hi from llvm")` and a
    `with State[Int](0) { get/set/return }` block both compile
-   and run with `--emit=llvm`. `make selfhost-llvm` stays a
-   fixed point.
+   and run on the LLVM path. (The `--emit=llvm` llvm-text path and
+   its `make selfhost-llvm` gate were since removed; the native
+   backend is the successor, validated by the backend-parity
+   ratchet and by C `make selfhost` for determinism.)
 
    *Limitation*: clauses that *discard* `resume` (m7a #6e)
    still UB because the op-call site does not check `k.status`
@@ -2136,9 +2140,10 @@ Implementation plan when the follow-up runs:
    stores the clause's return value into `discard_slot`, calls
    `kai_evidence_pop`, and `longjmp`s. The check needs
    `kaix_cont_status(k)` to read the byte field.
-4. **Test target**: a new `make -C stage2 test-llvm-effects`
-   that runs every `m7a_*.kai` / `m7b_*.kai` fixture under
-   `--emit=llvm` and asserts the same stdout as `--emit=c`.
+4. **Test target**: the backend-parity ratchet
+   `tools/test-backend-parity.sh` with `TARGET_BACKEND=native`
+   runs every `m7a_*.kai` / `m7b_*.kai` fixture under
+   `--backend=native` and asserts the same stdout as `--emit=c`.
 
 **Trigger to schedule**: when a real-world program needs to
 discard a continuation under the LLVM backend, OR when the
