@@ -122,7 +122,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native.kai compiler/emit_llvm.kai compiler/emit_c.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native.kai compiler/emit_c.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -147,7 +147,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-trmc-list-build test-issue-524 test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
 
 all: $(TARGET)
 
@@ -343,40 +343,6 @@ test-check: $(TARGET) build
 	    || { echo "check FAIL $$name"; exit 1; }; \
 	done
 
-# LLVM backend round-trip: emitted .ll is compiled with clang against
-# the runtime shim, and the resulting binary's output must match the
-# C backend's. `minimal/hello.kai` exercises the M3a skeleton; files
-# under `examples/llvm/` cover the incremental milestones with just
-# the constructs each one targets.
-LLVM_MIN_EXAMPLES := hello fizzbuzz interp quicksort
-LLVM_EXAMPLES     := m3b
-test-llvm: $(TARGET) build
-	@set -e; \
-	for name in $(LLVM_MIN_EXAMPLES); do \
-	  f=../examples/minimal/$$name.kai; \
-	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
-	  clang -w -I ../stage2 -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
-	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
-	  ./$(TARGET) $$f > build/llvm-$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
-	  ./build/llvm-$$name-c > build/llvm-$$name-c.out; \
-	  diff -q build/llvm-$$name-llvm.out build/llvm-$$name-c.out > /dev/null \
-	    && echo "llvm OK $$name" \
-	    || { echo "llvm DIFF $$name"; diff build/llvm-$$name-llvm.out build/llvm-$$name-c.out | head; exit 1; }; \
-	done; \
-	for name in $(LLVM_EXAMPLES); do \
-	  f=../examples/llvm/$$name.kai; \
-	  ./$(TARGET) --emit=llvm $$f > build/llvm-$$name.ll; \
-	  clang -w -I ../stage2 -I ../stage0 build/llvm-$$name.ll ../stage0/runtime_llvm.c -o build/llvm-$$name-llvm $(LDLIBS_M) ; \
-	  ./build/llvm-$$name-llvm > build/llvm-$$name-llvm.out; \
-	  ./$(TARGET) $$f > build/llvm-$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/llvm-$$name.c -o build/llvm-$$name-c $(LDLIBS_M) ; \
-	  ./build/llvm-$$name-c > build/llvm-$$name-c.out; \
-	  diff -q build/llvm-$$name-llvm.out build/llvm-$$name-c.out > /dev/null \
-	    && echo "llvm OK $$name" \
-	    || { echo "llvm DIFF $$name"; diff build/llvm-$$name-llvm.out build/llvm-$$name-c.out | head; exit 1; }; \
-	done
-
 # End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
 test-run: $(TARGET) build
 	@set -e; \
@@ -409,68 +375,6 @@ test-blocks: $(TARGET) build
 	    || { echo "tests DIFF $$name"; exit 1; }; \
 	done
 
-# Backend-parity coverage harness: for every fixture in
-# {sugars, units, minimal, llvm} that has a `.out.expected` golden,
-# compile through BOTH the C backend and the LLVM backend, run each
-# binary, and diff the outputs. A divergence (e.g. `Real<unit>`
-# printing 0 in LLVM but the actual value in C) fails the build.
-#
-# This rule is the systemic answer to the m7e13 / m12.5 / m12.8 lanes
-# each validating LLVM manually with a one-shot bash loop. It is
-# deliberately separate from `test-llvm` (which uses a hardcoded
-# fixture list and pre-dates the coverage push) and from
-# `test-protocols` / `test-modules` (which already do dual-backend
-# inside their own rules).
-#
-# Fixtures with `.err.expected` (negative) are skipped — backend
-# divergence is irrelevant when the typer rejects the program.
-# Fixtures without any expected file get a "no golden" pass when both
-# backends compile + run cleanly.
-#
-# To add a directory: extend the `for d in ...` loop. Each subdir
-# must contain `.kai` files at the top level.
-test-llvm-coverage: $(TARGET) build
-	@$(STACK) set -e; \
-	pass=0; fail=0; skip=0; \
-	for d in sugars units minimal llvm; do \
-	  for f in ../examples/$$d/*.kai; do \
-	    [ -e $$f ] || continue; \
-	    name=$$(basename $$f .kai); \
-	    tag="$$d/$$name"; \
-	    exp_out=../examples/$$d/$$name.out.expected; \
-	    exp_err=../examples/$$d/$$name.err.expected; \
-	    if [ -f $$exp_err ]; then \
-	      skip=$$((skip+1)); continue; \
-	    fi; \
-	    rc=0; ./$(TARGET) $$f > build/cov-$$d-$$name.c 2>/dev/null || rc=$$?; \
-	    if [ $$rc -ne 0 ]; then \
-	      echo "coverage SKIP $$tag (kaic2 errored — likely an opt-in stdlib module used without import)"; \
-	      skip=$$((skip+1)); continue; \
-	    fi; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/cov-$$d-$$name.c -o build/cov-$$d-$$name-c 2>/dev/null $(LDLIBS_M) \
-	      || { echo "coverage SKIP $$tag (C compile failed)"; skip=$$((skip+1)); continue; }; \
-	    ./build/cov-$$d-$$name-c > build/cov-$$d-$$name-c.out 2>/dev/null \
-	      || { echo "coverage SKIP $$tag (C run errored)"; skip=$$((skip+1)); continue; }; \
-	    ./$(TARGET) --emit=llvm $$f > build/cov-$$d-$$name.ll 2>/dev/null \
-	      || { echo "coverage SKIP $$tag (kaic2 --emit=llvm errored)"; skip=$$((skip+1)); continue; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/cov-$$d-$$name.ll ../stage0/runtime_llvm.c -o build/cov-$$d-$$name-llvm 2>/dev/null $(LDLIBS_M) \
-	      || { echo "coverage SKIP $$tag (LLVM compile failed)"; skip=$$((skip+1)); continue; }; \
-	    ./build/cov-$$d-$$name-llvm > build/cov-$$d-$$name-llvm.out 2>/dev/null \
-	      || { echo "coverage SKIP $$tag (LLVM run errored)"; skip=$$((skip+1)); continue; }; \
-	    if diff -q build/cov-$$d-$$name-c.out build/cov-$$d-$$name-llvm.out > /dev/null; then \
-	      echo "coverage OK $$tag"; \
-	      pass=$$((pass+1)); \
-	    else \
-	      echo "coverage DIFF $$tag"; \
-	      diff build/cov-$$d-$$name-c.out build/cov-$$d-$$name-llvm.out | head -10; \
-	      fail=$$((fail+1)); \
-	    fi; \
-	  done; \
-	done; \
-	echo ""; \
-	echo "coverage summary: $$pass pass, $$fail DIFF, $$skip skip"; \
-	[ $$fail -eq 0 ] || exit 1
-
 # M6.1 modules smoke test: the `examples/modules/` tree has a
 # diamond `main → {arith, shapes}` where `shapes` also imports
 # `arith`. A clean compile through each backend must produce the
@@ -482,12 +386,10 @@ test-modules: $(TARGET) build
 	./$(TARGET) ../examples/modules/main.kai > build/modules.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules.c -o build/modules-c $(LDLIBS_M) ; \
 	./build/modules-c > build/modules-c.out; \
-	./$(TARGET) --emit=llvm ../examples/modules/main.kai > build/modules.ll; \
-	clang -w -I ../stage2 -I ../stage0 build/modules.ll ../stage0/runtime_llvm.c -o build/modules-llvm $(LDLIBS_M) ; \
-	./build/modules-llvm > build/modules-llvm.out; \
-	diff -q build/modules-c.out build/modules-llvm.out > /dev/null \
+	printf '42\n42\n12\n' > build/modules.expected; \
+	diff -q build/modules-c.out build/modules.expected > /dev/null \
 	  && echo "modules OK" \
-	  || { echo "modules DIFF"; diff build/modules-c.out build/modules-llvm.out; exit 1; }
+	  || { echo "modules DIFF"; diff build/modules.expected build/modules-c.out; exit 1; }
 
 # m6.2 — qualified module calls. Each subdirectory under
 # examples/modules-qualified/ is one self-contained scenario
@@ -516,16 +418,8 @@ test-modules-qualified: $(TARGET) build
 	    || { echo "modules-qualified FAIL $$d (cc)"; exit 1; }; \
 	  ./build/mq-$$d-c > build/mq-$$d-c.out \
 	    || { echo "modules-qualified FAIL $$d (run C)"; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$src > build/mq-$$d.ll \
-	    || { echo "modules-qualified FAIL $$d (kaic2 --emit=llvm)"; exit 1; }; \
-	  clang -w -I ../stage2 -I ../stage0 build/mq-$$d.ll ../stage0/runtime_llvm.c -o build/mq-$$d-llvm $(LDLIBS_M) \
-	    || { echo "modules-qualified FAIL $$d (clang)"; exit 1; }; \
-	  ./build/mq-$$d-llvm > build/mq-$$d-llvm.out \
-	    || { echo "modules-qualified FAIL $$d (run LLVM)"; exit 1; }; \
 	  diff -q $$exp build/mq-$$d-c.out > /dev/null \
 	    || { echo "modules-qualified DIFF $$d (C vs golden)"; diff $$exp build/mq-$$d-c.out; exit 1; }; \
-	  diff -q build/mq-$$d-c.out build/mq-$$d-llvm.out > /dev/null \
-	    || { echo "modules-qualified DIFF $$d (C vs LLVM)"; diff build/mq-$$d-c.out build/mq-$$d-llvm.out; exit 1; }; \
 	  echo "modules-qualified OK $$d"; \
 	done
 
@@ -689,11 +583,6 @@ test-modules-path: $(TARGET) build
 	./$(TARGET) --path $$LIB $$MAIN > build/modules-path.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules-path.c -o build/modules-path-c $(LDLIBS_M) ; \
 	./build/modules-path-c > build/modules-path-c.out; \
-	./$(TARGET) --path $$LIB --emit=llvm $$MAIN > build/modules-path.ll; \
-	clang -w -I ../stage2 -I ../stage0 build/modules-path.ll ../stage0/runtime_llvm.c -o build/modules-path-llvm $(LDLIBS_M) ; \
-	./build/modules-path-llvm > build/modules-path-llvm.out; \
-	diff -q build/modules-path-c.out build/modules-path-llvm.out > /dev/null \
-	  || { echo "modules-path DIFF"; diff build/modules-path-c.out build/modules-path-llvm.out; exit 1; }; \
 	printf '42\nKAI!\n' > build/modules-path.expected; \
 	diff -q build/modules-path-c.out build/modules-path.expected > /dev/null \
 	  && echo "modules-path OK" \
@@ -766,10 +655,9 @@ test-issue-672: $(TARGET) build
 
 # m12.7.x FFI v1 regression — `[<extern_c>]` axiom lowers to a
 # direct `extern "C"` call. Compiles + runs the fixture on the C
-# backend and the LLVM backend so a regression on either path
-# (parser, lower_axiom_one, perceus skip, emit_fn_body detection,
-# llvm_emit_ffi_shim) shows up under tier1. The fixture stays
-# libc-only so it links without extra `cc` flags.
+# backend so a regression on the FFI path (parser, lower_axiom_one,
+# perceus skip, emit_fn_body detection) shows up under tier1. The
+# fixture stays libc-only so it links without extra `cc` flags.
 test-ffi-extern-c: $(TARGET) build
 	@set -e; \
 	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.c; \
@@ -777,13 +665,7 @@ test-ffi-extern-c: $(TARGET) build
 	./build/ffi_extern_c_basic-c > build/ffi_extern_c_basic.out; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out > /dev/null \
 	  && echo "ffi-extern-c OK (C backend)" \
-	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }; \
-	./$(TARGET) --emit=llvm ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.ll; \
-	clang -w -I ../stage2 -I ../stage0 build/ffi_extern_c_basic.ll ../stage0/runtime_llvm.c -o build/ffi_extern_c_basic-llvm $(LDLIBS_M) ; \
-	./build/ffi_extern_c_basic-llvm > build/ffi_extern_c_basic-llvm.out; \
-	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out > /dev/null \
-	  && echo "ffi-extern-c OK (LLVM backend)" \
-	  || { echo "ffi-extern-c DIFF (LLVM backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-llvm.out; exit 1; }
+	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }
 
 # Issue #315 fixture — the `//` integer-division operator was
 # retired in favour of plain `/` (which already truncates on `Int`
@@ -819,12 +701,6 @@ test-issue-260-261-extern-c-fn: $(TARGET) build
 	  diff -q $$exp build/$$f.out > /dev/null \
 	    && echo "$$f OK (C backend)" \
 	    || { echo "$$f DIFF (C backend)"; diff $$exp build/$$f.out; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$src > build/$$f.ll; \
-	  clang -w -I ../stage2 -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-llvm $(LDLIBS_M) ; \
-	  ./build/$$f-llvm > build/$$f.out.llvm; \
-	  diff -q $$exp build/$$f.out.llvm > /dev/null \
-	    && echo "$$f OK (LLVM backend)" \
-	    || { echo "$$f DIFF (LLVM backend)"; diff $$exp build/$$f.out.llvm; exit 1; }; \
 	done; \
 	./$(TARGET) ../examples/ffi/extern_c_old_syntax.err.kai > build/extern_c_old_syntax.out 2>&1 \
 	  && { echo "extern_c_old_syntax DID NOT FAIL — legacy syntax should be rejected"; exit 1; } \
@@ -855,19 +731,7 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 	  && echo "ffi-pub-axiom-cross-module OK (C backend)" \
 	  || { echo "ffi-pub-axiom-cross-module DIFF (C backend)"; \
 	       diff ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
-	            build/ffi_pub_axiom_cross_module.out; exit 1; }; \
-	./$(TARGET) --emit=llvm --path ../examples/effects/ffi_pub_axiom_cross_module \
-	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
-	  > build/ffi_pub_axiom_cross_module.ll; \
-	clang -w -I ../stage2 -I ../stage0 build/ffi_pub_axiom_cross_module.ll \
-	  ../stage0/runtime_llvm.c -o build/ffi_pub_axiom_cross_module-llvm $(LDLIBS_M); \
-	./build/ffi_pub_axiom_cross_module-llvm > build/ffi_pub_axiom_cross_module-llvm.out; \
-	diff -q ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
-	  build/ffi_pub_axiom_cross_module-llvm.out > /dev/null \
-	  && echo "ffi-pub-axiom-cross-module OK (LLVM backend)" \
-	  || { echo "ffi-pub-axiom-cross-module DIFF (LLVM backend)"; \
-	       diff ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
-	            build/ffi_pub_axiom_cross_module-llvm.out; exit 1; }
+	            build/ffi_pub_axiom_cross_module.out; exit 1; }
 
 # Issue #248 fixtures — stdlib `loop` helpers under the m7b §5
 # double-trailing-lambda sugar. Three positive fixtures exercise
@@ -968,31 +832,6 @@ test-issue-318: $(TARGET) build
 	diff -q ../examples/stdlib/issue_318_kai_test_prelude_scope.out.expected build/issue_318_kai_test_prelude_scope.out > /dev/null \
 	  && echo "issue-318 OK (user-only tests)" \
 	  || { echo "issue-318 DIFF"; diff ../examples/stdlib/issue_318_kai_test_prelude_scope.out.expected build/issue_318_kai_test_prelude_scope.out; exit 1; }
-
-# Issue #524 — module-qualified `file.read_bytes` shadowing the
-# prelude `read_bytes(n)` (Stdin) under the LLVM backend. Pre-fix,
-# `llvm_emit_call`'s `EModCall(mod, fname)` arm checked
-# `llvm_is_prelude_fn(fname)` first and routed the call to
-# `@kaix_prelude_read_bytes`, ignoring the qualifier. The C backend
-# never had this bug. The fixture lives under `examples/stdlib/`
-# (so the C-side `test-stdlib` runner picks it up automatically);
-# this rule is the LLVM-side regression: emit IR via `--emit=llvm`,
-# link with the runtime shim, run, and diff against the same
-# `.out.expected` golden the C side uses.
-test-issue-524: $(TARGET) build
-	@set -e; \
-	./$(TARGET) --emit=llvm --path ../stdlib \
-	            ../examples/stdlib/fs_file_bytes_qualified.kai \
-	            > build/fs_file_bytes_qualified.ll; \
-	clang -w -I ../stage2 -I ../stage0 build/fs_file_bytes_qualified.ll \
-	      ../stage0/runtime_llvm.c -o build/fs_file_bytes_qualified-llvm $(LDLIBS_M); \
-	./build/fs_file_bytes_qualified-llvm > build/fs_file_bytes_qualified-llvm.out; \
-	diff -q ../examples/stdlib/fs_file_bytes_qualified.out.expected \
-	        build/fs_file_bytes_qualified-llvm.out > /dev/null \
-	  && echo "issue-524 OK (LLVM EModCall does not fall back to prelude)" \
-	  || { echo "issue-524 DIFF"; \
-	       diff ../examples/stdlib/fs_file_bytes_qualified.out.expected \
-	            build/fs_file_bytes_qualified-llvm.out; exit 1; }
 
 # Issue #746 — a [(A, B)]-returning fn with an `[]` base case and a
 # sugared tuple/record in the recursive cons must type-check. Before
@@ -1212,7 +1051,7 @@ test-issue-501: $(TARGET) build
 # Issue #743 — a field access on a generic effect-op payload. The fix
 # is a timing one in the field-access path (deferred field-vs-UFCS
 # decision), not effect propagation. Positive: `b.id` on a `Repo[Box,_]`
-# payload type-checks against Box and runs `found` (C + LLVM). Negative
+# payload type-checks against Box and runs `found`. Negative
 # (the Tier 1 escape): `b.zzz` (nonexistent field) must now be REJECTED
 # at compile time on Box, instead of compiling silently.
 test-issue-743: $(TARGET) build
@@ -1224,12 +1063,6 @@ test-issue-743: $(TARGET) build
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
 	  && echo "issue-743 OK $$pos (C)" \
 	  || { echo "issue-743 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
-	./$(TARGET) --emit=llvm ../examples/effects/$$pos.kai > build/$$pos.ll; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/$$pos.ll ../stage0/runtime_llvm.c -o build/$$pos-llvm 2>/dev/null $(LDLIBS_M); \
-	./build/$$pos-llvm > build/$$pos-llvm.out; \
-	diff -q ../examples/effects/$$pos.out.expected build/$$pos-llvm.out > /dev/null \
-	  && echo "issue-743 OK $$pos (LLVM)" \
-	  || { echo "issue-743 DIFF $$pos (LLVM)"; diff ../examples/effects/$$pos.out.expected build/$$pos-llvm.out; exit 1; }; \
 	neg=issue_743_generic_effect_payload_bad_field; \
 	./$(TARGET) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
 	  { echo "issue-743 FAIL $$neg (Tier 1 escape: bad field accepted)"; exit 1; } \
@@ -1254,12 +1087,6 @@ test-issue-842: $(TARGET) build
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
 	  && echo "issue-842 OK $$pos (C)" \
 	  || { echo "issue-842 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
-	./$(TARGET) --emit=llvm ../examples/effects/$$pos.kai > build/$$pos.ll; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/$$pos.ll ../stage0/runtime_llvm.c -o build/$$pos-llvm 2>/dev/null $(LDLIBS_M); \
-	./build/$$pos-llvm > build/$$pos-llvm.out; \
-	diff -q ../examples/effects/$$pos.out.expected build/$$pos-llvm.out > /dev/null \
-	  && echo "issue-842 OK $$pos (LLVM)" \
-	  || { echo "issue-842 DIFF $$pos (LLVM)"; diff ../examples/effects/$$pos.out.expected build/$$pos-llvm.out; exit 1; }; \
 	neg=issue_842_multi_param_op_payload_bad_field; \
 	./$(TARGET) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
 	  { echo "issue-842 FAIL $$neg (Tier 1 escape: bad field accepted)"; exit 1; } \
@@ -1769,12 +1596,6 @@ test-holes: $(TARGET) build
 	  crc=0; ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || crc=$$?; \
 	  if [ $$crc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
 	    echo "holes FAIL $$name (C backend aborted without hole message)"; cat build/$$name-holes-c.out; exit 1; \
-	  fi; \
-	  ./$(TARGET) --emit=llvm $$f > build/$$name-holes.ll; \
-	  clang -w -I ../stage2 -I ../stage0 build/$$name-holes.ll ../stage0/runtime_llvm.c -o build/$$name-holes-llvm $(LDLIBS_M) ; \
-	  lrc=0; ./build/$$name-holes-llvm > build/$$name-holes-llvm.out 2>&1 || lrc=$$?; \
-	  if [ $$lrc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-llvm.out; then \
-	    echo "holes FAIL $$name (LLVM backend aborted without hole message)"; cat build/$$name-holes-llvm.out; exit 1; \
 	  fi; \
 	  echo "holes OK $$name"; \
 	done
@@ -2592,20 +2413,8 @@ test-effects: $(TARGET) build
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/s2-$$name \
+	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C))" \
 	    || { echo "effects FAIL $$name (C binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name.ll.err \
-	    || { echo "effects FAIL $$name (kaic2 --emit=llvm errored)"; cat build/s2-$$name.ll.err; exit 1; }; \
-	  enter_count=$$(grep -c "call i8\* @kaix_in_dispatch_enter" build/s2-$$name.ll || true); \
-	  leave_count=$$(grep -c "call void @kaix_in_dispatch_leave" build/s2-$$name.ll || true); \
-	  test "$$enter_count" -gt 0 \
-	    || { echo "effects FAIL $$name (LLVM in_dispatch_enter missing — bug #12 LLVM mirror regressed?)"; exit 1; }; \
-	  test "$$enter_count" = "$$leave_count" \
-	    || { echo "effects FAIL $$name (LLVM in_dispatch invariant broken: $$enter_count enter vs $$leave_count leave)"; exit 1; }; \
-	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
-	    || { echo "effects FAIL $$name (LLVM link failed)"; exit 1; }; \
-	  ./build/s2-$$name-llvm \
-	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C+LLVM))" \
-	    || { echo "effects FAIL $$name (LLVM binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_fiber_discard.kai \
 	         ../examples/effects/m8_fiber_discard_yields.kai; do \
@@ -2665,15 +2474,6 @@ test-effects: $(TARGET) build
 	      diff -q $$exp_out build/s2-$$name.out > /dev/null \
 	        && echo "effects OK $$name (C)" \
 	        || { echo "effects DIFF $$name (C)"; diff $$exp_out build/s2-$$name.out; exit 1; }; \
-	      ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll \
-	        || { echo "effects FAIL $$name (LLVM errored)"; exit 1; }; \
-	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
-	        || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	      ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
-	        || { echo "effects FAIL $$name (LLVM run errored)"; exit 1; }; \
-	      diff -q $$exp_out build/s2-$$name-llvm.out > /dev/null \
-	        && echo "effects OK $$name (LLVM)" \
-	        || { echo "effects DIFF $$name (LLVM)"; diff $$exp_out build/s2-$$name-llvm.out; exit 1; }; \
 	    else \
 	      echo "effects OK $$name (ran clean)"; \
 	    fi; \
@@ -2834,15 +2634,6 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (issue #308: user effect shadows stdlib)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	  ./$(TARGET) --emit=llvm --path ../stdlib $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
-	    || { echo "effects FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
-	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
-	    || { echo "effects FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out 2>&1 \
-	    || { echo "effects FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
-	  diff -q $$exp build/s2-$$name-llvm.out > /dev/null \
-	    && echo "effects OK $$name (issue #308: LLVM backend matches)" \
-	    || { echo "effects FAIL $$name (LLVM output mismatch)"; diff $$exp build/s2-$$name-llvm.out; exit 1; }; \
 	done; \
 	for f in ../examples/actors/dual_actor_send_only.kai \
 	         ../examples/actors/dual_actor_request_reply.kai \
@@ -3264,15 +3055,6 @@ test-protocols: $(TARGET) build
 	      diff -q $$exp_out build/p2-$$name.out > /dev/null \
 	        && echo "protocols OK $$name (C)" \
 	        || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
-	      ./$(TARGET) --emit=llvm $$f > build/p2-$$name.ll \
-	        || { echo "protocols FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	      $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/p2-$$name.ll ../stage0/runtime_llvm.c -o build/p2-$$name-llvm 2>/dev/null $(LDLIBS_M) \
-	        || { echo "protocols FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	      ./build/p2-$$name-llvm > build/p2-$$name-llvm.out \
-	        || { echo "protocols FAIL $$name (LLVM run errored)"; cat build/p2-$$name-llvm.out; exit 1; }; \
-	      diff -q $$exp_out build/p2-$$name-llvm.out > /dev/null \
-	        && echo "protocols OK $$name (LLVM)" \
-	        || { echo "protocols DIFF $$name (LLVM)"; diff $$exp_out build/p2-$$name-llvm.out; exit 1; }; \
 	    else \
 	      echo "protocols OK $$name (no golden, ran clean)"; \
 	    fi; \
@@ -3287,12 +3069,8 @@ test-protocols: $(TARGET) build
 # impl-table dispatch which, pre-fix, called the unboxed builtin scalar
 # impls (`Eq_Int_eq`, …) with the wrong ABI and SIGSEGV'd. Compiled
 # with `--test` (not as a program, so it is skipped by `test-protocols`).
-# The `--test` runner is C-only. The LLVM mirror shim is emitted by the
-# same `pimpl_row_is_unboxed` gate and verified structurally (the .ll
-# carries `@kai_<csym>__boxed` and the impl-table `call` bitcasts that
-# identity-typed symbol, which clang's verifier accepts — a raw scalar
-# impl bitcast to `%KaiValue*(%KaiValue*,...)*` was the pre-fix mismatch
-# clang would otherwise reject); selfhost-llvm stays byte-stable.
+# The `--test` runner is C-only; the native backend's parity is gated
+# separately by the native-vs-C ratchet.
 test-proto-scalar-dispatch: $(TARGET) build
 	@set -e; \
 	src=../examples/protocols/poly_scalar_dispatch.kai; \
@@ -3304,17 +3082,7 @@ test-proto-scalar-dispatch: $(TARGET) build
 	./build/psd > build/psd.out 2>&1; \
 	diff -q $$exp build/psd.out > /dev/null \
 	  && echo "proto-scalar-dispatch OK (C)" \
-	  || { echo "proto-scalar-dispatch DIFF (C)"; diff $$exp build/psd.out; exit 1; }; \
-	echo "=== arity-0 Default boxed-shim (issue fix-default-shim) ==="; \
-	./$(TARGET) --emit=llvm ../examples/protocols/default_basic.kai > build/default-basic.ll 2>build/default-basic.ll.err \
-	  || { echo "default-shim FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	for t in Int Real Bool; do \
-	  grep -q "register_one_impl.*@kai_protocols____pimpl_Default_$${t}_default to i8" build/default-basic.ll \
-	    && { echo "default-shim FAIL: Default_$${t}_default registered RAW (scalar fn bitcast as %KaiValue*()* — the clang verifier mismatch that broke v0.85/0.86 releases)"; exit 1; }; \
-	  grep -q "register_one_impl.*@kai_protocols____pimpl_Default_$${t}_default__boxed to i8" build/default-basic.ll \
-	    || { echo "default-shim FAIL: Default_$${t}_default __boxed shim not registered"; exit 1; }; \
-	done; \
-	echo "    arity-0 Default boxed-shim OK (Int/Real/Bool register via __boxed, not raw)"
+	  || { echo "proto-scalar-dispatch DIFF (C)"; diff $$exp build/psd.out; exit 1; }
 
 # Issue #758: `bare_narrow_in_assert.kai` exercises #235 first-arg
 # narrowing for a bare cross-module name used INLINE in an `assert`
@@ -3393,13 +3161,7 @@ test-m4c: $(TARGET) build
 	    || { echo "m4c FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/s2-$$name > build/s2-$$name.out \
 	    || { echo "m4c FAIL $$name (C binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$f > build/s2-$$name.ll 2> build/s2-$$name-llvm.err \
-	    || { echo "m4c FAIL $$name (LLVM emit errored)"; cat build/s2-$$name-llvm.err; exit 1; }; \
-	  clang -w -I ../stage2 -I ../stage0 build/s2-$$name.ll ../stage0/runtime_llvm.c -o build/s2-$$name-llvm $(LDLIBS_M) \
-	    || { echo "m4c FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	  ./build/s2-$$name-llvm > build/s2-$$name-llvm.out \
-	    || { echo "m4c FAIL $$name (LLVM binary exit non-zero)"; cat build/s2-$$name-llvm.out; exit 1; }; \
-	  echo "m4c OK $$name (C + LLVM)"; \
+	  echo "m4c OK $$name (C)"; \
 	done
 	@grep -q "kai_run_with__mono__Int__Int" build/s2-m4c_run_with.c \
 	  && grep -q "kai_run_with__mono__String__Int" build/s2-m4c_run_with.c \
@@ -3413,10 +3175,6 @@ test-m4c: $(TARGET) build
 	  && grep -q "= kai_run_with__mono__String__Int(" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
-	@grep -q "call %KaiValue\* @kai_run_with__mono__Int__Int(" build/s2-m4c_run_with.ll \
-	  && grep -q "call %KaiValue\* @kai_run_with__mono__String__Int(" build/s2-m4c_run_with.ll \
-	  && echo "m4c OK m4c_run_with LLVM call sites rewritten to mangled names" \
-	  || { echo "m4c FAIL m4c_run_with — LLVM main still calls polymorphic kai_run_with"; exit 1; }
 	@grep -q "= kai_process_with_log__mono__Int__Int(" build/s2-m4c_handler_in_body.c \
 	  && grep -q "= kai_process_with_log__mono__String__Int(" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
@@ -3451,22 +3209,6 @@ selfhost: $(TARGET) build
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
 	  || { echo "selfhost determinism: DIFF (kaic2b.c != kaic2c.c)"; exit 1; }
 
-# LLVM self-hosting: per-compiler determinism via the LLVM backend.
-# kaic2 (C) emits its own source as .ll, which is compiled to a
-# binary. That binary then re-emits the same .ll. We require the two
-# .ll outputs to match byte-for-byte — the LLVM emitter must be a
-# pure function of the typed AST. As with `selfhost` above, stage1's
-# output is not compared. See
-# docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md.
-selfhost-llvm: $(TARGET) build
-	@$(STACK) set -e; \
-	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
-	clang -w $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1 $(LDLIBS_M) ; \
-	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
-	diff -q build/kaic2-s1.ll build/kaic2-s2.ll > /dev/null \
-	  && echo "llvm selfhost determinism: OK (s1.ll == s2.ll)" \
-	  || { echo "llvm selfhost determinism: DIFF (s1.ll != s2.ll)"; exit 1; }
-
 # m12.8 Phase 3 — Core demos. Each demo lives in its own
 # `examples/<name>/<name>.kai` directory, ships an `<name>.out.expected`
 # golden, and (if the demo reads stdin) an `<name>.in` fixture fed via
@@ -3499,20 +3241,6 @@ test-demos-core: $(TARGET) build
 	  diff -q $$exp build/demo-$$name.out > /dev/null \
 	    && echo "demos-core OK $$name (C)" \
 	    || { echo "demos-core DIFF $$name (C)"; diff $$exp build/demo-$$name.out; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$preludes $$src > build/demo-$$name.ll \
-	    || { echo "demos-core FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/demo-$$name.ll ../stage0/runtime_llvm.c -o build/demo-$$name-llvm 2>/dev/null $(LDLIBS_M) \
-	    || { echo "demos-core FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	  if [ -f $$in ]; then \
-	    ./build/demo-$$name-llvm < $$in > build/demo-$$name-llvm.out \
-	      || { echo "demos-core FAIL $$name (LLVM run errored)"; cat build/demo-$$name-llvm.out; exit 1; }; \
-	  else \
-	    ./build/demo-$$name-llvm > build/demo-$$name-llvm.out \
-	      || { echo "demos-core FAIL $$name (LLVM run errored)"; cat build/demo-$$name-llvm.out; exit 1; }; \
-	  fi; \
-	  diff -q $$exp build/demo-$$name-llvm.out > /dev/null \
-	    && echo "demos-core OK $$name (LLVM)" \
-	    || { echo "demos-core DIFF $$name (LLVM)"; diff $$exp build/demo-$$name-llvm.out; exit 1; }; \
 	done
 
 # m12.8.x post-Core REOPEN — Eric level 3: aspirational unplanned
@@ -3540,15 +3268,6 @@ test-aspirational: $(TARGET) build
 	  diff -q $$exp build/asp-$$name.out > /dev/null \
 	    && echo "aspirational OK $$name (C)" \
 	    || { echo "aspirational DIFF $$name (C)"; diff $$exp build/asp-$$name.out; exit 1; }; \
-	  ./$(TARGET) --emit=llvm $$preludes $$src > build/asp-$$name.ll \
-	    || { echo "aspirational FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage2 -I ../stage0 build/asp-$$name.ll ../stage0/runtime_llvm.c -o build/asp-$$name-llvm 2>/dev/null $(LDLIBS_M) \
-	    || { echo "aspirational FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	  ./build/asp-$$name-llvm > build/asp-$$name-llvm.out \
-	    || { echo "aspirational FAIL $$name (LLVM run errored)"; cat build/asp-$$name-llvm.out; exit 1; }; \
-	  diff -q $$exp build/asp-$$name-llvm.out > /dev/null \
-	    && echo "aspirational OK $$name (LLVM)" \
-	    || { echo "aspirational DIFF $$name (LLVM)"; diff $$exp build/asp-$$name-llvm.out; exit 1; }; \
 	done
 
 # Inference branch-isolation canary. Stresses st_restore_entries +
@@ -3884,81 +3603,6 @@ test-tco-perceus-wrap: $(TARGET) build
 	  && echo "tco-perceus-wrap OK (issue #89 1M-deep self-tail-call through perceus wrap; goto label emitted; runs to completion)" \
 	  || { echo "tco-perceus-wrap DIFF"; diff ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out; exit 1; }
 
-# Issue #706 — TCO in the LLVM backend. Before this lane the LLVM
-# emitter ignored the `tcrec` self-tail-call sentinel (the driver
-# planted it only on the C path), so a 5M-deep self-tail loop
-# overflowed the stack (exit 139) under LLVM while running in O(1)
-# space under C. The fix runs `tcrec_rewrite_decls` for both backends
-# and lowers the sentinel to an alloca-based param rebind + `br
-# %tcrec.loop`. This target asserts the loop IR shape (`tcrec.loop`
-# header + a back-edge `br label %tcrec.loop`), that clang accepts the
-# IR, and that both backends run the 5M loop to the same `5000000`
-# golden. Requires clang; skipped gracefully when absent.
-#
-# Since #718, `loop` is a UFn with a scalar signature — `define i64
-# @kai_loop(i64 ...)`, not boxed `%KaiValue*` — so the loop body lowers
-# through the raw TCO back-edge (`alloca i64` slots, `store i64`, zero
-# drops). The IR-shape grep matches the `i64` signature accordingly.
-test-tco-llvm-706: $(TARGET) build
-	@command -v clang >/dev/null 2>&1 || { echo "tco-llvm-706 SKIP (clang not in PATH)"; exit 0; }
-	@set -e; \
-	src=../examples/perceus/tco_self_recursion_constant_space.kai; \
-	exp=../examples/perceus/tco_self_recursion_constant_space.out.expected; \
-	./$(TARGET) --emit=llvm $$src > build/tco-706.ll \
-	  || { echo "tco-llvm-706 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	awk '/^define i64 @kai_loop\(/,/^}/' build/tco-706.ll > build/tco-706.loop; \
-	grep -F -q 'tcrec.loop:' build/tco-706.loop \
-	  || { echo "tco-llvm-706 FAIL (no tcrec.loop header in @kai_loop IR — sentinel not lowered)"; cat build/tco-706.loop; exit 1; }; \
-	grep -F -q 'br label %tcrec.loop' build/tco-706.loop \
-	  || { echo "tco-llvm-706 FAIL (no back-edge br to %tcrec.loop)"; cat build/tco-706.loop; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/tco-706.ll ../stage0/runtime_llvm.c -o build/tco-706-llvm $(LDLIBS_M) \
-	  || { echo "tco-llvm-706 FAIL (clang rejected the IR)"; exit 1; }; \
-	./build/tco-706-llvm > build/tco-706-llvm.out; lrc=$$?; \
-	[ "$$lrc" = "0" ] || { echo "tco-llvm-706 FAIL (LLVM binary exit $$lrc — stack overflow regressed?)"; exit 1; }; \
-	diff -q $$exp build/tco-706-llvm.out > /dev/null \
-	  || { echo "tco-llvm-706 FAIL (LLVM output mismatch)"; diff $$exp build/tco-706-llvm.out; exit 1; }; \
-	./$(TARGET) $$src > build/tco-706.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-706.c -o build/tco-706-c $(LDLIBS_M); \
-	./build/tco-706-c > build/tco-706-c.out; \
-	diff -q $$exp build/tco-706-c.out > /dev/null \
-	  || { echo "tco-llvm-706 FAIL (C output mismatch)"; diff $$exp build/tco-706-c.out; exit 1; }; \
-	diff -q build/tco-706-c.out build/tco-706-llvm.out > /dev/null \
-	  && echo "tco-llvm-706 OK (5M-deep self-tail loop runs in O(1) stack on both backends; tcrec.loop IR shape asserted; C == LLVM)" \
-	  || { echo "tco-llvm-706 FAIL (C vs LLVM divergence)"; diff build/tco-706-c.out build/tco-706-llvm.out; exit 1; }
-
-# Issue #709 — the LLVM TCO back-edge must drop every UFn param slot,
-# so an accumulator loop leaks a CONSTANT number of boxes regardless of
-# iteration count (no linear growth). ASAN cannot catch this: a leak is
-# not a use-after-free and macOS runs `detect_leaks=0` — the #706 lane
-# passed ASAN + selfhost and still shipped this leak. The real gate is
-# the `KAI_TRACE_RC` `leaked=` line: build the fixture's loop at two very
-# different iteration counts and assert `leaked` is identical. A
-# per-iteration leak (the bug) would make `leaked` scale with N.
-test-tco-llvm-709: $(TARGET) build
-	@command -v clang >/dev/null 2>&1 || { echo "tco-llvm-709 SKIP (clang not in PATH)"; exit 0; }
-	@set -e; \
-	src=../examples/perceus/tco_accumulator_no_leak.kai; \
-	exp=../examples/perceus/tco_accumulator_no_leak.out.expected; \
-	./$(TARGET) --emit=llvm $$src > build/tco-709.ll \
-	  || { echo "tco-llvm-709 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/tco-709.ll ../stage0/runtime_llvm.c -o build/tco-709-llvm $(LDLIBS_M) \
-	  || { echo "tco-llvm-709 FAIL (clang rejected the IR)"; exit 1; }; \
-	./build/tco-709-llvm > build/tco-709-llvm.out; \
-	diff -q $$exp build/tco-709-llvm.out > /dev/null \
-	  || { echo "tco-llvm-709 FAIL (LLVM output mismatch)"; diff $$exp build/tco-709-llvm.out; exit 1; }; \
-	for N in 1000 100000; do \
-	  sed "s/loop(1000, 0)/loop($$N, 0)/" $$src > build/tco-709-$$N.kai; \
-	  ./$(TARGET) --emit=llvm build/tco-709-$$N.kai > build/tco-709-$$N.ll; \
-	  clang -w -I ../stage2 -I ../stage0 build/tco-709-$$N.ll ../stage0/runtime_llvm.c -o build/tco-709-$$N-llvm $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/tco-709-$$N-llvm > /dev/null 2> build/tco-709-$$N.rc; \
-	  eval "leaked_$$N=$$(grep -oE 'leaked=[0-9]+' build/tco-709-$$N.rc | head -1 | cut -d= -f2)"; \
-	done; \
-	[ -n "$$leaked_1000" ] && [ -n "$$leaked_100000" ] \
-	  || { echo "tco-llvm-709 FAIL (could not parse KAI_TRACE_RC leaked= line)"; cat build/tco-709-100000.rc; exit 1; }; \
-	[ "$$leaked_1000" = "$$leaked_100000" ] \
-	  && echo "tco-llvm-709 OK (accumulator TCO leaks $$leaked_1000 boxes at both N=1000 and N=100000 — bounded, no linear growth)" \
-	  || { echo "tco-llvm-709 FAIL (leaked scales with iterations: N=1000 -> $$leaked_1000, N=100000 -> $$leaked_100000 — per-iteration leak regressed)"; exit 1; }
-
 # Issue #812 Finding B — the KAI_TRACE_RC incref/decref counters must
 # COUNT even in a binary built WITHOUT `-DKAI_TRACE_RC` (the `kai build`
 # default path). Build the fixture WITHOUT the define and assert the
@@ -4006,34 +3650,6 @@ test-perceus-817-filter-leak: $(TARGET) build
 	[ "$$leaked" -lt 1000 ] \
 	  && echo "perceus-817-filter-leak OK (leaked=$$leaked < 1000 over 5000 filter-over-heap iters; arm-binder leak closed)" \
 	  || { echo "perceus-817-filter-leak FAIL (leaked=$$leaked — arm-binder leak regressed, grows with iters)"; exit 1; }
-
-# Mixed-param TCO in the LLVM backend: a self-tail-recursive fn whose
-# signature mixes raw scalars (`i`, `n`) with a BOXED accumulator
-# (`acc: String`). Before the per-param-mask fix, the LLVM UFn lowering
-# treated every param as raw `i64`, so the boxed `acc` was read as an
-# integer (the String pointer printed as a number) and C↔LLVM diverged.
-# Asserts: (1) the boxed param is `%KaiValue*` in the IR (not `i64`),
-# (2) C and LLVM agree with the golden.
-test-tco-llvm-mixed: $(TARGET) build
-	@command -v clang >/dev/null 2>&1 || { echo "tco-llvm-mixed SKIP (clang not in PATH)"; exit 0; }
-	@set -e; \
-	src=../examples/perceus/tco_mixed_param_boxed_acc.kai; \
-	exp=../examples/perceus/tco_mixed_param_boxed_acc.out.expected; \
-	./$(TARGET) --emit=llvm $$src > build/tco-mixed.ll \
-	  || { echo "tco-llvm-mixed FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	grep -F -q 'define %KaiValue* @kai_build(i64 %pargr_i, i64 %pargr_n, %KaiValue* %parg_acc)' build/tco-mixed.ll \
-	  || { echo "tco-llvm-mixed FAIL (boxed acc param not %KaiValue* in signature — mask ignored)"; grep 'define.*@kai_build' build/tco-mixed.ll; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/tco-mixed.ll ../stage0/runtime_llvm.c -o build/tco-mixed-llvm $(LDLIBS_M) \
-	  || { echo "tco-llvm-mixed FAIL (clang rejected the IR)"; exit 1; }; \
-	./build/tco-mixed-llvm > build/tco-mixed-llvm.out; \
-	diff -q $$exp build/tco-mixed-llvm.out > /dev/null \
-	  || { echo "tco-llvm-mixed FAIL (LLVM output mismatch)"; diff $$exp build/tco-mixed-llvm.out; exit 1; }; \
-	./$(TARGET) $$src > build/tco-mixed.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-mixed.c -o build/tco-mixed-c $(LDLIBS_M); \
-	./build/tco-mixed-c > build/tco-mixed-c.out; \
-	diff -q $$exp build/tco-mixed-c.out > /dev/null \
-	  && echo "tco-llvm-mixed OK (mixed raw/boxed-param TCO agrees C == LLVM == golden)" \
-	  || { echo "tco-llvm-mixed FAIL (C output mismatch)"; diff $$exp build/tco-mixed-c.out; exit 1; }
 
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
@@ -4745,177 +4361,6 @@ test-env-mutate-asan: $(TARGET) build
 	    || { echo "env-mutate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
-# Issue #87 / #718 — Phase 2 unbox LLVM mirror. Compiles unbox_bench.kai
-# through `--emit=llvm`, asserts the `pure_chain` body lowers to raw
-# `i64` arithmetic (no `kaix_int` / `kaix_add` / `kaix_mul` calls inside
-# the body), and that the emitted IR links cleanly through clang + the
-# LLVM runtime shim. Mirrors the C-side `test-unbox-phase2` greps.
-#
-# Since #718, `pure_chain` is a UFn with a SCALAR signature — `define
-# i64 @kai_pure_chain(i64 %kair_seed)`, not the old boxed `%KaiValue*`
-# form — so the body extraction matches the `i64` signature.
-#
-# Run + cross-check (upgraded from link-only since #708 LLVM TCO +
-# #718 scalar signatures landed): the bench's outer driver
-# `bench_loop(1_000_000, 0)` is self-tail-recursive and now runs in
-# O(1) C-stack on the LLVM backend (TCO #708), and the scalar UFn
-# signature (#718) keeps `pure_chain`'s own frame tiny — so the LLVM
-# binary runs to completion and must produce byte-identical output to
-# the C backend.
-test-unbox-llvm-bench: $(TARGET) build
-	@set -e; \
-	./$(TARGET) --emit=llvm ../examples/perceus/unbox_bench.kai > build/unbox-bench.ll \
-	  || { echo "unbox-llvm-bench FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/unbox-bench.ll ../stage0/runtime_llvm.c -o build/unbox-bench-llvm $(LDLIBS_M) \
-	  || { echo "unbox-llvm-bench FAIL (clang errored — IR ill-formed?)"; exit 1; }
-	@# Acceptance grep — `pure_chain` body must contain raw IR
-	@# arithmetic and must NOT contain boxed `kaix_*` arithmetic
-	@# calls. We extract the body between `define i64 @kai_pure_chain`
-	@# (scalar signature since #718) and the closing `}`.
-	@awk '/^define i64 @kai_pure_chain\(/,/^}/' build/unbox-bench.ll > build/unbox-bench.purechain
-	@grep -E '= (add|mul|sub|srem) i64' build/unbox-bench.purechain > /dev/null \
-	  || { echo "unbox-llvm-bench FAIL (no raw i64 arith inside pure_chain)"; \
-	       cat build/unbox-bench.purechain; exit 1; }
-	@if grep -E 'call %KaiValue\* @kaix_(add|sub|mul|mod)\(' build/unbox-bench.purechain; then \
-	  echo "unbox-llvm-bench FAIL (boxed kaix_add/sub/mul/mod survived inside pure_chain)"; exit 1; \
-	fi
-	@# At most one `kaix_int(` call survives — the boundary box of the
-	@# block tail before the scalar `ret i64` (the multi-stmt block body
-	@# round-trips through the boxed boundary; the loop arithmetic itself
-	@# is fully raw). More than one means the chain didn't collapse.
-	@n=$$(grep -c 'call %KaiValue\* @kaix_int(' build/unbox-bench.purechain); \
-	  if [ "$$n" -gt 1 ]; then \
-	    echo "unbox-llvm-bench FAIL (more than one kaix_int boundary box inside pure_chain: $$n)"; \
-	    cat build/unbox-bench.purechain; exit 1; \
-	  fi
-	@# Run + cross-check: the LLVM binary must run to completion (TCO
-	@# #708 keeps the driver O(1)-stack; #718 keeps pure_chain's frame
-	@# tiny) and match the C backend byte-for-byte.
-	@./build/unbox-bench-llvm > build/unbox-bench-llvm.out \
-	  || { echo "unbox-llvm-bench FAIL (LLVM binary errored at runtime)"; exit 1; }
-	@./$(TARGET) ../examples/perceus/unbox_bench.kai > build/unbox-bench-c.c \
-	  && cc -std=c99 -w -I ../stage2 -I ../stage0 build/unbox-bench-c.c -o build/unbox-bench-c $(LDLIBS_M) \
-	  && ./build/unbox-bench-c > build/unbox-bench-c.out \
-	  || { echo "unbox-llvm-bench FAIL (C backend build/run errored)"; exit 1; }
-	@diff -q build/unbox-bench-c.out build/unbox-bench-llvm.out > /dev/null \
-	  || { echo "unbox-llvm-bench FAIL (C vs LLVM output diverged):"; \
-	       diff build/unbox-bench-c.out build/unbox-bench-llvm.out; exit 1; }
-	@echo "unbox-llvm-bench OK (pure_chain raw i64; C == LLVM output; IR links + runs cleanly)"
-
-# issue #747 — LLVM backend Perceus RC. The LLVM emitter used to leak
-# every scrutinee + boxed Int in a match (3.7 GB RSS on the rb-tree); the
-# fix ported the C backend's protocol (borrow slot reads, kind-1 raw Int
-# binders, survivor incref at bind, match-exit + TRMC-step scrutinee drop,
-# two-pass test/bind pattern lowering). This fixture is a self-contained
-# red-black insert whose balance arms nest a sub-node in BOTH slot 1 and
-# slot 4 (the two-nested-arm shape that stranded a survivor incref) and
-# whose insert is TRMC modulo-cons. Gate: (1) LLVM output == C output ==
-# golden, (2) under KAI_TRACE_RC the LIVE variant count is ~= the final
-# tree size (garbage-free churn), NOT the alloc total (the pre-fix leak).
-test-issue-747: $(TARGET) build
-	@set -e; \
-	./$(TARGET) --path ../stdlib --emit=llvm ../examples/perceus/llvm_rc_nested_match.kai > build/issue747.ll \
-	  || { echo "issue-747 FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-llvm $(LDLIBS_M) \
-	  || { echo "issue-747 FAIL (clang errored — IR ill-formed?)"; exit 1; }; \
-	./build/issue747-llvm > build/issue747-llvm.out \
-	  || { echo "issue-747 FAIL (LLVM binary errored at runtime)"; exit 1; }; \
-	diff -q ../examples/perceus/llvm_rc_nested_match.out.expected build/issue747-llvm.out > /dev/null \
-	  || { echo "issue-747 FAIL (LLVM output != golden):"; \
-	       diff ../examples/perceus/llvm_rc_nested_match.out.expected build/issue747-llvm.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib --emit=c ../examples/perceus/llvm_rc_nested_match.kai > build/issue747.c \
-	  && cc -std=c99 -w -I ../stage2 -I ../stage0 build/issue747.c -o build/issue747-c $(LDLIBS_M) \
-	  && ./build/issue747-c > build/issue747-c.out \
-	  || { echo "issue-747 FAIL (C backend build/run errored)"; exit 1; }; \
-	diff -q build/issue747-c.out build/issue747-llvm.out > /dev/null \
-	  || { echo "issue-747 FAIL (C vs LLVM output diverged):"; \
-	       diff build/issue747-c.out build/issue747-llvm.out; exit 1; }; \
-	clang -w -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/issue747.ll ../stage0/runtime_llvm.c -o build/issue747-trace $(LDLIBS_M) \
-	  || { echo "issue-747 FAIL (trace build errored)"; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/issue747-trace 2> build/issue747-trace.err > /dev/null; \
-	live=$$(grep 'tag=variant allocs' build/issue747-trace.err | grep -oE 'live=[0-9]+' | grep -oE '[0-9]+'); \
-	allocs=$$(grep 'tag=variant allocs' build/issue747-trace.err | grep -oE 'allocs=[0-9]+' | grep -oE '[0-9]+'); \
-	if [ -z "$$live" ]; then echo "issue-747 FAIL (no KAI_TRACE_RC variant summary)"; cat build/issue747-trace.err; exit 1; fi; \
-	if [ "$$live" -ge 25000 ]; then \
-	  echo "issue-747 FAIL (LLVM leaks: live=$$live variants, allocs=$$allocs — expected ~20003 live tree, churn reclaimed)"; \
-	  exit 1; \
-	fi; \
-	grep -q '@kaix_variant_arg_i64' build/issue747.ll \
-	  || { echo "issue-747 FAIL (i64-inline read regressed: no kaix_variant_arg_i64 — Int slots read boxed via kaix_variant_arg + kaix_to_int)"; exit 1; }; \
-	grep -q '@kaix_variant_masked' build/issue747.ll \
-	  || { echo "issue-747 FAIL (i64-inline construction regressed: no kaix_variant_masked — Int slots boxed at construction)"; exit 1; }; \
-	if grep -q '@kaix_variant_arg_i64' build/issue747.ll && [ "$$(awk '/@kai_rb_tree__balance_left\(/{p=1} p{print} /^}/{if(p)exit}' build/issue747.ll | grep -c '@kaix_to_int')" -gt 0 ]; then \
-	  echo "issue-747 FAIL (i64-inline incomplete: balance_left still has kaix_to_int box round-trips on Int slots)"; exit 1; \
-	fi; \
-	echo "issue-747 OK (LLVM rb-tree garbage-free: live=$$live of allocs=$$allocs; C == LLVM == golden; Int slots ride raw i64 via kaix_variant_arg_i64 + kaix_variant_masked, no box round-trip)"
-
-# i64-inline parity (#747) COHERENCE gate — a variant with an Int slot
-# (kind-1, raw i64) ADJACENT to a Real (kind-2), an enum (kind-3) and a
-# pointer (kind-0) slot. Proves the LLVM backend's `k == 1` gate packs ONLY
-# the Int raw and leaves the rest boxed, so construction and the match-read
-# agree across backends. The rb-tree (Int-only) never exercises a Real slot;
-# this is the fixture that would catch a `k != 0` regression silently
-# corrupting a Real word. C is authoritative; LLVM must match byte-for-byte.
-test-issue-747-mixed-slots: $(TARGET) build
-	@set -e; \
-	f=llvm_mixed_int_real_slot; \
-	./$(TARGET) --path ../stdlib --emit=llvm ../examples/perceus/$$f.kai > build/$$f.ll \
-	  || { echo "747-mixed FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-llvm $(LDLIBS_M) \
-	  || { echo "747-mixed FAIL (clang errored — IR ill-formed?)"; exit 1; }; \
-	./build/$$f-llvm > build/$$f-llvm.out \
-	  || { echo "747-mixed FAIL (LLVM binary errored)"; exit 1; }; \
-	diff -q ../examples/perceus/$$f.out.expected build/$$f-llvm.out > /dev/null \
-	  || { echo "747-mixed FAIL (LLVM != golden):"; diff ../examples/perceus/$$f.out.expected build/$$f-llvm.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib --emit=c ../examples/perceus/$$f.kai > build/$$f.c \
-	  && cc -std=c99 -w -I ../stage2 -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
-	  && ./build/$$f-c > build/$$f-c.out \
-	  || { echo "747-mixed FAIL (C backend build/run errored)"; exit 1; }; \
-	diff -q build/$$f-c.out build/$$f-llvm.out > /dev/null \
-	  || { echo "747-mixed FAIL (C vs LLVM diverged):"; diff build/$$f-c.out build/$$f-llvm.out; exit 1; }; \
-	if ! grep -qE '@kaix_variant_masked\(i32 [0-9]+,.*, i32 4, i32 1,' build/$$f.ll; then \
-	  echo "747-mixed FAIL (MkCell 4-slot ctor mask != 1 — expected ONLY slot 0 Int raw; Real/enum/ptr must stay boxed):"; \
-	  grep -oE '@kaix_variant_masked\(i32 [0-9]+,.*, i32 4, i32 [0-9]+,' build/$$f.ll | head -1; exit 1; \
-	fi; \
-	echo "747-mixed OK (Int+Real+enum+ptr variant: C == LLVM == golden; mask=1 packs ONLY the Int slot raw, Real/enum/ptr boxed)"
-
-# llvm-c-parity lane — arm-top reuse (ParcReuse / token model) SHARED
-# branch. The rb-tree benchmark and #747 are perfectly linear (every
-# token UNIQUE, tok_null_shared == 0), so they never exercise the SHARED
-# path where `kaix_drop_reuse_token` returns null on an aliased scrutinee
-# and the arm must dup the kept children. This fixture KEEPS the base
-# tree alive and inserts into it twice → shared nodes → the shared
-# branch fires. Both backends must agree and the trace must show
-# tok_null_shared > 0 (proving the path was taken).
-test-arm-top-reuse-shared: $(TARGET) build
-	@set -e; \
-	f=llvm_arm_top_reuse_shared; \
-	./$(TARGET) --path ../stdlib --emit=llvm ../examples/perceus/$$f.kai > build/$$f.ll \
-	  || { echo "arm-top-reuse-shared FAIL (kaic2 --emit=llvm errored)"; exit 1; }; \
-	clang -w -I ../stage2 -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-llvm $(LDLIBS_M) \
-	  || { echo "arm-top-reuse-shared FAIL (clang errored — IR ill-formed?)"; exit 1; }; \
-	./build/$$f-llvm > build/$$f-llvm.out \
-	  || { echo "arm-top-reuse-shared FAIL (LLVM binary errored at runtime)"; exit 1; }; \
-	diff -q ../examples/perceus/$$f.out.expected build/$$f-llvm.out > /dev/null \
-	  || { echo "arm-top-reuse-shared FAIL (LLVM output != golden):"; \
-	       diff ../examples/perceus/$$f.out.expected build/$$f-llvm.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib --emit=c ../examples/perceus/$$f.kai > build/$$f.c \
-	  && $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
-	  && ./build/$$f-c > build/$$f-c.out \
-	  || { echo "arm-top-reuse-shared FAIL (C backend build/run errored)"; exit 1; }; \
-	diff -q build/$$f-c.out build/$$f-llvm.out > /dev/null \
-	  || { echo "arm-top-reuse-shared FAIL (C vs LLVM diverged):"; \
-	       diff build/$$f-c.out build/$$f-llvm.out; exit 1; }; \
-	clang -w -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/$$f.ll ../stage0/runtime_llvm.c -o build/$$f-trace $(LDLIBS_M) \
-	  || { echo "arm-top-reuse-shared FAIL (trace build errored)"; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/$$f-trace 2> build/$$f-trace.err > /dev/null; \
-	shared=$$(grep -oE 'tok_null_shared=[0-9]+' build/$$f-trace.err | grep -oE '[0-9]+'); \
-	if [ -z "$$shared" ] || [ "$$shared" -eq 0 ]; then \
-	  echo "arm-top-reuse-shared FAIL (SHARED branch not exercised: tok_null_shared=$$shared — fixture no longer shares)"; \
-	  exit 1; \
-	fi; \
-	echo "arm-top-reuse-shared OK (SHARED token branch: tok_null_shared=$$shared; C == LLVM == golden)"
-
 # issue #187 phase 2 — fixtures for unified-algebraic-types resolver.
 # Each .kai under `examples/unions/` either compiles + runs to a known
 # stdout (positive cases — diffed against `<name>.out.expected`) or
@@ -5107,12 +4552,11 @@ test-rc-trace-callsite: $(TARGET) build
 # pinned so a regression in build_violation_msg_span trips a clear
 # test rather than a downstream user surprise.
 #
-# v3 (#86 piece 2): every fixture is exercised under BOTH backends. The
-# LLVM `SAssert` arm used to be a no-op (contracts never fired); it is
-# now wired and must produce byte-identical output to the C backend, so
-# each fixture is diffed against the same golden under C and LLVM. A
-# divergence (e.g. the `kaix_assert_check_with_value` IR declare drifting
-# from the runtime_llvm.c forwarder ABI) trips here.
+# v3 (#86 piece 2): the `SAssert` arm is wired and must produce the golden
+# output under the C backend; each fixture is diffed against its
+# `.run.err.expected` (negative: contract panics) or `.out.expected`
+# (positive). The native backend's parity is gated separately by the
+# native-vs-C ratchet (tools/test-backend-parity.sh).
 test-violations: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/refinements/*.kai; do \
@@ -5124,35 +4568,20 @@ test-violations: $(TARGET) build
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/viol-$$name.c -o build/viol-$$name $(LDLIBS_M) \
 	    || { echo "violations FAIL $$name (C compile failed)"; exit 1; }; \
 	  rc=0; ./build/viol-$$name > build/viol-$$name.out 2> build/viol-$$name.err || rc=$$?; \
-	  ./$(TARGET) --emit=llvm $$f > build/viol-$$name.ll \
-	    || { echo "violations FAIL $$name (kaic2 --emit=llvm errored)"; exit 1; }; \
-	  clang -w -I ../stage2 -I ../stage0 build/viol-$$name.ll ../stage0/runtime_llvm.c -o build/viol-$$name-llvm $(LDLIBS_M) \
-	    || { echo "violations FAIL $$name (LLVM compile failed)"; exit 1; }; \
-	  lrc=0; ./build/viol-$$name-llvm > build/viol-$$name-llvm.out 2> build/viol-$$name-llvm.err || lrc=$$?; \
 	  if [ -f $$exp_run_err ]; then \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "violations FAIL $$name (C: expected runtime panic, got success)"; exit 1; \
 	    fi; \
 	    diff -q $$exp_run_err build/viol-$$name.err > /dev/null \
+	      && echo "violations OK $$name (C panic match)" \
 	      || { echo "violations DIFF $$name (C panic)"; diff $$exp_run_err build/viol-$$name.err; exit 1; }; \
-	    if [ $$lrc -eq 0 ]; then \
-	      echo "violations FAIL $$name (LLVM: expected runtime panic, got success)"; exit 1; \
-	    fi; \
-	    diff -q $$exp_run_err build/viol-$$name-llvm.err > /dev/null \
-	      && echo "violations OK $$name (C + LLVM panic match)" \
-	      || { echo "violations DIFF $$name (LLVM panic)"; diff $$exp_run_err build/viol-$$name-llvm.err; exit 1; }; \
 	  elif [ -f $$exp_out ]; then \
 	    if [ $$rc -ne 0 ]; then \
 	      echo "violations FAIL $$name (C: unexpected runtime error)"; cat build/viol-$$name.err; exit 1; \
 	    fi; \
 	    diff -q $$exp_out build/viol-$$name.out > /dev/null \
+	      && echo "violations OK $$name (C out match)" \
 	      || { echo "violations DIFF $$name (C out)"; diff $$exp_out build/viol-$$name.out; exit 1; }; \
-	    if [ $$lrc -ne 0 ]; then \
-	      echo "violations FAIL $$name (LLVM: unexpected runtime error)"; cat build/viol-$$name-llvm.err; exit 1; \
-	    fi; \
-	    diff -q $$exp_out build/viol-$$name-llvm.out > /dev/null \
-	      && echo "violations OK $$name (C + LLVM out match)" \
-	      || { echo "violations DIFF $$name (LLVM out)"; diff $$exp_out build/viol-$$name-llvm.out; exit 1; }; \
 	  else \
 	    echo "violations SKIP $$name (no golden)"; \
 	  fi; \
@@ -5357,7 +4786,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-trmc-list-build test-issue-524 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-kir
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-kir
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
@@ -5375,7 +4804,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-llvm test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-unbox-llvm-bench test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-llvm-706 test-tco-llvm-709 test-tco-llvm-mixed test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-747 test-issue-747-mixed-slots test-arm-top-reuse-shared test-issue-668 test-trmc-list-build test-issue-524 test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-kir test-packages
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-kir test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
