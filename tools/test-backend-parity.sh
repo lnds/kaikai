@@ -1,31 +1,26 @@
 #!/bin/bash
-# tier1-backend-parity (issue #575).
+# Backend-parity harness — native vs C-direct (the oracle).
 #
 # bash (not sh): the xargs worker fan-out uses `export -f` to make
 # the worker function visible to forked subshells. dash (Ubuntu's
 # /bin/sh) rejects `export -f` as illegal; bash supports it.
 #
-# Build every entry-point fixture with both backends (C and LLVM),
-# run the resulting binaries, and assert that stdout + exit code
-# match. Diverge => fail.
+# Build every entry-point fixture with the TARGET backend and the
+# ORACLE backend, run the resulting binaries, and assert that stdout
+# + exit code match. Diverge => fail. The default gates the in-process
+# libLLVM `native` backend against C-direct (the portable oracle).
 #
 # SCOPE (design decision, 2026-05-27): this harness is FILE-MODE ONLY.
 # It builds each fixture as a standalone file (`kai build <file>`),
 # which does NOT read a kai.toml or resolve manifest dependencies. A
 # fixture that needs package-mode (deps, git sources) cannot build
-# here and is NOT a parity bug — its C<->LLVM parity is covered by
+# here and is NOT a parity bug — its parity is covered by
 # tools/test-packages.sh's `run_parity` (which builds in package mode
 # with `kai run .` under both backends, where the git-fixture setup
 # lives). The two harnesses split on the package/file axis on purpose;
 # do not add package-mode logic here.
 #
-# This generalizes tools/test-llvm-driver.sh — that script gates
-# the *driver* wiring (--backend flag, KAI_BACKEND env, clang
-# detection, precedence) on a hard-coded fixture list. This script
-# gates *every* fixture across the documented example dirs and
-# demos.
-#
-# Skip discipline (per #575 acceptance):
+# Skip discipline:
 #   1. tools/backend-parity-skips.txt — one line per skipped
 #      fixture: <relative-path>:<issue-number>:<one-line-reason>
 #      File a separate issue first; the skip is the bookmark, the
@@ -50,12 +45,12 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
 
-# Parametrised axis (Lane 1.5). The harness diffs a TARGET backend
-# against an ORACLE backend over the same corpus. Defaults reproduce the
-# original #575 C<->LLVM-text gate; set TARGET_BACKEND=native to gate the
-# in-process libLLVM backend (the Lane 1.5 default) against C-direct.
+# Parametrised axis. The harness diffs a TARGET backend against an
+# ORACLE backend over the same corpus. The default gates the in-process
+# libLLVM `native` backend against C-direct (the portable oracle); the
+# tier1-native workflow adds NATIVE_PARITY_RATCHET=1 to forbid new gaps.
 ORACLE_BACKEND="${ORACLE_BACKEND:-c}"
-TARGET_BACKEND="${TARGET_BACKEND:-llvm}"
+TARGET_BACKEND="${TARGET_BACKEND:-native}"
 
 case "$TARGET_BACKEND" in
   native)
