@@ -1,0 +1,54 @@
+# Native-parity regression: a tail-self-recursive fn that takes a LAMBDA
+# parameter and calls it (`f(h)`) must run in O(1) stack inside a fiber.
+#
+# `apply_loop` is in tail position (the recursive call is the whole arm
+# body; the `[f(h), ...acc]` cons is an argument, evaluated before the
+# call), so the backend rewrites it to a `tcrec` goto-loop — O(1) call
+# frames. The bug was NOT the goto-loop (it fired): the lambda call `f(h)`
+# lowers to `kaix_apply(clo, n, args)`, and the `[n x ptr]` `args` buffer
+# was `alloca`'d in the LOOP BODY block. An alloca re-executed every
+# iteration grows the stack each time (fixed size, but N times), so 40 K
+# iterations overflowed the fiber's 64 KiB stack — while the same call from
+# `main`'s 8 MiB OS stack succeeded (which is why it hid). The fix hoists
+# the arg-buffer alloca to the function entry block (one slot per frame,
+# reused across iterations), matching the C-direct oracle's frame-scoped
+# `KaiValue *args[n]`.
+#
+# A tail-self-call WITHOUT a lambda call (`copy_loop`) never emitted
+# `kaix_apply`, so it had no per-iteration alloca and always worked; this
+# fixture pairs the two to pin the lambda-param path specifically. Running
+# inside a fiber (bounded stack) is load-bearing — on the OS stack the
+# overflow needs millions of iterations and the regression would not show.
+
+import spawn
+
+fn apply_loop(xs: [Int], f: (Int) -> Int, acc: [Int]) : [Int] = match xs {
+  [] -> acc
+  [h, ...t] -> apply_loop(t, f, [f(h), ...acc])
+}
+
+fn copy_loop(xs: [Int], acc: [Int]) : [Int] = match xs {
+  [] -> acc
+  [h, ...t] -> copy_loop(t, [h, ...acc])
+}
+
+fn build(n: Int, acc: [Int]) : [Int] =
+  if n <= 0 { acc } else { build(n - 1, [n, ...acc]) }
+
+fn dbl(n: Int) : Int = n + n
+
+fn work() : Int / Spawn = {
+  let xs = build(40000, [])
+  let mapped = apply_loop(xs, dbl, [])   # lambda-param tail-loop, O(1) stack
+  let copied = copy_loop(xs, [])          # no-lambda tail-loop (control)
+  list.length(mapped) + list.length(copied)
+}
+
+fn main() : Int / Spawn + Stdout = {
+  let total = nursery { n ->
+    let f = n.spawn(work)
+    n.await(f)
+  }
+  Stdout.print("total: #{int_to_string(total)}")   # 40000 + 40000 = 80000
+  0
+}

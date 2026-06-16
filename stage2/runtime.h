@@ -11748,6 +11748,31 @@ static void *kai_llvm_build_alloca(void *b, void *ty, KaiValue *name) {
     if (name) kai_decref(name);
     return (void *) a;
 }
+/* Build a fixed-size alloca in the CURRENT function's entry block, then
+ * restore the builder to where it was. A call-site arg buffer (`kaix_apply`
+ * / `kaix_variant` / `kaix_record`) must NOT alloca in a loop body: a
+ * `tcrec`/TRMC goto-loop re-executes that block per iteration, so an alloca
+ * there grows the stack each iteration (fixed size, but N times) and a fiber
+ * (64 KiB stack) overflows after ~8 K iterations — issue #668's `list.map`
+ * inside a fiber. The C-direct oracle uses a frame-scoped `KaiValue *args[n]`
+ * (allocated once); this hoists the equivalent alloca to the entry block so
+ * the goto-loop reuses one slot, exactly the "every alloca is an entry-block
+ * alloca" invariant the named registers already follow. Inserts before the
+ * entry block's terminator (the `br` to the loop header is already built when
+ * a body block emits a call), so the module stays well-formed. */
+static void *kai_llvm_build_alloca_entry(void *cv, void *ty, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    LLVMBuilderRef b = (LLVMBuilderRef) c->b;
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock((LLVMValueRef) c->fnval);
+    LLVMValueRef first = LLVMGetFirstInstruction(entry);
+    if (first) LLVMPositionBuilderBefore(b, first);
+    else LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef a = LLVMBuildAlloca(b, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMPositionBuilderAtEnd(b, cur);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
 /* `alloca elem, count` — a runtime-sized stack buffer (the handle frame's
  * `jmp_buf`, whose `sizeof` is a runtime value via `kai_jmpbuf_size` rather
  * than a platform-specific N baked into the IR). `count` is an i64 Value. */
@@ -12221,6 +12246,7 @@ static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (voi
 static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_add_global_zeroed(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_alloca_entry(void *c, void *t, KaiValue *nm) { (void) c; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_load(void *b, void *t, void *p) { (void) b; (void) t; (void) p; return kai_llvm_native_unavailable(); }
