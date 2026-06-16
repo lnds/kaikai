@@ -25,12 +25,13 @@
 # start. Bare repos under tests/fixtures/git-fixtures/ must exist
 # (setup.sh regenerates them).
 #
-# C<->LLVM PARITY (design decision, 2026-05-27): this harness owns
+# BACKEND PARITY (design decision, 2026-05-27): this harness owns
 # package-mode backend parity. tools/test-backend-parity.sh is
 # file-mode only and cannot resolve a package's manifest deps, so the
-# `run_parity` pass below builds + runs each positive fixture under
-# BOTH backends and compares stdout. The two harnesses split on the
-# package/file axis: file-mode parity there, package-mode parity here.
+# `run_parity` pass below builds + runs each positive fixture under the
+# C and native backends and compares stdout. The two harnesses split on
+# the package/file axis: file-mode parity there, package-mode parity
+# here. The parity pass SKIPs when native is unavailable (C-only kaic2).
 
 set -eu
 
@@ -109,33 +110,40 @@ run_negative() {
   fi
 }
 
-# Parity: build + run the package with BOTH backends (C, LLVM) and
+# Parity: build + run the package with the C and native backends and
 # assert their stdout matches. This is the ONLY place package fixtures
-# get C<->LLVM parity coverage — the file-mode parity harness
+# get native-vs-C parity coverage — the file-mode parity harness
 # (tools/test-backend-parity.sh) cannot resolve a package's manifest
 # deps, so package parity lives here, where the git-fixture setup +
 # package-mode build already exist (decided 2026-05-27). `kai run .`
 # honors KAI_BACKEND, verified on local_path + auto_install.
+#
+# The native backend needs a kaic2 built with libLLVM (KAI_LLVM=1). When
+# it is absent (the C-only bootstrap that `tier1` uses), each fixture
+# SKIPs its parity check — never a failure — so the native column runs
+# only where libLLVM is present (tier1-native). $NATIVE_OK is probed once
+# below, before the parity block.
 # Args: <fixture-name> <run-dir-rel-to-PKG_DIR>
 run_parity() {
   name="$1"; dir="$2"
   abs_dir="$PKG_DIR/$dir"
   [ -d "$abs_dir" ] || { skip "$name" "no dir $dir"; return; }
+  [ "$NATIVE_OK" = "1" ] || { skip "$name" "native backend unavailable (build kaic2 with KAI_LLVM=1)"; return; }
   # Compare program STDOUT only. stderr carries the package-manager
   # preamble ("kai-pkg: resolving …", lockfile writes) and git-fixture
   # setup noise (awk warnings), which differs run-to-run (cache warm vs
   # cold) and is not program output. Drop stderr; filter any `kai:` /
   # `kai-pkg:` driver lines that reach stdout.
-  c_out="$(cd "$abs_dir" && KAI_BACKEND=c   "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
-  l_out="$(cd "$abs_dir" && KAI_BACKEND=llvm "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
-  if [ "$c_out" = "$l_out" ]; then
+  c_out="$(cd "$abs_dir" && KAI_BACKEND=c      "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
+  n_out="$(cd "$abs_dir" && KAI_BACKEND=native "$KAI" run . 2>/dev/null | grep -vE '^kai(-pkg)?:' || true)"
+  if [ "$c_out" = "$n_out" ]; then
     ok "$name"
   else
     err "$name"
     echo "    --- C backend ---" >&2
     echo "$c_out" | sed 's/^/    /' >&2
-    echo "    --- LLVM backend ---" >&2
-    echo "$l_out" | sed 's/^/    /' >&2
+    echo "    --- native backend ---" >&2
+    echo "$n_out" | sed 's/^/    /' >&2
   fi
 }
 
@@ -192,13 +200,29 @@ run_check_script "add_failure"        "add_failure/check.sh"
 run_check_script "init_invalid_names" "init_invalid_names/check.sh"
 run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
 
-# --- C<->LLVM parity for package builds ---
-# Each positive fixture above is also built + run under BOTH backends
-# and their stdout compared. This is the package-mode counterpart to
-# tools/test-backend-parity.sh (which is file-mode only and cannot
+# --- native-vs-C parity for package builds ---
+# Each positive fixture above is also built + run under the C and native
+# backends and their stdout compared. This is the package-mode counterpart
+# to tools/test-backend-parity.sh (which is file-mode only and cannot
 # resolve manifest deps). Covers the git-dep path (auto_install,
-# local_path) end to end under LLVM, which had no parity coverage.
-printf '%s\n' "-- package parity (C vs LLVM) --"
+# local_path) end to end under native, which the file-mode harness misses.
+#
+# Probe native availability ONCE: a C-only kaic2 (the bootstrap `tier1`
+# uses) rejects --backend=native with a known sentinel, so the parity
+# fixtures SKIP rather than fail. The real native-vs-C run happens in
+# tier1-native, where kaic2 is built with KAI_LLVM=1.
+NATIVE_OK=0
+_probe="$(mktemp)"; mv "$_probe" "$_probe.kai"; _probe="$_probe.kai"
+printf 'fn main() : Int = 0\n' > "$_probe"
+if "$KAI" build --backend=native "$_probe" -o "${_probe%.kai}.bin" >/dev/null 2>&1; then
+  NATIVE_OK=1
+fi
+rm -f "$_probe" "${_probe%.kai}.bin"
+if [ "$NATIVE_OK" = "1" ]; then
+  printf '%s\n' "-- package parity (native vs C) --"
+else
+  printf '%s\n' "-- package parity (native vs C) — SKIPPED, native backend unavailable --"
+fi
 run_parity  "parity-self_import"        "self_import/examples/demo"
 run_parity  "parity-transitive_privacy" "transitive_privacy/consumer"
 run_parity  "parity-local_path"         "local_path/app"
