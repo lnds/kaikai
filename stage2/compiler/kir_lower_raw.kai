@@ -15,17 +15,29 @@
 # recursion into `lower_expr`); `lower_expr_raw` lives in the Expr-SCC
 # `kir_lower_walk.kai`.
 #
-# SCOPE: REAL ONLY (asu, Camino A — the native-parity "Real box/unbox"
-# family). A node is raw-promoted iff it is `MUnboxed` AND typed `Real`, OR
-# it is a comparison / `and`/`or`/`not` whose RESULT is Bool but whose
-# OPERANDS are raw Real (a Real comparison yields a raw i1). Int/Bool/Char
-# nodes that are MUnboxed for OTHER reasons (a UFn call returning Bool, a
-# `Char == Char`, integer arith) stay on the boxed path: boxed Int/Bool ride
-# the tagged-immediate / singleton cache (immortal, no double-free), so the
-# raw treatment is unnecessary AND the f64 machinery (`real.unbox`, `f==`)
-# is wrong for a Char/Bool operand. The gate is the OPERAND type for a
-# logical/comparison node, never just the result type — `kir_binop_is_raw`
-# inspects the children so a `bool or bool` from two UFn calls never enters.
+# SCOPE: REAL + INT arith/cmp. A node is raw-promoted iff it is `MUnboxed`
+# AND a natively-raw FORM in one of two scalar families:
+#   - REAL (asu, Camino A — the native-parity "Real box/unbox" family): a
+#     Real literal/var, Real arith (`+ - * /`), unary `-`, a Real comparison,
+#     or a logical over raw-Real comparisons.
+#   - INT (P1, native Int unboxing): an Int literal/var, Int arith (`+ - *`
+#     only — `/` and `%` stay BOXED, see below), or an Int comparison
+#     (`< > <= >= == !=` over Int operands). Int arith yields a raw `i64`
+#     (native `add`/`sub`/`mul`, wrapping, NO nsw/nuw — kaikai Int wraps);
+#     an Int comparison yields a raw i1 (signed `icmp`), boxed only at a
+#     raw→boxed border. `/` and `%` are NOT a raw FORM: native `sdiv`/`srem`
+#     are UB on divide-by-zero AND `INT_MIN / -1`, so they cross back to the
+#     boxed `kaix_div`/`kaix_mod` at the `int.box` border (precedent: Real
+#     `%` also stays boxed). Bit-ops (`<<`, `&`, …) likewise stay boxed (no
+#     raw `i`-prim lowering for them in v1).
+# Char/Bool nodes that are MUnboxed for OTHER reasons (a UFn call returning
+# Bool, a `Char == Char`) stay on the boxed path: boxed Char/Bool ride the
+# singleton cache (immortal, no double-free), and the scalar machinery
+# (`real.unbox`/`int.box`, `f==`/`i==`) is wrong for a Char/Bool operand.
+# The gate is the OPERAND type for a comparison/logical node, never just the
+# result type — `kir_kind_is_raw` inspects the children, so a `bool or bool`
+# from two UFn calls never enters, and a comparison routes to the f-family
+# (Real operands) or the i-family (Int operands) by operand type.
 
 import compiler.ast
 import compiler.kir
@@ -80,23 +92,30 @@ fn kir_ty_is_int_t(t: Ty) : Bool = match t {
 pub fn kir_node_is_raw(x: Expr) : Bool =
   match x.mode { MUnboxed -> kir_kind_is_raw(x) _ -> false }
 
-# Int raw promotion FORMS: a literal (`EInt`) and a var (`EVar`). The
-# `let`-binder gate (`raw_let_slot`) uses these to bind a `MUnboxed` Int
-# raw `SInt64`, so the all-boxed KIR stops sharing one consuming cell across
-# N reads (the out-of-cache multi-use double-free that hung SHA-512). Int
-# arith / bit-ops are NOT a raw FORM (no native `i+`/`ishl` lowering); an Int
-# `EVar` / `EInt` reaching a BOXED consumer (a call arg, a `+`) crosses back
-# at the slot-driven border (`nemit_load_reg_boxed` → a fresh `kaix_int`),
-# the round-trip the C oracle's `kai_int(kair_x)` also pays. Real keeps its
-# full raw arith / cmp / logical set.
+# The natively-raw FORMS, by `.kind`. A literal / var is raw when its type
+# is Real or Int. Arithmetic is raw when typed Real (`f+ f- f* f/`) or Int
+# (`i+ i- i*` — `/`/`%` excluded, P1 guard #2). A comparison routes by
+# OPERAND type: Real operands → the f-family (yields a raw i1), Int operands
+# → the i-family (signed `icmp`). A logical (`and`/`or`/`not`) is raw when
+# its operands are raw (a comparison over either scalar). The gate inspects
+# children so a boxed-Char / boxed-Bool node never enters the scalar path.
 fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EReal(_, _) -> kir_ty_is_real(x.ty)
   EInt(_)     -> kir_ty_is_int(x.ty)
   EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty)
   ELitUnit(inner, _) -> kir_node_is_raw(inner)
+  # Arith routes by RESULT type, not op string: `+ - *` overlap the Real
+  # (`f`) and Int (`i`) families, so a type-blind `if op_is_freal { real }`
+  # would reject every Int `+`/`-`/`*` (its result is Int, not Real) before
+  # the Int branch ran. Gate on the type first: a Real-typed freal-arith is
+  # raw, an Int-typed iint-arith is raw (`/` excluded from the Int set).
   EBinop(op, a, b) ->
-    if kir_op_is_raw_freal_arith(op) { kir_ty_is_real(x.ty) }
-    else if kir_op_is_raw_cmp(op) { kir_ty_is_real(a.ty) and kir_ty_is_real(b.ty) }
+    if kir_ty_is_real(x.ty) { kir_op_is_raw_freal_arith(op) }
+    else if kir_ty_is_int(x.ty) { kir_op_is_raw_iint_arith(op) }
+    else if kir_op_is_raw_cmp(op) {
+      (kir_ty_is_real(a.ty) and kir_ty_is_real(b.ty)) or
+      (kir_ty_is_int(a.ty) and kir_ty_is_int(b.ty))
+    }
     else if kir_op_is_raw_logical(op) { kir_node_is_raw(a) and kir_node_is_raw(b) }
     else { false }
   EUnop(op, a) ->
@@ -129,6 +148,21 @@ pub fn kir_fbinop_op(op: String) : Int =
 pub fn kir_op_is_raw_freal_arith(op: String) : Bool =
   op == "+" or op == "-" or op == "*" or op == "/"
 
+# The `ibinop` opcode for a raw-Int arithmetic operator (matches the runtime
+# `kai_llvm_build_ibinop` switch: 0=add 1=sub 2=mul, all WRAPPING — no
+# nsw/nuw). `/` and `%` have NO raw form (sdiv/srem are UB on /0 and
+# INT_MIN/-1; they stay boxed), so they never reach here.
+pub fn kir_ibinop_op(op: String) : Int =
+  if op == "+" { 0 }
+  else if op == "-" { 1 }
+  else { 2 }
+
+# Is `op` a raw-Int arithmetic operator (one `ibinop` lowers)? `+ - *` only —
+# `/` and `%` are EXCLUDED (boxed `kaix_div`/`kaix_mod`; native sdiv/srem are
+# UB on divide-by-zero and INT_MIN/-1). Bit-ops likewise stay boxed in v1.
+pub fn kir_op_is_raw_iint_arith(op: String) : Bool =
+  op == "+" or op == "-" or op == "*"
+
 # The `fcmp` predicate code for a raw-Real comparison (matches the runtime
 # `kai_llvm_build_fcmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all ordered).
 pub fn kir_fcmp_pred(op: String) : Int =
@@ -139,7 +173,19 @@ pub fn kir_fcmp_pred(op: String) : Int =
   else if op == "==" { 4 }
   else { 5 }
 
-# Is `op` a comparison (one `fcmp`+widen lowers, on Real operands)?
+# The `icmp` predicate code for a raw-Int comparison (matches the runtime
+# `kai_llvm_build_icmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all SIGNED).
+pub fn kir_icmp_pred(op: String) : Int =
+  if op == "<" { 0 }
+  else if op == ">" { 1 }
+  else if op == "<=" { 2 }
+  else if op == ">=" { 3 }
+  else if op == "==" { 4 }
+  else { 5 }
+
+# Is `op` a comparison (one `fcmp`/`icmp`+widen lowers)? The SAME operator
+# set for Real and Int operands; `kir_kind_is_raw` routes to the f- or
+# i-family by operand type.
 pub fn kir_op_is_raw_cmp(op: String) : Bool =
   op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
 
@@ -155,9 +201,13 @@ pub fn kir_logical_op(op: String) : Int = if op == "and" { 1 } else { 0 }
 
 # The KIR prim NAME carrying a raw binary op. The native emitter
 # (`nemit_prim`) dispatches these to `llvm_build_fbinop` / `llvm_build_fcmp`
-# / the i1 logical builder rather than the boxed `kaix_*` helpers. The `f`
-# prefix keeps them distinct from the boxed `+`/`<` strings so a translator
-# never confuses the two; logical `and`/`or` get a `b` prefix (i1 domain).
+# / `llvm_build_ibinop` / `llvm_build_icmp` / the i1 logical builder rather
+# than the boxed `kaix_*` helpers. The `f` prefix marks the raw-Real family,
+# `i` the raw-Int family; both keep them distinct from the boxed `+`/`<`
+# strings so a translator never confuses the two; logical `and`/`or` get a
+# `b` prefix (i1 domain).
 pub fn kir_raw_arith_prim(op: String) : String = cat2("f", op)
 pub fn kir_raw_cmp_prim(op: String) : String = cat2("f", op)
 pub fn kir_raw_logical_prim(op: String) : String = cat2("b", op)
+pub fn kir_raw_iarith_prim(op: String) : String = cat2("i", op)
+pub fn kir_raw_icmp_prim(op: String) : String = cat2("i", op)
