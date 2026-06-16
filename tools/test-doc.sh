@@ -90,7 +90,7 @@ fi
 if "$KAI" doc nosuchmodule >/dev/null 2>&1; then
   fail "bad module should exit non-zero"
 fi
-"$KAI" doc nosuchmodule 2>&1 | grep -q "no stdlib module" \
-  || fail "bad module missing 'no stdlib module' hint"
+"$KAI" doc nosuchmodule 2>&1 | grep -qE "no module .* in the stdlib" \
+  || fail "bad module missing 'no module ... in the stdlib' hint"
 
 echo "test-doc: OK — --help clean, doc list/module/symbol views, sig field, error paths"
