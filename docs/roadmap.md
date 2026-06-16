@@ -493,7 +493,7 @@ platforms.
 - WASM — runtime target with appropriate size + JIT-friendly
   emit constraints.
 - LLVM mirrors for Phase 2 + TCO — close the gap where
-  `--emit=llvm` binaries don't yet receive the speedups that
+  `--backend=native` binaries don't yet receive the speedups that
   `--emit=c` enjoys. Currently deferred per issue #87 and the
   closed issue #42.
   *(Optimization thread for this milestone.)*
@@ -508,7 +508,7 @@ platforms.
 
 1. CI matrix runs all 5 platforms (the founding two plus
    Linux arm64, macOS x86_64, Windows, WASM).
-2. `--emit=llvm` binaries reach inner-loop perf parity with
+2. `--backend=native` binaries reach inner-loop perf parity with
    `--emit=c` binaries.
 3. Profiling tooling exposes per-fn alloc / time / RC
    breakdown.

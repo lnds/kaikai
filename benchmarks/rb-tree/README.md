@@ -80,9 +80,16 @@ RC traffic. Quote whichever you mean, and say which.
 | kaikai-c     | 0.41s | 1.58x | 1.64x | 55.2 |
 | **kaikai-llvm** | **0.79s** | **3.04x** | **3.16x** | **55.4** |
 
-`kaikai-llvm` is the `--emit=llvm` backend (clang -O2 + `runtime_llvm.c`),
-`kaikai-c` the default C backend. The two share the front-end; the gap is
-pure code-generation.
+> **Historical (kaikai-llvm column).** The `kaikai-llvm` rows below recorded
+> the now-retired llvm-text backend (`--emit=llvm` + clang -O2 +
+> `runtime_llvm.c`), removed 2026-06-16. `run.sh` now measures a
+> `kaikai-native` column instead — the in-process libLLVM backend
+> (`--backend=native`, no `.ll` text, no clang) that replaced it. The rows
+> here are kept as a point-in-time record; re-run `run.sh` for current
+> native-vs-C numbers.
+
+`kaikai-c` is the default C backend; the two columns share the front-end, so
+the gap is pure code-generation.
 
 **Instruction count, Docker callgrind, N=100,000 (the perf-lane truth):**
 
