@@ -196,12 +196,16 @@ fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
     }
   }
 
-# A KIR raw-op prim name (the `f`/`b` family kir_lower_raw plants). These
-# never reach the boxed `kaix_*` dispatch — they emit native instructions.
+# A KIR raw-op prim name (the `f`/`i`/`b` family kir_lower_raw plants).
+# These never reach the boxed `kaix_*` dispatch — they emit native
+# instructions. `int.unbox` joins the box/unbox borders; the `i`-family
+# arith/cmp join the f-family.
 fn nprim_is_raw(nm: String) : Bool =
-  nm == "real.box" or nm == "bool.box" or nm == "int.box" or nm == "real.unbox" or
+  nm == "real.box" or nm == "bool.box" or nm == "int.box" or
+  nm == "real.unbox" or nm == "int.unbox" or
   nm == "fneg" or nm == "bnot" or nm == "band" or nm == "bor" or
-  nprim_raw_fbinop_op(nm) >= 0 or nprim_raw_fcmp_pred(nm) >= 0
+  nprim_raw_fbinop_op(nm) >= 0 or nprim_raw_fcmp_pred(nm) >= 0 or
+  nprim_raw_ibinop_op(nm) >= 0 or nprim_raw_icmp_pred(nm) >= 0
 
 # The `fbinop` opcode for a raw-Real arith prim (`f+`/`f-`/`f*`/`f/`), or -1.
 fn nprim_raw_fbinop_op(nm: String) : Int =
@@ -214,14 +218,28 @@ fn nprim_raw_fcmp_pred(nm: String) : Int =
   else if nm == "f>=" { 3 } else if nm == "f==" { 4 } else if nm == "f!=" { 5 }
   else { -1 }
 
-# Emit one raw op. Arith yields an `f64`; cmp yields a raw i32 (the `fcmp`
-# i1 widened, so it stores in the i32 `SBool` register); logical operates on
-# the i32 0/1 form; the borders box/unbox the scalar.
+# The `ibinop` opcode for a raw-Int arith prim (`i+`/`i-`/`i*`), or -1.
+# `/`/`%` have no raw form (boxed `kaix_div`/`kaix_mod`).
+fn nprim_raw_ibinop_op(nm: String) : Int =
+  if nm == "i+" { 0 } else if nm == "i-" { 1 } else if nm == "i*" { 2 }
+  else { -1 }
+
+# The `icmp` predicate for a raw-Int comparison prim, or -1.
+fn nprim_raw_icmp_pred(nm: String) : Int =
+  if nm == "i<" { 0 } else if nm == "i>" { 1 } else if nm == "i<=" { 2 }
+  else if nm == "i>=" { 3 } else if nm == "i==" { 4 } else if nm == "i!=" { 5 }
+  else { -1 }
+
+# Emit one raw op. Real arith yields an `f64`; Int arith yields an `i64`;
+# cmp yields a raw i32 (the `fcmp`/`icmp` i1 widened, so it stores in the
+# i32 `SBool` register); logical operates on the i32 0/1 form; the borders
+# box/unbox the scalar.
 fn nemit_raw_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   if nm == "real.box" { nemit_raw_box(ctx, "kaix_real", native_ctx_f64t(ctx), cargs) }
   else if nm == "bool.box" { nemit_raw_box(ctx, "kaix_bool", native_ctx_i32t(ctx), cargs) }
   else if nm == "int.box" { nemit_raw_box(ctx, "kaix_int", native_ctx_i64t(ctx), cargs) }
   else if nm == "real.unbox" { nemit_raw_unbox(ctx, cargs) }
+  else if nm == "int.unbox" { nemit_raw_int_unbox(ctx, cargs) }
   else if nm == "fneg" { nemit_raw_unary(ctx, "fneg", cargs) }
   else if nm == "bnot" { nemit_raw_unary(ctx, "lnot", cargs) }
   else if nm == "band" { nemit_raw_logical(ctx, 1, cargs) }
@@ -229,7 +247,15 @@ fn nemit_raw_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   else {
     let fop = nprim_raw_fbinop_op(nm)
     if fop >= 0 { nemit_raw_fbinop(ctx, fop, cargs) }
-    else { nemit_raw_fcmp(ctx, nprim_raw_fcmp_pred(nm), cargs) }
+    else {
+      let iop = nprim_raw_ibinop_op(nm)
+      if iop >= 0 { nemit_raw_ibinop(ctx, iop, cargs) }
+      else {
+        let fp = nprim_raw_fcmp_pred(nm)
+        if fp >= 0 { nemit_raw_fcmp(ctx, fp, cargs) }
+        else { nemit_raw_icmp(ctx, nprim_raw_icmp_pred(nm), cargs) }
+      }
+    }
   }
 
 # `<op>(a, b)` raw `f64` arithmetic → one `fbinop` instruction. Both atoms
@@ -248,6 +274,27 @@ fn nemit_raw_fcmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = ma
     llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
   }
   _ -> { nemit_unsupported(ctx, "raw fcmp arity"); nemit_null(ctx) }
+}
+
+# `<op>(a, b)` raw `i64` arithmetic → one `ibinop` instruction (wrapping
+# add/sub/mul — NO nsw/nuw). Both atoms load raw at `SInt64`. No buffer, no
+# call, no RC: a raw `i64` has no refcount, so a multi-use Int operand never
+# double-frees (the `let`-binder family's bug, here for arith).
+fn nemit_raw_ibinop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> llvm_build_ibinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
+  _      -> { nemit_unsupported(ctx, "raw ibinop arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` raw `i64` SIGNED comparison → `icmp` (i1) widened to i32, so
+# the result stores in the i32 `SBool` register and feeds `kaix_bool` / a
+# condbr uniformly (mirror of `nemit_raw_fcmp`). Operands load raw at
+# `SInt64`.
+fn nemit_raw_icmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_icmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw icmp arity"); nemit_null(ctx) }
 }
 
 # `and`/`or` over two raw i32 0/1 booleans → the i1-domain `logical`
@@ -281,6 +328,16 @@ fn nemit_raw_box(ctx: Handle, sym: String, pty: Handle, cargs: [KVal]) : Handle 
 fn nemit_raw_unbox(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
   [a] -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, a))
   _   -> { nemit_unsupported(ctx, "raw unbox arity"); nemit_null(ctx) }
+}
+
+# Unbox-borrow a boxed Int to its raw `i64` (`kaix_int_field` → `kai_intf`,
+# handling the tagged-immediate / bignum forms, NO decref). The box→raw
+# border (`(boxed)->as.i` in the oracle): non-consuming, so the box stays
+# owned by its binding for the normal drop. Mirror of `nemit_raw_unbox`,
+# and of the register-side `nemit_load_reg_as_int`.
+fn nemit_raw_int_unbox(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, a))
+  _   -> { nemit_unsupported(ctx, "raw int unbox arity"); nemit_null(ctx) }
 }
 
 # `<sym>(ptr rec, i8* name) -> ptr` (`kaix_field` owned / `kaix_field_borrow`

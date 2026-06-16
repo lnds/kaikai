@@ -342,14 +342,36 @@ fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
   KTrmcApply(leaf, _)   -> nemit_trmc_apply(ctx, leaf)
 }
 
-# `condbr`: the cond is a boxed Bool; `kaix_truthy` lowers it to i32 0/1,
-# then `icmp ne 0` to the i1 LLVM wants.
+# `condbr`: branch the current block to `tl`/`el` on the condition.
+#
+# Guard #3 (P1) — when the condition is a RAW `SBool`/`SInt32` register (a
+# raw comparison/bool the lowering left unboxed, `lower_if`'s raw branch),
+# read the i32 0/1 DIRECTLY and `icmp ne 0` it to the i1 — skipping the
+# `bool.box` (`kaix_bool`) + `kaix_truthy` round-trip a boxed condition
+# pays. The `i==0` / `i<N` loop header then issues NO call. A BOXED
+# condition (the default — a boxed Bool, a variant-tag bool, a UFn-call
+# result) goes through `kaix_truthy` (reads `as.b`, handles non-Bool
+# truthiness) as before. The slot of a `KVar` condition decides; a raw
+# `KBoolV` literal materialises its i32 directly.
 fn nemit_condbr(ctx: Handle, c: KVal, tl: String, el: String) : Unit / Console = {
-  let cv = nemit_atom(ctx, c)
-  let truthy = nemit_truthy_i32(ctx, cv)
-  let i1 = llvm_build_icmp_ne_zero(native_ctx_b(ctx), truthy, native_ctx_i32t(ctx))
+  let i32t = native_ctx_i32t(ctx)
+  let i1 = if ncond_is_raw_bool(ctx, c) {
+    llvm_build_icmp_ne_zero(native_ctx_b(ctx), nemit_atom_raw(ctx, c, SBool), i32t)
+  } else {
+    llvm_build_icmp_ne_zero(native_ctx_b(ctx), nemit_truthy_i32(ctx, nemit_atom(ctx, c)), i32t)
+  }
   llvm_build_cond_br(native_ctx_b(ctx), i1, native_ctx_find_block(ctx, tl), native_ctx_find_block(ctx, el))
   ()
+}
+
+# Is the condition a RAW i32 bool — a `KVar` of an `SBool` (tag 3) / `SInt32`
+# (tag 4) register, or a raw `KBoolV` literal? Such a condition was lowered
+# unboxed (guard #3); the condbr reads its i32 directly. A `KVar` of a boxed
+# register (slot `SBoxed`), or any other atom, is NOT raw.
+fn ncond_is_raw_bool(ctx: Handle, c: KVal) : Bool = match c {
+  KVar(n)   -> { let s = native_ctx_reg_slot(ctx, n); s == 3 or s == 4 }
+  KBoolV(_) -> true
+  _         -> false
 }
 
 # `kaix_truthy(ptr) -> i32` — the non-consuming truthiness predicate.
