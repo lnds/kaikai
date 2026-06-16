@@ -198,52 +198,84 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
   LRes(KUnitV, st)
 }
 
-# --- raw (unboxed) Real lowering (asu, Camino A) -----------------------
+# --- raw (unboxed) Real/Int lowering (asu, Camino A + P1) --------------
 #
-# Lower `x` in RAW position: the result is a raw `f64` value (an `SReal`
-# register or a `KRealV` literal the emitter materialises with
-# `llvm_const_real`), NOT a boxed `ptr`. Mirror of the C-direct oracle's
-# `emit_expr_raw` / `emit_kind_raw`, restricted to Real (kir_lower_raw
+# Lower `x` in RAW position: the result is a raw scalar — an `f64` (`SReal`)
+# for Real, an `i64` (`SInt64`) for Int, or an i1/i32 (`SBool`) for a
+# comparison — NOT a boxed `ptr`. Mirror of the C-direct oracle's
+# `emit_expr_raw` / `emit_kind_raw`, over Real + Int arith/cmp (kir_lower_raw
 # SCOPE). Two cases by `.mode`:
 #   - `MUnboxed` node → it IS a natively-raw form (literal / raw EVar / raw
 #     arith / raw cmp / raw neg): emit the raw op directly, no boxing.
 #   - any other node in raw position → a BOXED value read raw (the box→raw
-#     border, e.g. `self.re` field access): lower boxed then unbox-borrow
-#     (`real.unbox` → `kaix_real_field`, non-consuming, the oracle's bare
-#     `(boxed)->as.r`).
+#     border, e.g. `self.re` field access, or an Int-returning UFn call in
+#     an arith chain): lower boxed then unbox-borrow by type
+#     (`real.unbox` → `kaix_real_field` / `int.unbox` → `kaix_int_field`,
+#     non-consuming, the oracle's bare `(boxed)->as.r` / `(boxed)->as.i`).
 # The mutual recursion `lower_expr ↔ lower_expr_raw` is why this lives in
 # the Expr-SCC (not the pure `kir_lower_raw` helper module).
 fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console =
   match x.mode {
     MUnboxed -> lower_expr_raw_kind(x, st)
-    _        -> lower_real_unbox_border(x, st)
+    _        -> lower_scalar_unbox_border(x, st)
   }
 
-# A boxed Real read in raw position: lower it boxed, then unbox-borrow the
-# `f64` payload (`real.unbox`). NON-consuming — the box stays owned by its
-# binding for the normal drop, exactly like the oracle's `(boxed)->as.r`.
-fn lower_real_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
-  match lower_expr_boxed(x, st) {
-    LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x))
+# A boxed scalar read in raw position: lower it boxed, then unbox-borrow its
+# raw payload. The border is TYPE-DRIVEN — an Int node crosses through
+# `int.unbox` (→ `kaix_int_field`, slot `SInt64`), any other (Real)
+# through `real.unbox` (→ `kaix_real_field`, slot `SReal`). NON-consuming
+# in both cases — the box stays owned by its binding for the normal drop
+# (the oracle's bare `(boxed)->as.i` / `(boxed)->as.r`). A Real-only border
+# would `real.unbox` a boxed Int (`kaix_real_field` reading `as.r` off an
+# Int) — a silent miscompile; the type gate prevents it.
+fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
+  if kir_ty_is_int(x.ty) {
+    match lower_expr_boxed(x, st) {
+      LRes(bv, st1) -> bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(x))
+    }
+  } else {
+    match lower_expr_boxed(x, st) {
+      LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x))
+    }
   }
 
 # The natively-raw forms (the `MUnboxed` kinds the unbox pass produces).
-# Arithmetic / neg yield `SReal`; comparison / logical yield `SBool`.
-# Anything else falls back to the box→raw border (a defensive unbox of its
-# boxed form) — never a silent miscompile.
+# Real arith / neg yield `SReal`; Int arith yields `SInt64`; comparison /
+# logical yield `SBool`. A comparison routes to the f- or i-prim by OPERAND
+# type. Anything else falls back to the type-driven box→raw border (a
+# defensive unbox of its boxed form) — never a silent miscompile.
 fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EReal(r, _) -> LRes(KRealV(r), st)
   EInt(n)     -> LRes(KIntV(n), st)
   EBool(b)    -> LRes(KBoolV(b), st)
   EVar(name)  -> lower_var(name, st)
   ELitUnit(inner, _) -> lower_expr_raw(inner, st)
+  # Arith routes by RESULT type (mirror of `kir_kind_is_raw`): a Real-typed
+  # node lowers the f-family (`f+`, `SReal`), an Int-typed node the i-family
+  # (`i+`, `SInt64`). Routing by op string alone would send Int `+` down the
+  # Real `f+` path (a miscompile — `fadd` over i64 operands). A comparison
+  # routes by OPERAND type (its result is Bool, not the scalar).
   EBinop(op, a, b) ->
-    if kir_op_is_raw_freal_arith(op) { lower_raw_binop(x, kir_raw_arith_prim(op), SReal, a, b, st) }
-    else if kir_op_is_raw_cmp(op) { lower_raw_binop(x, kir_raw_cmp_prim(op), SBool, a, b, st) }
+    if kir_ty_is_real(x.ty) and kir_op_is_raw_freal_arith(op) {
+      lower_raw_binop(x, kir_raw_arith_prim(op), SReal, a, b, st)
+    }
+    else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
+      lower_raw_binop(x, kir_raw_iarith_prim(op), SInt64, a, b, st)
+    }
+    else if kir_op_is_raw_cmp(op) {
+      if kir_ty_is_int(a.ty) { lower_raw_binop(x, kir_raw_icmp_prim(op), SBool, a, b, st) }
+      else { lower_raw_binop(x, kir_raw_cmp_prim(op), SBool, a, b, st) }
+    }
     else if kir_op_is_raw_logical(op) { lower_raw_binop(x, kir_raw_logical_prim(op), SBool, a, b, st) }
-    else { lower_real_unbox_border(x, st) }
+    else { lower_scalar_unbox_border(x, st) }
+  # Unary `-` is raw ONLY for Real (`fneg` over f64); an Int `-x` has no raw
+  # `ineg` form in v1, so it crosses the box→raw border (boxed `kaix_neg`
+  # then `int.unbox`). Routing every `-` to `fneg`/`SReal` would emit
+  # `fneg ptr` over a boxed/i64 operand (the `int_cache_reuse_bump` crash:
+  # a raw-Int `seen == -1` recursing into the `-1` unop). `not` stays raw
+  # (i1 over a raw bool).
   EUnop(op, a) ->
-    if op == "-" {
+    if op == "-" and kir_ty_is_real(x.ty) {
       match lower_expr_raw(a, st) {
         LRes(av, st1) -> bind_op_slot(st1, KPrim("fneg", [av]), SReal, kpos_of(x))
       }
@@ -251,19 +283,20 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
       match lower_expr_raw(a, st) {
         LRes(av, st1) -> bind_op_slot(st1, KPrim("bnot", [av]), SBool, kpos_of(x))
       }
-    } else { lower_real_unbox_border(x, st) }
+    } else { lower_scalar_unbox_border(x, st) }
   # A single-tail block transparently wraps its raw tail (no preceding
   # statements). A multi-statement block, or any other shape, is not a
   # natively-raw form: lower it boxed then unbox-borrow at the border.
   EBlock(stmts, tail) ->
     match stmts {
-      [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_real_unbox_border(x, st) }
-      _  -> lower_real_unbox_border(x, st)
+      [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_scalar_unbox_border(x, st) }
+      _  -> lower_scalar_unbox_border(x, st)
     }
   # The guard (`kir_node_is_raw`) only admits the FORMS above, so this arm is
   # reached only via internal recursion on a sub-operand the unbox pass left
-  # boxed — lower it boxed and unbox-borrow its f64 (the box→raw border).
-  _ -> lower_real_unbox_border(x, st)
+  # boxed — lower it boxed and unbox-borrow its raw scalar (the box→raw
+  # border, by type).
+  _ -> lower_scalar_unbox_border(x, st)
 }
 
 # `a <op> b` raw binary op → one native instruction over two raw operands.
@@ -610,8 +643,20 @@ fn bind_let_as(pat: Pattern, name: String, v: KVal, st: LowerSt) : LowerSt / Con
 # `if c { t } else { e }`: condbr to two forked blocks, each storing its
 # arm into a shared join register, then both branch to a continuation. The
 # condition lowers here; the block-building (flat) is `lower_if_blocks`.
+#
+# Guard #3 (P1) — a RAW comparison/bool condition lowers RAW (an `SBool`
+# i32 0/1 register), NOT boxed. The backend's `nemit_condbr` then branches
+# on the i32 directly (`icmp ne 0`), skipping the `bool.box` (`kaix_bool`) +
+# `kaix_truthy` round-trip the boxed path pays — the `i==0` / `i<N` loop
+# header empties of calls. A non-raw (boxed Bool) condition keeps the boxed
+# path. The `bind_op_slot(SBool)` inside `lower_expr_raw` yields a `KVar` of
+# an `SBool` register; `nemit_condbr` reads the slot to pick its lowering.
 fn lower_if(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console {
-  match lower_expr(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, st1) }
+  if kir_node_is_raw(c) {
+    match lower_expr_raw(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, st1) }
+  } else {
+    match lower_expr(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, st1) }
+  }
 }
 
 # The `join` register is materialised with a `KLet` BEFORE the condbr so a
