@@ -11886,6 +11886,45 @@ static void *kai_llvm_build_lnot(void *b, void *a) {
 static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) {
     return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) i32ty, "");
 }
+/* Raw `i64` arithmetic for the unboxed-Int path (KIR mode-slave to the
+ * unbox pass). `op`: 0=`add`, 1=`sub`, 2=`mul` — matching the C-direct
+ * oracle's `kair_a + kair_b` on a raw `int64_t`. NO `nsw`/`nuw` flags:
+ * kaikai Int arithmetic WRAPS (the C emitter casts through `uint64_t`), so
+ * signed overflow must be defined two's-complement wrap, not UB the
+ * optimiser could exploit. The plain `LLVMBuildAdd`/`Sub`/`Mul` emit
+ * wrapping ops (no-wrap flags unset). `/` and `%` stay BOXED (native
+ * `sdiv`/`srem` are UB on divide-by-zero AND `INT_MIN/-1`; the boxed
+ * `kaix_div`/`kaix_mod` handle both — a raw operand crosses back at the
+ * `int.box` border first). Operands + result are `i64`, NOT boxed Ints:
+ * no RC, so the use-after-free the boxed path hit on a multi-use raw
+ * operand cannot arise. */
+static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    switch (op) {
+        case 0:  return (void *) LLVMBuildAdd(bld, la, lc, "");
+        case 1:  return (void *) LLVMBuildSub(bld, la, lc, "");
+        default: return (void *) LLVMBuildMul(bld, la, lc, "");
+    }
+}
+/* Raw `i64` SIGNED comparison → an `i1`. `pred`: 0=`<`, 1=`>`, 2=`<=`,
+ * 3=`>=`, 4=`==`, 5=`!=` — the signed (`S*`) family, matching the C
+ * `<`/`==` on a raw `int64_t`. The result is the `i1` a `condbr` consumes
+ * directly, or the caller boxes via `kaix_bool` at a raw→boxed border. */
+static void *kai_llvm_build_icmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMIntPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMIntSLT; break;
+        case 1:  p = LLVMIntSGT; break;
+        case 2:  p = LLVMIntSLE; break;
+        case 3:  p = LLVMIntSGE; break;
+        case 4:  p = LLVMIntEQ;  break;
+        default: p = LLVMIntNE;  break;
+    }
+    return (void *) LLVMBuildICmp(bld, p, la, lc, "");
+}
 
 /* --- constants + globals --- */
 static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
@@ -12197,6 +12236,8 @@ static void *kai_llvm_build_fneg(void *b, void *a) { (void) b; (void) a; return 
 static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_lnot(void *b, void *a) { (void) b; (void) a; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_icmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_fnval(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
