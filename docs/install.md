@@ -21,18 +21,21 @@ kaikai targets native binaries via one of two backends:
 
 | Backend  | Toolchain        | When it runs       |
 |----------|------------------|--------------------|
-| `c`      | `cc`             | Default — portable C with the in-tree runtime header. The bootstrap path and the parity oracle, supported across the whole corpus. |
-| `native` | in-process libLLVM | Opt-in. Builds the LLVM module via the C API and emits a native object directly (no `.ll` text, no `clang`). The intended default destination; opt-in until native-vs-C parity is complete. Needs a `kaic2` built with libLLVM (`make -C stage2 KAI_LLVM=1`). |
+| `native` | in-process libLLVM | **Default.** Builds the LLVM module via the C API and emits a native object directly (no `.ll` text, no `clang`). libLLVM is linked into `kaic2` (statically in a release), so it runs with no system LLVM. Needs a `kaic2` built with libLLVM (`make -C stage2 KAI_LLVM=1`; release tarballs ship one). |
+| `c`      | `cc`             | Portable C with the in-tree runtime header. The bootstrap path and the parity oracle, supported across the whole corpus. Select with `--backend=c`. |
 
 `kai` resolves the backend at every invocation:
 
 1. The `--backend=<c|native>` CLI flag wins, if passed.
 2. Otherwise, the `KAI_BACKEND` environment variable wins (must be
    `c` or `native`; anything else is an error).
-3. Otherwise the default is `c`.
+3. Otherwise the default is `native`.
 
-A `kaic2` built without libLLVM rejects `native` with an actionable
-error — it never silently falls back to C.
+A `kaic2` built without libLLVM (the cc-only bootstrap) cannot run
+`native`. When `native` is the *implicit* default, such a `kaic2`
+degrades to `c` with a note, so a checkout without LLVM keeps building.
+An *explicit* `--backend=native` / `KAI_BACKEND=native` on that `kaic2`
+errors instead — it never silently falls back on an explicit request.
 
 ### Forcing the C path
 
@@ -52,41 +55,24 @@ export KAI_BACKEND=c
 | `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
 | `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib preludes. |
 
-## Getting clang
+## The native backend and libLLVM
 
-The LLVM backend needs `clang` on `PATH`. The brew formula does not
-declare `depends_on "llvm"` — installation is opportunistic: if clang
-is around kai uses it, otherwise the C path keeps working.
+The native backend does **not** shell out to `clang` and does **not**
+need a system LLVM on `PATH`. It builds the LLVM module in-process via
+the C API, and libLLVM is linked directly into `kaic2` — statically in a
+release tarball / brew install. The brew formula therefore declares no
+`depends_on "llvm"`: a `kai` installed from a release runs the native
+default out of the box.
 
-### macOS
+A C compiler (`cc`) is still needed to link the emitted native object
+against the runtime and to drive the C backend; the Xcode Command Line
+Tools (macOS) or your distro's `build-essential` / `gcc` (Linux) provide
+it.
 
-clang ships with the Xcode Command Line Tools and is on `PATH` by
-default once they are installed:
-
-```sh
-xcode-select --install
-```
-
-No further action needed — `kai build hello.kai` will auto-detect
-clang and pick the LLVM backend.
-
-### Linux
-
-Install clang from your distro:
-
-```sh
-# Debian / Ubuntu
-sudo apt install clang
-
-# Fedora / RHEL
-sudo dnf install clang
-
-# Arch
-sudo pacman -S clang
-```
-
-The C path is always available regardless; clang is the speed-up, not
-a prerequisite.
+If you build `kaic2` yourself from a checkout, native capability is
+auto-detected from `llvm-config`: present → native-capable, absent →
+a cc-only `kaic2` whose implicit default degrades to the C backend.
+Force it on with `make -C stage2 KAI_LLVM=1`.
 
 ### Windows
 
