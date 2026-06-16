@@ -371,8 +371,8 @@ in.
      `emit_call_expr`'s op-dispatch branch, `emit_clause_*`,
      and the default-handler wrapper to LLVM IR. End state:
      `m7a_*.kai` and `m7b_*.kai` demos round-trip identically
-     between `--emit=c` and `--emit=llvm`, and
-     `bench-effects` runs against the LLVM-emitted binary as
+     between `--emit=c` and `--backend=native`, and
+     `bench-effects` runs against the native-emitted binary as
      well as the C one. Re-measure Doc C OQ #6 — hypothesis:
      ratio drops from m7a's ~4× (vs C-direct on `gcc -O2`)
      toward ~2× because the LLVM optimiser can see through
@@ -952,8 +952,8 @@ informal "MVP" labels used in earlier planning snapshots.
   in-flight external demos (`/tmp/kaikai-portfolio-demo`).
 - m12 self-host checkpoint: byte-identical fixed-point of
   `kaic2 stage2/compiler.kai`.
-- Both backends (`--emit=c`, `--emit=llvm`) at parity for every
-  shipped feature.
+- Both backends (`--emit=c` C-direct, `--backend=native` in-process
+  libLLVM) at parity for every shipped feature.
 
 State as of 2026-04-26: m12.8 protocols + #derive(records) landed
 (`1cf1183`); m12.8-cleanup round 1 in flight; m12.8.x and round 2

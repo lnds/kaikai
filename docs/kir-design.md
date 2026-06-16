@@ -32,12 +32,17 @@ reach every consumer.
 
 ## 1. Why this exists
 
-Stage 2 has two emitters that walk the **same** post-perceus `[Decl]`
-independently:
+Stage 2 has two backends that walk the **same** post-perceus `[Decl]`:
 
 - `emit_program(...)` → C (default backend, `--emit=c` / `c-modular`).
-- `emit_program_llvm(path, src, raw_decls, regions)` → LLVM IR (`--emit=llvm`,
-  opt-in today).
+- the in-process libLLVM **native** backend (`--emit=native` /
+  `--backend=native`): lowers to KIR, builds the LLVM module via the C
+  API, and emits a native object — no `.ll` text. Opt-in until its
+  native-vs-C parity ratchet reaches zero.
+
+(The earlier `emit_program_llvm` `.ll`-text frontend — `--emit=llvm` — was
+removed once the in-process backend's C-API binding was written; see the
+retirement note below.)
 
 `emit_shared.kai` (~160 fns) shares **analysis**, not **lowering**: symbol
 resolution (`c_sym`, `efn_resolve`, `fns_filter_*`), variant tags
@@ -473,6 +478,13 @@ and stays untouched as the oracle. Everything else is off the critical path.**
 >   not emit `.ll` text at all. The existing `--emit=llvm` text path is left AS
 >   IS (untouched), useful only as a *read-only reference* for which LLVM
 >   instructions each construct produces while writing the C-API binding.
+>   **(Retired 2026-06-16.)** That read-only-reference role was over once the
+>   in-process backend's C-API binding was written; with native at full
+>   native-vs-C parity its frozen `.ll` path was dead weight whose stale
+>   failures kept a gate red without protecting anything. `emit_llvm.kai`,
+>   `--emit=llvm`, `--backend=llvm`, and the C↔LLVM-text parity gate were
+>   removed. `stage0/runtime_llvm.c` stays — it is the shared `kaix_prelude_*`
+>   forwarder the native backend links against.
 > - **C-direct is the sufficient oracle.** It is mature (1.78 fix/KLOC), already
 >   the differential safety net, and validates behaviour ("same program, same
 >   output"). A second LLVM-text oracle adds nothing C-direct doesn't already
@@ -646,8 +658,9 @@ grow, not after.
     (`--backend=native` / `KAI_BACKEND=native`); a C-only kaic2 rejects it
     with an actionable error (no silent fallback to C).
   - `tools/test-backend-parity.sh` parametrised (`TARGET_BACKEND`/
-    `ORACLE_BACKEND`) — one harness for both the #575 C↔LLVM-text gate and
-    native-vs-C; plus a `NATIVE_PARITY_RATCHET=1` mode.
+    `ORACLE_BACKEND`) — now gates native-vs-C (the C↔LLVM-text gate it once
+    also served was removed with the llvm-text backend); plus a
+    `NATIVE_PARITY_RATCHET=1` mode.
   - `tools/native-parity-baseline.txt` — the 167-gap anti-regression
     ratchet (a new gap fails CI; the baseline only tightens). The flip
     re-runs when this file is empty.
@@ -680,9 +693,10 @@ grow, not after.
 > It was cut on 2026-06-08: the destination (Lane 1) emits native code via the
 > libLLVM C API in-process and never produces `.ll` text, so a text translator
 > would be a polished throwaway, and C-direct already gives the only oracle the
-> in-process backend needs. The existing `--emit=llvm` text path stays untouched
-> as a read-only reference (it shows which LLVM instructions a construct maps to)
-> — it is not migrated under KIR and not maintained to parity.
+> in-process backend needs. The `--emit=llvm` text path served briefly as a
+> read-only reference for which LLVM instructions a construct maps to — it was
+> never migrated under KIR, and it was **removed on 2026-06-16** once the
+> in-process backend's C-API binding was written (see the retirement note above).
 
 **Dependency summary.** The critical path is short: **`Lane 0 → Lane 1`** — the
 complete KIR lowering, then the in-process libLLVM backend, validated against the
@@ -827,18 +841,19 @@ backend's libLLVM dependency is opt-in; it never enters the bootstrap chain.
   *lowering* is what KIR creates.
 - `stage2/compiler/driver.kai:1343-1358` — `--emit=` dispatch (where `--emit=kir`
   and the `-kir` backend flags hook in); `:5232-5268` — pipeline order.
-- `tools/test-backend-parity.sh` — the existing C-vs-LLVM differential harness the
+- `tools/test-backend-parity.sh` — the native-vs-C differential harness the
   gates extend.
 
 For the §7.2 in-process backend (Lane 1):
 - `docs/ffi.md` Path 1 — the compiler-internal prelude-primitive mechanism (runtime
   forwarder + thunk + typer registration) that the libLLVM C-API binding rides.
-- `stage0/runtime_llvm.c` (1243 LOC) — the current LLVM-text backend's C forwarders;
-  the in-process backend's C-API forwarders are the same shape (now calling
-  `LLVMBuild*` instead of emitting `.ll` snippets) but live in `stage2/runtime.h`.
-- `stage2/Makefile:262-286` — the current out-of-process round-trip (`clang` on
-  emitted `.ll`); the in-process backend replaces this with an `llvm-config`-driven
-  `-lLLVM` link of stage2, opt-in.
+- `stage0/runtime_llvm.c` (1243 LOC) — the `kaix_prelude_*` C forwarders the native
+  object links against (originally the llvm-text backend's, now shared with and
+  owned by the in-process backend).
+- the in-process backend links stage2 against an `llvm-config`-driven static
+  `libLLVM` (opt-in via `make -C stage2 KAI_LLVM=1`), building the module via the C
+  API in memory and emitting a native object — no out-of-process `clang`-on-`.ll`
+  round-trip.
 
 ---
 
