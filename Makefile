@@ -531,15 +531,16 @@ tier1-asan: kaic2 test-arena
 	@$(MAKE) -C stage2 test-securerandom-asan
 	@echo "tier1-asan OK — issue #140 fixture passes under ASAN+UBSan (SecureRandom default-handler gate)"
 
-# Backend-parity (issue #575): build every entry-point fixture under
-# the documented example dirs + demos with both backends, run, diff
-# stdout + exit code. Path-gated CI (tier1-backend-parity.yml) on every
-# PR touching compiler / stdlib / examples / demos / driver. Local
-# convenience target — paralleled by the CI workflow, not invoked from
-# `tier1` because the cost (~15-30 min) does not belong on every PR
-# locally.
+# Backend-parity: build every entry-point fixture under the documented
+# example dirs + demos with the native backend AND the C-direct oracle,
+# run, diff stdout + exit code. This is the same gate the tier1-native
+# CI workflow runs (with NATIVE_PARITY_RATCHET=1 to forbid new gaps); the
+# llvm-text backend it once also covered was removed. Local convenience
+# target — not invoked from `tier1` because the cost (~15-30 min) does
+# not belong on every PR locally. SKIPs when kaic2 lacks libLLVM (build
+# it with `make -C stage2 KAI_LLVM=1`).
 tier1-backend-parity: kaic2
-	@tools/test-backend-parity.sh
+	@TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
@@ -612,20 +613,18 @@ test-binserialize-budget: kaic2
 	fi; \
 	echo "binserialize-budget OK — 100 decodes in $${wall_ms} ms ($${per_decode} ms/decode <= $$((ceiling / 100)) ms ceiling)"
 
-# ---- L0 LLVM static prep (issue: LLVM-direct DoD #6 follow-up) ------
+# ---- LLVM static prep (libLLVM for the in-process native backend) ----
 #
-# These targets prepare an out-of-tree, statically-linked libLLVM for
-# the future L3 lane that will replace the external `clang` shell-out
-# in `bin/kai --backend=llvm` with an in-process libLLVM call. None of
-# them run from `all`, `tier0`, or `tier1` — invocation is explicit.
-#
-# kaic2 emits LLVM IR as TEXT (see emit_program_llvm at compiler.kai:44202),
-# so the in-process replacement parses textual IR and drives the
-# codegen + linker pipeline. That is a MUCH smaller libLLVM surface
-# than constructing IR programmatically: roughly the components below.
+# These targets prepare an out-of-tree, statically-linked libLLVM that
+# the in-process `native` backend links stage2 against (built with
+# `make -C stage2 KAI_LLVM=1`): it constructs the LLVM module via the C
+# API in-process and emits a native object — no external `clang`, no
+# `.ll` text. None of these run from `all`, `tier0`, or `tier1` —
+# invocation is explicit. The components below are the libLLVM surface
+# the C-API path needs (codegen + target + object writer + linker).
 #
 # See docs/lane-experience-l0-llvm-static-prep.md for the full retro,
-# size measurements, CI plan, and recommendation for L3.
+# size measurements, and CI plan.
 
 LLVM_VERSION ?= 18.1.8
 LLVM_SRC_DIR := stage0/third_party/llvm

@@ -19,29 +19,25 @@ user-facing path is stage 2.
 
 kaikai targets native binaries via one of two backends:
 
-| Backend | Toolchain | When it runs       |
-|---------|-----------|--------------------|
-| `c`     | `cc`      | Always available — portable C with the in-tree runtime header. |
-| `llvm`  | `clang`   | Faster build line; emits LLVM IR directly from `kaic2`. |
+| Backend  | Toolchain        | When it runs       |
+|----------|------------------|--------------------|
+| `c`      | `cc`             | Default — portable C with the in-tree runtime header. The bootstrap path and the parity oracle, supported across the whole corpus. |
+| `native` | in-process libLLVM | Opt-in. Builds the LLVM module via the C API and emits a native object directly (no `.ll` text, no `clang`). The intended default destination; opt-in until native-vs-C parity is complete. Needs a `kaic2` built with libLLVM (`make -C stage2 KAI_LLVM=1`). |
 
-`kai` picks the backend automatically at every invocation:
+`kai` resolves the backend at every invocation:
 
-1. The `--backend=<c|llvm>` CLI flag wins, if passed.
+1. The `--backend=<c|native>` CLI flag wins, if passed.
 2. Otherwise, the `KAI_BACKEND` environment variable wins (must be
-   `c` or `llvm`; anything else is an error).
-3. Otherwise, `kai` auto-detects: if `clang` is on `PATH`, the LLVM
-   backend is used; if not, the C backend is used.
+   `c` or `native`; anything else is an error).
+3. Otherwise the default is `c`.
 
-Both backends compile the full stdlib as of the L2 LLVM-default lane
-(2026-05-11). Earlier notes about `KAI_NO_STDLIB=1` being required
-for `--backend=llvm` no longer apply.
+A `kaic2` built without libLLVM rejects `native` with an actionable
+error — it never silently falls back to C.
 
 ### Forcing the C path
 
-If a build under LLVM misbehaves and you want to bisect:
-
 ```sh
-kai build src/app.kai --backend=c -o app.c
+kai build src/app.kai --backend=c -o app
 # or, for an entire shell session:
 export KAI_BACKEND=c
 ```
@@ -50,11 +46,10 @@ export KAI_BACKEND=c
 
 | Variable        | Effect |
 |-----------------|--------|
-| `KAI_BACKEND`   | Default backend (`c` or `llvm`); overridden by `--backend`. |
-| `CC`            | C compiler invoked by the C backend (default: `cc`). |
+| `KAI_BACKEND`   | Default backend (`c` or `native`); overridden by `--backend`. |
+| `CC`            | C compiler invoked by the C backend / the native object link (default: `cc`). |
 | `CFLAGS`        | Extra flags appended to `CC`. |
-| `CLANG`         | `clang` binary used by `--backend=llvm` (default: `clang`). |
-| `CLANGFLAGS`    | Extra flags appended to `CLANG` (default: `-w -O2`). |
+| `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
 | `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib preludes. |
 
 ## Getting clang
@@ -107,11 +102,11 @@ kai --version
 kai run examples/minimal/hello.kai
 # Hello, kaikai
 
-kai build --backend=c    examples/minimal/hello.kai -o /tmp/hello-c
-kai build --backend=llvm examples/minimal/hello.kai -o /tmp/hello-llvm
-diff <(/tmp/hello-c) <(/tmp/hello-llvm) && echo "backends match"
+kai build --backend=c      examples/minimal/hello.kai -o /tmp/hello-c
+kai build --backend=native examples/minimal/hello.kai -o /tmp/hello-native
+diff <(/tmp/hello-c) <(/tmp/hello-native) && echo "backends match"
 ```
 
-The driver smoke test (`tools/test-llvm-driver.sh`) cross-builds a
-handful of fixtures with both backends and diffs their stdout — run it
+The backend-parity harness (`tools/test-backend-parity.sh`) cross-builds
+every fixture with the native backend and the C oracle and diffs their stdout — run it
 locally to confirm the toolchain is wired correctly.
