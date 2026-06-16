@@ -34,11 +34,14 @@ reach every consumer.
 
 Stage 2 has two backends that walk the **same** post-perceus `[Decl]`:
 
-- `emit_program(...)` → C (default backend, `--emit=c` / `c-modular`).
 - the in-process libLLVM **native** backend (`--emit=native` /
   `--backend=native`): lowers to KIR, builds the LLVM module via the C
-  API, and emits a native object — no `.ll` text. Opt-in until its
-  native-vs-C parity ratchet reaches zero.
+  API, and emits a native object — no `.ll` text. **The default backend
+  since the Lane 1.5 flip** (native-vs-C parity ratchet reached zero); a
+  `kaic2` built without libLLVM degrades the implicit default to C.
+- `emit_program(...)` → C (`--emit=c` / `c-modular`, `--backend=c`): the
+  portable bootstrap path and parity oracle. No longer the user default,
+  but the permanent fallback and selfhost oracle.
 
 (The earlier `emit_program_llvm` `.ll`-text frontend — `--emit=llvm` — was
 removed once the in-process backend's C-API binding was written; see the
@@ -636,6 +639,20 @@ grow, not after.
   working native-emitting `kai`. Mandatory retro.
 - **Deps:** Lane 1.2 (complete native walk + reproducible + in full parity vs
   C-direct over the 388). The flip cannot happen on the Lane 1 bring-up alone.
+- **Status (2026-06-16): SHIPPED — the flip landed.** The blocking premise
+  dissolved: the native-parity burn-down closed every gap
+  (`tools/native-parity-baseline.txt` is empty of fixtures), the llvm-text
+  backend was removed (#850), and `make llvm-build` is wired. All three deferred
+  steps executed on branch `native-default-flip`: (1) `resolve_backend` defaults
+  to `native`, degrading the IMPLICIT default to C on a C-only `kaic2` (an
+  EXPLICIT `native` still errors); (2) `tier1-native.yml` dropped its path
+  filter — it is now the always-on PR gate that protects the default; (3)
+  `build-release.sh` builds the vendored static libLLVM (`make llvm-build`) and
+  links it into the released `kaic2` (`KAI_LLVM=1`, `-lc++`/`-lstdc++` per
+  `UNAME_S`), with `release.yml` caching the LLVM tree. Retro:
+  `docs/lane-experience-native-default-flip-execute.md`. The 2026-06-09 BLOCKED
+  state below is kept for the historical record of why the flip was deferred.
+
 - **Status (2026-06-09): BLOCKED on parity — the flip did NOT proceed.** The
   premise that the native backend "emits the whole language" held for the 14
   curated `examples/native/` fixtures but FAILED on the corpus. Measured

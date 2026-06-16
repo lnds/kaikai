@@ -95,17 +95,18 @@ kai build examples/phase4/euler1.kai -o euler1
 
 There are two backends:
 
-- `c` (default) — the portable C path (`kaic2` emits C, linked with
-  `cc`). It is the bootstrap path and the parity oracle, supported
-  across the whole corpus.
-- `--backend=native` / `KAI_BACKEND=native` — the in-process libLLVM
-  backend (builds the module via the LLVM C API and emits a native
-  object directly; no `.ll` text, no `clang`). This is the project's
-  intended default destination (docs/kir-design.md §7.2); it is opt-in
-  until its full-corpus parity with the C oracle is complete.
+- `native` (default) — the in-process libLLVM backend (builds the module
+  via the LLVM C API and emits a native object directly; no `.ll` text,
+  no `clang`; docs/kir-design.md §7.2). libLLVM is linked into `kaic2`
+  (statically in a release), so it runs out-of-the-box with no system
+  LLVM. A `kaic2` built without libLLVM (the cc-only bootstrap) degrades
+  the default to `c` with a note.
+- `--backend=c` / `KAI_BACKEND=c` — the portable C path (`kaic2` emits C,
+  linked with `cc`). It is the bootstrap path and the parity oracle,
+  supported across the whole corpus.
 
-The `--backend` flag overrides `KAI_BACKEND`, which overrides the `c`
-default.
+The `--backend` flag overrides `KAI_BACKEND`, which overrides the
+`native` default.
 
 Run the inline test blocks in a file:
 

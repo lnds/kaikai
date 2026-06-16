@@ -28,9 +28,19 @@ jobs:
             os_name: darwin
             arch: arm64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Static-libLLVM cold build (Lane 1.5 flip: the shipped kaic2 links
+    # libLLVM IN so `kai build` runs the native default with no system
+    # LLVM). On a cache HIT the vendored build/ is reused and the long
+    # cmake step is a no-op; on a MISS (first release after an LLVM bump
+    # or a Makefile edit to the LLVM targets) the cold build dominates —
+    # ~10-15 min on the macos-14 M-series runner. 90 min leaves headroom.
+    timeout-minutes: 90
     outputs:
       version: ${{ steps.meta.outputs.version }}
+    env:
+      # Single source of truth for the cache key; must match the
+      # LLVM_VERSION default in the top-level Makefile (LLVM static prep).
+      LLVM_VERSION: 18.1.8
     steps:
       - name: Resolve tag
         id: tag
@@ -57,6 +67,34 @@ jobs:
             echo "::error::tag $tag does not match VERSION $ver"
             exit 1
           fi
+
+      # cmake + ninja drive the vendored static-libLLVM build
+      # (Makefile: llvm-configure / llvm-build). They are NOT stage 0
+      # deps — the bootstrap stays cc-only; these are release-host tools
+      # for assembling libLLVM only.
+      - name: Install cmake + ninja (static-libLLVM build deps)
+        run: |
+          if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+            brew install cmake ninja
+          fi
+          cmake --version
+          ninja --version
+
+      # Cache the vendored static-libLLVM tree so only the first release
+      # after an LLVM bump or a Makefile-LLVM edit pays the cold build.
+      # The key follows the L0 static-prep plan: runner.os + LLVM_VERSION
+      # + a hash of the Makefile (which owns the target list + cmake
+      # flags). `make llvm-build` is idempotent, so a restored build/ short
+      # -circuits inside build-release.sh.
+      - name: Cache vendored static libLLVM
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/third_party/llvm
+            stage0/third_party/cmake
+            stage0/third_party/llvm-${{ env.LLVM_VERSION }}.src.tar.xz
+            stage0/third_party/cmake-${{ env.LLVM_VERSION }}.src.tar.xz
+          key: llvm-static-${{ runner.os }}-${{ env.LLVM_VERSION }}-${{ hashFiles('Makefile') }}
 
       - name: Build release tarball
         run: ./scripts/build-release.sh
