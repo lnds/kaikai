@@ -69,6 +69,53 @@ pub fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
 
 pub fn nslot_type(ctx: Handle, s: KSlot) : Handle = nslot_type_of_tag(ctx, nslot_tag(s))
 
+# --- P3: raw fn signature (LLVM type) ----------------------------------
+#
+# A `KFnNormal` whose lowering populated raw param/return slots
+# (`lower_params_sig` / `ret_slot_of_sig` from the UFnSig) declares an
+# LLVM signature with RAW scalar params/return (`i64`/`f64`/`i1`) instead
+# of all-`ptr`. The body then reads each raw param directly (the alloca is
+# already raw via `collect_param_specs`'s `p.slot`) and the `KRet` returns
+# the raw scalar — no `kaix_int_field` per use, no `kaix_int` per return,
+# so O2 amplifies the loop exactly as the C-direct backend's `int64_t`
+# signature. A fully-boxed fn (every slot `SBoxed`) keeps the existing
+# `ptr (ptr × n)` shape, so non-UFn declarations are byte-identical.
+# Mirror of emit_c's `emit_fn_signature_unboxed`, expressed in LLVM types.
+
+# True iff any param slot OR the return slot is raw (non-`SBoxed`).
+pub fn nfn_has_raw_slot(f: KFn) : Bool =
+  (match nslot_tag(f.ret) { 0 -> false  _ -> true }) or nparams_any_raw(f.params)
+
+fn nparams_any_raw(ps: [KParam]) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> match nslot_tag(p.slot) { 0 -> nparams_any_raw(rest)  _ -> true }
+}
+
+# The LLVM function type for a `KFnNormal`: the raw mixed signature when
+# any slot is raw (ret type + one param type per `p.slot`), else the
+# legacy all-boxed `ptr (ptr × n)`. The param-type buffer is a C-side
+# `KaiLlvmBuf` (handles never ride a kaikai `[Handle]`), freed after the
+# `llvm_fn_type_n` builds the type.
+pub fn nfn_llvm_type(ctx: Handle, f: KFn) : Handle =
+  if nfn_has_raw_slot(f) {
+    let rett = nslot_type(ctx, f.ret)
+    let ptb = llvm_buf_new()
+    nparam_type_push(ctx, ptb, f.params)
+    let ty = llvm_fn_type_n(rett, ptb)
+    llvm_buf_free(ptb); ty
+  } else {
+    llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params))
+  }
+
+# Push each param's slot LLVM type into `ptb` (in order). Mirror of
+# `nemit_push_atoms`: the buffer is created by the CALLER in a `let`
+# (never `llvm_buf_new()` passed inline — that handle would be RC-dropped
+# by the type-blind kaic1 and then double-freed by `llvm_buf_free`).
+fn nparam_type_push(ctx: Handle, ptb: Handle, ps: [KParam]) : Unit = match ps {
+  [] -> ()
+  [p, ...rest] -> { llvm_buf_push(ptb, nslot_type(ctx, p.slot)); nparam_type_push(ctx, ptb, rest) }
+}
+
 # Loud abort: an unsupported node mis-lowered would be worse than a clear
 # error (the Lane 0 silent-catch-all class). Print kind + flip the ctx's
 # `ok` flag; the walk runs to completion (coherent verify error) but
@@ -172,6 +219,21 @@ pub fn nemit_atom_raw(ctx: Handle, v: KVal, slot: KSlot) : Handle / Console = ma
   }
   _ -> nemit_atom(ctx, v)
 }
+
+# A self-tail-call / TRMC reloop value at the DESTINATION param's slot
+# TAG: a raw slot (1=SInt64 / 2=SReal / 3=SBool) materialises the value
+# raw (`nemit_atom_raw` — a raw literal as an immediate, a raw register
+# loaded directly, a boxed atom unbox-borrowed down to its scalar); a boxed
+# slot (0=SBoxed, or -1 = unknown) keeps the plain boxed atom. The
+# back-edge store then writes the matching raw/boxed value, so an `i64`
+# param alloca never takes a `ptr` store. Shared by the `KTcrecGoto`
+# (`emit_native_term`) and `KTrmcStep` (`emit_native_trmc`) back-edges —
+# the two re-loop paths that re-store params, both raw-aware in lockstep.
+pub fn nemit_reloop_value(ctx: Handle, v: KVal, slot_tag: Int) : Handle / Console =
+  if slot_tag == 1 { nemit_atom_raw(ctx, v, SInt64) }
+  else if slot_tag == 2 { nemit_atom_raw(ctx, v, SReal) }
+  else if slot_tag == 3 { nemit_atom_raw(ctx, v, SBool) }
+  else { nemit_atom(ctx, v) }
 
 # Load register `n` as a raw `f64`. A raw `SReal` register loads directly;
 # a boxed register unbox-borrows its `as.r` payload (`kaix_real_field`, no

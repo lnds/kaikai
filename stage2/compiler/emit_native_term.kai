@@ -35,10 +35,10 @@ import compiler.emit_native_trmc
 # threads the program's handler decls so a `KInstall`/`KPerform` resolves
 # its op→clause-thunk map (effects subset 2a). A `KFnClause` rides the
 # effects clause ABI `ptr (ptr self, <args>, ptr k)`.
-pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl]) : Unit / Console = match f.kind {
-  KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers)
-  KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers)
-  KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers)
+pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match f.kind {
+  KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers, fns)
+  KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers, fns)
+  KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers, fns)
   # An `extern "C" fn` carries no lowered body — the shim is synthesised
   # here from the marshalling kinds the KIR classified (emit_native_ffi.kai).
   KFnFfi(csym, pks, rk) -> nemit_ffi_fn(ctx, f, csym, pks, rk)
@@ -53,7 +53,7 @@ pub type NFnAbi = NFnNormal | NFnLambda | NFnClause
 # lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)`; a clause
 # takes `ptr (ptr self, <args ptr>, ptr k)`. The block-building + alloca
 # prologue are identical; only the LLVM signature + the param seed differ.
-fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl]) : Unit / Console = {
+fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = {
   let fnval = nemit_declare_for_abi(ctx, f, abi)
   native_ctx_begin_fn(ctx, fnval)
   let aentry = llvm_append_block(native_ctx_m(ctx), fnval, "alloca.entry")
@@ -70,7 +70,10 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl]) : U
   nemit_trmc_allocas(ctx, f.blocks)
   nemit_seed_for_abi(ctx, f, abi, fnval)
   llvm_build_br(native_ctx_b(ctx), first_kblock)
-  nemit_fill_blocks(ctx, f.blocks, handlers)
+  # P3: pass the fn's return slot so a `KRet` returns the raw scalar
+  # matching the signature. Lambda / clause ABIs always carry `SBoxed`
+  # ret, so they keep the boxed return.
+  nemit_fill_blocks(ctx, f.blocks, handlers, f.ret, fns)
   native_ctx_end_fn(ctx)
 }
 
@@ -79,7 +82,7 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl]) : U
 # precise arity is materialised at the call site through the loaded op
 # fn-ptr, so the declaration only needs a stable address).
 fn nemit_declare_for_abi(ctx: Handle, f: KFn, abi: NFnAbi) : Handle = match abi {
-  NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+  NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), nfn_llvm_type(ctx, f))
   NFnLambda -> nemit_declare_thunk(ctx, f.sym)
   NFnClause -> nemit_declare_clause(ctx, f.sym, f.params)
 }
@@ -234,19 +237,19 @@ fn nemit_make_blocks(ctx: Handle, fnval: Handle, bs: [KBlock]) : Unit = match bs
 
 # --- pass 2: fill each block's statements + terminator -----------------
 
-fn nemit_fill_blocks(ctx: Handle, bs: [KBlock], handlers: [KHandlerDecl]) : Unit / Console = match bs {
+fn nemit_fill_blocks(ctx: Handle, bs: [KBlock], handlers: [KHandlerDecl], ret: KSlot, fns: [KFn]) : Unit / Console = match bs {
   [] -> ()
   [b, ...rest] -> {
     llvm_position_at_end(native_ctx_b(ctx), native_ctx_find_block(ctx, b.label))
-    nemit_stmts(ctx, b.stmts, handlers)
-    nemit_term(ctx, b.term)
-    nemit_fill_blocks(ctx, rest, handlers)
+    nemit_stmts(ctx, b.stmts, handlers, fns)
+    nemit_term(ctx, b.term, ret)
+    nemit_fill_blocks(ctx, rest, handlers, ret, fns)
   }
 }
 
-fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl]) : Unit / Console = match ss {
+fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match ss {
   [] -> ()
-  [s, ...rest] -> { nemit_stmt(ctx, s, handlers); nemit_stmts(ctx, rest, handlers) }
+  [s, ...rest] -> { nemit_stmt(ctx, s, handlers, fns); nemit_stmts(ctx, rest, handlers, fns) }
 }
 
 # --- statements ---------------------------------------------------------
@@ -263,7 +266,7 @@ fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl]) : Unit / Cons
 # use-after-free the LLVM verifier hits as a phantom-`phi` crash). The
 # `let h = ...` form rides the handle-binder exclusion (`pcs_rhs_is_handle`
 # in stage1), so `h` never enters Perceus and is never dropped.
-fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl]) : Unit / Console = match s {
+fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match s {
   # Capture the op/atom handle in a `let` (handle-binder exclusion) before
   # passing it on: a handle passed inline as a call ARGUMENT is RC-managed
   # by the type-blind kaic1, and a drop of an LLVM `Value*` clobbers its
@@ -275,8 +278,8 @@ fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl]) : Unit / Console 
   # materialise the scalar RAW (`llvm_const_real` / raw i32), not box it
   # (the default `nemit_atom` boxes via `kaix_real`). Every other op ignores
   # the slot (the register's repr already drives its load/store).
-  KLet(n, slot, op, _) -> { let h = nemit_op_fx_slot(ctx, op, slot, handlers); nemit_store_reg(ctx, n, h) }
-  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, op, handlers); () }
+  KLet(n, slot, op, _) -> { let h = nemit_op_fx_slot(ctx, op, slot, handlers, fns); nemit_store_reg(ctx, n, h) }
+  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, op, handlers, fns); () }
   KStore(n, v, _)   -> { let h = nemit_atom(ctx, v); nemit_store_reg(ctx, n, h) }
   KRC(rc, _)        -> nemit_rc(ctx, rc)
   KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
@@ -294,11 +297,14 @@ fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl]) : Unit / Console 
 # emitter lives in `emit_native_fx2`, which `emit_native_ops` cannot import —
 # it would cycle, fx2 already imports ops — so the seam is here, the module
 # that imports both). Everything else delegates to the pure `nemit_op`.
-fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl]) : Handle / Console = match op {
+fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console = match op {
+  # `nemit_perform` materialises its args as atoms (`nemit_atom`), never a
+  # direct `KCall` (a call arg is lowered to a prior KLet, reaching here as
+  # a `KVar`), so it does not need the `fns` sig table.
   KPerform(eff, o, cargs)   -> nemit_perform(ctx, eff, o, cargs, handlers)
   KResumeOp(k, v)           -> nemit_resume(ctx, k, v)
   KResume2Op(k, v, ns)      -> nemit_resume2(ctx, k, v, ns)
-  _                         -> nemit_op(ctx, op)
+  _                         -> nemit_op(ctx, op, fns)
 }
 
 # Slot-aware op emission for a `KLet` destination. A raw `SReal`/`SBool`
@@ -308,10 +314,10 @@ fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl]) : Handle / Consol
 # mis-store. Every other shape (a non-literal op, or a boxed slot) delegates
 # unchanged. This is the only point the KLet slot governs materialisation;
 # the load/store side is already slot-driven via `nslot_type_of_tag`.
-fn nemit_op_fx_slot(ctx: Handle, op: KOp, slot: KSlot, handlers: [KHandlerDecl]) : Handle / Console =
+fn nemit_op_fx_slot(ctx: Handle, op: KOp, slot: KSlot, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console =
   match op {
     KLitOp(v) -> nemit_atom_raw(ctx, v, slot)
-    _         -> nemit_op_fx(ctx, op, handlers)
+    _         -> nemit_op_fx(ctx, op, handlers, fns)
   }
 
 # A Perceus RC op → the runtime dup/drop. The call result is captured in a
@@ -330,8 +336,13 @@ fn nemit_rc(ctx: Handle, rc: KRCOp) : Unit / Console = match rc {
 # Pure control flow (ret/br/condbr/switch/unreachable) + the TCO back-edge
 # (`KTcrecGoto`) are subset 1; effect resume + TRMC + explicit tail calls
 # are later subsets.
-fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
-  KRet(v, _)            -> { llvm_build_ret(native_ctx_b(ctx), nemit_atom(ctx, v)); () }
+fn nemit_term(ctx: Handle, t: KTerm, ret: KSlot) : Unit / Console = match t {
+  # P3: a raw-return fn returns the value at its raw slot (`ret i64`/`f64`/
+  # `i1`), so `nemit_atom_raw` materialises a raw literal directly + loads a
+  # raw register without boxing. A boxed-return fn (`ret` == SBoxed) keeps
+  # the plain boxed `nemit_atom`. The lowering already lowers a raw-return
+  # body raw (`lower_fn_body`), so `v` is a raw register / raw literal here.
+  KRet(v, _)            -> { llvm_build_ret(native_ctx_b(ctx), nemit_ret_value(ctx, v, ret)); () }
   KBr(l, _)             -> { llvm_build_br(native_ctx_b(ctx), native_ctx_find_block(ctx, l)); () }
   KCondBr(c, tl, el, _) -> nemit_condbr(ctx, c, tl, el)
   KSwitch(v, cs, def, _) -> nemit_switch(ctx, v, cs, def)
@@ -340,6 +351,16 @@ fn nemit_term(ctx: Handle, t: KTerm) : Unit / Console = match t {
   KTailCall(_, _, _)    -> nemit_unsupported(ctx, "KTailCall (later subset)")
   KTrmcStep(_, hole, cname, tag, dropmask, heads, asg, _) -> nemit_trmc_step(ctx, hole, cname, tag, dropmask, heads, asg)
   KTrmcApply(leaf, _)   -> nemit_trmc_apply(ctx, leaf)
+}
+
+# The return value at the fn's return slot. A raw slot materialises the
+# value raw (a literal as an immediate, a register loaded at its slot —
+# `nemit_atom_raw` adapts a boxed register down too, but the raw-return
+# lowering plants a raw register here, so no border crosses); a boxed slot
+# keeps the plain boxed materialisation.
+fn nemit_ret_value(ctx: Handle, v: KVal, ret: KSlot) : Handle / Console = match ret {
+  SBoxed -> nemit_atom(ctx, v)
+  _      -> nemit_atom_raw(ctx, v, ret)
 }
 
 # `condbr`: branch the current block to `tl`/`el` on the condition.
@@ -435,10 +456,20 @@ fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign], dropmask: Int) :
 }
 
 # Push each reloop value handle into `valbuf` (left-to-right, reading the
-# OLD param allocas).
+# OLD param allocas). P3: each value is materialised at the DESTINATION
+# param's slot — a raw param (`SInt64`/`SReal`/`SBool`, by index `idx`,
+# since params are collected first in order) gets a raw value (no per-
+# iteration `kaix_int` re-box, the regression P3 removes); a boxed param
+# gets the boxed atom. `native_ctx_reg_slot_at(idx)` reads the param's slot
+# tag. The store side (`nemit_store_assigns`) then writes the matching
+# raw/boxed value into the alloca, so an `i64` param alloca never takes a
+# `ptr` store (the back-edge type mismatch the all-boxed `nemit_atom` hit).
 fn nemit_eval_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle) : Unit / Console = match asg {
   [] -> ()
-  [KAsg(_, v), ...rest] -> { llvm_buf_push(valbuf, nemit_atom(ctx, v)); nemit_eval_assigns(ctx, rest, valbuf) }
+  [KAsg(idx, v), ...rest] -> {
+    llvm_buf_push(valbuf, nemit_reloop_value(ctx, v, native_ctx_reg_slot_at(ctx, idx)))
+    nemit_eval_assigns(ctx, rest, valbuf)
+  }
 }
 
 # Store each evaluated value into its param alloca. `pN` selects the N-th
@@ -456,36 +487,90 @@ fn nemit_store_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle, i: Int) : Un
 #
 # A named fn `S` of arity `k` is referenced as a VALUE (a `KClosure` over
 # it) through a synthetic `_kai_S_thunk(ptr self, ptr* args, i32 n)` that
-# unpacks `args[0..k]` and tail-forwards to the boxed `S(args[0], …)`.
-# The KIR does not model these — they are emitted here, the native mirror
-# of `emit_c.kai`'s `emit_fn_thunk`. (All-boxed: no unboxing, so the body
-# is a plain load-each-arg + call + ret.)
+# unpacks `args[0..k]` and tail-forwards to `S(args[0], …)`. The KIR does
+# not model these — they are emitted here, the native mirror of
+# `emit_c.kai`'s `emit_fn_thunk`.
+#
+# P3: the thunk is the boxed-ABI NET for the uniform calling convention —
+# every indirect / `KClosure` call site enters a fn through it with BOXED
+# args. When `S` has a RAW signature (`nfn_has_raw_slot`), the thunk must
+# bridge: unbox each masked arg (`args[i]` boxed → `kaix_int_field` / … →
+# raw), call `S` at its raw LLVM type, and re-box a raw return (`kaix_int`)
+# back to the boxed `ptr` the thunk ABI returns. A fully-boxed fn keeps the
+# plain load-each-arg + boxed-call + ret. The thunk ALWAYS exists (not
+# gated on capture): the direct raw call (`nemit_call_raw`) is the fast
+# path, the thunk the fallback for first-class use. Mirror of emit_c's
+# `emit_fn_thunk` UFn branch.
 pub fn nemit_fn_thunks(ctx: Handle, fns: [KFn]) : Unit / Console = match fns {
   [] -> ()
   [f, ...rest] -> { match f.kind {
-    KFnNormal -> nemit_one_fn_thunk(ctx, f.sym, list_length(f.params))
+    KFnNormal -> nemit_one_fn_thunk(ctx, f)
     # An FFI wrapper is a first-class value too (a caller can pass `puts`
-    # as a `KClosure`); it needs the same boxed thunk forwarder.
-    KFnFfi(_, _, _) -> nemit_one_fn_thunk(ctx, f.sym, list_length(f.params))
+    # as a `KClosure`); it needs the same boxed thunk forwarder. Its KFn
+    # carries no raw slots (FFI is excluded from the raw classifier), so it
+    # takes the boxed bridge.
+    KFnFfi(_, _, _) -> nemit_one_fn_thunk(ctx, f)
     _ -> ()
   }; nemit_fn_thunks(ctx, rest) }
 }
 
-# Emit `_kai_<sym>_thunk`: a thunk-ABI forwarder to the boxed fn `sym`.
-fn nemit_one_fn_thunk(ctx: Handle, sym: String, arity: Int) : Unit / Console = {
+# Emit `_kai_<sym>_thunk`: a thunk-ABI forwarder to fn `f`. Boxed args come
+# in via `args[]`; the call to `f` adapts each arg to `f`'s param slot and
+# re-boxes a raw return.
+fn nemit_one_fn_thunk(ctx: Handle, f: KFn) : Unit / Console = {
+  let sym = f.sym
+  let arity = list_length(f.params)
   let tsym = cat3("_kai_", sym, "_thunk")
   let thunkv = nemit_declare_thunk(ctx, tsym)
   let entry = llvm_append_block(native_ctx_m(ctx), thunkv, "entry")
   llvm_position_at_end(native_ctx_b(ctx), entry)
   let args_v = llvm_get_param(thunkv, 1)
-  let argbuf = llvm_buf_new()
-  nemit_thunk_load_args(ctx, args_v, argbuf, 0, arity)
-  let fnty = llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity)
-  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(sym), fnty)
-  let r = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, argbuf)
-  llvm_buf_free(argbuf)
-  llvm_build_ret(native_ctx_b(ctx), r)
+  # Load the boxed args, then adapt each to its param slot (a raw param
+  # unboxes its boxed arg; a boxed param passes through). The two buffers
+  # — boxed loads + param types — feed `ncall_finish` at `f`'s LLVM type.
+  let boxbuf = llvm_buf_new()
+  nemit_thunk_load_args(ctx, args_v, boxbuf, 0, arity)
+  let ptb = llvm_buf_new()
+  let ab = llvm_buf_new()
+  nemit_thunk_adapt_args(ctx, f.params, boxbuf, 0, ptb, ab)
+  llvm_buf_free(boxbuf)
+  let r = ncall_finish(ctx, nfn_sym(sym), nslot_type(ctx, f.ret), ptb, ab)
+  llvm_build_ret(native_ctx_b(ctx), nthunk_box_ret(ctx, r, f.ret))
   ()
+}
+
+# Adapt each boxed arg in `boxbuf` to its param slot: push the param TYPE
+# into `ptb` and the (boxed or unboxed) arg VALUE into `ab`. A raw param
+# unbox-borrows the boxed `args[i]` at its slot; a boxed param passes the
+# `ptr` through. Parallel to `nemit_raw_args` but the source is a loaded
+# boxed handle, not a KIR atom.
+fn nemit_thunk_adapt_args(ctx: Handle, ps: [KParam], boxbuf: Handle, i: Int, ptb: Handle, ab: Handle) : Unit / Console = match ps {
+  [] -> ()
+  [p, ...rest] -> {
+    llvm_buf_push(ptb, nslot_type(ctx, p.slot))
+    llvm_buf_push(ab, nthunk_unbox_arg(ctx, llvm_buf_get(boxbuf, i), p.slot))
+    nemit_thunk_adapt_args(ctx, rest, boxbuf, i + 1, ptb, ab)
+  }
+}
+
+# Unbox a boxed arg handle to a param slot (a raw slot reads its scalar
+# payload — `kaix_int_field` / `kaix_real_field` / `kaix_bool_field`,
+# non-consuming; a boxed slot passes the `ptr` through). Mirror of the
+# C-direct thunk's `(boxed)->as.i` unbox per masked param.
+fn nthunk_unbox_arg(ctx: Handle, boxed: Handle, slot: KSlot) : Handle = match slot {
+  SInt64 -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
+  SReal  -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
+  SBool  -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  _      -> boxed
+}
+
+# Re-box a raw return to the boxed `ptr` the thunk ABI returns (a boxed
+# return passes through). Same shape as `nemit_box_ret`.
+fn nthunk_box_ret(ctx: Handle, r: Handle, ret: KSlot) : Handle = match ret {
+  SInt64 -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), r)
+  SReal  -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), r)
+  SBool  -> ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  _      -> r
 }
 
 # Load `args[0..arity]` into `argbuf` (each a boxed `ptr`).

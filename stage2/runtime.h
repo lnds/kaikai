@@ -11543,6 +11543,16 @@ static void *kai_native_ctx_reg_at(void *cv, int64_t i) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     return (i >= 0 && i < c->nregs) ? c->regs[i].alloca : NULL;
 }
+/* The slot TAG of the i-th register (params collected first, in order),
+ * so a `KTcrecGoto` reloop can re-materialise the `pN` value at the param's
+ * declared slot — RAW (`i64`/`f64`/`i1`) for a P3 raw param, so the back-
+ * edge store matches the alloca type (a boxed store into an `i64` alloca
+ * would mis-type, and re-boxing each iteration is the regression P3 fixes).
+ * -1 if out of range (a lowering bug). */
+static int64_t kai_native_ctx_reg_slot_at(void *cv, int64_t i) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return (i >= 0 && i < c->nregs) ? c->regs[i].slot : -1;
+}
 static KaiValue *kai_native_ctx_add_block(void *cv, KaiValue *label, void *bb) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     if (c->nblks == c->blkcap) {
@@ -12389,6 +12399,7 @@ static KaiValue *kai_native_ctx_add_reg(void *c, KaiValue *n, void *a, int64_t s
 static void *kai_native_ctx_find_reg(void *c, KaiValue *n) { (void) c; (void) n; return kai_llvm_native_unavailable(); }
 static int64_t kai_native_ctx_reg_slot(void *c, KaiValue *n) { (void) c; (void) n; kai_llvm_native_unavailable(); return -1; }
 static void *kai_native_ctx_reg_at(void *c, int64_t i) { (void) c; (void) i; return kai_llvm_native_unavailable(); }
+static int64_t kai_native_ctx_reg_slot_at(void *c, int64_t i) { (void) c; (void) i; kai_llvm_native_unavailable(); return -1; }
 static KaiValue *kai_native_ctx_add_block(void *c, KaiValue *l, void *bb) { (void) c; (void) l; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_native_ctx_find_block(void *c, KaiValue *l) { (void) c; (void) l; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_first_block(void *c) { (void) c; return kai_llvm_native_unavailable(); }
