@@ -3437,7 +3437,20 @@ static int kai_slots_all_immortal_ptr(int n, KaiVarSlot *slots) {
         /* An immediate value (tagged Int) has no header and is never
          * freed — it counts as immortal. A heap value is immortal only
          * when its rc is saturated. */
-        if (kai_is_value(slots[i].ptr)) continue;
+        /* A tagged-Int immediate slot DISQUALIFIES the variant from the
+         * immortal cache. The cache is for variants of BOUNDED cardinality
+         * (nullary ctors, all-immortal-pointer cells like `TLeaf` or
+         * interned-string payloads): caching them wins because a small fixed
+         * set is reused. A tagged Int has no header so it never frees — but a
+         * variant CONTAINING a *variable* tagged Int (`Lit(i)` for arbitrary
+         * `i`) has UNBOUNDED distinct identities. Immortalising it interns one
+         * cache entry per distinct `i`, saturating the fixed open-addressing
+         * table and degrading its linear probe to O(n) — the `variant_match`
+         * super-linear collapse (issue #855). The C backend never hits this:
+         * it builds such cells via `kai_variant_u_fast` with a TYPED `.i64`
+         * slot, bypassing the mask==0 cache path entirely. Excluding tagged-Int
+         * slots here brings the native (all-boxed) path to parity. */
+        if (kai_is_value(slots[i].ptr)) return 0;
         if (slots[i].ptr == NULL || slots[i].ptr->rc != INT32_MAX) return 0;
     }
     return 1;
