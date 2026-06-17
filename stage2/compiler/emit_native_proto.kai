@@ -18,14 +18,19 @@
 #   - one `kaix_register_one_impl(i32 proto_id, i32 head_tag, ptr fn)` per
 #     `__pimpl_*` row.
 #
-# NO boxed shims — UNLIKE the C / LLVM-text backends. Those emit impls with
-# raw scalar signatures (`int64_t Hash_Int_hash(KaiValue*)`) and wrap them
-# in a `_boxed` adapter so the runtime's `ptr(ptr,...)` dispatch ABI holds.
-# The in-process native backend lowers from KIR, which is ALL-BOXED: every
-# fn — impls included — is emitted `ptr (ptr, ...)` (boxed in, boxed out),
-# WHICH IS ALREADY the dispatch ABI. The impl is registered verbatim; a
-# `_boxed` shim would mis-call a `ptr(ptr)` impl as `i64(ptr)` and corrupt
-# the result (the hashmap_collision FAIL before this simplification).
+# Boxed shims for RAW impls (P3). Before P3 the native backend emitted every
+# fn — impls included — `ptr (ptr, ...)` (boxed in/out), WHICH IS ALREADY the
+# `kaix_proto_dispatch<N>` ABI (`KaiValue*(KaiValue*,...)`), so the impl was
+# registered verbatim. P3 gives a scalar-param/return impl (e.g.
+# `Hash_String_hash(String) : Int` → `i64 (ptr)`) a RAW signature; the
+# dispatcher would then cast a `i64(ptr)` fn to `ptr(ptr)` and deref the raw
+# `i64` return as a pointer (SIGSEGV — the hashmap/hashset tier1-native FAIL).
+# So a raw impl (`pimpl_row_is_unboxed`) is registered through a
+# `_kai_<csym>__boxed(ptr × arity)` adapter that unbox-borrows each masked
+# arg, calls the raw impl, and re-boxes the raw return — the dispatch ABI the
+# runtime casts to. Boxed impls still register verbatim (no shim). Mirror of
+# the C-direct oracle's `kai_<csym>__boxed` + `pimpl_row_is_unboxed` gate
+# (emit_c `emit_impl_table_array_loop`).
 #
 # The DECISION logic (head/proto tags, the variant->head map) is shared —
 # `collect_pimpl_rows` / `collect_variant_to_head` / `stdlib_head_tag_int` /
@@ -50,11 +55,34 @@ pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [EVar],
                          fns: [EFn]) : Unit / Console = {
   let rows = collect_pimpl_rows(decls, fns, [])
   let v2h  = collect_variant_to_head(variants, decls)
+  # P3: emit every raw impl's `_kai_<csym>__boxed` adapter FIRST, each as a
+  # complete standalone fn (its own entry block, no shared builder state), so
+  # `_kai_proto_init_llvm` below can take each adapter's address by symbol.
+  # Emitting them inside the init hook would need a save/restore of the
+  # builder's insert point; a separate up-front pass is cleaner.
+  nproto_emit_adapters(ctx, rows, decls)
   nproto_open_init(ctx)
   nproto_register_variants(ctx, v2h, 0)
   nproto_register_impls(ctx, rows, decls)
   llvm_build_ret_void(native_ctx_b(ctx))
 }
+
+# Emit a boxed adapter for each raw impl (skip boxed impls + unknown-head
+# rows). Done before the init hook opens, so each adapter owns the builder
+# while it is filled.
+fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / Console =
+  match rows {
+    [] -> ()
+    [pr, ...rest] -> {
+      match pr {
+        PR(csym, _, t, arity, sig) ->
+          if stdlib_head_tag_int(t, decls) >= 0 and pimpl_row_is_unboxed(pr) {
+            nproto_emit_boxed_adapter(ctx, csym, sig, arity)
+          } else { () }
+      }
+      nproto_emit_adapters(ctx, rest, decls)
+    }
+  }
 
 # Open `void _kai_proto_init_llvm()` and position the ctx builder at its
 # entry. Mirrors `ndef_open_void_fn` (emit_native_def): no reg/block table,
@@ -87,34 +115,140 @@ fn nproto_register_variants(ctx: Handle, v2h: [Int], i: Int) : Unit / Console =
 
 # One `kaix_register_one_impl(i32 proto_id, i32 head_tag, ptr fn)` per
 # pimpl row. Skips rows whose head tag is -1 (genuinely unknown type names
-# the runtime hashmap would never match). The impl is registered under its
-# bare `c_sym` — the native walk emits every fn `ptr (ptr, ...)` (boxed,
-# = the dispatch ABI), so no `_boxed` shim is needed (see file header).
+# the runtime hashmap would never match). A RAW impl (`pimpl_row_is_unboxed`)
+# registers a boxed adapter; a boxed impl registers its bare `c_sym` (= the
+# dispatch ABI). The whole `pr` flows through so the adapter reads the mask.
 fn nproto_register_impls(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / Console =
   match rows {
     [] -> ()
     [pr, ...rest] -> match pr {
-      PR(csym, p, t, arity, _) -> {
+      PR(_, p, t, arity, _) -> {
         let head_int = stdlib_head_tag_int(t, decls)
         if head_int < 0 { nproto_register_impls(ctx, rest, decls) }
         else {
-          nproto_register_one(ctx, stdlib_proto_id_int(p), head_int, csym, arity)
+          nproto_register_one(ctx, stdlib_proto_id_int(p), head_int, pr, arity)
           nproto_register_impls(ctx, rest, decls)
         }
       }
     }
   }
 
-# Declare the impl `csym` with the boxed dispatch shape `ptr (ptr x arity)`
-# (its actual native signature) and emit the register call. Under opaque
-# pointers the Function* IS the `ptr` arg — no bitcast.
+# Register one impl. A raw impl gets a `_kai_<csym>__boxed(ptr × arity)`
+# adapter emitted on the spot (unbox masked args, call the raw fn, re-box a
+# raw return) and registers THAT; a boxed impl registers `csym` verbatim
+# (its native signature already IS `ptr (ptr × arity)`). The registered
+# fn-ptr is consumed inside the register call in the same statement it is
+# declared (handle discipline, asu "risk #1").
 fn nproto_register_one(ctx: Handle, proto_id: Int, head_int: Int,
-                       csym: String, arity: Int) : Unit / Console = {
+                       pr: PimplRow, arity: Int) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
-  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), csym, llvm_fn_type_boxed(p, arity))
+  let fnv = nproto_impl_fnptr(ctx, pr, arity)
   let _r = ncall_sig3(ctx, "kaix_register_one_impl", native_ctx_voidt(ctx),
                       i32t, i32t, p,
                       llvm_const_i32(i32t, proto_id), llvm_const_i32(i32t, head_int), fnv)
   ()
+}
+
+# The fn-ptr to register: the boxed adapter (already emitted in the up-front
+# pass, referenced by its `_kai_<csym>__boxed` symbol) for a raw impl, else
+# the bare `csym` at its boxed dispatch shape.
+fn nproto_impl_fnptr(ctx: Handle, pr: PimplRow, arity: Int) : Handle / Console = match pr {
+  PR(csym, _, _, _, _) -> {
+    let sym = if pimpl_row_is_unboxed(pr) { cat3("_kai_", csym, "__boxed") } else { csym }
+    llvm_get_or_declare_fn(native_ctx_m(ctx), sym, llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity))
+  }
+}
+
+# Emit `ptr _kai_<csym>__boxed(ptr × arity)`: unbox each scalar-param arg
+# (per the sig's param types), call the raw impl `csym` at its raw LLVM type,
+# re-box a raw return. The dispatch ABI the runtime casts to
+# (`KaiValue*(KaiValue*,...)`). Emitted in the up-front pass (no shared
+# builder state to save), so it just appends + fills its own entry block.
+fn nproto_emit_boxed_adapter(ctx: Handle, csym: String, sig: Option[UFnSig], arity: Int) : Unit / Console = match sig {
+  None -> ()
+  Some(US(pts, rt, mask)) -> {
+    let p = native_ctx_ptrt(ctx)
+    let adapter = llvm_add_function(native_ctx_m(ctx), cat3("_kai_", csym, "__boxed"), llvm_fn_type_boxed(p, arity))
+    let entry = llvm_append_block(native_ctx_m(ctx), adapter, "entry")
+    llvm_position_at_end(native_ctx_b(ctx), entry)
+    let abuf = llvm_buf_new()
+    let ptb = llvm_buf_new()
+    nproto_adapter_args(ctx, adapter, pts, mask, 0, ptb, abuf)
+    let r = ncall_finish(ctx, csym, nproto_raw_ret_ty(ctx, rt), ptb, abuf)
+    llvm_build_ret(native_ctx_b(ctx), nproto_box_ret(ctx, r, rt))
+    ()
+  }
+}
+
+# Fill the adapter's arg + param-type buffers: LLVM param `i` is boxed; a
+# scalar param-type unbox-borrows it to its raw slot, a non-scalar passes the
+# `ptr` through. Parallel to the raw call-site marshaller, but the source is
+# the adapter's own boxed params, not KIR atoms.
+fn nproto_adapter_args(ctx: Handle, adapter: Handle, pts: [Ty], mask: [Bool], i: Int, ptb: Handle, abuf: Handle) : Unit / Console = match pts {
+  [] -> ()
+  [t, ...trest] -> {
+    let boxed = llvm_get_param(adapter, i)
+    let israw = match mask {
+      [m, ..._] -> m
+      [] -> false
+    }
+    llvm_buf_push(ptb, nproto_param_ty(ctx, t, israw))
+    llvm_buf_push(abuf, nproto_unbox_arg(ctx, boxed, t, israw))
+    let mrest = match mask {
+      [_, ...r] -> r
+      [] -> []
+    }
+    nproto_adapter_args(ctx, adapter, trest, mrest, i + 1, ptb, abuf)
+  }
+}
+
+# The raw LLVM param type for a scalar param (else `ptr`).
+fn nproto_param_ty(ctx: Handle, t: Ty, israw: Bool) : Handle =
+  if israw { nproto_scalar_ty(ctx, t) } else { native_ctx_ptrt(ctx) }
+
+# Unbox a boxed adapter param to its raw scalar (else pass the `ptr`).
+fn nproto_unbox_arg(ctx: Handle, boxed: Handle, t: Ty, israw: Bool) : Handle / Console =
+  if israw { nproto_unbox_scalar(ctx, boxed, t) } else { boxed }
+
+# Strip Dim / Refinement wrappers to the underlying scalar Ty. Recursion is
+# isolated HERE (a Ty -> Ty fn — boxed, no raw-signature/TCO-goto hazard) so
+# the scalar-type / unbox / box helpers below can `match` a FLAT ty: those
+# return a raw `Handle` (void*), and a self-tail-call in a raw-return fn
+# generates `_r = (goto-stmt)` C the cc rejects as int->pointer.
+fn nproto_strip_ty(t: Ty) : Ty = match t {
+  TyDimT(inner, _)    -> nproto_strip_ty(inner)
+  TyRefineT(inner, _) -> nproto_strip_ty(inner)
+  _                   -> t
+}
+
+# Unbox a boxed value to the raw scalar of `t` (Int/Real/Bool — the kslot
+# set; Char/Handle never reach here, gated by `pimpl_row_is_unboxed`'s
+# scalar set agreeing with this). Non-consuming borrow (the field readers).
+fn nproto_unbox_scalar(ctx: Handle, boxed: Handle, t: Ty) : Handle / Console = match nproto_strip_ty(t) {
+  TyInt  -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
+  TyReal -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
+  TyBool -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  _      -> boxed
+}
+
+# The raw scalar LLVM type for `t` (Int→i64, Real→f64, Bool→i32, else ptr).
+fn nproto_scalar_ty(ctx: Handle, t: Ty) : Handle = match nproto_strip_ty(t) {
+  TyInt  -> native_ctx_i64t(ctx)
+  TyReal -> native_ctx_f64t(ctx)
+  TyBool -> native_ctx_i32t(ctx)
+  _      -> native_ctx_ptrt(ctx)
+}
+
+# The raw LLVM return type for a (possibly scalar) return ty.
+fn nproto_raw_ret_ty(ctx: Handle, rt: Ty) : Handle =
+  if ty_is_scalar(rt) { nproto_scalar_ty(ctx, rt) } else { native_ctx_ptrt(ctx) }
+
+# Re-box a raw return into the boxed `ptr` the dispatch ABI returns (a
+# non-scalar return passes the `ptr` through).
+fn nproto_box_ret(ctx: Handle, r: Handle, rt: Ty) : Handle / Console = match nproto_strip_ty(rt) {
+  TyInt  -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), r)
+  TyReal -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), r)
+  TyBool -> ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  _      -> r
 }
