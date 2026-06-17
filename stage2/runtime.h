@@ -11395,6 +11395,8 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm-c/Linker.h>
+#include <llvm-c/IRReader.h>
 #include <stdlib.h>
 
 /* The native backend keeps one context + builder per compilation unit.
@@ -12130,6 +12132,120 @@ static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm) {
     return 0;
 }
 
+/* --- runtime bitcode link (P2, docs/native-codegen-perf-plan.md §P2) ---
+ *
+ * The native walk emits the runtime ops (`kaix_cons`, `kaix_variant_arg`,
+ * the list spine, the arithmetic helpers) as external `declare`s; their
+ * bodies live in `runtime_llvm.c`, compiled and linked by `cc` AFTER the
+ * in-process `default<O2>` pass. With no LTO, O2 sees opaque call barriers
+ * it cannot inline through — so a heap-bound loop (`list_fold`, the
+ * rb-tree) pays a real call per `kaix_cons` even at O2.
+ *
+ * This step closes that gap WITHOUT an LTO toolchain dependency or a second
+ * source of the runtime: `runtime_llvm.c` is compiled to LLVM bitcode at
+ * build time (`tools/gen-runtime-bc.sh`, clang 18, the same `-I stage2 -I
+ * stage0` resolution the cc link uses, so its `<runtime.h>` binds to the
+ * Koka runtime exactly as the C path does), and that bitcode is
+ * `LLVMLinkModules2`'d into the in-process module BEFORE the opt pipeline
+ * runs. O2 then sees the runtime BODIES and inlines/specialises them into
+ * the hot loop.
+ *
+ * Symbol model (asu-reviewed): a full link (Model X), NOT an
+ * `available_externally` graft (Model Y, the two-convergent-runtimes
+ * anti-pattern that killed the text-LLVM backend). After the link the
+ * runtime defs are merged physically into this module; we `internalize`
+ * every definition except `main` (the OS entry point the linker resolves)
+ * so the inliner can DCE the merged bodies it folds away. Because the
+ * bitcode supplies `main` + all `kaix_*` + the kaikai entry hooks, the
+ * resulting object is SELF-CONTAINED: the driver drops `runtime_llvm.c`
+ * from the final `cc` link (re-linking it would be a duplicate symbol).
+ *
+ * The bitcode path comes from `KAI_NATIVE_RUNTIME_BC` (the `bin/kai`
+ * wrapper resolves it next to `runtime_llvm.c`, mirroring how it resolves
+ * `RUNTIME_LLVM_C`; the stage2 Makefile builds it). When the env var is
+ * unset or the file is absent (a build without clang 18, so no bitcode was
+ * produced), this is a NO-OP and the driver falls back to the legacy
+ * `cc`-links-runtime_llvm.c path — correct, just unoptimised. The opt level
+ * is unchanged.
+ *
+ * MUST run after the module's target triple + data layout are set (this
+ * function copies them onto the bitcode source before linking, so the merge
+ * is clean and layout-correct) and BEFORE the opt pipeline. Returns 0 on
+ * success OR no-op; non-zero only on a real parse/link failure (a corrupt or
+ * incompatible bitcode), which the caller surfaces like a verify failure
+ * rather than emitting a half-linked module. */
+static void kai_llvm_internalize_except_main(LLVMModuleRef m) {
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;            /* nothing to internalise */
+        const char *nm = LLVMGetValueName(f);
+        if (nm && strcmp(nm, "main") == 0) continue;   /* OS entry point — keep external */
+        LLVMSetLinkage(f, LLVMInternalLinkage);
+    }
+    /* Globals defined by the runtime (string/variant-head tables, the
+     * default-evidence blobs) are referenced only from inside this now-merged
+     * module; internalise them too so globalDCE under O2 can drop the unused
+     * ones. A global the emitted code still references survives (it has a
+     * user); one the inliner folded away does not. */
+    for (LLVMValueRef g = LLVMGetFirstGlobal(m); g; g = LLVMGetNextGlobal(g)) {
+        if (LLVMIsDeclaration(g)) continue;
+        LLVMSetLinkage(g, LLVMInternalLinkage);
+    }
+}
+
+static int64_t kai_llvm_link_runtime_bc(void *m) {
+    const char *bc_path = getenv("KAI_NATIVE_RUNTIME_BC");
+    if (!bc_path || !bc_path[0]) return 0;             /* opt-out: legacy cc-links path */
+
+    LLVMMemoryBufferRef buf = NULL;
+    char *err = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+        /* File named but unreadable — not a no-op situation (the driver set
+         * the var, so it expected a bitcode). Fail loudly. */
+        fprintf(stderr, "kai: native runtime bitcode unreadable (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        return 1;
+    }
+
+    /* Parse INTO the destination module's context — LLVMLinkModules2 rejects
+     * a cross-context source. LLVMParseIRInContext takes ownership of `buf`. */
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) m);
+    LLVMModuleRef src = NULL;
+    err = NULL;
+    if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
+        fprintf(stderr, "kai: native runtime bitcode parse failed (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        return 1;
+    }
+
+    /* Reconcile the source's triple + data layout to the destination's BEFORE
+     * the link. The bitcode was produced by `clang -O2` with its own SDK
+     * triple (e.g. `arm64-apple-macosx16.0.0`), while the in-process module
+     * carries `LLVMGetDefaultTargetTriple()` (e.g. `...-darwin25.5.0`). The
+     * two are ABI-identical (same arch, same host LLVM), but a literal string
+     * mismatch makes LLVMLinkModules2 emit a noisy "different target triples"
+     * warning and would, on a real cross-target difference, keep the
+     * destination's silently. We set them equal so the link is clean and the
+     * match is guaranteed on every platform regardless of how the bitcode was
+     * generated. The destination's triple/layout were set by the caller from
+     * the emit TargetMachine just above this call. */
+    {
+        const char *dst_triple = LLVMGetTarget((LLVMModuleRef) m);
+        if (dst_triple) LLVMSetTarget(src, dst_triple);
+        LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout((LLVMModuleRef) m));
+    }
+
+    /* LLVMLinkModules2 consumes (and disposes) `src`. Returns 1 on error. */
+    if (LLVMLinkModules2((LLVMModuleRef) m, src)) {
+        fprintf(stderr, "kai: native runtime bitcode link failed (%s)\n", bc_path);
+        return 1;
+    }
+
+    kai_llvm_internalize_except_main((LLVMModuleRef) m);
+    return 0;
+}
+
 /* --- object emission --- */
 /* Verify the module, then emit it as a native object file at `path`
  * using the host target machine. Returns 0 on success, non-zero on a
@@ -12181,6 +12297,18 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
     if (features) LLVMDisposeMessage(features);
     LLVMSetTarget((LLVMModuleRef) m, triple);
     LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
+
+    /* P2: link the runtime as bitcode BEFORE opt, so default<O2> sees the
+     * `kaix_*` bodies and inlines them (no-op when KAI_NATIVE_RUNTIME_BC is
+     * unset — the legacy cc-links-runtime_llvm.c path). Runs after the
+     * triple/datalayout are set (they must match the bitcode's) and before
+     * the pipeline. A real link failure aborts before EmitToFile. */
+    if (kai_llvm_link_runtime_bc(m)) {
+        LLVMDisposeTargetMachine(tm);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
 
     /* L4 (issue #498): optimise the module in-process before codegen.
      * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-

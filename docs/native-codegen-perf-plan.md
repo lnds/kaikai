@@ -206,13 +206,27 @@ operand is never `decref`'d, so a multi-use Int never double-frees. The
 `let`-binder Int raw path (`kir_lower_raw.kai:47`) is the live precedent. Does
 **not** touch the boxed call/border ABI.
 
-### P2 — Link the runtime into the module before O2 · **do second**
+### P2 — Link the runtime into the module before O2 · **SHIPPED** (lane `native-bitcode-link`)
+
+> **Shipped 2026-06-16** (`docs/lane-experience-native-bitcode-link.md`).
+> Two structural corrections to the plan as written, both `asu`-reviewed:
+> (1) the symbol model is a FULL link + internalize-except-`main` (Model X),
+> not an `available_externally` graft — so the object is self-contained and
+> the cc link line DROPS `runtime_llvm.c` (it does NOT stay identical; the
+> literal "identical" reading was the unsound double-source one). (2) The
+> bitcode is generated at BUILD TIME per-platform (clang-18, version-gated),
+> NOT vendored — a single committed `.bc` mis-codegens across Mach-O/ELF
+> because it encodes the build host's data layout. Measured: `list_fold`
+> 1.21× and `rbtree` 1.05× faster than legacy native; `bl`-to-`kaix_*` per
+> binary 4704 → 573. The residual is the boxed-cons `malloc`/slab tax, which
+> P2 cannot remove (a future reuse-in-place / unboxed-cons lane).
 
 **What.** Compile `runtime_llvm.c` (and the `runtime.h` helpers) to LLVM
 **bitcode** and `LLVMLinkModules2` it into the in-process module *before*
 `default<O2>` runs. Then O2 sees the *bodies* of `kaix_cons`,
-`kaix_variant_arg`, the list spine — and can inline/specialise them. The final
-`cc` link line is unchanged.
+`kaix_variant_arg`, the list spine — and can inline/specialise them. The
+object becomes self-contained (the merged runtime is internalised + DCE'd
+into it), so the final `cc` link drops `runtime_llvm.c`.
 
 **Why this and not the alternatives (asu).** Rejected: (a) LTO via `cc` flags —
 adds a toolchain dependency and a release-only failure mode; (b) emitting the hot
