@@ -85,10 +85,15 @@ fn nname_in(xs: [String], t: String) : Bool = match xs {
 # Lower one op to a value handle. All results are boxed `ptr` except
 # `KTagOf` (raw i32). Effects (KPerform/KSetjmp) are later subsets — they
 # abort loudly and yield a null placeholder.
-pub fn nemit_op(ctx: Handle, op: KOp) : Handle / Console = match op {
+pub fn nemit_op(ctx: Handle, op: KOp, fns: [KFn]) : Handle / Console = match op {
   KLitOp(v)            -> nemit_atom(ctx, v)
   KPrim(nm, cargs)     -> nemit_prim(ctx, nm, cargs)
-  KCall(sym, cargs)    -> nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs))
+  # P3: a direct call to a UFn with a raw signature passes each arg at its
+  # param slot + boxes a raw return; everything else stays the boxed funnel.
+  # The callee KFn (looked up by its mangled `sym` in `fns`) carries the
+  # raw param/return slots the lowering populated, so the call-site reads
+  # them off the KIR — never re-deriving the UFnSig (KSlot single source).
+  KCall(sym, cargs)    -> nemit_call_direct(ctx, sym, cargs, fns)
   KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
   KCon(nm, tag, inits) -> nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits))
   KRecord(fields)      -> nemit_record(ctx, fields)
@@ -137,6 +142,85 @@ fn nemit_setjmp_op(ctx: Handle, sym: String) : Handle / Console = {
 # for every boxed call whose args were just materialised into a fresh buf.
 fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
   let r = nemit_call_boxed(ctx, sym, argbuf); llvm_buf_free(argbuf); r
+}
+
+# --- P3: direct call to a (possibly raw) UFn ---------------------------
+#
+# A `KCall(sym, cargs)` is a direct call to a known symbol (the KIR already
+# decided direct-vs-indirect via `callee_is_direct`, honouring the
+# locals-shadow rule). When that symbol resolves to a user fn whose KFn
+# carries a raw signature (`nfn_has_raw_slot`), the call is emitted RAW:
+# each arg is materialised at its PARAM slot (a raw param gets a raw arg
+# directly; a boxed param gets the boxed atom; a raw param fed a boxed atom
+# unbox-borrows at the slot, all via `nemit_atom_raw`), the call uses the
+# raw LLVM signature (`nfn_llvm_type`), and a RAW return is re-boxed (the
+# KCall's result register is always boxed — `lower_direct_call` binds it
+# `SBoxed`). Mirror of emit_c's `emit_ufn_boxed_call` + `ufn_call_result`.
+#
+# A symbol with no raw KFn (a prelude builtin, a runtime prim, a fully
+# boxed user fn) takes the legacy all-boxed funnel unchanged.
+fn nemit_call_direct(ctx: Handle, sym: String, cargs: [KVal], fns: [KFn]) : Handle / Console =
+  match nfn_by_sym(fns, sym) {
+    Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f) }
+               else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
+    None    -> nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs))
+  }
+
+# Look up the callee KFn by its mangled symbol (`KCall.sym` is already the
+# `c_sym` the lowering resolved, matching `KFn.sym`). Only `KFnNormal`
+# carries a raw signature — a lambda/clause/FFI is never a direct `KCall`
+# target with raw slots, so matching any kind by `sym` is safe (a non-raw
+# kind returns `nfn_has_raw_slot == false` and falls to the boxed path).
+fn nfn_by_sym(fns: [KFn], sym: String) : Option[KFn] = match fns {
+  [] -> None
+  [f, ...rest] -> if f.sym == sym { Some(f) } else { nfn_by_sym(rest, sym) }
+}
+
+# Emit the raw direct call: build the param-type buffer + the arg buffer in
+# lockstep (each arg materialised at its param slot), declare + call the fn
+# at its raw type, then re-box a raw return for the boxed result register.
+fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn) : Handle / Console = {
+  let ptb = llvm_buf_new()
+  let ab = llvm_buf_new()
+  nemit_raw_args(ctx, f.params, cargs, ptb, ab)
+  let r = ncall_finish(ctx, sym, nslot_type(ctx, f.ret), ptb, ab)
+  nemit_box_ret(ctx, r, f.ret)
+}
+
+# Materialise each arg at its param's slot, pushing the param TYPE into
+# `ptb` and the arg VALUE into `ab` in the same order. A raw param slot
+# (`SInt64`/`SReal`/`SBool`) materialises the arg raw (`nemit_atom_raw`
+# adapts a boxed atom down at the slot); a boxed param keeps the boxed
+# atom. The two buffers stay aligned, so `ncall_finish` builds a matching
+# `(rawslot...) -> ret` signature. A length mismatch is a lowering bug —
+# the param list and `cargs` are the same arity by construction.
+fn nemit_raw_args(ctx: Handle, ps: [KParam], cargs: [KVal], ptb: Handle, ab: Handle) : Unit / Console = match ps {
+  [] -> ()
+  [p, ...prest] -> match cargs {
+    [a, ...arest] -> {
+      llvm_buf_push(ptb, nslot_type(ctx, p.slot))
+      llvm_buf_push(ab, nemit_arg_at_slot(ctx, a, p.slot))
+      nemit_raw_args(ctx, prest, arest, ptb, ab)
+    }
+    [] -> { nemit_unsupported(ctx, "raw call arity mismatch (fewer args than params)"); () }
+  }
+}
+
+# An arg at a param slot: raw slots use `nemit_atom_raw` (raw literal /
+# raw register / boxed→raw border), a boxed slot the plain boxed atom.
+fn nemit_arg_at_slot(ctx: Handle, a: KVal, slot: KSlot) : Handle / Console = match slot {
+  SBoxed -> nemit_atom(ctx, a)
+  _      -> nemit_atom_raw(ctx, a, slot)
+}
+
+# Re-box a raw return into the boxed `KaiValue *` the result register
+# holds. A boxed return (slot `SBoxed`) passes through. Mirror of
+# `ufn_call_result`'s `box_wrap` (only boxes when the return is raw).
+fn nemit_box_ret(ctx: Handle, r: Handle, ret: KSlot) : Handle / Console = match ret {
+  SInt64 -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), r)
+  SReal  -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), r)
+  SBool  -> ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  _      -> r
 }
 
 # A fresh 2-element buffer (handles never ride a kaikai list).
