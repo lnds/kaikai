@@ -74,15 +74,15 @@ allocation**. Pure arithmetic (all scalar) is ~86×; heap-bound workloads where
 compress to ~2–3×. This is the signature of an Int-boxing problem, not a
 runtime-wide one.
 
-> **† `variant_match` is reported at 40K rounds because the native binary
-> scales *super-linearly* on this workload — an anomaly the other benches do
-> not show.** Native wall time: N=10K → 0.30 s, 20K → 0.30 s, 40K → 1.37 s,
-> **80K → 142 s** (a ~100× jump for a 2× increase in N). The C binary stays
-> linear (0.01 s at 150K). Peak RSS barely moves — native 24 MB at 40K, 34 MB
-> at 80K (1.4×) while time grew ~100× — so this is **not** a runaway leak; the
-> time blows up far faster than the live set. This is a **second, independent
-> finding**, distinct from the all-boxed gap, flagged for its own
-> investigation (§3.4); it is not on the P1/P2 critical path.
+> **† `variant_match` was reported at 40K rounds because the native binary used
+> to scale *super-linearly* on this workload (now FIXED — issue #855, §3.4).**
+> Before the fix, native wall time was N=10K → 0.30 s, 20K → 0.30 s, 40K →
+> 1.37 s, **80K → 142 s** (a ~100× jump for a 2× increase in N) while the C
+> binary stayed linear and peak RSS barely moved (24 MB → 34 MB) — the
+> signature of the immortal-variant cache saturating, not a runaway leak.
+> **After the fix, native scales flat:** N=10K → 0.31 s, 20K → 0.32 s, 40K →
+> 0.32 s, 80K → 0.35 s, matching C's shape. The residual native-vs-C factor is
+> now the *linear* all-boxed boxing gap (cause #1), the P1/P2 territory.
 
 ## 3. Root cause, with machine-level evidence
 
@@ -139,24 +139,40 @@ Three things the IR rules out, so the plan does not chase them:
   (`kai_tagged_int`, `runtime.h:520`): the re-box is a shift+bit-OR, not a heap
   allocation. So P1 below kills *inlining barriers*, not allocs.
 
-### 3.4 Open: `variant_match` super-linear collapse (second finding)
+### 3.4 RESOLVED: `variant_match` super-linear collapse (second finding) — issue #855
 
-The `variant_match` native binary does not just run slow — it runs
-*super-linearly* (table † in §2): doubling the round count from 40K to 80K
-multiplies wall time ~100× (1.37 s → 142 s), while the C binary stays linear and
-peak RSS barely moves (24 MB → 34 MB, 1.4×). The all-boxed gap (cause #1) is
-*linear* — it explains the `arith` and `list` factors but **not** a
-100×-per-2× collapse against a near-constant live set.
+> **Status (2026-06-17): FIXED.** Root cause was the runtime's **immortal-
+> variant cache**, not the allocator free-list / RC-bookkeeping / reuse-token
+> candidates guessed below. N=80K went from >70 s to 0.35 s; native now scales
+> **flat** in N, matching C. See `docs/lane-experience-native-variant-match-
+> superlinear.md` for the full investigation.
 
-This points at a distinct defect on the variant-build + recursive-`eval` path:
-something whose cost grows with the number of rounds despite the per-round work
-and the live set both being constant (`tree(i)` is a fixed 5-node tree). Candidate
-causes (not yet confirmed): a non-amortised slab/free-list operation that degrades
-as the allocation count climbs, an RC bookkeeping structure that grows, or a
-pathological reuse-token interaction. **This is out of scope for the P1/P2 plan
-below** (those address the linear boxing gap). It is recorded here so a future
-lane investigates it with `KAI_TRACE_RC` + an allocator profile; it likely
-warrants its own GitHub issue once reproduced minimally.
+The `variant_match` native binary ran *super-linearly* (table † in §2):
+doubling the round count from 40K to 80K multiplied wall time ~100× while the C
+binary stayed linear and peak RSS barely moved. The all-boxed gap (cause #1) is
+*linear* — it could not explain a 100×-per-2× collapse against a near-constant
+live set.
+
+**Root cause.** The bench rebuilds `tree(i)` each round with leaves carrying the
+variable index `i` (`Lit(i)`). The native all-boxed codegen boxes every Int
+field and builds the variant via `kaix_variant` → `kai_variant_u` with `mask==0`.
+That path consults the **immortal-variant cache** (`kai_slots_all_immortal_ptr`),
+which counted a *tagged-Int immediate* slot as "immortal" — so `Lit(i)` for
+**arbitrary** `i` was interned, one entry per distinct `i`, into a fixed
+262144-bucket open-addressing table. An unbounded set of `Lit(i)` saturates the
+table and degrades its linear probe to **O(n) per operation** → quadratic total.
+RSS stays flat because the table is pre-allocated. The C backend never hits this:
+it builds `Lit(k)` via `kai_variant_u_fast` with a typed `.i64` slot, bypassing
+the `mask==0` cache.
+
+**Fix (issue #855).** Two parts: (1) `kai_slots_all_immortal_ptr` now
+*disqualifies* a variant whose slot is a tagged-Int immediate from
+immortalisation (the load-bearing fix — closes the whole class); (2) the native
+KIR match-lowering emits the owned-scrutinee match-exit drop it had been
+skipping, so the no-longer-immortalised `Lit(i)` cells are reclaimed and the
+live set stays constant. A follow-up lane can build `Lit(i)` with a typed `.i64`
+slot in the native codegen (the C `_fast` path) to remove the representation
+divergence at the source; the runtime fix then stands as defense-in-depth.
 
 ## 4. Optimisation plan (priority-ordered)
 

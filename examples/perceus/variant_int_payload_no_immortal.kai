@@ -1,0 +1,55 @@
+# Issue #855 — a variant whose payload is a VARIABLE tagged Int must NOT be
+# interned in the native runtime's immortal-variant cache.
+#
+# Root cause: the stage2 runtime's `kai_variant_u` immortalises a `mask==0`
+# variant when every slot is "immortal" — and `kai_slots_all_immortal_ptr`
+# counted a tagged-Int IMMEDIATE as immortal (it has no header, so it never
+# frees). That is the right judgement for a *constant* Int reused a bounded
+# number of times, but the native all-boxed codegen boxes EVERY Int field and
+# routes it through this mask==0 path, so `Lit(i)` for arbitrary `i` was
+# interned once per distinct `i`. The immortal cache is a fixed-size open-
+# addressing table; interning an unbounded set of `Lit(i)` saturates it and
+# degrades its linear probe to O(n) — the `variant_match` bench ran super-
+# linearly (N=40K → 0.9 s, N=80K → >70 s) while the C backend stayed flat
+# (the C backend builds `Lit(k)` via `kai_variant_u_fast` with a TYPED `.i64`
+# slot, never touching the cache).
+#
+# Fix (stage2/runtime.h): a tagged-Int immediate slot DISQUALIFIES the variant
+# from immortalisation — only genuinely immortal heap pointers (interned
+# strings, other rc-saturated cells) make a variant cache-worthy. Combined
+# with the KIR match-exit drop of an owned scrutinee (kir_lower_walk.kai), the
+# rebuilt-each-round variant is now freed: the live set stays constant and the
+# bench scales linearly, matching C.
+#
+# This fixture builds a fresh `Expr` tree per round whose leaves carry the
+# round index (a variable Int), evaluates it, and sums the results. A leaked /
+# immortalised cell shows as an unbounded live set; a correct run frees each
+# tree. The parity harness gates native == C on the printed sum.
+
+type Expr =
+  Lit(Int)
+  | Add(Expr, Expr)
+  | Mul(Expr, Expr)
+
+fn eval(e: Expr) : Int =
+  match e {
+    Lit(n)    -> n
+    Add(a, b) -> eval(a) + eval(b)
+    Mul(a, b) -> eval(a) * eval(b)
+  }
+
+# A fresh 3-node tree carrying the variable index `k` in its leaves.
+fn tree(k: Int) : Expr = Add(Mul(Lit(k), Lit(2)), Lit(k))
+
+fn rounds(i: Int, acc: Int) : Int =
+  if i == 0 { acc }
+  else { rounds(i - 1, acc + eval(tree(i))) }
+
+fn main() : Int / Console = {
+  # 300 rounds: enough that an immortalising run would intern 300 distinct
+  # `Lit(i)` cells (plus the composites), but small enough to stay a fast
+  # tier fixture. eval(tree(k)) = k*2 + k = 3k, summed over 1..300:
+  # 3 * (300*301/2) = 3 * 45150 = 135450.
+  print(int_to_string(rounds(300, 0)))
+  0
+}
