@@ -187,6 +187,14 @@ else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+ifeq ($(KAI_LLVM),1)
+	@# P2 (docs/native-codegen-perf-plan.md §P2): generate the native-runtime
+	@# bitcode the in-process backend links before O2. Build-time + gated to
+	@# clang 18 (writer <= the libLLVM-18 reader); a clang-18-less host opts
+	@# out cleanly (native falls back to linking runtime_llvm.c with cc). The
+	@# script is idempotent — a no-op when the .bc is fresh.
+	@../tools/gen-runtime-bc.sh || true
+endif
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build

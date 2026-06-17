@@ -45,6 +45,14 @@ CC="${CC:-cc}"
 FIXDIR="examples/native"
 KAIC2="$ROOT/stage2/kaic2"
 RUNTIME_LLVM_C="$ROOT/stage0/runtime_llvm.c"
+# P2 (docs/native-codegen-perf-plan.md §P2): when the runtime bitcode is
+# present (the stage2 KAI_LLVM build generated it via clang 18), exercise the
+# P2 path — point kaic2 at the .bc so it links it before O2, and link the
+# self-contained object without runtime_llvm.c. Absent → the legacy path
+# (cc links runtime_llvm.c). Either way the oracle is C-direct, so this gate
+# proves P2 keeps parity, not just that it runs.
+RUNTIME_LLVM_BC="$ROOT/stage0/runtime_llvm.bc"
+[ -f "$RUNTIME_LLVM_BC" ] || RUNTIME_LLVM_BC=""
 
 # The native backend needs a kaic2 linked against libLLVM. The default
 # `make kaic2` does NOT link it, so (re)build with KAI_LLVM=1 here. The
@@ -85,7 +93,7 @@ for fix in "$FIXDIR"/*.kai; do
   # --- native backend: emit object in-process, link, run ---
   obj="$WORK/$name.o"
   nbin="$WORK/$name-native"
-  if ! "$KAIC2" --emit=native -o "$obj" "$fix" >/dev/null 2>"$WORK/$name.nemit.err"; then
+  if ! env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" "$KAIC2" --emit=native -o "$obj" "$fix" >/dev/null 2>"$WORK/$name.nemit.err"; then
     # --emit=native prints the object path; -o is ignored by the
     # current spine, so fall back to the source-derived path.
     :
@@ -101,8 +109,15 @@ for fix in "$FIXDIR"/*.kai; do
     fail=$((fail + 1))
     continue
   fi
-  if ! "$CC" "$obj" "$RUNTIME_LLVM_C" -I "$ROOT/stage2" -I "$ROOT/stage0" -o "$nbin" -lm \
-       >"$WORK/$name.nlink.err" 2>&1; then
+  # With the bitcode linked in-process, the object is self-contained (it
+  # defines main + every kaix_*), so re-adding runtime_llvm.c would be a
+  # duplicate symbol. Without it, link runtime_llvm.c as before.
+  if [ -n "$RUNTIME_LLVM_BC" ]; then
+    nlink_cmd='"$CC" "$obj" -o "$nbin" -lm'
+  else
+    nlink_cmd='"$CC" "$obj" "$RUNTIME_LLVM_C" -I "$ROOT/stage2" -I "$ROOT/stage0" -o "$nbin" -lm'
+  fi
+  if ! eval "$nlink_cmd" >"$WORK/$name.nlink.err" 2>&1; then
     echo "FAIL $name — native object did not link"
     cat "$WORK/$name.nlink.err"
     fail=$((fail + 1))

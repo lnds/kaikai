@@ -159,6 +159,28 @@ else
   RUNTIME_LLVM_C=""
 fi
 
+# P2 (docs/native-codegen-perf-plan.md §P2): the precompiled runtime
+# BITCODE, sitting next to runtime_llvm.c. When present, kaic2 links it
+# into the in-process module BEFORE default<O2> (via KAI_NATIVE_RUNTIME_BC),
+# so O2 inlines the runtime ops (kaix_cons, the list spine, the arith
+# helpers) into hot heap-bound loops. The resulting object is
+# SELF-CONTAINED — it already defines main + every kaix_*, so the final
+# `cc` link must NOT re-add runtime_llvm.c (that is a duplicate-symbol
+# error). When the .bc is absent (a checkout/release that did not vendor
+# it), this stays empty and the native link falls back to the legacy path:
+# cc compiles+links runtime_llvm.c, identical behaviour, just without the
+# P2 inlining. The bitcode is version-locked to the libLLVM kaic2 links
+# (writer ≤ reader); a stale/incompatible .bc would fail to parse, which is
+# why generation is pinned to the same clang-18 toolchain (see
+# stage0/runtime_llvm.bc.mk / the lane retro).
+if [ -f "$RUNTIME_INC/runtime_llvm.bc" ]; then
+  RUNTIME_LLVM_BC="$RUNTIME_INC/runtime_llvm.bc"
+elif [ -f "$ROOT/stage0/runtime_llvm.bc" ]; then
+  RUNTIME_LLVM_BC="$ROOT/stage0/runtime_llvm.bc"
+else
+  RUNTIME_LLVM_BC=""
+fi
+
 die() {
   echo "kai: error: $*" >&2
   exit 2
@@ -1084,8 +1106,18 @@ compile_to_binary() {
     cp "$src" "$tmp/$src_base"
     obj="$tmp/${src_base%.kai}.o"
     nerr="$tmp/native.err"
+    # P2: when the runtime bitcode is vendored, point kaic2 at it so it
+    # links it into the module before O2 (the object then defines main +
+    # every kaix_*, and the cc link below drops runtime_llvm.c). Absent →
+    # the env var stays unset, kaic2's link step is a no-op, and the cc
+    # link keeps runtime_llvm.c (legacy path). `--debug` (KAI_NATIVE_OPT=0)
+    # is unaffected: the bitcode is still linked, just not O2-inlined.
+    nbc_env=""
+    if [ -n "$RUNTIME_LLVM_BC" ]; then
+      nbc_env="$RUNTIME_LLVM_BC"
+    fi
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+    if ! (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
       # Distinguish "this kaic2 has no native backend" (actionable: the
       # build was C-only) from a real compile error in the user program.
       # The C-only stub aborts with a known sentinel string; anything
@@ -1128,7 +1160,19 @@ compile_to_binary() {
     # Same runtime-include precedence as the C path: the shim's
     # `#include "runtime.h"` must bind to stage2's Koka runtime
     # (tagged Int, slab, reuse-token), so $RUNTIME_INC_C leads.
-    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm
+    #
+    # P2: if the bitcode was linked in-process, the object already defines
+    # main + every kaix_* (the runtime is merged + internalised + DCE'd into
+    # it), so the cc link is just the object + libm — adding runtime_llvm.c
+    # would be a duplicate-symbol error. Without the bitcode (legacy /
+    # fallback), cc compiles+links runtime_llvm.c as before. The -I flags are
+    # only needed when runtime_llvm.c is compiled, but they are harmless on
+    # the self-contained line so the two arms stay close.
+    if [ -n "$RUNTIME_LLVM_BC" ]; then
+      $CC $CFLAGS "$obj" -o "$out" -lm
+    else
+      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm
+    fi
   elif [ "${KAI_MODULAR:-0}" = "1" ]; then
     # Issue #748: separate compilation. kaic2 emits a marker-delimited
     # stream of per-module `.c` files + two shared headers
