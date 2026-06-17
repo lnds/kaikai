@@ -100,6 +100,29 @@ keeps reading the `UFnSig` directly (it emits from the AST, not the KIR).
   Always `make selfhost` before "done" — `make kaic2` (bundle) is false-green
   on privacy + effect rows.
 
+- **Raw proto impls broke the dispatch ABI — caught by CI, masked locally by
+  the flaky-held ratchet.** A pimpl like `Hash_String_hash(String) : Int` now
+  classifies raw (`i64 (ptr)` — boxed param, raw return). `emit_native_proto`
+  registered the impl fn-ptr verbatim into the runtime table, on the
+  documented assumption "the KIR is all-boxed, the impl IS the dispatch ABI."
+  P3 broke that: the dispatcher (`kaix_proto_dispatch1`) casts the registered
+  fn to `KaiValue*(KaiValue*)` and calls it — a raw `i64(ptr)` impl returns an
+  `i64` read as a `ptr`, dereferenced → SIGSEGV (hashmap/hashset). The fix
+  mirrors the C-direct oracle: emit a `_kai_<csym>__boxed(ptr × arity)` adapter
+  (unbox masked args, call the raw impl, re-box the raw return) and register
+  THAT for a raw impl (`pimpl_row_is_unboxed`), the bare csym for a boxed one.
+  Adapters are emitted in an up-front pass (before `_kai_proto_init_llvm`
+  opens) so each owns the builder cleanly. **The local ratchet marked these
+  "flaky — passed on recheck" (the parallel-worker false-green the memory
+  warns about); only CI's serial-ish run failed consistently.** Lesson:
+  proto-heavy fixtures need a SERIAL native-vs-C check, not the parallel
+  ratchet, when an ABI-touching change lands. A second trap surfaced fixing
+  this: `nproto_scalar_ty` (`Ty -> Handle`, a raw `void*` return) recursed
+  TAIL on Dim/Refine; the C-direct TCO rewrite emitted `_r = (goto-stmt)`,
+  which cc rejects as int->pointer for a `void*` return. Isolating the
+  recursion in a `Ty -> Ty` strip helper (`nproto_strip_ty`, boxed return, no
+  raw-goto hazard) + flat matches fixed it.
+
 - **The RC double-free trap on buffer construction.** `nfn_llvm_type`'s first
   form passed `llvm_buf_new()` INLINE as an arg (`nparam_type_buf(ctx, ps,
   llvm_buf_new())`). The type-blind kaic1 RC-dropped that inline handle, then
