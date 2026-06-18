@@ -43,14 +43,16 @@ review).
 > | `list_fold` | 4.96 | 9.12 | **1.84×** |
 > | `rbtree_corpus` | 1.21 | 2.65 | **2.2×** |
 >
-> Scalar arithmetic is at C parity. Two residuals remain, both diagnosed and
-> tracked as open issues:
-> - **#860** — cons/list RC leak (native never cascades `decref→free`): the
->   dominant heap residual, drives `list_fold` 1.84× and `rbtree` 2.2×.
+> Scalar arithmetic is at C parity. Residual status:
+> - **#860 (FIXED)** — cons/list RC leak (native never cascaded `decref→free`):
+>   the native back-edge now emits the dropmask (`nemit_drop_assigns_masked`)
+>   and self-tail arms drop the owned scrutinee (`match_selftail_scr_drop` +
+>   the TRMC `__kai_cons_s` step), so `free_total` cascades exactly as the C
+>   oracle (`decref_total` identical). `leaked` is now a constant, not linear
+>   in the list length.
 > - **#861** — non-tail raw call result re-boxes (`kaix_int` → `kaix_int_field`
 >   per call): drives `deep_rec` ~8×; not heap-bound (zero allocs in the loop).
-> - **#858** (open) — native `kai_op_eq` over-decref UAF; must land before #860/#861
->   (shared native-RC frontier, serial-ratchet gate).
+> - **#858 (FIXED, PR #862)** — native `kai_op_eq` over-decref UAF.
 
 ## TL;DR
 
@@ -349,5 +351,5 @@ This lane **diagnosed and planned**. It shipped the benchmark harness
 lane. The opt-level "one-liner" the brief authorised does not exist (§TL;DR),
 so no compiler code changed here. The codegen work the plan scoped then shipped
 across follow-up lanes P1–P4 + §3.4 — see the closure-status table at the top.
-Remaining residuals are tracked as #858 (UAF), #860 (cons leak), #861 (non-tail
-raw call re-box).
+Residuals: #858 (UAF) and #860 (cons leak) are FIXED; #861 (non-tail raw call
+re-box, `deep_rec`) remains.

@@ -851,20 +851,62 @@ fn match_finish(owned: Bool, r: LRes) : LRes =
   if owned { match r { LRes(v, st) -> LRes(v, ls_emit(st, KRC(KDrop(KVar("__pcs_scr_drop")), KNoPos))) } }
   else { r }
 
-# NOTE on self-tail arms (`KTcrecGoto` / `KTrmcStep`): a self-tail-recursive
-# arm seals its block BEFORE control reaches the match continuation where
-# `match_finish` plants the owned-scrutinee drop, so it does NOT get that exit
-# drop. For the variant-switch path this lane fixes (the `variant_match`
-# collapse) the recursive call is NOT a self-tail (`eval(a) + eval(b)`), so the
-# scrutinee flows through the continuation and is dropped there. For the
-# cons-modulo (`KTrmcStep`) path the scrutinee's cons cell is consumed by the
-# TRMC reuse + dropmask already, so planting an extra exit drop there would
-# DOUBLE-FREE the cell (measured: it corrupts the `map`/`filter` spine that
-# `list_sum` then walks, → use-after-free → stack overflow). The pre-existing
-# native limitation that a self-tail arm over an *owned* (non-reused) scrutinee
-# leaks it is left to the codegen typed-slot follow-up (it needs the C oracle's
-# `pmask` raw/boxed param distinction to drop precisely); it is out of scope
-# here and unrelated to the immortalisation collapse this lane closes.
+# Self-tail arms (`KTcrecGoto`) seal their block BEFORE control reaches the
+# match continuation where `match_finish` plants the owned-scrutinee drop, so
+# the exit drop never runs for them: an owned, non-reused scrutinee consumed by
+# a pure self-tail leaks one cell per iteration (issue #860 — `free_total=0`).
+# The fix mirrors the C oracle `emit_match_arm`/`emit_match_arm_raw`
+# (`emit_c.kai`), which PRE-INJECTS `kai_decref(_scr)` INTO the arm body when
+# the scrutinee is owned and every tail leaf is a pure `__kai_tcrec|` sentinel
+# (`tcrec_tail_always_sentinel`), so the decref runs before the `goto` fires —
+# `match_selftail_scr_drop` plants the identical `KDrop(__pcs_scr_drop)` ahead
+# of the body lowering at each arm site.
+#
+# The discriminant is the C oracle's exactly: `arm_body_all_tail_self_tcrec`
+# tests `es_tcrec_is_sentinel` (the `__kai_tcrec|` pure self-tail), which
+# EXCLUDES the cons-modulo `__kai_trmc|` step. For a `KTrmcStep` the scrutinee's
+# cons cell is already consumed by the TRMC reuse + dropmask, so it is NOT a
+# tail-self-tcrec leaf, the pre-body drop is suppressed, and the cell is not
+# double-freed (the trap that corrupted the `map`/`filter` spine in the #856
+# first attempt). A self-tail arm is also never a reuse arm (`arm_body_uses_
+# reuse` would be the donor path), so the pre-body drop and the #858 alias dup
+# coexist exactly as the oracle's `is_alias` incref + pre-injected decref do.
+
+# Plant the owned-scrutinee drop AHEAD of a self-tail arm body, mirroring the
+# oracle's pre-injected `kai_decref(_scr)`. Emits `KDrop(__pcs_scr_drop)` (the
+# very binder `match_finish` would drop in the continuation the self-tail goto
+# skips) into the arm block before the body lowers — so it runs before the
+# back-edge seals. Gated on `owned ∧ arm_body_all_tail_self_tcrec`: the binder
+# is bound only by an OWNED `match_preamble`, and the predicate fires only for
+# a pure `__kai_tcrec|` tail (never a `__kai_trmc|` cons-modulo step, whose
+# cell the reuse + dropmask already consumes).
+fn match_selftail_scr_drop(owned: Bool, body: Expr, st: LowerSt) : LowerSt =
+  if owned and arm_body_all_tail_self_tcrec(body) {
+    ls_emit(st, KRC(KDrop(KVar("__pcs_scr_drop")), kpos_of(body)))
+  } else { st }
+
+# True iff EVERY tail leaf of `body` is a pure self-tail-call sentinel
+# (`__kai_tcrec|`, `es_tcrec_is_sentinel`) — the exact predicate the C oracle
+# uses (`tcrec_tail_always_sentinel`, emit_c.kai). A `__kai_trmc|` step is NOT
+# a leaf here (it has no `es_tcrec_is_sentinel` callee), so a cons-modulo arm
+# never satisfies this — the discriminant that keeps `match_selftail_scr_drop`
+# from double-freeing the TRMC-reused cell.
+fn arm_body_all_tail_self_tcrec(body: Expr) : Bool = match body.kind {
+  ECall(f, _) -> match f.kind { EVar(callee) -> es_tcrec_is_sentinel(callee) _ -> false }
+  EIf(_, t, oe) -> match oe {
+    None    -> false
+    Some(e) -> arm_body_all_tail_self_tcrec(t) and arm_body_all_tail_self_tcrec(e)
+  }
+  EMatch(_, arms) -> arms_all_tail_self_tcrec(arms)
+  EBlock(_, ot) -> match ot { None -> false Some(e) -> arm_body_all_tail_self_tcrec(e) }
+  _ -> false
+}
+
+fn arms_all_tail_self_tcrec(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, body)] -> arm_body_all_tail_self_tcrec(body)
+  [Arm(_, _, body), ...rest] -> arm_body_all_tail_self_tcrec(body) and arms_all_tail_self_tcrec(rest)
+}
 
 # `match scr { [list patterns] }`: a fail-chain decision tree mirroring the
 # C-direct (`emit_pat_test_list`) / LLVM (`llvm_emit_pat_list`) emitters.
@@ -925,7 +967,8 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
       let st_dup = if owned and not arm_body_uses_reuse(body) {
         lm_dup_alias_binders(list_arm_alias_binders(p), KAt(p.line, p.col), st_body)
       } else { st_body }
-      let st_done = lower_branch_into(body, join, lcont, st_dup)
+      let st_drop = match_selftail_scr_drop(owned, body, st_dup)
+      let st_done = lower_branch_into(body, join, lcont, st_drop)
       if list_arm_is_catchall(p) { st_done }
       else { lower_list_arms(rest, scrv, join, lcont, owned, reopen(st_done, fail_lbl)) }
     } } }
@@ -942,7 +985,7 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSReg(join, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let st3 = lower_lit_arms(arms, scrv, join, lcont, st2)
+      let st3 = lower_lit_arms(arms, scrv, join, lcont, owned, st2)
       LRes(KVar(join), reopen(st3, lcont))
     } } }
 
@@ -953,13 +996,14 @@ fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) :
 # (later arms are dead). With no catch-all the last fail label is sealed
 # `KUnreachable`.
 fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                  st: LowerSt) : LowerSt / Console = match arms {
+                  owned: Bool, st: LowerSt) : LowerSt / Console = match arms {
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_done = lower_branch_into(body, join, lcont, st_body)
+      let st_drop = match_selftail_scr_drop(owned, body, st_body)
+      let st_done = lower_branch_into(body, join, lcont, st_drop)
       if lit_arm_is_catchall(p) { st_done }
-      else { lower_lit_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+      else { lower_lit_arms(rest, scrv, join, lcont, owned, reopen(st_done, fail_lbl)) }
     } } }
 }
 
@@ -976,7 +1020,7 @@ fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSReg(join, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let st3 = lower_record_arms(arms, scrv, join, lcont, st2)
+      let st3 = lower_record_arms(arms, scrv, join, lcont, owned, st2)
       LRes(KVar(join), reopen(st3, lcont))
     } } }
 
@@ -988,13 +1032,14 @@ fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt
 # chain (later arms are dead). With no catch-all the last fail label is
 # sealed `KUnreachable`.
 fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                     st: LowerSt) : LowerSt / Console = match arms {
+                     owned: Bool, st: LowerSt) : LowerSt / Console = match arms {
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_done = lower_branch_into(body, join, lcont, st_body)
+      let st_drop = match_selftail_scr_drop(owned, body, st_body)
+      let st_done = lower_branch_into(body, join, lcont, st_drop)
       if rec_arm_is_catchall(p) { st_done }
-      else { lower_record_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+      else { lower_record_arms(rest, scrv, join, lcont, owned, reopen(st_done, fail_lbl)) }
     } } }
 }
 
@@ -1069,7 +1114,8 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # destructure) aliases the scrutinee like a variant arm; restore the
       # oracle's structural pointer-slot incref so the owned exit drop balances.
       let st_dup = dup_variant_arm_binders(p, body, owned, st_def)
-      lower_branch_into(body, join, lcont, st_dup)
+      let st_drop = match_selftail_scr_drop(owned, body, st_dup)
+      lower_branch_into(body, join, lcont, st_drop)
     }
     None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
   }
@@ -1168,7 +1214,8 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st_arm = reopen(st, lbl)
       let st_bound = bind_pattern_fields(p, scrv, st_arm)
       let st_dup = dup_variant_arm_binders(p, body, owned, st_bound)
-      lower_branch_into(body, join, lcont, st_dup)
+      let st_drop = match_selftail_scr_drop(owned, body, st_dup)
+      lower_branch_into(body, join, lcont, st_drop)
     } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, reopen(st, lbl)) }
   _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, reopen(st, lbl))
 }
@@ -1188,12 +1235,14 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
       let st3 = bind_pattern_fields(p, scrv, reopen(st2, body_lbl))
       let st3d = dup_variant_arm_binders(p, body, owned, st3)
-      lower_branch_into(body, join, lcont, st3d)
+      let st3dd = match_selftail_scr_drop(owned, body, st3d)
+      lower_branch_into(body, join, lcont, st3dd)
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
         let st4 = emit_arm_subtests_and_binds(p, scrv, body_lbl, next_fail, st2)
         let st4d = dup_variant_arm_binders(p, body, owned, st4)
-        let st5 = lower_branch_into(body, join, lcont, st4d)
+        let st4dd = match_selftail_scr_drop(owned, body, st4d)
+        let st5 = lower_branch_into(body, join, lcont, st4dd)
         lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, st5)
       } }
     } }

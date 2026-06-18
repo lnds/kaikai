@@ -31,8 +31,9 @@ The honesty claims are all met for emitted user programs:
 > (`--backend=native`) is now the default. Its bitcode-link (P2, #854) already
 > merges the runtime module before O2 — the "build-chain Tier-2 lane" this note
 > says the gap "needs". Current native-vs-C numbers and the live residuals live
-> in `docs/native-codegen-perf-plan.md` (scalar at C parity; #860 cons leak,
-> #861 non-tail re-box). The block below is retained for the RC-discipline
+> in `docs/native-codegen-perf-plan.md` (scalar at C parity; #860 cons leak
+> FIXED — `free_total` now cascades as the C oracle; #861 non-tail re-box
+> remains). The block below is retained for the RC-discipline
 > genealogy (#747), not as a current perf claim.
 
 > **Backend note (LLVM RC, 2026-06-07, #747 CLOSED — historical):** the numbers above
