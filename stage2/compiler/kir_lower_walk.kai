@@ -877,7 +877,7 @@ fn match_finish(owned: Bool, r: LRes) : LRes =
 fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSReg(join, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let st3 = lower_list_arms(arms, scrv, join, lcont, st2)
+      let st3 = lower_list_arms(arms, scrv, join, lcont, owned, st2)
       LRes(KVar(join), reopen(st3, lcont))
     } } }
 
@@ -909,14 +909,25 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSReg =
 # branches to `lcont`; the next arm reopens the fail label. A catch-all arm
 # matches unconditionally and ends the chain (later arms are dead). With no
 # catch-all the last fail label is sealed `KUnreachable`.
+#
+# Issue #858 — after `lm_emit_arm` binds the arm's alias binders (head /
+# tail / rest, all borrows of the scrutinee slots), emit a structural
+# `KDup` for each, mirroring the C-direct oracle's `kai_incref` on
+# `is_alias=true` cons binds. Gated on `owned ∧ ¬arm_body_uses_reuse`:
+# only an OWNED match plants the exit `__pcs_scr_drop` the dup balances,
+# and a reuse arm consumes the scrutinee through `__perceus_reuse_*` (which
+# owns the kept children's RC) so a dup there would double-incref.
 fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                   st: LowerSt) : LowerSt / Console = match arms {
+                   owned: Bool, st: LowerSt) : LowerSt / Console = match arms {
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lm_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_done = lower_branch_into(body, join, lcont, st_body)
+      let st_dup = if owned and not arm_body_uses_reuse(body) {
+        lm_dup_alias_binders(list_arm_alias_binders(p), KAt(p.line, p.col), st_body)
+      } else { st_body }
+      let st_done = lower_branch_into(body, join, lcont, st_dup)
       if list_arm_is_catchall(p) { st_done }
-      else { lower_list_arms(rest, scrv, join, lcont, reopen(st_done, fail_lbl)) }
+      else { lower_list_arms(rest, scrv, join, lcont, owned, reopen(st_done, fail_lbl)) }
     } } }
 }
 
@@ -1002,12 +1013,12 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         # non-variant pattern → tag -1, routed here rather than to a
         # duplicate switch case). With no catch-all the match is variant-
         # exhaustive, so the default is `KUnreachable` (Linus review #3).
-        let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, st6)
+        let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, owned, st6)
         # One switch case per DISTINCT tag (plan_arms dedups). A tag matched
         # by one arm lowers its body directly in the case block; a tag SHARED
         # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
         # case block that discriminates on the payload (kir_lower_variant).
-        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, st7)
+        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, owned, st7)
         LRes(KVar(join), reopen(st8, lcont))
       } } } }
 
@@ -1050,11 +1061,15 @@ fn kcase_has_tag(cases: [KCase], tag: Int) : Bool = match cases {
 # A `PWild`/`PLit` default binds nothing. Destructuring (variant / record)
 # default patterns also bind via `bind_pattern_fields_any`.
 fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                     ldef: String, st: LowerSt) : LowerSt / Console =
+                     ldef: String, owned: Bool, st: LowerSt) : LowerSt / Console =
   match first_default_arm(arms) {
     Some(Arm(p, _, body)) -> {
       let st_def = bind_default_pattern(p, scrv, reopen(st, ldef))
-      lower_branch_into(body, join, lcont, st_def)
+      # Issue #858 — the default arm's pattern (a `_`-tag binder / as-name /
+      # destructure) aliases the scrutinee like a variant arm; restore the
+      # oracle's structural pointer-slot incref so the owned exit drop balances.
+      let st_dup = dup_variant_arm_binders(p, body, owned, st_def)
+      lower_branch_into(body, join, lcont, st_dup)
     }
     None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
   }
@@ -1104,14 +1119,27 @@ fn arm_tag(p: Pattern, st: LowerSt) : Int = match p.pkind {
 # switch" — `ldef` carries the global `_` body or is `KUnreachable` when the
 # match is exhaustive (Linus review #3, mirror of `lower_default_arm`).
 fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
-                        lcont: String, ldef: String, st: LowerSt) : LowerSt / Console = match cases {
+                        lcont: String, ldef: String, owned: Bool, st: LowerSt) : LowerSt / Console = match cases {
   [] -> st
   [KC(tag, lbl), ...crest] -> {
     let group = arms_with_tag(arms, tag, st)
-    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, st)
-    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, st1)
+    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, owned, st)
+    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, owned, st1)
   }
 }
+
+# Issue #858 — structural incref of an owned variant arm's POINTER-kind
+# positional (KProj-borrow) sub-binders, mirroring the oracle's `kai_incref`
+# on `is_alias=true` pointer-slot variant-arg binds (Int/Real slots are read
+# unboxed by the oracle, so they are excluded — `variant_arm_alias_binders`
+# filters by slot kind via `st.vs`). Emitted after the arm's binds, before
+# the body lowers. Gated on `owned ∧ ¬arm_body_uses_reuse` exactly like the
+# list path: a reuse arm consumes the scrutinee through `__perceus_reuse_*`
+# (rb-tree `ins`), where a structural dup would double-incref kept children.
+fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : LowerSt / Console =
+  if owned and not arm_body_uses_reuse(body) {
+    lm_dup_alias_binders(variant_arm_alias_binders(p, st.vs), KAt(p.line, p.col), st)
+  } else { st }
 
 # The VARIANT arms whose top-level tag is `tag`, in source order.
 fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
@@ -1134,14 +1162,15 @@ fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
 # default = the global `_` body or `KUnreachable`). A shared tag (N>1 arms)
 # always opens the chain.
 fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
-                   lbl: String, ldef: String, st: LowerSt) : LowerSt / Console = match group {
+                   lbl: String, ldef: String, owned: Bool, st: LowerSt) : LowerSt / Console = match group {
   [Arm(p, g, body)] ->
     if var_arm_is_tag_catchall(p) {
       let st_arm = reopen(st, lbl)
       let st_bound = bind_pattern_fields(p, scrv, st_arm)
-      lower_branch_into(body, join, lcont, st_bound)
-    } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, reopen(st, lbl)) }
-  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, reopen(st, lbl))
+      let st_dup = dup_variant_arm_binders(p, body, owned, st_bound)
+      lower_branch_into(body, join, lcont, st_dup)
+    } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, reopen(st, lbl)) }
+  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, reopen(st, lbl))
 }
 
 # The sub-fail-chain for a tag shared by N>1 arms. Each arm: if it
@@ -1151,19 +1180,21 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
 # the typer's redundancy check forbids). After binding its fields, the arm's
 # body lowers into the shared join. The last fail label routes to `ldef`.
 fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
-                     fail_lbl: String, ldef: String, st: LowerSt) : LowerSt / Console = match group {
+                     fail_lbl: String, ldef: String, owned: Bool, st: LowerSt) : LowerSt / Console = match group {
   [] -> ls_seal(reopen(st, fail_lbl), KBr(ldef, KNoPos), ldef)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(reopen(st, fail_lbl)) { LSLabel(body_lbl, st1) ->
     if var_arm_is_tag_catchall(p) {
       # Catch-all of this tag: branch straight to the body; later arms dead.
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
       let st3 = bind_pattern_fields(p, scrv, reopen(st2, body_lbl))
-      lower_branch_into(body, join, lcont, st3)
+      let st3d = dup_variant_arm_binders(p, body, owned, st3)
+      lower_branch_into(body, join, lcont, st3d)
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
         let st4 = emit_arm_subtests_and_binds(p, scrv, body_lbl, next_fail, st2)
-        let st5 = lower_branch_into(body, join, lcont, st4)
-        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, st5)
+        let st4d = dup_variant_arm_binders(p, body, owned, st4)
+        let st5 = lower_branch_into(body, join, lcont, st4d)
+        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, st5)
       } }
     } }
 }
