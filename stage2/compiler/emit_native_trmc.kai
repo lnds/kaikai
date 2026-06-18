@@ -77,47 +77,65 @@ fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
 # ctor calls + an invalid `select ptr %c, null, @kaix_cons`. Keeping each
 # whole step on its own path is what avoids that.)
 # The `dropmask` (the lowering's per-param "dead after this back-edge"
-# bitfield) is accepted and IGNORED, identically to `nemit_tcrec`: reuse
-# correctness rides the move-semantics reuse + variant-TRMC build, verified
-# result-correct + ASAN-clean without a back-edge param drop; a naive
-# per-index drop over-drops a live heap param in the `list_*` parse loops
-# (the jwt fixture) for want of the C oracle's pmask raw/boxed distinction.
-# Skipping it only leaks more in the already-non-freeing all-boxed backend.
+# bitfield) is emitted in `ntrmc_extend_and_loop` between eval and store via
+# the shared `nemit_drop_assigns_masked` (issue #860), mirroring `nemit_tcrec`
+# and the C oracle's `tcrec_emit_drops_masked`: a BOXED param marked dead is
+# dropped before its alloca is overwritten; a raw scalar param is skipped.
 pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, dropmask: Int,
-                       head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
-  let _ignored_dropmask = dropmask
+                       head_vals: [KVal], asg: [KAssign]) : Unit / Console =
   match ntrmc_cname_is_cons(cname) {
-    true  -> ntrmc_cons_step(ctx, head_vals, asg)
-    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg)
+    # `__kai_cons_s` (s = has a scrutinee to drop): the reuse-cons arm
+    # (`map`) consumes the scrutinee, but the back-edge jumps over the
+    # match-exit drop, so the step itself drops `__pcs_scr_drop` — the
+    # native mirror of the C oracle's `scr_drop` (`emit_trmc_cons_step`,
+    # emit_c.kai). `__kai_cons` (raw EList, `build`) has no scrutinee to
+    # free (issue #860 — the TRMC cons-modulo output leak).
+    true  -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, ntrmc_cname_drops_scr(cname))
+    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg, dropmask)
   }
-}
 
 # Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr.
-fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
+fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int, drop_scr: Bool) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let node = ncall_sig2(ctx, "kaix_cons", p, p, p, ntrmc_head_val(ctx, head_vals), llvm_const_null(p))
-  ntrmc_extend_and_loop(ctx, node, ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node), asg)
+  ntrmc_extend_and_loop_scr(ctx, node, ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node), asg, dropmask, drop_scr)
 }
 
 # n-ary user-variant spine step: fill every non-hole slot from `head_vals`
 # (slot order) plus a NULL placeholder at `hole_slot`, build `kaix_variant`
 # (mask==0), hole at slot `hole_slot`.
 fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int,
-                      head_vals: [KVal], asg: [KAssign]) : Unit / Console = {
+                      head_vals: [KVal], asg: [KAssign], dropmask: Int) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let argbuf = ntrmc_variant_slots(ctx, head_vals, hole_slot, 0)
   let node = nemit_variant_call(ctx, "kaix_variant", tag, cname, argbuf)
   let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node, llvm_const_i32(i32t, hole_slot))
-  ntrmc_extend_and_loop(ctx, node, hole, asg)
+  ntrmc_extend_and_loop(ctx, node, hole, asg, dropmask)
 }
+
+# True for the scrutinee-reuse cons marker `__kai_cons_s` (the reuse-cons
+# arm shape), false for the plain `__kai_cons` (raw EList). The `_s` step
+# drops the consumed scrutinee; the plain step has none to free. Mirror of
+# the C oracle's `cname == trmc_cons_scr_cname()` test (emit_trmc_step).
+fn ntrmc_cname_drops_scr(cname: String) : Bool = cname == "__kai_cons_s"
 
 # The shared spine-step tail (both cons and variant): extend the cctx with
 # `node` (plug it into the OLD hole, get the new root), store the new hole,
 # rebind the loop params from the self-call args, then loop. Takes the node +
 # its open-hole address (the only cons/variant difference) ready-built so
 # this body never branches on the cell shape.
-fn ntrmc_extend_and_loop(ctx: Handle, node: Handle, hole_new: Handle, asg: [KAssign]) : Unit / Console = {
+fn ntrmc_extend_and_loop(ctx: Handle, node: Handle, hole_new: Handle, asg: [KAssign], dropmask: Int) : Unit / Console =
+  ntrmc_extend_and_loop_scr(ctx, node, hole_new, asg, dropmask, false)
+
+# `drop_scr` plants the consumed-scrutinee drop (the `__kai_cons_s` reuse-cons
+# arm) between the rebind eval and the param drops, mirroring the C oracle's
+# `arg_lets, scr_drop, drops, rebinds` order (emit_trmc_cons_step). The scr
+# drop runs AFTER the reloop values are read (the new cell's head/tail aliases
+# were already incref'd by the arm's `dup h`/`dup t`, so they survive `_scr`'s
+# free) and BEFORE the param store overwrites the alloca.
+fn ntrmc_extend_and_loop_scr(ctx: Handle, node: Handle, hole_new: Handle, asg: [KAssign],
+                             dropmask: Int, drop_scr: Bool) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let res_old = nemit_load_reg(ctx, ntrmc_res_reg())
   let hole_old = nemit_load_reg(ctx, ntrmc_hole_reg())
@@ -126,6 +144,8 @@ fn ntrmc_extend_and_loop(ctx: Handle, node: Handle, hole_new: Handle, asg: [KAss
   nemit_store_reg(ctx, ntrmc_hole_reg(), hole_new)
   let valbuf = llvm_buf_new()
   ntrmc_eval_assigns(ctx, asg, valbuf)
+  if drop_scr { let _d = nemit_call1(ctx, "kaix_internal_drop", nemit_load_reg(ctx, "__pcs_scr_drop")); () } else { () }
+  nemit_drop_assigns_masked(ctx, asg, dropmask)
   ntrmc_store_assigns(ctx, asg, valbuf, 0)
   llvm_buf_free(valbuf)
   llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))

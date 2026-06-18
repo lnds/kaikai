@@ -36,10 +36,18 @@ Grouped by subsystem:
 
 ### 1. LLVM backend
 
+> **v1 status (2026-06-17):** the original plan below emitted **textual
+> `.ll`** linked by `llc` + `clang`. That text path shipped first, then was
+> **removed (#850)**. The backend that actually shipped is **in-process
+> libLLVM** (`--backend=native`, the default): it builds the LLVM module via
+> the C API in one process and emits a native object directly — **no `.ll`
+> text, no `llc`/`clang` subprocess**. See `docs/kir-design.md` §7.2. The C
+> fallback below is accurate (`--backend=c`, still the bootstrap + oracle path).
+
 - Emit **textual LLVM IR** (`.ll`) as the canonical output.
   `kaic2 foo.kai -o foo.ll`; `kaic2 foo.kai -o foo` links via
   `llc` + `clang`.
-- A thin C fallback (`--emit=c`) kept for bootstrapping from stage 1
+- A thin C fallback (`--backend=c`) kept for bootstrapping from stage 1
   and for platforms where LLVM is absent.
 - Target triples: `x86_64-linux-gnu`, `aarch64-apple-darwin`, and
   `aarch64-linux-gnu` for the MVP+1 set. WASM and Windows stay
@@ -371,7 +379,7 @@ in.
      `emit_call_expr`'s op-dispatch branch, `emit_clause_*`,
      and the default-handler wrapper to LLVM IR. End state:
      `m7a_*.kai` and `m7b_*.kai` demos round-trip identically
-     between `--emit=c` and `--backend=native`, and
+     between `--backend=c` and `--backend=native`, and
      `bench-effects` runs against the native-emitted binary as
      well as the C one. Re-measure Doc C OQ #6 — hypothesis:
      ratio drops from m7a's ~4× (vs C-direct on `gcc -O2`)
@@ -952,7 +960,7 @@ informal "MVP" labels used in earlier planning snapshots.
   in-flight external demos (`/tmp/kaikai-portfolio-demo`).
 - m12 self-host checkpoint: byte-identical fixed-point of
   `kaic2 stage2/compiler.kai`.
-- Both backends (`--emit=c` C-direct, `--backend=native` in-process
+- Both backends (`--backend=c` C-direct, `--backend=native` in-process
   libLLVM) at parity for every shipped feature.
 
 State as of 2026-04-26: m12.8 protocols + #derive(records) landed
