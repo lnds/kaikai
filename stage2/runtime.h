@@ -11917,19 +11917,21 @@ static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) {
  * kaikai Int arithmetic WRAPS (the C emitter casts through `uint64_t`), so
  * signed overflow must be defined two's-complement wrap, not UB the
  * optimiser could exploit. The plain `LLVMBuildAdd`/`Sub`/`Mul` emit
- * wrapping ops (no-wrap flags unset). `/` and `%` stay BOXED (native
- * `sdiv`/`srem` are UB on divide-by-zero AND `INT_MIN/-1`; the boxed
- * `kaix_div`/`kaix_mod` handle both — a raw operand crosses back at the
- * `int.box` border first). Operands + result are `i64`, NOT boxed Ints:
- * no RC, so the use-after-free the boxed path hit on a multi-use raw
- * operand cannot arise. */
+ * wrapping ops (no-wrap flags unset). `/`→`sdiv`, `%`→`srem`, mirroring the
+ * C-direct oracle: it emits a bare `a / b` and accepts the `/0` and
+ * `INT_MIN/-1` UB as a separate concern, so a raw native `sdiv`/`srem` is
+ * byte-for-byte parity, not a regression. Operands + result are `i64`, NOT
+ * boxed Ints: no RC, so the use-after-free the boxed path hit on a multi-use
+ * raw operand cannot arise. */
 static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) {
     LLVMBuilderRef bld = (LLVMBuilderRef) b;
     LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
     switch (op) {
         case 0:  return (void *) LLVMBuildAdd(bld, la, lc, "");
         case 1:  return (void *) LLVMBuildSub(bld, la, lc, "");
-        default: return (void *) LLVMBuildMul(bld, la, lc, "");
+        case 2:  return (void *) LLVMBuildMul(bld, la, lc, "");
+        case 3:  return (void *) LLVMBuildSDiv(bld, la, lc, "");
+        default: return (void *) LLVMBuildSRem(bld, la, lc, "");
     }
 }
 /* Raw `i64` SIGNED comparison → an `i1`. `pred`: 0=`<`, 1=`>`, 2=`<=`,
