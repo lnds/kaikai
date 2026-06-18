@@ -81,7 +81,16 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
   # `fns_prefer_module` before each body. (`hashset.from_list`'s `empty()`
   # resolved to the imported `hashmap.empty` without this — `no such field`.)
   let st = ls_enter_fn_in(st0, sym, param_local_names(params, []), mo)
-  let kparams = lower_params(params, [])
+  # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
+  # applied the no-tparams / no-FFI / no-effect-row gates and computed the
+  # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
+  # scalar KSlot + a raw return slot, so the native backend declares an
+  # `i64`/`f64`/`i1` signature instead of all-`ptr`. `None` (FFI shims,
+  # proto dispatchers, effectful / generic fns) keeps the all-boxed shape.
+  # The unbox pass reads the SAME mask (`ufn_param_env`), so the body's raw
+  # param reads and these slots can never disagree.
+  let usig = lookup_ufn_sig(st.fns, name, mo)
+  let kparams = lower_params_sig(params, usig)
   # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
   # `ETodo("__kai_ffi__"[:override])` tag. C / LLVM-text intercept it in
   # `emit_fn_body` and synthesise an unbox→extern-call→re-box shim from the
@@ -113,12 +122,23 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
     # `kaix_proto_dispatch<N>` shim, which derives the head tag, resolves the
     # impl table, and indirect-calls (one ABI source of truth, shared with the
     # oracle). C / LLVM never reach this branch (they intercept upstream).
+    # The body lowers BOXED (its natural shape — `lower_expr` boxes a raw
+    # value at the border). For a raw-return UFn, the native `KRet`
+    # re-materialises the result register at the raw return slot
+    # (`nemit_ret_value` → `nemit_atom_raw`, which unbox-borrows a boxed
+    # register down to its raw scalar), so `ret i64`/`f64`/`i1` matches the
+    # raw signature without a body-side raw path. Lowering the body raw
+    # would route a Bool/Char-returning body (the many `…is_none : Bool`
+    # fns) through `lower_scalar_unbox_border`, whose Int-vs-else split mis-
+    # routes a Bool to `real.unbox` (an `f64` fed to `kaix_bool_field` — a
+    # verify failure). Keeping the body boxed sidesteps that: the only raw
+    # crossing is at the `KRet`, where the slot is known exactly.
     let r = if body_is_proto_dispatch(body) {
       lower_proto_dispatch(proto_dispatch_parts(body), params, kpos_of(body), st)
     } else { lower_expr(body, st) }
     match r {
       LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
-                              ret: slot_of_ty(ret_ty), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
+                              ret: ret_slot_of_sig(usig), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
                               region_id: None, stateful: false }
     }
   }

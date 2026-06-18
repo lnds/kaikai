@@ -505,6 +505,82 @@ pub fn capture_param(name: String, j: Int) : KParam =
 # the lowering consults the unbox classification.
 pub fn slot_of_ty(t: Option[TypeExpr]) : KSlot = SBoxed
 
+# --- P3: raw scalar param/return slots from the UFnSig -------------------
+#
+# The native backend's signature emitter reads `KParam.slot` / `KFn.ret`,
+# never the UFnSig (KSlot is the single source of a register's type — the
+# #845/#829 mode-slave discipline). So a `KFnNormal` whose `EFn` carries a
+# raw `UFnSig` (`Some(US(_, _, mask))`) lowers each RAW param to its scalar
+# slot and the return to its scalar slot, exactly the shape `emit_native`'s
+# raw-signature emitter then declares (`i64`/`f64`/`i1` instead of `ptr`).
+# The body already reads those params raw: the unbox pass seeds the same
+# mask-raw params `MUnboxed` (`ufn_param_env`), so an `EVar(param)` lowers
+# through `lower_expr_raw` and the native register-load sees the raw slot.
+#
+# The KSlot maps the SAME scalar set the native register machinery has
+# load/box shims for: Int → `SInt64`, Real → `SReal`, Bool → `SBool`. Char
+# (`uint32_t` in the C oracle) has NO raw KIR register form (no
+# `kaix_char_field`/`kaix_char` native shim), so a Char param/return stays
+# `SBoxed` — the native simply does not raw-promote it, mirroring the body
+# path (kir_lower_raw never raw-promotes a Char node). This is consistent
+# WITHOUT matching the C IR byte-for-byte: the native decides raw by KSlot,
+# the C by the UFnSig mask; a Char that the C carries as `kair` the native
+# carries boxed, and each backend reads/writes it uniformly within itself.
+pub fn kslot_of_raw_ty(t: Ty) : KSlot = match t {
+  TyInt               -> SInt64
+  TyReal              -> SReal
+  TyBool              -> SBool
+  TyDimT(inner, _)    -> kslot_of_raw_ty(inner)
+  TyRefineT(inner, _) -> kslot_of_raw_ty(inner)
+  _                   -> SBoxed
+}
+
+# The return slot for a UFn: raw iff the UFnSig's return type is unboxable
+# AND maps to a raw KIR slot (Int/Real/Bool — Char/Handle fall to SBoxed).
+# `None` (a fn with no raw signature) keeps the conservative boxed slot.
+pub fn ret_slot_of_sig(sig: Option[UFnSig]) : KSlot = match sig {
+  Some(US(_, rt, _)) -> if ty_is_unboxable_t(rt) { kslot_of_raw_ty(rt) } else { SBoxed }
+  None               -> SBoxed
+}
+
+# Lower a normal fn's params honouring the UFnSig raw mask: param `i` gets
+# its raw scalar slot when `mask[i]` is true (and the type maps to a raw
+# KIR slot), else stays `SBoxed`. `None` (no raw signature) is identical to
+# the all-boxed `lower_params`. The `param_tys` carry each param's real Ty,
+# indexed positionally — the same list `emit_fn_signature_unboxed` reads.
+pub fn lower_params_sig(ps: [Param], sig: Option[UFnSig]) : [KParam] = match sig {
+  Some(US(pts, _, mask)) -> lower_params_sig_idx(ps, pts, mask, 0, [])
+  None                   -> lower_params(ps, [])
+}
+
+fn lower_params_sig_idx(ps: [Param], pts: [Ty], mask: [Bool], i: Int, acc: [KParam]) : [KParam] = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let slot = param_slot_for(pts, mask)
+    let mrest = match mask {
+      [_, ...r] -> r
+      [] -> []
+    }
+    let trest = match pts {
+      [_, ...r] -> r
+      [] -> []
+    }
+    lower_params_sig_idx(rest, trest, mrest, i + 1,
+      list_append(acc, [KParam { name: p.pname, slot: slot, mode: KOwn, origin: PDirect(i) }]))
+  }
+}
+
+# The KSlot for the head param: raw (mapped from its Ty) when the head of
+# `mask` is true, else `SBoxed`. Defensive on a short mask/tys list (a
+# lowering bug, never reached for a well-formed UFnSig).
+fn param_slot_for(pts: [Ty], mask: [Bool]) : KSlot = match mask {
+  [true, ..._] -> match pts {
+    [t, ..._] -> kslot_of_raw_ty(t)
+    [] -> SBoxed
+  }
+  _ -> SBoxed
+}
+
 # Resolve a binary operator to its prim name. Arithmetic / comparison ops
 # map 1:1 to a runtime helper the translator knows (`+` → `kai_add`,
 # etc.), so the raw op string passes through. `++` is overloaded on the
