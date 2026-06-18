@@ -202,10 +202,13 @@ information exists in the AST — the native walk just has to consume it.
 1. **No `nsw`/`nuw` flags** on `add`/`sub`/`mul`. kaikai Int arithmetic *wraps*
    (the C emitter casts through `uint64_t`); a `nsw` add would make signed
    overflow UB and mis-optimise. Emit plain wrapping ops.
-2. **`/` and `%` stay BOXED in v1.** Native `sdiv`/`srem` are UB on divide-by-zero
-   *and* on `INT_MIN / -1`. The boxed `kaix_div`/`kaix_mod` already handle these.
-   Keep them boxed (precedent: Real `%` also stays boxed). A raw operand crosses
-   back to boxed at the `int.box` border before the division.
+2. **`/` and `%` emit raw `sdiv`/`srem` (P4, shipped).** Originally `/` and `%`
+   stayed boxed in v1 because native `sdiv`/`srem` are UB on divide-by-zero
+   *and* on `INT_MIN / -1`. P4 reversed this: the C-direct ORACLE already emits
+   a bare `a / b` and accepts that same UB as a separate concern, so the native
+   backend mirrors it (raw `sdiv`/`srem`) for byte-exact parity — a guard would
+   DIVERGE from the oracle. This closes the `i/3` residual on `arith_runtime`
+   (native to C parity). See `docs/lane-experience-native-div-rem-raw.md`.
 3. **Lower `icmp` to a direct `i1`→`condbr`**, not just raw arithmetic. The
    comparison feeding an `if` should branch on the `i1` directly, skipping
    `kaix_eq` + `kaix_truthy`.
