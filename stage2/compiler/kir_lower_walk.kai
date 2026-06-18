@@ -364,6 +364,44 @@ pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = 
   }
 }
 
+# P3: lower a self-tail-call's args at the DESTINATION param slots. When
+# the recursing fn has a raw signature, an arg whose param is raw lowers
+# RAW (`lower_expr_raw` → a raw register, NO trailing `int.box`); the
+# native back-edge then re-stores it raw with no `kaix_int`/`kaix_int_field`
+# round-trip (the per-iteration re-box that kept the boxed loop ~20× slower
+# than C even after the params themselves went raw). A boxed param keeps
+# the boxed `lower_expr`. With no raw signature (`None`) this is exactly
+# `lower_exprs`. The arg's type equals its param's type (a well-typed tail
+# call), so `lower_expr_raw` yields the param's scalar slot.
+fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LResMany / Console =
+  lower_tcrec_args_idx(xs, tcrec_mask_of(sig), st, [])
+
+fn lower_tcrec_args_idx(xs: [Expr], mask: [Bool], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
+  [] -> LResMany(acc, st)
+  [e, ...rest] -> {
+    let raw = match mask {
+      [true, ..._] -> true
+      _ -> false
+    }
+    let mrest = match mask {
+      [_, ...r] -> r
+      [] -> []
+    }
+    match lower_tcrec_arg(e, raw, st) {
+      LRes(v, st1) -> lower_tcrec_args_idx(rest, mrest, st1, list_append(acc, [v]))
+    }
+  }
+}
+
+fn lower_tcrec_arg(e: Expr, raw: Bool, st: LowerSt) : LRes / Console =
+  if raw { lower_expr_raw(e, st) } else { lower_expr(e, st) }
+
+# The per-param raw mask of a (self-recursing) UFn sig, `[]` when None.
+fn tcrec_mask_of(sig: Option[UFnSig]) : [Bool] = match sig {
+  Some(US(_, _, mask)) -> mask
+  None -> []
+}
+
 # --- List literals (and interpolation, which desugars to a list) --------
 
 # `[e0, ..., ...spread]` → a cons/nil/append spine. Reproduces the C
@@ -1657,7 +1695,7 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
 # p0..pN ordering, so the two must stay aligned.
 fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match es_tcrec_split_pipe(callee) {
-    [_, sym, dropmask_str, ..._pnames] -> match lower_exprs(cargs, st, []) {
+    [_, sym, dropmask_str, ..._pnames] -> match lower_tcrec_args(cargs, lookup_ufn_by_csym(st.fns, sym), st) {
       LResMany(avs, st1) ->
         seal_tail(st1,
                   KTcrecGoto(cat3("_kai_", sym, "_entry"), assigns_of(avs, 0, []),
@@ -1702,7 +1740,10 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
 # nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
 fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
                    heads: [KVal], self_args: [Expr], st: LowerSt) : LRes / Console =
-  match lower_exprs(self_args, st, []) {
+  # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
+  # param), so the TRMC back-edge re-stores them raw — no per-step
+  # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
+  match lower_tcrec_args(self_args, lookup_ufn_by_csym(st.fns, sym), st) {
     LResMany(reb, st1) -> {
       # The variant ctor tag is resolved here (as `KCon` resolves it), so the
       # backend builds the spine cell without a name→tag table. The builtin-
