@@ -492,10 +492,14 @@ platforms.
 - Windows — third platform.
 - WASM — runtime target with appropriate size + JIT-friendly
   emit constraints.
-- LLVM mirrors for Phase 2 + TCO — close the gap where
-  `--backend=native` binaries don't yet receive the speedups that
-  `--emit=c` enjoys. Currently deferred per issue #87 and the
-  closed issue #42.
+- Native codegen perf parity — close the residual gap where
+  `--backend=native` binaries are slower than `--backend=c`.
+  The unboxing mirror (issue #87, closed) and self-tail TCO
+  (issue #42, closed) already landed: scalar `+ - * / %` is at C
+  parity (lanes P1–P4, see `docs/native-codegen-perf-plan.md`).
+  Remaining residuals are tracked as #858 (`kai_op_eq` UAF),
+  #860 (cons/list RC leak — `list_fold`/`rbtree` ~2×), and
+  #861 (non-tail raw call re-box — `fib`-style ~8×).
   *(Optimization thread for this milestone.)*
 - Stage 1 mirrors for Phase 2 + TCO — bootstrap chain
   parity. Currently bootstrap-only, so user code is
@@ -509,7 +513,8 @@ platforms.
 1. CI matrix runs all 5 platforms (the founding two plus
    Linux arm64, macOS x86_64, Windows, WASM).
 2. `--backend=native` binaries reach inner-loop perf parity with
-   `--emit=c` binaries.
+   `--backend=c` binaries (scalar arithmetic already there; heap +
+   non-tail-call residuals tracked in #860 / #861).
 3. Profiling tooling exposes per-fn alloc / time / RC
    breakdown.
 
