@@ -1,0 +1,51 @@
+# Issue #860 — the native (in-process libLLVM) backend must cascade
+# decref->free for cons/list cells consumed by a self-tail-recursive arm.
+# Before the fix the native backend left `free_total=0` (every cons leaked,
+# `leaked` grew linearly with the list length) while the C-direct oracle
+# reclaimed them. Three self-tail shapes are exercised, each a distinct
+# leak site the fix closes:
+#
+#   - `build`  — an ACCUMULATOR self-tail (`build(n-1, [n, ...acc])`): the
+#     `KTcrecGoto` back-edge re-stores `acc` from the new cons but never
+#     dropped the OLD `acc`, leaking one cell per level. The dropmask the
+#     C oracle replays (`tcrec_emit_drops_masked`) is now emitted on the
+#     native back-edge too (`nemit_drop_assigns_masked`).
+#   - `suml`  — a CONSUMING self-tail (`suml(t, acc + h)`): the owned
+#     scrutinee's match-exit drop sits in the continuation the goto seals
+#     before, so it never ran. The fix pre-injects the scrutinee drop into
+#     the arm (`match_selftail_scr_drop`), mirroring the C oracle's
+#     `_r = ({ kai_decref(_scr); ... })` (`emit_match_arm`).
+#   - `double` — a TRMC cons-modulo self-tail (`[h*2, ...double(t)]`): the
+#     `__kai_cons_s` step consumes the scrutinee, but the back-edge skips
+#     the match-exit drop, so the step itself drops it now (the C oracle's
+#     `scr_drop` in `emit_trmc_cons_step`) — without double-freeing the
+#     fresh cons cell the step builds (the #856 trap).
+#
+# The gate (`make test-perceus-860-native-cons-leak`) builds it with the
+# NATIVE backend under KAI_TRACE_RC and asserts `leaked` stays a small
+# constant independent of the list length — a regression that drops the
+# cascade blows past it linearly. The `.out.expected` golden gates output
+# parity on both backends.
+
+fn build(n: Int, acc: [Int]) : [Int] =
+  if n <= 0 { acc } else { build(n - 1, [n, ...acc]) }
+
+fn double(xs: [Int]) : [Int] =
+  match xs {
+    []        -> []
+    [h, ...t] -> [h * 2, ...double(t)]
+  }
+
+fn suml(xs: [Int], acc: Int) : Int =
+  match xs {
+    []        -> acc
+    [h, ...t] -> suml(t, acc + h)
+  }
+
+# Sum the doubled 1..n list, repeated `reps` times so a per-cell leak (one
+# cons per element per rep) would scale with reps — the test runs two rep
+# counts and asserts the leak does not grow.
+fn run(reps: Int, n: Int, acc: Int) : Int =
+  if reps <= 0 { acc } else { run(reps - 1, n, acc + suml(double(build(n, [])), 0)) }
+
+fn main() : Unit / Console = print(int_to_string(run(50, 20, 0)))

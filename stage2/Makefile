@@ -147,7 +147,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
 
 all: $(TARGET)
 
@@ -3658,6 +3658,33 @@ test-perceus-817-filter-leak: $(TARGET) build
 	[ "$$leaked" -lt 1000 ] \
 	  && echo "perceus-817-filter-leak OK (leaked=$$leaked < 1000 over 5000 filter-over-heap iters; arm-binder leak closed)" \
 	  || { echo "perceus-817-filter-leak FAIL (leaked=$$leaked — arm-binder leak regressed, grows with iters)"; exit 1; }
+
+# Issue #860 — the NATIVE backend must cascade decref->free for cons cells
+# consumed by a self-tail arm (accumulator / consuming / TRMC cons-modulo).
+# Before the fix native left `free_total=0`, `leaked` growing linearly with
+# the list length; the C oracle reclaimed them. The fixture builds + doubles
+# + sums a 20-element list 50 times (1000 cons), so a per-cell leak would
+# leave ~1000 leaked. Built with the NATIVE backend under KAI_TRACE_RC, we
+# assert every cons is reclaimed: `free_total == alloc_total - 1` (the lone
+# residual is the final result string), the exact cascade the C oracle does.
+# Native-gated: only meaningful where libLLVM is linked (tier1-native); a
+# C-only kaic2 cannot run --backend=native, so the target is invoked from the
+# tier1-native workflow, not the C-backend tier1 suite.
+test-perceus-860-native-cons-leak: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_cons_selftail_leak_860.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-860ncl 2> build/s2-860ncl.err \
+	  || { echo "perceus-860-native-cons-leak FAIL (native build errored)"; cat build/s2-860ncl.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-860ncl > build/s2-860ncl.out 2> build/s2-860ncl.rc; \
+	diff -q ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out > /dev/null \
+	  || { echo "perceus-860-native-cons-leak FAIL (output diff)"; diff ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out; exit 1; }; \
+	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-860ncl.rc | head -1 | cut -d= -f2); \
+	free=$$(grep -oE 'free_total=[0-9]+' build/s2-860ncl.rc | head -1 | cut -d= -f2); \
+	[ -n "$$alloc" ] && [ -n "$$free" ] \
+	  || { echo "perceus-860-native-cons-leak FAIL (no alloc/free line)"; cat build/s2-860ncl.rc; exit 1; }; \
+	[ "$$free" -eq "$$(($$alloc - 1))" ] \
+	  && echo "perceus-860-native-cons-leak OK (native free_total=$$free == alloc_total-1=$$(($$alloc - 1)); cons cascade decref->free over 1000 cells)" \
+	  || { echo "perceus-860-native-cons-leak FAIL (native free_total=$$free, alloc_total=$$alloc — cons leak regressed, cascade dropped)"; exit 1; }
 
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
