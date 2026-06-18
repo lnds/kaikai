@@ -25,9 +25,19 @@ The honesty claims are all met for emitted user programs:
   backend; see the TCO section below for the bootstrap-chain and LLVM
   caveats that survive).
 
-> **Backend note (LLVM RC, 2026-06-07, #747 CLOSED):** the numbers above
+> **v1 status (2026-06-17):** the block below is the **2026-06-07 LLVM-text
+> backend** snapshot (`--emit=llvm`, a flag that no longer exists). That
+> backend was **removed (#850)**; the in-process **native** backend
+> (`--backend=native`) is now the default. Its bitcode-link (P2, #854) already
+> merges the runtime module before O2 — the "build-chain Tier-2 lane" this note
+> says the gap "needs". Current native-vs-C numbers and the live residuals live
+> in `docs/native-codegen-perf-plan.md` (scalar at C parity; #860 cons leak,
+> #861 non-tail re-box). The block below is retained for the RC-discipline
+> genealogy (#747), not as a current perf claim.
+
+> **Backend note (LLVM RC, 2026-06-07, #747 CLOSED — historical):** the numbers above
 > are the **C backend** (the primary, behind the honesty claims). The
-> **LLVM backend** (`--emit=llvm`) had never implemented the Perceus match
+> **LLVM-text backend** (`--emit=llvm`, since removed in #850) had never implemented the Perceus match
 > RC discipline at all — it leaked every scrutinee and boxed slot in every
 > match (rb-tree: `frees=0`, 3.7 GB RSS). PASO 1 (PR #756) ported the C RC
 > protocol + the unified stage2 runtime (slab + tagged-Int); the rb-tree
