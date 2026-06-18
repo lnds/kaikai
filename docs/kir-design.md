@@ -80,10 +80,12 @@ perceus does **not** add any new `ExprKind`. It reuses the AST as its own IR:
   `__kai_tcrec|<c_sym>|<dropmask>|<p0>|...` and
   `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`.
 
-And each backend **decodes them separately**: `tcrec_split_pipe` in C
-(`emit_c.kai:1982`), `es_tcrec_split_pipe` in LLVM (`emit_llvm.kai:3036,3053`).
-That duplicated decoding of a semantic string is, literally, the lowering
-duplication frontier.
+And each backend **decoded them separately**: `tcrec_split_pipe` in C
+(`emit_c.kai`), `es_tcrec_split_pipe` in the (since-removed, #850) llvm-text
+backend. That duplicated decoding of a semantic string was, literally, the
+lowering-duplication frontier this design closes — the native backend now
+decodes the sentinel once during KIR lowering (`KTcrecGoto` / `KTrmcStep`), not
+re-parsed per target.
 
 So KIR is **not** "add an IR where there was none." It is **promoting to typed
 structure what is already a clandestine IR encoded as strings over the AST**.
@@ -164,6 +166,29 @@ similarities:
 ---
 
 ## 4. KIR node set
+
+> **v1 status (2026-06-17) — this is the DESIGN node set, not the shipped one.**
+> The blocks below are the KIR as *planned*. The implementation (KIR lanes +
+> perf P1–P4) extended it; the **authoritative** type definitions are the
+> `type K…` / `UFnSig` declarations in `stage2/compiler/kir.kai` and
+> `stage2/compiler/fnreg.kai`. This doc intentionally does **not** mirror them
+> field-for-field (a prose mirror re-drifts on the next codegen change). The
+> material deltas a reader should know:
+>
+> | design (here) | shipped (code) | where |
+> |---|---|---|
+> | `KFn { …, is_handler_thunk }` | `KFn { …, kind: KFnKind, region_id, stateful }`; `KFnKind = KFnNormal \| KFnLambda \| KFnClause \| KFnFfi(c_sym, [KFfiKind], KFfiKind)` (the `extern "C"` shim, #260) | `kir.kai:241,279` |
+> | `KConReuse(donor, ctor, tag, inits)`; no record reuse | `KConReuse(KReuseKind, …)` (+ `RkVariant`/`RkCons`); plus `KRecord` and `KRecordReuse` | `kir.kai:98,102` |
+> | `resume` is a terminator `KResume(cont, arg, tail)` | `resume` is an **op**: `KResumeOp` / `KResume2Op` (stateful 2-arg) — body must run both `resume()`s | `kir.kai:115` |
+> | install/pop is an op `KInstallHandler` | install/pop/state-bind are **statements**: `KInstall` / `KPop` / `KBindEvState`; every `KStmt`/`KTerm` also carries a `KPos` | `kir.kai:144,180` |
+> | one TRMC terminator `KTrmcGoto(…)` | split into `KTrmcStep(…)` (modulo-cons site) + `KTrmcApply(leaf)` | `kir.kai:180` |
+> | `KProgram { …, regions }` | `+ defaults`, `+ synth_defaults` (`KDefault`); `KHandlerDecl` is defined (op_thunks/ret_thunk/env_caps) | `kir.kai:326,346` |
+> | `KSlot = SBoxed \| SInt64 \| SReal \| SBool` | `+ SInt32` (variant-tag width for the native `switch`) | `kir.kai:57` |
+> | (absent) | **`UFnSig = US([Ty], Ty, [Bool])`** — P3's per-param raw-scalar mask; the third `[Bool]` is the `raw_mask` | `fnreg.kai:78` |
+>
+> `KVal`/`KTypeDecl` differ only by a `V`/`T` name suffix (`KIntV`, `KSumT`).
+> The blocks below stand as the design intent + rationale; read the code for the
+> current shape.
 
 ### 4.1 Top-level
 ```
@@ -850,14 +875,20 @@ backend's libLLVM dependency is opt-in; it never enters the bootstrap chain.
 - `stage2/compiler/perceus.kai:1770-1780` — tail-position rationale (Risk 1);
   `__perceus_*` injectors at `:1737` (dup), `:3635` (drop), `:486` (borrow) — grep
   `EVar("__perceus_` for the current set, line numbers drift.
-- `stage2/compiler/emit_c.kai:1820+` — reuse lowering; `:8416-8637` — effect
-  install; `:1982+` — TRMC sentinel decode (`tcrec_split_pipe`).
-- `stage2/compiler/emit_llvm.kai:2527+` — reuse; `:3030-3053,7701+,7745+,7827+` —
-  tcrec/trmc sentinel decode (`es_tcrec_split_pipe`) — the duplicated mirror.
+- `stage2/compiler/emit_c.kai` — the C-direct backend (`--backend=c`): reuse
+  lowering, effect install, TRMC sentinel decode. The byte-exact oracle. (Grep
+  for `tcrec_split_pipe` / the reuse helpers — line numbers drift.)
+- `stage2/compiler/emit_native_*.kai` + `kir_lower*.kai` — the in-process native
+  backend (`--backend=native`, the default): KIR construction + the KIR→libLLVM
+  walk. This is the shipped "KIR→LLVM translator" of §5. (The old
+  `emit_llvm.kai` text backend that this doc's §5 still names as the
+  "duplicated mirror" was **removed in #850** — there is no `.ll`-text backend
+  anymore; do not look for that file.)
 - `stage2/compiler/emit_shared.kai` — the shared *analysis* (stays); the shared
   *lowering* is what KIR creates.
-- `stage2/compiler/driver.kai:1343-1358` — `--emit=` dispatch (where `--emit=kir`
-  and the `-kir` backend flags hook in); `:5232-5268` — pipeline order.
+- `stage2/compiler/driver.kai` — backend dispatch (`--backend=c|native`,
+  `resolve_backend`) and pipeline order. (`--emit=llvm`/`--emit=c` were retired
+  with the text backend; the flag is `--backend=`.)
 - `tools/test-backend-parity.sh` — the native-vs-C differential harness the
   gates extend.
 
