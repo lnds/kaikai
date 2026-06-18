@@ -545,8 +545,15 @@ tier1-backend-parity: kaic2
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
-daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget tier1-asan tier1-backend-parity
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget + tier1-asan + tier1-backend-parity"
+#
+# `tier1-asan` and `tier1-backend-parity` are deliberately NOT in this
+# target: both already run path-gated on PRs (and thus on every merge to
+# main that touches their paths), and together they pushed the cron past
+# its 30-min budget — every scheduled run was silently `cancelled` at the
+# timeout, producing no diagnostic at all. Keep the daily under its budget
+# so it actually completes; the two heavy gates keep their per-PR coverage.
+daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget
+	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC
