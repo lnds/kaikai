@@ -17,6 +17,7 @@
 # file sizes — contained.
 
 import compiler.ast
+import compiler.fnreg
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_variant
@@ -305,3 +306,223 @@ fn lm_bind_head_as(hp: Pattern, name: String, headv: KVal, st: LowerSt) : LowerS
 # for the same reason; KIR `KLet` never increfs (refcounting is KRC nodes).
 fn lm_bind_name(name: String, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
   ls_emit(st, KLet(name, SBoxed, op, KAt(p.line, p.col)))
+
+# --- issue #858: structural incref of OWNED-match LIST alias binders -----
+#
+# A list arm's head/tail/rest binders are ALIASES of the scrutinee's cons
+# slots (`KProj` / `KLitOp` over the scrutinee — a BORROW, no incref). The
+# C-direct oracle (`emit_pat_binds_list`) gives each such binder its OWN
+# owned reference with `kai_incref` (`is_alias=true`), so the owned match's
+# exit decref (`__pcs_scr_drop`) never frees a cell the binder transferred
+# onward (the self-tail back-edge → next scrutinee → its exit drop). The
+# KIR emitter omitted that structural incref, so a binder moved onward and
+# then dropped by the next level's `__pcs_scr_drop` over-freed the shared
+# cell — the #858 use-after-free over a recursive `mycontains`/`==`.
+#
+# We mirror the oracle structurally in the lowering (NOT perceus — the
+# incref is the EMITTER's, not a Perceus KRC decision; duplicating it in
+# perceus would be a second RC source of truth). Each alias binder of an
+# OWNED list arm gets a `KDup` right after its bind. Gated OFF for a reuse
+# arm: there the scrutinee is consumed by `__perceus_reuse_*` (which increfs
+# the kept children conditionally on the shared token) and there is NO exit
+# drop, so an extra structural dup would double-incref on the shared path.
+#
+# SCOPE: this restores the incref for LIST (cons head/tail) arms only — the
+# #858 shape (`==` over a recursively-traversed shared list). The variant /
+# record arm paths (`kir_lower_bind.kai`) share the same KProj-borrow shape
+# and the analogous gap exists there, but the oracle's variant-arg incref is
+# NOT unconditional (the rb-tree `ins` arm binds slots WITHOUT incref and
+# increfs only conditionally on the reuse token) — replicating it needs the
+# full move/borrow/reuse discriminant the variant path computes, so it is a
+# distinct follow-up, not this lane (a blunt variant-wide dup regresses 12
+# fixtures — measured).
+
+# Collect the ALIAS binder names of a list arm pattern — the head `PBind`s,
+# the `...rest` binder, and a whole-list catch-all `PBind` / `PAs` name.
+# These are exactly the binders that `lm_emit_cells` / `lm_bind_whole` bind
+# as a borrow of the scrutinee's storage (`KProj` / `KLitOp`) — the set the
+# oracle's `emit_pat_binds_list` increfs. `_`-prefixed discards bind nothing
+# the body uses; including them is harmless (a dup+exit-drop pair on a value
+# the arm ignores is balanced) and keeps the set aligned with what is bound.
+# Nested head sub-patterns (record / variant) are NOT collected here: their
+# own binders ride the variant-slot bind path, which the oracle increfs
+# separately; the #858 shape is the flat cons head/tail, so we restore the
+# incref for that set and leave the nested path to its existing discipline.
+pub fn list_arm_alias_binders(p: Pattern) : [String] = match p.pkind {
+  PList(pats, opt_rest) -> {
+    let heads = list_arm_head_binders(pats, [])
+    match opt_rest { None -> heads Some(name) -> [name, ...heads] }
+  }
+  PBind(name)  -> [name]
+  PAs(name, _) -> [name]
+  _            -> []
+}
+
+fn list_arm_head_binders(pats: [Pattern], acc: [String]) : [String] = match pats {
+  []           -> acc
+  [hp, ...rest] -> match hp.pkind {
+    PBind(name) -> list_arm_head_binders(rest, [name, ...acc])
+    _           -> list_arm_head_binders(rest, acc)
+  }
+}
+
+# Emit a structural incref (`KDup`) for each alias binder, mirroring the
+# oracle's `kai_incref` on `is_alias=true` cons head/tail binds. Emitted
+# into the arm's body block (after the binds, before the body lowers), so
+# each binder carries its OWN owned reference that the owned match's exit
+# decref balances — the #858 fix. Gated by the caller on
+# `owned ∧ ¬list_arm_uses_reuse`.
+pub fn lm_dup_alias_binders(names: [String], pos: KPos, st: LowerSt) : LowerSt = match names {
+  []           -> st
+  [n, ...rest] -> lm_dup_alias_binders(rest, pos, ls_emit(st, KRC(KDup(KVar(n)), pos)))
+}
+
+# True iff the arm BODY consumes its scrutinee through an arm-top reuse
+# (`__perceus_reuse_{cons,variant,record}`, stamped by perceus's reuse
+# recogniser). For such an arm the structural dup is suppressed — the reuse
+# helper owns the scrutinee's RC discipline (conditional incref of kept
+# children + no exit drop), so an extra dup would leak. Conservative: ANY
+# reuse call anywhere in the body suppresses the dup (suppressing where reuse
+# is present is the single-source-of-truth gate, mirroring the oracle's
+# `cx.borrowed` arm-top-reuse exemption).
+pub fn arm_body_uses_reuse(e: Expr) : Bool = arm_reuse_kind(e.kind)
+
+fn arm_reuse_kind(k: ExprKind) : Bool = match k {
+  ECall(cf, cas) -> arm_reuse_call_head(cf) or arm_reuse_any(cas)
+  EIf(c, t, oe)  -> arm_body_uses_reuse(c) or arm_body_uses_reuse(t) or
+                    match oe { None -> false Some(e2) -> arm_body_uses_reuse(e2) }
+  EMatch(s, arms) -> arm_body_uses_reuse(s) or arm_reuse_arms(arms)
+  EBlock(stmts, tail) -> arm_reuse_stmts(stmts) or
+                         match tail { None -> false Some(e) -> arm_body_uses_reuse(e) }
+  ERecordLit(_, fs) -> arm_reuse_field_inits(fs)
+  EList(elems)      -> arm_reuse_list_elems(elems)
+  EBinop(_, a, b)   -> arm_body_uses_reuse(a) or arm_body_uses_reuse(b)
+  EUnop(_, a)       -> arm_body_uses_reuse(a)
+  EField(e, _)      -> arm_body_uses_reuse(e)
+  EIndex(a, b)      -> arm_body_uses_reuse(a) or arm_body_uses_reuse(b)
+  # ELambda: a different call frame — perceus reuse never spans it (mirror
+  # of pcs_gtm_kind / pcs_atsc_kind's ELambda cutoff). Leaf kinds: no reuse.
+  _ -> false
+}
+
+fn arm_reuse_call_head(cf: Expr) : Bool = match cf.kind {
+  EVar(nm) -> string_starts_with_q(nm, "__perceus_reuse_")
+  _        -> false
+}
+
+fn arm_reuse_any(es: [Expr]) : Bool = match es {
+  []           -> false
+  [e, ...rest] -> if arm_body_uses_reuse(e) { true } else { arm_reuse_any(rest) }
+}
+
+fn arm_reuse_arms(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a { Arm(_, _, b) -> if arm_body_uses_reuse(b) { true } else { arm_reuse_arms(rest) } }
+}
+
+fn arm_reuse_stmts(stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> arm_body_uses_reuse(e)
+      SVar(_, _, e, _, _) -> arm_body_uses_reuse(e)
+      SExprStmt(e)        -> arm_body_uses_reuse(e)
+      _                   -> false
+    }
+    if here { true } else { arm_reuse_stmts(rest) }
+  }
+}
+
+fn arm_reuse_field_inits(fs: [FieldInit]) : Bool = match fs {
+  []           -> false
+  [f, ...rest] -> match f { FI(_, e) -> if arm_body_uses_reuse(e) { true } else { arm_reuse_field_inits(rest) } }
+}
+
+fn arm_reuse_list_elems(elems: [ListElem]) : Bool = match elems {
+  []           -> false
+  [el, ...rest] -> {
+    let here = match el {
+      ElPlain(e)  -> arm_body_uses_reuse(e)
+      ElSpread(e) -> arm_body_uses_reuse(e)
+    }
+    if here { true } else { arm_reuse_list_elems(rest) }
+  }
+}
+
+# --- issue #858 (variant / record arms) ----------------------------------
+#
+# The SAME structural-incref gap on the variant-switch / default-arm paths
+# (`kir_lower_bind.kai`). A `PVariant` POSITIONAL sub-binder is bound
+# `KLet name = KProj scrv idx` — a BORROW of the scrutinee slot, like a cons
+# head/tail (the regexp `Ok(ast) -> Ok(R(compile_nfa(ast)))` UAF, #858
+# sibling). The oracle's `emit_pat_binds_variant` increfs such a slot ONLY
+# when its kind is POINTER (`is_alias=true`, `kai_incref`): an Int slot is
+# read RAW (`int64_t kair_<n> = slot.i64`, no RC), a Real slot is a fresh
+# owning box (`is_alias=false`, no incref), an enum slot is an immortal
+# singleton. So the dup is restricted to POINTER slots — duping an Int/Real
+# slot binder over-increfs a value the KIR keeps unboxed (the 12-fixture
+# regression a blunt all-slot dup caused — measured).
+#
+# Record-FIELD binders are EXEMPT entirely: they bind `KLet = kai_op_field`,
+# and `kai_op_field` already increfs its return (runtime.h) — they own their
+# ref. So `variant_arm_alias_binders` collects only the POINTER-kind
+# positional `PBind` slots + a whole-binder / as-name aliasing the scrutinee.
+
+# Slot kind of a payload type (mirror of emit_c's `variant_slot_kind`; the
+# enum list is `[]` here — an enum slot then classifies as 0/pointer, but a
+# dup of an immortal-singleton enum slot is a runtime no-op, so the only
+# values this gates IN are real heap pointers and the only ones it gates OUT
+# are Int (1) / Real (2), exactly the unboxed slots the oracle reads raw).
+fn ls_slot_kind(te: TypeExpr) : Int = match te.tkind {
+  TyName(n, args) ->
+    if list_length(args) == 0 {
+      if n == "Int" { 1 } else if n == "Real" { 2 } else { 0 }
+    } else { 0 }
+  _ -> 0
+}
+
+# Collect the POINTER-kind positional binder names of a TOP-LEVEL variant /
+# variant-record arm pattern, plus a whole `PBind` / `PAs` alias. `vs` is the
+# variant registry (`LowerSt.vs`) — it carries each ctor's payload types, so a
+# slot's kind is known and Int/Real slots are excluded. A `PVariantRecord`
+# arm's fields bind via the incref-ing `kai_op_field`, so it contributes none.
+pub fn variant_arm_alias_binders(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
+  PVariant(cname, subs) -> variant_ptr_slot_binders(subs, evar_payload_tys_for(vs, cname), 0, [])
+  PVariantRecord(_, _)  -> []
+  PBind(name)           -> [name]
+  PAs(name, _)          -> [name]
+  _                     -> []
+}
+
+# A ctor's payload type list from the variant registry, or [] if unknown
+# (then every slot classifies kind-0/pointer — conservative: a dup of a
+# genuinely-Int slot would be wrong, but an unknown ctor never reaches a
+# native owned variant arm in practice; the registry is always populated for
+# user + builtin ctors by the time the lowering runs).
+fn evar_payload_tys_for(vs: [EVar], target: String) : [TypeExpr] = match vs {
+  []           -> []
+  [h, ...rest] -> match h { EV(n, _, tys, _) -> if n == target { tys } else { evar_payload_tys_for(rest, target) } }
+}
+
+# Positional `PBind` slots whose kind is POINTER (0). A nested variant /
+# record / wildcard / literal slot is not a direct borrow binder. An Int (1)
+# / Real (2) slot is read unboxed by the oracle, so it gets no structural
+# dup. `tys` is indexed by slot position `idx`; a missing entry (ragged /
+# unknown) defaults to pointer (kind 0).
+fn variant_ptr_slot_binders(subs: [Pattern], tys: [TypeExpr], idx: Int, acc: [String]) : [String] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = match list_nth_te(tys, idx) { Some(te) -> ls_slot_kind(te) None -> 0 }
+    let acc1 = match sp.pkind {
+      PBind(name) -> if k == 0 { [name, ...acc] } else { acc }
+      _           -> acc
+    }
+    variant_ptr_slot_binders(rest, tys, idx + 1, acc1)
+  }
+}
+
+# Nth element of a TypeExpr list (slot-position lookup), None past the end.
+fn list_nth_te(tys: [TypeExpr], n: Int) : Option[TypeExpr] = match tys {
+  []           -> None
+  [t, ...rest] -> if n == 0 { Some(t) } else { list_nth_te(rest, n - 1) }
+}
