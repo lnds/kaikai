@@ -1984,7 +1984,7 @@ case.
 Replicate the m7a/m7b effects codegen in the LLVM backend. The
 C and native backends must round-trip identically: every
 `m7a_*.kai` / `m7b_*.kai` fixture compiled with `--backend=native`
-behaves the same as `--emit=c` (validated by the backend-parity
+behaves the same as `--backend=c` (validated by the backend-parity
 ratchet `tools/test-backend-parity.sh` with `TARGET_BACKEND=native`).
 Doc B's open question OQ #6 (C vs native perf ratio for
 trivial-clause ops) gets re-measured after this lands.
@@ -2143,7 +2143,7 @@ Implementation plan when the follow-up runs:
 4. **Test target**: the backend-parity ratchet
    `tools/test-backend-parity.sh` with `TARGET_BACKEND=native`
    runs every `m7a_*.kai` / `m7b_*.kai` fixture under
-   `--backend=native` and asserts the same stdout as `--emit=c`.
+   `--backend=native` and asserts the same stdout as `--backend=c`.
 
 **Trigger to schedule**: when a real-world program needs to
 discard a continuation under the LLVM backend, OR when the

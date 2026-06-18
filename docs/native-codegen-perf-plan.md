@@ -14,6 +14,46 @@ review).
 > native is the **default** backend — so this gap is what users now ship by
 > default. The plan below is the work that makes that default fast.
 
+> **Closure status (2026-06-17) — the diagnosis below is historical; the plan SHIPPED.**
+> Everything from "ALL-BOXED scalar codegen" onward describes the *starting*
+> state (native ~6s on the arith loop). That is no longer true. The optimisation
+> lanes the plan scoped have all landed:
+>
+> | item | what shipped | PR |
+> |---|---|---|
+> | P1 | native Int unbox (mode-slave arith/cmp) | #853 |
+> | P2 | runtime bitcode-link before O2 | #854 |
+> | §3.4 | `variant_match` super-linear fix (immortal-cache tagged-Int trap) | #856 |
+> | P3 | raw scalar params/returns from `UFnSig` | #857 |
+> | P4 | raw `sdiv`/`srem` for Int `/` and `%` | #859 |
+>
+> **Numbering note:** the per-PR numbering above (the one in project memory and
+> CHANGELOG) is *not* the same as the §"P1/P2/P3" headings later in this doc. The
+> doc's "P3 — alloca→mem2reg · do not pursue" was correctly NOT pursued; the
+> *shipped* "P3" is the raw-scalar-params lane (#857), a different item the
+> original plan did not enumerate.
+>
+> **Measured today (best-of-3, freshly built native kaic2, `tools/native-perf/`):**
+>
+> | bench | C | native | ratio |
+> |---|---|---|---|
+> | `arith_const` / `arith_runtime` (scalar `+ - * / %`) | 0.07 | 0.07 | **1.0× (parity)** |
+> | `variant_match` | 0.00 | 0.01 | ~parity |
+> | `deep_rec` (non-tail `fib`) | 0.01 | 0.08 | **~8×** |
+> | `list_fold` | 4.96 | 9.12 | **1.84×** |
+> | `rbtree_corpus` | 1.21 | 2.65 | **2.2×** |
+>
+> Scalar arithmetic is at C parity. Residual status:
+> - **#860 (FIXED)** — cons/list RC leak (native never cascaded `decref→free`):
+>   the native back-edge now emits the dropmask (`nemit_drop_assigns_masked`)
+>   and self-tail arms drop the owned scrutinee (`match_selftail_scr_drop` +
+>   the TRMC `__kai_cons_s` step), so `free_total` cascades exactly as the C
+>   oracle (`decref_total` identical). `leaked` is now a constant, not linear
+>   in the list length.
+> - **#861** — non-tail raw call result re-boxes (`kaix_int` → `kaix_int_field`
+>   per call): drives `deep_rec` ~8×; not heap-bound (zero allocs in the loop).
+> - **#858 (FIXED, PR #862)** — native `kai_op_eq` over-decref UAF.
+
 ## TL;DR
 
 - **The brief's opt-level hypothesis is FALSE in HEAD.** `kai_native_opt_pipeline()`
@@ -178,7 +218,7 @@ divergence at the source; the runtime fix then stands as defense-in-depth.
 
 Reviewed by `asu`; the corrections below are folded in.
 
-### P1 — Native Int unboxing (mode-slave for Int arith/cmp) · **do first**
+### P1 — Native Int unboxing (mode-slave for Int arith/cmp) · **SHIPPED** (#853)
 
 **What.** Extend the existing `Real` raw-lowering machinery to `Int` arithmetic
 and comparison, so a `MUnboxed` Int loop runs on native `add`/`sub`/`mul` +
@@ -261,7 +301,11 @@ not Int arith).
 bitcode to be built reproducibly in both dev and release (the static-LLVM
 release path already vendors LLVM; bitcode is an added artefact).
 
-### P3 — alloca-everything → mem2reg · **do not pursue**
+### P3 — alloca-everything → mem2reg · **do not pursue** (correctly not pursued)
+
+> Not to be confused with the *shipped* "P3" in project memory / CHANGELOG,
+> which is the raw-scalar-params lane (#857). This heading's P3 (re-implementing
+> SSA construction in the walk) was correctly left alone — mem2reg gives it free.
 
 The native walk emits every temporary to an `alloca` and relies on mem2reg to
 promote to SSA. The arith-loop disassembly shows mem2reg *does* clear this under
@@ -302,7 +346,10 @@ objdump -d /tmp/x | awk '/<_?sum_loop>:/{p=1} p&&/^[0-9a-f]+ <[^k]/&&!/sum_loop/
 
 ## 7. Scope of this lane
 
-This lane **diagnoses and plans**. It ships the benchmark harness
-(`tools/native-perf/`) and this document. P1/P2 are follow-up lanes the plan
-scopes; no codegen rewrite lands here. The opt-level "one-liner" the brief
-authorised does not exist (§TL;DR), so no compiler code changed.
+This lane **diagnosed and planned**. It shipped the benchmark harness
+(`tools/native-perf/`) and this document; no codegen rewrite landed in *this*
+lane. The opt-level "one-liner" the brief authorised does not exist (§TL;DR),
+so no compiler code changed here. The codegen work the plan scoped then shipped
+across follow-up lanes P1–P4 + §3.4 — see the closure-status table at the top.
+Residuals: #858 (UAF) and #860 (cons leak) are FIXED; #861 (non-tail raw call
+re-box, `deep_rec`) remains.

@@ -428,27 +428,27 @@ fn nemit_switch_cases(ctx: Handle, sw: Handle, cs: [KCase]) : Unit / Console = m
 # values), so collect handles first.
 #
 # The `dropmask` (the lowering's per-param "dead after this back-edge"
-# bitfield) is NOT emitted here. Reuse-in-place correctness on the rb-tree
-# is carried by the move-semantics variant reuse (`kai_variant_reuse_at`,
-# which increfs the donated cell to survive the match-exit) + the variant-
-# TRMC spine build — both verified result-correct and ASAN-clean WITHOUT a
-# back-edge param drop. Replaying the dropmask as a naive per-index
-# `kaix_internal_drop` over-drops a still-live heap param (it corrupts the
-# JSON-parse `list_*` loops the jwt fixture exercises — `kid`→`"kid":"beef"`)
-# because the native lacks the C oracle's `pmask` raw/boxed param distinction
-# (`tcrec_emit_drops_masked`). Emitting it correctly needs that mask threaded
-# into the KIR; until then the only consequence of skipping it is extra leak
-# (the all-boxed native backend already never cascades decref→free — a
-# separate, pre-existing gap), never a double-free. `dropmask` is accepted
-# and ignored on this path (see lane retro).
+# bitfield) is emitted between eval and store, mirroring the C oracle's
+# `tcrec_emit_drops_masked` (emit_c.kai): the OLD value of a param that is
+# (a) BOXED and (b) marked dead by the dropmask is `kaix_internal_drop`ed
+# before the alloca is overwritten with the reloop value (issue #860 — the
+# `build`/accumulator self-tail leaked one cons per iteration without it).
+# The raw/boxed distinction the C oracle reads from `pmask` is read here from
+# the param's KIR slot tag (`native_ctx_reg_slot_at` == 0 ⇒ SBoxed): a raw
+# scalar param (`SInt64`/`SReal`/`SBool`) is never dropped (a decref of a
+# scalar is the #709 corruption — the over-drop that broke the jwt `list_*`
+# loops in the first cut). The eval pass already materialised every reloop
+# value (reading the OLD params) into `valbuf`, so dropping the old params
+# next is safe — a value the new cell captured was already incref'd by the
+# arm's own `dup` (e.g. `kai_cons(h, acc)` over a `dup acc`).
 fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign], dropmask: Int) : Unit / Console = {
   # Evaluate ALL reloop values FIRST (they read the OLD param values),
   # into a C buffer — handles never ride a kaikai list (asu "risk #1").
   # The `[KAssign]` carries the param indices (plain Ints, safe in a
   # list); the materialised value handles go into `valbuf` in parallel.
-  let _ignored_dropmask = dropmask
   let valbuf = llvm_buf_new()
   nemit_eval_assigns(ctx, asg, valbuf)
+  nemit_drop_assigns_masked(ctx, asg, dropmask)
   nemit_store_assigns(ctx, asg, valbuf, 0)
   llvm_buf_free(valbuf)
   llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
