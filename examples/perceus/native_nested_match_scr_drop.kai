@@ -1,0 +1,37 @@
+# Native nested-owned-match scrutinee-drop aliasing — the `max([T])` double-free.
+#
+# `Ord` for `[T]` compares via `list_cmp_loop`, an OWNED match on `a` whose body
+# nests an OWNED match on `b`. Both matches' exit-drop binders used the FIXED
+# name `__pcs_scr_drop`; the native (in-process libLLVM) backend dedupes its
+# register table by name, collapsing both into ONE alloca. The inner match's
+# `<- b` store then clobbered the outer's `<- a`, so the outer exit drop freed
+# `b` a second time.
+#
+# The symptom was direction-dependent and exactly explained the diagnosis:
+#   - `min(a, b)` returns `a` (the FIRST arg) -> reads a still-valid pointer ->
+#     ran (with a benign leak).
+#   - `max(a, b)` returns `b` (the SECOND arg) when `a < b` -> after the
+#     corrupting compare it must `dup b`, now a DANGLING pointer ->
+#     `kaix_internal_dup` over freed memory -> EXC_BAD_ACCESS (exit 138/139).
+# The C-direct oracle never had it: each match emits a lexically-shadowed `_scr`
+# statement-expression, so the outer decref reads the outer scrutinee.
+#
+# The fix mints a FRESH per-match exit-drop binder (`<join>$sd`) in
+# `match_preamble`, threaded to `match_finish` / `match_selftail_scr_drop` and
+# (via `LowerSt.mscr`) to the TRMC cons-modulo step — so nested matches never
+# share one native alloca. Before the fix this fixture crashed at the first
+# `max` over lists; the C oracle printed all four lines.
+
+fn main() : Unit / Console = {
+  # `max` returning the SECOND arg over lists — the exact crash shape.
+  let m1 : [Int] = max([3, 1], [3, 2])   # a < b -> returns b = [3, 2]
+  println(show(m1))
+  # `max` returning the FIRST arg (a > b) — the surviving direction.
+  let m2 : [Int] = max([9, 1], [3, 2])   # a > b -> returns a = [9, 1]
+  println(show(m2))
+  # `min` over lists — returns the first arg, always survived.
+  let m3 : [Int] = min([3, 1], [3, 2])   # returns a = [3, 1]
+  println(show(m3))
+  # A bare polymorphic `cmp` over the nested-match comparator.
+  println("#{cmp([1, 2], [1, 2, 3])}")   # -1: shorter prefix < longer
+}
