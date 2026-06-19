@@ -377,6 +377,16 @@ fn rspec_slot(acc: [RSpec], name: String) : Option[KSlot] = match acc {
   [RS(n, s), ...rest] -> if n == name { Some(s) } else { rspec_slot(rest, name) }
 }
 
+# Register a `KStore` destination: keep the declared slot when the register
+# already exists (its `KLet` decided it — a raw `if`-join must stay raw), seed
+# `SBoxed` only for a store onto an un-declared name (the boxed default). Never
+# WIDENS a declared slot, unlike `rspec_add` — a store writes at the existing
+# type, it does not re-declare.
+fn rspec_add_store(acc: [RSpec], name: String) : [RSpec] = match rspec_slot(acc, name) {
+  None    -> list_append(acc, [RS(name, SBoxed)])
+  Some(_) -> acc
+}
+
 # Re-register `name` as `SBoxed` (the slot-widening on a conflict), keeping
 # list order so the alloca-emit order — and the dump — stay deterministic.
 fn rspec_set_boxed(acc: [RSpec], name: String) : [RSpec] = match acc {
@@ -402,7 +412,14 @@ fn collect_stmt_specs(ss: [KStmt], acc: [RSpec]) : [RSpec] = match ss {
   [] -> acc
   [s, ...rest] -> collect_stmt_specs(rest, match s {
     KLet(n, slot, _, _) -> rspec_add(acc, n, slot)
-    KStore(n, _, _)     -> rspec_add(acc, n, SBoxed)
+    # A `KStore` does NOT decide its destination's slot — the `KLet` that
+    # declared the register does (a raw `if`-join is `KLet(.t, SInt64, ..)`
+    # then written by branch `KStore`s). Seeding the store `SBoxed` would
+    # CONFLICT with that `KLet` and widen the raw join back to `ptr` (an
+    # alloca-`ptr` / `store i64` mismatch). So a store only seeds a register
+    # with NO `KLet`; a store onto an already-declared register keeps the
+    # declared slot (`KStore` always follows its `KLet` in the same block).
+    KStore(n, _, _)     -> rspec_add_store(acc, n)
     # A stateful return clause's `KBindEvState` stores the Ev state into the
     # `state` / `log` registers — they need entry-block allocas like any
     # other binder, but the node names them implicitly, so register both here.
@@ -442,4 +459,24 @@ pub fn nemit_store_reg(ctx: Handle, name: String, h: Handle) : Unit / Console = 
   let slot = native_ctx_reg_slot(ctx, name)
   if slot < 0 { eprint(cat2("native: store to unbound register ", name)); () }
   else { llvm_build_store(native_ctx_b(ctx), h, alloca); () }
+}
+
+# `KStore n <- v` honouring the destination slot. A raw register (tag 1/2/3 —
+# `SInt64`/`SReal`/`SBool`, e.g. the raw `if`-join) takes the value raw via
+# `nemit_atom_raw` (the `i64`/`f64` flowing into the raw alloca with no
+# `kaix_int` box); a boxed register (tag 0 / unbound -1) keeps the plain
+# `nemit_atom` — byte-identical to the prior inline KStore arm.
+#
+# Materialise + store in ONE fn that returns Unit — it must NOT return the
+# LLVM `Handle`: the type-blind kaic1 RC-wraps a returned raw pointer (`risk
+# #1`), and that corruption rewrites neighbouring module state (it surfaced as
+# invalid `select`-shaped CallInsts on UNRELATED `kaix_ge`/`kaix_and` decls).
+# Keeping the handle inside this seam (passed straight to `nemit_store_reg`,
+# never crossing a return boundary) mirrors the original inline arm.
+pub fn nemit_store_slot_aware(ctx: Handle, name: String, v: KVal) : Unit / Console = {
+  let tag = native_ctx_reg_slot(ctx, name)
+  if tag == 1 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SInt64)) }
+  else if tag == 2 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SReal)) }
+  else if tag == 3 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SBool)) }
+  else { nemit_store_reg(ctx, name, nemit_atom(ctx, v)) }
 }

@@ -220,18 +220,51 @@ fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console =
     _        -> lower_scalar_unbox_border(x, st)
   }
 
+# Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
+# slot). A `MUnboxed` node lowers raw by its own form; a boxed node crosses
+# the border to the GIVEN slot, NOT one inferred from `x.ty`. The type-driven
+# `lower_scalar_unbox_border` mis-routes when the arg's `.ty` is absent /
+# unresolved (a generic-fn `EVar` the typer left untyped — `take(xs, mid)`
+# where `mid`'s ref carries no `Ty`): it falls to `real.unbox` over a boxed
+# Int, the `kaix_int_field(double)` verifier mismatch. Keying off the PARAM's
+# slot (the callee's declared `SInt64`/`SReal`/`SBool`) is exact.
+fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console =
+  match x.mode {
+    MUnboxed -> lower_expr_raw_kind(x, st)
+    _        -> lower_scalar_unbox_border_at(x, slot, st)
+  }
+
+# The box→raw border at a KNOWN slot: lower boxed, then unbox-borrow through
+# the slot's prim (`int.unbox`/`real.unbox`/`bool.unbox`). A `SBoxed` slot is
+# a lowering bug (a raw arg never targets a boxed param) — fall back to the
+# plain boxed lowering so the value is at least well-formed.
+fn lower_scalar_unbox_border_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match slot {
+  SInt64 -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(x)) }
+  SReal  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x)) }
+  SBool  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("bool.unbox", [bv]), SBool, kpos_of(x)) }
+  _      -> lower_expr_boxed(x, st)
+}
+
 # A boxed scalar read in raw position: lower it boxed, then unbox-borrow its
 # raw payload. The border is TYPE-DRIVEN — an Int node crosses through
-# `int.unbox` (→ `kaix_int_field`, slot `SInt64`), any other (Real)
-# through `real.unbox` (→ `kaix_real_field`, slot `SReal`). NON-consuming
-# in both cases — the box stays owned by its binding for the normal drop
-# (the oracle's bare `(boxed)->as.i` / `(boxed)->as.r`). A Real-only border
-# would `real.unbox` a boxed Int (`kaix_real_field` reading `as.r` off an
-# Int) — a silent miscompile; the type gate prevents it.
+# `int.unbox` (→ `kaix_int_field`, slot `SInt64`), a Bool through
+# `bool.unbox` (→ `kaix_bool_field`, slot `SBool`), any other (Real) through
+# `real.unbox` (→ `kaix_real_field`, slot `SReal`). NON-consuming in all
+# cases — the box stays owned by its binding for the normal drop (the
+# oracle's bare `(boxed)->as.i` / `(boxed)->as.b` / `(boxed)->as.r`). The
+# type gate is load-bearing: a Real-only border would `real.unbox` a boxed
+# Bool (`kaix_real_field` reading `as.r` off a Bool) — a silent miscompile +
+# the LLVM type mismatch the verifier rejects. The Bool case is reached by a
+# raw-Bool call arg (a `neg: Bool` param the callee unboxes — `lower_tcrec_
+# args` lowers it raw at the param's `SBool` slot).
 fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
   if kir_ty_is_int(x.ty) {
     match lower_expr_boxed(x, st) {
       LRes(bv, st1) -> bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(x))
+    }
+  } else if kir_ty_is_bool(x.ty) {
+    match lower_expr_boxed(x, st) {
+      LRes(bv, st1) -> bind_op_slot(st1, KPrim("bool.unbox", [bv]), SBool, kpos_of(x))
     }
   } else {
     match lower_expr_boxed(x, st) {
@@ -284,6 +317,20 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
         LRes(av, st1) -> bind_op_slot(st1, KPrim("bnot", [av]), SBool, kpos_of(x))
       }
     } else { lower_scalar_unbox_border(x, st) }
+  # A call in raw position (`fib(n-1) + fib(n-2)` — each call is an arith
+  # OPERAND, not a `let`-binder). Route it through the ORDINARY call dispatch:
+  # `lower_direct_call` binds the result at the callee's return slot, so a
+  # raw-return UFn lands its `i64`/`f64`/`i1` in a raw register and the
+  # consuming `lower_raw_binop` reads it directly (`nemit_load_reg_as_int`,
+  # no `kaix_int_field`) — eliminating the `kaix_int` box + `kaix_int_field`
+  # unbox round-trip the old `_`-arm border emitted per call (the ~8× on
+  # `fib`-tree recursion). A callee with a BOXED return resolves to an
+  # `SBoxed` register; the consumer then unbox-borrows at the slot exactly
+  # as the border did, so a non-raw callee keeps the prior behaviour. Mirror
+  # of the oracle's `emit_kind_raw` ECall arm → `emit_ufn_raw_call`. RC: a
+  # raw call result carries no refcount; perceus already skipped it (the
+  # node is `MUnboxed`), so no KDup/KDrop lands on the raw register.
+  ECall(f, cargs) -> lower_call(x, f, cargs, st)
   # A single-tail block transparently wraps its raw tail (no preceding
   # statements). A multi-statement block, or any other shape, is not a
   # natively-raw form: lower it boxed then unbox-borrow at the border.
@@ -373,28 +420,49 @@ pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = 
 # the boxed `lower_expr`. With no raw signature (`None`) this is exactly
 # `lower_exprs`. The arg's type equals its param's type (a well-typed tail
 # call), so `lower_expr_raw` yields the param's scalar slot.
+# Lower each arg at its PARAM's KSlot (`param_slot_for` — `mask[i]` AND the
+# type mapping to a raw KIR slot). An arg lowers RAW only when the param's
+# slot is raw (`SInt64`/`SReal`/`SBool`); a `SBoxed` param keeps the boxed
+# `lower_expr`. This is stricter than the bare `mask[i]`: a `Char`/`Handle`
+# param is `mask=true` (unboxable) yet maps to `SBoxed` (no raw KIR register
+# form), so lowering it raw would `real.unbox` a boxed Char (a miscompile —
+# native returned 0 vs C's 5 on a `Char` param). Using the slot keeps the arg
+# repr in lockstep with the param the callee declares (`lower_params_sig`).
 fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LResMany / Console =
-  lower_tcrec_args_idx(xs, tcrec_mask_of(sig), st, [])
+  lower_tcrec_args_idx(xs, tcrec_ptys_of(sig), tcrec_mask_of(sig), st, [])
 
-fn lower_tcrec_args_idx(xs: [Expr], mask: [Bool], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
+fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
   [] -> LResMany(acc, st)
   [e, ...rest] -> {
-    let raw = match mask {
-      [true, ..._] -> true
-      _ -> false
+    let pslot = param_slot_for(ptys, mask)
+    let trest = match ptys {
+      [_, ...r] -> r
+      [] -> []
     }
     let mrest = match mask {
       [_, ...r] -> r
       [] -> []
     }
-    match lower_tcrec_arg(e, raw, st) {
-      LRes(v, st1) -> lower_tcrec_args_idx(rest, mrest, st1, list_append(acc, [v]))
+    match lower_tcrec_arg(e, pslot, st) {
+      LRes(v, st1) -> lower_tcrec_args_idx(rest, trest, mrest, st1, list_append(acc, [v]))
     }
   }
 }
 
-fn lower_tcrec_arg(e: Expr, raw: Bool, st: LowerSt) : LRes / Console =
-  if raw { lower_expr_raw(e, st) } else { lower_expr(e, st) }
+# Lower an arg at its PARAM's slot: a raw param slot crosses the box→raw
+# border AT THAT SLOT (`lower_expr_raw_at` — exact, never inferred from the
+# arg's `.ty`, which a generic-fn `EVar` may lack); a `SBoxed` param keeps
+# the plain boxed `lower_expr`.
+fn lower_tcrec_arg(e: Expr, pslot: KSlot, st: LowerSt) : LRes / Console = match pslot {
+  SBoxed -> lower_expr(e, st)
+  _      -> lower_expr_raw_at(e, pslot, st)
+}
+
+# The per-param type list of a (self-recursing) UFn sig, `[]` when None.
+fn tcrec_ptys_of(sig: Option[UFnSig]) : [Ty] = match sig {
+  Some(US(ptys, _, _)) -> ptys
+  None -> []
+}
 
 # The per-param raw mask of a (self-recursing) UFn sig, `[]` when None.
 fn tcrec_mask_of(sig: Option[UFnSig]) : [Bool] = match sig {
@@ -700,28 +768,73 @@ fn lower_if(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes 
 # The `join` register is materialised with a `KLet` BEFORE the condbr so a
 # translator reads it as a mutable slot (alloca) each branch's `KStore`
 # writes — not an undeclared name to infer (Linus review #1).
-fn lower_if_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console =
+#
+# A RAW `if` (`if n<2 { n } else { fib(n-1)+fib(n-2) }` — the unbox pass
+# marks the whole `EIf` `MUnboxed` when both arms AND the cond are raw)
+# lowers the JOIN at the result's raw slot (`SInt64`/`SReal`), each arm
+# stored raw. This mirrors the C oracle's raw ternary `(cond ? a : b)`: the
+# `+`'s `i64` flows into the join WITHOUT a `kaix_int` box, and a raw-return
+# `KRet` reads the join directly (no `kaix_int_field`). The box/unbox round-
+# trip a boxed join forced on every `fib` arm is gone. A boxed `if` (the
+# default, and any Bool/Char-typed raw `if` outside the Int/Real raw KIR
+# scope) keeps the `SBoxed` join unchanged. RC: a raw join carries no
+# refcount; the arms are `MUnboxed` (perceus skipped them), so no KDup/KDrop
+# lands on the raw register.
+fn lower_if_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console = {
+  let js = if_join_slot(x)
   match ls_fresh_reg(st) { LSReg(join, st2) -> {
-    let st_decl = ls_emit(st2, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+    let st_decl = ls_emit(st2, KLet(join, js, KLitOp(if_join_init(js)), kpos_of(x)))
     match three_labels(st_decl) { LSL3(lt, le, lcont, st3) -> {
       let st4 = ls_seal(st3, KCondBr(cv, lt, le, kpos_of(x)), lt)
-      let st5 = lower_branch_into(t, join, lcont, st4)
-      let st6 = lower_else_into(e_opt, join, lcont, le, st5)
+      let st5 = lower_branch_into_slot(t, join, js, lcont, st4)
+      let st6 = lower_else_into_slot(e_opt, join, js, lcont, le, st5)
       LRes(KVar(join), st6)
     } }
   } }
+}
 
-# Lower one branch into the join register and branch to the continuation.
-fn lower_branch_into(e: Expr, join: String, lcont: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(e, st) { LRes(v, st1) ->
+# The join register's slot: raw (`SInt64`/`SReal`) when the `if`-node is a
+# raw-promoted Int/Real expression (`x.mode == MUnboxed` — both arms raw),
+# else `SBoxed`. Bool/Char raw `if`s stay boxed (no raw KIR register form —
+# the `kir_lower_raw` scope bound).
+fn if_join_slot(x: Expr) : KSlot = match x.mode {
+  MUnboxed -> if kir_ty_is_int(x.ty) { SInt64 } else if kir_ty_is_real(x.ty) { SReal } else { SBoxed }
+  _        -> SBoxed
+}
+
+# The join's initial placeholder, matching its slot (the `KLet` decl must
+# store a value of the alloca's type before the branches overwrite it).
+fn if_join_init(slot: KSlot) : KVal = match slot {
+  SInt64 -> KIntV(0)
+  SReal  -> KRealV(0.0)
+  _      -> KUnitV
+}
+
+# Lower one `if`-arm into the join register and branch to the continuation. A
+# raw join (`SInt64`/`SReal`) lowers the arm RAW; a boxed join keeps the
+# plain boxed `lower_expr`. The slot drives the choice so the store matches
+# the alloca. (`lower_branch_into` is the boxed-only match variant.)
+fn lower_branch_into_slot(e: Expr, join: String, js: KSlot, lcont: String, st: LowerSt) : LowerSt / Console =
+  match if_branch_lower(e, js, st) { LRes(v, st1) ->
     ls_seal(ls_emit(st1, KStore(join, v, kpos_of(e))), KBr(lcont, kpos_of(e)), lcont) }
 
-fn lower_else_into(e_opt: Option[Expr], join: String, lcont: String,
-                   le: String, st: LowerSt) : LowerSt / Console = match e_opt {
-  Some(e) -> lower_branch_into(e, join, lcont, reopen(st, le))
+fn if_branch_lower(e: Expr, js: KSlot, st: LowerSt) : LRes / Console = match js {
+  SBoxed -> lower_expr(e, st)
+  _      -> lower_expr_raw(e, st)
+}
+
+fn lower_else_into_slot(e_opt: Option[Expr], join: String, js: KSlot, lcont: String,
+                        le: String, st: LowerSt) : LowerSt / Console = match e_opt {
+  Some(e) -> lower_branch_into_slot(e, join, js, lcont, reopen(st, le))
   None    -> ls_seal(ls_emit(reopen(st, le), KStore(join, KUnitV, KNoPos)),
                      KBr(lcont, KNoPos), lcont)
 }
+
+# Lower one branch (a MATCH arm body) into a BOXED join register and branch
+# to the continuation. The match-lowering's join is always `SBoxed`.
+fn lower_branch_into(e: Expr, join: String, lcont: String, st: LowerSt) : LowerSt / Console =
+  match lower_expr(e, st) { LRes(v, st1) ->
+    ls_seal(ls_emit(st1, KStore(join, v, kpos_of(e))), KBr(lcont, kpos_of(e)), lcont) }
 
 # --- postfix `!` (Option/Result propagation) ----------------------------
 
@@ -1729,10 +1842,32 @@ fn lower_ctor_call(x: Expr, name: String, cargs: [Expr], st: LowerSt) : LRes / C
     bind_op(st1, KCon(name, tag, boxed_inits(avs, [])), kpos_of(x))
   } }
 
-# `sym` is the already-resolved mangled symbol.
-fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
-    bind_op(st1, KCall(sym, avs), kpos_of(x)) }
+# `sym` is the already-resolved mangled symbol. Resolve the callee's UFnSig
+# once: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
+#
+# ARGS — lower each at the callee's PARAM slot (`lower_tcrec_args`, shared
+# with the self-tail-call back-edge): a raw param gets its arg lowered RAW
+# (`fib(n-1)` passes the `i64` directly, no `int.box` → `kaix_int_field`
+# round-trip at the callee boundary), a boxed param keeps the boxed atom.
+# Without this the args round-tripped (`int.box(n-1)` then the callee's
+# `nemit_raw_args` unbox-borrowed back) — the other half of the residual.
+#
+# RESULT — bind at the callee's RETURN slot, not the unconditional `SBoxed`
+# of `bind_op`: a raw-return UFn lands its `i64` in a raw register, so a
+# consuming `i+` reads it directly (`nemit_load_reg_as_int`) and a boxed use
+# boxes once at the border (`nemit_load_reg_boxed` → `kaix_int`, the oracle's
+# `box_wrap`). A non-raw callee (FFI wrapper, effectful / generic / proto fn
+# → `None` sig) lowers args + result exactly as before (all boxed).
+#
+# RC: a raw `i64`/`f64`/`i1` carries NO refcount. Perceus already skips a raw
+# arg / result — the unbox pass marks them `MUnboxed`, so neither the raw
+# args nor the raw result register attract a KDup/KDrop. The raw slots here
+# only change the repr, never the RC plan.
+fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let sig = lookup_ufn_by_csym(st.fns, sym)
+  match lower_tcrec_args(cargs, sig, st) { LResMany(avs, st1) ->
+    bind_op_slot(st1, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x)) }
+}
 
 # Route a bare-name call: a top-level fn or a prelude builtin is a direct
 # `KCall`; anything else is a local binder holding a function value, so
