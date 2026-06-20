@@ -25,9 +25,10 @@ Flags mirror stage 0: `--tokens`, `--ast`, `--test`, `-h/--help`.
 
 ## Status
 
-Under construction. See `docs/stage1-design.md` for the milestones and
-`docs/kaikai-minimal.md` for the subset the compiler is written in.
+Complete and load-bearing. `kaic1` is the self-hosting kaikai-minimal
+compiler the whole bootstrap depends on: stage 0 compiles it, and it in
+turn compiles stage 2 (`stage2/kaic2`). The pipeline — lexer, parser,
+checker, emitter — is fully implemented and exercised on every build.
 
-Current milestone: **skeleton** (CLI, file IO, driver). The compilation
-pipeline is a placeholder; subsequent milestones land the lexer, parser,
-checker, and emitter one step at a time.
+See `docs/stage1-design.md` for the design and `docs/kaikai-minimal.md`
+for the subset the compiler is written in.
