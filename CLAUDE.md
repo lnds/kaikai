@@ -114,6 +114,18 @@ Binary, like CI-green and selfhost byte-id: a lane that ships a sub-B file does 
 - **Pending work lives in GitHub Issues.** Tracking docs were retired in PR #99; do not recreate them.
 - **Lane retros are mandatory for non-trivial lanes.** Every lane that ships a non-trivial change (any architectural impact, any refactor, any new feature surface, anything that future lanes will reference) MUST produce `docs/lane-experience-issue-NNN.md` (or `lane-experience-<topic>.md` if no issue) BEFORE `gh pr create`. Bug fixes confined to a single file and doc-only PRs are exempt. The retro lives in the same commit as the implementation, not in a follow-up. Minimum contents: scope-as-planned vs scope-as-shipped, design decisions and alternatives considered, structural surprises the brief did not anticipate, fixtures added and coverage gaps, real cost vs estimate, follow-ups left for next lanes. ~50-150 lines is the target; longer if the lane was genuinely novel. The 91 retros in `docs/lane-experience-*.md` are the precedent; the bug-bash batch 2026-05-09→10 violated this rule (13+ merged PRs, zero retros) and surfaced the gap.
 
+## Comments — brief, timeless, or absent
+
+Comments drift: nobody updates them when the code changes, and they end up lying (a comment says "0x not supported" when the lexer supports it; "chunked not implemented" when `dechunk_body` is wired). A lying comment is worse than none. Seniors comment little. The default is **fewer**.
+
+- **If the code is clear, write no comment.** A comment that paraphrases the code is noise and debt.
+- **Brief.** One line where possible. Not paragraphs narrating every decision.
+- **Timeless.** No contingent references in code comments: no issue/PR/ticket numbers, no lane names, no dates, no "v1 status / shipped in #N / lands when… / deferred". That history lives in git and issues, not in the source. A comment must still be true a year from now untouched.
+- **Document invariants and traps, not narrative.** A non-obvious invariant, a trap that bites, a subtle reason something is NOT done the obvious way — yes. The file's history, spec citations by section — no.
+- **When editing code, reduce existing comments** that violate this rather than add more. If a comment and the code contradict, the code wins: fix or delete the comment.
+
+**The one mandatory exception: every `pub` symbol carries a `#[doc]`.** That is API documentation for users, not an internal comment, and it is required (see Doc discipline below — `#[doc]` first line is a one-sentence synopsis). The "fewer comments" rule governs internal `#` comments and over-long `#[doc]` bodies; it never licenses dropping a `pub` `#[doc]`. Keep the `#[doc]` synopsis itself brief and timeless too — no issue numbers, no "v1", no narrative.
+
 ## Doc discipline
 
 Catalog docs (`docs/stdlib-roadmap.md`, `docs/stdlib-layout.md`, `docs/effects-stdlib.md`, `docs/roadmap.md`) drift away from reality unless lanes update them at close. Issue #367 catalogued the last round of drift; this section exists to prevent the next round.
