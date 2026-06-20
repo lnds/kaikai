@@ -1,71 +1,20 @@
 #[doc("""
-core.string — string helpers in kaikai-minimal.
-
-Wrappers around the compiler-provided string builtins
-(string_length, string_concat, string_slice, char_at, …).
-
-Naming convention (m14 phase 2 — 2026-05-04): definitions live
-under bare names so qualified callers reach them as
-`string.trim(s)`. The flat `string_*` aliases retired in this
-phase (issue #203) after every consumer in `examples/`,
-`demos/`, and `stdlib/` migrated to the qualified surface.
-
-Stage 0's PRELUDE table (`stage0/emit.c`) keeps the flat
-`string_*` names for the runtime primitives (`string_length`,
-`string_concat`, `string_slice`, `string_to_int`, etc.); those
-are NOT stdlib exports — they live below the user-facing
-language and are the actual C primitives this module wraps.
-Issue #332 closed the m14 phase 2 gap by adding three public
-wrappers (`length`, `slice`, `to_int`) below; the flat names
-remain accessible via the PRELUDE table for bootstrap code
-that runs before `core/string.kai` is loaded.
-
-`string.concat(a: String, b: String)` was deferred during #332
-/#334 because adding it surfaced a pre-existing resolver gap:
-a bare-name `concat([])` call inside `core/list.kai` should
-resolve to that file's local `pub fn concat(xss: [[a]])`, but
-once `string.concat` also exists in the prelude the resolver
-picked the wrong candidate. #335 fixed file-local precedence
-for bare-name lookup inside test/bench/check bodies; #336
-(this change) re-introduces the wrapper now that the resolver
-distinguishes the two `concat` schemes. External callers with
-both modules in scope qualify the call (`string.concat(...)`
-vs `list.concat(...)`).
-
-Cross-file dependency: `string_trim_left_loop` and
-`string_trim_right_loop` call `is_space` from `core/char.kai`.
-Load order is fine because the resolver collects all prelude
-decls before resolving names, but the dependency is real and
-should not be broken. We use the bare name (not `char.is_space`)
-because both files can be the test-stdlib-core-intrinsic target;
-when `char.kai` is target it is not in the module table, but its
-bare exports are still in scope when loaded as prelude.
+core.string — byte-indexed string helpers over the runtime string
+builtins. Lengths and offsets are byte counts unless a name says
+otherwise (`char_count`, `chars`, `char_indices` are codepoint-aware).
 """)]
 
 #[doc("""
-Thin wrappers over runtime primitives — see module comment for
-the seam. `slice(s, from, len)` mirrors the primitive's
-`(start, length)` shape (NOT end-exclusive). `to_int` returns
-`Option[Int]` because the primitive returns `Some/None` on
-parse success / failure (no panic). `concat(a, b)` shares the
-bare name with `list.concat(xss)`; #335's resolver fix makes
-the file-local candidate win for callers inside `core/list.kai`
-and external callers must qualify (`string.concat` /
-`list.concat`) when both are in scope.
-`CharIndex` pairs a Unicode codepoint with the byte offset at which it
-begins in the buffer — the element type of `char_indices` (issue #744).
-A nominal record rather than a sugared `(Int, Char)` tuple: `.off`/`.cp`
-read clearer than `.fst`/`.snd` at the call sites #745 `display_width`
-and TUI consumers build on.
+The byte offset at which a Unicode codepoint begins in the buffer —
+the element type of `char_indices`. A nominal record so `.off`/`.cp`
+read clearer than `.fst`/`.snd` at call sites.
 """)]
 pub type CharIndex = { off: Int, cp: Char }
 
 #[doc("""
-`length(s)` is the byte count (O(1)) — the cheap substrate length,
-matching the byte-indexed `slice`/`char_at` family it sits with. For
-the Unicode codepoint count use `char_count`; `byte_length` is an
-explicit synonym of this when the unit needs to be unambiguous at a
-call site (issue #744).
+Byte count of `s` (O(1)), matching the byte-indexed `slice`/`char_at`
+family. For the Unicode codepoint count use `char_count`; `byte_length`
+is an explicit synonym when the unit needs to be unambiguous.
 """)]
 pub fn length(s: String) : Int = string_length(s)
 #[doc("Returns the substring of `len` bytes starting at byte offset `from`.")]
@@ -91,11 +40,8 @@ pub fn ends_with(s: String, suffix: String) : Bool {
 }
 
 #[doc("""
-`drop_prefix` / `drop_suffix` (issue #632) return `Option[String]`
-rather than the bare string so callers fuse the membership check
-with the slice. The shape matches `to_int`, `log2`, `div_mod`:
-`Some(rest)` when the prefix/suffix is present, `None` otherwise.
-Rust's `str::strip_prefix` is the direct precedent.
+Returns `Some(rest)` with `prefix` removed when `s` starts with it,
+`None` otherwise — fusing the membership check with the slice.
 """)]
 pub fn drop_prefix(s: String, prefix: String) : Option[String] {
   if starts_with(s, prefix) {
@@ -148,12 +94,7 @@ pub fn trim(s: String) : String {
   if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
 }
 
-#[doc("""
-`string.repeat` is the canonical module surface. After issue #235
-the typer narrows bare-name candidates by first-arg type, so the
-self-recursive `repeat(s, n - 1)` resolves to this scheme even
-when `list.repeat` and `loop.repeat` share the bare name.
-""")]
+#[doc("Returns `s` repeated `n` times; `n <= 0` yields the empty string.")]
 pub fn repeat(s: String, n: Int) : String {
   if n <= 0 { "" }
   else { string_concat(s, repeat(s, n - 1)) }
@@ -168,24 +109,13 @@ pub fn join(xs: [String], sep: String) : String {
   }
 }
 
-# --- issue #338 / #396: surface expansion ----------------------------
-# The seven helpers below (#338) and the five further down (#396 —
-# `is_empty`, `reverse`, `to_upper`, `to_lower`, `index_of`) round out
-# the string surface. The #396 five share their bare names with core
-# exports (`list.is_empty`, `char.to_upper`, …); first-arg-type
-# narrowing (#235) routes the `String` receiver here.
-#
-# Helpers shipped here are byte-indexed and ASCII-aware where it
-# matters. `pad_left`/`pad_right` count bytes, not Unicode code
-# points (kaikai strings are byte-indexed today).
+# Helpers below are byte-indexed and ASCII-aware where it matters;
+# `pad_left`/`pad_right` count bytes, not codepoints.
 
 #[doc("""
-`split(s, sep)` returns the list of pieces produced by cutting `s`
-at every non-overlapping occurrence of `sep`. An empty separator
-panics — the runtime's `string_split` would otherwise return the
-whole string in a single-element list, which masks the caller's
-bug. Trailing/leading empty pieces are preserved (`split(",a,",
-",")` → `["", "a", ""]`).
+Cuts `s` at every non-overlapping occurrence of `sep`. An empty
+separator panics. Trailing/leading empty pieces are preserved
+(`split(",a,", ",")` → `["", "a", ""]`).
 """)]
 pub fn split(s: String, sep: String) : [String] {
   if string_length(sep) == 0 { panic("string.split: separator is empty") }
@@ -202,10 +132,6 @@ pub fn replace(s: String, from: String, to: String) : String {
   else { string.join(string.split(s, from), to) }
 }
 
-# `pad_left(s, width, fill)` left-pads `s` with `fill` so the result
-# has at least `width` *bytes* (not Unicode code points — kaikai
-# strings are byte-indexed). When `length(s) >= width` the input is
-# returned unchanged.
 fn string_pad_loop(fill: String, k: Int, acc: String) : String {
   if k <= 0 { acc }
   else { string_pad_loop(fill, k - 1, string_concat(acc, fill)) }
@@ -225,11 +151,6 @@ pub fn pad_right(s: String, width: Int, fill: Char) : String {
   else { string_concat(s, string_pad_loop("#{fill}", width - n, "")) }
 }
 
-# `lines(s)` splits on `'\n'` and drops a trailing empty entry when
-# `s` ends with a newline (so `"a\nb\n"` and `"a\nb"` both yield
-# `["a", "b"]`). Empty interior lines are preserved. `lines("")` is
-# the empty list — matches Python `"".splitlines()` and Rust
-# `"".lines()`, both of which yield no lines for an empty input.
 fn lines_drop_trailing_empty(xs: [String]) : [String] {
   match xs {
     [] -> []
@@ -242,12 +163,6 @@ fn lines_drop_trailing_empty(xs: [String]) : [String] {
 #[doc("Splits `s` on `'\\n'`, dropping a single trailing empty line; `lines(\"\")` is `[]`.")]
 pub fn lines(s: String) : [String] = lines_drop_trailing_empty(string_split(s, "\n"))
 
-# `bytes(s)` returns the list of bytes in `s` as `Char`s, one element
-# per byte. The list preserves source order. A multibyte UTF-8 sequence
-# is split into its constituent bytes (so `bytes("á")` is two elements:
-# 0xC3, 0xA1). This is the byte-level view; for Unicode codepoints use
-# `chars`. (Issue #744: this is the former `chars`, renamed to stop the
-# name lying about what it returns.)
 fn string_bytes_loop(s: String, i: Int, acc: [Char]) : [Char] {
   if i < 0 { acc }
   else {
@@ -261,13 +176,6 @@ fn string_bytes_loop(s: String, i: Int, acc: [Char]) : [Char] {
 #[doc("Returns the bytes of `s` as `Char`s, one element per byte (multibyte UTF-8 is split into its bytes); for codepoints use `chars`.")]
 pub fn bytes(s: String) : [Char] = string_bytes_loop(s, string_length(s) - 1, [])
 
-# `chars(s)` returns the list of Unicode codepoints in `s`, decoding
-# the UTF-8 buffer. `chars("áé▸")` is three elements (0xE1, 0xE9,
-# 0x25B8), unlike `bytes` which would give seven. This is the
-# codepoint-level view a TUI/i18n consumer wants (issue #744). O(n) and
-# materialized — kaikai has no lazy sequence type yet, matching Python 3
-# `list(s)`. For just the count without building the list use
-# `char_count`; for codepoints with their byte offsets use `char_indices`.
 fn string_chars_loop(s: String, off: Int, n: Int) : [Char] {
   if off >= n { [] }
   else {
@@ -281,9 +189,6 @@ fn string_chars_loop(s: String, off: Int, n: Int) : [Char] {
 #[doc("Returns the Unicode codepoints of `s` as `Char`s, decoding the UTF-8 buffer; for raw bytes use `bytes`.")]
 pub fn chars(s: String) : [Char] = string_chars_loop(s, 0, string_length(s))
 
-# `char_count(s)` is the number of Unicode codepoints in `s` — the
-# honest codepoint length, distinct from `length`/`byte_length` (bytes).
-# Walks the buffer without materializing a list (issue #744).
 fn string_char_count_loop(s: String, off: Int, n: Int, acc: Int) : Int {
   if off >= n { acc }
   else {
@@ -296,30 +201,19 @@ fn string_char_count_loop(s: String, off: Int, n: Int, acc: Int) : Int {
 #[doc("Returns the number of Unicode codepoints in `s` — the honest codepoint length, distinct from byte `length`.")]
 pub fn char_count(s: String) : Int = string_char_count_loop(s, 0, string_length(s), 0)
 
-#[doc("""
-`byte_length(s)` is the explicit byte count — a synonym of `length`,
-spelled to make the unit unambiguous at the call site next to
-`char_count` (issue #744).
-""")]
+#[doc("Explicit byte count of `s` — a synonym of `length`, spelled to make the unit unambiguous next to `char_count`.")]
 pub fn byte_length(s: String) : Int = string_length(s)
 
-# --- #396: the five deferred #338 helpers ----------------------------
-# Each name also exists as a bare core export (`list.is_empty`,
-# `list.reverse`, `char.to_upper` / `char.to_lower`, `list.index_of`);
-# first-arg-type narrowing (#235) routes `string.<name>(s)` to this
-# module by the `String` receiver. NOTE: bare `<name>(s)` inline in a
-# comparison/`assert` does not narrow today (issue #758), so the
-# intrinsic tests below bind the result with `let` before asserting.
+# Each name below also exists as a bare core export (`list.is_empty`,
+# `char.to_upper`, …); first-arg-type narrowing routes the `String`
+# receiver here.
 
-#[doc("""
-`is_empty(s)` is true iff `s` has zero bytes (byte-length and
-codepoint-count both zero for the empty string).
-""")]
+#[doc("True iff `s` has zero bytes.")]
 pub fn is_empty(s: String) : Bool = string_length(s) == 0
 
 #[doc("""
-`reverse(s)` reverses by Unicode codepoint, never byte — `reverse("áb")`
-is `"bá"`, not a broken UTF-8 sequence. O(n) over the decoded chars.
+Reverses `s` by Unicode codepoint, never byte — `reverse("áb")` is
+`"bá"`, not a broken UTF-8 sequence. O(n) over the decoded chars.
 """)]
 pub fn reverse(s: String) : String = string_reverse_loop(chars(s), "")
 
@@ -328,11 +222,7 @@ fn string_reverse_loop(cs: [Char], acc: String) : String = match cs {
   [c, ...t] -> string_reverse_loop(t, string_concat("#{c}", acc))
 }
 
-#[doc("""
-`to_upper(s)` / `to_lower(s)` fold each codepoint via `char.to_upper`
-/ `char.to_lower` (ASCII case folding; non-alpha passes through).
-Locale-independent, matching the `char` surface.
-""")]
+#[doc("Uppercases each codepoint via ASCII case folding; non-letters pass through. Locale-independent.")]
 pub fn to_upper(s: String) : String = string_map_chars(chars(s), char.to_upper, "")
 
 #[doc("Lowercases each codepoint via ASCII case folding; non-letters pass through. Locale-independent.")]
@@ -344,9 +234,8 @@ fn string_map_chars(cs: [Char], f: (Char) -> Char, acc: String) : String = match
 }
 
 #[doc("""
-`index_of(s, needle)` returns the byte offset of the first occurrence
-of `needle`, or `None`. `index_of(s, "")` is `Some(0)`. The offset is
-a byte index, consistent with `slice` / `char_at`.
+Byte offset of the first occurrence of `needle`, or `None`.
+`index_of(s, "")` is `Some(0)`. Byte index, consistent with `slice`.
 """)]
 pub fn index_of(s: String, needle: String) : Option[Int] =
   string_index_of_loop(s, needle, 0, string_length(s) - string_length(needle))
@@ -356,11 +245,6 @@ fn string_index_of_loop(s: String, needle: String, i: Int, last: Int) : Option[I
   else if starts_with(string_slice(s, i, string_length(s) - i), needle) { Some(i) }
   else { string_index_of_loop(s, needle, i + 1, last) }
 
-# `char_indices(s)` pairs each codepoint with the byte offset at which
-# it begins: `char_indices("á!")` is `[{off:0, cp:0xE1}, {off:2, cp:0x21}]`
-# (the `!` starts at byte 2 because `á` is two UTF-8 bytes). For consumers
-# that need both the codepoint and where it sits in the byte buffer in a
-# single pass (issue #744; the shape #745 `display_width` builds on).
 fn string_char_indices_loop(s: String, off: Int, n: Int) : [CharIndex] {
   if off >= n { [] }
   else {
@@ -374,9 +258,6 @@ fn string_char_indices_loop(s: String, off: Int, n: Int) : [CharIndex] {
 #[doc("Pairs each codepoint with the byte offset at which it begins, in a single pass.")]
 pub fn char_indices(s: String) : [CharIndex] = string_char_indices_loop(s, 0, string_length(s))
 
-# `is_blank(s)` is `true` for the empty string and for any string
-# whose bytes are all whitespace per the same rule used by `trim`
-# (`is_space(c) or c == '\n' or c == '\r' or c == '\t'`).
 fn string_is_blank_loop(s: String, i: Int, n: Int) : Bool {
   if i >= n { true }
   else {
@@ -392,11 +273,6 @@ fn string_is_blank_loop(s: String, i: Int, n: Int) : Bool {
 #[doc("True for the empty string or any string whose characters are all whitespace (same rule as `trim`).")]
 pub fn is_blank(s: String) : Bool = string_is_blank_loop(s, 0, string_length(s))
 
-# Intrinsic tests (issue #170 phase 1b). Run with
-# `KAI_NO_STDLIB=1 bin/kai test stdlib/core/string.kai` — same
-# rationale as option/result: KAI_NO_STDLIB=1 prevents bin/kai from
-# auto-loading this module as a prelude and then again as the test
-# source, which would compile the test blocks twice.
 test "starts_with — prefix match, miss, full string, empty" {
   assert starts_with("hello world", "hello") == true
   assert starts_with("hello world", "world") == false
@@ -492,7 +368,7 @@ test "bytes — byte-level view, multibyte splits into bytes" {
 }
 
 test "chars — codepoint-level view, multibyte decodes to one codepoint" {
-  # "áé▸" is 7 bytes, 3 codepoints (issue #744): á=0xE1, é=0xE9, ▸=0x25B8.
+  # "áé▸" is 7 bytes, 3 codepoints: á=0xE1, é=0xE9, ▸=0x25B8.
   assert chars("áé▸") == [int_to_char(225), int_to_char(233), int_to_char(9656)]
 }
 
@@ -501,11 +377,8 @@ test "char_count / byte_length — codepoints vs bytes" {
   assert char_count("abc") == 3
   assert char_count("áé▸") == 3
   assert byte_length("áé▸") == 7
-  # `length` is the bare-name synonym of `byte_length`, but spelled bare
-  # it collides with `list.length` under `--include-prelude-tests` (both
-  # export `length`), and the list impl's `match` over a String is
-  # non-exhaustive at runtime. Use the underlying primitive so the
-  # intrinsic test is unambiguous in every load mode.
+  # Bare `length` collides with `list.length`; call the primitive so the
+  # test is unambiguous in every load mode.
   assert string_length("áé▸") == 7
 }
 
@@ -524,8 +397,8 @@ test "is_blank — empty/spaces/tabs/newlines true; with content false" {
   assert is_blank("  a  ") == false
 }
 
-# #396 helpers. Results are bound with `let` before asserting because a
-# bare `is_empty(s)` inline in a comparison does not narrow today (#758).
+# Results are bound with `let` before asserting because a bare
+# `is_empty(s)` inline in a comparison does not narrow by receiver type.
 test "is_empty — empty true, any content false" {
   let a = is_empty("")
   let b = is_empty(" ")

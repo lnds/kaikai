@@ -1,91 +1,29 @@
 #[doc("""
-stdlib/collections/map.kai — AVL-tree-backed Map[k, v].
-
-v1 (issue #128): the carrier is a height-balanced binary search
-tree. Lookup, insert, and remove are all `O(log n)`. The previous
-association-list carrier scaled linearly and was flagged in
-`docs/proposed-extensions.md` §6 as "abysmal at scale" — the
-canonical motivating consumer is `ahu`'s Registry (named-actor
-lookup) where N grows past the dozens.
-
-AVL was picked over red-black for v1 because the rebalancing
-logic stays compact in pure-functional kaikai (one height field
-per node, four rotation cases) and the constant factor on lookup
-is slightly tighter than RB. HAMTs are deferred to v2 — they want
-a `Hashable` protocol that does not exist yet.
+AVL-tree-backed `Map[k, v]`: lookup, insert, and remove are all
+`O(log n)`.
 
 Conventions:
-  - **Iteration order is by key**, not by insertion order. The
-    v0 carrier preserved insertion order; that contract changed
-    when the tree carrier shipped (issue #128). `keys`, `values`,
-    and `to_pairs` produce keys in ascending order under the
-    runtime's `<` operator.
-  - Key equality is structural via `==` (kaikai's deep-equals
-    runtime helper). Key ordering is the runtime's `<` operator,
-    which today defines a total order on `Int`, `Real`, `Char`,
-    and `String`. Records and sum types as keys panic at runtime
-    on the first comparison; lift them to a primitive key
-    manually until v2 introduces an `Ord` protocol.
-  - Functions are pure — every operation returns a fresh `Map`.
-    The tree shares structure between revisions where possible
-    (rotations rebuild only the spine to the inserted/removed
-    leaf), so the per-op allocation cost stays `O(log n)`.
+  - **Iteration order is by key**, not insertion order. `keys`,
+    `values`, and `to_pairs` produce keys in ascending order under
+    the runtime's `<` operator.
+  - Key equality is structural via `==`; key ordering is `<`, a
+    total order on `Int`, `Real`, `Char`, and `String`. Records and
+    sum types as keys panic on the first comparison — lift them to a
+    primitive key manually.
+  - Functions are pure — every operation returns a fresh `Map`. The
+    tree shares structure between revisions (rotations rebuild only
+    the spine to the inserted/removed leaf), so per-op allocation
+    stays `O(log n)`.
 
-Public surface (issue #613): the qualified-call form is canonical
-(`map.put(m, k, v)`). Definitions are bare canonical names,
-canonical-only since the 2026-05-17 migration — the flat-prefix
-`map_*` aliases were dropped, and the indexing-sugar lowering now
-emits `map.get` directly (see below).
-
-Qualified canonical (16 pub fns):
-
-  pub fn empty[k, v]() : Map[k, v]
-  pub fn size[k, v](m: Map[k, v]) : Int
-  pub fn is_empty[k, v](m: Map[k, v]) : Bool
-  pub fn get[k, v](m: Map[k, v], key: k) : Option[v]
-  pub fn contains[k, v](m: Map[k, v], key: k) : Bool
-  pub fn put[k, v](m: Map[k, v], key: k, value: v) : Map[k, v]
-  pub fn remove[k, v](m: Map[k, v], key: k) : Map[k, v]
-  pub fn keys[k, v](m: Map[k, v]) : [k]
-  pub fn values[k, v](m: Map[k, v]) : [v]
-  pub fn to_pairs[k, v](m: Map[k, v]) : [Pair[k, v]]
-  pub fn from_pairs[k, v](ps: [Pair[k, v]]) : Map[k, v]
-  pub fn update[k, v](m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v]
-  pub fn fold[k, v, a, e](m: Map[k, v], init: a, f: (a, Pair[k, v]) -> a / e) : a / e
-  pub fn merge[k, v](m1: Map[k, v], m2: Map[k, v]) : Map[k, v]  -- m1 keys win
-  pub fn filter[k, v, e](m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e
-  pub fn transform_values[k, v, w, e](m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e
-
-Pipe convention (issue #594): `Map[k, v]` participates in `|`,
-`||`, `|?` through the canonical `map`, `flat_map`, `filter`
-exports — elements are `Pair[k, v]`. `filter` is shared with the
-round-out surface above.
-
-  pub fn map[k, v, w, e](m: Map[k, v], f: (Pair[k, v]) -> Pair[k, w] / e)
-      : Map[k, w] / e
-  pub fn flat_map[k, v, k2, v2, e](m: Map[k, v], f: (Pair[k, v]) -> Map[k2, v2] / e)
-      : Map[k2, v2] / e
-
-`transform_values` (values-only) is distinct from `map`
-(pair-based, pipe-canonical). The name avoids the ugly
-`map.map_values(m, f)` qualified call.
-
-The read-side indexing sugar `m[key]` lowers to `map.get(m, key)`
-at the typer (see `docs/syntax-sugars.md` §4) — an `EModCall`
-against the canonical export, no flat alias involved. The
-write-side `m[key] := v` is **rejected** in v1 with a typed error
-pointing at `map.put`; the v2 design lands alongside the HAMT
-carrier.
+The read-side indexing sugar `m[key]` lowers to `map.get(m, key)`;
+the write-side `m[key] := v` is rejected — use `map.put`.
 """)]
 
 # ---- Carrier -----------------------------------------------------
 #
-# `Tree[k, v]` is the AVL node. The `Int` payload on `TNode` is the
-# subtree height (1 for leaves) used by the rebalancer; recomputing
-# it from the children would be `O(n)` per insert. `Map[k, v]` is
-# the public wrapper so existing call sites that destructure the
-# record (none in tree-stage stdlib, but tests have done it before)
-# fail with a clear field error rather than a silent type mismatch.
+# The `Int` payload on `TNode` is the subtree height (1 for leaves)
+# used by the rebalancer; recomputing it from the children would be
+# `O(n)` per insert.
 
 type Tree[k, v]
   = TEmpty
@@ -120,9 +58,8 @@ fn tree_balance_factor(t: Tree[k, v]) : Int = match t {
 #    / \                   / \
 #   T1  T2                T2  T3
 #
-# `t` must be a TNode whose left child is also a TNode; the TEmpty
-# arms are unreachable on well-formed input but we keep them so
-# the match is exhaustive without panics.
+# The TEmpty arms are unreachable on well-formed input; kept so the
+# match is exhaustive without panics.
 fn tree_rotate_right(t: Tree[k, v]) : Tree[k, v] = match t {
   TNode(yk, yv, _, lt, t3) -> match lt {
     TNode(xk, xv, _, t1, t2) -> tree_node(xk, xv, t1, tree_node(yk, yv, t2, t3))
@@ -300,12 +237,12 @@ fn from_pairs_loop(ps: [Pair[k, v]], acc: Map[k, v]) : Map[k, v] = match ps {
 pub fn from_pairs(ps: [Pair[k, v]]) : Map[k, v] =
   from_pairs_loop(ps, map.empty())
 
-# ---- Round-out (issue #613) -------------------------------------
+# ---- Round-out --------------------------------------------------
 
 #[doc("""
 `update(m, key, default, f)`: when `key` is present, replaces its
-value with `f(old)`; when absent, inserts `default`. One tree
-walk via `get` + `put`; `f` is invoked at most once.
+value with `f(old)`; when absent, inserts `default`. `f` is invoked
+at most once.
 """)]
 pub fn update(m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v] =
   match map.get(m, key) {
@@ -341,23 +278,16 @@ pub fn filter(m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e =
 #[doc("""
 Transforms each value through `f`, keeping keys unchanged. The
 result type `Map[k, w]` may differ from the input value type.
-Named `transform_values` rather than `map_values` because the
-qualified call site reads `map.transform_values(m, f)` — the
-0-arg form `map.values(m) : [v]` already owns the `values`
-name, and `map.map` is reserved for the pipe-canonical
-pair-shaped transform below.
 """)]
 pub fn transform_values(m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e =
   fold(m, map.empty(), (acc, p) => map.put(acc, p.fst, f(p.snd)))
 
-# ---- Pipe convention exports (issue #594) -----------------------
+# ---- Pipe convention exports ------------------------------------
 #
-# `Map[k, v]` participates in `|`, `||`, `|?` post-#594 by
-# exporting `map`, `flat_map`, `filter` with the canonical
-# convention signatures. Elements are `Pair[k, v]` (consistent
-# with Elixir's `Enum.map(map, fn {k, v} -> … end)`). `filter` is
-# shared with the round-out section above; only `map` and
-# `flat_map` are introduced here.
+# `Map[k, v]` participates in `|`, `||`, `|?` via `map`, `flat_map`,
+# `filter`. Elements are `Pair[k, v]`. `filter` is shared with the
+# round-out section above; only `map` and `flat_map` are introduced
+# here.
 
 #[doc("""
 Pair-shaped element transform: each pair becomes a new pair,

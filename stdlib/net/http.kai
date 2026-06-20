@@ -1,103 +1,22 @@
 #[doc("""
-stdlib/net/http.kai — HTTP/1.1 over the NetTcp effect (client +
-minimal server-side helpers).
+HTTP/1.1 over the NetTcp effect — client plus minimal server-side
+helpers. `import net.http`, reached qualified (`http.get(url)`):
+short names like `get` / `put` / `delete` / `request` are ambiguous
+bare against `map.get` / `file.delete`.
 
-Spec: docs/effects-stdlib.md §`NetTcp` notes that "Higher-level
-protocols (HTTP, WebSocket, gRPC) live in stdlib modules that
-*use* the relevant effects". The client-side surface
-(`parse_url`, `serialize_request`, `parse_response`,
-`request`, `get/post/put/delete`) is the v1 stable
-contract. The server-side dual added by issue #605
-(`parse_request`, `serialize_response`,
-`status_reason`, `read_request`) lets kaikai-book chapter 17 and
-the future manutara framework
-build against real stdlib while we keep room to iterate before
-Anga Roa freezes.
+Scope: HTTP/1.1 only, plaintext `http://` (`https://` is rejected at
+parse time with a clear error — there is no TLS). Chunked transfer
+decoding is supported on responses; bodies otherwise read by
+`Content-Length`, or until peer close when absent. Each `request`
+opens a fresh `Conn`, sends, reads, and closes — no keep-alive,
+no compression, no cookies.
 
-Module path: `import net.http` (module entry is `http`).
-
-Public surface: bare canonical defs (canonical-only since the
-2026-05-17 migration), reached qualified (`http.get(url)`).
-
-  Canonical:  http.parse_url, http.parse_request, http.parse_response,
-              http.serialize_request, http.serialize_response,
-              http.status_reason, http.header_lookup, http.get,
-              http.post, http.put, http.delete, http.request,
-              http.bytes_to_string, http.string_to_bytes,
-              http.read_request, http.follow, http.get_follow,
-              http.post_follow, http.put_follow, http.delete_follow
-
-`map.get` / `env.get` / `file.delete` coexist (per-module C
-symbols) — short names like `get` / `put` / `delete` / `request`
-are ambiguous bare, so call sites use the qualified form; see
-docs/stdlib-layout.md §Qualified surface.
-
-What ships in v1:
-  - HTTP/1.1 only.
-  - Plaintext `http://` scheme. `https://` is rejected at parse
-    time with a clear error message — TLS waits on a separate
-    `Tls` effect (see docs/effects-stdlib.md §`NetTcp` "What's not
-    in v1").
-  - Convenience constructors (`get`, `post`, `put`,
-    `delete`) plus a lower-level `request` builder over
-    a fully-typed `Request` value.
-  - Pure helpers (`serialize_request`, `parse_response`,
-    `parse_url`) exposed so callers — and the regression
-    fixture under `examples/stdlib/http_client_basic.kai` — can
-    exercise the format roundtrip without a live socket.
-
-What's intentionally deferred (each defer matches docs/stdlib-layout.md
-§`net` "post-MVP" or docs/effects-stdlib.md §`NetTcp` "What's not
-in v1"):
-  - TLS / `https://`. Lands as a separate `Tls` effect; the v1
-    parser surfaces the gap as an explicit Err so the call site
-    fails loudly instead of silently downgrading.
-  - Chunked transfer decoding is supported on responses; bodies
-    otherwise read by `Content-Length`, or until peer close when
-    absent. Chunked encoding of outgoing bodies is not supported.
-  - Redirects (3xx). `request` returns the 3xx verbatim;
-    callers that want automatic follow use `follow` /
-    `get_follow` / `post_follow` / `put_follow` /
-    `delete_follow` (closes #357). The follow surface honours
-    RFC 9110 §15.4 method-rewrite rules through a `RedirectPolicy`
-    record with sane defaults; cookie persistence across hops
-    (Set-Cookie jar, cross-origin Authorization stripping policy,
-    per-host overrides) remains deferred until the cookie design
-    lands in a follow-up edition.
-  - Compression (gzip / deflate / br). The `Accept-Encoding`
-    header is not set automatically; servers that honour it
-    would need a decoder this lane does not ship.
-  - Content-negotiation helpers (`Accept`, `Accept-Language`).
-    Set by the caller via `req.headers` when needed.
-  - HTTP/2 and HTTP/3. Tier S3 per docs/stdlib-roadmap layout —
-    module add-ons over the same NetTcp (and NetUdp for QUIC),
-    no new effect.
-  - Connection pooling / keep-alive. Each `request` opens
-    a fresh `Conn`, sends, reads the response, closes. The
-    server-side `Connection: close` is implied.
-  - Cookies, auth helpers (Basic / Bearer pre-cooked headers),
-    multipart bodies. Composable on top of the v1 surface.
-  - A first-class `net.url` module. The minimal URL parser here
-    is inlined; it migrates out as soon as a URL surface beyond
-    "scheme + host + port + path" is needed (query params,
-    userinfo, fragments). Tracked alongside the URI lane.
-
-Effect row: every network-touching helper carries
-`/ NetTcp + Cancel`. NetTcp is the byte-level capability;
-Cancel is the cooperative-cancellation discipline shared by
-every blocking-shaped op in the catalog. The current v1
-NetTcp default handler is fully blocking (no kqueue / epoll
-yet — see docs/effects-stdlib.md §`NetTcp` "Default handler"),
-so a Cancel raised mid-call cannot interrupt a syscall in
-flight today; the row stays declared so the surface is
-forward-compatible with the m8.x reactor lane.
-
-DNS: `NetTcp.connect` already calls `getaddrinfo(3)` on the
-host string (see stage0/runtime.h §"NetTcp default handler" /
-`kai_default_nettcp_connect`), so this module passes the
-parsed host through verbatim — both numeric IPv4 and hostname
-inputs work. A separate `NetDns` effect arrives with that lane
-(docs/effects-stdlib.md §`NetTcp`); the row will gain it then.
+Every network-touching helper carries `/ NetTcp + Cancel`. The
+NetTcp default handler is fully blocking, so a Cancel raised
+mid-call cannot interrupt a syscall in flight; the row stays
+declared so the surface is forward-compatible. `NetTcp.connect`
+runs the host string through `getaddrinfo(3)`, so both numeric
+IPv4 and hostnames work.
 """)]
 
 # ---- types --------------------------------------------------------
@@ -109,13 +28,7 @@ with `/`; an empty path component is normalised to `/`.
 """)]
 pub type HttpUrl = { scheme: String, host: String, port: Int, path: String }
 
-#[doc("""
-Authority split — `host[:port]` decomposed for connect. Carrier
-record (rather than `Pair[String, Int]`) so the typer can pin
-the field types from the constructor literal at every call site
-without extra annotations. The same reasoning applies to
-`HttpHeader` below.
-""")]
+#[doc("Authority split — `host[:port]` decomposed for connect.")]
 pub type HttpHostPort = { host: String, port: Int }
 
 #[doc("""
@@ -125,33 +38,22 @@ of surrounding whitespace per RFC 7230 §3.2.4.
 pub type HttpHeader = { name: String, value: String }
 
 #[doc("""
-HTTP request. `method` is the verb (uppercase: "GET" / "POST"
-/ "PUT" / "DELETE"). `headers` is a list of name/value pairs
-appended after the auto-emitted `Host` and `Content-Length` (in
-user-provided order). `body` is the raw request body — empty for
-GET / DELETE, application-defined bytes for POST / PUT.
+HTTP request. `method` is the uppercase verb; `headers` are appended
+after the auto-emitted `Host` and `Content-Length`; `body` is the
+raw request body (empty for GET / DELETE).
 
-`url` carries different semantics on each side of the wire:
-  - For *outbound* requests built by the caller, `url` is the
-    absolute URL the request is directed at; `request` parses
-    it to derive the connect target and the request-line path.
-  - For *incoming* requests parsed by `parse_request`
-    (server side), `url` is just the request-line path
-    (e.g. "/hello"). The absolute URL never appears on the wire
-    for ordinary HTTP/1.1, so there is nothing to fill in.
-Both sides share the same record by design — the alternative
-(a sibling `HttpReq` type for the server) would be two forms with
-overlapping intent, forbidden by CLAUDE.md.
+`url` differs by side: for outbound requests it is the absolute URL
+`request` parses for the connect target and request-line path; for
+inbound requests parsed by `parse_request` it is just the
+request-line path (the absolute URL never travels on the wire).
 """)]
 pub type Request  = { method: String, url: String,
                       headers: [HttpHeader], body: String }
 
 #[doc("""
-Inbound response. `status` is the integer status code (200, 404,
-…). `headers` is the parsed header block in receive order. `body`
-is the response body; v1 reads it by `Content-Length` when set,
-otherwise drains until the peer closes the connection (HTTP/1.0
-fallback).
+Inbound response. `status` is the integer status code; `headers` is
+the parsed header block in receive order; `body` is read by
+`Content-Length` when set, otherwise drained until the peer closes.
 """)]
 pub type Response = { status: Int,
                       headers: [HttpHeader], body: String }
@@ -159,9 +61,6 @@ pub type Response = { status: Int,
 # ---- string helpers ----------------------------------------------
 
 # Index of the first occurrence of `needle` in `haystack`, or -1.
-# Linear-scan implementation; acceptable for response headers (a
-# few KB at most). A faster O(n+m) variant lands when stdlib
-# acquires a real string library.
 fn http_str_index_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
   if nn == 0 { 0 }
   else if i + nn > hn { 0 - 1 }
@@ -171,11 +70,8 @@ fn http_str_index_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : 
 fn http_str_index(hay: String, needle: String) : Int =
   http_str_index_loop(hay, needle, 0, string_length(hay), string_length(needle))
 
-# Trim ASCII whitespace from both ends — used on header values
-# where servers may emit `Header:   value` with extra spaces.
-# Reuses `string.trim` from stdlib/core/string.kai when in scope;
-# we re-derive locally to avoid the cross-module dependency the
-# stage 2 core-stdlib auto-load already enforces.
+# Trim ASCII whitespace from both ends — header values may arrive as
+# `Header:   value` with extra spaces.
 fn http_is_ws(c: Char) : Bool =
   c == ' ' or c == '\t' or c == '\r' or c == '\n'
 
@@ -211,10 +107,6 @@ fn http_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Int]) : [Int] =
 pub fn string_to_bytes(s: String) : [Int] =
   http_string_to_bytes_loop(s, 0, string_length(s), [])
 
-# [Int] → String. Intended for the response stream where each Int
-# is a byte the runtime read off the socket. Builds a list of
-# 1-char strings then concatenates once via `string_concat_all`,
-# avoiding the O(n²) repeated-concat trap.
 fn http_byte_to_str(b: Int) : String = "#{int_to_char(b)}"
 
 #[doc("Decodes a byte list (one `Int` per byte) back into a String.")]
@@ -223,9 +115,8 @@ pub fn bytes_to_string(bs: [Int]) : String =
 
 # ---- URL parsing -------------------------------------------------
 
-# Split an `authority` (`host[:port]`) into (host, port). When
-# the `:port` is missing or unparseable, `port` is 0 — callers
-# substitute a scheme default.
+# Split `host[:port]` into (host, port). Missing or unparseable
+# `:port` yields port 0 — callers substitute a scheme default.
 fn http_split_authority(auth: String) : HttpHostPort = {
   let i = http_str_index(auth, ":")
   if i < 0 { HttpHostPort { host: auth, port: 0 } }
@@ -287,9 +178,7 @@ fn http_format_headers(hs: [HttpHeader]) : String =
   string_concat_all(list.map(hs, http_format_header))
 
 # Authority string for the `Host` header: bare host when the port
-# is the scheme default, `host:port` otherwise. The HTTP/1.1 spec
-# allows either; servers that virtual-host on default ports do
-# not require the explicit `:80`.
+# is the scheme default, `host:port` otherwise.
 fn http_host_header(u: HttpUrl) : String =
   if u.port == http_default_port(u.scheme) { u.host }
   else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
@@ -304,9 +193,9 @@ emitted block is:
   \r\n
   <body>
 `Host` and `Content-Length` are auto-emitted; user headers are
-appended verbatim. `Connection: close` is NOT emitted — the v1
-read loop drains the socket until peer close anyway, and adding
-the header would surprise callers who supplied their own.
+appended verbatim. `Connection: close` is not emitted — the read
+loop drains until peer close, and adding the header would surprise
+callers who supplied their own.
 """)]
 pub fn serialize_request(req: Request) : String = {
   match parse_url(req.url) {
@@ -336,11 +225,8 @@ fn http_parse_status_line(line: String) : Result[String, Int] = {
   }
 }
 
-# Parse a single header line `Name: Value`. Values may have
-# surrounding whitespace per RFC 7230 §3.2.4; we trim both sides.
-# Lines without `:` are reported as a parse error so the caller
-# can surface a clear diagnostic instead of silently dropping
-# malformed headers.
+# Parse a single header line `Name: Value`, trimming whitespace from
+# the value. A line without `:` is a parse error, not a silent drop.
 fn http_parse_header_line(line: String) : Result[String, HttpHeader] = {
   let i = http_str_index(line, ":")
   if i < 0 { Err(string_concat("parse_response: header missing ':': ", line)) }
@@ -366,11 +252,8 @@ fn http_parse_header_lines(lines: [String]) : Result[String, [HttpHeader]] =
   http_parse_header_lines_loop(lines, [])
 
 #[doc("""
-Case-insensitive lookup is overkill for v1 — we ship a
-case-sensitive helper and document the convention (callers use
-canonical names: `Content-Length`, `Content-Type`). A real
-case-insensitive layer arrives with the protocol-level Headers
-type once it earns its keep.
+Look up a header by name. Case-sensitive — callers use canonical
+names (`Content-Length`, `Content-Type`).
 """)]
 pub fn header_lookup(hs: [HttpHeader], name: String) : Option[String] = match hs {
   [] -> None
@@ -400,16 +283,11 @@ pub fn parse_response(raw: String) : Result[String, Response] = {
         Ok(code) -> match http_parse_header_lines(rest) {
           Err(e) -> Err(e)
           Ok(hs) -> {
-            # Body framing precedence (RFC 9112 §6):
-            #   1. Transfer-Encoding: chunked  → walk the
-            #      `<hex-len>\r\n<bytes>\r\n` frames and
-            #      concatenate the payloads.
-            #   2. Content-Length: N           → slice the first
-            #      N bytes (anything past is the next response on a
-            #      keep-alive stream, which v1 does not multiplex).
-            #   3. Otherwise                   → body is everything
-            #      after the blank line; the recv loop already
-            #      drained until peer close.
+            # Body framing precedence:
+            #   1. Transfer-Encoding: chunked → dechunk the frames.
+            #   2. Content-Length: N          → take the first N bytes.
+            #   3. Otherwise                  → everything after the
+            #      blank line (recv already drained to peer close).
             let te = match header_lookup(hs, "Transfer-Encoding") {
               Some(v) -> http_trim(v)
               None    -> ""
@@ -436,17 +314,9 @@ pub fn parse_response(raw: String) : Result[String, Response] = {
 
 # ---- chunked transfer encoding ------------------------------------
 #
-# RFC 9112 §7.1. A chunked body is a sequence of `<hex-length>\r\n
-# <data>\r\n` frames followed by a `0\r\n\r\n` terminator. Servers
-# that don't know the response size in advance (CGI gateways,
-# wttr.in, …) emit this shape; `parse_response` peels it off so
-# every caller sees a single contiguous String regardless of
-# whether the server framed by length or by chunks.
-#
-# Exposed `pub` so callers building their own connection plumbing
-# (NetTcp directly, bypassing `http.request`) can reuse the
-# dechunker against bytes they've assembled themselves.
-#[doc("Decodes an HTTP chunked-transfer body (RFC 9112 §7.1) into a single contiguous string.")]
+# A chunked body is a sequence of `<hex-length>\r\n<data>\r\n` frames
+# followed by a `0\r\n\r\n` terminator.
+#[doc("Decodes an HTTP chunked-transfer body into a single contiguous string.")]
 pub fn dechunk_body(s: String) : String = http_dechunk_loop(s, 0, "")
 
 fn http_dechunk_loop(s: String, pos: Int, acc: String) : String = {
@@ -511,10 +381,8 @@ fn http_parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] = {
 
 # ---- network surface ---------------------------------------------
 
-# Drain a Conn until the peer closes (`recv` returns `Ok([])` per
-# docs/effects-stdlib.md §`NetTcp` "Error model"). v1 reads in
-# 4096-byte chunks; a future version with Content-Length-aware
-# pre-reads can stop earlier without waiting on the peer to FIN.
+# Drain a Conn in 4096-byte chunks until the peer closes
+# (`recv` returns `Ok([])`).
 fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel = {
   match NetTcp.recv(c, 4096) {
     Err(_)    -> list_reverse(acc)
@@ -525,22 +393,20 @@ fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel = {
   }
 }
 
-# Reverse-prepend `chunk` onto `acc` (caller will list_reverse
-# the whole thing once at the end). Avoids allocating an O(n)
-# `list_append` per chunk.
+# Reverse-prepend `chunk` onto `acc` (caller list_reverses once at
+# the end), avoiding an O(n) `list_append` per chunk.
 fn http_recv_all_prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
   [] -> acc
   [b, ...rest] -> http_recv_all_prepend(rest, [b, ...acc])
 }
 
 #[doc("""
-Lower-level builder. Opens a fresh Conn to the URL's host:port,
-writes the serialised request, drains the response, closes the
-Conn, and parses. Errors at any layer collapse to a synthetic
-Response with a `0 / "0 ERR"` placeholder so the caller can see
-the failure without a Result wrapper layered over every call;
-real-world callers who need per-step diagnostics use
-`NetTcp.*` directly.
+Lower-level builder: opens a fresh Conn to the URL's host:port,
+writes the serialised request, drains the response, closes, and
+parses. Errors at any layer collapse to a synthetic Response with
+status `0` and the error in `body`, so callers see the failure
+without a Result wrapper on every call; callers needing per-step
+diagnostics use `NetTcp.*` directly.
 """)]
 pub fn request(req: Request) : Response / NetTcp + Cancel = {
   match parse_url(req.url) {
@@ -583,19 +449,13 @@ pub fn put(url: String, body: String) : Response / NetTcp + Cancel =
 pub fn delete(url: String) : Response / NetTcp + Cancel =
   request(Request { method: "DELETE", url: url, headers: [], body: "" })
 
-# ---- server side (issue #605) -------------------------------------
+# ---- server side --------------------------------------------------
 #
-# Every export below is the dual of a client-side helper above.
-# (Formerly `#[unstable]`; dropped 2026-06-10 — stdlib does not use the
-# attribute pre-1.0. It returns when post-Orongo packages need it.)
-# Reuses the existing
-# internal helpers (`http_str_index`, `http_parse_header_lines`,
-# `http_format_headers`, `http_trim`, `header_lookup`) so the
-# new surface is purely additive.
+# Each export below is the dual of a client-side helper above.
 
-# Parse a request line — `METHOD SP PATH SP HTTP/1.1`. v1 is strict:
-# any other framing (extra spaces, HTTP/1.0, HTTP/2 prior knowledge)
-# is rejected. Callers wrap the Err in a 400 Bad Request.
+# Parse a request line — `METHOD SP PATH SP HTTP/1.1`. Strict: any
+# other framing (extra spaces, HTTP/1.0, HTTP/2 prior knowledge) is
+# rejected. Callers wrap the Err in a 400 Bad Request.
 fn http_parse_request_line(line: String) : Result[String, HttpReqLine] = {
   let parts = string_split(line, " ")
   match parts {
@@ -612,14 +472,9 @@ type HttpReqLine = { method: String, path: String }
 
 #[doc("""
 Parse a complete HTTP/1.1 request: request line + headers + body.
-Mirrors `parse_response`. Body length is read from
-`Content-Length`; absent header means an empty body (POST without
-Content-Length is malformed per RFC 7230 §3.3.3 for v1 purposes,
-but we accept the empty-body interpretation rather than reject).
-
-`Request.url` is populated from the request-line path; the
-absolute URL is never reconstructed because the wire does not
-carry it (the `Host` header is separate).
+Body length is read from `Content-Length`; an absent header means
+an empty body. `Request.url` is the request-line path — the
+absolute URL is never on the wire.
 """)]
 pub fn parse_request(raw: String) : Result[String, Request] = {
   let sep = "\r\n\r\n"
@@ -657,12 +512,9 @@ pub fn parse_request(raw: String) : Result[String, Request] = {
 }
 
 #[doc("""
-Minimal status code → reason phrase map. v1 lists the codes the
-book demos exercise plus the obvious 4xx/5xx; anything outside
-the table falls through to "OK" so the wire stays well-formed
-(the status code itself carries the semantics; the reason phrase
-is informational per RFC 7230 §3.1.2). A richer table arrives
-when manutara needs it.
+Status code → reason phrase. Codes outside the table fall through
+to "OK" so the wire stays well-formed — the status code carries
+the semantics, the reason phrase is informational.
 """)]
 pub fn status_reason(code: Int) : String =
   if      code == 200 { "OK" }
@@ -704,19 +556,12 @@ pub fn serialize_response(resp: Response) : String = {
 }
 
 #[doc("""
-Read a full HTTP/1.1 request off `conn`, capped at `max_bytes`
-to prevent unbounded header buffering. Loops `NetTcp.recv` until
-either (a) the header block separator `\r\n\r\n` has been seen
-AND enough bytes have followed it to cover `Content-Length`, or
-(b) the peer closes (`Ok([])` per docs/effects-stdlib.md §`NetTcp`
-"Error model"), or (c) `max_bytes` would be exceeded — in which
-case we return Err so the caller can answer 413.
-
-The function is intentionally simple: it copies bytes into a
-growing list, converts to String once the framing is complete,
-and hands the String to `parse_request`. v1 reads in
-4 KiB chunks; a future Content-Length-aware short-read can stop
-earlier without an extra recv.
+Read a full HTTP/1.1 request off `conn`, capped at `max_bytes` to
+prevent unbounded header buffering. Loops `NetTcp.recv` until
+either (a) the separator `\r\n\r\n` is seen and enough bytes follow
+to cover `Content-Length`, (b) the peer closes (`Ok([])`), or
+(c) `max_bytes` would be exceeded — returning Err so the caller can
+answer 413.
 """)]
 pub fn read_request(conn: Conn, max_bytes: Int) : Result[String, Request] / NetTcp =
   http_read_request_loop(conn, [], 0, max_bytes)
@@ -731,10 +576,8 @@ fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
       Err(e) -> Err(string_concat("read_request: ", e))
       Ok(chunk) -> match chunk {
         [] -> {
-          # Peer closed before a complete request arrived. If the
-          # accumulator already holds something that parses (e.g. a
-          # GET with no Content-Length), surface that; otherwise
-          # report the truncated read.
+          # Peer closed early: surface the accumulator if it parses
+          # (e.g. a GET with no Content-Length), else report truncation.
           let raw = bytes_to_string(list_reverse(acc_rev))
           match parse_request(raw) {
             Ok(r)  -> Ok(r)
@@ -751,11 +594,9 @@ fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
   } }
 }
 
-# Probe the in-flight buffer: if it already holds a complete
-# request (header block separator present AND body has at least
-# `Content-Length` bytes, or no Content-Length and we treat the
-# current accumulator as the full body), return Some(req). Else
-# None — caller does another recv.
+# Probe the in-flight buffer: Some(req) once it holds a complete
+# request (separator present and body covers `Content-Length`, or no
+# Content-Length), else None so the caller does another recv.
 fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
   let raw = bytes_to_string(list_reverse(acc_rev))
   let sep = "\r\n\r\n"
@@ -793,46 +634,23 @@ fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
   }
 }
 
-# ---- redirect following (issue #357) ------------------------------
+# ---- redirect following -------------------------------------------
 #
-# `follow` (and the convenience `http_*_follow` wrappers) sit
-# on top of the existing `request`. The single-call surface
-# (`request`, `get`, `post`, …) is unchanged: callers
-# that want explicit control over 3xx handling keep using it. Callers
-# that want browser-like behaviour (auto-follow, RFC 9110 §15.4
-# method-rewrite rules, bounded loop) opt into `follow`.
-#
-# Out of scope for this lane (each cited in the issue #357 body):
-#   - Set-Cookie persistence across hops.
-#   - Cross-origin Authorization / Cookie stripping policy. The
-#     v1 follow surface forwards `req.headers` verbatim; callers
-#     who care strip these themselves before calling.
-#   - HSTS preload table.
-#   - Per-host policy overrides.
-#   - Permanent-redirect (301 / 308) caching.
-# These follow once the cookie / credentials policy lands.
+# `follow` (and the `http_*_follow` wrappers) sit on top of `request`.
+# The single-call surface (`request`, `get`, `post`, …) is unchanged;
+# `follow` adds browser-like auto-follow with method-rewrite rules and
+# a bounded loop. It forwards `req.headers` verbatim across hops —
+# callers strip cross-origin Authorization / Cookie themselves.
 
 #[doc("""
-`RedirectPolicy` carries the four knobs the issue body pinned —
-nothing more. A record (rather than scattered `Bool` parameters
-on `follow`) so callers can build a default once and override
-only the field they care about; the typer pins the field types
-from a single constructor literal at every call site.
-
-Field semantics:
+Knobs for `follow`'s redirect handling:
   - `max_redirects`: hard cap on hops before `follow` returns
-    `Err("too many redirects (max <N>)")`. Default 10 — matches
-    curl, Go's net/http, Python's requests.
-  - `follow_3xx`: status codes that trigger a follow. Default
-    [301, 302, 303, 307, 308] — every redirect status RFC 9110
-    §15.4 lists.
-  - `rewrite_post_to_get_on_303`: when a POST hits a 303 See Other,
-    the follow request is a GET with no body (RFC 9110 §15.4.4).
-    Default true; flip to false only for compatibility with
-    non-conformant servers.
-  - `preserve_method_307_308`: when a 307 / 308 is followed, the
-    method and body are preserved (RFC 9110 §15.4.8 / §15.4.9).
-    Default true; flip to false only for caller-driven shims.
+    `Err("too many redirects (max <N>)")`.
+  - `follow_3xx`: status codes that trigger a follow.
+  - `rewrite_post_to_get_on_303`: a POST hitting a 303 follows as a
+    GET with no body.
+  - `preserve_method_307_308`: a 307 / 308 follow preserves the
+    method and body.
 """)]
 pub type RedirectPolicy = {
   max_redirects: Int,
@@ -853,11 +671,8 @@ pub fn default_redirect_policy() : RedirectPolicy = RedirectPolicy {
   preserve_method_307_308: true,
 }
 
-# Local helpers — neither `string_starts_with` nor `list_contains`
-# is in the auto-loaded core set (see stage1/compiler.kai EP() table);
-# we keep them private here rather than reaching into stdlib.core to
-# avoid the cross-module dependency the stage 2 core-stdlib auto-load
-# enforces.
+# Local helpers — `string_starts_with` / `list_contains` are not in
+# the auto-loaded core set, so keep private copies here.
 
 fn http_string_starts_with(s: String, prefix: String) : Bool = {
   let pn = string_length(prefix)
@@ -872,19 +687,14 @@ fn http_status_in(codes: [Int], status: Int) : Bool = match codes {
   [c, ...rest] -> if c == status { true } else { http_status_in(rest, status) }
 }
 
-# `Location` resolution per RFC 9110 §10.2.2. Three shapes:
-#   - Absolute URL (`http://…`, `https://…`): used verbatim. The
-#     downstream `request` will reject `https://` with a clear
-#     Err so callers see why the redirect dead-ends.
+# `Location` resolution, three shapes:
+#   - Absolute URL (`http://…`, `https://…`): used verbatim
+#     (downstream `request` rejects `https://` with a clear Err).
 #   - Path-absolute (`/foo`): keep scheme + host + port from the
-#     previous request, swap the path. The `:port` is always
-#     emitted (rather than relying on the scheme default) because
-#     `parse_url` round-trips it explicitly.
-#   - Anything else (relative path, protocol-relative `//host/…`):
-#     v1 returns the Location verbatim so the follow attempt fails
-#     with a parse error the caller can surface. A real RFC 3986
-#     §5 base resolver lands when `net.url` is its own module
-#     (docs/stdlib-layout.md §`net` "url.kai planned").
+#     previous request, swap the path. `:port` is always emitted
+#     because `parse_url` round-trips it explicitly.
+#   - Anything else (relative, protocol-relative `//host/…`):
+#     returned verbatim, so the follow fails with a parse error.
 fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
   if http_string_starts_with(loc, "http://") or http_string_starts_with(loc, "https://") {
     loc
@@ -898,11 +708,9 @@ fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
   }
 }
 
-# Build the follow-up `Request` from the original + the response
-# status + the `Location` value + the policy. Method-rewrite rules
-# are expressed positively: 303 wins over 307/308 wins over 301/302
-# because no real status hits more than one branch, but the order
-# matches RFC 9110 §15.4 reading order for clarity.
+# Build the follow-up `Request` from the original, response status,
+# `Location`, and policy. The method-rewrite branches are mutually
+# exclusive — no real status matches more than one.
 fn http_build_next_request(orig: Request, status: Int, loc: String,
                            policy: RedirectPolicy) : Request = {
   let new_method =
@@ -920,12 +728,10 @@ fn http_build_next_request(orig: Request, status: Int, loc: String,
   Request { method: new_method, url: new_url, headers: orig.headers, body: new_body }
 }
 
-# Inner loop — one hop per recursive call. Tail-recursive so the
-# mandatory TCO (CLAUDE.md Tier 1 #2) keeps the stack flat for the
-# `max_redirects=10` default. The `n_redirects` counter is the hop
-# index of the *current* request; we compare against `max_redirects`
-# *before* issuing so a policy of 0 redirects still allows the
-# initial request through.
+# Inner loop — one hop per recursive call. `n_redirects` is the hop
+# index of the *current* request, compared against `max_redirects`
+# *before* issuing so a policy of 0 redirects still lets the initial
+# request through.
 fn http_follow_loop(req: Request, policy: RedirectPolicy, n_redirects: Int)
     : Result[String, Response] / NetTcp + Cancel = {
   if n_redirects > policy.max_redirects {

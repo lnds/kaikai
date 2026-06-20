@@ -1,28 +1,15 @@
 #[doc("""
-m12.8 — stdlib protocols.
+Single-dispatch protocols + impls for kaikai primitives.
 
-Five single-dispatch protocols + impls for kaikai primitives.
-Auto-loaded by kaic2 as part of the core stdlib set; stage 0 and
-stage 1 do not parse `protocol`/`impl`, so the protocol mechanism
-is stage-2-only.
-
-Each op gets a `__proto_<op>` C-emit name to avoid colliding with
+Each op gets a `__proto_<op>` emit name to avoid colliding with
 runtime helpers like `kai_op_eq`, `kai_to_string`, `kai_op_lt`. The
-rename happens in the compiler's `lower_protocols` pass; the user
-calls the surface name (`eq`, `cmp`, ...) and the resolver picks
+user calls the surface name (`eq`, `cmp`, ...) and the resolver picks
 the right impl based on the inferred argument type.
 
-bin_* surface (m14 follow-up — issue #614):
-
-The `bin_*` helpers (`bin_byte`, `bin_byte_at`, `bin_int_to_bytes`,
-`bin_bytes_to_int`, `bin_write_len4`, `bin_char_to_bytes`,
-`bin_char_from_bytes`, `bin_list_to_bytes`, `bin_list_from_bytes`,
-`bin_option_to_bytes`, `bin_option_from_bytes`) and `array_*`
-byte builders live in `stdlib/protocols.kai`, sited next to the
-Show/Eq/Ord/Hash/BinSerialize protocols. They keep their `bin_*`
-names as the implementation home; the dedicated `stdlib/bin.kai`
-module (shipped) re-exposes them under bare canonical names
-(`bin.byte`, `bin.int_to_bytes`, …).
+The `bin_*` helpers and `array_*` byte builders are the implementation
+home for binary serialization; the dedicated `stdlib/bin.kai` module
+re-exposes them under bare canonical names (`bin.byte`,
+`bin.int_to_bytes`, …).
 """)]
 
 # ---- Show ---------------------------------------------------------
@@ -35,14 +22,13 @@ impl Show for Int {
   fn show(x: Int) : String = int_to_string(x)
 }
 
-# m12.8 phase 2: parametric impl. The unit tparam `u` is bound at the
-# impl level so the body sees `x : Real<u>` and `unit_name(x)` returns
-# the canonical unit symbol (or `""` for bare `Real`, which the
-# typer collapses to `Real<1>`). `__strip_unit` is a compiler-internal
-# erasure intrinsic — NOT user-callable — that the parametric body
-# uses to feed the dimensioned value into `real_to_string : Real ->
-# String`. The conditional skips the `" "` separator when there is no
-# unit so `let y : Real = 3.14` still renders as just `"3.14"`.
+# The unit tparam `u` is bound at the impl level so the body sees
+# `x : Real<u>` and `unit_name(x)` returns the canonical unit symbol
+# (or `""` for bare `Real`). `__strip_unit` is a compiler-internal
+# erasure intrinsic (NOT user-callable) that feeds the dimensioned
+# value into `real_to_string`. The conditional skips the `" "`
+# separator when there is no unit so `let y : Real = 3.14` renders as
+# just `"3.14"`.
 impl[u: Measure] Show for Real<u> {
   fn show(x: Real<u>) : String = {
     let bare = real_to_string(__strip_unit(x))
@@ -57,10 +43,8 @@ impl Show for Bool {
 }
 
 # Char Show via an ASCII printable table (codepoints 32–126) plus a
-# small set of named control escapes (`\t`, `\n`, `\r`). Anything
-# outside falls back to `\xNN` with the codepoint in decimal.
-# Mirrors the technique json_escape_char uses; kept self-contained
-# in protocols.kai because it loads before encoding/json.kai.
+# small set of named control escapes (`\t`, `\n`, `\r`). Bytes outside
+# printable ASCII emit as raw bytes (see the impl below).
 fn show_char_ascii_table() : String =
   " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
@@ -71,13 +55,10 @@ impl Show for Char {
     else if n == 9  { "\t" }
     else if n == 10 { "\n" }
     else if n == 13 { "\r" }
-    # For bytes outside printable ASCII the Char carries a single
-    # raw byte value (0..255) — the lexer / file reader sees UTF-8
-    # one byte at a time, so a multibyte glyph like U+2014 arrives
-    # as three Chars with bytes 0xE2 0x80 0x94. Emit each as a
-    # raw byte (no `\xNN` escape, no decimal) so concatenation
-    # reconstructs the original UTF-8 sequence; this is what `kai
-    # fmt` and the codegen string-literal path both want.
+    # Bytes outside printable ASCII carry a single raw byte (0..255):
+    # a multibyte glyph like U+2014 arrives as three Chars with bytes
+    # 0xE2 0x80 0x94. Emit each as a raw byte (no escape, no decimal)
+    # so concatenation reconstructs the original UTF-8 sequence.
     else { int_to_byte_string(n) }
   }
 }
@@ -90,13 +71,9 @@ impl Show for Unit {
   fn show(x: Unit) : String = "()"
 }
 
-# Polymorphic Show for parametric containers (issue #175). The bound
-# `[T : Show]` documents that the impl body recurses on `T` via
-# `show(x : T)`; the post-mono dispatch validator (issue #174) checks
-# that every concrete instantiation has the matching `Show for T'`.
-# `show_list_inner` is the shared helper that joins elements with
-# `, `; the impl wraps in `[...]` so an empty list renders as `[]`
-# rather than `[]`-with-extra-padding.
+# Polymorphic Show for parametric containers. The bound `[T : Show]`
+# documents that the impl body recurses on `T` via `show(x : T)`.
+# `show_list_inner` joins elements with `, `; the impl wraps in `[...]`.
 
 fn show_list_inner[T](xs: [T]) : String = match xs {
   []           -> ""
@@ -152,11 +129,10 @@ impl Eq for Unit {
   fn eq(a: Unit, b: Unit) : Bool = true
 }
 
-# Polymorphic Eq for parametric containers (issue #175). `list_eq_loop`
-# walks both lists in lockstep, returning false on the first
-# mismatch (length or element); the helper is generic in `T` and
-# delegates element comparison to `eq(x, y : T)`. Option / Result
-# match on the variant tags first, then defer to the inner Eq.
+# Polymorphic Eq for parametric containers. `list_eq_loop` walks both
+# lists in lockstep, returning false on the first mismatch (length or
+# element). Option / Result match on the variant tags first, then defer
+# to the inner Eq.
 
 fn list_eq_loop[T](a: [T], b: [T]) : Bool = match a {
   [] -> match b { [] -> true others -> false }
@@ -220,25 +196,18 @@ impl Ord for Char {
   fn max(a: Char, b: Char) : Char = if a > b { a } else { b }
 }
 
-# Note (resolver-arity, v0.7.2): `min(a, b)` / `max(a, b)` coexist
-# with `pub fn min(xs: [Int])` / `pub fn max(xs: [Int])` in
-# `stdlib/core/list.kai` because the pre-resolve dispatcher rewrite
-# is now arity-aware (`rename_proto_calls_kind`). A bare `max(xs)`
-# call (arity 1) skips the rewrite and resolves to `list.max`; a
-# `max(a, b)` call (arity 2) routes through `__proto_max` and
-# dispatches on the receiver type. The type-prefixed siblings
-# (`int_min`, `real_max`, ...) remain available in their respective
-# math modules for callers that prefer the explicit form.
+# Resolver-arity trap: `min(a, b)` / `max(a, b)` coexist with
+# `pub fn min(xs: [Int])` / `pub fn max(xs: [Int])` in
+# `stdlib/core/list.kai` because the dispatcher rewrite is arity-aware.
+# A bare `max(xs)` (arity 1) resolves to `list.max`; `max(a, b)`
+# (arity 2) routes through `__proto_max` and dispatches on the receiver
+# type. The type-prefixed siblings (`int_min`, `real_max`, ...) remain
+# available for callers that prefer the explicit form.
 
-# Polymorphic Ord for parametric containers (issue #175). Lists are
-# compared lexicographically (shorter list wins on shared prefix).
-# Option orders `None < Some(_)`. Result orders `Ok(_) < Err(_)` —
-# this matches the convention that the success branch is the
-# "smaller" result, parallel to the way many derived Ord
-# implementations order sum-type constructors by declaration
-# position. `min` / `max` are expressed in terms of `cmp` so any
-# improvement to `cmp` propagates without a second hand-written
-# pass over the variants.
+# Polymorphic Ord for parametric containers. Lists are compared
+# lexicographically (shorter list wins on shared prefix). Option orders
+# `None < Some(_)`. Result orders `Ok(_) < Err(_)`. `min` / `max` are
+# expressed in terms of `cmp` so any change to `cmp` propagates.
 
 fn list_cmp_loop[T](a: [T], b: [T]) : Int = match a {
   [] -> match b {
@@ -292,23 +261,19 @@ impl Hash for Int {
   fn hash(x: Int) : Int = x
 }
 
-# `string_hash` is a runtime builtin: a tight C FNV-1a loop over the
-# String's bytes returning the full 64-bit digest (issue #373). It is
-# NOT a kaikai byte-by-byte loop, which would box an Int per character
-# — unacceptable for the hot path a HashMap (#374) exercises. The
-# digest can wrap to a NEGATIVE Int (two's-complement overflow); that
-# is correct and intended. HashMap MUST normalise to a bucket via
-# `((h % n) + n) % n` (or `h & (n-1)` for power-of-two n) — absorbing
-# the sign is HashMap's contract, not Hash's. See #374.
+# `string_hash` is a runtime FNV-1a over the String's bytes returning
+# the full 64-bit digest, NOT a kaikai byte-by-byte loop (which would
+# box an Int per character). The digest can wrap NEGATIVE (two's-
+# complement overflow); that is intended. Normalising to a bucket via
+# `((h % n) + n) % n` is HashMap's contract, not Hash's.
 impl Hash for String {
   fn hash(x: String) : Int = string_hash(x)
 }
 
-# `real_bits` is a runtime builtin: it reinterprets the double's
-# IEEE-754 bit pattern as an Int (issue #373). A bit-cast, not an
-# `int_of_real` truncation — truncation would collapse the fraction
-# (1.5 and 1.9 would collide). Like the String digest, the result may
-# wrap negative; HashMap normalises (see the String note above).
+# `real_bits` reinterprets the double's IEEE-754 bit pattern as an Int:
+# a bit-cast, not a truncation (which would collapse the fraction so
+# 1.5 and 1.9 collide). Like the String digest, the result may wrap
+# negative; HashMap normalises.
 impl Hash for Real {
   fn hash(x: Real) : Int = real_bits(x)
 }
@@ -321,17 +286,14 @@ impl Hash for Char {
   fn hash(x: Char) : Int = char_to_int(x)
 }
 
-# Polymorphic Hash for parametric containers (issue #175). The list
-# fold is FNV-style: an `acc * 31 + hash(x)` polynomial mix that
-# matches the JVM convention and gives reasonable distribution for
-# mixed-arity primitive children. Option / Result mix the variant tag
-# MULTIPLICATIVELY against a large prime (`tag * 1099511628211`) before
-# adding the payload hash, so distinct variants with equal-hashing
-# payloads stay far apart: with the old additive offsets `Ok(1)` (=> 3)
-# collided with `Err(0)` (=> 3). The prime is the FNV-1a multiplier,
-# reused for the derive-Hash sum-type fold (see compiler/protos.kai).
-# Like every Hash backend here the result may wrap negative; HashMap
-# (#374) normalises to a bucket — see the String impl note above.
+# Polymorphic Hash for parametric containers. The list fold is an
+# `acc * 31 + hash(x)` polynomial mix (JVM convention). Option / Result
+# mix the variant tag MULTIPLICATIVELY against a large prime
+# (`tag * 1099511628211`, the FNV-1a multiplier) before adding the
+# payload hash, so distinct variants with equal-hashing payloads stay
+# apart (additive offsets would let `Ok(1)` collide with `Err(0)`).
+# Like every Hash backend the result may wrap negative; HashMap
+# normalises.
 
 fn list_hash_loop[T](xs: [T], acc: Int) : Int = match xs {
   []           -> acc
@@ -359,10 +321,9 @@ impl[E : Hash, T : Hash] Hash for Result[E, T] {
 # ---- Serialize ----------------------------------------------------
 #
 # `to_string` dispatches on Self (input position); `from_string` has
-# Self only in the return position so the v1 dispatch cannot pick its
-# impl from a bare call. Until m12.8.x adds annotation-aware lookup,
-# users must qualify by typing the result (`let r : Result[String, Int]
-# = from_string(s)`); see `examples/protocols/serialize_basic.kai`.
+# Self only in the return position, so single-dispatch cannot pick its
+# impl from a bare call. Users qualify by typing the result
+# (`let r : Result[String, Int] = from_string(s)`).
 
 protocol Serialize {
   to_string(x: Self) : String
@@ -398,57 +359,36 @@ impl Serialize for Bool {
     else { Err("not a bool") }
 }
 
-# ---- BinSerialize (issue #459; #487 Array[Byte] refactor) ---------
+# ---- BinSerialize -------------------------------------------------
 #
-# Cursor-based binary serialization on `Array[Byte]`. `Byte` is a
-# nominal primitive declared in `stdlib/core/byte.kai`; an
-# `Array[Byte]` is the contiguous mutable carrier with O(1)
-# `array_get` reads — the substrate the precompiled-stdlib cache
-# (#452) requires. The prior `[Byte]` cons-list carrier made
-# `from_bytes` O(N²) per #485; switching to `Array[Byte]` reduces
-# every cursor read to O(1) without touching the runtime.
-#
-# Why a sibling of Serialize and not a refit: Serialize is the
-# whole-string "config / round-trip" protocol; BinSerialize is the
-# stream/cursor "feed me a prefix, give me back what's left" protocol
-# the precompiled-stdlib cache (#452) needs. Two protocols with
-# overlapping but non-identical semantics — see #459 design notes
-# for the trade-off.
+# Cursor-based binary serialization on `Array[Byte]` — the contiguous
+# mutable carrier with O(1) `array_get` reads (a `[Byte]` cons-list
+# carrier made `from_bytes` O(N²)). Sibling of Serialize, not a refit:
+# Serialize is the whole-string round-trip protocol; BinSerialize is
+# the stream/cursor "feed me a prefix, give me back what's left" one.
 #
 # Shape:
 #   to_bytes(self)             : Array[Byte]
 #   from_bytes(buf, pos)       : Result[String, BinCursor[Self]]
-#                                # Ok({ value, pos: next_pos }) | Err(msg)
 #
-# `BinCursor[t]` is the cursor return shape — a local record so
-# `stdlib/protocols.kai` does not depend on `stdlib/core/tuple.kai`
-# (which declares `Pair[a, b]`, the desugar target of the `(a, b)`
-# tuple sugar). Test harnesses that bundle `protocols.kai` without
-# `core/tuple.kai` (e.g. `complex_literal_basic` in `test-sugars`)
-# would otherwise see `Pair` unresolved at every `from_bytes` call
-# site.
+# `BinCursor[t]` is a local record (not `Pair`) so this file does not
+# depend on `stdlib/core/tuple.kai`; harnesses that bundle
+# `protocols.kai` without `core/tuple.kai` would otherwise see `Pair`
+# unresolved at every `from_bytes` call site.
 #
-# Encoding (v1):
+# Encoding:
 #   Int    — 8-byte little-endian two's complement (assumes Int = i64).
-#   Real   — length-prefixed UTF-8 of `real_to_string` (decimal). Pinned
-#            here as a v1 fallback because no `real_to_bits` runtime
-#            primitive exists yet; finite values round-trip exactly via
-#            kaikai's existing `string_to_real`. Tracked as follow-up
-#            in `docs/lane-experience-issue-459-binserialize.md`.
+#   Real   — length-prefixed UTF-8 of `real_to_string` (decimal); finite
+#            values round-trip exactly via `string_to_real`.
 #   String — 4-byte little-endian length prefix + raw bytes.
 #   Bool   — 1 byte (0 = false, 1 = true).
 #
 # Mutable masking: every helper below constructs its `Array[Byte]`
-# output locally via `array_make` and fills it via `array_set` either
-# in-line (small fixed-size buffers) or inside a `bin_foldl` lambda
-# that captures the local Array — never receives it as a parameter.
-# This routes through the local-Array-only branch of the masking
-# pass (issue #251 + #252, `mask_local_mutable_demand` in
-# `stage2/compiler.kai`), so `Mutable` stays out of the inferred row
-# and the BinSerialize surface is pure. Helpers that take an existing
-# buffer (`array_concat_bytes`, `array_copy_into`) appear in the
-# whitelist via `is_array_safe_callee` so the caller's local Array
-# is not flagged as escaping.
+# output locally via `array_make` and fills it via `array_set` — never
+# receives the output buffer as a parameter — so the masking pass keeps
+# `Mutable` out of the inferred row and the BinSerialize surface stays
+# pure. Helpers that take an existing buffer (`array_concat_bytes`) are
+# whitelisted so the caller's local Array is not flagged as escaping.
 
 #[doc("A decode cursor: a decoded `value` paired with `pos`, the buffer offset just past it, threaded through `BinSerialize.from_bytes`.")]
 pub type BinCursor[t] = { value: t, pos: Int }
@@ -458,40 +398,30 @@ protocol BinSerialize {
   from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Self]]
 }
 
-# --- low-level helpers (private to the BinSerialize impls) --------
-#
-# `bin_*` is the namespace prefix; the module exports nothing because
-# stdlib/protocols.kai is auto-loaded flat into the global scope and
-# we want the helper names out of the bare-name resolver's reach.
+# --- low-level helpers (the `bin_*` prefix marks the BinSerialize
+# implementation namespace) ----------------------------------------
 
 #[doc("""
-`bin_byte(n)` is the internal Int → Byte coercion. Every call site
-below masks its input through `% 256` (with negative-wrap fold)
-before invoking, so the value is always in `[0, 255]` and the
-`int_to_byte` Result.Err branch is unreachable; we panic on it
-rather than thread an error type through every helper. After
-Lane 4 made `Byte` nominal the explicit conversion replaces the
-old `Byte = Int` transparent-alias shorthand.
+Internal Int → Byte coercion. Every call site masks its input through
+`% 256` (with negative-wrap fold) first, so the value is always in
+`[0, 255]` and the `int_to_byte` Err branch is unreachable; we panic
+on it rather than thread an error type through every helper.
 """)]
 pub fn bin_byte(n: Int) : Byte = match int_to_byte(n) {
   Ok(b)  -> b
   Err(m) -> panic(m)
 }
 
-# Private foldl. Mirrors `bin_foldl` but is bare so the BinSerialize
-# helpers below stay usable when stdlib/protocols.kai is auto-loaded
-# without `stdlib/core/list.kai` on the same chain (e.g. the
-# `complex_literal_*` test-sugars harness, which only adds protocols
-# + math). Kept as `bin_foldl` so the BinSerialize-private namespace
-# prefix flags it as not user-facing.
+# Private foldl, kept bare so the BinSerialize helpers stay usable when
+# protocols.kai is auto-loaded without `stdlib/core/list.kai` on the
+# same chain.
 fn bin_foldl[a, r, e](xs: [a], init: r, f: (r, a) -> r / e) : r / e = match xs {
   []          -> init
   [h, ...t]   -> bin_foldl(t, f(init, h), f)
 }
 
-# `bin_zero` is the all-purpose sentinel for `array_make` calls that
-# need a `Byte` slot but overwrite every position immediately. Folded
-# out by the optimiser; declaring it here documents the intent.
+# Sentinel for `array_make` calls that need a `Byte` fill but overwrite
+# every position immediately.
 fn bin_zero() : Byte = bin_byte(0)
 
 #[doc("""
@@ -504,8 +434,7 @@ pub fn bin_byte_at(buf: Array[Byte], pos: Int) : Result[String, Byte] = {
   } else { Ok(buf[pos]) }
 }
 
-# Range check — true iff the buffer holds at least `n` more bytes
-# starting at `pos`. O(1) via `array_length`.
+# True iff the buffer holds at least `n` more bytes starting at `pos`.
 fn bin_have(buf: Array[Byte], pos: Int, n: Int) : Bool =
   pos >= 0 and n >= 0 and pos + n <= array_length(buf)
 
@@ -540,25 +469,21 @@ pub fn bin_bytes_to_int(buf: Array[Byte], pos: Int) : Result[String, BinCursor[I
       let bi   = byte_to_int(buf[pos + k])
       let nxt  = st.fst + bi * st.snd
       let m2   = if k == 7 {
-        # Top byte: sign-extend if high bit is set so the value
-        # becomes a proper negative Int rather than a 64-bit
-        # unsigned-style positive.
+        # Top byte: sign-extend if the high bit is set so the value
+        # becomes a proper negative Int, not an unsigned-style positive.
         if bi >= 128 { nxt - 256 * st.snd } else { nxt }
       } else { nxt }
       (m2, st.snd * 256)
     })
-    # Note: bin_foldl invokes `f(acc, elem)` — the lambda above
-    # receives `st` (running pair) then `k` (current byte index).
     Ok(BinCursor { value: acc.fst, pos: pos + 8 })
   }
 }
 
 #[doc("""
 Write a 4-byte little-endian length prefix into positions
-`[off, off + 4)` of the buffer the caller passed in. Mutates `buf`,
-so the row declares `/ Mutable`. Callers that pass a
-locally-constructed `buf` get their `Mutable` demand masked by
-`mask_local_mutable_demand` (issue #528).
+`[off, off + 4)` of the caller's buffer. Mutates `buf`, so the row
+declares `/ Mutable`; callers that pass a locally-constructed `buf`
+get that demand masked.
 """)]
 pub fn bin_write_len4(buf: Array[Byte], off: Int, n: Int) : Array[Byte] / Mutable = {
   let _ = bin_foldl([0, 1, 2, 3], n, (cur, i) => {
@@ -570,12 +495,9 @@ pub fn bin_write_len4(buf: Array[Byte], off: Int, n: Int) : Array[Byte] / Mutabl
   buf
 }
 
-# String encoding — 4-byte LE length prefix + raw bytes. Allocates
-# the full output buffer up front, fills the length prefix in place,
-# then walks the source string once writing each character's byte.
-# Iterating via `int_range_to_list(0, n)` + `char_at` (rather than
-# `string.chars(s)` which is qualified-only in m14 phase 1) keeps
-# protocols.kai callable from the core auto-load without a
+# String encoding — 4-byte LE length prefix + raw bytes. Iterating via
+# `int_range_to_list(0, n)` + `char_at` (rather than `string.chars(s)`)
+# keeps protocols.kai callable from the core auto-load without a
 # `use string` directive — the auto-load path does not run
 # `expand_imports`.
 fn bin_string_to_bytes(s: String) : Array[Byte] = {
@@ -604,10 +526,9 @@ fn bin_read_len4(buf: Array[Byte], pos: Int) : Result[String, Int] = {
   }
 }
 
-# `bin_collect_chars(buf, pos, k)` rebuilds a String from `k` raw
-# bytes via `int_to_char` + interpolation. v1 limitation: characters
-# outside ASCII `[32, 126]` (incl. null) routes through `Show for
-# Char`'s escape rendering. Tracked in `docs/lane-experience-issue-459-binserialize.md`.
+# Rebuild a String from `k` raw bytes via `int_to_char` +
+# interpolation. Limitation: characters outside ASCII `[32, 126]`
+# (incl. null) route through `Show for Char`'s escape rendering.
 fn bin_collect_chars(buf: Array[Byte], pos: Int, k: Int) : Result[String, String] = {
   if not bin_have(buf, pos, k) {
     Err("unexpected end of buffer")
@@ -619,11 +540,9 @@ fn bin_collect_chars(buf: Array[Byte], pos: Int, k: Int) : Result[String, String
   }
 }
 
-# Build a list `[lo, lo+1, ..., hi-1]` for use as a `bin_foldl`
-# driver. Defined here (rather than in stdlib/core/list.kai) so the
-# helper stays private to the BinSerialize impls and the core-load
-# resolver does not have to clamber over an extra public name. Pure
-# functional cons; the produced list is consumed once and freed.
+# Build a list `[lo, lo+1, ..., hi-1]` for use as a `bin_foldl` driver.
+# Kept private here rather than in stdlib/core/list.kai so the core-load
+# resolver does not have to carry an extra public name.
 fn int_range_to_list(lo: Int, hi: Int) : [Int] =
   int_range_to_list_loop(hi - 1, lo, [])
 
@@ -633,13 +552,11 @@ fn int_range_to_list_loop(cur: Int, lo: Int, acc: [Int]) : [Int] = {
 }
 
 #[doc("""
-Concatenate two `Array[Byte]`s into a fresh buffer. Read-only on
-both inputs; the only mutation targets the local `dst`. Whitelisted
-via `is_array_safe_callee` (see compiler.kai), so the caller's
-locally-constructed Arrays do not register as escaping when passed
-in here. This is the canonical concat surface for the BinSerialize
-pipeline — every `to_bytes` for a multi-field record stitches its
-per-field outputs through `array_concat_bytes`.
+Concatenate two `Array[Byte]`s into a fresh buffer. Read-only on both
+inputs; the only mutation targets the local `dst`. Whitelisted as a
+safe callee so the caller's locally-constructed Arrays do not register
+as escaping when passed in. The canonical concat surface for the
+BinSerialize pipeline.
 """)]
 pub fn array_concat_bytes(a: Array[Byte], b: Array[Byte]) : Array[Byte] = {
   let la  = array_length(a)
@@ -689,15 +606,12 @@ impl BinSerialize for Bool {
   }
 }
 
-# String impl — v1 limitation: the decoder rebuilds a String from
-# `Array[Byte]` via `int_to_char` + `"#{c}"` interpolation, which
-# routes through `Show for Char` and emits `\xNN` for bytes outside
-# the printable ASCII range `[32, 126]`. Strings with null bytes also
-# truncate at the `\0` because the runtime treats String as a
-# null-terminated C buffer. Both gaps need an `int_to_byte_string`
-# runtime primitive to close; tracked as a follow-up in the lane
-# retro for #459. ASCII-only callers (the Phase A cache's primary
-# use case — file paths, identifier names, source spans) are
+# String impl limitation: the decoder rebuilds a String via
+# `int_to_char` + `"#{c}"` interpolation, which routes through
+# `Show for Char` and escapes bytes outside printable ASCII
+# `[32, 126]`. Strings with null bytes also truncate at the `\0`
+# because the runtime treats String as a null-terminated C buffer.
+# ASCII-only callers (file paths, identifiers, source spans) are
 # unaffected.
 impl BinSerialize for String {
   fn to_bytes(self: String) : Array[Byte] = bin_string_to_bytes(self)
@@ -742,19 +656,14 @@ impl BinSerialize for Real {
   }
 }
 
-# Per-type wrappers (issue #459): v1 single-dispatch picks the impl
-# from the first argument's type. For `to_bytes(self)` that is Self,
-# so dispatch is always correct. For `from_bytes(buf, pos)` Self
-# appears only in the return position, so a bare `from_bytes(bs, 0)`
-# dispatches on `[Byte]` (the buffer's type) and finds no impl. The
-# typer has no annotation-driven backstop for this in v1 (same
-# limitation Serialize.from_string and Default.default ride —
-# documented in the §Serialize prologue above).
-#
-# Until annotation-aware lookup lands, these sibling names give
-# users a non-overloaded entry point for each primitive impl. The
-# `derive_binserialize_impl` pass synthesises an analogous
-# `<tname>_from_bytes` helper for each derived type.
+# Per-type wrappers: single-dispatch picks the impl from the first
+# argument's type. For `to_bytes(self)` that is Self, so dispatch is
+# correct. For `from_bytes(buf, pos)` Self appears only in the return
+# position, so a bare `from_bytes(bs, 0)` dispatches on the buffer's
+# type and finds no impl (same limitation Serialize.from_string and
+# Default.default ride). These sibling names give a non-overloaded
+# entry point for each primitive impl; the derive pass synthesises an
+# analogous `<tname>_from_bytes` helper for each derived type.
 
 #[doc("Decodes an `Int` (as written by the integer codec) from `buf` at `pos`, returning the value and the next position. The non-overloaded entry point for `Int`'s `BinSerialize.from_bytes`.")]
 pub fn int_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Int]] =
@@ -809,16 +718,14 @@ fn real_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCursor[Real]]
   }
 }
 
-# ---- Collection combinators (Phase A.0 pre-blocker) ---------------
+# ---- Collection combinators ---------------------------------------
 #
 # `[T]` and `Option[T]` cannot have a useful single-dispatch
 # `BinSerialize` impl: the dispatcher resolves on the head type
-# (`"List"`, `"Option"`), which would collide with the buffer (also
-# `Array[Byte]`'s element type) and could not carry the element type
-# through `from_bytes`. The `#derive(BinSerialize)` pass emits direct
-# calls to these combinators when it sees `TyList(t)` / `Option[t]`
-# / `Char` field types, supplying the element encoder/decoder inline
-# as a lambda. See `docs/binserialize-collections-design.md`.
+# (`List`, `Option`) and could not carry the element type through
+# `from_bytes`. The `#[derive(BinSerialize)]` pass emits direct calls
+# to these combinators for list / option / char field types, supplying
+# the element encoder/decoder inline as a lambda.
 
 #[doc("Encodes a `Char` as its codepoint through the integer codec.")]
 pub fn bin_char_to_bytes(c: Char) : Array[Byte] = bin_int_to_bytes(char_to_int(c))
@@ -832,24 +739,17 @@ pub fn bin_char_from_bytes(buf: Array[Byte], pos: Int) : Result[String, BinCurso
 }
 
 #[doc("""
-`bin_list_to_bytes(xs, enc)` writes a 4-byte LE length prefix
-followed by the concatenation of `enc(x)` for each x in xs. Length
-encoding matches `String`'s 4-byte prefix so the codec shapes line
-up. `enc` is opaque to the combinator — the derive supplies a
-lambda that recurses through nested collections (`[[Int]]` → enc
-is `{ x -> bin_list_to_bytes(x, { y -> to_bytes(y) }) }`).
-
-The fold accumulator is itself an `Array[Byte]`. `array_concat_bytes`
-is whitelisted via `is_array_safe_callee`, so the locally-allocated
-`buf` does not register as escaping when fed into the concat call.
-The resulting Array each iteration is a fresh allocation (no
-in-place mutation observable to the caller), and the masking pass
-drops `Mutable` from this function's row.
+Write a 4-byte LE length prefix followed by the concatenation of
+`enc(x)` for each x in xs. The length encoding matches `String`'s
+4-byte prefix. `enc` is opaque to the combinator — the derive supplies
+a lambda that recurses through nested collections. Each iteration's
+Array is a fresh allocation (no observable in-place mutation), so the
+masking pass keeps `Mutable` out of the row.
 """)]
 pub fn bin_list_to_bytes[T](xs: [T], enc: (T) -> Array[Byte]) : Array[Byte] = {
   let len = list_length(xs)
-  # 4-byte LE length prefix matches `bin_read_len4` on the decode side.
-  # `bin_int_to_bytes` writes 8 bytes which would desync the cursor.
+  # 4-byte LE prefix matches `bin_read_len4` on decode; `bin_int_to_bytes`
+  # writes 8 bytes, which would desync the cursor.
   let len_buf = array_make(4, bin_zero())
   let _ = bin_write_len4(len_buf, 0, len)
   bin_foldl(xs, len_buf, (acc, x) => array_concat_bytes(acc, enc(x)))
@@ -919,20 +819,15 @@ pub fn bin_option_from_bytes[T](buf: Array[Byte], pos: Int,
   }
 }
 
-# ---- Default (issue #258) -----------------------------------------
+# ---- Default ------------------------------------------------------
 #
-# `default() : Self` has Self only in the return position, so v1
-# single-dispatch resolves it via the same annotation-driven path
-# that Serialize.from_string and From[a].from rely on (`let x : T =
-# default()`). Generic helpers like `fn make[T : Default]() : T =
-# default()` are out of reach until annotation-aware lookup lands in
-# free-function tparam bounds; the protocol still ships now because
-# the value at the call site (one annotation, one canonical default)
-# pays for itself even without the generic-fn shape.
+# `default() : Self` has Self only in the return position, so
+# single-dispatch resolves it via the annotation-driven path
+# (`let x : T = default()`), the same as Serialize.from_string.
 #
-# `Result[E, T]` is intentionally absent — neither `Ok(default()) :
-# Result[_, T]` nor `Err(default()) : Result[E, _]` is a privileged
-# default, so callers construct results explicitly.
+# `Result[E, T]` is intentionally absent — neither `Ok(default())` nor
+# `Err(default())` is a privileged default, so callers construct
+# results explicitly.
 
 protocol Default {
   default() : Self
@@ -955,11 +850,9 @@ impl Default for String {
 }
 
 # Polymorphic Default for parametric containers. The bodies are
-# constants in `T` (`[]` and `None`), so the impl trivially
-# monomorphises without recursing on `T` and the bound on `T` would
-# be unused — issue #174 (case 3) sanctions dropping it. The
-# precedent is Show/Eq/Ord/Hash for [T]/Option[T] from #175, except
-# those bodies do recurse and so carry `T : Show` etc.
+# constants in `T` (`[]` and `None`) and never recurse on `T`, so the
+# bound on `T` is dropped (unlike Show/Eq/Ord/Hash, whose bodies do
+# recurse and carry `T : Show` etc.).
 impl[T] Default for [T] {
   fn default() : [T] = []
 }
@@ -968,21 +861,18 @@ impl[T] Default for Option[T] {
   fn default() : Option[T] = None
 }
 
-# ---- Add / Sub / Mul / Div (issue #246, #180) ---------------------
+# ---- Add / Sub / Mul / Div ----------------------------------------
 #
 # Operator-overloading protocols. The typer rewrites a non-primitive
-# `EBinop("+"/"-"/"*"/"/", l, r)` into `__proto_<method>(l, r)`; the
-# post-inference pass then redirects to the matching `__pimpl_<P>_<T>_<op>`.
-# Primitive `Int + Int` / `Real + Real` arithmetic stays on the
-# unify-and-emit fast path — the typer never reaches the rewrite when
-# both operands are primitive numeric. The Int/Real impls below exist so
-# generic `T : Add` code can monomorphise / dispatch at runtime.
+# `+ - * /` binop into the matching protocol call. Primitive
+# `Int + Int` / `Real + Real` arithmetic stays on the fast path — the
+# typer never reaches the rewrite when both operands are primitive
+# numeric. The Int/Real impls below exist so generic `T : Add` code can
+# monomorphise / dispatch at runtime.
 #
-# Issue #180: parametrised by the rhs type. `protocol Add[a]` (lowercase
-# `a` follows kaikai's lowercase-tparam convention; the spec-level
-# uppercase `A` is a documentation choice only). Legacy un-parametrised
-# `impl Add for X` continues to parse and is treated as `impl Add[X]
-# for X` (the homogeneous default).
+# Parametrised by the rhs type (`protocol Add[a]`). An un-parametrised
+# `impl Add for X` is treated as `impl Add[X] for X` (the homogeneous
+# default).
 
 protocol Add[a] {
   add(self: Self, rhs: a) : Self
@@ -1032,13 +922,10 @@ impl Div for Real {
   fn div(self: Real, rhs: Real) : Real = self / rhs
 }
 
-# `Rem` (Wave Op-1): the `%` operator. Mirrors `Add` / `Sub` etc. The
-# typer keeps primitive `Int % Int` on the fast path; `Real % Real`
-# and concrete non-primitive operands route through `__proto_rem`.
-# `impl Rem for Real` (issue #364) lowers to the `fmod` libm binding
-# (`real_rem` / `kai_prelude_real_rem`); IEEE-754 NaN propagates on
-# divisor 0.0 — same convention as the rest of the libm bindings
-# (issue #343). Inspect with `real_is_nan` at boundaries.
+# `Rem`: the `%` operator. The typer keeps primitive `Int % Int` on the
+# fast path; `Real % Real` and non-primitive operands route through the
+# protocol. `impl Rem for Real` lowers to the `fmod` libm binding;
+# IEEE-754 NaN propagates on divisor 0.0 (inspect with `real_is_nan`).
 
 protocol Rem[a] {
   rem(self: Self, rhs: a) : Self
