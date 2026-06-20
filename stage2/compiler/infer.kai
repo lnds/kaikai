@@ -64,24 +64,6 @@ fn inf_all_clauses_extern_handler(cs: [HClause]) : Bool = match cs {
   }
 }
 
-# Search the handle stack for the topmost frame matching `eff_name`.
-# Step 2 (clause-merge) and step 3 (handle-with-default) both require
-# the topmost frame; step 1 fires when that frame's clauses list `op`.
-
-fn inf_builtin_effect_names() : [String] =
-  []
-
-# `Console` is now an alias `type Console = Stdout +
-# Stderr + Stdin` (per stdlib/effects.kai's pinned catalog), not a
-# first-class effect. The atomic Stdout/Stderr/Stdin decls carry the
-# actual ops; declaring `/ Console` in a row is an over-declaration
-# that the alias resolver expands to the three atomic labels before
-# the body-vs-declared subset check. Direct op calls of the form
-# `Stdout.print(...)` no longer typecheck — users write
-# `Stdout.print(...)` / `Stderr.eprint(...)` / `Stdin.read_line()`
-# explicitly, or rely on the bare `print` / `eprint` / `read_line`
-# sugar prelude that routes to the right atomic effect automatically.
-
 fn inf_cand_names_of(cands: [AliasCand]) : [String] {
   match cands {
     [] -> []
@@ -129,7 +111,7 @@ fn inf_collect_op_to_eff(decls: [Decl]) : [OpToEff] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, eff_name, _, ops, _, _, _) ->
+      DEffect(_, eff_name, _, ops, _, _, _, _) ->
         list_append(inf_ops_to_eff_pairs(eff_name, ops),
                     inf_collect_op_to_eff(rest))
       _ -> inf_collect_op_to_eff(rest)
@@ -245,7 +227,7 @@ fn inf_find_effect_default_block(eff_name: String, decls: [Decl]) : Option[Defau
   match decls {
     [] -> None
     [d, ...rest] -> match d {
-      DEffect(_, n, _, _, defblk, _, _) ->
+      DEffect(_, n, _, _, defblk, _, _, _) ->
         if n == eff_name { defblk } else { inf_find_effect_default_block(eff_name, rest) }
       _ -> inf_find_effect_default_block(eff_name, rest)
     }
@@ -745,14 +727,20 @@ fn inf_resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
   match todo {
     [] -> AliasResolution { aliases: list_reverse(acc), errs: st.errs }
     [c, ...rest] -> match c {
-      AC(name, _, _, _, _) -> {
-        let r = inf_resolve_alias(name, all_cands, cand_ns, eff_names, file, st)
-        let acc1 = match r.r {
-          Some(labels) -> [AR(name, labels), ...acc]
-          None -> acc
+      # A name declared as a first-class `effect` is an effect, not an
+      # alias: skip registering an alias entry for it so a row label
+      # resolves to the effect.
+      AC(name, _, _, _, _) ->
+        if list_has(eff_names, name) {
+          inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, st, rest, acc)
+        } else {
+          let r = inf_resolve_alias(name, all_cands, cand_ns, eff_names, file, st)
+          let acc1 = match r.r {
+            Some(labels) -> [AR(name, labels), ...acc]
+            None -> acc
+          }
+          inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, r.st, rest, acc1)
         }
-        inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, r.st, rest, acc1)
-      }
     }
   }
 }
@@ -2180,7 +2168,7 @@ fn build_effect_default_op_map(decls: [Decl]) : [EffDefaultOps] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, defblk, _, _) ->
+      DEffect(_, name, _, _, defblk, _, _, _) ->
         [EDOps(name, default_block_extern_ops(defblk)),
          ...build_effect_default_op_map(rest)]
       _ -> build_effect_default_op_map(rest)
@@ -2551,7 +2539,7 @@ fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
   match decls {
     [] -> false
     [d, ...rest] -> match d {
-      DEffect(_, n, _, _, _, _, _) ->
+      DEffect(_, n, _, _, _, _, _, _) ->
         if n == eff_name { true } else { is_effect_declared(eff_name, rest) }
       _ -> is_effect_declared(eff_name, rest)
     }
@@ -4319,7 +4307,7 @@ pub fn validate_fn_name_collisions_decls(root_decls: [Decl],
 # DFn / DType walkers above; shares `validate_name_collisions_walk`.
 
 fn extract_effect_site(d: Decl) : Option[NameSite] = match d {
-  DEffect(_, name, _, _, _, line, col) -> Some(NS(name, line, col))
+  DEffect(_, name, _, _, _, line, col, _) -> Some(NS(name, line, col))
   _ -> None
 }
 
@@ -4861,7 +4849,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           let env2 = add_variants_of_decl(env1, d, top_names)
           EnvWithArities { env: env2, arities: ar_acc }
         }
-        DEffect(_, eff_name, tparams, ops, _, _, _) -> {
+        DEffect(_, eff_name, tparams, ops, _, _, _, _) -> {
           let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
           # merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
@@ -16157,7 +16145,7 @@ fn validate_unit_refs_decl(d: Decl, declared: [String], file: String) : Int / Co
   DCheck(_, ps, body, _, _) ->
     validate_unit_refs_params(ps, declared, file, 0) +
     validate_unit_refs_expr(body, declared, file)
-  DEffect(_, _, _, ops, _, _, _) -> validate_unit_refs_eops(ops, declared, file, 0)
+  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, declared, file, 0)
   DImpl(_, _, _, sub_decls, _, _) ->
     validate_unit_refs_decls_loop(sub_decls, declared, file, 0)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
@@ -16520,7 +16508,7 @@ fn pub_leak_priv_one(d: Decl, home: String,
                         acc: [PubLeakPriv]) : [PubLeakPriv] = match d {
   DType(p, name, _, _, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "type"), ...acc] }
-  DEffect(p, name, _, _, _, _, _) ->
+  DEffect(p, name, _, _, _, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "effect"), ...acc] }
   DProtocol(p, name, _, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "protocol"), ...acc] }
@@ -16584,7 +16572,7 @@ fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
     if is_pub {
       vmps_typebody(body, name, home, priv_table, file, line, col)
     } else { 0 }
-  DEffect(is_pub, name, _, ops, _, line, col) ->
+  DEffect(is_pub, name, _, ops, _, line, col, _) ->
     if is_pub {
       vmps_eops(ops, name, home, priv_table, file, line, col, 0)
     } else { 0 }
@@ -16867,8 +16855,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
     DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, expand_aliases_expr(body, aliases), l, c)
     DImport(_, _, _) -> d
-    DEffect(p, n, tps, ops, defblk, l, c) ->
-      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), defblk, l, c)
+    DEffect(p, n, tps, ops, defblk, l, c, mo) ->
+      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), defblk, l, c, mo)
     DUnit(_, _, _, _, _) -> d
     # protocols are stripped by `lower_protocols` before
     # `infer_program` runs, so reaching one here means the unit-alias
@@ -17261,8 +17249,7 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
     all_program_decls
   } else { decls_a }
   let alias_cands = inf_collect_alias_cands(alias_src_decls)
-  let eff_names_for_alias = list_append(inf_builtin_effect_names(),
-                                          collect_effect_names(alias_src_decls))
+  let eff_names_for_alias = collect_effect_names(alias_src_decls)
   let alias_res = inf_resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff_here = inf_collect_op_to_eff(decls_a)
   let op_to_eff_all = list_append(op_to_eff_here, inherited.op_to_eff)
@@ -17601,8 +17588,9 @@ fn partition_by_homes_walk(decls: [Decl], target_mod: String,
 #   - DType with `mo = Some(m)`: that module.
 #   - DType with `mo = None`: `anchor` (untagged DType belongs
 #     to the same physical file as the surrounding tagged DFns).
-#   - DEffect / DUnit / DUse / DAxiom: `anchor` for the same
-#     "same-file" reason.
+#   - DEffect with `mo = Some(m)`: that module; `mo = None`:
+#     `target_mod` (a root-declared effect is target-authored).
+#   - DUnit / DUse / DAxiom: `anchor` for the same "same-file" reason.
 #   - DTest / DBench / DCheck: `target_mod` (these never live
 #     inside a prelude file).
 #   - Wrappers (DAttribPure, DDerive, DUnstable, DImpl): recurse
@@ -17617,7 +17605,10 @@ fn decide_partition_home(d: Decl, target_mod: String,
     Some(m) -> m
     None    -> anchor
   }
-  DEffect(_, _, _, _, _, _, _)       -> anchor
+  DEffect(_, _, _, _, _, _, _, mo) -> match mo {
+    Some(m) -> m
+    None    -> target_mod
+  }
   DUnit(_, _, _, _, _)                -> anchor
   DUse(_, _, _)                        -> anchor
   DAxiom(_, _, _, _, _, _, _, _, _, _) -> anchor
@@ -17646,12 +17637,13 @@ fn decide_partition_home(d: Decl, target_mod: String,
 
 # Like `decl_explicit_home` but specialised for the partition
 # walker: returns `Some(m)` when this decl declares its OWN home,
-# `None` when it inherits from the running anchor. DType counts
-# as explicit because the `tag_*` passes write its `mo`; DEffect /
-# DUnit do not (they carry no `module_origin` field).
+# `None` when it inherits from the running anchor. DType and DEffect
+# count as explicit because the `tag_*` passes write their `mo`;
+# DUnit does not (it carries no `module_origin` field).
 fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
   DType(_, _, _, _, _, _, mo)        -> mo
+  DEffect(_, _, _, _, _, _, _, mo)   -> mo
   DDerive(_, inner, _, _)         -> decl_explicit_module_origin(inner)
   DUnstable(inner, _, _)          -> decl_explicit_module_origin(inner)
   DImpl(_, _, _, sub, _, _)       -> match sub {
