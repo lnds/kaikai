@@ -11,24 +11,29 @@ A **functional**, **statically typed** programming language that compiles to
 
 ## Status
 
-MVP in progress.
+Pre-1.0, **Hanga Roa** edition. The language is self-hosting and
+runs the full toolchain today; it is unstable until the Orongo
+(1.0) edition lands — see `docs/editions.md`.
 
-- **Phase 1–3** (landed): kaikai-minimal language and a
-  self-hosting `stage1/kaic1` compiler.
-- **Phase 4** (landed): small stdlib (`stdlib/core/`) and the
-  `kai` driver so programs can be built with a single command.
-- **Stage 2** (in progress, `stage2/kaic2`): self-hosted
-  compiler in full kaikai. **Typed holes** are landed in m10
-  (`?` / `?name` with `--holes-json`); the effects mechanics
-  (m7a) and ergonomic sugars (m7b) are pinned across
-  `docs/effects.md`, `docs/effects-stdlib.md`,
-  `docs/effects-impl.md`, and `docs/syntax-sugars.md`. Fibers,
-  actors, and the structured-concurrency runtime ship in m8;
-  the LLVM IR backend, `kai fmt` / `kai lsp`, and
-  the `Map[K, V]` / `Vector[T]` collection family are
-  scheduled later milestones — see `docs/stage2-design.md`
-  §Milestones for the full list, and `docs/design.md` for the
-  roadmap context.
+- **Bootstrap** (landed): the 3-stage chain builds from any `cc`.
+  `stage1/kaic1` is the self-hosting kaikai-minimal compiler;
+  `stage2/kaic2` is the self-hosted compiler in full kaikai
+  (`make selfhost` proves it is a fixed point).
+- **Backend** (landed): the in-process libLLVM **native** backend
+  is the default; the C-direct backend is the bootstrap path and
+  parity oracle (`KAI_BACKEND=c`).
+- **Language + runtime** (landed): algebraic effects + handlers,
+  fibers / actors / structured concurrency, Perceus RC, typed
+  holes (`?` / `?name` with `--holes-json`), units of measure,
+  single-dispatch protocols.
+- **Tooling** (landed): `kai build` / `run` / `test` / `fmt` /
+  `lsp` / `doc`, plus a package manager (`kai add`).
+- **Stdlib** (landed): `core`, `math`, the effect catalog, and the
+  `Map` / `HashMap` / `Set` / `HashSet` / `Queue` / `Stack`
+  collection family — inventory in `docs/stdlib-layout.md`.
+
+See `docs/roadmap.md` for milestone state and `docs/design.md` for
+the design context.
 
 ## Quickstart
 
@@ -50,12 +55,14 @@ then fibers).
 ## Prerequisites
 
 - **C compiler** (cc/gcc/clang)
-- **LLVM 21** development headers and libraries:
+- **LLVM** development headers and libraries (CI builds against
+  LLVM 18; the build is version-agnostic via `llvm-config`):
   ```sh
-  sudo apt install llvm-21-dev libzstd-dev
+  sudo apt install llvm-dev libzstd-dev
   ```
-  Other distributions: install `llvm21-devel` (Fedora) or the equivalent
-  package for your distro. The build uses `llvm-config` to locate LLVM.
+  Other distributions: install the `llvm-devel` package (Fedora) or
+  the equivalent for your distro. The build locates LLVM through
+  `llvm-config`, so any reasonably recent version on `PATH` works.
 
 ## Build
 
@@ -154,9 +161,10 @@ stdlib source, so it stays in sync with the code it documents.
 ```
 stage0/          C bootstrap compiler for kaikai-minimal.
 stage1/          kaikai-minimal compiler (self-hosted in kaikai-minimal).
-stage2/          Stage 2 compiler in full kaikai (in progress;
-                 typed holes landed in m10).
-stdlib/          Core stdlib in kaikai-minimal (List/String/Option/...).
+stage2/          Self-hosted compiler in full kaikai (native libLLVM
+                 backend, fmt, lsp, doc).
+stdlib/          Standard library in kaikai (core, math, effects,
+                 collections).
 bin/             Shell driver (`kai build/run/test`).
 examples/minimal/  Canonical minimal examples used for regression.
 examples/phase4/   Small demos against stdlib.
