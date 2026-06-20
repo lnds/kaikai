@@ -3,14 +3,6 @@
 # contract lowering, `use Effect` desugar, the cap-binding nursery
 # rewrite, and the brand-mismatch validator.
 #
-# Extracted from main.kai under issue #677 Phase 1m — the fifth
-# "vertical pipeline" extraction, after the 11 leaf modules and the
-# module system (Phase 1l, PR #690). The cross-section analysis is in
-# docs/lane-desugar-cross-section-analysis.md and the retro in
-# docs/lane-experience-issue-677-phase1m.md.
-#
-# The cut, in one sentence
-#
 # Every pass here is a pure AST->AST (or AST->error-count) transform
 # the driver (`compile_source` in main.kai) invokes DOWNWARD, in this
 # order: positional records -> `var` rewrite -> `use Effect` ->
@@ -19,74 +11,55 @@
 # downward-only import: it calls into this module, this module never
 # calls back.
 #
-# What this module owns (six sub-sections, A-E of the brief; F left in
-# main, see below)
+# Sub-sections:
 #
-# - A. Positional-record sugar (issue #266): `Foo(a, b)` calls whose
-#   head names a record type are rewritten to `Foo { f1: a, f2: b }`
-#   record literals against the record table (`[RecInfo]`). Entry:
+# - A. Positional-record sugar: `Foo(a, b)` calls whose head names a
+#   record type are rewritten to `Foo { f1: a, f2: b }` record
+#   literals against the record table (`[RecInfo]`). Entry:
 #   `desugar_pos_records_decls`. The `dpr_*` walkers recurse the AST.
-# - B. The `var` rewriter (m7b #5b) + the lowering helpers that ride
-#   alongside it: `desugar_var_decls` (var -> Ref-cell), axiom
-#   lowering (`lower_axioms` / `lower_axiom_one`), refinement pred-fn
-#   synthesis (`synthesize_refine_pred_fns`), pattern-narrow lowering
+# - B. The `var` rewriter + the lowering helpers that ride alongside
+#   it: `desugar_var_decls` (var -> Ref-cell), axiom lowering
+#   (`lower_axioms` / `lower_axiom_one`), refinement pred-fn synthesis
+#   (`synthesize_refine_pred_fns`), pattern-narrow lowering
 #   (`lower_pattern_narrow_decls`), and contract-predicate validation
 #   (`validate_contract_predicates_decls`). Consts are NOT lowered —
 #   `DConst` survives intact as a value through the whole pipeline.
-# - C. `use Effect` desugar (m7e §25): strip file-level `use` decls
-#   and rewrite bare op references in their scope to qualified
-#   `Eff.op` calls. Entry: `desugar_use_decls`.
-# - D. Cap-binding nursery rewrite (m7b #4, issue #71(b) prereq):
-#   `nursery { n -> body }` strips the cap param and rewrites
-#   `n.<op>` to `Spawn.<op>`, minting a fresh BrandId per scope.
-#   Entry: `rewrite_nursery_caps_decls`; produces the brand registry.
-# - E. Brand-mismatch check (issue #71(b)): walks fn bodies with a
-#   brand-attribution environment and rejects sibling-nursery cap
-#   confusion at consume sites. Entry:
-#   `check_nursery_brand_mismatch_decls`. Consumes the registry D
-#   produces, so the driver must run D before E.
+# - C. `use Effect` desugar: strip file-level `use` decls and rewrite
+#   bare op references in their scope to qualified `Eff.op` calls.
+#   Entry: `desugar_use_decls`.
+# - D. Cap-binding nursery rewrite: `nursery { n -> body }` strips the
+#   cap param and rewrites `n.<op>` to `Spawn.<op>`, minting a fresh
+#   BrandId per scope. Entry: `rewrite_nursery_caps_decls`; produces
+#   the brand registry.
+# - E. Brand-mismatch check: walks fn bodies with a brand-attribution
+#   environment and rejects sibling-nursery cap confusion at consume
+#   sites. Entry: `check_nursery_brand_mismatch_decls`. Consumes the
+#   registry D produces, so the driver must run D before E.
 #
-# Sub-section F (m12.8.x phase 2 string-interpolation lift) STAYS in
-# main.kai. It depends on the emit-aware interp scanner
-# (`iscan_collect` -> `raw_lit_for_c` -> `escape_str_body_for_c`,
-# the C-literal escaper), so the `IpLit` parts it consumes carry a
-# precomputed escaped-for-C field that only the emit layer produces.
-# Lifting F would drag the emit layer into desugar; it extracts
-# cleanly only once a shared scanner/string-lift layer exists. The
-# scanner is also used by emit (`emit_interp_parts`), reinforcing that
-# it is a transverse service, not a desugar sub-pass.
+# The string-interpolation lift STAYS in main.kai: it depends on the
+# emit-aware interp scanner (`iscan_collect` -> `raw_lit_for_c` ->
+# `escape_str_body_for_c`, the C-literal escaper), so the `IpLit`
+# parts it consumes carry a precomputed escaped-for-C field that only
+# the emit layer produces. The scanner is a transverse service shared
+# with emit (`emit_interp_parts`), not a desugar sub-pass.
 #
-# Shared types promoted to compiler.ast: `RecInfo` (the record table
+# Shared types live in compiler.ast: `RecInfo` (the record table
 # entry, ctor `RI`) plus its pure lookups (`rec_find` /
-# `rec_find_with_field` / `collect_records`) moved to ast.kai under
-# the shared-AST-adjacent-types rule. The positional-record sugar
-# consumes `[RecInfo]` in 16 signatures NOW; the typer consumes it 49x
-# (the record table threaded through inference) and the future infer
-# lane will too. ast.kai is the only home both can import without a
-# lateral arrow.
+# `rec_find_with_field` / `collect_records`), the only home both this
+# pass and the typer can import without a lateral arrow.
 #
 # Local mirrors (downward-glue rule): the passes call AST-generic
-# helpers and trivial string/tag helpers that live in main.kai and are
-# used ubiquitously there (the `map_*` AST functor family, 25 callers;
-# `pat_bindings`, 19; the `rename_*` binder walkers; `string_starts_
-# with_q`, 7; the `ffi_extern_tag` / `ffi_extern_tag_prefix` string
-# constants the FFI-shim emitter also reads). Rather than `pub`-export
-# them upward (inverting the arrow), they are mirrored locally with a
-# `dsg_` prefix so the flat bundle does not mint duplicate C symbols
-# against main's copies. The `ffi_extern_tag` mirror is a string
-# literal constant ("__kai_ffi__") — the contract between the axiom
-# lowering (producer, here) and the FFI-shim emitter (consumer, main);
-# the mirror cannot diverge because both spell the same literal.
-#
-# Public surface (18): the pass entry points the driver invokes
-# (`desugar_pos_records_decls`, `desugar_var_decls`,
-# `validate_var_uses_decls`, `desugar_use_decls`,
-# `synthesize_refine_pred_fns`, `collect_refine_alias_names`,
-# `lower_pattern_narrow_decls`,
-# `validate_contract_predicates_decls`, `rewrite_nursery_caps_decls`,
-# `check_nursery_brand_mismatch_decls`, `dump_brands`, `lower_axioms`)
-# plus `lower_axiom_one` which the module-origin tagging in main
-# (`tag_decl_module_origin`) invokes.
+# helpers and trivial string/tag helpers that live in main.kai (the
+# `map_*` AST functor family, `pat_bindings`, the `rename_*` binder
+# walkers, `string_starts_with_q`, the `ffi_extern_tag` /
+# `ffi_extern_tag_prefix` string constants the FFI-shim emitter also
+# reads). Rather than `pub`-export them upward (inverting the arrow),
+# they are mirrored locally with a `dsg_` prefix so the flat bundle
+# does not mint duplicate C symbols against main's copies. The
+# `ffi_extern_tag` mirror is a string literal constant ("__kai_ffi__")
+# — the contract between the axiom lowering (producer, here) and the
+# FFI-shim emitter (consumer, main); the mirror cannot diverge because
+# both spell the same literal.
 
 import compiler.util
 import compiler.diag
@@ -124,10 +97,10 @@ fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     # visitor traverses). Same shape as EHole/ETodo for the
     # purposes of the structural recursion.
     EVariantsOf(_, _) -> k
-    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
-    # (both fields are plain Strings), so `f` has nothing to apply.
+    # Qualified module call carries no sub-Exprs (both fields are
+    # plain Strings), so `f` has nothing to apply.
     EModCall(_, _) -> k
-    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
+    # Intrinsic args ARE sub-Exprs, so the visitor recurs.
     EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
@@ -171,7 +144,7 @@ fn dsg_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
     SExprStmt(x)                -> SExprStmt(f(x))
     SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
     SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
-    # m7e §25: SUse has no sub-expression — pass through unchanged.
+    # SUse has no sub-expression — pass through unchanged.
     SUse(n, l, c)               -> SUse(n, l, c)
   }
 }
@@ -239,8 +212,7 @@ fn dsg_pat_bindings(pat: Pattern, acc: [String]) : [String] {
 # the let's RHS is `MUnboxed`, the binding is a raw C scalar and
 # must NOT enter the Perceus tracking scope. All other shapes —
 # destructured lets, wildcards, literals — defer to the standard
-# `dsg_pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
-# (boundary tactic) for the coordination contract.
+# `dsg_pat_bindings` walker.
 
 fn dsg_pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
   match ps {
@@ -325,7 +297,7 @@ fn dsg_ffi_extern_tag_prefix() : String = "__kai_ffi__:"
 # Desugar passes (sub-sections A-E)
 # ====================================================================
 
-# issue #266 — positional record construction sugar
+# Positional record construction sugar
 # ====================================================================
 #
 # `T { v1, v2 }` desugars to `T { f1: v1, f2: v2 }` using `T`'s
@@ -345,7 +317,7 @@ fn dsg_ffi_extern_tag_prefix() : String = "__kai_ffi__:"
 #[doc("Result of the positional-record desugar over a decl stream: the rewritten decls plus an error count.")]
 pub type DPRDecls = { decls: [Decl], errs: Int }
 
-#[doc("Issue #266 positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes.")]
+#[doc("Positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes.")]
 pub fn desugar_pos_records_decls(ds: [Decl], file: String) : DPRDecls / Console + File {
 
   let recs = collect_records(ds)
@@ -514,7 +486,7 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
 
   match k {
     # The interesting case: rewrite positional record literals using
-    # the record's declared field order. issue #326 also intercepts
+    # the record's declared field order. This also intercepts
     # the `...src, x: 10, ...` spread sugar here — a spread literal
     # is rewritten into `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`
     # so the expanded record-lit lands in the existing emit path.
@@ -741,7 +713,7 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
   }
 }
 
-# issue #326 — expand `T { ...src, x: 10, y: 20 }` into a let-block:
+# Expand `T { ...src, x: 10, y: 20 }` into a let-block:
 #
 #     {
 #       let __spread_src_<line>_<col>__ = src
@@ -773,8 +745,8 @@ fn dpr_record_spread(
     [] -> DPRSpread { expr: mk_expr(ERecordLit(name, fis), line, col), errs: errs }
     [head, ...overrides] -> match head {
       FI(_marker, src) -> {
-        # Issue #648 — probe by the first override's field name to
-        # disambiguate same-(name, arity) record collisions. Falls
+        # Probe by the first override's field name to disambiguate
+        # same-(name, arity) record collisions. Falls
         # back to bare lookup when no overrides accompany the spread
         # (rare).
         let probe = match overrides {
@@ -944,11 +916,10 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 }
 
 # ====================================================================
-# m7b #5b: pre-resolve desugar of `var name [: T] = init`
+# Pre-resolve desugar of `var name [: T] = init`
 # ====================================================================
 #
-# Doc B §`State[T]` *Syntax note* and Doc C §m7b #5 mandate this
-# lowering: a block
+# A block
 #
 #   { stmt0; ...; var name [: T] = init; rest_stmts; tail_expr }
 #
@@ -960,10 +931,10 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 #       return(x)      -> x
 #     } }
 #
-# Doc B locality: the `with` consumes `State[T]` inside the function,
-# so the function's effect row is unchanged (no `+ State[T]` leaking
-# out). When `T` is omitted, synth_handle infers it from the init's
-# inferred type — see the `eff_tyargs == []` fallback in synth_handle.
+# Locality: the `with` consumes `State[T]` inside the function, so the
+# function's effect row is unchanged (no `+ State[T]` leaking out).
+# When `T` is omitted, synth_handle infers it from the init's inferred
+# type — see the `eff_tyargs == []` fallback in synth_handle.
 #
 # Nested `var`s nest handlers, innermost first: the recursion finds
 # the head SVar in each block, wraps everything that follows it under
@@ -971,17 +942,16 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 # a second `var` inside the rest produces a second handler nested
 # inside the first.
 
-# m12.7: rewrite every `axiom name(params) : T / row` into a regular
+# Rewrite every `axiom name(params) : T / row` into a regular
 # `fn name(params) : T / row = todo!("axiom <name> not bound")`. The
-# `todo!` (m7d §1) body inherits "any type fits" inference and a
-# runtime `kai_prelude_panic`, matching the §4 spec ("by default,
-# calling an axiom at runtime aborts via `kai_prelude_panic`"). The
-# typer / monomorphiser / emitter therefore see only ordinary fns
+# `todo!` body inherits "any type fits" inference and a runtime
+# `kai_prelude_panic`, so calling an unbound axiom at runtime aborts.
+# The typer / monomorphiser / emitter therefore see only ordinary fns
 # and need no DAxiom-specific handling.
-#[doc("m12.7: rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function.")]
+#[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function.")]
 pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
-# §29 v3 — const references in MATCH PATTERNS. A bare uppercase const
+# Const references in MATCH PATTERNS. A bare uppercase const
 # name in pattern position parses as `PVariant(NAME, [])` (lex-time
 # uppercase rule); a lowercase one as `PBind(name)`. Neither is a real
 # constructor / binder when the name is a declared const — it means
@@ -995,7 +965,7 @@ pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 # no rewrite (a const IS a value, so `EVar(NAME)` resolves directly in
 # the typer + emit). Pattern position is the lone case the surface
 # syntax makes ambiguous, so it gets this targeted pass.
-#[doc("§29 v3: rewrite const names used in match patterns into an equality-guard arm.")]
+#[doc("Rewrite const names used in match patterns into an equality-guard arm.")]
 pub fn desugar_const_patterns_decls(decls: [Decl]) : [Decl] {
   let names = const_pat_names(decls, [])
   match names {
@@ -1094,18 +1064,18 @@ fn dcp_arm_eq_or_pass(pat: Pattern, name: String, opt_g: Option[Expr],
 pub fn lower_axiom_one(d: Decl) : Decl {
   match d {
     DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, l, c) -> {
-      # m12.7.x FFI v1: an `extern "C" fn` (or legacy `[<extern_c>]`
-      # axiom) lowers to a DFn whose body is a magic `ETodo` whose
-      # message tags it as an FFI shim. The C / LLVM `emit_fn_body`
-      # paths detect the tag and synthesise a real `extern "C"`
-      # call instead of the default `kai_prelude_panic` body.
-      # Typer-side `ETodo` still type-checks as "any type fits", so
-      # the FFI shim's typed signature is what flows into call sites.
+      # An `extern "C" fn` (or legacy `[<extern_c>]` axiom) lowers to a
+      # DFn whose body is a magic `ETodo` whose message tags it as an
+      # FFI shim. The C / LLVM `emit_fn_body` paths detect the tag and
+      # synthesise a real `extern "C"` call instead of the default
+      # `kai_prelude_panic` body. Typer-side `ETodo` still type-checks
+      # as "any type fits", so the FFI shim's typed signature is what
+      # flows into call sites.
       #
-      # Issue #261: when `c_sym_over` is non-empty, encode it inside
-      # the magic tag (`__kai_ffi__:<override>`) so the C / LLVM
-      # emitters can read it back when synthesising the call site
-      # without a second AST field carrying the override.
+      # When `c_sym_over` is non-empty, encode it inside the magic tag
+      # (`__kai_ffi__:<override>`) so the C / LLVM emitters can read it
+      # back when synthesising the call site without a second AST field
+      # carrying the override.
       let msg =
         if extern_c {
           if string_length(c_sym_over) > 0 {
@@ -1121,23 +1091,23 @@ pub fn lower_axiom_one(d: Decl) : Decl {
 }
 
 
-# m12.6.x #3 v2: synthesise a refinement-predicate fn for every
-# `type X = Base where pred` alias. The fn is named
-# `__ref_pred_X(self: Base) : Bool` and carries the same predicate
-# expression the user wrote. It has an empty effect row, so the
-# contract-predicate validator admits calls to it (purity is read off
-# the row). parse_optional_arm_refine references this name when
-# it sees `match { p : X -> ... }`; the resolver later binds the
-# call to this synthesised fn.
-# Issue #597 boundary tagging: thread `target_mod` so each synthesised
+# Synthesise a refinement-predicate fn for every `type X = Base where
+# pred` alias. The fn is named `__ref_pred_X(self: Base) : Bool` and
+# carries the same predicate expression the user wrote. It has an
+# empty effect row, so the contract-predicate validator admits calls
+# to it (purity is read off the row). parse_optional_arm_refine
+# references this name when it sees `match { p : X -> ... }`; the
+# resolver later binds the call to this synthesised fn.
+#
+# Boundary tagging: thread `target_mod` so each synthesised
 # `__ref_pred_X` inherits the home module of the originating `DType`.
 # `DType` carries no `module_origin` field of its own, so the home is
 # recovered by streaming through `decl_home_hint_reset` (same algorithm
 # `validate_pub_access` uses for non-DFn decls). A refinement alias
-# declared in `stdlib/foo.kai` now produces `__ref_pred_X` tagged with
+# declared in `stdlib/foo.kai` produces `__ref_pred_X` tagged with
 # `mo = Some("foo")` instead of mixing into the root file's untagged
-# decl set; root-file refinements still produce `mo = None`.
-#[doc("m12.6 refinements: synthesise the predicate fn backing each `type T = base where pred` refinement alias.")]
+# decl set; root-file refinements produce `mo = None`.
+#[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias.")]
 pub fn synthesize_refine_pred_fns(decls: [Decl], target_mod: String) : [Decl] =
   synth_refine_loop(decls, target_mod, target_mod, [])
 
@@ -1166,10 +1136,10 @@ fn synth_refine_for_decl(d: Decl, parent_mo: Option[String]) : [Decl] {
       }
       _ -> []
     }
-    # Issue #602: synthesise the `__ref_pred_X` fn for a refinement
-    # alias even when it is wrapped in the transparent `#[unstable]`
-    # node — otherwise the narrow guard references a fn that was never
-    # emitted ("cannot find `__ref_pred_X`").
+    # Synthesise the `__ref_pred_X` fn for a refinement alias even when
+    # it is wrapped in the transparent `#[unstable]` node — otherwise
+    # the narrow guard references a fn that was never emitted ("cannot
+    # find `__ref_pred_X`").
     DUnstable(inner, _, _) -> synth_refine_for_decl(inner, parent_mo)
     _ -> []
   }
@@ -1187,9 +1157,9 @@ fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
        REmpty, pred, l, c, mo)
 }
 
-# issue #187 phase 3: lower `PNarrow(name, TyName(t, []))` whose
-# `t` is a refinement-type alias (m12.6.x) back into the legacy
-# shape `PBind(name) + guard __ref_pred_t(name)`. The parser emits
+# Lower `PNarrow(name, TyName(t, []))` whose `t` is a refinement-type
+# alias back into the shape `PBind(name) + guard __ref_pred_t(name)`.
+# The parser emits
 # `PNarrow` uniformly because at parse time we can't tell whether
 # `t` names a refinement alias or a union-component nominal type;
 # this pass disambiguates after `synthesize_refine_pred_fns` has
@@ -1210,8 +1180,8 @@ fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
         }
         _ -> collect_refine_alias_loop(rest, acc)
       }
-      # Issue #602: a `#[unstable] pub type Pos = Int where ...` carries
-      # its refinement alias inside the transparent wrapper. Recurse into
+      # A `#[unstable] pub type Pos = Int where ...` carries its
+      # refinement alias inside the transparent wrapper. Recurse into
       # the inner decl so `Pos` is registered as a refine-alias name; the
       # companion `lower_narrow_decl` then lowers `p : Pos` patterns.
       DUnstable(inner, _, _) -> collect_refine_alias_loop([inner, ...rest], acc)
@@ -1220,7 +1190,7 @@ fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
   }
 }
 
-#[doc("m12.6 refinements: lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn.")]
+#[doc("Lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn.")]
 pub fn lower_pattern_narrow_decls(decls: [Decl], aliases: [String]) : [Decl] =
   map(decls, (d) => lower_narrow_decl(d, aliases))
 
@@ -1231,7 +1201,7 @@ fn lower_narrow_decl(d: Decl, aliases: [String]) : Decl {
     DTest(desc, body, l, c) -> DTest(desc, lower_narrow_expr(body, aliases), l, c)
     DBench(desc, body, l, c) -> DBench(desc, lower_narrow_expr(body, aliases), l, c)
     DCheck(desc, params, body, l, c) -> DCheck(desc, params, lower_narrow_expr(body, aliases), l, c)
-    # Issue #602: see through the transparent `#[unstable]` wrapper so a
+    # See through the transparent `#[unstable]` wrapper so a
     # `p : RefineAlias` narrow inside an unstable fn body still lowers to
     # a binder + predicate guard instead of reaching the typer as a raw
     # `PNarrow` ("requires a union scrutinee").
@@ -1266,7 +1236,7 @@ fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
         PNarrow(name, ty) -> match ty.tkind {
           TyName(tyname, []) ->
             if list_has(aliases, tyname) {
-              # Restore the m12.6.x shape: bind + synthesised pred call.
+              # Restore the bind + synthesised pred call shape.
               let var_e = mk_expr(EVar(name), pat.line, pat.col)
               let pred_fn = mk_expr(EVar(synth_refine_pred_fn_name(tyname)),
                                      pat.line, pat.col)
@@ -1293,7 +1263,7 @@ fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
 # `"ensures violated at ..."`) and runs find_impure_call on each
 # cond using `closed_pure_names ++ user_pure_names`. Returns the
 # error count; the driver folds it into the program's exit code.
-#[doc("m12.6 contracts: reject `requires`/`ensures` predicates that call effectful functions; returns the error count.")]
+#[doc("Reject `requires`/`ensures` predicates that call effectful functions; returns the error count.")]
 pub fn validate_contract_predicates_decls(decls: [Decl],
                                        file: String) : Int / Console {
 
@@ -1441,7 +1411,7 @@ fn contract_assert_kind(opt_msg: Option[Expr]) : Option[String] {
   }
 }
 
-#[doc("m7b #5b: pre-resolve desugar of `var name [: T] = init` into a Ref-cell let plus get/set rewrites; the per-program entry point.")]
+#[doc("Pre-resolve desugar of `var name [: T] = init` into a Ref-cell let plus get/set rewrites; the per-program entry point.")]
 pub fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
 
 fn desugar_var_decl(d: Decl) : Decl {
@@ -1451,8 +1421,8 @@ fn desugar_var_decl(d: Decl) : Decl {
     DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
     DBench(desc, body, l, c) -> DBench(desc, desugar_var_expr(body), l, c)
     DCheck(desc, params, body, l, c) -> DCheck(desc, params, desugar_var_expr(body), l, c)
-    # Issue #602: `#[unstable]` wraps a `pub fn`; the wrapper is
-    # transparent, so recurse into the inner decl and rewrap. Without
+    # `#[unstable]` wraps a `pub fn`; the wrapper is transparent, so
+    # recurse into the inner decl and rewrap. Without
     # this, a `var` in an unstable fn body never lowers to State and the
     # `.get`/`.set` receiver fails to resolve.
     DUnstable(inner, l, c) -> DUnstable(desugar_var_decl(inner), l, c)
@@ -1475,7 +1445,7 @@ fn desugar_var_decl(d: Decl) : Decl {
 # Scope rules: SLet, lambda params, match arm patterns, fn params,
 # nested SVar with the same name, and handler `as` aliases all shadow
 # a `var` binder. Bare reads under those scopes are NOT flagged.
-#[doc("m7b #5b: reject `var` rebinds that escape their defining scope before the rewrite runs; returns the error count.")]
+#[doc("Reject `var` rebinds that escape their defining scope before the rewrite runs; returns the error count.")]
 pub fn validate_var_uses_decls(ds: [Decl], file: String) : Int / Console + File {
 
   validate_var_decls_loop(ds, file, 0)
@@ -1803,13 +1773,13 @@ fn desugar_var_stmt(s: Stmt) : Stmt {
     # input).
     SVar(n, _, rhs, _, _) -> SLet(mk_pat(PBind(n), 0, 0), None,
                                    desugar_var_expr(rhs))
-    # m7e §25: SUse pass through.
+    # SUse pass through.
     SUse(n, l, c) -> SUse(n, l, c)
   }
 }
 
 # Build the canonical `with State[?T](init) as name { ... }` clauses
-# Doc B §`State[T]` *Syntax note* prescribes for a `var` lowering.
+# for a `var` lowering.
 #
 # `state` in the clause body is an alias of the C-level `self->state`
 # pointer. Returning it bare via `resume(state)` makes the caller the
@@ -1843,14 +1813,13 @@ fn var_canonical_return(line: Int, col: Int) : HReturn {
   HR("x", mk_expr(EVar("x"), line, col), line, col)
 }
 
-# m7b #16 — variable specialisation. Doc B §`State[T]` *Performance*
-# promised that a `var x = init; @x; x := v` block compiles to a
-# stack slot, not a chain of handler invocations. The specialised
+# Variable specialisation: a `var x = init; @x; x := v` block compiles
+# to a stack slot, not a chain of handler invocations. The specialised
 # form replaces the canonical `with State[T] as x` handler with:
 #   let x_slot = array_make(1, init)
 #   { rest_with_n.get() → array_get(x_slot, 0)
 #         and n.set(v)   → { let _ = array_set(x_slot, 0, v); () } }
-# Trigger conditions per Doc C §*Variable specialisation*:
+# Trigger conditions:
 #   1. canonical handler shape (always true — emitted by us);
 #   2. no multi-shot resume (always true — canonical clauses);
 #   3. `name` only appears as `name.get()` / `name.set(v)` callee
@@ -1893,8 +1862,8 @@ fn init_args_safe(es: [Expr]) : Bool {
   }
 }
 
-# Issue #672: scan a string-literal source span (quotes included) for a
-# `@name` cap-read inside any `#{...}` interpolation region. The interp
+# Scan a string-literal source span (quotes included) for a `@name`
+# cap-read inside any `#{...}` interpolation region. The interp
 # body is not parsed at this pre-resolve stage, so the structural escape
 # walk cannot see the `@name` that `desugar_interp_decls` will later lift
 # into `name.get()`. A pure lexical scan over the interp regions is
@@ -2006,8 +1975,8 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EReal(_, _) -> false
     EBool(_) -> false
     EChar(_) -> false
-    # Issue #672: a `@name` cap-read hidden inside a `#{...}`
-    # interpolation is invisible to the structural walk (the interp
+    # A `@name` cap-read hidden inside a `#{...}` interpolation is
+    # invisible to the structural walk (the interp
     # body is still a raw source span at this pre-resolve stage).
     # Treating it as an escape forces the canonical `State[T] as name`
     # handler, which keeps `name` in scope when `desugar_interp_decls`
@@ -2053,11 +2022,11 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
     EBang(inner) -> body_escapes(name, inner)
     ELitUnit(inner, _) -> body_escapes(name, inner)
-    # m7e §11: `variants[T]()` has no value-level sub-expressions —
+    # `variants[T]()` has no value-level sub-expressions —
     # nothing can mention `name` inside it.
     EVariantsOf(_, _) -> false
-    # m6.2 Phase 2.1: qualified module call mentions a module name and
-    # a function name as plain strings, never the local `name`.
+    # Qualified module call mentions a module name and a function name
+    # as plain strings, never the local `name`.
     EModCall(_, _) -> false
     EIntrinsic(_, args_) -> args_escape(name, args_)
   }
@@ -2092,7 +2061,7 @@ fn stmt_escapes(name: String, s: Stmt) : Bool {
     SIndexAssign(b, i, v, _, _) ->
       body_escapes(name, b) or body_escapes(name, i) or body_escapes(name, v)
     SVar(_, _, rhs, _, _) -> body_escapes(name, rhs)
-    # m7e §25: SUse has no expr — name cannot escape through it.
+    # SUse has no expr — name cannot escape through it.
     SUse(_, _, _) -> false
   }
 }
@@ -2172,7 +2141,7 @@ fn contains_var(name: String, e: Expr) : Bool {
     EFilterPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
     EBang(inner) -> contains_var(name, inner)
-    # Issue #672: a `@name` read inside a `#{...}` interpolation counts
+    # A `@name` read inside a `#{...}` interpolation counts
     # as a mention for the conservative lambda-capture check, the same
     # as it does for `body_escapes`.
     EStr(span, is_triple) -> interp_span_reads_cap(span, is_triple, name)
@@ -2206,7 +2175,7 @@ fn stmt_contains(name: String, s: Stmt) : Bool {
     SIndexAssign(b, i, v, _, _) ->
       contains_var(name, b) or contains_var(name, i) or contains_var(name, v)
     SVar(_, _, rhs, _, _) -> contains_var(name, rhs)
-    # m7e §25: SUse has no expression — never contains a value-level name.
+    # SUse has no expression — never contains a value-level name.
     SUse(_, _, _) -> false
   }
 }
@@ -2325,7 +2294,7 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
         let init_d = desugar_var_expr(init)
         let inner_kind = desugar_var_block(rest, tail)
         let inner_expr = mk_expr(inner_kind, line, col)
-        # m7b #16 — try variable specialisation first. When all
+        # Try variable specialisation first. When all
         # trigger conditions hold, lower the var to a 1-element
         # array slot (prelude `array_*`, no `Mutable` row) instead
         # of the canonical State[T] handler. The conditions:
@@ -2379,7 +2348,7 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 }
 
 # ====================================================================
-# m7e §25 — `use Effect` desugar
+# `use Effect` desugar
 # ====================================================================
 #
 # `use Effect` opens an effect's ops for bare-name resolution. After
@@ -2459,8 +2428,8 @@ fn use_eff_lookup(table: [EffOps], target: String) : Option[[String]] {
   }
 }
 
-# m7e §25: collect file-level DUse names; everything else passes
-# through. Returns (file_opens, decls_without_DUse).
+# Collect file-level DUse names; everything else passes through.
+# Returns (file_opens, decls_without_DUse).
 type UseSplit = { file_opens: [String], decls: [Decl] }
 
 fn use_split_decls(decls: [Decl], opens: [String], acc: [Decl]) : UseSplit {
@@ -2606,8 +2575,8 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     EHole(_)       -> UseKindAcc { kind: k, acc: acc }
     ETodo(_)       -> UseKindAcc { kind: k, acc: acc }
     EVariantsOf(_, _) -> UseKindAcc { kind: k, acc: acc }
-    # m6.2 Phase 2.1: qualified module call has no sub-Exprs to
-    # recurse into and binds no names — pass through unchanged.
+    # Qualified module call has no sub-Exprs to recurse into and binds
+    # no names — pass through unchanged.
     EModCall(_, _) -> UseKindAcc { kind: k, acc: acc }
     EIntrinsic(name, args_) -> {
       let ra = use_rewrite_exprs(args_, table, opens, bound, file, acc.errs, [])
@@ -2922,7 +2891,7 @@ fn use_alias_bound(alias: Option[String], bound: [String]) : [String] {
 #[doc("Result of the `use Effect` desugar: the rewritten decls plus an error count.")]
 pub type UseRwProgram = { decls: [Decl], errs: Int }
 
-#[doc("m7e §25: strip file-level `use Effect` decls and rewrite bare op references inside their scope to qualified `Eff.op` calls.")]
+#[doc("Strip file-level `use Effect` decls and rewrite bare op references inside their scope to qualified `Eff.op` calls.")]
 pub fn desugar_use_decls(decls: [Decl], file: String) : UseRwProgram / Console + File {
 
 
@@ -3019,15 +2988,13 @@ fn use_rewrite_decls(decls: [Decl], table: [EffOps], file_opens: [String],
 }
 
 # ====================================================================
-# Cap-binding nursery rewrite (issue #71 option (b) prerequisite, m7b #4)
+# Cap-binding nursery rewrite
 # ====================================================================
 #
 # `nursery { n -> ... n.spawn(task) ... n.await(f) ... }` is the
-# canonical form pinned in `docs/structured-concurrency.md` §*Type
-# system* and `docs/syntax-sugars.md` §1. The previous surface
-# `nursery { ... spawn.spawn(task) ... }` had no cap binder, which
-# meant a per-nursery brand had nowhere to attach (PR #74 deferred
-# section). This pass turns the cap-binding form into the runtime-
+# canonical form. The bare surface `nursery { ... spawn.spawn(task)
+# ... }` has no cap binder, so a per-nursery brand has nowhere to
+# attach. This pass turns the cap-binding form into the runtime-
 # equivalent `nursery { ... Spawn.spawn(task) ... Spawn.await(f) ... }`
 # the typer already accepts:
 #
@@ -3064,14 +3031,14 @@ pub type BrandRec = BR(Int, String, String, Int, Int)
 
 # Per-call attribution: every `n.<op>(args)` rewritten by this pass
 # records its (file, line, col, brand_id, op_name) so the post-rewrite
-# brand-mismatch check (issue #71 option (b)) can tell which scope
-# each call belongs to. The same registry feeds `--dump-brands`.
+# brand-mismatch check can tell which scope each call belongs to. The
+# same registry feeds `--dump-brands`.
 #[doc("A recorded nursery-cap consume site (file, line, col, brand id, op name) for brand-mismatch checking.")]
 pub type BrandCall = BC(String, Int, Int, Int, String)
 
-# Set of Spawn ops legal on a NurseryCap. Mirrors `builtin_spawn_decl`
-# in this file. Update both lists in lockstep when a new Spawn op
-# lands.
+# Set of Spawn ops legal on a NurseryCap. Mirrors the `Spawn` effect
+# in stdlib/effects/concurrent.kai. Update both lists in lockstep when
+# a new Spawn op lands.
 fn nursery_cap_op_names() : [String] =
   ["spawn", "await", "select", "cancel", "yield", "set_trap_exit", "cancel_all"]
 
@@ -3159,7 +3126,7 @@ fn bw_record_call(bw: BrandWalk, file: String, line: Int, col: Int,
 #[doc("Result of the cap-binding nursery rewrite: the rewritten decls plus the brand registry and recorded call sites.")]
 pub type NurseryRwProgram = { decls: [Decl], brands: [BrandRec], calls: [BrandCall] }
 
-#[doc("m7b #4 / issue #71(b): expand `nursery { n -> body }` by stripping the cap param and rewriting `n.<op>` to `Spawn.<op>`, minting one BrandId per scope.")]
+#[doc("Expand `nursery { n -> body }` by stripping the cap param and rewriting `n.<op>` to `Spawn.<op>`, minting one BrandId per scope.")]
 pub fn rewrite_nursery_caps_decls(decls: [Decl], file: String) : NurseryRwProgram {
   let bw0 = BrandWalk { bnext: 0, registry: [], calls: [] }
   let res = rewrite_nursery_caps_loop(decls, file, bw0, [])
@@ -3629,7 +3596,7 @@ fn split_last_loop(args_: [Expr], acc: [Expr]) : SplitLast {
 }
 
 # ====================================================================
-# Brand-mismatch check (issue #71 option (b))
+# Brand-mismatch check
 # ====================================================================
 #
 # The cap-binding rewrite above tags every `n.<op>(args)` it
@@ -3645,28 +3612,19 @@ fn split_last_loop(args_: [Expr], acc: [Expr]) : SplitLast {
 #   - At each rewritten `Spawn.await(arg)` / `Spawn.cancel(arg)` /
 #     `Spawn.select(args)`, the arg's brand attribution is checked
 #     against the call's own brand. A mismatch is a sibling-
-#     nursery brand violation (issue #71 option (b)). The
-#     diagnostic includes both brand IDs and where each was
-#     allocated (`nursery { n -> ... }`'s file:line:col), so the
-#     user can trace the breach.
+#     nursery brand violation. The diagnostic includes both brand IDs
+#     and where each was allocated (`nursery { n -> ... }`'s
+#     file:line:col), so the user can trace the breach.
 #
-# Limitations of this lane (documented in the PR body):
+# Limitations:
 #   - Brand propagation through generic helper fns
-#     (`fn id[T](x: T) : T = x`) is not yet wired through the
-#     typer's TyVarT instantiation; the brief's full
-#     TyBranded(Ty, BrandId) Ty extension would carry brands
-#     through unification automatically. Today the check sees
-#     direct let-chains (`let g = f`); a helper round-trip
-#     strips the brand.
-#   - Escape detection at the nursery boundary (returning a
-#     branded fiber as the body's value) is still served by the
-#     existing `check_no_fiber_escape` walker (PR #74's
-#     option (a) that catches Fiber/Pid in return types and sum
-#     payloads). The "brand outlives its scope" form requires the
-#     same TyBranded threading deferred above.
-#
-# Both gaps are tracked in `docs/fibers-honesty-targets.md`
-# §*Residual m8.x items* item 1.
+#     (`fn id[T](x: T) : T = x`) is not wired through the typer's
+#     TyVarT instantiation. The check sees direct let-chains
+#     (`let g = f`); a helper round-trip strips the brand.
+#   - Escape detection at the nursery boundary (returning a branded
+#     fiber as the body's value) is served by the `check_no_fiber_
+#     escape` walker, which catches Fiber/Pid in return types and sum
+#     payloads. The "brand outlives its scope" form is not covered.
 
 # Lookup: did this call get rewritten by the cap-binding pass?
 # Returns `Some((bid, op_name))` keyed on (file, line, col).
@@ -3748,8 +3706,7 @@ fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
 # Returns `Some(bid)` when the brand can be determined statically.
 # The `None` case is intentionally permissive — a fiber that lost
 # its brand through a non-let path (e.g., a list element retrieved
-# by index, a record field) is treated as unbranded for the v1 of
-# this check.
+# by index, a record field) is treated as unbranded.
 fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
   match e.kind {
     EVar(name) -> benv_lookup(env, name)
@@ -3823,7 +3780,7 @@ fn emit_brand_mismatch(file: String, line: Int, col: Int,
 }
 
 # Top-level entry — one error count for the whole program.
-#[doc("Issue #71(b): brand-mismatch validator over the post-rewrite AST; rejects sibling-nursery cap confusion at consume sites. Depends on the brand registry produced by rewrite_nursery_caps_decls.")]
+#[doc("Brand-mismatch validator over the post-rewrite AST; rejects sibling-nursery cap confusion at consume sites. Depends on the brand registry produced by rewrite_nursery_caps_decls.")]
 pub fn check_nursery_brand_mismatch_decls(ds: [Decl], file: String,
                                         calls: [BrandCall],
                                         brs: [BrandRec]) : Int / Console + File {

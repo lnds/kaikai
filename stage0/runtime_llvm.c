@@ -1366,8 +1366,8 @@ KaiValue *kaix_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
 KaiValue *kaix_default_env_args(void *self, KaiCont *k) {
     return kai_default_env_args(self, k);
 }
-KaiValue *kaix_default_env_var(void *self, KaiValue *name, KaiCont *k) {
-    return kai_default_env_var(self, name, k);
+KaiValue *kaix_default_env_get(void *self, KaiValue *name, KaiCont *k) {
+    return kai_default_env_get(self, name, k);
 }
 KaiValue *kaix_default_env_set_var(void *self, KaiValue *name, KaiValue *value, KaiCont *k) {
     return kai_default_env_set_var(self, name, value, k);
