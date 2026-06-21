@@ -591,11 +591,6 @@ postfix     ::= '.' field_name                         (* field / method / UFCS 
               | trailing_lambda                        (* paren-less call *)
               | trailing_lambda trailing_lambda
 field_name  ::= IDENT
-              | 'var' | 'and' | 'or' | 'not'
-              | 'test' | 'bench' | 'check'             (* keyword-as-field
-                                                        — keeps `bit.and`,
-                                                        `Env.var`, etc.
-                                                        parseable *)
 arg_list    ::= arg (',' arg)*
 arg         ::= expr
               | '_'                                    (* pipe placeholder
@@ -619,11 +614,10 @@ block_body  ::= (stmt stmt_sep)* expr?
 is no postfix `?`. See §1.4 *special tokens*. Integer `/` on `Int`
 operands truncates.
 
-A handful of keywords (`var`, `and`, `or`, `not`, `test`, `bench`,
-`check`) lex as keyword tokens but parse as identifiers when they
-appear *immediately after* `.` in a postfix chain — without this the
-prelude / stdlib could not export functions named after them
-(`bit.and`, `Env.var`, `bench.run`, …).
+Reserved words never appear as field names. A symbol that would
+otherwise collide with a keyword carries an underscore so it stays a
+plain identifier (the dotted bit ops spell `bit._and` / `bit._or` /
+`bit._not` / `bit._test`).
 
 #### Primary expressions
 

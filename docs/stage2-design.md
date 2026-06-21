@@ -535,8 +535,8 @@ in.
 13. **m13 — Property testing + bench + bit ops**: `check` and
     `bench` blocks, matching runners. Plus the bit-operations
     module per `proposed-extensions.md` §16: `stdlib/core/bit.kai`
-    with `bit.and` / `bit.or` / `bit.xor` / `bit.shl` / `bit.shr`
-    / `bit.ushr` / `bit.not` as **compiler intrinsics** (function
+    with `bit._and` / `bit._or` / `bit._xor` / `bit._shl` / `bit._shr`
+    / `bit._ushr` / `bit._not` as **compiler intrinsics** (function
     syntax at the surface, lowered directly to the backend op
     with zero call overhead). No new operators. Demand surfaced
     from `demos/9d9l/huffman` bit-packing and the planned `crypto`
@@ -556,19 +556,20 @@ in.
     `stage2/Makefile` `test-stdlib` asserts the lowering.
 
     **Dotted `bit.*` surface landed** as a follow-up chunk:
-    `bit.and(a, b)` / `bit.or(a, b)` / `bit.xor(a, b)` /
-    `bit.not(a)` / `bit.shl(a, n)` / `bit.shr(a, n)` /
-    `bit.ushr(a, n)` / `bit.count(a)` / `bit.test(a, n)` /
-    `bit.set(a, n)` / `bit.clear(a, n)` / `bit.toggle(a, n)` are
-    sugar for the flat-prefix names. `rqc_kind` rewrites
-    `EField(EVar("bit"), fname)` to `EVar("bit_" ++ fname)`
-    before the m14 ModuleEntry lookup, so the existing emit-time
-    intrinsic path handles the dotted form with byte-identical
-    C. Fixture `examples/stdlib/bits_dotted.kai`. The
-    `check` / `bench` blocks and the auxiliary `bit.*` helpers
+    `bit._and(a, b)` / `bit._or(a, b)` / `bit._xor(a, b)` /
+    `bit._not(a)` / `bit._shl(a, n)` / `bit._shr(a, n)` /
+    `bit._ushr(a, n)` / `bit._count(a)` / `bit._test(a, n)` /
+    `bit._set(a, n)` / `bit._clear(a, n)` / `bit._toggle(a, n)` are
+    sugar for the flat-prefix names — the leading underscore keeps
+    reserved words (`and`, `or`, `not`, `test`) off the field-name
+    surface. `rqc_kind` rewrites `EField(EVar("bit"), fname)` to
+    `EVar("bit" ++ fname)` before the m14 ModuleEntry lookup, so the
+    existing emit-time intrinsic path handles the dotted form with
+    byte-identical C. Fixture `examples/stdlib/bits_dotted.kai`. The
+    `check` / `bench` blocks and the auxiliary `bit._*` helpers
     (`leading_zeros`, `trailing_zeros`, `rotate_left`,
-    `rotate_right`, plus the ergonomic alias `bit.popcount` for
-    `bit.count`) remain open for a future m13 chunk.
+    `rotate_right`, plus the ergonomic alias `bit._popcount` for
+    `bit._count`) remain open for a future m13 chunk.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
     module-organised under `stdlib/core/{list,string,option,result,
     char,tuple,ordering}.kai` per `docs/stdlib-layout.md`. The
