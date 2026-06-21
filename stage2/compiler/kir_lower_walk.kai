@@ -1066,6 +1066,21 @@ fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) 
 # fixed — it is not the drop binder and a reuse arm has no exit drop.
 fn scr_drop_name(join: String) : String = cat2(join, "$sd")
 
+# True iff `x` is a match whose scrutinee is a reuse donor — any arm body holds
+# a `__perceus_reuse_*` call (`arm_body_uses_reuse`). Such a match keeps the
+# scrutinee dup in `match_preamble` (the native reuse path under-increfs shared
+# donors; the dup masks the UAF). Every other match consumes the scrutinee
+# linearly and binds the exit-drop binder bare, matching the C oracle.
+fn match_owns_reuse_arm(x: Expr) : Bool = match x.kind {
+  EMatch(_, arms) -> arm_reuse_arms_any(arms)
+  _               -> false
+}
+
+fn arm_reuse_arms_any(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] -> if arm_body_uses_reuse(b) { true } else { arm_reuse_arms_any(rest) }
+}
+
 fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
   match ls_fresh_reg(st) { LSReg(join, st1) -> {
     let sd = scr_drop_name(join)
@@ -1078,18 +1093,24 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
     # occur and no explicit restore is needed. Only an owned match has an exit
     # drop; a borrowed match leaves `mscr` as the enclosing one.
     let st_pub = if owned { ls_set_mscr(st_alias, sd) } else { st_alias }
-    # The exit-drop binder is a DUP of the scrutinee, not a bare alias — exactly
-    # the C oracle's `_scr = kai_internal_dup(<scrv>)` (emit_c.kai:4703). The
-    # match's exit drop then frees THIS dup, leaving the original `scrv`
-    # untouched for its own owner to reclaim. Without the dup, a match whose
-    # scrutinee is a live binder (a NESTED match over an arm alias binder, e.g.
-    # `rotate`'s `match lr`) would free the binder via `$sd` AND again via the
-    # arm's cleanup `drop lr` — the double-free that crashed `gap3`/rb-tree
-    # rotations. For a fresh-value scrutinee (the non-nested case) the dup+drop
-    # is net-zero over a value that is discarded anyway, matching the oracle.
-    let st_scr = if owned {
+    # Exit-drop binder. The C oracle consumes the scrutinee LINEARLY — `_scr = sc`
+    # (no dup), one match-exit decref — and a live-binder scrutinee already
+    # arrives wrapped in a perceus producer-side dup, so the exit drop frees that
+    # dup and the original survives. A blanket dup here over-increfs and blocks
+    # the cons cascade (free never reaches zero — issue #868).
+    #
+    # The exception is a reuse-arm match: the native `KConReuse` path donates the
+    # scrutinee's children without the per-child incref the C oracle emits on its
+    # non-unique reuse arm, so a SHARED donor (rb-tree rotation) under-increfs and
+    # would use-after-free the moved children. Keeping the dup there inflates the
+    # parent RC enough to mask it as a leak instead. The dup stays ONLY for a
+    # reuse-arm match until the native reuse lowering grows that incref; every
+    # other match binds the exit-drop binder bare.
+    let st_scr = if owned and match_owns_reuse_arm(x) {
                    let st_d = ls_emit(st_pub, KRC(KDup(scrv), kpos_of(x)))
                    ls_emit(st_d, KLet(sd, SBoxed, KLitOp(scrv), kpos_of(x)))
+                 } else if owned {
+                   ls_emit(st_pub, KLet(sd, SBoxed, KLitOp(scrv), kpos_of(x)))
                  } else { st_pub }
     LSPre(join, sd, ls_emit(st_scr, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x))))
   } }
