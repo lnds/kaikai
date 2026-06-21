@@ -1,54 +1,40 @@
 # compiler/modules.kai — kaikai module system: qualified-call/type
 # rewriters, import-hole symbol-index resolver, and pub enforcement.
 #
-# Extracted from main.kai under issue #677 Phase 1l — the first of the
-# "vertical pipeline" extractions, after the 11 leaf modules (util /
-# chars / diag / lex / ast / intervals / refinements / parse / resolve /
-# fmt / cache). The cross-section analysis is in
-# docs/lane-modules-cross-section-analysis.md and the retro in
-# docs/lane-experience-issue-677-phase1l.md.
-#
-# The cut, in one sentence
-#
 # The *import-load orchestrator* (`expand_imports` / `process_imports` /
-# `resolve_module` + the `ResolveState` it threads) STAYS in main.kai
+# `resolve_module` + the `ResolveState` it threads) lives in main.kai
 # because it calls UPWARD into the typer (`validate_module_same_module_
 # collisions`), the lowering layer (`tag_decls_module_origin` ->
 # `lower_axiom_one` / `lower_const_one`) and lexer reporting
-# (`report_errors`) — those are pipeline-orchestration concerns, the
-# "driver disguised". Everything the orchestrator *computes over* —
-# file resolution, the module table type, the qualified rewriters, the
-# import-hole index, pub enforcement — sits BELOW the driver and moves
-# here. main.kai keeps a downward-only import: it calls into this
-# module, this module never calls back.
+# (`report_errors`) — pipeline-orchestration concerns. Everything the
+# orchestrator *computes over* — file resolution, the module table type,
+# the qualified rewriters, the import-hole index, pub enforcement — sits
+# BELOW the driver and lives here. main.kai keeps a downward-only import:
+# it calls into this module, this module never calls back.
 #
 # What this module owns
 #
 # - File resolution: `find_module_file` / `module_to_path` /
 #   `dots_to_slashes` / `try_candidate*` / `CandidateFile` / `dir_of` /
 #   `last_slash` — pure path mechanics + on-disk lookup (File effect),
-#   no upward calls. The orchestrator in main.kai calls
-#   `find_module_file`; the import-hole pass calls it too.
+#   no upward calls.
 # - `ModuleEntry` (the per-import module-table entry, constructor `ME`)
 #   and its accessors (`me_has_export` / `me_lookup_export` /
 #   `mt_lookup` / `me_export_is_unstable` / `name_starts_upper`). This
 #   type is consumed widely by the typer and emitter in main.kai (the
 #   module table is threaded through inference and codegen), so it is
-#   `pub` here and resolves through `import compiler.modules`. It is a
-#   candidate to promote into compiler.ast in a future lane (it is more
-#   "shared AST-adjacent type" than "module-system internal"); kept here
-#   for now to keep this lane's blast radius to a single new file.
-# - Qualified-call rewrite (m6.2 Phase 2.3): EField(EVar(mod), name) ->
+#   `pub` here and resolves through `import compiler.modules`.
+# - Qualified-call rewrite: EField(EVar(mod), name) ->
 #   EModCall(mod, name, ...) once the module table proves `mod` is an
 #   imported module — `rqc_decls` / `rqc_expr` and the `rqc_*` walkers.
-# - Qualified-type rewrite (issue #232): `mod.Type` heads in signatures
+# - Qualified-type rewrite: `mod.Type` heads in signatures
 #   rewritten + validated against the module table — `qualtype_decls` /
 #   `qtchk_decls` and the `qualtype_*` / `qtchk_*` walkers.
 # - `#[unstable]` export checking — `unstable_check_decls` + walkers.
-# - Import-hole symbol-index resolver (m7f §7): `import ?name` is a
+# - Import-hole symbol-index resolver: `import ?name` is a
 #   diagnostic-only form that suggests stdlib/explicit modules exporting
 #   a wanted symbol — `report_import_holes` / `strip_import_holes`.
-# - Pub enforcement (issue #510): cross-module bare-name access to a
+# - Pub enforcement: cross-module bare-name access to a
 #   non-`pub` declaration is an error — `validate_pub_access`, the
 #   `vpa_*` signature/expr walkers, the `pae_*` access-table decision
 #   helpers, and the `HomeAnchor` / home-hint machinery that tracks
@@ -57,27 +43,12 @@
 # Two AST-generic helpers ride along because the rewriters use them but
 # they are NOT module-system concepts: `pat_binders` (pattern binder
 # names) and `fn_param_names` (parameter names). The typer/desugar in
-# main.kai also call them, so they are `pub`. Future lane should
-# promote both to compiler.ast or compiler.util.
+# main.kai also call them, so they are `pub`.
 #
-# Public surface (24 symbols + the `ME` / `CF` constructors exported
-# with `ModuleEntry` / `CandidateFile`): the file-resolution +
-# module-table types the orchestrator (in main.kai) needs downward
-# (`ModuleEntry`, `CandidateFile`, `dir_of`, `find_module_file`,
-# `last_slash`), the pass entry points the driver invokes
-# (`qualtype_decls`, `qtchk_decls`, `rqc_decls`, `unstable_check_decls`,
-# `report_import_holes`, `strip_import_holes`, `validate_pub_access`),
-# the home/access helpers the typer + emitter consume
-# (`collect_module_origins`, `decl_home_hint_reset`, `HomeAnchor`,
-# `ha_home`, `impl_first_fn_home`, `imports_home_anchors`, `pae_take`,
-# `pae_drop`, `PreludeSegment`), and the AST-generic helpers
-# (`pat_binders`, `fn_param_names`, `rqc_expr`).
-#
-# `PreludeSegment` (issue #510) moved here from the driver layer: it is
-# the per-prelude-file `(mod_name, decls)` split that `validate_pub_
-# access` consumes; the driver constructs `PSeg` values and threads
-# them downward. `join_with` / `diag_warning` are mirrored locally as
-# `mods_join_with` / `mods_diag_warning` (see below) rather than
+# `PreludeSegment` is the per-prelude-file `(mod_name, decls)` split that
+# `validate_pub_access` consumes; the driver constructs `PSeg` values and
+# threads them downward. `join_with` / `diag_warning` are mirrored locally
+# as `mods_join_with` / `mods_diag_warning` (see below) rather than
 # imported upward from main.
 
 import compiler.util
@@ -116,10 +87,10 @@ fn mods_diag_warning(file: String, line: Int, col: Int, msg: String) : Unit / Co
 # duplicate-symbol reason as `mods_diag_warning`.
 fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 
-# module resolution (M6.1 — simple concat semantics)
+# module resolution — simple concat semantics
 # ====================================================================
 #
-# First cut of the import system. `import a.b.c` maps to loading
+# `import a.b.c` maps to loading
 # `<dir-of-current-file>/a/b/c.kai` and concatenating its decls into
 # the program. No namespacing, no aliases, no selective imports (the
 # parser accepts them but this pass treats them as plain imports).
@@ -132,10 +103,10 @@ fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # reported. A → B → A still works — the second visit to A is a
 # no-op.
 
-# m6.2: ModuleEntry records the surface name a user wrote on an
+# ModuleEntry records the surface name a user wrote on an
 # `import` line, the public names that file exports, and the
 # absolute path the file was loaded from. The resolver collects one
-# per import in expand_imports; later passes (Phase 2.3 onward) use
+# per import in expand_imports; later passes use
 # the table to disambiguate `mod.fn` qualified calls from
 # record-field projections.
 #
@@ -144,13 +115,9 @@ fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # `IkSelective`. `exports` is the list of pub fn / pub type / pub
 # effect / pub protocol names declared in the imported file's
 # top-level (non-import) decls. Selective imports do NOT pre-filter
-# this list — concat semantics (M6.1) still bring every public decl
-# into the unqualified scope, so the qualified surface mirrors that
-# for now. Phase 2.3 / m6.2.v2 may revisit.
+# this list — concat semantics still bring every public decl
+# into the unqualified scope, so the qualified surface mirrors that.
 pub type ModuleEntry = ME(String, [String], String, [String])
-
-# `last_segment` already exists (line 6253) and is used by
-# register_import. We reuse it here unchanged.
 
 # Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
 # returns "." (current dir).
@@ -232,18 +199,17 @@ pub fn find_module_file(base_dir: String, mod_path: String, search_paths: [Strin
   }
 }
 
-# m6.2: `import_name` is the surface binding the importing file
+# `import_name` is the surface binding the importing file
 # uses to refer to this module — last segment of `IkPath` /
 # `IkSelective`, or the alias from `IkAlias`. The resolver records
 # a ModuleEntry under this name once the file has been parsed
 # successfully (skipped when the file is missing or has lex/parse
-# errors — the M6.1 fallback diagnostic still fires).
+# errors — the fallback diagnostic still fires).
 #
-# When `import_name` is `""`, the caller is asking for plain M6.1
+# When `import_name` is `""`, the caller is asking for plain concat
 # behaviour without registering a module entry — used by paths that
-# load files for other reasons (none in v1, but the parameter
-# leaves the door open).
-# Issue #538 shape 1: format the cycle chain for the diagnostic.
+# load files for other reasons.
+# Format the cycle chain for the diagnostic.
 # `in_progress` is head=deepest, tail=root; the target is the path
 # that the cycle re-entered. The chain we print walks root→deepest
 # (reverse of in_progress) and closes with the target appended once
@@ -265,7 +231,7 @@ fn join_with_arrow(xs: [String], acc: String) : String {
 }
 
 # ====================================================================
-# m6.2 Phase 2.3 — qualified call rewrite (EField → EModCall)
+# qualified call rewrite (EField → EModCall)
 # ====================================================================
 #
 # After expand_imports populates the module table, this pass walks
@@ -283,9 +249,7 @@ fn join_with_arrow(xs: [String], acc: String) : String {
 # Lexical scoping tracker: a flat `[String]` of names currently in
 # scope. Updated as the walker enters fn params, lambda params,
 # `let` patterns, `match` arm patterns, handle clause params, and
-# `with State[T](init) as alias` aliases. This is the same shape
-# stage 1 added in 2c5de6b for the codegen shadow bug — the
-# tracker reads identically here, just for a different decision.
+# `with State[T](init) as alias` aliases.
 
 fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
   match mt {
@@ -300,14 +264,14 @@ fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
   ME(_, exports, _, _) -> list_has(exports, fn_name)
 }
 
-# Issue #602: returns true when `fn_name` is in the module's unstable
+# Returns true when `fn_name` is in the module's unstable
 # export list. Callers use this from EField -> EModCall rewriting to
 # decide whether to emit the unstable-consumer warning.
 fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
   ME(_, _, _, unstable) -> list_has(unstable, fn_name)
 }
 
-# Issue #425: collect the absolute origin path of every ModuleEntry
+# Collect the absolute origin path of every ModuleEntry
 # in `mes`. Used to pre-seed the import resolver's `visited` set with
 # the paths of every `--prelude` file so a user `import` of the same
 # module is a no-op instead of a duplicate-symbol link error.
@@ -319,16 +283,6 @@ pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = ma
 }
 
 
-# m14 v1: resolve a qualified-call field name to the real exported
-# name in the module. Tries the verbatim `fname` first; if that is
-# not exported, falls back to `<module>_<fname>` (or the per-module
-# legacy prefix) so a caller can write `list.take(xs, n)` against
-# today's flat-prefix definitions (`pub fn list_take`) without
-# renaming the stdlib. The legacy definitions retire when the
-# per-module surface migration completes in a follow-up lane
-# (see `docs/stage2-design.md` §m14). Returns the export name to
-# thread through `EModCall`, which is what codegen uses to mint
-# the C symbol (`kai_<actual>`).
 fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
   Some(c) -> c >= 'A' and c <= 'Z'
   None    -> false
@@ -375,7 +329,7 @@ pub fn fn_param_names(params: [Param]) : [String] = match params {
 }
 
 # ====================================================================
-# Issue #232 — qualified type rewriter
+# qualified type rewriter
 # ====================================================================
 #
 # The parser turns `mod.Type[args?]` in type position into a single
@@ -461,7 +415,7 @@ fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Conso
   TyRefine(base, pred) ->
     TypeExpr { tkind: TyRefine(qualtype_te(base, mt, file), qualtype_expr(pred, mt, file)),
                 line: te.line, col: te.col }
-  # issue #772: a compound-row type argument (`Stream[Int, Stdout + Fail]`).
+  # A compound-row type argument (`Stream[Int, Stdout + Fail]`).
   # Rewrite any qualified labels it carries; the carrier is dissolved
   # later by alias substitution.
   TyRow(row) ->
@@ -556,7 +510,7 @@ fn qualtype_expr(e: Expr, mt: [ModuleEntry], file: String) : Expr / Console + Fi
   Expr { kind: qualtype_expr_kind_at(e.kind, mt, file, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-# Issue #456: qualtype rewrite at the kind level needs source position
+# Qualtype rewrite at the kind level needs source position
 # for module-export diagnostics on `ERecordLit("mod.Type", _)`. Routes
 # through here so the wrapping `Expr` can supply line/col; all other
 # arms forward to `qualtype_expr_kind` unchanged.
@@ -658,7 +612,7 @@ fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind /
 }
 
 # Helpers used by the inlined `_ -> map_expr_kind` expansion above.
-# Issue #528: `map_expr_kind` cannot accept an effectful callback
+# `map_expr_kind` cannot accept an effectful callback
 # without row polymorphism in function-param types (which stage 1 does
 # not parse), so each effectful traversal walks `ExprKind` directly
 # with these specialised helpers.
@@ -805,8 +759,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
         qualtype_expr(body, mt, file), l, c, mo)
   DType(p, n, tps, body, l, c, mo) ->
     DType(p, n, tps, qualtype_body(body, mt, file), l, c, mo)
-  DEffect(p, n, tps, ops, defblk, l, c) ->
-    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c)
+  DEffect(p, n, tps, ops, defblk, l, c, mo) ->
+    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c, mo)
   DProtocol(p, n, tps, ops, l, c) ->
     DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c)
   DImpl(name, proto_args, ty, sub_decls, l, c) ->
@@ -820,7 +774,7 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
     DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
             qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
-  # Issue #269: rewrite the declared type's qualifiers and the body
+  # Rewrite the declared type's qualifiers and the body
   # expression. `lower_consts` runs before this in the driver, but
   # the arm exists for completeness so any pre-lowering caller (e.g.
   # `--ast` of a future entry point) does not blow up. Mirrors what
@@ -835,7 +789,7 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   DImport(ik, l, c) -> DImport(ik, l, c)
   DUnit(p, n, opt, l, c) -> DUnit(p, n, opt, l, c)
   DUse(eff, l, c) -> DUse(eff, l, c)
-  # Issue #681: the root file's module-doc carrier rides the stream
+  # The root file's module-doc carrier rides the stream
   # until the typer lifts it into TypedProgram.module_doc; it has no
   # types to qualify.
   DDoc(raw, text, inner, l, c) -> DDoc(raw, text, qualtype_decl(inner, mt, file), l, c)
@@ -848,7 +802,7 @@ pub fn qualtype_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] /
   [d, ...rest] -> [qualtype_decl(d, mt, file), ...qualtype_decls(rest, mt, file)]
 }
 
-# Issue #232 validation pass: counts how many qualified type heads
+# Validation pass: counts how many qualified type heads
 # fail validation against the module table. Errors were already
 # emitted as part of the rewrite pass (qualtype_te); this counter
 # pass mirrors the same traversal so the caller can fold the count
@@ -870,7 +824,7 @@ fn qtchk_te(te: TypeExpr, mt: [ModuleEntry]) : Int = match te.tkind {
   TyFn(ps, ret, row) -> qtchk_te_list(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
   TyDim(base, _) -> qtchk_te(base, mt)
   TyRefine(base, _) -> qtchk_te(base, mt)
-  # issue #772: a compound-row type argument (`Stream[Int, Stdout + Fail]`).
+  # A compound-row type argument (`Stream[Int, Stdout + Fail]`).
   # Validate any qualified labels it carries before alias substitution
   # dissolves the carrier.
   TyRow(row) -> qtchk_row(row, mt)
@@ -950,7 +904,7 @@ fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
     (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
     qtchk_row(row, mt)
   DType(_, _, _, body, _, _, _) -> qtchk_body(body, mt)
-  DEffect(_, _, _, ops, _, _, _) -> qtchk_eops(ops, mt)
+  DEffect(_, _, _, ops, _, _, _, _) -> qtchk_eops(ops, mt)
   DProtocol(_, _, _, ops, _, _) -> qtchk_pops(ops, mt)
   DImpl(_, proto_args, ty, sub_decls, _, _) ->
     qtchk_te_list(proto_args, mt) +
@@ -974,7 +928,7 @@ pub fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Cons
   [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_decls(rest, mt, file)]
 }
 
-# Issue #602: walk every Decl body's EModCall sites and emit a
+# Walk every Decl body's EModCall sites and emit a
 # diagnostic for any call to a `#unstable` export from a package
 # the consumer has not opted into. Pure post-pass — runs AFTER
 # `rqc_decls` has lifted `EField(EVar(mod), fn)` into
@@ -1202,7 +1156,7 @@ pub fn rqc_expr(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : Ex
   Expr { kind: rqc_kind(e, locals, mt, file), line: e.line, col: e.col,
          ty: e.ty, mode: e.mode }
 
-# m6.2 diagnostics: emit a specific message when the user wrote
+# Emit a specific message when the user wrote
 # `mod.fname` against a known imported module that does not export
 # `fname`. The list of available exports is included so the fix is
 # obvious. Returns the original EField shape so the typer's own
@@ -1226,31 +1180,30 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
         # Rule B: local in scope. Treat as record projection.
         EField(rqc_expr(base, locals, mt, file), fname)
       } else if name == "bit" {
-        # m13: dotted bit.* surface. The bit operations are compiler
+        # Dotted bit.* surface. The bit operations are compiler
         # intrinsics — `bit_and`, `bit_or`, `bit_xor`, `bit_not`,
         # `bit_shl`, `bit_shr`, `bit_ushr`, `bit_count`, `bit_test`,
         # `bit_set`, `bit_clear`, `bit_toggle` — registered in the
         # typer's intrinsic table (`add_prelude_sigs`) and lowered
-        # inline by `emit_call_expr`'s else-if chain. There is no
-        # `kai_bit_*` runtime helper and no `bit` source file with
-        # bodies, so the m14 ModuleEntry path (which mints
-        # `kai_<mod>__<name>`) cannot apply. Rewrite `bit.X` to the
-        # flat-prefix `EVar("bit_X")` so the existing intrinsic path
-        # handles it without a codegen patch. If `bit_X` is not a
-        # known name the typer reports it as an unbound identifier,
-        # which is the right diagnostic for a typo like `bit.adn`.
-        EVar(string_concat("bit_", fname))
+        # inline by `emit_call_expr`'s else-if chain. The dotted
+        # method carries a leading underscore (`bit._and`) so reserved
+        # words (`and`, `or`, `not`, `test`) never appear as a field
+        # name; the rewrite drops the prefix dot and joins to the flat
+        # `bit_<op>` intrinsic (`bit` ++ `_and` = `bit_and`). An
+        # unknown `bit_X` surfaces as an unbound identifier, the right
+        # diagnostic for a typo like `bit._adn`.
+        EVar(string_concat("bit", fname))
       } else {
         match mt_lookup(mt, name) {
           Some(me) ->
-            # m14 v1: prefix-fallback — `list.take` resolves to the
+            # Prefix-fallback — `list.take` resolves to the
             # actual export `list_take` when the bare form is not
             # exported. EModCall carries the real name for codegen.
             #
-            # Issue #234: when `fname` starts with an uppercase
+            # When `fname` starts with an uppercase
             # letter and the module exports it, treat the qualifier
             # as a variant-constructor disambiguator. Variant ctors
-            # are auto-declared globally (#187), so `mod.Ctor`
+            # are auto-declared globally, so `mod.Ctor`
             # collapses back to a bare `EVar(Ctor)` after the
             # qualifier validates. The same rewrite applies to
             # qualified ctor pattern shape parsed below.
@@ -1259,7 +1212,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
             } else { match me_lookup_export(me, fname) {
               Some(actual) -> EModCall(name, actual)
               None -> {
-                # m6.2 diagnostics: imported module, missing export.
+                # Imported module, missing export.
                 # Emit specific error before falling back to EField
                 # (which the typer treats as a record-field
                 # projection on TyAny — produces a generic but
@@ -1311,7 +1264,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
     EBlock(res.stmts, final1)
   }
   # Everything else: inlined from `map_expr_kind` to allow the
-  # effect row to propagate (issue #528). Stage 1 cannot parse row
+  # effect row to propagate. Stage 1 cannot parse row
   # polymorphism in function-param types, so the HOF cannot accept
   # an effectful callback. The structural recursion is replicated
   # here with direct calls to `rqc_expr` and friends.
@@ -1481,7 +1434,7 @@ fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], file: String) : RqcStm
 }
 
 # ====================================================================
-# m7f §7 — `import ?name` symbol-index resolver
+# `import ?name` symbol-index resolver
 # ====================================================================
 #
 # When the user writes `import ?some_symbol`, the resolver scans a
@@ -1490,14 +1443,12 @@ fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], file: String) : RqcStm
 # diagnostic lists every match so the user can replace the hole with
 # an explicit module path.
 #
-# v1 scope:
 #  - The known-stdlib list is hardcoded — kaikai stage2 has no
 #    listdir effect, so an automatic walk over arbitrary search-paths
 #    is not feasible without one. The hardcoded list covers every
-#    module that lives in `stdlib/` today.
+#    module that lives in `stdlib/`.
 #  - The match is the literal pub fn name (no fuzzy matching, no
-#    type-direction). A v2 lane can add Levenshtein suggestions
-#    when nothing matches exactly.
+#    type-direction).
 #  - The IkHole node is treated as inert by every downstream pass
 #    (it loads no module, binds no name in the env, emits no code).
 #    The diagnostic is the entire user-visible effect.
@@ -1537,7 +1488,7 @@ fn import_hole_collect_pub_fns(ds: [Decl], acc: [String]) : [String] {
       DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
         if is_pub { import_hole_collect_pub_fns(rest, [name, ...acc]) }
         else     { import_hole_collect_pub_fns(rest, acc) }
-      # Issue #681: a documented `pub fn` arrives wrapped — unwrap so
+      # A documented `pub fn` arrives wrapped — unwrap so
       # import-hole suggestions still see it.
       DDoc(_, _, inner, _, _) -> import_hole_collect_pub_fns([inner, ...rest], acc)
       DUnstable(inner, _, _) -> import_hole_collect_pub_fns([inner, ...rest], acc)
@@ -1684,24 +1635,15 @@ pub fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 }
 
 # ====================================================================
-# Issue #510 — `pub` enforcement at module + prelude boundaries
+# `pub` enforcement at module + prelude boundaries
 # ====================================================================
 #
-# Pre-issue-#510, `pub` was parsed and stored on every Decl but only
-# consulted by:
-#   - `collect_pub_exports` (filters qualified-call resolution via
-#     `mod.fn` against the module table; `rqc_decls` rejects qualified
-#     calls to non-`pub` names with "module 'X' does not export 'Y'");
-#   - `import_hole_collect_pub_fns` (typed-hole / auto-import hints —
-#     not a visibility control).
-#
 # Bare-name resolution (the `EVar(name)` path that the typer
-# eventually drives through `ty_env_lookup`) had no visibility check.
-# A user-file `lib_private()` call against a prelude/import that
-# defined `fn lib_private()` (no `pub`) compiled cleanly and linked
-# straight through to `kai_lib__lib_private`, even though every
-# convention in `docs/design.md`, `docs/m14-bootstrap-audit.md`, and
-# 672 `pub` lines in `stdlib/` assumed otherwise.
+# eventually drives through `ty_env_lookup`) has no visibility check
+# of its own: without this pass a user-file `lib_private()` call
+# against a prelude/import that defined `fn lib_private()` (no `pub`)
+# would compile cleanly and link straight through to
+# `kai_lib__lib_private`.
 #
 # This pass closes the gap. It runs after `rqc_decls` rewrites
 # qualified `EField(EVar(mod), fn)` calls into `EModCall(mod, fn)`
@@ -1713,14 +1655,6 @@ pub fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 #     every Decl body with a (locals, home_module) tracker and
 #     rejecting `EVar(nm)` references where `nm` is a non-`pub` decl
 #     authored in a different module than the surrounding body.
-#
-# Strict enforcement (no warning grace period) per the v0.54.0
-# release plan: pre-1.0 kaikai has no external users, so one breaking
-# version with a clear migration path is preferable to two transitional
-# ones. The companion stdlib sweep adds `pub` to every internal helper
-# that user-facing code legitimately needs to reach (e.g. helpers that
-# moved here from the root file when modules were factored out, but
-# never had `pub` added back).
 
 # PubAccessEntry records ALL top-level declarations the bare-name
 # resolver might find under a given name, so the validator can
@@ -1746,7 +1680,7 @@ pub fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 #     the typer / `unions` infrastructure disambiguates by
 #     receiver type. Validation only refuses references where
 #     EVERY candidate entry is private to a foreign module.
-# Issue #510: the per-prelude-file `(mod_name, decls)` split. The
+# The per-prelude-file `(mod_name, decls)` split. The
 # driver's prelude loader (`load_core` in main.kai) builds one `PSeg`
 # per prelude file so the pub-access validator can treat each prelude
 # as its own home module — without it the flat decl append loses the
@@ -1778,7 +1712,7 @@ fn collect_priv_decls(decls: [Decl], target_mod: String,
   collect_priv_decls_loop(decls, target_mod, target_mod, acc)
 
 # DType / DEffect / DProtocol / DUnit / DConst / DAxiom carry no
-# `module_origin` field in v1 of issue #510, so we recover the
+# `module_origin` field, so we recover the
 # home module by streaming the flat decl list: every DFn (or
 # DAttribPure(DFn), or DAxiom-already-lowered) carries `mo`, and
 # whatever comes between them shares that module. The decl stream
@@ -1875,7 +1809,7 @@ fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry]
       [PAE(name, home_mod, is_pub), ...acc]
     DType(is_pub, name, _, body, _, _, _) ->
       pae_with_variants(name, body, home_mod, is_pub, acc)
-    DEffect(is_pub, name, _, _, _, _, _) ->
+    DEffect(is_pub, name, _, _, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
     DProtocol(is_pub, name, _, _, _, _) ->
       [PAE(name, home_mod, is_pub), ...acc]
@@ -1883,7 +1817,7 @@ fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry]
       [PAE(name, home_mod, is_pub), ...acc]
     DDerive(_, inner, _, _)  -> priv_one(inner, home_mod, acc)
     DUnstable(inner, _, _)   -> priv_one(inner, home_mod, acc)
-    # Issue #510 — DImpl method bodies. A `impl P for T { fn op(...)
+    # DImpl method bodies. A `impl P for T { fn op(...)
     # = body }` makes `op` callable cross-module through the protocol
     # dispatcher; the method itself has no surface `pub` marker.
     # Register every method as `is_pub = true` so a bare-name `op(x)`
@@ -1985,8 +1919,7 @@ fn pae_decide_loop(table: [PubAccessEntry], name: String, home: String,
 # A name in scope as a local always wins (Rule B in `rqc_decls`).
 # `take` / `drop` from `stdlib/core/list.kai` are not available
 # while building stage 1 (stage 0 has no prelude); use these
-# decl-list-specific helpers instead. Issue #510 is the only
-# caller, so the names stay private.
+# decl-list-specific helpers instead.
 pub fn pae_take(xs: [Decl], n: Int) : [Decl] = match xs {
   [] -> []
   [h, ...t] -> if n <= 0 { [] } else { [h, ...pae_take(t, n - 1)] }
@@ -2031,7 +1964,7 @@ fn collect_pub_access_table(prelude_segs: [PreludeSegment],
 # A per-decl home attribution paired with a flag distinguishing
 # anchored entries (the decl itself carried `module_origin =
 # Some(m)`) from derived entries (a non-DFn that inherited its
-# home from the running `cur_mod`). Issue #565: the flag is what
+# home from the running `cur_mod`). The flag is what
 # stops a later anchor from propagating across an unrelated
 # already-anchored module — see `propagate_home_back`.
 pub type HomeAnchor = HA(String, Bool)
@@ -2044,7 +1977,7 @@ pub type HomeAnchor = HA(String, Bool)
 # the running `cur_mod` and update the running home to `m`. The
 # result is a list of homes in source order — one per decl.
 #
-# Issue #565: without the anchored flag, a transitive import chain
+# Without the anchored flag, a transitive import chain
 # `consumer -> mid -> leaf` would mis-attribute every decl of `leaf`
 # to `mid`. When `leaf`'s decls land first (process_imports recurses
 # depth-first), they anchor under `leaf`; when `mid`'s first explicit
@@ -2082,7 +2015,7 @@ pub fn ha_home(h: HomeAnchor) : String = match h { HA(m, _) -> m }
 
 fn decl_explicit_home(d: Decl) : Option[String] = match d {
   DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
-  # Hanga Roa: root-file DTypes also carry `module_origin = Some(_)`
+  # Root-file DTypes also carry `module_origin = Some(_)`
   # after `tag_target_decl`, so use them as home anchors too — a
   # leading DType in the root file does not have a DFn ahead of it
   # to seed the propagate_home_back walk, and the home should not
@@ -2107,7 +2040,7 @@ pub fn impl_first_fn_home(ms: [Decl]) : Option[String] = match ms {
 # `new`, stopping at the first anchored entry OR the first entry
 # whose home already differs. Anchored entries belong to a module
 # that already locked in its attribution and must never be
-# rewritten. Returns the list still in reversed order. Issue #565.
+# rewritten. Returns the list still in reversed order.
 fn propagate_home_back(acc: [HomeAnchor], prev: String, new: String,
                          done: [HomeAnchor]) : [HomeAnchor] = match acc {
   [] -> done
@@ -2218,7 +2151,7 @@ fn vpa_decl(d: Decl, table: [PubAccessEntry], home: String,
   DType(is_pub, _, tparams, body, line, col, _) ->
     if is_pub { vpa_sig_typebody(body, table, home, file, tparams, line, col) }
     else      { 0 }
-  DEffect(_, _, tparams, ops, _, _, _) ->
+  DEffect(_, _, tparams, ops, _, _, _, _) ->
     vpa_sig_eops(ops, table, home, file, tparams, 0)
   DProtocol(_, _, tparams, ops, _, _) ->
     # Protocol ops carry `Self` as the implicit type parameter the
@@ -2292,7 +2225,7 @@ fn vpa_sig_te(te: TypeExpr, table: [PubAccessEntry], home: String,
     eb + eu
   }
   TyRefine(base, _) -> vpa_sig_te(base, table, home, file, tparams)
-  # issue #772: a compound row as a type argument — validate the
+  # A compound row as a type argument — validate the
   # privacy of any labels it carries before alias substitution
   # dissolves the carrier.
   TyRow(row) -> vpa_sig_row(row, table, home, file, tparams, te.line, te.col)

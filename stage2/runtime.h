@@ -7581,7 +7581,7 @@ static KaiValue *kai_default_env_args(void *self, KaiCont *k) {
     return kai_cont_resume(k, kai_prelude_args());
 }
 
-static KaiValue *kai_default_env_var(void *self, KaiValue *name, KaiCont *k) {
+static KaiValue *kai_default_env_get(void *self, KaiValue *name, KaiCont *k) {
     (void) self;
     if (!name || name->tag != KAI_STR) {
         return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));

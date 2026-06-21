@@ -1,158 +1,211 @@
 #[doc("""
-Atomic effect catalog (documentation only).
+Atomic effect catalog — the builtin capabilities the runtime ships a
+default handler for, declared in surface kaikai.
 
-This file is intentionally inert — no `effect` or `type` declarations
-are emitted. The compiler auto-loads it as part of the core stdlib set
-but parses it as comments. The atomic effects (`Stdin`, `Stdout`,
-`Stderr`, `File`, `Env`, `NetTcp`, `NetDns`, `NetUdp`, `Signal`) are
-declared in the compiler so the typer always sees them; the matching
-default handlers are installed around `main` when its row mentions the
-effect. This catalog records their shapes for reference.
+Auto-loaded as part of the core stdlib set, so user code names these
+effects (`Stdout.print`, `File.read_file`, ...) without an import.
+Each runtime-backed op bridges to its C entry through a `default { }`
+clause of the form `$extern_handler("kai_default_<eff>_<op>")`.
 
-----------------------------------------------------------------------
-Console / IO leaves
-----------------------------------------------------------------------
-
-effect Stdin {
-  read_line()        : Result[String, String]
-  read_bytes(n: Int) : String
-}
-
-`read_bytes(n)` reads up to `n` raw bytes (including '\n') and returns
-them as a String. On EOF the result is shorter than `n` — possibly
-empty. A short read is the framing protocol's own end-of-stream signal,
-so there is no Result wrapper.
-
-effect Stdout {
-  print(s: String) : Unit
-}
-
-effect Stderr {
-  eprint(s: String) : Unit
-}
-
-effect File {
-  read_file(path: String)                   : Result[String, String]
-  write_file(path: String, content: String) : Result[Unit, String]
-  open_read(path: String)                    : Result[String, FileHandle]
-  read_chunk(h: FileHandle, max: Int)        : Result[String, String]
-  open_write(path: String)                   : Result[String, FileHandle]
-  write_chunk(h: FileHandle, data: String)   : Result[String, Unit]
-  close_file(h: FileHandle)                  : Unit
-}
-
-`read_chunk` returns `Ok("")` at EOF. The handle is an opaque
-`FileHandle` (fd).
-
-effect Env {
-  env_get(key: String) : Option[String]
-}
-
-type Console = Stdout + Stderr + Stdin
-type Io      = Console + Env + File
-
-----------------------------------------------------------------------
-NetTcp — byte-level TCP networking
-----------------------------------------------------------------------
-
-effect NetTcp {
-  connect(host: String, port: Int)              : Result[String, Conn]
-  listen(host: String, port: Int)               : Result[String, Listener]
-  accept(l: Listener)                           : Result[String, Conn]
-  send(c: Conn, data: [Int])                    : Result[String, Int]
-  recv(c: Conn, max: Int)                       : Result[String, [Int]]
-  close(c: Conn)                                : Unit
-}
-
-Bytes are carried as `[Int]` (kaikai has no first-class Byte type that
-unifies with Int). Each element is expected to be in [0, 255]; the
-runtime truncates higher bits. `Result[e, a]` is Err-first / Ok-second,
-so user code matches `Ok(c)` / `Err(msg)`.
-
-Opaque handles. The `port` slot on Listener lets a server bound to
-port 0 read back the kernel-assigned port without a separate op.
-
-type Conn      = { fd: Int }
-type Listener  = { fd: Int, port: Int }
-
-Limitations: IPv4 only (AF_INET); all ops block the OS thread (no
-readiness reactor for sockets); `Listener` has no close op (the kernel
-reclaims the listening socket at process exit).
-
-----------------------------------------------------------------------
-NetDns — DNS name resolution
-----------------------------------------------------------------------
-
-getaddrinfo(3) exposed without the right to open sockets (that is
-NetTcp). Surface helpers (`resolve` / `resolve_first` / `with_dns`)
-live in stdlib/net/dns.kai.
-
-effect NetDns {
-  resolve(host: String)                         : Result[String, [IpAddr]]
-}
-
-Same Err-first Result order as NetTcp, so user code matches
-`Ok(addrs)` / `Err(msg)`.
-
-Opaque handle. Carries the textual IPv4 form so it round-trips through
-logging without a second decoder.
-
-type IpAddr = { addr: String }
-
-Limitations: IPv4 only (AF_INET); `resolve` blocks the OS thread
-(getaddrinfo is a blocking libc call); no reverse DNS, no caching/TTL.
-
-----------------------------------------------------------------------
-NetUdp — byte-level datagram UDP
-----------------------------------------------------------------------
-
-effect NetUdp {
-  bind(host: String, port: Int)                  : Result[String, UdpSocket]
-  send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[String, Int]
-  recv(s: UdpSocket, max: Int)                   : Result[String, Pair[SocketAddr, [Int]]]
-  close(s: UdpSocket)                            : Unit
-}
-
-Bytes are `[Int]` in [0, 255] (runtime truncates higher bits), same as
-NetTcp. `Result[e, a]` is Err-first; user code matches `Ok(s)` /
-`Err(msg)`. `recv` pairs the datagram source address with its bytes as
-`Pair[SocketAddr, [Int]]` (kaikai has no tuples).
-
-Opaque handles. The `port` slot on UdpSocket lets a probe bound to
-port 0 read back the kernel-assigned port without a separate op.
-SocketAddr stores the host as a textual IPv4 dotted-quad.
-
-type UdpSocket  = { fd: Int, port: Int }
-type SocketAddr = { host: String, port: Int }
-
-Limitations: IPv4 only (AF_INET); all ops block the OS thread (no
-readiness reactor for datagram sockets); no multicast / broadcast /
-connected UDP; no `with_udp` installer (the default handler is the
-only install path).
-
-----------------------------------------------------------------------
-Signal — POSIX signal trap for graceful shutdown
-----------------------------------------------------------------------
-
-Three ops modelled on/off/await rather than a per-signal handler
-callback: the runtime cannot honour user-installed Cancel handlers on
-runtime-triggered cancellation, so a callback shape would degrade to
-exit(0) for main without running the user's cleanup. on/off/await
-implements the trap synchronously via sigwait. Sig variant names are
-the runtime contract — adding a new variant requires a paired entry in
-the runtime's signal table.
-
-type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2
-
-effect Signal {
-  on(sig: Sig)  : Unit
-  off(sig: Sig) : Unit
-  await()       : Sig
-}
-
-Limitations: POSIX only; `await()` blocks the OS thread; SIGCHLD
-intentionally absent (Process.wait reaps); no real-time signals
-(SIGRTMIN+n) or siginfo_t.
-
-----------------------------------------------------------------------
+Networking (`NetTcp` / `NetUdp` / `NetDns`) lives with its surface
+helpers in `net/`; concurrency and OS-process effects live in
+`effects/concurrent.kai` and `effects/os.kai`.
 """)]
+
+# ---- Console / IO leaves ----
+
+#[doc("Write a line to standard output. The default handler bridges to the runtime stdout writer.")]
+pub effect Stdout {
+  print(s: String) : Unit
+  default {
+    print(s, resume) -> $extern_handler("kai_default_stdout_print")
+  }
+}
+
+#[doc("Write a line to standard error. The default handler bridges to the runtime stderr writer.")]
+pub effect Stderr {
+  eprint(s: String) : Unit
+  default {
+    eprint(s, resume) -> $extern_handler("kai_default_stderr_eprint")
+  }
+}
+
+#[doc("""
+Read from standard input. `read_line` returns `None` at EOF;
+`read_bytes(n)` reads up to `n` raw bytes (a short read is the
+end-of-stream signal). The default handler bridges to the runtime
+stdin reader.
+""")]
+pub effect Stdin {
+  read_line() : Option[String]
+  read_bytes(n: Int) : String
+  default {
+    read_line(resume)     -> $extern_handler("kai_default_stdin_read_line")
+    read_bytes(n, resume) -> $extern_handler("kai_default_stdin_read_bytes")
+  }
+}
+
+#[doc("Abandon the current computation with a message. `fail` returns `Nothing`, so no resume is possible.")]
+pub effect Fail {
+  fail(msg: String) : Nothing
+  default {
+    fail(msg, resume) -> $extern_handler("kai_default_fail_fail")
+  }
+}
+
+#[doc("""
+The FFI capability tag carried by every `extern "C"` signature. It
+declares no ops — the type-level name exists so public signatures can
+mention `/ Ffi` honestly. Codegen routes FFI calls around the effect
+dispatcher entirely.
+""")]
+pub effect Ffi {}
+
+# ---- Process environment ----
+
+#[doc("""
+Read and mutate the process environment, plus read the argv list.
+Writes (`set_var` / `unset_var`) return `Result[String, Unit]`
+(Err-first). The default handler bridges each op to its runtime
+entry.
+""")]
+pub effect Env {
+  args() : [String]
+  get(name: String) : Option[String]
+  set_var(name: String, value: String) : Result[String, Unit]
+  unset_var(name: String) : Result[String, Unit]
+  vars() : [Pair[String, String]]
+  default {
+    args(resume)                -> $extern_handler("kai_default_env_args")
+    get(name, resume)           -> $extern_handler("kai_default_env_get")
+    set_var(name, value, resume)-> $extern_handler("kai_default_env_set_var")
+    unset_var(name, resume)     -> $extern_handler("kai_default_env_unset_var")
+    vars(resume)                -> $extern_handler("kai_default_env_vars")
+  }
+}
+
+# ---- File IO ----
+
+#[doc("""
+Opaque file handle the chunked `File` ops return and consume. The
+`fd` field is the OS file descriptor; the runtime reads it by name,
+so the field name is load-bearing.
+""")]
+pub type FileHandle = { fd: Int }
+
+#[doc("""
+Read and write files, in bulk (`read_file` / `write_file`) or in
+chunks over an opaque `FileHandle`. `read_chunk` returns `Ok("")` at
+EOF. Errors ride `Result` (Err-first). The default handler bridges
+each op to the runtime's thread-pooled IO.
+""")]
+pub effect File {
+  read_file(path: String) : Result[String, String]
+  write_file(path: String, contents: String) : Result[Unit, String]
+  open_read(path: String) : Result[String, FileHandle]
+  read_chunk(h: FileHandle, max: Int) : Result[String, String]
+  open_write(path: String) : Result[String, FileHandle]
+  write_chunk(h: FileHandle, data: String) : Result[String, Unit]
+  close_file(h: FileHandle) : Unit
+  default {
+    read_file(path, resume)       -> $extern_handler("kai_default_file_read_file")
+    write_file(path, contents, resume) -> $extern_handler("kai_default_file_write_file")
+    open_read(path, resume)       -> $extern_handler("kai_default_file_open_read")
+    read_chunk(h, max, resume)    -> $extern_handler("kai_default_file_read_chunk")
+    open_write(path, resume)      -> $extern_handler("kai_default_file_open_write")
+    write_chunk(h, data, resume)  -> $extern_handler("kai_default_file_write_chunk")
+    close_file(h, resume)         -> $extern_handler("kai_default_file_close_file")
+  }
+}
+
+# ---- Randomness ----
+
+#[doc("""
+Non-cryptographic randomness. `int_range(lo, hi)` is uniform in
+`[lo, hi]`. The default handler seeds a PCG64 generator from the
+process clock and pid. Use `SecureRandom` for security-sensitive
+draws.
+""")]
+pub effect Random {
+  int_range(lo: Int, hi: Int) : Int
+  default {
+    int_range(lo, hi, resume) -> $extern_handler("kai_default_random_int_range")
+  }
+}
+
+#[doc("""
+Cryptographically-secure randomness, deliberately separate from
+`Random` so a test handler stubbing `Random` cannot weaken
+security-sensitive paths. `int_range` is uniform-inclusive;
+`bytes(n)` draws `n` bytes (as `[Int]` in `[0, 255]`). The default
+handler bridges to the OS CSPRNG (getrandom / arc4random).
+""")]
+pub effect SecureRandom {
+  int_range(min: Int, max: Int) : Int
+  bytes(n: Int) : [Int]
+  default {
+    int_range(min, max, resume) -> $extern_handler("kai_default_securerandom_int_range")
+    bytes(n, resume)            -> $extern_handler("kai_default_securerandom_bytes")
+  }
+}
+
+# ---- Logging ----
+
+#[doc("""
+Leveled structured logging. The default handler writes each message
+to stderr in `[ISO8601Z] LEVEL message` form. Install a `Log`
+handler to capture or filter output.
+""")]
+pub effect Log {
+  debug(msg: String) : Unit
+  info(msg: String) : Unit
+  warn(msg: String) : Unit
+  error(msg: String) : Unit
+  default {
+    debug(msg, resume) -> $extern_handler("kai_default_log_debug")
+    info(msg, resume)  -> $extern_handler("kai_default_log_info")
+    warn(msg, resume)  -> $extern_handler("kai_default_log_warn")
+    error(msg, resume) -> $extern_handler("kai_default_log_error")
+  }
+}
+
+# ---- Mutation ----
+
+#[doc("""
+Observable mutation of `Array` cells and `Ref` references. Each op
+carries its own element generic so one handler instance serves every
+type. `var x = init` sugar and bare-builtin array writes route here;
+the default handler wraps the runtime's array/ref primitives.
+
+`array_set` / `array_grow` return the (mutated) `Array` to keep
+`xs = array_set(xs, i, v)` chains typing — the runtime mutates in
+place and hands the same array back.
+""")]
+pub effect Mutable {
+  array_make[T](n: Int, init: T) : Array[T]
+  array_length[T](a: Array[T]) : Int
+  array_get[T](a: Array[T], i: Int) : T
+  array_set[T](a: Array[T], i: Int, v: T) : Array[T]
+  array_grow[T](a: Array[T], n: Int, init: T) : Array[T]
+  ref_make[T](init: T) : Ref[T]
+  ref_get[T](r: Ref[T]) : T
+  ref_set[T](r: Ref[T], v: T) : Unit
+  default {
+    array_make(n, init, resume)    -> $extern_handler("kai_default_mutable_array_make")
+    array_length(a, resume)        -> $extern_handler("kai_default_mutable_array_length")
+    array_get(a, i, resume)        -> $extern_handler("kai_default_mutable_array_get")
+    array_set(a, i, v, resume)     -> $extern_handler("kai_default_mutable_array_set")
+    array_grow(a, n, init, resume) -> $extern_handler("kai_default_mutable_array_grow")
+    ref_make(init, resume)         -> $extern_handler("kai_default_mutable_ref_make")
+    ref_get(r, resume)             -> $extern_handler("kai_default_mutable_ref_get")
+    ref_set(r, v, resume)          -> $extern_handler("kai_default_mutable_ref_set")
+  }
+}
+
+# ---- Effect aliases ----
+
+#[doc("The combined console capability — `Stdout + Stderr + Stdin`.")]
+pub type Console = Stdout + Stderr + Stdin
+
+#[doc("The full IO capability — `Console + Env + File`.")]
+pub type Io = Console + Env + File
