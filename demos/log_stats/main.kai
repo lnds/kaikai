@@ -1,0 +1,134 @@
+# Log analytics driven by `stdlib/stream.kai`, self-contained and
+# cwd-independent. First it SEEDS a sample log to an absolute path with the
+# `write_lines` sink (the twin of `read_lines`), then reads it back in
+# constant memory: keep the WARN/ERROR/FATAL lines with the `|?` filter
+# pipe and fold the levels into a count map; explode the problem lines into
+# words with the `||` flat-map pipe and count the long tokens. A final pass
+# proves the `ReadFault` recovery path: a synthetic source injects a bad
+# chunk and a `handle` resumes past it (skip) instead of aborting.
+#
+# Seeding through `write_lines` (rather than shipping the lines as a disk
+# fixture read by a cwd-relative path) keeps the demo self-contained: it
+# runs identically from any directory — the demos Makefile, the backend
+# parity harness, a bare shell.
+#
+# The `|?` / `||` pipes dispatch on the `Stream` head by convention, gated
+# on edition >= hanga-roa, so the demos Makefile pins `--edition
+# hanga-roa`. The `File` default handler must be installed ABOVE the
+# `handle ... with ReadFault`, so `main` carries `File` in its row and the
+# analysis helpers keep `File + ReadFault`. Both points are detailed in
+# docs/lane-experience-stream-dogfood.md.
+
+import stream
+import collections.map
+
+type Level = Warn | Error | Fatal | Other
+
+fn has(line: String, needle: String) : Bool = match string.index_of(line, needle) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn level_of(line: String) : Level =
+  if has(line, "FATAL") { Fatal }
+  else if has(line, "ERROR") { Error }
+  else if has(line, "WARN") { Warn }
+  else { Other }
+
+fn level_name(l: Level) : String = match l {
+  Warn  -> "WARN"
+  Error -> "ERROR"
+  Fatal -> "FATAL"
+  Other -> "OTHER"
+}
+
+fn is_problem(line: String) : Bool = match level_of(line) {
+  Other -> false
+  _     -> true
+}
+
+# The sample log lines, written out once so the rest of the demo reads a
+# real file through the streaming `read_lines` source.
+fn sample() : [String] = [
+  "2026-06-21T08:00:01 INFO  server started on :8080",
+  "2026-06-21T08:00:02 INFO  worker pool size=8",
+  "2026-06-21T08:01:10 WARN  slow query took 1320ms on accounts",
+  "2026-06-21T08:01:11 INFO  cache warm complete",
+  "2026-06-21T08:02:03 ERROR upstream timeout calling billing",
+  "2026-06-21T08:02:04 WARN  retry 1/3 for billing",
+  "2026-06-21T08:02:06 WARN  retry 2/3 for billing",
+  "2026-06-21T08:02:09 ERROR upstream timeout calling billing",
+  "2026-06-21T08:02:09 FATAL circuit breaker open for billing",
+  "2026-06-21T08:03:00 INFO  circuit breaker half-open",
+  "2026-06-21T08:03:01 INFO  billing recovered",
+  "2026-06-21T08:05:42 WARN  disk usage 81% on /var",
+]
+
+# Seed the input file with the `write_lines` sink, streaming the sample.
+fn seed_log(path: String) : Unit / File + ReadFault =
+  from_list(sample()) |> (s => stream.write_lines(s, path))
+
+# Tally one line's level into the running count map.
+fn bump(counts: Map[String, Int], line: String) : Map[String, Int] =
+  map.update(counts, level_name(level_of(line)), 1, (n) => n + 1)
+
+# Read the lines, keep the problem ones with `|?`, fold into a count map.
+fn count_by_level(path: String) : Map[String, Int] / File + ReadFault =
+  (read_lines(path) |? is_problem) |> (s => stream.fold(s, map.empty(), bump))
+
+# A pure sub-stream of a line's words — fed to the `||` flat-map pipe.
+fn words_of(line: String) : Stream[String, ReadFault] =
+  from_list(string.split(line, " "))
+
+fn long(word: String) : Bool = string.length(word) > 4
+
+# Keep the problem lines (`|?`), explode each to words (`||`), drop the
+# short tokens (`|?`), and count what remains. One pipe expression, three
+# dispatching pipes over the `Stream` head.
+fn noisy_word_count(path: String) : Int / File + ReadFault =
+  (read_lines(path) |? is_problem || words_of |? long) |> (s => s.count())
+
+# A synthetic source that performs `bad_chunk` between two good elements,
+# to drive the recovery path deterministically (a healthy file never trips
+# `bad_chunk`). Resuming skips the bad chunk; the good elements still reach
+# the sink.
+fn flaky_source() : Stream[String, ReadFault] =
+  Stream((yield) => {
+    let _ = yield("alpha")
+    ReadFault.bad_chunk("corrupted frame #2")
+    let _ = yield("gamma")
+    ()
+  })
+
+fn print_counts(counts: Map[String, Int]) : Unit / Stdout =
+  map.fold(counts, (), (_acc, p) => print("#{p.fst}: #{p.snd}"))
+
+fn main() : Unit / Stdout + File = {
+  let path = "/tmp/kai_log_stats.log"
+
+  handle { seed_log(path) } with ReadFault {
+    bad_chunk(_msg, resume)  -> resume(())
+    open_fault(msg, _resume) -> { print("cannot seed: #{msg}"); () }
+  }
+
+  print("== severity counts ==")
+  let counts = handle { count_by_level(path) } with ReadFault {
+    bad_chunk(msg, resume)   -> { print("skip bad chunk: #{msg}"); resume(()) }
+    open_fault(msg, _resume) -> { print("cannot open: #{msg}"); map.empty() }
+  }
+  print_counts(counts)
+
+  print("== noisy long words in problem lines ==")
+  let words = handle { noisy_word_count(path) } with ReadFault {
+    bad_chunk(msg, resume)   -> { print("skip bad chunk: #{msg}"); resume(()) }
+    open_fault(msg, _resume) -> { print("cannot open: #{msg}"); 0 }
+  }
+  print("count: #{words}")
+
+  print("== ReadFault recovery ==")
+  let survived = handle { flaky_source() |> (s => s.count()) } with ReadFault {
+    bad_chunk(msg, resume)    -> { print("recovering from: #{msg}"); resume(()) }
+    open_fault(_msg, _resume) -> 0
+  }
+  print("survived elements: #{survived}")
+}

@@ -25,6 +25,11 @@ KAIC2     := ../stage2/kaic2
 CORE_PRELUDES :=
 PRELUDES  :=
 STDLIB    := ../stdlib
+# kaic2 defaults to the oldest edition (tongariki) for flagless
+# invocations; pin the repo's current edition so demos see the same
+# surface as the rest of the tree (e.g. convention pipe-dispatch over a
+# stdlib head, gated on >= hanga-roa).
+EDITION   := --edition hanga-roa
 # These demos are built by kaic2 (stage 2), whose emitted C uses the
 # stage-2 runtime (Koka tagged-Int, kai_intf, reuse-token, borrow).
 # Resolve `#include "runtime.h"` to stage2/runtime.h — `-I ../stage2`
@@ -54,7 +59,7 @@ verify:
 	@mkdir -p $(BUILD)
 	@for d in $(DEMOS); do \
 	  rm -f $(BUILD)/$$d.status $(BUILD)/$$d.err $(BUILD)/$$d.out $(BUILD)/$$d.c $(BUILD)/$$d-bin; \
-	  if ! $(KAIC2) $(PRELUDES) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
+	  if ! $(KAIC2) $(EDITION) $(PRELUDES) --path $(STDLIB) $$d/main.kai > $(BUILD)/$$d.c 2> $(BUILD)/$$d.err; then \
 	    err=$$(head -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="kaikai compile error"; \
 	    echo "FAIL kaikai: $$err" > $(BUILD)/$$d.status; \
