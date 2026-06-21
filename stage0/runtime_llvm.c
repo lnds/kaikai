@@ -752,6 +752,14 @@ int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
 int64_t     kaix_int_field(KaiValue *v) { return kai_intf(v); }
 const char *kaix_str_bytes(KaiValue *v) { return v->as.s.bytes; }
 
+/* FFI v2 (#417): opaque-handle marshalling for the native backend.
+   `kaix_foreign_ptr` is the box→raw BORROW (read the parked `void *`);
+   `kaix_foreign` re-boxes a returned `void *` into a fresh KAI_FOREIGN
+   value. RC frees only the box, never the parked pointer — the driver
+   owns the C resource. */
+void      *kaix_foreign_ptr(KaiValue *v) { return kai_foreign_ptr(v); }
+KaiValue  *kaix_foreign(void *p)         { return kai_foreign(p); }
+
 /* ---------- m13: bit operations (compiler intrinsics) ----------
    The C-direct oracle (emit_c.kai) lowers each `bit_*` call INLINE to
    the matching C operator. The native backend routes a prelude callee

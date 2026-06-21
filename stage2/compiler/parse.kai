@@ -4276,6 +4276,18 @@ fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
         concat_all(["unsupported FFI ABI ", abi_span, " — only \"C\" is supported"])))
     } else {
       let p1 = p_advance(p_abi)
+      # FFI v2 (#417): after `extern "C"` the head can now be a
+      # foreign TYPE declaration (`type Name = { ... }` struct, or the
+      # contextual keyword `opaque Name`) in addition to the v1 `fn`
+      # form. A type head takes no `("symbol")` override (there is no
+      # C symbol to override) and no `pub`, so it is dispatched before
+      # the override/pub bookkeeping that only `fn` needs.
+      let head = p_peek(p1)
+      if tk_is(head.kind, TkType) {
+        parse_extern_struct_decl(p_advance(p1), t)
+      } else if is_opaque_keyword(p1, head) {
+        parse_extern_opaque_decl(p_advance(p1), t)
+      } else {
       # Optional `("real_symbol")` name override. Sits immediately
       # after the ABI literal with no intervening
       # newline so the parser cannot mistake a list literal that
@@ -4290,12 +4302,13 @@ fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
           let p3 = if is_pub { p_skip_newlines(p_advance(p2)) } else { p2 }
           let fn_tok = p_peek(p3)
           if not tk_is(fn_tok.kind, TkFn) {
-            err_d(p_error(p3, fn_tok, "expected `fn` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)"))
+            err_d(p_error(p3, fn_tok, "expected `fn`, `type`, or `opaque` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)"))
           } else {
             let decl_r = parse_axiom_decl(p_advance(p3), is_pub, true, c_sym_over, t)
             validate_extern_c_decl(decl_r, t)
           }
         }
+      }
       }
     }
   }
@@ -4342,6 +4355,60 @@ fn parse_optional_extern_c_override(p: Parser) : PStr / Console {
   }
 }
 
+# FFI v2 (#417): `opaque` is a CONTEXTUAL keyword — it is a plain
+# identifier everywhere except immediately after `extern "C"`, so the
+# lexer keeps no `TkOpaque` token (adding one would risk the stage1
+# selfhost fixed point). Recognise it by spelling at this one site.
+fn is_opaque_keyword(p: Parser, tok: Token) : Bool =
+  tk_is(tok.kind, TkIdent) and tok_source(p.src, tok) == "opaque"
+
+# FFI v2 (#417): parse `extern "C" type Name = { field: T, ... }` —
+# a C struct passed by value across the boundary. The body reuses the
+# ordinary record-body parser (so field syntax, `priv`, and trailing
+# commas behave identically) and the resulting field list is rewrapped
+# into the foreign-type node. Field C-ABI validation runs in
+# `validate_extern_struct_decl`; here we only parse the shape.
+# `p` points just past the `type` keyword; `t` is the `extern` token.
+fn parse_extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" type`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkEq) {
+      err_d(p_error_here(p1, "expected `=` in `extern \"C\" type` declaration"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      if not p_at(p2, TkLbrace) {
+        err_d(p_error_here(p2, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`"))
+      } else {
+        let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], t)
+        match body_r.r {
+          None -> body_r
+          Some(d) -> match d {
+            DType(_, _, _, TBRecord(fields), _, _, _) ->
+              validate_extern_struct_decl(name, fields, body_r.p, t)
+            _ -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
+          }
+        }
+      }
+    }
+  }
+}
+
+# FFI v2 (#417): parse `extern "C" opaque Name` — an opaque C handle.
+# No body, no `=`, no fields. `p` points just past `opaque`.
+fn parse_extern_opaque_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" opaque`"))
+  } else {
+    let name = tok_source(p.src, id)
+    ok_d(p_advance(p), DExternType(name, ETOpaque, t.line, t.col))
+  }
+}
+
 # An `extern "C" fn` declaration MUST advertise `Ffi` in its effect
 # row. FFI crosses to C *via* the `Ffi` capability; an extern without
 # that label silently bypasses the contract and downstream invariants
@@ -4377,6 +4444,17 @@ fn row_label_names_has(labels: [RowLabel], target: String) : Bool {
 # `is_return_slot` widens the allowlist to include `Unit` (a `void`
 # return is fine in C; a `void` parameter is not the same shape as
 # kaikai's nullary `Unit` and is excluded).
+# FFI v2 (#417): the fixed-width FFI-boundary scalar annotation types.
+# They map to C `uint8_t`/`int32_t`/`float`/... at the boundary and
+# are NOT first-class kaikai arithmetic types — a value flowing
+# through one is a plain `Int` (or `Real` for `F32`) box on the kaikai
+# side, C-cast at the shim. The set is closed (issue #417); a wider
+# numeric audit is #514's concern, not this lane's.
+fn is_fixed_width_ffi_name(name: String) : Bool =
+  name == "U8" or name == "U16" or name == "U32" or name == "U64" or
+  name == "I8" or name == "I16" or name == "I32" or name == "I64" or
+  name == "F32"
+
 fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
   match t.tkind {
     TyName(name, targs) ->
@@ -4386,10 +4464,88 @@ fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
       else if name == "Bool" { true }
       else if name == "String" { true }
       else if name == "Unit" { is_return_slot }
+      else if is_fixed_width_ffi_name(name) { true }
+      # FFI v2 (#417): a bare uppercase name MAY be a declared
+      # `extern "C" type`/`opaque`. The parser cannot see the type
+      # registry, so it accepts the shape here; the resolver
+      # (`validate_extern_fn_types`) rejects a name that is not a
+      # declared foreign type. Parameterized / list / function shapes
+      # stay hard-rejected (a real C ABI never has them).
+      else if is_upper_first(name) { true }
       else { false }
     _ -> false
   }
 }
+
+# True when `name`'s first character is an ASCII uppercase letter.
+fn is_upper_first(name: String) : Bool =
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None    -> false
+  }
+
+# FFI v2 (#417): every field of an `extern "C" type` struct must be a
+# C-ABI scalar — a fixed-width annotation, an FFI primitive, or
+# (recursively) another declared extern struct's name. A list /
+# parameterised / function field type would have no C struct layout.
+# Validation of nested struct existence is deferred to the resolver
+# (same registry-availability reason as fn params); here we reject the
+# shapes that can never be a C field.
+fn validate_extern_struct_decl(name: String, fields: [FieldDecl],
+                               p: Parser, t: Token) : PDecl / Console {
+  match first_non_c_field(fields) {
+    Some(fd) -> match fd {
+      FD(_, fname, fty) -> {
+        let msg = concat_all([
+          "`extern \"C\" type ", name, "` field `", fname,
+          "` has type `", type_surface(fty),
+          "` which has no C struct layout — fields must be fixed-width (U8 U16 U32 U64 I8 I16 I32 I64 F32) or another `extern \"C\" type`"
+        ])
+        err_d(p_error(p, t, msg))
+      }
+    }
+    None -> ok_d(p, DExternType(name, ETStruct(fields), t.line, t.col))
+  }
+}
+
+fn first_non_c_field(fields: [FieldDecl]) : Option[FieldDecl] {
+  match fields {
+    [] -> None
+    [fd, ...rest] -> match fd {
+      FD(_, _, fty) ->
+        if is_c_field_type(fty) { first_non_c_field(rest) }
+        else { Some(fd) }
+    }
+  }
+}
+
+# A struct field type is valid when it is a bare uppercase name with no
+# type arguments (a fixed-width annotation or a nested extern struct).
+# `Int`/`Real`/`String`/`Bool` are intentionally NOT accepted as struct
+# fields: a struct field needs an exact C width, which only the
+# fixed-width set guarantees (an `Int` is i64, breaking small-struct
+# layout — the precise footgun #417 calls out).
+# A struct field type is valid when it is a fixed-width annotation OR a
+# bare uppercase name that could be a nested `extern "C" type` struct.
+# The v1 primitives (Int/Real/String/Bool/Char/Unit) are REJECTED: a C
+# struct field needs an exact width, which `Int` (i64) / `Real` (double)
+# / `String` (ptr) do not give at the layout the C compiler sees — the
+# precise mis-alignment trap #417 calls out. Use the fixed-width set
+# (U8..F32) for struct fields.
+fn is_c_field_type(t: TypeExpr) : Bool {
+  match t.tkind {
+    TyName(name, targs) ->
+      if list_length(targs) > 0 { false }
+      else if is_fixed_width_ffi_name(name) { true }
+      else if is_v1_primitive_name(name) { false }
+      else { is_upper_first(name) }
+    _ -> false
+  }
+}
+
+fn is_v1_primitive_name(name: String) : Bool =
+  name == "Int" or name == "Real" or name == "Bool" or
+  name == "String" or name == "Char" or name == "Unit"
 
 # Walk an `extern "C" fn` parameter list and return the
 # first param whose type is NOT C-ABI safe, or `None` if every
@@ -4485,7 +4641,7 @@ fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
                 "`extern \"C\" fn ", name,
                 "` parameter `", p.pname,
                 "` has type `", ty_s,
-                "` which is not C-ABI compatible — allowed: Int, Real, Bool, String"
+                "` which is not C-ABI compatible — allowed: Int, Real, Bool, String, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
               ])
               err_d(p_error(decl_r.p, t, msg))
             }
@@ -4494,7 +4650,7 @@ fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
                 let msg = concat_all([
                   "`extern \"C\" fn ", name,
                   "` return type `", type_surface(ret_ty),
-                  "` is not C-ABI compatible — allowed: Int, Real, Bool, String, Unit"
+                  "` is not C-ABI compatible — allowed: Int, Real, Bool, String, Unit, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
                 ])
                 err_d(p_error(decl_r.p, t, msg))
               } else { decl_r }

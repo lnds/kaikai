@@ -60,6 +60,8 @@ import compiler.unbox
 import compiler.perceus
 import compiler.protos
 import compiler.emit_shared
+import compiler.ffi_v2
+import compiler.emit_ffi_c
 import compiler.region
 
 # ====================================================================
@@ -137,6 +139,11 @@ type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], c
                  # same-name effects from different modules thus emit and
                  # reference distinct `Ev` structs.
                  effs: [Decl],
+                 # FFI v2 (#417): the extern-type registry (struct field
+                 # layouts + opaque names), collected once from the
+                 # pre-lowering decls. The FFI shim emitter keys off it to
+                 # unwrap a record into a C struct / pass an opaque void*.
+                 ffi_reg: [ExternTypeReg],
                  # The post-monomorph, module-mangled symbol of the fn /
                  # lambda whose body is currently being emitted. Passed to
                  # `find_lam` so a nested ELambda resolves to ITS module's
@@ -147,7 +154,7 @@ type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], c
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
 # keys on this + (line, col) so a nested ELambda resolves to its own
@@ -155,31 +162,31 @@ fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
 fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: ef }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef }
 
 # issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
 fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # i64-inline (Lane B): set the kind-1 raw-bound binder name set for an arm
 # body. Entering a match arm whose pattern binds kind-1 Int slots, the
@@ -189,7 +196,7 @@ fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
 fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, cur_enc_fn: cx.cur_enc_fn }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn }
 
 # True when `nm` is a kind-1 raw-bound binder in the current arm scope.
 fn emit_ctx_kind1_raw_has(cx: EmitCtx, nm: String) : Bool = list_has(cx.kind1_raw, nm)
@@ -5245,7 +5252,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], cls: [ClauseInfo], enums: [String], consts: [Decl], effs: [Decl]) : String / Console =
 
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, cur_enc_fn: "" })))
+                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "" })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
@@ -7142,7 +7149,16 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
       if body_is_ffi_extern(body) {
         # Issue #261: the C-side symbol is either the override
         # baked into the body's tag or the kaikai identifier.
-        emit_ffi_shim_body(sig, ffi_extern_symbol_of(body, name), params, ret_ty_opt)
+        # FFI v2 (#417): a signature mentioning a struct / opaque /
+        # fixed-width type takes the v2 shim (struct unwrap + re-box,
+        # opaque void*, width casts); a purely-v1 scalar signature stays
+        # on the existing shim byte-for-byte.
+        let csym = ffi_extern_symbol_of(body, name)
+        if ffi_sig_uses_v2(params, ret_ty_opt, cx.ffi_reg) {
+          emit_ffi_v2_shim_body(sig, csym, params, ret_ty_opt, cx.ffi_reg)
+        } else {
+          emit_ffi_shim_body(sig, csym, params, ret_ty_opt)
+        }
       } else if body_is_proto_dispatch(body) {
         # Option C: runtime dispatch shim. Look up the matching
         # `__pimpl_*` in the impl-table and tail-call it. See
@@ -7169,7 +7185,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx) : String / Console {
         # `cur_enc_fn` becomes THIS fn's mangled symbol so a nested
         # ELambda in the body resolves to its own module's LamInfo.
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, cur_enc_fn: c_sym(name, mo) }
+                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo) }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -7305,6 +7321,11 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
       arg_decrefs,
       "    return kai_str(_kai_ffi_ret == NULL ? \"\" : _kai_ffi_ret);\n"
     ])
+    # FFI v2 kinds (#417) never reach the v1 shim — a signature using
+    # one routes to `emit_ffi_v2_shim_body`. Belt for exhaustiveness.
+    FfiRetFixed(_)   -> ffi_v1_v2_kind_error("fixed-width")
+    FfiRetStruct(n)  -> ffi_v1_v2_kind_error(n)
+    FfiRetForeign(n) -> ffi_v1_v2_kind_error(n)
     FfiRetUnknown(t) -> concat_all([
       "#error \"FFI return type `", t,
       "` is not supported in m12.7.x — use Int / Real / Bool / String / Unit\"\n"
@@ -7312,6 +7333,13 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
   }
   concat_all([sig, " {\n", body, "}\n\n"])
 }
+
+# FFI v2 (#417): a v2 kind reaching the v1 scalar shim is a routing bug
+# (`ffi_sig_uses_v2` should have sent it to `emit_ffi_v2_shim_body`).
+# Emit a `#error` naming the offending type so the C compile fails loud.
+fn ffi_v1_v2_kind_error(name: String) : String =
+  concat_all(["#error \"FFI v2 type `", name,
+              "` reached the v1 scalar shim — internal routing bug\"\n"])
 
 # Option C: runtime-dispatch shim body for `__proto_<op>`. Looks up
 # the matching `__pimpl_*` in the impl-table by `(proto_id,
@@ -7460,6 +7488,11 @@ fn ffi_c_ret_type_str(k: FfiRetKind) : String {
     FfiRetReal -> "double"
     FfiRetBool -> "int"
     FfiRetString -> "const char *"
+    # FFI v2 kinds never reach these v1 helpers (the v2 shim path owns
+    # them); the body is `#error`, never compiled. Belt for exhaustiveness.
+    FfiRetFixed(_)   -> "void"
+    FfiRetStruct(_)  -> "void"
+    FfiRetForeign(_) -> "void"
     FfiRetUnknown(_) -> "void"  # body is `#error`, never compiled
   }
 }
@@ -7473,6 +7506,9 @@ fn ffi_c_param_type_str(p: Param) : String {
       FfiRetBool -> "int"
       FfiRetString -> "const char *"
       FfiRetUnit -> "/* Unit param not supported */ void *"
+      FfiRetFixed(_)   -> "/* v2 fixed-width — v2 shim path */ void *"
+      FfiRetStruct(_)  -> "/* v2 struct — v2 shim path */ void *"
+      FfiRetForeign(_) -> "/* v2 opaque — v2 shim path */ void *"
       FfiRetUnknown(_) -> "/* unsupported FFI param */ void *"
     }
   }
@@ -7519,6 +7555,10 @@ fn ffi_emit_arg_setup(params: [Param], i: Int) : String {
         FfiRetUnit -> concat_all([
           "    /* Unit FFI arg #", int_to_string(i), " elided */\n"
         ])
+        # FFI v2 kinds are handled by the v2 shim path, never here.
+        FfiRetFixed(_)   -> ffi_v1_v2_kind_error("fixed-width")
+        FfiRetStruct(n)  -> ffi_v1_v2_kind_error(n)
+        FfiRetForeign(n) -> ffi_v1_v2_kind_error(n)
         FfiRetUnknown(t) -> concat_all([
           "#error \"FFI arg type `", t, "` is not supported\"\n"
         ])
@@ -7800,7 +7840,7 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # lambda otherwise looked up under the wrong enc_fn → "non-callable").
   let test_enc = concat_all(["__test__", int_to_string(test_line), "_", int_to_string(test_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, cur_enc_fn: test_enc }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -7890,7 +7930,7 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
   # inside a bench body resolve in `find_lam`.
   let bench_enc = concat_all(["__bench__", int_to_string(bench_line), "_", int_to_string(bench_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, cur_enc_fn: bench_enc }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -8242,7 +8282,7 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   # inside a check body resolve in `find_lam`.
   let check_enc = concat_all(["__check__", int_to_string(check_line), "_", int_to_string(check_col)])
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, cur_enc_fn: check_enc }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -9585,11 +9625,14 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   let mono_structs = mono_sum_decls(decls, enum_names)
   let eff_structs = effect_struct_decls(decls)
   let env_structs = emit_handle_env_typedefs(clauses_info)
+  # FFI v2 (#417): C struct typedefs for every `extern "C" type`, so a
+  # struct-by-value shim can name `struct __kai_ffi_<Name>`.
+  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls))
   let types_h = concat_all([
     "/* generated by kaikai stage 2 — shared types header */\n",
     "#ifndef KAI_TYPES_H\n#define KAI_TYPES_H\n",
     "#include \"runtime.h\"\n\n",
-    mono_structs, eff_structs, env_structs,
+    mono_structs, eff_structs, env_structs, ffi_structs,
     "\n#endif /* KAI_TYPES_H */\n"
   ])
 
@@ -9608,7 +9651,7 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
 
   # ---- per-module .c translation units ------------------------------
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), cur_enc_fn: "" }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "" }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
@@ -9706,6 +9749,9 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # the env type) and before the install-site stmt-expressions emitted
   # inside fn bodies.
   let env_structs = emit_handle_env_typedefs(clauses_info)
+  # FFI v2 (#417): C struct typedefs for every `extern "C" type`,
+  # emitted before any shim that passes one by value.
+  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
   let fwd = fn_forward_decls(decls, fns)
   let thunk_fwd = thunk_forward_decls(decls)
@@ -9724,7 +9770,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # recursing, so the entry `lcs` is `[]`.
   let enum_names = collect_enum_type_names(decls)
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), cur_enc_fn: "" }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "" }
   let bodies = fn_bodies(src, decls, cx)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names, const_decls_only(decls), effect_decls_only(decls))
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
@@ -9732,7 +9778,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
   let main_wr = emit_main_wrapper(decls, bmode, variants, fns, enum_names)
-  concat_all([header, mono_structs, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
+  concat_all([header, mono_structs, eff_structs, env_structs, ffi_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
 }
 
 # ====================================================================
@@ -10568,9 +10614,7 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
     # documented decl arriving wrapped (pre-strip callers) recurses.
     DDoc(raw, text, inner, l, c) -> DDoc(raw, text, expand_ta_decl(inner, table, aliases, fuel), l, c)
     DModuleDoc(_, _, _, _) -> d
-    # DProtoImpl shape, registry-only nodes, etc. fall through if any
-    # exist; the resolver is conservative about leaving unknown decl
-    # shapes untouched.
+    DExternType(_, _, _, _) -> d   # FFI v2: foreign type carries no transparent-alias-expandable type expressions
   }
 }
 
@@ -11617,6 +11661,8 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     # carrier declares no signature.
     DDoc(_, _, inner, _, _) -> dump_decl_type(inner)
     DModuleDoc(_, _, _, _) -> ()
+    DExternType(name, _, line, col) ->
+      print("extern type #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
   }
 }
 

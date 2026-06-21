@@ -172,7 +172,12 @@ typedef enum {
                      * Haskell `IORef` lineage. */
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
-    KAI_BYTE          /* Lane 4 (#473): unsigned 8-bit integer, nominal */
+    KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
+    KAI_FOREIGN       /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
+                       * Parks a raw `void *` the kaikai side threads through
+                       * but never inspects. RC manages the box; the parked
+                       * pointer is NEVER freed (no Drop integration — the
+                       * driver owns that lifetime). Identity-compared. */
 } KaiTag;
 
 /* Head-type tags — single-dispatch protocol dispatch key.
@@ -465,6 +470,10 @@ struct KaiValue {
          * mailbox (that happens when the with_mailbox / spawn_actor
          * scope exits). */
         struct KaiMailbox *mb;
+        /* FFI v2 (#417): opaque C handle. The parked pointer is borrowed
+         * external memory — the box's RC frees only the KaiValue, never
+         * `foreign_ptr` (the driver calls the C destructor itself). */
+        void *foreign_ptr;
     } as;
     /* Variant slots overlap the union `as` (a variant uses none of the
      * union's named members), so a node is `8 B header + n*8 slots` = 48 B
@@ -564,6 +573,7 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         case KAI_REF:     return KAI_HEAD_ANON;  /* Ref is not protocol-dispatchable */
         case KAI_FIBER:   return KAI_HEAD_FIBER;
         case KAI_PID:     return KAI_HEAD_PID;
+        case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
         case KAI_BYTE:    return KAI_HEAD_BYTE;
     }
     return KAI_HEAD_ANON;
@@ -3100,6 +3110,22 @@ static KAI_RC_NOINLINE KaiValue *kai_byte(uint8_t n) {
     return v;
 }
 
+/* FFI v2 (#417): box an opaque C handle. `p` is borrowed external
+ * memory — RC frees only this box, never `p` (see kai_free_value's
+ * default arm: no payload free for KAI_FOREIGN). */
+static KAI_RC_NOINLINE KaiValue *kai_foreign(void *p) {
+    KaiValue *v = kai_alloc(KAI_FOREIGN);
+    v->as.foreign_ptr = p;
+    return v;
+}
+
+/* Unwrap an opaque handle back to its raw `void *` (a borrow — the box
+ * keeps owning the cell; the pointer stays valid until the C resource
+ * is destroyed by the driver). */
+static inline void *kai_foreign_ptr(KaiValue *v) {
+    return (v && v->tag == KAI_FOREIGN) ? v->as.foreign_ptr : NULL;
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_char(uint32_t c) {
     if (c <= KAI_CHAR_CACHE_HI) {
         if (!kai_char_cache_init) kai_char_cache_warm();
@@ -4403,6 +4429,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
+        case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
     }
     return 0;
@@ -4507,6 +4534,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_FIBER:   return kai_str("<fiber>");
         case KAI_PID:     return kai_str("<pid>");
+        case KAI_FOREIGN: return kai_str("<foreign>");
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
             return kai_str(buf);

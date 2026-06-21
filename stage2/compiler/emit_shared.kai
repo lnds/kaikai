@@ -1453,6 +1453,7 @@ pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
     DUse(_, _, _) -> st                       # m7e §25: stripped by desugar_use_decls; no expressions
     DDoc(_, _, _, _, _) -> st                 # issue #681: stripped post-parse; wrapper itself has no expressions
     DModuleDoc(_, _, _, _) -> st              # issue #681: doc text only, no expressions
+    DExternType(_, _, _, _) -> st             # FFI v2: foreign type decl holds no expressions
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> st     # m12.7: rewritten to DFn by lower_axioms; no expressions on the bare form
     DConst(_, _, _, body, _, _, _) -> {              # issue #269: literal-only body, but walk for safety
       collect_expr(body, st)
@@ -1720,14 +1721,53 @@ pub fn is_fresh_alloc(e: Expr) : Bool {
 # m12.7.x FFI v1: enumeration of the supported return kinds plus an
 # escape hatch (`FfiRetUnknown`) carrying the offending type name so
 # the emitted `#error` can name it back to the user.
-#[doc("x FFI v1: enumeration of the supported return kinds plus an escape hatch (`FfiRetUnknown`) carrying the offending type name so the emitted `#error` can name it back to the user.")]
+#[doc("FFI marshalling kind of a boundary type. v1 scalars (Int/Real/Bool/String/Unit) plus FFI v2 (#417): fixed-width annotations (`FfiRetFixed`), struct-by-value (`FfiRetStruct`, carrying the declared name — fields looked up in the extern-type registry), and opaque handles (`FfiRetForeign`). `FfiRetUnknown` carries the offending type name so the emitted `#error` can name it.")]
 pub type FfiRetKind
   = FfiRetUnit
   | FfiRetInt
   | FfiRetReal
   | FfiRetBool
   | FfiRetString
+  | FfiRetFixed(FfiFixed)
+  | FfiRetStruct(String)
+  | FfiRetForeign(String)
   | FfiRetUnknown(String)
+
+#[doc("FFI v2 (#417): a fixed-width FFI-boundary scalar. Maps to a C `uintN_t`/`intN_t`/`float` at the boundary; the kaikai side stays `Int` (or `Real` for `F32`). C-cast semantics, no range-check.")]
+pub type FfiFixed = FxU8 | FxU16 | FxU32 | FxU64 | FxI8 | FxI16 | FxI32 | FxI64 | FxF32
+
+#[doc("FFI v2 (#417): the fixed-width annotation for `name`, or None if it is not one.")]
+pub fn ffi_fixed_of_name(name: String) : Option[FfiFixed] {
+  if name == "U8" { Some(FxU8) }
+  else if name == "U16" { Some(FxU16) }
+  else if name == "U32" { Some(FxU32) }
+  else if name == "U64" { Some(FxU64) }
+  else if name == "I8" { Some(FxI8) }
+  else if name == "I16" { Some(FxI16) }
+  else if name == "I32" { Some(FxI32) }
+  else if name == "I64" { Some(FxI64) }
+  else if name == "F32" { Some(FxF32) }
+  else { None }
+}
+
+#[doc("The C scalar type a fixed-width annotation maps to at the boundary.")]
+pub fn ffi_fixed_c_type(f: FfiFixed) : String = match f {
+  FxU8  -> "uint8_t"
+  FxU16 -> "uint16_t"
+  FxU32 -> "uint32_t"
+  FxU64 -> "uint64_t"
+  FxI8  -> "int8_t"
+  FxI16 -> "int16_t"
+  FxI32 -> "int32_t"
+  FxI64 -> "int64_t"
+  FxF32 -> "float"
+}
+
+#[doc("True when a fixed-width annotation is the floating `F32` (carried on the kaikai side as `Real`, not `Int`).")]
+pub fn ffi_fixed_is_float(f: FfiFixed) : Bool = match f {
+  FxF32 -> true
+  _     -> false
+}
 
 #[doc("FFI marshalling helper: ret kind of.")]
 pub fn ffi_ret_kind_of(opt: Option[TypeExpr]) : FfiRetKind {
@@ -1737,7 +1777,12 @@ pub fn ffi_ret_kind_of(opt: Option[TypeExpr]) : FfiRetKind {
   }
 }
 
-#[doc("FFI marshalling helper: kind of ty.")]
+# Registry-free classifier: handles v1 scalars + fixed-width
+# annotations (a closed global set). A non-primitive named type
+# becomes `FfiRetUnknown` here — the registry-AWARE classifier
+# (`ffi_kind_of_ty_reg`, compiler/ffi_v2.kai) upgrades a known extern
+# struct / opaque before the emitter consumes the result.
+#[doc("FFI marshalling helper: registry-free kind of a boundary type (v1 scalars + fixed-width).")]
 pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
   match t.tkind {
     TyName(n, _) ->
@@ -1746,7 +1791,10 @@ pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
       else if n == "Bool" { FfiRetBool }
       else if n == "String" { FfiRetString }
       else if n == "Unit" { FfiRetUnit }
-      else { FfiRetUnknown(n) }
+      else { match ffi_fixed_of_name(n) {
+        Some(fx) -> FfiRetFixed(fx)
+        None     -> FfiRetUnknown(n)
+      } }
     _ -> FfiRetUnknown("non-named type")
   }
 }

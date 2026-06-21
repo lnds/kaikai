@@ -180,19 +180,25 @@ package manager does not automate C source compilation; the
 consumer's build (`Makefile`, shell script, etc.) must produce
 the C object before invoking `kai build`.
 
-### What FFI v1 does NOT support
+### FFI capability matrix
 
-| Feature | Status | Tracking |
+| Feature | Status | Notes |
 | --- | --- | --- |
-| Struct / record by value | **Not supported** | #417 (FFI v2) |
-| Out-parameters / pointer-to-T arguments | **Not supported** | #417 |
-| Return-by-value of structs | **Not supported** | #417 |
-| Opaque pointers / handles | Workaround via `Int` | #417 |
+| Scalars (`Int`/`Real`/`Bool`/`String`/`Unit`) | **Shipped (v1)** | both backends |
+| Fixed-width types (`U8`..`F32`) | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
+| Struct / record by value | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
+| Return-by-value of structs | **Shipped (v2, #417)** | C backend |
+| Opaque pointers / handles | **Shipped (v2, #417)** | both backends; no-Drop ownership |
+| Out-parameters / pointer-to-T arguments | Not supported | model via opaque handle + accessor |
 | C unions | Not planned | — |
 | Variadic C functions (`printf` family) | Not planned | — |
-| Callbacks from C back into kaikai | Not planned | post-FFI-v2 |
+| Callbacks from C back into kaikai | Not planned | post-v2 |
 | Bitfields | Not planned | — |
-| Fixed-width integer types (`U8`, `I32`, …) | **Not supported** | #417 |
+
+The C shim pattern below remains valid for what stays out of scope
+(unions, variadics, callbacks) and for the native backend's struct
+gap. For the common cases it is no longer needed — see
+[What FFI v2 adds](#what-ffi-v2-adds-417) and `kai info ffi`.
 
 ### The C shim pattern
 
@@ -273,14 +279,19 @@ The shim approach works but has real costs:
 - **Future bindings** (SDL2, GLFW, libcurl, …) will hit the same
   wall and need their own shim layer until FFI v2 lands.
 
-## What changes in FFI v2
+## What FFI v2 adds (#417)
 
-Tracked under #417. Target: v1.1 (post-2026-05-21 release).
+FFI v2 ships three pieces on top of the v1 scalar boundary. The
+authoritative surface reference is `kai info ffi`.
 
-The minimum subset planned for v2:
+1. **Fixed-width boundary annotations** — `U8 U16 U32 U64 I8 I16 I32
+   I64 F32`. Boundary-only types: a value flowing through one is a
+   plain `Int` (or `Real` for `F32`) on the kaikai side (so it unifies
+   with literals and feeds arithmetic), C-cast to the exact width at
+   the shim. No arithmetic on `U8` in kaikai-land — these exist for C
+   layout correctness, not as a numeric primitive set.
 
-1. **Struct-by-value across the boundary.** A kaikai record maps
-   to a C struct, passable both ways:
+2. **Struct-by-value across the boundary** (incl. return-by-value):
 
    ```kai
    extern "C" type Color = { r: U8, g: U8, b: U8, a: U8 }
@@ -289,23 +300,37 @@ The minimum subset planned for v2:
    extern "C"("DrawCircleV")
    pub fn draw_circle_v(center: Vector2, radius: F32,
                         color: Color) : Unit / Ffi
+
+   extern "C"("GetMousePosition")
+   pub fn get_mouse_position() : Vector2 / Ffi
    ```
 
-2. **Return-by-value of structs**: `GetMousePosition() : Vector2`.
+   The shim unwraps the record's fields into a local C struct with the
+   real widths, passes by value, and re-boxes a returned struct. Each
+   struct field must be a fixed-width type (or a nested `extern "C"
+   type`) — `Int`/`Real`/`String` fields are rejected (they break the
+   small-struct layout). The C ABI register/memory classification is
+   the C compiler's job.
 
-3. **Opaque handles**: `extern "C" opaque Font` for types the
-   kaikai side passes around but never inspects.
+3. **Opaque handles** — `extern "C" opaque Name`, for types the kaikai
+   side threads through but never inspects (libpq `PGconn *`,
+   `PGresult *`). Backed by a reference-counted box parking the C
+   `void *`. **Ownership rule: no Drop integration** — kaikai RC frees
+   the box but NEVER the C resource; the driver calls the C destructor
+   explicitly. A handle threaded through many calls is never
+   double-freed.
 
-4. **Fixed-width primitive annotations**: `U8`, `U16`, `U32`,
-   `U64`, `I8`, `I16`, `I32`, `F32` — boundary-only types
-   (cannot do arithmetic in kaikai-land), used for layout
-   correctness in struct fields.
+> **Backend status.** Fixed-width, struct-by-value, and opaque all work
+> on the **C-direct backend** (`--backend=c`). On the **native**
+> (libLLVM) default backend, **opaque handles** are fully supported;
+> **struct-by-value and standalone fixed-width** route through the C
+> backend (a native build reports the gap and the `--backend=c` fix).
+> Native LLVM struct/width marshalling is a planned follow-up.
 
-After FFI v2 lands, the raylib binding from uira shrinks ~40
-trivial shim wrappers to bare `extern "C"` declarations. C shims
-remain available for cases that genuinely need them (callbacks
-from C into kaikai, unions, variadics) but the common case of
-"library uses small structs by value" stops requiring them.
+The raylib-style binding (small structs by value) and the libpq-style
+driver (opaque handles + strings) both stop needing hand-written C
+shims for the common case. C shims remain only for what stays out of
+scope: callbacks from C into kaikai, unions, variadics, bitfields.
 
 ## Bindgen (post-FFI-v2)
 

@@ -426,6 +426,14 @@ fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = mat
 }
 
 fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
+  # FFI v2 (#417): an `extern "C" fn`'s body is the magic FFI tag, so
+  # the borrow-inference walk sees no use of any param and would mark
+  # them all BORROWED — but the shim CONSUMES each boxed input
+  # (callee-owns). A borrowed classification makes the caller strip the
+  # dup, so a value passed to two extern calls is double-freed. Register
+  # NO borrowed positions for an FFI shim; the consume-map marks them
+  # consuming instead.
+  DFn(_, _, _, _, _, _, body, _, _, _) if body_is_ffi_extern(body) -> acc
   DFn(_, name, _, params, _, _, body, _, _, mo) -> {
     let pnames = map(params, (p) => p.pname)
     let bset = pcs_borrow_params(pnames, body)
@@ -611,7 +619,16 @@ fn pcs_build_consume_map(decls: [Decl], acc: [ConsumeEntry]) : [ConsumeEntry] = 
 fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d {
   DFn(_, name, _, params, _, _, body, _, _, mo) -> {
     let pnames = map(params, (p) => p.pname)
-    let positions = pcs_consumed_positions(pnames, body, 0)
+    # FFI v2 (#417): an `extern "C" fn`'s body is the magic FFI tag, so
+    # `pcs_consumed_positions` (which walks the body for consuming uses)
+    # would see none and mark every arg borrow. But the emitted shim
+    # decrefs each boxed input (callee-owns). The consume-map must say
+    # so, or a value passed to two extern calls is double-freed (the
+    # first shim's decref drops it, the second reads freed memory). Mark
+    # every boxed param consuming; a Unit param carries no boxed value
+    # (the shim elides it), so it is skipped.
+    let positions = if body_is_ffi_extern(body) { pcs_ffi_consumed_positions(params, 0) }
+                    else { pcs_consumed_positions(pnames, body, 0) }
     let qual = [CE(pcs_borrow_key(name, mo), positions), ...acc]
     match mo {
       None    -> qual
@@ -619,6 +636,21 @@ fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d
     }
   }
   _ -> acc
+}
+
+# Every boxed param position of an `extern "C" fn` is consumed by the
+# shim (it decrefs each input). A `Unit` param is skipped — the shim
+# carries no boxed value for it.
+fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
+  [] -> []
+  [p, ...rest] ->
+    if pcs_param_is_ffi_unit(p) { pcs_ffi_consumed_positions(rest, i + 1) }
+    else { [i, ...pcs_ffi_consumed_positions(rest, i + 1)] }
+}
+
+fn pcs_param_is_ffi_unit(p: Param) : Bool = match p.ptype {
+  Some(t) -> match t.tkind { TyName(n, _) -> n == "Unit" _ -> false }
+  None    -> false
 }
 
 fn pcs_consumed_positions(pnames: [String], body: Expr, i: Int) : [Int] = match pnames {

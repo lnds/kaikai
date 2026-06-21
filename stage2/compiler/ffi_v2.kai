@@ -1,0 +1,131 @@
+# compiler/ffi_v2.kai — FFI v2 (#417) boundary type machinery, shared
+# by both backends.
+#
+# Three pieces ride on top of FFI v1's scalar shim:
+#   - fixed-width annotations (U8..F32) — closed global set, classified
+#     registry-free in `ffi_kind_of_ty` (emit_shared);
+#   - struct-by-value (`extern "C" type Color = { r: U8, ... }`) — a
+#     nominal record whose fields each carry a fixed-width C type. The
+#     shim unwraps the KAI_RECORD box into a local C struct, passes it
+#     by value, and re-boxes a fresh record on return;
+#   - opaque handles (`extern "C" opaque Font`) — threaded through but
+#     never inspected. A KAI_FOREIGN box parks a `void *`: the box
+#     rides Perceus normally, but its RC NEVER frees the parked C
+#     resource (no Drop integration — the driver owns that lifetime).
+#     Returned C strings keep copy semantics (`kai_str`), so a
+#     handle-borrowed `char *` is never aliased.
+#
+# `DExternType` is lowered to an ordinary `DType` before the typer runs
+# (`lower_extern_types`, desugar.kai); the REGISTRY collected here is
+# what the shim emitters key off — by declared name, not lowered shape.
+
+import compiler.util
+import compiler.ast
+import compiler.emit_shared
+
+# One declared `extern "C" type`/`opaque`, recovered from the
+# pre-lowering decl stream. A struct carries its field list (each field
+# typed with a fixed-width annotation); an opaque carries nothing.
+#[doc("FFI v2 registry entry: a declared extern struct (with fields) or opaque handle, keyed by name.")]
+pub type ExternTypeReg = ExtStruct(String, [FieldDecl]) | ExtOpaque(String)
+
+#[doc("Collect every `extern \"C\" type`/`opaque` from the (pre-lowering) decl stream into the FFI v2 registry.")]
+pub fn collect_extern_types(ds: [Decl]) : [ExternTypeReg] = collect_extern_types_loop(ds, [])
+
+# The phantom field name `lower_extern_opaques` (desugar.kai) stamps on
+# the one-field record an `extern "C" opaque` lowers to. The registry
+# recognises that record shape so emit (which runs on the post-lowering
+# stream) still classifies the type as opaque.
+#[doc("The phantom field name marking the record an `extern \"C\" opaque` lowers to.")]
+pub fn ffi_opaque_phantom_field() : String = "__ffi_handle"
+
+fn collect_extern_types_loop(ds: [Decl], acc: [ExternTypeReg]) : [ExternTypeReg] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DExternType(name, body, _, _) -> match body {
+      ETStruct(fields) -> collect_extern_types_loop(rest, [ExtStruct(name, fields), ...acc])
+      ETOpaque         -> collect_extern_types_loop(rest, [ExtOpaque(name), ...acc])
+    }
+    # Post-lowering: an `extern "C" opaque` is a one-`__ffi_handle`-field
+    # record. Recognise it so emit's registry stays correct.
+    DType(_, name, _, TBRecord(fields), _, _, _) ->
+      if is_opaque_phantom_record(fields) { collect_extern_types_loop(rest, [ExtOpaque(name), ...acc]) }
+      else { collect_extern_types_loop(rest, acc) }
+    # A documented foreign type rides inside a DDoc wrapper on some
+    # paths; see through it so the registry stays complete.
+    DDoc(_, _, inner, _, _) -> collect_extern_types_loop([inner, ...rest], acc)
+    _ -> collect_extern_types_loop(rest, acc)
+  }
+}
+
+fn is_opaque_phantom_record(fields: [FieldDecl]) : Bool = match fields {
+  [FD(_, fname, _)] -> fname == ffi_opaque_phantom_field()
+  _ -> false
+}
+
+#[doc("Look up an extern-type registry entry by name; None if not a declared foreign type.")]
+pub fn extern_type_lookup(reg: [ExternTypeReg], name: String) : Option[ExternTypeReg] = match reg {
+  [] -> None
+  [e, ...rest] ->
+    if extern_type_name(e) == name { Some(e) }
+    else { extern_type_lookup(rest, name) }
+}
+
+#[doc("The declared name of a registry entry.")]
+pub fn extern_type_name(e: ExternTypeReg) : String = match e {
+  ExtStruct(n, _) -> n
+  ExtOpaque(n)    -> n
+}
+
+# Registry-AWARE classifier: upgrades a non-primitive named type to a
+# struct / opaque kind when the registry knows it. Fixed-width and v1
+# scalars fall through to the registry-free `ffi_kind_of_ty`.
+#[doc("FFI v2 (#417): classify a boundary type, consulting the extern-type registry for struct/opaque names.")]
+pub fn ffi_kind_of_ty_reg(t: TypeExpr, reg: [ExternTypeReg]) : FfiRetKind = match t.tkind {
+  TyName(n, targs) ->
+    if list_length(targs) > 0 { FfiRetUnknown(n) }
+    else {
+      match extern_type_lookup(reg, n) {
+        Some(e) -> match e {
+          ExtStruct(_, _) -> FfiRetStruct(n)
+          ExtOpaque(_)    -> FfiRetForeign(n)
+        }
+        None -> ffi_kind_of_ty(t)
+      }
+    }
+  _ -> ffi_kind_of_ty(t)
+}
+
+#[doc("FFI v2 ret kind of an optional return type, registry-aware (None = Unit/void).")]
+pub fn ffi_ret_kind_of_reg(opt: Option[TypeExpr], reg: [ExternTypeReg]) : FfiRetKind = match opt {
+  None    -> FfiRetUnit
+  Some(t) -> ffi_kind_of_ty_reg(t, reg)
+}
+
+#[doc("The C struct fields of a registered extern struct (empty if not a struct / not found).")]
+pub fn extern_struct_fields(reg: [ExternTypeReg], name: String) : [FieldDecl] =
+  match extern_type_lookup(reg, name) {
+    Some(ExtStruct(_, fields)) -> fields
+    _ -> []
+  }
+
+# The C type of one struct field. A field is always a fixed-width
+# annotation (the parser/validator guarantee it) or a nested extern
+# struct name (rendered as the nested C struct tag). Anything else is a
+# defensive fallthrough that yields an `#error`-friendly placeholder.
+#[doc("The C type string for one extern-struct field, given the registry (fixed-width or nested struct).")]
+pub fn extern_field_c_type(fd: FieldDecl, reg: [ExternTypeReg]) : String = match fd {
+  FD(_, _, fty) -> match fty.tkind {
+    TyName(n, _) -> match ffi_fixed_of_name(n) {
+      Some(fx) -> ffi_fixed_c_type(fx)
+      None     -> match extern_type_lookup(reg, n) {
+        Some(ExtStruct(_, _)) -> extern_struct_c_tag(n)
+        _ -> concat_all(["/* unsupported FFI field type ", n, " */ int"])
+      }
+    }
+    _ -> "/* unsupported FFI field type */ int"
+  }
+}
+
+#[doc("The C struct tag name for an extern struct (`struct __kai_ffi_<Name>`).")]
+pub fn extern_struct_c_tag(name: String) : String = concat_all(["struct __kai_ffi_", name])

@@ -13,6 +13,7 @@ import compiler.ast
 import compiler.util
 import compiler.fnreg
 import compiler.emit_shared
+import compiler.ffi_v2
 import compiler.resolve
 import compiler.region
 import compiler.kir
@@ -33,7 +34,11 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   let lc      = collect_lams(raw_decls, fns, variants)
   let st0     = ls_new(fns, variants, lc.lams, collect_effect_names(raw_decls),
                        kir_const_decls(raw_decls, []), ffi_extern_names(raw_decls, []))
-  let kfns    = lower_fns(raw_decls, st0, [])
+  # FFI v2 (#417): the extern-type registry classifies struct / opaque
+  # FFI types for the native shim. Threaded explicitly to the FFI-fn
+  # lowering (narrower than a LowerSt field).
+  let freg    = collect_extern_types(raw_decls)
+  let kfns    = lower_fns(raw_decls, st0, freg, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
@@ -57,14 +62,14 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [EVar]) : LamCollect / Cons
 
 # --- Ordinary functions -------------------------------------------------
 
-fn lower_fns(ds: [Decl], st: LowerSt, acc: [KFn]) : [KFn] / Console = match ds {
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], acc: [KFn]) : [KFn] / Console = match ds {
   [] -> acc
   [d, ...rest] -> match d {
     DFn(_, name, _, params, ret_ty, _, body, _, _, mo) -> {
-      let kfn = lower_fn(name, params, ret_ty, body, mo, st)
-      lower_fns(rest, st, list_append(acc, [kfn]))
+      let kfn = lower_fn(name, params, ret_ty, body, mo, st, freg)
+      lower_fns(rest, st, freg, list_append(acc, [kfn]))
     }
-    _ -> lower_fns(rest, st, acc)
+    _ -> lower_fns(rest, st, freg, acc)
   }
 }
 
@@ -73,7 +78,7 @@ fn lower_fns(ds: [Decl], st: LowerSt, acc: [KFn]) : [KFn] / Console = match ds {
 # The body lowers into the entry block and whatever blocks the control
 # flow forks off; the final value seals the last block with `KRet`.
 fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
-            body: Expr, mo: Option[String], st0: LowerSt) : KFn / Console {
+            body: Expr, mo: Option[String], st0: LowerSt, freg: [ExternTypeReg]) : KFn / Console {
   let sym = c_sym(name, mo)
   # Enter WITH the EFn table rotated to prefer `mo` (this fn's module), so a
   # bare call inside the body resolves to a same-module definition over an
@@ -110,7 +115,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
     # they never clashed — this mangling brings the FFI wrapper into line
     # WITHOUT prefixing the whole native backend (a separate concern).
     let c_symbol = ffi_extern_symbol_of(body, name)
-    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params), kffi_kind_of_ret(ret_ty)),
+    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg), kffi_kind_of_ret(ret_ty, freg)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
           region_id: None, stateful: false }
   } else {
@@ -149,26 +154,36 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
 # the raw call. Reuses emit_shared's type→`FfiRetKind` classifier (the
 # typer's supported-FFI-type gate) and translates into the KIR's own
 # `KFfiKind`, so kir.kai stays free of an emit_shared dependency (Lane 0).
-fn ffi_param_kinds(params: [Param]) : [KFfiKind] = match params {
+fn ffi_param_kinds(params: [Param], freg: [ExternTypeReg]) : [KFfiKind] = match params {
   []           -> []
-  [p, ...rest] -> [kffi_kind_of_param(p), ...ffi_param_kinds(rest)]
+  [p, ...rest] -> [kffi_kind_of_param(p, freg), ...ffi_param_kinds(rest, freg)]
 }
 
-fn kffi_kind_of_param(p: Param) : KFfiKind = match p.ptype {
+fn kffi_kind_of_param(p: Param, freg: [ExternTypeReg]) : KFfiKind = match p.ptype {
   None    -> KFfiUnknown("missing")
-  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty(t))
+  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty_reg(t, freg))
 }
 
-fn kffi_kind_of_ret(ret_ty: Option[TypeExpr]) : KFfiKind =
-  kffi_of_ret_kind(ffi_ret_kind_of(ret_ty))
+fn kffi_kind_of_ret(ret_ty: Option[TypeExpr], freg: [ExternTypeReg]) : KFfiKind =
+  kffi_of_ret_kind(ffi_ret_kind_of_reg(ret_ty, freg))
 
 # Translate emit_shared's `FfiRetKind` to the KIR-local `KFfiKind`.
+# An opaque handle becomes `KFfiForeign` (a `void *` on the existing
+# native pointer path). Fixed-width and struct-by-value need LLVM C-API
+# surface the native backend lacks (integer-width truncation; struct
+# types + extractvalue), so they stay `KFfiUnknown` — the native backend
+# aborts loud and the user routes through `--backend=c` (the oracle,
+# which marshals both fully). Native fixed-width + struct are the
+# documented follow-up.
 fn kffi_of_ret_kind(k: FfiRetKind) : KFfiKind = match k {
   FfiRetUnit       -> KFfiUnit
   FfiRetInt        -> KFfiInt
   FfiRetReal       -> KFfiReal
   FfiRetBool       -> KFfiBool
   FfiRetString     -> KFfiString
+  FfiRetForeign(_) -> KFfiForeign
+  FfiRetFixed(_)   -> KFfiUnknown("fixed-width FFI (U8..F32) needs --backend=c")
+  FfiRetStruct(n)  -> KFfiUnknown(concat_all(["struct ", n, " (struct-by-value FFI needs --backend=c)"]))
   FfiRetUnknown(t) -> KFfiUnknown(t)
 }
 
