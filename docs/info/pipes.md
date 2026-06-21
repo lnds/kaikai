@@ -53,6 +53,31 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+## stdlib types that ride the pipes
+
+These stdlib types export the canonical `map` / `flat_map` / `filter`,
+so they dispatch through `|` / `||` / `|?`:
+
+```text
+[T]                  element a            (core/list)
+Stream[t, e]         element t            (stream)
+Map[k, v]            element Pair[k, v]   (collections/map)
+HashMap[k, v]        element Pair[k, v]   (collections/hashmap, / Mutable)
+Set[a]               element a            (collections/set)
+HashSet[t]           element t            (collections/hashset, / Mutable)
+Stack[a]             element a            (collections/stack)
+Queue[a]             element a            (collections/queue)
+```
+
+`Set` / `HashSet` collapse output collisions; `Map` / `HashMap`
+collapse duplicate output keys. The mutable `HashMap` / `HashSet`
+combinators carry `/ Mutable`.
+
+`Option` and `Result` deliberately do NOT ride the pipes — use `!`
+for propagation (`x!`) or `and_then` for explicit chaining.
+
+Non-List head dispatch is gated on edition `hanga-roa` or later.
+
 ## Precedence
 
 Pipes are at the bottom of the precedence table (level 10, looser
