@@ -1,0 +1,302 @@
+# compiler/emit_ffi_c.kai — FFI v2 (#417) C-direct shim synthesis.
+#
+# Extends the v1 scalar shim (emit_c.kai's `emit_ffi_shim_body`) with:
+#   - fixed-width boundary scalars (U8..F32) — C-cast at the call;
+#   - struct-by-value — unwrap the KAI_RECORD box into a local C struct
+#     with correct C field widths, pass by value, re-box on return;
+#   - opaque handles — pass `kai_foreign_ptr(box)` as `void *`, re-box
+#     a returned pointer with `kai_foreign`.
+#
+# The C struct layout lives in a typedef emitted into kai_types.h
+# (`emit_ffi_struct_typedefs`); the shim references it by the
+# `struct __kai_ffi_<Name>` tag. The own-and-release discipline mirrors
+# v1: boxed inputs are decref'd AFTER the extern returns (a struct/
+# string field unboxed to a borrow must outlive the call).
+
+import compiler.util
+import compiler.ast
+import compiler.emit_shared
+import compiler.ffi_v2
+
+# Emit one C `typedef struct { ... } __kai_ffi_<Name>;` per extern
+# struct in the registry, for the shared kai_types.h. Opaque handles
+# need no typedef (they cross as `void *`).
+#[doc("Emit the C struct typedefs for every `extern \"C\" type` in the registry.")]
+pub fn emit_ffi_struct_typedefs(reg: [ExternTypeReg]) : String = match reg {
+  [] -> ""
+  [e, ...rest] -> match e {
+    ExtStruct(name, fields) -> cat2(emit_ffi_one_struct_typedef(name, fields, reg),
+                                    emit_ffi_struct_typedefs(rest))
+    ExtOpaque(_) -> emit_ffi_struct_typedefs(rest)
+  }
+}
+
+# A plain struct-TAG definition (`struct __kai_ffi_<Name> { ... };`) —
+# no typedef alias. Every reference uses the tag form `struct
+# __kai_ffi_<Name>` (`extern_struct_c_tag`), so the C type is named
+# consistently and the C compiler sees one struct layout.
+fn emit_ffi_one_struct_typedef(name: String, fields: [FieldDecl], reg: [ExternTypeReg]) : String =
+  concat_all([
+    extern_struct_c_tag(name), " {\n",
+    emit_ffi_struct_fields(fields, reg),
+    "};\n"
+  ])
+
+fn emit_ffi_struct_fields(fields: [FieldDecl], reg: [ExternTypeReg]) : String = match fields {
+  [] -> ""
+  [fd, ...rest] -> match fd {
+    FD(_, fname, _) -> concat_all([
+      "    ", extern_field_c_type(fd, reg), " ", fname, ";\n",
+      emit_ffi_struct_fields(rest, reg)
+    ])
+  }
+}
+
+# The v2 shim body. `reg` resolves struct/opaque param + return kinds.
+# Falls back to nothing special for the v1 scalar kinds (the caller
+# handles those via the v1 path — this is only reached for a fn that
+# mentions at least one v2 type).
+#[doc("Synthesise the C body of an `extern \"C\" fn` whose signature uses an FFI v2 type (struct / opaque / fixed-width).")]
+pub fn emit_ffi_v2_shim_body(sig: String, cname: String, params: [Param],
+                             ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg]) : String {
+  let ret_kind = ffi_ret_kind_of_reg(ret_ty_opt, reg)
+  let extern_decl = ffi_v2_extern_decl(cname, params, ret_kind, reg)
+  let arg_setup = ffi_v2_arg_setup(params, 0, reg)
+  let arg_list = ffi_v2_arg_list(params, 0)
+  let call_expr = concat_all([cname, "(", arg_list, ")"])
+  # Callee-owns: the shim consumes (decrefs) each boxed input after the
+  # call. Perceus marks an `extern "C" fn`'s boxed params consuming
+  # (`pcs_consume_entry_of`), so it dups a shared value before each
+  # non-final call and moves it on the last — balancing the shim's one
+  # decref per owned ref. Opaque handles ride this exactly: the
+  # `KAI_FOREIGN` box is freed at the handle's last use (payload
+  # untouched — the driver calls the C destructor).
+  let body = ffi_v2_ret_body(ret_kind, call_expr, arg_setup, ffi_v2_arg_decrefs(params, 0, reg), reg)
+  concat_all([extern_decl, sig, " {\n", body, "}\n\n"])
+}
+
+# Release each boxed input after the call (callee-owns). A Unit param
+# carries no boxed value (elided in arg setup), so it is skipped — the
+# count must match the boxed wrapper params the kaikai caller passed.
+fn ffi_v2_arg_decrefs(params: [Param], i: Int, reg: [ExternTypeReg]) : String = match params {
+  [] -> ""
+  [p, ...rest] -> {
+    let kind = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg) }
+    let head = match kind {
+      FfiRetUnit -> ""
+      _          -> concat_all(["    kai_decref(kai_", p.pname, ");\n"])
+    }
+    cat2(head, ffi_v2_arg_decrefs(rest, i + 1, reg))
+  }
+}
+
+# A v2 shim DOES forward-declare the extern symbol: a struct/opaque
+# signature has no libc equivalent, so the C compiler needs the
+# prototype with the right struct-by-value / void* shape to lay out
+# the call ABI.
+fn ffi_v2_extern_decl(cname: String, params: [Param], ret_kind: FfiRetKind,
+                      reg: [ExternTypeReg]) : String =
+  concat_all([
+    "extern ", ffi_v2_c_ret_type(ret_kind, reg), " ", cname,
+    "(", ffi_v2_c_param_list(params, reg), ");\n"
+  ])
+
+fn ffi_v2_c_param_list(params: [Param], reg: [ExternTypeReg]) : String = match params {
+  [] -> "void"
+  _  -> join_with(map(params, (p) => ffi_v2_c_param_type(p, reg)), ", ")
+}
+
+fn ffi_v2_c_param_type(p: Param, reg: [ExternTypeReg]) : String = match p.ptype {
+  None    -> "void *"
+  Some(t) -> ffi_v2_c_type(ffi_kind_of_ty_reg(t, reg))
+}
+
+fn ffi_v2_c_ret_type(k: FfiRetKind, reg: [ExternTypeReg]) : String = match k {
+  FfiRetUnit -> "void"
+  _          -> ffi_v2_c_type(k)
+}
+
+# The C type for one v2 kind. Struct → `struct __kai_ffi_<Name>`,
+# opaque → `void *`, fixed-width → its C scalar, v1 scalars unchanged.
+fn ffi_v2_c_type(k: FfiRetKind) : String = match k {
+  FfiRetUnit       -> "void"
+  FfiRetInt        -> "int64_t"
+  FfiRetReal       -> "double"
+  FfiRetBool       -> "int"
+  FfiRetString     -> "const char *"
+  FfiRetFixed(fx)  -> ffi_fixed_c_type(fx)
+  FfiRetStruct(n)  -> extern_struct_c_tag(n)
+  FfiRetForeign(_) -> "void *"
+  FfiRetUnknown(_) -> "void *"
+}
+
+# Per-param: unbox the boxed kaikai arg into a C local `_kai_ffi_argN`
+# of the matching C type. A struct unwraps field-by-field into a C
+# struct literal; an opaque reads `kai_foreign_ptr`; a fixed-width
+# C-casts the underlying Int/Real; v1 scalars match the v1 shim.
+fn ffi_v2_arg_setup(params: [Param], i: Int, reg: [ExternTypeReg]) : String = match params {
+  [] -> ""
+  [p, ...rest] -> {
+    let kind = match p.ptype {
+      None    -> FfiRetUnknown("missing")
+      Some(t) -> ffi_kind_of_ty_reg(t, reg)
+    }
+    let arg = concat_all(["_kai_ffi_arg", int_to_string(i)])
+    let box = concat_all(["kai_", p.pname])
+    let stmt = ffi_v2_unbox_one(kind, arg, box, reg)
+    cat2(stmt, ffi_v2_arg_setup(rest, i + 1, reg))
+  }
+}
+
+fn ffi_v2_unbox_one(kind: FfiRetKind, arg: String, box: String, reg: [ExternTypeReg]) : String = match kind {
+  FfiRetInt    -> concat_all(["    int64_t ", arg, " = kai_intf(", box, ");\n"])
+  FfiRetReal   -> concat_all(["    double ", arg, " = ", box, "->as.r;\n"])
+  FfiRetBool   -> concat_all(["    int ", arg, " = ", box, "->as.b ? 1 : 0;\n"])
+  FfiRetString -> concat_all(["    const char *", arg, " = ", box, "->as.s.bytes;\n"])
+  FfiRetUnit   -> concat_all(["    /* Unit arg elided */\n"])
+  FfiRetFixed(fx) ->
+    if ffi_fixed_is_float(fx) {
+      concat_all(["    ", ffi_fixed_c_type(fx), " ", arg, " = (", ffi_fixed_c_type(fx), ") ", box, "->as.r;\n"])
+    } else {
+      concat_all(["    ", ffi_fixed_c_type(fx), " ", arg, " = (", ffi_fixed_c_type(fx), ") kai_intf(", box, ");\n"])
+    }
+  FfiRetForeign(_) -> concat_all(["    void *", arg, " = kai_foreign_ptr(", box, ");\n"])
+  FfiRetStruct(n)  -> ffi_v2_unbox_struct(n, arg, box, reg)
+  FfiRetUnknown(t) -> concat_all(["#error \"FFI arg type `", t, "` is not supported\"\n"])
+}
+
+# Unwrap a boxed record into a C struct literal. Each field is read by
+# name (`kai_record_get_borrow`) and unboxed at its C width.
+fn ffi_v2_unbox_struct(name: String, arg: String, box: String, reg: [ExternTypeReg]) : String {
+  let fields = extern_struct_fields(reg, name)
+  concat_all([
+    "    ", extern_struct_c_tag(name), " ", arg, " = { ",
+    ffi_v2_struct_field_inits(fields, box, reg), " };\n"
+  ])
+}
+
+fn ffi_v2_struct_field_inits(fields: [FieldDecl], box: String, reg: [ExternTypeReg]) : String = match fields {
+  [] -> ""
+  [fd] -> ffi_v2_struct_field_init(fd, box, reg)
+  [fd, ...rest] -> concat_all([ffi_v2_struct_field_init(fd, box, reg), ", ",
+                               ffi_v2_struct_field_inits(rest, box, reg)])
+}
+
+fn ffi_v2_struct_field_init(fd: FieldDecl, box: String, reg: [ExternTypeReg]) : String = match fd {
+  FD(_, fname, fty) -> {
+    let fbox = concat_all(["kai_op_field_borrow(", box, ", \"", fname, "\")"])
+    let kind = ffi_kind_of_ty_reg(fty, reg)
+    ffi_v2_field_read(kind, fbox)
+  }
+}
+
+# Read one boxed field at its C width (a borrow — the struct value
+# copies it, the box keeps owning the cell).
+fn ffi_v2_field_read(kind: FfiRetKind, fbox: String) : String = match kind {
+  FfiRetInt    -> concat_all(["kai_intf(", fbox, ")"])
+  FfiRetReal   -> concat_all([fbox, "->as.r"])
+  FfiRetBool   -> concat_all([fbox, "->as.b ? 1 : 0"])
+  FfiRetFixed(fx) ->
+    if ffi_fixed_is_float(fx) { concat_all(["(", ffi_fixed_c_type(fx), ") ", fbox, "->as.r"]) }
+    else { concat_all(["(", ffi_fixed_c_type(fx), ") kai_intf(", fbox, ")"]) }
+  _ -> concat_all(["/* unsupported struct field */ 0"])
+}
+
+fn ffi_v2_arg_list(params: [Param], i: Int) : String = match params {
+  [] -> ""
+  [_, ...rest] -> {
+    let head = concat_all(["_kai_ffi_arg", int_to_string(i)])
+    match rest {
+      [] -> head
+      _  -> concat_all([head, ", ", ffi_v2_arg_list(rest, i + 1)])
+    }
+  }
+}
+
+# Re-box the C return into a fresh KaiValue. A struct copies into a
+# KAI_RECORD; an opaque parks the pointer in a KAI_FOREIGN; fixed-width
+# widens to Int/Real; v1 scalars unchanged.
+fn ffi_v2_ret_body(ret_kind: FfiRetKind, call_expr: String, arg_setup: String,
+                   arg_decrefs: String, reg: [ExternTypeReg]) : String = match ret_kind {
+  FfiRetUnit -> concat_all([arg_setup, "    ", call_expr, ";\n", arg_decrefs, "    return kai_unit();\n"])
+  FfiRetInt -> concat_all([arg_setup, "    int64_t _kai_ffi_ret = (int64_t) ", call_expr, ";\n", arg_decrefs, "    return kai_int(_kai_ffi_ret);\n"])
+  FfiRetReal -> concat_all([arg_setup, "    double _kai_ffi_ret = (double) ", call_expr, ";\n", arg_decrefs, "    return kai_real(_kai_ffi_ret);\n"])
+  FfiRetBool -> concat_all([arg_setup, "    int _kai_ffi_ret = (int) ", call_expr, ";\n", arg_decrefs, "    return kai_bool(_kai_ffi_ret != 0);\n"])
+  FfiRetString -> concat_all([arg_setup, "    const char *_kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_str(_kai_ffi_ret == NULL ? \"\" : _kai_ffi_ret);\n"])
+  FfiRetFixed(fx) ->
+    if ffi_fixed_is_float(fx) {
+      concat_all([arg_setup, "    ", ffi_fixed_c_type(fx), " _kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_real((double) _kai_ffi_ret);\n"])
+    } else {
+      concat_all([arg_setup, "    ", ffi_fixed_c_type(fx), " _kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_int((int64_t) _kai_ffi_ret);\n"])
+    }
+  FfiRetForeign(_) -> concat_all([arg_setup, "    void *_kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_foreign(_kai_ffi_ret);\n"])
+  FfiRetStruct(n) -> ffi_v2_rebox_struct(n, call_expr, arg_setup, arg_decrefs, reg)
+  FfiRetUnknown(t) -> concat_all(["#error \"FFI return type `", t, "` is not supported\"\n"])
+}
+
+# Re-box a returned C struct into a fresh KAI_RECORD: stash the C
+# struct in a local, then build a record whose fields box each member
+# at its kaikai width (a fixed-width field re-boxes as Int / Real).
+fn ffi_v2_rebox_struct(name: String, call_expr: String, arg_setup: String,
+                       arg_decrefs: String, reg: [ExternTypeReg]) : String {
+  let fields = extern_struct_fields(reg, name)
+  let n = list_length(fields)
+  let ns = int_to_string(n)
+  concat_all([
+    arg_setup,
+    "    ", extern_struct_c_tag(name), " _kai_ffi_ret = ", call_expr, ";\n",
+    arg_decrefs,
+    "    KaiValue *_kai_ffi_fields[", ns, "];\n",
+    "    const char *_kai_ffi_names[", ns, "];\n",
+    ffi_v2_rebox_struct_fields(fields, 0, reg),
+    "    return kai_record(", ns, ", _kai_ffi_fields, _kai_ffi_names);\n"
+  ])
+}
+
+fn ffi_v2_rebox_struct_fields(fields: [FieldDecl], i: Int, reg: [ExternTypeReg]) : String = match fields {
+  [] -> ""
+  [fd, ...rest] -> match fd {
+    FD(_, fname, fty) -> {
+      let ix = int_to_string(i)
+      let member = concat_all(["_kai_ffi_ret.", fname])
+      let boxed = ffi_v2_rebox_member(ffi_kind_of_ty_reg(fty, reg), member)
+      concat_all([
+        "    _kai_ffi_fields[", ix, "] = ", boxed, ";\n",
+        "    _kai_ffi_names[", ix, "] = \"", fname, "\";\n",
+        ffi_v2_rebox_struct_fields(rest, i + 1, reg)
+      ])
+    }
+  }
+}
+
+fn ffi_v2_rebox_member(kind: FfiRetKind, member: String) : String = match kind {
+  FfiRetInt    -> concat_all(["kai_int((int64_t) ", member, ")"])
+  FfiRetReal   -> concat_all(["kai_real((double) ", member, ")"])
+  FfiRetBool   -> concat_all(["kai_bool(", member, " != 0)"])
+  FfiRetFixed(fx) ->
+    if ffi_fixed_is_float(fx) { concat_all(["kai_real((double) ", member, ")"]) }
+    else { concat_all(["kai_int((int64_t) ", member, ")"]) }
+  _ -> "kai_unit()"
+}
+
+# True when an `extern "C" fn` signature mentions ANY FFI v2 type
+# (struct / opaque / fixed-width) — the trigger for the v2 shim path.
+# A purely-v1 signature stays on the existing scalar shim.
+#[doc("True when an extern fn signature uses an FFI v2 type (struct/opaque/fixed-width), per the registry.")]
+pub fn ffi_sig_uses_v2(params: [Param], ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg]) : Bool =
+  ffi_kind_is_v2(ffi_ret_kind_of_reg(ret_ty_opt, reg)) or ffi_params_use_v2(params, reg)
+
+fn ffi_params_use_v2(params: [Param], reg: [ExternTypeReg]) : Bool = match params {
+  [] -> false
+  [p, ...rest] -> {
+    let k = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg) }
+    if ffi_kind_is_v2(k) { true } else { ffi_params_use_v2(rest, reg) }
+  }
+}
+
+fn ffi_kind_is_v2(k: FfiRetKind) : Bool = match k {
+  FfiRetFixed(_)   -> true
+  FfiRetStruct(_)  -> true
+  FfiRetForeign(_) -> true
+  _                -> false
+}
