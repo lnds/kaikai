@@ -2772,7 +2772,9 @@ test-effects: $(TARGET) build
 	  "stream_skip_policy|^skip count=3$$|#801 ReadFault.bad_chunk resume = skip and continue" \
 	  "stream_shout_roundtrip|^shout: HELLO$$|#801 read map write_lines in one expression" \
 	  "stream_abort_leak|^abort result=aborted closes=0$$|#801 abort policy skips producer close (documented fd leak)" \
-	  "ctor_field_effect_row|^boom x2$$|#801 typer: ctor field's effect row survives instantiation"; do \
+	  "ctor_field_effect_row|^boom x2$$|#801 typer: ctor field's effect row survives instantiation" \
+	  "row_carrier_pipe|^ticks=3$$|#773 typer: nominal effect-row carrier rides pipes and threads its row" \
+	  "row_carrier_naming|^named ticks=2$$|#773 typer: concrete-row annotation Stream[Int, Tick] resolves the row slot"; do \
 	  name=$${spec%%|*}; rest=$${spec#*|}; pat=$${rest%%|*}; desc=$${rest#*|}; \
 	  f=../examples/effects/$$name.kai; \
 	  ./$(TARGET) --edition hanga-roa --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
