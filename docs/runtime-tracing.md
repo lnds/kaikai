@@ -225,3 +225,39 @@ the attribute (zero overhead).
 Together, sites 1 + 2 (both inside `kai_synth_dim_pow`) account
 for **62.5 %** of the total leak — exactly the localization the
 tag-level report could not produce.
+
+## `KAI_MAX_HEAP` — process heap ceiling (host containment)
+
+A separate runtime knob (issue #878), unrelated to tracing: a hard
+ceiling on total committed heap.
+
+```sh
+KAI_MAX_HEAP=4g  ./myprog     # cap at 4 GiB
+KAI_MAX_HEAP=512m ./myprog    # cap at 512 MiB
+KAI_MAX_HEAP=67108864 ./myprog  # cap in plain bytes
+```
+
+Accepts a plain byte count or a single `k`/`m`/`g` suffix
+(case-insensitive). On cross, the runtime aborts clean:
+
+```
+kai: heap limit exceeded (KAI_MAX_HEAP=512m, used 536870912 bytes)
+```
+
+…and `exit(1)` — the same path the OOM checks use, triggered at the
+configured limit instead of at OS exhaustion. **Unset, empty, or
+unparseable → no cap** (a malformed value never installs a wrong
+ceiling), and the unset path adds one predicted branch per heap-grow
+boundary — selfhost stays byte-identical.
+
+The counter is monotonic committed-heap high-water, charged at every
+OS-commit grow point (slab/arena/cell-pool grow plus string/array
+payloads), so no allocation path grows past the ceiling uncounted. One
+global process ceiling; per-fiber limits are out of scope.
+
+This is the **structural** host-safety defense. The per-harness
+`timeout` / `ulimit -v` wrappers around benchmark and stress runs are a
+band-aid that only protects the test that remembers to wrap; the ceiling
+contains *any* run. It matters most on macOS, where `ulimit -v` is a
+no-op and the RAM compressor masks exhaustion until the host hangs — so
+without `KAI_MAX_HEAP` there is no ceiling at all on Darwin.
