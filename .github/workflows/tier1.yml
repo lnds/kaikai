@@ -12,109 +12,224 @@ concurrency:
 permissions:
   contents: read
 
+# CI structure (docs/ci-time-analysis.md). The tier1 gate's ~15-min light
+# fixture pool is CPU-bound + independent, so it is sharded across SEPARATE
+# runners (each with its own memory bus — in-job `-j` is bandwidth-capped).
+# A single `build` job bootstraps the C-only kaic2 ONCE and publishes it as
+# an artifact; tier0 + the three tier1 shards consume it (download + a
+# dependency-ordered mtime touch so `make` rebuilds nothing). The `tier1`
+# aggregator job gates on all three shards, so the REQUIRED check is still
+# named `tier1` and branch protection needs no change.
 jobs:
-  # selfhost byte-identical + demos baseline. Independent of tier1 so
-  # the two run in parallel. selfhost determinism is a property of the
-  # kaikai emitter, not the host C compiler, so Linux is sufficient;
-  # Apple-clang coverage lives in daily.yml + release.yml, off the PR path.
-  tier0:
+  # Shared doc-only detection. Pure-doc PRs short-circuit every downstream
+  # job with SUCCESS so the required `tier1` check is satisfied without
+  # spending build/test runners. (paths-ignore can't be used: branch
+  # protection lists `tier1` as required, so the workflow must always
+  # produce a status — paths-ignore would leave doc PRs BLOCKED forever.)
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
+    outputs:
+      doc-only: ${{ steps.doc-only.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # Doc-only PRs short-circuit with SUCCESS so the required tier1
-      # check is satisfied without spending a runner. Branch protection
-      # lists tier1 as required, so the workflow must always produce a
-      # status — paths-ignore would leave doc PRs BLOCKED forever.
       - name: Detect doc-only diff
         id: doc-only
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           if [ -z "$CHANGED" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
           if [ -z "$NON_DOC" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Doc-only PR; skipping tier0 build."
+            echo "Doc-only PR; skipping tier1 build + shards."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Build the C-only kaic2 once and publish the bootstrap chain. Every
+  # consuming job downloads this instead of paying the ~260 s bootstrap
+  # (45 s bundle regen + 197 s kaic2 -O2 cc + 20 s stage0/1) again.
+  build:
+    needs: changes
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install toolchain
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang
+      - name: Bootstrap C-only kaic2
+        run: make CC=clang kaic2
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaic2-c
+          # Only the dependency chain `make` consults to decide up-to-date.
+          # NOT stage2/build/*.c fixture outputs (hundreds of MB of test
+          # litter that the test jobs regenerate anyway).
+          path: |
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+          retention-days: 1
+          if-no-files-found: error
 
+  # selfhost byte-identical + demos baseline + arena + heap-ceiling.
+  # Consumes the shared kaic2 (selfhost re-runs the binary twice and diffs —
+  # determinism coverage is unchanged by sharing the build).
+  tier0:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
       - name: tier0 (selfhost byte-identical + demos baseline)
-        if: steps.doc-only.outputs.skip != 'true'
         run: make CC=clang tier0
-
       - name: Working tree clean check
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier0; build artifacts leaked into tracked paths"
-            git status
-            exit 1
+            git status; exit 1
           fi
 
-  tier1:
+  tier1-shard-1:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Detect doc-only diff
-        id: doc-only
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          if [ -z "$CHANGED" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
-          if [ -z "$NON_DOC" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Doc-only PR; skipping tier1 build."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Install toolchain
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang
-
-      - name: tier1 (full make test + demos baseline)
-        if: steps.doc-only.outputs.skip != 'true'
-        run: make CC=clang tier1
-
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier1-shard-1 (costly self-compiles + caches)
+        run: make CC=clang tier1-shard-1
       - name: Working tree clean check
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
-            echo "::error::working tree dirty after tier1; build artifacts leaked into tracked paths"
-            git status
-            exit 1
+            echo "::error::working tree dirty after tier1-shard-1"
+            git status; exit 1
+          fi
+
+  tier1-shard-2:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier1-shard-2 (light slice 1/2 + demos)
+        run: make CC=clang tier1-shard-2
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-shard-2"
+            git status; exit 1
+          fi
+
+  tier1-shard-3:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier1-shard-3 (light slice 2/2 + rest)
+        run: make CC=clang tier1-shard-3
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-shard-3"
+            git status; exit 1
+          fi
+
+  # Aggregator: the REQUIRED check. Green iff every shard is green. Keeping
+  # the name `tier1` means branch protection needs no edit. A doc-only PR
+  # reaches here via the skipped shards and still reports SUCCESS, satisfying
+  # the required check.
+  tier1:
+    needs: [changes, tier1-shard-1, tier1-shard-2, tier1-shard-3]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on all shards
+        run: |
+          if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
+            echo "tier1 OK — doc-only PR, shards skipped"; exit 0
+          fi
+          r1='${{ needs.tier1-shard-1.result }}'
+          r2='${{ needs.tier1-shard-2.result }}'
+          r3='${{ needs.tier1-shard-3.result }}'
+          echo "shard results: 1=$r1 2=$r2 3=$r3"
+          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ]; then
+            echo "tier1 OK — all shards green (full gate coverage)"
+          else
+            echo "::error::tier1 FAIL — a shard did not succeed"; exit 1
           fi

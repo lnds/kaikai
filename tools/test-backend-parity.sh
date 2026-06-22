@@ -85,7 +85,18 @@ fi
 # Directories to walk. examples/negative is intentionally absent:
 # those fixtures must reject at compile time, so backend-parity
 # (which assumes both build cleanly) does not apply.
-DIRS="examples/effects
+#
+# Overridable via $BACKEND_PARITY_DIRS (newline- or space-separated) so CI
+# can shard the corpus across runners (docs/ci-time-analysis.md §7). Each
+# shard runs a disjoint subset; the union must equal this default so the
+# gate's coverage is unchanged. Sharding is safe ONLY while the ratchet
+# baseline (native-parity-baseline.txt) is empty: the new-gap check is
+# per-fixture (a gap in a shard's subset fails that shard), but the
+# closed-gap "suggest tightening" pass compares against the FULL baseline,
+# so a non-empty baseline would mis-report baseline entries outside a
+# shard's subset as closed. Keep the baseline empty, or de-shard, if that
+# changes.
+DIRS="${BACKEND_PARITY_DIRS:-examples/effects
 examples/actors
 examples/spawn
 examples/perceus
@@ -97,7 +108,7 @@ examples/quickstart
 examples/stdlib
 examples/attributes
 examples/unstable
-demos"
+demos}"
 
 SKIPS_FILE="$ROOT/tools/backend-parity-skips.txt"
 
