@@ -196,7 +196,7 @@ already touching every call site.
 The biggest surprise was how much the existing typer infrastructure
 already supports bidirectional inference: the SLet-annotation unify
 hook had been carrying the expected type into return-type position
-for years; we just needed to read it after the fact.
+all along; we just needed to read it after the fact.
 
 ## Limitations
 
