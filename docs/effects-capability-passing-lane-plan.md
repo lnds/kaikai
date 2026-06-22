@@ -1,6 +1,6 @@
 # Capability-passing evidence transport — lane plan
 
-> **Status: LANE PLAN (asu round, 2026-06-19). Input: `docs/effects-capability-passing-design.md` (Decision A, owner-taken 2026-06-11); umbrella issue #789 / #820.**
+> **Status: LANE PLAN (asu round, 2026-06-19; currency pass 2026-06-21). Input: `docs/effects-capability-passing-design.md` (Decision A, owner-taken 2026-06-11). Umbrella issue: #820 (OPEN). #789 is CLOSED — it closed via a native-parity codegen fix (`460c9bd6`), NOT the op-name-collision diagnostic this plan builds in L2; the by-name dispatch and the soundness hole #789 named are still live. See design §5.1.**
 > This document resolves §8 of the design (the four open questions) and tears §7's "suggested spine" into a sequenced, gated lane plan (L0–L6). It is implementable input for the worktree lanes — not a re-litigation of Decision A.
 >
 > **Load-bearing warning, repeated from the design and verified in code (2026-06-19): selfhost byte-id is FALSE-GREEN for this entire effort.** The compiler corpus contains no op-name collision and no effect instance passed through a call. Every lane gate below states explicitly where byte-id proves nothing and what the real oracle is.
@@ -101,7 +101,7 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 **Archivos/zonas.** `stage2/compiler/infer.kai` (injection after row inference, before mono — §3); `stage2/compiler/monomorph.kai` (specialise per evidence-tuple alongside types — `mono_mangle_*` `:200–283`); the collision diagnostic at the row-discharge hole (`infer.kai:2221–2402`).
 
-**Gate exacto.** **byte-id FALSE-GREEN** — injected-but-unused evidence params may not yet change emitted C, so the corpus could self-host byte-identical while injection is wrong. Real gates: (1) the three L0 collision fixtures now produce the **collision diagnostic** as `.err.expected` (out of quarantine — #789's typer-hole fix, §5.1); (2) the A.3 arity spike runs here — `--dump=evidence-arity` histogram recorded for the A.3 decision; (3) **KAI_TRACE_RC: zero evidence-tagged values enter dup/drop** (A.1 corruption tripwire); (4) ASAN clean.
+**Gate exacto.** **byte-id FALSE-GREEN** — injected-but-unused evidence params may not yet change emitted C, so the corpus could self-host byte-identical while injection is wrong. Real gates: (1) the three L0 collision fixtures now produce the **collision diagnostic** as `.err.expected` (out of quarantine — the op-name-collision diagnostic of design §5.1, which no longer exists despite #789's closure); (2) the A.3 arity spike runs here — `--dump=evidence-arity` histogram recorded for the A.3 decision; (3) **KAI_TRACE_RC: zero evidence-tagged values enter dup/drop** (A.1 corruption tripwire); (4) ASAN clean.
 
 **Dependencias.** L1. **Crosses with L3 as the frontend→emit_c block.** L2 may merge before L3 only if codegen provably ignores the new params (byte-id proves that, and only that). A reshape here whose only consumer (L3) aborts on the new shape must not merge frontend-alone (coupled-reshape discipline).
 
@@ -111,7 +111,7 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 **Objetivo.** Flip the C backend to consume injected evidence at perform sites instead of the by-name walk; execute the spawn/actor audit; make the L0 flagship correct.
 
-**Archivos/zonas.** `stage2/compiler/emit_c.kai` — perform-site emission at **`:2341`** (`kai_evidence_lookup_node("eff")` by-name → consume injected param), by-id sites `:2339/:5145/:6377`; `stage2/compiler/emit_shared.kai` (alias prologue `:605–655`, `:1201–1218`). The spawn audit reads `runtime.h:10649` (clone) but **does not delete it yet** (L5).
+**Archivos/zonas.** `stage2/compiler/emit_c.kai` — perform-site emission at **`:2394`** (`kai_evidence_lookup_node("eff")` by-name → consume injected param), by-id sites `:2392/:5198/:6430`; `stage2/compiler/emit_shared.kai` (alias prologue `:605–655`, `:1201–1218`). The spawn audit reads `runtime.h:10649` (clone) but **does not delete it yet** (L5).
 
 **Gate exacto.** **byte-id FALSE-GREEN.** Real gates: (1) **full C-direct corpus behavioural parity** vs the L0 spawn-audit baseline goldens; (2) the L0 flagship `two_instances_through_call.kai` now produces its correct `.out.expected` (out of quarantine); (3) **spawn audit executed** — every fixture performing a user effect inside a fiber re-validated; any that relied on the evidence clone fails loudly and is migrated to explicit in-fiber handles / actor messages, committed in this lane (the §3 behavioural change); (4) the A.4 actor fixture passes; (5) ASAN + KAI_TRACE_RC non-zero balanced. **The arity ABI decision (A.3) is finalised here** (build-both, measure, pick per the binary criterion).
 
@@ -123,7 +123,7 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 **Objetivo.** Flip the native backend's evidence model to consume injected evidence, validated against the L3 C-direct oracle, achieving full dual-backend parity.
 
-**Archivos/zonas.** The native KIR lowering of perform/handle (`kir_lower_walk.kai` + the native emitter's evidence sites — the native mirror of emit_c's `:2341`); the native consumption of `kai_evidence_lookup_node` flips to the injected param exactly as C did.
+**Archivos/zonas.** The native KIR lowering of perform/handle (`kir_lower_walk.kai` + the native emitter's evidence sites — the native mirror of emit_c's `:2394`); the native consumption of `kai_evidence_lookup_node` flips to the injected param exactly as C did.
 
 **Gate exacto.** **byte-id FALSE-GREEN.** Barrier gate: **full-corpus parity C-direct vs native (SERIAL ratchet, `BACKEND_PARITY_JOBS=1` — parallel is false-green per the #858 lesson), 0 gaps**; all L3 fixtures pass under native; ASAN + KAI_TRACE_RC balanced non-zero. **Strict barrier: the L3+L4 block does not merge to `main` until this serial dual parity is 0 gaps.** A bridge state (C new, native old) is forbidden on `main`.
 
@@ -136,8 +136,8 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 **Objetivo.** Delete the three obsolete mechanisms so one resolution path remains — the load-bearing simplification.
 
 **Archivos/zonas (verified 2026-06-19):**
-- `kai_evidence_lookup_node` — **`stage2/runtime.h:11332`** + the stage0 twin, and all callers (emit_c `:2341` dead after L3).
-- The lexical-alias special case — `alias_map_disable_tag` at **`stage2/compiler/emit_shared.kai:2497`**, the `kai_alias_<a>_id` C-local minting (`emit_shared.kai:605–655`, `:1201–1218`; emit_c `:2339/:5145/:6377`).
+- `kai_evidence_lookup_node` — **`stage2/runtime.h:11332`** + the stage0 twin, and all callers (emit_c `:2394` dead after L3).
+- The lexical-alias special case — `alias_map_disable_tag` at **`stage2/compiler/emit_shared.kai:2497`**, the `kai_alias_<a>_id` C-local minting (`emit_shared.kai:605–655`, `:1201–1218`; emit_c `:2392/:5198/:6430`).
 - The spawn-time evidence clone — `kai_clone_evidence_chain` call at **`stage2/runtime.h:10649`** (defn `:11125`, free `:11117`, field `:2272`), stage0 twins, clone-forward-decls `:2142–2143`.
 
 **Open decision (the §C one):** `kai_evidence_lookup_node_by_id` (`:11362`). The design hedges ("if at all"). **Decide in L5 by grep:** after L3+L4, if no emitted code calls it, **delete it too** — a validity-check with no caller is a dormant second mechanism. Recommendation: **delete it** unless L3/L4 leaves a concrete caller; if the typer wants a post-injection assertion, that lives in the compiler, not as a runtime lookup.
@@ -166,9 +166,9 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 **Archivos/zonas.** `docs/effects.md` (the regions describing the deleted walk), `docs/effects-impl.md` (the by-name walk pseudocode), `CLAUDE.md` (the "capability-passing Effekt + inference" line is now *true* — drop any hedge), `docs/dispatch-honesty-targets.md` (flip the accidental-equivalence row to Shipped).
 
-**Gate exacto.** Doc-only (skips tiers). Gate: no surviving sentence describes the by-name walk as current; the honesty target's "Broken/Accidental" rows retired; `gh issue view 789`/`820` cross-checked closed. **Barrier:** docs must not flip to "true" until L5 makes them true.
+**Gate exacto.** Doc-only (skips tiers). Gate: no surviving sentence describes the by-name walk as current; the honesty target's "Broken/Accidental" rows retired; `gh issue view 820` cross-checked closed. **Barrier:** docs must not flip to "true" until L5 makes them true.
 
-**Dependencias.** L5 + L6-surface. Closes #789 and #820.
+**Dependencias.** L5 + L6-surface. Closes #820. (#789 is already CLOSED on a tangential native fix; the lane plan that builds the collision diagnostic should decide whether to reopen #789 as the diagnostic's home or fold it under #820 — it does not "close" #789.)
 
 **Paralelo.** Can draft in parallel with L6-surface; merges last.
 
@@ -176,7 +176,7 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 ## C. Riesgos transversales
 
-**Mayor riesgo de diseño — L1 (evidence obligations).** L1 decides *what gets injected where* — the §3 three-way classification and the row-instance identity that distinguishes "two `Cell`s" from "one `Cell`." Every downstream lane inherits this analysis; if it mis-classifies an instance, L2 injects the wrong evidence and L3/L4 faithfully propagate a wrong answer that the ≤1-handler corpus *cannot reveal* (the false-green trap). The risk is not a crash — it is silently encoding a subtly-wrong evidence model that passes every gate except the L0 distinguishing fixtures. **Mitigation:** the L0 distinguishing fixtures are L1's only real oracle; the `--dump=evidence-obligations` gate must show the collision on the #789 fixtures, or L1 is blind. Same "analysis looks right, corpus can't falsify it" shape that hid the dispatch drift for a year (§1).
+**Mayor riesgo de diseño — L1 (evidence obligations).** L1 decides *what gets injected where* — the §3 three-way classification and the row-instance identity that distinguishes "two `Cell`s" from "one `Cell`." Every downstream lane inherits this analysis; if it mis-classifies an instance, L2 injects the wrong evidence and L3/L4 faithfully propagate a wrong answer that the ≤1-handler corpus *cannot reveal* (the false-green trap). The risk is not a crash — it is silently encoding a subtly-wrong evidence model that passes every gate except the L0 distinguishing fixtures. **Mitigation:** the L0 distinguishing fixtures are L1's only real oracle; the `--dump=evidence-obligations` gate must show the collision on the #789 fixtures, or L1 is blind. Same "analysis looks right, corpus can't falsify it" shape that hid the dispatch drift (§1).
 
 **Mayor riesgo de soundness — L5 (the delete).** L5 removes three subsystems simultaneously. A soundness defect here is a use-after-free or a missing-evidence segfault, not a wrong value. The spawn clone is the sharpest: it currently *masks* escape-vector-4 (a capability accidentally "working" across `spawn`); deleting it is correct, but any fixture that silently relied on it now performs against freed/absent evidence. **Mitigation:** L5 cannot start until L3's spawn audit has *already* migrated every such fixture (the audit is in L3 precisely so the delete in L5 lands on clean ground); ASAN + serial KAI_TRACE_RC on both backends is the gate, and the A.1 "evidence never enters dup/drop" assertion guards the corruption axis.
 

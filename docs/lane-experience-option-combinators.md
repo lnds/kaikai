@@ -193,7 +193,7 @@ audit §1a).
   for this PR.** This PR alone saves zero compiler LOC; it just unlocks
   the rewrite path. The -700 LOC gate in the brief therefore applies to
   the aggregate of the follow-up lanes, not to this PR.
-- **The fact that combinators existed but went unused for years is the
+- **The fact that combinators existed but went unused is the
   real audit finding.** The mechanical fix is the rewrite; the cultural
   fix is the lane-close-discipline that catches "we added combinators
   in m14 phase 3 but never adopted them in the compiler". Worth a note
