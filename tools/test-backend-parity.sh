@@ -318,43 +318,62 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
   # Flakiness guard. A handful of fixtures are NON-DETERMINISTIC under
   # --backend=native (output carrying raw pointers / addresses, RC or
   # hash-order dependence) — they pass on one run and fail the next. A
-  # strict set-equality ratchet would fail CI at random on those. So a
-  # candidate "new gap" is RE-VERIFIED: rebuild + run both backends once
-  # more, and only count it as a regression if it diverges AGAIN. A real
-  # regression diverges deterministically and survives the recheck; a
-  # flaky fixture clears it. (The known-flaky set already lives in the
-  # baseline as a normal gap — failing intermittently IS a parity gap.)
-  # A deterministic gap diverges on EVERY attempt; a flaky fixture passes
-  # at least once. Re-run the target up to 3 times against a single oracle
-  # build and report a regression only if it diverges ALL THREE times —
-  # so a fixture that flakes at any rate below 100% clears the recheck.
+  # strict set-equality ratchet would fail CI at random on those, so a
+  # candidate "new gap" is RE-VERIFIED before it is allowed to be called
+  # flaky. The bar is asymmetric on purpose: a single converging run is
+  # NOT evidence of flakiness — the parallel walk's evaluation order can
+  # make a 100%-reproducible failure happen to converge once. A flaky
+  # verdict therefore requires N CONSECUTIVE clean rechecks (a divergence
+  # that reproduces even ONCE across the rechecks is a REAL gap, exactly
+  # as it would be without any recheck). N=2 means a divergence is only
+  # downgraded after THREE total confirmations the failure is gone (the
+  # original walk plus N rechecks); a deterministic failure reproduces
+  # well within two extra runs, while a genuine 1-in-many timing flake is
+  # rare and the loud `flaky_warn` annotation covers it.
+  PARITY_RECHECKS="${PARITY_RECHECKS:-2}"
+  # Verdict codes: 0 = real gap (diverged at least once), 1 = flaky
+  # (converged on all N rechecks), 2 = unjudgeable (oracle won't build
+  # here). 2 keeps the caller's pre-recheck observation without emitting a
+  # misleading flaky warning.
   recheck_diverges() {
     rf="$1"
     rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
-    KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 1
+    KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 2
     oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null)" || oref=$?
     attempt=0
-    while [ "$attempt" -lt 3 ]; do
+    while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
       if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
-        # target build itself failed — a deterministic gap; keep checking.
-        continue
+        return 0   # target build failed => a deterministic, real gap.
       fi
       rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null)" || rt=$?
-      if [ "$rt" = "$oref" ] && [ "$rtout" = "$orefout" ]; then
-        return 1   # converged at least once => flaky, not a regression.
+      if [ "$rt" != "$oref" ] || [ "$rtout" != "$orefout" ]; then
+        return 0   # diverged on a recheck => a real (new) gap.
       fi
     done
-    return 0       # diverged on all 3 attempts => a real (new) gap.
+    return 1       # converged on all N rechecks => flaky, not a regression.
+  }
+  # Surface a flaky verdict LOUDLY: a GitHub annotation under CI (so it
+  # lands on the run summary, not buried in the log) plus a log line that
+  # is unmistakable. A divergence that clears the recheck is still noise
+  # we want visible, never swallowed silently into the green.
+  flaky_warn() {
+    fw="$1"
+    msg="native-parity: $fw diverged on the initial walk but converged on $PARITY_RECHECKS consecutive rechecks — held as flaky, not counted as a regression. Investigate: a divergence this harness deems flaky is still a parity gap."
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+      echo "::warning title=native-parity flaky::$msg"
+    fi
+    echo "ratchet WARNING (flaky): $msg"
   }
   real_new_gaps=""
   for g in $new_gaps; do
-    if recheck_diverges "$g"; then
-      real_new_gaps="$real_new_gaps$g
-"
-    else
-      echo "ratchet: $g diverged once but passed on recheck — flaky, not a regression"
-    fi
+    verdict=0; recheck_diverges "$g" || verdict=$?
+    case "$verdict" in
+      0) real_new_gaps="$real_new_gaps$g
+" ;;
+      1) flaky_warn "$g" ;;
+      *) echo "ratchet: $g — oracle ($ORACLE_BACKEND) failed to build on recheck; cannot judge, not counted as a new gap." ;;
+    esac
   done
   if [ -n "$real_new_gaps" ]; then
     echo ""
@@ -372,17 +391,17 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
   # passed THIS run might be a flaky gap that happened to converge, not a
   # genuinely-fixed one. Only suggest tightening the baseline for fixtures
   # that pass CONSISTENTLY — re-verify each candidate and keep it only if
-  # it does NOT diverge on a recheck. A real fix survives; a flaky gap
-  # (e.g. hex_basic at ~50%) is dropped from the suggestion so a lane is
-  # not nudged to remove a gap that will reappear.
+  # it does NOT diverge on ANY of the N consecutive rechecks. A real fix
+  # survives; a flaky gap (e.g. hex_basic at ~50%) is dropped from the
+  # suggestion so a lane is not nudged to remove a gap that will reappear.
   stable_closed=""
   for g in $closed_gaps; do
-    if recheck_diverges "$g"; then
-      : # still flaky / still a gap — do not suggest removal.
-    else
-      stable_closed="$stable_closed$g
-"
-    fi
+    verdict=0; recheck_diverges "$g" || verdict=$?
+    case "$verdict" in
+      1) stable_closed="$stable_closed$g
+" ;;                # passed all N rechecks => a genuine, stable fix.
+      *) : ;;          # still diverges, or unjudgeable — do not suggest removal.
+    esac
   done
   if [ -n "$stable_closed" ]; then
     echo ""
