@@ -965,8 +965,22 @@ fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
 # arm (which seals before the continuation) is deliberately NOT planted with a
 # drop here.
 fn match_finish(owned: Bool, sd: String, r: LRes) : LRes =
-  if owned { match r { LRes(v, st) -> LRes(v, ls_emit(st, KRC(KDrop(KVar(sd)), KNoPos))) } }
-  else { r }
+  match_finish_tok(owned, sd, false, r)
+
+# `match_finish` plus an optional `_arm_ru` token free (#872): a variant match
+# with an arm-top-reuse arm captured the consumed scrutinee as a token; the
+# TRMC-step tail consumes it (resets to null), but a non-step tail
+# (`balance_left(ins(l,..),..)`) leaves it live — free it in the continuation
+# (null-safe, no-op when consumed or when no arm-top fired). The exit drop of
+# `sd` follows; for an arm-top arm `sd` was rebound to unit, so its drop is a
+# no-op (the token was the disposer).
+fn match_finish_tok(owned: Bool, sd: String, free_tok: Bool, r: LRes) : LRes =
+  if owned {
+    match r { LRes(v, st) -> {
+      let st1 = if free_tok { ls_emit(st, KRC(KArmTokenFree, KNoPos)) } else { st }
+      LRes(v, ls_emit(st1, KRC(KDrop(KVar(sd)), KNoPos)))
+    } }
+  } else { r }
 
 # Self-tail arms (`KTcrecGoto`) seal their block BEFORE control reaches the
 # match continuation where `match_finish` plants the owned-scrutinee drop, so
@@ -1025,6 +1039,25 @@ fn arms_all_tail_self_tcrec(arms: [Arm]) : Bool = match arms {
   [Arm(_, _, body), ...rest] -> arm_body_all_tail_self_tcrec(body) and arms_all_tail_self_tcrec(rest)
 }
 
+# True iff ANY tail leaf of `body` is a `__kai_trmc|` modulo-cons step sentinel
+# (the C oracle's `trmc_body_has_step`). Such an arm's scrutinee cell is reused
+# in place by a TRMC step on at least one path; the arm-top reuse token model
+# (`KArmTopReuse`) captures the consumed cell once at the arm top so the step
+# reuses it (or frees it on a non-step tail like `balance_left(ins(l,..),..)`).
+# A pure self-tcrec body is NOT a step (its callee is `__kai_tcrec|`).
+fn body_has_trmc_step(body: Expr) : Bool = match body.kind {
+  ECall(f, _) -> match f.kind { EVar(callee) -> es_trmc_is_step_sentinel(callee) _ -> false }
+  EIf(_, t, oe) -> body_has_trmc_step(t) or match oe { None -> false Some(e) -> body_has_trmc_step(e) }
+  EMatch(_, arms) -> arms_have_trmc_step(arms)
+  EBlock(_, ot) -> match ot { None -> false Some(e) -> body_has_trmc_step(e) }
+  _ -> false
+}
+
+fn arms_have_trmc_step(arms: [Arm]) : Bool = match arms {
+  []                         -> false
+  [Arm(_, _, body), ...rest] -> if body_has_trmc_step(body) { true } else { arms_have_trmc_step(rest) }
+}
+
 # `match scr { [list patterns] }`: a fail-chain decision tree mirroring the
 # C-direct (`emit_pat_test_list`) / LLVM (`llvm_emit_pat_list`) emitters.
 # Each arm emits its cons/nil + length test into a block that branches to
@@ -1067,21 +1100,6 @@ fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) 
 # fixed — it is not the drop binder and a reuse arm has no exit drop.
 fn scr_drop_name(join: String) : String = cat2(join, "$sd")
 
-# True iff `x` is a match whose scrutinee is a reuse donor — any arm body holds
-# a `__perceus_reuse_*` call (`arm_body_uses_reuse`). Such a match keeps the
-# scrutinee dup in `match_preamble` (the native reuse path under-increfs shared
-# donors; the dup masks the UAF). Every other match consumes the scrutinee
-# linearly and binds the exit-drop binder bare, matching the C oracle.
-fn match_owns_reuse_arm(x: Expr) : Bool = match x.kind {
-  EMatch(_, arms) -> arm_reuse_arms_any(arms)
-  _               -> false
-}
-
-fn arm_reuse_arms_any(arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [Arm(_, _, b), ...rest] -> if arm_body_uses_reuse(b) { true } else { arm_reuse_arms_any(rest) }
-}
-
 fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
   match ls_fresh_reg(st) { LSReg(join, st1) -> {
     let sd = scr_drop_name(join)
@@ -1098,19 +1116,12 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
     # (no dup), one match-exit decref — and a live-binder scrutinee already
     # arrives wrapped in a perceus producer-side dup, so the exit drop frees that
     # dup and the original survives. A blanket dup here over-increfs and blocks
-    # the cons cascade (free never reaches zero — issue #868).
-    #
-    # The exception is a reuse-arm match: the native `KConReuse` path donates the
-    # scrutinee's children without the per-child incref the C oracle emits on its
-    # non-unique reuse arm, so a SHARED donor (rb-tree rotation) under-increfs and
-    # would use-after-free the moved children. Keeping the dup there inflates the
-    # parent RC enough to mask it as a leak instead. The dup stays ONLY for a
-    # reuse-arm match until the native reuse lowering grows that incref; every
-    # other match binds the exit-drop binder bare.
-    let st_scr = if owned and match_owns_reuse_arm(x) {
-                   let st_d = ls_emit(st_pub, KRC(KDup(scrv), kpos_of(x)))
-                   ls_emit(st_d, KLet(sd, SBoxed, KLitOp(scrv), kpos_of(x)))
-                 } else if owned {
+    # the cons cascade (free never reaches zero — issue #868). A reuse-arm match
+    # is no longer special-cased: the `KConReuse` path now grows the SHARED-donor
+    # per-child incref (`kai_incref_if_shared`, #872), so the old scrutinee dup
+    # that masked the under-incref as a leak is dead — every owned match binds
+    # the exit-drop binder bare.
+    let st_scr = if owned {
                    ls_emit(st_pub, KLet(sd, SBoxed, KLitOp(scrv), kpos_of(x)))
                  } else { st_pub }
     LSPre(join, sd, ls_emit(st_scr, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x))))
@@ -1234,8 +1245,15 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
         # case block that discriminates on the payload (kir_lower_variant).
         let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, owned, sd, st7)
-        match_finish(owned, sd, LRes(KVar(join), reopen(st8, lcont)))
+        match_finish_tok(owned, sd, arms_have_arm_top(arms, st8), LRes(KVar(join), reopen(st8, lcont)))
       } } } }
+
+# True iff any arm of this variant match captures an arm-top reuse token, so
+# the continuation must free an unconsumed token (#872).
+fn arms_have_arm_top(arms: [Arm], st: LowerSt) : Bool = match arms {
+  []                         -> false
+  [Arm(p, _, body), ...rest] -> if arm_is_top_reuse(p, body, st) { true } else { arms_have_arm_top(rest, st) }
+}
 
 # One switch case per DISTINCT variant tag, in first-appearance order.
 # Non-variant arms (tag -1, e.g. a wildcard `_`) get NO case — they are the
@@ -1283,8 +1301,8 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # Issue #858 — the default arm's pattern (a `_`-tag binder / as-name /
       # destructure) aliases the scrutinee like a variant arm; restore the
       # oracle's structural pointer-slot incref so the owned exit drop balances.
-      let st_dup = dup_variant_arm_binders(p, body, owned, st_def)
-      let st_drop = match_selftail_scr_drop(owned, sd, body, st_dup)
+      let st_rc = lower_arm_rc(p, body, sd, owned, st_def)
+      let st_drop = match_selftail_scr_drop(owned, sd, body, st_rc)
       lower_branch_into(body, join, lcont, st_drop)
     }
     None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
@@ -1357,6 +1375,52 @@ fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : L
     lm_dup_alias_binders(variant_arm_alias_binders(p, st.vs), KAt(p.line, p.col), st)
   } else { st }
 
+# native variant reuse leak (#872) — publish a reuse arm's scrutinee pointer
+# binders so the `KConReuse` lowered inside `body` (possibly under an `if`)
+# emits the shared-donor incref of each embedded kept child. A non-reuse arm
+# clears the set so a sibling arm's stale names never leak in. The set carries
+# top-level slots AND one-level nested grand-children (the rotation kept
+# children) — exactly the borrowed leaves the rebuild embeds.
+fn set_reuse_gc_for_arm(p: Pattern, body: Expr, st: LowerSt) : LowerSt =
+  if arm_body_uses_reuse(body) {
+    ls_set_reuse_gc(st, variant_reuse_scrutinee_binders(p, st.vs))
+  } else { ls_set_reuse_gc(st, []) }
+
+# True iff this arm should capture its consumed scrutinee as an arm-top reuse
+# token (#872): a PVariant arm whose body has a `__kai_trmc|` step on some tail
+# (`Node(c, ins(l,..),..)`) and binds ≥1 pointer child. The TRMC step reuses the
+# token in place; a non-step tail (`balance_left(ins(l,..),..)`) frees it. The C
+# oracle's `try_arm_top_reuse` predicate.
+fn arm_is_top_reuse(p: Pattern, body: Expr, st: LowerSt) : Bool = match p.pkind {
+  PVariant(_, _) -> body_has_trmc_step(body) and not list_is_empty_s(variant_arm_alias_binders(p, st.vs))
+  _              -> false
+}
+
+fn list_is_empty_s(xs: [String]) : Bool = match xs { [] -> true _ -> false }
+
+# Emit an owned arm's RC prologue, branching on shape:
+#  - arm-top reuse: capture the consumed scrutinee as `_arm_ru` + shared-incref
+#    the kept ptr children, then NEUTRALISE the match-exit drop by rebinding the
+#    exit-drop register `sd` to unit (the token is the sole disposer). No #858
+#    dup (the token model owns the kept children's RC).
+#  - a `__perceus_reuse_*` arm: publish the reuse-gc set (the `KConReuse` path
+#    emits the shared incref); no #858 dup.
+#  - otherwise: the #858 structural dup of pointer-slot alias binders.
+fn lower_arm_rc(p: Pattern, body: Expr, sd: String, owned: Bool, st: LowerSt) : LowerSt / Console =
+  if owned and arm_is_top_reuse(p, body, st) {
+    let st1 = ls_emit(st, KRC(KArmTopReuse(KVar(sd), variant_arm_arity(p, st.vs),
+                                           variant_arm_alias_binders(p, st.vs)), kpos_of(body)))
+    ls_emit(st1, KStore(sd, KUnitV, kpos_of(body)))
+  } else {
+    set_reuse_gc_for_arm(p, body, dup_variant_arm_binders(p, body, owned, st))
+  }
+
+# The rebuild arity for the arm-top token: the matched ctor's slot count.
+fn variant_arm_arity(p: Pattern, vs: [EVar]) : Int = match p.pkind {
+  PVariant(cname, subs) -> match evar_payload_tys_for(vs, cname) { [] -> list_length(subs) ts -> list_length(ts) }
+  _                     -> 0
+}
+
 # The VARIANT arms whose top-level tag is `tag`, in source order.
 fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
   [] -> []
@@ -1383,8 +1447,8 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
     if var_arm_is_tag_catchall(p) {
       let st_arm = reopen(st, lbl)
       let st_bound = bind_pattern_fields(p, scrv, st_arm)
-      let st_dup = dup_variant_arm_binders(p, body, owned, st_bound)
-      let st_drop = match_selftail_scr_drop(owned, sd, body, st_dup)
+      let st_rc = lower_arm_rc(p, body, sd, owned, st_bound)
+      let st_drop = match_selftail_scr_drop(owned, sd, body, st_rc)
       lower_branch_into(body, join, lcont, st_drop)
     } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, reopen(st, lbl)) }
   _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, reopen(st, lbl))
@@ -1404,13 +1468,13 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
       # Catch-all of this tag: branch straight to the body; later arms dead.
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
       let st3 = bind_pattern_fields(p, scrv, reopen(st2, body_lbl))
-      let st3d = dup_variant_arm_binders(p, body, owned, st3)
+      let st3d = lower_arm_rc(p, body, sd, owned, st3)
       let st3dd = match_selftail_scr_drop(owned, sd, body, st3d)
       lower_branch_into(body, join, lcont, st3dd)
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
         let st4 = emit_arm_subtests_and_binds(p, scrv, body_lbl, next_fail, st2)
-        let st4d = dup_variant_arm_binders(p, body, owned, st4)
+        let st4d = lower_arm_rc(p, body, sd, owned, st4)
         let st4dd = match_selftail_scr_drop(owned, sd, body, st4d)
         let st5 = lower_branch_into(body, join, lcont, st4dd)
         lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, st5)
@@ -1870,11 +1934,112 @@ fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: L
   _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
 }
 
+# native variant reuse leak (#872). Two backend-distinct reuse shapes:
+#
+#  - FLAT (bijective) rebuild — every rebuild slot is a direct top-level kept
+#    child or a scalar. `KConReuse` reuses the donor cell IN PLACE. A SHARED
+#    donor fresh-allocs and keeps a borrowed reference to each kept child, which
+#    the match-exit `kai_decref(donor)` cascade would free — so emit one
+#    `kai_incref_if_shared(donor, child)` per embedded use (multiset). A unique
+#    donor moves its children in place (no incref). This is half A of #872.
+#
+#  - NESTED (non-bijective) rebuild — a rebuild slot is a fresh sub-ctor that
+#    embeds GRAND-children of a deconstructed inner cell (the rb-tree rotation
+#    `Node(_, Node(Red, lx, ..), ..) -> Node(.., Node(.., lx, ..), ..)`). The C
+#    oracle reuses BOTH the outer cell and the inner cell (Koka 2-of-3 token
+#    reuse); native never grew the inner token, so reusing the outer in place
+#    ORPHANS the old inner cell (half B leak: native fresh-allocs the new inner
+#    and overwrites the slot without freeing the old). Native instead FRESH-
+#    allocs the whole outer (`KCon`, not `KConReuse`) and `dup`s each embedded
+#    borrowed leaf unconditionally (multiset); the existing match-exit
+#    `kai_decref(donor)` then cascades the donor + inner + leaves correctly, the
+#    dups keeping the embedded leaves alive. Costs one outer alloc per rebuild
+#    (the reuse-in-place recycle is a separate perf follow-up) but never leaks.
 fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match lower_exprs(cargs, st, []) { LResMany(avs, st1) -> {
     let tag = ls_variant_tag(st1, cn)
-    bind_op(st1, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
+    if reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs) {
+      let st_dup = emit_reuse_leaf_dups(reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
+      bind_op(st_dup, KCon(cn, tag, boxed_inits(avs, [])), kpos_of(x))
+    } else {
+      let st_gc = if reuse_kind_is_variant(rk) {
+                    emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
+                  } else { st1 }
+      bind_op(st_gc, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
+    }
   } }
+
+fn reuse_kind_is_variant(rk: KReuseKind) : Bool = match rk { RkVariant -> true RkCons -> false }
+
+# True iff any rebuild arg is a nested ctor call (the non-bijective rotation
+# shape). Such a rebuild embeds grand-children of a deconstructed inner cell.
+fn reuse_has_nested_ctor(cargs: [Expr]) : Bool = match cargs {
+  []           -> false
+  [e, ...rest] -> if expr_is_ctor_call(e) { true } else { reuse_has_nested_ctor(rest) }
+}
+
+fn expr_is_ctor_call(e: Expr) : Bool = match e.kind {
+  ECall(cf, _) -> match cf.kind {
+    EVar(c)        -> kir_name_is_ctor(c)
+    EModCall(_, c) -> kir_name_is_ctor(c)
+    _              -> false
+  }
+  _ -> false
+}
+
+# Emit one `KIncrefIfShared(donor, KVar(name))` per name in `uses` (a multiset:
+# a binder embedded twice appears twice). Order vs the reuse op is irrelevant —
+# nothing mutates the donor between, so each helper's `check_unique` agrees with
+# the reuse op's own (asu sign-off). Names only, never the donor itself.
+fn emit_reuse_gc_increfs(donor: KVal, uses: [String], pos: KPos, st: LowerSt) : LowerSt = match uses {
+  []           -> st
+  [n, ...rest] -> {
+    # Resolve the binder to its active shadow register, mirroring `lower_var`,
+    # so a shadowed kept child increfs the register the rebuild actually read.
+    let reg = match ls_lookup_rename(st, n) { Some(r) -> r None -> n }
+    emit_reuse_gc_increfs(donor, rest, pos,
+      ls_emit(st, KRC(KIncrefIfShared(donor, KVar(reg)), pos)))
+  }
+}
+
+# Unconditional `dup` per embedded borrowed leaf for the FRESH-alloc nested path
+# (multiset). The whole outer is fresh-allocated, so each embedded scrutinee
+# child needs its own ref; the match-exit `kai_decref(donor)` cascade then frees
+# the donor + inner + the original child refs, leaving the dup as the result's.
+fn emit_reuse_leaf_dups(uses: [String], pos: KPos, st: LowerSt) : LowerSt = match uses {
+  []           -> st
+  [n, ...rest] -> {
+    let reg = match ls_lookup_rename(st, n) { Some(r) -> r None -> n }
+    emit_reuse_leaf_dups(rest, pos, ls_emit(st, KRC(KDup(KVar(reg)), pos)))
+  }
+}
+
+# The multiset of scrutinee pointer-binder USES the rebuild args EMBED. Each
+# `EVar(nm)` whose `nm` is in `gc` contributes one entry per occurrence,
+# descending into nested CTOR calls (the rotation's inner `Node(Black, lx, ..)`
+# embeds `lx`/`rx`). A NON-ctor call (`ins(l,..)`, `f(x)`) CONSUMES its args —
+# it does not embed them — so a binder passed to a fn call is NOT counted (an
+# incref there would be spurious: the value is consumed, not kept — the mixed-
+# arm `Node(Red, ins(l,..),..)` leak).
+fn reuse_gc_uses(cargs: [Expr], gc: [String]) : [String] = match gc {
+  [] -> []
+  _  -> reuse_gc_uses_exprs(cargs, gc, [])
+}
+
+fn reuse_gc_uses_exprs(es: [Expr], gc: [String], acc: [String]) : [String] = match es {
+  []           -> acc
+  [e, ...rest] -> reuse_gc_uses_exprs(rest, gc, reuse_gc_uses_expr(e, gc, acc))
+}
+
+fn reuse_gc_uses_expr(e: Expr, gc: [String], acc: [String]) : [String] = match e.kind {
+  EVar(nm)        -> if name_in_list(gc, nm) { [nm, ...acc] } else { acc }
+  ECall(cf, cas)  -> match cf.kind {
+    EVar(c)        -> if kir_name_is_ctor(c) { reuse_gc_uses_exprs(cas, gc, acc) } else { acc }
+    EModCall(_, c) -> if kir_name_is_ctor(c) { reuse_gc_uses_exprs(cas, gc, acc) } else { acc }
+    _              -> acc
+  }
+  _ -> acc
+}
 
 # The record-reuse rebuild is an `ERecordLit` (perceus wraps it directly);
 # decode its (name, value) field inits into a `KRecordReuse` so the backend
@@ -2054,8 +2219,27 @@ fn trmc_self_args(xs: [Expr], hole: Int) : [Expr] = match xs {
 }
 
 # `__kai_trmc_apply(leaf)` → KTrmcApply (plug leaf into the open hole).
+#
+# A `KTrmcApply` is a terminal RET — it does NOT flow to the match's L0
+# continuation where `match_finish` plants the owned-scrutinee exit drop. When
+# the leaf is a variant CON-REUSE of the scrutinee (`Node(Red, ins(l,..),..)` —
+# reuse-in-place increfs the donor to survive that exit drop), skipping the drop
+# leaves the reused cell with an inflated rc → one leaked node per recursion
+# level (#872). Emit the scrutinee drop here, before the terminal, mirroring the
+# token free in `nemit_trmc_apply`. Gated on a reuse-of-scrutinee leaf so a cons
+# spine (`map`/`filter`, whose scrutinee the step already dropped) is untouched.
 fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [leaf] -> match lower_expr(leaf, st) { LRes(lv, st1) ->
-    seal_tail(st1, KTrmcApply(lv, kpos_of(x))) }
+  [leaf] -> match lower_expr(leaf, st) { LRes(lv, st1) -> {
+    let st2 = if st1.mscr == "" or not trmc_apply_leaf_reuses_scr(leaf) { st1 }
+              else { ls_emit(st1, KRC(KDrop(KVar(st1.mscr)), kpos_of(x))) }
+    seal_tail(st2, KTrmcApply(lv, kpos_of(x))) } }
   _ -> LRes(KUnitV, st)
+}
+
+# True iff the trmc-apply leaf is a variant con-reuse of the match scrutinee
+# (`__perceus_reuse_variant(scr, ..)`) — the shape that increfs the donor and so
+# needs the exit drop the terminal RET skips.
+fn trmc_apply_leaf_reuses_scr(leaf: Expr) : Bool = match leaf.kind {
+  ECall(cf, _) -> match cf.kind { EVar(nm) -> nm == "__perceus_reuse_variant" _ -> false }
+  _            -> false
 }
