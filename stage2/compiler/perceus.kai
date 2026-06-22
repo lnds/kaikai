@@ -415,10 +415,51 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
   let cmap = pcs_build_consume_map(decls, [])
-  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap))
+  # Names of `extern "C" fn` shims whose return type is an opaque handle.
+  # A `let h = f(...)` with such an `f` binds a handle box that must move
+  # at its last consuming use (the shim there decrefs the box); otherwise
+  # it is dup'd at every use and the birth ref never reaches zero.
+  let opaque_names = pcs_collect_opaque_names(decls, [])
+  let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns))
+}
+
+# `extern "C" fn` names whose return type is an opaque handle.
+fn pcs_collect_opaque_ret_fns(decls: [Decl], opaque_names: [String], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, opt_ret, _, body, _, _, mo) ->
+      if body_is_ffi_extern(body) and pcs_ret_is_opaque(opt_ret, opaque_names) {
+        pcs_collect_opaque_ret_fns(rest, opaque_names, [pcs_borrow_key(name, mo), name, ...acc])
+      } else { pcs_collect_opaque_ret_fns(rest, opaque_names, acc) }
+    _ -> pcs_collect_opaque_ret_fns(rest, opaque_names, acc)
+  }
+}
+
+fn pcs_ret_is_opaque(opt_ret: Option[TypeExpr], opaque_names: [String]) : Bool = match opt_ret {
+  Some(t) -> match t.tkind { TyName(n, _) -> list_has(opaque_names, n) _ -> false }
+  None    -> false
 }
 
 pub type BorrowEntry = BE(String, [Int])
+
+# Names of types declared `extern "C" opaque`, recovered from the
+# one-`__ffi_handle`-field records they lower to. Every boxed FFI input
+# is consumed (the shim decrefs each after the extern returns).
+fn pcs_collect_opaque_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DType(_, name, _, TBRecord(fields), _, _, _) ->
+      if pcs_is_ffi_opaque_record(fields) { pcs_collect_opaque_names(rest, [name, ...acc]) }
+      else { pcs_collect_opaque_names(rest, acc) }
+    _ -> pcs_collect_opaque_names(rest, acc)
+  }
+}
+
+fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
+  [FD(_, fname, _)] -> fname == "__ffi_handle"
+  _ -> false
+}
 
 fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
   []           -> acc
@@ -426,13 +467,10 @@ fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = mat
 }
 
 fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
-  # FFI v2 (#417): an `extern "C" fn`'s body is the magic FFI tag, so
-  # the borrow-inference walk sees no use of any param and would mark
-  # them all BORROWED — but the shim CONSUMES each boxed input
-  # (callee-owns). A borrowed classification makes the caller strip the
-  # dup, so a value passed to two extern calls is double-freed. Register
-  # NO borrowed positions for an FFI shim; the consume-map marks them
-  # consuming instead.
+  # An FFI shim's body is a tag the inspection walk reads as "param never
+  # referenced" — which it would mis-classify as borrowed, making the
+  # caller strip the dup. The shim CONSUMES each input, so it owns none:
+  # register no borrowed positions.
   DFn(_, _, _, _, _, _, body, _, _, _) if body_is_ffi_extern(body) -> acc
   DFn(_, name, _, params, _, _, body, _, _, mo) -> {
     let pnames = map(params, (p) => p.pname)
@@ -476,7 +514,7 @@ fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
 
 # Back-compat: tests call the 2-arg form with no borrow map.
 fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console =
-  perceus_decl_b(d, fns, [], [])
+  perceus_decl_b(d, fns, [], [], [])
 
 # Callee side: wrap `match p { ... }` as `match __perceus_borrow(p) {...}`
 # for each borrowed param `p` whose scrutinee is the bare param —
@@ -619,14 +657,10 @@ fn pcs_build_consume_map(decls: [Decl], acc: [ConsumeEntry]) : [ConsumeEntry] = 
 fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d {
   DFn(_, name, _, params, _, _, body, _, _, mo) -> {
     let pnames = map(params, (p) => p.pname)
-    # FFI v2 (#417): an `extern "C" fn`'s body is the magic FFI tag, so
-    # `pcs_consumed_positions` (which walks the body for consuming uses)
-    # would see none and mark every arg borrow. But the emitted shim
-    # decrefs each boxed input (callee-owns). The consume-map must say
-    # so, or a value passed to two extern calls is double-freed (the
-    # first shim's decref drops it, the second reads freed memory). Mark
-    # every boxed param consuming; a Unit param carries no boxed value
-    # (the shim elides it), so it is skipped.
+    # An FFI shim's body is opaque to the consuming-use walk, so a normal
+    # scan finds nothing consumed. The shim decrefs every boxed input, so
+    # mark each (a Unit param carries no boxed value and is skipped); else
+    # a value passed to two shim calls is double-freed.
     let positions = if body_is_ffi_extern(body) { pcs_ffi_consumed_positions(params, 0) }
                     else { pcs_consumed_positions(pnames, body, 0) }
     let qual = [CE(pcs_borrow_key(name, mo), positions), ...acc]
@@ -638,18 +672,22 @@ fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d
   _ -> acc
 }
 
-# Every boxed param position of an `extern "C" fn` is consumed by the
-# shim (it decrefs each input). A `Unit` param is skipped — the shim
-# carries no boxed value for it.
 fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
   [] -> []
   [p, ...rest] ->
-    if pcs_param_is_ffi_unit(p) { pcs_ffi_consumed_positions(rest, i + 1) }
+    if pcs_param_is_unit(p) { pcs_ffi_consumed_positions(rest, i + 1) }
     else { [i, ...pcs_ffi_consumed_positions(rest, i + 1)] }
 }
 
-fn pcs_param_is_ffi_unit(p: Param) : Bool = match p.ptype {
+fn pcs_param_is_unit(p: Param) : Bool = match p.ptype {
   Some(t) -> match t.tkind { TyName(n, _) -> n == "Unit" _ -> false }
+  None    -> false
+}
+
+# True when a param's declared type is one of the `extern "C" opaque`
+# names. A let-bound value of such a type moves at its last consuming use.
+fn pcs_param_is_opaque(p: Param, opaque_names: [String]) : Bool = match p.ptype {
+  Some(t) -> match t.tkind { TyName(n, _) -> list_has(opaque_names, n) _ -> false }
   None    -> false
 }
 
@@ -1067,6 +1105,139 @@ fn pcs_all_arm_binders_fields(fis: [FieldInit], acc: [String]) : [String] = matc
   [FI(_, e), ...rest] -> pcs_all_arm_binders_fields(rest, pcs_all_arm_binders(e, acc))
 }
 
+# Names bound by `let x = f(...)` where `f` returns an opaque handle —
+# the candidate set for the opaque move-at-last-use. Walks block/if/
+# match/lambda bodies for such bindings.
+fn pcs_collect_opaque_let_binders(e: Expr, opaque_ret_fns: [String], acc: [String]) : [String] =
+  pcs_olb_kind(e.kind, opaque_ret_fns, acc)
+
+fn pcs_olb_kind(k: ExprKind, ofns: [String], acc: [String]) : [String] = match k {
+  EBlock(stmts, tail) -> {
+    let a1 = pcs_olb_stmts(stmts, ofns, acc)
+    match tail { None -> a1 Some(e) -> pcs_collect_opaque_let_binders(e, ofns, a1) }
+  }
+  EIf(c, t, oe) -> {
+    let a1 = pcs_collect_opaque_let_binders(t, ofns, pcs_collect_opaque_let_binders(c, ofns, acc))
+    match oe { None -> a1 Some(e2) -> pcs_collect_opaque_let_binders(e2, ofns, a1) }
+  }
+  EMatch(s, arms) -> pcs_olb_arms(arms, ofns, pcs_collect_opaque_let_binders(s, ofns, acc))
+  ELambda(_, body) -> pcs_collect_opaque_let_binders(body, ofns, acc)
+  _ -> acc
+}
+
+fn pcs_olb_stmts(stmts: [Stmt], ofns: [String], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) -> if pcs_rhs_calls_opaque_fn(rhs, ofns) { [nm, ...pcs_collect_opaque_let_binders(rhs, ofns, acc)] }
+                     else { pcs_collect_opaque_let_binders(rhs, ofns, acc) }
+        _ -> pcs_collect_opaque_let_binders(rhs, ofns, acc)
+      }
+      SExprStmt(e) -> pcs_collect_opaque_let_binders(e, ofns, acc)
+      _ -> acc
+    }
+    pcs_olb_stmts(rest, ofns, a1)
+  }
+}
+
+fn pcs_olb_arms(arms: [Arm], ofns: [String], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [Arm(_, _, b), ...rest] -> pcs_olb_arms(rest, ofns, pcs_collect_opaque_let_binders(b, ofns, acc))
+}
+
+fn pcs_rhs_calls_opaque_fn(rhs: Expr, ofns: [String]) : Bool = match rhs.kind {
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> list_has(ofns, c)
+    EModCall(_, c) -> list_has(ofns, c)
+    _              -> false
+  }
+  _ -> false
+}
+
+# Append a `__perceus_drop(h)` to the block scope of each `let h = ...`
+# that binds an opaque handle in `opaque_lets`. Each shim call consumed a
+# dup of the handle; this releases the birth ref once. Placed as the last
+# block statement (after the final use), so it never double-frees a use.
+fn pcs_force_opaque_exit_drops(e: Expr, opaque_lets: [String], uses: [Use]) : Expr / Console = match opaque_lets {
+  [] -> e
+  _  -> Expr { kind: pcs_fed_kind(e.kind, opaque_lets, uses), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn pcs_fed_kind(k: ExprKind, opaque_lets: [String], uses: [Use]) : ExprKind / Console = match k {
+  EBlock(stmts, tail) -> {
+    # The normal exit-drop pass already drops a handle whose last use is
+    # in the block (not the tail) and read >= 2 times. The handles left
+    # without a drop are exactly those whose last use is in the tail OR
+    # read once — those get a drop here, complementary, never doubled.
+    let bound = pcs_fed_block_handles(stmts, opaque_lets, tail, uses, [])
+    let drops = pcs_fed_make_drops(bound)
+    match tail {
+      Some(t) -> {
+        # A handle's last use may be in the tail; bind the tail value, drop
+        # the handles, then return it.
+        match drops {
+          [] -> EBlock(pcs_fed_stmts(stmts, opaque_lets, uses), Some(pcs_force_opaque_exit_drops(t, opaque_lets, uses)))
+          _  -> {
+            let t1 = pcs_force_opaque_exit_drops(t, opaque_lets, uses)
+            let ret_let = SLet(mk_pat(PBind("__pcs_oret"), t1.line, t1.col), None, t1)
+            let ret_var = mk_expr(EVar("__pcs_oret"), t1.line, t1.col)
+            EBlock(list_append(pcs_fed_stmts(stmts, opaque_lets, uses), list_append([ret_let], drops)), Some(ret_var))
+          }
+        }
+      }
+      None -> EBlock(list_append(pcs_fed_stmts(stmts, opaque_lets, uses), drops), None)
+    }
+  }
+  EIf(c, t, oe) -> EIf(c, pcs_force_opaque_exit_drops(t, opaque_lets, uses),
+                       match oe { None -> None Some(e2) -> Some(pcs_force_opaque_exit_drops(e2, opaque_lets, uses)) })
+  _ -> k
+}
+
+# Handles bound by a `let` in these stmts that the normal exit-drop pass
+# leaves undropped — i.e. last-use-in-tail or read-once. (A handle read
+# >= 2 times whose last use is NOT in the tail already gets the normal
+# exit-drop, so it is excluded to avoid a double-free.)
+fn pcs_fed_block_handles(stmts: [Stmt], opaque_lets: [String], tail: Option[Expr], uses: [Use], acc: [String]) : [String] / Console = match stmts {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(pat, _, _) -> match pat.pkind {
+      PBind(nm) ->
+        if list_has(opaque_lets, nm) and pcs_fed_needs_drop(nm, tail, uses) {
+          pcs_fed_block_handles(rest, opaque_lets, tail, uses, [nm, ...acc])
+        } else { pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc) }
+      _ -> pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc)
+    }
+    _ -> pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc)
+  }
+}
+
+# A handle needs the force-drop here iff it is read >= 2 times AND its
+# last use is in the tail. That is the one shape the normal exit-drop
+# skips (for TCO) while still dup'ing every read — leaving the birth ref
+# orphaned. A read-once handle is moved raw into its single shim call (the
+# shim consumes the birth ref), so it needs no drop.
+fn pcs_fed_needs_drop(nm: String, tail: Option[Expr], uses: [Use]) : Bool / Console =
+  pcs_count_non_lam_uses(nm, uses, 0) >= 2 and pcs_name_in_tail(nm, tail)
+
+fn pcs_fed_make_drops(names: [String]) : [Stmt] = match names {
+  []           -> []
+  [nm, ...rest] -> [pcs_make_drop_stmt(nm, 0, 0), ...pcs_fed_make_drops(rest)]
+}
+
+# Recurse into each statement's sub-expressions (handles bound in inner
+# blocks get their own drop there).
+fn pcs_fed_stmts(stmts: [Stmt], opaque_lets: [String], uses: [Use]) : [Stmt] / Console = match stmts {
+  []           -> []
+  [s, ...rest] -> [pcs_fed_stmt(s, opaque_lets, uses), ...pcs_fed_stmts(rest, opaque_lets, uses)]
+}
+
+fn pcs_fed_stmt(s: Stmt, opaque_lets: [String], uses: [Use]) : Stmt / Console = match s {
+  SLet(p, t, e)       -> SLet(p, t, pcs_force_opaque_exit_drops(e, opaque_lets, uses))
+  SExprStmt(e)        -> SExprStmt(pcs_force_opaque_exit_drops(e, opaque_lets, uses))
+  _                   -> s
+}
+
 fn pcs_all_arm_binders_elems(els: [ListElem], acc: [String]) : [String] = match els {
   []           -> acc
   [h, ...rest] -> {
@@ -1220,16 +1391,15 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
   }
 }
 
-fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]) : Decl / Console {
+fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry], opaque_ret_fns: [String]) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
-      # m12.7.x FFI v1: an `[<extern_c>]` axiom's body is the magic
-      # ETodo tag that signals the C / LLVM emitters to inline an
-      # FFI shim. Skip Perceus rewriting — the shim handles its own
-      # arg-decref discipline (it `kai_decref`s every boxed input
-      # after the extern returns), so prepending unused-param drops
-      # would double-free.
+      # An `extern "C" fn` body is the magic ETodo tag that signals the
+      # C / LLVM emitters to inline an FFI shim. Skip Perceus rewriting
+      # — the shim handles its own arg-decref discipline (it
+      # `kai_decref`s every boxed input after the extern returns), so
+      # prepending unused-param drops would double-free.
       if body_is_ffi_extern(body) { d }
       # Phase 3 unboxing — UFn params are raw C scalars (`int64_t`
       # etc.) with no reference count, so they carry NO dup/drop
@@ -1340,7 +1510,12 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
             pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
             safe_arm_binders),
           skip_set)
-        let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap, move_last_set)
+        # Let-bound opaque handles whose birth ref needs an end-of-scope
+        # drop (each shim call consumes a dup; the birth ref is released
+        # here, even when the last use is in tail position).
+        let opaque_lets = pcs_collect_opaque_let_binders(body, opaque_ret_fns, [])
+        let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap, move_last_set)
+        let new_body = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         # Borrowed params carry no exit obligation — exclude from the
@@ -2075,8 +2250,11 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
       # LUAt-with-count==1 stays raw (lexically-last consumer
       # transfers the ref). LUUnused is handled by `block_unused_lets`
       # via inline decref.
+      # A binder that moves at its last use already pays the birth ref
+      # there; an exit-drop on top of the move would double-free, so the
+      # move-last set is excluded.
       let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
-                                                         opt_tail, [])
+                                                         opt_tail, move_last_set, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
     EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
@@ -3125,6 +3303,11 @@ fn pcs_sab_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry]) : [Strin
 fn pcs_strs_inter(xs: [String], ys: [String]) : [String] = match xs {
   []           -> []
   [h, ...rest] -> if list_has(ys, h) { [h, ...pcs_strs_inter(rest, ys)] } else { pcs_strs_inter(rest, ys) }
+}
+
+fn pcs_strs_union(xs: [String], ys: [String]) : [String] = match ys {
+  []           -> xs
+  [h, ...rest] -> if list_has(xs, h) { pcs_strs_union(xs, rest) } else { pcs_strs_union([h, ...xs], rest) }
 }
 
 # Walk a fn body, collecting EVERY guard-less match arm's pattern binders
@@ -4220,6 +4403,7 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], acc:
 # excludes Tier 2.5 raw locals (`int64_t`, etc.) which have no rc.
 fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
                                      uses: [Use], opt_tail: Option[Expr],
+                                     move_last_set: [String],
                                      acc: [Stmt]) : [Stmt] / Console {
 
   match stmts {
@@ -4231,7 +4415,10 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
             let names_in = prc_pat_bindings_skip_raw(pat, rhs, [])
             let in_block = list_has(names_in, nm) and not list_has(outer, nm)
             let in_tail = pcs_name_in_tail(nm, opt_tail)
-            if in_block and not in_tail {
+            # A move-at-last binder already releases the birth ref at its
+            # last use; an exit-drop here would double-free it.
+            let moves = list_has(move_last_set, nm)
+            if in_block and not in_tail and not moves {
               match last_use_for(nm, uses) {
                 LUBlocked(_) -> [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
                 LUAt(_, _, _) ->
@@ -4246,7 +4433,7 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
         }
         _ -> acc
       }
-      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, acc1)
+      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, move_last_set, acc1)
     }
   }
 }
