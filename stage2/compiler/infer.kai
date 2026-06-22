@@ -4105,6 +4105,12 @@ pub fn validate_union_collisions_decls(ds: [Decl], file: String,
                                      module_table: [ModuleEntry]) : Int / Console + File {
 
   let top_names = collect_top_type_names(ds)
+  # D2 only governs root-file unions. `target_mod` is the root file's
+  # stamped module_origin (`tag_target_decls_module_origin`); a DType
+  # whose origin differs belongs to a core/imported module and must
+  # not participate — a user union reusing a core type's variant name
+  # is ctor overloading resolved at use sites, not a collision.
+  let target_mod = inf_prelude_module_name(file)
   # pre-seed the claim table with the builtin variant
   # constructors registered by `add_builtin_variant_sigs` (Result.Ok,
   # Result.Err, Option.Some, Option.None). A user `pub type T = Ok(...)`
@@ -4114,9 +4120,17 @@ pub fn validate_union_collisions_decls(ds: [Decl], file: String,
   # collision here gives a precise diagnostic at the user's DType
   # instead of a cascade of unrelated type-mismatch errors pointing at
   # nonexistent line numbers in the user file.
-  validate_union_collisions_loop(ds, top_names, file, module_table, 0,
+  validate_union_collisions_loop(ds, top_names, file, module_table, target_mod, 0,
                                    builtin_variant_claims())
 }
+
+# A decl's `module_origin` marks it as belonging to the root file when
+# it is unstamped (`None`) or stamped with the root module's own name.
+fn is_root_decl_origin(origin: Option[String], target_mod: String) : Bool =
+  match origin {
+    None    -> true
+    Some(m) -> m == target_mod
+  }
 
 # locate the source file that exports `type_name`. Walks
 # the module table built by `expand_imports`; the entry's `origin`
@@ -4152,22 +4166,33 @@ fn builtin_variant_claims() : [VariantClaim] {
 
 fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
                                     file: String, mt: [ModuleEntry],
-                                    errs: Int,
+                                    target_mod: String, errs: Int,
                                     claims: [VariantClaim]) : Int / Console + File {
 
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      DType(_, parent, _, body, line, col, _) -> match body {
-        TBSum(vs) -> {
-          let decl_file = resolve_decl_file(parent, file, mt)
-          let r = check_variants_for_collision(vs, parent, line, col,
-                                                  top_names, claims, decl_file, errs)
-          validate_union_collisions_loop(rest, top_names, file, mt, r.errs, r.claims)
+      # Only root-file unions seed and test claims. A `type` from the
+      # core/imported modules sharing a variant name with a user union
+      # is ctor overloading resolved at use sites, not a D2 collision —
+      # registering its variants would reject a valid program (e.g.
+      # user `type Status = Exited(Int) | Signaled(Int)` vs core
+      # `os.Exit = Exited(Int) | Signaled(Int)`).
+      DType(_, parent, _, body, line, col, origin) ->
+        if is_root_decl_origin(origin, target_mod) {
+          match body {
+            TBSum(vs) -> {
+              let decl_file = resolve_decl_file(parent, file, mt)
+              let r = check_variants_for_collision(vs, parent, line, col,
+                                                      top_names, claims, decl_file, errs)
+              validate_union_collisions_loop(rest, top_names, file, mt, target_mod, r.errs, r.claims)
+            }
+            _ -> validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
+          }
+        } else {
+          validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
         }
-        _ -> validate_union_collisions_loop(rest, top_names, file, mt, errs, claims)
-      }
-      _ -> validate_union_collisions_loop(rest, top_names, file, mt, errs, claims)
+      _ -> validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
     }
   }
 }
