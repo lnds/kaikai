@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena clean tier0 tier1 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit clean tier0 tier1 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -166,8 +166,8 @@ clean:
 #
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes"
+tier0: selfhost demos-no-regression test-arena test-heap-limit
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains"
 
 # issue #120 — opt-in Perceus regions: P0 runtime arena gate. Plain +
 # ASAN build of the C-level bump-arena fixture. Fast (~1s), no kaic2
@@ -175,6 +175,12 @@ tier0: selfhost demos-no-regression test-arena
 test-arena:
 	@echo "== test-arena: bump-arena runtime gate (plain + ASAN) =="
 	@bash tools/run-arena-c-fixture.sh
+
+# issue #878 — KAI_MAX_HEAP host-safety gate. A bounded-growth fixture
+# aborts clean under a low cap and completes under a high/unset cap.
+# Host-safe: every run is wrapped in `timeout` inside the stage2 target.
+test-heap-limit: kaic2
+	@$(MAKE) -C stage2 test-heap-limit
 
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or

@@ -147,7 +147,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
 
 all: $(TARGET)
 
@@ -3736,6 +3736,34 @@ test-perceus-817-filter-leak: $(TARGET) build
 	  && echo "perceus-817-filter-leak OK (leaked=$$leaked < 1000 over 5000 filter-over-heap iters; arm-binder leak closed)" \
 	  || { echo "perceus-817-filter-leak FAIL (leaked=$$leaked — arm-binder leak regressed, grows with iters)"; exit 1; }
 
+# Issue #878 — KAI_MAX_HEAP heap ceiling. The fixture doubles a string
+# toward a bounded ~256 MB target. Under a LOW cap (64m) the runtime must
+# abort clean ("kai: heap limit exceeded", exit 1) before reaching it;
+# under a HIGH cap / unset it must complete and print the length. Each run
+# is wrapped in `timeout` as a host-safety backstop — a regression that
+# breaks the cap cannot then exhaust the host (the exact hazard #878 fixes;
+# `ulimit -v` is a no-op on macOS, so `timeout` is the real ceiling here).
+test-heap-limit: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/heap_limit_runaway_878.kai; \
+	./$(TARGET) --path ../stdlib $$src > build/s2-878hl.c \
+	  || { echo "heap-limit FAIL (kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-878hl.c -o build/s2-878hl $(LDLIBS_M); \
+	lo=0; KAI_MAX_HEAP=64m timeout 30 ./build/s2-878hl > build/s2-878hl.lo.out 2> build/s2-878hl.lo.err || lo=$$?; \
+	[ "$$lo" -eq 1 ] \
+	  || { echo "heap-limit FAIL (low cap exit $$lo, want 1)"; cat build/s2-878hl.lo.err; exit 1; }; \
+	grep -q 'heap limit exceeded' build/s2-878hl.lo.err \
+	  || { echo "heap-limit FAIL (low cap: no 'heap limit exceeded' message)"; cat build/s2-878hl.lo.err; exit 1; }; \
+	[ -s build/s2-878hl.lo.out ] \
+	  && { echo "heap-limit FAIL (low cap printed result before aborting)"; cat build/s2-878hl.lo.out; exit 1; }; \
+	hi=0; KAI_MAX_HEAP=2g timeout 60 ./build/s2-878hl > build/s2-878hl.hi.out 2> build/s2-878hl.hi.err || hi=$$?; \
+	{ [ "$$hi" -eq 0 ] && grep -q 'len=268435456' build/s2-878hl.hi.out; } \
+	  || { echo "heap-limit FAIL (high cap exit $$hi, output:)"; cat build/s2-878hl.hi.out build/s2-878hl.hi.err; exit 1; }; \
+	un=0; timeout 60 ./build/s2-878hl > build/s2-878hl.un.out 2> build/s2-878hl.un.err || un=$$?; \
+	{ [ "$$un" -eq 0 ] && grep -q 'len=268435456' build/s2-878hl.un.out; } \
+	  || { echo "heap-limit FAIL (unset cap exit $$un, output:)"; cat build/s2-878hl.un.out build/s2-878hl.un.err; exit 1; }; \
+	echo "heap-limit OK (64m -> clean abort exit 1; 2g + unset -> complete len=268435456; cap contains, unset unchanged)"
+
 # Issue #860 — the NATIVE backend must cascade decref->free for cons cells
 # consumed by a self-tail arm (accumulator / consuming / TRMC cons-modulo).
 # Before the fix native left `free_total=0`, `leaked` growing linearly with
@@ -4906,6 +4934,7 @@ test-light-parallel: $(TARGET) build
 test: $(TARGET) build
 	@$(MAKE) test-costly-parallel
 	@$(MAKE) test-light-parallel
+	@$(MAKE) test-heap-limit
 	@$(MAKE) test-user-cache
 	@$(MAKE) test-core-cache
 
