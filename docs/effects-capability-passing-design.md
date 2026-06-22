@@ -1,26 +1,29 @@
 # Capability-passing evidence transport — design
 
-> **Status: DESIGN ROUND (2026-06-11). Decision A taken by the language
-> owner: no shortcuts — the by-name dynamic dispatch is retired and
-> evidence travels with calls.** Supersedes the implementation premise of
-> `docs/named-handler-instances-design.md` (kept as lineage; its surface
-> design survives as §6 here). Implementation is gated on an asu lane
-> plan and on the in-flight lanes vacating the affected zones
-> (native-parity burn-down, #802). Issue: #789.
+> **Status: DESIGN ROUND (2026-06-11; currency pass 2026-06-21). Decision
+> A taken by the language owner: no shortcuts — the by-name dynamic
+> dispatch is retired and evidence travels with calls.** Supersedes the
+> implementation premise of `docs/named-handler-instances-design.md` (kept
+> as lineage; its surface design survives as §6 here). Implementation is
+> gated on the asu lane plan (`docs/effects-capability-passing-lane-plan.md`)
+> and on the in-flight lanes vacating the affected zones. Umbrella issue:
+> **#820 (OPEN).** Issue #789 is **CLOSED** — see §1 and §5.1 for what its
+> closure did and did not cover.
 
 ## 1. Why this exists, and why we only saw it now
 
 `docs/effects.md` and CLAUDE.md describe kaikai's effects as
 **capability-passing, Effekt-style**. The implementation is not that:
 an op call walks `fiber.evidence_top` at runtime and picks the innermost
-handler **by effect/op name** (`docs/effects-impl.md:364,668`;
-`stage2/runtime.h:11260`). That is **dynamic scoping**. The by-id path
+handler **by effect/op name** (`docs/effects-impl.md` §*Op-call lowering*,
+around `:665`; the resolution-by-lexical-scope note at `:360`;
+`stage2/runtime.h:11332`). That is **dynamic scoping**. The by-id path
 added for `with Eff as a` aliases is real but **lexical only** — the
 minted `handler_id` is a C local that dies at the first function or
 lambda boundary, and the emitter knows it
-(`alias_map_disable_tag`, `stage2/compiler/emit_shared.kai:2349`).
+(`alias_map_disable_tag`, `stage2/compiler/emit_shared.kai:2497`).
 
-Nobody noticed for a year because **the two models are observationally
+Nobody noticed because **the two models are observationally
 equivalent on every program in which each effect has at most one live
 handler** — which is every program in our corpus, the stdlib, and the
 compiler itself. No fixture *could* fail. The gap surfaced only when:
@@ -43,8 +46,12 @@ two models, so this class of drift can never be invisible again.
 unique `handler_id`) onto the fiber's evidence stack and pops it at the
 closing brace. An op call performs a runtime walk: innermost node whose
 effect/op *name* matches wins. Callees receive nothing; resolution
-happens wherever the perform executes. Spawn clones the parent's
-evidence stack into the child fiber (`stage2/runtime.h:10577`).
+happens wherever the perform executes. Spawn copies the parent's
+evidence chain into the child fiber — `kai_clone_evidence_chain`
+(`stage2/runtime.h:10649`), retained on the child's
+`cloned_evidence_chain` field (`:2272`) and freed when the fiber dies
+(`kai_free_cloned_evidence_chain`, `:11117`). This heap-cloned chain is
+the mechanism behind the nested-mailbox class (#104).
 
 **Target — capability passing.** Resolution happens **once, in the
 typer**, when a row obligation is discharged. The proof of discharge —
@@ -52,8 +59,8 @@ the evidence (handler_id / evidence-node reference) — is **injected as a
 hidden parameter** into every function whose row demands the effect, and
 flows through calls like any argument. At the perform site the evidence
 is *at hand*; no name lookup, no stack walk. `kai_evidence_lookup_node`
-(by-name) is deleted; `kai_evidence_lookup_node_by_id` survives only as
-a validity check, if at all.
+(by-name) is deleted; `kai_evidence_lookup_node_by_id`
+(`stage2/runtime.h:11362`) survives only as a validity check, if at all.
 
 Why A and not the alternatives (recorded from the review):
 
@@ -65,7 +72,8 @@ Why A and not the alternatives (recorded from the review):
 - **C — detection only:** make the op-name collision a compile error and
   ship nothing else. Correct as far as it goes, but leaves the by-name
   mechanism — the root cause — alive. **Rejected as an endpoint** (the
-  collision diagnostic still ships, see §5.1, but as part of A).
+  collision diagnostic still ships, see §5.1, but as part of A — and it
+  has not shipped on its own; see §5.1 on the state of #789).
 
 ## 3. What is injected, and where
 
@@ -97,7 +105,7 @@ Why A and not the alternatives (recorded from the review):
   the masked callee takes no evidence param for it, and *cannot* perform
   it — the soundness condition the masking discipline (#251/#252)
   already demands. Masking gets *stronger*, not re-designed.
-- **Spawn/fibers:** the evidence-stack clone is retired. A spawned
+- **Spawn/fibers:** the evidence-chain clone is retired. A spawned
   body's row must be satisfied *inside* the fiber (its own handles or
   builtin defaults). Capabilities do **not** cross `spawn` — that is
   escape vector 4 (§6.2) and the clone was its UAF. This is a
@@ -108,12 +116,16 @@ Why A and not the alternatives (recorded from the review):
 
 ## 4. What is deleted
 
-- The runtime by-name walk (`kai_evidence_lookup_node`) and its callers
-  in both backends.
-- The lexical-alias special case (`alias_map_disable_tag` and the
-  C-local `kai_alias_*_id` minting): aliases become ordinary evidence
-  values, valid wherever a value is valid (§6).
-- The spawn-time evidence-stack clone (`runtime.h:10577`).
+- The runtime by-name walk (`kai_evidence_lookup_node`,
+  `stage2/runtime.h:11332`) and its callers in both backends (the
+  C-direct call site is `stage2/compiler/emit_c.kai:2394`).
+- The lexical-alias special case (`alias_map_disable_tag`,
+  `stage2/compiler/emit_shared.kai:2497`, and the C-local
+  `kai_alias_*_id` minting): aliases become ordinary evidence values,
+  valid wherever a value is valid (§6).
+- The spawn-time evidence-chain clone (`kai_clone_evidence_chain`,
+  `stage2/runtime.h:10649`; the `cloned_evidence_chain` field `:2272`
+  and its free path `:11117`).
 
 One resolution mechanism remains. Two live paths is the anti-pattern
 that produced #789; this is the load-bearing simplification of the
@@ -123,14 +135,32 @@ whole redesign.
 
 ### 5.1 The op-name collision diagnostic (the #789 typer hole)
 
+**State of #789 (verified 2026-06-21).** #789 is **CLOSED**, but it did
+**not** close by fixing the root cause this doc owns. It closed via
+`460c9bd6 fix(emit): key native evidence frames per install-site, not
+per effect` — a native-backend codegen fix for an *unrelated* symptom
+(two nested same-effect `KInstall`s reused one alloca, making
+`node->parent == node` a self-cycle that hung the libLLVM walk). That
+commit carried `refs #789`, and the issue was marked completed the same
+day, but the by-name dispatch that *causes* the #789 op-name collisions
+is still live, and **no op-name-collision diagnostic exists in the typer
+today** (no detection pass, no `collision_*` fixtures). So the practical
+position is sharper than the original draft assumed: the "C companion"
+the design said "still ships as part of A" has **not** shipped on its
+own; #789's closure retired a native-parity crash, not the soundness
+hole. The transport mechanism #820 owns — and the collision diagnostic
+that rides with it — both remain unlanded.
+
 Repro 3 of #789 shows a row variable absorbing an effect that has no
 real handler when an op name collides with an installed effect — the
 type error is *lost* and codegen segfaults. Under capability passing
 this becomes structurally impossible (evidence must exist to be
-injected), but the **diagnostic** still ships: a clear compile error at
-the collision site, with the three #789 repros as `.err.expected` /
-behavioural fixtures. These fixtures are foundational: they are the
-programs that distinguish the models (§1).
+injected), but the **diagnostic** still ships with A: a clear compile
+error at the collision site, with the three #789 repros as
+`.err.expected` / behavioural fixtures. These fixtures are foundational:
+they are the programs that distinguish the models (§1). Reopening #789
+as the diagnostic's home, or filing it under #820, is a lane-plan call;
+the diagnostic does not exist yet either way.
 
 ### 5.2 Gates — fixtures, not byte-id
 
@@ -210,8 +240,10 @@ named reach proves insufficient.
 
 The riskiest property: **both backends must cross together** per
 program. A bridge where backend A passes evidence and backend B walks
-the stack cannot share fixtures or parity. Suggested spine, to be
-torn apart by the lane-plan review:
+the stack cannot share fixtures or parity. The lane plan
+(`docs/effects-capability-passing-lane-plan.md`) tears the spine below
+into its sequenced, gated form (L0–L6); this is the input to that round,
+not the plan.
 
 1. **Foundational fixtures first** (the model-distinguishing programs
    of §5.2) — written against today's compiler, documenting today's
@@ -229,19 +261,28 @@ torn apart by the lane-plan review:
    describe the now-true model; the honesty target updated.
 
 Sequencing constraint: starts only after the native-parity burn-down
-and #802 merge (this rewrites the code both stand on).
+and the in-flight zone-rewriting lanes merge (this rewrites the code
+both stand on).
 
-## 8. Open questions (for the lane-plan round)
+## 8. Open questions (resolved in the lane plan)
+
+The lane plan's §A resolves all four; they are kept here as the design's
+record of what it deferred.
 
 1. **Evidence representation:** raw pointer to the evidence node vs
    stable id + side table. Pointer is faster; id survives any future
-   evidence relocation. Spike-able.
+   evidence relocation. (Lane plan §A.1: raw pointer, opaque non-RC
+   scalar.)
 2. **Defaults granularity:** one evidence value per builtin effect at
    startup, or lazy per first demand? Interacts with #793's
-   module-global pattern in the native walk.
+   module-global pattern in the native walk. (Lane plan §A.2: eager,
+   one per builtin at startup.)
 3. **Arity cost:** rows with many effects inject many hidden params;
    measure call-ABI pressure on the hot corpus (rb-tree, self-compile)
    before choosing between individual params and an evidence tuple.
+   (Lane plan §A.3: measure first, binary threshold; individual params
+   the expected winner.)
 4. **Actor ops:** `send/receive/self` ride `Actor[Msg]` — confirm the
    actor runtime's dispatch sites tolerate the same injection or need
-   their own step in the spine.
+   their own step in the spine. (Lane plan §A.4: same injection, no
+   separate lane, one actor tripwire fixture in L3.)
