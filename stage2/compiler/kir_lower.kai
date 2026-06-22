@@ -89,7 +89,19 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # double-free fix); a fixed literal would alias them into
                      # one native alloca. Saved/restored around each match like
                      # `locals`.
-                     mscr: String }
+                     mscr: String,
+                     # `reuse_gc` carries the POINTER-kind scrutinee binder
+                     # names a variant REUSE arm projects (top-level + one-level
+                     # nested grand-children — the rb-tree rotation kept
+                     # children). Like `mscr`, the reuse op lowers far from the
+                     # arm pattern (inside the body, possibly under an `if`), so
+                     # the names travel here. `lower_reuse_con` counts each
+                     # name's uses in the rebuild and emits one
+                     # `kai_incref_if_shared(donor, child)` per use, so a SHARED
+                     # donor's fresh-alloc keeps a ref the match-exit decref
+                     # would otherwise cascade-free. Set per reuse arm, restored
+                     # around each match like `mscr`; "" / [] outside one.
+                     reuse_gc: [String] }
 
 # A shadowed surface binder name paired with the fresh register it was
 # alpha-renamed to inside the current block (`Rn(surface, reg)`).
@@ -116,7 +128,7 @@ pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
               consts: [Decl], ffi: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "" }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [] }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -126,7 +138,7 @@ pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
 # lowering.
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "" }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [] }
 
 # Rotate the EFn table so entries from module `mo` resolve FIRST, then enter
 # the fn. Mirror of the C / LLVM emitters, which call `fns_prefer_module(fns,
@@ -140,7 +152,7 @@ pub fn ls_enter_fn_in(st: LowerSt, enc_fn: String, locals: [String],
                       mo: Option[String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns_prefer_module(st.fns, mo),
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
-            locals: locals, ffi: st.ffi, renames: [], mscr: "" }
+            locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [] }
 
 # Extend the lexical scope with one bound name (a `let` / match binder).
 # Forward-visible: a binder is in scope only after its definition. Idempotent
@@ -150,7 +162,7 @@ pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
   if ls_is_local(st, name) { st }
   else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
                    vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames, mscr: st.mscr } }
+                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc } }
 
 # Is `name` a name bound locally in the current fn body? (param / capture /
 # let / match binder). The shadow test `lower_var` consults before treating
@@ -171,13 +183,21 @@ pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, n
 pub fn ls_set_mscr(st: LowerSt, sd: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: sd }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: sd, reuse_gc: st.reuse_gc }
+
+# Set the reuse arm's scrutinee pointer-binder names so a `KConReuse` lowered
+# inside this arm's body emits the shared-donor incref. Saved (read
+# `st.reuse_gc`) and restored around each match like `mscr`.
+pub fn ls_set_reuse_gc(st: LowerSt, gc: [String]) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
+            vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: gc }
 
 pub fn ls_push_rename(st: LowerSt, name: String, reg: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi,
-            renames: [Rn(name, reg), ...st.renames], mscr: st.mscr }
+            renames: [Rn(name, reg), ...st.renames], mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # Resolve a surface name to its active shadow register, if any. First match
 # (innermost shadow) wins. No entry → the name is not shadowed; the caller
@@ -196,7 +216,7 @@ fn ls_lookup_rename_loop(rs: [Rename], name: String) : Option[String] = match rs
 pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap, mscr: st.mscr }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # Restore the local-name set to a block-entry snapshot, so binders
 # defined inside the block leave scope at its exit. As with `renames`, the
@@ -205,7 +225,7 @@ pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
 pub fn ls_set_locals(st: LowerSt, snap: [String]) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: snap, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+            consts: st.consts, locals: snap, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # A fresh virtual-register name, deterministic per function: `.t0`, `.t1`, …
 # The leading `.` is load-bearing, NOT cosmetic: a temporary shares the
@@ -231,9 +251,9 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # --- Block accumulation -------------------------------------------------
 
@@ -254,14 +274,14 @@ fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -455,7 +475,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc }
 
 # --- Type declarations --------------------------------------------------
 

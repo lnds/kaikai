@@ -629,6 +629,18 @@ KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag,
   return r;
 }
 
+/* native variant reuse leak (#872) — incref a kept child only when the reuse
+ * donor is SHARED. The native reuse lowering fresh-allocs on a shared donor and
+ * keeps borrowed references to the donor's kept children; the match-exit decref
+ * would cascade-free them, so each embedded child needs its own ref. Unique
+ * donors reuse in place and MOVE their children — no incref. Emitted once per
+ * embedded borrowed child by the reuse lowering (multiset). Returns the child
+ * so the LLVM emitter can route it through the boxed-call helper. */
+KaiValue *kaix_incref_if_shared(KaiValue *donor, KaiValue *child) {
+  kai_incref_if_shared(donor, child);
+  return child;
+}
+
 /* ---------- token-model reuse-in-place (llvm-c-parity lane) ----------
  *
  * The simple `kaix_reuse_or_alloc_variant` above eager-decrefs each old
@@ -653,6 +665,18 @@ KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag,
  * lives there. `KaiReuse` is `KaiValue*` (runtime.h §reuse-token). */
 KaiReuse  kaix_drop_reuse_token(KaiValue *v, int n)      { return kai_drop_reuse_token(v, n); }
 void      kaix_reuse_free(KaiReuse at)                   { kai_reuse_free(at); }
+
+/* Arm-top reuse token capture (#872). When `kaix_drop_reuse_token` returned
+ * NULL the donor was SHARED — `kai_drop_reuse_token` already did the non-
+ * recursive rc-- and the kept children did NOT move, so each kept pointer
+ * child the rebuild embeds needs its own ref (the shell stays live for its
+ * other owners). When the token is non-null (unique) the children MOVED, so no
+ * incref. Emitted once per kept ptr binder by the arm-top lowering; returns the
+ * child so the LLVM emitter routes it through the boxed-call helper. */
+KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
+  if (token == kai_reuse_null) kai_incref(child);
+  return child;
+}
 
 /* Borrow read of a variant pointer slot — the bind-site uses this in the
  * UNIQUE branch so the child is moved (not duplicated) into the rebuild.
