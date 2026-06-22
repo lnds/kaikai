@@ -1088,6 +1088,17 @@ pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
 pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
 ```
 
+A head carrying an `(element, row)` parameter list — a streaming
+carrier like `Stream[t, e]` (or ahu's `Source[t, e]`) whose effect
+row is itself a type parameter — rides the pipes the same way. The
+canonical shape becomes `map[A, B, e](xs: T[A, e], f: (A) -> B / e) :
+T[B, e]`: the element unifies against the first slot, the row threads
+through the trailing row-kind slot. Dispatch is by head *name* and is
+arity-agnostic, so no extra opt-in is needed; the row slot threads via
+a row carrier (`row_arg_carrier`), keeping the effect visible in the
+type (the carrier is the fix for #773). The single-parameter `T[A]`
+form is the special case where `T` is pure.
+
 Diagnostic shape when conventions are violated (anchored at the
 user's pipe call site):
 
