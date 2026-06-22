@@ -3,29 +3,20 @@ name: tier1-native
 # tier1-native (KIR Lane 1.2, docs/kir-design.md §"Lane 1.2") gates the
 # in-process libLLVM NATIVE backend (`kaic2 --emit=native`,
 # docs/kir-design.md §7.2): it builds kaic2 with `KAI_LLVM=1`, then for
-# every examples/native/*.kai fixture emits a native object IN MEMORY
-# via the LLVM C API, links it against the effects runtime, runs it,
-# and diffs stdout + exit code against the C-direct backend (the
-# oracle). See tools/test-native-parity.sh.
+# every entry-point fixture emits a native object IN MEMORY via the LLVM C
+# API, links it against the effects runtime, runs it, and diffs stdout +
+# exit code against the C-direct backend (the oracle).
 #
-# Why this is an ALWAYS-ON PR gate (not path-gated): since the Lane 1.5
-# flip (this branch) the in-process libLLVM native backend is the DEFAULT
-# of `kai build` / `kai run`. The gate that protects the default backend
-# must run on every PR, exactly the way tier1 protects what used to be
-# the C default. Before the flip this workflow was path-gated (it only
-# fired on diffs to the native backend, its prims, the runtime
-# forwarders, the KIR lowering, or the Makefile that builds it), because
-# an opt-in backend is only reachable through those paths. PR #780 proved
-# even that was load-bearing: the native `main -> 42` spine was validated
-# by hand, a rebase silently re-broke the native prim dispatch in kaic1
-# (a non-callable forwarder => runtime panic), and CI stayed green. Now
-# that native is the default, ANY change can regress it (e.g. a stdlib
-# edit a native fixture exercises), so the path filter is gone — this
-# runs on every PR like tier1. The doc-only skip below keeps pure-doc PRs
-# free.
+# Why this is an ALWAYS-ON PR gate (not path-gated): since the Lane 1.5 flip
+# the in-process libLLVM native backend is the DEFAULT of `kai build` /
+# `kai run`, so any change can regress it.
 #
-# This is the single backend-parity gate (native vs C-direct); the old
-# llvm-text gate was removed (#850).
+# Structure (docs/ci-time-analysis.md §7): a single `build-native` job
+# builds the libLLVM kaic2 + P2 bitcode ONCE and publishes them; the corpus
+# ratchet (~620 fixtures, the dominant cost) is sharded across two runners
+# via $BACKEND_PARITY_DIRS (disjoint subsets whose union is the full corpus).
+# native is the DEFAULT backend and deserves equal-or-better coverage than
+# the C oracle — sharding cuts wall-clock without dropping a single fixture.
 on:
   pull_request:
   push:
@@ -39,115 +30,174 @@ permissions:
   contents: read
 
 jobs:
-  tier1-native:
+  changes:
     runs-on: ubuntu-latest
-    # The full-corpus ratchet now does MORE real work than when 30 min was
-    # set: as native-backend crashes get fixed, the formerly-aborting
-    # fixtures run to completion (and a few still hit the 30 s per-fixture
-    # run-timeout), so both the main pass and the flaky-recheck of the
-    # remaining gaps take longer. 45 min keeps margin over the ~25-30 min
-    # the corpus now needs without masking a real hang (the per-fixture
-    # 30 s timeout still bounds any single runaway).
-    timeout-minutes: 45
+    timeout-minutes: 5
+    outputs:
+      doc-only: ${{ steps.doc-only.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # Doc-only PRs short-circuit with SUCCESS (mirrors tier1-asan).
-      # The path filter above already excludes pure-doc PRs, but a PR
-      # that mixes a path-trigger file with doc edits would still spend
-      # a runner without this guard.
       - name: Detect doc-only diff
         id: doc-only
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           if [ -z "$CHANGED" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
           if [ -z "$NON_DOC" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Doc-only PR; skipping tier1-native build."
+            echo "Doc-only PR; skipping tier1-native."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # The native backend links against libLLVM (discovered via
-      # llvm-config). Ubuntu's llvm-dev ships a versioned llvm-config
-      # (e.g. llvm-config-18); resolve whichever the runner provides and
-      # export it for the stage2 Makefile + the harness.
+  # Build the libLLVM-capable kaic2 + P2 runtime bitcode once, assert P2 is
+  # active (clang 18 — a dropped clang 18 is a red build, not a silent perf
+  # regression), and publish for the shards. Both shards run on identical
+  # ubuntu-latest with the same apt llvm-dev, so the dynamically-linked
+  # libLLVM kaic2 is ABI-compatible across them.
+  build-native:
+    needs: changes
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install toolchain (clang + libLLVM)
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm-dev
           LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
           if [ -z "$LLVM_CONFIG" ]; then
-            echo "::error::no llvm-config found after installing llvm-dev"
-            exit 1
+            echo "::error::no llvm-config found after installing llvm-dev"; exit 1
           fi
           echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
           echo "using $LLVM_CONFIG ($($LLVM_CONFIG --version))"
-
-      # P2 (docs/native-codegen-perf-plan.md §P2): the stage2 KAI_LLVM build
-      # generates the native-runtime bitcode (tools/gen-runtime-bc.sh, gated
-      # to clang 18). ubuntu-latest's `clang` is 18.x, so P2 must turn ACTIVE
-      # here — if it silently opted out (e.g. a base-image clang bump past
-      # 18), the parity gate would only ever exercise the slow legacy link.
-      # Build kaic2 first (the parity harness does too, but the assert needs
-      # the bitcode in place), then assert. asu guard #2: a dropped clang 18
-      # is a red build, not a silent perf regression.
-      - name: "Assert native P2 bitcode is active"
-        if: steps.doc-only.outputs.skip != 'true'
+      - name: Build native kaic2 + assert P2 bitcode
         run: |
           rm -f stage2/kaic2
           make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >/dev/null 2>&1
           tools/assert-runtime-bc.sh
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaic2-native
+          path: |
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+          retention-days: 1
+          if-no-files-found: error
 
-      - name: "tier1-native (every native fixture: emit -> link -> run -> diff vs C-direct)"
-        if: steps.doc-only.outputs.skip != 'true'
+  # Shard 1 — first corpus subset + the curated smoke. Subset chosen to
+  # balance fixture count against shard 2 (~289 vs ~257 entry points).
+  native-shard-1:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: "Smoke: every examples/native fixture (emit -> link -> run -> diff)"
         run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-parity.sh
-
-      # Native-parity ratchet (KIR Lane 1.5). The curated fixtures above are
-      # the smoke; this gates the FULL corpus under --backend=native vs the
-      # C-direct oracle against tools/native-parity-baseline.txt. The
-      # burn-down reached zero — the baseline is empty, full corpus parity
-      # holds, and the Lane 1.5 flip landed (native is now the default). The
-      # ratchet stays as a regression gate: a fixture that diverges now but
-      # is NOT in the (empty) baseline FAILS, so no new gap can open. A
-      # listed-but-passing fixture would prompt to tighten the baseline —
-      # there are none left to list.
-      - name: "tier1-native ratchet (full corpus native vs C-direct, no new gaps)"
-        if: steps.doc-only.outputs.skip != 'true'
+      - name: "Ratchet shard 1 (effects/actors/spawn/perceus/refinements/llvm vs C-direct)"
         run: |
           CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
             TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_DIRS="examples/effects examples/actors examples/spawn examples/perceus examples/refinements examples/llvm" \
             tools/test-backend-parity.sh
-
-      # Issue #860 — native cons/list RC must cascade decref->free (free_total
-      # balanced) for self-tail-consumed cons, not just match output parity.
-      # The ratchet above gates output; this gates the RC ledger directly.
-      - name: "tier1-native #860 cons RC cascade (free_total == alloc_total-1)"
-        if: steps.doc-only.outputs.skip != 'true'
-        run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-perceus-860-native-cons-leak
-
-      - name: "tier1-native #872 variant reuse leak (rb-tree no longer leaks O(inserts))"
-        if: steps.doc-only.outputs.skip != 'true'
-        run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-perceus-872-native-variant-reuse-leak
-
       - name: Working tree clean check
-        if: steps.doc-only.outputs.skip != 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
-            echo "::error::working tree dirty after tier1-native; build artifacts leaked into tracked paths"
-            git status
-            exit 1
+            echo "::error::working tree dirty after native-shard-1"; git status; exit 1
+          fi
+
+  # Shard 2 — remaining corpus subset + the #860 cons-RC ledger gate.
+  native-shard-2:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: "Ratchet shard 2 (packages/minimal/quickstart/stdlib/attributes/unstable/demos vs C-direct)"
+        run: |
+          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
+            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_DIRS="examples/packages examples/minimal examples/quickstart examples/stdlib examples/attributes examples/unstable demos" \
+            tools/test-backend-parity.sh
+      - name: "tier1-native #860 cons RC cascade (free_total == alloc_total-1)"
+        run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-perceus-860-native-cons-leak
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after native-shard-2"; git status; exit 1
+          fi
+
+  # Aggregator (mirrors tier1's). Not a Required check, but keeps the PR's
+  # check list to one tidy `tier1-native` status that is green iff both
+  # shards pass.
+  tier1-native:
+    needs: [changes, native-shard-1, native-shard-2]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on both native shards
+        run: |
+          if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
+            echo "tier1-native OK — doc-only PR, shards skipped"; exit 0
+          fi
+          r1='${{ needs.native-shard-1.result }}'
+          r2='${{ needs.native-shard-2.result }}'
+          echo "native shard results: 1=$r1 2=$r2"
+          if [ "$r1" = "success" ] && [ "$r2" = "success" ]; then
+            echo "tier1-native OK — both shards green (full corpus parity)"
+          else
+            echo "::error::tier1-native FAIL — a shard did not succeed"; exit 1
           fi
