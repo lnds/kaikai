@@ -502,6 +502,7 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
+    EExternBody(_) -> k
     # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
     # TypeExpr and a resolved-names list, neither of which the
     # visitor traverses). Same shape as EHole/ETodo for the
@@ -783,6 +784,21 @@ fn inf_resolve_alias_labels(raw: [String], cands: [AliasCand], cand_ns: [String]
 }
 
 
+# True when `name` is a fixed-width boundary annotation. On the kaikai
+# side such a value is a plain `Int` (or
+# `Real` for the float `F32`) — the exact C width lives only at the
+# boundary (the classifier reads the surface name; the shim casts at
+# the call). Mapping here, not in the FFI classifier, is what lets
+# `make_gray(64)` and `Color { r: 255 }` type-check.
+fn is_ffi_fixed_name(name: String) : Bool =
+  name == "U8" or name == "U16" or name == "U32" or name == "U64" or
+  name == "I8" or name == "I16" or name == "I32" or name == "I64" or name == "F32"
+
+# The kaikai-side `Ty` of a fixed-width annotation: `Real` for `F32`,
+# `Int` for every integer width. Only call when `is_ffi_fixed_name`.
+fn ffi_fixed_ty_of_name(name: String) : Ty =
+  if name == "F32" { TyReal } else { TyInt }
+
 fn inf_resolve_ty(t: TypeExpr) : Ty {
   match t.tkind {
     TyName(name, targs) -> {
@@ -793,6 +809,13 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
       else if name == "Char" { TyChar }
       else if name == "Unit" { TyUnit }
       else if name == "Byte" { TyByte }
+      # A fixed-width boundary annotation is an `Int` (or `Real` for
+      # `F32`) on the kaikai side — it only carries its
+      # exact C width at the FFI boundary (the classifier reads the
+      # surface name). So literals and arithmetic unify normally; the
+      # shim casts at the call. Mapping here, not in the FFI classifier,
+      # is what lets `make_gray(64)` type-check.
+      else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
       # `Handle` is the surface name for the opaque LLVM
       # C-API scalar (`TyHandle`). Only the native backend writes it.
       else if name == "Handle" { TyHandle }
@@ -1625,6 +1648,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   EPlaceholder        -> acc
   EHole(_)            -> acc
   ETodo(_)            -> acc
+  EExternBody(_)      -> acc
   EVariantsOf(_, _)   -> acc
   EModCall(_, _)      -> acc
   EIntrinsic(_, args_) -> collect_call_labels_list(args_, acc)
@@ -1991,6 +2015,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
   EPlaceholder      -> acc
   EHole(_)          -> acc
   ETodo(_)          -> acc
+  EExternBody(_)    -> acc
   EVariantsOf(_, _) -> acc
   EModCall(_, _)    -> acc
   EIntrinsic(_, args_) -> walk_field_priv_list(file, home, all_decls, args_, acc)
@@ -2285,6 +2310,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     EPlaceholder      -> acc
     EHole(_)          -> acc
     ETodo(_)          -> acc
+    EExternBody(_)    -> acc
     EVariantsOf(_, _) -> acc
     EModCall(_, _)    -> acc
     EIntrinsic(_, args_) ->
@@ -3578,6 +3604,7 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
           else if name == "Byte"     { TyByte }
+          else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
           else if name == "Handle"   { TyHandle }
           # Nothing is the bottom type (used by
           # Fail.fail and Spawn's type-erased ops); the typer treats
@@ -4763,6 +4790,7 @@ fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk
           else if name == "Char"   { TyChar }
           else if name == "Unit"   { TyUnit }
           else if name == "Byte"     { TyByte }
+          else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
           else if name == "Handle"   { TyHandle }
           else if name == "Nothing" { TyAny }
           # Hanga Roa: the module_origin slot stays `None` here.
@@ -8458,6 +8486,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File {
     EFilterPipe(lhs, rhs)      -> synth_filter_pipe(st, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
     ETodo(msg)                 -> synth_todo(st, msg, e)
+    EExternBody(_)             -> synth_extern_body(st, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
     EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
     # numeric literal with a unit annotation. The inner Expr is
@@ -9158,6 +9187,15 @@ fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred {
   } else {
     register_fresh_hole(st, HKTodo(msg), e)
   }
+}
+
+# An extern-fn body type-checks like a hole (any expected type fits)
+# but is never a user hole: allocate a fresh tyvar without registering
+# it, so `--holes-json` ignores it and no effect leaks from the body.
+fn synth_extern_body(st: InferState, e: Expr) : Inferred {
+  let fresh_id = st.env.fresh
+  let st1 = st_set_env(st, fresh_var(st.env))
+  inferred_leaf(st1, TyVarT(fresh_id), e)
 }
 
 # `expr!` typer.
@@ -16629,6 +16667,7 @@ fn validate_unit_refs_kind(k: ExprKind, declared: [String], file: String,
   EPlaceholder   -> 0
   EHole(_)       -> 0
   ETodo(_)       -> 0
+  EExternBody(_) -> 0
   EVariantsOf(_, _) -> 0
   EModCall(_, _) -> 0
   EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, declared, file, 0)
@@ -17238,6 +17277,8 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DDoc(raw, text, inner, l, c) ->
       DDoc(raw, text, expand_unit_aliases_decl(inner, aliases), l, c)
     DModuleDoc(_, _, _, _) -> d
+    # FFI v2: a foreign type's fields are fixed-width — no unit aliases.
+    DExternType(_, _, _, _) -> d
   }
 }
 
@@ -17373,6 +17414,7 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
                                      expand_aliases_expr(b, aliases))
     EHole(_) -> k
     ETodo(_) -> k
+    EExternBody(_) -> k
     EBang(inner) -> EBang(expand_aliases_expr(inner, aliases))
     EHandle(body, eff_n, eff_tas, init_opt, alias_opt, cs, ret_opt) ->
       EHandle(expand_aliases_expr(body, aliases), eff_n,
@@ -18166,6 +18208,7 @@ fn tag_of_kind(k: ExprKind) : String {
       None     -> "hole ?"
     }
     ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
+    EExternBody(over) -> concat_all(["extern-body \"", over, "\""])
     EBang(_)       -> "bang"
     EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
     ELitUnit(_, u) -> concat_all(["lit-unit <", inf_unit_canon_display(u), ">"])
