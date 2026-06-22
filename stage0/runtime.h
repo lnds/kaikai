@@ -1440,13 +1440,82 @@ static uint32_t kai_slot_mask_of(int32_t tag) {
     return 0;
 }
 
+/* ---------- KAI_MAX_HEAP: process heap ceiling (host containment) ----------
+ *
+ * Caps total committed heap so a runaway aborts clean instead of dragging
+ * the host into an OOM hang (on macOS the RAM compressor masks exhaustion;
+ * RLIMIT_AS / `ulimit -v` are no-ops, so there is no OS ceiling at all).
+ * Set `KAI_MAX_HEAP` to a byte count or a k/m/g-suffixed size (e.g. `4g`).
+ * Unset/empty/unparseable -> no cap, one predicted branch per grow point.
+ *
+ * The counter is monotonic high-water (commit, not live). stage0 has no
+ * slab allocator, so it is charged per object at each grow point — cell
+ * calloc, variant block, slot array, arena chunk, and string/array
+ * payloads — so no allocation path grows past the ceiling uncounted.
+ * Single OS thread (fibers share it), so a plain global needs no sync. */
+static size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
+static int    kai_heap_inited       = 0;
+static size_t kai_heap_committed    = 0;
+
+static size_t kai_heap_limit(void) {
+    if (!kai_heap_inited) {
+        kai_heap_inited = 1;
+        const char *raw = getenv("KAI_MAX_HEAP");
+        if (raw && *raw) {
+            char *end = NULL;
+            unsigned long long n = strtoull(raw, &end, 10);
+            unsigned long long mul = 1;
+            if (end && *end) {
+                switch (*end) {
+                    case 'k': case 'K': mul = 1024ULL; break;
+                    case 'm': case 'M': mul = 1024ULL * 1024ULL; break;
+                    case 'g': case 'G': mul = 1024ULL * 1024ULL * 1024ULL; break;
+                    default: mul = 0; break;   /* junk suffix -> no cap */
+                }
+                if (mul && end[1]) mul = 0;    /* trailing junk after suffix -> no cap */
+            }
+            if (mul && n > 0 && n <= (unsigned long long) ((size_t) -1) / mul) {
+                kai_heap_limit_cached = (size_t) (n * mul);
+            }
+        }
+    }
+    return kai_heap_limit_cached;
+}
+
+static void kai_heap_charge(size_t sz) {
+    size_t limit = kai_heap_limit();
+    if (limit && kai_heap_committed + sz > limit) {
+        fprintf(stderr,
+            "kai: heap limit exceeded (KAI_MAX_HEAP=%s, used %zu bytes)\n",
+            getenv("KAI_MAX_HEAP"), kai_heap_committed);
+        exit(1);
+    }
+    kai_heap_committed += sz;
+}
+
+/* malloc/realloc that charge the payload against the ceiling and fold in
+ * the OOM check shared by every value-heap allocation. */
+static void *kai_heap_malloc(size_t sz) {
+    kai_heap_charge(sz);
+    void *p = malloc(sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    return p;
+}
+
+static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
+    if (new_sz > old_sz) kai_heap_charge(new_sz - old_sz);
+    void *p = realloc(ptr, new_sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    return p;
+}
+
 #ifdef KAI_TRACE_RC
 /* Under trace/profile the cell + slot free-lists are disabled (they
  * would perturb leak attribution and poisoning). Provide malloc-only
  * slot helpers here so the variant constructors below link in this
  * mode too — the pooled versions live in the #else branch. */
 static KaiVarSlot *kai_slots_alloc(int n) {
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    return (KaiVarSlot *) kai_heap_malloc((size_t) n * sizeof(KaiVarSlot));
 }
 static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
@@ -1493,7 +1562,7 @@ static KaiVarSlot *kai_slots_alloc(int n) {
         return kai_slot_pool[n][--kai_slot_pool_n[n]];
     }
 #endif
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    return (KaiVarSlot *) kai_heap_malloc((size_t) n * sizeof(KaiVarSlot));
 }
 
 static void kai_slots_free(KaiVarSlot *slots, int n) {
@@ -1508,7 +1577,7 @@ static void kai_slots_free(KaiVarSlot *slots, int n) {
 }
 #else
 static KaiVarSlot *kai_slots_alloc(int n) {
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+    return (KaiVarSlot *) kai_heap_malloc((size_t) n * sizeof(KaiVarSlot));
 }
 static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 #endif
@@ -1524,9 +1593,11 @@ static KaiValue *kai_alloc(KaiTag tag) {
          * union, slots ptr, etc. must start clean). */
         memset(v, 0, sizeof(KaiValue));
     } else {
+        kai_heap_charge(sizeof(KaiValue));
         v = (KaiValue *) calloc(1, sizeof(KaiValue));
     }
 #else
+    kai_heap_charge(sizeof(KaiValue));
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
 #endif
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -1572,6 +1643,7 @@ static size_t kai_var_block_size(int n) {
 }
 
 static KaiValue *kai_alloc_var(int n) {
+    kai_heap_charge(kai_var_block_size(n));
     KaiValue *v = (KaiValue *) calloc(1, kai_var_block_size(n));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
@@ -1667,6 +1739,7 @@ static size_t kai_arena_align_up(size_t n) {
 static KaiArenaChunk *kai_arena_chunk_new(size_t need) {
     size_t cap = KAI_ARENA_CHUNK_BYTES;
     if (need > cap) cap = need;               /* oversized single object */
+    kai_heap_charge(sizeof(KaiArenaChunk) + cap);
     KaiArenaChunk *c = (KaiArenaChunk *) malloc(sizeof(KaiArenaChunk));
     if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); exit(1); }
     c->data = (unsigned char *) malloc(cap);
@@ -2745,8 +2818,7 @@ static KAI_RC_NOINLINE KaiValue *kai_char(uint32_t c) {
 static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = len;
-    v->as.s.bytes = (char *) malloc(len + 1);
-    if (!v->as.s.bytes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->as.s.bytes = (char *) kai_heap_malloc(len + 1);
     if (len > 0) memcpy(v->as.s.bytes, bytes, len);
     v->as.s.bytes[len] = '\0';
     return v;
@@ -3236,8 +3308,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             KaiValue *c = kai_alloc(KAI_ARRAY);
             c->as.arr.len = len;
             c->as.arr.cap = len > 0 ? len : 1;
-            c->as.arr.items = (KaiValue **) malloc((size_t) c->as.arr.cap * sizeof(KaiValue *));
-            if (!c->as.arr.items) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            c->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) c->as.arr.cap * sizeof(KaiValue *));
             for (int64_t i = 0; i < len; ++i)
                 c->as.arr.items[i] = kai_deep_copy_out(v->as.arr.items[i]);
             return c;
@@ -3246,8 +3317,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             size_t len = v->as.s.len;
             KaiValue *c = kai_alloc(KAI_STR);
             c->as.s.len = len;
-            c->as.s.bytes = (char *) malloc(len + 1);
-            if (!c->as.s.bytes) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            c->as.s.bytes = (char *) kai_heap_malloc(len + 1);
             if (len > 0) memcpy(c->as.s.bytes, v->as.s.bytes, len);
             c->as.s.bytes[len] = '\0';
             return c;
@@ -3523,8 +3593,7 @@ static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
     KaiValue *v = kai_alloc(KAI_ARRAY);
     v->as.arr.len = len;
     v->as.arr.cap = len > 0 ? len : 1;
-    v->as.arr.items = (KaiValue **) malloc((size_t) v->as.arr.cap * sizeof(KaiValue *));
-    if (!v->as.arr.items) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) v->as.arr.cap * sizeof(KaiValue *));
     for (int64_t i = 0; i < len; ++i) v->as.arr.items[i] = kai_incref(init);
     return v;
 }
@@ -3540,8 +3609,8 @@ static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *ini
     if (new_len > a->as.arr.cap) {
         int64_t nc = a->as.arr.cap * 2;
         if (nc < new_len) nc = new_len;
-        a->as.arr.items = (KaiValue **) realloc(a->as.arr.items, (size_t) nc * sizeof(KaiValue *));
-        if (!a->as.arr.items) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        a->as.arr.items = (KaiValue **) kai_heap_realloc(a->as.arr.items,
+            (size_t) a->as.arr.cap * sizeof(KaiValue *), (size_t) nc * sizeof(KaiValue *));
         a->as.arr.cap = nc;
     }
     for (int64_t i = a->as.arr.len; i < new_len; ++i) a->as.arr.items[i] = kai_incref(init);
@@ -3855,7 +3924,7 @@ static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
     size_t lb = (b && b->tag == KAI_STR) ? b->as.s.len : 0;
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = la + lb;
-    v->as.s.bytes = (char *) malloc(la + lb + 1);
+    v->as.s.bytes = (char *) kai_heap_malloc(la + lb + 1);
     if (la) memcpy(v->as.s.bytes, a->as.s.bytes, la);
     if (lb) memcpy(v->as.s.bytes + la, b->as.s.bytes, lb);
     v->as.s.bytes[la + lb] = '\0';
@@ -3874,8 +3943,7 @@ static KAI_RC_NOINLINE KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
     }
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = total;
-    v->as.s.bytes = (char *) malloc(total + 1);
-    if (!v->as.s.bytes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->as.s.bytes = (char *) kai_heap_malloc(total + 1);
     size_t off = 0;
     for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
         KaiValue *s = p->as.cons.head;
@@ -3901,8 +3969,7 @@ static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *se
     if (count > 1) total += slen * (size_t)(count - 1);
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = total;
-    v->as.s.bytes = (char *) malloc(total + 1);
-    if (!v->as.s.bytes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->as.s.bytes = (char *) kai_heap_malloc(total + 1);
     size_t off = 0;
     int first = 1;
     for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
@@ -4987,6 +5054,7 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
             } else {
                 KaiValue *v = kai_alloc(KAI_STR);
                 v->as.s.len = (size_t) n;
+                kai_heap_charge((size_t) n + 1);
                 v->as.s.bytes = (char *) malloc((size_t) n + 1);
                 if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
                 size_t got = fread(v->as.s.bytes, 1, (size_t) n, fp);
@@ -5128,6 +5196,7 @@ static KaiValue *kai_prelude_file_read_chunk(KaiValue *h, KaiValue *max) {
         } else {
             KaiValue *v = kai_alloc(KAI_STR);
             v->as.s.len = (size_t) got;
+            kai_heap_charge((size_t) got + 1);
             v->as.s.bytes = (char *) malloc((size_t) got + 1);
             if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
             memcpy(v->as.s.bytes, buf, (size_t) got);
@@ -5317,6 +5386,7 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
                 KaiValue *arr = kai_alloc(KAI_ARRAY);
                 arr->as.arr.len = (int64_t) got;
                 arr->as.arr.cap = got > 0 ? (int64_t) got : 1;
+                kai_heap_charge((size_t) arr->as.arr.cap * sizeof(KaiValue *));
                 arr->as.arr.items = (KaiValue **) malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
                 if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
                 for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
