@@ -9,9 +9,9 @@ crosses the `Ffi` capability, so an extern signature MUST carry `/ Ffi`
 in its effect row. There is one ABI (`"C"`); the symbol the linker
 binds is the kaikai identifier, or an explicit override.
 
-```kaikai
+```text
 extern "C" fn cos(x: Real) : Real / Ffi             # binds C `cos`
-extern "C"("DrawCircleV") pub fn draw(...) : Unit / Ffi   # override
+extern "C"("DrawCircleV") pub fn draw(c: Real) : Unit / Ffi   # override
 ```
 
 ## Boundary types
@@ -36,7 +36,7 @@ literals and feeds arithmetic. The shim C-casts at the call (no
 range-check — exactly C's own truncation). There is no `U8 + U8` in
 kaikai-land; the wider numeric-primitive question is separate.
 
-```kaikai
+```text
 extern "C"("SetVolume") fn set_volume(level: U8) : Unit / Ffi
 ```
 
@@ -49,7 +49,7 @@ type, or a nested `extern "C" type`) — `Int`/`Real`/`String` are
 rejected as struct fields, because an `int64_t`/`double`/pointer field
 breaks the small-struct layout the C compiler lays out.
 
-```kaikai
+```text
 extern "C" type Color = { r: U8, g: U8, b: U8, a: U8 }
 extern "C" type Vector2 = { x: F32, y: F32 }
 
@@ -78,7 +78,7 @@ never inspects — the database / socket-driver case (`PGconn *`,
 `PGresult *`). Backed by a reference-counted box that parks the C
 `void *`.
 
-```kaikai
+```text
 extern "C" opaque Conn
 
 extern "C"("PQconnectdb") fn connect(s: String) : Conn / Ffi

@@ -11623,6 +11623,15 @@ static void *kai_llvm_ptr_type(void *m) {
 static void *kai_llvm_void_type(void *m) {
     return (void *) LLVMVoidTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
 }
+/* Float (32-bit) type — the C `float` width an `F32` FFI arg crosses as. */
+static void *kai_llvm_float_type(void *m) {
+    return (void *) LLVMFloatTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+/* An integer type of an arbitrary bit width (8/16/32/64) — the exact C
+ * width a fixed-width FFI scalar crosses as. */
+static void *kai_llvm_int_type(void *m, int64_t bits) {
+    return (void *) LLVMIntTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m), (unsigned) bits);
+}
 static void *kai_llvm_fn_type_0(void *ret) {
     return (void *) LLVMFunctionType((LLVMTypeRef) ret, NULL, 0, 0);
 }
@@ -11716,6 +11725,42 @@ static void *kai_llvm_fn_type_n(void *ret, void *buf) {
     KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
     return (void *) LLVMFunctionType((LLVMTypeRef) ret,
                                      (LLVMTypeRef *) bf->xs, (unsigned) bf->n, 0);
+}
+/* A struct type over a buffer of element types (non-packed: natural C
+ * padding), for an `extern "C" type` passed by value. */
+static void *kai_llvm_struct_type(void *m, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMStructTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m),
+                                            (LLVMTypeRef *) bf->xs, (unsigned) bf->n, 0);
+}
+/* GEP to the i-th field of a struct held in memory. The struct is passed
+ * to / returned from a C extern by value via a `byval`/`sret` pointer;
+ * the shim stores/loads each field through this. */
+static void *kai_llvm_build_struct_gep(void *b, void *sty, void *ptr, int64_t i) {
+    return (void *) LLVMBuildStructGEP2((LLVMBuilderRef) b, (LLVMTypeRef) sty,
+                                        (LLVMValueRef) ptr, (unsigned) i, "");
+}
+/* `byval(<struct>)` on a parameter — the directive that makes LLVM apply
+ * the target C-ABI for struct-by-value (registers vs indirect per
+ * SysV/AAPCS), so a clang-compiled callee receives the struct correctly.
+ * Applied to BOTH the extern declaration's param and the call site, at the
+ * same 1-based param index (index 0 is the return). */
+static void kai_llvm_byval_attr_at(LLVMModuleRef m, LLVMValueRef fn_or_call,
+                                   int is_call, int64_t param_ix, LLVMTypeRef sty) {
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    unsigned kind = LLVMGetEnumAttributeKindForName("byval", 5);
+    LLVMAttributeRef a = LLVMCreateTypeAttribute(ctx, kind, sty);
+    LLVMAttributeIndex ix = (LLVMAttributeIndex) (param_ix + 1);
+    if (is_call) LLVMAddCallSiteAttribute(fn_or_call, ix, a);
+    else LLVMAddAttributeAtIndex(fn_or_call, ix, a);
+}
+static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t param_ix, void *sty) {
+    kai_llvm_byval_attr_at((LLVMModuleRef) m, (LLVMValueRef) fn, 0, param_ix, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_byval_call(void *m, void *call, int64_t param_ix, void *sty) {
+    kai_llvm_byval_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, param_ix, (LLVMTypeRef) sty);
+    return kai_unit();
 }
 /* `n` copies of one pointer type, for the all-boxed fn signatures the
  * KIR lowers (every param/return is `ptr`). */
@@ -11938,6 +11983,39 @@ static void *kai_llvm_build_lnot(void *b, void *a) {
  * bool (`0`/`1`) feeds `kai_bool`. */
 static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) {
     return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) i32ty, "");
+}
+/* Integer narrow/widen for fixed-width FFI marshalling. `trunc` narrows
+ * i64→iN at the call (C-cast, no range-check); `sext`/`zext` widen iN→i64
+ * on return — `sext` for a signed `I*`, `zext` for an unsigned `U*`
+ * (picking the wrong one turns `uint8_t 255` into Int -1). */
+static void *kai_llvm_build_trunc(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildTrunc((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_sext(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildSExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_zext(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+/* Float narrow/widen: `double`→`float` at an F32 call, `float`→`double`
+ * on return. One `fpcast` covers both directions. */
+static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildFPCast((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+/* Struct-value construction in SSA (no memory): start from `undef` of the
+ * struct type, `insertvalue` each field at its index, pass the aggregate
+ * by value (the call-site ABI classifies it from the struct type). On
+ * return, `extractvalue` each field out. */
+static void *kai_llvm_get_undef(void *ty) {
+    return (void *) LLVMGetUndef((LLVMTypeRef) ty);
+}
+static void *kai_llvm_build_insertvalue(void *b, void *agg, void *elt, int64_t idx) {
+    return (void *) LLVMBuildInsertValue((LLVMBuilderRef) b, (LLVMValueRef) agg,
+                                         (LLVMValueRef) elt, (unsigned) idx, "");
+}
+static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) {
+    return (void *) LLVMBuildExtractValue((LLVMBuilderRef) b, (LLVMValueRef) agg,
+                                          (unsigned) idx, "");
 }
 /* Raw `i64` arithmetic for the unboxed-Int path (KIR mode-slave to the
  * unbox pass). `op`: 0=`add`, 1=`sub`, 2=`mul` — matching the C-direct
@@ -12437,6 +12515,19 @@ static void *kai_llvm_int64_type(void *m) { (void) m; return kai_llvm_native_una
 static void *kai_llvm_int32_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_ptr_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_void_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_float_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int_type(void *m, int64_t bits) { (void) m; (void) bits; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_struct_type(void *m, void *buf) { (void) m; (void) buf; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_struct_gep(void *b, void *s, void *p, int64_t i) { (void) b; (void) s; (void) p; (void) i; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t ix, void *s) { (void) m; (void) fn; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_byval_call(void *m, void *c, int64_t ix, void *s) { (void) m; (void) c; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_zext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_undef(void *ty) { (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_insertvalue(void *b, void *agg, void *elt, int64_t idx) { (void) b; (void) agg; (void) elt; (void) idx; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) { (void) b; (void) agg; (void) idx; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_fn_type_0(void *ret) { (void) ret; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_fn_type_1(void *ret, void *p0) { (void) ret; (void) p0; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_add_function(void *m, KaiValue *name, void *fnty) { (void) m; (void) name; (void) fnty; return kai_llvm_native_unavailable(); }
