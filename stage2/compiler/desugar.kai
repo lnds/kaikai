@@ -92,6 +92,7 @@ fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
+    EExternBody(_) -> k
     # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
     # TypeExpr and a resolved-names list, neither of which the
     # visitor traverses). Same shape as EHole/ETodo for the
@@ -288,10 +289,6 @@ fn dsg_starts_with_loop(s: String, prefix: String, i: Int) : Bool {
     }
   } }
 }
-
-fn dsg_ffi_extern_tag() : String = "__kai_ffi__"
-
-fn dsg_ffi_extern_tag_prefix() : String = "__kai_ffi__:"
 
 # ====================================================================
 # Desugar passes (sub-sections A-E)
@@ -951,6 +948,38 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 #[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function.")]
 pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 
+# Lower an `extern "C" opaque T` to a one-phantom-field nominal record
+# so Perceus reference-counts the handle box (dup before
+# each consuming use, drop once at end of scope). Without a field
+# Perceus treats the type as a non-heap scalar and emits no drop — the
+# `KAI_FOREIGN` box would then leak. The phantom field is never read or
+# constructed on the kaikai side (the only source is an FFI return, the
+# only sinks are FFI calls), and at runtime the value is a `KAI_FOREIGN`
+# box whose decref frees the box without touching any field — so the
+# record shape is a pure typer/RC fiction that never has to match the
+# box. An `extern "C" type` STRUCT is left untouched: it already works
+# as an ordinary structural record (constructed + field-accessed).
+#[doc("Lower every `extern \"C\" opaque` to a one-field nominal record so Perceus RC-tracks the handle box.")]
+pub fn lower_extern_opaques(ds: [Decl]) : [Decl] = map(ds, lower_extern_opaque_one)
+
+fn lower_extern_opaque_one(d: Decl) : Decl = match d {
+  DExternType(name, ETOpaque, l, c) ->
+    DType(false, name, [],
+          TBRecord([FD(false, "__ffi_handle", mk_ty(TyName("Int", []), l, c))]), l, c, None)
+  _ -> d
+}
+
+# The record/sum-type body an `extern "C" type`/`opaque` presents to
+# the typer's nominal-type machinery. A struct surfaces its
+# fields verbatim (so a kaikai value can be constructed and its fields
+# read); an opaque is an empty record (a declared abstract type with no
+# constructor the kaikai side ever builds — at the boundary the value
+# is a `KAI_FOREIGN` box, so the empty-record shape is a pure typer
+# fiction, never matched or built). The typer's `DType` registration
+# passes reuse this so foreign types ride the existing record-field /
+# type-name tables with no parallel machinery; the FFI shim emitters
+# key off the surviving `DExternType` decls (the registry), not this.
+
 # Const references in MATCH PATTERNS. A bare uppercase const
 # name in pattern position parses as `PVariant(NAME, [])` (lex-time
 # uppercase rule); a lowercase one as `PBind(name)`. Neither is a real
@@ -1064,26 +1093,16 @@ fn dcp_arm_eq_or_pass(pat: Pattern, name: String, opt_g: Option[Expr],
 pub fn lower_axiom_one(d: Decl) : Decl {
   match d {
     DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, l, c) -> {
-      # An `extern "C" fn` (or legacy `[<extern_c>]` axiom) lowers to a
-      # DFn whose body is a magic `ETodo` whose message tags it as an
-      # FFI shim. The C / LLVM `emit_fn_body` paths detect the tag and
-      # synthesise a real `extern "C"` call instead of the default
-      # `kai_prelude_panic` body. Typer-side `ETodo` still type-checks
-      # as "any type fits", so the FFI shim's typed signature is what
-      # flows into call sites.
-      #
-      # When `c_sym_over` is non-empty, encode it inside the magic tag
-      # (`__kai_ffi__:<override>`) so the C / LLVM emitters can read it
-      # back when synthesising the call site without a second AST field
-      # carrying the override.
-      let msg =
-        if extern_c {
-          if string_length(c_sym_over) > 0 {
-            string_concat(dsg_ffi_extern_tag_prefix(), c_sym_over)
-          } else { dsg_ffi_extern_tag() }
+      # An `extern "C" fn` lowers to a DFn whose body is an
+      # `EExternBody` marker carrying the C-side symbol override (the
+      # kaikai identifier when empty). The C / LLVM backends detect it
+      # and synthesise the `extern "C"` call instead of a body. A legacy
+      # `[<extern_c>]`-less axiom keeps the unbound-panic `ETodo`.
+      let body =
+        if extern_c { mk_expr(EExternBody(c_sym_over), l, c) }
+        else {
+          mk_expr(ETodo(string_concat("axiom ", string_concat(name, " not bound"))), l, c)
         }
-        else { string_concat("axiom ", string_concat(name, " not bound")) }
-      let body = mk_expr(ETodo(msg), l, c)
       DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None)
     }
     _ -> d
@@ -1989,6 +2008,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EPlaceholder -> false
     EHole(_) -> false
     ETodo(_) -> false
+    EExternBody(_) -> false
     EVar(n) -> n == name
     ECall(callee, args_) -> {
       let callee_is_get_set = match callee.kind {
@@ -2574,6 +2594,7 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     EPlaceholder   -> UseKindAcc { kind: k, acc: acc }
     EHole(_)       -> UseKindAcc { kind: k, acc: acc }
     ETodo(_)       -> UseKindAcc { kind: k, acc: acc }
+    EExternBody(_) -> UseKindAcc { kind: k, acc: acc }
     EVariantsOf(_, _) -> UseKindAcc { kind: k, acc: acc }
     # Qualified module call has no sub-Exprs to recurse into and binds
     # no names — pass through unchanged.
