@@ -147,7 +147,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-packages test-kir test-user-cache test-core-cache
 
 all: $(TARGET)
 
@@ -3816,6 +3816,33 @@ test-perceus-872-native-variant-reuse-leak: $(TARGET) build
 	[ "$$leaked" -lt 100 ] \
 	  && echo "perceus-872-native-variant-reuse-leak OK (native leaked=$$leaked < 100 over alloc_total=$$alloc; rb-tree variant reuse no longer leaks O(inserts))" \
 	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native leaked=$$leaked of alloc=$$alloc — variant reuse leak regressed, grows with inserts)"; exit 1; }
+
+# Issue #882 — native rotation-reuse crash gate. The gap3 balance rotation
+# (`Node(l,k,r) -> match l { match ll { Node(..) -> Node(Node(...), lk,
+# Node(lr, k, r)) } }`) reuses an INNER cell while OUTER arms drop their own
+# scrutinee at exit. Pre-fix the outer arm's #858 structural dup was
+# suppressed (the reuse anywhere in the body gate descended into the inner
+# match), leaving `r` embedded with no protecting incref → double-free →
+# recycled into a cycle → SIGSEGV in `size`. The C oracle returns 8 cleanly;
+# this gate asserts the native binary does too (exit 0 + "8") and that the
+# bounded-N rotation leaves no O(rotations) leak. Run under `timeout`: a
+# regression manifests as a hang (cyclic `size`), not a clean abort.
+test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/gap3_balance_minimal.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-882rot 2> build/s2-882rot.err \
+	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native build errored)"; cat build/s2-882rot.err; exit 1; }; \
+	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g timeout 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
+	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native run crashed/hung — exit $$?)"; exit 1; }; \
+	diff -q ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out > /dev/null \
+	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (output diff)"; diff ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out; exit 1; }; \
+	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-882rot.rc | head -1 | cut -d= -f2); \
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-882rot.rc | head -1 | cut -d= -f2); \
+	[ -n "$$alloc" ] && [ -n "$$leaked" ] \
+	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (no alloc/leaked line)"; cat build/s2-882rot.rc; exit 1; }; \
+	[ "$$leaked" -lt 100 ] \
+	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
+	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
 
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
