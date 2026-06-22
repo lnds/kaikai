@@ -859,6 +859,43 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
 
 fn inf_resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, inf_resolve_ty)
 
+# Annotation resolution that honours the per-type row-kind table: a
+# `T[..., e]` slot the type declares row-kind resolves to a row carrier
+# so `let s : Stream[String, File + ReadFault]` unifies with the
+# inferred carrier. Without the table this path can't tell `Console`
+# (an effect) from a type in argument position, so it falls back to
+# `inf_resolve_ty` for non-row-kind slots and types with no table entry.
+fn inf_resolve_ty_rk(t: TypeExpr, table: [RowKindEntry]) : Ty {
+  match t.tkind {
+    TyName(name, targs) ->
+      match row_kind_slots_of(table, name) {
+        [] -> inf_resolve_ty(t)
+        idxs -> TyCon(None, name, inf_resolve_args_rk(targs, idxs, 0, table))
+      }
+    TyList(inner) -> TyListT(inf_resolve_ty_rk(inner, table))
+    _ -> inf_resolve_ty(t)
+  }
+}
+
+fn inf_resolve_args_rk(targs: [TypeExpr], idxs: [Int], i: Int, table: [RowKindEntry]) : [Ty] {
+  match targs {
+    [] -> []
+    [a, ...rest] -> {
+      let resolved = if list_has_int(idxs, i) { inf_resolve_row_arg(a) }
+                     else { inf_resolve_ty_rk(a, table) }
+      [resolved, ...inf_resolve_args_rk(rest, idxs, i + 1, table)]
+    }
+  }
+}
+
+# A row-kind argument slot in an annotation: `Console`, `File + Fail`,
+# or a bare row var. Resolves to a row carrier matching the inferred one.
+fn inf_resolve_row_arg(a: TypeExpr) : Ty = match a.tkind {
+  TyRow(rexpr) -> row_arg_carrier(inf_row_of_expr(rexpr))
+  TyName(eff, []) -> row_arg_carrier(Row { labels: [Label { eff: eff, ty_args: [] }], tail: None, display_alias: None })
+  _ -> inf_resolve_ty(a)
+}
+
 
 fn inf_row_empty() : Row = Row {
   labels:        [],
@@ -1325,6 +1362,23 @@ fn inf_ty_list_eq(a: [Ty], b: [Ty]) : Bool =
 fn inf_ty_string_list(ts: [Ty]) : [String] = map(ts, inf_ty_to_string)
 
 
+# Recognise the row-arg carrier (`TyFnT([], TyUnit, row)`) a `TyCon`
+# slot uses to thread an effect row, so diagnostics show the slot as the
+# row itself (`Stream[String, File + ReadFault]`) rather than the carrier
+# function (`Stream[String, () -> Unit / File + ReadFault]`).
+fn inf_row_carrier_of(t: Ty) : Option[Row] = match t {
+  TyFnT(ps, ret, row) -> match ps {
+    [] -> match ret { TyUnit -> Some(row) _ -> None }
+    _  -> None
+  }
+  _ -> None
+}
+
+fn inf_tycon_arg_to_string(t: Ty) : String = match inf_row_carrier_of(t) {
+  Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, label_to_string), " + ") }
+  None      -> inf_ty_to_string(t)
+}
+
 fn inf_ty_to_string(t: Ty) : String {
   match t {
     TyInt    -> "Int"
@@ -1348,7 +1402,7 @@ fn inf_ty_to_string(t: Ty) : String {
     TyCon(_, cname, tas) -> {
       match tas {
         [] -> cname
-        _ -> concat_all([cname, "[", inf_join_with(inf_ty_string_list(tas), ", "), "]"])
+        _ -> concat_all([cname, "[", inf_join_with(map(tas, inf_tycon_arg_to_string), ", "), "]"])
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
@@ -2738,7 +2792,13 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # file's decls via `collect_root_fn_names` — NEVER inside
                # `add_decls_loop` (which also runs for imported modules
                # whose private `mo = None` decls would poison the set).
-               root_fns: [String] }
+               root_fns: [String],
+               # per-type effect-row-kind slot table (`compute_row_kind_slots`).
+               # Lets annotation resolution (`inf_resolve_ty_rk`) wrap a
+               # `T[..., e]` row slot in a carrier so a concrete-row
+               # `let s : Stream[String, File + ReadFault]` annotation
+               # unifies with the inferred carrier.
+               row_kind: [RowKindEntry] }
 
 # head-owner cache entry. `head` is the bare type name
 # (`List`, `MyBox`, ...); `mods` is the list of modules whose
@@ -2749,11 +2809,11 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [], root_fns: [] }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [], root_fns: [], row_kind: [] }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
   TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries],
-          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
 
 # composite key for module-qualified scheme entries.
 # When the same bare `fname` is exported from two prelude modules
@@ -3204,7 +3264,7 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
   # scheme cannot drift from the C forwarder + emit dispatch. Dead on
   # any program that does not use the native backend.
   let native_es = native_prim_ty_entries(rprelude_table())
-  TyEnv { entries: list_append(list_append(es, native_es), env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+  TyEnv { entries: list_append(list_append(es, native_es), env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
 }
 
 # Map each raw prelude prim to its typer entry: a monomorphic function
@@ -3244,7 +3304,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: ty_mod_key("Result", "Ok"),   scheme: ok_sc   },
     TyEntry { name: ty_mod_key("Result", "Err"),  scheme: err_sc  }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
 }
 
 # ---- user-defined signatures ----
@@ -3486,6 +3546,32 @@ fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
   }
 }
 
+# The type-var ids assigned (by `tparam_id_split`'s numbering) to the
+# tparams named in `targets`. Used to drop row-kind tparams from the
+# generalised type-var set.
+fn tparam_type_ids_of(tparams: [String], targets: [String]) : [Int] =
+  tparam_type_ids_of_loop(tparams, targets, 0, [])
+
+fn tparam_type_ids_of_loop(tparams: [String], targets: [String], ti: Int, acc: [Int]) : [Int] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [n, ...rest] ->
+      if tp_kind_is_unit(n) { tparam_type_ids_of_loop(rest, targets, ti, acc) }
+      else {
+        let acc1 = if list_has(targets, n) { [ti, ...acc] } else { acc }
+        tparam_type_ids_of_loop(rest, targets, ti + 1, acc1)
+      }
+  }
+}
+
+# Remove every id in `drop` from `xs` (order-preserving).
+fn remove_ints(xs: [Int], drop: [Int]) : [Int] = match xs {
+  [] -> []
+  [x, ...rest] ->
+    if list_has_int(drop, x) { remove_ints(rest, drop) }
+    else { [x, ...remove_ints(rest, drop)] }
+}
+
 # Resolve a TypeExpr under a mapping from tparam name to its TyVarT id.
 # The mapping is itself an association list for now.
 #[doc("infer: a type-parameter binding (name -> fresh id).")]
@@ -3586,6 +3672,120 @@ fn append_ints(a: [Int], b: [Int]) : [Int] {
   }
 }
 
+# An effect row occupying a `TyCon` argument slot. The row has no
+# runtime witness — it is a `TyFnT([], TyUnit, row)` carrier so every
+# existing `Ty` walker handles it (mangling erases the row, so two
+# `Stream[t, e]` differing only in `e` share one monomorphisation),
+# and unifying two carriers routes the row to `unify_row` via the
+# `TyFnT` arm. Keyed on a row-var id shared with the ctor field's row.
+fn row_arg_carrier(r: Row) : Ty = TyFnT([], TyUnit, r)
+
+# The head `TyCon`'s slot for declared-tparam id `i`: a row carrier
+# when `i` is a row-kind tparam, an ordinary type-var slot otherwise.
+fn head_slot_for(i: Int, rvar_ids: [Int]) : Ty =
+  if list_has_int(rvar_ids, i) { row_arg_carrier(row_with_tail(i)) } else { tv(i) }
+
+# Which slots of a nominal type are effect-row-kind. `RKE(name, [idx])`
+# lists the zero-based tparam positions a `pub type` declares in row
+# position (a tparam that appears after `/` inside some ctor field).
+# A use-site `T[..., e, ...]` consults this so the `e` slot resolves to
+# a row carrier even when the surrounding fn never mentions `e` after a
+# `/` — the `from_list[t,e](xs:[t]) : Stream[t,e]` case, where the row
+# var is sourced, not threaded from an argument.
+pub type RowKindEntry = RKE(String, [Int])
+
+# Build the per-type row-kind-slot table from the whole decl stream.
+fn compute_row_kind_slots(decls: [Decl]) : [RowKindEntry] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match row_kind_entry_of(d) {
+      Some(e) -> [e, ...compute_row_kind_slots(rest)]
+      None    -> compute_row_kind_slots(rest)
+    }
+  }
+}
+
+fn row_kind_entry_of(d: Decl) : Option[RowKindEntry] = match d {
+  DType(_, name, tparams, body, _, _, _) -> {
+    let row_names = row_names_of_typebody(body)
+    match row_names {
+      [] -> None
+      _  -> Some(RKE(name, row_kind_indices(tparams, row_names, 0)))
+    }
+  }
+  _ -> None
+}
+
+# Names a type body uses in row position across all its ctor fields.
+fn row_names_of_typebody(b: TypeBody) : [String] = match b {
+  TBSum(vs)    -> row_names_of_variants(vs, [])
+  TBRecord(fs) -> row_names_of_fields(fs, [])
+  _            -> []
+}
+
+fn row_names_of_variants(vs: [Variant], acc: [String]) : [String] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(_, vargs) -> row_names_of_variants(rest, collect_rvars_in_typeexprs(vargs, acc))
+  }
+}
+
+fn row_names_of_fields(fs: [FieldDecl], acc: [String]) : [String] = match fs {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FD(_, _, te) -> row_names_of_fields(rest, collect_rvars_in_typeexpr(te, acc))
+  }
+}
+
+# The zero-based positions in `tparams` whose name appears in `row_names`.
+fn row_kind_indices(tparams: [String], row_names: [String], i: Int) : [Int] = match tparams {
+  [] -> []
+  [n, ...rest] ->
+    if list_has(row_names, n) { [i, ...row_kind_indices(rest, row_names, i + 1)] }
+    else { row_kind_indices(rest, row_names, i + 1) }
+}
+
+# Row-kind slot indices declared for `name`, or [] if the type declares none.
+fn row_kind_slots_of(table: [RowKindEntry], name: String) : [Int] = match table {
+  [] -> []
+  [e, ...rest] -> match e {
+    RKE(n, idxs) -> if n == name { idxs } else { row_kind_slots_of(rest, name) }
+  }
+}
+
+# Reject a nominal type whose ctor field uses an effect-row variable
+# the type never declares as a tparam (`type Q[t] = Qq((t) -> Unit / e)`
+# with `e` absent from `[t]`). Without this the scheme builder panics in
+# `tpbind_id_of` — an unbound row var has no slot to thread through. The
+# fix the user wants is to declare the row var: `type Q[t, e] = ...`.
+#[doc("infer: `validate_nominal_row_vars_decls` — typer entry point invoked by the driver.")]
+pub fn validate_nominal_row_vars_decls(decls: [Decl], file: String) : Int / Console + File =
+  validate_nominal_row_vars_loop(decls, file, 0)
+
+fn validate_nominal_row_vars_loop(decls: [Decl], file: String, errs: Int) : Int / Console + File {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> validate_nominal_row_vars_loop(rest, file, errs + validate_nominal_row_vars_decl(d, file))
+  }
+}
+
+fn validate_nominal_row_vars_decl(d: Decl, file: String) : Int / Console + File = match d {
+  DType(_, _, tparams, body, line, col, _) -> {
+    let free = names_excluding(row_names_of_typebody(body), tparams)
+    match free {
+      [] -> 0
+      [name, ...__] -> {
+        diag_error(file, line, col,
+          concat_all(["unbound effect-row variable `", name,
+            "` in type declaration — declare it as a type parameter ",
+            "(`[..., ", name, "]`) so the carrier can thread the row"]))
+        1
+      }
+    }
+  }
+  _ -> 0
+}
+
 fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
   match v {
     Var(_ctor_name, vargs) -> {
@@ -3613,13 +3813,15 @@ fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TySchem
       let arg_tys = map(vargs, (a) => resolve_ty_with_binds(a, binds, rbinds))
       # The result `TyCon` carries one type-arg slot per declared tparam,
       # in declaration order, so use-site unification lines up positionally.
-      # Row-kind tparams still occupy their slot as a `tv` placeholder —
-      # the row machinery substitutes through it the same way the alias
-      # path does (`rows.kai`).
+      # A row-kind tparam's slot carries its effect row as a degenerate
+      # `TyFnT([], TyUnit, row)` keyed on the SAME row-var id the ctor
+      # field's `/ e` uses, so unifying the head slot threads the row (the
+      # bug behind the nominal Stream carrier was that the slot was a `tv`
+      # disjoint from that row id — the effect leaked uncheck).
       let ids = tparam_ids(tparams)
-      let result = TyCon(None, type_name, map(ids, tv))
       let tvar_ids = map(tvar_names, (n) => tpbind_id_of(binds, n))
       let rvar_ids = map(rvar_names, (n) => tpbind_id_of(binds, n))
+      let result = TyCon(None, type_name, map(ids, (i) => head_slot_for(i, rvar_ids)))
       match vargs {
         [] -> scheme(ids, result)
         _  -> scheme_full(tvar_ids, rvar_ids, fn_ty(arg_tys, result))
@@ -4452,6 +4654,64 @@ fn collect_rvars_in_params(ps: [Param], acc: [String]) : [String] {
   }
 }
 
+# Collect names a fn signature places in a row-kind slot of a nominal
+# type (`e` in `from_list(...) : Stream[t, e]`), consulting the
+# per-type row-kind table. These join `collect_decl_rvars` so the row
+# var is bound + generalised even when it never appears after a `/`.
+fn collect_rowkind_args_decl(d: Decl, table: [RowKindEntry]) : [String] = match d {
+  DFn(_, _, _, params, opt_ret, _, _, _, _, _) -> {
+    let a0 = collect_rowkind_args_params(params, table, [])
+    match opt_ret {
+      Some(rty) -> collect_rowkind_args_te(rty, table, a0)
+      None      -> a0
+    }
+  }
+  _ -> []
+}
+
+fn collect_rowkind_args_params(ps: [Param], table: [RowKindEntry], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let a1 = match p.ptype {
+      Some(te) -> collect_rowkind_args_te(te, table, acc)
+      None     -> acc
+    }
+    collect_rowkind_args_params(rest, table, a1)
+  }
+}
+
+fn collect_rowkind_args_te(t: TypeExpr, table: [RowKindEntry], acc: [String]) : [String] = match t.tkind {
+  TyName(name, tas) -> {
+    let here = collect_rowkind_args_at(tas, row_kind_slots_of(table, name), 0, acc)
+    collect_rowkind_args_tes(tas, table, here)
+  }
+  TyList(inner) -> collect_rowkind_args_te(inner, table, acc)
+  TyFn(ps, ret, _) -> collect_rowkind_args_te(ret, table, collect_rowkind_args_tes(ps, table, acc))
+  TyDim(base, _) -> collect_rowkind_args_te(base, table, acc)
+  TyRefine(base, _) -> collect_rowkind_args_te(base, table, acc)
+  TyRow(_) -> acc
+}
+
+fn collect_rowkind_args_tes(ts: [TypeExpr], table: [RowKindEntry], acc: [String]) : [String] = match ts {
+  [] -> acc
+  [t, ...rest] -> collect_rowkind_args_tes(rest, table, collect_rowkind_args_te(t, table, acc))
+}
+
+# For each slot index in `idxs`, if that slot is a bare `TyName(n, [])`,
+# collect `n`. The slot is declared row-kind, so `n` names a row var.
+fn collect_rowkind_args_at(tas: [TypeExpr], idxs: [Int], i: Int, acc: [String]) : [String] = match tas {
+  [] -> acc
+  [a, ...rest] -> {
+    let a1 = if list_has_int(idxs, i) {
+      match a.tkind {
+        TyName(n, []) -> if list_has(acc, n) { acc } else { list_append(acc, [n]) }
+        _ -> acc
+      }
+    } else { acc }
+    collect_rowkind_args_at(rest, idxs, i + 1, a1)
+  }
+}
+
 fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
   match t.tkind {
     TyName(_, tas) -> collect_rvars_in_typeexprs(tas, acc)
@@ -4504,7 +4764,16 @@ fn rvbind_ids(binds: [RVBind]) : [Int] = rvbind_ids_loop(binds, [])
 # Resolve a TypeExpr under both the type-parameter and row-variable
 # binding contexts. A `TyName(name, [])` is first looked up as a
 # tparam; if not found, the builtin / user-type fallback applies.
-fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty {
+fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty =
+  resolve_ty_with_binds_rk(t, tpbinds, rbinds, [])
+
+# As `resolve_ty_with_binds` but consulting the per-type row-kind table
+# so a `T[..., e]` slot the type declares row-kind resolves to a row
+# carrier — covering a row var, a single concrete effect, or a compound
+# row equally. Callers with no table pass `[]`: then only ctor-field row
+# vars (in `rbinds`) and literal compound rows resolve to carriers; a
+# single concrete effect stays a type.
+fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
   match t.tkind {
     TyName(name, tas) -> {
       match tpbind_lookup(tpbinds, name) {
@@ -4529,27 +4798,64 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
           # record / sum tables. That keeps `resolve_ty_with_binds`'s
           # 15 call sites untouched and concentrates the populate
           # logic in one place.
-          else { TyCon(None, name, map(tas, (a) => resolve_ty_with_binds(a, tpbinds, rbinds))) }
+          else { TyCon(None, name, resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk)) }
         }
       }
     }
-    TyList(inner) -> TyListT(resolve_ty_with_binds(inner, tpbinds, rbinds))
+    TyList(inner) -> TyListT(resolve_ty_with_binds_rk(inner, tpbinds, rbinds, rk))
     TyFn(fps, fret, rexpr) ->
-      TyFnT(map(fps, (p) => resolve_ty_with_binds(p, tpbinds, rbinds)),
-            resolve_ty_with_binds(fret, tpbinds, rbinds),
+      TyFnT(map(fps, (p) => resolve_ty_with_binds_rk(p, tpbinds, rbinds, rk)),
+            resolve_ty_with_binds_rk(fret, tpbinds, rbinds, rk),
             row_of_expr_with_binds(rexpr, tpbinds, rbinds))
     # dimensioned base — resolve the inner Ty against tpbinds,
     # then walk the unit and rewrite any symbol that names a unit
     # tparam (`[u: Measure]` → name "u#Unit") to UVar(id).
     TyDim(base, u) ->
-      dim_collapse(resolve_ty_with_binds(base, tpbinds, rbinds),
+      dim_collapse(resolve_ty_with_binds_rk(base, tpbinds, rbinds, rk),
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
     # preserve refinement on the semantic side.
-    TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds(base, tpbinds, rbinds), p)
+    TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds_rk(base, tpbinds, rbinds, rk), p)
     # a compound row reaching *type* position (not dissolved
     # by alias substitution). Resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
     TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
+  }
+}
+
+# Resolve a `TyCon`'s argument list, threading the parent type's
+# row-kind slot indices: a slot whose index is in `idxs` resolves to a
+# row carrier.
+fn resolve_tycon_args(tas: [TypeExpr], idxs: [Int], i: Int,
+                      tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : [Ty] {
+  match tas {
+    [] -> []
+    [a, ...rest] -> {
+      let resolved = resolve_tycon_arg(a, list_has_int(idxs, i), tpbinds, rbinds, rk)
+      [resolved, ...resolve_tycon_args(rest, idxs, i + 1, tpbinds, rbinds, rk)]
+    }
+  }
+}
+
+# Resolve a single `TyCon` argument slot. When `is_row` (the parent
+# declares this slot row-kind) a row var, a single concrete effect, or
+# a compound row all resolve to a carrier so the slot threads the
+# effect row. A ctor-field row var also resolves to a carrier off
+# `rbinds`, table-independent. The carrier shares its row-var id with
+# the ctor field's `/ e`, so the head slot and the function row are the
+# same generalised row var.
+fn resolve_tycon_arg(t: TypeExpr, is_row: Bool, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
+  match t.tkind {
+    TyName(name, tas) ->
+      match tas {
+        [] -> match inf_rvbind_lookup(rbinds, name) {
+          Some(id) -> row_arg_carrier(row_with_tail(id))
+          None     -> if is_row { inf_resolve_row_arg(t) }
+                      else { resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk) }
+        }
+        _ -> resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk)
+      }
+    TyRow(rexpr) -> row_arg_carrier(row_of_expr_with_binds(rexpr, tpbinds, rbinds))
+    _ -> resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk)
   }
 }
 
@@ -4613,9 +4919,12 @@ fn string_ends_with(s: String, suffix: String) : Bool {
 fn resolve_ty_with_rvbinds(t: TypeExpr, rbinds: [RVBind]) : Ty =
   resolve_ty_with_binds(t, [], rbinds)
 
-fn param_ty_with_binds(pm: Param, tpbinds: [TPBind], rbinds: [RVBind]) : Ty {
+fn param_ty_with_binds(pm: Param, tpbinds: [TPBind], rbinds: [RVBind]) : Ty =
+  param_ty_with_binds_rk(pm, tpbinds, rbinds, [])
+
+fn param_ty_with_binds_rk(pm: Param, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
   match pm.ptype {
-    Some(te) -> resolve_ty_with_binds(te, tpbinds, rbinds)
+    Some(te) -> resolve_ty_with_binds_rk(te, tpbinds, rbinds, rk)
     None     -> TyAny
   }
 }
@@ -4658,7 +4967,12 @@ fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBi
 }
 
 #[doc("infer: project a function declaration to its quantified type scheme.")]
-pub fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
+pub fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] = fn_scheme_of_decl_rk(d, [])
+
+# As `fn_scheme_of_decl` but with the per-type row-kind-slot table so a
+# row var sourced only in a `T[..., e, ...]` return position (e.g.
+# `from_list(...) : Stream[t, e]`) is bound + generalised as a row var.
+pub fn fn_scheme_of_decl_rk(d: Decl, row_kind_table: [RowKindEntry]) : Option[TyScheme] {
   match d {
     DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, _) -> {
       # collect row-variable names per decl, allocate small
@@ -4676,14 +4990,15 @@ pub fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
       # call site fails to unify with `[Int], Int`. The implicit
       # set is appended to the declared one so explicit `[a]` still
       # wins on collisions; their ids form a contiguous block.
-      let names = collect_decl_rvars(d)
+      let rk_names = collect_rowkind_args_decl(d, row_kind_table)
+      let names = list_append(collect_decl_rvars(d), rk_names)
       let rbinds = mk_rvbinds(names)
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      let pts = map(params, (p) => param_ty_with_binds(p, tpbinds, rbinds))
+      let pts = map(params, (p) => param_ty_with_binds_rk(p, tpbinds, rbinds, row_kind_table))
       let ret = match opt_ret {
-        Some(rty) -> resolve_ty_with_binds(rty, tpbinds, rbinds)
+        Some(rty) -> resolve_ty_with_binds_rk(rty, tpbinds, rbinds, row_kind_table)
         None      -> TyUnit
       }
       # elaboration for pure named callbacks. When a fn
@@ -4707,14 +5022,20 @@ pub fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
       }
       let body = TyFnT(pts, ret, row)
       # split tparam IDs by kind so unit-vars live in their own
-      # pool and get fresh-instantiated by st_instantiate_report.
+      # pool and get fresh-instantiated by st_instantiate_report. A
+      # row-kind tparam (sourced in a `T[..., e]` slot) is generalised
+      # as a row var, not a type var, so drop its type-var id from the
+      # split — its `tv(id)` never appears in the body (the slot is a
+      # carrier), and leaving it would generalise a dead type var.
       let split = tparam_id_split(effective_tparams)
+      let rk_tvar_ids = tparam_type_ids_of(effective_tparams, rk_names)
+      let tvars = remove_ints(split.tvars, rk_tvar_ids)
       let rvars = if elaborate_phantom_row(rexpr, fname) {
         list_append(rvbind_ids(rbinds), [phantom_id])
       } else {
         rvbind_ids(rbinds)
       }
-      Some(scheme_uvars(split.tvars, rvars, split.uvars, body))
+      Some(scheme_uvars(tvars, rvars, split.uvars, body))
     }
     _ -> None
   }
@@ -4829,7 +5150,11 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
 }
 
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
-                    top_names: [String]) : EnvWithArities {
+                    top_names: [String]) : EnvWithArities =
+  add_decls_loop_rk(env, ar_acc, ds, top_names, compute_row_kind_slots(ds))
+
+fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
+                    top_names: [String], rk_table: [RowKindEntry]) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -4844,7 +5169,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # unaffected — the EModCall branch consults the qualified
         # key first and falls back to bare only for prelude-only
         # schemes registered by `add_prelude_sigs`.
-        DFn(_, fname, _, _, _, _, _, _, _, mo) -> match fn_scheme_of_decl(d) {
+        DFn(_, fname, _, _, _, _, _, _, _, mo) -> match fn_scheme_of_decl_rk(d, rk_table) {
           Some(sc) -> {
             let env1 = ty_env_add(env, fname, sc)
             let env2 = match mo {
@@ -4895,7 +5220,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop(r.env, r.arities, rest, top_names)
+      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table)
     }
   }
 }
@@ -5063,7 +5388,8 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
                         unions: [UnionInfo], top_names: [String]) : BuiltEnv {
   let env_with_unions = TyEnv {
     entries: seed.env.entries, fresh: seed.env.fresh, unions: unions,
-    head_owners: seed.env.head_owners, root_fns: seed.env.root_fns
+    head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
+    row_kind: compute_row_kind_slots(decls)
   }
   let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
   BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
@@ -5084,14 +5410,26 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
 # that have no upstream delta keep the earlier byte-identical path.
 fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
-                            top_names: [String]) : BuiltEnv {
+                            top_names: [String]) : BuiltEnv =
+  build_ty_env_inherited_rk(seed, inherited, decls, unions, top_names,
+                            compute_row_kind_slots(decls))
+
+# As `build_ty_env_inherited` but with an explicit row-kind table. The
+# per-module typer fold passes the table computed over the FULL program
+# decl stream, so a `T[..., e]` annotation in one module resolves the
+# row slot of a type declared in another (e.g. a root `fn : Stream[t, e]`
+# against stdlib's `Stream`).
+fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
+                            decls: [Decl], unions: [UnionInfo],
+                            top_names: [String], rk_table: [RowKindEntry]) : BuiltEnv {
   let seeded_entries = list_append(inherited.ty_entries, seed.env.entries)
   let env_in = TyEnv {
     entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
-    head_owners: seed.env.head_owners, root_fns: seed.env.root_fns
+    head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
+    row_kind: rk_table
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
-  let r = add_decls_loop(env_in, ar_in, decls, top_names)
+  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table)
   BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
              op_eff_arities: r.arities }
 }
@@ -6487,7 +6825,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] {
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -6524,7 +6862,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -7917,7 +8255,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind },
     prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -7956,7 +8294,7 @@ fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) :
 fn param_ty_or_fresh_with_binds(st: InferState, pm: Param,
                                 tpbinds: [TPBind], rbinds: [RVBind]) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, resolve_ty_with_binds(te, tpbinds, rbinds))
+    Some(te) -> ty_res(st, resolve_ty_with_binds_rk(te, tpbinds, rbinds, st.env.row_kind))
     None     -> st_fresh_ty(st)
   }
 }
@@ -10957,10 +11295,19 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
 #   pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
 #   pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
 #
-# A package that exports `pub type T` but ships `map` with a swapped
-# argument order, missing row var, or extra parameter still surfaces
-# the standard call-inference signature mismatch — the typer does not
-# need a separate diagnostic for "your map shape is wrong".
+# A head carrying an `(element, row)` parameter list — `Stream[t, e]`,
+# the streaming carrier whose effect row is a type parameter — also
+# rides the pipes: dispatch is by head NAME (arity-agnostic), and the
+# whole LHS type unifies against the canonical receiver, so the row
+# slot threads via the row carrier (`row_arg_carrier`). The element
+# unifies against the first slot; the row threads as `e`.
+#
+# A package that ships `map` with a swapped argument order or a missing
+# row var still surfaces the standard call-inference signature mismatch
+# — the typer does not need a separate diagnostic for "your map shape
+# is wrong". (An extra *type* parameter that is NOT the trailing
+# effect-row slot still mismatches; only the legitimate `(element, row)`
+# shape is accepted.)
 #
 # Construction: linear over `(decls, modules)`, called once per
 # `compile_source` invocation right before `infer_program_with_protos`
@@ -11124,7 +11471,7 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
-          head_owners: hos, root_fns: env.root_fns }
+          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind }
 
 # attach the set of root-file (user) function names to the
 # env. A root `fn foo` unconditionally shadows a stdlib `pub fn foo`;
@@ -11133,7 +11480,7 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # export exactly. Seeded once per compile.
 fn ty_env_with_root_fns(env: TyEnv, rfns: [String]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
-          head_owners: env.head_owners, root_fns: rfns }
+          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind }
 
 # collect the bare names of root-file (`mo = None`)
 # functions from the full program decl stream. Imported / prelude decls
@@ -12504,17 +12851,17 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
       let rr = match ann {
         Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
-            let exp_resolved = inf_resolve_ty(te)
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           EIf(_, _, _) -> {
-            let exp_resolved = inf_resolve_ty(te)
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
           # literals can be retagged to Byte when expected is [Byte].
           EList(_) -> {
-            let exp_resolved = inf_resolve_ty(te)
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           # route ECall/EVar with annotation
@@ -12522,11 +12869,11 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
           # qualified `<parent>::<cname>` matches the annotation
           # resolves to the qualified scheme.
           ECall(_, _) -> {
-            let exp_resolved = inf_resolve_ty(te)
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           EVar(_) -> {
-            let exp_resolved = inf_resolve_ty(te)
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           _ -> synth(amb_st, rhs)
@@ -12539,18 +12886,18 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File {
       # types instead of a `Real<u>` vs `Decimal<u>` shape clash.
       let lower_pair = match ann {
         None -> ExprTy { expr: rr.expr, ty: rr.ty }
-        Some(te) -> maybe_lower_decimal_lit(rr.expr, rr.ty, apply_ty(rr.st.sub, inf_resolve_ty(te)))
+        Some(te) -> maybe_lower_decimal_lit(rr.expr, rr.ty, apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind)))
       }
       let binding_st = match ann {
         None -> rr.st
         Some(te) -> {
-          let declared = inf_resolve_ty(te)
+          let declared = inf_resolve_ty_rk(te, rr.st.env.row_kind)
           st_unify(rr.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
         }
       }
       let binding_ty = match ann {
         None -> lower_pair.ty
-        Some(te) -> inf_resolve_ty(te)
+        Some(te) -> inf_resolve_ty_rk(te, rr.st.env.row_kind)
       }
       let dup_st = check_pattern_no_dup_binds(binding_st, pat)
       let after = check_pattern(dup_st, pat, binding_ty)
@@ -15083,7 +15430,11 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # same idea for tpbinds — fn-level tparams resolve
       # to small bound ids reused by the inferencer when fresh-
       # instantiating at call sites.
-      let rbinds = mk_rvbinds(collect_decl_rvars(d))
+      # include row vars sourced only in a `T[..., e]` slot (the
+      # `from_list(...) : Stream[t, e]` case) so the body walk's rbinds
+      # match the registered scheme's; consult `env.row_kind`.
+      let rbinds = mk_rvbinds(list_append(collect_decl_rvars(d),
+                                          collect_rowkind_args_decl(d, env.row_kind)))
       # pick up implicit lowercase tparams the
       # signature uses but did not declare in `[…]`, matching the
       # set fn_scheme_of_decl built into the registered scheme.
@@ -15150,7 +15501,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # called from user code); a future pass threading the inferred
       # return into the scheme is the proper fix for callable helpers.
       let opt_declared = match opt_ret {
-        Some(rty) -> Some(resolve_ty_with_binds(rty, tpbinds, rbinds))
+        Some(rty) -> Some(resolve_ty_with_binds_rk(rty, tpbinds, rbinds, env.row_kind))
         None      -> None
       }
       # thread the declared return type through the body walk
@@ -17254,8 +17605,16 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let unions_here = collect_unions(decls_a)
   let unions_all = list_append(unions_here, inherited.unions)
   let top_names = collect_top_type_names(decls_a)
-  let built = build_ty_env_inherited(seed, inherited, decls_a,
-                                       unions_all, top_names)
+  # row-kind table over the FULL program decl stream so a
+  # `T[..., e]` annotation in one module resolves the row slot of a
+  # type declared in another (a root `fn : Stream[t, e]` against
+  # stdlib's `Stream`). Same whole-program scoping as alias resolution.
+  let rk_src_decls = if list_length(all_program_decls) > 0 {
+    all_program_decls
+  } else { decls_a }
+  let rk_table = compute_row_kind_slots(rk_src_decls)
+  let built = build_ty_env_inherited_rk(seed, inherited, decls_a,
+                                       unions_all, top_names, rk_table)
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
   # rebuild the type-alias resolution table here so
@@ -18205,7 +18564,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [] }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [] }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -18234,7 +18593,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [] }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [] }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
