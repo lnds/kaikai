@@ -3941,6 +3941,18 @@ static inline int kai_check_unique(KaiValue *v) {
     return v != NULL && !kai_is_value(v) && v->rc == 1;
 }
 
+/* Conditional incref for a variant reuse arm whose donor is SHARED. When the
+ * donor reuses in place (unique), its kept children MOVE into the rebuild — no
+ * incref. When it is shared, the rebuild fresh-allocs and keeps a borrowed
+ * reference to each kept child, but the donor still owns those children and the
+ * match-exit `kai_decref(donor)` will cascade-free them; so each kept child the
+ * rebuild embeds needs its own ref. The emitter calls this once per embedded
+ * borrowed child (multiset: a child used twice is incref'd twice). Idempotent
+ * vs the reuse op's own uniqueness test — nothing mutates the donor between. */
+static inline void kai_incref_if_shared(KaiValue *donor, KaiValue *child) {
+    if (!kai_check_unique(donor)) kai_incref(child);
+}
+
 static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
                                          KaiValue *head, KaiValue *tail) {
     if (_scr != NULL && _scr->tag == KAI_CONS && kai_check_unique(_scr)) {

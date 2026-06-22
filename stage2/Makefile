@@ -3791,6 +3791,32 @@ test-perceus-860-native-cons-leak: $(TARGET) build
 	  && echo "perceus-860-native-cons-leak OK (native free_total=$$free == alloc_total-1=$$(($$alloc - 1)); cons cascade decref->free over 1000 cells)" \
 	  || { echo "perceus-860-native-cons-leak FAIL (native free_total=$$free, alloc_total=$$alloc — cons leak regressed, cascade dropped)"; exit 1; }
 
+# Issue #872 — the NATIVE backend must free the rb-tree variant-reuse churn:
+# the rotation reuse arm, the TRMC variant modulo-cons step, the arm-top reuse
+# token, and the con-reuse recolor. Before the fix native leaked nearly every
+# node (reachable-but-unfreed, ~4x over-alloc); the C oracle frees it all. The
+# fixture builds + discards an rb-tree of 60-key passes (20 passes) under the
+# NATIVE backend with KAI_TRACE_RC; the leak must be a SMALL CONSTANT (the lone
+# result string + a few residuals), not O(inserts). We assert leaked < 100 (it
+# is 4 fixed); a regression that drops one node per recursion level blows past
+# this within a few passes. Native-gated (tier1-native): a C-only kaic2 cannot
+# run --backend=native, so the target is invoked from the tier1-native workflow.
+test-perceus-872-native-variant-reuse-leak: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_variant_reuse_leak_872.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-872vrl 2> build/s2-872vrl.err \
+	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native build errored)"; cat build/s2-872vrl.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-872vrl > build/s2-872vrl.out 2> build/s2-872vrl.rc; \
+	diff -q ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out > /dev/null \
+	  || { echo "perceus-872-native-variant-reuse-leak FAIL (output diff)"; diff ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out; exit 1; }; \
+	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-872vrl.rc | head -1 | cut -d= -f2); \
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-872vrl.rc | head -1 | cut -d= -f2); \
+	[ -n "$$alloc" ] && [ -n "$$leaked" ] \
+	  || { echo "perceus-872-native-variant-reuse-leak FAIL (no alloc/leaked line)"; cat build/s2-872vrl.rc; exit 1; }; \
+	[ "$$leaked" -lt 100 ] \
+	  && echo "perceus-872-native-variant-reuse-leak OK (native leaked=$$leaked < 100 over alloc_total=$$alloc; rb-tree variant reuse no longer leaks O(inserts))" \
+	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native leaked=$$leaked of alloc=$$alloc — variant reuse leak regressed, grows with inserts)"; exit 1; }
+
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
 # does not appear anywhere in the recursive call's args, so rule 3
@@ -4192,7 +4218,7 @@ test-perceus-issue350-asan: $(TARGET) build
 # exact shape `pcs_sub_is_flat` now admits. The golden is the post-insert
 # node count: a token used by the rebuild AND freed afterward (the
 # double-use bug the lane hit) drops a subtree, so size comes out SHORT.
-PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance
+PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance native_variant_reuse_leak_872 native_variant_reuse_double_use_872
 
 test-perceus-nested-reuse: $(TARGET) build
 	@set -e; \
