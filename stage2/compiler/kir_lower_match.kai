@@ -381,17 +381,26 @@ pub fn lm_dup_alias_binders(names: [String], pos: KPos, st: LowerSt) : LowerSt =
 # (`__perceus_reuse_{cons,variant,record}`, stamped by perceus's reuse
 # recogniser). For such an arm the structural dup is suppressed — the reuse
 # helper owns the scrutinee's RC discipline (conditional incref of kept
-# children + no exit drop), so an extra dup would leak. Conservative: ANY
-# reuse call anywhere in the body suppresses the dup (suppressing where reuse
-# is present is the single-source-of-truth gate, mirroring the oracle's
-# `cx.borrowed` arm-top-reuse exemption).
+# children + no exit drop), so an extra dup would leak.
+#
+# A `__perceus_reuse_*` consumes the scrutinee of the NEAREST enclosing match
+# (its donor is that match's `__pcs_scr`). So the search must NOT descend into
+# a nested `EMatch`: a reuse inside an inner match consumes the inner
+# scrutinee, not this arm's — descending there suppressed the outer arm's dup
+# of its own kept children and left them under-incref'd against the arm-exit
+# cascade drop (the gap3 rotation UAF: `Node(l,k,r) -> match l { match ll {
+# Node(..) -> Node(Node(...), lk, Node(lr, k, r)) } }` reuses `ll`, but the
+# outer arm's `r` was embedded with no protecting incref, double-freed by the
+# `t` drop, and recycled into a cycle). The oracle (`emit_c`) avoids this
+# structurally: every owned arm `kai_incref`s its pointer children and only the
+# reuse arm itself borrow-binds. We stop at the `EMatch` boundary to match it.
 pub fn arm_body_uses_reuse(e: Expr) : Bool = arm_reuse_kind(e.kind)
 
 fn arm_reuse_kind(k: ExprKind) : Bool = match k {
   ECall(cf, cas) -> arm_reuse_call_head(cf) or arm_reuse_any(cas)
   EIf(c, t, oe)  -> arm_body_uses_reuse(c) or arm_body_uses_reuse(t) or
                     match oe { None -> false Some(e2) -> arm_body_uses_reuse(e2) }
-  EMatch(s, arms) -> arm_body_uses_reuse(s) or arm_reuse_arms(arms)
+  EMatch(s, _arms) -> arm_body_uses_reuse(s)
   EBlock(stmts, tail) -> arm_reuse_stmts(stmts) or
                          match tail { None -> false Some(e) -> arm_body_uses_reuse(e) }
   ERecordLit(_, fs) -> arm_reuse_field_inits(fs)
@@ -413,11 +422,6 @@ fn arm_reuse_call_head(cf: Expr) : Bool = match cf.kind {
 fn arm_reuse_any(es: [Expr]) : Bool = match es {
   []           -> false
   [e, ...rest] -> if arm_body_uses_reuse(e) { true } else { arm_reuse_any(rest) }
-}
-
-fn arm_reuse_arms(arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [a, ...rest] -> match a { Arm(_, _, b) -> if arm_body_uses_reuse(b) { true } else { arm_reuse_arms(rest) } }
 }
 
 fn arm_reuse_stmts(stmts: [Stmt]) : Bool = match stmts {
