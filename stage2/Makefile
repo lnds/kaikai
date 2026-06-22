@@ -4931,6 +4931,26 @@ TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
 
+# CI sharding (docs/ci-time-analysis.md §7). The ~100 light targets are the
+# dominant tier1 cost (~15 min on ubuntu-latest) and are CPU-bound +
+# independent, so they scale near-linearly across SEPARATE runners (in-job
+# `-j` is memory-bandwidth-capped at 1.24×; separate runners each get their
+# own memory bus — the tier1-perf retro measured this). `test-light-shard`
+# runs the round-robin slice `SHARD` of `SHARDS` of TEST_LIGHT_TARGETS:
+# target i (1-based) belongs to shard ((i-1) % SHARDS) + 1. Round-robin (not
+# contiguous wordlist) balances the heavy families (stdlib/sugars/effects)
+# across slices instead of piling them into one. The slices are a partition
+# of the single canonical list — their union is exactly TEST_LIGHT_TARGETS,
+# with no overlap, by construction. SHARDS=1 (default) reproduces the full
+# list, so a non-sharded `test` is unchanged.
+SHARD  ?= 1
+SHARDS ?= 1
+test-light-shard: $(TARGET) build
+	@slice=$$(echo $(TEST_LIGHT_TARGETS) | tr ' ' '\n' \
+	  | awk 'NR % $(SHARDS) == ($(SHARD) - 1) % $(SHARDS)' | tr '\n' ' '); \
+	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
+	$(MAKE) -j$(TEST_JOBS) $$slice
+
 test: $(TARGET) build
 	@$(MAKE) test-costly-parallel
 	@$(MAKE) test-light-parallel

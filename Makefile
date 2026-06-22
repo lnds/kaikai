@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit clean tier0 tier1 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,6 +187,48 @@ test-heap-limit: kaic2
 # a CI link) — without it, the merge does not happen.
 tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke + kai doc smoke"
+
+# CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
+# grout dominates the PR critical path; it is CPU-bound + independent, so we
+# split it across SEPARATE runners (each with its own memory bus — in-job
+# `-j` is bandwidth-capped). These three shards PARTITION the `tier1` work:
+# every phase of `tier1` above appears in exactly one shard, so the union is
+# the full gate with identical coverage. The CI workflow runs them in
+# parallel on a shared pre-built kaic2 and an aggregator job (`tier1`)
+# gates on all three — the Required check name is unchanged.
+#
+#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound; kept on
+#            their own runner so they never contend with the light pool).
+#  shard 2 — light slice 1/2 + demos baseline.
+#  shard 3 — light slice 2/2 + every remaining non-light phase.
+#
+# Coverage invariant (do not break): the set
+#   { test-costly-parallel, test-heap-limit, test-user-cache,
+#     test-core-cache, light(1/2), light(2/2), demos-no-regression,
+#     test-fmt, test-fmt-selfhost, test-bench, test-check,
+#     test-library-mode, test-diagnostics-collected, test-negative,
+#     test-stdlib-modules, test-packages, test-private-type-shadow-audit,
+#     test-private-record-shadow-audit, test-canonical-aliases,
+#     test-info, test-doc }
+# equals exactly the prerequisites of `tier1` (light(1/2) ∪ light(2/2)
+# == TEST_LIGHT_TARGETS, proven by the round-robin partition in
+# stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
+tier1-shard-1: kaic2
+	$(MAKE) -C stage2 test-costly-parallel
+	$(MAKE) -C stage2 test-heap-limit
+	$(MAKE) -C stage2 test-user-cache
+	$(MAKE) -C stage2 test-core-cache
+	@echo "tier1-shard-1 OK — costly self-compiles + heap-limit + user/core caches"
+
+tier1-shard-2: kaic2
+	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=2
+	$(MAKE) demos-no-regression
+	@echo "tier1-shard-2 OK — light slice 1/2 + demos baseline"
+
+tier1-shard-3: kaic2
+	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=2
+	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
+	@echo "tier1-shard-3 OK — light slice 2/2 + fmt/bench/check/negative/stdlib-modules/packages/audits/info/doc"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
