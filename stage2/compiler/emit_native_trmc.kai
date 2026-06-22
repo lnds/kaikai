@@ -39,6 +39,13 @@ import compiler.emit_native_ops
 pub fn ntrmc_res_reg() : String = "_kai_acc_res"
 pub fn ntrmc_hole_reg() : String = "_kai_acc_hole"
 
+# The arm-top reuse token register (#872). Fn-wide alloca, null by default, so
+# a TRMC step can reference it unconditionally: an arm-top-reuse arm writes the
+# consumed scrutinee shell here; a fn with no such arm leaves it null and the
+# step fresh-allocs (the old behaviour). Mirrors the C oracle's fn-wide
+# `KaiReuse _arm_ru` (emit_c.kai `acc_decl`).
+pub fn ntrmc_armru_reg() : String = "_arm_ru"
+
 # Reserve the cctx accumulator allocas for a fn whose body contains a
 # `KTrmcStep` (the walk's allocas-in-entry rule). `_kai_acc_res` is a
 # boxed `ptr` seeded NULL; `_kai_acc_hole` is a `ptr` cell holding a
@@ -53,8 +60,48 @@ pub fn nemit_trmc_allocas(ctx: Handle, blocks: [KBlock]) : Unit / Console =
     let hole = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ntrmc_hole_reg(), ".addr"))
     native_ctx_add_reg(ctx, ntrmc_hole_reg(), hole, 0)
     let _z1 = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), hole)
+    # `_arm_ru` token slot (#872), seeded null — the arm-top reuse capture
+    # writes the consumed scrutinee here, the TRMC step / arm tail reads it.
+    let armru = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ntrmc_armru_reg(), ".addr"))
+    native_ctx_add_reg(ctx, ntrmc_armru_reg(), armru, 0)
+    let _z2 = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), armru)
     ()
   } else { () }
+
+# Arm-top reuse capture (#872, the C oracle's `emit_arm_top_reuse`). Steal the
+# consumed scrutinee `donor` as the reuse token `_arm_ru = kaix_drop_reuse_token
+# (donor, n)`: UNIQUE hands back the shell (kept children MOVED via the borrow
+# binds — no incref), SHARED returns null after a non-recursive rc-- and the
+# kept ptr children need their own ref. Each name in `bs` is a kept pointer
+# binder the rebuild embeds; incref it only on the shared (token-null) path. The
+# lowering neutralises the match-exit decref of `donor` (no `KDrop(sd)`), so the
+# token is the sole disposer — consumed by a TRMC step (`kaix_variant_at`) or
+# freed by `KArmTokenFree` on a non-step tail.
+pub fn nemit_arm_top_reuse(ctx: Handle, donor: Handle, n: Int, bs: [String]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let token = ncall_sig2(ctx, "kaix_drop_reuse_token", p, p, i32t, donor, llvm_const_i32(i32t, n))
+  nemit_store_reg(ctx, ntrmc_armru_reg(), token)
+  nemit_arm_top_incref_binders(ctx, token, bs)
+}
+
+fn nemit_arm_top_incref_binders(ctx: Handle, token: Handle, bs: [String]) : Unit / Console = match bs {
+  []           -> ()
+  [nm, ...rest] -> {
+    let p = native_ctx_ptrt(ctx)
+    let _r = ncall_sig2(ctx, "kaix_incref_if_token_null", p, p, p, token, nemit_atom(ctx, KVar(nm)))
+    nemit_arm_top_incref_binders(ctx, token, rest)
+  }
+}
+
+# Free `_arm_ru` if a non-step arm tail (`balance_left(ins(l,..),..)`) left it
+# unconsumed (Koka ParcReuse's linear token disposal). `kaix_reuse_free` is a
+# null-safe shell-only free (no cascade into the moved children); reset to null.
+pub fn nemit_arm_token_free(ctx: Handle) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let _d = nemit_call1(ctx, "kaix_reuse_free", nemit_load_reg(ctx, ntrmc_armru_reg()))
+  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
+}
 
 fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
   [] -> false
@@ -92,7 +139,15 @@ pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, dro
     # oracle's `scr_drop` (`emit_trmc_cons_step`, emit_c.kai). `__kai_cons`
     # (raw EList, `build`) has no scrutinee to free (issue #860).
     true  -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, ntrmc_cname_drops_scr(cname), scr_drop)
-    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg, dropmask)
+    # native variant reuse leak (#872): a self-modulo-cons variant step
+    # (`Node(c, insert_loop(l,..), ..)`) CONSUMES the matched scrutinee but the
+    # back-edge jumps over the match-exit drop. The C oracle reclaims it via an
+    # arm-top reuse token (`_arm_ru`); native fresh-allocs, so without dropping
+    # the consumed scrutinee here every descent level leaks (insert_loop alone
+    # leaked ~10x over-alloc). The kept pointer children were already incref'd
+    # by the arm's `dup` binds, so they outlive the scrutinee's recursive
+    # decref — the same discipline the cons `_s` step uses.
+    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg, dropmask, scr_drop)
   }
 
 # Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr.
@@ -106,14 +161,24 @@ fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int
 # (slot order) plus a NULL placeholder at `hole_slot`, build `kaix_variant`
 # (mask==0), hole at slot `hole_slot`.
 fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int,
-                      head_vals: [KVal], asg: [KAssign], dropmask: Int) : Unit / Console = {
+                      head_vals: [KVal], asg: [KAssign], dropmask: Int, scr_drop: String) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
+  # Dispose the arm-top reuse token (#872): a self-modulo-cons variant step
+  # CONSUMES the matched scrutinee, captured at the arm top as `_arm_ru`. Free
+  # the token shell (null-safe, no cascade — the kept children moved into the
+  # fresh node's slots) and reset it, so the loop does not leak the consumed
+  # shell each iteration. A `build`-shaped step (no arm-top capture) reads a null
+  # token and the free is a no-op. The fresh `kaix_variant` node carries the
+  # rebuilt slots; reuse-in-place of the token shell is a separate perf step.
+  let _f = nemit_call1(ctx, "kaix_reuse_free", nemit_load_reg(ctx, ntrmc_armru_reg()))
+  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
   let argbuf = ntrmc_variant_slots(ctx, head_vals, hole_slot, 0)
   let node = nemit_variant_call(ctx, "kaix_variant", tag, cname, argbuf)
   let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node, llvm_const_i32(i32t, hole_slot))
   ntrmc_extend_and_loop(ctx, node, hole, asg, dropmask)
 }
+
 
 # True for the scrutinee-reuse cons marker `__kai_cons_s` (the reuse-cons
 # arm shape), false for the plain `__kai_cons` (raw EList). The `_s` step
@@ -221,6 +286,13 @@ pub fn nemit_trmc_apply(ctx: Handle, leaf: KVal) : Unit / Console = {
   let res = nemit_load_reg(ctx, ntrmc_res_reg())
   let hole = nemit_load_reg(ctx, ntrmc_hole_reg())
   let out = ncall_sig3(ctx, "kaix_cctx_apply", p, p, p, p, res, hole, leafv)
+  # Free an unconsumed arm-top reuse token before this terminal RET (#872): a
+  # non-TRMC-step tail (`balance_left(ins(l,..),..)`) ends in `KTrmcApply`, which
+  # RETURNS directly and SKIPS the L0 continuation where `KArmTokenFree` lives —
+  # so the captured scrutinee shell would leak once per recursion level. The free
+  # is null-safe (a step-consumed or never-captured token is null).
+  let _f = nemit_call1(ctx, "kaix_reuse_free", nemit_load_reg(ctx, ntrmc_armru_reg()))
+  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
   let _r = llvm_build_ret(native_ctx_b(ctx), out)
   ()
 }
