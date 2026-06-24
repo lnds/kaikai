@@ -901,16 +901,30 @@ fn synthesize_inst_for_decl(d: Decl, args_: [Expr], line: Int, col: Int) : Optio
       None -> None
       Some(sc) -> match sc {
         Scheme(_, _, _, fnty) -> match fnty {
-          TyFnT(formal_pts, _, _) -> {
-            let implicit = collect_implicit_tparams_in_decl(d, tparams)
-            let effective = list_append(tparams, implicit)
-            let split = tparam_id_split(effective)
-            let bindings = extract_bindings_args(formal_pts, args_,
-                              SubstBindings { tvars: [], uvars: [] })
-            let tys = collect_subst_tys(split.tvars, bindings.tvars)
-            let units = collect_subst_units(split.uvars, bindings.uvars)
-            Some(RCS(name, line, col, tys, units, None))
-          }
+          TyFnT(formal_pts, _, _) ->
+            # An arity mismatch means the call cannot be this generic:
+            # decline so a same-named monomorphic root fn of a different
+            # arity keeps winning the call site (#748 shadowing).
+            if list_length(formal_pts) != list_length(args_) { None }
+            else {
+              let implicit = collect_implicit_tparams_in_decl(d, tparams)
+              let effective = list_append(tparams, implicit)
+              let split = tparam_id_split(effective)
+              let bindings = extract_bindings_args(formal_pts, args_,
+                                SubstBindings { tvars: [], uvars: [] })
+              match collect_subst_tys(split.tvars, bindings.tvars) {
+                # An unbound type-tparam means the generic's formal shape
+                # did not unify with the call's actual arg types: this is
+                # not a real instantiation of this generic. Decline rather
+                # than defaulting to TyAny, so a same-named monomorphic
+                # root fn keeps winning the call site (#748 shadowing).
+                None -> None
+                Some(tys) -> {
+                  let units = collect_subst_units(split.uvars, bindings.uvars)
+                  Some(RCS(name, line, col, tys, units, None))
+                }
+              }
+            }
           _ -> None
         }
       }
@@ -984,12 +998,18 @@ fn extract_bindings_unit(formal: UnitExprT, actual: UnitExprT,
   }
 }
 
-fn collect_subst_tys(ids: [Int], pairs: [SubstPairTy]) : [Ty] {
+# Resolve each type-tparam id to its bound type. Returns None if any
+# id is left unbound — the generic's formal shape did not unify with
+# the call, so no instantiation should be synthesised.
+fn collect_subst_tys(ids: [Int], pairs: [SubstPairTy]) : Option[[Ty]] {
   match ids {
-    [] -> []
+    [] -> Some([])
     [i, ...rest] -> match subst_pairs_lookup_ty(pairs, i) {
-      Some(t) -> [t, ...collect_subst_tys(rest, pairs)]
-      None    -> [TyAny, ...collect_subst_tys(rest, pairs)]
+      Some(t) -> match collect_subst_tys(rest, pairs) {
+        Some(ts) -> Some([t, ...ts])
+        None     -> None
+      }
+      None    -> None
     }
   }
 }
