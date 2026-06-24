@@ -220,7 +220,8 @@ typedef enum {
 #define KAI_PROTO_MUL           9
 #define KAI_PROTO_DIV          10
 #define KAI_PROTO_REM          11
-#define KAI_USER_PROTO_ID_BASE 12
+#define KAI_PROTO_NUMERIC      12
+#define KAI_USER_PROTO_ID_BASE 13
 
 /* Variant-tag -> head-type-tag map. Set once at startup by codegen-
  * emitted main via kai_register_variant_heads(table, len). Until set,
