@@ -1055,6 +1055,66 @@ fn lookup_poly_fn(polys: [PolyFn], name: String) : Option[Decl] {
   }
 }
 
+# True iff `name` is defined as a poly fn by module `modn` AND by no other
+# module. A qualified call `modn.name(...)` is only a safe monomorphisation
+# target then: the spec-generation worklist keys tuples by bare name
+# (`generate_specs_iter` → `lookup_poly_fn`), so a name shared across two
+# modules (`list.map` vs `stream.map`) cannot be disambiguated — the
+# generator would emit the first module's spec while the call site demands
+# the other's, leaving an undeclared symbol. When the name is unique to one
+# module, the bare-name lookup is unambiguous and the rewrite is sound.
+# (`map.filter`, which is tparam-less, is not in `polys` at all, so it also
+# fails this guard and stays an ordinary generic call.)
+fn poly_fn_unique_in_module(polys: [PolyFn], name: String, modn: String) : Bool =
+  poly_fn_module_count(polys, name) == 1 and poly_fn_has_module(polys, name, modn)
+
+# Count how many DISTINCT modules define a poly fn named `name`.
+fn poly_fn_module_count(polys: [PolyFn], name: String) : Int =
+  count_distinct_mods(poly_mods_for(polys, name), [])
+
+fn poly_mods_for(polys: [PolyFn], name: String) : [String] {
+  match polys {
+    [] -> []
+    [p, ...rest] -> match p {
+      PFn(n, d) ->
+        if n == name { match poly_decl_mo(d) {
+          Some(m) -> [m, ...poly_mods_for(rest, name)]
+          None    -> poly_mods_for(rest, name)
+        }} else { poly_mods_for(rest, name) }
+    }
+  }
+}
+
+fn count_distinct_mods(mods: [String], seen: [String]) : Int {
+  match mods {
+    [] -> 0
+    [m, ...rest] ->
+      if list_has(seen, m) { count_distinct_mods(rest, seen) }
+      else { 1 + count_distinct_mods(rest, [m, ...seen]) }
+  }
+}
+
+fn poly_fn_has_module(polys: [PolyFn], name: String, modn: String) : Bool {
+  match polys {
+    [] -> false
+    [p, ...rest] -> match p {
+      PFn(n, d) ->
+        if n == name and poly_decl_mo_is(d, modn) { true }
+        else { poly_fn_has_module(rest, name, modn) }
+    }
+  }
+}
+
+fn poly_decl_mo(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  _ -> None
+}
+
+fn poly_decl_mo_is(d: Decl, modn: String) : Bool = match poly_decl_mo(d) {
+  Some(m) -> m == modn
+  None    -> false
+}
+
 # Resolved call-site tuples keyed by (name, [Ty], [UnitExprT]).
 # Stored as a flat list; lookup is O(n × m) but the input is
 # bounded by the program's total call-site count which is small in
@@ -1557,29 +1617,41 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
   match e.kind {
     ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> {
-        let is_user_poly = match lookup_poly_fn(polys, name) {
-          Some(_) -> true None -> false
-        }
-        if not is_user_poly { acc1 }
-        else {
-          match resolve_call_inst(insts, polys, name, callee, args_, sm) {
-            Some(p) -> match p {
-              MIPair(tys, units) -> {
-                let any_slot = list_length(tys) > 0 or list_length(units) > 0
-                let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
-                let mt = MT(name, tys, units)
-                let is_new = concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
-                if is_new { [mt, ...acc1] } else { acc1 }
-              }
-            }
-            None -> acc1
-          }
-        }
-      }
+      EVar(name) -> discover_call_tuple(name, callee, args_, insts, polys, existing, sm, acc1)
+      # A qualified call `mod.fn(...)` seeds the same spec as the bare form,
+      # but only when `fn` is a `[T:P]` generic unique to `mod` — the
+      # rewriter applies the same guard, so the two stay in lockstep.
+      EModCall(modn, name) ->
+        if poly_fn_unique_in_module(polys, name, modn) {
+          discover_call_tuple(name, callee, args_, insts, polys, existing, sm, acc1)
+        } else { acc1 }
       _ -> acc1
     }
     _ -> acc1
+  }
+}
+
+fn discover_call_tuple(name: String, callee: Expr, args_: [Expr],
+                        insts: [ResolvedCS], polys: [PolyFn],
+                        existing: [MonoTuple], sm: SubstMap,
+                        acc1: [MonoTuple]) : [MonoTuple] {
+  let is_user_poly = match lookup_poly_fn(polys, name) {
+    Some(_) -> true None -> false
+  }
+  if not is_user_poly { acc1 }
+  else {
+    match resolve_call_inst(insts, polys, name, callee, args_, sm) {
+      Some(p) -> match p {
+        MIPair(tys, units) -> {
+          let any_slot = list_length(tys) > 0 or list_length(units) > 0
+          let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+          let mt = MT(name, tys, units)
+          let is_new = concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
+          if is_new { [mt, ...acc1] } else { acc1 }
+        }
+      }
+      None -> acc1
+    }
   }
 }
 
@@ -1794,6 +1866,31 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
               ECall(callee, new_args)
             }
           None -> ECall(callee, new_args)
+        }
+      }
+      # A qualified call `mod.fn(...)` is `ECall(EModCall(mod, fn), ...)`.
+      # Only retarget it when `fn` is a `[T:P]` generic UNIQUE to `mod`. The
+      # typer records an inst for every qualified callee, and the spec
+      # worklist keys by bare name, so retargeting a name shared by two
+      # modules (`list.map` / `stream.map`) or a tparam-less qualified fn
+      # (`map.filter`) would demand a spec the generator never emits.
+      EModCall(modn, name) -> {
+        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm))
+        if not poly_fn_unique_in_module(polys, name, modn) { ECall(callee, new_args) }
+        else {
+          match resolve_call_inst(insts, polys, name, callee, args_, sm) {
+            Some(MIPair(tys, units)) ->
+              if tuple_in(tuples, MT(name, tys, units)) {
+                let mangled = mono_mangle_name(name, tys, units)
+                let new_callee = Expr { kind: EModCall(modn, mangled),
+                                         line: callee.line, col: callee.col,
+                                         ty: callee.ty, mode: callee.mode }
+                ECall(new_callee, new_args)
+              } else {
+                ECall(callee, new_args)
+              }
+            None -> ECall(callee, new_args)
+          }
         }
       }
       _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm),
