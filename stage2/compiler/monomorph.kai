@@ -1803,6 +1803,48 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
   }
 }
 
+# Collect every RCS recorded at one `(name, line, col)` source
+# position. A position is shared by more than one instantiation when
+# distinct `#{...}` interpolation bodies reparse to call sites that
+# all start at the slice-local `(1,1)` — the lexer restarts each
+# `#{...}` reparse at line 1, col 1, so the callee EVar of every
+# interpolated `f(...)` lands at the same coordinate.
+fn find_mono_insts_at(insts: [ResolvedCS], name: String,
+                       line: Int, col: Int) : [MonoInstPair] {
+  match insts {
+    [] -> []
+    [r, ...rest] -> match r {
+      RCS(rn, rl, rc, tys, units, _) ->
+        if rn == name and rl == line and rc == col {
+          [MIPair(tys, units), ...find_mono_insts_at(rest, name, line, col)]
+        } else {
+          find_mono_insts_at(rest, name, line, col)
+        }
+    }
+  }
+}
+
+# True when two or more recorded instantiations share a position but
+# disagree on (tys, units) — the position cannot pick a single spec by
+# first-match, so the call site's actual arg types must disambiguate.
+fn mono_insts_collide(pairs: [MonoInstPair]) : Bool {
+  match pairs {
+    [] -> false
+    [_] -> false
+    [MIPair(t0, u0), ...rest] -> mono_insts_collide_rest(t0, u0, rest)
+  }
+}
+
+fn mono_insts_collide_rest(t0: [Ty], u0: [UnitExprT], rest: [MonoInstPair]) : Bool {
+  match rest {
+    [] -> false
+    [MIPair(ti, ui), ...more] ->
+      if ty_list_eq(t0, ti) and unit_list_eq(u0, ui) {
+        mono_insts_collide_rest(t0, u0, more)
+      } else { true }
+  }
+}
+
 # Resolve the (tys, units) tuple for an `ECall(EVar(name), args)`
 # call site, applying `sm`. The lookup prefers the typer-recorded
 # RCS at (name, callee.line, callee.col) when it exists;
@@ -1815,28 +1857,53 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
 # calls that coalesce onto one source position under string
 # interpolation (each `#{x}` becomes `__pimpl_Show_<T>_show(x)` at
 # the same outer (line, col) for distinct `x.ty`).
+#
+# A bare `fn[T:P]` instantiated at >=2 types inside `#{...}` records
+# several distinct-type RCS at one slice-local position; first-match
+# would resolve every such site to the first spec (wrong ABI). When
+# the position collides, synthesise from the call's actual arg types
+# so each site retargets its own spec.
 fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
                       callee: Expr, args_: [Expr],
                       sm: SubstMap) : Option[MonoInstPair] {
-  match find_mono_inst(insts, name, callee.line, callee.col) {
-    Some(MIPair(tys0, units0)) -> {
+  let at_pos = find_mono_insts_at(insts, name, callee.line, callee.col)
+  if mono_insts_collide(at_pos) {
+    match synth_inst_pair(polys, name, callee, args_, sm) {
+      Some(p) -> Some(p)
+      None -> resolve_call_inst_first(at_pos, polys, name, callee, args_, sm)
+    }
+  } else {
+    resolve_call_inst_first(at_pos, polys, name, callee, args_, sm)
+  }
+}
+
+fn resolve_call_inst_first(at_pos: [MonoInstPair], polys: [PolyFn], name: String,
+                            callee: Expr, args_: [Expr],
+                            sm: SubstMap) : Option[MonoInstPair] {
+  match at_pos {
+    [MIPair(tys0, units0), ..._] -> {
       let tys = map(tys0, (t) => subst_ty(t, sm))
       let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
       Some(MIPair(tys, units))
     }
-    None -> match lookup_poly_fn(polys, name) {
-      Some(d) -> match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
-        Some(rcs) -> match rcs {
-          RCS(_, _, _, tys0, units0, _) -> {
-            let tys = map(tys0, (t) => subst_ty(t, sm))
-            let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
-            Some(MIPair(tys, units))
-          }
+    [] -> synth_inst_pair(polys, name, callee, args_, sm)
+  }
+}
+
+fn synth_inst_pair(polys: [PolyFn], name: String, callee: Expr,
+                    args_: [Expr], sm: SubstMap) : Option[MonoInstPair] {
+  match lookup_poly_fn(polys, name) {
+    Some(d) -> match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
+      Some(rcs) -> match rcs {
+        RCS(_, _, _, tys0, units0, _) -> {
+          let tys = map(tys0, (t) => subst_ty(t, sm))
+          let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+          Some(MIPair(tys, units))
         }
-        None -> None
       }
       None -> None
     }
+    None -> None
   }
 }
 
@@ -1919,19 +1986,4 @@ fn rewrite_callsites_decls_full(ds: [Decl], insts: [ResolvedCS],
   map(ds, (d) => rewrite_callsites_decl_sm(d, insts, tuples, polys, subst_map_empty()))
 
 type MonoInstPair = MIPair([Ty], [UnitExprT])
-
-fn find_mono_inst(insts: [ResolvedCS], name: String,
-                   line: Int, col: Int) : Option[MonoInstPair] {
-  match insts {
-    [] -> None
-    [r, ...rest] -> match r {
-      RCS(rn, rl, rc, tys, units, _) ->
-        if rn == name and rl == line and rc == col {
-          Some(MIPair(tys, units))
-        } else {
-          find_mono_inst(rest, name, line, col)
-        }
-    }
-  }
-}
 
