@@ -962,45 +962,54 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
 # prelude's basename so a cache loader can partition post-cascade
 # decls back into their original prelude/user segments.
 fn generate_dispatchers(reg: ProtocolReg) : [Decl] =
-  generate_dispatchers_loop(reg.ops, reg.origins, [])
+  generate_dispatchers_loop(reg.ops, reg.origins,
+                            op_arities_from_ops(reg.ops), [])
 
 fn generate_dispatchers_loop(ops: [ProtoOpReg], origins: [ProtoOriginReg],
-                                acc: [Decl]) : [Decl] {
+                                arities: [OpAr], acc: [Decl]) : [Decl] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
       POR(pname, opname, params, ret, line, col) -> {
-        let already = dispatcher_in_acc(acc, opname)
-        if already { generate_dispatchers_loop(rest, origins, acc) }
+        # Dedup by the arity-resolved dispatcher NAME, not the bare op
+        # name: an arity-ambiguous op (`f/1` + `f/2`) yields two
+        # distinct dispatcher names, so both survive; same-arity
+        # collisions still collapse to one shared dispatcher.
+        let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
+        let already = dispatcher_named_in_acc(acc, disp)
+        if already { generate_dispatchers_loop(rest, origins, arities, acc) }
         else {
           let mo = proto_origin_lookup(origins, pname)
-          let stub = make_dispatcher_fn(pname, opname, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, origins, [stub, ...acc])
+          let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
+          generate_dispatchers_loop(rest, origins, arities, [stub, ...acc])
         }
       }
     }
   }
 }
 
-fn dispatcher_in_acc(ds: [Decl], target: String) : Bool {
-  let want = proto_dispatcher_name(target)
+fn dispatcher_named_in_acc(ds: [Decl], want: String) : Bool {
   match ds {
     [] -> false
     [d, ...rest] -> match d {
       DFn(_, n, _, _, _, _, _, _, _, _) ->
-        if n == want { true } else { dispatcher_in_acc(rest, target) }
-      _ -> dispatcher_in_acc(rest, target)
+        if n == want { true } else { dispatcher_named_in_acc(rest, want) }
+      _ -> dispatcher_named_in_acc(rest, want)
     }
   }
 }
 
-fn make_dispatcher_fn(pname: String, opname: String, params: [Param],
-                       ret: TypeExpr, line: Int, col: Int,
+# `disp_name` is the arity-resolved dispatcher symbol (may carry an
+# `__a<N>` suffix); `opname` is the original op name, kept for the
+# dispatch tag so the post-inference rewrite and emit resolve the impl
+# by the protocol's true op name.
+fn make_dispatcher_fn(pname: String, opname: String, disp_name: String,
+                       params: [Param], ret: TypeExpr, line: Int, col: Int,
                        mo: Option[String]) : Decl {
   let new_params = map(params, dispatcher_substitute_self_param)
   let new_ret = substitute_self_in_type(ret)
   let body = make_dispatcher_body(pname, opname, new_ret, line, col)
-  DFn(true, proto_dispatcher_name(opname), [], new_params, Some(new_ret),
+  DFn(true, disp_name, [], new_params, Some(new_ret),
       REmpty, body, line, col, mo)
 }
 
@@ -2940,10 +2949,12 @@ pub fn lower_protocols(decls: [Decl], file: String,
   # `pub fn min(xs)` / arity-2 `Ord.min(a, b)` split is preserved as
   # before — different arities never get filtered.
   let raw_op_arities = op_arities_from_ops(lower_res.reg.ops)
-  let local_arities = collect_local_fn_arities(stripped)
-  let op_arities = filter_shadowed_ops(raw_op_arities, local_arities)
-  let user_renamed = rename_proto_calls_decls(stripped, op_arities)
-  let impl_renamed = rename_proto_calls_decls(lower_res.fns, op_arities)
+  # Per-module shadow guard: collect each top-level fn with its home
+  # module so a prelude helper (`complex::add`) shadows the bare op
+  # only inside its own module, never in the user's file.
+  let local_fns = collect_local_fn_arities_mo(stripped)
+  let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, local_fns, target_mod)
+  let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, local_fns, target_mod)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
   LoweredProtocols { decls: final_decls, reg: lower_res.reg, errs: errs }
 }
@@ -2984,6 +2995,16 @@ pub fn lower_protocols(decls: [Decl], file: String,
 #[doc("An (op_name, arity) pair threaded into the arity-aware protocol-call rename pass.")]
 pub type OpAr = OpAr(String, Int)
 
+# A top-level fn's `(name, arity, module)`. The shadow guard is
+# per-module: a free `pub fn add` in `math/complex` shadows the bare
+# `add` op only inside complex's own bodies, not in a user file that
+# merely imports it. Without the module key, any prelude helper
+# homonymous with a protocol op (`complex::add`) would shadow that op
+# program-wide and the call would bind the concrete helper instead of
+# the polymorphic dispatcher.
+#[doc("A top-level fn's (name, arity, module) used by the per-module shadow guard.")]
+pub type LFnAr = LFnAr(String, Int, Option[String])
+
 # Project the registry's POR list into `[OpAr]`. Done once at the
 # `lower_protocols` boundary; the rewriter then threads it.
 #[doc("Project the registry's protocol ops into their (name, arity) pairs.")]
@@ -3020,6 +3041,45 @@ fn op_ar_match(arities: [OpAr], target: String, n: Int) : Bool {
         if name == target and ar == n { true }
         else { op_ar_match(rest, target, n) }
     }
+  }
+}
+
+# True when `target` is declared by two protocols at DIFFERENT arities
+# (`P { f(x) }` + `Q { f(a, b) }`). A single `__proto_f` dispatcher
+# cannot carry two incompatible signatures, so the rename + dispatcher
+# generation switch to arity-suffixed names (`__proto_f__a1`) for such
+# a name. Same-arity collisions (the common case — `Ring.add` vs
+# `Add.add`, both arity 2) keep the unsuffixed `__proto_<op>` and the
+# runtime impl-table disambiguates by `head_tag(self)`.
+fn op_name_arity_ambiguous(arities: [OpAr], target: String) : Bool =
+  op_name_arity_ambiguous_loop(arities, target, -1)
+
+fn op_name_arity_ambiguous_loop(arities: [OpAr], target: String,
+                                  seen: Int) : Bool {
+  match arities {
+    [] -> false
+    [a, ...rest] -> match a {
+      OpAr(name, ar) ->
+        if name == target {
+          if seen >= 0 and ar != seen { true }
+          else { op_name_arity_ambiguous_loop(rest, target, ar) }
+        } else {
+          op_name_arity_ambiguous_loop(rest, target, seen)
+        }
+    }
+  }
+}
+
+# Dispatcher name for an op call resolved at a known arity. Unsuffixed
+# `__proto_<op>` unless the name is arity-ambiguous, in which case the
+# arity is appended so the two protocols' ops land on distinct
+# dispatchers. Keeping the unsuffixed form for the common case is what
+# preserves the selfhost byte-id.
+fn proto_dispatcher_name_at(arities: [OpAr], op: String, arity: Int) : String {
+  if op_name_arity_ambiguous(arities, op) {
+    concat_all(["__proto_", op, "__a", int_to_string(arity)])
+  } else {
+    proto_dispatcher_name(op)
   }
 }
 
@@ -3067,6 +3127,67 @@ pub fn collect_local_fn_arities(ds: [Decl]) : [OpAr] {
   }
 }
 
+# Per-module variant: each top-level DFn carries its home module so the
+# shadow guard fires only against fns in the same module as the call
+# site (see `LFnAr`).
+#[doc("Collect every top-level DFn's (name, arity, module) for the per-module shadow guard.")]
+pub fn collect_local_fn_arities_mo(ds: [Decl]) : [LFnAr] {
+  match ds {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, name, _, ps, _, _, _, _, _, mo) ->
+        [LFnAr(name, list_length(ps), mo), ...collect_local_fn_arities_mo(rest)]
+      _ -> collect_local_fn_arities_mo(rest)
+    }
+  }
+}
+
+# Project the `[LFnAr]` set down to the `[OpAr]` shadows visible to a
+# call site in module `mo`: a fn shadows only when it lives in the same
+# module. `None` (root file) shadows only root-file call sites. This is
+# the dominion fix for the global-shadow bug — `complex::add` no longer
+# masks the `add` op outside complex.
+#[doc("The (name, arity) shadows visible to a call site in module `mo`.")]
+pub fn local_arities_for_mo(fns: [LFnAr], mo: Option[String]) : [OpAr] {
+  match fns {
+    [] -> []
+    [f, ...rest] -> match f {
+      LFnAr(name, ar, fmo) ->
+        if opt_str_eq(fmo, mo) {
+          [OpAr(name, ar), ...local_arities_for_mo(rest, mo)]
+        } else {
+          local_arities_for_mo(rest, mo)
+        }
+    }
+  }
+}
+
+# Same as `local_arities_for_mo` but canonicalises each fn's module
+# against `target_mod` first, so a root-file `pub fn` tagged
+# `Some(target_mod)` lands in the same bucket as an untagged root call
+# site (`canon_mo` maps both to `None`).
+fn local_arities_for_mo_canon(fns: [LFnAr], mo: Option[String],
+                               target_mod: String) : [OpAr] {
+  match fns {
+    [] -> []
+    [f, ...rest] -> match f {
+      LFnAr(name, ar, fmo) ->
+        if opt_str_eq(canon_mo(fmo, target_mod), mo) {
+          [OpAr(name, ar), ...local_arities_for_mo_canon(rest, mo, target_mod)]
+        } else {
+          local_arities_for_mo_canon(rest, mo, target_mod)
+        }
+    }
+  }
+}
+
+fn opt_str_eq(a: Option[String], b: Option[String]) : Bool {
+  match a {
+    None -> match b { None -> true _ -> false }
+    Some(x) -> match b { None -> false Some(y) -> x == y }
+  }
+}
+
 # Drop every op entry whose `(name, arity)` exists in `locals`. Same
 # `(name, arity)` pair means a user-visible DFn shadows the protocol
 # op; the rewrite should skip those call sites entirely so the local
@@ -3091,6 +3212,44 @@ pub fn filter_shadowed_ops(ops: [OpAr], locals: [OpAr]) : [OpAr] {
 #[doc("Rewrite non-shadowed protocol-op call sites to the `__proto_<op>` dispatcher across all decls.")]
 pub fn rename_proto_calls_decls(ds: [Decl], op_arities: [OpAr]) : [Decl] =
   map(ds, (d) => rename_proto_calls_decl(d, op_arities))
+
+# Per-module rename: each decl is rewritten against the raw op set
+# filtered by the shadows of that decl's OWN module. A `pub fn add` in
+# `complex` shadows `add` inside complex bodies but leaves the user's
+# `add(a, b)` to reach `__proto_add`.
+#[doc("Per-module variant of `rename_proto_calls_decls`: shadows are module-scoped.")]
+# `target_mod` is the compilation unit's own module: a root-file decl
+# carries `mo = None` OR `mo = Some(target_mod)` inconsistently (a `pub`
+# fn gets tagged, a private one stays None), so both must canonicalise
+# to the same "root" bucket — else a `pub fn show` (tagged) fails to
+# shadow `Show.show` in `fn main` (untagged).
+#[doc("Per-module variant of `rename_proto_calls_decls`: shadows are module-scoped.")]
+pub fn rename_proto_calls_decls_mo(ds: [Decl], raw_ops: [OpAr],
+                                    local_fns: [LFnAr],
+                                    target_mod: String) : [Decl] =
+  map(ds, (d) => {
+    let dmo = canon_mo(decl_module(d), target_mod)
+    let ops = local_arities_for_mo_canon(local_fns, dmo, target_mod)
+    rename_proto_calls_decl(d, filter_shadowed_ops(raw_ops, ops))
+  })
+
+# Collapse `Some(target_mod)` and `None` to a single canonical `None`
+# (the root bucket); foreign modules keep their `Some(name)`.
+fn canon_mo(mo: Option[String], target_mod: String) : Option[String] {
+  match mo {
+    None -> None
+    Some(m) -> if m == target_mod { None } else { Some(m) }
+  }
+}
+
+# A decl's home module. `DFn` carries it; `DTest`/`DBench`/`DCheck` are
+# always authored in the root file, so `None`.
+fn decl_module(d: Decl) : Option[String] {
+  match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+    _ -> None
+  }
+}
 
 fn rename_proto_calls_decl(d: Decl, op_arities: [OpAr]) : Decl {
   match d {
@@ -3292,7 +3451,8 @@ fn rename_proto_calls_kind(k: ExprKind, op_arities: [OpAr], bound: [String]) : E
       EVar(name) -> {
         let is_op = op_ar_has_name(op_arities, name)
         let bound_locally = list_has(bound, name)
-        let arity_ok = op_ar_match(op_arities, name, list_length(args_))
+        let arity = list_length(args_)
+        let arity_ok = op_ar_match(op_arities, name, arity)
         let preserve_callee = is_op and not bound_locally and not arity_ok
         let new_args = map(args_, (a) => rename_proto_calls_expr(a, op_arities, bound))
         if preserve_callee {
@@ -3301,11 +3461,16 @@ fn rename_proto_calls_kind(k: ExprKind, op_arities: [OpAr], bound: [String]) : E
           # arity-1-list-fn case (e.g. `max(xs)`) lands here when
           # `Ord.max(a, b)` is the only protocol op.
           ECall(callee, new_args)
+        } else if is_op and not bound_locally {
+          # Matched a protocol op at this arity. Rename to the
+          # arity-resolved dispatcher (suffixed only when the name is
+          # arity-ambiguous), bypassing the structural EVar branch so
+          # the arity of THIS call selects the dispatcher.
+          let disp = proto_dispatcher_name_at(op_arities, name, arity)
+          ECall(mk_expr(EVar(disp), callee.line, callee.col), new_args)
         } else {
-          # Match (or no protocol-op collision at all): fall through
-          # to the structural recursion. The EVar branch above turns
-          # the matched callee into `__proto_<name>` exactly as in
-          # the original m12.8 pass.
+          # No protocol-op collision (or a locally-bound name): fall
+          # through to the structural recursion unchanged.
           ECall(rename_proto_calls_expr(callee, op_arities, bound), new_args)
         }
       }
@@ -3828,13 +3993,14 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
               None -> errs
               Some(ty) -> match ty_head_name(ty) {
                 None -> errs
-                Some(tname) -> match find_impl(reg, opname, tname) {
+                # Collision-aware: an impl under ANY protocol declaring
+                # `opname` clears the call (the bare name carries no
+                # protocol, so `Ring.add` and `Add.add` are both valid
+                # targets for `add`).
+                Some(tname) -> match find_impl_any_proto(reg, opname, tname) {
                   Some(_) -> errs
                   None -> {
-                    let pname = match proto_op_lookup(reg, opname) {
-                      Some(po) -> match po { POR(pn, _, _, _, _, _) -> pn }
-                      None -> "?"
-                    }
+                    let pname = first_proto_of_op(reg, opname)
                     diag_error(file, e.line, e.col,
                       concat_all(["no impl of `", pname,
                                   "` for type `", tname,
@@ -4385,6 +4551,11 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
     [] -> None
     [po, ...rest] -> match po {
       POR(pname, _, params, ret_te, _, _) ->
+        # Arity guard: skip a candidate whose arity differs from the
+        # call (an arity-ambiguous name reaches both protocols' POR).
+        if list_length(params) != list_length(args_) {
+          try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
+        }
         # Only ops whose Self is informed SOLELY by the return position
         # are dispatched here. When Self also appears in a parameter
         # (`show(x: Self) : String`), arg-driven dispatch in
@@ -4392,7 +4563,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         # return head would misroute a no-impl receiver (e.g. `Bare`
         # with no `impl Show`) onto an unrelated impl whose head happens
         # to equal the concrete return head (`String`).
-        if not proto_op_self_only_in_return(params, ret_te) {
+        else if not proto_op_self_only_in_return(params, ret_te) {
           try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
         } else {
           match self_head_in_ret(ret_te, ret_ty) {
@@ -4457,10 +4628,18 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
     [] -> None
     [po, ...rest] -> match po {
       POR(pname, _, params, ret, _, _) -> {
+        # Arity guard: a name declared by two protocols at different
+        # arities (`P { f(x) }` + `Q { f(a, b) }`) yields one POR per
+        # protocol here. Only the candidate whose arity matches the
+        # call can be the target — skipping the rest is what stops a
+        # 1-arg call landing on the 2-arg impl.
+        if list_length(params) != list_length(args_) {
+          try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
+        }
         # When Self appears only in the op's return position (e.g.
         # `from(x: a) : Self`), the args carry no Self information —
         # defer to the caller-provided ret_ty (the `_with_ret` wrapper).
-        if proto_op_self_only_in_return(params, ret) {
+        else if proto_op_self_only_in_return(params, ret) {
           try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
         } else {
           match find_proto_impl_for_args(reg, pname, opname, args_) {
@@ -4659,9 +4838,37 @@ fn strip_proto_dispatcher_prefix(name: String) : String {
   let n_pfx = string_length(pfx)
   if string_length(name) <= n_pfx { name }
   else if string_slice(name, 0, n_pfx) == pfx {
-    string_slice(name, n_pfx, string_length(name) - n_pfx)
+    strip_arity_suffix(string_slice(name, n_pfx, string_length(name) - n_pfx))
   }
   else { name }
+}
+
+# Drop the `__a<N>` arity suffix an arity-ambiguous dispatcher carries
+# (`f__a1` -> `f`). Scans the trailing digit run, then checks the `__a`
+# marker right before it. Names without the shape pass through, so an
+# op literally named `x__a` (no digits) is untouched.
+fn strip_arity_suffix(name: String) : String {
+  let n = string_length(name)
+  let digit_start = scan_trailing_digits(name, n)
+  let marker = "__a"
+  let m = string_length(marker)
+  if digit_start < n and digit_start >= m and
+     string_slice(name, digit_start - m, m) == marker {
+    string_slice(name, 0, digit_start - m)
+  } else { name }
+}
+
+# Index of the first char of the trailing digit run (== `n` when the
+# last char is not a digit). Walks backward from `n`.
+fn scan_trailing_digits(s: String, n: Int) : Int {
+  if n <= 0 { 0 }
+  else {
+    match char_at(s, n - 1) {
+      Some(c) -> if c >= '0' and c <= '9' { scan_trailing_digits(s, n - 1) }
+                 else { n }
+      None -> n
+    }
+  }
 }
 
 # Map an inferred Ty back to its canonical "head-constructor" name —
@@ -4710,6 +4917,40 @@ fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
     Some(po) -> match po {
       POR(pname, _, _, _, _, _) -> find_impl_for(reg.impls, pname, tname, opname)
     }
+  }
+}
+
+# Collision-aware: `opname` may be declared by several protocols
+# (`add` by `Add[a]` and a user `Ring`). Returns an impl when ANY
+# declaring protocol has one for `tname`, so the post-rewrite
+# validator does not fix the protocol to the wrong one and flag a
+# spurious "no impl". Returns the owning protocol name alongside.
+fn find_impl_any_proto(reg: ProtocolReg, opname: String,
+                        tname: String) : Option[ImplHit] =
+  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, tname)
+
+#[doc("A resolved impl hit: the owning protocol and the impl fn symbol.")]
+pub type ImplHit = ImplHit(String, String)
+
+fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
+                             opname: String, tname: String) : Option[ImplHit] {
+  match cands {
+    [] -> None
+    [po, ...rest] -> match po {
+      POR(pname, _, _, _, _, _) ->
+        match find_impl_for(reg.impls, pname, tname, opname) {
+          Some(fn_name) -> Some(ImplHit(pname, fn_name))
+          None -> find_impl_any_proto_loop(rest, reg, opname, tname)
+        }
+    }
+  }
+}
+
+# First protocol name declaring `opname` (for diagnostics only).
+fn first_proto_of_op(reg: ProtocolReg, opname: String) : String {
+  match proto_ops_lookup_all(reg, opname) {
+    [] -> "?"
+    [po, ..._rest] -> match po { POR(pn, _, _, _, _, _) -> pn }
   }
 }
 
