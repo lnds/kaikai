@@ -1,0 +1,142 @@
+# compiler/infer_index.kai -- persistent name index for the typing
+# environment.
+#
+# A NameIndex[a] maps a bucket key (a name's last ::-segment) to a chain
+# of payloads in newest-first order, so the typer answers "entries
+# registered under this name" in near-constant time instead of walking
+# the whole TyEnv.entries assoc list per call site.
+#
+# The structure is a height-balanced (AVL) tree keyed by the bucket
+# key's hash, each node carrying that bucket's newest-first chain. The
+# read-walk returns the chain BOUND at the matching node (never a value
+# threaded up through discarded siblings) -- the same shape the stdlib
+# AVL Map uses, which keeps Perceus from decref-ing a sub-structure it
+# still returns. Hash collisions between distinct bucket keys share a
+# node's chain; that is harmless -- every consumer re-applies the exact
+# name predicate over the returned chain, so a foreign entry is filtered
+# out, never returned.
+#
+# The chain order within a bucket equals the global insertion order
+# restricted to that bucket: every payload is prepended to both
+# TyEnv.entries and its bucket chain at the same moment. So a per-name
+# filtered walk over entries yields the identical subsequence as a walk
+# over the bucket chain -- this makes the index a behaviour-preserving
+# drop-in for the linear lookup.
+
+# Number of hash buckets. The bucket key's FNV-1a hash is reduced modulo
+# this; distinct names colliding on a bucket share one chain and are
+# separated by the consumer's exact predicate.
+fn index_buckets() : Int = 4096
+
+# Hash-keyed AVL node: bucket id, that bucket's newest-first chain, the
+# subtree height, and the two children.
+#[doc("infer_index: internal AVL node carrying a hash bucket's chain.")]
+pub type IndexNode[a] = IEmpty | INode(Int, [a], Int, IndexNode[a], IndexNode[a])
+
+#[doc("Persistent name index mapping bucket keys to newest-first payload chains.")]
+pub type NameIndex[a] = { root: IndexNode[a] }
+
+#[doc("The empty name index.")]
+pub fn idx_empty() : NameIndex[a] = NameIndex { root: IEmpty }
+
+# Bucket id for a key: the FNV-1a hash reduced to a non-negative value
+# in [0, index_buckets()). string_hash may be negative, so fold it
+# positive before the modulo. Arithmetic only -- no bit primitives, so
+# the bundle compiler (kaic1) can build this module too.
+fn idx_hash(key: String) : Int {
+  let m = index_buckets()
+  ((string_hash(key) % m) + m) % m
+}
+
+fn inode_height(t: IndexNode[a]) : Int = match t {
+  IEmpty                 -> 0
+  INode(_, _, h, _, _)   -> h
+}
+
+fn inode_mk(k: Int, chain: [a], l: IndexNode[a], r: IndexNode[a]) : IndexNode[a] {
+  let lh = inode_height(l)
+  let rh = inode_height(r)
+  let h = if lh > rh { lh + 1 } else { rh + 1 }
+  INode(k, chain, h, l, r)
+}
+
+fn inode_balance_factor(t: IndexNode[a]) : Int = match t {
+  IEmpty               -> 0
+  INode(_, _, _, l, r) -> inode_height(l) - inode_height(r)
+}
+
+fn inode_rotate_right(t: IndexNode[a]) : IndexNode[a] = match t {
+  INode(yk, yv, _, lt, t3) -> match lt {
+    INode(xk, xv, _, t1, t2) -> inode_mk(xk, xv, t1, inode_mk(yk, yv, t2, t3))
+    IEmpty                   -> t
+  }
+  IEmpty -> t
+}
+
+fn inode_rotate_left(t: IndexNode[a]) : IndexNode[a] = match t {
+  INode(xk, xv, _, t1, rt) -> match rt {
+    INode(yk, yv, _, t2, t3) -> inode_mk(yk, yv, inode_mk(xk, xv, t1, t2), t3)
+    IEmpty                   -> t
+  }
+  IEmpty -> t
+}
+
+fn inode_balance(t: IndexNode[a]) : IndexNode[a] {
+  let bf = inode_balance_factor(t)
+  if bf > 1 {
+    if inode_balance_factor(inode_left(t)) >= 0 { inode_rotate_right(t) }
+    else { inode_rotate_right(inode_with_left(t, inode_rotate_left(inode_left(t)))) }
+  } else if bf < (0 - 1) {
+    if inode_balance_factor(inode_right(t)) <= 0 { inode_rotate_left(t) }
+    else { inode_rotate_left(inode_with_right(t, inode_rotate_right(inode_right(t)))) }
+  } else { t }
+}
+
+fn inode_left(t: IndexNode[a]) : IndexNode[a] = match t {
+  IEmpty               -> IEmpty
+  INode(_, _, _, l, _) -> l
+}
+
+fn inode_right(t: IndexNode[a]) : IndexNode[a] = match t {
+  IEmpty               -> IEmpty
+  INode(_, _, _, _, r) -> r
+}
+
+fn inode_with_left(t: IndexNode[a], nl: IndexNode[a]) : IndexNode[a] = match t {
+  IEmpty                 -> IEmpty
+  INode(k, v, _, _, r)   -> inode_mk(k, v, nl, r)
+}
+
+fn inode_with_right(t: IndexNode[a], nr: IndexNode[a]) : IndexNode[a] = match t {
+  IEmpty                 -> IEmpty
+  INode(k, v, _, l, _)   -> inode_mk(k, v, l, nr)
+}
+
+# Prepend `payload` to bucket `key`'s chain, creating the node when the
+# bucket is new and rebalancing on the way back up.
+fn inode_prepend(t: IndexNode[a], key: Int, payload: a) : IndexNode[a] = match t {
+  IEmpty -> INode(key, [payload], 1, IEmpty, IEmpty)
+  INode(nk, nv, _, l, r) ->
+    if key == nk     { inode_mk(nk, [payload, ...nv], l, r) }
+    else if key < nk { inode_balance(inode_mk(nk, nv, inode_prepend(l, key, payload), r)) }
+    else             { inode_balance(inode_mk(nk, nv, l, inode_prepend(r, key, payload))) }
+}
+
+#[doc("Index a payload under bucket key, prepended newest-first.")]
+pub fn idx_prepend(ix: NameIndex[a], key: String, payload: a) : NameIndex[a] =
+  NameIndex { root: inode_prepend(ix.root, idx_hash(key), payload) }
+
+# Return bucket `key`'s newest-first chain, re-emitting the chain BOUND
+# at the matching node (the AVL Map idiom) so the read-walk never
+# threads a value up through a discarded sibling.
+fn inode_chain(t: IndexNode[a], key: Int) : [a] = match t {
+  IEmpty -> []
+  INode(nk, nv, _, l, r) ->
+    if key == nk     { nv }
+    else if key < nk { inode_chain(l, key) }
+    else             { inode_chain(r, key) }
+}
+
+#[doc("The newest-first payload chain registered under a bucket key; empty when none.")]
+pub fn idx_chain(ix: NameIndex[a], key: String) : [a] =
+  inode_chain(ix.root, idx_hash(key))
