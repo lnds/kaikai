@@ -1,0 +1,92 @@
+#[doc("""
+`StringBuilder` — an amortised text accumulator. Appending `n`
+fragments and building once is O(total length), not the O(n²) a
+left-fold of immutable `++` pays (each step copies the whole
+accumulator).
+
+Backed by a growable `Array[String]` of the fragments plus a live
+count; `build` joins them in a single pass (`string_concat_all`),
+one allocation for the result. The fragment array doubles on
+overflow, so `append` is amortised O(1).
+
+Effect discipline (observable-effects, `docs/effects-stdlib.md`
+§`Mutable`):
+  - **`append` / `append_char` ride `Mutable`.** They write the
+    builder's fragment array, which the caller shares — the
+    mutation is observable, exactly like `array_set` on a
+    parameter Array.
+  - **`build` / `len` / `is_empty` are PURE.** They only read the
+    array (`array_get` / `array_length`), and reads never demand
+    `Mutable`. A caller that creates a builder, appends, and
+    builds entirely locally has `Mutable` masked at its boundary,
+    the same way a local `array_make` + writes mask it.
+
+`append` returns a fresh `StringBuilder` carrying the updated count
+(kaikai has no record-update form); the fragment array is shared
+and mutated in place, so this stays O(1) — bind the result and use
+it linearly, as you would a `var` cell.
+""")]
+
+import core.list
+
+# Fragments live in a growable Array; `count` is how many slots are
+# in use (≤ the array's capacity). The unused tail holds the empty
+# string from `array_make` / `array_grow` and is never read.
+#[doc("An amortised O(1)-append text accumulator over a growable fragment array; `build` joins in one pass. `append` rides `Mutable`, `build` is pure.")]
+pub type StringBuilder = {
+  priv parts : Array[String],
+  priv count : Int
+}
+
+fn sb_initial_cap() : Int = 8
+
+#[doc("A fresh, empty `StringBuilder` with a default starting capacity.")]
+pub fn new() : StringBuilder =
+  StringBuilder { parts: array_make(sb_initial_cap(), ""), count: 0 }
+
+#[doc("""
+A fresh, empty `StringBuilder` sized to hold at least `cap`
+fragments before its first grow. `cap < 1` falls back to capacity
+1 — the array always has room for the first append.
+""")]
+pub fn with_capacity(cap: Int) : StringBuilder =
+  StringBuilder { parts: array_make(if cap < 1 { 1 } else { cap }, ""), count: 0 }
+
+# Append `s` at index `count`, growing (doubling) first when full.
+# The write targets the builder's shared array, so this is the
+# observable mutation that puts `Mutable` in the row.
+#[doc("Appends `s`, returning the updated builder. Rides `Mutable`: the builder's fragment array is mutated in place.")]
+pub fn append(sb: StringBuilder, s: String) : StringBuilder / Mutable = {
+  let cap = array_length(sb.parts)
+  if sb.count == cap {
+    let grown = array_grow(sb.parts, cap * 2, "")
+    grown[sb.count] := s
+    StringBuilder { parts: grown, count: sb.count + 1 }
+  } else {
+    sb.parts[sb.count] := s
+    StringBuilder { parts: sb.parts, count: sb.count + 1 }
+  }
+}
+
+#[doc("Appends a single character `c` (its UTF-8 encoding). Rides `Mutable`, like `append`.")]
+pub fn append_char(sb: StringBuilder, c: Char) : StringBuilder / Mutable =
+  append(sb, "#{c}")
+
+# Walk tail-to-head so the result is in append order with no
+# intermediate reverse — only `array_get`, so this stays pure.
+fn collect_loop(parts: Array[String], i: Int, acc: [String]) : [String] =
+  if i < 0 { acc } else { collect_loop(parts, i - 1, [parts[i], ...acc]) }
+
+#[doc("""
+The accumulated text, in append order. Pure: a single-pass join of
+the fragments (`string_concat_all`), one allocation for the
+result. `Mutable` is masked here — `build` only reads the array.
+""")]
+pub fn build(sb: StringBuilder) : String =
+  string_concat_all(collect_loop(sb.parts, sb.count - 1, []))
+
+#[doc("The number of fragments appended so far. Pure (a read).")]
+pub fn len(sb: StringBuilder) : Int = sb.count
+
+#[doc("Whether nothing has been appended yet. Pure (a read).")]
+pub fn is_empty(sb: StringBuilder) : Bool = sb.count == 0
