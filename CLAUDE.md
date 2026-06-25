@@ -80,6 +80,13 @@ cc stage0/*.c -o kaic0
 ./fizzbuzz
 ```
 
+## Build system — read before running the compiler or touching a Makefile
+
+Full map in **`docs/build-system.md`** (Makefile structure, the bundle, bootstrap chain, verification targets, parity harness, traps). The two rules that prevent the recurring time-sinks:
+
+- **To run/build kaikai code, use `./bin/kai run <file.kai>` / `./bin/kai build <file.kai> -o <out>`.** The wrapper resolves stdlib (`--path`), the backend, and the `cc`/link step. Do NOT call `kaic2` raw, pass `--path ../stdlib` yourself, or reconstruct a `cc … -I ../stage0` line from Makefile recipes.
+- **To rebuild the compiler after editing `stage2/compiler/*.kai`, run `make kaic2`** (C) or `make KAI_LLVM=1 kaic2` (native) from the repo root — it reassembles the `BUNDLE_SRCS` bundle and compiles. The root Makefile is a thin façade delegating to `stage0/1/2` via `$(MAKE) -C`; the compiler's own ~147 targets live in `stage2/Makefile` (`make -C stage2 <target>`). **`stage2/main.kai` is a 33-line stub, not the compiler** — the compiler is the concatenated `BUNDLE_SRCS` (~55 modules); a new module must be added there in dependency order.
+
 ## Testing discipline
 
 Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI in `.github/workflows/tier1.yml` (and `tier1-asan.yml`).
