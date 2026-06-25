@@ -4901,6 +4901,7 @@ test-shadowing: $(TARGET) build
 # exercises the same split + link discipline the driver ships.
 MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/multi-module/issue-237/main.kai \
+                   ../examples/multi-module/issue-898-qualified-generic/main.kai \
                    ../examples/multi-module/modular_stdlib_lambdas.kai \
                    ../examples/modules-qualified/basic/main.kai \
                    ../examples/modules-qualified/two_modules/main.kai \
