@@ -1,0 +1,89 @@
+# compiler/impl_index.kai — O(1) lookup index over a ProtocolReg's
+# immutable impl table (issue #916).
+#
+# reg.impls is one flat, prepend-built list of every registered impl.
+# The post-inference rewrite scans it linearly per call site and per
+# nominal cmp-binop, once per monomorphised spec. This module buckets
+# the table once at the lower_protocols boundary so each scan consults
+# a short bucket instead of the whole list.
+#
+# Equivalence to the linear scan rests on one invariant: a bucket holds
+# its entries in the SAME order as reg.impls, so the first bucket entry
+# matching a predicate is the first list entry matching it. The builder
+# folds impls front-to-back and appends, preserving that order; the
+# fine predicate (op + arg-names) runs over the bucket, as in the linear
+# path.
+#
+# Single-line `#[doc(...)]` only — kaic1 still consumes the bundle and
+# does not accept triple-quoted strings inside attributes.
+
+import compiler.ast
+import compiler.util
+
+# 256 is a fixed, power-of-two bucket count: deterministic (no input
+# affects it), and comfortably larger than the ~hundred impls a self-
+# compile registers, so collisions stay rare and buckets stay short.
+fn ii_nbuckets() : Int = 256
+
+#[doc("The unbuilt placeholder index. Lookups fall back to a linear scan.")]
+pub fn impl_index_empty() : ImplIndex =
+  ImplIndex { by_key: array_make(0, []), by_sym: array_make(0, []), nbuckets: 0 }
+
+# `string_hash` is FNV-1a cast through int64_t, so it may be negative.
+# `((h % n) + n) % n` lands in `[0, n)` for any sign; stage1 supports
+# only `%` and `+`, so no bit ops here.
+fn ii_slot(h: Int, n: Int) : Int = ((h % n) + n) % n
+
+# The hashed string for a `(proto, type)` key. The `|` separator (not
+# a valid identifier char) keeps `("Ab", "c")` and `("A", "bc")` apart.
+# Bucketing only affects distribution, never correctness: the fine
+# `(proto, type)` filter inside a bucket disambiguates any collision.
+fn ii_key_str(proto: String, type_: String) : String = concat_all([proto, "|", type_])
+
+fn ii_key_slot(proto: String, type_: String) : Int =
+  ii_slot(string_hash(ii_key_str(proto, type_)), ii_nbuckets())
+
+fn ii_sym_slot(sym: String) : Int = ii_slot(string_hash(sym), ii_nbuckets())
+
+# Accumulator threaded through the fill fold: the two bucket arrays
+# under construction.
+type IIAcc = { by_key: Array[[ProtoImplReg]], by_sym: Array[[ProtoImplReg]] }
+
+#[doc("Build the lookup index from an impl table. Bucket order mirrors `impls`.")]
+pub fn build_impl_index(impls: [ProtoImplReg]) : ImplIndex {
+  let acc0 = IIAcc { by_key: array_make(ii_nbuckets(), []),
+                     by_sym: array_make(ii_nbuckets(), []) }
+  let acc = ii_fill(impls, acc0)
+  ImplIndex { by_key: acc.by_key, by_sym: acc.by_sym, nbuckets: ii_nbuckets() }
+}
+
+# Fold `impls` front-to-back, appending each entry to the tail of its
+# `(proto, type)` and `impl_fn_name` buckets. Appending (not
+# prepending) is what preserves the `impls` order inside a bucket.
+fn ii_fill(impls: [ProtoImplReg], acc: IIAcc) : IIAcc / Mutable {
+  match impls {
+    [] -> acc
+    [pir, ...rest] -> match pir {
+      PIR(proto, type_, _, sym, _, _) -> {
+        let ks = ii_key_slot(proto, type_)
+        let ss = ii_sym_slot(sym)
+        let bk1 = array_set(acc.by_key, ks, list_append(array_get(acc.by_key, ks), [pir]))
+        let bs1 = array_set(acc.by_sym, ss, list_append(array_get(acc.by_sym, ss), [pir]))
+        ii_fill(rest, IIAcc { by_key: bk1, by_sym: bs1 })
+      }
+    }
+  }
+}
+
+#[doc("Impls sharing the `(proto, type)` key, in `impls` order. Empty when unbuilt.")]
+pub fn ii_key_bucket(idx: ImplIndex, proto: String, type_: String) : [ProtoImplReg] =
+  if idx.nbuckets == 0 { [] }
+  else { array_get(idx.by_key, ii_slot(string_hash(ii_key_str(proto, type_)), idx.nbuckets)) }
+
+#[doc("Impls sharing the `impl_fn_name` key, in `impls` order. Empty when unbuilt.")]
+pub fn ii_sym_bucket(idx: ImplIndex, sym: String) : [ProtoImplReg] =
+  if idx.nbuckets == 0 { [] }
+  else { array_get(idx.by_sym, ii_slot(string_hash(sym), idx.nbuckets)) }
+
+#[doc("True when the index is built (lookups use buckets, not the linear fallback).")]
+pub fn ii_built(idx: ImplIndex) : Bool = idx.nbuckets != 0
