@@ -1055,22 +1055,44 @@ fn lookup_poly_fn(polys: [PolyFn], name: String) : Option[Decl] {
   }
 }
 
-# True iff `name` is defined as a poly fn by module `modn` AND by no other
-# module. A qualified call `modn.name(...)` is only a safe monomorphisation
-# target then: the spec-generation worklist keys tuples by bare name
-# (`generate_specs_iter` → `lookup_poly_fn`), so a name shared across two
-# modules (`list.map` vs `stream.map`) cannot be disambiguated — the
-# generator would emit the first module's spec while the call site demands
-# the other's, leaving an undeclared symbol. When the name is unique to one
-# module, the bare-name lookup is unambiguous and the rewrite is sound.
-# (`map.filter`, which is tparam-less, is not in `polys` at all, so it also
-# fails this guard and stays an ordinary generic call.)
-fn poly_fn_unique_in_module(polys: [PolyFn], name: String, modn: String) : Bool =
-  poly_fn_module_count(polys, name) == 1 and poly_fn_has_module(polys, name, modn)
+# Pick the poly `DFn` a spec tuple specialises. A module-tagged tuple
+# (`Some(m)`, from a qualified call to a name two modules share) must bind
+# to that module's decl so the spec carries `mo = Some(m)` and emits the
+# matching `kai_<m>__…` symbol. An untagged tuple (`None`) keeps the
+# bare-name lookup — UNLESS the name is shared across modules, where a bare
+# tuple is inherently ambiguous (e.g. a spec's self-recursion surfaces as a
+# bare `EVar` and is already retargeted by `retarget_self_calls_decl`); such
+# tuples are dropped so the per-module `Some(m)` specs are the only ones emitted.
+fn lookup_poly_fn_for(polys: [PolyFn], name: String, mo: Option[String]) : Option[Decl] =
+  match mo {
+    None    -> if name_shared(polys, name) { None }
+               else { lookup_poly_fn(polys, name) }
+    Some(m) -> lookup_poly_fn_in_module(polys, name, m)
+  }
+
+fn lookup_poly_fn_in_module(polys: [PolyFn], name: String, modn: String) : Option[Decl] {
+  match polys {
+    [] -> None
+    [p, ...rest] -> match p {
+      PFn(n, d) ->
+        if n == name and poly_decl_mo_is(d, modn) { Some(d) }
+        else { lookup_poly_fn_in_module(rest, name, modn) }
+    }
+  }
+}
 
 # Count how many DISTINCT modules define a poly fn named `name`.
 fn poly_fn_module_count(polys: [PolyFn], name: String) : Int =
   count_distinct_mods(poly_mods_for(polys, name), [])
+
+# True when two-or-more modules define a poly fn `name`: its specs must be
+# keyed by module, and a bare call to it is ambiguous without a host module.
+fn name_shared(polys: [PolyFn], name: String) : Bool =
+  poly_fn_module_count(polys, name) > 1
+
+# `name_shared` AND module `modn` is one of the definers.
+fn name_shared_in(polys: [PolyFn], name: String, modn: String) : Bool =
+  name_shared(polys, name) and poly_fn_has_module(polys, name, modn)
 
 fn poly_mods_for(polys: [PolyFn], name: String) : [String] {
   match polys {
@@ -1115,16 +1137,24 @@ fn poly_decl_mo_is(d: Decl, modn: String) : Bool = match poly_decl_mo(d) {
   None    -> false
 }
 
-# Resolved call-site tuples keyed by (name, [Ty], [UnitExprT]).
+# Resolved call-site tuples keyed by (callee module, name, [Ty], [UnitExprT]).
 # Stored as a flat list; lookup is O(n × m) but the input is
 # bounded by the program's total call-site count which is small in
-# practice.
-type MonoTuple = MT(String, [Ty], [UnitExprT])
+# practice. The module slot distinguishes two same-named generics from
+# different modules (`a.reduce[Int]` vs `b.reduce[Int]`): they must emit
+# separate specs under `kai_a__…` / `kai_b__…`. `None` is the unqualified
+# /module-unique case, where the bare name already picks a single decl.
+type MonoTuple = MT(Option[String], String, [Ty], [UnitExprT])
 
 fn tuple_eq(a: MonoTuple, b: MonoTuple) : Bool =
-  match a { MT(an, atys, aus) -> match b { MT(bn, btys, bus) ->
-    an == bn and ty_list_eq(atys, btys) and unit_list_eq(aus, bus)
+  match a { MT(amo, an, atys, aus) -> match b { MT(bmo, bn, btys, bus) ->
+    mt_mo_eq(amo, bmo) and an == bn and ty_list_eq(atys, btys) and unit_list_eq(aus, bus)
   }}
+
+fn mt_mo_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true Some(_) -> false }
+  Some(x) -> match b { Some(y) -> x == y None -> false }
+}
 
 fn ty_list_eq(a: [Ty], b: [Ty]) : Bool =
   match a {
@@ -1216,8 +1246,13 @@ fn collect_distinct_tuples(insts: [ResolvedCS], polys: [PolyFn],
         }
         let any_slot = list_length(tys) > 0 or list_length(units) > 0
         let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
-        let mt = MT(name, tys, units)
-        if is_poly and concrete and not tuple_in(acc, mt) {
+        # The typer's RCS carries the *caller*'s module, not the callee's,
+        # so a name shared by two modules cannot be split here. Skip those:
+        # the AST-walking discovery pass sees each `EModCall(mod, name)` and
+        # seeds a module-tagged tuple, so the per-module spec is still emitted.
+        let shared = name_shared(polys, name)
+        let mt = MT(None, name, tys, units)
+        if is_poly and concrete and not shared and not tuple_in(acc, mt) {
           collect_distinct_tuples(rest, polys, [mt, ...acc])
         } else {
           collect_distinct_tuples(rest, polys, acc)
@@ -1450,7 +1485,7 @@ type SpecEmitOut = SEO(Decl, [MonoTuple], [MLeakRecord])
 fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
               all_tuples: [MonoTuple], reg: ProtocolReg,
               local_arities: [OpAr]) : SpecEmitOut {
-  match mt { MT(_, tys, units) -> {
+  match mt { MT(_, _, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
     let spec0 = specialise_decl(d, tys, units)
     let spec1a = subst_decl(spec0, sm)
@@ -1467,9 +1502,13 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     # a shadowed bare name keeps the user fn (not the impl).
     let spec1 = resolve_protocol_calls_decl(spec1a, reg, local_arities)
     # Discover transitive tuples introduced by body subst: for each
-    # ECall(EVar(name)) inside the spec body, look up the original
-    # CS, apply sm, and collect concrete poly tuples not yet known.
-    let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
+    # ECall(EVar(name)) inside the spec body, look up the original CS,
+    # apply sm, and collect concrete poly tuples not yet known. The spec's
+    # module (`host_mo`) tags any bare call to a module-shared helper (e.g.
+    # `agg.fold_from`'s body calling the private `collapse_loop` that `prod`
+    # also defines), so each module's spec is emitted and links cleanly.
+    let host_mo = poly_decl_mo(d)
+    let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm, host_mo)
     let updated_tuples = list_append(all_tuples, new_tuples)
     let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
     # Issue #680: self-recursive calls inside a spec body must retarget
@@ -1581,14 +1620,14 @@ fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
     [] -> acc
     [d, ...rest] -> {
       let acc1 = match d {
-        DFn(_, _, _, _, _, _, body, _, _, _) ->
-          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+        DFn(_, _, _, _, _, _, body, _, _, mo) ->
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc, mo)
         DTest(_, body, _, _) ->
-          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc, None)
         DBench(_, body, _, _) ->
-          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc, None)
         DCheck(_, _, body, _, _) ->
-          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc)
+          discover_new_tuples_expr(body, [], polys, existing, subst_map_empty(), acc, None)
         _ -> acc
       }
       collect_impl_tuples_in_decls_loop(rest, polys, existing, acc1)
@@ -1597,33 +1636,37 @@ fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
 }
 
 fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap) : [MonoTuple] {
+                             existing: [MonoTuple], sm: SubstMap, host_mo: Option[String]) : [MonoTuple] {
   match d {
     DFn(_, _, _, _, _, _, body, _, _, _) ->
-      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, [], host_mo))
     DTest(_, body, _, _) ->
-      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, [], host_mo))
     DBench(_, body, _, _) ->
-      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, [], host_mo))
     DCheck(_, _, body, _, _) ->
-      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, [], host_mo))
     _ -> []
   }
 }
 
 fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
                              existing: [MonoTuple], sm: SubstMap,
-                             acc: [MonoTuple]) : [MonoTuple] {
-  let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
+                             acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
+  let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc, host_mo)
   match e.kind {
     ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> discover_call_tuple(name, callee, args_, insts, polys, existing, sm, acc1)
-      # A qualified call `mod.fn(...)` seeds the same spec as the bare form,
-      # but only when `fn` is a `[T:P]` generic unique to `mod` — the
-      # rewriter applies the same guard, so the two stay in lockstep.
+      EVar(name) -> discover_call_tuple(name, None, callee, args_, insts, polys, existing, sm, acc1, host_mo)
+      # A qualified call `mod.fn(...)` seeds a spec only when `fn` is a
+      # `[T:P]` generic that `mod` actually defines. When the name is unique
+      # to one module the tuple stays `None` (the bare-name `DFn` lookup
+      # already carries the right `mo`); when two modules share the name the
+      # tuple is tagged `Some(mod)` so each emits its own per-module spec and
+      # the rewriter retargets to the matching `kai_<mod>__…` symbol.
       EModCall(modn, name) ->
-        if poly_fn_unique_in_module(polys, name, modn) {
-          discover_call_tuple(name, callee, args_, insts, polys, existing, sm, acc1)
+        if poly_fn_has_module(polys, name, modn) {
+          let cmo = if name_shared(polys, name) { Some(modn) } else { None }
+          discover_call_tuple(name, cmo, callee, args_, insts, polys, existing, sm, acc1, host_mo)
         } else { acc1 }
       _ -> acc1
     }
@@ -1631,10 +1674,10 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
   }
 }
 
-fn discover_call_tuple(name: String, callee: Expr, args_: [Expr],
+fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [Expr],
                         insts: [ResolvedCS], polys: [PolyFn],
                         existing: [MonoTuple], sm: SubstMap,
-                        acc1: [MonoTuple]) : [MonoTuple] {
+                        acc1: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   let is_user_poly = match lookup_poly_fn(polys, name) {
     Some(_) -> true None -> false
   }
@@ -1645,7 +1688,12 @@ fn discover_call_tuple(name: String, callee: Expr, args_: [Expr],
         MIPair(tys, units) -> {
           let any_slot = list_length(tys) > 0 or list_length(units) > 0
           let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
-          let mt = MT(name, tys, units)
+          # Canonicalise the module tag BEFORE the novelty test: a bare call
+          # to a module-shared name is re-tagged with the host module, so the
+          # dedup compares the same form the worklist already holds and the
+          # spec fixpoint converges. `mt_retag_bare_shared` is idempotent on
+          # an already-tagged `Some(_)` tuple (an `EModCall` callee).
+          let mt = mt_retag_bare_shared(MT(cmo, name, tys, units), polys, host_mo)
           let is_new = concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
           if is_new { [mt, ...acc1] } else { acc1 }
         }
@@ -1667,7 +1715,7 @@ fn mt_in_acc(acc: [MonoTuple], t: MonoTuple) : Bool {
 # mono_map_expr_kind shape but with a fold accumulator.
 fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
                              existing: [MonoTuple], sm: SubstMap,
-                             acc: [MonoTuple]) : [MonoTuple] {
+                             acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match k {
     EInt(_)        -> acc
     EReal(_, _)       -> acc
@@ -1683,77 +1731,77 @@ fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
     EExternBody(_) -> acc
     EVariantsOf(_, _) -> acc
     EModCall(_, _) -> acc
-    EIntrinsic(_, args_) -> discover_new_tuples_args(args_, insts, polys, existing, sm, acc)
+    EIntrinsic(_, args_) -> discover_new_tuples_args(args_, insts, polys, existing, sm, acc, host_mo)
     ECall(callee, args_) -> {
-      let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
-      discover_new_tuples_args(args_, insts, polys, existing, sm, acc1)
+      let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc, host_mo)
+      discover_new_tuples_args(args_, insts, polys, existing, sm, acc1, host_mo)
     }
-    EField(base, _)   -> discover_new_tuples_expr(base, insts, polys, existing, sm, acc)
+    EField(base, _)   -> discover_new_tuples_expr(base, insts, polys, existing, sm, acc, host_mo)
     EIndex(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
     EBinop(_, a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
-    EUnop(_, x)       -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
+    EUnop(_, x)       -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc, host_mo)
     EIf(c, t_, eo)    -> {
-      let a1 = discover_new_tuples_expr(c, insts, polys, existing, sm, acc)
-      let a2 = discover_new_tuples_expr(t_, insts, polys, existing, sm, a1)
-      match eo { Some(eb) -> discover_new_tuples_expr(eb, insts, polys, existing, sm, a2) None -> a2 }
+      let a1 = discover_new_tuples_expr(c, insts, polys, existing, sm, acc, host_mo)
+      let a2 = discover_new_tuples_expr(t_, insts, polys, existing, sm, a1, host_mo)
+      match eo { Some(eb) -> discover_new_tuples_expr(eb, insts, polys, existing, sm, a2, host_mo) None -> a2 }
     }
     EMatch(scr, arms) -> {
-      let a1 = discover_new_tuples_expr(scr, insts, polys, existing, sm, acc)
-      discover_new_tuples_arms(arms, insts, polys, existing, sm, a1)
+      let a1 = discover_new_tuples_expr(scr, insts, polys, existing, sm, acc, host_mo)
+      discover_new_tuples_arms(arms, insts, polys, existing, sm, a1, host_mo)
     }
-    ELambda(_, b)     -> discover_new_tuples_expr(b, insts, polys, existing, sm, acc)
-    ERecordLit(_, fs) -> discover_new_tuples_fields(fs, insts, polys, existing, sm, acc)
-    EList(els)        -> discover_new_tuples_elems(els, insts, polys, existing, sm, acc)
+    ELambda(_, b)     -> discover_new_tuples_expr(b, insts, polys, existing, sm, acc, host_mo)
+    ERecordLit(_, fs) -> discover_new_tuples_fields(fs, insts, polys, existing, sm, acc, host_mo)
+    EList(els)        -> discover_new_tuples_elems(els, insts, polys, existing, sm, acc, host_mo)
     ERange(a, b, opt_step) -> {
-      let a1 = discover_new_tuples_expr(a, insts, polys, existing, sm, acc)
-      let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
-      match opt_step { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a2) None -> a2 }
+      let a1 = discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo)
+      let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1, host_mo)
+      match opt_step { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a2, host_mo) None -> a2 }
     }
     EBlock(stmts, tail) -> {
-      let a1 = discover_new_tuples_stmts(stmts, insts, polys, existing, sm, acc)
-      match tail { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
+      let a1 = discover_new_tuples_stmts(stmts, insts, polys, existing, sm, acc, host_mo)
+      match tail { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1, host_mo) None -> a1 }
     }
     EPipe(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
     EMapPipe(a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
     EFlatMapPipe(a, b) -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                            discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                            discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
     EFilterPipe(a, b) -> discover_new_tuples_expr(b, insts, polys, existing, sm,
-                           discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                           discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let a1 = discover_new_tuples_expr(body, insts, polys, existing, sm, acc)
-      let a2 = match init_opt { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
-      let a3 = discover_new_tuples_clauses(clauses, insts, polys, existing, sm, a2)
-      match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> discover_new_tuples_expr(b, insts, polys, existing, sm, a3) } None -> a3 }
+      let a1 = discover_new_tuples_expr(body, insts, polys, existing, sm, acc, host_mo)
+      let a2 = match init_opt { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1, host_mo) None -> a1 }
+      let a3 = discover_new_tuples_clauses(clauses, insts, polys, existing, sm, a2, host_mo)
+      match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> discover_new_tuples_expr(b, insts, polys, existing, sm, a3, host_mo) } None -> a3 }
     }
-    ELitUnit(inner, _) -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
-    EBang(inner)       -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
+    ELitUnit(inner, _) -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc, host_mo)
+    EBang(inner)       -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc, host_mo)
   }
 }
 
 fn discover_new_tuples_args(args: [Expr], insts: [ResolvedCS], polys: [PolyFn],
                              existing: [MonoTuple], sm: SubstMap,
-                             acc: [MonoTuple]) : [MonoTuple] {
+                             acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match args {
     [] -> acc
     [a, ...rest] -> discover_new_tuples_args(rest, insts, polys, existing, sm,
-                      discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+                      discover_new_tuples_expr(a, insts, polys, existing, sm, acc, host_mo), host_mo)
   }
 }
 
 fn discover_new_tuples_arms(arms: [Arm], insts: [ResolvedCS], polys: [PolyFn],
                              existing: [MonoTuple], sm: SubstMap,
-                             acc: [MonoTuple]) : [MonoTuple] {
+                             acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match arms {
     [] -> acc
     [arm, ...rest] -> match arm {
       Arm(_, g, b) -> {
-        let a1 = match g { Some(ge) -> discover_new_tuples_expr(ge, insts, polys, existing, sm, acc) None -> acc }
-        let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
-        discover_new_tuples_arms(rest, insts, polys, existing, sm, a2)
+        let a1 = match g { Some(ge) -> discover_new_tuples_expr(ge, insts, polys, existing, sm, acc, host_mo) None -> acc }
+        let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1, host_mo)
+        discover_new_tuples_arms(rest, insts, polys, existing, sm, a2, host_mo)
       }
     }
   }
@@ -1761,60 +1809,60 @@ fn discover_new_tuples_arms(arms: [Arm], insts: [ResolvedCS], polys: [PolyFn],
 
 fn discover_new_tuples_fields(fs: [FieldInit], insts: [ResolvedCS], polys: [PolyFn],
                                existing: [MonoTuple], sm: SubstMap,
-                               acc: [MonoTuple]) : [MonoTuple] {
+                               acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match fs {
     [] -> acc
     [f, ...rest] -> match f {
       FI(_, v) -> discover_new_tuples_fields(rest, insts, polys, existing, sm,
-                    discover_new_tuples_expr(v, insts, polys, existing, sm, acc))
+                    discover_new_tuples_expr(v, insts, polys, existing, sm, acc, host_mo), host_mo)
     }
   }
 }
 
 fn discover_new_tuples_elems(els: [ListElem], insts: [ResolvedCS], polys: [PolyFn],
                               existing: [MonoTuple], sm: SubstMap,
-                              acc: [MonoTuple]) : [MonoTuple] {
+                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match els {
     [] -> acc
     [el, ...rest] -> {
       let acc1 = match el {
-        ElPlain(x)  -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
-        ElSpread(x) -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        ElPlain(x)  -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc, host_mo)
+        ElSpread(x) -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc, host_mo)
       }
-      discover_new_tuples_elems(rest, insts, polys, existing, sm, acc1)
+      discover_new_tuples_elems(rest, insts, polys, existing, sm, acc1, host_mo)
     }
   }
 }
 
 fn discover_new_tuples_stmts(stmts: [Stmt], insts: [ResolvedCS], polys: [PolyFn],
                               existing: [MonoTuple], sm: SubstMap,
-                              acc: [MonoTuple]) : [MonoTuple] {
+                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match stmts {
     [] -> acc
     [s, ...rest] -> {
       let acc1 = match s {
-        SLet(_, _, rhs)            -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
-        SAssert(c, m)              -> match m { Some(me) -> discover_new_tuples_expr(me, insts, polys, existing, sm, discover_new_tuples_expr(c, insts, polys, existing, sm, acc)) None -> discover_new_tuples_expr(c, insts, polys, existing, sm, acc) }
-        SExprStmt(x)               -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        SLet(_, _, rhs)            -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc, host_mo)
+        SAssert(c, m)              -> match m { Some(me) -> discover_new_tuples_expr(me, insts, polys, existing, sm, discover_new_tuples_expr(c, insts, polys, existing, sm, acc, host_mo), host_mo) None -> discover_new_tuples_expr(c, insts, polys, existing, sm, acc, host_mo) }
+        SExprStmt(x)               -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc, host_mo)
         SIndexAssign(b, i, v, _, _)-> discover_new_tuples_expr(v, insts, polys, existing, sm,
                                         discover_new_tuples_expr(i, insts, polys, existing, sm,
-                                          discover_new_tuples_expr(b, insts, polys, existing, sm, acc)))
-        SVar(_, _, rhs, _, _)      -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
+                                          discover_new_tuples_expr(b, insts, polys, existing, sm, acc, host_mo), host_mo), host_mo)
+        SVar(_, _, rhs, _, _)      -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc, host_mo)
         SUse(_, _, _)              -> acc
       }
-      discover_new_tuples_stmts(rest, insts, polys, existing, sm, acc1)
+      discover_new_tuples_stmts(rest, insts, polys, existing, sm, acc1, host_mo)
     }
   }
 }
 
 fn discover_new_tuples_clauses(cs: [HClause], insts: [ResolvedCS], polys: [PolyFn],
                                 existing: [MonoTuple], sm: SubstMap,
-                                acc: [MonoTuple]) : [MonoTuple] {
+                                acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match cs {
     [] -> acc
     [c, ...rest] -> match c {
       HC(_, _, b, _, _) -> discover_new_tuples_clauses(rest, insts, polys, existing, sm,
-                            discover_new_tuples_expr(b, insts, polys, existing, sm, acc))
+                            discover_new_tuples_expr(b, insts, polys, existing, sm, acc, host_mo), host_mo)
     }
   }
 }
@@ -1824,81 +1872,107 @@ fn discover_new_tuples_clauses(cs: [HClause], insts: [ResolvedCS], polys: [PolyF
 # applied to the looked-up `(tys, units)` at each call site so that
 # internal polymorphic-flow-through calls retarget to their spec
 # mangled names.
+# The callee module a bare call retargets to: `Some(host)` for a
+# module-shared name (binds to the enclosing module's spec), else `None`.
+fn bare_callee_mo(polys: [PolyFn], name: String, host_mo: Option[String]) : Option[String] =
+  match host_mo {
+    None    -> None
+    Some(m) ->
+      if name_shared_in(polys, name, m) { Some(m) }
+      else { None }
+  }
+
+# Build the retargeted callee for a bare call: an `EModCall` into the host
+# module when the spec is module-tagged, else a plain `EVar`.
+fn bare_spec_callee(callee: Expr, mangled: String, bmo: Option[String]) : Expr =
+  match bmo {
+    Some(m) -> Expr { kind: EModCall(m, mangled),
+                      line: callee.line, col: callee.col, ty: callee.ty, mode: callee.mode }
+    None    -> Expr { kind: EVar(mangled),
+                      line: callee.line, col: callee.col, ty: callee.ty, mode: callee.mode }
+  }
+
 fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
                               sm: SubstMap) : Decl {
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, tps, ps, ret, row,
-          rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
+          rewrite_callsites_expr_sm(body, insts, tuples, polys, sm, mo), l, c, mo)
     DTest(desc, body, l, c) ->
-      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
+      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm, None), l, c)
     DBench(desc, body, l, c) ->
-      DBench(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
+      DBench(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm, None), l, c)
     DCheck(desc, ps, body, l, c) ->
-      DCheck(desc, ps, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c)
+      DCheck(desc, ps, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm, None), l, c)
     _ -> d
   }
 }
 
+# `host_mo` is the module of the enclosing decl. A bare call to a
+# module-shared name resolves to the host module's spec (a private helper
+# two modules share belongs to whichever module's body calls it).
 fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
-                              sm: SubstMap) : Expr =
-  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm),
+                              sm: SubstMap, host_mo: Option[String]) : Expr =
+  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm, host_mo),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
                               tuples: [MonoTuple], polys: [PolyFn],
-                              sm: SubstMap) : ExprKind {
+                              sm: SubstMap, host_mo: Option[String]) : ExprKind {
   match k {
-    ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> {
-        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm))
-        match resolve_call_inst(insts, polys, name, callee, args_, sm) {
-          Some(MIPair(tys, units)) ->
-            if tuple_in(tuples, MT(name, tys, units)) {
-              let mangled = mono_mangle_name(name, tys, units)
-              let new_callee = Expr { kind: EVar(mangled),
-                                       line: callee.line, col: callee.col,
-                                       ty: callee.ty, mode: callee.mode }
-              ECall(new_callee, new_args)
-            } else {
-              ECall(callee, new_args)
-            }
-          None -> ECall(callee, new_args)
-        }
+    ECall(callee, args_) -> {
+      let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm, host_mo))
+      match callee.kind {
+        EVar(name) -> rewrite_bare_call(name, callee, new_args, insts, tuples, polys, sm, host_mo)
+        EModCall(modn, name) -> rewrite_qualified_call(modn, name, callee, new_args, insts, tuples, polys, sm)
+        _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm, host_mo), new_args)
       }
-      # A qualified call `mod.fn(...)` is `ECall(EModCall(mod, fn), ...)`.
-      # Only retarget it when `fn` is a `[T:P]` generic UNIQUE to `mod`. The
-      # typer records an inst for every qualified callee, and the spec
-      # worklist keys by bare name, so retargeting a name shared by two
-      # modules (`list.map` / `stream.map`) or a tparam-less qualified fn
-      # (`map.filter`) would demand a spec the generator never emits.
-      EModCall(modn, name) -> {
-        let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm))
-        if not poly_fn_unique_in_module(polys, name, modn) { ECall(callee, new_args) }
-        else {
-          match resolve_call_inst(insts, polys, name, callee, args_, sm) {
-            Some(MIPair(tys, units)) ->
-              if tuple_in(tuples, MT(name, tys, units)) {
-                let mangled = mono_mangle_name(name, tys, units)
-                let new_callee = Expr { kind: EModCall(modn, mangled),
-                                         line: callee.line, col: callee.col,
-                                         ty: callee.ty, mode: callee.mode }
-                ECall(new_callee, new_args)
-              } else {
-                ECall(callee, new_args)
-              }
-            None -> ECall(callee, new_args)
-          }
-        }
-      }
-      _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm),
-                  map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm)))
     }
-    _ -> mono_map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, polys, sm))
+    _ -> mono_map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, polys, sm, host_mo))
   }
 }
+
+# Retarget a bare call `f(args)` to its `__mono__` spec. A module-shared
+# name binds to the host module's spec via an `EModCall` callee (minting
+# `kai_<host>__…`); a unique name keeps the bare `EVar(mangled)` callee.
+fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr],
+                      insts: [ResolvedCS], tuples: [MonoTuple], polys: [PolyFn],
+                      sm: SubstMap, host_mo: Option[String]) : ExprKind =
+  match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
+    Some(MIPair(tys, units)) -> {
+      let bmo = bare_callee_mo(polys, name, host_mo)
+      if tuple_in(tuples, MT(bmo, name, tys, units)) {
+        let mangled = mono_mangle_name(name, tys, units)
+        ECall(bare_spec_callee(callee, mangled, bmo), new_args)
+      } else { ECall(callee, new_args) }
+    }
+    None -> ECall(callee, new_args)
+  }
+
+# Retarget a qualified call `mod.fn(args)` to its `__mono__` spec when `mod`
+# defines a `[T:P]` generic of that name. The tuple is module-tagged exactly
+# when the name is shared across modules (mirroring discovery); a tparam-less
+# qualified fn (`map.filter`) is not in `polys` and stays a generic call.
+fn rewrite_qualified_call(modn: String, name: String, callee: Expr, new_args: [Expr],
+                           insts: [ResolvedCS], tuples: [MonoTuple], polys: [PolyFn],
+                           sm: SubstMap) : ExprKind =
+  if not poly_fn_has_module(polys, name, modn) { ECall(callee, new_args) }
+  else {
+    let cmo = if name_shared(polys, name) { Some(modn) } else { None }
+    match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
+      Some(MIPair(tys, units)) ->
+        if tuple_in(tuples, MT(cmo, name, tys, units)) {
+          let mangled = mono_mangle_name(name, tys, units)
+          let new_callee = Expr { kind: EModCall(modn, mangled),
+                                   line: callee.line, col: callee.col,
+                                   ty: callee.ty, mode: callee.mode }
+          ECall(new_callee, new_args)
+        } else { ECall(callee, new_args) }
+      None -> ECall(callee, new_args)
+    }
+  }
 
 # Collect every RCS recorded at one `(name, line, col)` source
 # position. A position is shared by more than one instantiation when
@@ -2016,7 +2090,7 @@ fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
                         local_arities: [OpAr]) : GenSpecsResult {
   match worklist {
     [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples, list_reverse(leaks_acc))
-    [t, ...rest] -> match lookup_poly_fn(polys, mt_name(t)) {
+    [t, ...rest] -> match lookup_poly_fn_for(polys, mt_name(t), mt_mo(t)) {
       None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg, local_arities)
       Some(d) -> {
         let r = emit_spec(d, t, insts, polys, all_tuples, reg, local_arities)
@@ -2042,7 +2116,27 @@ fn prepend_leaks(xs: [MLeakRecord], acc: [MLeakRecord]) : [MLeakRecord] {
 }
 
 fn mt_name(t: MonoTuple) : String =
-  match t { MT(n, _, _) -> n }
+  match t { MT(_, n, _, _) -> n }
+
+fn mt_mo(t: MonoTuple) : Option[String] =
+  match t { MT(mo, _, _, _) -> mo }
+
+# Re-tag a bare (`None`) tuple for a module-shared name with `host_mo`, the
+# module of the spec whose body produced it. A private helper two modules
+# share (`collapse_loop`) called bare inside one module's spec belongs to
+# that module; tagging it picks the right per-module spec. Untagged tuples
+# (unique names, or `host_mo` absent) pass through unchanged.
+fn mt_retag_bare_shared(t: MonoTuple, polys: [PolyFn], host_mo: Option[String]) : MonoTuple =
+  match mt_mo(t) {
+    Some(_) -> t
+    None -> match host_mo {
+      None    -> t
+      Some(m) ->
+        if name_shared_in(polys, mt_name(t), m) {
+          match t { MT(_, n, tys, units) -> MT(Some(m), n, tys, units) }
+        } else { t }
+    }
+  }
 
 fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
   match d {
