@@ -38,7 +38,7 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # the native shim. Threaded explicitly to the FFI-fn lowering
   # (narrower than a LowerSt field).
   let freg    = collect_extern_types(raw_decls)
-  let kfns    = lower_fns(raw_decls, st0, freg, [])
+  let kfns    = lower_fns(raw_decls, st0, freg, fns_by_mod_new(fns), [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
@@ -62,14 +62,20 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [EVar]) : LamCollect / Cons
 
 # --- Ordinary functions -------------------------------------------------
 
-fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], acc: [KFn]) : [KFn] / Console = match ds {
+# `fbm` memoises the per-module EFn-table rotation by module origin (one
+# entry per distinct module, not per fn body) — the `O(n²)` retention the
+# per-body rebuild caused on a self-compile. Threaded like the C emitter's
+# `fn_bodies_loop`: each body reads its rotated table from the cache and
+# passes the grown cache to the next decl.
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, acc: [KFn]) : [KFn] / Console = match ds {
   [] -> acc
   [d, ...rest] -> match d {
     DFn(_, name, _, params, ret_ty, _, body, _, _, mo) -> {
-      let kfn = lower_fn(name, params, ret_ty, body, mo, st, freg)
-      lower_fns(rest, st, freg, list_append(acc, [kfn]))
+      let r = fns_prefer_module_cached(fbm, mo)
+      let kfn = lower_fn(name, params, ret_ty, body, mo, r.table, st, freg)
+      lower_fns(rest, st, freg, r.cache, list_append(acc, [kfn]))
     }
-    _ -> lower_fns(rest, st, freg, acc)
+    _ -> lower_fns(rest, st, freg, fbm, acc)
   }
 }
 
@@ -78,14 +84,14 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], acc: [KFn]) : [KFn]
 # The body lowers into the entry block and whatever blocks the control
 # flow forks off; the final value seals the last block with `KRet`.
 fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
-            body: Expr, mo: Option[String], st0: LowerSt, freg: [ExternTypeReg]) : KFn / Console {
+            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg]) : KFn / Console {
   let sym = c_sym(name, mo)
-  # Enter WITH the EFn table rotated to prefer `mo` (this fn's module), so a
-  # bare call inside the body resolves to a same-module definition over an
-  # imported homonym — the C / LLVM emitters do the same via
-  # `fns_prefer_module` before each body. (`hashset.from_list`'s `empty()`
-  # resolved to the imported `hashmap.empty` without this — `no such field`.)
-  let st = ls_enter_fn_in(st0, sym, param_local_names(params, []), mo)
+  # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
+  # module) by the cached `lower_fns` loop, so a bare call inside the body
+  # resolves to a same-module definition over an imported homonym — the C /
+  # LLVM emitters do the same. (`hashset.from_list`'s `empty()` resolved to
+  # the imported `hashmap.empty` without this — `no such field`.)
+  let st = ls_enter_fn_with(st0, sym, param_local_names(params, []), body_fns)
   # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
   # applied the no-tparams / no-FFI / no-effect-row gates and computed the
   # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
