@@ -2617,7 +2617,9 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/array_mutable_explicit.kai \
 	         ../examples/effects/array_read_only_no_mutable.kai \
-	         ../examples/effects/array_local_masks_mutable.kai; do \
+	         ../examples/effects/array_local_masks_mutable.kai \
+	         ../examples/effects/array_record_forward_explicit.kai \
+	         ../examples/effects/array_record_local_masks_mutable.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -2657,7 +2659,8 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (user handler did not shadow base default)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/array_mutable_required.kai \
-	         ../examples/effects/string_builder_append_requires_mutable.kai; do \
+	         ../examples/effects/string_builder_append_requires_mutable.kai \
+	         ../examples/effects/array_record_forward_requires_mutable.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=$${f%.kai}.err.expected; \
 	  rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
