@@ -52,7 +52,7 @@ test-multi-module: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	kai="$$root/bin/kai"; \
-	for case in multi-module multi-module/issue-237 multi-module/issue-897-shadow multi-module/pipe_custom_type multi-module/pipe_two_types_same_pkg; do \
+	for case in multi-module multi-module/issue-237 multi-module/issue-897-shadow multi-module/issue-898-qualified-generic multi-module/pipe_custom_type multi-module/pipe_two_types_same_pkg; do \
 	  src_dir="$$root/examples/$$case"; \
 	  exp="$$src_dir/main.out.expected"; \
 	  out_abs=$$(mktemp); \
