@@ -84,6 +84,77 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.91.0 (2026-06-25)
+
+### Added
+
+- **stdlib**: add StringBuilder — amortised O(n) text accumulator
+- **stdlib**: generalise [Int]-only aggregates to protocol-bounded type params
+- **typer**: protocol bounds on free-fn type params
+- **runtime**: KAI_MAX_HEAP heap ceiling for host containment
+- **native**: FFI v2 fixed-width marshalling + struct WIP on native backend
+- **stdlib**: make collection pipe-participation coherent
+- **typer**: thread effect rows through nominal carrier slots (Stream[t, e])
+- **ffi**: implement FFI v2 — struct-by-value, opaque handles, fixed-width types
+- **stdlib**: make Instant opaque with instant_of_nanos / instant_to_nanos
+- **compiler**: give effects module identity like types
+- **stdlib**: migrate builtin effects from compiler AST to source
+- **native**: flip the default backend from c to native
+- **doc**: resolve kai doc <module> against the current package, not just stdlib
+- **refinements**: emit `help: narrow` line on contract-violation panic (#750)
+- **native**: run LLVM opt passes in-process before object emit (L4, #498)
+
+### Fixed
+
+- **typer**: make Mutable row honest for Array-backed record forwarding
+- **monomorph**: key generic specs by callee module for shared names
+- **typer**: honour root-fn shadowing for a protocol op in value position
+- **monomorph**: rewrite qualified calls to a protocol-bounded generic
+- **monomorph**: disambiguate interpolation call-site position collision by arg type
+- **monomorph**: decline poly call-site synth on shape/arity mismatch
+- **typer**: canonicalise root-module tag in per-module shadow guard
+- **typer**: disambiguate protocol ops sharing a name across protocols
+- **emit**: disambiguate homonymous effect default-handler install
+- **native**: stop reuse-dup gate at the EMatch boundary
+- **typer**: scope D2 ctor-uniqueness to root-file unions
+- **native**: close variant reuse leak in the rb-tree shape
+- **native**: gate match scrutinee dup on reuse arms, restoring cons cascade
+- **compiler**: preserve module_origin through the decl cache
+- **stdlib**: revert Instant field priv — it broke external constructors
+- **stdlib**: correct doc-vs-code lies, trim contingent comments
+- **stdlib**: replace raw control bytes with readable escapes in json.kai
+- **native**: per-match scrutinee drop binder + scrutinee dup, fixing nested-match double-free
+- **native**: make non-tail raw-scalar calls fully raw (no box/unbox round-trip)
+- **native**: cascade decref->free for self-tail-consumed cons cells (#860)
+- **native**: structural incref of owned-match alias binders (#858)
+- **native**: register raw proto impls through a boxed dispatch adapter
+- **native**: stop variant_match super-linear collapse (immortal cache)
+- **native**: prefix every degradation-note line with `kai:`
+- **ci**: retarget package-mode parity to native, skip when unavailable
+- **native**: hoist call-site arg-buffer alloca to the entry block
+- **effects**: arm the signal handler before ready in issue_107_signal_trap too
+- **effects**: arm the signal handler before the ready marker in m8x_signal_await_parks
+- **kir**: lower resume as an expression-call, not a block terminator
+- **kir**: restore the local-name set on block exit so siblings don't false-shadow (#846)
+- **emit**: break C declarator self-scope for a self-referential shadowing let
+- **kir**: alpha-rename a shadowing let-binder to a fresh register (#846)
+- **kir**: lower a MUnboxed Int let-binder raw to avoid a multi-use double-free
+- **native**: lower extern "C" fn to a real shim in the in-process backend
+- **typer**: bind generic effect op payload from declared row at drain (#842)
+- **emit**: native reuse-in-place move semantics + variant-TRMC
+- **typer**: mask Mutable for any local mutable value via unconditional default install
+
+### Changed
+
+- **emit**: cut self-compile RAM peak from 9.3 to 5.3 GB
+- **monomorph**: concrete spec signatures so scalar fn[T:P] specs unbox
+- **ast**: replace ETodo extern-body hack with dedicated EExternBody node
+- **native**: emit raw sdiv/srem for Int / and %
+- **native**: emit raw scalar params/returns for unboxed-signature fns
+- **native**: link the runtime as bitcode before O2 (P2)
+- **native**: unbox Int arithmetic and comparison
+- **emit**: remove the dead llvm-text backend frontend
+
 ## v0.90.0 (2026-06-14)
 
 ### Added
