@@ -270,6 +270,7 @@ stdlib/
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
   date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
   array.kai      pure (Array[T] / [T] bridge — shipped via #366)
+  string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure (top-level module — shipped, closes #902)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
   log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
@@ -470,6 +471,16 @@ the only effectful fn is `today()`.
   configurable) and `today()` `/ Clock` *(shipped via PR #770 — closes #767)*.
   Out of scope v1: tzdata/DST, civil time-of-day, locales, ISO week
   dates, non-Gregorian calendars.
+
+- `string_builder` — amortised text accumulator over a growable
+  `Array[String]` of fragments. `new` / `with_capacity` construct;
+  `append(sb, s)` / `append_char(sb, c)` ride `Mutable` (direct
+  `array_set` into the builder's array, doubling on overflow → O(1)
+  amortised); `build(sb)` joins the fragments in one pass
+  (`string_concat_all`, single allocation) and is **pure**, so a
+  caller that creates/appends/builds locally has `Mutable` masked at
+  its boundary; `len` / `is_empty` are pure reads. O(total) build vs
+  the O(n²) of a left-fold of `++` *(shipped — closes #902)*.
 
 ### random (`/ Random`) and random_secure (`/ SecureRandom`)
 
