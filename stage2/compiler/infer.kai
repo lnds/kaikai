@@ -21,6 +21,7 @@ import compiler.modules
 import compiler.desugar
 import compiler.doc_attr
 import compiler.native_prims
+import compiler.infer_index
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -2802,7 +2803,13 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # `T[..., e]` row slot in a carrier so a concrete-row
                # `let s : Stream[String, File + ReadFault]` annotation
                # unifies with the inferred carrier.
-               row_kind: [RowKindEntry] }
+               row_kind: [RowKindEntry],
+               # name index over `entries`, keyed by each entry's bucket
+               # key (last `::`-segment). Mirrors `entries` exactly: every
+               # prepend to `entries` prepends to this index too, so
+               # `ty_env_lookup` / `ty_env_collect_candidates` answer
+               # per-name queries without walking the full assoc list.
+               index: NameIndex[TyEntry] }
 
 # head-owner cache entry. `head` is the bare type name
 # (`List`, `MyBox`, ...); `mods` is the list of modules whose
@@ -2813,11 +2820,15 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [], root_fns: [], row_kind: [] }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }
 
-fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv =
-  TyEnv { entries: [TyEntry { name: name, scheme: sc }, ...env.entries],
-          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
+fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
+  let k = ty_bucket_key(name)
+  let e = TyEntry { name: name, scheme: sc }
+  TyEnv { entries: [e, ...env.entries],
+          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+          index: idx_prepend(env.index, k, e) }
+}
 
 # composite key for module-qualified scheme entries.
 # When the same bare `fname` is exported from two prelude modules
@@ -2833,6 +2844,52 @@ fn ty_mod_key(mod: String, fname: String) : String =
 fn ty_env_add_qualified(env: TyEnv, mod: String, name: String, sc: TyScheme) : TyEnv =
   ty_env_add(env, ty_mod_key(mod, name), sc)
 
+# Bucket key for the name index: the segment after the FINAL `::`, or
+# the whole name when it has none. Applied identically on insert and on
+# query so an entry registered under `<mod>::<fname>` and a bare-name
+# query for `<fname>` land in the same bucket. Soundness rests on the
+# scan re-applying the exact byte predicate of each lookup, so a hash or
+# bucket collision is filtered out, never returned.
+fn ty_bucket_key(name: String) : String {
+  let i = ty_last_sep(name, string_length(name) - 1)
+  if i < 0 { name } else { string_slice(name, i + 2, string_length(name) - (i + 2)) }
+}
+
+# Index of the `:` that opens the final `::` in `name`, scanning down
+# from `from`; -1 when no `::` is present.
+fn ty_last_sep(name: String, from: Int) : Int {
+  if from < 1 { -1 }
+  else {
+    match char_at(name, from - 1) {
+      Some(a) -> match char_at(name, from) {
+        Some(b) -> if a == ':' and b == ':' { from - 1 } else { ty_last_sep(name, from - 1) }
+        None    -> ty_last_sep(name, from - 1)
+      }
+      None -> ty_last_sep(name, from - 1)
+    }
+  }
+}
+
+# Prepend a fresh batch of new entries onto BOTH the entries list and the
+# index, returning the pair. Each `TyEntry` is shared into `entries`
+# (cons) and `index` (idx_prepend) exactly as `ty_env_add` shares a
+# single entry. `batch` must be a fresh local (not an already-stored
+# list): it is reversed so a tail-recursive prepend lands the original
+# head (newest) at the front of both structures, matching `ty_env_add`'s
+# newest-first order.
+type TyEnvParts = TEP([TyEntry], NameIndex[TyEntry])
+
+fn ty_env_prepend_batch(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry]) : TyEnvParts =
+  ty_env_prepend_batch_loop(list_reverse(batch), entries, ix)
+
+fn ty_env_prepend_batch_loop(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry]) : TyEnvParts = match batch {
+  [] -> TEP(entries, ix)
+  [e, ...rest] -> {
+    let k = ty_bucket_key(e.name)
+    ty_env_prepend_batch_loop(rest, [e, ...entries], idx_prepend(ix, k, e))
+  }
+}
+
 fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
   match es {
     [] -> None
@@ -2840,8 +2897,12 @@ fn ty_env_lookup_loop(es: [TyEntry], target: String) : Option[TyScheme] {
   }
 }
 
+# The index bucket for `target` is the entries-order subsequence of
+# all entries sharing `target`'s bucket key, newest-first; scanning it
+# with the same `e.name == target` predicate returns the identical
+# first match the full-`entries` walk produced.
 fn ty_env_lookup(env: TyEnv, target: String) : Option[TyScheme] =
-  ty_env_lookup_loop(env.entries, target)
+  ty_env_lookup_loop(idx_chain(env.index, ty_bucket_key(target)), target)
 
 # qualifier-aware lookup. Returns the scheme registered
 # under `<mod>::<fname>` if present; the EModCall branch consults
@@ -2914,10 +2975,14 @@ fn ty_entry_split_mod(key: String, fname: String) : Option[String] {
 type TyCandidate = { scheme: TyScheme, mod: String }
 
 # collect every qualified scheme registered for
-# `target`. Walks `env.entries` newest-first so picks honour the
-# same tie-break the legacy `ty_env_lookup` used.
+# `target`, newest-first so picks honour the same tie-break the legacy
+# `ty_env_lookup` used. `target` always arrives bare, so its bucket key
+# is `target`; the bucket is the entries-order subsequence of every
+# entry whose last `::`-segment is `target` (a superset of the
+# `<mod>::target` keys), and the unchanged `ty_entry_extract_mod` filter
+# drops the bare `target` entry: identical to walking full `entries`.
 fn ty_env_collect_candidates(env: TyEnv, target: String) : [TyCandidate] =
-  ty_env_collect_candidates_loop(env.entries,
+  ty_env_collect_candidates_loop(idx_chain(env.index, ty_bucket_key(target)),
                                  string_concat("::", target), [])
 
 fn ty_env_collect_candidates_loop(es: [TyEntry],
@@ -3268,7 +3333,12 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
   # scheme cannot drift from the C forwarder + emit dispatch. Dead on
   # any program that does not use the native backend.
   let native_es = native_prim_ty_entries(rprelude_table())
-  TyEnv { entries: list_append(list_append(es, native_es), env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
+  let batch = list_append(es, native_es)
+  match ty_env_prepend_batch(batch, env.entries, env.index) {
+    TEP(all_entries, idx) ->
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+              index: idx }
+  }
 }
 
 # Map each raw prelude prim to its typer entry: a monomorphic function
@@ -3308,7 +3378,11 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: ty_mod_key("Result", "Ok"),   scheme: ok_sc   },
     TyEntry { name: ty_mod_key("Result", "Err"),  scheme: err_sc  }
   ]
-  TyEnv { entries: list_append(es, env.entries), fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
+  match ty_env_prepend_batch(es, env.entries, env.index) {
+    TEP(all_entries, idx) ->
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+              index: idx }
+  }
 }
 
 # ---- user-defined signatures ----
@@ -5418,7 +5492,7 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
   let env_with_unions = TyEnv {
     entries: seed.env.entries, fresh: seed.env.fresh, unions: unions,
     head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-    row_kind: compute_row_kind_slots(decls)
+    row_kind: compute_row_kind_slots(decls), index: seed.env.index
   }
   let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
   BuiltEnv { env: r.env, prelude_len: seed.prelude_len,
@@ -5451,11 +5525,17 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
 fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String], rk_table: [RowKindEntry]) : BuiltEnv {
-  let seeded_entries = list_append(inherited.ty_entries, seed.env.entries)
-  let env_in = TyEnv {
-    entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
-    head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-    row_kind: rk_table
+  # `inherited.ty_entries` are newer than the seed (prepended at head).
+  # Prepend them onto BOTH the seed entries and the seed index in one
+  # pass, sharing each entry exactly as `ty_env_add` does -- never
+  # re-walking an already-stored list, which double-consumes its
+  # backbone under Perceus.
+  let env_in = match ty_env_prepend_batch(inherited.ty_entries, seed.env.entries, seed.env.index) {
+    TEP(seeded_entries, seeded_index) -> TyEnv {
+      entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
+      head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
+      row_kind: rk_table, index: seeded_index
+    }
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
   let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table)
@@ -6854,7 +6934,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -6891,7 +6971,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -8284,7 +8364,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index },
     prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -11510,7 +11590,7 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
-          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind }
+          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
 
 # attach the set of root-file (user) function names to the
 # env. A root `fn foo` unconditionally shadows a stdlib `pub fn foo`;
@@ -11519,7 +11599,7 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # export exactly. Seeded once per compile.
 fn ty_env_with_root_fns(env: TyEnv, rfns: [String]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
-          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind }
+          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, index: env.index }
 
 # collect the bare names of root-file (`mo = None`)
 # functions from the full program decl stream. Imported / prelude decls
@@ -18674,7 +18754,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [] }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -18703,7 +18783,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [] }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
