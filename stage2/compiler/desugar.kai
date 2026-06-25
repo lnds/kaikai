@@ -501,7 +501,13 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
         DPRKind { expr: r.expr, errs: r.errs }
       } else {
         let renamed = dpr_record_lit(name, rfis.fields, line, col, recs, file, rfis.errs)
-        DPRKind { expr: mk_expr(ERecordLit(name, renamed.fields), line, col), errs: renamed.errs }
+        # Canonicalise the field order to the record's declaration order so
+        # the runtime layout is a global property of the type, not of how
+        # each literal was written. A literal already in declaration order
+        # passes through unchanged; an out-of-order one becomes a let-block
+        # that evaluates fields in SOURCE order then assembles in
+        # DECLARATION order (preserving observable effect order).
+        DPRKind { expr: dpr_record_canon(name, renamed.fields, line, col, recs), errs: renamed.errs }
       }
     }
     EBlock(stmts, tail) -> {
@@ -709,6 +715,81 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
     }
   }
 }
+
+# Canonicalise a named record literal to DECLARATION order. A literal whose
+# fields already follow declaration order (the overwhelming common case)
+# returns unchanged. An out-of-order literal becomes a let-block: each field
+# value is bound to a fresh temp IN SOURCE ORDER, then the record is
+# assembled in declaration order from those temps. This keeps the observable
+# effect order (source order) while making the physical layout a global
+# property of the type — the invariant the constant-index field read relies
+# on. An unknown record type passes through (the typer reports the error).
+fn dpr_record_canon(name: String, fis: [FieldInit], line: Int, col: Int,
+                    recs: [RecInfo]) : Expr {
+  match rec_find_canon_target(recs, name, fis) {
+    None -> mk_expr(ERecordLit(name, fis), line, col)
+    Some(ri) -> match ri {
+      RI(_, _, fds, _) ->
+        if fields_in_decl_order(fis, fds) {
+          mk_expr(ERecordLit(name, fis), line, col)
+        } else {
+          let binds = canon_field_binds(fis, line, col, 0, [])
+          let assembled = canon_assemble(fds, fis, line, col, 0, [])
+          mk_expr(EBlock(binds, Some(mk_expr(ERecordLit(name, assembled), line, col))), line, col)
+        }
+    }
+  }
+}
+
+# Resolve the literal's `RecInfo` from its type name + first field, the
+# field-set tie-break `synth_record_lit` uses for same-(name, arity)
+# collisions. Arity `-1`: the literal carries no type args.
+fn rec_find_canon_target(recs: [RecInfo], name: String, fis: [FieldInit]) : Option[RecInfo] =
+  match fis {
+    []               -> rec_find(recs, name)
+    [FI(f0, _), ..._] -> rec_find_with_field(recs, name, -1, f0)
+  }
+
+# True iff the literal's field names already follow declaration order. The
+# typer enforces a complete field set, so a same-length positional walk is
+# enough — no field is missing or extra.
+fn fields_in_decl_order(fis: [FieldInit], fds: [FieldDecl]) : Bool = match fis {
+  [] -> true
+  [FI(fnm, _), ...frest] -> match fds {
+    [] -> true
+    [FD(_, dnm, _), ...drest] -> if fnm == dnm { fields_in_decl_order(frest, drest) } else { false }
+  }
+}
+
+# `let __rf_<l>_<c>_<i> = <value>` for each field, in SOURCE order.
+fn canon_field_binds(fis: [FieldInit], line: Int, col: Int, i: Int, acc: [Stmt]) : [Stmt] = match fis {
+  [] -> list_reverse(acc)
+  [FI(_, val), ...rest] -> {
+    let pat = mk_pat(PBind(canon_temp_name(line, col, i)), line, col)
+    canon_field_binds(rest, line, col, i + 1, [SLet(pat, None, val), ...acc])
+  }
+}
+
+# Assemble `[FI(declared_name, EVar(temp))]` in DECLARATION order: for each
+# declared field, find its source-order index and reference that temp.
+fn canon_assemble(fds: [FieldDecl], fis: [FieldInit], line: Int, col: Int,
+                  _i: Int, acc: [FieldInit]) : [FieldInit] = match fds {
+  [] -> list_reverse(acc)
+  [FD(_, dnm, _), ...drest] -> {
+    let si = field_init_index(fis, dnm, 0)
+    let ref = mk_expr(EVar(canon_temp_name(line, col, si)), line, col)
+    canon_assemble(drest, fis, line, col, _i + 1, [FI(dnm, ref), ...acc])
+  }
+}
+
+# Source-order index of the field named `target` in `fis`.
+fn field_init_index(fis: [FieldInit], target: String, i: Int) : Int = match fis {
+  [] -> -1
+  [FI(nm, _), ...rest] -> if nm == target { i } else { field_init_index(rest, target, i + 1) }
+}
+
+fn canon_temp_name(line: Int, col: Int, i: Int) : String =
+  concat_all(["__rf_", int_to_string(line), "_", int_to_string(col), "_", int_to_string(i), "__"])
 
 # Expand `T { ...src, x: 10, y: 20 }` into a let-block:
 #
