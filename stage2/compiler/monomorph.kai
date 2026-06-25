@@ -2138,11 +2138,126 @@ fn mt_retag_bare_shared(t: MonoTuple, polys: [PolyFn], host_mo: Option[String]) 
     }
   }
 
+# A spec's signature must read concrete: `subst_decl` only rewrites
+# the body, leaving `Param.ptype` / `opt_ret` at the polymorphic
+# `TyName("T")`. The unbox classifier reads the SIGNATURE, so an
+# unconcreted one keeps the spec boxed (lost int64 ABI on every
+# scalar `fn[T:P]`). These helpers concrete the syntactic signature
+# by mapping each type-kind tparam name to its actual TypeExpr.
+
+# Reverse of resolve_ty for the slots that matter to unboxing.
+# Primitives become bare TyName so the classifier sees Int/Real/Bool/
+# Char; compound types reconstruct structurally (a boxed param either
+# way, but kept faithful for the rest of the signature walk).
+fn ty_to_typeexpr(t: Ty) : TypeExpr {
+  let k = match t {
+    TyInt    -> TyName("Int", [])
+    TyReal   -> TyName("Real", [])
+    TyBool   -> TyName("Bool", [])
+    TyString -> TyName("String", [])
+    TyChar   -> TyName("Char", [])
+    TyUnit   -> TyName("Unit", [])
+    TyByte   -> TyName("Byte", [])
+    TyHandle -> TyName("Handle", [])
+    TyAny    -> TyName("Any", [])
+    TyListT(inner) -> TyList(ty_to_typeexpr(inner))
+    TyFnT(ps, ret, _) -> TyFn(map(ps, ty_to_typeexpr), ty_to_typeexpr(ret), REmpty)
+    TyCon(_, cname, tas) -> TyName(cname, map(tas, ty_to_typeexpr))
+    TyVarT(_) -> TyName("Any", [])
+    TyDimT(base, u) -> TyDim(ty_to_typeexpr(base), u)
+    TyRefineT(base, p) -> TyRefine(ty_to_typeexpr(base), p)
+    TyUnion(parts) -> union_head_tkind(parts)
+  }
+  mk_ty(k, 0, 0)
+}
+
+fn union_head_tkind(parts: [Ty]) : TyKind = match parts {
+  [p, ..._] -> {
+    let te = ty_to_typeexpr(p)
+    te.tkind
+  }
+  [] -> TyName("Any", [])
+}
+
+type SigSubst = SS(String, TypeExpr)
+
+# Pair the decl's type-kind tparams (unit-kind dropped, matching the
+# `tys` alignment) with their concrete TypeExprs. Declared ++ implicit
+# tparams, same ordering build_subst_map uses.
+fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] {
+  match d {
+    DFn(_, _, tparams, _, _, _, _, _, _, _) -> {
+      let implicit = collect_implicit_tparams_in_decl(d, tparams)
+      let effective = list_append(tparams, implicit)
+      let type_names = filter(effective, (n) => not tp_name_is_unit(n))
+      zip_sig_subst(type_names, tys)
+    }
+    _ -> []
+  }
+}
+
+fn tp_name_is_unit(stored: String) : Bool = mono_str_ends_with(stored, tp_unit_suffix())
+
+fn mono_str_ends_with(s: String, suffix: String) : Bool {
+  let sl = string_length(s)
+  let xl = string_length(suffix)
+  if xl > sl { false } else { string_slice(s, sl - xl, xl) == suffix }
+}
+
+fn zip_sig_subst(names: [String], tys: [Ty]) : [SigSubst] {
+  match names {
+    [] -> []
+    [n, ...nrest] -> match tys {
+      [] -> []
+      [t, ...trest] -> [SS(n, ty_to_typeexpr(t)), ...zip_sig_subst(nrest, trest)]
+    }
+  }
+}
+
+fn sig_subst_lookup(subst: [SigSubst], name: String) : Option[TypeExpr] = match subst {
+  [] -> None
+  [SS(n, te), ...rest] -> if n == name { Some(te) } else { sig_subst_lookup(rest, name) }
+}
+
+# Rewrite a TypeExpr, replacing each tparam-named TyName with its
+# concrete form. Mirrors emit_c's apply_tp_subst_te.
+fn apply_sig_subst_te(te: TypeExpr, subst: [SigSubst]) : TypeExpr {
+  let k = match te.tkind {
+    TyName(name, targs) -> {
+      let targs1 = map(targs, (a) => apply_sig_subst_te(a, subst))
+      match sig_subst_lookup(subst, name) {
+        Some(rep) -> if targs1 == [] { rep.tkind } else { TyName(name, targs1) }
+        None -> TyName(name, targs1)
+      }
+    }
+    TyList(inner) -> TyList(apply_sig_subst_te(inner, subst))
+    TyFn(ps, ret, row) -> TyFn(map(ps, (p) => apply_sig_subst_te(p, subst)),
+                                apply_sig_subst_te(ret, subst), row)
+    TyDim(base, u) -> TyDim(apply_sig_subst_te(base, subst), u)
+    TyRefine(base, p) -> TyRefine(apply_sig_subst_te(base, subst), p)
+    TyRow(row) -> TyRow(row)
+  }
+  mk_ty(k, te.line, te.col)
+}
+
+fn subst_param_sig(p: Param, subst: [SigSubst]) : Param =
+  match p.ptype {
+    None -> p
+    Some(te) -> Param { pname: p.pname, ptype: Some(apply_sig_subst_te(te, subst)),
+                        pline: p.pline, pcol: p.pcol }
+  }
+
 fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
   match d {
     DFn(is_pub, name, _, params, opt_ret, row, body, ln, cl, mo) -> {
       let mangled = mono_mangle_name(name, tys, units)
-      DFn(is_pub, mangled, [], params, opt_ret, row, body, ln, cl, mo)
+      let subst = build_sig_subst(d, tys)
+      let params1 = map(params, (p) => subst_param_sig(p, subst))
+      let opt_ret1 = match opt_ret {
+        None -> None
+        Some(te) -> Some(apply_sig_subst_te(te, subst))
+      }
+      DFn(is_pub, mangled, [], params1, opt_ret1, row, body, ln, cl, mo)
     }
     _ -> d
   }
