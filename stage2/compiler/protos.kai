@@ -88,6 +88,7 @@
 import compiler.ast
 import compiler.diag
 import compiler.util
+import compiler.impl_index
 import compiler.modules
 import compiler.infer
 
@@ -266,7 +267,8 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 # ====================================================================
 
 fn proto_reg_empty() : ProtocolReg =
-  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [] }
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
+                impl_index: impl_index_empty() }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -356,7 +358,8 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg,
           let reg1 = ProtocolReg {
             ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
             tparams: [PTPR(name, tparams), ...reg.tparams],
-            origins: [PrOR(name, proto_mo), ...reg.origins]
+            origins: [PrOR(name, proto_mo), ...reg.origins],
+            impl_index: reg.impl_index
           }
           collect_proto_decls(rest, register_proto_ops(reg1, name, ops),
                                 target_mod, next_mod)
@@ -385,7 +388,8 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : Protoco
           impls: reg.impls,
           op_names: names1,
           tparams: reg.tparams,
-          origins: reg.origins
+          origins: reg.origins,
+          impl_index: reg.impl_index
         }
         register_proto_ops(reg1, proto, rest)
       }
@@ -940,7 +944,8 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
           impls: [entry, ...reg.impls],
           op_names: reg.op_names,
           tparams: reg.tparams,
-          origins: reg.origins
+          origins: reg.origins,
+          impl_index: reg.impl_index
         }
         lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
@@ -2956,8 +2961,19 @@ pub fn lower_protocols(decls: [Decl], file: String,
   let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, local_fns, target_mod)
   let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, local_fns, target_mod)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
-  LoweredProtocols { decls: final_decls, reg: lower_res.reg, errs: errs }
+  # Index the now-final impl table once; the post-inference rewrite's
+  # per-spec scans consult it instead of walking `reg.impls` linearly.
+  let indexed_reg = reg_with_impl_index(lower_res.reg)
+  LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs }
 }
+
+# Attach a freshly-built `ImplIndex` to a finalised registry. The impl
+# table is immutable past this point, so the index built here serves
+# every subsequent lookup.
+fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins,
+                impl_index: build_impl_index(reg.impls) }
 
 # m12.8 + resolver-arity: pre-resolve renaming pass. Walks every DFn /
 # DTest body and rewrites every `EVar(name)` whose name is a known
@@ -3674,7 +3690,9 @@ fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolR
   match kind {
     ECall(callee, _) -> match callee.kind {
       EVar(sym) -> {
-        let rh = impl_ret_head_by_sym(reg.impls, sym)
+        let pool = if ii_built(reg.impl_index) { ii_sym_bucket(reg.impl_index, sym) }
+                   else { reg.impls }
+        let rh = impl_ret_head_by_sym(pool, sym)
         if rh == "" { cur_ty }
         else {
           let cur_head = match cur_ty {
@@ -3810,9 +3828,16 @@ fn prc_ty_head_name(t: Ty) : Option[String] {
   }
 }
 
-# True iff `reg` holds an `impl proto for head` entry.
+# True iff `reg` holds an `impl proto for head` entry. The index
+# narrows the scan to the `(proto, head)` bucket; the same membership
+# predicate then runs over that short list (or the full table when the
+# index is the unbuilt placeholder), so the answer is unchanged.
 fn prc_reg_has_impl(reg: ProtocolReg, proto: String, head: String) : Bool =
-  prc_impls_has(reg.impls, proto, head)
+  if ii_built(reg.impl_index) {
+    prc_impls_has(ii_key_bucket(reg.impl_index, proto, head), proto, head)
+  } else {
+    prc_impls_has(reg.impls, proto, head)
+  }
 
 fn prc_impls_has(impls: [ProtoImplReg], proto: String, head: String) : Bool {
   match impls {
@@ -4662,7 +4687,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
             None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
                                                opname, ret_ty)
             Some(self_name) ->
-              match find_impl_by_recv(reg.impls, pname, opname, self_name) {
+              match find_impl_by_recv(impl_pool(reg, pname, self_name), pname, opname, self_name) {
                 Some(impl_fn) -> {
                   let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
                   Some(ECall(new_callee, args_))
@@ -4795,6 +4820,14 @@ fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
 # `arg_names_match` against [recv] applies — `find_impl_legacy`
 # does that. The legacy `find_impl_for` (no arg-name filter) is
 # kept around for unrelated callers.
+# The impl candidates a `(proto, recv)` lookup must consider: the
+# `(proto, recv)` bucket when the index is built, else the whole table.
+# Every `find_impl_*` filter keys on `t == recv`, so the bucket holds
+# exactly the entries the linear scan would not skip, in the same order.
+fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
+  if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, pname, recv) }
+  else { reg.impls }
+
 fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
                              args_: [Expr]) : Option[String] {
   let names = args_head_names(args_)
@@ -4802,7 +4835,7 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
     None -> None
     Some(ns) -> match ns {
       [] -> None
-      [a] -> find_impl_homogeneous(reg.impls, pname, opname, a)
+      [a] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
       [a, b] -> {
         let proto_takes_args = proto_has_tparams(reg.tparams, pname)
         if not proto_takes_args {
@@ -4810,26 +4843,26 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
           # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
           # homogeneous (recv=a) lookup applies; the second arg is
           # not a proto-arg.
-          find_impl_homogeneous(reg.impls, pname, opname, a)
+          find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
         } else {
           # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
           #          `impl Add[Real] for Complex` for Complex + Real.
           # Pass 1b: homogeneous (recv=a) — covers `impl Add for
           #          Complex` for Complex + Complex.
-          match find_impl_with_args(reg.impls, pname, opname, a, [b]) {
+          match find_impl_with_args(impl_pool(reg, pname, a), pname, opname, a, [b]) {
             Some(fn_name) -> Some(fn_name)
             None -> {
-              match find_impl_homogeneous(reg.impls, pname, opname, a) {
+              match find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a) {
                 Some(fn_name) ->
                   if a == b { Some(fn_name) }
-                  else { find_impl_with_args(reg.impls, pname, opname, b, [a]) }
-                None -> find_impl_with_args(reg.impls, pname, opname, b, [a])
+                  else { find_impl_with_args(impl_pool(reg, pname, b), pname, opname, b, [a]) }
+                None -> find_impl_with_args(impl_pool(reg, pname, b), pname, opname, b, [a])
               }
             }
           }
         }
       }
-      [a, ..._rest] -> find_impl_homogeneous(reg.impls, pname, opname, a)
+      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
     }
   }
 }
@@ -5007,7 +5040,7 @@ fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
   match proto_op_lookup(reg, opname) {
     None -> None
     Some(po) -> match po {
-      POR(pname, _, _, _, _, _) -> find_impl_for(reg.impls, pname, tname, opname)
+      POR(pname, _, _, _, _, _) -> find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname)
     }
   }
 }
@@ -5030,7 +5063,7 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
     [] -> None
     [po, ...rest] -> match po {
       POR(pname, _, _, _, _, _) ->
-        match find_impl_for(reg.impls, pname, tname, opname) {
+        match find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname) {
           Some(fn_name) -> Some(ImplHit(pname, fn_name))
           None -> find_impl_any_proto_loop(rest, reg, opname, tname)
         }
