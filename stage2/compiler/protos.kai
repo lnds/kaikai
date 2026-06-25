@@ -3261,12 +3261,61 @@ pub fn rename_proto_calls_decls(ds: [Decl], op_arities: [OpAr],
 pub fn rename_proto_calls_decls_mo(ds: [Decl], raw_ops: [OpAr],
                                     local_fns: [LFnAr],
                                     target_mod: String) : [Decl] =
-  map(ds, (d) => {
+  rename_proto_calls_decls_mo_loop(ds, raw_ops, local_fns, target_mod,
+                                    ShadowByMod { entries: [], has_root: false,
+                                                  root_ops: [], root_names: [] }, [])
+
+# The (filtered_ops, names) pair a decl rewrites against depends only on
+# its canonical module bucket — `local_fns`, `raw_ops` and `target_mod`
+# are invariant across the whole list. A self-compile carries thousands
+# of decls but tens of distinct modules, so recomputing the per-module
+# shadow set per decl is the same O(n²) retention #907/#912 fixed on the
+# emit / KIR paths. Memoise the pair by module origin: one entry per
+# distinct module, an `O(1)` lookup per decl.
+type ShadowByMod = { entries: [ShadowEntry], has_root: Bool,
+                     root_ops: [OpAr], root_names: [String] }
+type ShadowEntry = { key: String, ops: [OpAr], names: [String] }
+
+fn sbm_lookup(entries: [ShadowEntry], k: String) : Option[ShadowEntry] = match entries {
+  [] -> None
+  [e, ...rest] -> if e.key == k { Some(e) } else { sbm_lookup(rest, k) }
+}
+
+type ShadowResult = { cache: ShadowByMod, ops: [OpAr], names: [String] }
+
+fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
+                 local_fns: [LFnAr], target_mod: String) : ShadowResult = match dmo {
+  None ->
+    if c.has_root { ShadowResult { cache: c, ops: c.root_ops, names: c.root_names } }
+    else {
+      let ops = filter_shadowed_ops(raw_ops, local_arities_for_mo_canon(local_fns, None, target_mod))
+      let names = local_names_for_mo_canon(local_fns, None, target_mod)
+      ShadowResult { cache: ShadowByMod { entries: c.entries, has_root: true, root_ops: ops, root_names: names },
+                     ops: ops, names: names }
+    }
+  Some(m) -> match sbm_lookup(c.entries, m) {
+    Some(e) -> ShadowResult { cache: c, ops: e.ops, names: e.names }
+    None    -> {
+      let ops = filter_shadowed_ops(raw_ops, local_arities_for_mo_canon(local_fns, dmo, target_mod))
+      let names = local_names_for_mo_canon(local_fns, dmo, target_mod)
+      ShadowResult { cache: ShadowByMod { entries: [ShadowEntry { key: m, ops: ops, names: names }, ...c.entries],
+                                          has_root: c.has_root, root_ops: c.root_ops, root_names: c.root_names },
+                     ops: ops, names: names }
+    }
+  }
+}
+
+fn rename_proto_calls_decls_mo_loop(ds: [Decl], raw_ops: [OpAr], local_fns: [LFnAr],
+                                     target_mod: String, c: ShadowByMod, acc: [Decl]) : [Decl] = match ds {
+  [] -> acc
+  [d, ...rest] -> {
     let dmo = canon_mo(decl_module(d), target_mod)
-    let ops = local_arities_for_mo_canon(local_fns, dmo, target_mod)
-    let names = local_names_for_mo_canon(local_fns, dmo, target_mod)
-    rename_proto_calls_decl(d, filter_shadowed_ops(raw_ops, ops), names)
-  })
+    let r = shadow_for_mo(c, dmo, raw_ops, local_fns, target_mod)
+    let renamed = rename_proto_calls_decl(d, r.ops, r.names)
+    rename_proto_calls_decls_mo_loop(rest, raw_ops, local_fns, target_mod, r.cache,
+                                     list_append(acc, [renamed]))
+  }
+}
 
 # Collapse `Some(target_mod)` and `None` to a single canonical `None`
 # (the root bucket); foreign modules keep their `Some(name)`.
