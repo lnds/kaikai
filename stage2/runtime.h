@@ -2576,6 +2576,10 @@ static void     kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns);
 static void     kai_reactor_park_pid(KaiFiber *f, int pid);
 static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
 static uint64_t kai_reactor_now_ns(void);
+/* Timeout-receive dual-park: arm a deadline alongside the mailbox park
+ * and disarm it if a message wins. Bodies sit with the timer wheel. */
+static void     kai_reactor_timer_insert(KaiFiber *f);
+static int      kai_reactor_timer_remove(KaiFiber *f);
 
 /* Issue #620 — Phase R3 reactor forward decls. The default Stdin
  * handlers live ~1700 lines above the reactor implementation. They
@@ -2695,6 +2699,26 @@ static KaiFiber *kai_mailbox_waiter_dequeue(KaiFiber **head, KaiFiber **tail) {
     return f;
 }
 
+/* Splice `f` out of a waiter chain regardless of position. Returns 1
+ * if found. The timeout-receive uses this to drop itself from the
+ * recv-waiter chain when its deadline fires first, so a later send
+ * does not unpark a fiber that already returned `None`. */
+static int kai_mailbox_waiter_remove(KaiFiber **head, KaiFiber **tail, KaiFiber *f) {
+    KaiFiber **link = head;
+    KaiFiber  *prev = NULL;
+    while (*link) {
+        if (*link == f) {
+            *link = f->awaiters_next;
+            if (!*link) *tail = prev;
+            f->awaiters_next = NULL;
+            return 1;
+        }
+        prev = *link;
+        link = &(*link)->awaiters_next;
+    }
+    return 0;
+}
+
 static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     /* m8 #8 + Phase 4: enforce policy on full. */
     if (mb->cap > 0 && mb->len >= mb->cap) {
@@ -2760,6 +2784,68 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
                                                     &mb->send_waiter_tail);
     if (waiter) kai_sched_unpark(waiter);
     return msg;
+}
+
+/* Receive with a deadline: park the caller on BOTH the recv-waiter
+ * chain and the timer wheel, woken by whichever fires first. Returns
+ * the popped message, or NULL if `timeout_nanos` elapsed first.
+ *
+ * The discriminant on wake is recv-waiter membership: a send unparks
+ * us by dequeuing us from the recv-waiter chain (we stay on the timer
+ * wheel), while the timer drain unparks us off the wheel (we stay on
+ * the recv-waiter chain). Whichever wakeup ran, we splice ourselves
+ * out of the OTHER structure so a later event cannot touch a fiber
+ * that already returned — the use-after-free trap this guards.
+ *
+ * A spurious message-wake (another receiver drained the slot first)
+ * re-parks for the remaining time; an elapsed deadline returns NULL. */
+static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos) {
+    if (mb->head) {
+        KaiMboxNode *node = mb->head;
+        mb->head = node->next;
+        if (!mb->head) { mb->tail = NULL; }
+        KaiValue *msg = node->msg;
+        free(node);
+        mb->len--;
+        KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                   &mb->send_waiter_tail);
+        if (sw) kai_sched_unpark(sw);
+        return msg;
+    }
+    uint64_t deadline = kai_reactor_now_ns() + timeout_nanos;
+    for (;;) {
+        if (kai_reactor_now_ns() >= deadline) return NULL;
+        KaiFiber *me = kai_current_fiber();
+        kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
+                                   &mb->recv_waiter_tail, me);
+        kai_reactor_park_timer(me, deadline);
+
+        /* park_timer's drain already spliced us off the wheel on a
+         * deadline wake. Disarm it on a message wake; in both cases
+         * remove ourselves from the chain we are still linked into. */
+        int still_waiting = kai_mailbox_waiter_remove(&mb->recv_waiter_head,
+                                                      &mb->recv_waiter_tail, me);
+        if (still_waiting) {
+            /* Deadline fired: we were never dequeued by a send. */
+            return NULL;
+        }
+        /* A send dequeued us; disarm the still-armed deadline timer. */
+        kai_reactor_timer_remove(me);
+        if (mb->head) {
+            KaiMboxNode *node = mb->head;
+            mb->head = node->next;
+            if (!mb->head) { mb->tail = NULL; }
+            KaiValue *msg = node->msg;
+            free(node);
+            mb->len--;
+            KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                      &mb->send_waiter_tail);
+            if (sw) kai_sched_unpark(sw);
+            return msg;
+        }
+        /* Spurious: another receiver took the slot. Loop re-checks the
+         * deadline and re-parks for whatever time remains. */
+    }
 }
 
 static void kai_mailbox_free(KaiMailbox *mb) {
@@ -5728,6 +5814,26 @@ static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
     return msg;
 }
 
+/* Receive within a deadline. `timeout_nanos` is a relative nanosecond
+ * budget; returns `Some(msg)` if a message arrives in time, `None` if
+ * the deadline elapses first. Mirrors `kai_prelude_mailbox_recv`'s
+ * callee-consumes-clean discipline for the input `pid` ref. */
+static KaiValue *kai_prelude_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos) {
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
+        exit(1);
+    }
+    int64_t ns = kai_intf(timeout_nanos);
+    kai_decref(timeout_nanos);
+    KaiValue *msg = kai_mailbox_pop_timeout(pid->as.mb,
+                                            ns < 0 ? 0 : (uint64_t) ns);
+    kai_decref(pid);
+    if (msg) {
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+
 /* Free the mailbox attached to a Pid. Called by `with_mailbox` when
  * the scope exits; the Pid value itself is RC-managed independently. */
 static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
@@ -6892,6 +6998,7 @@ static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int
 static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_recv(a[0]); }
+static KaiValue *_kai_prelude_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_recv_timeout(a[0], a[1]); }
 static KaiValue *_kai_prelude_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_free(a[0]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
@@ -9814,6 +9921,25 @@ static int kai_reactor_timer_drain(uint64_t now) {
         woken++;
     }
     return woken;
+}
+
+/* Splice `f` out of the timer wheel if present. Returns 1 if it was
+ * found (and unparks accounting reconciled), 0 if absent. The dual-park
+ * receive uses this to disarm its deadline timer once a message wakes
+ * it first, so a later drain cannot wake a fiber that already returned. */
+static int kai_reactor_timer_remove(KaiFiber *f) {
+    KaiFiber **link = &kai_reactor_timer_head;
+    while (*link) {
+        if (*link == f) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_deadline_ns = 0;
+            kai_reactor_parked_count--;
+            return 1;
+        }
+        link = &(*link)->reactor_next;
+    }
+    return 0;
 }
 
 /* Drain SIGCHLD self-pipe and waitpid(-1, ..., WNOHANG) until no
