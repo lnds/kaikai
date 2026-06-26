@@ -3923,6 +3923,34 @@ static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
 
 static KaiValue *kai_to_string(KaiValue *v);
 
+/* Encode scalar value `cp` into `out` (>= 4 bytes), the exact inverse of
+ * the `string_cp_at` decode. Returns the byte width 1..4. A `Char` is
+ * always a valid scalar value (enforced at `int_to_char`); the surrogate
+ * / out-of-range clamp to U+FFFD only guards a raw uint32 reaching here. */
+static int kai_utf8_encode(uint32_t cp, unsigned char *out) {
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+    if (cp < 0x80) {
+        out[0] = (unsigned char) cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (unsigned char) (0xC0 | (cp >> 6));
+        out[1] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (unsigned char) (0xE0 | (cp >> 12));
+        out[1] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (unsigned char) (0xF0 | (cp >> 18));
+    out[1] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (unsigned char) (0x80 | (cp & 0x3F));
+    return 4;
+}
+
 static KaiValue *kai_list_to_string(KaiValue *v) {
     KaiValue *acc = kai_str("[");
     int first = 1;
@@ -6009,6 +6037,38 @@ static KaiValue *kai_prelude_string_cp_at(KaiValue *s, KaiValue *off) {
     return kai_int(cp);
 }
 
+/* Reverse `s` by Unicode codepoint in one pass and one allocation: walk
+ * the source forward by UTF-8 sequence width and copy each FULL sequence,
+ * byte order intact, into the destination filled from the tail. Byte order
+ * within a codepoint is preserved; codepoint order is reversed. O(n), no
+ * intermediate `[Char]`, no per-char re-encode. A truncated trailing
+ * sequence (malformed input) is copied as-is via the clamped width. */
+static KaiValue *kai_prelude_string_reverse(KaiValue *s) {
+    if (!s || s->tag != KAI_STR) {
+        if (s) kai_decref(s);
+        return kai_str("");
+    }
+    size_t len = s->as.s.len;
+    const unsigned char *src = (const unsigned char *) s->as.s.bytes;
+    KaiValue *out = kai_alloc(KAI_STR);
+    out->as.s.len = len;
+    out->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+    out->as.s.bytes[len] = '\0';
+    unsigned char *dst = (unsigned char *) out->as.s.bytes;
+    size_t i = 0;
+    size_t w = len;
+    while (i < len) {
+        int seq = kai_utf8_seq_len(src[i]);
+        size_t avail = len - i;
+        size_t step = ((size_t) seq > avail) ? avail : (size_t) seq;
+        w -= step;
+        memcpy(dst + w, src + i, step);
+        i += step;
+    }
+    kai_decref(s);
+    return out;
+}
+
 static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
     KaiValue *acc;
     if (!s || s->tag != KAI_STR) {
@@ -6277,6 +6337,7 @@ static KaiValue *_kai_prelude_int_to_byte_string_thunk(KaiValue *s, KaiValue **a
 static KaiValue *_kai_prelude_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_byte_at_int(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_cp_at(a[0], a[1]); }
 static KaiValue *_kai_prelude_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_cp_len(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_reverse(a[0]); }
 static KaiValue *_kai_prelude_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_hash(a[0]); }
 static KaiValue *_kai_prelude_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_bits(a[0]); }
 static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
