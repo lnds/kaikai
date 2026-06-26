@@ -853,6 +853,7 @@ KaiValue *kaix_prelude_int_to_byte_string(KaiValue *i)         { return kai_prel
 KaiValue *kaix_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_prelude_string_byte_at_int(s, i); }
 KaiValue *kaix_prelude_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_prelude_string_cp_at(s, off); }
 KaiValue *kaix_prelude_string_cp_len(KaiValue *s, KaiValue *off) { return kai_prelude_string_cp_len(s, off); }
+KaiValue *kaix_prelude_string_reverse(KaiValue *s)            { return kai_prelude_string_reverse(s); }
 KaiValue *kaix_prelude_string_hash(KaiValue *s)                { return kai_prelude_string_hash(s); }
 KaiValue *kaix_prelude_real_bits(KaiValue *v)                  { return kai_prelude_real_bits(v); }
 KaiValue *kaix_prelude_array_make(KaiValue *n, KaiValue *init)           { return kai_prelude_array_make(n, init); }
