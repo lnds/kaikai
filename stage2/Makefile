@@ -82,16 +82,18 @@ LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # New-PM PassBuilder behind `LLVMRunPasses` / `LLVMCreatePassBuilderOptions`
 # the in-process opt pipeline calls; llvm-config expands its transitive
 # closure (ipo / vectorize / scalaropts / instcombine …), so the explicit
-# `core analysis target codegen` deps below stay covered. `--link-static`
-# keeps `--libs`/`--system-libs` from aborting on absent components in the
-# static build (a harmless no-op against a dynamic Homebrew llvm-config,
-# which has every lib). LLVM is C++, so a static link needs the C++ runtime
+# `core analysis target codegen` deps below stay covered. The component
+# list is repeated on `--system-libs`: without it, against the narrow
+# static vendored build, llvm-config scans every known lib and spews a
+# `missing libLLVM*.a` line per absent component to stderr (a dynamic
+# Homebrew llvm-config has every lib, so it stays quiet there).
+# LLVM is C++, so a static link needs the C++ runtime
 # explicitly (`cc` does not add it; a dynamic `-lLLVM.dylib` carried it
 # implicitly) — `$(LLVM_CXXLIB)` resolves to `-lc++` on macOS and `-lstdc++`
 # on Linux (the apt libLLVM is libstdc++-built). The release-static path
 # (Rust/Zig/Julia model) thus links with no libLLVM runtime dep; the
 # dev-dynamic path links the right C++ lib for the host.
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs) $(LLVM_CXXLIB)
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs passes core analysis target nativecodegen bitwriter) $(LLVM_CXXLIB)
 else
 LLVM_CPPFLAGS :=
 LLVM_LDFLAGS  :=
