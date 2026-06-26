@@ -706,7 +706,8 @@ LLVM_CMAKE_TARGETS := LLVMCore LLVMSupport LLVMIRReader LLVMAsmParser \
                       LLVMSelectionDAG LLVMGlobalISel LLVMAsmPrinter \
                       LLVMipo LLVMInstCombine LLVMInstrumentation \
                       LLVMVectorize LLVMLinker LLVMPasses \
-                      LLVMDemangle LLVMRemarks LLVMDebugInfoDWARF LLVMDebugInfoCodeView
+                      LLVMDemangle LLVMRemarks LLVMDebugInfoDWARF LLVMDebugInfoCodeView \
+                      llvm-config
 
 # llvm-info: prints what would be downloaded / built, without doing it.
 # Safe to run on any machine.
