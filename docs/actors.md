@@ -51,6 +51,7 @@ effect Actor[Msg] {
   self()                          : Pid[Msg]
   send(pid: Pid[Msg], msg: Msg)   : Unit / Cancel
   receive()                       : Msg / Cancel
+  receive_timeout(nanos: Int)     : Option[Msg]
 }
 ```
 
@@ -67,6 +68,17 @@ effect Actor[Msg] {
   arrives. Carries `Cancel` in its row because a blocked
   `receive` is a yield point where the scheduler delivers
   `Cancel.raise()` to a cancelled fiber.
+- `receive_timeout(nanos)` — like `receive()` but gives up
+  after a relative nanosecond deadline, returning `Some(msg)`
+  if a message arrives in time and `None` otherwise. The fiber
+  parks on the mailbox and the reactor timer wheel at once,
+  woken by whichever fires first — no busy-poll. The deadline
+  is serviced by the runtime reactor, which is always present
+  under the fiber scheduler, so the op's row stays `Actor[Msg]`
+  with no `Clock` capability. The `Duration`-typed
+  `receive_timeout(d)` wrapper in `stdlib/actor.kai` is the
+  surface callers use; it converts to nanoseconds and invokes
+  this op.
 
 `Msg` is the concrete message type of the actor. One
 `Actor[Msg]` instance corresponds to one mailbox for one
@@ -728,5 +740,5 @@ Open work after v1:
 - **Doc C updates for mailbox layout**: runtime representation
   of mailboxes, lock-free vs per-actor-mutex, how `DropOldest`
   interacts with Perceus RC on messages in flight.
-- **Timeout-bounded `Actor.receive`** — RFC #638, deferred to
-  the Orongo edition. v1 receive blocks indefinitely.
+- **Selective `receive_match { }`** — pattern-driven mailbox
+  selection. Deferred to the Orongo edition; v1 receive is FIFO.
