@@ -3709,6 +3709,17 @@ static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
     fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
 }
 
+/* Constant-index field read. Same RC contract as kai_op_field (increfs the
+   read field) but skips the strcmp: the emitter computes the slot from the
+   static record type when known, relying on the desugar-canonicalised
+   declaration-order layout. */
+static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+    }
+    return kai_incref(rec->as.rec.fields[i]);
+}
+
 /* m5.x §4b sibling: borrow the field without incref. Used in pat_test
    paths where the caller only reads the field's tag / value to decide
    the arm match — no downstream consumer that would need an owned ref.
