@@ -2703,7 +2703,11 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/actors/dual_actor_send_only.kai \
 	         ../examples/actors/dual_actor_request_reply.kai \
-	         ../examples/actors/dual_actor_receive_only.kai; do \
+	         ../examples/actors/dual_actor_receive_only.kai \
+	         ../examples/actors/receive_timeout_none.kai \
+	         ../examples/actors/receive_timeout_some.kai \
+	         ../examples/actors/receive_timeout_race_message.kai \
+	         ../examples/actors/receive_timeout_race_deadline.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \

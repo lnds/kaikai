@@ -898,6 +898,7 @@ KaiValue *kaix_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *ov
 KaiValue *kaix_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_prelude_mailbox_assign_owner(pid, fiber); }
 KaiValue *kaix_prelude_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_prelude_mailbox_send(pid, msg); }
 KaiValue *kaix_prelude_mailbox_recv(KaiValue *pid)                       { return kai_prelude_mailbox_recv(pid); }
+KaiValue *kaix_prelude_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns) { return kai_prelude_mailbox_recv_timeout(pid, ns); }
 KaiValue *kaix_prelude_mailbox_free(KaiValue *pid)                       { return kai_prelude_mailbox_free(pid); }
 /* Lane 4 (#473) Byte primitive ops. Mirrors the C-side prelude
  * table; needed at link time when the LLVM emit references
