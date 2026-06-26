@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.91.1 (2026-06-26)
+
+### Fixed
+
+- **emit**: exclude module consts from closure capture sets
+
+### Changed
+
+- **emit**: build prelude lookup tables once, not per call site
+
 ## v0.91.0 (2026-06-25)
 
 ### Added
