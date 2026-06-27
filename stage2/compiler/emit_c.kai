@@ -2037,7 +2037,7 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
       else { match efn_resolve(cx.fns, callee) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
           let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-          let raw_call = cat5("kai_", c_sym(callee, mo), "(", raw_args, ")")
+          let raw_call = emit_user_call(c_sym(callee, mo), raw_args, cx)
           Some(ufn_call_result(rt, raw_call))
         }
         _ -> None
@@ -2045,7 +2045,7 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
       Some(US(_, rt, mask)) -> {
         let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-        let raw_call = cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")")
+        let raw_call = emit_user_call(c_sym(fname, Some(mod)), raw_args, cx)
         Some(ufn_call_result(rt, raw_call))
       }
       None -> None
@@ -2637,7 +2637,7 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
       None -> match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, _)) -> cat5("kai_", c_sym(callee, mo), "(", call_args, ")")
+        Some(EFn(_, _, mo, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
           ", (KaiValue *[]){", call_args, "})"
@@ -2646,6 +2646,59 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
     }
     }
   } }
+
+# #820 L3 — fill the callee's evidence frame at the call site and prepend
+# it to the user args. For each of the callee's slots, the value is what
+# THIS caller resolves for that effect (its own supplier classification):
+#   - the caller forwards it (the effect is in the caller's frame) →
+#     `__evf[caller_idx]`;
+#   - otherwise the caller has it lexically (a `handle` in scope) or via a
+#     startup default → `kai_evidence_lookup_node("E")`, the node live at
+#     this point. Threaded into the slot, the callee reads it without a
+#     re-walk. (Two live instances would need a per-instance node here —
+#     that is the L6 surface; under the ≤1-handler corpus the live node is
+#     the right one.)
+fn emit_evf_call_arg(slots: [String], call_args: String, cx: EmitCtx) : String = match slots {
+  [] -> call_args
+  _  -> {
+    let frame = concat_all(["(KaiEvidence *[]){", emit_evf_slots(slots, cx), "}"])
+    if call_args == "" { frame } else { concat_all([frame, ", ", call_args]) }
+  }
+}
+
+fn emit_evf_slots(slots: [String], cx: EmitCtx) : String =
+  join_with(map(slots, (eff) => emit_evf_one_slot(eff, cx)), ", ")
+
+fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
+  let caller_idx = frame_slot_index(cx.evf, cx.cur_enc_fn, eff)
+  if caller_idx >= 0 { concat_all(["__evf[", int_to_string(caller_idx), "]"]) }
+  else { concat_all(["kai_evidence_lookup_node(\"", eff, "\")"]) }
+}
+
+# Emit a direct user-fn call `kai_<csym>(<frame?><args>)`, prepending the
+# evidence frame when the callee carries one. The single funnel every
+# user-fn call site routes through, so the frame is filled consistently;
+# a frameless callee (`frame_slots_of` empty) reduces to the legacy form.
+fn emit_user_call(csym: String, call_args: String, cx: EmitCtx) : String =
+  cat5("kai_", csym, "(", emit_evf_call_arg(frame_slots_of(cx.evf, csym), call_args, cx), ")")
+
+# Join a frame ARGUMENT (already a `(KaiEvidence *[]){...}` value, or "") to
+# the user args — the value-side analogue of `evf_join_params`.
+fn evf_join_args(frame_arg: String, rest: String) : String =
+  if frame_arg == "" { rest }
+  else if rest == "" { frame_arg }
+  else { concat_all([frame_arg, ", ", rest]) }
+
+# The frame value a thunk passes: each slot filled by the live by-name walk
+# (the thunk has no caller frame; the node live at the indirect call is the
+# ≤1-handler-correct one). Empty when the callee carries no frame.
+fn emit_evf_thunk_frame(slots: [String]) : String = match slots {
+  [] -> ""
+  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, evf_thunk_slot), ", "), "}"])
+}
+
+fn evf_thunk_slot(eff: String) : String =
+  concat_all(["kai_evidence_lookup_node(\"", eff, "\")"])
 
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Console {
 
@@ -6063,7 +6116,7 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
         Some(EFn(_, _, mo, Some(US(_, rt, mask)))) ->
           if ty_is_unboxable_t(rt) {
             let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-            Some(cat5("kai_", c_sym(callee, mo), "(", raw_args, ")"))
+            Some(emit_user_call(c_sym(callee, mo), raw_args, cx))
           } else { None }
         _ -> None
       } }
@@ -6071,7 +6124,7 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
       Some(US(_, rt, mask)) ->
         if ty_is_unboxable_t(rt) {
           let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-          Some(cat5("kai_", c_sym(fname, Some(mod)), "(", raw_args, ")"))
+          Some(emit_user_call(c_sym(fname, Some(mod)), raw_args, cx))
         } else { None }
       None -> None
     }
@@ -7696,7 +7749,7 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
+fn emit_fn_thunk(d: Decl, fns: [EFn], frames: [FnEvidenceFrame]) : String {
   match d {
     DFn(_, name, _, params, opt_ret, _, _, _, _, mo) -> {
       let sym = c_sym(name, mo)
@@ -7724,6 +7777,10 @@ fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
       # still hands back a `KaiValue *`. This is the dispatch
       # bridge between the boxed first-class-fn world and the
       # raw direct-call world.
+      # #820 L3 — a thunk is the indirect (closure) entry; it has no
+      # caller frame, so it fills the callee's frame from the live evidence
+      # stack (a walk per slot — the ≤1-handler-correct node at the call).
+      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym))
       match lookup_ufn_sig(fns, name, mo) {
         Some(US(pts, rt, mask)) -> {
           # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
@@ -7732,7 +7789,7 @@ fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
           # and the result wraps only if the return is raw.
           let arg_unbox = emit_thunk_unbox_args_masked(params, pts, mask, 0)
           let arg_list = emit_thunk_arg_list_masked(params, mask, 0)
-          let call_raw = concat_all(["kai_", sym, "(", arg_list, ")"])
+          let call_raw = concat_all(["kai_", sym, "(", evf_join_args(thunk_frame, arg_list), ")"])
           let body = concat_all([
             arg_unbox,
             "    return ", ufn_call_result(rt, call_raw), ";\n}\n\n"
@@ -7742,7 +7799,7 @@ fn emit_fn_thunk(d: Decl, fns: [EFn]) : String {
         None -> {
           let param_reads = emit_param_reads(params, 0)
           let named_args = emit_param_args(params)
-          let call = concat_all(["    return kai_", sym, "(", named_args, ");\n}\n\n"])
+          let call = concat_all(["    return kai_", sym, "(", evf_join_args(thunk_frame, named_args), ");\n}\n\n"])
           concat_all([hdr, param_reads, call])
         }
       }
@@ -7906,7 +7963,7 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, b: SB)
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, mo) -> {
       let r = fns_prefer_module_cached(fbm, mo)
-      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table)), emit_fn_thunk(d, cx.fns))
+      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table)), emit_fn_thunk(d, cx.fns, cx.evf))
       fn_bodies_loop(src, rest, cx, r.cache, b1)
     }
     _ -> fn_bodies_loop(src, rest, cx, fbm, b)
