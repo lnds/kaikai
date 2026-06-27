@@ -1,0 +1,124 @@
+# compiler/evidence_scan.kai — discharge-backed effect scan (#820 L1).
+#
+# The op-name collision predicate (`evidence.kai`) turns on whether the
+# effect a perform RESOLVED to is discharge-backed program-wide. An
+# effect is backed when some function installs a `handle ... with <eff>`
+# for it, or it carries a `default {}` block (a startup default). Either
+# commits a discharger. Absence means a perform of the effect is absorbed
+# by an open row-variable tail that no signature closes against a
+# handler — the #789 phantom-absorption that lets the by-name walk divert
+# the perform to a sibling effect's evidence.
+#
+# This is the structural search for that fact, split out of evidence.kai
+# so the AST descent (one arm per `ExprKind`) does not weigh down the
+# obligation model. Single-line `#[doc(...)]` only — kaic1 consumes the
+# concatenated bundle and rejects triple-quoted attribute strings.
+
+import compiler.ast
+
+#[doc("evidence: true when `eff` is discharge-backed program-wide — handled in some fn, or carrying a `default {}` block.")]
+pub fn obl_eff_backed(decls: [Decl], eff: String) : Bool =
+  obl_eff_has_default(decls, eff) or obl_eff_handled_anywhere(decls, decls, eff)
+
+fn obl_eff_has_default(decls: [Decl], eff: String) : Bool = match decls {
+  []           -> false
+  [d, ...rest] -> match d {
+    DEffect(_, n, _, _, defblk, _, _, _) ->
+      if n == eff { match defblk { Some(_) -> true None -> false } }
+      else { obl_eff_has_default(rest, eff) }
+    _ -> obl_eff_has_default(rest, eff)
+  }
+}
+
+fn obl_eff_handled_anywhere(all: [Decl], ds: [Decl], eff: String) : Bool = match ds {
+  []           -> false
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      if obl_body_handles(body, eff) { true } else { obl_eff_handled_anywhere(all, rest, eff) }
+    _ -> obl_eff_handled_anywhere(all, rest, eff)
+  }
+}
+
+# True when `body` contains a `handle ... with <eff>` anywhere. A
+# read-only structural search; it descends every sub-expression form
+# (the `_ -> false` arm covers leaves).
+fn obl_body_handles(e: Expr, eff: String) : Bool = match e.kind {
+  EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) ->
+    (eff_name == eff) or obl_body_handles(body, eff) or obl_opt_handles(init_opt, eff) or obl_clauses_handle(clauses, eff) or obl_ret_handles(ret_opt, eff)
+  ECall(callee, args_)  -> obl_body_handles(callee, eff) or obl_any_handles(args_, eff)
+  EIntrinsic(_, args_)  -> obl_any_handles(args_, eff)
+  EField(b, _)          -> obl_body_handles(b, eff)
+  EUnop(_, x)           -> obl_body_handles(x, eff)
+  EBang(x)              -> obl_body_handles(x, eff)
+  ELitUnit(x, _)        -> obl_body_handles(x, eff)
+  ELambda(_, b)         -> obl_body_handles(b, eff)
+  EIndex(a, b)          -> obl_handles2(a, b, eff)
+  EBinop(_, a, b)       -> obl_handles2(a, b, eff)
+  EPipe(a, b)           -> obl_handles2(a, b, eff)
+  EMapPipe(a, b)        -> obl_handles2(a, b, eff)
+  EFlatMapPipe(a, b)    -> obl_handles2(a, b, eff)
+  EFilterPipe(a, b)     -> obl_handles2(a, b, eff)
+  EIf(c, t, eo)         -> obl_handles2(c, t, eff) or obl_opt_handles(eo, eff)
+  ERange(a, b, eo)      -> obl_handles2(a, b, eff) or obl_opt_handles(eo, eff)
+  EMatch(scr, arms)     -> obl_body_handles(scr, eff) or obl_arms_handle(arms, eff)
+  ERecordLit(_, fs)     -> obl_fields_handle(fs, eff)
+  EList(els)            -> obl_elems_handle(els, eff)
+  EBlock(stmts, tail)   -> obl_stmts_handle(stmts, eff) or obl_opt_handles(tail, eff)
+  _                     -> false
+}
+
+fn obl_handles2(a: Expr, b: Expr, eff: String) : Bool =
+  obl_body_handles(a, eff) or obl_body_handles(b, eff)
+
+fn obl_opt_handles(eo: Option[Expr], eff: String) : Bool = match eo {
+  Some(e) -> obl_body_handles(e, eff)   None -> false
+}
+
+fn obl_any_handles(es: [Expr], eff: String) : Bool = match es {
+  []           -> false
+  [h, ...rest] -> obl_body_handles(h, eff) or obl_any_handles(rest, eff)
+}
+
+fn obl_arms_handle(arms: [Arm], eff: String) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> obl_opt_handles(og, eff) or obl_body_handles(body, eff) or obl_arms_handle(rest, eff)
+  }
+}
+
+fn obl_fields_handle(fs: [FieldInit], eff: String) : Bool = match fs {
+  []           -> false
+  [f, ...rest] -> match f { FI(_, e) -> obl_body_handles(e, eff) or obl_fields_handle(rest, eff) }
+}
+
+fn obl_elems_handle(els: [ListElem], eff: String) : Bool = match els {
+  []            -> false
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> obl_body_handles(e, eff) or obl_elems_handle(rest, eff)
+    ElSpread(e) -> obl_body_handles(e, eff) or obl_elems_handle(rest, eff)
+  }
+}
+
+fn obl_stmts_handle(ss: [Stmt], eff: String) : Bool = match ss {
+  []           -> false
+  [s, ...rest] -> obl_stmt_handles(s, eff) or obl_stmts_handle(rest, eff)
+}
+
+fn obl_stmt_handles(s: Stmt, eff: String) : Bool = match s {
+  SLet(_, _, e)        -> obl_body_handles(e, eff)
+  SVar(_, _, e, _, _)  -> obl_body_handles(e, eff)
+  SExprStmt(e)         -> obl_body_handles(e, eff)
+  SAssert(e, og)       -> obl_body_handles(e, eff) or obl_opt_handles(og, eff)
+  SIndexAssign(a, b, c, _, _) -> obl_body_handles(a, eff) or obl_body_handles(b, eff) or obl_body_handles(c, eff)
+  SUse(_, _, _)        -> false
+}
+
+fn obl_clauses_handle(cs: [HClause], eff: String) : Bool = match cs {
+  []           -> false
+  [c, ...rest] -> match c { HC(_, _, b, _, _) -> obl_body_handles(b, eff) or obl_clauses_handle(rest, eff) }
+}
+
+fn obl_ret_handles(ret_opt: Option[HReturn], eff: String) : Bool = match ret_opt {
+  Some(r) -> match r { HR(_, b, _, _) -> obl_body_handles(b, eff) }
+  None    -> false
+}
