@@ -221,6 +221,16 @@ typedef enum {
 #define KAI_PROTO_NUMERIC      12
 #define KAI_USER_PROTO_ID_BASE 13
 
+/* Operation index within a protocol (declaration order in
+ * stdlib/protocols.kai). The impl table keys on (proto_id, op_id, head_tag):
+ * a multi-op protocol (Ord, Numeric) registers one impl per op for the same
+ * (proto_id, head_tag), so the op_id disambiguates which impl a dispatcher
+ * or a bare-op-as-value lookup resolves. Single-op protocols use op 0. */
+#define KAI_OP_ORD_CMP          0
+#define KAI_OP_ORD_MIN          1
+#define KAI_OP_ORD_MAX          2
+#define KAI_OP_EQ_EQ            0
+
 /* Variant-tag -> head-type-tag map. Set once at startup by codegen-
  * emitted main via kai_register_variant_heads(table, len). Until set,
  * the bootstrap table covers the 11 reserved builtin variants
@@ -252,14 +262,18 @@ static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
  * loaded into the runtime hashmap at startup by kai_register_impls. */
 typedef struct {
     int32_t proto_id;
+    int32_t op_id;
     int32_t head_tag;
     void   *fn;
 } KaiImplEntry;
 
 /* Open-addressing hashmap, linear probing. Capacity is a power of 2.
- * Empty slot marked by fn == NULL (no impl ever has NULL function). */
+ * Empty slot marked by fn == NULL (no impl ever has NULL function).
+ * Key is (proto_id, op_id, head_tag): a multi-op protocol registers one
+ * impl per op for the same (proto_id, head_tag), so op_id disambiguates. */
 typedef struct {
     int32_t proto_id;
+    int32_t op_id;
     int32_t head_tag;
     void   *fn;
 } KaiImplSlot;
@@ -268,22 +282,24 @@ static KaiImplSlot *kai_impl_table  = NULL;
 static int32_t      kai_impl_cap    = 0;
 static int32_t      kai_impl_count  = 0;
 
-static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t head_tag) {
+static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t op_id, int32_t head_tag) {
     /* FNV-1a-ish mix; keys are small ints so any cheap mix is fine. */
     uint32_t h = (uint32_t) proto_id * 2654435761u;
+    h ^= (uint32_t) op_id * 2246822519u;
     h ^= (uint32_t) head_tag * 40503u;
     h ^= h >> 13;
     return h;
 }
 
-/* Lookup. Returns NULL when no impl is registered for (proto_id, head_tag).
+/* Lookup. Returns NULL when no impl is registered for the key.
  * The dispatcher panics on NULL with a meaningful message. */
-static inline void *kai_lookup_impl(int32_t proto_id, int32_t head_tag) {
+static inline void *kai_lookup_impl(int32_t proto_id, int32_t op_id, int32_t head_tag) {
     if (kai_impl_cap == 0) return NULL;
     uint32_t mask = (uint32_t) (kai_impl_cap - 1);
-    uint32_t i    = kai_impl_hash(proto_id, head_tag) & mask;
+    uint32_t i    = kai_impl_hash(proto_id, op_id, head_tag) & mask;
     while (kai_impl_table[i].fn != NULL) {
         if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].op_id == op_id &&
             kai_impl_table[i].head_tag == head_tag) {
             return kai_impl_table[i].fn;
         }
@@ -292,14 +308,14 @@ static inline void *kai_lookup_impl(int32_t proto_id, int32_t head_tag) {
     return NULL;
 }
 
-static inline void kai_impl_insert(int32_t proto_id, int32_t head_tag, void *fn) {
+static inline void kai_impl_insert(int32_t proto_id, int32_t op_id, int32_t head_tag, void *fn) {
     uint32_t mask = (uint32_t) (kai_impl_cap - 1);
-    uint32_t i    = kai_impl_hash(proto_id, head_tag) & mask;
+    uint32_t i    = kai_impl_hash(proto_id, op_id, head_tag) & mask;
     while (kai_impl_table[i].fn != NULL) {
-        /* Duplicate registration of the same (proto_id, head_tag) is
-         * a codegen bug — overwrite silently rather than crash, but
-         * keep the same fn pointer in practice. */
+        /* Duplicate registration of the same key is a codegen bug —
+         * overwrite silently rather than crash. */
         if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].op_id == op_id &&
             kai_impl_table[i].head_tag == head_tag) {
             kai_impl_table[i].fn = fn;
             return;
@@ -307,6 +323,7 @@ static inline void kai_impl_insert(int32_t proto_id, int32_t head_tag, void *fn)
         i = (i + 1u) & mask;
     }
     kai_impl_table[i].proto_id = proto_id;
+    kai_impl_table[i].op_id    = op_id;
     kai_impl_table[i].head_tag = head_tag;
     kai_impl_table[i].fn       = fn;
     kai_impl_count++;
@@ -324,7 +341,7 @@ static void kai_register_impls(const KaiImplEntry *entries, int32_t n) {
     kai_impl_cap    = cap;
     kai_impl_count  = 0;
     for (int32_t k = 0; k < n; ++k) {
-        kai_impl_insert(entries[k].proto_id, entries[k].head_tag, entries[k].fn);
+        kai_impl_insert(entries[k].proto_id, entries[k].op_id, entries[k].head_tag, entries[k].fn);
     }
 }
 
@@ -3850,7 +3867,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
              * kai_op_eq is NON-consuming, so we incref a/b for the impl (which
              * consumes them) and do NOT decref here. */
             int32_t _eq_head = kai_head_tag(a);
-            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, _eq_head);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
             if (_eq_fn) {
                 kai_incref(a); kai_incref(b);
                 KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
@@ -3892,7 +3909,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
              * a tag today). Root records reached via the resolver still work;
              * this hook fires only when as.rec.head_type_tag is a real impl. */
             int32_t _eq_head = kai_head_tag(a);
-            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, _eq_head);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
             if (_eq_fn) {
                 kai_incref(a); kai_incref(b);
                 KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
@@ -4776,7 +4793,7 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
          * nested). kai_op_lt CONSUMES a/b, so incref for the impl (which also
          * consumes) AND decref a/b at the end. cmp result < 0 means a < b. */
         int32_t _o_head = kai_head_tag(a);
-        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, _o_head);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, KAI_OP_ORD_CMP, _o_head);
         if (_o_fn) {
             kai_incref(a); kai_incref(b);
             KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
@@ -4804,7 +4821,7 @@ static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     } else {
         /* Ord dispatch (mirror of kai_op_lt). cmp result > 0 means a > b. */
         int32_t _o_head = kai_head_tag(a);
-        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, _o_head);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, KAI_OP_ORD_CMP, _o_head);
         if (_o_fn) {
             kai_incref(a); kai_incref(b);
             KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
