@@ -210,6 +210,57 @@ fn main() : Unit / Stdout = Stdout.print(act(Green))
 compile error, whereas a missing `else` branch silently does nothing.
 See `kai info match`.
 
+## clause-block vs match-in-body
+
+When the WHOLE point of a function is to dispatch on its parameters,
+write a clause-block — `case` arms in lieu of a body. It reads like
+an Elixir/Haskell multi-clause head and drops the `= match arg { ... }`
+wrapper.
+
+```kaikai
+type Shape = Circle(Int) | Square(Int)
+
+fn area(s: Shape) : Int {
+  case Circle(r) -> 3 * r * r
+  case Square(w) -> w * w
+}
+
+fn main() : Unit / Stdout = Stdout.print(int_to_string(area(Circle(2))))
+```
+
+Reach for `match`-in-body instead when you discriminate something
+that is NOT directly a parameter — a derived value, a field, an
+intermediate result. There is no parameter to put after `case`, so a
+`match` over the sub-expression is the honest form.
+
+```kaikai
+fn parity(n: Int) : String = match n % 2 {     # match a derived value,
+  0 -> "even"                                   #   not a bare argument
+  _ -> "odd"
+}
+
+fn main() : Unit / Stdout = Stdout.print(parity(7))
+```
+
+The criterion: clause-block when the arms ARE the function and dispatch
+straight on the arguments; `match`-in-body when you first compute or
+project the thing you discriminate. The guard keyword differs too —
+`when` inside a clause-block, `if` inside a plain `match` arm. These do
+NOT compile (clause-block guard is `when`; signatures take no literal
+patterns or guards):
+
+```kaikai-neg
+fn classify(n: Int) : String {
+  case n if n < 0 -> "neg"                       # clause-block guard is
+  case _          -> "pos"                       #   `when`, not `if`
+}
+```
+
+```kaikai-neg
+fn fib(0) : Int = 0                             # no literal-in-signature
+fn fib(n: Int) : Int = fib(n - 1)               #   multi-clause head
+```
+
 ## Option over a sentinel
 
 Absence is `Option[T]`, not a magic value like `-1`, an empty string,
@@ -231,9 +282,10 @@ fn main() : Unit / Stdout = match find_pos([3, 7, 9], 7) {
 ## Short body vs block body
 
 Use the `=` short body when a function is a single expression; use a
-`{ }` block when it needs intermediate `let`s or statements. Two
-function-body forms is a deliberate redundancy — pick the one that
-reads cleaner, not a third invented one.
+`{ }` block when it needs intermediate `let`s or statements; use a
+clause-block `{ case … }` when the body dispatches straight on the
+parameters (see above). Each has a clear intent — pick the one that
+reads cleaner, not a fourth invented one.
 
 ```kaikai
 fn square(x: Int) : Int = x * x
@@ -291,6 +343,8 @@ These are the reaches an agent makes from another language. Each
 LEFT form does NOT exist in kaikai; write the RIGHT form. The
 authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 
+- `fn f(0) = ...` / `fn f(n) when c = ...` (Elixir multi-clause head)
+  → a clause-block `fn f(n) { case 0 -> ...; case _ -> ... }`
 - `\x -> body` (Haskell) / `fn x -> body` (ML) → `(x) => body`
 - `(+ 1)` operator section → `(x => x + 1)`
 - `[x * 2 for x in xs]` list comprehension → `xs | (x => x * 2)`
