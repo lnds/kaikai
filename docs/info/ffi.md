@@ -76,10 +76,30 @@ fresh record. The C ABI (small struct in registers vs. memory per
 SysV / AAPCS) is the C compiler's job — kaikai emits the struct type
 and lets the C compiler classify it.
 
+### The shim names the struct from `kai_ffi.h`
+
+A program with an `extern "C" type` struct generates a `kai_ffi.h`
+beside the build, with one `typedef` per declared type. A hand-written
+C shim `#include`s it and names the SAME type — so the boundary is one
+authoritative struct definition the C compiler can check, not a layout
+twin the linker silently matches:
+
+```c
+#include "kai_ffi.h"        /* provides Color, Vector2, ... */
+
+void draw_circle_v(Vector2 center, float radius, Color color) { ... }
+Vector2 get_mouse_position(void) { ... }
+```
+
+Build with the shim on `CFLAGS`: `CFLAGS="shim.c" kai build --backend=c app.kai`.
+
 > Struct-by-value compiles on the **C-direct backend** (`--backend=c`).
-> The native (libLLVM) backend routes struct FFI through the C backend;
-> a native build of a struct-FFI program reports the gap and the
-> `--backend=c` fix. Native struct marshalling is a planned follow-up.
+> The native (libLLVM) backend does NOT yet marshal it: a small struct's
+> C ABI (coerced to `iN` / `[N x float]` / `sret` per SysV / AAPCS) is
+> frontend classification LLVM does not derive from a struct value, so a
+> native build of a struct-FFI program fails with an actionable message
+> naming the function and the `--backend=c` fix. The C compiler owns that
+> classification; native ABI classification is a planned follow-up.
 
 ## Opaque handles
 
