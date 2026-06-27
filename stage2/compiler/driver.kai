@@ -29,6 +29,7 @@ import compiler.region
 import compiler.infer
 import compiler.evidence_scan
 import compiler.evidence
+import compiler.evidence_inject
 import compiler.fnreg
 import compiler.unbox
 import compiler.rawsafe
@@ -1121,6 +1122,10 @@ pub type Mode
   # discharges each (lexical handle / forwarded caller param / startup
   # default / collision). Analysis only; emits nothing codegen reads.
   | MDumpEvidenceObligations
+  # `--dump=evidence-arity` — histogram the injected evidence-param count
+  # per function (max / p99 / mean / count > 3). The §A.3 spike feeding the
+  # L3 individual-params-vs-packed-tuple ABI decision. Analysis only.
+  | MDumpEvidenceArity
   | MHoles
   | MHolesJson
   | MEffectsJson
@@ -1386,6 +1391,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpBrands))
       } else if a == "--dump=evidence-obligations" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpEvidenceObligations))
+      } else if a == "--dump=evidence-arity" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpEvidenceArity))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -1535,6 +1542,7 @@ fn usage() : Unit / Console {
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --dump-brands      list nursery cap-binding brand allocations + per-call attributions (issue #71 option (b))")
   eprint("  --dump=evidence-obligations  per fn: demanded effect-instance evidence + per-supplier classification")
+  eprint("  --dump=evidence-arity        histogram injected evidence-param count per fn (max/p99/mean/>3)")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --effects-json     report per-fn effects + handlers as JSON")
   eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
@@ -4222,6 +4230,14 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 # Exit 0 — analysis only, so fixtures can pin a golden.
                 dump_evidence_obligations(path, all_decls)
               }
+              MDumpEvidenceArity -> {
+                # Injection-arity histogram for the §A.3 ABI spike. Runs
+                # the injection pass over the whole loaded program (self-
+                # compile + stdlib when pointed at the compiler) and
+                # reports the per-fn evidence-param count distribution.
+                # Analysis only; exit 0.
+                dump_evidence_arity(path, all_decls)
+              }
               MHoles -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_holes(path, all_decls) }
@@ -4306,6 +4322,15 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   # of the three structural properties is violated. See
                   # `validate_typer_invariants` for the catalog.
                   let inv_errs = validate_typer_invariants(typed_prog, path)
+                  # #789 op-name collision diagnostic. The by-name handler
+                  # walk binds the wrong evidence when an op name is shared
+                  # by ≥2 effects and the call is not disambiguated; the
+                  # typer's resolution record (`op_res`) flags those sites.
+                  # Capability passing makes the collision impossible, so it
+                  # is a compile error, not corruption (the soundness hole
+                  # #789's tangential native fix left open).
+                  let collision_errs =
+                    check_op_collisions(path, typed_prog.op_res, all_decls)
                   # Emit a warning for each ambiguous bare-name that the
                   # root file ACTUALLY references. Firing one per
                   # ambiguous export regardless of usage produces
@@ -4325,6 +4350,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                   if typed_prog.errs != 0 { typed_prog.errs }
                   else if dispatch_errs != 0 { dispatch_errs }
                   else if inv_errs != 0 { inv_errs }
+                  else if collision_errs != 0 { collision_errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
@@ -4334,6 +4360,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       let mono_out = monomorphise(typed_prog, proto_reg,
                                                      post_local_arities)
                       let mono_decls = match mono_out { MonoOut(ds, _) -> ds }
+                      # Evidence-param threading (#820 L2). Compute the
+                      # per-function evidence obligations pre-mono and
+                      # re-key them onto the specialised symbols, so each
+                      # mono spec carries the obligations its row demands.
+                      # This is the only honest half of "thread through
+                      # monomorphisation" the frontend can do alone: mono
+                      # transports the metadata across the type fan-out;
+                      # L3 consumes it to materialise the hidden params.
+                      # Codegen reads none of it here (byte-id proves it),
+                      # so the result is exercised, not consumed.
+                      let _ev_meta = reindex_evidence_params(
+                        inject_evidence_params(typed_prog.decls), mono_decls)
                       # Per-spec leak records
                       # carry only TyVarT/UVar ids in the spec's
                       # SubstMap domain — any leak means body subst

@@ -122,3 +122,131 @@ fn obl_ret_handles(ret_opt: Option[HReturn], eff: String) : Bool = match ret_opt
   Some(r) -> match r { HR(_, b, _, _) -> obl_body_handles(b, eff) }
   None    -> false
 }
+
+# ----------------------------------------------------------------------
+# Distinct live-instance count for an effect, keyed by handler alias.
+#
+# A cross-instance op-name collision (#789) needs ≥2 distinct instances
+# of one effect for the by-name walk to bind the wrong one — a single
+# instance (e.g. the `var xs` clause-scope desugar) is unambiguous, there
+# is no second instance to mis-bind to. The count is program-wide, a
+# conservative over-approximation of "co-reachable at the read": it cannot
+# miss a real collision, and the case it could over-count (two instances
+# that never coexist) does not arise in the corpus. Instances are keyed by
+# `as <alias>`; a bare handler is one anonymous instance, and two bare
+# handlers of one effect collapse to that one anonymous instance — the
+# bare-vs-bare accidental-equivalence the redesign already tolerates.
+# ----------------------------------------------------------------------
+
+#[doc("evidence: count distinct live instances of `eff` program-wide, keyed by handler alias (bare = one anonymous instance).")]
+pub fn obl_eff_instance_count(decls: [Decl], eff: String) : Int =
+  list_length(obl_collect_aliases_decls(decls, eff, []))
+
+fn obl_collect_aliases_decls(ds: [Decl], eff: String, seen: [String]) : [String] = match ds {
+  []           -> seen
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      obl_collect_aliases_decls(rest, eff, obl_collect_aliases(body, eff, seen))
+    _ -> obl_collect_aliases_decls(rest, eff, seen)
+  }
+}
+
+# A bare handler (`with State`) maps to the sentinel "" key; an aliased
+# one (`with State as xs`) maps to its alias. Distinct keys = distinct
+# instances.
+fn obl_alias_add(seen: [String], alias_opt: Option[String]) : [String] = {
+  let key = match alias_opt { Some(a) -> a None -> "" }
+  if obl_alias_seen(seen, key) { seen } else { [key, ...seen] }
+}
+
+fn obl_alias_seen(seen: [String], key: String) : Bool = match seen {
+  []           -> false
+  [h, ...rest] -> if h == key { true } else { obl_alias_seen(rest, key) }
+}
+
+fn obl_collect_aliases(e: Expr, eff: String, seen: [String]) : [String] = match e.kind {
+  EHandle(body, eff_name, _, init_opt, alias_opt, clauses, ret_opt) -> {
+    let s1 = if eff_name == eff { obl_alias_add(seen, alias_opt) } else { seen }
+    let s2 = obl_collect_aliases(body, eff, s1)
+    let s3 = obl_alias_opt(init_opt, eff, s2)
+    let s4 = obl_alias_clauses(clauses, eff, s3)
+    obl_alias_ret(ret_opt, eff, s4)
+  }
+  ECall(callee, args_)  -> obl_alias_list(args_, eff, obl_collect_aliases(callee, eff, seen))
+  EIntrinsic(_, args_)  -> obl_alias_list(args_, eff, seen)
+  EField(b, _)          -> obl_collect_aliases(b, eff, seen)
+  EUnop(_, x)           -> obl_collect_aliases(x, eff, seen)
+  EBang(x)              -> obl_collect_aliases(x, eff, seen)
+  ELitUnit(x, _)        -> obl_collect_aliases(x, eff, seen)
+  ELambda(_, b)         -> obl_collect_aliases(b, eff, seen)
+  EIndex(a, b)          -> obl_alias2(a, b, eff, seen)
+  EBinop(_, a, b)       -> obl_alias2(a, b, eff, seen)
+  EPipe(a, b)           -> obl_alias2(a, b, eff, seen)
+  EMapPipe(a, b)        -> obl_alias2(a, b, eff, seen)
+  EFlatMapPipe(a, b)    -> obl_alias2(a, b, eff, seen)
+  EFilterPipe(a, b)     -> obl_alias2(a, b, eff, seen)
+  EIf(c, t, eo)         -> obl_alias_opt(eo, eff, obl_alias2(c, t, eff, seen))
+  ERange(a, b, eo)      -> obl_alias_opt(eo, eff, obl_alias2(a, b, eff, seen))
+  EMatch(scr, arms)     -> obl_alias_arms(arms, eff, obl_collect_aliases(scr, eff, seen))
+  ERecordLit(_, fs)     -> obl_alias_fields(fs, eff, seen)
+  EList(els)            -> obl_alias_elems(els, eff, seen)
+  EBlock(stmts, tail)   -> obl_alias_opt(tail, eff, obl_alias_stmts(stmts, eff, seen))
+  _                     -> seen
+}
+
+fn obl_alias2(a: Expr, b: Expr, eff: String, seen: [String]) : [String] =
+  obl_collect_aliases(b, eff, obl_collect_aliases(a, eff, seen))
+
+fn obl_alias_opt(eo: Option[Expr], eff: String, seen: [String]) : [String] = match eo {
+  Some(e) -> obl_collect_aliases(e, eff, seen)   None -> seen
+}
+
+fn obl_alias_list(es: [Expr], eff: String, seen: [String]) : [String] = match es {
+  []           -> seen
+  [h, ...rest] -> obl_alias_list(rest, eff, obl_collect_aliases(h, eff, seen))
+}
+
+fn obl_alias_arms(arms: [Arm], eff: String, seen: [String]) : [String] = match arms {
+  []           -> seen
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> obl_alias_arms(rest, eff, obl_collect_aliases(body, eff, obl_alias_opt(og, eff, seen)))
+  }
+}
+
+fn obl_alias_fields(fs: [FieldInit], eff: String, seen: [String]) : [String] = match fs {
+  []           -> seen
+  [f, ...rest] -> match f { FI(_, e) -> obl_alias_fields(rest, eff, obl_collect_aliases(e, eff, seen)) }
+}
+
+fn obl_alias_elems(els: [ListElem], eff: String, seen: [String]) : [String] = match els {
+  []            -> seen
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> obl_alias_elems(rest, eff, obl_collect_aliases(e, eff, seen))
+    ElSpread(e) -> obl_alias_elems(rest, eff, obl_collect_aliases(e, eff, seen))
+  }
+}
+
+fn obl_alias_stmts(ss: [Stmt], eff: String, seen: [String]) : [String] = match ss {
+  []           -> seen
+  [s, ...rest] -> obl_alias_stmts(rest, eff, obl_alias_stmt(s, eff, seen))
+}
+
+fn obl_alias_stmt(s: Stmt, eff: String, seen: [String]) : [String] = match s {
+  SLet(_, _, e)        -> obl_collect_aliases(e, eff, seen)
+  SVar(_, _, e, _, _)  -> obl_collect_aliases(e, eff, seen)
+  SExprStmt(e)         -> obl_collect_aliases(e, eff, seen)
+  SAssert(e, og)       -> obl_alias_opt(og, eff, obl_collect_aliases(e, eff, seen))
+  SIndexAssign(a, b, c, _, _) ->
+    obl_collect_aliases(c, eff, obl_collect_aliases(b, eff, obl_collect_aliases(a, eff, seen)))
+  SUse(_, _, _)        -> seen
+}
+
+fn obl_alias_clauses(cs: [HClause], eff: String, seen: [String]) : [String] = match cs {
+  []           -> seen
+  [c, ...rest] -> match c { HC(_, _, b, _, _) -> obl_alias_clauses(rest, eff, obl_collect_aliases(b, eff, seen)) }
+}
+
+fn obl_alias_ret(ret_opt: Option[HReturn], eff: String, seen: [String]) : [String] = match ret_opt {
+  Some(r) -> match r { HR(_, b, _, _) -> obl_collect_aliases(b, eff, seen) }
+  None    -> seen
+}

@@ -1,0 +1,331 @@
+# compiler/evidence_inject.kai — evidence-param injection (#820 L2).
+#
+# Consumes the L1 obligation model (`evidence.kai`) and turns it into
+# two products the capability-passing transport needs, plus the #789
+# soundness diagnostic:
+#
+#   1. The op-name COLLISION diagnostic. L1 detects, per op resolution,
+#      whether the by-name walk mis-binds the evidence (`obl_is_collision`).
+#      Here that detection becomes a real compile error at the call site,
+#      closing the #789 soundness hole the by-name dispatch left open.
+#
+#   2. Evidence-param METADATA (design §3 / lane-plan §A.1). Per function,
+#      one hidden param per distinct effect-instance its row demands, typed
+#      as the opaque non-RC `TyHandle` scalar — a raw evidence-node
+#      pointer Perceus must never dup/drop. This is LATERAL: it injects
+#      nothing into the emitted AST, so codegen still ignores it (the L3
+#      flip materialises it as real params + call-site rewrites). The
+#      metadata SURVIVES monomorphisation re-keyed by mangled symbol, so
+#      L3 finds each spec's obligations after the type fan-out.
+#
+#   3. The `--dump=evidence-arity` histogram (lane-plan §A.3) — feeds the
+#      L3 individual-params-vs-packed-tuple decision.
+#
+# Why metadata and not real params here: a row-polymorphic `fn f() : T / e`
+# does not yet know, at any call site, which evidence the caller passes —
+# that is the L3 call-site rewrite. The specialisation key (`MonoTuple`)
+# stays untouched; the only honest threading L2 can do is preserve the
+# per-function obligations across mono's symbol fan-out. byte-id green
+# proves codegen consumes none of this.
+#
+# Single-line `#[doc(...)]` only — kaic1 consumes the concatenated bundle
+# and rejects triple-quoted attribute strings.
+
+import compiler.util
+import compiler.ast
+import compiler.diag
+import compiler.infer
+import compiler.evidence
+
+# One injected hidden param: the demanded effect-instance label, the op
+# that raised the demand, and the supplier that discharges it. Its runtime
+# type is always the opaque `TyHandle` evidence scalar (A.1), so the tag is
+# implicit and never stored — materialising it is L3's job.
+pub type FnEvidenceParam = FEP(String, String, Supplier)
+
+# A function's evidence params, keyed by its symbol. Pre-mono the key is
+# the source name; after `reindex_evidence_params` it is the mangled spec
+# name, so L3 can look up obligations per specialised function.
+pub type FnEvidenceParams = FEPs(String, [FnEvidenceParam])
+
+# ----------------------------------------------------------------------
+# 1. The #789 op-name collision diagnostic.
+# ----------------------------------------------------------------------
+
+#[doc("evidence: report every op-name collision in the resolution record as a compile error; returns the error count.")]
+pub fn check_op_collisions(file: String, ors: [OpResolution],
+                           decls: [Decl]) : Int / Console + File =
+  check_op_collisions_loop(file, ors, decls, 0)
+
+fn check_op_collisions_loop(file: String, ors: [OpResolution],
+                            decls: [Decl], acc: Int) : Int / Console + File = match ors {
+  []           -> acc
+  [o, ...rest] ->
+    if obl_is_collision(o, decls) {
+      report_op_collision(file, o)
+      check_op_collisions_loop(file, rest, decls, acc + 1)
+    } else { check_op_collisions_loop(file, rest, decls, acc) }
+}
+
+# A collision is the by-name walk binding the wrong evidence: the op is
+# declared by ≥2 effects and the call is not disambiguated, so dynamic
+# dispatch picks the innermost matching instance rather than the intended
+# one (#789). Capability passing makes this structurally impossible — the
+# evidence must exist to be injected — so we reject it at the site.
+fn report_op_collision(file: String, o: OpResolution) : Unit / Console + File = match o {
+  OPR(_, op, cands, chosen, alias, _, line, col) -> {
+    let header = concat_all(["ambiguous op-name collision: `", op,
+                             "` is shared by ", obl_join(cands, ", ")])
+    diag_error(file, line, col, header)
+    diag_note(concat_all(["by-name handler dispatch cannot tell these effects apart, ",
+                          "so the perform would bind ", collision_target(chosen, alias),
+                          " — the wrong evidence (#789)"]))
+    diag_help(concat_all(["give the op distinct names across the effects, ",
+                          "or bind the handler instance with `with ", chosen,
+                          " as <name>` and call `<name>.", op, "(...)`"]))
+  }
+}
+
+fn collision_target(chosen: String, alias: Option[String]) : String = match alias {
+  None    -> concat_all(["effect `", chosen, "`"])
+  Some(a) -> concat_all(["instance `", chosen, "@", a, "` (whose tag is lost crossing a clause boundary)"])
+}
+
+# ----------------------------------------------------------------------
+# 2. Evidence-param metadata + survival across monomorphisation.
+# ----------------------------------------------------------------------
+
+#[doc("evidence: per function, its injected evidence params (one per discharge-backed effect-instance the row demands).")]
+pub fn inject_evidence_params(decls: [Decl]) : [FnEvidenceParams] =
+  inject_loop(decls, decls, [])
+
+fn inject_loop(all: [Decl], ds: [Decl], acc: [FnEvidenceParams]) : [FnEvidenceParams] = match ds {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    # Every function the program will emit needs its obligations, root or
+    # imported — L3 materialises a hidden param on each that demands an
+    # effect, so the scan is whole-program, not root-only like the dump.
+    DFn(_, fname, _, _, _, _, body, _, _, _) -> {
+      let obls = obl_walk(all, fname, body, [], [])
+      inject_loop(all, rest, [FEPs(fname, list_reverse(obls_to_params(obls))), ...acc])
+    }
+    _ -> inject_loop(all, rest, acc)
+  }
+}
+
+# One injected param per DISTINCT effect instance (A.1), not per op call:
+# a body that performs `State.get` and `State.set` on one instance gets a
+# single `State` evidence param threaded to both. A collision has no honest
+# evidence — it is a compile error, not a param.
+fn obls_to_params(obls: [Obligation]) : [FnEvidenceParam] = obls_to_params_acc(obls, [])
+
+fn obls_to_params_acc(obls: [Obligation], seen: [String]) : [FnEvidenceParam] = match obls {
+  []           -> []
+  [o, ...rest] -> match o {
+    Obl(eff, op, sup) -> match sup {
+      SupCollision(_) -> obls_to_params_acc(rest, seen)
+      _ -> if evi_has_str(seen, eff) { obls_to_params_acc(rest, seen) }
+           else { [FEP(eff, op, sup), ...obls_to_params_acc(rest, [eff, ...seen])] }
+    }
+  }
+}
+
+#[doc("evidence: re-key the pre-mono evidence metadata onto the post-mono spec symbols so each specialisation finds its obligations.")]
+pub fn reindex_evidence_params(meta: [FnEvidenceParams],
+                               mono_decls: [Decl]) : [FnEvidenceParams] =
+  reindex_loop(meta, mono_decls, [])
+
+# Evidence demand is a property of the row, invariant under type
+# substitution, so every spec `f__mono__Int` inherits the obligations of
+# its pre-mono base `f`. Re-key each mono DFn to the metadata of its base
+# (the name before the first mangle marker).
+fn reindex_loop(meta: [FnEvidenceParams], ds: [Decl],
+                acc: [FnEvidenceParams]) : [FnEvidenceParams] = match ds {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, mangled, _, _, _, _, _, _, _, _) -> match evi_lookup_meta(meta, evi_demangle_base(mangled)) {
+      Some(ps) -> reindex_loop(meta, rest, [FEPs(mangled, ps), ...acc])
+      None     -> reindex_loop(meta, rest, acc)
+    }
+    _ -> reindex_loop(meta, rest, acc)
+  }
+}
+
+fn evi_lookup_meta(meta: [FnEvidenceParams], name: String) : Option[[FnEvidenceParam]] = match meta {
+  []           -> None
+  [m, ...rest] -> match m {
+    FEPs(n, ps) -> if n == name { Some(ps) } else { evi_lookup_meta(rest, name) }
+  }
+}
+
+# The mangled name is `<base>__mono__...` and/or `<base>__umono__...`; a
+# non-generic function keeps its base name. Return the prefix before the
+# first mangle marker.
+fn evi_demangle_base(name: String) : String =
+  string_slice(name, 0, evi_demangle_cut(name, 0, string_length(name)))
+
+fn evi_demangle_cut(s: String, i: Int, n: Int) : Int {
+  if i >= n { n }
+  else if evi_marker_at(s, i, n) { i }
+  else { evi_demangle_cut(s, i + 1, n) }
+}
+
+# True when `__mono__` or `__umono__` starts at index `i`. Both share the
+# `__` prefix and an `mono__` body; the `u` only shifts the body start.
+fn evi_marker_at(s: String, i: Int, n: Int) : Bool =
+  if not evi_two_underscores_at(s, i, n) { false }
+  else {
+    let j = i + 2
+    if evi_substr_is(s, j, n, "mono__") { true }
+    else { evi_substr_is(s, j, n, "umono__") }
+  }
+
+fn evi_two_underscores_at(s: String, i: Int, n: Int) : Bool =
+  if i + 1 >= n { false }
+  else { evi_char_eq_at(s, i, '_') and evi_char_eq_at(s, i + 1, '_') }
+
+fn evi_substr_is(s: String, i: Int, n: Int, pat: String) : Bool =
+  evi_substr_is_loop(s, i, n, pat, 0, string_length(pat))
+
+fn evi_substr_is_loop(s: String, i: Int, n: Int, pat: String, k: Int, plen: Int) : Bool {
+  if k >= plen { true }
+  else if i + k >= n { false }
+  else {
+    match char_at(pat, k) {
+      Some(pc) -> if evi_char_eq_at(s, i + k, pc) { evi_substr_is_loop(s, i, n, pat, k + 1, plen) } else { false }
+      None     -> false
+    }
+  }
+}
+
+fn evi_char_eq_at(s: String, i: Int, c: Char) : Bool = match char_at(s, i) {
+  Some(sc) -> sc == c
+  None     -> false
+}
+
+# ----------------------------------------------------------------------
+# 3. `--dump=evidence-arity` — injected-param count histogram (§A.3).
+# ----------------------------------------------------------------------
+
+#[doc("evidence-arity: histogram the evidence-param arity per function for the §A.3 ABI decision — primary metric is the row cardinality (the hidden-param count a signature carries, forwarders included).")]
+pub fn dump_evidence_arity(file: String, decls: [Decl]) : Int / Console + File {
+  let r = infer_program(file, decls, false)
+  # Primary metric (asu A.3): distinct effect-instance count in each
+  # function's row — the hidden-param arity its signature carries,
+  # forwarders included. This is the upper bound L3 sizes its ABI
+  # against, not the local-op-call floor.
+  let row_counts = evi_row_counts(r.decls)
+  # Secondary metric: distinct instances PERFORMED locally (op-call
+  # obligations) — how much evidence is consumed in-body vs forwarded.
+  let local_counts = evi_arity_counts(inject_evidence_params(r.decls))
+  print("# evidence-arity")
+  evi_report("row-cardinality (ABI arity)", row_counts)
+  evi_report("local op-calls (consumed in-body)", local_counts)
+  0
+}
+
+fn evi_report(label: String, counts: [Int]) : Unit / Console {
+  let total = list_length(counts)
+  print(concat_all(["## ", label]))
+  if total == 0 { print("  (no functions)") }
+  else {
+    let sorted = evi_isort(counts)
+    print(concat_all(["  functions:  ", int_to_string(total)]))
+    print(concat_all(["  max:        ", int_to_string(evi_arity_max(sorted))]))
+    print(concat_all(["  p99:        ", int_to_string(evi_percentile(sorted, 99))]))
+    print(concat_all(["  mean:       ", evi_mean_str(counts)]))
+    print(concat_all(["  > 3 params: ", int_to_string(evi_count_gt(counts, 3))]))
+  }
+}
+
+# Per function, the count of distinct effect labels in its row — the
+# hidden-param arity capability passing gives its signature (a forwarder
+# whose body performs nothing still carries one param per row effect).
+fn evi_row_counts(ds: [Decl]) : [Int] = match ds {
+  []           -> []
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, row, _, _, _, _) -> [evi_row_card(row), ...evi_row_counts(rest)]
+    _ -> evi_row_counts(rest)
+  }
+}
+
+fn evi_row_card(row: RowExpr) : Int = match row {
+  REmpty           -> 0
+  RClosed(ls)      -> evi_distinct_labels(ls, [])
+  ROpen(_, ls)     -> evi_distinct_labels(ls, [])
+}
+
+fn evi_distinct_labels(ls: [RowLabel], seen: [String]) : Int = match ls {
+  []           -> 0
+  [l, ...rest] -> match l {
+    RL(name, _) -> if evi_has_str(seen, name) { evi_distinct_labels(rest, seen) }
+                   else { 1 + evi_distinct_labels(rest, [name, ...seen]) }
+  }
+}
+
+fn evi_arity_counts(meta: [FnEvidenceParams]) : [Int] = match meta {
+  []           -> []
+  [m, ...rest] -> match m { FEPs(_, ps) -> [list_length(ps), ...evi_arity_counts(rest)] }
+}
+
+fn evi_arity_max(sorted: [Int]) : Int = match list_reverse(sorted) {
+  []        -> 0
+  [h, ..._] -> h
+}
+
+# Nearest-rank percentile on an ascending list. Rank = ceil(p/100 * N),
+# 1-based; clamp to the last element.
+fn evi_percentile(sorted: [Int], p: Int) : Int {
+  let n = list_length(sorted)
+  if n == 0 { 0 }
+  else {
+    let rank = (p * n + 99) / 100
+    let idx = if rank < 1 { 0 } else if rank > n { n - 1 } else { rank - 1 }
+    evi_nth_or(sorted, idx, 0)
+  }
+}
+
+fn evi_nth_or(xs: [Int], i: Int, dflt: Int) : Int = match xs {
+  []           -> dflt
+  [h, ...rest] -> if i <= 0 { h } else { evi_nth_or(rest, i - 1, dflt) }
+}
+
+fn evi_count_gt(xs: [Int], k: Int) : Int = match xs {
+  []           -> 0
+  [h, ...rest] -> if h > k { 1 + evi_count_gt(rest, k) } else { evi_count_gt(rest, k) }
+}
+
+# Mean rendered to two decimals without floats: integer and hundredths.
+fn evi_mean_str(xs: [Int]) : String {
+  let n = list_length(xs)
+  if n == 0 { "0.00" }
+  else {
+    let s = evi_isum(xs)
+    let whole = s / n
+    let frac = ((s - whole * n) * 100) / n
+    concat_all([int_to_string(whole), ".", evi_pad2(frac)])
+  }
+}
+
+fn evi_pad2(x: Int) : String = if x < 10 { concat_all(["0", int_to_string(x)]) } else { int_to_string(x) }
+
+fn evi_isum(xs: [Int]) : Int = match xs {
+  []           -> 0
+  [h, ...rest] -> h + evi_isum(rest)
+}
+
+# Insertion sort — the bundle has no Int sort and the count list is short.
+fn evi_isort(xs: [Int]) : [Int] = match xs {
+  []           -> []
+  [h, ...rest] -> evi_iinsert(h, evi_isort(rest))
+}
+
+fn evi_iinsert(x: Int, sorted: [Int]) : [Int] = match sorted {
+  []           -> [x]
+  [h, ...rest] -> if x <= h { [x, h, ...rest] } else { [h, ...evi_iinsert(x, rest)] }
+}
+
+fn evi_has_str(xs: [String], s: String) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> if h == s { true } else { evi_has_str(rest, s) }
+}
