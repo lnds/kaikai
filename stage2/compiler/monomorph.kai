@@ -69,6 +69,7 @@
 import compiler.ast
 import compiler.util
 import compiler.infer
+import compiler.infer_index
 import compiler.protos
 
 # ==================================================================
@@ -871,18 +872,19 @@ pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
   # retargets to its own per-(tys, units) specialisation, even when
   # multiple calls share a (line, col) under string interpolation.
   let typer_tuples = collect_distinct_tuples(tp.insts, polys, [])
-  let impl_tuples = collect_impl_tuples_in_decls(tp.decls, polys, typer_tuples)
+  let impl_tuples = collect_impl_tuples_in_decls(tp.decls, polys, ts_of(typer_tuples))
   let initial_tuples = list_append(typer_tuples, impl_tuples)
+  let initial_ts = ts_of(initial_tuples)
   # Pre-mono rewrite over the whole program, retargeting every
   # concrete call site whose tuple matches a known specialisation.
-  let rewritten = rewrite_callsites_decls_full(tp.decls, tp.insts, initial_tuples, polys)
+  let rewritten = rewrite_callsites_decls_full(tp.decls, tp.insts, initial_ts, polys)
   # Iterate spec generation to fixpoint. Per-spec body subst can
   # promote previously-polymorphic flow-through call sites to
   # concrete tuples (e.g., `f__mono__Int`'s body calls `g(x : Int)`
   # which now mangles to `g__mono__Int`); those new tuples enter
   # the worklist and produce additional specs. Each spec also
   # accumulates a per-spec leak record (m4c Phase 3 invariant).
-  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_tuples, [], reg, local_arities)
+  let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_ts, [], reg, local_arities)
   match r {
     GenSpecsOut(specs, _, leaks) -> MonoOut(list_append(rewritten, specs), leaks)
   }
@@ -1230,6 +1232,38 @@ fn tuple_in(tuples: [MonoTuple], t: MonoTuple) : Bool {
   }
 }
 
+# The growing spec set carried through the fixpoint, with a hash index
+# beside the list. The mangle digest folds together the same four slots
+# `tuple_eq` compares (`mo`, `name`, `[Ty]`, `[UnitExprT]`), but it is
+# lossy — a `TyCon`'s module slot is dropped at mangle time — so the
+# index is a CANDIDATE filter: `ts_mem` re-runs `tuple_eq` over the
+# bucket chain, picking the exact membership the linear `tuple_in` did.
+type TupleSet = { items: [MonoTuple], idx: NameIndex[MonoTuple] }
+
+fn tuple_key(t: MonoTuple) : String =
+  match t { MT(mo, name, tys, units) ->
+    cat3(mt_mo_key(mo), "|", mono_mangle_name(name, tys, units)) }
+
+fn mt_mo_key(mo: Option[String]) : String = match mo {
+  None    -> "*"
+  Some(m) -> m
+}
+
+fn ts_empty() : TupleSet = TupleSet { items: [], idx: idx_empty() }
+
+fn ts_add(ts: TupleSet, t: MonoTuple) : TupleSet =
+  TupleSet { items: [t, ...ts.items], idx: idx_prepend(ts.idx, tuple_key(t), t) }
+
+fn ts_add_all(ts: TupleSet, ts_new: [MonoTuple]) : TupleSet = match ts_new {
+  []           -> ts
+  [h, ...rest] -> ts_add_all(ts_add(ts, h), rest)
+}
+
+fn ts_of(xs: [MonoTuple]) : TupleSet = ts_add_all(ts_empty(), xs)
+
+fn ts_mem(ts: TupleSet, t: MonoTuple) : Bool =
+  tuple_in(idx_chain(ts.idx, tuple_key(t)), t)
+
 # Reduce `tp.insts` to distinct `(name, [Ty], [UnitExprT])` triples
 # whose `name` matches a polymorphic DFn. Empty tuples (calls to
 # non-polymorphic decls or to local variables) are filtered out.
@@ -1483,7 +1517,7 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
 type SpecEmitOut = SEO(Decl, [MonoTuple], [MLeakRecord])
 
 fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
-              all_tuples: [MonoTuple], reg: ProtocolReg,
+              all_tuples: TupleSet, reg: ProtocolReg,
               local_arities: [OpAr]) : SpecEmitOut {
   match mt { MT(_, _, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
@@ -1509,7 +1543,7 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: [ResolvedCS], polys: [PolyFn],
     # also defines), so each module's spec is emitted and links cleanly.
     let host_mo = poly_decl_mo(d)
     let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm, host_mo)
-    let updated_tuples = list_append(all_tuples, new_tuples)
+    let updated_tuples = ts_add_all(all_tuples, new_tuples)
     let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
     # Issue #680: self-recursive calls inside a spec body must retarget
     # to the spec's own mangled name. Without this step the spec body
@@ -1608,13 +1642,13 @@ fn retarget_self_calls_kind(k: ExprKind, orig_name: String, mangled: String) : E
 # the interpolation desugar collapses every show callee onto the
 # enclosing print's source position.
 fn collect_impl_tuples_in_decls(ds: [Decl], polys: [PolyFn],
-                                 existing: [MonoTuple]) : [MonoTuple] {
+                                 existing: TupleSet) : [MonoTuple] {
   let r = collect_impl_tuples_in_decls_loop(ds, polys, existing, [])
   list_reverse(r)
 }
 
 fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
-                                      existing: [MonoTuple],
+                                      existing: TupleSet,
                                       acc: [MonoTuple]) : [MonoTuple] {
   match ds {
     [] -> acc
@@ -1636,7 +1670,7 @@ fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: [PolyFn],
 }
 
 fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap, host_mo: Option[String]) : [MonoTuple] {
+                             existing: TupleSet, sm: SubstMap, host_mo: Option[String]) : [MonoTuple] {
   match d {
     DFn(_, _, _, _, _, _, body, _, _, _) ->
       list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, [], host_mo))
@@ -1651,7 +1685,7 @@ fn discover_new_tuples_decl(d: Decl, insts: [ResolvedCS], polys: [PolyFn],
 }
 
 fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap,
+                             existing: TupleSet, sm: SubstMap,
                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc, host_mo)
   match e.kind {
@@ -1676,7 +1710,7 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
 
 fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [Expr],
                         insts: [ResolvedCS], polys: [PolyFn],
-                        existing: [MonoTuple], sm: SubstMap,
+                        existing: TupleSet, sm: SubstMap,
                         acc1: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   let is_user_poly = match lookup_poly_fn(polys, name) {
     Some(_) -> true None -> false
@@ -1694,7 +1728,7 @@ fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [
           # spec fixpoint converges. `mt_retag_bare_shared` is idempotent on
           # an already-tagged `Some(_)` tuple (an `EModCall` callee).
           let mt = mt_retag_bare_shared(MT(cmo, name, tys, units), polys, host_mo)
-          let is_new = concrete and not tuple_in(existing, mt) and not mt_in_acc(acc1, mt)
+          let is_new = concrete and not ts_mem(existing, mt) and not mt_in_acc(acc1, mt)
           if is_new { [mt, ...acc1] } else { acc1 }
         }
       }
@@ -1714,7 +1748,7 @@ fn mt_in_acc(acc: [MonoTuple], t: MonoTuple) : Bool {
 # discovery walker can find calls in nested positions. Uses
 # mono_map_expr_kind shape but with a fold accumulator.
 fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap,
+                             existing: TupleSet, sm: SubstMap,
                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match k {
     EInt(_)        -> acc
@@ -1783,7 +1817,7 @@ fn discover_new_tuples_kind(k: ExprKind, insts: [ResolvedCS], polys: [PolyFn],
 }
 
 fn discover_new_tuples_args(args: [Expr], insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap,
+                             existing: TupleSet, sm: SubstMap,
                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match args {
     [] -> acc
@@ -1793,7 +1827,7 @@ fn discover_new_tuples_args(args: [Expr], insts: [ResolvedCS], polys: [PolyFn],
 }
 
 fn discover_new_tuples_arms(arms: [Arm], insts: [ResolvedCS], polys: [PolyFn],
-                             existing: [MonoTuple], sm: SubstMap,
+                             existing: TupleSet, sm: SubstMap,
                              acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match arms {
     [] -> acc
@@ -1808,7 +1842,7 @@ fn discover_new_tuples_arms(arms: [Arm], insts: [ResolvedCS], polys: [PolyFn],
 }
 
 fn discover_new_tuples_fields(fs: [FieldInit], insts: [ResolvedCS], polys: [PolyFn],
-                               existing: [MonoTuple], sm: SubstMap,
+                               existing: TupleSet, sm: SubstMap,
                                acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match fs {
     [] -> acc
@@ -1820,7 +1854,7 @@ fn discover_new_tuples_fields(fs: [FieldInit], insts: [ResolvedCS], polys: [Poly
 }
 
 fn discover_new_tuples_elems(els: [ListElem], insts: [ResolvedCS], polys: [PolyFn],
-                              existing: [MonoTuple], sm: SubstMap,
+                              existing: TupleSet, sm: SubstMap,
                               acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match els {
     [] -> acc
@@ -1835,7 +1869,7 @@ fn discover_new_tuples_elems(els: [ListElem], insts: [ResolvedCS], polys: [PolyF
 }
 
 fn discover_new_tuples_stmts(stmts: [Stmt], insts: [ResolvedCS], polys: [PolyFn],
-                              existing: [MonoTuple], sm: SubstMap,
+                              existing: TupleSet, sm: SubstMap,
                               acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match stmts {
     [] -> acc
@@ -1856,7 +1890,7 @@ fn discover_new_tuples_stmts(stmts: [Stmt], insts: [ResolvedCS], polys: [PolyFn]
 }
 
 fn discover_new_tuples_clauses(cs: [HClause], insts: [ResolvedCS], polys: [PolyFn],
-                                existing: [MonoTuple], sm: SubstMap,
+                                existing: TupleSet, sm: SubstMap,
                                 acc: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   match cs {
     [] -> acc
@@ -1893,7 +1927,7 @@ fn bare_spec_callee(callee: Expr, mangled: String, bmo: Option[String]) : Expr =
   }
 
 fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
-                              tuples: [MonoTuple], polys: [PolyFn],
+                              tuples: TupleSet, polys: [PolyFn],
                               sm: SubstMap) : Decl {
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
@@ -1913,13 +1947,13 @@ fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
 # module-shared name resolves to the host module's spec (a private helper
 # two modules share belongs to whichever module's body calls it).
 fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
-                              tuples: [MonoTuple], polys: [PolyFn],
+                              tuples: TupleSet, polys: [PolyFn],
                               sm: SubstMap, host_mo: Option[String]) : Expr =
   Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm, host_mo),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
-                              tuples: [MonoTuple], polys: [PolyFn],
+                              tuples: TupleSet, polys: [PolyFn],
                               sm: SubstMap, host_mo: Option[String]) : ExprKind {
   match k {
     ECall(callee, args_) -> {
@@ -1945,7 +1979,7 @@ fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
 # spec. The recorded instantiation sits at the callee's own position, so we
 # resolve it with no args and mint the mangled `EVar`/`EModCall` the emitter
 # already mints for a saturated call; a non-callee rhs recurses normally.
-fn rewrite_pointfree_callee(rhs: Expr, insts: [ResolvedCS], tuples: [MonoTuple],
+fn rewrite_pointfree_callee(rhs: Expr, insts: [ResolvedCS], tuples: TupleSet,
                              polys: [PolyFn], sm: SubstMap,
                              host_mo: Option[String]) : Expr =
   match rhs.kind {
@@ -1964,12 +1998,12 @@ fn rewrite_pointfree_callee(rhs: Expr, insts: [ResolvedCS], tuples: [MonoTuple],
 # name binds to the host module's spec via an `EModCall` callee (minting
 # `kai_<host>__…`); a unique name keeps the bare `EVar(mangled)` callee.
 fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr],
-                      insts: [ResolvedCS], tuples: [MonoTuple], polys: [PolyFn],
+                      insts: [ResolvedCS], tuples: TupleSet, polys: [PolyFn],
                       sm: SubstMap, host_mo: Option[String]) : ExprKind =
   match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
     Some(MIPair(tys, units)) -> {
       let bmo = bare_callee_mo(polys, name, host_mo)
-      if tuple_in(tuples, MT(bmo, name, tys, units)) {
+      if ts_mem(tuples, MT(bmo, name, tys, units)) {
         let mangled = mono_mangle_name(name, tys, units)
         ECall(bare_spec_callee(callee, mangled, bmo), new_args)
       } else { ECall(callee, new_args) }
@@ -1982,14 +2016,14 @@ fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr],
 # when the name is shared across modules (mirroring discovery); a tparam-less
 # qualified fn (`map.filter`) is not in `polys` and stays a generic call.
 fn rewrite_qualified_call(modn: String, name: String, callee: Expr, new_args: [Expr],
-                           insts: [ResolvedCS], tuples: [MonoTuple], polys: [PolyFn],
+                           insts: [ResolvedCS], tuples: TupleSet, polys: [PolyFn],
                            sm: SubstMap) : ExprKind =
   if not poly_fn_has_module(polys, name, modn) { ECall(callee, new_args) }
   else {
     let cmo = if name_shared(polys, name) { Some(modn) } else { None }
     match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
       Some(MIPair(tys, units)) ->
-        if tuple_in(tuples, MT(cmo, name, tys, units)) {
+        if ts_mem(tuples, MT(cmo, name, tys, units)) {
           let mangled = mono_mangle_name(name, tys, units)
           let new_callee = Expr { kind: EModCall(modn, mangled),
                                    line: callee.line, col: callee.col,
@@ -2110,12 +2144,12 @@ fn synth_inst_pair(polys: [PolyFn], name: String, callee: Expr,
 # by per-spec rewrite to know which retargets are reachable.
 fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
                         insts: [ResolvedCS], specs_acc: [Decl],
-                        all_tuples: [MonoTuple],
+                        all_tuples: TupleSet,
                         leaks_acc: [MLeakRecord],
                         reg: ProtocolReg,
                         local_arities: [OpAr]) : GenSpecsResult {
   match worklist {
-    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples, list_reverse(leaks_acc))
+    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc))
     [t, ...rest] -> match lookup_poly_fn_for(polys, mt_name(t), mt_mo(t)) {
       None -> generate_specs_iter(polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg, local_arities)
       Some(d) -> {
@@ -2123,7 +2157,7 @@ fn generate_specs_iter(polys: [PolyFn], worklist: [MonoTuple],
         match r {
           SEO(spec, new_ts, new_leaks) -> {
             let next_worklist = list_append(rest, new_ts)
-            let next_all = list_append(all_tuples, new_ts)
+            let next_all = ts_add_all(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(polys, next_worklist, insts,
                                  [spec, ...specs_acc], next_all, next_leaks, reg, local_arities)
@@ -2314,7 +2348,7 @@ fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
 # through) leave the callee alone — those become concrete only inside
 # specs, where `rewrite_callsites_decl_sm` runs with the spec's map.
 fn rewrite_callsites_decls_full(ds: [Decl], insts: [ResolvedCS],
-                                 tuples: [MonoTuple], polys: [PolyFn]) : [Decl] =
+                                 tuples: TupleSet, polys: [PolyFn]) : [Decl] =
   map(ds, (d) => rewrite_callsites_decl_sm(d, insts, tuples, polys, subst_map_empty()))
 
 type MonoInstPair = MIPair([Ty], [UnitExprT])
