@@ -7268,48 +7268,31 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn]) : String
   }
 }
 
-# m12.7.x FFI v1: the C body of an `[<extern_c>]` axiom. The shim
-# - forward-declares the extern symbol with the matching C signature,
+# FFI v1: the C body of a scalar `extern "C" fn`. The shim
+# - forward-declares the extern symbol with the call site's C ABI types,
 # - unboxes each kaikai parameter into its C-side equivalent,
 # - calls the extern, releases the input args, and
 # - boxes the return value back into a `KaiValue *` (or `kai_unit()`
 #   for a `void`-returning extern).
 #
-# Type translation v1 (per `docs/m12.7-ffi.md` §*Type table*):
-#   Int    ↔ int64_t        Real   ↔ double
-#   Bool   ↔ int             String ↔ const char *
-#   Unit   ↔ void   (return only)
-# Anything else surfaces as an `#error` so the C compiler flags it
-# at build time — silently emitting a wrong shim would be worse than
-# refusing the cast.
-
-# m12.7.x FFI v1: the C body of an `[<extern_c>]` axiom. The shim
-# - forward-declares the extern symbol with the matching C signature,
-# - unboxes each kaikai parameter into its C-side equivalent,
-# - calls the extern, releases the input args, and
-# - boxes the return value back into a `KaiValue *` (or `kai_unit()`
-#   for a `void`-returning extern).
-#
-# Type translation v1 (per `docs/m12.7-ffi.md` §*Type table*):
-#   Int    ↔ int64_t        Real   ↔ double
-#   Bool   ↔ int             String ↔ const char *
-#   Unit   ↔ void   (return only)
+# Boundary type translation:
+#   Int  ↔ int64_t    Real ↔ double      Bool ↔ int
+#   Char ↔ int32_t    String ↔ const char *    Unit ↔ void (return only)
 # Anything else surfaces as an `#error` so the C compiler flags it
 # at build time — silently emitting a wrong shim would be worse than
 # refusing the cast.
 fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
                       ret_ty_opt: Option[TypeExpr]) : String {
   let ret_kind = ffi_ret_kind_of(ret_ty_opt)
-  # FFI v1 deliberately does NOT mint a fresh `extern` declaration
-  # for the named symbol. The user is expected to either rely on a
-  # libc symbol already declared by `<stdio.h>` / `<stdlib.h>` /
-  # `<string.h>` / `<unistd.h>` / `<time.h>` (all pulled in by
-  # `runtime.h`), or to feed an `#include` for their FFI library
-  # via the user-supplied wrapper.c that the build links in. A
-  # local extern declaration here would conflict with libc's
-  # canonical signature whenever the kaikai-side type mapping does
-  # not match the C-side native (e.g. kaikai `Int` → `int64_t` vs
-  # libc `puts`'s `int` return).
+  # Forward-declare the extern symbol with the C ABI types the call site
+  # uses (`extern <ret> sym(<params>);`), so `cc` compiles the call
+  # without an implicit declaration. The declaration IS the binding
+  # contract: a user binding a libc symbol must declare a type whose C
+  # mapping matches the system header, or `cc` rejects the redeclaration
+  # at compile time — the binding is honoured literally, not silently
+  # reconciled. A `FfiRetUnknown` signature emits an `#error` body
+  # instead, so it gets no declaration.
+  let extern_decl = ffi_v1_extern_decl(name, params, ret_kind)
   let arg_setup = ffi_emit_arg_setup(params, 0)
   let arg_list = ffi_emit_arg_list(params, 0)
   let call_expr = concat_all([name, "(", arg_list, ")"])
@@ -7339,6 +7322,12 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
       arg_decrefs,
       "    return kai_bool(_kai_ffi_ret != 0);\n"
     ])
+    FfiRetChar -> concat_all([
+      arg_setup,
+      "    int32_t _kai_ffi_ret = (int32_t) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_char((uint32_t) _kai_ffi_ret);\n"
+    ])
     FfiRetString -> concat_all([
       arg_setup,
       "    const char *_kai_ffi_ret = ", call_expr, ";\n",
@@ -7353,11 +7342,22 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
     FfiRetForeign(n) -> ffi_v1_v2_kind_error(n)
     FfiRetUnknown(t) -> concat_all([
       "#error \"FFI return type `", t,
-      "` is not supported in m12.7.x — use Int / Real / Bool / String / Unit\"\n"
+      "` is not supported in m12.7.x — use Int / Real / Bool / String / Char / Unit\"\n"
     ])
   }
-  concat_all([sig, " {\n", body, "}\n\n"])
+  concat_all([extern_decl, sig, " {\n", body, "}\n\n"])
 }
+
+# Forward declaration for an `extern "C"` scalar symbol: `extern <ret>
+# sym(<params>);` over the C ABI types the shim's call site uses. A
+# `FfiRetUnknown` return yields the empty string — that signature emits
+# an `#error` body, so a declaration would only add noise.
+fn ffi_v1_extern_decl(name: String, params: [Param], ret_kind: FfiRetKind) : String =
+  match ret_kind {
+    FfiRetUnknown(_) -> ""
+    _ -> concat_all(["extern ", ffi_c_ret_type_str(ret_kind), " ", name,
+                     "(", ffi_c_param_list(params), ");\n"])
+  }
 
 # A struct / opaque / fixed-width kind reaching the basic scalar shim
 # is a routing bug (`ffi_sig_uses_v2` should have sent it to
@@ -7514,6 +7514,7 @@ fn ffi_c_ret_type_str(k: FfiRetKind) : String {
     FfiRetInt -> "int64_t"
     FfiRetReal -> "double"
     FfiRetBool -> "int"
+    FfiRetChar -> "int32_t"
     FfiRetString -> "const char *"
     # FFI v2 kinds never reach these v1 helpers (the v2 shim path owns
     # them); the body is `#error`, never compiled. Belt for exhaustiveness.
@@ -7531,6 +7532,7 @@ fn ffi_c_param_type_str(p: Param) : String {
       FfiRetInt -> "int64_t"
       FfiRetReal -> "double"
       FfiRetBool -> "int"
+      FfiRetChar -> "int32_t"
       FfiRetString -> "const char *"
       FfiRetUnit -> "/* Unit param not supported */ void *"
       FfiRetFixed(_)   -> "/* v2 fixed-width — v2 shim path */ void *"
@@ -7575,6 +7577,9 @@ fn ffi_emit_arg_setup(params: [Param], i: Int) : String {
         ])
         FfiRetBool -> concat_all([
           "    int ", arg_name, " = kai_", p.pname, "->as.b ? 1 : 0;\n"
+        ])
+        FfiRetChar -> concat_all([
+          "    int32_t ", arg_name, " = (int32_t) kai_", p.pname, "->as.c;\n"
         ])
         FfiRetString -> concat_all([
           "    const char *", arg_name, " = kai_", p.pname, "->as.s.bytes;\n"

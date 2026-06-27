@@ -23,8 +23,18 @@ Scalars cross directly:
 | `Int`       | `int64_t`    |
 | `Real`      | `double`     |
 | `Bool`      | `int`        |
+| `Char`      | `int32_t` (Unicode codepoint) |
 | `String`    | `const char *` (copied in on return via `kai_str`) |
 | `Unit`      | `void` (return only) |
+
+The compiler emits a forward declaration over these C types
+(`extern <ret> sym(<params>);`) on both backends, so the call links
+without an implicit declaration. The declaration IS the binding
+contract: a symbol a system header already declares (libc) must be
+bound with the C-exact type — `abs(n: I32) : I32` (libc's `int`),
+not `: Int` — or `cc` rejects the redeclaration. A symbol whose C
+type has no kaikai mapping (`size_t`, a struct return) is wrapped in
+a small `.c`.
 
 ## Fixed-width boundary types
 
