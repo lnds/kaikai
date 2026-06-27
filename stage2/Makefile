@@ -677,21 +677,27 @@ test-ffi-extern-c: $(TARGET) build
 	  && echo "ffi-extern-c OK (C backend)" \
 	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }
 
-# FFI v2 (#417) — struct-by-value + fixed-width across the C boundary.
-# The kaikai-emitted C is linked against examples/ffi/v2_shim.c (whose
-# struct tags match `struct __kai_ffi_<Name>`), so the by-value calling
-# convention lines up. ASAN-clean (boundary unwrap + re-box is fresh
-# malloc territory). Struct-by-value is a C-backend feature; the native
-# backend routes it through `--backend=c` (documented gap).
+# FFI v2 (#417) — struct-by-value across the C boundary. The emitter
+# ships the `extern "C" type` structs in a shared `kai_ffi.h` (issue
+# #924); a struct program emits a `//KAIFILE`-marker stream the wrapper
+# splits into `kai_ffi.h` + `out.c`. The shim (v2_struct_shim.c)
+# `#include`s the SAME header and names the SAME `Color` / `Vector2`
+# types, so a layout mismatch is a C compile error, not silent corruption.
+# ASAN-clean (boundary unwrap + re-box is fresh malloc territory).
+# Struct-by-value is a C-backend feature; the native backend rejects it
+# with an actionable `--backend=c` diagnostic (issue #923).
 test-ffi-v2-struct: $(TARGET) build
 	@set -e; \
-	./$(TARGET) --backend=c ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.c; \
-	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_struct.c ../examples/ffi/v2_shim.c -o build/v2_struct-c $(LDLIBS_M); \
+	./$(TARGET) --backend=c ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
+	rm -rf build/v2_struct.d; mkdir -p build/v2_struct.d; \
+	nonce=$$(sed -n '1s/^\/\/KAIDELIM://p' build/v2_struct.stream); \
+	awk -v dir=build/v2_struct.d -v pfx="//KAIFILE:$$nonce::" 'index($$0, pfx) == 1 { out = dir "/" substr($$0, length(pfx) + 1); next } out { print > out }' build/v2_struct.stream; \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-c $(LDLIBS_M); \
 	./build/v2_struct-c > build/v2_struct.out; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out > /dev/null \
 	  && echo "ffi-v2-struct OK (C backend)" \
 	  || { echo "ffi-v2-struct DIFF (C backend)"; diff ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out; exit 1; }; \
-	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_struct.c ../examples/ffi/v2_shim.c -o build/v2_struct-asan $(LDLIBS_M); \
+	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-asan $(LDLIBS_M); \
 	./build/v2_struct-asan > build/v2_struct.asan.out 2>&1; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.asan.out > /dev/null \
 	  && echo "ffi-v2-struct OK (ASAN clean)" \
@@ -715,6 +721,24 @@ test-ffi-v2-opaque: $(TARGET) build
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.asan.out > /dev/null \
 	  && echo "ffi-v2-opaque OK (ASAN clean)" \
 	  || { echo "ffi-v2-opaque ASAN DIFF"; cat build/v2_opaque.asan.out; exit 1; }
+
+# FFI v2 — native backend rejects struct-by-value with an actionable
+# `--backend=c` diagnostic (issue #923) instead of crashing. A small
+# struct's C ABI (iN / [N x float] / sret) is frontend classification the
+# native backend does not yet replicate; the C backend marshals it. Gated
+# on KAI_LLVM (the native backend must be built to exercise the reject).
+ifeq ($(KAI_LLVM),1)
+test-ffi-v2-native-reject: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --emit=native --path ../examples/ffi ../examples/ffi/v2_struct_by_value.kai > /dev/null 2> build/v2_struct_native.err \
+	  && { echo "ffi-v2-native-reject DID NOT FAIL — native must reject struct-by-value"; exit 1; } || true; \
+	grep -F "$$(cat ../examples/ffi/v2_struct_native_reject.err.expected)" build/v2_struct_native.err > /dev/null \
+	  && echo "ffi-v2-native-reject OK (actionable --backend=c diagnostic)" \
+	  || { echo "ffi-v2-native-reject DIFF — expected diagnostic not in output"; cat build/v2_struct_native.err; exit 1; }
+else
+test-ffi-v2-native-reject:
+	@echo "ffi-v2-native-reject SKIP (C-only build; native backend not compiled)"
+endif
 
 # FFI v2 (#417) — negatives the surface still rejects: a struct field
 # with no exact C width, and a function-typed (callback-from-C) extern
@@ -5046,7 +5070,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-kir
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-kir
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
@@ -5085,7 +5109,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-kir test-packages
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-unused-bindings test-kir test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
