@@ -4416,10 +4416,12 @@ test-perceus-int-cache-asan: $(TARGET) build
 # Covers every shape the per-route attempts broke on: explicit Int field
 # (rb-tree descent), generic Some/Ok fields, Int arg to a raw-param fn
 # inside a nested match, reuse-variant rebuild, Int+ptr mixed arm, the
-# other primitives (Real/Char/Bool must stay untouched), and an Int read
-# BOTH raw and boxed in one arm. A wrong kair_/kai_ bind shows up as a
-# wrong number or an ASan diagnostic, not a silent change.
-INT_FIELD_INLINE_FIXTURES := int_field_inline
+# other primitives (Real/Char/Bool must stay untouched), an Int read BOTH
+# raw and boxed in one arm, and a raw Int binder captured by a closure
+# (re-box at the capture border, not the absent boxed local). A wrong
+# kair_/kai_ bind shows up as a wrong number or an ASan diagnostic, not a
+# silent change.
+INT_FIELD_INLINE_FIXTURES := int_field_inline int_field_closure_capture
 
 test-int-field-inline: $(TARGET) build
 	@set -e; \
