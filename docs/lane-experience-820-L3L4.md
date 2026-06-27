@@ -121,44 +121,39 @@ on the by-name walk: **pass=514, fail=0 over 577 fixtures.** The corpus is
 equivalent (the accidental equivalence the redesign exists to retire) — the
 distinguishing fixtures give 16 / handled / trace correct on BOTH backends.
 
-## Native flip — attempted, reverted, the remaining work
+## Native flip — done
 
-The native flip mirrors the C cut (asu): frame read corpus-wide at
-`nemit_perform_node`, frame construction where the fixtures exercise it,
-`main` frame-exempt, the native twin of the `emit_lam_helpers evf:[]` fix.
-The C-frame/native-walk state is NOT a legitimate block end (asu): it is the
-§7 bridge — green only by accident-of-≤1-handler — and once native flips,
-dual parity becomes a REAL differential oracle on the ABI axis (two
-independent frame constructions compared, not the frame vs the walk). So the
-native flip belongs in this block.
+The native flip mirrors the C cut: frame read at `nemit_perform_node`, frame
+construction where the fixtures exercise it, `main` frame-exempt. Without it,
+C-frame/native-walk is the §7 bridge — green only by accident-of-≤1-handler.
+With both backends on the frame, dual parity becomes a REAL differential
+oracle: it compares two INDEPENDENT frame constructions (C-text ABI vs
+native-LLVM calling convention), not the frame vs the walk, so any ABI /
+slot-order / construction asymmetry is a parity red. That is the oracle the
+bridge state could never give.
 
-Implemented and compiling: a C-side frame table in `KaiNativeCtx`
-(`KaiNFrame { sym; slots; nslots }`) with `add_frame_slot` /
-`frame_slot_count` / `frame_slot_index` / `frame_slot_eff` prims registered
-in BOTH `native_prims.kai` AND `stage1/compiler.kai` (the bootstrap gotcha:
-kaic1 resolves the bundle against ITS OWN rprelude list, so a new native
-prim must land in stage1 too or the bundle fails "undefined name"); the
+The native ABI table lives in `KaiNativeCtx` (`KaiNFrame { sym; slots;
+nslots }`) with `add_frame_slot` / `frame_slot_count` / `frame_slot_index` /
+`frame_slot_eff` prims. The bootstrap gotcha: a new native prim must be
+registered in BOTH `native_prims.kai` AND `stage1/compiler.kai` — kaic1
+resolves the bundle against its OWN rprelude list, so a stage2-only prim
+fails the bundle with "undefined name". The flip then is: the
 `nfn_llvm_type` leading-`ptr` frame param; the param-index shift +
-`__evf`-register seed; the `__evf` entry alloca; and the call-site frame
-construction (`alloca [N x ptr]` + per-slot `kaix_evidence_lookup_node` +
-`array_gep` store, prepended in both the raw and boxed call funnels).
+`__evf`-register seed of LLVM param 0; the `__evf` register reserved in the
+entry head; and the call-site frame construction (`alloca [N x ptr]` +
+per-slot `kaix_evidence_lookup_node` + `array_gep` store, prepended in both
+the raw and boxed call funnels).
 
-Frame fixtures ran correctly under native with the ABI consistent
-(signature + call both carry the frame). BUT the call-site frame
-construction SEGFAULTS the native compiler on forward-chain fixtures
-(`two_level_forward`, `trace_basic` — a frame-carrying fn calling another
-frame-carrying fn), a crash in the IR-building of the nested frame alloca
-not yet root-caused. To leave the native backend compilable and ABI-
-consistent rather than half-flipped (signature-with-frame + call-without =
-broken ABI, worse than the walk), the native flip was reverted to the walk;
-the C frame flip + the frame table design + the bootstrap-prim wiring are
-the durable artefacts. The native flip resumes from here: re-apply the
-native changes (all preserved in this lane's history / the design above) and
-root-cause the forward-chain frame-construction segfault — likely the
-`llvm_build_alloca_entry` for the frame array firing outside the entry block
-when the builder is mid-body, or the `array_gep` index/context. Then gate on
-`KAI_EVIDENCE_FRAME_ONLY` native-side + dual serial parity (now a real ABI
-oracle).
+The one real bug: the frame array was first alloca'd via
+`build_alloca_entry`, which repositions the builder into the current fn's
+entry block. On a forward-chain call (a frame fn calling another frame fn)
+the entry block is mid-construction when the call site builds the callee
+frame, so `GetFirstInstruction` on it faulted (`EXC_BAD_ACCESS` at a small
+offset — lldb pointed straight at `kai_llvm_build_alloca_entry`). A plain
+`build_alloca` plants the array where the builder already sits, which is
+valid — the frame array does not need promotion. After that one-line fix:
+181 effects+actors fixtures compile native with zero crashes/verify-fails,
+the distinguishing fixtures give 16 / handled under native matching C.
 
 ## A.3 — measured
 
