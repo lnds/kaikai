@@ -34,10 +34,74 @@ fn greet(name: String) : Unit / Logger {       # with effect row
 }
 pub fn area(w: Int, h: Int) : Int = w * h      # exported
 
+fn fib(n: Int) : Int {                         # clause-block body:
+  case 0 -> 0                                  #   `case` arms dispatch
+  case 1 -> 1                                  #   on the parameter(s)
+  case _ -> fib(n - 1) + fib(n - 2)
+}
+fn classify(a: Int, b: Int) : Int {            # multi-arg: comma-separated
+  case 0, y          -> y                      #   patterns per arm,
+  case x, y when x < 0 -> y                    #   `when` guard AFTER them
+  case x, y          -> x + y                  #   (not `if` — that is the
+}                                              #   plain-`match` guard kw)
+
+const MAX : Int = 100                          # module constant
+
+protocol Named {                               # single-dispatch protocol
+  name(self: Int) : String
+}
+impl Named for Int {                           # protocol implementation
+  fn name(self: Int) : String = "int"          #   `fn` REQUIRED on methods
+}
+
+axiom unchecked(x: Int) : Int                  # body-less audited escape
+
 extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
+
+fn main() : Int = fib(10) + classify(0, 5) + MAX
+```
+
+The clause-block body (`{ case <pat> (when <guard>)? -> <body> ... }`)
+desugars to a `match` over the parameter(s) — it is the kaikai form
+for Elixir/Haskell-style multi-clause function heads. One parameter
+matches it directly; 2–4 parameters match a comma-separated tuple per
+arm. A clause-block holds ONLY `case` arms: mixing a `let`/statement
+with `case` is a parse error.
+
+## Imports and effect opening
+
+```kaikai
+import loop                                     # whole module
+import loop as lp                               # aliased
+import loop.{while}                             # selective
+
+effect Clock {
+  now() : Int
+}
+use Clock                                        # open ops for bare names
+
+fn read() : Int / Clock = now()                  # `now`, not `Clock.now`
 
 fn main() : Int = 0
 ```
+
+`import` brings in a module (optionally aliased, or restricted to a
+selection); `use E` opens an effect's operations so they resolve by
+bare name. `use` takes an effect (PascalCase), never a module.
+
+## Tests
+
+```kaikai
+test "addition" {                               # builtin test block
+  assert 1 + 1 == 2                             # run by `kai test`
+}
+
+fn main() : Int = 0
+```
+
+`test "..." { }` (and the parallel `bench` / `check` forms) are
+top-level declarations, not function calls. `assert cond` inside a
+test body checks a condition; see `kai info testing`.
 
 ## Attributes
 
@@ -201,6 +265,8 @@ Empty row means pure.
 ## Literals and operators
 
 ```kaikai
+type Color = Red | Green | Blue
+
 fn main() : Unit / Stdout = {
   let n = 42 + 0xFF + 0b1010                   # numbers
   let r = 3.14 + 2.5e-2                        # reals
@@ -213,7 +279,9 @@ fn main() : Unit / Stdout = {
   let r2 = [1..10..2]                          # range w/ step
   let opt = Some(42)                           # variant
   let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
-  Stdout.print("n=#{int_to_string(n)} s=#{s} xs len=#{int_to_string(xs.length())} r1 len=#{int_to_string(r1.length())} r2 len=#{int_to_string(r2.length())} combined len=#{int_to_string(combined.length())}")
+  let all = variants[Color]()                  # enumerate ctors of a
+                                               #   nullary sum type
+  Stdout.print("n=#{int_to_string(n)} s=#{s} xs len=#{int_to_string(xs.length())} r1 len=#{int_to_string(r1.length())} r2 len=#{int_to_string(r2.length())} combined len=#{int_to_string(combined.length())} colors=#{int_to_string(all.length())}")
   match opt {
     Some(v) -> Stdout.print("v=#{int_to_string(v)}")
     None    -> Stdout.print("none")
@@ -288,9 +356,27 @@ fn main() : Unit / Stdout = {
 ## Patterns (highlights — see `kai info match`)
 
 ```kaikai
+type Point = { x: Int, y: Int }
+
 fn first(xs: [Int]) : Option[Int] = match xs {
   []             -> None                        # empty list
   [x, ..._]      -> Some(x)                     # head + ignored rest
+}
+
+fn sign(n: Int) : String = match n {
+  0  -> "zero"                                  # int literal
+  -1 -> "minus-one"                             # negative literal
+  k if k > 0 -> "pos"                           # `if` guard (plain match)
+  _  -> "neg"
+}
+
+fn origin(p: Point) : Bool = match p {
+  { x: 0, y: 0 } -> true                        # record pattern w/ values
+  _              -> false
+}
+
+fn swap(pr: (Int, Int)) : (Int, Int) = match pr {
+  (a, b) -> (b, a)                              # tuple pattern
 }
 
 fn list_info(xs: [Int]) : String = match xs {
@@ -305,9 +391,17 @@ fn main() : Unit / Stdout = {
     Some(n) -> Stdout.print("first=#{int_to_string(n)}")
     None    -> Stdout.print("empty")
   }
+  Stdout.print(sign(-1))
   Stdout.print(list_info([1, 2]))
+  let _ = origin(Point { x: 0, y: 0 })
+  let _ = swap((1, 2))
 }
 ```
+
+Literal patterns (`0`, `-1`, `"hi"`, `'c'`, `true`), record patterns
+(`{ x: 0, y }`), and tuple patterns (`(a, b)`) all appear in `match`
+arms, `let` LHS, and fn parameters. The guard keyword in a plain
+`match` arm is `if`; in a clause-block fn body it is `when`.
 
 ## Postfix `!` — Option/Result propagation
 
@@ -505,6 +599,25 @@ pub fn documented() : Int = 1                  # (use #[doc("...")])
 ```
 
 ```kaikai-neg
+fn fib(0) : Int = 0                            # no literal-in-signature
+fn fib(n: Int) : Int = fib(n - 1)              #   multi-clause; use a
+                                               #   clause-block `{ case … }`
+```
+
+```kaikai-neg
+fn classify(n: Int) when n > 0 : String = "p"  # no `when` guard in the
+                                               #   signature; guard lives
+                                               #   in a `case` arm
+```
+
+```kaikai-neg
+fn classify(n: Int) : String {
+  case n if n < 0 -> "neg"                      # clause-block guard is
+  case _          -> "pos"                      #   `when`, not `if`
+}
+```
+
+```kaikai-neg
 fn pick() : Int = null                         # no null
 ```
 
@@ -527,6 +640,8 @@ fn main() : Int = {
 
 Use instead:
 
+- `fn f(0) = ...` / `fn f(n) when ... = ...` (Elixir multi-clause head) → a clause-block `fn f(n) { case 0 -> ...; case _ -> ... }`
+- `case n if cond ->` (clause-block guard) → `case n when cond ->` (`if` is the plain-`match` guard)
 - `\x -> body` / `fn x -> body` → `(x) => body`
 - `(+ 1)` → `(x => x + 1)`
 - `[x*2 for x in xs]` → `xs | (x => x * 2)`
