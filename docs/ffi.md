@@ -135,8 +135,17 @@ fn main() : Unit / Ffi + Stdout = {
 Three things are happening:
 
 1. `extern "C" fn name(args) : T / Ffi` declares an external
-   symbol. The compiler emits a forward declaration; the linker
-   resolves `name` at link time.
+   symbol. The compiler emits a forward declaration over the C ABI
+   types the boundary uses (`extern <ret> name(<params>);`) on both
+   backends, and the linker resolves `name` at link time. The
+   declaration IS the binding contract: when you bind a symbol a
+   system header already declares (libc), the kaikai-side type must
+   map to the C type the header uses, or `cc` rejects the
+   redeclaration. So `abs` binds as `abs(n: I32) : I32` (libc's
+   `int`), not `: Int` (`int64_t`). A symbol whose C type has no
+   exact kaikai mapping — `size_t`, a struct return — must be wrapped
+   in a small `.c` whose signature uses a width kaikai can express
+   (see *The C shim pattern*).
 2. `extern "C"("symbol") pub fn name(args) : T / Ffi` overrides
    the C symbol when the kaikai-side identifier doesn't match
    (e.g. wrapping `printf` as `c_printf` to avoid kai-side
@@ -152,13 +161,13 @@ Three things are happening:
 
 - `Int`  → `int64_t`
 - `Real` → `double`
-- `Bool` → `int8_t` (0 / 1)
+- `Bool` → `int` (0 / 1)
 - `Char` → `int32_t` (Unicode scalar value: `0..0x10FFFF` excluding
   the surrogate range `0xD800..0xDFFF`). A `Char` produced inside
   kaikai always satisfies this invariant; an `int32_t` crossing back
   from C that is not a scalar value is undefined at the type level —
   validate on the C side, or route through `int_to_char` (which panics
-  on a non-scalar-value argument). See issue #744.
+  on a non-scalar-value argument).
 - `String` → `const char *` (NUL-terminated, kaikai-allocated;
   caller-side lifetime, do not free from C)
 - `Unit` → `void` (return only)
@@ -184,7 +193,7 @@ the C object before invoking `kai build`.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Scalars (`Int`/`Real`/`Bool`/`String`/`Unit`) | **Shipped (v1)** | both backends |
+| Scalars (`Int`/`Real`/`Bool`/`Char`/`String`/`Unit`) | **Shipped (v1)** | both backends |
 | Fixed-width types (`U8`..`F32`) | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
 | Struct / record by value | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
 | Return-by-value of structs | **Shipped (v2, #417)** | C backend |
