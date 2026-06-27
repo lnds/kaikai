@@ -1883,8 +1883,8 @@ pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
 # `KaiValue*(...)` shape (String / Unit / List / Option / Result) and is
 # registered directly. See `emit_impl_shim_defs` (fix-proto-eq-abi).
 #[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), the impl fn's arity, and its unboxed signature (Some when scalar, None when boxed). Heterogeneous- mangled impls…")]
-pub type PimplRow = PR(String, String, String, Int, Option[UFnSig])
-#                  c_sym    proto   type_name arity      unboxed sig
+pub type PimplRow = PR(String, String, String, Int, Option[UFnSig], String)
+#                  c_sym    proto   type_name arity      unboxed sig   op_name
 
 #[doc("AST collector walking pimpl rows. `fns` is the EFn registry, used to recover each pimpl's unboxed signature (the unbox pass stamps it there).")]
 pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] {
@@ -1913,13 +1913,13 @@ pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] 
 
 #[doc("Attach the minted C symbol + unboxed signature to a decoded protocol-impl row.")]
 pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig]) : PimplRow {
-  match pr { PR(_, p, t, _, _) -> PR(csym, p, t, arity, sig) }
+  match pr { PR(_, p, t, _, _, op) -> PR(csym, p, t, arity, sig, op) }
 }
 
 #[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND it touches a raw scalar at the ABI boundary — either a scalar PARAM or a scalar RETURN. The return-only branch covers arity-0 impls like `Default` (`Default_Int_default() : Int` is emitted `i64 ()*` but the impl table bitcasts the slot to `%KaiValue* ()*` — clang's LLVM verifier rejects the mismatch; the C backend gets an implicit cast and only the LLVM smoke test catches it). issue fix-default-shim.")]
 pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
   match pr {
-    PR(_, _, _, _, sig) -> match sig {
+    PR(_, _, _, _, sig, _) -> match sig {
       None -> false
       Some(US(pts, rt, _)) -> any_param_scalar(pts) or ty_is_scalar(rt)
     }
@@ -1978,7 +1978,8 @@ pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
           if last <= 0 { None }
           else {
             let tname = string_slice(rest1, 0, last)
-            Some(PR("", p, tname, 0, None))
+            let op = string_slice(rest1, last + 1, m - last - 1)
+            Some(PR("", p, tname, 0, None, op))
           }
         }
       }
@@ -2193,6 +2194,30 @@ pub fn stdlib_proto_id_int(pname: String) : Int {
   else if pname == "Numeric"    { 12 }
   else { 0 - 1 }
 }
+
+# The operation index within a protocol. The impl table keys on
+# (proto_id, op_id, head_tag), so a multi-op protocol's ops (Ord.cmp/min/max,
+# Numeric.*) resolve distinctly instead of colliding on (proto_id, head_tag).
+# Single-op protocols are op 0. The exact value is irrelevant — only that it
+# is unique within a protocol and that both backends compute it from the same
+# function, so a C table entry and the native dispatch agree on the key.
+pub fn stdlib_proto_op_id_int(pname: String, opname: String) : Int {
+  if pname == "Ord" {
+    if opname == "cmp" { 0 } else if opname == "min" { 1 } else { 2 }
+  } else if pname == "Numeric" {
+    if opname == "add" { 0 } else if opname == "mul" { 1 } else if opname == "zero" { 2 }
+    else if opname == "one" { 3 } else if opname == "abs" { 4 } else if opname == "sign" { 5 }
+    else if opname == "pow_int" { 6 } else if opname == "clamp" { 7 } else { 8 }
+  } else if pname == "Serialize" {
+    if opname == "to_string" { 0 } else { 1 }
+  } else if pname == "BinSerialize" {
+    if opname == "to_bytes" { 0 } else { 1 }
+  } else { 0 }
+}
+
+#[doc("The op-id (`stdlib_proto_op_id_int`) as a C integer literal for the impl table + dispatch shim.")]
+pub fn stdlib_proto_op_id_c(pname: String, opname: String) : String =
+  int_to_string(stdlib_proto_op_id_int(pname, opname))
 
 # Koka-style enum representation: a sum type whose EVERY constructor is
 # nullary (zero payload) is "enum-like" — its values carry no data, only
