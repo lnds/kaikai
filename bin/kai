@@ -1232,6 +1232,24 @@ compile_to_binary() {
   else
     # shellcheck disable=SC2086
     (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $user_cache_flag "$@" "$src") > "$tmp/out.c"
+    # struct-by-value FFI emits a marker stream (line 1 `//KAIDELIM:`)
+    # carrying a shared `kai_ffi.h` + `out.c`. Split it INTO A SUBDIR (the
+    # awk input is `$tmp/out.c`, so writing the split `out.c` back to
+    # `$tmp` would truncate the file awk is still reading) so a hand-written
+    # shim can `#include "kai_ffi.h"` and name the SAME struct type the
+    # boundary uses. Plain programs (no extern struct) emit bare `out.c`
+    # with no marker — the common path, byte-identical to before.
+    cfile="$tmp/out.c"; cincl="$RUNTIME_INC_C"
+    nonce="$(sed -n '1s/^\/\/KAIDELIM://p' "$tmp/out.c")"
+    if [ -n "$nonce" ]; then
+      ffidir="$tmp/ffi"
+      mkdir -p "$ffidir"
+      awk -v dir="$ffidir" -v pfx="//KAIFILE:$nonce::" '
+        index($0, pfx) == 1 { out = dir "/" substr($0, length(pfx) + 1); next }
+        out { print > out }
+      ' "$tmp/out.c"
+      cfile="$ffidir/out.c"; cincl="$ffidir"
+    fi
     # shellcheck disable=SC2086
     # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
     # are unresolved on Linux glibc without an explicit link line.
@@ -1241,8 +1259,10 @@ compile_to_binary() {
     # "runtime.h"` resolves to stage 2's Koka-style runtime (tagged Int,
     # kai_intf, reuse-token). `-I "$RUNTIME_INC"` (stage0) stays as a
     # fallback for the bootstrap-only header set; in dev layout these
-    # differ, in installed layout they are the same dir.
-    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$tmp/out.c" -o "$out" -lm
+    # differ, in installed layout they are the same dir. `-I "$cincl"`
+    # (the split subdir, when present) lets the emitted `#include
+    # "kai_ffi.h"` AND a shim in $CFLAGS resolve the shared FFI header.
+    $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
   fi
 }
 

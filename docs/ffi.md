@@ -194,9 +194,9 @@ the C object before invoking `kai build`.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Scalars (`Int`/`Real`/`Bool`/`Char`/`String`/`Unit`) | **Shipped (v1)** | both backends |
-| Fixed-width types (`U8`..`F32`) | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
-| Struct / record by value | **Shipped (v2, #417)** | C backend; native routes via `--backend=c` |
-| Return-by-value of structs | **Shipped (v2, #417)** | C backend |
+| Fixed-width types (`U8`..`F32`) | **Shipped (v2, #417)** | both backends |
+| Struct / record by value | **Shipped (v2, #417)** | C backend; native rejects with `--backend=c` hint |
+| Return-by-value of structs | **Shipped (v2, #417)** | C backend; native rejects with `--backend=c` hint |
 | Opaque pointers / handles | **Shipped (v2, #417)** | both backends; no-Drop ownership |
 | Out-parameters / pointer-to-T arguments | Not supported | model via opaque handle + accessor |
 | C unions | Not planned | — |
@@ -205,8 +205,10 @@ the C object before invoking `kai build`.
 | Bitfields | Not planned | — |
 
 The C shim pattern below remains valid for what stays out of scope
-(unions, variadics, callbacks) and for the native backend's struct
-gap. For the common cases it is no longer needed — see
+(unions, variadics, callbacks) and for the native backend's struct gap.
+A struct shim `#include`s the generated `kai_ffi.h` (the struct
+`typedef`s) so it names the boundary types directly. For the common
+cases it is no longer needed — see
 [What FFI v2 adds](#what-ffi-v2-adds-417) and `kai info ffi`.
 
 ### The C shim pattern
@@ -319,7 +321,10 @@ authoritative surface reference is `kai info ffi`.
    struct field must be a fixed-width type (or a nested `extern "C"
    type`) — `Int`/`Real`/`String` fields are rejected (they break the
    small-struct layout). The C ABI register/memory classification is
-   the C compiler's job.
+   the C compiler's job. A program with a struct extern type generates a
+   `kai_ffi.h`; a hand-written shim `#include`s it and names the same
+   `typedef`'d type, so the boundary is one C-compiler-checked struct
+   definition rather than a layout twin the linker silently matches.
 
 3. **Opaque handles** — `extern "C" opaque Name`, for types the kaikai
    side threads through but never inspects (libpq `PGconn *`,
@@ -331,10 +336,11 @@ authoritative surface reference is `kai info ffi`.
 
 > **Backend status.** Fixed-width, struct-by-value, and opaque all work
 > on the **C-direct backend** (`--backend=c`). On the **native**
-> (libLLVM) default backend, **opaque handles** are fully supported;
-> **struct-by-value and standalone fixed-width** route through the C
-> backend (a native build reports the gap and the `--backend=c` fix).
-> Native LLVM struct/width marshalling is a planned follow-up.
+> (libLLVM) default backend, **scalars, fixed-width, and opaque handles**
+> are fully supported; **struct-by-value** is rejected with an actionable
+> message naming the function and the `--backend=c` fix — a small struct's
+> C ABI classification is frontend work LLVM does not derive from a struct
+> value. Native struct ABI classification is a planned follow-up.
 
 The raylib-style binding (small structs by value) and the libpq-style
 driver (opaque handles + strings) both stop needing hand-written C
