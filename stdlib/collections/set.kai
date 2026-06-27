@@ -1,12 +1,17 @@
 #[doc("""
-List-backed `Set[a]` wrapping `[a]`: membership, insert, and remove
-are O(n). Structural equality via `==`; pure operations that always
-return a fresh `Set`.
+AVL-backed `Set[a]`: membership, insert, and remove are `O(log n)`,
+and `from_list` is `O(n log n)`. A member is a key in an inner
+`Map[a, Int]` whose value records the insertion sequence, so
+iteration replays insertion order without a linear carrier.
 
 Conventions:
   - Insert order is preserved on `to_list`. Re-inserting an existing
-    element is a no-op (no duplicate, no reordering).
-  - Element equality is structural via `==`.
+    element is a no-op (no duplicate, no reordering — the original
+    sequence number is kept).
+  - Element ordering is the runtime `<`, a total order on `Int`,
+    `Real`, `Char`, and `String` (plus sum types deriving `Ord`).
+    Records as elements panic on the first comparison, like `Map`
+    keys — lift them to a primitive id manually. Equality is `==`.
   - `union(a, b)` keeps `a`'s order, then appends elements of `b` not
     in `a`. Symmetric in *content* but not in *order*.
   - `intersect(a, b)` and `diff(a, b)` keep `a`'s order.
@@ -16,56 +21,62 @@ maps each element; collisions in the output collapse to one element,
 so `map` may shrink the set (`{1, -1} | abs == {1}`).
 """)]
 
-# ---- Carrier -----------------------------------------------------
+import collections.map
 
-#[doc("A list-backed set with structural-equality membership; lookup, insert, and remove are O(n).")]
-pub type Set[a] = { priv items: [a] }
+# ---- Carrier -----------------------------------------------------
+#
+# `index` maps each member to the sequence number it was first
+# inserted at; `next` is the next number to hand out. Sequence
+# numbers only grow, so sorting members by their number replays
+# insertion order. Removal never reuses a number.
+
+#[doc("An AVL-backed set with insertion-ordered iteration; membership, insert, and remove are O(log n).")]
+pub type Set[a] = { priv index: Map[a, Int], priv next: Int }
 
 # ---- Empty / size ------------------------------------------------
 
 #[doc("Returns an empty set.")]
-pub fn empty() : Set[a] = Set { items: [] }
+pub fn empty() : Set[a] = Set { index: map.empty(), next: 0 }
 
 #[doc("Number of elements in the set.")]
-pub fn size(s: Set[a]) : Int = list_length(s.items)
+pub fn size(s: Set[a]) : Int = map.size(s.index)
 
 #[doc("True when the set has no elements.")]
-pub fn is_empty(s: Set[a]) : Bool = list.is_empty(s.items)
+pub fn is_empty(s: Set[a]) : Bool = map.is_empty(s.index)
 
 # ---- Membership --------------------------------------------------
 
 #[doc("True when `x` is a member of the set (structural `==`).")]
-pub fn contains(s: Set[a], x: a) : Bool = list.contains(s.items, x)
+pub fn contains(s: Set[a], x: a) : Bool = map.contains(s.index, x)
 
 # ---- Insert ------------------------------------------------------
 
 #[doc("""
-Append at the tail when missing; no-op when already present. Keeps
-insertion order stable so `to_list` is deterministic across
-recompiles.
+Records `x` at the next sequence number when missing; a no-op when
+already present, keeping the original number so `to_list` order
+stays stable across recompiles.
 """)]
 pub fn insert(s: Set[a], x: a) : Set[a] =
-  if list.contains(s.items, x) {
+  if map.contains(s.index, x) {
     s
   } else {
-    Set { items: list_append(s.items, [x]) }
+    Set { index: map.put(s.index, x, s.next), next: s.next + 1 }
   }
 
 # ---- Remove ------------------------------------------------------
 
-fn set_remove_loop(xs: [a], x: a) : [a] = match xs {
-  []           -> []
-  [h, ...rest] -> if h == x { rest } else { [h, ...set_remove_loop(rest, x)] }
-}
-
 #[doc("Returns a fresh set with `x` removed; a no-op when `x` is absent.")]
 pub fn remove(s: Set[a], x: a) : Set[a] =
-  Set { items: set_remove_loop(s.items, x) }
+  Set { index: map.remove(s.index, x), next: s.next }
 
 # ---- Iteration / construction -----------------------------------
 
+# Members carry their insertion sequence; sorting by it replays
+# insertion order, then we drop the sequence to expose just the
+# elements.
 #[doc("Returns the elements as a list, in insertion order.")]
-pub fn to_list(s: Set[a]) : [a] = s.items
+pub fn to_list(s: Set[a]) : [a] =
+  list.map(list.sort_by(map.to_pairs(s.index), (p, q) => p.snd - q.snd), (p) => p.fst)
 
 # Fold left, applying `insert` once per element so duplicates in
 # the input collapse and the first occurrence wins for ordering.
@@ -95,36 +106,36 @@ fn set_union_loop(left: Set[a], rest: [a]) : Set[a] = match rest {
 
 #[doc("Union of two sets: keeps `s1`'s order, then appends elements of `s2` not already present.")]
 pub fn union(s1: Set[a], s2: Set[a]) : Set[a] =
-  set_union_loop(s1, s2.items)
+  set_union_loop(s1, to_list(s2))
 
 # Intersection — elements of `s1` that are also in `s2`. Preserves
-# `s1`'s order.
-fn set_intersect_loop(xs: [a], other: Set[a]) : [a] = match xs {
-  []           -> []
+# `s1`'s order by re-inserting in that order into a fresh set.
+fn set_intersect_loop(xs: [a], other: Set[a], acc: Set[a]) : Set[a] = match xs {
+  []           -> acc
   [h, ...rest] -> if contains(other, h) {
-    [h, ...set_intersect_loop(rest, other)]
+    set_intersect_loop(rest, other, insert(acc, h))
   } else {
-    set_intersect_loop(rest, other)
+    set_intersect_loop(rest, other, acc)
   }
 }
 
 #[doc("Intersection: elements present in both sets, preserving `s1`'s order.")]
 pub fn intersect(s1: Set[a], s2: Set[a]) : Set[a] =
-  Set { items: set_intersect_loop(s1.items, s2) }
+  set_intersect_loop(to_list(s1), s2, set.empty())
 
 # Difference — elements of `s1` not in `s2`. Preserves `s1`'s order.
-fn set_diff_loop(xs: [a], other: Set[a]) : [a] = match xs {
-  []           -> []
+fn set_diff_loop(xs: [a], other: Set[a], acc: Set[a]) : Set[a] = match xs {
+  []           -> acc
   [h, ...rest] -> if contains(other, h) {
-    set_diff_loop(rest, other)
+    set_diff_loop(rest, other, acc)
   } else {
-    [h, ...set_diff_loop(rest, other)]
+    set_diff_loop(rest, other, insert(acc, h))
   }
 }
 
 #[doc("Difference: elements of `s1` not present in `s2`, preserving `s1`'s order.")]
 pub fn diff(s1: Set[a], s2: Set[a]) : Set[a] =
-  Set { items: set_diff_loop(s1.items, s2) }
+  set_diff_loop(to_list(s1), s2, set.empty())
 
 # ---- Pipe convention exports ------------------------------------
 #
@@ -138,15 +149,15 @@ set. Collisions collapse: if two elements map to the same result the
 output set holds it once, so `map` can shrink the set.
 """)]
 pub fn map(s: Set[a], f: (a) -> b / e) : Set[b] / e =
-  set_from_list_loop(list.map(s.items, f), set.empty())
+  set_from_list_loop(list.map(to_list(s), f), set.empty())
 
 #[doc("""
 Maps each element to a sub-set and unions the results into one fresh
 set. Duplicate elements across sub-sets collapse to one.
 """)]
 pub fn flat_map(s: Set[a], f: (a) -> Set[b] / e) : Set[b] / e =
-  set_flat_map_loop(s.items, f, set.empty())
+  set_flat_map_loop(to_list(s), f, set.empty())
 
 #[doc("Keeps the elements for which `p` returns true, preserving order.")]
 pub fn filter(s: Set[a], p: (a) -> Bool / e) : Set[a] / e =
-  Set { items: list.filter(s.items, p) }
+  set_from_list_loop(list.filter(to_list(s), p), set.empty())
