@@ -157,7 +157,7 @@ Without this discipline, doc → reality drift recurs and downstream analysis (L
 When reasoning about *current state* of the language, runtime, or stdlib, the **primary** sources are:
 
 - `docs/design.md`, `docs/effects.md`, `docs/effects-stdlib.md`, `docs/effects-impl.md`, `docs/protocols.md`, `docs/structured-concurrency.md`, `docs/actors.md` — language semantics.
-- `docs/fibers-honesty-targets.md`, `docs/perceus-honesty-targets.md` — what's shipped vs. deferred per honesty tier.
+- `docs/fibers-honesty-targets.md`, `docs/perceus-honesty-targets.md`, `docs/dispatch-honesty-targets.md` — what's shipped vs. deferred per honesty tier.
 - `docs/stdlib-layout.md`, `docs/stdlib-roadmap.md` — current inventory.
 - `docs/roadmap.md` — milestone state.
 

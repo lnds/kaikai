@@ -140,13 +140,19 @@ run_with_timeout() {
 }
 
 # Collect entry points into $tmp/entry-points (one path per line).
+#
+# `quarantine/` subdirs hold fixtures that DOCUMENT broken/accidental
+# behaviour (no stable golden — silent corruption, segfault) and must
+# not enter the parity corpus. The flat walk's -maxdepth 1 already skips
+# any subdir, but the package walk is pruned explicitly so a future
+# quarantine/main.kai cannot leak in.
 collect_entry_points() {
   for dir in $DIRS; do
     [ -d "$dir" ] || continue
     # Flat shape: *.kai immediately under $dir (depth 1 from $dir).
     find "$dir" -maxdepth 1 -name "*.kai" -not -name "*.err.kai" 2>/dev/null
     # Package shape: <dir>/<pkg>/main.kai (depth >= 2).
-    find "$dir" -mindepth 2 -name "main.kai" 2>/dev/null
+    find "$dir" -mindepth 2 -name "main.kai" -not -path '*/quarantine/*' 2>/dev/null
   done | sort -u > "$tmp/entry-points"
 }
 
