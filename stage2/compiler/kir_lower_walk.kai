@@ -1317,14 +1317,27 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
     None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
   }
 
+# Alias a match-arm binder to the whole scrutinee. When `name` already names
+# a register in scope (a fn param / outer binder of the SAME name — `match n {
+# 0 -> ..; n if n < 0 -> .. }` over a param `n`), a second `KLet(name, ...)`
+# would reuse the outer register's string-keyed alloca and, if their slots
+# differ, widen and corrupt it (the native register table is name-keyed). So
+# mint a fresh `.tN` register and record `name -> .tN` so the arm's guard +
+# body reads resolve to it — exactly `lower_let_pbind`'s shadow discipline.
+fn bind_scr_alias(name: String, scrv: KVal, pos: KPos, st: LowerSt) : LowerSt / Console =
+  if ls_is_local(st, name) {
+    match ls_fresh_reg(st) { LSReg(reg, st1) ->
+      ls_push_rename(ls_emit(st1, KLet(reg, SBoxed, KLitOp(scrv), pos)), name, reg) }
+  } else { ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), pos)) }
+
 # Bind the default arm's pattern to the whole scrutinee. A plain / narrowed
 # binder aliases `scrv`; an as-pattern aliases then descends; a
 # destructuring pattern reuses the field-bind path; wildcard/literal bind
 # nothing.
 fn bind_default_pattern(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
-  PNarrow(name, _)     -> ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
-  PAs(name, _)         -> bind_let_as(p, name, scrv, st)
+  PBind(name)          -> bind_scr_alias(name, scrv, KAt(p.line, p.col), st)
+  PNarrow(name, _)     -> bind_scr_alias(name, scrv, KAt(p.line, p.col), st)
+  PAs(name, _)         -> bind_pattern_fields_any(as_inner(p), scrv, bind_scr_alias(name, scrv, KAt(p.line, p.col), st))
   PVariant(_, _)       -> bind_pattern_fields_any(p, scrv, st)
   PVariantRecord(_, _) -> bind_pattern_fields_any(p, scrv, st)
   PRecord(_)           -> bind_pattern_fields_any(p, scrv, st)
@@ -1336,7 +1349,16 @@ fn first_default_arm(arms: [Arm]) : Option[Arm] = match arms {
   [a, ...rest] -> match a { Arm(p, _, _) -> if arm_is_default(p) { Some(a) } else { first_default_arm(rest) } }
 }
 
-fn arm_is_default(p: Pattern) : Bool = match p.pkind {
+# The pattern an arm dispatches on, looking through an as-pattern's binder
+# (`a @ A` / `a: A` after the typer's narrow rewrite dispatch on `A`). The
+# binder is bound separately by `bind_default_pattern`; here only the inner
+# pattern's discriminant decides the arm's tag / default classification.
+fn arm_disc_pat(p: Pattern) : Pattern = match p.pkind {
+  PAs(_, inner) -> arm_disc_pat(inner)
+  _             -> p
+}
+
+fn arm_is_default(p: Pattern) : Bool = match (arm_disc_pat(p)).pkind {
   PVariant(_, _)       -> false
   PVariantRecord(_, _) -> false
   _                    -> true
@@ -1344,7 +1366,7 @@ fn arm_is_default(p: Pattern) : Bool = match p.pkind {
 
 # The variant tag an arm matches. Non-variant patterns carry tag -1 so
 # `plan_arms` routes them to the default path instead of a switch case.
-fn arm_tag(p: Pattern, st: LowerSt) : Int = match p.pkind {
+fn arm_tag(p: Pattern, st: LowerSt) : Int = match (arm_disc_pat(p)).pkind {
   PVariant(name, _)       -> ls_variant_tag(st, name)
   PVariantRecord(name, _) -> ls_variant_tag(st, name)
   _                       -> 0 - 1
@@ -1569,6 +1591,10 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [Arm(p, opt_guard, body), ...rest] -> match ls_fresh_label(st) { LSLabel(next_fail, st0) ->
     match guard_emit_pat_test(p, scrv, next_fail, st0) {
       LMArm(st_body, _) -> {
+        # The arm's binder may shadow-rename an outer name; that rename is
+        # scoped to THIS arm's guard + body. Snapshot before binding so the
+        # rest of the chain (lowered at `next_fail`) does not inherit it.
+        let rsnap = st_body.renames
         let st_bound = bind_default_pattern(p, scrv, st_body)
         let st_done = match opt_guard {
           None -> lower_branch_into(body, join, lcont, st_bound)
@@ -1590,7 +1616,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         if arm_is_terminal {
           ls_seal(reopen(st_done, next_fail), KUnreachable(KNoPos), next_fail)
         } else {
-          lower_guard_arms(rest, scrv, join, lcont, reopen(st_done, next_fail))
+          lower_guard_arms(rest, scrv, join, lcont, ls_set_renames(reopen(st_done, next_fail), rsnap))
         }
       } } }
 }
@@ -1621,11 +1647,13 @@ fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
       let st2 = var_seal_tag_of(scrv, cname, body_lbl, fail_lbl, p, st1)
       LMArm(reopen(st2, body_lbl), fail_lbl)
     } }
+    # An as-pattern emits the inner pattern's test (the binder is bound after,
+    # by `bind_default_pattern`); `a @ A` tests the `A` tag, `a @ _` passes.
+    PAs(_, inner) -> guard_emit_pat_test(inner, scrv, fail_lbl, st)
     # Non-discriminating: always matches — branch straight to a fresh body.
     PWild        -> guard_pat_passthrough(p, fail_lbl, st)
     PBind(_)     -> guard_pat_passthrough(p, fail_lbl, st)
     PNarrow(_, _) -> guard_pat_passthrough(p, fail_lbl, st)
-    PAs(_, _)    -> guard_pat_passthrough(p, fail_lbl, st)
     PHole(_)     -> guard_pat_passthrough(p, fail_lbl, st)
     # PList / PRecord guarded arms are not yet covered by the linear chain
     # (their test machinery owns its own fail label, which does not compose
@@ -1669,14 +1697,16 @@ fn guard_pat_passthrough(p: Pattern, fail_lbl: String, st: LowerSt) : LMArm / Co
   match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     LMArm(reopen(ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl), body_lbl), fail_lbl) }
 
-# Does this pattern match every value (no test needed)?
+# Does this pattern match every value (no test needed)? An as-pattern matches
+# every value iff its inner pattern does (`a @ A` discriminates on `A`; `a @ _`
+# does not).
 fn guard_pat_always_matches(p: Pattern) : Bool = match p.pkind {
-  PWild        -> true
-  PBind(_)     -> true
+  PWild         -> true
+  PBind(_)      -> true
   PNarrow(_, _) -> true
-  PAs(_, _)    -> true
-  PHole(_)     -> true
-  _            -> false
+  PAs(_, inner) -> guard_pat_always_matches(inner)
+  PHole(_)      -> true
+  _             -> false
 }
 
 # Does `arms` carry any arm guard (`X if cond -> …`)?
