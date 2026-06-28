@@ -174,9 +174,23 @@ fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
 pub fn nemit_call_direct(ctx: Handle, sym: String, cargs: [KVal], fns: [KFn], dst: KSlot) : Handle / Console =
   match nfn_by_sym(fns, sym) {
     Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f, dst) }
-               else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
+               else { nemit_call_boxed_evf(ctx, sym, cargs) }
     None    -> nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs))
   }
+
+# The all-boxed direct call with the evidence frame prepended when the
+# callee carries one; a frameless callee reduces to the legacy buffer. The
+# frame `ptr` is pushed first so it lands in the signature's leading slot.
+fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal]) : Handle / Console = {
+  let n = native_ctx_frame_slot_count(ctx, sym)
+  if n > 0 {
+    let buf = llvm_buf_new()
+    let frame = nemit_evf_build_frame(ctx, sym, n)
+    llvm_buf_push(buf, frame)
+    nemit_push_atoms(ctx, buf, cargs)
+    let r = nemit_call_boxed(ctx, ncall_sym(sym), buf); llvm_buf_free(buf); r
+  } else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
+}
 
 # Look up the callee KFn by its mangled symbol (`KCall.sym` is already the
 # `c_sym` the lowering resolved, matching `KFn.sym`). Only `KFnNormal`
@@ -197,6 +211,9 @@ fn nfn_by_sym(fns: [KFn], sym: String) : Option[KFn] = match fns {
 fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, dst: KSlot) : Handle / Console = {
   let ptb = llvm_buf_new()
   let ab = llvm_buf_new()
+  # Prepend the evidence frame when the callee carries one, so the call type
+  # matches the definition's leading `ptr __evf`.
+  nemit_evf_call_push(ctx, sym, ptb, ab)
   nemit_raw_args(ctx, f.params, cargs, ptb, ab)
   let r = ncall_finish(ctx, sym, nslot_type(ctx, f.ret), ptb, ab)
   match dst {
@@ -204,6 +221,40 @@ fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, dst: KSlot) :
     _      -> r
   }
 }
+
+# Push the callee's evidence-frame arg (a `ptr` to a `[N x ptr]` of slots,
+# each filled by the live walk) + its type, when the callee carries a frame.
+#[doc("Push the callee's walk-filled evidence frame arg + type onto the buffers when it carries a frame.")]
+pub fn nemit_evf_call_push(ctx: Handle, callee: String, ptb: Handle, ab: Handle) : Unit / Console = {
+  let n = native_ctx_frame_slot_count(ctx, callee)
+  if n > 0 {
+    let frame = nemit_evf_build_frame(ctx, callee, n)
+    llvm_buf_push(ptb, native_ctx_ptrt(ctx))
+    llvm_buf_push(ab, frame)
+  } else { () }
+}
+
+# Build the `[N x ptr]` evidence frame for `callee`: alloca it in the entry
+# head, store each slot's node (the live `kaix_evidence_lookup_node(eff)`) at
+# its index, return the array pointer. The perform reads slot j.
+fn nemit_evf_build_frame(ctx: Handle, callee: String, n: Int) : Handle / Console = {
+  let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
+  let frame = llvm_build_alloca(native_ctx_b(ctx), arrty, "__evf_frame")
+  nemit_evf_fill_slots(ctx, callee, arrty, frame, 0, n)
+  frame
+}
+
+fn nemit_evf_fill_slots(ctx: Handle, callee: String, arrty: Handle, frame: Handle, j: Int, n: Int) : Unit / Console =
+  if j >= n { () }
+  else {
+    let eff = native_ctx_frame_slot_eff(ctx, callee, j)
+    let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+    let node = ncall_sig1(ctx, "kaix_evidence_lookup_node", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), effname)
+    let idx = llvm_const_int(native_ctx_i64t(ctx), j)
+    let slotptr = llvm_build_array_gep(native_ctx_b(ctx), arrty, frame, idx)
+    let _s = llvm_build_store(native_ctx_b(ctx), node, slotptr)
+    nemit_evf_fill_slots(ctx, callee, arrty, frame, j + 1, n)
+  }
 
 # Materialise each arg at its param's slot, pushing the param TYPE into
 # `ptb` and the arg VALUE into `ab` in the same order. A raw param slot
