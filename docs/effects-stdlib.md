@@ -87,6 +87,37 @@ ergonomics by adding a `default { }` block whose clauses point at a
 runtime C entry (the bridge does not validate the C symbol exists —
 that's the FFI contract).
 
+## Three classes of builtin effect
+
+"Builtin" is not one privileged category — it is three, each with a
+distinct reason to exist and a distinct dispatch mechanism. A builtin
+exists only when one of these three applies; none is arbitrary.
+
+1. **Value-transportable** (`Stdout`, `Stderr`, `Stdin`, `Env`,
+   `File`, `Clock`, `Random`, `SecureRandom`, the `Net` family,
+   `Process`, `Signal`, `Mutable`, and the user-defined `State[T]`,
+   `Reader[T]`, `Writer[W]`). Their evidence is a value that travels
+   as an injected hidden parameter; the `default { }` property decides
+   only which supplier fills the slot. These are uniform with
+   user-declared effects — a builtin here has no privilege a user
+   effect lacks. `frame_effect_is_carried` draws the line.
+
+2. **Fiber-local** (`Cancel`, `Link`, `Monitor`, `Spawn`, `Actor`).
+   The scheduler installs their evidence *per fiber* (cancel pad,
+   link set, mailbox, nursery). They cannot ride an injected slot:
+   transporting one across a `spawn` would carry a parent's handler
+   into a child, where capabilities must not cross. This is a
+   soundness constraint, not pending work — they resolve through the
+   runtime's per-fiber disposition permanently. `frame_is_fiber_local`
+   lists them.
+
+3. **Boundary marker** (`Ffi`, declared `effect Ffi {}` — the only
+   zero-op effect). It carries no operations and dispatches nothing.
+   Its sole job is to appear in the row: a signature with `/ Ffi`
+   documents that the function crosses to C, where the effect system
+   loses visibility and cannot verify purity. It uses the row machinery
+   as an honesty marker for a trust boundary, not as a dispatch site.
+
 Sections are self-contained; skim the catalog, then dive where
 you care.
 
