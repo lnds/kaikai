@@ -45,13 +45,13 @@ fn main() : Int / Spawn + Stdout = {
 
 - On normal exit, the nursery scope is the structured boundary;
   fibers cannot escape its lexical extent.
-
-> **v1 status (2026-05-21):** `nursery` is a typed pass-through —
-> the body runs and its return value is returned, but the
-> structured semantics ("wait for every child on exit; cancel the
-> rest and re-raise on child failure") are m8.x scope, tracked in
-> `docs/fibers-honesty-targets.md`. Spawned children outlive the
-> nursery body under the current cooperative scheduler.
+- Children are joined automatically: the nursery does not return
+  until every child spawned inside it has finished, even with no
+  explicit `await`.
+- If a child raises `Cancel` on its own, the surviving siblings are
+  cancelled and the failure re-raises out of the scope. A child
+  cancelled on request (`n.cancel`) is an expected outcome and does
+  not propagate.
 
 ## Actors
 
