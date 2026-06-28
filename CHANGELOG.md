@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.92.0 (2026-06-27)
+
+### Added
+
+- **native**: implement test/bench runner on the native backend
+- **emit**: thread evidence frame through C call sites (#820 L3)
+- **typer**: inject evidence params + ship #789 collision diagnostic (#820 L2)
+- **typer**: compute evidence obligations per function (#820 L1)
+
+### Fixed
+
+- **cli**: route test/bench/watch to the native backend by default
+- **native**: make nemit_push_atoms pub for the evf call funnel
+- **native**: pass the evidence frame through the fn thunk
+- **native**: build the evidence frame with a body alloca, not entry
+- **emit**: thread evidence frame into lambda/clause bodies + exempt main (#820 L3)
+- **emit**: keep Actor/Console/Ffi on the by-name walk (#820 L3)
+- **emit**: box unboxed pattern binder at closure capture site
+
 ## v0.91.2 (2026-06-27)
 
 ### Fixed
