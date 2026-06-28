@@ -334,42 +334,92 @@ fn arg_names_mangle(args: [String]) : String = match args {
 #[doc("kaikai name of the polymorphic dispatcher DFn for protocol op `op` (`__proto_<op>`).")]
 pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 
+# A protocol's home module, keyed by name. Built once from the merged
+# decl stream's home-anchor analysis; `collect_proto_decls` consults it
+# instead of inferring the home from the running `cur_mod`.
+type ProtoHome = PH(String, Option[String])
+
+# The home module of each DProtocol, recovered with the SAME back-
+# propagating home-anchor analysis `validate_pub_access` uses. A bare
+# forward stream (the legacy approach) mis-tags any DProtocol that
+# precedes the first anchored DFn of its file: a user protocol declared
+# before `fn main` inherits the last prelude's module instead of the
+# root file's, and every prelude protocol shifts to the preceding
+# module. `imports_home_anchors` assigns one home per decl in source
+# order with the back-propagation that fixes both.
+fn proto_homes_from_decls(ds: [Decl], target_mod: String) : [ProtoHome] = {
+  let homes = imports_home_anchors(ds, target_mod, target_mod, [])
+  proto_homes_zip(ds, homes, target_mod, [])
+}
+
+fn proto_homes_zip(ds: [Decl], homes: [HomeAnchor], target_mod: String,
+                   acc: [ProtoHome]) : [ProtoHome] = match ds {
+  [] -> acc
+  [d, ...rest] -> match homes {
+    [] -> acc
+    [h, ...hrest] -> {
+      let acc1 = proto_home_record(d, ha_home(h), target_mod, acc)
+      proto_homes_zip(rest, hrest, target_mod, acc1)
+    }
+  }
+}
+
+# Record a `(proto_name, home)` for `d` when it is (or wraps) a
+# DProtocol. `home == target_mod` canonicalises to `None`, matching the
+# rest of the root file's untagged decls.
+fn proto_home_record(d: Decl, home: String, target_mod: String,
+                     acc: [ProtoHome]) : [ProtoHome] = match d {
+  DProtocol(_, name, _, _, _, _) -> {
+    let mo = if home == target_mod { None } else { Some(home) }
+    [PH(name, mo), ...acc]
+  }
+  DDerive(_, inner, _, _)  -> proto_home_record(inner, home, target_mod, acc)
+  DUnstable(inner, _, _)   -> proto_home_record(inner, home, target_mod, acc)
+  _ -> acc
+}
+
+fn proto_home_lookup(homes: [ProtoHome], name: String) : Option[String] = match homes {
+  [] -> None
+  [PH(n, mo), ...rest] -> if n == name { mo } else { proto_home_lookup(rest, name) }
+}
+
 # Register every DProtocol decl the program declares. The op list
 # becomes the universe of "names that look like ordinary fn calls but
 # really need protocol dispatch".
 #
-# Issue #597 boundary tagging: thread `cur_mod` through the walk so
-# each registered DProtocol records its home module. DProtocol carries
-# no `module_origin` field of its own (v1 of #510 only added the field
-# to DFn), so we recover the home by streaming through the same
-# `decl_home_hint_reset` algorithm `validate_pub_access` uses. The
-# result `proto_origins` table feeds `make_dispatcher_fn` so each
-# synthesised dispatcher inherits the originating module's tag.
+# Issue #597 boundary tagging: each registered DProtocol records its
+# home module. DProtocol carries no `module_origin` field of its own (v1
+# of #510 only added the field to DFn), so the home is recovered up
+# front via `proto_homes_from_decls` (the back-propagating home-anchor
+# analysis) and looked up by name here. The `origins` table feeds
+# `make_dispatcher_fn` so each synthesised dispatcher inherits the
+# originating module's tag, AND the #962 directional-visibility cut,
+# which needs a user protocol's origin to be exactly `None`.
 fn collect_proto_decls(ds: [Decl], reg: ProtocolReg,
-                        target_mod: String, cur_mod: String) : ProtocolReg {
+                        target_mod: String) : ProtocolReg {
+  collect_proto_decls_h(ds, reg, proto_homes_from_decls(ds, target_mod))
+}
+
+fn collect_proto_decls_h(ds: [Decl], reg: ProtocolReg,
+                          homes: [ProtoHome]) : ProtocolReg {
   match ds {
     [] -> reg
-    [d, ...rest] -> {
-      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
-      match d {
-        DProtocol(_, name, tparams, ops, _, _) -> {
-          let proto_mo =
-            if next_mod == target_mod { None } else { Some(next_mod) }
-          let reg1 = ProtocolReg {
-            ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-            tparams: [PTPR(name, tparams), ...reg.tparams],
-            origins: [PrOR(name, proto_mo), ...reg.origins],
-            impl_index: reg.impl_index
-          }
-          collect_proto_decls(rest, register_proto_ops(reg1, name, ops),
-                                target_mod, next_mod)
+    [d, ...rest] -> match d {
+      DProtocol(_, name, tparams, ops, _, _) -> {
+        let proto_mo = proto_home_lookup(homes, name)
+        let reg1 = ProtocolReg {
+          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+          tparams: [PTPR(name, tparams), ...reg.tparams],
+          origins: [PrOR(name, proto_mo), ...reg.origins],
+          impl_index: reg.impl_index
         }
-        DDerive(_, inner, _, _) ->
-          collect_proto_decls([inner, ...rest], reg, target_mod, cur_mod)
-        DUnstable(inner, _, _) ->
-          collect_proto_decls([inner, ...rest], reg, target_mod, cur_mod)
-        _ -> collect_proto_decls(rest, reg, target_mod, next_mod)
+        collect_proto_decls_h(rest, register_proto_ops(reg1, name, ops), homes)
       }
+      DDerive(_, inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      DUnstable(inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      _ -> collect_proto_decls_h(rest, reg, homes)
     }
   }
 }
@@ -2913,13 +2963,10 @@ pub fn lower_protocols(decls: [Decl], file: String,
   let local_types = collect_local_type_names(expanded, [])
   let coh_errs = validate_impls(expanded, file, proto_names, local_types)
   # Step 3 — collect every protocol op into the registry.
-  # Issue #597 boundary tagging: thread `target_mod` so each
-  # DProtocol's home module is recorded in `reg.origins`; the
-  # streaming `decl_home_hint_reset` algorithm recovers the home
-  # from the surrounding DFn tags (DProtocol carries no `mo` field
-  # of its own).
-  let reg0 = collect_proto_decls(expanded, proto_reg_empty(),
-                                    target_mod, target_mod)
+  # Issue #597 boundary tagging: each DProtocol's home module is
+  # recorded in `reg.origins` via the back-propagating home-anchor
+  # analysis (DProtocol carries no `mo` field of its own).
+  let reg0 = collect_proto_decls(expanded, proto_reg_empty(), target_mod)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
   # head-name signature mismatch). Runs after the registry is built so
@@ -2954,12 +3001,17 @@ pub fn lower_protocols(decls: [Decl], file: String,
   # `pub fn min(xs)` / arity-2 `Ord.min(a, b)` split is preserved as
   # before — different arities never get filtered.
   let raw_op_arities = op_arities_from_ops(lower_res.reg.ops)
+  # Directional visibility (#962): a body homed in a named module (core
+  # / prelude) may only be rewritten against ops whose protocol is
+  # itself core-origin; a root-file decl (user) sees every op. This is
+  # the cut that keeps a once-typed core independent of any user file.
+  let core_op_arities = core_origin_op_arities(lower_res.reg.ops, lower_res.reg.origins)
   # Per-module shadow guard: collect each top-level fn with its home
   # module so a prelude helper (`complex::add`) shadows the bare op
   # only inside its own module, never in the user's file.
   let local_fns = collect_local_fn_arities_mo(stripped)
-  let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, local_fns, target_mod)
-  let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, local_fns, target_mod)
+  let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, core_op_arities, local_fns, target_mod)
+  let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, core_op_arities, local_fns, target_mod)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
@@ -3030,6 +3082,27 @@ pub fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
     [op, ...rest] -> match op {
       POR(_, name, params, _, _, _) ->
         [OpAr(name, list_length(params)), ...op_arities_from_ops(rest)]
+    }
+  }
+}
+
+# Directional visibility (#962): the same projection, but keeping only
+# ops whose declaring protocol has a named home module. A protocol
+# defined in the root file is tagged `origin = None` (root file is the
+# user); excluding those from a core body's rewrite set is exactly the
+# "core never sees the user" invariant that makes reusing a once-typed
+# core sound. The discriminant is the PROTOCOL'S origin, never the impl
+# provider — so legitimate polymorphic dispatch (a core body calls a
+# core op, the user supplies the impl) is untouched: the core op's
+# protocol is still core-origin and survives the filter.
+fn core_origin_op_arities(ops: [ProtoOpReg], origins: [ProtoOriginReg]) : [OpAr] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POR(proto, name, params, _, _, _) -> match proto_origin_lookup(origins, proto) {
+        None -> core_origin_op_arities(rest, origins)
+        Some(_) -> [OpAr(name, list_length(params)), ...core_origin_op_arities(rest, origins)]
+      }
     }
   }
 }
@@ -3275,19 +3348,24 @@ pub fn rename_proto_calls_decls(ds: [Decl], op_arities: [OpAr],
 # shadow `Show.show` in `fn main` (untagged).
 #[doc("Per-module variant of `rename_proto_calls_decls`: shadows are module-scoped.")]
 pub fn rename_proto_calls_decls_mo(ds: [Decl], raw_ops: [OpAr],
-                                    local_fns: [LFnAr],
+                                    core_ops: [OpAr], local_fns: [LFnAr],
                                     target_mod: String) : [Decl] =
-  rename_proto_calls_decls_mo_loop(ds, raw_ops, local_fns, target_mod,
+  rename_proto_calls_decls_mo_loop(ds, raw_ops, core_ops, local_fns, target_mod,
                                     ShadowByMod { entries: [], has_root: false,
                                                   root_ops: [], root_names: [] }, [])
 
 # The (filtered_ops, names) pair a decl rewrites against depends only on
-# its canonical module bucket — `local_fns`, `raw_ops` and `target_mod`
+# its canonical module bucket — `local_fns`, the op sets and `target_mod`
 # are invariant across the whole list. A self-compile carries thousands
 # of decls but tens of distinct modules, so recomputing the per-module
 # shadow set per decl is the same O(n²) retention #907/#912 fixed on the
 # emit / KIR paths. Memoise the pair by module origin: one entry per
 # distinct module, an `O(1)` lookup per decl.
+#
+# Directional visibility (#962): a root-file decl (`dmo = None`, the
+# user) rewrites against `raw_ops` (every op); a named-module decl (core
+# / prelude) rewrites against `core_ops` (only core-origin ops) so no
+# user `protocol` can reach into a core body.
 type ShadowByMod = { entries: [ShadowEntry], has_root: Bool,
                      root_ops: [OpAr], root_names: [String] }
 type ShadowEntry = { key: String, ops: [OpAr], names: [String] }
@@ -3300,7 +3378,7 @@ fn sbm_lookup(entries: [ShadowEntry], k: String) : Option[ShadowEntry] = match e
 type ShadowResult = { cache: ShadowByMod, ops: [OpAr], names: [String] }
 
 fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
-                 local_fns: [LFnAr], target_mod: String) : ShadowResult = match dmo {
+                 core_ops: [OpAr], local_fns: [LFnAr], target_mod: String) : ShadowResult = match dmo {
   None ->
     if c.has_root { ShadowResult { cache: c, ops: c.root_ops, names: c.root_names } }
     else {
@@ -3312,7 +3390,7 @@ fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
   Some(m) -> match sbm_lookup(c.entries, m) {
     Some(e) -> ShadowResult { cache: c, ops: e.ops, names: e.names }
     None    -> {
-      let ops = filter_shadowed_ops(raw_ops, local_arities_for_mo_canon(local_fns, dmo, target_mod))
+      let ops = filter_shadowed_ops(core_ops, local_arities_for_mo_canon(local_fns, dmo, target_mod))
       let names = local_names_for_mo_canon(local_fns, dmo, target_mod)
       ShadowResult { cache: ShadowByMod { entries: [ShadowEntry { key: m, ops: ops, names: names }, ...c.entries],
                                           has_root: c.has_root, root_ops: c.root_ops, root_names: c.root_names },
@@ -3321,14 +3399,15 @@ fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
   }
 }
 
-fn rename_proto_calls_decls_mo_loop(ds: [Decl], raw_ops: [OpAr], local_fns: [LFnAr],
-                                     target_mod: String, c: ShadowByMod, acc: [Decl]) : [Decl] = match ds {
+fn rename_proto_calls_decls_mo_loop(ds: [Decl], raw_ops: [OpAr], core_ops: [OpAr],
+                                     local_fns: [LFnAr], target_mod: String,
+                                     c: ShadowByMod, acc: [Decl]) : [Decl] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> {
     let dmo = canon_mo(decl_module(d), target_mod)
-    let r = shadow_for_mo(c, dmo, raw_ops, local_fns, target_mod)
+    let r = shadow_for_mo(c, dmo, raw_ops, core_ops, local_fns, target_mod)
     let renamed = rename_proto_calls_decl(d, r.ops, r.names)
-    rename_proto_calls_decls_mo_loop(rest, raw_ops, local_fns, target_mod, r.cache,
+    rename_proto_calls_decls_mo_loop(rest, raw_ops, core_ops, local_fns, target_mod, r.cache,
                                      [renamed, ...acc])
   }
 }
