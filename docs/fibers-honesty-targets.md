@@ -98,8 +98,10 @@ or in the 1.0-honesty target list is shipped and verifiable.
   (Spawn.cancel reaches the parked fiber). This unblocks
   `lnds/ahu`'s `run_app(root)` spawn+multiplex+cancel pattern and
   the todo-demo (#606) graceful-shutdown story.
-- §*Residual m8.x items* below now reduces to three minor
-  items, none of which surface as runtime errors today.
+- §*Residual m8.x items* below now reduces to two minor
+  items, none of which surface as runtime errors today
+  (structured auto-join + cancel-on-fail shipped — see that
+  section's item 3).
 
 ## Tier 1 — *Show HN honest* (~1 day)
 
@@ -241,16 +243,30 @@ of option (b) outstanding. Documented in
   trampoline `cancel_pad` directly; user cleanup clauses are not
   invoked. Documented in the `kai_check_cancel_yield_point`
   comment.
-- Structured cancel-on-fail in `nursery`. The `nursery` body in
-  `stdlib/spawn.kai` is currently a typed pass-through; the full
-  cancel-failed-siblings-and-rethrow shape from
-  `docs/structured-concurrency.md` requires the nursery to install
-  its own `Spawn` handler that observes child terminations through
-  Link.
+- `Fail`-at-nursery-level recovery. A child that fails through the
+  modelled `Fail` effect (rather than `Cancel`) is not yet caught
+  and re-raised by the scope — that needs the nursery to reshape the
+  body's inferred row, which is its own type-design lane.
 
 These three are notes for future agents — none of them surface to
 user code as runtime errors today, and none of them block the issue
 #59 close.
+
+### 3. Structured auto-join + cancel-on-fail in `nursery` (shipped)
+
+`nursery` is no longer a typed pass-through. It opens a runtime scope
+(`Spawn.scope_enter`); children spawned inside register on it, and at
+the closing brace `Spawn.scope_exit` joins every child FIFO before the
+nursery returns — no explicit `await` required. If a child terminates
+CANCELLED without anyone requesting its cancellation (it raised
+`Cancel` on its own), the surviving siblings are cancelled and the
+failure re-raises out of the scope via the running fiber's cancel pad.
+A child cancelled on request (`n.cancel`, or the cancel-on-fail walk
+itself) terminates CANCELLED with `cancel_requested` set and is an
+expected, non-propagating outcome. The scope state is a per-fiber
+stack of `KaiNursery` so nested nurseries compose. Coverage:
+`examples/effects/m8x_9_nursery_autojoin.kai` (auto-join order),
+`m8x_10_nursery_cancel_on_fail.kai` (sibling cancel + re-raise).
 
 ## Sequencing recommendation
 

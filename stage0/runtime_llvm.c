@@ -1330,6 +1330,12 @@ KaiValue *kaix_default_spawn_cancel(void *self, KaiValue *fib, KaiCont *k) {
 KaiValue *kaix_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k) {
     return kai_default_spawn_set_trap_exit(self, on, k);
 }
+KaiValue *kaix_default_spawn_scope_enter(void *self, KaiCont *k) {
+    return kai_default_spawn_scope_enter(self, k);
+}
+KaiValue *kaix_default_spawn_scope_exit(void *self, KaiCont *k) {
+    return kai_default_spawn_scope_exit(self, k);
+}
 
 /* Issue #582 — LLVM-visible wrapper around `kai_default_cancel_raise`.
  * The LLVM emitter installs this by name from `kai_main_install_defaults`
