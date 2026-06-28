@@ -24,7 +24,7 @@ To make the scope explicit:
 - No tuples (use records; or use sum-type variants with positional fields).
 - No full Perceus — a simple reference counter is used.
 - No string format beyond interpolation. No regex.
-- No m7b sugars (trailing lambdas, double trailing, `@cap`, `:=`, `var`, `a[i]`, lambda-block as expression). They appear in stage 1+; their grammar lives in §*Post-stage-0 grammar additions* below.
+- No m7b sugars (trailing lambdas, double trailing, naked cell read, `:=`, `var`, `a[i]`, lambda-block as expression). They appear in stage 1+; their grammar lives in §*Post-stage-0 grammar additions* below.
 - No hex / binary integer literals (`0xFF`, `0b1010`); decimal only. The `0x`/`0b` lexer branches land in full kaikai (see `docs/syntax-sugars.md` §7).
 - No regex sigil `~r/.../`, no n-tuple sugar `(a, b)`. Both are full-kaikai; see `docs/syntax-sugars.md` §6 and §"Regex sigil".
 
@@ -742,17 +742,15 @@ Expr            ::= ...
                   | "{" LambdaParams "->" Expr "}"     (* lambda-block expression *)
                   | "{" "->" Expr "}"                  (* zero-arity lambda-block *)
 
-(* §2 — capability read/write *)
-Expr            ::= ...
-                  | "@" Ident                           (* capability read *)
+(* §2 — capability read/write; a naked Ident reads the cell *)
 Stmt            ::= ...
                   | Ident ":=" Expr                     (* capability write *)
                   | IndexLhs "[" Expr "]" ":=" Expr     (* indexed write *)
 IndexLhs        ::= Ident ("." Ident)*
 
-(* §3 — local mutable cells *)
+(* §3 — local mutable cells; ":=" is the mutability marker *)
 Stmt            ::= ...
-                  | "var" Ident (":" Type)? "=" Expr
+                  | "var" Ident (":" Type)? ":=" Expr
 
 (* §4 — array indexing read uses the existing postfix on Expr *)
 ```

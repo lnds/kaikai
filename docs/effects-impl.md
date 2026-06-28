@@ -850,7 +850,7 @@ up like any other identifier:
 
 - *Trailing lambdas* → ordinary application with the last
   argument as a lambda expression.
-- *Local mutable cell* — `var x = init; body` →
+- *Local mutable cell* — `var x := init; body` →
   `handle { body } with State[?T](init)` with canonical
   `get`/`set`/`return` clauses. `?T` is a fresh type variable;
   HM inference later unifies it with the type of `init` (or of
@@ -863,10 +863,10 @@ up like any other identifier:
 **Post-resolve** (after resolve, before infer). Sugars whose
 rewrite depends on which effect a capability binding refers to:
 
-- *Capability read / write* — `@cap` → `cap.ask()` when `cap`
-  resolved as a `Reader` capability or `cap.get()` when it
-  resolved as `State`; `cap := v` → `cap.set(v)` for `State` or
-  `cap.put(v)` for `Writer`.
+- *Capability read / write* — a naked read `cap` → `cap.ask()`
+  when `cap` resolved as a `Reader` capability or `cap.get()`
+  when it resolved as `State`; `cap := v` → `cap.set(v)` for
+  `State` or `cap.put(v)` for `Writer`.
 
 Resolve records each `Eff as name` rebind (and each default
 capability binding produced by `with Eff { ... }`) as a
@@ -882,16 +882,17 @@ transformations are hard-coded and tested.
 Pre-resolve sugars produce stdlib names (`Mutable.array_get`,
 `State[T]` for `var`'s implicit handler) that resolve must look
 up uniformly with hand-written calls — so they have to run
-*before* resolve. Capability sugars are the opposite: `@cap`
-cannot rewrite without knowing whether `cap` denotes a Reader
-or a State, and that decision is exactly what resolve produces.
+*before* resolve. Capability sugars are the opposite: a naked
+read `cap` cannot rewrite without knowing whether `cap` denotes
+a Reader or a State, and that decision is exactly what resolve
+produces.
 Splitting the pass keeps each transformation local to the
 information it needs.
 
 ## Variable specialisation
 
-Doc B §`State[T]` *Performance* promised that `var x = 0;
-x := @x + 1` compiles to a native mutable int, not a chain of
+Doc B §`State[T]` *Performance* promised that `var x := 0;
+x := x + 1` compiles to a native mutable int, not a chain of
 handler invocations. The mechanism:
 
 ### Trigger conditions
@@ -917,7 +918,7 @@ replaced by:
 
 - An `alloca` for a slot of type `T`, initialised from the
   `init` expression.
-- `@x` (= `State.get()`) → `load` from the slot.
+- `x` (= `State.get()`) → `load` from the slot.
 - `x := v` (= `State.set(v)`) → `store` to the slot.
 - `return(x) -> expr` → `expr` evaluated after the body,
   dropping the slot at the enclosing frame's end.
@@ -955,7 +956,7 @@ gaps remain between the lowered code and what Doc B implies should
    — same as a `let` of the same name shadows an outer binding.
    Doc B's "Nested vars nest handlers" stops short of saying the
    outer cell stays reachable from inside the inner's body, and
-   today it doesn't: `var a = 0; var b = 0; { ... a.set(1) ... }`
+   today it doesn't: `var a := 0; var b := 0; { ... a.set(1) ... }`
    inside `b`'s body hits `b`. The cure is per-`handler_id`
    dispatch — the alias rewrite would emit a node lookup keyed on
    the specific handler instance instead of the effect name. The
@@ -967,7 +968,7 @@ gaps remain between the lowered code and what Doc B implies should
 2. **Variable specialisation (§*Variable specialisation*) is
    still pending.** The desugar emits the canonical heap-handler
    form unconditionally; until specialisation lands, every
-   `var n = 0; n.set(@n + 1)` pays a full op-call (evidence
+   `var n := 0; n.set(n + 1)` pays a full op-call (evidence
    lookup + identity continuation) per access. Doc B §`State[T]`
    *Performance* promised this lowers to a stack slot when the
    four trigger conditions hold — the trigger check + slot
@@ -1625,27 +1626,28 @@ page the way they are written.
    (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
    single trailing, lambda-block as expression, double trailing.
    **Landed.**
-4. **`@cap` and `cap := v`** — Doc B §`Syntax note: capability
-   read/write sugar`. Implementation: parser inlines the desugar.
-   `@Ident` parses as `EApp(EField(EVar(name), "get"), [])`;
-   `Ident := value` parses as
-   `SExprStmt(EApp(EField(EVar(name), "set"), [value]))`. The
+4. **naked cell read and `cap := v`** — Doc B §`Syntax note:
+   capability read/write sugar`. Implementation: a bare `Ident`
+   that resolved to a capability binding rewrites to
+   `EApp(EField(EVar(name), "get"), [])`; `Ident := value` parses
+   as `SExprStmt(EApp(EField(EVar(name), "set"), [value]))`. The
    inferencer's existing alias path (`try_op_call`) handles
    `cap.op(args)` by looking up `Eff.op` once the alias is
    resolved; an extra remap turns `cap.get` into `Reader.ask`
    when `cap` is bound to a Reader. The narrow scope from
-   Doc B (rule 1: `@` only on get/ask; rule 2: `:=` only on set)
-   is enforced by shape — `@State.get` does not parse, and
-   `cap := v` on a Reader binding falls through to the existing
-   "unknown op `set` on effect Reader" diagnostic. **Landed.**
-5. **`var x = init`** — pre-resolve desugar + variable
+   Doc B (rule 1: naked read only lowers get/ask; rule 2: `:=`
+   only on set) is enforced by shape — a non-capability
+   identifier stays an ordinary variable read, and `cap := v` on
+   a Reader binding falls through to the existing "unknown op
+   `set` on effect Reader" diagnostic. **Landed.**
+5. **`var x := init`** — pre-resolve desugar + variable
    specialisation (§*Variable specialisation*). **Landed.** Doc B
    §3 mandates lowering to `handle { rest } with State[T](init) as
    name { ... }` with the canonical `get`/`set`/`return` clauses;
    `desugar_var_decls` (`stage2/compiler.kai`) walks every block,
    wraps the rest-of-block from each `SVar` onward in that handler
    shape, and recurses so nested vars nest handlers innermost
-   first. The annotated form `var x: T = init` passes `[T]` as the
+   first. The annotated form `var x: T := init` passes `[T]` as the
    handler's syntactic type args; the unannotated form leaves the
    list empty and synth_handle fills `[type_of_init]` from the
    `init`'s inferred type. A pre-resolve alias rewrite (sibling
@@ -1867,8 +1869,9 @@ and #17 are the three known gaps it left behind, promoted from
 the §*Known follow-ups after m7b #5b* subsection. m7b #13, #14,
 and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
 capture) landed too, surfaced while exercising the polymorphic
-helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
-landed, completing the user-facing surface of the `var` workflow.
+helpers from #14. m7b #4 (naked cell read / `cap := v` sugars)
+also landed, completing the user-facing surface of the `var`
+workflow.
 m7b #2a (per-op generics mechanism), #2b (Mutable introduction),
 and #2c (audit, "no migration" decision pinned to stage 0
 parser limitations) all landed. m7b #17 (alias-rewrite shadow

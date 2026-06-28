@@ -209,7 +209,7 @@ that lands with its message text, not a TODO.
 .kai source
   → lex        (shared with stage 1 — subset-compatible)
   → parse      (extended grammar: effects, handlers, nursery, holes)
-  → desugar    (trailing lambdas, @cap / cap := v, var, a[i] —
+  → desugar    (trailing lambdas, naked cell read / cap := v, var, a[i] —
                 see docs/syntax-sugars.md §Migration and diagnostics)
   → resolve    (module-aware: imports become edges)
   → infer      (HM-extended with effect rows, region branding)
@@ -367,9 +367,9 @@ in.
      compiles and runs end-to-end.
    - **m7b — ergonomics**: closed effect aliases (`type Io =
      Console + Stdin + Env + File`), per-operation type
-     generics (Doc A amendment), trailing lambdas, `@cap` /
-     `cap := v` capability sugar, local mutable cells (`var x
-     = init`), array indexing (`a[i]` / `a[i] := v`),
+     generics (Doc A amendment), trailing lambdas, naked cell
+     read / `cap := v` capability sugar, local mutable cells
+     (`var x := init`), array indexing (`a[i]` / `a[i] := v`),
      `Reader[T]` / `Writer[W]` as their own effects.
    - **m7c — LLVM effects port**: replicate the m7a/m7b
      effects codegen in the LLVM backend. Today
@@ -638,7 +638,7 @@ Rationale:
    every subsequent doc (effects, sugars, fibers, actors)
    because they all assume row inference + handler runtime.
 2. **m7b (effects ergonomics)** — ships the sugars (trailing
-   lambdas, `@cap`/`:=`, `var`, `a[i]`, aliases). The code in
+   lambdas, naked cell read/`:=`, `var`, `a[i]`, aliases). The code in
    `effects-stdlib.md` and `actors.md` reads as written only
    after m7b lands.
 3. **m7c (LLVM effects port)** — closes the asymmetry the C
@@ -929,7 +929,7 @@ informal "MVP" labels used in earlier planning snapshots.
   green.
 - Effects + handlers + parametric effects + per-instance dispatch
   (m7a/b/c).
-- Ergonomic sugars: trailing lambdas, `@cap`, `var`, `a[i]`, aliases,
+- Ergonomic sugars: trailing lambdas, naked cell read, `var`, `a[i]`, aliases,
   `todo!`, record punning, `@` as-patterns, pipeline `_`, `++`, `!`
   postfix on `Option`/`Result` (m7b/d/e§13).
 - Fibers, structured concurrency, actors with supervision (m8).
@@ -1085,7 +1085,7 @@ set in `demos/`, four typer/resolver/codegen bugs surfaced:
    row pinned `while`'s row var `e` to empty, then the second lambda's
    `[Stdout]` row could not unify.
 4. **Closure capture of var-bound aliases** (`4c61184`): `fv_expr` /
-   `collect_expr` collected handler aliases (`var top = 0` desugars
+   `collect_expr` collected handler aliases (`var top := 0` desugars
    to `with State[Int](0) as top`) as captured values; the C emit
    read `kai_top` against an undeclared identifier.
 

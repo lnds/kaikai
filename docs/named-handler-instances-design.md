@@ -35,7 +35,7 @@ That rule has two costs:
    three distinct effects, which does not scale and loses the point.
 
 2. **By-name resolution is unsound when op names collide** (#789).
-   Reading a `@var` inside an unrelated handler clause, or calling a
+   Reading a `var` cell inside an unrelated handler clause, or calling a
    user effect's `get` while a `State` runner is installed, binds to the
    wrong handler's evidence — producing silent corruption, a runtime
    `type mismatch`, or a segfault. The repros are in #789.
