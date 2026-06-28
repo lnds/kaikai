@@ -2264,6 +2264,7 @@ typedef enum {
 } KaiFiberState;
 
 typedef struct KaiFiber   KaiFiber;
+typedef struct KaiNursery KaiNursery;     /* issue #959 — defined below */
 typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
 typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
 
@@ -2394,6 +2395,29 @@ struct KaiFiber {
     int             reactor_wait_pid;
     int             reactor_wait_status;
     void           *reactor_data;
+    /* Issue #959 — structured-concurrency scope. `nursery_top` is the
+     * innermost open nursery on THIS fiber (a per-fiber stack so a
+     * spawned child opening its own nursery does not collide with the
+     * parent's; nesting composes Trio-style). `Spawn.spawn` registers
+     * the new child on `kai_active_fiber->nursery_top`'s children list
+     * via `scope_sibling_next`. `nursery_exit` joins every child on
+     * that list before returning, cancelling the rest and re-raising
+     * on the first child that terminated CANCELLED. NULL when no
+     * nursery is open (bare spawns then have no scope to join). */
+    struct KaiNursery *nursery_top;
+    KaiFiber          *scope_sibling_next;
+};
+
+/* Issue #959 — one open structured-concurrency scope. Children spawned
+ * while this scope is the active fiber's `nursery_top` are pushed on
+ * `children_head` (intrusive via the child's `scope_sibling_next`).
+ * `parent` chains to the enclosing nursery so a nested `nursery { }`
+ * restores it on exit. The scope holds one extra ref on each child's
+ * wrapper (taken at registration, released at join) so a discarded
+ * `Fiber[T]` handle cannot free the struct before the scope joins it. */
+struct KaiNursery {
+    KaiFiber   *children_head;
+    KaiNursery *parent;
 };
 
 /* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
@@ -2419,7 +2443,8 @@ static KaiFiber kai_main_fiber = {
     NULL,                /* mailbox — set by with_mailbox if main uses one */
     NULL,                /* monitor_head — Monitor.monitor(...) appends here */
     NULL,                /* cloned_evidence_chain — main never inherits */
-    NULL, 0, 0, 0, NULL  /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */
+    NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */
+    NULL, NULL           /* nursery_top, scope_sibling_next — issue #959 */
 };
 
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
@@ -11035,6 +11060,16 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
      * trampoline's DONE/CANCELLED tail via `kai_decref(self->value)`). */
     KaiValue *v = kai_fiber_value(f);  /* RC=1, sets f->value */
     kai_incref(v);                     /* RC=2, scheduler's own ref */
+    /* Issue #959 — register on the spawning fiber's innermost open
+     * nursery. The scope takes its own ref (RC=3 here) so a discarded
+     * `Fiber[T]` handle cannot free the wrapper before `nursery_exit`
+     * joins this child; the scope releases it during the join walk. */
+    KaiNursery *scope = kai_current_fiber()->nursery_top;
+    if (scope) {
+        kai_incref(v);
+        f->scope_sibling_next = scope->children_head;
+        scope->children_head  = f;
+    }
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
     return kai_cont_resume(k, v);
@@ -11206,6 +11241,111 @@ static KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCo
     KaiFiber *f = kai_current_fiber();
     int v = (on && on->tag == KAI_BOOL && on->as.b) ? 1 : 0;
     f->trap_exit = v;
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* Issue #959 — open a structured-concurrency scope on the current
+ * fiber. Subsequent `Spawn.spawn` calls register their child on this
+ * scope's children list; `nursery_exit` joins them all. Scopes nest:
+ * the new scope's `parent` is the fiber's previous `nursery_top`. */
+static KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k) {
+    (void) self;
+    KaiFiber *f = kai_current_fiber();
+    KaiNursery *n = (KaiNursery *) calloc(1, sizeof(KaiNursery));
+    if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); exit(1); }
+    n->children_head = NULL;
+    n->parent        = f->nursery_top;
+    f->nursery_top   = n;
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* Park the current fiber on `child`'s awaiter chain until it reaches
+ * DONE or CANCELLED. Mirrors the await park; no result is read — the
+ * scope joins for completion, not for the value. */
+static void kai_nursery_join_child(KaiFiber *child) {
+    if (child->state == KAI_FIBER_DONE || child->state == KAI_FIBER_CANCELLED) {
+        return;
+    }
+    KaiFiber *me = kai_active_fiber;
+    me->awaiters_next  = child->awaiters_head;
+    child->awaiters_head = me;
+    kai_sched_park();
+}
+
+/* Cancel every not-yet-terminated child still on the scope list: set
+ * the flag, and if the child is parked on the reactor, detach + unpark
+ * so the cancel is delivered at its next op boundary. Idempotent. */
+static void kai_nursery_cancel_siblings(KaiFiber *head) {
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
+            continue;
+        }
+        c->cancel_requested = 1;
+        if (kai_reactor_detach_fiber(c)) {
+            kai_sched_unpark(c);
+        }
+    }
+}
+
+/* Issue #959 — close the innermost scope: join every child, then on
+ * the first child that terminated CANCELLED cancel the remaining
+ * siblings, finish the drain (waiting their unwind), release the
+ * scope's refs, and re-raise via the current fiber's cancel_pad so
+ * the failure propagates out of the nursery body. On a clean drain
+ * just release the refs and return unit. */
+static KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k) {
+    (void) self;
+    KaiFiber   *f     = kai_current_fiber();
+    KaiNursery *scope = f->nursery_top;
+    if (!scope) {
+        /* No open scope — `nursery_exit` without a matching enter is a
+         * runtime invariant violation, but degrade to a no-op rather
+         * than crash. */
+        return kai_cont_resume(k, kai_unit());
+    }
+    /* Pop the scope first so children joined below (which run on the
+     * scheduler) see the enclosing scope, not this closing one. */
+    f->nursery_top = scope->parent;
+
+    KaiFiber *head   = scope->children_head;
+    int       failed = 0;
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        kai_nursery_join_child(c);
+        /* A child counts as a *failure* only if it terminated
+         * CANCELLED without anyone requesting its cancellation — i.e.
+         * it raised `Cancel` on its own. A child cancelled on request
+         * (`Spawn.cancel` from a sibling, or the cancel_siblings walk
+         * below) terminates CANCELLED with `cancel_requested` set and
+         * is an expected, non-propagating outcome. */
+        if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
+            failed = 1;
+            kai_nursery_cancel_siblings(head);
+        }
+    }
+    /* Release the scope's refs and clear the intrusive links. The
+     * children are all terminated now; their wrappers may still be
+     * held by the user's `Fiber[T]` handles, so decref (not free). */
+    KaiFiber *c = head;
+    while (c) {
+        KaiFiber *nx = c->scope_sibling_next;
+        c->scope_sibling_next = NULL;
+        if (c->value) kai_decref(c->value);
+        c = nx;
+    }
+    free(scope);
+
+    if (failed) {
+        if (f->cancel_pad_set) {
+            f->cancel_delivered = 1;
+            longjmp(f->cancel_pad, 1);
+            /* Unreachable. */
+        }
+        /* The root fiber (main) has no cancel_pad — a child crash at
+         * the program root is a terminal failure. Match the unhandled
+         * Cancel.raise() root behaviour: banner + exit. */
+        fputs("kai: nursery child cancelled; no survivors\n", stderr);
+        exit(1);
+    }
     return kai_cont_resume(k, kai_unit());
 }
 
