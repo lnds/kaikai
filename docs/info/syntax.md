@@ -238,6 +238,35 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+## Point-free sections
+
+A leading `.` in function position is a point-free section: it stands
+for a one-argument lambda whose body is the rest of the chain applied
+to the implicit argument. The chain may be a field, a field path, a
+method call, or a method call with arguments.
+
+```kaikai
+type Addr = { city: String }
+type Person = { name: String, addr: Addr }
+
+fn main() : Unit / Stdout = {
+  let people = [Person { name: "ana", addr: Addr { city: "Hanga Roa" } }]
+  let names  = people | .name                    # (p) => p.name
+  let cities = people | .addr.city               # (p) => p.addr.city
+  let lens   = (people | .name) | .length()      # (s) => s.length()
+  let init   = people | .name |? .starts_with("a")  # (s) => s.starts_with("a")
+  let upper  = Some("hi").map(.length())         # UFCS arg position
+  Stdout.print("ok")
+}
+```
+
+The receiver is supplied implicitly (first argument by UFCS), so
+`.starts_with("a")` reads its written argument after the receiver.
+Point-free sections work as the function of `|`, `||`, `|?` and as a
+combinator argument (`.map`, `.and_then`, `.filter`). A point-free
+section is unary; to drop a positional argument, use the `|>`
+placeholder `_` instead — the two do not mix in one section.
+
 ## Effects
 
 ```kaikai
