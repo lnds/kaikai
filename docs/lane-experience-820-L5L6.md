@@ -85,6 +85,18 @@ is therefore **three** mechanisms, not one; the docs name all three.
    for a `var` cell reads `a` naked (`a.get()`); a user `with Cell as a` passes
    `a` as a capability. The `eff_is_cell_effect` split keeps cells on the legacy
    path and user effects on `#`.
+5. **The honest-error guard had a hole only CI surfaced.** The first guard
+   checked `node == NULL`, which caught the empty-evidence-stack case and gave a
+   clean error in my local `-O0` reproductions. But a `_kai_default_node_<eff>`
+   global minted for a fiber-local effect with no real default is non-NULL with a
+   NULL handler; under C-`-O2` and on native it slipped past and segfaulted at the
+   `node->handler` deref. Local mac runs (`-O0`, or the link-flaky native parity
+   harness) hid it; CI's `c=1 / native=139` mismatch on `spawn_inherited_actor_
+   rejected` and `ping_pong` exposed it. Fix: guard `node == NULL || node->handler
+   == NULL` and wrap native's `lookup_or_default` in the guard too. Lesson — for a
+   runtime-soundness change, the cross-backend parity gate is the real oracle, and
+   mac-local parity (link false-reds) is not a substitute; demos carry the pattern
+   too, not just `examples/`.
 
 ## Fixtures added and coverage
 
