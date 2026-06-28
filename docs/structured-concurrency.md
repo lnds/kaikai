@@ -47,10 +47,14 @@ nursery { n ->
 - `n.cancel_all() : Unit / Spawn` requests cancellation of every
   child of the nursery. Same delivery mechanism as `cancel`,
   applied to all live children.
-- Leaving the nursery block **waits for all pending children**.
-- If any child crashes (unhandled effect or panic), the nursery
-  cancels the remaining children, drains them, and re-raises the
-  original cause.
+- Leaving the nursery block **waits for all pending children** —
+  no explicit `await` is required.
+- If a child raises `Cancel` on its own (a crash that is not a
+  requested cancellation), the nursery cancels the remaining
+  children, drains them, and re-raises out of the scope. A child
+  cancelled on request (`n.cancel`) is an expected outcome and does
+  not propagate. (`panic` is a process-terminating escape, not a
+  scope-recoverable failure.)
 
 `spawn`, `await`, and `select` carry `Cancel` because each is a
 yield point: a fiber blocked in any of them can be cancelled by
