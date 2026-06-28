@@ -595,12 +595,12 @@ type BusMsg =
 type Sub = Sub(topic: String, pid: Pid[Event])
 
 fn event_bus(m: ActorCap[BusMsg]) : Unit / Actor[BusMsg] + Actor[Event] + Cancel {
-  var subscribers: [Sub] = []
+  var subscribers: [Sub] := []
   forever {
     match m.receive() {
-      Publish(topic, payload)  -> broadcast(m, @subscribers, topic, payload)
-      Subscribe(topic, p)      -> subscribers := @subscribers ++ [Sub(topic, p)]
-      Unsubscribe(topic, p)    -> subscribers := @subscribers |> filter((s) => !(s.topic == topic && s.pid == p))
+      Publish(topic, payload)  -> broadcast(m, subscribers, topic, payload)
+      Subscribe(topic, p)      -> subscribers := subscribers ++ [Sub(topic, p)]
+      Unsubscribe(topic, p)    -> subscribers := subscribers |> filter((s) => !(s.topic == topic && s.pid == p))
     }
   }
 }

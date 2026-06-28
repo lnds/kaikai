@@ -4064,16 +4064,15 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `var`'s init or its rest-of-block has already been
             # lowered to a call.
             let indexed_decls = desugar_index_decls(raw_decls)
-            # Pre-desugar validation: bare reads of `var` cap binders
-            # are caught here with a Tier-3-style help line, instead
-            # of leaking to the C compiler as `kai_<name>` undeclared
-            # (or, worse, panicking inside `lower_protocols` while it
-            # walks the still-bare AST). Short-circuit when this
-            # validation fires so downstream passes never see bare
-            # cap reads.
-            let var_use_errs = validate_var_uses_decls(indexed_decls, path)
-            if var_use_errs > 0 { var_use_errs } else {
-            let var_decls = desugar_var_decls(indexed_decls)
+            # Lower naked cell reads (`counter` → `counter.get()`) and
+            # veto cell access from an escaping closure. Runs before the
+            # SVar → State[T] rewrite, so the lowered `.get()` is a plain
+            # call by the time `desugar_var_decls` decides stack-slot
+            # specialisation. Short-circuit on error so downstream passes
+            # never see a dangling cap read.
+            let cell_low = lower_cell_reads_decls(indexed_decls, path)
+            if cell_low.errs > 0 { cell_low.errs } else {
+            let var_decls = desugar_var_decls(cell_low.decls)
             # `use Effect` desugar. Strips DUse / SUse and rewrites bare
             # `EVar(op)` references into qualified
             # `EField(EVar(eff), op)` form when the op belongs to an
@@ -4113,10 +4112,22 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let interp_raw_arities = op_arities_from_ops(lowered.reg.ops)
             let interp_local_arities = collect_local_fn_arities(lowered.decls)
             let interp_op_arities = filter_shadowed_ops(interp_raw_arities, interp_local_arities)
-            let interp_decls_pre = desugar_interp_decls(lowered.decls,
+            let interp_decls_pre0 = desugar_interp_decls(lowered.decls,
                                                          lowered.reg.op_names,
                                                          interp_op_arities,
                                                          module_table, path)
+            # `#{counter}` lifts to a raw `EVar(counter)` inside the
+            # `show(...)` call only now (the interp body was a raw span
+            # until this pass). Re-run the cell-read lowering so that
+            # naked cell reads hidden in interpolations become
+            # `counter.get()`. The cell set is now seeded from the
+            # `with State[T] as counter` handler the var rewrite produced
+            # (and from user `with State/Reader as name`), so an inner
+            # `let counter = ...` inside `#{...}` correctly shadows.
+            # Idempotent on the rest of the tree: already-lowered
+            # `counter.get()` is recognised as legitimate, not re-lowered.
+            let interp_cell = relower_cell_reads_decls(interp_decls_pre0, path)
+            let interp_decls_pre = interp_cell.decls
             # `lower_protocols`'s `rename_proto_calls_decls` ran before
             # string interpolations were lifted, so any
             # `EVar(opname)` that just surfaced from an `#{...}` body
@@ -4157,6 +4168,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if doc_errs > 0 { doc_errs }
+            else if interp_cell.errs > 0 { interp_cell.errs }
             else if import_resolve_errs > 0 { import_resolve_errs }
             else if alias_res.errs > 0 { alias_res.errs }
             else if use_errs > 0 { use_errs }

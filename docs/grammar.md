@@ -1030,14 +1030,16 @@ Lexer-only: `<digits>i` with no whitespace is one `COMPLEX_LIT` token.
 ### 4.9 Capability read / write
 
 ```
-@cap                    ≡  Cap.get()
+cap                     ≡  Cap.get()                   (* naked cell read *)
 cap := v                ≡  Cap.set(v)
 a[i] := v               ≡  Mutable.array_set(a, i, v)  (* indexed write *)
 a[i]                    ≡  Mutable.array_get(a, i)     (* indexed read *)
-var x = init            ≡  handle { ... } with State[T](init) { ... }
+var x := init           ≡  handle { ... } with State[T](init) { ... }
 ```
 
-The `@` prefix and `:=` are exclusively for capability reads/writes;
+`:=` is the single mark of mutability: `var x := init` declares the
+cell, `x := v` writes it, and a bare `x` reads it. `@` is no longer a
+read prefix — its only role is the as-pattern (`name @ subpattern`).
 `Ref[T]` uses ordinary `r.get()` / `r.set(v)`.
 
 ### 4.10 `unit` keyword

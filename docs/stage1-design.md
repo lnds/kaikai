@@ -7,7 +7,7 @@ Stage 1 is the **dogfooding** step: a compiler for kaikai, written in kaikai its
 ## Relationship to stage 0
 
 - Stage 0 (`./kaic0`) compiles **stage 1's sources** (kaikai-minimal) into C, which `cc` then turns into `./kaic1`.
-- Stage 1 (`./kaic1`) compiles **enough of full kaikai to compile stage 2** into C as well. The LLVM backend, the full effect catalog (Console / Stdin / Env / File / State / Reader / Writer / Mutable), m7b sugars (trailing lambdas, `@cap` / `cap := v`, `var`, `a[i]`), fibers, and actors are deferred to stage 2 — see `docs/stage2-design.md` §*Milestones within stage 2*.
+- Stage 1 (`./kaic1`) compiles **enough of full kaikai to compile stage 2** into C as well. The LLVM backend, the full effect catalog (Console / Stdin / Env / File / State / Reader / Writer / Mutable), m7b sugars (trailing lambdas, naked cell read / `cap := v`, `var`, `a[i]`), fibers, and actors are deferred to stage 2 — see `docs/stage2-design.md` §*Milestones within stage 2*.
 - **Fixed-point bootstrap**: once stage 1 accepts the same subset stage 0 does, `kaic1` must compile `stage1/*.kai` and produce a binary behaviorally identical to `kaic1` itself. This is the self-hosting checkpoint.
 
 Stage 0 is not thrown away yet: it remains the one C-only ingress into the ecosystem. Stage 1 replaces it as the working compiler.

@@ -28,12 +28,12 @@ predicate becomes false (`while` / `until`) or the input is exhausted
 import loop
 
 fn count_up(n: Int) : Int / Stdout = {
-  var i = 0
-  while { @i < n } {                            # `var` reads need `@`
-    Stdout.print("#{int_to_string(@i)}")
-    i := @i + 1
+  var i := 0
+  while { i < n } {                             # naked cell read
+    Stdout.print("#{int_to_string(i)}")
+    i := i + 1
   }
-  @i
+  i
 }
 
 fn sum_loop(xs: [Int], acc: Int) : Int = match xs {
@@ -129,7 +129,7 @@ Non-self tail calls do not generally get TCO.
 - `break` / `continue` statements.
 - C-style `for (init; cond; step)`. Use `[start..end..step] |> each(...)`.
 - `for x in xs { ... }`. No for-in loop. Use a pipe.
-- `do { ... } while (cond)`. Use `var x = ...; while { cond } { ... }`.
+- `do { ... } while (cond)`. Use `var x := ...; while { cond } { ... }`.
 - List comprehensions `[x*2 for x in xs]`. Use `xs | (x => x * 2)`.
 - `goto`.
 - `return`. The last expression of a block is the value.
