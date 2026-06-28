@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.93.0 (2026-06-28)
+
+### Added
+
+- **typer**: extend point-free sections to method calls and chained fields (#964)
+- **runtime**: #959 structured nursery — auto-join + cancel-on-fail
+- **parser**: naked cell read, var := declaration, @ as Ref deref
+- **emit,native**: route value-transportable effects through the evidence frame
+
+### Fixed
+
+- **fmt**: emit `var name := init` so cell declarations round-trip
+
+### Changed
+
+- migrate stdlib, demos, examples to naked cell read + var :=
+
 ## v0.92.0 (2026-06-27)
 
 ### Added
