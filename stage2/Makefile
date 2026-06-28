@@ -3934,6 +3934,37 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
 
+# Issue #950 — the native backend runs `test` blocks. `kai test` on the
+# fixture must produce the SAME summary + exit code on native as on the C
+# oracle (a pass, a caught failing assertion, and a test after the
+# failure), and the native runner must balance RC on both the pass and
+# the caught-fail path. Both backends are diffed against the golden, and
+# native's KAI_TRACE_RC report must show no leak.
+test-native-test-runner-950: $(TARGET) build
+	@set -e; \
+	src=../examples/native/test_runner_parity.kai; \
+	gold=../examples/native/test_runner_parity.out.expected; \
+	cexit=0; \
+	KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
+	diff -q $$gold build/s2-950tr-c.out > /dev/null \
+	  || { echo "native-test-runner-950 FAIL (C output diff)"; diff $$gold build/s2-950tr-c.out; exit 1; }; \
+	[ "$$cexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (C exit $$cexit != 1)"; exit 1; }; \
+	nexit=0; \
+	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
+	grep -E '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.rc 2>/dev/null || true; \
+	grep -vE '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.out 2>/dev/null || true; \
+	diff -q $$gold build/s2-950tr-n.out > /dev/null \
+	  || { echo "native-test-runner-950 FAIL (native output diff vs C oracle)"; diff $$gold build/s2-950tr-n.out; exit 1; }; \
+	[ "$$nexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (native exit $$nexit != 1, must match C)"; exit 1; }; \
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-950tr-n.rc | head -1 | cut -d= -f2); \
+	if [ -n "$$leaked" ]; then \
+	  [ "$$leaked" -eq 0 ] \
+	    && echo "native-test-runner-950 OK (native == C: summary 2/3, exit 1; RC leaked=0 on pass+caught-fail)" \
+	    || { echo "native-test-runner-950 FAIL (native RC leaked=$$leaked on the runner path)"; cat build/s2-950tr-n.rc; exit 1; }; \
+	else \
+	  echo "native-test-runner-950 OK (native == C: summary 2/3, exit 1; no RC trace line — KAI_TRACE_RC inert)"; \
+	fi
+
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
 # does not appear anywhere in the recursive call's args, so rule 3
