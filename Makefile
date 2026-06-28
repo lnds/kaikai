@@ -166,8 +166,14 @@ clean:
 #
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds"
+
+# #820 — KAI_EVIDENCE_FRAME_ONLY gate. A user effect's named instance must
+# resolve through its capability slot, never the by-name walk (retained only for
+# fiber-local + Ffi builtins). Binary grep-oracle over the emitted C.
+test-evidence-frame: kaic2
+	@bash tools/evidence-frame-gate.sh
 
 # issue #120 — opt-in Perceus regions: P0 runtime arena gate. Plain +
 # ASAN build of the C-level bump-arena fixture. Fast (~1s), no kaic2

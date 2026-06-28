@@ -89,8 +89,10 @@ document pins that translation.
 - **Segmented stacks.** Régime B's continuations live in the
   heap, not in a separate stack segment. The scheduler is
   simpler; the stack looks like any other program's stack.
-- **First-class named handlers.** Already ruled out by Doc A
-  §*Out of scope for v1*; régime C does not revisit that.
+- **First-class named handlers.** Shipped (§6 named instances,
+  #820): a `with Eff as a` capability is a first-class value of type
+  `Eff`, threadable into a call. It stays second-class — no return,
+  no storage, no escaping closure — so it needs no heap capture here.
 
 ### Fallback
 
@@ -662,7 +664,16 @@ is `alloca`'d inside the `handle`'s compiled frame).
 
 ### Lookup
 
-`Eff.op(args)` looks up the innermost handler for `Eff`:
+The by-name walk below is **one of three dispatch mechanisms** and is not the
+path for user effects (`docs/dispatch-honesty-targets.md`). A user /
+value-transportable effect resolves through the evidence the caller supplied
+(a frame slot, or a named instance's capability value `kai_<name>`); a
+`var`/State/Reader cell resolves by `handler_id` (`kai_evidence_lookup_node_by_id`).
+The walk shown here is retained for fiber-local builtins
+(`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) — whose handler is per-fiber and must
+not cross a `spawn` — and for a frameless perform of a default-bearing builtin.
+
+`Eff.op(args)` (fiber-local / frameless case) looks up the innermost handler:
 
 ```
 node = fiber.evidence_top              ; *Evidence
@@ -1380,7 +1391,9 @@ allocation; effects within a fiber behave as specified above.
 - **Segmented stacks.** Régime C reifies continuations as heap
   closures (when promoted) on a normal C stack; the segmented-
   stack approach used by some Effekt backends is not adopted.
-- **First-class named handlers.** Doc A rules them out.
+- **First-class named handlers.** Shipped (§6, #820): the
+  capability is the runtime evidence node, threaded by slot — no
+  heap promotion, second-class by the §6.2 positional rule.
 - **Cross-fiber evidence sharing.** Each fiber has its own
   vector; there is no global effect registry.
 - **Thread-level parallelism that is not fiber-based.** Stage 2

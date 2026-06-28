@@ -535,14 +535,22 @@ worth noting so the syntax is not mystery:
 
 - `handle { body } with Eff { ... }` compiles `body` so each
   `Eff.op` call becomes a suspension point, and installs the
-  handler record on a runtime handler stack.
-- `Eff.op(args)` compiles to a call into the runtime that walks
-  the stack to find the innermost handler for `Eff`, invokes the
-  op clause with a reified continuation, and either resumes
-  (normal path) or returns directly (discard path).
-- `Eff as X { ... }` binds `X` as a capability value inside the
-  body; `X.op(args)` and `Eff.op(args)` desugar identically — the
-  only difference is which identifier the checker accepts.
+  handler record as the effect's evidence node.
+- `Eff.op(args)` resolves the handler by the effect's **class**
+  (`docs/dispatch-honesty-targets.md`): a user / value-transportable
+  effect reads the evidence the caller supplied (a frame slot it
+  filled, or the capability value of a named instance) — no walk; a
+  fiber-local builtin (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`)
+  resolves through the runtime's per-fiber disposition; a frameless
+  perform of a default-bearing builtin (e.g. in `main`) falls to the
+  installed default. The op clause runs with a reified continuation
+  and either resumes (normal path) or returns directly (discard path).
+- `with Eff as X { ... }` binds `X` as a first-class **capability
+  value** of type `Eff` (§6 named instances). Inside the body
+  `X.op(args)` performs against *that* instance; `X` may also be
+  passed down as a call argument (`fn f(c: Eff)`), where it remains
+  second-class — it cannot be returned, stored, or captured by a
+  closure that outlives the `handle`.
 - One-shot `resume` is a direct tail call. Multi-shot requires
   copying the fiber stack frames, hence the opt-in.
 
@@ -715,14 +723,21 @@ third slot for the effect row).
 - **`raise` / `throw` / `catch` keywords.** The only surface
   verb is `handle`; operation calls happen through plain
   method-call syntax (e.g., `Io.print(s)`).
-- **Named handlers as first-class values.** A handler always
-  appears at a `handle ... with ...` site; you cannot bind a
-  handler to a variable, pass it as an argument, or return it.
-  Doable as a later extension, not needed for v1.
-- **Multiple instances of the same effect** differentiated by
-  label (e.g., two independent `State[Int]` handlers distinguished
-  in scope). The innermost handler for an effect always wins; if
-  you need two cells, declare two effects.
+Two items once listed here as out of scope have **shipped** (§6
+named instances, #820) and now live in the surface above:
+
+- **Named handler instances are first-class capability values.**
+  `with Eff as a` binds `a` as a value of type `Eff`; `a` may be
+  passed *down* into a function (`fn f(c: Eff)`), where each
+  instance performs against its own evidence. It stays second-class
+  (no return, no storage, no escaping closure — §6.2), so a value
+  that must outlive its scope is a `Ref[T]` under `Mutable`, not a
+  capability. No `Handler[E]` wrapper, no HKT.
+- **Multiple instances of one effect, addressed independently.**
+  Three `with Cell as c1/c2/target` instances pass through one
+  `add(c1, c2, dst)` call and each performs against its own node —
+  the design §6.1 flagship. You no longer have to declare three
+  effects to get three cells.
 
 ## Open questions
 

@@ -968,6 +968,10 @@ void *kaix_evidence_lookup_node(const char *eff_label) {
     return (void *) kai_evidence_lookup_node(eff_label);
 }
 
+void *kaix_evidence_require(void *node_v, const char *eff_label) {
+    return (void *) kai_evidence_require((KaiEvidence *) node_v, eff_label);
+}
+
 /* m7c-c (LLVM per-instance dispatch) — mirror of the C emit's
  * `kai_evidence_lookup_node_by_id`. An aliased `with State[T](init)
  * as name` handler captures its `handler_id` at install time; a
