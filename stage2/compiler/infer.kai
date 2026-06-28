@@ -1314,6 +1314,43 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
 }
 
 
+# The element type a `|` / `||` / `|?` combinator feeds its function:
+# the `A` of a list `[A]` or a head `T[A, ...]`. Used to thread the
+# receiver type into a point-free section's lambda up front.
+fn pipe_elem_ty(t: Ty) : Option[Ty] {
+  match t {
+    TyListT(e)       -> Some(e)
+    TyCon(_, _, [a, ...]) -> Some(a)
+    _                -> None
+  }
+}
+
+# A point-free section the parser synthesised has a single
+# `__pl`-named placeholder parameter. Recognise it so only those
+# lambdas get the up-front receiver-threading — user-written lambdas
+# keep the unchanged synth path.
+fn is_point_free_lambda(rhs: Expr) : Bool =
+  match rhs.kind {
+    ELambda([p], _) -> p.pname == "__pl"
+    _               -> false
+  }
+
+# Infer a pipe / combinator function argument. A point-free section
+# gets its `__pl` receiver pinned to `lhs_ty`'s element type up front
+# (so `.length()` resolves its UFCS dispatch); everything else takes
+# the plain synth path unchanged.
+fn synth_pipe_rhs(st: InferState, rhs: Expr, lhs_ty: Ty) : Inferred / Console + File + Mutable =
+  if is_point_free_lambda(rhs) {
+    match pipe_elem_ty(apply_ty(st.sub, lhs_ty)) {
+      Some(et) -> match rhs.kind {
+        ELambda(ps, body) ->
+          synth_lambda_threaded(st, ps, body, Some(et), rhs.line, rhs.col)
+        _ -> synth(st, rhs)
+      }
+      None -> synth(st, rhs)
+    }
+  } else { synth(st, rhs) }
+
 fn inf_ty_head_name(t: Ty) : Option[String] {
   match t {
     TyInt          -> Some("Int")
@@ -9588,6 +9625,50 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList / Console + File + Muta
   }
 }
 
+# The domain of a function type's first parameter, if any — the
+# element type a combinator passes a point-free section's `__pl`.
+fn fn_first_dom(t: Ty) : Option[Ty] = match t {
+  TyFnT([dom, ...], _, _) -> Some(dom)
+  _                       -> None
+}
+
+# Like `synth_many`, but each argument is paired with the declared
+# parameter type at the same position (`param_tys`). A point-free
+# section gets its `__pl` receiver pinned to that parameter's function
+# domain before its body is walked, so `o.map(.length())` resolves the
+# UFCS dispatch the same way the pipe forms do. Every other argument
+# takes the plain synth path; a missing or non-function expected type
+# is a no-op.
+fn synth_many_threaded(st: InferState, es: [Expr],
+                        param_tys: [Ty]) : InferredList / Console + File + Mutable {
+  match es {
+    [] -> InferredList { st: st, tys: [], exprs: [] }
+    [x, ...rest] -> {
+      let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
+      let prest = match param_tys { [_, ...pr] -> pr  _ -> [] }
+      let r = synth_threaded_arg(st, x, exp)
+      let rr = synth_many_threaded(r.st, rest, prest)
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+    }
+  }
+}
+
+fn synth_threaded_arg(st: InferState, x: Expr,
+                       exp: Option[Ty]) : Inferred / Console + File + Mutable =
+  if is_point_free_lambda(x) {
+    match exp {
+      Some(et) -> match fn_first_dom(et) {
+        Some(dom) -> match x.kind {
+          ELambda(ps, body) ->
+            synth_lambda_threaded(st, ps, body, Some(dom), x.line, x.col)
+          _ -> synth(st, x)
+        }
+        None -> synth(st, x)
+      }
+      None -> synth(st, x)
+    }
+  } else { synth(st, x) }
+
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
@@ -10268,7 +10349,11 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
             None -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
             Some(_) -> {
               # Walk the remaining args (obj is already typed in obj_expr).
-              let ra = synth_many(st_inst, args_)
+              # Thread each declared param type (skip the receiver at
+              # params[0]) so a point-free section arg gets its receiver
+              # pinned from the combinator's element type up front.
+              let arg_param_tys = match params { [_, ...pr] -> pr  _ -> [] }
+              let ra = synth_many_threaded(st_inst, args_, arg_param_tys)
               let all_arg_tys = [obj_ty, ...ra.tys]
               let all_arg_exprs = [obj_expr, ...ra.exprs]
               # Same expected-row pattern `synth_call` and
@@ -11283,11 +11368,31 @@ fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, col:
   }
 }
 
-fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_lambda_threaded(st, ps, body, None, line, col)
+
+# Like `synth_lambda`, but when `expected_first` is `Some(et)` the
+# first parameter's type is unified with `et` BEFORE the body is
+# walked. Point-free sections (`.method()`, `.a.b`) need the receiver
+# pinned from the combinator's element type up front: the body's UFCS
+# dispatch (`__pl.length()`) cannot defer the way a bare field access
+# can, so the receiver must already be concrete when synth reaches it.
+fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
+                          expected_first: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let outer = st
-  let added = add_infer_params(st, ps)
+  let added0 = add_infer_params(st, ps)
+  let added = match expected_first {
+    None -> added0
+    Some(et) -> match added0.tys {
+      [] -> added0
+      [t0, ...] ->
+        InferredParams { st: st_unify(added0.st, t0, et,
+                                       "point-free receiver", line, col),
+                          tys: added0.tys }
+    }
+  }
   # walk the body in an isolated row context. Effects
   # invoked inside the lambda body MUST NOT leak to the enclosing
   # function's row — they belong to the lambda type's own row.
@@ -11871,7 +11976,7 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
                 st_bump_err(rl.st)
               }
           }
-          let rf = synth(st_after_diag, rhs)
+          let rf = synth_pipe_rhs(st_after_diag, rhs, lhs_ty)
           let rc = synth(rf.st, with_ty(mk_expr(callee_kind, line, col), TyAny))
           let rv = st_fresh_ty(rc.st)
           let fr = subst_fresh_row(rv.st.sub)
