@@ -59,9 +59,26 @@ fn ndef_node_slots() : Int = 8
 
 # --- install: build the runtime-entry hook + per-effect push -----------
 
-# Build `void kai_main_install_defaults()` with a real body: open the fn
-# (a positioned ctx builder), push every default in install order, then
-# `ret void`.
+# Mint the `_kai_default_ev_<eff>` / `_kai_default_node_<eff>` module globals
+# for every default in the SUPERSET (zero-init). The call site addresses a
+# default-bearing slot through `_kai_default_node_<eff>`, so the global must
+# exist before the fn bodies are walked — even for an effect main never
+# installs (a dead-code path) so its reference still links.
+pub fn nemit_declare_default_globals(ctx: Handle, defaults: [KDefault]) : Unit / Console = match defaults {
+  [] -> ()
+  [KDef(eff, _), ...rest] -> {
+    let evty = llvm_array_type(native_ctx_ptrt(ctx), ndef_ev_slots())
+    let _ev = llvm_add_global_zeroed(native_ctx_m(ctx), evty, cat2("_kai_default_ev_", eff))
+    let ndty = llvm_array_type(native_ctx_ptrt(ctx), ndef_node_slots())
+    let _node = llvm_add_global_zeroed(native_ctx_m(ctx), ndty, cat2("_kai_default_node_", eff))
+    nemit_declare_default_globals(ctx, rest)
+  }
+}
+
+# Build `void kai_main_install_defaults()`: stamp the handler_id + op fn-ptrs
+# into each installed default's Ev blob. The minted default is a frame-suppliable
+# value, NOT a stack push — the call site fills a default-bearing slot with the
+# global node directly, so there is no `kaix_evidence_push`/`pop` pair.
 pub fn nemit_build_install_defaults(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
   ndef_open_void_fn(ctx, "kai_main_install_defaults")
   ndef_install_each(ctx, defaults)
@@ -69,13 +86,11 @@ pub fn nemit_build_install_defaults(ctx: Handle, defaults: [KDefault]) : Unit / 
   ()
 }
 
-# Build `void kai_main_teardown_defaults()`: pop once per installed
-# default, in REVERSE install order (LIFO drain). Only the effects pushed
-# by the install are popped, so the reverse of the same `defaults` list is
-# exactly the matching pop set.
+# Build `void kai_main_teardown_defaults()` — now empty: a frame-supplied
+# default is never pushed, so there is nothing to pop. The symbol stays so the
+# runtime entry that calls it needs no change.
 pub fn nemit_build_teardown_defaults(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
   ndef_open_void_fn(ctx, "kai_main_teardown_defaults")
-  ndef_pop_n(ctx, list_length(defaults))
   llvm_build_ret_void(native_ctx_b(ctx))
   ()
 }
@@ -100,36 +115,44 @@ fn ndef_install_each(ctx: Handle, defaults: [KDefault]) : Unit / Console = match
   [d, ...rest] -> { ndef_install_one(ctx, d); ndef_install_each(ctx, rest) }
 }
 
-# Install one default handler: module globals, handler_id, op fn-ptrs, push.
+# Install one default handler: stamp handler_id + op fn-ptrs into the (already
+# minted) Ev global and connect its node to the Ev. No push — the default rides
+# the frame, not the stack; the call site addresses the node directly.
 fn ndef_install_one(ctx: Handle, d: KDefault) : Unit / Console = match d {
   KDef(eff, ops) -> {
     let p = native_ctx_ptrt(ctx)
     let ev = ndef_ev_global(ctx, eff)
-    let node = ndef_node_global(ctx, eff)
     # handler_id (field 0) = kaix_fresh_handler_id() : i64.
     let hid = ncall_sig0(ctx, "kaix_fresh_handler_id", native_ctx_i64t(ctx))
     let _h0 = ncall_sig2(ctx, "kaix_ev_set_handler_id", native_ctx_voidt(ctx),
                          p, native_ctx_i64t(ctx), ev, hid)
     ndef_store_ops(ctx, ev, ops, 0)
-    # 3-arg push (no jmp_buf): a default always resumes.
+    # Connect the node to the Ev without pushing it on the evidence stack.
+    let node = ndef_node_global(ctx, eff)
     let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
-    ndef_push(ctx, node, effname, ev)
+    ndef_init_default(ctx, node, effname, ev)
   }
 }
 
-# The module-level Ev blob for `eff` (`[16 x ptr]`, internal, zero-init).
-# A handle (the global's address) — captured in a `let` by every caller.
-fn ndef_ev_global(ctx: Handle, eff: String) : Handle = {
-  let evty = llvm_array_type(native_ctx_ptrt(ctx), ndef_ev_slots())
-  llvm_add_global_zeroed(native_ctx_m(ctx), evty, cat2("_kai_default_ev_", eff))
+# `kaix_evidence_init_default(ptr node, i8* eff, ptr ev) -> void` — set the
+# node's handler / eff_label, NULL the discard fields, no parent linkage.
+fn ndef_init_default(ctx: Handle, node: Handle, effname: Handle, ev: Handle) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, node); llvm_buf_push(ab, effname); llvm_buf_push(ab, ev)
+  let _r = ncall_finish(ctx, "kaix_evidence_init_default", native_ctx_voidt(ctx), ptb, ab)
+  ()
 }
 
-# The module-level KaiEvidence node for `eff` (`[8 x ptr]`, internal,
-# zero-init — so handle_jmp / discard_slot start NULL).
-fn ndef_node_global(ctx: Handle, eff: String) : Handle = {
-  let ndty = llvm_array_type(native_ctx_ptrt(ctx), ndef_node_slots())
-  llvm_add_global_zeroed(native_ctx_m(ctx), ndty, cat2("_kai_default_node_", eff))
-}
+# The module-level Ev blob for `eff` — recovered by name from the global
+# `nemit_declare_default_globals` minted up front, so install and every call
+# site agree on one `GlobalVariable*`. A handle (captured in a `let` by callers).
+fn ndef_ev_global(ctx: Handle, eff: String) : Handle =
+  llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_ev_", eff))
+
+# The module-level KaiEvidence node for `eff`, recovered by name.
+fn ndef_node_global(ctx: Handle, eff: String) : Handle =
+  llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", eff))
 
 # Store each op's `kaix_default_<eff>_<op>` forwarder address into the Ev
 # blob at field (`nfx_op_base` + position). Reuses
@@ -145,24 +168,6 @@ fn ndef_store_ops(ctx: Handle, ev: Handle, ops: [KDefOp], i: Int) : Unit / Conso
     ndef_store_ops(ctx, ev, rest, i + 1)
   }
 }
-
-# `kaix_evidence_push(ptr node, i8* eff, ptr ev) -> void` — the 3-arg form
-# (NO jmp_buf / discard slot). The user-handler install in emit_native_fx2
-# uses `kaix_evidence_push_with_jmp`; a default never discards, so it omits
-# the landing pad and rides this lighter push.
-fn ndef_push(ctx: Handle, node: Handle, effname: Handle, ev: Handle) : Unit / Console = {
-  let p = native_ctx_ptrt(ctx)
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
-  let ab = llvm_buf_new(); llvm_buf_push(ab, node); llvm_buf_push(ab, effname); llvm_buf_push(ab, ev)
-  let _r = ncall_finish(ctx, "kaix_evidence_push", native_ctx_voidt(ctx), ptb, ab)
-  ()
-}
-
-# Emit `n` `kaix_evidence_pop()` calls (the teardown). The pop is argless
-# and void; one per installed default drains the stack LIFO.
-fn ndef_pop_n(ctx: Handle, n: Int) : Unit / Console =
-  if n <= 0 { () }
-  else { let _r = nemit_call0(ctx, "kaix_evidence_pop"); ndef_pop_n(ctx, n - 1) }
 
 # --- perform side: synthetic handler decls for builtin dispatch --------
 #

@@ -2422,6 +2422,12 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         let walk_c =
           if at_pos >= 0 {
             concat_all(["kai_evidence_lookup_node_by_id(kai_alias_", alias_n, "_id)"])
+          } else if effect_has_default_block(eff_idn, cx.effs) {
+            # No caller frame here (a direct perform in a frameless fn such as
+            # `main`): a lexical handler on the stack wins, else the minted
+            # default node — the default is no longer on the stack for the walk.
+            concat_all(["kai_evidence_lookup_or_default(\"", eff_idn,
+                        "\", &_kai_default_node_", string_to_lower_ascii(eff_idn), ")"])
           } else {
             concat_all(["kai_evidence_lookup_node(\"", eff_idn, "\")"])
           }
@@ -2449,8 +2455,14 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [] -> ""
           _  -> cat2(", ", arg_passes)
         }
+        # A frame-slot read skips `kai_evidence_lookup_node`, where the
+        # cooperative-cancel yield-point hook lives, so a Cancel requested while
+        # this fiber was parked would never be delivered at the next op. Fire the
+        # hook explicitly before a slot-resolved perform (the walk path already
+        # runs it inside the lookup).
+        let yield_chk = if evf_slot >= 0 { "kai_check_cancel_yield_point(); " } else { "" }
         concat_all([
-          "({ KaiEvidence *_node_op = ", lookup_c, "; ",
+          "({ ", yield_chk, "KaiEvidence *_node_op = ", lookup_c, "; ",
           eff_evn, " *_ev_op = (", eff_evn, " *) _node_op->handler; ",
           "KaiCont _k; kai_cont_init_identity(&_k, _ev_op->handler_id); ",
           arg_bindings,
@@ -2648,12 +2660,10 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
 # THIS caller resolves for that effect (its own supplier classification):
 #   - the caller forwards it (the effect is in the caller's frame) →
 #     `__evf[caller_idx]`;
-#   - otherwise the caller has it lexically (a `handle` in scope) or via a
-#     startup default → `kai_evidence_lookup_node("E")`, the node live at
-#     this point. Threaded into the slot, the callee reads it without a
-#     re-walk. (Two live instances would need a per-instance node here —
-#     that needs the named-instance surface; with one live handler the node is
-#     the right one.)
+#   - the effect has a `default {}` and no lexical handler here → the
+#     startup-minted default node `&_kai_default_node_<eff>`;
+#   - otherwise the caller has it lexically (a `handle` in scope) →
+#     `kai_evidence_lookup_node("E")`, the node live at this point.
 fn emit_evf_call_arg(slots: [String], call_args: String, cx: EmitCtx) : String = match slots {
   [] -> call_args
   _  -> {
@@ -2668,8 +2678,17 @@ fn emit_evf_slots(slots: [String], cx: EmitCtx) : String =
 fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
   let caller_idx = frame_slot_index(cx.evf, cx.cur_enc_fn, eff)
   if caller_idx >= 0 { concat_all(["__evf[", int_to_string(caller_idx), "]"]) }
-  else { concat_all(["kai_evidence_lookup_node(\"", eff, "\")"]) }
+  else { evf_terminal_slot(eff, cx) }
 }
+
+# A slot the caller does not forward: a lexical handler on the stack wins (the
+# walk finds it), falling back to the minted default node for a default-bearing
+# effect (no longer pushed). A non-default effect stays on the plain walk.
+fn evf_terminal_slot(eff: String, cx: EmitCtx) : String =
+  if effect_has_default_block(eff, cx.effs) {
+    concat_all(["kai_evidence_lookup_or_default(\"", eff,
+                "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
+  } else { concat_all(["kai_evidence_lookup_node(\"", eff, "\")"]) }
 
 # Emit a direct user-fn call `kai_<csym>(<frame?><args>)`, prepending the
 # evidence frame when the callee carries one. The single funnel every
@@ -2685,16 +2704,20 @@ fn evf_join_args(frame_arg: String, rest: String) : String =
   else if rest == "" { frame_arg }
   else { concat_all([frame_arg, ", ", rest]) }
 
-# The frame value a thunk passes: each slot filled by the live by-name walk
-# (the thunk has no caller frame; the node live at the indirect call is the
-# ≤1-handler-correct one). Empty when the callee carries no frame.
-fn emit_evf_thunk_frame(slots: [String]) : String = match slots {
+# The frame value a thunk passes: a default-bearing slot from its minted
+# default node, else the live by-name walk (the thunk has no caller frame; the
+# node live at the indirect call is the ≤1-handler-correct one). Empty when the
+# callee carries no frame.
+fn emit_evf_thunk_frame(slots: [String], effs: [Decl]) : String = match slots {
   [] -> ""
-  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, evf_thunk_slot), ", "), "}"])
+  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs)), ", "), "}"])
 }
 
-fn evf_thunk_slot(eff: String) : String =
-  concat_all(["kai_evidence_lookup_node(\"", eff, "\")"])
+fn evf_thunk_slot(eff: String, effs: [Decl]) : String =
+  if effect_has_default_block(eff, effs) {
+    concat_all(["kai_evidence_lookup_or_default(\"", eff,
+                "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
+  } else { concat_all(["kai_evidence_lookup_node(\"", eff, "\")"]) }
 
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Console {
 
@@ -7744,7 +7767,7 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl, fns: [EFn], frames: [FnEvidenceFrame]) : String {
+fn emit_fn_thunk(d: Decl, fns: [EFn], frames: [FnEvidenceFrame], effs: [Decl]) : String {
   match d {
     DFn(_, name, _, params, opt_ret, _, _, _, _, mo) -> {
       let sym = c_sym(name, mo)
@@ -7775,7 +7798,7 @@ fn emit_fn_thunk(d: Decl, fns: [EFn], frames: [FnEvidenceFrame]) : String {
       # A thunk is the indirect (closure) entry; it has no
       # caller frame, so it fills the callee's frame from the live evidence
       # stack (a walk per slot — the ≤1-handler-correct node at the call).
-      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym))
+      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym), effs)
       match lookup_ufn_sig(fns, name, mo) {
         Some(US(pts, rt, mask)) -> {
           # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
@@ -7958,7 +7981,7 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, b: SB)
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, mo) -> {
       let r = fns_prefer_module_cached(fbm, mo)
-      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table)), emit_fn_thunk(d, cx.fns, cx.evf))
+      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table)), emit_fn_thunk(d, cx.fns, cx.evf, cx.effs))
       fn_bodies_loop(src, rest, cx, r.cache, b1)
     }
     _ -> fn_bodies_loop(src, rest, cx, fbm, b)
@@ -9025,7 +9048,6 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EF
           cmt_row_effects_without_default_handler(main_row_labels(decls), decls))
         let shims    = default_shims_for(main_row, decls)
         let setup    = default_setups_for(main_row, decls)
-        let teardown = default_pops_for(main_row)
         concat_all([
           shims,
           proto_tables,
@@ -9034,7 +9056,6 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [EVar], fns: [EF
           proto_init,
           setup,
           "    KaiValue *_result = kai_main();\n",
-          teardown,
           "    kai_decref(_result);\n",
           "    return 0;\n",
           "}\n"
@@ -9057,24 +9078,56 @@ fn default_shims_from_block(eff_name: String, decls: [Decl]) : String =
     }
   }
 
+# The minted default is a frame-suppliable value, not a stack push: the
+# call site fills a default-bearing slot with `&_kai_default_node_<eff>`. The
+# Ev blob and node are file-scope globals (`emit_default_node_globals`) so any
+# call site can address them; this only stamps the handler_id and op fn-ptrs
+# at startup. No `kai_evidence_push` — the walk still resolves a lexical handler
+# pushed above, but the default itself rides the frame.
 fn default_setups_from_block(eff_name: String, decls: [Decl]) : String =
   match find_effect_default_block(eff_name, decls) {
     None         -> ""
     Some(defblk) -> match defblk {
       DBlk(clauses, _, _, _) -> {
         let eff_lc = string_to_lower_ascii(eff_name)
-        let mo = default_block_owner_mo(eff_name, decls)
         concat_all([
-          "    static ", ev_name(eff_name, mo), " _kai_default_ev_", eff_lc, ";\n",
-          "    static KaiEvidence _kai_default_node_", eff_lc, ";\n",
           "    _kai_default_ev_", eff_lc, ".handler_id = kai_fresh_handler_id();\n",
           concat_all(map(clauses, (c) => default_setup_assign_from_clause(eff_name, c))),
-          "    kai_evidence_push(&_kai_default_node_", eff_lc,
+          "    kai_evidence_init_default(&_kai_default_node_", eff_lc,
             ", \"", eff_name, "\", &_kai_default_ev_", eff_lc, ");\n"
         ])
       }
     }
   }
+
+# File-scope `_kai_default_ev_<eff>` / `_kai_default_node_<eff>` definitions for
+# every effect whose decl carries a `default {}` block — the superset, not just
+# main's row, so a call site in a never-installed (dead-code) path still links.
+# External linkage (one definition in the root TU, `extern` in the shared
+# header) so a call site in any module TU addresses the same node. Zero-init;
+# the per-program setup stamps handler_id + op fn-ptrs only for installed effects.
+fn emit_default_node_globals(decls: [Decl]) : String =
+  concat_all(map(decls, (d) => default_node_global_for(d, decls, false)))
+
+# The `extern` declarations of the same globals, for the shared decls header.
+fn emit_default_node_extern_decls(decls: [Decl]) : String =
+  concat_all(map(decls, (d) => default_node_global_for(d, decls, true)))
+
+fn default_node_global_for(d: Decl, decls: [Decl], ext: Bool) : String = match d {
+  DEffect(_, eff_name, _, _, defblk, _, _, _) -> match defblk {
+    Some(_) -> {
+      let eff_lc = string_to_lower_ascii(eff_name)
+      let mo = default_block_owner_mo(eff_name, decls)
+      let kw = if ext { "extern " } else { "" }
+      concat_all([
+        kw, ev_name(eff_name, mo), " _kai_default_ev_", eff_lc, ";\n",
+        kw, "KaiEvidence _kai_default_node_", eff_lc, ";\n"
+      ])
+    }
+    None -> ""
+  }
+  _ -> ""
+}
 
 fn effect_has_default_block(eff_name: String, decls: [Decl]) : Bool =
   match find_effect_default_block(eff_name, decls) {
@@ -9234,35 +9287,6 @@ fn emit_default_shims_in_order(order: [String], main_row: [String],
   }
 }
 
-# Pops in reverse-push order so the evidence stack drains LIFO.
-# Push order: builtins first (in `builtin_default_install_order`),
-# then user-declared effects (in declaration order). Pops therefore
-# walk user-declared effects first (reverse declaration order), then
-# builtins (reverse pinned order).
-
-# Pops in reverse-push order so the evidence stack drains LIFO.
-# Push order: builtins first (in `builtin_default_install_order`),
-# then user-declared effects (in declaration order). Pops therefore
-# walk user-declared effects first (reverse declaration order), then
-# builtins (reverse pinned order).
-fn default_pops_for(main_row: [String]) : String = {
-  let order = list_append(builtin_default_install_order(),
-                            user_effects_in_row(main_row))
-  emit_default_pops_in_order(list_reverse(order), main_row)
-}
-
-fn emit_default_pops_in_order(order_rev: [String], main_row: [String]) : String {
-  match order_rev {
-    [] -> ""
-    [eff, ...rest] ->
-      if list_has(main_row, eff) {
-        concat_all(["    kai_evidence_pop();\n",
-                    emit_default_pops_in_order(rest, main_row)])
-      } else {
-        emit_default_pops_in_order(rest, main_row)
-      }
-  }
-}
 
 fn desugar_op_calls_decls(ds: [Decl], effs: [String]) : [Decl] =
   map(ds, (d) => desugar_op_calls_decl(d, effs))
@@ -9790,11 +9814,12 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   let fwd = fn_forward_decls(decls, fns)
   let thunk_fwd = thunk_forward_decls(decls)
   let lam_fwd = emit_lam_forward_decls(lams)
+  let default_ev_extern = emit_default_node_extern_decls(effect_decls_only(decls))
   let decls_h = concat_all([
     "/* generated by kaikai stage 2 — shared declarations header */\n",
     "#ifndef KAI_DECLS_H\n#define KAI_DECLS_H\n",
     "#include \"kai_types.h\"\n\n",
-    clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n",
+    clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", default_ev_extern, "\n",
     "\n#endif /* KAI_DECLS_H */\n"
   ])
 
@@ -9814,8 +9839,11 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
   let main_wr = emit_main_wrapper(decls, bmode, variants, fns, enum_names)
+  # One definition of each default-block effect's evidence globals, in the root
+  # TU; module TUs see them via the `extern` decls in the shared header.
+  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls))
   let root_tu = CModuleTU { stem: "__root__",
-    body: concat_all([root_bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr]) }
+    body: concat_all([default_ev_defs, root_bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr]) }
   # Module TUs: one per distinct module-origin, carrying only that
   # module's fn bodies. `fn_bodies` carries the `Console` effect, so we
   # fold with an explicit loop rather than `map` (which is pure).
@@ -9939,7 +9967,11 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # struct they ride the shared `kai_ffi.h` instead, so `out.c` here omits
   # them (it `#include`s the header) and the whole program ships as a
   # marker stream the wrapper splits into `kai_ffi.h` + `out.c`.
-  let out_c = concat_all([header, mono_structs, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
+  # Default-block evidence globals are defined ahead of the fn bodies so a
+  # call site supplying a default-bearing slot addresses an already-declared
+  # symbol (single-TU: one definition, file scope).
+  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls))
+  let out_c = concat_all([header, mono_structs, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", default_ev_defs, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
   if has_ffi_struct(extern_types) { emit_ffi_header_stream(src, ffi_structs, out_c) }
   else { out_c }
 }
