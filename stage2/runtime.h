@@ -11807,7 +11807,11 @@ static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvi
  * installed no handler for it has no disposition to bind. Report it instead of
  * dereferencing the NULL node. */
 static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_label) {
-    if (node == NULL) {
+    /* A NULL node (empty evidence stack) or a node whose handler slot was never
+     * filled (a default global minted for a fiber-local effect that has no real
+     * default) both mean "no disposition to bind here". Report either, instead
+     * of letting a later `node->handler` deref segfault. */
+    if (node == NULL || node->handler == NULL) {
         fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
         exit(1);
     }
