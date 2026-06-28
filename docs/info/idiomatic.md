@@ -95,6 +95,31 @@ fn main() : Unit / Stdout = {
 Use the intermediate-`let` form only when a step needs a name a
 reader benefits from, or the same value is consumed twice.
 
+## Point-free sections over throwaway lambdas
+
+When a pipe or combinator step is just "reach into the element", drop
+the lambda and write the point-free section — a leading `.` followed
+by the field, path, or method (see `kai info syntax`). It reads as the
+projection itself, with no bound name to invent.
+
+```kaikai
+type Person = { name: String, addr: Addr }
+type Addr = { city: String }
+
+fn main() : Unit / Stdout = {
+  let people = [Person { name: "ana", addr: Addr { city: "Hanga Roa" } }]
+  let names  = people | .name                    # not (c) => c.name
+  let cities = people | .addr.city               # not (c) => c.addr.city
+  let lens   = names | .length()                 # not (s) => s.length()
+  let first  = Some("hi").map(.length())         # UFCS arg position
+  Stdout.print("ok")
+}
+```
+
+The explicit lambda is only worth its name when the body does more
+than project — a computation, multiple uses of the parameter, or a
+positional `_` placeholder (which a point-free section does not take).
+
 ## Units of measure over bare Real
 
 When a quantity has a dimension, annotate it. The unit rides as a
