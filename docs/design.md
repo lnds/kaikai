@@ -350,7 +350,7 @@ was first pinned; many items below have since shipped — see
   - `docs/effects.md` (Doc A): rows, unification, syntax, `handle` / `resume`, inference. The mental model.
   - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `Fail`, `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
   - `docs/effects-impl.md` (Doc C, in progress): CPS transform, handler-stack runtime, codemod for migrating bare builtins.
-- **Syntax sugars** (`docs/syntax-sugars.md`): trailing lambdas, `@cap` / `cap := v`, local `var x = init` cells, array indexing `a[i]` / `a[i] := v`. m7b ships these alongside the effects mechanics.
+- **Syntax sugars** (`docs/syntax-sugars.md`): trailing lambdas, naked cell read / `cap := v`, local `var x := init` cells, array indexing `a[i]` / `a[i] := v`. m7b ships these alongside the effects mechanics.
 - **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing. *Landed in stage 2 m10.*
 - **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
 - **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.

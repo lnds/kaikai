@@ -309,12 +309,12 @@ manual loop and hand-rolled recursion. There is no `for x in xs`.
 import loop
 
 fn main() : Int / Stdout = {
-  var i = 0
-  while { @i < 3 } {
-    Stdout.print("tick #{int_to_string(@i)}")
-    i := @i + 1
+  var i := 0
+  while { i < 3 } {
+    Stdout.print("tick #{int_to_string(i)}")
+    i := i + 1
   }
-  @i
+  i
 }
 ```
 

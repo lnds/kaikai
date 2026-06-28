@@ -14,9 +14,10 @@ The five sugars:
    block-form `{ x -> body }` is also legal as a standalone
    lambda expression in non-trailing positions (operand of
    `|` / `|>`, RHS of `let`, etc.).
-2. **Capability read/write** — `@cap` and `cap := v` as short
-   forms for capability ops on `State[T]` and `Reader[T]`.
-3. **Local mutable cells** — `var x = init` declares an
+2. **Capability read/write** — a naked read `cap` and
+   `cap := v` as short forms for capability ops on `State[T]`
+   and `Reader[T]`.
+3. **Local mutable cells** — `var x := init` declares an
    in-block `State[T]` handler.
 4. **Array indexing** — `a[i]` and `a[i] := v` for
    `Mutable.array_get` / `Mutable.array_set`.
@@ -39,7 +40,7 @@ actually lives:
 - Trailing lambdas — Doc B §*Syntax note: trailing lambdas*
   motivates; §1 below specifies, including the lambda-block
   expression form.
-- `@cap` / `cap := v` — Doc B §*Syntax note: capability
+- naked cell read / `cap := v` — Doc B §*Syntax note: capability
   read/write sugar* motivates; §2 below specifies.
 - `var` — Doc B §*Syntax note: local mutable cells with `var`*
   motivates; §3 below specifies.
@@ -60,8 +61,8 @@ and a cross-reference back to Doc A.
 The five sugars together add:
 
 - one keyword: `var`.
-- three binding shapes: `cap := v`, `a[i] := v`, `var x = v`.
-- one prefix form: `@cap`.
+- three binding shapes: `cap := v`, `a[i] := v`, `var x := v`.
+- one naked-read form: a bare `cap` identifier.
 - one postfix form: `a[i]`.
 - two call-site shapes: trailing lambda, and a second
   trailing-lambda slot for two-block control-flow helpers.
@@ -70,11 +71,11 @@ The five sugars together add:
 
 Two filters justify accepting this surface:
 
-1. **Each sugar has one intent the long form obscures.** `@cap`
-   is a capability read, not any other kind of expression;
-   `cap := v` is a capability write on `State`; `var` is a
-   local cell; `a[i]` is array indexing. Doc A's "few forms,
-   each with clear intent" standard.
+1. **Each sugar has one intent the long form obscures.** A
+   naked `cap` is a capability read, not any other kind of
+   expression; `cap := v` is a capability write on `State`;
+   `var` is a local cell; `a[i]` is array indexing. Doc A's
+   "few forms, each with clear intent" standard.
 2. **None replaces an existing form.** The long forms —
    `counter.get()`, `counter.set(v)`, `Mutable.array_get(a, i)`,
    `handle { ... } with State[T](init) as name { ... }` —
@@ -254,14 +255,14 @@ and `{` are on the same line. A newline between them splits the
 two into separate statements (the second of which would be a
 standalone block expression).
 
-## 2. Capability read/write: `@cap` and `cap := v`
+## 2. Capability read/write: naked read and `cap := v`
 
 ### Receiver classes
 
 Three receiver shapes accept this sugar today; the desugar dispatches
 on the receiver's type:
 
-| Receiver shape | `@cap` lowers to | `cap := v` lowers to |
+| Receiver shape | naked `cap` lowers to | `cap := v` lowers to |
 |---|---|---|
 | `State[T]` (an `as`-bound handler capability) | `cap.get()` (resolves to `State.get`) | `cap.set(v)` |
 | `Reader[T]` (an `as`-bound handler capability) | `cap.get()` (alias-rewritten to `Reader.ask`) | rejected — `Reader` has no `set` op |
@@ -278,34 +279,37 @@ crosses function boundaries, which `var` cannot.
 
 Four restrictions, lifted verbatim from Doc B:
 
-1. `@cap` applies **only to `State[T].get()`,
+1. A naked read applies **only to `State[T].get()`,
    `Reader[T].ask()`, and `Mutable.ref_get(c)` for `c : Ref[T]`**.
 2. `cap := v` applies **only to `State[T].set(v)` and
    `Mutable.ref_set(c, v)` for `c : Ref[T]`**.
-3. The identifier after `@` must be **a simple capability
-   binding** (`@counter`, not `@config.section.level`).
-4. `@` and `:=` on a `State[T]` / `Reader[T]` capability require
-   **an `as`-bound capability name**. Using the default
-   capability name (`State` itself) keeps the explicit
-   `State.get()` / `State.set(v)` form. (`Ref[T]` has no
-   "default name" — every `Ref[T]` value is bound by an
+3. A naked-read identifier must be **a simple capability
+   binding** (`counter`, not `config.section.level`).
+4. The naked read and `:=` on a `State[T]` / `Reader[T]`
+   capability require **an `as`-bound capability name**. Using
+   the default capability name (`State` itself) keeps the
+   explicit `State.get()` / `State.set(v)` form. (`Ref[T]` has
+   no "default name" — every `Ref[T]` value is bound by an
    ordinary `let` or parameter, so this rule does not apply
    to the `Ref` shape.)
 
    Reason for rule 4: without `as`, the default capability's
-   identifier is also the effect's name (`State`). Allowing
-   `@State` would give two forms for the same op with no intent
-   difference, and `State := v` would read as an assignment to
-   the effect rather than to a cell. Requiring an `as`-bound
-   name sidesteps both: the sugar applies only to identifiers
-   the user has introduced as bindings, and the default form
-   stays as an explicit method call.
+   identifier is also the effect's name (`State`). A bare
+   `State` already names the effect, and `State := v` would
+   read as an assignment to the effect rather than to a cell.
+   Requiring an `as`-bound name sidesteps both: the sugar
+   applies only to identifiers the user has introduced as
+   bindings, and the default form stays as an explicit method
+   call.
 
 ### Grammar delta
 
+The read needs no new production: a capability read is an
+ordinary `Ident` in `Primary` position; the checker rewrites it
+once it knows the identifier resolved to a capability binding.
+Only the write adds a statement form:
+
 ```
-Primary     ::= ...
-              | "@" Ident                        # capability read
 Stmt        ::= ...
               | Ident ":=" Expr                  # capability / array write
 ```
@@ -316,8 +320,9 @@ the internal types the compiler assigns to `as`-bound
 capabilities of the corresponding effects — they are checker
 implementation details, not names users spell in source code.
 
-- `@x` legal iff `x : StateCap[T]` (for any `T`),
-  `x : ReaderCap[T]`, or `x : Ref[T]`.
+- a naked read of `x` lowers to the get/ask op iff
+  `x : StateCap[T]` (for any `T`), `x : ReaderCap[T]`, or
+  `x : Ref[T]`; otherwise `x` stays an ordinary variable read.
 - `x := v` legal iff `x : StateCap[T]` and `v : T`, or
   `x : Ref[T]` and `v : T`, **or** the array-indexing form below.
 
@@ -325,34 +330,33 @@ When `x : Ref[T]`, the call site adds `Mutable` to the enclosing
 function's effect row (issue #275, mirroring the `a[i] := v` /
 `Mutable.array_set` row injection from issue #265).
 
-If `x` does not have a capability type, the error points at
-the sugar site and suggests either the method call
-(`x.get()` / `x.set(v)`) or the explicit long form
-(`State.get()` / `State.set(v)`).
+If `x := v` targets an identifier without a capability type, the
+error points at the sugar site and suggests either the method
+call (`x.set(v)`) or the explicit long form (`State.set(v)`).
 
-### Why `@` specifically
+### Why the read is naked
 
-`@` is unused elsewhere in kaikai's expression grammar. It is
-short enough for `@counter + 1` to read cleanly, visually
-distinct from a plain identifier (so the capability read is
-still *visible* per Doc A §*Context*'s capability-explicit
-stance), and does not collide with type-parameter brackets or
-the method call `.`.
+`:=` is the single mark of mutability. It declares the cell
+(`var x := init`), and every write spells it (`x := v`), so the
+cell is already visible at its declaration and at each mutation.
+Marking the read too would be redundant: a bare `counter` reads
+the current value, and the surrounding `:=` discipline keeps the
+capability visible per Doc A §*Context*'s capability-explicit
+stance.
 
-The only other proposed use of `@` is as-patterns
-(`name@pattern` in `match`), documented in
+`@` carries no expression-level role: its only use is the
+as-pattern (`name @ subpattern` in `match`), documented in
 `docs/proposed-extensions.md` §14. That usage is **infix** in
-patterns; `@cap` here is **prefix** in expressions. Contexts
-are disjoint; the same symbol plays two roles decided by
-grammar position.
+patterns, so there is no clash with the naked read in
+expressions.
 
 ## 3. Local mutable cells: `var`
 
 ### Rule
 
 ```kai
-var name: T = init       # with type annotation
-var name = init          # with inference
+var name: T := init      # with type annotation
+var name := init         # with inference
 ```
 
 desugars, in the same block, to:
@@ -381,7 +385,7 @@ does **not** gain `State[T]` — the cell is purely local. See
 
 ```
 Stmt        ::= ...
-              | "var" Ident (":" Type)? "=" Expr
+              | "var" Ident (":" Type)? ":=" Expr
 ```
 
 `var` is a **new keyword**. It is the only keyword the sugars
@@ -410,7 +414,7 @@ Rules that follow from the desugar:
   to them inside `handle { ... } with Eff { ... }`). It
   desugars to a sibling `with State[T](init) as name` wrapping
   the handler. Reads inside clause bodies use the same
-  `@name` / `name.get()` forms as anywhere else; `var` and
+  naked `name` / `name.get()` forms as anywhere else; `var` and
   `let` must precede every operation clause inside one
   handler block (interleaving is a parse error).
 
@@ -418,11 +422,11 @@ Rules that follow from the desugar:
 
 Because the implicit `handle` closes `State[T]` in the same
 block, the enclosing function's effect row **does not** gain
-`State[T]`. A `var counter = 0` inside a function of signature
+`State[T]`. A `var counter := 0` inside a function of signature
 `: Int / Console` leaves the signature untouched.
 
 `var` encapsulates `State[T]` and nothing else. Any other
-effect the body uses — `Console.print(@counter)`,
+effect the body uses — `Console.print(counter)`,
 `File.write_file(...)`, `Spawn.yield()` — still appears in the
 enclosing function's row, same as without the `var`. The sugar
 is narrow on purpose: it makes one local cell invisible; it
@@ -553,9 +557,9 @@ The canonical use is control-flow helpers built as ordinary
 stdlib functions:
 
 ```kai
-while      { @i > 0 } { i := @i - 1; io.println("#{@i}") }
-until      { @done }  { process_one() }
-if_then_else(p)       { run_a() } { run_b() }
+while      { i > 0 } { i := i - 1; io.println("#{i}") }
+until      { done }  { process_one() }
+if_then_else(p)      { run_a() } { run_b() }
 ```
 
 These compose with row polymorphism the same way single-trailing
@@ -1225,10 +1229,11 @@ precise anchor for the "expected `case` or `}`" diagnostic.
 All five sugars compose without ambiguity because their grammar
 slots are disjoint:
 
-- `@cap` is a prefix of `Primary`.
+- a naked cap read is an ordinary `Ident` in `Primary` — the
+  checker rewrites it from the resolved type, no new grammar.
 - `a[i]` is a postfix of `Primary`.
 - `cap := v` and `a[i] := v` are statement forms.
-- `var x = init` is a statement form with a distinct keyword.
+- `var x := init` is a statement form with a distinct keyword.
 - Trailing lambda is a suffix of a call (also a `Primary`
   postfix slot, distinct from `[i]`); the second trailing
   lambda (§5) extends the same suffix slot with greedy
@@ -1241,28 +1246,29 @@ slots are disjoint:
 Combining them:
 
 ```kai
-var counter = 0
+var counter := 0
 each(events) { e ->
-  if @counter < max {
+  if counter < max {
     buffer[e.id] := e.payload
-    counter := @counter + 1
+    counter := counter + 1
   }
 }
-Console.print("processed #{@counter}")
+Console.print("processed #{counter}")
 ```
 
 Parsing this unambiguously walks:
 
-- `var counter = 0` — statement, declares a `State[Int]` cell.
+- `var counter := 0` — statement, declares a `State[Int]` cell.
 - `each(events) { e -> ... }` — call with trailing lambda.
   Inside the lambda, `counter` and `buffer` are in scope.
-- `@counter < max` — prefix `@` on `counter`, binary `<`.
+- `counter < max` — `counter` is an ordinary `Ident` the checker
+  rewrites to a cap read, binary `<`.
 - `buffer[e.id] := e.payload` — indexed write. `buffer` must
   be `Array[T]`; the checker picks `T` from `e.payload`.
-- `counter := @counter + 1` — capability write + capability
+- `counter := counter + 1` — capability write + capability
   read.
-- `Console.print("processed #{@counter}")` — interpolation
-  containing `@counter`, which is an ordinary expression
+- `Console.print("processed #{counter}")` — interpolation
+  containing `counter`, which is an ordinary expression
   inside `#{...}`.
 
 Every branching decision (identifier → `:=`, `[`, `.`, or end
@@ -1274,20 +1280,16 @@ lookahead. No extra peek beyond that is required.
 Candidates discussed during Doc B review and rejected, with
 reasons:
 
-- **`cap.x` implicit read (Koka-style), dropping the `@`.**
-  Writing `counter` where `counter.get()` is meant would
-  make capability reads invisible at the call site. Doc A
-  §*Context* picked Effekt's capability-explicit design over
-  Koka's sugar precisely to avoid this. Rejected.
-
 - **`r := v` for `Ref[T]`.** Would unify Ref and State writes
   under one sugar. Rejected because Ref is a value, not a
   capability binding, and the checker would then need to
   inspect the LHS's declared type to pick a desugar target,
   complicating diagnostics.
 
-- **`@r` for `Ref[T]` reads.** Same reason as above — Ref is
-  not a capability.
+- **A naked read for `Ref[T]`.** A bare `r` does not read a
+  `Ref[T]`; that stays the explicit `Mutable.ref_get(r)` form.
+  Same reason as above — Ref is a value, not a capability
+  binding.
 
 - **`counter <- v` (Haskell-style) instead of `counter := v`.**
   `<-` reads as "pull value from computation" in Haskell and
@@ -1301,7 +1303,7 @@ reasons:
 ## Migration and diagnostics
 
 - **Error messages show the source form.** A type error
-  inside `counter := @counter + 1` prints the expression as
+  inside `counter := counter + 1` prints the expression as
   the user wrote it, with the caret at the sugar site. Where
   understanding the error depends on the desugar (e.g., the
   checker talks about `set(v: T)`'s parameter type and the
@@ -1362,12 +1364,13 @@ reasons:
    as the rest of kaikai's tooling (see §*Migration and
    diagnostics* and §*Next steps*).
 
-2. **`@` precedence relative to postfix `.` and `[i]`.**
-   *Decided:* `@a.b` = `(@a).b`. `@` binds tight — same slot
-   as unary `-`, which is why `-a.b` is `(-a).b` in every
-   language the reader knows. The intuition is "read the
-   capability, then project." The pretty-printer adds explicit
-   parens when the nesting is non-obvious.
+2. **Naked-read precedence relative to postfix `.` and `[i]`.**
+   *Dissolved:* with the read naked, `a.b` is an ordinary
+   postfix projection on `a`. When `a` is a capability binding,
+   the checker reads it first and then projects, so `a.b` reads
+   "read the capability, then project" with no extra precedence
+   rule. There is no read marker to bind, so the question that
+   the `@` prefix once raised no longer applies.
 
 3. **`var` declarations in the top-level of a file.**
    *Decided:* error at top level. The broader rule: kaikai has
