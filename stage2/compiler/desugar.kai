@@ -1808,10 +1808,12 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
         None -> caps
       }
       let rb = lcr_expr(body, body_caps, reject_at, file, ri.errs)
-      # A user `with State/Reader as a` makes `a` a cell over the handle
-      # body; same escape rule as a `var`.
+      # A `with Eff as a` capability — a `var`/State/Reader cell OR a §6 named
+      # instance — may not outlive the handle that installed it: its evidence
+      # node is torn down at the closing brace. The same positional escape check
+      # (a closure that captures `a` and survives the block) applies to both.
       let esc = match alias_opt {
-        Some(a) -> if eff_is_cell(eff) { lcr_escape_in_value(rb.expr, a, file) } else { 0 }
+        Some(a) -> lcr_escape_in_value(rb.expr, a, file)
         None -> 0
       }
       let rc = lcr_clauses(clauses, caps, reject_at, file, rb.errs + esc)
@@ -1960,18 +1962,35 @@ fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool,
 fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], n: String, file: String) : Int / Console + File {
 
   let tainted = lcr_taint_stmts(stmts, n, [])
-  match escaping_closure_opt(tail, n, tainted) {
-    Some(p) -> report_cell_escape(n, p, file)
+  # A bare `n` in tail position returns the capability itself out of its handle
+  # (escape vector 3). A capability may only appear as a call argument or an op
+  # receiver, never as a return value — reject it directly.
+  let direct = match tail {
+    Some(t) -> match t.kind { EVar(v) -> if v == n { report_cap_return(n, t.line, t.col, file) } else { 0 } _ -> 0 }
     None    -> 0
   }
+  match escaping_closure_opt(tail, n, tainted) {
+    Some(p) -> direct + report_cell_escape(n, p, file)
+    None    -> direct
+  }
+}
+
+fn report_cap_return(n: String, line: Int, col: Int, file: String) : Int / Console + File {
+  diag_error(file, line, col, concat_all([
+    "the capability `", n, "` cannot be returned from its `handle`"
+  ]))
+  diag_help(concat_all([
+    "a capability bound by `as` is second-class — it may only be passed down as a call argument or used as an op receiver, not returned or stored; a value that must outlive its scope is a `Ref[T]` under `Mutable`"
+  ]))
+  1
 }
 
 fn report_cell_escape(n: String, p: CellPos, file: String) : Int / Console + File {
   diag_error(file, p.line, p.col, concat_all([
-    "a closure that accesses the mutable cell `", n, "` escapes its block"
+    "a closure that captures the capability `", n, "` escapes its block"
   ]))
   diag_help(concat_all([
-    "the `State` handler for `", n, "` is torn down when the block exits; the cell does not outlive the block, so the closure cannot run later"
+    "the handler for `", n, "` is torn down when the block exits, so a capability bound by `as` cannot outlive its `handle`; pass it down as a call argument instead"
   ]))
   1
 }

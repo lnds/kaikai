@@ -2400,7 +2400,15 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         let eff_evmo = eff_mo(cx.effs, eff_n)
         let eff_evn = ev_name(eff_n, eff_evmo)
         let eff_idn = eff_n
-        let op_n_tagged = dotted_suffix(callee)
+        let op_n_tagged0 = dotted_suffix(callee)
+        # §6 named instances: the typer tags a capability-parameter op call
+        # `c.op` as `op#<recv>`. The evidence is the parameter `kai_<recv>`
+        # itself (a `KaiEvidence *`), not a by-name walk — distinct capability
+        # params resolve to distinct nodes by parameter position. Split the
+        # receiver off first; the bare op name then flows through the normal path.
+        let hash_pos = string_index_of_char(op_n_tagged0, '#')
+        let cap_recv = if hash_pos >= 0 { string_slice(op_n_tagged0, hash_pos + 1, string_length(op_n_tagged0)) } else { "" }
+        let op_n_tagged = if hash_pos >= 0 { string_slice(op_n_tagged0, 0, hash_pos) } else { op_n_tagged0 }
         # m7b #15 (compiler integration, scope-limited): the alias
         # rewrite tags op names with `@<alias>` when the original
         # callee was an `as`-bound capability. Split here: when
@@ -2438,7 +2446,12 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
                         "\"), \"", eff_idn, "\")"])
           }
         let lookup_c =
-          if evf_slot >= 0 {
+          if cap_recv != "" {
+            # Capability value: the evidence is the node bound to this name —
+            # a `KaiEvidence *` param or the `&_node` an alias prologue binds.
+            # The param ABI carries it as a `KaiValue *` scalar, so cast back.
+            concat_all(["((KaiEvidence *) kai_", cap_recv, ")"])
+          } else if evf_slot >= 0 {
             concat_all(["__evf[", int_to_string(evf_slot), "]"])
           } else { walk_c }
         # m8.x bug #12: mark the handler's evidence node as
@@ -6569,9 +6582,20 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
   # `@<a>`. The local lives in the same statement-expression
   # as the rest of the handle prologue, so it is in scope for
   # every op-call site inside `body_c`.
+  # §6 named instances: bind the alias as a first-class capability VALUE — the
+  # handle's own evidence node — so `a.op(...)` reads `kai_<a>` (the node) and
+  # `f(a)` passes it as the callee's capability parameter. This is the same node
+  # the param ABI threads, so alias and parameter capabilities share one path
+  # (no by-id walk). `&_node` is valid from its declaration below; the address
+  # is stable across the push that fills it.
+  # Bind the alias two ways: `kai_alias_<a>_id` for the legacy by-id dispatch a
+  # `var`/State/Reader cell uses, and `kai_<a>` (the node itself) for the §6
+  # capability dispatch a user effect's named instance uses. The typer picks one
+  # via the `@`/`#` dispatch tag; emitting both keeps each path in scope.
   let alias_id_c = match alias_opt {
     Some(a) -> concat_all([
-      "KaiHandlerId kai_alias_", a, "_id = _ev.handler_id; "
+      "KaiHandlerId kai_alias_", a, "_id = _ev.handler_id; ",
+      "KaiValue *kai_", a, " = (KaiValue *) &_node; "
     ])
     None -> ""
   }

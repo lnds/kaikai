@@ -66,6 +66,16 @@ fn nemit_install_with(ctx: Handle, eff: String, sym: String, init: Option[KVal],
   let disc = native_ctx_find_reg(ctx, nfx_discard_reg(sym))
   let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
   nemit_push_with_jmp(ctx, node, effname, ev, jmpbuf, disc)
+  # §6 named instances: bind the bare alias name to the node as a first-class
+  # capability value (mirror of emit_c's `kai_<a> = &_node`). `node` is the
+  # alloca holding the KaiEvidence; storing it lets a `#<recv>` perform read it
+  # and a call site pass the alias as a capability parameter.
+  nemit_install_cap_value(ctx, alias, node)
+}
+
+fn nemit_install_cap_value(ctx: Handle, alias: Option[String], node: Handle) : Unit / Console = match alias {
+  None    -> ()
+  Some(a) -> nemit_store_reg(ctx, a, node)
 }
 
 # Seed the Ev `state` slot from the `with Eff(init)` value (stateful
@@ -197,6 +207,18 @@ fn nfx_op_alias(op: String) : Option[String] = {
   if at >= 0 { Some(string_slice(op, at + 1, string_length(op))) } else { None }
 }
 
+# Split an `<op>#<recv>` tag (§6 named instances): the bare op resolves the
+# clause field; the receiver names the register holding the evidence node the
+# perform dispatches through. Mirrors emit_c's `#` split (emit_c.kai:2409).
+fn nfx_op_before_hash(op: String) : String = {
+  let h = string_index_of_char(op, '#')
+  if h >= 0 { string_slice(op, 0, h) } else { op }
+}
+fn nfx_op_recv(op: String) : Option[String] = {
+  let h = string_index_of_char(op, '#')
+  if h >= 0 { Some(string_slice(op, h + 1, string_length(op))) } else { None }
+}
+
 # The evidence node a perform dispatches through. By-id for an aliased op
 # (resolve THIS handler instance via the `__alias_id__<a>` sentinel). Else,
 # when the enclosing fn's frame carries this effect, read its slot from `__evf`
@@ -265,24 +287,30 @@ fn nemit_evf_load_slot(ctx: Handle, cur_fn: String, slot: Int) : Handle / Consol
 # guard, then `kaix_op_finish` (the folded discard test + unwind — on a
 # discard it longjmps and does not return; otherwise yields the op result).
 pub fn nemit_perform(ctx: Handle, cur_fn: String, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
-  # An aliased op is spelled `<op>@<alias>` (the resolver's per-instance
-  # dispatch tag). Split it: the bare op resolves the clause field; the
-  # alias (if any) switches the node lookup from by-name to by-id.
-  let bare = nfx_op_before_at(op)
-  let alias = nfx_op_alias(op)
+  # Two dispatch tags can ride the op name. `<op>#<recv>` (§6 named instances):
+  # the evidence is the register `recv` (a capability param or `with..as` value).
+  # `<op>@<alias>`: the legacy by-id lookup for a `var`/State/Reader cell. The
+  # bare op (stripped of both) resolves the clause field.
+  let recv = nfx_op_recv(op)
+  let no_hash = nfx_op_before_hash(op)
+  let bare = nfx_op_before_at(no_hash)
+  let alias = nfx_op_alias(no_hash)
   match nfx_find_handler_by_eff(handlers, eff) {
     None -> { nemit_unsupported(ctx, cat2("KPerform: no handler for effect ", eff)); nemit_null(ctx) }
-    Some(h) -> nemit_perform_with(ctx, cur_fn, eff, bare, alias, cargs, h)
+    Some(h) -> nemit_perform_with(ctx, cur_fn, eff, bare, alias, recv, cargs, h)
   }
 }
 
-fn nemit_perform_with(ctx: Handle, cur_fn: String, eff: String, op: String, alias: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
+fn nemit_perform_with(ctx: Handle, cur_fn: String, eff: String, op: String, alias: Option[String], recv: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let field = nfx_op_field(h.op_thunks, op, 0)
-  # 1. node = by-id lookup for an aliased op (resolve THIS instance), the
-  # enclosing fn's frame slot when carried, else the innermost-by-effect-name
-  # lookup; handler = node_handler(node).
-  let node = nemit_perform_node(ctx, cur_fn, eff, alias)
+  # 1. node = the capability register for a `#<recv>` op (read it directly), a
+  # by-id lookup for an aliased op, the enclosing fn's frame slot when carried,
+  # else the innermost-by-effect-name lookup; handler = node_handler(node).
+  let node = match recv {
+    Some(r) -> nemit_load_reg(ctx, r)
+    None    -> nemit_perform_node(ctx, cur_fn, eff, alias)
+  }
   let handler = nemit_call1(ctx, "kaix_evidence_node_handler", node)
   # 2. cont = the reserved KaiCont alloca; init identity with handler_id.
   # `kaix_ev_handler_id(ptr) -> i64` (NOT a boxed ptr); `cont_init_identity`

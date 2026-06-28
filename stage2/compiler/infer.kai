@@ -2645,7 +2645,9 @@ fn strip_alias_suffix_loop(key: String, i: Int, n: Int) : String {
   if i >= n { key }
   else {
     match char_at(key, i) {
-      Some(c) -> if c == '@' { string_slice(key, 0, i) }
+      # `@` is the legacy by-id alias tag; `#` is the §6 capability dispatch tag.
+      # Both are codegen-only suffixes the coverage/display path strips.
+      Some(c) -> if c == '@' or c == '#' { string_slice(key, 0, i) }
                  else { strip_alias_suffix_loop(key, i + 1, n) }
       None    -> key
     }
@@ -8907,8 +8909,25 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         }
         _ -> inf_resolve_ty_list(eff_tyargs)
       }
-      let prev_row = st_aliased.row
-      let st_in = st_set_row(st_aliased, [])
+      # A `with Eff as a` binding makes `a` a first-class capability value of
+      # type `Eff[ty_args]` so it can be passed as a call argument (§6 named
+      # instances). The capability type IS the effect's nominal type — no
+      # `Handler[E]` wrapper (HKT stays banned). The alias entry on st.aliases
+      # still drives op dispatch inside the handle body; this env binding is what
+      # lets `a` cross into `f(a)` and type against a `c: Eff` parameter.
+      # The capability type carries only the effect's own tparams, not the
+      # handler's full state type: a non-parametric `Cell` is `TyCon("Cell", [])`
+      # even when `with Cell(0)` infers an Int state. Truncating to the effect's
+      # tparam arity makes the binding unify with a `c: Cell` parameter.
+      let cap_arity = eff_tparam_arity(st_aliased.op_eff_arities, eff_name)
+      let cap_tyargs = take_first_tys(resolved_eff_tyargs, cap_arity)
+      let st_capbound = match alias_opt {
+        Some(a) -> st_set_env(st_aliased,
+                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs))))
+        None    -> st_aliased
+      }
+      let prev_row = st_capbound.row
+      let st_in = st_set_row(st_capbound, [])
       let rb = synth(st_in, body)
       # filter out *only* the labels whose ty_args unify with
       # the handler's instantiation. Labels with the same eff name but
@@ -8921,9 +8940,13 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # discharge binds the cell's type via `unify_list`, so thread the
       # resulting substitution into the handler's output state (all reads
       # of the cell converge on the handler's instantiation).
+      # Discharge against the effect's own tparam tyargs (truncated to its
+      # arity), not the full handler state type — a non-parametric `Cell` op
+      # carries a `[]` label even when `with Cell(0)` infers an Int state, so
+      # matching against `[Int]` would leave the label undischarged.
       let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
       let filt = filter_labels_matching_res(rb.st.row, discharge_eff,
-                                              resolved_eff_tyargs, rb.st.sub)
+                                              cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
       let rb_st1 = st_set_sub(rb.st, filt.sub)
       let merged = merge_label_lists(prev_row, body_row_minus, rb_st1.sub)
@@ -9938,6 +9961,9 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
               # `@cap` desugars to `cap.get()` for every
               # capability shape; for a Reader-bound alias the op
               # is `ask`, not `get`. Remap here so the lookup hits.
+              # A capability PARAMETER (`c: Eff`, not a `with..as` alias) is
+              # provided by the caller, so it falls through to `cap_op_call`
+              # below — its op does not join the row (§6 named instances).
               match lookup_alias(st.aliases, name) {
                 None ->
                   # try type alias (`type Console =
@@ -9950,7 +9976,11 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                   # the right key. Ambiguity (multiple components
                   # share an op_name) resolves to the leftmost.
                   match inf_find_alias(st.type_aliases, name) {
-                    None -> None
+                    # Not an effect, not a `with..as` alias, not a type alias —
+                    # last shot: a capability PARAMETER (`c: Eff`), provided by
+                    # the caller (§6 named instances). Op dispatches against the
+                    # param's evidence; effect does not join the row.
+                    None -> cap_op_call(st, name, op_name, args_, line, col)
                     Some(AR(_, components)) ->
                       match inf_find_eff_for_alias_op(components, st.op_to_eff, op_name) {
                         None -> None
@@ -9969,24 +9999,28 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                 Some(eff) -> {
                   let real_op = canonical_cap_getter(eff, op_name)
                   let lookup_key = string_concat(eff, string_concat(".", real_op))
-                  # (compiler integration, scope-limited):
-                  # when the alias is taggable (the call site is
-                  # in the same lexical scope as the handle's
-                  # prologue, no intervening lambda), the
-                  # dispatched callee carries an `@<alias>`
-                  # suffix so the codegen routes through the
-                  # handle's `kai_alias_<a>_id` C local instead
-                  # of the innermost name-keyed lookup. Inside a
-                  # lambda body the local is out of scope; we
-                  # then emit a bare dispatch key so the legacy
-                  # name-keyed lookup runs and the closure-
-                  # capture path keeps compiling.
+                  # §6 named instances: a `with Eff as name` binding dispatches
+                  # `name.op` against the handle's own evidence node, bound in the
+                  # prologue as `kai_<name>`. The dispatch key carries `#<name>`
+                  # so codegen reads that node directly — the same path a
+                  # capability parameter uses, no by-id walk. Inside a lambda body
+                  # the prologue local is out of scope, so the tag is suppressed
+                  # and the bare name-keyed lookup runs (closure-capture path).
                   let taggable = match lookup_alias_taggable(st.aliases, name) {
                     Some(b) -> b
                     None    -> false
                   }
+                  # `var`/State/Reader cells keep the legacy by-id dispatch (`@`):
+                  # their naked-read sugar and nested-cell identity ride that path
+                  # across the corpus. A user effect's `with Eff as name` uses the
+                  # §6 capability dispatch (`#`) so it threads as a first-class
+                  # value through calls — the named-instances surface.
                   let dispatch_key = if taggable {
-                    string_concat(lookup_key, string_concat("@", name))
+                    if eff_is_cell_effect(eff) {
+                      string_concat(lookup_key, string_concat("@", name))
+                    } else {
+                      string_concat(lookup_key, string_concat("#", name))
+                    }
                   } else {
                     lookup_key
                   }
@@ -10405,6 +10439,47 @@ fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
   mk_inferred(st_bump_err(st), TyAny, root)
 }
 
+# When `name` is a value bound to a capability type — a parameter `c: Eff` or a
+# `with Eff as name` binding (§6 named instances) — return the effect it carries.
+# The capability type is the effect's own nominal `TyCon(None, Eff, args)`; an
+# `Eff.op` exists in the env iff `Eff` is a declared effect, so a TyCon head that
+# `is_effect_in_env` recognises is a capability. Returns the effect label with
+# the resolved ty_args so the op-call instantiation pins the row instance.
+fn cap_eff_of_var(st: InferState, name: String) : Option[Label] =
+  match ty_env_lookup(st.env, name) {
+    None     -> None
+    Some(sc) -> match sc {
+      Scheme(_, _, _, ty) -> match apply_ty(st.sub, ty) {
+        TyCon(None, ename, args) ->
+          if is_effect_in_env(st.env, ename) { Some(Label { eff: ename, ty_args: args }) }
+          else { None }
+        _ -> None
+      }
+    }
+  }
+
+# `State`/`Reader` are readable cells: a `var` desugars to `with State as name`
+# and reads naked. Their dispatch keeps the legacy by-id path; a user effect's
+# named instance uses the §6 capability path. Mirrors desugar's `eff_is_cell`.
+fn eff_is_cell_effect(eff: String) : Bool = eff == "State" or eff == "Reader"
+
+# Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
+# effect it carries; codegen reads `name`'s evidence node. The effect does NOT
+# join the row — the capability is provided, not demanded.
+fn cap_op_call(st: InferState, name: String, op_name: String, args_: [Expr],
+               line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match cap_eff_of_var(st, name) {
+    None      -> None
+    Some(lab) -> {
+      let cap_eff = lab.eff
+      let cap_key = string_concat(cap_eff, string_concat(".", op_name))
+      match ty_env_lookup(st.env, cap_key) {
+        Some(sc) -> Some(synth_op_call_provided(st, sc, args_, name, cap_key, line, col))
+        None     -> Some(synth_op_call_unknown_op(st, cap_eff, op_name, line, col))
+      }
+    }
+  }
+
 fn is_effect_in_env(env: TyEnv, eff_name: String) : Bool =
   is_effect_in_env_loop(env.entries, string_concat(eff_name, "."))
 
@@ -10445,6 +10520,28 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
   # a direct `Eff.op(...)` call is not a `with ... as <name>` cell, so
   # its row label keeps the bare effect name.
   synth_op_call_with_scheme_keys(st, sc, args_, key, key, None, line, col)
+}
+
+# An op call on a PROVIDED capability (`c.op(...)` where `c: Eff` is a value
+# parameter, §6 named instances). Types the call exactly like a normal op call —
+# instantiate, unify args against the op scheme — but does NOT add the effect to
+# the body's row: a capability passed in is satisfied by the caller, not demanded
+# by this function (design §3 "capability as a parameter does not enter the row").
+# Codegen reads the evidence from the parameter's own slot, keyed by the variable
+# name so distinct instances stay distinct by parameter position.
+fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
+                           recv: String, key: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let inst = st_instantiate_report(st, sc)
+  let ra = synth_many(inst.st, args_)
+  let rv = st_fresh_ty(ra.st)
+  let expected = fn_ty(ra.tys, rv.ty)
+  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("cap op call ", key), line, col)
+  let ty = apply_ty(st2.sub, rv.ty)
+  # Dispatch key carries the receiver name so codegen reads `recv`'s own evidence
+  # slot rather than walking by effect name — distinct capability params resolve
+  # to distinct nodes. No row label: the capability is provided, not demanded.
+  let root = with_ty(mk_expr(ECall(callee_expr_for_op(string_concat(key, string_concat("#", recv)), line, col), ra.exprs), line, col), ty)
+  mk_inferred(st2, ty, root)
 }
 
 fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
@@ -10498,6 +10595,30 @@ fn lookup_op_eff_arity(table: [OpEffArity], key: String) : Int {
       OEA(k, n) -> if k == key { n } else { lookup_op_eff_arity(rest, key) }
     }
   }
+}
+
+# The tparam arity of an effect — how many type args its capability type carries.
+# Found via any op key `<eff>.<op>` in the arity table (all ops of one effect
+# share its tparam count). A non-parametric effect (`Cell`) returns 0 so its
+# capability type is the bare `TyCon(None, "Cell", [])` a parameter annotates.
+fn eff_tparam_arity(table: [OpEffArity], eff: String) : Int =
+  eff_tparam_arity_loop(table, string_concat(eff, "."))
+
+fn eff_tparam_arity_loop(table: [OpEffArity], prefix: String) : Int {
+  match table {
+    [] -> 0
+    [h, ...rest] -> match h {
+      OEA(k, n) -> if string_has_prefix(k, prefix) { n } else { eff_tparam_arity_loop(rest, prefix) }
+    }
+  }
+}
+
+fn take_first_tys(xs: [Ty], n: Int) : [Ty] {
+  if n <= 0 { [] }
+  else { match xs {
+    [] -> []
+    [h, ...rest] -> [h, ...take_first_tys(rest, n - 1)]
+  } }
 }
 
 fn take_first(xs: [Int], n: Int) : [Int] {
