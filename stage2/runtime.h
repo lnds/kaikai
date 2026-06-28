@@ -11529,6 +11529,17 @@ static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *ha
     node->discard_slot = NULL;
     f->evidence_top    = node;
 }
+/* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
+ * evidence stack: the call site addresses this node directly through the frame,
+ * so it needs `handler` / `eff_label` set and the discard fields NULL, but no
+ * `parent` / `evidence_top` linkage (a default never discards, never unwinds). */
+static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
+    node->parent       = NULL;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = NULL;
+    node->discard_slot = NULL;
+}
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
  * setjmp/longjmp landing pad. The op-call site uses the node's
@@ -11728,6 +11739,15 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
         node = node->parent;
     }
     return NULL;
+}
+
+/* Resolve a default-bearing effect performed with no caller frame slot: a
+ * lexical handler on the stack wins (the walk finds it), else the frame-supplied
+ * default node (no longer pushed). The bridge for a direct perform in a fn that
+ * carries no frame (e.g. `main`), where the walk alone would miss the default. */
+static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
+    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
+    return node != NULL ? node : def;
 }
 
 /* m7b #15: per-instance dispatch — find the evidence node whose
@@ -12300,6 +12320,17 @@ static KaiValue *kai_llvm_build_store(void *b, void *val, void *ptr) {
 static void *kai_llvm_build_load(void *b, void *ty, void *ptr) {
     return (void *) LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ty, (LLVMValueRef) ptr, "");
 }
+/* The module global named `name` (its address as a Value*), or NULL when no
+ * such global exists. The call site addresses a default node minted in
+ * `kai_main_install_defaults` by this name. */
+static void *kai_llvm_get_named_global(void *m, KaiValue *name) {
+    LLVMValueRef g = LLVMGetNamedGlobal((LLVMModuleRef) m, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+/* True when a handle (an LLVM Value pointer) is the null pointer: the
+ * discriminant for `get_named_global` returning "no such global". */
+static int32_t kai_llvm_handle_is_null(void *h) { return h == NULL ? 1 : 0; }
 /* Position the builder at the START of a block (allocas must precede the
  * block's other instructions to stay promotable + static). */
 static KaiValue *kai_llvm_position_at_start(void *b, void *bb) {
@@ -12981,6 +13012,8 @@ static void *kai_llvm_build_alloca_entry(void *c, void *t, KaiValue *nm) { (void
 static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_load(void *b, void *t, void *p) { (void) b; (void) t; (void) p; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_named_global(void *m, KaiValue *nm) { (void) m; (void) nm; return kai_llvm_native_unavailable(); }
+static int32_t kai_llvm_handle_is_null(void *h) { (void) h; return 1; }
 static KaiValue *kai_llvm_build_br(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_build_cond_br(void *b, void *c, void *t, void *e) { (void) b; (void) c; (void) t; (void) e; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_switch(void *b, void *v, void *d, int64_t n) { (void) b; (void) v; (void) d; (void) n; return kai_llvm_native_unavailable(); }
