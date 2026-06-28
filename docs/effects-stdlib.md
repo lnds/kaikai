@@ -131,12 +131,13 @@ paren form.
 ## Syntax note: capability read/write sugar
 
 Two small sugars make `State` and `Reader` capabilities read as
-concisely as local variables without hiding that they are
-capability operations.
+concisely as local variables. `:=` is the single mark of
+mutability: it declares and writes a cell, and a bare identifier
+reads one.
 
 ```kai
-# Read with `@cap`:  @counter   ≡   counter.get()    (State)
-#                    @config    ≡   config.ask()     (Reader)
+# Naked read:  counter   ≡   counter.get()    (State)
+#              config    ≡   config.ask()     (Reader)
 #
 # Write with `cap := v`:  counter := v   ≡   counter.set(v)
 ```
@@ -144,26 +145,25 @@ capability operations.
 Both are strictly limited — each sugar only applies to one
 specific op shape on one specific effect:
 
-1. **`@` applies only to `State[T].get()` and `Reader[T].ask()`.**
-   Other zero-argument operations (like a hypothetical
-   `Clock.now()`) still need `Clock.now()` spelled out. Narrow
-   scope keeps the `@` visually meaningful — "read the current
-   value of a capability".
+1. **A naked read only lowers `State[T].get()` and
+   `Reader[T].ask()`.** Other zero-argument operations (like a
+   hypothetical `Clock.now()`) still need `Clock.now()` spelled
+   out. The bare identifier reads the capability's current value.
 2. **`:=` applies only to `State[T].set(v)`.** Any other
    `set`-shaped op on some other effect keeps `.set(v)`.
-3. **The identifier after `@` must be a simple capability
-   binding** (`@counter`, not `@config.section.level`).
-4. **`@` and `:=` require an `as`-bound capability name.**
-   `@State` and `State := v` are not legal; only bindings like
+3. **A capability read must be a simple binding** (`counter`,
+   not `config.section.level`).
+4. **The naked read and `:=` require an `as`-bound capability
+   name.** `State := v` is not legal; only bindings like
    `handle { ... } with State[Int](0) as counter { ... }` can
    use the sugar. Using the default capability name (`State`
    itself) forces the explicit `State.get()` / `State.set(v)`.
 
-The `@` glyph was picked for two reasons: it is not used
-anywhere else in kaikai, and it is short enough that
-`@counter + 1` reads cleanly while still clearly being different
-from a plain identifier — the operation is visible, consistent
-with Doc A §*Context*'s capability-passing-explicit stance.
+`:=` is the single mark of mutability — `var x := init` declares
+the cell, `x := v` writes it, and a bare `x` reads it. The read
+needs no marker because `:=` already makes the cell visible at
+its declaration and at every write, consistent with Doc A
+§*Context*'s capability-passing-explicit stance.
 
 Both sugars ship in **m7b** (see §*Next steps*), alongside
 trailing lambdas. Until then, `counter.get()` and
@@ -182,16 +182,16 @@ The `var` keyword declares a local mutable cell:
 
 ```kai
 fn sum_costs(events: [Event]) : Int / Console {
-  var total = 0
+  var total := 0
   each(events, (e) => {
-    total := @total + e.cost
-    Console.print("running: #{@total}")
+    total := total + e.cost
+    Console.print("running: #{total}")
   })
-  @total
+  total
 }
 ```
 
-`var total = 0` desugars to a `handle { rest-of-block } with
+`var total := 0` desugars to a `handle { rest-of-block } with
 State[Int](0) as total { ... }` wrapping everything from the
 `var` down to the closing `}` of the enclosing block. The
 generated handler uses the canonical clauses — there is no other
@@ -215,8 +215,8 @@ Consequences:
   `handle`, innermost first. One-shot resume stays a tail call,
   so there is no per-update runtime cost beyond the
   state-threading the handler was already doing.
-- **Explicit annotation is optional.** `var total = 0` infers
-  `Int`; `var total: Int = 0` is the annotated form.
+- **Explicit annotation is optional.** `var total := 0` infers
+  `Int`; `var total: Int := 0` is the annotated form.
 - **Sibling to `let`, not replacement.** `let` is immutable
   binding; `var` is a local `State[T]` cell. Both survive,
   each with its own intent.
@@ -235,8 +235,8 @@ allocates and threads a fresh handler invocation. It does not.
 `var` is always local, always uses the canonical clauses, and
 never uses multi-shot `resume`, so the compiler specialises it
 down to a stack-allocated mutable slot (Koka's "variable
-specialization"). End result: `var counter = 0; counter :=
-@counter + 1` lowers to the same native code as a C mutable
+specialization"). End result: `var counter := 0; counter :=
+counter + 1` lowers to the same native code as a C mutable
 `int`. Full details live in Doc C; for Doc B it is enough to
 know the ergonomy is free.
 
@@ -1406,12 +1406,12 @@ code — no `handle` in sight:
 
 ```kai
 fn sum_costs(events: [Event]) : Int / Console {
-  var total = 0
+  var total := 0
   each(events, (e) => {
-    total := @total + e.cost
-    Console.print("running: #{@total}")
+    total := total + e.cost
+    Console.print("running: #{total}")
   })
-  @total
+  total
 }
 ```
 
@@ -1432,8 +1432,8 @@ fn tokenise(src: String) : (AST, Int) {
 `parse_tracking_cursor` has signature `(String) -> AST /
 State[Int]`; inside the `with_state` body the default `State`
 capability name is in scope, so calls look like `State.get()` /
-`State.set(v)` (the `@` / `:=` sugar needs an `as`-bound name,
-per §*Syntax note: capability read/write sugar* rule 4).
+`State.set(v)` (the naked read / `:=` sugar needs an `as`-bound
+name, per §*Syntax note: capability read/write sugar* rule 4).
 
 `modify` is useful inside a `with_state` body (or any handler
 that keeps `State` under its default capability name), when the
@@ -1447,7 +1447,7 @@ with_state(initial_config) {
 ```
 
 For straight updates that read-then-write a rebound capability,
-write `counter := @counter + 1` directly — that shape is what
+write `counter := counter + 1` directly — that shape is what
 the sugar is for. `modify` buys the most when the transform is
 already a named function (`modify(normalise_fields)`).
 
@@ -1534,13 +1534,13 @@ The three `State`-like effects cover three different shapes of
 
 The read/write sugar follows the shape:
 
-| Effect      | `@cap` (read) | `cap := v` (write) |
-|-------------|:-------------:|:------------------:|
-| `State[T]`  | ✓             | ✓                  |
-| `Reader[T]` | ✓             | —                  |
-| `Writer[W]` | —             | —                  |
+| Effect      | naked read | `cap := v` (write) |
+|-------------|:----------:|:------------------:|
+| `State[T]`  | ✓          | ✓                  |
+| `Reader[T]` | ✓          | —                  |
+| `Writer[W]` | —          | —                  |
 
-`@cap` applies where the effect exposes a single read op;
+A naked read applies where the effect exposes a single read op;
 `cap := v` applies where the effect exposes a value-replacing
 `set` op (the State pattern, not the Writer accumulation
 pattern).
@@ -1620,7 +1620,7 @@ or short-circuit.
 > helpers; they DO NOT travel through the handler stack. A user-
 > installed `with Mutable { ... }` therefore observes only the
 > qualified `Mutable.array_*` form. Stdlib-internal `array_*`
-> calls (the desugars in `var x = init`, `a[i] := v`, the
+> calls (the desugars in `var x := init`, `a[i] := v`, the
 > `array_*` bridge module) bypass observers entirely. A future
 > lane may rewrite bare-builtin calls through the handler stack
 > when a user handler is present; until then, test harnesses that
@@ -1659,7 +1659,7 @@ function body once to classify each demand as local (the target
 Array was constructed in this function and never escapes via a
 non-`array_*` call) or external (anything else). A function
 whose every demand is local has `Mutable` *masked* from its
-inferred row — the same way `var x = init` masks `State[T]` at
+inferred row — the same way `var x := init` masks `State[T]` at
 the surrounding block boundary. A function with even one
 external demand keeps `Mutable` and must declare it.
 
@@ -1670,11 +1670,11 @@ external demand keeps `Mutable` and must declare it.
 ```kai
 fn build_circle(verts: Int) : Array[Real] {
   let f = array_make(verts * 2, 0.0)   # local
-  var i = 0
+  var i := 0
   repeat(verts) {
-    f[@i * 2]     := raylib.cos(...)   # array_set on LOCAL f
-    f[@i * 2 + 1] := raylib.sin(...)
-    i := @i + 1
+    f[i * 2]     := raylib.cos(...)   # array_set on LOCAL f
+    f[i * 2 + 1] := raylib.sin(...)
+    i := i + 1
   }
   f                                     # returned; caller never witnesses the mutation
 }
@@ -1701,13 +1701,13 @@ the call returns. Omitting the row is a type error with the
 
 ```kai
 fn draw_buffer(buf: Array[Int]) : Unit / Ffi {
-  var i = 0
+  var i := 0
   repeat(buf_len) {
-    let n = buf[@i]   # array_get — pure read, never observable
+    let n = buf[i]   # array_get — pure read, never observable
     if n < max_iter {
       raylib.draw_rectangle(..., color_for(n))
     }
-    i := @i + 1
+    i := i + 1
   }
 }
 ```
@@ -1737,7 +1737,7 @@ keep mutation inline inside the constructing function.
   Mutation through a parameter / capture / global is observable
   and therefore in the row.
 - **`var` precedent**: kaikai already masks `State[T]` for
-  `var x = init` because the State doesn't escape the block. The
+  `var x := init` because the State doesn't escape the block. The
   same logic applies to `Array[T]` whose lifetime is bounded by
   the function body.
 
@@ -1746,22 +1746,22 @@ keep mutation inline inside the constructing function.
 ```kai
 fn fill_squares(n: Int) : Array[Int] {
   let xs = array_make(n, 0)
-  var i = 0
+  var i := 0
   repeat(n) {
-    xs[@i] := @i * @i   # local Array — Mutable masked
-    i := @i + 1
+    xs[i] := i * i   # local Array — Mutable masked
+    i := i + 1
   }
   xs
 }
 
 fn sum(xs: Array[Int]) : Int {
-  var total = 0
-  var i = 0
+  var total := 0
+  var i := 0
   repeat(array_length(xs)) {
-    total := @total + xs[@i]   # array_get — never raises Mutable
-    i := @i + 1
+    total := total + xs[i]   # array_get — never raises Mutable
+    i := i + 1
   }
-  @total
+  total
 }
 
 fn set_first(xs: Array[Int], v: Int) : Unit / Mutable {
@@ -1883,12 +1883,12 @@ coroutines, Eio.
 
 ```kai
 fn crunch(n: Int) : Int / Spawn + Cancel {
-  var total = 0
+  var total := 0
   each(range(0, n), (i) => {
-    total := @total + expensive(i)
+    total := total + expensive(i)
     if i % 1000 == 0 { Spawn.yield() }    # cancellation point
   })
-  @total
+  total
 }
 ```
 
@@ -2081,8 +2081,8 @@ A one-shot codemod (`kai fmt --upgrade-effects`) performs the
 mechanical conversion (`print` → `Console.print`, etc., plus
 effect-row updates on signatures). It ships in m7a alongside the
 first type checker that can see effects; migration to the m7b
-sugars (`a[i]`, `@counter`, `var x = 0`) is a separate pass,
-done by hand or by a second codemod. Implementation detail
+sugars (`a[i]`, naked cell read, `var x := 0`) is a separate
+pass, done by hand or by a second codemod. Implementation detail
 lives in Doc C.
 
 ## `main` and the runtime
@@ -2219,8 +2219,9 @@ Ffi                                   (always innermost, compiler-synthesised)
    *Decided:* m7a. The codemod rewrites bare builtins to their
    explicit effect form (`print` → `Console.print`, etc.) and
    adds the corresponding rows to signatures. Migration to the
-   m7b sugars (`a[i]`, `@counter`, `var x = 0`) is a separate
-   pass and can be done by hand or by a second codemod later.
+   m7b sugars (`a[i]`, naked cell read, `var x := 0`) is a
+   separate pass and can be done by hand or by a second codemod
+   later.
 
 5. **Exit-code shape of `main`.** `fn main() : Int / Io` is
    accepted; is it idiomatic, or should the convention be
@@ -2262,8 +2263,9 @@ Ffi                                   (always innermost, compiler-synthesised)
   Doc B catalog.
 
 - **`docs/syntax-sugars.md`** — future consolidation of the
-  call-site sugars decided in Doc B (trailing lambdas, `@cap` /
-  `cap := v`, `var x = init`, `a[i]` / `a[i] := v`). These are
+  call-site sugars decided in Doc B (trailing lambdas, naked
+  cell read / `cap := v`, `var x := init`, `a[i]` / `a[i] := v`).
+  These are
   general language features, not effect-specific; Doc B introduces
   them next to the effects that motivate them, but a standalone
   syntax spec avoids scattering the grammar across effect docs.
@@ -2285,8 +2287,8 @@ radius tractable:
   (Doc A §*Out of scope for v1* item 3 amended), trailing
   lambdas for call-site syntax (`try { body }`, `with_state(0)
   { body }`, `nursery { n -> ... }`), capability read/write
-  sugar (`@counter` for `State.get`/`Reader.ask`; `counter :=
-  v` for `State.set`), local mutable cells (`var x = 0`),
+  sugar (naked `counter` for `State.get`/`Reader.ask`; `counter
+  := v` for `State.set`), local mutable cells (`var x := 0`),
   array indexing sugar (`a[i]` / `a[i] := v` over
   `Mutable.array_{get,set}`), `Reader[T]` / `Writer[W]` as
   their own effects (Open question #2 resolved in their

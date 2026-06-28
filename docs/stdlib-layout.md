@@ -223,7 +223,7 @@ construct, selfhost breaks.
 
 > Why this split is intentional: kaikai-minimal is **the bootstrap
 > language**, not "kaikai for beginners". Effects, row polymorphism,
-> and the operator sugars (`++`, `@cap`, trailing lambdas) are
+> and the operator sugars (`++`, naked cell read, trailing lambdas) are
 > full-kaikai by design — they cannot land in kaikai-minimal
 > without breaking Tier 1 principle 3 ("fast compilation, LL(1)
 > grammar with minor bookkeeping"). The right layer for those
@@ -399,8 +399,8 @@ Used with the m7b §5 double-trailing-lambda sugar for the natural
 Koka feel:
 
 ```kai
-while  { @i > 0 }  { i := @i - 1; io.println("#{@i}") }
-until  { @done }   { process_one() }
+while  { i > 0 }  { i := i - 1; io.println("#{i}") }
+until  { done }   { process_one() }
 repeat(10)         { io.println("hi") }
 forever            { handle_message() }
 ```

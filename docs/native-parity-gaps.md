@@ -35,7 +35,7 @@
 > bisect to ONE trigger: a closure that captures TWO OR MORE `__alias_id__<a>`
 > handler-id sentinels hangs the native fiber dispatch BEFORE its body runs.
 > Minimal repro (~10 lines): two `var` cells + a `loop.while` whose body writes
-> BOTH (`other := @other+1; i := @i+1`) hangs; the body-closure then captures
+> BOTH (`other := other+1; i := i+1`) hangs; the body-closure then captures
 > `[__alias_id__other, __alias_id__i]`. With ONE alias capture (body writes only
 > `i`) it runs; with TWO non-alias captures (`() => a + b` over two `let`s) it
 > also runs — the failure is specific to MULTIPLE handler-id captures in one

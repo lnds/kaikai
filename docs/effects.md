@@ -618,7 +618,7 @@ algebraic-effects literature. It generalises to `Reader[T]`,
 covered effect-by-effect in `docs/effects-stdlib.md`.
 
 The same *masking-at-scope-boundary* idea extends from `State[T]`
-(masked at the `var x = init` block) to `Mutable` (masked at the
+(masked at the `var x := init` block) to `Mutable` (masked at the
 function boundary when the `Array[T]` is constructed locally and
 never escapes — see `docs/effects-stdlib.md` §`Mutable`
 *Observable-effects discipline*). In both cases the row tracks

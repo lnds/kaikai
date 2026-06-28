@@ -139,10 +139,10 @@ fn main() : Int / Stdout = {
   let x = 42                                   # immutable
   let y: Int = 100                             # with annotation
 
-  var counter = 0                              # local mutable cell
+  var counter := 0                             # local mutable cell
                                                # (State[Int] handler)
-  counter := @counter + 1                      # write needs `:=`
-  let result = @counter                        # read needs `@`
+  counter := counter + 1                       # write needs `:=`
+  let result = counter                         # naked read
   Stdout.print("x=#{int_to_string(x)} y=#{int_to_string(y)} c=#{int_to_string(result)}")
   0
 }
@@ -195,12 +195,12 @@ fn classify(n: Int) : String = {
 }
 
 fn count_to(n: Int) : Int / Stdout = {
-  var i = 0
-  while { @i < n } {
-    Stdout.print("#{int_to_string(@i)}")
-    i := @i + 1
+  var i := 0
+  while { i < n } {
+    Stdout.print("#{int_to_string(i)}")
+    i := i + 1
   }
-  @i
+  i
 }
 
 fn main() : Int / Stdout = {
@@ -299,7 +299,7 @@ Operators by precedence (looser at the bottom):
 ```text
 postfix       f(args)  a.b  a[i]  expr!  trailing-lambda
 power         a ^ b                                  (right-assoc)
-unary         -x  not x  @cap
+unary         -x  not x
 multiplicative *  /  %
 additive      +  -
 concat        ++                                     (right-assoc)
@@ -474,21 +474,22 @@ exponent there is a unit-level integer literal — see `kai info units`.
 
 ## Capability sugar
 
-Capability read / write — `@cap` and `cap := v`:
+Capability read / write — naked read and `cap := v`:
 
 ```kaikai
 fn main() : Int / Stdout = {
-  var tally = 0
-  tally := @tally + 1                          # cap := v writes
-  tally := @tally + 1                          # @cap reads
-  let v = @tally
+  var tally := 0
+  tally := tally + 1                           # `:=` writes
+  tally := tally + 1                           # `tally` reads naked
+  let v = tally
   Stdout.print("tally=#{int_to_string(v)}")
   v
 }
 ```
 
-`@cap` does not currently flatten through string interpolation
-(`"#{@cap}"`); bind to a `let` first.
+`:=` is the single mark of mutability: `var x := init` declares the
+cell, `x := v` writes it, and a bare `x` reads it. A naked cell read
+flows through string interpolation (`"#{tally}"`) like any other name.
 
 Array indexing — `a[i]` reads, `a[i] := v` writes:
 
