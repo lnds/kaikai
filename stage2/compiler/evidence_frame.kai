@@ -1,6 +1,6 @@
 # compiler/evidence_frame.kai — the per-function evidence-frame ABI.
 #
-# One hidden frame pointer per function whose row demands a user effect — a
+# One hidden frame pointer per function whose row demands an effect — a
 # Koka-style evidence vector whose slots the call site fills per its own
 # supplier classification. The perform site reads its slot by index instead
 # of the by-name walk; the walk stays live as the retreatable fallback.
@@ -11,9 +11,10 @@
 # its callee. The frame ABI is a property of the row's distinct effect
 # labels — exactly the param set the signature carries.
 #
-# Builtin-default effects (Stdout/Stderr/Stdin/Mutable …) stay on the by-name
-# walk and take no slot; only user effects ride the frame. `frame_effect_is_user`
-# draws the line.
+# Every declared effect rides the frame, builtin-default ones included: the
+# default-bearing property no longer decides whether an effect uses the frame,
+# only which supplier fills its slot (a startup-minted default node when no
+# lexical handler is in scope). `frame_effect_is_carried` draws the line.
 #
 # Single-line `#[doc(...)]` only — kaic1 rejects triple-quoted attribute
 # strings in the concatenated bundle.
@@ -29,7 +30,7 @@ import compiler.evidence_inject
 # and the call site (the callee's frame) resolve the same layout.
 pub type FnEvidenceFrame = FEF(String, [String])
 
-#[doc("evidence-frame: per function, the distinct USER-effect labels its row demands, in canonical slot order, keyed by emitted symbol.")]
+#[doc("evidence-frame: per function, the distinct effect labels its row demands, in canonical slot order, keyed by emitted symbol.")]
 pub fn build_evidence_frames(decls: [Decl]) : [FnEvidenceFrame] =
   build_frames_loop(decls, decls, [])
 
@@ -41,7 +42,7 @@ fn build_frames_loop(all: [Decl], ds: [Decl], acc: [FnEvidenceFrame]) : [FnEvide
     # `main` wrapper installs (found via the live walk). So it never takes
     # a frame param — an empty slot list keeps its performs on the walk.
     DFn(_, fname, _, _, _, row, _, _, _, mo) -> {
-      let slots = if fname == "main" { [] } else { frame_user_slots(all, row) }
+      let slots = if fname == "main" { [] } else { frame_carried_slots(all, row) }
       build_frames_loop(all, rest, [FEF(frame_c_sym(fname, mo), slots), ...acc])
     }
     _ -> build_frames_loop(all, rest, acc)
@@ -56,11 +57,11 @@ fn frame_c_sym(name: String, mo: Option[String]) : String = match mo {
   Some(m) -> string_concat(m, string_concat("__", name))
 }
 
-# The slot layout: distinct effect labels in the row, KEPT only when the
-# effect is a transported user effect. Builtin-default effects stay on the
-# walk (the verifiable cut) so they never occupy a slot.
-fn frame_user_slots(decls: [Decl], row: RowExpr) : [String] =
-  frame_keep_user(frame_row_labels(row), decls, [])
+# The slot layout: distinct effect labels in the row, KEPT when the effect is
+# a declared effect (every one rides the frame; the supplier is decided per
+# call site, not whether it takes a slot).
+fn frame_carried_slots(decls: [Decl], row: RowExpr) : [String] =
+  frame_keep_carried(frame_row_labels(row), decls, [])
 
 fn frame_row_labels(row: RowExpr) : [String] = match row {
   REmpty       -> []
@@ -73,22 +74,25 @@ fn frame_label_names(ls: [RowLabel]) : [String] = match ls {
   [l, ...rest] -> match l { RL(name, _) -> [name, ...frame_label_names(rest)] }
 }
 
-fn frame_keep_user(labels: [String], decls: [Decl], seen: [String]) : [String] = match labels {
+fn frame_keep_carried(labels: [String], decls: [Decl], seen: [String]) : [String] = match labels {
   []           -> []
   [l, ...rest] ->
-    if frame_has(seen, l) { frame_keep_user(rest, decls, seen) }
-    else if frame_effect_is_user(l, decls) { [l, ...frame_keep_user(rest, decls, [l, ...seen])] }
-    else { frame_keep_user(rest, decls, [l, ...seen]) }
+    if frame_has(seen, l) { frame_keep_carried(rest, decls, seen) }
+    else if frame_effect_is_carried(l, decls) { [l, ...frame_keep_carried(rest, decls, [l, ...seen])] }
+    else { frame_keep_carried(rest, decls, [l, ...seen]) }
 }
 
-# A transported user effect: declared as an `effect` and not a builtin with
-# a startup default. A user effect rides the frame with or without its own
-# `default {}` — the default is a startup value loaded into the slot at the
-# terminal call site, where "default or handle" is decided per call site,
-# not a reason to stay on the walk.
-#[doc("evidence-frame: true when an effect is a transported user effect (frame-carried), false for a builtin-default effect that stays on the by-name walk.")]
-pub fn frame_effect_is_user(eff: String, decls: [Decl]) : Bool =
-  frame_is_declared_effect(eff, decls) and not frame_is_builtin_default(eff)
+# A frame-carried effect: declared as an `effect` whose evidence is transportable
+# by value. A builtin-default IO effect (`Stdout`/`File`/`Clock`/`Mutable` …)
+# rides the frame; the `default {}` property decides only which supplier fills
+# the slot. The exception is an effect whose evidence the scheduler installs
+# per-fiber (cancel_pad, link-set, mailbox, nursery) — transporting it would
+# carry a parent's handler across a `spawn`, where capabilities must not cross.
+# Those stay on the dynamic walk so a perform inside a fiber binds the fiber's
+# own disposition. `Ffi` declares no ops and is routed around the dispatcher.
+#[doc("evidence-frame: true when an effect's evidence is transportable by value; false for an effect the scheduler installs per-fiber (it stays on the dynamic walk so it does not cross a spawn).")]
+pub fn frame_effect_is_carried(eff: String, decls: [Decl]) : Bool =
+  frame_is_declared_effect(eff, decls) and not frame_is_fiber_local(eff)
 
 fn frame_is_declared_effect(eff: String, decls: [Decl]) : Bool = match decls {
   []           -> false
@@ -98,19 +102,10 @@ fn frame_is_declared_effect(eff: String, decls: [Decl]) : Bool = match decls {
   }
 }
 
-# True for an effect the runtime resolves without a user handler, so it
-# stays on the by-name walk and takes no frame slot.
-fn frame_is_builtin_default(eff: String) : Bool =
-  frame_has(frame_builtin_effects(), eff)
-
-# The canonical default-handler effects plus the runtime-provided
-# concurrency effects (`Actor` is installed by the actor runtime, not a user
-# handler) and the `Console` surface alias the `Stdout`/`Stderr`/`Stdin` trio
-# desugars from. All resolve through the walk, never a frame slot.
-fn frame_builtin_effects() : [String] =
-  ["Stdout", "Stderr", "Stdin", "Fail", "Env", "File", "Clock", "Random",
-   "SecureRandom", "NetTcp", "Signal", "Process", "Log", "Mutable", "Cancel",
-   "Link", "Monitor", "Spawn", "Actor", "Console", "Ffi"]
+# Effects whose evidence the scheduler installs per-fiber, so it must not ride a
+# frame slot (that would transport a parent's handler across a `spawn`).
+fn frame_is_fiber_local(eff: String) : Bool =
+  frame_has(["Cancel", "Link", "Monitor", "Spawn", "Actor"], eff)
 
 # The slot index of `eff` in a function's frame, or -1 when the frame does
 # not carry it (the perform site then falls back to the by-name walk).
