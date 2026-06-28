@@ -976,8 +976,9 @@ EOF
 #
 # `c` is the portable C-text backend — the bootstrap path and the parity
 # oracle, supported across the whole corpus. It stays reachable via
-# `--backend=c` / `KAI_BACKEND=c` and remains the backend every dev-loop
-# subcommand (test / bench / check / watch) uses.
+# `--backend=c` / `KAI_BACKEND=c`. The dev-loop subcommands `test` /
+# `bench` / `watch` now default to `native` like build/run; only `check`
+# still pins `c` (its native runner is unbuilt).
 #
 # Graceful degradation (the load-bearing flip subtlety): a kaic2 built
 # WITHOUT libLLVM (the cc-only bootstrap path — Tier 1: stage 0/1 build
@@ -1022,11 +1023,13 @@ compile_to_binary() {
   #                                 flag/env (explicit) or the default
   #                                 (implicit). Drives graceful
   #                                 degradation on a C-only kaic2.
-  # `kai build` / `kai run` always pass both, resolved through
-  # resolve_backend() (default since Lane 1.5: `native`). The dev-loop
-  # subcommands (`kai test` / `bench` / `check` / watch) call without
-  # either flag and so use the `c` fallback directly — they stay on the
-  # C oracle, unaffected by the flip.
+  # `kai build` / `kai run` and the dev-loop subcommands `kai test` /
+  # `bench` / `watch` all pass both flags, resolved through
+  # resolve_backend() (default: `native`) — the native backend now runs
+  # test blocks and benches, so they no longer need `cc`. Only `kai
+  # check` still passes `--backend c` explicitly (the native check runner
+  # is not built yet). The `c` fallback below stays for any caller that
+  # passes neither flag.
   backend="c"
   backend_origin="explicit"
   while :; do
@@ -1624,19 +1627,33 @@ cmd_test() {
   # Issue #318: parse `--include-prelude-tests` here so we can forward
   # it to kaic2 alongside the implicit `--test`. Any non-flag argument
   # is the source file; everything else gets passed straight through.
+  # `--backend` is consumed here (NOT forwarded) so `kai test` resolves
+  # the backend through resolve_backend() — native by default, the same
+  # as `kai build`/`run`, now that the native backend runs test blocks.
   extra_flags=""
+  backend_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage_test; return 0 ;;
       --include-prelude-tests) extra_flags="$extra_flags --include-prelude-tests"; shift ;;
+      --backend) shift; backend_cli="$1"; shift ;;
+      --backend=*) backend_cli="${1#--backend=}"; shift ;;
       --) shift; break ;;
       -*) extra_flags="$extra_flags $1"; shift ;;
       *) break ;;
     esac
   done
+  # Resolve the backend (native by default). An explicit choice is
+  # propagated to the recursive `kai test` invocations so the whole walk
+  # honours it; the implicit native default is re-resolved per package.
+  resolved_be="$(resolve_backend "$backend_cli")"
+  backend="${resolved_be%% *}"; backend_origin="${resolved_be#* }"
+  rec_backend_flag=""
+  [ -n "$backend_cli" ] && rec_backend_flag="--backend $backend_cli"
   case "${1:-}" in
     "./..."|"...") shift
-        run_tests_recursively "$extra_flags"
+        # shellcheck disable=SC2086
+        run_tests_recursively "$rec_backend_flag $extra_flags"
         return $? ;;
     "") src="$(resolve_package_spec "")"
         [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
@@ -1649,7 +1666,7 @@ cmd_test() {
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-t"
   # shellcheck disable=SC2086
-  compile_to_binary "$src" "$tmp" "$bin" "test" --test $extra_flags
+  compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "test" --test $extra_flags
 
   # Tests-dir auto-discovery: when the resolved entry sits next to a
   # `tests/` sibling directory containing `*.kai` files (the
@@ -1679,7 +1696,7 @@ cmd_test() {
     tbin="$tmp/$(basename "$tf" .kai)-t"
     printf '== kai test %s\n' "$tf" >&2
     # shellcheck disable=SC2086
-    compile_to_binary "$tf" "$tmp" "$tbin" "test" --test $extra_flags
+    compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$tf" "$tmp" "$tbin" "test" --test $extra_flags
     "$tbin" || agg_status=$?
   done
   return $agg_status
@@ -1687,6 +1704,7 @@ cmd_test() {
 
 cmd_bench() {
   iters_override=""
+  backend_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage_bench; return 0 ;;
@@ -1694,6 +1712,8 @@ cmd_bench() {
         [ $# -ge 2 ] || die "--iters requires a value (see 'kai bench --help')"
         iters_override="$2"; shift 2 ;;
       --iters=*) iters_override="${1#--iters=}"; shift ;;
+      --backend) shift; backend_cli="$1"; shift ;;
+      --backend=*) backend_cli="${1#--backend=}"; shift ;;
       --) shift; break ;;
       -*) die "unknown option: $1 (see 'kai bench --help')" ;;
       *) break ;;
@@ -1716,7 +1736,9 @@ cmd_bench() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-b"
-  compile_to_binary "$src" "$tmp" "$bin" "bench" --bench
+  resolved_be="$(resolve_backend "$backend_cli")"
+  backend="${resolved_be%% *}"; backend_origin="${resolved_be#* }"
+  compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "bench" --bench
   if [ -n "$iters_override" ]; then
     KAI_BENCH_ITERS="$iters_override" "$bin"
   else
@@ -1737,7 +1759,14 @@ cmd_check() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   bin="$tmp/$(basename "$src" .kai)-c"
-  compile_to_binary "$src" "$tmp" "$bin" "check" --prop-check
+  # `kai check` stays on the C backend explicitly: the native check
+  # runner is not built yet. A check block's `with`-clause params are
+  # generated and shrunk by the runtime, which needs the parametrised
+  # predicate + shrink loop the native lowering does not emit (the
+  # `lower_runner_loop` test/bench path skips DCheck). test/bench are
+  # native by default; check is the one dev-loop subcommand that still
+  # requires `cc`.
+  compile_to_binary --backend c --backend-origin explicit "$src" "$tmp" "$bin" "check" --prop-check
   "$bin"
 }
 
@@ -1823,10 +1852,10 @@ file_mtime() {
 }
 
 watch_run_once() {
-  src="$1"; tmp="$2"
+  src="$1"; tmp="$2"; backend="$3"; backend_origin="$4"
   bin="$tmp/$(basename "$src" .kai)"
   ts="$(date '+%H:%M:%S')"
-  if compile_to_binary "$src" "$tmp" "$bin" "watch" 2>"$tmp/err"; then
+  if compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "watch" 2>"$tmp/err"; then
     printf '\n[%s] Build OK\n' "$ts"
     "$bin" || printf '\n[%s] Program exited with status %d\n' "$ts" "$?"
   else
@@ -1836,6 +1865,14 @@ watch_run_once() {
 }
 
 cmd_watch() {
+  backend_cli=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --backend) shift; backend_cli="$1"; shift ;;
+      --backend=*) backend_cli="${1#--backend=}"; shift ;;
+      *) break ;;
+    esac
+  done
   case "${1:-}" in
     -h|--help) usage_watch; return 0 ;;
     "") src="$(resolve_package_spec "")"
@@ -1849,6 +1886,8 @@ cmd_watch() {
   abs_src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
+  resolved_be="$(resolve_backend "$backend_cli")"
+  watch_backend="${resolved_be%% *}"; watch_origin="${resolved_be#* }"
 
   printf 'kaikai watch — recompiling on every save\n'
   printf 'Watching: %s\n' "$abs_src"
@@ -1858,11 +1897,11 @@ cmd_watch() {
     printf '(backend: mtime poll @ 500ms — install fswatch for lower latency)\n'
   fi
 
-  watch_run_once "$abs_src" "$tmp"
+  watch_run_once "$abs_src" "$tmp" "$watch_backend" "$watch_origin"
 
   if command -v fswatch >/dev/null 2>&1; then
     fswatch -o "$abs_src" | while read -r _; do
-      watch_run_once "$abs_src" "$tmp"
+      watch_run_once "$abs_src" "$tmp" "$watch_backend" "$watch_origin"
     done
   else
     last="$(file_mtime "$abs_src")"
@@ -1871,7 +1910,7 @@ cmd_watch() {
       cur="$(file_mtime "$abs_src")"
       if [ "$cur" != "$last" ]; then
         last="$cur"
-        watch_run_once "$abs_src" "$tmp"
+        watch_run_once "$abs_src" "$tmp" "$watch_backend" "$watch_origin"
       fi
     done
   fi
