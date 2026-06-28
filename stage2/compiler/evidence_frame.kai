@@ -1,0 +1,145 @@
+# compiler/evidence_frame.kai — the per-function evidence-frame ABI.
+#
+# One hidden frame pointer per function whose row demands a user effect — a
+# Koka-style evidence vector whose slots the call site fills per its own
+# supplier classification. The perform site reads its slot by index instead
+# of the by-name walk; the walk stays live as the retreatable fallback.
+#
+# Frame slots are derived from the ROW, not from local op calls: a pure
+# forwarder (`mid() : T / E` whose body only calls a callee that performs E)
+# has no dotted op call, yet its row demands E and it must thread evidence to
+# its callee. The frame ABI is a property of the row's distinct effect
+# labels — exactly the param set the signature carries.
+#
+# Builtin-default effects (Stdout/Stderr/Stdin/Mutable …) stay on the by-name
+# walk and take no slot; only user effects ride the frame. `frame_effect_is_user`
+# draws the line.
+#
+# Single-line `#[doc(...)]` only — kaic1 rejects triple-quoted attribute
+# strings in the concatenated bundle.
+
+import compiler.util
+import compiler.ast
+import compiler.evidence
+import compiler.evidence_inject
+
+# The distinct USER-effect labels a function's row demands, in canonical
+# (row, deduped) order — the slot layout caller and callee agree on. Keyed
+# by the function's emitted symbol so both the perform site (its own frame)
+# and the call site (the callee's frame) resolve the same layout.
+pub type FnEvidenceFrame = FEF(String, [String])
+
+#[doc("evidence-frame: per function, the distinct USER-effect labels its row demands, in canonical slot order, keyed by emitted symbol.")]
+pub fn build_evidence_frames(decls: [Decl]) : [FnEvidenceFrame] =
+  build_frames_loop(decls, decls, [])
+
+fn build_frames_loop(all: [Decl], ds: [Decl], acc: [FnEvidenceFrame]) : [FnEvidenceFrame] = match ds {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    # `main` is the root of the transport: it has no caller to fill a
+    # frame, and its row effects are satisfied by the startup defaults the
+    # `main` wrapper installs (found via the live walk). So it never takes
+    # a frame param — an empty slot list keeps its performs on the walk.
+    DFn(_, fname, _, _, _, row, _, _, _, mo) -> {
+      let slots = if fname == "main" { [] } else { frame_user_slots(all, row) }
+      build_frames_loop(all, rest, [FEF(frame_c_sym(fname, mo), slots), ...acc])
+    }
+    _ -> build_frames_loop(all, rest, acc)
+  }
+}
+
+# The emitted C symbol — keyed to match `EmitCtx.cur_enc_fn` so a perform
+# site finds its own frame. Mirrors `emit_shared.c_sym` (which lives later
+# in the bundle, so it cannot be imported here without a cycle).
+fn frame_c_sym(name: String, mo: Option[String]) : String = match mo {
+  None    -> name
+  Some(m) -> string_concat(m, string_concat("__", name))
+}
+
+# The slot layout: distinct effect labels in the row, KEPT only when the
+# effect is a transported user effect. Builtin-default effects stay on the
+# walk (the verifiable cut) so they never occupy a slot.
+fn frame_user_slots(decls: [Decl], row: RowExpr) : [String] =
+  frame_keep_user(frame_row_labels(row), decls, [])
+
+fn frame_row_labels(row: RowExpr) : [String] = match row {
+  REmpty       -> []
+  RClosed(ls)  -> frame_label_names(ls)
+  ROpen(_, ls) -> frame_label_names(ls)
+}
+
+fn frame_label_names(ls: [RowLabel]) : [String] = match ls {
+  []           -> []
+  [l, ...rest] -> match l { RL(name, _) -> [name, ...frame_label_names(rest)] }
+}
+
+fn frame_keep_user(labels: [String], decls: [Decl], seen: [String]) : [String] = match labels {
+  []           -> []
+  [l, ...rest] ->
+    if frame_has(seen, l) { frame_keep_user(rest, decls, seen) }
+    else if frame_effect_is_user(l, decls) { [l, ...frame_keep_user(rest, decls, [l, ...seen])] }
+    else { frame_keep_user(rest, decls, [l, ...seen]) }
+}
+
+# A transported user effect: declared as an `effect` and not a builtin with
+# a startup default. A user effect rides the frame with or without its own
+# `default {}` — the default is a startup value loaded into the slot at the
+# terminal call site, where "default or handle" is decided per call site,
+# not a reason to stay on the walk.
+#[doc("evidence-frame: true when an effect is a transported user effect (frame-carried), false for a builtin-default effect that stays on the by-name walk.")]
+pub fn frame_effect_is_user(eff: String, decls: [Decl]) : Bool =
+  frame_is_declared_effect(eff, decls) and not frame_is_builtin_default(eff)
+
+fn frame_is_declared_effect(eff: String, decls: [Decl]) : Bool = match decls {
+  []           -> false
+  [d, ...rest] -> match d {
+    DEffect(_, n, _, _, _, _, _, _) -> if n == eff { true } else { frame_is_declared_effect(eff, rest) }
+    _ -> frame_is_declared_effect(eff, rest)
+  }
+}
+
+# True for an effect the runtime resolves without a user handler, so it
+# stays on the by-name walk and takes no frame slot.
+fn frame_is_builtin_default(eff: String) : Bool =
+  frame_has(frame_builtin_effects(), eff)
+
+# The canonical default-handler effects plus the runtime-provided
+# concurrency effects (`Actor` is installed by the actor runtime, not a user
+# handler) and the `Console` surface alias the `Stdout`/`Stderr`/`Stdin` trio
+# desugars from. All resolve through the walk, never a frame slot.
+fn frame_builtin_effects() : [String] =
+  ["Stdout", "Stderr", "Stdin", "Fail", "Env", "File", "Clock", "Random",
+   "SecureRandom", "NetTcp", "Signal", "Process", "Log", "Mutable", "Cancel",
+   "Link", "Monitor", "Spawn", "Actor", "Console", "Ffi"]
+
+# The slot index of `eff` in a function's frame, or -1 when the frame does
+# not carry it (the perform site then falls back to the by-name walk).
+#[doc("evidence-frame: slot index of an effect in a function's frame, or -1 when the frame does not carry it (perform falls back to the walk).")]
+pub fn frame_slot_index(frames: [FnEvidenceFrame], fsym: String, eff: String) : Int =
+  match frame_lookup(frames, fsym) {
+    Some(slots) -> frame_index_of(slots, eff, 0)
+    None        -> 0 - 1
+  }
+
+# The slot labels of a function's frame (its ABI arity), or [] when unknown.
+#[doc("evidence-frame: the ordered slot labels of a function's frame (its ABI arity), or [] when the symbol is unknown.")]
+pub fn frame_slots_of(frames: [FnEvidenceFrame], fsym: String) : [String] =
+  match frame_lookup(frames, fsym) {
+    Some(slots) -> slots
+    None        -> []
+  }
+
+fn frame_lookup(frames: [FnEvidenceFrame], fsym: String) : Option[[String]] = match frames {
+  []           -> None
+  [f, ...rest] -> match f { FEF(n, slots) -> if n == fsym { Some(slots) } else { frame_lookup(rest, fsym) } }
+}
+
+fn frame_index_of(slots: [String], eff: String, i: Int) : Int = match slots {
+  []           -> 0 - 1
+  [s, ...rest] -> if s == eff { i } else { frame_index_of(rest, eff, i + 1) }
+}
+
+fn frame_has(xs: [String], s: String) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> if h == s { true } else { frame_has(rest, s) }
+}

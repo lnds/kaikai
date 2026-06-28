@@ -11778,10 +11778,15 @@ static void *kai_llvm_module_new(KaiValue *name) {
  * handles (stable LLVM pointers), never pointers into the table itself. */
 typedef struct { char *name; void *alloca; int slot; } KaiNReg;
 typedef struct { char *label; void *bb; } KaiNBlk;
+/* Evidence-frame ABI table: per fn symbol, the ordered user-effect slot
+ * labels its row demands. Off-RC, strdup'd; resolved by symbol from the
+ * signature, call site, and perform. */
+typedef struct { char *sym; char **slots; int nslots; } KaiNFrame;
 typedef struct {
     void *m, *b, *ptrt, *i64t, *i32t, *voidt, *f64t, *fnval;
     KaiNReg *regs; int nregs, regcap;
     KaiNBlk *blks; int nblks, blkcap;
+    KaiNFrame *frames; int nframes, framecap;
     int ok;
     int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
 } KaiNativeCtx;
@@ -11799,8 +11804,68 @@ static void *kai_native_ctx_new(void *m) {
     c->fnval = NULL;
     c->regs = NULL; c->nregs = 0; c->regcap = 0;
     c->blks = NULL; c->nblks = 0; c->blkcap = 0;
+    c->frames = NULL; c->nframes = 0; c->framecap = 0;
     c->ok = 1; c->in_fn = 0;
     return (void *) c;
+}
+/* Append `eff` to fn `sym`'s frame slot list, in canonical order. Returns
+ * kai_unit() — the prim ABI never returns C void. */
+static KaiValue *kai_native_ctx_add_frame_slot(void *cv, KaiValue *symv, KaiValue *effv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *eff = effv->as.s.bytes;
+    KaiNFrame *fr = NULL;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) { fr = &c->frames[i]; break; }
+    if (!fr) {
+        if (c->nframes == c->framecap) {
+            c->framecap = c->framecap ? c->framecap * 2 : 16;
+            c->frames = (KaiNFrame *) realloc(c->frames, (size_t) c->framecap * sizeof(KaiNFrame));
+        }
+        fr = &c->frames[c->nframes++];
+        fr->sym = strdup(sym); fr->slots = NULL; fr->nslots = 0;
+    }
+    fr->slots = (char **) realloc(fr->slots, (size_t) (fr->nslots + 1) * sizeof(char *));
+    fr->slots[fr->nslots++] = strdup(eff);
+    if (symv) kai_decref(symv);
+    if (effv) kai_decref(effv);
+    return kai_unit();
+}
+static int64_t kai_native_ctx_frame_slot_count(void *cv, KaiValue *symv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    int64_t r = 0;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) { r = (int64_t) c->frames[i].nslots; break; }
+    if (symv) kai_decref(symv);
+    return r;
+}
+static KaiValue *kai_native_ctx_frame_slot_eff(void *cv, KaiValue *symv, int64_t j) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *r = "";
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) {
+            if (j >= 0 && j < c->frames[i].nslots) r = c->frames[i].slots[j];
+            break;
+        }
+    if (symv) kai_decref(symv);
+    return kai_str(r);
+}
+static int64_t kai_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValue *effv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *eff = effv->as.s.bytes;
+    int64_t r = -1;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) {
+            for (int j = 0; j < c->frames[i].nslots; j++)
+                if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
+            break;
+        }
+    if (symv) kai_decref(symv);
+    if (effv) kai_decref(effv);
+    return r;
 }
 static void *kai_native_ctx_b(void *c)     { return ((KaiNativeCtx *) c)->b; }
 static void *kai_native_ctx_m(void *c)     { return ((KaiNativeCtx *) c)->m; }
@@ -12804,6 +12869,10 @@ static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailabl
 static KaiValue *kai_native_ctx_fail(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_native_ctx_begin_fn(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_native_ctx_end_fn(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_add_frame_slot(void *c, KaiValue *s, KaiValue *e) { (void) c; (void) s; (void) e; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_frame_slot_count(void *c, KaiValue *s) { (void) c; (void) s; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_ctx_frame_slot_eff(void *c, KaiValue *s, int64_t j) { (void) c; (void) s; (void) j; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_frame_slot_index(void *c, KaiValue *s, KaiValue *e) { (void) c; (void) s; (void) e; kai_llvm_native_unavailable(); return -1; }
 static KaiValue *kai_native_ctx_add_reg(void *c, KaiValue *n, void *a, int64_t s) { (void) c; (void) n; (void) a; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_native_ctx_find_reg(void *c, KaiValue *n) { (void) c; (void) n; return kai_llvm_native_unavailable(); }
 static int64_t kai_native_ctx_reg_slot(void *c, KaiValue *n) { (void) c; (void) n; kai_llvm_native_unavailable(); return -1; }

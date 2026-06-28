@@ -96,16 +96,28 @@ fn nparams_any_raw(ps: [KParam]) : Bool = match ps {
 # legacy all-boxed `ptr (ptr × n)`. The param-type buffer is a C-side
 # `KaiLlvmBuf` (handles never ride a kaikai `[Handle]`), freed after the
 # `llvm_fn_type_n` builds the type.
-pub fn nfn_llvm_type(ctx: Handle, f: KFn) : Handle =
+pub fn nfn_llvm_type(ctx: Handle, f: KFn) : Handle = {
+  # A frame-carrying fn takes the evidence frame `ptr` as its first param;
+  # a zero slot count leaves the legacy signature unchanged.
+  let nevf = native_ctx_frame_slot_count(ctx, nfn_sym(f.sym))
   if nfn_has_raw_slot(f) {
     let rett = nslot_type(ctx, f.ret)
     let ptb = llvm_buf_new()
+    nfn_push_evf_type(ctx, ptb, nevf)
     nparam_type_push(ctx, ptb, f.params)
     let ty = llvm_fn_type_n(rett, ptb)
     llvm_buf_free(ptb); ty
   } else {
-    llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params))
+    llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params) + nfn_evf_extra(nevf))
   }
+}
+
+# Push the evidence-frame `ptr` param type when the fn carries a frame.
+fn nfn_push_evf_type(ctx: Handle, ptb: Handle, nevf: Int) : Unit =
+  if nevf > 0 { llvm_buf_push(ptb, native_ctx_ptrt(ctx)) } else { () }
+
+#[doc("1 when the frame slot count is positive (the single leading evidence-frame param), else 0.")]
+pub fn nfn_evf_extra(nevf: Int) : Int = if nevf > 0 { 1 } else { 0 }
 
 # Push each param's slot LLVM type into `ptb` (in order). Mirror of
 # `nemit_push_atoms`: the buffer is created by the CALLER in a `let`
@@ -338,7 +350,8 @@ pub fn nemit_atoms_buf(ctx: Handle, vs: [KVal]) : Handle / Console = {
   nemit_push_atoms(ctx, buf, vs); buf
 }
 
-fn nemit_push_atoms(ctx: Handle, buf: Handle, vs: [KVal]) : Unit / Console = match vs {
+#[doc("Materialise each KIR atom and push its LLVM handle into the arg buffer, in order.")]
+pub fn nemit_push_atoms(ctx: Handle, buf: Handle, vs: [KVal]) : Unit / Console = match vs {
   [] -> ()
   [v, ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_atoms(ctx, buf, rest) }
 }
@@ -442,12 +455,14 @@ pub fn nemit_allocas(ctx: Handle, specs: [RSpec]) : Unit / Console = match specs
 # Seed a normal fn's params: `store (param i) -> alloca(name)`, in order.
 # (Lambda/clause thunk ABI — args[i] / capture reads — is a later subset;
 # `PDirect` only here.)
-pub fn nemit_seed_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = match ps {
+# `evf_off` is 1 when the fn carries a leading evidence-frame param, so each
+# user param's LLVM index shifts by one; 0 otherwise.
+pub fn nemit_seed_params(ctx: Handle, ps: [KParam], fnval: Handle, evf_off: Int) : Unit / Console = match ps {
   [] -> ()
   [p, ...rest] -> match p.origin {
     PDirect(i) -> {
-      llvm_build_store(native_ctx_b(ctx), llvm_get_param(fnval, i), native_ctx_find_reg(ctx, p.name))
-      nemit_seed_params(ctx, rest, fnval)
+      llvm_build_store(native_ctx_b(ctx), llvm_get_param(fnval, i + evf_off), native_ctx_find_reg(ctx, p.name))
+      nemit_seed_params(ctx, rest, fnval, evf_off)
     }
     _ -> { nemit_unsupported(ctx, "non-direct param origin (thunk ABI = later subset)"); () }
   }
