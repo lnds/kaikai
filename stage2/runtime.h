@@ -2237,15 +2237,6 @@ static void       kai_decref(KaiValue *v);
  * kai_apply (defined further down) to invoke spawned thunks. */
 typedef struct KaiEvidence KaiEvidence;
 
-/* Issue #104 — forward decls: walk / clone heap evidence chains
- * (allocated in kai_default_spawn_spawn). The full KaiEvidence
- * struct sits further down, but kai_free_value (which holds the
- * KAI_FIBER cleanup) and kai_default_spawn_spawn are defined
- * above the struct, so these helpers let those paths drive the
- * walk without touching struct members before they're declared. */
-static void         kai_free_cloned_evidence_chain(KaiEvidence *head);
-static KaiEvidence *kai_clone_evidence_chain(KaiEvidence *src);
-
 /* m8 #3 + m8.x: fiber lifecycle states. The pre-v0.4.0 runtime ran
  * `spawn` synchronously and only ever needed NEW/DONE; the m8.x
  * cooperative scheduler (landed v0.4.0) adds READY (enqueued in the
@@ -2357,24 +2348,6 @@ struct KaiFiber {
      * the propagation walk and as a safety net in
      * kai_free_value's KAI_FIBER branch. */
     KaiMonitorNode *monitor_head;
-    /* Issue #104 — heap-cloned head of the inherited evidence chain.
-     * At spawn time the runtime walks parent->evidence_top and
-     * allocates a heap KaiEvidence for each frame, copying the
-     * fields (eff_label, handler, parent). Child's evidence_top is
-     * set to the head of this heap chain instead of sharing a
-     * pointer into parent's stack. The clone is needed because the
-     * parent's stack contents at the inherited frame addresses get
-     * overwritten by any function call the parent makes after
-     * popping those frames (printf, runtime ops, anything that
-     * reuses the same SP region) — even when the parent's stack
-     * mmap is kept alive. The lookup walk reads only eff_label and
-     * parent fields, both copied; handler is deref'd only when a
-     * frame matches, and default handlers point to static *Ev
-     * structs that outlive every fiber. Inherited user handlers
-     * whose *Ev sits on a parent's stack remain a separate
-     * concern (the *Ev itself can be overwritten the same way) —
-     * not safe across parent termination, tracked for follow-up. */
-    KaiEvidence    *cloned_evidence_chain;
     /* Issue #611 — Phase R1 reactor metadata. A parked fiber lives
      * on exactly one reactor list at a time (timer wheel, pid waiter
      * map, or file-pool waiter list), so a single intrusive link slot
@@ -2442,7 +2415,6 @@ static KaiFiber kai_main_fiber = {
     0,                   /* trap_exit — main starts opted out */
     NULL,                /* mailbox — set by with_mailbox if main uses one */
     NULL,                /* monitor_head — Monitor.monitor(...) appends here */
-    NULL,                /* cloned_evidence_chain — main never inherits */
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */
     NULL, NULL           /* nursery_top, scope_sibling_next — issue #959 */
 };
@@ -3066,14 +3038,6 @@ static void kai_free_value(KaiValue *v) {
             break;
         case KAI_FIBER:
             if (v->as.fib) {
-                /* Issue #104 — free the heap-cloned inherited
-                 * evidence chain. Each node was malloc'd in
-                 * kai_default_spawn_spawn from parent's evidence
-                 * chain at spawn time. The walk lives in a helper
-                 * defined alongside the KaiEvidence struct further
-                 * down (forward-declared above kai_free_value). */
-                kai_free_cloned_evidence_chain(v->as.fib->cloned_evidence_chain);
-                v->as.fib->cloned_evidence_chain = NULL;
                 kai_decref(v->as.fib->thunk);
                 kai_decref(v->as.fib->result);
                 /* Phase 5: free any remaining link nodes. Normally
@@ -11022,33 +10986,14 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     /* incref to retain a ref the fiber owns; the caller-side ref is
      * still the caller's to manage (Perceus decrefs at call-site exit). */
     f->thunk        = kai_incref(thunk);
-    /* Inherit parent's evidence_top as floor. The lexical guarantee
-     * (docs/fibers-impl.md §*Balance invariant*) was that a handle
-     * scoping the spawn cannot pop while the spawned fiber is still
-     * live, so the inherited pointer would stay valid.
-     *
-     * Issue #104 — that guarantee held only at the level of "stack
-     * memory mapping", not "stack memory contents". Once parent's
-     * code returns past those frames, any subsequent function call
-     * the parent makes (a Stdout.print after closing the inner
-     * with_mailbox, the link/monitor propagate walks at trampoline
-     * tail) writes its locals into the SAME stack slots the popped
-     * KaiEvidence frames lived in. The frames' eff_label / parent
-     * fields turn into garbage long before the spawned child runs.
-     *
-     * Fix: at spawn time clone the inherited chain into heap nodes
-     * so navigation from the child reads only memory we own. The
-     * clone is shallow — handler / handle_jmp / discard_slot still
-     * point at the original *Ev structs, which is fine for default
-     * handlers (their *Ev sits in static storage from the main
-     * wrapper) and accepted as a known limitation for inherited
-     * USER handlers (those *Ev structs live on a parent's stack and
-     * face the same overwrite hazard regardless of the chain
-     * representation). The chain is owned by this fiber and freed
-     * in kai_free_value's KAI_FIBER branch via
-     * kai_free_cloned_evidence_chain. */
-    f->evidence_top          = kai_clone_evidence_chain(f->parent->evidence_top);
-    f->cloned_evidence_chain = f->evidence_top;
+    /* Capabilities do not cross a spawn: a value-transportable effect
+     * rides the child thunk's own evidence frame, and a fiber-local
+     * effect resolves against this fiber's own disposition (cancel pad,
+     * link set, mailbox, nursery), never the parent's. The child starts
+     * with an empty evidence stack rather than inheriting the parent's —
+     * inheriting it would carry a parent handler whose *Ev struct lives
+     * on a stack frame the parent overwrites once it returns. */
+    f->evidence_top          = NULL;
     kai_fiber_init_ctx(f);
     /* R4 fix — allocate the wrapper before enqueue so the scheduler
      * can hold its own incref on the value. Without this second ref a
@@ -11623,39 +11568,6 @@ struct KaiEvidence {
     KaiValue   **discard_slot;
 };
 
-/* Issue #104 — implementations of the forward-declared helpers.
- * `kai_clone_evidence_chain` walks `src` via its .parent links,
- * malloc's a heap KaiEvidence per node, copies the fields shallow
- * (parent overwritten next iteration; eff_label / handler /
- * handle_jmp / discard_slot copied as-is — see issue #104 notes
- * on KaiFiber.cloned_evidence_chain for the *Ev caveat), and
- * returns the head of the heap chain. */
-static void kai_free_cloned_evidence_chain(KaiEvidence *head) {
-    while (head) {
-        KaiEvidence *next = head->parent;
-        free(head);
-        head = next;
-    }
-}
-
-static KaiEvidence *kai_clone_evidence_chain(KaiEvidence *src) {
-    KaiEvidence *head = NULL;
-    KaiEvidence **link = &head;
-    while (src != NULL) {
-        KaiEvidence *cp = (KaiEvidence *) malloc(sizeof(KaiEvidence));
-        if (!cp) {
-            fprintf(stderr, "kai: out of memory (spawn evidence clone)\n");
-            exit(1);
-        }
-        *cp = *src;
-        *link = cp;
-        link = &cp->parent;
-        src = src->parent;
-    }
-    *link = NULL;
-    return head;
-}
-
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
  * `handle` prologue. This primitive only fills its fields and
@@ -11867,10 +11779,9 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
-        /* m8 bug #12: skip a node whose clause body is currently
-         * being dispatched on *this* fiber. Per-fiber state because
-         * spawned fibers share the parent's evidence stack — a flag
-         * on the node would skip for every fiber, breaking m8x_2. */
+        /* m8 bug #12: skip a node whose clause body is currently being
+         * dispatched on *this* fiber, so a recursive op resolves to the
+         * outer handler. Per-fiber state, not a flag on the node. */
         if (node != f->in_dispatch_node
             && (node->eff_label == eff_label
                 || strcmp(node->eff_label, eff_label) == 0)) {
@@ -11888,6 +11799,23 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
 static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
     KaiEvidence *node = kai_evidence_lookup_node(eff_label);
     return node != NULL ? node : def;
+}
+
+/* A fiber-local effect resolved to no handler — the perform site walked an
+ * empty evidence stack. A capability does not cross a spawn, so a fiber-local
+ * op (Actor/Cancel/Link/Monitor/Spawn) performed in a fiber whose own body
+ * installed no handler for it has no disposition to bind. Report it instead of
+ * dereferencing the NULL node. */
+static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_label) {
+    /* A NULL node (empty evidence stack) or a node whose handler slot was never
+     * filled (a default global minted for a fiber-local effect that has no real
+     * default) both mean "no disposition to bind here". Report either, instead
+     * of letting a later `node->handler` deref segfault. */
+    if (node == NULL || node->handler == NULL) {
+        fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
+        exit(1);
+    }
+    return node;
 }
 
 /* m7b #15: per-instance dispatch — find the evidence node whose

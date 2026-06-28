@@ -141,6 +141,36 @@ fn main() : Int / Stdout = {
 }
 ```
 
+## Named instances — a capability as a first-class value
+
+`with Eff as a` binds `a` as a value whose type IS the effect
+(`Cell`, `State[Int]`) — no `Handler[E]` wrapper. So a capability
+appears in two positions, one uniform rule:
+
+- in a row (`fn f() : T / Cell`) — *demanded*, satisfied by a handle;
+- as a parameter (`fn f(c: Cell)`) — *provided* by the caller, NOT in
+  the row.
+
+This lets several instances of one effect be addressed independently
+by passing them *down* into a function:
+
+```kaikai
+effect Cell { get() : Int  set(n: Int) : Unit }
+
+fn add(c1: Cell, c2: Cell, dst: Cell) : Unit =
+  dst.set(c1.get() + c2.get())            # each performs against its own instance
+
+fn main() : Int = 0
+```
+
+A capability is **second-class**: it may appear only as a call
+argument or an op receiver. It cannot be returned from its `handle`,
+stored in a value, or captured by a closure that outlives the block —
+a value that must outlive its scope is a `Ref[T]` under `Mutable`, a
+dynamic population of stateful entities is actors/`Spawn`. Instances
+are monomorphic (`f(c: State[Int])`, not `f(c: State[T])`); `mask` is
+not provided — name the outer instance instead.
+
 ## Stdlib effects
 
 Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,
