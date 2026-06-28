@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.94.0 (2026-06-28)
+
+### Added
+
+- **effects**: close #820 — capability passing for user effects, named instances, hybrid dispatch (#965)
+
 ## v0.93.0 (2026-06-28)
 
 ### Added
