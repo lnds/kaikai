@@ -76,7 +76,7 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns
   # P3: pass the fn's return slot so a `KRet` returns the raw scalar
   # matching the signature. Lambda / clause ABIs always carry `SBoxed`
   # ret, so they keep the boxed return.
-  nemit_fill_blocks(ctx, f.blocks, handlers, f.ret, fns)
+  nemit_fill_blocks(ctx, nfn_sym(f.sym), f.blocks, handlers, f.ret, fns)
   native_ctx_end_fn(ctx)
 }
 
@@ -252,19 +252,19 @@ fn nemit_make_blocks(ctx: Handle, fnval: Handle, bs: [KBlock]) : Unit = match bs
 
 # --- pass 2: fill each block's statements + terminator -----------------
 
-fn nemit_fill_blocks(ctx: Handle, bs: [KBlock], handlers: [KHandlerDecl], ret: KSlot, fns: [KFn]) : Unit / Console = match bs {
+fn nemit_fill_blocks(ctx: Handle, cur_fn: String, bs: [KBlock], handlers: [KHandlerDecl], ret: KSlot, fns: [KFn]) : Unit / Console = match bs {
   [] -> ()
   [b, ...rest] -> {
     llvm_position_at_end(native_ctx_b(ctx), native_ctx_find_block(ctx, b.label))
-    nemit_stmts(ctx, b.stmts, handlers, fns)
+    nemit_stmts(ctx, cur_fn, b.stmts, handlers, fns)
     nemit_term(ctx, b.term, ret)
-    nemit_fill_blocks(ctx, rest, handlers, ret, fns)
+    nemit_fill_blocks(ctx, cur_fn, rest, handlers, ret, fns)
   }
 }
 
-fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match ss {
+fn nemit_stmts(ctx: Handle, cur_fn: String, ss: [KStmt], handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match ss {
   [] -> ()
-  [s, ...rest] -> { nemit_stmt(ctx, s, handlers, fns); nemit_stmts(ctx, rest, handlers, fns) }
+  [s, ...rest] -> { nemit_stmt(ctx, cur_fn, s, handlers, fns); nemit_stmts(ctx, cur_fn, rest, handlers, fns) }
 }
 
 # --- statements ---------------------------------------------------------
@@ -281,7 +281,7 @@ fn nemit_stmts(ctx: Handle, ss: [KStmt], handlers: [KHandlerDecl], fns: [KFn]) :
 # use-after-free the LLVM verifier hits as a phantom-`phi` crash). The
 # `let h = ...` form rides the handle-binder exclusion (`pcs_rhs_is_handle`
 # in stage1), so `h` never enters Perceus and is never dropped.
-fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match s {
+fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match s {
   # Capture the op/atom handle in a `let` (handle-binder exclusion) before
   # passing it on: a handle passed inline as a call ARGUMENT is RC-managed
   # by the type-blind kaic1, and a drop of an LLVM `Value*` clobbers its
@@ -293,8 +293,8 @@ fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Uni
   # materialise the scalar RAW (`llvm_const_real` / raw i32), not box it
   # (the default `nemit_atom` boxes via `kaix_real`). Every other op ignores
   # the slot (the register's repr already drives its load/store).
-  KLet(n, slot, op, _) -> { let h = nemit_op_fx_slot(ctx, op, slot, handlers, fns); nemit_store_reg(ctx, n, h) }
-  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, op, handlers, fns); () }
+  KLet(n, slot, op, _) -> { let h = nemit_op_fx_slot(ctx, cur_fn, op, slot, handlers, fns); nemit_store_reg(ctx, n, h) }
+  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, cur_fn, op, handlers, fns); () }
   KStore(n, v, _)   -> nemit_store_slot_aware(ctx, n, v)
   KRC(rc, _)        -> nemit_rc(ctx, rc)
   KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
@@ -312,11 +312,11 @@ fn nemit_stmt(ctx: Handle, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Uni
 # emitter lives in `emit_native_fx2`, which `emit_native_ops` cannot import —
 # it would cycle, fx2 already imports ops — so the seam is here, the module
 # that imports both). Everything else delegates to the pure `nemit_op`.
-fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console = match op {
+fn nemit_op_fx(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console = match op {
   # `nemit_perform` materialises its args as atoms (`nemit_atom`), never a
   # direct `KCall` (a call arg is lowered to a prior KLet, reaching here as
   # a `KVar`), so it does not need the `fns` sig table.
-  KPerform(eff, o, cargs)   -> nemit_perform(ctx, eff, o, cargs, handlers)
+  KPerform(eff, o, cargs)   -> nemit_perform(ctx, cur_fn, eff, o, cargs, handlers)
   KResumeOp(k, v)           -> nemit_resume(ctx, k, v)
   KResume2Op(k, v, ns)      -> nemit_resume2(ctx, k, v, ns)
   _                         -> nemit_op(ctx, op, fns)
@@ -335,11 +335,11 @@ fn nemit_op_fx(ctx: Handle, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Han
 #     slot is the box decision, symmetric with the load side.
 # Every other shape delegates unchanged; the load/store side is already
 # slot-driven via `nslot_type_of_tag`.
-fn nemit_op_fx_slot(ctx: Handle, op: KOp, slot: KSlot, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console =
+fn nemit_op_fx_slot(ctx: Handle, cur_fn: String, op: KOp, slot: KSlot, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console =
   match op {
     KLitOp(v)         -> nemit_atom_raw(ctx, v, slot)
     KCall(sym, cargs) -> nemit_call_direct(ctx, sym, cargs, fns, slot)
-    _                 -> nemit_op_fx(ctx, op, handlers, fns)
+    _                 -> nemit_op_fx(ctx, cur_fn, op, handlers, fns)
   }
 
 # A Perceus RC op → the runtime dup/drop. The call result is captured in a

@@ -197,11 +197,13 @@ fn nfx_op_alias(op: String) : Option[String] = {
   if at >= 0 { Some(string_slice(op, at + 1, string_length(op))) } else { None }
 }
 
-# The evidence node a perform dispatches through: by-id for an aliased op
-# (resolve THIS handler instance via the `__alias_id__<a>` sentinel) — the
-# `kaix_evidence_lookup_node` by-name walk would otherwise pick the
-# innermost same-effect handler — else the ordinary by-name lookup.
-fn nemit_perform_node(ctx: Handle, eff: String, alias: Option[String]) : Handle / Console = {
+# The evidence node a perform dispatches through. By-id for an aliased op
+# (resolve THIS handler instance via the `__alias_id__<a>` sentinel). Else,
+# when the enclosing fn's frame carries this effect, read its slot from `__evf`
+# (the call site filled it with the right instance's node) — the C-direct
+# `__evf[slot]` mirror. Else the ordinary by-name walk for a lexically-handled
+# effect the frame does not carry.
+fn nemit_perform_node(ctx: Handle, cur_fn: String, eff: String, alias: Option[String]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   match alias {
     Some(a) -> {
@@ -210,10 +212,45 @@ fn nemit_perform_node(ctx: Handle, eff: String, alias: Option[String]) : Handle 
       ncall_sig1(ctx, "kaix_evidence_lookup_node_by_id", p, native_ctx_i64t(ctx), id)
     }
     None -> {
-      let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
-      ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+      let slot = native_ctx_frame_slot_index(ctx, cur_fn, eff)
+      if slot >= 0 {
+        # A slot read skips the walk, where the cooperative-cancel yield-point
+        # hook lives; fire it explicitly so a Cancel is delivered at this op.
+        let _y = nemit_call0(ctx, "kaix_check_cancel_yield_point")
+        nemit_evf_load_slot(ctx, cur_fn, slot)
+      }
+      else { nemit_perform_walk_node(ctx, eff) }
     }
   }
+}
+
+# The node for a perform with no caller frame slot: a lexical handler on the
+# stack wins, falling back to the minted default node for a default-bearing
+# effect (no longer pushed) — the mirror of emit_c's `lookup_or_default`. A
+# non-default effect (no global) stays on the plain by-name walk.
+fn nemit_perform_walk_node(ctx: Handle, eff: String) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let effname = llvm_build_global_string(native_ctx_b(ctx), eff)
+  let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", eff))
+  if llvm_handle_is_null(g) == 1 {
+    ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+  } else {
+    ncall_sig2(ctx, "kaix_evidence_lookup_or_default", p, p, p, effname, g)
+  }
+}
+
+# Load `__evf[slot]` — the node the call site stored at this effect's frame
+# index. `__evf` (LLVM param 0) is the reserved register pointing at the
+# caller-built `[N x ptr]` array; a GEP at `slot` then a load yields the
+# `KaiEvidence *`. The array type is rebuilt from the fn's own slot count.
+fn nemit_evf_load_slot(ctx: Handle, cur_fn: String, slot: Int) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let n = native_ctx_frame_slot_count(ctx, cur_fn)
+  let arrty = llvm_array_type(p, n)
+  let evf = nemit_load_reg(ctx, "__evf")
+  let idx = llvm_const_int(native_ctx_i64t(ctx), slot)
+  let slotptr = llvm_build_array_gep(native_ctx_b(ctx), arrty, evf, idx)
+  llvm_build_load(native_ctx_b(ctx), p, slotptr)
 }
 
 # --- KPerform: dispatch an op to its handler clause --------------------
@@ -223,7 +260,7 @@ fn nemit_perform_node(ctx: Handle, eff: String, alias: Option[String]) : Handle 
 # guard, indirect-call the op fn-ptr at its field index, restore the
 # guard, then `kaix_op_finish` (the folded discard test + unwind — on a
 # discard it longjmps and does not return; otherwise yields the op result).
-pub fn nemit_perform(ctx: Handle, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
+pub fn nemit_perform(ctx: Handle, cur_fn: String, eff: String, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
   # An aliased op is spelled `<op>@<alias>` (the resolver's per-instance
   # dispatch tag). Split it: the bare op resolves the clause field; the
   # alias (if any) switches the node lookup from by-name to by-id.
@@ -231,16 +268,17 @@ pub fn nemit_perform(ctx: Handle, eff: String, op: String, cargs: [KVal], handle
   let alias = nfx_op_alias(op)
   match nfx_find_handler_by_eff(handlers, eff) {
     None -> { nemit_unsupported(ctx, cat2("KPerform: no handler for effect ", eff)); nemit_null(ctx) }
-    Some(h) -> nemit_perform_with(ctx, eff, bare, alias, cargs, h)
+    Some(h) -> nemit_perform_with(ctx, cur_fn, eff, bare, alias, cargs, h)
   }
 }
 
-fn nemit_perform_with(ctx: Handle, eff: String, op: String, alias: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
+fn nemit_perform_with(ctx: Handle, cur_fn: String, eff: String, op: String, alias: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let field = nfx_op_field(h.op_thunks, op, 0)
-  # 1. node = by-id lookup for an aliased op (resolve THIS instance), else
-  # the innermost-by-effect-name lookup; handler = node_handler(node).
-  let node = nemit_perform_node(ctx, eff, alias)
+  # 1. node = by-id lookup for an aliased op (resolve THIS instance), the
+  # enclosing fn's frame slot when carried, else the innermost-by-effect-name
+  # lookup; handler = node_handler(node).
+  let node = nemit_perform_node(ctx, cur_fn, eff, alias)
   let handler = nemit_call1(ctx, "kaix_evidence_node_handler", node)
   # 2. cont = the reserved KaiCont alloca; init identity with handler_id.
   # `kaix_ev_handler_id(ptr) -> i64` (NOT a boxed ptr); `cont_init_identity`

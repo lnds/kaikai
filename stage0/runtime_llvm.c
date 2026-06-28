@@ -935,6 +935,16 @@ void kaix_evidence_push(KaiEvidence *node, const char *eff_label, void *handler)
     kai_evidence_push(node, eff_label, handler);
 }
 
+void kaix_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
+    kai_evidence_init_default(node, eff_label, handler);
+}
+
+KaiEvidence *kaix_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
+    return kai_evidence_lookup_or_default(eff_label, def);
+}
+
+void kaix_check_cancel_yield_point(void) { kai_check_cancel_yield_point(); }
+
 void kaix_evidence_pop(void) { kai_evidence_pop(); }
 
 void *kaix_evidence_lookup_handler(const char *eff_label) {
