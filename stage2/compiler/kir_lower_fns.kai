@@ -27,7 +27,7 @@ import compiler.kir_lower_walk
 # `KProgram` with everything resolved, so the translators resolve nothing
 # (design §5).
 pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
-                    fns: [EFn], variants: [EVar]) : KProgram / Console {
+                    fns: [EFn], variants: [EVar], target_origin: Option[String]) : KProgram / Console {
   let types = lower_types(raw_decls, variants, [])
   # The lifted-lambda table is the SAME analysis the emitters run
   # (`collect_decls` over the global-name set) — reused, not re-derived.
@@ -45,12 +45,62 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # `emit_clause_bodies`), appended after the ordinary fns.
   let lamfns  = lower_lam_fns(lc.lams, st0, [])
   let clsfns  = lower_clause_fns(lc.clauses, lc.clauses, st0, [])
-  KProgram { types: types, fns: list_append(kfns, list_append(lamfns, clsfns)),
+  # Each test / bench body becomes a runner `KFn` returning the block's
+  # final boxed value (mirror of emit_c's `emit_test_fn` / `emit_bench_fn`,
+  # minus the inline setjmp — the native runtime helper holds the landing
+  # pad). The native `kai_main` driver calls them via the runner list; the
+  # C-direct backend never reads either. `target_origin` rotates the EFn
+  # table file-local exactly as the C emitters do (issue #335).
+  let rs = lower_runner_decls(raw_decls, target_origin, st0, freg)
+  KProgram { types: types,
+             fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
              handlers: lower_handler_decls(lc.clauses, lc.clauses, []),
              install_order: kir_install_order(raw_decls),
              defaults: kir_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls),
-             regions: lower_regions(regions, []) }
+             regions: lower_regions(regions, []), runners: rs.runners }
+}
+
+# The runner KFns + the KRunner index, built together so the emitted
+# symbol and the index agree. `_kai_test_<i>` / `_kai_bench_<i>` are
+# numbered per-kind in source order (the same scheme emit_c uses), so the
+# native driver and any cross-backend reasoning name the same block.
+pub type RunnerLower = { fns: [KFn], runners: [KRunner] }
+
+fn lower_runner_decls(decls: [Decl], target_origin: Option[String],
+                      st0: LowerSt, freg: [ExternTypeReg]) : RunnerLower / Console = {
+  let body_fns = fns_prefer_module(st0.fns, target_origin)
+  lower_runner_loop(decls, st0, freg, body_fns, 0, 0, [], [])
+}
+
+# Walk the decls accumulating one runner KFn + KRunner per test/bench
+# block. `ti`/`bi` are the per-kind counters. The runner sym is passed as
+# the fn name with `mo = None`, so `c_sym` keeps it literal
+# (`_kai_test_0`) and the native driver names the same symbol. The body's
+# own calls already resolve through the pre-rotated `body_fns`. Check
+# blocks carry `with`-clause params whose values the runtime generates —
+# that needs the parametrised-predicate runner the native check path does
+# not yet build, so they are skipped here and the wrapper keeps
+# `kai check` on the C oracle.
+fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
+                     body_fns: [EFn], ti: Int, bi: Int,
+                     fns_acc: [KFn], run_acc: [KRunner]) : RunnerLower / Console = match decls {
+  [] -> RunnerLower { fns: list_reverse(fns_acc), runners: list_reverse(run_acc) }
+  [d, ...rest] -> match d {
+    DTest(desc, body, _, _) -> {
+      let sym = cat2("_kai_test_", int_to_string(ti))
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let r = KRunner { sym: sym, desc: desc, kind: KRTest }
+      lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
+    }
+    DBench(desc, body, _, _) -> {
+      let sym = cat2("_kai_bench_", int_to_string(bi))
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let r = KRunner { sym: sym, desc: desc, kind: KRBench }
+      lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
+    }
+    _ -> lower_runner_loop(rest, st, freg, body_fns, ti, bi, fns_acc, run_acc)
+  }
 }
 
 # Run the shared lambda-collection pass (`collect_decls`) — the SAME

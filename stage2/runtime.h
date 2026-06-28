@@ -7109,6 +7109,29 @@ static int kai_test_summary(void) {
     return (kai_test_count_passed == kai_test_count_total) ? 0 : 1;
 }
 
+/* Run one test body through the begin/setjmp/pass landing pad. The
+   C-direct backend weaves this same shape inline into each emitted
+   `_kai_test_<id>`; the native backend cannot emit a generated `int
+   main`, so it emits each test body as a plain fn and drives them
+   through this helper. The setjmp landing lives HERE, not in `body` —
+   so `kai_assert_check`'s longjmp on a failed assertion unwinds into a
+   frame still on the stack, and the body fn itself stays
+   mem2reg-promotable (no setjmp in its IR). `body` returns the block's
+   final value (a boxed `KaiValue *`), decref'd here exactly as the
+   C-direct runner's `kai_decref(_body)`. */
+static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
+    kai_test_begin(desc);
+    if (setjmp(kai_test_jmp) == 0) {
+        kai_test_in_progress = 1;
+        KaiValue *r = body();
+        kai_decref(r);
+        kai_test_in_progress = 0;
+        kai_test_pass();
+    } else {
+        kai_test_in_progress = 0;
+    }
+}
+
 /* ---------- bench harness hooks (used by --bench runs) ----------
  * bench v1.x (issue #437): per-iteration timings collected into a
  * sample buffer; on finalize we sort and report median + MAD + mean
@@ -7256,6 +7279,30 @@ static int kai_bench_summary(void) {
         kai_bench_samples_cap = 0;
     }
     return 0;
+}
+
+/* Run one bench body through warmup + timed iterations. The C-direct
+   backend weaves this loop inline into each `_kai_bench_<id>`; the
+   native backend emits each body as a fn returning the block's final
+   boxed value and drives them here, decref'ing each result like the
+   C-direct runner. No setjmp pad — an assertion inside a bench should
+   panic, since timing aborted code is meaningless (`kai_assert_check`
+   with `kai_test_in_progress == 0` panics, which is the wanted
+   behaviour). */
+static void kai_bench_run_one(const char *desc, KaiValue *(*body)(void)) {
+    int iters  = kai_bench_iters();
+    int warmup = kai_bench_warmup();
+    int i;
+    kai_bench_ensure_capacity(iters);
+    for (i = 0; i < warmup; i++) kai_decref(body());
+    for (i = 0; i < iters; i++) {
+        long long a = kai_bench_now_ns();
+        KaiValue *r = body();
+        long long b = kai_bench_now_ns();
+        kai_decref(r);
+        kai_bench_record(i, b - a);
+    }
+    kai_bench_finalize(desc, iters);
 }
 
 /* ---------- check harness hooks (used by --check runs) ----------

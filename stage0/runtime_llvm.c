@@ -1431,6 +1431,21 @@ KaiValue *kaix_default_signal_await(void *self, KaiCont *k) {
 extern void kai_main_install_defaults(void);
 extern void kai_main_teardown_defaults(void);
 
+/* Test/bench runner forwarders. The native `kai test`/`bench` driver
+ * (the synthetic `kai_main` the emitter builds in test/bench mode)
+ * calls one `kaix_*_run_one` per block, passing the block's body fn
+ * (which returns the block's final boxed value), then ends with the
+ * matching `*_summary_exit`. The setjmp landing pad + accounting live
+ * in runtime.h's `kai_test_run_one` / `kai_bench_run_one`; these are
+ * the `kaix_` names the LLVM call sites reference. `*_summary_exit`
+ * prints the summary and `exit()`s with its code, so the process exit
+ * status matches the C-direct `int main`'s `return kai_*_summary()`
+ * without the shim's `int main` needing to know the build mode. */
+void kaix_test_run_one(const char *desc, KaiValue *(*body)(void)) { kai_test_run_one(desc, body); }
+void kaix_bench_run_one(const char *desc, KaiValue *(*body)(void)) { kai_bench_run_one(desc, body); }
+void kaix_test_summary_exit(void)  { exit(kai_test_summary()); }
+void kaix_bench_summary_exit(void) { exit(kai_bench_summary()); }
+
 /* Option C — protocol dispatch tables. The LLVM emitter generates the
  * body of `_kai_proto_init_llvm` per program: it calls
  * `kaix_register_one_impl` once per impl and

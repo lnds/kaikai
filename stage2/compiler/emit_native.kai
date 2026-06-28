@@ -40,13 +40,14 @@ import compiler.emit_native_ops
 import compiler.emit_native_term
 import compiler.emit_native_def
 import compiler.emit_native_proto
+import compiler.emit_native_test
 
 # Build the LLVM module for `kp` in memory and emit it as an object at
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
 # failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
 # `--emit=native`.
 pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [EVar],
-                           fns: [EFn], out_path: String) : Int / Console = {
+                           fns: [EFn], bmode: BuildMode, out_path: String) : Int / Console = {
   let m = llvm_module_new("kai_native")
   # ALL backend state (module, builder, types, fn, reg/block tables) lives
   # in the C-side `ctx` reached through this opaque Handle — no handle
@@ -56,10 +57,15 @@ pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [EVar],
   # symbol, so signature / call / perform resolve the same slots without
   # threading.
   nframes_register(ctx, build_evidence_frames(decls))
+  # In test/bench mode the synthetic driver (`nemit_build_runner_driver`)
+  # owns the `kai_main` symbol, so the user's placeholder `fn main` is
+  # dropped from the emit list — it would otherwise define a colliding
+  # `kai_main`. The runner body fns stay (they carry the block bodies).
+  let emit_fns = nfilter_user_main(kp.fns, bmode)
   # Declare every user fn first (forward references), then walk each.
   # `kp.handlers` threads the effect handler decls so a `KInstall`/
   # `KPerform` resolves its op→clause-thunk map (effects subset 2a).
-  nemit_declare_fns(ctx, kp.fns)
+  nemit_declare_fns(ctx, emit_fns)
   # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one
   # per default-block effect so `nemit_perform` resolves the op's field index
   # for the builtin-dispatch path (the op fn-ptr itself is loaded at runtime
@@ -76,13 +82,20 @@ pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [EVar],
   # dead fn runs (it does not). INSTALL/teardown below stay on `kp.defaults`
   # (the LIFO-balanced push/pop set).
   let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.synth_defaults))
-  nemit_walk_fns(ctx, kp.fns, all_handlers, kp.fns)
+  # `all_fns` (the stable P3 call-site lookup table) stays the full list;
+  # only the walk cursor / thunk list drop the user `main`.
+  nemit_walk_fns(ctx, emit_fns, all_handlers, kp.fns)
   # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
   # passed as a first-class value (a `KClosure` over a named fn references
   # this symbol). The KIR does NOT model these — they are synthetic, like
   # the C-direct emitter's `emit_fn_thunk`.
-  nemit_fn_thunks(ctx, kp.fns)
+  nemit_fn_thunks(ctx, emit_fns)
   native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns)
+  # In test/bench mode, emit the synthetic `kai_main` driver that runs
+  # the lowered runner bodies through the runtime helpers and exits with
+  # the summary code (build mode emits nothing — the user's `fn main`
+  # already carries the `kai_main` symbol).
+  nemit_build_runner_driver(ctx, kp.runners, bmode)
   if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
   else {
     eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
@@ -103,6 +116,13 @@ fn nframes_register_slots(ctx: Handle, sym: String, slots: [String]) : Unit = ma
   [] -> ()
   [s, ...rest] -> { native_ctx_add_frame_slot(ctx, sym, s); nframes_register_slots(ctx, sym, rest) }
 }
+
+# Drop the user's `fn main` (KFn sym `main`) from the emit list when a
+# synthetic test/bench driver owns the `kai_main` symbol. Identity in
+# build mode (and for every non-`main` fn), so a normal build is
+# byte-unchanged.
+fn nfilter_user_main(fns: [KFn], bmode: BuildMode) : [KFn] =
+  if nemit_is_runner_mode(bmode) { filter(fns, (f) => not (f.sym == "main")) } else { fns }
 
 # Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
 # front so a call/install site resolves the symbol even when the definition
