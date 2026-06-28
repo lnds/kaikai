@@ -159,6 +159,8 @@ effect Cell { get() : Int  set(n: Int) : Unit }
 
 fn add(c1: Cell, c2: Cell, dst: Cell) : Unit =
   dst.set(c1.get() + c2.get())            # each performs against its own instance
+
+fn main() : Int = 0
 ```
 
 A capability is **second-class**: it may appear only as a call
