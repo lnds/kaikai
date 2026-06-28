@@ -1,0 +1,106 @@
+# compiler/emit_native_test.kai — the synthetic `kai_main` driver the
+# native backend emits in test / bench mode (`--emit=native --test` /
+# `--bench`).
+#
+# The C-direct backend builds a fresh `int main` per build mode
+# (emit_c's `emit_main_wrapper`): in test mode it calls each
+# `_kai_test_<id>()` and returns `kai_test_summary()`. The native
+# backend cannot emit `int main` — `stage0/runtime_llvm.c` owns it and
+# always calls `kai_main()`. So in test/bench mode the runner body fns
+# already live in `KProgram.fns` (one per block, returning the block's
+# final boxed value — see `lower_runner_decls`), and THIS module emits
+# the `kai_main` symbol as a driver that runs them through the runtime
+# helpers and `exit()`s with the summary code. The user's own `fn main`
+# is skipped in that mode (`nemit_skip_user_main`), so its `kai_main`
+# does not collide with the driver.
+
+import compiler.util
+import compiler.kir
+import compiler.emit_shared
+import compiler.native_prims
+import compiler.emit_native_ops
+import compiler.emit_native_fn
+
+# True when the build mode runs a synthetic test/bench driver instead of
+# the user's `fn main`. `BMCheck` stays on the C oracle (the native check
+# runner is a later burn-down — see `lower_runner_decls`), so it is NOT
+# driver-mode here.
+pub fn nemit_is_runner_mode(bmode: BuildMode) : Bool = match bmode {
+  BMTest  -> true
+  BMBench -> true
+  _       -> false
+}
+
+# The user's `fn main` (KFn sym `main` → `kai_main`) must NOT be emitted
+# in runner mode: the synthetic driver owns the `kai_main` symbol. Every
+# other fn (including the test/bench runner bodies) is emitted as usual.
+pub fn nemit_skip_user_main(f: KFn, bmode: BuildMode) : Bool =
+  nemit_is_runner_mode(bmode) and f.sym == "main"
+
+# Emit the synthetic `kai_main` driver for the active runner mode. Opens
+# `kai_main` with the shim's `ptr ()` signature, calls one
+# `kaix_<kind>_run_one(desc, &runner)` per matching block, then the
+# matching `*_summary_exit` (which prints the summary and `exit()`s with
+# its code). The block ends `unreachable`: `*_summary_exit` never
+# returns, but a basic block still needs a terminator.
+pub fn nemit_build_runner_driver(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console =
+  if nemit_is_runner_mode(bmode) {
+    ndriver_open_kai_main(ctx)
+    nemit_runner_calls(ctx, runners, bmode)
+    let _e = ncall_sig0(ctx, ndriver_exit_sym(bmode), native_ctx_voidt(ctx))
+    llvm_build_unreachable(native_ctx_b(ctx))
+  } else { () }
+
+# Open `KaiValue *kai_main(void)` + position the builder at its entry.
+# Mirrors `ndef_open_void_fn` but with the `ptr ()` return the shim's
+# `extern KaiValue *kai_main(void)` expects.
+fn ndriver_open_kai_main(ctx: Handle) : Unit = {
+  let m = native_ctx_m(ctx)
+  let fnty = llvm_fn_type_0(native_ctx_ptrt(ctx))
+  let fnval = llvm_add_function(m, "kai_main", fnty)
+  let entry = llvm_append_block(m, fnval, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+}
+
+# The `*_summary_exit` forwarder for this mode.
+fn ndriver_exit_sym(bmode: BuildMode) : String = match bmode {
+  BMBench -> "kaix_bench_summary_exit"
+  _       -> "kaix_test_summary_exit"
+}
+
+# The `*_run_one` forwarder for a runner kind.
+fn nrunner_call_sym(kind: KRunnerKind) : String = match kind {
+  KRBench -> "kaix_bench_run_one"
+  _       -> "kaix_test_run_one"
+}
+
+# Does this runner belong to the active driver mode? `kai test` runs the
+# test blocks; `kai bench` the bench blocks. A bench block in a test run
+# (and vice-versa) is skipped — the C oracle drives the same split by
+# emitting a per-mode call list.
+fn nrunner_in_mode(kind: KRunnerKind, bmode: BuildMode) : Bool = match bmode {
+  BMBench -> match kind { KRBench -> true _ -> false }
+  _       -> match kind { KRTest  -> true _ -> false }
+}
+
+fn nemit_runner_calls(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console = match runners {
+  [] -> ()
+  [r, ...rest] -> {
+    if nrunner_in_mode(r.kind, bmode) { nemit_one_runner_call(ctx, r) } else { () }
+    nemit_runner_calls(ctx, rest, bmode)
+  }
+}
+
+# `kaix_<kind>_run_one(i8* desc, ptr body) -> void`. `desc` is the
+# block's quote-wrapped source span, materialised as a global string
+# (strip quotes + decode escapes, the same `llvm_build_string_span` the
+# assert-message path uses). `body` is the runner fn's address — its
+# `Function*` handle, declared `ptr ()` to match the body fn the lowering
+# emitted; under opaque pointers the handle IS the `ptr` argument.
+fn nemit_one_runner_call(ctx: Handle, r: KRunner) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let desc = llvm_build_string_span(native_ctx_b(ctx), r.desc)
+  let bodyfn = llvm_get_or_declare_fn(native_ctx_m(ctx), r.sym, llvm_fn_type_0(p))
+  let _c = ncall_sig2(ctx, nrunner_call_sym(r.kind), native_ctx_voidt(ctx), p, p, desc, bodyfn)
+  ()
+}

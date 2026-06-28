@@ -1143,22 +1143,6 @@ pub type Mode
   # pin the lowering against `.kir.expected` goldens and to feed the
   # KIR→target translators.
   | MEmitKir
-  # The in-process libLLVM native backend. Lowers to KIR, builds the
-  # LLVM module via the C API in memory (`build_native_object`), emits
-  # a native object, and links it against the effects runtime — one
-  # process, no `.ll` text, no `clang`. Opt-in (`--emit=native` /
-  # `KAI_BACKEND=native`); the C-text backend is the default +
-  # bootstrap + oracle. The forwarders are only compiled under
-  # `-DKAI_LLVM`, so a default kaic2 rejects this mode at the dispatch
-  # with a clear error.
-  | MEmitNative
-  # Separate compilation. Emit the program as N per-module `.c`
-  # translation units + two shared headers (`kai_types.h`,
-  # `kai_decls.h`), joined into one marker-delimited stream the
-  # `bin/kai` wrapper splits into files and compiles each to its own
-  # `.o` before linking. Opt-in for USER programs only; the default
-  # single-TU C path (and thus selfhost byte-identity) is untouched.
-  | MEmitCModular
   | MTest
   # Emits a main wrapper that runs every `bench "..." { ... }` block
   # and reports mean ns/iter.
@@ -1226,7 +1210,17 @@ pub type Mode
   | MEmitPreludeCache
 
 #[doc("Parsed CLI configuration: mode, target path, preludes, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
-pub type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
+# The codegen backend, ORTHOGONAL to `Mode`. `Mode` carries the
+# build-shape (build / test / bench / prop-check) plus every read-only
+# dump; `Backend` carries the destination. Keeping them separate lets
+# `--emit=native --test` compose — the dev-loop subcommands now run
+# their runners on the native backend instead of being forced through
+# the C oracle. `BkC` is the default (bootstrap + parity oracle);
+# `BkNative` is the in-process libLLVM destination `kai build`/`run`
+# already default to; `BkCModular` is the separate-compilation C path.
+pub type Backend = BkC | BkNative | BkCModular
+
+pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], preludes: [String],
                     prelude_caches: [String], cache_sha: String,
                     strict_holes: Bool, search_paths: [String],
                     # Identity of the consuming package (from
@@ -1255,7 +1249,16 @@ pub type CliOptions = { mode: Mode, path: Option[String], preludes: [String],
                     user_cache: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
-  CliOptions { mode: m, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: m, backend: opts.backend, path: opts.path, preludes: opts.preludes,
+               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+
+# Select the codegen backend, orthogonal to `mode`. `--emit=native` and
+# `--emit=c-modular` set this instead of `mode`, so they compose with
+# `--test`/`--bench`/`--prop-check`.
+fn cli_with_backend(opts: CliOptions, bk: Backend) : CliOptions =
+  CliOptions { mode: opts.mode, backend: bk, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
@@ -1264,19 +1267,19 @@ fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
 # `--user-cache`, which `bin/kai` passes only under `KAI_CACHE=1`
 # after creating `<project>/.kai-cache/`.
 fn cli_with_user_cache(opts: CliOptions) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: true }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: Some(p), preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: Some(p), preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
                preludes: list_append(opts.preludes, [p]),
                prelude_caches: list_append(opts.prelude_caches, [""]),
                cache_sha: opts.cache_sha,
@@ -1284,7 +1287,7 @@ fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
                preludes: list_append(opts.preludes, [src]),
                prelude_caches: list_append(opts.prelude_caches, [cache]),
                cache_sha: opts.cache_sha,
@@ -1292,19 +1295,19 @@ fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOpt
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
@@ -1314,7 +1317,7 @@ fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
 # through to the qualified-call rewriter so self-imports from a
 # package's own modules never emit the unstable warning.
 fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
@@ -1326,7 +1329,7 @@ fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
 # as the oldest edition (tongariki) so flagless invocations and old
 # fixture harnesses keep working.
 fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins,
@@ -1348,7 +1351,7 @@ fn edition_is_known(n: String) : Bool = edition_is_known_loop(known_editions(), 
 # (tongariki) defensively; the CLI rejects unknown values before any
 # rank lookup runs.
 fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, preludes: opts.preludes,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
                prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name,
@@ -1413,11 +1416,12 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
       } else if a == "--emit=kir" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitKir))
       } else if a == "--emit=native" {
-        # In-process libLLVM native backend (opt-in).
-        parse_cli_loop(more, cli_with_mode(opts, MEmitNative))
+        # In-process libLLVM native backend. A BACKEND, not a mode — it
+        # composes with --test/--bench/--prop-check.
+        parse_cli_loop(more, cli_with_backend(opts, BkNative))
       } else if a == "--emit=c-modular" {
-        # Separate compilation — per-module .c/.h + link.
-        parse_cli_loop(more, cli_with_mode(opts, MEmitCModular))
+        # Separate compilation — per-module .c/.h + link. A backend.
+        parse_cli_loop(more, cli_with_backend(opts, BkCModular))
       } else if a == "--fmt" {
         parse_cli_loop(more, cli_with_mode(opts, MFmt))
       } else if a == "--fmt-check" {
@@ -1516,7 +1520,7 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
 #[doc("Parse argv into CliOptions: mode, path, preludes, search paths, edition, and feature flags. Driver entry point called by fn main().")]
 pub fn parse_cli(argv: [String]) : CliOptions / Console {
 
-  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, preludes: [],
+  parse_cli_loop(argv, CliOptions { mode: MDefault, backend: BkC, path: None, preludes: [],
                                     prelude_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
@@ -3718,7 +3722,7 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -4407,10 +4411,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       }
                       # Read-only KIR dump (no binary emitted).
                       let use_kir = match mode { MEmitKir -> true _ -> false }
-                      # In-process libLLVM native backend (opt-in).
-                      let use_native = match mode { MEmitNative -> true _ -> false }
+                      # In-process libLLVM native backend.
+                      let use_native = match backend { BkNative -> true _ -> false }
                       # Separate-compilation C path (per-module .c/.h).
-                      let use_modular = match mode { MEmitCModular -> true _ -> false }
+                      let use_modular = match backend { BkCModular -> true _ -> false }
                       # Pipeline order: `perceus → tcrec`. Perceus runs
                       # first so the AST already carries explicit
                       # `__perceus_dup` / `__perceus_drop` nodes by the
@@ -4470,9 +4474,9 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                         # final executable.
                         let nfns = register_fn_decls(perceus_decls)
                         let nvariants = register_variants(perceus_decls)
-                        let kp = lower_to_kir(perceus_decls, region_marks, nfns, nvariants)
+                        let kp = lower_to_kir(perceus_decls, region_marks, nfns, nvariants, Some(target_mod_name))
                         let obj_path = native_object_path(path)
-                        let rc = build_native_object(kp, perceus_decls, nvariants, nfns, obj_path)
+                        let rc = build_native_object(kp, perceus_decls, nvariants, nfns, bmode, obj_path)
                         if rc == 0 { print(obj_path); 0 } else { rc }
                       }
                       else {
@@ -4541,7 +4545,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache)
+              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }
