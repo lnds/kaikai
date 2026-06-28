@@ -46,7 +46,9 @@ The design's §8 left four questions for this round. All four are resolved below
 
 The asymmetry is deliberate: individual params are the simpler ABI (no struct construction at every call site, monomorphisation stays a type-tuple game it already plays), so they win ties; the tuple only earns its place if the data says the corpus actually has wide rows. The prior, stated honestly: kaikai rows are narrow (most functions demand ≤ 2 effects — `Console`, maybe `Mutable`), so individual params are expected to win and the tuple branch to never ship. But this is the one question the design correctly refused to answer from a chair — **measure, then decide.**
 
-### A.4 Actors — **`send/receive/self` ride the same injection; no separate spine step, but L3 carries an actor-specific fixture as a tripwire.** (resolves §8.4)
+### A.4 Actors — **CORRECTED 2026-06-28: Actor is fiber-local; it does NOT ride the injection.** (supersedes the original §8.4 resolution)
+
+> **Correction.** The original resolution below ("`send/receive/self` ride the same injection") is **false**. `Actor[Msg]` is fiber-local (`frame_is_fiber_local`): its handler is installed by the runtime *inside the actor's own fiber* when the actor is created, so no caller call-site exists to fill an injected slot — evidence is born in the callee, not passed by the caller. Actor stays on the **bounded** by-name lookup (the retained-builtins set of the reformulated L5), exactly like `Spawn`/`Cancel`. The original text is kept below for history.
 
 **Recommendation.** `Actor[Msg]`'s ops resolve through the same evidence mechanism as any other effect; they do **not** get their own lane. But because the actor runtime has its own dispatch glue (`kai_actor_*`, the `Actor[Msg]` handler installed at `runtime.h:5524`), L3's spawn-audit must include at least one actor fixture (a parent that performs an actor op and a child actor), confirming the injected evidence reaches the actor op sites without the now-deleted spawn clone.
 
@@ -131,9 +133,15 @@ Seven lanes. **Three strict barriers** (marked **⛔ BARRIER**): L0 (nothing sta
 
 **Paralelo.** No.
 
-### L5 — Delete: by-name walk + alias special case + spawn clone ⛔ POINT OF NO RETURN
+### L5 — Delete (REFORMULATED 2026-06-28): retire the walk for USER effects ⛔ POINT OF NO RETURN
 
-**Objetivo.** Delete the three obsolete mechanisms so one resolution path remains — the load-bearing simplification.
+**Reformulation.** The original "delete all three so one path remains" was found internally contradictory once L0–L4 landed: the by-name walk does two jobs, and only one is the pathology. See #820 §*Scope reformulation* and `docs/effects-stdlib.md` §*Three classes of builtin effect*. Corrected objective:
+
+- **Delete fully** (no surviving justification): `alias_map_disable_tag` (`emit_shared.kai`) + the `kai_alias_<a>_id` minting; `kai_clone_evidence_chain` (the spawn clone, `runtime.h`) — it masked escape-vector-4.
+- **Bound, do NOT delete:** `kai_evidence_lookup_node` retained *only* for fiber-local builtins (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`, per `frame_is_fiber_local`) and `Ffi`. The scheduler installs their evidence per-fiber; transporting it across `spawn` is the hazard the clone caused. Bounded retention is correct, not debt.
+- **Gate (`KAI_EVIDENCE_FRAME_ONLY` grep-oracle):** a `kai_evidence_lookup_node("X")` in emitted C is allowed iff `X` is in the retained builtin set; every user / value-transportable effect MUST resolve by slot or fail to compile.
+
+**Objetivo (original, superseded).** Delete the three obsolete mechanisms so one resolution path remains — the load-bearing simplification.
 
 **Archivos/zonas (verified 2026-06-19):**
 - `kai_evidence_lookup_node` — **`stage2/runtime.h:11332`** + the stage0 twin, and all callers (emit_c `:2394` dead after L3).
