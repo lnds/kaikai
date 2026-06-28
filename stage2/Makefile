@@ -124,7 +124,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -3933,6 +3933,37 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	[ "$$leaked" -lt 100 ] \
 	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
+
+# Issue #950 — the native backend runs `test` blocks. `kai test` on the
+# fixture must produce the SAME summary + exit code on native as on the C
+# oracle (a pass, a caught failing assertion, and a test after the
+# failure), and the native runner must balance RC on both the pass and
+# the caught-fail path. Both backends are diffed against the golden, and
+# native's KAI_TRACE_RC report must show no leak.
+test-native-test-runner-950: $(TARGET) build
+	@set -e; \
+	src=../examples/native/test_runner_parity.kai; \
+	gold=../examples/native/test_runner_parity.out.expected; \
+	cexit=0; \
+	KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
+	diff -q $$gold build/s2-950tr-c.out > /dev/null \
+	  || { echo "native-test-runner-950 FAIL (C output diff)"; diff $$gold build/s2-950tr-c.out; exit 1; }; \
+	[ "$$cexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (C exit $$cexit != 1)"; exit 1; }; \
+	nexit=0; \
+	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
+	grep -E '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.rc 2>/dev/null || true; \
+	grep -vE '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.out 2>/dev/null || true; \
+	diff -q $$gold build/s2-950tr-n.out > /dev/null \
+	  || { echo "native-test-runner-950 FAIL (native output diff vs C oracle)"; diff $$gold build/s2-950tr-n.out; exit 1; }; \
+	[ "$$nexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (native exit $$nexit != 1, must match C)"; exit 1; }; \
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-950tr-n.rc | head -1 | cut -d= -f2); \
+	if [ -n "$$leaked" ]; then \
+	  [ "$$leaked" -eq 0 ] \
+	    && echo "native-test-runner-950 OK (native == C: summary 2/3, exit 1; RC leaked=0 on pass+caught-fail)" \
+	    || { echo "native-test-runner-950 FAIL (native RC leaked=$$leaked on the runner path)"; cat build/s2-950tr-n.rc; exit 1; }; \
+	else \
+	  echo "native-test-runner-950 OK (native == C: summary 2/3, exit 1; no RC trace line — KAI_TRACE_RC inert)"; \
+	fi
 
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
