@@ -1530,47 +1530,86 @@ fn desugar_var_decl(d: Decl) : Decl {
   }
 }
 
-# Pre-desugar validation: walk every fn / test body looking for bare
-# `EVar(name)` references where `name` is currently bound by an
-# enclosing `var name = init` (an SVar that has not yet been desugared
-# into the State[T] handler). The legitimate uses are
-# `name.get()` / `name.set(v)` (capability access) and `name := <expr>`
-# (cap write — the parser already lowers it before we get here, so it
-# surfaces as `name.set(v)`). Any other bare read leaks the cap binder
-# to the emitter as `kai_<name>`, which the linker rejects with an
-# unhelpful `undeclared identifier` from `cc`. Reporting at this layer
-# turns the post-cc opaque link error into a typed-hole-style hint at
-# the use site — a Tier 3 (LLM authorability) requirement.
+# Naked-cell-read lowering + escape veto. Walks every fn / test body
+# tracking the set `caps` of names currently bound as a mutable cell —
+# either by an enclosing `var name := init` (an SVar not yet rewritten
+# into a State[T] handler) or by a user-written `with State[T] as name`
+# / `with Reader[T] as name`. A bare `EVar(name)` for such a name is
+# lowered here to `name.get()`; the parser already lowered the write
+# `name := v` to `name.set(v)`. Doing the read lowering at this layer
+# (where the scope of each cell is known) keeps it out of the parser,
+# which cannot tell a cell read from an ordinary local read.
+#
+# Escape veto: a cell cannot be read or written from a closure whose
+# VALUE reaches the block's exit (tail / returned / stored in the exit
+# value), because the State[T] handler is torn down when the block
+# exits (the runtime is dynamic-scoping) — such a closure run later
+# reads a dead frame. A closure that is applied inside the block, or
+# passed as a call argument (applied eagerly), is sound and allowed.
+# The veto is a separate forward-taint walk (lcr_escape_check), not part
+# of the read lowering.
 #
 # Scope rules: SLet, lambda params, match arm patterns, fn params,
-# nested SVar with the same name, and handler `as` aliases all shadow
-# a `var` binder. Bare reads under those scopes are NOT flagged.
-#[doc("Reject `var` rebinds that escape their defining scope before the rewrite runs; returns the error count.")]
-pub fn validate_var_uses_decls(ds: [Decl], file: String) : Int / Console + File {
+# nested SVar with the same name, and non-cell handler `as` aliases all
+# shadow a cell binder; cell reads under those scopes are ordinary
+# locals, left untouched.
+pub type VarLow = { decls: [Decl], errs: Int }
+type VLExpr = { expr: Expr, errs: Int }
+type VLOpt  = { opt: Option[Expr], errs: Int }
+type VLExprs = { exprs: [Expr], errs: Int }
+type VLElems = { elems: [ListElem], errs: Int }
+type VLFields = { fields: [FieldInit], errs: Int }
+type VLArms = { arms: [Arm], errs: Int }
+type VLClauses = { clauses: [HClause], errs: Int }
+type VLStmts = { stmts: [Stmt], opt: Option[Expr], errs: Int }
 
-  validate_var_decls_loop(ds, file, 0)
-}
+#[doc("Lower naked reads of mutable cells to `cell.get()` and reject cell access that escapes its block; the entry point used before the SVar rewrite, where `@cell` is rejected.")]
+pub fn lower_cell_reads_decls(ds: [Decl], file: String) : VarLow / Console + File =
+  lcr_decls_loop(ds, true, file, [], 0)
 
-fn validate_var_decls_loop(ds: [Decl], file: String, errs: Int) : Int / Console + File {
+#[doc("Re-run of the cell-read lowering after string-interp lifting; `reject_at` is false because reads were already lowered, so `@cell` is no longer distinguishable from a generated `cell.get()`.")]
+pub fn relower_cell_reads_decls(ds: [Decl], file: String) : VarLow / Console + File =
+  lcr_decls_loop(ds, false, file, [], 0)
+
+fn lcr_decls_loop(ds: [Decl], reject_at: Bool, file: String, acc: [Decl], errs: Int) : VarLow / Console + File {
 
   match ds {
-    [] -> errs
+    [] -> VarLow { decls: list_reverse(acc), errs: errs }
     [d, ...rest] -> {
-      let e1 = match d {
-        DFn(_, _, _, ps, _, _, body, _, _, _) -> {
-          let pnames = dsg_rename_param_names(ps, [])
-          validate_var_in_expr(body, caps_minus_names([], pnames), file, errs)
-        }
-        DTest(_, body, _, _) -> validate_var_in_expr(body, [], file, errs)
-        DBench(_, body, _, _) -> validate_var_in_expr(body, [], file, errs)
-        DCheck(_, ps, body, _, _) -> {
-          let pnames = dsg_rename_param_names(ps, [])
-          validate_var_in_expr(body, caps_minus_names([], pnames), file, errs)
-        }
-        _ -> errs
-      }
-      validate_var_decls_loop(rest, file, e1)
+      let r = lcr_decl(d, reject_at, file, errs)
+      lcr_decls_loop(rest, reject_at, file, [r.decl, ...acc], r.errs)
     }
+  }
+}
+
+type VLDecl = { decl: Decl, errs: Int }
+
+fn lcr_decl(d: Decl, reject_at: Bool, file: String, errs: Int) : VLDecl / Console + File {
+
+  match d {
+    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) -> {
+      let pnames = dsg_rename_param_names(ps, [])
+      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
+      VLDecl { decl: DFn(pub_, n, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
+    }
+    DTest(desc, body, l, c) -> {
+      let r = lcr_expr(body, [], reject_at, file, errs)
+      VLDecl { decl: DTest(desc, r.expr, l, c), errs: r.errs }
+    }
+    DBench(desc, body, l, c) -> {
+      let r = lcr_expr(body, [], reject_at, file, errs)
+      VLDecl { decl: DBench(desc, r.expr, l, c), errs: r.errs }
+    }
+    DCheck(desc, ps, body, l, c) -> {
+      let pnames = dsg_rename_param_names(ps, [])
+      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
+      VLDecl { decl: DCheck(desc, ps, r.expr, l, c), errs: r.errs }
+    }
+    DUnstable(inner, l, c) -> {
+      let r = lcr_decl(inner, reject_at, file, errs)
+      VLDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
+    }
+    _ -> VLDecl { decl: d, errs: errs }
   }
 }
 
@@ -1590,256 +1629,546 @@ fn caps_minus_names(caps: [String], names: [String]) : [String] {
   }
 }
 
-fn validate_var_in_expr(e: Expr, caps: [String], file: String, errs: Int) : Int / Console + File {
+# A user-written `with State[T] as name` / `with Reader[T] as name`
+# binds `name` as a readable cell, the same as a desugared `var`. Other
+# effects' aliases (`with Console as c`) are ordinary capability values,
+# not cells, so their alias shadows rather than seeds the cell set.
+fn eff_is_cell(eff: String) : Bool = eff == "State" or eff == "Reader"
 
-  validate_var_in_kind(e.kind, caps, e.line, e.col, file, errs)
+fn lcr_expr(e: Expr, caps: [String], reject_at: Bool, file: String, errs: Int) : VLExpr / Console + File {
+
+  let r = lcr_kind(e.kind, caps, reject_at, e.line, e.col, file, errs)
+  VLExpr { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode },
+           errs: r.errs }
 }
 
-fn validate_var_in_opt(o: Option[Expr], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_opt(o: Option[Expr], caps: [String], reject_at: Bool, file: String, errs: Int) : VLOpt / Console + File {
 
   match o {
-    Some(e) -> validate_var_in_expr(e, caps, file, errs)
-    None    -> errs
+    Some(e) -> { let r = lcr_expr(e, caps, reject_at, file, errs)
+                 VLOpt { opt: Some(r.expr), errs: r.errs } }
+    None    -> VLOpt { opt: None, errs: errs }
   }
 }
 
-fn validate_var_in_exprs(es: [Expr], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_exprs(es: [Expr], caps: [String], reject_at: Bool, file: String, errs: Int) : VLExprs / Console + File {
 
   match es {
-    [] -> errs
+    [] -> VLExprs { exprs: [], errs: errs }
     [h, ...rest] -> {
-      let e1 = validate_var_in_expr(h, caps, file, errs)
-      validate_var_in_exprs(rest, caps, file, e1)
+      let r1 = lcr_expr(h, caps, reject_at, file, errs)
+      let r2 = lcr_exprs(rest, caps, reject_at, file, r1.errs)
+      VLExprs { exprs: [r1.expr, ...r2.exprs], errs: r2.errs }
     }
   }
 }
 
-fn validate_var_in_list_elem(le: ListElem, caps: [String], file: String, errs: Int) : Int / Console + File {
-
-  match le {
-    ElPlain(e) -> validate_var_in_expr(e, caps, file, errs)
-    ElSpread(e) -> validate_var_in_expr(e, caps, file, errs)
-  }
-}
-
-fn validate_var_in_list_elems(les: [ListElem], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_elems(les: [ListElem], caps: [String], reject_at: Bool, file: String, errs: Int) : VLElems / Console + File {
 
   match les {
-    [] -> errs
+    [] -> VLElems { elems: [], errs: errs }
     [h, ...rest] -> {
-      let e1 = validate_var_in_list_elem(h, caps, file, errs)
-      validate_var_in_list_elems(rest, caps, file, e1)
+      let r1 = match h {
+        ElPlain(e)  -> { let r = lcr_expr(e, caps, reject_at, file, errs)
+                         VLExpr { expr: r.expr, errs: r.errs } }
+        ElSpread(e) -> { let r = lcr_expr(e, caps, reject_at, file, errs)
+                         VLExpr { expr: r.expr, errs: r.errs } }
+      }
+      let wrapped = match h { ElPlain(_) -> ElPlain(r1.expr)  ElSpread(_) -> ElSpread(r1.expr) }
+      let r2 = lcr_elems(rest, caps, reject_at, file, r1.errs)
+      VLElems { elems: [wrapped, ...r2.elems], errs: r2.errs }
     }
   }
 }
 
-fn validate_var_in_field(f: FieldInit, caps: [String], file: String, errs: Int) : Int / Console + File {
-
-  match f {
-    FI(_, value) -> validate_var_in_expr(value, caps, file, errs)
-  }
-}
-
-fn validate_var_in_fields(fs: [FieldInit], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_fields(fs: [FieldInit], caps: [String], reject_at: Bool, file: String, errs: Int) : VLFields / Console + File {
 
   match fs {
-    [] -> errs
-    [h, ...rest] -> {
-      let e1 = validate_var_in_field(h, caps, file, errs)
-      validate_var_in_fields(rest, caps, file, e1)
+    [] -> VLFields { fields: [], errs: errs }
+    [FI(nm, v), ...rest] -> {
+      let r1 = lcr_expr(v, caps, reject_at, file, errs)
+      let r2 = lcr_fields(rest, caps, reject_at, file, r1.errs)
+      VLFields { fields: [FI(nm, r1.expr), ...r2.fields], errs: r2.errs }
     }
   }
 }
 
-fn validate_var_in_arm(a: Arm, caps: [String], file: String, errs: Int) : Int / Console + File {
-
-  match a {
-    Arm(p, g, b) -> {
-      let names = dsg_rename_pat_names(p, [])
-      let caps1 = caps_minus_names(caps, names)
-      let e1 = validate_var_in_opt(g, caps1, file, errs)
-      validate_var_in_expr(b, caps1, file, e1)
-    }
-  }
-}
-
-fn validate_var_in_arms(arms: [Arm], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_arms(arms: [Arm], caps: [String], reject_at: Bool, file: String, errs: Int) : VLArms / Console + File {
 
   match arms {
-    [] -> errs
-    [h, ...rest] -> {
-      let e1 = validate_var_in_arm(h, caps, file, errs)
-      validate_var_in_arms(rest, caps, file, e1)
+    [] -> VLArms { arms: [], errs: errs }
+    [Arm(p, g, b), ...rest] -> {
+      let names = dsg_rename_pat_names(p, [])
+      let caps1 = caps_minus_names(caps, names)
+      let rg = lcr_opt(g, caps1, reject_at, file, errs)
+      let rb = lcr_expr(b, caps1, reject_at, file, rg.errs)
+      let r2 = lcr_arms(rest, caps, reject_at, file, rb.errs)
+      VLArms { arms: [Arm(p, rg.opt, rb.expr), ...r2.arms], errs: r2.errs }
     }
   }
 }
 
-fn validate_var_in_clause(c: HClause, caps: [String], file: String, errs: Int) : Int / Console + File {
-
-  match c {
-    HC(_, ps, b, _, _) -> {
-      let pnames = dsg_rename_param_names(ps, [])
-      validate_var_in_expr(b, caps_minus_names(caps, pnames), file, errs)
-    }
-  }
-}
-
-fn validate_var_in_clauses(cs: [HClause], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_clauses(cs: [HClause], caps: [String], reject_at: Bool, file: String, errs: Int) : VLClauses / Console + File {
 
   match cs {
-    [] -> errs
-    [h, ...rest] -> {
-      let e1 = validate_var_in_clause(h, caps, file, errs)
-      validate_var_in_clauses(rest, caps, file, e1)
+    [] -> VLClauses { clauses: [], errs: errs }
+    [HC(nm, ps, b, l, c), ...rest] -> {
+      let pnames = dsg_rename_param_names(ps, [])
+      let rb = lcr_expr(b, caps_minus_names(caps, pnames), reject_at, file, errs)
+      let r2 = lcr_clauses(rest, caps, reject_at, file, rb.errs)
+      VLClauses { clauses: [HC(nm, ps, rb.expr, l, c), ...r2.clauses], errs: r2.errs }
     }
   }
 }
 
-fn validate_var_in_return(r: HReturn, caps: [String], file: String, errs: Int) : Int / Console + File {
-
-  match r {
-    HR(p, b, _, _) -> validate_var_in_expr(b, caps_remove_name(caps, p), file, errs)
-  }
+# Lower the naked cell read `EVar(name)` to `name.get()` (a `State.get`
+# call the alias rewrite later maps to `Reader.ask` for Reader cells).
+fn mk_cell_get(n: String, line: Int, col: Int) : ExprKind {
+  let cap = mk_expr(EVar(n), line, col)
+  let getter = mk_expr(EField(cap, "get"), line, col)
+  ECall(getter, [])
 }
 
-fn validate_var_in_kind(k: ExprKind, caps: [String], line: Int, col: Int, file: String, errs: Int) : Int / Console + File {
+fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File {
 
   match k {
     EVar(n) ->
       if list_has(caps, n) {
-        diag_error(file, line, col, concat_all([
-          "`", n, "` is a State capability bound by `var ", n, " = ...` — bare reads are not allowed"
-        ]))
-        diag_help(concat_all([
-          "use `@", n, "` to read the cell, `", n, " := <expr>` to write it; cap binders are not ordinary locals"
-        ]))
-        errs + 1
-      } else { errs }
+        VLExpr { expr: mk_expr(mk_cell_get(n, line, col), line, col), errs: errs }
+      } else { VLExpr { expr: mk_expr(EVar(n), line, col), errs: errs } }
     ECall(callee, args_) -> match callee.kind {
       EField(base, fname) -> match base.kind {
         EVar(n) ->
-          if list_has(caps, n) and (fname == "get" or fname == "set") {
-            # Legitimate cap usage. Skip the base; the get/set is the
-            # whole point of the binder. Validate the args under the
-            # same scope so nested misuses still surface.
-            validate_var_in_exprs(args_, caps, file, errs)
+          if fname == "__deref" {
+            if list_has(caps, n) {
+              # `@cell`. A `var`/`State`/`Reader` cell reads naked; `@`
+              # is the deref of a first-class `Ref[T]`, which a cell is
+              # not. Reject it.
+              diag_error(file, line, col, concat_all([
+                "`@", n, "` is not how a `var` cell is read — read it naked, as `", n, "`"
+              ]))
+              diag_help(concat_all([
+                "`@` dereferences a first-class `Ref[T]`; a `var`/`State`/`Reader` cell is block-local and reads without `@`"
+              ]))
+              let ra = lcr_exprs(args_, caps, reject_at, file, errs + 1)
+              VLExpr { expr: mk_expr(ECall(callee, ra.exprs), line, col), errs: ra.errs }
+            } else {
+              # `@ref` — deref of a `Ref[T]`. Rewrite the sentinel to the
+              # real `ref.get()`; the alias rewrite maps it to
+              # `Mutable.ref_get(ref)`.
+              let getter = mk_expr(EField(mk_expr(EVar(n), base.line, base.col), "get"), line, col)
+              let ra = lcr_exprs(args_, caps, reject_at, file, errs)
+              VLExpr { expr: mk_expr(ECall(getter, ra.exprs), line, col), errs: ra.errs }
+            }
+          } else if list_has(caps, n) and (fname == "get" or fname == "set") {
+            # A real State op on the cell: `n.get()` (also what a naked
+            # read lowers to) or `n.set(v)` (also what `n := v` lowers
+            # to). Legal — recurse into the args only, NOT the callee,
+            # whose `EVar(n)` base would re-lower to `n.get()` and yield
+            # `n.get().get()`. Escape is rejected separately.
+            let ra = lcr_exprs(args_, caps, reject_at, file, errs)
+            VLExpr { expr: mk_expr(ECall(callee, ra.exprs), line, col), errs: ra.errs }
           } else {
-            let e1 = validate_var_in_expr(callee, caps, file, errs)
-            validate_var_in_exprs(args_, caps, file, e1)
+            let rc = lcr_expr(callee, caps, reject_at, file, errs)
+            let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
+            VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
           }
         _ -> {
-          let e1 = validate_var_in_expr(callee, caps, file, errs)
-          validate_var_in_exprs(args_, caps, file, e1)
+          let rc = lcr_expr(callee, caps, reject_at, file, errs)
+          let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
+          VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
         }
       }
       _ -> {
-        let e1 = validate_var_in_expr(callee, caps, file, errs)
-        validate_var_in_exprs(args_, caps, file, e1)
+        let rc = lcr_expr(callee, caps, reject_at, file, errs)
+        let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
+        VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
       }
     }
-    EBlock(stmts, tail) -> validate_var_in_block(stmts, tail, caps, file, errs)
+    EBlock(stmts, tail) -> {
+      let r = lcr_block(stmts, tail, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EBlock(r.stmts, r.opt), line, col), errs: r.errs }
+    }
     ELambda(ps, body) -> {
       let pnames = dsg_rename_param_names(ps, [])
-      validate_var_in_expr(body, caps_minus_names(caps, pnames), file, errs)
+      let r = lcr_expr(body, caps_minus_names(caps, pnames), reject_at, file, errs)
+      VLExpr { expr: mk_expr(ELambda(ps, r.expr), line, col), errs: r.errs }
     }
     EMatch(scr, arms) -> {
-      let e1 = validate_var_in_expr(scr, caps, file, errs)
-      validate_var_in_arms(arms, caps, file, e1)
+      let rs = lcr_expr(scr, caps, reject_at, file, errs)
+      let ra = lcr_arms(arms, caps, reject_at, file, rs.errs)
+      VLExpr { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
     }
-    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
-      let e1 = validate_var_in_opt(init_opt, caps, file, errs)
+    EHandle(body, eff, tys, init_opt, alias_opt, clauses, ret_opt) -> {
+      let ri = lcr_opt(init_opt, caps, reject_at, file, errs)
       let body_caps = match alias_opt {
-        Some(a) -> caps_remove_name(caps, a)
-        None    -> caps
+        Some(a) ->
+          if eff_is_cell(eff) { [a, ...caps_remove_name(caps, a)] }
+          else { caps_remove_name(caps, a) }
+        None -> caps
       }
-      let e2 = validate_var_in_expr(body, body_caps, file, e1)
-      let e3 = validate_var_in_clauses(clauses, caps, file, e2)
-      match ret_opt {
-        Some(r) -> validate_var_in_return(r, caps, file, e3)
-        None    -> e3
+      let rb = lcr_expr(body, body_caps, reject_at, file, ri.errs)
+      # A user `with State/Reader as a` makes `a` a cell over the handle
+      # body; same escape rule as a `var`.
+      let esc = match alias_opt {
+        Some(a) -> if eff_is_cell(eff) { lcr_escape_in_value(rb.expr, a, file) } else { 0 }
+        None -> 0
       }
+      let rc = lcr_clauses(clauses, caps, reject_at, file, rb.errs + esc)
+      let rr = match ret_opt {
+        Some(HR(p, rbody, hl, hc)) -> {
+          let r = lcr_expr(rbody, caps_remove_name(caps, p), reject_at, file, rc.errs)
+          VLExpr { expr: r.expr, errs: r.errs }
+        }
+        None -> VLExpr { expr: mk_expr(EUnit, line, col), errs: rc.errs }
+      }
+      let ret_opt1 = match ret_opt {
+        Some(HR(p, _, hl, hc)) -> Some(HR(p, rr.expr, hl, hc))
+        None -> None
+      }
+      VLExpr { expr: mk_expr(EHandle(rb.expr, eff, tys, ri.opt, alias_opt, rc.clauses, ret_opt1), line, col), errs: rr.errs }
     }
-    EField(base, _) -> validate_var_in_expr(base, caps, file, errs)
+    EField(base, nm) -> {
+      let r = lcr_expr(base, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EField(r.expr, nm), line, col), errs: r.errs }
+    }
     EIndex(b, i) -> {
-      let e1 = validate_var_in_expr(b, caps, file, errs)
-      validate_var_in_expr(i, caps, file, e1)
+      let r1 = lcr_expr(b, caps, reject_at, file, errs)
+      let r2 = lcr_expr(i, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EIndex(r1.expr, r2.expr), line, col), errs: r2.errs }
     }
-    EBinop(_, a, b) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      validate_var_in_expr(b, caps, file, e1)
+    EBinop(op, a, b) -> {
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EBinop(op, r1.expr, r2.expr), line, col), errs: r2.errs }
     }
-    EUnop(_, x) -> validate_var_in_expr(x, caps, file, errs)
+    EUnop(op, x) -> {
+      let r = lcr_expr(x, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EUnop(op, r.expr), line, col), errs: r.errs }
+    }
     EIf(c, t_, eo) -> {
-      let e1 = validate_var_in_expr(c, caps, file, errs)
-      let e2 = validate_var_in_expr(t_, caps, file, e1)
-      validate_var_in_opt(eo, caps, file, e2)
+      let r1 = lcr_expr(c, caps, reject_at, file, errs)
+      let r2 = lcr_expr(t_, caps, reject_at, file, r1.errs)
+      let r3 = lcr_opt(eo, caps, reject_at, file, r2.errs)
+      VLExpr { expr: mk_expr(EIf(r1.expr, r2.expr, r3.opt), line, col), errs: r3.errs }
     }
-    EList(elems) -> validate_var_in_list_elems(elems, caps, file, errs)
+    EList(elems) -> {
+      let r = lcr_elems(elems, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EList(r.elems), line, col), errs: r.errs }
+    }
     EPipe(a, b) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      validate_var_in_expr(b, caps, file, e1)
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EPipe(r1.expr, r2.expr), line, col), errs: r2.errs }
     }
     EMapPipe(a, b) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      validate_var_in_expr(b, caps, file, e1)
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EMapPipe(r1.expr, r2.expr), line, col), errs: r2.errs }
     }
     EFlatMapPipe(a, b) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      validate_var_in_expr(b, caps, file, e1)
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EFlatMapPipe(r1.expr, r2.expr), line, col), errs: r2.errs }
     }
     EFilterPipe(a, b) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      validate_var_in_expr(b, caps, file, e1)
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      VLExpr { expr: mk_expr(EFilterPipe(r1.expr, r2.expr), line, col), errs: r2.errs }
     }
     ERange(a, b, opt_step) -> {
-      let e1 = validate_var_in_expr(a, caps, file, errs)
-      let e2 = validate_var_in_expr(b, caps, file, e1)
-      validate_var_in_opt(opt_step, caps, file, e2)
+      let r1 = lcr_expr(a, caps, reject_at, file, errs)
+      let r2 = lcr_expr(b, caps, reject_at, file, r1.errs)
+      let r3 = lcr_opt(opt_step, caps, reject_at, file, r2.errs)
+      VLExpr { expr: mk_expr(ERange(r1.expr, r2.expr, r3.opt), line, col), errs: r3.errs }
     }
-    ERecordLit(_, fields) -> validate_var_in_fields(fields, caps, file, errs)
-    EBang(inner) -> validate_var_in_expr(inner, caps, file, errs)
-    ELitUnit(inner, _) -> validate_var_in_expr(inner, caps, file, errs)
-    _ -> errs
+    ERecordLit(nm, fields) -> {
+      let r = lcr_fields(fields, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(ERecordLit(nm, r.fields), line, col), errs: r.errs }
+    }
+    EBang(inner) -> {
+      let r = lcr_expr(inner, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EBang(r.expr), line, col), errs: r.errs }
+    }
+    ELitUnit(inner, u) -> {
+      let r = lcr_expr(inner, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(ELitUnit(r.expr, u), line, col), errs: r.errs }
+    }
+    _ -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
   }
 }
 
-fn validate_var_in_block(stmts: [Stmt], tail: Option[Expr], caps: [String], file: String, errs: Int) : Int / Console + File {
+fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool, file: String, errs: Int) : VLStmts / Console + File {
 
   match stmts {
-    [] -> validate_var_in_opt(tail, caps, file, errs)
+    [] -> { let r = lcr_opt(tail, caps, reject_at, file, errs)
+            VLStmts { stmts: [], opt: r.opt, errs: r.errs } }
     [s, ...rest] -> match s {
-      SLet(p, _, rhs) -> {
-        let e1 = validate_var_in_expr(rhs, caps, file, errs)
+      SLet(p, ann, rhs) -> {
+        let r = lcr_expr(rhs, caps, reject_at, file, errs)
         let names = dsg_rename_pat_names(p, [])
-        validate_var_in_block(rest, tail, caps_minus_names(caps, names), file, e1)
+        let r2 = lcr_block(rest, tail, caps_minus_names(caps, names), reject_at, file, r.errs)
+        VLStmts { stmts: [SLet(p, ann, r.expr), ...r2.stmts], opt: r2.opt, errs: r2.errs }
       }
-      SVar(n, _, rhs, _, _) -> {
-        # The init is evaluated under the *outer* caps (a `var n = n`
-        # is a self-shadow only after the binder appears, F# / Rust
-        # convention).
-        let e1 = validate_var_in_expr(rhs, caps, file, errs)
-        # From this point the new var binder shadows any same-named
-        # outer cap and adds itself to the live set.
+      SVar(n, ty, rhs, l, c) -> {
+        # The init runs under the *outer* caps (`var n := n` self-shadows
+        # only after the binder, F# / Rust convention).
+        let r = lcr_expr(rhs, caps, reject_at, file, errs)
         let caps1 = [n, ...caps_remove_name(caps, n)]
-        validate_var_in_block(rest, tail, caps1, file, e1)
+        let r2 = lcr_block(rest, tail, caps1, reject_at, file, r.errs)
+        # `rest` + `tail` is exactly the block the var's `State[n]`
+        # handler wraps. Reject a closure that reads/writes `n` and whose
+        # value reaches the block's exit (tail / returned / stored) — the
+        # handler is gone by the time such a closure could run.
+        let esc = lcr_escape_check(r2.stmts, r2.opt, n, file)
+        VLStmts { stmts: [SVar(n, ty, r.expr, l, c), ...r2.stmts], opt: r2.opt, errs: r2.errs + esc }
       }
       SExprStmt(x) -> {
-        let e1 = validate_var_in_expr(x, caps, file, errs)
-        validate_var_in_block(rest, tail, caps, file, e1)
+        let r = lcr_expr(x, caps, reject_at, file, errs)
+        let r2 = lcr_block(rest, tail, caps, reject_at, file, r.errs)
+        VLStmts { stmts: [SExprStmt(r.expr), ...r2.stmts], opt: r2.opt, errs: r2.errs }
       }
-      SIndexAssign(b, i, v, _, _) -> {
-        let e1 = validate_var_in_expr(b, caps, file, errs)
-        let e2 = validate_var_in_expr(i, caps, file, e1)
-        let e3 = validate_var_in_expr(v, caps, file, e2)
-        validate_var_in_block(rest, tail, caps, file, e3)
+      SIndexAssign(b, i, v, l, c) -> {
+        let r1 = lcr_expr(b, caps, reject_at, file, errs)
+        let r2 = lcr_expr(i, caps, reject_at, file, r1.errs)
+        let r3 = lcr_expr(v, caps, reject_at, file, r2.errs)
+        let r4 = lcr_block(rest, tail, caps, reject_at, file, r3.errs)
+        VLStmts { stmts: [SIndexAssign(r1.expr, r2.expr, r3.expr, l, c), ...r4.stmts], opt: r4.opt, errs: r4.errs }
       }
       SAssert(c, m) -> {
-        let e1 = validate_var_in_expr(c, caps, file, errs)
-        let e2 = validate_var_in_opt(m, caps, file, e1)
-        validate_var_in_block(rest, tail, caps, file, e2)
+        let r1 = lcr_expr(c, caps, reject_at, file, errs)
+        let r2 = lcr_opt(m, caps, reject_at, file, r1.errs)
+        let r3 = lcr_block(rest, tail, caps, reject_at, file, r2.errs)
+        VLStmts { stmts: [SAssert(r1.expr, r2.opt), ...r3.stmts], opt: r3.opt, errs: r3.errs }
       }
-      SUse(_, _, _) -> validate_var_in_block(rest, tail, caps, file, errs)
+      SUse(nm, l, c) -> {
+        let r = lcr_block(rest, tail, caps, reject_at, file, errs)
+        VLStmts { stmts: [SUse(nm, l, c), ...r.stmts], opt: r.opt, errs: r.errs }
+      }
     }
+  }
+}
+
+# Escape check for a cell `n` over its block (the `stmts` + `tail` the
+# `State[n]` handler wraps). A closure that accesses `n` is legal as
+# long as its VALUE never reaches the block's exit; once the block
+# exits the handler is gone, so such a closure run later reads a dead
+# frame. Forward-taint each `let f = <value carrying such a closure>`,
+# then test whether the block's exit value carries one. Applying a
+# tainted binder (`f()`) consumes the closure — its result, not `f`,
+# flows on — which is what keeps `let f = () => n; let r = f()` legal.
+fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], n: String, file: String) : Int / Console + File {
+
+  let tainted = lcr_taint_stmts(stmts, n, [])
+  match escaping_closure_opt(tail, n, tainted) {
+    Some(p) -> report_cell_escape(n, p, file)
+    None    -> 0
+  }
+}
+
+fn report_cell_escape(n: String, p: CellPos, file: String) : Int / Console + File {
+  diag_error(file, p.line, p.col, concat_all([
+    "a closure that accesses the mutable cell `", n, "` escapes its block"
+  ]))
+  diag_help(concat_all([
+    "the `State` handler for `", n, "` is torn down when the block exits; the cell does not outlive the block, so the closure cannot run later"
+  ]))
+  1
+}
+
+# A single exit value (a handle body that is not a block). Same rule
+# with no preceding statements to taint.
+fn lcr_escape_in_value(e: Expr, n: String, file: String) : Int / Console + File {
+
+  match e.kind {
+    EBlock(stmts, tail) -> lcr_escape_check(stmts, tail, n, file)
+    _ -> match escaping_closure_pos(e, n, []) {
+           Some(p) -> report_cell_escape(n, p, file)
+           None    -> 0
+         }
+  }
+}
+
+# Forward pass: a `let f = rhs` taints `f` when `rhs` (in value
+# position) carries a closure accessing `n`. Only `let`-bound names
+# are tracked — other statements introduce no exit-reaching binder.
+fn lcr_taint_stmts(stmts: [Stmt], n: String, tainted: [String]) : [String] {
+
+  match stmts {
+    [] -> tainted
+    [s, ...rest] -> match s {
+      SLet(p, _, rhs) -> {
+        let t1 = match p.pkind {
+          PBind(f) -> match escaping_closure_pos(rhs, n, tainted) { Some(_) -> [f, ...tainted]  None -> tainted }
+          _ -> tainted
+        }
+        lcr_taint_stmts(rest, n, t1)
+      }
+      _ -> lcr_taint_stmts(rest, n, tainted)
+    }
+  }
+}
+
+# The source position of the escaping closure, for the diagnostic.
+type CellPos = { line: Int, col: Int }
+
+# If the value of `e` carries a closure that accesses cell `n` and has
+# not been applied, return the closure's position; else None. The access
+# `n.get()`/`n.set()` itself is fine (consumed in place); a bare lambda
+# or a tainted binder is the escaping value; applying either consumes
+# it. Call arguments are not followed — a lambda passed as an argument
+# runs eagerly inside the block.
+fn escaping_closure_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] {
+
+  match e.kind {
+    ELambda(_, body) -> if contains_cell_access(body, n) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    EVar(f) -> if list_has(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    ECall(callee, _) -> match callee.kind {
+      # `f(...)` / `(\...)(...)` — applying consumes the closure; the
+      # value is the call result, never the closure itself.
+      EVar(_) -> None
+      ELambda(_, _) -> None
+      # Any other callee (a field access, a nested call) might itself
+      # carry the closure; the arguments do not.
+      _ -> escaping_closure_pos(callee, n, tainted)
+    }
+    EIf(_, t_, eo) -> first_pos(escaping_closure_pos(t_, n, tainted),
+                                escaping_closure_opt(eo, n, tainted))
+    EMatch(_, arms) -> arms_escaping_pos(arms, n, tainted)
+    EBlock(ss, t) -> {
+      let inner = lcr_taint_stmts(ss, n, tainted)
+      escaping_closure_opt(t, n, inner)
+    }
+    EList(elems) -> elems_escaping_pos(elems, n, tainted)
+    ERecordLit(_, fields) -> fields_escaping_pos(fields, n, tainted)
+    EField(base, _) -> escaping_closure_pos(base, n, tainted)
+    EBang(inner) -> escaping_closure_pos(inner, n, tainted)
+    ELitUnit(inner, _) -> escaping_closure_pos(inner, n, tainted)
+    _ -> None
+  }
+}
+
+fn first_pos(a: Option[CellPos], b: Option[CellPos]) : Option[CellPos] =
+  match a { Some(_) -> a  None -> b }
+
+fn escaping_closure_opt(o: Option[Expr], n: String, tainted: [String]) : Option[CellPos] =
+  match o { Some(e) -> escaping_closure_pos(e, n, tainted)  None -> None }
+
+fn arms_escaping_pos(arms: [Arm], n: String, tainted: [String]) : Option[CellPos] {
+  match arms {
+    [] -> None
+    [Arm(_, _, b), ...rest] ->
+      first_pos(escaping_closure_pos(b, n, tainted), arms_escaping_pos(rest, n, tainted))
+  }
+}
+
+fn elems_escaping_pos(es: [ListElem], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [el, ...rest] -> {
+      let here = match el {
+        ElPlain(x)  -> escaping_closure_pos(x, n, tainted)
+        ElSpread(x) -> escaping_closure_pos(x, n, tainted)
+      }
+      first_pos(here, elems_escaping_pos(rest, n, tainted))
+    }
+  }
+}
+
+fn fields_escaping_pos(fs: [FieldInit], n: String, tainted: [String]) : Option[CellPos] {
+  match fs {
+    [] -> None
+    [FI(_, v), ...rest] ->
+      first_pos(escaping_closure_pos(v, n, tainted), fields_escaping_pos(rest, n, tainted))
+  }
+}
+
+# `n.get()` or `n.set(...)` appears anywhere in `e` — the lowered shape
+# of a naked read or a `n := v` write of the cell.
+fn contains_cell_access(e: Expr, n: String) : Bool {
+  match e.kind {
+    ECall(callee, args_) -> {
+      let here = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EVar(m) -> m == n and (fname == "get" or fname == "set")
+          _ -> false
+        }
+        _ -> false
+      }
+      here or contains_cell_access(callee, n) or any_contains_cell_access(args_, n)
+    }
+    ELambda(_, body) -> contains_cell_access(body, n)
+    EField(base, _) -> contains_cell_access(base, n)
+    EIndex(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EBinop(_, a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EUnop(_, x) -> contains_cell_access(x, n)
+    EIf(c, t_, eo) -> contains_cell_access(c, n) or contains_cell_access(t_, n) or
+      (match eo { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EBlock(ss, t) -> stmts_contain_cell_access(ss, n) or
+      (match t { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EMatch(scr, arms) -> contains_cell_access(scr, n) or arms_contain_cell_access(arms, n)
+    EList(elems) -> elems_contain_cell_access(elems, n)
+    ERecordLit(_, fields) -> fields_contain_cell_access(fields, n)
+    ERange(a, b, os) -> contains_cell_access(a, n) or contains_cell_access(b, n) or
+      (match os { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EMapPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EFlatMapPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EFilterPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EBang(inner) -> contains_cell_access(inner, n)
+    ELitUnit(inner, _) -> contains_cell_access(inner, n)
+    _ -> false
+  }
+}
+
+fn any_contains_cell_access(es: [Expr], n: String) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if contains_cell_access(h, n) { true } else { any_contains_cell_access(rest, n) }
+  }
+}
+
+fn stmts_contain_cell_access(ss: [Stmt], n: String) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> contains_cell_access(rhs, n)
+        SExprStmt(x) -> contains_cell_access(x, n)
+        SAssert(c, m) -> contains_cell_access(c, n) or (match m { Some(x) -> contains_cell_access(x, n)  None -> false })
+        SIndexAssign(b, i, v, _, _) -> contains_cell_access(b, n) or contains_cell_access(i, n) or contains_cell_access(v, n)
+        SVar(_, _, rhs, _, _) -> contains_cell_access(rhs, n)
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { stmts_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn arms_contain_cell_access(arms: [Arm], n: String) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, g, b), ...rest] -> {
+      let here = (match g { Some(x) -> contains_cell_access(x, n)  None -> false }) or contains_cell_access(b, n)
+      if here { true } else { arms_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn elems_contain_cell_access(es: [ListElem], n: String) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> contains_cell_access(x, n)  ElSpread(x) -> contains_cell_access(x, n) }
+      if here { true } else { elems_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn fields_contain_cell_access(fs: [FieldInit], n: String) : Bool {
+  match fs {
+    [] -> false
+    [FI(_, v), ...rest] -> if contains_cell_access(v, n) { true } else { fields_contain_cell_access(rest, n) }
   }
 }
 
@@ -1913,7 +2242,7 @@ fn var_canonical_return(line: Int, col: Int) : HReturn {
   HR("x", mk_expr(EVar("x"), line, col), line, col)
 }
 
-# Variable specialisation: a `var x = init; @x; x := v` block compiles
+# Variable specialisation: a `var x := init; x; x := v` block compiles
 # to a stack slot, not a chain of handler invocations. The specialised
 # form replaces the canonical `with State[T] as x` handler with:
 #   let x_slot = array_make(1, init)
@@ -1962,14 +2291,16 @@ fn init_args_safe(es: [Expr]) : Bool {
   }
 }
 
-# Scan a string-literal source span (quotes included) for a `@name`
-# cap-read inside any `#{...}` interpolation region. The interp
+# Scan a string-literal source span (quotes included) for a naked
+# `name` cell-read inside any `#{...}` interpolation region. The interp
 # body is not parsed at this pre-resolve stage, so the structural escape
-# walk cannot see the `@name` that `desugar_interp_decls` will later lift
-# into `name.get()`. A pure lexical scan over the interp regions is
-# enough — a match disables the array-slot specialisation and keeps the
-# canonical `State[T] as name` handler (always correct, just less
-# optimised). False positives only cost the cheaper lowering, never
+# walk cannot see the read that `desugar_interp_decls` will later lift,
+# and that the post-interp cell-read lowering will turn into
+# `name.get()`. A pure lexical scan over the interp regions is enough —
+# a match disables the array-slot specialisation and keeps the canonical
+# `State[T] as name` handler (always correct, just less optimised), so
+# the lifted `name.get()` still has the `as name` binder to resolve
+# against. False positives only cost the cheaper lowering, never
 # correctness, so the scan stays conservative.
 fn interp_span_reads_cap(span: String, is_triple: Bool, name: String) : Bool {
   let n = string_length(span)
@@ -1980,9 +2311,9 @@ fn interp_span_reads_cap(span: String, is_triple: Bool, name: String) : Bool {
 }
 
 # Walk the literal body looking for an interpolation opener `#{`. On a
-# hit, scan the brace-balanced interp region for `@name`; otherwise
-# advance one char. Mirrors `iscan_collect`'s opener detection without
-# importing fnreg (which would form a desugar↔infer cycle).
+# hit, scan the brace-balanced interp region for a naked `name`;
+# otherwise advance one char. Mirrors `iscan_collect`'s opener detection
+# without importing fnreg (which would form a desugar↔infer cycle).
 fn icap_scan(span: String, i: Int, end: Int, name: String) : Bool {
   if i + 1 >= end { false }
   else {
@@ -2019,23 +2350,26 @@ fn icap_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
   }
 }
 
-# True when `@name` (the cap-read sugar) appears in [start, end), with
-# `name` delimited so `@tallyx` does not match a read of `tally`.
+# True when a naked `name` cell-read appears in [start, end), delimited
+# on both sides so `tallyx`/`xtally` do not match a read of `tally`. The
+# char before must not be an identifier continuation (so `mytally` is
+# skipped); the char after is checked by `dsg_matches_at`. A false
+# positive (e.g. a field `r.tally` after a `.`) only forces the safe
+# canonical handler, never miscompiles.
 fn icap_region_reads(span: String, i: Int, end: Int, name: String) : Bool {
   if i >= end { false }
   else {
-    match char_at(span, i) {
-      Some(c) ->
-        if c == '@' and dsg_matches_at(span, i + 1, end, name) { true }
-        else { icap_region_reads(span, i + 1, end, name) }
-      None -> false
-    }
+    let prev_cont = if i == 0 { false }
+                    else { match char_at(span, i - 1) {
+                      Some(pc) -> dsg_ident_cont(pc)  None -> false } }
+    if not prev_cont and dsg_matches_at(span, i, end, name) { true }
+    else { icap_region_reads(span, i + 1, end, name) }
   }
 }
 
 # True when `name` occurs at index `i` of `span` (bounded by `end`) and
 # the character right after it is not an identifier continuation, so
-# `@tally` matches `tally` but `@tallyx` does not.
+# `tally` matches `tally` but not the prefix of `tallyx`.
 fn dsg_matches_at(span: String, i: Int, end: Int, name: String) : Bool {
   let nn = string_length(name)
   if i + nn > end { false }
@@ -2075,14 +2409,14 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EReal(_, _) -> false
     EBool(_) -> false
     EChar(_) -> false
-    # A `@name` cap-read hidden inside a `#{...}` interpolation is
-    # invisible to the structural walk (the interp
-    # body is still a raw source span at this pre-resolve stage).
-    # Treating it as an escape forces the canonical `State[T] as name`
-    # handler, which keeps `name` in scope when `desugar_interp_decls`
-    # later parses `@name` into `name.get()`. The cheaper array-slot
-    # specialisation would have dropped the binder and the lifted
-    # `name.get()` would resolve to nothing.
+    # A naked `name` cell-read hidden inside a `#{...}` interpolation is
+    # invisible to the structural walk (the interp body is still a raw
+    # source span at this pre-resolve stage). Treating it as an escape
+    # forces the canonical `State[T] as name` handler, which keeps `name`
+    # in scope when `desugar_interp_decls` lifts the read and the
+    # post-interp cell-read lowering turns it into `name.get()`. The
+    # cheaper array-slot specialisation would have dropped the binder and
+    # the lifted `name.get()` would resolve to nothing.
     EStr(span, is_triple) -> interp_span_reads_cap(span, is_triple, name)
     EUnit -> false
     EUnder -> false
@@ -2242,9 +2576,9 @@ fn contains_var(name: String, e: Expr) : Bool {
     EFilterPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
     EBang(inner) -> contains_var(name, inner)
-    # A `@name` read inside a `#{...}` interpolation counts
-    # as a mention for the conservative lambda-capture check, the same
-    # as it does for `body_escapes`.
+    # A naked `name` read inside a `#{...}` interpolation counts as a
+    # mention for the conservative lambda-capture check, the same as it
+    # does for `body_escapes`.
     EStr(span, is_triple) -> interp_span_reads_cap(span, is_triple, name)
     _ -> false
   }
