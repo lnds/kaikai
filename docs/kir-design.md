@@ -1,12 +1,15 @@
 # KIR — kaikai Intermediate Representation (design)
 
-**Status:** Lane 0 (KIR types + AST→KIR lowering + `--emit=kir` dumper) shipped on
-main; lowering-completion (interp/closures/effects) in progress. Lane 1
-(in-process libLLVM backend) is the destination, not yet started.
+**Status:** Lane 0 (KIR types + AST→KIR lowering + `--emit=kir` dumper) and Lane 1
+(in-process libLLVM backend) shipped on main. Lane 1.5 flipped the default to
+native (2026-06-16, #851) and the llvm-text backend was removed (#850), so
+`--backend=native` is now the user default; a `kaic2` built without libLLVM
+degrades the implicit default to C. Lane 2 (migrate the C-text backend under KIR)
+is deferrable cleanup, off the critical path.
 **Scope:** stage 2 only. Does not touch the bootstrap contract (stages 0–1 keep
 emitting portable C from any `cc`). The in-process libLLVM backend is the
-destination DEFAULT for users (native binary, no external toolchain); it enters
-opt-in for validation and a later lane flips the default. libLLVM never enters the
+DEFAULT for users (native binary, no external toolchain); it shipped opt-in for
+validation and Lane 1.5 flipped the default (#851). libLLVM never enters the
 bootstrap chain — bootstrap stays on the C path, which also remains the
 differential oracle.
 **Motivation:** (1) strategic — KIR is the launch platform for a native, in-process
