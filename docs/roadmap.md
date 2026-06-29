@@ -1,11 +1,14 @@
 # kaikai roadmap
 
-Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-05-20 (HEAD
-0.79.0, post the LSP v1 → v2 → v3 wave that closed #447 — hover,
-goto-def, publishDiagnostics, documentSymbol, completion,
-signatureHelp, plus hole warning diagnostics — and exposed the
-`--diags-json` / `--effects-json` / `--library-mode` flags on
-`kai build`). Names follow the Rapa Nui convention already in use across
+Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-06-29 (HEAD
+0.94.0, post the 0.79 → 0.94 arc: the in-process libLLVM backend
+became the default (#851) and the llvm-text backend was removed
+(#850); user-effect dispatch moved to capability passing with named
+instances and hybrid dispatch (#820); the compile-time cache chain
+closed its last load-bearing item, Phase B (#455); stage 2 began its
+per-phase modularization (#677); and lazy `Stream[t, e]` landed in
+stdlib (#801)). The prior pin tracked the LSP v1 → v2 → v3 wave that
+closed #447 at 0.79.0. Names follow the Rapa Nui convention already in use across
 the project (the language `kaikai` itself, the framework `ahu`,
 the web framework `manutara`). Each milestone is a real Rapa Nui
 site; the sequence Tongariki → Hanga Roa → Orongo → Anakena tracks
@@ -26,21 +29,49 @@ when discussing 1.0 readiness):
 
 ## Status snapshot
 
-- **HEAD**: `0.79.0` (post the LSP v1 → v2 → v3 wave 2026-05-09 →
-  2026-05-20 closing #447 — hover, goto-def, publishDiagnostics,
-  documentSymbol, completion, signatureHelp, plus hole warning
-  diagnostics — and the `kai build` JSON-flag surface
-  (`--diags-json`, `--effects-json`, `--library-mode`,
-  `--effect-holes-json`)). The earlier `0.69.0` pin tracked the
-  2026-05-15→2026-05-16 reactor wave closing #611 (R1
-  file/sleep/process), #620 (R3 stdin), #630 (R2 TCP), the cache
-  chain closing #452 (Phase A.0) + #592 (KAB2) + #597
-  (lower_protocols boundary tagging), the Hanga Roa-precondition
-  fixes #643/#644/#645, and the mirror pipeline fix #649. The
-  prior `0.54.3` pin tracked the negative-space audit phase 2;
-  the run from 0.55 → 0.69 was the bug-bash week (LLVM default
-  handlers #570/#582/#587, edition dispatch #603) plus the reactor
-  wave plus the cache chain that landed in 2026-05-14→2026-05-16.
+- **HEAD**: `0.94.0`. The 0.79 → 0.94 arc (2026-05-20 → 2026-06-29)
+  was dominated by seven waves, all inside the Hanga Roa edition:
+  - **Native backend default** — the in-process libLLVM backend
+    (`--backend=native`) became the default (PR #851) and the
+    llvm-text backend was removed (#850). It now implements mandatory
+    TCO (#706), carries the Perceus RC discipline (cons/variant leaks
+    #860/#868/#872 + the `kai_op_eq` UAF #858 closed), static-links
+    libLLVM to drop external clang (#497), runs opt passes in-process
+    (#498), caches bitcode (#499), and runs the dev-loop subcommands
+    `test`/`bench`/`watch` C-free (#950). Backend-parity audit #622.
+  - **User-effect dispatch overhaul (#820)** — by-name dynamic
+    dispatch retired for user effects in favour of capability passing
+    with first-class named instances (`with Eff as a`) and hybrid
+    dispatch; a bounded lookup is retained for fiber-local builtins +
+    `Ffi`. Evidence frames thread through both backends; the op-name
+    evidence-collision corruption (#789) is fixed. Builtin effects
+    migrated from compiler AST into stdlib source (#866).
+  - **Compile-time perf + Phase B** — Phase A.1 core post-typecheck
+    cache (#825) + A.2 (#461) + Phase B user-file incremental cache
+    (#455) closed DoD #6's last load-bearing item. A quadratic sweep
+    (#911/#914/#915/#916/#937) plus the emitter `Array[Byte]`
+    accumulator (#901/#910) cut self-compile RSS from ~9 to ~5 GB and
+    recovered throughput.
+  - **Stage 2 modularization (#677)** — per-phase source split (#580)
+    + `.kaii` interface persistence (#760); separate compilation
+    (cross-module monomorph + per-module LLVM) is in progress (#963).
+  - **Stdlib surface** — lazy `Stream[t, e]` + pipe combinators (#801)
+    and chunked file reading (#771); civil date/calendar v1 (#767);
+    protocol-bounded free-fn generics + generalised aggregates
+    (#877/#891); `StringBuilder` (#902) and AVL-backed `Set` (#936);
+    codepoint-correct String/Char fixes (#744/#926/#935); `#[doc]`
+    attribute migration + coverage audit (#681/#774); opaque `Instant`
+    (#867); `KAI_MAX_HEAP` ceiling (#878).
+  - **Concurrency** — nursery auto-join + cancel-on-fail completes the
+    structured-concurrency semantics (#959); `Spawn.cancel` now reaches
+    parked fibers (#679/#682); `Actor.receive_timeout` (#638) and
+    `spawn_actor_policy` (#763) landed.
+  - **Tooling + surface ergonomics** — `kai lint` subcommand, phase 1
+    (#966); `kai fmt` completed to the full language surface with a
+    self-hosting ratchet (#781/#786); naked cell read + `var x := init`
+    with `@` as Ref-deref (#956); point-free sections on method calls
+    and chained fields (#958); block lambda pattern binder
+    `{ (a, b) -> ... }` (#970).
 - **Current target**: **kaikai-Hanga Roa** — de-facto since
   ~2026-05-03 with the protocols + ergonomics precondition chain.
   Tongariki MVP closed 2026-05-02 via PR #73 (issue #59 — m8.x
@@ -65,17 +96,20 @@ when discussing 1.0 readiness):
   - Tier 1 #1 (memory safety + effects in types) — defendible
   - Tier 1 #2 (mandatory TCO) — defendible without footnote as of 0.23.0
   - Tier 1 #3 (fast compilation) — defendible
-- **Inner-loop perf**: ~2.0× C reference under -O2 on
-  compute-bound code (post Real unboxing in 0.27.0). Target
-  trajectory bifurcates at Hanga Roa by workload class
-  (see DoD #3 below): compute-bound code → ≤ 1.5–2× C in-MVP;
-  structural data traversal → ≤ 5–10× C in-MVP, ≤ 2× post-MVP
-  via Phase 3. Orongo: near-C on compute-bound with multi-thread
-  + Tier 3b unboxed messages.
-- **Selfhost**: per-compiler determinism under both C and LLVM
-  backends — `kaic2b` and `kaic2c` (stage 2 compiled by itself, twice)
-  produce byte-identical output. Stage 1's output is not required to
-  match (see
+- **Inner-loop perf**: compute-bound code at C parity — fib(35) =
+  1.0× C, Euler #4 = 1.05× C (post Phase 3 unboxing #383). Structural
+  traversal: red-black tree at **2.64× C wall / 1.17× C RSS /
+  garbage-free** (`docs/benchmarks/rb_tree_2026-06-02.md`). The
+  default `--backend=native` reaches C parity on scalar arithmetic
+  (#853/#857/#859); its cons/list and non-tail-call residuals
+  (#858/#860/#861) closed through 2026-06-19. The remaining native-vs-C
+  gap is heap-bound traversal tuning (`list_fold`/`rbtree`); numbers in
+  `docs/native-codegen-perf-plan.md`. Orongo target: near-C on
+  compute-bound with multi-thread + Tier 3b unboxed messages.
+- **Selfhost**: per-compiler determinism — `kaic2b` and `kaic2c`
+  (stage 2 compiled by itself, twice) produce byte-identical output.
+  The native backend is now the default; the C backend remains the
+  selfhost oracle. Stage 1's output is not required to match (see
   `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
 
 ## Milestones — kaikai language
@@ -270,13 +304,16 @@ diagnostic surface stabilised, LSP needs the protocol resolver,
 and `check` v2 (`Arbitrary`) needs `protocol P[A]` plus the
 polymorphic-impl machinery.
 
-**Scope — closure status (refreshed 2026-05-20, HEAD v0.79.0)**:
+**Scope — closure status (refreshed 2026-06-29, HEAD v0.94.0)**:
 
 The original Hanga Roa scope was six items: m11 diagnostics, LSP,
 bench v1.x, check shrinking, reuse-in-place, plus the compile-time
-perf chain pinned in DoD #6. Five of those six items have shipped;
-only Phase B of the cache chain (#455) remains load-bearing for
-Hanga Roa closure.
+perf chain pinned in DoD #6. **All six have shipped** — Phase B
+(#455), the last load-bearing item, closed 2026-06-12. The edition
+then absorbed a large architectural wave that was not in the original
+six (native backend default #851, user-effect dispatch #820, stage 2
+modularization #677, lazy streams #801); see the §Status snapshot
+HEAD bullet for the full 0.79 → 0.94 arc.
 
 - ~~**m11 diagnostics quality pass**~~ ✅ **shipped 2026-05-03 → 2026-05-15**.
   Elm/Rust-grade error messages with stable JSON alongside the
@@ -314,11 +351,10 @@ Hanga Roa closure.
     interaction so reuse-in-place actually fires.
   - #210 (`e8cf955`): typer-aware shape predicate enables
     variant + record reuse-in-place (PR #289).
-- **Compile-time perf chain (DoD #6)** — see §DoD #6 below.
-  Phase A.0 + A.1 + A.2 + KAB2 binary format all shipped; only
-  Phase B (user-file incremental cache, #455) remains. Phase B
-  is the **single load-bearing pre-1.0 item** still open for
-  Hanga Roa closure.
+- ~~**Compile-time perf chain (DoD #6)**~~ ✅ **complete** — see
+  §DoD #6 below. Phase A.0 + A.1 (#825) + A.2 (#461) + KAB2 binary
+  format + Phase B user-file incremental cache (#455, closed
+  2026-06-12) all shipped.
 
 **Definition of Done** (closure status refreshed 2026-05-20):
 
@@ -366,10 +402,9 @@ Hanga Roa closure.
 6. **Compile-time performance — DoD #6 (added 2026-05-11)**:
    - **Tiny program cold compile** (empty fn, no user imports):
      ≤ 300 ms wall, ≤ 100 MB RSS. Phase A.0 + KAB2 landed
-     2026-05-14 → 2026-05-16 (#452 + #592); re-measure pending
-     post-Phase B.
+     2026-05-14 → 2026-05-16 (#452 + #592).
    - **Incremental recompile** (touch + 0-byte change → rebuild):
-     ≤ 150 ms wall. **Pending Phase B (#455).**
+     ≤ 150 ms wall. Phase B (#455) shipped 2026-06-12.
    - **Self-compile** (`make -C stage2 kaic2`): ≤ 5 s wall, ≤ 800 MB
      RSS. Original baseline 6.8 s / 950 MB; re-measure pending.
 
@@ -389,32 +424,30 @@ Hanga Roa closure.
    - ✅ #592 — KAB2 binary on-disk format. **Shipped**
      (`8b33888`, `3954c21`). Default cache flipped to
      `KAI_PRELUDE_CACHE=1`.
-   - ✅ #461 — Phase A.1 / A.2 verification (post-perceus cache
-     + emit-only-user). A.1 verified; A.2 still tracked (open).
-   - **#455 — Phase B user-file incremental cache (still
-     OPEN).** Mtime + hash skipping for user modules; the
-     single load-bearing item left to close DoD #6.
+   - ✅ #825 — Phase A.1 core post-typecheck cache. **Shipped.**
+   - ✅ #461 — Phase A.2 (post-perceus cache + emit-only-user).
+     **Shipped.**
+   - ✅ #455 — Phase B user-file incremental cache. **Shipped
+     2026-06-12.** Mtime + hash skipping for user modules; the
+     last load-bearing item closing DoD #6.
 
-   Phase A is complete; Phase B is the remaining work. #447 (LSP)
-   already consumes the same query surface from #454 and is a
-   thin layer over it today (shipped).
+   DoD #6 is complete. #447 (LSP) consumes the same query surface
+   from #454 and is a thin layer over it (shipped).
 
 **Estimated cost**: original 4–6 weeks. The precondition chain
-absorbed ~2 weeks. The six scope items closed in roughly two
-weeks of agent work (m11 v1+v1.x+collectable, LSP v1→v3, bench
-v1.x, check shrinking, reuse-in-place). Remaining work to close
-Hanga Roa:
+absorbed ~2 weeks. The six scope items closed in roughly two weeks
+of agent work (m11 v1+v1.x+collectable, LSP v1→v3, bench v1.x, check
+shrinking, reuse-in-place); Phase B (#455) closed 2026-06-12. With
+all six DoD items met, Hanga Roa's original scope is closed; the
+0.79 → 0.94 architectural wave (native default, #820 dispatch, stage 2
+modularization, streams) is additional edition-window work, not a
+blocker. Remaining notes:
 
-- **#455 Phase B incremental cache** (~1-2 days estimated; the
-  single load-bearing item).
-- **DoD #3b** RB-tree perf is **explicitly v1.0-trajectory**,
-  not Hanga Roa (decided 2026-05-09; see the §DoD #3b note).
-  Tracked via #383 (shipped, Int unboxing), #384 (open,
-  variant-reuse borrowed-binds), #593 (open, primitive-slot
-  extract raw).
-
-At current pace, Hanga Roa closes when #455 lands; the perf-side
-items #384 / #593 carry forward to Orongo without blocking.
+- **DoD #3b** RB-tree perf is **explicitly v1.0-trajectory**, not
+  Hanga Roa (decided 2026-05-09; see the §DoD #3b note). Its three
+  levers all shipped: #383 (Int unboxing), #384 (variant-reuse
+  borrowed-binds, closed 2026-06-03), #593 (primitive-slot extract
+  raw, closed 2026-06-03). Current measured state: 2.64× C wall.
 
 ### Orongo — 1.0.0
 
@@ -446,7 +479,14 @@ multi-thread, complete tooling, no honest-target footnotes.
   `kai new` (project scaffolding) and a registry abstraction
   on top of git.)*
 - FFI binding generator — given a C header, emit kaikai
-  `extern "C" fn` declarations and `Ffi`-effected wrappers.
+  `extern "C" fn` declarations and `Ffi`-effected wrappers. The
+  marshalling substrate it needs shipped as **FFI v2** (#417,
+  2026-06-22): struct-by-value, opaque handles, fixed-width types.
+  The remaining work is the header-to-declarations generator itself.
+- Separate compilation — cross-module monomorphization + per-module
+  LLVM path (#963), the Phase 3 remainder of the stage 2
+  modularization (#677). The source split (#580) and `.kaii`
+  interface persistence (#760) already landed.
 - Region-brand full `TyBranded` machinery — propagation
   through every binding form, sum-type-payload escape
   detection, brand-mismatch detection between sibling
@@ -492,14 +532,13 @@ platforms.
 - Windows — third platform.
 - WASM — runtime target with appropriate size + JIT-friendly
   emit constraints.
-- Native codegen perf parity — close the residual gap where
-  `--backend=native` binaries are slower than `--backend=c`.
-  The unboxing mirror (issue #87, closed) and self-tail TCO
-  (issue #42, closed) already landed: scalar `+ - * / %` is at C
-  parity (lanes P1–P4, see `docs/native-codegen-perf-plan.md`).
-  Remaining residuals are tracked as #858 (`kai_op_eq` UAF),
-  #860 (cons/list RC leak — `list_fold`/`rbtree` ~2×), and
-  #861 (non-tail raw call re-box — `fib`-style ~8×).
+- Native codegen perf parity — the in-process libLLVM backend is
+  now the **default** (PR #851), so this gap is what users ship by
+  default. Scalar `+ - * / %` is at C parity (lanes #853/#857/#859,
+  see `docs/native-codegen-perf-plan.md`); the cons/list RC leak
+  (#860), the `kai_op_eq` UAF (#858), and the non-tail raw-call re-box
+  (#861) all closed (to 2026-06-19). Per-target tuning of the heap-
+  bound traversal residuals continues here.
   *(Optimization thread for this milestone.)*
 - Stage 1 mirrors for Phase 2 + TCO — bootstrap chain
   parity. Currently bootstrap-only, so user code is
@@ -513,8 +552,9 @@ platforms.
 1. CI matrix runs all 5 platforms (the founding two plus
    Linux arm64, macOS x86_64, Windows, WASM).
 2. `--backend=native` binaries reach inner-loop perf parity with
-   `--backend=c` binaries (scalar arithmetic already there; heap +
-   non-tail-call residuals tracked in #860 / #861).
+   `--backend=c` binaries (scalar arithmetic at parity; the heap +
+   non-tail-call residuals #858/#860/#861 closed — heap-bound
+   traversal tuning ongoing).
 3. Profiling tooling exposes per-fn alloc / time / RC
    breakdown.
 

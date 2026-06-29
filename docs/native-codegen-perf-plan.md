@@ -14,10 +14,11 @@ review).
 > native is the **default** backend — so this gap is what users now ship by
 > default. The plan below is the work that makes that default fast.
 
-> **Closure status (2026-06-17) — the diagnosis below is historical; the plan SHIPPED.**
+> **Closure status (updated 2026-06-29) — the diagnosis below is historical; the plan SHIPPED.**
 > Everything from "ALL-BOXED scalar codegen" onward describes the *starting*
 > state (native ~6s on the arith loop). That is no longer true. The optimisation
-> lanes the plan scoped have all landed:
+> lanes the plan scoped have all landed, and the three residuals the
+> 2026-06-17 snapshot tracked (#858/#860/#861) have since all closed:
 >
 > | item | what shipped | PR |
 > |---|---|---|
@@ -26,6 +27,7 @@ review).
 > | §3.4 | `variant_match` super-linear fix (immortal-cache tagged-Int trap) | #856 |
 > | P3 | raw scalar params/returns from `UFnSig` | #857 |
 > | P4 | raw `sdiv`/`srem` for Int `/` and `%` | #859 |
+> | #861 | non-tail raw-scalar calls stay raw (no box/unbox round-trip) | `b1fce7ed` |
 >
 > **Numbering note:** the per-PR numbering above (the one in project memory and
 > CHANGELOG) is *not* the same as the §"P1/P2/P3" headings later in this doc. The
@@ -33,13 +35,15 @@ review).
 > *shipped* "P3" is the raw-scalar-params lane (#857), a different item the
 > original plan did not enumerate.
 >
-> **Measured today (best-of-3, freshly built native kaic2, `tools/native-perf/`):**
+> **Measured 2026-06-17 (best-of-3, native kaic2, `tools/native-perf/`) — this
+> snapshot predates the #861 fix (`b1fce7ed`, 2026-06-19), so the `deep_rec`
+> row is the pre-fix number; re-measure pending:**
 >
 > | bench | C | native | ratio |
 > |---|---|---|---|
 > | `arith_const` / `arith_runtime` (scalar `+ - * / %`) | 0.07 | 0.07 | **1.0× (parity)** |
 > | `variant_match` | 0.00 | 0.01 | ~parity |
-> | `deep_rec` (non-tail `fib`) | 0.01 | 0.08 | **~8×** |
+> | `deep_rec` (non-tail `fib`) | 0.01 | 0.08 | **~8× (pre-#861-fix)** |
 > | `list_fold` | 4.96 | 9.12 | **1.84×** |
 > | `rbtree_corpus` | 1.21 | 2.65 | **2.2×** |
 >
@@ -50,9 +54,14 @@ review).
 >   the TRMC `__kai_cons_s` step), so `free_total` cascades exactly as the C
 >   oracle (`decref_total` identical). `leaked` is now a constant, not linear
 >   in the list length.
-> - **#861** — non-tail raw call result re-boxes (`kaix_int` → `kaix_int_field`
->   per call): drives `deep_rec` ~8×; not heap-bound (zero allocs in the loop).
+> - **#861 (FIXED, `b1fce7ed`, 2026-06-19)** — non-tail raw calls no longer
+>   re-box the result (`kaix_int` → `kaix_int_field` round-trip eliminated);
+>   raw-scalar calls stay raw. This drove the `deep_rec` ~8×; that row above
+>   is the pre-fix measurement.
 > - **#858 (FIXED, PR #862)** — native `kai_op_eq` over-decref UAF.
+>
+> The heap-bound traversal residuals (`list_fold`, `rbtree_corpus`) are the
+> remaining native-vs-C gap; their tuning continues under Anakena.
 
 ## TL;DR
 
@@ -351,5 +360,7 @@ This lane **diagnosed and planned**. It shipped the benchmark harness
 lane. The opt-level "one-liner" the brief authorised does not exist (§TL;DR),
 so no compiler code changed here. The codegen work the plan scoped then shipped
 across follow-up lanes P1–P4 + §3.4 — see the closure-status table at the top.
-Residuals: #858 (UAF) and #860 (cons leak) are FIXED; #861 (non-tail raw call
-re-box, `deep_rec`) remains.
+Residuals: #858 (UAF), #860 (cons leak), and #861 (non-tail raw call re-box,
+`deep_rec`) are all FIXED (the last via `b1fce7ed`, 2026-06-19). The remaining
+native-vs-C gap is the heap-bound traversal tuning (`list_fold`, `rbtree`),
+carried forward under Anakena.
