@@ -1,0 +1,172 @@
+#[doc("Dead-code lint: dead_code_unused_priv. A private root-file function never referenced anywhere in the file is dead code the compiler does not warn about; pub functions and `main` are always considered reachable.")]
+
+import compiler.ast
+
+# `LintFinding` is defined in `compiler.lint_idiom` and shared by every
+# lint module.
+
+#[doc("dead_code_unused_priv findings over a typed program's root-file decls; one finding per unreferenced private function.")]
+pub fn deadcode_findings(decls: [Decl]) : [LintFinding] {
+  let used = collect_used(decls, [])
+  scan_unused(decls, used, [])
+}
+
+# ---- the reference set -----------------------------------------------
+#
+# Every name mentioned in any decl body (a call, a bare reference, a
+# qualified call). A private function whose name is absent from this set
+# is referenced nowhere and is dead.
+
+fn collect_used(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    []           -> acc
+    [d, ...rest] -> collect_used(rest, used_in_decl(d, acc))
+  }
+}
+
+fn used_in_decl(d: Decl, acc: [String]) : [String] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) -> names_in_expr(body, acc)
+    _                                    -> acc
+  }
+}
+
+# Accumulate every referenced name in an expression tree. A bare `EVar`
+# and a qualified `EModCall` both name something; descend through every
+# child so a reference nested anywhere counts.
+fn names_in_expr(e: Expr, acc: [String]) : [String] {
+  let a1 = name_here(e, acc)
+  names_in_exprs(dc_child_exprs(e.kind), a1)
+}
+
+fn name_here(e: Expr, acc: [String]) : [String] {
+  match e.kind {
+    EVar(n)        -> [n, ...acc]
+    EModCall(_, n) -> [n, ...acc]
+    _              -> acc
+  }
+}
+
+fn names_in_exprs(xs: [Expr], acc: [String]) : [String] {
+  match xs {
+    []           -> acc
+    [x, ...rest] -> names_in_exprs(rest, names_in_expr(x, acc))
+  }
+}
+
+# ---- the unused scan -------------------------------------------------
+
+fn scan_unused(decls: [Decl], used: [String], acc: [LintFinding]) : [LintFinding] {
+  match decls {
+    []           -> list_reverse(acc)
+    [d, ...rest] -> scan_unused(rest, used, dc_decl(d, used, acc))
+  }
+}
+
+# A private root-file function (mo = None, not pub, not `main`) whose name
+# never appears in the reference set is dead code. pub functions are
+# reachable from other modules; `main` is the entry point.
+fn dc_decl(d: Decl, used: [String], acc: [LintFinding]) : [LintFinding] {
+  match d {
+    DFn(is_pub, name, _, _, _, _, _, line, col, mo) ->
+      if dc_is_dead(is_pub, name, mo, used) {
+        [LF("dead_code_unused_priv", line, col,
+            concat_all(["private function `", name, "` is never used; remove it or export it"])), ...acc]
+      } else { acc }
+    _ -> acc
+  }
+}
+
+fn dc_is_dead(is_pub: Bool, name: String, mo: Option[String], used: [String]) : Bool =
+  is_root(mo) and not is_pub and name != "main" and not mem(name, used)
+
+fn is_root(mo: Option[String]) : Bool {
+  match mo {
+    None    -> true
+    Some(_) -> false
+  }
+}
+
+fn mem(name: String, xs: [String]) : Bool {
+  match xs {
+    []           -> false
+    [x, ...rest] -> if x == name { true } else { mem(name, rest) }
+  }
+}
+
+# ---- structural child extractor --------------------------------------
+#
+# Mirrors the shared walk: flatten an ExprKind's immediate sub-expressions
+# so `names_in_expr` reaches a reference nested at any depth.
+
+fn dc_child_exprs(k: ExprKind) : [Expr] {
+  match k {
+    ECall(callee, xs)   -> [callee, ...xs]
+    EField(base, _)     -> [base]
+    EIndex(a, b)        -> [a, b]
+    EBinop(_, a, b)     -> [a, b]
+    EUnop(_, x)         -> [x]
+    EIf(c, t, eo)       -> [c, t, ...dc_opt(eo)]
+    EMatch(scr, arms)   -> [scr, ...dc_arm_exprs(arms)]
+    ELambda(_, body)    -> [body]
+    ERecordLit(_, fis)  -> dc_field_exprs(fis)
+    EList(els)          -> dc_elem_exprs(els)
+    ERange(a, b, so)    -> [a, b, ...dc_opt(so)]
+    EBlock(ss, tail)    -> list_append(dc_stmt_exprs(ss), dc_opt(tail))
+    EPipe(a, b)         -> [a, b]
+    EMapPipe(a, b)      -> [a, b]
+    EFlatMapPipe(a, b)  -> [a, b]
+    EFilterPipe(a, b)   -> [a, b]
+    ELitUnit(inner, _)  -> [inner]
+    EBang(inner)        -> [inner]
+    EHandle(body, _, _, init, _, _, _) -> [body, ...dc_opt(init)]
+    _                   -> []
+  }
+}
+
+fn dc_opt(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn dc_arm_exprs(arms: [Arm]) : [Expr] {
+  match arms {
+    []                      -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(dc_opt(g), [b]), dc_arm_exprs(rest))
+  }
+}
+
+fn dc_field_exprs(fis: [FieldInit]) : [Expr] {
+  match fis {
+    []                  -> []
+    [FI(_, v), ...rest] -> [v, ...dc_field_exprs(rest)]
+  }
+}
+
+fn dc_elem_exprs(els: [ListElem]) : [Expr] {
+  match els {
+    []                     -> []
+    [ElPlain(x), ...rest]  -> [x, ...dc_elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...dc_elem_exprs(rest)]
+  }
+}
+
+fn dc_stmt_exprs(ss: [Stmt]) : [Expr] {
+  match ss {
+    []           -> []
+    [s, ...rest] -> list_append(dc_stmt_expr_list(s), dc_stmt_exprs(rest))
+  }
+}
+
+fn dc_stmt_expr_list(s: Stmt) : [Expr] {
+  match s {
+    SExprStmt(x)                -> [x]
+    SLet(_, _, rhs)             -> [rhs]
+    SAssert(c, mo)              -> [c, ...dc_opt(mo)]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SVar(_, _, rhs, _, _)       -> [rhs]
+    SUse(_, _, _)               -> []
+  }
+}
