@@ -1,0 +1,260 @@
+#[doc("Idiom-nudge lints: point_free_nudge and and_then_to_map_nudge. Each fires only when the suggested form is provably equivalent and exists in the language; bias is false-negatives over noisy false-positives.")]
+
+import compiler.ast
+
+# A single lint hit, addressed by source position. The first field
+# names the lint so it can be allowed/denied individually.
+pub type LintFinding = LF(String, Int, Int, String)
+
+# A point-free section desugars to a lambda over this synthetic param,
+# so a lambda binding it is ALREADY point-free and must never be nudged.
+fn pf_param() : String = "__pl"
+
+#[doc("Idiom-nudge findings rooted at this node (point-free, and_then→map); children are visited by the caller's walk.")]
+pub fn idiom_findings(e: Expr) : [LintFinding] {
+  match e.kind {
+    EMapPipe(_, f)      -> pf_nudge(f)
+    EFlatMapPipe(_, f)  -> pf_nudge(f)
+    EFilterPipe(_, f)   -> pf_nudge(f)
+    ECall(callee, cargs) -> call_nudges(e, callee, cargs)
+    _                   -> []
+  }
+}
+
+# A combinator call carries two nudges: its function argument may be a
+# point-free candidate, and an `and_then` whose lambda always wraps in
+# `Some` is a `map` in disguise. The function is the call's last
+# argument (`map(o, f)` after inference, `o.map(f)` before it).
+fn call_nudges(e: Expr, callee: Expr, cargs: [Expr]) : [LintFinding] {
+  match fn_arg_of(cargs) {
+    None    -> []
+    Some(f) -> {
+      let pf = if callee_is_combinator(callee) { pf_nudge(f) } else { [] }
+      let am = if callee_named(callee, "and_then") { at_map_nudge(e, f) } else { [] }
+      list_append(pf, am)
+    }
+  }
+}
+
+# ---- point_free_nudge ------------------------------------------------
+
+# A lambda whose whole body is a field/method chain over its single
+# parameter reads cleaner as a leading-dot section (`.name`,
+# `.length()`, `.addr.city`). The `__pl` guard skips a lambda the parser
+# already synthesised from a point-free section.
+fn pf_nudge(f: Expr) : [LintFinding] {
+  match f.kind {
+    ELambda(ps, body) -> pf_lambda(f, ps, body)
+    _                  -> []
+  }
+}
+
+# A unary lambda whose param is user-written (not the `__pl` synthetic)
+# and whose body is a point-free chain over that param.
+fn pf_lambda(f: Expr, ps: [Param], body: Expr) : [LintFinding] {
+  let pn = unary_param_name(ps)
+  if pn == "" { [] }
+  else if pn == pf_param() { [] }
+  else if pf_chain(body, pn) {
+    [LF("point_free_nudge", f.line, f.col,
+        "lambda is a field/method access on its argument; a point-free section reads cleaner")]
+  } else { [] }
+}
+
+# The sole parameter's name for a unary lambda, or "" for any other
+# arity. "" cannot collide with a real binder, so it doubles as the
+# "not a unary lambda" sentinel.
+fn unary_param_name(ps: [Param]) : String {
+  match ps {
+    []           -> ""
+    [p, ...rest] -> match rest {
+      [] -> p.pname
+      _  -> ""
+    }
+  }
+}
+
+fn is_unary(ps: [Param]) : Bool {
+  match ps {
+    []           -> false
+    [_, ...rest] -> match rest { [] -> true _ -> false }
+  }
+}
+
+# A point-free chain is a postfix chain rooted exactly at the parameter,
+# with at least one field or method link, and no link's arguments
+# mentioning the parameter (the section supplies the receiver only).
+fn pf_chain(body: Expr, pn: String) : Bool {
+  match body.kind {
+    EField(base, _)  -> pf_receiver(base, pn)
+    ECall(c, cargs)  -> pf_method(c, cargs, pn)
+    _                -> false
+  }
+}
+
+# A method link `recv.m(margs)`. UFCS rewrites `recv.m(a)` to
+# `EModCall(mod, m)` with the receiver as the first argument, so the
+# chain continues through the head of the call's arguments and the
+# remaining (written) arguments must not depend on the parameter. The
+# pre-rewrite `EField(recv, m)` form is handled too so the lint does not
+# hinge on how far the typer has rewritten the body.
+fn pf_method(c: Expr, cargs: [Expr], pn: String) : Bool {
+  match c.kind {
+    EModCall(_, _)  -> pf_modcall_method(cargs, pn)
+    EField(base, _) -> pf_receiver(base, pn) and not any_mentions(cargs, pn)
+    _               -> false
+  }
+}
+
+fn pf_modcall_method(cargs: [Expr], pn: String) : Bool {
+  match cargs {
+    []           -> false
+    [recv, ...margs] -> pf_receiver(recv, pn) and not any_mentions(margs, pn)
+  }
+}
+
+# The receiver is either the bare parameter (chain root) or a further
+# field/method link over it.
+fn pf_receiver(base: Expr, pn: String) : Bool {
+  match base.kind {
+    EVar(n) -> n == pn
+    _       -> pf_chain(base, pn)
+  }
+}
+
+# ---- and_then_to_map_nudge -------------------------------------------
+
+# `o.and_then((x) => Some(expr))` is `o.map((x) => expr)` when the lambda
+# ALWAYS returns `Some(...)`. If any return position can yield `None`
+# (or a non-`Some` value), the rewrite changes meaning and is not made.
+fn at_map_nudge(e: Expr, f: Expr) : [LintFinding] {
+  match f.kind {
+    ELambda(ps, body) ->
+      if is_unary(ps) and always_some(body) {
+        [LF("and_then_to_map_nudge", e.line, e.col,
+            "and_then whose function always wraps its result in Some; use map")]
+      } else { [] }
+    _ -> []
+  }
+}
+
+# Every tail position of the body is a `Some(_)` construction. `if`
+# without an else, a block without a tail, or a non-`Some` tail all read
+# as "can be other than Some" and stop the nudge.
+fn always_some(body: Expr) : Bool {
+  match body.kind {
+    EIf(_, t, Some(el)) -> always_some(t) and always_some(el)
+    EMatch(_, arms)     -> all_arms_some(arms)
+    EBlock(_, Some(t))  -> always_some(t)
+    ECall(c, cargs)     -> is_some_ctor(c, cargs)
+    _                   -> false
+  }
+}
+
+fn is_some_ctor(c: Expr, cargs: [Expr]) : Bool {
+  match c.kind {
+    EVar(n) -> n == "Some" and arity_one(cargs)
+    _       -> false
+  }
+}
+
+fn arity_one(xs: [Expr]) : Bool {
+  match xs {
+    []           -> false
+    [_, ...rest] -> match rest { [] -> true _ -> false }
+  }
+}
+
+fn all_arms_some(arms: [Arm]) : Bool {
+  match arms {
+    []           -> true
+    [a, ...rest] -> always_some(arm_body(a)) and all_arms_some(rest)
+  }
+}
+
+fn arm_body(a: Arm) : Expr {
+  match a {
+    Arm(_, _, b) -> b
+  }
+}
+
+# ---- callee recognition ----------------------------------------------
+#
+# After inference a combinator call reads as `EModCall(mod, name)`; the
+# pre-rewrite forms `EVar(name)` and `EField(_, name)` are matched too so
+# the lint is independent of how far the typer has rewritten the call.
+
+fn callee_is_combinator(callee: Expr) : Bool {
+  callee_named(callee, "map") or callee_named(callee, "filter") or callee_named(callee, "and_then") or callee_named(callee, "flat_map")
+}
+
+fn callee_named(callee: Expr, name: String) : Bool {
+  match callee.kind {
+    EModCall(_, n) -> n == name
+    EField(_, n)   -> n == name
+    EVar(n)        -> n == name
+    _              -> false
+  }
+}
+
+# ---- small helpers ---------------------------------------------------
+
+# The function argument of a combinator call is its last argument: after
+# inference `o.map(f)` reads as `map(o, f)`, and pre-rewrite as `o.map(f)`
+# with a single arg. Either way the function is last.
+fn fn_arg_of(cargs: [Expr]) : Option[Expr] {
+  match cargs {
+    []           -> None
+    [x, ...rest] -> match rest {
+      []  -> Some(x)
+      _   -> fn_arg_of(rest)
+    }
+  }
+}
+
+fn any_mentions(xs: [Expr], pn: String) : Bool {
+  match xs {
+    []           -> false
+    [x, ...rest] -> if mentions(x, pn) { true } else { any_mentions(rest, pn) }
+  }
+}
+
+# Does `pn` appear free anywhere in `e`? Lambda params can shadow it,
+# but the only callers pass method-argument expressions, where a shadow
+# binding of the chain's own parameter would be a different variable; a
+# conservative structural scan is enough to keep the nudge sound.
+fn mentions(e: Expr, pn: String) : Bool {
+  match e.kind {
+    EVar(n) -> n == pn
+    _       -> any_mentions(idiom_child_exprs(e.kind), pn)
+  }
+}
+
+fn idiom_child_exprs(k: ExprKind) : [Expr] {
+  match k {
+    ECall(callee, xs)  -> [callee, ...xs]
+    EField(base, _)    -> [base]
+    EIndex(a, b)       -> [a, b]
+    EBinop(_, a, b)    -> [a, b]
+    EUnop(_, x)        -> [x]
+    EIf(c, t, eo)      -> [c, t, ...idiom_opt(eo)]
+    ELambda(_, body)   -> [body]
+    EList(els)         -> idiom_elems(els)
+    _                  -> []
+  }
+}
+
+fn idiom_opt(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn idiom_elems(els: [ListElem]) : [Expr] {
+  match els {
+    []                     -> []
+    [ElPlain(x), ...rest]  -> [x, ...idiom_elems(rest)]
+    [ElSpread(x), ...rest] -> [x, ...idiom_elems(rest)]
+  }
+}
