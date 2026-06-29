@@ -94,6 +94,22 @@ touching either emitter should remember.
   regression, rc 1 the clean diagnostic, so the target asserts `rc == 1`
   explicitly rather than only diffing stdout.
 
+- **The guard over-reached to `Ffi` — caught only by serial parity.** `Ffi` is
+  frame-carried (it is NOT in `frame_is_fiber_local`), so its slot is filled by
+  the same `evf_terminal_slot`/`evf_thunk_slot`/`nemit_evf_slot_node` paths. But
+  `Ffi` "declares no ops and is routed around the dispatcher": its slot node
+  legitimately carries a NULL handler the FFI shim never dereferences. The first
+  cut of the guard wrapped `Ffi`'s slot too, so every FFI program turned into
+  `kai: effect not handled in fiber: Ffi` (exit 1) on the C backend — three
+  `examples/effects/ffi_*` fixtures regressed. tier0 and the effects targets all
+  stayed green; only `tools/test-backend-parity.sh` surfaced it, as a C-vs-native
+  exit-code mismatch (C=1, native=0 — native happened not to trip its guard for
+  `Ffi`). Fix: exempt `eff == "Ffi"` from the guard on both backends, emitting
+  the bare lookup as before. Lesson reinforced: a runtime/codegen change is not
+  verified until serial parity over the whole corpus is green — the targeted
+  effect tests do not exercise FFI, and a guard that looks effect-agnostic can
+  catch a frame-carried effect that is special by design.
+
 ## Fixtures
 
 - `examples/effects/issue_978_spawn_parent_handled_effect.kai`
@@ -114,6 +130,8 @@ touching either emitter should remember.
 - Stdout/Console in a spawned fiber: still prints, exit 0, both backends.
 - An effect handled *within* the spawned fiber: still dispatches to the local
   handler, exit 0, both backends.
+- FFI fixtures (`ffi_extern_c_basic`, `ffi_native_symbol_separation`): still
+  run to completion, exit 0, both backends (the `Ffi` exemption).
 - `tier0`: green (selfhost `kaic2b.c == kaic2c.c` byte-identical; evidence-frame
   gate `KAI_EVIDENCE_FRAME_ONLY` PASS; demos no-regression).
 - `test-effects` + `test-effect-runtime` + `issue-668`/`679`/`682`: green.
