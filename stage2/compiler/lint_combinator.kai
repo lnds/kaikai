@@ -1,0 +1,217 @@
+#[doc("Combinator-suggestion lint: match_option_to_combinator. A manual two-arm match over an Option that map / and_then / unwrap_or expresses exactly is nudged toward the combinator; fires only when the rewrite is value-equivalent, including evaluation order.")]
+
+import compiler.ast
+
+# `LintFinding` is defined in `compiler.lint_idiom` and shared by every
+# lint module; this file constructs the same `LF(rule, line, col, msg)`.
+
+#[doc("match_option_to_combinator finding rooted at this node; the caller's walk visits children.")]
+pub fn combinator_findings(e: Expr) : [LintFinding] {
+  match e.kind {
+    EMatch(scr, arms) -> mo_nudge(e, scr, arms)
+    _                 -> []
+  }
+}
+
+# A `match` over an `Option[T]` with exactly two unguarded arms — one
+# `Some(bind)`, one `None` — that a single combinator expresses exactly.
+# The scrutinee must be statically known to be an Option; an unknown or
+# non-Option type stops the nudge.
+fn mo_nudge(e: Expr, scr: Expr, arms: [Arm]) : [LintFinding] {
+  if scr_is_option(scr) { two_arm_nudge(e, arms) } else { [] }
+}
+
+fn scr_is_option(scr: Expr) : Bool = ty_is_option(scr.ty)
+
+fn ty_is_option(t: Option[Ty]) : Bool {
+  match t {
+    Some(TyCon(_, n, _)) -> n == "Option"
+    _                    -> false
+  }
+}
+
+# The two arms in either source order. Each must be unguarded; `Some`
+# binds a single name, `None` is nullary. Any other arm shape (a guard,
+# a literal, an as-pattern) means the match does work a combinator does
+# not, so it is left alone.
+fn two_arm_nudge(e: Expr, arms: [Arm]) : [LintFinding] {
+  match arms {
+    []            -> []
+    [a1, ...rest] -> match rest {
+      []          -> []
+      [a2, ...tl] -> match tl {
+        [] -> both_arms_nudge(e, a1, a2)
+        _  -> []
+      }
+    }
+  }
+}
+
+fn both_arms_nudge(e: Expr, a1: Arm, a2: Arm) : [LintFinding] {
+  if mo_arm_unguarded(a1) and mo_arm_unguarded(a2) {
+    ordered_nudge(e, mo_arm_pat(a1), mo_arm_body(a1), mo_arm_pat(a2), mo_arm_body(a2))
+  } else { [] }
+}
+
+fn mo_arm_unguarded(a: Arm) : Bool {
+  match a {
+    Arm(_, g, _) -> match g {
+      Some(_) -> false
+      None    -> true
+    }
+  }
+}
+
+fn mo_arm_pat(a: Arm) : Pattern {
+  match a {
+    Arm(p, _, _) -> p
+  }
+}
+
+fn mo_arm_body(a: Arm) : Expr {
+  match a {
+    Arm(_, _, b) -> b
+  }
+}
+
+fn ordered_nudge(e: Expr, p1: Pattern, b1: Expr, p2: Pattern, b2: Expr) : [LintFinding] {
+  match some_bind(p1) {
+    Some(x) -> if is_none_pat(p2) { classify(e, x, b1, b2) } else { [] }
+    None    -> match some_bind(p2) {
+      Some(x) -> if is_none_pat(p1) { classify(e, x, b2, b1) } else { [] }
+      None    -> []
+    }
+  }
+}
+
+# `some_body` is the `Some(x)` arm body, `none_body` the `None` arm body.
+# Three value-equivalent rewrites, checked most-specific first:
+#   Some(x) -> x          + None -> dflt  => unwrap_or(dflt)   (dflt trivial)
+#   Some(x) -> Some(expr) + None -> None  => map((x) => expr)
+#   Some(x) -> opt        + None -> None  => and_then((x) => opt)
+fn classify(e: Expr, x: String, some_body: Expr, none_body: Expr) : [LintFinding] {
+  let iv = is_var(some_body, x)
+  let tr = is_trivial(none_body)
+  let ne = is_none_expr(none_body)
+  let ws = wraps_some(some_body)
+  let bo = body_is_option(some_body)
+  if iv and tr { [mo_finding(e, "unwrap_or")] }
+  else if ne and ws { [mo_finding(e, "map")] }
+  else if ne and bo { [mo_finding(e, "and_then")] }
+  else { [] }
+}
+
+fn mo_finding(e: Expr, combinator: String) : LintFinding =
+  LF("match_option_to_combinator", e.line, e.col,
+     concat_all(["manual match over Option; use ", combinator]))
+
+# ---- pattern shape ---------------------------------------------------
+
+# The bound name of a `Some(name)` pattern, or None for any other shape.
+# Only a single bare binder qualifies — a nested destructure is work a
+# combinator's lambda parameter cannot stand in for.
+fn some_bind(p: Pattern) : Option[String] {
+  match p.pkind {
+    PVariant(n, subs) -> if n == "Some" { sole_bind(subs) } else { None }
+    _                 -> None
+  }
+}
+
+# The single sub-pattern's bound name, or None unless there is exactly
+# one and it is a bare binder.
+fn sole_bind(subs: [Pattern]) : Option[String] {
+  match subs {
+    []             -> None
+    [sub, ...rest] -> match rest {
+      [] -> bind_name(sub)
+      _  -> None
+    }
+  }
+}
+
+fn bind_name(p: Pattern) : Option[String] {
+  match p.pkind {
+    PBind(n) -> Some(n)
+    _        -> None
+  }
+}
+
+fn is_none_pat(p: Pattern) : Bool {
+  match p.pkind {
+    PVariant(n, subs) -> n == "None" and pats_empty(subs)
+    _                 -> false
+  }
+}
+
+fn pats_empty(subs: [Pattern]) : Bool {
+  match subs {
+    []        -> true
+    [_, ..._] -> false
+  }
+}
+
+# ---- expression shape ------------------------------------------------
+
+fn is_var(e: Expr, name: String) : Bool {
+  match e.kind {
+    EVar(n) -> n == name
+    _       -> false
+  }
+}
+
+# A `None` value, whether the typer has rewritten it to `EModCall` or it
+# is still the surface `EVar("None")`.
+fn is_none_expr(e: Expr) : Bool {
+  match e.kind {
+    EModCall(m, n) -> m == "Option" and n == "None"
+    EVar(n)        -> n == "None"
+    _              -> false
+  }
+}
+
+# A `Some(...)` construction: the callee is the `Some` constructor. The
+# arity is fixed by the constructor (always one), so checking the callee
+# is enough; the argument is reached by the combinator's lambda.
+fn wraps_some(e: Expr) : Bool {
+  match e.kind {
+    ECall(c, _) -> mo_is_some_ctor(c)
+    _           -> false
+  }
+}
+
+fn mo_is_some_ctor(c: Expr) : Bool {
+  match c.kind {
+    EModCall(m, n) -> m == "Option" and n == "Some"
+    EVar(n)        -> n == "Some"
+    _              -> false
+  }
+}
+
+fn body_is_option(e: Expr) : Bool = ty_is_option(e.ty)
+
+# A `None` default whose value is cheap and effect-free, so eager
+# `unwrap_or` evaluation matches the match's lazy None arm. A literal,
+# a variable, or a nullary constructor qualifies; a call or any computed
+# expression does not (it might be `unwrap_or_else` territory, where the
+# default must stay lazy).
+fn is_trivial(e: Expr) : Bool {
+  match e.kind {
+    EInt(_)        -> true
+    EReal(_, _)    -> true
+    EBool(_)       -> true
+    EChar(_)       -> true
+    EStr(_, _)     -> true
+    EUnit          -> true
+    EVar(_)        -> true
+    EModCall(_, _) -> true
+    EList(els)     -> mo_list_empty(els)
+    _              -> false
+  }
+}
+
+fn mo_list_empty(els: [ListElem]) : Bool {
+  match els {
+    []        -> true
+    [_, ..._] -> false
+  }
+}
