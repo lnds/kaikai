@@ -1220,6 +1220,16 @@ pub type Mode
   # Used by bin/kai's cache MISS path; the driver redirects stdout
   # to a temp file and atomically renames into the cache dir.
   | MEmitPreludeCache
+  # Internal batch driver. `path` names a list file whose lines are
+  # `<input.kai>\t<output>` pairs. Loads (lexes + parses) the core
+  # module set once, then compiles every input against that shared
+  # `PreludesLoaded`, writing each result to its `<output>`. Amortises
+  # the core's lex + parse — the ~90ms fixed cost every standalone
+  # invocation re-pays — across N fixtures; the per-file typecheck +
+  # codegen still runs fresh, so each output is byte-identical to a
+  # standalone build. Not a user-facing build mode — the test harness
+  # uses it to avoid forking once per fixture.
+  | MBatchList
 
 #[doc("Parsed CLI configuration: mode, target path, preludes, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
 # The codegen backend, ORTHOGONAL to `Mode`. `Mode` carries the
@@ -1452,6 +1462,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MCacheRoundtrip))
       } else if a == "--emit-prelude-cache" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitPreludeCache))
+      } else if a == "--batch-list" {
+        parse_cli_loop(more, cli_with_mode(opts, MBatchList))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "--bench" {
@@ -3740,7 +3752,13 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool) : Int / Console + File {
+# `batch_out`, when `Some(p)`, redirects the C-backend `.c` emission
+# to `write_file(p, ...)` instead of stdout, so the batch driver can
+# write each fixture's output to its own file from one process. `None`
+# keeps the stdout path every standalone invocation uses; the native
+# backend writes its `.o` to `native_object_path(path)` regardless, so
+# only the C sink changes here.
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String]) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -4535,8 +4553,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         } else {
                           emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
-                        print(out)
-                        0
+                        match batch_out {
+                          # `print` appends a trailing newline; match it
+                          # so a batch `.c` is byte-identical to the
+                          # stdout-captured fork output.
+                          Some(op) -> { write_file(op, cat2(out, "\n")); 0 }
+                          None     -> { print(out); 0 }
+                        }
                       }
                     }
                   }
@@ -4551,6 +4574,73 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
         }
       }
     }
+  }
+}
+
+# One `<input.kai>\t<output>` entry of a batch list.
+type BatchEntry = BE(String, String)
+
+# Parse the batch list file's contents into entries. Each non-blank
+# line is `<input>\t<output>`; a line missing the tab is reported and
+# dropped. Blank lines (trailing newline) are skipped.
+fn parse_batch_entries(content: String) : [BatchEntry] =
+  parse_batch_entries_loop(string_split(content, "\n"), [])
+
+fn parse_batch_entries_loop(lines: [String], acc: [BatchEntry]) : [BatchEntry] = match lines {
+  [] -> list_reverse(acc)
+  [ln, ...rest] ->
+    if string_length(ln) == 0 { parse_batch_entries_loop(rest, acc) }
+    else { match string_split(ln, "\t") {
+      [inp, outp, ..._] -> parse_batch_entries_loop(rest, [BE(inp, outp), ...acc])
+      _                 -> parse_batch_entries_loop(rest, acc)
+    } }
+}
+
+# Internal batch driver. Loads (lexes + parses) the core module set
+# ONCE and compiles every listed input against that shared
+# `PreludesLoaded`, so the core's lex + parse is paid a single time for
+# the whole batch instead of once per file. The per-file typecheck and
+# codegen still run fresh — only the core load is amortised — so each
+# output is byte-identical to a standalone build. Each input's `.c` is
+# written to its paired output (native writes its `.o` to
+# `native_object_path(input)`). Returns the count of inputs that failed
+# to compile; 0 means the whole batch is clean.
+fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
+  match read_file(listfile) {
+    Err(msg) -> { eprint("kaic2: #{listfile}: #{msg}"); 1 }
+    Ok(content) -> {
+      let entries = parse_batch_entries(content)
+      match entries {
+        [] -> 0
+        [BE(first_in, _), ..._] ->
+          match load_core(dir_of(first_in), opts.user_cache) {
+            None -> 1
+            Some(pls) -> match pls {
+              PLS(pds, pmods, psegs) ->
+                batch_compile_loop(entries, pds, pmods, psegs, opts, 0)
+            }
+          }
+      }
+    }
+  }
+
+# Compile each entry against the shared preludes. Failures accumulate
+# into `nfail`; a per-file failure is reported but does not abort the
+# batch, so the harness sees every result in one pass.
+fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
+                       psegs: [PreludeSegment], opts: CliOptions,
+                       nfail: Int) : Int / Console + File = match entries {
+  [] -> nfail
+  [BE(inp, outp), ...rest] -> {
+    let rc = match read_file(inp) {
+      Err(msg) -> { eprint("kaic2: #{inp}: #{msg}"); 1 }
+      Ok(src) -> compile_source(inp, opts.mode, opts.backend, opts.strict_holes,
+                                 opts.search_paths, src, pds, pmods, psegs,
+                                 opts.package_name, opts.unstable_optins,
+                                 opts.edition, opts.user_cache, Some(outp))
+    }
+    let nfail1 = if rc == 0 { nfail } else { nfail + 1 }
+    batch_compile_loop(rest, pds, pmods, psegs, opts, nfail1)
   }
 }
 
@@ -4575,6 +4665,13 @@ pub fn run(opts: CliOptions) : Int / Console + File {
       }
       Some(p) -> emit_prelude_cache_for(p, opts.cache_sha)
     }
+    MBatchList -> match opts.path {
+      None -> {
+        eprint("kaic2: --batch-list requires a list-file argument")
+        2
+      }
+      Some(lf) -> run_batch_list(lf, opts)
+    }
     _ -> match opts.path {
       None -> { usage(); 2 }
       Some(p) -> {
@@ -4591,7 +4688,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache)
+              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None)
               Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
             }
           }
