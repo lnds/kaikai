@@ -1,0 +1,102 @@
+#[doc("Redundant-form lints: redundant_if_bool and redundant_match_catchall. Each fires only when a strictly simpler equivalent form exists in the language; the rewrite is value-for-value identical, never a behaviour change.")]
+
+import compiler.ast
+
+# `LintFinding` is defined in `compiler.lint_idiom` and shared by every
+# lint module; this file constructs the same `LF(rule, line, col, msg)`.
+
+#[doc("Redundant-form findings rooted at this node (redundant_if_bool, redundant_match_catchall); children are visited by the caller's walk.")]
+pub fn redundant_findings(e: Expr) : [LintFinding] {
+  match e.kind {
+    EIf(_, t, Some(el)) -> if_bool_nudge(e, t, el)
+    EMatch(_, arms)     -> catchall_nudge(e, arms)
+    _                   -> []
+  }
+}
+
+# ---- redundant_if_bool -----------------------------------------------
+
+# `if c { true } else { false }` is `c`; the inverse `if c { false }
+# else { true }` is `not c`. Both branches must be the bare boolean
+# literals (a block whose only value is `true`/`false`), so the rewrite
+# drops the conditional with no change in meaning. An `if` without an
+# else, or a branch that does anything beyond yielding the literal, is
+# left alone.
+fn if_bool_nudge(e: Expr, t: Expr, el: Expr) : [LintFinding] {
+  if is_true_lit(t) and is_false_lit(el) { if_bool_finding(e, true) }
+  else if is_false_lit(t) and is_true_lit(el) { if_bool_finding(e, false) }
+  else { [] }
+}
+
+fn is_true_lit(e: Expr) : Bool {
+  match branch_bool(e) {
+    Some(b) -> b
+    None    -> false
+  }
+}
+
+fn is_false_lit(e: Expr) : Bool {
+  match branch_bool(e) {
+    Some(b) -> not b
+    None    -> false
+  }
+}
+
+# The two branches differ (one true, one false), so the form is
+# redundant. `then=true` collapses to the condition; `then=false`
+# collapses to its negation.
+fn if_bool_finding(e: Expr, then_true: Bool) : [LintFinding] {
+  let hint = if then_true { "the condition itself" } else { "`not` of the condition" }
+  [LF("redundant_if_bool", e.line, e.col,
+      concat_all(["if/else yields only boolean literals; use ", hint]))]
+}
+
+# The boolean value of a branch that is exactly a `true`/`false` literal,
+# directly or as the sole tail of an otherwise-empty block. Any other
+# shape returns None and stops the nudge.
+fn bool_dbg(b: Bool) : String = if b { "T" } else { "F" }
+
+fn branch_bool(e: Expr) : Option[Bool] {
+  match e.kind {
+    EBool(b)         -> Some(b)
+    EBlock(ss, tail) -> block_bool(ss, tail)
+    _                -> None
+  }
+}
+
+fn block_bool(ss: [Stmt], tail: Option[Expr]) : Option[Bool] {
+  match ss {
+    [] -> match tail {
+      Some(t) -> branch_bool(t)
+      None    -> None
+    }
+    _  -> None
+  }
+}
+
+# ---- redundant_match_catchall ----------------------------------------
+
+# A `match` with a single unguarded arm whose pattern is `_` or a bare
+# binding never destructures: `match e { _ -> body }` is `body`, and
+# `match e { x -> body }` is `let x = e ... body`. Either way the
+# `match` is ceremony around a direct expression. A literal/constructor
+# pattern, a guard, or more than one arm all mean the match does real
+# work and is left alone.
+fn catchall_nudge(e: Expr, arms: [Arm]) : [LintFinding] {
+  match arms {
+    [Arm(p, None, _)] -> catchall_arm(e, p)
+    _                 -> []
+  }
+}
+
+fn catchall_arm(e: Expr, p: Pattern) : [LintFinding] {
+  match p.pkind {
+    PWild     -> [catchall_finding(e, "use the expression directly")]
+    PBind(_)  -> [catchall_finding(e, "bind the scrutinee with `let`")]
+    _         -> []
+  }
+}
+
+fn catchall_finding(e: Expr, hint: String) : LintFinding =
+  LF("redundant_match_catchall", e.line, e.col,
+     concat_all(["match has a single catch-all arm; ", hint]))
