@@ -1,0 +1,254 @@
+#[doc("Effect-row lints: effect_over_declared and effect_ffi_without_extern. A public signature whose declared effect row carries a label the body never demands over-declares it; one motor (declared minus used), two lint ids — Ffi gets its own.")]
+
+import compiler.ast
+
+# `LintFinding` is defined in `compiler.lint_idiom` and shared by every
+# lint module.
+
+#[doc("Effect-row findings over a typed program's root-file public functions, given the root module name.")]
+pub fn effect_findings(decls: [Decl], root_mod: String) : [LintFinding] =
+  scan_overdeclared(decls, root_mod, [])
+
+# ---- the over-declared scan ------------------------------------------
+
+fn scan_overdeclared(decls: [Decl], root_mod: String, acc: [LintFinding]) : [LintFinding] {
+  match decls {
+    []           -> list_reverse(acc)
+    [d, ...rest] -> scan_overdeclared(rest, root_mod, fx_decl(d, root_mod, acc))
+  }
+}
+
+# A public root-file function whose declared row carries a closed,
+# monomorphic label that ITS OWN body never demands over-declares it. The
+# used-set is per-function: the typer already stamped each call's row, so
+# an effect reached through a helper shows on that helper-call's type and
+# counts as used. An open row (a tail variable) or a parametric label is
+# left alone — the typer may satisfy it in ways this scan cannot see.
+fn fx_decl(d: Decl, root_mod: String, acc: [LintFinding]) : [LintFinding] {
+  match d {
+    DFn(is_pub, name, _, _, _, row, body, line, col, mo) ->
+      if is_pub and fx_is_root_origin(mo, root_mod) {
+        fx_labels(declared_closed_labels(row), name, line, col, effects_in_expr(body, []), acc)
+      } else { acc }
+    _ -> acc
+  }
+}
+
+# A root-file decl: unstamped, or stamped with the root module's own name
+# (pub root decls carry `Some(root_mod)`).
+fn fx_is_root_origin(mo: Option[String], root_mod: String) : Bool {
+  match mo {
+    None    -> true
+    Some(m) -> m == root_mod
+  }
+}
+
+# Each declared label absent from the used-set is over-declared. `Ffi`
+# carries its own lint id and message; every other effect is
+# effect_over_declared.
+fn fx_labels(labels: [String], fn_name: String, line: Int, col: Int, used: [String], acc: [LintFinding]) : [LintFinding] {
+  match labels {
+    []             -> acc
+    [eff, ...rest] -> {
+      let a1 = if mem_str(eff, used) { acc } else { [fx_finding(eff, fn_name, line, col), ...acc] }
+      fx_labels(rest, fn_name, line, col, used, a1)
+    }
+  }
+}
+
+fn fx_finding(eff: String, fn_name: String, line: Int, col: Int) : LintFinding {
+  if eff == "Ffi" {
+    LF("effect_ffi_without_extern", line, col,
+       concat_all(["pub fn `", fn_name, "` declares `/ Ffi` but its body calls no extern function"]))
+  } else {
+    LF("effect_over_declared", line, col,
+       concat_all(["pub fn `", fn_name, "` declares effect `", eff, "` its body never uses"]))
+  }
+}
+
+# ---- declared row ----------------------------------------------------
+#
+# Only a CLOSED row contributes labels; an open row (tail variable) is a
+# polymorphic promise the body may satisfy elsewhere, so it is skipped
+# entirely (conservative: no labels => no findings).
+
+fn declared_closed_labels(row: RowExpr) : [String] {
+  match row {
+    RClosed(ls) -> row_label_names(ls)
+    REmpty      -> []
+    ROpen(_, _) -> []
+  }
+}
+
+fn row_label_names(ls: [RowLabel]) : [String] {
+  match ls {
+    []                    -> []
+    [RL(n, _), ...rest]   -> [n, ...row_label_names(rest)]
+  }
+}
+
+# ---- effects demanded by a body --------------------------------------
+#
+# An effect is demanded when the body references one of its ops, calls a
+# function whose resolved type carries it in its row, or installs a
+# handler for it. Mirrors `lint.kai`'s purity sources, but collects the
+# effect NAMES rather than a yes/no.
+
+fn effects_in_expr(e: Expr, acc: [String]) : [String] {
+  let a1 = effects_here(e, acc)
+  effects_in_exprs(fx_child_exprs(e.kind), a1)
+}
+
+# An `EExternBody` is the body of an `extern "C" fn`: it IS the foreign
+# call, so it demands `Ffi` even though there is no `ECall` node.
+fn effects_here(e: Expr, acc: [String]) : [String] {
+  match e.kind {
+    EVar(name)       -> add_op_effect(name, acc)
+    ECall(callee, _) -> add_callee_effects(callee, acc)
+    EHandle(_, eff, _, _, _, _, _) -> [eff, ...acc]
+    EExternBody(_)   -> ["Ffi", ...acc]
+    _                -> acc
+  }
+}
+
+# A flattened `Eff.op` reference: the effect is the dotted prefix when it
+# starts with an uppercase letter (effects are PascalCase). `Ffi` ops are
+# also extern-call markers, so this is the same source the Ffi lint reads.
+fn add_op_effect(name: String, acc: [String]) : [String] {
+  let pre = upper_dotted_prefix(name)
+  if pre == "" { acc } else { [pre, ...acc] }
+}
+
+fn upper_dotted_prefix(name: String) : String {
+  let n = string_length(name)
+  if n == 0 { "" }
+  else if first_upper(name) { take_to_dot(name, 0, n) } else { "" }
+}
+
+fn first_upper(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None    -> false
+  }
+}
+
+fn take_to_dot(name: String, i: Int, n: Int) : String {
+  if i >= n { "" }
+  else {
+    match char_at(name, i) {
+      Some('.') -> string_slice(name, 0, i)
+      Some(_)   -> take_to_dot(name, i + 1, n)
+      None      -> ""
+    }
+  }
+}
+
+# A call demands every effect on its callee's resolved function row.
+fn add_callee_effects(callee: Expr, acc: [String]) : [String] {
+  match callee.ty {
+    Some(TyFnT(_, _, row)) -> add_row_effects(row, acc)
+    _                      -> acc
+  }
+}
+
+fn add_row_effects(row: Row, acc: [String]) : [String] =
+  add_label_effects(row.labels, acc)
+
+fn add_label_effects(ls: [Label], acc: [String]) : [String] {
+  match ls {
+    []           -> acc
+    [l, ...rest] -> add_label_effects(rest, [label_eff(l), ...acc])
+  }
+}
+
+fn label_eff(l: Label) : String = l.eff
+
+# ---- small helpers ---------------------------------------------------
+
+fn effects_in_exprs(xs: [Expr], acc: [String]) : [String] {
+  match xs {
+    []           -> acc
+    [x, ...rest] -> effects_in_exprs(rest, effects_in_expr(x, acc))
+  }
+}
+
+fn mem_str(name: String, xs: [String]) : Bool {
+  match xs {
+    []           -> false
+    [x, ...rest] -> if x == name { true } else { mem_str(name, rest) }
+  }
+}
+
+# ---- structural child extractor --------------------------------------
+
+fn fx_child_exprs(k: ExprKind) : [Expr] {
+  match k {
+    ECall(callee, xs)   -> [callee, ...xs]
+    EField(base, _)     -> [base]
+    EIndex(a, b)        -> [a, b]
+    EBinop(_, a, b)     -> [a, b]
+    EUnop(_, x)         -> [x]
+    EIf(c, t, eo)       -> [c, t, ...fx_opt(eo)]
+    EMatch(scr, arms)   -> [scr, ...fx_arm_exprs(arms)]
+    ELambda(_, body)    -> [body]
+    ERecordLit(_, fis)  -> fx_field_exprs(fis)
+    EList(els)          -> fx_elem_exprs(els)
+    ERange(a, b, so)    -> [a, b, ...fx_opt(so)]
+    EBlock(ss, tail)    -> list_append(fx_stmt_exprs(ss), fx_opt(tail))
+    EPipe(a, b)         -> [a, b]
+    EMapPipe(a, b)      -> [a, b]
+    EFlatMapPipe(a, b)  -> [a, b]
+    EFilterPipe(a, b)   -> [a, b]
+    ELitUnit(inner, _)  -> [inner]
+    EBang(inner)        -> [inner]
+    EHandle(body, _, _, init, _, _, _) -> [body, ...fx_opt(init)]
+    _                   -> []
+  }
+}
+
+fn fx_opt(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn fx_arm_exprs(arms: [Arm]) : [Expr] {
+  match arms {
+    []                      -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(fx_opt(g), [b]), fx_arm_exprs(rest))
+  }
+}
+
+fn fx_field_exprs(fis: [FieldInit]) : [Expr] {
+  match fis {
+    []                  -> []
+    [FI(_, v), ...rest] -> [v, ...fx_field_exprs(rest)]
+  }
+}
+
+fn fx_elem_exprs(els: [ListElem]) : [Expr] {
+  match els {
+    []                     -> []
+    [ElPlain(x), ...rest]  -> [x, ...fx_elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...fx_elem_exprs(rest)]
+  }
+}
+
+fn fx_stmt_exprs(ss: [Stmt]) : [Expr] {
+  match ss {
+    []           -> []
+    [s, ...rest] -> list_append(fx_stmt_expr_list(s), fx_stmt_exprs(rest))
+  }
+}
+
+fn fx_stmt_expr_list(s: Stmt) : [Expr] {
+  match s {
+    SExprStmt(x)                -> [x]
+    SLet(_, _, rhs)             -> [rhs]
+    SAssert(c, mo)              -> [c, ...fx_opt(mo)]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SVar(_, _, rhs, _, _)       -> [rhs]
+    SUse(_, _, _)               -> []
+  }
+}
