@@ -71,6 +71,55 @@ so it is never flagged.
 
 Precedent: OCaml Warning 10, Rust `#[must_use]`.
 
+### point_free_nudge
+
+A unary lambda whose body is nothing but a field or method chain over
+its parameter reads cleaner as a leading-dot section. kaikai has
+point-free sections for fields, method calls, and chains (`kai info
+syntax` §Point-free sections), so the lambda has an equivalent
+shorter form:
+
+```kaikai
+type Person = { name: String }
+
+fn names(ps: [Person]) : [String] = ps.map((c) => c.name)
+#                                            ^^^^^^^^^^^^^ point_free_nudge: use .name
+```
+
+The nudge fires only when the section is **equivalent**: the chain is
+rooted exactly at the parameter and no method argument depends on it
+(the section supplies the receiver, the written arguments follow). A
+lambda whose body computes anything more than the access — `(c) => c.age
+* 2`, or `(x) => f(x, x)` — is left alone, because no point-free section
+expresses it. A lambda the parser already synthesised from a `.field`
+section is never re-nudged.
+
+### and_then_to_map_nudge
+
+`o.and_then((x) => Some(expr))` is `o.map((x) => expr)` when the function
+**always** wraps its result in `Some` — the bind is doing nothing a map
+would not:
+
+```kaikai
+fn inc(o: Option[Int]) : Option[Int] = o.and_then((x) => Some(x + 1))
+#                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ and_then_to_map_nudge: use map
+```
+
+Every tail position of the function must construct `Some` — a direct
+`Some(...)`, the tail of a block, both branches of an `if`, every arm of
+a `match`. If any path can yield `None` (or anything other than `Some`),
+the rewrite would drop a short-circuit `.map` cannot express, so the
+call is left alone:
+
+```kaikai
+# not flagged: the else branch is None, so this is a real bind
+fn keep_positive(o: Option[Int]) : Option[Int] =
+  o.and_then((x) => if x > 0 { Some(x) } else { None })
+```
+
+Both nudges recognise the combinator call whether it is still written as
+a pipe / UFCS method or has been rewritten by the typer.
+
 ## Output
 
 The JSON form mirrors `--diags-json` / `--holes-json`: a single array,
@@ -84,6 +133,7 @@ one object per finding, stable schema.
 
 ## Not yet
 
-The linter ships one rule today (`discard_pure_value`). Idiom nudges,
-redundant-pattern checks, dead-code and effect-row smells are planned as
-incremental additions, each its own rule with its own name.
+The linter ships three rules today (`discard_pure_value`,
+`point_free_nudge`, `and_then_to_map_nudge`). Redundant-pattern checks,
+dead-code and effect-row smells are planned as incremental additions,
+each its own rule with its own name.
