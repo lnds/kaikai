@@ -59,6 +59,15 @@ on the native backend; selfhost byte-id and tier0 green.
   stage1 face of the shadowing trap; the lesson is recorded for the next
   lane.
 
+- **`test-info-blocks` compiles every `` ```kaikai `` doc block as a full
+  program (build + link), so each needs `fn main`.** The three idiom-nudge
+  examples in `docs/info/lint.md` were illustrative `fn` fragments and the
+  CI gate (tier1-shard-3) failed them with `undefined reference to 'main'`
+  — green locally because `test-info-blocks` is not in tier0. Fixed by
+  adding `fn main() : Int = 0` to each. A `` ```kaikai-snippet `` fence
+  wraps an expression fragment instead, but these blocks declare
+  top-level `fn`s so the full-program form is the right one.
+
 - **`--lint` does not build the head-owner cache, so `|` pipes report
   "no module declaring type List".** Inherited from Phase 1's lint mode,
   not this lane's surface. The rules still detect the pipe nodes
