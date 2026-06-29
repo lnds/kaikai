@@ -73,7 +73,14 @@ pub type Parser = { file: String, src: String, rest: [Token], had_error: Bool,
                 # the `{` as a trailing lambda. This flag is set to false
                 # while parsing such a cond and restored when the cond
                 # parser finishes.
-                allow_trailing_lambda: Bool }
+                allow_trailing_lambda: Bool,
+                # Positional record literals (`Name { ... }`) share the
+                # same hazard: in an `if`/`match` cond the `{` opening the
+                # body would otherwise be eaten as a record literal. False
+                # while parsing such a cond; re-enabled inside any
+                # delimiter (call args, `()`, `[]`, block) where a record
+                # literal is unambiguous.
+                allow_record_lit: Bool }
 
 # A result = a new parser plus an optional payload. `None` means the
 # parser failed (had_error is set on `p`). This mirrors stage 0's
@@ -93,17 +100,20 @@ type PPF     = { p: Parser, r: Option[PField] }
 type PEL     = { p: Parser, r: Option[ListElem] }
 
 fn parser_new(file: String, src: String, toks: [Token]) : Parser =
-  Parser { file: file, src: src, rest: toks, had_error: false, allow_trailing_lambda: true }
+  Parser { file: file, src: src, rest: toks, had_error: false,
+           allow_trailing_lambda: true, allow_record_lit: true }
 
 fn p_mark_err(p: Parser) : Parser =
   Parser { file: p.file, src: p.src, rest: p.rest, had_error: true,
-           allow_trailing_lambda: p.allow_trailing_lambda }
+           allow_trailing_lambda: p.allow_trailing_lambda,
+           allow_record_lit: p.allow_record_lit }
 
 fn p_advance(p: Parser) : Parser {
   match p.rest {
     [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1,
                               had_error: p.had_error,
-                              allow_trailing_lambda: p.allow_trailing_lambda }
+                              allow_trailing_lambda: p.allow_trailing_lambda,
+                              allow_record_lit: p.allow_record_lit }
     [] -> p
   }
 }
@@ -244,8 +254,23 @@ fn p_skip_newlines(p: Parser) : Parser {
 # threading the flag back via `p_with_trailing_lambda(p, true)`.
 fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
-           allow_trailing_lambda: allow }
+           allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit }
 }
+
+# Toggle positional record-literal parsing (see `Parser.allow_record_lit`).
+# Mirrors `p_with_trailing_lambda`: `if` / `match` disable it for the
+# cond, delimiters re-enable it for their interior.
+fn p_with_record_lit(p: Parser, allow: Bool) : Parser {
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
+           allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow }
+}
+
+# Reinstate the caller's `allow_record_lit` on the result of a delimited
+# sub-parse. A delimiter re-enables record literals for its interior; on
+# return the caller's flag must be restored so a following operand in an
+# `if`/`match` cond stays suppressed.
+fn restore_rl(prev: Bool, r: PExpr) : PExpr =
+  PExpr { p: p_with_record_lit(r.p, prev), r: r.r }
 
 fn p_skip_newlines_and_semis(p: Parser) : Parser {
   if p_at(p, TkNewline) or p_at(p, TkSemi) { p_skip_newlines_and_semis(p_advance(p)) }
@@ -1134,7 +1159,12 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr / Console {
 
   let t = p_peek(p)
   if tk_is(t.kind, TkLparen) {
-    let args_r = parse_call_args(p_advance(p))
+    # Call arguments are a delimited context: record literals are
+    # unambiguous here, so re-enable them even inside an `if`/`match`
+    # cond, then restore the cond's flag on the way out.
+    let prev_rl = p.allow_record_lit
+    let args_r0 = parse_call_args(p_with_record_lit(p_advance(p), true))
+    let args_r = PArgs { p: p_with_record_lit(args_r0.p, prev_rl), r: args_r0.r }
     match args_r.r {
       None -> err_e(args_r.p)
       Some(xs) -> {
@@ -1170,12 +1200,16 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr / Console {
       err_e(p_error_here(p1, "expected field name after `.`"))
     }
   } else if tk_is(t.kind, TkLbracket) {
-    let p1 = p_advance(p)
+    # Index brackets delimit the cond, so record literals are
+    # unambiguous inside; re-enable, then restore on the way out.
+    let prev_rl = p.allow_record_lit
+    let p1 = p_with_record_lit(p_advance(p), true)
     let r = parse_expr(p1)
     match r.r {
       None -> err_e(r.p)
       Some(idx) -> {
-        let closed = p_expect(r.p, TkRbracket, "expected `]` after index")
+        let rp = p_with_record_lit(r.p, prev_rl)
+        let closed = p_expect(rp, TkRbracket, "expected `]` after index")
         match closed.r {
           None -> err_e(closed.p)
           Some(_) -> parse_postfix_rest(closed.p, mk_expr(EIndex(lhs, idx), t.line, t.col))
@@ -1526,9 +1560,12 @@ fn parse_primary(p: Parser) : PExpr / Console {
     TkTodoBang -> parse_todo_bang(p, t)
     TkRegex -> parse_regex_sigil(p, t)
     TkIdent -> parse_ident_primary(p, t)
-    TkLparen -> parse_paren_or_lambda(p, t)
-    TkLbracket -> parse_list_or_range(p, t)
-    TkLbrace -> parse_brace_primary(p, t)
+    # `()`, `[]`, and `{}` open delimited contexts where a record
+    # literal is unambiguous: re-enable it for the interior even inside
+    # an `if`/`match` cond, then restore the caller's flag on return.
+    TkLparen -> restore_rl(p.allow_record_lit, parse_paren_or_lambda(p_with_record_lit(p, true), t))
+    TkLbracket -> restore_rl(p.allow_record_lit, parse_list_or_range(p_with_record_lit(p, true), t))
+    TkLbrace -> restore_rl(p.allow_record_lit, parse_brace_primary(p_with_record_lit(p, true), t))
     TkIf -> parse_if(p, t)
     TkMatch -> parse_match(p, t)
     TkHandle -> parse_handle(p_advance(p), t)
@@ -1929,8 +1966,10 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
       }
     }
   }
-  # Record literal: `Name { ... }` — but only when the name is Uppercase.
-  else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) {
+  # Record literal: `Name { ... }` — but only when the name is Uppercase
+  # and record literals are allowed here (suppressed in `if`/`match` cond
+  # position so the `{` opens the body, not a positional record).
+  else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) and p.allow_record_lit {
     parse_record_lit(p1, name, t)
   }
   # Qualified record literal `mod.Type { ... }`. Lowercase head +
@@ -1942,7 +1981,7 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
   else if (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and
           tk_is(p_peek1(p1).kind, TkIdent) and
           is_upper_ident(p1.src, p_peek1(p1)) and
-          tk_is(p_peek2(p1).kind, TkLbrace) {
+          tk_is(p_peek2(p1).kind, TkLbrace) and p.allow_record_lit {
     let nt = p_peek1(p1)
     let qname = concat_all([name, ".", tok_source(p1.src, nt)])
     # Advance past `.` and the UpperIdent so `p2` is at the `{`.
@@ -2888,17 +2927,19 @@ fn parse_assert(p: Parser, t: Token) : PStmt / Console {
 fn parse_if(p: Parser, t: Token) : PExpr / Console {
 
   let p1 = p_advance(p)
-  # Cond cannot consume a trailing `{` as a trailing lambda
-  # — that `{` is the `if` body. Disable while parsing cond, then
-  # restore the flag's prior value before consuming the body.
+  # Cond cannot consume a trailing `{` (as a trailing lambda) or an
+  # `UpperIdent {` (as a record literal) — that `{` is the `if` body.
+  # Disable both while parsing cond, then restore their prior values
+  # before consuming the body.
   let prev_atl = p1.allow_trailing_lambda
-  let pc = p_with_trailing_lambda(p1, false)
+  let prev_arl = p1.allow_record_lit
+  let pc = p_with_record_lit(p_with_trailing_lambda(p1, false), false)
   let rc = parse_expr(pc)
   match rc.r {
     None -> err_e(rc.p)
     Some(cond) -> {
       # Then-block
-      let p2 = p_skip_newlines(p_with_trailing_lambda(rc.p, prev_atl))
+      let p2 = p_skip_newlines(p_with_record_lit(p_with_trailing_lambda(rc.p, prev_atl), prev_arl))
       if not p_at(p2, TkLbrace) {
         err_e(p_error_here(p2, "expected `{` after `if` condition"))
       } else {
@@ -2940,10 +2981,11 @@ fn parse_if(p: Parser, t: Token) : PExpr / Console {
 fn parse_match(p: Parser, t: Token) : PExpr / Console {
 
   let p1 = p_advance(p)
-  # Same as `if` — scrutinees cannot eat the `{` that opens
-  # the arms block as a trailing lambda.
+  # Same as `if` — scrutinees cannot eat the `{` that opens the arms
+  # block, whether as a trailing lambda or a record literal.
   let prev_atl = p1.allow_trailing_lambda
-  let ps = p_with_trailing_lambda(p1, false)
+  let prev_arl = p1.allow_record_lit
+  let ps = p_with_record_lit(p_with_trailing_lambda(p1, false), false)
   let rs = parse_expr(ps)
   match rs.r {
     None -> err_e(rs.p)
@@ -2955,7 +2997,7 @@ fn parse_match(p: Parser, t: Token) : PExpr / Console {
       # column-1 wildcard branch. For N=1 (the original form), the
       # behaviour is unchanged.
       let r_more = parse_more_scruts(rs.p, [scrut1])
-      let p2 = p_skip_newlines(p_with_trailing_lambda(r_more.p, prev_atl))
+      let p2 = p_skip_newlines(p_with_record_lit(p_with_trailing_lambda(r_more.p, prev_atl), prev_arl))
       if not p_at(p2, TkLbrace) {
         err_e(p_error_here(p2, "expected `{` after `match` expression"))
       } else {
