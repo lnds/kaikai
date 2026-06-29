@@ -24,6 +24,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 chain=(
+  stage0/main.o
+  stage0/lexer.o
+  stage0/ast.o
+  stage0/parser.o
+  stage0/parser_expr.o
+  stage0/check.o
+  stage0/emit.o
   stage0/kaic0
   stage1/build/stage1.c
   stage1/kaic1
@@ -48,13 +55,24 @@ for f in "${chain[@]}"; do
   touch "$f"
 done
 
-# Self-check: make must consider kaic2 up-to-date now. A rebuild here means
-# the chain is wrong (a source slipped past the touch) — fail loud rather
-# than silently pay the bootstrap.
-if make -C stage2 -q kaic2 2>/dev/null; then
-  echo "ci-touch-build OK — kaic2 up-to-date, no rebuild needed"
+# Self-check: every stage sub-make must consider its binary up-to-date.
+# The ROOT `kaic0/kaic1/kaic2` targets are .PHONY, so they always run the
+# sub-make regardless of mtime — checking the root `-q` would be a false
+# negative. What actually matters is that each sub-make (`make -C stageN -q`)
+# finds nothing to rebuild; that is the recompile the shards were paying.
+# stage0's binary depends on its .o objects, which the artifact now ships and
+# this script touches — the missing .o was the cascade trigger.
+rebuild=0
+for s in "stage0 kaic0" "stage1 kaic1" "stage2 kaic2"; do
+  dir=${s% *}; tgt=${s#* }
+  if ! make -C "$dir" -q "$tgt" 2>/dev/null; then
+    echo "ci-touch-build WARN — $dir wants to rebuild $tgt; reason:" >&2
+    make -C "$dir" --debug=basic "$tgt" 2>&1 | grep -iE 'newer|must remake|remaking' | head -6 >&2 || true
+    rebuild=1
+  fi
+done
+if [ "$rebuild" -eq 0 ]; then
+  echo "ci-touch-build OK — kaic0/kaic1/kaic2 up-to-date, no rebuild needed"
 else
-  echo "ci-touch-build WARN — make still wants to rebuild kaic2; dumping reason:" >&2
-  make -C stage2 --debug=basic kaic2 2>&1 | grep -iE 'newer|must remake|remaking' | head -10 >&2 || true
   exit 1
 fi
