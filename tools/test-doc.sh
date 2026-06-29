@@ -93,4 +93,21 @@ fi
 "$KAI" doc nosuchmodule 2>&1 | grep -qE "no module .* in the stdlib" \
   || fail "bad module missing 'no module ... in the stdlib' hint"
 
-echo "test-doc: OK — --help clean, doc list/module/symbol views, sig field, error paths"
+# 7. A PACKAGE module that imports a STDLIB module documents (issue #976).
+#    `--doc-json` for a package module must see the stdlib search root the
+#    same way `kai check` / `kai build` do; otherwise `import spawn` fails
+#    to resolve, the extractor exits non-zero, and `kai doc` prints nothing
+#    — while `kai check` on the same module passes.
+pkg_doc_dir="$ROOT/examples/packages/doc_stdlib_import"
+( cd "$pkg_doc_dir" && "$KAI" doc pkg/clean >/dev/null 2>&1 ) \
+  || fail "'kai doc pkg/clean' (no-import package module) exited non-zero"
+pkg_imp_out="$( cd "$pkg_doc_dir" && "$KAI" doc pkg/withimport 2>&1 )" \
+  || fail "'kai doc pkg/withimport' (package module importing stdlib) exited non-zero"
+echo "$pkg_imp_out" | grep -q "^# pkg/withimport" \
+  || fail "'kai doc pkg/withimport' missing module header"
+echo "$pkg_imp_out" | grep -q "Imports a stdlib module" \
+  || fail "'kai doc pkg/withimport' missing module doc"
+echo "$pkg_imp_out" | grep -q "go" \
+  || fail "'kai doc pkg/withimport' did not list the go item"
+
+echo "test-doc: OK — --help clean, doc list/module/symbol views, sig field, error paths, package-module stdlib import"
