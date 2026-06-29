@@ -84,6 +84,8 @@ type Person = { name: String }
 
 fn names(ps: [Person]) : [String] = ps.map((c) => c.name)
 #                                            ^^^^^^^^^^^^^ point_free_nudge: use .name
+
+fn main() : Int = 0
 ```
 
 The nudge fires only when the section is **equivalent**: the chain is
@@ -103,6 +105,8 @@ would not:
 ```kaikai
 fn inc(o: Option[Int]) : Option[Int] = o.and_then((x) => Some(x + 1))
 #                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ and_then_to_map_nudge: use map
+
+fn main() : Int = 0
 ```
 
 Every tail position of the function must construct `Some` — a direct
@@ -115,6 +119,8 @@ call is left alone:
 # not flagged: the else branch is None, so this is a real bind
 fn keep_positive(o: Option[Int]) : Option[Int] =
   o.and_then((x) => if x > 0 { Some(x) } else { None })
+
+fn main() : Int = 0
 ```
 
 Both nudges recognise the combinator call whether it is still written as
