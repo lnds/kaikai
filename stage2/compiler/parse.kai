@@ -1255,7 +1255,7 @@ fn parse_trailing_lambda(p: Parser) : PExpr / Console {
       let body_r = parse_lambda_block_body(res.p, t)
       match body_r.r {
         None -> err_e(body_r.p)
-        Some(body) -> ok_e(body_r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
+        Some(body) -> ok_e(body_r.p, finish_block_lambda(res, body, t))
       }
     }
     None -> {
@@ -1286,16 +1286,71 @@ fn parse_lambda_block_body(p: Parser, t: Token) : PExpr / Console {
 # bare `"->"`. Returns Some(parser-after-arrow, params) on match,
 # None otherwise. The scan never consumes tokens of the underlying
 # parser on failure (it's a pure predicate over the token stream).
-type LamBlockParams = { p: Parser, params: [Param] }
+# `wrap` carries a single destructuring pattern (`{ (a, b) -> ... }`);
+# when present the caller rewrites the body to `match <fresh> { pat -> body }`,
+# reusing the existing pattern lowering and its exhaustiveness check.
+type LamBlockParams = { p: Parser, params: [Param], wrap: Option[Pattern] }
 
-fn try_parse_lambda_block_params(p: Parser) : Option[LamBlockParams] {
+fn try_parse_lambda_block_params(p: Parser) : Option[LamBlockParams] / Console {
   # Zero-arity: `{ -> body }`.
   if p_at(p, TkArrow) {
-    Some(LamBlockParams { p: p_advance(p), params: [] })
+    Some(LamBlockParams { p: p_advance(p), params: [], wrap: None })
+  } else if p_at(p, TkLparen) {
+    try_parse_lambda_block_pattern(p)
   } else if p_at(p, TkIdent) {
     try_parse_lambda_block_params_loop(p, [])
   } else {
     None
+  }
+}
+
+# A block lambda whose sole parameter is a tuple pattern: `{ (a, b) -> body }`.
+# Disambiguated from a brace block opening with a parenthesised expression
+# (`{ (a + b) }`) by a balanced-paren scan: a pattern binder only if `->`
+# immediately follows the matching `)`. The scan reports no errors, so a
+# misfire falls back to the ordinary block path.
+fn try_parse_lambda_block_pattern(p: Parser) : Option[LamBlockParams] / Console {
+  let after = skip_balanced_parens(p_advance(p), 1)
+  if not p_at(after, TkArrow) { None }
+  else {
+    let pr = parse_pattern(p)
+    match pr.r {
+      None -> None
+      Some(pat) -> {
+        let p2 = p_skip_newlines(pr.p)
+        if not p_at(p2, TkArrow) { None }
+        else {
+          let fresh = lam_pat_binder_name(pat.line, pat.col)
+          let pm = Param { pname: fresh, ptype: None, pline: pat.line, pcol: pat.col }
+          Some(LamBlockParams { p: p_advance(p2), params: [pm], wrap: Some(pat) })
+        }
+      }
+    }
+  }
+}
+
+fn lam_pat_binder_name(line: Int, col: Int) : String =
+  string_concat_all(["__lam_pat_", int_to_string(line), "_", int_to_string(col), "__"])
+
+# Build a block-lambda expression, rewriting the body to a single-arm
+# `match` over the fresh binder when the parameter is a destructuring
+# pattern. The match's exhaustiveness check rejects a refutable pattern
+# (e.g. `Some(x)`) with the standard non-exhaustive diagnostic.
+fn finish_block_lambda(res: LamBlockParams, body: Expr, t: Token) : Expr {
+  match res.wrap {
+    None -> mk_expr(ELambda(res.params, body), t.line, t.col)
+    Some(pat) -> {
+      let scrut = mk_expr(EVar(lam_block_binder(res.params)), pat.line, pat.col)
+      let m = mk_expr(EMatch(scrut, [Arm(pat, None, body)]), pat.line, pat.col)
+      mk_expr(ELambda(res.params, m), t.line, t.col)
+    }
+  }
+}
+
+fn lam_block_binder(params: [Param]) : String {
+  match params {
+    [pm, ..._] -> pm.pname
+    [] -> "_"
   }
 }
 
@@ -1310,7 +1365,7 @@ fn try_parse_lambda_block_params_loop(p: Parser, acc: [Param]) : Option[LamBlock
     if p_at(p1, TkComma) {
       try_parse_lambda_block_params_loop(p_skip_newlines(p_advance(p1)), acc1)
     } else if p_at(p1, TkArrow) {
-      Some(LamBlockParams { p: p_advance(p1), params: list_reverse(acc1) })
+      Some(LamBlockParams { p: p_advance(p1), params: list_reverse(acc1), wrap: None })
     } else {
       None
     }
@@ -2585,7 +2640,7 @@ fn parse_brace_primary(p: Parser, t: Token) : PExpr / Console {
       let body_r = parse_lambda_block_body(res.p, t)
       match body_r.r {
         None -> err_e(body_r.p)
-        Some(body) -> ok_e(body_r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
+        Some(body) -> ok_e(body_r.p, finish_block_lambda(res, body, t))
       }
     }
     None -> parse_block(p, t)

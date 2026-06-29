@@ -178,6 +178,23 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+A block lambda's parameter may be a tuple pattern, destructuring a
+`Pair`/tuple argument inline instead of an explicit `let`:
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let rows = ["a", "b", "c"]
+  foreach(rows.enumerate()) { (row, line) ->   # binds row, line from the Pair
+    Stdout.print("#{int_to_string(row)}: #{line}")
+  }
+}
+```
+
+The pattern binder is irrefutable: `(a, b)` over a `Pair` always
+matches. A refutable pattern (e.g. `(Some(n))`) is rejected with a
+non-exhaustive-match diagnostic. This destructuring is block-lambda
+only — the arrow form `(a, b) => ...` stays a two-parameter lambda.
+
 ## Control flow
 
 ```kaikai
