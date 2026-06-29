@@ -1,0 +1,335 @@
+#[doc("kai lint: Clippy-style opinion linter over the typed AST. Phase 1 ships discard_pure_value; warnings only, never blocks a build.")]
+
+import compiler.ast
+import compiler.util
+import compiler.infer
+
+# A single lint hit, addressed by source position. The first field
+# names the lint so it can be allowed/denied individually later.
+pub type LintFinding = LF(String, Int, Int, String)
+
+# ---- discard_pure_value ----------------------------------------------
+
+#[doc("Run every lint over the root-file decls of a typed program; returns findings in source order.")]
+pub fn lint_program(decls: [Decl]) : [LintFinding] =
+  lint_walk_decls(decls, [])
+
+fn lint_walk_decls(decls: [Decl], acc: [LintFinding]) : [LintFinding] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> lint_walk_decls(rest, lint_decl(d, acc))
+  }
+}
+
+# Only decls authored in the root file (module_origin = None) are linted.
+fn lint_decl(d: Decl, acc: [LintFinding]) : [LintFinding] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
+      None    -> lint_expr(body, acc)
+      Some(_) -> acc
+    }
+    _ -> acc
+  }
+}
+
+# Recursion into sub-expressions is what reaches blocks nested inside
+# lambda bodies, match arms, and if branches.
+fn lint_expr(e: Expr, acc: [LintFinding]) : [LintFinding] {
+  match e.kind {
+    EBlock(stmts, tail) -> lint_block(stmts, tail, acc)
+    _ -> lint_children(e, acc)
+  }
+}
+
+# The tail (or its absence) is the block's own value, never a discard;
+# every other statement sits in non-tail position.
+fn lint_block(stmts: [Stmt], tail: Option[Expr], acc: [LintFinding]) : [LintFinding] {
+  let a1 = lint_stmts(stmts, acc)
+  match tail {
+    Some(t) -> lint_expr(t, a1)
+    None    -> a1
+  }
+}
+
+fn lint_stmts(ss: [Stmt], acc: [LintFinding]) : [LintFinding] {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> lint_stmts(rest, lint_stmt(s, acc))
+  }
+}
+
+# Recurse into every sub-expression (to reach nested blocks), then add
+# the discard finding when this statement drops a pure non-Unit value.
+fn lint_stmt(s: Stmt, acc: [LintFinding]) : [LintFinding] {
+  let inner = lint_exprs(stmt_expr_list(s), acc)
+  match s {
+    SExprStmt(x) -> if discard_is_smell(x) { [discard_finding(x), ...inner] } else { inner }
+    _            -> inner
+  }
+}
+
+# Point at the start of the discarded expression. An ECall's own
+# line/col mark its argument parens, so prefer the callee's position;
+# every other node already carries its leftmost span.
+fn discard_finding(x: Expr) : LintFinding {
+  let pos = discard_pos(x)
+  LF("discard_pure_value", pos.line, pos.col, discard_message(x))
+}
+
+fn discard_pos(x: Expr) : Expr {
+  match x.kind {
+    ECall(callee, _) -> callee
+    _                -> x
+  }
+}
+
+fn discard_message(x: Expr) : String =
+  concat_all(["pure value of type ", lint_ty_name(x), " discarded; bind it or drop the statement"])
+
+# A non-Unit pure value dropped in statement position is dead code; an
+# effectful discard is legitimate because the effect row tracks it.
+fn discard_is_smell(x: Expr) : Bool =
+  not ty_is_unit(x.ty) and expr_is_pure(x)
+
+# None ("unknown") is not Unit; expr_is_pure keeps such nodes silent.
+fn ty_is_unit(t: Option[Ty]) : Bool {
+  match t {
+    Some(TyUnit) -> true
+    _            -> false
+  }
+}
+
+# ---- purity ----------------------------------------------------------
+#
+# "Provably pure": the bias is false-negatives over false-positives.
+# The only effect introducers are an effect-op reference, a handler,
+# and an application of a function whose type carries a non-empty row;
+# every other node only propagates the purity of its children. Any case
+# that cannot be proven pure (a `?` op with no inferred type, an open
+# row tail, an untyped node) reads as impure and stays silent.
+
+fn expr_is_pure(e: Expr) : Bool =
+  not expr_has_effect(e)
+
+fn expr_has_effect(e: Expr) : Bool =
+  expr_introduces_effect(e) or children_have_effect(e)
+
+# Judged at this node only; children are covered by expr_has_effect.
+fn expr_introduces_effect(e: Expr) : Bool {
+  match e.kind {
+    EHandle(_, _, _, _, _, _, _) -> true
+    EVar(name)                   -> is_effect_op(name)
+    ECall(callee, _)             -> callee_is_effectful(callee)
+    _                            -> false
+  }
+}
+
+# A flattened `Eff.op` reference carries no inferred type, so it is
+# recognised by name with the same uppercase-prefix rule --effects-json
+# uses: a `.` whose prefix starts with an uppercase letter (effects are
+# PascalCase, so this skips record/field paths like `list.length`).
+fn is_effect_op(name: String) : Bool =
+  qualified_upper_prefix(name, 0, string_length(name))
+
+fn qualified_upper_prefix(name: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(name, i) {
+      Some('.') -> first_is_upper(name)
+      Some(_)   -> qualified_upper_prefix(name, i + 1, n)
+      None      -> false
+    }
+  }
+}
+
+fn first_is_upper(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None    -> false
+  }
+}
+
+# A call is effectful when its callee's function type carries a non-empty
+# row. An unresolved callee type reads as effectful unless it is a bare
+# binding (then the call's purity rides on its arguments alone).
+fn callee_is_effectful(callee: Expr) : Bool {
+  match callee.ty {
+    Some(TyFnT(_, _, row)) -> not row_is_pure(row)
+    Some(_)                -> false
+    None                   -> not is_known_pure_var(callee)
+  }
+}
+
+fn is_known_pure_var(callee: Expr) : Bool {
+  match callee.kind {
+    EVar(name) -> not is_effect_op(name)
+    _          -> false
+  }
+}
+
+# Pure iff the row carries no labels. The tail is internal bookkeeping:
+# a pure fn typically keeps a free row variable with no demand on it
+# (the phantom fn_scheme_of_decl inserts for an empty signature), and
+# the compiler itself treats label-free rows as pure regardless of the
+# tail (see inf_row_to_string_suffix). Matching that is what lets a
+# call to a pure user fn read as pure.
+fn row_is_pure(row: Row) : Bool =
+  labels_empty(row.labels)
+
+# ---- structural recursion over children ------------------------------
+#
+# One extractor flattens an ExprKind's immediate sub-expressions to a
+# flat [Expr], so both the effect scan and the finding walk recurse
+# through the same shape and neither restates the per-kind structure.
+
+fn children_have_effect(e: Expr) : Bool =
+  any_expr_effect(child_exprs(e.kind))
+
+fn lint_children(e: Expr, acc: [LintFinding]) : [LintFinding] =
+  lint_exprs(child_exprs(e.kind), acc)
+
+fn child_exprs(k: ExprKind) : [Expr] {
+  match k {
+    ECall(callee, xs)   -> [callee, ...xs]
+    EField(base, _)     -> [base]
+    EIndex(a, b)        -> [a, b]
+    EBinop(_, a, b)     -> [a, b]
+    EUnop(_, x)         -> [x]
+    EIf(c, t, eo)       -> [c, t, ...opt_list(eo)]
+    EMatch(scr, arms)   -> [scr, ...arm_exprs(arms)]
+    ELambda(_, body)    -> [body]
+    ERecordLit(_, fis)  -> field_exprs(fis)
+    EList(els)          -> elem_exprs(els)
+    ERange(a, b, so)    -> [a, b, ...opt_list(so)]
+    EBlock(ss, tail)    -> list_append(stmt_exprs(ss), opt_list(tail))
+    EPipe(a, b)         -> [a, b]
+    EMapPipe(a, b)      -> [a, b]
+    EFlatMapPipe(a, b)  -> [a, b]
+    EFilterPipe(a, b)   -> [a, b]
+    ELitUnit(inner, _)  -> [inner]
+    EBang(inner)        -> [inner]
+    EHandle(body, _, _, init, _, _, _) -> [body, ...opt_list(init)]
+    _                   -> []
+  }
+}
+
+fn opt_list(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn arm_exprs(arms: [Arm]) : [Expr] {
+  match arms {
+    []          -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(opt_list(g), [b]), arm_exprs(rest))
+  }
+}
+
+fn field_exprs(fis: [FieldInit]) : [Expr] {
+  match fis {
+    []                -> []
+    [FI(_, v), ...rest] -> [v, ...field_exprs(rest)]
+  }
+}
+
+fn elem_exprs(els: [ListElem]) : [Expr] {
+  match els {
+    [] -> []
+    [ElPlain(x), ...rest]  -> [x, ...elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...elem_exprs(rest)]
+  }
+}
+
+fn stmt_exprs(ss: [Stmt]) : [Expr] {
+  match ss {
+    []          -> []
+    [s, ...rest] -> list_append(stmt_expr_list(s), stmt_exprs(rest))
+  }
+}
+
+fn stmt_expr_list(s: Stmt) : [Expr] {
+  match s {
+    SExprStmt(x)            -> [x]
+    SLet(_, _, rhs)         -> [rhs]
+    SAssert(c, mo)          -> [c, ...opt_list(mo)]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SVar(_, _, rhs, _, _)   -> [rhs]
+    SUse(_, _, _)           -> []
+  }
+}
+
+fn any_expr_effect(xs: [Expr]) : Bool {
+  match xs {
+    []          -> false
+    [x, ...rest] -> if expr_has_effect(x) { true } else { any_expr_effect(rest) }
+  }
+}
+
+fn lint_exprs(xs: [Expr], acc: [LintFinding]) : [LintFinding] {
+  match xs {
+    []          -> acc
+    [x, ...rest] -> lint_exprs(rest, lint_expr(x, acc))
+  }
+}
+
+# ---- type display ----------------------------------------------------
+
+fn lint_ty_name(e: Expr) : String {
+  match e.ty {
+    Some(t) -> inf_ty_to_string(t)
+    None    -> "?"
+  }
+}
+
+# ---- reporting -------------------------------------------------------
+
+#[doc("Run lints over a typed program and print human-readable findings; always returns 0 (lints never block a build).")]
+pub fn run_lint(file: String, decls: [Decl]) : Int / Console + File {
+  let r = infer_program(file, decls, false)
+  let findings = lint_program(r.decls)
+  lint_report_text(file, findings)
+  0
+}
+
+fn lint_report_text(file: String, findings: [LintFinding]) : Unit / Console {
+  match findings {
+    [] -> ()
+    [f, ...rest] -> { print(lint_finding_text(file, f)) lint_report_text(file, rest) }
+  }
+}
+
+fn lint_finding_text(file: String, f: LintFinding) : String {
+  match f {
+    LF(rule, line, col, msg) ->
+      concat_all([file, ":", int_to_string(line), ":", int_to_string(col),
+                  ": warning: ", msg, " [", rule, "]"])
+  }
+}
+
+#[doc("Run lints over a typed program and print findings as a JSON array; always returns 0 (lints never block a build).")]
+pub fn run_lint_json(file: String, decls: [Decl]) : Int / Console + File {
+  let r = infer_program(file, decls, false)
+  let findings = lint_program(r.decls)
+  print(concat_all(["[", lint_json_body(file, findings), "]"]))
+  0
+}
+
+fn lint_json_body(file: String, findings: [LintFinding]) : String =
+  string_join(map(findings, (f) => lint_finding_json(file, f)), ", ")
+
+fn lint_finding_json(file: String, f: LintFinding) : String {
+  match f {
+    LF(rule, line, col, msg) ->
+      concat_all([
+        "{\"file\": ", json_quote(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"rule\": ", json_quote(rule),
+        ", \"severity\": \"warning\"",
+        ", \"message\": ", json_quote(msg),
+        "}"
+      ])
+  }
+}
