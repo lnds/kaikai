@@ -729,12 +729,14 @@ Options:
                        portable C-text path (bootstrap + parity oracle).
                        KAI_BACKEND env var overrides the default; this
                        flag overrides both.
-  --release            Optimise with -O2 (default). For the native
-                       backend this runs the LLVM \`default<O2>\` pipeline
-                       in-process — parity with the clang -O2 the C
-                       path gets.
-  --debug              Optimise with -O0: fast compile, no inlining,
-                       symbols kept. Native runs \`default<O0>\`.
+  --release            Ship profile: -O2 \`default<O2>\` (parity with the
+                       clang -O2 the C path gets) AND strip symbols, so
+                       the binary is smaller than the default. No DWARF.
+  --debug              Debug profile: -O0 (fast compile, no inlining),
+                       symbols kept, AND full DWARF line tables keyed to
+                       the .kai source. \`lldb\`/\`gdb\` break on kaikai
+                       lines; panics print the .kai:line stack trace.
+                       Native only (the C backend ignores it).
   --holes              Report every typed hole (\`?\` / \`?name\`) with
                        expected type, in-scope bindings, and candidate
                        fillers, then exit. No binary is produced. See
@@ -1169,8 +1171,15 @@ compile_to_binary() {
     if [ -n "$RUNTIME_LLVM_BC" ]; then
       nbc_env="$RUNTIME_LLVM_BC"
     fi
+    # DWARF (#500): the entry file was copied to $tmp, so the path kaic2 sees
+    # (and bakes into the DIFile) is the ephemeral $tmp copy — `lldb` then
+    # cannot find the source. Hand kaic2 the ORIGINAL absolute path via
+    # KAI_DEBUG_SRC so the debug DIFile + comp_dir point at the user's real
+    # file. Only consulted in --debug; harmless otherwise.
+    dbg_src="$src"
+    case "$dbg_src" in /*) ;; *) dbg_src="$(cd "$src_dir" && pwd)/$src_base" ;; esac
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+    if ! (unset KAI_TRACE_RC; KAI_DEBUG_SRC="$dbg_src" KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
       # Distinguish "this kaic2 has no native backend" (actionable: the
       # build was C-only) from a real compile error in the user program.
       # The C-only stub aborts with a known sentinel string; anything
@@ -1221,10 +1230,26 @@ compile_to_binary() {
     # fallback), cc compiles+links runtime_llvm.c as before. The -I flags are
     # only needed when runtime_llvm.c is compiled, but they are harmless on
     # the self-contained line so the two arms stay close.
+    # `-ldl` (issue #500): the runtime's panic backtrace calls `dladdr` to
+    # de-slide PIE frames. On modern glibc it lives in libc and on macOS in
+    # libSystem (both make `-ldl` a harmless no-op), but older glibc needs
+    # the explicit lib — so request it everywhere.
     if [ -n "$RUNTIME_LLVM_BC" ]; then
-      $CC $CFLAGS "$obj" -o "$out" -lm
+      $CC $CFLAGS "$obj" -o "$out" -lm -ldl
     else
-      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm
+      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+    fi
+    # --debug DWARF (#500): the native object carries the .debug_* sections.
+    # On ELF (Linux) the linker copies them straight into the executable, so
+    # `lldb`/`gdb`/dwarfdump work on $out with no extra step. On Mach-O the
+    # linker instead leaves a debug map pointing at the .o (which $tmp drops
+    # on exit), so the DWARF must be collected into a .dSYM bundle next to
+    # the binary — `dsymutil` reads the debug map while $obj still exists.
+    # Guarded on `command -v dsymutil` so a Linux build (no dsymutil) skips
+    # it; failure is non-fatal (the .o-resident DWARF is still there to debug
+    # against manually). The .dSYM is what `lldb $out` auto-loads.
+    if [ "${KAI_BUILD_MODE:-default}" = "debug" ] && command -v dsymutil >/dev/null 2>&1; then
+      dsymutil "$out" 2>/dev/null || true
     fi
   elif [ "${KAI_MODULAR:-0}" = "1" ]; then
     # Issue #748: separate compilation. kaic2 emits a marker-delimited
@@ -1468,7 +1493,7 @@ run_report_mode() {
 report_holes() { run_report_mode "$@"; }
 
 cmd_build() {
-  src=""; out=""; report_mode=""; backend_cli=""; opt_level=""
+  src=""; out=""; report_mode=""; backend_cli=""; opt_level=""; build_mode=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
@@ -1509,14 +1534,20 @@ cmd_build() {
           c|native) ;;
           *) die "--backend must be 'c' or 'native' (got: $backend_cli)" ;;
         esac ;;
-      # L4 (issue #498): optimisation profile for the native backend.
-      # Default (no flag) is `--release` = `-O2`, matching the `cc -O2`
-      # the C path gets. `--debug` drops to `-O0` (fast compile, no
-      # inlining, symbols kept). Threaded to the in-process libLLVM
-      # pipeline via KAI_NATIVE_OPT (read by the emit prim); the C
-      # backend ignores it (it already gets -O2 / -O0 from CFLAGS).
-      --debug)   opt_level="0"; shift ;;
-      --release) opt_level="2"; shift ;;
+      # Build profiles (issue #500). Three modes, distinct on TWO axes —
+      # opt level AND debug-info — so the default and --release share an
+      # opt level (2) yet differ on symbol stripping, and --debug is the
+      # only mode that emits DWARF:
+      #   default (no flag) : -O2, symbols kept, NO DWARF  (fast iteration)
+      #   --release         : -O2, stripped,     NO DWARF  (ship it)
+      #   --debug           : -O0, symbols kept, full DWARF (source debug)
+      # `opt_level` threads to the libLLVM pass pipeline via KAI_NATIVE_OPT;
+      # `build_mode` threads the debug-info + strip decisions via
+      # KAI_BUILD_MODE (the native emit prim reads it to gate DWARF; the
+      # link step below reads it to strip). The C backend ignores both (it
+      # already gets -O2 / -O0 from CFLAGS, and DWARF is out of its scope).
+      --debug)   opt_level="0"; build_mode="debug"; shift ;;
+      --release) opt_level="2"; build_mode="release"; shift ;;
       -*) die "unknown flag: $1 (see 'kai build --help')" ;;
       *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
     esac
@@ -1526,6 +1557,7 @@ cmd_build() {
   set -- $(resolve_backend "$backend_cli")
   backend="$1"; backend_origin="$2"
   export KAI_NATIVE_OPT="${opt_level:-2}"
+  export KAI_BUILD_MODE="${build_mode:-default}"
   if [ -n "$report_mode" ]; then
     [ -z "$out" ] || die "$report_mode does not produce a binary; drop -o <out>"
     # Report modes run the typer only — backend selection is irrelevant.
@@ -1561,6 +1593,18 @@ cmd_build() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$out" "build"
+  # --release (issue #500): strip the linked binary so a shipped artifact
+  # is smaller than the symbol-keeping default. Plain `strip` removes the
+  # local + debug symbols (the bulk: the native object names every emitted
+  # kaikai fn + every `_.str` constant) while preserving the dynamic symbol
+  # table the loader resolves against — semantics shared by the macOS
+  # `strip` and GNU binutils `strip`, so the binary still runs. Runs only on
+  # a successful build of an actual file. A strip failure is non-fatal — the
+  # unstripped binary already runs — so a `strip` missing from PATH degrades
+  # to "not smaller", never to "no binary".
+  if [ "$build_mode" = "release" ] && [ -f "$out" ]; then
+    strip "$out" 2>/dev/null || true
+  fi
 }
 
 cmd_run() {

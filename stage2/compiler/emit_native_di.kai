@@ -1,0 +1,111 @@
+#[doc("""
+DWARF debug-info emission for the native (in-process libLLVM) backend (#500).
+
+The C forwarders (`native_di_*` in native_prims / runtime.h) hold the LLVM
+DIBuilder state in the off-RC ctx; this module is the kaikai-side glue that
+the emit_native walk calls: enable DI from the source path, open a
+DISubprogram per fn, set a statement's source line, and finalize.
+
+Every entry is a thin wrapper that is a no-op unless `--debug` enabled DI
+(the gate lives in C: `native_di_enable` checks KAI_BUILD_MODE). So a
+release/default build pays only a handful of `native_di_enabled` checks and
+emits no metadata.
+""")]
+import compiler.util
+import compiler.kir
+import compiler.native_prims
+
+#[doc("Enable DWARF for `ctx` from the source path, splitting it into the file name and its directory. A no-op in release/default (gated in C by KAI_BUILD_MODE).")]
+pub fn ndi_enable(ctx: Handle, src_path: String) : Unit =
+  native_di_enable(ctx, ndi_basename(src_path), ndi_dirname(src_path))
+
+#[doc("Resolve DWARF temporaries before verify. A no-op when DI is off.")]
+pub fn ndi_finalize(ctx: Handle) : Unit = native_di_finalize(ctx)
+
+#[doc("Emit the `__kai_build_debug = 1` marker so a panic in this binary prints a .kai:line stack trace. A no-op when DI is off.")]
+pub fn ndi_debug_marker(ctx: Handle) : Unit = native_di_debug_marker(ctx)
+
+#[doc("Open + attach this fn's DISubprogram (the location scope) at `line`. A no-op when DI is off.")]
+pub fn ndi_subprogram(ctx: Handle, fnval: Handle, sym: String, line: Int) : Unit =
+  if native_di_enabled(ctx) == 1 { native_di_subprogram(ctx, fnval, sym, line) } else { () }
+
+#[doc("Set the builder's current source position from a KIR `KPos`. `KAt` sets the line/col; `KNoPos` clears it (a synthetic instruction carries no source). A no-op when DI is off.")]
+pub fn ndi_set_pos(ctx: Handle, pos: KPos) : Unit =
+  if native_di_enabled(ctx) == 1 {
+    match pos {
+      KAt(line, col) -> native_di_set_loc(ctx, line, col)
+      KNoPos         -> native_di_clear_loc(ctx)
+    }
+  } else { () }
+
+#[doc("The source line for a fn's DISubprogram: the first statement/terminator position across its blocks, or 1 when the fn is wholly synthetic.")]
+pub fn ndi_fn_line(blocks: [KBlock]) : Int = match blocks {
+  [] -> 1
+  [b, ...rest] -> match ndi_first_block_line(b) {
+    Some(l) -> l
+    None    -> ndi_fn_line(rest)
+  }
+}
+
+# First source line within one block: a statement's, else the terminator's.
+fn ndi_first_block_line(b: KBlock) : Option[Int] = match ndi_stmts_line(b.stmts) {
+  Some(l) -> Some(l)
+  None    -> ndi_pos_line(ndi_term_pos(b.term))
+}
+
+fn ndi_stmts_line(ss: [KStmt]) : Option[Int] = match ss {
+  [] -> None
+  [s, ...rest] -> match ndi_pos_line(ndi_stmt_pos(s)) {
+    Some(l) -> Some(l)
+    None    -> ndi_stmts_line(rest)
+  }
+}
+
+# The line of a KPos, or None for a synthetic node.
+fn ndi_pos_line(pos: KPos) : Option[Int] = match pos {
+  KAt(line, _) -> Some(line)
+  KNoPos       -> None
+}
+
+#[doc("The source position carried by a statement.")]
+pub fn ndi_stmt_pos(s: KStmt) : KPos = match s {
+  KLet(_, _, _, p)      -> p
+  KDo(_, p)             -> p
+  KRC(_, p)             -> p
+  KStore(_, _, p)       -> p
+  KInstall(_, _, _, _, p) -> p
+  KPop(_, _, p)         -> p
+  KBindEvState(_, _, p) -> p
+}
+
+#[doc("The source position carried by a terminator.")]
+pub fn ndi_term_pos(t: KTerm) : KPos = match t {
+  KRet(_, p)                  -> p
+  KBr(_, p)                   -> p
+  KCondBr(_, _, _, p)         -> p
+  KSwitch(_, _, _, p)         -> p
+  KTailCall(_, _, p)          -> p
+  KTcrecGoto(_, _, _, p)      -> p
+  KTrmcStep(_, _, _, _, _, _, _, _, p) -> p
+  KTrmcApply(_, p)            -> p
+  KUnreachable(p)             -> p
+}
+
+# The file-name component of a path (after the last `/`), or the whole path
+# when it has no slash.
+fn ndi_basename(path: String) : String = {
+  let i = ndi_last_slash(path, string_length(path) - 1)
+  if i < 0 { path } else { string_slice(path, i + 1, string_length(path) - i - 1) }
+}
+
+# The directory component (before the last `/`), or "." when there is none.
+fn ndi_dirname(path: String) : String = {
+  let i = ndi_last_slash(path, string_length(path) - 1)
+  if i <= 0 { "." } else { string_slice(path, 0, i) }
+}
+
+# Index of the last `/` at or before `i`, or -1 when none.
+fn ndi_last_slash(path: String, i: Int) : Int =
+  if i < 0 { 0 - 1 }
+  else if char_at_or_zero(path, i) == '/' { i }
+  else { ndi_last_slash(path, i - 1) }
