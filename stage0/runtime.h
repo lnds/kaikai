@@ -11081,6 +11081,20 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
     return node;
 }
 
+/* A by-id capability (a `var`/State/Reader cell or a `with Eff as a` alias)
+ * resolved to no node — the alias's evidence is on the fiber where it was
+ * installed and does not cross a spawn. A NULL here means the op ran on a
+ * child fiber that does not carry the cell; report it instead of dereferencing
+ * the NULL node. The compile-time escape check catches the common shapes; this
+ * is the runtime floor for the ones it cannot see statically. */
+static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char *cap_name) {
+    if (node == NULL || node->handler == NULL) {
+        fprintf(stderr, "kai: capability not reachable in this fiber: %s\n", cap_name);
+        exit(1);
+    }
+    return node;
+}
+
 /* m7b #15: per-instance dispatch — find the evidence node whose
  * handler_id matches `id`, no name match required. The codegen
  * uses this when the op call comes from a `with Eff as alias`
