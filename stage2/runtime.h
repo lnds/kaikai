@@ -59,6 +59,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
+#include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
 
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
@@ -4884,12 +4886,97 @@ static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
     return kai_unit();
 }
 
+/* --debug stack trace (#500). `__kai_build_debug` is 0 in a default/release
+ * binary and set to 1 by the native backend's debug marker global (emitted
+ * only when DWARF is on). A weak definition here means a binary that never
+ * defines the strong one still links. When it is 1, a panic resolves its
+ * return-address backtrace to `<file>.kai:<line>` via the platform symboliser
+ * (`atos` on macOS, `addr2line` on ELF) reading the DWARF this build emitted.
+ * In a non-debug binary the flag is 0, so the panic stays the one-line form
+ * and pays no symboliser cost. */
+__attribute__((weak)) int __kai_build_debug = 0;
+
+/* Best-effort absolute path of the running executable, into `buf`. Returns 1
+ * on success. The symboliser needs it to read the binary's (or its .dSYM's)
+ * DWARF. */
+static int kai_self_exe_path(char *buf, size_t n) {
+#if defined(__APPLE__)
+    uint32_t sz = (uint32_t) n;
+    extern int _NSGetExecutablePath(char *, uint32_t *);
+    return _NSGetExecutablePath(buf, &sz) == 0;
+#else
+    ssize_t r = readlink("/proc/self/exe", buf, n - 1);
+    if (r <= 0) return 0;
+    buf[r] = '\0';
+    return 1;
+#endif
+}
+
+/* Resolve and print the panic backtrace as kaikai source positions. Captures
+ * the native return addresses, then shells out to the platform symboliser
+ * once with all addresses (the DWARF line table maps each back to .kai:line).
+ * Silent + harmless when the symboliser is absent or resolves nothing — the
+ * caller already printed `panic: <msg>`. */
+static void kai_panic_backtrace(void) {
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    if (n <= 0) return;
+    char exe[4096];
+    if (!kai_self_exe_path(exe, sizeof exe)) return;
+
+    /* The frames are RUNTIME addresses (PIE/ASLR-slid). The symboliser reads
+     * the binary at its STATIC link addresses, so the slide must be removed.
+     * `dladdr` on this fn's own address yields `dli_fbase` — the load address
+     * of the main image — which is exactly that slide. `atos -l <fbase>`
+     * tells atos the load address (it subtracts internally); for `addr2line`
+     * we subtract per-address and pass static offsets. */
+    Dl_info info;
+    uintptr_t base = 0;
+    if (dladdr((void *) kai_panic_backtrace, &info) && info.dli_fbase)
+        base = (uintptr_t) info.dli_fbase;
+
+    char cmd[8192];
+#if defined(__APPLE__)
+    int off = snprintf(cmd, sizeof cmd, "atos -o '%s' -fullPath -l %p", exe, (void *) base);
+#else
+    int off = snprintf(cmd, sizeof cmd, "addr2line -f -p -e '%s'", exe);
+#endif
+    if (off <= 0 || off >= (int) sizeof cmd) return;
+    /* Skip frame 0 (this fn) and frame 1 (kai_prelude_panic): start at the
+     * panic's caller. atos gets the runtime address (it applies -l itself);
+     * addr2line gets the static offset (runtime - base). */
+    for (int i = 2; i < n && off < (int) sizeof cmd - 32; i++) {
+#if defined(__APPLE__)
+        off += snprintf(cmd + off, sizeof cmd - off, " %p", frames[i]);
+#else
+        off += snprintf(cmd + off, sizeof cmd - off, " %p",
+                        (void *) ((uintptr_t) frames[i] - base));
+#endif
+    }
+
+    fflush(stderr);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    /* Print only the frames the symboliser resolved to a `.kai` source — the
+     * runtime/libc frames (no `.kai`) are noise. Header is emitted lazily so
+     * a build whose symboliser resolves nothing prints no empty header. */
+    char line[1024];
+    int printed = 0;
+    while (fgets(line, sizeof line, p)) {
+        if (!strstr(line, ".kai")) continue;
+        if (!printed) { fprintf(stderr, "stack trace (kaikai source):\n"); printed = 1; }
+        fprintf(stderr, "  %s", line);
+    }
+    pclose(p);
+}
+
 static KaiValue *kai_prelude_panic(KaiValue *msg) {
     fprintf(stderr, "panic: ");
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    if (__kai_build_debug) kai_panic_backtrace();
     exit(1);
     return kai_unit();
 }
@@ -12052,6 +12139,15 @@ static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
     for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
     c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1;
+    /* DWARF (#500): start each fn with NO subprogram + no current location.
+     * Only a fn that calls `native_di_subprogram` (the user-fn walk) gets a
+     * scope; a synthetic fn (thunk / runtime hook / runner driver) keeps
+     * `disub == NULL`, so its instructions carry no `!dbg` — which avoids a
+     * location whose scope is the PREVIOUS fn's subprogram (the verifier's
+     * "wrong subprogram" rejection). The builder's stale location is
+     * cleared too so no instruction inherits one across the fn boundary. */
+    c->disub = NULL;
+    if (c->b) LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
     return kai_unit();
 }
 static KaiValue *kai_native_ctx_end_fn(void *cv) { ((KaiNativeCtx *) cv)->in_fn = 0; return kai_unit(); }
@@ -12771,9 +12867,18 @@ static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
 /* Enable DWARF for module `m`'s ctx: build the DIBuilder, the DIFile from
  * (filename, directory), and the compile unit, and set the module's DWARF
  * version + debug-info-version flags (without them the backend drops the
- * metadata silently). Idempotent — a second call is a no-op. */
+ * metadata silently). Idempotent — a second call is a no-op.
+ *
+ * Gated on KAI_BUILD_MODE=debug, read HERE in C — the same place the opt
+ * level is gated (`kai_llvm_pass_pipeline` reads KAI_NATIVE_OPT). The
+ * kaikai walk calls this unconditionally; a non-debug build leaves `c->dib`
+ * NULL, so every later DI prim is a no-op and the module is byte-identical
+ * to before this lane. Keeping the gate in C means the emit_native walk
+ * needs no env-var prim. */
 static KaiValue *kai_native_di_enable(void *cv, KaiValue *fnamev, KaiValue *dirv) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *mode = getenv("KAI_BUILD_MODE");
+    if (!mode || strcmp(mode, "debug") != 0) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
     if (c->dib) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
     LLVMModuleRef m = (LLVMModuleRef) c->m;
     LLVMContextRef ctx = LLVMGetModuleContext(m);
@@ -12826,6 +12931,17 @@ static KaiValue *kai_native_di_subprogram(void *cv, void *fnval, KaiValue *namev
         LLVMDIFlagZero, /*IsOptimized=*/0);
     LLVMSetSubprogram((LLVMValueRef) fnval, sp);
     c->disub = sp;
+    /* Seed the builder's current location to this fn's line UNDER THE NEW
+     * subprogram, so the prologue (allocas / param store / entry br, all
+     * emitted before the first statement's `set_loc`) carries a `!dbg`
+     * scoped to THIS fn — not the previous fn's lingering location, which
+     * the shared builder would otherwise keep and which the verifier
+     * rejects as "wrong subprogram". The builder is still positioned in the
+     * previous fn here; this only sets the location state, which persists
+     * across the `position_at_end` the caller does next. */
+    LLVMContextRef lctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef ploc = LLVMDIBuilderCreateDebugLocation(lctx, ln, 0, sp, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, ploc);
     kai_decref(namev);
     return kai_unit();
 }
@@ -12860,6 +12976,21 @@ static KaiValue *kai_native_di_clear_loc(void *cv) {
 static KaiValue *kai_native_di_finalize(void *cv) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     if (c->dib) LLVMDIBuilderFinalize((LLVMDIBuilderRef) c->dib);
+    return kai_unit();
+}
+
+/* Emit the strong `__kai_build_debug = 1` global that flips the runtime's
+ * weak default (0), so a panic in THIS (debug) binary resolves its backtrace
+ * to .kai:line. No-op when DI is off, so a release/default binary keeps the
+ * weak 0 and the one-line panic. */
+static KaiValue *kai_native_di_debug_marker(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(LLVMGetModuleContext(m));
+    LLVMValueRef g = LLVMAddGlobal(m, i32, "__kai_build_debug");
+    LLVMSetInitializer(g, LLVMConstInt(i32, 1, 0));
+    LLVMSetGlobalConstant(g, 1);
     return kai_unit();
 }
 
@@ -13230,6 +13361,7 @@ static KaiValue *kai_native_di_subprogram(void *c, void *fn, KaiValue *n, int64_
 static KaiValue *kai_native_di_set_loc(void *c, int64_t l, int64_t col) { (void) c; (void) l; (void) col; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_native_di_clear_loc(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_native_di_finalize(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_debug_marker(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
 #endif /* KAI_LLVM */
 
 #endif /* KAI_RUNTIME_H */
