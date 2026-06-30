@@ -203,43 +203,46 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check
 # parallel on a shared pre-built kaic2 and an aggregator job (`tier1`)
 # gates on all three — the Required check name is unchanged.
 #
-#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), then
-#            light slice 1/3 — run AFTER the costly compiles free their RSS,
-#            so memory-bound and CPU-bound work never overlap on the runner.
-#  shard 2 — light slice 2/3 + demos baseline.
-#  shard 3 — light slice 3/3 + every remaining non-light phase.
-# The light pool is split three ways (not two) so shard 1's spare capacity
-# after the ~200 s costly compiles carries a third of it, levelling the
-# three runners and shortening the slowest — which sets the critical path.
+#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), then,
+#            after they free their RSS, demos + every non-light phase. These
+#            are CPU-light, so the runner that finishes the costly compiles
+#            fastest absorbs the tail instead of sitting idle.
+#  shard 2 — light slice 1/2.
+#  shard 3 — light slice 2/2.
+# Why the non-light tail lives on shard 1 and the light pool stays split two
+# ways: the light pool divides evenly in two (~600 s each), but the tail and
+# demos piled onto a light shard is what made it the slowest. Round-robin
+# splits by target COUNT, not cost, and the families differ ~50x (stdlib 158
+# fixtures vs 1-fixture targets) — so a finer light split must be weighted by
+# measured cost, not just a larger SHARDS value.
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
-#     test-core-cache, light(1/3), light(2/3), light(3/3), demos-no-regression,
+#     test-core-cache, light(1/2), light(2/2), demos-no-regression,
 #     test-fmt, test-fmt-selfhost, test-bench, test-check,
 #     test-library-mode, test-diagnostics-collected, test-negative,
 #     test-stdlib-modules, test-packages, test-private-type-shadow-audit,
 #     test-private-record-shadow-audit, test-canonical-aliases,
 #     test-info, test-doc }
-# equals exactly the prerequisites of `tier1` (light(1/3) ∪ light(2/3) ∪
-# light(3/3) == TEST_LIGHT_TARGETS, proven by the round-robin partition in
+# equals exactly the prerequisites of `tier1` (light(1/2) ∪ light(2/2)
+# == TEST_LIGHT_TARGETS, proven by the round-robin partition in
 # stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
 tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-costly-parallel
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
-	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=3
-	@echo "tier1-shard-1 OK — costly self-compiles + heap-limit + user/core caches + light slice 1/3"
+	$(MAKE) demos-no-regression
+	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc)"
 
 tier1-shard-2: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=3
-	$(MAKE) demos-no-regression
-	@echo "tier1-shard-2 OK — light slice 2/3 + demos baseline"
+	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=2
+	@echo "tier1-shard-2 OK — light slice 1/2"
 
 tier1-shard-3: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=3
-	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
-	@echo "tier1-shard-3 OK — light slice 3/3 + fmt/bench/check/negative/stdlib-modules/independence-oracle/packages/audits/info/doc"
+	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=2
+	@echo "tier1-shard-3 OK — light slice 2/2"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
