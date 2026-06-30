@@ -149,7 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation
 
 all: $(TARGET)
 
@@ -3991,6 +3991,44 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	[ "$$leaked" -lt 100 ] \
 	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
+
+# Issue #995 — the native backend reused a recursive-ADT node in place while
+# the original was still live, mutating it (orig=5 instead of 3). The C oracle
+# was correct. The parity ratchet catches native!=C divergence, but it would
+# miss a regression that corrupts BOTH backends identically; this gate anchors
+# the ABSOLUTE correct output (orig=3) on native against the golden. Both the
+# binary tree and the linear list shapes are exercised in one fixture.
+test-perceus-995-native-shared-reuse-corruption: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_shared_reuse_corruption_995.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995corr 2> build/s2-995corr.err \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native build errored)"; cat build/s2-995corr.err; exit 1; }; \
+	./build/s2-995corr > build/s2-995corr.out 2> build/s2-995corr.rc \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native run errored — exit $$?)"; exit 1; }; \
+	diff -q ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out > /dev/null \
+	  && echo "perceus-995-native-shared-reuse-corruption OK (native orig=3 — original not mutated by the rewrite)" \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (output diff — original corrupted)"; diff ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out; exit 1; }
+
+# Issue #995 companion — the fix must not disable valid reuse-in-place. With a
+# DEAD donor (no live alias) the rewrite must still recycle the nodes: assert
+# the native binary reports a non-zero `reuse_in_place` under KAI_TRACE_RC. A
+# regression that fresh-allocated everywhere (the over-conservative fix) shows
+# reuse_in_place=0 and fails here.
+test-perceus-995-native-dead-donor-reuse: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_dead_donor_reuse_995.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995dead 2> build/s2-995dead.err \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native build errored)"; cat build/s2-995dead.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-995dead > build/s2-995dead.out 2> build/s2-995dead.rc \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native run errored — exit $$?)"; exit 1; }; \
+	diff -q ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out > /dev/null \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (output diff)"; diff ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out; exit 1; }; \
+	reuse=$$(grep -oE 'reuse_in_place=[0-9]+' build/s2-995dead.rc | head -1 | cut -d= -f2); \
+	[ -n "$$reuse" ] \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (no reuse_in_place line)"; cat build/s2-995dead.rc; exit 1; }; \
+	[ "$$reuse" -gt 0 ] \
+	  && echo "perceus-995-native-dead-donor-reuse OK (native reuse_in_place=$$reuse > 0; dead-donor reuse-in-place preserved)" \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (reuse_in_place=0 — valid reuse disabled by the fix)"; exit 1; }
 
 # Issue #950 — the native backend runs `test` blocks. `kai test` on the
 # fixture must produce the SAME summary + exit code on native as on the C

@@ -1,0 +1,49 @@
+# Issue #995 — the native backend reused a recursive-ADT node in place while
+# the original binding was still live, mutating it and breaking value
+# semantics. `inc(t)` returns a new tree, but `total(t)` afterwards read the
+# corrupted original: native printed orig=5 (mutated) instead of orig=3, while
+# the C backend was correct.
+#
+# Root cause was in the KIR reuse lowering: a `__perceus_reuse_variant` arm
+# whose rebuild threads a kept scrutinee child through a recursive call
+# (`Node(inc(l), inc(r))`) skipped the shared-donor incref of l/r, so when the
+# donor was shared the recursion reused the still-aliased child in place. The
+# fix descends into fn-call args in `reuse_gc_uses` and emits the conditional
+# `KIncrefIfShared` BEFORE the consuming call. A unique donor still moves its
+# children (reuse-in-place preserved); a shared donor protects them.
+#
+# Both the binary tree and the linear list reproduce; both must print orig=3.
+
+type Tree = Leaf(Int) | Node(Tree, Tree)
+
+fn tinc(t: Tree) : Tree {
+  case Leaf(n)    -> Leaf(n + 1)
+  case Node(l, r) -> Node(tinc(l), tinc(r))
+}
+
+fn ttotal(t: Tree) : Int {
+  case Leaf(n)    -> n
+  case Node(l, r) -> ttotal(l) + ttotal(r)
+}
+
+type Seq = SNil | SCons(Int, Seq)
+
+fn sinc(xs: Seq) : Seq {
+  case SNil         -> SNil
+  case SCons(h, t)  -> SCons(h + 1, sinc(t))
+}
+
+fn ssum(xs: Seq) : Int {
+  case SNil        -> 0
+  case SCons(h, t) -> h + ssum(t)
+}
+
+fn main() : Int / Stdout = {
+  let t  = Node(Leaf(1), Leaf(2))
+  let t2 = tinc(t)
+  Stdout.print("tree orig=#{int_to_string(ttotal(t))} new=#{int_to_string(ttotal(t2))}")
+  let xs = SCons(1, SCons(2, SNil))
+  let ys = sinc(xs)
+  Stdout.print("list orig=#{int_to_string(ssum(xs))} new=#{int_to_string(ssum(ys))}")
+  0
+}
