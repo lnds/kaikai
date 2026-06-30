@@ -447,7 +447,13 @@ struct KaiValue {
         int32_t  i32;                               /* KAI_INT32 */
         uint32_t u32;                               /* KAI_UINT32 */
         uint64_t u64;                               /* KAI_UINT64 */
-        __int128 i128;                              /* KAI_INT128 */
+        /* KAI_INT128. Stored as two 8-byte halves, NOT a bare `__int128`:
+         * `__int128` carries a 16-byte alignment requirement that would
+         * raise KaiValue's alignment to 16, but the allocator/arena align
+         * to 8 — a misaligned `->as.i128` access is UB that segfaults on
+         * Linux/-O2 (and UBSan flags it). Access via kai_i128_load /
+         * kai_i128_store (memcpy, alignment-agnostic). */
+        uint64_t i128_halves[2];                    /* KAI_INT128 (lo, hi) */
         struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
         struct { KaiValue *head; KaiValue *tail; } cons;
         struct {
@@ -3331,9 +3337,22 @@ static KAI_RC_NOINLINE KaiValue *kai_uint64(uint64_t n) {
     v->as.u64 = n;
     return v;
 }
+/* Load / store an Int128 box's value through its two 8-byte halves.
+ * `memcpy` is alignment-agnostic, so this never triggers the misaligned
+ * `__int128` access UB that a bare `v->as.i128` would on an 8-byte-aligned
+ * KaiValue (the cause of the Linux/-O2 selfhost segfault). */
+static inline __int128 kai_i128_load(const KaiValue *v) {
+    __int128 n;
+    memcpy(&n, v->as.i128_halves, sizeof(n));
+    return n;
+}
+static inline void kai_i128_store(KaiValue *v, __int128 n) {
+    memcpy(v->as.i128_halves, &n, sizeof(n));
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_int128(__int128 n) {
     KaiValue *v = kai_alloc(KAI_INT128);
-    v->as.i128 = n;
+    kai_i128_store(v, n);
     return v;
 }
 
@@ -4718,7 +4737,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_INT32:     return a->as.i32 == b->as.i32;
         case KAI_UINT32:    return a->as.u32 == b->as.u32;
         case KAI_UINT64:    return a->as.u64 == b->as.u64;
-        case KAI_INT128:    return a->as.i128 == b->as.i128;
+        case KAI_INT128:    return kai_i128_load(a) == kai_i128_load(b);
     }
     return 0;
 }
@@ -4865,7 +4884,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
             return kai_str(buf);
         case KAI_INT128: {
             char i128buf[44];
-            return kai_str(kai_i128_to_decimal(v->as.i128, i128buf, sizeof(i128buf)));
+            return kai_str(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
         }
     }
     return kai_str("?");
@@ -5259,7 +5278,7 @@ static KaiValue *kai_prelude_uint64_to_string(KaiValue *v) {
     return kai_str(buf);
 }
 static KaiValue *kai_prelude_int128_to_string(KaiValue *v) {
-    __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? v->as.i128 : 0;
+    __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0;
     if (v) kai_decref(v);
     char buf[44];
     return kai_str(kai_i128_to_decimal(n, buf, sizeof(buf)));
@@ -5277,7 +5296,7 @@ static KaiValue *kai_prelude_int_to_int128(KaiValue *v) { int64_t n = kai_intf(v
 static KaiValue *kai_prelude_int32_to_int(KaiValue *v)  { int32_t n  = (v && kai_is_ptr(v) && v->tag == KAI_INT32)  ? v->as.i32  : 0; kai_decref(v); return kai_int((int64_t) n); }
 static KaiValue *kai_prelude_uint32_to_int(KaiValue *v) { uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32  : 0; kai_decref(v); return kai_int((int64_t) n); }
 static KaiValue *kai_prelude_uint64_to_int(KaiValue *v) { uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64  : 0; kai_decref(v); return kai_int((int64_t) n); }
-static KaiValue *kai_prelude_int128_to_int(KaiValue *v) { __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? v->as.i128 : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_int128_to_int(KaiValue *v) { __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0; kai_decref(v); return kai_int((int64_t) n); }
 
 /* ---------- prelude: math/real libm bindings (issue #343) ----------
  * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
@@ -5693,7 +5712,7 @@ static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
             uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint32(r); }
         case KAI_UINT64: { uint64_t x = a->as.u64, y = b->as.u64;
             uint64_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint64(r); }
-        case KAI_INT128: { unsigned __int128 x = (unsigned __int128) a->as.i128, y = (unsigned __int128) b->as.i128;
+        case KAI_INT128: { unsigned __int128 x = (unsigned __int128) kai_i128_load(a), y = (unsigned __int128) kai_i128_load(b);
             unsigned __int128 r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int128((__int128) r); }
         default: return NULL;
     }
@@ -5773,7 +5792,7 @@ static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
         case KAI_INT32:  *out = a->as.i32  < b->as.i32;  return 1;
         case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
         case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
-        case KAI_INT128: *out = a->as.i128 < b->as.i128; return 1;
+        case KAI_INT128: *out = kai_i128_load(a) < kai_i128_load(b); return 1;
         default: return 0;
     }
 }
