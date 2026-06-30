@@ -1,23 +1,30 @@
 #[doc("""
 Fixed-point decimal arithmetic.
 
-Pure functional. The carrier is `{ raw: Int, scale: Int }` where
+Pure functional. The carrier is `{ raw: Int128, scale: Int }` where
 the represented value is `raw * 10^(-scale)`. So `1.23` is
 `Decimal { raw: 123, scale: 2 }` and `100` is `Decimal { raw: 100,
-scale: 0 }`.
+scale: 0 }`. The `Int128` carrier holds ~38 significant digits
+(±1.7e38), so monetary magnitudes well past national-debt scale fit
+without loss where the old 64-bit carrier silently wrapped.
 
 Variable scale lets call sites preserve significant digits across
 operations. Add and subtract normalise to `max(sa, sb)`; multiply
 yields `sa + sb`; divide takes an explicit target scale (no implicit
 precision loss).
 
+Overflow is never silent. The total `add`/`sub`/`mul` PANIC when a
+result exceeds the `Int128` carrier — a corrupt-input invariant, not
+a domain outcome. The `checked_*` variants return `Option[Decimal]`
+(`None` on overflow) for callers that prefer to handle it. `div`
+returns `Option[Decimal]` (`None` on a zero divisor).
+
 Limits:
-  - scale must be in `[0, 18]`. Beyond 18, `pow10(scale)` overflows
-    a 64-bit Int.
+  - scale must be in `[0, 38]`. Beyond 38, `pow10(scale)` exceeds the
+    `Int128` carrier and panics rather than wrapping.
   - parsing accepts `[+-]?digits[.digits]?`. No exponent notation,
-    no thousands separator.
-  - division returns `Option[Decimal]`: `None` when the divisor is
-    zero. Callers unwrap explicitly (no silent zero, no panic).
+    no thousands separator. Integer magnitudes up to ~38 digits decode
+    (the carrier width), not just the 18–19 a 64-bit Int held.
   - rounding is "half away from zero" (the common financial
     convention).
 """)]
@@ -25,49 +32,94 @@ Limits:
 # ---- Carrier -----------------------------------------------------
 
 #[doc("A base-10 fixed-point number: the value is `raw / 10^scale`.")]
-pub type Decimal = { raw: Int, scale: Int }
+pub type Decimal = { raw: Int128, scale: Int }
+
+# ---- Int128 helpers ----------------------------------------------
+
+# Carrier constants. The carrier is kind-distinct from Int, so a bare
+# `0`/`1`/`10` literal will not unify with `raw` — these lift them.
+fn i128z() : Int128 = int_to_int128(0)
+fn i128one() : Int128 = int_to_int128(1)
+fn i128ten() : Int128 = int_to_int128(10)
+
+# `x + y` with carrier-overflow detection. Same-sign operands whose
+# sum flips sign overflowed Int128. `None` on overflow.
+fn checked_raw_add(x: Int128, y: Int128) : Option[Int128] = {
+  let r = x + y
+  let same_sign = (x < i128z()) == (y < i128z())
+  let flipped = (x < i128z()) != (r < i128z())
+  if same_sign and flipped { None } else { Some(r) }
+}
+
+# `x * y` with carrier-overflow detection via the division inverse:
+# when `x != 0` and `r / x != y` the product did not fit. `None` on
+# overflow. The `Int128.MIN * -1` corner also flips through the same
+# inverse check, so no separate guard is needed.
+fn checked_raw_mul(x: Int128, y: Int128) : Option[Int128] = {
+  if x == i128z() { Some(i128z()) }
+  else {
+    let r = x * y
+    if r / x == y { Some(r) } else { None }
+  }
+}
+
+# Unwrap a checked carrier op, panicking on overflow. Backs the total
+# `add`/`sub`/`mul`: overflow of a 38-digit carrier signals corrupt
+# input, so it aborts loudly rather than returning a wrapped value.
+fn raw_or_panic(o: Option[Int128], what: String) : Int128 = match o {
+  Some(v) -> v
+  None    -> panic(string_concat("decimal.", string_concat(what, ": Int128 overflow")))
+}
 
 # ---- Constructors -----------------------------------------------
 
 #[doc("The decimal `0` (scale 0).")]
-pub fn zero() : Decimal = Decimal { raw: 0, scale: 0 }
+pub fn zero() : Decimal = Decimal { raw: i128z(), scale: 0 }
 
 #[doc("Lifts an integer to a decimal with scale 0.")]
-pub fn from_int(n: Int) : Decimal = Decimal { raw: n, scale: 0 }
+pub fn from_int(n: Int) : Decimal = Decimal { raw: int_to_int128(n), scale: 0 }
 
 #[doc("""
 Build a Decimal from integer + fractional parts and the digit
 count of the fraction. Example: `decimal.from_parts(12, 50, 2)` →
 `12.50`. Sign flows through `units`; `fraction` must be
-non-negative and shorter than `pow10(scale)`.
+non-negative and shorter than `pow10(scale)`. Panics if the
+combined magnitude overflows the `Int128` carrier.
 """)]
 pub fn from_parts(units: Int, fraction: Int, scale: Int) : Decimal = {
   let p = pow10(scale)
-  let mag = if units < 0 { 0 - units } else { units }
-  let raw_mag = mag * p + fraction
-  let raw_signed = if units < 0 { 0 - raw_mag } else { raw_mag }
+  let mag128 = if units < 0 { int_to_int128(0 - units) } else { int_to_int128(units) }
+  let scaled = raw_or_panic(checked_raw_mul(mag128, p), "from_parts")
+  let raw_mag = raw_or_panic(checked_raw_add(scaled, int_to_int128(fraction)), "from_parts")
+  let raw_signed = if units < 0 { i128z() - raw_mag } else { raw_mag }
   Decimal { raw: raw_signed, scale: scale }
 }
 
 # ---- Internal arithmetic helpers --------------------------------
 
-#[doc("10^n. Internal — clamps n to [0, 18] to stay within Int64 range.")]
-pub fn pow10(n: Int) : Int = {
-  if n <= 0 { 1 }
-  else if n >= 18 { pow10_loop(1, 18) }
-  else { pow10_loop(1, n) }
+#[doc("""
+`10^n` as an `Int128`. Internal scaling factor. Panics for `n > 38`,
+where the result exceeds the carrier — a silent clamp would
+reintroduce the very overflow this module exists to prevent.
+""")]
+pub fn pow10(n: Int) : Int128 = {
+  if n <= 0 { i128one() }
+  else if n > 38 { panic("decimal.pow10: scale exceeds Int128 range (max 38)") }
+  else { pow10_loop(i128one(), n) }
 }
 
-fn pow10_loop(acc: Int, n: Int) : Int =
-  if n <= 0 { acc } else { pow10_loop(acc * 10, n - 1) }
+fn pow10_loop(acc: Int128, n: Int) : Int128 =
+  if n <= 0 { acc } else { pow10_loop(acc * i128ten(), n - 1) }
 
 # Re-scale a Decimal to a new scale by multiplying or truncating.
 # Scaling UP (new > old) is exact; scaling DOWN (new < old)
-# truncates toward zero. Use `round` if you want rounding.
+# truncates toward zero. Use `round` if you want rounding. Scaling up
+# panics if the widened magnitude overflows the carrier.
 fn dec_rescale(d: Decimal, new_scale: Int) : Decimal = {
   if new_scale == d.scale { d }
   else if new_scale > d.scale {
-    Decimal { raw: d.raw * pow10(new_scale - d.scale), scale: new_scale }
+    let widened = raw_or_panic(checked_raw_mul(d.raw, pow10(new_scale - d.scale)), "rescale")
+    Decimal { raw: widened, scale: new_scale }
   }
   else {
     Decimal { raw: d.raw / pow10(d.scale - new_scale), scale: new_scale }
@@ -82,42 +134,86 @@ fn dec_align(a: Decimal, b: Decimal) : Pair[Decimal, Decimal] = {
 
 # ---- Arithmetic --------------------------------------------------
 
-#[doc("Adds two decimals, aligning them to the larger scale (exact).")]
+#[doc("""
+Adds two decimals, aligning them to the larger scale (exact). Panics
+on `Int128` carrier overflow; use `checked_add` to handle it.
+""")]
 pub fn add(a: Decimal, b: Decimal) : Decimal = {
   let p = dec_align(a, b)
-  Decimal { raw: p.fst.raw + p.snd.raw, scale: p.fst.scale }
+  let raw = raw_or_panic(checked_raw_add(p.fst.raw, p.snd.raw), "add")
+  Decimal { raw: raw, scale: p.fst.scale }
 }
 
-#[doc("Subtracts two decimals, aligning them to the larger scale (exact).")]
+#[doc("""
+Subtracts two decimals, aligning them to the larger scale (exact).
+Panics on `Int128` carrier overflow; use `checked_sub` to handle it.
+""")]
 pub fn sub(a: Decimal, b: Decimal) : Decimal = {
   let p = dec_align(a, b)
-  Decimal { raw: p.fst.raw - p.snd.raw, scale: p.fst.scale }
+  let raw = raw_or_panic(checked_raw_add(p.fst.raw, i128z() - p.snd.raw), "sub")
+  Decimal { raw: raw, scale: p.fst.scale }
 }
 
 #[doc("Negates a decimal.")]
 pub fn neg(d: Decimal) : Decimal =
-  Decimal { raw: 0 - d.raw, scale: d.scale }
+  Decimal { raw: i128z() - d.raw, scale: d.scale }
 
-#[doc("Multiply: scales add. `1.23 * 1.5 = 1.845` (scale 3).")]
-pub fn mul(a: Decimal, b: Decimal) : Decimal =
-  Decimal { raw: a.raw * b.raw, scale: a.scale + b.scale }
+#[doc("""
+Multiply: scales add. `1.23 * 1.5 = 1.845` (scale 3). Panics on
+`Int128` carrier overflow; use `checked_mul` to handle it.
+""")]
+pub fn mul(a: Decimal, b: Decimal) : Decimal = {
+  let raw = raw_or_panic(checked_raw_mul(a.raw, b.raw), "mul")
+  Decimal { raw: raw, scale: a.scale + b.scale }
+}
+
+#[doc("""
+Like `add` but returns `None` instead of panicking when the result
+overflows the `Int128` carrier. For callers that treat overflow as a
+recoverable domain event rather than a corrupt-input abort.
+""")]
+pub fn checked_add(a: Decimal, b: Decimal) : Option[Decimal] = {
+  let p = dec_align(a, b)
+  match checked_raw_add(p.fst.raw, p.snd.raw) {
+    None    -> None
+    Some(r) -> Some(Decimal { raw: r, scale: p.fst.scale })
+  }
+}
+
+#[doc("Like `sub` but returns `None` on `Int128` carrier overflow.")]
+pub fn checked_sub(a: Decimal, b: Decimal) : Option[Decimal] = {
+  let p = dec_align(a, b)
+  match checked_raw_add(p.fst.raw, i128z() - p.snd.raw) {
+    None    -> None
+    Some(r) -> Some(Decimal { raw: r, scale: p.fst.scale })
+  }
+}
+
+#[doc("Like `mul` but returns `None` on `Int128` carrier overflow.")]
+pub fn checked_mul(a: Decimal, b: Decimal) : Option[Decimal] =
+  match checked_raw_mul(a.raw, b.raw) {
+    None    -> None
+    Some(r) -> Some(Decimal { raw: r, scale: a.scale + b.scale })
+  }
 
 #[doc("""
 Divide: caller picks the result scale. Internally we widen the
 numerator first so the truncation only loses digits beyond
 `target_scale`. Returns `None` when the divisor is zero — the
 caller decides how to react (propagate, default, abort) rather
-than receiving a silent zero result.
+than receiving a silent zero result. Panics if widening the
+numerator overflows the `Int128` carrier (a scaling-invariant
+break, distinct from the zero-divisor domain case).
 """)]
 pub fn div(a: Decimal, b: Decimal, target_scale: Int) : Option[Decimal] = {
-  if b.raw == 0 { None }
+  if b.raw == i128z() { None }
   else {
     # value = a.raw / 10^a.scale ÷ b.raw / 10^b.scale
     #       = (a.raw * 10^b.scale) / (b.raw * 10^a.scale)
     # Want result with `target_scale` decimal digits → multiply
     # numerator by 10^target_scale extra.
-    let num = a.raw * pow10(b.scale + target_scale)
-    let den = b.raw * pow10(a.scale)
+    let num = raw_or_panic(checked_raw_mul(a.raw, pow10(b.scale + target_scale)), "div")
+    let den = raw_or_panic(checked_raw_mul(b.raw, pow10(a.scale)), "div")
     Some(Decimal { raw: num / den, scale: target_scale })
   }
 }
@@ -125,14 +221,14 @@ pub fn div(a: Decimal, b: Decimal, target_scale: Int) : Option[Decimal] = {
 # ---- Predicates --------------------------------------------------
 
 #[doc("True when the decimal is zero.")]
-pub fn is_zero(d: Decimal) : Bool = d.raw == 0
+pub fn is_zero(d: Decimal) : Bool = d.raw == i128z()
 
 #[doc("True when the decimal is negative.")]
-pub fn is_negative(d: Decimal) : Bool = d.raw < 0
+pub fn is_negative(d: Decimal) : Bool = d.raw < i128z()
 
 #[doc("Absolute value of a decimal.")]
 pub fn abs(d: Decimal) : Decimal =
-  if d.raw < 0 { Decimal { raw: 0 - d.raw, scale: d.scale } } else { d }
+  if d.raw < i128z() { Decimal { raw: i128z() - d.raw, scale: d.scale } } else { d }
 
 # ---- Comparison --------------------------------------------------
 
@@ -162,12 +258,12 @@ pub fn round(d: Decimal, target_scale: Int) : Decimal = {
   else {
     let drop = d.scale - target_scale
     let factor = pow10(drop)
-    let half = factor / 2
-    let mag = if d.raw < 0 { 0 - d.raw } else { d.raw }
+    let half = factor / i128ten() * int_to_int128(5)
+    let mag = if d.raw < i128z() { i128z() - d.raw } else { d.raw }
     let q = mag / factor
     let r = mag - q * factor
-    let q1 = if r >= half { q + 1 } else { q }
-    let signed = if d.raw < 0 { 0 - q1 } else { q1 }
+    let q1 = if r >= half { q + i128one() } else { q }
+    let signed = if d.raw < i128z() { i128z() - q1 } else { q1 }
     Decimal { raw: signed, scale: target_scale }
   }
 }
@@ -180,16 +276,16 @@ to scale digits). Negative values prefix with `-`. Scale 0 emits
 the integer alone with no trailing dot.
 """)]
 pub fn to_string(d: Decimal) : String = {
-  if d.scale == 0 { int_to_string(d.raw) }
+  if d.scale == 0 { int128_to_string(d.raw) }
   else {
-    let neg = d.raw < 0
-    let mag = if neg { 0 - d.raw } else { d.raw }
+    let neg = d.raw < i128z()
+    let mag = if neg { i128z() - d.raw } else { d.raw }
     let factor = pow10(d.scale)
     let units = mag / factor
     let frac = mag - units * factor
-    let frac_str = pad_left_zeros(int_to_string(frac), d.scale)
+    let frac_str = pad_left_zeros(int128_to_string(frac), d.scale)
     let sign = if neg { "-" } else { "" }
-    string_concat(string_concat(sign, int_to_string(units)),
+    string_concat(string_concat(sign, int128_to_string(units)),
                   string_concat(".", frac_str))
   }
 }
@@ -205,7 +301,8 @@ fn pad_left_zeros(s: String, width: Int) : String = {
 Parse a Decimal from a string. Accepts `[+-]?digits[.digits]?`.
 None on any malformed input. The fractional digit count
 determines the resulting `scale`; `"1.5"` → scale 1, `"1.50"` →
-scale 2 (preserves trailing zeros).
+scale 2 (preserves trailing zeros). Magnitudes up to the `Int128`
+carrier (~38 digits) decode.
 """)]
 pub fn parse(s: String) : Option[Decimal] = {
   let n = string_length(s)
@@ -223,37 +320,80 @@ pub fn parse(s: String) : Option[Decimal] = {
 fn dec_parse_body(s: String, start: Int, n: Int, neg: Bool) : Option[Decimal] = {
   let dot_idx = dec_find_dot(s, start, n)
   if dot_idx < 0 {
-    # No decimal point — pure integer.
-    let int_str = string_slice(s, start, n - start)
-    match string_to_int(int_str) {
+    match dec_digits_to_i128(string_slice(s, start, n - start)) {
       None    -> None
-      Some(v) -> Some(Decimal { raw: if neg { 0 - v } else { v }, scale: 0 })
+      Some(v) -> Some(dec_signed(v, 0, neg))
     }
   }
   else {
     let int_part = string_slice(s, start, dot_idx - start)
     let frac_part = string_slice(s, dot_idx + 1, n - dot_idx - 1)
     if string_length(frac_part) == 0 { None }
-    else { match dec_parse_int_part(int_part) {
-      None     -> None
-      Some(iv) -> match string_to_int(frac_part) {
-        None     -> None
-        Some(fv) -> {
-          let scale = string_length(frac_part)
-          let raw_mag = iv * pow10(scale) + fv
-          Some(Decimal { raw: if neg { 0 - raw_mag } else { raw_mag },
-                         scale: scale })
-        }
-      }
-    } }
+    else { dec_combine(dec_parse_int_part(int_part), frac_part, neg) }
   }
 }
 
+# Fold a parsed integer side and the fractional digit string into a
+# signed Decimal. `None` if either side fails to decode.
+fn dec_combine(iv_opt: Option[Int128], frac_part: String, neg: Bool) : Option[Decimal] =
+  match iv_opt {
+    None     -> None
+    Some(iv) -> match dec_digits_to_i128(frac_part) {
+      None     -> None
+      Some(fv) -> {
+        let scale = string_length(frac_part)
+        let scaled = raw_or_panic(checked_raw_mul(iv, pow10(scale)), "parse")
+        let raw_mag = raw_or_panic(checked_raw_add(scaled, fv), "parse")
+        Some(dec_signed(raw_mag, scale, neg))
+      }
+    }
+  }
+
+# Apply a parsed sign to a magnitude carrier.
+fn dec_signed(mag: Int128, scale: Int, neg: Bool) : Decimal =
+  Decimal { raw: if neg { i128z() - mag } else { mag }, scale: scale }
+
 # Parse the integer-side digits. Empty string → 0 (allows ".5" to
-# decode as 0.5). Otherwise parses normally.
-fn dec_parse_int_part(s: String) : Option[Int] = {
-  if string_length(s) == 0 { Some(0) }
-  else { string_to_int(s) }
+# decode as 0.5). Otherwise parses into Int128.
+fn dec_parse_int_part(s: String) : Option[Int128] = {
+  if string_length(s) == 0 { Some(i128z()) }
+  else { dec_digits_to_i128(s) }
+}
+
+# Decode a non-empty all-digits string into Int128, accumulating
+# digit by digit so magnitudes beyond a 64-bit Int round-trip. `None`
+# on any non-digit OR when the magnitude exceeds the carrier — an
+# out-of-range literal is malformed, never a silently wrapped value.
+# Empty input is `None` (callers handle the allow-empty cases).
+fn dec_digits_to_i128(s: String) : Option[Int128] = {
+  let n = string_length(s)
+  if n == 0 { None }
+  else { dec_digits_loop(s, 0, n, i128z()) }
+}
+
+fn dec_digits_loop(s: String, i: Int, n: Int, acc: Int128) : Option[Int128] = {
+  if i >= n { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> match dec_push_digit(acc, c) {
+      None      -> None
+      Some(nxt) -> dec_digits_loop(s, i + 1, n, nxt)
+    }
+  } }
+}
+
+# Fold one decimal digit into an accumulator: `acc * 10 + digit`, with
+# carrier-overflow detection. `None` if `c` is not a digit or the step
+# overflows Int128.
+fn dec_push_digit(acc: Int128, c: Char) : Option[Int128] = {
+  if c < '0' or c > '9' { None }
+  else {
+    let d = int_to_int128(char_to_int(c) - char_to_int('0'))
+    match checked_raw_mul(acc, i128ten()) {
+      None      -> None
+      Some(ten) -> checked_raw_add(ten, d)
+    }
+  }
 }
 
 # Locate `.` in [start, n). Returns -1 if absent.
@@ -284,7 +424,7 @@ impl Numeric for Decimal {
   fn abs(x: Decimal) : Decimal = abs(x)
 
   fn sign(x: Decimal) : Int =
-    if x.raw < 0 { 0 - 1 } else { if x.raw > 0 { 1 } else { 0 } }
+    if x.raw < i128z() { 0 - 1 } else { if x.raw > i128z() { 1 } else { 0 } }
 
   fn pow_int(base: Decimal, exp: Int) : Decimal =
     if exp < 0 { zero() }
