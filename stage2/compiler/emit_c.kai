@@ -6573,6 +6573,13 @@ fn emit_bang(src: String, inner: Expr, cx: EmitCtx) : String / Console {
   }
 }
 
+# `var`/State/Reader cells dispatch strictly by-id (`@<name>`); the typer
+# never tags their ops with the `#<name>` capability-value path. So the
+# `kai_<name> = &_node` alias node a `#` dispatch would read is dead for
+# them, and emitting it collides with the user's own `kai_<name>` (a return
+# param or the stateful prologue's `kai_state`/`kai_log`) inside one block.
+fn alias_is_byid_cell(eff_name: String) : Bool = eff_name == "State" or eff_name == "Reader"
+
 fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr],
                alias_opt: Option[String],
                clauses: [HClause],
@@ -6590,30 +6597,20 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
   let env_enc_fn = handle_enc_fn_at(cx.cls, hline, hcol)
   let env_alloc = emit_handle_env_alloc(env_caps, env_enc_fn, hline, hcol)
   let env_assign = emit_handle_env_ev_assign(env_caps)
-  # m7b #15 (compiler integration): expose the handle's
-  # `handler_id` as a local C variable named `kai_alias_<a>_id`
-  # whenever the handle declared an `as`-bound capability. The
-  # op-call dispatch (emit_call_expr) emits a
-  # `kai_evidence_lookup_node_by_id(kai_alias_<a>_id)` call
-  # whenever the alias rewrite tagged the op name with
-  # `@<a>`. The local lives in the same statement-expression
-  # as the rest of the handle prologue, so it is in scope for
-  # every op-call site inside `body_c`.
-  # §6 named instances: bind the alias as a first-class capability VALUE — the
-  # handle's own evidence node — so `a.op(...)` reads `kai_<a>` (the node) and
-  # `f(a)` passes it as the callee's capability parameter. This is the same node
-  # the param ABI threads, so alias and parameter capabilities share one path
-  # (no by-id walk). `&_node` is valid from its declaration below; the address
-  # is stable across the push that fills it.
-  # Bind the alias two ways: `kai_alias_<a>_id` for the legacy by-id dispatch a
-  # `var`/State/Reader cell uses, and `kai_<a>` (the node itself) for the §6
-  # capability dispatch a user effect's named instance uses. The typer picks one
-  # via the `@`/`#` dispatch tag; emitting both keeps each path in scope.
+  # An `as`-bound capability is exposed two ways inside the handle prologue:
+  # `kai_alias_<a>_id` (the `_ev.handler_id`) backs the by-id dispatch a
+  # `var`/State/Reader cell uses (`kai_evidence_lookup_node_by_id`, tag `@<a>`);
+  # `kai_<a>` (the node `&_node` itself) backs the §6 capability dispatch a user
+  # effect's named instance uses (`a.op(...)`, `f(a)`). The typer tags an op with
+  # `@` or `#`; a by-id cell never gets `#`, so its `kai_<a>` node is dead — and
+  # emitting it collides with the user's own `kai_<a>` (a return param or the
+  # stateful prologue's `kai_state`/`kai_log`). Emit the node only for non-cells.
   let alias_id_c = match alias_opt {
-    Some(a) -> concat_all([
-      "KaiHandlerId kai_alias_", a, "_id = _ev.handler_id; ",
-      "KaiValue *kai_", a, " = (KaiValue *) &_node; "
-    ])
+    Some(a) -> {
+      let id_bind = concat_all(["KaiHandlerId kai_alias_", a, "_id = _ev.handler_id; "])
+      if alias_is_byid_cell(eff_name) { id_bind }
+      else { concat_all([id_bind, "KaiValue *kai_", a, " = (KaiValue *) &_node; "]) }
+    }
     None -> ""
   }
   let init_c = match init_opt {
