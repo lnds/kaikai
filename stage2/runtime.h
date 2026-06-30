@@ -11888,6 +11888,7 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm-c/Linker.h>
 #include <llvm-c/IRReader.h>
+#include <llvm-c/DebugInfo.h>
 #include <stdlib.h>
 
 /* The native backend keeps one context + builder per compilation unit.
@@ -11938,6 +11939,13 @@ typedef struct {
     KaiNFrame *frames; int nframes, framecap;
     int ok;
     int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
+    /* DWARF debug info (#500), populated only in --debug. `dib` is the
+     * module DIBuilder, `difile` the source DIFile, `dicu` the compile
+     * unit, `disub` the CURRENT function's DISubprogram (the scope every
+     * `set_loc` attaches to). All NULL in release/default (calloc-zeroed)
+     * — `native_di_enabled` gates the emit so a non-debug build is
+     * byte-identical to before this lane. */
+    void *dib, *difile, *dicu, *disub;
 } KaiNativeCtx;
 
 static void *kai_native_ctx_new(void *m) {
@@ -12744,6 +12752,117 @@ static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
  * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
  * object links it, the compiler does not call it.) */
 
+/* --- DWARF debug info (#500) ---------------------------------------------
+ * The native backend emits DWARF line tables in --debug so `lldb`/`gdb`
+ * break on kaikai source lines and a panic resolves to `<file>.kai:<line>`
+ * via `atos`/`addr2line`. The metadata lives in the off-RC `KaiNativeCtx`
+ * (same vehicle as every other LLVM handle — a `DIBuilderRef` must never
+ * ride a kaikai record/list). The kaikai walk calls six high-level prims;
+ * the per-DI-node LLVM sequence stays in C so the emit_native code reads as
+ * "enable / open subprogram / set line / finalize", not raw DIBuilder.
+ *
+ * Scope: one DIFile + DICompileUnit per module, one DISubprogram per fn (a
+ * void() subroutine type — enough for line tables; we do not describe
+ * parameter/local types, which is out of scope per #500). A `set_loc`
+ * attaches the current subprogram as the location scope. Every prim is a
+ * NO-OP when DI was never enabled (`c->dib == NULL`), so a release/default
+ * build that never calls `native_di_enable` is byte-identical. */
+
+/* Enable DWARF for module `m`'s ctx: build the DIBuilder, the DIFile from
+ * (filename, directory), and the compile unit, and set the module's DWARF
+ * version + debug-info-version flags (without them the backend drops the
+ * metadata silently). Idempotent — a second call is a no-op. */
+static KaiValue *kai_native_di_enable(void *cv, KaiValue *fnamev, KaiValue *dirv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->dib) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    /* DWARF needs these module flags; emit them once. Values match what
+     * clang sets for `-g` on the LLVM 18 line. */
+    LLVMMetadataRef dwarf_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), 4, 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13, dwarf_ver);
+    LLVMMetadataRef di_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), (unsigned) LLVMDebugMetadataVersion(), 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18, di_ver);
+
+    c->dib = LLVMCreateDIBuilder(m);
+    const char *fname = fnamev->as.s.bytes;
+    const char *dir = dirv->as.s.bytes;
+    c->difile = LLVMDIBuilderCreateFile((LLVMDIBuilderRef) c->dib,
+        fname, strlen(fname), dir, strlen(dir));
+    c->dicu = LLVMDIBuilderCreateCompileUnit((LLVMDIBuilderRef) c->dib,
+        LLVMDWARFSourceLanguageC, (LLVMMetadataRef) c->difile,
+        "kaikai", 6, /*isOptimized=*/0, "", 0, /*RuntimeVer=*/0,
+        "", 0, LLVMDWARFEmissionFull, /*DWOId=*/0,
+        /*SplitDebugInlining=*/0, /*DebugInfoForProfiling=*/0, "", 0, "", 0);
+    kai_decref(fnamev); kai_decref(dirv);
+    return kai_unit();
+}
+
+/* 1 when DWARF is enabled on this ctx (the --debug walk gates every DI
+ * call on it), 0 otherwise — so the kaikai walk reads `if di_enabled`. */
+static int64_t kai_native_di_enabled(void *cv) {
+    return ((KaiNativeCtx *) cv)->dib ? 1 : 0;
+}
+
+/* Open a DISubprogram for the current fn `fnval` named `name` at source
+ * `line`, attach it (LLVMSetSubprogram), and record it as the current
+ * location scope. No-op when DI is off. */
+static KaiValue *kai_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) { kai_decref(namev); return kai_unit(); }
+    /* A `void ()` subroutine type — line tables need a type but not the
+     * parameter shapes (out of scope per #500). */
+    LLVMMetadataRef subty = LLVMDIBuilderCreateSubroutineType(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->difile, NULL, 0, LLVMDIFlagZero);
+    const char *name = namev->as.s.bytes;
+    unsigned ln = (line > 0) ? (unsigned) line : 1u;
+    LLVMMetadataRef sp = LLVMDIBuilderCreateFunction(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->dicu,
+        name, strlen(name), name, strlen(name),
+        (LLVMMetadataRef) c->difile, ln, subty,
+        /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
+        LLVMDIFlagZero, /*IsOptimized=*/0);
+    LLVMSetSubprogram((LLVMValueRef) fnval, sp);
+    c->disub = sp;
+    kai_decref(namev);
+    return kai_unit();
+}
+
+/* Set the builder's current debug location to (line, col) under the
+ * current subprogram scope. No-op when DI is off or no subprogram is open
+ * (a synthetic fn with no source). The walk calls this before each
+ * source-bearing instruction; `set_loc(0,0)` style positions never reach
+ * here (the walk only calls on a real KAt). */
+static KaiValue *kai_native_di_set_loc(void *cv, int64_t line, int64_t col) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib || !c->disub) return kai_unit();
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(
+        ctx, (unsigned) line, (unsigned) col, (LLVMMetadataRef) c->disub, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, loc);
+    return kai_unit();
+}
+
+/* Clear the builder's current debug location (the prologue / synthetic
+ * instructions carry none). No-op when DI is off. */
+static KaiValue *kai_native_di_clear_loc(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
+    return kai_unit();
+}
+
+/* Resolve every temporary DI node — MUST run after the whole module is
+ * built and BEFORE verify (an unfinalized DIBuilder leaves forward-ref
+ * placeholders the verifier rejects). No-op when DI is off. */
+static KaiValue *kai_native_di_finalize(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->dib) LLVMDIBuilderFinalize((LLVMDIBuilderRef) c->dib);
+    return kai_unit();
+}
+
 /* --- optimisation pass pipeline (L4, issue #498) ---
  * Run the LLVM New-PM pipeline in-process on the module before codegen,
  * matching the `-O2` the out-of-process C/LLVM-text paths get from
@@ -13103,6 +13222,14 @@ static KaiValue *kai_llvm_add_case(void *sw, void *on, void *bb) { (void) sw; (v
 static KaiValue *kai_llvm_build_unreachable(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+/* DWARF DI stubs (#500): unreachable on the C-only path (the native walk
+ * that calls them never runs), so they just satisfy the link. */
+static KaiValue *kai_native_di_enable(void *c, KaiValue *f, KaiValue *d) { (void) c; (void) f; (void) d; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_di_enabled(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_di_subprogram(void *c, void *fn, KaiValue *n, int64_t l) { (void) c; (void) fn; (void) n; (void) l; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_set_loc(void *c, int64_t l, int64_t col) { (void) c; (void) l; (void) col; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_clear_loc(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_finalize(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
 #endif /* KAI_LLVM */
 
 #endif /* KAI_RUNTIME_H */
