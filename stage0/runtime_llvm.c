@@ -786,6 +786,18 @@ int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
    the shim must read it AND finish the extern call BEFORE the input decref,
    or the buffer is freed under the extern. */
 int64_t     kaix_int_field(KaiValue *v) { return kai_intf(v); }
+/* Read an honest fixed-width value box as i64 (numeric lane A): the
+ * native FFI shim truncates it back to the exact C width. Sign/zero
+ * extension follows the box tag so a uint32_t 0xFFFFFFFF stays positive. */
+int64_t     kaix_fixed_val_field(KaiValue *v) {
+    if (!v) return 0;
+    switch ((KaiTag) v->tag) {
+        case KAI_INT32:  return (int64_t) v->as.i32;
+        case KAI_UINT32: return (int64_t) v->as.u32;
+        case KAI_UINT64: return (int64_t) v->as.u64;
+        default:         return kai_intf(v);
+    }
+}
 const char *kaix_str_bytes(KaiValue *v) { return v->as.s.bytes; }
 
 /* FFI v2 (#417): opaque-handle marshalling for the native backend.
