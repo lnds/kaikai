@@ -69,6 +69,19 @@ remaining work was the debug-info half — DWARF emission, symbol stripping on
    "DWARF is present" check is necessary but not sufficient — only an actual
    `lldb`/`gdb` open proves the paths are usable.
 
+6. **`dladdr` needs `_GNU_SOURCE` on glibc — caught only by CI.** The panic
+   backtrace uses `dladdr` / `Dl_info` (a GNU extension, not C99). glibc hides
+   them behind `_GNU_SOURCE`; macOS libSystem exposes them regardless. So the
+   full mac build (native AND C-only) passed locally, but the strict `-std=c99`
+   C-only bootstrap on Linux CI failed with "undeclared identifier Dl_info". This
+   is the mac-clang-hides-GNU-extensions trap: a mac `-std=c99 -pedantic-errors`
+   over the same header does NOT reproduce it, because the symbols are visible on
+   mac no matter the feature-test macros. Fix: `#define _GNU_SOURCE` in the Linux
+   branch before any include, alongside the existing `_XOPEN_SOURCE` /
+   `_DEFAULT_SOURCE`. Lesson: any new libc call that is a GNU/BSD extension must
+   be assumed gated behind a feature-test macro on glibc, and a mac-only local
+   pass proves nothing about the C-only Linux bootstrap — that gate lives in CI.
+
 ## Why the panic trace is best-effort, and what it does NOT do
 
 The trace resolves via a shell-out to the platform symboliser (`atos`/`addr2line`)
