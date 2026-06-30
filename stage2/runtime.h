@@ -1735,8 +1735,27 @@ static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
  * keep the recycle hit-rate high; beyond it we fall through to
  * malloc/free. */
 #define KAI_CELL_POOL_CAP 1048576
+/* The free-list pools are multi-MB .bss. Under separate compilation (one
+ * TU per module) the default file-local `static` replicates every pool
+ * into every TU, blowing the combined .bss past the small-code-model
+ * ADRP reach at the compiler's TU count. KAI_SEPARATE_COMPILATION shares
+ * one copy: every TU sees an `extern` declaration; the single owner TU
+ * (KAI_RUNTIME_OWNER) carries the definition. Each pool's index counter
+ * moves with its array — they address one shared backing store and must
+ * not diverge per-TU. With both macros undefined the preprocessor yields
+ * the original `static` lines verbatim, so the single-TU build is
+ * byte-identical. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+extern int kai_cell_pool_n;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+int kai_cell_pool_n = 0;
+#  endif
+#else
 static KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
 static int kai_cell_pool_n = 0;
+#endif
 
 /* Companion free-list for the variant `slots[]` arrays, keyed by arity
  * (the dominant per-node malloc alongside the cell header). Arity 1..8
@@ -1745,8 +1764,17 @@ static int kai_cell_pool_n = 0;
  * set so slot reuse does not become the spill bottleneck. */
 #define KAI_SLOT_POOL_MAXN 8
 #define KAI_SLOT_POOL_CAP  1048576
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+extern int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#  endif
+#else
 static KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
 static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#endif
 
 /* FAM lane: free-list for whole variant BLOCKS (header + n inline slots
  * in one allocation), keyed by arity. Replaces the cell_pool + slot_pool
@@ -1758,8 +1786,17 @@ static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
  * construction (the reuse recognisers only ever rewrite same-arity). */
 #define KAI_VAR_BLOCK_POOL_MAXN 8
 #define KAI_VAR_BLOCK_POOL_CAP  1048576
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+extern int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#  endif
+#else
 static KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
 static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#endif
 
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
  *
