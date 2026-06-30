@@ -35,6 +35,40 @@ runs the full toolchain today; it is unstable until the Orongo
 See `docs/roadmap.md` for milestone state and `docs/design.md` for
 the design context.
 
+## Install
+
+Two ways to get a prebuilt `kai` on macOS arm64 (Apple Silicon). The
+binary is self-contained — no system LLVM needed.
+
+**curl | sh** (rustup-style, no Homebrew required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kaikailang-org/kaikai/main/install.sh | sh
+```
+
+This downloads the latest release, verifies its SHA-256, installs to
+`~/.kaikai/`, and adds `~/.kaikai/bin` to your `PATH`. Open a new shell
+(or `export PATH="$HOME/.kaikai/bin:$PATH"`) and run `kai --version`.
+Self-update later with:
+
+```sh
+kai upgrade
+```
+
+**Homebrew** (coexists with the curl installer):
+
+```sh
+brew install kaikailang-org/kaikai/kaikai
+brew upgrade kaikai     # to update
+```
+
+A `kai upgrade` on a Homebrew install defers to `brew upgrade` rather
+than touching the Cellar.
+
+> Linux and x86_64 are a later iteration; the installer reports clearly
+> when run on an unsupported platform. Build from source (below) on any
+> platform meanwhile.
+
 ## Quickstart
 
 Five short programs that cover the language's main shapes:
