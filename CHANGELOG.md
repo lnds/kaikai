@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.95.0 (2026-06-29)
+
+### Added
+
+- **lint**: expand the kai lint catalog with six rules (refs #966, Phase 3) (#993)
+- **driver**: --batch-list mode amortising core load across N files (refs #962) (#979)
+- **lint**: idiom nudges — point_free_nudge + and_then_to_map_nudge (refs #966, Phase 2) (#977)
+- **typer**: differential independence oracle (refs #962, Lane 3) (#973)
+- **parser**: block lambda pattern binder `{ (a, b) -> ... }` (closes #970) (#971)
+- **lint**: kai lint subcommand + discard_pure_value (refs #966, phase 1) (#972)
+- **typer**: isolate root_fns to the target bucket (refs #962, Lane 1) (#969)
+- **typer**: cut user->core protocol-op contamination in lower_protocols
+
+### Fixed
+
+- **parser**: suppress record-literal in if/match header position (closes #975)
+- **lexer**: stage1 skips multi-line #[...] attributes whole (closes #968)
+- **emit**: spawned fiber's parent-handled effect diagnoses instead of segfaulting (closes #978) (#983)
+- **cli**: pass stdlib search path to kai doc for package modules (closes #976) (#981)
+- **cli**: escape backticks in kai build --help heredoc
+
 ## v0.94.0 (2026-06-28)
 
 ### Added
