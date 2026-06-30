@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.97.0 (2026-06-30)
+
+### Added
+
+- **stdlib**: DecimalBig + Rational on BigInt (numeric lane D, closes #514) (#1011)
+- **typer**: fixed-width integers Int32/UInt32/UInt64/Int128 (numeric lane A, refs #514) (#1008)
+- **emit**: release/debug build modes + DWARF debuginfo (closes #500) (#1007)
+
+### Fixed
+
+- **runtime**: share RC free-list pools across c-modular TUs (closes #1012)
+- **cli**: kai info -k searches page bodies, not just topic names and taglines (#1013)
+- **emit**: emit external linkage for cross-module symbols in c-modular (closes #990)
+
+### Changed
+
+- **build**: parallel cc + .o content-hash cache for c-modular (refs #999)
+
 ## v0.96.1 (2026-06-29)
 
 ### Fixed
