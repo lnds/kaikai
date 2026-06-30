@@ -8,6 +8,8 @@
 #   kai bench [--iters N] <file.kai>  compile with --bench and run
 #   kai check <file.kai>              compile with --prop-check and run
 #                                      (property-based tests, issue #44)
+#   kai upgrade                       self-update the compiler (curl|sh
+#                                      installs; defers to brew on brew)
 #   kai help                          show this help
 #   kai --version                     print version
 #
@@ -42,12 +44,24 @@ set -eu
 # that reject it.
 ulimit -s 32768 2>/dev/null || true
 
-# Resolve script path portably (macOS lacks GNU readlink -f).
+# Resolve script path portably (macOS lacks GNU readlink -f), following
+# symlinks one hop at a time so $ROOT points at the real install root
+# even when kai is invoked through a symlink (e.g. Homebrew's binstub
+# under /opt/homebrew/bin → ../Cellar/kaikai/<ver>/bin/kai).
 SCRIPT="$0"
 case "$SCRIPT" in
   /*) ;;
   *)  SCRIPT="$(pwd)/$SCRIPT" ;;
 esac
+_hops=0
+while [ -L "$SCRIPT" ] && [ "$_hops" -lt 40 ]; do
+  _t="$(readlink "$SCRIPT")"
+  case "$_t" in
+    /*) SCRIPT="$_t" ;;
+    *)  SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/$_t" ;;
+  esac
+  _hops=$((_hops + 1))
+done
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -626,6 +640,9 @@ Commands:
   add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
   install                       Resolve dependencies (git fetch + lock).
   update [<name>]               Re-fetch deps; refresh kai.lock.
+  upgrade                       Self-update the compiler to the latest
+                                release (curl|sh installs). Defers to
+                                'brew upgrade kaikai' on brew installs.
   show                          Print the parsed kai.toml.
   lsp                           Language Server (JSON-RPC over stdio).
   info [<topic>] [--json]       Reference pages (man/info style). Run
@@ -2712,6 +2729,150 @@ EOF
   esac
 }
 
+# ---- kai upgrade — rustup-style self-update --------------------------------
+#
+# Updates a ~/.kaikai/ install in place from the latest GitHub release.
+# Coexists with Homebrew: a brew-managed kai (resolved path under a
+# Cellar) is refused with a pointer to `brew upgrade`, never touched.
+# Distinct from `kai update`, which refreshes package dependencies.
+
+# Real on-disk path of the running wrapper. $SCRIPT is already
+# symlink-resolved at startup; normalise away any `..` so the brew
+# Cellar check matches cleanly.
+upgrade_resolve_self() {
+  printf '%s/%s\n' "$(cd "$(dirname "$SCRIPT")" && pwd)" "$(basename "$SCRIPT")"
+}
+
+# GNU-style "<hash>  <file>" → hash only; tool varies by OS.
+upgrade_sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    die "no sha256 tool (shasum or sha256sum) found"
+  fi
+}
+
+upgrade_latest_tag() {
+  curl -fsSL "https://api.github.com/repos/kaikailang-org/kaikai/releases/latest" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n1
+}
+
+# True (0) when $1 (dotted X.Y.Z) is strictly greater than $2.
+upgrade_version_gt() {
+  [ "$1" = "$2" ] && return 1
+  newer="$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)"
+  [ "$newer" = "$1" ]
+}
+
+cmd_upgrade() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai upgrade
+
+Self-update the kaikai compiler to the latest GitHub release.
+
+Updates a curl|sh install under \$KAIKAI_HOME (default ~/.kaikai) in
+place: queries the latest release tag, and if it is newer than the
+running version, downloads + verifies + replaces the binaries. If
+already current, says so and exits.
+
+A Homebrew-managed install is left untouched — run \`brew upgrade
+kaikai\` for that. This is distinct from \`kai update\`, which refreshes
+package dependencies declared in kai.toml.
+EOF
+      return 0 ;;
+  esac
+
+  command -v curl >/dev/null 2>&1 || die "kai upgrade requires curl"
+  command -v tar  >/dev/null 2>&1 || die "kai upgrade requires tar"
+
+  # Homebrew coexistence: detect by the running wrapper's resolved
+  # path. brew installs under a Cellar; refuse and defer to brew.
+  self="$(upgrade_resolve_self)"
+  case "$self" in
+    */Cellar/kaikai/*|*/Cellar/*)
+      echo "kai is installed via Homebrew ($self)." >&2
+      echo "Run 'brew upgrade kaikai' to update it." >&2
+      return 0 ;;
+  esac
+
+  # Platform: only darwin-arm64 ships a tarball today.
+  os="$(uname -s)"; arch="$(uname -m)"
+  case "$os" in
+    Darwin) os_name="darwin" ;;
+    *) die "kai upgrade supports macOS (darwin-arm64) only in this iteration; got $os" ;;
+  esac
+  case "$arch" in
+    arm64|aarch64) arch_name="arm64" ;;
+    *) die "kai upgrade supports arm64 only in this iteration; got $arch" ;;
+  esac
+  platform="$os_name-$arch_name"
+
+  # The install prefix is the wrapper's grandparent ($ROOT already
+  # points there: <prefix>/bin/kai → $ROOT=<prefix>).
+  prefix="$ROOT"
+  if [ ! -w "$prefix" ]; then
+    die "cannot write to install prefix $prefix — not a curl|sh install?"
+  fi
+
+  echo "==> checking for updates" >&2
+  tag="$(upgrade_latest_tag)"
+  [ -n "$tag" ] || die "could not determine latest release tag from GitHub"
+  latest="${tag#v}"
+  current="$(read_version)"
+
+  if ! upgrade_version_gt "$latest" "$current"; then
+    echo "kai is up to date (version $current)." >&2
+    return 0
+  fi
+
+  echo "==> upgrading kaikai $current -> $latest" >&2
+  tarball="kaikai-$tag-$platform.tar.gz"
+  base="https://github.com/kaikailang-org/kaikai/releases/download/$tag"
+
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-upgrade.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  curl -fsSL -o "$tmp/$tarball" "$base/$tarball" \
+    || die "failed to download $tarball"
+  curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256" \
+    || die "failed to download $tarball.sha256"
+
+  echo "==> verifying checksum" >&2
+  want="$(awk '{print $1}' "$tmp/$tarball.sha256")"
+  got="$(upgrade_sha256_of "$tmp/$tarball")"
+  if [ "$want" != "$got" ]; then
+    die "checksum mismatch for $tarball (expected $want, got $got) — aborting upgrade"
+  fi
+
+  echo "==> installing $latest to $prefix" >&2
+  mkdir -p "$tmp/unpack"
+  tar -xzf "$tmp/$tarball" -C "$tmp/unpack"
+  top="$tmp/unpack/kaikai-$tag-$platform"
+  [ -d "$top" ] || top="$(find "$tmp/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  [ -d "$top" ] || die "unexpected tarball layout: no top-level directory"
+  [ -x "$top/bin/kai" ] || die "tarball missing bin/kai"
+
+  # Swap contents in place. Replace bin/libexec/share wholesale so a
+  # removed file from the old version does not linger.
+  for d in bin libexec share; do
+    if [ -d "$top/$d" ]; then
+      rm -rf "$prefix/$d"
+      (cd "$top" && tar -cf - "$d") | (cd "$prefix" && tar -xf -)
+    fi
+  done
+  for f in README.md LICENSE; do
+    [ -f "$top/$f" ] && cp "$top/$f" "$prefix/$f"
+  done
+
+  echo "==> upgraded to kaikai $latest" >&2
+  "$prefix/bin/kai" --version >&2 || true
+}
+
 case "${1:-}" in
   build)     shift; cmd_build "$@" ;;
   run)       shift; cmd_run   "$@" ;;
@@ -2725,6 +2886,7 @@ case "${1:-}" in
   install)   shift; cmd_install "$@" ;;
   add)       shift; cmd_add     "$@" ;;
   update)    shift; cmd_update  "$@" ;;
+  upgrade)   shift; cmd_upgrade "$@" ;;
   show)      shift; cmd_show_pkg "$@" ;;
   lsp)       shift; cmd_lsp     "$@" ;;
   info)      shift; cmd_info    "$@" ;;
