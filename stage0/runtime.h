@@ -4423,6 +4423,13 @@ static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
     return r;
 }
 
+/* Length-0 array of any element type. `kai_array_make(0, NULL)` is
+   sound only because the fill loop never runs at len 0 — NULL is
+   never dereferenced. */
+static KaiValue *kai_prelude_array_empty(void) {
+    return kai_array_make(0, NULL);
+}
+
 static KaiValue *kai_prelude_array_length(KaiValue *a) {
     int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
     KaiValue *r = kai_int(len);
@@ -6299,6 +6306,7 @@ static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int
 static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
 static KaiValue *_kai_prelude_string_join_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_join(a[0], a[1]); }
 static KaiValue *_kai_prelude_array_make_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_make(a[0], a[1]); }
+static KaiValue *_kai_prelude_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_array_empty(); }
 static KaiValue *_kai_prelude_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_array_length(a[0]); }
 static KaiValue *_kai_prelude_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_get(a[0], a[1]); }
 static KaiValue *_kai_prelude_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_set(a[0], a[1], a[2]); }
