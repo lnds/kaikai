@@ -12892,8 +12892,25 @@ static KaiValue *kai_native_di_enable(void *cv, KaiValue *fnamev, KaiValue *dirv
     LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18, di_ver);
 
     c->dib = LLVMCreateDIBuilder(m);
+    /* The kaikai-side path is the entry file kaic2 saw — which `bin/kai`
+     * copied to $tmp, so it is ephemeral. KAI_DEBUG_SRC carries the user's
+     * ORIGINAL absolute path; prefer it so the DIFile + comp_dir point at the
+     * real source `lldb`/`gdb` can open. Split it into (dir, base) here. */
     const char *fname = fnamev->as.s.bytes;
     const char *dir = dirv->as.s.bytes;
+    char dirbuf[4096];
+    const char *real = getenv("KAI_DEBUG_SRC");
+    if (real && real[0]) {
+        const char *slash = strrchr(real, '/');
+        if (slash) {
+            size_t dl = (size_t) (slash - real);
+            if (dl >= sizeof dirbuf) dl = sizeof dirbuf - 1;
+            memcpy(dirbuf, real, dl); dirbuf[dl] = '\0';
+            dir = dirbuf; fname = slash + 1;
+        } else {
+            fname = real;
+        }
+    }
     c->difile = LLVMDIBuilderCreateFile((LLVMDIBuilderRef) c->dib,
         fname, strlen(fname), dir, strlen(dir));
     c->dicu = LLVMDIBuilderCreateCompileUnit((LLVMDIBuilderRef) c->dib,
