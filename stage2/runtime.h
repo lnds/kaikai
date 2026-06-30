@@ -4917,12 +4917,39 @@ static int kai_self_exe_path(char *buf, size_t n) {
  * once with all addresses (the DWARF line table maps each back to .kai:line).
  * Silent + harmless when the symboliser is absent or resolves nothing — the
  * caller already printed `panic: <msg>`. */
+/* Single-quote-wrap `src` into `dst` for safe inclusion in a /bin/sh command
+ * line, escaping any embedded `'` as `'\''` (close-quote, literal-quote,
+ * re-open-quote). Without this a path containing a single quote would break
+ * out of the quoting and the rest would be run by the shell — `exe` comes
+ * from the executable's own path, but it is still attacker-influenceable
+ * (a binary placed at a crafted path), so quote it properly. Truncates
+ * safely if `dst` fills; returns 1 on success, 0 if it could not fit. */
+static int kai_shell_squote(const char *src, char *dst, size_t n) {
+    size_t j = 0;
+    if (n < 3) return 0;
+    dst[j++] = '\'';
+    for (; *src; src++) {
+        if (*src == '\'') {
+            if (j + 4 >= n) return 0;
+            dst[j++] = '\''; dst[j++] = '\\'; dst[j++] = '\''; dst[j++] = '\'';
+        } else {
+            if (j + 1 >= n) return 0;
+            dst[j++] = *src;
+        }
+    }
+    if (j + 2 > n) return 0;
+    dst[j++] = '\''; dst[j] = '\0';
+    return 1;
+}
+
 static void kai_panic_backtrace(void) {
     void *frames[64];
     int n = backtrace(frames, 64);
     if (n <= 0) return;
     char exe[4096];
     if (!kai_self_exe_path(exe, sizeof exe)) return;
+    char qexe[4112];   /* exe single-quoted for the shell (worst case grows it) */
+    if (!kai_shell_squote(exe, qexe, sizeof qexe)) return;
 
     /* The frames are RUNTIME addresses (PIE/ASLR-slid). The symboliser reads
      * the binary at its STATIC link addresses, so the slide must be removed.
@@ -4937,9 +4964,9 @@ static void kai_panic_backtrace(void) {
 
     char cmd[8192];
 #if defined(__APPLE__)
-    int off = snprintf(cmd, sizeof cmd, "atos -o '%s' -fullPath -l %p", exe, (void *) base);
+    int off = snprintf(cmd, sizeof cmd, "atos -o %s -fullPath -l %p", qexe, (void *) base);
 #else
-    int off = snprintf(cmd, sizeof cmd, "addr2line -f -p -e '%s'", exe);
+    int off = snprintf(cmd, sizeof cmd, "addr2line -f -p -e %s", qexe);
 #endif
     if (off <= 0 || off >= (int) sizeof cmd) return;
     /* Skip frame 0 (this fn) and frame 1 (kai_prelude_panic): start at the
