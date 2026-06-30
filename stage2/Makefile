@@ -124,7 +124,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -149,7 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-build-modes
 
 all: $(TARGET)
 
@@ -676,6 +676,97 @@ test-ffi-extern-c: $(TARGET) build
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out > /dev/null \
 	  && echo "ffi-extern-c OK (C backend)" \
 	  || { echo "ffi-extern-c DIFF (C backend)"; diff ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out; exit 1; }
+
+# Numeric lane A (#514) — fixed-width Int32/UInt32/UInt64/Int128. The
+# two pure fixtures (Int128 arithmetic past 2^63, every width + Show/Eq/
+# Ord) run libc-only; the honest FFI fixture links the standalone
+# ffi_fixed_shim.c (int32_t/uint32_t/uint64_t at the boundary). The
+# negative fixture proves the widths are kind-distinct from Int (an
+# Int32 value rejected against an Int annotation). C backend; the native
+# parity is covered by the backend-parity harness.
+test-numeric-fixed-width: $(TARGET) build
+	@set -e; \
+	for f in int128_overflow fixed_width_protocols; do \
+	  ./$(TARGET) ../examples/numeric/$$f.kai > build/$$f.c; \
+	  $(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
+	  ./build/$$f-c > build/$$f.out; \
+	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
+	    && echo "numeric $$f OK (C backend)" \
+	    || { echo "numeric $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
+	done; \
+	./$(TARGET) ../examples/numeric/ffi_fixed_honest.kai > build/ffi_fixed_honest.c; \
+	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/ffi_fixed_honest.c ../examples/numeric/ffi_fixed_shim.c -o build/ffi_fixed_honest-c $(LDLIBS_M); \
+	./build/ffi_fixed_honest-c > build/ffi_fixed_honest.out; \
+	diff -q ../examples/numeric/ffi_fixed_honest.out.expected build/ffi_fixed_honest.out > /dev/null \
+	  && echo "numeric ffi_fixed_honest OK (C backend)" \
+	  || { echo "numeric ffi_fixed_honest DIFF"; diff ../examples/numeric/ffi_fixed_honest.out.expected build/ffi_fixed_honest.out; exit 1; }; \
+	./$(TARGET) ../examples/numeric/kind_mismatch.err.kai > build/kind_mismatch.out 2>&1 \
+	  && { echo "kind_mismatch DID NOT FAIL — Int32 must not unify with Int"; exit 1; } \
+	  || true; \
+	grep -F "$$(head -1 ../examples/numeric/kind_mismatch.err.expected)" build/kind_mismatch.out > /dev/null \
+	  && echo "numeric kind_mismatch OK (kind-distinct rejection)" \
+	  || { echo "numeric kind_mismatch DIFF — expected type-mismatch diagnostic"; cat build/kind_mismatch.out; exit 1; }
+
+# Pure-kaikai BigInt (numeric lane B) — C backend. Each fixture compiles
+# to C, runs, and diffs against its golden. Verifies arbitrary-precision
+# arithmetic beyond 2^64, factorials, the i64<->heap border, the `99n`
+# literal suffix, and error paths (bad parse / divide-by-zero -> None).
+# Native parity is gated separately in test-numeric-bigint-native.
+test-numeric-bigint: $(TARGET) build
+	@set -e; \
+	for f in bigint_arith bigint_factorial bigint_border bigint_literal bigint_errors; do \
+	  ./$(TARGET) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
+	  ./build/$$f-c > build/$$f.out; \
+	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
+	    && echo "bigint $$f OK (C backend)" \
+	    || { echo "bigint $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
+	done
+
+# Pure-kaikai BigInt — NATIVE backend parity. Same fixtures and goldens,
+# built with the in-process libLLVM backend. Native-gated: a C-only
+# kaic2 cannot run --backend=native, so this is invoked from the
+# tier1-native workflow, not the C-backend tier1 suite.
+test-numeric-bigint-native: $(TARGET) build
+	@set -e; \
+	for f in bigint_arith bigint_factorial bigint_border bigint_literal bigint_errors; do \
+	  KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
+	    || { echo "bigint $$f FAIL (native build errored)"; cat build/$$f-nat.err; exit 1; }; \
+	  ./build/$$f-nat > build/$$f-nat.out; \
+	  diff -q ../examples/numeric/$$f.out.expected build/$$f-nat.out > /dev/null \
+	    && echo "bigint $$f OK (native backend)" \
+	    || { echo "bigint $$f DIFF (native)"; diff ../examples/numeric/$$f.out.expected build/$$f-nat.out; exit 1; }; \
+	done
+
+# DecimalBig + Rational (numeric lane D) — C backend. Each fixture
+# compiles to C, runs, and diffs against its golden. Verifies a
+# BigInt-carrier decimal past the ~38-digit Int128 ceiling and exact
+# rationals with gcd normalisation. Native parity is in
+# test-numeric-decimal-rational-native.
+test-numeric-decimal-rational: $(TARGET) build
+	@set -e; \
+	for f in decimal_big_demo rational_demo; do \
+	./$(TARGET) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
+	./build/$$f-c > build/$$f.out; \
+	diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
+	&& echo "decimal-rational $$f OK (C backend)" \
+	|| { echo "decimal-rational $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
+	done
+
+# DecimalBig + Rational — NATIVE backend parity. Same fixtures and
+# goldens, built with the in-process libLLVM backend. Native-gated;
+# invoked from the tier1-native workflow.
+test-numeric-decimal-rational-native: $(TARGET) build
+	@set -e; \
+	for f in decimal_big_demo rational_demo; do \
+	KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
+	|| { echo "decimal-rational $$f FAIL (native build errored)"; cat build/$$f-nat.err; exit 1; }; \
+	./build/$$f-nat > build/$$f-nat.out; \
+	diff -q ../examples/numeric/$$f.out.expected build/$$f-nat.out > /dev/null \
+	&& echo "decimal-rational $$f OK (native backend)" \
+	|| { echo "decimal-rational $$f DIFF (native)"; diff ../examples/numeric/$$f.out.expected build/$$f-nat.out; exit 1; }; \
+	done
 
 # FFI v2 (#417) — struct-by-value across the C boundary. The emitter
 # ships the `extern "C" type` structs in a shared `kai_ffi.h` (issue
@@ -3992,6 +4083,53 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
 
+# Issue #995 — the native backend reused a recursive-ADT node in place while
+# the original was still live, mutating it (orig=5 instead of 3). The C oracle
+# was correct. The parity ratchet catches native!=C divergence, but it would
+# miss a regression that corrupts BOTH backends identically; this gate anchors
+# the ABSOLUTE correct output (orig=3) on native against the golden. Both the
+# binary tree and the linear list shapes are exercised in one fixture.
+test-perceus-995-native-shared-reuse-corruption: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_shared_reuse_corruption_995.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995corr 2> build/s2-995corr.err \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native build errored)"; cat build/s2-995corr.err; exit 1; }; \
+	./build/s2-995corr > build/s2-995corr.out 2> build/s2-995corr.rc \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native run errored — exit $$?)"; exit 1; }; \
+	diff -q ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out > /dev/null \
+	  && echo "perceus-995-native-shared-reuse-corruption OK (native orig=3 — original not mutated by the rewrite)" \
+	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (output diff — original corrupted)"; diff ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out; exit 1; }
+
+# Issue #995 companion — the fix must not disable valid reuse-in-place. With a
+# DEAD donor (no live alias) the rewrite must still recycle the nodes: assert
+# the native binary reports a non-zero `reuse_in_place` under KAI_TRACE_RC. A
+# regression that fresh-allocated everywhere (the over-conservative fix) shows
+# reuse_in_place=0 and fails here.
+test-perceus-995-native-dead-donor-reuse: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_dead_donor_reuse_995.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995dead 2> build/s2-995dead.err \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native build errored)"; cat build/s2-995dead.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-995dead > build/s2-995dead.out 2> build/s2-995dead.rc \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native run errored — exit $$?)"; exit 1; }; \
+	diff -q ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out > /dev/null \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (output diff)"; diff ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out; exit 1; }; \
+	reuse=$$(grep -oE 'reuse_in_place=[0-9]+' build/s2-995dead.rc | head -1 | cut -d= -f2); \
+	[ -n "$$reuse" ] \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (no reuse_in_place line)"; cat build/s2-995dead.rc; exit 1; }; \
+	[ "$$reuse" -gt 0 ] \
+	  && echo "perceus-995-native-dead-donor-reuse OK (native reuse_in_place=$$reuse > 0; dead-donor reuse-in-place preserved)" \
+	  || { echo "perceus-995-native-dead-donor-reuse FAIL (reuse_in_place=0 — valid reuse disabled by the fix)"; exit 1; }
+
+# Issue #500 — native build profiles. Drives examples/build-modes/check.sh:
+# --debug emits DWARF whose line table names the .kai source and a panic
+# prints a kaikai-source stack trace; --release strips and is smaller than
+# the default. The script SKIPs (exit 0) on a cc-only kaic2 (DWARF is
+# native-only), so this is safe in the C-only tier1 and meaningful in the
+# native (KAI_LLVM=1) build.
+test-build-modes: $(TARGET) build
+	@../examples/build-modes/check.sh ../bin/kai build/build-modes-work
+
 # Issue #950 — the native backend runs `test` blocks. `kai test` on the
 # fixture must produce the SAME summary + exit code on native as on the C
 # oracle (a pass, a caught failing assertion, and a test after the
@@ -4163,6 +4301,41 @@ test-issue-978-spawn-parent-handled-effect: $(TARGET) build
 	diff -q ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out > /dev/null \
 	  && echo "issue-978 OK (spawned fiber's parent-handled effect reports clean diagnostic, not a segfault)" \
 	  || { echo "issue-978 DIFF"; diff ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out; exit 1; }
+
+# Issue #997 — a spawned fiber that reads/writes an enclosing `var` (a State
+# cell) type-checked but segfaulted (rc 139, both backends): the cell's evidence
+# is fiber-local (#820) and the by-id lookup on the child fiber returned NULL,
+# whose handler deref crashed. The escape check now rejects the common shapes at
+# compile time; a runtime guard turns the residue the static check cannot see
+# (a cell read reached through a rebound closure alias) into a clean diagnostic
+# instead of a segfault. Three reject fixtures, one runtime-floor fixture, two
+# positive controls (a fiber's own inner cell; a spawn that never touches it).
+test-issue-997-spawn-cell-fiber-local: $(TARGET) build
+	@set -e; \
+	for name in issue_997_spawn_cell_read_rejected issue_997_spawn_cell_write_rejected \
+	            issue_997_spawn_cell_transitive_rejected; do \
+	  rc=0; ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c 2> build/$$name.err || rc=$$?; \
+	  [ $$rc -ne 0 ] || { echo "issue-997 FAIL $$name (compiled, want compile-time reject)"; exit 1; }; \
+	  grep -F "$$(cat ../examples/effects/$$name.err.expected)" build/$$name.err > /dev/null \
+	    && echo "issue-997 OK $$name (cell-across-spawn rejected at compile time)" \
+	    || { echo "issue-997 MISS $$name (rejected, wrong diagnostic)"; cat build/$$name.err; exit 1; }; \
+	done; \
+	./$(TARGET) --path ../stdlib ../examples/effects/issue_997_spawn_cell_runtime_floor.kai > build/iss997rf.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss997rf.c -o build/iss997rf $(LDLIBS_M); \
+	rc=0; ./build/iss997rf > build/iss997rf.out 2>&1 || rc=$$?; \
+	[ $$rc -eq 1 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss997rf.out; exit 1; }; \
+	diff -q ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out > /dev/null \
+	  && echo "issue-997 OK runtime_floor (unreachable cell reports clean diagnostic, not a segfault)" \
+	  || { echo "issue-997 DIFF runtime_floor"; diff ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out; exit 1; }; \
+	for name in issue_997_spawn_inner_cell_ok issue_997_spawn_no_cell_ok issue_997_spawn_shadowed_cell_ok; do \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
+	  ./build/$$name > build/$$name.out 2>&1 \
+	    || { echo "issue-997 FAIL $$name (valid program crashed)"; cat build/$$name.out; exit 1; }; \
+	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
+	    && echo "issue-997 OK $$name (valid fiber-local cell use unaffected)" \
+	    || { echo "issue-997 DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
+	done
 
 # Issue #680 — polymorphic recursive fold with a closure-typed
 # parameter. Pre-fix the body `fold_events(f(initial, ev1), rest, f)`
@@ -5200,7 +5373,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-kir test-batch-isolation
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-issue-963-cross-module-mono test-kir test-batch-isolation
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
@@ -5239,7 +5412,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-unused-bindings test-issue-963-cross-module-mono test-kir test-packages
+test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-reject test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-issue-315-no-double-slash test-issue-248-loop-sugars test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-unused-bindings test-issue-963-cross-module-mono test-kir test-packages
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category

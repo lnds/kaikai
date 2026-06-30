@@ -35,10 +35,29 @@ runs the full toolchain today; it is unstable until the Orongo
 See `docs/roadmap.md` for milestone state and `docs/design.md` for
 the design context.
 
-## Install
+# Two ways in, and which one you want
 
-Two ways to get a prebuilt `kai` on macOS arm64 (Apple Silicon). The
-binary is self-contained — no system LLVM needed.
+There are two completely separate paths, for two different people. Pick
+the one that matches you — they do not overlap, and you almost certainly
+want the first.
+
+| You want to… | Path | Needs |
+| --- | --- | --- |
+| **Use kaikai** (write and run programs) | **A. Install a prebuilt `kai`** | nothing — the binary is self-contained |
+| **Hack on the compiler itself** (change the language, the runtime, the codegen) | **B. Build the compiler from source** | a C compiler + LLVM dev libraries |
+
+If you just want to write kaikai, go to **A** and ignore everything under
+**B**. The LLVM / `llvm-config` / `make` machinery in **B** is *only* for
+rebuilding the compiler — an installed `kai` needs none of it.
+
+---
+
+# A. Install — to use kaikai
+
+Get a prebuilt `kai` on **macOS arm64** (Apple Silicon). The binary is
+**self-contained**: libLLVM is linked in, so there is **no system LLVM,
+no `make`, and no toolchain to install**. This is the path for everyone
+who is not changing the compiler.
 
 **curl | sh** (rustup-style, no Homebrew required):
 
@@ -66,8 +85,8 @@ A `kai upgrade` on a Homebrew install defers to `brew upgrade` rather
 than touching the Cellar.
 
 > Linux and x86_64 are a later iteration; the installer reports clearly
-> when run on an unsupported platform. Build from source (below) on any
-> platform meanwhile.
+> when run on an unsupported platform. To run kaikai on those platforms
+> today, build the compiler from source (path **B**).
 
 ## Quickstart
 
@@ -86,7 +105,18 @@ header comment. Read them in order — each one introduces one new
 concept (sum types, then recursion + match, then algebraic effects,
 then fibers).
 
-## Prerequisites
+---
+
+# B. Build from source — to regenerate the compiler
+
+**You only need this section if you are changing kaikai itself** — the
+language, the runtime, the codegen — or running on a platform the
+installer does not yet ship a binary for. **If you installed `kai` in
+section A, skip all of this.** None of the LLVM / `make` / bootstrap
+machinery below is needed to *use* the language; it is the toolchain for
+*rebuilding the compiler*.
+
+## Prerequisites (for building from source only)
 
 - **C compiler** (cc/gcc/clang)
 - **LLVM** development headers and libraries (CI builds against
@@ -98,7 +128,7 @@ then fibers).
   the equivalent for your distro. The build locates LLVM through
   `llvm-config`, so any reasonably recent version on `PATH` works.
 
-## Build
+## Building the compiler
 
 Everything builds from the repo root with `make`:
 
@@ -108,7 +138,10 @@ make test      # runs stage 0, stage 1, and phase 4 demo suites
 make selfhost  # proves kaic1 compiled by kaic1 is a fixed point
 ```
 
-On a fresh checkout, only a C compiler is required:
+The bootstrap chain regenerates the compiler from nothing but a C
+compiler: stage 0 (C) builds `kaic0`, which compiles the kaikai-minimal
+compiler `kaic1`, which compiles the self-hosted full compiler `kaic2`.
+On a fresh checkout, only a C compiler is required to start:
 
 ```sh
 cc stage0/*.c -o stage0/kaic0
@@ -116,6 +149,9 @@ cc stage0/*.c -o stage0/kaic0
 cc /tmp/stage1.c -I stage0 -o stage1/kaic1
 bin/kai run examples/phase4/hello.kai
 ```
+
+`make selfhost` is the fixed-point proof that the compiler can rebuild
+itself byte-for-byte — the defining property of a self-hosted compiler.
 
 ## Usage
 

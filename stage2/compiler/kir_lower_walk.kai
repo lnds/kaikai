@@ -58,6 +58,7 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # Atoms: no statement, the literal IS the value.
   EInt(n)            -> LRes(KIntV(n), st)
   EReal(r, _)           -> LRes(KRealV(r), st)
+  EFixed(span, ty)      -> LRes(KFixedV(span, ty), st)
   EBool(b)           -> LRes(KBoolV(b), st)
   EChar(c)           -> LRes(KCharV(c), st)
   EStr(span, _)      -> LRes(KStrV(span), st)
@@ -288,6 +289,7 @@ fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
 fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EReal(r, _) -> LRes(KRealV(r), st)
   EInt(n)     -> LRes(KIntV(n), st)
+  EFixed(span, ty) -> LRes(KFixedV(span, ty), st)
   EBool(b)    -> LRes(KBoolV(b), st)
   EVar(name)  -> lower_var(name, st)
   ELitUnit(inner, _) -> lower_expr_raw(inner, st)
@@ -1994,19 +1996,29 @@ fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: L
 #    `kai_decref(donor)` then cascades the donor + inner + leaves correctly, the
 #    dups keeping the embedded leaves alive. Costs one outer alloc per rebuild
 #    (the reuse-in-place recycle is a separate perf follow-up) but never leaks.
-fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_exprs(cargs, st, []) { LResMany(avs, st1) -> {
+# The shared-donor incref of each kept child must precede `lower_exprs`: a
+# rebuild arg that CONSUMES a kept child (`inc(l)`, `ins(l, ..)`) reuses it
+# in place inside the call, so the incref has to land BEFORE the call runs —
+# else the call mutates the donor's still-live child. Emitting it after the
+# args (as the old `emit_reuse_gc_increfs(.., st1)` did) protected only
+# children embedded by reference, not children threaded through a call. The
+# nested-rotation path keeps its own ordering (the dup precedes nothing it
+# consumes — `KCon` fresh-allocs).
+fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
+  let st_gc = if reuse_kind_is_variant(rk) and not nested {
+                emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st.reuse_gc), kpos_of(x), st)
+              } else { st }
+  match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) -> {
     let tag = ls_variant_tag(st1, cn)
-    if reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs) {
+    if nested {
       let st_dup = emit_reuse_leaf_dups(reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
       bind_op(st_dup, KCon(cn, tag, boxed_inits(avs, [])), kpos_of(x))
     } else {
-      let st_gc = if reuse_kind_is_variant(rk) {
-                    emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
-                  } else { st1 }
-      bind_op(st_gc, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
+      bind_op(st1, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
     }
   } }
+}
 
 fn reuse_kind_is_variant(rk: KReuseKind) : Bool = match rk { RkVariant -> true RkCons -> false }
 
@@ -2053,13 +2065,19 @@ fn emit_reuse_leaf_dups(uses: [String], pos: KPos, st: LowerSt) : LowerSt = matc
   }
 }
 
-# The multiset of scrutinee pointer-binder USES the rebuild args EMBED. Each
+# The multiset of scrutinee pointer-binder USES the rebuild args reach. Each
 # `EVar(nm)` whose `nm` is in `gc` contributes one entry per occurrence,
-# descending into nested CTOR calls (the rotation's inner `Node(Black, lx, ..)`
-# embeds `lx`/`rx`). A NON-ctor call (`ins(l,..)`, `f(x)`) CONSUMES its args —
-# it does not embed them — so a binder passed to a fn call is NOT counted (an
-# incref there would be spurious: the value is consumed, not kept — the mixed-
-# arm `Node(Red, ins(l,..),..)` leak).
+# descending into BOTH nested ctor calls (the rotation's inner
+# `Node(Black, lx, ..)` embeds `lx`/`rx`) AND ordinary fn calls (`f(l)`,
+# `ins(l, ..)`). A kept child passed to a fn call still needs the
+# shared-donor incref: when the donor is shared, the reuse fresh-allocs the
+# rebuild but the donor keeps its own reference to the child, and the call
+# would consume / reuse-in-place that still-aliased child. `KIncrefIfShared`
+# is conditional (it increfs only when the donor is shared), so a unique
+# donor pays nothing and the call MOVEs the child as before; a shared donor
+# gives the child its own ref, so the call fresh-allocs instead of mutating
+# the donor's still-live child. The genuinely-dangerous nested-rotation `ins`
+# rides `reuse_has_nested_ctor` to the fresh-alloc-and-dup path, never here.
 fn reuse_gc_uses(cargs: [Expr], gc: [String]) : [String] = match gc {
   [] -> []
   _  -> reuse_gc_uses_exprs(cargs, gc, [])
@@ -2072,11 +2090,7 @@ fn reuse_gc_uses_exprs(es: [Expr], gc: [String], acc: [String]) : [String] = mat
 
 fn reuse_gc_uses_expr(e: Expr, gc: [String], acc: [String]) : [String] = match e.kind {
   EVar(nm)        -> if name_in_list(gc, nm) { [nm, ...acc] } else { acc }
-  ECall(cf, cas)  -> match cf.kind {
-    EVar(c)        -> if kir_name_is_ctor(c) { reuse_gc_uses_exprs(cas, gc, acc) } else { acc }
-    EModCall(_, c) -> if kir_name_is_ctor(c) { reuse_gc_uses_exprs(cas, gc, acc) } else { acc }
-    _              -> acc
-  }
+  ECall(cf, cas)  -> reuse_gc_uses_exprs(cas, gc, reuse_gc_uses_expr(cf, gc, acc))
   _ -> acc
 }
 
