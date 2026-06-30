@@ -1610,6 +1610,11 @@ fn parse_primary(p: Parser) : PExpr / Console {
     TkIf -> parse_if(p, t)
     TkMatch -> parse_match(p, t)
     TkHandle -> parse_handle(p_advance(p), t)
+    # `%{ }` / `%[ ]` collection literals. Only in primary position:
+    # infix `a % b` (modulo) is consumed by `parse_mul_rest` and never
+    # reaches here. A `%` not followed by `{`/`[` falls back to the
+    # expression error inside `parse_collection_lit`.
+    TkPercent -> parse_collection_lit(p, t)
     _ -> err_e(p_error_here(p, "expected expression"))
   }
 }
@@ -2689,6 +2694,261 @@ fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr / Console {
     err_e(p_error_here(p0, "expected `,` or `]` in list"))
   }
 }
+
+# ====================================================================
+# collection literals: `%{ }` map, `%[ ]` set
+# ====================================================================
+#
+# `%` always lexes as `TkPercent`; in primary position followed by
+# `{`/`[` it opens a literal, while infix `a % b` (modulo) is consumed
+# by `parse_mul_rest` before reaching primary. The delimiter (brace vs
+# bracket) discriminates map from set with no ambiguity, empties
+# included. No new AST node: like `<int>n -> bigint.from_int`, the
+# literal lowers here into the pure L1 calls `map.from`/`set.from`/
+# `map.empty`/`set.empty` (no spread) or chained `map.put`/`set.insert`
+# (spread base first). The callee is `EField(EVar(mod), fn)` so the
+# qualified-call resolver rewrites it to an `EModCall`, as the numeric
+# literal sugars do. The single-spread-first rule is enforced at the
+# parse site, mirroring the record-spread loop.
+
+# A parsed map entry: key and value expressions.
+type MapEntry = ME(Expr, Expr)
+
+# Result of parsing one `key: value` entry, mirroring `PExpr`.
+type PEntry = { p: Parser, r: Option[MapEntry] }
+
+fn ok_entry(p: Parser, e: MapEntry) : PEntry = PEntry { p: p, r: Some(e) }
+fn err_entry(p: Parser) : PEntry = PEntry { p: p, r: None }
+
+# `EField(EVar(mod), fn)`: the unresolved qualified callee the
+# qualified-call resolver rewrites into an `EModCall`.
+fn coll_callee(mod: String, fn_name: String, line: Int, col: Int) : Expr =
+  mk_expr(EField(mk_expr(EVar(mod), line, col), fn_name), line, col)
+
+fn coll_call(mod: String, fn_name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(coll_callee(mod, fn_name, line, col), args), line, col)
+
+# Entry from `parse_primary` on `TkPercent`. The token after `%`
+# selects map (`{`) or set (`[`); anything else is not a literal.
+fn parse_collection_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let after = p_peek1(p)
+  if tk_is(after.kind, TkLbrace) {
+    parse_map_lit(p_advance(p_advance(p)), t)
+  } else if tk_is(after.kind, TkLbracket) {
+    parse_set_lit(p_advance(p_advance(p)), t)
+  } else {
+    err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+# `%{}` -> map.empty(); `%{ k: v }` -> map.from([Pair]);
+# `%{ ...base, k: v }` -> map.put chain over base.
+fn parse_map_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), coll_call("map", "empty", [], t.line, t.col))
+  } else if p_at(p0, TkEllipsis) {
+    let r = parse_expr(p_skip_newlines(p_advance(p0)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(base) -> map_after_spread(r.p, base, t)
+    }
+  } else {
+    parse_map_entries(p0, [], t)
+  }
+}
+
+# Collect `k: v` entries (no spread present) into `map.from([Pair])`.
+fn parse_map_entries(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
+
+  let r = parse_map_entry(p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(entry) -> map_entries_sep(p_skip_newlines(r.p), [entry, ...acc], t)
+  }
+}
+
+# After one entry: `}` (or `,}`) closes, `,` continues, `, ...` is the
+# spread-not-first error, anything else is a separator error.
+fn map_entries_sep(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
+
+  if p_at(p, TkRbrace) {
+    ok_e(p_advance(p), map_from_entries(list_reverse(acc), t))
+  } else if not p_at(p, TkComma) {
+    err_e(p_error_here(p, "expected `,` or `}` in map literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkRbrace) {
+      ok_e(p_advance(p1), map_from_entries(list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "map literal admits a single `...` spread, and it must come first"))
+    } else {
+      parse_map_entries(p1, acc, t)
+    }
+  }
+}
+
+# Parse one `key: value`. A bare element (no `:`) is the set-shape mistake.
+fn parse_map_entry(p: Parser, t: Token) : PEntry / Console {
+
+  let rk = parse_expr(p)
+  match rk.r {
+    None -> err_entry(rk.p)
+    Some(key) -> {
+      let p1 = p_skip_newlines(rk.p)
+      if p_at(p1, TkColon) {
+        let rv = parse_expr(p_skip_newlines(p_advance(p1)))
+        match rv.r {
+          None -> err_entry(rv.p)
+          Some(val) -> ok_entry(rv.p, ME(key, val))
+        }
+      } else {
+        err_entry(p_error_here(p1,
+          "set element in map literal: use a set literal `%[ ]`, or write `key: value`"))
+      }
+    }
+  }
+}
+
+# Override chain after `%{ ...base }`: each later `key: value` becomes
+# an outer `map.put`, so a key repeated from the base wins.
+fn map_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), base)
+  } else if not p_at(p0, TkComma) {
+    err_e(p_error_here(p0, "expected `,` or `}` after `...` source in map literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkRbrace) {
+      ok_e(p_advance(p1), base)
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "map literal admits a single `...` spread; remove the second one"))
+    } else {
+      let r = parse_map_entry(p1, t)
+      match r.r {
+        None -> err_e(r.p)
+        Some(entry) -> map_after_spread(r.p, map_put(base, entry, t), t)
+      }
+    }
+  }
+}
+
+fn map_put(base: Expr, entry: MapEntry, t: Token) : Expr = match entry {
+  ME(k, v) -> coll_call("map", "put", [base, k, v], t.line, t.col)
+}
+
+fn map_from_entries(entries: [MapEntry], t: Token) : Expr =
+  coll_call("map", "from",
+            [mk_expr(EList(map(entries, (e) => pair_elem(e, t))), t.line, t.col)],
+            t.line, t.col)
+
+fn pair_elem(entry: MapEntry, t: Token) : ListElem = match entry {
+  ME(k, v) -> ElPlain(mk_expr(ERecordLit("Pair", [FI("fst", k), FI("snd", v)]), t.line, t.col))
+}
+
+# `%[]` -> set.empty(); `%[ e ]` -> set.from([e]);
+# `%[ ...base, e ]` -> set.insert chain over base.
+fn parse_set_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), coll_call("set", "empty", [], t.line, t.col))
+  } else if p_at(p0, TkEllipsis) {
+    let r = parse_expr(p_skip_newlines(p_advance(p0)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(base) -> set_after_spread(r.p, base, t)
+    }
+  } else {
+    parse_set_elems(p0, [], t)
+  }
+}
+
+fn parse_set_elems(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
+
+  let r = parse_set_elem(p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(elem) -> set_elems_sep(p_skip_newlines(r.p), [elem, ...acc], t)
+  }
+}
+
+# After one element: `]` (or `,]`) closes, `,` continues, `, ...` is
+# the spread-not-first error, anything else is a separator error.
+fn set_elems_sep(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
+
+  if p_at(p, TkRbracket) {
+    ok_e(p_advance(p), set_from_elems(list_reverse(acc), t))
+  } else if not p_at(p, TkComma) {
+    err_e(p_error_here(p, "expected `,` or `]` in set literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkRbracket) {
+      ok_e(p_advance(p1), set_from_elems(list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "set literal admits a single `...` spread, and it must come first"))
+    } else {
+      parse_set_elems(p1, acc, t)
+    }
+  }
+}
+
+# Parse one set element. A `key: value` pair is the map-shape mistake.
+fn parse_set_elem(p: Parser, t: Token) : PExpr / Console {
+
+  let r = parse_expr(p)
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkColon) {
+        err_e(p_error_here(p1,
+          "key:value pair in set literal: use a map literal `%{ }`"))
+      } else {
+        ok_e(r.p, e)
+      }
+    }
+  }
+}
+
+fn set_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), base)
+  } else if not p_at(p0, TkComma) {
+    err_e(p_error_here(p0, "expected `,` or `]` after `...` source in set literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkRbracket) {
+      ok_e(p_advance(p1), base)
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "set literal admits a single `...` spread; remove the second one"))
+    } else {
+      let r = parse_set_elem(p1, t)
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> set_after_spread(r.p, set_insert(base, e, t), t)
+      }
+    }
+  }
+}
+
+fn set_insert(base: Expr, e: Expr, t: Token) : Expr =
+  coll_call("set", "insert", [base, e], t.line, t.col)
+
+fn set_from_elems(elems: [Expr], t: Token) : Expr =
+  coll_call("set", "from",
+            [mk_expr(EList(map(elems, (e) => ElPlain(e))), t.line, t.col)],
+            t.line, t.col)
 
 # ====================================================================
 # block, if, match
