@@ -670,6 +670,7 @@ fn collect_root_bare_callees_decl(d: Decl, acc: [String]) : [String] = match d {
 fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   EInt(_)             -> acc
   EReal(_, _)            -> acc
+  EFixed(_, _)          -> acc
   EBool(_)            -> acc
   EChar(_)            -> acc
   EStr(_, _)          -> acc
@@ -936,6 +937,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
   match e.kind {
     EInt(_) -> ()
     EReal(_, _) -> ()
+    EFixed(_, _) -> ()
     EBool(_) -> ()
     EChar(_) -> ()
     EStr(_, _) -> ()
@@ -1273,6 +1275,19 @@ fn prelude_table() : [EPrelude] {
     EP("byte_eq",            "kai_prelude_byte_eq",            2),
     EP("byte_lt",            "kai_prelude_byte_lt",            2),
     EP("byte_to_string",     "kai_prelude_byte_to_string",     1),
+    # Fixed-width integer prims (numeric lane A). C bodies in runtime.h.
+    EP("int32_to_string",    "kai_prelude_int32_to_string",    1),
+    EP("uint32_to_string",   "kai_prelude_uint32_to_string",   1),
+    EP("uint64_to_string",   "kai_prelude_uint64_to_string",   1),
+    EP("int128_to_string",   "kai_prelude_int128_to_string",   1),
+    EP("int_to_int32",       "kai_prelude_int_to_int32",       1),
+    EP("int_to_uint32",      "kai_prelude_int_to_uint32",      1),
+    EP("int_to_uint64",      "kai_prelude_int_to_uint64",      1),
+    EP("int_to_int128",      "kai_prelude_int_to_int128",      1),
+    EP("int32_to_int",       "kai_prelude_int32_to_int",       1),
+    EP("uint32_to_int",      "kai_prelude_uint32_to_int",      1),
+    EP("uint64_to_int",      "kai_prelude_uint64_to_int",      1),
+    EP("int128_to_int",      "kai_prelude_int128_to_int",      1),
     EP("array_make",       "kai_prelude_array_make",       2),
     EP("array_length",     "kai_prelude_array_length",     1),
     EP("array_get",        "kai_prelude_array_get",        2),
@@ -5705,6 +5720,10 @@ fn raw_c_type(opt_ty: Option[Ty]) : String {
       TyReal -> "double"
       TyBool -> "int"
       TyChar -> "uint32_t"
+      TyInt32  -> "int32_t"
+      TyUInt32 -> "uint32_t"
+      TyUInt64 -> "uint64_t"
+      TyInt128 -> "__int128"
       # KIR Lane 1: an LLVM C-API handle is a raw opaque pointer.
       TyHandle -> "void *"
       TyDimT(inner, _)    -> raw_c_type(Some(inner))
@@ -5731,6 +5750,10 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
       TyReal -> cat3("kai_real(", raw, ")")
       TyBool -> cat3("kai_bool(", raw, ")")
       TyChar -> cat3("kai_char(", raw, ")")
+      TyInt32  -> cat3("kai_int32(",  raw, ")")
+      TyUInt32 -> cat3("kai_uint32(", raw, ")")
+      TyUInt64 -> cat3("kai_uint64(", raw, ")")
+      TyInt128 -> cat3("kai_int128(", raw, ")")
       # A `TyHandle` re-parks the raw `void *` into a `KaiValue *` slot
       # with a plain cast — NOT `kai_int` (which would heap-box the LLVM
       # pointer as an integer). The mirror of the `unbox_boxed_scalar`
@@ -5768,9 +5791,66 @@ fn ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
   None -> false
 }
 
+# True when the optional type is one of the fixed-width integer
+# primitives. They share the raw-arithmetic wrapping discipline with
+# `Int`; the cast width differs (per `raw_signed_c_type`).
+fn ty_opt_is_fixed_width(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt32 -> true   TyUInt32 -> true
+    TyUInt64 -> true  TyInt128 -> true
+    _ -> false
+  }
+  None -> false
+}
+
 fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
   let is_wrap_op = op == "+" or op == "-" or op == "*"
-  is_wrap_op and ty_opt_is_int(opt_ty)
+  is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
+}
+
+# The signed/unsigned C scalar type a raw integer slot computes in.
+# `Int` and unknown default to `int64_t`; the fixed-width primitives
+# pick their exact width. The unsigned form drives the two's-complement
+# wrap (defined C, no UBSan trap); the signed form is the cast back.
+fn raw_signed_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyInt32)  -> "int32_t"
+  Some(TyUInt32) -> "uint32_t"
+  Some(TyUInt64) -> "uint64_t"
+  Some(TyInt128) -> "__int128"
+  Some(TyDimT(inner, _))    -> raw_signed_c_type(Some(inner))
+  Some(TyRefineT(inner, _)) -> raw_signed_c_type(Some(inner))
+  _ -> "int64_t"
+}
+
+fn raw_unsigned_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyInt32)  -> "uint32_t"
+  Some(TyUInt32) -> "uint32_t"
+  Some(TyUInt64) -> "uint64_t"
+  Some(TyInt128) -> "unsigned __int128"
+  Some(TyDimT(inner, _))    -> raw_unsigned_c_type(Some(inner))
+  Some(TyRefineT(inner, _)) -> raw_unsigned_c_type(Some(inner))
+  _ -> "uint64_t"
+}
+
+# A fixed-width literal as a raw C scalar. Int32/UInt32 fit the
+# compiler's 64-bit decode and cast directly. UInt64 and Int128 may hold
+# values above 2^63 (which overflow `decode_int`), so they parse their
+# textual span at runtime via `kai_i128_parse` and cast to the width.
+fn fixed_raw_c_lit(span: String, ty: Ty) : String = match ty {
+  TyInt32  -> cat3("((int32_t)", int_to_string(decode_int(span)), "LL)")
+  TyUInt32 -> cat3("((uint32_t)", int_to_string(decode_int(span)), "ULL)")
+  TyUInt64 -> cat3("((uint64_t)kai_i128_parse(\"", span, "\"))")
+  TyInt128 -> cat3("kai_i128_parse(\"", span, "\")")
+  _        -> cat2(int_to_string(decode_int(span)), "LL")
+}
+
+# A fixed-width literal as a boxed KaiValue (constructor call).
+fn fixed_box_c_lit(span: String, ty: Ty) : String = match ty {
+  TyInt32  -> cat3("kai_int32((int32_t)", int_to_string(decode_int(span)), "LL)")
+  TyUInt32 -> cat3("kai_uint32((uint32_t)", int_to_string(decode_int(span)), "ULL)")
+  TyUInt64 -> cat3("kai_uint64((uint64_t)kai_i128_parse(\"", span, "\"))")
+  TyInt128 -> cat3("kai_int128(kai_i128_parse(\"", span, "\"))")
+  _        -> cat3("kai_int(", int_to_string(decode_int(span)), "LL)")
 }
 
 # C operator for an order-comparison op, when both operands are Int and the
@@ -5828,6 +5908,15 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
       TyReal -> "->as.r"
       TyBool -> "->as.b"
       TyChar -> "->as.c"
+      TyInt32  -> "->as.i32"
+      TyUInt32 -> "->as.u32"
+      TyUInt64 -> "->as.u64"
+      # Int128 has no single alignment-safe field suffix (its value spans
+      # two 8-byte halves); the raw path reads it via `kai_i128_load` in
+      # `unbox_boxed_scalar`, which intercepts TyInt128 before this point.
+      # The low half keeps any stray emit a valid (if lossy) C expression
+      # rather than a reference to the removed `->as.i128` field.
+      TyInt128 -> "->as.i128_halves[0]"
       TyDimT(inner, _)    -> unbox_field_for(Some(inner))
       TyRefineT(inner, _) -> unbox_field_for(Some(inner))
       _ -> "->as.i /* unbox: unexpected ty */"
@@ -5948,6 +6037,11 @@ fn unbox_boxed_scalar(boxed: String, opt_ty: Option[Ty]) : String {
       # Int param (e.g. `nemit_int_lit`) raw-promotes and `->as.i`-mangles
       # the `ctx` handle, breaking selfhost.
       TyHandle -> cat3("(void *)(", boxed, ")")
+      # An Int128 box stores its value in two 8-byte halves, never a bare
+      # `->as.i128` (that field carries a 16-byte alignment requirement the
+      # 8-byte-aligned KaiValue does not meet — a misaligned read segfaults
+      # on Linux/-O2). Read it through the alignment-agnostic load helper.
+      TyInt128 -> cat3("kai_i128_load(", boxed, ")")
       TyDimT(inner, _)    -> unbox_boxed_scalar(boxed, Some(inner))
       TyRefineT(inner, _) -> unbox_boxed_scalar(boxed, Some(inner))
       _ -> cat3("(", boxed, cat2(")", unbox_field_for(opt_ty)))
@@ -6000,21 +6094,25 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
   match x.kind {
     EInt(n)  -> cat2(int_to_string(n), "LL")
+    EFixed(span, ty) -> fixed_raw_c_lit(span, ty)
     EReal(r, _) -> real_c_lit(real_to_string(r))
     EBool(b) -> if b { "1" } else { "0" }
     EChar(c) -> int_to_string(char_to_int(c))
     EVar(name) -> cat2("kair_", name)
     EBinop(op, a, b) ->
       if raw_arith_is_wrapping_int(op, x.ty) {
-        # Int +/-/* wrap in two's complement by design (matches the
-        # boxed `kai_op_*` path). Compute in uint64_t and cast back so
-        # the wrap is well-defined C (6.3.1.3) rather than signed-
-        # overflow UB that `-fsanitize=undefined` flags — reachable
-        # the moment a hash mix (`acc * 31`) overflows. Real `*`/`+`
-        # and Int `/`/`%` keep the plain form (handled below).
-        concat_all(["((int64_t)((uint64_t)(",
+        # Int and fixed-width `+`/`-`/`*` wrap in two's complement by
+        # design (matches the boxed `kai_op_*` path). Compute in the
+        # unsigned of the width and cast back so the wrap is well-defined
+        # C (6.3.1.3) rather than signed-overflow UB that
+        # `-fsanitize=undefined` flags — reachable the moment a hash mix
+        # (`acc * 31`) overflows. Real `*`/`+` and Int `/`/`%` keep the
+        # plain form (handled below).
+        let st = raw_signed_c_type(x.ty)
+        let ut = raw_unsigned_c_type(x.ty)
+        concat_all(["((", st, ")((", ut, ")(",
                     emit_expr_raw(src, a, cx),
-                    ") ", raw_op_str(op), " (uint64_t)(",
+                    ") ", raw_op_str(op), " (", ut, ")(",
                     emit_expr_raw(src, b, cx),
                     ")))"])
       } else if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
@@ -6215,6 +6313,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       Some(TyByte) -> cat3("kai_byte((uint8_t)", int_to_string(n), ")")
       _            -> cat3("kai_int(", int_to_string(n), "LL)")
     }
+    EFixed(span, ty) -> fixed_box_c_lit(span, ty)
     EReal(r, _)     -> cat3("kai_real(", real_to_string(r), ")")
     EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
     EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
@@ -7511,7 +7610,8 @@ fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
     # Struct / opaque / fixed-width kinds never reach the basic shim —
     # a signature using one routes to `emit_ffi_v2_shim_body`. Belt for
     # exhaustiveness.
-    FfiRetFixed(_)   -> ffi_v1_v2_kind_error("fixed-width")
+    FfiRetFixed(_)    -> ffi_v1_v2_kind_error("fixed-width")
+    FfiRetFixedVal(_) -> ffi_v1_v2_kind_error("fixed-width")
     FfiRetStruct(n)  -> ffi_v1_v2_kind_error(n)
     FfiRetForeign(n) -> ffi_v1_v2_kind_error(n)
     FfiRetUnknown(t) -> concat_all([
@@ -7693,7 +7793,8 @@ fn ffi_c_ret_type_str(k: FfiRetKind) : String {
     FfiRetString -> "const char *"
     # FFI v2 kinds never reach these v1 helpers (the v2 shim path owns
     # them); the body is `#error`, never compiled. Belt for exhaustiveness.
-    FfiRetFixed(_)   -> "void"
+    FfiRetFixed(_)    -> "void"
+    FfiRetFixedVal(_) -> "void"
     FfiRetStruct(_)  -> "void"
     FfiRetForeign(_) -> "void"
     FfiRetUnknown(_) -> "void"  # body is `#error`, never compiled
@@ -7710,7 +7811,8 @@ fn ffi_c_param_type_str(p: Param) : String {
       FfiRetChar -> "int32_t"
       FfiRetString -> "const char *"
       FfiRetUnit -> "/* Unit param not supported */ void *"
-      FfiRetFixed(_)   -> "/* v2 fixed-width — v2 shim path */ void *"
+      FfiRetFixed(_)    -> "/* v2 fixed-width — v2 shim path */ void *"
+      FfiRetFixedVal(_) -> "/* v2 fixed-width — v2 shim path */ void *"
       FfiRetStruct(_)  -> "/* v2 struct — v2 shim path */ void *"
       FfiRetForeign(_) -> "/* v2 opaque — v2 shim path */ void *"
       FfiRetUnknown(_) -> "/* unsupported FFI param */ void *"
@@ -7763,7 +7865,8 @@ fn ffi_emit_arg_setup(params: [Param], i: Int) : String {
           "    /* Unit FFI arg #", int_to_string(i), " elided */\n"
         ])
         # FFI v2 kinds are handled by the v2 shim path, never here.
-        FfiRetFixed(_)   -> ffi_v1_v2_kind_error("fixed-width")
+        FfiRetFixed(_)    -> ffi_v1_v2_kind_error("fixed-width")
+        FfiRetFixedVal(_) -> ffi_v1_v2_kind_error("fixed-width")
         FfiRetStruct(n)  -> ffi_v1_v2_kind_error(n)
         FfiRetForeign(n) -> ffi_v1_v2_kind_error(n)
         FfiRetUnknown(t) -> concat_all([
@@ -9538,6 +9641,7 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String], op_arities: [OpAr],
     # blocked by stage 1's lack of row polymorphism on function-param types).
     EInt(_)        -> k
     EReal(_, _)       -> k
+    EFixed(_, _)      -> k
     EBool(_)       -> k
     EChar(_)       -> k
     EUnit          -> k
@@ -11749,6 +11853,10 @@ fn mangle_ty(t: Ty) : String {
     TyChar   -> "Char"
     TyUnit   -> "Unit"
     TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
     TyHandle   -> "Handle"
     TyListT(inner) -> concat_all(["L_", mangle_ty(inner), "_E"])
     TyFnT(ps, ret, _) -> concat_all([
@@ -12222,6 +12330,7 @@ fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[Str
     EVar(_)             -> false
     EInt(_)             -> false
     EReal(_, _)            -> false
+    EFixed(_, _)           -> false
     EStr(_, _)          -> false
     EBool(_)            -> false
     EChar(_)            -> false
