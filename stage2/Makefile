@@ -2995,6 +2995,7 @@ test-sugars: $(TARGET) build
 	  exp_err=../examples/sugars/$$name.err.expected; \
 	  case "$$name" in \
 	    complex_literal_*) extra_flags="--path ../stdlib" ;; \
+	    coll_literal_*) extra_flags="--path ../stdlib" ;; \
 	    *) extra_flags="" ;; \
 	  esac; \
 	  if [ -f $$exp_err ]; then \

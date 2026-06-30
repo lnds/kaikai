@@ -342,6 +342,29 @@ is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
 parameters. It is not an RHS expression form. See the
 [Patterns section](#patterns-highlights-see-kai-info-match).
 
+Collection literals — `%{ }` is an immutable `Map`, `%[ ]` an
+immutable `Set`. The delimiter discriminates with no ambiguity, so
+`%{}` and `%[]` are the distinct empties. `...` spreads the immutable
+sibling first; later entries override (last write wins). Prefix `%`
+opens a literal only in primary position — infix `a % b` stays modulo.
+
+```kaikai
+import collections.map
+import collections.set
+
+fn main() : Unit / Stdout = {
+  let m = %{ "a": 1, "b": 2 }                  # Map literal
+  let s = %[ 1, 2, 3 ]                          # Set literal
+  let em = %{}                                  # empty Map
+  let es = %[]                                  # empty Set
+  let n = %{ ...m, "c": 3 }                     # spread + extend
+  let t = %[ ...s, 4 ]                          # spread + insert
+  let hit = match m["a"] { Some(v) -> v  None -> 0 }
+  let empties = map.size(em) + set.size(es)     # both 0
+  Stdout.print("size=#{int_to_string(map.size(n))} set=#{int_to_string(set.size(t))} a=#{int_to_string(hit)} empties=#{int_to_string(empties)} mod=#{int_to_string(10 % 3)}")
+}
+```
+
 Operators by precedence (looser at the bottom):
 
 ```text
