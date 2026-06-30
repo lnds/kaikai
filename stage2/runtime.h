@@ -5718,6 +5718,21 @@ static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
     }
 }
 
+/* Division for two same-tag fixed-width boxes. Unlike the wrapping
+ * add/sub/mul, the result depends on signedness, so each width divides
+ * in its own signed/unsigned domain (truncated toward zero, C
+ * semantics). A zero divisor aborts. NULL on a non-fixed-width pair. */
+static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int32(a->as.i32 / y); }
+        case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint32(a->as.u32 / y); }
+        case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint64(a->as.u64 / y); }
+        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int128(kai_i128_load(a) / y); }
+        default: return NULL;
+    }
+}
+
 static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
@@ -5755,7 +5770,8 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
         r = kai_int(kai_intf(a) / kai_intf(b));
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
-    } else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
+    } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
