@@ -1,0 +1,257 @@
+#[doc("""
+Arbitrary-precision signed integers, pure kaikai — no GMP, no C
+dependency, no compiler primitive.
+
+The carrier is a sign-magnitude sum type:
+
+  `Small(Int)`        the value fits a 64-bit signed `Int` and is held
+                      inline — no heap allocation.
+  `Big(sign, mag)`    `sign` is `-1` or `+1`; `mag` is the magnitude as
+                      little-endian base-2^32 limbs (`mag[0]` is least
+                      significant) with no high zero limbs.
+
+A value above `Int` range promotes to `Big`; it never demotes inside a
+loop. The one demotion is canonical: `make` collapses a `Big` whose
+value fits `Int` back to `Small`, so every integer has exactly one
+representation. That biyection is what makes `Eq`/`Hash` direct: equal
+values share an identical shape.
+
+Zero is always `Small(0)`. `i64::MIN` has magnitude 2^63 (not an
+`Int`), so it is the one `Int`-range value held as `Big` — keeping it
+out of `Small` removes the `negate(i64::MIN)` overflow trap from every
+arithmetic path.
+
+The magnitude layer (carry discipline, schoolbook multiply, limb
+division) lives in `bigint_limbs`; decimal/string conversion lives in
+`bigint_convert`; protocol impls in `bigint_proto`.
+""")]
+
+import math.bits
+import math.bigint_limbs.{sig_len, mag_cmp, mag_add, mag_sub, mag_mul, limb_lo, limb_hi}
+
+# ---- Representation ----------------------------------------------
+
+#[doc("An arbitrary-precision signed integer. `Small` holds an inline 64-bit value; `Big` holds sign-magnitude with little-endian base-2^32 limbs.")]
+pub type BigInt = Small(Int) | Big(Int, Array[Int])
+
+# Largest magnitude representable inline as `Small`: 2^63 - 1. The value
+# 2^63 (the magnitude of `i64::MIN`) does not fit a signed Int, so it
+# lives as `Big`.
+fn small_mag_max() : Int = 9223372036854775807
+
+# True when a magnitude of significant length `n` is within `Small`
+# range. (2^31-1)*2^32 + (2^32-1) == 2^63-1 exactly, so a 2-limb value
+# fits iff its high limb is below 2^31.
+fn fits_small(mag: Array[Int], n: Int) : Bool =
+  if n <= 1 { true }
+  else if n == 2 { mag[1] <= bit_shl(1, 31) - 1 }
+  else { false }
+
+# Fold a magnitude known to fit `Int` range to its value.
+fn mag_to_int(mag: Array[Int], n: Int) : Int = mag_to_int_from(mag, n - 1, 0)
+
+fn mag_to_int_from(mag: Array[Int], i: Int, acc: Int) : Int =
+  if i < 0 { acc }
+  else { mag_to_int_from(mag, i - 1, acc * bit_shl(1, 32) + mag[i]) }
+
+# ---- Canonical constructor (the single normalization choke point) ----
+
+#[doc("""
+Builds a BigInt from a sign (`<0` negative, else non-negative) and a
+possibly non-canonical magnitude: trims high zero limbs, returns
+`Small(0)` on zero, demotes to `Small` when the value fits `Int`, else
+keeps a canonical `Big`. Every arithmetic op routes its result through
+this, so the one-representation-per-integer invariant holds everywhere.
+""")]
+pub fn make(sign: Int, mag: Array[Int]) : BigInt = {
+  let n = sig_len(mag)
+  if n == 0 { Small(0) }
+  else if fits_small(mag, n) {
+    let v = mag_to_int(mag, n)
+    Small(if sign < 0 { 0 - v } else { v })
+  }
+  else { Big(if sign < 0 { 0 - 1 } else { 1 }, mag) }
+}
+
+# ---- Constructors ------------------------------------------------
+
+#[doc("The BigInt `0`.")]
+pub fn zero() : BigInt = Small(0)
+
+#[doc("The BigInt `1`.")]
+pub fn one() : BigInt = Small(1)
+
+#[doc("Lifts a 64-bit `Int`. Values in `[-(2^63-1), 2^63-1]` stay inline; `i64::MIN` promotes to `Big` (its magnitude 2^63 does not fit a signed Int).")]
+pub fn from_int(n: Int) : BigInt =
+  if n == 0 - small_mag_max() - 1 { Big(0 - 1, min_i64_mag()) }
+  else { Small(n) }
+
+# Magnitude of `i64::MIN` (2^63) as base-2^32 limbs: [0, 2^31].
+fn min_i64_mag() : Array[Int] = {
+  let mag = array_make(2, 0)
+  mag[1] := bit_shl(1, 31)
+  mag
+}
+
+# ---- Sign / magnitude views --------------------------------------
+
+#[doc("The sign of `x` as `-1`, `0`, or `1`.")]
+pub fn sign(x: BigInt) : Int = match x {
+  Small(n) -> if n < 0 { 0 - 1 } else if n > 0 { 1 } else { 0 }
+  Big(s, _) -> s
+}
+
+#[doc("The magnitude of `x` as canonical base-2^32 limbs.")]
+pub fn magnitude(x: BigInt) : Array[Int] = match x {
+  Small(n) -> int_magnitude(n)
+  Big(_, mag) -> mag
+}
+
+# Magnitude of an `Int` (never `i64::MIN`, always `Big`) as 1-2 limbs.
+# The buffer is built and returned inline, so `Mutable` masks.
+fn int_magnitude(n: Int) : Array[Int] = {
+  let m = if n < 0 { 0 - n } else { n }
+  let hi = limb_hi(m)
+  if hi == 0 {
+    let out = array_make(1, 0)
+    out[0] := limb_lo(m)
+    out
+  } else {
+    let out = array_make(2, 0)
+    out[0] := limb_lo(m)
+    out[1] := hi
+    out
+  }
+}
+
+# ---- Predicates --------------------------------------------------
+
+#[doc("True when `x` is zero.")]
+pub fn is_zero(x: BigInt) : Bool = match x {
+  Small(n) -> n == 0
+  Big(_, _) -> false
+}
+
+#[doc("True when `x` is strictly negative.")]
+pub fn is_negative(x: BigInt) : Bool = sign(x) < 0
+
+#[doc("True when `x` is strictly positive.")]
+pub fn is_positive(x: BigInt) : Bool = sign(x) > 0
+
+# ---- Sign manipulation -------------------------------------------
+
+#[doc("Negates `x`. `neg(zero())` is `zero()`.")]
+pub fn neg(x: BigInt) : BigInt = match x {
+  Small(n) -> Small(0 - n)
+  Big(s, mag) -> Big(0 - s, mag)
+}
+
+#[doc("The absolute value of `x`.")]
+pub fn abs(x: BigInt) : BigInt = match x {
+  Small(n) -> if n < 0 { from_int(0 - n) } else { Small(n) }
+  Big(_, mag) -> Big(1, mag)
+}
+
+# ---- Conversion to Int -------------------------------------------
+
+#[doc("`Some(n)` when `x` fits a 64-bit signed `Int`, else `None`. By canonical form the only `Big` that fits is `i64::MIN`.")]
+pub fn to_int(x: BigInt) : Option[Int] = match x {
+  Small(n) -> Some(n)
+  Big(s, mag) ->
+    if s < 0 and sig_len(mag) == 2 and mag[0] == 0 and mag[1] == bit_shl(1, 31) {
+      Some(0 - small_mag_max() - 1)
+    } else { None }
+}
+
+# ====================================================================
+# High-level arithmetic. Each op tries the inline `Small` fast path
+# first (no allocation), promoting to magnitude arithmetic only when an
+# operand is `Big` or the result overflows `Int`.
+# ====================================================================
+
+#[doc("Compares `a` and `b`: `-1` if `a < b`, `0` if equal, `1` if `a > b`.")]
+pub fn compare(a: BigInt, b: BigInt) : Int = match a {
+  Small(x) -> match b {
+    Small(y) -> if x < y { 0 - 1 } else if x > y { 1 } else { 0 }
+    _ -> compare_signed(a, b)
+  }
+  _ -> compare_signed(a, b)
+}
+
+fn compare_signed(a: BigInt, b: BigInt) : Int = {
+  let sa = sign(a)
+  let sb = sign(b)
+  if sa < sb { 0 - 1 }
+  else if sa > sb { 1 }
+  else if sa == 0 { 0 }
+  else {
+    let c = mag_cmp(magnitude(a), magnitude(b))
+    if sa < 0 { 0 - c } else { c }
+  }
+}
+
+#[doc("Sum of `a` and `b`.")]
+pub fn add(a: BigInt, b: BigInt) : BigInt = match a {
+  Small(x) -> match b {
+    Small(y) -> add_small(x, y)
+    _ -> add_general(a, b)
+  }
+  _ -> add_general(a, b)
+}
+
+# Inline `Small + Small`. The sum overflows `Int` exactly when both
+# operands share a sign and the wrapped sum flips it; otherwise
+# `from_int` settles it (promoting `i64::MIN`).
+fn add_small(x: Int, y: Int) : BigInt = {
+  let s = x + y
+  if x >= 0 and y >= 0 and s < 0 { add_general(Small(x), Small(y)) }
+  else if x < 0 and y < 0 and s >= 0 { add_general(Small(x), Small(y)) }
+  else { from_int(s) }
+}
+
+# Magnitude add/subtract driven by signs: like signs add magnitudes;
+# unlike signs subtract the smaller from the larger, taking its sign.
+fn add_general(a: BigInt, b: BigInt) : BigInt =
+  if is_zero(a) { b }
+  else if is_zero(b) { a }
+  else { add_nonzero(a, b) }
+
+fn add_nonzero(a: BigInt, b: BigInt) : BigInt = {
+  let sa = sign(a)
+  let ma = magnitude(a)
+  let mb = magnitude(b)
+  if sa == sign(b) { make(sa, mag_add(ma, mb)) }
+  else {
+    let c = mag_cmp(ma, mb)
+    if c == 0 { Small(0) }
+    else if c > 0 { make(sa, mag_sub(ma, mb)) }
+    else { make(sign(b), mag_sub(mb, ma)) }
+  }
+}
+
+#[doc("Difference `a - b`.")]
+pub fn sub(a: BigInt, b: BigInt) : BigInt = add(a, neg(b))
+
+#[doc("Product of `a` and `b`.")]
+pub fn mul(a: BigInt, b: BigInt) : BigInt = match a {
+  Small(x) -> match b {
+    Small(y) -> mul_small(x, y)
+    _ -> mul_general(a, b)
+  }
+  _ -> mul_general(a, b)
+}
+
+# Inline `Small * Small`. Zero short-circuits; the product overflows
+# `Int` exactly when dividing it back does not recover an operand (or it
+# is `i64::MIN`, which `Small` cannot hold).
+fn mul_small(x: Int, y: Int) : BigInt =
+  if x == 0 or y == 0 { Small(0) }
+  else {
+    let p = x * y
+    if p / x == y and p != 0 - small_mag_max() - 1 { Small(p) }
+    else { mul_general(Small(x), Small(y)) }
+  }
+
+fn mul_general(a: BigInt, b: BigInt) : BigInt =
+  if is_zero(a) or is_zero(b) { Small(0) }
+  else { make(sign(a) * sign(b), mag_mul(magnitude(a), magnitude(b))) }

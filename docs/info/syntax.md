@@ -379,6 +379,39 @@ intervening space; `42i` without a width stays a complex literal.
 In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
 
+### Arbitrary-precision integers (`BigInt`)
+
+`BigInt` (`stdlib/math/bigint.kai`) is an arbitrary-precision signed
+integer — pure kaikai, no external dependency. It is an opt-in stdlib
+type, so reach for it with `import math.bigint`. The `n` literal suffix
+is sugar for `bigint.from_int`: `99n` builds the `BigInt` `99`. The
+suffix only covers `Int`-range literals (the lexer decodes the digits
+as a 64-bit value first); for values beyond `Int`, build from a string
+with `bigint.from_string("123…")`.
+
+```kaikai
+import math.bigint
+import math.bigint_convert as bc
+import math.bigint_proto
+
+fn main() : Unit / Stdout = {
+  let a = 1000000007n                          # `n` suffix → BigInt
+  let sq = bigint.mul(a, a)                    # exact, even past 2^64
+  Stdout.print(show(sq))                       # Show renders decimal
+  match bc.from_string("340282366920938463463374607431768211456") {
+    Some(big) -> Stdout.print(bc.to_string(bigint.add(big, a)))
+    None      -> Stdout.print("parse error")
+  }
+}
+```
+
+`BigInt` is sign-magnitude with an inline fast path: values in `Int`
+range stay unboxed; larger values use a heap limb array. `add`, `sub`,
+`mul`, `divmod`, and `compare` are exact; `Show`, `Eq`, `Ord`, and
+`Hash` are implemented (`Eq`/`Hash` agree because every integer has one
+canonical form). It is distinct from the fixed-width types above — those
+wrap at a fixed width; `BigInt` never overflows.
+
 ## Records
 
 ```kaikai
