@@ -838,7 +838,7 @@ ergonomic gap.
 The genuinely irreducible case where C wins over B is **dispatch by
 runtime value (not type) extensible post-hoc** — and that is
 expressible in kaikai with `Map[K, V]` + first-class functions
-(`Map.from_pairs([(Compact, ser_compact), ...])`), not a language
+(`Map.from([(Compact, ser_compact), ...])`), not a language
 feature.
 
 ### Why C costs more than it gains for kaikai
