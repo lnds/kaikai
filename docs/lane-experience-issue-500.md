@@ -58,6 +58,17 @@ remaining work was the debug-info half — DWARF emission, symbol stripping on
    Six DI prims + the debug marker × two tables. Both derive their resolver names
    from the table, so one edit per stage covers resolver + emit.
 
+5. **`bin/kai` compiles a `$tmp` copy, not the user's file.** To avoid dropping a
+   `.o` in the user's tree, the native path copies the entry `.kai` to `$tmp` and
+   compiles that — so kaic2 baked the *ephemeral* `$tmp` path into the DIFile +
+   `comp_dir`. `lldb` then could not open the source, and the panic trace named a
+   path that no longer existed. Caught only by trying `lldb breakpoint set --file
+   … --line …` (the DWARF-present + line-table checks all passed against the
+   `$tmp` path). Fix: `bin/kai` hands kaic2 the original absolute path via
+   `KAI_DEBUG_SRC`; `native_di_enable` splits it into (dir, base). Lesson: a green
+   "DWARF is present" check is necessary but not sufficient — only an actual
+   `lldb`/`gdb` open proves the paths are usable.
+
 ## Why the panic trace is best-effort, and what it does NOT do
 
 The trace resolves via a shell-out to the platform symboliser (`atos`/`addr2line`)
