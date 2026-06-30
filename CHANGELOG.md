@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.96.0 (2026-06-29)
+
+### Added
+
+- **install**: rustup-style curl|sh installer + kai upgrade self-update (#998)
+
 ## v0.95.0 (2026-06-29)
 
 ### Added
