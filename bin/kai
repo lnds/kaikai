@@ -729,12 +729,14 @@ Options:
                        portable C-text path (bootstrap + parity oracle).
                        KAI_BACKEND env var overrides the default; this
                        flag overrides both.
-  --release            Optimise with -O2 (default). For the native
-                       backend this runs the LLVM \`default<O2>\` pipeline
-                       in-process — parity with the clang -O2 the C
-                       path gets.
-  --debug              Optimise with -O0: fast compile, no inlining,
-                       symbols kept. Native runs \`default<O0>\`.
+  --release            Ship profile: -O2 \`default<O2>\` (parity with the
+                       clang -O2 the C path gets) AND strip symbols, so
+                       the binary is smaller than the default. No DWARF.
+  --debug              Debug profile: -O0 (fast compile, no inlining),
+                       symbols kept, AND full DWARF line tables keyed to
+                       the .kai source. \`lldb\`/\`gdb\` break on kaikai
+                       lines; panics print the .kai:line stack trace.
+                       Native only (the C backend ignores it).
   --holes              Report every typed hole (\`?\` / \`?name\`) with
                        expected type, in-scope bindings, and candidate
                        fillers, then exit. No binary is produced. See
@@ -1468,7 +1470,7 @@ run_report_mode() {
 report_holes() { run_report_mode "$@"; }
 
 cmd_build() {
-  src=""; out=""; report_mode=""; backend_cli=""; opt_level=""
+  src=""; out=""; report_mode=""; backend_cli=""; opt_level=""; build_mode=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
@@ -1509,14 +1511,20 @@ cmd_build() {
           c|native) ;;
           *) die "--backend must be 'c' or 'native' (got: $backend_cli)" ;;
         esac ;;
-      # L4 (issue #498): optimisation profile for the native backend.
-      # Default (no flag) is `--release` = `-O2`, matching the `cc -O2`
-      # the C path gets. `--debug` drops to `-O0` (fast compile, no
-      # inlining, symbols kept). Threaded to the in-process libLLVM
-      # pipeline via KAI_NATIVE_OPT (read by the emit prim); the C
-      # backend ignores it (it already gets -O2 / -O0 from CFLAGS).
-      --debug)   opt_level="0"; shift ;;
-      --release) opt_level="2"; shift ;;
+      # Build profiles (issue #500). Three modes, distinct on TWO axes —
+      # opt level AND debug-info — so the default and --release share an
+      # opt level (2) yet differ on symbol stripping, and --debug is the
+      # only mode that emits DWARF:
+      #   default (no flag) : -O2, symbols kept, NO DWARF  (fast iteration)
+      #   --release         : -O2, stripped,     NO DWARF  (ship it)
+      #   --debug           : -O0, symbols kept, full DWARF (source debug)
+      # `opt_level` threads to the libLLVM pass pipeline via KAI_NATIVE_OPT;
+      # `build_mode` threads the debug-info + strip decisions via
+      # KAI_BUILD_MODE (the native emit prim reads it to gate DWARF; the
+      # link step below reads it to strip). The C backend ignores both (it
+      # already gets -O2 / -O0 from CFLAGS, and DWARF is out of its scope).
+      --debug)   opt_level="0"; build_mode="debug"; shift ;;
+      --release) opt_level="2"; build_mode="release"; shift ;;
       -*) die "unknown flag: $1 (see 'kai build --help')" ;;
       *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
     esac
@@ -1526,6 +1534,7 @@ cmd_build() {
   set -- $(resolve_backend "$backend_cli")
   backend="$1"; backend_origin="$2"
   export KAI_NATIVE_OPT="${opt_level:-2}"
+  export KAI_BUILD_MODE="${build_mode:-default}"
   if [ -n "$report_mode" ]; then
     [ -z "$out" ] || die "$report_mode does not produce a binary; drop -o <out>"
     # Report modes run the typer only — backend selection is irrelevant.
@@ -1561,6 +1570,18 @@ cmd_build() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
   compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$out" "build"
+  # --release (issue #500): strip the linked binary so a shipped artifact
+  # is smaller than the symbol-keeping default. Plain `strip` removes the
+  # local + debug symbols (the bulk: the native object names every emitted
+  # kaikai fn + every `_.str` constant) while preserving the dynamic symbol
+  # table the loader resolves against — semantics shared by the macOS
+  # `strip` and GNU binutils `strip`, so the binary still runs. Runs only on
+  # a successful build of an actual file. A strip failure is non-fatal — the
+  # unstripped binary already runs — so a `strip` missing from PATH degrades
+  # to "not smaller", never to "no binary".
+  if [ "$build_mode" = "release" ] && [ -f "$out" ]; then
+    strip "$out" 2>/dev/null || true
+  fi
 }
 
 cmd_run() {
