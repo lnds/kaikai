@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -188,11 +188,19 @@ test-arena:
 test-heap-limit: kaic2
 	@$(MAKE) -C stage2 test-heap-limit
 
+# Issue #1012 — the whole compiler links under --emit=c-modular (shared RC
+# free-list pools). Builds stage2/main.kai through bin/kai's KAI_MODULAR
+# path and smokes --version; a regression of the shared-pool guard trips it
+# at link time (multi-GB .bss). Costly (a full modular self-compile), so it
+# rides tier1-shard-1 with the other self-compiles, not the light pool.
+test-modular-selfhost: kaic2
+	@$(MAKE) -C stage2 test-modular-selfhost
+
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
-	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke + kai doc smoke"
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
+	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
 # grout dominates the PR critical path; it is CPU-bound + independent, so we
@@ -218,12 +226,12 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
-#     test-core-cache, light(1/2), light(2/2), demos-no-regression,
-#     test-fmt, test-fmt-selfhost, test-bench, test-check,
-#     test-library-mode, test-diagnostics-collected, test-negative,
-#     test-stdlib-modules, test-packages, test-private-type-shadow-audit,
-#     test-private-record-shadow-audit, test-canonical-aliases,
-#     test-info, test-doc }
+#     test-core-cache, test-modular-selfhost, light(1/2), light(2/2),
+#     demos-no-regression, test-fmt, test-fmt-selfhost, test-bench,
+#     test-check, test-library-mode, test-diagnostics-collected,
+#     test-negative, test-stdlib-modules, test-packages,
+#     test-private-type-shadow-audit, test-private-record-shadow-audit,
+#     test-canonical-aliases, test-info, test-doc }
 # equals exactly the prerequisites of `tier1` (light(1/2) ∪ light(2/2)
 # == TEST_LIGHT_TARGETS, proven by the round-robin partition in
 # stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
@@ -232,9 +240,10 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
+	$(MAKE) -C stage2 test-modular-selfhost
 	$(MAKE) demos-no-regression
 	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc)"
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + whole-compiler c-modular link + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc)"
 
 tier1-shard-2: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=2

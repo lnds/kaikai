@@ -1321,6 +1321,21 @@ compile_to_binary() {
     # emitted `#include "runtime.h"` resolves without an -I race against
     # a stale system copy. (kai_types.h includes runtime.h by name.)
     cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
+    # runtime.h declares the multi-MB RC free-list pools `static`, so each
+    # TU would replicate them and overflow .bss at the compiler's TU count.
+    # KAI_SEPARATE_COMPILATION turns the pools into one shared `extern`
+    # copy; the single owner TU (KAI_RUNTIME_OWNER) carries the definition.
+    # Owner is the root module; fall back to the first TU so there is always
+    # exactly one (a zero-owner build would fail to link the pool symbols).
+    mod_defs="-DKAI_SEPARATE_COMPILATION=1"
+    mod_owner="__root__.c"
+    [ -f "$moddir/$mod_owner" ] || mod_owner="$(basename "$(ls "$moddir"/*.c | head -1)")"
+    # A deeply-recursive program (the self-hosted compiler) overruns the
+    # 8 MB default macOS main-thread stack, which is fixed at link time.
+    # Match the single-TU compiler link. Linux grows the stack via ulimit,
+    # so it needs no flag.
+    mod_ldstack=""
+    [ "$(uname -s)" = "Darwin" ] && mod_ldstack="-Wl,-stack_size,0x8000000"
     # Backend incremental lever: compile the per-module .c in PARALLEL
     # and cache each .o by content hash. The key folds the compiler, its
     # flags, the target arch and the shared headers (so any header edit
@@ -1339,7 +1354,7 @@ compile_to_binary() {
       mkdir -p "$cachedir" 2>/dev/null || cachedir=""
     fi
     if [ -n "$cachedir" ]; then
-      common="$( { printf '%s\n%s\n%s\n' "$CC" "$CFLAGS" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
+      common="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$mod_defs" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
     fi
     # Per-module worker (one cc per file, fanned out by xargs -P): a key
     # hit copies the cached .o; a miss compiles then stores it atomically
@@ -1353,18 +1368,22 @@ compile_to_binary() {
     export KAI_MC_CC="$CC" KAI_MC_CFLAGS="$CFLAGS" \
       KAI_MC_INC="-I $moddir -I $RUNTIME_INC_C -I $RUNTIME_INC" \
       KAI_MC_CACHE="$cachedir" KAI_MC_COMMON="$common" \
-      KAI_MC_HASHER="$hasher"
+      KAI_MC_HASHER="$hasher" \
+      KAI_MC_DEFS="$mod_defs" KAI_MC_OWNER="$mod_owner" \
+      KAI_MC_OWNER_DEF="-DKAI_RUNTIME_OWNER=1"
     outcomes="$(printf '%s\n' "$moddir"/*.c | xargs -P "$jobs" -n 1 sh -c '
       cf="$1"; of="${cf%.c}.o"
+      defs="$KAI_MC_DEFS"
+      [ "${cf##*/}" = "$KAI_MC_OWNER" ] && defs="$defs $KAI_MC_OWNER_DEF"
       key=""
       if [ -n "$KAI_MC_CACHE" ]; then
-        key="$( { printf "%s\n" "$KAI_MC_COMMON"; cat "$cf"; } | $KAI_MC_HASHER | awk "{print \$1}" )"
+        key="$( { printf "%s\n%s\n" "$KAI_MC_COMMON" "$defs"; cat "$cf"; } | $KAI_MC_HASHER | awk "{print \$1}" )"
       fi
       if [ -n "$key" ] && [ -f "$KAI_MC_CACHE/$key.o" ]; then
         cp "$KAI_MC_CACHE/$key.o" "$of" || exit 1
       else
         # shellcheck disable=SC2086
-        $KAI_MC_CC $KAI_MC_CFLAGS $KAI_MC_INC -c "$cf" -o "$of" || {
+        $KAI_MC_CC $KAI_MC_CFLAGS $KAI_MC_INC $defs -c "$cf" -o "$of" || {
           echo "kai: error: modular compile failed for ${cf##*/}" >&2; exit 1; }
         echo M
         if [ -n "$key" ]; then
@@ -1381,7 +1400,7 @@ compile_to_binary() {
     fi
     # Link all module objects.
     # shellcheck disable=SC2086
-    $CC $CFLAGS "$moddir"/*.o -o "$out" -lm \
+    $CC $CFLAGS $mod_ldstack "$moddir"/*.o -o "$out" -lm \
       || die "modular link failed"
   else
     # shellcheck disable=SC2086
