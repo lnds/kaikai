@@ -7,6 +7,7 @@
 #   3. Every topic page is non-empty (`kai info <topic>` returns text).
 #   4. Every topic page emits valid JSON under --json.
 #   5. The `syntax` topic exists (load-bearing — CLAUDE.md cites it).
+#   6. `kai info -k <keyword>` searches page bodies, not just names.
 #
 # Catches: deleted .md, broken cmd_info dispatcher, JSON-escape
 # regressions, awk shape drift.
@@ -73,4 +74,13 @@ done
 # 5. The `syntax` topic exists (CLAUDE.md cites it as load-bearing).
 "$KAI" info syntax >/dev/null 2>&1 || fail "'kai info syntax' must exist; CLAUDE.md cites it"
 
-echo "test-info: OK — $count topics, plain + JSON output"
+# 6. `-k` searches page bodies. `tuple` lives only in syntax's body
+#    (§N-tuples), so a body-search must surface `syntax`.
+kw_out="$("$KAI" info -k tuple 2>&1)" || fail "'kai info -k tuple' exited non-zero (body search regressed)"
+echo "$kw_out" | grep -q "syntax" || fail "'kai info -k tuple' did not surface 'syntax'"
+"$KAI" info -k nursery >/dev/null 2>&1 || fail "'kai info -k nursery' exited non-zero (name/tagline search regressed)"
+if "$KAI" info -k zzznotarealword >/dev/null 2>&1; then
+  fail "'kai info -k zzznotarealword' should exit non-zero"
+fi
+
+echo "test-info: OK — $count topics, plain + JSON output, -k body search"
