@@ -41,6 +41,13 @@
 #endif
 #if defined(__linux__)
 #  define _DEFAULT_SOURCE 1
+/* glibc hides `dladdr` + `Dl_info` (a GNU extension, not C99) behind
+ * _GNU_SOURCE; the --debug panic backtrace (#500) needs them to de-slide
+ * PIE frames. Must be defined BEFORE any include, like the macros above —
+ * a strict `-std=c99` C-only bootstrap rejects the implicit declaration
+ * otherwise (macOS libSystem exposes them regardless, which is why a mac
+ * build did not catch it). _GNU_SOURCE implies _DEFAULT_SOURCE. */
+#  define _GNU_SOURCE 1
 #endif
 
 #ifndef KAI_RUNTIME_H
