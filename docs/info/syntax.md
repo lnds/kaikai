@@ -342,28 +342,8 @@ is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
 parameters. It is not an RHS expression form. See the
 [Patterns section](#patterns-highlights-see-kai-info-match).
 
-Collection literals — `%{ }` is an immutable `Map`, `%[ ]` an
-immutable `Set`. The delimiter discriminates with no ambiguity, so
-`%{}` and `%[]` are the distinct empties. `...` spreads the immutable
-sibling first; later entries override (last write wins). Prefix `%`
-opens a literal only in primary position — infix `a % b` stays modulo.
-
-```kaikai
-import collections.map
-import collections.set
-
-fn main() : Unit / Stdout = {
-  let m = %{ "a": 1, "b": 2 }                  # Map literal
-  let s = %[ 1, 2, 3 ]                          # Set literal
-  let em = %{}                                  # empty Map
-  let es = %[]                                  # empty Set
-  let n = %{ ...m, "c": 3 }                     # spread + extend
-  let t = %[ ...s, 4 ]                          # spread + insert
-  let hit = match m["a"] { Some(v) -> v  None -> 0 }
-  let empties = map.size(em) + set.size(es)     # both 0
-  Stdout.print("size=#{int_to_string(map.size(n))} set=#{int_to_string(set.size(t))} a=#{int_to_string(hit)} empties=#{int_to_string(empties)} mod=#{int_to_string(10 % 3)}")
-}
-```
+`Map` and `Set` have their own literals (`%{ }` / `%[ ]`) — see the
+[Collections section](#collections).
 
 Operators by precedence (looser at the bottom):
 
@@ -478,6 +458,104 @@ fn main() : Unit / Stdout = {
 `make` panics on a zero denominator; `recip`/`div` return `Option` when
 the divisor is zero. `Show` renders `num/den` (whole numbers drop the
 denominator).
+
+## Collections
+
+kaikai builds every collection the same way: a literal that names what
+it builds by itself, a runtime constructor `X.from(list)`, and `.to_X`
+methods to cross between the immutable and mutable siblings. A literal
+is **always** an immutable, pure value; the crossing to a mutable
+collection is an explicit, local token.
+
+### Literals — immutable, pure
+
+`%{ k: v }` is an immutable `Map`; `%[ e ]` an immutable `Set`. The
+delimiter discriminates with no ambiguity, so `%{}` and `%[]` are the
+distinct empties. `...` spreads the immutable sibling — a single spread,
+first; later entries override (last write wins). `m[k]` reads a `Map`
+and returns `Option[v]`.
+
+```kaikai
+import collections.map
+import collections.set
+import core.io
+
+fn main() : Unit / Stdout {
+  let m = %{ "a": 1, "b": 2 }                  # Map  (immutable, pure)
+  let s = %[ 1, 2, 3 ]                          # Set  (immutable, pure)
+  let em : Map[String, Int] = %{}              # empty Map
+  let es : Set[Int] = %[]                       # empty Set
+  let n = %{ ...m, "c": 3, "a": 9 }            # spread first; "a" -> 9
+  let t = %[ ...s, 4, 5 ]                       # spread then add
+  let hit = match m["a"] { Some(v) -> v  None -> 0 }   # m[k] : Option[v]
+  println("#{hit} #{map.size(n)} #{set.size(t)} #{map.size(em)} #{set.size(es)}")
+}
+```
+
+A `Map` literal is immutable, so an indexed write `m[k] := v` is a
+compile error — use `map.put(m, k, v)` and rebind. To mutate in place,
+cross to a `HashMap` first (see *Immutable and mutable* below).
+
+### Building from a runtime list
+
+One verb `from` per module turns a list into a collection. `array.from`
+needs no caller sentinel — the element type is inferred from the input,
+and an empty list still yields a length-0 array of the right type.
+
+```kaikai
+import collections.map
+import collections.set
+import core.io
+
+fn main() : Unit / Stdout + Mutable {
+  let m = map.from([Pair { fst: "a", snd: 1 }, Pair { fst: "b", snd: 2 }])
+  let s = set.from([10, 20, 30])
+  let a = array.from([1, 2, 3])                 # element slot inferred
+  println("#{map.size(m)} #{set.size(s)} #{array_length(a)}")
+}
+```
+
+### Immutable and mutable
+
+`Map`/`Set` (literal, persistent, pure) and `HashMap`/`HashSet`
+(hash-backed, `Mutable`) are separate types. The four `.to_X` methods
+(`collections.convert`) are the only crossing, and each makes the
+mutability decision visible at the call site — never driven by a remote
+annotation.
+
+```kaikai
+import collections.map
+import collections.set
+import collections.hashmap
+import collections.hashset
+import collections.convert
+import core.io
+
+fn main() : Unit / Stdout + Mutable {
+  let m = %{ "a": 1, "b": 2 }
+  let h = m.to_hashmap()                        # Map -> HashMap (mutable)
+  hashmap.put(h, "c", 3)                        # mutate the open handle
+  let frozen = h.to_map()                       # HashMap -> Map (freeze)
+  let s = %[ 1, 2, 3 ]
+  let hs = s.to_hashset()                       # Set -> HashSet
+  hashset.add(hs, 4)
+  let fs = hs.to_set()                          # HashSet -> Set
+  println("#{map.size(m)} #{map.size(frozen)} #{set.size(s)} #{set.size(fs)}")
+}
+```
+
+The source `m` and `s` are untouched: `map.size(m)` stays `2`,
+`set.size(s)` stays `3`. The `Mutable` effect rides only the functions
+that open a mutable handle.
+
+### Why the `%` sigil and the `:` separator
+
+Bare `{ }` and `[ ]` are already taken — a record/block and a list — so
+a map or set literal carries a `%` prefix to stay unambiguous in one
+token of lookahead. The `%` opens a literal only in primary position;
+infix `a % b` is still modulo. The map separator is `:` (not `=>`,
+which is the lambda arrow), matching the `k: v` shape records and type
+annotations already use.
 
 ## Records
 
