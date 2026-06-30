@@ -412,6 +412,50 @@ range stay unboxed; larger values use a heap limb array. `add`, `sub`,
 canonical form). It is distinct from the fixed-width types above — those
 wrap at a fixed width; `BigInt` never overflows.
 
+### Arbitrary-precision decimal (`DecimalBig`)
+
+`DecimalBig` (`stdlib/decimal_big.kai`) is fixed-point with a `BigInt`
+carrier — `{ raw: BigInt, scale: Int }`, value `raw / 10^scale`. Unlike
+`Decimal` (`stdlib/decimal.kai`, an `Int128` carrier that tops out near
+38 digits), it has no width or scale ceiling: `add`, `sub`, and `mul`
+are total, `div` takes an explicit truncating target scale.
+
+```kaikai
+import decimal_big as db
+import decimal_big_proto
+
+fn main() : Unit / Stdout =
+  match db.parse("123456789012345678901234567890.123456789") {
+    Some(d) -> Stdout.print(show(db.mul(d, db.from_int(2))))   # exact
+    None    -> Stdout.print("parse error")
+  }
+```
+
+`Show`/`Eq`/`Ord` are scale-independent (`1.5` equals `1.50`).
+
+### Exact rationals (`Rational`)
+
+`Rational` (`stdlib/rational.kai`) is `{ num: BigInt, den: BigInt }`
+kept canonical: positive denominator, sign in the numerator, reduced to
+lowest terms by `gcd` at every construction. `add`, `sub`, `mul`, `div`,
+and `recip` stay exact and reduced.
+
+```kaikai
+import rational as rat
+import rational_proto
+import math.bigint
+
+fn main() : Unit / Stdout = {
+  let half  = rat.make(bigint.from_int(1), bigint.from_int(2))
+  let third = rat.make(bigint.from_int(1), bigint.from_int(3))
+  Stdout.print(show(rat.add(half, third)))                    # 5/6
+}
+```
+
+`make` panics on a zero denominator; `recip`/`div` return `Option` when
+the divisor is zero. `Show` renders `num/den` (whole numbers drop the
+denominator).
+
 ## Records
 
 ```kaikai
