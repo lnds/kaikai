@@ -240,17 +240,28 @@ mtimes are correct — the touch above makes it so.
 All three shards run on a pre-built kaic2 (build-once simulated via the
 touch), C-only, `KAI_MAX_HEAP=12g`:
 
-| Shard | Contents | Local wall | Result |
-|---|---|---|---|
-| tier1-shard-1 | 5 costly self-compiles + heap-limit + user/core caches | 67 s | OK |
-| tier1-shard-2 | light slice 1/2 + demos-no-regression | 166 s | OK |
-| tier1-shard-3 | light slice 2/2 + fmt/bench/check/negative/stdlib-modules/packages/audits/info/doc | 263 s | OK |
+| Shard | Contents |
+|---|---|
+| tier1-shard-1 | 5 costly self-compiles + heap-limit + user/core caches + demos + the non-light tail (fmt/bench/check/negative/stdlib-modules/packages/audits/info/doc) |
+| tier1-shard-2 | light slice 1/2 |
+| tier1-shard-3 | light slice 2/2 |
 
-Union == the original `tier1` (every phase ran, none twice). The slowest
-shard (shard-3) sets the critical path; it carries the heavier non-light
-tail. A finer split (SHARDS=3, or moving the non-light tail off shard-3) is
-the obvious next tuning if CI shows shard-3 still dominating — left as a
-follow-up since the knob already exists and the gate is green and under
-budget as-is. The `cc` opt level was confirmed a wash for fixtures; none of
-the shards rebuild kaic2 (verified: `make[2]: 'kaic2' is up to date.` in
-each shard's log).
+Union == the original `tier1` (every phase ran, none twice); the light pool
+stays split two ways (1/2 ∪ 2/2 == TEST_LIGHT_TARGETS) and everything
+non-light rides shard-1.
+
+Measured rebalance (CI, four green `main` runs): the two light slices were
+already even (~600 s each); the imbalance was the **non-light tail piled on
+shard-3** (light/2 ~600 s + tail ~160 s = ~760 s) while shard-1 finished its
+costly compiles in ~200 s and sat idle. Moving demos + the tail onto shard-1
+(CPU-light, run after the costly compiles free their RSS) lifts shard-1 to
+~440 s and drops the slowest shard to ~600 s — critical path build (~295 s) +
+~600 s ≈ 15 min, down from ~17.6 min.
+
+A **finer light split was tried and reverted**: `SHARDS=3` round-robin
+measured *worse* (critical path ~21 min) because round-robin partitions by
+target COUNT, and the families differ in cost ~50× (`stdlib` 158 fixtures vs
+1-fixture targets), so it dumped `stdlib`+`sugars`+`effects` into a single
+slice (982 s). A correct sub-15-min split must weight targets by measured
+cost (LPT/greedy), not raise `SHARDS`. The `cc` opt level is a wash for
+fixtures; no shard rebuilds kaic2 (`make[2]: 'kaic2' is up to date.`).
