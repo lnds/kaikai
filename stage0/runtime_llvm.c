@@ -72,6 +72,17 @@ KaiValue *kaix_bool_of_i32(int32_t i)          { return kai_bool(i != 0); }
 KaiValue *kaix_byte(uint8_t b)                 { return kai_byte(b); }
 KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
 
+/* Fixed-width integer literal constructors (numeric lane A). The native
+ * backend boxes a fixed-width literal through these; arithmetic and
+ * comparison ride the shared `kai_op_*` runtime, which dispatches on the
+ * KAI_INT32/.../KAI_INT128 tags. Int32/UInt32/UInt64 take the value as a
+ * 64-bit arg (the emitter sign/zero-extends the iN const); Int128 takes
+ * its decimal/hex string global and parses it (no 128-bit LLVM arg). */
+KaiValue *kaix_int32(int64_t v)                { return kai_int32((int32_t) v); }
+KaiValue *kaix_uint32(int64_t v)               { return kai_uint32((uint32_t) v); }
+KaiValue *kaix_uint64(int64_t v)               { return kai_uint64((uint64_t) v); }
+KaiValue *kaix_int128_str(const char *s)       { return kai_int128(kai_i128_parse(s)); }
+
 /* ---------- binops ---------- */
 KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_op_add(a, b); }
 KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_op_sub(a, b); }
@@ -912,6 +923,20 @@ KaiValue *kaix_prelude_byte_sub(KaiValue *a, KaiValue *b)                { retur
 KaiValue *kaix_prelude_byte_eq(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_eq(a, b); }
 KaiValue *kaix_prelude_byte_lt(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_lt(a, b); }
 KaiValue *kaix_prelude_byte_to_string(KaiValue *v)                       { return kai_prelude_byte_to_string(v); }
+
+/* Fixed-width integer prims (numeric lane A). */
+KaiValue *kaix_prelude_int32_to_string(KaiValue *v)   { return kai_prelude_int32_to_string(v); }
+KaiValue *kaix_prelude_uint32_to_string(KaiValue *v)  { return kai_prelude_uint32_to_string(v); }
+KaiValue *kaix_prelude_uint64_to_string(KaiValue *v)  { return kai_prelude_uint64_to_string(v); }
+KaiValue *kaix_prelude_int128_to_string(KaiValue *v)  { return kai_prelude_int128_to_string(v); }
+KaiValue *kaix_prelude_int_to_int32(KaiValue *v)      { return kai_prelude_int_to_int32(v); }
+KaiValue *kaix_prelude_int_to_uint32(KaiValue *v)     { return kai_prelude_int_to_uint32(v); }
+KaiValue *kaix_prelude_int_to_uint64(KaiValue *v)     { return kai_prelude_int_to_uint64(v); }
+KaiValue *kaix_prelude_int_to_int128(KaiValue *v)     { return kai_prelude_int_to_int128(v); }
+KaiValue *kaix_prelude_int32_to_int(KaiValue *v)      { return kai_prelude_int32_to_int(v); }
+KaiValue *kaix_prelude_uint32_to_int(KaiValue *v)     { return kai_prelude_uint32_to_int(v); }
+KaiValue *kaix_prelude_uint64_to_int(KaiValue *v)     { return kai_prelude_uint64_to_int(v); }
+KaiValue *kaix_prelude_int128_to_int(KaiValue *v)     { return kai_prelude_int128_to_int(v); }
 KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
 KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
 KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
