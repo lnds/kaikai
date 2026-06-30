@@ -48,6 +48,27 @@ On a Homebrew install, `kai upgrade` does not touch the Cellar — it
 prints a pointer to `brew upgrade kaikai` and exits. This is distinct
 from `kai update`, which refreshes package dependencies in `kai.toml`.
 
+## Build profiles
+
+`kai build` takes a profile flag that trades compile speed, binary size,
+and debuggability. All three use the native backend; the C backend ignores
+them (it gets its opt level from `cc`).
+
+```sh
+kai build app.kai              # default: -O2, symbols kept, no DWARF
+kai build --release app.kai    # -O2, stripped + smaller, no DWARF
+kai build --debug   app.kai    # -O0, full DWARF line tables, source debug
+```
+
+- **default** (no flag) — `-O2` for fast runtime, symbols kept for cheap
+  iteration. The baseline.
+- **`--release`** — `-O2` and the binary is stripped, so it is smaller than
+  the default. Ship this.
+- **`--debug`** — `-O0` (fast compile, no inlining) and full DWARF keyed to
+  the `.kai` source. `lldb`/`gdb` break on kaikai lines, and a panic prints
+  a `<file>.kai:<line>` stack trace. On macOS the DWARF lands in a `.dSYM`
+  bundle next to the binary; on Linux it stays in the executable.
+
 ## Platforms
 
 This iteration ships darwin-arm64 only. On any other platform the
