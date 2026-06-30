@@ -1,0 +1,225 @@
+#[doc("""
+Arbitrary-precision fixed-point decimal.
+
+The carrier is `{ raw: BigInt, scale: Int }` where the represented
+value is `raw * 10^(-scale)`. So `1.23` is `DecimalBig { raw: 123n,
+scale: 2 }` and `100` is `DecimalBig { raw: 100n, scale: 0 }`.
+
+Unlike `Decimal` (whose `Int128` carrier tops out near 38 significant
+digits and panics past `scale` 38), the `BigInt` carrier has no width
+ceiling: magnitude and scale grow as far as memory allows, and `add` /
+`sub` / `mul` never overflow — they are total. `div` still takes an
+explicit target scale (truncating; no implicit precision loss) and
+returns `None` only on a zero divisor.
+
+Add and subtract normalise to `max(sa, sb)` (exact); multiply yields
+`sa + sb`; divide truncates toward zero at `target_scale`. Parsing
+accepts `[+-]?digits[.digits]?` with any digit count on either side.
+""")]
+
+import math.bigint
+import math.bigint_convert as bc
+
+# ---- Carrier -----------------------------------------------------
+
+#[doc("An arbitrary-precision base-10 fixed-point number: the value is `raw / 10^scale`.")]
+pub type DecimalBig = { raw: bigint.BigInt, scale: Int }
+
+# ---- Internal scaling --------------------------------------------
+
+#[doc("`10^n` as a `BigInt` (`n <= 0` yields `1`). No width ceiling — the carrier grows with `n`.")]
+pub fn pow10(n: Int) : bigint.BigInt =
+  if n <= 0 { bigint.one() } else { pow10_loop(bigint.one(), n) }
+
+fn pow10_loop(acc: bigint.BigInt, n: Int) : bigint.BigInt =
+  if n <= 0 { acc } else { pow10_loop(bigint.mul(acc, bigint.from_int(10)), n - 1) }
+
+# Re-scale to a new scale: scaling up multiplies (exact), scaling down
+# truncates toward zero. The carrier never overflows on the way up.
+fn db_rescale(d: DecimalBig, new_scale: Int) : DecimalBig =
+  if new_scale == d.scale { d }
+  else if new_scale > d.scale {
+    DecimalBig { raw: bigint.mul(d.raw, pow10(new_scale - d.scale)), scale: new_scale }
+  }
+  else { DecimalBig { raw: trunc_div(d.raw, pow10(d.scale - new_scale)), scale: new_scale } }
+
+# Truncating quotient of two BigInts; the divisor here is a power of
+# ten (never zero), so `divmod` always returns `Some`.
+fn trunc_div(a: bigint.BigInt, b: bigint.BigInt) : bigint.BigInt =
+  match bc.div(a, b) { Some(q) -> q  None -> bigint.zero() }
+
+# Both operands brought to the larger scale.
+fn db_align(a: DecimalBig, b: DecimalBig) : Pair[DecimalBig, DecimalBig] = {
+  let target = if a.scale > b.scale { a.scale } else { b.scale }
+  Pair { fst: db_rescale(a, target), snd: db_rescale(b, target) }
+}
+
+# ---- Constructors ------------------------------------------------
+
+#[doc("The decimal `0` (scale 0).")]
+pub fn zero() : DecimalBig = DecimalBig { raw: bigint.zero(), scale: 0 }
+
+#[doc("Lifts a 64-bit `Int` to a decimal with scale 0.")]
+pub fn from_int(n: Int) : DecimalBig = DecimalBig { raw: bigint.from_int(n), scale: 0 }
+
+#[doc("Lifts a `BigInt` to a decimal with scale 0.")]
+pub fn from_big(n: bigint.BigInt) : DecimalBig = DecimalBig { raw: n, scale: 0 }
+
+#[doc("""
+Builds a DecimalBig from a raw `BigInt` carrier and a scale: the value
+is `raw / 10^scale`. The single low-level constructor every other path
+routes through.
+""")]
+pub fn from_parts(raw: bigint.BigInt, scale: Int) : DecimalBig =
+  DecimalBig { raw: raw, scale: scale }
+
+# ---- Arithmetic --------------------------------------------------
+
+#[doc("Adds two decimals, aligning to the larger scale. Total — the `BigInt` carrier never overflows.")]
+pub fn add(a: DecimalBig, b: DecimalBig) : DecimalBig = {
+  let p = db_align(a, b)
+  DecimalBig { raw: bigint.add(p.fst.raw, p.snd.raw), scale: p.fst.scale }
+}
+
+#[doc("Negates a decimal.")]
+pub fn neg(d: DecimalBig) : DecimalBig = DecimalBig { raw: bigint.neg(d.raw), scale: d.scale }
+
+#[doc("Subtracts two decimals, aligning to the larger scale. Total.")]
+pub fn sub(a: DecimalBig, b: DecimalBig) : DecimalBig = add(a, neg(b))
+
+#[doc("Multiply: scales add. `1.23 * 1.5 = 1.845` (scale 3). Total.")]
+pub fn mul(a: DecimalBig, b: DecimalBig) : DecimalBig =
+  DecimalBig { raw: bigint.mul(a.raw, b.raw), scale: a.scale + b.scale }
+
+#[doc("""
+Divide: the caller picks the result scale. The numerator is widened
+before truncation so only digits beyond `target_scale` are lost.
+`None` when the divisor is zero — the caller decides how to react.
+""")]
+pub fn div(a: DecimalBig, b: DecimalBig, target_scale: Int) : Option[DecimalBig] =
+  if bigint.is_zero(b.raw) { None }
+  else {
+    let num = bigint.mul(a.raw, pow10(b.scale + target_scale))
+    let den = bigint.mul(b.raw, pow10(a.scale))
+    match bc.div(num, den) {
+      Some(q) -> Some(DecimalBig { raw: q, scale: target_scale })
+      None    -> None
+    }
+  }
+
+# ---- Predicates --------------------------------------------------
+
+#[doc("True when the decimal is zero.")]
+pub fn is_zero(d: DecimalBig) : Bool = bigint.is_zero(d.raw)
+
+#[doc("True when the decimal is negative.")]
+pub fn is_negative(d: DecimalBig) : Bool = bigint.is_negative(d.raw)
+
+#[doc("Absolute value of a decimal.")]
+pub fn abs(d: DecimalBig) : DecimalBig = DecimalBig { raw: bigint.abs(d.raw), scale: d.scale }
+
+# ---- Comparison --------------------------------------------------
+
+#[doc("True when two decimals are numerically equal, independent of scale.")]
+pub fn eq(a: DecimalBig, b: DecimalBig) : Bool = {
+  let p = db_align(a, b)
+  bigint.compare(p.fst.raw, p.snd.raw) == 0
+}
+
+#[doc("Three-way comparison: `-1`, `0`, or `1` for `a < b`, `a == b`, `a > b`. Scale-independent.")]
+pub fn cmp(a: DecimalBig, b: DecimalBig) : Int = {
+  let p = db_align(a, b)
+  bigint.compare(p.fst.raw, p.snd.raw)
+}
+
+# ---- String I/O --------------------------------------------------
+
+#[doc("""
+Pretty-print: integer part, then `.` and the zero-padded fractional
+part. Negative values prefix `-`; scale 0 emits the integer alone.
+""")]
+pub fn to_string(d: DecimalBig) : String =
+  if d.scale == 0 { bc.to_string(d.raw) }
+  else {
+    let mag = bigint.abs(d.raw)
+    let factor = pow10(d.scale)
+    let units = trunc_div(mag, factor)
+    let frac = bigint.sub(mag, bigint.mul(units, factor))
+    let frac_str = pad_left_zeros(bc.to_string(frac), d.scale)
+    let sign = if bigint.is_negative(d.raw) { "-" } else { "" }
+    string_concat(string_concat(sign, bc.to_string(units)), string_concat(".", frac_str))
+  }
+
+# Left-pad a numeric string with zeros to a target width.
+fn pad_left_zeros(s: String, width: Int) : String = {
+  let n = string_length(s)
+  if n >= width { s } else { string_concat(string.repeat("0", width - n), s) }
+}
+
+#[doc("""
+Parse a DecimalBig from `[+-]?digits[.digits]?`. The fractional digit
+count sets the `scale`, so `"1.50"` keeps scale 2. `None` on malformed
+input. Magnitudes of any length decode exactly.
+""")]
+pub fn parse(s: String) : Option[DecimalBig] = {
+  let n = string_length(s)
+  if n == 0 { None }
+  else {
+    let first = char_at(s, 0)
+    let neg = match first { Some(c) -> c == '-'  None -> false }
+    let pos = match first { Some(c) -> c == '+'  None -> false }
+    let start = if neg or pos { 1 } else { 0 }
+    if start >= n { None } else { db_parse_body(s, start, n, neg) }
+  }
+}
+
+fn db_parse_body(s: String, start: Int, n: Int, neg: Bool) : Option[DecimalBig] = {
+  let dot = db_find_dot(s, start, n)
+  if dot < 0 {
+    db_combine(db_int_part(string_slice(s, start, n - start)), "", neg)
+  }
+  else {
+    let int_part = string_slice(s, start, dot - start)
+    let frac_part = string_slice(s, dot + 1, n - dot - 1)
+    if string_length(frac_part) == 0 { None }
+    else { db_combine(db_int_part(int_part), frac_part, neg) }
+  }
+}
+
+# Combine a parsed integer side and a fractional digit string. `None` if
+# either side has a non-digit.
+fn db_combine(iv_opt: Option[bigint.BigInt], frac_part: String, neg: Bool) : Option[DecimalBig] =
+  match iv_opt {
+    None     -> None
+    Some(iv) -> {
+      let scale = string_length(frac_part)
+      match db_digits(frac_part) {
+        None     -> None
+        Some(fv) -> {
+          let mag = bigint.add(bigint.mul(iv, pow10(scale)), fv)
+          Some(DecimalBig { raw: if neg { bigint.neg(mag) } else { mag }, scale: scale })
+        }
+      }
+    }
+  }
+
+# Integer side: empty parses as `0` (so `.5` → `0.5`); else digits-only.
+fn db_int_part(s: String) : Option[bigint.BigInt] =
+  if string_length(s) == 0 { Some(bigint.zero()) } else { db_digits(s) }
+
+# Decode a digit string as an unsigned BigInt. Empty → `0`. `None` on
+# any non-digit (an embedded sign or `.` is malformed here).
+fn db_digits(s: String) : Option[bigint.BigInt] =
+  if string_length(s) == 0 { Some(bigint.zero()) }
+  else { match bc.from_string(s) {
+    Some(v) -> if bigint.is_negative(v) { None } else { Some(v) }
+    None    -> None
+  } }
+
+# Locate `.` in `[i, n)`, or `-1` if absent.
+fn db_find_dot(s: String, i: Int, n: Int) : Int =
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    Some('.') -> i
+    _         -> db_find_dot(s, i + 1, n)
+  } }
