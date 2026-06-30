@@ -41,6 +41,13 @@
 #endif
 #if defined(__linux__)
 #  define _DEFAULT_SOURCE 1
+/* glibc hides `dladdr` + `Dl_info` (a GNU extension, not C99) behind
+ * _GNU_SOURCE; the --debug panic backtrace (#500) needs them to de-slide
+ * PIE frames. Must be defined BEFORE any include, like the macros above —
+ * a strict `-std=c99` C-only bootstrap rejects the implicit declaration
+ * otherwise (macOS libSystem exposes them regardless, which is why a mac
+ * build did not catch it). _GNU_SOURCE implies _DEFAULT_SOURCE. */
+#  define _GNU_SOURCE 1
 #endif
 
 #ifndef KAI_RUNTIME_H
@@ -59,6 +66,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
+#include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
 
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
@@ -173,6 +182,10 @@ typedef enum {
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
+    KAI_INT32,        /* numeric lane A: signed 32-bit, nominal */
+    KAI_UINT32,       /* numeric lane A: unsigned 32-bit, nominal */
+    KAI_UINT64,       /* numeric lane A: unsigned 64-bit, nominal */
+    KAI_INT128,       /* numeric lane A: signed 128-bit, nominal */
     KAI_FOREIGN       /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
                        * Parks a raw `void *` the kaikai side threads through
                        * but never inspects. RC manages the box; the parked
@@ -431,6 +444,16 @@ struct KaiValue {
         double   r;                                 /* KAI_REAL */
         uint32_t c;                                 /* KAI_CHAR */
         uint8_t  byte_val;                                /* KAI_BYTE — Lane 4 (#473) */
+        int32_t  i32;                               /* KAI_INT32 */
+        uint32_t u32;                               /* KAI_UINT32 */
+        uint64_t u64;                               /* KAI_UINT64 */
+        /* KAI_INT128. Stored as two 8-byte halves, NOT a bare `__int128`:
+         * `__int128` carries a 16-byte alignment requirement that would
+         * raise KaiValue's alignment to 16, but the allocator/arena align
+         * to 8 — a misaligned `->as.i128` access is UB that segfaults on
+         * Linux/-O2 (and UBSan flags it). Access via kai_i128_load /
+         * kai_i128_store (memcpy, alignment-agnostic). */
+        uint64_t i128_halves[2];                    /* KAI_INT128 (lo, hi) */
         struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
         struct { KaiValue *head; KaiValue *tail; } cons;
         struct {
@@ -593,6 +616,15 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         case KAI_PID:     return KAI_HEAD_PID;
         case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
         case KAI_BYTE:    return KAI_HEAD_BYTE;
+        /* Fixed-width integers dispatch protocols at compile time (the
+         * typer resolves Show/Eq/Ord against the static type), so the
+         * runtime head tag is only consulted for a dynamically-typed
+         * box — there they ride the Int head, which is sound because no
+         * primitive carries a conflicting custom impl. */
+        case KAI_INT32:
+        case KAI_UINT32:
+        case KAI_UINT64:
+        case KAI_INT128:  return KAI_HEAD_INT;
     }
     return KAI_HEAD_ANON;
 }
@@ -675,6 +707,10 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_ARRAY:   return "array";
         case KAI_REF:     return "ref";
         case KAI_BYTE:      return "Byte";
+        case KAI_INT32:     return "Int32";
+        case KAI_UINT32:    return "UInt32";
+        case KAI_UINT64:    return "UInt64";
+        case KAI_INT128:    return "Int128";
         default:          return "?";
     }
 }
@@ -1143,6 +1179,10 @@ static const char *kai_leaksite_alloc_fn(int32_t tag) {
         case KAI_FIBER:   return "kai_fiber";
         case KAI_PID:     return "kai_pid";
         case KAI_BYTE:      return "kai_byte";
+        case KAI_INT32:     return "kai_int32";
+        case KAI_UINT32:    return "kai_uint32";
+        case KAI_UINT64:    return "kai_uint64";
+        case KAI_INT128:    return "kai_int128";
         default:          return "kai_alloc";
     }
 }
@@ -3279,6 +3319,81 @@ static KAI_RC_NOINLINE KaiValue *kai_byte(uint8_t n) {
     return v;
 }
 
+/* Fixed-width integer boxes (numeric lane A). Used only when a raw iN
+ * value must cross into a boxed slot (Show, polymorphic container);
+ * arithmetic stays raw and never allocates. */
+static KAI_RC_NOINLINE KaiValue *kai_int32(int32_t n) {
+    KaiValue *v = kai_alloc(KAI_INT32);
+    v->as.i32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint32(uint32_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT32);
+    v->as.u32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint64(uint64_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT64);
+    v->as.u64 = n;
+    return v;
+}
+/* Load / store an Int128 box's value through its two 8-byte halves.
+ * `memcpy` is alignment-agnostic, so this never triggers the misaligned
+ * `__int128` access UB that a bare `v->as.i128` would on an 8-byte-aligned
+ * KaiValue (the cause of the Linux/-O2 selfhost segfault). */
+static inline __int128 kai_i128_load(const KaiValue *v) {
+    __int128 n;
+    memcpy(&n, v->as.i128_halves, sizeof(n));
+    return n;
+}
+static inline void kai_i128_store(KaiValue *v, __int128 n) {
+    memcpy(v->as.i128_halves, &n, sizeof(n));
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_int128(__int128 n) {
+    KaiValue *v = kai_alloc(KAI_INT128);
+    kai_i128_store(v, n);
+    return v;
+}
+
+/* Parse a decimal / `0x` hex / `0b` binary integer literal (digits
+ * only, optional leading `-`, `_` separators allowed) into __int128.
+ * The compiler emits this for Int128 literals whose value may exceed
+ * 64 bits — no C integer constant can hold them, so we build the value
+ * at runtime. Overflow past 128 bits wraps (two's complement). */
+static __int128 kai_i128_parse(const char *s) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    unsigned __int128 acc = 0;
+    unsigned base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+    else if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) { base = 2; s += 2; }
+    for (; *s; s++) {
+        char c = *s;
+        if (c == '_') continue;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned) (c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned) (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned) (c - 'A' + 10);
+        else break;
+        acc = acc * base + d;
+    }
+    return neg ? -(__int128) acc : (__int128) acc;
+}
+
+/* Render a signed 128-bit value to decimal (handles INT128_MIN). The
+ * C library has no %lld for __int128, so we build the digits manually
+ * into `buf` (max 40 chars: sign + 39 digits) and return the start. */
+static char *kai_i128_to_decimal(__int128 v, char *buf, size_t buflen) {
+    char *p = buf + buflen - 1;
+    *p = '\0';
+    unsigned __int128 mag = (v < 0) ? (unsigned __int128)(-(v + 1)) + 1u
+                                    : (unsigned __int128) v;
+    do { *--p = (char) ('0' + (int) (mag % 10)); mag /= 10; } while (mag != 0);
+    if (v < 0) *--p = '-';
+    return p;
+}
+
 /* FFI v2 (#417): box an opaque C handle. `p` is borrowed external
  * memory — RC frees only this box, never `p` (see kai_free_value's
  * default arm: no payload free for KAI_FOREIGN). */
@@ -4619,6 +4734,10 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
         case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
+        case KAI_INT32:     return a->as.i32 == b->as.i32;
+        case KAI_UINT32:    return a->as.u32 == b->as.u32;
+        case KAI_UINT64:    return a->as.u64 == b->as.u64;
+        case KAI_INT128:    return kai_i128_load(a) == kai_i128_load(b);
     }
     return 0;
 }
@@ -4754,6 +4873,19 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
             return kai_str(buf);
+        case KAI_INT32:
+            snprintf(buf, sizeof(buf), "%d", (int) v->as.i32);
+            return kai_str(buf);
+        case KAI_UINT32:
+            snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u32);
+            return kai_str(buf);
+        case KAI_UINT64:
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long) v->as.u64);
+            return kai_str(buf);
+        case KAI_INT128: {
+            char i128buf[44];
+            return kai_str(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
+        }
     }
     return kai_str("?");
 }
@@ -4884,12 +5016,124 @@ static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
     return kai_unit();
 }
 
+/* --debug stack trace (#500). `__kai_build_debug` is 0 in a default/release
+ * binary and set to 1 by the native backend's debug marker global (emitted
+ * only when DWARF is on). A weak definition here means a binary that never
+ * defines the strong one still links. When it is 1, a panic resolves its
+ * return-address backtrace to `<file>.kai:<line>` via the platform symboliser
+ * (`atos` on macOS, `addr2line` on ELF) reading the DWARF this build emitted.
+ * In a non-debug binary the flag is 0, so the panic stays the one-line form
+ * and pays no symboliser cost. */
+__attribute__((weak)) int __kai_build_debug = 0;
+
+/* Best-effort absolute path of the running executable, into `buf`. Returns 1
+ * on success. The symboliser needs it to read the binary's (or its .dSYM's)
+ * DWARF. */
+static int kai_self_exe_path(char *buf, size_t n) {
+#if defined(__APPLE__)
+    uint32_t sz = (uint32_t) n;
+    extern int _NSGetExecutablePath(char *, uint32_t *);
+    return _NSGetExecutablePath(buf, &sz) == 0;
+#else
+    ssize_t r = readlink("/proc/self/exe", buf, n - 1);
+    if (r <= 0) return 0;
+    buf[r] = '\0';
+    return 1;
+#endif
+}
+
+/* Resolve and print the panic backtrace as kaikai source positions. Captures
+ * the native return addresses, then shells out to the platform symboliser
+ * once with all addresses (the DWARF line table maps each back to .kai:line).
+ * Silent + harmless when the symboliser is absent or resolves nothing — the
+ * caller already printed `panic: <msg>`. */
+/* Single-quote-wrap `src` into `dst` for safe inclusion in a /bin/sh command
+ * line, escaping any embedded `'` as `'\''` (close-quote, literal-quote,
+ * re-open-quote). Without this a path containing a single quote would break
+ * out of the quoting and the rest would be run by the shell — `exe` comes
+ * from the executable's own path, but it is still attacker-influenceable
+ * (a binary placed at a crafted path), so quote it properly. Truncates
+ * safely if `dst` fills; returns 1 on success, 0 if it could not fit. */
+static int kai_shell_squote(const char *src, char *dst, size_t n) {
+    size_t j = 0;
+    if (n < 3) return 0;
+    dst[j++] = '\'';
+    for (; *src; src++) {
+        if (*src == '\'') {
+            if (j + 4 >= n) return 0;
+            dst[j++] = '\''; dst[j++] = '\\'; dst[j++] = '\''; dst[j++] = '\'';
+        } else {
+            if (j + 1 >= n) return 0;
+            dst[j++] = *src;
+        }
+    }
+    if (j + 2 > n) return 0;
+    dst[j++] = '\''; dst[j] = '\0';
+    return 1;
+}
+
+static void kai_panic_backtrace(void) {
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    if (n <= 0) return;
+    char exe[4096];
+    if (!kai_self_exe_path(exe, sizeof exe)) return;
+    char qexe[4112];   /* exe single-quoted for the shell (worst case grows it) */
+    if (!kai_shell_squote(exe, qexe, sizeof qexe)) return;
+
+    /* The frames are RUNTIME addresses (PIE/ASLR-slid). The symboliser reads
+     * the binary at its STATIC link addresses, so the slide must be removed.
+     * `dladdr` on this fn's own address yields `dli_fbase` — the load address
+     * of the main image — which is exactly that slide. `atos -l <fbase>`
+     * tells atos the load address (it subtracts internally); for `addr2line`
+     * we subtract per-address and pass static offsets. */
+    Dl_info info;
+    uintptr_t base = 0;
+    if (dladdr((void *) kai_panic_backtrace, &info) && info.dli_fbase)
+        base = (uintptr_t) info.dli_fbase;
+
+    char cmd[8192];
+#if defined(__APPLE__)
+    int off = snprintf(cmd, sizeof cmd, "atos -o %s -fullPath -l %p", qexe, (void *) base);
+#else
+    int off = snprintf(cmd, sizeof cmd, "addr2line -f -p -e %s", qexe);
+#endif
+    if (off <= 0 || off >= (int) sizeof cmd) return;
+    /* Skip frame 0 (this fn) and frame 1 (kai_prelude_panic): start at the
+     * panic's caller. atos gets the runtime address (it applies -l itself);
+     * addr2line gets the static offset (runtime - base). */
+    for (int i = 2; i < n && off < (int) sizeof cmd - 32; i++) {
+#if defined(__APPLE__)
+        off += snprintf(cmd + off, sizeof cmd - off, " %p", frames[i]);
+#else
+        off += snprintf(cmd + off, sizeof cmd - off, " %p",
+                        (void *) ((uintptr_t) frames[i] - base));
+#endif
+    }
+
+    fflush(stderr);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    /* Print only the frames the symboliser resolved to a `.kai` source — the
+     * runtime/libc frames (no `.kai`) are noise. Header is emitted lazily so
+     * a build whose symboliser resolves nothing prints no empty header. */
+    char line[1024];
+    int printed = 0;
+    while (fgets(line, sizeof line, p)) {
+        if (!strstr(line, ".kai")) continue;
+        if (!printed) { fprintf(stderr, "stack trace (kaikai source):\n"); printed = 1; }
+        fprintf(stderr, "  %s", line);
+    }
+    pclose(p);
+}
+
 static KaiValue *kai_prelude_panic(KaiValue *msg) {
     fprintf(stderr, "panic: ");
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    if (__kai_build_debug) kai_panic_backtrace();
     exit(1);
     return kai_unit();
 }
@@ -5011,6 +5255,48 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
     kai_decref(v);
     return kai_str(buf);
 }
+
+/* Fixed-width integer Show prims (numeric lane A). Each consumes its
+ * boxed argument (per the prelude consume discipline) and renders the
+ * raw value via the same width-correct formatting as `kai_to_string`. */
+static KaiValue *kai_prelude_int32_to_string(KaiValue *v) {
+    int32_t n = (v && kai_is_ptr(v) && v->tag == KAI_INT32) ? v->as.i32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%d", (int) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_uint32_to_string(KaiValue *v) {
+    uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%u", (unsigned) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_uint64_to_string(KaiValue *v) {
+    uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64 : 0;
+    if (v) kai_decref(v);
+    char buf[24]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_int128_to_string(KaiValue *v) {
+    __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0;
+    if (v) kai_decref(v);
+    char buf[44];
+    return kai_str(kai_i128_to_decimal(n, buf, sizeof(buf)));
+}
+
+/* Fixed-width conversions. `int_to_*` truncates the 64-bit Int into the
+ * width (C cast semantics, no range check); `*_to_int` widens back —
+ * lossless for Int32/UInt32, a reinterpret for UInt64/Int128 values
+ * beyond Int's range (documented; callers needing exact 128-bit values
+ * keep them as Int128). */
+static KaiValue *kai_prelude_int_to_int32(KaiValue *v)  { int64_t n = kai_intf(v); kai_decref(v); return kai_int32((int32_t) n); }
+static KaiValue *kai_prelude_int_to_uint32(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint32((uint32_t) n); }
+static KaiValue *kai_prelude_int_to_uint64(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint64((uint64_t) n); }
+static KaiValue *kai_prelude_int_to_int128(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_int128((__int128) n); }
+static KaiValue *kai_prelude_int32_to_int(KaiValue *v)  { int32_t n  = (v && kai_is_ptr(v) && v->tag == KAI_INT32)  ? v->as.i32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_uint32_to_int(KaiValue *v) { uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_uint64_to_int(KaiValue *v) { uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_int128_to_int(KaiValue *v) { __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0; kai_decref(v); return kai_int((int64_t) n); }
 
 /* ---------- prelude: math/real libm bindings (issue #343) ----------
  * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
@@ -5411,10 +5697,47 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
  * silences the UB without changing any emitted output. Division and
  * comparison stay signed (their overflow is not part of the contract).
  */
+/* Fixed-width boxed arithmetic (numeric lane A). The native backend
+ * boxes fixed-width literals, so `+`/`-`/`*` over two same-tag boxes land
+ * here. Each computes in the unsigned of the width (defined two's-
+ * complement wrap) and re-boxes. Returns NULL when the pair is not a
+ * matching fixed-width pair, so the caller falls through to its Int/Real
+ * path. (The C backend never reaches this — it keeps fixed-width raw.) */
+static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32: { uint32_t x = (uint32_t) a->as.i32, y = (uint32_t) b->as.i32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int32((int32_t) r); }
+        case KAI_UINT32: { uint32_t x = a->as.u32, y = b->as.u32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint32(r); }
+        case KAI_UINT64: { uint64_t x = a->as.u64, y = b->as.u64;
+            uint64_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint64(r); }
+        case KAI_INT128: { unsigned __int128 x = (unsigned __int128) kai_i128_load(a), y = (unsigned __int128) kai_i128_load(b);
+            unsigned __int128 r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int128((__int128) r); }
+        default: return NULL;
+    }
+}
+
+/* Division for two same-tag fixed-width boxes. Unlike the wrapping
+ * add/sub/mul, the result depends on signedness, so each width divides
+ * in its own signed/unsigned domain (truncated toward zero, C
+ * semantics). A zero divisor aborts. NULL on a non-fixed-width pair. */
+static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int32(a->as.i32 / y); }
+        case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint32(a->as.u32 / y); }
+        case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint64(a->as.u64 / y); }
+        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int128(kai_i128_load(a) / y); }
+        default: return NULL;
+    }
+}
+
 static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '+')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5424,6 +5747,7 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '-')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5433,6 +5757,7 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '*')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5445,7 +5770,8 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
         r = kai_int(kai_intf(a) / kai_intf(b));
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
-    } else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
+    } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -5474,11 +5800,26 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     return r;
 }
 
+/* Less-than for two same-tag fixed-width boxes; signedness per the
+ * width. Sets `*out` and returns 1 on a match, 0 otherwise. */
+static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32:  *out = a->as.i32  < b->as.i32;  return 1;
+        case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
+        case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
+        case KAI_INT128: *out = kai_i128_load(a) < kai_i128_load(b); return 1;
+        default: return 0;
+    }
+}
+
 static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
+    int _flt;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) < kai_intf(b));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
     else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
+    else if (kai_fixed_lt(a, b, &_flt)) r = kai_bool(_flt);
     else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
@@ -11818,6 +12159,20 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
     return node;
 }
 
+/* A by-id capability (a `var`/State/Reader cell or a `with Eff as a` alias)
+ * resolved to no node — the alias's evidence is on the fiber where it was
+ * installed and does not cross a spawn. A NULL here means the op ran on a
+ * child fiber that does not carry the cell; report it instead of dereferencing
+ * the NULL node. The compile-time escape check catches the common shapes; this
+ * is the runtime floor for the ones it cannot see statically. */
+static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char *cap_name) {
+    if (node == NULL || node->handler == NULL) {
+        fprintf(stderr, "kai: capability not reachable in this fiber: %s\n", cap_name);
+        exit(1);
+    }
+    return node;
+}
+
 /* m7b #15: per-instance dispatch — find the evidence node whose
  * handler_id matches `id`, no name match required. The codegen
  * uses this when the op call comes from a `with Eff as alias`
@@ -11874,6 +12229,7 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm-c/Linker.h>
 #include <llvm-c/IRReader.h>
+#include <llvm-c/DebugInfo.h>
 #include <stdlib.h>
 
 /* The native backend keeps one context + builder per compilation unit.
@@ -11924,6 +12280,13 @@ typedef struct {
     KaiNFrame *frames; int nframes, framecap;
     int ok;
     int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
+    /* DWARF debug info (#500), populated only in --debug. `dib` is the
+     * module DIBuilder, `difile` the source DIFile, `dicu` the compile
+     * unit, `disub` the CURRENT function's DISubprogram (the scope every
+     * `set_loc` attaches to). All NULL in release/default (calloc-zeroed)
+     * — `native_di_enabled` gates the emit so a non-debug build is
+     * byte-identical to before this lane. */
+    void *dib, *difile, *dicu, *disub;
 } KaiNativeCtx;
 
 static void *kai_native_ctx_new(void *m) {
@@ -12030,6 +12393,15 @@ static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
     for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
     c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1;
+    /* DWARF (#500): start each fn with NO subprogram + no current location.
+     * Only a fn that calls `native_di_subprogram` (the user-fn walk) gets a
+     * scope; a synthetic fn (thunk / runtime hook / runner driver) keeps
+     * `disub == NULL`, so its instructions carry no `!dbg` — which avoids a
+     * location whose scope is the PREVIOUS fn's subprogram (the verifier's
+     * "wrong subprogram" rejection). The builder's stale location is
+     * cleared too so no instruction inherits one across the fn boundary. */
+    c->disub = NULL;
+    if (c->b) LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
     return kai_unit();
 }
 static KaiValue *kai_native_ctx_end_fn(void *cv) { ((KaiNativeCtx *) cv)->in_fn = 0; return kai_unit(); }
@@ -12730,6 +13102,169 @@ static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
  * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
  * object links it, the compiler does not call it.) */
 
+/* --- DWARF debug info (#500) ---------------------------------------------
+ * The native backend emits DWARF line tables in --debug so `lldb`/`gdb`
+ * break on kaikai source lines and a panic resolves to `<file>.kai:<line>`
+ * via `atos`/`addr2line`. The metadata lives in the off-RC `KaiNativeCtx`
+ * (same vehicle as every other LLVM handle — a `DIBuilderRef` must never
+ * ride a kaikai record/list). The kaikai walk calls six high-level prims;
+ * the per-DI-node LLVM sequence stays in C so the emit_native code reads as
+ * "enable / open subprogram / set line / finalize", not raw DIBuilder.
+ *
+ * Scope: one DIFile + DICompileUnit per module, one DISubprogram per fn (a
+ * void() subroutine type — enough for line tables; we do not describe
+ * parameter/local types, which is out of scope per #500). A `set_loc`
+ * attaches the current subprogram as the location scope. Every prim is a
+ * NO-OP when DI was never enabled (`c->dib == NULL`), so a release/default
+ * build that never calls `native_di_enable` is byte-identical. */
+
+/* Enable DWARF for module `m`'s ctx: build the DIBuilder, the DIFile from
+ * (filename, directory), and the compile unit, and set the module's DWARF
+ * version + debug-info-version flags (without them the backend drops the
+ * metadata silently). Idempotent — a second call is a no-op.
+ *
+ * Gated on KAI_BUILD_MODE=debug, read HERE in C — the same place the opt
+ * level is gated (`kai_llvm_pass_pipeline` reads KAI_NATIVE_OPT). The
+ * kaikai walk calls this unconditionally; a non-debug build leaves `c->dib`
+ * NULL, so every later DI prim is a no-op and the module is byte-identical
+ * to before this lane. Keeping the gate in C means the emit_native walk
+ * needs no env-var prim. */
+static KaiValue *kai_native_di_enable(void *cv, KaiValue *fnamev, KaiValue *dirv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *mode = getenv("KAI_BUILD_MODE");
+    if (!mode || strcmp(mode, "debug") != 0) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
+    if (c->dib) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    /* DWARF needs these module flags; emit them once. Values match what
+     * clang sets for `-g` on the LLVM 18 line. */
+    LLVMMetadataRef dwarf_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), 4, 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13, dwarf_ver);
+    LLVMMetadataRef di_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), (unsigned) LLVMDebugMetadataVersion(), 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18, di_ver);
+
+    c->dib = LLVMCreateDIBuilder(m);
+    /* The kaikai-side path is the entry file kaic2 saw — which `bin/kai`
+     * copied to $tmp, so it is ephemeral. KAI_DEBUG_SRC carries the user's
+     * ORIGINAL absolute path; prefer it so the DIFile + comp_dir point at the
+     * real source `lldb`/`gdb` can open. Split it into (dir, base) here. */
+    const char *fname = fnamev->as.s.bytes;
+    const char *dir = dirv->as.s.bytes;
+    char dirbuf[4096];
+    const char *real = getenv("KAI_DEBUG_SRC");
+    if (real && real[0]) {
+        const char *slash = strrchr(real, '/');
+        if (slash) {
+            size_t dl = (size_t) (slash - real);
+            if (dl >= sizeof dirbuf) dl = sizeof dirbuf - 1;
+            memcpy(dirbuf, real, dl); dirbuf[dl] = '\0';
+            dir = dirbuf; fname = slash + 1;
+        } else {
+            fname = real;
+        }
+    }
+    c->difile = LLVMDIBuilderCreateFile((LLVMDIBuilderRef) c->dib,
+        fname, strlen(fname), dir, strlen(dir));
+    c->dicu = LLVMDIBuilderCreateCompileUnit((LLVMDIBuilderRef) c->dib,
+        LLVMDWARFSourceLanguageC, (LLVMMetadataRef) c->difile,
+        "kaikai", 6, /*isOptimized=*/0, "", 0, /*RuntimeVer=*/0,
+        "", 0, LLVMDWARFEmissionFull, /*DWOId=*/0,
+        /*SplitDebugInlining=*/0, /*DebugInfoForProfiling=*/0, "", 0, "", 0);
+    kai_decref(fnamev); kai_decref(dirv);
+    return kai_unit();
+}
+
+/* 1 when DWARF is enabled on this ctx (the --debug walk gates every DI
+ * call on it), 0 otherwise — so the kaikai walk reads `if di_enabled`. */
+static int64_t kai_native_di_enabled(void *cv) {
+    return ((KaiNativeCtx *) cv)->dib ? 1 : 0;
+}
+
+/* Open a DISubprogram for the current fn `fnval` named `name` at source
+ * `line`, attach it (LLVMSetSubprogram), and record it as the current
+ * location scope. No-op when DI is off. */
+static KaiValue *kai_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) { kai_decref(namev); return kai_unit(); }
+    /* A `void ()` subroutine type — line tables need a type but not the
+     * parameter shapes (out of scope per #500). */
+    LLVMMetadataRef subty = LLVMDIBuilderCreateSubroutineType(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->difile, NULL, 0, LLVMDIFlagZero);
+    const char *name = namev->as.s.bytes;
+    unsigned ln = (line > 0) ? (unsigned) line : 1u;
+    LLVMMetadataRef sp = LLVMDIBuilderCreateFunction(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->dicu,
+        name, strlen(name), name, strlen(name),
+        (LLVMMetadataRef) c->difile, ln, subty,
+        /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
+        LLVMDIFlagZero, /*IsOptimized=*/0);
+    LLVMSetSubprogram((LLVMValueRef) fnval, sp);
+    c->disub = sp;
+    /* Seed the builder's current location to this fn's line UNDER THE NEW
+     * subprogram, so the prologue (allocas / param store / entry br, all
+     * emitted before the first statement's `set_loc`) carries a `!dbg`
+     * scoped to THIS fn — not the previous fn's lingering location, which
+     * the shared builder would otherwise keep and which the verifier
+     * rejects as "wrong subprogram". The builder is still positioned in the
+     * previous fn here; this only sets the location state, which persists
+     * across the `position_at_end` the caller does next. */
+    LLVMContextRef lctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef ploc = LLVMDIBuilderCreateDebugLocation(lctx, ln, 0, sp, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, ploc);
+    kai_decref(namev);
+    return kai_unit();
+}
+
+/* Set the builder's current debug location to (line, col) under the
+ * current subprogram scope. No-op when DI is off or no subprogram is open
+ * (a synthetic fn with no source). The walk calls this before each
+ * source-bearing instruction; `set_loc(0,0)` style positions never reach
+ * here (the walk only calls on a real KAt). */
+static KaiValue *kai_native_di_set_loc(void *cv, int64_t line, int64_t col) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib || !c->disub) return kai_unit();
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(
+        ctx, (unsigned) line, (unsigned) col, (LLVMMetadataRef) c->disub, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, loc);
+    return kai_unit();
+}
+
+/* Clear the builder's current debug location (the prologue / synthetic
+ * instructions carry none). No-op when DI is off. */
+static KaiValue *kai_native_di_clear_loc(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
+    return kai_unit();
+}
+
+/* Resolve every temporary DI node — MUST run after the whole module is
+ * built and BEFORE verify (an unfinalized DIBuilder leaves forward-ref
+ * placeholders the verifier rejects). No-op when DI is off. */
+static KaiValue *kai_native_di_finalize(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->dib) LLVMDIBuilderFinalize((LLVMDIBuilderRef) c->dib);
+    return kai_unit();
+}
+
+/* Emit the strong `__kai_build_debug = 1` global that flips the runtime's
+ * weak default (0), so a panic in THIS (debug) binary resolves its backtrace
+ * to .kai:line. No-op when DI is off, so a release/default binary keeps the
+ * weak 0 and the one-line panic. */
+static KaiValue *kai_native_di_debug_marker(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(LLVMGetModuleContext(m));
+    LLVMValueRef g = LLVMAddGlobal(m, i32, "__kai_build_debug");
+    LLVMSetInitializer(g, LLVMConstInt(i32, 1, 0));
+    LLVMSetGlobalConstant(g, 1);
+    return kai_unit();
+}
+
 /* --- optimisation pass pipeline (L4, issue #498) ---
  * Run the LLVM New-PM pipeline in-process on the module before codegen,
  * matching the `-O2` the out-of-process C/LLVM-text paths get from
@@ -13089,6 +13624,15 @@ static KaiValue *kai_llvm_add_case(void *sw, void *on, void *bb) { (void) sw; (v
 static KaiValue *kai_llvm_build_unreachable(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+/* DWARF DI stubs (#500): unreachable on the C-only path (the native walk
+ * that calls them never runs), so they just satisfy the link. */
+static KaiValue *kai_native_di_enable(void *c, KaiValue *f, KaiValue *d) { (void) c; (void) f; (void) d; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_di_enabled(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_di_subprogram(void *c, void *fn, KaiValue *n, int64_t l) { (void) c; (void) fn; (void) n; (void) l; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_set_loc(void *c, int64_t l, int64_t col) { (void) c; (void) l; (void) col; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_clear_loc(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_finalize(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_debug_marker(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
 #endif /* KAI_LLVM */
 
 #endif /* KAI_RUNTIME_H */

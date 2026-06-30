@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.96.1 (2026-06-29)
+
+### Fixed
+
+- **emit**: a spawned fiber that touches an enclosing var cell diagnoses instead of segfaulting (closes #997) (#1004)
+- **perceus**: incref shared-donor children consumed by rebuild calls (closes #995) (#1002)
+- **emit**: drop dead capability-value alias node for by-id cells (closes #996)
+
+### Changed
+
+- **ci**: rebalance tier1 shards by splitting the light pool three ways
+
 ## v0.96.0 (2026-06-29)
 
 ### Added

@@ -1,0 +1,190 @@
+#[doc("""
+Decimal conversion and division for `bigint`: rendering to a base-10
+string, parsing from one, and `divmod` / `div` / `rem` / `pow`.
+
+Decimal rendering divides the magnitude by 10^9 repeatedly, emitting
+9-digit groups least-significant first, then reverses. Division is
+schoolbook binary long division (shift-subtract on the magnitudes): one
+bit per step, exact, and obviously correct — the magnitudes in practice
+(fintech, `Int128` range) are small enough that the simplicity beats a
+limb-estimating divider.
+""")]
+
+import loop
+import math.bits
+import math.bigint
+import math.bigint_limbs.{sig_len, mag_cmp, mag_sub, limb_lo, limb_hi, mag_divmod_limb}
+
+# 10^9 — the largest power of ten below 2^31, so `mag_divmod_limb`'s
+# `rem * 2^32` term stays within signed `Int` range.
+fn chunk_base() : Int = 1000000000
+
+# ---- to_string ---------------------------------------------------
+
+#[doc("Renders `x` in base 10, with a leading `-` for negatives.")]
+pub fn to_string(x: bigint.BigInt) : String =
+  if bigint.is_zero(x) { "0" }
+  else {
+    let body = mag_decimal(bigint.magnitude(x))
+    if bigint.is_negative(x) { "-" ++ body } else { body }
+  }
+
+# Render a nonzero magnitude as decimal digits by repeated /10^9.
+fn mag_decimal(mag: Array[Int]) : String = mag_decimal_loop(mag, "")
+
+fn mag_decimal_loop(mag: Array[Int], acc: String) : String = {
+  let qr = mag_divmod_limb(mag, chunk_base())
+  let chunk = qr.snd
+  if sig_len(qr.fst) == 0 {
+    # Most significant chunk: no zero padding.
+    int_to_string(chunk) ++ acc
+  } else {
+    mag_decimal_loop(qr.fst, pad9(chunk) ++ acc)
+  }
+}
+
+# Left-pad a 9-digit chunk with zeros (it is a non-leading group).
+fn pad9(n: Int) : String = {
+  let s = int_to_string(n)
+  pad_zeros(s, 9 - string_length(s))
+}
+
+fn pad_zeros(s: String, k: Int) : String =
+  if k <= 0 { s } else { pad_zeros("0" ++ s, k - 1) }
+
+# ---- from_string -------------------------------------------------
+
+#[doc("""
+Parses a base-10 integer, with an optional leading `+` or `-`.
+`Some(big)` on success; `None` on an empty string, a lone sign, or any
+non-digit character. Values beyond `Int` range parse exactly.
+""")]
+pub fn from_string(s: String) : Option[bigint.BigInt] = {
+  let n = string_length(s)
+  if n == 0 { None }
+  else {
+    match char_at(s, 0) {
+      Some('-') -> parse_body(s, 1, n, 0 - 1)
+      Some('+') -> parse_body(s, 1, n, 1)
+      _         -> parse_body(s, 0, n, 1)
+    }
+  }
+}
+
+# Fold digits `[start, n)` into a BigInt with the given sign. Empty span
+# (a lone sign) is `None`.
+fn parse_body(s: String, start: Int, n: Int, sign: Int) : Option[bigint.BigInt] =
+  if start >= n { None }
+  else { parse_digits(s, start, n, sign, bigint.zero()) }
+
+fn parse_digits(s: String, i: Int, n: Int, sign: Int, acc: bigint.BigInt) : Option[bigint.BigInt] =
+  if i >= n {
+    Some(if sign < 0 { bigint.neg(acc) } else { acc })
+  } else {
+    match digit_value(s, i) {
+      None    -> None
+      Some(d) -> parse_digits(s, i + 1, n, sign,
+                   bigint.add(bigint.mul(acc, bigint.from_int(10)), bigint.from_int(d)))
+    }
+  }
+
+fn digit_value(s: String, i: Int) : Option[Int] =
+  match char_at(s, i) {
+    Some(c) -> {
+      let v = char_to_int(c) - char_to_int('0')
+      if v >= 0 and v <= 9 { Some(v) } else { None }
+    }
+    None -> None
+  }
+
+# ---- divmod (binary long division) -------------------------------
+
+#[doc("""
+Truncating division with remainder: `Some(Pair(q, r))` where
+`a == q*b + r`, `r` has the sign of `a` (truncation toward zero), and
+`abs(r) < abs(b)`. `None` when `b` is zero.
+""")]
+pub fn divmod(a: bigint.BigInt, b: bigint.BigInt) : Option[Pair[bigint.BigInt, bigint.BigInt]] =
+  if bigint.is_zero(b) { None }
+  else if bigint.is_zero(a) { Some(Pair { fst: bigint.zero(), snd: bigint.zero() }) }
+  else {
+    let qm = divmod_mag(bigint.magnitude(a), bigint.magnitude(b))
+    let q = bigint.make(bigint.sign(a) * bigint.sign(b), qm.fst)
+    let r = bigint.make(bigint.sign(a), qm.snd)
+    Some(Pair { fst: q, snd: r })
+  }
+
+#[doc("Quotient of truncating division, or `None` when `b` is zero.")]
+pub fn div(a: bigint.BigInt, b: bigint.BigInt) : Option[bigint.BigInt] =
+  match divmod(a, b) { Some(p) -> Some(p.fst) None -> None }
+
+#[doc("Remainder of truncating division (sign of `a`), or `None` when `b` is zero.")]
+pub fn rem(a: bigint.BigInt, b: bigint.BigInt) : Option[bigint.BigInt] =
+  match divmod(a, b) { Some(p) -> Some(p.snd) None -> None }
+
+# Magnitude division returning `Pair(quotient_mag, remainder_mag)`. The
+# quotient and remainder are each produced by an independent inline
+# shift-subtract sweep so neither buffer crosses a call boundary and
+# `Mutable` masks in both producers. (Two sweeps trade a constant factor
+# for pure signatures; division is not a BigInt hot path.)
+fn divmod_mag(num: Array[Int], den: Array[Int]) : Pair[Array[Int], Array[Int]] =
+  Pair { fst: div_quotient_mag(num, den), snd: div_remainder_mag(num, den) }
+
+# Quotient magnitude by shift-subtract: walk dividend bits most-
+# significant first, shifting the running remainder left one bit and
+# subtracting the divisor when it fits, recording the set quotient bit.
+fn div_quotient_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
+  let nbits = sig_len(num) * 32
+  let nq = sig_len(num)
+  let q = array_make(if nq <= 0 { 1 } else { nq }, 0)
+  var rem := array_make(1, 0)
+  var i := nbits - 1
+  while { i >= 0 } {
+    rem := shl1_or(rem, mag_bit(num, i))
+    if mag_cmp(rem, den) >= 0 {
+      rem := mag_sub(rem, den)
+      let limb = i / 32
+      q[limb] := bit_or(q[limb], bit_shl(1, i % 32))
+    }
+    i := i - 1
+  }
+  q
+}
+
+# Remainder magnitude by the same sweep, returning the leftover instead
+# of the quotient bits.
+fn div_remainder_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
+  let nbits = sig_len(num) * 32
+  var rem := array_make(1, 0)
+  var i := nbits - 1
+  while { i >= 0 } {
+    rem := shl1_or(rem, mag_bit(num, i))
+    if mag_cmp(rem, den) >= 0 { rem := mag_sub(rem, den) }
+    i := i - 1
+  }
+  rem
+}
+
+# The `i`-th bit of a magnitude (0 or 1).
+fn mag_bit(mag: Array[Int], i: Int) : Int = {
+  let limb = i / 32
+  if limb >= array_length(mag) { 0 }
+  else { bit_and(bit_ushr(mag[limb], i % 32), 1) }
+}
+
+# `mag << 1 | bit`, returning a fresh magnitude. Built and returned
+# inline, so `Mutable` masks.
+fn shl1_or(mag: Array[Int], bit: Int) : Array[Int] = {
+  let n = array_length(mag)
+  let out = array_make(n + 1, 0)
+  var i := 0
+  var carry := bit
+  while { i < n } {
+    let v = mag[i] * 2 + carry
+    out[i] := limb_lo(v)
+    carry := limb_hi(v)
+    i := i + 1
+  }
+  out[n] := carry
+  out
+}

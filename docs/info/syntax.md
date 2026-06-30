@@ -316,6 +316,8 @@ type Color = Red | Green | Blue
 fn main() : Unit / Stdout = {
   let n = 42 + 0xFF + 0b1010                   # numbers
   let r = 3.14 + 2.5e-2                        # reals
+  let w = 42i32 + 7i32                         # fixed-width: i32/u32/
+  let big : Int128 = 9223372036854775808i128   #   u64/i128 suffixes
   let c = 'A'                                  # chars (Unicode scalar
   let acc = 'á'                                #   value; 'á' '▸'
   let emo = '\u{1F389}'                        #   '\u{1F389}' all lex)
@@ -359,6 +361,100 @@ pipes         |>  |  ||  |?                          (left-assoc)
 Boolean operators are the keywords `and`, `or`, `not` — not `&&`,
 `||`, `!`. (`||` is the flat-map pipe; `!` is postfix Option/Result
 propagation.)
+
+### Fixed-width integers
+
+Besides `Int` (64-bit) and `Real`, there are four fixed-width integer
+types written with a literal suffix: `42i32` (`Int32`), `42u32`
+(`UInt32`), `42u64` (`UInt64`), `42i128` (`Int128`). They are
+kind-distinct from `Int` — an `Int32` does not unify with an `Int`, so
+mixing them is a type error; convert explicitly with `int_to_int32` /
+`int32_to_int` (and the `u32`/`u64`/`i128` analogues). Arithmetic
+(`+ - * < ==`) wraps two's-complement in the width, and `Show` / `Eq` /
+`Ord` / `Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at
+~19), so a literal above 2^63 is written `…i128` and round-trips
+exactly. The suffix attaches to a decimal/hex/bin literal with no
+intervening space; `42i` without a width stays a complex literal.
+
+In an `extern "C"` signature these widths marshal honestly: `Int32`
+crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
+
+### Arbitrary-precision integers (`BigInt`)
+
+`BigInt` (`stdlib/math/bigint.kai`) is an arbitrary-precision signed
+integer — pure kaikai, no external dependency. It is an opt-in stdlib
+type, so reach for it with `import math.bigint`. The `n` literal suffix
+is sugar for `bigint.from_int`: `99n` builds the `BigInt` `99`. The
+suffix only covers `Int`-range literals (the lexer decodes the digits
+as a 64-bit value first); for values beyond `Int`, build from a string
+with `bigint.from_string("123…")`.
+
+```kaikai
+import math.bigint
+import math.bigint_convert as bc
+import math.bigint_proto
+
+fn main() : Unit / Stdout = {
+  let a = 1000000007n                          # `n` suffix → BigInt
+  let sq = bigint.mul(a, a)                    # exact, even past 2^64
+  Stdout.print(show(sq))                       # Show renders decimal
+  match bc.from_string("340282366920938463463374607431768211456") {
+    Some(big) -> Stdout.print(bc.to_string(bigint.add(big, a)))
+    None      -> Stdout.print("parse error")
+  }
+}
+```
+
+`BigInt` is sign-magnitude with an inline fast path: values in `Int`
+range stay unboxed; larger values use a heap limb array. `add`, `sub`,
+`mul`, `divmod`, and `compare` are exact; `Show`, `Eq`, `Ord`, and
+`Hash` are implemented (`Eq`/`Hash` agree because every integer has one
+canonical form). It is distinct from the fixed-width types above — those
+wrap at a fixed width; `BigInt` never overflows.
+
+### Arbitrary-precision decimal (`DecimalBig`)
+
+`DecimalBig` (`stdlib/decimal_big.kai`) is fixed-point with a `BigInt`
+carrier — `{ raw: BigInt, scale: Int }`, value `raw / 10^scale`. Unlike
+`Decimal` (`stdlib/decimal.kai`, an `Int128` carrier that tops out near
+38 digits), it has no width or scale ceiling: `add`, `sub`, and `mul`
+are total, `div` takes an explicit truncating target scale.
+
+```kaikai
+import decimal_big as db
+import decimal_big_proto
+
+fn main() : Unit / Stdout =
+  match db.parse("123456789012345678901234567890.123456789") {
+    Some(d) -> Stdout.print(show(db.mul(d, db.from_int(2))))   # exact
+    None    -> Stdout.print("parse error")
+  }
+```
+
+`Show`/`Eq`/`Ord` are scale-independent (`1.5` equals `1.50`).
+
+### Exact rationals (`Rational`)
+
+`Rational` (`stdlib/rational.kai`) is `{ num: BigInt, den: BigInt }`
+kept canonical: positive denominator, sign in the numerator, reduced to
+lowest terms by `gcd` at every construction. `add`, `sub`, `mul`, `div`,
+and `recip` stay exact and reduced.
+
+```kaikai
+import rational as rat
+import rational_proto
+import math.bigint
+
+fn main() : Unit / Stdout = {
+  let half  = rat.make(bigint.from_int(1), bigint.from_int(2))
+  let third = rat.make(bigint.from_int(1), bigint.from_int(3))
+  Stdout.print(show(rat.add(half, third)))                    # 5/6
+}
+```
+
+`make` panics on a zero denominator; `recip`/`div` return `Option` when
+the divisor is zero. `Show` renders `num/den` (whole numbers drop the
+denominator).
 
 ## Records
 

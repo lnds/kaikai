@@ -72,6 +72,17 @@ KaiValue *kaix_bool_of_i32(int32_t i)          { return kai_bool(i != 0); }
 KaiValue *kaix_byte(uint8_t b)                 { return kai_byte(b); }
 KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
 
+/* Fixed-width integer literal constructors (numeric lane A). The native
+ * backend boxes a fixed-width literal through these; arithmetic and
+ * comparison ride the shared `kai_op_*` runtime, which dispatches on the
+ * KAI_INT32/.../KAI_INT128 tags. Int32/UInt32/UInt64 take the value as a
+ * 64-bit arg (the emitter sign/zero-extends the iN const); Int128 takes
+ * its decimal/hex string global and parses it (no 128-bit LLVM arg). */
+KaiValue *kaix_int32(int64_t v)                { return kai_int32((int32_t) v); }
+KaiValue *kaix_uint32(int64_t v)               { return kai_uint32((uint32_t) v); }
+KaiValue *kaix_uint64_str(const char *s)       { return kai_uint64((uint64_t) kai_i128_parse(s)); }
+KaiValue *kaix_int128_str(const char *s)       { return kai_int128(kai_i128_parse(s)); }
+
 /* ---------- binops ---------- */
 KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_op_add(a, b); }
 KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_op_sub(a, b); }
@@ -775,6 +786,18 @@ int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
    the shim must read it AND finish the extern call BEFORE the input decref,
    or the buffer is freed under the extern. */
 int64_t     kaix_int_field(KaiValue *v) { return kai_intf(v); }
+/* Read an honest fixed-width value box as i64 (numeric lane A): the
+ * native FFI shim truncates it back to the exact C width. Sign/zero
+ * extension follows the box tag so a uint32_t 0xFFFFFFFF stays positive. */
+int64_t     kaix_fixed_val_field(KaiValue *v) {
+    if (!v) return 0;
+    switch ((KaiTag) v->tag) {
+        case KAI_INT32:  return (int64_t) v->as.i32;
+        case KAI_UINT32: return (int64_t) v->as.u32;
+        case KAI_UINT64: return (int64_t) v->as.u64;
+        default:         return kai_intf(v);
+    }
+}
 const char *kaix_str_bytes(KaiValue *v) { return v->as.s.bytes; }
 
 /* FFI v2 (#417): opaque-handle marshalling for the native backend.
@@ -912,6 +935,20 @@ KaiValue *kaix_prelude_byte_sub(KaiValue *a, KaiValue *b)                { retur
 KaiValue *kaix_prelude_byte_eq(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_eq(a, b); }
 KaiValue *kaix_prelude_byte_lt(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_lt(a, b); }
 KaiValue *kaix_prelude_byte_to_string(KaiValue *v)                       { return kai_prelude_byte_to_string(v); }
+
+/* Fixed-width integer prims (numeric lane A). */
+KaiValue *kaix_prelude_int32_to_string(KaiValue *v)   { return kai_prelude_int32_to_string(v); }
+KaiValue *kaix_prelude_uint32_to_string(KaiValue *v)  { return kai_prelude_uint32_to_string(v); }
+KaiValue *kaix_prelude_uint64_to_string(KaiValue *v)  { return kai_prelude_uint64_to_string(v); }
+KaiValue *kaix_prelude_int128_to_string(KaiValue *v)  { return kai_prelude_int128_to_string(v); }
+KaiValue *kaix_prelude_int_to_int32(KaiValue *v)      { return kai_prelude_int_to_int32(v); }
+KaiValue *kaix_prelude_int_to_uint32(KaiValue *v)     { return kai_prelude_int_to_uint32(v); }
+KaiValue *kaix_prelude_int_to_uint64(KaiValue *v)     { return kai_prelude_int_to_uint64(v); }
+KaiValue *kaix_prelude_int_to_int128(KaiValue *v)     { return kai_prelude_int_to_int128(v); }
+KaiValue *kaix_prelude_int32_to_int(KaiValue *v)      { return kai_prelude_int32_to_int(v); }
+KaiValue *kaix_prelude_uint32_to_int(KaiValue *v)     { return kai_prelude_uint32_to_int(v); }
+KaiValue *kaix_prelude_uint64_to_int(KaiValue *v)     { return kai_prelude_uint64_to_int(v); }
+KaiValue *kaix_prelude_int128_to_int(KaiValue *v)     { return kai_prelude_int128_to_int(v); }
 KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
 KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
 KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
@@ -970,6 +1007,10 @@ void *kaix_evidence_lookup_node(const char *eff_label) {
 
 void *kaix_evidence_require(void *node_v, const char *eff_label) {
     return (void *) kai_evidence_require((KaiEvidence *) node_v, eff_label);
+}
+
+void *kaix_evidence_require_reachable(void *node_v, const char *cap_name) {
+    return (void *) kai_evidence_require_reachable((KaiEvidence *) node_v, cap_name);
 }
 
 /* m7c-c (LLVM per-instance dispatch) — mirror of the C emit's

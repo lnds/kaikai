@@ -187,6 +187,11 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
     TkReal       -> match b { TkReal -> true _ -> false }
+    TkInt32      -> match b { TkInt32 -> true _ -> false }
+    TkUInt32     -> match b { TkUInt32 -> true _ -> false }
+    TkUInt64     -> match b { TkUInt64 -> true _ -> false }
+    TkInt128     -> match b { TkInt128 -> true _ -> false }
+    TkBigInt     -> match b { TkBigInt -> true _ -> false }
     TkComplex    -> match b { TkComplex -> true _ -> false }
     TkChar       -> match b { TkChar -> true _ -> false }
     TkString     -> match b { TkString -> true _ -> false }
@@ -381,7 +386,8 @@ fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
   }
 }
 
-fn decode_int(span: String) : Int {
+#[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
+pub fn decode_int(span: String) : Int {
   let n = string_length(span)
   if n == 0 { 0 }
   else {
@@ -391,6 +397,17 @@ fn decode_int(span: String) : Int {
       None -> 0
     }
   }
+}
+
+# Build a fixed-width integer literal: strip the `suf_len`-char width
+# suffix off the token span and keep the remaining digits verbatim in an
+# `EFixed` node tagged with the width type. The span is decoded per
+# backend (so an Int128 value above 2^63 survives); the value is
+# range-checked at the typer, not here.
+fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
+  let span = tok_source(src, t)
+  let digits = string_slice(span, 0, string_length(span) - suf_len)
+  with_ty(mk_expr(EFixed(digits, ty), t.line, t.col), ty)
 }
 
 fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
@@ -635,6 +652,7 @@ fn arg_has_placeholder(e: Expr) : Bool {
     EPlaceholder        -> true
     EInt(_)             -> false
     EReal(_, _)            -> false
+    EFixed(_, _)          -> false
     EBool(_)            -> false
     EChar(_)            -> false
     EStr(_, _)          -> false
@@ -750,6 +768,7 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
   match k {
     EInt(_)             -> k
     EReal(_, _)            -> k
+    EFixed(_, _)          -> k
     EBool(_)            -> k
     EChar(_)            -> k
     EStr(_, _)          -> k
@@ -1488,6 +1507,28 @@ fn parse_primary(p: Parser) : PExpr / Console {
       let span = tok_source(p.src, t)
       let lit = mk_expr(EReal(decode_real(span), span), t.line, t.col)
       try_lit_unit_annotation(p_advance(p), lit, t)
+    }
+    # Fixed-width integer literals. The token span covers digits +
+    # width suffix; strip the suffix and tag the literal with its width
+    # type, which rides the `EFixed` node (not `.ty`, which later passes
+    # drop). No unit annotation can follow a width-tagged literal.
+    TkInt32  -> ok_e(p_advance(p), fixed_lit(p.src, t, 3, TyInt32))
+    TkUInt32 -> ok_e(p_advance(p), fixed_lit(p.src, t, 3, TyUInt32))
+    TkUInt64 -> ok_e(p_advance(p), fixed_lit(p.src, t, 3, TyUInt64))
+    TkInt128 -> ok_e(p_advance(p), fixed_lit(p.src, t, 4, TyInt128))
+    # `<int>n` desugars at parse time to `bigint.from_int(<int>)`. The
+    # span covers digits + trailing `n`; strip the `n` before decoding.
+    # The value is i64-range (the lexer only accepted a decodable
+    # literal), so it rides an EInt. The resolver rewrites the
+    # `EField(EVar("bigint"), "from_int")` callee to an EModCall once the
+    # `bigint` module is imported (`import math.bigint`).
+    TkBigInt -> {
+      let span = tok_source(p.src, t)
+      let digits = string_slice(span, 0, string_length(span) - 1)
+      let n_e = mk_expr(EInt(decode_int(digits)), t.line, t.col)
+      let mod_var = mk_expr(EVar("bigint"), t.line, t.col)
+      let callee = mk_expr(EField(mod_var, "from_int"), t.line, t.col)
+      ok_e(p_advance(p), mk_expr(ECall(callee, [n_e]), t.line, t.col))
     }
     # `<digits>i` desugars at parse time to
     # `complex.mk(0.0, <digits>)`. Span covers digits + trailing `i`;

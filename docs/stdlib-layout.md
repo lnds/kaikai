@@ -252,7 +252,10 @@ stdlib/
     bits.kai     (shipped — intrinsic bit ops live here, NOT in `math.int`)
     numeric.kai  (shipped)
     complex.kai  (shipped)
+    bigint.kai   (shipped — arbitrary-precision integers, pure kaikai; +bigint_limbs/_convert/_proto)
   decimal.kai    pure, stage 2 (top-level module — shipped)
+  decimal_big.kai pure, stage 2 (top-level module; BigInt carrier, no scale ceiling — shipped; +decimal_big_proto)
+  rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped; +rational_proto)
   money.kai      pure, stage 2 (top-level module; depends on decimal — shipped)
   fx.kai         pure, stage 2 (top-level module; depends on decimal + money — shipped via #365)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
@@ -327,6 +330,11 @@ land in each module's own spec when implemented.
 - `math.numeric` — the `Numeric` ring protocol (`stdlib/math/numeric.kai`), dispatched single-arg. Ring ops `add`, `mul`, `zero`, `one` (#891) plus `abs`, `sign`, `pow_int`, `clamp`; `impl Numeric for Int` / `for Real` (and `for Decimal` in `decimal.kai`). The ring ops back `list.sum` / `list.product` over `[T : Numeric]`. The typer does not verify the ring axioms — implementor's contract.
 - `math.int` — `min`, `max`, `gcd`, `lcm`, `factorial`, `fib`, `is_prime`, `log2`, `div_mod` *(all shipped; `log2` and `div_mod` via #347)*. `abs`, `signum`, `clamp`, `pow` are NOT here — they dispatch through `Numeric for Int` (`stdlib/math/numeric.kai`); `signum` is `Numeric.sign` and `pow` is `Numeric.pow_int`. Coverage for the four Numeric ops over Int lives in `examples/stdlib/math_int_basic.kai`. Bit ops (`shl`, `shr`, `and`, `or`, `xor`, `not`, `popcount`, `leading_zeros`, `trailing_zeros`) are intrinsic — they live in `math/bits.kai`, NOT in `math/int.kai`.
 - `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*; `rem` (`fmod`) wires `impl Rem for Real` so `r1 % r2` type-checks — *(shipped, closes #364)*. `is_nan` / `is_inf` *(planned, no tracking issue)*.
+- `math.bigint` — arbitrary-precision signed integers, pure kaikai, no GMP *(shipped — numeric lane B)*. Sign-magnitude carrier with an inline `Int`-range fast path (`Small(Int) | Big(sign, Array[Int])`); promotes on overflow, never overflows. `from_int` / `from_string` / `to_int`, `add` / `sub` / `mul` / `compare`, `neg` / `abs` / `sign`, and `divmod` / `div` / `rem` (`bigint_convert`). The `n` literal suffix (`99n`) desugars to `bigint.from_int`. `Show` / `Serialize` / `Eq` / `Ord` / `Hash` in `bigint_proto`; magnitude limb arithmetic in `bigint_limbs`.
+
+- `decimal_big` — arbitrary-precision fixed-point with a `BigInt` carrier *(shipped — numeric lane D, closes #514)*. `{ raw: BigInt, scale: Int }`, value `raw / 10^scale`. Unlike `decimal` (Int128 carrier, ~38-digit ceiling), it has no width or scale limit: `add` / `sub` / `mul` are total; `div` takes an explicit truncating target scale (`None` on a zero divisor). `from_int` / `from_big` / `from_parts` / `parse`, `to_string`, `eq` / `cmp` (scale-independent). `Show` / `Eq` / `Ord` in `decimal_big_proto`.
+
+- `rational` — exact rationals over `BigInt` *(shipped — numeric lane D, closes #514)*. `{ num: BigInt, den: BigInt }` kept canonical (positive denominator, sign in the numerator, reduced by `gcd` at every construction). `make` / `from_int` / `from_big` / `parse`, `add` / `sub` / `mul` / `div` / `recip` / `neg` / `abs`, `numerator` / `denominator`, `cmp` / `eq`, `to_string` (`num/den`). `gcd` is the Euclidean algorithm over `BigInt`. `Show` / `Eq` / `Ord` in `rational_proto`.
 
 ### decimal (pure, stage 2)
 

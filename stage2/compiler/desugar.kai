@@ -83,6 +83,7 @@ fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     # Leaves: no sub-Expr to recurse into.
     EInt(_)        -> k
     EReal(_, _)       -> k
+    EFixed(_, _)      -> k
     EBool(_)       -> k
     EChar(_)       -> k
     EStr(_, _)     -> k
@@ -1969,10 +1970,19 @@ fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], n: String, file: String) 
     Some(t) -> match t.kind { EVar(v) -> if v == n { report_cap_return(n, t.line, t.col, file) } else { 0 } _ -> 0 }
     None    -> 0
   }
-  match escaping_closure_opt(tail, n, tainted) {
-    Some(p) -> direct + report_cell_escape(n, p, file)
-    None    -> direct
+  # A `spawn(task)` anywhere in the block defers `task` to another fiber
+  # where the cell's evidence does not exist — a distinct escape from the
+  # value-reaching-exit one above, caught over the whole block, not just
+  # the tail.
+  let spawned = match spawn_block_escape_pos(stmts, tail, n, tainted) {
+    Some(p) -> report_cell_escape(n, p, file)
+    None    -> 0
   }
+  let valued = match escaping_closure_opt(tail, n, tainted) {
+    Some(p) -> report_cell_escape(n, p, file)
+    None    -> 0
+  }
+  direct + spawned + valued
 }
 
 fn report_cap_return(n: String, line: Int, col: Int, file: String) : Int / Console + File {
@@ -1990,7 +2000,7 @@ fn report_cell_escape(n: String, p: CellPos, file: String) : Int / Console + Fil
     "a closure that accesses the mutable cell `", n, "` escapes its block"
   ]))
   diag_help(concat_all([
-    "the handler for `", n, "` is torn down when the block exits; a `var`/State/Reader cell or a capability bound by `as` cannot outlive its `handle` — pass it down as a call argument instead"
+    "the handler for `", n, "` is fiber-local: it is torn down when its block exits and does not cross a `spawn`; a `var`/State/Reader cell or a capability bound by `as` cannot outlive its `handle` — pass its value down as a call argument, or model shared mutable state across fibers as an actor"
   ]))
   1
 }
@@ -2064,6 +2074,222 @@ fn escaping_closure_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos]
     EBang(inner) -> escaping_closure_pos(inner, n, tainted)
     ELitUnit(inner, _) -> escaping_closure_pos(inner, n, tainted)
     _ -> None
+  }
+}
+
+# Walk a block's stmts + tail for a `spawn(task)` whose task touches the
+# cell `n` in the child fiber. Unlike the value-reaching-exit check, this
+# follows into eager lambdas (a `nursery { n -> ... }` body runs in place
+# but may itself spawn), so the whole block is scanned.
+fn spawn_block_escape_pos(stmts: [Stmt], tail: Option[Expr], n: String, tainted: [String]) : Option[CellPos] =
+  first_pos(spawn_stmts_escape_pos(stmts, n, tainted),
+            match tail { Some(t) -> spawn_escape_pos(t, n, tainted)  None -> None })
+
+fn spawn_stmts_escape_pos(stmts: [Stmt], n: String, tainted: [String]) : Option[CellPos] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> spawn_escape_pos(rhs, n, tainted)
+        SExprStmt(x) -> spawn_escape_pos(x, n, tainted)
+        SVar(_, _, rhs, _, _) -> spawn_escape_pos(rhs, n, tainted)
+        SIndexAssign(b, i, v, _, _) -> first_pos(spawn_escape_pos(b, n, tainted),
+          first_pos(spawn_escape_pos(i, n, tainted), spawn_escape_pos(v, n, tainted)))
+        SAssert(c, m) -> first_pos(spawn_escape_pos(c, n, tainted),
+          match m { Some(x) -> spawn_escape_pos(x, n, tainted)  None -> None })
+        _ -> None
+      }
+      # A binder that rebinds `n` (a nested `var n`, or a `let` whose pattern
+      # binds `n`) shadows the cell for the rest of the block: a `counter`
+      # under it is the inner one, on the fiber that declared it. Stop tracking.
+      if stmt_rebinds_cell(s, n) { here }
+      else { first_pos(here, spawn_stmts_escape_pos(rest, n, tainted)) }
+    }
+  }
+}
+
+# `s` introduces a fresh binder named `n`, shadowing the cell from here on.
+fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
+  match s {
+    SVar(m, _, _, _, _) -> m == n
+    SLet(p, _, _) -> list_has(dsg_rename_pat_names(p, []), n)
+    _ -> false
+  }
+
+# A `<recv>.spawn(task)` defers `task` to another fiber, so a `task` that
+# touches the cell escapes its handler. Recurse the whole expression to
+# reach spawns nested under eager lambdas; at each spawn call, test its
+# arguments with `spawn_arg_escape_pos`.
+fn spawn_escape_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let at_spawn = match callee.kind {
+        EField(_, "spawn") -> spawn_args_escape_pos(args_, n, tainted)
+        _ -> None
+      }
+      first_pos(at_spawn, first_pos(spawn_escape_pos(callee, n, tainted),
+                                    spawn_escape_args(args_, n, tainted)))
+    }
+    # A lambda param named `n` shadows the cell inside the body; only descend
+    # when it does not, so the inner `n` is left to its own fiber's handler.
+    ELambda(ps, body) ->
+      if list_has(dsg_rename_param_names(ps, []), n) { None }
+      else { spawn_escape_pos(body, n, tainted) }
+    EBlock(ss, t) -> spawn_block_escape_pos(ss, t, n, tainted)
+    EIf(c, t_, eo) -> first_pos(spawn_escape_pos(c, n, tainted),
+      first_pos(spawn_escape_pos(t_, n, tainted),
+                match eo { Some(x) -> spawn_escape_pos(x, n, tainted)  None -> None }))
+    EMatch(scr, arms) -> first_pos(spawn_escape_pos(scr, n, tainted), spawn_escape_arms(arms, n, tainted))
+    EField(base, _) -> spawn_escape_pos(base, n, tainted)
+    EBang(inner) -> spawn_escape_pos(inner, n, tainted)
+    ELitUnit(inner, _) -> spawn_escape_pos(inner, n, tainted)
+    EList(elems) -> spawn_escape_elems(elems, n, tainted)
+    EBinop(_, a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EUnop(_, x) -> spawn_escape_pos(x, n, tainted)
+    EPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EMapPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EFlatMapPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EFilterPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    _ -> None
+  }
+
+fn spawn_escape_args(es: [Expr], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [h, ...rest] -> first_pos(spawn_escape_pos(h, n, tainted), spawn_escape_args(rest, n, tainted))
+  }
+}
+
+fn spawn_escape_arms(arms: [Arm], n: String, tainted: [String]) : Option[CellPos] {
+  match arms {
+    [] -> None
+    [Arm(p, _, b), ...rest] -> {
+      # An arm pattern binding `n` shadows the cell in that arm's body.
+      let here = if list_has(dsg_rename_pat_names(p, []), n) { None }
+                 else { spawn_escape_pos(b, n, tainted) }
+      first_pos(here, spawn_escape_arms(rest, n, tainted))
+    }
+  }
+}
+
+fn spawn_escape_elems(es: [ListElem], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> spawn_escape_pos(x, n, tainted)  ElSpread(x) -> spawn_escape_pos(x, n, tainted) }
+      first_pos(here, spawn_escape_elems(rest, n, tainted))
+    }
+  }
+}
+
+# A `spawn(task)` argument escapes when the deferred task touches the cell
+# in the child fiber. The task may touch it directly (`n.get`/`n.set`), apply a
+# closure that captured it (a tainted binder), or BE such a captured closure
+# passed straight through (`spawn(reader)`). A bare mention that only forwards
+# the closure onward is not an escape here — the spawn that runs it is.
+fn spawn_args_escape_pos(args_: [Expr], n: String, tainted: [String]) : Option[CellPos] {
+  match args_ {
+    [] -> None
+    [a, ...rest] -> first_pos(spawn_arg_escape_pos(a, n, tainted),
+                              spawn_args_escape_pos(rest, n, tainted))
+  }
+}
+
+fn spawn_arg_escape_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] =
+  match e.kind {
+    ELambda(ps, body) ->
+      # A param named `n` shadows the cell inside the task body.
+      if list_has(dsg_rename_param_names(ps, []), n) { None }
+      else if task_touches_cell(body, n, tainted) { Some(CellPos { line: e.line, col: e.col }) }
+      else { None }
+    EVar(f) -> if list_has(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    _ -> None
+  }
+
+# Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
+# tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
+# `n` masks the cell from that point on, so the inner `n` is its own fiber's.
+fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let direct = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EVar(m) -> m == n and (fname == "get" or fname == "set")
+          _ -> false
+        }
+        _ -> false
+      }
+      let applied = match callee.kind { EVar(f) -> list_has(tainted, f)  _ -> false }
+      direct or applied or task_touches_cell(callee, n, tainted) or task_args_touch_cell(args_, n, tainted)
+    }
+    ELambda(ps, body) ->
+      if list_has(dsg_rename_param_names(ps, []), n) { false } else { task_touches_cell(body, n, tainted) }
+    EField(base, _) -> task_touches_cell(base, n, tainted)
+    EIndex(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EBinop(_, a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EUnop(_, x) -> task_touches_cell(x, n, tainted)
+    EIf(c, t_, eo) -> task_touches_cell(c, n, tainted) or task_touches_cell(t_, n, tainted) or
+      (match eo { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+    EBlock(ss, t) -> task_stmts_touch_cell(ss, n, tainted, t)
+    EMatch(scr, arms) -> task_touches_cell(scr, n, tainted) or task_arms_touch_cell(arms, n, tainted)
+    EList(elems) -> task_elems_touch_cell(elems, n, tainted)
+    ERange(a, b, os) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted) or
+      (match os { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+    EPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EMapPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EFlatMapPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EFilterPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EBang(inner) -> task_touches_cell(inner, n, tainted)
+    ELitUnit(inner, _) -> task_touches_cell(inner, n, tainted)
+    _ -> false
+  }
+
+fn task_args_touch_cell(es: [Expr], n: String, tainted: [String]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if task_touches_cell(h, n, tainted) { true } else { task_args_touch_cell(rest, n, tainted) }
+  }
+}
+
+# A nested `var n` / `let n` rebinds the cell for the rest of the block.
+fn task_stmts_touch_cell(ss: [Stmt], n: String, tainted: [String], tail: Option[Expr]) : Bool {
+  match ss {
+    [] -> match tail { Some(x) -> task_touches_cell(x, n, tainted)  None -> false }
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> task_touches_cell(rhs, n, tainted)
+        SExprStmt(x) -> task_touches_cell(x, n, tainted)
+        SVar(_, _, rhs, _, _) -> task_touches_cell(rhs, n, tainted)
+        SIndexAssign(b, i, v, _, _) -> task_touches_cell(b, n, tainted) or
+          task_touches_cell(i, n, tainted) or task_touches_cell(v, n, tainted)
+        SAssert(c, m) -> task_touches_cell(c, n, tainted) or
+          (match m { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+        _ -> false
+      }
+      if here { true }
+      else if stmt_rebinds_cell(s, n) { false }
+      else { task_stmts_touch_cell(rest, n, tainted, tail) }
+    }
+  }
+}
+
+fn task_arms_touch_cell(arms: [Arm], n: String, tainted: [String]) : Bool {
+  match arms {
+    [] -> false
+    [Arm(p, _, b), ...rest] -> {
+      let here = if list_has(dsg_rename_pat_names(p, []), n) { false } else { task_touches_cell(b, n, tainted) }
+      here or task_arms_touch_cell(rest, n, tainted)
+    }
+  }
+}
+
+fn task_elems_touch_cell(es: [ListElem], n: String, tainted: [String]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> task_touches_cell(x, n, tainted)  ElSpread(x) -> task_touches_cell(x, n, tainted) }
+      here or task_elems_touch_cell(rest, n, tainted)
+    }
   }
 }
 
@@ -2285,6 +2511,7 @@ fn init_is_safe(e: Expr) : Bool {
   match e.kind {
     EInt(_) -> true
     EReal(_, _) -> true
+    EFixed(_, _) -> true
     EBool(_) -> true
     EChar(_) -> true
     EStr(_, _) -> true
@@ -2426,6 +2653,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
   match e.kind {
     EInt(_) -> false
     EReal(_, _) -> false
+    EFixed(_, _) -> false
     EBool(_) -> false
     EChar(_) -> false
     # A naked `name` cell-read hidden inside a `#{...}` interpolation is
@@ -3019,6 +3247,7 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
   match k {
     EInt(_)        -> UseKindAcc { kind: k, acc: acc }
     EReal(_, _)       -> UseKindAcc { kind: k, acc: acc }
+    EFixed(_, _)      -> UseKindAcc { kind: k, acc: acc }
     EBool(_)       -> UseKindAcc { kind: k, acc: acc }
     EChar(_)       -> UseKindAcc { kind: k, acc: acc }
     EStr(_, _)     -> UseKindAcc { kind: k, acc: acc }
