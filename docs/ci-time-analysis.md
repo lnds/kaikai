@@ -240,25 +240,17 @@ mtimes are correct — the touch above makes it so.
 All three shards run on a pre-built kaic2 (build-once simulated via the
 touch), C-only, `KAI_MAX_HEAP=12g`:
 
-| Shard | Contents |
-|---|---|
-| tier1-shard-1 | 5 costly self-compiles + heap-limit + user/core caches + light slice 1/3 |
-| tier1-shard-2 | light slice 2/3 + demos-no-regression |
-| tier1-shard-3 | light slice 3/3 + fmt/bench/check/negative/stdlib-modules/packages/audits/info/doc |
+| Shard | Contents | Local wall | Result |
+|---|---|---|---|
+| tier1-shard-1 | 5 costly self-compiles + heap-limit + user/core caches | 67 s | OK |
+| tier1-shard-2 | light slice 1/2 + demos-no-regression | 166 s | OK |
+| tier1-shard-3 | light slice 2/2 + fmt/bench/check/negative/stdlib-modules/packages/audits/info/doc | 263 s | OK |
 
-Union == the original `tier1` (every phase ran, none twice); the round-robin
-partition of `TEST_LIGHT_TARGETS` into three slices is loss-free and
-overlap-free by construction (35 + 36 + 36 == 107 distinct targets).
-
-The light pool was widened from two slices to three after CI measurement
-exposed a badly unbalanced gate: across four green `main` runs shard-1
-(costly + caches only) finished in ~200 s while shard-3 ran ~700–760 s, so
-the slowest shard — which sets the critical path — carried ~3.7× the
-lightest. Spreading the light pool across all three runners (shard-1 picks
-up slice 1/3 **after** its costly compiles free their RSS, so memory-bound
-and CPU-bound work never overlap) levels the three and shortens the slowest,
-pulling the critical path from ~17.5 min toward ~14–15 min. The remaining
-floor is the `build` job every shard waits on (~295 s, the `-O2` kaic2 `cc`);
-lowering it needs parallel-cc (#999) or a smaller light pool (#962), not more
-shards. The `cc` opt level is a wash for fixtures; no shard rebuilds kaic2
-(verified: `make[2]: 'kaic2' is up to date.` in each shard's log).
+Union == the original `tier1` (every phase ran, none twice). The slowest
+shard (shard-3) sets the critical path; it carries the heavier non-light
+tail. A finer split (SHARDS=3, or moving the non-light tail off shard-3) is
+the obvious next tuning if CI shows shard-3 still dominating — left as a
+follow-up since the knob already exists and the gate is green and under
+budget as-is. The `cc` opt level was confirmed a wash for fixtures; none of
+the shards rebuild kaic2 (verified: `make[2]: 'kaic2' is up to date.` in
+each shard's log).
