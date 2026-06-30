@@ -80,7 +80,7 @@ KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
  * its decimal/hex string global and parses it (no 128-bit LLVM arg). */
 KaiValue *kaix_int32(int64_t v)                { return kai_int32((int32_t) v); }
 KaiValue *kaix_uint32(int64_t v)               { return kai_uint32((uint32_t) v); }
-KaiValue *kaix_uint64(int64_t v)               { return kai_uint64((uint64_t) v); }
+KaiValue *kaix_uint64_str(const char *s)       { return kai_uint64((uint64_t) kai_i128_parse(s)); }
 KaiValue *kaix_int128_str(const char *s)       { return kai_int128(kai_i128_parse(s)); }
 
 /* ---------- binops ---------- */
