@@ -340,6 +340,44 @@ resolve_cache_root() {
   esac
 }
 
+# Usable CPU count for parallel `cc` in the c-modular path. nproc on
+# Linux, sysctl on macOS, else a safe default.
+modular_core_count() {
+  n="$( { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null; } | head -n1 )"
+  case "$n" in
+    ''|*[!0-9]*) n=4 ;;
+  esac
+  printf '%s' "$n"
+}
+
+# Cache root for the c-modular `.o` content-hash cache. Honours
+# KAI_MODULAR_CACHE_DIR, else the same platform conventions as
+# resolve_cache_root under a `cmodular` sub-path. Content keying makes
+# the cache safe to share across projects.
+resolve_modular_cache_dir() {
+  if [ -n "${KAI_MODULAR_CACHE_DIR:-}" ]; then
+    printf '%s' "$KAI_MODULAR_CACHE_DIR"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/cmodular' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/cmodular' "$HOME" ;;
+    *)      printf '%s/.cache/kai/cmodular' "$HOME" ;;
+  esac
+}
+
+# First available content hasher; the command prints the digest as
+# field 1. Empty when none is found, which disables the .o cache.
+modular_hasher() {
+  if command -v sha256sum >/dev/null 2>&1; then printf 'sha256sum'
+  elif command -v shasum >/dev/null 2>&1; then printf 'shasum -a 256'
+  elif command -v cksum >/dev/null 2>&1; then printf 'cksum'
+  fi
+}
+
 # Walk up from $1 looking for a kai.toml. Echoes the directory
 # containing the manifest, or empty if none found before /.
 find_manifest_dir() {
@@ -1283,17 +1321,67 @@ compile_to_binary() {
     # emitted `#include "runtime.h"` resolves without an -I race against
     # a stale system copy. (kai_types.h includes runtime.h by name.)
     cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
-    # Compile each generated .c to its own .o, then link.
-    objs=""
-    for cfile in "$moddir"/*.c; do
-      ofile="${cfile%.c}.o"
-      # shellcheck disable=SC2086
-      $CC $CFLAGS -I "$moddir" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$ofile" \
-        || die "modular compile failed for $(basename "$cfile")"
-      objs="$objs $ofile"
-    done
+    # Backend incremental lever: compile the per-module .c in PARALLEL
+    # and cache each .o by content hash. The key folds the compiler, its
+    # flags, the target arch and the shared headers (so any header edit
+    # invalidates every .o) with the module's own source — so editing one
+    # module recompiles exactly that .o and reuses the rest. The cache
+    # lives outside $tmp so it survives across builds; content keying
+    # makes a stale hit impossible. Knobs: KAI_MODULAR_JOBS (parallelism),
+    # KAI_MODULAR_CACHE_DIR (location), KAI_MODULAR_NO_CACHE=1 (off),
+    # KAI_MODULAR_STATS=1 (one-line hit/compile summary).
+    jobs="${KAI_MODULAR_JOBS:-$(modular_core_count)}"
+    hasher="$(modular_hasher || true)"
+    cachedir=""
+    common=""
+    if [ "${KAI_MODULAR_NO_CACHE:-0}" != "1" ] && [ -n "$hasher" ]; then
+      cachedir="$(resolve_modular_cache_dir)"
+      mkdir -p "$cachedir" 2>/dev/null || cachedir=""
+    fi
+    if [ -n "$cachedir" ]; then
+      common="$( { printf '%s\n%s\n%s\n' "$CC" "$CFLAGS" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
+    fi
+    # Per-module worker (one cc per file, fanned out by xargs -P): a key
+    # hit copies the cached .o; a miss compiles then stores it atomically
+    # via a pid-suffixed temp + mv. Vars cross into the worker as env so
+    # the command template carries no filename placeholder (no xargs -I
+    # substring traps). The trailing input file lands as $1. A miss prints
+    # one `M` line; the hit count is derived as (TUs - misses) rather than
+    # counted, so it is exact by construction — a fast all-hit burst on
+    # some filesystems / shells drops a few of N concurrent marker writes,
+    # but compiles are slow + spaced and the miss tally stays reliable.
+    export KAI_MC_CC="$CC" KAI_MC_CFLAGS="$CFLAGS" \
+      KAI_MC_INC="-I $moddir -I $RUNTIME_INC_C -I $RUNTIME_INC" \
+      KAI_MC_CACHE="$cachedir" KAI_MC_COMMON="$common" \
+      KAI_MC_HASHER="$hasher"
+    outcomes="$(printf '%s\n' "$moddir"/*.c | xargs -P "$jobs" -n 1 sh -c '
+      cf="$1"; of="${cf%.c}.o"
+      key=""
+      if [ -n "$KAI_MC_CACHE" ]; then
+        key="$( { printf "%s\n" "$KAI_MC_COMMON"; cat "$cf"; } | $KAI_MC_HASHER | awk "{print \$1}" )"
+      fi
+      if [ -n "$key" ] && [ -f "$KAI_MC_CACHE/$key.o" ]; then
+        cp "$KAI_MC_CACHE/$key.o" "$of" || exit 1
+      else
+        # shellcheck disable=SC2086
+        $KAI_MC_CC $KAI_MC_CFLAGS $KAI_MC_INC -c "$cf" -o "$of" || {
+          echo "kai: error: modular compile failed for ${cf##*/}" >&2; exit 1; }
+        echo M
+        if [ -n "$key" ]; then
+          cp "$of" "$KAI_MC_CACHE/$key.o.$$" 2>/dev/null \
+            && mv "$KAI_MC_CACHE/$key.o.$$" "$KAI_MC_CACHE/$key.o" 2>/dev/null || true
+        fi
+      fi
+    ' _)" || die "modular compile failed"
+    if [ "${KAI_MODULAR_STATS:-0}" = "1" ]; then
+      ntu="$(ls "$moddir"/*.c 2>/dev/null | wc -l | tr -d ' ')"
+      nmiss="$(printf '%s\n' "$outcomes" | grep -c '^M$' || true)"
+      nhit=$(( ntu - nmiss ))
+      echo "kai: c-modular: ${ntu} TUs, jobs=${jobs}, cache hits=${nhit} compiled=${nmiss}${cachedir:+ (${cachedir})}" >&2
+    fi
+    # Link all module objects.
     # shellcheck disable=SC2086
-    $CC $CFLAGS $objs -o "$out" -lm \
+    $CC $CFLAGS "$moddir"/*.o -o "$out" -lm \
       || die "modular link failed"
   else
     # shellcheck disable=SC2086
