@@ -316,6 +316,8 @@ type Color = Red | Green | Blue
 fn main() : Unit / Stdout = {
   let n = 42 + 0xFF + 0b1010                   # numbers
   let r = 3.14 + 2.5e-2                        # reals
+  let w = 42i32 + 7i32                         # fixed-width: i32/u32/
+  let big : Int128 = 9223372036854775808i128   #   u64/i128 suffixes
   let c = 'A'                                  # chars (Unicode scalar
   let acc = 'á'                                #   value; 'á' '▸'
   let emo = '\u{1F389}'                        #   '\u{1F389}' all lex)
@@ -359,6 +361,23 @@ pipes         |>  |  ||  |?                          (left-assoc)
 Boolean operators are the keywords `and`, `or`, `not` — not `&&`,
 `||`, `!`. (`||` is the flat-map pipe; `!` is postfix Option/Result
 propagation.)
+
+### Fixed-width integers
+
+Besides `Int` (64-bit) and `Real`, there are four fixed-width integer
+types written with a literal suffix: `42i32` (`Int32`), `42u32`
+(`UInt32`), `42u64` (`UInt64`), `42i128` (`Int128`). They are
+kind-distinct from `Int` — an `Int32` does not unify with an `Int`, so
+mixing them is a type error; convert explicitly with `int_to_int32` /
+`int32_to_int` (and the `u32`/`u64`/`i128` analogues). Arithmetic
+(`+ - * < ==`) wraps two's-complement in the width, and `Show` / `Eq` /
+`Ord` / `Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at
+~19), so a literal above 2^63 is written `…i128` and round-trips
+exactly. The suffix attaches to a decimal/hex/bin literal with no
+intervening space; `42i` without a width stays a complex literal.
+
+In an `extern "C"` signature these widths marshal honestly: `Int32`
+crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
 
 ## Records
 

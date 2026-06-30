@@ -182,6 +182,10 @@ typedef enum {
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
+    KAI_INT32,        /* numeric lane A: signed 32-bit, nominal */
+    KAI_UINT32,       /* numeric lane A: unsigned 32-bit, nominal */
+    KAI_UINT64,       /* numeric lane A: unsigned 64-bit, nominal */
+    KAI_INT128,       /* numeric lane A: signed 128-bit, nominal */
     KAI_FOREIGN       /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
                        * Parks a raw `void *` the kaikai side threads through
                        * but never inspects. RC manages the box; the parked
@@ -440,6 +444,16 @@ struct KaiValue {
         double   r;                                 /* KAI_REAL */
         uint32_t c;                                 /* KAI_CHAR */
         uint8_t  byte_val;                                /* KAI_BYTE — Lane 4 (#473) */
+        int32_t  i32;                               /* KAI_INT32 */
+        uint32_t u32;                               /* KAI_UINT32 */
+        uint64_t u64;                               /* KAI_UINT64 */
+        /* KAI_INT128. Stored as two 8-byte halves, NOT a bare `__int128`:
+         * `__int128` carries a 16-byte alignment requirement that would
+         * raise KaiValue's alignment to 16, but the allocator/arena align
+         * to 8 — a misaligned `->as.i128` access is UB that segfaults on
+         * Linux/-O2 (and UBSan flags it). Access via kai_i128_load /
+         * kai_i128_store (memcpy, alignment-agnostic). */
+        uint64_t i128_halves[2];                    /* KAI_INT128 (lo, hi) */
         struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
         struct { KaiValue *head; KaiValue *tail; } cons;
         struct {
@@ -602,6 +616,15 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         case KAI_PID:     return KAI_HEAD_PID;
         case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
         case KAI_BYTE:    return KAI_HEAD_BYTE;
+        /* Fixed-width integers dispatch protocols at compile time (the
+         * typer resolves Show/Eq/Ord against the static type), so the
+         * runtime head tag is only consulted for a dynamically-typed
+         * box — there they ride the Int head, which is sound because no
+         * primitive carries a conflicting custom impl. */
+        case KAI_INT32:
+        case KAI_UINT32:
+        case KAI_UINT64:
+        case KAI_INT128:  return KAI_HEAD_INT;
     }
     return KAI_HEAD_ANON;
 }
@@ -684,6 +707,10 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_ARRAY:   return "array";
         case KAI_REF:     return "ref";
         case KAI_BYTE:      return "Byte";
+        case KAI_INT32:     return "Int32";
+        case KAI_UINT32:    return "UInt32";
+        case KAI_UINT64:    return "UInt64";
+        case KAI_INT128:    return "Int128";
         default:          return "?";
     }
 }
@@ -1152,6 +1179,10 @@ static const char *kai_leaksite_alloc_fn(int32_t tag) {
         case KAI_FIBER:   return "kai_fiber";
         case KAI_PID:     return "kai_pid";
         case KAI_BYTE:      return "kai_byte";
+        case KAI_INT32:     return "kai_int32";
+        case KAI_UINT32:    return "kai_uint32";
+        case KAI_UINT64:    return "kai_uint64";
+        case KAI_INT128:    return "kai_int128";
         default:          return "kai_alloc";
     }
 }
@@ -3288,6 +3319,81 @@ static KAI_RC_NOINLINE KaiValue *kai_byte(uint8_t n) {
     return v;
 }
 
+/* Fixed-width integer boxes (numeric lane A). Used only when a raw iN
+ * value must cross into a boxed slot (Show, polymorphic container);
+ * arithmetic stays raw and never allocates. */
+static KAI_RC_NOINLINE KaiValue *kai_int32(int32_t n) {
+    KaiValue *v = kai_alloc(KAI_INT32);
+    v->as.i32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint32(uint32_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT32);
+    v->as.u32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint64(uint64_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT64);
+    v->as.u64 = n;
+    return v;
+}
+/* Load / store an Int128 box's value through its two 8-byte halves.
+ * `memcpy` is alignment-agnostic, so this never triggers the misaligned
+ * `__int128` access UB that a bare `v->as.i128` would on an 8-byte-aligned
+ * KaiValue (the cause of the Linux/-O2 selfhost segfault). */
+static inline __int128 kai_i128_load(const KaiValue *v) {
+    __int128 n;
+    memcpy(&n, v->as.i128_halves, sizeof(n));
+    return n;
+}
+static inline void kai_i128_store(KaiValue *v, __int128 n) {
+    memcpy(v->as.i128_halves, &n, sizeof(n));
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_int128(__int128 n) {
+    KaiValue *v = kai_alloc(KAI_INT128);
+    kai_i128_store(v, n);
+    return v;
+}
+
+/* Parse a decimal / `0x` hex / `0b` binary integer literal (digits
+ * only, optional leading `-`, `_` separators allowed) into __int128.
+ * The compiler emits this for Int128 literals whose value may exceed
+ * 64 bits — no C integer constant can hold them, so we build the value
+ * at runtime. Overflow past 128 bits wraps (two's complement). */
+static __int128 kai_i128_parse(const char *s) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    unsigned __int128 acc = 0;
+    unsigned base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+    else if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) { base = 2; s += 2; }
+    for (; *s; s++) {
+        char c = *s;
+        if (c == '_') continue;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned) (c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned) (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned) (c - 'A' + 10);
+        else break;
+        acc = acc * base + d;
+    }
+    return neg ? -(__int128) acc : (__int128) acc;
+}
+
+/* Render a signed 128-bit value to decimal (handles INT128_MIN). The
+ * C library has no %lld for __int128, so we build the digits manually
+ * into `buf` (max 40 chars: sign + 39 digits) and return the start. */
+static char *kai_i128_to_decimal(__int128 v, char *buf, size_t buflen) {
+    char *p = buf + buflen - 1;
+    *p = '\0';
+    unsigned __int128 mag = (v < 0) ? (unsigned __int128)(-(v + 1)) + 1u
+                                    : (unsigned __int128) v;
+    do { *--p = (char) ('0' + (int) (mag % 10)); mag /= 10; } while (mag != 0);
+    if (v < 0) *--p = '-';
+    return p;
+}
+
 /* FFI v2 (#417): box an opaque C handle. `p` is borrowed external
  * memory — RC frees only this box, never `p` (see kai_free_value's
  * default arm: no payload free for KAI_FOREIGN). */
@@ -4628,6 +4734,10 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
         case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
+        case KAI_INT32:     return a->as.i32 == b->as.i32;
+        case KAI_UINT32:    return a->as.u32 == b->as.u32;
+        case KAI_UINT64:    return a->as.u64 == b->as.u64;
+        case KAI_INT128:    return kai_i128_load(a) == kai_i128_load(b);
     }
     return 0;
 }
@@ -4763,6 +4873,19 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
             return kai_str(buf);
+        case KAI_INT32:
+            snprintf(buf, sizeof(buf), "%d", (int) v->as.i32);
+            return kai_str(buf);
+        case KAI_UINT32:
+            snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u32);
+            return kai_str(buf);
+        case KAI_UINT64:
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long) v->as.u64);
+            return kai_str(buf);
+        case KAI_INT128: {
+            char i128buf[44];
+            return kai_str(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
+        }
     }
     return kai_str("?");
 }
@@ -5132,6 +5255,48 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
     kai_decref(v);
     return kai_str(buf);
 }
+
+/* Fixed-width integer Show prims (numeric lane A). Each consumes its
+ * boxed argument (per the prelude consume discipline) and renders the
+ * raw value via the same width-correct formatting as `kai_to_string`. */
+static KaiValue *kai_prelude_int32_to_string(KaiValue *v) {
+    int32_t n = (v && kai_is_ptr(v) && v->tag == KAI_INT32) ? v->as.i32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%d", (int) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_uint32_to_string(KaiValue *v) {
+    uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%u", (unsigned) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_uint64_to_string(KaiValue *v) {
+    uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64 : 0;
+    if (v) kai_decref(v);
+    char buf[24]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long) n);
+    return kai_str(buf);
+}
+static KaiValue *kai_prelude_int128_to_string(KaiValue *v) {
+    __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0;
+    if (v) kai_decref(v);
+    char buf[44];
+    return kai_str(kai_i128_to_decimal(n, buf, sizeof(buf)));
+}
+
+/* Fixed-width conversions. `int_to_*` truncates the 64-bit Int into the
+ * width (C cast semantics, no range check); `*_to_int` widens back —
+ * lossless for Int32/UInt32, a reinterpret for UInt64/Int128 values
+ * beyond Int's range (documented; callers needing exact 128-bit values
+ * keep them as Int128). */
+static KaiValue *kai_prelude_int_to_int32(KaiValue *v)  { int64_t n = kai_intf(v); kai_decref(v); return kai_int32((int32_t) n); }
+static KaiValue *kai_prelude_int_to_uint32(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint32((uint32_t) n); }
+static KaiValue *kai_prelude_int_to_uint64(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint64((uint64_t) n); }
+static KaiValue *kai_prelude_int_to_int128(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_int128((__int128) n); }
+static KaiValue *kai_prelude_int32_to_int(KaiValue *v)  { int32_t n  = (v && kai_is_ptr(v) && v->tag == KAI_INT32)  ? v->as.i32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_uint32_to_int(KaiValue *v) { uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_uint64_to_int(KaiValue *v) { uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_prelude_int128_to_int(KaiValue *v) { __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0; kai_decref(v); return kai_int((int64_t) n); }
 
 /* ---------- prelude: math/real libm bindings (issue #343) ----------
  * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
@@ -5532,10 +5697,32 @@ static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
  * silences the UB without changing any emitted output. Division and
  * comparison stay signed (their overflow is not part of the contract).
  */
+/* Fixed-width boxed arithmetic (numeric lane A). The native backend
+ * boxes fixed-width literals, so `+`/`-`/`*` over two same-tag boxes land
+ * here. Each computes in the unsigned of the width (defined two's-
+ * complement wrap) and re-boxes. Returns NULL when the pair is not a
+ * matching fixed-width pair, so the caller falls through to its Int/Real
+ * path. (The C backend never reaches this — it keeps fixed-width raw.) */
+static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32: { uint32_t x = (uint32_t) a->as.i32, y = (uint32_t) b->as.i32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int32((int32_t) r); }
+        case KAI_UINT32: { uint32_t x = a->as.u32, y = b->as.u32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint32(r); }
+        case KAI_UINT64: { uint64_t x = a->as.u64, y = b->as.u64;
+            uint64_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint64(r); }
+        case KAI_INT128: { unsigned __int128 x = (unsigned __int128) kai_i128_load(a), y = (unsigned __int128) kai_i128_load(b);
+            unsigned __int128 r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int128((__int128) r); }
+        default: return NULL;
+    }
+}
+
 static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '+')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5545,6 +5732,7 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '-')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5554,6 +5742,7 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '*')) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -5595,11 +5784,26 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     return r;
 }
 
+/* Less-than for two same-tag fixed-width boxes; signedness per the
+ * width. Sets `*out` and returns 1 on a match, 0 otherwise. */
+static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_INT32:  *out = a->as.i32  < b->as.i32;  return 1;
+        case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
+        case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
+        case KAI_INT128: *out = kai_i128_load(a) < kai_i128_load(b); return 1;
+        default: return 0;
+    }
+}
+
 static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
+    int _flt;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) < kai_intf(b));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
     else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
+    else if (kai_fixed_lt(a, b, &_flt)) r = kai_bool(_flt);
     else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);

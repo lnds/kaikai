@@ -83,6 +83,13 @@ pub type TokKind
   | TkRegex
   # literals
   | TkInt | TkReal | TkChar | TkString
+  # Fixed-width integer literals: a numeric scan followed *immediately*
+  # by a width suffix (`42i32`, `42u32`, `42u64`, `42i128`). The token
+  # span covers the digits AND the suffix; the parser strips the suffix
+  # before decoding and pins the literal's type. `i128` keeps its
+  # textual span (an EFixed node) because its value can exceed 2^63 and
+  # would overflow the compiler's 64-bit decode.
+  | TkInt32 | TkUInt32 | TkUInt64 | TkInt128
   # m12.x: numeric literal followed *immediately* (no whitespace) by
   # `i` lexes as TkComplex. The token span includes the trailing `i`;
   # the parser strips it before decoding the imaginary value as Real
@@ -147,6 +154,7 @@ pub fn tk_name(k: TokKind) : String {
     TkHashOpen -> "#["
     TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
+    TkInt32 -> "INT32" TkUInt32 -> "UINT32" TkUInt64 -> "UINT64" TkInt128 -> "INT128"
     TkComplex -> "COMPLEX"
     TkIdent -> "IDENT" TkUnderscore -> "_"
     TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
@@ -482,18 +490,92 @@ fn lex_number_decimal(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
   }
 }
 
-# Phase 1 of #267 — after a complete numeric scan, peek for an
-# *immediately adjacent* `i` and, if present, consume it and emit
-# TkComplex. The token span covers the digits + `i` suffix; the
-# parser strips the trailing `i` before decoding the imaginary value
-# as Real. Whitespace before `i` already terminates the numeric scan,
-# so `3 + i` and `for i in ...` continue to lex `i` as TkIdent.
+# A matched fixed-width suffix: the width token and the lexer advanced
+# past the suffix characters.
+type WidthSuffix = WS(TokKind, Lexer)
+
+# Try to consume a fixed-width suffix (`i32`/`u32`/`u64`/`i128`) starting
+# at `l`. Only valid on an integer base, so the caller gates on
+# `fallback == TkInt`. `i64` is intentionally NOT a suffix (the base
+# `Int` IS i64); it is rejected so a stray `42i64` surfaces as a lex
+# error rather than silently becoming complex `42i` + `64`.
+fn lex_width_suffix(l: Lexer, fallback: TokKind) : Option[WidthSuffix] {
+  let is_int = match fallback { TkInt -> true _ -> false }
+  if not is_int { None }
+  else {
+    match lex_peek(l) {
+      Some('i') -> lex_width_after_i(lex_advance(l))
+      Some('u') -> lex_width_after_u(lex_advance(l))
+      _         -> None
+    }
+  }
+}
+
+# After the leading `i`: `32` is Int32, `128` is Int128. Anything else
+# (including a bare `i`, which is complex) returns None.
+fn lex_width_after_i(l: Lexer) : Option[WidthSuffix] {
+  if lex_match_str(l, "32") { Some(WS(TkInt32, lex_skip(l, 2))) }
+  else if lex_match_str(l, "128") { Some(WS(TkInt128, lex_skip(l, 3))) }
+  else { None }
+}
+
+# After the leading `u`: `32` is UInt32, `64` is UInt64.
+fn lex_width_after_u(l: Lexer) : Option[WidthSuffix] {
+  if lex_match_str(l, "32") { Some(WS(TkUInt32, lex_skip(l, 2))) }
+  else if lex_match_str(l, "64") { Some(WS(TkUInt64, lex_skip(l, 2))) }
+  else { None }
+}
+
+# True when `s` matches the source at `l.pos` AND the char immediately
+# after is not alphanumeric (so `42u32x` does not match `u32`).
+fn lex_match_str(l: Lexer, s: String) : Bool {
+  let n = string_length(s)
+  if not lex_str_eq_at(l, s, 0, n) { false }
+  else {
+    match lex_peek_at(l, n) {
+      Some(c) -> not ch_is_alnum(c)
+      None    -> true
+    }
+  }
+}
+
+fn lex_str_eq_at(l: Lexer, s: String, i: Int, n: Int) : Bool {
+  if i >= n { true }
+  else {
+    match char_at(s, i) {
+      None -> true
+      Some(want) -> match lex_peek_at(l, i) {
+        Some(got) -> if got == want { lex_str_eq_at(l, s, i + 1, n) } else { false }
+        None      -> false
+      }
+    }
+  }
+}
+
+fn lex_skip(l: Lexer, n: Int) : Lexer =
+  if n <= 0 { l } else { lex_skip(lex_advance(l), n - 1) }
+
+# After a complete numeric scan, peek for an *immediately adjacent*
+# typed suffix. Three outcomes:
+#  - a fixed-width suffix (`i32`/`u32`/`u64`/`i128`) gives the matching
+#    width token, span covering digits + suffix (parser strips it);
+#  - a lone `i` not starting a width suffix gives TkComplex (#267 phase
+#    1), its span covering the digits + `i`;
+#  - nothing adjacent gives the integer/real `fallback`.
+# Whitespace before the suffix already terminates the numeric scan, so
+# `3 + i` and `for i in ...` keep lexing `i` as TkIdent. The width path
+# only fires on the *integer* fallback; a Real base never reaches it
+# (`lex_width_suffix` returns None), so `1.0i` stays complex.
 fn lex_maybe_complex_suffix(l: Lexer, sl: Int, sc: Int, start: Int, fallback: TokKind) : LexStep {
-  if lex_peek_is(l, 'i') {
-    let l_after = lex_advance(l)
-    Step(l_after, tok(TkComplex, sl, sc, start, l_after.pos))
-  } else {
-    Step(l, tok(fallback, sl, sc, start, l.pos))
+  match lex_width_suffix(l, fallback) {
+    Some(WS(kind, l_after)) -> Step(l_after, tok(kind, sl, sc, start, l_after.pos))
+    None ->
+      if lex_peek_is(l, 'i') {
+        let l_after = lex_advance(l)
+        Step(l_after, tok(TkComplex, sl, sc, start, l_after.pos))
+      } else {
+        Step(l, tok(fallback, sl, sc, start, l.pos))
+      }
   }
 }
 
