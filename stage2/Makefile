@@ -5563,14 +5563,13 @@ test-independence-oracle: $(TARGET)
 test-batch-isolation: $(TARGET)
 	@KAIC2="$$(pwd)/$(TARGET)" bash ../tools/batch-isolation.sh
 
-# Native self-host gate (#1021): compile the compiler (stage2/main.kai)
-# with the in-process libLLVM native backend and count the `unbound
-# register` subset-gap aborts against tools/native-selfhost-baseline.txt.
-# FAILS only on regression (count rises); the current known gap is a
-# documented expected-fail that PASSES. The script relinks kaic2 with
-# KAI_LLVM=1 itself and SKIPs (exit 0) where libLLVM is absent — additive
-# and native-only, does not touch the C bootstrap. NO $(TARGET) prereq:
-# the script owns the native relink (mirrors test-native-parity.sh).
+# Native self-host gate: compile the compiler (stage2/main.kai) with the
+# native backend and count the `unbound register` subset-gap aborts against
+# tools/native-selfhost-baseline.txt. FAILS only on regression (count rises);
+# the known gap is a documented expected-fail that PASSES. The script relinks
+# kaic2 with KAI_LLVM=1 itself and SKIPs (exit 0) where libLLVM is absent —
+# native-only, does not touch the C bootstrap. No $(TARGET) prereq: the script
+# owns the native relink (mirrors test-native-parity.sh).
 test-native-selfhost-gate:
 	@CC="$(CC)" LLVM_CONFIG="$(LLVM_CONFIG)" bash ../tools/test-native-selfhost-gate.sh
 

@@ -1,28 +1,20 @@
 #!/bin/bash
-# Native self-host gate (issue #1021).
+# Native self-host gate.
 #
-# The in-process libLLVM native backend (`kaic2 --emit=native`) is the
-# DEFAULT since the Lane 1.5 flip, and the native-vs-C parity ratchet
-# reached zero — but that ratchet covers ~620 USER-PROGRAM fixtures. No
-# test compiles the COMPILER ITSELF with the native backend (the compiler
-# is built C-only: bootstrap + selfhost oracle). So any KIR construct the
-# native backend cannot yet lower, but the compiler's own source uses, is
-# NEVER exercised in CI — the subset gap is silent. native looks
-# "complete" because nothing that uses the missing pieces is tested.
+# The native-vs-C parity ratchet covers user-program fixtures, but nothing
+# compiles the COMPILER ITSELF with the native backend (the compiler builds
+# C-only). So a KIR construct the native backend cannot lower yet, but the
+# compiler's own source uses, is never exercised — the subset gap is silent.
 #
-# This gate makes the gap VISIBLE: it compiles `stage2/main.kai` (the
-# modular compiler entry point) with `--emit=native` and counts the
-# `unbound register` subset-gap aborts. It does NOT block: in the current
-# expected-fail state the count equals the baseline and the gate PASSES.
-# It fails ONLY on REGRESSION (the count rises). See
-# tools/native-selfhost-baseline.txt for the ratchet semantics.
+# This gate makes the gap visible: it compiles `stage2/main.kai` with
+# `--emit=native` and counts the `unbound register` subset-gap aborts,
+# ratcheting the total against tools/native-selfhost-baseline.txt — FAIL
+# only on regression (count rises). The baseline file documents the ratchet
+# semantics. Measuring only; closing the gap lives in emit_native_fn.kai +
+# kir_lower_*.kai.
 #
-# This gate does NOT close the gap (driving the count to 0 is separate,
-# potentially large work in emit_native_fn.kai + kir_lower_*.kai, tracked
-# by #1021). It installs the meter + baseline + regression guard only.
-#
-# Additive and native-only: it does NOT touch the C bootstrap or the
-# selfhost C-byte-id check. It exits 0 (SKIP) where libLLVM is absent.
+# Native-only: does not touch the C bootstrap or the selfhost C-byte-id
+# check. Exits 0 (SKIP) where libLLVM is absent.
 
 set -eu
 
@@ -112,13 +104,13 @@ if [ "$count" -gt "$baseline" ]; then
   exit 1
 elif [ "$count" -eq 0 ]; then
   echo "native-selfhost-gate: native self-host ACHIEVED — the compiler lowers under the native backend with zero subset-gap aborts."
-  echo "  Next: upgrade this gate to require the native object to LINK + RUN, and close #1021."
+  echo "  Next: upgrade this gate to require the native object to LINK + RUN."
   exit 0
 elif [ "$count" -lt "$baseline" ]; then
   echo "native-selfhost-gate: PASS — baseline improvable; part of the gap closed."
   echo "  Lower the baseline in $BASELINE_FILE from $baseline to $count to tighten the ratchet."
   exit 0
 else
-  echo "native-selfhost-gate: PASS — known gap held at baseline $baseline (documented expected-fail; #1021 still open)."
+  echo "native-selfhost-gate: PASS — known gap held at baseline $baseline (documented expected-fail)."
   exit 0
 fi
