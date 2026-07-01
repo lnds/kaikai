@@ -6,12 +6,19 @@
 # C-only). So a KIR construct the native backend cannot lower yet, but the
 # compiler's own source uses, is never exercised — the subset gap is silent.
 #
-# This gate makes the gap visible: it compiles `stage2/main.kai` with
-# `--emit=native` and counts the `unbound register` subset-gap aborts,
-# ratcheting the total against tools/native-selfhost-baseline.txt — FAIL
-# only on regression (count rises). The baseline file documents the ratchet
-# semantics. Measuring only; closing the gap lives in emit_native_fn.kai +
-# kir_lower_*.kai.
+# This gate makes the gap visible and drives it toward LINK + RUN:
+#   1. compiles `stage2/main.kai` with `--emit=native` and counts the
+#      `unbound register` subset-gap aborts, ratcheting against
+#      tools/native-selfhost-baseline.txt (FAIL on regression). The baseline
+#      is 0 — the COMPILE half is cleared.
+#   2. once the count is 0, LINKS the native object into an executable
+#      kaic2-native (tools/native-selfhost-link.sh) and RUNS it (`--version`)
+#      to prove the native-built compiler starts and executes real kaikai.
+#
+# Milestone status (issue #1021): COMPILE + LINK + RUN are green. The
+# remaining step — recursive self-host (the native-built kaic2 compiling a
+# sample program) — is blocked by a native -O2 codegen bug (see the count==0
+# arm below) and tracked separately; this gate does not yet require it.
 #
 # Native-only: does not touch the C bootstrap or the selfhost C-byte-id
 # check. Exits 0 (SKIP) where libLLVM is absent.
@@ -64,7 +71,7 @@ LLVM_CONFIG="$LLVM_CONFIG" make -C "$ROOT/stage2" KAI_LLVM=1 kaic2 >/dev/null 2>
 # object path from the source (main.kai -> main.o) and ignores -o, so we
 # pass no -o and clean main.o (+ any partial compiler/*.o) afterwards.
 ERR="$(mktemp)"
-trap 'rm -f "$ERR" "$ROOT/stage2/main.o"; find "$ROOT/stage2/compiler" -name "*.o" -delete 2>/dev/null || true' EXIT
+trap 'rm -f "$ERR" "$ROOT/stage2/main.o" "$ROOT/stage2/kaic2-native" "$ROOT/stage2/native-selfhost-shim.o"; find "$ROOT/stage2/compiler" -name "*.o" -delete 2>/dev/null || true' EXIT
 
 echo "native-selfhost-gate: compiling stage2/main.kai with --emit=native …"
 rc=0
@@ -103,8 +110,41 @@ if [ "$count" -gt "$baseline" ]; then
   echo "  Either fix the regression, or (if intentional and justified) raise the baseline in $BASELINE_FILE."
   exit 1
 elif [ "$count" -eq 0 ]; then
-  echo "native-selfhost-gate: native self-host ACHIEVED — the compiler lowers under the native backend with zero subset-gap aborts."
-  echo "  Next: upgrade this gate to require the native object to LINK + RUN."
+  # COMPILE cleared: the native backend lowers the whole compiler with zero
+  # subset-gap aborts and produced main.o. Now assert LINK + RUN — the
+  # milestone this gate ratchets toward (issue #1021).
+  echo "native-selfhost-gate: COMPILE OK — the compiler lowers under the native backend with zero subset-gap aborts."
+  echo "native-selfhost-gate: linking the native compiler object …"
+  BIN="$ROOT/stage2/kaic2-native"
+  if ! LLVM_CONFIG="$LLVM_CONFIG" CC="$CC" "$ROOT/tools/native-selfhost-link.sh" "$ROOT/stage2/main.o" "$BIN" 2>&1; then
+    echo "::error::native-selfhost-gate FAIL — the native compiler object did NOT link into an executable."
+    exit 1
+  fi
+  [ -x "$BIN" ] || { echo "::error::native-selfhost-gate FAIL — linker produced no $BIN"; exit 1; }
+  echo "native-selfhost-gate: LINK OK — produced $BIN"
+
+  # RUN: the native-built compiler must START and execute real kaikai code.
+  # `--version` runs `fn main`'s driver far enough to print via Stdout (the
+  # inferred-row default-handler path #1021 fixed) and exit cleanly, WITHOUT
+  # entering the front-end. It proves the binary loads, its runtime + effect
+  # defaults are wired, and it runs — the LINK+RUN half of the milestone.
+  echo "native-selfhost-gate: running the native compiler (--version) …"
+  vout="$("$BIN" --version 2>&1)"; vrc=$?
+  if [ "$vrc" -ne 0 ]; then
+    echo "::error::native-selfhost-gate FAIL — the native-built compiler crashed on --version (exit $vrc)."
+    echo "  It linked but does not run. Output:"; echo "$vout" | sed 's/^/    /'
+    rm -f "$BIN"; exit 1
+  fi
+  echo "native-selfhost-gate: RUN OK — the native-built compiler starts and runs: $vout"
+  rm -f "$BIN"
+
+  # SELF-COMPILE (recursive self-host) is the remaining milestone: the
+  # native-built kaic2 compiling a sample program. It is BLOCKED by a native
+  # -O2 codegen bug (a variant scrutinee reaches `kaix_variant_tag_of` as a
+  # tagged Int in `rqc_decl`, crashing the front-end; -O0 masks it). Tracked
+  # separately (refs #1021). This gate holds LINK+RUN against regression; it
+  # does not yet require self-compile.
+  echo "native-selfhost-gate: LINK + RUN achieved. Self-compile (recursive self-host) is blocked by a native -O2 codegen bug — tracked separately."
   exit 0
 elif [ "$count" -lt "$baseline" ]; then
   echo "native-selfhost-gate: PASS — baseline improvable; part of the gap closed."
