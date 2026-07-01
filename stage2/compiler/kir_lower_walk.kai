@@ -1156,9 +1156,13 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lm_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
+      # A non-reuse owned arm gets the #858 structural dup of its alias binders;
+      # a reuse arm instead publishes its head/tail binders as the reuse-gc set so
+      # the `KConReuse` shared path increfs them (the C oracle's shared-branch
+      # `incref(_scr->head/tail)`), else the match-exit drop frees them (#1025).
       let st_dup = if owned and not arm_body_uses_reuse(body) {
         lm_dup_alias_binders(list_arm_alias_binders(p), KAt(p.line, p.col), st_body)
-      } else { st_body }
+      } else { set_reuse_gc_for_arm(p, body, st_body) }
       let st_drop = match_selftail_scr_drop(owned, sd, body, st_dup)
       let st_done = lower_branch_into(body, join, lcont, st_drop)
       if list_arm_is_catchall(p) { st_done }
@@ -1416,8 +1420,18 @@ fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : L
 # children) — exactly the borrowed leaves the rebuild embeds.
 fn set_reuse_gc_for_arm(p: Pattern, body: Expr, st: LowerSt) : LowerSt =
   if arm_body_uses_reuse(body) {
-    ls_set_reuse_gc(st, variant_reuse_scrutinee_binders(p, st.vs))
+    ls_set_reuse_gc(st, reuse_scrutinee_binders(p, st.vs))
   } else { ls_set_reuse_gc(st, []) }
+
+# The scrutinee pointer-binders the `KConReuse` shared path protects, by pattern
+# shape. A `PVariant` filters by slot kind; a `PList` cons arm keeps head + tail,
+# both cons pointer slots — the C oracle increfs `_scr->head`/`_scr->tail` in its
+# shared branch, so a reuse over a SHARED cons donor needs the same per-child
+# incref or the match-exit `decref(donor)` frees the borrowed children (#1025).
+fn reuse_scrutinee_binders(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
+  PList(_, _) -> list_arm_alias_binders(p)
+  _           -> variant_reuse_scrutinee_binders(p, vs)
+}
 
 # True iff this arm should capture its consumed scrutinee as an arm-top reuse
 # token (#872): a PVariant arm whose body has a `__kai_trmc|` step on some tail
@@ -2011,7 +2025,7 @@ fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: L
 # consumes — `KCon` fresh-allocs).
 fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
-  let st_gc = if reuse_kind_is_variant(rk) and not nested {
+  let st_gc = if not nested {
                 emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st.reuse_gc), kpos_of(x), st)
               } else { st }
   match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) -> {

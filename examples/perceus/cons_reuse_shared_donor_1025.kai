@@ -1,0 +1,60 @@
+# Issue #1025 — native cons-reuse over a SHARED donor dropped its borrowed
+# children without an incref.
+#
+# A `match ds { [d, ...rest] -> [f(d), ...g(rest)] }` whose arm body rebuilds
+# the cons is a Perceus cons-reuse: when `ds` is UNIQUE the node is donated in
+# place, when SHARED the rebuild fresh-allocs and keeps a BORROWED reference to
+# each kept child (`d`, `rest`). The C-direct oracle increfs `_scr->head` /
+# `_scr->tail` in its shared branch; the native backend emitted the reuse-gc
+# increfs only for VARIANT reuse (`reuse_kind_is_variant`), never for cons — so
+# the match-exit `decref(donor)` freed `d`/`rest` while the still-live shared
+# `ds` referenced them. Reading `ds` afterwards saw recycled memory: a tagged
+# Int where a variant pointer was expected (`kaix_variant_tag_of` on `0xb`),
+# which crashed the native-built compiler on every input (blocking self-host).
+#
+# The trigger is narrow: the arm must (1) rebuild the cons (reuse), (2) carry an
+# effect row so the body lowers through the reuse path rather than TRMC, and (3)
+# run over a donor kept live past the walk (shared). `walk` here reconstructs the
+# list while `input` stays live for the post-walk `count` — the shared-donor path.
+#
+# Native output must match the C oracle: the fix increfs the borrowed children,
+# so `input` survives the walk intact and `count` sees the full list.
+
+type D = DFn(String, Int) | DImpl(String, [D], Int) | DOther(Int)
+
+fn walk_one(d: D) : D / Console = match d {
+  DFn(n, l)            -> DFn(n, l)
+  DImpl(name, subs, l) -> DImpl(name, walk(subs), l)
+  _                    -> d
+}
+
+fn walk(ds: [D]) : [D] / Console = match ds {
+  []           -> []
+  [d, ...rest] -> [walk_one(d), ...walk(rest)]
+}
+
+fn count(ds: [D]) : Int = match ds {
+  []          -> 0
+  [_, ...rest] -> 1 + count(rest)
+}
+
+fn tag_sum(ds: [D]) : Int = match ds {
+  []           -> 0
+  [d, ...rest] -> tag_of(d) + tag_sum(rest)
+}
+
+fn tag_of(d: D) : Int = match d {
+  DFn(_, _)      -> 1
+  DImpl(_, _, _) -> 2
+  DOther(_)      -> 4
+}
+
+fn main() : Unit / Console = {
+  let subs  = [DFn("add", 1), DFn("mul", 2), DFn("zero", 3), DFn("one", 4)]
+  let input = [DOther(0), DImpl("Numeric", subs, 5), DOther(9)]
+  let out = walk(input)
+  # `input` read AFTER the walk — this is what saw freed memory pre-fix.
+  Stdout.print("count=#{int_to_string(count(input))}")
+  Stdout.print("out_tags=#{int_to_string(tag_sum(out))}")
+  Stdout.print("in_tags=#{int_to_string(tag_sum(input))}")
+}
