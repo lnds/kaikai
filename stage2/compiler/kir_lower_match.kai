@@ -345,10 +345,10 @@ fn lm_bind_name(name: String, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
 # oracle's `emit_pat_binds_list` increfs. `_`-prefixed discards bind nothing
 # the body uses; including them is harmless (a dup+exit-drop pair on a value
 # the arm ignores is balanced) and keeps the set aligned with what is bound.
-# Nested head sub-patterns (record / variant) are NOT collected here: their
-# own binders ride the variant-slot bind path, which the oracle increfs
-# separately; the #858 shape is the flat cons head/tail, so we restore the
-# incref for that set and leave the nested path to its existing discipline.
+# Nested head sub-patterns (variant slots) contribute their own borrowed
+# binders too, at any depth — collected by `owned_arm_alias_binders`, which
+# mirrors the oracle's full `emit_pat_binds` alias set. This function stays
+# the flat cons head/tail set the reuse-gc path publishes.
 pub fn list_arm_alias_binders(p: Pattern) : [String] = match p.pkind {
   PList(pats, opt_rest) -> {
     let heads = list_arm_head_binders(pats, [])
@@ -364,6 +364,49 @@ fn list_arm_head_binders(pats: [Pattern], acc: [String]) : [String] = match pats
   [hp, ...rest] -> match hp.pkind {
     PBind(name) -> list_arm_head_binders(rest, [name, ...acc])
     _           -> list_arm_head_binders(rest, acc)
+  }
+}
+
+# Every pointer-kind binder an OWNED (non-reuse) match arm reaches over a
+# BORROW path — the full set the C oracle's `emit_pat_binds` increfs under
+# `is_alias`. Each such binder is bound by native as a `KProj`/`KLitOp` alias
+# of the scrutinee's storage (no incref); the owned match's exit
+# `__pcs_scr_drop` cascades through that storage and would free the binder
+# before a self-tail arm body reads it. Generalises the flat cons head/tail
+# set to nested variant slots at any depth: `[D(tg), ...r] -> walk(r, tg.tn)`
+# borrows `tg` one level down; a `[C(_, X(f)), ...] -> g(rest, f)` two levels.
+#
+# Mirrors `emit_pat_binds` exactly: descend PList (heads + rest), PVariant
+# POINTER slots (Int/Real/enum excluded by `ls_slot_kind`), and PAs (name +
+# inner). It does NOT descend into record fields — `kai_op_field` already
+# increfs those, so their subtree is owned (not an alias in the oracle).
+pub fn owned_arm_alias_binders(p: Pattern, vs: [EVar]) : [String] =
+  oab_pat(p, vs, [])
+
+fn oab_pat(p: Pattern, vs: [EVar], acc: [String]) : [String] = match p.pkind {
+  PBind(name)  -> [name, ...acc]
+  PAs(name, _) -> oab_pat(as_inner(p), vs, [name, ...acc])
+  PList(pats, opt_rest) -> {
+    let a1 = match opt_rest { None -> acc Some(name) -> [name, ...acc] }
+    oab_pats(pats, vs, a1)
+  }
+  PVariant(cname, subs) -> oab_variant_slots(subs, evar_payload_tys_for(vs, cname), 0, vs, acc)
+  _ -> acc
+}
+
+fn oab_pats(pats: [Pattern], vs: [EVar], acc: [String]) : [String] = match pats {
+  []           -> acc
+  [hp, ...rest] -> oab_pats(rest, vs, oab_pat(hp, vs, acc))
+}
+
+# A variant's POINTER slots (kind 0) recurse; Int/Real slots carry no RC and
+# are skipped by kind, matching the oracle's `variant_slot_kind` gate.
+fn oab_variant_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, vs: [EVar], acc: [String]) : [String] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = match list_nth_te(tys, idx) { Some(te) -> ls_slot_kind(te) None -> 0 }
+    let acc1 = if k == 0 { oab_pat(sp, vs, acc) } else { acc }
+    oab_variant_slots(rest, tys, idx + 1, vs, acc1)
   }
 }
 

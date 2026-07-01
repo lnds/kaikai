@@ -1,0 +1,45 @@
+# Issue #1025 (bug#2a) — a native OWNED self-tail `match` arm that binds a
+# POINTER-kind sub-binder NESTED in a variant head over a BORROW path never got
+# the structural incref the C-direct oracle's `emit_pat_binds` emits under
+# `is_alias`.
+#
+# The #858 fix restored that incref for the FLAT cons head/tail set only; a
+# binder nested inside a list head's variant sub-pattern (`[D(tg), ...r]` binds
+# `tg` as a `KProj` borrow of the `D` slot) was left out. The arm's pre-injected
+# scrutinee drop (`match_selftail_scr_drop`, the #860 self-tail leak fix) then
+# freed the borrowed `tg` BEFORE the self-tail arm body read it — the native
+# `walk(r, acc + tg.tn)` read recycled memory (a wrong value or a segfault; C
+# oracle correct).
+#
+# The trigger: (1) an OWNED, non-reuse match arm, (2) a self-tail call in the
+# body (so the scrutinee drop is pre-injected AHEAD of the body), (3) a binder
+# nested inside a VARIANT sub-pattern of a list head, read in the tail-call arg.
+# `walk_impls` binds the whole nested record `tg` (single-level nest);
+# `walk6` binds a nested slot of a 6-field variant (the `impl Numeric` /
+# `DImpl(String,[TypeExpr],TypeExpr,[Decl],Int,Int)` shape the residual UAF hit
+# in `validate_pub_access`). Pre-fix both segfault / mis-read on native at -O2
+# AND -O0; post-fix both match the C oracle.
+
+type Ty = { tn: Int }
+type Dec = D(Ty)
+
+fn walk_impls(ds: [Dec], acc: Int) : Int = match ds {
+  []              -> acc
+  [D(tg), ...r]   -> walk_impls(r, acc + tg.tn)
+}
+
+# 6-field variant, nested binder at slot 2 read in the self-tail arg — the
+# native miscompile returned a constant (1) for the projected `tg.tn` here.
+type Dec6 = DImpl6(String, [Ty], Ty, [Dec6], Int, Int)
+
+fn walk6(ds: [Dec6], acc: Int) : Int = match ds {
+  []                                  -> acc
+  [DImpl6(_, _, tg, _, _, _), ...r]   -> walk6(r, acc + tg.tn)
+}
+
+fn main() : Unit / Console {
+  let impls = [D(Ty { tn: 100 }), D(Ty { tn: 5 })]
+  let six   = [DImpl6("a", [], Ty { tn: 200 }, [], 0, 0),
+               DImpl6("b", [], Ty { tn: 3 }, [], 0, 0)]
+  print("impls=#{walk_impls(impls, 0)} six=#{walk6(six, 0)}")
+}
