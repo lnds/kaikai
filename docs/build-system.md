@@ -7,7 +7,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 | You want to… | Command (from repo root) |
 |---|---|
 | Run / build a `.kai` program | `./bin/kai run <file.kai>` · `./bin/kai build <file.kai> -o <out>` |
-| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2` (C) · `make KAI_LLVM=1 kaic2` (native) |
+| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (bootstrap, C) · `make KAI_LLVM=1 kaic2` (native) |
 | Full bootstrap from scratch | `make all` (→ `kaic0` → `kaic1` → `kaic2` → `bin/kai`) |
 | Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
@@ -62,6 +62,24 @@ stage1/kaic1 is kaikai-minimal: it does **not** resolve `import`. So the stage2 
 - `stage2/main.kai` is a 33-line entry stub at the END of the bundle, not the compiler. Compiling `main.kai` alone does nothing useful.
 
 When you add a NEW `stage2/compiler/*.kai` module, it must be added to `BUNDLE_SRCS` in dependency order, or the bundle won't see it.
+
+## `make kaic2-fast` — dev rebuild via modular self-compile
+
+`make kaic2` always re-bootstraps: re-concatenate the ~99k-line bundle, kaic1 re-monolithises it, `cc -O2` compiles one giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
+
+1. The existing `kaic2` compiles `stage2/main.kai` **directly** — resolving imports, no bundle, no kaic1 — through `bin/kai`'s `KAI_MODULAR=1 --backend=c` path: ~86 per-module TUs compiled in parallel with the `.o` content-hash cache, so a one-module edit recompiles one TU.
+2. The result lands in a **staging binary** (`stage2/build/kaic2-fast.bin`) and is sanity-gated (`--version` + a golden demo compiled with no flags, exercising the baked stdlib path) before being swapped into `stage2/kaic2`. A broken build never clobbers the working compiler.
+
+Selection is **explicit, never automatic**: `make kaic2` stays pure bootstrap, `make kaic2-fast` is additive and opt-in. Auto-preferring the fast path was rejected — a stale `kaic2` silently building a wrong `kaic2` is the failure mode to avoid; typing `-fast` is the acknowledgment that you trust the binary currently in place.
+
+Caveats:
+
+- **C backend only.** The fast-built `kaic2` has no native (libLLVM) backend even if the previous one did. For a native-capable compiler run `make KAI_LLVM=1 kaic2`.
+- **The first `kaic2` still comes from the bootstrap**, as does anything CI or the selfhost oracle trusts.
+
+### `make kaic2-fast-verify` — equivalence gate
+
+Checks that the fast path builds the *same compiler* as the one in place: the fast-built staging binary and `./stage2/kaic2` must emit **byte-identical C** for the compiler itself (`main.kai`, single-TU) and for a sample program. Run it from a fixed point — `kaic2` built from the current source (right after `make kaic2` it proves bootstrap ≡ fast). It does not touch `kaic2`. Byte-identity of the *binaries* is not expected (multi-`.o` parallel link vs one `-O2` TU); identical emitted C is the functional-parity gate, consistent with how `selfhost` pins determinism.
 
 ## Verification targets (root)
 

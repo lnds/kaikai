@@ -149,7 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-cache test-modular-selfhost test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate test-build-modes
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate test-build-modes
 
 all: $(TARGET)
 
@@ -197,6 +197,64 @@ ifeq ($(KAI_LLVM),1)
 	@# script is idempotent — a no-op when the .bc is fresh.
 	@../tools/gen-runtime-bc.sh || true
 endif
+
+# --- Dev fast rebuild: modular self-compile ---------------------------
+# An existing kaic2 recompiles the compiler from main.kai directly,
+# resolving imports — no kaic1, no bundle. Rides bin/kai's c-modular
+# path: per-module TUs compiled in parallel plus the .o content-hash
+# cache, so an edit to one module recompiles one TU. C backend only.
+# This is a REBUILD convenience: the bootstrap chain (`make kaic2`)
+# remains the trust path for fresh machines, CI, and the selfhost
+# oracle. The stdlib path is baked in exactly as the bootstrap build
+# does, so the result resolves core imports with no --path flags.
+KAIC2_FAST_STAGING := build/kaic2-fast.bin
+KAIC2_FAST_CFLAGS  := $(CFLAGS) -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
+
+$(KAIC2_FAST_STAGING): FORCE | build
+	@set -e; \
+	[ -x ./$(TARGET) ] || { echo "kaic2-fast: no existing ./$(TARGET) — bootstrap first with 'make kaic2'"; exit 1; }; \
+	out=$$(pwd)/$@; rm -f $$out; \
+	( cd .. && KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_STATS=1 \
+	    CFLAGS="$(KAIC2_FAST_CFLAGS)" \
+	    bin/kai build stage2/$(SRC) -o $$out )
+
+# The staging binary is swapped in only after a sanity gate (--version
+# plus a golden demo compiled with NO flags, exercising the baked
+# stdlib path), so a broken build never clobbers the working kaic2.
+kaic2-fast: $(KAIC2_FAST_STAGING)
+	@set -e; \
+	./$(KAIC2_FAST_STAGING) --version | grep -q "self-hosted" \
+	  || { echo "kaic2-fast FAIL (--version) — keeping existing ./$(TARGET)"; exit 1; }; \
+	./$(KAIC2_FAST_STAGING) ../examples/portfolio/portfolio.kai > build/kaic2-fast-smoke.c \
+	  || { echo "kaic2-fast FAIL (smoke compile) — keeping existing ./$(TARGET)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2-fast-smoke.c -o build/kaic2-fast-smoke $(LDLIBS_M); \
+	./build/kaic2-fast-smoke > build/kaic2-fast-smoke.out; \
+	diff -q ../examples/portfolio/portfolio.out.expected build/kaic2-fast-smoke.out > /dev/null \
+	  || { echo "kaic2-fast FAIL (smoke DIFF) — keeping existing ./$(TARGET)"; diff ../examples/portfolio/portfolio.out.expected build/kaic2-fast-smoke.out; exit 1; }; \
+	mv $(KAIC2_FAST_STAGING) $(TARGET); \
+	echo "kaic2-fast OK — ./$(TARGET) rebuilt via modular self-compile (C backend)"
+
+# Equivalence gate for the fast path. Precondition: ./kaic2 was built
+# from the CURRENT source (bootstrap or a previous kaic2-fast). The
+# fast-built staging binary must emit byte-identical C to ./kaic2 for
+# the compiler itself and for a sample program. Byte-identity of the
+# BINARIES is out of reach (multi-.o parallel link vs one -O2 TU);
+# identical emitted C from the same source is the functional gate.
+# Does not touch ./kaic2.
+kaic2-fast-verify: $(KAIC2_FAST_STAGING)
+	@set -e; \
+	./$(TARGET) $(SRC) > build/kaic2-fast-ref.c; \
+	./$(KAIC2_FAST_STAGING) $(SRC) > build/kaic2-fast-new.c; \
+	diff -q build/kaic2-fast-ref.c build/kaic2-fast-new.c > /dev/null \
+	  && echo "kaic2-fast-verify: self-compile OK (emitted C byte-identical)" \
+	  || { echo "kaic2-fast-verify: self-compile DIFF — is ./$(TARGET) built from the current source?"; exit 1; }; \
+	./$(TARGET) ../examples/portfolio/portfolio.kai > build/kaic2-fast-ref-smoke.c; \
+	./$(KAIC2_FAST_STAGING) ../examples/portfolio/portfolio.kai > build/kaic2-fast-new-smoke.c; \
+	diff -q build/kaic2-fast-ref-smoke.c build/kaic2-fast-new-smoke.c > /dev/null \
+	  && echo "kaic2-fast-verify OK (compiler + sample emitted C byte-identical)" \
+	  || { echo "kaic2-fast-verify: sample DIFF"; exit 1; }
+
+FORCE:
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build
@@ -5393,9 +5451,12 @@ test-modular-cache: $(TARGET) build
 # build; the ~86-TU modular split would replicate them into every TU and
 # overflow the small-code-model link reach. The shared-pool guard
 # (KAI_SEPARATE_COMPILATION / KAI_RUNTIME_OWNER) emits one copy, so the
-# split links. Drives bin/kai's KAI_MODULAR path on the compiler itself and
-# smokes `--version`. Without the guard this fails at LINK (multi-GB .bss),
-# so a regression trips the gate. Hermetic: a fresh .o cache each run.
+# split links. Drives bin/kai's KAI_MODULAR path on the compiler itself,
+# smokes `--version`, and then makes the modular-built binary COMPILE a
+# program, byte-compared against $(TARGET)'s output — linking and
+# answering --version is not evidence the binary works (per-TU runtime
+# state can corrupt the first real compile while leaving --version
+# intact). Hermetic: a fresh .o cache each run.
 test-modular-selfhost: $(TARGET) build
 	@set -e; \
 	out=$$(pwd)/build/modular-selfhost.bin; \
@@ -5409,7 +5470,12 @@ test-modular-selfhost: $(TARGET) build
 	  || { echo "modular-selfhost FAIL (--version run)"; cat build/modular-selfhost.ver; exit 1; }; \
 	grep -q "self-hosted" build/modular-selfhost.ver \
 	  || { echo "modular-selfhost FAIL (--version output)"; cat build/modular-selfhost.ver; exit 1; }; \
-	echo "modular-selfhost OK (full compiler linked modularly + --version runs)"
+	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $$out ../examples/portfolio/portfolio.kai > build/modular-selfhost-smoke.c \
+	  || { echo "modular-selfhost FAIL (modular binary crashed compiling)"; exit 1; }; \
+	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) ./$(TARGET) ../examples/portfolio/portfolio.kai > build/modular-selfhost-smoke-ref.c; \
+	diff -q build/modular-selfhost-smoke-ref.c build/modular-selfhost-smoke.c > /dev/null \
+	  || { echo "modular-selfhost FAIL (emitted C differs from single-TU kaic2)"; exit 1; }; \
+	echo "modular-selfhost OK (linked modularly + --version + compiles byte-identically)"
 
 # Lane tier1-perf — the five "costly" subtargets each compile the
 # whole compiler (`main.kai`, ~4 GB RSS, ~20 s) in a different dump
