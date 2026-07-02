@@ -1167,7 +1167,17 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # frees them.
       let st_dup = if owned and not arm_body_uses_reuse(body) {
         lm_dup_alias_binders(owned_arm_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
-      } else { set_reuse_gc_for_arm(p, body, st_body) }
+      } else {
+        # Reuse arm (dual-branch): the DECONSTRUCTED sub-binders of a head
+        # (`RP(name, _, ptys, rty)`) are incref'd UNCONDITIONALLY — the oracle's
+        # `emit_pat_binds` is_alias path increfs them in both the unique and the
+        # shared branch, so they leave the condbr; only the DIRECT cons slots
+        # (published as reuse_gc) differ per branch (borrow in unique, dup in
+        # shared). Emitting the decon dups here (outside the fork) keeps the
+        # fork managing only the direct slots.
+        let st_decon = lm_dup_alias_binders(decon_arm_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
+        set_reuse_gc_for_arm(p, body, st_decon)
+      }
       let st_drop = match_selftail_scr_drop(owned, sd, body, st_dup)
       let st_done = lower_branch_into(body, join, lcont, st_drop)
       if list_arm_is_catchall(p) { st_done }
@@ -1405,16 +1415,21 @@ fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
 }
 
 # Issue #858 — structural incref of an owned variant arm's POINTER-kind
-# positional (KProj-borrow) sub-binders, mirroring the oracle's `kai_incref`
-# on `is_alias=true` pointer-slot variant-arg binds (Int/Real slots are read
-# unboxed by the oracle, so they are excluded — `variant_arm_alias_binders`
-# filters by slot kind via `st.vs`). Emitted after the arm's binds, before
-# the body lowers. Gated on `owned ∧ ¬arm_body_uses_reuse` exactly like the
-# list path: a reuse arm consumes the scrutinee through `__perceus_reuse_*`
-# (rb-tree `ins`), where a structural dup would double-incref kept children.
+# sub-binders (Int/Real slots are read unboxed by the oracle, so they are
+# excluded by slot kind via `st.vs`), mirroring the oracle's `kai_incref` on
+# `is_alias=true` pointer-slot variant-arg binds. The set is RECURSIVE
+# (`owned_arm_alias_binders`): a binder inside a discriminating nested
+# sub-pattern (`DType(_, tn, _, TBRecord(fields), _, _, mo)` binds `fields`
+# two levels down) is also a KProj borrow of the scrutinee's storage — the
+# flat top-level set left it un-dup'd, so a callee consuming it freed the
+# still-referenced slot of a live decl (use-after-free on the second lookup).
+# Emitted after the arm's binds, before the body lowers. Gated on
+# `owned ∧ ¬arm_body_uses_reuse` exactly like the list path: a reuse arm
+# consumes the scrutinee through `__perceus_reuse_*` (rb-tree `ins`), where
+# a structural dup would double-incref kept children.
 fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : LowerSt / Console =
   if owned and not arm_body_uses_reuse(body) {
-    lm_dup_alias_binders(variant_arm_alias_binders(p, st.vs), KAt(p.line, p.col), st)
+    lm_dup_alias_binders(owned_arm_alias_binders(p, st.vs), KAt(p.line, p.col), st)
   } else { st }
 
 # native variant reuse leak (#872) — publish a reuse arm's scrutinee pointer
@@ -2030,18 +2045,82 @@ fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: L
 # consumes — `KCon` fresh-allocs).
 fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
-  let st_gc = if not nested {
-                emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st.reuse_gc), kpos_of(x), st)
-              } else { st }
-  match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) -> {
-    let tag = ls_variant_tag(st1, cn)
-    if nested {
+  if nested {
+    # Non-bijective rotation: fresh-alloc the whole outer + dup each embedded
+    # leaf; the match-exit `decref(donor)` reclaims donor+inner+originals.
+    match lower_exprs(cargs, st, []) { LResMany(avs, st1) -> {
+      let tag = ls_variant_tag(st1, cn)
       let st_dup = emit_reuse_leaf_dups(reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
       bind_op(st_dup, KCon(cn, tag, boxed_inits(avs, [])), kpos_of(x))
-    } else {
-      bind_op(st1, KConReuse(rk, donor, cn, tag, boxed_inits(avs, [])), kpos_of(x))
-    }
+    } }
+  } else if reuse_kind_is_variant(rk) {
+    # Flat variant reuse keeps the single-body move (`kaix_variant_reuse_at`
+    # decides unique/shared in the shim); the AST already carries the perceus
+    # dups protecting re-embedded slot binders, so a dual-branch here
+    # double-counts. Only the CONS arm needs the genuine fork: its match-exit
+    # `drop scr` cascades onto the just-embedded rebuilt head, which no
+    # single-body shim can neutralise per-branch.
+    let st_gc = emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st.reuse_gc), kpos_of(x), st)
+    match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) ->
+      bind_op(st1, KConReuse(rk, donor, cn, ls_variant_tag(st1, cn), boxed_inits(avs, [])), kpos_of(x)) }
+  } else {
+    lower_reuse_dual(x, rk, donor, cn, cargs, st)
+  }
+}
+
+# The genuine dual-branch reuse (mirrors emit_c's emit_match_arm_reuse_cons /
+# _variant). The single-body `kai_reuse_or_alloc_*` shim cannot mirror C's
+# per-branch binding mode: the UNIQUE branch binds the DIRECT scrutinee slots
+# BORROW (no incref) and rebuilds in place (store RAW, no decref of the old
+# slot — the borrow gave up no ownership), while the SHARED branch binds them
+# OWNED (dup) and fresh-allocs. Borrow-no-incref and store-raw-no-decref are
+# the two halves of one saving and must go together — mixing an owned bind
+# with a raw store leaks, a borrow bind with a decref-store double-frees. The
+# DECONSTRUCTED sub-binders were already dup'd unconditionally by the caller
+# (they are incref'd in both branches, per the oracle's is_alias path), so the
+# fork manages only the direct slots (`st.reuse_gc`). The body's rebuild args
+# are lowered TWICE (textual duplication, evaluated once — the branches are
+# mutually exclusive), exactly as C interpolates h_new_c/t_new_c in both arms.
+fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
+    let pos = kpos_of(x)
+    let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
+    match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
+      match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
+        let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
+        # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
+        let st_ub = match lower_exprs(cargs, st_fork, []) { LResMany(avs_u, st_u1) -> {
+          let tag_u = ls_variant_tag(st_u1, cn)
+          match bind_op(st_u1, KConReuse(rk, donor, cn, tag_u, boxed_inits(avs_u, [])), pos) { LRes(ru, st_u2) ->
+            ls_seal(ls_emit(st_u2, KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } } }
+        # SHARED: dup the direct slots (owned), rebuild, fresh-alloc. A cons
+        # rebuild allocates a real KAI_CONS cell (`kai_cons`) — `Cons` is the
+        # builtin list ctor, not a registered variant, so a `KCon` here would
+        # build a variant-shaped cell whose `as.cons` reads are garbage.
+        let st_sd = emit_direct_dups(st.reuse_gc, pos, st_ub)
+        let st_sb = match lower_exprs(cargs, st_sd, []) { LResMany(avs_s, st_s1) ->
+          match bind_op(st_s1, reuse_fresh_op(rk, cn, avs_s, st_s1), pos) { LRes(rs, st_s2) ->
+            ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) } }
+        LRes(KVar(rjoin), st_sb)
+      } } }
   } }
+
+# The shared branch's fresh allocation: a real cons cell for a cons rebuild
+# (`Cons` is the builtin list ctor, not a registered variant), a variant
+# ctor otherwise.
+fn reuse_fresh_op(rk: KReuseKind, cn: String, avs: [KVal], st: LowerSt) : KOp = match rk {
+  RkCons    -> KPrim("kai_cons", avs)
+  RkVariant -> KCon(cn, ls_variant_tag(st, cn), boxed_inits(avs, []))
+}
+
+# Dup each direct scrutinee slot (head `PBind` / `...rest`) for the shared
+# branch, resolving through any active shadow like `emit_reuse_gc_increfs`.
+fn emit_direct_dups(directs: [String], pos: KPos, st: LowerSt) : LowerSt = match directs {
+  []           -> st
+  [n, ...rest] -> {
+    let reg = match ls_lookup_rename(st, n) { Some(r) -> r None -> n }
+    emit_direct_dups(rest, pos, ls_emit(st, KRC(KDup(KVar(reg)), pos)))
+  }
 }
 
 fn reuse_kind_is_variant(rk: KReuseKind) : Bool = match rk { RkVariant -> true RkCons -> false }
