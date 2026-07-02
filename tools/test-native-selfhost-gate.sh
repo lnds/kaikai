@@ -6,19 +6,19 @@
 # C-only). So a KIR construct the native backend cannot lower yet, but the
 # compiler's own source uses, is never exercised — the subset gap is silent.
 #
-# This gate makes the gap visible and drives it toward LINK + RUN:
+# This gate makes the gap visible and drives it to full SELF-COMPILE:
 #   1. compiles `stage2/main.kai` with `--emit=native` and counts the
 #      `unbound register` subset-gap aborts, ratcheting against
 #      tools/native-selfhost-baseline.txt (FAIL on regression). The baseline
 #      is 0 — the COMPILE half is cleared.
 #   2. once the count is 0, LINKS the native object into an executable
-#      kaic2-native (tools/native-selfhost-link.sh) and RUNS it (`--version`)
-#      to prove the native-built compiler starts and executes real kaikai.
+#      kaic2-native (tools/native-selfhost-link.sh), RUNS it (`--version`),
+#      then SELF-COMPILES: the native-built kaic2 emits C for a sample
+#      program and that output must be BYTE-IDENTICAL to the C-direct oracle.
+#      A native codegen bug that corrupts the emitted program shows up here.
 #
-# Milestone status (issue #1021): COMPILE + LINK + RUN are green. The
-# remaining step — recursive self-host (the native-built kaic2 compiling a
-# sample program) — is blocked by a native -O2 codegen bug (see the count==0
-# arm below) and tracked separately; this gate does not yet require it.
+# Milestone status (issue #1021): COMPILE + LINK + RUN + SELF-COMPILE are
+# green — the circle closes.
 #
 # Native-only: does not touch the C bootstrap or the selfhost C-byte-id
 # check. Exits 0 (SKIP) where libLLVM is absent.
@@ -136,15 +136,34 @@ elif [ "$count" -eq 0 ]; then
     rm -f "$BIN"; exit 1
   fi
   echo "native-selfhost-gate: RUN OK — the native-built compiler starts and runs: $vout"
-  rm -f "$BIN"
 
-  # SELF-COMPILE (recursive self-host) is the remaining milestone: the
-  # native-built kaic2 compiling a sample program. It is BLOCKED by a native
-  # -O2 codegen bug (a variant scrutinee reaches `kaix_variant_tag_of` as a
-  # tagged Int in `rqc_decl`, crashing the front-end; -O0 masks it). Tracked
-  # separately (refs #1021). This gate holds LINK+RUN against regression; it
-  # does not yet require self-compile.
-  echo "native-selfhost-gate: LINK + RUN achieved. Self-compile (recursive self-host) is blocked by a native -O2 codegen bug — tracked separately."
+  # SELF-COMPILE (recursive self-host): the native-built kaic2 emits C for a
+  # sample program, and that C must be BYTE-IDENTICAL to what the C-direct
+  # oracle emits. This closes the circle — the native-built compiler produces
+  # the same program the trusted bootstrap compiler does. Run from ROOT so a
+  # transitive `import` of a `stdlib/core/*.kai` module resolves relative to
+  # the CWD (the driver composes core paths from the CWD, not from --path;
+  # the oracle does the same, so both must run in the same directory).
+  SAMPLE="$(mktemp -d)/sc_probe.kai"
+  printf 'fn main() : Unit / Console = println("kaikai self-host")\n' > "$SAMPLE"
+  nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ncrc=$?
+  oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ocrc=$?
+  rm -f "$BIN"
+  if [ "$ncrc" -ne 0 ]; then
+    echo "::error::native-selfhost-gate FAIL — the native-built compiler failed to compile the sample program (exit $ncrc)."
+    exit 1
+  fi
+  if [ "$ocrc" -ne 0 ]; then
+    echo "::error::native-selfhost-gate FAIL — the C-direct oracle failed to compile the sample program (exit $ocrc). Unexpected — the oracle is the trusted reference."
+    exit 1
+  fi
+  if [ "$nc" != "$oc" ]; then
+    echo "::error::native-selfhost-gate FAIL — the native-built compiler's emitted C DIVERGES from the oracle. A native codegen bug corrupts the emitted program."
+    diff <(printf '%s' "$oc") <(printf '%s' "$nc") | head -20 | sed 's/^/    /'
+    exit 1
+  fi
+  echo "native-selfhost-gate: SELF-COMPILE OK — the native-built compiler emits byte-identical C to the oracle."
+  echo "native-selfhost-gate: COMPILE + LINK + RUN + SELF-COMPILE achieved — the circle closes (issue #1021)."
   exit 0
 elif [ "$count" -lt "$baseline" ]; then
   echo "native-selfhost-gate: PASS — baseline improvable; part of the gap closed."
