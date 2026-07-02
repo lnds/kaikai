@@ -12759,6 +12759,44 @@ static KaiValue *kai_llvm_add_byval_call(void *m, void *call, int64_t param_ix, 
     kai_llvm_byval_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, param_ix, (LLVMTypeRef) sty);
     return kai_unit();
 }
+/* `sret(<struct>)` on the hidden first parameter of a struct-returning
+ * extern — the ABI directive that makes a MEMORY-class return write
+ * through a caller-supplied pointer. Applied to the declaration's param 0
+ * and the matching call-site arg 0. */
+static void kai_llvm_sret_attr_at(LLVMModuleRef m, LLVMValueRef fn_or_call,
+                                  int is_call, LLVMTypeRef sty) {
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    unsigned kind = LLVMGetEnumAttributeKindForName("sret", 4);
+    LLVMAttributeRef a = LLVMCreateTypeAttribute(ctx, kind, sty);
+    if (is_call) LLVMAddCallSiteAttribute(fn_or_call, 1u, a);
+    else LLVMAddAttributeAtIndex(fn_or_call, 1u, a);
+}
+static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *sty) {
+    kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) fn, 0, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_sret_call(void *m, void *call, void *sty) {
+    kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+/* The target C-ABI class of the native backend's default triple: 1 =
+ * AArch64 (AAPCS64), 2 = x86-64 SysV, 0 = anything else (the emitter keeps
+ * the honest struct-by-value reject there). Read once at module build; the
+ * object emission below pins the SAME `LLVMGetDefaultTargetTriple()`. */
+static int64_t kai_native_target_abi(void) {
+    char *triple = LLVMGetDefaultTargetTriple();
+    int64_t plat = 0;
+    if (triple) {
+        if (strncmp(triple, "arm64", 5) == 0 || strncmp(triple, "aarch64", 7) == 0) plat = 1;
+        else if (strncmp(triple, "x86_64", 6) == 0) {
+            /* SysV only — a `x86_64-pc-windows` triple uses a different
+             * struct ABI the classifier does not model. */
+            if (strstr(triple, "windows") == NULL) plat = 2;
+        }
+        LLVMDisposeMessage(triple);
+    }
+    return plat;
+}
 /* `n` copies of one pointer type, for the all-boxed fn signatures the
  * KIR lowers (every param/return is `ptr`). */
 static void *kai_llvm_fn_type_boxed(void *ptr_t, int64_t n) {
@@ -13696,6 +13734,9 @@ static void *kai_llvm_struct_type(void *m, void *buf) { (void) m; (void) buf; re
 static void *kai_llvm_build_struct_gep(void *b, void *s, void *p, int64_t i) { (void) b; (void) s; (void) p; (void) i; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t ix, void *s) { (void) m; (void) fn; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_byval_call(void *m, void *c, int64_t ix, void *s) { (void) m; (void) c; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *s) { (void) m; (void) fn; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (void) c; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
 static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_zext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
