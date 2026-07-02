@@ -595,6 +595,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #298 fixture passes under ASAN+UBSan (closure capture lifecycle gate)"
 	@$(MAKE) -C stage2 test-perceus-issue350-asan
 	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
+	@$(MAKE) -C stage2 test-perceus-trmc-spread-asan
+	@echo "tier1-asan OK — TRMC shared pass-through arg fixture passes under ASAN+UBSan (dropmask / wrap-skip alignment gate)"
 	@$(MAKE) -C stage2 test-perceus-issue703-asan
 	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
 	@$(MAKE) -C stage2 test-issue-779-asan
