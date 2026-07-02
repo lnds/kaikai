@@ -57,7 +57,7 @@ What ships with `brew install kaikai`:
 | Crypto base | `crypto/{hash, mac}` |
 | Identifiers + text | `uuid`, `regexp` |
 | Observability | `log`, `trace` |
-| Networking | `net/{http, tcp}` (+ futuros udp, dns, tls) |
+| Networking (basic) | `net/{http, tcp}` (+ futuros udp, dns) — plaintext only; TLS/advanced net live outside stdlib (see §*The stdlib networking + crypto boundary*) |
 | Finance | `money`, `fx` |
 | Testing | `check` (property-based with shrinking) |
 | Concurrency wrappers | `spawn`, `actor` (thin wrappers over Spawn/Actor effects) |
@@ -175,8 +175,16 @@ When a new module or API is proposed:
    feature) → core (`kaikailang-org/kaikai`).
 
 2. **Does it depend on language primitives that just landed?**
-   Universal building blocks (list, option, result, json, http
-   client, basic crypto) → core stdlib.
+   Universal building blocks (list, option, result, json, plaintext
+   http client, hash/mac) → core stdlib. **But not if it carries a
+   heavy system-library dependency** — see rule 3b.
+
+3b. **Does it need a heavy system library** (OpenSSL/LibreSSL, a
+   protocol crypto stack, an advanced-networking C lib) that stdlib
+   would have to ship in the base binary? → outside stdlib, even if
+   it feels "basic". TLS is the canonical case: HTTPS is universal,
+   but `-lssl -lcrypto` must not ride the bundled-stdlib install.
+   See §*The stdlib networking + crypto boundary*.
 
 3. **Is it infrastructure common to multiple downstream apps but
    not used by every kaikai program?** (concurrency patterns, cli
@@ -190,6 +198,31 @@ When a new module or API is proposed:
 
 6. **Is it a third-party initiative** → `github.com/<user>/<repo>`,
    installable but not endorsed.
+
+## The stdlib networking + crypto boundary
+
+The line: **basic networking in stdlib; advanced crypto and advanced
+networking outside.**
+
+- **In core stdlib:** plaintext `net/http` (HTTP/1.1 client), `net/tcp`,
+  and the base `crypto/{hash, mac}`. These carry no heavy system-library
+  dependency — they build on the runtime and the FFI already in the base
+  install.
+- **Outside stdlib:** TLS, and anything that pulls a heavy system crypto
+  or advanced-networking C library (`-lssl -lcrypto`, protocol crypto
+  stacks). A bundled-stdlib distribution (Go-style, one `brew install`)
+  must not drag OpenSSL into every kaikai binary. An opt-out build flag
+  is not enough: the *default* install would still carry the dependency.
+
+Consequence: `net/http` rejects `https://` at parse time, and that is
+**correct, not a gap**. Core stdlib speaks plaintext HTTP; a program that
+needs HTTPS pulls in the advanced layer, which brings its own OpenSSL FFI
+in its own repo — the same pattern kohau uses for libsqlite3.
+
+Home for the advanced layer: an ecosystem package (the `ahu/crypto/*`
+family, already scoped for advanced/experimental crypto, or a dedicated
+networking-crypto repo). Not core stdlib, not a domain toolkit. The
+package that hosts it is defined in a separate handoff.
 
 ## Versioning policy
 
