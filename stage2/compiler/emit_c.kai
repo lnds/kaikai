@@ -7520,7 +7520,8 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn]) : String
                 emit_expr(src, body, body_cx)
               }
             let label = if tcrec_body_has_sentinel(body) {
-              concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+              concat_all([tcrec_emit_param_ptrs_masked(params, usig, 0),
+                          "\n    _kai_", c_sym(name, mo), "_entry:;\n    "])
             } else { "" }
             concat_all([sig, " {\n    ", acc_decl, label, "return ", body_c, ";\n}\n\n"])
           }
@@ -7532,7 +7533,8 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn]) : String
             # the `return ({ ... });` so the goto inside the
             # statement-expression has a target.
             let label = if tcrec_body_has_sentinel(body) {
-              concat_all(["_kai_", c_sym(name, mo), "_entry:;\n    "])
+              concat_all([tcrec_emit_param_ptrs(params, 0),
+                          "\n    _kai_", c_sym(name, mo), "_entry:;\n    "])
             } else { "" }
             concat_all([sig, " {\n    ", acc_decl, label, "return ", body_c, ";\n}\n\n"])
           }
@@ -14080,28 +14082,10 @@ fn tcrec_parse_decimal(s: String) : Int = es_tcrec_parse_decimal(s)
 #    exactly the params that would have been dropped by the wrap's
 #    exit drops, which the goto skips by jumping out of the
 #    enclosing statement-expression.
-# 3. Rebind `kai_<pname> = _t<i>`, in declaration order. Each
-#    rebound variable now holds rc=1, the same invariant the wrap
-#    relies on at fn entry.
-# 4. Goto the entry label planted by `emit_fn_body`.
-# 5. Trailing `(KaiValue *)0;` so the statement-expression is a
-#    well-typed lvalue; the value is unreachable past the goto.
-
-# ---- m37 / TCO — goto-block emission ------------------------------
-#
-# Called from `emit_call_expr` when the callee's `EVar` carries a
-# `__kai_tcrec|...` sentinel. Emits the rebind-and-goto block
-# documented in `tcrec_rewrite_decl`. Refcount discipline:
-#
-# 1. Evaluate every arg into a fresh `_t<i>` local (each with rc=1
-#    per the Perceus contract — args may share storage with a
-#    parameter only via `kai_internal_dup`, which already bumped rc).
-# 2. Drop the params whose bit is set in the dropmask. Those are
-#    exactly the params that would have been dropped by the wrap's
-#    exit drops, which the goto skips by jumping out of the
-#    enclosing statement-expression.
-# 3. Rebind `kai_<pname> = _t<i>`, in declaration order. Each
-#    rebound variable now holds rc=1, the same invariant the wrap
+# 3. Rebind `*_kai_tcrp<i> = _t<i>`, in declaration order — through
+#    the param pointers captured at fn top, since a same-named
+#    pattern/let binder may shadow `kai_<pname>` at the call site.
+#    Each rebound param now holds rc=1, the same invariant the wrap
 #    relies on at fn entry.
 # 4. Goto the entry label planted by `emit_fn_body`.
 # 5. Trailing `(KaiValue *)0;` so the statement-expression is a
@@ -14168,10 +14152,7 @@ fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String]
     Some(US(_, _, pmask)) -> tcrec_emit_drops_masked(pnames, pmask, dropmask, 0)
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
-  let rebinds  = match sig_opt {
-    Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
-    None                  -> tcrec_emit_rebinds(pnames, 0)
-  }
+  let rebinds  = tcrec_emit_rebinds(pnames, 0)
   # The goto leaves before the match-exit `kai_decref(_scr)`, so the drop
   # is planted here (the goto-skip is why the leak existed). `_scr`'s head
   # and tail are dropped + the cell freed; the incref'd `kai_h`/`kai_t`
@@ -14220,10 +14201,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     Some(US(_, _, pmask)) -> tcrec_emit_drops_masked(pnames, pmask, dropmask, 0)
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
-  let rebinds  = match sig_opt {
-    Some(US(_, _, pmask)) -> tcrec_emit_rebinds_masked(pnames, pmask, 0)
-    None                  -> tcrec_emit_rebinds(pnames, 0)
-  }
+  let rebinds  = tcrec_emit_rebinds(pnames, 0)
   let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", cname, args_e, tys_opt, holeslot, 0, cx)
   concat_all([
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
@@ -14419,17 +14397,16 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
   # to no-ops since raw scalars carry no reference count.
   match lookup_ufn_by_csym(cx.fns, sym) {
     Some(US(pts, rt, mask)) -> {
-      # Mixed-param lane (issue #440 follow-up): params are a mix of raw
-      # scalars (`kair_<p>`) and boxed pointers (`kai_<p>`). Per slot:
-      #   - raw: raw `_tN`, rebind `kair_<p> = _tN`, NO drop (decref of a
-      #     scalar would corrupt — the #709 bug-class).
-      #   - boxed: `KaiValue *_tN`, drop OLD `kai_<p>` if dropmask, rebind
-      #     `kai_<p> = _tN` (the all-boxed path, per slot).
-      # Temporaries computed before any rebind (args may reference old
-      # param values).
+      # Mixed-param lane: params are a mix of raw scalars and boxed
+      # pointers. Raw slots take raw `_tN` temporaries and are never
+      # dropped (decref of a scalar corrupts — the #709 bug-class);
+      # boxed slots drop the old param value when their dropmask bit is
+      # set. Temporaries are computed before any rebind (args may
+      # reference old param values); drops and rebinds go through the
+      # `_kai_tcrp<N>` param pointers, immune to same-name binder shadow.
       let arg_lets = tcrec_emit_arg_lets_masked(src, args_e, pts, mask, 0, cx)
       let drops    = tcrec_emit_drops_masked(pnames, mask, dropmask, 0)
-      let rebinds  = tcrec_emit_rebinds_masked(pnames, mask, 0)
+      let rebinds  = tcrec_emit_rebinds(pnames, 0)
       # The statement-expression's value type must match the enclosing
       # match `_r`: a RAW-return UFn uses a scalar `0`; a BOXED-return
       # mixed UFn (e.g. `drop(xs, n) : [a]`) needs `(KaiValue *)0` so the
@@ -14505,15 +14482,73 @@ fn tcrec_emit_arg_lets_raw(src: String, args_e: [Expr], pts: [Ty], i: Int, cx: E
   }
 }
 
+# The goto-loop's drops/rebinds reach the fn's C param locals through
+# `_kai_tcrp<N>` pointers captured before the entry label: a pattern or
+# let binder named like a param shadows `kai_<p>`/`kair_<p>` at the
+# sentinel site, so a by-name rebind there would write the shadow and
+# leave the real param frozen at its first-call value.
+fn tcrec_emit_param_ptrs(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = concat_all([
+        "KaiValue **_kai_tcrp", int_to_string(i), " = &kai_", p.pname, "; "
+      ])
+      string_concat(head, tcrec_emit_param_ptrs(rest, i + 1))
+    }
+  }
+}
+
+# Mixed-param variant: a raw slot's pointer takes the param's raw C
+# scalar type; a boxed slot's is `KaiValue **`, as in the all-boxed path.
+fn tcrec_emit_param_ptrs_masked(params: [Param], usig: UFnSig, i: Int) : String {
+  match usig {
+    US(pts, _, mask) -> tcrec_emit_param_ptrs_masked_loop(params, pts, mask, i)
+  }
+}
+
+fn tcrec_emit_param_ptrs_masked_loop(params: [Param], pts: [Ty], mask: [Bool], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let pty = match pts {
+        [t, ..._] -> Some(t)
+        [] -> None
+      }
+      let trest = match pts {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let head =
+        if is_raw {
+          concat_all([raw_c_type(pty), " *_kai_tcrp", int_to_string(i),
+                      " = &kair_", p.pname, "; "])
+        } else {
+          concat_all(["KaiValue **_kai_tcrp", int_to_string(i),
+                      " = &kai_", p.pname, "; "])
+        }
+      string_concat(head, tcrec_emit_param_ptrs_masked_loop(rest, trest, mrest, i + 1))
+    }
+  }
+}
+
 fn tcrec_emit_drops(pnames: [String], dropmask: Int, i: Int) : String {
   match pnames {
     [] -> ""
-    [p, ...rest] -> {
+    [_, ...rest] -> {
       let bit = tcrec_pow2(i)
       let head =
         if (dropmask / bit) % 2 == 1 {
           concat_all([
-            "{ KaiValue *_ = kai_internal_drop(kai_", p, "); (void) _; } "
+            "{ KaiValue *_ = kai_internal_drop(*_kai_tcrp", int_to_string(i), "); (void) _; } "
           ])
         } else { "" }
       string_concat(head, tcrec_emit_drops(rest, dropmask, i + 1))
@@ -14524,28 +14559,11 @@ fn tcrec_emit_drops(pnames: [String], dropmask: Int, i: Int) : String {
 fn tcrec_emit_rebinds(pnames: [String], i: Int) : String {
   match pnames {
     [] -> ""
-    [p, ...rest] -> {
+    [_, ...rest] -> {
       let head = concat_all([
-        "kai_", p, " = _t", int_to_string(i), "; "
+        "*_kai_tcrp", int_to_string(i), " = _t", int_to_string(i), "; "
       ])
       string_concat(head, tcrec_emit_rebinds(rest, i + 1))
-    }
-  }
-}
-
-# Phase 3 unboxing — rebind raw param locals (`kair_<name>`) from
-# the temporaries computed by `tcrec_emit_arg_lets_raw`.
-
-# Phase 3 unboxing — rebind raw param locals (`kair_<name>`) from
-# the temporaries computed by `tcrec_emit_arg_lets_raw`.
-fn tcrec_emit_rebinds_raw(pnames: [String], i: Int) : String {
-  match pnames {
-    [] -> ""
-    [p, ...rest] -> {
-      let head = concat_all([
-        "kair_", p, " = _t", int_to_string(i), "; "
-      ])
-      string_concat(head, tcrec_emit_rebinds_raw(rest, i + 1))
     }
   }
 }
@@ -14590,12 +14608,12 @@ fn tcrec_emit_arg_lets_masked(src: String, args_e: [Expr], pts: [Ty], mask: [Boo
 }
 
 # Drops: ONLY boxed slots whose dropmask bit is set get a drop of the
-# old `kai_<p>`. Raw slots are skipped (a scalar has no refcount —
+# old param value. Raw slots are skipped (a scalar has no refcount —
 # dropping it is the #709 corruption bug).
 fn tcrec_emit_drops_masked(pnames: [String], mask: [Bool], dropmask: Int, i: Int) : String {
   match pnames {
     [] -> ""
-    [p, ...rest] -> {
+    [_, ...rest] -> {
       let is_raw = match mask {
         [m, ..._] -> m
         [] -> true
@@ -14608,29 +14626,9 @@ fn tcrec_emit_drops_masked(pnames: [String], mask: [Bool], dropmask: Int, i: Int
       let head =
         if is_raw { "" }
         else if (dropmask / bit) % 2 == 1 {
-          concat_all(["{ KaiValue *_ = kai_internal_drop(kai_", p, "); (void) _; } "])
+          concat_all(["{ KaiValue *_ = kai_internal_drop(*_kai_tcrp", int_to_string(i), "); (void) _; } "])
         } else { "" }
       string_concat(head, tcrec_emit_drops_masked(rest, mrest, dropmask, i + 1))
-    }
-  }
-}
-
-# Rebind: raw slot → `kair_<p> = _tN`, boxed slot → `kai_<p> = _tN`.
-fn tcrec_emit_rebinds_masked(pnames: [String], mask: [Bool], i: Int) : String {
-  match pnames {
-    [] -> ""
-    [p, ...rest] -> {
-      let is_raw = match mask {
-        [m, ..._] -> m
-        [] -> true
-      }
-      let mrest = match mask {
-        [_, ...r] -> r
-        [] -> []
-      }
-      let prefix = if is_raw { "kair_" } else { "kai_" }
-      let head = concat_all([prefix, p, " = _t", int_to_string(i), "; "])
-      string_concat(head, tcrec_emit_rebinds_masked(rest, mrest, i + 1))
     }
   }
 }
