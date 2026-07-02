@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.98.0 (2026-07-02)
+
+### Added
+
+- **native**: struct-by-value FFI — C-ABI classification in the emitter (closes #1030) (#1041)
+- **build**: add kaic2-fast dev rebuild via modular self-compile (refs #1029)
+- **native**: native self-host LINK + RUN -- the native-built compiler links and runs (refs #1021) (#1026)
+
+### Fixed
+
+- **native**: single alias-binder collector mirroring emit_pat_binds (closes #1021) (#1044)
+- **native**: add struct-FFI prim forwarders to the self-host link shim (#1043)
+- **perceus**: align tcrec dropmask with pcs branch-aware skip (closes #1036) (#1040)
+- **driver**: correct stale kaic1: prefix on kaic2 file-read errors (#1039)
+- **emit**: rebind self-tail params through param pointers under binder shadow (closes #1031) (#1037)
+- **native**: dual-branch cons reuse + recursive alias-binder dup (refs #1021, refs #1025) (#1035)
+- **lexer**: stage0 skips multi-line #[...] attributes whole (closes #987) (#1032)
+- **native**: incref nested variant alias binders in owned self-tail arms (refs #1025) (#1028)
+- **native**: incref shared cons donor head/tail in reuse-gc (refs #1025) (#1027)
+- **native**: bind sibling slots in lone-list-slot variant arms (#1024)
+
 ## v0.97.0 (2026-06-30)
 
 ### Added
