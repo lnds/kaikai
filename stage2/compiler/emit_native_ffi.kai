@@ -1,33 +1,30 @@
 # compiler/emit_native_ffi.kai — `extern "C" fn` shim synthesis for the
-# in-process libLLVM native backend (FFI v1, issue #260).
+# in-process libLLVM native backend (FFI v1 + v2).
 #
 # A `KFnFfi(c_symbol, param_kinds, ret_kind)` carries NO lowered body: the
-# native shim is synthesised here, the mirror of `llvm_emit_ffi_shim`
-# (emit_llvm.kai) and `emit_ffi_shim_body` (emit_c.kai). The KIR already
-# resolved `c_symbol` (the issue #261 override carved out of the magic tag),
-# so this module never re-reads the tag — one resolver, not three (asu).
+# native shim is synthesised here, the mirror of `emit_ffi_v2_shim_body`
+# (emit_ffi_c.kai) and `emit_ffi_shim_body` (emit_c.kai). The KIR already
+# resolved `c_symbol` (the issue #261 override), so this module never
+# re-reads the tag — one resolver, not three (asu).
 #
 # Shape (per param, then the call):
-#   1. unbox each boxed wrapper arg to its raw C scalar (`kaix_int_field`,
-#      `kaix_real_field`, `kaix_bool_field`, `kaix_str_bytes` — box→raw
-#      BORROWS, no decref);
-#   2. call the raw extern symbol over the scalars;
-#   3. decref each boxed input (mirror of emit_c's `ffi_emit_arg_decrefs`);
-#   4. re-box the raw return into a fresh `KaiValue *` (`kaix_int` / … /
-#      `kaix_unit`), then `ret` it.
+#   1. unbox each boxed wrapper arg to its raw C scalar (box->raw BORROWS,
+#      no decref) — or, for a struct-by-value param, marshal it per the
+#      platform C ABI (emit_native_abi + emit_native_struct);
+#   2. call the raw extern symbol;
+#   3. decref each boxed input (mirror of emit_c's arg decrefs);
+#   4. re-box the raw return into a fresh `KaiValue *`.
 #
 # RC discipline (asu, load-bearing): the input decref runs AFTER the extern
 # call returns. A String arg unboxes to a borrowed `char *` aliasing inside
 # the boxed cell; decref'ing before the call finishes reading it is a
-# use-after-free. The raw return has no RC (a C `int`/`double`/`char *`); the
-# re-box mints the single owner, so there is nothing to decref on the return.
+# use-after-free. The raw return has no RC; the re-box mints the owner.
 #
-# Scope: scalars, fixed-width (U8..F32) and opaque handles marshal here.
-# Struct-by-value is REJECTED with an actionable diagnostic — a small
-# struct's C ABI (iN / [N x float] / sret per SysV / AAPCS / Darwin) is
-# frontend classification, not something LLVM derives from a `byval`
-# pointer; replicating it per target is a separate lane. The C-direct
-# backend marshals structs correctly (the C compiler owns the ABI).
+# Struct-by-value crosses the boundary with the platform C-ABI
+# classification done in the emitter (issue #1030): AAPCS64 (arm64 Darwin)
+# and x86-64 SysV are marshalled; any other target keeps the honest reject
+# (a small struct's coercion into iN / [n x float] / sret is frontend work
+# LLVM does not derive from a struct value).
 
 import compiler.util
 import compiler.ast
@@ -35,11 +32,10 @@ import compiler.kir
 import compiler.native_prims
 import compiler.emit_native_fn
 import compiler.emit_native_ops
+import compiler.emit_native_abi
+import compiler.emit_native_struct
 
-# Synthesise the whole `kai_<name>` wrapper for an `extern "C" fn`. The
-# wrapper has the all-boxed signature its callers invoke (`ptr (ptr × n)`),
-# declared up front by `nemit_declare_fns`; here we open its entry block,
-# fill it, and seal with `ret`.
+# Synthesise the whole `kai_<name>` wrapper for an `extern "C" fn`.
 pub fn nemit_ffi_fn(ctx: Handle, f: KFn, c_symbol: String,
                     param_kinds: [KFfiKind], ret_kind: KFfiKind) : Unit / Console = {
   let arity = list_length(f.params)
@@ -49,85 +45,203 @@ pub fn nemit_ffi_fn(ctx: Handle, f: KFn, c_symbol: String,
   native_ctx_set_fnval(ctx, wrapper)
   let entry = llvm_append_block(native_ctx_m(ctx), wrapper, "entry")
   llvm_position_at_end(native_ctx_b(ctx), entry)
-  if ffi_uses_struct(param_kinds, ret_kind) {
-    ffi_reject_struct(ctx, c_symbol)
-    llvm_build_ret(native_ctx_b(ctx), nemit_call0(ctx, "kaix_unit")); ()
-  } else if ffi_any_unknown(param_kinds, ret_kind) {
+  let plat = abi_plat_of_code(native_target_abi())
+  if ffi_any_unknown(param_kinds, ret_kind) {
     nemit_unsupported(ctx, cat2("unsupported FFI boundary type in ", c_symbol))
     llvm_build_ret(native_ctx_b(ctx), nemit_call0(ctx, "kaix_unit")); ()
+  } else if ffi_uses_struct(param_kinds, ret_kind) and not ffi_abi_ok(param_kinds, ret_kind, plat) {
+    ffi_reject_struct(ctx, c_symbol)
+    llvm_build_ret(native_ctx_b(ctx), nemit_call0(ctx, "kaix_unit")); ()
   } else {
-    # The boxed wrapper params (LLVM 0..n-1) feed two buffers in one walk: the
-    # raw scalar arg list (unboxed) and the boxed-input list (decref'd after).
-    let argbuf = llvm_buf_new()      # raw extern args
-    let ptbuf  = llvm_buf_new()      # raw extern param types
-    let boxbuf = llvm_buf_new()      # boxed inputs to decref post-call
-    ffi_unbox_params(ctx, wrapper, param_kinds, 0, argbuf, ptbuf, boxbuf)
-    let raw = ncall_finish(ctx, c_symbol, ffi_ret_type(ctx, ret_kind), ptbuf, argbuf)
-    ffi_decref_inputs(ctx, boxbuf, 0)
-    llvm_buf_free(boxbuf)
-    llvm_build_ret(native_ctx_b(ctx), ffi_rebox_ret(ctx, ret_kind, raw)); ()
+    ffi_emit_shim(ctx, wrapper, c_symbol, param_kinds, ret_kind, plat); ()
   }
   native_ctx_set_fnval(ctx, saved_fnval); ()
 }
 
-# Struct-by-value rejection (the `kai info ffi` degrade contract). A small
-# struct's C ABI is the FRONTEND's job — clang coerces it into iN / [N x
-# float] / sret per SysV / AAPCS / Darwin; LLVM does NOT reclassify a
-# `byval` pointer into those registers. Replicating that classification
-# per target is a separate lane; until then the native backend rejects
-# struct-by-value with an actionable message instead of corrupting the
-# value silently. A dedicated diagnostic (NOT the generic subset-gap
-# notice) names the symbol + the `--backend=c` fix the C-direct backend
-# honours (it marshals structs correctly — the C compiler owns the ABI).
-fn ffi_reject_struct(ctx: Handle, c_symbol: String) : Unit / Console = {
-  eprint(concat_all([
-    "native FFI: extern \"C\" fn `", c_symbol,
-    "` passes or returns a struct by value, not yet supported on the native backend — rebuild with --backend=c"
-  ]))
-  native_ctx_fail(ctx)
+# The shim body: build the call (returns the raw extern result), decref the
+# boxed inputs, and return the re-boxed result. A struct return via `sret`
+# has no raw value — the record is built from the sret alloca inside
+# `ffi_build_call`, so `ffi_rebox_ret` sees the finished record.
+fn ffi_emit_shim(ctx: Handle, wrapper: Handle, c_symbol: String,
+                 param_kinds: [KFfiKind], ret_kind: KFfiKind, plat: AbiPlat) : Unit / Console = {
+  let boxbuf = llvm_buf_new()
+  let raw = ffi_build_call(ctx, wrapper, c_symbol, param_kinds, ret_kind, plat, boxbuf)
+  ffi_decref_inputs(ctx, boxbuf, 0)
+  llvm_buf_free(boxbuf)
+  llvm_build_ret(native_ctx_b(ctx), ffi_rebox_ret(ctx, ret_kind, plat, raw)); ()
 }
 
-# True when any param OR the return crosses as a struct-by-value.
-fn ffi_uses_struct(param_kinds: [KFfiKind], ret_kind: KFfiKind) : Bool =
-  ffi_is_struct(ret_kind) or ffi_params_any_struct(param_kinds)
-
-fn ffi_params_any_struct(ks: [KFfiKind]) : Bool = match ks {
-  []           -> false
-  [k, ...rest] -> if ffi_is_struct(k) { true } else { ffi_params_any_struct(rest) }
+# Build the extern declaration + call, applying the struct-by-value ABI on
+# both. Returns the raw result the re-box consumes: a scalar value, or —
+# for a struct return — the finished KAI_RECORD (sret / coerce both re-box
+# inside, so the caller re-boxes trivially).
+fn ffi_build_call(ctx: Handle, wrapper: Handle, sym: String, kinds: [KFfiKind],
+                  ret_kind: KFfiKind, plat: AbiPlat, boxbuf: Handle) : Handle / Console = {
+  let ptb = llvm_buf_new()      # extern param types
+  let ab  = llvm_buf_new()      # extern call args
+  let m = native_ctx_m(ctx)
+  # A struct return classified indirect prepends the hidden sret pointer.
+  let sret = ffi_struct_ret_sret(ctx, ret_kind, plat)
+  ffi_push_sret_arg(ctx, sret, ptb, ab)
+  ffi_marshal_params(ctx, wrapper, kinds, plat, 0, ptb, ab, boxbuf)
+  let ret_ty = ffi_extern_ret_type(ctx, ret_kind, plat)
+  let fnty = llvm_fn_type_n(ret_ty, ptb)
+  let fnv = llvm_get_or_declare_fn(m, sym, fnty)
+  ffi_stamp_byval(ctx, m, fnv, sret, ret_kind, kinds, plat, ffi_sret_offset(sret), true)
+  let call = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, ab)
+  ffi_stamp_byval(ctx, m, call, sret, ret_kind, kinds, plat, ffi_sret_offset(sret), false)
+  llvm_buf_free(ptb); llvm_buf_free(ab)
+  ffi_finish_ret(ctx, ret_kind, plat, sret, call)
 }
 
-fn ffi_is_struct(k: KFfiKind) : Bool = match k {
-  KFfiStruct(_) -> true
-  _             -> false
+# --- struct return: sret alloca (or null when not indirect) ----------
+
+# When the return classifies MEMORY (AbiSret), alloca the struct and return
+# its pointer; else a genuinely-NULL handle (no sret). The `nemit_null`
+# helper yields an LLVM `ConstantPointerNull` VALUE — a non-NULL C handle —
+# so it CANNOT signal "no sret"; a missing named global gives a real NULL C
+# handle instead, which `llvm_handle_is_null` reads as 1.
+fn ffi_struct_ret_sret(ctx: Handle, ret_kind: KFfiKind, plat: AbiPlat) : Handle / Console = match ret_kind {
+  KFfiStruct(fields) -> match abi_classify_ret(fields, plat) {
+    AbiSret -> {
+      let sty = nstruct_llvm_type(ctx, fields)
+      llvm_build_alloca_entry(ctx, sty, "ffi.sret")
+    }
+    _       -> ffi_null_handle(ctx)
+  }
+  _ -> ffi_null_handle(ctx)
 }
 
-# Declare the extern + emit the call, then stamp `byval(<struct>)` on each
-# struct-arg position of BOTH the declaration and the call site so LLVM
-# applies the target C-ABI. The struct types are recreated from
-# `param_kinds` (a kaikai list — safe; LLVM dedups identical struct types,
-# so a recreated type IS the one the alloca used). LLVM handles must never
-# ride a kaikai list, hence we carry the kinds, not the types.
-# Unbox each wrapper param into `argbuf` (raw scalar) + `ptbuf` (its raw
-# LLVM type), recording the boxed input in `boxbuf` for the post-call
-# decref. A `KFfiUnit` param carries no runtime value (the C oracle elides
-# it) and contributes to no buffer.
-fn ffi_unbox_params(ctx: Handle, wrapper: Handle, kinds: [KFfiKind], i: Int,
-                    argbuf: Handle, ptbuf: Handle, boxbuf: Handle) : Unit / Console = match kinds {
+# A genuinely NULL C handle (not an LLVM null value): probing a global that
+# was never defined returns a real NULL pointer.
+fn ffi_null_handle(ctx: Handle) : Handle =
+  llvm_get_named_global(native_ctx_m(ctx), "__kai_ffi_absent_sret")
+
+fn ffi_sret_offset(sret: Handle) : Int = if llvm_handle_is_null(sret) == 1 { 0 } else { 1 }
+
+fn ffi_push_sret_arg(ctx: Handle, sret: Handle, ptb: Handle, ab: Handle) : Unit =
+  if llvm_handle_is_null(sret) == 1 { () }
+  else { llvm_buf_push(ptb, native_ctx_ptrt(ctx)); llvm_buf_push(ab, sret) }
+
+# --- param marshalling -----------------------------------------------
+
+fn ffi_marshal_params(ctx: Handle, wrapper: Handle, kinds: [KFfiKind], plat: AbiPlat,
+                      i: Int, ptb: Handle, ab: Handle, boxbuf: Handle) : Unit / Console = match kinds {
   [] -> ()
   [k, ...rest] -> match k {
-    KFfiUnit -> ffi_unbox_params(ctx, wrapper, rest, i + 1, argbuf, ptbuf, boxbuf)
+    KFfiUnit -> ffi_marshal_params(ctx, wrapper, rest, plat, i + 1, ptb, ab, boxbuf)
+    KFfiStruct(fields) -> {
+      let boxed = llvm_get_param(wrapper, i)
+      llvm_buf_push(boxbuf, boxed)
+      ffi_marshal_struct_param(ctx, fields, plat, boxed, ptb, ab)
+      ffi_marshal_params(ctx, wrapper, rest, plat, i + 1, ptb, ab, boxbuf)
+    }
     _ -> {
       let boxed = llvm_get_param(wrapper, i)
       llvm_buf_push(boxbuf, boxed)
-      llvm_buf_push(argbuf, ffi_unbox_one(ctx, k, boxed))
-      llvm_buf_push(ptbuf, ffi_arg_type(ctx, k))
-      ffi_unbox_params(ctx, wrapper, rest, i + 1, argbuf, ptbuf, boxbuf)
+      llvm_buf_push(ab, ffi_unbox_one(ctx, k, boxed))
+      llvm_buf_push(ptb, ffi_scalar_type(ctx, k))
+      ffi_marshal_params(ctx, wrapper, rest, plat, i + 1, ptb, ab, boxbuf)
     }
   }
 }
 
-# Box→raw borrow of one boxed param at its FFI kind (no decref — the
-# trailing `ffi_decref_inputs` releases the box once the extern has read it).
+# A struct param: fill an alloca, then pass it per its ABI class — the
+# coerce-loaded register value, or the pointer (byval stamped later).
+fn ffi_marshal_struct_param(ctx: Handle, fields: [KFfiField], plat: AbiPlat,
+                            boxed: Handle, ptb: Handle, ab: Handle) : Unit / Console = {
+  let slot = nstruct_fill_arg(ctx, fields, boxed)
+  match abi_classify_param(fields, plat) {
+    AbiCoerce(slots, as_array) -> {
+      let cty = nabi_coerce_type(ctx, slots, as_array)
+      let loaded = nstruct_load_coerced(ctx, slot, cty)
+      llvm_buf_push(ab, loaded)
+      llvm_buf_push(ptb, cty)
+    }
+    _ -> { llvm_buf_push(ab, slot); llvm_buf_push(ptb, native_ctx_ptrt(ctx)) }
+  }
+}
+
+# --- byval stamping ---------------------------------------------------
+
+# Stamp the aggregate ABI attributes: `sret(<struct>)` on the hidden
+# return pointer (when indirect) + `byval(<struct>)` on each indirect
+# struct param. `cpos` counts value-carrying params from the sret offset.
+fn ffi_stamp_byval(ctx: Handle, m: Handle, target: Handle, sret: Handle, ret_kind: KFfiKind,
+                   kinds: [KFfiKind], plat: AbiPlat, cpos: Int, is_decl: Bool) : Unit / Console = {
+  ffi_stamp_sret(ctx, m, target, sret, ret_kind, is_decl)
+  ffi_stamp_byval_params(ctx, m, target, kinds, plat, cpos, is_decl)
+}
+
+# Stamp `sret(<struct>)` when the return crosses indirectly. The struct
+# type is recreated from `ret_kind` (LLVM dedups it with the alloca type).
+fn ffi_stamp_sret(ctx: Handle, m: Handle, target: Handle, sret: Handle,
+                  ret_kind: KFfiKind, is_decl: Bool) : Unit / Console =
+  if llvm_handle_is_null(sret) == 1 { () }
+  else {
+    match ret_kind {
+      KFfiStruct(fields) -> {
+        let sty = nstruct_llvm_type(ctx, fields)
+        if is_decl { llvm_add_sret_decl(m, target, sty); () } else { llvm_add_sret_call(m, target, sty); () }
+      }
+      _ -> ()
+    }
+  }
+
+fn ffi_stamp_byval_params(ctx: Handle, m: Handle, target: Handle, kinds: [KFfiKind],
+                          plat: AbiPlat, cpos: Int, is_decl: Bool) : Unit / Console = match kinds {
+  [] -> ()
+  [KFfiUnit, ...rest] -> ffi_stamp_byval_params(ctx, m, target, rest, plat, cpos, is_decl)
+  [KFfiStruct(fields), ...rest] -> {
+    ffi_stamp_one_byval(ctx, m, target, fields, plat, cpos, is_decl)
+    ffi_stamp_byval_params(ctx, m, target, rest, plat, cpos + 1, is_decl)
+  }
+  [_, ...rest] -> ffi_stamp_byval_params(ctx, m, target, rest, plat, cpos + 1, is_decl)
+}
+
+fn ffi_stamp_one_byval(ctx: Handle, m: Handle, target: Handle, fields: [KFfiField],
+                       plat: AbiPlat, cpos: Int, is_decl: Bool) : Unit / Console = match abi_classify_param(fields, plat) {
+  AbiIndirect(true) -> {
+    let sty = nstruct_llvm_type(ctx, fields)
+    if is_decl { llvm_add_byval_decl(m, target, cpos, sty); () }
+    else { llvm_add_byval_call(m, target, cpos, sty); () }
+  }
+  _ -> ()
+}
+
+# --- return handling --------------------------------------------------
+
+# The raw extern return type: the coerce type for a coerced struct return,
+# void for an sret return, else the scalar type.
+fn ffi_extern_ret_type(ctx: Handle, ret_kind: KFfiKind, plat: AbiPlat) : Handle = match ret_kind {
+  KFfiStruct(fields) -> match abi_classify_ret(fields, plat) {
+    AbiCoerce(slots, as_array) -> nabi_coerce_type(ctx, slots, as_array)
+    _                          -> native_ctx_voidt(ctx)
+  }
+  _ -> ffi_scalar_type(ctx, ret_kind)
+}
+
+# Turn the raw call result into what the re-box consumes. A struct return
+# builds the record here (sret: reload the alloca; coerce: stash then
+# reload); a scalar passes through untouched.
+fn ffi_finish_ret(ctx: Handle, ret_kind: KFfiKind, plat: AbiPlat, sret: Handle, call: Handle) : Handle / Console = match ret_kind {
+  KFfiStruct(fields) -> match abi_classify_ret(fields, plat) {
+    AbiSret -> {
+      let sty = nstruct_llvm_type(ctx, fields)
+      nstruct_rebox_from_slot(ctx, fields, sty, sret)
+    }
+    AbiCoerce(slots, as_array) -> {
+      let sty = nstruct_llvm_type(ctx, fields)
+      let slot = nstruct_stash_coerced(ctx, sty, nabi_coerce_type(ctx, slots, as_array), call)
+      nstruct_rebox_from_slot(ctx, fields, sty, slot)
+    }
+    _ -> nemit_call0(ctx, "kaix_unit")
+  }
+  _ -> call
+}
+
+# --- scalar unbox / rebox (v1 + fixed-width, unchanged) --------------
+
 fn ffi_unbox_one(ctx: Handle, k: KFfiKind, boxed: Handle) : Handle / Console = match k {
   KFfiInt     -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
   KFfiReal    -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
@@ -137,21 +251,14 @@ fn ffi_unbox_one(ctx: Handle, k: KFfiKind, boxed: Handle) : Handle / Console = m
   KFfiForeign -> ncall_sig1(ctx, "kaix_foreign_ptr", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), boxed)
   KFfiFixed(bits, _, isf) -> ffi_unbox_fixed(ctx, bits, isf, boxed)
   KFfiFixedVal(bits, _) -> ffi_unbox_fixed_val(ctx, bits, boxed)
-  # KFfiStruct rejected at the shim gate (`ffi_uses_struct`); never reaches
-  # here. KFfiUnit/KFfiUnknown gated upstream.
   _           -> nemit_null(ctx)
 }
 
-# Unbox an honest fixed-width value box: read its exact width field as an
-# i64 (the shim zero/sign-extends per width) and trunc to the C width.
 fn ffi_unbox_fixed_val(ctx: Handle, bits: Int, boxed: Handle) : Handle / Console = {
   let i = ncall_sig1(ctx, "kaix_fixed_val_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
   llvm_build_trunc(native_ctx_b(ctx), i, llvm_int_type(native_ctx_m(ctx), bits))
 }
 
-# Unbox a fixed-width arg: read the i64 (or f64 for F32) payload, then
-# narrow to the exact C width — `trunc i64→iN` (C-cast, no range-check),
-# or `fpcast f64→float`.
 fn ffi_unbox_fixed(ctx: Handle, bits: Int, isf: Bool, boxed: Handle) : Handle / Console =
   if isf {
     let r = ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
@@ -161,10 +268,8 @@ fn ffi_unbox_fixed(ctx: Handle, bits: Int, isf: Bool, boxed: Handle) : Handle / 
     llvm_build_trunc(native_ctx_b(ctx), i, llvm_int_type(native_ctx_m(ctx), bits))
   }
 
-# The raw LLVM type the extern symbol takes/returns for one kind. A
-# fixed-width crosses at its exact C width (iN or `float`). Struct kinds
-# are rejected at the shim gate, so the defensive arm never fires.
-fn ffi_llvm_type(ctx: Handle, k: KFfiKind) : Handle = match k {
+# The raw LLVM type of a NON-struct FFI kind at its exact C width.
+fn ffi_scalar_type(ctx: Handle, k: KFfiKind) : Handle = match k {
   KFfiUnit       -> native_ctx_voidt(ctx)
   KFfiInt        -> native_ctx_i64t(ctx)
   KFfiReal       -> native_ctx_f64t(ctx)
@@ -179,13 +284,9 @@ fn ffi_llvm_type(ctx: Handle, k: KFfiKind) : Handle = match k {
   _              -> native_ctx_ptrt(ctx)
 }
 
-fn ffi_arg_type(ctx: Handle, k: KFfiKind) : Handle = ffi_llvm_type(ctx, k)
-fn ffi_ret_type(ctx: Handle, k: KFfiKind) : Handle = ffi_llvm_type(ctx, k)
-
-# Re-box the raw extern return into a fresh boxed `KaiValue *`. A `void`
-# extern (`KFfiUnit`) discards `raw` and returns the canonical unit; the
-# scalar kinds box through the matching runtime constructor.
-fn ffi_rebox_ret(ctx: Handle, k: KFfiKind, raw: Handle) : Handle / Console = match k {
+# Re-box the raw scalar extern return. A struct return is already a record
+# (built in `ffi_finish_ret`); it flows through untouched here.
+fn ffi_rebox_ret(ctx: Handle, k: KFfiKind, plat: AbiPlat, raw: Handle) : Handle / Console = match k {
   KFfiUnit    -> nemit_call0(ctx, "kaix_unit")
   KFfiInt     -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw)
   KFfiReal    -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), raw)
@@ -195,13 +296,10 @@ fn ffi_rebox_ret(ctx: Handle, k: KFfiKind, raw: Handle) : Handle / Console = mat
   KFfiForeign -> ncall_sig1(ctx, "kaix_foreign", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), raw)
   KFfiFixed(_, signed, isf) -> ffi_rebox_fixed(ctx, signed, isf, raw)
   KFfiFixedVal(bits, signed) -> ffi_rebox_fixed_val(ctx, bits, signed, raw)
-  # KFfiStruct rejected at the shim gate; never reaches here.
+  KFfiStruct(_) -> raw   # already a record
   _           -> nemit_call0(ctx, "kaix_unit")
 }
 
-# Re-box an honest fixed-width return: widen the C-width raw to i64
-# (sext/zext per signedness) and box with the matching width constructor
-# (the shim truncates back to the exact width).
 fn ffi_rebox_fixed_val(ctx: Handle, bits: Int, signed: Bool, raw: Handle) : Handle / Console = {
   let w = if signed { llvm_build_sext(native_ctx_b(ctx), raw, native_ctx_i64t(ctx)) }
           else { llvm_build_zext(native_ctx_b(ctx), raw, native_ctx_i64t(ctx)) }
@@ -209,10 +307,6 @@ fn ffi_rebox_fixed_val(ctx: Handle, bits: Int, signed: Bool, raw: Handle) : Hand
   ncall_sig1(ctx, ctor, native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
 }
 
-# Re-box a fixed-width return: widen the exact-C-width raw back to the
-# i64/f64 box payload. `sext` for a signed `I*`, `zext` for an unsigned
-# `U*` (the wrong choice turns `uint8_t 255` into Int -1); `fpext`
-# float→double for F32.
 fn ffi_rebox_fixed(ctx: Handle, signed: Bool, isf: Bool, raw: Handle) : Handle / Console =
   if isf {
     let w = llvm_build_fpcast(native_ctx_b(ctx), raw, native_ctx_f64t(ctx))
@@ -223,8 +317,7 @@ fn ffi_rebox_fixed(ctx: Handle, signed: Bool, isf: Bool, raw: Handle) : Handle /
     ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
   }
 
-# Decref each boxed input recorded during unboxing (one `kaix_decref` per
-# input, post-call — mirror of emit_c's `ffi_emit_arg_decrefs`).
+# Decref each boxed input recorded during marshalling (post-call).
 fn ffi_decref_inputs(ctx: Handle, boxbuf: Handle, i: Int) : Unit / Console =
   if i >= llvm_buf_len(boxbuf) { () }
   else {
@@ -233,9 +326,53 @@ fn ffi_decref_inputs(ctx: Handle, boxbuf: Handle, i: Int) : Unit / Console =
     ffi_decref_inputs(ctx, boxbuf, i + 1)
   }
 
-# True when any param kind OR the return kind is `KFfiUnknown` — a type
-# the typer already rejects upstream. Defensive belt: emit a
-# unit-returning stub rather than malformed IR for a still-building module.
+# --- struct-by-value gates -------------------------------------------
+
+# Struct-by-value rejection: kept for a target the classifier does not
+# model (`AbiNoAbi`). A small struct's C ABI is frontend classification;
+# where it is unknown, reject loudly instead of corrupting silently.
+fn ffi_reject_struct(ctx: Handle, c_symbol: String) : Unit / Console = {
+  eprint(concat_all([
+    "native FFI: extern \"C\" fn `", c_symbol,
+    "` passes or returns a struct by value, not yet supported on the native backend — rebuild with --backend=c"
+  ]))
+  native_ctx_fail(ctx)
+}
+
+# True when the platform classifies EVERY struct param + the struct return
+# (`AbiNoAbi` anywhere aborts to the reject).
+fn ffi_abi_ok(param_kinds: [KFfiKind], ret_kind: KFfiKind, plat: AbiPlat) : Bool =
+  ffi_ret_abi_ok(ret_kind, plat) and ffi_params_abi_ok(param_kinds, plat)
+
+fn ffi_ret_abi_ok(k: KFfiKind, plat: AbiPlat) : Bool = match k {
+  KFfiStruct(fields) -> ffi_pass_ok(abi_classify_ret(fields, plat))
+  _                  -> true
+}
+
+fn ffi_params_abi_ok(ks: [KFfiKind], plat: AbiPlat) : Bool = match ks {
+  [] -> true
+  [KFfiStruct(fields), ...rest] -> ffi_pass_ok(abi_classify_param(fields, plat)) and ffi_params_abi_ok(rest, plat)
+  [_, ...rest] -> ffi_params_abi_ok(rest, plat)
+}
+
+fn ffi_pass_ok(p: AbiPass) : Bool = match p {
+  AbiNoAbi(_) -> false
+  _           -> true
+}
+
+fn ffi_uses_struct(param_kinds: [KFfiKind], ret_kind: KFfiKind) : Bool =
+  ffi_is_struct(ret_kind) or ffi_params_any_struct(param_kinds)
+
+fn ffi_params_any_struct(ks: [KFfiKind]) : Bool = match ks {
+  []           -> false
+  [k, ...rest] -> if ffi_is_struct(k) { true } else { ffi_params_any_struct(rest) }
+}
+
+fn ffi_is_struct(k: KFfiKind) : Bool = match k {
+  KFfiStruct(_) -> true
+  _             -> false
+}
+
 fn ffi_any_unknown(param_kinds: [KFfiKind], ret_kind: KFfiKind) : Bool =
   ffi_is_unknown(ret_kind) or ffi_params_any_unknown(param_kinds)
 
