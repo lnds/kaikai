@@ -1,0 +1,224 @@
+# compiler/emit_native_abi.kai — C-ABI classification for struct-by-value
+# FFI on the native backend.
+#
+# LLVM does NOT derive the platform calling convention from a struct
+# value: deciding HOW an aggregate crosses the C boundary (coerced into
+# integer/float registers, passed indirectly, returned through a hidden
+# sret pointer) is the frontend's job. This module is that decision,
+# mirrored from clang's lowering for the two supported targets:
+#
+#   - AArch64 (AAPCS64): an HFA (1-4 same-width float fields after
+#     flattening) rides float registers as [n x float] / [n x double];
+#     any other aggregate <= 16 bytes rides GPRs (params round up to
+#     i64 / [2 x i64], returns use the exact bit width); larger crosses
+#     indirectly (plain pointer param / sret return).
+#   - x86-64 SysV: per-eightbyte classification. An eightbyte whose
+#     fields are all float crosses in an SSE register (a float / double
+#     slot — bit-identical to clang's <2 x float>); any integer field
+#     makes it INTEGER at the exact remaining width (i64 / i32 / i24 /
+#     ...). > 16 bytes crosses in memory (byval param / sret return).
+#
+# Pure classification: KFfiField lists in, AbiPass descriptors out. NO
+# LLVM handles live here — the emitter (emit_native_ffi) turns slots
+# into LLVM types — so this layer sits entirely outside the Perceus
+# handle-exclusion regime.
+
+import compiler.util
+import compiler.kir
+
+#[doc("Target C ABI for aggregate FFI marshalling on the native backend.")]
+pub type AbiPlat = PlatA64 | PlatSysV | PlatNone
+
+#[doc("One register slot of a coerced aggregate: an iN integer (bit width), a float, or a double.")]
+pub type AbiSlot = ASInt(Int) | ASF32 | ASF64
+
+#[doc("""How one struct-by-value crosses the C boundary.
+
+`AbiCoerce(slots, as_array)`: in registers as the given slots — a single
+slot is a bare scalar; multiple slots emit as `[n x T]` when `as_array`
+(the AAPCS64 form) or as a literal struct (the SysV form).
+`AbiIndirect(byval)`: via a pointer to a caller-built temp, stamped
+`byval` when the ABI wants the caller-copy attribute (SysV memory class).
+`AbiSret`: returned through a hidden pointer param. `AbiNoAbi`: not
+classifiable — the emitter keeps the honest reject.""")]
+pub type AbiPass
+  = AbiCoerce([AbiSlot], Bool)
+  | AbiIndirect(Bool)
+  | AbiSret
+  | AbiNoAbi(String)
+
+#[doc("Decode the `native_target_abi` prim code: 1 = AArch64, 2 = x86-64 SysV, other = unsupported.")]
+pub fn abi_plat_of_code(c: Int) : AbiPlat =
+  if c == 1 { PlatA64 } else { if c == 2 { PlatSysV } else { PlatNone } }
+
+#[doc("Classify how a struct-by-value PARAM crosses the boundary on the platform.")]
+pub fn abi_classify_param(fields: [KFfiField], plat: AbiPlat) : AbiPass =
+  abi_classify(fields, plat, false)
+
+#[doc("Classify how a struct-by-value RETURN crosses the boundary on the platform.")]
+pub fn abi_classify_ret(fields: [KFfiField], plat: AbiPlat) : AbiPass =
+  abi_classify(fields, plat, true)
+
+fn abi_classify(fields: [KFfiField], plat: AbiPlat, is_ret: Bool) : AbiPass =
+  if not abi_fields_ok(fields) { AbiNoAbi("unsupported field type") }
+  else {
+    match plat {
+      PlatA64  -> a64_classify(fields, is_ret)
+      PlatSysV -> sysv_classify(fields, is_ret)
+      PlatNone -> AbiNoAbi("no C-ABI classification for this target")
+    }
+  }
+
+# ---- field metrics --------------------------------------------------
+
+# Only kinds with an exact C width may live in a marshalled struct
+# (String/Foreign fields have no C-layout story; empty structs have no
+# well-defined ABI class).
+fn abi_kind_ok(k: KFfiKind) : Bool = match k {
+  KFfiInt            -> true
+  KFfiReal           -> true
+  KFfiBool           -> true
+  KFfiChar           -> true
+  KFfiFixed(_, _, _) -> true
+  KFfiFixedVal(_, _) -> true
+  KFfiStruct(fs)     -> abi_fields_ok(fs)
+  _                  -> false
+}
+
+fn abi_fields_ok(fields: [KFfiField]) : Bool = match fields {
+  []                    -> false
+  [KFF(_, k), ...rest]  -> abi_kind_ok(k) and (match rest {
+    [] -> true
+    _  -> abi_fields_ok(rest)
+  })
+}
+
+fn abi_kind_align(k: KFfiKind) : Int = match k {
+  KFfiBool              -> 4
+  KFfiChar              -> 4
+  KFfiFixed(bits, _, _) -> bits / 8
+  KFfiFixedVal(bits, _) -> bits / 8
+  KFfiStruct(fs)        -> abi_fields_align(fs, 1)
+  _                     -> 8   # KFfiInt / KFfiReal (int64_t / double)
+}
+
+fn abi_fields_align(fields: [KFfiField], best: Int) : Int = match fields {
+  [] -> best
+  [KFF(_, k), ...rest] -> {
+    let a = abi_kind_align(k)
+    abi_fields_align(rest, if a > best { a } else { best })
+  }
+}
+
+# Every supported scalar kind is size == align; a struct pads.
+fn abi_kind_size(k: KFfiKind) : Int = match k {
+  KFfiStruct(fs) -> abi_struct_size(fs)
+  _              -> abi_kind_align(k)
+}
+
+fn abi_struct_size(fields: [KFfiField]) : Int =
+  abi_align_up(abi_fields_end(fields, 0), abi_fields_align(fields, 1))
+
+# End of the last field's data (offset + size) BEFORE trailing padding —
+# the extent the SysV eightbyte slots must cover.
+fn abi_fields_end(fields: [KFfiField], cur: Int) : Int = match fields {
+  [] -> cur
+  [KFF(_, k), ...rest] ->
+    abi_fields_end(rest, abi_align_up(cur, abi_kind_align(k)) + abi_kind_size(k))
+}
+
+fn abi_align_up(x: Int, a: Int) : Int = ((x + a - 1) / a) * a
+
+# ---- flattening -----------------------------------------------------
+
+# One scalar leaf of the flattened aggregate: absolute offset, size,
+# is-float. Order is irrelevant to both classifiers.
+type AbiLeaf = AL(Int, Int, Bool)
+
+fn abi_kind_isf(k: KFfiKind) : Bool = match k {
+  KFfiReal             -> true
+  KFfiFixed(_, _, isf) -> isf
+  _                    -> false
+}
+
+fn abi_leaves(fields: [KFfiField], base: Int, cur: Int, acc: [AbiLeaf]) : [AbiLeaf] = match fields {
+  [] -> acc
+  [KFF(_, k), ...rest] -> {
+    let off = abi_align_up(cur, abi_kind_align(k))
+    let acc2 = match k {
+      KFfiStruct(nfs) -> abi_leaves(nfs, base + off, 0, acc)
+      _               -> [AL(base + off, abi_kind_size(k), abi_kind_isf(k)), ...acc]
+    }
+    abi_leaves(rest, base, off + abi_kind_size(k), acc2)
+  }
+}
+
+# ---- AAPCS64 --------------------------------------------------------
+
+# HFA: 1-4 leaves, all float, all one width. Returns the element size
+# (4 or 8), or 0 when not an HFA.
+fn abi_hfa_elem(leaves: [AbiLeaf]) : Int = match leaves {
+  [] -> 0
+  [AL(_, s, isf), ...rest] ->
+    if isf and list_length(rest) < 4 and abi_hfa_rest(rest, s) { s } else { 0 }
+}
+
+fn abi_hfa_rest(leaves: [AbiLeaf], s: Int) : Bool = match leaves {
+  [] -> true
+  [AL(_, s2, isf), ...rest] -> isf and s2 == s and abi_hfa_rest(rest, s)
+}
+
+fn a64_classify(fields: [KFfiField], is_ret: Bool) : AbiPass = {
+  let leaves = abi_leaves(fields, 0, 0, [])
+  let hfa = abi_hfa_elem(leaves)
+  if hfa > 0 { a64_hfa_pass(hfa, list_length(leaves)) }
+  else { a64_gpr_pass(abi_struct_size(fields), is_ret) }
+}
+
+fn a64_hfa_pass(elem_size: Int, n: Int) : AbiPass =
+  AbiCoerce(abi_repeat(if elem_size == 4 { ASF32 } else { ASF64 }, n), true)
+
+# Non-HFA aggregate: <= 8 bytes rides one GPR (a param rounds up to i64, a
+# return uses the exact bit width — clang's i64-param / i24-return split);
+# <= 16 rides a GPR pair; larger crosses indirect (sret return / byval-less
+# pointer param).
+fn a64_gpr_pass(size: Int, is_ret: Bool) : AbiPass =
+  if size <= 8 { AbiCoerce([ASInt(if is_ret { size * 8 } else { 64 })], false) }
+  else if size <= 16 { AbiCoerce([ASInt(64), ASInt(64)], true) }
+  else if is_ret { AbiSret }
+  else { AbiIndirect(false) }
+
+fn abi_repeat(s: AbiSlot, n: Int) : [AbiSlot] =
+  if n <= 0 { [] } else { [s, ...abi_repeat(s, n - 1)] }
+
+# ---- x86-64 SysV ----------------------------------------------------
+
+fn sysv_classify(fields: [KFfiField], is_ret: Bool) : AbiPass = {
+  let size = abi_struct_size(fields)
+  if size > 16 {
+    if is_ret { AbiSret } else { AbiIndirect(true) }
+  } else {
+    AbiCoerce(sysv_slots(abi_leaves(fields, 0, 0, []), 0, abi_fields_end(fields, 0)), false)
+  }
+}
+
+fn sysv_slots(leaves: [AbiLeaf], lo: Int, end: Int) : [AbiSlot] =
+  if lo >= end { [] }
+  else {
+    let hi = if end < lo + 8 { end } else { lo + 8 }
+    [sysv_slot(leaves, lo, hi), ...sysv_slots(leaves, lo + 8, end)]
+  }
+
+# SSE when every field in the eightbyte is float (a lone float stays a
+# float; two packed floats or a double take the full 8 bytes); any
+# integer makes the eightbyte INTEGER at the exact remaining width.
+fn sysv_slot(leaves: [AbiLeaf], lo: Int, hi: Int) : AbiSlot =
+  if sysv_all_float(leaves, lo, hi) {
+    if hi - lo <= 4 { ASF32 } else { ASF64 }
+  } else { ASInt((hi - lo) * 8) }
+
+fn sysv_all_float(leaves: [AbiLeaf], lo: Int, hi: Int) : Bool = match leaves {
+  [] -> true
+  [AL(off, sz, isf), ...rest] ->
+    (isf or off >= hi or off + sz <= lo) and sysv_all_float(rest, lo, hi)
+}
