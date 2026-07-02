@@ -1692,9 +1692,23 @@ static uint32_t kai_slot_mask_of(int32_t tag) {
  * calloc, variant-block fallback, arena chunk, and string/array payloads —
  * so no allocation path can grow past the ceiling uncounted. Single OS
  * thread (fibers share it), so a plain global needs no synchronisation. */
+/* Committed footprint is a whole-process total, so KAI_MAX_HEAP caps the
+ * program, not each TU: one shared accumulator (owner defines, others
+ * extern). A per-TU copy would let every TU spend the full ceiling. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern size_t kai_heap_limit_cached;
+extern int    kai_heap_inited;
+extern size_t kai_heap_committed;
+#  if defined(KAI_RUNTIME_OWNER)
+size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
+int    kai_heap_inited       = 0;
+size_t kai_heap_committed    = 0;
+#  endif
+#else
 static size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
 static int    kai_heap_inited       = 0;
 static size_t kai_heap_committed    = 0;
+#endif
 
 static size_t kai_heap_limit(void) {
     if (!kai_heap_inited) {
@@ -2162,10 +2176,27 @@ static void kai_var_block_free(KaiValue *v, int n) {
  * Selfhost stays byte-identical because the emitted text is
  * unchanged — only the runtime semantics shift.
  */
+/* Singletons are returned by address (kai_unit() = &kai_singleton_unit),
+ * so their identity is observable: any pointer-equality fast path breaks if
+ * two TUs each hold a private copy. One shared instance (owner defines,
+ * others extern) keeps unit/true/false/nil pointer-identical across TUs. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue kai_singleton_unit;
+extern KaiValue kai_singleton_true;
+extern KaiValue kai_singleton_false;
+extern KaiValue kai_singleton_nil;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = { .b = 0 } };
+KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
+KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
+KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
+#  endif
+#else
 static KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = { .b = 0 } };
 static KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
 static KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
 static KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
+#endif
 
 /* issue #120 — opt-in Perceus regions: bump-arena primitive (P0).
  *
@@ -2301,8 +2332,21 @@ static void kai_arena_free(KaiArena *a) {
  * block depth — 64 is far beyond any realistic region nesting and
  * keeps the stack a flat global with no allocation of its own. */
 #define KAI_ARENA_STACK_MAX 64
+/* One region stack per process: a `region { }` pushing in one TU and the
+ * matching pop in another must land on the same stack, so it is shared
+ * (owner defines, others extern) — a per-TU copy would push and pop two
+ * disjoint stacks and desync the region depth. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+extern int      kai_arena_sp;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+int      kai_arena_sp = 0;
+#  endif
+#else
 static KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
 static int      kai_arena_sp = 0;
+#endif
 
 static KaiArena *kai_arena_push(void) {
     if (kai_arena_sp >= KAI_ARENA_STACK_MAX) {
@@ -2517,54 +2561,87 @@ struct KaiNursery {
     KaiNursery *parent;
 };
 
-/* m7a #5 + m8.x: kai_main_fiber starts as the OS-thread context,
- * representing the dispatch loop. Its ctx is filled lazily on first
- * yield (getcontext at the moment we suspend the dispatch loop into
- * a fiber). The active-fiber pointer (kai_active_fiber) tracks
- * whoever is currently executing; kai_current_fiber returns it.
+/* kai_main_fiber starts as the OS-thread context, representing the
+ * dispatch loop. Its ctx is filled lazily on first yield (getcontext at
+ * the moment we suspend the dispatch loop into a fiber). The active-fiber
+ * pointer (kai_active_fiber) tracks whoever is currently executing;
+ * kai_current_fiber returns it.
+ *
+ * Scheduler state is process-global: a fiber spawned by one TU is parked,
+ * resumed, and freed by another, so under separate compilation there is
+ * one shared scheduler (extern everywhere, owner defines) — a per-TU copy
+ * would split the ready queue and the active-fiber pointer in two. The
+ * active-fiber initializer takes kai_main_fiber's address, so both live in
+ * the owner TU together; other TUs see the same address via extern.
  * Spec: docs/fibers-impl.md §*Dispatch loop*. */
-static KaiFiber kai_main_fiber = {
-    NULL,                /* evidence_top */
-    0, 0,                /* cancel_requested, cancel_delivered */
-    NULL, NULL,          /* sched_next, parent */
-    KAI_FIBER_RUNNING,   /* state — main starts running on the OS thread */
-    NULL, NULL,          /* thunk, result */
-    {0},                 /* ctx — getcontext fills it on first swap */
-    NULL, 0,             /* stack_base, stack_size — main uses the OS stack */
-    NULL, NULL,          /* awaiters_head, awaiters_next */
-    {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */
-    NULL,                /* linked_head */
-    NULL,                /* in_dispatch_node */
-    NULL,                /* value — main has no wrapper */
-    0,                   /* trap_exit — main starts opted out */
-    NULL,                /* mailbox — set by with_mailbox if main uses one */
-    NULL,                /* monitor_head — Monitor.monitor(...) appends here */
-    NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */
-    NULL, NULL           /* nursery_top, scope_sibling_next — issue #959 */
-};
-
+#define KAI_MAIN_FIBER_INIT {                                            \
+    NULL,                /* evidence_top */                              \
+    0, 0,                /* cancel_requested, cancel_delivered */        \
+    NULL, NULL,          /* sched_next, parent */                        \
+    KAI_FIBER_RUNNING,   /* state — main starts running on the OS thread */ \
+    NULL, NULL,          /* thunk, result */                            \
+    {0},                 /* ctx — getcontext fills it on first swap */   \
+    NULL, 0,             /* stack_base, stack_size — main uses OS stack */ \
+    NULL, NULL,          /* awaiters_head, awaiters_next */              \
+    {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */ \
+    NULL,                /* linked_head */                               \
+    NULL,                /* in_dispatch_node */                          \
+    NULL,                /* value — main has no wrapper */               \
+    0,                   /* trap_exit — main starts opted out */         \
+    NULL,                /* mailbox — set by with_mailbox if main uses one */ \
+    NULL,                /* monitor_head — Monitor.monitor(...) appends here */ \
+    NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
+    NULL, NULL           /* nursery_top, scope_sibling_next */           \
+}
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber  kai_main_fiber;
+extern KaiFiber *kai_active_fiber;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
+KaiFiber *kai_active_fiber = &kai_main_fiber;
+#  endif
+#else
+static KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
 static KaiFiber *kai_active_fiber = &kai_main_fiber;
+#endif
 
 static KaiFiber *kai_current_fiber(void) {
     return kai_active_fiber;
 }
 
-/* m8 #1 + m8.x: ready queue (intrusive singly-linked, head/tail).
- * Fibers go on the queue when spawned (NEW→READY) or unparked
- * (PARKED→READY); off the queue when dispatched (READY→RUNNING).
- * The dispatch loop drains it; deadlock detection panics when the
- * queue is empty *and* parked fibers exist with no wakeup path. */
+/* Ready queue (intrusive singly-linked, head/tail). Fibers go on the queue
+ * when spawned (NEW→READY) or unparked (PARKED→READY); off the queue when
+ * dispatched (READY→RUNNING). The dispatch loop drains it; deadlock
+ * detection panics when the queue is empty *and* parked fibers exist with
+ * no wakeup path. Shared like the rest of the scheduler. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_ready_head;
+extern KaiFiber *kai_ready_tail;
+extern int       kai_parked_count;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_ready_head = NULL;
+KaiFiber *kai_ready_tail = NULL;
+int       kai_parked_count = 0;
+#  endif
+#else
 static KaiFiber *kai_ready_head = NULL;
 static KaiFiber *kai_ready_tail = NULL;
 static int       kai_parked_count = 0;  /* deadlock detection */
+#endif
 
-/* R4 fix — single-slot pending-free for fiber structs whose wrappers
- * went to RC=0 while the fiber itself was still the current fiber
- * (the trampoline tail's `kai_decref(self->value)` is the producer).
- * Drained at every entry point that follows a context switch (top of
- * trampoline, post-swapcontext in yield/park) so the freed stack is
- * never the one we are running on. */
+/* Single-slot pending-free for fiber structs whose wrappers went to RC=0
+ * while the fiber itself was still the current fiber (the trampoline tail's
+ * kai_decref(self->value) is the producer). Drained at every entry point
+ * that follows a context switch (top of trampoline, post-swapcontext in
+ * yield/park) so the freed stack is never the one we are running on. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_pending_free;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_pending_free = NULL;
+#  endif
+#else
 static KaiFiber *kai_pending_free = NULL;
+#endif
 
 /* Forward decl — defined alongside the m8.x fiber stack allocator
  * later in the file, but used here by the free path (munmap needs the
@@ -3312,8 +3389,21 @@ static KaiValue *kai_bool(int b) {
 #define KAI_CHAR_CACHE_HI  ((uint32_t) 127)
 #define KAI_CHAR_CACHE_SIZE 128
 
+/* Cached char values are returned by address (&kai_char_cache[c]), so like
+ * the singletons they must be one shared instance across TUs — a per-TU
+ * copy would hand out non-identical pointers for the same char and warm the
+ * cache once per TU. Owner defines, others extern. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+extern int      kai_char_cache_init;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+int      kai_char_cache_init = 0;
+#  endif
+#else
 static KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
 static int kai_char_cache_init = 0;
+#endif
 
 /* Per-entry lazy warm for the Int cache (Phase 1.A, 2026-05-29).
  *
@@ -3542,7 +3632,18 @@ typedef struct {
     size_t      len;
     KaiValue   *value;
 } KaiStrInternBucket;
+/* The intern table's whole purpose is pointer-identity: equal strings map to
+ * one immortal value. A per-TU table would give each TU its own dedup set,
+ * so the same literal interned in two TUs would yield distinct pointers and
+ * defeat the interning. One shared table (owner defines, others extern). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+#  endif
+#else
 static KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+#endif
 
 static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
     /* FNV-1a, len-bounded. */
@@ -6133,8 +6234,20 @@ static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
 
 /* ---------- prelude: args (set by generated `int main`) ---------- */
 
+/* Argv snapshot is written once by the generated main (the owner TU) and
+ * read by os_args()/exe_name() anywhere, so it is shared — a per-TU copy
+ * would leave every non-owner TU reading a NULL argv. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int    kai_g_argc;
+extern char **kai_g_argv;
+#  if defined(KAI_RUNTIME_OWNER)
+int    kai_g_argc = 0;
+char **kai_g_argv = NULL;
+#  endif
+#else
 static int          kai_g_argc = 0;
 static char       **kai_g_argv = NULL;
+#endif
 
 static void kai_set_args(int argc, char **argv) {
     kai_g_argc = argc;
@@ -8160,7 +8273,17 @@ static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
  * if cross-fiber id collisions become a debugging concern. */
 typedef unsigned long long KaiHandlerId;
 
+/* Handler ids must be unique per process: a handler installed in one TU and
+ * one in another would draw colliding ids from a per-TU counter (both start
+ * at 1). One shared counter (owner defines, others extern). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiHandlerId kai_next_handler_id;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiHandlerId kai_next_handler_id = 1;
+#  endif
+#else
 static KaiHandlerId kai_next_handler_id = 1;
+#endif
 
 static KaiHandlerId kai_fresh_handler_id(void) {
     return kai_next_handler_id++;
@@ -8674,9 +8797,22 @@ static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
  * §`Random` specifies seeding from SecureRandom; that is deferred
  * until SecureRandom lands. Non-cryptographic by design — for
  * games, simulations, sampling, fixtures. */
+/* Per-process RNG stream: one shared state so a seed in one TU is observed
+ * by random() in another (owner defines, others extern). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern uint64_t _kai_pcg_state;
+extern uint64_t _kai_pcg_inc;
+extern int      _kai_pcg_seeded;
+#  if defined(KAI_RUNTIME_OWNER)
+uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+int      _kai_pcg_seeded = 0;
+#  endif
+#else
 static uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
 static uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
 static int      _kai_pcg_seeded = 0;
+#endif
 
 static uint32_t _kai_pcg32_next(void) {
     uint64_t old = _kai_pcg_state;
@@ -9579,8 +9715,20 @@ static KaiValue *_kai_signal_to_variant(int signo) {
     return NULL;
 }
 
+/* Subscribed-signal set for the Signal effect: one module subscribes, a
+ * handler in another tests membership, so it is shared process state (owner
+ * defines, others extern) — a per-TU set would split the subscription. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern sigset_t kai_signal_subscribed;
+extern int      kai_signal_subscribed_init;
+#  if defined(KAI_RUNTIME_OWNER)
+sigset_t kai_signal_subscribed;
+int      kai_signal_subscribed_init = 0;
+#  endif
+#else
 static sigset_t kai_signal_subscribed;
 static int      kai_signal_subscribed_init = 0;
+#endif
 
 static void _kai_signal_init_subscribed(void) {
     if (!kai_signal_subscribed_init) {
@@ -10234,8 +10382,19 @@ static size_t kai_fiber_stack_size(void) {
  * decorate the stack-overflow case. The handler runs on a sigaltstack
  * so the overflowed stack is never used to format the message. Spec:
  * `docs/fibers-honesty-targets.md` Tier 1. */
+/* The stack-guard SIGSEGV handler is installed once per process on a shared
+ * sigaltstack; the install flag is shared so no TU re-installs it. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern void *kai_sigalt_stack;
+extern int   kai_sigsegv_installed;
+#  if defined(KAI_RUNTIME_OWNER)
+void *kai_sigalt_stack = NULL;
+int   kai_sigsegv_installed = 0;
+#  endif
+#else
 static void *kai_sigalt_stack = NULL;
 static int   kai_sigsegv_installed = 0;
+#endif
 
 static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
     (void) ucp;
@@ -10323,8 +10482,24 @@ static void kai_install_fiber_sigsegv_handler(void) {
  * kai_reactor_filepool_pipe[1] on completion to wake the main
  * thread from poll(). Both pipes are O_NONBLOCK so neither writer
  * ever blocks; the reactor drains them with read() in a loop. */
+/* The reactor is one process-global structure: a fiber parks on a waiter
+ * list in one TU and kai_reactor_wait (compiled in a single TU) polls the
+ * self-pipes and drains those same lists. All reactor state — pipes, timer
+ * wheel, waiter lists, parked count, and the file-pool below — is therefore
+ * shared (owner defines, others extern); split ownership would let one TU
+ * enqueue a waiter the polling TU never sees, or poll a pipe another TU
+ * never opened. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_sigchld_pipe[2];
+extern int kai_reactor_filepool_pipe[2];
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
+int kai_reactor_filepool_pipe[2] = { -1, -1 };
+#  endif
+#else
 static int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
 static int kai_reactor_filepool_pipe[2] = { -1, -1 };
+#endif
 
 /* Issue #671 — Phase R4 reactor: Signal effect self-pipe. The
  * sa_handler installed by `signal_on` writes the signo to
@@ -10334,22 +10509,45 @@ static int kai_reactor_filepool_pipe[2] = { -1, -1 };
  * → variant and waking the parked waiter. Replaces the v1
  * sigwait body of `kai_default_signal_await` which blocked the
  * entire OS thread. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_signal_pipe[2];
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_signal_pipe[2]   = { -1, -1 };
+#  endif
+#else
 static int kai_reactor_signal_pipe[2]   = { -1, -1 };
+#endif
 
 /* Sorted timer-wheel head (intrusive list of parked fibers chained
  * through f->reactor_next, ordered by ascending deadline). Insertion
  * is O(n); for v1 with handfuls of concurrent sleepers this stays
  * well under the noise floor of poll() itself. A heap is queued for
  * Orongo if the wheel ever shows up on a profile. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_timer_head;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_timer_head = NULL;
+#  endif
+#else
 static KaiFiber *kai_reactor_timer_head = NULL;
+#endif
 
 /* Process-wait map and file-pool waiter list. Both are intrusive
  * single-linked through f->reactor_next, so a fiber can sit on at
  * most one reactor structure at a time (asserted by the parking
  * call sites — a fiber awaiting a pid cannot simultaneously sleep
  * or sit on a file-pool completion). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_pid_waiters;
+extern KaiFiber *kai_reactor_filepool_waiters;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_pid_waiters     = NULL;
+KaiFiber *kai_reactor_filepool_waiters = NULL;
+#  endif
+#else
 static KaiFiber *kai_reactor_pid_waiters     = NULL;
 static KaiFiber *kai_reactor_filepool_waiters = NULL;
+#endif
 
 /* Issue #620 — Phase R3 reactor: stdin slot. Singleton because
  * STDIN_FILENO is process-shared; multiple fibers reading the same
@@ -10357,8 +10555,17 @@ static KaiFiber *kai_reactor_filepool_waiters = NULL;
  * parking op rejects with a clear panic if a second fiber tries.
  * Wake source is POLLIN on fd 0, drained alongside the SIGCHLD /
  * file-pool self-pipes by `kai_reactor_wait`. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_stdin_waiter;
+extern int       kai_reactor_stdin_orig_flags;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_stdin_waiter = NULL;
+int       kai_reactor_stdin_orig_flags = -1;
+#  endif
+#else
 static KaiFiber *kai_reactor_stdin_waiter = NULL;
 static int       kai_reactor_stdin_orig_flags = -1;
+#endif
 
 /* Issue #630 — Phase R2 reactor: per-direction socket waiter lists.
  * One fiber-per-(fd, direction); the same fd may simultaneously have
@@ -10368,8 +10575,17 @@ static int       kai_reactor_stdin_orig_flags = -1;
  * Each list is intrusive through `f->reactor_next`; the fd lives in
  * `f->reactor_wait_pid` (the slot doubles as "what are we waiting
  * for"; pid waiters and socket waiters are mutually exclusive). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_socket_read_waiters;
+extern KaiFiber *kai_reactor_socket_write_waiters;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_socket_read_waiters  = NULL;
+KaiFiber *kai_reactor_socket_write_waiters = NULL;
+#  endif
+#else
 static KaiFiber *kai_reactor_socket_read_waiters  = NULL;
 static KaiFiber *kai_reactor_socket_write_waiters = NULL;
+#endif
 
 /* Issue #671 — Phase R4 reactor: Signal waiter slot. Singleton
  * because only one fiber can sit on `Signal.await()` at a time —
@@ -10381,13 +10597,27 @@ static KaiFiber *kai_reactor_socket_write_waiters = NULL;
  * SIGCHLD / file-pool / stdin pipes by `kai_reactor_wait`. The
  * delivered signo is parked in `f->reactor_data` (a void * slot)
  * so the await handler can rebuild the variant on resume. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_signal_waiter;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_signal_waiter = NULL;
+#  endif
+#else
 static KaiFiber *kai_reactor_signal_waiter = NULL;
+#endif
 
 /* Aggregate count of fibers parked on any reactor structure.
  * kai_sched_park reads this to decide between "no one can wake us
  * up — deadlock" (count == 0) and "block on the reactor until a
  * timer/SIGCHLD/file-pool event arrives" (count > 0). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_parked_count;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_parked_count = 0;
+#  endif
+#else
 static int kai_reactor_parked_count = 0;
+#endif
 
 /* File-pool work item. Each fiber-side park allocates one of these
  * on the calling fiber's stack (lifetime = until wake) and pushes
@@ -10408,13 +10638,34 @@ struct KaiFilepoolItem {
     KaiFilepoolItem *queue_next;
 };
 
+#define KAI_FILEPOOL_WORKERS 4
+/* One file-pool per process: a file op parked in one TU enqueues here and a
+ * worker thread drains it, so the queue, its lock, and the started/threads
+ * state are shared (owner defines, others extern). Two per-TU pools would
+ * spawn two thread sets and split the work queue. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t  kai_filepool_mu;
+extern pthread_cond_t   kai_filepool_cv;
+extern KaiFilepoolItem *kai_filepool_q_head;
+extern KaiFilepoolItem *kai_filepool_q_tail;
+extern int              kai_filepool_started;
+extern pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_mutex_t  kai_filepool_mu    = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t   kai_filepool_cv    = PTHREAD_COND_INITIALIZER;
+KaiFilepoolItem *kai_filepool_q_head = NULL;
+KaiFilepoolItem *kai_filepool_q_tail = NULL;
+int              kai_filepool_started = 0;
+pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#  endif
+#else
 static pthread_mutex_t  kai_filepool_mu    = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   kai_filepool_cv    = PTHREAD_COND_INITIALIZER;
 static KaiFilepoolItem *kai_filepool_q_head = NULL;
 static KaiFilepoolItem *kai_filepool_q_tail = NULL;
 static int              kai_filepool_started = 0;
-#define KAI_FILEPOOL_WORKERS 4
 static pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#endif
 
 /* SIGCHLD delivery slot. The handler does the minimum allowed
  * inside signal context: write a single byte to the pipe. The
@@ -10704,10 +10955,21 @@ static void kai_reactor_stdin_set_nonblocking(void) {
  * actual file op via kai_reactor_init_filepool — sleep-only and
  * process-only workloads should not pay the pthread_create cost. */
 static void kai_reactor_init_filepool(void);
+/* Idempotency is process-global, not per-TU: kai_reactor_init is called from
+ * many sites that land in different modular TUs, and it opens the shared
+ * self-pipes. A per-TU flag would let each TU re-run init and reopen the
+ * pipes over the shared fds. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_inited;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_inited = 0;
+#  endif
+#else
+static int kai_reactor_inited = 0;
+#endif
 static void kai_reactor_init(void) {
-    static int initialized = 0;
-    if (initialized) return;
-    initialized = 1;
+    if (kai_reactor_inited) return;
+    kai_reactor_inited = 1;
 
     /* Self-pipes for the three wake sources (SIGCHLD, file-pool,
      * Signal R4). O_NONBLOCK so handlers and worker threads never
