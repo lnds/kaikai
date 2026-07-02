@@ -12,7 +12,6 @@ See [../../docs/kaikai-minimal.md](../../docs/kaikai-minimal.md) for the full sp
 | `fizzbuzz.kai` | `if`/`else if`, arithmetic, `match` on numbers, pipes, `map` |
 | `quicksort.kai` | Pattern matching on lists, spread cons, recursion, higher-order functions, tests |
 | `interp.kai` | Sum types (tagged unions), AST representation, recursive interpreter — the dogfooding target |
-| `attributes.kai` | `#[...]` attributes skipped by the lexer, including multi-line bodies (triple-string, bracketed) |
 
 ## Checking
 
