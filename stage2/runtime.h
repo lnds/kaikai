@@ -265,8 +265,24 @@ static const int32_t kai_variant_to_head_bootstrap[11] = {
     /* 10 */ KAI_HEAD_PROCESS_EXIT,  /* Signaled */
 };
 
+/* Tag-keyed runtime metadata (variant->head map, impl table, name/mask
+ * tables, caches below) is process-global by design: a variant built in
+ * one translation unit is walked, freed, and dispatched in another.
+ * Under KAI_SEPARATE_COMPILATION each table therefore gets one shared
+ * copy (extern everywhere, defined by the KAI_RUNTIME_OWNER TU), like
+ * the RC free-list pools. A per-TU copy is not just waste: the reader
+ * TU would see an empty table and free through the wrong slot mask. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern const int32_t *kai_variant_to_head;
+extern int32_t        kai_variant_to_head_len;
+#  if defined(KAI_RUNTIME_OWNER)
+const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
+int32_t        kai_variant_to_head_len = 11;
+#  endif
+#else
 static const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
 static int32_t        kai_variant_to_head_len = 11;
+#endif
 
 static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
     kai_variant_to_head     = tbl;
@@ -293,9 +309,20 @@ typedef struct {
     void   *fn;
 } KaiImplSlot;
 
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiImplSlot *kai_impl_table;
+extern int32_t      kai_impl_cap;
+extern int32_t      kai_impl_count;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiImplSlot *kai_impl_table  = NULL;
+int32_t      kai_impl_cap    = 0;
+int32_t      kai_impl_count  = 0;
+#  endif
+#else
 static KaiImplSlot *kai_impl_table  = NULL;
 static int32_t      kai_impl_cap    = 0;
 static int32_t      kai_impl_count  = 0;
+#endif
 
 static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t op_id, int32_t head_tag) {
     /* FNV-1a-ish mix; keys are small ints so any cheap mix is fine. */
@@ -1581,8 +1608,17 @@ static void kai_var_name_report_at_exit(void) {
  * with a lazy grow covers them. Names are static string literals, never
  * freed. */
 #define KAI_VARNAME_TABLE_INIT 256
+#if defined(KAI_SEPARATE_COMPILATION)
+extern const char **kai_varname_table;
+extern int kai_varname_table_cap;
+#  if defined(KAI_RUNTIME_OWNER)
+const char **kai_varname_table = NULL;
+int kai_varname_table_cap = 0;
+#  endif
+#else
 static const char **kai_varname_table = NULL;
 static int kai_varname_table_cap = 0;
+#endif
 
 static void kai_varname_register(int32_t tag, const char *name) {
     if (tag < 0 || name == NULL) return;
@@ -1608,9 +1644,20 @@ static const char *kai_variant_name_of(int32_t tag) {
  * holds them (populated at first construction, like the name table). The
  * generic drop / copy / reuse walkers read `kai_slot_mask_of(tag)`. A tag
  * never seen returns 0 (all-pointer), the conservative default. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern uint32_t *kai_slotmask_table;
+extern int kai_slotmask_table_cap;
+extern uint8_t *kai_slotmask_seen;
+#  if defined(KAI_RUNTIME_OWNER)
+uint32_t *kai_slotmask_table = NULL;
+int kai_slotmask_table_cap = 0;
+uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
+#  endif
+#else
 static uint32_t *kai_slotmask_table = NULL;
 static int kai_slotmask_table_cap = 0;
 static uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
+#endif
 
 static void kai_slotmask_register(int32_t tag, uint32_t mask) {
     if (tag < 0) return;
@@ -3600,8 +3647,17 @@ typedef struct {
     const char   *name;     /* NULL ⇒ empty bucket */
     KaiValue     *value;
 } KaiNullarySingletonBucket;
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#  endif
+#else
 static KaiNullarySingletonBucket
     kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#endif
 
 static inline size_t kai_nullary_hash(int32_t tag, const char *name) {
     uintptr_t p = (uintptr_t) name;
@@ -3629,7 +3685,14 @@ static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
  * each nullary ctor is first constructed. Singletons are immortal
  * (rc == INT32_MAX), so the stored pointer never dangles. */
 #define KAI_ENUM_TAG_MAX 1024
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
+#  endif
+#else
 static KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
+#endif
 
 /* Fast nullary-ctor construction: read the interned singleton straight
  * from kai_enum_by_tag[tag] — an array load — instead of kai_variant_u's
@@ -3717,8 +3780,17 @@ typedef struct {
     KaiValue     *args[KAI_IMMORTAL_VAR_MAXN];
     KaiValue     *value;
 } KaiImmortalVarBucket;
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#  endif
+#else
 static KaiImmortalVarBucket
     kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#endif
 
 /* Reusable-tag registry (issue #118 layer 3) — the immortal-args
  * cache above immortalises any variant whose slots are all immortal,
@@ -3743,7 +3815,14 @@ static KaiImmortalVarBucket
  * a single 8 KiB static array. Out-of-range tags (defensive) are
  * treated as non-reusable, i.e. cacheable as before. */
 #define KAI_REUSABLE_TAG_MAX 65536
+#if defined(KAI_SEPARATE_COMPILATION)
+extern unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#  if defined(KAI_RUNTIME_OWNER)
+unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#  endif
+#else
 static unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#endif
 
 static void kai_register_reusable_tags(const int32_t *tags, int n) {
     for (int i = 0; i < n; i++) {

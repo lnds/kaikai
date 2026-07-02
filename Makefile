@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -10,6 +10,15 @@ kaic1: kaic0
 
 kaic2: kaic1
 	$(MAKE) -C stage2 kaic2
+
+# Dev fast rebuild — an EXISTING kaic2 recompiles itself modularly
+# (no kaic1, no bundle). Deliberately not wired into the bootstrap
+# chain: `make kaic2` stays the trust path. See docs/build-system.md.
+kaic2-fast:
+	$(MAKE) -C stage2 kaic2-fast
+
+kaic2-fast-verify:
+	$(MAKE) -C stage2 kaic2-fast-verify
 
 # bin/kai is already a checked-in shell script; this target just confirms it
 # is executable and visible.
