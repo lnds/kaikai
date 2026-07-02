@@ -112,12 +112,59 @@ static void skip_line_comment(Lexer *l) {
     while (!at_end(l) && peek(l) != '\n') advance(l);
 }
 
+static int lex_interp_block(Lexer *l);
+
+/* Skip a string literal inside an attribute, consuming through its closing
+   quote. On entry the opening '"' is at peek. Escapes and #{...}
+   interpolation pass through; a newline ends a single-line string early
+   (malformed input — the outer bracket scan resumes there). */
+static void skip_attr_string(Lexer *l) {
+    advance(l);                                   /* opening " */
+    int triple = 0;
+    if (peek(l) == '"' && peek2(l) == '"') { advance(l); advance(l); triple = 1; }
+    while (!at_end(l)) {
+        char c = peek(l);
+        if (c == '\\') { advance(l); if (!at_end(l)) advance(l); continue; }
+        if (c == '#' && peek2(l) == '{') { advance(l); advance(l); lex_interp_block(l); continue; }
+        if (triple) {
+            if (c == '"' && peek2(l) == '"' && peek3(l) == '"') {
+                advance(l); advance(l); advance(l);
+                return;
+            }
+        } else {
+            if (c == '"') { advance(l); return; }
+            if (c == '\n') return;
+        }
+        advance(l);
+    }
+}
+
+/* An attribute `#[...]` can span physical lines (e.g. a triple-string
+   `#[doc("""...""")]`), unlike a `#` line comment. Skip the balanced
+   bracket group whole, stepping over string bodies so a `]` or newline
+   inside one does not end the attribute early. On entry `#[` has been
+   consumed. */
+static void skip_attribute(Lexer *l) {
+    int depth = 1;
+    while (!at_end(l) && depth > 0) {
+        char c = peek(l);
+        if      (c == '[') { depth++; advance(l); }
+        else if (c == ']') { depth--; advance(l); }
+        else if (c == '"') skip_attr_string(l);
+        else advance(l);
+    }
+}
+
 static void skip_whitespace_and_comments(Lexer *l) {
     for (;;) {
         if (at_end(l)) return;
         char c = peek(l);
         if (c == ' ' || c == '\t' || c == '\r') { advance(l); continue; }
-        if (c == '#') { advance(l); skip_line_comment(l); continue; }
+        if (c == '#') {
+            if (peek2(l) == '[') { advance(l); advance(l); skip_attribute(l); }
+            else                 { advance(l); skip_line_comment(l); }
+            continue;
+        }
         return;
     }
 }

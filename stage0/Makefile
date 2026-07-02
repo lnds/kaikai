@@ -26,10 +26,16 @@ clean:
 build:
 	@mkdir -p build
 
+# Attribute fixtures in minimal syntax: multi-line #[...] must be
+# skipped whole by the lexer. They live outside examples/minimal/
+# because stage2 tokenizes attributes (token parity would break).
+ATTR_LEX_EXAMPLES := ../examples/attributes/attr_doc_multiline.kai \
+                     ../examples/attributes/attr_multiline_ascii.kai
+
 # End-to-end: compile each example to a native binary and run it.
 test-run: $(TARGET) build
 	@set -e; \
-	for f in ../examples/minimal/*.kai; do \
+	for f in ../examples/minimal/*.kai $(ATTR_LEX_EXAMPLES); do \
 	  name=$$(basename $$f .kai); \
 	  echo "=== run $$name ==="; \
 	  ./$(TARGET) $$f > build/$$name.c; \

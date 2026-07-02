@@ -62,7 +62,7 @@ test-ast: $(TARGET) build
 # example. Exit status is the check result; no undefined names allowed.
 test-check: $(TARGET) build
 	@set -e; \
-	for f in ../examples/minimal/*.kai ../examples/attributes/attr_doc_multiline.kai compiler.kai; do \
+	for f in ../examples/minimal/*.kai ../examples/attributes/attr_doc_multiline.kai ../examples/attributes/attr_multiline_ascii.kai compiler.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > /dev/null \
 	    && echo "check OK $$name" \
