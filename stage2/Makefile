@@ -149,7 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes
 
 all: $(TARGET)
 
@@ -5399,6 +5399,8 @@ MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/multi-module/issue-898-qualified-generic/main.kai \
                    ../examples/multi-module/issue-963-cross-module-mono/main.kai \
                    ../examples/multi-module/issue-990-handle-linkage/main.kai \
+                   ../examples/multi-module/issue-1033-cross-module-fiber/main.kai \
+                   ../examples/multi-module/issue-1033-cross-module-arena/main.kai \
                    ../examples/multi-module/modular_stdlib_lambdas.kai \
                    ../examples/modules-qualified/basic/main.kai \
                    ../examples/modules-qualified/two_modules/main.kai \
@@ -5427,7 +5429,9 @@ test-modular-build: $(TARGET) build
 	  objs=""; \
 	  for c in $$mod/*.c; do \
 	    o=$${c%.c}.o; \
-	    $(CC) $(CFLAGS) -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
+	    defs=-DKAI_SEPARATE_COMPILATION=1; \
+	    [ "$$(basename $$c)" = "__root__.c" ] && defs="$$defs -DKAI_RUNTIME_OWNER=1"; \
+	    $(CC) $(CFLAGS) $$defs -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
 	      || { echo "modular FAIL $$name (compile $$(basename $$c))"; exit 1; }; \
 	    objs="$$objs $$o"; \
 	  done; \
@@ -5443,6 +5447,34 @@ test-modular-build: $(TARGET) build
 	    echo "modular OK $$name (no golden, linked + ran clean)"; \
 	  fi; \
 	done
+
+# Pointer-identity gate for the shared runtime state (issue #1033). stdout
+# diffs cannot see identity: two disjoint per-TU copies of a singleton or the
+# intern table still print the same bytes, and structural `==` is unaffected.
+# A successful link does not prove uniqueness either — an internal-linkage
+# (`static`) symbol links green while materialising one copy PER TU. So the
+# regression is only visible after link: `nm` on the final executable must
+# show exactly ONE address per shared symbol. Two addresses means the guard
+# regressed to per-TU state. Runs on the cross-module fiber binary from
+# test-modular-build, which links the widest set of runtime modules.
+MODULAR_SHARED_SYMS = kai_singleton_unit kai_singleton_nil kai_str_intern_table \
+                      kai_char_cache kai_active_fiber kai_ready_head kai_arena_sp \
+                      kai_heap_committed kai_next_handler_id
+test-modular-identity: test-modular-build
+	@set -e; \
+	bin=build/modular-6.bin; \
+	[ -x $$bin ] || { echo "modular-identity FAIL (no fiber binary; run test-modular-build)"; exit 1; }; \
+	fail=0; \
+	for s in $(MODULAR_SHARED_SYMS); do \
+	  n=$$(nm $$bin 2>/dev/null | grep -E " _?$$s\$$" | awk '{print $$1}' | sort -u | wc -l | tr -d ' '); \
+	  if [ "$$n" = "1" ]; then \
+	    echo "modular-identity OK $$s (1 address)"; \
+	  else \
+	    echo "modular-identity FAIL $$s ($$n addresses — per-TU state leaked)"; fail=1; \
+	  fi; \
+	done; \
+	[ $$fail = 0 ] || exit 1; \
+	echo "modular-identity OK (shared runtime state is one copy per process)"
 
 # Issue #963 Part A — cross-module monomorphization home-TU discipline.
 # One generic (`boxer.box[T]`) instantiated at the SAME type (Int) from two
@@ -5578,7 +5610,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-cache test-issue-963-cross-module-mono test-kir test-batch-isolation
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-issue-963-cross-module-mono test-kir test-batch-isolation
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
