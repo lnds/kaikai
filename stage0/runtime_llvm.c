@@ -582,6 +582,26 @@ KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_reuse_or_alloc_cons(scr, h, t);
 }
 
+/* Dual-branch cons reuse (mirrors emit_c's emit_match_arm_reuse_cons). The
+ * lowering forks on `kaix_check_unique(scr)`; the UNIQUE arm binds head/tail
+ * BORROW (no incref) and rebuilds, then hands the fresh slots here to write
+ * RAW — no decref of the old slots, since a borrow gave up no ownership. The
+ * reused cell survives the match-exit decref via the incref below. Pairs with
+ * borrow binds; `kai_reuse_or_alloc_cons`'s decref-if-differs is the OTHER
+ * model (owned binds) and must not be mixed with borrow binds. */
+KaiValue *kaix_cons_reuse_move(KaiValue *scr, KaiValue *h, KaiValue *t) {
+  scr->as.cons.head = h;
+  scr->as.cons.tail = t;
+  kai_rc_reuse_total++;
+  return kai_incref(scr);
+}
+
+/* Boxed uniqueness test for the dual-branch condbr guard. KCondBr consumes a
+ * boxed Bool; `kai_check_unique` returns a raw int. */
+KaiValue *kaix_check_unique(KaiValue *scr) {
+  return kai_bool(kai_check_unique(scr));
+}
+
 /* issue #210 — record + variant reuse-in-place. Same shape as the
  * cons wrapper: the LLVM emit synthesises a call with the same
  * argument layout as `kai_record` / `kai_variant`, with the consumed
