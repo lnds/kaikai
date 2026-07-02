@@ -19,15 +19,17 @@ also complete frameworks and domain toolkits. The line between
 core stdlib and `kaikailang-org/*` is **API stability**, not
 "experimental vs production".
 
-## The five repos
+## The repos
 
 ```
 kaikailang-org/
 ├── kaikai      ← the language (compiler + runtime + core stdlib)
-├── ahu         ← platform extension (concurrency, cli, text, crypto-extra)
+├── ahu         ← platform extension (concurrency, cli, text)
 ├── kohau       ← database / persistence
 ├── henua       ← DDD building blocks
-└── hopu        ← fintech platform (payment, ledger, settlement)
+├── hopu        ← fintech platform (payment, ledger, settlement)
+├── rongo       ← advanced networking (TLS, system-dependency transport)
+└── garo        ← advanced cryptography (ciphers, KDF, system-dependency crypto)
 
 (plus producto cliente, NOT under kaikailang-org/)
 manutara        ← web framework (LiveView-shaped)
@@ -85,7 +87,11 @@ multiple repos. One `kai add` brings everything:
 | `ahu/jobs` | Background jobs / queue / scheduler — Oban/Sidekiq/Celery analog (post-Tongariki) |
 | `ahu/cli` | CLI framework — subcommands, flags, help generation (post-Tongariki) |
 | `ahu/text/*` | i18n, unicode normalization, charset encoding (post-Tongariki) |
-| `ahu/crypto/*` | Experimental crypto: curve25519, ed25519, NaCl, kdf, post-quantum (post-Tongariki) |
+
+Advanced cryptography (curve25519, ed25519, NaCl, kdf, ciphers,
+post-quantum) is **not** in ahu — it lives in its own repo `garo`
+(see Layer 3), because it carries a system-crypto FFI dependency and is
+a domain of its own, not general platform infrastructure.
 
 ahu's scope is **infrastructure common to serious applications
 that isn't language primitive**. If multiple downstream consumers
@@ -137,6 +143,36 @@ Scope:
 
 Note: `stdlib/money` and `stdlib/fx` stay in core stdlib (basic
 building blocks). hopu is the layer **above** them.
+
+Status: not started.
+
+#### `rongo` (advanced networking)
+
+`github.com/kaikailang-org/rongo`. Rapa Nui *rongo* — errand, message,
+notice; the transmission of word (the root of *rongorongo*). A network
+carries messages; `rongo` is that carrier.
+
+Scope: the networking that carries a heavy system-library dependency and
+must not ride the bundled base install — **TLS** (the `Tls` effect +
+`tls_wrap`, enabling `https://`, OpenSSL/LibreSSL via FFI) and later
+protocols needing a system stack. Consumes `garo`.
+
+Note: plaintext `net/http` + `net/tcp` stay in core stdlib; `net/http`'s
+`https://` rejection is resolved by pulling in `rongo` (§*The stdlib
+networking + crypto boundary*). Design for the first TLS lane is preserved
+in closed kaikai issue #351.
+
+Status: not started.
+
+#### `garo` (advanced cryptography)
+
+`github.com/kaikailang-org/garo`. Rapa Nui *garo* — hidden, to conceal
+(*te mana'u garo*, hidden thoughts). Encryption is concealment.
+
+Scope: ciphers, key derivation, signing, and crypto primitives backed by a
+system crypto stack (OpenSSL/LibreSSL) via FFI. Base crypto (`crypto/hash`,
+`crypto/mac`, `random_secure`) stays in core stdlib; `garo` is the
+system-dependency-carrying layer above.
 
 Status: not started.
 
@@ -219,10 +255,10 @@ Consequence: `net/http` rejects `https://` at parse time, and that is
 needs HTTPS pulls in the advanced layer, which brings its own OpenSSL FFI
 in its own repo — the same pattern kohau uses for libsqlite3.
 
-Home for the advanced layer: an ecosystem package (the `ahu/crypto/*`
-family, already scoped for advanced/experimental crypto, or a dedicated
-networking-crypto repo). Not core stdlib, not a domain toolkit. The
-package that hosts it is defined in a separate handoff.
+Home for the advanced layer: two ecosystem repos — **`rongo`** (advanced
+networking, incl. TLS) and **`garo`** (advanced cryptography). `rongo`
+consumes `garo`. Both are Layer-3 repos under `kaikailang-org/`, not core
+stdlib and not part of `ahu`.
 
 ## Versioning policy
 
