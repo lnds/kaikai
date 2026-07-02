@@ -1,0 +1,146 @@
+# compiler/kir_pat_alias.kai — the single source of truth for which match
+# arm binders are ALIASES of the scrutinee's storage and therefore need a
+# structural incref (dup) in the native lowering.
+#
+# The C-direct oracle (`emit_pat_binds` in emit_c.kai) decides alias-ness as
+# part of ONE textual walk: a binder reached with `is_alias=true` shares
+# storage with the scrutinee (a variant pointer slot, a cons head/tail/rest)
+# and is bound `kai_incref(scr)`; a binder reached with `is_alias=false`
+# already owns its ref (a `kai_op_field` result, a freshly-boxed Real slot).
+# The native backend re-derives that same discipline; before this module it
+# did so with several ad-hoc collectors keyed by arm shape, each a partial
+# re-implementation that drifted from the oracle as new arm shapes appeared.
+#
+# This module holds ONE recursive collector — `pat_alias_binders` — that
+# mirrors `emit_pat_binds` at any depth, plus pure position predicates that
+# PARTITION its result for the two reuse call-sites that need a subset. No
+# consumer re-walks a pattern to decide alias-ness; they all read this set.
+
+import compiler.ast
+import compiler.emit_shared
+
+# Slot kind of a variant payload type (mirror of emit_c's `variant_slot_kind`
+# for the pointer/scalar split). 0 = pointer (alias, needs a structural
+# incref), 1 = Int (read unboxed, no RC), 2 = Real (freshly boxed, owned).
+# An enum slot has no distinct code here: with an empty enum list it maps to
+# 0/pointer, and a dup of an immortal enum singleton is a runtime no-op, so
+# the only values gated IN are heap pointers and the only ones gated OUT are
+# the unboxed Int / Real slots the oracle reads raw.
+pub fn pa_slot_kind(te: TypeExpr) : Int = match te.tkind {
+  TyName(n, args) ->
+    if list_length(args) == 0 {
+      if n == "Int" { 1 } else if n == "Real" { 2 } else { 0 }
+    } else { 0 }
+  _ -> 0
+}
+
+# A ctor's payload type list from the variant registry, or [] if unknown
+# (every slot then classifies pointer — conservative, but an unknown ctor
+# never reaches a native owned variant arm: the registry is populated for
+# user + builtin ctors by the time the lowering runs).
+pub fn pa_payload_tys(vs: [EVar], target: String) : [TypeExpr] = match vs {
+  []           -> []
+  [h, ...rest] -> match h { EV(n, _, tys, _) -> if n == target { tys } else { pa_payload_tys(rest, target) } }
+}
+
+# Nth element of a TypeExpr list (slot-position lookup), None past the end.
+pub fn pa_nth_ty(tys: [TypeExpr], n: Int) : Option[TypeExpr] = match tys {
+  []           -> None
+  [t, ...rest] -> if n == 0 { Some(t) } else { pa_nth_ty(rest, n - 1) }
+}
+
+#[doc("""
+Every pointer-kind binder a match arm reaches over a BORROW path — the full
+set the C-direct oracle's `emit_pat_binds` increfs under `is_alias=true`, at
+any depth. This is the single mirror of that discipline; all native
+alias-dup / reuse call-sites derive their sets from it, never re-walking.
+
+Descends PList (heads + `...rest`), PVariant POINTER slots (Int/Real excluded
+by `pa_slot_kind`), and PAs (name + inner, inner always alias). Record and
+variant-record fields are NOT descended: `kai_op_field` already increfs its
+return, so their subtree is owned in the oracle, not an alias.
+""")]
+pub fn pat_alias_binders(p: Pattern, vs: [EVar]) : [String] = pab_pat(p, vs, [])
+
+fn pab_pat(p: Pattern, vs: [EVar], acc: [String]) : [String] = match p.pkind {
+  PBind(name)     -> [name, ...acc]
+  PNarrow(name, _) -> [name, ...acc]
+  PAs(name, inner) -> pab_pat(inner, vs, [name, ...acc])
+  PList(pats, opt_rest) -> {
+    let a1 = match opt_rest { None -> acc Some(name) -> [name, ...acc] }
+    pab_pats(pats, vs, a1)
+  }
+  PVariant(cname, subs) -> pab_variant_slots(subs, pa_payload_tys(vs, cname), 0, vs, acc)
+  _ -> acc
+}
+
+fn pab_pats(pats: [Pattern], vs: [EVar], acc: [String]) : [String] = match pats {
+  []           -> acc
+  [hp, ...rest] -> pab_pats(rest, vs, pab_pat(hp, vs, acc))
+}
+
+fn pab_variant_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, vs: [EVar], acc: [String]) : [String] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = match pa_nth_ty(tys, idx) { Some(te) -> pa_slot_kind(te) None -> 0 }
+    let acc1 = if k == 0 { pab_pat(sp, vs, acc) } else { acc }
+    pab_variant_slots(rest, tys, idx + 1, vs, acc1)
+  }
+}
+
+#[doc("""
+The DIRECT-slot partition of `pat_alias_binders`: the alias binders bound as
+a top-level cons slot (head `PBind`, `...rest`) or a top-level variant
+pointer slot. These are the slots a dual-branch reuse binds per-branch (a
+borrow in the unique branch, a dup in the shared branch); everything else in
+the alias set is deconstructed and dup'd unconditionally outside the fork.
+""")]
+pub fn pat_direct_alias_slots(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
+  PList(pats, opt_rest) -> {
+    let heads = pa_list_direct_heads(pats, [])
+    match opt_rest { None -> heads Some(name) -> [name, ...heads] }
+  }
+  PVariant(cname, subs) -> pa_variant_direct_slots(subs, pa_payload_tys(vs, cname), 0, [])
+  PBind(name)  -> [name]
+  PAs(name, _) -> [name]
+  _            -> []
+}
+
+fn pa_list_direct_heads(pats: [Pattern], acc: [String]) : [String] = match pats {
+  []            -> acc
+  [hp, ...rest] -> match hp.pkind {
+    PBind(name) -> pa_list_direct_heads(rest, [name, ...acc])
+    _           -> pa_list_direct_heads(rest, acc)
+  }
+}
+
+fn pa_variant_direct_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, acc: [String]) : [String] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = match pa_nth_ty(tys, idx) { Some(te) -> pa_slot_kind(te) None -> 0 }
+    let acc1 = match sp.pkind {
+      PBind(name) -> if k == 0 { [name, ...acc] } else { acc }
+      _           -> acc
+    }
+    pa_variant_direct_slots(rest, tys, idx + 1, acc1)
+  }
+}
+
+#[doc("""
+The DECONSTRUCTED partition of `pat_alias_binders`: the alias set minus the
+direct slots. In a dual-branch cons reuse these sub-binders are incref'd
+UNCONDITIONALLY (in both branches, per the oracle's is_alias path), so they
+leave the condbr; only the direct slots differ per branch.
+""")]
+pub fn pat_decon_alias_binders(p: Pattern, vs: [EVar]) : [String] =
+  names_minus(pat_alias_binders(p, vs), pat_direct_alias_slots(p, vs))
+
+fn names_minus(all: [String], drop: [String]) : [String] = match all {
+  []           -> []
+  [n, ...rest] -> if name_in_names(drop, n) { names_minus(rest, drop) } else { [n, ...names_minus(rest, drop)] }
+}
+
+fn name_in_names(xs: [String], n: String) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> if h == n { true } else { name_in_names(rest, n) }
+}

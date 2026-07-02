@@ -18,6 +18,7 @@ import compiler.emit_shared
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_pat_alias
 import compiler.kir_lower_raw
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
@@ -1158,24 +1159,24 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
     match lm_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
       # A non-reuse owned arm structurally dups EVERY alias binder it reaches
       # over a borrow path — the flat cons head/tail PLUS nested-variant slot
-      # binders at any depth (`owned_arm_alias_binders` mirrors the oracle's
-      # full `emit_pat_binds` alias set). All are `KProj` borrows the exit
+      # binders at any depth (`pat_alias_binders`, the sole mirror of the
+      # oracle's `emit_pat_binds` alias set). All are `KProj` borrows the exit
       # `__pcs_scr_drop` would free before a self-tail arm body reads them. A
       # reuse arm instead publishes its head/tail binders as the reuse-gc set
       # so the `KConReuse` shared path increfs them (the C oracle's
       # shared-branch `incref(_scr->head/tail)`), else the match-exit drop
       # frees them.
       let st_dup = if owned and not arm_body_uses_reuse(body) {
-        lm_dup_alias_binders(owned_arm_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
+        lm_dup_alias_binders(pat_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
       } else {
-        # Reuse arm (dual-branch): the DECONSTRUCTED sub-binders of a head
-        # (`RP(name, _, ptys, rty)`) are incref'd UNCONDITIONALLY — the oracle's
-        # `emit_pat_binds` is_alias path increfs them in both the unique and the
-        # shared branch, so they leave the condbr; only the DIRECT cons slots
-        # (published as reuse_gc) differ per branch (borrow in unique, dup in
-        # shared). Emitting the decon dups here (outside the fork) keeps the
-        # fork managing only the direct slots.
-        let st_decon = lm_dup_alias_binders(decon_arm_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
+        # Reuse arm (dual-branch): the DECONSTRUCTED sub-binders of a head are
+        # incref'd UNCONDITIONALLY — the oracle's `emit_pat_binds` is_alias
+        # path increfs them in both the unique and the shared branch, so they
+        # leave the condbr; only the DIRECT cons slots (published as reuse_gc)
+        # differ per branch (borrow in unique, dup in shared). Emitting the
+        # decon dups here (outside the fork) keeps the fork managing only the
+        # direct slots.
+        let st_decon = lm_dup_alias_binders(pat_decon_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
         set_reuse_gc_for_arm(p, body, st_decon)
       }
       let st_drop = match_selftail_scr_drop(owned, sd, body, st_dup)
@@ -1418,18 +1419,17 @@ fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
 # sub-binders (Int/Real slots are read unboxed by the oracle, so they are
 # excluded by slot kind via `st.vs`), mirroring the oracle's `kai_incref` on
 # `is_alias=true` pointer-slot variant-arg binds. The set is RECURSIVE
-# (`owned_arm_alias_binders`): a binder inside a discriminating nested
-# sub-pattern (`DType(_, tn, _, TBRecord(fields), _, _, mo)` binds `fields`
-# two levels down) is also a KProj borrow of the scrutinee's storage — the
-# flat top-level set left it un-dup'd, so a callee consuming it freed the
-# still-referenced slot of a live decl (use-after-free on the second lookup).
-# Emitted after the arm's binds, before the body lowers. Gated on
-# `owned ∧ ¬arm_body_uses_reuse` exactly like the list path: a reuse arm
-# consumes the scrutinee through `__perceus_reuse_*` (rb-tree `ins`), where
-# a structural dup would double-incref kept children.
+# (`pat_alias_binders`): a binder inside a discriminating nested sub-pattern
+# is also a KProj borrow of the scrutinee's storage — a flat top-level set
+# would leave it un-dup'd, so a callee consuming it frees the still-referenced
+# slot of a live decl (use-after-free on the second lookup). Emitted after the
+# arm's binds, before the body lowers. Gated on `owned ∧ ¬arm_body_uses_reuse`
+# exactly like the list path: a reuse arm consumes the scrutinee through
+# `__perceus_reuse_*` (rb-tree `ins`), where a structural dup would
+# double-incref kept children.
 fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : LowerSt / Console =
   if owned and not arm_body_uses_reuse(body) {
-    lm_dup_alias_binders(owned_arm_alias_binders(p, st.vs), KAt(p.line, p.col), st)
+    lm_dup_alias_binders(pat_alias_binders(p, st.vs), KAt(p.line, p.col), st)
   } else { st }
 
 # native variant reuse leak (#872) — publish a reuse arm's scrutinee pointer
@@ -1443,14 +1443,19 @@ fn set_reuse_gc_for_arm(p: Pattern, body: Expr, st: LowerSt) : LowerSt =
     ls_set_reuse_gc(st, reuse_scrutinee_binders(p, st.vs))
   } else { ls_set_reuse_gc(st, []) }
 
-# The scrutinee pointer-binders the `KConReuse` shared path protects, by pattern
-# shape. A `PVariant` filters by slot kind; a `PList` cons arm keeps head + tail,
-# both cons pointer slots — the C oracle increfs `_scr->head`/`_scr->tail` in its
-# shared branch, so a reuse over a SHARED cons donor needs the same per-child
-# incref or the match-exit `decref(donor)` frees the borrowed children (#1025).
+# The scrutinee pointer-binders the `KConReuse` shared path protects, by
+# pattern shape. A `PList` cons arm keeps its DIRECT slots (head + tail) — the
+# deconstructed sub-binders are already dup'd unconditionally outside the fork,
+# so the reuse-gc set covers only the per-branch direct slots. A variant
+# rotation embeds kept children at ANY depth (a two-level rotation reaches
+# grand-grand-children), so it publishes the FULL alias set; `reuse_gc_uses`
+# then filters to the ones the rebuild actually re-embeds. Either way the
+# C oracle increfs each kept child in its shared branch, so a reuse over a
+# SHARED donor needs the same per-child incref or the match-exit
+# `decref(donor)` frees the borrowed children.
 fn reuse_scrutinee_binders(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
-  PList(_, _) -> list_arm_alias_binders(p)
-  _           -> variant_reuse_scrutinee_binders(p, vs)
+  PList(_, _) -> pat_direct_alias_slots(p, vs)
+  _           -> pat_alias_binders(p, vs)
 }
 
 # True iff this arm should capture its consumed scrutinee as an arm-top reuse
@@ -1459,7 +1464,7 @@ fn reuse_scrutinee_binders(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
 # token in place; a non-step tail (`balance_left(ins(l,..),..)`) frees it. The C
 # oracle's `try_arm_top_reuse` predicate.
 fn arm_is_top_reuse(p: Pattern, body: Expr, st: LowerSt) : Bool = match p.pkind {
-  PVariant(_, _) -> body_has_trmc_step(body) and not list_is_empty_s(variant_arm_alias_binders(p, st.vs))
+  PVariant(_, _) -> body_has_trmc_step(body) and not list_is_empty_s(pat_direct_alias_slots(p, st.vs))
   _              -> false
 }
 
@@ -1476,7 +1481,7 @@ fn list_is_empty_s(xs: [String]) : Bool = match xs { [] -> true _ -> false }
 fn lower_arm_rc(p: Pattern, body: Expr, sd: String, owned: Bool, st: LowerSt) : LowerSt / Console =
   if owned and arm_is_top_reuse(p, body, st) {
     let st1 = ls_emit(st, KRC(KArmTopReuse(KVar(sd), variant_arm_arity(p, st.vs),
-                                           variant_arm_alias_binders(p, st.vs)), kpos_of(body)))
+                                           pat_direct_alias_slots(p, st.vs)), kpos_of(body)))
     ls_emit(st1, KStore(sd, KUnitV, kpos_of(body)))
   } else {
     set_reuse_gc_for_arm(p, body, dup_variant_arm_binders(p, body, owned, st))
@@ -1484,7 +1489,7 @@ fn lower_arm_rc(p: Pattern, body: Expr, sd: String, owned: Bool, st: LowerSt) : 
 
 # The rebuild arity for the arm-top token: the matched ctor's slot count.
 fn variant_arm_arity(p: Pattern, vs: [EVar]) : Int = match p.pkind {
-  PVariant(cname, subs) -> match evar_payload_tys_for(vs, cname) { [] -> list_length(subs) ts -> list_length(ts) }
+  PVariant(cname, subs) -> match pa_payload_tys(vs, cname) { [] -> list_length(subs) ts -> list_length(ts) }
   _                     -> 0
 }
 
