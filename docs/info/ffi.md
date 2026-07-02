@@ -93,13 +93,14 @@ Vector2 get_mouse_position(void) { ... }
 
 Build with the shim on `CFLAGS`: `CFLAGS="shim.c" kai build --backend=c app.kai`.
 
-> Struct-by-value compiles on the **C-direct backend** (`--backend=c`).
-> The native (libLLVM) backend does NOT yet marshal it: a small struct's
-> C ABI (coerced to `iN` / `[N x float]` / `sret` per SysV / AAPCS) is
-> frontend classification LLVM does not derive from a struct value, so a
-> native build of a struct-FFI program fails with an actionable message
-> naming the function and the `--backend=c` fix. The C compiler owns that
-> classification; native ABI classification is a planned follow-up.
+> Struct-by-value works on **both backends**. The C-direct backend
+> (`--backend=c`) lets the C compiler own the ABI; the native (libLLVM)
+> backend classifies each aggregate in the emitter and coerces it to the
+> platform calling convention (`iN` / `[N x float]` / `sret`), so a
+> clang-compiled callee receives it correctly. AArch64 (arm64 Darwin,
+> AAPCS64) and x86-64 SysV are marshalled; a target the classifier does
+> not model falls back to an actionable `--backend=c` diagnostic naming
+> the function.
 
 ## Opaque handles
 
