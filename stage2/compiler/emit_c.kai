@@ -12609,12 +12609,14 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console
             let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
             let dm_table = tcrec_collect_dm_table(body, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
-            # Issue #599 — recompute the branch-aware skip-set so the
-            # TCO-site dropmask aligns with pcs_pass's wrap-skip
-            # decisions. Without this, params in skip_set get the
-            # TCO drop planted while the rewriter omitted the
-            # matching dup, double-freeing the original ref.
-            let skip_set = pcs_branch_aware_skip_params(pnames, body)
+            # Skip-set aligned with pcs_pass's wrap-skip decisions: the
+            # derived set under-approximates on a rewritten body (the
+            # reuse recogniser replaces the cons the classifier judged
+            # linear), so widen it with every param whose reads the
+            # rewriter actually left bare. A TCO drop planted without
+            # the matching dup double-frees the original ref.
+            let skip_set = tcrec_widen_skip_raw_reads(pnames, body,
+                             pcs_branch_aware_skip_params(pnames, body))
             # TRMC: when the fn is modulo-cons-eligible (a constructor
             # in tail position with a self-call slot) AND its effect row
             # is affine (REmpty — no suspendable effect between the cctx
@@ -12758,8 +12760,11 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
             let dm_table = tcrec_collect_dm_table(inner, name, arity, params,
                                                    pnames, uses, borrow_flags, [], [])
-            # Issue #599 — branch-aware skip-set for TCO drop alignment.
-            let skip_set = pcs_branch_aware_skip_params(pnames, inner)
+            # Skip-set aligned with pcs_pass's wrap-skip decisions —
+            # widened with the params the rewriter left bare (raw
+            # transfer), same as the non-wrap branch.
+            let skip_set = tcrec_widen_skip_raw_reads(pnames, inner,
+                             pcs_branch_aware_skip_params(pnames, inner))
             # TRMC: when the inner body is modulo-cons-eligible and the
             # effect row is affine, rewrite the INNER via the cctx path
             # and DROP the exit-drop wrap entirely. The cctx carries the
@@ -13496,6 +13501,172 @@ fn tcrec_span_has_interp(s: String, i: Int, n: Int) : Bool {
         }
       } else { tcrec_span_has_interp(s, i + 1, n) }
   } }
+}
+
+# The perceus rewrite records its ownership decision in the body itself:
+# a read wrapped in `__perceus_dup` leaves the original ref alive; a bare
+# read transfers it raw. A param with any bare non-lambda read must not
+# get the goto-block drop — the drop and the wrap must pair or RC
+# double-counts. Widening only (never removes a derived skip entry), so
+# a read this walker cannot see (interp strings) keeps today's mask.
+fn tcrec_widen_skip_raw_reads(pnames: [String], body: Expr, skip: [String]) : [String] {
+  match pnames {
+    [] -> skip
+    [h, ...rest] -> {
+      let skip1 =
+        if not list_has(skip, h) and tcrec_expr_raw_read(body, h) { [h, ...skip] }
+        else { skip }
+      tcrec_widen_skip_raw_reads(rest, body, skip1)
+    }
+  }
+}
+
+# Lambda bodies are excluded: closure captures are RC'd separately, and
+# the dropmask's lambda story lives in the LUBlocked arm.
+fn tcrec_expr_raw_read(e: Expr, p: String) : Bool =
+  tcrec_kind_raw_read(e.kind, p)
+
+fn tcrec_kind_raw_read(k: ExprKind, p: String) : Bool {
+  match k {
+    EVar(nm) -> nm == p
+    ECall(f, xs) -> match f.kind {
+      EVar(callee) ->
+        if callee == "__perceus_dup" { tcrec_dup_arg_raw_read(xs, p) }
+        else if callee == p { true }
+        else { tcrec_args_raw_read(xs, p) }
+      _ ->
+        if tcrec_expr_raw_read(f, p) { true } else { tcrec_args_raw_read(xs, p) }
+    }
+    EIntrinsic(_, xs) -> tcrec_args_raw_read(xs, p)
+    EBinop(_, l, r) ->
+      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+    EUnop(_, x) -> tcrec_expr_raw_read(x, p)
+    EField(x, _) -> tcrec_expr_raw_read(x, p)
+    EIndex(x, i) ->
+      if tcrec_expr_raw_read(x, p) { true } else { tcrec_expr_raw_read(i, p) }
+    EIf(c, t, opt_e) ->
+      if tcrec_expr_raw_read(c, p) { true }
+      else if tcrec_expr_raw_read(t, p) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_expr_raw_read(e2, p)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_expr_raw_read(s, p) { true }
+      else { tcrec_arms_raw_read(arms, p) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_stmts_raw_read(stmts, p) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_expr_raw_read(e, p)
+      } }
+    EList(elems) -> tcrec_elems_raw_read(elems, p)
+    ERange(lo, hi, opt_by) ->
+      if tcrec_expr_raw_read(lo, p) { true }
+      else if tcrec_expr_raw_read(hi, p) { true }
+      else { match opt_by {
+        None -> false
+        Some(e) -> tcrec_expr_raw_read(e, p)
+      } }
+    ERecordLit(_, fis) -> tcrec_fields_raw_read(fis, p)
+    EPipe(l, r) ->
+      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+    EMapPipe(l, r) ->
+      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+    EFlatMapPipe(l, r) ->
+      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+    EFilterPipe(l, r) ->
+      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+    EBang(inner) -> tcrec_expr_raw_read(inner, p)
+    ELitUnit(inner, _) -> tcrec_expr_raw_read(inner, p)
+    _ -> false
+  }
+}
+
+# `__perceus_dup(x)` shields a bare-var read; a composite arg recurses.
+fn tcrec_dup_arg_raw_read(xs: [Expr], p: String) : Bool {
+  match xs {
+    [a] -> match a.kind {
+      EVar(_) -> false
+      _       -> tcrec_expr_raw_read(a, p)
+    }
+    _ -> tcrec_args_raw_read(xs, p)
+  }
+}
+
+fn tcrec_args_raw_read(args: [Expr], p: String) : Bool {
+  match args {
+    [] -> false
+    [h, ...rest] ->
+      if tcrec_expr_raw_read(h, p) { true }
+      else { tcrec_args_raw_read(rest, p) }
+  }
+}
+
+fn tcrec_arms_raw_read(arms: [Arm], p: String) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let g_hit = match opt_g {
+          None -> false
+          Some(g) -> tcrec_expr_raw_read(g, p)
+        }
+        if g_hit { true }
+        else if tcrec_expr_raw_read(body, p) { true }
+        else { tcrec_arms_raw_read(rest, p) }
+      }
+    }
+  }
+}
+
+fn tcrec_stmts_raw_read(stmts: [Stmt], p: String) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_expr_raw_read(e, p)
+        SVar(_, _, e, _, _) -> tcrec_expr_raw_read(e, p)
+        SAssert(c, opt_m) ->
+          if tcrec_expr_raw_read(c, p) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_expr_raw_read(m, p)
+          } }
+        SExprStmt(e) -> tcrec_expr_raw_read(e, p)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_expr_raw_read(b, p) { true }
+          else if tcrec_expr_raw_read(i, p) { true }
+          else { tcrec_expr_raw_read(v, p) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_stmts_raw_read(rest, p) }
+    }
+  }
+}
+
+fn tcrec_elems_raw_read(elems: [ListElem], p: String) : Bool {
+  match elems {
+    [] -> false
+    [e, ...rest] -> {
+      let here = match e {
+        ElPlain(x) -> tcrec_expr_raw_read(x, p)
+        ElSpread(x) -> tcrec_expr_raw_read(x, p)
+      }
+      if here { true } else { tcrec_elems_raw_read(rest, p) }
+    }
+  }
+}
+
+fn tcrec_fields_raw_read(fis: [FieldInit], p: String) : Bool {
+  match fis {
+    [] -> false
+    [h, ...rest] -> match h {
+      FI(_, e) ->
+        if tcrec_expr_raw_read(e, p) { true }
+        else { tcrec_fields_raw_read(rest, p) }
+    }
+  }
 }
 
 # Lookup the rule-3 mask for the call site at (line, col). Returns 0
