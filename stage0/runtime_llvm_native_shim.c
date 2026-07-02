@@ -28,9 +28,13 @@
 #include <runtime.h>
 
 #ifdef KAI_LLVM
+KaiValue * kaix_prelude_llvm_add_byval_call(void *m, void *call, int64_t param_ix, void *sty) { return kai_llvm_add_byval_call(m, call, param_ix, sty); }
+KaiValue * kaix_prelude_llvm_add_byval_decl(void *m, void *fn, int64_t param_ix, void *sty) { return kai_llvm_add_byval_decl(m, fn, param_ix, sty); }
 KaiValue * kaix_prelude_llvm_add_case(void *sw, void *onval, void *bb) { return kai_llvm_add_case(sw, onval, bb); }
 void * kaix_prelude_llvm_add_function(void *m, KaiValue *name, void *fnty) { return kai_llvm_add_function(m, name, fnty); }
 void * kaix_prelude_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) { return kai_llvm_add_global_zeroed(m, ty, name); }
+KaiValue * kaix_prelude_llvm_add_sret_call(void *m, void *call, void *sty) { return kai_llvm_add_sret_call(m, call, sty); }
+KaiValue * kaix_prelude_llvm_add_sret_decl(void *m, void *fn, void *sty) { return kai_llvm_add_sret_decl(m, fn, sty); }
 void * kaix_prelude_llvm_append_block(void *m, void *fn, KaiValue *name) { return kai_llvm_append_block(m, fn, name); }
 void * kaix_prelude_llvm_array_type(void *elem, int64_t n) { return kai_llvm_array_type(elem, n); }
 KaiValue * kaix_prelude_llvm_buf_free(void *buf) { return kai_llvm_buf_free(buf); }
@@ -62,6 +66,7 @@ KaiValue * kaix_prelude_llvm_build_ret_void(void *b) { return kai_llvm_build_ret
 void * kaix_prelude_llvm_build_sext(void *b, void *v, void *ty) { return kai_llvm_build_sext(b, v, ty); }
 KaiValue * kaix_prelude_llvm_build_store(void *b, void *val, void *ptr) { return kai_llvm_build_store(b, val, ptr); }
 void * kaix_prelude_llvm_build_string_span(void *b, KaiValue *s) { return kai_llvm_build_string_span(b, s); }
+void * kaix_prelude_llvm_build_struct_gep(void *b, void *sty, void *ptr, int64_t i) { return kai_llvm_build_struct_gep(b, sty, ptr, i); }
 void * kaix_prelude_llvm_build_switch(void *b, void *val, void *default_bb, int64_t ncases) { return kai_llvm_build_switch(b, val, default_bb, ncases); }
 void * kaix_prelude_llvm_build_trunc(void *b, void *v, void *ty) { return kai_llvm_build_trunc(b, v, ty); }
 KaiValue * kaix_prelude_llvm_build_unreachable(void *b) { return kai_llvm_build_unreachable(b); }
@@ -83,6 +88,7 @@ int32_t kaix_prelude_llvm_handle_is_null(void *h) { return kai_llvm_handle_is_nu
 void * kaix_prelude_llvm_int_type(void *m, int64_t bits) { return kai_llvm_int_type(m, bits); }
 void * kaix_prelude_llvm_module_new(KaiValue *name) { return kai_llvm_module_new(name); }
 KaiValue * kaix_prelude_llvm_position_at_end(void *b, void *bb) { return kai_llvm_position_at_end(b, bb); }
+void * kaix_prelude_llvm_struct_type(void *m, void *buf) { return kai_llvm_struct_type(m, buf); }
 KaiValue * kaix_prelude_native_ctx_add_block(void *cv, KaiValue *label, void *bb) { return kai_native_ctx_add_block(cv, label, bb); }
 KaiValue * kaix_prelude_native_ctx_add_frame_slot(void *cv, KaiValue *symv, KaiValue *effv) { return kai_native_ctx_add_frame_slot(cv, symv, effv); }
 KaiValue * kaix_prelude_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, int64_t slot) { return kai_native_ctx_add_reg(cv, name, alloca, slot); }
@@ -116,4 +122,5 @@ int64_t kaix_prelude_native_di_enabled(void *cv) { return kai_native_di_enabled(
 KaiValue * kaix_prelude_native_di_finalize(void *cv) { return kai_native_di_finalize(cv); }
 KaiValue * kaix_prelude_native_di_set_loc(void *cv, int64_t line, int64_t col) { return kai_native_di_set_loc(cv, line, col); }
 KaiValue * kaix_prelude_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) { return kai_native_di_subprogram(cv, fnval, namev, line); }
+int64_t kaix_prelude_native_target_abi(void) { return kai_native_target_abi(); }
 #endif /* KAI_LLVM */
