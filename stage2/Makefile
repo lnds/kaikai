@@ -779,7 +779,13 @@ test-numeric-bigint: $(TARGET) build
 	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
 	    && echo "bigint $$f OK (C backend)" \
 	    || { echo "bigint $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
-	done
+	done; \
+	./$(TARGET) --path ../stdlib ../examples/numeric/int_overflow.err.kai > build/int_overflow.out 2>&1 \
+	  && { echo "int_overflow DID NOT FAIL — Int literal past i64 must diagnose"; exit 1; } \
+	  || true; \
+	grep -F "$$(head -1 ../examples/numeric/int_overflow.err.expected)" build/int_overflow.out > /dev/null \
+	  && echo "bigint int_overflow OK (out-of-range Int rejection)" \
+	  || { echo "bigint int_overflow DIFF — expected out-of-range diagnostic"; cat build/int_overflow.out; exit 1; }
 
 # Pure-kaikai BigInt — NATIVE backend parity. Same fixtures and goldens,
 # built with the in-process libLLVM backend. Native-gated: a C-only
