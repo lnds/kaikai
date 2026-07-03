@@ -1,0 +1,136 @@
+# compiler/migrate_walk.kai — the source-preserving AST rewriter.
+#
+# The migrator's machinery, independent of the rule set: walk every
+# expression in a parsed program and apply the rule set at each call
+# node. Rewrites rebuild nodes in place, preserving line/col so the
+# fmt-writer re-emits the surrounding source unchanged; only the
+# renamed callee differs. The walk is bottom-up — children first — so
+# a rule never re-sees a node it just produced.
+#
+# Rewriting (`mig_expr`) and reporting (`migrate_scan`) are separate
+# stateless passes: each returns a plain value (a node, a list) over a
+# list-match, the shape kaic1 compiles correctly. Threading a paired
+# (node, state) wrapper out of a list-match miscompiles under kaic1,
+# so the report is collected by a second walk instead.
+
+import compiler.ast
+import compiler.migrate_rules
+
+fn with_kind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# A `<module>.<method>(...)` call is `ECall(EField(EVar(mod), method),
+# args)` when `mod` is an unresolved name (the shape migrate sees for
+# an unimported module) and `ECall(EModCall(mod, method), args)` once
+# the resolver has bound `mod` to an imported module (core modules
+# like `array` are pre-bound, so they arrive as EModCall even before
+# the user imports anything). Both spell the same surface call, so the
+# rule set must see through both.
+#[doc("The (module, method) of a `<mod>.<method>(...)` call in surface form — matching both the pre-resolve `EField` shape and the post-bind `EModCall` shape — or None when the callee is not a module-qualified name.")]
+pub fn call_mod_method(callee: Expr) : Option[Pair[String, String]] = match callee.kind {
+  EField(obj, method) -> call_mod_method_field(obj, method)
+  EModCall(m, method) -> Some(Pair { fst: m, snd: method })
+  _ -> None
+}
+
+fn call_mod_method_field(obj: Expr, method: String) : Option[Pair[String, String]] = match obj.kind {
+  EVar(m) -> Some(Pair { fst: m, snd: method })
+  _ -> None
+}
+
+fn rename_callee(callee: Expr, new_method: String) : Expr = match callee.kind {
+  EField(obj, _) -> with_kind(callee, EField(obj, new_method))
+  _ -> callee
+}
+
+
+# --- rewrite pass: Expr -> Expr, no state -----------------------------
+
+# Apply the rule set to one already-child-walked call, renaming the
+# callee in place when a rule matches (manual-only and no-match cases
+# leave the node untouched — the scan pass reports the manual ones).
+fn mig_apply_call(e: Expr, callee: Expr, cargs: [Expr]) : Expr = match call_mod_method(callee) {
+  None -> with_kind(e, ECall(callee, cargs))
+  Some(mm) -> match migrate_rule_for(mm.fst, mm.snd) {
+    Some(CR(new_method)) -> with_kind(e, ECall(rename_callee(callee, new_method), cargs))
+    None -> with_kind(e, ECall(callee, cargs))
+  }
+}
+
+#[doc("Walk one expression, rewriting every call the rule set renames. Children are walked before the node, so a rewrite never cascades into a freshly-produced node.")]
+pub fn mig_expr(e: Expr) : Expr = match e.kind {
+  ECall(callee, cargs) -> mig_apply_call(e, mig_expr(callee), map(cargs, mig_expr))
+  EField(obj, f) -> with_kind(e, EField(mig_expr(obj), f))
+  EIndex(o, i) -> with_kind(e, EIndex(mig_expr(o), mig_expr(i)))
+  EBinop(op, l, r) -> with_kind(e, EBinop(op, mig_expr(l), mig_expr(r)))
+  EUnop(op, x) -> with_kind(e, EUnop(op, mig_expr(x)))
+  EBang(x) -> with_kind(e, EBang(mig_expr(x)))
+  EPipe(l, r) -> with_kind(e, EPipe(mig_expr(l), mig_expr(r)))
+  EMapPipe(l, r) -> with_kind(e, EMapPipe(mig_expr(l), mig_expr(r)))
+  EFlatMapPipe(l, r) -> with_kind(e, EFlatMapPipe(mig_expr(l), mig_expr(r)))
+  EFilterPipe(l, r) -> with_kind(e, EFilterPipe(mig_expr(l), mig_expr(r)))
+  EIf(c, t, eo) -> with_kind(e, EIf(mig_expr(c), mig_expr(t), mig_expr_opt(eo)))
+  EMatch(scrut, arms) -> with_kind(e, EMatch(mig_expr(scrut), mig_arms(arms)))
+  ELambda(ps, body) -> with_kind(e, ELambda(ps, mig_expr(body)))
+  ERecordLit(name, fields) -> with_kind(e, ERecordLit(name, mig_fields(fields)))
+  EList(elems) -> with_kind(e, EList(mig_elems(elems)))
+  ERange(lo, hi, step) -> with_kind(e, ERange(mig_expr(lo), mig_expr(hi), mig_expr_opt(step)))
+  EBlock(stmts, tail) -> with_kind(e, EBlock(mig_stmts(stmts), mig_expr_opt(tail)))
+  ELitUnit(inner, u) -> with_kind(e, ELitUnit(mig_expr(inner), u))
+  EIntrinsic(name, iargs) -> with_kind(e, EIntrinsic(name, map(iargs, mig_expr)))
+  EHandle(body, en, ta, io, al, cls, ro) ->
+    with_kind(e, EHandle(mig_expr(body), en, ta, mig_expr_opt(io), al, mig_clauses(cls), mig_hreturn(ro)))
+  _ -> e
+}
+
+fn mig_expr_opt(eo: Option[Expr]) : Option[Expr] = match eo {
+  None -> None
+  Some(x) -> Some(mig_expr(x))
+}
+
+# These list walks delegate to the `map` prelude prim rather than
+# recursing with a local list-match. kaic1 miscompiles a list-match
+# fed by an AST constructor's 2nd-field binder (`ECall(_, args)` etc.)
+# into a runtime non-exhaustive panic; `map` runs in the runtime, so
+# the arg list is iterated by trap-free code. This mirrors how
+# desugar.kai walks call arguments.
+fn mig_fields(fs: [FieldInit]) : [FieldInit] = map(fs, mig_field)
+
+fn mig_field(fi: FieldInit) : FieldInit = match fi {
+  FI(n, x) -> FI(n, mig_expr(x))
+}
+
+fn mig_elems(es: [ListElem]) : [ListElem] = map(es, mig_elem)
+
+fn mig_elem(el: ListElem) : ListElem = match el {
+  ElPlain(x) -> ElPlain(mig_expr(x))
+  ElSpread(x) -> ElSpread(mig_expr(x))
+}
+
+fn mig_stmts(ss: [Stmt]) : [Stmt] = map(ss, mig_stmt)
+
+fn mig_stmt(s: Stmt) : Stmt = match s {
+  SLet(p, t, x) -> SLet(p, t, mig_expr(x))
+  SExprStmt(x) -> SExprStmt(mig_expr(x))
+  SVar(n, t, x, l, c) -> SVar(n, t, mig_expr(x), l, c)
+  SAssert(x, mo) -> SAssert(mig_expr(x), mig_expr_opt(mo))
+  SIndexAssign(a, i, v, l, c) -> SIndexAssign(mig_expr(a), mig_expr(i), mig_expr(v), l, c)
+  SUse(n, l, c) -> SUse(n, l, c)
+}
+
+fn mig_arms(arms: [Arm]) : [Arm] = map(arms, mig_arm)
+
+fn mig_arm(a: Arm) : Arm = match a {
+  Arm(p, g, body) -> Arm(p, mig_expr_opt(g), mig_expr(body))
+}
+
+fn mig_clauses(cls: [HClause]) : [HClause] = map(cls, mig_clause)
+
+fn mig_clause(c: HClause) : HClause = match c {
+  HC(n, ps, b, l, col) -> HC(n, ps, mig_expr(b), l, col)
+}
+
+fn mig_hreturn(ro: Option[HReturn]) : Option[HReturn] = match ro {
+  None -> None
+  Some(HR(n, b, l, c)) -> Some(HR(n, mig_expr(b), l, c))
+}

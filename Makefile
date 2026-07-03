@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -208,7 +208,7 @@ test-modular-selfhost: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -317,6 +317,12 @@ test-canonical-aliases:
 # breaking re-parse. Cheap enough to gate every Tier 1 run.
 test-fmt: kaic2
 	@./tests/fmt_fixtures.sh
+
+# Issue #1047 — `kai migrate` edition-migration fixtures. Asserts the
+# rewrite matches the golden, is idempotent, re-parses, and reports
+# un-migratable changes as `manual:` (see examples/migrate/).
+test-migrate: kaic2
+	@./tests/migrate_fixtures.sh
 
 # Issue #786 — `kai fmt` self-hosting ratchet. For every source under
 # stdlib/ + stage2/compiler/, asserts `kai fmt` exits 0 (no refusal)

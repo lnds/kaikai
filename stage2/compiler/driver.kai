@@ -20,6 +20,10 @@ import compiler.parse
 import compiler.resolve
 import compiler.fmt
 import compiler.fmt_writer
+import compiler.migrate
+import compiler.migrate_rules
+import compiler.migrate_walk
+import compiler.migrate_scan
 import compiler.cache
 import compiler.modules
 import compiler.user_cache
@@ -1186,6 +1190,13 @@ pub type Mode
   # emits nothing (exit 0).
   | MFmt
   | MFmtCheck
+  # `--migrate` — edition source migration. Parse, rewrite every
+  # edition-broken surface form the rule set knows, re-emit through
+  # the fmt-writer. Prints the migrated source to stdout and a
+  # `manual:` report to stderr; the bin/kai wrapper owns the safe
+  # write-back (diff by default, `--write` to apply). Idempotent: a
+  # second run over migrated source is a no-op.
+  | MMigrate
   # Library mode. Run lex → parse → resolve → infer and answer
   # position-keyed queries against the typed AST instead of emitting
   # C. Probes are embedded in the source as line comments of the
@@ -1456,6 +1467,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MFmt))
       } else if a == "--fmt-check" {
         parse_cli_loop(more, cli_with_mode(opts, MFmtCheck))
+      } else if a == "--migrate" {
+        parse_cli_loop(more, cli_with_mode(opts, MMigrate))
       } else if a == "--library-mode" {
         parse_cli_loop(more, cli_with_mode(opts, MLibraryMode))
       } else if a == "--diags-json" {
@@ -3761,6 +3774,43 @@ fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
 
 # ============================================================
 
+# `kai migrate` body: rewrite the decls, re-emit through the fmt-
+# writer, and guard the never-emit-non-parsing invariant by reparsing
+# the output. On a reparse failure nothing is printed and the run
+# fails, so the user's file is never overwritten with broken source.
+# The migrated source goes to stdout; the `manual:` report and the
+# change summary go to stderr, keeping stdout a clean source stream
+# the bin/kai wrapper can diff or write back.
+# The report is scanned from an INDEPENDENT parse of the same source,
+# not the binding the rewrite consumes: the rewrite moves its owned
+# `decls`, so reusing one binding for both passes would leave the scan
+# reading freed sub-lists. Re-parsing is cheap next to the rest of
+# migrate and keeps the two passes fully decoupled.
+fn run_migrate(path: String, src: String, decls: [Decl], cmts: [Cmt]) : Int / Console =
+  run_migrate_scanned(path, cmts, scan_source(path, src), migrate_decls(decls))
+
+fn scan_source(path: String, src: String) : [MigRep] / Console = match parse_program(path, src, tokenize(src)).decls {
+  None -> []
+  Some(ds) -> migrate_scan_decls(ds)
+}
+
+fn run_migrate_scanned(path: String, cmts: [Cmt], reps: [MigRep], migrated: [Decl]) : Int / Console = {
+  let out = fmt_program(migrated, cmts)
+  let reparsed = parse_program(path, out, tokenize(out))
+  match reparsed.decls {
+    None -> { eprint("migrate: internal error — rewritten source does not parse; aborting (no file written)"); 1 }
+    Some(_) -> run_migrate_ok(out, reps)
+  }
+}
+
+fn run_migrate_ok(out: String, reps: [MigRep]) : Int / Console = {
+  print(out)
+  let report = migrate_manual_report(reps)
+  if report != "" { eprint(report) } else { () }
+  eprint("migrate: #{int_to_string(mig_count_renames(reps))} automatic rewrite(s) applied")
+  0
+}
+
 # `batch_out`, when `Some(p)`, redirects the C-backend `.c` emission
 # to `write_file(p, ...)` instead of stdout, so the batch driver can
 # write each fixture's output to its own file from one process. `None`
@@ -3799,6 +3849,16 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               let cmts = collect_comments(src, tokens)
               let formatted = fmt_program(own_decls, cmts)
               if formatted == src { 0 } else { print(formatted); 1 }
+            }
+            # `kai migrate`. Same parse-then-fmt path as MFmt, with the
+            # rule set applied to the decls in between. The migrated
+            # source goes to stdout (bin/kai owns the safe write-back);
+            # the `manual:` report goes to stderr. Guards the never-
+            # emit-non-parsing invariant: the output is reparsed and,
+            # on failure, nothing is printed and the run fails.
+            MMigrate -> {
+              let cmts = collect_comments(src, tokens)
+              run_migrate(path, src, own_decls, cmts)
             }
             _ -> {
             # Strip `#[doc(...)]` wrappers into the doc side table right
