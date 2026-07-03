@@ -1,0 +1,187 @@
+# compiler/emit_native_modular.kai — the native separate-compilation driver.
+#
+# The frontend stays whole-program: parse / infer / perceus / monomorph run
+# once and produce ONE `KProgram`. This backend partitions only the CODEGEN —
+# it projects that whole-program `KProgram` onto one LLVM module per `KFn.mo`
+# (the `home_tu` partition L2 stamped) plus the root, emits each to its own
+# object, and returns the object paths for the driver to link. The per-module
+# object is a PROJECTION of the whole-program computation, never an isolated
+# compile: every partition declares the SAME whole-program fn table, so their
+# ABIs agree by construction and no serialised signature can drift.
+#
+# What lands where (asu-reviewed):
+#   root TU  — every fn with `mo = None` (private fns, lambdas, clauses, the
+#              user `main`), the fn thunks, the proto impl-table init, the
+#              default install/teardown, the default-evidence global DEFINITIONS
+#              (external), and the synthetic `kai_main` runner driver. It is the
+#              runtime owner, so the runtime links against it.
+#   leaf TU  — every fn homing to that module; the default globals and the other
+#              modules' fns it calls are EXTERNAL declarations resolved at link.
+#
+# Cache: each partition's object is content-addressed on the hash of its
+# projected KIR — the fns it DEFINES plus every program fn's SIGNATURE (so a
+# producer's signature/ownership flip rewrites a consumer's key). With a cache
+# dir, a hit reuses the stored object and SKIPS codegen; only changed partitions
+# re-emit. Without one, every partition emits to `<out_dir>/<stem>.o`.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.kir_dump
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native
+
+#[doc("Emit the program as N native objects (root plus one per KFn.mo) and return their object paths, empty on a codegen failure. A Some cache_dir content-addresses each object and skips codegen on a hit. The caller links every returned path with the runtime owner.")]
+pub fn build_native_modular(kp: KProgram, decls: [Decl], variants: [EVar],
+                            fns: [EFn], bmode: BuildMode, out_dir: String,
+                            cache_dir: Option[String], src_path: String)
+                            : [String] / Console + File = {
+  let emit_fns = nmod_filter_main(kp.fns, bmode)
+  let mods = nmod_distinct_modules(emit_fns, [])
+  let root = nmod_emit_one(kp, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+                           "__root__", nmod_fns_of(emit_fns, None), NModRoot)
+  match root {
+    None    -> []
+    Some(r) -> nmod_emit_leaves(kp, decls, variants, fns, bmode, src_path, out_dir,
+                                cache_dir, emit_fns, mods, [r])
+  }
+}
+
+# Drop the user `fn main` in runner mode (the synthetic driver owns `kai_main`),
+# matching the whole-program `nfilter_user_main`.
+fn nmod_filter_main(fns: [KFn], bmode: BuildMode) : [KFn] =
+  if nemit_is_runner_mode(bmode) { filter(fns, (f) => not (f.sym == "main")) } else { fns }
+
+# The distinct `Some(m)` module origins across the fn list, first-seen order.
+fn nmod_distinct_modules(fns: [KFn], acc: [String]) : [String] = match fns {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> match f.mo {
+    None    -> nmod_distinct_modules(rest, acc)
+    Some(m) -> if list_has(acc, m) { nmod_distinct_modules(rest, acc) }
+               else                { nmod_distinct_modules(rest, [m, ...acc]) }
+  }
+}
+
+# The fns homing to `mo` (`None` = root), preserving program order.
+fn nmod_fns_of(fns: [KFn], mo: Option[String]) : [KFn] = nmod_fns_of_loop(fns, mo, [])
+fn nmod_fns_of_loop(fns: [KFn], mo: Option[String], acc: [KFn]) : [KFn] = match fns {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> if nmod_mo_eq(f.mo, mo) { nmod_fns_of_loop(rest, mo, [f, ...acc]) }
+                  else                    { nmod_fns_of_loop(rest, mo, acc) }
+}
+
+fn nmod_mo_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { None -> false Some(y) -> x == y }
+}
+
+# Emit each leaf module, threading the accumulated object-path list. A partition
+# that fails codegen aborts the whole build (returns []), since a missing object
+# would break the link.
+fn nmod_emit_leaves(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+                    bmode: BuildMode, src_path: String, out_dir: String,
+                    cache_dir: Option[String], all_fns: [KFn], mods: [String],
+                    acc: [String]) : [String] / Console + File = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> {
+    let a = nmod_emit_one(kp, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+                          nmod_stem(m), nmod_fns_of(all_fns, Some(m)), NModLeaf)
+    match a {
+      None    -> []
+      Some(x) -> nmod_emit_leaves(kp, decls, variants, fns, bmode, src_path, out_dir,
+                                  cache_dir, all_fns, rest, [x, ...acc])
+    }
+  }
+}
+
+# Build one partition. On a cache hit (the content-addressed object already
+# exists) codegen is skipped and the cached path returned; otherwise the module
+# is built and emitted. Returns the object path, or `None` on a codegen failure.
+fn nmod_emit_one(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+                 bmode: BuildMode, src_path: String, out_dir: String,
+                 cache_dir: Option[String], stem: String, define_fns: [KFn],
+                 role: NModRole) : Option[String] / Console + File = {
+  let key = nmod_cache_key(kp, define_fns, role)
+  let obj = nmod_obj_path(out_dir, cache_dir, stem, key)
+  if nmod_cached(cache_dir, obj) { Some(obj) }
+  else { nmod_build(kp, decls, variants, fns, bmode, src_path, stem, define_fns, role, obj) }
+}
+
+# The object path: content-addressed `<cache_dir>/<key>.o` when a cache dir is
+# set (so identical KIR reuses one object across builds), else `<out_dir>/<stem>.o`.
+fn nmod_obj_path(out_dir: String, cache_dir: Option[String], stem: String, key: String) : String =
+  match cache_dir {
+    Some(d) -> concat_all([d, "/", key, ".o"])
+    None    -> concat_all([out_dir, "/", stem, ".o"])
+  }
+
+# A cache hit iff a cache dir is set and the content-addressed object already
+# exists — probed with `read_file` (its `Ok` means present) rather than a
+# dedicated exists prim, so kaic1 (which lacks that prim) still bootstraps.
+fn nmod_cached(cache_dir: Option[String], obj: String) : Bool / File = match cache_dir {
+  None    -> false
+  Some(_) -> match read_file(obj) { Ok(_) -> true Err(_) -> false }
+}
+
+# Build the LLVM module for this partition and emit its object with the raw
+# (no runtime-bitcode-merge, no internalise) emitter so cross-TU symbols keep
+# external linkage. The object path is content-addressed, so a concurrent build
+# racing on the same key writes byte-identical bytes — the emit is idempotent.
+fn nmod_build(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+              bmode: BuildMode, src_path: String, stem: String,
+              define_fns: [KFn], role: NModRole, obj: String) : Option[String] / Console + File = {
+  let m = llvm_module_new(cat2("kai_native_", stem))
+  let ctx = native_ctx_new(m)
+  nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path, define_fns, kp.fns, role)
+  if native_ctx_ok(ctx) == 1 {
+    if llvm_emit_object_raw(m, obj) == 0 { Some(obj) } else { None }
+  } else {
+    eprint(concat_all(["native-modular: partition ", stem, " not emitted — a KIR node is outside the current subset (see above)"]))
+    None
+  }
+}
+
+# The content-addressed cache key of a partition: a hash of the KIR text that
+# feeds its codegen — the fns this TU DEFINES plus every program fn's SIGNATURE
+# (its cross-TU callee shapes). A producer changing a signature or ownership
+# flips the consumer's key and forces its re-emit; a body-only change in another
+# module leaves this key untouched. There is no serialised ABI to go stale,
+# because the KIR text itself carries every callee shape.
+fn nmod_cache_key(kp: KProgram, define_fns: [KFn], role: NModRole) : String =
+  nmod_hash(concat_all([
+    nmod_role_tag(role), "\n",
+    kir_dump_fns_pub(define_fns),
+    "; externs\n", nmod_dump_sigs(kp.fns, "")
+  ]))
+
+fn nmod_role_tag(role: NModRole) : String = match role {
+  NModWhole -> "whole"  NModRoot -> "root"  NModLeaf -> "leaf"
+}
+
+# Every program fn's signature (name + kind + param/return slots), no bodies —
+# the external-declaration slice each object emits for its cross-TU calls.
+fn nmod_dump_sigs(fns: [KFn], acc: String) : String = match fns {
+  [] -> acc
+  [f, ...rest] -> nmod_dump_sigs(rest, concat_all([acc, kir_dump_fn_sig_pub(f), "\n"]))
+}
+
+# Sanitise a module origin into an object-file stem (`geo.shapes` -> `geo_shapes`).
+fn nmod_stem(m: String) : String = nmod_dots(m, 0, string_length(m), "")
+fn nmod_dots(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else {
+    let c = string_slice(s, i, 1)
+    nmod_dots(s, i + 1, n, cat2(acc, if c == "." { "_" } else { c }))
+  }
+
+# A stable, platform-independent content hash (djb2 over the bytes). The key
+# only needs to change whenever the projected KIR changes; the masked 48-bit
+# accumulator keeps it a compact decimal string and avoids native-int wrap
+# diverging between the C oracle and the native backend.
+fn nmod_hash(s: String) : String = int_to_string(nmod_djb2(s, 0, string_length(s), 5381))
+fn nmod_djb2(s: String, i: Int, n: Int, h: Int) : Int =
+  if i >= n { h }
+  else { nmod_djb2(s, i + 1, n, nmod_mask(h * 33 + char_to_int(char_at_or_zero(s, i)))) }
+
+fn nmod_mask(h: Int) : Int = h % 281474976710656
