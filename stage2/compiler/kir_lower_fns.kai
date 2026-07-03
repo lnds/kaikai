@@ -55,7 +55,7 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   let rs = lower_runner_decls(raw_decls, target_origin, st0, freg)
   KProgram { types: types,
              fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
-             handlers: lower_handler_decls(lc.clauses, lc.clauses, []),
+             handlers: canon_handler_op_order(lower_handler_decls(lc.clauses, lc.clauses, []), raw_decls),
              install_order: kir_install_order(raw_decls),
              defaults: kir_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls),
@@ -477,6 +477,77 @@ fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KP
 }
 
 # --- Handler decls + one-shot resume check ------------------------------
+
+# Canonicalise op-thunk layout so the Ev field index of an op is intrinsic
+# to the EFFECT, not to a particular handler. A `KPerform` resolves an op's
+# field statically (from the innermost matching handler) but derefs whichever
+# node the fiber carries at runtime — a parent handler in-scope, or the effect's
+# default node in a spawned child (evidence does not cross the spawn boundary,
+# so the child resolves the effect to its default). If a handler's op_thunks
+# and the default node disagree on order, the static field lands on the wrong
+# slot of the default node. Reorder each handler of a DEFAULT-carrying effect
+# into that effect's default-block order and fill omitted ops with the default
+# forwarder — so install (nemit_install_ops) and dispatch (nfx_op_field) match
+# the default node WITHOUT dropping any slot. A handler for an effect with no
+# default block is left untouched: no default node exists to disagree with, and
+# its op_thunks are self-consistent across its own install and dispatch.
+fn canon_handler_op_order(hs: [KHandlerDecl], decls: [Decl]) : [KHandlerDecl] = match hs {
+  [] -> []
+  [h, ...rest] -> [canon_one_handler(h, decls), ...canon_handler_op_order(rest, decls)]
+}
+
+# The default block is resolved by effect NAME, so a program that redefines a
+# stdlib effect name (`effect Log { log }` shadowing stdlib `Log`) would resolve
+# the WRONG decl's default ops. Reorder only when the resolved default block is a
+# superset of the handler's ops — i.e. the handler and the default belong to the
+# same effect. A homonym whose ops the default block does not cover is left
+# untouched (it has no runtime default node of its own to disagree with).
+fn canon_one_handler(h: KHandlerDecl, decls: [Decl]) : KHandlerDecl =
+  match kir_default_for_effect(h.eff, decls) {
+    None     -> h
+    Some(kd) -> match kd {
+      KDef(_, defops) ->
+        if op_thunks_covered_by(h.op_thunks, defops) {
+          KHandlerDecl { eff: h.eff, sym: h.sym,
+                         op_thunks: reorder_op_thunks(defops, h.op_thunks),
+                         ret_thunk: h.ret_thunk, env_caps: h.env_caps }
+        } else { h }
+    }
+  }
+
+# True when every op the handler provides appears in `defops` (the resolved
+# default block's op set) — the guard that a name-resolved default belongs to
+# the same effect the handler handles.
+fn op_thunks_covered_by(thunks: [KOpThunk], defops: [KDefOp]) : Bool = match thunks {
+  []                    -> true
+  [KOT(nm, _), ...rest] -> match find_defop(defops, nm) {
+    None    -> false
+    Some(_) -> op_thunks_covered_by(rest, defops)
+  }
+}
+
+fn find_defop(defops: [KDefOp], op: String) : Option[KDefOp] = match defops {
+  []                       -> None
+  [KDOp(nm, sym), ...rest] -> if nm == op { Some(KDOp(nm, sym)) } else { find_defop(rest, op) }
+}
+
+# The handler's op-thunks in default-block (declaration) order. An op the
+# handler provides keeps its clause thunk; an op it omits is filled with the
+# effect's default forwarder, so the field index of every op equals its
+# declaration position on BOTH the handler and the default node. Zero drop —
+# the list is exactly as long as the effect's op set.
+fn reorder_op_thunks(defops: [KDefOp], thunks: [KOpThunk]) : [KOpThunk] = match defops {
+  []                        -> []
+  [KDOp(op, dsym), ...rest] -> match find_op_thunk(thunks, op) {
+    None    -> [KOT(op, dsym), ...reorder_op_thunks(rest, thunks)]
+    Some(t) -> [t, ...reorder_op_thunks(rest, thunks)]
+  }
+}
+
+fn find_op_thunk(thunks: [KOpThunk], op: String) : Option[KOpThunk] = match thunks {
+  []                      -> None
+  [KOT(nm, sym), ...rest] -> if nm == op { Some(KOT(nm, sym)) } else { find_op_thunk(rest, op) }
+}
 
 # One `KHandlerDecl` per (effect, handler-site) the clauses belong to.
 # Groups clauses by their (line, col) handler key, mapping each op to its
