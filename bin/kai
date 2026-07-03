@@ -369,6 +369,25 @@ resolve_modular_cache_dir() {
   esac
 }
 
+# Cache root for the native-modular content-addressed `.o` cache. kaic2 writes
+# `<dir>/<hash>.o` and skips codegen on a hit, so pointing this at a persistent
+# directory makes an unchanged partition reuse its object across builds. Honours
+# KAI_NATIVE_MODULAR_CACHE_DIR, else the platform cache dir under `nmodular`.
+resolve_native_modular_cache_dir() {
+  if [ -n "${KAI_NATIVE_MODULAR_CACHE_DIR:-}" ]; then
+    printf '%s' "$KAI_NATIVE_MODULAR_CACHE_DIR"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/nmodular' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/nmodular' "$HOME" ;;
+    *)      printf '%s/.cache/kai/nmodular' "$HOME" ;;
+  esac
+}
+
 # First available content hasher; the command prints the digest as
 # field 1. Empty when none is found, which disables the .o cache.
 modular_hasher() {
@@ -1175,6 +1194,48 @@ compile_to_binary() {
     cache_proj_dir="${manifest_dir:-$src_dir}"
     mkdir -p "$cache_proj_dir/.kai-cache" 2>/dev/null || true
     user_cache_flag="--user-cache"
+  fi
+  if [ "$backend" = "native" ] && [ "${KAI_NATIVE_MODULAR:-0}" = "1" ]; then
+    # Native separate compilation. `kaic2 --emit=native-modular` partitions the
+    # whole-program KIR by module into one object per module (root + each mo),
+    # content-addressed under a per-project cache dir so an unchanged partition
+    # reuses its object across builds, and prints one object path per line. We
+    # link every object with the runtime owner (runtime_llvm.c) — the L1 model:
+    # one runtime TU, every generated object calls it extern. The frontend is
+    # whole-program; only the codegen + link fan out.
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      die "native-modular backend: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
+    fi
+    src_base="$(basename "$src")"
+    # Per-project object directory: a stable subdir of the cache root keyed by
+    # the entry file's absolute path, so kaic2's content-addressed objects
+    # persist across builds of THIS project without colliding with another's.
+    nm_abs="$(cd "$src_dir" && pwd)/$src_base"
+    nm_key="$(printf '%s' "$nm_abs" | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null || cksum; } | awk '{print $1}')"
+    nm_dir="$(resolve_native_modular_cache_dir)/$nm_key"
+    mkdir -p "$nm_dir" 2>/dev/null || nm_dir="$tmp"
+    cp "$src" "$nm_dir/$src_base"
+    nmerr="$tmp/native-modular.err"
+    # shellcheck disable=SC2086
+    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr"; then
+      cat "$nmerr" >&2
+      exit 1
+    fi
+    # The compiler prints one object path per line. Empty = a codegen failure it
+    # already reported.
+    if [ ! -s "$tmp/native-modular.objs" ]; then
+      cat "$nmerr" >&2
+      die "native-modular backend: no objects produced"
+    fi
+    nm_ldstack=""
+    [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
+    # Link every partition object + the runtime owner (one TU compiled here).
+    nm_objs="$(tr '\n' ' ' < "$tmp/native-modular.objs")"
+    # shellcheck disable=SC2086
+    if ! $CC $CFLAGS $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl; then
+      die "native-modular link failed"
+    fi
+    return 0
   fi
   if [ "$backend" = "native" ]; then
     # KIR Lane 1.5: the in-process libLLVM native backend is the default.
