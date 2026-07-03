@@ -124,7 +124,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/desugar.kai compiler/region.kai compiler/infer_index.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox.kai compiler/rawsafe.kai compiler/perceus.kai compiler/impl_index.kai compiler/protos.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_ffi_c.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -5494,6 +5494,36 @@ test-issue-963-cross-module-mono: $(TARGET) build
 	diff -q $$fx/main.out.expected build/issue_963_cross_module_mono.out > /dev/null \
 	  && echo "issue-963-cross-module-mono OK (default single-TU)" \
 	  || { echo "issue-963-cross-module-mono DIFF"; diff $$fx/main.out.expected build/issue_963_cross_module_mono.out; exit 1; }
+
+# `home_tu` per-case partition: one fixture whose c-modular split lands
+# each symbol in the TU `home_tu` names. Asserts every decl-to-TU case
+# from one stream — a root pub fn in main.c, a root private fn + main +
+# lambdas in __root__.c, an imported pub fn and its cross-module spec in
+# widget.c — then runs the whole-program build to pin the output. A shift
+# in any case (the empty-TU regression an over-broad `home_tu` causes)
+# fails an assertion; the run pins the partition link-correct.
+test-home-tu-partition: $(TARGET) build
+	@set -e; \
+	fx=../examples/multi-module/home-tu-partition; \
+	KAI_MODULAR=1 KAI_MODULAR_NO_CACHE=1 KAIKAI_STDLIB_PATH=$(STDLIB_ABS) \
+	  ./$(TARGET) --emit=c-modular --path ../stdlib --path $$fx $$fx/main.kai \
+	  2>/dev/null > build/home_tu_partition.stream; \
+	tu_of() { awk -v sym="$$1" '/^\/\/KAIFILE:.*\.c$$/{t=$$0;sub(/.*::/,"",t)} $$0 ~ sym && /\{$$/ {print t; exit}' build/home_tu_partition.stream; }; \
+	assert_tu() { got=$$(tu_of "$$2"); [ "$$got" = "$$3" ] \
+	  || { echo "home-tu FAIL: $$1 ($$2) in '$$got', want $$3"; exit 1; }; \
+	  echo "home-tu OK: $$1 -> $$3"; }; \
+	assert_tu "root pub fn"        "kai_main__badge"             "main.c"; \
+	assert_tu "root private fn"    "kai_helper"                  "__root__.c"; \
+	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
+	assert_tu "root lambda"        "_kai_lam_0"                  "__root__.c"; \
+	assert_tu "imported pub fn"    "kai_widget__label"           "widget.c"; \
+	assert_tu "cross-module spec"  "kai_widget__wrap__mono__Int" "widget.c"; \
+	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
+	./build/home_tu_partition > build/home_tu_partition.out; \
+	diff -q $$fx/main.out.expected build/home_tu_partition.out > /dev/null \
+	  && echo "test-home-tu-partition OK (6 cases + run)" \
+	  || { echo "home-tu DIFF"; diff $$fx/main.out.expected build/home_tu_partition.out; exit 1; }
 
 # Backend incremental lever — parallel cc + .o content-hash cache.
 # Drives bin/kai's KAI_MODULAR path (the parallel + cache wrapper, not the
