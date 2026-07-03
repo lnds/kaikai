@@ -75,14 +75,16 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # a known record, the field's slot is a compile-time constant (layout is
   # canonical, declaration order) → `kai_op_field_at` indexed load, skipping
   # the `kai_op_field` strcmp. Unknown / polymorphic base type keeps strcmp.
-  # Both keep the IDENTICAL RC contract: incref the read field, base
-  # disposition unchanged.
+  # The read increfs the field; the base arrives OWNED (perceus dups non-last
+  # reads, transfers single-use, ctors return rc=1) and is no longer reachable
+  # through the result, so drop it to balance — the C oracle's `kai_decref(_b)`
+  # after the field load.
   EField(base, fname) -> {
     let rb = lower_expr(base, st)
     match rb { LRes(bv, st1) ->
       match field_index_of(st1.recs, base.ty, fname) {
-        Some(n) -> bind_op(st1, KPrim("kai_op_field_at", [bv, KIntV(n)]), kpos_of(x))
-        None    -> bind_op(st1, KPrim("kai_op_field", [bv, KStrV(fname)]), kpos_of(x))
+        Some(n) -> lower_field_read(st1, KPrim("kai_op_field_at", [bv, KIntV(n)]), bv, kpos_of(x))
+        None    -> lower_field_read(st1, KPrim("kai_op_field", [bv, KStrV(fname)]), bv, kpos_of(x))
       } }
   }
 
@@ -635,11 +637,57 @@ fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes /
   let snap = st.renames
   let lsnap = st.locals
   let st1 = lower_stmts(stmts, st)
+  # Invariant: every heap-allocated value bound to a dead `let` is decref'd
+  # at scope exit — records, variants, lists, call results alike. Mirrors
+  # the C oracle's `block_unused_lets` drops (boxed bindings only; a raw
+  # scalar carries no rc).
+  let st2 = lower_block_exit_drops(stmts, tail, st1)
   match tail {
-    Some(e) -> match lower_expr(e, st1) { LRes(v, st2) -> LRes(v, ls_set_locals(ls_set_renames(st2, snap), lsnap)) }
-    None    -> LRes(KUnitV, ls_set_locals(ls_set_renames(st1, snap), lsnap))
+    Some(e) -> match lower_expr(e, st2) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
+    None    -> LRes(KUnitV, ls_set_locals(ls_set_renames(st2, snap), lsnap))
   }
 }
+
+# Emit a `KDrop` for each dead `let`-binding whose RHS is a fresh boxed
+# allocation. Same set the C emitter drops (`block_unused_lets`), minus the
+# raw-scalar bindings (an `MUnboxed` rhs binds a raw register with no rc).
+fn lower_block_exit_drops(stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LowerSt / Console =
+  lb_exit_drops_loop(block_unused_lets(stmts, tail), stmts, st)
+
+fn lb_exit_drops_loop(names: [String], stmts: [Stmt], st: LowerSt) : LowerSt / Console = match names {
+  [] -> st
+  [nm, ...rest] ->
+    if lb_binding_is_boxed(stmts, nm) {
+      let reg = match ls_lookup_rename(st, nm) { Some(r) -> r None -> nm }
+      lb_exit_drops_loop(rest, stmts, ls_emit(st, KRC(KDrop(KVar(reg)), KNoPos)))
+    } else {
+      lb_exit_drops_loop(rest, stmts, st)
+    }
+}
+
+# True when `nm` is bound by a `let nm = <boxed rhs>` in `stmts`. A raw
+# binding (`raw_let_slot` = Some, the `SReal`/`SBool`/`SInt64` register)
+# carries no rc — dropping it would decref a non-pointer.
+fn lb_binding_is_boxed(stmts: [Stmt], nm: String) : Bool = match stmts {
+  [] -> false
+  [s, ...rest] -> match s {
+    SLet(pat, _, rhs) -> match pat.pkind {
+      PBind(bn) -> if bn == nm {
+                     match raw_let_slot(pat, rhs) { Some(_) -> false None -> true }
+                   } else { lb_binding_is_boxed(rest, nm) }
+      _         -> lb_binding_is_boxed(rest, nm)
+    }
+    _ -> lb_binding_is_boxed(rest, nm)
+  }
+}
+
+# Bind the field-read op to a fresh register (captures the incref'd field
+# BEFORE the base is dropped), then drop the owned base — mirror of the C
+# oracle's `_f = kai_op_field_at(_b, n); kai_decref(_b)`.
+fn lower_field_read(st: LowerSt, op: KOp, base: KVal, pos: KPos) : LRes / Console =
+  match bind_op(st, op, pos) {
+    LRes(fv, st1) -> LRes(fv, ls_emit(st1, KRC(KDrop(base), pos)))
+  }
 
 fn lower_stmts(stmts: [Stmt], st: LowerSt) : LowerSt / Console = match stmts {
   [] -> st
