@@ -47,78 +47,80 @@ import compiler.emit_native_test
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
 # failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
 # `--emit=native`.
+#
+# Whole-program is the root-role emission over the full fn list: it defines
+# every fn and owns every whole-program singleton. The modular backend
+# (`emit_native_modular`) reuses `nemit_build_module` with a leaf role to
+# project a partition into its own object, so the shape stays single-sourced.
 pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [EVar],
                            fns: [EFn], bmode: BuildMode, out_path: String,
                            src_path: String) : Int / Console = {
   let m = llvm_module_new("kai_native")
-  # ALL backend state (module, builder, types, fn, reg/block tables) lives
-  # in the C-side `ctx` reached through this opaque Handle — no handle
-  # ever enters a kaikai record/list (would RC-corrupt under kaic1).
   let ctx = native_ctx_new(m)
-  # DWARF (#500): build the DIBuilder + DIFile + compile unit from the
-  # source path. A no-op unless KAI_BUILD_MODE=debug (gated in C), so a
-  # release/default build is byte-identical. Once enabled, the per-fn walk
-  # opens a DISubprogram and each statement sets its source line.
-  ndi_enable(ctx, src_path)
-  # In --debug, emit the `__kai_build_debug = 1` marker so a panic resolves
-  # its backtrace to .kai:line at runtime. A no-op in release/default.
-  ndi_debug_marker(ctx)
-  # Register the per-fn evidence-frame ABI into the ctx, keyed by emitted
-  # symbol, so signature / call / perform resolve the same slots without
-  # threading.
-  nframes_register(ctx, build_evidence_frames(decls))
-  # In test/bench mode the synthetic driver (`nemit_build_runner_driver`)
-  # owns the `kai_main` symbol, so the user's placeholder `fn main` is
-  # dropped from the emit list — it would otherwise define a colliding
-  # `kai_main`. The runner body fns stay (they carry the block bodies).
-  let emit_fns = nfilter_user_main(kp.fns, bmode)
-  # Declare every user fn first (forward references), then walk each.
-  # `kp.handlers` threads the effect handler decls so a `KInstall`/
-  # `KPerform` resolves its op→clause-thunk map (effects subset 2a).
-  nemit_declare_fns(ctx, emit_fns)
-  # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one
-  # per default-block effect so `nemit_perform` resolves the op's field index
-  # for the builtin-dispatch path (the op fn-ptr itself is loaded at runtime
-  # from the Ev `kai_main_install_defaults` pushed). User handlers come
-  # first so a user `handle` shadows a same-effect default in scope.
-  #
-  # DISPATCH uses `synth_defaults` (the SUPERSET — every default-block
-  # effect, not just `install_order ∩ main_row`): the native backend emits
-  # a body for every fn, so a dead fn's `KPerform <eff>` for an effect main
-  # never installs (e.g. `today : Date / Clock` in a Clock-free program)
-  # still needs a synth handler for its field index, or `nemit_perform`
-  # aborts the build. The actual handler resolves from the evidence stack at
-  # runtime — the C-direct oracle never aborts and null-derefs only if the
-  # dead fn runs (it does not). INSTALL/teardown below stay on `kp.defaults`
-  # (the LIFO-balanced push/pop set).
-  let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.synth_defaults))
-  # Mint the `_kai_default_ev_<eff>` / `_kai_default_node_<eff>` globals over
-  # the SUPERSET (every default-block effect) BEFORE the fn bodies, so a call
-  # site's `llvm_get_named_global` resolves the node it supplies a default slot
-  # with — and a dead-code path's reference still links.
-  nemit_declare_default_globals(ctx, kp.synth_defaults)
-  # `all_fns` (the stable P3 call-site lookup table) stays the full list;
-  # only the walk cursor / thunk list drop the user `main`.
-  nemit_walk_fns(ctx, emit_fns, all_handlers, kp.fns)
-  # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
-  # passed as a first-class value (a `KClosure` over a named fn references
-  # this symbol). The KIR does NOT model these — they are synthetic, like
-  # the C-direct emitter's `emit_fn_thunk`.
-  nemit_fn_thunks(ctx, emit_fns)
-  native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns)
-  # In test/bench mode, emit the synthetic `kai_main` driver that runs
-  # the lowered runner bodies through the runtime helpers and exits with
-  # the summary code (build mode emits nothing — the user's `fn main`
-  # already carries the `kai_main` symbol).
-  nemit_build_runner_driver(ctx, kp.runners, bmode)
-  # Resolve DWARF temporaries before verify (an unfinalized DIBuilder leaves
-  # forward-ref placeholders the verifier rejects). A no-op when DI is off.
-  ndi_finalize(ctx)
+  nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path,
+                     nfilter_user_main(kp.fns, bmode), kp.fns, NModWhole)
   if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
   else {
     eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
     1
   }
+}
+
+# Populate one LLVM module: register the evidence-frame ABI, DECLARE every
+# program fn (`all_fns`, so a cross-TU call forward-references its callee's
+# signature), then DEFINE only `define_fns` (the walk). A root TU additionally
+# mints the whole-program singletons; a leaf declares the default globals as
+# externals so its `perform` sites resolve the node the root defines.
+#
+# The per-module artefact is a PROJECTION of the whole-program computation:
+# `all_fns` / `kp` are the SAME whole-program tables every TU sees, so the
+# emitted signatures agree across objects by construction — no serialised ABI
+# to drift.
+pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [EVar],
+                          fns: [EFn], bmode: BuildMode, src_path: String,
+                          define_fns: [KFn], all_fns: [KFn], role: NModRole) : Unit / Console = {
+  # DWARF (#500): a no-op unless KAI_BUILD_MODE=debug, so a release build is
+  # byte-identical.
+  ndi_enable(ctx, src_path)
+  ndi_debug_marker(ctx)
+  # Register the per-fn evidence-frame ABI, keyed by emitted symbol, so
+  # signature / call / perform resolve the same slots without threading.
+  nframes_register(ctx, build_evidence_frames(decls))
+  # Declare every program fn first (forward + cross-TU references).
+  nemit_declare_fns(ctx, all_fns)
+  # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one per
+  # default-block effect so `nemit_perform` resolves the op's field index.
+  # DISPATCH uses `synth_defaults` (the SUPERSET) because a dead fn's
+  # `KPerform` still needs a synth handler for its field index or the build
+  # aborts; the actual handler resolves from the evidence stack at runtime.
+  let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.synth_defaults))
+  # The default-evidence globals: the owner DEFINES them, a leaf declares them
+  # as an external so its `perform` site resolves the node the owner supplies.
+  # Whole-program keeps internal linkage; modular root uses external so the
+  # definition is visible across objects. `llvm_get_named_global` in the walk
+  # finds every shape.
+  nemit_declare_default_globals_for(ctx, kp.synth_defaults, role)
+  # Walk only this TU's fns; `all_fns` stays the stable P3 call-site lookup.
+  nemit_walk_fns(ctx, define_fns, all_handlers, all_fns)
+  # The whole-program singletons live in exactly one TU (the owner, which also
+  # owns the runtime): the fn thunks, the proto impl-table init, the default
+  # install/teardown, and the synthetic `kai_main` runner driver. A leaf emits
+  # none of them. The `else ()` is load-bearing: kaic1 (which compiles stage2)
+  # runs a bodied `if` WITHOUT an else unconditionally, so an if-expression is
+  # the only form that actually gates the block.
+  # The owner emits the fn thunks over EVERY program fn, not just its own: a
+  # `KClosure` over `char.to_lower` in the `string` module references
+  # `_kai_char__to_lower_thunk`, so all thunks must live in one TU (the owner)
+  # for every module's closure to resolve one definition. Whole-program passes
+  # its own `define_fns` (== the emit set) so its byte shape is unchanged.
+  let thunk_fns = match role { NModRoot -> all_fns _ -> define_fns }
+  let _s = if nmod_owns_singletons(role) {
+    nemit_fn_thunks(ctx, thunk_fns)
+    native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns)
+    nemit_build_runner_driver(ctx, kp.runners, bmode)
+  } else { () }
+  # Resolve DWARF temporaries before verify (a no-op when DI is off).
+  ndi_finalize(ctx)
 }
 
 # Replay the AST-derived evidence-frame table into the ctx, one slot per
