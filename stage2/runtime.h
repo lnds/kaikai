@@ -13521,6 +13521,29 @@ static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
     return (void *) g;
 }
 
+/* Modular backend: the default-evidence globals cross object boundaries, so
+ * the owner TU defines them EXTERNAL (zero-init, cross-TU visible) and every
+ * other TU declares them EXTERNAL with no initializer. Same shape as
+ * `add_global_zeroed` but external linkage — the single-TU path keeps
+ * internal linkage so its byte-id is untouched. */
+static void *kai_llvm_add_global_extern_def(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetInitializer(g, LLVMConstNull((LLVMTypeRef) ty));
+    LLVMSetLinkage(g, LLVMExternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
+/* A leaf TU's external DECLARATION of an owner-defined global: no initializer
+ * (LLVM reads that as an external declaration) so the definition stays unique
+ * to the owner and the link resolves the reference across objects. */
+static void *kai_llvm_add_global_extern_decl(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetLinkage(g, LLVMExternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
 /* (The `i32 variant_tag` reader the emitted object calls for a `KTagOf`
  * — `kaix_variant_tag_of` — is a RUNTIME symbol in stage0/runtime_llvm.c
  * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
@@ -13853,7 +13876,7 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
  * using the host target machine. Returns 0 on success, non-zero on a
  * verify or codegen failure (the driver surfaces the error and aborts).
  * One process: no `.ll` text, no `clang` subprocess. */
-static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
+static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runtime) {
     const char *out = path->as.s.bytes;
     int64_t rc = 0;
     char *err = NULL;
@@ -13904,8 +13927,14 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
      * `kaix_*` bodies and inlines them (no-op when KAI_NATIVE_RUNTIME_BC is
      * unset — the legacy cc-links-runtime_llvm.c path). Runs after the
      * triple/datalayout are set (they must match the bitcode's) and before
-     * the pipeline. A real link failure aborts before EmitToFile. */
-    if (kai_llvm_link_runtime_bc(m)) {
+     * the pipeline. A real link failure aborts before EmitToFile.
+     *
+     * The modular backend passes `link_runtime = 0`: each per-module object is
+     * a separate TU, so bitcode-merge-then-internalise would both duplicate
+     * the runtime in every object AND strip the external linkage a cross-TU
+     * call depends on. Modular links the runtime as one owner TU
+     * (runtime_llvm.c) at the final `cc` step — the L1 runtime-owner model. */
+    if (link_runtime && kai_llvm_link_runtime_bc(m)) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
         if (path) kai_decref(path);
@@ -13933,6 +13962,19 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
     LLVMDisposeMessage(triple);
     if (path) kai_decref(path);
     return rc;
+}
+
+/* Whole-program object: merge the runtime bitcode + internalise so O2 inlines
+ * the `kaix_*` bodies. The default single-TU native path. */
+static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
+    return kai_llvm_emit_object_impl(m, path, 1);
+}
+
+/* One partition of a modular build: no runtime-bitcode merge, no internalise —
+ * cross-TU symbols keep external linkage and the runtime is one owner TU at
+ * link time. O2 still optimises this object's own bodies. */
+static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) {
+    return kai_llvm_emit_object_impl(m, path, 0);
 }
 #else /* !KAI_LLVM */
 /* Default / bootstrap build: libLLVM is not linked, so the C-API
@@ -14037,6 +14079,8 @@ static void *kai_llvm_const_null(void *t) { (void) t; return kai_llvm_native_una
 static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_add_global_zeroed(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_extern_def(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_extern_decl(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_alloca_entry(void *c, void *t, KaiValue *nm) { (void) c; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
@@ -14051,6 +14095,7 @@ static KaiValue *kai_llvm_add_case(void *sw, void *on, void *bb) { (void) sw; (v
 static KaiValue *kai_llvm_build_unreachable(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
 /* DWARF DI stubs (#500): unreachable on the C-only path (the native walk
  * that calls them never runs), so they just satisfy the link. */
 static KaiValue *kai_native_di_enable(void *c, KaiValue *f, KaiValue *d) { (void) c; (void) f; (void) d; kai_llvm_native_unavailable(); return kai_unit(); }

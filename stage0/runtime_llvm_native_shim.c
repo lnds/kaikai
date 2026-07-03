@@ -33,6 +33,8 @@ KaiValue * kaix_prelude_llvm_add_byval_decl(void *m, void *fn, int64_t param_ix,
 KaiValue * kaix_prelude_llvm_add_case(void *sw, void *onval, void *bb) { return kai_llvm_add_case(sw, onval, bb); }
 void * kaix_prelude_llvm_add_function(void *m, KaiValue *name, void *fnty) { return kai_llvm_add_function(m, name, fnty); }
 void * kaix_prelude_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) { return kai_llvm_add_global_zeroed(m, ty, name); }
+void * kaix_prelude_llvm_add_global_extern_def(void *m, void *ty, KaiValue *name) { return kai_llvm_add_global_extern_def(m, ty, name); }
+void * kaix_prelude_llvm_add_global_extern_decl(void *m, void *ty, KaiValue *name) { return kai_llvm_add_global_extern_decl(m, ty, name); }
 KaiValue * kaix_prelude_llvm_add_sret_call(void *m, void *call, void *sty) { return kai_llvm_add_sret_call(m, call, sty); }
 KaiValue * kaix_prelude_llvm_add_sret_decl(void *m, void *fn, void *sty) { return kai_llvm_add_sret_decl(m, fn, sty); }
 void * kaix_prelude_llvm_append_block(void *m, void *fn, KaiValue *name) { return kai_llvm_append_block(m, fn, name); }
@@ -77,6 +79,7 @@ void * kaix_prelude_llvm_const_int(void *i64ty, int64_t v) { return kai_llvm_con
 void * kaix_prelude_llvm_const_null(void *ptr_t) { return kai_llvm_const_null(ptr_t); }
 void * kaix_prelude_llvm_const_real(void *f64ty, double d) { return kai_llvm_const_real(f64ty, d); }
 int64_t kaix_prelude_llvm_emit_object(void *m, KaiValue *path) { return kai_llvm_emit_object(m, path); }
+int64_t kaix_prelude_llvm_emit_object_raw(void *m, KaiValue *path) { return kai_llvm_emit_object_raw(m, path); }
 void * kaix_prelude_llvm_float_type(void *m) { return kai_llvm_float_type(m); }
 void * kaix_prelude_llvm_fn_type_0(void *ret) { return kai_llvm_fn_type_0(ret); }
 void * kaix_prelude_llvm_fn_type_boxed(void *ptr_t, int64_t n) { return kai_llvm_fn_type_boxed(ptr_t, n); }
