@@ -386,6 +386,75 @@ fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
   }
 }
 
+# Largest `Int` magnitude, as a digit string, for the overflow check
+# on decimal literals: 2^63 - 1.
+fn i64_max_digits() : String = "9223372036854775807"
+
+# True when a decimal literal span's magnitude exceeds `Int` range, so
+# `decode_int` would wrap it silently. Only decimal spans are checked
+# (hex/bin carry a `0x`/`0b` prefix and a bit-pattern intent); `_`
+# separators are ignored. Magnitude comparison is done on the digit
+# strings so it never itself overflows.
+fn int_lit_overflows(span: String) : Bool = {
+  let digits = strip_int_lit_digits(span, 0, string_length(span), "")
+  if has_base_prefix(span) { false }
+  else { mag_gt(digits, i64_max_digits()) }
+}
+
+fn has_base_prefix(span: String) : Bool =
+  match char_at(span, 0) {
+    Some('0') -> match char_at(span, 1) {
+      Some(c) -> c == 'x' or c == 'X' or c == 'b' or c == 'B'
+      None    -> false
+    }
+    _ -> false
+  }
+
+# Collect the decimal digits of a span, dropping `_` separators and any
+# leading zeros (so the length compare in `mag_gt` is on significant
+# digits only).
+fn strip_int_lit_digits(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { if string_length(acc) == 0 { "0" } else { acc } }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) ->
+        if c == '_' { strip_int_lit_digits(s, i + 1, n, acc) }
+        else if c == '0' and string_length(acc) == 0 {
+          strip_int_lit_digits(s, i + 1, n, acc)
+        }
+        else if ch_is_digit(c) { strip_int_lit_digits(s, i + 1, n, string_concat(acc, "#{c}")) }
+        else { acc }
+    }
+  }
+
+# `a > b` for two significant-digit magnitude strings: longer wins, else
+# lexicographic (digit strings of equal length order like the numbers).
+fn mag_gt(a: String, b: String) : Bool = {
+  let la = string_length(a)
+  let lb = string_length(b)
+  if la != lb { la > lb } else { string_gt(a, b) }
+}
+
+fn string_gt(a: String, b: String) : Bool = string_cmp(a, b) > 0
+
+fn string_cmp(a: String, b: String) : Int = string_cmp_loop(a, b, 0, string_length(a))
+
+fn string_cmp_loop(a: String, b: String, i: Int, n: Int) : Int =
+  if i >= n { 0 }
+  else {
+    match char_at(a, i) {
+      None -> 0
+      Some(ca) -> match char_at(b, i) {
+        None -> 1
+        Some(cb) ->
+          if char_to_int(ca) < char_to_int(cb) { 0 - 1 }
+          else if char_to_int(ca) > char_to_int(cb) { 1 }
+          else { string_cmp_loop(a, b, i + 1, n) }
+      }
+    }
+  }
+
 #[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
 pub fn decode_int(span: String) : Int {
   let n = string_length(span)
@@ -1500,8 +1569,13 @@ fn parse_primary(p: Parser) : PExpr / Console {
   match t.kind {
     TkInt -> {
       let span = tok_source(p.src, t)
-      let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
-      try_lit_unit_annotation(p_advance(p), lit, t)
+      if int_lit_overflows(span) {
+        err_e(p_error(p_advance(p), t,
+          "integer literal out of Int range; use a BigInt literal #{span}n or bigint.from_string"))
+      } else {
+        let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
+        try_lit_unit_annotation(p_advance(p), lit, t)
+      }
     }
     TkReal -> {
       let span = tok_source(p.src, t)
