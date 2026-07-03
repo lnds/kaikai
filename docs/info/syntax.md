@@ -387,10 +387,11 @@ crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
 `BigInt` (`stdlib/math/bigint.kai`) is an arbitrary-precision signed
 integer — pure kaikai, no external dependency. It is an opt-in stdlib
 type, so reach for it with `import math.bigint`. The `n` literal suffix
-is sugar for `bigint.from_int`: `99n` builds the `BigInt` `99`. The
-suffix only covers `Int`-range literals (the lexer decodes the digits
-as a 64-bit value first); for values beyond `Int`, build from a string
-with `bigint.from_string("123…")`.
+builds a `BigInt` from the digits directly: `99n` is `99`, and the
+suffix folds the digit string exactly, so literals of any magnitude
+work — `340282366920938463463374607431768211456n` is the exact value,
+not a wrapped one. (A plain `Int` literal past `Int` range is a
+compile-time error that points you here.)
 
 ```kaikai
 import math.bigint
@@ -401,10 +402,8 @@ fn main() : Unit / Stdout = {
   let a = 1000000007n                          # `n` suffix → BigInt
   let sq = bigint.mul(a, a)                    # exact, even past 2^64
   Stdout.print(show(sq))                       # Show renders decimal
-  match bc.from_string("340282366920938463463374607431768211456") {
-    Some(big) -> Stdout.print(bc.to_string(bigint.add(big, a)))
-    None      -> Stdout.print("parse error")
-  }
+  let big = 340282366920938463463374607431768211456n   # past i64, exact
+  Stdout.print(bc.to_string(bigint.add(big, a)))
 }
 ```
 
