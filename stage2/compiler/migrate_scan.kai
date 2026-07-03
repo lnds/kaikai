@@ -1,0 +1,143 @@
+# compiler/migrate_scan.kai — the migration report pass.
+#
+# A second stateless walk that mirrors migrate_walk's tree recursion
+# but, instead of rewriting, collects one report event per call the
+# rule set recognises: a rename (counted) or a `manual:` pointer. The
+# child lists are traversed with the `map` + `reduce` prelude prims,
+# not a local list-match, so an AST constructor's 2nd-field binder
+# (`ECall(_, args)` etc.) never feeds a bundle-local list-match — the
+# shape kaic1 miscompiles into a runtime non-exhaustive panic. This
+# separates "what changed" from "how it changed": the driver derives
+# the count and the manual lines from the returned event list.
+
+import compiler.ast
+import compiler.migrate_rules
+import compiler.migrate_walk
+
+#[doc("One migration report event: an automatic rename (counted), or a change that needs a human, pinned to its source pointer.")]
+pub type MigRep = MRRename | MRManual(MigrateManual)
+
+# Flatten a list of per-element report lists via the `reduce` prim,
+# which runs in the runtime — so no AST 2nd-field binder ever feeds a
+# bundle-local list-match, the shape kaic1 miscompiles. Callers map
+# their (typed) child list to `[[MigRep]]` with the generic `map` prim
+# first; `flatten_reps` is monomorphic because kaic1 does not support
+# type parameters on bundle functions.
+fn flatten_reps(xss: [[MigRep]]) : [MigRep] = reduce(xss, [], cat_reps)
+
+#[doc("Append two report-event lists — the reducer used to flatten per-element scans.")]
+pub fn cat_reps(acc: [MigRep], x: [MigRep]) : [MigRep] = list_append(acc, x)
+
+# --- report derivation ------------------------------------------------
+
+#[doc("The number of automatic rewrites in an event list.")]
+pub fn mig_count_renames(reps: [MigRep]) : Int = list_length(filter(reps, is_rename))
+
+fn is_rename(r: MigRep) : Bool = match r {
+  MRRename -> true
+  MRManual(_) -> false
+}
+
+#[doc("The `manual:` pointers in an event list, in source order.")]
+pub fn mig_manuals(reps: [MigRep]) : [MigrateManual] =
+  reduce(map(reps, rep_manual), [], cat_manuals)
+
+fn cat_manuals(acc: [MigrateManual], x: [MigrateManual]) : [MigrateManual] = list_append(acc, x)
+
+fn rep_manual(r: MigRep) : [MigrateManual] = match r {
+  MRRename -> []
+  MRManual(m) -> [m]
+}
+
+# --- scan pass: Expr -> [MigRep] --------------------------------------
+
+# Scan a callee for nested calls. For a module-qualified head
+# (`EField(EVar(mod), m)`) this reduces to scanning `EVar`, which
+# yields no events, so it never double-counts the head that
+# `scan_call_head` already handled.
+fn scan_callee(callee: Expr) : [MigRep] = scan_expr(callee)
+
+# Report events for the call node itself (rename or manual), given the
+# already-computed arg count. The recursive scan of the arguments is
+# emitted by the ECall arm, so this handles only the head.
+fn scan_call_head(e: Expr, callee: Expr, argc: Int) : [MigRep] = match call_mod_method(callee) {
+  None -> []
+  Some(mm) -> scan_head_rule(e, mm, argc)
+}
+
+fn scan_head_rule(e: Expr, mm: Pair[String, String], argc: Int) : [MigRep] = match migrate_rule_for(mm.fst, mm.snd) {
+  Some(CR(_)) -> [MRRename]
+  None -> scan_head_manual(e, mm, argc)
+}
+
+fn scan_head_manual(e: Expr, mm: Pair[String, String], argc: Int) : [MigRep] =
+  match migrate_manual_for_call(mm.fst, mm.snd, argc, e.line, e.col) {
+    Some(man) -> [MRManual(man)]
+    None -> []
+  }
+
+#[doc("Collect the migration report events for one expression.")]
+pub fn scan_expr(e: Expr) : [MigRep] = match e.kind {
+  ECall(callee, cargs) ->
+    list_append(list_append(scan_call_head(e, callee, list_length(cargs)), scan_callee(callee)),
+                flatten_reps(map(cargs, scan_expr)))
+  EField(obj, _) -> scan_expr(obj)
+  EIndex(o, i) -> list_append(scan_expr(o), scan_expr(i))
+  EBinop(_, l, r) -> list_append(scan_expr(l), scan_expr(r))
+  EUnop(_, x) -> scan_expr(x)
+  EBang(x) -> scan_expr(x)
+  EPipe(l, r) -> list_append(scan_expr(l), scan_expr(r))
+  EMapPipe(l, r) -> list_append(scan_expr(l), scan_expr(r))
+  EFlatMapPipe(l, r) -> list_append(scan_expr(l), scan_expr(r))
+  EFilterPipe(l, r) -> list_append(scan_expr(l), scan_expr(r))
+  EIf(c, t, eo) -> list_append(list_append(scan_expr(c), scan_expr(t)), scan_opt(eo))
+  EMatch(scrut, arms) -> list_append(scan_expr(scrut), flatten_reps(map(arms, scan_arm)))
+  ELambda(_, body) -> scan_expr(body)
+  ERecordLit(_, fields) -> flatten_reps(map(fields, scan_field))
+  EList(elems) -> flatten_reps(map(elems, scan_elem))
+  ERange(lo, hi, step) -> list_append(list_append(scan_expr(lo), scan_expr(hi)), scan_opt(step))
+  EBlock(stmts, tail) -> list_append(flatten_reps(map(stmts, scan_stmt)), scan_opt(tail))
+  ELitUnit(inner, _) -> scan_expr(inner)
+  EIntrinsic(_, iargs) -> flatten_reps(map(iargs, scan_expr))
+  EHandle(body, _, _, io, _, cls, ro) ->
+    list_append(list_append(scan_expr(body), scan_opt(io)), list_append(flatten_reps(map(cls, scan_clause)), scan_hreturn(ro)))
+  _ -> []
+}
+
+# --- per-child scanners (map/flat_map prims iterate, no list-match) ----
+
+fn scan_opt(eo: Option[Expr]) : [MigRep] = match eo {
+  None -> []
+  Some(x) -> scan_expr(x)
+}
+
+fn scan_arm(a: Arm) : [MigRep] = match a {
+  Arm(_, g, body) -> list_append(scan_opt(g), scan_expr(body))
+}
+
+fn scan_field(fi: FieldInit) : [MigRep] = match fi {
+  FI(_, x) -> scan_expr(x)
+}
+
+fn scan_elem(el: ListElem) : [MigRep] = match el {
+  ElPlain(x) -> scan_expr(x)
+  ElSpread(x) -> scan_expr(x)
+}
+
+fn scan_stmt(s: Stmt) : [MigRep] = match s {
+  SLet(_, _, x) -> scan_expr(x)
+  SExprStmt(x) -> scan_expr(x)
+  SVar(_, _, x, _, _) -> scan_expr(x)
+  SAssert(x, mo) -> list_append(scan_expr(x), scan_opt(mo))
+  SIndexAssign(a, i, v, _, _) -> list_append(list_append(scan_expr(a), scan_expr(i)), scan_expr(v))
+  SUse(_, _, _) -> []
+}
+
+fn scan_clause(c: HClause) : [MigRep] = match c {
+  HC(_, _, b, _, _) -> scan_expr(b)
+}
+
+fn scan_hreturn(ro: Option[HReturn]) : [MigRep] = match ro {
+  None -> []
+  Some(HR(_, b, _, _)) -> scan_expr(b)
+}

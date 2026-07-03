@@ -107,7 +107,7 @@ needed and the version increments per Conventional Commits
 |----------|-------------|-----------------|------------------------------------------------------------------------------|
 | Tongariki | pre-2026-05-15 | v0.x series through v0.68.x | The pre-Hanga-Roa phase. Rapid iteration on internals; user surface stabilising. Closed when `EDITION` flipped to `hanga-roa` on 2026-05-16. |
 | **Hanga Roa** | **2026-05-16 (default)** | v0.69.0+ (HEAD v0.79.0) | First public-target edition. Ships: Phase A.0 precompiled stdlib cache (≤300 ms tiny cold compile, #452); package-mode workflow with edition dispatch (#603); HTTP client + server-side helpers + automatic redirect-following (#605, #357); full reactor — NetTcp + file + sleep + process + stdin all park the fiber, never the OS thread (#611, #620, #630); convention-based pipe dispatch (`|` against downstream `Stream`, `Repository`, etc., #594); constructor overloading at use sites — local declarations shadow prelude names (#644); pure named functions auto-generalize over effect rows (#645); private prelude types no longer leak into user scope (#643, #647, #648); `#unstable` annotation for surface excluded from the edition contract (#602); the `tier1-backend-parity` CI gate enforcing C/LLVM equivalence on every fixture (#575); `kai lsp` v1 → v3 (hover, goto-def, publishDiagnostics, documentSymbol, completion, signatureHelp, hole warnings; #447, v0.75.0 → v0.79.0); `--diags-json` / `--effects-json` / `--library-mode` / `--effect-holes-json` flags on `kai build`. |
-| Orongo | post-Hanga-Roa | **1.0.0** (TBD) | The 1.0 edition. **Most of the originally-deferred Orongo scope already shipped inside Hanga Roa** and is listed below for the record; what actually gates the 1.0 cut is the *Remaining* set. **Shipped:** Phase A.1/A.2/B/L5 cache layers (#461, #455, #499); advanced FFI struct-by-value, both backends (#1030 native + the earlier C path — verified against a clang callee); numeric primitives BigInt/Rational/Decimal/Float32/Int32/UInt32/UInt64/Int128 (#514); LLVM direct emit, static libLLVM, no clang shell-out (#497, #498); native self-host — the native backend compiles itself (#1021); timeout-bounded `Actor.receive` (#638); NetDns + NetUdp (#352); m14 qualified-call migration (#614); `kaic2-fast` incremental dev rebuild (#1029). **Remaining (the real 1.0 gates):** `kai migrate` automated edition migration (does not exist yet — load-bearing for the "never dread upgrading" edition contract); separate/modular compilation for user programs (#963/#989, in progress — L1 #1033 shipped); a compilation daemon (partially covered by `kaic2-fast`); near-C perf on structural workloads (ongoing tuning, `docs/native-codegen-perf-plan.md`); and the deliberate act of pinning the 1.0 surface + flipping `EDITION` to `orongo`. |
+| Orongo | post-Hanga-Roa | **1.0.0** (TBD) | The 1.0 edition. **Most of the originally-deferred Orongo scope already shipped inside Hanga Roa** and is listed below for the record; what actually gates the 1.0 cut is the *Remaining* set. **Shipped:** Phase A.1/A.2/B/L5 cache layers (#461, #455, #499); advanced FFI struct-by-value, both backends (#1030 native + the earlier C path — verified against a clang callee); numeric primitives BigInt/Rational/Decimal/Float32/Int32/UInt32/UInt64/Int128 (#514); LLVM direct emit, static libLLVM, no clang shell-out (#497, #498); native self-host — the native backend compiles itself (#1021); timeout-bounded `Actor.receive` (#638); NetDns + NetUdp (#352); m14 qualified-call migration (#614); `kaic2-fast` incremental dev rebuild (#1029). **Remaining (the real 1.0 gates):** `kai migrate` automated edition migration (machinery **shipped** #1047 — parse → AST rewrite → emit, idempotent, dry-run default, `manual:` reporting, seeded with the #1015 rename rule; the full rule set expands with the Orongo surface-pin); separate/modular compilation for user programs (#963/#989, in progress — L1 #1033 shipped); a compilation daemon (partially covered by `kaic2-fast`); near-C perf on structural workloads (ongoing tuning, `docs/native-codegen-perf-plan.md`); and the deliberate act of pinning the 1.0 surface + flipping `EDITION` to `orongo`. |
 
 The current edition name is in the `EDITION` file at repo root.
 This table is updated when an edition transitions; the historical
@@ -235,11 +235,15 @@ toolchain ships migration help:
 
 - **Release notes** list every breaking change with before/after
   examples.
-- **`kai migrate --from <old> --to <new>`** is the goal: a
-  command that rewrites source from one edition to the next where
-  the change is mechanical (renames, signature shifts, syntax
-  desugars). Non-mechanical changes get diagnostics asking the
-  user to fix them manually.
+- **`kai migrate --from <old> --to <new>`** rewrites source from
+  one edition to the next where the change is mechanical (renames,
+  signature shifts, syntax desugars). It is an AST rewrite through
+  the parser + the formatter — never a textual pass — so it does
+  not corrupt code and never emits source that fails to parse.
+  Dry-run by default (prints the migrated source, writes nothing);
+  `--write` applies it in place, and a second `--write` run is a
+  byte-stable no-op. Non-mechanical changes are reported as
+  `manual: <line>:<col> — …` pointers, not silently dropped.
 - **Deprecation warnings** appear in the older edition where
   possible, pointing at the future change. A user staying on the
   older edition keeps compiling; they get a heads-up about what
@@ -249,6 +253,16 @@ The principle: a user planning to upgrade can read the release
 notes, run `kai migrate`, and have a working build. Worst case,
 the migration leaves diagnostics that explain what to fix. We
 never silently change behaviour.
+
+> **v1 status (2026-07-03):** `kai migrate` is **shipped** (issue
+> #1047). The machinery (parse → AST rewrite → emit) and its safety
+> invariants (idempotent, never emits non-parsing source, dry-run
+> default, `manual:` reporting) are live. The Hanga Roa → Orongo
+> rule set is seeded with the #1015 uniform-construction rename
+> (`map`/`hashmap`.`from_pairs` and `set`/`hashset`.`from_list` →
+> `.from`); the full rule
+> set expands as the Orongo surface is pinned — that surface-pin is
+> a separate 1.0 gate.
 
 ## What is NOT an edition
 

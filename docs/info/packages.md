@@ -18,6 +18,7 @@ kai add <source>[@<ref>]          # add a dep
 kai install                       # resolve + lock
 kai update [<name>]               # refresh deps
 kai show                          # dump parsed manifest
+kai migrate [<file>] [--write]    # migrate source across an edition bump
 ```
 
 ## Manifest
@@ -32,6 +33,30 @@ entry = "main.kai"                # optional; defaults to main.kai
 jsonlib = { git = "https://github.com/x/jsonlib", tag = "v1.2.0" }
 utilslib = { path = "../utilslib" }
 ```
+
+## Migrating across an edition
+
+An edition bump can change the language surface (renames, signature
+shifts). `kai migrate` rewrites a package's source from one edition's
+surface to the next, applying each mechanical change. It parses, walks
+the AST, and re-emits through the formatter — never a textual pass —
+so it does not corrupt code, and it never emits source that fails to
+parse.
+
+```text
+kai migrate src/main.kai            # dry-run: print migrated source, write nothing
+kai migrate --write src/main.kai    # apply the rewrite in place
+kai migrate --from hanga-roa --to orongo src/main.kai
+```
+
+- **Dry-run by default** — prints the migrated source to stdout and
+  touches no files. Pass `--write` to rewrite in place. Running
+  `--write` twice is a byte-stable no-op (idempotent).
+- **Editions default** to the package/repo edition as `--from` and its
+  successor as `--to`. Today only `hanga-roa -> orongo` has a rule set.
+- **Un-migratable changes are reported, not dropped** — a change with
+  no automatic rule prints a `manual: <line>:<col> — …` pointer to
+  stderr so you fix it by hand.
 
 ## Imports
 

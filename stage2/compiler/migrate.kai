@@ -1,0 +1,68 @@
+# compiler/migrate.kai — `kai migrate` entry point.
+#
+# migrate is a source-preserving, idempotent AST rewrite: parse the
+# package, rename every edition-broken surface form the rule set
+# knows, and re-emit through the fmt-writer. It never emits source
+# that does not parse — the driver reparses the output before writing
+# and aborts on failure. Changes the rule set cannot make safely are
+# reported as `manual:` pointers, never silently dropped.
+#
+# Two stateless passes over the top-level decls: `migrate_decls`
+# rewrites every body expression; `migrate_scan_decls` collects the
+# report. Both delegate the per-expression walk to migrate_walk /
+# migrate_scan and return plain lists.
+
+import compiler.ast
+import compiler.migrate_rules
+import compiler.migrate_walk
+import compiler.migrate_scan
+
+# --- rewrite pass over decls ------------------------------------------
+
+#[doc("Rewrite every expression body in a parsed program under the active rule set. Declarations with no expression body pass through unchanged.")]
+pub fn migrate_decls(decls: [Decl]) : [Decl] = map(decls, mig_decl)
+
+fn mig_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> DFn(p, n, tp, ps, rt, row, mig_expr(body), l, c, mo)
+  DTest(desc, body, l, c) -> DTest(desc, mig_expr(body), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, mig_expr(body), l, c)
+  DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, mig_expr(body), l, c)
+  DConst(p, n, t, body, mo, l, c) -> DConst(p, n, t, mig_expr(body), mo, l, c)
+  DImpl(pn, ta, tgt, ds, l, c) -> DImpl(pn, ta, tgt, migrate_decls(ds), l, c)
+  DDerive(prots, inner, l, c) -> DDerive(prots, mig_decl(inner), l, c)
+  DUnstable(inner, l, c) -> DUnstable(mig_decl(inner), l, c)
+  DDoc(raw, txt, inner, l, c) -> DDoc(raw, txt, mig_decl(inner), l, c)
+  _ -> d
+}
+
+# --- report pass over decls -------------------------------------------
+
+#[doc("Collect the migration report events across a whole program.")]
+pub fn migrate_scan_decls(decls: [Decl]) : [MigRep] = reduce(map(decls, scan_decl), [], cat_reps)
+
+fn scan_decl(d: Decl) : [MigRep] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> scan_expr(body)
+  DTest(_, body, _, _) -> scan_expr(body)
+  DBench(_, body, _, _) -> scan_expr(body)
+  DCheck(_, _, body, _, _) -> scan_expr(body)
+  DConst(_, _, _, body, _, _, _) -> scan_expr(body)
+  DImpl(_, _, _, ds, _, _) -> migrate_scan_decls(ds)
+  DDerive(_, inner, _, _) -> scan_decl(inner)
+  DUnstable(inner, _, _) -> scan_decl(inner)
+  DDoc(_, _, inner, _, _) -> scan_decl(inner)
+  _ -> []
+}
+
+# --- report rendering -------------------------------------------------
+
+#[doc("Render the `manual:` reports as one diagnostic block, one line per report, or the empty string when the rule set applied cleanly.")]
+pub fn migrate_manual_report(reps: [MigRep]) : String = match mig_manuals(reps) {
+  [] -> ""
+  ms -> "migrate: #{int_to_string(list_length(ms))} change(s) need manual attention:\n#{manual_lines(ms)}"
+}
+
+fn manual_lines(ms: [MigrateManual]) : String = match ms {
+  [] -> ""
+  [MM(l, c, msg)] -> "  manual: #{int_to_string(l)}:#{int_to_string(c)} — #{msg}\n"
+  [MM(l, c, msg), ...rest] -> "  manual: #{int_to_string(l)}:#{int_to_string(c)} — #{msg}\n#{manual_lines(rest)}"
+}

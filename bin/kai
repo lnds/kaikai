@@ -692,6 +692,8 @@ Commands:
                                 flags suspect-but-valid code. Warnings
                                 only — never blocks a build.
   fmt   [<spec>] [--check]      Pretty-print kaikai source canonically.
+  migrate [<file>] [--write]    Rewrite source across an edition bump
+                                (dry-run by default; --write applies).
   watch [<spec>]                Recompile + run on every save (live demo).
   init  <name>                  Create a kai.toml manifest in the cwd.
   add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
@@ -1048,6 +1050,37 @@ Examples:
   kai fmt stage2/compiler.kai
   kai fmt --check src/foo.kai && echo OK
   cat src/foo.kai | kai fmt --stdin > /tmp/foo-fmt.kai
+EOF
+}
+
+usage_migrate() {
+  cat <<EOF
+usage: kai migrate [--from <edition>] [--to <edition>] [--write] <file.kai>
+
+Rewrite a package's source from one edition's surface to the next,
+applying each mechanical breaking change the edition bump introduced
+(renames, signature shifts). It is an AST rewrite through the parser +
+the fmt-writer, so it never corrupts code: the output is reparsed
+before anything is written, and a change with no automatic rule is
+reported as 'manual: ...' rather than silently dropped.
+
+Safe by default — dry-run: the migrated source is printed to stdout and
+NO file is touched. Pass --write to rewrite the file in place. Running
+--write twice is a byte-stable no-op (idempotent).
+
+Editions default to the current edition (from kai.toml or EDITION) as
+--from and its successor as --to. Only hanga-roa -> orongo is supported.
+
+Options:
+  --from <edition>   Source edition (default: package/repo edition).
+  --to <edition>     Target edition (default: the successor edition).
+  --write            Apply the rewrite in place instead of dry-run.
+  -h, --help         Show this help.
+
+Examples:
+  kai migrate src/main.kai                 # dry-run: print migrated source
+  kai migrate --write src/main.kai         # apply in place
+  kai migrate --from hanga-roa --to orongo src/main.kai
 EOF
 }
 
@@ -2107,6 +2140,75 @@ cmd_fmt() {
   fi
 }
 
+# kai migrate — rewrite source from one edition's surface to the next.
+#
+# Dry-run by default (prints the migrated source to stdout, writes
+# nothing); --write applies the rewrite in place, matching cmd_fmt's
+# write-back. The compiler (kaic2 --migrate) does the AST rewrite and
+# the never-emit-non-parsing guard; this wrapper validates the edition
+# pair and owns the safe write-back. Only hanga-roa -> orongo has a
+# rule set; other pairs are refused before invoking the compiler.
+migrate_supported_pair() {
+  # $1 = from, $2 = to. Returns 0 only for the one supported migration.
+  [ "$1" = "hanga-roa" ] && [ "$2" = "orongo" ]
+}
+
+cmd_migrate() {
+  src=""; from_ed=""; to_ed=""; do_write=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)         usage_migrate; return 0 ;;
+      --from)            shift; from_ed="$1"; shift ;;
+      --from=*)          from_ed="${1#--from=}"; shift ;;
+      --to)              shift; to_ed="$1"; shift ;;
+      --to=*)            to_ed="${1#--to=}"; shift ;;
+      --write|--in-place) do_write=1; shift ;;
+      -*)                die "unknown flag: $1 (see 'kai migrate --help')" ;;
+      *)                 [ -z "$src" ] || die "only one input file supported"
+                         src="$1"; shift ;;
+    esac
+  done
+  ensure_built
+
+  # Default the edition pair: --from is the package/repo edition, --to
+  # is its successor. Today the only successor with a rule set is orongo.
+  [ -n "$from_ed" ] || from_ed="$(read_edition)"
+  [ -n "$to_ed" ] || to_ed="orongo"
+  if ! migrate_supported_pair "$from_ed" "$to_ed"; then
+    printf 'kai: error: no migration rules for %s -> %s\n' "$from_ed" "$to_ed" >&2
+    printf '  supported migrations: hanga-roa -> orongo\n' >&2
+    exit 1
+  fi
+
+  if [ -z "$src" ]; then
+    src="$(resolve_package_spec "" "migrating")"
+  else
+    case "$src" in
+      .|./*) src="$(resolve_package_spec "$src" "migrating")" ;;
+    esac
+  fi
+  [ -n "$src" ] || die "missing input file (see 'kai migrate --help')"
+  [ -f "$src" ] || die_file_not_found "$src" "migrate"
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  # kaic2 --migrate prints the migrated source to stdout and the
+  # 'manual:' report + change summary to stderr. The report reaches the
+  # user's terminal in both modes.
+  if "$KAIC2" --migrate "$src" > "$tmp/out.kai"; then
+    if [ -n "$do_write" ]; then
+      if ! cmp -s "$src" "$tmp/out.kai"; then
+        cat "$tmp/out.kai" > "$src"
+      fi
+    else
+      cat "$tmp/out.kai"
+    fi
+  else
+    cat "$tmp/out.kai" >&2 2>/dev/null || true
+    return 1
+  fi
+}
+
 # kai watch — recompile + run on every save.
 #
 # Two backends:
@@ -3092,6 +3194,7 @@ case "${1:-}" in
   check)     shift; cmd_check "$@" ;;
   lint)      shift; cmd_lint  "$@" ;;
   fmt)       shift; cmd_fmt   "$@" ;;
+  migrate)   shift; cmd_migrate "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
   init)      shift; cmd_init    "$@" ;;
   install)   shift; cmd_install "$@" ;;
