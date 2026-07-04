@@ -8,12 +8,12 @@ directions: (A) reinstate the diagonal gate, or (B) incref the reused child
 when shared.
 
 Shipped: a third, narrower cut of (B) — gate reuse RECOGNITION on a
-counted-owner scrutinee. (A) and (B)-as-written were both rejected on
-inspection; see below. The #1048 re-apply was attempted, verified green on its
-own fixture, and then WITHDRAWN: the drop surfaces a further, distinct
-under-count in the native reuse LOWERING (shared-donor consumed children —
-details below), so #1048 stays blocked on that named residual, no longer on
-this issue.
+counted-owner scrutinee — plus a second fix the #1048 re-apply forced into
+scope: the native lowering's shared-donor compensation had a coverage hole
+(details below), and re-applying the #1048 drop turned it from a silent leak
+into a live UAF. Both fixed, the #1048 scope-exit drops are re-applied and
+hold under ASAN-on-selfhost. (A) and (B)-as-written were rejected on
+inspection; see below.
 
 ## The actual mechanism, one level deeper than the issue
 
@@ -82,9 +82,10 @@ is the correctness.
 - ASAN-on-selfhost (the gate the bounded repros cannot replace), method as
   in the #1054 retro (runtime cc-compiled under
   `-fsanitize=address -DKAI_NO_CELL_POOL`, bitcode hidden, full self-compile):
-  - NATIVE: CLEAN with the fix (the `kaix_variant_reuse_at ← rqc_kind` UAF is
-    gone). With the #1048 drop re-applied on top it goes red again — on a
-    THIRD bug, not this one (see the shared-donor consumed-child finding).
+  - NATIVE: CLEAN with the recognition gate (the `kaix_variant_reuse_at ←
+    rqc_kind` UAF is gone). Re-applying the #1048 drop turned it red again on
+    a THIRD bug (the shared-donor compensation hole below); with that fixed
+    too, CLEAN WITH the #1048 drops applied.
   - C oracle: still red — and PROVEN unrelated, see below.
 - Fixture `reuse_projection_scrutinee_1069`: both backends golden (the
   original tree survives two grow passes un-mutated) + a recognition ratchet
@@ -119,38 +120,35 @@ reassembled from the #1054 retro + `native-selfhost-link.sh`; the native
 ASAN link additionally needs the KAI_LLVM shim TU) and the bisect that
 decoupled the C oracle signature from the reuse mechanism.
 
-## The residual that still blocks #1048 — shared-donor CONSUMED children
+## The third bug under the same revert — the shared-donor compensation hole
 
-Re-applying the #1048 drop (fixture green: free_total=6008 ≥ alloc-10) turns
+Re-applying the #1048 drop (fixture green: free_total=6008 ≥ alloc-10) turned
 the native ASAN-selfhost red again with a familiar-looking but distinct
 stack: UAF read in `kaix_internal_dup ← region__rw_expr`, freed by a planted
-drop in `expand_ta_expr`, cell allocated by the FRESH-ALLOC fallback inside
-`kaix_variant_reuse_at ← rqc_kind` (frame: `kai_variant_u ←
+scope-exit drop in `expand_ta_expr`, cell allocated by the FRESH-ALLOC
+fallback inside `kaix_variant_reuse_at ← rqc_kind` (frame: `kai_variant_u ←
 kaix_variant_reuse_at` — the donation did NOT fire).
 
-Mechanism: when a recognised reuse arm runs against a donor that is SHARED at
-runtime, the fresh-alloc fallback still lets the arm extract the donor's
-children without incref and CONSUME them (`EMatch(rqc(s), rqc_arms(arms))` —
-`s` is an argument, not an embedded use). The #872 compensation
-(`reuse_gc` → `kai_incref_if_shared` in the `KConReuse` shared branch) covers
-only children the rebuild RE-EMBEDS, and it runs at rebuild time — after the
-argument evaluation has already consumed (and freed) the child. The shared
-donor's surviving copy then points at freed cells; without the #1048 drop
-that copy leaks silently (which is why this lane's no-drop ASAN run is
-clean), with the drop the cascade reads the freed child.
+Mechanism: the native single-body reuse lowering protects a runtime-SHARED
+donor with `kai_incref_if_shared` per binder use in the rebuild args
+(`reuse_gc_uses`, the #872 mechanism, correctly emitted BEFORE the args) —
+but the use walk only descended `EVar`/`ECall` shapes. A binder inside any
+other arg shape (a match scrutinee, an if branch, a block tail — the
+`expand_ta_expr_kind` `EBlock(…, match opt_final { … })` walk) was missed:
+on a shared donor the use consumed a child the donor's slot still points at.
+Without the #1048 drop the donor's copy leaks silently (why the no-drop ASAN
+run was clean); with the drop, the cascade reads the freed child. The C
+oracle never had the hole — its reuse arm is dual-branch and binds OWNED on
+the shared branch (`emit_match_arm_reuse_variant`); the single-body native
+model is sound only if the compensation set is complete.
 
-Fix direction for the follow-up lane: arm-entry compensation — on a
-`__perceus_reuse_*` arm, `incref_if_shared(donor, child)` each extracted
-pointer binder the body consumes OUTSIDE embed position, before the body
-runs; or unify by moving ALL shared compensation (kept + consumed) to arm
-entry and retiring the per-embed incref. Native lowering only
-(`kir_lower_walk.kai` `lower_arm_rc` / reuse-gc plumbing); the C oracle's
-`kai_reuse_or_alloc_*` path increfs binds and is not affected.
+Fixed in this lane: `reuse_gc_uses` now runs perceus's own full-coverage use
+collector (`pcs_collect_uses_expr`) scoped to the donor binder names,
+filtered back to them (the collector also returns lambda-param uses — the
+unfiltered first cut broke the native emit with unbound registers).
 
 ## Follow-ups
 
-- Shared-donor consumed-child under-count in the native reuse lowering
-  (above) — the actual remaining blocker of #1048; needs its own issue+lane.
 - The C oracle ASAN-selfhost heap-buffer-overflow (above) needs its own
   issue + lane; this lane's evidence (stack, allocation site, donation-off
   bisect) is in the PR.
