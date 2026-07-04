@@ -4711,7 +4711,7 @@ static inline void kai_reuse_free(KaiReuse at) {
  * enclosing `match` arm just consumed. When it is UNIQUE and has the
  * target arity, donate it as the storage for the rebuilt node:
  * overwrite the slot words (MOVE semantics — the arm already extracted
- * the donor's children into locals via kai_incref, so we must NOT
+ * the donor's children into locals without incref, so we must NOT
  * decref them), retag, and `incref` the cell so it survives the
  * `kai_decref(_scr)` the match emits at arm exit (net rc after exit:
  * 1, a unique freshly-built node — exactly the kai_reuse_or_alloc_cons
