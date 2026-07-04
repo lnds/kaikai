@@ -827,7 +827,7 @@ test-numeric-bigint-native: $(TARGET) build
 # test-numeric-decimal-rational-native.
 test-numeric-decimal-rational: $(TARGET) build
 	@set -e; \
-	for f in decimal_big_demo rational_demo big_numeric_operators; do \
+	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator; do \
 	./$(TARGET) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	./build/$$f-c > build/$$f.out; \
@@ -841,7 +841,7 @@ test-numeric-decimal-rational: $(TARGET) build
 # invoked from the tier1-native workflow.
 test-numeric-decimal-rational-native: $(TARGET) build
 	@set -e; \
-	for f in decimal_big_demo rational_demo big_numeric_operators; do \
+	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator; do \
 	KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
 	|| { echo "decimal-rational $$f FAIL (native build errored)"; cat build/$$f-nat.err; exit 1; }; \
 	./build/$$f-nat > build/$$f-nat.out; \
