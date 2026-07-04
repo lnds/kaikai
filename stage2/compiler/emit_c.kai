@@ -4787,15 +4787,17 @@ fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
 # hoist `_scr`'s nested-deref slots to C locals `_hs<i>` at the top of
 # the match, then have the per-arm tests/binds read `_hs<i>`.
 #
-# SOUNDNESS GATE (load-bearing): a hoisted `kai_var_slots(_scr)[i].ptr`
-# is an unconditional load. It is only sound when `_scr` is *known* to
-# be a variant whose slot i exists and is a pointer at the point of the
-# hoist. We require EVERY arm to be a PVariant of the SAME outer ctor
-# (so `_scr` is that ctor on entry — the match would not have been
-# reached otherwise for a well-typed exhaustive set), and we only hoist
-# slot i when some arm's sub-pattern at i is itself a PVariant (a nested
-# deref worth sharing) and slot i is a pointer slot. The hoist is a
-# borrow (read, no incref) — RC balance is unchanged.
+# SOUNDNESS (load-bearing): the hoisted load is guarded by the shared
+# ctor's tag. `_scr` may be a SMALLER sibling ctor (nullary arm,
+# catch-all arm, or a non-exhaustive match), and variant blocks are
+# sized by arity, so an unguarded `kai_var_slots(_scr)[i]` reads past
+# the block's end; a sibling with enough slots may still carry a
+# primitive (non-pointer) payload at i. Guarding on the exact ctor tag
+# makes the load legal for every scrutinee: arms of that ctor read the
+# real slot, any other value yields NULL and its arm test fails first.
+# We only hoist slot i when some arm's sub-pattern at i is itself a
+# PVariant (a nested deref worth sharing) and slot i is a pointer slot.
+# The hoist is a borrow (read, no incref) — RC balance is unchanged.
 
 # The outer ctor name shared by all arms, if they are all PVariant of
 # one ctor with no guard. None otherwise (mixed ctors, wildcard arms,
@@ -4805,12 +4807,9 @@ fn arms_shared_ctor(arms: [Arm]) : Option[String] =
 
 # Fold the arms, tracking the one ctor shared by all PAYLOAD-carrying
 # arms. A nullary PVariant (RBLeaf) or a PWild/PBind catch-all does NOT
-# constrain the ctor: it never reads a hoisted slot, and each deref-arm's
-# own outer-tag test short-circuits (`_scr->variant_tag==CTOR && _hs<i>->
-# ...`) so a hoisted slot-i load is never USED when `_scr` is the nullary
-# ctor. The load itself is a borrow read within the cell's own block (a
-# nullary singleton is sizeof(KaiValue), slot i is inside it), not OOB.
-# Any guard disables hoisting (a guard could reject after a slot read).
+# constrain the ctor: those arms never read a hoisted slot, and the tag
+# guard on the hoisted load keeps the load itself legal when they match.
+# Any pattern guard disables hoisting.
 fn arms_shared_ctor_loop(arms: [Arm], acc: Option[String]) : Option[String] = match arms {
   [] -> acc
   [a, ...rest] -> match a { Arm(p, g, _) -> match g {
@@ -4867,13 +4866,28 @@ fn hoist_slot_member(xs: [Int], n: Int) : Bool = match xs {
   [h, ...rest] -> if h == n { true } else { hoist_slot_member(rest, n) }
 }
 
-# Emit the `KaiValue *_hs<i> = kai_var_slots(_scr)[i].ptr;` declarations
-# for each hoisted slot, at the top of the match `do {}`.
-fn emit_hoist_decls(slots: [Int]) : String = match slots {
+# Emit the `_hs<i>` declarations for each hoisted slot, at the top of
+# the match `do {}`. The load is tag-guarded (see SOUNDNESS above); the
+# shared ctor always resolves in `cx.variants` because the hoist set is
+# non-empty only when `evar_payload_tys` found it in the same table.
+fn emit_hoist_decls(slots: [Int], arms: [Arm], cx: EmitCtx) : String = match slots {
+  [] -> ""
+  _  -> match arms_shared_ctor(arms) {
+    None     -> ""
+    Some(nm) -> match evar_find_tag_opt(cx.variants, nm) {
+      None      -> ""
+      Some(tag) -> emit_hoist_decls_loop(slots, tag)
+    }
+  }
+}
+
+fn emit_hoist_decls_loop(slots: [Int], tag: Int) : String = match slots {
   [] -> ""
   [i, ...rest] -> concat_all([
-    "KaiValue *_hs", int_to_string(i), " = kai_var_slots(_scr)[", int_to_string(i), "].ptr; ",
-    emit_hoist_decls(rest)
+    "KaiValue *_hs", int_to_string(i),
+    " = (_scr->tag == KAI_VARIANT && _scr->variant_tag == ", int_to_string(tag),
+    ") ? kai_var_slots(_scr)[", int_to_string(i), "].ptr : NULL; ",
+    emit_hoist_decls_loop(rest, tag)
   ])
 }
 
@@ -4925,7 +4939,7 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
       let arm_cx = emit_ctx_with_hoisted(cx, hs)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-        emit_hoist_decls(hs),
+        emit_hoist_decls(hs, arms, cx),
         emit_match_arms(src, arms, arm_cx),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
@@ -5083,7 +5097,7 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
   let arm_cx = emit_ctx_with_hoisted(cx, hs)
   concat_all([
     "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-    emit_hoist_decls(hs),
+    emit_hoist_decls(hs, arms, cx),
     emit_match_arms(src, arms, arm_cx),
     match_tail_panic(arms),
     "} while (0); kai_decref(_scr); _r; })"
