@@ -3812,21 +3812,6 @@ static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     return kai_incref(rec->as.rec.fields[i]);
 }
 
-/* Consuming field read: incref the field, decref the base, in one call — the
-   native lowering uses it so the base drop is clamped to the read and cannot
-   be scheduled past a reuse-in-place that rewrites the base's cell. */
-static KaiValue *kai_op_field_consume(KaiValue *rec, const char *name) {
-    KaiValue *f = kai_op_field(rec, name);
-    kai_decref(rec);
-    return f;
-}
-
-static KaiValue *kai_op_field_at_consume(KaiValue *rec, int i) {
-    KaiValue *f = kai_op_field_at(rec, i);
-    kai_decref(rec);
-    return f;
-}
-
 /* m5.x §4b sibling: borrow the field without incref. Used in pat_test
    paths where the caller only reads the field's tag / value to decide
    the arm match — no downstream consumer that would need an owned ref.

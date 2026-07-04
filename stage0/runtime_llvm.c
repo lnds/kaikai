@@ -777,8 +777,6 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
 KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
 KaiValue *kaix_field_at(KaiValue *rec, int32_t i)            { return kai_op_field_at(rec, i); }
 KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
-KaiValue *kaix_field_consume(KaiValue *rec, const char *name){ return kai_op_field_consume(rec, name); }
-KaiValue *kaix_field_at_consume(KaiValue *rec, int32_t i)    { return kai_op_field_at_consume(rec, i); }
 
 /* Raw-Real box/unbox borders for the unboxed-Real native path (KIR
    mode-slave to the unbox pass). `kaix_real` (above) is the raw→boxed box.
