@@ -785,7 +785,19 @@ test-numeric-bigint: $(TARGET) build
 	  || true; \
 	grep -F "$$(head -1 ../examples/numeric/int_overflow.err.expected)" build/int_overflow.out > /dev/null \
 	  && echo "bigint int_overflow OK (out-of-range Int rejection)" \
-	  || { echo "bigint int_overflow DIFF — expected out-of-range diagnostic"; cat build/int_overflow.out; exit 1; }
+	  || { echo "bigint int_overflow DIFF — expected out-of-range diagnostic"; cat build/int_overflow.out; exit 1; }; \
+	./$(TARGET) --path ../stdlib ../examples/numeric/hex_literal.kai > build/hex_literal.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/hex_literal.c -o build/hex_literal-c $(LDLIBS_M); \
+	./build/hex_literal-c > build/hex_literal.out; \
+	diff -q ../examples/numeric/hex_literal.out.expected build/hex_literal.out > /dev/null \
+	  && echo "hex_literal OK (C backend)" \
+	  || { echo "hex_literal DIFF"; diff ../examples/numeric/hex_literal.out.expected build/hex_literal.out; exit 1; }; \
+	./$(TARGET) --path ../stdlib ../examples/numeric/hex_overflow.err.kai > build/hex_overflow.out 2>&1 \
+	  && { echo "hex_overflow DID NOT FAIL — hex literal past 64 bits must diagnose"; exit 1; } \
+	  || true; \
+	grep -F "$$(head -1 ../examples/numeric/hex_overflow.err.expected)" build/hex_overflow.out > /dev/null \
+	  && echo "hex_overflow OK (over-width hex rejection)" \
+	  || { echo "hex_overflow DIFF — expected over-width diagnostic"; cat build/hex_overflow.out; exit 1; }
 
 # Pure-kaikai BigInt — NATIVE backend parity. Same fixtures and goldens,
 # built with the in-process libLLVM backend. Native-gated: a C-only
@@ -800,7 +812,13 @@ test-numeric-bigint-native: $(TARGET) build
 	  diff -q ../examples/numeric/$$f.out.expected build/$$f-nat.out > /dev/null \
 	    && echo "bigint $$f OK (native backend)" \
 	    || { echo "bigint $$f DIFF (native)"; diff ../examples/numeric/$$f.out.expected build/$$f-nat.out; exit 1; }; \
-	done
+	done; \
+	KAI_BACKEND=native ../bin/kai build ../examples/numeric/hex_literal.kai -o build/hex_literal-nat 2> build/hex_literal-nat.err \
+	  || { echo "hex_literal FAIL (native build errored)"; cat build/hex_literal-nat.err; exit 1; }; \
+	./build/hex_literal-nat > build/hex_literal-nat.out; \
+	diff -q ../examples/numeric/hex_literal.out.expected build/hex_literal-nat.out > /dev/null \
+	  && echo "hex_literal OK (native backend)" \
+	  || { echo "hex_literal DIFF (native)"; diff ../examples/numeric/hex_literal.out.expected build/hex_literal-nat.out; exit 1; }
 
 # DecimalBig + Rational (numeric lane D) — C backend. Each fixture
 # compiles to C, runs, and diffs against its golden. Verifies a
