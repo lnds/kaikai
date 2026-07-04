@@ -20,12 +20,10 @@ import compiler.ast
 import compiler.emit_shared
 
 # Slot kind of a variant payload type (mirror of emit_c's `variant_slot_kind`
-# for the pointer/scalar split). 0 = pointer (alias, needs a structural
-# incref), 1 = Int (read unboxed, no RC), 2 = Real (freshly boxed, owned).
-# An enum slot has no distinct code here: with an empty enum list it maps to
-# 0/pointer, and a dup of an immortal enum singleton is a runtime no-op, so
-# the only values gated IN are heap pointers and the only ones gated OUT are
-# the unboxed Int / Real slots the oracle reads raw.
+# for the pointer/scalar split). 0 = pointer, 1 = Int, 2 = Real. `pa_slot_needs_dup`
+# maps kind to whether the native binder is a heap-box borrow (0 and 2) or a
+# no-RC read (1). An enum slot maps to 0/pointer via the empty enum list, and a
+# dup of an immortal enum singleton is a runtime no-op.
 pub fn pa_slot_kind(te: TypeExpr) : Int = match te.tkind {
   TyName(n, args) ->
     if list_length(args) == 0 {
@@ -50,15 +48,17 @@ pub fn pa_nth_ty(tys: [TypeExpr], n: Int) : Option[TypeExpr] = match tys {
 }
 
 #[doc("""
-Every pointer-kind binder a match arm reaches over a BORROW path — the full
-set the C-direct oracle's `emit_pat_binds` increfs under `is_alias=true`, at
-any depth. This is the single mirror of that discipline; all native
-alias-dup / reuse call-sites derive their sets from it, never re-walking.
+Every binder a match arm reaches over a heap-box BORROW path — the set the
+native lowering must structurally dup so a consuming arm body cannot free a
+slot the scrutinee still holds. This is the single mirror of that discipline;
+all native alias-dup / reuse call-sites derive their sets from it, never
+re-walking.
 
-Descends PList (heads + `...rest`), PVariant POINTER slots (Int/Real excluded
-by `pa_slot_kind`), and PAs (name + inner, inner always alias). Record and
-variant-record fields are NOT descended: `kai_op_field` already increfs its
-return, so their subtree is owned in the oracle, not an alias.
+Descends PList (heads + `...rest`), PVariant slots that `pa_slot_needs_dup`
+(pointer and Real; Int is a tagged immediate), and PAs (name + inner, inner
+always alias). Record and variant-record fields are NOT descended:
+`kai_op_field` already increfs its return, so their subtree is owned, not a
+borrow.
 """)]
 pub fn pat_alias_binders(p: Pattern, vs: [EVar]) : [String] = pab_pat(p, vs, [])
 
@@ -83,10 +83,18 @@ fn pab_variant_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, vs: [EVar], acc
   []            -> acc
   [sp, ...rest] -> {
     let k = match pa_nth_ty(tys, idx) { Some(te) -> pa_slot_kind(te) None -> 0 }
-    let acc1 = if k == 0 { pab_pat(sp, vs, acc) } else { acc }
+    let acc1 = if pa_slot_needs_dup(k) { pab_pat(sp, vs, acc) } else { acc }
     pab_variant_slots(rest, tys, idx + 1, vs, acc1)
   }
 }
+
+# A slot binder needs a structural dup iff the native reads it as a heap box
+# the arm may consume. Pointer (0) and Real (2) both are: the native builds
+# every variant with slot_mask 0, so a Real payload is a boxed `KaiValue*`
+# read via `KProj` (borrow, no incref), NOT the fresh `kai_real(slot.r)` the C
+# oracle mints — a consuming builtin would decref the shared box and free a
+# live slot. Int (1) is a tagged immediate whose decref is a no-op.
+fn pa_slot_needs_dup(k: Int) : Bool = k == 0 or k == 2
 
 #[doc("""
 The DIRECT-slot partition of `pat_alias_binders`: the alias binders bound as

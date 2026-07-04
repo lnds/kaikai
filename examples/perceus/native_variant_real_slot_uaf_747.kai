@@ -1,0 +1,41 @@
+# Issue #747 / #1054 — a variant REAL slot bound in a match arm and consumed
+# by the arm body is a use-after-free on the native (in-process libLLVM)
+# backend. The native builds every variant with slot_mask 0, so a Real payload
+# is a boxed `KaiValue*` read via `KProj` / `kaix_variant_arg` (a borrow, no
+# incref) — NOT the fresh `kai_real(slot.r)` owning temporary the C-direct
+# oracle mints for a Real slot. `pat_alias_binders` used to EXCLUDE Real slots
+# (assuming the oracle's fresh-box semantics), so no structural dup protected
+# the borrow. A consuming builtin (`real_to_string` decref's its arg) freed the
+# shared box, then the arm-exit `__pcs_scr_drop` re-decref'd the scrutinee's
+# now-freed slot — a heap-use-after-free (SIGSEGV 139 in the self-compile).
+#
+# The fix descends Real slots in `pat_alias_binders` (via `pa_slot_needs_dup`)
+# so the owned match arm structurally dups the Real binder, exactly as it dups
+# a pointer slot. Int slots stay excluded — a tagged immediate's decref is a
+# no-op. The gate builds this NATIVE under ASAN + no-cell-pool (rc-detector):
+# without the dup the second decref frees a live cell and ASAN's redzone trips.
+# The `.out.expected` golden gates output parity on both backends.
+
+type Node = ERealN(Real, String) | EIntN(Int)
+
+# Consume the Real binder `r` with a consuming builtin (`real_to_string`
+# decref's its argument). Without the dup, `r` is a borrow of the scrutinee's
+# slot and the decref frees a live cell.
+fn render(x: Node) : String = match x {
+  ERealN(r, _) -> real_to_string(r)
+  EIntN(n)     -> int_to_string(n)
+}
+
+fn loop_render(xs: [Node], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> loop_render(rest, acc + string_length(render(x)))
+}
+
+fn build(n: Int, acc: [Node]) : [Node] =
+  if n <= 0 { acc } else { build(n - 1, [ERealN(3.14, "3.14"), ...acc]) }
+
+fn main() : Int / Stdout = {
+  let total = loop_render(build(2000, []), 0)
+  Stdout.print("total=#{total}")
+  0
+}
