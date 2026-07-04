@@ -2843,6 +2843,11 @@ static void      kai_reactor_stdin_set_nonblocking(void);
  * exclusive park reasons). */
 static void      kai_reactor_park_socket_read(KaiFiber *f, int fd);
 static void      kai_reactor_park_socket_write(KaiFiber *f, int fd);
+/* Read-readiness park with a deadline: parks on the read-waiter list
+ * carrying `deadline_ns` in the fiber's own slot (single-list dual-park,
+ * no second intrusive link). Returns 1 if readiness woke us, 0 if the
+ * deadline fired first. */
+static int       kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t deadline_ns);
 static void      kai_socket_set_nonblock(int fd);
 
 /* Issue #671 — Phase R4: park `f` on the singleton signal waiter
@@ -9378,6 +9383,65 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
     return kai_cont_resume(k, ok);
 }
 
+/* recv_timeout(c, max, nanos) -> Option[Result[String, [Int]]]. The
+ * socket-side dual of Actor.receive_timeout: park on read-readiness and
+ * a `nanos` deadline, resume on whichever fires first (reactor single-
+ * list dual-park). `None` = deadline elapsed before any byte; `Some(Ok
+ * (bytes))` = data (or `Ok([])` on a clean EOF); `Some(Err(msg))` = a
+ * transport error. Three-way distinguishable, as the DoS fix requires. */
+static KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
+                                                 KaiValue *max, KaiValue *ns,
+                                                 KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv_timeout: invalid conn");
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    if (cap <= 0) {
+        fputs("kai: NetTcp.recv_timeout: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
+    int64_t budget = (kai_is_int(ns)) ? kai_intf(ns) : 0;
+    if (budget < 0) budget = 0;
+
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv_timeout: out of memory");
+
+    kai_reactor_init();
+    kai_socket_set_nonblock(fd);
+
+    uint64_t deadline = kai_reactor_now_ns() + (uint64_t) budget;
+    ssize_t got;
+    for (;;) {
+        got = recv(fd, buf, (size_t) cap, 0);
+        if (got >= 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!kai_reactor_park_socket_read_timeout(kai_current_fiber(),
+                                                      fd, deadline)) {
+                free(buf);
+                return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+            }
+            continue;  /* Readiness → retry recv() */
+        }
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        free(buf);
+        const char *m = strerror(saved_errno);
+        if (!m) m = "unknown error";
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0,
+                                      (KaiVarSlot[]){{.ptr = kai_str(m)}});
+        KaiValue *some = kai_variant_u(0, "Some", 1, 0,
+                                       (KaiVarSlot[]){{.ptr = err}});
+        return kai_cont_resume(k, some);
+    }
+    KaiValue *acc = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
+    KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = ok}});
+    return kai_cont_resume(k, some);
+}
+
 /* close(c) -> Unit. Spec says errors from close(2) are logged and
  * swallowed — the user can do nothing useful with the value, and
  * shutdown() is the right tool for "did everything flush?" anyway.
@@ -11206,6 +11270,27 @@ static void kai_reactor_park_socket_write(KaiFiber *f, int fd) {
     kai_sched_park();
 }
 
+/* Dual-park read-readiness + deadline on a single intrusive slot. The
+ * fiber lives only on the read-waiter list; its `reactor_deadline_ns`
+ * arms the poll timeout and the deadline-drain pass in kai_reactor_wait.
+ * Whichever wins, the drain that unparks us has already spliced us out
+ * of the one list — no second structure to disarm, so no UAF window.
+ * The deadline-drain stamps `reactor_wait_status = 1` before waking;
+ * readiness leaves it 0. Returns 1 (readiness) or 0 (deadline). */
+static int kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t deadline_ns) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    f->reactor_deadline_ns = deadline_ns;
+    f->reactor_next = kai_reactor_socket_read_waiters;
+    kai_reactor_socket_read_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+    int timed_out = (f->reactor_wait_status == 1);
+    f->reactor_wait_status = 0;
+    f->reactor_deadline_ns = 0;
+    return timed_out ? 0 : 1;
+}
+
 /* Submit `work(arg)` to the file-pool worker queue and park the
  * caller until completion. Returns the worker's KaiValue *result.
  * The KaiFilepoolItem lives on the caller's fiber stack — safe
@@ -11285,6 +11370,31 @@ static int kai_reactor_socket_drain(KaiFiber **head_ptr, struct pollfd *pfds,
     return woken;
 }
 
+/* Wake every deadline-armed socket-read waiter whose deadline has
+ * passed, stamping reactor_wait_status = 1 so the park site returns
+ * timeout. Runs AFTER the readiness drain: a socket that turned ready
+ * in the same poll is already off the list, so data-just-in-time wins
+ * over a coincident deadline. */
+static int kai_reactor_socket_read_deadline_drain(uint64_t now) {
+    int woken = 0;
+    KaiFiber **link = &kai_reactor_socket_read_waiters;
+    while (*link) {
+        KaiFiber *f = *link;
+        if (f->reactor_deadline_ns && f->reactor_deadline_ns <= now) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_pid = 0;
+            f->reactor_wait_status = 1;
+            kai_reactor_parked_count--;
+            kai_sched_unpark(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
 /* Block in poll() until either the SIGCHLD pipe or the file-pool
  * completion pipe fires, a socket fd becomes ready, or the next
  * timer deadline arrives. Promotes every newly-ready fiber to the
@@ -11293,15 +11403,27 @@ static int kai_reactor_socket_drain(KaiFiber **head_ptr, struct pollfd *pfds,
  * dedicated event loop thread. */
 static void kai_reactor_wait(void) {
     /* Compute the timeout in ms (poll's resolution). A negative
-     * timeout is "wait forever"; a zero timeout polls. */
-    int timeout_ms = -1;
+     * timeout is "wait forever"; a zero timeout polls. The wake
+     * deadline is the earliest of the timer wheel head and any
+     * deadline-armed socket-read waiter (recv_timeout), so a socket
+     * deadline that precedes every timer still bounds the sleep. */
+    uint64_t wake_dl = 0;
     if (kai_reactor_timer_head) {
+        wake_dl = kai_reactor_timer_head->reactor_deadline_ns;
+    }
+    for (KaiFiber *f = kai_reactor_socket_read_waiters; f; f = f->reactor_next) {
+        if (f->reactor_deadline_ns &&
+            (wake_dl == 0 || f->reactor_deadline_ns < wake_dl)) {
+            wake_dl = f->reactor_deadline_ns;
+        }
+    }
+    int timeout_ms = -1;
+    if (wake_dl) {
         uint64_t now = kai_reactor_now_ns();
-        uint64_t dl  = kai_reactor_timer_head->reactor_deadline_ns;
-        if (dl <= now) {
+        if (wake_dl <= now) {
             timeout_ms = 0;
         } else {
-            uint64_t diff_ns = dl - now;
+            uint64_t diff_ns = wake_dl - now;
             uint64_t ms = (diff_ns + 999999ULL) / 1000000ULL;  /* ceil */
             if (ms > (uint64_t) INT_MAX) ms = (uint64_t) INT_MAX;
             timeout_ms = (int) ms;
@@ -11423,6 +11545,10 @@ static void kai_reactor_wait(void) {
         kai_reactor_socket_drain(&kai_reactor_socket_read_waiters,  pfds, nfds, POLLIN);
         kai_reactor_socket_drain(&kai_reactor_socket_write_waiters, pfds, nfds, POLLOUT);
     }
+    /* Timeout-armed recv waiters whose deadline elapsed. Unconditional
+     * (like the timer drain): a bare poll timeout with no revents still
+     * has to expire them. Runs after the readiness drain above. */
+    kai_reactor_socket_read_deadline_drain(now);
     /* A SIGCHLD delivered before we entered poll() may not appear
      * in revents (the signal handler ran but the byte arrived
      * after the kernel snapshot). Always attempt a non-blocking
