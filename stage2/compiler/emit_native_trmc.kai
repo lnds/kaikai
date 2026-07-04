@@ -158,25 +158,34 @@ fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int
 }
 
 # n-ary user-variant spine step: fill every non-hole slot from `head_vals`
-# (slot order) plus a NULL placeholder at `hole_slot`, build `kaix_variant`
-# (mask==0), hole at slot `hole_slot`.
+# (slot order) plus a NULL placeholder at `hole_slot`, rebuild INTO the
+# arm-top reuse token — the consumed scrutinee's shell, fresh alloc when the
+# token is null — with the hole at slot `hole_slot`. The kept children
+# already moved into the borrow binds, so the in-place slot writes are a
+# move (no old-slot decref). The token rides as `args[0]` of the plain
+# 4-arg variant-ctor call shape (`kaix_variant_at_argv`): widening the call
+# with a 5th leading arg here is miscompiled by the stage1-built emitter
+# (its RC pass wraps the node handle in a dup that scribbles on the LLVM
+# CallInst), so the buffer carries it instead.
 fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int,
                       head_vals: [KVal], asg: [KAssign], dropmask: Int, scr_drop: String) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
-  # Dispose the arm-top reuse token (#872): a self-modulo-cons variant step
-  # CONSUMES the matched scrutinee, captured at the arm top as `_arm_ru`. Free
-  # the token shell (null-safe, no cascade — the kept children moved into the
-  # fresh node's slots) and reset it, so the loop does not leak the consumed
-  # shell each iteration. A `build`-shaped step (no arm-top capture) reads a null
-  # token and the free is a no-op. The fresh `kaix_variant` node carries the
-  # rebuilt slots; reuse-in-place of the token shell is a separate perf step.
-  let _f = nemit_call1(ctx, "kaix_reuse_free", nemit_load_reg(ctx, ntrmc_armru_reg()))
-  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
-  let argbuf = ntrmc_variant_slots(ctx, head_vals, hole_slot, 0)
-  let node = nemit_variant_call(ctx, "kaix_variant", tag, cname, argbuf)
+  let argbuf = ntrmc_variant_at_slots(ctx, head_vals, hole_slot)
+  let node = nemit_variant_call(ctx, "kaix_variant_at_argv", tag, cname, argbuf)
   let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node, llvm_const_i32(i32t, hole_slot))
   ntrmc_extend_and_loop(ctx, node, hole, asg, dropmask)
+}
+
+# `[token, ...slots]` for `kaix_variant_at_argv`: take the arm-top reuse
+# token (load, then reset the register so no later disposer frees the
+# now-live reused cell), front it to the slot buffer.
+fn ntrmc_variant_at_slots(ctx: Handle, head_vals: [KVal], hole_slot: Int) : Handle / Console = {
+  let buf = llvm_buf_new()
+  llvm_buf_push(buf, nemit_load_reg(ctx, ntrmc_armru_reg()))
+  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
+  ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, 0)
+  buf
 }
 
 
