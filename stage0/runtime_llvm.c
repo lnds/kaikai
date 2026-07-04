@@ -1318,6 +1318,9 @@ KaiValue *kaix_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiC
 KaiValue *kaix_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
     return kai_default_nettcp_recv(self, c, max, k);
 }
+KaiValue *kaix_default_nettcp_recv_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k) {
+    return kai_default_nettcp_recv_timeout(self, c, max, ns, k);
+}
 KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     return kai_default_nettcp_close(self, c, k);
 }

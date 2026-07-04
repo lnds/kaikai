@@ -1,0 +1,92 @@
+# net-tcp-recv-timeout — the deadline-park recv over a socket.
+# Three distinguishable outcomes on one loopback pair:
+#   1. data before the deadline -> Some(Ok(bytes))
+#   2. an idle peer past `nanos` -> None (the slow-loris fix: the
+#      fiber returns instead of parking forever)
+#   3. a clean peer close        -> Some(Ok([])) — EOF stays distinct
+#      from timeout.
+#
+# Sequenced in a single fiber over 127.0.0.1: the kernel queues the
+# SYN at listen-time so connect succeeds before accept, and a send
+# fits the loopback buffer so the readable case never blocks.
+
+import net.tcp
+
+fn ping_bytes() : [Int] = [80, 73, 78, 71]
+
+fn report_data(got: [Int]) : Int / Stdout = {
+  let n = list_length(got)
+  match got {
+    [h, ..._tail] ->
+      if n == 4 and h == 80 { Stdout.print("data ok"); 0 }
+      else { Stdout.print("data FAIL: wrong shape"); 1 }
+    [] -> { Stdout.print("data FAIL: empty"); 1 }
+  }
+}
+
+# 20 ms budget — long enough that a loopback send always lands first
+# on the readable path, short enough that the idle-peer path returns
+# promptly instead of hanging the harness.
+fn budget_ns() : Int = 20000000
+
+fn case_data(client: Conn, server: Conn) : Int / NetTcp + Stdout =
+  match NetTcp.send(client, ping_bytes()) {
+    Err(e) -> { Stdout.print(string_concat("send FAIL: ", e)); 1 }
+    Ok(_n) ->
+      match NetTcp.recv_timeout(server, 64, budget_ns()) {
+        None            -> { Stdout.print("data FAIL: timed out"); 1 }
+        Some(Err(e))    -> { Stdout.print(string_concat("data FAIL: ", e)); 1 }
+        Some(Ok(bytes)) -> report_data(bytes)
+      }
+  }
+
+fn case_timeout(server: Conn) : Int / NetTcp + Stdout =
+  match NetTcp.recv_timeout(server, 64, budget_ns()) {
+    None            -> { Stdout.print("timeout ok"); 0 }
+    Some(Ok(_b))    -> { Stdout.print("timeout FAIL: got data"); 1 }
+    Some(Err(e))    -> { Stdout.print(string_concat("timeout FAIL: ", e)); 1 }
+  }
+
+fn case_eof(client: Conn, server: Conn) : Int / NetTcp + Stdout = {
+  NetTcp.close(client)
+  match NetTcp.recv_timeout(server, 64, budget_ns()) {
+    None            -> { Stdout.print("eof FAIL: timed out"); 1 }
+    Some(Err(e))    -> { Stdout.print(string_concat("eof FAIL: ", e)); 1 }
+    Some(Ok(bytes)) ->
+      match bytes {
+        [] -> { Stdout.print("eof ok"); 0 }
+        _  -> { Stdout.print("eof FAIL: got bytes"); 1 }
+      }
+  }
+}
+
+fn run_session(l: Listener) : Int / NetTcp + Stdout = {
+  let port = local_port(l)
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(e) -> { Stdout.print(string_concat("connect FAIL: ", e)); 1 }
+    Ok(client) ->
+      match NetTcp.accept(l) {
+        Err(e) -> { NetTcp.close(client); Stdout.print(string_concat("accept FAIL: ", e)); 1 }
+        Ok(server) -> {
+          let r1 = case_data(client, server)
+          let r2 = case_timeout(server)
+          let r3 = case_eof(client, server)
+          NetTcp.close(server)
+          r1 + r2 + r3
+        }
+      }
+  }
+}
+
+fn main() : Int / NetTcp + Stdout = {
+  Stdout.print("net_tcp_recv_timeout start")
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> { Stdout.print(string_concat("listen FAIL: ", e)); 1 }
+    Ok(l) -> {
+      Stdout.print("listen ok")
+      let rc = run_session(l)
+      if rc == 0 { Stdout.print("done"); 0 }
+      else { Stdout.print("done with errors"); rc }
+    }
+  }
+}
