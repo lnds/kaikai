@@ -149,7 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
-.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-home-tu-partition test-native-modular test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes
+.PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-860-native-cons-leak test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-home-tu-partition test-native-modular test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes
 
 all: $(TARGET)
 
@@ -4153,6 +4153,40 @@ test-perceus-860-native-cons-leak: $(TARGET) build
 	[ "$$free" -eq "$$(($$alloc - 1))" ] \
 	  && echo "perceus-860-native-cons-leak OK (native free_total=$$free == alloc_total-1=$$(($$alloc - 1)); cons cascade decref->free over 1000 cells)" \
 	  || { echo "perceus-860-native-cons-leak FAIL (native free_total=$$free, alloc_total=$$alloc — cons leak regressed, cascade dropped)"; exit 1; }
+
+# Issue #747 / #1054 — a variant REAL slot bound in a match arm and consumed by
+# the arm body is a native use-after-free: the native reads the Real slot as a
+# boxed borrow (`KProj`/`kaix_variant_arg`, mask 0 -> `.ptr`, no incref), while
+# `pat_alias_binders` excluded Real slots, so no structural dup protected the
+# borrow. A consuming builtin (`real_to_string` decref's its arg) freed the
+# shared box, then the arm-exit scrutinee drop re-decref'd the freed slot
+# (SIGSEGV 139 in the self-compile). The fix descends Real slots in
+# `pat_alias_binders`. The gate builds NATIVE under ASAN + no-cell-pool so the
+# double free trips the redzone, then checks output parity; without the dup the
+# binary aborts on the UAF. Native-gated (tier1-native).
+test-perceus-747-native-real-slot-uaf: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/native_variant_real_slot_uaf_747.kai; \
+	exp=../examples/perceus/native_variant_real_slot_uaf_747.out.expected; \
+	mv ../stage0/runtime_llvm.bc ../stage0/runtime_llvm.bc.hidden747 2>/dev/null || true; \
+	CFLAGS="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable" \
+	  KAI_BACKEND=native ../bin/kai build $$src -o build/s2-747rsu 2> build/s2-747rsu.err; \
+	bs=$$?; \
+	mv ../stage0/runtime_llvm.bc.hidden747 ../stage0/runtime_llvm.bc 2>/dev/null || true; \
+	[ "$$bs" -eq 0 ] \
+	  || { echo "perceus-747-native-real-slot-uaf FAIL (native ASAN build errored)"; cat build/s2-747rsu.err; exit 1; }; \
+	ASAN_OPTIONS=abort_on_error=0:halt_on_error=1:detect_leaks=0 \
+	  ./build/s2-747rsu > build/s2-747rsu.out 2> build/s2-747rsu.asan; \
+	rc=$$?; \
+	if grep -qE 'AddressSanitizer|heap-use-after-free|runtime error:' build/s2-747rsu.asan; then \
+	  echo "perceus-747-native-real-slot-uaf FAIL (ASAN diagnostic — Real slot borrow freed live):"; \
+	  grep -m3 -E 'AddressSanitizer|heap-use-after-free|runtime error:' build/s2-747rsu.asan; exit 1; \
+	fi; \
+	[ "$$rc" -eq 0 ] \
+	  || { echo "perceus-747-native-real-slot-uaf FAIL (native ASAN run crashed, exit $$rc)"; tail -20 build/s2-747rsu.asan; exit 1; }; \
+	diff -q $$exp build/s2-747rsu.out > /dev/null \
+	  && echo "perceus-747-native-real-slot-uaf OK (native ASAN clean + output parity; Real slot dup protects the borrow)" \
+	  || { echo "perceus-747-native-real-slot-uaf FAIL (output diff)"; diff $$exp build/s2-747rsu.out; exit 1; }
 
 # Issue #872 — the NATIVE backend must free the rb-tree variant-reuse churn:
 # the rotation reuse arm, the TRMC variant modulo-cons step, the arm-top reuse
