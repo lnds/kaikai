@@ -738,6 +738,16 @@ KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name,
   return r;
 }
 
+/* `kaix_variant_at` behind the plain 4-arg ctor call shape: `args[0]`
+ * carries the arm-top reuse token, `args[1..n-1]` the slots. The TRMC
+ * variant step rides this instead of a widened 5-arg call, which the
+ * stage1-built emitter miscompiles (its RC pass wraps the node handle in
+ * a dup that scribbles on the LLVM CallInst). */
+KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int n,
+                               KaiValue **args) {
+  return kaix_variant_at((KaiReuse) args[0], tag, name, n - 1, args + 1);
+}
+
 /* i64-inline parity (#747) — reuse-in-place rebuild with a `slot_mask`.
  * The TRMC step (`llvm_emit_trmc_goto`) rebuilds a ctor INTO the donated
  * unique cell. It must write the SAME word kinds the typed construction
