@@ -101,7 +101,7 @@ TWO owners. Any legitimate drop kills it for the other owner (the UAF); without
 the drop it leaks (#1048 is the balance of the same missing ref). The commit
 `113e2991` ("perf(perceus): reuse-token for typed cells + drop the diagonal
 gate") removed the gate that had restricted reuse; `pcs_reuse_is_diagonal`
-(perceus.kai) is now orphaned. This wants its own issue + lane: it is
+(perceus.kai) is now orphaned. Tracked as its own issue (#1069): it is
 platform-level RC corruption, not a #1054/#1048 detail. Fix direction: reinstate
 the diagonal gate, or have the reuse incref a sub-node shared with a live
 structure — verified against ASAN-selfhost + byte-id, without regressing the
