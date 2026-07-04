@@ -2456,6 +2456,15 @@ struct KaiFiber {
      * exit(0) (the m8 v1 behaviour for unhandled root cancellation). */
     jmp_buf         cancel_pad;
     int             cancel_pad_set;
+    /* Fiber-level trap isolation. A recoverable trap (index out of
+     * range, divide by zero, non-exhaustive match) unwinds to
+     * cancel_pad like Cancel does, but sets `trapped` so the
+     * trampoline reports KAI_EXIT_TRAPPED instead of CRASHED — a
+     * program bug, distinguishable from cooperative cancellation.
+     * trap_msg is a static C string (never freed). With no pad
+     * installed (main_fiber) a trap terminates the process. */
+    int             trapped;
+    const char     *trap_msg;
     /* Phase 5 — intrusive list of linked peer fibers. Walked at
      * trampoline termination (DONE or CANCELLED branches) to set
      * cancel_requested on each peer. Owned by the fiber; nodes are
@@ -2584,6 +2593,7 @@ struct KaiNursery {
     NULL, 0,             /* stack_base, stack_size — main uses OS stack */ \
     NULL, NULL,          /* awaiters_head, awaiters_next */              \
     {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */ \
+    0, NULL,             /* trapped, trap_msg — main starts untrapped */  \
     NULL,                /* linked_head */                               \
     NULL,                /* in_dispatch_node */                          \
     NULL,                /* value — main has no wrapper */               \
@@ -2607,6 +2617,24 @@ static KaiFiber *kai_active_fiber = &kai_main_fiber;
 
 static KaiFiber *kai_current_fiber(void) {
     return kai_active_fiber;
+}
+
+/* A recoverable runtime trap (index out of range, divide by zero,
+ * non-exhaustive match). With a fiber pad installed, unwind to it
+ * like Cancel — the trampoline reports the fiber TRAPPED and a
+ * supervisor contains the fault. With no pad (main_fiber, or before
+ * runtime init) terminate the process, preserving the pre-existing
+ * top-level behaviour. `msg` must be a static string. */
+static void kai_trap_abort(const char *msg) {
+    KaiFiber *f = kai_current_fiber();
+    if (f && f->cancel_pad_set) {
+        f->trapped  = 1;
+        f->trap_msg = msg;
+        longjmp(f->cancel_pad, 1);
+        /* Unreachable. */
+    }
+    fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
+    exit(1);
 }
 
 /* Ready queue (intrusive singly-linked, head/tail). Fibers go on the queue
@@ -4741,8 +4769,10 @@ static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
         fprintf(stderr, "kai: array_get: not an array\n"); exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
-        fprintf(stderr, "kai: array_get: index %lld out of range (len=%lld)\n",
-                (long long) i, (long long) a->as.arr.len); exit(1);
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) a->as.arr.len);
+        kai_trap_abort(buf);
     }
     return kai_incref(a->as.arr.items[i]);
 }
@@ -4754,8 +4784,10 @@ static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
         fprintf(stderr, "kai: array_set: not an array\n"); exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
-        fprintf(stderr, "kai: array_set: index %lld out of range (len=%lld)\n",
-                (long long) i, (long long) a->as.arr.len); exit(1);
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) a->as.arr.len);
+        kai_trap_abort(buf);
     }
     kai_decref(a->as.arr.items[i]);
     a->as.arr.items[i] = v;
@@ -5345,6 +5377,18 @@ static void kai_panic_backtrace(void) {
 }
 
 static KaiValue *kai_prelude_panic(KaiValue *msg) {
+    KaiFiber *f = kai_current_fiber();
+    if (f && f->cancel_pad_set) {
+        static char buf[256];
+        int n = 0;
+        if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
+            n = (int) msg->as.s.len;
+            if (n > (int) sizeof(buf) - 1) n = (int) sizeof(buf) - 1;
+            memcpy(buf, msg->as.s.bytes, (size_t) n);
+        }
+        buf[n] = '\0';
+        kai_trap_abort(buf);
+    }
     fprintf(stderr, "panic: ");
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
@@ -5949,10 +5993,10 @@ static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
 static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
     switch ((KaiTag) a->tag) {
-        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int32(a->as.i32 / y); }
-        case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint32(a->as.u32 / y); }
-        case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_uint64(a->as.u64 / y); }
-        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); } return kai_int128(kai_i128_load(a) / y); }
+        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int32(a->as.i32 / y); }
+        case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint32(a->as.u32 / y); }
+        case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint64(a->as.u64 / y); }
+        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int128(kai_i128_load(a) / y); }
         default: return NULL;
     }
 }
@@ -5990,7 +6034,7 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
 static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a) && kai_is_int(b)) {
-        if (kai_intf(b) == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
+        if (kai_intf(b) == 0) { kai_trap_abort("divide by zero"); }
         r = kai_int(kai_intf(a) / kai_intf(b));
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
@@ -6008,7 +6052,7 @@ static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
     if      (kai_is_int(b))  bv = kai_intf(b);
     else if (kai_is_ptr(b) && b->tag == KAI_REAL) bv = (int64_t) b->as.r;
     else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
-    if (bv == 0) { fprintf(stderr, "kai: divide by zero\n"); exit(1); }
+    if (bv == 0) { kai_trap_abort("divide by zero"); }
     KaiValue *r = kai_int(av / bv);
     kai_decref(a); kai_decref(b);
     return r;
@@ -6017,7 +6061,7 @@ static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
 static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a) && kai_is_int(b)) {
-        if (kai_intf(b) == 0) { fprintf(stderr, "kai: mod by zero\n"); exit(1); }
+        if (kai_intf(b) == 0) { kai_trap_abort("mod by zero"); }
         r = kai_int(kai_intf(a) % kai_intf(b));
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
@@ -11418,10 +11462,12 @@ static void kai_fiber_trampoline(void);
 /* Phase 5 forward decl: link propagation runs in the trampoline's
  * termination tail; the helper itself is defined alongside the
  * Link default handler further down. The reason argument distinguishes
- * Normal (DONE) from Crashed (CANCELLED) for trap-exit delivery. */
+ * Normal (DONE) from Crashed (CANCELLED) and Trapped (a runtime trap)
+ * for trap-exit delivery. */
 typedef enum {
     KAI_EXIT_NORMAL  = 0,
-    KAI_EXIT_CRASHED = 1
+    KAI_EXIT_CRASHED = 1,
+    KAI_EXIT_TRAPPED = 2
 } KaiExitReason;
 
 static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
@@ -11597,8 +11643,10 @@ static void kai_fiber_trampoline(void) {
         self->cancel_pad_set = 0;
         self->state  = KAI_FIBER_DONE;
     } else {
-        /* Cancel landing: the yield-point hook (or kai_default_cancel_raise)
-         * longjmped here. The body did not finish; result stays NULL. */
+        /* Cancel or trap landing: the yield-point hook, the default
+         * Cancel handler, or kai_trap_abort longjmped here. The body
+         * did not finish; result stays NULL. `trapped` distinguishes
+         * a runtime trap (a bug) from cooperative cancellation. */
         self->cancel_pad_set = 0;
         self->state = KAI_FIBER_CANCELLED;
     }
@@ -11607,14 +11655,14 @@ static void kai_fiber_trampoline(void) {
      * peer, behaviour depends on the peer's trap_exit flag (Tier 2):
      *   - trap_exit=0 (default): set cancel_requested (current
      *     behaviour, delivered at the peer's next yield-point hook).
-     *   - trap_exit=1: push a "Normal"/"Crashed" string into the
-     *     peer's mailbox so the peer can react in user code instead
-     *     of being cancelled.
-     * The exit reason is read from `self->state` at this point —
-     * DONE → Normal, CANCELLED → Crashed (any other state would be
-     * a runtime invariant violation). */
+     *   - trap_exit=1: push a "Normal"/"Crashed"/"Trapped" string
+     *     into the peer's mailbox so the peer can react in user code
+     *     instead of being cancelled.
+     * The exit reason: DONE → Normal, trapped → Trapped, otherwise
+     * CANCELLED → Crashed. */
     kai_link_propagate_terminate(self,
-        self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL : KAI_EXIT_CRASHED);
+        self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL
+        : self->trapped ? KAI_EXIT_TRAPPED : KAI_EXIT_CRASHED);
 
     /* Tier 2 Monitor — push our pid into each observer's mailbox.
      * Observers do not get cancel_requested set; monitors are
@@ -11985,10 +12033,11 @@ static KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k) {
         kai_nursery_join_child(c);
         /* A child counts as a *failure* only if it terminated
          * CANCELLED without anyone requesting its cancellation — i.e.
-         * it raised `Cancel` on its own. A child cancelled on request
-         * (`Spawn.cancel` from a sibling, or the cancel_siblings walk
-         * below) terminates CANCELLED with `cancel_requested` set and
-         * is an expected, non-propagating outcome. */
+         * it raised `Cancel` on its own or hit a runtime trap. A child
+         * cancelled on request (`Spawn.cancel` from a sibling, or the
+         * cancel_siblings walk below) terminates CANCELLED with
+         * `cancel_requested` set and is an expected, non-propagating
+         * outcome. */
         if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
             failed = 1;
             kai_nursery_cancel_siblings(head);
@@ -12101,8 +12150,15 @@ static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
                  * mailbox_send's incref). Wake any parked receiver
                  * — that's exactly what kai_mailbox_push already does
                  * via its recv_waiter handoff. */
-                const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
-                kai_mailbox_push(peer->mailbox, kai_str(txt));
+                if (reason == KAI_EXIT_TRAPPED) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "Trapped: %s",
+                             self->trap_msg ? self->trap_msg : "runtime trap");
+                    kai_mailbox_push(peer->mailbox, kai_str(buf));
+                } else {
+                    const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
+                    kai_mailbox_push(peer->mailbox, kai_str(txt));
+                }
             } else {
                 peer->cancel_requested = 1;
             }
