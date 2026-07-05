@@ -61,6 +61,16 @@ self-consistent at mask 0. Writing raw i64 slots (the real i64-inline) is a
 all atomic or the tree corrupts — the same shape as the #1054/#1069/#1074 UAF
 family. Deferred to its own lane with a dedicated ASAN cycle (as #1053 was).
 
+## CI catch the local gates missed
+
+Adding the mask to `KCon` meant the `kir_dump` printed ` m<mask>` on every
+`con`, which `test-kir` (a shard-3 golden, not run by tier0/selfhost) flagged.
+selfhost byte-id passed because the *emitted C* was unchanged — the dump text
+is a separate artifact. Fix: emit the suffix only when `mask != 0` (all-boxed /
+nullary cons dump unchanged) and regenerate the one affected golden line. The
+lesson: a new AST slot that a dumper prints needs its dump goldens checked,
+even when selfhost is green.
+
 ## Call-count before → after (rb-tree `insert_loop`, otool)
 
 | entry | baseline | Block 1+2 | C backend |
