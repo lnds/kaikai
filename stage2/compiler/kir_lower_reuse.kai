@@ -1,0 +1,191 @@
+# compiler/kir_lower_reuse.kai — nested (non-bijective) variant rotation
+# reuse: the pattern-side slot plan and the unique-branch RC accounting.
+#
+# A rotation arm (`Node(_, Node(Red, lx, ..), ..) -> Node(.., Node(.., lx,
+# ..), ..)`) deconstructs one INNER cell and rebuilds through fresh
+# sub-ctors. When the donor is unique the dual-branch lowering
+# (kir_lower_walk) donates BOTH shells — the outer by in-place overwrite,
+# the inner via a stolen reuse token consumed by the first same-arity
+# sub-ctor (Koka's 2-of-3 rotation reuse; the C oracle's `_ru_inner`).
+# This module computes the per-slot plan from the arm pattern and settles
+# the unique branch's RC before the rebuild args run.
+
+import compiler.ast
+import compiler.emit_shared
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_pat_alias
+
+# Result of scanning the direct slots for the single nested sub-ctor.
+type RNFind = RNFound(Int, String, [Pattern]) | RNMulti | RNNone
+
+# Slot classification accumulator; `RNBail` = an unsupported sub-pattern
+# shape appeared, the whole arm keeps the fresh-alloc path.
+type RNPlan = RNOk([RNSlot]) | RNBail
+
+#[doc("""
+Slot plan of a nested-rebuild variant reuse arm. `RNI` with a non-negative
+`nslot` when the pattern deconstructs exactly ONE nested sub-ctor (the
+rotation shape: outer overwrite + inner token donation); `RNI` with
+`nslot = -1` when the pattern is flat but the rebuild nests (the
+recolor-wrap shape: outer overwrite only). `RNInone` when any slot is an
+unsupported sub-pattern shape — the rebuild then keeps the fresh-alloc
+path. Tagged-immediate (Int) slots carry no plan entry.
+""")]
+pub fn pat_reuse_nested(p: Pattern, vs: [EVar]) : ReuseNested = match p.pkind {
+  PVariant(cname, subs) -> rn_plan_variant(cname, subs, vs)
+  _                     -> RNInone
+}
+
+fn rn_plan_variant(cname: String, subs: [Pattern], vs: [EVar]) : ReuseNested = {
+  let tys = pa_payload_tys(vs, cname)
+  match rn_find_nested(subs, 0) {
+    RNFound(nslot, iname, isubs) -> rn_plan_rotation(subs, tys, nslot, iname, isubs, vs)
+    RNMulti -> RNInone
+    RNNone  -> rn_plan_flat(subs, tys)
+  }
+}
+
+# The rotation shape: outer plan minus the nested slot + inner plan.
+fn rn_plan_rotation(subs: [Pattern], tys: [TypeExpr], nslot: Int,
+                    iname: String, isubs: [Pattern], vs: [EVar]) : ReuseNested = {
+  let itys = pa_payload_tys(vs, iname)
+  match rn_slots(subs, tys, 0, nslot, RNOk([])) {
+    RNOk(directs) -> match rn_slots(isubs, itys, 0, 0 - 1, RNOk([])) {
+      RNOk(grands) -> RNI(rn_arity(subs, tys), nslot,
+                          rn_arity(isubs, itys), directs, grands)
+      RNBail       -> RNInone
+    }
+    RNBail -> RNInone
+  }
+}
+
+# The recolor-wrap shape: flat pattern, outer overwrite only.
+fn rn_plan_flat(subs: [Pattern], tys: [TypeExpr]) : ReuseNested =
+  match rn_slots(subs, tys, 0, 0 - 1, RNOk([])) {
+    RNOk(directs) -> RNI(rn_arity(subs, tys), 0 - 1, 0, directs, [])
+    RNBail        -> RNInone
+  }
+
+# A ctor's arity: its registered payload count, pattern length if unknown.
+fn rn_arity(subs: [Pattern], tys: [TypeExpr]) : Int =
+  match tys { [] -> list_length(subs) _ -> list_length(tys) }
+
+# Find the single nested sub-ctor slot (a PVariant with payload slots).
+# A nullary ctor literal (`Red`) is a plain slot, not a nested cell.
+fn rn_find_nested(subs: [Pattern], i: Int) : RNFind = match subs {
+  []            -> RNNone
+  [sp, ...rest] -> match sp.pkind {
+    PVariant(iname, isubs) ->
+      if list_length(isubs) > 0 {
+        match rn_find_nested(rest, i + 1) {
+          RNNone -> RNFound(i, iname, isubs)
+          _      -> RNMulti
+        }
+      } else { rn_find_nested(rest, i + 1) }
+    _ -> rn_find_nested(rest, i + 1)
+  }
+}
+
+# Classify each slot into the RC plan. `skip` is the nested slot (consumed
+# by the token steal), -1 to classify every slot (the inner level). Int
+# slots are tagged immediates (no RC); a live binder plans `RNBind`, any
+# binderless heap-box slot plans `RNDrop` (disposal by projection — a
+# nullary-singleton or immediate drop is a runtime no-op).
+fn rn_slots(subs: [Pattern], tys: [TypeExpr], i: Int, skip: Int, acc: RNPlan) : RNPlan = match acc {
+  RNBail      -> RNBail
+  RNOk(sofar) -> match subs {
+    []            -> RNOk(sofar)
+    [sp, ...rest] -> {
+      let k = match pa_nth_ty(tys, i) { Some(te) -> pa_slot_kind(te) None -> 0 }
+      rn_slots(rest, tys, i + 1, skip, rn_slot_add(sp, k, i, skip, sofar))
+    }
+  }
+}
+
+fn rn_slot_add(sp: Pattern, k: Int, i: Int, skip: Int, sofar: [RNSlot]) : RNPlan =
+  if i == skip or k == 1 { RNOk(sofar) }
+  else { match sp.pkind {
+    PBind(nm) -> if rn_name_unused(nm) { RNOk([RNDrop(i), ...sofar]) }
+                 else { RNOk([RNBind(i, nm), ...sofar]) }
+    PWild     -> RNOk([RNDrop(i), ...sofar])
+    PLit(_)   -> RNOk([RNDrop(i), ...sofar])
+    PVariant(_, isubs2) ->
+      if list_length(isubs2) == 0 { RNOk([RNDrop(i), ...sofar]) } else { RNBail }
+    _ -> RNBail
+  } }
+
+# `_`-prefixed names signal "unused" by convention (`__` stays internal);
+# their binds are not emitted, so disposal goes by projection instead.
+fn rn_name_unused(name: String) : Bool = match char_at(name, 0) {
+  Some(c0) -> c0 == '_' and match char_at(name, 1) {
+    Some(c1) -> c1 != '_'
+    None     -> true
+  }
+  None -> false
+}
+
+#[doc("""
+Unique-branch RC settlement for the outer (direct) slots. The donated
+shell's old references are owned by the rebuild: an embedded binder keeps
+its first use for free (`uses-1` extra dups), an unused binder is dropped,
+and a binderless slot's old value is dropped by projection. Runs before
+the rebuild args so a consuming arg sees settled counts.
+""")]
+pub fn rn_direct_acct(slots: [RNSlot], donor: KVal, uses: [String], pos: KPos, st: LowerSt) : LowerSt = match slots {
+  [] -> st
+  [RNBind(_, nm), ...rest] -> {
+    let k = rn_uses_of(uses, nm)
+    let st1 = if k == 0 { ls_emit(st, KRC(KDrop(rn_reg(st, nm)), pos)) }
+              else { rn_extra_dups(nm, k - 1, pos, st) }
+    rn_direct_acct(rest, donor, uses, pos, st1)
+  }
+  [RNDrop(i), ...rest] ->
+    match ls_fresh_reg(st) { LSReg(greg, st0) -> {
+      let st1 = ls_emit(st0, KLet(greg, SBoxed, KProj(donor, i), pos))
+      rn_direct_acct(rest, donor, uses, pos, ls_emit(st1, KRC(KDrop(KVar(greg)), pos)))
+    } }
+}
+
+#[doc("""
+Unique-branch RC settlement for the inner (grand) slots. Ownership of the
+inner cell's old references is conditional on the steal: a non-null token
+means they MOVED here, a null token (shared inner) means they did not. The
+token-null incref makes every path own exactly one, then embedded binders
+follow the direct rule and binderless slots are dropped by projection.
+The inner cell and token travel as REGISTER NAMES (a fresh `KVar` per
+use), never as one KVal reused across calls — the stage1-built compiler
+miscompiles that shape.
+""")]
+pub fn rn_grand_acct(slots: [RNSlot], innerreg: String, tokreg: String, uses: [String], pos: KPos, st: LowerSt) : LowerSt = match slots {
+  [] -> st
+  [RNBind(_, nm), ...rest] -> {
+    let k = rn_uses_of(uses, nm)
+    match bind_op(st, KCall("kaix_incref_if_token_null", [KVar(tokreg), rn_reg(st, nm)]), pos) { LRes(_, st1) -> {
+      let st2 = if k == 0 { ls_emit(st1, KRC(KDrop(rn_reg(st1, nm)), pos)) }
+                else { rn_extra_dups(nm, k - 1, pos, st1) }
+      rn_grand_acct(rest, innerreg, tokreg, uses, pos, st2)
+    } }
+  }
+  [RNDrop(j), ...rest] ->
+    match ls_fresh_reg(st) { LSReg(greg, st0) -> {
+      let st1 = ls_emit(st0, KLet(greg, SBoxed, KProj(KVar(innerreg), j), pos))
+      match bind_op(st1, KCall("kaix_incref_if_token_null", [KVar(tokreg), KVar(greg)]), pos) { LRes(_, st2) ->
+        rn_grand_acct(rest, innerreg, tokreg, uses, pos, ls_emit(st2, KRC(KDrop(KVar(greg)), pos))) }
+    } }
+}
+
+# Multiset count of `nm` among the rebuild's scrutinee-binder uses.
+fn rn_uses_of(uses: [String], nm: String) : Int = match uses {
+  []            -> 0
+  [u, ...rest]  -> if u == nm { 1 + rn_uses_of(rest, nm) } else { rn_uses_of(rest, nm) }
+}
+
+# The binder's active register (through any shadow rename), as an atom.
+fn rn_reg(st: LowerSt, nm: String) : KVal =
+  KVar(match ls_lookup_rename(st, nm) { Some(r) -> r None -> nm })
+
+# Emit `n` unconditional dups of a binder (its extra embedded uses).
+fn rn_extra_dups(nm: String, n: Int, pos: KPos, st: LowerSt) : LowerSt =
+  if n <= 0 { st }
+  else { rn_extra_dups(nm, n - 1, pos, ls_emit(st, KRC(KDup(rn_reg(st, nm)), pos))) }
