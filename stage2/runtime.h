@@ -14117,6 +14117,40 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
     return 0;
 }
 
+/* Copy one function attribute (by name) from `src` onto `dst` if `dst` lacks it. */
+static void kai_llvm_copy_fn_str_attr(LLVMValueRef dst, LLVMValueRef src,
+                                      const char *name, unsigned nlen) {
+    if (LLVMGetStringAttributeAtIndex(dst, LLVMAttributeFunctionIndex, name, nlen)) return;
+    LLVMAttributeRef a = LLVMGetStringAttributeAtIndex(src, LLVMAttributeFunctionIndex, name, nlen);
+    if (a) LLVMAddAttributeAtIndex(dst, LLVMAttributeFunctionIndex, a);
+}
+
+/* Give every emitted program function the SAME `target-cpu`/`target-features`
+ * the linked runtime bitcode carries, so the inliner sees caller ⊇ callee and
+ * folds the `kaix_*` ops into the hot path — without this the featureless
+ * program function is not a superset of the featured runtime callee and
+ * `areInlineCompatible` refuses every runtime-op inline. The attributes are
+ * copied from a runtime function already in the module (clang baked host
+ * features into the bc), which guarantees an exact match regardless of what
+ * `LLVMGetHostCPUFeatures` reports on this libLLVM build. MUST run after the bc
+ * is linked (so a donor is present) and before the opt pipeline. No-op when no
+ * runtime function carries the attributes (the legacy cc-links path). */
+static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
+    LLVMValueRef donor = NULL;
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        if (LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex, "target-features", 15)) {
+            donor = f; break;
+        }
+    }
+    if (!donor) return;
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        kai_llvm_copy_fn_str_attr(f, donor, "target-cpu", 10);
+        kai_llvm_copy_fn_str_attr(f, donor, "target-features", 15);
+    }
+}
+
 /* --- object emission --- */
 /* Verify the module, then emit it as a native object file at `path`
  * using the host target machine. Returns 0 on success, non-zero on a
@@ -14186,6 +14220,11 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
         if (path) kai_decref(path);
         return 1;
     }
+
+    /* Propagate the runtime bc's host target-cpu/features onto the emitted
+     * program functions so the opt pipeline can inline the runtime ops. Runs
+     * on the linked module (donor present) and before the passes. */
+    kai_llvm_stamp_host_features((LLVMModuleRef) m);
 
     /* L4 (issue #498): optimise the module in-process before codegen.
      * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-
