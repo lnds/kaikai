@@ -32,19 +32,39 @@ external reference not otherwise in the tree.
 
 ```sh
 make -C stage2 kaic2          # build the kaikai compiler first
-benchmarks/rb-tree/run.sh     # wall-clock (median of 5) + peak RSS
+benchmarks/rb-tree/run.sh     # wall-clock (median of 7) + peak RSS
 benchmarks/rb-tree/run.sh 100000   # smaller N
 ```
 
-`run.sh` emits the kaikai C, compiles all three with `cc -O2`, runs each
-five times, and prints a `vs C` / `vs Koka` / `RSS` table. The Koka
-column is skipped automatically if `koka` is not on `PATH`.
+`run.sh` emits the kaikai C, compiles all three with `cc -O2`, gives each
+binary one discarded warm-up run, then times seven **interleaved** rounds
+(one run per column per round) and prints the median in a
+`vs C` / `vs Koka` / `RSS` table. Warm-up + interleaving keeps run-to-run
+noise (cold cache, CPU-frequency ramp, scheduler) from landing
+systematically on whichever column is measured first, so the wall figures
+are stable across re-runs. The Koka column is skipped automatically if
+`koka` is not on `PATH`.
 
 ## Wall-clock vs instruction count — which to trust
 
 **Wall-clock on a laptop is noisy** (cache misses + scheduler dominate;
 runs vary ±10%). It is the number a *user* feels, so it is what `run.sh`
 reports. But it is NOT what the perf lanes gate on.
+
+`kaikai-c` and `kaikai-native` share the front-end but NOT the code
+generator, and on this bench they do NOT do the same work: the C backend
+retires ~2.5G instructions (N=1M) against native's ~15G — a real ~6×
+native-vs-C codegen gap (measured with `/usr/bin/time -l` on Darwin arm64).
+So the native column's larger wall is the codegen gap surfacing, not
+measurement noise; closing it is native-backend perf work (tracked in the
+perf lanes), not a harness bug. When you want the exact, host-independent
+number, read the instruction count below rather than the wall.
+
+> A `./bin/kai build` with no `--backend` is **native** by default, so
+> timing it against `--backend=native` compares native to itself (identical
+> counts) — not native to the C backend. `run.sh`'s kaikai-c column is the
+> C backend (`kaic2` → C → `cc -O2`); that is the honest native-vs-C
+> comparison.
 
 For an **exact, host-independent** measurement use **callgrind in
 Docker** — deterministic instruction count, the truth the perf work is
@@ -70,26 +90,27 @@ RC traffic. Quote whichever you mean, and say which.
 
 ## Last recorded result
 
-**Wall-clock, Mac (Darwin arm64), `cc -O2`, N=1,000,000, median of 5
-(`run.sh`):**
+**Wall-clock, Mac (Darwin arm64), `cc -O2`, N=1,000,000, median of 7
+(`run.sh`, warm-up + interleaved):**
 
 | column | wall (median) | vs C | vs Koka | RSS (MB) |
 |---|---:|---:|---:|---:|
-| C            | 0.26s | 1.00x | 1.04x | 47.4 |
-| Koka         | 0.25s | 0.96x | 1.00x | 48.1 |
-| kaikai-c     | 0.41s | 1.58x | 1.64x | 55.2 |
-| **kaikai-llvm** | **0.79s** | **3.04x** | **3.16x** | **55.4** |
+| C            | 0.25s | 1.00x | 1.00x | 47.4 |
+| Koka         | 0.25s | 1.00x | 1.00x | 48.1 |
+| kaikai-c     | 0.41s | 1.64x | 1.64x | 55.2 |
+| **kaikai-native** | **0.96s** | **3.84x** | **3.84x** | **55.2** |
 
-> **Historical (kaikai-llvm column).** The `kaikai-llvm` rows below recorded
-> the now-retired llvm-text backend (`--emit=llvm` + clang -O2 +
-> `runtime_llvm.c`), removed 2026-06-16. `run.sh` now measures a
-> `kaikai-native` column instead — the in-process libLLVM backend
-> (`--backend=native`, no `.ll` text, no clang) that replaced it. The rows
-> here are kept as a point-in-time record; re-run `run.sh` for current
-> native-vs-C numbers.
+> **Historical (kaikai-llvm column).** An earlier table here recorded the
+> now-retired llvm-text backend (`--emit=llvm` + clang -O2 +
+> `runtime_llvm.c`), removed 2026-06-16. `run.sh` measures the
+> `kaikai-native` column above instead — the in-process libLLVM backend
+> (`--backend=native`, no `.ll` text, no clang) that replaced it.
 
-`kaikai-c` is the default C backend; the two columns share the front-end, so
-the gap is pure code-generation.
+`kaikai-native` is the *default* backend (`kai build` with no `--backend`
+is native since the Lane 1.5 flip); `kaikai-c` is the portable C-text
+backend (`--backend=c`). Both share the front-end, so the ~2.3x wall / ~6x
+instruction gap between them is pure code-generation, not a measurement
+artefact — closing it is native-backend perf work.
 
 **Instruction count, Docker callgrind, N=100,000 (the perf-lane truth):**
 
