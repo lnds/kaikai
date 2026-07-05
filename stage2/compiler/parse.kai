@@ -193,6 +193,8 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkUInt32     -> match b { TkUInt32 -> true _ -> false }
     TkUInt64     -> match b { TkUInt64 -> true _ -> false }
     TkInt128     -> match b { TkInt128 -> true _ -> false }
+    TkUInt8      -> match b { TkUInt8 -> true _ -> false }
+    TkDecimal    -> match b { TkDecimal -> true _ -> false }
     TkBigInt     -> match b { TkBigInt -> true _ -> false }
     TkComplex    -> match b { TkComplex -> true _ -> false }
     TkChar       -> match b { TkChar -> true _ -> false }
@@ -507,6 +509,15 @@ fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
   with_ty(mk_expr(EFixed(digits, ty), t.line, t.col), ty)
 }
 
+# Build a `Byte` literal from a `<int>u8` token: strip the 2-char `u8`
+# suffix, decode the fitting-i64 value, and stamp `TyByte`. The `0..255`
+# range check is deferred to the typer (the `[Byte]` element path).
+fn byte_lit(src: String, t: Token) : Expr {
+  let span = tok_source(src, t)
+  let digits = string_slice(span, 0, string_length(span) - 2)
+  with_ty(mk_expr(EInt(decode_int(digits)), t.line, t.col), TyByte)
+}
+
 fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
   if i >= n { acc }
   else {
@@ -749,6 +760,8 @@ fn arg_has_placeholder(e: Expr) : Bool {
     EPlaceholder        -> true
     EInt(_)             -> false
     EReal(_, _)            -> false
+    EIntLit(_)            -> false
+    EDecimalLit(_)        -> false
     EFixed(_, _)          -> false
     EBool(_)            -> false
     EChar(_)            -> false
@@ -865,6 +878,8 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
   match k {
     EInt(_)             -> k
     EReal(_, _)            -> k
+    EIntLit(_)            -> k
+    EDecimalLit(_)        -> k
     EFixed(_, _)          -> k
     EBool(_)            -> k
     EChar(_)            -> k
@@ -1598,12 +1613,19 @@ fn parse_primary(p: Parser) : PExpr / Console {
     TkInt -> {
       let span = tok_source(p.src, t)
       if int_lit_overflows(span) {
-        err_e(p_error(p_advance(p), t,
-          if has_base_prefix(span) {
-            "hex/binary literal exceeds 64 bits; Int is 64-bit — use bigint.from_string"
-          } else {
-            "integer literal out of Int range; use a BigInt literal #{span}n or bigint.from_string"
-          }))
+        # A hex/binary literal past 64 bits is a hard error — no
+        # arbitrary-precision carrier decodes a base-prefixed span.
+        if has_base_prefix(span) {
+          err_e(p_error(p_advance(p), t,
+            "hex/binary literal exceeds 64 bits; Int is 64-bit — use bigint.from_string"))
+        } else {
+          # A decimal literal past i64 keeps its lexeme in an EIntLit so
+          # an annotation can mint it to BigInt/DecimalBig/Int128; the
+          # typer surfaces the out-of-range error when no such context
+          # is present. A unit annotation cannot follow (the carrier is
+          # arbitrary-precision, not a `Real<u>`).
+          ok_e(p_advance(p), mk_expr(EIntLit(span), t.line, t.col))
+        }
       } else {
         let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
         try_lit_unit_annotation(p_advance(p), lit, t)
@@ -1622,6 +1644,18 @@ fn parse_primary(p: Parser) : PExpr / Console {
     TkUInt32 -> ok_e(p_advance(p), fixed_lit(p.src, t, 3, TyUInt32))
     TkUInt64 -> ok_e(p_advance(p), fixed_lit(p.src, t, 3, TyUInt64))
     TkInt128 -> ok_e(p_advance(p), fixed_lit(p.src, t, 4, TyInt128))
+    # `<int>u8` is a Byte literal. The value fits i64, so decode it and
+    # stamp the node `TyByte`; the typer range-checks `0..255`, matching
+    # the `[Byte]` list-element path.
+    TkUInt8  -> ok_e(p_advance(p), byte_lit(p.src, t))
+    # `<num>d` is a Decimal literal. Strip the `d` and keep the lexeme in
+    # an EDecimalLit; the typer folds the exact `{ raw, scale }` and
+    # errors past the Int128 carrier.
+    TkDecimal -> {
+      let span = tok_source(p.src, t)
+      let digits = string_slice(span, 0, string_length(span) - 1)
+      ok_e(p_advance(p), mk_expr(EDecimalLit(digits), t.line, t.col))
+    }
     # `<int>n` desugars at parse time to `bigint.from_literal("<digits>")`.
     # The span covers digits + trailing `n`; strip the `n` and pass the
     # digit string through untouched so arbitrary-precision values fold
