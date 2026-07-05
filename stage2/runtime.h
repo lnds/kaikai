@@ -3215,6 +3215,59 @@ static void kai_free_cons_spine(KaiValue *v) {
     }
 }
 
+/* Iterative unique-variant tree free — the tree analogue of
+ * kai_free_cons_spine. Entered from kai_free_value's KAI_VARIANT case
+ * only once a unique (rc==1) variant child (`first`) is found: `v` has
+ * rc 0 and its slots below `next_slot` already released. A unique
+ * variant child transfers ownership to the walk (rc set to 0, no
+ * decref — that per-node decrement is the traffic this path deletes)
+ * through a worklist bounded by tree depth; immediate, shared,
+ * saturated, primitive, and non-variant slots cascade through
+ * kai_decref, and a full worklist falls back to kai_decref's recursive
+ * path. Out of line on purpose: the worklist frame (and its stack
+ * guard) must not tax the common shared-children free. Each block
+ * frees whole via KAI_RECYCLE_CELL, exactly once per cell. */
+#define KAI_VARIANT_SPINE_CAP 128
+static KAI_RC_NOINLINE void kai_free_variant_spine(KaiValue *v, int next_slot,
+                                                   KaiValue *first) {
+    KaiValue *pending[KAI_VARIANT_SPINE_CAP];
+    int n_pending = 0;
+    first->rc = 0;
+    pending[n_pending++] = first;
+    for (;;) {
+        uint32_t mask = kai_slot_mask_of(v->variant_tag);
+        int n_args = v->var_n_args;
+        for (int i = next_slot; i < n_args; ++i) {
+            if (mask != 0 && kai_var_slot_kind(mask, i) != KAI_VAR_SLOT_PTR) continue;
+            KaiValue *c = kai_var_slots(v)[i].ptr;
+            if (!kai_is_ptr(c)) continue;         /* immediate / null: no RC */
+            int32_t rc = c->rc;
+            if (rc == INT32_MAX) continue;        /* saturated singleton */
+            if (rc == 1) {
+                if (c->tag == (int32_t) KAI_VARIANT &&
+                    n_pending < KAI_VARIANT_SPINE_CAP) {
+                    c->rc = 0;
+                    pending[n_pending++] = c;
+                    continue;
+                }
+                kai_decref(c);                    /* unique non-variant: own free path */
+                continue;
+            }
+            /* Shared: kai_decref's rc>1 arm unfolded — one rc load, no
+             * re-checks. Must stay behaviourally identical to kai_decref. */
+            kai_rc_decref_total++;
+#ifdef KAI_TRACE_RC
+            kai_rc_history_log(c, /* op=decref */ 2, c->tag);
+#endif
+            c->rc = rc - 1;
+        }
+        KAI_RECYCLE_CELL(v);
+        if (n_pending == 0) return;
+        v = pending[--n_pending];
+        next_slot = 0;
+    }
+}
+
 static void kai_free_value(KaiValue *v) {
     KAI_PROF_ENTER();
     switch ((KaiTag) v->tag) {
@@ -3235,28 +3288,39 @@ static void kai_free_value(KaiValue *v) {
             free((void *) v->as.rec.names);
             break;
         case KAI_VARIANT: {
-            /* Issue #440 — only pointer slots cascade through decref.
-             * Phase 2: primitive slots (mask kind != PTR) carry raw
-             * scalars and need no RC. The mask==0 hot path skips the
-             * kind branch entirely. The mask lookup is hoisted out of the
-             * slot loop — it was re-read per slot (5× for an RBNode), a
-             * table lookup each time; the tag is fixed across the loop so
-             * one read suffices. (The whole tree's free walks this.) */
+            /* Only pointer slots carry RC (mask kind PTR; mask==0 means
+             * all-PTR; the mask lookup is hoisted — the tag is fixed
+             * across the loop). A unique variant child hands the whole
+             * subtree to the iterative walk, which recycles v and
+             * returns — must NOT fall to the post-switch tail (that
+             * would double-free v). Shared children take kai_decref's
+             * rc>1 arm unfolded: one rc load, no re-checks. FAM payload
+             * slots are inline in this block — the whole block returns
+             * to the per-arity variant pool at the recycle step. */
             uint32_t fmask = kai_slot_mask_of(v->variant_tag);
             int fn_args = v->var_n_args;
-            if (fmask == 0) {
-                for (int i = 0; i < fn_args; ++i) kai_decref(kai_var_slots(v)[i].ptr);
-            } else {
-                for (int i = 0; i < fn_args; ++i) {
-                    if (kai_var_slot_kind(fmask, i) == KAI_VAR_SLOT_PTR) {
-                        kai_decref(kai_var_slots(v)[i].ptr);
+            for (int i = 0; i < fn_args; ++i) {
+                if (fmask != 0 && kai_var_slot_kind(fmask, i) != KAI_VAR_SLOT_PTR) continue;
+                KaiValue *c = kai_var_slots(v)[i].ptr;
+                if (!kai_is_ptr(c)) continue;
+                int32_t crc = c->rc;
+                if (crc == INT32_MAX) continue;
+                if (crc == 1) {
+                    if (c->tag == (int32_t) KAI_VARIANT) {
+                        kai_free_variant_spine(v, i + 1, c);
+                        KAI_PROF_EXIT(free);
+                        return;
                     }
+                    kai_decref(c);
+                    continue;
                 }
+                kai_rc_decref_total++;
+#ifdef KAI_TRACE_RC
+                kai_rc_history_log(c, /* op=decref */ 2, c->tag);
+#endif
+                c->rc = crc - 1;
             }
         }
-            /* FAM: payload slots are inline in this block — no separate
-             * array to free. The whole block returns to the per-arity
-             * variant pool at the recycle step below (keyed on tag). */
             break;
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
