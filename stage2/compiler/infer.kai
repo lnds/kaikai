@@ -22,6 +22,7 @@ import compiler.desugar
 import compiler.doc_attr
 import compiler.native_prims
 import compiler.infer_index
+import compiler.lit_mint
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -498,6 +499,8 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     # Leaves: no sub-Expr to recurse into.
     EInt(_)        -> k
     EReal(_, _)       -> k
+    EIntLit(_)        -> k
+    EDecimalLit(_)    -> k
     EFixed(_, _)      -> k
     EBool(_)       -> k
     EChar(_)       -> k
@@ -1715,6 +1718,8 @@ fn inferred_main_row(performed: [Label]) : RowExpr {
 fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   EInt(_)             -> acc
   EReal(_, _)            -> acc
+  EIntLit(_)            -> acc
+  EDecimalLit(_)        -> acc
   EFixed(_, _)          -> acc
   EBool(_)            -> acc
   EChar(_)            -> acc
@@ -2098,6 +2103,8 @@ fn walk_field_priv_children(file: String, home: Option[String],
                               acc: Int) : Int / Console + File = match k {
   EInt(_)           -> acc
   EReal(_, _)          -> acc
+  EIntLit(_)           -> acc
+  EDecimalLit(_)       -> acc
   EFixed(_, _)         -> acc
   EBool(_)          -> acc
   EChar(_)          -> acc
@@ -2394,6 +2401,8 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
   match e.kind {
     EInt(_)           -> acc
     EReal(_, _)          -> acc
+    EIntLit(_)           -> acc
+    EDecimalLit(_)       -> acc
     EFixed(_, _)         -> acc
     EBool(_)          -> acc
     EChar(_)          -> acc
@@ -8774,6 +8783,12 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # node itself; that type IS the literal's type.
     EFixed(_, ty)  -> inferred_leaf(st, ty, e)
     EReal(_, _)       -> inferred_leaf(st, TyReal, e)
+    # A past-i64 integer literal with no concrete carrier in context is
+    # out of range — the `n`/`bigint.from_string` escape hatch is named.
+    EIntLit(span)  -> synth_lit_mint_or_err(st, e, EIntLit(span))
+    # A `d`-suffixed literal always targets `Decimal`; the suffix
+    # supplies the carrier locally, so mint it with no expected type.
+    EDecimalLit(_) -> synth_lit_mint_or_err(st, e, e.kind)
     EBool(_)       -> inferred_leaf(st, TyBool, e)
     EChar(_)       -> inferred_leaf(st, TyChar, e)
     EStr(_, _)     -> inferred_leaf(st, TyString, e)
@@ -13401,6 +13416,93 @@ fn maybe_lower_decimal_lit(value: Expr, value_ty: Ty, expected: Ty) : ExprTy {
 
 type ExprTy = { expr: Expr, ty: Ty }
 
+type MintedExpr = { st: InferState, pair: ExprTy }
+
+# Coin a numeric literal to a concrete carrier resolved from context.
+# `expected` must already be `apply_ty`-resolved: a concrete carrier
+# mints (or errors on overflow / shape mismatch); a type variable falls
+# through to the Decimal-with-unit lowering and then the shape default,
+# so unification stays the authority and principality is preserved.
+fn maybe_mint_literal(st: InferState, value: Expr, value_ty: Ty, expected: Ty,
+                      line: Int, col: Int) : MintedExpr / Console + File + Mutable {
+  match mint_literal(value, expected) {
+    MintOk(e2) -> {
+      let new_ty = match e2.ty { Some(t) -> t None -> value_ty }
+      MintedExpr { st: st, pair: ExprTy { expr: e2, ty: new_ty } }
+    }
+    MintErr(msg) -> {
+      diag_error(st.file, line, col, msg)
+      MintedExpr { st: st_bump_err(st), pair: ExprTy { expr: value, ty: value_ty } }
+    }
+    MintNone -> MintedExpr { st: st, pair: maybe_lower_decimal_lit(value, value_ty, expected) }
+  }
+}
+
+# The synth-side entry for the textual literal nodes that carry no shape
+# default. A `d` suffix mints to `Decimal` unconditionally; a bare
+# past-i64 integer with no concrete carrier in context is out of range
+# and names the `n` / `bigint.from_string` escape hatch.
+fn synth_lit_mint_or_err(st: InferState, e: Expr, kind: ExprKind) : Inferred / Console + File + Mutable {
+  match kind {
+    EDecimalLit(_) -> synth_mint_decimal(st, e)
+    EIntLit(span)  -> {
+      diag_error(st.file, e.line, e.col, lit_mint_int_range_error(span))
+      mk_inferred(st_bump_err(st), TyInt, e)
+    }
+    _ -> {
+      diag_error(st.file, e.line, e.col, "numeric literal has no concrete type in context")
+      mk_inferred(st_bump_err(st), TyInt, e)
+    }
+  }
+}
+
+# A let-RHS under annotation. A textual numeric literal
+# (`EIntLit`/`EDecimalLit`) coins against the resolved annotation here,
+# before `synth` would error on the missing context; everything else
+# synths normally and the post-synth `maybe_mint_literal` covers the
+# `EInt`/`EReal` cases.
+fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
+                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  match rhs.kind {
+    EIntLit(_)     -> mint_let_textual(st, rhs, te, line, col)
+    EDecimalLit(_) -> mint_let_textual(st, rhs, te, line, col)
+    _ -> synth(st, rhs)
+  }
+}
+
+fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
+                    line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let expected = apply_ty(st.sub, inf_resolve_ty_rk(te, st.env.row_kind))
+  match mint_literal(rhs, expected) {
+    MintOk(e2) -> {
+      let ty = match e2.ty { Some(t) -> t None -> expected }
+      mk_inferred(st, ty, e2)
+    }
+    MintErr(msg) -> {
+      diag_error(st.file, line, col, msg)
+      mk_inferred(st_bump_err(st), expected, rhs)
+    }
+    MintNone -> synth(st, rhs)
+  }
+}
+
+fn synth_mint_decimal(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
+  match mint_literal(e, TyCon(None, "Decimal", [])) {
+    MintOk(e2) -> {
+      let ty = match e2.ty { Some(t) -> t None -> TyCon(None, "Decimal", []) }
+      mk_inferred(st, ty, e2)
+    }
+    MintErr(msg) -> {
+      diag_error(st.file, e.line, e.col, msg)
+      mk_inferred(st_bump_err(st), TyCon(None, "Decimal", []), e)
+    }
+    MintNone -> {
+      diag_error(st.file, e.line, e.col, "numeric literal has no concrete type in context")
+      mk_inferred(st_bump_err(st), TyCon(None, "Decimal", []), e)
+    }
+  }
+}
+
 fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits / Console + File + Mutable {
 
 
@@ -13409,15 +13511,16 @@ fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int,
     [fi, ...rest] -> match fi {
       FI(fnm, ex) -> {
         let r = synth(st, ex)
-        let lower_pair = match fty_find(fields, fnm) {
-          None -> ExprTy { expr: r.expr, ty: r.ty }
-          Some(ft) -> maybe_lower_decimal_lit(r.expr, r.ty, apply_ty(r.st.sub, ft))
+        let minted = match fty_find(fields, fnm) {
+          None -> MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } }
+          Some(ft) -> maybe_mint_literal(r.st, r.expr, r.ty, apply_ty(r.st.sub, ft), line, col)
         }
+        let lower_pair = minted.pair
         let s1 = match fty_find(fields, fnm) {
-          None -> r.st
+          None -> minted.st
           Some(ft) -> {
             let what = string_concat("record field '", string_concat(fnm, "'"))
-            st_unify(r.st, ft, lower_pair.ty, what, line, col)
+            st_unify(minted.st, ft, lower_pair.ty, what, line, col)
           }
         }
         let rr = synth_field_inits(s1, rest, fields, line, col)
@@ -13525,23 +13628,31 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
             let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
-          _ -> synth(amb_st, rhs)
+          # a bare numeric literal coins directly to the annotated carrier
+          # from its source lexeme, before synth would stamp a default
+          # type (or error on a textual `EIntLit`/`EDecimalLit`).
+          _ -> synth_let_rhs_or_mint(amb_st, rhs, te, pat.line, pat.col)
         }
         None -> synth(amb_st, rhs)
       }
-      # when the let binding is annotated `Decimal<u>` and
-      # the RHS is a UoM-literal `<u>`, lower it to a typed
-      # `Decimal { raw, scale }` carrier so the unifier sees equal
-      # types instead of a `Real<u>` vs `Decimal<u>` shape clash.
-      let lower_pair = match ann {
-        None -> ExprTy { expr: rr.expr, ty: rr.ty }
-        Some(te) -> maybe_lower_decimal_lit(rr.expr, rr.ty, apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind)))
+      # when the let binding is annotated, coin a numeric RHS literal to
+      # the declared carrier: a point literal to an exact Decimal, an
+      # integer to any numeric type, from the source lexeme. The
+      # Decimal-with-unit lowering is folded into `maybe_mint_literal`.
+      # `st_unify` below still confirms the minted type equals the
+      # declared one, so the unifier stays the authority.
+      let minted = match ann {
+        None -> MintedExpr { st: rr.st, pair: ExprTy { expr: rr.expr, ty: rr.ty } }
+        Some(te) -> maybe_mint_literal(rr.st, rr.expr, rr.ty,
+                                       apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind)),
+                                       pat.line, pat.col)
       }
+      let lower_pair = minted.pair
       let binding_st = match ann {
-        None -> rr.st
+        None -> minted.st
         Some(te) -> {
-          let declared = inf_resolve_ty_rk(te, rr.st.env.row_kind)
-          st_unify(rr.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
+          let declared = inf_resolve_ty_rk(te, minted.st.env.row_kind)
+          st_unify(minted.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
         }
       }
       let binding_ty = match ann {
@@ -17320,6 +17431,8 @@ fn validate_unit_refs_kind(k: ExprKind, declared: [String], file: String,
                               line: Int, col: Int) : Int / Console + File = match k {
   EInt(_)        -> 0
   EReal(_, _)       -> 0
+  EIntLit(_)        -> 0
+  EDecimalLit(_)    -> 0
   EFixed(_, _)      -> 0
   EBool(_)       -> 0
   EChar(_)       -> 0
@@ -18035,6 +18148,8 @@ fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
   match k {
     EInt(_) -> k
     EReal(_, _) -> k
+    EIntLit(_) -> k
+    EDecimalLit(_) -> k
     EFixed(_, _) -> k
     EBool(_) -> k
     EChar(_) -> k
@@ -18860,6 +18975,8 @@ fn tag_of_kind(k: ExprKind) : String {
     EInt(n)        -> concat_all(["int ", int_to_string(n)])
     EFixed(span, _)   -> concat_all(["fixed ", span])
     EReal(_, _)       -> "real"
+    EIntLit(_)        -> "real"
+    EDecimalLit(_)    -> "real"
     EBool(b)       -> if b { "bool true" } else { "bool false" }
     EChar(_)       -> "char"
     EStr(_, _)     -> "string"

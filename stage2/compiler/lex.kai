@@ -90,6 +90,17 @@ pub type TokKind
   # textual span (an EFixed node) because its value can exceed 2^63 and
   # would overflow the compiler's 64-bit decode.
   | TkInt32 | TkUInt32 | TkUInt64 | TkInt128
+  # An integer literal followed *immediately* by `u8` (`200u8`) lexes as
+  # TkUInt8, the surface literal for the `Byte` carrier. The span covers
+  # the digits AND the suffix; the parser strips it and the typer
+  # range-checks `0..255`, mirroring the `[Byte]` list-element path.
+  | TkUInt8
+  # A numeric literal followed *immediately* by `d` (`19.99d`, `42d`)
+  # lexes as TkDecimal, the suffix form for the `Decimal` carrier. Unlike
+  # the width and bigint suffixes it fires on both the integer and real
+  # base. The span covers the digits AND the `d`; the parser strips it
+  # and folds an exact `Decimal { raw, scale }` from the source lexeme.
+  | TkDecimal
   # A decimal integer literal followed *immediately* by `n` (`99n`)
   # lexes as TkBigInt. The token span includes the trailing `n`; the
   # parser strips it and desugars to `bigint.from_literal("<digits>")`,
@@ -162,6 +173,7 @@ pub fn tk_name(k: TokKind) : String {
     TkRegex -> "REGEX"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkInt32 -> "INT32" TkUInt32 -> "UINT32" TkUInt64 -> "UINT64" TkInt128 -> "INT128"
+    TkUInt8 -> "UINT8" TkDecimal -> "DECIMAL"
     TkBigInt -> "BIGINT"
     TkComplex -> "COMPLEX"
     TkIdent -> "IDENT" TkUnderscore -> "_"
@@ -529,9 +541,10 @@ fn lex_width_after_i(l: Lexer) : Option[WidthSuffix] {
   else { None }
 }
 
-# After the leading `u`: `32` is UInt32, `64` is UInt64.
+# After the leading `u`: `8` is Byte, `32` is UInt32, `64` is UInt64.
 fn lex_width_after_u(l: Lexer) : Option[WidthSuffix] {
-  if lex_match_str(l, "32") { Some(WS(TkUInt32, lex_skip(l, 2))) }
+  if lex_match_str(l, "8") { Some(WS(TkUInt8, lex_skip(l, 1))) }
+  else if lex_match_str(l, "32") { Some(WS(TkUInt32, lex_skip(l, 2))) }
   else if lex_match_str(l, "64") { Some(WS(TkUInt64, lex_skip(l, 2))) }
   else { None }
 }
@@ -580,10 +593,17 @@ fn lex_maybe_complex_suffix(l: Lexer, sl: Int, sc: Int, start: Int, fallback: To
   match lex_width_suffix(l, fallback) {
     Some(WS(kind, l_after)) -> Step(l_after, tok(kind, sl, sc, start, l_after.pos))
     None ->
+      # `<num>d` is a Decimal literal — on either base (`42d`, `19.99d`),
+      # only when no identifier char follows (so `42d` lexes but `42down`
+      # keeps `42` then `down`).
+      if lex_is_decimal_suffix(l) {
+        let l_after = lex_advance(l)
+        Step(l_after, tok(TkDecimal, sl, sc, start, l_after.pos))
+      }
       # `<int>n` is a BigInt literal — only on an integer base, and only
       # when no identifier char follows (so `99n` lexes but `99name`
       # keeps `99` then `name`).
-      if lex_is_bigint_suffix(l, fallback) {
+      else if lex_is_bigint_suffix(l, fallback) {
         let l_after = lex_advance(l)
         Step(l_after, tok(TkBigInt, sl, sc, start, l_after.pos))
       } else if lex_peek_is(l, 'i') {
@@ -594,6 +614,15 @@ fn lex_maybe_complex_suffix(l: Lexer, sl: Int, sc: Int, start: Int, fallback: To
       }
   }
 }
+
+# True when `l` is at a `d` that ends a numeric literal (`<num>d`) and is
+# not the start of an identifier. Fires on both integer and real bases.
+fn lex_is_decimal_suffix(l: Lexer) : Bool =
+  lex_peek_is(l, 'd') and
+    match lex_peek_at(l, 1) {
+      Some(c) -> not ch_is_alnum(c)
+      None    -> true
+    }
 
 # True when `l` is at an `n` that ends an integer literal (`<int>n`) and
 # is not the start of an identifier.
