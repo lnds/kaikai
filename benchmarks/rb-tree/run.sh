@@ -35,7 +35,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 CC="${CC:-cc}"
-RUNS=5
+RUNS=7
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -96,29 +96,54 @@ fi
 
 # --- measure: median wall (s) + peak RSS (MB) ------------------------------
 # /usr/bin/time -p prints 'real <s>'; -l adds 'maximum resident set size'.
-median_wall() {
-  local bin="$1" t
-  local -a xs=()
-  for _ in $(seq "$RUNS"); do
-    t=$(/usr/bin/time -p "$bin" >/dev/null 2>"$WORK/t"; grep '^real' "$WORK/t" | awk '{print $2}')
-    xs+=("$t")
-  done
-  printf '%s\n' "${xs[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'
-}
+#
+# Warm-up + interleaving. Measuring one column's RUNS back-to-back before the
+# next makes the FIRST column pay cold-cache/cold-frequency while the rest run
+# warm — a systematic bias that makes the wall figures swing run-to-run.
+# Instead every binary gets one discarded warm-up run, then the timed runs
+# interleave round-robin so cache / scheduler / CPU-frequency noise falls
+# evenly on all columns and the medians are stable across re-runs.
+
+# One '/usr/bin/time -p' run of $bin; echoes the 'real' seconds.
+time_once() { /usr/bin/time -p "$1" >/dev/null 2>"$WORK/t"; grep '^real' "$WORK/t" | awk '{print $2}'; }
+
+median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
+
 peak_rss_mb() {
-  local bin="$1"
-  /usr/bin/time -l "$bin" >/dev/null 2>"$WORK/t" || true
+  /usr/bin/time -l "$1" >/dev/null 2>"$WORK/t" || true
   awk '/maximum resident set size/{printf "%.1f", $1/1048576}' "$WORK/t"
 }
 
-say "measuring (median of $RUNS wall runs + peak RSS) ..."
-C_W=$(median_wall "$WORK/rb_c");        C_R=$(peak_rss_mb "$WORK/rb_c")
-KAI_W=$(median_wall "$WORK/rb_kaikai"); KAI_R=$(peak_rss_mb "$WORK/rb_kaikai")
+# Columns present this run, as parallel indexed arrays (bash 3.2 has no
+# associative arrays). SAMPLES[i] accumulates column i's timed runs.
+PATHS=("$WORK/rb_c" "$WORK/rb_kaikai")
+[[ "$HAVE_NATIVE" == 1 ]] && PATHS+=("$WORK/rb_kaikai_native")
+[[ "$HAVE_KOKA"   == 1 ]] && PATHS+=("$WORK/rb_koka")
+NCOL=${#PATHS[@]}
+SAMPLES=()
+
+say "measuring (1 warm-up + median of $RUNS interleaved wall runs + peak RSS) ..."
+
+# Warm-up pass: prime cache/branch-predictor for every column, discard timings.
+i=0; while [[ $i -lt $NCOL ]]; do time_once "${PATHS[$i]}" >/dev/null; i=$((i + 1)); done
+# Timed passes: interleave columns each round so noise spreads evenly.
+r=0; while [[ $r -lt $RUNS ]]; do
+  i=0; while [[ $i -lt $NCOL ]]; do
+    SAMPLES[$i]="${SAMPLES[$i]:-} $(time_once "${PATHS[$i]}")"
+    i=$((i + 1))
+  done
+  r=$((r + 1))
+done
+
+# Columns are appended in a fixed order; map each back by index.
+ci=0
+C_W=$(median ${SAMPLES[$ci]});          C_R=$(peak_rss_mb "$WORK/rb_c");        ci=$((ci + 1))
+KAI_W=$(median ${SAMPLES[$ci]});        KAI_R=$(peak_rss_mb "$WORK/rb_kaikai"); ci=$((ci + 1))
 if [[ "$HAVE_NATIVE" == 1 ]]; then
-  KNT_W=$(median_wall "$WORK/rb_kaikai_native"); KNT_R=$(peak_rss_mb "$WORK/rb_kaikai_native")
+  KNT_W=$(median ${SAMPLES[$ci]}); KNT_R=$(peak_rss_mb "$WORK/rb_kaikai_native"); ci=$((ci + 1))
 fi
 if [[ "$HAVE_KOKA" == 1 ]]; then
-  KK_W=$(median_wall "$WORK/rb_koka");  KK_R=$(peak_rss_mb "$WORK/rb_koka")
+  KK_W=$(median ${SAMPLES[$ci]});  KK_R=$(peak_rss_mb "$WORK/rb_koka");          ci=$((ci + 1))
 fi
 
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0==0) print "—"; else printf "%.2fx", a/b }'; }
@@ -136,4 +161,11 @@ if [[ "$HAVE_NATIVE" == 1 ]]; then
 printf "%-12s  %9ss  %8s  %8s  %10s\n" "kaikai-native" "$KNT_W" "$(ratio "$KNT_W" "$C_W")" "$( [[ $HAVE_KOKA == 1 ]] && ratio "$KNT_W" "$KK_W" || echo '—')" "$KNT_R"
 fi
 echo
+if [[ "$HAVE_NATIVE" == 1 ]]; then
+echo "Note: kaikai-c and kaikai-native share the front-end but NOT the code path."
+echo "On this bench native retires ~6x more instructions than the C backend (real"
+echo "codegen gap, tracked in the perf lanes — see README 'Wall-clock vs"
+echo "instruction count'), so its larger wall is expected, not measurement noise."
+echo
+fi
 echo "kaikai @ $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
