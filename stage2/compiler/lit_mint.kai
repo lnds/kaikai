@@ -1,0 +1,283 @@
+# Context-driven numeric-literal minting. When an annotation (or a `d`
+# suffix) fixes a concrete numeric carrier, a literal is coined to that
+# carrier at fold time from its source lexeme, exactly -- trailing zeros
+# and arbitrary precision survive because the digits, not a lossy f64,
+# drive the fold.
+#
+# The lattice is closed and by lexical shape:
+#   integer `5`   -> Int, Int32, UInt32, UInt64, Int128, Byte,
+#                    Decimal, DecimalBig, BigInt, Real
+#   point   `0.2` -> Real, Decimal, DecimalBig  (never an integer type)
+# A magnitude past the target carrier is a fold-time error, not a wrap.
+#
+# The unifier stays the authority: minting only PROPOSES a rewrite whose
+# type equals the concrete expected, and the caller lets unification
+# confirm it. When the expected type is still a variable, minting yields
+# `MintNone` and the literal falls back to its shape default, so
+# principality is preserved (an integer literal defaults to `Int`, a
+# point literal to `Real`, and unifies) -- no "coinable-from-integer"
+# obligation ever travels.
+
+import compiler.ast
+
+# `Int128` positive maximum, `2^127 - 1` (39 digits). A minted magnitude
+# above this overflows the `Decimal`/`Int128` carrier.
+fn int128_max_digits() : String = "170141183460469231731687303715884105727"
+
+pub type MintResult
+  # The literal was coined to the concrete carrier.
+  = MintOk(Expr)
+  # The concrete carrier rejects this literal (wrong shape, or magnitude
+  # past the carrier). Carries the diagnostic message.
+  | MintErr(String)
+  # No concrete carrier in context; the caller keeps the literal's
+  # shape default and unifies.
+  | MintNone
+
+#[doc("Coin a numeric literal `value` to the concrete carrier `target`, or report why it cannot. `MintNone` means the target is not a concrete numeric carrier -- fall back to shape-default inference.")]
+pub fn mint_literal(value: Expr, target: Ty) : MintResult =
+  match value.kind {
+    EInt(n)        -> mint_int(n, value, target)
+    EIntLit(span)  -> mint_big_int(span, value, target)
+    EReal(_, span) -> mint_point(span, value, target)
+    EDecimalLit(span) -> mint_decimal_suffix(span, value)
+    _ -> MintNone
+  }
+
+# An integer literal that fits i64. Every carrier in the lattice accepts
+# it; the fold is exact because `n` is the exact value.
+fn mint_int(n: Int, value: Expr, target: Ty) : MintResult =
+  match target {
+    TyInt    -> MintOk(with_ty(value, TyInt))
+    TyInt32  -> MintOk(mk_fixed(int_to_dec_string(n), TyInt32, value))
+    TyUInt32 -> MintOk(mk_fixed(int_to_dec_string(n), TyUInt32, value))
+    TyUInt64 -> MintOk(mk_fixed(int_to_dec_string(n), TyUInt64, value))
+    TyInt128 -> MintOk(mk_fixed(int_to_dec_string(n), TyInt128, value))
+    TyByte   -> mint_byte(n, value)
+    TyReal   -> MintOk(mk_real(int_to_real(n), int_to_dec_string(n), value))
+    TyCon(_, name, _) -> mint_int_carrier(n, name, value)
+    _ -> MintNone
+  }
+
+fn mint_int_carrier(n: Int, name: String, value: Expr) : MintResult =
+  if name == "Decimal" { MintOk(mk_decimal_lit(int_to_dec_string(n), 0, value)) }
+  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(int_to_dec_string(n), 0, value)) }
+  else if name == "BigInt" { MintOk(mk_bigint_lit(int_to_dec_string(n), value)) }
+  else { MintNone }
+
+fn mint_byte(n: Int, value: Expr) : MintResult =
+  if n >= 0 and n <= 255 { MintOk(with_ty(mk_expr(EInt(n), value.line, value.col), TyByte)) }
+  else { MintErr("Byte literal out of range 0..255") }
+
+# An integer literal past i64 (`EIntLit`). Only the arbitrary-precision
+# carriers and `Int128` accept it; a fixed carrier is an out-of-range
+# error keyed to the same escape hatch the parser used to name.
+fn mint_big_int(span: String, value: Expr, target: Ty) : MintResult =
+  match target {
+    TyInt128 -> mint_int128_span(span, value)
+    TyCon(_, name, _) -> mint_big_carrier(span, name, value)
+    _ -> MintErr(lit_mint_int_range_error(span))
+  }
+
+fn mint_big_carrier(span: String, name: String, value: Expr) : MintResult =
+  if name == "BigInt" { MintOk(mk_bigint_lit(span, value)) }
+  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(span, 0, value)) }
+  else if name == "Decimal" { mint_decimal_span(span, 0, value) }
+  else { MintErr(lit_mint_int_range_error(span)) }
+
+fn mint_int128_span(span: String, value: Expr) : MintResult =
+  if dec_overflows_int128(span) { MintErr(int128_range_error()) }
+  else { MintOk(mk_fixed(span, TyInt128, value)) }
+
+# A point literal (`EReal`). Only Real and the two decimal carriers
+# accept it -- an integer carrier rejects the fractional form outright so
+# `let n: Int = 0.2` (and `3.0`) is an error, never a truncation.
+fn mint_point(span: String, value: Expr, target: Ty) : MintResult =
+  match target {
+    TyReal -> MintOk(with_ty(value, TyReal))
+    TyCon(_, name, _) -> mint_point_carrier(span, name, value)
+    TyInt    -> MintErr(int_from_point_error())
+    TyInt32  -> MintErr(int_from_point_error())
+    TyUInt32 -> MintErr(int_from_point_error())
+    TyUInt64 -> MintErr(int_from_point_error())
+    TyInt128 -> MintErr(int_from_point_error())
+    TyByte   -> MintErr(int_from_point_error())
+    _ -> MintNone
+  }
+
+fn mint_point_carrier(span: String, name: String, value: Expr) : MintResult = {
+  let parts = dec_parts_of_span(span)
+  if name == "Decimal" { mint_decimal_span(parts.raw, parts.scale, value) }
+  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(parts.raw, parts.scale, value)) }
+  else { MintNone }
+}
+
+# The `d` suffix (`19.99d`, `42d`) always targets `Decimal`. The suffix
+# supplies the carrier locally, so this needs no expected type.
+fn mint_decimal_suffix(span: String, value: Expr) : MintResult = {
+  let parts = dec_parts_of_span(span)
+  mint_decimal_span(parts.raw, parts.scale, value)
+}
+
+# Build a `Decimal { raw, scale }` from a raw-digit magnitude string,
+# erroring when the magnitude overflows the `Int128` carrier.
+fn mint_decimal_span(raw_digits: String, scale: Int, value: Expr) : MintResult =
+  if dec_overflows_int128(raw_digits) { MintErr(decimal_range_error()) }
+  else { MintOk(mk_decimal_lit(raw_digits, scale, value)) }
+
+# ---- carrier node builders ----
+
+fn mk_fixed(digits: String, ty: Ty, value: Expr) : Expr =
+  with_ty(mk_expr(EFixed(digits, ty), value.line, value.col), ty)
+
+fn mk_real(r: Real, span: String, value: Expr) : Expr =
+  with_ty(mk_expr(EReal(r, span), value.line, value.col), TyReal)
+
+# `Decimal { raw: <Int128>, scale: <Int> }`. The raw rides an EFixed so
+# a magnitude above 2^63 survives the 64-bit decode.
+fn mk_decimal_lit(raw_digits: String, scale: Int, value: Expr) : Expr = {
+  let raw = mk_fixed(raw_digits, TyInt128, value)
+  let scale_lit = mk_expr(EInt(scale), value.line, value.col)
+  let fields = [FI("raw", raw), FI("scale", scale_lit)]
+  with_ty(mk_expr(ERecordLit("Decimal", fields), value.line, value.col),
+          TyCon(None, "Decimal", []))
+}
+
+# `DecimalBig { raw: <BigInt>, scale: <Int> }`. The raw is a
+# `bigint.from_literal` call so an unbounded magnitude folds exactly.
+fn mk_decimal_big_lit(raw_digits: String, scale: Int, value: Expr) : Expr = {
+  let raw = mk_bigint_call(raw_digits, value)
+  let scale_lit = mk_expr(EInt(scale), value.line, value.col)
+  let fields = [FI("raw", raw), FI("scale", scale_lit)]
+  with_ty(mk_expr(ERecordLit("DecimalBig", fields), value.line, value.col),
+          TyCon(None, "DecimalBig", []))
+}
+
+fn mk_bigint_lit(digits: String, value: Expr) : Expr =
+  with_ty(mk_bigint_call(digits, value), TyCon(None, "BigInt", []))
+
+# `bigint.from_literal("<digits>")`, the same call the `n` suffix
+# desugars to. Minting runs after the resolver, so the callee is already
+# the resolved `EModCall` rather than an `EField(EVar, _)` the resolver
+# would still need to rewrite.
+fn mk_bigint_call(digits: String, value: Expr) : Expr = {
+  let s_lit = mk_expr(EStr(quote_digits(digits), false), value.line, value.col)
+  let callee = mk_expr(EModCall("bigint", "from_literal"), value.line, value.col)
+  mk_expr(ECall(callee, [s_lit]), value.line, value.col)
+}
+
+fn quote_digits(digits: String) : String =
+  string_concat(string_concat("\"", digits), "\"")
+
+# ---- lexeme decode (exact, string-based) ----
+
+pub type DecSpanParts = { raw: String, scale: Int }
+
+# Decode a point/exponent-free real lexeme into (raw-digit magnitude,
+# scale). The lexeme's own fractional length is the scale, so `0.20`
+# yields scale 2 -- trailing zeros are preserved because the digits, not
+# a re-stringified f64, drive the result.
+fn dec_parts_of_span(span: String) : DecSpanParts = {
+  let n = string_length(span)
+  let neg = match char_at(span, 0) { Some(c) -> c == '-' None -> false }
+  let start = if neg { 1 } else { 0 }
+  let dot = span_find_dot(span, start, n)
+  if dot < 0 {
+    let mag = strip_leading_zeros(collect_digits(span, start, n))
+    DecSpanParts { raw: with_sign(neg, mag), scale: 0 }
+  } else {
+    let int_digits = collect_digits(span, start, dot)
+    let frac_digits = collect_digits(span, dot + 1, n)
+    let scale = string_length(frac_digits)
+    let mag = strip_leading_zeros(string_concat(int_digits, frac_digits))
+    DecSpanParts { raw: with_sign(neg, mag), scale: scale }
+  }
+}
+
+fn with_sign(neg: Bool, mag: String) : String =
+  if neg and not (mag == "0") { string_concat("-", mag) } else { mag }
+
+fn span_find_dot(s: String, i: Int, n: Int) : Int =
+  if i >= n { 0 - 1 }
+  else { match char_at(s, i) {
+    None    -> 0 - 1
+    Some(c) -> if c == '.' { i } else { span_find_dot(s, i + 1, n) }
+  } }
+
+# Collect digit characters over `[i, n)`, dropping `_` separators.
+fn collect_digits(s: String, i: Int, n: Int) : String =
+  collect_digits_loop(s, i, n, "")
+
+fn collect_digits_loop(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> if c == '_' { collect_digits_loop(s, i + 1, n, acc) }
+               else { collect_digits_loop(s, i + 1, n, string_concat(acc, "#{c}")) }
+  } }
+
+# Drop leading zeros so a length compare orders by real magnitude;
+# an all-zero string collapses to "0".
+fn strip_leading_zeros(s: String) : String = {
+  let n = string_length(s)
+  let stripped = strip_zeros_loop(s, 0, n)
+  if string_length(stripped) == 0 { "0" } else { stripped }
+}
+
+fn strip_zeros_loop(s: String, i: Int, n: Int) : String =
+  if i >= n { "" }
+  else { match char_at(s, i) {
+    None    -> ""
+    Some(c) -> if c == '0' { strip_zeros_loop(s, i + 1, n) }
+               else { string_slice(s, i, n - i) }
+  } }
+
+# True when the significant-digit magnitude of `raw_digits` exceeds the
+# `Int128` positive maximum.
+fn dec_overflows_int128(raw_digits: String) : Bool = {
+  let mag = strip_leading_zeros(collect_digits(raw_digits, sign_offset(raw_digits),
+                                               string_length(raw_digits)))
+  mag_str_gt(mag, int128_max_digits())
+}
+
+fn sign_offset(s: String) : Int =
+  match char_at(s, 0) { Some(c) -> if c == '-' { 1 } else { 0 } None -> 0 }
+
+# `a > b` for two significant-digit magnitude strings: longer wins,
+# else compare lexicographically.
+fn mag_str_gt(a: String, b: String) : Bool = {
+  let la = string_length(a)
+  let lb = string_length(b)
+  if la != lb { la > lb } else { mag_lex_gt(a, b, 0, la) }
+}
+
+fn mag_lex_gt(a: String, b: String, i: Int, n: Int) : Bool =
+  if i >= n { false }
+  else { match char_at(a, i) {
+    None -> false
+    Some(ca) -> match char_at(b, i) {
+      None -> true
+      Some(cb) ->
+        if char_to_int(ca) > char_to_int(cb) { true }
+        else if char_to_int(ca) < char_to_int(cb) { false }
+        else { mag_lex_gt(a, b, i + 1, n) }
+    }
+  } }
+
+fn int_to_dec_string(n: Int) : String = int_to_string(n)
+
+# ---- diagnostics ----
+
+#[doc("The out-of-Int-range diagnostic for a bare past-i64 integer literal, naming the `n` / `bigint.from_string` escape hatch.")]
+pub fn lit_mint_int_range_error(span: String) : String =
+  string_concat("integer literal out of Int range; use a BigInt literal ",
+                string_concat(span, "n or bigint.from_string"))
+
+fn int128_range_error() : String =
+  "integer literal exceeds Int128 range; annotate `: BigInt` or `: DecimalBig`"
+
+fn decimal_range_error() : String =
+  "literal exceeds Decimal range; annotate `: DecimalBig` or drop `d`"
+
+fn int_from_point_error() : String =
+  "a point literal cannot be coerced to an integer type; drop the fraction or annotate a decimal type"

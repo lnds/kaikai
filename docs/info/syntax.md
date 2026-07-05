@@ -382,6 +382,30 @@ intervening space; `42i` without a width stays a complex literal.
 In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
 
+The `u8` suffix writes a `Byte` (`200u8`); a value outside `0..255` is a
+compile-time error. The `d` suffix writes a `Decimal` (`19.99d`, `42d`),
+folding the exact `{ raw, scale }` from the source digits; past the
+`Int128` carrier it errors, pointing at `DecimalBig`.
+
+### Context-driven minting
+
+A numeric literal with no suffix coins to the type its context demands,
+exactly, at compile time. An annotation is the trigger: `let a: Decimal
+= 0.2` is born an exact `Decimal` (not a rounded float), `let a:
+DecimalBig = 3.14159265358979323846` keeps every digit, `let x: BigInt =
+5` builds a `BigInt` with no `n` suffix, and `let w: UInt32 = 40` mints a
+`UInt32`. The lattice is by lexical shape: an integer literal reaches
+`Int`/`Int32`/`UInt32`/`UInt64`/`Int128`/`Byte`/`Decimal`/`DecimalBig`/
+`BigInt`/`Real`; a point literal (`0.2`) reaches only `Real`/`Decimal`/
+`DecimalBig` — `let n: Int = 0.2` (or `3.0`) is an error, never a
+truncation.
+
+Minting fires ONLY when the context type is concrete. Passed to a type
+variable, an integer defaults to `Int` and a point literal to `Real`,
+then unifies as usual: `f(5)` where `fn f[a](x: a)` sends `5` in as
+`Int`. There is no "any numeric type" obligation that travels — to reach
+another type at such a call, annotate or use a suffix (`f(5u8)`).
+
 ### Arbitrary-precision integers (`BigInt`)
 
 `BigInt` (`stdlib/math/bigint.kai`) is an arbitrary-precision signed
