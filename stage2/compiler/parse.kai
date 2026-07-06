@@ -90,7 +90,7 @@ type PExpr   = { p: Parser, r: Option[Expr] }
 type PStmt   = { p: Parser, r: Option[Stmt] }
 type PPat    = { p: Parser, r: Option[Pattern] }
 type PTy     = { p: Parser, r: Option[TypeExpr] }
-type PDecl   = { p: Parser, r: Option[Decl] }
+type PDecl   = { p: Parser, r: Option[Decl], bounds: [FnTPBound] }
 type PArm    = { p: Parser, r: Option[Arm] }
 type PParam  = { p: Parser, r: Option[Param] }
 type PFI     = { p: Parser, r: Option[FieldInit] }
@@ -643,8 +643,14 @@ fn ok_p(p: Parser, x: Pattern) : PPat = PPat { p: p, r: Some(x) }
 fn err_p(p: Parser) : PPat = PPat { p: p, r: None }
 fn ok_t(p: Parser, x: TypeExpr) : PTy = PTy { p: p, r: Some(x) }
 fn err_t(p: Parser) : PTy = PTy { p: p, r: None }
-fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x) }
-fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None }
+fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x), bounds: [] }
+fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None, bounds: [] }
+# `parse_fn_decl` variant carrying the fn's declared protocol bounds
+# alongside the (already stripped) DFn. `parse_program_loop` seeds the
+# root file's fn-bounds side table from these; the DFn itself stays
+# stripped, so every downstream pass and every load path (root,
+# prelude, cache) sees clean tparam strings.
+fn ok_d_fn(p: Parser, x: Decl, bs: [FnTPBound]) : PDecl = PDecl { p: p, r: Some(x), bounds: bs }
 fn ok_a(p: Parser, x: Arm) : PArm = PArm { p: p, r: Some(x) }
 fn err_a(p: Parser) : PArm = PArm { p: p, r: None }
 fn ok_pm(p: Parser, x: Param) : PParam = PParam { p: p, r: Some(x) }
@@ -5471,6 +5477,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
       None -> err_d(tparams_r.p)
       Some(tparams_raw) -> {
         let tparams = map(tparams_raw, tp_strip_bounds)
+        let fn_bounds = fn_tp_bounds_of(tparams_raw)
         let pp = tparams_r.p
         if not p_at(pp, TkLparen) {
           err_d(p_error_here(pp, "expected `(` after function name"))
@@ -5516,7 +5523,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                 Some(body) -> {
                   let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                   let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                  ok_d(rb.p, dfn)
+                  ok_d_fn(rb.p, dfn, fn_bounds)
                 }
               }
             } else if p_at(p4, TkLbrace) {
@@ -5534,7 +5541,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   Some(body) -> {
                     let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d(rb.p, dfn)
+                    ok_d_fn(rb.p, dfn, fn_bounds)
                   }
                 }
               } else {
@@ -5544,7 +5551,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   Some(body) -> {
                     let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d(rb.p, dfn)
+                    ok_d_fn(rb.p, dfn, fn_bounds)
                   }
                 }
               }
@@ -6814,6 +6821,36 @@ pub fn tp_bounds_of(stored: String) : [String] {
   }
 }
 
+# Collect the protocol bounds of each type-kind tparam, keyed by its
+# position among the type-kind tparams (unit-kind tparams excluded, so
+# the index aligns with a monomorphised call's concrete `tys`).
+fn fn_tp_bounds_of(tparams_raw: [String]) : [FnTPBound] =
+  fn_tp_bounds_loop(tparams_raw, 0, [])
+
+fn fn_tp_bounds_loop(tps: [String], idx: Int, acc: [FnTPBound]) : [FnTPBound] {
+  match tps {
+    [] -> list_reverse(acc)
+    [tp, ...rest] ->
+      if tp_kind_is_unit_raw(tp) {
+        fn_tp_bounds_loop(rest, idx, acc)
+      } else {
+        let bs = tp_bounds_of(tp)
+        let acc1 = match bs { [] -> acc  _ -> [FTB(idx, bs), ...acc] }
+        fn_tp_bounds_loop(rest, idx + 1, acc1)
+      }
+  }
+}
+
+# A raw tparam string carries `#Unit` (Measure kind) XOR `#b:...`
+# (bounds); the two never coexist, so a bounded tparam is never unit-
+# kind and the `#Unit` suffix check runs on the raw form directly.
+fn tp_kind_is_unit_raw(stored: String) : Bool = {
+  let suf = tp_unit_suffix()
+  let sl = string_length(stored)
+  let xl = string_length(suf)
+  if xl > sl { false } else { string_slice(stored, sl - xl, xl) == suf }
+}
+
 fn split_csv_index(s: String, i: Int, n: Int) : Int {
   if i >= n { -1 }
   else {
@@ -7256,7 +7293,7 @@ fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : P
 # program
 # ====================================================================
 
-fn parse_program_loop(p: Parser, acc: [Decl]) : PParser / Console {
+fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec]) : PParser / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkEof) {
@@ -7265,23 +7302,35 @@ fn parse_program_loop(p: Parser, acc: [Decl]) : PParser / Console {
     # the driver claim success. Surface had_error as `decls: None`
     # so the entry point exits non-zero, even when every decl
     # parsed in shape.
-    if p0.had_error { PParser { p: p0, decls: None } }
-    else { PParser { p: p0, decls: Some(list_reverse(acc)) } }
+    if p0.had_error { PParser { p: p0, decls: None, fn_bounds: [] } }
+    else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc) } }
   }
   else {
     let r = parse_decl(p0)
     match r.r {
-      None -> PParser { p: r.p, decls: None }
-      Some(d) -> parse_program_loop(r.p, [d, ...acc])
+      None -> PParser { p: r.p, decls: None, fn_bounds: [] }
+      Some(d) -> parse_program_loop(r.p, [d, ...acc], fn_bounds_seed(d, r.bounds, bacc))
     }
   }
 }
 
-pub type PParser = { p: Parser, decls: Option[[Decl]] }
+# Seed a fn-bounds record for a bounded free fn. `mo` is None here (the
+# parser only produces root-file decls); the driver re-keys the target
+# file's records to its module name to match the monomorphiser's view.
+fn fn_bounds_seed(d: Decl, bs: [FnTPBound], bacc: [FnBoundsRec]) : [FnBoundsRec] =
+  match bs {
+    [] -> bacc
+    _  -> match d {
+      DFn(_, name, _, _, _, _, _, _, _, mo) -> [FBR(name, mo, bs), ...bacc]
+      _ -> bacc
+    }
+  }
+
+pub type PParser = { p: Parser, decls: Option[[Decl]], fn_bounds: [FnBoundsRec] }
 
 pub fn parse_program(file: String, src: String, toks: [Token]) : PParser / Console {
 
-  parse_program_loop(parser_new(file, src, toks), [])
+  parse_program_loop(parser_new(file, src, toks), [], [])
 }
 
 # tp_make: encode a type-param name with its kind. The parser is its

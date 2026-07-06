@@ -76,6 +76,21 @@ fn dump_tokens(src: String, tokens: [Token]) : Unit {
   tokens |> each((t) => dump_token(src, t))
 }
 
+# Emit one diagnostic per free-fn protocol-bound violation caught at a
+# concrete instantiation. Returns the count so the exit code reflects
+# them.
+fn report_bound_violations(file: String, vs: [BoundViolation]) : Int / Console + File {
+  match vs {
+    [] -> 0
+    [v, ...rest] -> match v {
+      BV(msg, line, col) -> {
+        diag_error(file, line, col, msg)
+        1 + report_bound_violations(file, rest)
+      }
+    }
+  }
+}
+
 # Monomorphisation invariant reporter: print one diag per spec leak,
 # return total leak count (0 = clean). Lives near `diag_error` so
 # its row is `Console`-only and the caller's row inference picks it
@@ -1073,6 +1088,22 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], cach
 # `compile_source` can fold it into the exit code even when nothing
 # downstream references a name from the missing module.
 type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Int)
+
+# Re-key the root file's fn-bounds records (parser-supplied `mo = None`)
+# to the target module, matching how `tag_target_decls_module_origin`
+# re-keys the decls. A bare call surfaces a `mo = None` tuple and a
+# self-qualified call a `Some(target)` tuple; the monomorphiser's
+# `lookup_fn_bounds` treats a `None` tuple as the target module, so
+# both resolve to these records without colliding with a same-named
+# module fn.
+fn rekey_fn_bounds(fbs: [FnBoundsRec], mod: String) : [FnBoundsRec] {
+  match fbs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FBR(name, _, ftbs) -> [FBR(name, Some(mod), ftbs), ...rekey_fn_bounds(rest, mod)]
+    }
+  }
+}
 
 # Given a root file's path and its parsed decls, return the flat
 # decl list with every (transitively-)imported module's decls
@@ -3947,6 +3978,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let target_unstable = collect_unstable_exports(expanded_decls_raw, [])
             let target_me = ME(target_mod_name, target_exports, path, target_unstable)
             let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name)
+            # Free-fn protocol bounds for the root file. Stdlib/prelude
+            # bounded aggregates already dispatch their op via a `_loop`
+            # helper, so the existing post-mono validator covers them;
+            # only root-file fns whose body never dispatches the bound
+            # need this check. Re-key to the target module the same way
+            # `tag_target_decls_module_origin` re-keys the decls, so the
+            # records match the monomorphiser's `mo`.
+            let fn_bounds = rekey_fn_bounds(parsed.fn_bounds, target_mod_name)
             # Every prelude file is also registered as a module under
             # its basename, so qualified calls into the stdlib
             # (`list.take(xs, n)`, `string.trim(s)`) resolve without an
@@ -4534,8 +4573,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # Monomorphise: specialise each polymorphic spec
                       # and substitute body type / unit per spec.
                       let mono_out = monomorphise(typed_prog, proto_reg,
-                                                     post_local_arities)
-                      let mono_decls = match mono_out { MonoOut(ds, _) -> ds }
+                                                     post_local_arities, fn_bounds)
+                      let mono_decls = match mono_out { MonoOut(ds, _, _) -> ds }
+                      # Free-fn protocol bounds checked at each concrete
+                      # instantiation: a `[T: P]` bound is a precondition
+                      # on the caller's type, enforced even when the
+                      # callee body never dispatches the bounded op.
+                      let mono_bound_viols = match mono_out { MonoOut(_, _, vs) -> vs }
+                      let mono_bound_errs = report_bound_violations(path, mono_bound_viols)
                       # Evidence-param threading (#820 L2). Compute the
                       # per-function evidence obligations pre-mono and
                       # re-key them onto the specialised symbols, so each
@@ -4554,7 +4599,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # missed a node and the spec would behave like
                       # a polymorphic copy. Free typer tyvars whose
                       # ids fall outside the domain are skipped.
-                      let mono_leaks = match mono_out { MonoOut(_, ls) -> ls }
+                      let mono_leaks = match mono_out { MonoOut(_, ls, _) -> ls }
                       let mono_inv_errs = report_mono_leaks(path, mono_leaks)
                       # Post-mono protocol-dispatch validation. After
                       # monomorphisation each
@@ -4635,7 +4680,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # O(1)-stack.
                       let cons_ok = true
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok)
-                      if mono_inv_errs != 0 { mono_inv_errs }
+                      if mono_bound_errs != 0 { mono_bound_errs }
+                      else if mono_inv_errs != 0 { mono_inv_errs }
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
                       else if use_native {
                         # In-process libLLVM native backend. Lower to
