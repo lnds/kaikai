@@ -294,6 +294,56 @@ pub fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] {
   }
 }
 
+#[doc("The declared payload types of ctor target, or None when it is not a registered variant.")]
+pub fn evar_payload_tys(vs: [EVar], target: String) : Option[[TypeExpr]] = match vs {
+  [] -> None
+  [h, ...rest] -> match h {
+    EV(n, _, tys, _) -> if n == target { Some(tys) } else { evar_payload_tys(rest, target) }
+  }
+}
+
+# A tagged Int rides `.i64`, a Real `.r`, an enum its immediate tag; anything
+# else is a boxed `KaiValue *`. Shared by both backends so the slot mask never
+# diverges between the C-text and native emitters.
+#[doc("Slot-kind code for a payload type: 1 Int, 2 Real, 3 enum, 0 boxed pointer.")]
+pub fn variant_slot_kind(te: TypeExpr, enums: [String]) : Int = match te.tkind {
+  TyName(n, args) ->
+    if list_length(args) == 0 {
+      if n == "Int" { 1 }
+      else if n == "Real" { 2 }
+      else if enum_names_has(enums, n) { 3 }
+      else { 0 }
+    } else { 0 }
+  _ -> 0
+}
+
+# Plain arithmetic, no `<<`/`bit_or`: the stage-1 compiler does not parse the
+# bit-intrinsic surface, and disjoint 2-bit windows make `+` equal to `or`.
+#[doc("The base-4 scaler for slot i (each slot owns a disjoint 2-bit window in the mask).")]
+pub fn variant_slot_pos(i: Int) : Int =
+  if i <= 0 { 1 } else { 4 * variant_slot_pos(i - 1) }
+
+fn variant_slot_mask_loop(tys: [TypeExpr], i: Int, acc: Int, enums: [String]) : Int = match tys {
+  [] -> acc
+  [t, ...rest] ->
+    if i >= 16 { 0 }
+    else {
+      let k = variant_slot_kind(t, enums)
+      variant_slot_mask_loop(rest, i + 1, acc + (k * variant_slot_pos(i)), enums)
+    }
+}
+
+#[doc("The 2-bit-per-slot mask for a payload type list (0 when > 16 slots overflow the field).")]
+pub fn variant_slot_mask(tys: [TypeExpr], enums: [String]) : Int = variant_slot_mask_loop(tys, 0, 0, enums)
+
+#[doc("True iff any slot of the payload is a primitive (Int/Real/enum) — the typed-construction gate.")]
+pub fn variant_has_primitive_slot(tys: [TypeExpr], enums: [String]) : Bool = match tys {
+  [] -> false
+  [t, ...rest] ->
+    if variant_slot_kind(t, enums) != 0 { true }
+    else { variant_has_primitive_slot(rest, enums) }
+}
+
 #[doc("The fixed table of built-in variant constructors (Option/Result/etc.) every emit run seeds.")]
 pub fn builtin_variants() : [EVar] =
   # Phase 2 #440: builtins use empty type lists so the emitter falls

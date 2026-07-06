@@ -64,7 +64,67 @@ pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [EVar],
   nproto_open_init(ctx)
   nproto_register_variants(ctx, v2h, 0)
   nproto_register_impls(ctx, rows, decls)
+  nproto_register_payload_ctors(ctx, variants)
+  nproto_seed_nullary(ctx, variants)
   llvm_build_ret_void(native_ctx_b(ctx))
+}
+
+# Seed every USER nullary ctor's immortal singleton at startup, so the steady-
+# state `kaix_nullary_fast` array load always hits (Red/Black/RBLeaf) and a
+# direct enum-slot tag store stays sound regardless of construction order.
+#
+# BUILTIN nullary (tag < user base: None, Sig*) are NOT seeded: they are never
+# an i64-inline enum slot, and `kaix_nullary_fast` self-installs them on first
+# use. Seeding them would mint immortal singletons even in a program that never
+# touches them, so a trivial run (the #950 test runner) reports `leaked` = the
+# seed count instead of 0. Leaving them lazy keeps the pre-lane RC accounting.
+fn nproto_seed_nullary(ctx: Handle, variants: [EVar]) : Unit / Console = match variants {
+  [] -> ()
+  [EV(nm, ar, _, tag), ...rest] -> {
+    if ar == 0 and tag >= user_variant_tag_base() { nproto_seed_one_nullary(ctx, tag, nm) } else { () }
+    nproto_seed_nullary(ctx, rest)
+  }
+}
+
+# One `kaix_seed_nullary(i32 tag, i8* name)`.
+fn nproto_seed_one_nullary(ctx: Handle, tag: Int, nm: String) : Unit / Console = {
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let _r = ncall_sig2(ctx, "kaix_seed_nullary", native_ctx_voidt(ctx),
+                      i32t, native_ctx_ptrt(ctx), llvm_const_i32(i32t, tag), gname)
+  ()
+}
+
+# Stamp tag→name (mask 0) for every USER ctor the emitter routes to the fast
+# entry `kaix_variant_masked` — a primitive-slot ctor (`variant_slot_mask != 0`
+# under the same enums=[] gate `ls_ctor_mask` uses). Native builds these boxed,
+# so the registered mask is 0 (the drop walker + slot read treat every slot as a
+# pointer). Mirror of the C backend's `kai_register_payload_ctors`.
+#
+# BUILTINS (tag < user base) are EXCLUDED: the C runtime mints Exited(Int) /
+# Signaled(Int) with a RAW i64 slot (mask 1, `_kai_process_make_exit_exited`),
+# and the match reads it via the registered mask. Stamping their tag with mask 0
+# here would make the raw exit code read back as a pointer — every `Exited(0)`
+# looking non-zero (the #741 shape). The emitter never builds a builtin through
+# the fast path, so leave the runtime's own mask untouched.
+fn nproto_register_payload_ctors(ctx: Handle, variants: [EVar]) : Unit / Console = match variants {
+  [] -> ()
+  [EV(nm, _, tys, tag), ...rest] -> {
+    if tag >= user_variant_tag_base() and variant_slot_mask(tys, []) != 0 {
+      nproto_register_one_payload_ctor(ctx, tag, nm)
+    } else { () }
+    nproto_register_payload_ctors(ctx, rest)
+  }
+}
+
+# One `kaix_register_one_payload_ctor(i32 tag, i8* name, i32 mask=0)`.
+fn nproto_register_one_payload_ctor(ctx: Handle, tag: Int, nm: String) : Unit / Console = {
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let _r = ncall_sig3(ctx, "kaix_register_one_payload_ctor", native_ctx_voidt(ctx),
+                      i32t, native_ctx_ptrt(ctx), i32t,
+                      llvm_const_i32(i32t, tag), gname, llvm_const_i32(i32t, 0))
+  ()
 }
 
 # Emit a boxed adapter for each raw impl (skip boxed impls + unknown-head

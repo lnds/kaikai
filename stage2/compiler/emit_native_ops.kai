@@ -99,7 +99,7 @@ pub fn nemit_op(ctx: Handle, op: KOp, fns: [KFn]) : Handle / Console = match op 
   # destination routes through `nemit_op_fx_slot`, which threads its slot.
   KCall(sym, cargs)    -> nemit_call_direct(ctx, sym, cargs, fns, SBoxed)
   KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
-  KCon(nm, tag, inits) -> nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits))
+  KCon(nm, tag, mask, inits) -> nemit_con(ctx, nm, tag, mask, inits)
   KRecord(fields)      -> nemit_record(ctx, fields)
   KProj(v, i)          -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
   KTagOf(v)            -> nemit_tagof(ctx, v)
@@ -701,6 +701,48 @@ pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Hand
   let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
   let r = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, ab)
   llvm_buf_free(ptb); llvm_buf_free(ab); r
+}
+
+# A `KCon`, routed to the cheapest runtime entry:
+#   - nullary (no slots) → `kaix_nullary_fast`: an array load from the
+#     startup-seeded singleton table, skipping `kai_variant_u`'s NOINLINE call
+#     + nullary-cache hash probe (Red/Black/RBLeaf on the rb-tree).
+#   - primitive slot (`mask != 0`) → `kaix_variant_masked` (→ `kai_variant_u_fast`):
+#     a bare alloc + slot stores, tag→name/mask stamped once at startup, so the
+#     per-call register + immortal-args hash scan of `kai_variant_u` are gone.
+#   - all-pointer payload → `kaix_variant`: its immortal-args interning is a win
+#     the fast path would drop.
+# Slots stay boxed here (masked call passes mask 0); the raw-i64 slot inline is a
+# later increment. Mirror of emit_c's `emit_ident_value` (nullary) +
+# `emit_variant_call_typed` (`variant_has_primitive_slot`).
+fn nemit_con(ctx: Handle, nm: String, tag: Int, mask: Int, inits: [KSlotInit]) : Handle / Console = match inits {
+  [] -> nemit_nullary_fast(ctx, tag, nm)
+  _  -> if mask == 0 { nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits)) }
+        else { nemit_variant_masked_call(ctx, tag, nm, nemit_init_buf(ctx, inits)) }
+}
+
+# `kaix_nullary_fast(i32 tag, i8* name) -> ptr` — read the startup-seeded
+# immortal singleton (an array load) instead of the cold `kai_variant_u`.
+fn nemit_nullary_fast(ctx: Handle, tag: Int, nm: String) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  ncall_sig2(ctx, "kaix_nullary_fast", p, i32t, p, llvm_const_i32(i32t, tag), gname)
+}
+
+# `kaix_variant_masked(i32 tag, i8* name, i32 n, i32 mask, ptr* slots) -> ptr`
+# — the fast typed ctor. `mask` is passed 0: Block-1 slots are boxed pointers,
+# so the drop walker (reading the startup-registered mask) must see all-boxed.
+fn nemit_variant_masked_call(ctx: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let n = llvm_buf_len(argvalbuf)
+  let argarr = nemit_ptr_array(ctx, argvalbuf)
+  llvm_buf_free(argvalbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, llvm_const_i32(i32t, 0)); llvm_buf_push(ab, argarr)
+  ncall_finish(ctx, "kaix_variant_masked", p, ptb, ab)
 }
 
 # `kaix_variant(i32 tag, i8* name, i32 n, ptr* args) -> ptr`. The `args`
