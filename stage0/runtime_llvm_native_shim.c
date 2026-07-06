@@ -66,6 +66,8 @@ void * kaix_prelude_llvm_build_logical(void *b, int64_t op, void *a, void *c) { 
 KaiValue * kaix_prelude_llvm_build_ret(void *b, void *v) { return kai_llvm_build_ret(b, v); }
 KaiValue * kaix_prelude_llvm_build_ret_void(void *b) { return kai_llvm_build_ret_void(b); }
 void * kaix_prelude_llvm_build_sext(void *b, void *v, void *ty) { return kai_llvm_build_sext(b, v, ty); }
+void * kaix_prelude_llvm_build_ptrtoint(void *b, void *v, void *ty) { return kai_llvm_build_ptrtoint(b, v, ty); }
+void * kaix_prelude_llvm_build_inttoptr(void *b, void *v, void *ty) { return kai_llvm_build_inttoptr(b, v, ty); }
 KaiValue * kaix_prelude_llvm_build_store(void *b, void *val, void *ptr) { return kai_llvm_build_store(b, val, ptr); }
 void * kaix_prelude_llvm_build_string_span(void *b, KaiValue *s) { return kai_llvm_build_string_span(b, s); }
 void * kaix_prelude_llvm_build_struct_gep(void *b, void *sty, void *ptr, int64_t i) { return kai_llvm_build_struct_gep(b, sty, ptr, i); }

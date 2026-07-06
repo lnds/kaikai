@@ -108,7 +108,7 @@ fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
   [b, ...rest] -> if ntrmc_term_is_step(b.term) { true } else { ntrmc_blocks_have_step(rest) }
 }
 fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
-  KTrmcStep(_, _, _, _, _, _, _, _, _) -> true
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -128,7 +128,7 @@ fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
 # the shared `nemit_drop_assigns_masked` (issue #860), mirroring `nemit_tcrec`
 # and the C oracle's `tcrec_emit_drops_masked`: a BOXED param marked dead is
 # dropped before its alloca is overwritten; a raw scalar param is skipped.
-pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, dropmask: Int,
+pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, i64_mask: Int, dropmask: Int,
                        head_vals: [KVal], asg: [KAssign], scr_drop: String) : Unit / Console =
   match ntrmc_cname_is_cons(cname) {
     # `__kai_cons_s` (s = has a scrutinee to drop): the reuse-cons arm
@@ -147,7 +147,7 @@ pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, dro
     # leaked ~10x over-alloc). The kept pointer children were already incref'd
     # by the arm's `dup` binds, so they outlive the scrutinee's recursive
     # decref — the same discipline the cons `_s` step uses.
-    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, head_vals, asg, dropmask, scr_drop)
+    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, i64_mask, head_vals, asg, dropmask, scr_drop)
   }
 
 # Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr.
@@ -167,25 +167,53 @@ fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int
 # with a 5th leading arg here is miscompiled by the stage1-built emitter
 # (its RC pass wraps the node handle in a dup that scribbles on the LLVM
 # CallInst), so the buffer carries it instead.
-fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int,
+# The variant spine step builds `RBNode(...)` INTO the arm-top reuse token via
+# `kaix_variant_at_argv_masked` over an `[1+nslots x i64]` word buffer built
+# STORE-IMMEDIATE: `slots[0]` the token pointer word, `slots[1+j]` each ctor
+# slot (the hole a NULL word, a kind-1 Int slot raw, else `ptrtoint`). Store-
+# immediate (materialise-and-store per slot, no `[Handle]` buffer holding an
+# ncall-result handle across a frame return) is what avoids the kaic1 RC UAF.
+fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, i64_mask: Int,
                       head_vals: [KVal], asg: [KAssign], dropmask: Int, scr_drop: String) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
-  let argbuf = ntrmc_variant_at_slots(ctx, head_vals, hole_slot)
-  let node = nemit_variant_call(ctx, "kaix_variant_at_argv", tag, cname, argbuf)
-  let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node, llvm_const_i32(i32t, hole_slot))
-  ntrmc_extend_and_loop(ctx, node, hole, asg, dropmask)
+  # The node CallInst is SPILLED to an alloca the instant it is born and read
+  # back for each of its two uses (`slot_addr` + `extend_and_loop`). Reusing the
+  # CallInst handle directly makes kaic1's RC pass dup+scribble it (the
+  # `<Invalid operator>` verify failure); a spill+reload gives each use a fresh
+  # load handle, off the RC regime, so the CallInst is never clobbered. The
+  # boxed original tolerated a direct 2-use because its frame carried no other
+  # live handles; the i64 build does, so the spill is the robust form.
+  let nodeslot = llvm_build_alloca_entry(ctx, p, "node")
+  llvm_build_store(native_ctx_b(ctx), ntrmc_variant_build(ctx, tag, cname, i64_mask, hole_slot, head_vals), nodeslot)
+  let node1 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
+  let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node1, llvm_const_i32(i32t, hole_slot))
+  let node2 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
+  ntrmc_extend_and_loop(ctx, node2, hole, asg, dropmask)
 }
 
-# `[token, ...slots]` for `kaix_variant_at_argv`: take the arm-top reuse
-# token (load, then reset the register so no later disposer frees the
-# now-live reused cell), front it to the slot buffer.
-fn ntrmc_variant_at_slots(ctx: Handle, head_vals: [KVal], hole_slot: Int) : Handle / Console = {
-  let buf = llvm_buf_new()
-  llvm_buf_push(buf, nemit_load_reg(ctx, ntrmc_armru_reg()))
-  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
-  ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, 0)
-  buf
+# Build the `[1+nslots x i64]` word buffer (STORE-IMMEDIATE: `slots[0]` the
+# reuse-token word, `slots[1+j]` each ctor slot) AND emit the
+# `kaix_variant_at_argv_i64` ctor over it, returning the node CallInst IN TAIL.
+# 4 args (no mask arg — the runtime reads the tag's registered mask). Producing
+# `node` in tail (no live handle-locals in the caller's frame) is what keeps
+# kaic1 from dup-scribbling the reused CallInst (the `<Invalid operator>`).
+fn ntrmc_variant_build(ctx: Handle, tag: Int, nm: String, i64_mask: Int, hole_slot: Int, head_vals: [KVal]) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let nslots = list_length(head_vals) + 1
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), nslots + 1)
+  let arr = llvm_build_alloca_entry(ctx, arrty, "slots")
+  let tok = nemit_load_reg(ctx, ntrmc_armru_reg())
+  let tokw = llvm_build_ptrtoint(native_ctx_b(ctx), tok, native_ctx_i64t(ctx))
+  let slot0 = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(i32t, 0))
+  llvm_build_store(native_ctx_b(ctx), tokw, slot0)
+  nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
+  ntrmc_store_variant_slots(ctx, arr, arrty, head_vals, hole_slot, i64_mask, 0)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, nslots + 1)); llvm_buf_push(ab, arr)
+  ncall_finish(ctx, "kaix_variant_at_argv_i64", p, ptb, ab)
 }
 
 
@@ -233,29 +261,39 @@ fn ntrmc_extend_and_loop_scr(ctx: Handle, node: Handle, hole_new: Handle, asg: [
 fn ntrmc_cname_is_cons(cname: String) : Bool =
   cname == "__kai_cons" or cname == "__kai_cons_s"
 
-# Materialise the variant slot buffer in ctor slot order: each non-hole
-# slot takes the next `head_vals` atom; `hole_slot` takes a NULL placeholder
-# (the cctx fills it next). `i` is the slot index being emitted.
-fn ntrmc_variant_slots(ctx: Handle, head_vals: [KVal], hole_slot: Int, i: Int) : Handle / Console = {
-  let buf = llvm_buf_new()
-  ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, i)
-  buf
-}
-fn ntrmc_push_variant_slots(ctx: Handle, buf: Handle, head_vals: [KVal], hole_slot: Int, i: Int) : Unit / Console =
+# Store each variant slot word into `arr[1+i]` (offset +1 past the token at
+# slot 0) the instant it is materialised: the `hole_slot` a NULL pointer word
+# (the cctx fills it next), a kind-1 Int slot raw per `i64_mask`, else
+# `ptrtoint(ptr)`. Store-immediate — no handle waits in a buffer (kaic1 RC UAF).
+# `i` is the ctor slot index (the mask window).
+fn ntrmc_store_variant_slots(ctx: Handle, arr: Handle, arrty: Handle, head_vals: [KVal], hole_slot: Int, i64_mask: Int, i: Int) : Unit / Console =
   match i == hole_slot {
     true -> {
-      llvm_buf_push(buf, llvm_const_null(native_ctx_ptrt(ctx)))
-      ntrmc_push_variant_slots(ctx, buf, head_vals, hole_slot, i + 1)
+      let holep = llvm_const_null(native_ctx_ptrt(ctx))
+      let holew = llvm_build_ptrtoint(native_ctx_b(ctx), holep, native_ctx_i64t(ctx))
+      let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i + 1))
+      llvm_build_store(native_ctx_b(ctx), holew, slot)
+      ntrmc_store_variant_slots(ctx, arr, arrty, head_vals, hole_slot, i64_mask, i + 1)
     }
     false -> match head_vals {
       [] -> ()
       [h, ...rest] -> {
-        let hv = nemit_atom(ctx, h)
-        llvm_buf_push(buf, hv)
-        ntrmc_push_variant_slots(ctx, buf, rest, hole_slot, i + 1)
+        let w = ntrmc_slot_word(ctx, h, ntrmc_mask_kind1(i64_mask, i))
+        let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i + 1))
+        llvm_build_store(native_ctx_b(ctx), w, slot)
+        ntrmc_store_variant_slots(ctx, arr, arrty, rest, hole_slot, i64_mask, i + 1)
       }
     }
   }
+
+# One TRMC slot word: raw `i64` for a kind-1 Int slot in tail, else the boxed
+# handle `let`-bound in THIS frame + `ptrtoint` inline (asu "risk #1").
+fn ntrmc_slot_word(ctx: Handle, h: KVal, is_int: Bool) : Handle / Console =
+  if is_int { nemit_atom_raw(ctx, h, SInt64) }
+  else { let b = nemit_atom(ctx, h); llvm_build_ptrtoint(native_ctx_b(ctx), b, native_ctx_i64t(ctx)) }
+
+# True iff the 2-bit window `i` of `i64_mask` is kind-1 (Int) — `(mask / 4^i) % 4 == 1`.
+fn ntrmc_mask_kind1(i64_mask: Int, i: Int) : Bool = (i64_mask / nvariant_slot_pos(i)) % 4 == 1
 
 # The cons head is the single non-hole ctor arg (builtin cons is binary:
 # head + the hole tail). Materialise it; a malformed `head_vals` (not
