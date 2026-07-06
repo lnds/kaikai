@@ -1733,7 +1733,7 @@ test-unused-bindings: $(TARGET) build
 # from the compile-time KAI_STDLIB_PATH — there is no "prelude" and no
 # `--prelude` flag (both retired in 7c1bb4b). Fixtures that use an
 # opt-in stdlib module (base64, hex, json, collections, encoding/math/
-# crypto, decimal/money/fx, uuid, regexp, path, random*) must `import`
+# crypto, decimal, uuid, regexp, path, random*) must `import`
 # it themselves.
 
 # Cartography variant of `test-stdlib`: same fixture set, same
