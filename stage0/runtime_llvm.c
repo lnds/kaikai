@@ -90,6 +90,10 @@ KaiValue *kaix_mul(KaiValue *a, KaiValue *b)   { return kai_op_mul(a, b); }
 KaiValue *kaix_div(KaiValue *a, KaiValue *b)   { return kai_op_div(a, b); }
 KaiValue *kaix_idiv(KaiValue *a, KaiValue *b)  { return kai_op_idiv(a, b); }
 KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
+/* Raw i64 `/` `%` the native backend calls in place of a bare `sdiv`/`srem`,
+   so div-by-zero and INT64_MIN/-1 trap instead of hitting hardware UB. */
+int64_t kaix_idiv_chk(int64_t a, int64_t b)    { return kai_idiv_chk(a, b); }
+int64_t kaix_imod_chk(int64_t a, int64_t b)    { return kai_imod_chk(a, b); }
 KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_op_eq_v(a, b); }
 KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_op_ne_v(a, b); }
 KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_op_lt(a, b); }

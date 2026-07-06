@@ -5797,9 +5797,9 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
 # True when a raw EBinop is Int `+`/`-`/`*` and must therefore wrap in
 # two's complement (kaikai's documented Int semantics). The emitter
 # renders these via a uint64_t round-trip so the wrap is well-defined
-# C; `/` and `%` are excluded (their overflow is not contractually a
-# wrap, and div-by-INT64_MIN is a separate concern) and Real `+`/`-`/`*`
-# are excluded by the TyInt gate. See the EBinop arm in emit_kind_raw.
+# C; `/` and `%` are excluded here (they route through the checked helper,
+# see `raw_int_divmod_is_checked`) and Real `+`/`-`/`*` are excluded by the
+# TyInt gate. See the EBinop arm in emit_kind_raw.
 # True iff the optional type is Int (or an Int newtype/refinement). Shared
 # by the wrapping-arith gate and the direct-Int-comparison fast path.
 fn ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
@@ -5827,6 +5827,14 @@ fn ty_opt_is_fixed_width(opt_ty: Option[Ty]) : Bool = match opt_ty {
 fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
   let is_wrap_op = op == "+" or op == "-" or op == "*"
   is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
+}
+
+# True when a raw EBinop is a signed-`Int` `/`/`%` — the one that must route
+# through the trapping helper (`kai_idiv_chk`/`kai_imod_chk`) rather than a
+# bare `a / b`. Only `Int` (i64) reaches the raw path for div/mod; fixed-width
+# div/mod stays boxed and already traps via `kai_fixed_div`.
+fn raw_int_divmod_is_checked(op: String, opt_ty: Option[Ty]) : Bool {
+  (op == "/" or op == "%") and ty_opt_is_int(opt_ty)
 }
 
 # The signed/unsigned C scalar type a raw integer slot computes in.
@@ -6127,8 +6135,8 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         # unsigned of the width and cast back so the wrap is well-defined
         # C (6.3.1.3) rather than signed-overflow UB that
         # `-fsanitize=undefined` flags — reachable the moment a hash mix
-        # (`acc * 31`) overflows. Real `*`/`+` and Int `/`/`%` keep the
-        # plain form (handled below).
+        # (`acc * 31`) overflows. Real `*`/`+` keep the plain form; Int
+        # `/`/`%` route through the checked helper (handled below).
         let st = raw_signed_c_type(x.ty)
         let ut = raw_unsigned_c_type(x.ty)
         concat_all(["((", st, ")((", ut, ")(",
@@ -6136,6 +6144,12 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
                     ") ", raw_op_str(op), " (", ut, ")(",
                     emit_expr_raw(src, b, cx),
                     ")))"])
+      } else if raw_int_divmod_is_checked(op, x.ty) {
+        # Raw i64 `/`/`%` trap on a zero divisor and on INT64_MIN/-1
+        # instead of the bare `a / b` the hardware would run as UB.
+        concat_all([if op == "/" { "kai_idiv_chk(" } else { "kai_imod_chk(" },
+                    emit_expr_raw(src, a, cx), ", ",
+                    emit_expr_raw(src, b, cx), ")"])
       } else if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
         concat_all(["(",
                     emit_expr_raw(src, a, cx),

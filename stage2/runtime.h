@@ -6137,6 +6137,23 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     return r;
 }
 
+/* Raw (unboxed) i64 `/` and `%` with the same trap discipline as the boxed
+ * path and array indexing: a zero divisor, or the one signed overflow
+ * `INT64_MIN / -1` (whose two's-complement result is unrepresentable), is a
+ * clean `kai_trap_abort`, not the hardware UB `sdiv`/`srem` would invoke.
+ * Both backends route raw Int div/mod here so the fault is deterministic
+ * across them. */
+static int64_t kai_idiv_chk(int64_t a, int64_t b) {
+    if (b == 0) { kai_trap_abort("divide by zero"); }
+    if (a == INT64_MIN && b == -1) { kai_trap_abort("divide overflow"); }
+    return a / b;
+}
+static int64_t kai_imod_chk(int64_t a, int64_t b) {
+    if (b == 0) { kai_trap_abort("mod by zero"); }
+    if (a == INT64_MIN && b == -1) { kai_trap_abort("divide overflow"); }
+    return a % b;
+}
+
 /* Less-than for two same-tag fixed-width boxes; signedness per the
  * width. Sets `*out` and returns 1 on a match, 0 otherwise. */
 static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
@@ -13577,12 +13594,12 @@ static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) {
  * kaikai Int arithmetic WRAPS (the C emitter casts through `uint64_t`), so
  * signed overflow must be defined two's-complement wrap, not UB the
  * optimiser could exploit. The plain `LLVMBuildAdd`/`Sub`/`Mul` emit
- * wrapping ops (no-wrap flags unset). `/`→`sdiv`, `%`→`srem`, mirroring the
- * C-direct oracle: it emits a bare `a / b` and accepts the `/0` and
- * `INT_MIN/-1` UB as a separate concern, so a raw native `sdiv`/`srem` is
- * byte-for-byte parity, not a regression. Operands + result are `i64`, NOT
- * boxed Ints: no RC, so the use-after-free the boxed path hit on a multi-use
- * raw operand cannot arise. */
+ * wrapping ops (no-wrap flags unset). Cases 3/4 (`sdiv`/`srem`) remain for
+ * completeness but the raw div/mod path no longer routes through them — it
+ * calls the checked helper `kai_idiv_chk`/`kai_imod_chk` so div-by-zero and
+ * INT64_MIN/-1 trap. Operands + result are `i64`, NOT boxed Ints: no RC, so
+ * the use-after-free the boxed path hit on a multi-use raw operand cannot
+ * arise. */
 static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) {
     LLVMBuilderRef bld = (LLVMBuilderRef) b;
     LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
