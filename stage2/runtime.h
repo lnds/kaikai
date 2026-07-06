@@ -13441,11 +13441,39 @@ static void *kai_llvm_build_array_alloca(void *b, void *elemty, void *count, Kai
     return (void *) a;
 }
 static KaiValue *kai_llvm_build_store(void *b, void *val, void *ptr) {
-    LLVMBuildStore((LLVMBuilderRef) b, (LLVMValueRef) val, (LLVMValueRef) ptr);
+    LLVMValueRef s = LLVMBuildStore((LLVMBuilderRef) b, (LLVMValueRef) val, (LLVMValueRef) ptr);
+    /* Stamp the natural alignment from the value's type. Without a module
+     * DataLayout at emit time LLVM infers the ABI-generic (preferred) alignment,
+     * which is 4 for i64 — a store i64 align 4 the x86-64 -O2 backend lowers to a
+     * misaligned access that SIGSEGVs (arm64/-O0 tolerates it, hiding the bug).
+     * An `[n x i64]` slot is 8-aligned; stamp it so the store agrees. */
+    LLVMTypeRef vt = LLVMTypeOf((LLVMValueRef) val);
+    LLVMTypeKind k = LLVMGetTypeKind(vt);
+    if (k == LLVMIntegerTypeKind) {
+        unsigned bits = LLVMGetIntTypeWidth(vt);
+        LLVMSetAlignment(s, bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8);
+    } else if (k == LLVMPointerTypeKind || k == LLVMDoubleTypeKind) {
+        LLVMSetAlignment(s, 8);
+    } else if (k == LLVMFloatTypeKind) {
+        LLVMSetAlignment(s, 4);
+    }
     return kai_unit();
 }
 static void *kai_llvm_build_load(void *b, void *ty, void *ptr) {
-    return (void *) LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ty, (LLVMValueRef) ptr, "");
+    LLVMValueRef l = LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ty, (LLVMValueRef) ptr, "");
+    /* Same natural-alignment stamp as `kai_llvm_build_store`: without a module
+     * DataLayout at emit time a `load i64` gets ABI-generic align 4, which the
+     * x86-64 -O2 backend lowers to a misaligned load that SIGSEGVs. */
+    LLVMTypeKind k = LLVMGetTypeKind((LLVMTypeRef) ty);
+    if (k == LLVMIntegerTypeKind) {
+        unsigned bits = LLVMGetIntTypeWidth((LLVMTypeRef) ty);
+        LLVMSetAlignment(l, bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8);
+    } else if (k == LLVMPointerTypeKind || k == LLVMDoubleTypeKind) {
+        LLVMSetAlignment(l, 8);
+    } else if (k == LLVMFloatTypeKind) {
+        LLVMSetAlignment(l, 4);
+    }
+    return (void *) l;
 }
 /* The module global named `name` (its address as a Value*), or NULL when no
  * such global exists. The call site addresses a default node minted in
