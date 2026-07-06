@@ -13568,6 +13568,16 @@ static void *kai_llvm_build_sext(void *b, void *v, void *ty) {
 static void *kai_llvm_build_zext(void *b, void *v, void *ty) {
     return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
 }
+/* Pointer↔integer round-trip for the i64-inline variant slot buffer: a boxed
+ * `KaiValue *` slot enters an `[n x i64]` payload word via `ptrtoint`, and
+ * a raw word is read back as a pointer via `inttoptr`. `KaiVarSlot` is a
+ * one-word union, so the bits survive the round-trip unchanged. */
+static void *kai_llvm_build_ptrtoint(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildPtrToInt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_inttoptr(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildIntToPtr((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
 /* Float narrow/widen: `double`→`float` at an F32 call, `float`→`double`
  * on return. One `fpcast` covers both directions. */
 static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) {
@@ -14346,6 +14356,8 @@ static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); retu
 static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_zext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ptrtoint(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_inttoptr(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_get_undef(void *ty) { (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_insertvalue(void *b, void *agg, void *elt, int64_t idx) { (void) b; (void) agg; (void) elt; (void) idx; return kai_llvm_native_unavailable(); }
