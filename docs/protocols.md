@@ -126,12 +126,22 @@ Bounds stack with `+`:
 impl[T : Show + Eq] Show for [T] { ... }
 ```
 
-**Where bounds are allowed.** Constraints exist only inside the
-impl-site type-parameter list — the brackets after `impl`. They do
-NOT propagate into ordinary function signatures: `fn foo[T : Show](x
-: T)` is **not** valid kaikai. This boundary is the line that keeps
-single-dispatch protocols (Tier 1 #3 in `CLAUDE.md`) clear of
-Haskell-style typeclasses, HKT, and constraint propagation.
+**Where bounds are allowed.** Protocol bounds appear on **impl-site**
+type parameters (`impl[T : Eq] ... for ...`) and, since #877, on
+**free-fn** type parameters (`fn dedup[T : Eq](xs : [T])`,
+`fn sum[T : Numeric](xs : [T])` — the stdlib aggregates use this).
+They do **not** appear on `type`/record declarations: `type M[T : Add]`
+is a parse error ("type-parameter kind must be `Type` or `Measure`").
+The line that keeps single-dispatch protocols clear of Haskell
+typeclasses / HKT / constraint propagation (Tier 1 #3) is *how* the
+bound is honoured, not *where* it may be written: dispatch resolves
+per monomorphised instance, never by a constraint that travels with
+the signature. **Known gap:** a free-fn bound is currently NOT
+enforced at the call site — `fn f[T : Eq](xs : [T])` whose body does
+not call `eq` accepts a `T` without `Eq`; the error only appears when
+the body dispatches the op on a concrete type lacking it. The bound is
+effectively documentation until the body forces the op. Tracked
+separately.
 
 **How dispatch resolves.** The monomorphiser specialises the impl
 once per concrete `T'` (e.g. `Int`, `String`, ...). Inside each
