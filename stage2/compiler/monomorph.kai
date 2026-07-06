@@ -868,12 +868,15 @@ fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
   }
 }
 
-#[doc("Result of the monomorphisation pass: the fully specialised decl list plus the m4c Phase 3 invariant leak records (empty = clean).")]
-pub type MonoOutput = MonoOut([Decl], [MLeakRecord])
+#[doc("One free-fn protocol-bound violation caught at a concrete instantiation: the message plus the call-site (or callee) location.")]
+pub type BoundViolation = BV(String, Int, Int)
 
-#[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), emitting one mangled spec per (name, tys, units) tuple; returns the rewritten program and any Phase 3 leak records.")]
+#[doc("Result of the monomorphisation pass: the fully specialised decl list, the m4c Phase 3 invariant leak records (empty = clean), and any fn protocol-bound violations found at concrete instantiations.")]
+pub type MonoOutput = MonoOut([Decl], [MLeakRecord], [BoundViolation])
+
+#[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), emitting one mangled spec per (name, tys, units) tuple; returns the rewritten program, any Phase 3 leak records, and fn-bound violations at concrete instantiations.")]
 pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
-                  local_arities: [OpAr]) : MonoOutput {
+                  local_arities: [OpAr], fn_bounds: [FnBoundsRec]) : MonoOutput {
   let polys = collect_poly_fns(tp.decls)
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
@@ -900,7 +903,151 @@ pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
   # accumulates a per-spec leak record (m4c Phase 3 invariant).
   let r = generate_specs_iter(polys, initial_tuples, tp.insts, [], initial_ts, [], reg, local_arities)
   match r {
-    GenSpecsOut(specs, _, leaks) -> MonoOut(list_append(rewritten, specs), leaks)
+    GenSpecsOut(specs, all_items, leaks) -> {
+      # Every concrete instantiation (direct + transitive) surfaces as a
+      # tuple in `all_items`; check each against the callee's declared
+      # bounds. A tuple whose type-kind slot is still a tyvar never
+      # reaches here (it isn't concrete), so a generic caller forwarding
+      # its own tparam defers to its own instantiation — no constraint
+      # propagation.
+      let viols = check_fn_bounds(all_items, fn_bounds, tp.insts, polys, reg, [])
+      MonoOut(list_append(rewritten, specs), leaks, viols)
+    }
+  }
+}
+
+# Cross each concrete instantiation tuple with the callee's declared
+# protocol bounds. A bound `T: P` on the type-kind tparam at index
+# `idx` is satisfied iff the concrete `tys[idx]` head has an impl of
+# `P` (user or synthesised-from-derive, both in `reg.impls`) or a
+# structural builtin impl. A direct call resolves its span from
+# `tp.insts`; a tuple mono discovered transitively has no inst, so the
+# error falls back to the callee decl's own line/col.
+fn check_fn_bounds(tuples: [MonoTuple], fn_bounds: [FnBoundsRec],
+                   insts: [ResolvedCS], polys: [PolyFn], reg: ProtocolReg,
+                   acc: [BoundViolation]) : [BoundViolation] {
+  match tuples {
+    [] -> list_reverse(acc)
+    [t, ...rest] -> match t {
+      MT(mo, name, tys, _) -> match lookup_fn_bounds(fn_bounds, name, mo) {
+        None -> check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc)
+        Some(ftbs) -> {
+          let loc = match inst_loc_for(insts, name, tys) {
+            LC(0, 0) -> decl_loc_of(polys, name)
+            lc       -> lc
+          }
+          let acc1 = check_tuple_bounds(ftbs, tys, name, reg, loc, acc)
+          check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc1)
+        }
+      }
+    }
+  }
+}
+
+# Callee decl's own line/col, used when a transitive tuple has no
+# call-site inst.
+fn decl_loc_of(polys: [PolyFn], name: String) : LineCol =
+  match lookup_poly_fn(polys, name) {
+    Some(d) -> match d { DFn(_, _, _, _, _, _, _, ln, cl, _) -> LC(ln, cl)  _ -> LC(0, 0) }
+    None    -> LC(0, 0)
+  }
+
+# Match a tuple to its callee's bounds. Records are keyed to the
+# target module. A bare-call tuple (`None`) refers to the root file's
+# own fn, so it matches the target-keyed record; a qualified tuple
+# (`Some(m)`) must name the same module. This keeps a same-named module
+# fn from picking up the root fn's bounds.
+fn lookup_fn_bounds(fbs: [FnBoundsRec], name: String, mo: Option[String]) : Option[[FnTPBound]] {
+  match fbs {
+    [] -> None
+    [f, ...rest] -> match f {
+      FBR(n, fmo, ftbs) ->
+        if n == name and mo_matches(fmo, mo) { Some(ftbs) }
+        else { lookup_fn_bounds(rest, name, mo) }
+    }
+  }
+}
+
+fn mo_matches(rec_mo: Option[String], tuple_mo: Option[String]) : Bool = match tuple_mo {
+  None    -> true
+  Some(m) -> match rec_mo { Some(r) -> r == m  None -> false }
+}
+
+# Line/col of the resolved call site matching this (name, tys) tuple.
+# The typer's insts carry the caller's span; a transitive tuple mono
+# discovered later has no inst here → 0:0.
+fn inst_loc_for(insts: [ResolvedCS], name: String, tys: [Ty]) : LineCol {
+  match insts {
+    [] -> LC(0, 0)
+    [cs, ...rest] -> match cs {
+      RCS(n, line, col, itys, _, _) ->
+        if n == name and tys_eq(itys, tys) { LC(line, col) }
+        else { inst_loc_for(rest, name, tys) }
+    }
+  }
+}
+
+type LineCol = LC(Int, Int)
+
+fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
+                      reg: ProtocolReg, loc: LineCol,
+                      acc: [BoundViolation]) : [BoundViolation] {
+  match ftbs {
+    [] -> acc
+    [ftb, ...rest] -> match ftb {
+      FTB(idx, protos) -> {
+        let acc1 = match ty_at(tys, idx) {
+          None -> acc
+          Some(ty) -> match ty_head_name(ty) {
+            None -> acc
+            Some(head) -> check_protos_for_head(protos, head, name, ty, reg, loc, acc)
+          }
+        }
+        check_tuple_bounds(rest, tys, name, reg, loc, acc1)
+      }
+    }
+  }
+}
+
+fn check_protos_for_head(protos: [String], head: String, fname: String,
+                         ty: Ty, reg: ProtocolReg, loc: LineCol,
+                         acc: [BoundViolation]) : [BoundViolation] {
+  match protos {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = if head_satisfies_proto(reg, p, head) { acc }
+                 else {
+                   let msg = concat_all(["type `", mono_ty_to_string(ty),
+                     "` does not satisfy the bound `", p,
+                     "` on a type parameter of `", fname, "`"])
+                   match loc { LC(l, c) -> [BV(msg, l, c), ...acc] }
+                 }
+      check_protos_for_head(rest, head, fname, ty, reg, loc, acc1)
+    }
+  }
+}
+
+# Canonical "head satisfies protocol": a user impl or a derive-
+# synthesised impl (both land in `reg.impls` via `expand_derives`
+# + `lower_impls`), or a structural builtin (Int/Real/... for
+# Eq/Show/Ord/Hash). Same trio the derive validator trusts.
+fn head_satisfies_proto(reg: ProtocolReg, proto: String, head: String) : Bool =
+  prc_reg_has_impl(reg, proto, head) or derive_builtin_impl(proto, head)
+
+fn ty_at(tys: [Ty], idx: Int) : Option[Ty] {
+  match tys {
+    [] -> None
+    [t, ...rest] -> if idx == 0 { Some(t) } else { ty_at(rest, idx - 1) }
+  }
+}
+
+fn tys_eq(a: [Ty], b: [Ty]) : Bool {
+  match a {
+    [] -> match b { [] -> true  _ -> false }
+    [x, ...xr] -> match b {
+      [] -> false
+      [y, ...yr] -> if ty_eq(x, y) { tys_eq(xr, yr) } else { false }
+    }
   }
 }
 
