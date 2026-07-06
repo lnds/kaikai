@@ -164,13 +164,23 @@ every other symbol. No new `intrinsic`/`builtin` marker: visibility is the barri
 
 ```kaikai
 # stdlib/core/taxa.kai
-pub  taxon Type    = $structural                    # public: usable
-priv taxon Effect  = $rows                           # DECLARED, but private → unusable
-pub  taxon Measure = $abelian_group with unit
-pub  taxon Money   = $abelian_group with currency
-pub  taxon Perm    = $semilattice  with perm
-pub  taxon Layout  = $composition  with layout { be le }
+pub  taxon Type    = $structural                       # public: usable
+priv taxon Effect  = $rows                              # DECLARED, but private → unusable
+pub  taxon Measure   = $abelian_group with unit
+pub  taxon Currency  = $module over T with currency        # NOT $abelian_group; scalar is the carrier T — see below
+pub  taxon Perm      = $semilattice  with perm
+pub  taxon Layout    = $composition over Int      with layout { be le }
+pub  taxon Waterfall = $composition over Rational with pct
 ```
+
+> **Money is `$module`, not `$abelian_group` — `USD²` is the bite.** An earlier draft wrote
+> `Money = $abelian_group with currency`. That is WRONG: `$abelian_group` is a *multiplicative*
+> group over its habitants — it gives `unit × unit` (that is why `m/s²` and `m·s` work for
+> physics), which for money means `USD × USD = USD²`, nonsense. Money admits `USD + USD`,
+> scalar-mult by a dimensionless number (`3 · USD`), but NOT `USD × USD`. That is a **module /
+> vector space**: an additive group of elements plus scalar multiplication from an external
+> ring, no element×element product. See *The surface: `[carrier]`, `<habitant>`, `over`, `with`*
+> and *When to separate two abelian taxa* below.
 
 **Declared-but-unusable is just `priv`.** `Effect` *is* a first-class taxon — real,
 declared, in the registry, listed by `kai info taxa` — but `priv`, so a user who writes
@@ -183,8 +193,8 @@ concept: it is the visibility kaikai already has.
 A user may declare taxa over **public** taxologies only:
 
 ```kaikai
-taxon Money = $abelian_group with currency     # ✓ $abelian_group is public
-taxon Perm  = $semilattice with perm           # ✓
+taxon Metric = $abelian_group with metric      # ✓ $abelian_group is public
+taxon Perm   = $semilattice with perm          # ✓
 # taxon Access = $structural                   # ✗ pub-leak: $structural is private
 # taxon Bad   = $rows                          # ✗ pub-leak: $rows is private
 ```
@@ -306,6 +316,133 @@ A tolerance-based check (`|sum − 100| < ε`) would inject an arbitrary ε into
 checker — the same unpredictable "accept/reject by a magic number" that Tier 1 #3
 rejects. Exact arithmetic keeps the sum verification decidable and sound.
 
+## The surface: `[carrier]`, `<habitant>`, `over`, `with`
+
+The full declaration form:
+
+```
+taxon Name = $taxology [over SecondDomain] with <habitant-form>
+type  M[T]<Taxon> = { ... }
+# use:  M[Carrier]<habitant>      e.g.  Money[Real]<USD>,  Matrix[Real]<3,4>
+```
+
+Four pieces, each with one job.
+
+### `[T]` vs `<habitant>` — two orthogonal axes
+
+A user type over a taxon has **two** parameters of different natures, in different brackets:
+
+- **`[T]`** — an ordinary **type** parameter (`[]`, exactly like `Option[T]`). The `[]` list
+  holds ONLY `Type` params (the carrier), with **no protocol bound** (see next). By convention
+  name it `T` uppercase, as the stdlib does. It is the type the value is built from:
+  `Money[Real]`, `Money[Decimal]`, `Matrix[BigInt]`.
+- **`<habitant>`** — the taxon **habitant** (`<>`, exactly like `Real<m>`). A currency or a
+  dimension is **not a type** — it is a classifying habitant, so it goes in `<>`. Taxa go in
+  `<>`, never in `[]`; only `Type` goes in `[]`.
+
+`Money[Decimal]<USD>` reads "money with carrier `Decimal`, currency `USD`". The two axes are
+independent: the carrier is a plain generic in `[]`, the habitant is the taxon marker in `<>`.
+This is what lets a taxon habitant live on a **library/user type** (`Money`) without the unit
+machinery being wired to native heads — the number enters as an ordinary `[T]` generic, and
+only the wrapper type (`Money`, `Matrix`) carries the `<>`.
+
+```kaikai
+type Money[T]<Currency> = { amount: T }
+fn sum(a, v : Money[Real]<USD>) = a + v          # a inferred Money[Real]<USD>; a+v needs same currency+carrier
+```
+
+### No protocol bound on the carrier — monomorphisation is the gate
+
+The carrier `[T]` carries **no** `: Add`/`: Numeric` bound. Protocol bounds are NOT valid in
+`fn`/`type` parameter lists — `fn foo[T: Show](x: T)` and `type M[T: Add]` are **not** kaikai
+(`docs/protocols.md`: constraints live only in the `impl[...]`-site list; this is the line that
+keeps single-dispatch protocols clear of Haskell typeclasses / constraint propagation, Tier 1
+#3). The old `[u: Measure]` form is different (`Measure` was a *kind*, not a protocol) and is
+superseded here anyway: taxa go in `<>`, only `Type` in `[]`.
+
+So how is "the carrier must be summable" enforced without a bound? **By monomorphisation, in
+the USE, not the signature — it does not propagate.** Verified:
+
+- `Money[String]<USD>` *constructs* (kaikai does not check the carrier at type declaration). But
+  it is **inert**: any monetary op fails at compile time — `money + money` on a `String` carrier
+  gives `error: no impl of Add for type String`, because monomorphisation specialises the op per
+  concrete carrier and checks the impl-table there. A `Money[String]` is a dead type that never
+  reaches runtime — exactly as `List[T]` accepts any `T` and fails when you use an unsupported
+  op. NOT special to Money.
+- A generic `fn combine[T](a: Money[T], b: Money[T]) = a.amount.add(b.amount)` compiles even
+  though `T` may lack `Add` — kaikai does NOT verify the abstract `T`; it waits for the concrete
+  instance (`combine[Int]` checks `Int.add`, `combine[String]` errors on `.add`). The sharp line
+  vs Haskell: NO constraint travels with the signature; the check is local per monomorphised
+  instance. **`concrete ⇒ check locally / variable ⇒ wait for the instance`** — the same
+  discipline as literal minting.
+
+So `Money[String]` is constructible-but-inert (the accepted price of "no typeclasses"): it never
+does harm, and forbidding it *in construction* would need the taxon to validate its carrier — a
+local `impl`-table check per concrete instantiation (no constraint propagation), DEFERRED because
+monomorphisation already rejects any real use. And there is **no algebraic-protocol hierarchy**
+(`Numeric extends Ring…` = Haskell superclasses, vetoed): the fat `Numeric` protocol (only
+Int/Real/Decimal implement it) is never the gate; overlapping small protocols (`Add` on every
+numeric carrier) plus per-instance monomorphisation cover it.
+
+### `over R` — the second domain (present iff the structure crosses two type domains)
+
+`over R` comes from "a module **over** a ring R": it names a **second, distinct type domain**
+the operation crosses. Present exactly when the taxology has two domains, absent otherwise:
+
+- `$module` (Money): elements (amounts, the carrier) **and** scalars (a ring) — the two-domain
+  structure. `over T` names the scalar; for Money the scalar IS the carrier `T` (you scale a
+  `Money[Decimal]` by a `Decimal`, `3` minted to the carrier). A *general* module allows scalar
+  ≠ element (a vector space of matrices over reals) — the surface can express that when needed
+  by naming a scalar distinct from `[T]`; Money simply reuses `T`. Either way `over` is what
+  marks the second domain, and (like the carrier) carries no protocol bound — monomorphisation
+  checks the scalar's ops per concrete instance.
+- `$composition` (Layout, Waterfall): elements (fields/tranches) **and** a summed **measure**
+  (a number). `over Int` (Layout, byte sizes) / `over Rational` (Waterfall, exact %s). Here
+  `over` names the measure type, an additive second domain, not a multiplicative scalar.
+- Single-domain taxologies take **no** `over`: `$abelian_group`/Measure (`unit × unit → unit`,
+  one domain — the rich `m/s²` algebra is still one domain), `$semilattice`, `$dimensional`.
+
+The sharp line: **`over` is not "more than one operation" — it is "does the operation cross two
+distinct type domains?"** UoM has `·`, `/`, `^` but all within one domain (units) → no `over`.
+A module crosses element↔scalar → `over`.
+
+### `with <form>` — what a habitant is (one keyword, four forms)
+
+`with` always declares what a habitant *is*; the taxology behind it decides how the habitant
+behaves (opaque vs measure-carrying, open vs closed — the per-taxology properties above):
+
+- **(a) introducer → symbol** — `with currency` ⇒ `currency USD`. An opaque, user-declared
+  symbol, open set. Money, Perm, Measure (`unit`).
+- **(b) type → value** — `with Int`, `with String`. Habitants **are values** of that type,
+  written directly (`<3>`, `<"tag">`), not declared; the type restricts validity
+  (`Matrix[Real]<3,4>` ok, `<USD,4>` error). `Dim`, `Matrix`.
+- **(c) introducer → symbol-with-measure** — `with pct` ⇒ `pct pct70 = 70`. A declared symbol
+  that **carries a number** the taxology sums. Waterfall. The `= N` is the habitant declaring
+  its measure (a measure-carrying taxology).
+- **(d) closed set** — `with layout { be le }`. Habitants are a **fixed** set the engine knows
+  (`be`/`le`), not user-extendable. Layout endianness.
+
+One keyword, four forms; which applies follows from the taxology's properties. Integer literals
+in `<>` already work today (`Real<m^2>`, exponent = literal integer), so `<3>` is not a new
+capability.
+
+### Practical mode — decidable checks compile-time, the rest at runtime
+
+The catalog's "two interacting operations = indecidable = out" rule is not the last word for a
+user's declared structure. The language lets you **declare** the mathematical structure of a
+type and enforces it in a split: **compile-time for what is decidable, runtime for what is
+not.** `$module`'s scalar-distributivity is never *proven* statically (that would be F*); what
+the compiler checks statically is which operations exist and whether habitants/carriers are
+compatible, and it **inserts runtime checks** for the rest.
+
+For Money: `Money<USD> + Money<USD>` ✓ and `+ Money<EUR>` ✗ and `Money × Money` ✗ (no internal
+product → no `USD²`) are **compile-time**; a currency read from a file is dynamic, so the
+value→type boundary lives in `parse(carrier, code) : Option[Money<...>]` (like `int.parse`, one
+type, no parallel "dynamic Money"). For Matrix: static shapes `Matrix<3,4> * Matrix<4,5>` check
+at compile time (inner `4` cancels); a matrix of runtime-unknown shape checks at runtime (a trap
+like an out-of-bounds index). Same split both cases — this is the "practicidad" that makes
+indecidable structures usable without weakening Tier 1 #3's static core.
+
 ## Usage — uniform surface
 
 ```kaikai
@@ -316,22 +453,24 @@ perm read                        # habitant of Perm
 
 let d : Real<km>  = 5.0<km>      # Measure habitant on a numeric (bare unit in <>)
 type H = { magic: U32<be> }      # Layout habitant on a field
+let m : Money[Real]<USD> = ...   # user type: carrier T in [], currency habitant in <>
 
-fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h   # polymorphism over a taxon
+fn area(w: Real<u>, h: Real<u>) : Real<u^2> = w * h   # unit-polymorphic; u is a Measure habitant in <>
 ```
 
-Note the taxon name appears in `[u: Measure]` and the habitant is bare in `Real<km>` —
-the keyword `taxon` never appears in *use* positions, only in the one-line declaration,
-exactly as `[u: Measure]` works today.
+The taxon and its habitants appear in `<>` (`Real<u>`, `Real<km>`); `[]` holds only `Type`
+carriers (`Money[Real]`). The keyword `taxon` never appears in *use* positions — only in the
+one-line declaration. (The pre-taxon surface spelled unit-polymorphism `[u: Measure]`, a
+*kind*-bound in `[]`; the taxon design moves habitants to `<>` uniformly, so `[]` is `Type`-only.)
 
 ## `unit` compatibility
 
 `unit` stays exactly as-is: `unit x` ≡ a `Measure` habitant (its exclusive
 introducer), spelled with the existing `TkUnitKw`. All current code (`unit m`,
 `unit USD`, `unit kg`) is unchanged — no `: Measure` annotation is ever required,
-because `unit` *is* Measure's introducer. A currency living in its own separated taxon
-uses that taxon's introducer (`currency USD` after
-`taxon Money = $abelian_group with currency`); `unit` remains Measure-only.
+because `unit` *is* Measure's introducer. A currency uses its own taxon's introducer
+(`currency USD` after `taxon Currency = $module over T with currency`); `unit`
+remains Measure-only.
 
 ## The hard locks (summary)
 
