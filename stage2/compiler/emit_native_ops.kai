@@ -707,18 +707,19 @@ pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Hand
 #   - nullary (no slots) → `kaix_nullary_fast`: an array load from the
 #     startup-seeded singleton table, skipping `kai_variant_u`'s NOINLINE call
 #     + nullary-cache hash probe (Red/Black/RBLeaf on the rb-tree).
-#   - primitive slot (`mask != 0`) → `kaix_variant_masked` (→ `kai_variant_u_fast`):
-#     a bare alloc + slot stores, tag→name/mask stamped once at startup, so the
-#     per-call register + immortal-args hash scan of `kai_variant_u` are gone.
+#   - a kind-1 Int slot (`mask != 0`) → `kaix_variant_masked` over an `[n x i64]`
+#     word buffer: Int slots are raw `.i64` words, boxed slots `ptrtoint(ptr)`,
+#     the mask telling the runtime + drop walker which is which. No box/unbox
+#     round-trip on the rb-tree's key/value slots — the `#1083` lever.
 #   - all-pointer payload → `kaix_variant`: its immortal-args interning is a win
 #     the fast path would drop.
-# Slots stay boxed here (masked call passes mask 0); the raw-i64 slot inline is a
-# later increment. Mirror of emit_c's `emit_ident_value` (nullary) +
-# `emit_variant_call_typed` (`variant_has_primitive_slot`).
+# Mirror of emit_c's `emit_ident_value` (nullary) + `emit_variant_call_typed`.
 fn nemit_con(ctx: Handle, nm: String, tag: Int, mask: Int, inits: [KSlotInit]) : Handle / Console = match inits {
   [] -> nemit_nullary_fast(ctx, tag, nm)
+  # `mask != 0` gates the raw route; the mask VALUE is not passed — the runtime
+  # reads it from the tag's startup-registered mask (`kai_slot_mask_of`).
   _  -> if mask == 0 { nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits)) }
-        else { nemit_variant_masked_call(ctx, tag, nm, nemit_init_buf(ctx, inits)) }
+        else { nemit_variant_masked_call(ctx, tag, nm, inits) }
 }
 
 # `kaix_nullary_fast(i32 tag, i8* name) -> ptr` — read the startup-seeded
@@ -730,18 +731,74 @@ fn nemit_nullary_fast(ctx: Handle, tag: Int, nm: String) : Handle / Console = {
   ncall_sig2(ctx, "kaix_nullary_fast", p, i32t, p, llvm_const_i32(i32t, tag), gname)
 }
 
-# `kaix_variant_masked(i32 tag, i8* name, i32 n, i32 mask, ptr* slots) -> ptr`
-# — the fast typed ctor. `mask` is passed 0: Block-1 slots are boxed pointers,
-# so the drop walker (reading the startup-registered mask) must see all-boxed.
-fn nemit_variant_masked_call(ctx: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+# `4^i` — the base-4 window scaler, plain arithmetic (stage1 parses no `<<`).
+# `pub` so the variant-TRMC step reads the mask window (selfhost catches the
+# privacy; bundle-concat hides it).
+pub fn nvariant_slot_pos(i: Int) : Int = if i <= 0 { 1 } else { 4 * nvariant_slot_pos(i - 1) }
+
+# An `[n x i64]` alloca of the slot words. The word is materialised and stored
+# IN THE SAME STEP (no `[Handle]` buffer holding it in between): a handle that
+# is the result of an `ncall` (`kaix_int_field` for a kind-1 slot) does not
+# survive sitting in a buffer across kaic1's RC bookkeeping — it is stored the
+# instant it is born (the ASAN UAF was the word freed while it waited in the
+# buffer). Entry-block-scoped alloca (a loop body must not re-alloca per
+# iteration — issue #668), mirroring `nemit_ptr_array`.
+fn nemit_i64_slot_array(ctx: Handle, inits: [KSlotInit]) : Handle / Console = {
+  let n = list_length(inits)
+  if n == 0 { llvm_const_null(native_ctx_ptrt(ctx)) }
+  else {
+    let arrty = llvm_array_type(native_ctx_i64t(ctx), n)
+    let arr = llvm_build_alloca_entry(ctx, arrty, "slots")
+    nemit_store_slot_words(ctx, arr, arrty, inits, 0); arr
+  }
+}
+# Store each slot word into `arr[i]` the instant it is materialised. A kind-1
+# `SIInt64` slot is the raw `i64` (`nemit_atom_raw` absorbs the boxed→raw
+# border via `kaix_int_field`); a boxed/Real slot is `ptrtoint(ptr)` over a
+# `let`-bound boxed handle in this frame (asu "risk #1"). `arr[i]` is a fresh
+# `let`-bound gep so the store's two operands are both frame-local.
+fn nemit_store_slot_words(ctx: Handle, arr: Handle, arrty: Handle, inits: [KSlotInit], i: Int) : Unit / Console = match inits {
+  [] -> ()
+  [it, ...rest] -> {
+    let w = nemit_slot_word(ctx, it)
+    let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i))
+    llvm_build_store(native_ctx_b(ctx), w, slot)
+    nemit_store_slot_words(ctx, arr, arrty, rest, i + 1)
+  }
+}
+
+# A `[1+n x i64]` alloca for the token-carrying ctor: `slots[0]` the already-
+# materialised token word, `slots[1..]` the inits store-immediate (same UAF-free
+# discipline as `nemit_i64_slot_array`).
+fn nemit_i64_token_slot_array(ctx: Handle, tokw: Handle, inits: [KSlotInit]) : Handle / Console = {
+  let n = list_length(inits) + 1
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), n)
+  let arr = llvm_build_alloca_entry(ctx, arrty, "slots")
+  let slot0 = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), 0))
+  llvm_build_store(native_ctx_b(ctx), tokw, slot0)
+  nemit_store_slot_words(ctx, arr, arrty, inits, 1); arr
+}
+# FLAT single frame (asu "risk #1"): a kind-1 Int slot returns the raw `i64`
+# in tail; a boxed/Real slot captures its boxed handle in a `let` in THIS frame
+# and `ptrtoint`s it in tail (mirror of `ffi_rebox_fixed_val`).
+fn nemit_slot_word(ctx: Handle, it: KSlotInit) : Handle / Console = match it {
+  SIInt64(v) -> nemit_atom_raw(ctx, v, SInt64)
+  SIReal(v)  -> { let b = nemit_atom(ctx, v); llvm_build_ptrtoint(native_ctx_b(ctx), b, native_ctx_i64t(ctx)) }
+  SIBoxed(v) -> { let b = nemit_atom(ctx, v); llvm_build_ptrtoint(native_ctx_b(ctx), b, native_ctx_i64t(ctx)) }
+}
+
+# `kaix_variant_masked(i32 tag, i8* name, i32 n, i64* slots) -> ptr` — the fast
+# typed ctor over the `[n x i64]` word buffer. No mask arg: the runtime reads
+# the slot layout from the tag's startup-registered mask (`kai_slot_mask_of`),
+# so the drop walker + this ctor share one source and the CallInst stays narrow.
+fn nemit_variant_masked_call(ctx: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
-  let n = llvm_buf_len(argvalbuf)
-  let argarr = nemit_ptr_array(ctx, argvalbuf)
-  llvm_buf_free(argvalbuf)
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
-  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, llvm_const_i32(i32t, 0)); llvm_buf_push(ab, argarr)
+  let n = list_length(inits)
+  let argarr = nemit_i64_slot_array(ctx, inits)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
   ncall_finish(ctx, "kaix_variant_masked", p, ptb, ab)
 }
 
@@ -772,38 +829,57 @@ pub fn nemit_variant_call(ctx: Handle, sym: String, tag: Int, nm: String, argval
 # the rebuilt node). Cons reuse rides the binary-cons helper (head + tail).
 fn nemit_con_reuse(ctx: Handle, rk: KReuseKind, d: KVal, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console =
   match rk {
-    RkVariant -> nemit_variant_reuse_call(ctx, nemit_atom(ctx, d), tag, nm, nemit_init_buf(ctx, inits))
-    RkCons    -> nemit_cons_reuse_call(ctx, nemit_atom(ctx, d), nemit_init_buf(ctx, inits))
+    # Capture the donor handle in a `let` before the call (kaic1 handle-RC UAF):
+    # the slot-word emission inside the call emits instructions, and an inline
+    # donor handle arg would be RC-dropped mid-build, clobbering its use-list.
+    RkVariant -> { let scr = nemit_atom(ctx, d); nemit_variant_reuse_call(ctx, scr, tag, nm, inits) }
+    RkCons    -> { let scr = nemit_atom(ctx, d); nemit_cons_reuse_call(ctx, scr, nemit_init_buf(ctx, inits)) }
     RkTokenVariant -> nemit_con_at(ctx, d, tag, nm, inits)
   }
 
-# `kaix_variant_reuse_at(ptr scr, i32 tag, i8* name, i32 n, ptr* args) -> ptr`
-# — the Koka move-semantics variant reuse (donate unique cell, write slots,
-# NO donor-child decref; fall back to a fresh alloc when the donor is
-# shared/wrong-arity). Same arg layout as `kaix_reuse_or_alloc_variant`; the
-# entry point is the only difference.
-fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, argvalbuf: Handle) : Handle / Console = {
+# `kaix_variant_reuse_at_i64(ptr scr, i32 tag, i8* name, i32 n, i64* slots)` —
+# the Koka move-semantics variant reuse over the `[n x i64]` word buffer. No
+# mask arg: the runtime reads the tag's registered mask, so a reused and a fresh
+# RBNode carry key/value identically (one mask source, narrow CallInst).
+fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
-  let n = llvm_buf_len(argvalbuf)
-  let argarr = nemit_ptr_array(ctx, argvalbuf)
-  llvm_buf_free(argvalbuf)
+  let n = list_length(inits)
+  let argarr = nemit_i64_slot_array(ctx, inits)
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
   let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
-  ncall_finish(ctx, "kaix_variant_reuse_at", p, ptb, ab)
+  ncall_finish(ctx, "kaix_variant_reuse_at_i64", p, ptb, ab)
 }
 
-# `RkTokenVariant`: rebuild a ctor INTO a donated reuse token (fresh alloc
-# when the token is null). The token rides as `args[0]` of the plain 4-arg
-# variant-ctor call shape (`kaix_variant_at_argv`) — the same buffer-carried
-# form the TRMC variant step uses; a widened 5-arg call is miscompiled by
-# the stage1-built emitter.
+# `RkTokenVariant`: rebuild a ctor INTO a donated reuse token (fresh alloc when
+# the token is null) over the `[1+n x i64]` word buffer. The token rides as
+# `slots[0]` of `kaix_variant_at_argv_i64` (4 args — the runtime reads the tag's
+# mask; a widened mask arg is miscompiled by the stage1 emitter). Store-immediate.
 fn nemit_con_at(ctx: Handle, tok: KVal, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
-  let buf = llvm_buf_new()
-  llvm_buf_push(buf, nemit_atom(ctx, tok))
-  nemit_push_inits(ctx, buf, inits)
-  nemit_variant_call(ctx, "kaix_variant_at_argv", tag, nm, buf)
+  # The token as a pointer word: `let`-bind the boxed handle in THIS frame and
+  # `ptrtoint` it inline (asu "risk #1").
+  let tokv = nemit_atom(ctx, tok)
+  let tokw = llvm_build_ptrtoint(native_ctx_b(ctx), tokv, native_ctx_i64t(ctx))
+  nemit_variant_at_masked_call(ctx, tag, nm, tokw, inits)
+}
+
+# `kaix_variant_at_argv_masked(i32 tag, i8* name, i32 n, i32 mask, i64* slots)`
+# — the token-carrying masked ctor over an `[n x i64]` word buffer built by
+# STORE-IMMEDIATE (`slots[0]` the reuse token word, `slots[1..]` the real
+# payload words materialised-and-stored one at a time, so no ncall-result
+# handle waits in a C-opaque buffer across a frame return — the kaic1 RC UAF).
+# `n` counts token+slots so the runtime slices `slots + 1`. Shared by
+# `nemit_con_at` (RkTokenVariant) and the variant-TRMC spine step.
+pub fn nemit_variant_at_masked_call(ctx: Handle, tag: Int, nm: String, tokw: Handle, inits: [KSlotInit]) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let n = list_length(inits) + 1
+  let argarr = nemit_i64_token_slot_array(ctx, tokw, inits)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
+  ncall_finish(ctx, "kaix_variant_at_argv_i64", p, ptb, ab)
 }
 
 # `kaix_cons_reuse_move(ptr scr, ptr head, ptr tail) -> ptr`. A `KConReuse`

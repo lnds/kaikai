@@ -487,20 +487,48 @@ pub fn boxed_inits(vs: [KVal], acc: [KSlotInit]) : [KSlotInit] = match vs {
   [v, ...rest] -> boxed_inits(rest, list_append(acc, [SIBoxed(v)]))
 }
 
-# The 2-bit-per-slot mask for a ctor, from its declared payload types. Non-
-# zero iff the ctor carries an Int/Real slot — the gate the native emitter
-# reads to route construction through the fast entry (`kai_variant_u_fast`).
-# Mirror of the C backend's `variant_slot_mask`; `[]` for enums accepts an
-# enum-typed slot reading kind-0 (boxed), as emit_c's `ctor_int_slots_of` does.
+# Wrap each value atom as a slot-init typed by the ctor's declared payload:
+# a kind-1 Int slot becomes `SIInt64`, everything else `SIBoxed`. The KIND is
+# the definition's, read from the SAME `variant_slot_kind`/`evar_payload_tys`
+# the native mask (`variant_i64_mask`) + drop-walker read, so construction,
+# drop and read stay in lockstep. The i64 slot still holds a boxed `KVal`
+# here — the emitter (`nemit_slot_words`) absorbs the boxed→raw border at the
+# slot via `nemit_atom_raw`, so a tagged pointer is unboxed before it lands in
+# `.i64` (never stored raw). Real/enum slots stay boxed (the native i64 layout
+# is Int-only per `variant_i64_mask`). Builtins fall through to `SIBoxed`
+# (their mask is 0 per `ls_ctor_mask`).
+pub fn typed_inits(vs: [KVal], name: String, st: LowerSt) : [KSlotInit] =
+  match evar_payload_tys(st.vs, name) {
+    Some(tys) -> if evar_find_tag(st.vs, name) < user_variant_tag_base() {
+                   boxed_inits(vs, [])
+                 } else { typed_inits_idx(vs, tys, []) }
+    None      -> boxed_inits(vs, [])
+  }
+
+fn typed_inits_idx(vs: [KVal], tys: [TypeExpr], acc: [KSlotInit]) : [KSlotInit] = match vs {
+  [] -> acc
+  [v, ...vrest] -> match tys {
+    [t, ...trest] ->
+      if variant_slot_kind(t, []) == 1 { typed_inits_idx(vrest, trest, list_append(acc, [SIInt64(v)])) }
+      else { typed_inits_idx(vrest, trest, list_append(acc, [SIBoxed(v)])) }
+    []            -> typed_inits_idx(vrest, [], list_append(acc, [SIBoxed(v)]))
+  }
+}
+
+# The 2-bit-per-slot i64-inline mask for a ctor, from its declared payload
+# types. Non-zero iff the ctor carries a kind-1 Int slot — the native emitter
+# lays those raw (`.i64`) and boxes the rest. `variant_i64_mask` (Int-only)
+# is the single source construction, the startup drop-walker register, and
+# the KProj read all consult, so a tag's cells never hold mixed word kinds.
 #
-# BUILTIN ctors (tag < user base) return 0 so they NEVER take the fast path: the
-# C runtime mints Exited(Int)/Signaled(Int) with a raw i64 slot (mask 1) and the
-# match reads it via that mask, so the emitter must not build a competing boxed
-# cell nor re-register the tag. The runtime owns their slot layout end to end.
+# BUILTIN ctors (tag < user base) return 0 so they NEVER take the raw path: the
+# C runtime mints Exited(Int)/Signaled(Int) with its own raw i64 slot and the
+# match reads it via that mask, so the emitter must not build a competing cell
+# nor re-register the tag. The runtime owns their slot layout end to end.
 pub fn ls_ctor_mask(st: LowerSt, name: String) : Int =
   if evar_find_tag(st.vs, name) < user_variant_tag_base() { 0 }
   else { match evar_payload_tys(st.vs, name) {
-    Some(tys) -> variant_slot_mask(tys, [])
+    Some(tys) -> variant_i64_mask(tys, [])
     None      -> 0
   } }
 

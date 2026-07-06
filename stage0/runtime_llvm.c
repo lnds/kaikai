@@ -329,19 +329,16 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
  * one word, binary-compatible with `i64`/`KaiValue *`, so the emitter's
  * `store i64` (raw) and `store i64 ptrtoint(ptr)` (boxed) land the right
  * bits in either slot kind. */
+/* The mask is NOT an argument — it is read from the tag's startup-registered
+ * slot mask (`kai_slot_mask_of`, stamped by `kaix_register_one_payload_ctor`).
+ * Keeping the ctor at 4 args (no mask arg) means the stage1-built emitter never
+ * widens the CallInst, so its RC pass cannot dup+scribble a reused-node handle
+ * (the `<Invalid operator>` verify failure the 5-arg form hit in the TRMC
+ * spine). One mask source for construction, read, and the drop walker.
+ * `kai_variant_u_fast` reads `kai_slot_mask_of(tag)` for the slot layout. */
 KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n,
-                              int32_t mask, KaiVarSlot *slots) {
+                              KaiVarSlot *slots) {
     if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
-    /* Fast path (matches the C backend's `kai_variant_u_fast`): alloc +
-     * slot stores only, NO per-call name/mask register or cache probe. The
-     * tag→name and tag→mask tables are stamped ONCE at startup by
-     * `_kai_proto_init_llvm` (one `kaix_register_one_payload_ctor` per
-     * primitive-slot ctor), so the generic drop walker still reads the
-     * right mask. Before this, the masked ctor went through the cold
-     * `kai_variant_u` whose preamble (varname/slotmask register + nullary
-     * probe + immortal-args 262144-bucket hash scan) dominated the rb-tree
-     * profile at 34.8% of all instructions — the bulk of the LLVM-vs-C gap
-     * remaining after i64-inline. */
     return kai_variant_u_fast(tag, n, slots);
 }
 
@@ -766,6 +763,38 @@ KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name,
                                  int n, int32_t mask, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
   return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
+}
+
+/* i64-inline twin of `kaix_variant_at_argv`, KEPT AT 4 ARGS (tag,name,n,slots)
+ * so the TRMC spine step's CallInst is not widened to a 5th `mask` arg — the
+ * stage1-built emitter's RC pass dups a widened reused-node handle and
+ * scribbles the CallInst (the `<Invalid operator>` verify failure). The mask is
+ * NOT an argument: it is read from the tag's startup-registered slot mask
+ * (`kai_slot_mask_of`, stamped by `kaix_register_one_payload_ctor` in tarea C),
+ * so a token-donated rebuild lays the SAME word kinds a fresh
+ * `kaix_variant_masked` cell does — the 3-routes-or-none invariant.
+ * `slots[0].ptr` carries the arm-top reuse token, `slots[1..n-1]` the real
+ * payload words (raw i64 for a kind-1 Int slot, ptrtoint(ptr) for boxed). */
+KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n,
+                                   KaiVarSlot *slots) {
+  return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1,
+                                (int32_t) kai_slot_mask_of(tag), slots + 1);
+}
+
+/* i64-inline twin of `kaix_variant_reuse_at`: rebuild-in-place laying the SAME
+ * kind-1 raw words a fresh `kaix_variant_masked` cell does. The mask is NOT an
+ * argument — read from the tag's startup-registered slot mask
+ * (`kai_slot_mask_of`), so the reuse and fresh routes share one mask source and
+ * the CallInst stays at 4 args (no widening → no kaic1 dup-scribble). Mirror of
+ * the C backend's `emit_reuse_variant_body` (`kai_variant_reuse_at` with the
+ * real mask). Without the raw layout the reuse route wrote `.ptr` for a slot
+ * the drop-walker (reading the tag's mask) treats as `.i64` — a tagged pointer
+ * read as an integer (the rb-tree height divergence). */
+KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, KaiVarSlot *slots) {
+  if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
+  return kai_variant_reuse_at(scr, tag, name, n,
+                              (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
 /* Used by lambda thunks to read their captured values from the

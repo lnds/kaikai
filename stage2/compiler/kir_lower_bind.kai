@@ -44,7 +44,7 @@ import compiler.kir_lower
 # to bind. `PVariant` reads positional slots (`KProj scrv idx`);
 # `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
 pub fn bind_pattern_fields(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, subs)         -> bind_sub_binders(subs, scrv, 0, st)
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, scrv, 0, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, st)
   # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
   # whole scrutinee to `name`, then bind the inner pattern's own sub-binders.
@@ -53,10 +53,20 @@ pub fn bind_pattern_fields(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Cons
   _                         -> st
 }
 
-fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match subs {
+fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match subs {
   [] -> st
-  [sp, ...rest] -> bind_sub_binders(rest, scrv, idx + 1, bind_slot_pattern(sp, scrv, idx, st))
+  [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, bind_slot_pattern(cn, sp, scrv, idx, st))
 }
+
+# The KSlot a match-arm binder reads slot `idx` of ctor `cn` at. Currently
+# always `SBoxed`: the slot is BUILT i64-inline (typed_inits) but READ boxed
+# via `kaix_variant_arg`, which consults the tag's registered mask and re-boxes
+# a raw i64 slot correctly (`kai_variant_slot_box`). So construction/drop are
+# i64-inline (the #1083 layout) while the read stays boxed — correct, one box
+# per read. The raw read (`SInt64` → `kaix_variant_arg_i64`) is a follow-up: it
+# regressed the native self-host (a raw binder propagated to a consumer the
+# border did not cover), so it is deferred until that propagation is audited.
+pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int) : KSlot = SBoxed
 
 # Bind ONE positional slot's sub-pattern. A `PBind` aliases the slot; a
 # nested plain record projects the slot and recurses; an as-pattern binds
@@ -74,8 +84,12 @@ fn bind_sub_binders(subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerS
 # name, so it stays a no-op. The payload-bearing case projects the slot and
 # recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
 # direct sub-binders), the SAME shared bind recursion the record path uses.
-fn bind_slot_pattern(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
-  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KProj(scrv, idx), KAt(sp.line, sp.col)))
+fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
+  # A kind-1 Int slot binder reads raw (`SInt64` → `kaix_variant_arg_i64`), no
+  # box round-trip; every other slot stays boxed. The read slot matches the
+  # ctor's write layout (both via `variant_slot_kind`), so no tagged pointer is
+  # ever read as `.i64` nor vice versa.
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx), KProj(scrv, idx), KAt(sp.line, sp.col)))
   PRecord(_)           -> bind_nested_slot(sp, scrv, idx, st)
   PAs(name, _)         -> bind_nested_as(sp, name, scrv, idx, st)
   PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(sp, scrv, idx, st) }
@@ -114,7 +128,7 @@ fn bind_nested_as(sp: Pattern, name: String, scrv: KVal, idx: Int, st: LowerSt) 
 # here arrives only from a context whose tag is settled (the let-bind of a
 # single-ctor type, an as-pattern inner), so its direct subs bind.
 pub fn bind_pattern_fields_any(p: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, subs)         -> bind_sub_binders(subs, v, 0, st)
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, v, 0, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, v, st)
   PRecord(fields)           -> bind_record_subfields(fields, v, st)
   _                         -> st
