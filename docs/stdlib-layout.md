@@ -129,7 +129,7 @@ in a mechanical follow-up. The `opt_or` survivor is independent
 Since the 2026-05-17 canonical-only migration, stdlib modules define
 their operations under **bare canonical names** (`pub fn make`,
 `pub fn parse`, `pub fn push`, …) and callers reach them qualified
-(`money.make`, `date.parse`, `queue.push`) or bare where the call
+(`decimal.make`, `date.parse`, `queue.push`) or bare where the call
 site is unambiguous. Three mechanisms make this work:
 
 - **The qualified-call resolver consults the module's actual
@@ -140,7 +140,7 @@ site is unambiguous. Three mechanisms make this work:
   there is no silent `module.fn` → `module_fn` rewriting anymore.
 - **Codegen mints per-module C symbols** (`kai_<module>__<name>`;
   separate compilation, #748), so same-named exports across modules
-  coexist at link time: `decimal.parse`, `money.parse`, `uuid.parse`
+  coexist at link time: `decimal.parse`, `rational.parse`, `uuid.parse`
   and `date.parse` are four distinct symbols.
 - **Bare call sites disambiguate by argument type/arity** (the
   typer's first-arg narrowing). Names that are ambiguous bare or
@@ -149,9 +149,8 @@ site is unambiguous. Three mechanisms make this work:
 
 Surviving flat-prefix names are *compound* names, not legacy debt:
 `time.kai`'s `duration_*` / `instant_*` / `walltime_*` (three
-carriers in one module), `fx.kai`'s `money_*_via_fx`, and
-`protocols.kai`'s `bin_*` implementation home (re-exposed bare by
-`stdlib/bin.kai`'s one-line wrappers).
+carriers in one module) and `protocols.kai`'s `bin_*` implementation
+home (re-exposed bare by `stdlib/bin.kai`'s one-line wrappers).
 
 The migration history — which batch renamed which module, and why
 issue #614's Option E was first rejected (pre-#748 there was no
@@ -185,7 +184,7 @@ Modules are tagged by which compiler stage they require:
   every CI run.
 - **Stage 2 — full-kaikai.** Requires the full language (effects,
   row polymorphism, Perceus, monomorphisation, `++`). Everything
-  else (`encoding/`, `collections/`, `decimal`, `money`, `loop`,
+  else (`encoding/`, `collections/`, `decimal`, `loop`,
   `reader`, `writer`, `random`, `time`, `net/`, `crypto/`,
   `regexp`, `concurrent/`, `testing`).
 
@@ -256,8 +255,6 @@ stdlib/
   decimal.kai    pure, stage 2 (top-level module — shipped)
   decimal_big.kai pure, stage 2 (top-level module; BigInt carrier, no scale ceiling — shipped; +decimal_big_proto)
   rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped; +rational_proto)
-  money.kai      pure, stage 2 (top-level module; depends on decimal — shipped)
-  fx.kai         pure, stage 2 (top-level module; depends on decimal + money — shipped via #365)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
   reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
@@ -343,24 +340,6 @@ land in each module's own spec when implemented.
   modes (top-level module: `decimal.add`, `decimal.from_string`, …).
   `dec_div(a, b, target_scale)` returns `Option[Decimal]`: `None` on
   division by zero, `Some(q)` otherwise *(closes #363)*.
-
-### money (pure, stage 2)
-
-- `money` — `Money[Currency]` with precision per currency, safe
-  arithmetic (no implicit cross-currency ops); depends on `decimal`
-
-### fx (pure, stage 2 — shipped via #365)
-
-- `fx` — currency conversion on top of `Money` + `Decimal`. Carriers
-  `FxPair`, `FxRate`, `FxTable`, `FxTimestamp`. Operations:
-  `fx_pair`, `fx_rate_make`, `fx_rate_at`, `fx_table_empty`,
-  `fx_table_put`, `fx_lookup`, `fx_convert`. Composition wrappers:
-  `money_add_via_fx`, `money_sub_via_fx`, `money_cmp_via_fx`.
-  Inverse rates are NOT auto-derived (real-world bid/ask spreads
-  are asymmetric); callers register both directions explicitly or
-  derive an inverse via `dec_div`. v1 has no transitive lookup,
-  no rate aging, no live feed — those follow up in
-  `stdlib/fx-extras.kai` once a use case appears.
 
 ### array (pure, stage 2 — shipped via #366)
 
@@ -466,7 +445,7 @@ Single top-level module. Contains both the types (`Instant`,
 ### date (pure; `today()` rides `/ Clock`)
 
 Single top-level module: civil calendar dates, proleptic Gregorian,
-timezone-naive. Pure data + algorithms following the decimal/money
+timezone-naive. Pure data + algorithms following the decimal
 precedent (`Option` for fallible constructors/parsers, no panics);
 the only effectful fn is `today()`.
 
@@ -633,8 +612,8 @@ their own repo and name from the Rapa Nui pool per
 
 - Web framework: HTTP server, router, middleware, templating, auth.
 - Fintech toolkit: ledger, audit hash-chain, ISO 20022 bindings.
-  (But the `decimal` and `money` top-level modules **are** stdlib —
-  they are frontloaded primitives per the roadmap.)
+  (But the `decimal` top-level module **is** stdlib — a frontloaded
+  primitive per the roadmap.)
 - IA toolkit: LLM clients, agent orchestration, vector stores.
 
 ## Open questions

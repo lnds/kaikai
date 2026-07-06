@@ -32,8 +32,6 @@ modules=(
   "stdlib/math/int.kai:int:int"
   "stdlib/math/real.kai:real:real"
   "stdlib/decimal.kai:dec:decimal"
-  "stdlib/money.kai:money:money"
-  "stdlib/fx.kai:fx:fx"
   "stdlib/encoding/base64.kai:base64:base64"
   "stdlib/encoding/hex.kai:hex:hex"
   "stdlib/encoding/toml.kai:toml:toml"
