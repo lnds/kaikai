@@ -2885,8 +2885,16 @@ pub type UnionInfo = UI(String, [Ty], Int, Int)
 # — those paths have no module table to consult, so the only head a
 # pipe could resolve against is the prelude-loaded `List`, which their
 # fixtures already exercise via the standard prelude path.
+# `#[constructor]` registry entry: the constructed type's bare name,
+# its home module, and the marked fn's name. `try_constructor_call`
+# reads it to rewrite `Type(args)` into `EModCall(home, fn)(args)`.
+#[doc("infer: one `#[constructor]` binding — `(type_name, home_module, fn_name)`.")]
+pub type CtorEntry = CtorE(String, String, String)
+
 #[doc("infer: `TyEnv` — driver-facing type.")]
 pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
+               # `#[constructor]` bindings: `type_name -> (home, fn)`.
+               constructors: [CtorEntry],
                head_owners: [HeadOwnerEntry],
                # bare names of functions declared in the ROOT
                # (user) file. A root `fn foo` unconditionally shadows any
@@ -2924,13 +2932,13 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
   let e = TyEntry { name: name, scheme: sc }
   TyEnv { entries: [e, ...env.entries],
-          fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+          fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
           index: idx_prepend(env.index, k, e) }
 }
 
@@ -3467,7 +3475,7 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
   let batch = list_append(es, native_es)
   match ty_env_prepend_batch(batch, env.entries, env.index) {
     TEP(all_entries, idx) ->
-      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
               index: idx }
   }
 }
@@ -3511,7 +3519,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   ]
   match ty_env_prepend_batch(es, env.entries, env.index) {
     TEP(all_entries, idx) ->
-      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
               index: idx }
   }
 }
@@ -4576,6 +4584,7 @@ fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
           validate_one_type_decl(rest, file, claims, errs, name, line, col)
         _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
       }
+      DConstructor(inner, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
       _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
     }
   }
@@ -4661,6 +4670,54 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
       diag_error(file, line, col, msg)
       diag_help(concat_all(["remove or rename the second 'type ", name,
                               " = ...' declaration"]))
+    }
+  }
+}
+
+#[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type.")]
+pub fn validate_constructor_uniqueness_decls(decls: [Decl], file: String) : Int / Console + File {
+
+  validate_constructor_uniqueness_loop(decls, file, [], 0)
+}
+
+fn validate_constructor_uniqueness_loop(remaining: [Decl], file: String,
+                                        claims: [TypeNameClaim],
+                                        errs: Int) : Int / Console + File {
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match constructor_decl_type(d) {
+      Some(TNC(tname, line, col)) -> match find_type_name_claim(claims, tname) {
+        Some(prev) -> {
+          report_dup_constructor(file, tname, line, col, prev)
+          validate_constructor_uniqueness_loop(rest, file, claims, errs + 1)
+        }
+        None -> validate_constructor_uniqueness_loop(rest, file,
+                                                     [TNC(tname, line, col), ...claims], errs)
+      }
+      None -> validate_constructor_uniqueness_loop(rest, file, claims, errs)
+    }
+  }
+}
+
+# `Some(TNC(type_name, line, col))` for a `#[constructor]` wrapper whose
+# inner fn returns a named type; None for any other decl.
+fn constructor_decl_type(d: Decl) : Option[TypeNameClaim] = match d {
+  DConstructor(DFn(_, _, _, _, Some(ret_te), _, _, _, _, _), l, c) ->
+    match constructor_type_name(ret_te) {
+      Some(tname) -> Some(TNC(tname, l, c))
+      None        -> None
+    }
+  _ -> None
+}
+
+fn report_dup_constructor(file: String, tname: String, line: Int, col: Int,
+                          prev: TypeNameClaim) : Unit / Console + File {
+  match prev {
+    TNC(_, prev_line, prev_col) -> {
+      diag_error(file, line, col,
+        concat_all(["type '", tname, "' already has a `#[constructor]` (earlier at ",
+                    file, ":", int_to_string(prev_line), ":", int_to_string(prev_col), ")"]))
+      diag_help(concat_all(["a type has at most one `#[constructor]`; keep one and make the other a named `pub fn` (overloading is out — Tier 1 #3)"]))
     }
   }
 }
@@ -5462,10 +5519,96 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           }
           EnvWithArities { env: env2, arities: ar_acc }
         }
+        # `#[constructor]` wrapper: register the inner `pub fn` exactly
+        # as a bare `DFn` would be, then record its `type -> (home, fn)`
+        # binding so `try_constructor_call` can desugar `Type(args)`.
+        DConstructor(inner, cl, cc) -> {
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
+        }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
       add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table)
     }
+  }
+}
+
+# Record a `#[constructor]` binding on the env. The inner `DFn`'s
+# return type names the constructed type; its home module and fn name
+# complete the `EModCall` target. Entries accumulate (a duplicate is
+# a second entry for the same type name); `check_constructor_uniqueness`
+# reports the second as an error later, where diagnostics are available.
+fn register_constructor(env: TyEnv, inner: Decl, l: Int, c: Int) : TyEnv {
+  match inner {
+    DFn(_, fname, _, _, ret_opt, _, _, _, _, mo) -> match ret_opt {
+      Some(ret_te) -> match constructor_type_name(ret_te) {
+        Some(tname) -> {
+          let home = match mo { Some(m) -> m  None -> "" }
+          ctor_add(env, CtorE(tname, home, fname), l, c)
+        }
+        None -> env
+      }
+      None -> env
+    }
+    _ -> env
+  }
+}
+
+# Bare name of a return type: the final `::`/`.` segment of a
+# `TyName`, so `bigint.BigInt` and `BigInt` both key on `BigInt`.
+fn constructor_type_name(te: TypeExpr) : Option[String] = match te.tkind {
+  TyName(nm, _) -> Some(ctor_last_segment(nm))
+  _             -> None
+}
+
+fn ctor_last_segment(nm: String) : String {
+  let i = ctor_last_dot(nm, string_length(nm) - 1)
+  if i < 0 { nm } else { string_slice(nm, i + 1, string_length(nm) - (i + 1)) }
+}
+
+fn ctor_last_dot(nm: String, from: Int) : Int {
+  if from < 0 { -1 }
+  else {
+    match char_at(nm, from) {
+      Some(ch) -> if ch == '.' { from } else { ctor_last_dot(nm, from - 1) }
+      None     -> ctor_last_dot(nm, from - 1)
+    }
+  }
+}
+
+fn ctor_add(env: TyEnv, entry: CtorEntry, l: Int, c: Int) : TyEnv =
+  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
+          constructors: [entry, ...env.constructors],
+          head_owners: env.head_owners, root_fns: env.root_fns,
+          row_kind: env.row_kind, index: env.index }
+
+# Collect every `#[constructor]` binding in a decl stream. Used to
+# seed a module's `ModuleEnvDelta` so downstream modules inherit the
+# registry — the sugar resolves cross-module `Type(args)` calls.
+fn collect_constructors(ds: [Decl], acc: [CtorEntry]) : [CtorEntry] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DConstructor(DFn(_, fname, _, _, Some(ret_te), _, _, _, _, mo), _, _) ->
+        match constructor_type_name(ret_te) {
+          Some(tname) -> {
+            let home = match mo { Some(m) -> m  None -> "" }
+            collect_constructors(rest, [CtorE(tname, home, fname), ...acc])
+          }
+          None -> collect_constructors(rest, acc)
+        }
+      _ -> collect_constructors(rest, acc)
+    }
+  }
+}
+
+# Look up the constructor binding for a bare type name; newest-first,
+# so the reported duplicate never masks the first-registered target.
+fn constructor_lookup(cs: [CtorEntry], tname: String) : Option[CtorEntry] {
+  match cs {
+    [] -> None
+    [CtorE(t, h, f), ...rest] ->
+      if t == tname { Some(CtorE(t, h, f)) } else { constructor_lookup(rest, tname) }
   }
 }
 
@@ -5631,7 +5774,7 @@ fn build_ty_env_seed() : BuiltEnv {
 fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
                         unions: [UnionInfo], top_names: [String]) : BuiltEnv {
   let env_with_unions = TyEnv {
-    entries: seed.env.entries, fresh: seed.env.fresh, unions: unions,
+    entries: seed.env.entries, fresh: seed.env.fresh, unions: unions, constructors: seed.env.constructors,
     head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
     row_kind: compute_row_kind_slots(decls), index: seed.env.index
   }
@@ -5674,6 +5817,7 @@ fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
   let env_in = match ty_env_prepend_batch(inherited.ty_entries, seed.env.entries, seed.env.index) {
     TEP(seeded_entries, seeded_index) -> TyEnv {
       entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
+      constructors: list_append(inherited.constructors, seed.env.constructors),
       head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
       row_kind: rk_table, index: seeded_index
     }
@@ -7083,7 +7227,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -7120,7 +7264,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -8598,7 +8742,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index },
     prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -9830,7 +9974,9 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
         Some(inf) -> inf
         None -> match try_ufcs_call(st_p, callee, args_, line, col) {
           Some(inf) -> inf
-          None -> match try_bare_call_narrow(st_p, callee, args_, line, col) {
+          None -> match try_constructor_call(st_p, callee, args_, line, col) {
+            Some(inf) -> inf
+            None -> match try_bare_call_narrow(st_p, callee, args_, line, col) {
             Some(inf) -> inf
             None -> {
             let rc = synth(st_p, callee)
@@ -9867,8 +10013,62 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             mk_inferred(st2, ty, root)
             }
           }
+          }
         }
       }
+  }
+}
+
+# `#[constructor]` sugar: a call whose callee is a bare type name with
+# a registered constructor desugars to a call to that fn via its home
+# module, so `Rational(2, 3)` routes through `rational.make` — passing
+# the fn's logic (canonicalisation, invariants), never the raw record
+# literal — and its arg literals mint against `make`'s param types.
+fn try_constructor_call(st: InferState, callee: Expr, args_: [Expr],
+                        line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+  match callee.kind {
+    EVar(nm) -> match constructor_lookup(st.env.constructors, nm) {
+      Some(CtorE(_, home, fnm)) -> {
+        let qcallee = mk_expr(EModCall(home, fnm), callee.line, callee.col)
+        # coin bare numeric args to the marked fn's param types (its
+        # scheme is concrete, e.g. `make(BigInt, BigInt)`), so
+        # `Rational(2, 3)` mints `2`/`3` to `BigInt`. Call-arg minting
+        # is not automatic, so the sugar does it explicitly here.
+        let minted_args = match ty_env_lookup_qualified(st.env, home, fnm) {
+          Some(sc) -> constructor_mint_args(st.env, sc, args_)
+          None     -> args_
+        }
+        let rewritten = mk_expr(ECall(qcallee, minted_args), line, col)
+        Some(synth(st, rewritten))
+      }
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+# Coin each bare numeric arg to the marked constructor's param type.
+# The scheme is instantiated to read its `TyFnT` param list; an arg
+# whose literal mints against its param is rewritten, others pass
+# through untouched (the unifier still confirms the result).
+fn constructor_mint_args(env: TyEnv, sc: TyScheme, args_: [Expr]) : [Expr] {
+  match instantiate(env, sc).ty {
+    TyFnT(param_tys, _, _) -> constructor_mint_zip(args_, param_tys)
+    _                      -> args_
+  }
+}
+
+fn constructor_mint_zip(args_: [Expr], param_tys: [Ty]) : [Expr] {
+  match args_ {
+    [] -> []
+    [a, ...rest_a] -> match param_tys {
+      [] -> args_
+      [p, ...rest_p] -> {
+        let a2 = match mint_literal(a, p) { MintOk(e2) -> e2  _ -> a }
+        [a2, ...constructor_mint_zip(rest_a, rest_p)]
+      }
+    }
   }
 }
 
@@ -12018,6 +12218,7 @@ fn collect_pub_type_name_one(d: Decl, acc: [String]) : [String] = match d {
     if list_has(acc, name) { acc } else { [name, ...acc] }
   DDerive(_, inner, _, _) -> collect_pub_type_name_one(inner, acc)
   DUnstable(inner, _, _) -> collect_pub_type_name_one(inner, acc)
+  DConstructor(inner, _, _) -> collect_pub_type_name_one(inner, acc)
   _ -> acc
 }
 
@@ -12066,7 +12267,7 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # the rest of the env. Called once per compile from `compile_source`
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
+  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
           head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index }
 
 # attach the set of root-file (user) function names to the
@@ -12075,7 +12276,7 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # so the user's decl wins even when its signature matches a stdlib
 # export exactly. Seeded once per compile.
 fn ty_env_with_root_fns(env: TyEnv, rfns: [String]) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
+  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
           head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, index: env.index }
 
 # collect the bare names of root-file (`mo = None`)
@@ -16426,6 +16627,12 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
     DCheck(_, ps, body, line, col) -> infer_test_body(file, env, prelude_len, recs,
       op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
       ps, body, d, line, col)
+    # `#[constructor]` wrapper: type-check the inner fn and unwrap it —
+    # the marker has done its job (the registry was built in
+    # `add_decls_loop`), so the emitter sees a plain `DFn`.
+    DConstructor(inner, _, _) -> infer_decl(file, env, prelude_len, recs,
+                                            op_eff_arities, type_aliases, op_to_eff,
+                                            sums, proto_impls, all_decls, inner, verbose)
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
   }
 }
@@ -17230,6 +17437,7 @@ fn collect_declared_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
       DUnit(_, name, _, _, _) -> collect_declared_unit_names_loop(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
+      DConstructor(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       _ -> collect_declared_unit_names_loop(rest, acc)
     }
   }
@@ -17250,6 +17458,7 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
       DUnit(true, name, _, _, _) -> collect_pub_unit_names_loop(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
+      DConstructor(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       _ -> collect_pub_unit_names_loop(rest, acc)
     }
   }
@@ -17312,6 +17521,7 @@ fn validate_unit_refs_decl(d: Decl, declared: [String], file: String) : Int / Co
     validate_unit_refs_decls_loop(sub_decls, declared, file, 0)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
   DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
+  DConstructor(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
   _ -> 0
 }
 
@@ -17682,6 +17892,7 @@ fn pub_leak_priv_one(d: Decl, home: String,
     if p { acc } else { [PLPriv(home, name, "unit"), ...acc] }
   DDerive(_, inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   DUnstable(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
+  DConstructor(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   _ -> acc
 }
 
@@ -17757,6 +17968,7 @@ fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
     0
   DDerive(_, inner, _, _) -> vmps_decl(inner, home, priv_table, file)
   DUnstable(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
+  DConstructor(inner, _, _) -> vmps_decl(inner, home, priv_table, file)
   _ -> 0
 }
 
@@ -18031,6 +18243,7 @@ fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
     DImpl(_, _, _, _, _, _) -> d
     DDerive(_, _, _, _) -> d
     DUnstable(_, _, _) -> d
+    DConstructor(_, _, _) -> d
     # DUse has no TypeExpr to expand; pass through. The
     # desugar_use_decls pass handles it later.
     DUse(_, _, _) -> d
@@ -18306,12 +18519,13 @@ type ModuleEnvDelta = {
   recs:           [RecInfo],
   sums:           [SumInfo],
   op_to_eff:      [OpToEff],
-  unit_aliases:   [UAliasEntry]
+  unit_aliases:   [UAliasEntry],
+  constructors:   [CtorEntry]
 }
 
 fn module_env_delta_empty() : ModuleEnvDelta = ModuleEnvDelta {
   name: None, ty_entries: [], unions: [], op_eff_arities: [],
-  recs: [], sums: [], op_to_eff: [], unit_aliases: []
+  recs: [], sums: [], op_to_eff: [], unit_aliases: [], constructors: []
 }
 
 # Compose a child delta onto a parent. Cons-front so the child's
@@ -18328,7 +18542,8 @@ fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleEnvDe
     recs:           list_append(child.recs, parent.recs),
     sums:           list_append(child.sums, parent.sums),
     op_to_eff:      list_append(child.op_to_eff, parent.op_to_eff),
-    unit_aliases:   list_append(child.unit_aliases, parent.unit_aliases)
+    unit_aliases:   list_append(child.unit_aliases, parent.unit_aliases),
+    constructors:   list_append(child.constructors, parent.constructors)
   }
 
 # A single module's view of the decl stream. `name = None` is the
@@ -18571,7 +18786,8 @@ fn typecheck_module(file: String, mod: ModuleDecls,
     recs:           collect_records(data.decls_a),
     sums:           collect_sums(data.decls_a),
     op_to_eff:      inf_collect_op_to_eff(data.decls_a),
-    unit_aliases:   collect_unit_alias_table(mod.decls)
+    unit_aliases:   collect_unit_alias_table(mod.decls),
+    constructors:   collect_constructors(data.decls_a, [])
   }
   TypecheckedModule { typed: typed, delta: delta }
 }
@@ -18823,6 +19039,7 @@ fn decide_partition_home(d: Decl, target_mod: String,
   DCheck(_, _, _, _, _)                -> anchor
   DDerive(_, inner, _, _)              -> decide_partition_home(inner, target_mod, anchor)
   DUnstable(inner, _, _)               -> decide_partition_home(inner, target_mod, anchor)
+  DConstructor(inner, _, _)            -> decide_partition_home(inner, target_mod, anchor)
   DImpl(_, _, _, sub, _, _)            -> match sub {
     [] -> anchor
     [m, ..._] -> decide_partition_home(m, target_mod, anchor)
@@ -18841,6 +19058,7 @@ fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
   DEffect(_, _, _, _, _, _, _, mo)   -> mo
   DDerive(_, inner, _, _)         -> decl_explicit_module_origin(inner)
   DUnstable(inner, _, _)          -> decl_explicit_module_origin(inner)
+  DConstructor(inner, _, _)       -> decl_explicit_module_origin(inner)
   DImpl(_, _, _, sub, _, _)       -> match sub {
     [] -> None
     [m, ..._] -> decl_explicit_module_origin(m)
@@ -18863,6 +19081,7 @@ fn partition_home_for(d: Decl, target_mod: String) : String = match d {
   DType(_, _, _, _, _, _, mo)        -> home_or_target(mo, target_mod)
   DDerive(_, inner, _, _)         -> partition_home_for(inner, target_mod)
   DUnstable(inner, _, _)          -> partition_home_for(inner, target_mod)
+  DConstructor(inner, _, _)       -> partition_home_for(inner, target_mod)
   DImpl(_, _, _, sub, _, _)       -> match sub {
     [] -> target_mod
     [m, ..._] -> partition_home_for(m, target_mod)
@@ -19411,7 +19630,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -19440,7 +19659,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
