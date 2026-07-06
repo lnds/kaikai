@@ -8,11 +8,26 @@ C backend stored them raw `i64` INLINE. Make native mirror C, reusing the existi
 pieces: (1) pass the real mask in construction, (2) write raw `i64` instead of
 boxed, (3) read `i64` in `KProj`, (4) drop skips `i64`.
 
-**Shipped:** all four, plus two structural surprises the brief did not anticipate
-(a new LLVM prim, and a kaic1 handle-RC UAF that dominated the debugging time).
-The layout is now byte-identical to C (`--emit=kir` shows `i64:` inits + `m<mask>`
-on `con`/`trmc-step`; slot binders are `i64` not `box`). Selfhost byte-identical,
-rb-tree 1M `height:29` byte-identical on both backends.
+**Shipped:** three of four — construction (raw write), mask registration, and drop
+(skip i64) are live; the **raw read (piece 3) is deferred**. The layout is
+i64-inline like C (`--emit=kir` shows `i64:` inits + `m<mask>` on `con`/`trmc-step`)
+and the READ stays boxed via `kaix_variant_arg`, which consults the tag's
+registered mask and re-boxes a raw i64 slot correctly (`kai_variant_slot_box`). So
+construction/drop are i64-inline (one box per read, not per read+write). Byte-id C
+self-host + rb-tree 1M `height:29` on both backends. Plus four structural surprises
+the brief did not anticipate (see below), of which the raw read is the one that
+did not make it.
+
+**Why the raw read is deferred.** Reading a kind-1 slot raw (`SInt64` binder →
+`kaix_variant_arg_i64`) passed rb-tree byte-id, C-selfhost byte-id, tier1-asan, and
+rc-detector — but **regressed the native self-host gate** (SIGSEGV, `address=0x10` =
+a slot Int read as a pointer and dereferenced). It reproduced only when the
+native-built compiler compiles ITSELF (thousands of AST/KIR variants with Int
+slots), not on the rb-tree. A `SInt64` binder propagated to a consumer the emitter's
+boxed↔raw border did not cover. Isolated by bisection: forcing the read binder back
+to `SBoxed` (build i64, read boxed) makes the self-host gate green again. The raw
+read is a follow-up once that propagation path is audited; the construction/mask/
+drop half — the actual #1083 layout — ships now.
 
 ## The four pieces, and where each landed
 
