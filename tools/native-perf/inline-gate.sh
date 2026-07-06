@@ -59,3 +59,24 @@ if [ "$CALLS" -gt "$THRESHOLD" ]; then
   exit 1
 fi
 echo "native-perf/inline-gate OK — runtime ops inline into the hot path."
+
+# Variant fast-path gate: a primitive-slot ctor (RBNode's Int keys) must route
+# through the fast entry `kai_variant_u_fast` (via `kaix_variant_masked`), not
+# the cold `kai_variant_u` whose per-call name/mask register + immortal-args
+# hash scan dominated the native-vs-C wall. A regression that drops the routing
+# reverts every RBNode to `kai_variant_u`, so assert the fast entry fires.
+if command -v otool >/dev/null 2>&1; then
+  MASKED="$(otool -tV "$BIN" | grep -c 'bl.*kaix_variant_masked' || true)"
+elif command -v objdump >/dev/null 2>&1; then
+  MASKED="$(objdump -d "$BIN" | grep -cE '\b(bl|call)\b.*kaix_variant_masked' || true)"
+else
+  MASKED=1
+fi
+echo "native-perf/inline-gate: kaix_variant_masked calls = $MASKED (expect > 0)"
+if [ "$MASKED" -eq 0 ]; then
+  echo "::error::native-perf/inline-gate FAIL — no kaix_variant_masked calls;"
+  echo "  primitive-slot ctors reverted to the cold kai_variant_u path (see"
+  echo "  nemit_con / ls_ctor_mask / nproto_register_payload_ctors)."
+  exit 1
+fi
+echo "native-perf/inline-gate OK — primitive-slot ctors take the fast variant entry."
