@@ -353,12 +353,13 @@ fn sum(a, v : Money[Real]<USD>) = a + v          # a inferred Money[Real]<USD>; 
 
 ### No protocol bound on the carrier — monomorphisation is the gate
 
-The carrier `[T]` carries **no** `: Add`/`: Numeric` bound. Protocol bounds are NOT valid in
-`fn`/`type` parameter lists — `fn foo[T: Show](x: T)` and `type M[T: Add]` are **not** kaikai
-(`docs/protocols.md`: constraints live only in the `impl[...]`-site list; this is the line that
-keeps single-dispatch protocols clear of Haskell typeclasses / constraint propagation, Tier 1
-#3). The old `[u: Measure]` form is different (`Measure` was a *kind*, not a protocol) and is
-superseded here anyway: taxa go in `<>`, only `Type` in `[]`.
+The carrier `[T]` carries **no** protocol bound. Protocol bounds on a `type`/record declaration
+are NOT valid — `type M[T: Add]` is a parse error ("type-parameter kind must be `Type` or
+`Measure`"). (Free *functions* DO accept bounds since #877 — `fn sum[T: Numeric](...)` — but a
+`type` decl does not; and even on functions the bound is not yet enforced at the call site, see
+issue tracking that gap. Either way, the taxon carrier `[T]` takes no bound.) The old
+`[u: Measure]` form is different (`Measure` was a *kind*, not a protocol) and is superseded here:
+taxa go in `<>`, only `Type` in `[]`.
 
 So how is "the carrier must be summable" enforced without a bound? **By monomorphisation, in
 the USE, not the signature — it does not propagate.** Verified:
