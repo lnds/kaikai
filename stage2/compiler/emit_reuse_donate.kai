@@ -1,0 +1,294 @@
+#[doc("""
+Interprocedural reuse-token donation for the C backend.
+
+A match arm that captures an arm-top reuse token (`_arm_ru`, a unique
+constructor shell whose children already moved out) but tails into an
+out-of-line call — `balance_left(insert_loop(l,k,v), kx, vx, r)` in the
+red-black rb-tree — cannot consume that token: the callee allocates its
+own rebuild cells in its own frame, so the arm epilogue frees the shell
+(`kai_reuse_free`). The rb-tree throws away one 48-byte shell per balance
+call (~4.24 per insert), driving ~5x Koka's allocator traffic.
+
+Koka avoids this by inlining `balance` into `ins` before Perceus, so the
+parent shell and the rotation's third cell share one scope and its
+size-keyed `Available` pool donates the shell to the fresh constructor.
+kaikai has no inliner; replicating the pool alone is a no-op because there
+is nothing to thread across the call boundary. Instead this module crosses
+the boundary directly: the callee takes a hidden `KaiReuse _donor`
+parameter, the caller MOVES its live unconsumed token into that slot, and
+the callee's fresh-alloc rebuild cells consume it via `kai_variant_at`
+(which falls back to a fresh alloc when the token is null or a size
+mismatch — so donation is always sound). This is the classic
+linear-owned-resource transfer (Cyclone/ATS `Owned<Cell>`), not Koka reuse.
+
+Soundness contract of the `_donor` param:
+  - MOVE at the call site: the caller nulls its own token copy so the arm
+    epilogue free becomes a no-op. The token is move, never copy.
+  - consume-OR-free on every callee return path: leftover `_donor` is freed
+    at each donation-capable body's exit.
+  - size match: `kai_variant_at` writes only when the token's arity equals
+    the ctor's; otherwise it fresh-allocs, leaving the token for the exit
+    free. Never writes an M-slot ctor into an N-slot cell.
+  - fiber-local: the token belongs to the capturing fiber; a
+    donation-capable fn must stay pure/local (no cross-`spawn` propagation).
+""")]
+
+import compiler.ast
+import compiler.chars
+import compiler.emit_shared
+
+# The C name of the hidden reuse-token parameter and its scratch temp.
+pub fn rd_donor_param() : String = "_donor"
+
+# The scratch temp of a donation. Declared once per reuse arm (inline,
+# alongside the fragment) rather than function-wide, so it cannot alias
+# another arm's temp — the `-Wunsequenced` UB the manual spike hit when two
+# fast-allocs shared one temp is avoided by giving each arm its own name via
+# the arm index.
+fn rd_donor_tmp(site: Int) : String = concat_all(["_donor_tmp", int_to_string(site)])
+
+#[doc("""
+Is this function body donation-capable — does it host a match-arm variant
+reuse rebuild that fresh-allocs a fixed-arity constructor? Such an arm is
+exactly where a donated token pays for a cell that would otherwise malloc.
+Structural, not name-based: any function whose body rebuilds a variant
+through a reuse arm qualifies, so the mechanism is not rb-tree-specific.
+""")]
+pub fn rd_body_is_capable(body: Expr) : Bool = rd_scan_capable_kind(body.kind)
+
+fn rd_scan_capable_kind(k: ExprKind) : Bool = match k {
+  EMatch(_, arms) -> rd_arms_have_variant_rebuild(arms)
+  EIf(_, t, opt_e) ->
+    rd_body_is_capable(t) or (match opt_e { None -> false Some(e) -> rd_body_is_capable(e) })
+  # A `= match {...}` body desugars to `EBlock(stmts, tail)` where the match
+  # sits in a statement, not the tail — scan both.
+  EBlock(ss, opt_tail) -> {
+    let tail_cap = match opt_tail { None -> false Some(e) -> rd_body_is_capable(e) }
+    tail_cap or rd_stmts_capable(ss)
+  }
+  _ -> false
+}
+
+fn rd_stmts_capable(ss: [Stmt]) : Bool = match ss {
+  []           -> false
+  [s, ...rest] -> rd_stmt_capable(s) or rd_stmts_capable(rest)
+}
+
+fn rd_stmt_capable(s: Stmt) : Bool = match s {
+  SLet(_, _, e)  -> rd_body_is_capable(e)
+  SExprStmt(e)   -> rd_body_is_capable(e)
+  SVar(_, _, e, _, _) -> rd_body_is_capable(e)
+  _              -> false
+}
+
+# An arm rebuilds a variant when its body constructs a data constructor
+# (uppercase head) that embeds a nested constructor — the rotation shape
+# the reuse-variant path lowers with a fresh third cell.
+fn rd_arms_have_variant_rebuild(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(pat, _, body) -> {
+      let here = rd_pat_deconstructs_variant(pat) and rd_expr_builds_nested_ctor(body)
+      here or rd_arms_have_variant_rebuild(rest)
+    }
+  }
+}
+
+# A donation-capable arm has the ROTATION shape: it deconstructs an INNER
+# cell — a sub-pattern that is itself a PVariant with payload (e.g.
+# `RBNode(_, RBNode(Red, lx, ..), ..)`). That inner deconstruction is what
+# the reuse-variant path lowers with a fresh third cell — the one a donated
+# token pays for. A FLAT arm (`ElPlain(x)`, `Node(l, k, r)` with no nested
+# ctor pattern) reuses at most its own shell, has no fresh third cell, so it
+# is NOT capable — narrowing to rotation keeps the `_donor` ABI off the many
+# simple reuse fns whose call sites don't all route through emit_user_call.
+fn rd_pat_deconstructs_variant(p: Pattern) : Bool = match p.pkind {
+  PVariant(_, subs) -> rd_any_sub_is_nested_variant(subs)
+  _                 -> false
+}
+
+fn rd_any_sub_is_nested_variant(subs: [Pattern]) : Bool = match subs {
+  []           -> false
+  [s, ...rest] -> match s.pkind {
+    PVariant(_, isubs) -> list_length(isubs) > 0 or rd_any_sub_is_nested_variant(rest)
+    _                  -> rd_any_sub_is_nested_variant(rest)
+  }
+}
+
+# The rebuild is a reuse-variant arm: Perceus rewrote the arm's tail ctor
+# `Ctor(...)` into `__perceus_reuse_variant(__pcs_scr, Ctor(...))` (the same
+# marker emit_c's reuse-variant path lowers with a fresh third cell). That
+# marker — NOT a bare ctor head — is the precise capability signal; a bare
+# `Ctor(...)` tail that Perceus did not mark reuses nothing. Walks if/block
+# tails to the arm's return position.
+fn rd_expr_builds_nested_ctor(e: Expr) : Bool = match e.kind {
+  ECall(f, _) -> rd_is_reuse_marker(f)
+  EIf(_, t, opt_e) ->
+    rd_expr_builds_nested_ctor(t) or (match opt_e { None -> false Some(x) -> rd_expr_builds_nested_ctor(x) })
+  EBlock(_, opt_tail) -> match opt_tail { None -> false Some(x) -> rd_expr_builds_nested_ctor(x) }
+  EMatch(_, arms) -> rd_arms_have_variant_rebuild(arms)
+  _ -> false
+}
+
+# The Perceus reuse-cons / reuse-variant markers, whose lowering fresh-allocs
+# a same-size cell a donated token can pay for.
+fn rd_is_reuse_marker(f: Expr) : Bool = match f.kind {
+  EVar(c) -> c == "__perceus_reuse_variant" or c == "__perceus_reuse_cons"
+  _       -> false
+}
+
+#[doc("""
+The emitted C symbol of every donation-capable top-level function,
+pre-scanned once so a call site can decide in O(1) (by `csym`) whether a
+callee accepts a `_donor`. A capable fn is one whose body `rd_body_is_capable`
+accepts. Keyed on the module-mangled symbol (`c_sym`) so two same-named fns
+from different modules stay distinct.
+""")]
+pub fn rd_scan_capable(decls: [Decl]) : [String] = rd_scan_capable_go(decls, [])
+
+fn rd_scan_capable_go(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, body, _, _, mo) ->
+      if rd_body_is_capable(body) { rd_scan_capable_go(rest, [c_sym(name, mo), ...acc]) }
+      else { rd_scan_capable_go(rest, acc) }
+    _ -> rd_scan_capable_go(rest, acc)
+  }
+}
+
+#[doc("Is `csym` (a module-mangled C symbol) in the pre-scanned donation-capable set?")]
+pub fn rd_is_capable(csym: String, capable: [String]) : Bool = match capable {
+  []           -> false
+  [c, ...rest] -> if c == csym { true } else { rd_is_capable(csym, rest) }
+}
+
+# --- C fragment generation -------------------------------------------------
+
+#[doc("""
+The `, KaiReuse _donor` suffix a donation-capable fn adds to its C
+parameter list, or `""` for a non-capable fn. Appended after the user
+params so the positional ABI of every existing (non-donation) caller and
+the thunk is preserved — those pass `kai_reuse_null`.
+""")]
+pub fn rd_param_suffix(capable: Bool) : String =
+  if capable { concat_all([", KaiReuse ", rd_donor_param()]) } else { "" }
+
+#[doc("The `kai_reuse_null` a non-donating caller (or the thunk) passes.")]
+pub fn rd_null_arg() : String = "kai_reuse_null"
+
+#[doc("""
+Append a null `_donor` argument to an emitted argument list — for a call to
+a donation-capable callee that holds no live token to donate. Empty list
+becomes just the null arg.
+""")]
+pub fn rd_join_null_donor(args: String) : String =
+  if args == "" { rd_null_arg() }
+  else { concat_all([args, ", ", rd_null_arg()]) }
+
+#[doc("""
+Splice the `_donor` parameter into an already-emitted C signature just
+before its closing paren, when `capable`. Preserves the signature's own
+`)`s inside param types by targeting the LAST `)`. No-op when not capable.
+""")]
+pub fn rd_splice_param(sig: String, capable: Bool) : String =
+  if not capable { sig }
+  else {
+    let n = string_length(sig)
+    match rd_last_rparen(sig, n - 1) {
+      Some(idx) -> concat_all([string_slice(sig, 0, idx), rd_param_suffix(true), string_slice(sig, idx, n - idx)])
+      None      -> sig
+    }
+  }
+
+#[doc("""
+Rewrite the FIRST fresh `kai_variant_u_fast(tag, n, ` in a reuse-arm
+rebuild fragment into a donor-consuming `kai_variant_at`, consuming
+`_donor` atomically (read + null in one comma-expression so a later
+same-statement rebuild sees null and fresh-allocs — linear consumption).
+The `_donor_tmpSITE` scratch is NOT declared here (the fragment may sit
+inside a `(KaiVarSlot[]){...}` initializer where a decl is illegal); the
+caller places `rd_tmp_decl(site)` at the enclosing block top. `site` must
+be unique across the fn. Fragment unchanged if no fresh alloc is present.
+""")]
+pub fn rd_donate(frag: String, tag: Int, cname: String, n: Int, mask: Int, site: Int) : String {
+  let needle = concat_all(["kai_variant_u_fast(", int_to_string(tag), ", ", int_to_string(n), ", "])
+  let repl = concat_all([
+    "kai_variant_at((", rd_donor_tmp(site), " = ", rd_donor_param(), ", ",
+    rd_donor_param(), " = kai_reuse_null, ", rd_donor_tmp(site), "), ",
+    int_to_string(tag), ", \"", cname, "\", ", int_to_string(n), ", ",
+    int_to_string(mask), ", "])
+  rd_replace_first(frag, needle, repl)
+}
+
+#[doc("The scratch-temp declaration for a donation `site`, placed at the top of the branch block that hosts the rewritten fragment.")]
+pub fn rd_tmp_decl(site: Int) : String =
+  concat_all(["KaiReuse ", rd_donor_tmp(site), "; (void) ", rd_donor_tmp(site), "; "])
+
+# Replace the first occurrence of `needle` in `hay` with `repl` (whole
+# string unchanged when absent). `string_slice`'s THIRD argument is a LENGTH,
+# not an end index — the trap that silently no-op'd the first cut of this.
+fn rd_replace_first(hay: String, needle: String, repl: String) : String {
+  let at = find_substring(hay, needle, 0)
+  let hn = string_length(hay)
+  if at >= hn { hay }
+  else {
+    let nn = string_length(needle)
+    concat_all([string_slice(hay, 0, at), repl, string_slice(hay, at + nn, hn - (at + nn))])
+  }
+}
+
+#[doc("""
+Free a `_donor` the callee received but never consumed (the arm that ran
+had no size-matching fresh alloc). Placed on every return path of a
+donation-capable body. A null token is a no-op.
+""")]
+pub fn rd_free_leftover() : String =
+  concat_all(["if (", rd_donor_param(), " != kai_reuse_null) { kai_reuse_free(",
+              rd_donor_param(), "); ", rd_donor_param(), " = kai_reuse_null; } "])
+
+#[doc("""
+Wrap a donation-capable body's return expression so a `_donor` no arm
+consumed is freed AFTER the result is computed (a null token is a no-op).
+`body_c` is the emitted body expression; `boxed` is true when the return is
+a `KaiValue *` (the leftover-free is a plain statement then), false for a
+raw scalar return (the free rides a comma before the value). This covers
+every return path: the body is one expression, so one wrap suffices.
+""")]
+pub fn rd_wrap_body(body_c: String, boxed: Bool, capable: Bool) : String =
+  if not capable { body_c }
+  else if boxed {
+    concat_all(["({ KaiValue *_rdret = ", body_c, "; ", rd_free_leftover(), "_rdret; })"])
+  } else {
+    concat_all(["({ ", rd_raw_ret_c_type(), " _rdret = ", body_c, "; ", rd_free_leftover(), "_rdret; })"])
+  }
+
+# The C scalar type of a raw (unboxed) return that a donation-capable fn
+# could carry. A reuse-rebuilding fn returns a heap variant, so a raw
+# return is only a defensive path; `int64_t` covers every kaikai raw scalar.
+fn rd_raw_ret_c_type() : String = "int64_t"
+
+#[doc("""
+Wrap a donation-eligible tail call so it MOVES the live arm token into the
+callee's `_donor` slot: capture `_arm_ru`, null the caller's copy (arm
+epilogue free becomes a no-op), then call. `call_c` is the already-emitted
+callee invocation ending just before its close paren — this splices the
+donor arg in. Given `callee(a, b, c)`, produces
+`({ KaiReuse _dn = _arm_ru; _arm_ru = kai_reuse_null; callee(a, b, c, _dn); })`.
+""")]
+pub fn rd_wrap_call(call_c: String) : String =
+  concat_all(["({ KaiReuse _dn = _arm_ru; _arm_ru = kai_reuse_null; ",
+              rd_splice_donor_arg(call_c), " })"])
+
+# Insert `, _dn` before the final `)` of a call fragment. The fragment is a
+# single call expression, so the last `)` is its argument-list close.
+fn rd_splice_donor_arg(call_c: String) : String = {
+  let n = string_length(call_c)
+  match rd_last_rparen(call_c, n - 1) {
+    Some(idx) -> concat_all([string_slice(call_c, 0, idx), ", _dn", string_slice(call_c, idx, n - idx), ";"])
+    None      -> concat_all([call_c, ";"])
+  }
+}
+
+fn rd_last_rparen(s: String, i: Int) : Option[Int] =
+  if i < 0 { None }
+  else { match char_at(s, i) { Some(c) -> if c == ')' { Some(i) } else { rd_last_rparen(s, i - 1) } None -> None } }
