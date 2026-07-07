@@ -84,6 +84,54 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.0 (2026-07-06)
+
+### BREAKING CHANGE
+
+- money and fx are removed; a currency-taxon-based
+replacement will land later
+
+### Added
+
+- **stdlib**: complete numeric operator surface — Decimal ops, Div for big types, uniform div-by-zero trap
+- **typer**: #[constructor] sugar for Type(args) construction (#1098)
+- **stdlib**: remove money and fx (#1097)
+- **typer**: context-driven numeric-literal minting (#1091)
+- **lexer**: reserve `taxon` and `taxology` as hard keywords (#1089)
+- **native**: nested rotation reuse via dual-branch inner-cell donation (closes #1053) (#1081)
+- **native**: rebuild the TRMC variant spine step into the arm-top reuse token (#1053) (#1080)
+- **stdlib**: homogeneous Div operator for Complex (#1075)
+- **stdlib**: NetTcp.recv_timeout — socket recv with deadline (closes #1066) (#1072)
+- **runtime**: route runtime traps to a fiber abort pad instead of exit(1) (closes #1067) (#1071)
+- **stdlib**: Add/Sub/Mul operators for BigInt, Rational, DecimalBig (#1068)
+- **cli**: kai migrate — automated edition source migration (closes #1047) (#1055)
+- **native**: per-module separate compilation with content-addressed object cache (closes #989, closes #963) (#1050)
+
+### Fixed
+
+- **typer**: enforce free-fn protocol bounds at the concrete call site (#1101)
+- **runtime**: trap on integer div/mod by zero and INT64_MIN/-1 (#1094)
+- **bench**: rb-tree harness measures native column consistently with kaikai-c (closes #1082) (#1085)
+- **emit**: guard hoisted sub-pattern slot load against smaller sibling ctors (closes #1073) (#1079)
+- **perceus**: variant reuse-in-place increfs a shared child (closes #1069, closes #1048) (#1078)
+- **parse**: diagnose hex/binary integer literals beyond Int range (closes #1076) (#1077)
+- **native**: variant Real-slot projection dups its borrowed binder (closes #1054)
+- **native**: kai test emits the synthetic kai_main so the test-runner links (closes #1061) (#1063)
+- **emit**: spawned-fiber builtin default resolves without regressing non-spawn handler layout (closes #1051) (#1062)
+- **parse**: BigInt literal routes digits through from_string; Int literal overflow diagnoses (closes #1059) (#1060)
+- **emit**: spawned-fiber builtin default resolves (not segfault) on both backends (closes #1051) (#1052)
+- **native**: decref record values on scope exit (closes #1048) (#1049)
+- **runtime**: single runtime owner shares fiber/arena/heap state across modular TUs (closes #1033) (#1045)
+
+### Changed
+
+- **native**: read known-pointer variant slots as a direct borrow (#1083) (#1102)
+- **native**: i64-inline variant slots, mirroring the C backend (closes #1083) (#1100)
+- **native**: variant fast-entry construction (refs #1083) (#1092)
+- **native**: stamp host target-features so runtime ops inline (closes #1083) (#1088)
+- **runtime**: iterative variant spine-free + reduce per-node RC traffic (refs #1083) (#1084)
+- **kir**: shared home_tu partitioner + KFn.mo for modular codegen (refs #963, refs #989) (#1046)
+
 ## v0.98.0 (2026-07-02)
 
 ### Added
