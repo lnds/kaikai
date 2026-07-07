@@ -1,0 +1,75 @@
+# Soundness fixture for the native pointer-borrow field read (#1083). A
+# `match` arm that binds a variant's POINTER children (kind-0, read as a
+# direct `.ptr` borrow via `KProjBorrow`) on every level of the rb-tree
+# navigation shape. A desync between how a pointer slot is written and read
+# shows up here as a wrong number or a crash on the native backend, not a
+# silent perf change.
+#
+# The driver builds AND discards a fresh tree every iteration, so the native
+# RC must reclaim each tree: the direct `.ptr` borrow must not disturb the RC
+# balance the mask-consulting read had (both are `#747` borrows), or an
+# alloc/free imbalance surfaces under KAI_TRACE_RC.
+#
+# Run on the NATIVE backend (`kai build --backend=native`): the C oracle
+# already reads a pointer slot as `slots[i].ptr`, so this pins the native
+# codegen to the same result.
+
+type Tree = Leaf | Node(Tree, Int, Int, Tree)
+
+# BST insert: descends binding the pointer children (l, r) and the Int key
+# (kx) of each node — every field kind the fix touches, in one arm.
+fn insert(t: Tree, k: Int, v: Int) : Tree = match t {
+  Leaf -> Node(Leaf, k, v, Leaf)
+  Node(l, kx, vx, r) ->
+    if k < kx      { Node(insert(l, k, v), kx, vx, r) }
+    else if k > kx { Node(l, kx, vx, insert(r, k, v)) }
+    else           { Node(l, k, v, r) }
+}
+
+# Pure lookup descent: reads the pointer child (l / r) and the Int key raw
+# on every level; returns the value or -1. This is the read shape the fix
+# accelerates.
+fn lookup(t: Tree, k: Int) : Int = match t {
+  Leaf -> 0 - 1
+  Node(l, kx, vx, r) ->
+    if k < kx      { lookup(l, k) }
+    else if k > kx { lookup(r, k) }
+    else           { vx }
+}
+
+# Sum every key by descent — reads the Int key slot raw at every node, plus
+# both pointer children.
+fn sum_keys(t: Tree) : Int = match t {
+  Leaf              -> 0
+  Node(l, kx, _, r) -> kx + sum_keys(l) + sum_keys(r)
+}
+
+fn build7(seed: Int) : Tree = {
+  let a = insert(Leaf, seed + 4, seed)
+  let b = insert(a, seed + 2, seed)
+  let c = insert(b, seed + 6, seed)
+  let d = insert(c, seed + 1, seed)
+  let e = insert(d, seed + 3, seed)
+  let f = insert(e, seed + 5, seed)
+  insert(f, seed + 7, seed)
+}
+
+# Build a fresh 7-node tree, probe it, let it die. The tree is local to the
+# iteration — the native RC must reclaim it before the next round, so
+# free_total tracks alloc_total over the whole loop.
+fn drive(n: Int, acc: Int) : Int =
+  if n <= 0 { acc }
+  else {
+    let t = build7(n)
+    let hit = lookup(t, n + 4)
+    let miss = lookup(t, n + 99)
+    let ks = sum_keys(t)
+    drive(n - 1, acc + hit + miss + ks)
+  }
+
+fn main() = {
+  # 2000 build-probe-discard rounds. hit = n (root value), miss = -1,
+  # ks = sum(seed+1..seed+7) = 7*n + 28. Per round: n + (-1) + 7n + 28 = 8n + 27.
+  let total = drive(2000, 0)
+  print(int_to_string(total))
+}
