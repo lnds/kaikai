@@ -349,6 +349,132 @@ pipeline). So the instruction win is large, the wall win is small:
   "instructions are free"). Re-measure on the target host before quoting;
   the ratios are stable run-to-run here.
 
+## 6. Cost to close the native gap: what would change and how big
+
+Re-measured on `c95de1f6` (Lane 1+2 landed — front-end RC is now at Koka
+parity, so the native residual vs kaikai-c is **pure codegen**): insert
+N=1M is C 0.32 s / 2.03 G insns / CPI 0.714 vs native 0.43 s / 6.15 G / CPI
+0.314 → native/C **wall 1.34×, insns 3.03×, cycles 1.33×**. Wall tracks
+cycles (§2b holds on the new base).
+
+### The structural cause: native reads slots DYNAMICALLY, C reads them STATICALLY
+
+The ~4.1 G excess native instructions are **not un-inlined calls** — route
+(a) already inlines them (bitcode link `stage2/runtime.h:14121` + the #1088
+target-features stamp `runtime.h:14193`; verified: 0 residual `bl kaix_*`
+for the cell-access ops in the descent). The gap is what the *inlined body*
+does. Native's slot read is `kaix_variant_arg` → `kai_variant_slot_box`
+(`runtime.h:4383`), which per read does: `kai_slot_mask_of(v->variant_tag)`
+(a table lookup keyed on the tag *loaded from the cell at runtime*,
+`runtime.h:1675`) + `kai_var_slot_kind(mask, i)` 4-way kind-dispatch + for
+an Int slot `kai_int(...i64)` **re-box into a heap Int**. The C oracle reads
+`kair_k0 = kai_var_slots(_scr)[i].i64` — one inline load, kind known at
+codegen, no mask lookup, no dispatch, no re-box.
+
+Measured cost of that dynamic-vs-static difference (isolation benches,
+key-sum − tag-walk, same 20M node-visits): a native slot read is **22
+instructions / 2.75 cycles**; the C read is **≈ 0** (free inline load). On
+the insert IR native issues `kaix_variant_arg` ×203 (dynamic borrow) +
+`kaix_int_field` ×344 (unbox) + `kaix_int` ×441 (re-box); `kaix_variant_arg_i64`
+(the static raw-read path the emitter already has) fires **0 times**.
+
+This is a slot-read tax **every** program pays that matches over a variant
+with an Int payload (parsers, ASTs, counters, indices) — rb-tree is where it
+was measured, not where it uniquely applies.
+
+### Route (a) — inline the shim: ALREADY DONE, does not close it
+
+The bitcode-link + target-features stamp already merge and inline the
+runtime bodies before O2. But the inlined body is the dynamic
+mask-lookup+dispatch+rebox above, so inlining alone cannot close the gap.
+No lane here — it is shipped.
+
+### Route (b) — static slot read (kind-1 raw binder): the bounded lane
+
+The static slot kind **already exists** in the KIR: `slot_kind_of`
+(`kir_lower_bind.kai:71`) resolves it with the same `variant_slot_kind`
+resolver emit_c uses (`emit_c.kai:362`), the construction path already
+consumes it (`kaix_variant_masked`, #1100), and the kind-0 pointer read
+already uses it (`bind_slot_op` → `KProjBorrow`, `kir_lower_bind.kai:93`).
+The **only** gap: `bind_slot_kslot` (`kir_lower_bind.kai:86`) hardcodes
+`SBoxed` for the read binder — for Int *and* Real *and* Bool — throwing away
+the static kind, so scalar reads go dynamic. The native emitter's static-read
+consumer is already wired (`emit_native_term.kai:372`, `KProj SInt64` →
+`kaix_variant_arg_i64`, one raw load) — it just never receives an `SInt64`.
+
+**The #709 border-rebox concern is already solved, per-load, not per-pass.**
+A raw binder that flows to a boxed consumer needs a re-box at that border.
+The native design does this in the emitter, not via a use-site pass: every
+`KVar(n)` in boxed position loads through `nemit_load_reg_boxed`
+(`emit_native_fn.kai:311`), which already re-boxes a slot-1 register via
+`kaix_int` (line 315) — alongside the live slot-2 Real (313) and slot-3 Bool
+(314) cases. The name→slot table populates itself from the `KLet`'s `KSlot`
+(`rspec_add` / `native_ctx_add_reg`), so if `bind_slot_kslot` returns
+`SInt64` the border fires automatically at every boxed use (nested match,
+call arg, tail return, closure capture, store into another slot). The real
+audit surface is the *raw* consumers that read a `KVar` WITHOUT going
+through `nemit_load_reg_boxed` — the ~25 `nemit_load_reg` sites, a small
+enumerable grep, not "every use-site." emit_c reached the same result the
+other way (a use-site MBoxed analysis, `seed_variant_int_binders`
+`unbox.kai:723`, which shipped for the C backend in `1f4f66f0` at −11.6 %
+insns after "6 prior tries" — the naive re-box-at-bind was net-negative);
+the native model does not need that pass because it decides the border at
+load time from the register's slot.
+
+- **Size:** small — the `bind_slot_kslot`/`bind_slot_op` change plus the raw-
+  consumer sweep is well under ~100 LOC; the border re-box is **zero new
+  LOC** (`emit_native_fn.kai:315` already exists). It **completes a 3-case
+  pattern** (Real/Bool binders read boxed today too; Int is the measured hot
+  one), it does not open a subsystem.
+- **Risk:** low–medium, and *binary-gated*. The hazard is #709 (a raw
+  register reaching a `ptr` consumer → SIGSEGV, which macOS `-O0` hides). The
+  gate catches it deterministically: **native self-host at `-O2`** (the
+  self-compile segfaults if any raw consumer was missed) + selfhost byte-id
+  re-baseline + backend serial parity + ASAN. The prior native regression
+  was exactly a border not covering a raw consumer; with `emit_native_fn.kai:315`
+  live, that surface is mostly closed and the sweep finishes it.
+- **Expected wall gain (measured, honest):** removes the 22-insn/read tax on
+  the descent, but each insn is ~2.75 cycles and IPC-diluted. §2b measured
+  ~0.045 G cycles / ~0.02 s on a 20M-read walk; on the 1M insert, **~0.03–
+  0.05 s of the 0.11 s wall gap** (0.43 → ~0.39). Gate the lane on the
+  **cycle** delta, not the instruction delta, so it cannot close claiming a
+  wall win it did not produce.
+
+### Route (c) — keep the read boxed, const-fold the mask lookup: rejected
+
+Passing a constant tag so O2 folds `kai_slot_mask_of(tag)` does not help:
+(1) the tag is loaded from the cell at runtime, not constant at the call
+site, so folding it would itself need a per-tag accessor emitted from the
+front-end — *more* codegen machinery than route (b), not less; (2) it leaves
+the **heap re-box** (`kai_int(...i64)`, an allocation with observable RC that
+O2 cannot elide) — the expensive half. It attacks the cheap symptom and
+keeps the costly one. Rejected.
+
+### Verdict: run ONE bounded lane (route b) — do NOT close on "not worth it," do NOT defer to a redesign
+
+- **It is not a redesign.** The redesign already happened: the slot-driven
+  `nemit_load_reg_boxed` / `nemit_atom_raw` border model that Real and Bool
+  already ride. Int kind-1 read is the third case of a three-case pattern,
+  not a new subsystem. Weeks-of-codegen is the wrong mental model; the trozo
+  is <~100 LOC with a binary soundness gate.
+- **It is not nothing.** The wall gain is modest and IPC-diluted (~0.03–0.05 s
+  on this bench), but the tax it removes is paid by every Int-payload match,
+  and closing it removes a *named structural source* of the 3.03× native
+  instruction gap for a whole program class — not just this bench.
+- **Do not over-promise.** This does NOT bring native to 1.3× C. The residual
+  after it — the uniform `%KaiValue` boxed representation (native never gets
+  C's flat-per-ctor struct, `emit_c.kai:1670`+), the boxed-Bool dispatch
+  (measured NOT a wall cost, §2b), and the hardware-absorbed instruction bulk
+  — is a genuine codegen redesign (flat monomorphic node layout) that IS a
+  weeks-scale effort and is a separate decision. Route (b) is the bounded win
+  available now; the redesign is the thing to *defer*, not route (b).
+- **Closing #1104 without route (b) would document a permanent, unmotivated
+  asymmetry** (Real/Bool/Int all read boxed from variants while `let`/arith
+  read raw) with no soundness reason — design debt the next agent on the read
+  path re-discovers. The honest close is: land route (b) (the bounded lane),
+  then close #1104 with the redesign (flat node layout) tracked as the
+  separate, deferred, weeks-scale follow-up.
+
 ## Reproducing
 
 ```sh
