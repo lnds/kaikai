@@ -34,6 +34,7 @@
 
 import compiler.ast
 import compiler.util
+import compiler.emit_shared
 import compiler.kir
 import compiler.kir_lower
 
@@ -58,15 +59,39 @@ fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, st: Lower
   [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, bind_slot_pattern(cn, sp, scrv, idx, st))
 }
 
+# The runtime kind of ctor `cn`'s slot `idx`, classified with the IDENTICAL
+# `variant_slot_kind(te, [])` call the construction path uses (`typed_inits`,
+# `variant_i64_mask` — enums always `[]`), so a slot READ never disagrees with
+# how the ctor WROTE it. 1 = Int (`.i64` raw), 2 = Real, 3 = enum, 0 = boxed
+# pointer (the default: unresolvable ctors, runtime-minted variants with no
+# user-visible payload, and — since `enums` is `[]` — enum-typed slots, which
+# the ctor also built boxed). This single resolver is the one place the
+# read/write invariant lives; both `bind_slot_kslot` and `bind_slot_op`
+# consult it, never re-deriving the kind with a different `enums`.
+fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
+  match evar_payload_tys(st.vs, cn) {
+    Some(tys) -> match variant_nth_ty(tys, idx) {
+                   Some(te) -> variant_slot_kind(te, [])
+                   None     -> 0
+                 }
+    None      -> 0
+  }
+
 # The KSlot a match-arm binder reads slot `idx` of ctor `cn` at. Currently
 # always `SBoxed`: the slot is BUILT i64-inline (typed_inits) but READ boxed
 # via `kaix_variant_arg`, which consults the tag's registered mask and re-boxes
 # a raw i64 slot correctly (`kai_variant_slot_box`). So construction/drop are
 # i64-inline (the #1083 layout) while the read stays boxed — correct, one box
-# per read. The raw read (`SInt64` → `kaix_variant_arg_i64`) is a follow-up: it
-# regressed the native self-host (a raw binder propagated to a consumer the
-# border did not cover), so it is deferred until that propagation is audited.
+# per read. The raw read (`SInt64` → `kaix_variant_arg_i64`) is a follow-up.
 pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int) : KSlot = SBoxed
+
+# The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
+# reads as a direct `.ptr` borrow (`KProjBorrow`), the native fast path that
+# skips `kaix_variant_arg`'s per-read mask branch; every typed slot (kind-1
+# Int, kind-2 Real, kind-3 enum) stays the mask-consulting `KProj`. The read op
+# always matches the ctor's write layout (both via `variant_slot_kind(te, [])`).
+fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
+  if slot_kind_of(st, cn, idx) == 0 { KProjBorrow(scrv, idx) } else { KProj(scrv, idx) }
 
 # Bind ONE positional slot's sub-pattern. A `PBind` aliases the slot; a
 # nested plain record projects the slot and recurses; an as-pattern binds
@@ -85,15 +110,15 @@ pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int) : KSlot = SBoxed
 # recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
 # direct sub-binders), the SAME shared bind recursion the record path uses.
 fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
-  # A kind-1 Int slot binder reads raw (`SInt64` → `kaix_variant_arg_i64`), no
-  # box round-trip; every other slot stays boxed. The read slot matches the
-  # ctor's write layout (both via `variant_slot_kind`), so no tagged pointer is
-  # ever read as `.i64` nor vice versa.
-  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx), KProj(scrv, idx), KAt(sp.line, sp.col)))
-  PRecord(_)           -> bind_nested_slot(sp, scrv, idx, st)
-  PAs(name, _)         -> bind_nested_as(sp, name, scrv, idx, st)
-  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(sp, scrv, idx, st) }
-  PVariantRecord(_, _) -> bind_nested_slot(sp, scrv, idx, st)
+  # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
+  # every other slot stays the mask-consulting `KProj`. The read op matches the
+  # ctor's write layout (both via `variant_slot_kind(te, [])`), so no tagged
+  # pointer is ever read raw nor vice versa.
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
+  PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, st)
+  PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, st)
+  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, st) }
+  PVariantRecord(_, _) -> bind_nested_slot(cn, sp, scrv, idx, st)
   _                    -> st
 }
 
@@ -107,15 +132,18 @@ fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
 }
 
 # Project slot `idx` into a fresh register, then bind the nested sub-pattern
-# (plain record OR a tag-tested variant payload) against it.
-fn bind_nested_slot(sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
+# (plain record OR a tag-tested variant payload) against it. A nested
+# variant / record slot is always a kind-0 boxed pointer, so `bind_slot_op`
+# reads it as a direct `.ptr` borrow (the same hot child read the balance
+# rotations perform) rather than the mask-consulting `KProj`.
+fn bind_nested_slot(cn: String, sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
     bind_pattern_fields_any(sp, sub, st1) }
 
 # An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
 # the inner pattern against the SAME projected value.
-fn bind_nested_as(sp: Pattern, name: String, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
+fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
     bind_pattern_fields_any(as_inner(sp), sub, st2)
   } }
