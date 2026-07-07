@@ -1482,13 +1482,18 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
         # (reuse-in-place); this is the free-cell-then-goto model.
         let goto_moves = pcs_collect_goto_tail_moves(name, body, bmap, cmap)
-        let skip_set = pcs_list_union(
+        let skip_set0 = pcs_list_union(
           pcs_list_union(
             pcs_list_union(
               pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
               arm_moves),
             goto_moves),
           raw_pnames)
+        # Koka Parc `ownedInScope`: owned sibling params read once-per-path in
+        # a top-level match, moved at their single use with the exit drop
+        # replaced by a branch-local drop in the arms that never read them.
+        let owned_moves = pcs_owned_scope_move_params(pnames, body, skip_set0, bmap, cmap)
+        let skip_set = pcs_list_union(skip_set0, owned_moves)
         # Issue #817 — arm-binders whose LAST use lands in a consuming slot
         # but which are NOT in `skip_set` (so the conservative dup orphans
         # the birth ref: the `list.filter`-over-heap leak). `pcs_is_non_last`
@@ -1527,7 +1532,10 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap, move_last_set)
         let new_body = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
-        let reused_body = pcs_recognise_reuse_expr(arm_dropped)
+        # Plant the branch-local drop for each `owned_moves` param in the arms
+        # that never read it (their exit drop was skipped via `skip_set`).
+        let param_dropped = pcs_inject_param_branch_drops(arm_dropped, owned_moves, name)
+        let reused_body = pcs_recognise_reuse_expr(param_dropped)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
         # so they must not receive an unused-param drop either.
@@ -4432,6 +4440,148 @@ fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
     ),
     line: ln, col: cl, ty: None, mode: MUnknown
   })
+
+# ---- Koka Parc `ownedInScope`: owned sibling-param move + branch-drop ----
+#
+# An owned param read exactly once per path (e.g. `r` in
+# `balance_left(l,k,v,r) = match l { ...arms rebuild with r...; RBLeaf }`)
+# hits the whole-body `count_non_lam_uses >= 2` fallback because it appears
+# in several mutually-exclusive arms: it is dup'd at every read + dropped at
+# fn exit. Parc nets this to zero on the consuming path (move at the single
+# use, no exit drop) and drops the param only in the branch that never reads
+# it (`ownedInScope`, Parc.hs:984-990). This selects such params so the
+# rewriter moves them (skip-set) and `pcs_inject_param_branch_drops` plants
+# the branch-local drop the exit drop used to cover.
+#
+# Safety fence (matches Parc's Borrowed dual + the arm-binder path's
+# `pcs_uses_only_consuming_slots` guard, adversarially reviewed):
+#   1. `mp_borrow_aware(p) <= 1` — no path reads p twice.
+#   2. `all_consumers_linear(p)` — every real consumer is linear.
+#   3. `uses_only_consuming_slots(p, cmap)` — no borrowed-slot use (a
+#      borrow does not transfer ownership; moving there would UAF).
+#   4. every arm of the top-level match EITHER consumes p once at a
+#      linear last use OR reads p zero times — no arm reads-without-
+#      consuming, no arm reads twice.
+#   5. no arm guard mentions p — a guard can fall through, so a guard
+#      read can neither consume nor host the branch drop soundly.
+# Narrow shape only: the fn body is a single top-level EMatch (possibly
+# under the `__pcs_ret` exit wrap) whose scrutinee does not mention p.
+# A missed selection is a missed optimisation, never a bug.
+fn pcs_owned_scope_move_params(pnames: [String], body: Expr, skip: [String],
+                                bmap: [BorrowEntry], cmap: [ConsumeEntry]) : [String] =
+  match pnames {
+    [] -> []
+    [p, ...rest] -> {
+      let rest_sel = pcs_owned_scope_move_params(rest, body, skip, bmap, cmap)
+      if list_has(skip, p) { rest_sel }
+      else {
+        let mp = pcs_max_paths_b_expr(p, body, bmap)
+        let linear = pcs_all_consumers_linear(p, body)
+        let cons_ok = pcs_uses_only_consuming_slots(p, body, cmap)
+        let arms_ok = pcs_param_arms_move_safe(p, body)
+        let ok = mp <= 1 and linear and cons_ok and arms_ok
+        if ok { [p, ...rest_sel] } else { rest_sel }
+      }
+    }
+  }
+
+# The narrow-shape check for condition 4+5: `body` must be a top-level match
+# (peeling the exit wrap) whose scrutinee omits `p`, and every arm either
+# reads `p` zero times or consumes it exactly once with no guard read.
+fn pcs_param_arms_move_safe(p: String, body: Expr) : Bool =
+  match pcs_peel_ret_wrap(body).kind {
+    EMatch(scr, arms) ->
+      not pcs_name_in_expr(p, scr) and pcs_param_each_arm_move_safe(p, arms)
+    _ -> false
+  }
+
+fn pcs_param_each_arm_move_safe(p: String, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let guard_reads = match opt_g { None -> false Some(g) -> pcs_name_in_expr(p, g) }
+      let n = pcs_max_paths_in_expr(p, body)
+      let arm_ok = not guard_reads and (n == 0 or n == 1)
+      arm_ok and pcs_param_each_arm_move_safe(p, rest)
+    }
+  }
+}
+
+# Peel the `EBlock([SLet(__pcs_ret, m), ...drops], Some(__pcs_ret))` exit wrap
+# so the top-level match is visible. No wrap ⇒ returns `body` unchanged.
+fn pcs_peel_ret_wrap(body: Expr) : Expr = match body.kind {
+  EBlock(stmts, _) -> match stmts {
+    [SLet(pat, _, rhs), ..._] -> match pat.pkind {
+      PBind(nm) -> if nm == "__pcs_ret" { rhs } else { body }
+      _         -> body
+    }
+    _ -> body
+  }
+  _ -> body
+}
+
+# Plant `__perceus_drop(p)` into every top-level-match arm that never reads
+# `p`, for each `p` the rewriter moved. Reuses `pcs_inject_arm_drops` so the
+# drop lands post-body (TCO-safe: a self-tail arm gets the drop distributed
+# into its dead leaves; RBLeaf's ctor tail is wrapped). Walks only the peeled
+# top-level match — the same narrow shape `pcs_owned_scope_move_params` gated.
+fn pcs_inject_param_branch_drops(body: Expr, params: [String], fn_name: String) : Expr =
+  match params {
+    []           -> body
+    [_, ..._]    -> match pcs_peel_ret_wrap(body).kind {
+      EMatch(scr, arms) -> {
+        let arms1 = pcs_param_drop_arms(arms, params, fn_name)
+        pcs_replace_peeled_match(body, scr, arms1)
+      }
+      _ -> body
+    }
+  }
+
+fn pcs_param_drop_arms(arms: [Arm], params: [String], fn_name: String) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> {
+      let dead = pcs_params_dead_in_arm(params, body)
+      let body1 = match dead {
+        []        -> body
+        [_, ..._] -> pcs_inject_arm_drops(body, map(dead, (p) => pcs_make_drop_stmt(p, pat.line, pat.col)), fn_name)
+      }
+      [Arm(pat, opt_g, body1), ...pcs_param_drop_arms(rest, params, fn_name)]
+    }
+  }
+}
+
+fn pcs_params_dead_in_arm(params: [String], body: Expr) : [String] = match params {
+  []           -> []
+  [p, ...rest] -> {
+    let r = pcs_params_dead_in_arm(rest, body)
+    if pcs_name_in_expr(p, body) { r } else { [p, ...r] }
+  }
+}
+
+# Rebuild `body` with the peeled top-level match's arms replaced. Mirrors the
+# `pcs_peel_ret_wrap` shape: rewrites the wrap's `SLet(__pcs_ret, match)` rhs,
+# or the bare match when unwrapped.
+fn pcs_replace_peeled_match(body: Expr, scr: Expr, arms1: [Arm]) : Expr = {
+  let m = Expr { kind: EMatch(scr, arms1), line: body.line, col: body.col,
+                 ty: body.ty, mode: body.mode }
+  match body.kind {
+    EBlock(stmts, tail) -> match stmts {
+      [SLet(pat, ann, rhs), ...rest] -> match pat.pkind {
+        PBind(nm) ->
+          if nm == "__pcs_ret" {
+            let m2 = Expr { kind: EMatch(scr, arms1), line: rhs.line, col: rhs.col,
+                            ty: rhs.ty, mode: rhs.mode }
+            Expr { kind: EBlock([SLet(pat, ann, m2), ...rest], tail),
+                   line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+          } else { m }
+        _ -> m
+      }
+      _ -> m
+    }
+    _ -> m
+  }
+}
 
 # Issue #350 — Gap 3: emit `__perceus_drop` for multi-use pattern
 # bindings introduced by match arms. Mirror of the SLet exit-drop
