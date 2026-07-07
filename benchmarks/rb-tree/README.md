@@ -53,12 +53,13 @@ reports. But it is NOT what the perf lanes gate on.
 
 `kaikai-c` and `kaikai-native` share the front-end but NOT the code
 generator, and on this bench they do NOT do the same work: the C backend
-retires ~2.5G instructions (N=1M) against native's ~15G — a real ~6×
-native-vs-C codegen gap (measured with `/usr/bin/time -l` on Darwin arm64).
-So the native column's larger wall is the codegen gap surfacing, not
-measurement noise; closing it is native-backend perf work (tracked in the
-perf lanes), not a harness bug. When you want the exact, host-independent
-number, read the instruction count below rather than the wall.
+retires ~2.49G instructions (N=1M) against native's ~6.27G — a ~2.5×
+native-vs-C codegen gap (measured with `/usr/bin/time -l` on Darwin arm64,
+kaikai `72a04181`). So the native column's larger wall is the codegen gap
+surfacing, not measurement noise; closing the remainder is native-backend
+perf work (tracked in the perf lanes), not a harness bug. When you want the
+exact, host-independent number, read the instruction count below rather than
+the wall.
 
 > A `./bin/kai build` with no `--backend` is **native** by default, so
 > timing it against `--backend=native` compares native to itself (identical
@@ -97,8 +98,8 @@ RC traffic. Quote whichever you mean, and say which.
 |---|---:|---:|---:|---:|
 | C            | 0.25s | 1.00x | 1.00x | 47.4 |
 | Koka         | 0.25s | 1.00x | 1.00x | 48.1 |
-| kaikai-c     | 0.41s | 1.64x | 1.64x | 55.2 |
-| **kaikai-native** | **0.96s** | **3.84x** | **3.84x** | **55.2** |
+| kaikai-c     | 0.40s | 1.60x | 1.60x | 55.2 |
+| **kaikai-native** | **0.48s** | **1.92x** | **1.92x** | **55.2** |
 
 > **Historical (kaikai-llvm column).** An earlier table here recorded the
 > now-retired llvm-text backend (`--emit=llvm` + clang -O2 +
@@ -108,42 +109,45 @@ RC traffic. Quote whichever you mean, and say which.
 
 `kaikai-native` is the *default* backend (`kai build` with no `--backend`
 is native since the Lane 1.5 flip); `kaikai-c` is the portable C-text
-backend (`--backend=c`). Both share the front-end, so the ~2.3x wall / ~6x
+backend (`--backend=c`). Both share the front-end, so the ~1.2x wall / ~2.5x
 instruction gap between them is pure code-generation, not a measurement
-artefact — closing it is native-backend perf work.
+artefact — closing the remainder is native-backend perf work.
 
-**Instruction count, Docker callgrind, N=100,000 (the perf-lane truth):**
+**Instructions retired, `/usr/bin/time -l`, Darwin arm64, N=1,000,000
+(median of 3):**
 
-| column | instructions @ 100K | vs kaikai-c | vs Koka |
-|---|---:|---:|---:|
-| Koka         | 130.38M | 0.71x | 1.00x |
-| kaikai-c     | 184.27M | 1.00x | 1.41x |
-| **kaikai-llvm (separate `-c` compile, production)** | **897.15M** | **4.87x** | **6.88x** |
-| kaikai-llvm (`llvm-link` merged module) | 534.87M | 2.90x | 4.10x |
+| column | instructions @ 1M | vs kaikai-c |
+|---|---:|---:|
+| kaikai-c     | ~2.49G | 1.00x |
+| **kaikai-native** | **~6.27G** | **~2.51x** |
 
-The LLVM column at #747-close: i64-inline (Int variant slots ride raw
-`i64`), the fast variant ctor path (`kai_variant_u_fast` + startup
-payload-ctor / nullary seed), and reuse-in-place all ported. That took the
-LLVM backend from **1,331.93M (7.23x C)** to **897.15M (4.87x C)** in the
-production separate-compile path, and to **534.87M (2.90x C)** when the
-shim TU is merged with the program IR (`llvm-link` / `-flto`). The residual
-gap is the `kaix_*` shim call boundary (the LLVM backend keeps `%KaiValue`
-opaque and routes every cell access through an external shim, where the C
-backend has the whole runtime inlined in one TU) plus the structurally
-heavier codegen of the hot `insert_loop` body. Closing it needs the
-production link to merge the shim module (`-flto` / `llvm-link`) — a
-build-chain lane, not a codegen change — and is tracked separately.
+The native-vs-C instruction gap is ~2.5×, down from 2.73× before the
+native perf arc (#1088 target-features, #1092 fast-entry, #1100 i64-inline
+construction, #1102 KProjBorrow pointer read). The residual is the `kaix_*`
+shim call boundary (the native backend keeps `%KaiValue` opaque and routes
+cell access through an external shim, where the C backend inlines the whole
+runtime in one TU) plus the deferred kind-1 Int raw binder read (the lever
+to ~1.08× pure-lookup, reverted in #1102 because it SIGSEGVs the native
+self-host gate — #709 phantom-box; needs border-reboxing to ship). Tracked
+in the Koka-parity issue.
 
-Recorded at **kaikai `8ea608c`** (Lane B i64-inline shipped, 2026-06-05).
-History: the rb-tree started this perf arc at ~404M instructions
-(~3.7x Koka); the i64-inline lever (kind-1 raw variant Int slots) was the
-last big sound win, taking it 208M → 184M (1.60x → 1.41x).
+> **Host-independent number (Docker callgrind) not re-measured here.** The
+> earlier callgrind table measured the now-retired llvm-**text** backend
+> (`--emit=llvm`, removed 2026-06-16), which emitted a `.ll` file callgrind
+> could compile with `-g`. The current in-process native backend emits an
+> object directly, so the old llvm-text callgrind recipe no longer applies
+> to it. The kaikai-c column is still callgrind-able; Koka reference was
+> 130.38M @ 100K (Koka 3.2.3, same Docker image). The `/usr/bin/time -l`
+> counts above are host-dependent but reproducible on this machine.
 
-The remaining gap to ~1.2x Koka is NOT in Int boxing (the field is fully
-raw now) — it is in the zipper/descent machinery (`cctx_apply_linear`,
-`is_red`, `check_unique`). Those levers were measured and refuted in the
-2026-06-05 session; closing the gap needs a zipper redesign, not more
-i64-inline.
+Recorded at **kaikai `72a04181`** (v0.99.0, native perf arc closed
+2026-07-06).
+
+The remaining gap to Koka is shared by BOTH backends (kaikai-c 1.60× Koka
+wall, kaikai-native 1.92×) — a front-end / language cost (Perceus RC,
+zipper/descent machinery `cctx_apply_linear` / `is_red` / `check_unique`,
+layout), NOT code generation. That is the Koka-parity work, tracked
+separately.
 
 > Numbers drift as the runtime evolves. Re-run `run.sh` and update the
 > "Last recorded result" tables (and the commit hash) when you take a new

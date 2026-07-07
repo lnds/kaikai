@@ -163,7 +163,7 @@ fi
 echo
 if [[ "$HAVE_NATIVE" == 1 ]]; then
 echo "Note: kaikai-c and kaikai-native share the front-end but NOT the code path."
-echo "On this bench native retires ~6x more instructions than the C backend (real"
+echo "On this bench native retires ~2.5x more instructions than the C backend (real"
 echo "codegen gap, tracked in the perf lanes — see README 'Wall-clock vs"
 echo "instruction count'), so its larger wall is expected, not measurement noise."
 echo
