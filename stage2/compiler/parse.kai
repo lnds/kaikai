@@ -233,6 +233,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkGe         -> match b { TkGe -> true _ -> false }
     TkBang       -> match b { TkBang -> true _ -> false }
     TkAt         -> match b { TkAt -> true _ -> false }
+    TkAmp        -> match b { TkAmp -> true _ -> false }
     TkDollar     -> match b { TkDollar -> true _ -> false }
     TkCaret      -> match b { TkCaret -> true _ -> false }
     TkHole       -> match b { TkHole -> true _ -> false }
@@ -1217,6 +1218,24 @@ fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr / Console {
   } else { ok_e(p, lhs) }
 }
 
+# Consume a `.field` chain after the base of a `@`-deref, building an
+# `EField` path. `@n.a.b` derefs the ref `n.a.b`; the chain stops at
+# the first non-`.field` token (no calls or indices — a deref target is
+# a plain `.`-path). A bare `@n` leaves `acc` as the base `EVar`.
+fn parse_deref_path(p: Parser, acc: Expr) : PExpr / Console {
+  if not p_at(p, TkDot) { ok_e(p, acc) }
+  else {
+    let p1 = p_advance(p)
+    let f = p_peek(p1)
+    if not tk_is(f.kind, TkIdent) {
+      err_e(p_error(p1, f, "expected a field name after `.` in a `@`-deref path"))
+    } else {
+      let fld = tok_source(p1.src, f)
+      parse_deref_path(p_advance(p1), mk_expr(EField(acc, fld), acc.line, acc.col))
+    }
+  }
+}
+
 fn parse_unary(p: Parser) : PExpr / Console {
 
   let t = p_peek(p)
@@ -1232,14 +1251,31 @@ fn parse_unary(p: Parser) : PExpr / Console {
       None -> err_e(r.p)
       Some(e) -> ok_e(r.p, mk_expr(EUnop("not", e), t.line, t.col))
     }
+  } else if tk_is(t.kind, TkAmp) {
+    # `&x` takes a reference: `Mutable.ref_make(x)`. The sigil mirrors
+    # the C/C++/Go `&` address-of; `Mutable` never appears on the
+    # surface but rides the inferred effect row. Binds tighter than the
+    # binary operators, so `&x + 1` is `(&x) + 1` — a ref of `x`, not
+    # `&(x + 1)` — matching `-`/`not` prefix precedence.
+    let r = parse_unary(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> {
+        let eff = mk_expr(EVar("Mutable"), t.line, t.col)
+        let maker = mk_expr(EField(eff, "ref_make"), t.line, t.col)
+        ok_e(r.p, mk_expr(ECall(maker, [e]), t.line, t.col))
+      }
+    }
   } else if tk_is(t.kind, TkAt) {
-    # `@r` dereferences a first-class `Ref[T]` (OCaml `!r` / C `*p`). It
-    # lowers to the sentinel method `r.__deref()` — a reserved name the
-    # user cannot spell — so the cell-read lowering can tell a `@`-deref
-    # from a literal `r.get()`: `@cell` is rejected (a cell reads naked),
-    # while `@ref` rewrites to `ref.get()` and the alias rewrite maps it
-    # to `Mutable.ref_get(ref)`. The identifier after `@` must be a
-    # simple binding (no dotted paths).
+    # `@r` / `@r.field…` dereferences a first-class `Ref[T]` (OCaml `!r`
+    # / C `*p`). A bare `@ident` lowers to the sentinel `ident.__deref()`
+    # — a reserved name the user cannot spell — so the cell-read lowering
+    # can tell a `@`-deref from a literal `ident.get()`: `@cell` is
+    # rejected (a cell reads naked), while `@ref` rewrites to
+    # `ref.get()` and the alias rewrite maps it to `Mutable.ref_get`.
+    # A dotted `@r.field` cannot be a cell (cells are simple bindings),
+    # so it skips the sentinel and lowers straight to `r.field.get()`,
+    # which the typer's `try_ref_sugar_op` maps to `Mutable.ref_get`.
     let p1 = p_advance(p)
     let id = p_peek(p1)
     if not tk_is(id.kind, TkIdent) {
@@ -1248,8 +1284,15 @@ fn parse_unary(p: Parser) : PExpr / Console {
       let name = tok_source(p1.src, id)
       let p2 = p_advance(p1)
       let cap = mk_expr(EVar(name), id.line, id.col)
-      let getter = mk_expr(EField(cap, "__deref"), t.line, t.col)
-      ok_e(p2, mk_expr(ECall(getter, []), t.line, t.col))
+      let pr = parse_deref_path(p2, cap)
+      match pr.r {
+        None -> err_e(pr.p)
+        Some(target) -> {
+          let sentinel = match target.kind { EVar(_) -> "__deref" _ -> "get" }
+          let getter = mk_expr(EField(target, sentinel), t.line, t.col)
+          ok_e(pr.p, mk_expr(ECall(getter, []), t.line, t.col))
+        }
+      }
     }
   } else {
     parse_pow(p)
@@ -3252,6 +3295,30 @@ fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console {
         }
       }
     }
+    EField(_, _) -> {
+      # `record.field := v` where `field : Ref[T]` — desugar to
+      # `record.field.set(v)`, the same `.set` shape as the `cap` arm.
+      # The typer's `try_ref_sugar_op` maps `.set` on a `Ref` receiver
+      # to `Mutable.ref_set(record.field, v)`; a non-`Ref` field falls
+      # through to the ordinary UFCS lookup and its "no method `set`"
+      # diagnostic. Only a `.`-chain rooted at an identifier is a valid
+      # write target, mirroring the indexed-write rule.
+      if not is_index_lhs_path(lhs) {
+        err_s(p_error(p, t,
+          "left-hand side of `:=` must be `Ident` or `Ident.field…`; bind a temporary first if you need to write through a call result"))
+      } else {
+        let p1 = p_skip_newlines(p_advance(p))
+        let rv = parse_expr(p1)
+        match rv.r {
+          None -> err_s(rv.p)
+          Some(v) -> {
+            let setter = mk_expr(EField(lhs, "set"), lhs.line, lhs.col)
+            let call = mk_expr(ECall(setter, [v]), lhs.line, lhs.col)
+            ok_s(rv.p, SExprStmt(call))
+          }
+        }
+      }
+    }
     _ -> err_s(p_error(p, t,
       "left-hand side of `:=` must be a capability binding `Ident`, an indexed `Ident[i]`, or `Ident.field…[i]`"))
   }
@@ -4097,12 +4164,14 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
   } else if is_upper_ident(p.src, t) {
     # Bare uppercase ident: 0-arg variant.
     ok_p(p1, mk_pat(PVariant(name, []), t.line, t.col))
-  } else if p_at(p1, TkAt) {
-    # `name @ pattern` — as-pattern. Bind `name` to the
-    # whole scrutinee and continue matching with the sub-pattern.
-    # The lowercase ident already implies a fresh binding; the inner
-    # pattern is parsed by the same `parse_pattern` entry, so list,
-    # variant, record, hole, and even nested as-patterns compose.
+  } else if p_at(p1, TkAs) or p_at(p1, TkAt) {
+    # `name as pattern` — as-pattern. Bind `name` to the whole scrutinee
+    # and continue matching with the sub-pattern. The lowercase ident
+    # already implies a fresh binding; the inner pattern is parsed by the
+    # same `parse_pattern` entry, so list, variant, record, hole, and
+    # even nested as-patterns compose. The legacy `name @ pattern`
+    # spelling is still accepted; `@` now primarily means deref, and the
+    # as-binding reads more naturally as `as` ("bind `name` as …").
     let p2 = p_skip_newlines(p_advance(p1))
     let r = parse_pattern(p2)
     match r.r {
