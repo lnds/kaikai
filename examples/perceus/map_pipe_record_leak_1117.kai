@@ -1,0 +1,43 @@
+# Issue #1117 — a map pipe (`|`) whose closure PROJECTS a field of a
+# record element leaks the record box, one per element (linear in the
+# input). `map_loop`'s `[h, ...t] -> map_loop(t, f, [f(h), ...acc])`
+# hands `h` to `f` as an owned arg (kai_apply contract, #298), but a
+# closure body only ever DUPs its param reads (`in_lam` forces a dup on
+# every EVar), so the param's birth ref is never consumed and leaks.
+#
+# The differential vs #817's filter: `filter_loop` stores `h` into the
+# `[h, ...acc]` cons (the ctor RETAINS h, no drop needed). `map_loop`
+# stores `f(h)` — `f` does NOT retain `h`, so the box must be released
+# after the call. The fix drops each closure param at the end of the
+# lifted thunk (`emit_lam_helper` / `lower_lam_fn`); it is sound because
+# the param is never moved raw out of a closure body — every use dups.
+#
+# This program maps a field-projecting closure over 1000 freshly-built
+# heap records, 20 times. With the leak, `leaked` grows with the loop
+# count (~1000/iter); fixed, `leaked` is a small constant. The gate
+# builds it WITHOUT `-DKAI_TRACE_RC` and asserts `leaked` stays tight.
+
+type P = { v: Int, w: Int }
+
+fn build(n: Int, acc: [P]) : [P] =
+  if n == 0 { acc }
+  else { build(n - 1, [P{ v: n, w: n * 2 }, ...acc]) }
+
+fn sum(xs: [Int], acc: Int) : Int =
+  match xs {
+    [] -> acc
+    [h, ...t] -> sum(t, acc + h)
+  }
+
+fn once() : Int =
+  sum(build(1000, []) | (p => p.v), 0)
+
+fn loop_n(n: Int, acc: Int) : Int =
+  if n == 0 { acc }
+  else { loop_n(n - 1, acc + once()) }
+
+fn main() : Int / Stdout = {
+  let total = loop_n(20, 0)
+  Stdout.print("total=#{int_to_string(total)}\n")
+  0
+}
