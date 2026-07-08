@@ -5413,6 +5413,19 @@ fn emit_lam_cap_reads(caps: [String], i: Int) : String {
   }
 }
 
+# Every param is owned by the invocation (kai_apply hands ownership per
+# call, #298) yet a closure body only ever DUPs its reads — `in_lam`
+# forces a `__perceus_dup` on every EVar and a nested-closure capture
+# rides `kai_closure`'s own incref — so the birth ref of each param is
+# never consumed and leaks one box per call. Release it after the body.
+# Captures are NOT dropped here: the closure owns them (donated once at
+# construction, released in the KAI_CLOSURE destructor); a per-call drop
+# would UAF after the first of N invocations.
+fn emit_lam_param_decrefs(params: [Param]) : String = match params {
+  []           -> ""
+  [p, ...rest] -> concat_all(["    kai_decref(kai_", p.pname, ");\n", emit_lam_param_decrefs(rest)])
+}
+
 fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 
   match l {
@@ -5426,12 +5439,19 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
       let body_lcs = list_append(list_append(cx.lcs, fn_param_names(params)), caps)
       let lam_cx = emit_ctx_with_lcs(cx, body_lcs)
       let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, concat_all(["_kai_lam_", int_to_string(id)])))
+      let tail = match params {
+        [] -> concat_all(["    return ", body_c, ";\n}\n\n"])
+        _  -> concat_all([
+          "    KaiValue *_lam_ret = ", body_c, ";\n",
+          emit_lam_param_decrefs(params),
+          "    return _lam_ret;\n}\n\n"
+        ])
+      }
       concat_all([
         "static KaiValue *_kai_lam_", int_to_string(id),
         "(KaiValue *self, KaiValue **args, int n) {\n",
         "    (void) self; (void) n;\n",
-        arg_reads, cap_reads,
-        "    return ", body_c, ";\n}\n\n"
+        arg_reads, cap_reads, tail
       ])
     }
   }
