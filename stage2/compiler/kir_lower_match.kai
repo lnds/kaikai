@@ -36,24 +36,31 @@ import compiler.kir_lower_bind
 fn prim_is_cons() : String = "kai_is_cons_b"
 fn prim_is_nil() : String = "kai_is_nil_b"
 
-# A `match` is a list match iff any arm pattern is a `PList`. The typer
-# guarantees a homogeneous scrutinee, so list arms never mix with variant
-# arms; a trailing `_`/binder catch-all may still follow (handled as an
-# unconditional arm in the fail chain).
+# A `match` is a list match iff any arm pattern is a `PList` (directly or as
+# the inner of a `name as [..]`). The typer guarantees a homogeneous
+# scrutinee, so list arms never mix with variant arms; a trailing `_`/binder
+# catch-all may still follow (handled as an unconditional arm in the fail
+# chain).
 pub fn match_is_list(arms: [Arm]) : Bool = match arms {
   [] -> false
-  [Arm(p, _, _), ...rest] -> match p.pkind {
-    PList(_, _) -> true
-    _           -> match_is_list(rest)
-  }
+  [Arm(p, _, _), ...rest] -> if pat_is_list(p) { true } else { match_is_list(rest) }
+}
+
+fn pat_is_list(p: Pattern) : Bool = match p.pkind {
+  PList(_, _)   -> true
+  PAs(_, inner) -> pat_is_list(inner)
+  _             -> false
 }
 
 # A non-list arm in a list match (a trailing `_`, a whole-list binder, a
 # hole, or an as-pattern). It matches unconditionally, so it terminates the
-# chain — no test, just bind-the-whole-scrutinee where a name is present.
+# chain — no test, just bind-the-whole-scrutinee where a name is present. A
+# `name as [..]` is the exception: its inner list-destructure carries a length
+# test, so it does NOT terminate the chain (the next arm reopens its fail).
 pub fn list_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
-  PList(_, _) -> false
-  _           -> true
+  PList(_, _)   -> false
+  PAs(_, inner) -> list_arm_is_catchall(inner)
+  _             -> true
 }
 
 # Result of emitting one arm's test+binds: the state positioned at the
@@ -68,15 +75,39 @@ pub type LMArm = LMArm(LowerSt, String)
 # to the body) and its "fail" label is unreachable.
 pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
                    st: LowerSt) : LMArm / Console = match p.pkind {
-  PList(pats, opt_rest) -> match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
+  PList(pats, opt_rest) -> lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, st)
+  # `name as [h, ...rest]`: an as-binding whose inner is a list-destructure
+  # is NOT a catch-all — it carries the inner list's length test. Emit the
+  # inner PList's cells (so h/tail registers exist), then bind `name` to the
+  # whole scrutinee in the matched body. Mirror of the oracle's `emit_pat_test`
+  # delegating to the inner (`PAs(_, sub) -> emit_pat_test(sub)`) plus its
+  # `emit_pat_binds` binding the as-name to the scrutinee.
+  PAs(name, inner) -> match inner.pkind {
+    PList(pats, opt_rest) -> match lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, st) {
+      LMArm(st_body, fail_lbl) ->
+        LMArm(lm_bind_name(name, KLitOp(scrv), p, st_body), fail_lbl)
+    }
+    _ -> lm_emit_catchall_arm(p, scrv, body_lbl, st)
+  }
+  _ -> lm_emit_catchall_arm(p, scrv, body_lbl, st)
+}
+
+# Emit the cons/nil discrimination + head/tail binds for one list arm,
+# sealing into `body_lbl` on a match and a fresh fail label on a mismatch.
+fn lm_emit_list_arm(pats: [Pattern], opt_rest: Option[String], scrv: KVal,
+                    body_lbl: String, p: Pattern, st: LowerSt) : LMArm / Console =
+  match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
     let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, st1)
     LMArm(reopen(st2, body_lbl), fail_lbl)
   } }
-  _ -> {
-    let st1 = lm_bind_whole(p, scrv, st)
-    let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
-    LMArm(reopen(st2, body_lbl), body_lbl)
-  }
+
+# A catch-all arm (trailing `_`, whole-list binder, `name as _`): no test,
+# bind the whole scrutinee, branch straight to the body.
+fn lm_emit_catchall_arm(p: Pattern, scrv: KVal, body_lbl: String,
+                        st: LowerSt) : LMArm / Console = {
+  let st1 = lm_bind_whole(p, scrv, st)
+  let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+  LMArm(reopen(st2, body_lbl), body_lbl)
 }
 
 # Bind a catch-all arm's name (a whole-list binder or as-pattern) to the
