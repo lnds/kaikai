@@ -84,6 +84,28 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.1 (2026-07-08)
+
+### Added
+
+- Ref[T] surface sugar — `&` make, `:=` set, `@` deref (closes #1114, #1113) (#1116)
+- **resolve**: gate `theory` declarations to the kind catalog only (#1109)
+- kind/theory surface v1 (the cosmetic first cut) (#1107)
+
+### Fixed
+
+- **unbox**: one backend-aware rawness verdict — native reuse-in-place Int slot (#1110) (#1124)
+- **kir**: lower as-binding over list-destructure on the native backend (#1118)
+- **emit**: decref owned value discarded in statement position on native (#1119)
+- **perceus**: drop closure params to close map-pipe record leak (#1122)
+
+### Changed
+
+- **perceus**: borrow read-only array prims to elide per-access RC (#1120) (#1125)
+- **emit**: native inline variant-slot read (Eje 1) (#1111)
+- **perceus,emit**: fuse residual RC pairs in the match protocol (#1104 Lane 2) (#1106)
+- **emit**: donate the arm reuse token across the balance-call boundary (#1105)
+
 ## v0.99.0 (2026-07-06)
 
 ### BREAKING CHANGE
