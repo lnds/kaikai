@@ -686,23 +686,31 @@ position (`Real<meter>`, `Money[Real]<USD>`). `theory` is catalog-surface (and f
 user-assemblable from the property menu), so it is first-class, not hidden plumbing.
 `taxon`/`taxology` (reserved by an earlier lexical lane) are un-reserved and replaced.
 
+## Shipped over AbelianGroup
+
+User-declared abelian kinds, per-kind isolation, and use-site resolution
+ship (issue #1108). Per-kind introducer keywords (`metric`, `cur`, …) are
+recognised through a linear token pre-scan that builds the file's
+introducer→kind map before any body is parsed — order-independent, and
+without a stateful LL(1) parser (the spike's feared piece turned out
+avoidable). Isolation rides the habitant symbol: the resolver rewrites a
+bare `<sym>` to its kind-qualified form before unification, so the
+existing abelian engine — which cancels by symbol-name equality —
+isolates habitants across kinds with no new engine and no kind-tag on
+`TyDimT`. `use kind Kind` extends the existing `use` keyword as designed.
+
 ## Open questions
 
-- Per-kind introducer keywords (`metric`, `currency`, `perm`) at top level need the
-  contextual-keyword mechanism, populated by the `kind … with intro` declarations read
-  so far — a stateful table in the LL(1) parser (precedent: `opaque`/`region`, but
-  those are not stateful). This is the delicate piece the spike flagged.
-- **`unit` should stop being a keyword.** It is `Measure`'s introducer, so once the
-  stateful introducer table above exists, `unit` becomes a registered introducer like
-  `metric`/`cur` — not a hard keyword. v1 keeps `unit` as `TkUnitKw` (no introducer
-  machinery yet); the v2+ direction removes the keyword. North star, not v1 scope.
-- **`use kind Kind`** — the module-level default for bare habitants (see *Habitant
-  resolution*). This extends the **existing** `use` keyword: `use Clock` already
-  "opens ops for bare names" (`kai info syntax`), so `use kind Currency` opens a
-  kind's habitants for bare `<>` names by the same mechanism — not a new form. The
-  open piece is wiring the kind-default into the `<>` habitant resolver. Only needed
-  once a symbol is shared across kinds (Currency + Measure), so it can land with the
-  multi-kind work, not before.
+- **`unit` should stop being a keyword.** It is `Measure`'s introducer,
+  so it could become a registered introducer like `metric`/`cur` rather
+  than a hard `TkUnitKw`. #1108 keeps `unit` as a keyword (the introducer
+  table coexists with it); dropping the keyword is a follow-up. North
+  star, not required for the engine.
+- **Alias bodies across kinds.** Kind rewriting runs before alias
+  expansion, so an alias whose body's symbols are shared across kinds is
+  not re-qualified per use site (`metric.Newton` / `imperial.Newton`
+  where `unit Newton = kg·m/s²`). #1108 leaves this to a follow-up; the
+  fix is to move rewriting after expansion, not to add a `TyDimT` tag.
 - Whether user-assembled theories (`theory Mine = { assoc, commut, idempotent }`)
   ship in the first cut or are deferred — the mechanism (closed property menu +
   decidable-combination check) is designed, but the standard aliases cover the known

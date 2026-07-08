@@ -1,0 +1,264 @@
+#[doc("Generic Decl->UnitExprT walker parameterised by a leaf transform, shared by unit-alias expansion and kind rewriting.")]
+
+import compiler.util
+import compiler.ast
+
+#[doc("Rewrite every unit expression reachable from `ds` through `f`, descending the full decl/type/expr/stmt tree.")]
+pub fn map_units_decls(ds: [Decl], f: (UnitExprT) -> UnitExprT) : [Decl] =
+  map(ds, (d) => map_units_decl(d, f))
+
+#[doc("Rewrite every unit expression reachable from `d` through `f`.")]
+pub fn map_units_decl(d: Decl, f: (UnitExprT) -> UnitExprT) : Decl {
+  match d {
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, n, tps,
+          map(ps, (pm) => map_units_param(pm, f)),
+          match ret { Some(t) -> Some(map_units_typeexpr(t, f)) None -> None },
+          row,
+          map_units_expr(body, f),
+          l, c, mo)
+    DType(p, n, tps, body, l, c, mo) ->
+      DType(p, n, tps, map_units_typebody(body, f), l, c, mo)
+    DTest(desc, body, l, c) -> DTest(desc, map_units_expr(body, f), l, c)
+    DBench(desc, body, l, c) -> DBench(desc, map_units_expr(body, f), l, c)
+    DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, map_units_expr(body, f), l, c)
+    DImport(_, _, _) -> d
+    DEffect(p, n, tps, ops, defblk, l, c, mo) ->
+      DEffect(p, n, tps, map(ops, (op) => map_units_op(op, f)), defblk, l, c, mo)
+    DUnit(_, _, _, _, _, _) -> d
+    # protocols are stripped by `lower_protocols` before
+    # `infer_program` runs, so reaching one here means the pass
+    # executed on a pre-lowering decl stream — pass through.
+    DProtocol(_, _, _, _, _, _) -> d
+    DImpl(_, _, _, _, _, _) -> d
+    DDerive(_, _, _, _) -> d
+    DUnstable(_, _, _) -> d
+    DConstructor(_, _, _) -> d
+    DUse(_, _, _) -> d
+    DUseKind(_, _, _) -> d
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> d
+    DConst(p, n, ty, body, mo, l, c) ->
+      DConst(p, n, map_units_typeexpr(ty, f),
+              map_units_expr(body, f), mo, l, c)
+    DDoc(raw, text, inner, l, c) ->
+      DDoc(raw, text, map_units_decl(inner, f), l, c)
+    DModuleDoc(_, _, _, _) -> d
+    DExternType(_, _, _, _) -> d
+    DTheory(_, _, _, _) -> d
+    DKind(_, _, _, _, _, _) -> d
+  }
+}
+
+fn map_units_param(pm: Param, f: (UnitExprT) -> UnitExprT) : Param =
+  Param {
+    pname: pm.pname,
+    ptype: match pm.ptype {
+      Some(t) -> Some(map_units_typeexpr(t, f))
+      None -> None
+    },
+    pline: pm.pline,
+    pcol: pm.pcol, pborrow: pm.pborrow
+  }
+
+fn map_units_typebody(b: TypeBody, f: (UnitExprT) -> UnitExprT) : TypeBody {
+  match b {
+    TBAlias(t) -> TBAlias(map_units_typeexpr(t, f))
+    TBRecord(fs) -> TBRecord(map_units_fdecls(fs, f))
+    TBSum(vs) -> TBSum(map_units_variants(vs, f))
+    TBEffectAlias(_) -> b
+  }
+}
+
+fn map_units_fdecls(fs: [FieldDecl], f: (UnitExprT) -> UnitExprT) : [FieldDecl] {
+  match fs {
+    [] -> []
+    [h, ...rest] -> match h {
+      FD(is_pub, n, t) -> [FD(is_pub, n, map_units_typeexpr(t, f)),
+                   ...map_units_fdecls(rest, f)]
+    }
+  }
+}
+
+fn map_units_variants(vs: [Variant], f: (UnitExprT) -> UnitExprT) : [Variant] {
+  match vs {
+    [] -> []
+    [h, ...rest] -> match h {
+      Var(n, ts) -> [Var(n, map_units_typeexprs(ts, f)),
+                     ...map_units_variants(rest, f)]
+    }
+  }
+}
+
+fn map_units_typeexprs(ts: [TypeExpr], f: (UnitExprT) -> UnitExprT) : [TypeExpr] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> [map_units_typeexpr(h, f),
+                     ...map_units_typeexprs(rest, f)]
+  }
+}
+
+fn map_units_op(op: EffectOp, f: (UnitExprT) -> UnitExprT) : EffectOp {
+  match op {
+    EOp(n, tps, ps, ret, l, c) ->
+      EOp(n, tps,
+          map(ps, (pm) => map_units_param(pm, f)),
+          map_units_typeexpr(ret, f), l, c)
+  }
+}
+
+fn map_units_typeexpr(t: TypeExpr, f: (UnitExprT) -> UnitExprT) : TypeExpr {
+  match t.tkind {
+    TyName(n, ts) ->
+      mk_ty(TyName(n, map(ts, (a) => map_units_typeexpr(a, f))), t.line, t.col)
+    TyList(inner) ->
+      mk_ty(TyList(map_units_typeexpr(inner, f)), t.line, t.col)
+    TyFn(ps, ret, row) ->
+      mk_ty(TyFn(map(ps, (a) => map_units_typeexpr(a, f)),
+                 map_units_typeexpr(ret, f), row), t.line, t.col)
+    TyDim(base, u) ->
+      mk_ty(TyDim(map_units_typeexpr(base, f),
+                  f(u)), t.line, t.col)
+    # refinements pass through: the predicate carries no unit expression.
+    TyRefine(base, p) ->
+      mk_ty(TyRefine(map_units_typeexpr(base, f), p), t.line, t.col)
+    # a compound-row carrier is passed through unchanged, matching the
+    # `TyFn` arm (which leaves its row untouched).
+    TyRow(_) -> t
+  }
+}
+
+fn map_units_expr(e: Expr, f: (UnitExprT) -> UnitExprT) : Expr {
+  let new_kind = map_units_exprkind(e.kind, f)
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn map_units_exprkind(k: ExprKind, f: (UnitExprT) -> UnitExprT) : ExprKind {
+  match k {
+    EInt(_) -> k
+    EReal(_, _) -> k
+    EIntLit(_) -> k
+    EDecimalLit(_) -> k
+    EFixed(_, _) -> k
+    EBool(_) -> k
+    EChar(_) -> k
+    EStr(_, _) -> k
+    EUnit -> k
+    EVar(_) -> k
+    EUnder -> k
+    EPlaceholder -> k
+    ECall(fc, xs) -> ECall(map_units_expr(fc, f),
+                          map(xs, (x) => map_units_expr(x, f)))
+    EField(b, n) -> EField(map_units_expr(b, f), n)
+    EIndex(a, b) -> EIndex(map_units_expr(a, f),
+                           map_units_expr(b, f))
+    EBinop(op, a, b) -> EBinop(op, map_units_expr(a, f),
+                                   map_units_expr(b, f))
+    EUnop(op, x) -> EUnop(op, map_units_expr(x, f))
+    EIf(c, t_, eo) -> EIf(map_units_expr(c, f),
+                          map_units_expr(t_, f),
+                          match eo { Some(eb) -> Some(map_units_expr(eb, f)) None -> None })
+    EMatch(scr, arms) -> EMatch(map_units_expr(scr, f),
+                                map(arms, (a) => map_units_arm(a, f)))
+    ELambda(ps, body) ->
+      ELambda(map(ps, (pm) => map_units_param(pm, f)),
+              map_units_expr(body, f))
+    ERecordLit(n, fis) -> ERecordLit(n, map_units_field_inits(fis, f))
+    EList(els) -> EList(map(els, (el) => map_units_listelem(el, f)))
+    ERange(a, b, opt_step) ->
+      ERange(map_units_expr(a, f),
+             map_units_expr(b, f),
+             match opt_step { Some(s) -> Some(map_units_expr(s, f)) None -> None })
+    EBlock(stmts, opt_final) ->
+      EBlock(map(stmts, (s) => map_units_stmt(s, f)),
+             match opt_final { Some(fe) -> Some(map_units_expr(fe, f)) None -> None })
+    EPipe(a, b) -> EPipe(map_units_expr(a, f),
+                         map_units_expr(b, f))
+    EMapPipe(a, b) -> EMapPipe(map_units_expr(a, f),
+                               map_units_expr(b, f))
+    EFlatMapPipe(a, b) -> EFlatMapPipe(map_units_expr(a, f),
+                                       map_units_expr(b, f))
+    EFilterPipe(a, b) -> EFilterPipe(map_units_expr(a, f),
+                                     map_units_expr(b, f))
+    EHole(_) -> k
+    ETodo(_) -> k
+    EExternBody(_) -> k
+    EBang(inner) -> EBang(map_units_expr(inner, f))
+    EHandle(body, eff_n, eff_tas, init_opt, alias_opt, cs, ret_opt) ->
+      EHandle(map_units_expr(body, f), eff_n,
+              map(eff_tas, (t) => map_units_typeexpr(t, f)),
+              match init_opt { Some(ie) -> Some(map_units_expr(ie, f)) None -> None },
+              alias_opt,
+              map(cs, (c) => map_units_hclause(c, f)),
+              match ret_opt { Some(r) -> Some(map_units_hreturn(r, f)) None -> None })
+    ELitUnit(inner, u) ->
+      ELitUnit(map_units_expr(inner, f),
+               f(u))
+    EVariantsOf(ty, names) ->
+      EVariantsOf(map_units_typeexpr(ty, f), names)
+    # qualified module call holds plain strings only.
+    EModCall(m, fname) -> EModCall(m, fname)
+    EIntrinsic(name, args_) ->
+      EIntrinsic(name, map(args_, (a) => map_units_expr(a, f)))
+  }
+}
+
+fn map_units_field_inits(fis: [FieldInit], f: (UnitExprT) -> UnitExprT) : [FieldInit] {
+  match fis {
+    [] -> []
+    [h, ...rest] -> match h {
+      FI(fn_, v) -> [FI(fn_, map_units_expr(v, f)),
+                     ...map_units_field_inits(rest, f)]
+    }
+  }
+}
+
+fn map_units_arm(a: Arm, f: (UnitExprT) -> UnitExprT) : Arm {
+  match a {
+    Arm(pat, opt_g, body) -> Arm(pat,
+      match opt_g { Some(g) -> Some(map_units_expr(g, f)) None -> None },
+      map_units_expr(body, f))
+  }
+}
+
+fn map_units_listelem(el: ListElem, f: (UnitExprT) -> UnitExprT) : ListElem {
+  match el {
+    ElPlain(x) -> ElPlain(map_units_expr(x, f))
+    ElSpread(x) -> ElSpread(map_units_expr(x, f))
+  }
+}
+
+fn map_units_stmt(s: Stmt, f: (UnitExprT) -> UnitExprT) : Stmt {
+  match s {
+    SLet(p, t, rhs) ->
+      SLet(p,
+           match t { Some(te) -> Some(map_units_typeexpr(te, f)) None -> None },
+           map_units_expr(rhs, f))
+    SAssert(c, msg) ->
+      SAssert(map_units_expr(c, f),
+              match msg { Some(m) -> Some(map_units_expr(m, f)) None -> None })
+    SExprStmt(x) -> SExprStmt(map_units_expr(x, f))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(map_units_expr(b, f),
+                   map_units_expr(i, f),
+                   map_units_expr(v, f), l, c)
+    SVar(n, te, rhs, l, c) ->
+      SVar(n,
+           match te { Some(t) -> Some(map_units_typeexpr(t, f)) None -> None },
+           map_units_expr(rhs, f), l, c)
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
+fn map_units_hclause(c: HClause, f: (UnitExprT) -> UnitExprT) : HClause {
+  match c {
+    HC(n, ps, body, l, col) ->
+      HC(n, map(ps, (pm) => map_units_param(pm, f)),
+         map_units_expr(body, f), l, col)
+  }
+}
+
+fn map_units_hreturn(r: HReturn, f: (UnitExprT) -> UnitExprT) : HReturn {
+  match r {
+    HR(n, body, l, c) -> HR(n, map_units_expr(body, f), l, c)
+  }
+}
