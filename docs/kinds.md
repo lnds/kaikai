@@ -1,7 +1,12 @@
 # The kind system
 
-> Status: stable for the two kinds shipped (`Type`, `Measure`).
-> Adding new kinds requires a separate design doc.
+> Status: `Type` and `Measure` are the two *operational* kinds.
+> The kind system is no longer closed: the `kind` / `theory`
+> declaration surface is shipped (catalog in
+> `stdlib/core/kinds.kai`), and the generalized engine — user
+> kinds over `AbelianGroup`, per-kind isolation, use-site
+> resolution — is in progress (#1108). The authoritative design
+> is `docs/kind-system-design.md`; this page is the primer.
 
 ## What is a kind?
 
@@ -15,19 +20,21 @@ concept stays invisible. kaikai exposes a second kind so the
 type system can keep units of measure separate from ordinary
 types.
 
-## kaikai's two kinds
-
-kaikai has exactly **two** kinds:
+## The two operational kinds
 
 | Kind      | Inhabits | Examples |
 |-----------|----------|----------|
 | `Type`    | ordinary types | `Int`, `String`, `Bool`, `[T]`, `Option[T]`, `Result[E, T]`, user records, user variants |
 | `Measure` | units of measure | `USD`, `EUR`, `m`, `kg`, `m/s`, `m^2` |
 
-That is the whole list. There is no `Effect` kind, no `Row` kind,
-no higher-order kinds. Effects and rows live in their own
-machinery (see `docs/effects.md`); they do not show up at the
-kind level.
+There is no `Effect` kind, no `Row` kind, no higher-order kinds.
+Effects and rows live in their own machinery (see
+`docs/effects.md`); they do not show up at the kind level.
+
+`Measure` is itself declared in the catalog —
+`kind Measure : AbelianGroup with unit` in `stdlib/core/kinds.kai`
+— rather than hardcoded; `unit m` mints its habitants. Further
+kinds follow the same shape once the generalized engine lands.
 
 ## Kind annotation syntax
 
@@ -89,20 +96,38 @@ type names are uppercase. The remaining ambiguity lived between
 only by syntactic position (return slot vs `[]` annotation).
 After #253 the kind has its own name and the ambiguity is gone.
 
-## When you meet a new kind
+## Declaring a new kind
 
-You will not. The kind system is closed at two — adding a new
-kind would require a separate design doc, a parser change, and a
-typer change, and is not on any roadmap. Treat the table above
-as the complete list.
+A kind is declared over a **theory** — a unification discipline
+drawn from a closed catalog (`stdlib/core/kinds.kai`; only the
+catalog may declare theories):
 
-If a future feature needs a third kind (e.g. row-level
-polymorphism for protocols), that proposal must motivate why the
-existing two are insufficient and what concrete program patterns
-the new kind enables.
+```kai
+kind Metric : AbelianGroup with metric   # user kind, own habitants
+metric m
+metric s
+```
+
+The theory decides how the kind's habitants unify (`AbelianGroup`
+gives Measure-style exponent algebra); the optional `with`
+introducer mints habitants. Habitants in different kinds never
+unify, and the same symbol may inhabit several kinds, resolved at
+the use site by qualification > `use kind` > uniqueness — see
+`docs/kind-system-design.md` § *Habitant resolution at the use
+site*.
+
+> **v1 status (2026-07-08):** the declaration surface is shipped;
+> user kinds beyond the built-in `Measure` activate with the
+> generalized engine (#1108, in progress). Candidate theories
+> under design: `Structural` (identity — regions, #1123) and
+> `Module` (currency/money — no internal product, so `USD^2`
+> cannot arise).
 
 ## Cross-references
 
+- `docs/kind-system-design.md` — the authoritative design of the
+  kind/theory system: catalog, introducers, habitant resolution,
+  `over`, the practical mode.
 - `docs/units-of-measure.md` — full UoM design; defines the
   `Measure` kind formally and gives the abelian-group unification
   algorithm.
