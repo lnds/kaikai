@@ -21,6 +21,7 @@ import compiler.kir
 import compiler.native_prims
 import compiler.resolve
 import compiler.emit_native_fn
+import compiler.emit_native_slot
 
 # --- KPrim / KCall symbol resolution -----------------------------------
 
@@ -101,10 +102,13 @@ pub fn nemit_op(ctx: Handle, op: KOp, fns: [KFn]) : Handle / Console = match op 
   KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
   KCon(nm, tag, mask, inits) -> nemit_con(ctx, nm, tag, mask, inits)
   KRecord(fields)      -> nemit_record(ctx, fields)
+  # A boxed read of a TYPED slot: the pure path has no ctor name to classify
+  # the kind, so it keeps the mask-consulting shim (which re-boxes a raw i64 /
+  # real correctly). The typed binder path (`nemit_proj_slot`) reads raw inline.
   KProj(v, i)          -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
-  # A known-pointer slot: `.ptr` borrow with no mask branch (the inline-friendly
-  # `kaix_variant_arg_borrow`), matching the C backend's `slots[i].ptr`.
-  KProjBorrow(v, i)    -> ncall_sig2(ctx, "kaix_variant_arg_borrow", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
+  # A known-pointer slot: inline `.ptr` load, no shim call and no mask branch —
+  # `GEP(&v->as)[i]` then `load ptr`, exactly the C backend's `slots[i].ptr`.
+  KProjBorrow(v, i)    -> nemit_projborrow_inline(ctx, v, i)
   KTagOf(v)            -> nemit_tagof(ctx, v)
   KClosure(sym, ar, caps) -> nemit_closure_call(ctx, sym, ar, nemit_atoms_buf(ctx, caps))
   KConReuse(rk, d, nm, tag, inits) -> nemit_con_reuse(ctx, rk, d, tag, nm, inits)
@@ -122,6 +126,14 @@ pub fn nemit_op(ctx: Handle, op: KOp, fns: [KFn]) : Handle / Console = match op 
   KResumeOp(_, _)      -> { nemit_unsupported(ctx, "KResumeOp reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
   KResume2Op(_, _, _)  -> { nemit_unsupported(ctx, "KResume2Op reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
   KSetjmp(_, sym)      -> nemit_setjmp_op(ctx, sym)
+}
+
+# The scrutinee atom is captured in a `let` before the inline `.ptr` load so
+# the handle stays off the RC regime across the call boundary (the same
+# handle-binder discipline the ctor/record emitters use).
+fn nemit_projborrow_inline(ctx: Handle, v: KVal, i: Int) : Handle / Console = {
+  let sv = nemit_atom(ctx, v)
+  nemit_slot_read_ptr(ctx, sv, i)
 }
 
 # `KSetjmp(eff, sym)` → `setjmp(jmpbuf) : i32`, boxed as an Int so the boxed

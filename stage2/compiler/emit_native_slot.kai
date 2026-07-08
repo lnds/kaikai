@@ -1,0 +1,79 @@
+# compiler/emit_native_slot.kai — inline pointer-slot reads for the native
+# backend: `GEP+load` against the `KaiValue` header, mirroring the C backend's
+# `kai_var_slots(v)[i].ptr`.
+#
+# A `KProjBorrow` (a known pointer slot — the child pointers a match arm
+# borrows, e.g. an rb-tree node's `l`/`r`) used to route through the
+# `kaix_variant_arg_borrow` shim: a runtime call that re-derives the slot base
+# and loads `.ptr`. The kind is known at compile time (kind-0 pointer), so the
+# read is a static `getelementptr` into the inline slot array plus one `load
+# ptr` — exactly what the C emitter produces, no call.
+#
+# The slot base is `&v->as` (slots overlap the union at its first offset),
+# reached by GEP-ing a header struct type that matches `struct KaiValue`'s
+# vanilla 8-byte header and letting LLVM compute the offset — never a
+# hardcoded `8`, which breaks under `-DKAI_TRACE_RC` header growth. The linked
+# runtime bitcode is always compiled without those defines, so the header is
+# `{ i32, i8, i8, i16 }` and `as` sits at field 4. The load carries the `ptr`
+# type, inheriting the 8-byte ABI alignment the allocator guarantees.
+
+import compiler.util
+import compiler.native_prims
+import compiler.emit_native_fn
+
+# The mask encodes at most 16 slots (2 bits each in a 32-bit word); a wider
+# variant falls back to mask=0 all-pointer. The array element count only types
+# the GEP — it never bounds-checks — so 16 covers every masked read.
+fn nslot_array_cap() : Int = 16
+
+# The LLVM struct type mirroring `struct KaiValue`'s vanilla header:
+# `{ i32 rc, i8 tag, i8 var_n_args, i16 variant_tag, [16 x i64] slots }`.
+# Field 4 lands at offset 8 (the header packs with no interior padding, and
+# the i64 array forces the struct's 8-byte alignment), matching `&v->as`.
+# LLVM dedups identical struct types, so recreating it on demand is free.
+fn nkaivalue_header_type(ctx: Handle) : Handle = {
+  let m = native_ctx_m(ctx)
+  let i8t  = llvm_int_type(m, 8)
+  let i16t = llvm_int_type(m, 16)
+  let slotst = llvm_array_type(native_ctx_i64t(ctx), nslot_array_cap())
+  let elems = llvm_buf_new()
+  llvm_buf_push(elems, native_ctx_i32t(ctx))
+  llvm_buf_push(elems, i8t)
+  llvm_buf_push(elems, i8t)
+  llvm_buf_push(elems, i16t)
+  llvm_buf_push(elems, slotst)
+  let t = llvm_struct_type(m, elems)
+  llvm_buf_free(elems)
+  t
+}
+
+# The address of slot `i` inside `v`'s inline slot array: `&v->as` via the
+# header field-4 GEP, then the element GEP over the homogeneous `[16 x i64]`.
+fn nemit_slot_ptr(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let b = native_ctx_b(ctx)
+  let hty = nkaivalue_header_type(ctx)
+  let base = llvm_build_struct_gep(b, hty, v, 4)
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), nslot_array_cap())
+  llvm_build_array_gep(b, arrty, base, llvm_const_i32(native_ctx_i32t(ctx), i))
+}
+
+# A `let`-bound slot pointer keeps the GEP handle off the RC regime before it
+# becomes a `llvm_build_load` argument (the handle-binder exclusion — a Value*
+# passed inline as a call arg is RC-clobbered by the type-blind kaic1).
+#[doc("Load variant slot `i` of `v` as a raw `i64` (kind-1 Int, `.i64`).")]
+pub fn nemit_slot_read_i64(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_i64t(ctx), p)
+}
+
+#[doc("Load variant slot `i` of `v` as a raw `double` (kind-2 Real, `.r`).")]
+pub fn nemit_slot_read_real(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_f64t(ctx), p)
+}
+
+#[doc("Load variant slot `i` of `v` as a boxed `KaiValue *` (kind-0, `.ptr`).")]
+pub fn nemit_slot_read_ptr(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_ptrt(ctx), p)
+}

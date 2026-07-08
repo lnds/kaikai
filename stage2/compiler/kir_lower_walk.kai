@@ -798,9 +798,9 @@ fn lower_let_pbind(name: String, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt
 
 fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match pat.pkind {
   PBind(name)          -> lower_let_pbind(name, SBoxed, v, pat, st)
-  PRecord(_)           -> bind_pattern_fields_any(pat, v, st)
-  PVariant(_, _)       -> bind_pattern_fields_any(pat, v, st)
-  PVariantRecord(_, _) -> bind_pattern_fields_any(pat, v, st)
+  PRecord(_)           -> bind_pattern_fields_any(pat, v, bind_body_none(), st)
+  PVariant(_, _)       -> bind_pattern_fields_any(pat, v, bind_body_none(), st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(pat, v, bind_body_none(), st)
   PAs(name, _)         -> bind_let_as(pat, name, v, st)
   _                    -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
 }
@@ -809,7 +809,7 @@ fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = matc
 # inner pattern against it.
 fn bind_let_as(pat: Pattern, name: String, v: KVal, st: LowerSt) : LowerSt / Console = {
   let st1 = ls_emit(st, KLet(name, SBoxed, KLitOp(v), KAt(pat.line, pat.col)))
-  bind_pattern_fields_any(as_inner(pat), v, st1)
+  bind_pattern_fields_any(as_inner(pat), v, bind_body_none(), st1)
 }
 
 # --- if -----------------------------------------------------------------
@@ -1383,7 +1383,7 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
                      ldef: String, owned: Bool, sd: String, st: LowerSt) : LowerSt / Console =
   match first_default_arm(arms) {
     Some(Arm(p, _, body)) -> {
-      let st_def = bind_default_pattern(p, scrv, reopen(st, ldef))
+      let st_def = bind_default_pattern(p, scrv, body, reopen(st, ldef))
       # Issue #858 — the default arm's pattern (a `_`-tag binder / as-name /
       # destructure) aliases the scrutinee like a variant arm; restore the
       # oracle's structural pointer-slot incref so the owned exit drop balances.
@@ -1411,13 +1411,13 @@ fn bind_scr_alias(name: String, scrv: KVal, pos: KPos, st: LowerSt) : LowerSt / 
 # binder aliases `scrv`; an as-pattern aliases then descends; a
 # destructuring pattern reuses the field-bind path; wildcard/literal bind
 # nothing.
-fn bind_default_pattern(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
+fn bind_default_pattern(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
   PBind(name)          -> bind_scr_alias(name, scrv, KAt(p.line, p.col), st)
   PNarrow(name, _)     -> bind_scr_alias(name, scrv, KAt(p.line, p.col), st)
-  PAs(name, _)         -> bind_pattern_fields_any(as_inner(p), scrv, bind_scr_alias(name, scrv, KAt(p.line, p.col), st))
-  PVariant(_, _)       -> bind_pattern_fields_any(p, scrv, st)
-  PVariantRecord(_, _) -> bind_pattern_fields_any(p, scrv, st)
-  PRecord(_)           -> bind_pattern_fields_any(p, scrv, st)
+  PAs(name, _)         -> bind_pattern_fields_any(as_inner(p), scrv, body, bind_scr_alias(name, scrv, KAt(p.line, p.col), st))
+  PVariant(_, _)       -> bind_pattern_fields_any(p, scrv, body, st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(p, scrv, body, st)
+  PRecord(_)           -> bind_pattern_fields_any(p, scrv, body, st)
   _                    -> st
 }
 
@@ -1574,7 +1574,7 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
   [Arm(p, g, body)] ->
     if var_arm_is_tag_catchall(p) {
       let st_arm = reopen(st, lbl)
-      let st_bound = bind_pattern_fields(p, scrv, st_arm)
+      let st_bound = bind_pattern_fields(p, scrv, body, st_arm)
       let st_rc = lower_arm_rc(p, body, sd, owned, st_bound)
       let st_drop = match_selftail_scr_drop(owned, sd, body, st_rc)
       lower_branch_into(body, join, lcont, st_drop)
@@ -1595,13 +1595,13 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
     if var_arm_is_tag_catchall(p) {
       # Catch-all of this tag: branch straight to the body; later arms dead.
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
-      let st3 = bind_pattern_fields(p, scrv, reopen(st2, body_lbl))
+      let st3 = bind_pattern_fields(p, scrv, body, reopen(st2, body_lbl))
       let st3d = lower_arm_rc(p, body, sd, owned, st3)
       let st3dd = match_selftail_scr_drop(owned, sd, body, st3d)
       lower_branch_into(body, join, lcont, st3dd)
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
-        let st4 = emit_arm_subtests_and_binds(p, scrv, body_lbl, next_fail, st2)
+        let st4 = emit_arm_subtests_and_binds(p, scrv, body, body_lbl, next_fail, st2)
         let st4d = lower_arm_rc(p, body, sd, owned, st4)
         let st4dd = match_selftail_scr_drop(owned, sd, body, st4d)
         let st5 = lower_branch_into(body, join, lcont, st4dd)
@@ -1626,7 +1626,7 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
 # cycle (variant <- match). A slot-list arm has exactly one discriminating
 # slot (the list); a mixed multi-slot payload with a list stays the documented
 # subset gap (`bind_unsupported_nested` traps loud, never silent-wrong).
-fn emit_arm_subtests_and_binds(p: Pattern, scrv: KVal, body_lbl: String,
+fn emit_arm_subtests_and_binds(p: Pattern, scrv: KVal, body: Expr, body_lbl: String,
                                fail_lbl: String, st: LowerSt) : LowerSt / Console =
   match var_arm_lone_list_slot(p) {
     Some(VLSlot(idx, pats, opt_rest)) ->
@@ -1635,11 +1635,11 @@ fn emit_arm_subtests_and_binds(p: Pattern, scrv: KVal, body_lbl: String,
         # The list slot's own head/tail names bound via lm_emit_cells; the
         # sibling binder/wildcard slots still need their KLet. A PList slot is
         # a no-op in bind_pattern_fields, so this binds the siblings only.
-        bind_pattern_fields(p, scrv, st2)
+        bind_pattern_fields(p, scrv, body, st2)
       } }
     None -> {
       let st3 = var_emit_subtests(p, scrv, body_lbl, fail_lbl, st)
-      bind_pattern_fields(p, scrv, st3)
+      bind_pattern_fields(p, scrv, body, st3)
     }
   }
 
@@ -1697,7 +1697,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         # scoped to THIS arm's guard + body. Snapshot before binding so the
         # rest of the chain (lowered at `next_fail`) does not inherit it.
         let rsnap = st_body.renames
-        let st_bound = bind_default_pattern(p, scrv, st_body)
+        let st_bound = bind_default_pattern(p, scrv, body, st_body)
         let st_done = match opt_guard {
           None -> lower_branch_into(body, join, lcont, st_bound)
           Some(g) -> match ls_fresh_label(st_bound) { LSLabel(run_lbl, stg) ->

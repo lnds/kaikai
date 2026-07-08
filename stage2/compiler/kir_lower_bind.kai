@@ -37,6 +37,7 @@ import compiler.util
 import compiler.emit_shared
 import compiler.kir
 import compiler.kir_lower
+import compiler.fnreg
 
 # --- top-level arm binds (the switch already tested the tag) ------------
 
@@ -44,19 +45,19 @@ import compiler.kir_lower
 # `KSwitch` already matched the arm's tag, so the direct sub-slots are safe
 # to bind. `PVariant` reads positional slots (`KProj scrv idx`);
 # `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
-pub fn bind_pattern_fields(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, scrv, 0, st)
-  PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, st)
+pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, scrv, 0, body, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, body, st)
   # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
   # whole scrutinee to `name`, then bind the inner pattern's own sub-binders.
-  PAs(name, _)              -> bind_pattern_fields(as_inner(p), scrv,
+  PAs(name, _)              -> bind_pattern_fields(as_inner(p), scrv, body,
                                  ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col))))
   _                         -> st
 }
 
-fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match subs {
+fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match subs {
   [] -> st
-  [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, bind_slot_pattern(cn, sp, scrv, idx, st))
+  [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, body, bind_slot_pattern(cn, sp, scrv, idx, body, st))
 }
 
 # The runtime kind of ctor `cn`'s slot `idx`, classified with the IDENTICAL
@@ -77,13 +78,108 @@ fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
     None      -> 0
   }
 
-# The KSlot a match-arm binder reads slot `idx` of ctor `cn` at. Currently
-# always `SBoxed`: the slot is BUILT i64-inline (typed_inits) but READ boxed
-# via `kaix_variant_arg`, which consults the tag's registered mask and re-boxes
-# a raw i64 slot correctly (`kai_variant_slot_box`). So construction/drop are
-# i64-inline (the #1083 layout) while the read stays boxed — correct, one box
-# per read. The raw read (`SInt64` → `kaix_variant_arg_i64`) is a follow-up.
-pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int) : KSlot = SBoxed
+# The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at, gated by
+# the SAME predicate the unbox pass (`seed_variant_int_binders`) uses to seed a
+# binder MUnboxed: a kind-1 Int / kind-2 Real slot is raw (`SInt64` / `SReal`)
+# ONLY when `nm` is read purely raw in the arm body. If `nm` is captured by a
+# lambda or crosses any boxed use-site the native's non-total load-border does
+# not cover, it stays `SBoxed` — the native cannot synthesise boxing at every
+# use-site the way the C oracle's mode-slave emitter does, so a raw slot whose
+# value reaches a boxed consumer (Perceus `dup`/`drop`, a closure capture, a
+# `kai_intf` tagged dispatch) would hand a bare `i64` where a `KaiValue *` is
+# expected — a segfault the rb-tree never hits but the self-compile does.
+pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, body: Expr) : KSlot / Console =
+  match slot_kind_of(st, cn, idx) {
+    1 -> if binder_read_raw(nm, body) { SInt64 } else { SBoxed }
+    2 -> if binder_read_raw(nm, body) { SReal } else { SBoxed }
+    _ -> SBoxed
+  }
+
+# True iff EVERY use of binder `nm` in `body` is a direct operand of a raw
+# arithmetic / comparison `EBinop` (`k < kx`, `k + 1`) — the only use shape the
+# native lowers to a raw operand with no boxed border. This is STRICTER than
+# the unbox pass's `seed_variant_int_binders` on purpose: the C oracle is
+# mode-slave (it re-boxes a raw binder at every boxed use-site), so it can seed
+# a binder MUnboxed as long as no interp / lambda escapes it and box the rest;
+# the native's boxing border is NOT total, so any use we cannot prove raw
+# (a call arg, a ctor slot, a pipe, an index) must keep the binder boxed or a
+# bare `i64` reaches a `kai_intf` tagged dispatch (a self-compile segfault). A
+# binder used nowhere is trivially raw-safe (`all_uses_raw` is vacuously true),
+# but stays boxed via the `EUnit` sentinel path — a no-op either way.
+fn binder_read_raw(nm: String, body: Expr) : Bool / Console = match body.kind {
+  EUnit -> false
+  _     -> all_uses_raw(nm, body)
+}
+
+# Walk `e`, returning false the moment binder `nm` is read in a position the
+# native does NOT lower raw-safely. The one raw-safe shape is a direct operand
+# of an arithmetic / comparison `EBinop` (`k < kx`, `k + 1`), lowered to an
+# `i`/`f`-family op over raw registers. `EVar(nm)` reached in ANY other
+# position — a call arg (even a variant ctor slot), a pipe, an index — is a
+# boxed use the native's non-total border may not cover, so it forces `SBoxed`.
+# (A ctor-slot use IS lossless in principle, but the reuse-in-place / TRMC
+# rebuild path mishandles a raw binder in a reused Int slot — a separate
+# codegen gap — so ctor args stay conservative here until that lands.)
+fn all_uses_raw(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EVar(n)          -> n != nm
+  EInt(_)          -> true
+  EReal(_, _)      -> true
+  EBinop(op, l, r) ->
+    if binop_is_raw(op) { operand_raw(nm, l) and operand_raw(nm, r) }
+    else { all_uses_raw(nm, l) and all_uses_raw(nm, r) }
+  EUnop(_, x)      -> all_uses_raw(nm, x)
+  EIf(c, t, oe)    -> all_uses_raw(nm, c) and all_uses_raw(nm, t) and opt_uses_raw(nm, oe)
+  EBlock(ss, tl)   -> stmts_uses_raw(nm, ss) and opt_uses_raw(nm, tl)
+  _                -> not expr_mentions(nm, e)
+}
+
+# A raw-arith `EBinop` operand: `EVar(nm)` here IS the raw use we allow;
+# otherwise recurse.
+fn operand_raw(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EVar(_) -> true
+  _       -> all_uses_raw(nm, e)
+}
+
+fn opt_uses_raw(nm: String, oe: Option[Expr]) : Bool / Console = match oe {
+  None    -> true
+  Some(e) -> all_uses_raw(nm, e)
+}
+
+fn stmts_uses_raw(nm: String, ss: [Stmt]) : Bool / Console = match ss {
+  []           -> true
+  [s, ...rest] -> stmt_uses_raw(nm, s) and stmts_uses_raw(nm, rest)
+}
+
+fn stmt_uses_raw(nm: String, s: Stmt) : Bool / Console = match s {
+  SExprStmt(e)    -> all_uses_raw(nm, e)
+  SLet(_, _, rhs) -> all_uses_raw(nm, rhs)
+  _               -> not stmt_mentions(nm, s)
+}
+
+# The arithmetic / comparison operators the native lowers to a raw `i`/`f`
+# family op over raw operands. Anything else (`++`, bit-ops without a raw
+# path) keeps the operand boxed.
+fn binop_is_raw(op: String) : Bool =
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%" or
+  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
+
+# True iff `nm` appears anywhere in `e` (any position). Used to reject a
+# binder that escapes into a sub-expression shape `all_uses_raw` does not
+# model — conservative: an unmodelled mention forces boxed.
+fn expr_mentions(nm: String, e: Expr) : Bool / Console =
+  uses_mention(scan_uses_expr(e, false), nm)
+
+fn stmt_mentions(nm: String, s: Stmt) : Bool / Console =
+  uses_mention(scan_uses_in_stmts([s], false), nm)
+
+fn uses_mention(uses: [Use], nm: String) : Bool = match uses {
+  []           -> false
+  [u, ...rest] -> match u { U(n, _, _, _) -> if n == nm { true } else { uses_mention(rest, nm) } }
+}
+
+# The conservative "no bounded arm body" sentinel — a bind path with no arm
+# body passes this so an Int/Real slot binder stays boxed.
+pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 
 # The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
 # reads as a direct `.ptr` borrow (`KProjBorrow`), the native fast path that
@@ -109,16 +205,16 @@ fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
 # name, so it stays a no-op. The payload-bearing case projects the slot and
 # recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
 # direct sub-binders), the SAME shared bind recursion the record path uses.
-fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console = match sp.pkind {
+fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
   # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
   # every other slot stays the mask-consulting `KProj`. The read op matches the
   # ctor's write layout (both via `variant_slot_kind(te, [])`), so no tagged
   # pointer is ever read raw nor vice versa.
-  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
-  PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, st)
-  PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, st)
-  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, st) }
-  PVariantRecord(_, _) -> bind_nested_slot(cn, sp, scrv, idx, st)
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, body), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
+  PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, body, st)
+  PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, body, st)
+  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, body, st) }
+  PVariantRecord(_, _) -> bind_nested_slot(cn, sp, scrv, idx, body, st)
   _                    -> st
 }
 
@@ -136,16 +232,16 @@ fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
 # variant / record slot is always a kind-0 boxed pointer, so `bind_slot_op`
 # reads it as a direct `.ptr` borrow (the same hot child read the balance
 # rotations perform) rather than the mask-consulting `KProj`.
-fn bind_nested_slot(cn: String, sp: Pattern, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+fn bind_nested_slot(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
-    bind_pattern_fields_any(sp, sub, st1) }
+    bind_pattern_fields_any(sp, sub, body, st1) }
 
 # An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
 # the inner pattern against the SAME projected value.
-fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, st: LowerSt) : LowerSt / Console =
+fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
-    bind_pattern_fields_any(as_inner(sp), sub, st2)
+    bind_pattern_fields_any(as_inner(sp), sub, body, st2)
   } }
 
 # --- bind against an already-extracted value ----------------------------
@@ -155,20 +251,20 @@ fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, s
 # `PVariantRecord` payload binds its fields; a top-level-shaped `PVariant`
 # here arrives only from a context whose tag is settled (the let-bind of a
 # single-ctor type, an as-pattern inner), so its direct subs bind.
-pub fn bind_pattern_fields_any(p: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, v, 0, st)
-  PVariantRecord(_, fields) -> bind_record_subfields(fields, v, st)
-  PRecord(fields)           -> bind_record_subfields(fields, v, st)
+pub fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, v, 0, body, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, v, body, st)
+  PRecord(fields)           -> bind_record_subfields(fields, v, body, st)
   _                         -> st
 }
 
 # Bind the named binding fields of a record / variant-record payload by
 # `kai_op_field` read, recursing into nested sub-patterns. Literal /
 # wildcard fields bind nothing. Mirror of emit_c's `emit_pat_binds_record`.
-fn bind_record_subfields(fields: [PField], v: KVal, st: LowerSt) : LowerSt / Console = match fields {
+fn bind_record_subfields(fields: [PField], v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match fields {
   [] -> st
   [PField(fname, sub, _), ...rest] ->
-    bind_record_subfields(rest, v, bind_field_pattern(fname, sub, v, st))
+    bind_record_subfields(rest, v, body, bind_field_pattern(fname, sub, v, body, st))
 }
 
 # A field whose sub-pattern is a nested VARIANT / VARIANT-RECORD
@@ -177,28 +273,28 @@ fn bind_record_subfields(fields: [PField], v: KVal, st: LowerSt) : LowerSt / Con
 # reading the field and binding the payload's inner names is dominated by a
 # passed tag test. The variant/record/as cases all read the field into a
 # fresh register and recurse through `bind_pattern_fields_any`.
-fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match sub.pkind {
+fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
   PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
-  PRecord(_)           -> bind_field_nested(fname, sub, v, st)
-  PAs(name, _)         -> bind_field_as(fname, name, sub, v, st)
-  PVariant(_, _)       -> bind_field_nested(fname, sub, v, st)
-  PVariantRecord(_, _) -> bind_field_nested(fname, sub, v, st)
+  PRecord(_)           -> bind_field_nested(fname, sub, v, body, st)
+  PAs(name, _)         -> bind_field_as(fname, name, sub, v, body, st)
+  PVariant(_, _)       -> bind_field_nested(fname, sub, v, body, st)
+  PVariantRecord(_, _) -> bind_field_nested(fname, sub, v, body, st)
   _                    -> st
 }
 
 # A nested-record / tag-tested-variant field: read the field into a fresh
 # register (owned `kai_op_field`), then bind the sub-pattern against it
 # through the shared `bind_pattern_fields_any` recursion.
-fn bind_field_nested(fname: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+fn bind_field_nested(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) ->
-    bind_pattern_fields_any(sub, fv, st1) }
+    bind_pattern_fields_any(sub, fv, body, st1) }
 
 # An as-pattern field (`f: name @ inner`): bind the field to `name`, then
 # the inner pattern against the same field value.
-fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) -> {
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
-    bind_pattern_fields_any(as_inner(sub), fv, st2)
+    bind_pattern_fields_any(as_inner(sub), fv, body, st2)
   } }
 
 # --- soundness guard ----------------------------------------------------
