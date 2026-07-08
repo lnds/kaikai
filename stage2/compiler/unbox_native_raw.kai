@@ -1,0 +1,164 @@
+# compiler/unbox_native_raw.kai — the NATIVE-backend strict raw-binder
+# predicate (#1110).
+#
+# The unbox pass (`seed_variant_int_binders`) seeds a kind-1 Int arm binder
+# `MUnboxed` so its reads lower to a raw `i64`. The C oracle's re-box border is
+# TOTAL — it re-boxes a raw value at every tagged consumer — so it can seed a
+# binder raw whenever it is not read via interp / a captured lambda. The NATIVE
+# load-border is NOT total: it re-boxes a raw register only where a value flows
+# through `nemit_load_reg_boxed`, not at every tagged consumer inline. So under
+# the native backend the same binder is raw ONLY in the shapes the native
+# lowers raw-safe, decided here.
+#
+# This is the ONE rawness verdict for a native arm binder: it governs the
+# `unbox` mode, and `bind_slot_kslot` reads that mode for the register's KSlot,
+# so mode and KSlot can never diverge — the classifier drift #1110 traced to
+# two independent verdicts of the same binder's rawness.
+#
+# Split into its own module (not folded into the `unbox.kai` monolith) so the
+# analysis carries its own grade and the import graph stays acyclic: it reads
+# only `compiler.ast`, and `unbox` imports IT.
+
+import compiler.ast
+
+# True iff EVERY use of the kind-1 Int arm binder `nm` in `e` is a shape the
+# native backend lowers raw-safe: an operand of a raw-arith / comparison
+# `EBinop` whose SIBLING operand is itself a raw-Int form (an `EVar` or an Int
+# literal), so the emitter lowers the WHOLE binop raw (`icmp`/`iadd` over two
+# raw i64), never the tagged `kaix_eq` shim that would read `nm` as a
+# `KaiValue *`. This is the READ-side use that drives the rb-tree descent win
+# (`k < kx` → `nemit_proj_slot` reads the key `.i64` inline). Any other use —
+# a call arg, a variant ctor slot, a field read, an index, a pipe, a
+# mixed-operand compare, a nested-match pattern — is boxed on the native's
+# non-total border, so the binder stays boxed. Conservative by exclusion: an
+# unmodelled form forces boxed. STRICTER than the C oracle's mode-slave seeding,
+# which the native's non-total load-border cannot match. (The WRITE-side
+# ctor-slot raw permit — a reuse-in-place rebuild `RBNode(..,kx,..)` — is a
+# separate write-side optimization that still crashes the native self-compile
+# with no reduced repro; it stays boxed here, a #1110 follow-up.)
+pub fn native_arm_binder_raw_safe(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EUnit -> false
+  _     -> nab_uses_ok(nm, e)
+}
+
+fn nab_uses_ok(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EVar(n)          -> n != nm
+  EInt(_)          -> true
+  EReal(_, _)      -> true
+  EBinop(op, l, r) ->
+    if nab_op_is_raw(op) and (nab_is_var(nm, l) or nab_is_var(nm, r)) {
+      nab_operand(nm, l) and nab_operand(nm, r)
+    } else { nab_uses_ok(nm, l) and nab_uses_ok(nm, r) }
+  EUnop(_, x)      -> nab_uses_ok(nm, x)
+  EIf(c, t, oe)    -> nab_uses_ok(nm, c) and nab_uses_ok(nm, t) and nab_opt(nm, oe)
+  EBlock(ss, tl)   -> nab_stmts(nm, ss) and nab_opt(nm, tl)
+  _                -> not nab_mentions(nm, e)
+}
+
+# The arith / comparison operators the native lowers to a raw `i`-family op
+# over raw operands. Kept local (not imported from `unbox`) so the import graph
+# stays acyclic — `unbox` imports this module, not the reverse.
+fn nab_op_is_raw(op: String) : Bool =
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%" or
+  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
+
+# A binop operand: `EVar(nm)` (the raw use) is safe iff its SIBLING is a
+# raw-Int form; a non-`nm` operand must be a raw-Int form too (var / Int lit)
+# for the whole binop to lower raw. Anything else keeps the binder boxed.
+fn nab_operand(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EVar(_)    -> true
+  EInt(_)    -> true
+  EIntLit(_) -> true
+  _          -> nab_uses_ok(nm, e)
+}
+
+fn nab_is_var(nm: String, e: Expr) : Bool = match e.kind { EVar(n) -> n == nm _ -> false }
+fn nab_opt(nm: String, oe: Option[Expr]) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e) }
+fn nab_stmts(nm: String, ss: [Stmt]) : Bool / Console = match ss {
+  []           -> true
+  [s, ...rest] -> nab_stmt(nm, s) and nab_stmts(nm, rest)
+}
+fn nab_stmt(nm: String, s: Stmt) : Bool / Console = match s {
+  SExprStmt(e)    -> nab_uses_ok(nm, e)
+  SLet(_, _, rhs) -> nab_uses_ok(nm, rhs)
+  _               -> not nab_stmt_mentions(nm, s)
+}
+
+# Exhaustive mention walk (every sub-Expr AND nested match patterns) — the
+# conservative catch-all for a form `nab_uses_ok` does not model. Unlike
+# `scan_uses_expr` this descends into arm patterns, so a binder read in a
+# nested match pattern still forces boxed.
+fn nab_mentions(nm: String, e: Expr) : Bool / Console = match e.kind {
+  EVar(n)              -> n == nm
+  ECall(f, xs)         -> nab_mentions(nm, f) or nab_mentions_list(nm, xs)
+  EIntrinsic(_, xs)    -> nab_mentions_list(nm, xs)
+  EField(x, _)         -> nab_mentions(nm, x)
+  EIndex(a, b)         -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EBinop(_, a, b)      -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EUnop(_, x)          -> nab_mentions(nm, x)
+  EBang(x)             -> nab_mentions(nm, x)
+  ELitUnit(x, _)       -> nab_mentions(nm, x)
+  EIf(c, t, oe)        -> nab_mentions(nm, c) or nab_mentions(nm, t) or nab_mentions_opt(nm, oe)
+  EMatch(s, arms)      -> nab_mentions(nm, s) or nab_mentions_arms(nm, arms)
+  ELambda(_, b)        -> nab_mentions(nm, b)
+  ERecordLit(_, fis)   -> nab_mentions_fields(nm, fis)
+  EList(els)           -> nab_mentions_elems(nm, els)
+  ERange(a, b, ob)     -> nab_mentions(nm, a) or nab_mentions(nm, b) or nab_mentions_opt(nm, ob)
+  EBlock(ss, tl)       -> nab_mentions_stmts(nm, ss) or nab_mentions_opt(nm, tl)
+  EPipe(a, b)          -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EMapPipe(a, b)       -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EFlatMapPipe(a, b)   -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EFilterPipe(a, b)    -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  _                    -> false
+}
+fn nab_mentions_list(nm: String, es: [Expr]) : Bool / Console = match es {
+  []        -> false
+  [e, ...r] -> nab_mentions(nm, e) or nab_mentions_list(nm, r)
+}
+fn nab_mentions_opt(nm: String, oe: Option[Expr]) : Bool / Console = match oe {
+  None    -> false
+  Some(e) -> nab_mentions(nm, e)
+}
+fn nab_mentions_arms(nm: String, arms: [Arm]) : Bool / Console = match arms {
+  []        -> false
+  [a, ...r] -> (match a { Arm(p, g, b) -> nab_pat(nm, p) or nab_mentions_opt(nm, g) or nab_mentions(nm, b) }) or nab_mentions_arms(nm, r)
+}
+fn nab_mentions_fields(nm: String, fis: [FieldInit]) : Bool / Console = match fis {
+  []        -> false
+  [f, ...r] -> (match f { FI(_, e) -> nab_mentions(nm, e) }) or nab_mentions_fields(nm, r)
+}
+fn nab_mentions_elems(nm: String, els: [ListElem]) : Bool / Console = match els {
+  []         -> false
+  [el, ...r] -> (match el { ElPlain(e) -> nab_mentions(nm, e) ElSpread(e) -> nab_mentions(nm, e) }) or nab_mentions_elems(nm, r)
+}
+fn nab_mentions_stmts(nm: String, ss: [Stmt]) : Bool / Console = match ss {
+  []        -> false
+  [s, ...r] -> nab_stmt_mentions(nm, s) or nab_mentions_stmts(nm, r)
+}
+fn nab_stmt_mentions(nm: String, s: Stmt) : Bool / Console = match s {
+  SExprStmt(e)                -> nab_mentions(nm, e)
+  SLet(p, _, rhs)             -> nab_pat(nm, p) or nab_mentions(nm, rhs)
+  SVar(_, _, rhs, _, _)       -> nab_mentions(nm, rhs)
+  SAssert(e, oe)              -> nab_mentions(nm, e) or nab_mentions_opt(nm, oe)
+  SIndexAssign(b, i, v, _, _) -> nab_mentions(nm, b) or nab_mentions(nm, i) or nab_mentions(nm, v)
+  _                           -> false
+}
+fn nab_pat(nm: String, p: Pattern) : Bool / Console = match p.pkind {
+  PBind(n)              -> n == nm
+  PLit(e)               -> nab_mentions(nm, e)
+  PList(subs, orest)    -> nab_pats(nm, subs) or (match orest { Some(n) -> n == nm None -> false })
+  PVariant(_, subs)     -> nab_pats(nm, subs)
+  PVariantRecord(_, fs) -> nab_pfields(nm, fs)
+  PRecord(fs)           -> nab_pfields(nm, fs)
+  PAs(n, inner)         -> n == nm or nab_pat(nm, inner)
+  PNarrow(n, _)         -> n == nm
+  _                     -> false
+}
+fn nab_pats(nm: String, ps: [Pattern]) : Bool / Console = match ps {
+  []        -> false
+  [p, ...r] -> nab_pat(nm, p) or nab_pats(nm, r)
+}
+fn nab_pfields(nm: String, fs: [PField]) : Bool / Console = match fs {
+  []        -> false
+  [f, ...r] -> (match f { PField(_, sub, _) -> nab_pat(nm, sub) }) or nab_pfields(nm, r)
+}

@@ -78,107 +78,115 @@ fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
     None      -> 0
   }
 
-# The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at, gated by
-# the SAME predicate the unbox pass (`seed_variant_int_binders`) uses to seed a
-# binder MUnboxed: a kind-1 Int / kind-2 Real slot is raw (`SInt64` / `SReal`)
-# ONLY when `nm` is read purely raw in the arm body. If `nm` is captured by a
-# lambda or crosses any boxed use-site the native's non-total load-border does
-# not cover, it stays `SBoxed` — the native cannot synthesise boxing at every
-# use-site the way the C oracle's mode-slave emitter does, so a raw slot whose
-# value reaches a boxed consumer (Perceus `dup`/`drop`, a closure capture, a
-# `kai_intf` tagged dispatch) would hand a bare `i64` where a `KaiValue *` is
-# expected — a segfault the rb-tree never hits but the self-compile does.
+# The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at. Only a
+# kind-1 Int slot can go raw (`SInt64`): the native variant layout lays ONLY
+# kind-1 Int slots inline (`variant_i64_mask` is Int-only), so a kind-2 Real
+# slot is physically a boxed pointer — reading it raw (`.r` load) would read
+# the pointer bits as an `f64` (garbage). Real slots therefore stay `SBoxed`.
+#
+# A kind-1 Int binder is `SInt64` iff the unbox pass ALREADY seeded it
+# `MUnboxed` (`seed_variant_int_binders`, unbox.kai). That single verdict is
+# authoritative: the emitter obeys the SAME mode when it lowers the binder's
+# uses (an `EBinop` becomes a raw `icmp` because the KIR lowered it raw from
+# the mode; a boxed use re-boxes at the mode-slave border). Re-deriving rawness
+# here with a separate predicate would produce a SECOND verdict that diverges
+# from the mode — a raw register loaded where the KIR planned boxed, or vice
+# versa, the #1110 self-compile SIGSEGV. One discriminant, no desync: `nm` is
+# `SInt64` exactly when its `EVar` reads carry mode `MUnboxed`.
 pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, body: Expr) : KSlot / Console =
   match slot_kind_of(st, cn, idx) {
-    1 -> if binder_read_raw(nm, body) { SInt64 } else { SBoxed }
-    2 -> if binder_read_raw(nm, body) { SReal } else { SBoxed }
+    1 -> if binder_mode_unboxed(nm, body) { SInt64 } else { SBoxed }
     _ -> SBoxed
   }
 
-# True iff EVERY use of binder `nm` in `body` is a direct operand of a raw
-# arithmetic / comparison `EBinop` (`k < kx`, `k + 1`) — the only use shape the
-# native lowers to a raw operand with no boxed border. This is STRICTER than
-# the unbox pass's `seed_variant_int_binders` on purpose: the C oracle is
-# mode-slave (it re-boxes a raw binder at every boxed use-site), so it can seed
-# a binder MUnboxed as long as no interp / lambda escapes it and box the rest;
-# the native's boxing border is NOT total, so any use we cannot prove raw
-# (a call arg, a ctor slot, a pipe, an index) must keep the binder boxed or a
-# bare `i64` reaches a `kai_intf` tagged dispatch (a self-compile segfault). A
-# binder used nowhere is trivially raw-safe (`all_uses_raw` is vacuously true),
-# but stays boxed via the `EUnit` sentinel path — a no-op either way.
-fn binder_read_raw(nm: String, body: Expr) : Bool / Console = match body.kind {
-  EUnit -> false
-  _     -> all_uses_raw(nm, body)
+# True iff an `EVar(nm)` read in `body` carries mode `MUnboxed` — the unbox
+# pass's raw verdict for this binder (`seed_variant_int_binders`). Every
+# `EVar(nm)` shares the one mode the pass seeded into the arm env, so the first
+# one found decides. A binder never read (`EUnit` sentinel, or a bind with no
+# arm body) is not raw — it stays boxed, a no-op either way.
+fn binder_mode_unboxed(nm: String, body: Expr) : Bool / Console = match evar_mode(nm, body) {
+  Some(m) -> match m { MUnboxed -> true _ -> false }
+  None    -> false
 }
 
-# Walk `e`, returning false the moment binder `nm` is read in a position the
-# native does NOT lower raw-safely. The one raw-safe shape is a direct operand
-# of an arithmetic / comparison `EBinop` (`k < kx`, `k + 1`), lowered to an
-# `i`/`f`-family op over raw registers. `EVar(nm)` reached in ANY other
-# position — a call arg (even a variant ctor slot), a pipe, an index — is a
-# boxed use the native's non-total border may not cover, so it forces `SBoxed`.
-# (A ctor-slot use IS lossless in principle, but the reuse-in-place / TRMC
-# rebuild path mishandles a raw binder in a reused Int slot — a separate
-# codegen gap — so ctor args stay conservative here until that lands.)
-fn all_uses_raw(nm: String, e: Expr) : Bool / Console = match e.kind {
-  EVar(n)          -> n != nm
-  EInt(_)          -> true
-  EReal(_, _)      -> true
-  EBinop(op, l, r) ->
-    if binop_is_raw(op) { operand_raw(nm, l) and operand_raw(nm, r) }
-    else { all_uses_raw(nm, l) and all_uses_raw(nm, r) }
-  EUnop(_, x)      -> all_uses_raw(nm, x)
-  EIf(c, t, oe)    -> all_uses_raw(nm, c) and all_uses_raw(nm, t) and opt_uses_raw(nm, oe)
-  EBlock(ss, tl)   -> stmts_uses_raw(nm, ss) and opt_uses_raw(nm, tl)
-  _                -> not expr_mentions(nm, e)
+# The mode of the first `EVar(nm)` reached in `e` (any position), or None if
+# `nm` is not read. Walks every sub-Expr AND nested match patterns / stmts so
+# the search never misses a use behind a form `scan_uses_expr` skips.
+fn evar_mode(nm: String, e: Expr) : Option[ValueMode] / Console = match e.kind {
+  EVar(n)              -> if n == nm { Some(e.mode) } else { None }
+  ECall(f, xs)         -> em_first(evar_mode(nm, f), em_exprs(nm, xs))
+  EIntrinsic(_, xs)    -> em_exprs(nm, xs)
+  EField(x, _)         -> evar_mode(nm, x)
+  EIndex(a, b)         -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EBinop(_, a, b)      -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EUnop(_, x)          -> evar_mode(nm, x)
+  EBang(x)             -> evar_mode(nm, x)
+  ELitUnit(x, _)       -> evar_mode(nm, x)
+  EIf(c, t, oe)        -> em_first(evar_mode(nm, c), em_first(evar_mode(nm, t), em_opt(nm, oe)))
+  EMatch(s, arms)      -> em_first(evar_mode(nm, s), em_arms(nm, arms))
+  ELambda(_, b)        -> evar_mode(nm, b)
+  ERecordLit(_, fis)   -> em_fields(nm, fis)
+  EList(els)           -> em_elems(nm, els)
+  ERange(a, b, ob)     -> em_first(evar_mode(nm, a), em_first(evar_mode(nm, b), em_opt(nm, ob)))
+  EBlock(ss, tl)       -> em_first(em_stmts(nm, ss), em_opt(nm, tl))
+  EPipe(a, b)          -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EMapPipe(a, b)       -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EFlatMapPipe(a, b)   -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EFilterPipe(a, b)    -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EHandle(b, _, _, io, _, cls, ro) -> em_first(evar_mode(nm, b), em_first(em_opt(nm, io), em_first(em_clauses(nm, cls), em_ret(nm, ro))))
+  _                    -> None
 }
 
-# A raw-arith `EBinop` operand: `EVar(nm)` here IS the raw use we allow;
-# otherwise recurse.
-fn operand_raw(nm: String, e: Expr) : Bool / Console = match e.kind {
-  EVar(_) -> true
-  _       -> all_uses_raw(nm, e)
+fn em_first(a: Option[ValueMode], b: Option[ValueMode]) : Option[ValueMode] = match a { Some(_) -> a None -> b }
+fn em_exprs(nm: String, es: [Expr]) : Option[ValueMode] / Console = match es {
+  []           -> None
+  [e, ...rest] -> em_first(evar_mode(nm, e), em_exprs(nm, rest))
 }
-
-fn opt_uses_raw(nm: String, oe: Option[Expr]) : Bool / Console = match oe {
-  None    -> true
-  Some(e) -> all_uses_raw(nm, e)
+fn em_opt(nm: String, oe: Option[Expr]) : Option[ValueMode] / Console = match oe { None -> None Some(e) -> evar_mode(nm, e) }
+fn em_arms(nm: String, arms: [Arm]) : Option[ValueMode] / Console = match arms {
+  []           -> None
+  [a, ...rest] -> em_first(match a { Arm(p, g, b) -> em_first(em_pat(nm, p), em_first(em_opt(nm, g), evar_mode(nm, b))) }, em_arms(nm, rest))
 }
-
-fn stmts_uses_raw(nm: String, ss: [Stmt]) : Bool / Console = match ss {
-  []           -> true
-  [s, ...rest] -> stmt_uses_raw(nm, s) and stmts_uses_raw(nm, rest)
+fn em_fields(nm: String, fis: [FieldInit]) : Option[ValueMode] / Console = match fis {
+  []           -> None
+  [f, ...rest] -> em_first(match f { FI(_, e) -> evar_mode(nm, e) }, em_fields(nm, rest))
 }
-
-fn stmt_uses_raw(nm: String, s: Stmt) : Bool / Console = match s {
-  SExprStmt(e)    -> all_uses_raw(nm, e)
-  SLet(_, _, rhs) -> all_uses_raw(nm, rhs)
-  _               -> not stmt_mentions(nm, s)
+fn em_elems(nm: String, els: [ListElem]) : Option[ValueMode] / Console = match els {
+  []           -> None
+  [el, ...rest] -> em_first(match el { ElPlain(e) -> evar_mode(nm, e) ElSpread(e) -> evar_mode(nm, e) }, em_elems(nm, rest))
 }
-
-# The arithmetic / comparison operators the native lowers to a raw `i`/`f`
-# family op over raw operands. Anything else (`++`, bit-ops without a raw
-# path) keeps the operand boxed.
-fn binop_is_raw(op: String) : Bool =
-  op == "+" or op == "-" or op == "*" or op == "/" or op == "%" or
-  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
-
-# True iff `nm` appears anywhere in `e` (any position). Used to reject a
-# binder that escapes into a sub-expression shape `all_uses_raw` does not
-# model — conservative: an unmodelled mention forces boxed.
-fn expr_mentions(nm: String, e: Expr) : Bool / Console =
-  uses_mention(scan_uses_expr(e, false), nm)
-
-fn stmt_mentions(nm: String, s: Stmt) : Bool / Console =
-  uses_mention(scan_uses_in_stmts([s], false), nm)
-
-fn uses_mention(uses: [Use], nm: String) : Bool = match uses {
-  []           -> false
-  [u, ...rest] -> match u { U(n, _, _, _) -> if n == nm { true } else { uses_mention(rest, nm) } }
+fn em_stmts(nm: String, ss: [Stmt]) : Option[ValueMode] / Console = match ss {
+  []           -> None
+  [s, ...rest] -> em_first(em_stmt(nm, s), em_stmts(nm, rest))
+}
+fn em_stmt(nm: String, s: Stmt) : Option[ValueMode] / Console = match s {
+  SExprStmt(e)                -> evar_mode(nm, e)
+  SLet(p, _, rhs)             -> em_first(em_pat(nm, p), evar_mode(nm, rhs))
+  SVar(_, _, rhs, _, _)       -> evar_mode(nm, rhs)
+  SAssert(e, oe)              -> em_first(evar_mode(nm, e), em_opt(nm, oe))
+  SIndexAssign(b, i, v, _, _) -> em_first(evar_mode(nm, b), em_first(evar_mode(nm, i), evar_mode(nm, v)))
+  _                           -> None
+}
+fn em_clauses(nm: String, cls: [HClause]) : Option[ValueMode] / Console = match cls {
+  []           -> None
+  [c, ...rest] -> em_first(match c { HC(_, _, b, _, _) -> evar_mode(nm, b) }, em_clauses(nm, rest))
+}
+fn em_ret(nm: String, ro: Option[HReturn]) : Option[ValueMode] / Console = match ro {
+  None     -> None
+  Some(hr) -> match hr { HR(_, b, _, _) -> evar_mode(nm, b) }
+}
+# A pattern mentioning `nm` is a re-BIND (shadow) or a literal read; either way
+# the mode carried in the pattern is not an `Expr.mode`, so patterns contribute
+# no mode. Its only role is that a nested match still gets its body/guards
+# walked (above); the pattern itself yields None.
+fn em_pat(nm: String, p: Pattern) : Option[ValueMode] / Console = match p.pkind {
+  PLit(e) -> evar_mode(nm, e)
+  _       -> None
 }
 
 # The conservative "no bounded arm body" sentinel — a bind path with no arm
-# body passes this so an Int/Real slot binder stays boxed.
+# body passes this so an Int/Real slot binder stays boxed (`evar_mode` finds no
+# `EVar` in the `EUnit` body → None → `SBoxed`).
 pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 
 # The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
