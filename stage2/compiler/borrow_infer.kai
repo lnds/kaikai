@@ -48,62 +48,44 @@ fn binf_uses_ok(self_name: String, nm: String, i: Int, e: Expr) : Bool =
   binf_kind_ok(self_name, nm, i, e.kind)
 
 fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match k {
-  # Inspection: `nm` as a bare scrutinee is fine at ANY arm shape — the
-  # children the arms bind are increfed at the bind (owned flow), so no
-  # component of `nm` escapes borrowed. `nm` inside a non-bare scrutinee,
-  # or anywhere in an arm body/guard, must itself stay borrowable.
-  EMatch(s, arms) -> {
-    # A scrutinee whose arms REBUILD a constructor is a reuse-in-place
-    # candidate (the matched cell is stolen for the rebuild — rb-tree
-    # balance/insert), and a scrutinee deconstructed by a LIST pattern with a
-    # rest-binder (`[h, ...t]`) has its spine consumed cell-by-cell as the
-    # loop advances `t` (map/filter/fold). Both want OWNERSHIP — borrow is a
-    # read/HOF lever, not a reuse or spine-consume lever. Disqualify `nm` as
-    # the bare scrutinee of either shape.
-    let reuse_target = match s.kind {
-      EVar(u) -> u == nm and (binf_arms_rebuild_ctor(arms) or binf_arms_list_deconstruct(arms))
-      _       -> false
-    }
-    if reuse_target { false }
-    else {
-      let scr_ok = match s.kind {
-        EVar(u) -> true
-        _       -> binf_uses_ok(self_name, nm, i, s)
-      }
-      scr_ok and binf_arms_ok(self_name, nm, i, arms)
-    }
-  }
-  # Callee position: `nm(...)` reads `nm` to invoke it. A call to a TOP-LEVEL
-  # fn (`c` a known symbol) reads nothing of `nm` at the callee. A call whose
-  # callee IS `nm` is an INDIRECT `call_ind` on a closure param — the runtime
-  # CONSUMES the closure at the call (no `call_ind_borrow` variant), so it
-  # takes ownership and `nm` is NOT borrowable through it. The args must stay
-  # borrowable; a self-call passing `nm` at its own position `i` is
-  # borrow-through.
+  # Inspection: `nm` as a bare scrutinee (arms incref the children they bind,
+  # so no component escapes borrowed). Split out — it is the one arm with a
+  # reuse/spine-consume disqualifier.
+  EMatch(s, arms)     -> binf_match_ok(self_name, nm, i, s, arms)
+  # Callee position. A call whose callee IS `nm` is an INDIRECT `call_ind` on
+  # a closure param — the runtime CONSUMES it (no `call_ind_borrow`), so `nm`
+  # is not borrowable through it. A self-call passing `nm` at its own
+  # position `i` is borrow-through (see binf_call_ok).
   ECall(f, xs) -> match f.kind {
     EVar(c)        -> if c == nm { false } else { binf_call_ok(self_name, nm, i, c, xs) }
     EModCall(_, c) -> binf_call_ok(self_name, nm, i, c, xs)
     _              -> binf_uses_ok(self_name, nm, i, f) and binf_args_ok(self_name, nm, i, xs)
   }
   EIntrinsic(_, xs)   -> binf_args_ok(self_name, nm, i, xs)
-  # A bare read that is NOT a scrutinee nor a callee = an owned use
-  # (returned, bound to a let that owns it). Disqualify.
+  # A bare read that is NOT a scrutinee nor a callee = an owned use. Field
+  # read / index base / lambda capture of `nm` = owned. Disqualify.
   EVar(u)             -> u != nm
-  # Field read of `nm` = owned (the record is projected, taking the field's
-  # ref which the caller must have dup'd). Disqualify if `nm` appears.
   EField(x, _)        -> binf_absent(nm, x)
   EIndex(a, b)        -> binf_absent(nm, a) and binf_uses_ok(self_name, nm, i, b)
+  EBlock(stmts, tail) -> binf_stmts_ok(self_name, nm, i, stmts) and binf_opt_ok(self_name, nm, i, tail)
+  # Capture by a lambda = owned. Stored in a ctor/record/list slot = owned.
+  ELambda(_, b)       -> binf_absent(nm, b)
+  ERecordLit(_, fis)  -> binf_absent_fields(nm, fis)
+  EList(els)          -> binf_absent_elems(nm, els)
+  # Interpolation reads and handlers are owned (conservative).
+  EStr(_, _)          -> false
+  EHandle(_, _, _, _, _, _, _) -> false
+  # Transparent forms: `nm` stays borrowable iff it does in every child.
+  _                   -> binf_transparent_ok(self_name, nm, i, k)
+}
+
+# Forms that neither consume nor store `nm` — it stays borrowable iff every
+# sub-expression keeps it borrowable. Leaves (literals) never reference `nm`.
+fn binf_transparent_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match k {
   EBinop(_, a, b)     -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
   EUnop(_, x)         -> binf_uses_ok(self_name, nm, i, x)
   EIf(c, t, oe)       -> binf_uses_ok(self_name, nm, i, c) and
-                          binf_uses_ok(self_name, nm, i, t) and
-                          binf_opt_ok(self_name, nm, i, oe)
-  EBlock(stmts, tail) -> binf_stmts_ok(self_name, nm, i, stmts) and binf_opt_ok(self_name, nm, i, tail)
-  # Capture by a lambda = owned (the closure holds `nm` past the call).
-  ELambda(_, b)       -> binf_absent(nm, b)
-  # Stored in a constructor/record/list slot = owned. Disqualify if present.
-  ERecordLit(_, fis)  -> binf_absent_fields(nm, fis)
-  EList(els)          -> binf_absent_elems(nm, els)
+                          binf_uses_ok(self_name, nm, i, t) and binf_opt_ok(self_name, nm, i, oe)
   ERange(a, b, oe)    -> binf_uses_ok(self_name, nm, i, a) and
                           binf_uses_ok(self_name, nm, i, b) and binf_opt_ok(self_name, nm, i, oe)
   EPipe(a, b)         -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
@@ -112,9 +94,24 @@ fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = mat
   EFilterPipe(a, b)   -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
   EBang(x)            -> binf_uses_ok(self_name, nm, i, x)
   ELitUnit(x, _)      -> binf_uses_ok(self_name, nm, i, x)
-  EStr(_, _)          -> false   # interpolation reads are owned (conservative)
-  EHandle(_, _, _, _, _, _, _) -> false   # handlers are owned (conservative)
-  _                   -> true    # leaves never reference nm
+  _                   -> true
+}
+
+# `nm` as a bare scrutinee whose arms REBUILD a constructor (rb-tree
+# balance/insert reuse) or DECONSTRUCT a list with a rest-binder (map/filter
+# spine, consumed cell-by-cell) wants OWNERSHIP — borrow is a read/HOF lever,
+# not a reuse or spine-consume lever, so `nm` is disqualified there. A
+# non-bare scrutinee, and every arm body/guard, must stay borrowable.
+fn binf_match_ok(self_name: String, nm: String, i: Int, s: Expr, arms: [Arm]) : Bool = {
+  let reuse_target = match s.kind {
+    EVar(u) -> u == nm and (binf_arms_rebuild_ctor(arms) or binf_arms_list_deconstruct(arms))
+    _       -> false
+  }
+  if reuse_target { false }
+  else {
+    let scr_ok = match s.kind { EVar(_) -> true  _ -> binf_uses_ok(self_name, nm, i, s) }
+    scr_ok and binf_arms_ok(self_name, nm, i, arms)
+  }
 }
 
 # A call `c(xs)`. If `c` is the self function, `nm` at its OWN position `i`
@@ -261,15 +258,20 @@ fn binf_var_present_k(nm: String, k: ExprKind) : Bool = match k {
   ECall(f, xs)        -> binf_var_present(nm, f) or binf_any_present(nm, xs)
   EIntrinsic(_, xs)   -> binf_any_present(nm, xs)
   EField(x, _)        -> binf_var_present(nm, x)
-  EIndex(a, b)        -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EBinop(_, a, b)     -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EUnop(_, x)         -> binf_var_present(nm, x)
-  EIf(c, t, oe)       -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
   EMatch(s, arms)     -> binf_var_present(nm, s) or binf_present_arms(nm, arms)
   EBlock(stmts, tail) -> binf_present_stmts(nm, stmts) or binf_present_opt(nm, tail)
   ELambda(_, b)       -> binf_var_present(nm, b)
   ERecordLit(_, fis)  -> binf_present_fields(nm, fis)
   EList(els)          -> binf_present_elems(nm, els)
+  _                   -> binf_present_transparent(nm, k)
+}
+
+# The binary/unary transparent forms — `nm` present iff present in any child.
+fn binf_present_transparent(nm: String, k: ExprKind) : Bool = match k {
+  EIndex(a, b)        -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EBinop(_, a, b)     -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EUnop(_, x)         -> binf_var_present(nm, x)
+  EIf(c, t, oe)       -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
   ERange(a, b, oe)    -> binf_var_present(nm, a) or binf_var_present(nm, b) or binf_present_opt(nm, oe)
   EPipe(a, b)         -> binf_var_present(nm, a) or binf_var_present(nm, b)
   EMapPipe(a, b)      -> binf_var_present(nm, a) or binf_var_present(nm, b)
