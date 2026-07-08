@@ -211,22 +211,84 @@ that isolation; the kind would add nothing a wrapper does not.
 ## Habitants — the introducer and its policy
 
 `with <introducer>` gives the keyword that declares the kind's habitants. **One
-introducer word declares exactly one kind** — there is no default kind and no
-disambiguation rule. `unit` always means `Measure`; `metric` (from
-`kind Metric : AbelianGroup with metric`) always means `Metric`. The word *is* the
-kind:
+introducer word declares habitants of exactly one kind** — the introducer *is* the
+kind at the declaration site. `unit m` declares `m` in `Measure`; `metric meter`
+(from `kind Metric : AbelianGroup with metric`) declares `meter` in `Metric`:
 
 ```kaikai
-unit m                                          # unit ⇒ Measure, always
-kind Metric : AbelianGroup with metric
-metric meter                                    # metric ⇒ Metric, always
+kind Measure  : AbelianGroup with unit
+kind Metric   : AbelianGroup with metric
+
+unit m                                          # m declared in Measure
+metric meter                                    # meter declared in Metric
 ```
 
-This is why `unit` never had to disambiguate before and never will: it is Measure's
-exclusive introducer. A new kind brings its own introducer word (you name it in the
-`with`), so `metric meter` and `unit m` are never ambiguous. The cost — one new word
-per kind — buys zero ambiguity and zero magic default; the word carries domain
-meaning (`metric`, `imperial`, `currency`, `perm`).
+**A habitant *symbol* may live in more than one kind.** The introducer disambiguates
+at the *declaration* site, but the same word can be declared through different
+introducers into different kinds — `unit USD` and `cur USD` (from
+`kind Currency : AbelianGroup with cur`) are two distinct habitants that happen to
+share the symbol `USD`. This is deliberate: a currency is a legitimate `Measure`
+habitant *and* can be a `Currency` habitant, depending on which algebra the user
+wants at a given site. Resolution at the *use* site is the next section.
+
+`unit` is no longer special — it is `Measure`'s registered introducer, exactly as
+`metric`/`cur` are their kinds'. (Today `unit` is still a hard keyword; the v2+
+direction is to make it an introducer registered by the kind declaration, like every
+other introducer, so it stops being a keyword. See *Open questions*.)
+
+## Habitant resolution at the use site
+
+A habitant symbol in `<>` (`Real<USD>`) must resolve to exactly one kind. When the
+symbol lives in only one kind, that is the answer. When it lives in several
+(`unit USD` *and* `cur USD`), resolution follows a fixed precedence — no magic, no
+order-dependence:
+
+```kaikai
+kind Currency : AbelianGroup with cur
+kind Measure  : AbelianGroup with unit
+
+unit USD                                   # USD in Measure
+cur  USD                                   # USD ALSO in Currency
+
+# 1. Explicit qualification wins — Kind.habitant (or introducer.habitant):
+let a : Real<Currency.USD> = 10.0<Currency.USD>    # unambiguous → Currency
+let b : Real<cur.USD>      = 10.0<cur.USD>         # introducer form, same effect
+
+# 2. `use kind` sets the module default for a bare habitant:
+use kind Currency
+let c : Real<USD> = 10.0<USD>              # bare USD ⇒ Currency (the used kind)
+
+# 3. No qualification, no `use kind`, and the symbol is AMBIGUOUS:
+let d : Real<USD> = 10.0<USD>              # ✗ ERROR: `USD` is declared in
+                                           #   Currency and Measure — qualify
+                                           #   (Currency.USD) or `use kind`.
+```
+
+**The precedence: qualification `>` `use kind` `>` unique-symbol.** If none of the
+first three resolve a multi-kind symbol, it is a **compile error demanding
+disambiguation** — never a silent "last declared wins". Order-of-declaration must
+NOT change a program's meaning; a bare `<USD>` that is ambiguous is rejected, not
+guessed. This is the same discipline kaikai already applies to ambiguous module
+names, and it keeps the surface decidable and surprise-free (Tier 1 #3, and the
+"few forms, clear intent" rule).
+
+**Why symbols may collide across kinds — the `USD/kWh` case.** Money and physical
+units must be able to compose: `USD/kWh` (energy price), `USD/km` (freight),
+`USD/hour` (wage) are legitimate — `(USD/kWh) * kWh = USD` must type-check. That only
+works if `USD` and `kWh` inhabit the **same** abelian kind, so their algebra
+cancels. So a user who needs money-with-physics declares both in `Measure`
+(`unit USD`, `unit kWh` → they compose). A user who wants money *isolated* from
+physics declares `USD` in a separate `Currency` kind — then `USD` (Currency) does NOT
+cancel against `kWh` (Measure), which is correct if that isolation is the intent. The
+kind a symbol lives in is a user choice about *which algebra it participates in*; the
+resolution rules above just make that choice legible at each use site.
+
+> **Contrast with strict isolation (Metric/Imperial).** `meter + foot` is always a
+> bug, so `meter` (Metric) and `foot` (Imperial) live in separate kinds and never
+> unify — no `use kind` makes them compose. The difference from `USD`/`kWh` is
+> intent: cross-kind composition is *legitimate* for money+physics (same kind) and
+> *always wrong* for metric+imperial (separate kinds). See *When to separate two
+> abelian kinds* below.
 
 Two properties of each habitant set fall out of the **kind** (not always the
 theory):
@@ -337,10 +399,14 @@ Four pieces, each with one job.
 
 A user type over a kind has **two** parameters of different natures, in different brackets:
 
-- **`[T]`** — an ordinary **type** parameter (`[]`, exactly like `Option[T]`). The `[]` list
-  holds ONLY `Type` params (the carrier), with **no protocol bound** (see next). By convention
-  name it `T` uppercase, as the stdlib does. It is the type the value is built from:
-  `Money[Real]`, `Money[Decimal]`, `Matrix[BigInt]`.
+- **`[Carrier]`** — an ordinary **type** parameter (`[]`, exactly like `Option[T]`). The `[]`
+  list holds ONLY `Type` params (the carrier), with **no protocol bound** (see next). Its
+  *name* is a plain convention — but a meaningful convention: name it for what the theory
+  expects, not a bare `T`. Money's carrier is a number, so name it `Num`
+  (`type Money[Num]<Currency>`); a bare `T` reads as "anything" and hides the intent. The name
+  is documentation, not a bound — the compiler enforces the numeric requirement through the
+  theory (below), the name just makes it legible. It is the type the value is built from:
+  `Money[Decimal]`, `Money[BigInt]`, `Matrix[Real]`.
 - **`<habitant>`** — the kind **habitant** (`<>`, exactly like `Real<m>`). A currency or a
   dimension is **not a type** — it is a classifying habitant, so it goes in `<>`. Kinds go in
   `<>`, never in `[]`; only `Type` goes in `[]`.
@@ -348,47 +414,41 @@ A user type over a kind has **two** parameters of different natures, in differen
 `Money[Decimal]<USD>` reads "money with carrier `Decimal`, currency `USD`". The two axes are
 independent: the carrier is a plain generic in `[]`, the habitant is the kind marker in `<>`.
 This is what lets a kind habitant live on a **library/user type** (`Money`) without the unit
-machinery being wired to native heads — the number enters as an ordinary `[T]` generic, and
+machinery being wired to native heads — the number enters as an ordinary carrier generic, and
 only the wrapper type (`Money`, `Matrix`) carries the `<>`.
 
 ```kaikai
-type Money[T]<Currency> = { amount: T }
+type Money[Num]<Currency> = { amount: Num }
 fn sum(a, v : Money[Real]<USD>) = a + v          # a inferred Money[Real]<USD>; a+v needs same currency+carrier
 ```
 
-### No protocol bound on the carrier — monomorphisation is the gate
+### No protocol bound on the carrier — the theory restricts it
 
-The carrier `[T]` carries **no** protocol bound. Protocol bounds on a `type`/record declaration
-are NOT valid — `type M[T: Add]` is a parse error ("type-parameter kind must be `Type` or
-`Measure`"). (Free *functions* DO accept bounds since #877 — `fn sum[T: Numeric](...)` — but a
-`type` decl does not; and even on functions the bound is not yet enforced at the call site, see
-issue tracking that gap. Either way, the kind carrier `[T]` takes no bound.) The old
-`[u: Measure]` form is different (`Measure` was a *kind*, not a protocol) and is superseded here:
-kinds go in `<>`, only `Type` in `[]`.
+The carrier takes **no** protocol bound in the surface. `type M[Num: Add]` is a parse error
+("type-parameter kind must be `Type` or `Measure`") — a bound on a `type` declaration is the
+Haskell constraint-propagation the language vetoes (a `Num: Add` would travel with every
+signature that touches `M[Num]`). So the carrier is named for intent (`Num`), not bounded.
 
-So how is "the carrier must be summable" enforced without a bound? **By monomorphisation, in
-the USE, not the signature — it does not propagate.** Verified:
+But `Money[String]<USD>` must not be a valid type — a string is not money. The requirement
+"the carrier is a number" is real; it just does not live as a bound on the declaration. **It
+lives in the theory.** `Module` is "additive group + scalar-from-a-ring", so its carrier/scalar
+must support the ring operations by the theory's own definition. A kind over `Module`
+therefore validates its carrier **at construction, per concrete instantiation**: `Money[Int]<USD>`
+checks that `Int` provides what `Module` requires (it does → ✓); `Money[String]<USD>` checks
+`String` (it does not → **error at construction**, not a deferred failure-on-use).
 
-- `Money[String]<USD>` *constructs* (kaikai does not check the carrier at type declaration). But
-  it is **inert**: any monetary op fails at compile time — `money + money` on a `String` carrier
-  gives `error: no impl of Add for type String`, because monomorphisation specialises the op per
-  concrete carrier and checks the impl-table there. A `Money[String]` is a dead type that never
-  reaches runtime — exactly as `List[T]` accepts any `T` and fails when you use an unsupported
-  op. NOT special to Money.
-- A generic `fn combine[T](a: Money[T], b: Money[T]) = a.amount.add(b.amount)` compiles even
-  though `T` may lack `Add` — kaikai does NOT verify the abstract `T`; it waits for the concrete
-  instance (`combine[Int]` checks `Int.add`, `combine[String]` errors on `.add`). The sharp line
-  vs Haskell: NO constraint travels with the signature; the check is local per monomorphised
-  instance. **`concrete ⇒ check locally / variable ⇒ wait for the instance`** — the same
-  discipline as literal minting.
+The sharp line vs Haskell: this validation is **local and non-propagating**. It is an
+`impl`-table check at the concrete construction site — the same `concrete ⇒ check locally /
+variable ⇒ wait for the instance` discipline as literal minting. No constraint travels with a
+signature; a generic `fn combine[C](a: Money[C], b: Money[C])` still waits for the concrete `C`
+(and the theory's carrier check fires when `C` is pinned), rather than propagating a `C: Numeric`
+up the call graph. So the theory gives what a bound would — `Money[String]` is impossible — without
+the constraint resolution Tier 1 #3 rejects.
 
-So `Money[String]` is constructible-but-inert (the accepted price of "no typeclasses"): it never
-does harm, and forbidding it *in construction* would need the kind to validate its carrier — a
-local `impl`-table check per concrete instantiation (no constraint propagation), DEFERRED because
-monomorphisation already rejects any real use. And there is **no algebraic-protocol hierarchy**
-(`Numeric extends Ring…` = Haskell superclasses, vetoed): the fat `Numeric` protocol (only
-Int/Real/Decimal implement it) is never the gate; overlapping small protocols (`Add` on every
-numeric carrier) plus per-instance monomorphisation cover it.
+And there is **no algebraic-protocol hierarchy** (`Numeric extends Ring…` = Haskell superclasses,
+vetoed): the theory names the operations its carrier must support (via the closed property menu),
+not a subclass chain. Overlapping small protocols (`Add`, `Mul` on each numeric carrier) are what
+the theory's carrier check consults, per concrete instance.
 
 ### `over R` — the second domain (present iff the structure crosses two type domains)
 
@@ -402,6 +462,17 @@ the operation crosses. Present exactly when the theory has two domains, absent o
   by naming a scalar distinct from `[T]`; Money simply reuses `T`. Either way `over` is what
   marks the second domain, and (like the carrier) carries no protocol bound — monomorphisation
   checks the scalar's ops per concrete instance.
+
+  > **Why not `kind Currency[T: Numeric] : Module over T`?** A module mathematically
+  > *requires* its scalar to be a ring, so it is tempting to spell that as a bound on the
+  > kind. Don't: that predicate belongs to the **theory**, not the kind declaration. `Module`
+  > *is* "additive group + scalar-from-a-ring" by construction — the `scale` property has no
+  > meaning without a ring to draw scalars from, so the ring requirement is baked into the
+  > theory. A `[T: Numeric]` on the kind would (a) be redundant with what `Module` already
+  > guarantees and (b) reintroduce exactly the constraint-propagation the carrier rule forbids
+  > — a bound that travels with the signature, the Haskell line Tier 1 #3 rejects. The scalar's
+  > ring-ness is enforced the same way the carrier's summability is: monomorphisation at the
+  > use, not a bound on the declaration. `Money[String]<USD>` constructs but cannot scale.
 - `Composition` (Layout, Waterfall): elements (fields/tranches) **and** a summed **measure**
   (a number). `over Int` (Layout, byte sizes) / `over Rational` (Waterfall, exact %s). Here
   `over` names the measure type, an additive second domain, not a multiplicative scalar.
@@ -539,9 +610,12 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-`meter` and `foot` are bare units in `<>` — there is no `Metric.meter` qualification;
-the kind is carried by the unit's declaration, not by the use site. `kind` appears
-only in the two declaration lines.
+Here `meter` and `foot` each live in exactly one kind, so a bare `<meter>` resolves
+by the unique-symbol rule with no qualification needed. Qualification
+(`<Metric.meter>`) and `use kind Metric` are still *available* — they are how a use
+site disambiguates when a symbol is shared across kinds (see *Habitant resolution at
+the use site*) — but for a symbol that is unique to one kind they are optional. `kind`
+appears only in the two declaration lines.
 
 ## Implementation cost (measured by spike, 2026-07-05)
 
@@ -618,6 +692,17 @@ user-assemblable from the property menu), so it is first-class, not hidden plumb
   contextual-keyword mechanism, populated by the `kind … with intro` declarations read
   so far — a stateful table in the LL(1) parser (precedent: `opaque`/`region`, but
   those are not stateful). This is the delicate piece the spike flagged.
+- **`unit` should stop being a keyword.** It is `Measure`'s introducer, so once the
+  stateful introducer table above exists, `unit` becomes a registered introducer like
+  `metric`/`cur` — not a hard keyword. v1 keeps `unit` as `TkUnitKw` (no introducer
+  machinery yet); the v2+ direction removes the keyword. North star, not v1 scope.
+- **`use kind Kind`** — the module-level default for bare habitants (see *Habitant
+  resolution*). This extends the **existing** `use` keyword: `use Clock` already
+  "opens ops for bare names" (`kai info syntax`), so `use kind Currency` opens a
+  kind's habitants for bare `<>` names by the same mechanism — not a new form. The
+  open piece is wiring the kind-default into the `<>` habitant resolver. Only needed
+  once a symbol is shared across kinds (Currency + Measure), so it can land with the
+  multi-kind work, not before.
 - Whether user-assembled theories (`theory Mine = { assoc, commut, idempotent }`)
   ship in the first cut or are deferred — the mechanism (closed property menu +
   decidable-combination check) is designed, but the standard aliases cover the known
