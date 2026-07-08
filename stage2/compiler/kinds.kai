@@ -1,0 +1,294 @@
+#[doc("""
+compiler.kinds — the per-file kind registry.
+
+A `kind K : AbelianGroup with intro` declaration names an abelian kind
+`K` and the word `intro` that declares its habitants (`metric m`). The
+introducer is a user-chosen identifier, so the LL(1) dispatch cannot
+know it without first seeing every kind declaration. A cheap linear
+pre-scan over the already-lexed token stream collects the
+`intro -> K` map before any body is parsed; the parser then recognises
+a habitant declaration by set membership, order-independently.
+
+The built-in `Measure` kind (introducer `unit`) is always present so
+`unit m` resolves through the same path.
+
+Depends only on lex + ast (never on parse), so the parser can import it
+without a cycle: token kinds are compared through `tk_name`, and the
+token source is sliced locally.
+""")]
+
+import compiler.util
+import compiler.lex
+import compiler.ast
+
+# One `intro -> kind` binding from a `kind K : Thy with intro` decl.
+# `intro` is the habitant-introducer word; `kind` is the kind's name.
+pub type KindIntro = KI(String, String)
+#                       intro   kind
+
+# Kind registry for one file: every declared `intro -> kind` binding,
+# built-in `Measure`/`unit` included. Read-only once built.
+pub type KindReg = KReg([KindIntro])
+
+fn ki_intro(k: KindIntro) : String = match k { KI(i, _) -> i }
+fn ki_kind(k: KindIntro) : String = match k { KI(_, n) -> n }
+
+# --- type-parameter kind decoders (encode side is tp_make in parse) ---
+# A `[u: Measure]` param encodes as `u#Unit`; a `[u: Metric]` param as
+# `u#Unit:Metric`. The `#Unit` sentinel is a substring (suffix for
+# Measure, mid-string before `:Kind` for a user kind).
+
+# Index of the `#Unit` sentinel in an encoded tparam string, or -1.
+fn tp_unit_marker_index(stored: String) : Int =
+  tp_unit_marker_loop(stored, tp_unit_suffix(), 0,
+    string_length(stored) - string_length(tp_unit_suffix()))
+
+fn tp_unit_marker_loop(s: String, marker: String, i: Int, last: Int) : Int {
+  if i > last { -1 }
+  else if string_slice(s, i, string_length(marker)) == marker { i }
+  else { tp_unit_marker_loop(s, marker, i + 1, last) }
+}
+
+#[doc("True when an encoded tparam name ranges over a unit kind (`Measure` or a user kind).")]
+pub fn tp_kind_is_unit(stored: String) : Bool = tp_unit_marker_index(stored) >= 0
+
+#[doc("The `Kind` discriminant of an encoded tparam name.")]
+pub fn tp_kind_of(stored: String) : Kind =
+  if tp_kind_is_unit(stored) { KUnit } else { KType }
+
+#[doc("The surface tparam name, stripping any encoded kind marker (`u#Unit:Metric` -> `u`).")]
+pub fn tp_strip_kind(stored: String) : String {
+  let i = tp_unit_marker_index(stored)
+  if i < 0 { stored } else { string_slice(stored, 0, i) }
+}
+
+#[doc("The kind a unit-param ranges over: `Measure` for a bare `#Unit`, the named kind after `#Unit:`, or empty for a non-unit param.")]
+pub fn tp_kind_name(stored: String) : String {
+  let i = tp_unit_marker_index(stored)
+  if i < 0 { "" }
+  else {
+    let after = i + string_length(tp_unit_suffix())
+    let sep = tp_unit_kind_sep()
+    if string_slice(stored, after, string_length(sep)) == sep {
+      let start = after + string_length(sep)
+      string_slice(stored, start, string_length(stored) - start)
+    } else { measure_kind_name() }
+  }
+}
+
+# Source slice of a token — a local copy so this module need not depend
+# on the parser's private `tok_source`.
+fn ksrc(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+# Token-kind comparison via the lexer's stable name table, avoiding a
+# dependency on the parser's private `tk_is`.
+fn tk_named(t: Token, name: String) : Bool = tk_name(t.kind) == name
+
+#[doc("The empty registry seeded with the built-in `Measure`/`unit` binding.")]
+pub fn kind_reg_base() : KindReg = KReg(base_intros())
+
+fn base_intros() : [KindIntro] = [KI("unit", measure_kind_name())]
+
+#[doc("Every introducer word registered in `r` (for the parser's habitant-decl dispatch).")]
+pub fn kind_reg_introducers(r: KindReg) : [String] = match r {
+  KReg(bs) -> kind_field_of(bs, true, [])
+}
+
+#[doc("Every kind name registered in `r` (for validating `[u: Kind]` tparam annotations).")]
+pub fn kind_reg_kinds(r: KindReg) : [String] = match r {
+  KReg(bs) -> kind_field_of(bs, false, [])
+}
+
+fn kind_field_of(bs: [KindIntro], want_intro: Bool, acc: [String]) : [String] = match bs {
+  [] -> list_reverse(acc)
+  [b, ...rest] -> {
+    let v = if want_intro { ki_intro(b) } else { ki_kind(b) }
+    kind_field_of(rest, want_intro, [v, ...acc])
+  }
+}
+
+#[doc("The kind an introducer word declares habitants into, if registered.")]
+pub fn kind_of_introducer(r: KindReg, intro: String) : Option[String] = match r {
+  KReg(bs) -> kind_of_intro_loop(bs, intro)
+}
+
+fn kind_of_intro_loop(bs: [KindIntro], intro: String) : Option[String] = match bs {
+  [] -> None
+  [b, ...rest] -> if ki_intro(b) == intro { Some(ki_kind(b)) }
+                  else { kind_of_intro_loop(rest, intro) }
+}
+
+#[doc("True when `intro` is a registered habitant introducer (`unit` or a user kind's word).")]
+pub fn kind_reg_is_introducer(r: KindReg, intro: String) : Bool =
+  list_has(kind_reg_introducers(r), intro)
+
+#[doc("True when `name` names a registered kind (`Measure` or a user kind).")]
+pub fn kind_reg_has_kind(r: KindReg, name: String) : Bool =
+  list_has(kind_reg_kinds(r), name)
+
+#[doc("""
+Resolve a qualifier (a kind name `Metric` or an introducer word `metric`)
+to its kind name. `<Metric.m>` and `<metric.m>` both qualify `m` to the
+kind `Metric`. Returns None if the qualifier names neither.
+""")]
+pub fn kind_reg_resolve_qualifier(r: KindReg, qual: String) : Option[String] =
+  if kind_reg_has_kind(r, qual) { Some(qual) }
+  else { kind_of_introducer(r, qual) }
+
+#[doc("""
+The separator between a kind and its habitant in a qualified unit symbol
+(`Metric$m`). `$` is rejected by the unit lexer, so a qualified symbol
+is a disjoint subspace of user symbol names by construction.
+""")]
+pub fn kind_qual_sep() : String = "$"
+
+#[doc("Build the qualified form of a habitant symbol (`Metric` + `m` -> `Metric$m`).")]
+pub fn kind_qualify_sym(kind: String, sym: String) : String =
+  concat_all([kind, kind_qual_sep(), sym])
+
+#[doc("""
+Qualified form of a habitant, eliding the default kind. `Measure` (the
+kind every plain `unit` inhabits) stays bare (`m`), so all pre-kind code
+is byte-identical and an alias body's factors — expanded later, always
+bare — unify with a qualified literal. A user kind is materialised
+(`Metric$m`), which is what isolates it.
+""")]
+pub fn kind_qualify_nondefault(kind: String, sym: String) : String =
+  if kind == measure_kind_name() { sym } else { kind_qualify_sym(kind, sym) }
+
+#[doc("True when a unit symbol already carries a kind qualifier (`Metric$m`).")]
+pub fn kind_sym_is_qualified(s: String) : Bool = kind_qual_index(s) >= 0
+
+#[doc("The kind of a qualified symbol (`Metric$m` -> `Metric`), or empty if bare.")]
+pub fn kind_sym_kind(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { "" } else { string_slice(s, 0, i) }
+}
+
+#[doc("The bare habitant of a symbol, dropping any kind qualifier (`Metric$m` -> `m`).")]
+pub fn kind_sym_bare(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { s }
+  else {
+    let start = i + string_length(kind_qual_sep())
+    string_slice(s, start, string_length(s) - start)
+  }
+}
+
+#[doc("""
+Mangle-safe form of a qualified symbol for C identifiers. The default
+kind `Measure` is elided (`Measure$m` -> `m`, byte-identical to
+pre-kind mangling); a user kind is kept but its `$` separator becomes
+the C-safe sentinel `_k_` (`Metric$m` -> `Metric_k_m`), so habitants
+stay isolated across kinds in codegen without emitting `$`.
+""")]
+pub fn kind_sym_mangle(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { s }
+  else {
+    let kind = string_slice(s, 0, i)
+    let bare = kind_sym_bare(s)
+    if kind == measure_kind_name() { bare }
+    else { concat_all([kind, "_k_", bare]) }
+  }
+}
+
+fn kind_qual_index(s: String) : Int =
+  kind_qual_index_loop(s, kind_qual_sep(), 0, string_length(s) - string_length(kind_qual_sep()))
+
+fn kind_qual_index_loop(s: String, sep: String, i: Int, last: Int) : Int {
+  if i > last { -1 }
+  else if string_slice(s, i, string_length(sep)) == sep { i }
+  else { kind_qual_index_loop(s, sep, i + 1, last) }
+}
+
+#[doc("""
+Build a `KindReg` from the declaration stream: fold every `DKind`'s
+introducer->kind binding onto the built-in `unit`->Measure base. Used
+over the merged program stream, where all kinds (cross-module) are
+visible, by the kind-resolution pass.
+""")]
+pub fn kind_reg_from_decls(decls: [Decl]) : KindReg =
+  KReg(kind_reg_from_decls_loop(decls, base_intros()))
+
+fn kind_reg_from_decls_loop(decls: [Decl], acc: [KindIntro]) : [KindIntro] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DKind(_, name, _, intro, _, _) -> kind_reg_from_decls_loop(rest, [KI(intro, name), ...acc])
+    _ -> kind_reg_from_decls_loop(rest, acc)
+  }
+}
+
+#[doc("""
+Pre-scan the token stream for every `kind K : Thy with intro` head and
+build the file's `KindReg`. Deliberately dumb: it locates a `kind` in
+declaration position, the kind name after it, then skips to the `with`
+and captures the introducer that follows — it validates neither the
+theory nor the name (the real parser does). Order-independent: the map
+is complete before any body is parsed.
+""")]
+pub fn prescan_kinds(src: String, toks: [Token]) : KindReg =
+  KReg(prescan_loop(src, toks, base_intros()))
+
+fn prescan_loop(src: String, toks: [Token], acc: [KindIntro]) : [KindIntro] = match toks {
+  [] -> acc
+  [t, ...rest] ->
+    if tk_at_kind_head(src, t, rest) {
+      match scan_one_kind(src, rest) {
+        Some(b) -> prescan_loop(src, rest, [b, ...acc])
+        None    -> prescan_loop(src, rest, acc)
+      }
+    } else { prescan_loop(src, rest, acc) }
+}
+
+# A `kind` head is the identifier `kind` immediately followed by an
+# IDENT (the kind name) — the shape the parser's `decl_head_is_kind`
+# keys on, minus the `:` lookahead the scanner does not need (it skips
+# to `with` regardless).
+fn tk_at_kind_head(src: String, t: Token, rest: [Token]) : Bool =
+  tk_named(t, "IDENT") and ksrc(src, t) == "kind" and next_is_ident(rest)
+
+fn next_is_ident(toks: [Token]) : Bool = match toks {
+  [] -> false
+  [t, ..._] -> tk_named(t, "IDENT")
+}
+
+# `rest` begins at the kind name. Capture it, skip to the first `with`,
+# and take the introducer token after it. Returns the `intro -> kind`
+# binding, or None if the head is malformed (the real parser reports
+# the diagnostic).
+fn scan_one_kind(src: String, rest: [Token]) : Option[KindIntro] = match rest {
+  [] -> None
+  [name_tok, ...after_name] -> {
+    let kind_name = ksrc(src, name_tok)
+    match skip_to_with(after_name) {
+      None -> None
+      Some(after_with) -> match after_with {
+        [] -> None
+        [intro_tok, ..._] -> Some(KI(introducer_word(src, intro_tok), kind_name))
+      }
+    }
+  }
+}
+
+# The introducer is either the `unit` keyword or a plain IDENT; both
+# render to their surface word.
+fn introducer_word(src: String, t: Token) : String =
+  if tk_named(t, "unit") { "unit" } else { ksrc(src, t) }
+
+# Skip tokens up to and including the first `with`, bounded by the next
+# declaration head so a missing `with` does not run past its decl.
+fn skip_to_with(toks: [Token]) : Option[[Token]] = match toks {
+  [] -> None
+  [t, ...rest] ->
+    if tk_named(t, "with") { Some(rest) }
+    else if scan_boundary(t) { None }
+    else { skip_to_with(rest) }
+}
+
+# Tokens that end a declaration head — reaching one before `with` means
+# this `kind` has no introducer clause (the parser errors on it).
+fn scan_boundary(t: Token) : Bool =
+  tk_named(t, "theory") or tk_named(t, "fn") or tk_named(t, "type") or
+  tk_named(t, "effect") or tk_named(t, "protocol") or tk_named(t, "impl") or
+  tk_named(t, "EOF")
