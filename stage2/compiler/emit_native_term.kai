@@ -311,7 +311,7 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   # (the default `nemit_atom` boxes via `kaix_real`). Every other op ignores
   # the slot (the register's repr already drives its load/store).
   KLet(n, slot, op, _) -> { let h = nemit_op_fx_slot(ctx, cur_fn, op, slot, handlers, fns); nemit_store_reg(ctx, n, h) }
-  KDo(op, _)        -> { let _h = nemit_op_fx(ctx, cur_fn, op, handlers, fns); () }
+  KDo(op, _)        -> nemit_do(ctx, cur_fn, op, handlers, fns)
   KStore(n, v, _)   -> nemit_store_slot_aware(ctx, n, v)
   KRC(rc, _)        -> nemit_rc(ctx, rc)
   KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
@@ -321,6 +321,35 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   # return clause's `list_length(log)` reads them. Shares `nemit_bind_ev_state`
   # with the clause prologue; the only difference is the address source.
   KBindEvState(_, sym, _) -> nemit_bind_ev_state(ctx, native_ctx_find_reg(ctx, nfx_ev_reg(sym)))
+}
+
+# A `KDo` evaluates an op for effect and discards its result. When that
+# result is an OWNED boxed value (a discarded `mk(7)`/`array_set(a)` — the
+# op is `KLitOp(KVar(n))` with `n` at a boxed slot), the discarded reference
+# must be `kaix_internal_drop`ed, exactly as the C oracle's `SExprStmt`
+# lowers `{ KaiValue *_ = <e>; kai_decref(_); }`. Omitting it is the leak:
+# an Array[Record] slot never reaches rc0, so its children are never walked.
+# A pure-effect result (`Stdout.print` → Unit singleton) and a raw scalar
+# (`SInt64`/`SReal`/`SBool` register, tag != 0) own nothing to drop; a decref
+# of the Unit singleton is a no-op and a decref of a raw scalar reinterpreted
+# as a `ptr` is an over-drop (UAF) — both are excluded by the boxed-slot gate.
+# The value Handle is captured in a `let` before the drop so the type-blind
+# kaic1 Perceus never sees the raw LLVM `Value*` (the :289 handle-binder rule).
+fn nemit_do(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = {
+  let h = nemit_op_fx(ctx, cur_fn, op, handlers, fns)
+  if ndo_discards_owned_box(ctx, op) {
+    let _d = nemit_call1(ctx, "kaix_internal_drop", h); ()
+  } else { () }
+}
+
+# The discarded op owns a boxed value iff it is a bare atom naming a register
+# at a boxed slot (tag 0). A discard always lowers as `KLitOp(KVar(n))`: the
+# ctor/call landed in a prior `KLet` register, so the `KDo` carries the
+# register read, not the call. A raw-slot register (tag >= 1) or a literal /
+# non-register atom (`KUnitV`, an inlined constant) owns nothing.
+fn ndo_discards_owned_box(ctx: Handle, op: KOp) : Bool = match op {
+  KLitOp(KVar(n)) -> native_ctx_reg_slot(ctx, n) == 0
+  _               -> false
 }
 
 # `nemit_op` covers the pure-walk ops; a `KPerform` needs the handler map,
