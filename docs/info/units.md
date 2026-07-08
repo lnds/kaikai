@@ -66,15 +66,27 @@ imperial ft
 fn area_of[u: Metric](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
 
 fn main() : Unit / Stdout = {
-  let ok  = 3.0<m> + 2.0<m>          # ✓ same kind
-  let bad = 3.0<m> + 2.0<ft>         # ✗ Metric and Imperial never unify
+  let ok = 3.0<m> + 2.0<m>           # same kind → Real<m>
   Stdout.print("ok")
 }
 ```
 
-Two habitants in **different** kinds never unify — `meter + foot` is a
-compile-time error, the Mars-Orbiter class of bug. A symbol may live in
-more than one kind (`unit USD` *and* `cur USD` from
+Two habitants in **different** kinds never unify — `metric m + imperial ft`
+is a compile-time error, the Mars-Orbiter class of bug:
+
+```kaikai-neg
+kind Metric   : AbelianGroup with metric
+kind Imperial : AbelianGroup with imperial
+
+metric m
+imperial ft
+
+fn bad(a: Real<m>, b: Real<ft>) : Real<m> = a + b   # Metric vs Imperial
+
+fn main() : Unit / Stdout = { Stdout.print("unreachable") }
+```
+
+A symbol may live in more than one kind (`unit USD` *and* `cur USD` from
 `kind Currency : AbelianGroup with cur`); they are distinct habitants
 that share the spelling `USD`.
 
@@ -96,10 +108,13 @@ disambiguation.
 kind Currency : AbelianGroup with cur
 unit USD                                    # USD in Measure
 cur  USD                                    # USD also in Currency
-
-let a : Real<Currency.USD> = 10.0<Currency.USD>   # qualified → Currency
 use kind Currency
-let b : Real<USD> = 10.0<USD>                      # bare → Currency (used)
+
+fn main() : Unit / Stdout = {
+  let a : Real<Currency.USD> = 10.0<Currency.USD>   # qualified → Currency
+  let b : Real<USD>          = 10.0<USD>            # bare → Currency (used)
+  Stdout.print("ok")
+}
 ```
 
 Because money and physics can share one abelian kind, `USD/kWh` (price
