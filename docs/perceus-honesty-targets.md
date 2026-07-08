@@ -108,12 +108,14 @@ loop shape, where the recursive re-thread keeps the array alive.
 
 ### User-parameter borrow (#1127)
 
-The borrow **surface** now extends to **user function parameters**: `^` on
-a `pub` parameter (calling convention = ABI, serialized in the module
-interface), plus the pre-existing conservative inference (the `is_red`
-shape) on non-`pub` functions. The emit soundness gates that make a
-borrowed scrutinee safe on the native backend (arm-move / goto-tail / reuse
-recogniser inhibited, TCO dropmask unions the borrow set) ship too.
+The borrow **surface** extends to **user function parameters**: `^` on a
+`pub` parameter (calling convention = ABI, serialized in the module
+interface), plus inference on non-`pub` functions. The emit soundness gates
+that make a borrowed scrutinee safe on the native backend (arm-move /
+goto-tail / reuse recogniser inhibited, TCO dropmask unions the borrow set)
+ship too.
+
+Both borrow wins now ship — the two DEFERRED footnotes are gone.
 
 The **closure borrow (HOF win) shipped in #1130**: the runtime
 `kai_apply_borrow` / `kaix_apply_borrow` invokes a closure without consuming
@@ -123,20 +125,23 @@ recursive HOFs pay zero closure RC per element (borrow-through); `map` /
 `filter` and the loop-delegating HOFs take one dup-on-consume at the owned
 private-loop entry (rule 3, Koka `parcBorrowApp`) — one incref per HOF call,
 not per element. The decision is local (uses only the callee's borrow-map
-positions), so it survives the sep-comp oracle that #1127's whole-program
-relaxed inference did not.
+positions), so it survives the sep-comp oracle. Because the runtime call
+variant now exists, `pcs_closure_param_names` is no longer subtracted from the
+effective borrow set — a called closure param borrows soundly.
 
-> **v1 status (2026-07-08):** one thing is still DEFERRED:
->
-> - **Relaxed read-path inference.** A relaxed callee-discipline rule
->   (children-of-borrowed, borrow-through) passed every single-TU gate but
->   crashed `test-modular-selfhost` (the sep-comp compiler UAF'd compiling a
->   real program). The emit is not a pure function of the whole-program
->   borrow map — it rides a decl-grouping / per-partition-linkage invariant
->   the monolithic TU only guarantees incidentally. Reverted to the
->   conservative rule; reopening gate is the modular fixture in red. (A fresh
->   borrowed closure passed to a HOF also leaks one bounded ref per call-site
->   — the caller drop-after-call reconciled with TCO is a #1130 follow-up.)
+The **relaxed read-path inference** shipped in #1131. A non-`pub` param is
+borrowed when every use is an INSPECTION (a bare match scrutinee), a CALLEE
+position, or a SELF-BORROW-THROUGH. A read-only tree descent
+(`examples/perceus/borrow_descent_1127.kai`) drops from **23097 → 21097**
+increfs with NO annotation — the per-level dup is elided. The soundness
+gate that makes it sep-comp-safe: a child the arm binds is an **interior
+pointer** of the borrowed scrutinee (the RC pass does not dup it at the
+bind), so the borrow is refused if any arm lets a child ESCAPE — returned in
+tail position, stored in a ctor/record/list, captured, or passed owned. A
+pure read (binop operand, callee inspection) does not escape. The escape
+walk lives in `compiler/borrow_escape.kai`. This is decided whole-program
+but is sound per-function (bounded to what the RC pass guarantees), so it
+survives the sep-comp oracle that the pre-gate revert (#1129) did not.
 
 ### The one remaining lever, and what is NOT the lever
 
