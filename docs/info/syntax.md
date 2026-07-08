@@ -33,14 +33,13 @@ fn greet(name: String) : Unit / Logger {       # with effect row
   Logger.log("hi #{name}")
 }
 pub fn area(w: Int, h: Int) : Int = w * h      # exported
-pub fn each(xs: [a], ^f: (a) -> b) : Unit      # `^` borrows a param: the
-fn lookup(^t: Tree, k: Int) : Bool = ...       #   callee only reads it, no
-                                               #   dup/drop. Per-name (`^a, b`
-                                               #   borrows a alone), only in a
-                                               #   `fn` param list — not on
-                                               #   lambdas, not in fn types.
-                                               #   pub states it (ABI); non-pub
-                                               #   infers it.
+pub fn twice(^f: (Int) -> Int, x: Int) : Int   # `^` borrows a param: the
+  = f(f(x))                                    #   callee reads it, the caller
+                                               #   skips the dup. Per-name
+                                               #   (`^a, b` borrows a alone),
+                                               #   only in a `fn` param list —
+                                               #   not on lambdas, not in fn
+                                               #   types. `pub` states it (ABI).
 
 fn fib(n: Int) : Int {                         # clause-block body:
   case 0 -> 0                                  #   `case` arms dispatch
