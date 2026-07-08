@@ -4321,10 +4321,12 @@ test-perceus-1126-read-loop-drop-native: $(TARGET) build
 # (`go(n, acc, f)`) threads a closure through a tail-recursive loop; under
 # the owned convention it paid 2 rc ops per iteration (caller incref +
 # callee decref of `f`). The relaxed inference borrows `f` (no annotation —
-# `go` is non-`pub`), collapsing the closure RC to ~0. The stdlib HOF
-# fixture drives the `^`-annotated map/filter/foldl over one closure. Both
-# gate output-exact; the closure gate also asserts incref_total collapsed
-# (well under the 2000 pre-borrow floor over 1000 iterations).
+# `go` is non-`pub`). A CLOSURE param is not borrowed in codegen — the
+# runtime `kai_apply` consumes it and there is no borrowing call variant —
+# so this gate pins SOUNDNESS: the `^` serializes in the ABI but the closure
+# stays owned, neither leaked nor double-freed. `leaked` stays bounded
+# (constant, not O(iterations)). The RC collapse is gated on a borrowing
+# call variant (follow-up). The stdlib HOF gate mirrors this.
 test-perceus-1127-borrow-closure: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_closure_1127.kai; \
@@ -4335,12 +4337,10 @@ test-perceus-1127-borrow-closure: $(TARGET) build
 	KAI_TRACE_RC=1 ./build/s2-1127bc > build/s2-1127bc.out 2> build/s2-1127bc.rc; \
 	diff -q $$exp build/s2-1127bc.out > /dev/null \
 	  || { echo "perceus-1127-borrow-closure FAIL (output diff)"; diff $$exp build/s2-1127bc.out; exit 1; }; \
-	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1127bc.rc | head -1 | cut -d= -f2); \
-	[ -n "$$inc" ] \
-	  || { echo "perceus-1127-borrow-closure FAIL (no incref_total line)"; cat build/s2-1127bc.rc; exit 1; }; \
-	[ "$$inc" -lt 100 ] \
-	  && echo "perceus-1127-borrow-closure OK (incref_total=$$inc < 100 over 1000 iters; closure borrow elided the per-iteration dup, was ~2000)" \
-	  || { echo "perceus-1127-borrow-closure FAIL (incref_total=$$inc — closure dup regressed, expected ~0)"; exit 1; }
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127bc.rc | head -1 | cut -d= -f2); \
+	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
+	  && echo "perceus-1127-borrow-closure OK (leaked=$$leaked < 100 over 1000 iters; closure ^ serializes but stays owned — no UAF, no O(N) leak)" \
+	  || { echo "perceus-1127-borrow-closure FAIL (leaked=$$leaked — closure ^ wrongly relaxed codegen, orphaned the closure)"; exit 1; }
 
 test-perceus-1127-borrow-closure-native: $(TARGET) build
 	@set -e; \
@@ -4351,12 +4351,10 @@ test-perceus-1127-borrow-closure-native: $(TARGET) build
 	KAI_TRACE_RC=1 ./build/s2-1127bcn > build/s2-1127bcn.out 2> build/s2-1127bcn.rc; \
 	diff -q $$exp build/s2-1127bcn.out > /dev/null \
 	  || { echo "perceus-1127-borrow-closure-native FAIL (output diff)"; diff $$exp build/s2-1127bcn.out; exit 1; }; \
-	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1127bcn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$inc" ] \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (no incref_total line)"; cat build/s2-1127bcn.rc; exit 1; }; \
-	[ "$$inc" -lt 100 ] \
-	  && echo "perceus-1127-borrow-closure-native OK (native incref_total=$$inc < 100; closure borrow inherited from the shared KIR)" \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (native incref_total=$$inc — closure dup regressed)"; exit 1; }
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127bcn.rc | head -1 | cut -d= -f2); \
+	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
+	  && echo "perceus-1127-borrow-closure-native OK (native leaked=$$leaked < 100; closure stays owned, sound on both backends)" \
+	  || { echo "perceus-1127-borrow-closure-native FAIL (native leaked=$$leaked — closure orphaned)"; exit 1; }
 
 test-perceus-1127-borrow-hof: $(TARGET) build
 	@set -e; \
@@ -4365,10 +4363,13 @@ test-perceus-1127-borrow-hof: $(TARGET) build
 	./$(TARGET) --path ../stdlib $$src > build/s2-1127hof.c \
 	  || { echo "perceus-1127-borrow-hof FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127hof.c -o build/s2-1127hof $(LDLIBS_M); \
-	./build/s2-1127hof > build/s2-1127hof.out; \
+	KAI_TRACE_RC=1 ./build/s2-1127hof > build/s2-1127hof.out 2> build/s2-1127hof.rc; \
 	diff -q $$exp build/s2-1127hof.out > /dev/null \
-	  && echo "perceus-1127-borrow-hof OK (stdlib map/filter/foldl with ^ closure param)" \
 	  || { echo "perceus-1127-borrow-hof FAIL (output diff)"; diff $$exp build/s2-1127hof.out; exit 1; }; \
+	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127hof.rc | head -1 | cut -d= -f2); \
+	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
+	  && echo "perceus-1127-borrow-hof OK (stdlib map/filter/foldl with ^ closure param; leaked=$$leaked < 100 — closure ^ serializes in ABI but stays consumed, no UAF/leak)" \
+	  || { echo "perceus-1127-borrow-hof FAIL (leaked=$$leaked — closure ^ wrongly relaxed codegen, orphaned the closure)"; exit 1; }; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1127hofn 2> build/s2-1127hofn.err \
 	  || { echo "perceus-1127-borrow-hof FAIL (native build errored)"; cat build/s2-1127hofn.err; exit 1; }; \
 	./build/s2-1127hofn > build/s2-1127hofn.out; \

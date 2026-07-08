@@ -12,10 +12,23 @@ exclusion held.
 **Shipped:** the full hybrid model (inferred private + explicit `^` public),
 the `^` surface with `pub`-ABI serialization, the stdlib HOF sweep (17
 annotations in `stdlib/core/list.kai`), and the soundness gates. Both
-backends (C oracle + native) compile and run all shapes. One probe (the
-closure-threaded loop — the design's "big one") collapses to **0 RC ops** on
-both backends; the other (read-only tree descent) improves but does not fully
-collapse (see below).
+backends (C oracle + native) compile and run all shapes, selfhost byte-id C
+AND native.
+
+**Scope call, verified by the C selfhost oracle: closure borrow is deferred.**
+The runtime `kai_apply` (call_ind) CONSUMES the closure it invokes (issue
+#298), and there is no borrowing call variant. Borrowing a CALLED closure
+would strip the caller dup while the callee still consumes → a
+use-after-free. The native backend hid this; the C selfhost byte-id destroyed
+it — the self-hosted C compiler crashed with `attempted to call a
+non-callable value` when a compiler-internal HOF's borrowed closure was freed
+before a call. So a CLOSURE param (function type) is excluded from the
+EFFECTIVE (codegen) borrow set: the `^` still SERIALIZES in the ABI
+(ABI-ready), but codegen keeps the closure owned. The design's "big one" —
+the HOF closure win, the RC collapse of the closure-threaded loop — is gated
+on a borrowing call variant (`call_ind_borrow`), tracked as a follow-up. What
+DID ship: the read-path (non-closure) borrow, inferred and sound; the surface
+and ABI; and the stdlib `^` annotations, inert-but-sound.
 
 ## The cause chain, verified (the brief warned soundness would be subtle)
 
@@ -67,15 +80,16 @@ had the gaps. Every gap was invisible until a real program ran on the default
 
 ## Measured motivation (KAI_TRACE_RC)
 
-| shape | before (owned) | after (borrow) |
+| shape | before (owned) | after (this lane) |
 |---|---:|---:|
-| closure threaded, 1000 iters (P1), C | 2000 incref | **0** |
-| closure threaded, 1000 iters (P1), native | 2000 incref | **0** |
+| closure threaded (P1) — closure borrow deferred | 2000 incref, leaked=7 | 2000 incref, leaked=7 (SOUND, no collapse) |
 | read-only tree descent (P2), native | 23097 incref | 21097 |
-| stdlib `foldl` over 10k, closure RC | dup per call | dup elided |
+| stdlib `foldl` over 10k, non-closure RC | — | closure `^` serialized, still consumed |
 
-P1 — the design's "big one" (every user of `map`/`filter`/`fold` paid it per
-call) — collapses to zero on both backends. P2 improves only partially: the
+P1 (the closure-threaded loop, the design's "big one") does NOT collapse: the
+closure stays owned because call_ind consumes it (see the scope call above).
+The gate pins soundness — `leaked` stays bounded, no UAF — not the collapse.
+P2 (read-descent over a value type, no closure) improves partially: the
 container re-thread is elided, but the per-level dup of a bound child that
 flows to a borrow-through position is NOT. Collapsing P2 fully needs a bound
 child whose ONLY use is a borrow-through position to bind borrowed (no incref)
@@ -117,6 +131,12 @@ more, still sound). #1128's read-loop-drop fixtures stay green.
 
 ## Follow-ups
 
+- **`call_ind_borrow` + the HOF closure win (the deferred "big one").** A
+  runtime call variant that invokes a closure WITHOUT consuming it, a KIR node
+  routing it, and the C runtime.h + native shim. Only then does borrowing a
+  called closure become sound and the closure-threaded / HOF RC collapse. The
+  compiler-internal HOF that crashed the C selfhost is the first negative
+  fixture. This is a runtime-ABI change, not a perceus tweak — its own issue.
 - **Collapse P2 fully:** bind a child whose only use is a borrow-through
   position borrowed (no incref), not the unconditional is_alias dup.
 - **Native borrow-through element unboxing** — orthogonal, the boxing border
