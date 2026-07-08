@@ -53,11 +53,25 @@ fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = mat
   # component of `nm` escapes borrowed. `nm` inside a non-bare scrutinee,
   # or anywhere in an arm body/guard, must itself stay borrowable.
   EMatch(s, arms) -> {
-    let scr_ok = match s.kind {
-      EVar(u) -> if u == nm { true } else { true }
-      _       -> binf_uses_ok(self_name, nm, i, s)
+    # A scrutinee whose arms REBUILD a constructor is a reuse-in-place
+    # candidate (the matched cell is stolen for the rebuild — rb-tree
+    # balance/insert), and a scrutinee deconstructed by a LIST pattern with a
+    # rest-binder (`[h, ...t]`) has its spine consumed cell-by-cell as the
+    # loop advances `t` (map/filter/fold). Both want OWNERSHIP — borrow is a
+    # read/HOF lever, not a reuse or spine-consume lever. Disqualify `nm` as
+    # the bare scrutinee of either shape.
+    let reuse_target = match s.kind {
+      EVar(u) -> u == nm and (binf_arms_rebuild_ctor(arms) or binf_arms_list_deconstruct(arms))
+      _       -> false
     }
-    scr_ok and binf_arms_ok(self_name, nm, i, arms)
+    if reuse_target { false }
+    else {
+      let scr_ok = match s.kind {
+        EVar(u) -> true
+        _       -> binf_uses_ok(self_name, nm, i, s)
+      }
+      scr_ok and binf_arms_ok(self_name, nm, i, arms)
+    }
   }
   # Callee position: `nm(...)` reads `nm` to invoke it. A call to a TOP-LEVEL
   # fn (`c` a known symbol) reads nothing of `nm` at the callee; a call whose
@@ -128,6 +142,51 @@ fn binf_self_args_ok(self_name: String, nm: String, i: Int, xs: [Expr], j: Int) 
 fn binf_arg_is_borrow_through(nm: String, a: Expr) : Bool = match a.kind {
   EVar(u) -> u == nm
   _       -> false
+}
+
+# Any arm whose tail rebuilds a constructor (an uppercase-initial call or a
+# record literal in tail position). This is the reuse-in-place shape the
+# recogniser fires on; a scrutinee feeding it wants ownership, not borrow.
+fn binf_arms_rebuild_ctor(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> binf_tail_rebuilds_ctor(b) or binf_arms_rebuild_ctor(rest)
+  }
+}
+
+# Any arm matching a LIST pattern with a rest-binder (`[h, ...t]`). The
+# scrutinee's spine is consumed cell-by-cell (the loop frees each cons as it
+# advances the tail), so it wants ownership — not borrowable.
+fn binf_arms_list_deconstruct(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(p, _, _) -> binf_pat_is_list_rest(p) or binf_arms_list_deconstruct(rest)
+  }
+}
+
+fn binf_pat_is_list_rest(p: Pattern) : Bool = match p.pkind {
+  PList(_, opt_rest) -> match opt_rest { Some(_) -> true None -> false }
+  _                  -> false
+}
+
+fn binf_tail_rebuilds_ctor(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _) -> true
+  ECall(f, _)      -> match f.kind {
+    EVar(c)        -> binf_name_is_ctor(c)
+    EModCall(_, c) -> binf_name_is_ctor(c)
+    _              -> false
+  }
+  EIf(_, t, oe)    -> binf_tail_rebuilds_ctor(t) or (match oe { None -> false Some(e2) -> binf_tail_rebuilds_ctor(e2) })
+  EBlock(_, tail)  -> match tail { None -> false Some(t) -> binf_tail_rebuilds_ctor(t) }
+  EMatch(_, arms)  -> binf_arms_rebuild_ctor(arms)
+  _                -> false
+}
+
+# An uppercase-initial name is a constructor (the same heuristic the KIR
+# lowering's `kir_name_is_ctor` uses).
+fn binf_name_is_ctor(nm: String) : Bool = match char_at(nm, 0) {
+  Some(c) -> c >= 'A' and c <= 'Z'
+  None    -> false
 }
 
 # Non-self call args: `nm` must be absent in owned position. A sub-inspection
