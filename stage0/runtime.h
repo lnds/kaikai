@@ -3896,6 +3896,21 @@ static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     return r;
 }
 
+/* Borrowing indirect call (issue #1130). Invokes the closure WITHOUT
+ * consuming it: the caller retains the ref and drops it after its last
+ * use. This is the call variant a `^`-borrowed function-typed parameter
+ * routes to — the closure threaded through a tail loop pays no per-call
+ * incref/decref pair, only the entry dup and one exit drop. Args keep the
+ * owned convention (the body consumes them exactly as under kai_apply);
+ * only the closure is borrowed. */
+static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
+    if (!clo || clo->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: attempted to call a non-callable value\n");
+        exit(1);
+    }
+    return clo->as.clo.fn(clo, argv, argc);
+}
+
 /* ---------- field access helpers ---------- */
 
 static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
