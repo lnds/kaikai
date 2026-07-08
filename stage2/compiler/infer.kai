@@ -13,6 +13,8 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.kinds
+import compiler.kind_resolve
 import compiler.intervals
 import compiler.refinements
 import compiler.parse
@@ -23,6 +25,7 @@ import compiler.doc_attr
 import compiler.native_prims
 import compiler.infer_index
 import compiler.lit_mint
+import compiler.unit_walk
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -1573,7 +1576,7 @@ fn inf_unit_eq(a: UnitExprT, b: UnitExprT) : Bool {
 fn inf_unit_expr_display(u: UnitExprT) : String {
   match u {
     UOne -> "1"
-    USym(s) -> s
+    USym(s) -> kind_sym_bare(s)
     UMul(a, b) -> match b {
       UInv(b_inner) -> match a {
         UOne -> concat_all(["1/", inf_unit_expr_display(b_inner)])
@@ -5195,19 +5198,8 @@ fn unit_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
 }
 
 # tp_unit_suffix lives in compiler/ast.kai; tp_make lives in
-# compiler/parse.kai with the parser.
-
-
-fn tp_kind_is_unit(stored: String) : Bool = string_ends_with(stored, tp_unit_suffix())
-
-fn tp_kind_of(stored: String) : Kind =
-  if tp_kind_is_unit(stored) { KUnit } else { KType }
-
-fn tp_strip_kind(stored: String) : String {
-  if tp_kind_is_unit(stored) {
-    string_slice(stored, 0, string_length(stored) - string_length(tp_unit_suffix()))
-  } else { stored }
-}
+# compiler/parse.kai; the kind decoders (tp_kind_is_unit / tp_kind_of /
+# tp_strip_kind / tp_kind_name) live in compiler/kinds.kai.
 
 fn string_ends_with(s: String, suffix: String) : Bool {
   let sl = string_length(s)
@@ -6021,7 +6013,7 @@ fn subst_fresh_unit(s: Subst) : FreshUnit {
 #      shape and a canonical (sym, exponent) / (uvar, exponent) table.
 #   2. unit_canon — normal form: alphabetically-sorted symbols, grouped
 #      exponents, no factor-of-1 noise.
-#   3. unify_unit — abelian-group unification (Stuckey/Kennedy): solve
+#   3. unify_abelian — abelian-group unification (Stuckey/Kennedy): solve
 #      `u1 = u2` by reducing `u1 * u2^-1 = 1` to a substitution.
 #
 # Aliases (`unit Newton = kg * m / sec^2`) are expanded by the *resolver*
@@ -6329,6 +6321,14 @@ fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
   }
 }
 
+# Dimension-unification dispatch seam. The kind's theory selects the
+# unification engine (`unify_<theory>`: abelian today; structural,
+# module, composition follow, each plugging in here without touching
+# the callers). Habitant symbols already carry their kind, so isolation
+# rides the symbol key, not a branch here.
+fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable =
+  unify_abelian(u1, u2, s)
+
 # Unify two unit expressions under `s`. The classic equational view:
 # `u1 ≡ u2` iff `u1 * u2^-1 ≡ 1`. We solve the homogeneous form by
 # repeatedly picking the unit-var with the smallest |exponent| and
@@ -6339,14 +6339,14 @@ fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
 # a real Smith-normal-form pass, that is a sign the design is being
 # pushed past the docs/units-of-measure.md "polynomial" promise — call
 # it out before extending.
-fn unify_unit(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
+fn unify_abelian(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
   let t1 = unit_to_table_resolved(u1, s)
   let t2 = unit_to_table_resolved(u2, s)
   let diff = utable_diff(t1, t2)
-  unify_unit_diff(diff, s)
+  unify_abelian_diff(diff, s)
 }
 
-fn unify_unit_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
+fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
   if utable_is_one(t) { Some(s) }
   else {
     match utable_pick_min_var(t) {
@@ -7004,7 +7004,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
     TyCon(_, _, atys) -> occurs_any(v, atys, s)
     # TyDimT carries a base Ty to recurse into; the unit side
-    # has its own occurs_unit guard inside unify_unit.
+    # has its own occurs_unit guard inside unify_abelian.
     TyDimT(base, _) -> occurs(v, base, s)
     # predicates carry value-level identifiers, not Ty
     # vars; only the base contributes to occurs.
@@ -7099,12 +7099,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     # `Real<USD>` is rejected).
     TyInt    -> match b {
       TyInt    -> Some(s)
-      TyDimT(bb, bu) -> match bb { TyInt -> unify_unit(UOne, bu, s) _ -> None }
+      TyDimT(bb, bu) -> match bb { TyInt -> unify_dim(UOne, bu, s) _ -> None }
       _ -> None
     }
     TyReal   -> match b {
       TyReal   -> Some(s)
-      TyDimT(bb, bu) -> match bb { TyReal -> unify_unit(UOne, bu, s) _ -> None }
+      TyDimT(bb, bu) -> match bb { TyReal -> unify_dim(UOne, bu, s) _ -> None }
       _ -> None
     }
     TyBool   -> match b { TyBool   -> Some(s) _ -> None }
@@ -7168,7 +7168,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
         TyCon(_, bn, ba) ->
           if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
-            Some(s1) -> unify_unit(UOne, bu, s1)
+            Some(s1) -> unify_dim(UOne, bu, s1)
           } } else { None }
         _ -> None
       }
@@ -7181,10 +7181,10 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     TyDimT(ab, au) -> match b {
       TyDimT(bb, bu) -> match unify_env(env, ab, bb, s) {
         None -> None
-        Some(s1) -> unify_unit(au, bu, s1)
+        Some(s1) -> unify_dim(au, bu, s1)
       }
-      TyInt    -> match ab { TyInt -> unify_unit(au, UOne, s) _ -> None }
-      TyReal   -> match ab { TyReal -> unify_unit(au, UOne, s) _ -> None }
+      TyInt    -> match ab { TyInt -> unify_dim(au, UOne, s) _ -> None }
+      TyReal   -> match ab { TyReal -> unify_dim(au, UOne, s) _ -> None }
       # `Decimal<u>` ≡ bare `Decimal` when u collapses to 1,
       # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
       # flow into a fn expecting bare `Decimal` only when the units
@@ -7193,7 +7193,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
         TyCon(_, an, aa) ->
           if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
-            Some(s1) -> unify_unit(au, UOne, s1)
+            Some(s1) -> unify_dim(au, UOne, s1)
           } } else { None }
         _ -> None
       }
@@ -17415,7 +17415,7 @@ fn collect_unit_alias_table_loop(decls: [Decl], acc: [UAliasEntry]) : [UAliasEnt
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DUnit(_, name, Some(body), _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
+      DUnit(_, name, Some(body), _, _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
       _ -> collect_unit_alias_table_loop(rest, acc)
     }
   }
@@ -17434,7 +17434,7 @@ fn collect_declared_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DUnit(_, name, _, _, _) -> collect_declared_unit_names_loop(rest, [name, ...acc])
+      DUnit(_, name, _, _, _, _) -> collect_declared_unit_names_loop(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_declared_unit_names_loop([inner, ...rest], acc)
@@ -17455,7 +17455,7 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DUnit(true, name, _, _, _) -> collect_pub_unit_names_loop(rest, [name, ...acc])
+      DUnit(true, name, _, _, _, _) -> collect_pub_unit_names_loop(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_pub_unit_names_loop([inner, ...rest], acc)
@@ -17482,46 +17482,46 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
 #     set for the duration of a single decl; that scoping is handled
 #     in `validate_unit_refs_decl` itself.
 #[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver.")]
-pub fn validate_unit_refs_decls(decls: [Decl], declared: [String],
+pub fn validate_unit_refs_decls(decls: [Decl], scope: UnitScope,
                               file: String) : Int / Console + File =
-  validate_unit_refs_decls_loop(decls, declared, file, 0)
+  validate_unit_refs_decls_loop(decls, scope, file, 0)
 
-fn validate_unit_refs_decls_loop(decls: [Decl], declared: [String],
+fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitScope,
                                     file: String, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
     [d, ...rest] -> {
-      let e1 = errs + validate_unit_refs_decl(d, declared, file)
-      validate_unit_refs_decls_loop(rest, declared, file, e1)
+      let e1 = errs + validate_unit_refs_decl(d, scope, file)
+      validate_unit_refs_decls_loop(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_decl(d: Decl, declared: [String], file: String) : Int / Console + File = match d {
+fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Console + File = match d {
   DFn(_, _, tparams, ps, ret, _, body, _, _, _) -> {
-    # Extend `declared` with this fn's unit-kind tparams (parametric
+    # Extend the scope with this fn's unit-kind tparams (parametric
     # impls like `impl[u: Measure] Show for Real<u>` introduce `u` as
     # a unit symbol valid only inside this body).
-    let local_declared = list_append(collect_unit_tparam_names(tparams), declared)
-    let e0 = validate_unit_refs_params(ps, local_declared, file, 0)
+    let local_scope = unit_scope_add_locals(scope, collect_unit_tparam_names(tparams))
+    let e0 = validate_unit_refs_params(ps, local_scope, file, 0)
     let e1 = match ret {
-      Some(te) -> e0 + validate_unit_refs_te(te, local_declared, file)
+      Some(te) -> e0 + validate_unit_refs_te(te, local_scope, file)
       None -> e0
     }
-    e1 + validate_unit_refs_expr(body, local_declared, file)
+    e1 + validate_unit_refs_expr(body, local_scope, file)
   }
-  DType(_, _, _, body, _, _, _) -> validate_unit_refs_typebody(body, declared, file)
-  DTest(_, body, _, _) -> validate_unit_refs_expr(body, declared, file)
-  DBench(_, body, _, _) -> validate_unit_refs_expr(body, declared, file)
+  DType(_, _, _, body, _, _, _) -> validate_unit_refs_typebody(body, scope, file)
+  DTest(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
+  DBench(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
   DCheck(_, ps, body, _, _) ->
-    validate_unit_refs_params(ps, declared, file, 0) +
-    validate_unit_refs_expr(body, declared, file)
-  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, declared, file, 0)
+    validate_unit_refs_params(ps, scope, file, 0) +
+    validate_unit_refs_expr(body, scope, file)
+  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
   DImpl(_, _, _, sub_decls, _, _) ->
-    validate_unit_refs_decls_loop(sub_decls, declared, file, 0)
-  DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
-  DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
-  DConstructor(inner, _, _) -> validate_unit_refs_decl(inner, declared, file)
+    validate_unit_refs_decls_loop(sub_decls, scope, file, 0)
+  DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
+  DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
+  DConstructor(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   _ -> 0
 }
 
@@ -17543,101 +17543,101 @@ fn collect_unit_tparam_names_loop(tparams: [String], acc: [String]) : [String] {
   }
 }
 
-fn validate_unit_refs_params(ps: [Param], declared: [String], file: String,
+fn validate_unit_refs_params(ps: [Param], scope: UnitScope, file: String,
                                 acc: Int) : Int / Console + File = match ps {
   [] -> acc
   [p, ...rest] -> {
     let e1 = match p.ptype {
-      Some(te) -> acc + validate_unit_refs_te(te, declared, file)
+      Some(te) -> acc + validate_unit_refs_te(te, scope, file)
       None -> acc
     }
-    validate_unit_refs_params(rest, declared, file, e1)
+    validate_unit_refs_params(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_eops(ops: [EffectOp], declared: [String], file: String,
+fn validate_unit_refs_eops(ops: [EffectOp], scope: UnitScope, file: String,
                               acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [op, ...rest] -> match op {
     EOp(_, _, ps, ret, _, _) -> {
-      let e1 = acc + validate_unit_refs_params(ps, declared, file, 0) +
-                validate_unit_refs_te(ret, declared, file)
-      validate_unit_refs_eops(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_params(ps, scope, file, 0) +
+                validate_unit_refs_te(ret, scope, file)
+      validate_unit_refs_eops(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_typebody(b: TypeBody, declared: [String], file: String) : Int / Console + File = match b {
-  TBAlias(te) -> validate_unit_refs_te(te, declared, file)
-  TBRecord(fs) -> validate_unit_refs_fdecls(fs, declared, file, 0)
-  TBSum(vs) -> validate_unit_refs_variants(vs, declared, file, 0)
+fn validate_unit_refs_typebody(b: TypeBody, scope: UnitScope, file: String) : Int / Console + File = match b {
+  TBAlias(te) -> validate_unit_refs_te(te, scope, file)
+  TBRecord(fs) -> validate_unit_refs_fdecls(fs, scope, file, 0)
+  TBSum(vs) -> validate_unit_refs_variants(vs, scope, file, 0)
   TBEffectAlias(_) -> 0
 }
 
-fn validate_unit_refs_fdecls(fs: [FieldDecl], declared: [String], file: String,
+fn validate_unit_refs_fdecls(fs: [FieldDecl], scope: UnitScope, file: String,
                                 acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     FD(_, _, te) -> {
-      let e1 = acc + validate_unit_refs_te(te, declared, file)
-      validate_unit_refs_fdecls(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_te(te, scope, file)
+      validate_unit_refs_fdecls(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_variants(vs: [Variant], declared: [String], file: String,
+fn validate_unit_refs_variants(vs: [Variant], scope: UnitScope, file: String,
                                   acc: Int) : Int / Console + File = match vs {
   [] -> acc
   [v, ...rest] -> match v {
     Var(_, payload_tes) -> {
-      let e1 = acc + validate_unit_refs_te_list(payload_tes, declared, file, 0)
-      validate_unit_refs_variants(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_te_list(payload_tes, scope, file, 0)
+      validate_unit_refs_variants(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_te(te: TypeExpr, declared: [String], file: String) : Int / Console + File = match te.tkind {
-  TyName(_, targs) -> validate_unit_refs_te_list(targs, declared, file, 0)
-  TyList(inner) -> validate_unit_refs_te(inner, declared, file)
-  TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, declared, file, 0) +
-                       validate_unit_refs_te(ret, declared, file)
-  TyDim(base, u) -> validate_unit_refs_te(base, declared, file) +
-                     validate_unit_expr(u, declared, file, te.line, te.col)
-  TyRefine(base, _) -> validate_unit_refs_te(base, declared, file)
+fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / Console + File = match te.tkind {
+  TyName(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
+  TyList(inner) -> validate_unit_refs_te(inner, scope, file)
+  TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, scope, file, 0) +
+                       validate_unit_refs_te(ret, scope, file)
+  TyDim(base, u) -> validate_unit_refs_te(base, scope, file) +
+                     validate_unit_expr(u, scope, file, te.line, te.col)
+  TyRefine(base, _) -> validate_unit_refs_te(base, scope, file)
   # a compound row as a type argument — validate units
   # inside any parameterised labels it carries (`Reader[Int<m>]`).
-  TyRow(row) -> validate_unit_refs_row(row, declared, file)
+  TyRow(row) -> validate_unit_refs_row(row, scope, file)
 }
 
-fn validate_unit_refs_row(row: RowExpr, declared: [String], file: String) : Int / Console + File =
+fn validate_unit_refs_row(row: RowExpr, scope: UnitScope, file: String) : Int / Console + File =
   match row {
     REmpty -> 0
-    RClosed(labels) -> validate_unit_refs_rls(labels, declared, file, 0)
-    ROpen(_, labels) -> validate_unit_refs_rls(labels, declared, file, 0)
+    RClosed(labels) -> validate_unit_refs_rls(labels, scope, file, 0)
+    ROpen(_, labels) -> validate_unit_refs_rls(labels, scope, file, 0)
   }
 
-fn validate_unit_refs_rls(ls: [RowLabel], declared: [String], file: String,
+fn validate_unit_refs_rls(ls: [RowLabel], scope: UnitScope, file: String,
                              acc: Int) : Int / Console + File = match ls {
   [] -> acc
   [RL(_, ts), ...rest] -> {
-    let e1 = acc + validate_unit_refs_te_list(ts, declared, file, 0)
-    validate_unit_refs_rls(rest, declared, file, e1)
+    let e1 = acc + validate_unit_refs_te_list(ts, scope, file, 0)
+    validate_unit_refs_rls(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_te_list(ts: [TypeExpr], declared: [String], file: String,
+fn validate_unit_refs_te_list(ts: [TypeExpr], scope: UnitScope, file: String,
                                  acc: Int) : Int / Console + File = match ts {
   [] -> acc
   [t, ...rest] -> {
-    let e1 = acc + validate_unit_refs_te(t, declared, file)
-    validate_unit_refs_te_list(rest, declared, file, e1)
+    let e1 = acc + validate_unit_refs_te(t, scope, file)
+    validate_unit_refs_te_list(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_expr(e: Expr, declared: [String], file: String) : Int / Console + File =
-  validate_unit_refs_kind(e.kind, declared, file, e.line, e.col)
+fn validate_unit_refs_expr(e: Expr, scope: UnitScope, file: String) : Int / Console + File =
+  validate_unit_refs_kind(e.kind, scope, file, e.line, e.col)
 
-fn validate_unit_refs_kind(k: ExprKind, declared: [String], file: String,
+fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
                               line: Int, col: Int) : Int / Console + File = match k {
   EInt(_)        -> 0
   EReal(_, _)       -> 0
@@ -17656,154 +17656,173 @@ fn validate_unit_refs_kind(k: ExprKind, declared: [String], file: String,
   EExternBody(_) -> 0
   EVariantsOf(_, _) -> 0
   EModCall(_, _) -> 0
-  EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, declared, file, 0)
-  ECall(callee, args_) -> validate_unit_refs_expr(callee, declared, file) +
-                           validate_unit_refs_expr_list(args_, declared, file, 0)
-  EField(base, _) -> validate_unit_refs_expr(base, declared, file)
-  EIndex(a, b) -> validate_unit_refs_expr(a, declared, file) +
-                  validate_unit_refs_expr(b, declared, file)
-  EBinop(_, a, b) -> validate_unit_refs_expr(a, declared, file) +
-                     validate_unit_refs_expr(b, declared, file)
-  EUnop(_, x) -> validate_unit_refs_expr(x, declared, file)
-  EIf(c, t_, eo) -> validate_unit_refs_expr(c, declared, file) +
-                     validate_unit_refs_expr(t_, declared, file) +
-                     validate_unit_refs_opt_expr(eo, declared, file)
-  EMatch(scr, arms) -> validate_unit_refs_expr(scr, declared, file) +
-                        validate_unit_refs_arms(arms, declared, file, 0)
-  ELambda(_, b) -> validate_unit_refs_expr(b, declared, file)
-  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, declared, file, 0)
-  EList(els) -> validate_unit_refs_elems(els, declared, file, 0)
-  ERange(a, b, opt_step) -> validate_unit_refs_expr(a, declared, file) +
-                             validate_unit_refs_expr(b, declared, file) +
-                             validate_unit_refs_opt_expr(opt_step, declared, file)
-  EBlock(stmts, tail) -> validate_unit_refs_stmts(stmts, declared, file, 0) +
-                          validate_unit_refs_opt_expr(tail, declared, file)
-  EPipe(a, b)        -> validate_unit_refs_expr(a, declared, file) +
-                         validate_unit_refs_expr(b, declared, file)
-  EMapPipe(a, b)     -> validate_unit_refs_expr(a, declared, file) +
-                         validate_unit_refs_expr(b, declared, file)
-  EFlatMapPipe(a, b) -> validate_unit_refs_expr(a, declared, file) +
-                         validate_unit_refs_expr(b, declared, file)
-  EFilterPipe(a, b)  -> validate_unit_refs_expr(a, declared, file) +
-                         validate_unit_refs_expr(b, declared, file)
+  EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, scope, file, 0)
+  ECall(callee, args_) -> validate_unit_refs_expr(callee, scope, file) +
+                           validate_unit_refs_expr_list(args_, scope, file, 0)
+  EField(base, _) -> validate_unit_refs_expr(base, scope, file)
+  EIndex(a, b) -> validate_unit_refs_expr(a, scope, file) +
+                  validate_unit_refs_expr(b, scope, file)
+  EBinop(_, a, b) -> validate_unit_refs_expr(a, scope, file) +
+                     validate_unit_refs_expr(b, scope, file)
+  EUnop(_, x) -> validate_unit_refs_expr(x, scope, file)
+  EIf(c, t_, eo) -> validate_unit_refs_expr(c, scope, file) +
+                     validate_unit_refs_expr(t_, scope, file) +
+                     validate_unit_refs_opt_expr(eo, scope, file)
+  EMatch(scr, arms) -> validate_unit_refs_expr(scr, scope, file) +
+                        validate_unit_refs_arms(arms, scope, file, 0)
+  ELambda(_, b) -> validate_unit_refs_expr(b, scope, file)
+  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, scope, file, 0)
+  EList(els) -> validate_unit_refs_elems(els, scope, file, 0)
+  ERange(a, b, opt_step) -> validate_unit_refs_expr(a, scope, file) +
+                             validate_unit_refs_expr(b, scope, file) +
+                             validate_unit_refs_opt_expr(opt_step, scope, file)
+  EBlock(stmts, tail) -> validate_unit_refs_stmts(stmts, scope, file, 0) +
+                          validate_unit_refs_opt_expr(tail, scope, file)
+  EPipe(a, b)        -> validate_unit_refs_expr(a, scope, file) +
+                         validate_unit_refs_expr(b, scope, file)
+  EMapPipe(a, b)     -> validate_unit_refs_expr(a, scope, file) +
+                         validate_unit_refs_expr(b, scope, file)
+  EFlatMapPipe(a, b) -> validate_unit_refs_expr(a, scope, file) +
+                         validate_unit_refs_expr(b, scope, file)
+  EFilterPipe(a, b)  -> validate_unit_refs_expr(a, scope, file) +
+                         validate_unit_refs_expr(b, scope, file)
   EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
-    validate_unit_refs_expr(body, declared, file) +
-    validate_unit_refs_opt_expr(init_opt, declared, file) +
-    validate_unit_refs_clauses(clauses, declared, file, 0) +
-    validate_unit_refs_opt_return(ret_opt, declared, file)
-  ELitUnit(inner, u) -> validate_unit_refs_expr(inner, declared, file) +
-                         validate_unit_expr(u, declared, file, line, col)
-  EBang(inner) -> validate_unit_refs_expr(inner, declared, file)
+    validate_unit_refs_expr(body, scope, file) +
+    validate_unit_refs_opt_expr(init_opt, scope, file) +
+    validate_unit_refs_clauses(clauses, scope, file, 0) +
+    validate_unit_refs_opt_return(ret_opt, scope, file)
+  ELitUnit(inner, u) -> validate_unit_refs_expr(inner, scope, file) +
+                         validate_unit_expr(u, scope, file, line, col)
+  EBang(inner) -> validate_unit_refs_expr(inner, scope, file)
 }
 
-fn validate_unit_refs_expr_list(es: [Expr], declared: [String], file: String,
+fn validate_unit_refs_expr_list(es: [Expr], scope: UnitScope, file: String,
                                    acc: Int) : Int / Console + File = match es {
   [] -> acc
   [e, ...rest] -> {
-    let e1 = acc + validate_unit_refs_expr(e, declared, file)
-    validate_unit_refs_expr_list(rest, declared, file, e1)
+    let e1 = acc + validate_unit_refs_expr(e, scope, file)
+    validate_unit_refs_expr_list(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_opt_expr(opt: Option[Expr], declared: [String],
+fn validate_unit_refs_opt_expr(opt: Option[Expr], scope: UnitScope,
                                   file: String) : Int / Console + File = match opt {
   None -> 0
-  Some(e) -> validate_unit_refs_expr(e, declared, file)
+  Some(e) -> validate_unit_refs_expr(e, scope, file)
 }
 
-fn validate_unit_refs_arms(arms: [Arm], declared: [String], file: String,
+fn validate_unit_refs_arms(arms: [Arm], scope: UnitScope, file: String,
                               acc: Int) : Int / Console + File = match arms {
   [] -> acc
   [a, ...rest] -> match a {
     Arm(_, g, b) -> {
-      let e1 = acc + validate_unit_refs_opt_expr(g, declared, file) +
-                validate_unit_refs_expr(b, declared, file)
-      validate_unit_refs_arms(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_opt_expr(g, scope, file) +
+                validate_unit_refs_expr(b, scope, file)
+      validate_unit_refs_arms(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_fields(fs: [FieldInit], declared: [String], file: String,
+fn validate_unit_refs_fields(fs: [FieldInit], scope: UnitScope, file: String,
                                 acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     FI(_, v) -> {
-      let e1 = acc + validate_unit_refs_expr(v, declared, file)
-      validate_unit_refs_fields(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_expr(v, scope, file)
+      validate_unit_refs_fields(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_elems(els: [ListElem], declared: [String], file: String,
+fn validate_unit_refs_elems(els: [ListElem], scope: UnitScope, file: String,
                                acc: Int) : Int / Console + File = match els {
   [] -> acc
   [el, ...rest] -> {
     let e1 = match el {
-      ElPlain(x)  -> acc + validate_unit_refs_expr(x, declared, file)
-      ElSpread(x) -> acc + validate_unit_refs_expr(x, declared, file)
+      ElPlain(x)  -> acc + validate_unit_refs_expr(x, scope, file)
+      ElSpread(x) -> acc + validate_unit_refs_expr(x, scope, file)
     }
-    validate_unit_refs_elems(rest, declared, file, e1)
+    validate_unit_refs_elems(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_stmts(stmts: [Stmt], declared: [String], file: String,
+fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
                                acc: Int) : Int / Console + File = match stmts {
   [] -> acc
   [s, ...rest] -> {
     let e1 = match s {
-      SLet(_, _, rhs)             -> acc + validate_unit_refs_expr(rhs, declared, file)
+      SLet(_, _, rhs)             -> acc + validate_unit_refs_expr(rhs, scope, file)
       SAssert(c, m) -> match m {
-        Some(me) -> acc + validate_unit_refs_expr(c, declared, file) +
-                          validate_unit_refs_expr(me, declared, file)
-        None     -> acc + validate_unit_refs_expr(c, declared, file)
+        Some(me) -> acc + validate_unit_refs_expr(c, scope, file) +
+                          validate_unit_refs_expr(me, scope, file)
+        None     -> acc + validate_unit_refs_expr(c, scope, file)
       }
-      SExprStmt(x)                -> acc + validate_unit_refs_expr(x, declared, file)
-      SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, declared, file) +
-                                            validate_unit_refs_expr(i, declared, file) +
-                                            validate_unit_refs_expr(v, declared, file)
-      SVar(_, _, rhs, _, _)       -> acc + validate_unit_refs_expr(rhs, declared, file)
+      SExprStmt(x)                -> acc + validate_unit_refs_expr(x, scope, file)
+      SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, scope, file) +
+                                            validate_unit_refs_expr(i, scope, file) +
+                                            validate_unit_refs_expr(v, scope, file)
+      SVar(_, _, rhs, _, _)       -> acc + validate_unit_refs_expr(rhs, scope, file)
       SUse(_, _, _)               -> acc
     }
-    validate_unit_refs_stmts(rest, declared, file, e1)
+    validate_unit_refs_stmts(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_clauses(cs: [HClause], declared: [String], file: String,
+fn validate_unit_refs_clauses(cs: [HClause], scope: UnitScope, file: String,
                                  acc: Int) : Int / Console + File = match cs {
   [] -> acc
   [c, ...rest] -> match c {
     HC(_, _, b, _, _) -> {
-      let e1 = acc + validate_unit_refs_expr(b, declared, file)
-      validate_unit_refs_clauses(rest, declared, file, e1)
+      let e1 = acc + validate_unit_refs_expr(b, scope, file)
+      validate_unit_refs_clauses(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_opt_return(opt: Option[HReturn], declared: [String],
+fn validate_unit_refs_opt_return(opt: Option[HReturn], scope: UnitScope,
                                     file: String) : Int / Console + File = match opt {
   None -> 0
-  Some(r) -> match r { HR(_, b, _, _) -> validate_unit_refs_expr(b, declared, file) }
+  Some(r) -> match r { HR(_, b, _, _) -> validate_unit_refs_expr(b, scope, file) }
 }
 
-# Walk a UnitExprT and emit one error per undeclared USym. Linear in
-# the tree size; cycles cannot occur because UnitExprT is finite.
-fn validate_unit_expr(u: UnitExprT, declared: [String], file: String,
-                         line: Int, col: Int) : Int / Console + File = match u {
+# Walk a UnitExprT and emit one diagnostic per unresolved habitant
+# symbol. After kind resolution a resolved symbol is qualified
+# (`Metric$m`); a still-bare `USym` either resolves to zero kinds
+# (undeclared) or several with no `use kind` (ambiguous). The scope
+# carries the kind context and the decl's local unit-kind tparams.
+fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
+                         file: String, line: Int, col: Int) : Int / Console + File = match u {
   UOne -> 0
   UVar(_) -> 0
-  USym(s) ->
-    if list_has_string(declared, s) { 0 }
-    else if is_builtin_unit_symbol(s) { 0 }
-    else {
+  USym(s) -> match scope_resolve_sym(scope, s) {
+    SRok(_) -> 0
+    SRunknown -> {
       diag_error(file, line, col,
         concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
                     "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
       1
     }
-  UMul(a, b) -> validate_unit_expr(a, declared, file, line, col) +
-                validate_unit_expr(b, declared, file, line, col)
-  UInv(a) -> validate_unit_expr(a, declared, file, line, col)
-  UPow(a, _) -> validate_unit_expr(a, declared, file, line, col)
+    SRambig(kinds) -> {
+      diag_error(file, line, col,
+        concat_all(["unit `", s, "` is ambiguous — it is declared in ",
+                    join_with(kinds, " and "),
+                    "; qualify it (`<", ambig_first_kind(kinds), ".", s,
+                    ">`) or add `use kind ", ambig_first_kind(kinds), "`"]))
+      1
+    }
+  }
+  UMul(a, b) -> validate_unit_expr(a, scope, file, line, col) +
+                validate_unit_expr(b, scope, file, line, col)
+  UInv(a) -> validate_unit_expr(a, scope, file, line, col)
+  UPow(a, _) -> validate_unit_expr(a, scope, file, line, col)
+}
+
+# First candidate kind of an ambiguous symbol, for the "qualify as
+# <Kind.sym>" hint. The candidate list is never empty here (ambiguity
+# means >= 2), but a fallback keeps the walker total.
+fn ambig_first_kind(kinds: [String]) : String = match kinds {
+  [] -> "Kind"
+  [h, ..._] -> h
 }
 
 # Reserved unit symbols the compiler treats as built-in (currently
@@ -17888,7 +17907,7 @@ fn pub_leak_priv_one(d: Decl, home: String,
     if p { acc } else { [PLPriv(home, name, "effect"), ...acc] }
   DProtocol(p, name, _, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "protocol"), ...acc] }
-  DUnit(p, name, _, _, _) ->
+  DUnit(p, name, _, _, _, _) ->
     if p { acc } else { [PLPriv(home, name, "unit"), ...acc] }
   DDerive(_, inner, _, _) -> pub_leak_priv_one(inner, home, acc)
   DUnstable(inner, _, _) -> pub_leak_priv_one(inner, home, acc)
@@ -18216,284 +18235,7 @@ fn expand_unit_aliases_in_unit(u: UnitExprT, aliases: [UAliasEntry], seen: [Stri
 }
 
 fn expand_unit_aliases_decls(ds: [Decl], aliases: [UAliasEntry]) : [Decl] =
-  map(ds, (d) => expand_unit_aliases_decl(d, aliases))
-
-fn expand_unit_aliases_decl(d: Decl, aliases: [UAliasEntry]) : Decl {
-  match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(p, n, tps,
-          map(ps, (pm) => expand_aliases_param(pm, aliases)),
-          match ret { Some(t) -> Some(expand_aliases_typeexpr(t, aliases)) None -> None },
-          row,
-          expand_aliases_expr(body, aliases),
-          l, c, mo)
-    DType(p, n, tps, body, l, c, mo) ->
-      DType(p, n, tps, expand_aliases_typebody(body, aliases), l, c, mo)
-    DTest(desc, body, l, c) -> DTest(desc, expand_aliases_expr(body, aliases), l, c)
-    DBench(desc, body, l, c) -> DBench(desc, expand_aliases_expr(body, aliases), l, c)
-    DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, expand_aliases_expr(body, aliases), l, c)
-    DImport(_, _, _) -> d
-    DEffect(p, n, tps, ops, defblk, l, c, mo) ->
-      DEffect(p, n, tps, map(ops, (op) => expand_aliases_op(op, aliases)), defblk, l, c, mo)
-    DUnit(_, _, _, _, _) -> d
-    # protocols are stripped by `lower_protocols` before
-    # `infer_program` runs, so reaching one here means the unit-alias
-    # pass executed on a pre-lowering decl stream — pass through.
-    DProtocol(_, _, _, _, _, _) -> d
-    DImpl(_, _, _, _, _, _) -> d
-    DDerive(_, _, _, _) -> d
-    DUnstable(_, _, _) -> d
-    DConstructor(_, _, _) -> d
-    # DUse has no TypeExpr to expand; pass through. The
-    # desugar_use_decls pass handles it later.
-    DUse(_, _, _) -> d
-    # DAxiom is rewritten to DFn by lower_axioms before this
-    # pass; the case is kept for completeness when expand_aliases_decl
-    # is invoked on a pre-lowering decl stream (e.g., via --ast).
-    DAxiom(_, _, _, _, _, _, _, _, _, _) -> d
-    # (a): DAttribPure unwraps before this pass runs in
-    # the driver; case kept for `--ast` and other early-pipeline
-    # callers that work on the raw decl stream.
-    # DConst survives as DConst through the whole pipeline (no longer
-    # lowered to a disguised zero-arg fn). Walks the type expression
-    # for unit aliases and the body for any nested literals; consts
-    # always have literal bodies today but the recursion is harmless.
-    DConst(p, n, ty, body, mo, l, c) ->
-      DConst(p, n, expand_aliases_typeexpr(ty, aliases),
-              expand_aliases_expr(body, aliases), mo, l, c)
-    # doc wrappers — the item wrapper recurses (pre-strip
-    # callers like --ast), the module-doc carrier has no types.
-    DDoc(raw, text, inner, l, c) ->
-      DDoc(raw, text, expand_unit_aliases_decl(inner, aliases), l, c)
-    DModuleDoc(_, _, _, _) -> d
-    # FFI v2: a foreign type's fields are fixed-width — no unit aliases.
-    DExternType(_, _, _, _) -> d
-    # catalog decls carry no TypeExprs; stripped pre-infer anyway.
-    DTheory(_, _, _, _) -> d
-    DKind(_, _, _, _, _, _) -> d
-  }
-}
-
-fn expand_aliases_param(pm: Param, aliases: [UAliasEntry]) : Param =
-  Param {
-    pname: pm.pname,
-    ptype: match pm.ptype {
-      Some(t) -> Some(expand_aliases_typeexpr(t, aliases))
-      None -> None
-    },
-    pline: pm.pline,
-    pcol: pm.pcol, pborrow: pm.pborrow }
-
-fn expand_aliases_typebody(b: TypeBody, aliases: [UAliasEntry]) : TypeBody {
-  match b {
-    TBAlias(t) -> TBAlias(expand_aliases_typeexpr(t, aliases))
-    TBRecord(fs) -> TBRecord(expand_aliases_fdecls(fs, aliases))
-    TBSum(vs) -> TBSum(expand_aliases_variants(vs, aliases))
-    TBEffectAlias(_) -> b
-  }
-}
-
-fn expand_aliases_fdecls(fs: [FieldDecl], aliases: [UAliasEntry]) : [FieldDecl] {
-  match fs {
-    [] -> []
-    [h, ...rest] -> match h {
-      FD(is_pub, n, t) -> [FD(is_pub, n, expand_aliases_typeexpr(t, aliases)),
-                   ...expand_aliases_fdecls(rest, aliases)]
-    }
-  }
-}
-
-fn expand_aliases_variants(vs: [Variant], aliases: [UAliasEntry]) : [Variant] {
-  match vs {
-    [] -> []
-    [h, ...rest] -> match h {
-      Var(n, ts) -> [Var(n, expand_aliases_typeexprs(ts, aliases)),
-                     ...expand_aliases_variants(rest, aliases)]
-    }
-  }
-}
-
-fn expand_aliases_typeexprs(ts: [TypeExpr], aliases: [UAliasEntry]) : [TypeExpr] {
-  match ts {
-    [] -> []
-    [h, ...rest] -> [expand_aliases_typeexpr(h, aliases),
-                     ...expand_aliases_typeexprs(rest, aliases)]
-  }
-}
-
-fn expand_aliases_op(op: EffectOp, aliases: [UAliasEntry]) : EffectOp {
-  match op {
-    EOp(n, tps, ps, ret, l, c) ->
-      EOp(n, tps,
-          map(ps, (pm) => expand_aliases_param(pm, aliases)),
-          expand_aliases_typeexpr(ret, aliases), l, c)
-  }
-}
-
-fn expand_aliases_typeexpr(t: TypeExpr, aliases: [UAliasEntry]) : TypeExpr {
-  match t.tkind {
-    TyName(n, ts) ->
-      mk_ty(TyName(n, map(ts, (a) => expand_aliases_typeexpr(a, aliases))), t.line, t.col)
-    TyList(inner) ->
-      mk_ty(TyList(expand_aliases_typeexpr(inner, aliases)), t.line, t.col)
-    TyFn(ps, ret, row) ->
-      mk_ty(TyFn(map(ps, (a) => expand_aliases_typeexpr(a, aliases)),
-                 expand_aliases_typeexpr(ret, aliases), row), t.line, t.col)
-    TyDim(base, u) ->
-      mk_ty(TyDim(expand_aliases_typeexpr(base, aliases),
-                  expand_unit_aliases_in_unit(u, aliases, [])), t.line, t.col)
-    # refinements pass through alias expansion. The predicate
-    # is preserved verbatim — no unit aliases live inside it.
-    TyRefine(base, p) ->
-      mk_ty(TyRefine(expand_aliases_typeexpr(base, aliases), p), t.line, t.col)
-    # a compound-row carrier is passed through this unit-alias
-    # expansion unchanged, matching the `TyFn` arm (which leaves its row
-    # untouched). Effect-alias labels are expanded on the row-expression
-    # side, not here.
-    TyRow(_) -> t
-  }
-}
-
-fn expand_aliases_expr(e: Expr, aliases: [UAliasEntry]) : Expr {
-  let new_kind = expand_aliases_exprkind(e.kind, aliases)
-  Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-}
-
-fn expand_aliases_exprkind(k: ExprKind, aliases: [UAliasEntry]) : ExprKind {
-  match k {
-    EInt(_) -> k
-    EReal(_, _) -> k
-    EIntLit(_) -> k
-    EDecimalLit(_) -> k
-    EFixed(_, _) -> k
-    EBool(_) -> k
-    EChar(_) -> k
-    EStr(_, _) -> k
-    EUnit -> k
-    EVar(_) -> k
-    EUnder -> k
-    EPlaceholder -> k
-    ECall(f, xs) -> ECall(expand_aliases_expr(f, aliases),
-                          map(xs, (x) => expand_aliases_expr(x, aliases)))
-    EField(b, n) -> EField(expand_aliases_expr(b, aliases), n)
-    EIndex(a, b) -> EIndex(expand_aliases_expr(a, aliases),
-                           expand_aliases_expr(b, aliases))
-    EBinop(op, a, b) -> EBinop(op, expand_aliases_expr(a, aliases),
-                                   expand_aliases_expr(b, aliases))
-    EUnop(op, x) -> EUnop(op, expand_aliases_expr(x, aliases))
-    EIf(c, t_, eo) -> EIf(expand_aliases_expr(c, aliases),
-                          expand_aliases_expr(t_, aliases),
-                          match eo { Some(eb) -> Some(expand_aliases_expr(eb, aliases)) None -> None })
-    EMatch(scr, arms) -> EMatch(expand_aliases_expr(scr, aliases),
-                                map(arms, (a) => expand_aliases_arm(a, aliases)))
-    ELambda(ps, body) ->
-      ELambda(map(ps, (pm) => expand_aliases_param(pm, aliases)),
-              expand_aliases_expr(body, aliases))
-    ERecordLit(n, fis) -> ERecordLit(n, expand_aliases_field_inits(fis, aliases))
-    EList(els) -> EList(map(els, (el) => expand_aliases_listelem(el, aliases)))
-    ERange(a, b, opt_step) ->
-      ERange(expand_aliases_expr(a, aliases),
-             expand_aliases_expr(b, aliases),
-             match opt_step { Some(s) -> Some(expand_aliases_expr(s, aliases)) None -> None })
-    EBlock(stmts, opt_final) ->
-      EBlock(map(stmts, (s) => expand_aliases_stmt(s, aliases)),
-             match opt_final { Some(fe) -> Some(expand_aliases_expr(fe, aliases)) None -> None })
-    EPipe(a, b) -> EPipe(expand_aliases_expr(a, aliases),
-                         expand_aliases_expr(b, aliases))
-    EMapPipe(a, b) -> EMapPipe(expand_aliases_expr(a, aliases),
-                               expand_aliases_expr(b, aliases))
-    EFlatMapPipe(a, b) -> EFlatMapPipe(expand_aliases_expr(a, aliases),
-                                       expand_aliases_expr(b, aliases))
-    EFilterPipe(a, b) -> EFilterPipe(expand_aliases_expr(a, aliases),
-                                     expand_aliases_expr(b, aliases))
-    EHole(_) -> k
-    ETodo(_) -> k
-    EExternBody(_) -> k
-    EBang(inner) -> EBang(expand_aliases_expr(inner, aliases))
-    EHandle(body, eff_n, eff_tas, init_opt, alias_opt, cs, ret_opt) ->
-      EHandle(expand_aliases_expr(body, aliases), eff_n,
-              map(eff_tas, (t) => expand_aliases_typeexpr(t, aliases)),
-              match init_opt { Some(ie) -> Some(expand_aliases_expr(ie, aliases)) None -> None },
-              alias_opt,
-              map(cs, (c) => expand_aliases_hclause(c, aliases)),
-              match ret_opt { Some(r) -> Some(expand_aliases_hreturn(r, aliases)) None -> None })
-    ELitUnit(inner, u) ->
-      ELitUnit(expand_aliases_expr(inner, aliases),
-               expand_unit_aliases_in_unit(u, aliases, []))
-    # expand aliases inside the TypeExpr that `variants[T]()`
-    # carries, so a unit-aliased name (or a future generic-aliased
-    # type) reaches the resolver in canonical form.
-    EVariantsOf(ty, names) ->
-      EVariantsOf(expand_aliases_typeexpr(ty, aliases), names)
-    # qualified module call holds plain strings
-    # (module + function names). No type alias to expand.
-    EModCall(m, fname) -> EModCall(m, fname)
-    EIntrinsic(name, args_) ->
-      EIntrinsic(name, map(args_, (a) => expand_aliases_expr(a, aliases)))
-  }
-}
-
-fn expand_aliases_field_inits(fis: [FieldInit], aliases: [UAliasEntry]) : [FieldInit] {
-  match fis {
-    [] -> []
-    [h, ...rest] -> match h {
-      FI(fn_, v) -> [FI(fn_, expand_aliases_expr(v, aliases)),
-                     ...expand_aliases_field_inits(rest, aliases)]
-    }
-  }
-}
-
-fn expand_aliases_arm(a: Arm, aliases: [UAliasEntry]) : Arm {
-  match a {
-    Arm(pat, opt_g, body) -> Arm(pat,
-      match opt_g { Some(g) -> Some(expand_aliases_expr(g, aliases)) None -> None },
-      expand_aliases_expr(body, aliases))
-  }
-}
-
-fn expand_aliases_listelem(el: ListElem, aliases: [UAliasEntry]) : ListElem {
-  match el {
-    ElPlain(x) -> ElPlain(expand_aliases_expr(x, aliases))
-    ElSpread(x) -> ElSpread(expand_aliases_expr(x, aliases))
-  }
-}
-
-fn expand_aliases_stmt(s: Stmt, aliases: [UAliasEntry]) : Stmt {
-  match s {
-    SLet(p, t, rhs) ->
-      SLet(p,
-           match t { Some(te) -> Some(expand_aliases_typeexpr(te, aliases)) None -> None },
-           expand_aliases_expr(rhs, aliases))
-    SAssert(c, msg) ->
-      SAssert(expand_aliases_expr(c, aliases),
-              match msg { Some(m) -> Some(expand_aliases_expr(m, aliases)) None -> None })
-    SExprStmt(x) -> SExprStmt(expand_aliases_expr(x, aliases))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(expand_aliases_expr(b, aliases),
-                   expand_aliases_expr(i, aliases),
-                   expand_aliases_expr(v, aliases), l, c)
-    SVar(n, te, rhs, l, c) ->
-      SVar(n,
-           match te { Some(t) -> Some(expand_aliases_typeexpr(t, aliases)) None -> None },
-           expand_aliases_expr(rhs, aliases), l, c)
-    # SUse has no TypeExpr to expand. Pass through.
-    SUse(n, l, c) -> SUse(n, l, c)
-  }
-}
-
-fn expand_aliases_hclause(c: HClause, aliases: [UAliasEntry]) : HClause {
-  match c {
-    HC(n, ps, body, l, col) ->
-      HC(n, map(ps, (pm) => expand_aliases_param(pm, aliases)),
-         expand_aliases_expr(body, aliases), l, col)
-  }
-}
-
-fn expand_aliases_hreturn(r: HReturn, aliases: [UAliasEntry]) : HReturn {
-  match r {
-    HR(n, body, l, c) -> HR(n, expand_aliases_expr(body, aliases), l, c)
-  }
-}
+  map_units_decls(ds, (u) => expand_unit_aliases_in_unit(u, aliases, []))
 
 # Per-module typer env deltas.
 #
@@ -19022,8 +18764,9 @@ fn decide_partition_home(d: Decl, target_mod: String,
     Some(m) -> m
     None    -> target_mod
   }
-  DUnit(_, _, _, _, _)                -> anchor
+  DUnit(_, _, _, _, _, _)             -> anchor
   DUse(_, _, _)                        -> anchor
+  DUseKind(_, _, _)                    -> anchor
   DAxiom(_, _, _, _, _, _, _, _, _, _) -> anchor
   # a `test`/`bench`/`check` block lives in the same
   # physical .kai file as the surrounding decls, so it belongs to the
