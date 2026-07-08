@@ -108,34 +108,32 @@ loop shape, where the recursive re-thread keeps the array alive.
 
 ### User-parameter borrow (#1127)
 
-The same borrow machinery now extends to **user function parameters**,
-hybrid: inferred on non-`pub` functions (a relaxed callee-discipline rule,
-`borrow_infer.kai`), explicit `^` on `pub` parameters (calling convention =
-ABI, serialized in the module interface). The read-path (non-closure)
-borrow ships: a value-typed parameter inspected and re-passed
-borrow-through no longer forces the whole parameter owned.
+The borrow **surface** now extends to **user function parameters**: `^` on
+a `pub` parameter (calling convention = ABI, serialized in the module
+interface), plus the pre-existing conservative inference (the `is_red`
+shape) on non-`pub` functions. The emit soundness gates that make a
+borrowed scrutinee safe on the native backend (arm-move / goto-tail / reuse
+recogniser inhibited, TCO dropmask unions the borrow set) ship too.
 
-> **v1 status (2026-07-08):** the CLOSURE borrow — the HOF win, the RC
-> collapse of a closure threaded through `map`/`filter`/`fold` — is
-> DEFERRED. The runtime `kai_apply` (call_ind) consumes the closure it
-> invokes and there is no borrowing call variant, so borrowing a called
-> closure would strip the caller dup while the callee consumes — a
-> use-after-free (the C selfhost byte-id oracle caught it; the native
-> backend hid it). A closure param (function type) is excluded from the
-> effective borrow set: `^f` / `^p` on the stdlib HOFs SERIALIZE in the
-> ABI (ABI-ready) but codegen keeps the closure owned. The collapse is
-> gated on a borrowing call variant (`call_ind_borrow`), a runtime-ABI
-> follow-up.
-
-Honest residual on the read path: a read-only *tree descent* (the lookup
-shape) improves but does NOT fully collapse — the container re-thread is
-elided, but the per-level dup of a bound child that flows to a
-borrow-through position still fires (measured 23097 → 21097 over a
-200-deep degenerate tree, 1000 lookups). Collapsing it needs a bound child
-whose sole use is a borrow-through position to bind borrowed rather than
-take the unconditional `is_alias` dup — a finer analysis than the one-step
-fixpoint shipped here, tracked as a follow-up. The shipped choice dups the
-child (a missed elision, never a use-after-free).
+> **v1 status (2026-07-08):** two things are DEFERRED, each blocked by a
+> selfhost oracle, not by effort:
+>
+> - **Closure borrow (the HOF win).** The runtime `kai_apply` (call_ind)
+>   consumes the closure it invokes (#298); no borrowing call variant. A
+>   closure (function-typed) param is excluded from the effective borrow
+>   set — `^f` / `^p` SERIALIZE in the ABI (ABI-ready) but codegen keeps the
+>   closure owned. Gated on `call_ind_borrow` (the C selfhost byte-id caught
+>   the UAF; native hid it).
+> - **Relaxed read-path inference.** A relaxed callee-discipline rule
+>   (children-of-borrowed, borrow-through) passed every single-TU gate but
+>   crashed `test-modular-selfhost` (the sep-comp compiler UAF'd compiling a
+>   real program). The emit is not a pure function of the whole-program
+>   borrow map — it rides a decl-grouping / per-partition-linkage invariant
+>   the monolithic TU only guarantees incidentally. Reverted to the
+>   conservative rule; reopening gate is the modular fixture in red.
+>
+> Both wins are real but blocked on runtime-ABI / sep-comp work, tracked as
+> follow-up issues.
 
 ### The one remaining lever, and what is NOT the lever
 

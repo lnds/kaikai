@@ -9,26 +9,46 @@ ultra-conservative `pcs_borrow_params`), explicit `^` on `pub` parameters
 `^` parses + serializes + elides the caller dup; TCO preserved; reuse
 exclusion held.
 
-**Shipped:** the full hybrid model (inferred private + explicit `^` public),
-the `^` surface with `pub`-ABI serialization, the stdlib HOF sweep (17
-annotations in `stdlib/core/list.kai`), and the soundness gates. Both
-backends (C oracle + native) compile and run all shapes, selfhost byte-id C
-AND native.
+**Shipped:** the `^` surface with `pub`-ABI serialization, the stdlib HOF
+sweep (17 annotations in `stdlib/core/list.kai`), the conservative inference
+(the pre-existing `is_red` rule, kept), and the emit soundness gates. Two
+independent oracles forced two scope calls, and the RELAXED inference was
+removed entirely — the surface and ABI are what ships.
 
-**Scope call, verified by the C selfhost oracle: closure borrow is deferred.**
-The runtime `kai_apply` (call_ind) CONSUMES the closure it invokes (issue
-#298), and there is no borrowing call variant. Borrowing a CALLED closure
-would strip the caller dup while the callee still consumes → a
-use-after-free. The native backend hid this; the C selfhost byte-id destroyed
-it — the self-hosted C compiler crashed with `attempted to call a
-non-callable value` when a compiler-internal HOF's borrowed closure was freed
-before a call. So a CLOSURE param (function type) is excluded from the
-EFFECTIVE (codegen) borrow set: the `^` still SERIALIZES in the ABI
-(ABI-ready), but codegen keeps the closure owned. The design's "big one" —
-the HOF closure win, the RC collapse of the closure-threaded loop — is gated
-on a borrowing call variant (`call_ind_borrow`), tracked as a follow-up. What
-DID ship: the read-path (non-closure) borrow, inferred and sound; the surface
-and ABI; and the stdlib `^` annotations, inert-but-sound.
+**Scope call 1 (C selfhost oracle): closure borrow deferred.** The runtime
+`kai_apply` (call_ind) CONSUMES the closure it invokes (#298); no borrowing
+call variant. Borrowing a CALLED closure strips the caller dup while the
+callee consumes → use-after-free. The native backend hid it; the C selfhost
+byte-id caught it (the self-hosted C compiler crashed "attempted to call a
+non-callable value" on a compiler-internal HOF). So a closure (function-typed)
+param is excluded from the effective codegen borrow set — the `^` SERIALIZES
+in the ABI (ABI-ready) but codegen keeps the closure owned.
+
+**Scope call 2 (modular selfhost oracle): relaxed inference reverted.** The
+relaxed read-path inference (children-of-borrowed, borrow-through) passed
+every single-TU gate (selfhost byte-id C+native, tier0, rc-detector,
+tier1-asan) but the SEP-COMP `test-modular-selfhost` failed: the compiler
+compiled in `--emit=c-modular` mode crashed compiling a real program
+(`portfolio.kai`) with `panic: non-exhaustive match` — a UAF. Bisection was
+decisive: with the relaxed inference disabled (conservative only), the modular
+binary compiles portfolio cleanly. The emit is not a pure function of the
+whole-program borrow map: it depends on the decl grouping and per-partition
+linkage a monolithic TU only guarantees incidentally (the relaxation planted a
+dup/drop whose correctness rode that incidental invariant; asu's leading
+suspects are TRMC-plant-before-goto and per-partition static-ization). Per the
+project tie-breaker *safety beats ergonomics* and the rule *never ship
+something that breaks the selfhost*, the relaxed inference was removed from the
+pass (not flagged off — dead code behind a flag lies about a supported path).
+The read-path win it bought (P2 descent, which was only PARTIAL anyway,
+23097→21097) is reopened as its own issue whose reopening gate is the modular
+fixture in red.
+
+**What ships, all sound in single-TU AND modular:** the `^` surface, the
+`pub`-ABI serialization, the conservative inference, the stdlib `^`
+annotations (inert-but-sound — closures stay owned), and the emit soundness
+gates (arm-move / goto-tail / reuse-recogniser inhibited over any borrowed
+scrutinee, TCO dropmask unions the borrow set). Selfhost byte-id C AND native;
+modular selfhost green.
 
 ## The cause chain, verified (the brief warned soundness would be subtle)
 
