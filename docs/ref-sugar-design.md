@@ -1,9 +1,10 @@
 # `Ref[T]` surface sugar — `&` make, `:=` set, `@` deref (design proposal)
 
-**Status:** proposal, not accepted. Consolidates a design conversation. Motivated by
-#1113 (`:=` rejects a `Ref` record field) and by `Ref[T]` surfacing in everyday user
-code (graph nodes with rewritable edges — `kaikai-vs-rust` cases 1 & 6), which
-refutes the original rationale for leaving `Ref` verbose.
+**Status:** shipped. Motivated by #1113 (`:=` rejects a `Ref` record field) and by
+`Ref[T]` surfacing in everyday user code (graph nodes with rewritable edges —
+`kaikai-vs-rust` cases 1 & 6), which refutes the original rationale for leaving `Ref`
+verbose. The trio `&` / `:=` / `@` is live: `&x` opens a ref, `r := v` and
+`record.field := v` write, `@r` and `@r.field` read.
 
 ## The problem
 
@@ -68,9 +69,11 @@ remains in the row type inferred for any function that touches a ref, so Tier 1 
 
 - **`&`** is free — not a lexer token, no bit-and-as-sigil (bitwise ops live in
   `stdlib/math/bits.kai` via UFCS, not as a symbol). Available for `ref_make`.
-- **`@`** is currently `TkAt`, used for **as-binding patterns** (`whole @ [_, ...]`,
-  `parse.kai:1235`). To use `@` for deref, the as-binding must move to the `as`
-  keyword (below). This is the load-bearing dependency of the elegant trio.
+- **`@`** is `TkAt`. It serves deref in **expression** position (`@r`) and, as
+  legacy, as-binding in **pattern** position (`whole @ [_, ...]`). The two never
+  collide — the parser is never in both grammatical positions at once — so deref did
+  not have to wait on migrating the as-binding. The as-binding now reads canonically
+  as `as` (`whole as [_, ...]`); `@`-as-binding stays accepted for now.
 - **`!`** (`TkBang`) and **`^`** (`TkCaret`, power / UoM) are taken — not candidates
   for deref.
 
@@ -94,8 +97,9 @@ match xs {
 }
 ```
 
-`@` was an ML/Rust inheritance kaikai has no reason to carry. Migrating it frees `@`
-for its more natural pointer-deref meaning.
+`@`-as-binding was an ML/Rust inheritance; `as` reads more naturally. The migration is
+a readability move, not a prerequisite for deref — `@r` deref and `@`-as-binding
+already coexist in disjoint grammatical positions.
 
 ### Migration cost (measured)
 
