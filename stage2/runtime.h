@@ -5760,12 +5760,27 @@ static KaiValue *kai_prelude_array_length(KaiValue *a) {
     return r;
 }
 
+/* Borrow variant (issue #1120): read the length without consuming `a`. */
+static KaiValue *kai_prelude_array_length_borrow(KaiValue *a) {
+    int64_t len = (kai_is_ptr(a) && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
+    return kai_int(len);
+}
+
 static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     KaiValue *r = kai_array_get_impl(a, idx);
     if (a) kai_decref(a);
     if (i) kai_decref(i);
     return r;
+}
+
+/* Borrow variant (issue #1120): the container is BORROWED, not consumed —
+   the caller kept its ref (Perceus stripped the dup), so we must NOT decref
+   `a`. The element still leaves the array with +1 (it escapes to the
+   caller). `i` is a tagged Int and is not rc-touched. */
+static KaiValue *kai_prelude_array_get_borrow(KaiValue *a, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    return kai_array_get_impl(a, idx);
 }
 
 static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
