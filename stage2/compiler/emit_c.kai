@@ -11139,7 +11139,7 @@ fn expand_ta_param(pm: Param, table: [TAEntry], aliases: [AliasResult], fuel: In
             None -> None
             Some(te) -> Some(expand_ta_te(te, table, aliases, fuel))
           },
-          pline: pm.pline, pcol: pm.pcol }
+          pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
 
 fn expand_ta_fields(fs: [FieldDecl], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [FieldDecl] {
   match fs {
@@ -11649,7 +11649,7 @@ fn mangle_param(pm: Param, entries: [PrivTyEntry],
             None -> None
             Some(te) -> Some(mangle_te(te, entries, home_mod))
           },
-          pline: pm.pline, pcol: pm.pcol }
+          pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
 
 fn mangle_typebody(b: TypeBody, entries: [PrivTyEntry],
                      home_mod: String) : TypeBody {
@@ -12746,8 +12746,17 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console
             # linear), so widen it with every param whose reads the
             # rewriter actually left bare. A TCO drop planted without
             # the matching dup double-frees the original ref.
-            let skip_set = tcrec_widen_skip_raw_reads(pnames, body,
-                             pcs_branch_aware_skip_params(pnames, body))
+            # Issue #1127 — a borrowed param (inferred or `^`) is never
+            # dropped by the callee (it does not own the value), so the TCO
+            # step must NOT drop it either: a borrow-through self-tail-call
+            # re-passes the SAME borrowed value. Union the hybrid borrow set
+            # into the skip-set so `tcrec_compute_site_dropmask` leaves those
+            # slots out of the dropmask (else the step drops a value the
+            # caller still owns and the back-edge re-reads freed memory).
+            let borrowed_ps = pcs_borrow_params_hybrid(is_pub, pcs_borrow_key(name, mo), params, pnames, body)
+            let skip_set = pcs_list_union(borrowed_ps,
+                             tcrec_widen_skip_raw_reads(pnames, body,
+                               pcs_branch_aware_skip_params(pnames, body)))
             # TRMC: when the fn is modulo-cons-eligible (a constructor
             # in tail position with a self-call slot) AND its effect row
             # is affine (REmpty — no suspendable effect between the cctx
@@ -12893,9 +12902,12 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                                                    pnames, uses, borrow_flags, [], [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
-            # transfer), same as the non-wrap branch.
-            let skip_set = tcrec_widen_skip_raw_reads(pnames, inner,
-                             pcs_branch_aware_skip_params(pnames, inner))
+            # transfer), same as the non-wrap branch. Plus the #1127
+            # borrow set (a borrow-through param is never TCO-dropped).
+            let borrowed_ps = pcs_borrow_params_hybrid(is_pub, pcs_borrow_key(name, mo), params, pnames, inner)
+            let skip_set = pcs_list_union(borrowed_ps,
+                             tcrec_widen_skip_raw_reads(pnames, inner,
+                               pcs_branch_aware_skip_params(pnames, inner)))
             # TRMC: when the inner body is modulo-cons-eligible and the
             # effect row is affine, rewrite the INNER via the cctx path
             # and DROP the exit-drop wrap entirely. The cctx carries the
