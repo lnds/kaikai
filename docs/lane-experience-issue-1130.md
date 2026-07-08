@@ -76,19 +76,20 @@ call, not per element).
 | shape | before (#1129, owned) | after (#1130) |
 |---|---:|---:|
 | Probe A: `go(1000, ^f)` closure through tail loop | ~2000 incref + ~2000 decref | **incref_total=0, decref_total=0** |
-| closure alloc across the loop | — | `allocs=1 leak=1` CONSTANT (N=100k → still 1) |
-| HOF fixture (map/filter/2×foldl over 10 elems) | closure dup per call | correct=170, leaked=11 bounded |
+| HOF fixture (map/filter/2×foldl over 10 elems) | closure dup per call | correct=170, leaked=7 |
+| #817 filter-over-heap, 5000 iters | (baseline) | leaked=12 (was 5012 pre-drop-after-call) |
 
 **The measured 2+2/iter → 0 (isolated closure-dominated bench, N=5M, C):**
 
-| | incref_total | decref_total | leaked |
-|---|---:|---:|---:|
-| owned (`go(5M, f)`, no `^`) | **10,000,000** | 10,000,001 | 7 |
-| borrow (`go(5M, ^f)`) | **0** | **0** | 8 |
+| | incref_total | decref_total |
+|---|---:|---:|
+| owned (`go(5M, f)`, no `^`) | **10,000,000** | 10,000,001 |
+| borrow (`go(5M, ^f)`) | **0** | **0** |
 
 Exactly 2 incref + 2 decref per iteration eliminated. The native fixture
-inherits the collapse from the shared KIR (`incref_total=0`). The +1 leaked is
-the bounded fresh-closure caller leak.
+inherits the collapse from the shared KIR (`incref_total=0`). Leaked counters
+are constant across all fixtures now that the caller drops the fresh closure
+after the call (see the drop-after-call section below).
 
 **Wall (acceptance #3).** HOF pipeline map+filter+foldl over N=1M list: 0.04s
 C, 0.04s native (identical). The workload is **memory-bound** — building and
@@ -105,19 +106,68 @@ vs C (README baseline 1.92x — identical within noise), kaikai-c 1.36x. The
 rb-tree insert path uses NO `^` HOFs (the inference extension that would touch
 it is out of scope), so its RC counters are unchanged by construction.
 
-## Known imperfection: fresh-closure caller leak (bounded)
+## The drop-after-call (rule 1) — forced in mid-lane by the #817 CI oracle
 
-A closure literal passed to a borrow slot (`sum_via_fold(xs) = foldl(xs, 0,
-LAMBDA)`) leaks ONE ref per call-site: the HOF borrows it (never drops), and
-the caller does not drop-after-call. This is BOUNDED — per static call-site,
-never per element (verified: N=100k `foldl` still leaks exactly 1). The full
-rule-1 fix (caller drop-after-call) conflicts with mandatory TCO when the HOF
-call sits in the caller's tail position (rule 6 wants dup-before/drop-before,
-which a fresh rc=1 closure cannot take), and the `EBlock([…, SLet(__pcs_ret,
-call), drop], __pcs_ret)` wrap that would fix it "cannot be lowered in a
-closure body" on native (the #817 note). Left as a follow-up, matching the
-#1129 precedent of accepting a bounded borrow leak; the win (zero per-iteration
-RC) is unaffected.
+The first cut deferred the caller drop-after-call, reasoning the leak was
+"bounded per call-site." **CI proved that wrong**: `test-perceus-817-filter-leak`
+calls `filter` (with the now-active `^p`) inside a 5000-iteration loop, so a
+fresh materialised closure leaked ONCE PER ITERATION — `leaked=5012`, O(N). The
+"bounded per call-site" framing missed that a call-site in a loop scales.
+
+The fix is the drop-after-call rule 1 always required (Koka `parcBorrowApp`):
+a bare top-level fn NAME passed by value to a BORROWED slot — the emit
+materialises a fresh `kai_closure` no one drops — has its birth ref balanced
+after the call.
+
+**The load-bearing lesson: the drop belongs in the EMIT, not the AST.** The
+first cut did the classic AST rewrite `f(.., g, ..) → { let t = g; let r =
+f(.., t, ..); drop(t); r }` as a post-pass. It MISCOMPILED the self-hosted
+compiler (`panic: non-exhaustive match` on a *comment line* — a corrupted
+binary; selfhost byte-id broke) even after narrowing the predicate to just
+fn-names. Bisection was decisive: revert the AST wrap → selfhost green again.
+
+Why the AST wrap corrupts (asu's diagnosis, verified): **the unbalanced ref
+does not exist in the AST — it is born in the emit**, when `efn_resolve` turns
+the `EVar(g)` into `kai_closure(&_kai_g_thunk, ...)` (emit_c.kai `emit_ident_value`).
+Perceus has nothing to drop because there is no binder, no `Use`, nothing.
+Worse, an `EBlock` injected in *tail position of a self-recursive fn of the
+compiler* hides the self-tail-call from `tcrec_rewrite_decls` (the exact trap
+perceus.kai:2649 documents) → TCO/TRMC stops firing → heap corruption → tag
+garbage → non-exhaustive match. The compiler uses `filter`/`find`/`map` with
+fn-named predicates everywhere, so hundreds of call-sites get wrapped and one
+in tail-of-self-recursion corrupts. The in-tree precedent that works,
+`pcs_force_opaque_exit_drops`, only ever touches an *existing* `EBlock`/`EIf`
+(`_ -> k` for all else) — it never creates a block in an argument or tail
+position. Creating blocks is the whole difference between green and corruption.
+
+**The shipped design (asu Option B):** perceus marks the arg with a plain
+wrapper `__perceus_owned_borrow(g)` — a simple arg wrapper like
+`__perceus_dup`, NOT an `EBlock`, so it disturbs no tail position. The C emit
+(`emit_call_expr`) sees a call whose arg is `__perceus_owned_borrow(...)` and
+emits a local statement-expression:
+
+```c
+({ KaiValue *kai_bcN = kai_closure(&_kai_g_thunk, ...); \
+   KaiValue *_bcr = <call with kai_bcN>; kai_decref(kai_bcN); _bcr; })
+```
+
+The `kai_closure` birth ref is balanced right where it is born, in the emit —
+invisible to `tcrec`/TCO because it never existed in the AST. A fallback arm
+handles the marker as callee (transparent, emits the inner `g`) for the rare
+emit path that does not route through `emit_call_expr` as an arg — degrade to
+a bounded leak, never a `kai___perceus_owned_borrow` undeclared-symbol
+miscompile. On **native**, the marker lowers transparently (`CkOwnedBorrow →
+lower_borrow_through`); the post-call `KDrop` is a follow-up, so native keeps a
+bounded closure leak while the C oracle carries the full fix.
+
+**Owned-dying is exactly a top-level fn name — NOT a lambda, NOT an
+`EModCall`.** A lambda already flows through the owned dup/drop + lambda-lift
+RC (#1117); marking it would double-drop. An `EModCall` by value is not the
+materialisation shape. A `^` param re-passed borrow-through is an `EVar` not
+in `fn_names`, excluded — so the `foldl` zero-RC collapse holds.
+
+Result: `#817` back to `leaked=12` (constant, was 5012), Probe A still
+`incref_total=0`, selfhost byte-id C green again.
 
 ## Gates
 
@@ -133,24 +183,41 @@ RC) is unaffected.
 - The six `test-perceus-1127-borrow-*` gates (closure/hof/tco × C+native) all
   OK; the C ones assert `incref_total < 100` (the collapse), the native ones
   ride tier1-native.yml (never TEST_LIGHT_TARGETS — the kaic2 there is C-only).
-- New `test-perceus-1130-borrow-pipe` (C, in TEST_LIGHT) + `-native`
-  (tier1-native.yml) — the apply-pipe UAF regression fixture.
+- New `test-perceus-1130-borrow-pipe` + `test-perceus-1130-hof-tail-drop`
+  (C in TEST_LIGHT) + `-native` (tier1-native.yml) — the apply-pipe UAF and
+  the tail-position drop-after-call regressions.
+- `test-perceus-817-filter-leak`: back to green (`leaked=12`), the CI signal
+  that forced the drop-after-call.
 
 ## Fixtures added / updated
 
 - `borrow_closure_1127.kai` — reworked to `^f` (Probe A); the counter gate
   now asserts `incref_total < 100` (was ~2000).
 - `borrow_stdlib_hof_1127.kai` — comment + gate flipped inert → active.
-- **`borrow_closure_pipe_1130.kai` (+`.out.expected`)** — the apply-pipe
-  UAF regression (found mid-lane): `^f` used through `x |> f` then `f(x)`.
+- **`borrow_closure_pipe_1130.kai` (+golden)** — the apply-pipe UAF (found
+  mid-lane): `^f` used through `x |> f` then `f(x)`.
+- **`borrow_hof_tail_drop_1130.kai` (+golden)** — the tail-position
+  drop-after-call: 5000 materialised closures freed, TCO intact.
 
 The compiler-internal HOF that crashed #1127's C selfhost is covered by the
 green selfhost byte-id.
 
+## Composition with #1133 (kinds engine)
+
+#1133 (the kind engine over AbelianGroup) merged to `main` mid-lane, touching
+parse/resolve/infer. This lane touches perceus/runtime/emit/kir — disjoint
+zones, so the rebase was clean (no conflict, `infer.kai` untouched by us).
+Selfhost byte-id re-run after the rebase stayed green: the borrow surface and
+kind resolution do not interact (`^` changes the calling convention, not the
+type/kind, per rule 7).
+
 ## Follow-ups
 
-- **Caller drop-after-call for a fresh borrowed closure** (bounded leak → 0),
-  reconciled with TCO.
+- **Native post-call `KDrop` for the owned-borrow marker.** On native
+  `CkOwnedBorrow` lowers transparently, so a fn-name closure passed to a
+  borrowed HOF slot keeps a bounded leak on the native backend (the C oracle
+  has the full drop-after-call). Emit the `KDrop` of the materialised closure
+  after the `KCall` to close it.
 - **Inference extension (Option 2):** infer a private fn's fn-typed param
   whose only use is a direct call as borrowed, closing the `map_loop`/
   `filter_loop` owned-exit entirely (no dup-on-consume there). Gated on the
