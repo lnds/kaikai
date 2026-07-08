@@ -418,7 +418,12 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   # positions, consumed by BOTH sides of the flip (callee wraps the
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
   # decref; caller strips the __perceus_dup on args in borrowed slots).
-  let bmap = pcs_build_borrow_map(decls, [])
+  let bmap0 = pcs_build_borrow_map(decls, [])
+  # Read-only prims (array_get/array_length) join the borrow map so the
+  # caller strips the container dup and the path counter charges 0 —
+  # reusing the whole borrow pipeline. Seeded only where no user fn
+  # shadows the name; the same entry gates the callee rename.
+  let bmap = pcs_seed_prim_borrows(pcs_user_fn_names(decls, []), bmap0)
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
@@ -472,6 +477,125 @@ fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
 fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
   []           -> acc
   [d, ...rest] -> pcs_build_borrow_map(rest, pcs_borrow_entry_of(d, acc))
+}
+
+# Read-only runtime primitives that borrow their container. A closed
+# table (array_get arg0, array_length arg0): the prim reads the array
+# without consuming it, so the caller need not dup and the runtime
+# `_borrow` variant skips the container decref. Any other position is
+# owned as before. Not derived by body inspection (a prim has no kaikai
+# body) — this is the hard-coded dual of `pcs_borrow_params`.
+fn pcs_prim_borrow_positions(nm: String) : [Int] =
+  if nm == "array_get" or nm == "array_length" { [0] } else { [] }
+
+# The borrow variant symbol for a read-only prim, or None if `nm` is not
+# a borrowing prim. The rename routes the call to the `_borrow` runtime
+# body that does NOT decref the container.
+fn pcs_prim_borrow_variant(nm: String) : Option[String] =
+  if nm == "array_get" { Some("array_get_borrow") }
+  else if nm == "array_length" { Some("array_length_borrow") }
+  else { None }
+
+# Seed the borrow map with the read-only prims, EXCEPT any a user fn
+# shadows (a user `fn array_get(...)` owns its arg; borrowing it would
+# be a use-after-free in user code). The same non-shadowed predicate
+# then gates BOTH the caller-dup strip and the callee rename — driving
+# them from one map entry makes a strip-without-rename (double free) or
+# rename-without-strip (leak) impossible.
+fn pcs_seed_prim_borrows(user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] =
+  pcs_seed_prim(["array_get", "array_length"], user_fns, acc)
+
+fn pcs_seed_prim(prims: [String], user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] = match prims {
+  []           -> acc
+  [p, ...rest] ->
+    if list_has(user_fns, p) { pcs_seed_prim(rest, user_fns, acc) }
+    else { pcs_seed_prim(rest, user_fns, [BE(p, pcs_prim_borrow_positions(p)), ...acc]) }
+}
+
+fn pcs_user_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, _, _, _, _) -> pcs_user_fn_names(rest, [name, ...acc])
+    _                                    -> pcs_user_fn_names(rest, acc)
+  }
+}
+
+# A container read ONLY through borrowed-prim slots (never consumed by a
+# later owning use) has no consumer to release its ref. Borrowing every one
+# of its reads would leak it (and the drop-after-call wrap that would fix
+# that resets a raw sibling param's unbox scope in the C emitter). So such a
+# container keeps ALL its accesses CONSUMING — identical to the pre-borrow
+# behaviour: the runtime `array_get`/`array_length` decref reclaims it at
+# its final read, RC balances as before, no wrap.
+#
+# The borrow WIN is the loop shape, where the container is re-threaded
+# through a consuming recursive call — there `borrowed` is discounted but
+# the consuming re-thread keeps `total > borrowed`, so the container is NOT
+# borrow-only and its `a[i]` reads ARE rewritten to the borrow variant.
+#
+# Detection: a name whose borrow-discounted path count is 0 while its raw
+# count is positive is read only through borrowed slots. `prim_bmap`
+# restricts to the seeded prims (a user borrow param, handled by the
+# scrutinee-wrap path, is not swept in); membership is the shadow gate.
+fn pcs_collect_borrow_last_set(names: [String], body: Expr, prim_bmap: [BorrowEntry]) : [String] = match names {
+  []           -> []
+  [n, ...rest] -> {
+    let more = pcs_collect_borrow_last_set(rest, body, prim_bmap)
+    let total    = pcs_max_paths_b_expr(n, body, [])
+    let borrowed = pcs_max_paths_b_expr(n, body, prim_bmap)
+    if total > 0 and borrowed == 0 { [n, ...more] } else { more }
+  }
+}
+
+# All `let`-bound names in a body (PBind SLets), so a locally-built array
+# read only through `a[i]` is caught by the borrow-last analysis too.
+fn pcs_let_binder_names(e: Expr, acc: [String]) : [String] = pcs_lbn_kind(e.kind, acc)
+
+fn pcs_lbn_kind(k: ExprKind, acc: [String]) : [String] = match k {
+  EBlock(stmts, tail) -> {
+    let a1 = pcs_lbn_stmts(stmts, acc)
+    match tail { Some(t) -> pcs_lbn_kind(t.kind, a1) None -> a1 }
+  }
+  EIf(c, t, eo) -> {
+    let a1 = pcs_lbn_kind(c.kind, acc)
+    let a2 = pcs_lbn_kind(t.kind, a1)
+    match eo { Some(e) -> pcs_lbn_kind(e.kind, a2) None -> a2 }
+  }
+  EMatch(s, arms) -> pcs_lbn_arms(arms, pcs_lbn_kind(s.kind, acc))
+  _ -> acc
+}
+
+fn pcs_lbn_stmts(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) -> pcs_lbn_kind(rhs.kind, [nm, ...acc])
+        _         -> pcs_lbn_kind(rhs.kind, acc)
+      }
+      _ -> acc
+    }
+    pcs_lbn_stmts(rest, a1)
+  }
+}
+
+fn pcs_lbn_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> pcs_lbn_arms(rest, pcs_lbn_kind(b.kind, acc))
+  }
+}
+
+# The borrow map restricted to the seeded read-only prims, for the
+# borrow-last detection (a user-fn borrow param must not be swept in).
+fn pcs_prim_only_bmap(bmap: [BorrowEntry]) : [BorrowEntry] = match bmap {
+  []           -> []
+  [e, ...rest] -> match e {
+    BE(k, ps) ->
+      if (match pcs_prim_borrow_variant(k) { Some(_) -> true None -> false })
+      { [BE(k, ps), ...pcs_prim_only_bmap(rest)] }
+      else { pcs_prim_only_bmap(rest) }
+  }
 }
 
 fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
@@ -564,19 +688,66 @@ fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [String]) : [Arm] = match arms {
 # that lands in a borrowed parameter slot of the callee. The callee
 # borrows (does not consume) so the caller need not dup → the incref is
 # removed. Uses the global borrow map keyed by callee name.
+#
+# `borrow_last` names are the containers whose sole use IS this borrow —
+# their prim access stays CONSUMING (no strip, no rename): the runtime
+# decref reclaims them in place, avoiding the exit-drop wrap that would
+# otherwise reset a raw sibling param's unbox scope. The borrow win lives
+# in the loop shape (container re-threaded, not last-use), which this
+# does not touch.
 fn pcs_strip_borrow_args(e: Expr, bmap: [BorrowEntry]) : Expr =
-  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap),
+  pcs_strip_borrow_args_b(e, bmap, [])
+
+fn pcs_strip_borrow_args_b(e: Expr, bmap: [BorrowEntry], borrow_last: [String]) : Expr =
+  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap, borrow_last),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry]) : ExprKind = match k {
+fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry], borrow_last: [String]) : ExprKind = match k {
   ECall(callee, args_) -> {
     let key = pcs_callee_key(callee)
-    let positions = pcs_borrow_lookup(bmap, key)
-    let args2 = pcs_strip_args_at(args_, positions, 0, bmap)
-    ECall(pcs_strip_borrow_args(callee, bmap), args2)
+    # A prim call whose container arg0 is its LAST borrowed use stays
+    # consuming: suppress the dup strip and the rename so the runtime
+    # decref reclaims the container. Earlier borrowed reads are rewritten.
+    let keep_consuming = pcs_arg0_is_borrow_last(args_, borrow_last) and
+                         (match pcs_prim_borrow_variant(key) { Some(_) -> true None -> false })
+    let positions = if keep_consuming { [] } else { pcs_borrow_lookup(bmap, key) }
+    let args2 = pcs_strip_args_at_b(args_, positions, 0, bmap, borrow_last)
+    let callee2 = if keep_consuming { callee }
+                  else { pcs_maybe_rename_borrow_prim(callee, key, positions) }
+    ECall(pcs_strip_borrow_args_b(callee2, bmap, borrow_last), args2)
   }
-  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args(sub, bmap))
+  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_b(sub, bmap, borrow_last))
 }
+
+# The arg0 var name, seeing through a `__perceus_dup(x)` wrap the rewrite
+# may have placed. `None` if arg0 is not a (possibly dup-wrapped) bare var.
+fn pcs_arg0_var_name(args_: [Expr]) : Option[String] = match args_ {
+  []          -> None
+  [h, ...___] -> pcs_unwrap_dup_var(h)
+}
+
+fn pcs_unwrap_dup_var(e: Expr) : Option[String] = match e.kind {
+  EVar(nm)        -> Some(nm)
+  ECall(f, inner) -> match f.kind {
+    EVar(fn_) -> if fn_ == "__perceus_dup" { match inner { [x] -> pcs_unwrap_dup_var(x) _ -> None } } else { None }
+    _         -> None
+  }
+  _ -> None
+}
+
+fn pcs_arg0_is_borrow_last(args_: [Expr], borrow_last: [String]) : Bool = match pcs_arg0_var_name(args_) {
+  Some(nm) -> list_has(borrow_last, nm)
+  None     -> false
+}
+
+fn pcs_maybe_rename_borrow_prim(callee: Expr, key: String, positions: [Int]) : Expr =
+  if pcs_has_int(positions, 0) {
+    match pcs_prim_borrow_variant(key) {
+      Some(v) -> Expr { kind: EVar(v), line: callee.line, col: callee.col,
+                        ty: callee.ty, mode: callee.mode }
+      None    -> callee
+    }
+  } else { callee }
 
 # The call key for a callee expr — bare EVar or resolved EModCall.
 fn pcs_callee_key(callee: Expr) : String = match callee.kind {
@@ -587,12 +758,15 @@ fn pcs_callee_key(callee: Expr) : String = match callee.kind {
 
 # For each arg: if its index is in `positions` (borrowed slot) and it is
 # `__perceus_dup(x)`, strip to `x`. Recurse into every arg either way.
-fn pcs_strip_args_at(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : [Expr] = match args_ {
+fn pcs_strip_args_at(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : [Expr] =
+  pcs_strip_args_at_b(args_, positions, i, bmap, [])
+
+fn pcs_strip_args_at_b(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String]) : [Expr] = match args_ {
   []           -> []
   [a, ...rest] -> {
-    let a1 = pcs_strip_borrow_args(a, bmap)
+    let a1 = pcs_strip_borrow_args_b(a, bmap, borrow_last)
     let a2 = if pcs_has_int(positions, i) { pcs_strip_dup_wrap(a1) } else { a1 }
-    [a2, ...pcs_strip_args_at(rest, positions, i + 1, bmap)]
+    [a2, ...pcs_strip_args_at_b(rest, positions, i + 1, bmap, borrow_last)]
   }
 }
 
@@ -1540,11 +1714,25 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
         # so they must not receive an unused-param drop either.
         let drop_params = pcs_params_minus(pcs_params_minus(params, borrowed), raw_pnames)
+        # Issue #1120 — a param used ONLY in a borrowed-prim slot (`a[i]`).
+        # Its container access stays CONSUMING (the strip below keeps the
+        # dup + the `array_get` symbol) so the runtime decref reclaims it —
+        # no exit-drop wrap, which would reset a raw sibling param's unbox
+        # scope in the emitter. The borrow win is the loop shape (container
+        # re-threaded, not last-use), which this exclusion leaves untouched.
+        let prim_bmap = pcs_prim_only_bmap(bmap)
+        # Params AND locally-bound arrays read only through `a[i]` (never
+        # consumed) keep all their accesses consuming; a container with a
+        # later consuming use (the loop re-thread) is NOT borrow-only and its
+        # reads ARE rewritten to the borrow variant.
+        let bl_names = pcs_list_union(pnames, pcs_let_binder_names(body, []))
+        let borrow_last = pcs_collect_borrow_last_set(bl_names, body, prim_bmap)
         let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set)
         # Callee flip: wrap borrowed scrutinees so emit_match skips the
-        # decref. Caller flip: strip __perceus_dup on borrowed-slot args.
+        # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
+        # keeping the last-use of a borrow-only container consuming.
         let body_borrow_scr = pcs_wrap_borrow_scrutinees(body_with_drops, borrowed)
-        let body_borrow = pcs_strip_borrow_args(body_borrow_scr, bmap)
+        let body_borrow = pcs_strip_borrow_args_b(body_borrow_scr, bmap, borrow_last)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
     }

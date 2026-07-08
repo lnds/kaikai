@@ -89,6 +89,23 @@ After the cascade `free_total == alloc_total` holds at HEAD — Perceus
 is garbage-free on this workload, which is why process RSS sits at
 1.17× C rather than the 6.26× C of the pre-cascade baseline.
 
+### Read-only array borrow (#1120)
+
+`array_get` / `array_length` are borrow-annotated on their container
+(arg0): the caller no longer dups the array to pass it, and a `_borrow`
+runtime variant reads the slot without decref'ing the container.
+Bulk-read of an `Array[Int]` (idiomatic tail-recursive `a[i]` sum) used
+to pay a fixed **2 rc ops per access** (container incref + decref) that
+the borrow-free Perceus model does not need — the array outlives every
+borrow. Those per-access container ops now collapse to **0**; the
+residual is the element escaping the array (owned by the caller), which
+the boxing gap — not this lane — governs. Measured on a 10 M-element
+sum: container `incref_total`/`decref_total` fell from `20 M` / `20 M`
+to `0` / `0` (only the element's `10 M` incref remains). A container
+read *only* through borrowed slots (never re-threaded to a consumer)
+stays consuming so its ref is still reclaimed — the borrow fires on the
+loop shape, where the recursive re-thread keeps the array alive.
+
 ### The one remaining lever, and what is NOT the lever
 
 The gap to Koka is now a **constant factor**, not a chasm, and the
