@@ -1,0 +1,60 @@
+# Issue #1112 — the native (in-process libLLVM) backend must decref->free an
+# OWNED boxed value discarded in STATEMENT position. Before the fix the native
+# `KDo` arm evaluated the op for effect and dropped the LLVM Handle without a
+# runtime decref, so any owned result discarded as a statement leaked; the
+# C-direct oracle's `SExprStmt` lowers `{ KaiValue *_ = <e>; kai_decref(_); }`
+# and reclaims it. The array case is the worst victim: `array_set(a, ..)`
+# returns an owned `incref(a)` that is discarded — never released, so the array
+# never reaches rc0 and its element slots are never walked (a 7 GB RSS leak in
+# the issue's churn workload).
+#
+# Two discard shapes the fix closes, both against the C oracle's discipline:
+#
+#   - a bare ctor result discarded  — `mk(i)` as its own statement returns an
+#     owned record the block never binds; the native `KDo` now decrefs it.
+#   - a discarded `array_set` result — the owned array ref `array_set` returns
+#     is dropped, so the array (and every boxed element slot) is reclaimed.
+#
+# The gate (`make test-perceus-1112-native-discard-decref`) builds it NATIVE
+# under KAI_TRACE_RC and asserts `free_total` tracks `alloc_total` (every owned
+# discard is reclaimed); a regression that drops the discard decref leaves
+# `free_total` near zero and `leaked` growing linearly.
+
+import loop
+
+type P = { x: Int }
+
+fn mk(v: Int) : P = P { x: v }
+
+# A bare ctor result discarded in statement position, once per iteration.
+fn discard_ctors(n: Int) : Unit / Stdout = {
+  var iter := 0
+  while { iter < n } {
+    mk(iter)
+    iter := iter + 1
+  }
+}
+
+# `array_set` returns an owned ref to `a`; discarding it must not pin the array.
+# Each element is a boxed record whose slot is walked only once the array hits
+# rc0 — the leak the issue reported for `Array[Record]`.
+fn fill(a: Array[P], i: Int, n: Int) : Unit / Mutable = {
+  if i >= n { () } else { array_set(a, i, mk(i)); fill(a, i + 1, n) }
+}
+
+# Build and drop one array-of-records per round; every round's slots must free.
+fn rounds(round: Int, total: Int, sz: Int) : Unit / Mutable = {
+  if round >= total { () }
+  else {
+    let a = array_make(sz, mk(0))
+    fill(a, 0, sz)
+    rounds(round + 1, total, sz)
+  }
+}
+
+fn main() : Int / Stdout + Mutable = {
+  discard_ctors(1000)
+  rounds(0, 100, 1000)
+  Stdout.print("done")
+  0
+}
