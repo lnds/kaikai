@@ -405,13 +405,29 @@ fn nemit_proj_slot(ctx: Handle, v: KVal, i: Int, slot: KSlot) : Handle / Console
   _      -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
 }
 
+# A register whose native slot is a raw scalar (`SInt64`/`SReal`/`SBool`,
+# tags 1/2/3) carries no refcount, so a `dup`/`drop`/`incref` over it is a
+# no-op — the value is not heap-allocated. Perceus plans RC ops from the
+# unbox-pass modes, which do NOT see a match-arm sub-binder that
+# `bind_slot_kslot` later typed raw (that decision is post-Perceus lowering,
+# from the ctor's slot layout); so the plan may carry an RC op over a binder
+# the emitter materialises raw. Executing it would re-box the raw scalar into
+# an ephemeral box (`kaix_int(raw)`) and dup/drop THAT — a phantom box (leak)
+# plus an RC desync (#1110). Skip it: same rule `nemit_drop_assigns_masked`
+# already applies to raw back-edge params (#709). Only a `KVar` names a
+# register; a literal atom is never RC-tracked.
+fn kval_is_raw_scalar(ctx: Handle, v: KVal) : Bool = match v {
+  KVar(n) -> match native_ctx_reg_slot(ctx, n) { s -> s == 1 or s == 2 or s == 3 }
+  _       -> false
+}
+
 # A Perceus RC op → the runtime dup/drop. The call result is captured in a
 # `let` (see `nemit_stmt`'s KDo note) so the discarded Handle is not
-# Perceus-dropped.
+# Perceus-dropped. A raw-scalar register is a no-op (see `kval_is_raw_scalar`).
 fn nemit_rc(ctx: Handle, rc: KRCOp) : Unit / Console = match rc {
-  KDup(v)  -> { let _d = nemit_call1(ctx, "kaix_internal_dup", nemit_atom(ctx, v)); () }
-  KDrop(v) -> { let _d = nemit_call1(ctx, "kaix_internal_drop", nemit_atom(ctx, v)); () }
-  KIncrefIfShared(d, c) -> {
+  KDup(v)  -> if kval_is_raw_scalar(ctx, v) { () } else { let _d = nemit_call1(ctx, "kaix_internal_dup", nemit_atom(ctx, v)); () }
+  KDrop(v) -> if kval_is_raw_scalar(ctx, v) { () } else { let _d = nemit_call1(ctx, "kaix_internal_drop", nemit_atom(ctx, v)); () }
+  KIncrefIfShared(d, c) -> if kval_is_raw_scalar(ctx, d) { () } else {
     let p = native_ctx_ptrt(ctx)
     let _r = ncall_sig2(ctx, "kaix_incref_if_shared", p, p, p, nemit_atom(ctx, d), nemit_atom(ctx, c)); ()
   }
