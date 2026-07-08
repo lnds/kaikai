@@ -54,6 +54,7 @@ import compiler.chars
 import compiler.diag
 import compiler.lex
 import compiler.ast
+import compiler.kinds
 import compiler.refinements
 import compiler.doc_attr
 
@@ -80,7 +81,12 @@ pub type Parser = { file: String, src: String, rest: [Token], had_error: Bool,
                 # while parsing such a cond; re-enabled inside any
                 # delimiter (call args, `()`, `[]`, block) where a record
                 # literal is unambiguous.
-                allow_record_lit: Bool }
+                allow_record_lit: Bool,
+                # Read-only registry of the file's kind introducers,
+                # built by a pre-scan before any body is parsed. Lets the
+                # top-level dispatch recognise `metric m` as a habitant
+                # declaration by set membership, order-independently.
+                kind_reg: KindReg }
 
 # A result = a new parser plus an optional payload. `None` means the
 # parser failed (had_error is set on `p`). This mirrors stage 0's
@@ -101,19 +107,21 @@ type PEL     = { p: Parser, r: Option[ListElem] }
 
 fn parser_new(file: String, src: String, toks: [Token]) : Parser =
   Parser { file: file, src: src, rest: toks, had_error: false,
-           allow_trailing_lambda: true, allow_record_lit: true }
+           allow_trailing_lambda: true, allow_record_lit: true,
+           kind_reg: prescan_kinds(src, toks) }
 
 fn p_mark_err(p: Parser) : Parser =
   Parser { file: p.file, src: p.src, rest: p.rest, had_error: true,
            allow_trailing_lambda: p.allow_trailing_lambda,
-           allow_record_lit: p.allow_record_lit }
+           allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg }
 
 fn p_advance(p: Parser) : Parser {
   match p.rest {
     [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1,
                               had_error: p.had_error,
                               allow_trailing_lambda: p.allow_trailing_lambda,
-                              allow_record_lit: p.allow_record_lit }
+                              allow_record_lit: p.allow_record_lit,
+                              kind_reg: p.kind_reg }
     [] -> p
   }
 }
@@ -263,7 +271,8 @@ fn p_skip_newlines(p: Parser) : Parser {
 # threading the flag back via `p_with_trailing_lambda(p, true)`.
 fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
-           allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit }
+           allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit,
+           kind_reg: p.kind_reg }
 }
 
 # Toggle positional record-literal parsing (see `Parser.allow_record_lit`).
@@ -271,7 +280,8 @@ fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
 # cond, delimiters re-enable it for their interior.
 fn p_with_record_lit(p: Parser, allow: Bool) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
-           allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow }
+           allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow,
+           kind_reg: p.kind_reg }
 }
 
 # Reinstate the caller's `allow_record_lit` on the result of a delimited
@@ -4803,6 +4813,8 @@ fn parse_decl(p: Parser) : PDecl / Console {
     else { parse_theory_decl(p_advance(p1), hd) }
   } else if decl_head_is_kind(p1, hd) {
     parse_kind_decl(p_advance(p1), is_pub, hd)
+  } else if decl_head_is_user_introducer(p1, hd) {
+    parse_unit_decl(p_advance(p1), is_pub, hd)
   } else {
     let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
     let msg = if tk_is(hd.kind, TkIdent) {
@@ -5397,14 +5409,18 @@ fn parse_use_decl(p: Parser, t: Token) : PDecl / Console {
   }
 }
 
-# Parse a unit declaration. Two shapes:
-#   `unit USD`                                    — atomic
+# Parse a habitant declaration. Two shapes, either introducer word:
+#   `unit USD` / `metric m`                       — atomic
 #   `unit Newton = kg * m / sec^2`                — alias
+# `t` is the introducer token (`unit` or a user kind's word); its
+# source is stored verbatim so the formatter round-trips it and the
+# typer maps it to its kind through the KindReg.
 fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
 
+  let intro = tok_source(p.src, t)
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
-    err_d(p_error(p, id, "expected unit name after `unit`"))
+    err_d(p_error(p, id, concat_all(["expected a name after `", intro, "`"])))
   } else {
     let name = tok_source(p.src, id)
     let p1 = p_advance(p)
@@ -5413,10 +5429,10 @@ fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
       let rb = parse_unit_expr(p2)
       match rb.r {
         None -> err_d(rb.p)
-        Some(u) -> ok_d(rb.p, DUnit(is_pub, name, Some(u), t.line, t.col))
+        Some(u) -> ok_d(rb.p, DUnit(is_pub, name, Some(u), intro, t.line, t.col))
       }
     } else {
-      ok_d(p1, DUnit(is_pub, name, None, t.line, t.col))
+      ok_d(p1, DUnit(is_pub, name, None, intro, t.line, t.col))
     }
   }
 }
@@ -5432,6 +5448,21 @@ fn decl_head_is_kind(p: Parser, hd: Token) : Bool {
   else if not (tok_source(p.src, hd) == "kind") { false }
   else {
     tk_is(p_peek1(p).kind, TkIdent) and tk_is(p_peek2(p).kind, TkColon)
+  }
+}
+
+# A user-kind habitant declaration head: an IDENT whose word is a
+# registered introducer (from a `kind … with intro` seen anywhere in
+# the file, via the pre-scan) followed by the habitant name. `unit` is
+# excluded — it has its own `TkUnitKw` path — so a typo like `retrun x`
+# still falls through to the "did you mean `fn`?" diagnostic.
+fn decl_head_is_user_introducer(p: Parser, hd: Token) : Bool {
+  if not tk_is(hd.kind, TkIdent) { false }
+  else {
+    let word = tok_source(p.src, hd)
+    if word == "unit" { false }
+    else if not kind_reg_is_introducer(p.kind_reg, word) { false }
+    else { tk_is(p_peek1(p).kind, TkIdent) }
   }
 }
 
@@ -5527,15 +5558,21 @@ fn parse_kind_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   }
 }
 
-# The `with <introducer>` tail of a `kind` decl. v1 recognises only
-# `unit` (Measure's introducer, spelled with the existing keyword);
-# per-kind introducer words (`metric`, `currency`, ...) are v2.
+# The `with <introducer>` tail of a `kind` decl. The introducer is
+# `unit` (Measure's, spelled with the existing keyword) or any user
+# identifier (`metric`, `cur`, …) that becomes the habitant-declaring
+# word for this kind. Stored verbatim on the `DKind`.
 fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
                          thy: String, t: Token) : PDecl / Console {
   if p_at(p, TkUnitKw) {
     ok_d(p_advance(p), DKind(is_pub, name, thy, "unit", t.line, t.col))
   } else {
-    err_d(p_error_here(p, "expected `unit` as the introducer — v1 kinds only support `with unit`"))
+    let it = p_peek(p)
+    if not tk_is(it.kind, TkIdent) {
+      err_d(p_error_here(p, "expected an introducer word after `with` (e.g. `with metric`)"))
+    } else {
+      ok_d(p_advance(p), DKind(is_pub, name, thy, tok_source(p.src, it), t.line, t.col))
+    }
   }
 }
 
