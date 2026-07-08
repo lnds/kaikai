@@ -106,6 +106,29 @@ read *only* through borrowed slots (never re-threaded to a consumer)
 stays consuming so its ref is still reclaimed — the borrow fires on the
 loop shape, where the recursive re-thread keeps the array alive.
 
+### User-parameter borrow (#1127)
+
+The same borrow machinery now extends to **user function parameters**,
+hybrid: inferred on non-`pub` functions (a relaxed callee-discipline rule,
+`borrow_infer.kai`), explicit `^` on `pub` parameters (calling convention =
+ABI, serialized in the module interface). A closure threaded through a
+tail-recursive loop (`go(n, acc, f)` — the shape every user of
+`map`/`filter`/`fold` pays per element) used to cost **2 rc ops per
+iteration** (caller incref + callee decref of the closure); with the borrow
+they collapse to **0** on both backends (measured: 2000 → 0 over 1000
+iterations, C and native). The stdlib `list` HOFs are annotated (`^f` /
+`^p`), handing the win to all existing code.
+
+Honest residual: a read-only *tree descent* (the lookup shape) improves but
+does NOT fully collapse — the container re-thread is elided, but the
+per-level dup of a bound child that flows to a borrow-through position still
+fires (measured 23097 → 21097 over a 200-deep degenerate tree, 1000
+lookups). Collapsing it needs a bound child whose sole use is a
+borrow-through position to bind borrowed rather than take the unconditional
+`is_alias` dup — a finer analysis than the one-step fixpoint shipped here,
+tracked as a follow-up. The shipped choice dups the child (a missed elision,
+never a use-after-free).
+
 ### The one remaining lever, and what is NOT the lever
 
 The gap to Koka is now a **constant factor**, not a chasm, and the
