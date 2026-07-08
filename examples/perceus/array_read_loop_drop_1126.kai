@@ -1,0 +1,41 @@
+# Issue #1126 — the tail-recursive read loop must drop its re-threaded
+# Array container.
+#
+# `read(a, i, n, acc)` borrows `a[i].x` per iteration (the #1120 borrow
+# variant) and re-threads `a` through the self-tail-call. Post-#1120 the
+# borrow read no longer consumes `a`, but the borrow inflated the flat
+# use count to 2, so the dup fallback fired on the re-thread: the goto
+# re-bound `a` to itself WITHOUT dropping the original, leaking one
+# container ref per iteration. With `Array[Record]` the un-freed array
+# pins all N boxed records, so `leaked` scaled with N (the bulk-read
+# shape that pins its array forever).
+#
+# The fix suppresses that dup (the sole consumer is the re-thread, which
+# transfers raw) while keeping the base arm's exit drop, so the container
+# — and transitively its records — is reclaimed. `workload` binds the
+# read result to a `let` so the array dies inside the fn (exit-liveness
+# cannot mask the result). The RC profile (leaked bounded, independent of
+# N) is gated in the Makefile target under KAI_TRACE_RC; this fixture
+# asserts the functional sum.
+
+type P = { x: Int }
+
+fn fill(a: Array[P], i: Int, n: Int) : Unit / Mutable = {
+  if i >= n { () } else { a[i] := P { x: i }; fill(a, i + 1, n) }
+}
+
+fn read(a: Array[P], i: Int, n: Int, acc: Int) : Int = {
+  if i >= n { acc } else { read(a, i + 1, n, acc + a[i].x) }
+}
+
+fn workload() : Int / Mutable = {
+  let a = array_make(1000, P { x: 0 })
+  fill(a, 0, 1000)
+  let total = read(a, 0, 1000, 0)
+  total
+}
+
+fn main() : Int / Stdout + Mutable = {
+  Stdout.print(int_to_string(workload()))
+  0
+}
