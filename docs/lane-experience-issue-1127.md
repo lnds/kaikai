@@ -52,11 +52,15 @@ modular selfhost green.
 
 ## The cause chain, verified (the brief warned soundness would be subtle)
 
-The inference was the easy half; the load-bearing work was making the
-**native KIR lowering** sound for a borrowed scrutinee whose arms bind
-children. The conservative rule never bound a used child under a borrowed
-scrutinee, so the native path had never exercised it. Five distinct native
-gaps surfaced, each caught by running a real program (not by the inference):
+The relaxed inference (later reverted, see above) was the easy half; the
+load-bearing work was making the **native KIR lowering** sound for a borrowed
+scrutinee whose arms bind children — a shape the conservative rule never
+produced (its arms bind nothing used), so the native path had never exercised
+it, but which an explicit `^` on a value-typed param CAN produce. Five distinct
+native gaps surfaced while the relaxed inference was in the tree, each caught by
+running a real program. The emit gates that close them stayed in (they are
+correct for an explicit `^` borrow too); the relaxed inference that first
+exposed them did not:
 
 1. **Reuse recogniser marked reuse over a borrowed scrutinee** (the root
    cause of nearly every `unbound register` abort). `pcs_recognise_reuse_expr`
@@ -98,24 +102,22 @@ The C oracle handled all five from the start — it was the native lowering that
 had the gaps. Every gap was invisible until a real program ran on the default
 (native) backend; `--emit=kir` textual output looked clean.
 
-## Measured motivation (KAI_TRACE_RC)
+## Measured motivation (KAI_TRACE_RC) — and why neither win landed
 
-| shape | before (owned) | after (this lane) |
-|---|---:|---:|
-| closure threaded (P1) — closure borrow deferred | 2000 incref, leaked=7 | 2000 incref, leaked=7 (SOUND, no collapse) |
-| read-only tree descent (P2), native | 23097 incref | 21097 |
-| stdlib `foldl` over 10k, non-closure RC | — | closure `^` serialized, still consumed |
+| shape | before (owned) | after (this lane) | why deferred |
+|---|---:|---:|---|
+| closure threaded (P1) | 2000 incref, leaked=7 | unchanged (SOUND) | call_ind consumes; C selfhost UAF |
+| read-only tree descent (P2) | 23097 incref | unchanged | relaxed inference UAF'd modular selfhost |
+| stdlib `foldl` closure RC | dup per call | unchanged | closure `^` serialized, still consumed |
 
-P1 (the closure-threaded loop, the design's "big one") does NOT collapse: the
-closure stays owned because call_ind consumes it (see the scope call above).
-The gate pins soundness — `leaked` stays bounded, no UAF — not the collapse.
-P2 (read-descent over a value type, no closure) improves partially: the
-container re-thread is elided, but the per-level dup of a bound child that
-flows to a borrow-through position is NOT. Collapsing P2 fully needs a bound
-child whose ONLY use is a borrow-through position to bind borrowed (no incref)
-rather than the current unconditional is_alias dup — a finer analysis than the
-one-step fixpoint this lane shipped, and a follow-up. The safe, sound choice
-here was to dup the child (never a UAF, a missed elision at worst).
+Neither RC win landed. The relaxed inference that would have collapsed P2
+(measured 23097→21097 while it was in the tree — only a PARTIAL collapse
+anyway) UAF'd the sep-comp compiler and was reverted; the closure borrow that
+would have collapsed P1 is a call_ind-consume UAF. Both gates pin SOUNDNESS
+(leaked bounded, no UAF; modular byte-id), not RC collapse. The wins are real
+but each is blocked on runtime-ABI / sep-comp work and reopened as its own
+issue. The safe, sound choice throughout was to keep the value owned — never a
+UAF, a missed elision at worst.
 
 ## Design decisions and alternatives
 
