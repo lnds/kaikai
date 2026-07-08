@@ -1217,6 +1217,87 @@ fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: [
   }
 }
 
+# Issue #1126 — a boxed param whose reads are a borrow
+# (`array_get_borrow(a, i)`, discounted by `bmap`) PLUS a single
+# consuming re-thread through a self-tail-call (`read(a, ...)`). The
+# borrow read inflates the flat non-lam count to >= 2, so the
+# `pcs_is_non_last` fallback dups the param; the goto then re-binds it to
+# itself without dropping the original, leaking one container ref per
+# iteration (the bulk read loop pins its array forever).
+#
+# Gates (each param `nm`):
+#   - flat count >= 2 (the fallback would dup) while borrow-aware
+#     max-paths == 1 (exactly one real consumer; borrow reads discounted).
+#     == 0 is the borrow-only case (consuming reclaim, no move).
+#   - the body has a self-tail-call (`tcrec` lowers it to a goto, moving
+#     the exit-drop wrap OUT of the recursive path).
+#   - `nm` never appears in a tail that is NOT a self-call. This makes the
+#     sole consumer the re-thread: base arms neither read nor consume
+#     `nm`, so the exit-drop on the base path is the only release and
+#     transferring the re-thread raw double-frees nothing.
+# Excludes `borrowed` (never dup'd) and `skip_set` (already moves on
+# every use, exit drop suppressed).
+fn pcs_collect_borrow_move_last_params(self_name: String, pnames: [String], body: Expr, uses: [Use],
+                                       bmap: [BorrowEntry], borrowed: [String],
+                                       skip_set: [String]) : [String] / Console = {
+  if not pcs_body_has_tail_self_call(self_name, body) { [] }
+  else { pcs_bmlp_loop(self_name, pnames, body, uses, bmap, borrowed, skip_set) }
+}
+
+fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
+                 bmap: [BorrowEntry], borrowed: [String], skip_set: [String]) : [String] / Console = match pnames {
+  []           -> []
+  [nm, ...rest] -> {
+    let more = pcs_bmlp_loop(self_name, rest, body, uses, bmap, borrowed, skip_set)
+    if list_has(borrowed, nm) or list_has(skip_set, nm) { more }
+    else {
+      match last_use_for(nm, uses) {
+        LUAt(_, _, _) ->
+          if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and
+             pcs_max_paths_b_expr(nm, body, bmap) == 1 and
+             pcs_nm_absent_from_nonrec_tails(self_name, nm, body) {
+            [nm, ...more]
+          } else { more }
+        _ -> more
+      }
+    }
+  }
+}
+
+# True iff `nm` appears in no tail position that is not a self-call —
+# i.e. every base arm is `nm`-free. A tail self-call is skipped (that is
+# where the re-thread lives); any other tail is scanned for `nm`.
+fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr) : Bool / Console =
+  pcs_nmant_kind(self_name, nm, e.kind)
+
+fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind) : Bool / Console = match k {
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
+    EModCall(_, c) -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
+    _              -> not pcs_name_in_expr_k(nm, k)
+  }
+  EIf(_, t, opt_e) ->
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, t) and
+    (match opt_e { None -> true Some(e2) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, e2) })
+  EMatch(_, arms) -> pcs_nmant_arms(self_name, nm, arms)
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> true
+    Some(t) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, t)
+  }
+  _ -> not pcs_name_in_expr_k(nm, k)
+}
+
+fn pcs_nmant_arms(self_name: String, nm: String, arms: [Arm]) : Bool / Console = match arms {
+  []           -> true
+  [Arm(_, _, b), ...rest] ->
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, b) and pcs_nmant_arms(self_name, nm, rest)
+}
+
+fn pcs_name_in_expr_k(nm: String, k: ExprKind) : Bool / Console = {
+  let us = pcs_collect_uses_kind(k, 0, 0, [nm], false, [])
+  pcs_uses_has_name(us, nm)
+}
+
 # Issue #817 — every match-arm pattern binder bound anywhere in `body`,
 # the candidate set for `pcs_collect_move_last_set`. (Params are excluded
 # — they ride `skip_set` / the goto dropmask, not the move-at-last-use
@@ -1694,6 +1775,13 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # never a wrong one). The `(line,col)` identity of AST nodes makes
         # a false move impossible.
         let safe_arm_binders = pcs_collect_safe_arm_binders(name, body, bmap)
+        # Params whose sole consumer is a borrow-discounted re-thread
+        # (#1126). They must not dup on any read (the borrow read is
+        # stripped; the single re-thread transfers raw), yet — unlike a
+        # skip_set param — they DO keep their exit drop, because the base
+        # arm that never re-threads owns the container and must free it.
+        let borrow_move_params = pcs_collect_borrow_move_last_params(
+          name, pnames, body, uses, bmap, borrowed, skip_set)
         let move_last_set = pcs_strs_minus(
           pcs_strs_inter(
             pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
@@ -1703,7 +1791,12 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # drop (each shim call consumes a dup; the birth ref is released
         # here, even when the last use is in tail position).
         let opaque_lets = pcs_collect_opaque_let_binders(body, opaque_ret_fns, [])
-        let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, skip_set, [], bmap, move_last_set)
+        # `rewrite_skip_set` suppresses the dup wrap for #1126 borrow-move
+        # params too, so the re-thread transfers raw. The exit-drop set
+        # (`skip_set`) deliberately excludes them: the base arm still frees
+        # the container. Keep the two sets distinct.
+        let rewrite_skip_set = pcs_list_union(skip_set, borrow_move_params)
+        let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, [], bmap, move_last_set)
         let new_body = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         # Plant the branch-local drop for each `owned_moves` param in the arms
@@ -3304,6 +3397,37 @@ fn pcs_atsc_arms_rest(self_name: String, arms: [Arm]) : Bool = match arms {
   []           -> true
   [Arm(_, _, b), ...rest] ->
     pcs_arm_all_tails_self_call(self_name, b) and pcs_atsc_arms_rest(self_name, rest)
+}
+
+# True iff SOME tail position of `e` is a direct self-call — the
+# base-plus-recursive shape (`if i>=n { acc } else { read(...) }`) that
+# `tcrec` lowers to a goto loop, moving the exit-drop wrap OUT of the
+# recursive path. The `and` variant above demands EVERY tail recurse
+# (map/filter); this `or` variant fits a fn with a non-recursing base
+# arm. Descends only tail positions (blocks flow to their tail).
+fn pcs_body_has_tail_self_call(self_name: String, e: Expr) : Bool = pcs_bhtsc_kind(self_name, e.kind)
+
+fn pcs_bhtsc_kind(self_name: String, k: ExprKind) : Bool = match k {
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> c == self_name
+    EModCall(_, c) -> c == self_name
+    _              -> false
+  }
+  EIf(_, t, opt_e) ->
+    pcs_body_has_tail_self_call(self_name, t) or
+    (match opt_e { None -> false Some(e2) -> pcs_body_has_tail_self_call(self_name, e2) })
+  EMatch(_, arms) -> pcs_bhtsc_arms(self_name, arms)
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> false
+    Some(t) -> pcs_body_has_tail_self_call(self_name, t)
+  }
+  _ -> false
+}
+
+fn pcs_bhtsc_arms(self_name: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] ->
+    pcs_body_has_tail_self_call(self_name, b) or pcs_bhtsc_arms(self_name, rest)
 }
 
 # Issue #817 — arm-binders of goto-tail (`pcs_arm_all_tails_self_call`)
