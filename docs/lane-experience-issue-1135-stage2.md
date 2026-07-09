@@ -125,6 +125,22 @@ unpacked fields on its first raw push, stamping head tag 0 exactly as
    emitted by nobody — record literals always stamp head tag 0, so the
    raw push takes no head-tag parameter and stamps 0, staying
    bit-identical with the boxed classify path.
+5. **The unbox-signature classifier ran to different verdicts on the
+   two sides of the tcrec rewrite.** `classify_unbox_sig` is evaluated
+   once for the Perceus registry (pre-tcrec) and once for the emit
+   registry (post-tcrec). Its effect-op heuristic treated ANY
+   lowercase `EModCall` as potentially effectful — so a qualified
+   self-call classified boxed pre-rewrite, while the goto sentinel
+   that replaces it classified pure/raw post-rewrite. With the tcrec
+   fix live, modular `agg.c` (the issue-898 fixture) got a raw
+   signature over a boxed body plan (undeclared `kai_<p>`), failing
+   tier1 shards in CI. Fixed at the verdict: `EModCall(own_mod, self)`
+   is a plain self-call, not an effect op (`body_is_effectful_s`), so
+   both registry passes classify identically — and module-qualified
+   loops now legitimately take the mixed raw signature their
+   bare-self-call twins always had. The recurring lesson of this lane
+   is literally the one-classifier rule: any predicate evaluated on
+   both sides of a rewrite must be invariant under that rewrite.
 
 ## Fixtures added (wired; native variants in tier1-native.yml)
 
