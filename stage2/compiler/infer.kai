@@ -11988,6 +11988,15 @@ type PipeRes = { st: InferState, ty: Ty, rhs: Expr }
 fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
+  match try_fuse_terminal_fold(st, lhs, rhs, line, col) {
+    Some(inf) -> inf
+    None      -> synth_pipe_plain(st, lhs, rhs, line, col)
+  }
+}
+
+fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
   let rl = synth(st, lhs)
   let res = match rhs.kind {
     ECall(f, pa) -> {
@@ -12527,6 +12536,42 @@ fn fuse_expr_ty(e: Expr) : Ty =
     Some(t) -> t
     None    -> TyAny
   }
+
+# Terminal-fold deforestation (issue #1134). A `map`-into-`foldl` chain
+# — `xs | stage |> foldl(init, combine)` — folds over a full mapped list
+# built first. When both closures are pure, rewrite to the stdlib
+# `map_foldl` (or `range_map_foldl` for a range head), which folds
+# `combine` over `stage(x)` in one pass, materialising nothing: the
+# mapped list disappears, and a range head never allocates at all.
+#
+# The purity gate synthesises `stage` and `combine` in isolation to read
+# their effect rows (fresh tvars each time, so this does not poison the
+# shared substitution). If both are pure the raw rewrite is synthesised
+# once — `synth_call` instantiates the generic stdlib scheme cleanly, so
+# no node type is built by hand.
+fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
+                          line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match pipe_fusion_as_terminal_fold(lhs, rhs) {
+    None -> None
+    Some(ff) ->
+      if fuse_all_raw_pure(st, ff.stages) and fuse_raw_pure(st, ff.combine) {
+        Some(synth(st, pipe_fusion_fold_rewrite(ff, line, col)))
+      } else { None }
+  }
+
+fn fuse_all_raw_pure(st: InferState, closures: [Expr]) : Bool / Console + File + Mutable =
+  match closures {
+    []           -> true
+    [c, ...rest] -> if fuse_raw_pure(st, c) { fuse_all_raw_pure(st, rest) } else { false }
+  }
+
+# Synthesise a raw stage/combine closure solely to read its effect row.
+# The typed result is discarded — only the purity verdict is kept; its
+# fresh tvars are inert in the shared substitution (never re-referenced).
+fn fuse_raw_pure(st: InferState, closure: Expr) : Bool / Console + File + Mutable {
+  let r = synth(st, closure)
+  fuse_stage_pure(r.st.sub, r.expr)
+}
 
 # Format a list of module names for the ambiguous-head diagnostic.
 # Two modules become "`a` and `b`"; three or more become "`a`, `b`,

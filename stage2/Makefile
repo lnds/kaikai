@@ -4245,6 +4245,30 @@ test-perceus-1134-pipe-fusion-ordering: $(TARGET) build
 	  && echo "perceus-1134-pipe-fusion-ordering OK (effectful stages declined fusion; order preserved)" \
 	  || { echo "perceus-1134-pipe-fusion-ordering FAIL (order diff — effectful fusion fired)"; diff $$exp build/s2-1134pfo.out; exit 1; }
 
+# Issue #1134 — terminal-fold + range-head deforestation. A pure
+# `[1..1M] | stage |> foldl(init, combine)` fuses the range head, the map
+# stage, and the terminal fold into one counting loop that materialises
+# nothing. The gate asserts alloc_total stays in the bookkeeping range
+# (< 100; materialising the range alone would be ~1M) AND the output is
+# exact. A regression that stops fusing rematerialises the range and
+# trips the threshold.
+test-perceus-1134-pipe-fusion-terminal: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_terminal_1134.kai; \
+	exp=../examples/perceus/pipe_fusion_terminal_1134.out.expected; \
+	./$(TARGET) --path ../stdlib $$src > build/s2-1134pft.c \
+	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pft.c -o build/s2-1134pft $(LDLIBS_M); \
+	KAI_TRACE_RC=1 ./build/s2-1134pft > build/s2-1134pft.out 2> build/s2-1134pft.rc; \
+	diff -q $$exp build/s2-1134pft.out > /dev/null \
+	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (output diff)"; diff $$exp build/s2-1134pft.out; exit 1; }; \
+	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1134pft.rc | head -1 | cut -d= -f2); \
+	[ -n "$$tot" ] \
+	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (no alloc_total line)"; cat build/s2-1134pft.rc; exit 1; }; \
+	[ "$$tot" -lt 100 ] \
+	  && echo "perceus-1134-pipe-fusion-terminal OK (alloc_total=$$tot < 100; range + map + fold fused, nothing materialised)" \
+	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (alloc_total=$$tot — range rematerialised, fusion regressed)"; exit 1; }
+
 # Issue #1134 (native) — the fused chain must run byte-identically on the
 # native backend. Native-gated (tier1-native). Same purity source; asserts
 # output parity + the fused cons budget carries to native codegen.
@@ -4258,6 +4282,20 @@ test-perceus-1134-pipe-fusion-native: $(TARGET) build
 	diff -q $$exp build/s2-1134pfn.out > /dev/null \
 	  && echo "perceus-1134-pipe-fusion-native OK (fused chain byte-identical on native)" \
 	  || { echo "perceus-1134-pipe-fusion-native FAIL (native output diff)"; diff $$exp build/s2-1134pfn.out; exit 1; }
+
+# Issue #1134 (native) — the range-headed terminal fold must fold a 1M-wide
+# range in O(1) stack on native (the counting loop is tail-recursive) and
+# produce the exact result. Native-gated (tier1-native).
+test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_terminal_1134.kai; \
+	exp=../examples/perceus/pipe_fusion_terminal_1134.out.expected; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1134pftn 2> build/s2-1134pftn.err \
+	  || { echo "perceus-1134-pipe-fusion-terminal-native FAIL (native build errored)"; cat build/s2-1134pftn.err; exit 1; }; \
+	./build/s2-1134pftn > build/s2-1134pftn.out; \
+	diff -q $$exp build/s2-1134pftn.out > /dev/null \
+	  && echo "perceus-1134-pipe-fusion-terminal-native OK (range terminal-fold byte-identical on native, O(1) stack)" \
+	  || { echo "perceus-1134-pipe-fusion-terminal-native FAIL (native output diff)"; diff $$exp build/s2-1134pftn.out; exit 1; }
 
 # Issue #1117 (native) — same closure-param leak on the native backend: the
 # lifted `KFnLambda` never dropped its owned params. The fix emits a `KDrop`
