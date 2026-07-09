@@ -1,0 +1,258 @@
+# Relaxed borrow inference for non-`pub` function parameters (issue #1127).
+#
+# The conservative rule (`pcs_borrow_params`) borrows a parameter only when
+# its match arms bind nothing — the `is_red` shape. This relaxes it with the
+# Koka callee discipline: a parameter is borrowed when every use of it is
+# an INSPECTION (a bare match scrutinee), a CALLEE position (`p(x)` invokes
+# without consuming), or a SELF-BORROW-THROUGH (`p` passed to its own
+# position of a self-recursive call — the optimistic one-step fixpoint).
+#
+# Any other use — stored in a ctor/record/list slot, returned bare,
+# field-read, captured by a lambda, or passed to a non-self owned position —
+# disqualifies the parameter.
+#
+# Soundness gate on INSPECTION (the interior-pointer trap): a component the
+# arm binds is an interior pointer of the borrowed scrutinee — the RC pass
+# does NOT dup it at the bind. So a bare scrutinee is borrowable only if
+# every child binder is itself used borrow-ably in the arm body (inspected
+# or borrow-through), never escaping to an owned position. A child that
+# escapes outlives the borrowed extent of its parent and dangles once
+# another path frees the parent — the analysis must reject that, since the
+# emit has no dup-on-bind to rescue it. `pub` functions are excluded — their
+# borrow-ness is ABI, stated with `^`, never inferred.
+
+import compiler.ast
+import compiler.util
+import compiler.borrow_escape
+
+# Borrow the parameters of a non-`pub` function body under the relaxed rule.
+# `self_name` is the function's own (qualified) name for self-call detection;
+# `explicit` lists positions already borrowed via `^` (a pub signature or an
+# explicit annotation) so inference never contradicts a stated convention.
+pub fn borrow_infer_params(self_name: String, pnames: [String], body: Expr) : [String] =
+  binf_loop(self_name, pnames, pnames, 0, body)
+
+fn binf_loop(self_name: String, all: [String], rem: [String], i: Int, body: Expr) : [String] =
+  match rem {
+    []           -> []
+    [h, ...rest] -> {
+      let more = binf_loop(self_name, all, rest, i + 1, body)
+      if binf_param_borrowable(self_name, h, i, body) { [h, ...more] } else { more }
+    }
+  }
+
+# A parameter at position `i` is borrowable iff every read of it in `body`
+# is inspection | callee | self-borrow-through. `binf_uses_ok` walks the
+# body proving the discipline holds; any owned exit returns false.
+fn binf_param_borrowable(self_name: String, nm: String, i: Int, body: Expr) : Bool = {
+  # A parameter never read at all is trivially borrowable (nothing to own).
+  # A parameter read only through borrowable positions is borrowable too.
+  binf_uses_ok(self_name, nm, i, body)
+}
+
+fn binf_uses_ok(self_name: String, nm: String, i: Int, e: Expr) : Bool =
+  binf_kind_ok(self_name, nm, i, e.kind)
+
+fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match k {
+  # Inspection: `nm` as a bare scrutinee. A component the arm binds is an
+  # interior pointer of the borrowed `nm` (no dup-on-bind), so it is safe
+  # only while it stays borrowed too — `binf_match_ok` disqualifies if any
+  # arm lets a child binder escape, or rebuilds/spine-consumes the scrutinee.
+  EMatch(s, arms)     -> binf_match_ok(self_name, nm, i, s, arms)
+  # Callee position. A call whose callee IS `nm` is an INDIRECT `call_ind` on
+  # a closure param — the runtime CONSUMES it (no `call_ind_borrow`), so `nm`
+  # is not borrowable through it. A self-call passing `nm` at its own
+  # position `i` is borrow-through (see binf_call_ok).
+  ECall(f, xs) -> match f.kind {
+    EVar(c)        -> if c == nm { false } else { binf_call_ok(self_name, nm, i, c, xs) }
+    EModCall(_, c) -> binf_call_ok(self_name, nm, i, c, xs)
+    _              -> binf_uses_ok(self_name, nm, i, f) and binf_args_ok(self_name, nm, i, xs)
+  }
+  EIntrinsic(_, xs)   -> binf_args_ok(self_name, nm, i, xs)
+  # A bare read that is NOT a scrutinee nor a callee = an owned use. Field
+  # read / index base / lambda capture of `nm` = owned. Disqualify.
+  EVar(u)             -> u != nm
+  EField(x, _)        -> binf_absent(nm, x)
+  EIndex(a, b)        -> binf_absent(nm, a) and binf_uses_ok(self_name, nm, i, b)
+  EBlock(stmts, tail) -> binf_stmts_ok(self_name, nm, i, stmts) and binf_opt_ok(self_name, nm, i, tail)
+  # Capture by a lambda = owned. Stored in a ctor/record/list slot = owned.
+  ELambda(_, b)       -> binf_absent(nm, b)
+  ERecordLit(_, fis)  -> binf_absent_fields(nm, fis)
+  EList(els)          -> binf_absent_elems(nm, els)
+  # Interpolation reads and handlers are owned (conservative).
+  EStr(_, _)          -> false
+  EHandle(_, _, _, _, _, _, _) -> false
+  # Transparent forms: `nm` stays borrowable iff it does in every child.
+  _                   -> binf_transparent_ok(self_name, nm, i, k)
+}
+
+# Forms that neither consume nor store `nm` — it stays borrowable iff every
+# sub-expression keeps it borrowable. Leaves (literals) never reference `nm`.
+fn binf_transparent_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match k {
+  EBinop(_, a, b)     -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
+  EUnop(_, x)         -> binf_uses_ok(self_name, nm, i, x)
+  EIf(c, t, oe)       -> binf_uses_ok(self_name, nm, i, c) and
+                          binf_uses_ok(self_name, nm, i, t) and binf_opt_ok(self_name, nm, i, oe)
+  ERange(a, b, oe)    -> binf_uses_ok(self_name, nm, i, a) and
+                          binf_uses_ok(self_name, nm, i, b) and binf_opt_ok(self_name, nm, i, oe)
+  EPipe(a, b)         -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
+  EMapPipe(a, b)      -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
+  EFlatMapPipe(a, b)  -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
+  EFilterPipe(a, b)   -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
+  EBang(x)            -> binf_uses_ok(self_name, nm, i, x)
+  ELitUnit(x, _)      -> binf_uses_ok(self_name, nm, i, x)
+  _                   -> true
+}
+
+# `nm` as a bare scrutinee whose arms REBUILD a constructor (rb-tree
+# balance/insert reuse) or DECONSTRUCT a list with a rest-binder (map/filter
+# spine, consumed cell-by-cell) wants OWNERSHIP — borrow is a read/HOF lever,
+# not a reuse or spine-consume lever, so `nm` is disqualified there. A
+# non-bare scrutinee, and every arm body/guard, must stay borrowable.
+fn binf_match_ok(self_name: String, nm: String, i: Int, s: Expr, arms: [Arm]) : Bool = {
+  let reuse_target = match s.kind {
+    EVar(u) -> u == nm and (binf_arms_rebuild_ctor(arms) or binf_arms_list_deconstruct(arms))
+    _       -> false
+  }
+  if reuse_target { false }
+  else {
+    let scr_bare = match s.kind { EVar(u) -> u == nm  _ -> false }
+    let scr_ok = match s.kind { EVar(_) -> true  _ -> binf_uses_ok(self_name, nm, i, s) }
+    # When `nm` is borrowed as a bare scrutinee, a component the arm binds is
+    # an INTERIOR pointer of `nm` (the runtime does not dup-on-bind). It is
+    # only safe if the body never lets it ESCAPE to an owned position — else
+    # it outlives `nm`'s borrowed extent and dangles once another path frees
+    # the parent. Require every child binder to itself pass the borrow
+    # discipline over the arm body.
+    let bound_ok = if scr_bare { binf_arms_binders_borrowed(self_name, i, arms) } else { true }
+    scr_ok and bound_ok and binf_arms_ok(self_name, nm, i, arms)
+  }
+}
+
+# No child binder of any arm may ESCAPE the arm body. An escape is a use
+# that RETAINS the interior pointer past the arm: returned bare (tail
+# position), stored in a ctor/record/list slot, captured by a lambda, or
+# passed owned to a call. Merely READING the binder — a match scrutinee, a
+# binop operand, a comparison, a guard, a callee-position — does not retain
+# it, so it is safe. (Reads of an escaped-owned param DO disqualify the
+# param, but a bound child is an interior read: the distinction is whether
+# the reference survives the arm, tracked here by tail-position.)
+# A call `c(xs)`. If `c` is the self function, `nm` at its OWN position `i`
+# is borrow-through (the optimistic one-step fixpoint); at any other
+# position it is an owned pass. If `c` is another fn, `nm` in any arg is an
+# owned pass (its borrow map is not assumed). Either way the callee itself
+# (`c`) being `nm` is fine — that is the callee-position read.
+fn binf_call_ok(self_name: String, nm: String, i: Int, c: String, xs: [Expr]) : Bool =
+  if c == self_name { binf_self_args_ok(self_name, nm, i, xs, 0) }
+  else { binf_args_ok(self_name, nm, i, xs) }
+
+# Self-call args: `nm` at position `i` is borrow-through (skip the owned
+# check on that slot); every other slot must not carry a bare `nm` in owned
+# position but may still inspect/borrow-through it in a sub-expression.
+fn binf_self_args_ok(self_name: String, nm: String, i: Int, xs: [Expr], j: Int) : Bool = match xs {
+  []           -> true
+  [a, ...rest] -> {
+    let here = if j == i { binf_arg_is_borrow_through(nm, a) or binf_uses_ok(self_name, nm, i, a) }
+               else { binf_uses_ok(self_name, nm, i, a) }
+    here and binf_self_args_ok(self_name, nm, i, rest, j + 1)
+  }
+}
+
+# The borrow-through slot carries exactly the bare `nm` (or `nm` inspected).
+fn binf_arg_is_borrow_through(nm: String, a: Expr) : Bool = match a.kind {
+  EVar(u) -> u == nm
+  _       -> false
+}
+
+# Any arm whose tail rebuilds a constructor (an uppercase-initial call or a
+# record literal in tail position). This is the reuse-in-place shape the
+# recogniser fires on; a scrutinee feeding it wants ownership, not borrow.
+fn binf_arms_rebuild_ctor(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> binf_tail_rebuilds_ctor(b) or binf_arms_rebuild_ctor(rest)
+  }
+}
+
+# Any arm matching a LIST pattern with a rest-binder (`[h, ...t]`). The
+# scrutinee's spine is consumed cell-by-cell (the loop frees each cons as it
+# advances the tail), so it wants ownership — not borrowable.
+fn binf_arms_list_deconstruct(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(p, _, _) -> binf_pat_is_list_rest(p) or binf_arms_list_deconstruct(rest)
+  }
+}
+
+fn binf_pat_is_list_rest(p: Pattern) : Bool = match p.pkind {
+  PList(_, opt_rest) -> match opt_rest { Some(_) -> true None -> false }
+  _                  -> false
+}
+
+fn binf_tail_rebuilds_ctor(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _) -> true
+  ECall(f, _)      -> match f.kind {
+    EVar(c)        -> binf_name_is_ctor(c)
+    EModCall(_, c) -> binf_name_is_ctor(c)
+    _              -> false
+  }
+  EIf(_, t, oe)    -> binf_tail_rebuilds_ctor(t) or (match oe { None -> false Some(e2) -> binf_tail_rebuilds_ctor(e2) })
+  EBlock(_, tail)  -> match tail { None -> false Some(t) -> binf_tail_rebuilds_ctor(t) }
+  EMatch(_, arms)  -> binf_arms_rebuild_ctor(arms)
+  _                -> false
+}
+
+# An uppercase-initial name is a constructor (the same heuristic the KIR
+# lowering's `kir_name_is_ctor` uses).
+fn binf_name_is_ctor(nm: String) : Bool = match char_at(nm, 0) {
+  Some(c) -> c >= 'A' and c <= 'Z'
+  None    -> false
+}
+
+# Non-self call args: `nm` must be absent in owned position. A sub-inspection
+# (`f(is_red(nm))`) is still borrowable; a bare `nm` argument is owned.
+fn binf_args_ok(self_name: String, nm: String, i: Int, xs: [Expr]) : Bool = match xs {
+  []           -> true
+  [a, ...rest] -> {
+    let here = match a.kind {
+      EVar(u) -> u != nm   # bare arg to a non-self call = owned pass
+      _       -> binf_uses_ok(self_name, nm, i, a)
+    }
+    here and binf_args_ok(self_name, nm, i, rest)
+  }
+}
+
+fn binf_arms_ok(self_name: String, nm: String, i: Int, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, abody) -> {
+      let g_ok = match opt_g { None -> true Some(g) -> binf_uses_ok(self_name, nm, i, g) }
+      if g_ok and binf_uses_ok(self_name, nm, i, abody) { binf_arms_ok(self_name, nm, i, rest) }
+      else { false }
+    }
+  }
+}
+
+fn binf_opt_ok(self_name: String, nm: String, i: Int, oe: Option[Expr]) : Bool = match oe {
+  None    -> true
+  Some(e) -> binf_uses_ok(self_name, nm, i, e)
+}
+
+fn binf_stmts_ok(self_name: String, nm: String, i: Int, stmts: [Stmt]) : Bool = match stmts {
+  []           -> true
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, rhs) -> binf_uses_ok(self_name, nm, i, rhs)
+      SExprStmt(e)    -> binf_uses_ok(self_name, nm, i, e)
+      _               -> binf_absent_stmt(nm, s)
+    }
+    here and binf_stmts_ok(self_name, nm, i, rest)
+  }
+}
+
+fn binf_absent_stmt(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> binf_absent(nm, rhs)
+  SExprStmt(e)    -> binf_absent(nm, e)
+  _               -> true
+}
+
