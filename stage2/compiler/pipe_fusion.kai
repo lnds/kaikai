@@ -1,0 +1,178 @@
+import compiler.ast
+
+# Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
+# collapses two map traversals into one — one result list, zero
+# intermediates. Fusion reorders per-element execution, observable only
+# if a stage has effects, so it fires only when both stage rows are pure
+# (empty or Mutable-masked). The composed lambda is built already-typed
+# (a direct projection of resolved types); the in-place-mutated
+# substitution must never be forked, so no node is re-synthesised.
+#
+# This module holds the AST-only half: pattern recognition and typed-node
+# construction. The purity gate and type projections that need the live
+# substitution stay in the typer (`try_fuse_map_pipe`).
+
+# A recognised map-call: the `map` callee (`EModCall`/`EVar`), the
+# source list, and the stage closure — all already typed.
+pub type FusedMapCall = { callee: Expr, source: Expr, stage: Expr }
+
+# Resolved stage types the composed lambda is built from: the parameter
+# (inner stage domain), the mid value (inner codomain / outer domain),
+# the result (outer codomain), and the merged effect row.
+pub type FuseTypes = { param: Ty, mid: Ty, result: Ty, row: Row }
+
+#[doc("Recognise a lowered `map` call `map(source, stage)` for map-map fusion.")]
+pub fn pipe_fusion_as_map_call(e: Expr) : Option[FusedMapCall] =
+  match e.kind {
+    ECall(callee, [source, stage]) ->
+      if pipe_fusion_callee_is_map(callee) {
+        Some(FusedMapCall { callee: callee, source: source, stage: stage })
+      } else { None }
+    _ -> None
+  }
+
+# The canonical `map` op is `EModCall(_, "map")` for a module-resident
+# head or the bare `EVar("map")` fallback the seeded `List` head routes
+# through. `flat_map`/`filter` are deliberately not matched — v1 fuses
+# map-map only.
+fn pipe_fusion_callee_is_map(callee: Expr) : Bool =
+  match callee.kind {
+    EModCall(_, op) -> op == "map"
+    EVar(name)      -> name == "map"
+    _               -> false
+  }
+
+# The effect row off a resolved function type; a pipe stage is
+# `(A) -> B / e`. Non-function types have no row.
+pub fn pipe_fusion_fn_row(t: Ty) : Option[Row] =
+  match t {
+    TyFnT(_, _, row) -> Some(row)
+    _                -> None
+  }
+
+# A resolved row is pure for fusion iff its concrete labels are a subset
+# of `{Mutable}`. Kaikai lambdas always carry an open tail (Rémy-style
+# row polymorphism), so an unresolved tail is NOT impurity — only
+# realised labels are. `Mutable` is masked to pure for locally-
+# constructed, non-escaping cells; a cell captured by reference escapes
+# and keeps a non-maskable label, which lands here as impure.
+pub fn pipe_fusion_labels_pure(labels: [Label]) : Bool =
+  match labels {
+    []           -> true
+    [l, ...rest] -> l.eff == "Mutable" and pipe_fusion_labels_pure(rest)
+  }
+
+#[doc("Build the typed composed closure `x => outer(inner(x))` from resolved stage types.")]
+pub fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
+                           line: Int, col: Int) : Expr {
+  let pname = concat_all(["__fuse_", int_to_string(line), "_", int_to_string(col)])
+  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
+  let arg = with_ty(mk_expr(EVar(pname), line, col), tys.param)
+  let inner_call = with_ty(mk_expr(ECall(inner, [arg]), line, col), tys.mid)
+  let outer_call = with_ty(mk_expr(ECall(outer, [inner_call]), line, col), tys.result)
+  let lam_ty = TyFnT([tys.param], tys.result, tys.row)
+  with_ty(mk_expr(ELambda([param], outer_call), line, col), lam_ty)
+}
+
+# A map-into-terminal-fold shape: the mapped source, the chain's stage
+# closures (outermost-applied last), and the fold's `init` + `combine` —
+# all still raw (pre-synth). `stages` holds each map stage separately so
+# the purity gate can check them one at a time; they compose into a
+# single closure only at rewrite time.
+pub type FusedFold = { source: Expr, stages: [Expr], init: Expr, combine: Expr }
+
+#[doc("Recognise a `map`-pipe chain into `foldl(init, combine)` for terminal-fold fusion.")]
+pub fn pipe_fusion_as_terminal_fold(lhs: Expr, rhs: Expr) : Option[FusedFold] =
+  match lhs.kind {
+    EMapPipe(_, _) -> match pipe_fusion_as_foldl_call(rhs) {
+      Some(ff) -> {
+        let flat = pipe_fusion_flatten_map_chain(lhs)
+        Some(FusedFold { source: flat.source, stages: flat.stages,
+                         init: ff.init, combine: ff.combine })
+      }
+      None -> None
+    }
+    _ -> None
+  }
+
+type FlatMapChain = { source: Expr, stages: [Expr] }
+
+# Flatten an adjacent map-pipe chain `EMapPipe(EMapPipe(xs, f), g)` into
+# its base source `xs` and the stage list `[f, g]` (application order), so
+# a `map`-into-terminal-fold over a multi-map chain fuses the whole chain
+# — not just the last stage.
+fn pipe_fusion_flatten_map_chain(e: Expr) : FlatMapChain =
+  match e.kind {
+    EMapPipe(inner, stage) -> match inner.kind {
+      EMapPipe(_, _) -> {
+        let flat = pipe_fusion_flatten_map_chain(inner)
+        FlatMapChain { source: flat.source, stages: [...flat.stages, stage] }
+      }
+      _ -> FlatMapChain { source: inner, stages: [stage] }
+    }
+    _ -> FlatMapChain { source: e, stages: [] }
+  }
+
+#[doc("Compose a stage list `[f, g, ...]` into a single raw closure `x => ...g(f(x))`.")]
+pub fn pipe_fusion_compose_stages(stages: [Expr], line: Int, col: Int) : Expr {
+  let pname = concat_all(["__fusef_", int_to_string(line), "_", int_to_string(col)])
+  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
+  let body = pipe_fusion_apply_stages(stages, mk_expr(EVar(pname), line, col), line, col)
+  mk_expr(ELambda([param], body), line, col)
+}
+
+fn pipe_fusion_apply_stages(stages: [Expr], acc: Expr, line: Int, col: Int) : Expr =
+  match stages {
+    []           -> acc
+    [f, ...rest] -> pipe_fusion_apply_stages(rest, mk_expr(ECall(f, [acc]), line, col), line, col)
+  }
+
+# Raw (untyped) closure composition `x => outer(inner(x))`. Used when the
+# composed stage will be synthesised fresh, so no `.ty` is attached.
+fn pipe_fusion_compose_raw(inner: Expr, outer: Expr, line: Int, col: Int) : Expr {
+  let pname = concat_all(["__fusef_", int_to_string(line), "_", int_to_string(col)])
+  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
+  let arg = mk_expr(EVar(pname), line, col)
+  let body = mk_expr(ECall(outer, [mk_expr(ECall(inner, [arg]), line, col)]), line, col)
+  mk_expr(ELambda([param], body), line, col)
+}
+
+type FoldlArgs = { init: Expr, combine: Expr }
+
+# A terminal `foldl(init, combine)` — the LHS becomes the folded list, so
+# only `init` and `combine` are explicit args. Matches the bare `foldl`
+# and the qualified `list.foldl` spellings.
+fn pipe_fusion_as_foldl_call(rhs: Expr) : Option[FoldlArgs] =
+  match rhs.kind {
+    ECall(callee, [init, combine]) ->
+      if pipe_fusion_callee_is_foldl(callee) {
+        Some(FoldlArgs { init: init, combine: combine })
+      } else { None }
+    _ -> None
+  }
+
+fn pipe_fusion_callee_is_foldl(callee: Expr) : Bool =
+  match callee.kind {
+    EModCall(_, op) -> op == "foldl"
+    EVar(name)      -> name == "foldl"
+    _               -> false
+  }
+
+#[doc("Rewrite a terminal-fold to the matching non-materialising stdlib call.")]
+pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr {
+  let stage = pipe_fusion_compose_stages(ff.stages, line, col)
+  match ff.source.kind {
+    ERange(a, b, None) ->
+      fold_call("protocols", "range_map_foldl",
+                [a, b, stage, ff.init, ff.combine], line, col)
+    ERange(a, b, Some(step)) ->
+      fold_call("protocols", "range_step_map_foldl",
+                [a, b, step, stage, ff.init, ff.combine], line, col)
+    _ ->
+      fold_call("list", "map_foldl",
+                [ff.source, stage, ff.init, ff.combine], line, col)
+  }
+}
+
+fn fold_call(mod: String, fname: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(EModCall(mod, fname), line, col), args), line, col)
