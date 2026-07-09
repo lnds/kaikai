@@ -47,6 +47,7 @@
 import compiler.ast
 import compiler.kinds
 import compiler.home_tu
+import compiler.purity
 import compiler.chars
 import compiler.diag
 import compiler.util
@@ -7606,7 +7607,7 @@ fn is_ufn_decl(fns: [EFn], name: String, mo: Option[String]) : Bool {
   }
 }
 
-fn emit_fn_forward(d: Decl, fns: [EFn], frames: [FnEvidenceFrame], capable: [String]) : String {
+fn emit_fn_forward(d: Decl, fns: [EFn], frames: [FnEvidenceFrame], capable: [String], const_syms: [String]) : String {
   match d {
     DFn(_, name, _, params, _, _, body, _, _, mo) -> {
       let slots = frame_slots_of(frames, c_sym(name, mo))
@@ -7616,10 +7617,23 @@ fn emit_fn_forward(d: Decl, fns: [EFn], frames: [FnEvidenceFrame], capable: [Str
         Some(us) -> emit_fn_signature_unboxed_evf(c_sym(name, mo), params, us, slots)
         None     -> emit_fn_signature_evf(c_sym(name, mo), params, slots)
       }, rd_is_capable(c_sym(name, mo), capable))
-      cat2(sig, ";\n")
+      cat2(purity_const_prefix(c_sym(name, mo), const_syms), cat2(sig, ";\n"))
     }
     _ -> ""
   }
+}
+
+# `KAI_CONST ` when the confirmation table proved this fn memory-clean,
+# else empty. The prefix must be IDENTICAL on the forward decl and the
+# definition (both go through this helper on the same `c_sym`), so `cc`
+# never sees a mismatched declaration.
+fn purity_const_prefix(sym: String, const_syms: [String]) : String =
+  if ec_name_present(const_syms, sym) { "KAI_CONST " } else { "" }
+
+fn ec_name_present(xs: [String], t: String) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == t { true } else { ec_name_present(rest, t) }
+  _ -> false
 }
 
 fn emit_thunk_forward(d: Decl) : String {
@@ -7630,7 +7644,7 @@ fn emit_thunk_forward(d: Decl) : String {
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn]) : String / Console {
+fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_syms: [String]) : String / Console {
 
   match d {
     DFn(_, name, _, params, ret_ty_opt, _, body, _, _, mo) -> {
@@ -7645,10 +7659,10 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn]) : String
       # separate compilation the set is empty (a cross-TU call cannot see the
       # body), so no fn takes `_donor` and every call site omits it.
       let rd_cap = rd_is_capable(c_sym(name, mo), cx.rd_capable)
-      let sig = rd_splice_param(match opt_sig {
+      let sig = cat2(purity_const_prefix(c_sym(name, mo), const_syms), rd_splice_param(match opt_sig {
         Some(us) -> emit_fn_signature_unboxed_evf(c_sym(name, mo), params, us, evf_slots)
         None     -> emit_fn_signature_evf(c_sym(name, mo), params, evf_slots)
-      }, rd_cap)
+      }, rd_cap))
       # m12.7.x FFI v1: a `[<extern_c>]` axiom lowered into a DFn
       # whose body is the magic ETodo tag. Emit the FFI shim instead
       # of the standard body — the shim unboxes each parameter to
@@ -8341,9 +8355,9 @@ fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int) : String {
 
 # ---- top-level passes ----
 
-fn fn_forward_decls(decls: [Decl], fns: [EFn], capable: [String]) : String = {
+fn fn_forward_decls(decls: [Decl], fns: [EFn], capable: [String], const_syms: [String]) : String = {
   let frames = build_evidence_frames(decls)
-  concat_all(map(decls, (d) => emit_fn_forward(d, fns, frames, capable)))
+  concat_all(map(decls, (d) => emit_fn_forward(d, fns, frames, capable, const_syms)))
 }
 
 # Drop from the donation-capable set any fn whose body carries a TRMC
@@ -8372,18 +8386,18 @@ fn rd_decl_ret_is_raw(name: String, mo: Option[String], fns: [EFn]) : Bool =
 fn thunk_forward_decls(decls: [Decl]) : String =
   concat_all(map(decls, emit_thunk_forward))
 
-fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx) : String / Console + Mutable =
-  sb_build(fn_bodies_loop(src, decls, cx, fns_by_mod_new(cx.fns), sb_new()))
+fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx, const_syms: [String]) : String / Console + Mutable =
+  sb_build(fn_bodies_loop(src, decls, cx, fns_by_mod_new(cx.fns), const_syms, sb_new()))
 
-fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, b: SB) : SB / Console + Mutable = match decls {
+fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, const_syms: [String], b: SB) : SB / Console + Mutable = match decls {
   [] -> b
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, mo) -> {
       let r = fns_prefer_module_cached(fbm, mo)
-      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table)), emit_fn_thunk(d, cx.fns, cx.evf, cx.effs, cx.rd_capable))
-      fn_bodies_loop(src, rest, cx, r.cache, b1)
+      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, r.table, const_syms)), emit_fn_thunk(d, cx.fns, cx.evf, cx.effs, cx.rd_capable))
+      fn_bodies_loop(src, rest, cx, r.cache, const_syms, b1)
     }
-    _ -> fn_bodies_loop(src, rest, cx, fbm, b)
+    _ -> fn_bodies_loop(src, rest, cx, fbm, const_syms, b)
   }
 }
 
@@ -10200,8 +10214,13 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   # ---- kai_decls.h : every prototype, whole program (shared) ---------
   # Donation is OFF under separate compilation (empty capable set) — see the
   # cx construction below; the forward decls must agree, so `[]` here too.
+  # Purity attributes are safe under separate compilation (unlike reuse
+  # donation): `KAI_CONST` does not change the ABI, and the analysis runs
+  # over the whole `decls`, so the shared `kai_decls.h` forward decl every
+  # TU includes carries the same promise as each definition.
+  let const_syms = purity_const_syms(purity_analyze(decls))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
-  let fwd = fn_forward_decls(decls, fns, [])
+  let fwd = fn_forward_decls(decls, fns, [], const_syms)
   let thunk_fwd = thunk_forward_decls(decls)
   let lam_fwd = emit_lam_forward_decls(lams)
   let default_ev_extern = emit_default_node_extern_decls(effect_decls_only(decls))
@@ -10231,7 +10250,7 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
   let root_decls = decls_of_origin(decls, None)
-  let root_bodies = fn_bodies(src, root_decls, cx)
+  let root_bodies = fn_bodies(src, root_decls, cx, const_syms)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, clauses_info, enum_names, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), prelude_tbl, rprelude_tbl, cx.evf)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
@@ -10247,7 +10266,7 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   # module's fn bodies. `fn_bodies` carries the `Console` effect, so we
   # fold with an explicit loop rather than `map` (which is pure).
   let mod_names = distinct_module_origins(decls)
-  let mod_tus = emit_module_tus_loop(src, decls, mod_names, cx, [])
+  let mod_tus = emit_module_tus_loop(src, decls, mod_names, cx, const_syms, [])
   let all_tus = [root_tu, ...mod_tus]
 
   # ---- assemble the marker-delimited multi-file stream --------------
@@ -10262,12 +10281,12 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
 }
 
 #[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
-fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, acc: [CModuleTU]) : [CModuleTU] / Console + Mutable = match mod_names {
+fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_syms: [String], acc: [CModuleTU]) : [CModuleTU] / Console + Mutable = match mod_names {
   [] -> list_reverse(acc)
   [m, ...rest] -> {
-    let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx)
+    let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx, const_syms)
     let tu = CModuleTU { stem: tu_stem(Some(m)), body: body }
-    emit_module_tus_loop(src, decls, rest, cx, [tu, ...acc])
+    emit_module_tus_loop(src, decls, rest, cx, const_syms, [tu, ...acc])
   }
 }
 
@@ -10348,8 +10367,14 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # filter is a soundness fence, not a live change. Computed once, threaded
   # to the forward decls and the emit context.
   let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fns)
+  # Confirmed-purity symbols (#1139): the emitted `c_sym` of every fn
+  # whose lowered body is memory-clean, so the signature helper prefixes
+  # `KAI_CONST`. Computed once over the same decls the native backend
+  # sees; empty under separate compilation is fine (a cross-TU caller
+  # keeps the barrier). Same set drives the forward decl and the body.
+  let const_syms = purity_const_syms(purity_analyze(decls))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
-  let fwd = fn_forward_decls(decls, fns, rd_cap_set)
+  let fwd = fn_forward_decls(decls, fns, rd_cap_set, const_syms)
   let thunk_fwd = thunk_forward_decls(decls)
   let lam_fwd = emit_lam_forward_decls(lams)
   # Top-level emission runs with an empty lexical scope; each fn /
@@ -10369,7 +10394,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   let rprelude_tbl = rprelude_table()
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
                      regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), prelude: prelude_tbl, rprelude: rprelude_tbl, evf: build_evidence_frames(decls), rd_active: false, rd_capable: rd_cap_set }
-  let bodies = fn_bodies(src, decls, cx)
+  let bodies = fn_bodies(src, decls, cx, const_syms)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), prelude_tbl, rprelude_tbl, cx.evf)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
