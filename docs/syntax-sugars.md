@@ -1126,6 +1126,22 @@ are rejected with a typed diagnostic pointing the user at `!` or
 `option.and_then` / `result.and_then` for explicit chaining. The
 pipes are list-shaped sugar, not a generic monadic chain.
 
+### Fusion (#1134)
+
+Adjacent `|` stages fuse into one traversal when every stage closure is
+pure: `xs | f | g` lowers to `map(xs, x => g(f(x)))` — one result list,
+no intermediates. A `|`-chain into a terminal `foldl` fuses further, to a
+single accumulating loop that builds no list at all; and a range literal
+at the head (`[a..b] | f |> foldl(...)`) becomes a counting loop that
+never materialises the range. Fusion is invisible — it changes only time
+and allocation, never a value.
+
+Purity is the license: fusion reorders stage execution per element, which
+is observable only if a stage has effects. The typer reads each stage's
+inferred effect row; a stage whose row is non-empty (beyond a masked
+`Mutable`) breaks the fused run at that point, so observable ordering is
+preserved byte-for-byte. No annotation controls this — the row decides.
+
 ## 12. Multi-clause function bodies — `case`-led arms
 
 Issue #415. A third form of `fn` body, alongside `= expr`
