@@ -5194,18 +5194,37 @@ static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
     return kai_vec_read_elem(m, kai_vec_elems(v) + (size_t) i * (size_t) m->stride);
 }
 
+/* The one unique-or-copy decision every Vec write rides: unique (rc==1)
+ * mutates in place, shared clones with `need_cap` capacity. Every write
+ * path — boxed or raw — MUST pass through here before touching bytes; a
+ * raw store on a shared buffer would silently corrupt a value another
+ * reference is observing. */
+static KaiValue *kai_vec_ensure_unique(KaiValue *v, int64_t need_cap) {
+    if (!kai_check_unique(v)) {
+        KaiValue *c = kai_vec_clone(v, need_cap);
+        kai_decref(v);
+        kai_vec_cow_total++;
+        return c;
+    }
+    kai_vec_inplace_total++;
+    return v;
+}
+
+/* Grow the (unique) block to `ncap` elements; returns the moved meta. */
+static KaiVecMeta *kai_vec_grow_cap(KaiValue *v, int64_t ncap) {
+    KaiVecMeta *m = kai_vec_meta(v);
+    v->as.vec.data = kai_heap_realloc(v->as.vec.data,
+        sizeof(KaiVecMeta) + (size_t) v->as.vec.cap * (size_t) (m->stride > 0 ? m->stride : 0),
+        sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
+    v->as.vec.cap = ncap;
+    return kai_vec_meta(v);
+}
+
 /* Pure write. Consumes `v` and `x`; returns the result vec (in place
  * when `v` was unique, a copy when shared). */
 static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {
     kai_vec_bounds(v, i, "vec_set");
-    if (!kai_check_unique(v)) {
-        KaiValue *c = kai_vec_clone(v, v->as.vec.cap);
-        kai_decref(v);
-        v = c;
-        kai_vec_cow_total++;
-    } else {
-        kai_vec_inplace_total++;
-    }
+    v = kai_vec_ensure_unique(v, v->as.vec.cap);
     KaiVecMeta *m = kai_vec_meta(v);
     char *slot = kai_vec_elems(v) + (size_t) i * (size_t) m->stride;
     if (m->ekind == KAI_VEC_EK_BOXED) {
@@ -5227,39 +5246,129 @@ static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
         fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
     }
     int64_t len = v->as.vec.len;
-    if (!kai_check_unique(v)) {
-        int64_t cap = v->as.vec.cap;
-        int64_t ncap = cap * 2;
+    {
+        int64_t ncap = v->as.vec.cap * 2;
         if (ncap < len + 1) ncap = len + 1;
         if (ncap < 4) ncap = 4;
-        KaiValue *c = kai_vec_clone(v, ncap);
-        kai_decref(v);
-        v = c;
-        kai_vec_cow_total++;
-    } else {
-        kai_vec_inplace_total++;
+        v = kai_vec_ensure_unique(v, ncap);
     }
     KaiVecMeta *m = kai_vec_meta(v);
     if (m->ekind == KAI_VEC_EK_PENDING) {
         kai_vec_classify(m, x);
         int64_t ncap = v->as.vec.cap;
         if (ncap < 4) ncap = 4;
-        v->as.vec.data = kai_heap_realloc(v->as.vec.data,
-            sizeof(KaiVecMeta),
-            sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
-        v->as.vec.cap = ncap;
-        m = kai_vec_meta(v);
+        m = kai_vec_grow_cap(v, ncap);
     } else if (len == v->as.vec.cap) {
         int64_t ncap = v->as.vec.cap * 2;
         if (ncap < 4) ncap = 4;
-        v->as.vec.data = kai_heap_realloc(v->as.vec.data,
-            sizeof(KaiVecMeta) + (size_t) v->as.vec.cap * (size_t) m->stride,
-            sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
-        v->as.vec.cap = ncap;
-        m = kai_vec_meta(v);
+        m = kai_vec_grow_cap(v, ncap);
     }
     kai_vec_write_elem(m, kai_vec_elems(v) + (size_t) len * (size_t) m->stride, x);
     v->as.vec.len = len + 1;
+    return v;
+}
+
+/* ---------- Vec raw element paths (compiler-fused) ----------
+ *
+ * The compiler fuses `vec_get(v, i).f` and `vec_push(v, Rec{..})` on
+ * inline-record carriers into these entry points so no boxed record is
+ * built per access. Only the element MOVE is raw: every write still
+ * rides kai_vec_ensure_unique — the ownership decision is never
+ * skipped. Field index trusts the declaration-order column layout,
+ * the same bet the constant-index record read (kai_op_field_at)
+ * already makes; ekind/arity/tag are checked and trap on mismatch. */
+
+static KaiValue *kai_vec_get_field_impl(KaiValue *v, KaiValue *i, int32_t fidx) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    kai_vec_bounds(v, idx, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind != KAI_VEC_EK_REC || fidx < 0 || fidx >= m->n_fields)
+        kai_trap_abort("vec: fused field read on a non-inline-record vec");
+    int64_t bits;
+    memcpy(&bits, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride
+                  + (size_t) fidx * 8, 8);
+    return kai_vec_scalar_box(m->field_tags[fidx], bits);
+}
+
+/* Consuming / borrowing pair, mirroring kai_prelude_array_get(_borrow). */
+static KaiValue *kai_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx) {
+    KaiValue *r = kai_vec_get_field_impl(v, i, fidx);
+    if (v) kai_decref(v);
+    if (i) kai_decref(i);
+    return r;
+}
+static KaiValue *kai_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) {
+    return kai_vec_get_field_impl(v, i, fidx);
+}
+
+/* Store `n` unpacked scalar fields into one REC slot; consumes each x. */
+static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
+                                     KaiValue **xs) {
+    if (m->ekind != KAI_VEC_EK_REC || (int64_t) m->n_fields != n)
+        kai_trap_abort("vec: record shape mismatch");
+    for (int64_t k = 0; k < n; ++k) {
+        if (kai_vec_scalar_tag(xs[k]) != m->field_tags[k])
+            kai_trap_abort("vec: record shape mismatch");
+        int64_t bits = kai_vec_scalar_bits(xs[k], m->field_tags[k]);
+        memcpy(slot + (size_t) k * 8, &bits, 8);
+        kai_decref(xs[k]);
+    }
+}
+
+/* Fused `vec_push(v, Rec{f0: x0, ...})`: consumes v and every x; the
+ * record is never allocated. A PENDING vec classifies REC directly
+ * from the unpacked fields (`names` must be static literals); the
+ * head tag is 0, mirroring kai_record's anonymous-literal stamp. */
+static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
+                                      KaiValue **xs, const char **names) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    {
+        int64_t ncap = v->as.vec.cap * 2;
+        if (ncap < len + 1) ncap = len + 1;
+        if (ncap < 4) ncap = 4;
+        v = kai_vec_ensure_unique(v, ncap);
+    }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind == KAI_VEC_EK_PENDING) {
+        if (n < 1 || n > KAI_VEC_REC_MAX)
+            kai_trap_abort("vec: record shape mismatch");
+        m->ekind = KAI_VEC_EK_REC;
+        m->n_fields = (int32_t) n;
+        m->head_tag = 0;
+        m->stride = n * 8;
+        for (int64_t k = 0; k < n; ++k) {
+            int ft = kai_vec_scalar_tag(xs[k]);
+            if (ft < 0) kai_trap_abort("vec: record shape mismatch");
+            m->field_tags[k] = (uint8_t) ft;
+            m->names[k] = names[k];
+        }
+        int64_t ncap = v->as.vec.cap;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    } else if (len == v->as.vec.cap) {
+        int64_t ncap = v->as.vec.cap * 2;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    }
+    kai_vec_store_rec_fields(m, kai_vec_elems(v) + (size_t) len * (size_t) m->stride,
+                             n, xs);
+    v->as.vec.len = len + 1;
+    return v;
+}
+
+/* Fused `vec_set(v, i, Rec{...})`: consumes v, i, and every x. */
+static KaiValue *kai_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n,
+                                     KaiValue **xs) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (i) kai_decref(i);
+    kai_vec_bounds(v, idx, "vec_set");
+    v = kai_vec_ensure_unique(v, v->as.vec.cap);
+    KaiVecMeta *m = kai_vec_meta(v);
+    kai_vec_store_rec_fields(m, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride,
+                             n, xs);
     return v;
 }
 
@@ -6314,6 +6423,19 @@ static KaiValue *kai_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
 
 static KaiValue *kai_prelude_vec_push(KaiValue *v, KaiValue *x) {
     return kai_vec_push_impl(v, x);       /* consumes v and x */
+}
+
+/* Borrow variants (the array_get_borrow move): the container is
+ * BORROWED — the caller kept its ref (Perceus stripped the dup), so
+ * no decref here. `i` is a tagged Int and is not rc-touched. */
+static KaiValue *kai_prelude_vec_length_borrow(KaiValue *v) {
+    int64_t len = (v && kai_is_ptr(v) && v->tag == KAI_VEC) ? v->as.vec.len : 0;
+    return kai_int(len);
+}
+
+static KaiValue *kai_prelude_vec_get_borrow(KaiValue *v, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    return kai_vec_get_impl(v, idx);
 }
 
 /* ---------- prelude: refs (issue #257) ----------

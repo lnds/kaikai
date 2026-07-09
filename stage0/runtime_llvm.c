@@ -964,6 +964,14 @@ KaiValue *kaix_prelude_vec_length(KaiValue *v)                           { retur
 KaiValue *kaix_prelude_vec_get(KaiValue *v, KaiValue *i)                 { return kai_prelude_vec_get(v, i); }
 KaiValue *kaix_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { return kai_prelude_vec_set(v, i, x); }
 KaiValue *kaix_prelude_vec_push(KaiValue *v, KaiValue *x)                { return kai_prelude_vec_push(v, x); }
+KaiValue *kaix_prelude_vec_length_borrow(KaiValue *v)                    { return kai_prelude_vec_length_borrow(v); }
+KaiValue *kaix_prelude_vec_get_borrow(KaiValue *v, KaiValue *i)          { return kai_prelude_vec_get_borrow(v, i); }
+/* Vec raw element paths (compiler-fused): field read without record
+ * rebuild, push/set of an unpacked record literal. */
+KaiValue *kaix_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx)        { return kai_vec_get_field(v, i, fidx); }
+KaiValue *kaix_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) { return kai_vec_get_field_borrow(v, i, fidx); }
+KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) { return kai_vec_push_rec_raw(v, n, xs, names); }
+KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) { return kai_vec_set_rec_raw(v, i, n, xs); }
 /* Issue #364: `impl Rem for Real` in stdlib/protocols.kai delegates
  * to this libm fmod binding. Listed in the LLVM prelude table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */

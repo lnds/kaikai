@@ -28,6 +28,7 @@ import compiler.kir_lower_match
 import compiler.kir_lower_lit
 import compiler.kir_lower_rec
 import compiler.kir_lower_variant
+import compiler.vec_raw
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -72,7 +73,10 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EVar(name)         -> lower_var(name, st)
 
   # A call / constructor / perceus mark / sentinel — the dense dispatch.
-  ECall(f, cargs)    -> lower_call(x, f, cargs, st)
+  ECall(f, cargs)    -> match lower_vec_write_rec_fused(x, f, cargs, st) {
+    Some(r) -> r
+    None    -> lower_call(x, f, cargs, st)
+  }
 
   # `e.field` → a field read over the base atom. When `base.ty` resolves to
   # a known record, the field's slot is a compile-time constant (layout is
@@ -82,13 +86,16 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # reads, transfers single-use, ctors return rc=1) and is no longer reachable
   # through the result, so drop it to balance — the C oracle's `kai_decref(_b)`
   # after the field load.
-  EField(base, fname) -> {
-    let rb = lower_expr(base, st)
-    match rb { LRes(bv, st1) ->
-      match field_index_of(st1.recs, base.ty, fname) {
-        Some(n) -> lower_field_read(st1, KPrim("kai_op_field_at", [bv, KIntV(n)]), bv, kpos_of(x))
-        None    -> lower_field_read(st1, KPrim("kai_op_field", [bv, KStrV(fname)]), bv, kpos_of(x))
-      } }
+  EField(base, fname) -> match lower_vec_get_field_fused(x, base, fname, st) {
+    Some(r) -> r
+    None -> {
+      let rb = lower_expr(base, st)
+      match rb { LRes(bv, st1) ->
+        match field_index_of(st1.recs, base.ty, fname) {
+          Some(n) -> lower_field_read(st1, KPrim("kai_op_field_at", [bv, KIntV(n)]), bv, kpos_of(x))
+          None    -> lower_field_read(st1, KPrim("kai_op_field", [bv, KStrV(fname)]), bv, kpos_of(x))
+        } }
+    }
   }
 
   # Binary / unary operators → a KPrim over their operand atoms. The
@@ -695,6 +702,109 @@ fn lower_field_read(st: LowerSt, op: KOp, base: KVal, pos: KPos) : LRes / Consol
   match bind_op(st, op, pos) {
     LRes(fv, st1) -> LRes(fv, ls_emit(st1, KRC(KDrop(base), pos)))
   }
+
+# ---- Vec raw element fusion (classifier verdict in vec_raw.kai) -----
+
+# `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier →
+# `kai_vec_get_field(_borrow)(v, i, fidx)`. The helper's RC contract on
+# (v, i) matches the vec_get variant it replaces; no record is built,
+# so there is no base to drop.
+fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : Option[LRes] / Console = match base.kind {
+  ECall(f, cargs) -> match f.kind {
+    EVar(callee) ->
+      if callee == "vec_get" or callee == "vec_get_borrow" {
+        match vec_rec_field_slot(st.recs, base.ty, fname) {
+          Some(fidx) -> match cargs {
+            [v, i] -> {
+              let prim = if callee == "vec_get_borrow" { "kai_vec_get_field_borrow" }
+                         else { "kai_vec_get_field" }
+              let rv = lower_expr(v, st)
+              match rv { LRes(vv, st1) -> {
+                let ri = lower_expr(i, st1)
+                match ri { LRes(iv, st2) ->
+                  Some(bind_op(st2, KPrim(prim, [vv, iv, KIntV(fidx)]), kpos_of(x))) }
+              } }
+            }
+            _ -> None
+          }
+          None -> None
+        }
+      } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
+# `kai_vec_push_rec_raw` / `kai_vec_set_rec_raw` over the unpacked
+# field values; the record is never allocated and the uniqueness
+# decision stays inside the runtime helper. Push carries (value, name)
+# pairs after the arity (the PENDING classify needs the names); set
+# writes an already-classified slot and carries values only.
+fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console = match f.kind {
+  EVar(callee) ->
+    if callee == "vec_push" {
+      match cargs {
+        [v, lit] -> match lit.kind {
+          ERecordLit(_, fis) ->
+            if vec_elem_is_rec_carrier(st.recs, lit.ty) {
+              let rv = lower_expr(v, st)
+              match rv { LRes(vv, st1) ->
+                match lower_vec_rec_pairs(fis, st1, []) {
+                  LResMany(pvs, st2) ->
+                    Some(bind_op(st2,
+                      KPrim("kai_vec_push_rec_raw", [vv, KIntV(list_length(fis)), ...pvs]),
+                      kpos_of(x)))
+                } }
+            } else { None }
+          _ -> None
+        }
+        _ -> None
+      }
+    } else if callee == "vec_set" {
+      match cargs {
+        [v, i, lit] -> match lit.kind {
+          ERecordLit(_, fis) ->
+            if vec_elem_is_rec_carrier(st.recs, lit.ty) {
+              let rv = lower_expr(v, st)
+              match rv { LRes(vv, st1) -> {
+                let ri = lower_expr(i, st1)
+                match ri { LRes(iv, st2) ->
+                  match lower_vec_rec_vals(fis, st2, []) {
+                    LResMany(fvs, st3) ->
+                      Some(bind_op(st3,
+                        KPrim("kai_vec_set_rec_raw", [vv, iv, KIntV(list_length(fis)), ...fvs]),
+                        kpos_of(x)))
+                  } }
+              } }
+            } else { None }
+          _ -> None
+        }
+        _ -> None
+      }
+    } else { None }
+  _ -> None
+}
+
+fn lower_vec_rec_pairs(fis: [FieldInit], st: LowerSt, acc: [KVal]) : LResMany / Console = match fis {
+  []           -> LResMany(list_reverse(acc), st)
+  [fi, ...rest] -> match fi {
+    FI(nm, e) -> {
+      let re = lower_expr(e, st)
+      match re { LRes(ev, st1) -> lower_vec_rec_pairs(rest, st1, [KStrV(nm), ev, ...acc]) }
+    }
+  }
+}
+
+fn lower_vec_rec_vals(fis: [FieldInit], st: LowerSt, acc: [KVal]) : LResMany / Console = match fis {
+  []           -> LResMany(list_reverse(acc), st)
+  [fi, ...rest] -> match fi {
+    FI(_, e) -> {
+      let re = lower_expr(e, st)
+      match re { LRes(ev, st1) -> lower_vec_rec_vals(rest, st1, [ev, ...acc]) }
+    }
+  }
+}
 
 fn lower_stmts(stmts: [Stmt], st: LowerSt) : LowerSt / Console = match stmts {
   [] -> st

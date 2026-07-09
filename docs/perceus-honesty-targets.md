@@ -105,6 +105,11 @@ to `0` / `0` (only the element's `10 M` incref remains). A container
 read *only* through borrowed slots (never re-threaded to a consumer)
 stays consuming so its ref is still reclaimed — the borrow fires on the
 loop shape, where the recursive re-thread keeps the array alive.
+`vec_get` / `vec_length` join the same seed with `_borrow` variants:
+Vec read loops pay zero container rc ops, and the fused inline-record
+paths (`vec_get(v, i).f`, push/set of a record literal) additionally
+delete the per-access boxed-record round-trip while every raw write
+still rides the one unique-or-copy decision.
 
 ### User-parameter borrow (#1127)
 

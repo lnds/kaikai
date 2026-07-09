@@ -1,0 +1,65 @@
+# compiler/vec_raw.kai — the ONE compile-time verdict for the Vec[T]
+# raw element paths (the #1110 discipline: one classifier, not two).
+#
+# Mirror of the runtime element classifier (kai_vec_classify): an
+# element type is an inline-record carrier iff it is a known record of
+# 1..8 fields whose every field is a concrete raw scalar (Int / Real /
+# Bool / Char / Byte). Both emitters consult THIS verdict before
+# fusing `vec_get(v, i).f` / `vec_push(v, Rec{..})` / `vec_set(v, i,
+# Rec{..})` into the raw runtime entry points; any other element shape
+# keeps the boxed path, which is sound for every storage kind. The
+# mirror must stay exact in the fuse direction: a raw fuse over a
+# buffer the runtime classified BOXED would move the wrong bytes — the
+# raw helpers trap on ekind/arity/tag mismatch as the last line of
+# defence.
+
+import compiler.ast
+
+# KAI_VEC_REC_MAX in the runtime.
+fn vr_rec_max() : Int = 8
+
+# kai_vec_scalar_tag's accept set. Fixed-width ints (Int32 & co)
+# deliberately fall to boxed, exactly like the runtime.
+fn vr_scalar_name(nm: String) : Bool =
+  nm == "Int" or nm == "Real" or nm == "Bool" or nm == "Char" or nm == "Byte"
+
+# A field stored as one raw 8-byte column: a bare concrete scalar
+# name. Dimensioned / refined / generic field types keep the record on
+# the boxed path — the static verdict cannot see through them, and
+# conservative-by-exclusion is sound.
+fn vr_field_is_scalar(fd: FieldDecl) : Bool = match fd {
+  FD(_, _, te) -> match te.tkind {
+    TyName(nm, targs) -> (match targs { [] -> vr_scalar_name(nm) _ -> false })
+    _                 -> false
+  }
+}
+
+fn vr_fields_all_scalar(fs: [FieldDecl]) : Bool = match fs {
+  []           -> true
+  [f, ...rest] -> vr_field_is_scalar(f) and vr_fields_all_scalar(rest)
+}
+
+#[doc("True iff `opt_t` is an element type the Vec runtime stores as an inline all-scalar record (the REC carrier): a known record of 1..8 concrete raw-scalar fields. Both backends gate the raw get/set/push fusion on this one verdict.")]
+pub fn vec_elem_is_rec_carrier(recs: [RecInfo], opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> vr_rec_carrier_t(recs, t)
+  None    -> false
+}
+
+fn vr_rec_carrier_t(recs: [RecInfo], t: Ty) : Bool = match t {
+  TyCon(_, cname, cargs) ->
+    match rec_find_arity_loop(recs, cname, list_length(cargs), None) {
+      None     -> false
+      Some(ri) -> match ri {
+        RI(_, _, fs, _) -> {
+          let n = list_length(fs)
+          n >= 1 and n <= vr_rec_max() and vr_fields_all_scalar(fs)
+        }
+      }
+    }
+  _ -> false
+}
+
+#[doc("Declaration-order column of `field` when `elem_t` is a REC-carrier record: the slot a fused `vec_get(v, i).field` loads raw. `None` keeps the unfused boxed path.")]
+pub fn vec_rec_field_slot(recs: [RecInfo], elem_t: Option[Ty], field: String) : Option[Int] =
+  if vec_elem_is_rec_carrier(recs, elem_t) { field_index_of(recs, elem_t, field) }
+  else { None }
