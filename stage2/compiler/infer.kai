@@ -11999,9 +11999,10 @@ type PipeRes = { st: InferState, ty: Ty, rhs: Expr }
 fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  match try_fuse_terminal_fold(st, lhs, rhs, line, col) {
+  let att = try_fuse_terminal_fold(st, lhs, rhs, line, col)
+  match att.fused {
     Some(inf) -> inf
-    None      -> synth_pipe_plain(st, lhs, rhs, line, col)
+    None      -> synth_pipe_plain(att.st, lhs, rhs, line, col)
   }
 }
 
@@ -12560,29 +12561,68 @@ fn fuse_expr_ty(e: Expr) : Ty =
 # shared substitution). If both are pure the raw rewrite is synthesised
 # once — `synth_call` instantiates the generic stdlib scheme cleanly, so
 # no node type is built by hand.
+# A gated fusion attempt. `st` is threaded, never discarded: the
+# isolation synths advance the fresh-tvar counter against the in-place-
+# mutated substitution, so a caller that rewound the counter would
+# re-mint ids the isolation pass already bound and types would silently
+# cross between chains.
+type FuseAttempt = { st: InferState, fused: Option[Inferred] }
+
+type FuseGate = { st: InferState, ok: Bool }
+
 fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
-                          line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+                          line: Int, col: Int) : FuseAttempt / Console + File + Mutable =
   match pipe_fusion_as_terminal_fold(lhs, rhs) {
-    None -> None
-    Some(ff) ->
-      if fuse_all_raw_pure(st, ff.stages) and fuse_raw_pure(st, ff.combine) {
-        Some(synth(st, pipe_fusion_fold_rewrite(ff, line, col)))
-      } else { None }
+    None -> FuseAttempt { st: st, fused: None }
+    Some(ff) -> {
+      let g = fuse_terminal_gate(st, ff)
+      if g.ok {
+        FuseAttempt { st: g.st, fused: Some(synth(g.st, pipe_fusion_fold_rewrite(ff, line, col))) }
+      } else { FuseAttempt { st: g.st, fused: None } }
+    }
   }
 
-fn fuse_all_raw_pure(st: InferState, closures: [Expr]) : Bool / Console + File + Mutable =
+# An explicit `foldl` keeps the Mutable-masked purity gate — its stage
+# and combine still run, only reordered. An implicit terminal (`sum`,
+# `product`, `length`) rewrites to a target with a row-less stage
+# parameter — and `length` drops the stages — so it demands strictly
+# empty labels.
+fn fuse_terminal_gate(st: InferState, ff: FusedFold) : FuseGate / Console + File + Mutable =
+  match ff.term {
+    TermFoldl(_, combine) -> {
+      let g = fuse_all_raw(st, ff.stages, false)
+      if g.ok { fuse_raw(g.st, combine, false) } else { g }
+    }
+    _ -> fuse_all_raw(st, ff.stages, true)
+  }
+
+fn fuse_all_raw(st: InferState, closures: [Expr], strict: Bool) : FuseGate / Console + File + Mutable =
   match closures {
-    []           -> true
-    [c, ...rest] -> if fuse_raw_pure(st, c) { fuse_all_raw_pure(st, rest) } else { false }
+    [] -> FuseGate { st: st, ok: true }
+    [c, ...rest] -> {
+      let g = fuse_raw(st, c, strict)
+      if g.ok { fuse_all_raw(g.st, rest, strict) } else { g }
+    }
   }
 
 # Synthesise a raw stage/combine closure solely to read its effect row.
-# The typed result is discarded — only the purity verdict is kept; its
-# fresh tvars are inert in the shared substitution (never re-referenced).
-fn fuse_raw_pure(st: InferState, closure: Expr) : Bool / Console + File + Mutable {
+# The typed node is discarded — only the verdict and the threaded state
+# are kept.
+fn fuse_raw(st: InferState, closure: Expr, strict: Bool) : FuseGate / Console + File + Mutable {
   let r = synth(st, closure)
-  fuse_stage_pure(r.st.sub, r.expr)
+  let ok = if strict { fuse_row_strict(r.st.sub, r.expr) }
+           else { fuse_stage_pure(r.st.sub, r.expr) }
+  FuseGate { st: r.st, ok: ok }
 }
+
+fn fuse_row_strict(sub: Subst, stage: Expr) : Bool =
+  match pipe_fusion_fn_row(apply_ty(sub, fuse_expr_ty(stage))) {
+    None      -> false
+    Some(row) -> match apply_row(sub, row).labels {
+      [] -> true
+      _  -> false
+    }
+  }
 
 # Format a list of module names for the ambiguous-head diagnostic.
 # Two modules become "`a` and `b`"; three or more become "`a`, `b`,

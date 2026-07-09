@@ -74,26 +74,50 @@ pub fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
   with_ty(mk_expr(ELambda([param], outer_call), line, col), lam_ty)
 }
 
-# A map-into-terminal-fold shape: the mapped source, the chain's stage
-# closures (outermost-applied last), and the fold's `init` + `combine` —
-# all still raw (pre-synth). `stages` holds each map stage separately so
-# the purity gate can check them one at a time; they compose into a
-# single closure only at rewrite time.
-pub type FusedFold = { source: Expr, stages: [Expr], init: Expr, combine: Expr }
+# A recognised fold-shaped terminal. `TermFoldl` carries the explicit
+# `init` + `combine`; the implicit terminals (`sum`, `product`,
+# `length`) take their seed and combine from the stdlib rewrite target.
+pub type FoldTerminal
+  = TermFoldl(Expr, Expr)
+  | TermSum
+  | TermProduct
+  | TermLength
 
-#[doc("Recognise a `map`-pipe chain into `foldl(init, combine)` for terminal-fold fusion.")]
+# A map-into-terminal shape: the mapped source, the chain's stage
+# closures (outermost-applied last), and the terminal — all still raw
+# (pre-synth). `stages` holds each map stage separately so the purity
+# gate can check them one at a time; they compose into a single closure
+# only at rewrite time.
+pub type FusedFold = { source: Expr, stages: [Expr], term: FoldTerminal }
+
+#[doc("Recognise a `map`-pipe chain into a fold-shaped terminal (`foldl(init, combine)`, `sum`, `product`, `length`) for terminal fusion.")]
 pub fn pipe_fusion_as_terminal_fold(lhs: Expr, rhs: Expr) : Option[FusedFold] =
   match lhs.kind {
-    EMapPipe(_, _) -> match pipe_fusion_as_foldl_call(rhs) {
-      Some(ff) -> {
+    EMapPipe(_, _) -> match pipe_fusion_as_terminal(rhs) {
+      Some(term) -> {
         let flat = pipe_fusion_flatten_map_chain(lhs)
-        Some(FusedFold { source: flat.source, stages: flat.stages,
-                         init: ff.init, combine: ff.combine })
+        Some(FusedFold { source: flat.source, stages: flat.stages, term: term })
       }
       None -> None
     }
     _ -> None
   }
+
+fn pipe_fusion_as_terminal(rhs: Expr) : Option[FoldTerminal] =
+  match rhs.kind {
+    ECall(callee, [init, combine]) ->
+      if pipe_fusion_callee_is_foldl(callee) { Some(TermFoldl(init, combine)) }
+      else { None }
+    EModCall(mod, op) -> if mod == "list" { pipe_fusion_named_terminal(op) } else { None }
+    EVar(name)        -> pipe_fusion_named_terminal(name)
+    _                 -> None
+  }
+
+fn pipe_fusion_named_terminal(name: String) : Option[FoldTerminal] =
+  if name == "sum" { Some(TermSum) }
+  else if name == "product" { Some(TermProduct) }
+  else if name == "length" { Some(TermLength) }
+  else { None }
 
 type FlatMapChain = { source: Expr, stages: [Expr] }
 
@@ -113,8 +137,54 @@ fn pipe_fusion_flatten_map_chain(e: Expr) : FlatMapChain =
     _ -> FlatMapChain { source: e, stages: [] }
   }
 
-#[doc("Compose a stage list `[f, g, ...]` into a single raw closure `x => ...g(f(x))`.")]
-pub fn pipe_fusion_compose_stages(stages: [Expr], line: Int, col: Int) : Expr {
+fn pipe_fusion_callee_is_foldl(callee: Expr) : Bool =
+  match callee.kind {
+    EModCall(_, op) -> op == "foldl"
+    EVar(name)      -> name == "foldl"
+    _               -> false
+  }
+
+# The stage argument for the rewritten call plus the `let` binds that
+# hoist inline lambda stages out of the per-element path. A lambda node
+# left inside the composed closure's body would allocate a fresh
+# closure per element; bound once and called through its variable, the
+# per-element path stays allocation-free. A single stage needs no
+# composing wrapper at all — passed directly, it is evaluated once.
+type BoundStages = { binds: [Stmt], stage: Expr }
+
+fn pipe_fusion_bind_stages(stages: [Expr], line: Int, col: Int) : BoundStages =
+  match stages {
+    [only] -> BoundStages { binds: [], stage: only }
+    _ -> {
+      let hoisted = pipe_fusion_hoist_lambdas(stages, 0, line, col)
+      BoundStages { binds: hoisted.binds,
+                    stage: pipe_fusion_compose_stages(hoisted.refs, line, col) }
+    }
+  }
+
+type HoistedStages = { binds: [Stmt], refs: [Expr] }
+
+fn pipe_fusion_hoist_lambdas(stages: [Expr], i: Int, line: Int, col: Int) : HoistedStages =
+  match stages {
+    [] -> HoistedStages { binds: [], refs: [] }
+    [s, ...rest] -> {
+      let r = pipe_fusion_hoist_lambdas(rest, i + 1, line, col)
+      match s.kind {
+        ELambda(_, _) -> {
+          let name = concat_all(["__fusev_", int_to_string(line), "_",
+                                 int_to_string(col), "_", int_to_string(i)])
+          let pat = Pattern { pkind: PBind(name), line: line, col: col }
+          HoistedStages { binds: [SLet(pat, None, s), ...r.binds],
+                          refs: [mk_expr(EVar(name), line, col), ...r.refs] }
+        }
+        _ -> HoistedStages { binds: r.binds, refs: [s, ...r.refs] }
+      }
+    }
+  }
+
+# Compose a stage list `[f, g, ...]` into a single raw closure
+# `x => ...g(f(x))`.
+fn pipe_fusion_compose_stages(stages: [Expr], line: Int, col: Int) : Expr {
   let pname = concat_all(["__fusef_", int_to_string(line), "_", int_to_string(col)])
   let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
   let body = pipe_fusion_apply_stages(stages, mk_expr(EVar(pname), line, col), line, col)
@@ -127,52 +197,44 @@ fn pipe_fusion_apply_stages(stages: [Expr], acc: Expr, line: Int, col: Int) : Ex
     [f, ...rest] -> pipe_fusion_apply_stages(rest, mk_expr(ECall(f, [acc]), line, col), line, col)
   }
 
-# Raw (untyped) closure composition `x => outer(inner(x))`. Used when the
-# composed stage will be synthesised fresh, so no `.ty` is attached.
-fn pipe_fusion_compose_raw(inner: Expr, outer: Expr, line: Int, col: Int) : Expr {
-  let pname = concat_all(["__fusef_", int_to_string(line), "_", int_to_string(col)])
-  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
-  let arg = mk_expr(EVar(pname), line, col)
-  let body = mk_expr(ECall(outer, [mk_expr(ECall(inner, [arg]), line, col)]), line, col)
-  mk_expr(ELambda([param], body), line, col)
-}
-
-type FoldlArgs = { init: Expr, combine: Expr }
-
-# A terminal `foldl(init, combine)` — the LHS becomes the folded list, so
-# only `init` and `combine` are explicit args. Matches the bare `foldl`
-# and the qualified `list.foldl` spellings.
-fn pipe_fusion_as_foldl_call(rhs: Expr) : Option[FoldlArgs] =
-  match rhs.kind {
-    ECall(callee, [init, combine]) ->
-      if pipe_fusion_callee_is_foldl(callee) {
-        Some(FoldlArgs { init: init, combine: combine })
-      } else { None }
-    _ -> None
+#[doc("Rewrite a recognised terminal to the matching non-materialising stdlib call.")]
+pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr =
+  match ff.term {
+    TermLength               -> pipe_fusion_length_call(ff.source, line, col)
+    TermFoldl(init, combine) -> pipe_fusion_stage_fold(ff, "map_foldl", [init, combine], line, col)
+    TermSum                  -> pipe_fusion_stage_fold(ff, "map_sum", [], line, col)
+    TermProduct              -> pipe_fusion_stage_fold(ff, "map_product", [], line, col)
   }
 
-fn pipe_fusion_callee_is_foldl(callee: Expr) : Bool =
-  match callee.kind {
-    EModCall(_, op) -> op == "foldl"
-    EVar(name)      -> name == "foldl"
-    _               -> false
-  }
-
-#[doc("Rewrite a terminal-fold to the matching non-materialising stdlib call.")]
-pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr {
-  let stage = pipe_fusion_compose_stages(ff.stages, line, col)
-  match ff.source.kind {
+# `<target>(source-args..., stage, extra...)` with the lambda stages
+# hoisted into `let` binds ahead of the call.
+fn pipe_fusion_stage_fold(ff: FusedFold, op: String, extra: [Expr],
+                          line: Int, col: Int) : Expr {
+  let bound = pipe_fusion_bind_stages(ff.stages, line, col)
+  let call = match ff.source.kind {
     ERange(a, b, None) ->
-      fold_call("protocols", "range_map_foldl",
-                [a, b, stage, ff.init, ff.combine], line, col)
+      fold_call("protocols", concat_all(["range_", op]),
+                [a, b, bound.stage, ...extra], line, col)
     ERange(a, b, Some(step)) ->
-      fold_call("protocols", "range_step_map_foldl",
-                [a, b, step, stage, ff.init, ff.combine], line, col)
+      fold_call("protocols", concat_all(["range_step_", op]),
+                [a, b, step, bound.stage, ...extra], line, col)
     _ ->
-      fold_call("list", "map_foldl",
-                [ff.source, stage, ff.init, ff.combine], line, col)
+      fold_call("list", op, [ff.source, bound.stage, ...extra], line, col)
+  }
+  match bound.binds {
+    [] -> call
+    _  -> mk_expr(EBlock(bound.binds, Some(call)), line, col)
   }
 }
+
+# `length` never runs the (strictly pure) stages, so they are dropped:
+# the mapped length is the source's length.
+fn pipe_fusion_length_call(source: Expr, line: Int, col: Int) : Expr =
+  match source.kind {
+    ERange(a, b, None)       -> fold_call("protocols", "range_length", [a, b], line, col)
+    ERange(a, b, Some(step)) -> fold_call("protocols", "range_step_length", [a, b, step], line, col)
+    _                        -> fold_call("list", "length", [source], line, col)
+  }
 
 fn fold_call(mod: String, fname: String, args: [Expr], line: Int, col: Int) : Expr =
   mk_expr(ECall(mk_expr(EModCall(mod, fname), line, col), args), line, col)
