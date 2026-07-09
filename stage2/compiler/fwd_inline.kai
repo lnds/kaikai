@@ -1,0 +1,150 @@
+# compiler/fwd_inline.kai — trivial-forwarder inlining.
+#
+# A module export whose body only forwards its params, in order, to a
+# runtime primitive — `pub fn push(v, x) = vec_push(v, x)` — hides the
+# primitive behind a call frame and a boxing boundary, so every
+# downstream analysis keyed on the primitive's call shape (raw element
+# fusion, borrow reads, consumer linearity) misses the module spelling
+# and the qualified surface silently costs more than the builtin one.
+# This pass rewrites each saturated `mod.fn(args…)` call to such a
+# forwarder into the direct primitive call.
+#
+# Runs post-typer (Expr.ty stamped, protocol calls resolved), pre-
+# monomorph, on both backends. Soundness fences:
+#   - the forwarder body is exactly `prim(p1, …, pn)`: its own params,
+#     in order, each exactly once, no borrowed (`^`) param;
+#   - the callee is a runtime primitive — a name no DFn in the program
+#     declares (a module-local helper would not resolve in the
+#     caller's namespace) and no constructor;
+#   - the forwarder declares no effect row;
+#   - only saturated `ECall` sites rewrite — a forwarder passed as a
+#     value keeps the wrapper fn.
+
+import compiler.ast
+import compiler.desugar
+import compiler.infer
+
+# One inlinable forwarder: qualified key "mod.fn", primitive, arity.
+type FwdEntry = FW(String, String, Int)
+
+#[doc("Rewrites every saturated qualified call to a trivial forwarder (a pub module fn whose body just forwards its params, in order, to a runtime primitive) into the direct primitive call, so the module surface hits the same fused/raw paths as the builtin spelling.")]
+pub fn inline_trivial_forwarders(typed: TypedProgram) : TypedProgram = {
+  let fwds = fwd_collect(typed.decls, fwd_fn_names(typed.decls, []), [])
+  match fwds {
+    [] -> typed
+    _  -> TypedProgram {
+      decls: map(typed.decls, (d) => fwd_rw_decl(d, fwds)),
+      errs: typed.errs,
+      insts: typed.insts,
+      holes: typed.holes,
+      row_holes: typed.row_holes,
+      prelude_len: typed.prelude_len,
+      module_doc: typed.module_doc,
+      diags: typed.diags,
+      op_res: typed.op_res
+    }
+  }
+}
+
+fn fwd_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, _, _, _, _) -> fwd_fn_names(rest, [name, ...acc])
+    _                                    -> fwd_fn_names(rest, acc)
+  }
+}
+
+fn fwd_collect(decls: [Decl], fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match decls {
+  []           -> acc
+  [d, ...rest] -> fwd_collect(rest, fn_names, fwd_add(d, fn_names, acc))
+}
+
+fn fwd_add(d: Decl, fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match d {
+  DFn(is_pub, name, _, params, _, row, body, _, _, mo) -> match mo {
+    Some(m) ->
+      if is_pub and fwd_row_is_empty(row) {
+        match fwd_prim_of(params, body, fn_names) {
+          Some(prim) -> [FW(concat_all([m, ".", name]), prim, list_length(params)), ...acc]
+          None       -> acc
+        }
+      } else { acc }
+    None -> acc
+  }
+  _ -> acc
+}
+
+fn fwd_row_is_empty(row: RowExpr) : Bool = match row {
+  REmpty -> true
+  _      -> false
+}
+
+# The primitive name when `body` is exactly `prim(p1, …, pn)` over
+# `params` in declaration order, `prim` resolving to no program fn.
+fn fwd_prim_of(params: [Param], body: Expr, fn_names: [String]) : Option[String] = match body.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(prim) ->
+      if fwd_prim_name_ok(prim, fn_names) and fwd_args_are_params(params, args_) { Some(prim) }
+      else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# Lowercase, not underscore-prefixed (synthetics), declared by no DFn:
+# only the runtime's global primitives survive all three.
+fn fwd_prim_name_ok(prim: String, fn_names: [String]) : Bool = match char_at(prim, 0) {
+  Some(c) -> c >= 'a' and c <= 'z' and not list_has(fn_names, prim)
+  None    -> false
+}
+
+fn fwd_args_are_params(params: [Param], args_: [Expr]) : Bool = match params {
+  [] -> match args_ { [] -> true _ -> false }
+  [p, ...prest] -> match args_ {
+    []            -> false
+    [a, ...arest] -> match a.kind {
+      EVar(nm) -> nm == p.pname and not p.pborrow and fwd_args_are_params(prest, arest)
+      _        -> false
+    }
+  }
+}
+
+fn fwd_rw_decl(d: Decl, fwds: [FwdEntry]) : Decl = match d {
+  DFn(is_pub, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, n, tps, ps, ret, row, fwd_rw_expr(body, fwds), l, c, mo)
+  DTest(desc, body, l, c)      -> DTest(desc, fwd_rw_expr(body, fwds), l, c)
+  DBench(desc, body, l, c)     -> DBench(desc, fwd_rw_expr(body, fwds), l, c)
+  DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, fwd_rw_expr(body, fwds), l, c)
+  _ -> d
+}
+
+fn fwd_rw_expr(e: Expr, fwds: [FwdEntry]) : Expr = {
+  let k = match fwd_try_call(e.kind, fwds) {
+    Some(hit) -> hit
+    None      -> dsg_map_expr_kind(e.kind, (sub) => fwd_rw_expr(sub, fwds))
+  }
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+# `mod.fn(args…)` whose callee is a collected forwarder at matching
+# arity → the direct primitive call. Args recurse either way.
+fn fwd_try_call(k: ExprKind, fwds: [FwdEntry]) : Option[ExprKind] = match k {
+  ECall(callee, args_) -> match callee.kind {
+    EModCall(m, f) ->
+      match fwd_lookup(fwds, concat_all([m, ".", f]), list_length(args_)) {
+        Some(prim) -> Some(ECall(
+          Expr { kind: EVar(prim), line: callee.line, col: callee.col,
+                 ty: callee.ty, mode: callee.mode },
+          map(args_, (a) => fwd_rw_expr(a, fwds))))
+        None -> None
+      }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn fwd_lookup(fwds: [FwdEntry], key: String, arity: Int) : Option[String] = match fwds {
+  []           -> None
+  [e, ...rest] -> match e {
+    FW(k, prim, a) -> if k == key and a == arity { Some(prim) } else { fwd_lookup(rest, key, arity) }
+  }
+}
