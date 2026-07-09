@@ -145,11 +145,22 @@ instruction overhead the two-necks note bounds.
    builtin-tag guard and classified the slot from the user
    declaration (Int → kind 1). The new static literal test then read
    the tagged word `(0<<1)|1 = 1` as a raw i64 and `Exited(0)` matched
-   the `Exited(1)` arm. Fixed by mirroring `ls_ctor_mask`'s guard in
-   `slot_kind_of`; the lesson is the #1147 rule again — any read-side
-   classifier must be evaluated against the same registry entry the
-   write side used, INCLUDING its guards, not just the same kind
-   function.
+   the `Exited(1)` arm. The first fix (mirror `ls_ctor_mask`'s guard
+   → kind 0, boxed) then failed the parity walk in the OPPOSITE
+   direction: `os_process_basic` matches an `Exited` cell minted by
+   the RUNTIME, whose slot is a raw i64 — a static `.ptr` borrow read
+   it as a null pointer ("wait FAIL"). The truth: the builtin-tag
+   family has TWO writers with TWO layouts on native (runtime: raw;
+   user-side construction: boxed), and only the mask-consulting
+   dynamic `KProj` tolerates both. Final shape: such ctors classify
+   as a sentinel "dynamic" kind — no raw binder, no static borrow, no
+   static literal test — the pre-lane behavior, preserved. Lesson:
+   the #1147 one-verdict rule needs a corollary — a static read-side
+   kind is only sound when the tag has exactly ONE writer layout; a
+   mixed-writer tag must stay dynamic. (The mixed layout itself is a
+   latent pre-existing hazard: a program holding BOTH user-built and
+   runtime-built tag-9 cells would confuse even the dynamic read; no
+   fixture mixes them today.)
 5. **Build failures can masquerade as stale results**: `make … |
    tail && echo OK` reports OK on a failed pipe head. Two debug
    cycles were lost to a compiler binary that never contained the
