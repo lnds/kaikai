@@ -169,6 +169,23 @@ in `fn_names`, excluded — so the `foldl` zero-RC collapse holds.
 Result: `#817` back to `leaked=12` (constant, was 5012), Probe A still
 `incref_total=0`, selfhost byte-id C green again.
 
+### The marker-as-free-var trap (`stdlib/list_pipeline`)
+
+The marker `__perceus_owned_borrow(g)` is a call whose CALLEE is an
+`EVar("__perceus_owned_borrow")`. In a `xs |> list.map(_, ^f) |> …` pipeline,
+the placeholder `_` desugars each stage to a lifted lambda, and the borrow
+marker gets spliced INSIDE that lambda's body. The lambda-lifting free-var
+scan (`fv_expr`, `emit_shared.kai`) then saw the sentinel as a genuine free
+variable and asked the lambda to capture it → an undeclared
+`kai___perceus_owned_borrow` in the C (a call-site the direct-call fixtures
+never produced, so selfhost + #817 were green while `test-stdlib`'s
+`list_pipeline` failed). The `__pcs_scr`/`__pcs_ret` sentinels already had this
+exact suppression in `fv_expr`; the fix generalises it to every `__perceus_*`
+name. Both backends share `fv_expr`, so one fix covers native too. Lesson: a
+new perceus sentinel that can land as a call callee inside a lifted lambda
+must be excluded from the free-var scan — the placeholder-pipe shape is the one
+that plants it there.
+
 ## Gates
 
 - Selfhost byte-id **C**: green.
