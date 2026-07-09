@@ -137,7 +137,20 @@ instruction overhead the two-necks note bounds.
    fix needs the pass that rebuilds those reads (tcrec/TRMC or the
    guard-walk) to preserve `Expr.mode`; left as the documented
    follow-up with this evidence.
-4. **Build failures can masquerade as stale results**: `make … |
+4. **The rc-detector caught a one-verdict violation the local gates
+   missed.** `match_shared_tag_subdiscrimination` declares a user type
+   named `Exited` — colliding with the runtime-minted builtin ctor.
+   Construction resolves the mask by name (first match = the builtin,
+   tag < user base → mask 0, boxed slots), but `slot_kind_of` had no
+   builtin-tag guard and classified the slot from the user
+   declaration (Int → kind 1). The new static literal test then read
+   the tagged word `(0<<1)|1 = 1` as a raw i64 and `Exited(0)` matched
+   the `Exited(1)` arm. Fixed by mirroring `ls_ctor_mask`'s guard in
+   `slot_kind_of`; the lesson is the #1147 rule again — any read-side
+   classifier must be evaluated against the same registry entry the
+   write side used, INCLUDING its guards, not just the same kind
+   function.
+5. **Build failures can masquerade as stale results**: `make … |
    tail && echo OK` reports OK on a failed pipe head. Two debug
    cycles were lost to a compiler binary that never contained the
    probe (and one more to a bundle-name collision: a helper named
