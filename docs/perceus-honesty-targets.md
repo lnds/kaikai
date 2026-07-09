@@ -115,25 +115,28 @@ shape) on non-`pub` functions. The emit soundness gates that make a
 borrowed scrutinee safe on the native backend (arm-move / goto-tail / reuse
 recogniser inhibited, TCO dropmask unions the borrow set) ship too.
 
-> **v1 status (2026-07-08):** two things are DEFERRED, each blocked by a
-> selfhost oracle, not by effort:
+The **closure borrow (HOF win) shipped in #1130**: the runtime
+`kai_apply_borrow` / `kaix_apply_borrow` invokes a closure without consuming
+it, so a `^`-borrowed function-typed parameter routes its indirect call to the
+borrowing variant. `foldl` / `foreach` / `any` / `all` and the other self-
+recursive HOFs pay zero closure RC per element (borrow-through); `map` /
+`filter` and the loop-delegating HOFs take one dup-on-consume at the owned
+private-loop entry (rule 3, Koka `parcBorrowApp`) — one incref per HOF call,
+not per element. The decision is local (uses only the callee's borrow-map
+positions), so it survives the sep-comp oracle that #1127's whole-program
+relaxed inference did not.
+
+> **v1 status (2026-07-08):** one thing is still DEFERRED:
 >
-> - **Closure borrow (the HOF win).** The runtime `kai_apply` (call_ind)
->   consumes the closure it invokes (#298); no borrowing call variant. A
->   closure (function-typed) param is excluded from the effective borrow
->   set — `^f` / `^p` SERIALIZE in the ABI (ABI-ready) but codegen keeps the
->   closure owned. Gated on `call_ind_borrow` (the C selfhost byte-id caught
->   the UAF; native hid it).
 > - **Relaxed read-path inference.** A relaxed callee-discipline rule
 >   (children-of-borrowed, borrow-through) passed every single-TU gate but
 >   crashed `test-modular-selfhost` (the sep-comp compiler UAF'd compiling a
 >   real program). The emit is not a pure function of the whole-program
 >   borrow map — it rides a decl-grouping / per-partition-linkage invariant
 >   the monolithic TU only guarantees incidentally. Reverted to the
->   conservative rule; reopening gate is the modular fixture in red.
->
-> Both wins are real but blocked on runtime-ABI / sep-comp work, tracked as
-> follow-up issues.
+>   conservative rule; reopening gate is the modular fixture in red. (A fresh
+>   borrowed closure passed to a HOF also leaks one bounded ref per call-site
+>   — the caller drop-after-call reconciled with TCO is a #1130 follow-up.)
 
 ### The one remaining lever, and what is NOT the lever
 

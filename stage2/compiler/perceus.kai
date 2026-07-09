@@ -638,18 +638,18 @@ pub fn pcs_borrow_key(name: String, mo: Option[String]) : String = match mo {
 # the union of its explicit `^` marks and the conservative inference
 # (`pcs_borrow_params`, the `is_red` shape whose arms bind nothing used).
 #
-# CLOSURE params are excluded from the EFFECTIVE (codegen) borrow set: the
-# runtime `kai_apply` (call_ind) consumes the closure it invokes, and there
-# is no `call_ind_borrow` variant, so borrowing a called closure would strip
-# the caller dup while the callee still consumes — a use-after-free. The
-# `^` on a closure param still SERIALIZES in the interface (ABI-ready for the
-# day a borrowing call lands); it just does not relax codegen today.
+# CLOSURE params now participate in the EFFECTIVE (codegen) borrow set
+# (issue #1130): a `f(args)` through a borrowed function-typed param routes
+# to `kai_apply_borrow` / `kaix_apply_borrow`, which invoke without
+# consuming the closure, so borrowing a called closure is sound (the caller
+# keeps the ref and drops after last use, per rule 1). Before #1130 the
+# runtime call variant did not exist, so `pcs_closure_param_names` was
+# subtracted here to keep the closure owned.
 pub fn pcs_borrow_params_hybrid(is_pub: Bool, params: [Param],
                             pnames: [String], body: Expr) : [String] = {
   let explicit = pcs_explicit_borrow_names(params)
-  let all = if is_pub { explicit }
-            else { pcs_list_union(explicit, pcs_borrow_params(pnames, body)) }
-  pcs_strs_minus(all, pcs_closure_param_names(params))
+  if is_pub { explicit }
+  else { pcs_list_union(explicit, pcs_borrow_params(pnames, body)) }
 }
 
 fn pcs_explicit_borrow_names(params: [Param]) : [String] = match params {
@@ -739,6 +739,58 @@ fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [String]) : [Arm] = match arms {
   }
 }
 
+# Callee side, closure (issue #1130). A direct call `f(args)` where `f` is
+# a borrowed function-typed param routes to the borrowing indirect call:
+# `__perceus_apply_borrow(f, args...)`. The closure ref stays with the
+# caller (it is in the skip-set, never dup'd; its exit drop frees it once),
+# so the per-call incref/decref pair collapses. `bc` is the borrowed set
+# restricted to function-typed params — a value-typed borrowed param is
+# never a callee, so this only fires on closures. Args keep the owned
+# convention and are walked so nested calls also flip.
+fn pcs_wrap_borrow_calls(e: Expr, bc: [String]) : Expr =
+  Expr { kind: pcs_wrap_borrow_call_kind(e.kind, bc),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn pcs_wrap_borrow_call_kind(k: ExprKind, bc: [String]) : ExprKind = match k {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(nm) ->
+      if list_has(bc, nm) {
+        let args2 = map(args_, (a) => pcs_wrap_borrow_calls(a, bc))
+        pcs_apply_borrow_call(callee, args2)
+      } else {
+        ECall(pcs_wrap_borrow_calls(callee, bc),
+              map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+      }
+    _ -> ECall(pcs_wrap_borrow_calls(callee, bc),
+               map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+  }
+  # `a |> f` is `f(a)`. When the pipe target is a bare borrowed closure it
+  # must route to the borrowing call too — otherwise the desugar to a
+  # consuming `kai_apply` frees the borrowed (skip-set, never-dup'd) closure
+  # and a later read is a UAF. The map/flat/filter pipes (`|`,`||`,…) hit the
+  # `kai_prelude_*` helpers, which already borrow the closure, so only the
+  # apply-pipe needs the rewrite.
+  EPipe(a, rhs) -> match rhs.kind {
+    EVar(nm) ->
+      if list_has(bc, nm) { pcs_apply_borrow_call(rhs, [pcs_wrap_borrow_calls(a, bc)]) }
+      else { EPipe(pcs_wrap_borrow_calls(a, bc), rhs) }
+    _ -> EPipe(pcs_wrap_borrow_calls(a, bc), pcs_wrap_borrow_calls(rhs, bc))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_calls(sub, bc))
+}
+
+# Build `__perceus_apply_borrow(clo, args…)` from a closure callee expr and
+# its already-walked call args.
+fn pcs_apply_borrow_call(clo: Expr, args2: [Expr]) : ExprKind =
+  ECall(Expr { kind: EVar("__perceus_apply_borrow"), line: clo.line,
+               col: clo.col, ty: None, mode: MUnknown },
+        [clo, ...args2])
+
+# The borrowed set restricted to function-typed params (the only ones a
+# `f(args)` callee can name).
+fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
+  pcs_strs_inter(borrowed, pcs_closure_param_names(params))
+
 # Caller side: strip the __perceus_dup the rewrite put on an argument
 # that lands in a borrowed parameter slot of the callee. The callee
 # borrows (does not consume) so the caller need not dup → the incref is
@@ -751,27 +803,53 @@ fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [String]) : [Arm] = match arms {
 # in the loop shape (container re-threaded, not last-use), which this
 # does not touch.
 fn pcs_strip_borrow_args(e: Expr, bmap: [BorrowEntry]) : Expr =
-  pcs_strip_borrow_args_b(e, bmap, [])
+  pcs_strip_borrow_args_c(e, bmap, [], [])
 
+# `bclosures` (issue #1130) — the current fn's borrowed function-typed
+# params. They live in the skip-set (never dup'd on a read), so when one
+# flows to an OWNED argument slot of a callee it would reach a consuming
+# callee with no incref → use-after-free. Dup-on-consume (rule 3, Koka
+# `parcBorrowApp`): re-insert `__perceus_dup(f)` at that owned-exit. The
+# decision is local — it uses only the callee's `bmap` positions, so the
+# balance closes inside this decl regardless of partition grouping.
 fn pcs_strip_borrow_args_b(e: Expr, bmap: [BorrowEntry], borrow_last: [String]) : Expr =
-  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap, borrow_last),
+  pcs_strip_borrow_args_d(e, bmap, borrow_last, [], [])
+
+fn pcs_strip_borrow_args_c(e: Expr, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String]) : Expr =
+  pcs_strip_borrow_args_d(e, bmap, borrow_last, bclosures, [])
+
+# `fn_names` (issue #1130 rule 1) — the known top-level fns. A bare fn name
+# in a borrowed slot materialises a fresh `kai_closure` the callee borrows
+# but no one drops; it is marked `__perceus_owned_borrow` here for the emit
+# to balance after the call.
+fn pcs_strip_borrow_args_d(e: Expr, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : Expr =
+  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap, borrow_last, bclosures, fn_names),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry], borrow_last: [String]) : ExprKind = match k {
+fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : ExprKind = match k {
   ECall(callee, args_) -> {
     let key = pcs_callee_key(callee)
+    # `__perceus_apply_borrow(f, args…)` — arg0 is the borrowed closure
+    # itself (invoked, not consumed): position 0 is a borrow slot, so it
+    # must not take the dup-on-consume. Its remaining args keep the owned
+    # convention. Treat position 0 as borrowed for this call.
+    if key == "__perceus_apply_borrow" {
+      let args2 = pcs_strip_args_at_d(args_, [0], 0, bmap, borrow_last, bclosures, fn_names)
+      ECall(pcs_strip_borrow_args_d(callee, bmap, borrow_last, bclosures, fn_names), args2)
+    } else {
     # A prim call whose container arg0 is its LAST borrowed use stays
     # consuming: suppress the dup strip and the rename so the runtime
     # decref reclaims the container. Earlier borrowed reads are rewritten.
     let keep_consuming = pcs_arg0_is_borrow_last(args_, borrow_last) and
                          (match pcs_prim_borrow_variant(key) { Some(_) -> true None -> false })
     let positions = if keep_consuming { [] } else { pcs_borrow_lookup(bmap, key) }
-    let args2 = pcs_strip_args_at_b(args_, positions, 0, bmap, borrow_last)
+    let args2 = pcs_strip_args_at_d(args_, positions, 0, bmap, borrow_last, bclosures, fn_names)
     let callee2 = if keep_consuming { callee }
                   else { pcs_maybe_rename_borrow_prim(callee, key, positions) }
-    ECall(pcs_strip_borrow_args_b(callee2, bmap, borrow_last), args2)
+    ECall(pcs_strip_borrow_args_d(callee2, bmap, borrow_last, bclosures, fn_names), args2)
+    }
   }
-  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_b(sub, bmap, borrow_last))
+  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_d(sub, bmap, borrow_last, bclosures, fn_names))
 }
 
 # The arg0 var name, seeing through a `__perceus_dup(x)` wrap the rewrite
@@ -814,16 +892,76 @@ fn pcs_callee_key(callee: Expr) : String = match callee.kind {
 # For each arg: if its index is in `positions` (borrowed slot) and it is
 # `__perceus_dup(x)`, strip to `x`. Recurse into every arg either way.
 fn pcs_strip_args_at(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : [Expr] =
-  pcs_strip_args_at_b(args_, positions, i, bmap, [])
+  pcs_strip_args_at_d(args_, positions, i, bmap, [], [], [])
 
-fn pcs_strip_args_at_b(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String]) : [Expr] = match args_ {
+fn pcs_strip_args_at_b(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String]) : [Expr] =
+  pcs_strip_args_at_d(args_, positions, i, bmap, borrow_last, [], [])
+
+fn pcs_strip_args_at_c(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String]) : [Expr] =
+  pcs_strip_args_at_d(args_, positions, i, bmap, borrow_last, bclosures, [])
+
+fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : [Expr] = match args_ {
   []           -> []
   [a, ...rest] -> {
-    let a1 = pcs_strip_borrow_args_b(a, bmap, borrow_last)
-    let a2 = if pcs_has_int(positions, i) { pcs_strip_dup_wrap(a1) } else { a1 }
-    [a2, ...pcs_strip_args_at_b(rest, positions, i + 1, bmap, borrow_last)]
+    let a1 = pcs_strip_borrow_args_d(a, bmap, borrow_last, bclosures, fn_names)
+    let borrowed_slot = pcs_has_int(positions, i)
+    # Borrowed slot: strip the dup (callee borrows, no incref needed). A
+    # freshly-materialised closure (a bare top-level fn name → kai_closure)
+    # in a borrowed slot has no consumer, so the emit must drop its birth
+    # ref after the call (#1130 rule 1): mark it `__perceus_owned_borrow`
+    # for the emit to recognise. The mark is a plain arg wrapper (like
+    # `__perceus_dup`), NOT an EBlock — the emit unwraps it and balances the
+    # ref in a local C statement-expression, invisible to tcrec/TCO.
+    # Owned slot carrying a bare borrowed closure: dup-on-consume (#1130,
+    # rule 3) — the callee consumes it, so pay the incref here so the
+    # borrowed param's single exit-drop still balances.
+    let a2 = if borrowed_slot {
+               let s = pcs_strip_dup_wrap(a1)
+               if pcs_arg_is_fn_name(s, fn_names) { pcs_wrap_owned_borrow(s) } else { s }
+             }
+             else if pcs_arg_is_bare_borrowed_closure(a1, bclosures) { pcs_wrap_dup(a1) }
+             else { a1 }
+    [a2, ...pcs_strip_args_at_d(rest, positions, i + 1, bmap, borrow_last, bclosures, fn_names)]
   }
 }
+
+# A bare `EVar(f)` argument (no dup wrap — it was suppressed by the skip-
+# set) whose name is a borrowed closure param of the current fn. Flowing to
+# an owned slot, it needs the dup-on-consume. A `__perceus_apply_borrow(f,…)`
+# arg is a CALL of `f`, not a value-flow, so it is not matched here.
+fn pcs_arg_is_bare_borrowed_closure(a: Expr, bclosures: [String]) : Bool = match a.kind {
+  EVar(nm) -> list_has(bclosures, nm)
+  _        -> false
+}
+
+# A bare top-level fn name passed by value (the emit materialises a fresh
+# `kai_closure`). This is the only owned-dying shape safe to drop-after —
+# a lambda has its own lift/RC, a local/param is borrow-through or tracked.
+fn pcs_arg_is_fn_name(a: Expr, fn_names: [String]) : Bool = match a.kind {
+  EVar(nm) -> list_has(fn_names, nm)
+  _        -> false
+}
+
+fn pcs_wrap_owned_borrow(a: Expr) : Expr =
+  Expr { kind: ECall(
+           Expr { kind: EVar("__perceus_owned_borrow"), line: a.line, col: a.col,
+                  ty: None, mode: MUnknown },
+           [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
+
+# Names of the known top-level fns (an `EVar` naming one is materialised as
+# a fresh `kai_closure` when passed by value to a borrowed slot).
+fn pcs_efn_names(fns: [EFn]) : [String] = match fns {
+  []           -> []
+  [f, ...rest] -> match f { EFn(nm, _, _, _) -> [nm, ...pcs_efn_names(rest)] }
+}
+
+fn pcs_wrap_dup(a: Expr) : Expr =
+  Expr { kind: ECall(
+           Expr { kind: EVar("__perceus_dup"), line: a.line, col: a.col,
+                  ty: None, mode: MUnknown },
+           [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
 
 fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
   []           -> false
@@ -1880,7 +2018,17 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
         # keeping the last-use of a borrow-only container consuming.
         let body_borrow_scr = pcs_wrap_borrow_scrutinees(body_with_drops, borrowed)
-        let body_borrow = pcs_strip_borrow_args_b(body_borrow_scr, bmap, borrow_last)
+        # Closure flip (#1130): route `f(args)` through a borrowed
+        # function-typed param to the borrowing indirect call. `borrowed`
+        # is in the skip-set (never dup'd); the borrowing call does not
+        # consume, so the closure's exit drop frees it exactly once.
+        let borrowed_closures = pcs_borrowed_closure_names(borrowed, params)
+        let body_borrow_call = pcs_wrap_borrow_calls(body_borrow_scr, borrowed_closures)
+        # Dup-on-consume (#1130 rule 3): a borrowed closure flowing to an
+        # owned callee slot re-dups here, so `map`/`filter` that delegate to
+        # an owned private loop stay sound (the loop gets a genuinely owned
+        # ref). Threaded into the strip so it fires per owned-exit.
+        let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, bmap, borrow_last, borrowed_closures, pcs_efn_names(fns))
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
     }
