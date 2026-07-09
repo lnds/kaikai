@@ -26,6 +26,7 @@ import compiler.native_prims
 import compiler.infer_index
 import compiler.lit_mint
 import compiler.unit_walk
+import compiler.pipe_fusion
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -11987,6 +11988,15 @@ type PipeRes = { st: InferState, ty: Ty, rhs: Expr }
 fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
+  match try_fuse_terminal_fold(st, lhs, rhs, line, col) {
+    Some(inf) -> inf
+    None      -> synth_pipe_plain(st, lhs, rhs, line, col)
+  }
+}
+
+fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
   let rl = synth(st, lhs)
   let res = match rhs.kind {
     ECall(f, pa) -> {
@@ -12436,12 +12446,131 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           let pipe_callee = mk_expr(callee_kind, line, col)
           let st2 = st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
           let ty = apply_ty(st2.sub, rv.ty)
-          let root = with_ty(mk_expr(ECall(rc.expr, [rl.expr, rf.expr]), line, col), ty)
-          mk_inferred(st2, ty, root)
+          let fused = try_fuse_map_pipe(st2, op, rc.expr, rl.expr, rf.expr, ty, line, col)
+          mk_inferred(fused.st, ty, fused.root)
         }
       }
     }
   }
+}
+
+# A pipe-lowering result: the emitted call and the threaded state.
+type FusedPipe = { root: Expr, st: InferState }
+
+# Map-map deforestation (issue #1134). When an already-lowered `map`
+# stage feeds another `map` stage and both stage closures are pure,
+# collapse `map(map(xs, f), g)` into `map(xs, x => g(f(x)))` — one
+# traversal, one result list, zero intermediates. Types are already
+# resolved here; the composed lambda is built typed (never re-synthesised)
+# so the shared, in-place-mutated substitution is not forked. Any other
+# `op`, an impure stage, or a non-map LHS leaves the call untouched.
+fn try_fuse_map_pipe(st: InferState, op: String, callee: Expr,
+                     lhs: Expr, stage: Expr, ty: Ty,
+                     line: Int, col: Int) : FusedPipe {
+  let unfused = with_ty(mk_expr(ECall(callee, [lhs, stage]), line, col), ty)
+  if op != "map" { FusedPipe { root: unfused, st: st } }
+  else { match pipe_fusion_as_map_call(lhs) {
+    None -> FusedPipe { root: unfused, st: st }
+    Some(inner) ->
+      if fuse_stages_pure(st.sub, inner.stage, stage) {
+        fuse_emit(st, callee, inner, stage, ty, line, col)
+      } else { FusedPipe { root: unfused, st: st } }
+  } }
+}
+
+# Both stage closures must be pure to reorder them. Reads the resolved
+# effect row off each `TyFnT`; an unresolved tail is fine (lambdas are
+# always open-tailed), only realised labels outside `{Mutable}` block.
+fn fuse_stages_pure(sub: Subst, inner_stage: Expr, outer_stage: Expr) : Bool =
+  fuse_stage_pure(sub, inner_stage) and fuse_stage_pure(sub, outer_stage)
+
+fn fuse_stage_pure(sub: Subst, stage: Expr) : Bool =
+  match pipe_fusion_fn_row(apply_ty(sub, fuse_expr_ty(stage))) {
+    None      -> false
+    Some(row) -> pipe_fusion_labels_pure(apply_row(sub, row).labels)
+  }
+
+# Emit the fused `map(source, compose(inner, outer))`, threading the
+# fresh row tail the composed lambda needs into the substitution.
+fn fuse_emit(st: InferState, callee: Expr, inner: FusedMapCall,
+             stage: Expr, ty: Ty, line: Int, col: Int) : FusedPipe {
+  let fr = subst_fresh_row(st.sub)
+  let tys = fuse_types(fr.subst, inner.stage, stage, fr.id)
+  let lam = pipe_fusion_compose(inner.stage, stage, tys, line, col)
+  let fused = with_ty(mk_expr(ECall(callee, [inner.source, lam]), line, col), ty)
+  FusedPipe { root: fused, st: st_set_sub(st, fr.subst) }
+}
+
+# Project the composed lambda's types off the resolved stage types:
+# parameter = inner domain, mid = inner codomain, result = outer
+# codomain, row = merged concrete labels under a fresh tail.
+fn fuse_types(sub: Subst, inner: Expr, outer: Expr, tail: Int) : FuseTypes {
+  let it = apply_ty(sub, fuse_expr_ty(inner))
+  let ot = apply_ty(sub, fuse_expr_ty(outer))
+  let row = Row { labels: label_concat(fuse_row_labels(sub, it), fuse_row_labels(sub, ot)),
+                  tail: Some(tail), display_alias: None }
+  FuseTypes { param: fuse_fn_domain(it), mid: fuse_fn_codomain(it),
+              result: fuse_fn_codomain(ot), row: row }
+}
+
+fn fuse_row_labels(sub: Subst, t: Ty) : [Label] =
+  match pipe_fusion_fn_row(t) {
+    None      -> []
+    Some(row) -> apply_row(sub, row).labels
+  }
+
+fn fuse_fn_domain(t: Ty) : Ty =
+  match t {
+    TyFnT([a, ...], _, _) -> a
+    _                     -> TyAny
+  }
+
+fn fuse_fn_codomain(t: Ty) : Ty =
+  match t {
+    TyFnT(_, b, _) -> b
+    _              -> TyAny
+  }
+
+fn fuse_expr_ty(e: Expr) : Ty =
+  match e.ty {
+    Some(t) -> t
+    None    -> TyAny
+  }
+
+# Terminal-fold deforestation (issue #1134). A `map`-into-`foldl` chain
+# — `xs | stage |> foldl(init, combine)` — folds over a full mapped list
+# built first. When both closures are pure, rewrite to the stdlib
+# `map_foldl` (or `range_map_foldl` for a range head), which folds
+# `combine` over `stage(x)` in one pass, materialising nothing: the
+# mapped list disappears, and a range head never allocates at all.
+#
+# The purity gate synthesises `stage` and `combine` in isolation to read
+# their effect rows (fresh tvars each time, so this does not poison the
+# shared substitution). If both are pure the raw rewrite is synthesised
+# once — `synth_call` instantiates the generic stdlib scheme cleanly, so
+# no node type is built by hand.
+fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
+                          line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match pipe_fusion_as_terminal_fold(lhs, rhs) {
+    None -> None
+    Some(ff) ->
+      if fuse_all_raw_pure(st, ff.stages) and fuse_raw_pure(st, ff.combine) {
+        Some(synth(st, pipe_fusion_fold_rewrite(ff, line, col)))
+      } else { None }
+  }
+
+fn fuse_all_raw_pure(st: InferState, closures: [Expr]) : Bool / Console + File + Mutable =
+  match closures {
+    []           -> true
+    [c, ...rest] -> if fuse_raw_pure(st, c) { fuse_all_raw_pure(st, rest) } else { false }
+  }
+
+# Synthesise a raw stage/combine closure solely to read its effect row.
+# The typed result is discarded — only the purity verdict is kept; its
+# fresh tvars are inert in the shared substitution (never re-referenced).
+fn fuse_raw_pure(st: InferState, closure: Expr) : Bool / Console + File + Mutable {
+  let r = synth(st, closure)
+  fuse_stage_pure(r.st.sub, r.expr)
 }
 
 # Format a list of module names for the ambiguous-head diagnostic.
