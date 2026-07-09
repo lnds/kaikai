@@ -64,6 +64,7 @@ import compiler.perceus
 import compiler.protos
 import compiler.emit_shared
 import compiler.emit_reuse_donate
+import compiler.vec_raw
 import compiler.ffi_v2
 import compiler.emit_ffi_c
 import compiler.modular_linkage
@@ -1321,6 +1322,8 @@ fn prelude_table() : [EPrelude] {
     EP("vec_get",          "kai_prelude_vec_get",          2),
     EP("vec_set",          "kai_prelude_vec_set",          3),
     EP("vec_push",         "kai_prelude_vec_push",         2),
+    EP("vec_length_borrow", "kai_prelude_vec_length_borrow", 1),
+    EP("vec_get_borrow",   "kai_prelude_vec_get_borrow",   2),
     # m8 #7: mailbox runtime
     EP("mailbox_alloc",         "kai_prelude_mailbox_alloc",         0),
     EP("mailbox_alloc_bounded", "kai_prelude_mailbox_alloc_bounded", 2),
@@ -2020,9 +2023,17 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / 
   # user-declared top-level fns and cannot be overridden by an
   # `lcs` shadow with the same name (a let-bound closure shadowing
   # a UFn keeps the boxed call site — `lcs.has(name)` test wins).
-  match emit_ufn_boxed_call(src, f, args_e, cx) {
+  # Vec raw fuse: `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on
+  # an inline-record carrier move the unpacked scalar fields straight
+  # into the buffer — the record is never allocated. The uniqueness
+  # decision stays inside the runtime helper.
+  match emit_vec_write_rec_fused(src, f, args_e, cx) {
     Some(s) -> s
-    None    -> emit_call_expr_default(src, f, args_e, cx)
+    None ->
+      match emit_ufn_boxed_call(src, f, args_e, cx) {
+        Some(s) -> s
+        None    -> emit_call_expr_default(src, f, args_e, cx)
+      }
   }
   }
 }
@@ -3086,6 +3097,86 @@ fn emit_field_init_val(src: String, fi: FieldInit, cx: EmitCtx) : String / Conso
 
 fn emit_field_init_name(fi: FieldInit) : String {
   match fi { FI(name, _) -> cat3("\"", name, "\"") }
+}
+
+# ---- Vec raw element fusion ----------------------------------------
+#
+# The classifier verdict lives in vec_raw.kai (one classifier for both
+# backends); these emit the C for the three fused shapes. In-region
+# code keeps the boxed path (arena field boxes must not reach the
+# raw helpers' decref).
+
+# `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier →
+# `kai_vec_get_field(_borrow)(v, i, fidx)`. The helper's RC contract
+# on (v, i) matches the vec_get variant it replaces; no record, no
+# base drop.
+fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx) : Option[String] / Console = match base.kind {
+  ECall(f, args_e) -> match f.kind {
+    EVar(callee) ->
+      if (callee == "vec_get" or callee == "vec_get_borrow") and not cx.in_region {
+        match vec_rec_field_slot(cx.recs, base.ty, fname) {
+          Some(fidx) -> match args_e {
+            [v, i] -> {
+              let helper = if callee == "vec_get_borrow" { "kai_vec_get_field_borrow(" }
+                           else { "kai_vec_get_field(" }
+              Some(concat_all([
+                helper, emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
+                ", ", int_to_string(fidx), ")"
+              ]))
+            }
+            _ -> None
+          }
+          None -> None
+        }
+      } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
+# `kai_vec_push_rec_raw` / `kai_vec_set_rec_raw` with the unpacked
+# field values (compound literals, the __perceus_reuse_record idiom).
+# Field order is the desugar-canonicalised declaration order — the
+# same layout bet the constant-index record read makes.
+fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match f.kind {
+  EVar(callee) -> {
+    if callee == "vec_push" and not cx.in_region {
+      match args_e {
+        [v, lit] -> match lit.kind {
+          ERecordLit(_, fis) ->
+            if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
+              let n = list_length(fis)
+              let vals  = join_with(map(fis, (fi) => emit_field_init_val(src, fi, cx)), ", ")
+              let names = join_with(map(fis, emit_field_init_name), ", ")
+              Some(concat_all([
+                "kai_vec_push_rec_raw(", emit_expr(src, v, cx), ", ", int_to_string(n),
+                ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
+              ]))
+            } else { None }
+          _ -> None
+        }
+        _ -> None
+      }
+    } else if callee == "vec_set" and not cx.in_region {
+      match args_e {
+        [v, i, lit] -> match lit.kind {
+          ERecordLit(_, fis) ->
+            if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
+              let n = list_length(fis)
+              let vals = join_with(map(fis, (fi) => emit_field_init_val(src, fi, cx)), ", ")
+              Some(concat_all([
+                "kai_vec_set_rec_raw(", emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
+                ", ", int_to_string(n), ", (KaiValue *[]){", vals, "})"
+              ]))
+            } else { None }
+          _ -> None
+        }
+        _ -> None
+      }
+    } else { None }
+  }
+  _ -> None
 }
 
 fn emit_record_lit(src: String, fields: [FieldInit], cx: EmitCtx) : String / Console {
@@ -6553,6 +6644,14 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       # A known record base reads by constant index (`kai_op_field_at`,
       # the desugar-canonicalised layout); else the `kai_op_field`
       # strcmp. Identical RC contract either way.
+      #
+      # Vec raw fuse: `vec_get(v, i).f` on an inline-record carrier
+      # loads the scalar column directly — no boxed record is built,
+      # so there is no base to drop. The helper's RC contract on
+      # (v, i) matches the vec_get variant it replaces.
+      match emit_vec_get_field_fused(src, base, fname, cx) {
+        Some(code) -> code
+        None -> {
       let b = emit_expr(src, base, cx)
       match field_index_of(cx.recs, base.ty, fname) {
         Some(n) -> concat_all([
@@ -6563,6 +6662,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           "({ KaiValue *_b = ", b,
           "; KaiValue *_f = kai_op_field(_b, \"", fname, "\"); kai_decref(_b); _f; })"
         ])
+      }
+        }
       }
     }
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
@@ -12699,8 +12800,14 @@ fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
           # Builtin cons via perceus's reuse-cons rewrite.
           match trmc_reuse_cons_modcons(callee, xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
-      EModCall(_, callee) ->
-        if name_first_is_upper(callee) and not list_has(scope, nm) {
+      # The monomorphiser retargets a bare call to a module-shared poly
+      # name as `EModCall(host, nm)` — a qualified call to the enclosing
+      # module IS a direct self-call.
+      EModCall(callmod, callee) ->
+        if callee == nm and tcrec_modcall_is_self(callmod, own_mod) and
+           not list_has(scope, nm) and list_length(xs) == arity {
+          true
+        } else if name_first_is_upper(callee) and not list_has(scope, nm) {
           # Resolver qualifies user ctors as EModCall(tycon, Ctor).
           match tcrec_ctor_modcons_slot(xs, nm, arity, own_mod) { Some(_) -> true None -> false }
         } else { false }
@@ -12902,7 +13009,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console
             # double-decrefs values whose single use already consumed
             # them (e.g. direct call args like `lex_next(l)`).
             let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
-            let dm_table = tcrec_collect_dm_table(body, name, arity, params,
+            let dm_table = tcrec_collect_dm_table(body, name, arity, mo, params,
                                                    pnames, uses, borrow_flags, [], [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
             # derived set under-approximates on a rewritten body (the
@@ -12939,7 +13046,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console
                 trmc_rewrite_body(body, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [], cons_ok)
               } else {
-                tcrec_rewrite_body(body, name, arity, c_sym_str,
+                tcrec_rewrite_body(body, name, arity, mo, c_sym_str,
                                    params, pnames, uses, dm_table, skip_set, [])
               }
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo)
@@ -13062,7 +13169,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let c_sym_str = c_sym(name, mo)
             # Issue #92: same precomputation as the non-pcs-ret-wrap branch.
             let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
-            let dm_table = tcrec_collect_dm_table(inner, name, arity, params,
+            let dm_table = tcrec_collect_dm_table(inner, name, arity, mo, params,
                                                    pnames, uses, borrow_flags, [], [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
@@ -13084,7 +13191,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                 trmc_rewrite_body(inner, name, arity, mo, c_sym_str,
                                   params, pnames, uses, dm_table, skip_set, [], cons_ok)
               } else {
-                let new_inner = tcrec_rewrite_body(inner, name, arity, c_sym_str,
+                let new_inner = tcrec_rewrite_body(inner, name, arity, mo, c_sym_str,
                                                     params, pnames, uses, dm_table, skip_set, [])
                 tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
               }
@@ -13318,13 +13425,13 @@ type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, rule-3 mask
 # it records TcrDm(f.line, f.col, rule3_mask) where `f` is the EVar
 # callee. Args are inspected once (via `tcrec_args_have_evar`) to
 # build the int mask, then discarded.
-fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int,
+fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int, own_mod: Option[String],
                           params: [Param], pnames: [String],
                           uses: [Use], borrow_flags: [Bool],
                           scope: [String], acc: [TcrDm]) : [TcrDm] =
-  tcrec_collect_dm_kind(body.kind, nm, arity, params, pnames, uses, borrow_flags, scope, acc)
+  tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
 
-fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int,
+fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
                          params: [Param], pnames: [String], uses: [Use],
                          borrow_flags: [Bool], scope: [String],
                          acc: [TcrDm]) : [TcrDm] {
@@ -13335,28 +13442,35 @@ fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int,
           let mask = tcrec_rule3_mask(params, uses, xs, borrow_flags, 0, 0)
           [TcrDm(f.line, f.col, mask), ...acc]
         } else { acc }
+      # Same-module qualified self-call: same rule-3 mask as the bare shape.
+      EModCall(callmod, callee) ->
+        if callee == nm and tcrec_modcall_is_self(callmod, own_mod) and
+           not list_has(scope, nm) and list_length(xs) == arity {
+          let mask = tcrec_rule3_mask(params, uses, xs, borrow_flags, 0, 0)
+          [TcrDm(f.line, f.col, mask), ...acc]
+        } else { acc }
       _ -> acc
     }
     EIf(_, t, opt_e) -> {
-      let a1 = tcrec_collect_dm_table(t, nm, arity, params, pnames, uses, borrow_flags, scope, acc)
+      let a1 = tcrec_collect_dm_table(t, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
       match opt_e {
         None -> a1
-        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, params, pnames, uses, borrow_flags, scope, a1)
+        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, a1)
       }
     }
-    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, params, pnames, uses, borrow_flags, scope, acc)
+    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> acc
-        Some(e) -> tcrec_collect_dm_table(e, nm, arity, params, pnames, uses, borrow_flags, scope1, acc)
+        Some(e) -> tcrec_collect_dm_table(e, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, acc)
       }
     }
     _ -> acc
   }
 }
 
-fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, params: [Param],
+fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], params: [Param],
                          pnames: [String], uses: [Use], borrow_flags: [Bool],
                          scope: [String], acc: [TcrDm]) : [TcrDm] {
   match arms {
@@ -13364,8 +13478,8 @@ fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, params: [Param],
     [a, ...rest] -> match a {
       Arm(pat, _, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let a1 = tcrec_collect_dm_table(body, nm, arity, params, pnames, uses, borrow_flags, scope1, acc)
-        tcrec_collect_dm_arms(rest, nm, arity, params, pnames, uses, borrow_flags, scope, a1)
+        let a1 = tcrec_collect_dm_table(body, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, acc)
+        tcrec_collect_dm_arms(rest, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, a1)
       }
     }
   }
@@ -14067,10 +14181,10 @@ fn tcrec_split_pipe(s: String) : [String] = es_tcrec_split_pipe(s)
 # *per call site* by inspecting that site's args. Args are not
 # recursed into — they are non-tail and `emit_expr` evaluates
 # them normally on emit.
-fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, c_sym_str: String,
+fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
                       dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
-  Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity,
+  Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
                                    c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
@@ -14257,7 +14371,7 @@ fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String
 }
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
-                      c_sym_str: String, params: [Param], pnames: [String],
+                      own_mod: Option[String], c_sym_str: String, params: [Param], pnames: [String],
                       uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
     ECall(f, xs) -> match f.kind {
@@ -14269,35 +14383,36 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
           # built once at `tcrec_rewrite_decl` entry. The two masks are
           # disjoint by construction (rule 1+2 fires on count==0 or
           # count>=2; rule 3 fires only on count==1) so OR == ADD.
-          let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
-          let rule3_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
-          let dropmask = base_mask + rule3_mask
-          let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
-          ECall(
-            Expr { kind: EVar(sentinel), line: f.line, col: f.col,
-                   ty: f.ty, mode: f.mode },
-            xs)
+          tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
+        } else { k }
+      # A qualified call to the enclosing module with the fn's own name
+      # is the same self-call (the monomorphiser's module-shared
+      # retarget); the sentinel replaces the callee wholesale.
+      EModCall(callmod, callee) ->
+        if callee == nm and tcrec_modcall_is_self(callmod, own_mod) and
+           not list_has(scope, nm) and list_length(xs) == arity {
+          tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
         } else { k }
       _ -> k
     }
     EIf(c, t, opt_e) -> {
-      let t1 = tcrec_rewrite_body(t, nm, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
+      let t1 = tcrec_rewrite_body(t, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(tcrec_rewrite_body(e2, nm, arity, c_sym_str, params,
+        Some(e2) -> Some(tcrec_rewrite_body(e2, nm, arity, own_mod, c_sym_str, params,
                                             pnames, uses, dm_table, skip_set, scope))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, tcrec_rewrite_arms(arms, nm, arity, c_sym_str, params, pnames,
+      EMatch(s, tcrec_rewrite_arms(arms, nm, arity, own_mod, c_sym_str, params, pnames,
                                     uses, dm_table, skip_set, scope, []))
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> k
         Some(e) ->
-          EBlock(stmts, Some(tcrec_rewrite_body(e, nm, arity, c_sym_str, params,
+          EBlock(stmts, Some(tcrec_rewrite_body(e, nm, arity, own_mod, c_sym_str, params,
                                                  pnames, uses, dm_table, skip_set, scope1)))
       }
     }
@@ -14305,7 +14420,22 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
   }
 }
 
-fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
+# Plant the goto sentinel for one recognised self-call site (shared by
+# the bare-EVar and qualified-EModCall shapes).
+fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
+                        uses: [Use], dm_table: [TcrDm], skip_set: [String],
+                        c_sym_str: String) : ExprKind {
+  let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
+  let rule3_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
+  let dropmask = base_mask + rule3_mask
+  let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
+  ECall(
+    Expr { kind: EVar(sentinel), line: f.line, col: f.col,
+           ty: f.ty, mode: f.mode },
+    xs)
+}
+
+fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                       params: [Param], pnames: [String], uses: [Use],
                       dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
   match arms {
@@ -14313,9 +14443,9 @@ fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, c_sym_str: String,
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let new_body = tcrec_rewrite_body(body, nm, arity, c_sym_str, params,
+        let new_body = tcrec_rewrite_body(body, nm, arity, own_mod, c_sym_str, params,
                                           pnames, uses, dm_table, skip_set, scope1)
-        tcrec_rewrite_arms(rest, nm, arity, c_sym_str, params, pnames, uses,
+        tcrec_rewrite_arms(rest, nm, arity, own_mod, c_sym_str, params, pnames, uses,
                            dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
