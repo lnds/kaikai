@@ -4269,6 +4269,48 @@ test-perceus-1134-pipe-fusion-terminal: $(TARGET) build
 	  && echo "perceus-1134-pipe-fusion-terminal OK (alloc_total=$$tot < 100; range + map + fold fused, nothing materialised)" \
 	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (alloc_total=$$tot — range rematerialised, fusion regressed)"; exit 1; }
 
+# Issue #1143 — inline-lambda stages fuse like named ones. A lambda left
+# inside the composed closure's body would allocate a fresh closure per
+# element (~1M at this N); the hoisted rewrite keeps the per-element
+# path allocation-free. Gate: exact output + alloc_total < 100.
+test-perceus-1143-pipe-fusion-lambda: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_lambda_1143.kai; \
+	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
+	./$(TARGET) --path ../stdlib $$src > build/s2-1143pfl.c \
+	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfl.c -o build/s2-1143pfl $(LDLIBS_M); \
+	KAI_TRACE_RC=1 ./build/s2-1143pfl > build/s2-1143pfl.out 2> build/s2-1143pfl.rc; \
+	diff -q $$exp build/s2-1143pfl.out > /dev/null \
+	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (output diff)"; diff $$exp build/s2-1143pfl.out; exit 1; }; \
+	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfl.rc | head -1 | cut -d= -f2); \
+	[ -n "$$tot" ] \
+	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (no alloc_total line)"; cat build/s2-1143pfl.rc; exit 1; }; \
+	[ "$$tot" -lt 100 ] \
+	  && echo "perceus-1143-pipe-fusion-lambda OK (alloc_total=$$tot < 100; lambda stages fused, nothing per-element)" \
+	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (alloc_total=$$tot — per-element allocation returned)"; exit 1; }
+
+# Issue #1143 — sum/product/length recognized as fusion terminals over
+# range / step-range / list sources, including a non-Int Numeric ring;
+# an effectful stage still declines. Gate: exact output (pins the
+# decline's per-element effects too) + alloc_total < 100.
+test-perceus-1143-pipe-fusion-ring: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_ring_1143.kai; \
+	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
+	./$(TARGET) --path ../stdlib $$src > build/s2-1143pfr.c \
+	  || { echo "perceus-1143-pipe-fusion-ring FAIL (kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfr.c -o build/s2-1143pfr $(LDLIBS_M); \
+	KAI_TRACE_RC=1 ./build/s2-1143pfr > build/s2-1143pfr.out 2> build/s2-1143pfr.rc; \
+	diff -q $$exp build/s2-1143pfr.out > /dev/null \
+	  || { echo "perceus-1143-pipe-fusion-ring FAIL (output diff)"; diff $$exp build/s2-1143pfr.out; exit 1; }; \
+	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfr.rc | head -1 | cut -d= -f2); \
+	[ -n "$$tot" ] \
+	  || { echo "perceus-1143-pipe-fusion-ring FAIL (no alloc_total line)"; cat build/s2-1143pfr.rc; exit 1; }; \
+	[ "$$tot" -lt 100 ] \
+	  && echo "perceus-1143-pipe-fusion-ring OK (alloc_total=$$tot < 100; ring terminals fused, nothing materialised)" \
+	  || { echo "perceus-1143-pipe-fusion-ring FAIL (alloc_total=$$tot — a recognized terminal rematerialised)"; exit 1; }
+
 # Issue #1134 (native) — the fused chain must run byte-identically on the
 # native backend. Native-gated (tier1-native). Same purity source; asserts
 # output parity + the fused cons budget carries to native codegen.
@@ -4296,6 +4338,39 @@ test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) build
 	diff -q $$exp build/s2-1134pftn.out > /dev/null \
 	  && echo "perceus-1134-pipe-fusion-terminal-native OK (range terminal-fold byte-identical on native, O(1) stack)" \
 	  || { echo "perceus-1134-pipe-fusion-terminal-native FAIL (native output diff)"; diff $$exp build/s2-1134pftn.out; exit 1; }
+
+# Issue #1143 (native) — lambda-stage fusion parity: exact output + the
+# per-element path stays allocation-free on native too. Native-gated
+# (tier1-native).
+test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_lambda_1143.kai; \
+	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfln 2> build/s2-1143pfln.err \
+	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (native build errored)"; cat build/s2-1143pfln.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-1143pfln > build/s2-1143pfln.out 2> build/s2-1143pfln.rc; \
+	diff -q $$exp build/s2-1143pfln.out > /dev/null \
+	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (output diff)"; diff $$exp build/s2-1143pfln.out; exit 1; }; \
+	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfln.rc | head -1 | cut -d= -f2); \
+	[ -n "$$tot" ] && [ "$$tot" -lt 100 ] \
+	  && echo "perceus-1143-pipe-fusion-lambda-native OK (alloc_total=$$tot < 100 on native)" \
+	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (alloc_total=$$tot)"; exit 1; }
+
+# Issue #1143 (native) — ring/length terminal fusion parity on native.
+# Native-gated (tier1-native).
+test-perceus-1143-pipe-fusion-ring-native: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/pipe_fusion_ring_1143.kai; \
+	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfrn 2> build/s2-1143pfrn.err \
+	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (native build errored)"; cat build/s2-1143pfrn.err; exit 1; }; \
+	KAI_TRACE_RC=1 ./build/s2-1143pfrn > build/s2-1143pfrn.out 2> build/s2-1143pfrn.rc; \
+	diff -q $$exp build/s2-1143pfrn.out > /dev/null \
+	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (output diff)"; diff $$exp build/s2-1143pfrn.out; exit 1; }; \
+	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfrn.rc | head -1 | cut -d= -f2); \
+	[ -n "$$tot" ] && [ "$$tot" -lt 100 ] \
+	  && echo "perceus-1143-pipe-fusion-ring-native OK (alloc_total=$$tot < 100 on native)" \
+	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (alloc_total=$$tot)"; exit 1; }
 
 # Issue #1117 (native) — same closure-param leak on the native backend: the
 # lifted `KFnLambda` never dropped its owned params. The fix emits a `KDrop`
@@ -6716,7 +6791,7 @@ test-costly-parallel: $(TARGET) build
 # axis, so it is bounded well below nproc; override TEST_JOBS=1 to force
 # the old serial behaviour.
 TEST_JOBS ?= 8
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1127-borrow-closure test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1104-balance-token-donation test-perceus-1104-sibling-param-move test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-native-modular test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-issue-963-cross-module-mono test-home-tu-partition test-kir test-batch-isolation
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-holes test-driver-holes test-effects test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1143-pipe-fusion-lambda test-perceus-1143-pipe-fusion-ring test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1127-borrow-closure test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1104-balance-token-donation test-perceus-1104-sibling-param-move test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-native-modular test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-issue-963-cross-module-mono test-home-tu-partition test-kir test-batch-isolation
 
 test-light-parallel: $(TARGET) build
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
