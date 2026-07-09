@@ -173,9 +173,15 @@ typedef enum {
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
-    KAI_FOREIGN       /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
+    KAI_FOREIGN,      /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
                        * Parks a raw `void *`; RC frees only the box, never
                        * the parked pointer. Identity-compared. */
+    KAI_VEC           /* Vec[T]: pure value vector over one flat growable
+                       * buffer. One RC header for the whole vector; elements
+                       * stored unboxed (raw scalars / inline records) when
+                       * the element shape allows, boxed otherwise. Writes
+                       * mutate in place when the buffer is uniquely owned
+                       * (rc == 1) and copy-on-write when shared. */
 } KaiTag;
 
 /* Head-type tags — single-dispatch protocol dispatch key.
@@ -197,6 +203,7 @@ typedef enum {
 #define KAI_HEAD_FIBER       11
 #define KAI_HEAD_PID         12
 #define KAI_HEAD_BYTES       13
+#define KAI_HEAD_VEC         14
 #define KAI_HEAD_OPTION      16
 #define KAI_HEAD_RESULT      17
 #define KAI_HEAD_SIGNAL      18
@@ -446,6 +453,18 @@ struct KaiValue {
             int64_t     cap;
             KaiValue  **items;
         } arr;
+        /* KAI_VEC: pure value vector. `data` is ONE heap block laid out
+         * as [KaiVecMeta][cap * stride bytes of elements]. The meta
+         * records how elements are stored (boxed pointers, raw scalars,
+         * or inline all-scalar records); len/cap live here so reads
+         * never touch the block for bounds. Writes go through the
+         * rc==1 uniqueness check: in place when unique, copy-on-write
+         * when shared — aliasing is never observable. */
+        struct {
+            int64_t     len;
+            int64_t     cap;
+            void       *data;
+        } vec;
         /* KAI_REF: a single mutable cell. Owns one strong reference to
          * `cell`. ref_set drops the old cell and steals the new value;
          * ref_get hands back an incref'd copy; ref_make steals its init.
@@ -482,6 +501,41 @@ struct KaiValue {
  * byte-for-byte identical; only the spelling changes. */
 #define kai_var_slots(v) ((KaiVarSlot *) (&(v)->as))
 
+/* ---------- Vec[T] element-storage metadata ---------- */
+
+/* How a KAI_VEC stores its elements. Decided once, from the first
+ * element the vector ever holds; a vector's element type is static so
+ * every later element has the same shape. */
+#define KAI_VEC_EK_PENDING 0   /* empty vector, no element seen yet */
+#define KAI_VEC_EK_BOXED   1   /* KaiValue* per element, each slot RC'd */
+#define KAI_VEC_EK_RAW     2   /* one 8-byte scalar payload per element */
+#define KAI_VEC_EK_REC     3   /* all-scalar record stored inline */
+
+/* Inline-record field cap: a record with more fields (or any non-scalar
+ * field) falls back to boxed storage, which is always sound. */
+#define KAI_VEC_REC_MAX 8
+
+/* Prefix of the single heap block behind a KAI_VEC: the block is
+ * [KaiVecMeta][cap * stride bytes]. Field names are the static string
+ * literals record constructors carry; the meta stores copies of the
+ * pointers, never owns the strings. */
+typedef struct {
+    int32_t     ekind;
+    int32_t     elem_tag;                     /* RAW: KaiTag reboxed on read */
+    int64_t     stride;                       /* bytes per element */
+    int32_t     n_fields;                     /* REC */
+    int32_t     head_tag;                     /* REC: nominal head-type tag */
+    uint8_t     field_tags[KAI_VEC_REC_MAX];  /* REC: per-field scalar KaiTag */
+    const char *names[KAI_VEC_REC_MAX];       /* REC: field names (static) */
+} KaiVecMeta;
+
+static inline KaiVecMeta *kai_vec_meta(KaiValue *v) {
+    return (KaiVecMeta *) v->as.vec.data;
+}
+static inline char *kai_vec_elems(KaiValue *v) {
+    return (char *) v->as.vec.data + sizeof(KaiVecMeta);
+}
+
 /* ---------- head-type tag derivation ---------- */
 
 /* kai_head_tag — single-dispatch protocol dispatch key for any value.
@@ -507,6 +561,7 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         }
         case KAI_CLOSURE: return KAI_HEAD_CLOSURE;
         case KAI_ARRAY:   return KAI_HEAD_ARRAY;
+        case KAI_VEC:     return KAI_HEAD_VEC;
         case KAI_REF:     return KAI_HEAD_ANON;  /* Ref is not protocol-dispatchable */
         case KAI_FIBER:   return KAI_HEAD_FIBER;
         case KAI_PID:     return KAI_HEAD_PID;
@@ -549,6 +604,11 @@ static int64_t kai_arena_free_total  = 0;
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 static int64_t kai_rc_reuse_total = 0;
+
+/* Vec uniqueness counters: writes that mutated a unique (rc == 1)
+ * buffer in place vs. writes that had to copy a shared one. */
+static int64_t kai_vec_inplace_total = 0;
+static int64_t kai_vec_cow_total     = 0;
 /* Phase 1.B.1 — incref/decref call counters (the ones that actually
  * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
  * borrow optimisation that elides incref/decref pairs show its effect
@@ -574,6 +634,7 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_VARIANT: return "variant";
         case KAI_CLOSURE: return "closure";
         case KAI_ARRAY:   return "array";
+        case KAI_VEC:     return "vec";
         case KAI_REF:     return "ref";
         case KAI_BYTE:      return "Byte";
         default:          return "?";
@@ -600,6 +661,11 @@ static void kai_rc_report(void) {
     if (kai_rc_reuse_total > 0) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
                 (long long) kai_rc_reuse_total);
+    }
+    if (kai_vec_inplace_total > 0 || kai_vec_cow_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   vec_inplace=%lld vec_cow=%lld\n",
+                (long long) kai_vec_inplace_total,
+                (long long) kai_vec_cow_total);
     }
     /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
     fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
@@ -1023,6 +1089,7 @@ static const char *kai_leaksite_alloc_fn(int32_t tag) {
         case KAI_CHAR:    return "kai_char";
         case KAI_CLOSURE: return "kai_closure";
         case KAI_ARRAY:   return "kai_array";
+        case KAI_VEC:     return "kai_vec";
         case KAI_BOOL:    return "kai_bool";
         case KAI_UNIT:    return "kai_unit";
         case KAI_NIL:     return "kai_nil";
@@ -2766,6 +2833,17 @@ static void kai_free_value(KaiValue *v) {
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
             free(v->as.arr.items);
             break;
+        case KAI_VEC: {
+            /* Only boxed elements carry RC; raw / inline-record elements
+             * are plain bytes freed with the block. The meta prefix and
+             * the elements are ONE allocation (see kai_vec_meta). */
+            if (kai_vec_meta(v)->ekind == KAI_VEC_EK_BOXED) {
+                KaiValue **items = (KaiValue **) kai_vec_elems(v);
+                for (int64_t i = 0; i < v->as.vec.len; ++i) kai_decref(items[i]);
+            }
+            free(v->as.vec.data);
+            break;
+        }
         case KAI_REF:
             /* A Ref owns one strong reference to its cell. */
             kai_decref(v->as.ref.cell);
@@ -3520,6 +3598,23 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             c->as.s.bytes[len] = '\0';
             return c;
         }
+        case KAI_VEC: {
+            KaiVecMeta *m = kai_vec_meta(v);
+            int64_t len = v->as.vec.len;
+            size_t stride = (size_t) (m->stride > 0 ? m->stride : 0);
+            KaiValue *c = kai_alloc(KAI_VEC);
+            c->as.vec.len = len;
+            c->as.vec.cap = len;
+            c->as.vec.data = kai_heap_malloc(sizeof(KaiVecMeta) + (size_t) len * stride);
+            *kai_vec_meta(c) = *m;
+            memcpy(kai_vec_elems(c), kai_vec_elems(v), (size_t) len * stride);
+            if (m->ekind == KAI_VEC_EK_BOXED) {
+                KaiValue **src = (KaiValue **) kai_vec_elems(v);
+                KaiValue **dst = (KaiValue **) kai_vec_elems(c);
+                for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy_out(src[i]);
+            }
+            return c;
+        }
         default:
             return kai_incref(v);
     }
@@ -3847,6 +3942,340 @@ static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
     return kai_incref(a);
 }
 
+/* ---------- Vec[T] — pure value vector (flat buffer, CoW) ----------
+ *
+ * One contiguous growable buffer with a single RC header (the KaiValue
+ * node). The pure API never exposes mutation: writes go through the
+ * same rc == 1 uniqueness check as Perceus reuse-in-place — a unique
+ * buffer is rewritten in place (no witness can observe it), a shared
+ * one is copied first. Element storage is unboxed whenever the element
+ * shape allows: raw 8-byte scalars, or all-scalar records inlined at
+ * n_fields * 8 bytes per element with no per-element header. */
+
+/* The scalar KaiTag of a value that can live unboxed in a vec slot,
+ * or -1 when it must stay boxed. */
+static int kai_vec_scalar_tag(KaiValue *x) {
+    if (!x) return -1;
+    switch ((KaiTag) x->tag) {
+        case KAI_INT: case KAI_REAL: case KAI_BOOL:
+        case KAI_CHAR: case KAI_BYTE:
+            return (int) x->tag;
+        default:
+            return -1;
+    }
+}
+
+static int64_t kai_vec_scalar_bits(KaiValue *x, uint8_t tag) {
+    switch ((KaiTag) tag) {
+        case KAI_INT:  return x->as.i;
+        case KAI_REAL: { int64_t b; memcpy(&b, &x->as.r, 8); return b; }
+        case KAI_BOOL: return (int64_t) x->as.b;
+        case KAI_CHAR: return (int64_t) x->as.c;
+        default:       return (int64_t) x->as.byte_val;  /* KAI_BYTE */
+    }
+}
+
+static KaiValue *kai_vec_scalar_box(uint8_t tag, int64_t bits) {
+    switch ((KaiTag) tag) {
+        case KAI_INT:  return kai_int(bits);
+        case KAI_REAL: { double r; memcpy(&r, &bits, 8); return kai_real(r); }
+        case KAI_BOOL: return kai_bool((int) bits);
+        case KAI_CHAR: return kai_char((uint32_t) bits);
+        default:       return kai_byte((uint8_t) bits);  /* KAI_BYTE */
+    }
+}
+
+/* Decide the storage kind from the first element the vec holds. The
+ * element type is static, so one classification covers every element
+ * the vector will ever store. */
+static void kai_vec_classify(KaiVecMeta *m, KaiValue *x) {
+    int st = kai_vec_scalar_tag(x);
+    if (st >= 0) {
+        m->ekind = KAI_VEC_EK_RAW;
+        m->elem_tag = st;
+        m->stride = 8;
+        return;
+    }
+    if (x && x->tag == KAI_RECORD &&
+        x->as.rec.n_fields > 0 && x->as.rec.n_fields <= KAI_VEC_REC_MAX) {
+        int n = x->as.rec.n_fields;
+        int all_scalar = 1;
+        for (int i = 0; i < n; ++i) {
+            int ft = kai_vec_scalar_tag(x->as.rec.fields[i]);
+            if (ft < 0) { all_scalar = 0; break; }
+            m->field_tags[i] = (uint8_t) ft;
+            m->names[i] = x->as.rec.names[i];
+        }
+        if (all_scalar) {
+            m->ekind = KAI_VEC_EK_REC;
+            m->n_fields = n;
+            m->head_tag = x->as.rec.head_type_tag;
+            m->stride = (int64_t) n * 8;
+            return;
+        }
+    }
+    m->ekind = KAI_VEC_EK_BOXED;
+    m->stride = (int64_t) sizeof(KaiValue *);
+}
+
+/* Fresh node + block. The block always carries a meta prefix, even at
+ * cap 0 (PENDING keeps stride 0; the alloc floor keeps malloc happy). */
+static KaiValue *kai_vec_alloc(int64_t len, int64_t cap, const KaiVecMeta *src) {
+    KaiValue *v = kai_alloc(KAI_VEC);
+    int64_t stride = (src && src->stride > 0) ? src->stride : 0;
+    size_t bytes = sizeof(KaiVecMeta) + (size_t) cap * (size_t) stride;
+    v->as.vec.len = len;
+    v->as.vec.cap = cap;
+    v->as.vec.data = kai_heap_malloc(bytes);
+    if (src) *kai_vec_meta(v) = *src;
+    else     memset(kai_vec_meta(v), 0, sizeof(KaiVecMeta));
+    return v;
+}
+
+/* Write one element into a slot whose old contents are GARBAGE (fresh
+ * or already released). Consumes `x`. The shape checks trap loudly on
+ * a meta mismatch — unreachable under a sound typer. */
+static void kai_vec_write_elem(KaiVecMeta *m, char *slot, KaiValue *x) {
+    switch (m->ekind) {
+        case KAI_VEC_EK_RAW: {
+            if (kai_vec_scalar_tag(x) != m->elem_tag)
+                kai_trap_abort("vec: element shape mismatch");
+            int64_t bits = kai_vec_scalar_bits(x, (uint8_t) m->elem_tag);
+            memcpy(slot, &bits, 8);
+            kai_decref(x);
+            return;
+        }
+        case KAI_VEC_EK_REC: {
+            if (!x || x->tag != KAI_RECORD || x->as.rec.n_fields != m->n_fields)
+                kai_trap_abort("vec: record shape mismatch");
+            for (int i = 0; i < m->n_fields; ++i) {
+                /* Constructors normally emit fields in one canonical
+                 * order; resolve by name so a permuted literal still
+                 * lands each payload in its column. */
+                int j = -1;
+                if (x->as.rec.names[i] == m->names[i]) j = i;
+                else {
+                    for (int k = 0; k < m->n_fields; ++k) {
+                        if (x->as.rec.names[k] == m->names[i] ||
+                            strcmp(x->as.rec.names[k], m->names[i]) == 0) { j = k; break; }
+                    }
+                }
+                if (j < 0 || kai_vec_scalar_tag(x->as.rec.fields[j]) != m->field_tags[i])
+                    kai_trap_abort("vec: record shape mismatch");
+                int64_t bits = kai_vec_scalar_bits(x->as.rec.fields[j], m->field_tags[i]);
+                memcpy(slot + (size_t) i * 8, &bits, 8);
+            }
+            kai_decref(x);
+            return;
+        }
+        default:  /* BOXED — the slot steals x's incoming ref */
+            memcpy(slot, &x, sizeof(KaiValue *));
+            return;
+    }
+}
+
+/* Read one element as an owned boxed value. */
+static KaiValue *kai_vec_read_elem(KaiVecMeta *m, const char *slot) {
+    switch (m->ekind) {
+        case KAI_VEC_EK_RAW: {
+            int64_t bits;
+            memcpy(&bits, slot, 8);
+            return kai_vec_scalar_box((uint8_t) m->elem_tag, bits);
+        }
+        case KAI_VEC_EK_REC: {
+            KaiValue *fields[KAI_VEC_REC_MAX];
+            for (int i = 0; i < m->n_fields; ++i) {
+                int64_t bits;
+                memcpy(&bits, slot + (size_t) i * 8, 8);
+                fields[i] = kai_vec_scalar_box(m->field_tags[i], bits);
+            }
+            KaiValue *r = kai_record(m->n_fields, fields, m->names);
+            r->as.rec.head_type_tag = m->head_tag;
+            return r;
+        }
+        default: {  /* BOXED */
+            KaiValue *p;
+            memcpy(&p, slot, sizeof(KaiValue *));
+            return kai_incref(p);
+        }
+    }
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_vec_make(int64_t len, KaiValue *init) {
+    if (len < 0) { fprintf(stderr, "kai: vec_make: negative length\n"); exit(1); }
+    KaiVecMeta m;
+    memset(&m, 0, sizeof(m));
+    if (len > 0) kai_vec_classify(&m, init);
+    KaiValue *v = kai_vec_alloc(len, len, &m);
+    KaiVecMeta *vm = kai_vec_meta(v);
+    char *base = kai_vec_elems(v);
+    if (len == 0) return v;
+    if (vm->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue **items = (KaiValue **) base;
+        for (int64_t i = 0; i < len; ++i) items[i] = kai_incref(init);
+    } else {
+        /* Extract the payload once, then replicate the stride image. */
+        kai_vec_write_elem(vm, base, kai_incref(init));
+        for (int64_t i = 1; i < len; ++i)
+            memcpy(base + (size_t) i * (size_t) vm->stride, base, (size_t) vm->stride);
+    }
+    return v;
+}
+
+static KaiValue *kai_vec_empty(void) {
+    return kai_vec_alloc(0, 0, NULL);
+}
+
+/* Copy for the shared-write path. Boxed children are shared (incref),
+ * raw bytes are memcpy'd; the copy is unique (rc = 1) by construction. */
+static KAI_RC_NOINLINE KaiValue *kai_vec_clone(KaiValue *v, int64_t cap) {
+    KaiVecMeta *m = kai_vec_meta(v);
+    int64_t len = v->as.vec.len;
+    if (cap < len) cap = len;
+    KaiValue *c = kai_vec_alloc(len, cap, m);
+    char *dst = kai_vec_elems(c);
+    memcpy(dst, kai_vec_elems(v), (size_t) len * (size_t) (m->stride > 0 ? m->stride : 0));
+    if (m->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue **items = (KaiValue **) dst;
+        for (int64_t i = 0; i < len; ++i) kai_incref(items[i]);
+    }
+    return c;
+}
+
+static void kai_vec_bounds(KaiValue *v, int64_t i, const char *op) {
+    if (!v || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: %s: not a vec\n", op); exit(1);
+    }
+    if (i < 0 || i >= v->as.vec.len) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) v->as.vec.len);
+        kai_trap_abort(buf);
+    }
+}
+
+/* O(1) read; the element leaves the vec owned by the caller. */
+static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
+    kai_vec_bounds(v, i, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    return kai_vec_read_elem(m, kai_vec_elems(v) + (size_t) i * (size_t) m->stride);
+}
+
+/* Pure write. Consumes `v` and `x`; returns the result vec (in place
+ * when `v` was unique, a copy when shared). */
+static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {
+    kai_vec_bounds(v, i, "vec_set");
+    if (!kai_check_unique(v)) {
+        KaiValue *c = kai_vec_clone(v, v->as.vec.cap);
+        kai_decref(v);
+        v = c;
+        kai_vec_cow_total++;
+    } else {
+        kai_vec_inplace_total++;
+    }
+    KaiVecMeta *m = kai_vec_meta(v);
+    char *slot = kai_vec_elems(v) + (size_t) i * (size_t) m->stride;
+    if (m->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue *old;
+        memcpy(&old, slot, sizeof(KaiValue *));
+        kai_vec_write_elem(m, slot, x);
+        kai_decref(old);
+    } else {
+        kai_vec_write_elem(m, slot, x);
+    }
+    return v;
+}
+
+/* Pure append. Consumes `v` and `x`. Unique with spare capacity is a
+ * plain in-place append; unique at capacity grows the block (doubling);
+ * shared copies first. An empty PENDING vec classifies from `x`. */
+static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
+    if (!v || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    if (!kai_check_unique(v)) {
+        int64_t cap = v->as.vec.cap;
+        int64_t ncap = cap * 2;
+        if (ncap < len + 1) ncap = len + 1;
+        if (ncap < 4) ncap = 4;
+        KaiValue *c = kai_vec_clone(v, ncap);
+        kai_decref(v);
+        v = c;
+        kai_vec_cow_total++;
+    } else {
+        kai_vec_inplace_total++;
+    }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind == KAI_VEC_EK_PENDING) {
+        kai_vec_classify(m, x);
+        int64_t ncap = v->as.vec.cap;
+        if (ncap < 4) ncap = 4;
+        v->as.vec.data = kai_heap_realloc(v->as.vec.data,
+            sizeof(KaiVecMeta),
+            sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
+        v->as.vec.cap = ncap;
+        m = kai_vec_meta(v);
+    } else if (len == v->as.vec.cap) {
+        int64_t ncap = v->as.vec.cap * 2;
+        if (ncap < 4) ncap = 4;
+        v->as.vec.data = kai_heap_realloc(v->as.vec.data,
+            sizeof(KaiVecMeta) + (size_t) v->as.vec.cap * (size_t) m->stride,
+            sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
+        v->as.vec.cap = ncap;
+        m = kai_vec_meta(v);
+    }
+    kai_vec_write_elem(m, kai_vec_elems(v) + (size_t) len * (size_t) m->stride, x);
+    v->as.vec.len = len + 1;
+    return v;
+}
+
+/* Structural equality — Vec is a value, unlike identity-compared
+ * Array. Raw scalars compare by payload (Reals via `==`, preserving
+ * NaN/-0.0 semantics); boxed elements recurse through kai_op_eq. */
+static int kai_op_eq(KaiValue *a, KaiValue *b);
+static int kai_vec_eq(KaiValue *a, KaiValue *b) {
+    int64_t len = a->as.vec.len;
+    if (len != b->as.vec.len) return 0;
+    if (len == 0) return 1;
+    KaiVecMeta *ma = kai_vec_meta(a);
+    KaiVecMeta *mb = kai_vec_meta(b);
+    if (ma->ekind != mb->ekind) return 0;   /* unreachable for one static type */
+    const char *pa = kai_vec_elems(a);
+    const char *pb = kai_vec_elems(b);
+    if (ma->ekind == KAI_VEC_EK_BOXED) {
+        for (int64_t i = 0; i < len; ++i) {
+            KaiValue *xa, *xb;
+            memcpy(&xa, pa + (size_t) i * sizeof(KaiValue *), sizeof(KaiValue *));
+            memcpy(&xb, pb + (size_t) i * sizeof(KaiValue *), sizeof(KaiValue *));
+            if (!kai_op_eq(xa, xb)) return 0;
+        }
+        return 1;
+    }
+    /* RAW / REC: word-compare, except Real columns via double ==. */
+    int64_t words = (ma->stride / 8) * len;
+    int has_real = (ma->ekind == KAI_VEC_EK_RAW && ma->elem_tag == KAI_REAL);
+    if (ma->ekind == KAI_VEC_EK_REC) {
+        for (int i = 0; i < ma->n_fields; ++i)
+            if (ma->field_tags[i] == KAI_REAL) has_real = 1;
+    }
+    if (!has_real) return memcmp(pa, pb, (size_t) words * 8) == 0;
+    for (int64_t w = 0; w < words; ++w) {
+        int fld = (int) (w % (ma->stride / 8));
+        uint8_t t = (ma->ekind == KAI_VEC_EK_RAW) ? (uint8_t) ma->elem_tag
+                                                  : ma->field_tags[fld];
+        if (t == KAI_REAL) {
+            double ra, rb;
+            memcpy(&ra, pa + (size_t) w * 8, 8);
+            memcpy(&rb, pb + (size_t) w * 8, 8);
+            if (!(ra == rb)) return 0;
+        } else {
+            if (memcmp(pa + (size_t) w * 8, pb + (size_t) w * 8, 8) != 0) return 0;
+        }
+    }
+    return 1;
+}
+
 /* m5.x #2: incref each captured value so the closure owns its own
  * reference. Symmetric with `kai_free_value` (KAI_CLOSURE branch),
  * which decrefs every capture on chain-free. Without this incref the
@@ -4038,6 +4467,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         }
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_VEC:     return kai_vec_eq(a, b);  /* value: structural */
         case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
@@ -4156,6 +4586,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_CLOSURE: return kai_str("<closure>");
         case KAI_ARRAY:   return kai_str("<array>");
+        case KAI_VEC:     return kai_str("<vec>");
         case KAI_REF: {
             /* Honest render `Ref(<inner>)` — closes the follow-up the
              * #257 retro left open (length-1 array printed as <array>). */
@@ -4620,6 +5051,50 @@ static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init
     if (n) kai_decref(n);
     if (init) kai_decref(init);
     return r;
+}
+
+/* ---------- prelude: Vec (pure value vector) ----------
+ *
+ * Callee-consumes at the boundary, like every prelude fn. The impls
+ * for set/push take the vec ref itself as the ownership transfer:
+ * a last-use caller arrives with rc == 1 (in-place is unobservable),
+ * a caller that kept the vec arrives with rc > 1 (copy-on-write). */
+
+static KaiValue *kai_prelude_vec_make(KaiValue *n, KaiValue *init) {
+    int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    KaiValue *r = kai_vec_make(len, init);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
+}
+
+static KaiValue *kai_prelude_vec_empty(void) {
+    return kai_vec_empty();
+}
+
+static KaiValue *kai_prelude_vec_length(KaiValue *v) {
+    int64_t len = (v && v->tag == KAI_VEC) ? v->as.vec.len : 0;
+    KaiValue *r = kai_int(len);
+    if (v) kai_decref(v);
+    return r;
+}
+
+static KaiValue *kai_prelude_vec_get(KaiValue *v, KaiValue *i) {
+    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    KaiValue *r = kai_vec_get_impl(v, idx);
+    if (v) kai_decref(v);
+    if (i) kai_decref(i);
+    return r;
+}
+
+static KaiValue *kai_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
+    int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
+    if (i) kai_decref(i);
+    return kai_vec_set_impl(v, idx, x);   /* consumes v and x */
+}
+
+static KaiValue *kai_prelude_vec_push(KaiValue *v, KaiValue *x) {
+    return kai_vec_push_impl(v, x);       /* consumes v and x */
 }
 
 /* ---------- prelude: refs (issue #257) ----------
