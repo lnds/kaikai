@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.2 (2026-07-09)
+
+### Added
+
+- **runtime**: Vec[T] stage 2 — raw element paths, borrow reads, qualified self-call TCO fix (#1147)
+- **runtime**: Vec[T] stage 1 — flat value vector, uniqueness in-place, unboxed storage (#1142)
+- **match**: range patterns — `case lo..hi ->` matches an integer interval (#1141)
+- **perceus**: call_ind_borrow — borrowing indirect call unblocks the closure/HOF borrow (#1130) (#1132)
+- the kind engine over AbelianGroup — user kinds, per-kind isolation, use-site resolution (#1108) (#1133)
+
+### Fixed
+
+- **runtime**: Vec push capacity grows only at capacity — recursive push-loop OOM (#1152)
+- **kir**: test nested ctor payloads in cons-arm heads and record fields on native (#1149)
+- **perceus**: modular-safe relaxed borrow inference (closes #1131) (#1138)
+- **perceus**: drop the re-threaded Array container in the read loop (#1126) (#1128)
+
+### Changed
+
+- **perceus**: module-call consumers are linear; inline trivial forwarders (#1153) (#1154)
+- **emit**: stamp purity attributes on emitted functions — nounwind + memory(none) native, ((const)) C (#1139) (#1146)
+- **pipes**: fuse inline-lambda stages and sum/product/length terminals (#1145)
+- **pipes**: fuse map-pipe chains into single loops (deforestation, #1134) (#1140)
+
 ## v0.99.1 (2026-07-08)
 
 ### Added
