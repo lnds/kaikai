@@ -13812,6 +13812,30 @@ static KaiValue *kai_llvm_add_sret_call(void *m, void *call, void *sty) {
     kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, (LLVMTypeRef) sty);
     return kai_unit();
 }
+/* Purity/aliasing function attributes (issue #1139). Attached at
+ * `LLVMAttributeFunctionIndex` on the declaration, so every call site the
+ * optimizer sees carries the promise. `nounwind` is broad: kaikai has no
+ * exception unwinding (a trap longjmps past nounwind frames, which is
+ * orthogonal to the attribute — it names EH-personality unwinding only).
+ * `memory(none)` is stamped ONLY on a confirmed-pure scalar fn (no alloc,
+ * no RC, no pointer read); it takes the MemoryEffects bitmask, and
+ * `none()` is 0. willreturn is NEVER stamped — kaikai does not model
+ * termination, and a memory(none) fn that traps must not be DCE'd. */
+static void kai_llvm_add_enum_fn_attr(LLVMValueRef fn, const char *name,
+                                      unsigned name_len, uint64_t val) {
+    LLVMContextRef ctx = LLVMGetTypeContext(LLVMTypeOf(fn));
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, name_len);
+    LLVMAttributeRef a = LLVMCreateEnumAttribute(ctx, kind, val);
+    LLVMAddAttributeAtIndex((LLVMValueRef) fn, LLVMAttributeFunctionIndex, a);
+}
+static KaiValue *kai_llvm_add_nounwind(void *fn) {
+    kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "nounwind", 8, 0);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_memory_none(void *fn) {
+    kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "memory", 6, 0);
+    return kai_unit();
+}
 /* The target C-ABI class of the native backend's default triple: 1 =
  * AArch64 (AAPCS64), 2 = x86-64 SysV, 0 = anything else (the emitter keeps
  * the honest struct-by-value reject there). Read once at module build; the

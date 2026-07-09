@@ -32,6 +32,7 @@ import compiler.util
 import compiler.ast
 import compiler.kir
 import compiler.fnreg
+import compiler.purity
 import compiler.evidence_frame
 import compiler.emit_shared
 import compiler.native_prims
@@ -90,8 +91,12 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [E
   # Register the per-fn evidence-frame ABI, keyed by emitted symbol, so
   # signature / call / perform resolve the same slots without threading.
   nframes_register(ctx, build_evidence_frames(decls))
+  # Confirmed-purity symbols (#1139): the emitted `c_sym` of every fn whose
+  # LOWERED body is memory-clean. Computed once here over the same
+  # post-perceus decls the C backend sees, so both stamp the same set.
+  let const_syms = purity_const_syms(purity_analyze(decls))
   # Declare every program fn first (forward + cross-TU references).
-  nemit_declare_fns(ctx, all_fns)
+  nemit_declare_fns(ctx, all_fns, const_syms)
   # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one per
   # default-block effect so `nemit_perform` resolves the op's field index.
   # DISPATCH uses `synth_defaults` (the SUPERSET) because a dead fn's
@@ -151,15 +156,16 @@ fn nfilter_user_main(fns: [KFn], bmode: BuildMode) : [KFn] =
 # Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
 # front so a call/install site resolves the symbol even when the definition
 # comes later in the list. (Lambda thunks declare lazily at their use.)
-fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
+fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_syms: [String]) : Unit = match fns {
   [] -> ()
   [f, ...rest] -> match f.kind {
     # `KFnFfi` shares the all-boxed declaration: its callers invoke the
     # kaikai-visible wrapper `kai_<name>(boxed args) -> boxed` like any fn;
-    # only its body differs (a synthesised unbox→extern→re-box shim).
+    # only its body differs (a synthesised unbox→extern→re-box shim). No
+    # purity attribute: the shim calls into arbitrary C.
     KFnFfi(_, _, _) -> {
       let _f = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
-      nemit_declare_fns(ctx, rest)
+      nemit_declare_fns(ctx, rest, const_syms)
     }
     KFnNormal -> {
       # Bind the declaration handle in a `let` (the handle-binder
@@ -177,17 +183,30 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
       # boxed `ptr (ptr × n)` for a fully-boxed fn, so non-UFn decls are
       # unchanged.
       let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), nfn_llvm_type(ctx, f))
-      nemit_declare_fns(ctx, rest)
+      # Stamp purity attributes on the declaration (#1139). `nounwind`
+      # broadly on every normal kaikai fn (no EH unwinding; a trap longjmps
+      # past nounwind frames, orthogonal to the attribute). `memory(none)`
+      # only when the confirmation table proved the body memory-clean.
+      let _nu = llvm_add_nounwind(_d)
+      let _mn = if nname_present(const_syms, f.sym) { llvm_add_memory_none(_d) } else { () }
+      nemit_declare_fns(ctx, rest, const_syms)
     }
     # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
     # its address) before its own definition is walked, so forward-declare
     # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
     KFnClause -> {
       let _c = nemit_declare_clause(ctx, f.sym, f.params)
-      nemit_declare_fns(ctx, rest)
+      nemit_declare_fns(ctx, rest, const_syms)
     }
-    _ -> nemit_declare_fns(ctx, rest)
+    _ -> nemit_declare_fns(ctx, rest, const_syms)
   }
+}
+
+# Membership of an emitted symbol in the confirmed-pure set.
+fn nname_present(xs: [String], t: String) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == t { true } else { nname_present(rest, t) }
+  _ -> false
 }
 
 # Walk each fn (imperative over `ctx`; an uncovered node flips `ctx.ok`).
