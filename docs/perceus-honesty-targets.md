@@ -111,6 +111,15 @@ paths (`vec_get(v, i).f`, push/set of a record literal) additionally
 delete the per-access boxed-record round-trip while every raw write
 still rides the one unique-or-copy decision.
 
+The **module surface reaches the same paths as the builtin spelling**:
+a resolved lowercase `mod.fn(...)` callee is a linear consumer (the
+loop param moves instead of dup'ing, so the callee sees a unique
+container), and a trivial forwarder (`pub fn push(v, x) = vec_push(v,
+x)`) inlines to the primitive call pre-monomorph, exposing the fused
+raw paths and borrow reads at the call site. An idiomatic
+`vec.push`/`vec.get` fill+sum loop measures identical wall and RSS to
+the builtin-prim spelling on both backends.
+
 ### User-parameter borrow (#1127)
 
 The borrow **surface** extends to **user function parameters**: `^` on a
