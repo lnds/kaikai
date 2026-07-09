@@ -37,6 +37,8 @@ void * kaix_prelude_llvm_add_global_extern_def(void *m, void *ty, KaiValue *name
 void * kaix_prelude_llvm_add_global_extern_decl(void *m, void *ty, KaiValue *name) { return kai_llvm_add_global_extern_decl(m, ty, name); }
 KaiValue * kaix_prelude_llvm_add_sret_call(void *m, void *call, void *sty) { return kai_llvm_add_sret_call(m, call, sty); }
 KaiValue * kaix_prelude_llvm_add_sret_decl(void *m, void *fn, void *sty) { return kai_llvm_add_sret_decl(m, fn, sty); }
+KaiValue * kaix_prelude_llvm_add_nounwind(void *fn) { return kai_llvm_add_nounwind(fn); }
+KaiValue * kaix_prelude_llvm_add_memory_none(void *fn) { return kai_llvm_add_memory_none(fn); }
 void * kaix_prelude_llvm_append_block(void *m, void *fn, KaiValue *name) { return kai_llvm_append_block(m, fn, name); }
 void * kaix_prelude_llvm_array_type(void *elem, int64_t n) { return kai_llvm_array_type(elem, n); }
 KaiValue * kaix_prelude_llvm_buf_free(void *buf) { return kai_llvm_buf_free(buf); }
