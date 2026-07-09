@@ -958,6 +958,12 @@ KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { retur
 KaiValue *kaix_prelude_array_get_borrow(KaiValue *a, KaiValue *i)        { return kai_prelude_array_get_borrow(a, i); }
 KaiValue *kaix_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_prelude_array_set(a, i, v); }
 KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_prelude_array_grow(a, n, init); }
+KaiValue *kaix_prelude_vec_make(KaiValue *n, KaiValue *init)             { return kai_prelude_vec_make(n, init); }
+KaiValue *kaix_prelude_vec_empty(void)                                   { return kai_prelude_vec_empty(); }
+KaiValue *kaix_prelude_vec_length(KaiValue *v)                           { return kai_prelude_vec_length(v); }
+KaiValue *kaix_prelude_vec_get(KaiValue *v, KaiValue *i)                 { return kai_prelude_vec_get(v, i); }
+KaiValue *kaix_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { return kai_prelude_vec_set(v, i, x); }
+KaiValue *kaix_prelude_vec_push(KaiValue *v, KaiValue *x)                { return kai_prelude_vec_push(v, x); }
 /* Issue #364: `impl Rem for Real` in stdlib/protocols.kai delegates
  * to this libm fmod binding. Listed in the LLVM prelude table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */
