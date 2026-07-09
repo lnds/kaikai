@@ -195,6 +195,7 @@ fn dsg_pat_bindings(pat: Pattern, acc: [String]) : [String] {
   match pat.pkind {
     PWild -> acc
     PLit(_) -> acc
+    PRange(_, _) -> acc
     PBind(name) -> [name, ...acc]
     PList(pats, opt_rest) -> {
       let acc1 = dsg_pat_bindings_loop(pats, acc)
@@ -248,6 +249,7 @@ fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
   match p.pkind {
     PWild         -> acc
     PLit(_)       -> acc
+    PRange(_, _)  -> acc
     PBind(name)   -> [name, ...acc]
     PList(pats, opt_rest) -> {
       let a = dsg_rename_pats_names(pats, acc)
@@ -1172,6 +1174,61 @@ fn dcp_arm_eq_or_pass(pat: Pattern, name: String, opt_g: Option[Expr],
     }
     Arm(new_pat, combined, body)
   }
+}
+
+# Rewrite `lo..hi` interval patterns into a binder + comparison guard —
+# the same shape a `case n when n >= lo and n <= hi` arm produces, so a
+# range pattern and its guard equivalent lower identically. The bounds
+# are always Int/Char literals (the parser rejects non-literal bounds),
+# so no expression escapes into the guard the exhaustiveness checker
+# cannot reason about. Mirrors `PNarrow`'s bind+predicate desugar.
+#[doc("Rewrite `lo..hi` match patterns into a binder plus a `>= lo and <= hi` guard.")]
+pub fn desugar_range_patterns_decls(decls: [Decl]) : [Decl] =
+  map(decls, (d) => drp_decl(d))
+
+fn drp_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, drp_expr(body), l, c, mo)
+  DTest(desc, body, l, c) -> DTest(desc, drp_expr(body), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, drp_expr(body), l, c)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, drp_expr(body), mo, l, c)
+  DUnstable(inner, l, c) -> DUnstable(drp_decl(inner), l, c)
+  DConstructor(inner, l, c) -> DConstructor(drp_decl(inner), l, c)
+  _ -> d
+}
+
+fn drp_expr(e: Expr) : Expr {
+  match e.kind {
+    EMatch(scr, arms) ->
+      mk_expr(EMatch(drp_expr(scr), map(arms, (a) => drp_arm(a))), e.line, e.col)
+    _ -> mk_expr(dsg_map_expr_kind(e.kind, (sub) => drp_expr(sub)), e.line, e.col)
+  }
+}
+
+fn drp_arm(a: Arm) : Arm = match a {
+  Arm(pat, guard, body) -> {
+    let body1 = drp_expr(body)
+    let guard1 = match guard { Some(g) -> Some(drp_expr(g)) None -> None }
+    match pat.pkind {
+      PRange(lo, hi) -> drp_range_arm(pat, lo, hi, guard1, body1)
+      _ -> Arm(pat, guard1, body1)
+    }
+  }
+}
+
+fn drp_range_arm(pat: Pattern, lo: Expr, hi: Expr,
+                 guard: Option[Expr], body: Expr) : Arm {
+  let nm = concat_all(["__range_", int_to_string(pat.line), "_",
+                       int_to_string(pat.col), "__"])
+  let var_e = mk_expr(EVar(nm), pat.line, pat.col)
+  let ge = mk_expr(EBinop(">=", var_e, lo), pat.line, pat.col)
+  let le = mk_expr(EBinop("<=", var_e, hi), pat.line, pat.col)
+  let range_g = mk_expr(EBinop("and", ge, le), pat.line, pat.col)
+  let combined = match guard {
+    None -> Some(range_g)
+    Some(ug) -> Some(mk_expr(EBinop("and", range_g, ug), pat.line, pat.col))
+  }
+  Arm(mk_pat(PBind(nm), pat.line, pat.col), combined, body)
 }
 
 pub fn lower_axiom_one(d: Decl) : Decl {

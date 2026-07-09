@@ -25,6 +25,10 @@ x: Int                                    # bind + union-variant narrow
 
 42  3.14  "hello"  'c'  true  false       # literals
 
+1..9      'a'..'z'                        # inclusive range (Int/Char,
+                                          # literal bounds — no step,
+                                          # no expressions)
+
 Some(x)   None                            # Option
 Ok(v)     Err(e)                          # Result
 Red       Green       Blue                # nullary variants
@@ -86,6 +90,55 @@ fn main() : Unit / Stdout = {
   Stdout.print(int_to_string(area_at_origin(Point { x: 3, y: 4 })))
   Stdout.print(list_info([1, 2, 3]))
 }
+```
+
+## Range patterns
+
+`lo..hi` matches when the scrutinee falls in the inclusive interval.
+Both bounds are Int or Char literals — no expressions, no step. A range
+arm is exactly a `when lo <= x <= hi` guard, so a catch-all is still
+required (an interval never covers all of `Int`).
+
+```kaikai
+fn classify(n: Int) : String = match n {
+  0      -> "zero"
+  1..9   -> "small"
+  10..99 -> "medium"
+  _      -> "large"
+}
+
+fn grade(c: Char) : String {
+  case 'a'..'z' -> "lower"
+  case '0'..'9' -> "digit"
+  case _        -> "other"
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(classify(5))
+  Stdout.print(grade('k'))
+}
+```
+
+Both bounds must be literals — a variable bound is rejected:
+
+```kaikai-neg
+fn f(n: Int, hi: Int) : String = match n {
+  1..hi -> "in"
+  _     -> "out"
+}
+
+fn main() : Unit / Stdout = Stdout.print(f(5, 9))
+```
+
+The scrutinee must be numeric — a range over a String is a type error:
+
+```kaikai-neg
+fn f(s: String) : String = match s {
+  1..9 -> "in"
+  _    -> "out"
+}
+
+fn main() : Unit / Stdout = Stdout.print(f("hi"))
 ```
 
 ## Exhaustiveness
