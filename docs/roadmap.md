@@ -452,72 +452,72 @@ blocker. Remaining notes:
 ### Orongo — 1.0.0
 
 The ceremonial village on Rano Kau, where the birdman cult
-sealed the year's transitions. Mark the language as 1.0.0:
-multi-thread, complete tooling, no honest-target footnotes.
+sealed the year's transitions. Mark the language as 1.0.0.
 
-**Scope**:
+The scope below supersedes the original draft (which gated 1.0 on a
+multi-thread scheduler and a package registry); the authoritative
+remaining-gates list lives in `docs/editions.md` and this section
+mirrors it. The two 1.0 pillars the edition was re-scoped around
+(2026-07-08) have both **shipped**:
 
-- Multi-thread scheduler — work-stealing across N OS threads;
-  cross-thread RC requires atomics; changes the memory model.
-  Single-thread cooperative is correct and parallelisable
-  later, so this gates 1.0.0.
-- asm-level context switch — `ucontext` is deprecated on
-  macOS and ~1–2 µs per switch; production wants ~50–100 ns
-  (boost.context shape).
-- Cross-fiber unboxed messages (Tier 3b) — `send` / mailbox
-  copies stay raw `int64_t` for primitive payloads, rather
-  than always going through boxed `KaiValue *`. Coordinates
-  with the multi-thread scheduler.
-  *(Optimization thread for this milestone.)*
-- Type-erased layouts (Tier 3b) — polymorphic raw layouts so
-  generic containers can hold unboxed primitives without
-  monomorphising for every primitive type.
-- Package manager — `kai new` (and registry abstraction).
-  *(`kai add` / `kai install` / `kai update` / lockfile + git
-  dependency resolution shipped 2026-05-09 via #405; see
-  `docs/packages.md`. The remaining work in this row is
-  `kai new` (project scaffolding) and a registry abstraction
-  on top of git.)*
-- FFI binding generator — given a C header, emit kaikai
-  `extern "C" fn` declarations and `Ffi`-effected wrappers. The
-  marshalling substrate it needs shipped as **FFI v2** (#417,
-  2026-06-22): struct-by-value, opaque handles, fixed-width types.
-  The remaining work is the header-to-declarations generator itself.
-- Separate compilation — cross-module monomorphization + per-module
-  LLVM path (#963), the Phase 3 remainder of the stage 2
-  modularization (#677). The source split (#580) and `.kaii`
-  interface persistence (#760) already landed.
-- Region-brand full `TyBranded` machinery — propagation
-  through every binding form, sum-type-payload escape
-  detection, brand-mismatch detection between sibling
-  nurseries. Closes m8x §6.
-- Opt-in regions (Tier 3a residual) — arena allocation for
-  parser scratch and similar narrow workloads.
-- `check` v2 — protocol-based generators (`impl Arbitrary
-  for T`). Replaces the v1 intrinsic-table approach. Requires
-  protocols to be load-bearing for stdlib (m12.8+).
+- **Kind engine** (#1108, PR #1133) — user abelian kinds, per-kind
+  habitant isolation, use-site resolution, the `unify_<theory>`
+  dispatch seam for future theories (`Structural`, `Module`).
+- **Borrow** (#1129/#1130/#1138) — `^` surface + interface ABI,
+  non-consuming indirect calls (closure RC eliminated), relaxed
+  read-path inference, modular-safe.
 
-**Definition of Done**:
+**Remaining scope (the real 1.0 gates):**
 
-1. Multi-threaded fiber scheduler running production
-   workloads; context switch under 200 ns.
-2. `kai new my_app && cd my_app && kai add some_lib && kai
-   build` round-trips end to end. *(`kai init` / `add` /
-   `install` / `update` / `build` round-trip works as of #405,
-   2026-05-09; only `kai new` (scaffolding) remains.)*
-3. FFI binding generator produces working bindings for at
-   least one non-trivial C library (libc subset, sqlite, or
-   similar).
-4. Region-brand `TyBranded` propagation: no more "shallow
-   check" caveats; sibling-nursery brand mismatch flagged at
-   compile time.
-5. Tier 1 #1, #2, #3 fully defendible without footnotes;
-   `docs/perceus-honesty-targets.md` and
-   `docs/fibers-honesty-targets.md` Tier 3 sections marked
-   closed.
+- **The surface pin + `EDITION` flip** — the deliberate act. Two
+  surface decisions are explicitly deferred to this moment, to be
+  taken with measurements in hand: the list-literal default
+  (`[1,2,3]`: cons today; the flip — literal AND type together,
+  cons becoming nominal `List[T]`, no sigil — per the 2026-07-09
+  design consult) and the final `kai info syntax` freeze.
+- **`kai migrate` rule set** — machinery shipped (#1047); the rule
+  set grows with the surface pin (the list flip, if taken, is its
+  largest rule).
+- **Separate/modular compilation for user programs** — L1–L3
+  shipped; the Phase 3 remainder of #963 closes the gate.
+- **Near-C performance on structural workloads** — the measured
+  ladder, in order: pipe fusion (#1140/#1145, shipped: fused
+  chains, range generator heads), `Vec[T]` (#1142/#1147, shipped:
+  flat unboxed storage, uniqueness in-place, raw element paths —
+  case-6 memory at Rust parity), sized-exact variant
+  representation (#1136, in flight — the rb-tree wall closer),
+  `Vec` surface stage 3 (#1150: slices, minting, fused collect).
+- **The authorability benchmark** — the Tier 3 acceptance measured
+  head-to-head (kaikai vs Rust vs Go, success rate per compile
+  round; harness repo exists, task set in authoring). 1.0 ships
+  with the number published, not asserted.
 
-**Estimated cost**: ~2–3 months. Multi-thread scheduler is
-the long pole; the rest can parallelise.
+**Definition of Done:**
+
+1. `EDITION` reads `orongo`; every surface decision in
+   `kai info syntax` is pinned; `kai migrate` rewrites the full
+   Hanga-Roa → Orongo delta with a byte-identity gate on the
+   migrated compiler.
+2. The perf ladder holds on `main`: case-6 within the
+   Koka-class envelope on wall with Rust-class memory, rb-tree
+   within the Eje-2 target on both backends, all guarded by
+   tier-wired bench fixtures (no unreproducible claims).
+3. Modular compilation compiles, links and runs a multi-package
+   user program with per-package rebuilds.
+4. The authorability benchmark's function tier runs green
+   end-to-end and its result ships in the release notes.
+5. Honesty docs current: no `v1 status` sidebar older than the
+   release; `docs/perceus-honesty-targets.md` and
+   `docs/fibers-honesty-targets.md` reflect shipped reality.
+
+**Explicitly moved past 1.0** (tracked for Anakena, matching
+`docs/editions.md`): the multi-thread scheduler (work-stealing,
+atomics-free by fiber isolation — the architecture already paid
+for it), asm-level context switch, cross-fiber unboxed messages,
+type-erased layouts, the package registry and FFI binding
+generator, `check` v2, and the full region machinery (#1123,
+parked: `Vec` took the confined-bulk case; regions keep
+trees-in-arena, lifetime batching and the generational escape).
 
 ### Anakena — post-1.0 horizon
 
