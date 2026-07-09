@@ -69,6 +69,20 @@
 #include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
 #include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
 
+/* Purity attribute for a confirmed memory-clean fn (issue #1139): the C
+ * emitter prefixes `KAI_CONST` on the signature of a fn whose lowered
+ * body performs no memory access, so `cc -O2` can CSE / hoist / fold
+ * calls to it. `((const))` promises the result depends only on the
+ * arguments and the fn reads no memory through them — the C mirror of
+ * LLVM `memory(none)`. Only GCC/Clang honour it; elsewhere it vanishes.
+ * Defined unconditionally (NOT inside KAI_TRACE_RC), since every C build
+ * the emitter targets references it. */
+#if defined(__GNUC__) || defined(__clang__)
+#define KAI_CONST __attribute__((const))
+#else
+#define KAI_CONST
+#endif
+
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
  * blocking-only: the m8.x cooperative scheduler (landed v0.4.0)
@@ -14912,6 +14926,8 @@ static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t ix, void *s)
 static KaiValue *kai_llvm_add_byval_call(void *m, void *c, int64_t ix, void *s) { (void) m; (void) c; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *s) { (void) m; (void) fn; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (void) c; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_nounwind(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_memory_none(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
 static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
