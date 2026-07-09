@@ -639,6 +639,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #140 fixture passes under ASAN+UBSan (SecureRandom default-handler gate)"
 	@$(MAKE) -C stage2 test-perceus-1151-vec-push-growth-asan
 	@echo "tier1-asan OK — issue #1151 fixtures pass under ASAN+UBSan (Vec push growth-at-capacity gate)"
+	@$(MAKE) -C stage2 test-perceus-1153-modcall-linear-asan
+	@echo "tier1-asan OK — issue #1153 fixtures pass under ASAN+UBSan (module-call linearity gate)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
