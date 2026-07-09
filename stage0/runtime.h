@@ -4195,10 +4195,14 @@ static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
     }
     int64_t len = v->as.vec.len;
     if (!kai_check_unique(v)) {
-        int64_t cap = v->as.vec.cap;
-        int64_t ncap = cap * 2;
-        if (ncap < len + 1) ncap = len + 1;
-        if (ncap < 4) ncap = 4;
+        /* Grow only at capacity: an unconditional cap*2 here would double
+         * the clone's capacity on EVERY shared push (2^n blow-up). */
+        int64_t ncap = v->as.vec.cap;
+        if (len >= ncap) {
+            ncap = ncap * 2;
+            if (ncap < len + 1) ncap = len + 1;
+            if (ncap < 4) ncap = 4;
+        }
         KaiValue *c = kai_vec_clone(v, ncap);
         kai_decref(v);
         v = c;
