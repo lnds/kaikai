@@ -1,0 +1,268 @@
+# Escape analysis for the relaxed borrow inference (issue #1131).
+#
+# When `borrow_infer` borrows a param used only as a bare match scrutinee, a
+# component the arm binds is an INTERIOR pointer of the borrowed parent — the
+# RC pass does not dup it at the bind. The borrow is sound only while every
+# such child stays borrowed too. This module answers: does any child binder
+# of an arm ESCAPE its body — flow out as the returned value, get stored in a
+# ctor/record/list slot, be captured by a lambda, or be passed owned to a
+# call? A child that escapes outlives its parent's borrowed extent and dangles
+# once another path frees the parent (the sep-comp UAF of #1131). A pure read
+# (a binop/comparison operand, a callee inspection, a match discriminant) does
+# not retain a reference, so it is safe.
+#
+# Kept in its own module so `borrow_infer` stays a single-responsibility
+# reader; the structural `binf_absent*` walk lives here too since both the
+# borrow reader and this escape reader consult it (kaikai forbids import
+# cycles, so the shared leaf sits at the lower module).
+
+import compiler.ast
+
+# Every child binder of every arm must NOT escape its body. `i` is the
+# enclosing param's position — the one self-call slot that carries a bare
+# child on as a borrow-through (not an owned pass).
+pub fn binf_arms_binders_borrowed(self_name: String, i: Int, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(p, _, abody) -> {
+      let names = binf_pat_binders(p, [])
+      binf_none_escapes(self_name, i, names, abody) and binf_arms_binders_borrowed(self_name, i, rest)
+    }
+  }
+}
+
+fn binf_none_escapes(self_name: String, i: Int, names: [String], abody: Expr) : Bool = match names {
+  []           -> true
+  [h, ...rest] -> not binf_escapes(self_name, i, h, true, abody) and binf_none_escapes(self_name, i, rest, abody)
+}
+
+# `h` escapes `e` iff a reference to it survives the evaluation of `e`: `e`
+# yields `h` in TAIL position (its value becomes the arm result), or `h` is
+# stored in a ctor/record/list slot, captured by a lambda, or passed owned to
+# a call — ANYWHERE, tail or not, since those retain past the arm. A pure
+# READ (binop / comparison operand, unop, match discriminant, callee
+# inspection) does NOT escape: the operator consumes the read, keeping no
+# reference. The `tail` flag tracks whether the current position's value flows
+# out as the result; a bare `h` escapes only in tail position. The one safe
+# owned-looking site: a self-call carrying `h` at the enclosing param's
+# borrow-through slot `i` — the fixpoint carries the borrow on.
+fn binf_escapes(self_name: String, i: Int, h: String, tail: Bool, e: Expr) : Bool = binf_escapes_k(self_name, i, h, tail, e.kind)
+
+fn binf_escapes_k(self_name: String, i: Int, h: String, tail: Bool, k: ExprKind) : Bool = match k {
+  # Bare `h`: escapes only if it is the returned value (tail).
+  EVar(u)             -> tail and u == h
+  # Stored in a slot / captured / field-projected: retains past the arm.
+  ERecordLit(_, fis)  -> not binf_absent_fields(h, fis)
+  EList(els)          -> not binf_absent_elems(h, els)
+  ELambda(_, b)       -> not binf_absent(h, b)
+  EField(x, _)        -> tail and (not binf_absent(h, x))
+  # A ctor/user call storing `h` in an argument retains it; a call that only
+  # inspects (`is_red(h)`) does not. A self-call carrying `h` at position `i`
+  # (the enclosing param's borrow-through slot) is safe.
+  ECall(f, xs)        -> match f.kind {
+    EVar(c)        -> if c == h { false } else { binf_call_escapes(self_name, i, h, c, xs) }
+    EModCall(_, c) -> binf_call_escapes(self_name, i, h, c, xs)
+    _              -> binf_escapes(self_name, i, h, false, f) or binf_any_arg_escapes(self_name, i, h, xs)
+  }
+  EIntrinsic(_, xs)   -> binf_any_arg_escapes(self_name, i, h, xs)
+  # Control-flow propagates `tail` to branches / block tail; the discriminant
+  # / condition is a non-tail read.
+  EIf(c, t, oe)       -> binf_escapes(self_name, i, h, false, c) or binf_escapes(self_name, i, h, tail, t) or
+                          binf_opt_escapes(self_name, i, h, tail, oe)
+  EBlock(stmts, tail2) -> binf_stmts_escape(self_name, i, h, stmts) or binf_opt_escapes(self_name, i, h, tail, tail2)
+  EMatch(s, arms)     -> binf_escapes(self_name, i, h, false, s) or binf_arms_escape(self_name, i, h, tail, arms)
+  EBang(x)            -> binf_escapes(self_name, i, h, tail, x)
+  EIndex(a, b)        -> (tail and (not binf_absent(h, a))) or binf_escapes(self_name, i, h, false, b)
+  # Pure reads (operands inspected, not stored) and pipes / ranges (thread `h`
+  # owned into a callee) are grouped in `binf_escapes_other`.
+  _                   -> binf_escapes_other(self_name, i, h, k)
+}
+
+# The read-through and pipe forms. A binop/unop operand is a non-tail read
+# (no retention); a pipe/range carrying `h` threads it owned into a callee,
+# so any presence escapes. Split out to keep `binf_escapes_k` shallow.
+fn binf_escapes_other(self_name: String, i: Int, h: String, k: ExprKind) : Bool = match k {
+  EBinop(_, a, b)     -> binf_escapes(self_name, i, h, false, a) or binf_escapes(self_name, i, h, false, b)
+  EUnop(_, x)         -> binf_escapes(self_name, i, h, false, x)
+  ELitUnit(x, _)      -> binf_escapes(self_name, i, h, false, x)
+  EPipe(a, b)         -> binf_pipe_escapes(h, a, b)
+  EMapPipe(a, b)      -> binf_pipe_escapes(h, a, b)
+  EFlatMapPipe(a, b)  -> binf_pipe_escapes(h, a, b)
+  EFilterPipe(a, b)   -> binf_pipe_escapes(h, a, b)
+  ERange(a, b, oe)    -> binf_pipe_escapes(h, a, b) or (not binf_opt_absent(h, oe))
+  _                   -> false
+}
+
+fn binf_pipe_escapes(h: String, a: Expr, b: Expr) : Bool = not binf_absent(h, a) or not binf_absent(h, b)
+
+fn binf_opt_escapes(self_name: String, i: Int, h: String, tail: Bool, oe: Option[Expr]) : Bool = match oe {
+  None    -> false
+  Some(e) -> binf_escapes(self_name, i, h, tail, e)
+}
+
+fn binf_opt_absent(h: String, oe: Option[Expr]) : Bool = match oe {
+  None    -> true
+  Some(e) -> binf_absent(h, e)
+}
+
+fn binf_call_escapes(self_name: String, i: Int, h: String, c: String, xs: [Expr]) : Bool =
+  if c == self_name { binf_self_args_escape(self_name, i, h, xs, 0) }
+  else { binf_any_arg_escapes(self_name, i, h, xs) }
+
+# A bare `h` in any arg is passed owned → escapes. A sub-inspection does not.
+fn binf_any_arg_escapes(self_name: String, i: Int, h: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> {
+    let here = match a.kind { EVar(u) -> u == h  _ -> binf_escapes(self_name, i, h, false, a) }
+    here or binf_any_arg_escapes(self_name, i, h, rest)
+  }
+}
+
+# In a self-call, a bare `h` at position `i` is borrow-through (the enclosing
+# param's borrowed slot carries `h` on, so it is NOT consumed there — safe).
+# A bare `h` at any OTHER position is an owned pass → escapes.
+fn binf_self_args_escape(self_name: String, i: Int, h: String, xs: [Expr], j: Int) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> {
+    let here = if j == i { match a.kind { EVar(_) -> false  _ -> binf_escapes(self_name, i, h, false, a) } }
+               else { match a.kind { EVar(u) -> u == h  _ -> binf_escapes(self_name, i, h, false, a) } }
+    here or binf_self_args_escape(self_name, i, h, rest, j + 1)
+  }
+}
+
+fn binf_stmts_escape(self_name: String, i: Int, h: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, rhs) -> not binf_absent(h, rhs)
+      SExprStmt(e)    -> binf_escapes(self_name, i, h, false, e)
+      _               -> false
+    }
+    here or binf_stmts_escape(self_name, i, h, rest)
+  }
+}
+
+fn binf_arms_escape(self_name: String, i: Int, h: String, tail: Bool, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> binf_escapes(self_name, i, h, tail, b) or binf_arms_escape(self_name, i, h, tail, rest)
+  }
+}
+
+# Collect the binder names a pattern introduces (the `PBind`/`PAs`/`PNarrow`
+# leaves), recursing through variant / record / list sub-patterns.
+fn binf_pat_binders(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PBind(n)               -> [n, ...acc]
+  PAs(n, inner)          -> binf_pat_binders(inner, [n, ...acc])
+  PNarrow(n, _)          -> [n, ...acc]
+  PVariant(_, sub)       -> binf_pats_binders(sub, acc)
+  PVariantRecord(_, fps) -> binf_fieldpats_binders(fps, acc)
+  PRecord(fps)           -> binf_fieldpats_binders(fps, acc)
+  PList(sub, orst)       -> {
+    let a1 = binf_pats_binders(sub, acc)
+    match orst { Some(n) -> [n, ...a1] None -> a1 }
+  }
+  _                      -> acc
+}
+fn binf_pats_binders(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> binf_pats_binders(rest, binf_pat_binders(p, acc))
+}
+fn binf_fieldpats_binders(fps: [PField], acc: [String]) : [String] = match fps {
+  []           -> acc
+  [f, ...rest] -> match f { PField(_, p, _) -> binf_fieldpats_binders(rest, binf_pat_binders(p, acc)) }
+}
+
+# `nm` does not appear as a read anywhere in `e` — a pure structural walk for
+# `EVar(nm)`. Shared by `borrow_infer` (owned-exit check) and the escape walk
+# above; kept here (the lower module) so neither forms an import cycle.
+pub fn binf_absent(nm: String, e: Expr) : Bool = not binf_var_present(nm, e)
+
+fn binf_var_present(nm: String, e: Expr) : Bool = binf_var_present_k(nm, e.kind)
+
+fn binf_var_present_k(nm: String, k: ExprKind) : Bool = match k {
+  EVar(u)             -> u == nm
+  ECall(f, xs)        -> binf_var_present(nm, f) or binf_any_present(nm, xs)
+  EIntrinsic(_, xs)   -> binf_any_present(nm, xs)
+  EField(x, _)        -> binf_var_present(nm, x)
+  EMatch(s, arms)     -> binf_var_present(nm, s) or binf_present_arms(nm, arms)
+  EBlock(stmts, tail) -> binf_present_stmts(nm, stmts) or binf_present_opt(nm, tail)
+  ELambda(_, b)       -> binf_var_present(nm, b)
+  ERecordLit(_, fis)  -> binf_present_fields(nm, fis)
+  EList(els)          -> binf_present_elems(nm, els)
+  _                   -> binf_present_transparent(nm, k)
+}
+
+# The binary/unary transparent forms — `nm` present iff present in any child.
+fn binf_present_transparent(nm: String, k: ExprKind) : Bool = match k {
+  EIndex(a, b)        -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EBinop(_, a, b)     -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EUnop(_, x)         -> binf_var_present(nm, x)
+  EIf(c, t, oe)       -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
+  ERange(a, b, oe)    -> binf_var_present(nm, a) or binf_var_present(nm, b) or binf_present_opt(nm, oe)
+  EPipe(a, b)         -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EMapPipe(a, b)      -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EFlatMapPipe(a, b)  -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EFilterPipe(a, b)   -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EBang(x)            -> binf_var_present(nm, x)
+  ELitUnit(x, _)      -> binf_var_present(nm, x)
+  _                   -> false
+}
+
+fn binf_any_present(nm: String, es: [Expr]) : Bool = match es {
+  []           -> false
+  [e, ...rest] -> binf_var_present(nm, e) or binf_any_present(nm, rest)
+}
+
+fn binf_present_opt(nm: String, oe: Option[Expr]) : Bool = match oe {
+  None    -> false
+  Some(e) -> binf_var_present(nm, e)
+}
+
+fn binf_present_arms(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, g, b) -> {
+      let g_here = match g { None -> false Some(gg) -> binf_var_present(nm, gg) }
+      g_here or binf_var_present(nm, b) or binf_present_arms(nm, rest)
+    }
+  }
+}
+
+fn binf_present_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, rhs) -> binf_var_present(nm, rhs)
+      SExprStmt(e)    -> binf_var_present(nm, e)
+      _               -> false
+    }
+    here or binf_present_stmts(nm, rest)
+  }
+}
+
+pub fn binf_absent_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> true
+  [f, ...rest] -> match f { FI(_, v) -> binf_absent(nm, v) and binf_absent_fields(nm, rest) }
+}
+
+pub fn binf_absent_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [el, ...rest] -> {
+    let ok = match el { ElPlain(e) -> binf_absent(nm, e) ElSpread(e) -> binf_absent(nm, e) }
+    ok and binf_absent_elems(nm, rest)
+  }
+}
+
+fn binf_present_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [f, ...rest] -> match f { FI(_, v) -> binf_var_present(nm, v) or binf_present_fields(nm, rest) }
+}
+
+fn binf_present_elems(nm: String, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [el, ...rest] -> {
+    let here = match el { ElPlain(e) -> binf_var_present(nm, e) ElSpread(e) -> binf_var_present(nm, e) }
+    here or binf_present_elems(nm, rest)
+  }
+}
