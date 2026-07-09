@@ -275,6 +275,14 @@ KaiValue *kaix_apply(KaiValue *clo, int32_t n, KaiValue **args) {
     return kai_apply(clo, n, args);
 }
 
+/* Borrowing indirect call (issue #1130). The native backend emits this
+   for a `^`-borrowed function-typed parameter: the closure is invoked
+   WITHOUT being consumed, so the caller keeps the ref and drops it after
+   its last use. Args keep the owned convention. */
+KaiValue *kaix_apply_borrow(KaiValue *clo, int32_t n, KaiValue **args) {
+    return kai_apply_borrow(clo, n, args);
+}
+
 /* Prelude thunks exported as regular symbols so LLVM IR can take
    their address to build closures passed into higher-order prelude
    calls. One per prelude entry we may reference as a value. */

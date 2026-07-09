@@ -1992,6 +1992,17 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
 
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
 
+  # issue #1130 rule 1 — drop-after-call for a freshly materialised closure
+  # in a borrowed slot. perceus marks such an arg `__perceus_owned_borrow(g)`;
+  # the callee borrows it (never drops), so the caller balances its birth ref
+  # AFTER the call. Wrap the whole call in a local C statement-expression:
+  # each marked arg is bound to a temp, the call runs, then each temp is
+  # decref'd. This is invisible to tcrec/TCO (the ref never existed in the
+  # AST — it is born here as `kai_closure`), unlike an AST-level EBlock wrap.
+  if emit_args_have_owned_borrow(args_e) {
+    emit_call_with_owned_borrow_drops(src, f, args_e, cx)
+  } else {
+
   # Phase 3 unboxing — when the callee resolves to a UFn (raw C
   # signature), emit the call against raw args and wrap the
   # result with `kai_int` / `kai_bool` / `kai_char` / `kai_real`
@@ -2004,6 +2015,87 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / 
   match emit_ufn_boxed_call(src, f, args_e, cx) {
     Some(s) -> s
     None    -> emit_call_expr_default(src, f, args_e, cx)
+  }
+  }
+}
+
+fn emit_args_have_owned_borrow(args_e: [Expr]) : Bool = match args_e {
+  []           -> false
+  [a, ...rest] -> if emit_is_owned_borrow(a) { true } else { emit_args_have_owned_borrow(rest) }
+}
+
+fn emit_is_owned_borrow(a: Expr) : Bool = match a.kind {
+  ECall(callee, _) -> match callee.kind {
+    EVar(nm) -> nm == "__perceus_owned_borrow"
+    _        -> false
+  }
+  _ -> false
+}
+
+# Unwrap `__perceus_owned_borrow(g)` to `g` (the fn-name / closure expr).
+fn emit_owned_borrow_inner(a: Expr) : Expr = match a.kind {
+  ECall(_, inner) -> match inner { [x] -> x  _ -> a }
+  _               -> a
+}
+
+# `({ KaiValue *kai_bcN = <clo>; ...; KaiValue *_bcr = <call with kai_bcN>;
+#     kai_decref(kai_bcN); ...; _bcr; })`. Each `__perceus_owned_borrow` arg
+# is materialised into a temp `bcN` (added to `lcs` so its `EVar` re-emits
+# as the raw `kai_bcN` local), the call runs borrowing them, then each temp
+# is dropped — the birth ref the callee did not consume.
+fn emit_call_with_owned_borrow_drops(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
+  let names = emit_ob_names(args_e, 0)
+  let cx2 = emit_ctx_with_lcs(cx, list_append(cx.lcs, names))
+  let binds = emit_ob_binds(src, args_e, 0, cx)
+  let call_args = emit_ob_rewrite_args(args_e, 0)
+  let call = match emit_ufn_boxed_call(src, f, call_args, cx2) {
+    Some(s) -> s
+    None    -> emit_call_expr_default(src, f, call_args, cx2)
+  }
+  let drops = emit_ob_drops(args_e, 0)
+  concat_all(["({ ", binds, "KaiValue *_bcr = ", call, "; ", drops, "_bcr; })"])
+}
+
+fn emit_ob_names(args_e: [Expr], i: Int) : [String] = match args_e {
+  []           -> []
+  [a, ...rest] -> {
+    let more = emit_ob_names(rest, i + 1)
+    if emit_is_owned_borrow(a) { [concat_all(["bc", int_to_string(i)]), ...more] } else { more }
+  }
+}
+
+fn emit_ob_binds(src: String, args_e: [Expr], i: Int, cx: EmitCtx) : String / Console = match args_e {
+  []           -> ""
+  [a, ...rest] -> {
+    let more = emit_ob_binds(src, rest, i + 1, cx)
+    if emit_is_owned_borrow(a) {
+      concat_all(["KaiValue *kai_bc", int_to_string(i), " = ",
+                  emit_expr(src, emit_owned_borrow_inner(a), cx), "; ", more])
+    } else { more }
+  }
+}
+
+# Replace each `__perceus_owned_borrow(g)` arg with a bare `EVar("bcN")`
+# referencing its temp; leave the rest untouched. (`bcN` is in `lcs` for the
+# re-emit, so it prints as `kai_bcN`.)
+fn emit_ob_rewrite_args(args_e: [Expr], i: Int) : [Expr] = match args_e {
+  []           -> []
+  [a, ...rest] -> {
+    let a2 = if emit_is_owned_borrow(a) {
+               Expr { kind: EVar(concat_all(["bc", int_to_string(i)])),
+                      line: a.line, col: a.col, ty: a.ty, mode: a.mode }
+             } else { a }
+    [a2, ...emit_ob_rewrite_args(rest, i + 1)]
+  }
+}
+
+fn emit_ob_drops(args_e: [Expr], i: Int) : String = match args_e {
+  []           -> ""
+  [a, ...rest] -> {
+    let more = emit_ob_drops(rest, i + 1)
+    if emit_is_owned_borrow(a) {
+      concat_all(["kai_decref(kai_bc", int_to_string(i), "); ", more])
+    } else { more }
   }
 }
 
@@ -2370,6 +2462,36 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_toggle: expected 2 args */"
+        }
+      } else if callee == "__perceus_apply_borrow" {
+        # issue #1130 — borrowing indirect call. perceus rewrites a
+        # `f(args)` through a `^`-borrowed function-typed param into
+        # `__perceus_apply_borrow(f, args...)`. `f` is invoked WITHOUT
+        # being consumed (`kai_apply_borrow`, no closure decref); the
+        # caller keeps the ref and drops after last use. Args keep the
+        # owned convention. The first arg is the closure value; the rest
+        # are the call arguments.
+        match args_e {
+          [fv, ...rest] -> {
+            let rest_args = emit_call_args(src, rest, cx)
+            concat_all([
+              "kai_apply_borrow(", emit_expr(src, fv, cx), ", ",
+              int_to_string(list_length(rest)),
+              ", (KaiValue *[]){", rest_args, "})"
+            ])
+          }
+          _ -> "kai_unit() /* __perceus_apply_borrow: expected closure + args */"
+        }
+      } else if callee == "__perceus_owned_borrow" {
+        # issue #1130 rule 1 — normally `emit_call_expr` intercepts a call
+        # whose ARG is `__perceus_owned_borrow(g)` and emits the closure +
+        # drop-after. Reaching here means this marker was NOT captured as
+        # such an arg (a rarer emit path, e.g. a pipe splice). Degrade
+        # transparently: emit the inner `g` (materialise the closure). The
+        # drop-after is skipped — a bounded leak, never a miscompile.
+        match args_e {
+          [g] -> emit_expr(src, g, cx)
+          _   -> "kai_unit() /* __perceus_owned_borrow: expected 1 arg */"
         }
       } else if string_contains_dot(callee) {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
