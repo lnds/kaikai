@@ -840,6 +840,11 @@ double kaix_take_real(KaiValue *v)  { return kai_take_real(v); }
    backend's `kai_take_enum` at construction (`{.i64 = kai_take_enum(...)}`);
    the decref is a no-op on the immortal singleton. */
 int64_t kaix_take_enum(KaiValue *v)  { return kai_take_enum(v); }
+/* Enum-slot unpack: re-box a kind-3 slot's immediate tag word into its
+   interned immortal singleton — the read half of `kaix_take_enum`. The
+   emitter's static-kind slot read (`KProjKind`) loads the raw word inline
+   and calls this instead of the mask-consulting `kaix_variant_arg`. */
+KaiValue *kaix_enum_slot_box(int64_t tag) { return kai_enum_slot_box(tag); }
 /* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
    the box→raw border for a boxed Bool reaching the raw i1 path. */
 int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
