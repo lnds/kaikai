@@ -124,6 +124,35 @@ Self-tail calls are MANDATORY-OPTIMISED (Tier 1 #2). A function
 whose final expression is a call to itself uses constant stack.
 Non-self tail calls do not generally get TCO.
 
+## Performance: `while`/`until` cost in a tight loop
+
+`while` and `until` take their predicate and body as lambdas, so each
+iteration pays two indirect closure calls. Worse, a `var` mutated inside
+those lambdas escapes into a closure, which disqualifies the `var`→stack-slot
+specialisation — the cell falls back to a dispatched `State` effect, so every
+read and write of the counter is an effect operation, not a load/store.
+
+For a tight numeric loop this is large. The same computation written as a
+direct self-tail-recursive function — where the accumulator is a plain
+parameter that never escapes — keeps the `var`→slot form and drops the
+closures, and runs on the order of tens of times faster in the current
+compiler.
+
+Rule of thumb: reach for `while`/`until` for readability and I/O-bound or
+coarse-grained loops; for a hot numeric inner loop, write a self-tail-recursive
+helper with the state as parameters:
+
+```kaikai
+fn go(n: Int, i: Int, acc: Int) : Int =
+  if i < n { go(n, i + 1, acc + i) } else { acc }
+
+fn main() : Int = go(1000, 0, 0)
+```
+
+The gap closes on its own once the small-function inliner fuses the loop
+combinator's lambdas at the call site (the same move Koka makes) — at which
+point the counter stops escaping and the slot form applies again.
+
 ## NOT IN KAIKAI
 
 - `break` / `continue` statements.
