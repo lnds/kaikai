@@ -1,0 +1,256 @@
+import compiler.ast
+
+# Vec surface rewrites: the AST-only halves of the Vec literal build
+# and the Vec-scrutinee match lowering. The typer owns the gates
+# (types, diagnostics, exhaustiveness) and synthesises what is built
+# here ONCE.
+
+# ---- node builders ----
+
+fn vs_var(nm: String, line: Int, col: Int) : Expr = mk_expr(EVar(nm), line, col)
+
+fn vs_int(n: Int, line: Int, col: Int) : Expr = mk_expr(EInt(n), line, col)
+
+fn vs_call(f: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(vs_var(f, line, col), args), line, col)
+
+fn vs_let(nm: String, rhs: Expr, line: Int, col: Int) : Stmt =
+  SLet(Pattern { pkind: PBind(nm), line: line, col: col }, None, rhs)
+
+# ---- Vec literal ----
+
+# The chain is built ALREADY TYPED (every call node carries `vty`) and
+# is never re-synthesised: the elements arrive typed from the element
+# check, and a re-synth would undo context retags (a Byte-minted `65`
+# reverts to Int). Same discipline as the fusion's composed lambda.
+#[doc("Build the typed `vec_reserve`/`vec_push` chain for a Vec-minted `[e1, ..., en]` literal — one pre-sized buffer, n in-place appends.")]
+pub fn vec_lit_build(elems: [Expr], vty: Ty, line: Int, col: Int) : Expr =
+  match elems {
+    [] -> with_ty(vs_call("vec_empty", [], line, col), vty)
+    _  -> {
+      let n = with_ty(vs_int(list_length(elems), line, col), TyInt)
+      let reserve = with_ty(vs_call("vec_reserve", [n], line, col), vty)
+      vec_lit_pushes(elems, reserve, vty, line, col)
+    }
+  }
+
+fn vec_lit_pushes(elems: [Expr], acc: Expr, vty: Ty, line: Int, col: Int) : Expr =
+  match elems {
+    [] -> acc
+    [x, ...rest] -> {
+      let push = with_ty(vs_call("vec_push", [acc, x], line, col), vty)
+      vec_lit_pushes(rest, push, vty, line, col)
+    }
+  }
+
+# ---- Vec-scrutinee match ----
+
+# A `match` over a `Vec[T]` whose arms are list patterns cannot ride
+# the cons/nil machinery: a vec is one flat node, not a spine. Instead
+# the typer rewrites the whole match into an `if`-chain of O(1) length
+# tests, `vec_get` element binds and ONE `vec_tail_from` slice per rest
+# binder — every downstream pass (perceus, tcrec, reuse, both emitters)
+# sees only standard lets, ifs and prims. The tail bind is an O(1)
+# view: consuming a unique view re-slices the same node in place, so a
+# `[h, ...t]` descent allocates nothing per level.
+
+# The supported arm shapes. Heads must be simple binders (`PBind` /
+# `PWild` / `PHole`) — a discriminating head would need arm fallthrough
+# out of an already-taken branch, which an if-chain cannot express.
+pub type VecArmKind
+  # `[a, b, ...rest]`: fixed head patterns + optional rest binder.
+  = VArmList([Pattern], Option[String])
+  # `name as [a, ...rest]`: bind the whole vec, then the list shape.
+  | VArmAs(String, [Pattern], Option[String])
+  # catch-all: `_`, a whole-vec binder, or `name as _`.
+  | VArmCatch(Option[String])
+  # anything else — the typer diagnoses and declines the rewrite.
+  | VArmUnsupported
+
+#[doc("Classify one Vec-match arm pattern into its supported shape (or `VArmUnsupported`).")]
+pub fn vec_arm_kind(p: Pattern) : VecArmKind =
+  match p.pkind {
+    PList(pats, rest) ->
+      if vec_heads_simple(pats) { VArmList(pats, rest) } else { VArmUnsupported }
+    PWild      -> VArmCatch(None)
+    PHole(_)   -> VArmCatch(None)
+    PBind(nm)  -> VArmCatch(Some(nm))
+    PAs(nm, inner) -> vec_as_arm_kind(nm, inner)
+    _ -> VArmUnsupported
+  }
+
+fn vec_as_arm_kind(nm: String, inner: Pattern) : VecArmKind =
+  match inner.pkind {
+    PList(pats, rest) ->
+      if vec_heads_simple(pats) { VArmAs(nm, pats, rest) } else { VArmUnsupported }
+    PWild -> VArmCatch(Some(nm))
+    _     -> VArmUnsupported
+  }
+
+fn vec_heads_simple(pats: [Pattern]) : Bool =
+  match pats {
+    [] -> true
+    [p, ...rest] -> match p.pkind {
+      PBind(_) -> vec_heads_simple(rest)
+      PWild    -> vec_heads_simple(rest)
+      PHole(_) -> vec_heads_simple(rest)
+      _        -> false
+    }
+  }
+
+#[doc("True when some arm pattern is a list shape — the trigger for the Vec-match rewrite.")]
+pub fn vec_match_has_list_arm(arms: [Arm]) : Bool =
+  match arms {
+    [] -> false
+    [Arm(p, _, _), ...rest] ->
+      if vec_pat_is_list(p) { true } else { vec_match_has_list_arm(rest) }
+  }
+
+fn vec_pat_is_list(p: Pattern) : Bool =
+  match p.pkind {
+    PList(_, _)   -> true
+    PAs(_, inner) -> vec_pat_is_list(inner)
+    _             -> false
+  }
+
+# Perceus identity invariant, load-bearing: every `EVar(vn)` use this
+# builder emits carries a DISTINCT (line, col) — perceus keys last-use
+# and move-at-last-use decisions on node positions, and a duplicated
+# position silently mis-plans RC. Each use takes the arm pattern's
+# position plus a small per-role column offset (test +0, as-bind +1,
+# element i +2+i, tail +2+n), all smaller than the pattern's own width.
+#
+# A bare `EVar` scrutinee is used DIRECTLY (no alias let): the borrowed
+# length/get reads discount to zero and the consuming `vec_tail_from`
+# re-thread is the param's single real consumer, which is exactly the
+# shape perceus moves raw — the unique view then re-slices in place.
+# An alias let would be multi-use and dup every read.
+#[doc("Build the if-chain replacing a Vec-scrutinee match. Arms must already be validated.")]
+pub fn vec_match_build(scr: Expr, arms: [Arm], line: Int, col: Int) : Expr =
+  match scr.kind {
+    EVar(nm) ->
+      if vec_match_binds_name(arms, nm) { vec_match_build_alias(scr, arms, line, col) }
+      else { vm_chain(arms, nm, line, col) }
+    _ -> vec_match_build_alias(scr, arms, line, col)
+  }
+
+# Complex scrutinee (or an arm binder shadowing the scrutinee name):
+# bind it once and chain over the alias. The alias is a multi-use let,
+# so its reads dup conservatively — correct, just not the zero-alloc
+# descent shape.
+fn vec_match_build_alias(scr: Expr, arms: [Arm], line: Int, col: Int) : Expr {
+  let vn = concat_all(["__vecm_", int_to_string(line), "_", int_to_string(col)])
+  let chain = vm_chain(arms, vn, line, col)
+  mk_expr(EBlock([vs_let(vn, scr, line, col)], Some(chain)), line, col)
+}
+
+# True when any arm binds `nm` (head, rest, as-name or catch-all) — the
+# direct-name chain would shadow the scrutinee mid-arm.
+fn vec_match_binds_name(arms: [Arm], nm: String) : Bool =
+  match arms {
+    [] -> false
+    [Arm(p, _, _), ...rest] ->
+      if vec_pat_binds_name(p, nm) { true } else { vec_match_binds_name(rest, nm) }
+  }
+
+fn vec_pat_binds_name(p: Pattern, nm: String) : Bool =
+  match p.pkind {
+    PBind(b)          -> b == nm
+    PAs(b, inner)     -> b == nm or vec_pat_binds_name(inner, nm)
+    PList(pats, rest) -> vec_rest_is(rest, nm) or vec_pats_bind_name(pats, nm)
+    _                 -> false
+  }
+
+fn vec_rest_is(rest: Option[String], nm: String) : Bool =
+  match rest { Some(r) -> r == nm  None -> false }
+
+fn vec_pats_bind_name(pats: [Pattern], nm: String) : Bool =
+  match pats {
+    [] -> false
+    [p, ...rest] ->
+      if vec_pat_binds_name(p, nm) { true } else { vec_pats_bind_name(rest, nm) }
+  }
+
+# The last arm becomes the bare else branch: exhaustiveness (validated
+# by the typer) guarantees a value that failed every earlier test
+# matches it.
+fn vm_chain(arms: [Arm], vn: String, line: Int, col: Int) : Expr =
+  match arms {
+    [only]       -> vm_arm_body(only, vn)
+    [a, ...rest] -> match a {
+      Arm(p, _, _) -> {
+        let alt = vm_chain(rest, vn, line, col)
+        mk_expr(EIf(vm_test(p, vn), vm_arm_body(a, vn), Some(alt)), p.line, p.col)
+      }
+    }
+    [] -> mk_expr(EUnit, line, col)
+  }
+
+# `vec_length(v) == n` for an exact arm, `>= n` for a rest arm. A
+# non-list arm mid-chain (catch-all before the end) always passes.
+fn vm_test(p: Pattern, vn: String) : Expr =
+  match vec_arm_kind(p) {
+    VArmList(pats, rest)  -> vm_len_test(pats, rest, vn, p)
+    VArmAs(_, pats, rest) -> vm_len_test(pats, rest, vn, p)
+    _                     -> mk_expr(EBool(true), p.line, p.col)
+  }
+
+fn vm_len_test(pats: [Pattern], rest: Option[String], vn: String, p: Pattern) : Expr {
+  let len_call = vs_call("vec_length", [vs_var(vn, p.line, p.col)], p.line, p.col)
+  let op = match rest { None -> "==" Some(_) -> ">=" }
+  mk_expr(EBinop(op, len_call, vs_int(list_length(pats), p.line, p.col)), p.line, p.col)
+}
+
+# One scrutinee-use var node with its per-role unique position.
+fn vm_scr_use(vn: String, p: Pattern, off: Int) : Expr =
+  vs_var(vn, p.line, p.col + off)
+
+# One arm's body: element binds (`vec_get`), the rest slice
+# (`vec_tail_from` — the scrutinee's LAST use on this path, so a moved
+# unique view re-slices in place), then the user body.
+fn vm_arm_body(a: Arm, vn: String) : Expr =
+  match a {
+    Arm(p, _, body) -> match vec_arm_kind(p) {
+      VArmList(pats, rest)   -> vm_block(vm_binds(pats, rest, vn, p), body, p)
+      VArmAs(nm, pats, rest) -> {
+        let as_bind = vs_let(nm, vm_scr_use(vn, p, 1), p.line, p.col)
+        vm_block([as_bind, ...vm_binds(pats, rest, vn, p)], body, p)
+      }
+      VArmCatch(Some(nm)) ->
+        vm_block([vs_let(nm, vm_scr_use(vn, p, 1), p.line, p.col)], body, p)
+      VArmCatch(None)     -> body
+      VArmUnsupported     -> body
+    }
+  }
+
+fn vm_block(binds: [Stmt], body: Expr, p: Pattern) : Expr =
+  match binds {
+    [] -> body
+    _  -> mk_expr(EBlock(binds, Some(body)), p.line, p.col)
+  }
+
+fn vm_binds(pats: [Pattern], rest: Option[String], vn: String, p: Pattern) : [Stmt] {
+  let heads = vm_head_binds(pats, 0, vn, p)
+  match rest {
+    None -> heads
+    Some(rnm) -> {
+      let n = list_length(pats)
+      let args = [vm_scr_use(vn, p, 2 + n), vs_int(n, p.line, p.col)]
+      let tail_call = vs_call("vec_tail_from", args, p.line, p.col)
+      list_append(heads, [vs_let(rnm, tail_call, p.line, p.col)])
+    }
+  }
+}
+
+fn vm_head_binds(pats: [Pattern], i: Int, vn: String, arm_p: Pattern) : [Stmt] =
+  match pats {
+    [] -> []
+    [p, ...rest] -> match p.pkind {
+      PBind(nm) -> {
+        let args = [vm_scr_use(vn, arm_p, 2 + i), vs_int(i, p.line, p.col)]
+        let get_call = vs_call("vec_get", args, p.line, p.col)
+        [vs_let(nm, get_call, p.line, p.col), ...vm_head_binds(rest, i + 1, vn, arm_p)]
+      }
+      _ -> vm_head_binds(rest, i + 1, vn, arm_p)
+    }
+  }

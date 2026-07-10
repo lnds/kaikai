@@ -966,6 +966,10 @@ KaiValue *kaix_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { retur
 KaiValue *kaix_prelude_vec_push(KaiValue *v, KaiValue *x)                { return kai_prelude_vec_push(v, x); }
 KaiValue *kaix_prelude_vec_length_borrow(KaiValue *v)                    { return kai_prelude_vec_length_borrow(v); }
 KaiValue *kaix_prelude_vec_get_borrow(KaiValue *v, KaiValue *i)          { return kai_prelude_vec_get_borrow(v, i); }
+KaiValue *kaix_prelude_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n)  { return kai_prelude_vec_slice(v, s, n); }
+KaiValue *kaix_prelude_vec_tail_from(KaiValue *v, KaiValue *s)           { return kai_prelude_vec_tail_from(v, s); }
+KaiValue *kaix_prelude_vec_reserve(KaiValue *n)                          { return kai_prelude_vec_reserve(n); }
+KaiValue *kaix_prelude_vec_from_list(KaiValue *xs)                       { return kai_prelude_vec_from_list(xs); }
 /* Vec raw element paths (compiler-fused): field read without record
  * rebuild, push/set of an unpacked record literal. */
 KaiValue *kaix_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx)        { return kai_vec_get_field(v, i, fidx); }

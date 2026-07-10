@@ -544,11 +544,23 @@ struct KaiValue {
          * or inline all-scalar records); len/cap live here so reads
          * never touch the block for bounds. Writes go through the
          * rc==1 uniqueness check: in place when unique, copy-on-write
-         * when shared — aliasing is never observable. */
+         * when shared — aliasing is never observable.
+         *
+         * A SLICE is a KAI_VEC whose `view_of` points at the owning
+         * vec node (never at another view — chains flatten on
+         * creation). For a view, `data` points at the view's FIRST
+         * ELEMENT inside the owner's block (not at the block start),
+         * `cap == len`, and the node holds one strong ref on the
+         * owner: a live slice pins the whole buffer, and the owner's
+         * rc > 1 disables its in-place writes until the slice dies.
+         * A view never owns element refs — the owner's free path
+         * releases them. Every write through a view copies first
+         * (kai_vec_ensure_unique treats any view as shared). */
         struct {
             int64_t     len;
             int64_t     cap;
             void       *data;
+            KaiValue   *view_of;
         } vec;
         /* KAI_REF: a single mutable cell. Owns one strong reference to
          * `cell`. ref_set drops the old cell and steals the new value;
@@ -619,11 +631,17 @@ typedef struct {
     const char *names[KAI_VEC_REC_MAX];       /* REC: field names (static) */
 } KaiVecMeta;
 
+/* Owner: `data` is the block start ([meta][elems]). View: `data` is
+ * the view's first element; the meta lives at the owner's block. Both
+ * accessors are the ONLY sanctioned way to reach a vec's meta/elements
+ * — direct `as.vec.data` arithmetic breaks on views. */
 static inline KaiVecMeta *kai_vec_meta(KaiValue *v) {
-    return (KaiVecMeta *) v->as.vec.data;
+    return (KaiVecMeta *) (v->as.vec.view_of ? v->as.vec.view_of->as.vec.data
+                                             : v->as.vec.data);
 }
 static inline char *kai_vec_elems(KaiValue *v) {
-    return (char *) v->as.vec.data + sizeof(KaiVecMeta);
+    return v->as.vec.view_of ? (char *) v->as.vec.data
+                             : (char *) v->as.vec.data + sizeof(KaiVecMeta);
 }
 
 /* ---------- Koka-style tagged-value Int representation ----------
@@ -3411,6 +3429,12 @@ static void kai_free_value(KaiValue *v) {
             free(v->as.arr.items);
             break;
         case KAI_VEC: {
+            /* A view owns nothing but its ref on the owner: release it
+             * and stop — elements and block belong to the owner. */
+            if (v->as.vec.view_of) {
+                kai_decref(v->as.vec.view_of);
+                break;
+            }
             /* Only boxed elements carry RC; raw / inline-record elements
              * are plain bytes freed with the block. The meta prefix and
              * the elements are ONE allocation (see kai_vec_meta). */
@@ -4465,6 +4489,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             KaiValue *c = kai_alloc(KAI_VEC);
             c->as.vec.len = len;
             c->as.vec.cap = len;
+            c->as.vec.view_of = NULL;
             c->as.vec.data = kai_heap_malloc(sizeof(KaiVecMeta) + (size_t) len * stride);
             *kai_vec_meta(c) = *m;
             memcpy(kai_vec_elems(c), kai_vec_elems(v), (size_t) len * stride);
@@ -5057,6 +5082,7 @@ static KaiValue *kai_vec_alloc(int64_t len, int64_t cap, const KaiVecMeta *src) 
     size_t bytes = sizeof(KaiVecMeta) + (size_t) cap * (size_t) stride;
     v->as.vec.len = len;
     v->as.vec.cap = cap;
+    v->as.vec.view_of = NULL;
     v->as.vec.data = kai_heap_malloc(bytes);
     if (src) *kai_vec_meta(v) = *src;
     else     memset(kai_vec_meta(v), 0, sizeof(KaiVecMeta));
@@ -5199,7 +5225,9 @@ static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
  * raw store on a shared buffer would silently corrupt a value another
  * reference is observing. */
 static KaiValue *kai_vec_ensure_unique(KaiValue *v, int64_t need_cap) {
-    if (!kai_check_unique(v)) {
+    /* A view is shared by construction: its bytes belong to the owner,
+     * so every write through it copies — even at node rc == 1. */
+    if (v->as.vec.view_of || !kai_check_unique(v)) {
         KaiValue *c = kai_vec_clone(v, need_cap);
         kai_decref(v);
         kai_vec_cow_total++;
@@ -5377,6 +5405,74 @@ static KaiValue *kai_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n,
     KaiVecMeta *m = kai_vec_meta(v);
     kai_vec_store_rec_fields(m, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride,
                              n, xs);
+    return v;
+}
+
+/* ---------- Vec slices: O(1) views over the shared buffer ----------
+ *
+ * A slice never copies elements: it is a fresh KAI_VEC node whose
+ * `view_of` holds one strong ref on the owner and whose `data` points
+ * at the first sliced element inside the owner's block. Consuming a
+ * UNIQUE view retargets it in place (no allocation) — a `[h, ...t]`
+ * descent re-slices the same node per level. An empty slice releases
+ * the source entirely, so a descent's pin dies exactly at `[]`. */
+
+static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    if (start < 0 || slen < 0 || start > len || slen > len - start) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "slice [%lld, +%lld] out of range (len=%lld)",
+                 (long long) start, (long long) slen, (long long) len);
+        kai_trap_abort(buf);
+    }
+    if (slen == 0) { kai_decref(v); return kai_vec_empty(); }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (v->as.vec.view_of && kai_check_unique(v)) {
+        v->as.vec.data = (char *) v->as.vec.data + (size_t) start * (size_t) m->stride;
+        v->as.vec.len = slen;
+        v->as.vec.cap = slen;
+        kai_vec_inplace_total++;
+        return v;
+    }
+    KaiValue *owner = v->as.vec.view_of ? v->as.vec.view_of : v;
+    KaiValue *s = kai_alloc(KAI_VEC);
+    s->as.vec.len = slen;
+    s->as.vec.cap = slen;
+    s->as.vec.data = kai_vec_elems(v) + (size_t) start * (size_t) m->stride;
+    s->as.vec.view_of = owner;
+    /* A view source hands its owner-ref over via incref+release; an
+     * owner source transfers the consumed ref directly. */
+    if (v->as.vec.view_of) { kai_incref(owner); kai_decref(v); }
+    return s;
+}
+
+/* `[h, ...t]`'s tail: everything from `start` on. */
+static KaiValue *kai_vec_tail_from_impl(KaiValue *v, int64_t start) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+    }
+    return kai_vec_slice_impl(v, start, v->as.vec.len - start);
+}
+
+/* Empty vec with `n` elements of capacity. Classification is still
+ * PENDING (stride 0), so the block holds only the meta; the first push
+ * classifies and grows the block to the reserved capacity in one
+ * realloc. */
+static KaiValue *kai_vec_reserve_impl(int64_t n) {
+    return kai_vec_alloc(0, n < 0 ? 0 : n, NULL);
+}
+
+/* Cons list -> vec, pre-sized to the list's length. Consumes `xs`. */
+static KaiValue *kai_vec_from_list_impl(KaiValue *xs) {
+    int64_t n = 0;
+    for (KaiValue *it = xs; it && kai_is_ptr(it) && it->tag == KAI_CONS; it = it->as.cons.tail) n++;
+    KaiValue *v = kai_vec_alloc(0, n, NULL);
+    for (KaiValue *it = xs; it && kai_is_ptr(it) && it->tag == KAI_CONS; it = it->as.cons.tail)
+        v = kai_vec_push_impl(v, kai_incref(it->as.cons.head));
+    kai_decref(xs);
     return v;
 }
 
@@ -6444,6 +6540,30 @@ static KaiValue *kai_prelude_vec_length_borrow(KaiValue *v) {
 static KaiValue *kai_prelude_vec_get_borrow(KaiValue *v, KaiValue *i) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     return kai_vec_get_impl(v, idx);
+}
+
+static KaiValue *kai_prelude_vec_slice(KaiValue *v, KaiValue *start, KaiValue *n) {
+    int64_t s = (kai_is_int(start)) ? kai_intf(start) : 0;
+    int64_t sl = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (start) kai_decref(start);
+    if (n) kai_decref(n);
+    return kai_vec_slice_impl(v, s, sl);      /* consumes v */
+}
+
+static KaiValue *kai_prelude_vec_tail_from(KaiValue *v, KaiValue *start) {
+    int64_t s = (kai_is_int(start)) ? kai_intf(start) : 0;
+    if (start) kai_decref(start);
+    return kai_vec_tail_from_impl(v, s);      /* consumes v */
+}
+
+static KaiValue *kai_prelude_vec_reserve(KaiValue *n) {
+    int64_t cap = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (n) kai_decref(n);
+    return kai_vec_reserve_impl(cap);
+}
+
+static KaiValue *kai_prelude_vec_from_list(KaiValue *xs) {
+    return kai_vec_from_list_impl(xs);        /* consumes xs */
 }
 
 /* ---------- prelude: refs (issue #257) ----------
