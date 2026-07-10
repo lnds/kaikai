@@ -26,6 +26,7 @@ import compiler.util
 import compiler.kir
 import compiler.kir_inline_clone
 import compiler.kir_inline_beta
+import compiler.kir_varslot
 
 # Inline cost ceilings: a template admits when its total statement count
 # is at most the ceiling of its class. Both at 0 disables the pass
@@ -53,13 +54,13 @@ pub fn kir_inline_program(kp: KProgram) : KProgram =
     let fns1  = match tmpls { [] -> kp.fns  _ -> kin_fn_loop(kp.fns, tmpls, []) }
     let lams  = kin_lam_collect(fns1, [])
     let fns2  = match lams { [] -> fns1 _ -> kin_beta_loop(fns1, lams, []) }
-    KProgram { types: kp.types, fns: fns2,
+    kvs_program(KProgram { types: kp.types, fns: fns2,
                handlers: kp.handlers,
                install_order: kp.install_order,
                defaults: kp.defaults,
                synth_defaults: kp.synth_defaults,
                regions: kp.regions,
-               runners: kp.runners }
+               runners: kp.runners })
   }
 
 fn kin_beta_loop(fs: [KFn], lams: [KinTmpl], acc: [KFn]) : [KFn] = match fs {
@@ -75,22 +76,26 @@ fn kin_collect(fs: [KFn], acc: [KinTmpl]) : [KinTmpl] = match fs {
 }
 
 fn kin_admit(f: KFn) : Bool = match f.kind {
-  KFnNormal ->
-    if f.stateful { false }
-    else if kin_region_some(f.region_id) { false }
-    else {
-      let loop_ = kin_has_tcrec(f.blocks)
-      let reuse = kin_has_reuse(f.blocks)
-      let maxb = if loop_ { kin_max_loop_blocks() }
-                 else if reuse { kin_max_reuse_blocks() } else { kin_max_blocks() }
-      let maxs = if loop_ { kin_max_loop_stmts() }
-                 else if reuse { kin_max_reuse_stmts() } else { kin_max_stmts() }
-      if list_length(f.blocks) < 1 or list_length(f.blocks) > maxb { false }
-      else if kin_count_stmts(f.blocks, 0) > maxs { false }
-      else { kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), false) }
-    }
-  _ -> false
+  KFnNormal -> kin_shape_ok(f) and kin_size_ok(f.blocks) and kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), false)
+  _         -> false
 }
+
+fn kin_shape_ok(f: KFn) : Bool = not f.stateful and not kin_region_some(f.region_id)
+
+# The ceiling of the template's class: loop templates (a pasted
+# self-loop) are tightest, reuse-carrying bodies widest.
+fn kin_size_ok(bs: [KBlock]) : Bool = {
+  let loop_ = kin_has_tcrec(bs)
+  let reuse = kin_has_reuse(bs)
+  let maxb = if loop_ { kin_max_loop_blocks() }
+             else if reuse { kin_max_reuse_blocks() } else { kin_max_blocks() }
+  let maxs = if loop_ { kin_max_loop_stmts() }
+             else if reuse { kin_max_reuse_stmts() } else { kin_max_stmts() }
+  kin_within(bs, maxb, maxs)
+}
+
+fn kin_within(bs: [KBlock], maxb: Int, maxs: Int) : Bool =
+  list_length(bs) >= 1 and list_length(bs) <= maxb and kin_count_stmts(bs, 0) <= maxs
 
 #[doc("True when any block ends in a `KTcrecGoto` (the template is a self-loop the paste re-creates with local registers).")]
 pub fn kin_has_tcrec(bs: [KBlock]) : Bool = match bs {
@@ -112,15 +117,15 @@ fn kin_lam_collect(fs: [KFn], acc: [KinTmpl]) : [KinTmpl] = match fs {
 }
 
 fn kin_lam_admit(f: KFn) : Bool = match f.kind {
-  KFnLambda ->
-    if f.stateful { false }
-    else if kin_region_some(f.region_id) { false }
-    else if list_length(f.blocks) < 1 or list_length(f.blocks) > kin_max_blocks() { false }
-    else if kin_count_stmts(f.blocks, 0) > kin_max_stmts() { false }
-    else if kin_has_tcrec(f.blocks) { false }
-    else if not kin_lam_origins_ok(f.params) { false }
-    else { kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), true) and kin_lam_alias_shape_ok(f) }
-  _ -> false
+  KFnLambda -> kin_lam_admissible(f)
+  _         -> false
+}
+
+fn kin_lam_admissible(f: KFn) : Bool = {
+  let sized = kin_shape_ok(f) and kin_within(f.blocks, kin_max_blocks(), kin_max_stmts())
+  let shaped = not kin_has_tcrec(f.blocks) and kin_lam_origins_ok(f.params)
+  let body = kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), true) and kin_lam_alias_shape_ok(f)
+  sized and shaped and body
 }
 
 fn kin_lam_origins_ok(ps: [KParam]) : Bool = match ps {

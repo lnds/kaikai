@@ -16,6 +16,7 @@
 import compiler.util
 import compiler.kir
 import compiler.kir_inline_clone
+import compiler.kir_uses
 
 # One resolvable closure binding: register name, lambda sym, capture atoms.
 pub type KinClo = KCl(String, String, [KVal])
@@ -128,9 +129,9 @@ fn kin_beta_scan(label: String, ss: [KStmt], term: KTerm, env: [KinClo],
                  lams: [KinTmpl], c: Int, pre_rev: [KStmt]) : KinBBlks = match ss {
   [] -> KBB([KBlock { label: label, stmts: list_reverse(pre_rev), term: term, region_id: None }], c)
   [s, ...rest] -> match kin_beta_site(s, env, lams) {
-    Some(hit) -> match hit { KBH(x, slot, cn, lam, caps, args, consuming, pos) -> {
+    Some(hit) -> match hit { KBH(x, slot, cn, lam, caps, vargs, consuming, pos) -> {
       let sfx  = cat2("$bt", int_to_string(c))
-      let ordered = kin_origin_args(lam.params, args, caps, [])
+      let ordered = kin_origin_args(lam.params, vargs, caps, [])
       let sub  = KinSub { pargs: kin_bind_boxed_args(lam.params, ordered, []),
                           sfx: sfx, params: lam.params, entry: kin_beta_entry(lam) }
       let plets = kin_param_lets(lam.params, ordered, sfx, false, pos, [])
@@ -155,22 +156,22 @@ fn kin_beta_scan(label: String, ss: [KStmt], term: KTerm, env: [KinClo],
 type KinBetaHit = KBH(String, KSlot, String, KFn, [KVal], [KVal], Bool, KPos)
 
 fn kin_beta_site(s: KStmt, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] = match s {
-  KLet(x, slot, KCallIndirect(KVar(cn), args), pos) ->
-    kin_beta_resolve(x, slot, cn, args, true, pos, env, lams)
-  KLet(x, slot, KCallIndirectBorrow(KVar(cn), args), pos) ->
-    kin_beta_resolve(x, slot, cn, args, false, pos, env, lams)
+  KLet(x, slot, KCallIndirect(KVar(cn), vargs), pos) ->
+    kin_beta_resolve(x, slot, cn, vargs, true, pos, env, lams)
+  KLet(x, slot, KCallIndirectBorrow(KVar(cn), vargs), pos) ->
+    kin_beta_resolve(x, slot, cn, vargs, false, pos, env, lams)
   _ -> None
 }
 
-fn kin_beta_resolve(x: String, slot: KSlot, cn: String, args: [KVal], consuming: Bool,
+fn kin_beta_resolve(x: String, slot: KSlot, cn: String, vargs: [KVal], consuming: Bool,
                     pos: KPos, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] =
   match kin_clo_find(env, cn) {
     None -> None
     Some(KCl(_, sym, caps)) -> match kin_tmpl_find(lams, sym) {
       None      -> None
       Some(lam) ->
-        if kin_beta_arity_ok(lam.params, args, caps) and kin_lam_alias_site_ok(lam, caps) {
-          Some(KBH(x, slot, cn, lam, caps, args, consuming, pos))
+        if kin_beta_arity_ok(lam.params, vargs, caps) and kin_lam_alias_site_ok(lam, caps) {
+          Some(KBH(x, slot, cn, lam, caps, vargs, consuming, pos))
         } else { None }
     }
   }
@@ -187,20 +188,20 @@ fn kin_beta_entry(f: KFn) : String = match f.blocks {
 
 # Each param must resolve through its origin: `PDirect(i)` within the
 # args, `PCapture(j)` within the captures.
-fn kin_beta_arity_ok(ps: [KParam], args: [KVal], caps: [KVal]) : Bool = match ps {
+fn kin_beta_arity_ok(ps: [KParam], vargs: [KVal], caps: [KVal]) : Bool = match ps {
   [] -> true
   [p, ...rest] -> match p.origin {
-    PDirect(i)  -> i >= 0 and i < list_length(args) and kin_beta_arity_ok(rest, args, caps)
-    PCapture(j) -> j >= 0 and j < list_length(caps) and kin_beta_arity_ok(rest, args, caps)
+    PDirect(i)  -> i >= 0 and i < list_length(vargs) and kin_beta_arity_ok(rest, vargs, caps)
+    PCapture(j) -> j >= 0 and j < list_length(caps) and kin_beta_arity_ok(rest, vargs, caps)
     _           -> false
   }
 }
 
 # The params in template order, each resolved to its site atom.
-fn kin_origin_args(ps: [KParam], args: [KVal], caps: [KVal], acc: [KVal]) : [KVal] = match ps {
+fn kin_origin_args(ps: [KParam], vargs: [KVal], caps: [KVal], acc: [KVal]) : [KVal] = match ps {
   [] -> list_reverse(acc)
-  [p, ...rest] -> kin_origin_args(rest, args, caps, [match p.origin {
-    PDirect(i)  -> kin_val_at(args, i)
+  [p, ...rest] -> kin_origin_args(rest, vargs, caps, [match p.origin {
+    PDirect(i)  -> kin_val_at(vargs, i)
     PCapture(j) -> kin_val_at(caps, j)
     _           -> KUnitV
   }, ...acc])
@@ -316,90 +317,9 @@ fn kin_caps_all_alias(caps: [KVal]) : Bool = match caps {
 fn kin_is_alias_name(n: String) : Bool =
   string_length(n) > 11 and string_slice(n, 0, 11) == "__alias_id_"
 
-# Any non-RC use of register `n` across the fn (op atoms, store values,
-# terminator atoms). The closure's own `KLet` and its dup/drop do not
-# count.
-fn kin_name_used(bs: [KBlock], n: String) : Bool = match bs {
-  []           -> false
-  [b, ...rest] -> kin_name_used_stmts(b.stmts, n) or kin_term_uses(b.term, n) or kin_name_used(rest, n)
-}
-
-fn kin_name_used_stmts(ss: [KStmt], n: String) : Bool = match ss {
-  []           -> false
-  [s, ...rest] -> kin_stmt_uses(s, n) or kin_name_used_stmts(rest, n)
-}
-
-fn kin_stmt_uses(s: KStmt, n: String) : Bool = match s {
-  KLet(_, _, op, _)   -> kin_op_uses(op, n)
-  KDo(op, _)          -> kin_op_uses(op, n)
-  KRC(_, _)           -> false
-  KStore(_, v, _)     -> kin_val_is(v, n)
-  KInstall(_, _, iv, _, _) -> match iv { Some(v) -> kin_val_is(v, n) None -> false }
-  _                   -> false
-}
-
-fn kin_op_uses(op: KOp, n: String) : Bool = match op {
-  KCall(_, vs)               -> kin_vals_use(vs, n)
-  KCallIndirect(f2, vs)      -> kin_val_is(f2, n) or kin_vals_use(vs, n)
-  KCallIndirectBorrow(f2, vs) -> kin_val_is(f2, n) or kin_vals_use(vs, n)
-  KPrim(_, vs)               -> kin_vals_use(vs, n)
-  KCon(_, _, _, inits)       -> kin_inits_use(inits, n)
-  KConReuse(_, d, _, _, inits) -> kin_val_is(d, n) or kin_inits_use(inits, n)
-  KRecord(fs)                -> kin_fields_use(fs, n)
-  KRecordReuse(d, fs)        -> kin_val_is(d, n) or kin_fields_use(fs, n)
-  KTokenSteal(v, _)          -> kin_val_is(v, n)
-  KProj(v, _)                -> kin_val_is(v, n)
-  KProjBorrow(v, _)          -> kin_val_is(v, n)
-  KProjKind(v, _, _)         -> kin_val_is(v, n)
-  KTagOf(v)                  -> kin_val_is(v, n)
-  KClosure(_, _, caps)       -> kin_vals_use(caps, n)
-  KPerform(_, _, vs)         -> kin_vals_use(vs, n)
-  KSetjmp(_, _)              -> false
-  KResumeOp(k, v)            -> kin_val_is(k, n) or kin_val_is(v, n)
-  KResume2Op(k, v, s2)       -> kin_val_is(k, n) or kin_val_is(v, n) or kin_val_is(s2, n)
-  KLitOp(v)                  -> kin_val_is(v, n)
-}
-
-fn kin_term_uses(t: KTerm, n: String) : Bool = match t {
-  KRet(v, _)              -> kin_val_is(v, n)
-  KCondBr(v, _, _, _)     -> kin_val_is(v, n)
-  KSwitch(v, _, _, _)     -> kin_val_is(v, n)
-  KTailCall(_, vs, _)     -> kin_vals_use(vs, n)
-  KTcrecGoto(_, asg, _, _) -> kin_asg_use(asg, n)
-  KTrmcStep(_, _, _, _, _, _, hs, asg, _, _) -> kin_vals_use(hs, n) or kin_asg_use(asg, n)
-  KTrmcApply(v, _)        -> kin_val_is(v, n)
-  _                       -> false
-}
-
-fn kin_asg_use(asg: [KAssign], n: String) : Bool = match asg {
-  []                   -> false
-  [KAsg(_, v), ...rest] -> kin_val_is(v, n) or kin_asg_use(rest, n)
-}
-
-fn kin_val_is(v: KVal, n: String) : Bool = match v {
-  KVar(m) -> m == n
-  _       -> false
-}
-
-fn kin_vals_use(vs: [KVal], n: String) : Bool = match vs {
-  []           -> false
-  [v, ...rest] -> kin_val_is(v, n) or kin_vals_use(rest, n)
-}
-
-fn kin_inits_use(inits: [KSlotInit], n: String) : Bool = match inits {
-  []            -> false
-  [si, ...rest] -> match si {
-    SIBoxed(v) -> kin_val_is(v, n) or kin_inits_use(rest, n)
-    SIInt64(v) -> kin_val_is(v, n) or kin_inits_use(rest, n)
-    SIReal(v)  -> kin_val_is(v, n) or kin_inits_use(rest, n)
-    SIEnum(v)  -> kin_val_is(v, n) or kin_inits_use(rest, n)
-  }
-}
-
-fn kin_fields_use(fs: [KFieldInit], n: String) : Bool = match fs {
-  []                   -> false
-  [KFI(_, v), ...rest] -> kin_val_is(v, n) or kin_fields_use(rest, n)
-}
+# Any non-RC use of register `n` across the fn (op atoms, store
+# values, terminator atoms). The closure's own dup/drop do not count.
+fn kin_name_used(bs: [KBlock], n: String) : Bool = kir_reg_used(bs, n, false)
 
 # Drop the dead closures' KLets and their dup/drop RC statements.
 fn kin_dce_rewrite(bs: [KBlock], dead: [String], acc: [KBlock]) : [KBlock] = match bs {
