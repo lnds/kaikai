@@ -71,6 +71,17 @@ Shipped exactly that, plus two pieces the plan implied but did not name:
 - **A stale kaic2 misled once**: a cosmetic fix looked ineffective because
   the harness had rebuilt kaic2 without the edit; the next harness run
   (which rebuilds) showed it working. FRESHNESS discipline is real.
+- **CI caught a type-level false positive the local suite did not**:
+  refinements composed with units of measure (`Real<USD> where >= 0.0`,
+  `m12_6_uom_refinement_show`). The inserted assert compared the
+  dimensioned binding against the predicate's unitless literal — a unit
+  mismatch in the typer, so a *valid* program stopped compiling. Neither
+  a value bug nor a golden-documenting-the-bug: a third failure class.
+  Fix: when the refined base is `TyDim`, the assert substitutes
+  `__strip_unit(self)` (typer-internal erasure, identity at runtime,
+  supported by both backends) — matching the documented semantics that
+  the predicate describes the numeric value and the unit the dimension.
+  Pinned by `refine_uom_param_runtime_violation`.
 
 ## Fixtures
 
