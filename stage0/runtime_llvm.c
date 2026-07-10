@@ -344,7 +344,7 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
  * (the `<Invalid operator>` verify failure the 5-arg form hit in the TRMC
  * spine). One mask source for construction, read, and the drop walker.
  * `kai_variant_u_fast` reads `kai_slot_mask_of(tag)` for the slot layout. */
-KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n,
+__attribute__((always_inline)) KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n,
                               KaiVarSlot *slots) {
     if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
     return kai_variant_u_fast(tag, n, slots);
@@ -767,7 +767,7 @@ KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int n,
  * slots, ptrtoint(ptr) for the rest. `kai_variant_at` re-registers
  * tag→mask, so a token-donated rebuild and a fresh alloc carry the same
  * mask. */
-KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name,
+__attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name,
                                  int n, int32_t mask, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
   return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
@@ -783,7 +783,7 @@ KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name,
  * `kaix_variant_masked` cell does — the 3-routes-or-none invariant.
  * `slots[0].ptr` carries the arm-top reuse token, `slots[1..n-1]` the real
  * payload words (raw i64 for a kind-1 Int slot, ptrtoint(ptr) for boxed). */
-KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n,
+__attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n,
                                    KaiVarSlot *slots) {
   return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1,
                                 (int32_t) kai_slot_mask_of(tag), slots + 1);
@@ -798,7 +798,7 @@ KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n,
  * real mask). Without the raw layout the reuse route wrote `.ptr` for a slot
  * the drop-walker (reading the tag's mask) treats as `.i64` — a tagged pointer
  * read as an integer (the rb-tree height divergence). */
-KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag,
+__attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag,
                                     const char *name, int n, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
   return kai_variant_reuse_at(scr, tag, name, n,
