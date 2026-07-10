@@ -75,6 +75,8 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns
   # `_kai_acc_hole`) when the body has a `KTrmcStep` — they must live in
   # the entry block to be visible across the goto-loop.
   nemit_trmc_allocas(ctx, f.blocks)
+  # Reserve the hidden cross-call donor slot when this fn takes one.
+  nemit_donor_alloca(ctx, f)
   # Reserve the `__evf` register in the entry head when the fn carries a
   # frame, so the seed can bind LLVM param 0 and a perform can load a slot.
   nemit_evf_alloca(ctx, f)
@@ -113,6 +115,8 @@ fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / 
     let evf_off = nfn_evf_extra(native_ctx_frame_slot_count(ctx, nfn_sym(f.sym)))
     if evf_off > 0 { nemit_store_reg(ctx, "__evf", llvm_get_param(fnval, 0)) } else { () }
     nemit_seed_params(ctx, f.params, fnval, evf_off)
+    # The hidden donor token is the trailing LLVM param.
+    if f.donor { nemit_store_reg(ctx, ndonor_reg(), llvm_get_param(fnval, evf_off + list_length(f.params))) } else { () }
   }
   NFnLambda -> nemit_seed_thunk_params(ctx, f.params, fnval)
   NFnClause -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
@@ -467,7 +471,10 @@ fn nemit_term(ctx: Handle, t: KTerm, ret: KSlot) : Unit / Console = match t {
   # raw register without boxing. A boxed-return fn (`ret` == SBoxed) keeps
   # the plain boxed `nemit_atom`. The lowering already lowers a raw-return
   # body raw (`lower_fn_body`), so `v` is a raw register / raw literal here.
-  KRet(v, _)            -> { llvm_build_ret(native_ctx_b(ctx), nemit_ret_value(ctx, v, ret)); () }
+  # A donor-capable fn frees an unconsumed cross-call token after the
+  # return value is materialised (the token is a dead shell whose children
+  # moved out, so the free cannot touch the result). No-op otherwise.
+  KRet(v, _)            -> { let rv = nemit_ret_value(ctx, v, ret); nemit_donor_free(ctx); llvm_build_ret(native_ctx_b(ctx), rv); () }
   KBr(l, _)             -> { llvm_build_br(native_ctx_b(ctx), native_ctx_find_block(ctx, l)); () }
   KCondBr(c, tl, el, _) -> nemit_condbr(ctx, c, tl, el)
   KSwitch(v, cs, def, _) -> nemit_switch(ctx, v, cs, def)
@@ -663,6 +670,9 @@ fn nemit_one_fn_thunk(ctx: Handle, f: KFn) : Unit / Console = {
   nemit_evf_call_push(ctx, nfn_sym(sym), ptb, ab)
   nemit_thunk_adapt_args(ctx, f.params, boxbuf, 0, ptb, ab)
   llvm_buf_free(boxbuf)
+  # A donation-capable target takes the trailing token; the thunk has no
+  # arm token to move, so it passes null (the runtime fresh-allocs).
+  if f.donor { let p = native_ctx_ptrt(ctx); llvm_buf_push(ptb, p); llvm_buf_push(ab, llvm_const_null(p)) } else { () }
   let r = ncall_finish(ctx, nfn_sym(sym), nslot_type(ctx, f.ret), ptb, ab)
   llvm_build_ret(native_ctx_b(ctx), nthunk_box_ret(ctx, r, f.ret))
   ()
