@@ -829,6 +829,25 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr
                               (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
+/* The MOVE twin of `kaix_variant_reuse_at_i64`, emitted only inside the
+ * dual fork's UNIQUE branch where the lowering statically neutralised the
+ * match-exit drop: overwrite in place and return the cell at rc==1 with NO
+ * survive-the-drop incref — the C backend's `_r = _scr; _scr = NULL`. The
+ * fresh-alloc fallback is a belt (uniqueness and arity are proven upstream
+ * by `kaix_check_unique` and the lowering's arity gate); if it ever fires,
+ * the neutralised exit drop leaks the donor rather than corrupting it. */
+__attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, KaiVarSlot *slots) {
+  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
+      scr->var_n_args == n && kai_check_unique(scr)) {
+    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
+    scr->variant_tag = tag;
+    kai_rc_reuse_total++;
+    return scr;
+  }
+  return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
+}
+
 /* Used by lambda thunks to read their captured values from the
    closure's self parameter. i is the capture's index. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }

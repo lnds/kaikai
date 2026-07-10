@@ -225,20 +225,56 @@ fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
 pub fn nemit_call_direct(ctx: Handle, sym: String, cargs: [KVal], fns: [KFn], dst: KSlot) : Handle / Console =
   match nfn_by_sym(fns, sym) {
     Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f, dst) }
-               else { nemit_call_boxed_evf(ctx, sym, cargs) }
+               else { nemit_call_boxed_evf(ctx, sym, cargs, f.donor) }
     None    -> nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs))
   }
 
+#[doc("""
+The reuse token a call to a donation-capable callee fills its hidden
+trailing param with: the caller's live `_arm_ru` MOVED out of its slot
+(read + null, so the arm epilogue free and any later donation see null),
+or a null token when this fn never captures one. The move is always sound
+— whichever consumer runs first wins, the rest fresh-alloc.
+""")]
+fn ndonate_token(ctx: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  if native_ctx_reg_slot(ctx, ntrmc_armru_reg()) < 0 { llvm_const_null(p) }
+  else {
+    let t = nemit_load_reg(ctx, ntrmc_armru_reg())
+    nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
+    t
+  }
+}
+
+#[doc("Reserve + null-seed the hidden donor register for a donation-capable fn (entry-block alloca; the param seed overwrites it).")]
+pub fn nemit_donor_alloca(ctx: Handle, f: KFn) : Unit / Console =
+  if f.donor {
+    let p = native_ctx_ptrt(ctx)
+    let a = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ndonor_reg(), ".addr"))
+    native_ctx_add_reg(ctx, ndonor_reg(), a, 0)
+    let _z = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), a)
+    ()
+  } else { () }
+
+#[doc("Free an unconsumed cross-call donor token on a fn exit path (null-safe shell-only free); a fn with no donor channel is a no-op.")]
+pub fn nemit_donor_free(ctx: Handle) : Unit / Console =
+  if native_ctx_reg_slot(ctx, ndonor_reg()) < 0 { () }
+  else {
+    let _d = nemit_call1(ctx, "kaix_reuse_free", nemit_load_reg(ctx, ndonor_reg()))
+    nemit_store_reg(ctx, ndonor_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
+  }
+
 # The all-boxed direct call with the evidence frame prepended when the
-# callee carries one; a frameless callee reduces to the legacy buffer. The
-# frame `ptr` is pushed first so it lands in the signature's leading slot.
-fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal]) : Handle / Console = {
+# callee carries one and the donor token appended when it takes one; a
+# frameless, donor-less callee reduces to the legacy buffer. The frame
+# `ptr` is pushed first so it lands in the signature's leading slot.
+fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal], dn: Bool) : Handle / Console = {
   let n = native_ctx_frame_slot_count(ctx, sym)
-  if n > 0 {
+  if n > 0 or dn {
     let buf = llvm_buf_new()
-    let frame = nemit_evf_build_frame(ctx, sym, n)
-    llvm_buf_push(buf, frame)
+    if n > 0 { let frame = nemit_evf_build_frame(ctx, sym, n); llvm_buf_push(buf, frame) } else { () }
     nemit_push_atoms(ctx, buf, cargs)
+    if dn { let tok = ndonate_token(ctx); llvm_buf_push(buf, tok) } else { () }
     let r = nemit_call_boxed(ctx, ncall_sym(sym), buf); llvm_buf_free(buf); r
   } else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
 }
@@ -266,6 +302,8 @@ fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, dst: KSlot) :
   # matches the definition's leading `ptr __evf`.
   nemit_evf_call_push(ctx, sym, ptb, ab)
   nemit_raw_args(ctx, f.params, cargs, ptb, ab)
+  # A donation-capable callee takes the trailing reuse token.
+  if f.donor { llvm_buf_push(ptb, native_ctx_ptrt(ctx)); let tok = ndonate_token(ctx); llvm_buf_push(ab, tok) } else { () }
   let r = ncall_finish(ctx, sym, nslot_type(ctx, f.ret), ptb, ab)
   match dst {
     SBoxed -> nemit_box_ret(ctx, r, f.ret)
@@ -1009,13 +1047,24 @@ fn nemit_con_reuse(ctx: Handle, rk: KReuseKind, d: KVal, tag: Int, nm: String, i
     RkVariant -> { let scr = nemit_atom(ctx, d); nemit_variant_reuse_call(ctx, scr, tag, nm, inits) }
     RkCons    -> { let scr = nemit_atom(ctx, d); nemit_cons_reuse_call(ctx, scr, nemit_init_buf(ctx, inits)) }
     RkTokenVariant -> nemit_con_at(ctx, d, tag, nm, inits)
+    RkDonorVariant -> nemit_con_donor(ctx, tag, nm, inits)
+    # The unique-branch in-place MOVE: no survive-the-exit-drop incref (the
+    # lowering rebound the exit-drop register to unit).
+    RkVariantMove -> { let scr = nemit_atom(ctx, d); nemit_variant_reuse_call_sym(ctx, "kaix_variant_reuse_move_i64", scr, tag, nm, inits) }
   }
 
 # `kaix_variant_reuse_at_i64(ptr scr, i32 tag, i8* name, i32 n, i64* slots)` —
 # the Koka move-semantics variant reuse over the `[n x i64]` word buffer. No
 # mask arg: the runtime reads the tag's registered mask, so a reused and a fresh
 # RBNode carry key/value identically (one mask source, narrow CallInst).
-fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
+fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console =
+  nemit_variant_reuse_call_sym(ctx, "kaix_variant_reuse_at_i64", scr, tag, nm, inits)
+
+# The shared (scr, tag, name, n, slots) reuse-call shape behind both runtime
+# entries: `kaix_variant_reuse_at_i64` (single body, increfs to survive the
+# match-exit drop) and `kaix_variant_reuse_move_i64` (unique-branch move, no
+# incref — the exit drop was neutralised).
+fn nemit_variant_reuse_call_sym(ctx: Handle, sym: String, scr: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
@@ -1023,7 +1072,7 @@ fn nemit_variant_reuse_call(ctx: Handle, scr: Handle, tag: Int, nm: String, init
   let argarr = nemit_i64_slot_array(ctx, inits)
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
   let ab = llvm_buf_new(); llvm_buf_push(ab, scr); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
-  ncall_finish(ctx, "kaix_variant_reuse_at_i64", p, ptb, ab)
+  ncall_finish(ctx, sym, p, ptb, ab)
 }
 
 # `RkTokenVariant`: rebuild a ctor INTO a donated reuse token (fresh alloc when
@@ -1036,6 +1085,22 @@ fn nemit_con_at(ctx: Handle, tok: KVal, tag: Int, nm: String, inits: [KSlotInit]
   let tokv = nemit_atom(ctx, tok)
   let tokw = llvm_build_ptrtoint(native_ctx_b(ctx), tokv, native_ctx_i64t(ctx))
   nemit_variant_at_masked_call(ctx, tag, nm, tokw, inits)
+}
+
+# `RkDonorVariant`: rebuild a ctor INTO the fn's cross-call donor token,
+# consuming the `__donor` slot linearly (read + null — a later site sees
+# null and fresh-allocs). A fn with no donor channel passes a zero word,
+# so the runtime takes its fresh-alloc branch — the mark degrades soundly.
+fn nemit_con_donor(ctx: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
+  let i64t = native_ctx_i64t(ctx)
+  if native_ctx_reg_slot(ctx, ndonor_reg()) < 0 {
+    nemit_variant_at_masked_call(ctx, tag, nm, llvm_const_int(i64t, 0), inits)
+  } else {
+    let t = nemit_load_reg(ctx, ndonor_reg())
+    nemit_store_reg(ctx, ndonor_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
+    let tokw = llvm_build_ptrtoint(native_ctx_b(ctx), t, i64t)
+    nemit_variant_at_masked_call(ctx, tag, nm, tokw, inits)
+  }
 }
 
 # `kaix_variant_at_argv_masked(i32 tag, i8* name, i32 n, i32 mask, i64* slots)`
