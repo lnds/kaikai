@@ -427,40 +427,25 @@ int32_t kaix_variant_tag_of(KaiValue *v) {
    forced per-destination accounting the bind-site could not do (a
    ctor-bound survivor needs +1 over the cascade, a TRMC recursive-child
    that br's to the loop needs a bare move) and leaked. Borrow collapses
-   both to one rule, identical to the C backend.
-
-   Typed slots (Int/Real, mask!=0 — runtime-minted only; the LLVM
-   codegen now reads kind-1 Int slots raw via kaix_to_int) still return
-   the freshly-boxed OWNING temporary: the bind consumes it like the C
-   `is_alias=false` path, no extra ref to balance. */
+   both to one rule, identical to the C backend. */
 KaiValue *kaix_variant_arg(KaiValue *v, int i) {
-    /* Issue #126 / #622 (Cluster F) — variant slot must honor the
-     * `slot_mask`. The LLVM emitter always *builds* variants with
-     * mask==0 (all boxed pointers, see `kaix_variant` above), so for
-     * everything the codegen mints `.ptr` is correct. Since #741 moved
-     * Int variant slots to the tagged-`kai_int` boxed representation,
-     * the C runtime's own constructors (notably `Exited(Int)` /
-     * `Signaled(Int)` from the Process default handler,
-     * runtime.h §`_kai_process_make_exit_exited`) also mint boxed
-     * slots with mask==0, so this accessor's `.ptr` path covers them
-     * directly. The mask-honoring branch below stays as a defensive
-     * accessor for any future runtime-minted typed slot (mask!=0):
-     * reading a typed slot via `.ptr` would reinterpret the raw scalar
-     * as a pointer and feed garbage into the match arm.
-     * `kai_variant_slot_box` is exactly the boxed-view accessor the C
-     * backend uses (`slot_read_for_test` in emit_c.kai); route through
-     * it so both backends agree on any runtime-minted typed-slot variant.
+    /* The slot mask discriminates the read: any typed slot (Int / Real /
+     * enum) re-boxes through `kai_variant_slot_box` — the SAME boxed-view
+     * accessor the C backend uses (`slot_read_for_test`) — so a raw word
+     * is never dereferenced as a pointer.
      *
-     * Ownership: `kai_variant_slot_box` returns a borrowed pointer for
-     * pointer slots and a freshly-allocated boxed temporary (rc==1)
-     * for typed slots. The LLVM path keeps ownership uniform (caller
-     * owns the returned cell), so incref only the borrowed pointer-slot
-     * case; the typed-slot temporary already arrives owned. */
+     * Ownership: a pointer slot returns a BORROW (no incref — the cell
+     * still owns the child; the bind-site dup covers a survivor). A typed
+     * slot returns an owned view with no ref to balance: Int is a tagged
+     * immediate, an enum slot re-interns its immortal singleton, and a
+     * Real slot mints a fresh rc==1 box the bind consumes (the C
+     * `is_alias=false` path — such binders are excluded from the
+     * bind-site dup set). */
     uint32_t k = kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i);
-    if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_REAL) {
+    if (k != KAI_VAR_SLOT_PTR) {
         return kai_variant_slot_box(v, i);
     }
-    return kai_var_slots(v)[i].ptr;   /* #747 — borrow (no incref) */
+    return kai_var_slots(v)[i].ptr;   /* borrow (no incref) */
 }
 
 /* i64-inline parity (#747) — read a kind-1 Int (or kind-3 enum) slot as a
@@ -840,6 +825,11 @@ KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_fie
    oracle does. */
 double kaix_real_field(KaiValue *v) { return v->as.r; }
 double kaix_take_real(KaiValue *v)  { return kai_take_real(v); }
+/* Enum-slot pack: read the variant_tag of a (nullary, interned) enum value
+   and release the box — the word a kind-3 slot stores. Mirror of the C
+   backend's `kai_take_enum` at construction (`{.i64 = kai_take_enum(...)}`);
+   the decref is a no-op on the immortal singleton. */
+int64_t kaix_take_enum(KaiValue *v)  { return kai_take_enum(v); }
 /* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
    the box→raw border for a boxed Bool reaching the raw i1 path. */
 int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
