@@ -325,13 +325,18 @@ three coupled pieces:
   slot-rewritten 0.36 s (**5.5×**). Hand-written tail-rec sits at
   0.167 s; the residual is boxed slot arithmetic (get dups a box, set
   re-mints — a raw-slot follow-up would close it).
-- **rb-tree 1M native**: balance_left/right + is_red inline into
-  insert_loop (KIR shows zero balance calls; con-reuse machinery pasted
-  intact). Wall moves ~3% (median 0.394 s vs 0.407 s identity, 4/5 runs
-  faster). The lever the issue chased was never call overhead: it is
-  cross-call token donation (#1164, in flight in parallel). The paste
-  is the ENABLER — once the donor rides the caller's frame, the pasted
-  `con Node` sits next to the live `_arm_ru` for a later peephole.
+- **rb-tree 1M native**: measured twice, on either side of #1164
+  landing. Pre-#1164, balance_left/right + is_red inlined into
+  insert_loop (KIR showed zero balance calls, con-reuse machinery
+  pasted intact) and moved the wall ~3%. Post-rebase onto #1164,
+  `balance_*` are donation-capable (`KFn.donor`) and the lane EXCLUDES
+  them: the donor channel is a hidden trailing param + an implicit
+  `donor-variant` slot — fn-wide state a paste cannot re-home, and
+  inlining the call would silently drop the cross-call donation that
+  IS the rb-tree lever (1.27×→1.13× in #1164). With donation preserved
+  on the call, rb-tree lands flat under the inliner (0.333 s vs
+  0.337 s identity, within noise) and the #1164/#1104 donation
+  counters stay intact through the pass.
 - **Native self-compile**: 11.88 s vs 11.92 s identity — ~0% (the KIR
   walk is milliseconds; LLVM codegen dominates).
 - **C backend**: byte-identical emission (KIR feeds only native), the
@@ -355,6 +360,17 @@ three coupled pieces:
 - **The mac 872 leak gate is red on main** (leaked=1204, identical on
   a clean main worktree) — a pre-existing mac-local escape, not a lane
   regression; CI ubuntu is the gate of record.
+- **The natively-built compiler hangs on op-call programs — on main
+  too.** `kaic2-native` (linked from `--emit=native main.kai`) times
+  out compiling a `Stdout.print` hello-world under BOTH `--emit=c` and
+  `--emit=native`, at identity thresholds and on a clean main
+  worktree alike. The shape: `effs_declaring_op`'s short-circuit `and`
+  lowers to the KIR's STRICT `prim and`, turning a linear walk
+  exponential (2^|op table|) — visible only in the native-built
+  binary's inference of a direct op call; the selfhost gate's
+  `println` probe dodges that path, which is why the gate stays green
+  (the documented `--emit=c` blindspot). Pre-existing; the inliner
+  neither causes nor fixes it.
 
 ### Fixtures added
 
@@ -369,10 +385,12 @@ three coupled pieces:
 
 ### Follow-ups left
 
+- The donation-capable class (post-#1164 `balance_*`) stays un-inlined
+  by design; a KIR-level donation-aware paste (rewiring `donor-variant`
+  to the caller's live `_arm_ru`) is the only way to have both.
+
 - Raw var slots: the rewritten cell is a boxed register; a slot-typed
   cell (i64 when the init and all sets are Int) would close most of the
   2.2× residual vs hand-written tail-rec.
-- KIR-level donation peephole once #1164 lands: route the pasted
-  fresh `con` through the caller's live `_arm_ru` (the rb-tree lever).
 - `KDo`-bound and tail-call inline sites stay unadmitted (KLet sites
   only), as does the multi-cell same-alias shape (bails).
