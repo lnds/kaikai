@@ -27,6 +27,7 @@ import compiler.infer_index
 import compiler.lit_mint
 import compiler.unit_walk
 import compiler.pipe_fusion
+import compiler.vec_surface
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -3420,6 +3421,10 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "vec_get",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt],                   tv(0))) },
     TyEntry { name: "vec_set",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt, tv(0)],     TyCon(None, "Vec", [tv(0)]))) },
     TyEntry { name: "vec_push",   scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), tv(0)],            TyCon(None, "Vec", [tv(0)]))) },
+    TyEntry { name: "vec_slice",  scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt, TyInt],     TyCon(None, "Vec", [tv(0)]))) },
+    TyEntry { name: "vec_tail_from", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt],         TyCon(None, "Vec", [tv(0)]))) },
+    TyEntry { name: "vec_reserve", scheme: scheme([0], fn_ty([TyInt],                                        TyCon(None, "Vec", [tv(0)]))) },
+    TyEntry { name: "vec_from_list", scheme: scheme([0], fn_ty([TyListT(tv(0))],                             TyCon(None, "Vec", [tv(0)]))) },
     # mailbox runtime — type-erased entries (Msg flows
     # through TyAny). The polymorphic surface is in stdlib/actor.kai
     # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
@@ -9965,7 +9970,50 @@ fn synth_threaded_arg(st: InferState, x: Expr,
       }
       None -> synth(st, x)
     }
-  } else { synth(st, x) }
+  } else {
+    match exp {
+      Some(et) ->
+        if arg_wants_vec_context(x, et) {
+          check_expr_against(st, x, et, "argument", x.line, x.col)
+        } else { synth(st, x) }
+      None -> synth(st, x)
+    }
+  }
+
+# A list literal / map-pipe chain in a Vec-typed parameter slot takes
+# the bidirectional check path so it mints / collects — a plain synth
+# would build the cons list and fail unification.
+fn arg_wants_vec_context(x: Expr, et: Ty) : Bool =
+  if ty_is_vec_head(et) {
+    match x.kind {
+      EList(_)       -> true
+      EMapPipe(_, _) -> true
+      _              -> false
+    }
+  } else { false }
+
+# `synth_many` with the callee's declared params threaded per position,
+# ONLY to route Vec-context args (literal / collect) through the
+# bidirectional check; every other arg keeps the plain synth path.
+fn synth_many_vec_args(st: InferState, es: [Expr],
+                       param_tys: [Ty]) : InferredList / Console + File + Mutable {
+  match es {
+    [] -> InferredList { st: st, tys: [], exprs: [] }
+    [x, ...rest] -> {
+      let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
+      let prest = match param_tys { [_, ...pr] -> pr  _ -> [] }
+      let r = match exp {
+        Some(et) ->
+          if arg_wants_vec_context(x, et) {
+            check_expr_against(st, x, et, "argument", x.line, x.col)
+          } else { synth(st, x) }
+        None -> synth(st, x)
+      }
+      let rr = synth_many_vec_args(r.st, rest, prest)
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+    }
+  }
+}
 
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -9992,7 +10040,14 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             Some(inf) -> inf
             None -> {
             let rc = synth(st_p, callee)
-            let ra = synth_many(rc.st, args_)
+            # pair each arg with its declared param so a Vec-typed
+            # param mints an EList / collects a map-pipe chain — the
+            # argument-position face of the annotation-context rules.
+            let vparams = match apply_ty(rc.st.sub, rc.ty) {
+              TyFnT(ps, _, _) -> ps
+              _               -> []
+            }
+            let ra = synth_many_vec_args(rc.st, args_, vparams)
             let rv = st_fresh_ty(ra.st)
             # build the expected function type with an *open*
             # row (a fresh row variable in the tail) so that calling a
@@ -11326,16 +11381,37 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
 
   let probe = synth(st, coll)
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
-  let callee = match coll_ty {
-    TyCon(_, name, _) ->
-      if name == "Map"          { mk_expr(EModCall("map", "get"), line, col) }
-      else if name == "HashMap" { mk_expr(EModCall("hashmap", "get"), line, col) }
-      else                      { mk_expr(EVar("array_get"), line, col) }
-    _ -> mk_expr(EVar("array_get"), line, col)
+  match coll_ty {
+    TyCon(_, cname, _) ->
+      if cname == "Vec" { synth_vec_index(probe.st, coll, ix, line, col) }
+      else {
+        let callee =
+          if cname == "Map"          { mk_expr(EModCall("map", "get"), line, col) }
+          else if cname == "HashMap" { mk_expr(EModCall("hashmap", "get"), line, col) }
+          else                       { mk_expr(EVar("array_get"), line, col) }
+        synth(st, mk_expr(ECall(callee, [coll, ix]), line, col))
+      }
+    _ -> synth(st, mk_expr(ECall(mk_expr(EVar("array_get"), line, col), [coll, ix]), line, col))
   }
-  let call_node = mk_expr(ECall(callee, [coll, ix]), line, col)
-  synth(st, call_node)
 }
+
+# `xs[i]` on a Vec reads the element; `xs[a..b]` (inclusive, like the
+# range literal) is the O(1) slice — the same view `[h, ...t]` binds.
+fn synth_vec_index(st: InferState, coll: Expr, ix: Expr,
+                   line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match ix.kind {
+    ERange(a, b, None) -> {
+      let slen = mk_expr(EBinop("+", mk_expr(EBinop("-", b, a), line, col),
+                                mk_expr(EInt(1), line, col)),
+                         line, col)
+      synth(st, mk_expr(ECall(mk_expr(EVar("vec_slice"), line, col), [coll, a, slen]), line, col))
+    }
+    ERange(_, _, Some(_)) -> {
+      diag_error(st.file, line, col, "a stepped range cannot slice a Vec — a slice is one contiguous view")
+      mk_inferred(st_bump_err(st), TyAny, with_ty(mk_expr(EIndex(coll, ix), line, col), TyAny))
+    }
+    _ -> synth(st, mk_expr(ECall(mk_expr(EVar("vec_get"), line, col), [coll, ix]), line, col))
+  }
 
 # Binop typing is deliberately coarse: numeric operators unify their
 # two operands and return the shared type (usually `Int`); comparison
@@ -13992,8 +14068,15 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
-          # literals can be retagged to Byte when expected is [Byte].
+          # literals can be retagged to Byte when expected is [Byte]
+          # (and a Vec annotation mints the literal to a vec build).
           EList(_) -> {
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
+            check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
+          }
+          # a Vec-annotated map-pipe chain collects into the vec
+          # (pre-sized when the head is a pure range).
+          EMapPipe(_, _) -> {
             let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind)
             check_expr_against(amb_st, rhs, exp_resolved, "let annotation", pat.line, pat.col)
           }
@@ -14720,6 +14803,9 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
 
   let st0 = check_arms_redundancy(st, arms, [], false, line, col)
   let rs_ = synth(st0, scr)
+  if vec_match_route(apply_ty(rs_.st.sub, rs_.ty), arms) {
+    synth_vec_match(rs_.st, scr, arms, None, line, col)
+  } else {
   let rv = st_fresh_ty(rs_.st)
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
   let ty = apply_ty(ra.st.sub, rv.ty)
@@ -14746,6 +14832,7 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let arms_codegen = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+  }
 }
 
 # bidirectional check variant of `synth_match`. When the
@@ -14765,6 +14852,9 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 
   let st0 = check_arms_redundancy(st, arms, [], false, line, col)
   let rs_ = synth(st0, scr)
+  if vec_match_route(apply_ty(rs_.st.sub, rs_.ty), arms) {
+    synth_vec_match(rs_.st, scr, arms, Some(expected), line, col)
+  } else {
   # walk arms via `check_arms` so the expected type
   # propagates into nested EMatch / EIf / EBlock-tailed-by-match
   # arm bodies — the shape produced by the multi-clause fn-body
@@ -14781,6 +14871,93 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
+  }
+}
+
+# A match routes through the Vec rewrite when the scrutinee resolved to
+# `Vec[T]` and some arm is list-shaped. List arms over a Vec never reach
+# the cons/nil machinery: `synth_vec_match` rebuilds the whole match as
+# an if-chain over `vec_length` / `vec_get` / `vec_tail_from`.
+fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
+  match scr_ty {
+    TyCon(_, name, _) -> name == "Vec" and vec_match_has_list_arm(arms)
+    _                 -> false
+  }
+
+type VecMatchGate = { st: InferState, ok: Bool }
+
+# The rewrite's contract, diagnosed before building: no guards, heads
+# are simple binders, and the arms cover every length (a catch-all, or
+# `[]` plus a spread arm — the list-exhaustiveness rule).
+fn vec_match_validate(st: InferState, arms: [Arm], line: Int, col: Int) : VecMatchGate / Console + File {
+  let g = vec_match_check_arms(st, arms)
+  let exhaustive = any_arm(arms, vec_arm_catchall) or
+                   (any_arm(arms, arm_pat_empty_list) and any_arm(arms, arm_pat_spread_list))
+  if exhaustive { g }
+  else {
+    diag_error(g.st.file, line, col,
+      "non-exhaustive match on Vec: cover both `[]` and a spread pattern (`[_, ...rest]`), or add a wildcard `_` arm")
+    VecMatchGate { st: st_bump_err(g.st), ok: false }
+  }
+}
+
+fn vec_arm_catchall(a: Arm) : Bool =
+  match a {
+    Arm(p, guard, _) -> match guard {
+      Some(_) -> false
+      None -> match vec_arm_kind(p) {
+        VArmCatch(_) -> true
+        _            -> false
+      }
+    }
+  }
+
+fn vec_match_check_arms(st: InferState, arms: [Arm]) : VecMatchGate / Console + File =
+  match arms {
+    [] -> VecMatchGate { st: st, ok: true }
+    [Arm(p, guard, _), ...rest] -> {
+      let g1 = match guard {
+        None -> VecMatchGate { st: st, ok: true }
+        Some(gx) -> {
+          diag_error(st.file, gx.line, gx.col,
+            "guards are not supported on Vec match arms")
+          diag_help("test the condition with `if` inside the arm body")
+          VecMatchGate { st: st_bump_err(st), ok: false }
+        }
+      }
+      let g2 = match vec_arm_kind(p) {
+        VArmUnsupported -> {
+          diag_error(g1.st.file, p.line, p.col,
+            "Vec match arms support `[]` / `[a, b, ...rest]` with simple binders, and a catch-all")
+          diag_help("bind the element and match it separately: `[h, ...t] -> match h { ... }`")
+          VecMatchGate { st: st_bump_err(g1.st), ok: false }
+        }
+        _ -> g1
+      }
+      let dup_st = check_pattern_no_dup_binds(g2.st, p)
+      let g2b = VecMatchGate { st: dup_st, ok: g2.ok and dup_st.errs == g2.st.errs }
+      let gr = vec_match_check_arms(g2b.st, rest)
+      VecMatchGate { st: gr.st, ok: g2b.ok and gr.ok }
+    }
+  }
+
+# Rewrite a Vec-scrutinee match into the vec_match if-chain and type it
+# ONCE (check-mode when an expected type is in play). The scrutinee was
+# already synthesised to learn its type; the returned state is threaded
+# so its fresh-tvar mints stay bound — the chain re-synthesises the raw
+# scrutinee node under that same state.
+fn synth_vec_match(st: InferState, scr: Expr, arms: [Arm], expected: Option[Ty],
+                   line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let g = vec_match_validate(st, arms, line, col)
+  if g.ok {
+    let chain = vec_match_build(scr, arms, line, col)
+    match expected {
+      None    -> synth(g.st, chain)
+      Some(t) -> check_expr_against(g.st, chain, t, "match arm", line, col)
+    }
+  } else {
+    mk_inferred(g.st, TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
+  }
 }
 
 # bidirectional walker over match arms. Mirrors
@@ -14909,8 +15086,23 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
     # element type is TyByte.
     EList(els) -> match apply_ty(st.sub, expected) {
       TyListT(elem_ty) -> check_list_elems_against(st, els, elem_ty, e.line, e.col)
+      # Vec-context minting (the #1091 shape for containers): the
+      # literal builds a pre-sized vec instead of a cons list. A BARE
+      # literal keeps denoting the cons list — only annotation /
+      # argument context reaches here.
+      TyCon(_, hname, hargs) ->
+        if hname == "Vec" { check_vec_lit_against(st, els, hargs, e.line, e.col) }
+        else { synth(st, e) }
       _                -> synth(st, e)
     }
+    # Vec-context pipeline collect: a map-pipe chain in Vec-expected
+    # position collects into a vec. Pure range-headed chains rewrite to
+    # the pre-sized collect combinator (one buffer, zero intermediates);
+    # anything else materialises once through `vec_from_list`.
+    EMapPipe(_, _) ->
+      if ty_is_vec_head(apply_ty(st.sub, expected)) {
+        check_map_pipe_vec_collect(st, e, e.line, e.col)
+      } else { synth(st, e) }
     # annotation-driven ctor disambiguation. When
     # the expected type is `TyCon(_, parent, _)` and the callee is a bare
     # `EVar(cname)` whose qualified `parent::cname` scheme exists,
@@ -15137,6 +15329,86 @@ fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
 # element type. For plain `EInt(n)` literals expected to be Byte,
 # validate 0..255 and retag the node as TyByte; the emitter handles
 # the kai_byte(...) lowering.
+fn ty_is_vec_head(t: Ty) : Bool =
+  match t {
+    TyCon(_, name, _) -> name == "Vec"
+    _                 -> false
+  }
+
+# `[e1, ..., en]` under a `Vec[T]` expectation: coin numeric elements
+# against `T` (the #1091 lattice), check the rest against `T` (Byte
+# retag included), then hand the TYPED elements to the typed chain
+# build — never re-synthesised, so retags survive. The caller's
+# trailing unify confirms the result against the annotation. Spread
+# elements have no vec build; they are rejected here.
+fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
+                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  if vec_lit_has_spread(els) {
+    diag_error(st.file, line, col, "spread elements are not supported in a Vec literal")
+    diag_help("build the list first and convert it: `vec_from_list([...xs, y])`")
+    let r = synth(st_bump_err(st), mk_expr(EList(els), line, col))
+    r
+  } else {
+    let elem_exp = match hargs { [t] -> apply_ty(st.sub, t)  _ -> TyAny }
+    let checked = check_vec_elems(st, els, elem_exp, line, col, [])
+    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)])
+    mk_inferred(checked.st, vty, vec_lit_build(list_reverse(checked.elems), vty, line, col))
+  }
+}
+
+type VecElems = { st: InferState, elems: [Expr] }
+
+fn check_vec_elems(st: InferState, els: [ListElem], elem_ty: Ty,
+                   line: Int, col: Int, acc: [Expr]) : VecElems / Console + File + Mutable =
+  match els {
+    [] -> VecElems { st: st, elems: acc }
+    [el, ...rest] -> match el {
+      ElPlain(ex) -> match mint_literal(ex, apply_ty(st.sub, elem_ty)) {
+        MintOk(m) -> check_vec_elems(st, rest, elem_ty, line, col, [m, ...acc])
+        MintErr(msg) -> {
+          diag_error(st.file, ex.line, ex.col, msg)
+          check_vec_elems(st_bump_err(st), rest, elem_ty, line, col, [ex, ...acc])
+        }
+        MintNone -> {
+          let r = check_elem_against(st, ex, apply_ty(st.sub, elem_ty), line, col)
+          check_vec_elems(r.st, rest, elem_ty, line, col, [r.expr, ...acc])
+        }
+      }
+      ElSpread(ex) -> check_vec_elems(st, rest, elem_ty, line, col, [ex, ...acc])
+    }
+  }
+
+fn vec_lit_has_spread(els: [ListElem]) : Bool =
+  match els {
+    [] -> false
+    [el, ...rest] -> match el {
+      ElSpread(_) -> true
+      ElPlain(_)  -> vec_lit_has_spread(rest)
+    }
+  }
+
+# A Vec-typed map-pipe chain. Pure stages over a range head collect
+# into ONE pre-sized buffer (`range_map_collect_vec`); an impure stage
+# or a non-range source keeps the ordinary list pipeline and converts
+# once via `vec_from_list` — same semantics, one materialisation.
+fn check_map_pipe_vec_collect(st: InferState, e: Expr,
+                              line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match pipe_fusion_as_collect(e) {
+    None -> synth(st, e)
+    Some(fc) -> {
+      let g = fuse_all_raw(st, fc.stages, false)
+      if g.ok {
+        match pipe_fusion_collect_rewrite(fc, line, col) {
+          Some(rewritten) -> synth(g.st, rewritten)
+          None            -> synth(g.st, vec_collect_via_list(e, line, col))
+        }
+      } else { synth(g.st, vec_collect_via_list(e, line, col)) }
+    }
+  }
+
+fn vec_collect_via_list(e: Expr, line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(EVar("vec_from_list"), line, col), [e]), line, col)
+
 fn check_list_elems_against(st: InferState, els: [ListElem], elem_ty: Ty,
                             line: Int, col: Int) : Inferred / Console + File + Mutable {
 

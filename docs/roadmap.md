@@ -486,7 +486,7 @@ mirrors it. The two 1.0 pillars the edition was re-scoped around
   flat unboxed storage, uniqueness in-place, raw element paths —
   case-6 memory at Rust parity), sized-exact variant
   representation (#1136, in flight — the rb-tree wall closer),
-  `Vec` surface stage 3 (#1150: slices, minting, fused collect).
+  `Vec` surface stage 3 (#1150, shipped: O(1) slices with in-place re-slice, literal minting, fused pipeline collect).
 - **The authorability benchmark** — the Tier 3 acceptance measured
   head-to-head (kaikai vs Rust vs Go, success rate per compile
   round; harness repo exists, task set in authoring). 1.0 ships
