@@ -176,13 +176,32 @@ fn var_seal_list_unsupported(sp: Pattern, ok_lbl: String, st: LowerSt) : LowerSt
   ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
 }
 
-# A nested ctor slot: project the slot at its static kind (`bind_slot_op` —
-# a pointer slot is a direct `.ptr` borrow), then test the projected value's
-# tag and payload (`var_seal_ctor_of`).
+# A nested ctor slot. A kind-3 ENUM slot holding a nullary ctor pattern
+# (`Node(Red, ..)`) tests the raw tag word directly — one `.i64` load + one
+# inline `i==` against the ctor tag, the C oracle's `emit_enum_slot_test`
+# (no singleton re-box, no `kai_tag_eq` call). Every other shape projects
+# the slot at its static kind (`bind_slot_op` — a pointer slot is a direct
+# `.ptr` borrow), then tests the projected value's tag and payload
+# (`var_seal_ctor_of`).
 fn var_seal_variant(cn: String, idx: Int, scn: String, subs: [Pattern], scrv: KVal, ok_lbl: String,
                     fail_lbl: String, sp: Pattern, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
-    var_seal_ctor_of(scn, subs, sv, ok_lbl, fail_lbl, sp, st1) }
+  if slot_kind_of(st, cn, idx) == 3 and nullary_pat_subs(subs) {
+    match bind_op_slot(st, KProj(scrv, idx), SInt64, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+      match bind_op_slot(st1, KPrim("i==", [sv, KIntV(ls_variant_tag(st1, scn))]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+        ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
+  } else {
+    match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+      var_seal_ctor_of(scn, subs, sv, ok_lbl, fail_lbl, sp, st1) }
+  }
+
+# A nullary sub-ctor pattern (no payload sub-patterns) — the enum-slot
+# raw-tag test shape. An enum type is all-nullary by construction, so a
+# payload-bearing pattern in a kind-3 slot cannot arise; the guard keeps
+# the raw path exact anyway.
+fn nullary_pat_subs(subs: [Pattern]) : Bool = match subs {
+  [] -> true
+  _  -> false
+}
 
 # Full ctor test over an ALREADY-PROJECTED value `sv` (a variant slot, a list
 # head, a record field): a NULLARY ctor (`Red`) is a bare tag test; a PAYLOAD-
@@ -204,22 +223,35 @@ pub fn var_seal_ctor_of(cn: String, subs: [Pattern], sv: KVal, ok_lbl: String,
 
 # A literal slot's test. A kind-1 Int slot reads its raw `.i64` word and
 # compares with an inline `i==` (one load + one icmp — no mask consult, no
-# re-box); every other kind reads the slot at its static op and compares
-# with the non-consuming boxed `kai_eq_raw` (mirror of the literal/record
-# paths).
+# re-box); a kind-2 Real slot reads its raw `.r` word and compares with an
+# inline `f==` — the boxed route would mint an owned re-box the
+# non-consuming `kai_eq_raw` never releases (a leak per test). Every other
+# kind reads the slot at its static op and compares with the non-consuming
+# boxed `kai_eq_raw` (mirror of the literal/record paths).
 fn var_seal_eq(cn: String, idx: Int, lit: KVal, scrv: KVal, ok_lbl: String, fail_lbl: String,
-               sp: Pattern, st: LowerSt) : LowerSt / Console =
-  if slot_kind_of(st, cn, idx) == 1 and var_lit_is_int(lit) {
-    match bind_op_slot(st, KProj(scrv, idx), SInt64, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
-      match bind_op_slot(st1, KPrim("i==", [sv, lit]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
-        ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
+               sp: Pattern, st: LowerSt) : LowerSt / Console = {
+  let k = slot_kind_of(st, cn, idx)
+  if k == 1 and var_lit_is_int(lit) {
+    var_seal_raw_eq(idx, "i==", SInt64, lit, scrv, ok_lbl, fail_lbl, sp, st)
+  } else if k == 2 and var_lit_is_real(lit) {
+    var_seal_raw_eq(idx, "f==", SReal, lit, scrv, ok_lbl, fail_lbl, sp, st)
   } else {
     match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
       match bind_op(st1, KPrim("kai_eq_raw", [sv, lit]), KAt(sp.line, sp.col)) { LRes(cond, st2) ->
         ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
   }
+}
+
+# Raw slot-literal test: read slot `idx` at its raw KSlot, compare with the
+# inline raw prim (`i==` / `f==`), condbr. One load + one compare.
+fn var_seal_raw_eq(idx: Int, cmp: String, kslot: KSlot, lit: KVal, scrv: KVal, ok_lbl: String,
+                   fail_lbl: String, sp: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op_slot(st, KProj(scrv, idx), kslot, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+    match bind_op_slot(st1, KPrim(cmp, [sv, lit]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+      ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
 
 fn var_lit_is_int(lit: KVal) : Bool = match lit { KIntV(_) -> true _ -> false }
+fn var_lit_is_real(lit: KVal) : Bool = match lit { KRealV(_) -> true _ -> false }
 
 # `condbr (kai_tag_eq sv ctor_tag) ? ok : fail` — bare tag test of an
 # already-projected value `sv`. The ctor tag is materialised as a `KIntV`

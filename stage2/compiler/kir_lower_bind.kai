@@ -7,9 +7,8 @@
 # aborts on. This module owns that bind emission, recursing into NESTED
 # sub-patterns so `let { p: { x, y } } = b` and `Some(x)` bind their inner
 # names against the EXTRACTED inner value. Mirror of emit_c's
-# `emit_pat_binds` / `emit_pat_binds_variant` / `emit_pat_binds_record`
-# (the boxed `k==0` arm — the KIR keeps every slot boxed today, so there is
-# no kind-split here). A bare `KLet`/`KProj` never increfs: Perceus's
+# `emit_pat_binds` / `emit_pat_binds_variant` / `emit_pat_binds_record`.
+# A bare `KLet`/`KProj` never increfs: Perceus's
 # already-placed KRC nodes own the refcounting (`lm_bind_name` note).
 #
 # It drives ON the lowering base (`bind_op`, `ls_emit`, `KProj`,
@@ -61,14 +60,14 @@ fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body: Exp
 }
 
 # The runtime kind of ctor `cn`'s slot `idx`, classified with the IDENTICAL
-# `variant_slot_kind(te, [])` call the construction path uses (`typed_inits`,
-# `variant_i64_mask` — enums always `[]`), so a slot READ never disagrees with
-# how the ctor WROTE it. 1 = Int (`.i64` raw), 2 = Real, 3 = enum, 0 = boxed
-# pointer (the default: unresolvable ctors, runtime-minted variants with no
-# user-visible payload, and — since `enums` is `[]` — enum-typed slots, which
-# the ctor also built boxed). This single resolver is the one place the
-# read/write invariant lives; both `bind_slot_kslot` and `bind_slot_op`
-# consult it, never re-deriving the kind with a different `enums`.
+# `variant_slot_kind(te, st.enums)` call the construction path uses
+# (`typed_inits`, `ls_ctor_mask`), so a slot READ never disagrees with how
+# the ctor WROTE it. 1 = Int (`.i64` raw), 2 = Real (`.r` raw), 3 = enum
+# (immediate tag), 0 = boxed pointer (the default: unresolvable ctors and
+# runtime-minted variants with no user-visible payload). This single
+# resolver is the one place the read/write invariant lives; both
+# `bind_slot_kslot` and `bind_slot_op` consult it, never re-deriving the
+# kind with a different `enums`.
 #
 # A name whose first registry match is a runtime-minted ctor (tag below
 # the user base — `Exited`/`Signaled`, or a user type reusing such a name)
@@ -84,17 +83,17 @@ pub fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
   if evar_find_tag(st.vs, cn) < user_variant_tag_base() { 0 - 1 }
   else { match evar_payload_tys(st.vs, cn) {
     Some(tys) -> match variant_nth_ty(tys, idx) {
-                   Some(te) -> variant_slot_kind(te, [])
+                   Some(te) -> variant_slot_kind(te, st.enums)
                    None     -> 0
                  }
     None      -> 0
   } }
 
 # The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at. Only a
-# kind-1 Int slot can go raw (`SInt64`): the native variant layout lays ONLY
-# kind-1 Int slots inline (`variant_i64_mask` is Int-only), so a kind-2 Real
-# slot is physically a boxed pointer — reading it raw (`.r` load) would read
-# the pointer bits as an `f64` (garbage). Real slots therefore stay `SBoxed`.
+# kind-1 Int slot can go raw (`SInt64`): the unbox pass seeds Int binders
+# only. A kind-2 Real / kind-3 enum binder stays `SBoxed` — its `KProj` read
+# re-boxes at the border (a fresh owned box for Real, the interned immortal
+# singleton for enum), so the register always holds a `KaiValue *`.
 #
 # A kind-1 Int binder is `SInt64` iff the unbox pass ALREADY seeded it
 # `MUnboxed` (`seed_variant_int_binders`, unbox.kai). That single verdict is
@@ -208,7 +207,7 @@ pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 # reads as a direct `.ptr` borrow (`KProjBorrow`), the native fast path that
 # skips `kaix_variant_arg`'s per-read mask branch; every typed slot (kind-1
 # Int, kind-2 Real, kind-3 enum) stays the mask-consulting `KProj`. The read op
-# always matches the ctor's write layout (both via `variant_slot_kind(te, [])`).
+# always matches the ctor's write layout (both via `variant_slot_kind(te, st.enums)`).
 pub fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
   if slot_kind_of(st, cn, idx) == 0 { KProjBorrow(scrv, idx) } else { KProj(scrv, idx) }
 
@@ -231,7 +230,7 @@ pub fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
 fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
   # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
   # every other slot stays the mask-consulting `KProj`. The read op matches the
-  # ctor's write layout (both via `variant_slot_kind(te, [])`), so no tagged
+  # ctor's write layout (both via `variant_slot_kind(te, st.enums)`), so no tagged
   # pointer is ever read raw nor vice versa.
   PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, body), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
   PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, body, st)

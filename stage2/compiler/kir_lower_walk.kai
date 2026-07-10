@@ -2566,10 +2566,23 @@ fn lower_ctor_args(cargs: [Expr], name: String, tys: [TypeExpr], st: LowerSt, ac
         [_, ...r] -> r
         [] -> []
       }
-      # A user-ctor kind-1 Int slot lowers RAW; builtins + boxed slots stay boxed.
-      if lower_ctor_slot_is_int(st, name, tys) {
+      let k = lower_ctor_slot_kind(st, name, tys)
+      # A user-ctor kind-1 Int slot lowers RAW; a kind-2 Real / kind-3 enum
+      # slot lowers boxed but is WRAPPED at its kind so the emitter stores the
+      # raw f64 bits / immediate tag word; builtins + boxed slots stay boxed.
+      if k == 1 {
         match lower_expr_raw_at(e, SInt64, st) { LRes(v, st1) ->
           lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIInt64(v)])) }
+      } else if k == 2 {
+        match lower_expr(e, st) { LRes(v, st1) ->
+          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIReal(v)])) }
+      } else if k == 3 {
+        # Literal-ctor peephole (the C `{.i64 = tag}` mirror): a bare nullary
+        # user-ctor arg (`Red`) contributes its tag as an immediate — no
+        # singleton load + tag re-read. Anything else lowers boxed and the
+        # emitter takes the tag at the border (`kaix_take_enum`).
+        match lower_enum_slot_arg(e, st) { LRes(v, st1) ->
+          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIEnum(v)])) }
       } else {
         match lower_expr(e, st) { LRes(v, st1) ->
           lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIBoxed(v)])) }
@@ -2577,14 +2590,34 @@ fn lower_ctor_args(cargs: [Expr], name: String, tys: [TypeExpr], st: LowerSt, ac
     }
   }
 
-# True iff the head slot of `tys` is a kind-1 Int slot of a USER ctor (builtins
-# stay boxed — the runtime owns their slot layout).
-fn lower_ctor_slot_is_int(st: LowerSt, name: String, tys: [TypeExpr]) : Bool =
-  if evar_find_tag(st.vs, name) < user_variant_tag_base() { false }
+# The slot kind of the head slot of `tys` for a USER ctor; builtins classify
+# 0 (boxed — the runtime owns their slot layout). Same resolver as
+# `slot_kind_of` / `ls_ctor_mask` (`variant_slot_kind` over `st.enums`).
+fn lower_ctor_slot_kind(st: LowerSt, name: String, tys: [TypeExpr]) : Int =
+  if evar_find_tag(st.vs, name) < user_variant_tag_base() { 0 }
   else { match tys {
-    [t, ..._] -> variant_slot_kind(t, []) == 1
-    []        -> false
+    [t, ..._] -> variant_slot_kind(t, st.enums)
+    []        -> 0
   } }
+
+# An enum-slot ctor arg. A bare `EVar` naming a NULLARY user ctor (not
+# shadowed by a local) lowers to its tag immediate (`KIntV`); everything else
+# lowers boxed (the emitter's `kaix_take_enum` reads whatever tag it carries).
+fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
+  EVar(nm) ->
+    if not ls_is_local(st, nm) and kir_name_is_ctor(nm) {
+      match evar_find(st.vs, nm) {
+        Some(ar) ->
+          if ar == 0 {
+            let tag = evar_find_tag(st.vs, nm)
+            if tag >= user_variant_tag_base() { LRes(KIntV(tag), st) }
+            else { lower_expr(e, st) }
+          } else { lower_expr(e, st) }
+        None -> lower_expr(e, st)
+      }
+    } else { lower_expr(e, st) }
+  _ -> lower_expr(e, st)
+}
 
 # `sym` is the already-resolved mangled symbol. Resolve the callee's UFnSig
 # once: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
@@ -2709,15 +2742,15 @@ fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int
       # cons spine (`__kai_cons` / `__kai_cons_s`) is not a registered variant
       # → tag -1 (its backend path is cons-specific and ignores the tag).
       let tag = if trmc_cname_is_cons(cname) { 0 - 1 } else { ls_variant_tag(st1, cname) }
-      # The i64-inline mask of the spine ctor (0 for the builtin cons spine),
-      # so the native step lays kind-1 Int slots raw like KCon/KConReuse do —
-      # the same `ls_ctor_mask` (`variant_i64_mask`) the fresh route reads.
-      let i64_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask(st1, cname) }
+      # The full slot mask of the spine ctor (0 for the builtin cons spine),
+      # so the native step lays each slot at its kind like KCon/KConReuse do —
+      # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
+      let slot_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask(st1, cname) }
       # The `__kai_cons_s` reuse-cons step drops the consumed scrutinee; its
       # register is THIS match's fresh `<join>$sd` (st.mscr), not the old fixed
       # `__pcs_scr_drop` literal (which aliased nested matches in the native
       # flat table). `__kai_cons` (no `_s`) has nothing to free → "".
-      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, i64_mask, dropmask,
+      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, slot_mask, dropmask,
                                heads, assigns_of(reb, 0, []), st1.mscr, kpos_of(x)))
     }
   }
