@@ -149,6 +149,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # prefixes still expand to a no-op and don't have to be edited.
 STACK :=
 
+.PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158
 .PHONY: all clean test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-transitive-privacy test-modules-uom-privacy test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-foreign-prelude test-issue-672 test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-682-cancel-sibling-handler test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-home-tu-partition test-native-modular test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes
 all: $(TARGET)
 
@@ -5448,6 +5449,45 @@ test-perceus-1160-de-opaque-native: $(TARGET) build
 	    || { echo "perceus-1160-de-opaque-native FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1160-$$name-nat.out; exit 1; }; \
 	  echo "perceus-1160-de-opaque-native OK ($$name, native)"; \
 	done
+
+# Issue #1158 — the KIR inliner must not corrupt the TRMC spine of a
+# caller it pastes into: the leaf helper inlines ahead of the modulo-cons
+# step, and the 1M build still runs O(1)-stack with the right checksum.
+test-kir-inline-trmc-1158: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/kir_inline_trmc_tail_1158.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1158trmc 2> build/s2-1158trmc.err \
+	  || { echo "kir-inline-trmc-1158 FAIL (native build errored)"; cat build/s2-1158trmc.err; exit 1; }; \
+	timeout 60 ./build/s2-1158trmc > build/s2-1158trmc.out \
+	  || { echo "kir-inline-trmc-1158 FAIL (run crashed/hung — TRMC spine broke under the paste)"; exit 1; }; \
+	diff -q ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out > /dev/null \
+	  || { echo "kir-inline-trmc-1158 FAIL (output diff)"; diff ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out; exit 1; }; \
+	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn build/,/^}/'); \
+	echo "$$kir" | grep -q 'trmc-step' \
+	  || { echo "kir-inline-trmc-1158 FAIL (build lost its trmc-step terminator)"; exit 1; }; \
+	echo "$$kir" | grep -q 'classify' \
+	  && { echo "kir-inline-trmc-1158 FAIL (classify call survived — leaf inline regressed)"; exit 1; } \
+	  || echo "kir-inline-trmc-1158 OK (helper inlined, trmc-step intact, 1M build O(1)-stack, checksum matches)"
+
+# Issue #1158 — the while/until fusion chain: combinator + lambdas paste
+# into main, the var cells stop escaping, and the canonical State
+# handlers rewrite to registers. The KIR must show slots, not dispatch.
+test-kir-while-slot-1158: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/kir_while_slot_1158.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1158wslot 2> build/s2-1158wslot.err \
+	  || { echo "kir-while-slot-1158 FAIL (native build errored)"; cat build/s2-1158wslot.err; exit 1; }; \
+	./build/s2-1158wslot > build/s2-1158wslot.out \
+	  || { echo "kir-while-slot-1158 FAIL (run errored)"; exit 1; }; \
+	diff -q ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out > /dev/null \
+	  || { echo "kir-while-slot-1158 FAIL (output diff)"; diff ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out; exit 1; }; \
+	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	echo "$$kir" | grep -qE 'install State|perform State' \
+	  && { echo "kir-while-slot-1158 FAIL (State dispatch survived in main)"; exit 1; } \
+	  || true; \
+	echo "$$kir" | grep -q '__vcell_' \
+	  || { echo "kir-while-slot-1158 FAIL (no var-cell register in main — the slot rewrite did not fire)"; exit 1; }; \
+	echo "kir-while-slot-1158 OK (loop fused, var cells are registers, no State dispatch in main)"
 
 test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	@set -e; \
