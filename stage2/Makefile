@@ -2073,6 +2073,27 @@ test-driver-holes: $(TARGET) build
 	  build/driver-hole-multi.json \
 	  || { echo "driver-holes FAIL hole_multiple (content)"; cat build/driver-hole-multi.json; exit 1; }; \
 	echo "driver-holes OK hole_multiple (--holes + --holes-json multi)"; \
+	grep -q "in scope (local):" build/driver-hole-pretty.out \
+	  || { echo "driver-holes FAIL hole_pretty (local scope header missing)"; cat build/driver-hole-pretty.out; exit 1; }; \
+	if grep -q "Spawn.spawn" build/driver-hole-pretty.out; then \
+	  echo "driver-holes FAIL hole_pretty (--holes leaked the full scope)"; exit 1; \
+	fi; \
+	grep -q "more bindings in scope (--holes-scope lists them)" build/driver-hole-pretty.out \
+	  || { echo "driver-holes FAIL hole_pretty (elided-count line missing)"; cat build/driver-hole-pretty.out; exit 1; }; \
+	$$KAI build --holes-scope $$pretty > build/driver-hole-scope.out; \
+	grep -q "Spawn.spawn" build/driver-hole-scope.out \
+	  || { echo "driver-holes FAIL hole_pretty (--holes-scope missing stdlib bindings)"; exit 1; }; \
+	echo "driver-holes OK hole_scope (--holes local vs --holes-scope full)"; \
+	python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d[0]; assert r['scope_elided'] > 0, r['scope_elided']; assert len(r['in_scope']) < 20, len(r['in_scope'])" \
+	  build/driver-hole-json.out \
+	  || { echo "driver-holes FAIL hole_json (default not bounded)"; exit 1; }; \
+	$$KAI build --holes-json-scope $$json > build/driver-hole-json-scope.out; \
+	python3 ../scripts/validate_holes_json.py build/driver-hole-json-scope.out \
+	  || { echo "driver-holes FAIL hole_json_scope (schema)"; cat build/driver-hole-json-scope.out; exit 1; }; \
+	python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d[0]; assert r['scope_elided'] == 0, r['scope_elided']; assert len(r['in_scope']) > 100, len(r['in_scope'])" \
+	  build/driver-hole-json-scope.out \
+	  || { echo "driver-holes FAIL hole_json_scope (full scope missing)"; exit 1; }; \
+	echo "driver-holes OK hole_json_scope (--holes-json bounded vs -scope full)"; \
 	echo "driver-holes OK"
 
 # m7a #3 — parser-level smoke tests for `effect` declarations and
