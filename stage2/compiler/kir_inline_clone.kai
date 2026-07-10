@@ -1,0 +1,126 @@
+# compiler/kir_inline_clone.kai — alpha-renaming clone for the KIR
+# inliner: paste one admitted template body into a call site.
+#
+# The clone substitutes param reads with the site's argument atoms,
+# suffixes every template-local binder and label with the site-unique
+# tag, rewrites `KRet v` into `x <- v; br join`, and leaves every other
+# terminator's shape intact. The fall-through arms (`_ -> …`) are
+# unreachable on an admitted template — the admission whitelist in
+# `kir_inline.kai` and these matches move together.
+
+import compiler.util
+import compiler.kir
+
+# Clone context for one paste: param name → argument atom, plus the
+# site-unique suffix every local binder and label takes.
+pub type KinArg = KA(String, KVal)
+pub type KinSub = { pargs: [KinArg], sfx: String }
+
+pub fn kin_bind_args(ps: [KParam], cargs: [KVal], acc: [KinArg]) : [KinArg] = match ps {
+  [] -> list_reverse(acc)
+  [p, ...prest] -> match cargs {
+    []            -> list_reverse(acc)
+    [a, ...arest] -> kin_bind_args(prest, arest, [KA(p.name, a), ...acc])
+  }
+}
+
+pub fn kin_clone_blocks(bs: [KBlock], sub: KinSub, x: String, join: String, acc: [KBlock]) : [KBlock] = match bs {
+  []           -> list_reverse(acc)
+  [b, ...rest] -> kin_clone_blocks(rest, sub, x, join, [kin_clone_block(b, sub, x, join), ...acc])
+}
+
+# `KRet v` becomes `x <- v; br join`; every other terminator renames its
+# labels in place.
+fn kin_clone_block(b: KBlock, sub: KinSub, x: String, join: String) : KBlock = match b.term {
+  KRet(v, p) -> KBlock { label: kin_lbl(sub, b.label),
+                         stmts: list_append(kin_sub_stmts(b.stmts, sub, []),
+                                            [KStore(x, kin_sub_val(sub, v), p)]),
+                         term: KBr(join, p), region_id: None }
+  _          -> KBlock { label: kin_lbl(sub, b.label),
+                         stmts: kin_sub_stmts(b.stmts, sub, []),
+                         term: kin_sub_term(sub, b.term), region_id: None }
+}
+
+pub fn kin_lbl(sub: KinSub, l: String) : String = cat2(l, sub.sfx)
+
+# A `KVar` naming a param reads the bound argument atom; any other name
+# is a template-local binder and takes the site suffix (admission
+# guarantees no third kind of name appears in atom position).
+fn kin_sub_val(sub: KinSub, v: KVal) : KVal = match v {
+  KVar(n) -> match kin_arg_find(sub.pargs, n) {
+    Some(a) -> a
+    None    -> KVar(cat2(n, sub.sfx))
+  }
+  _ -> v
+}
+
+fn kin_arg_find(pargs: [KinArg], n: String) : Option[KVal] = match pargs {
+  []                  -> None
+  [KA(p, a), ...rest] -> if p == n { Some(a) } else { kin_arg_find(rest, n) }
+}
+
+fn kin_sub_vals(vs: [KVal], sub: KinSub, acc: [KVal]) : [KVal] = match vs {
+  []           -> list_reverse(acc)
+  [v, ...rest] -> kin_sub_vals(rest, sub, [kin_sub_val(sub, v), ...acc])
+}
+
+fn kin_sub_stmts(ss: [KStmt], sub: KinSub, acc: [KStmt]) : [KStmt] = match ss {
+  []           -> list_reverse(acc)
+  [s, ...rest] -> kin_sub_stmts(rest, sub, [kin_sub_stmt(sub, s), ...acc])
+}
+
+fn kin_sub_stmt(sub: KinSub, s: KStmt) : KStmt = match s {
+  KLet(n, slot, op, p) -> KLet(cat2(n, sub.sfx), slot, kin_sub_op(sub, op), p)
+  KDo(op, p)           -> KDo(kin_sub_op(sub, op), p)
+  KRC(rc, p)           -> KRC(kin_sub_rc(sub, rc), p)
+  KStore(n, v, p)      -> KStore(cat2(n, sub.sfx), kin_sub_val(sub, v), p)
+  _                    -> s
+}
+
+fn kin_sub_rc(sub: KinSub, rc: KRCOp) : KRCOp = match rc {
+  KDup(v)  -> KDup(kin_sub_val(sub, v))
+  KDrop(v) -> KDrop(kin_sub_val(sub, v))
+  _        -> rc
+}
+
+fn kin_sub_op(sub: KinSub, op: KOp) : KOp = match op {
+  KPrim(nm, vs)              -> KPrim(nm, kin_sub_vals(vs, sub, []))
+  KCon(nm, tag, mask, inits) -> KCon(nm, tag, mask, kin_sub_inits(inits, sub, []))
+  KRecord(fs)                -> KRecord(kin_sub_fields(fs, sub, []))
+  KProj(v, i)                -> KProj(kin_sub_val(sub, v), i)
+  KProjBorrow(v, i)          -> KProjBorrow(kin_sub_val(sub, v), i)
+  KProjKind(v, i, k)         -> KProjKind(kin_sub_val(sub, v), i, k)
+  KTagOf(v)                  -> KTagOf(kin_sub_val(sub, v))
+  KLitOp(v)                  -> KLitOp(kin_sub_val(sub, v))
+  _                          -> op
+}
+
+fn kin_sub_inits(inits: [KSlotInit], sub: KinSub, acc: [KSlotInit]) : [KSlotInit] = match inits {
+  []            -> list_reverse(acc)
+  [si, ...rest] -> kin_sub_inits(rest, sub, [kin_sub_init(sub, si), ...acc])
+}
+
+fn kin_sub_init(sub: KinSub, si: KSlotInit) : KSlotInit = match si {
+  SIBoxed(v) -> SIBoxed(kin_sub_val(sub, v))
+  SIInt64(v) -> SIInt64(kin_sub_val(sub, v))
+  SIReal(v)  -> SIReal(kin_sub_val(sub, v))
+  SIEnum(v)  -> SIEnum(kin_sub_val(sub, v))
+}
+
+fn kin_sub_fields(fs: [KFieldInit], sub: KinSub, acc: [KFieldInit]) : [KFieldInit] = match fs {
+  []                   -> list_reverse(acc)
+  [KFI(n, v), ...rest] -> kin_sub_fields(rest, sub, [KFI(n, kin_sub_val(sub, v)), ...acc])
+}
+
+fn kin_sub_term(sub: KinSub, t: KTerm) : KTerm = match t {
+  KBr(l, p)             -> KBr(kin_lbl(sub, l), p)
+  KCondBr(v, a, b, p)   -> KCondBr(kin_sub_val(sub, v), kin_lbl(sub, a), kin_lbl(sub, b), p)
+  KSwitch(v, cs, d, p)  -> KSwitch(kin_sub_val(sub, v), kin_sub_cases(cs, sub, []), kin_lbl(sub, d), p)
+  KUnreachable(p)       -> KUnreachable(p)
+  _                     -> t
+}
+
+fn kin_sub_cases(cs: [KCase], sub: KinSub, acc: [KCase]) : [KCase] = match cs {
+  []                  -> list_reverse(acc)
+  [KC(t, l), ...rest] -> kin_sub_cases(rest, sub, [KC(t, kin_lbl(sub, l)), ...acc])
+}
