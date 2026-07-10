@@ -10,9 +10,15 @@
 # join block holding the site's remaining statements.
 #
 # Template admission is deliberately narrow: a leaf `KFnNormal` (no
-# calls, no effect ops, no handler frames, no reuse machinery, no
-# regions) whose only terminators are ret/br/condbr/switch/unreachable
-# and whose `KStore` targets are its own `KLet` binders. Everything the
+# program-fn calls, no effect ops, no handler frames, no regions) whose
+# only terminators are ret/br/condbr/switch/unreachable and whose
+# `KStore` targets are its own `KLet` binders. Reuse-in-place bodies
+# (`KConReuse`/`KTokenSteal` + the runtime uniqueness helpers) admit
+# under a HIGHER cost ceiling: they are the rotation-shaped class where
+# cross-boundary RC/alloc fusion pays most, and they are structurally
+# rare, so the extra code growth is bounded. The arm-top token family
+# (`KArmTopReuse`/`KArmTokenFree`) never admits — it addresses the
+# fn-wide `_arm_ru` register a paste cannot re-home. Everything the
 # admission whitelists, the clone renames; the two lists must move
 # together.
 
@@ -20,12 +26,16 @@ import compiler.util
 import compiler.kir
 import compiler.kir_inline_clone
 
-# Inline cost ceiling: a template admits when its total statement count
-# is at most this. 0 disables the pass entirely (identity — the program
-# is returned untouched, no walk runs).
-fn kin_max_stmts() : Int = 0
+# Inline cost ceilings: a template admits when its total statement count
+# is at most the ceiling of its class. Both at 0 disables the pass
+# entirely (identity — the program is returned untouched, no walk runs).
+fn kin_max_stmts() : Int = 16
 
 fn kin_max_blocks() : Int = 8
+
+fn kin_max_reuse_stmts() : Int = 128
+
+fn kin_max_reuse_blocks() : Int = 32
 
 # One admitted template, keyed by its resolved symbol.
 type KinTmpl = KT(String, KFn)
@@ -35,7 +45,7 @@ type KinBlksOut = KBO([KBlock], Int)
 
 #[doc("Inlines admitted small leaf functions into their KLet call sites across a lowered KProgram; identity when the cost ceiling is 0.")]
 pub fn kir_inline_program(kp: KProgram) : KProgram =
-  if kin_max_stmts() <= 0 { kp }
+  if kin_max_stmts() <= 0 and kin_max_reuse_stmts() <= 0 { kp }
   else {
     let tmpls = kin_collect(kp.fns, [])
     match tmpls {
@@ -62,10 +72,36 @@ fn kin_admit(f: KFn) : Bool = match f.kind {
   KFnNormal ->
     if f.stateful { false }
     else if kin_region_some(f.region_id) { false }
-    else if list_length(f.blocks) < 1 or list_length(f.blocks) > kin_max_blocks() { false }
-    else if kin_count_stmts(f.blocks, 0) > kin_max_stmts() { false }
-    else { kin_blocks_ok(f.blocks, kin_binders(f.blocks, [])) }
+    else {
+      let reuse = kin_has_reuse(f.blocks)
+      let maxb = if reuse { kin_max_reuse_blocks() } else { kin_max_blocks() }
+      let maxs = if reuse { kin_max_reuse_stmts() } else { kin_max_stmts() }
+      if list_length(f.blocks) < 1 or list_length(f.blocks) > maxb { false }
+      else if kin_count_stmts(f.blocks, 0) > maxs { false }
+      else { kin_blocks_ok(f.blocks, kin_binders(f.blocks, [])) }
+    }
   _ -> false
+}
+
+fn kin_has_reuse(bs: [KBlock]) : Bool = match bs {
+  []           -> false
+  [b, ...rest] -> kin_stmts_have_reuse(b.stmts) or kin_has_reuse(rest)
+}
+
+fn kin_stmts_have_reuse(ss: [KStmt]) : Bool = match ss {
+  []           -> false
+  [s, ...rest] -> match s {
+    KLet(_, _, op, _) -> kin_op_is_reuse(op) or kin_stmts_have_reuse(rest)
+    KDo(op, _)        -> kin_op_is_reuse(op) or kin_stmts_have_reuse(rest)
+    _                 -> kin_stmts_have_reuse(rest)
+  }
+}
+
+fn kin_op_is_reuse(op: KOp) : Bool = match op {
+  KConReuse(_, _, _, _, _) -> true
+  KRecordReuse(_, _)       -> true
+  KTokenSteal(_, _)        -> true
+  _                        -> false
 }
 
 fn kin_region_some(r: Option[Int]) : Bool = match r { Some(_) -> true  None -> false }
@@ -111,27 +147,43 @@ fn kin_stmt_ok(s: KStmt, binders: [String]) : Bool = match s {
   _                 -> false
 }
 
-# The op whitelist. Calls keep templates leaf (no growth, no recursion
-# fence needed); effect ops / closures / reuse-token machinery carry
-# non-local structure the paste does not re-derive.
+# The op whitelist. Program-fn calls are rejected so templates stay
+# leaf (no growth, no recursion fence needed); the whitelisted `kaix_`
+# runtime helpers are not program fns, so they keep that property.
+# Effect ops / closures carry non-local structure the paste does not
+# re-derive. Reuse ops are local: their donor/token atoms are template
+# binders or params, both of which the clone rewrites.
 fn kin_op_ok(op: KOp) : Bool = match op {
-  KPrim(_, _)          -> true
-  KCon(_, _, _, _)     -> true
-  KRecord(_)           -> true
-  KProj(_, _)          -> true
-  KProjBorrow(_, _)    -> true
-  KProjKind(_, _, _)   -> true
-  KTagOf(_)            -> true
-  KLitOp(_)            -> true
-  _                    -> false
+  KPrim(_, _)              -> true
+  KCon(_, _, _, _)         -> true
+  KRecord(_)               -> true
+  KProj(_, _)              -> true
+  KProjBorrow(_, _)        -> true
+  KProjKind(_, _, _)       -> true
+  KTagOf(_)                -> true
+  KLitOp(_)                -> true
+  KConReuse(_, _, _, _, _) -> true
+  KRecordReuse(_, _)       -> true
+  KTokenSteal(_, _)        -> true
+  KCall(sym, _)            -> kin_call_ok(sym)
+  _                        -> false
 }
 
-# Only the plain RC pair moves; the reuse-token family is tied to an
-# owned-match arm shape the site does not have.
+# Runtime RC/uniqueness helpers a reuse body calls directly. Leaf by
+# construction (runtime symbols, not program fns).
+fn kin_call_ok(sym: String) : Bool =
+  sym == "kaix_check_unique" or sym == "kaix_incref_if_token_null"
+
+# The RC family whose operands are local atoms. `KArmTopReuse` /
+# `KArmTokenFree` are excluded: they read/write the fn-wide `_arm_ru`
+# register, which only exists in a TRMC caller's frame. `KDropReuse`
+# is excluded because the native backend does not lower it.
 fn kin_rc_ok(rc: KRCOp) : Bool = match rc {
-  KDup(_)  -> true
-  KDrop(_) -> true
-  _        -> false
+  KDup(_)               -> true
+  KDrop(_)              -> true
+  KFreeToken(_)         -> true
+  KIncrefIfShared(_, _) -> true
+  _                     -> false
 }
 
 fn kin_term_ok(t: KTerm) : Bool = match t {
@@ -181,6 +233,14 @@ fn kin_block(b: KBlock, tmpls: [KinTmpl], caller: String, c: Int) : KinBlksOut =
 # prefix closes as a head block branching into the clone, and the scan
 # continues on the remainder as the join block — so several sites in one
 # source block chain head → clone → join → clone → …
+#
+# A boxed param substitutes its argument atom directly. A RAW param
+# (i64/f64/i1) is materialised ONCE in the head block as a `KLet` at the
+# param's slot — the same single boxed→raw border the call ABI has
+# (`nemit_arg_at_slot`) — so a boxed argument is not re-unboxed at every
+# use inside the paste. The materialised register's name is exactly
+# `param+sfx`, which is what the clone's fallback rename resolves an
+# unbound param read to.
 fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: [KinTmpl],
             caller: String, c: Int, pre_rev: [KStmt]) : KinBlksOut = match ss {
   [] -> KBO([KBlock { label: label, stmts: list_reverse(pre_rev), term: term, region_id: None }], c)
@@ -188,10 +248,11 @@ fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: [KinTmpl],
     Some(t) -> match s {
       KLet(x, slot, KCall(_, cargs), pos) -> {
         let sfx  = cat2("$in", int_to_string(c))
-        let sub  = KinSub { pargs: kin_bind_args(t.params, cargs, []), sfx: sfx }
+        let sub  = KinSub { pargs: kin_bind_boxed_args(t.params, cargs, []), sfx: sfx }
+        let plets = kin_raw_param_lets(t.params, cargs, sfx, pos, [])
         let join = cat2("Lj", sfx)
         let head = KBlock { label: label,
-                            stmts: list_reverse([KLet(x, slot, KLitOp(kin_zero(slot)), pos), ...pre_rev]),
+                            stmts: list_reverse([KLet(x, slot, KLitOp(kin_zero(slot)), pos), ...list_append(plets, pre_rev)]),
                             term: KBr(kin_lbl(sub, kin_entry_label(t)), pos),
                             region_id: None }
         let cloned = kin_clone_blocks(t.blocks, sub, x, join, [])
@@ -202,6 +263,19 @@ fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: [KinTmpl],
       _ -> kin_scan(label, rest, term, tmpls, caller, c, [s, ...pre_rev])
     }
     None -> kin_scan(label, rest, term, tmpls, caller, c, [s, ...pre_rev])
+  }
+}
+
+# Head-block `KLet`s for the raw params, REVERSED (the head accumulator
+# is a reversed list): `param+sfx: slot = arg`.
+fn kin_raw_param_lets(ps: [KParam], cargs: [KVal], sfx: String, pos: KPos, acc: [KStmt]) : [KStmt] = match ps {
+  [] -> acc
+  [p, ...prest] -> match cargs {
+    []            -> acc
+    [a, ...arest] -> kin_raw_param_lets(prest, arest, sfx, pos, match p.slot {
+      SBoxed -> acc
+      _      -> [KLet(cat2(p.name, sfx), p.slot, KLitOp(a), pos), ...acc]
+    })
   }
 }
 

@@ -7311,7 +7311,9 @@ test-core-cache: $(TARGET)
 	done; \
 	echo "core-cache OK (all #825 core-cache invalidation fixtures passed)"
 
-# KIR Lane 0 — `--emit=kir` dumper goldens + determinism gate.
+# KIR Lane 0 — KIR dumper goldens + determinism gate. Goldens pin the RAW
+# lowering (`--emit=kir-noinline`), decoupled from inline thresholds; the
+# determinism gate covers both dump modes.
 # For each fixture in ../examples/kir/*.kai: dump KIR, extract just the
 # USER functions (named in the matching `<name>.kir.fns` list, so the
 # golden stays stable across stdlib churn), diff against the
@@ -7323,15 +7325,19 @@ test-kir: $(TARGET) build
 	for f in ../examples/kir/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  fns=$$(cat ../examples/kir/$$name.kir.fns); \
-	  ./$(TARGET) --path ../stdlib --emit=kir $$f 2>/dev/null \
+	  ./$(TARGET) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null \
 	    | awk -v fns="$$fns" 'BEGIN{n=split(fns,a," ");for(i=1;i<=n;i++)w[a[i]]=1} /^fn |^lambda fn |^clause fn /{nm="";for(i=1;i<=NF;i++)if($$i ~ /\(/){nm=$$i;sub(/\(.*/,"",nm);break} cur=(nm in w)} cur{print} /^}/{if(cur){print "";cur=0}}' \
 	    > build/$$name.kir; \
 	  diff -q ../examples/kir/$$name.kir.expected build/$$name.kir > /dev/null \
 	    || { echo "kir DIFF $$name"; diff ../examples/kir/$$name.kir.expected build/$$name.kir; exit 1; }; \
 	  ./$(TARGET) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2a; \
 	  ./$(TARGET) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2b; \
+	  ./$(TARGET) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2c; \
+	  ./$(TARGET) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2d; \
 	  diff -q build/$$name.kir.run2a build/$$name.kir.run2b > /dev/null \
 	    || { echo "kir NON-DETERMINISTIC $$name"; exit 1; }; \
+	  diff -q build/$$name.kir.run2c build/$$name.kir.run2d > /dev/null \
+	    || { echo "kir NON-DETERMINISTIC (noinline) $$name"; exit 1; }; \
 	  echo "kir OK $$name"; \
 	done
 
