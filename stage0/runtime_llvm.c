@@ -35,14 +35,14 @@
  * Koka runtime while the trailing stage0 dir still supplies any header
  * the shim needs that stage2 lacks.
  *
- * Soundness: the emitted IR declares `%KaiValue = type opaque` and
- * every `getelementptr` is over `%KaiValue**` arrays (arg/capture/
- * buffer), NEVER over a cell's `as.*`/`tag`/`rc` interior — verified
- * across the rb-tree IR (1056 GEPs, all `%KaiValue*`, zero
- * inttoptr/ptrtoint). One runtime behind two ABIs is therefore sound:
- * the IR cannot observe the value representation. The only place that
- * reads a cell's Int payload is this shim, and every such read now
- * goes through `kai_intf` (tagged-immediate-safe), not raw `->as.i`.
+ * Layout coupling: the emitted IR reads cell interiors directly (the
+ * variant tag word and the inline slot array) through typed GEPs the
+ * emitter lays against the VANILLA packed header — see
+ * stage2/compiler/emit_native_slot.kai, the one module that owns that
+ * layout. The static asserts below pin `struct KaiValue` to the exact
+ * offsets the emitter hardcodes; a header change (or a build defining
+ * KAI_TRACE_RC* for this TU, which grows the header) fails here at
+ * compile time instead of miscompiling every slot read.
  *
  * Angle brackets, not quotes: this file LIVES in stage0/, next to the
  * old stage0/runtime.h. A quoted `#include "runtime.h"` searches the
@@ -52,6 +52,16 @@
  * lines place stage2 ahead of stage0 — exactly the resolution the
  * C-backend already relies on. */
 #include <runtime.h>
+#include <stddef.h>
+
+/* The native emitter's layout module (emit_native_slot.kai) models the
+ * cell as `{ i32 rc, i8 tag, i8 var_n_args, i16 variant_tag, [N x i64] }`
+ * with the slot array at the union offset. These pins are that contract. */
+_Static_assert(offsetof(KaiValue, rc) == 0, "native emitter layout: rc at 0");
+_Static_assert(offsetof(KaiValue, tag) == 4, "native emitter layout: tag at 4");
+_Static_assert(offsetof(KaiValue, var_n_args) == 5, "native emitter layout: var_n_args at 5");
+_Static_assert(offsetof(KaiValue, variant_tag) == 6, "native emitter layout: variant_tag at 6");
+_Static_assert(offsetof(KaiValue, as) == 8, "native emitter layout: slot array at 8");
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
@@ -94,12 +104,41 @@ KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
    so div-by-zero and INT64_MIN/-1 trap instead of hitting hardware UB. */
 int64_t kaix_idiv_chk(int64_t a, int64_t b)    { return kai_idiv_chk(a, b); }
 int64_t kaix_imod_chk(int64_t a, int64_t b)    { return kai_imod_chk(a, b); }
-KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_op_eq_v(a, b); }
-KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_op_ne_v(a, b); }
-KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_op_lt(a, b); }
-KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_op_gt(a, b); }
-KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_op_le(a, b); }
-KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_op_ge(a, b); }
+/* Comparison shims carry the tagged-Int fast path INLINE: two immediates
+   compare as one signed word compare (the n*2+1 encoding is monotonic, and
+   two tagged words are numerically equal iff bit-equal), yielding the
+   interned Bool singleton. Everything the generic kai_op_* would do for
+   this shape — consume both operands (no-op on immediates), mint a Bool —
+   is preserved. The point is fold visibility: these shims inline into the
+   emitted module, so a comparison over inline-boxed slot reads reduces to
+   load+cmp, where the out-of-line kai_op_* call froze the whole chain. */
+static inline int kaix_both_tagged(KaiValue *a, KaiValue *b) {
+    return (((intptr_t) a) & ((intptr_t) b) & KAI_INT_TAG_BIT) != 0;
+}
+KaiValue *kaix_eq(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool(a == b);
+    return kai_op_eq_v(a, b);
+}
+KaiValue *kaix_ne(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool(a != b);
+    return kai_op_ne_v(a, b);
+}
+KaiValue *kaix_lt(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a < (intptr_t) b);
+    return kai_op_lt(a, b);
+}
+KaiValue *kaix_gt(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a > (intptr_t) b);
+    return kai_op_gt(a, b);
+}
+KaiValue *kaix_le(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a <= (intptr_t) b);
+    return kai_op_le(a, b);
+}
+KaiValue *kaix_ge(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a >= (intptr_t) b);
+    return kai_op_ge(a, b);
+}
 KaiValue *kaix_neg(KaiValue *a)                { return kai_op_neg(a); }
 KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_op_pow_int(a, b); }
 /* Route through kai_op_boolnot so the LLVM backend's `not` matches the
@@ -830,6 +869,11 @@ double kaix_take_real(KaiValue *v)  { return kai_take_real(v); }
    backend's `kai_take_enum` at construction (`{.i64 = kai_take_enum(...)}`);
    the decref is a no-op on the immortal singleton. */
 int64_t kaix_take_enum(KaiValue *v)  { return kai_take_enum(v); }
+/* Enum-slot unpack: re-box a kind-3 slot's immediate tag word into its
+   interned immortal singleton — the read half of `kaix_take_enum`. The
+   emitter's static-kind slot read (`KProjKind`) loads the raw word inline
+   and calls this instead of the mask-consulting `kaix_variant_arg`. */
+KaiValue *kaix_enum_slot_box(int64_t tag) { return kai_enum_slot_box(tag); }
 /* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
    the box→raw border for a boxed Bool reaching the raw i1 path. */
 int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
