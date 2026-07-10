@@ -14,6 +14,7 @@ import compiler.home_tu
 import compiler.util
 import compiler.fnreg
 import compiler.emit_shared
+import compiler.emit_reuse_donate
 import compiler.ffi_v2
 import compiler.resolve
 import compiler.region
@@ -40,7 +41,11 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # the native shim. Threaded explicitly to the FFI-fn lowering
   # (narrower than a LowerSt field).
   let freg    = collect_extern_types(raw_decls)
-  let kfns    = lower_fns(raw_decls, st0, freg, fns_by_mod_new(fns), [])
+  # Donation-capable fns — the SAME structural scan the C backend runs
+  # (`emit_reuse_donate`), keyed on the mangled symbol, so both backends
+  # pick one capable set and the reuse ABI cannot diverge between them.
+  let capable = rd_scan_capable(raw_decls)
+  let kfns    = lower_fns(raw_decls, st0, freg, fns_by_mod_new(fns), capable, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
@@ -95,13 +100,13 @@ fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
       # "non-callable"). Mirror of emit_c's `test_enc`. The position is
       # unique, so it doubles as the emitted symbol.
       let sym = runner_enc_sym("__test__", line, col)
-      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRTest }
       lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DBench(desc, body, line, col) -> {
       let sym = runner_enc_sym("__bench__", line, col)
-      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRBench }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
     }
@@ -130,7 +135,7 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [EVar]) : LamCollect / Cons
 # per-body rebuild caused on a self-compile. Threaded like the C emitter's
 # `fn_bodies_loop`: each body reads its rotated table from the cache and
 # passes the grown cache to the next decl.
-fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, acc: [KFn]) : [KFn] / Console = match ds {
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, capable: [String], acc: [KFn]) : [KFn] / Console = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DFn(_, name, _, params, ret_ty, _, body, _, _, _) -> {
@@ -139,10 +144,13 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, acc:
       # the KFn instead of re-deriving it.
       let mo = home_tu(d)
       let r = fns_prefer_module_cached(fbm, mo)
-      let kfn = lower_fn(name, params, ret_ty, body, mo, r.table, st, freg)
-      lower_fns(rest, st, freg, r.cache, [kfn, ...acc])
+      # `main` never takes the donor param: the runtime entry calls it
+      # directly, outside the donor-aware call funnel.
+      let dn = name != "main" and rd_is_capable(c_sym(name, mo), capable)
+      let kfn = lower_fn(name, params, ret_ty, body, mo, r.table, st, freg, dn)
+      lower_fns(rest, st, freg, r.cache, capable, [kfn, ...acc])
     }
-    _ -> lower_fns(rest, st, freg, fbm, acc)
+    _ -> lower_fns(rest, st, freg, fbm, capable, acc)
   }
 }
 
@@ -151,7 +159,7 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, acc:
 # The body lowers into the entry block and whatever blocks the control
 # flow forks off; the final value seals the last block with `KRet`.
 fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
-            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg]) : KFn / Console {
+            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool) : KFn / Console {
   let sym = c_sym(name, mo)
   # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
   # module) by the cached `lower_fns` loop, so a bare call inside the body
@@ -190,7 +198,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
     let c_symbol = ffi_extern_symbol_of(body, name)
     KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg), kffi_kind_of_ret(ret_ty, freg)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
-          region_id: None, stateful: false, mo: mo }
+          region_id: None, stateful: false, mo: mo, donor: false }
   } else {
     # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
     # lowering would otherwise reduce to a panic stub (the native path then
@@ -217,7 +225,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
     match r {
       LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
                               ret: ret_slot_of_sig(usig), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                              region_id: None, stateful: false, mo: mo }
+                              region_id: None, stateful: false, mo: mo, donor: dn }
     }
   }
 }
@@ -354,7 +362,7 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt) : KFn / Console = match l {
       let st2 = lam_drop_params(params, st1)
       KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
             blocks: ls_finish(st2, KRet(val, kpos_of(body))), region_id: None,
-            stateful: false, mo: None } } }
+            stateful: false, mo: None, donor: false } } }
   }
 }
 
@@ -468,7 +476,7 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt) : KFn / C
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
       KFn { sym: sym, kind: KFnClause, params: kparams, ret: SBoxed,
-            blocks: blocks, region_id: None, stateful: stateful, mo: None }
+            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false }
     } }
   }
 }
