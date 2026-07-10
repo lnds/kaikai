@@ -50,6 +50,17 @@ did not name.
 
 ### Axis 1 (the big rock) — Opaque `%KaiValue` in the native emitter vs. inlined layout
 
+> **Status (2026-07-10):** shipped in #1160 — inline tag tests, static-kind
+> slot reads (`KProjKind`), tagged-compare fast paths, and the raw
+> call-arg binder verdict; rb-tree native went ~1.43× → ~1.28× the C
+> backend (instructions −31%). The residual is NOT emission opacity: the
+> KIR/native path lacks the C emitter's cross-call reuse-token donation
+> (`KaiReuse _donor` params), measured as 6.3× variant allocs on the
+> rb-tree — tracked as its own follow-up. Note the mechanism below
+> ("a call boundary the optimiser cannot see through") predates bc-link
+> inlining; the shipped win is fold-visibility (no runtime mask-table
+> loads), not call removal.
+
 This is the dominant native-vs-C axis and the one that most cleanly explains
 the 6.27 G vs 2.25 G split. It is separable from representation and it is the
 highest-leverage single change.
