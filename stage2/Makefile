@@ -5333,6 +5333,35 @@ test-perceus-1156-raw-widen-native: $(TARGET) build
 	  || { echo "perceus-1156-raw-widen-native FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1156-$$name-nat.out; exit 1; }; \
 	echo "perceus-1156-raw-widen-native OK (widened-register raw/boxed arm collision, native)"
 
+# Issue #1157 — full variant_slot_mask parity gate. One ctor carries all
+# four slot kinds (pointer / enum / Real / Int); the fixture exercises
+# construction, the static enum/Real/Int slot tests, binder reads, the
+# unique and shared reuse rebuilds and a 200k-deep TRMC spine, and its
+# folds read every slot back — a word laid at the wrong kind is a wrong
+# sum or a crash, on either backend.
+test-perceus-1157-full-mask: $(TARGET) build
+	@set -e; \
+	name=variant_full_mask_1157; \
+	src=../examples/perceus/$$name.kai; \
+	./$(TARGET) --path ../stdlib $$src > build/s2-1157-$$name.c \
+	  || { echo "perceus-1157-full-mask FAIL ($$name kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1157-$$name.c -o build/s2-1157-$$name $(LDLIBS_M); \
+	./build/s2-1157-$$name > build/s2-1157-$$name.out; \
+	diff -q ../examples/perceus/$$name.out.expected build/s2-1157-$$name.out > /dev/null \
+	  || { echo "perceus-1157-full-mask FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1157-$$name.out; exit 1; }; \
+	echo "perceus-1157-full-mask OK (full slot-mask layout, C oracle)"
+
+test-perceus-1157-full-mask-native: $(TARGET) build
+	@set -e; \
+	name=variant_full_mask_1157; \
+	src=../examples/perceus/$$name.kai; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1157-$$name-nat 2> build/s2-1157-$$name-nat.err \
+	  || { echo "perceus-1157-full-mask-native FAIL ($$name native build errored)"; cat build/s2-1157-$$name-nat.err; exit 1; }; \
+	./build/s2-1157-$$name-nat > build/s2-1157-$$name-nat.out; \
+	diff -q ../examples/perceus/$$name.out.expected build/s2-1157-$$name-nat.out > /dev/null \
+	  || { echo "perceus-1157-full-mask-native FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1157-$$name-nat.out; exit 1; }; \
+	echo "perceus-1157-full-mask-native OK (full slot-mask layout, native)"
+
 # Issue #882 — native rotation-reuse crash gate. The gap3 balance rotation
 # (`Node(l,k,r) -> match l { match ll { Node(..) -> Node(Node(...), lk,
 # Node(lr, k, r)) } }`) reuses an INNER cell while OUTER arms drop their own

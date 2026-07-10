@@ -129,7 +129,14 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # emit fields in DECLARATION order, the canonical layout the
                      # constant-index field read relies on. Shared (never reset);
                      # threaded verbatim through every fn-entry / state rebuild.
-                     recs: [RecInfo] }
+                     recs: [RecInfo],
+                     # `enums` is the set of all-nullary sum type names
+                     # (`collect_enum_type_names`), the same list the C
+                     # backend's `cx.enums` carries. It feeds every
+                     # `variant_slot_kind` / `variant_slot_mask` call in the
+                     # lowering, so the write mask, the binder read kind and
+                     # the startup registration share ONE enum verdict.
+                     enums: [String] }
 
 # A shadowed surface binder name paired with the fresh register it was
 # alpha-renamed to inside the current block (`Rn(surface, reg)`).
@@ -154,9 +161,9 @@ pub type RecPlan = RecPlan([KFieldInit], LowerSt)
 pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
 pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
-              consts: [Decl], ffi: [String], recs: [RecInfo]) : LowerSt =
+              consts: [Decl], ffi: [String], recs: [RecInfo], enums: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: recs }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: recs, enums: enums }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -166,7 +173,7 @@ pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
 # lowering.
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs, enums: st.enums }
 
 # Enter the fn with `body_fns` as the EFn table — already rotated to prefer
 # this fn's module so a bare call to a name exported by BOTH the current
@@ -182,7 +189,7 @@ pub fn ls_enter_fn_with(st: LowerSt, enc_fn: String, locals: [String],
                         body_fns: [EFn]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns,
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
-            locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs }
+            locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs, enums: st.enums }
 
 # Extend the lexical scope with one bound name (a `let` / match binder).
 # Forward-visible: a binder is in scope only after its definition. Idempotent
@@ -192,7 +199,7 @@ pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
   if ls_is_local(st, name) { st }
   else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
                    vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs } }
+                   consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums } }
 
 # Is `name` a name bound locally in the current fn body? (param / capture /
 # let / match binder). The shadow test `lower_var` consults before treating
@@ -213,7 +220,7 @@ pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, n
 pub fn ls_set_mscr(st: LowerSt, sd: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: sd, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: sd, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Set the reuse arm's scrutinee pointer-binder names so a `KConReuse` lowered
 # inside this arm's body emits the shared-donor incref. Saved (read
@@ -221,20 +228,20 @@ pub fn ls_set_mscr(st: LowerSt, sd: String) : LowerSt =
 pub fn ls_set_reuse_gc(st: LowerSt, gc: [String]) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: gc, rnested: st.rnested, recs: st.recs }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Set the reuse arm's nested-rotation slot plan (see `ReuseNested`). Travels
 # with `reuse_gc` — same set/clear discipline, same arm scope.
 pub fn ls_set_rnested(st: LowerSt, rn: ReuseNested) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: rn, recs: st.recs }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: rn, recs: st.recs, enums: st.enums }
 
 pub fn ls_push_rename(st: LowerSt, name: String, reg: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi,
-            renames: [Rn(name, reg), ...st.renames], mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+            renames: [Rn(name, reg), ...st.renames], mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Resolve a surface name to its active shadow register, if any. First match
 # (innermost shadow) wins. No entry → the name is not shadowed; the caller
@@ -253,7 +260,7 @@ fn ls_lookup_rename_loop(rs: [Rename], name: String) : Option[String] = match rs
 pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+            consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Restore the local-name set to a block-entry snapshot, so binders
 # defined inside the block leave scope at its exit. As with `renames`, the
@@ -262,7 +269,7 @@ pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
 pub fn ls_set_locals(st: LowerSt, snap: [String]) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
-            consts: st.consts, locals: snap, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+            consts: st.consts, locals: snap, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # A fresh virtual-register name, deterministic per function: `.t0`, `.t1`, …
 # The leading `.` is load-bearing, NOT cosmetic: a temporary shares the
@@ -288,9 +295,9 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # --- Block accumulation -------------------------------------------------
 
@@ -311,14 +318,14 @@ fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # Seal the final block without opening a successor (function exit).
 pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
@@ -487,39 +494,45 @@ pub fn boxed_inits(vs: [KVal], acc: [KSlotInit]) : [KSlotInit] = match vs {
   [v, ...rest] -> boxed_inits(rest, list_append(acc, [SIBoxed(v)]))
 }
 
-# Wrap each value atom as a slot-init typed by the ctor's declared payload:
-# a kind-1 Int slot becomes `SIInt64`, everything else `SIBoxed`. The KIND is
-# the definition's, read from the SAME `variant_slot_kind`/`evar_payload_tys`
-# the native mask (`variant_i64_mask`) + drop-walker read, so construction,
-# drop and read stay in lockstep. The i64 slot still holds a boxed `KVal`
-# here — the emitter (`nemit_slot_words`) absorbs the boxed→raw border at the
-# slot via `nemit_atom_raw`, so a tagged pointer is unboxed before it lands in
-# `.i64` (never stored raw). Real/enum slots stay boxed (the native i64 layout
-# is Int-only per `variant_i64_mask`). Builtins fall through to `SIBoxed`
-# (their mask is 0 per `ls_ctor_mask`).
+# Wrap each value atom as a slot-init typed by the ctor's declared payload
+# kind: 1 (Int) → `SIInt64`, 2 (Real) → `SIReal`, 3 (enum) → `SIEnum`, else
+# `SIBoxed`. The KIND is the definition's, read from the SAME
+# `variant_slot_kind`/`evar_payload_tys` the native mask (`ls_ctor_mask`) +
+# drop-walker read, so construction, drop and read stay in lockstep. A typed
+# slot may still hold a boxed `KVal` here — the emitter (`nemit_slot_word`)
+# absorbs the boxed→raw border (borrow for the tagged Int, consuming
+# `kaix_take_real`/`kaix_take_enum` for Real/enum), so a tagged pointer never
+# lands raw. Builtins fall through to `SIBoxed` (their mask is 0 per
+# `ls_ctor_mask`).
 pub fn typed_inits(vs: [KVal], name: String, st: LowerSt) : [KSlotInit] =
   match evar_payload_tys(st.vs, name) {
     Some(tys) -> if evar_find_tag(st.vs, name) < user_variant_tag_base() {
                    boxed_inits(vs, [])
-                 } else { typed_inits_idx(vs, tys, []) }
+                 } else { typed_inits_idx(vs, tys, st.enums, []) }
     None      -> boxed_inits(vs, [])
   }
 
-fn typed_inits_idx(vs: [KVal], tys: [TypeExpr], acc: [KSlotInit]) : [KSlotInit] = match vs {
+fn typed_inits_idx(vs: [KVal], tys: [TypeExpr], enums: [String], acc: [KSlotInit]) : [KSlotInit] = match vs {
   [] -> acc
   [v, ...vrest] -> match tys {
-    [t, ...trest] ->
-      if variant_slot_kind(t, []) == 1 { typed_inits_idx(vrest, trest, list_append(acc, [SIInt64(v)])) }
-      else { typed_inits_idx(vrest, trest, list_append(acc, [SIBoxed(v)])) }
-    []            -> typed_inits_idx(vrest, [], list_append(acc, [SIBoxed(v)]))
+    [t, ...trest] -> typed_inits_idx(vrest, trest, enums, list_append(acc, [typed_init_one(v, t, enums)]))
+    []            -> typed_inits_idx(vrest, [], enums, list_append(acc, [SIBoxed(v)]))
   }
 }
 
-# The 2-bit-per-slot i64-inline mask for a ctor, from its declared payload
-# types. Non-zero iff the ctor carries a kind-1 Int slot — the native emitter
-# lays those raw (`.i64`) and boxes the rest. `variant_i64_mask` (Int-only)
-# is the single source construction, the startup drop-walker register, and
-# the KProj read all consult, so a tag's cells never hold mixed word kinds.
+fn typed_init_one(v: KVal, t: TypeExpr, enums: [String]) : KSlotInit = {
+  let k = variant_slot_kind(t, enums)
+  if k == 1 { SIInt64(v) }
+  else if k == 2 { SIReal(v) }
+  else if k == 3 { SIEnum(v) }
+  else { SIBoxed(v) }
+}
+
+# The full 2-bit-per-slot mask for a ctor, from its declared payload types
+# (`variant_slot_mask` — Int, Real AND enum slots, the same mask the C
+# backend lays). It is the single source construction, the startup
+# drop-walker register, and the KProj read all consult, so a tag's cells
+# never hold mixed word kinds.
 #
 # BUILTIN ctors (tag < user base) return 0 so they NEVER take the raw path: the
 # C runtime mints Exited(Int)/Signaled(Int) with its own raw i64 slot and the
@@ -528,7 +541,7 @@ fn typed_inits_idx(vs: [KVal], tys: [TypeExpr], acc: [KSlotInit]) : [KSlotInit] 
 pub fn ls_ctor_mask(st: LowerSt, name: String) : Int =
   if evar_find_tag(st.vs, name) < user_variant_tag_base() { 0 }
   else { match evar_payload_tys(st.vs, name) {
-    Some(tys) -> variant_i64_mask(tys, [])
+    Some(tys) -> variant_slot_mask(tys, st.enums)
     None      -> 0
   } }
 
@@ -557,7 +570,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, enums: st.enums }
 
 # --- Type declarations --------------------------------------------------
 
