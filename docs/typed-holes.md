@@ -36,14 +36,16 @@ time, unless the user opts into `--strict-holes`.
 
 ## Output formats
 
-Human-readable (default):
+Human-readable (default). `in scope (local)` lists the hole's LOCAL
+bindings — parameters and lets — and summarises the surrounding
+top-level scope (hundreds of stdlib entries) as a count:
 
 ```
 foo.kai:4:3: type hole
 
   expected: String
 
-  in scope:
+  in scope (local):
     name    : String
     excited : String
 
@@ -52,8 +54,11 @@ foo.kai:4:3: type hole
     name
     string_concat(name, excited)
 
-  replace `?` with one of the candidates or a literal String.
+  312 more bindings in scope (--holes-scope lists them)
 ```
+
+`kai build --holes-scope` prints the same report with every reachable
+binding listed instead of the count.
 
 Machine-readable (`kai build --holes-json`): a single JSON array
 where each element describes one hole. Stable schema:
@@ -71,6 +76,7 @@ where each element describes one hole. Stable schema:
       {"name": "name", "type": "String"},
       {"name": "excited", "type": "String"}
     ],
+    "scope_elided": 312,
     "candidates": [
       {"expr": "excited", "kind": "local"},
       {"expr": "string_concat(name, excited)", "kind": "application"}
@@ -78,6 +84,10 @@ where each element describes one hole. Stable schema:
   }
 ]
 ```
+
+`in_scope` carries the local bindings; `scope_elided` counts the
+reachable bindings not listed. `kai build --holes-json-scope` lists
+everything in `in_scope` (prelude included) with `scope_elided: 0`.
 
 `kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
 which share the typed-hole pipeline (see *Implementation notes*).
@@ -139,14 +149,15 @@ deep); the bound keeps compilation fast, keeps candidate lists short
 (*few forms, each with clear intent*), and leaves deeper reasoning
 to tools.
 
-The flags are `--holes` (human-readable report) and `--holes-json`
-(stable JSON schema, same contract as typed holes promises). They are
-exposed at two levels: the underlying `kaic2 --holes` / `kaic2
---holes-json` (no implicit stdlib preludes — used by
-`make test-holes`), and the driver-level `kai build --holes` /
-`kai build --holes-json` (issue #477, auto-loads the same stdlib
-preludes as a normal `kai build` so the in-scope dump matches what
-the user actually sees at compile time). Both surfaces print the
+The flags are `--holes` (human-readable report), `--holes-json`
+(stable JSON schema, same contract as typed holes promises), and
+their `--holes-scope` / `--holes-json-scope` variants that list the
+full reachable scope instead of the local slice. They are exposed at
+two levels: the underlying `kaic2 --holes` / `kaic2 --holes-json`
+(no implicit stdlib preludes — used by `make test-holes`), and the
+driver-level `kai build --holes` / `kai build --holes-json`
+(auto-loads the same stdlib preludes as a normal `kai build` so the
+in-scope dump matches what the user actually sees at compile time). Both surfaces print the
 report and exit without producing a binary. Unfilled holes that
 reach codegen compile to a runtime panic via the existing
 `kai_prelude_panic` helper; no codegen impact beyond a stub for

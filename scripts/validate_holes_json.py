@@ -16,6 +16,7 @@ REQUIRED = {
     "message",
     "expected_type",
     "in_scope",
+    "scope_elided",
     "candidates",
 }
 

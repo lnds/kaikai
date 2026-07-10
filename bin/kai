@@ -752,6 +752,8 @@ usage_build() {
 usage: kai build [<spec>] [-o <out>] [--backend=<c|native>]
        kai build --holes [<spec>]
        kai build --holes-json [<spec>]
+       kai build --holes-scope [<spec>]
+       kai build --holes-json-scope [<spec>]
        kai build --diags-json [<spec>]
        kai build --effects-json [<spec>]
        kai build --effect-holes-json [<spec>]
@@ -797,12 +799,15 @@ Options:
                        lines; panics print the .kai:line stack trace.
                        Native only (the C backend ignores it).
   --holes              Report every typed hole (\`?\` / \`?name\`) with
-                       expected type, in-scope bindings, and candidate
-                       fillers, then exit. No binary is produced. See
-                       docs/typed-holes.md.
+                       expected type, LOCAL in-scope bindings (params
+                       + lets), and candidate fillers, then exit. No
+                       binary is produced. See docs/typed-holes.md.
   --holes-json         Same as --holes, but emits the stable JSON
                        schema documented in docs/typed-holes.md (LLM
                        integration point).
+  --holes-scope        Like --holes / --holes-json, but list the FULL
+  --holes-json-scope   reachable scope per hole (hundreds of stdlib
+                       bindings) instead of the local slice.
   --diags-json         Emit collected structured diagnostics (errors +
                        notes) as a JSON object matching the LSP
                        Diagnostic shape. Only the m11 templates T1-T5
@@ -1698,6 +1703,12 @@ cmd_build() {
       --holes-json)
         [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
         report_mode="--holes-json"; shift ;;
+      --holes-scope)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes-scope"; shift ;;
+      --holes-json-scope)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes-json-scope"; shift ;;
       --diags-json)
         [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
         report_mode="--diags-json"; shift ;;
@@ -2845,6 +2856,9 @@ For language semantics and ecosystem, this is the entry point. The
 quickref of every form kaikai actually has is at:
 
   kai info syntax
+
+To look up ONE symbol's signature + doc (the cheapest reference
+read), use 'kai doc <module>.<symbol>' instead of a topic page.
 EOF
       return 0 ;;
     --list)
@@ -2893,9 +2907,12 @@ EOF
       echo
       echo "Usage:"
       echo "  kai info <topic>          Show topic page"
-      echo "  kai info <topic> --json   Structured JSON"
+      echo "  kai info <topic> --json [--section <name>]   Structured JSON"
       echo "  kai info --list           Topic names only"
       echo "  kai info -k <keyword>     Search"
+      echo
+      echo "For a single API, 'kai doc <module>.<symbol>' is cheaper than"
+      echo "any topic page."
       return 0 ;;
   esac
 
@@ -2912,6 +2929,10 @@ EOF
     ensure_built
     case "${1:-}" in
       --json)
+        if [ -n "${2:-}" ]; then
+          echo "kai: error: 'kai info builtins --json' takes no further flags" >&2
+          exit 2
+        fi
         exec "$KAIC2" --builtins-doc-json ;;
       *)
         echo "# builtins"
@@ -2943,103 +2964,107 @@ EOF
     exit 1
   fi
 
-  case "${1:-}" in
-    --json)
-      # Convert the page to JSON. Sections are H2 markdown headers
-      # (`## Section name`). The H1 (`# topic`) is the page title and
-      # is exposed as `"title"`; the first non-empty line after the H1
-      # before any H2 is the tagline (exposed as `"tagline"`). Body of
-      # each section is everything until the next H2 or EOF.
-      awk -v topic="$topic" '
-        function json_escape(s,    out, i, c, code) {
-          out = ""
-          for (i = 1; i <= length(s); i++) {
-            c = substr(s, i, 1)
-            code = ord[c]
-            if (c == "\\")      out = out "\\\\"
-            else if (c == "\"") out = out "\\\""
-            else if (c == "\t") out = out "\\t"
-            else if (c == "\n") out = out "\\n"
-            else if (c == "\r") out = out "\\r"
-            else if (code < 32) out = out sprintf("\\u%04x", code)
-            else                out = out c
-          }
-          return out
+  # Flags after the topic: `--json`, optionally narrowed by one or
+  # more `--section <name>` selectors (case-insensitive H2 names).
+  json=0
+  want=""
+  us="$(printf '\037')"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)
+        json=1; shift ;;
+      --section)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "kai: error: --section requires a section name" >&2
+          exit 2
+        fi
+        want="${want}${want:+$us}$1"; shift ;;
+      --section=*)
+        want="${want}${want:+$us}${1#--section=}"; shift ;;
+      *)
+        echo "kai: error: unknown flag for 'kai info $topic': $1" >&2
+        echo "  try '--json', '--json --section <name>', or no flag." >&2
+        exit 2 ;;
+    esac
+  done
+  if [ -n "$want" ] && [ "$json" = 0 ]; then
+    echo "kai: error: --section requires --json" >&2
+    exit 2
+  fi
+  if [ "$json" = 0 ]; then
+    cat "$page"
+    return 0
+  fi
+
+  # Convert the page to JSON. Sections are H2 markdown headers
+  # (`## Section name`). The H1 (`# topic`) is the page title and
+  # is exposed as `"title"`; the first non-empty line after the H1
+  # before any H2 is the tagline (exposed as `"tagline"`). Body of
+  # each section is everything until the next H2 or EOF. When `want`
+  # is non-empty only the named sections are emitted, and a name
+  # that matches nothing is an error listing what exists.
+  awk -v topic="$topic" -v want="$want" '
+    function json_escape(s,    out, i, c) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\")      out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else if (c == "\t") out = out "\\t"
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else if ((c in ord) && ord[c] < 32) out = out sprintf("\\u%04x", ord[c])
+        else                out = out c
+      }
+      return out
+    }
+    function want_has(name,    i) {
+      if (nwant == 0) return 1
+      for (i = 1; i <= nwant; i++)
+        if (tolower(wanted[i]) == tolower(name)) { hit[i] = 1; return 1 }
+      return 0
+    }
+    function save_section() {
+      if (sec == "") return
+      avail = avail (avail == "" ? "" : ", ") sec
+      if (!want_has(sec)) return
+      sub(/^\n+/, "", buf)
+      sub(/\n+$/, "", buf)
+      out = out (emitted ? "," : "") "\n    \"" json_escape(sec) "\": \"" json_escape(buf) "\""
+      emitted = 1
+    }
+    BEGIN {
+      for (i = 0; i < 128; i++) ord[sprintf("%c", i)] = i
+      nwant = (want == "") ? 0 : split(want, wanted, "\037")
+      title = ""; tagline = ""; sec = ""; buf = ""
+      in_preamble = 0; emitted = 0; out = ""; avail = ""
+    }
+    /^# / { title = substr($0, 3); in_preamble = 1; next }
+    /^## / { save_section(); sec = substr($0, 4); buf = ""; in_preamble = 0; next }
+    {
+      if (in_preamble) {
+        if (tagline == "" && NF > 0) tagline = $0
+      } else if (sec != "") {
+        buf = buf $0 "\n"
+      }
+    }
+    END {
+      save_section()
+      bad = 0
+      for (i = 1; i <= nwant; i++) {
+        if (!(i in hit)) {
+          printf "kai: error: no section \"%s\" in topic \"%s\"\n", wanted[i], topic > "/dev/stderr"
+          bad = 1
         }
-        BEGIN {
-          for (i = 0; i < 128; i++) ord[sprintf("%c", i)] = i
-          title = ""
-          tagline = ""
-          sec = ""
-          buf = ""
-          first = 1
-          in_preamble = 0
-          sections_started = 0
-        }
-        # H1: the page title.
-        /^# / {
-          title = substr($0, 3)
-          in_preamble = 1
-          next
-        }
-        # H2: a section header.
-        /^## / {
-          if (sec != "") {
-            sub(/\n+$/, "", buf)
-            if (!sections_started) {
-              printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
-              sections_started = 1
-            }
-            if (!first) printf ","
-            first = 0
-            printf "\n    \"%s\": \"%s\"", json_escape(sec), json_escape(buf)
-          }
-          sec = substr($0, 4)
-          buf = ""
-          in_preamble = 0
-          next
-        }
-        {
-          if (in_preamble) {
-            # Collect first non-empty line as tagline.
-            if (tagline == "" && NF > 0) {
-              tagline = $0
-            }
-          } else if (sec != "") {
-            buf = buf $0 "\n"
-          }
-        }
-        {
-          if (sec != "") {
-            buf = buf $0 "\n"
-          }
-        }
-        END {
-          if (sec != "") {
-            sub(/\n+$/, "", buf)
-            if (!sections_started) {
-              printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
-              sections_started = 1
-            }
-            if (!first) printf ","
-            first = 0
-            printf "\n    \"%s\": \"%s\"", json_escape(sec), json_escape(buf)
-          } else if (!sections_started) {
-            printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
-            sections_started = 1
-          }
-          printf "\n  }\n}\n"
-        }
-      ' "$page"
-      return 0 ;;
-    "")
-      cat "$page"
-      return 0 ;;
-    *)
-      echo "kai: error: unknown flag for 'kai info $topic': $1" >&2
-      echo "  try '--json' or no flag." >&2
-      exit 2 ;;
-  esac
+      }
+      if (bad) {
+        printf "  sections: %s\n", avail > "/dev/stderr"
+        exit 1
+      }
+      printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {%s\n  }\n}\n", topic, json_escape(title), json_escape(tagline), out
+    }
+  ' "$page"
 }
 
 # ---- kai upgrade — rustup-style self-update --------------------------------

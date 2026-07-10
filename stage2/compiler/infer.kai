@@ -17745,6 +17745,12 @@ pub fn label_to_string(l: Label) : String {
 pub type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
                       holes: [ResolvedHole], row_holes: [ResolvedRowHole],
                       prelude_len: Int,
+                      # length of the top-level env the root module's
+                      # decl bodies start from. A hole's scope entries
+                      # past this boundary (counted from the tail) are
+                      # top-level/prelude bindings; the head slice is
+                      # the hole's locals.
+                      toplevel_len: Int,
                       # the root file's module-level
                       # `#[doc(...)]` text, lifted from the DModuleDoc
                       # carrier decl that rides the stream into the
@@ -17781,6 +17787,7 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
       prelude_len: prelude_len,
+      toplevel_len: list_length(env.entries),
       module_doc: doc_module_doc_text(all_decls),
       diags: list_reverse(acc_diags),
       op_res: list_reverse(acc_op_res)
@@ -18954,7 +18961,8 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   let typed = TypedProgram {
     decls: tp.decls, errs: tp.errs + cov_errs + priv_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
-    prelude_len: tp.prelude_len, module_doc: tp.module_doc,
+    prelude_len: tp.prelude_len, toplevel_len: tp.toplevel_len,
+    module_doc: tp.module_doc,
     diags: tp.diags, op_res: tp.op_res
   }
   # the returned delta carries ONLY this module's
@@ -19040,7 +19048,7 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
   typecheck_program_loop(file, modules, module_env_delta_empty(),
                           all_program_decls,
                           proto_impls, head_owners, verbose,
-                          [], 0, [], [], [], [], [], 0)
+                          [], 0, [], [], [], [], [], 0, 0)
 }
 
 fn flatten_module_decls(mods: [ModuleDecls], acc: [Decl]) : [Decl] = match mods {
@@ -19069,7 +19077,11 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                             acc_row_holes: [ResolvedRowHole],
                             acc_diags: [Diagnostic],
                             acc_op_res: [OpResolution],
-                            prelude_len_acc: Int) : TypedProgram / Console + File {
+                            prelude_len_acc: Int,
+                            # last module's top-level env length. The
+                            # target file is typed last, so this is the
+                            # boundary its holes' locals sit above.
+                            toplevel_len_acc: Int) : TypedProgram / Console + File {
 
   match modules {
     [] -> TypedProgram {
@@ -19077,6 +19089,7 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
       prelude_len: prelude_len_acc,
+      toplevel_len: toplevel_len_acc,
       module_doc: doc_module_doc_text(all_program_decls),
       diags: list_reverse(acc_diags),
       op_res: list_reverse(acc_op_res)
@@ -19099,7 +19112,7 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                                                          acc_row_holes),
                               prepend_reverse_diags(r.typed.diags, acc_diags),
                               prepend_reverse_op_res(r.typed.op_res, acc_op_res),
-                              next_prelude_len)
+                              next_prelude_len, r.typed.toplevel_len)
     }
   }
 }
@@ -19722,21 +19735,29 @@ fn dump_scope_entry(te: TyEntry) : Unit / Console =
 fn dump_hole_candidate(c: String) : Unit / Console =
   print("    #{c}")
 
-fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit / Console {
+# The default report lists only the hole's LOCAL bindings (params +
+# lets); the surrounding top-level scope — hundreds of stdlib entries
+# — is summarised as a count and dumped only under `--holes-scope`.
+fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int,
+                    toplevel_len: Int, full: Bool) : Unit / Console {
   match rh {
     RH(kind, line, col, ty, scope, env_fresh) -> {
       let label = hole_kind_label(kind)
       let user_scope = drop_last_entries(scope, prelude_len)
+      let shown = if full { user_scope }
+                  else { drop_last_entries(scope, toplevel_len) }
+      let elided = list_length(user_scope) - list_length(shown)
       let cands = synth_candidates(scope, ty, env_fresh)
       print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
       print("")
       print("  expected: #{inf_ty_to_string(ty)}")
       print("")
-      match user_scope {
-        [] -> { print("  in scope: (empty)") print("") }
+      let scope_label = if full { "  in scope:" } else { "  in scope (local):" }
+      match shown {
+        [] -> { print(if full { "  in scope: (empty)" } else { "  in scope (local): (empty)" }) print("") }
         _  -> {
-          print("  in scope:")
-          user_scope |> each(dump_scope_entry)
+          print(scope_label)
+          shown |> each(dump_scope_entry)
           print("")
         }
       }
@@ -19745,6 +19766,13 @@ fn dump_hole_report(file: String, rh: ResolvedHole, prelude_len: Int) : Unit / C
         _  -> {
           print("  candidates that fit:")
           cands |> each(dump_hole_candidate)
+          print("")
+        }
+      }
+      match elided {
+        0 -> ()
+        _ -> {
+          print("  #{int_to_string(elided)} more bindings in scope (--holes-scope lists them)")
           print("")
         }
       }
@@ -19764,11 +19792,15 @@ fn hole_kind_label(k: HoleKind) : String {
   }
 }
 
-fn dump_holes_loop(file: String, hs: [ResolvedHole], prelude_len: Int) : Unit / Console {
+fn dump_holes_loop(file: String, hs: [ResolvedHole], prelude_len: Int,
+                   toplevel_len: Int, full: Bool) : Unit / Console {
 
   match hs {
     [] -> ()
-    [h, ...rest] -> { dump_hole_report(file, h, prelude_len) dump_holes_loop(file, rest, prelude_len) }
+    [h, ...rest] -> {
+      dump_hole_report(file, h, prelude_len, toplevel_len, full)
+      dump_holes_loop(file, rest, prelude_len, toplevel_len, full)
+    }
   }
 }
 
@@ -19896,13 +19928,13 @@ fn synth_candidates_loop(all: [TyEntry], cur: [TyEntry], expected: Ty, fresh: In
 fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int) : [String] =
   synth_candidates_loop(scope, scope, expected, fresh, [], 8)
 
-#[doc("infer: --holes human-readable typed-hole report.")]
-pub fn dump_holes(file: String, decls: [Decl]) : Int / Console + File {
+#[doc("infer: --holes human-readable typed-hole report. `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes(file: String, decls: [Decl], full: Bool) : Int / Console + File {
 
   let r = infer_program(file, decls, false)
   match r.holes {
     [] -> { print("(no typed holes)") r.errs }
-    _  -> { dump_holes_loop(file, r.holes, r.prelude_len) r.errs }
+    _  -> { dump_holes_loop(file, r.holes, r.prelude_len, r.toplevel_len, full) r.errs }
   }
 }
 
@@ -19910,11 +19942,10 @@ pub fn dump_holes(file: String, decls: [Decl]) : Int / Console + File {
 #
 # Emits a single JSON array, stable schema per docs/typed-holes.md.
 # Each element carries {file, line, col, name, expected_type, in_scope,
-# candidates}. `in_scope` lists every reachable binding including the
-# prelude — an LLM that consumes this output wants the full picture.
-# `candidates` is a (possibly empty) list; bounded synthesis fills it
-# in a follow-up pass, but the array is always present so the schema
-# stays stable across feature rollouts.
+# candidates, scope_elided}. By default `in_scope` lists the hole's
+# LOCAL bindings (params + lets) and `scope_elided` counts the
+# reachable bindings not listed; `--holes-json-scope` lists everything
+# (prelude included) with `scope_elided: 0`.
 
 # the JSON string escaper moved to compiler/util.kai
 # (json_escape / json_quote) so doc_attr.kai can share it without
@@ -19940,10 +19971,13 @@ fn json_candidate(expr: String) : String =
 fn json_candidates(cs: [String]) : String =
   concat_all(["[", inf_join_with(map(cs, json_candidate), ", "), "]"])
 
-fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole) : String {
+fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole,
+                    toplevel_len: Int, full: Bool) : String {
   match rh {
     RH(kind, line, col, ty, scope, env_fresh) -> {
       let kj = hole_kind_json(kind)
+      let shown = if full { scope } else { drop_last_entries(scope, toplevel_len) }
+      let elided = list_length(scope) - list_length(shown)
       let cands = synth_candidates(scope, ty, env_fresh)
       # the surrounding declaration's `#[doc(...)]` text,
       # resolved by source position against the root file's doc side
@@ -19961,7 +19995,8 @@ fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole) : Stri
         ", \"name\": ", kj.name,
         ", \"message\": ", kj.message,
         ", \"expected_type\": ", json_str(inf_ty_to_string(ty)),
-        ", \"in_scope\": ", json_scope_entries(scope),
+        ", \"in_scope\": ", json_scope_entries(shown),
+        ", \"scope_elided\": ", int_to_string(elided),
         ", \"candidates\": ", json_candidates(cands),
         ", \"doc\": ", doc_field,
         "}"
@@ -19989,11 +20024,11 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
   }
 }
 
-#[doc("infer: --holes-json structured typed-hole report. doc_items is the root file's doc side table.")]
-pub fn dump_holes_json(file: String, decls: [Decl], doc_items: [DocItem]) : Int / Console + File {
+#[doc("infer: --holes-json structured typed-hole report. doc_items is the root file's doc side table; `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes_json(file: String, decls: [Decl], doc_items: [DocItem], full: Bool) : Int / Console + File {
 
   let r = infer_program(file, decls, false)
-  let body = inf_join_with(map(r.holes, (h) => json_hole_report(file, doc_items, h)), ", ")
+  let body = inf_join_with(map(r.holes, (h) => json_hole_report(file, doc_items, h, r.toplevel_len, full)), ", ")
   print(concat_all(["[", body, "]"]))
   r.errs
 }

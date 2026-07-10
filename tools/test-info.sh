@@ -83,4 +83,26 @@ if "$KAI" info -k zzznotarealword >/dev/null 2>&1; then
   fail "'kai info -k zzznotarealword' should exit non-zero"
 fi
 
-echo "test-info: OK — $count topics, plain + JSON output, -k body search"
+# 7. `--json --section` narrows to the named sections (case-insensitive,
+#    repeatable); an unknown name errors listing what exists; --section
+#    without --json is rejected.
+if command -v python3 >/dev/null 2>&1; then
+  "$KAI" info pipes --json --section description --section Examples 2>&1 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+keys = sorted(d['sections'].keys())
+if keys != ['Description', 'Examples']:
+    sys.stderr.write('unexpected sections: %r\n' % keys); sys.exit(1)
+" || fail "'kai info pipes --json --section' did not narrow to the named sections"
+fi
+if "$KAI" info pipes --json --section zzznotasection >/dev/null 2>&1; then
+  fail "'--section zzznotasection' should exit non-zero"
+fi
+if "$KAI" info pipes --section Description >/dev/null 2>&1; then
+  fail "'--section' without '--json' should exit non-zero"
+fi
+
+# 8. `deltas` exists (the prior-collision card the llm topic points at).
+"$KAI" info deltas >/dev/null 2>&1 || fail "'kai info deltas' must exist; 'kai info llm' cites it"
+
+echo "test-info: OK — $count topics, plain + JSON output, -k body search, --section"

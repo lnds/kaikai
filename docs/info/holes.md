@@ -34,11 +34,18 @@ fn main() : Int = 0
 $ kai build --holes file.kai
 file.kai:2:11: type hole ?
   expected: Int
-  in scope:
+  in scope (local):
     s : String
-    main : () -> Int
-    ...stdlib functions in scope...
+  candidates that fit:
+    maybe_parse(s)
+    ...
+  861 more bindings in scope (--holes-scope lists them)
 ```
+
+The report is LOCAL by default: parameters and lets around the hole,
+plus candidate fillers. The full reachable scope (hundreds of stdlib
+bindings) is one flag away — `kai build --holes-scope` — but the
+local report plus `kai doc <module>.<symbol>` is usually cheaper.
 
 ## JSON output
 
@@ -52,8 +59,13 @@ kind            string         "hole" (vs other hole kinds)
 name            string|null    null for `?`, name for `?ident`
 message         string|null    extra context if any
 expected_type   string         the type the hole must have
-in_scope        array          [{name, type}, ...] of all bindings
+in_scope        array          [{name, type}, ...] local bindings
+scope_elided    int            reachable bindings not listed
 ```
+
+`kai build --holes-json-scope` lists every reachable binding in
+`in_scope` (`scope_elided: 0`) when you genuinely need the full
+picture.
 
 See `docs/lsp.md` for the LSP hover format that wraps the same data.
 

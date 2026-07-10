@@ -3,12 +3,28 @@
 Bootstrap guide for an agentic AI pointed at a kaikai repo — what
 kaikai is, where to read, and how to use the tooling built for you.
 
-## Description
+## The cheap path (read this first)
 
-This page is for an LLM with weak prior exposure to kaikai. You will
-extrapolate from Haskell, Python, JS, or Elixir and get kaikai wrong;
-the tooling here exists to stop that. Read it once, then use
-`kai info` as your standing source of truth.
+Reference reads cost you tokens; buy the smallest answer that works.
+In order of preference:
+
+1. **One API? `kai doc <module>.<symbol>`** — signature + doc of a
+   single symbol (`kai doc string.split`). `kai doc <module>` lists a
+   module; `kai doc` lists the modules. This is the default move for
+   "what does X take / return / do".
+2. **Before your first line of kaikai: `kai info deltas`** — the
+   ~60-line card of where kaikai deliberately breaks Rust/Go/Python
+   habits (`#` comments, `:=` assignment, `++` is concat, no
+   `return`, …). One read prevents the classic prior collisions.
+3. **A form you have not written before? `kai info syntax`** — the
+   one-page sheet of every form kaikai has, with a NOT-IN-KAIKAI
+   section of false friends. Treat it as ground truth.
+4. **Full topic pages (`kai info effects`, `kai info match`, …) are
+   the fallback, not the default.** Read one only when you are stuck
+   or working deep in that feature — each page is a big read, and
+   most questions are answered by 1–3 above.
+
+Never extrapolate from another language; check first.
 
 ## What kaikai is
 
@@ -20,20 +36,11 @@ BEAM-style isolated fibers — there is no garbage collector and no
 borrow checker. Effects are visible in the type of every function
 that performs them.
 
-## kai info is your first source of truth
-
-Before writing ANY `.kai` code, run `kai info syntax` — the one-page
-cheat sheet of every form kaikai actually has. It carries a
-NOT-IN-KAIKAI section listing the false friends (operator sections,
-`\x -> body` lambdas, list comprehensions, `do { }` blocks, type
-classes, `throw`/`catch`, `return` statements) that look plausible
-but do not exist. Treat that section as ground truth.
-
-Then read the per-topic page for the feature you are using. The
-topics:
+## The topic list
 
 ```text
-syntax      the one-page cheat sheet (read this first)
+syntax      the one-page cheat sheet of forms
+deltas      prior-collision card — kaikai vs. your habits
 idiomatic   how to write kaikai well, with the wrong reaches to avoid
 effects     algebraic effects and handlers
 fibers      structured concurrency, Spawn/await/cancel
@@ -51,10 +58,9 @@ lsp         editor integration surface
 builtins    doc tree of the auto-loaded core modules
 ```
 
-The rule, verbatim: never extrapolate from another language. Running
-`kai info <topic>` is the cheap, always-correct check. For idiom
-specifically — when your code compiles but reads wrong — read
-`kai info idiomatic`.
+Topic pages open with a TL;DR — if the first ten lines do not answer
+you, `kai info <topic> --json --section <name>` fetches one section
+instead of the whole page.
 
 ## LLM-facing tooling
 
@@ -67,23 +73,24 @@ compilation. Three features make that reachable.
 
 ### Structured JSON of any topic
 
-Every `kai info` page has a `--json` form with the same content as
-structured data, for programmatic consumption:
+Every `kai info` page has a `--json` form, and `--section <name>`
+narrows it to the sections you name (repeatable; case-insensitive):
 
 ```text
-$ kai info pipes --json
+$ kai info pipes --json --section Description
 { "topic": "pipes", "title": "pipes", "tagline": "...",
-  "sections": { "Description": "...", "Examples": "..." } }
+  "sections": { "Description": "..." } }
 ```
 
-Prefer the JSON form when you are parsing, not reading.
+Prefer the JSON form when you are parsing, not reading — and prefer
+`--section` over paying for the whole object.
 
 ### Typed holes
 
 Write `?` (or `?name`) where you do not yet know an expression, then
-let the compiler tell you the type it must have and the bindings in
-scope. `kai info holes` is authoritative; the workflow is: stub →
-compile → read the report → fill.
+let the compiler tell you the type it must have and the local
+bindings in scope. `kai info holes` is authoritative; the workflow
+is: stub → compile → read the report → fill.
 
 ```kaikai
 fn scale(xs: [Int], factor: Int) : [Int] = {
@@ -98,16 +105,18 @@ fn main() : Int = 0
 $ kai build --holes file.kai
 file.kai:2:16: type hole ?
   expected: [Int]
-  in scope:
+  in scope (local):
     factor : Int
     xs : [Int]
-    ...stdlib functions in scope...
 ```
 
 `kai build --holes-json` emits the same per-hole report as a JSON
-array (`expected_type`, `in_scope`, position) designed for you to
-consume directly. Holes are the prototype of the LLM-authorability
-bet — reach for them whenever you are unsure of a type.
+array (`expected_type`, `in_scope`, `candidates`, position) designed
+for you to consume directly. Both forms report the LOCAL scope —
+parameters and lets around the hole. When you genuinely need every
+reachable binding (stdlib included), `--holes-scope` /
+`--holes-json-scope` dump the full picture; it is large, so reach
+for `kai doc` first.
 
 ### Structured diagnostics
 
@@ -139,18 +148,19 @@ syntax*, `kai info` wins over any doc prose — docs can drift; the
 The concrete recipe for writing a kaikai function as an agent:
 
 ```text
-1. kai info syntax + kai info idiomatic   (forms + idiom)
-2. kai info <topic>                        (the feature you need)
-3. write it, using ? holes where unsure
-4. kai build / kai run  (read diagnostics; prefer the --json forms)
-5. iterate
+1. kai info deltas                (once per session — the collisions)
+2. kai doc <module>.<symbol>      (each API you are about to call)
+3. write it, using ? holes where unsure; check a form against
+   kai info syntax if you have not written it before
+4. kai build / kai run            (read diagnostics; prefer --json)
+5. stuck on a feature? only then read its topic page
 ```
 
-`kai info` for the forms, holes for the unknowns, and JSON
-diagnostics for the errors are how you hit the one-round bar: the
-top 80% of typical functions correct on the first compile.
+`kai doc` for the APIs, holes for the unknowns, and JSON diagnostics
+for the errors are how you hit the one-round bar: the top 80% of
+typical functions correct on the first compile.
 
 ## See also
 
-`kai info idiomatic`, `kai info syntax`, `kai info holes`,
-`kai info effects`, `kai info packages`
+`kai info deltas`, `kai info syntax`, `kai info idiomatic`,
+`kai info holes`, `kai info packages`
