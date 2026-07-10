@@ -710,8 +710,8 @@ fn nemit_tag_eq(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
 fn nemit_tagof(ctx: Handle, v: KVal) : Handle / Console =
   ncall_sig1(ctx, "kaix_variant_tag_of", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, v))
 
-# Push each boxed slot-init atom into a fresh buffer (all SIBoxed today;
-# the i64-inline raw-scalar shapes are a later subset).
+# Push each slot-init atom BOXED into a fresh buffer — the mask==0 ctor
+# route (`kaix_variant`), where every slot is a pointer word.
 fn nemit_init_buf(ctx: Handle, inits: [KSlotInit]) : Handle / Console = {
   let buf = llvm_buf_new(); nemit_push_inits(ctx, buf, inits); buf
 }
@@ -720,6 +720,7 @@ fn nemit_push_inits(ctx: Handle, buf: Handle, inits: [KSlotInit]) : Unit / Conso
   [SIBoxed(v), ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
   [SIInt64(v), ...rest] -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
   [SIReal(v), ...rest]  -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
+  [SIEnum(v), ...rest]  -> { llvm_buf_push(buf, nemit_atom(ctx, v)); nemit_push_inits(ctx, buf, rest) }
 }
 
 # A record literal: `kaix_record(n, fieldbuf, namebuf)` — parallel C
@@ -887,12 +888,39 @@ fn nemit_i64_token_slot_array(ctx: Handle, tokw: Handle, inits: [KSlotInit]) : H
   nemit_store_slot_words(ctx, arr, arrty, inits, 1); arr
 }
 # FLAT single frame (asu "risk #1"): a kind-1 Int slot returns the raw `i64`
-# in tail; a boxed/Real slot captures its boxed handle in a `let` in THIS frame
-# and `ptrtoint`s it in tail (mirror of `ffi_rebox_fixed_val`).
-fn nemit_slot_word(ctx: Handle, it: KSlotInit) : Handle / Console = match it {
+# in tail; a kind-2 Real slot the raw `f64` (its 8 bytes land in the union
+# word); a kind-3 enum slot the immediate tag as `i64`; a boxed slot captures
+# its boxed handle in a `let` in THIS frame and `ptrtoint`s it in tail.
+#[doc("The machine word for one ctor slot init, at the slot's declared kind.")]
+pub fn nemit_slot_word(ctx: Handle, it: KSlotInit) : Handle / Console = match it {
   SIInt64(v) -> nemit_atom_raw(ctx, v, SInt64)
-  SIReal(v)  -> { let b = nemit_atom(ctx, v); llvm_build_ptrtoint(native_ctx_b(ctx), b, native_ctx_i64t(ctx)) }
+  SIReal(v)  -> nemit_real_slot_word(ctx, v)
+  SIEnum(v)  -> nemit_enum_slot_word(ctx, v)
   SIBoxed(v) -> { let b = nemit_atom(ctx, v); llvm_build_ptrtoint(native_ctx_b(ctx), b, native_ctx_i64t(ctx)) }
+}
+
+# The raw `f64` word for a kind-2 Real slot. A raw literal / raw `SReal`
+# register needs no box; a boxed source is CONSUMED (`kaix_take_real`, the
+# C `{.r = kai_take_real(...)}` mirror) — a borrow here would leak the
+# owned heap box the ctor was planned to consume.
+fn nemit_real_slot_word(ctx: Handle, v: KVal) : Handle / Console = match v {
+  KRealV(r) -> llvm_const_real(native_ctx_f64t(ctx), r)
+  KVar(n)   ->
+    if native_ctx_reg_slot(ctx, n) == 2 { nemit_load_reg(ctx, n) }
+    else { let b = nemit_atom(ctx, v)
+           ncall_sig1(ctx, "kaix_take_real", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), b) }
+  _         -> { let b = nemit_atom(ctx, v)
+                 ncall_sig1(ctx, "kaix_take_real", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), b) }
+}
+
+# The immediate-tag `i64` word for a kind-3 enum slot. A `KIntV` is the
+# lowering's literal-ctor peephole (the tag itself — no singleton read); any
+# other atom is the boxed enum value, consumed via `kaix_take_enum` (the
+# decref is a no-op on the immortal singleton, kept for C-oracle symmetry).
+fn nemit_enum_slot_word(ctx: Handle, v: KVal) : Handle / Console = match v {
+  KIntV(tag) -> llvm_const_int(native_ctx_i64t(ctx), tag)
+  _          -> { let b = nemit_atom(ctx, v)
+                  ncall_sig1(ctx, "kaix_take_enum", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), b) }
 }
 
 # `kaix_variant_masked(i32 tag, i8* name, i32 n, i64* slots) -> ptr` — the fast

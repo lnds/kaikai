@@ -1,0 +1,98 @@
+# Full variant_slot_mask parity (issue #1157). One ctor carries all four
+# slot kinds — pointer, enum (Color), Real and Int — so the native mask,
+# construction, the match reads, reuse-in-place and the TRMC spine step all
+# exercise the full 2-bit-per-slot layout the C backend lays. The folds read
+# every slot back, so a word stored at the wrong kind (a tagged pointer in a
+# raw slot or vice versa) shows up as a wrong sum or a crash; the 200k-deep
+# spine pins the TRMC interplay and the drop walker over raw slots.
+
+type Color = Red | Black
+type Chain = End | Cell(Chain, Color, Real, Int)
+
+fn flip(c: Color) : Color = match c {
+  Red   -> Black
+  Black -> Red
+}
+
+# Ascending keys keep each push O(1); the single below-min push afterwards
+# descends the whole spine — one full-depth TRMC rebuild storing enum, Real
+# and Int words through the spine step.
+fn push_max(c: Chain, k: Int, r: Real, col: Color) : Chain = match c {
+  End -> Cell(End, col, r, k)
+  Cell(rest, cx, rx, kx) ->
+    if k > kx { Cell(Cell(rest, cx, rx, kx), col, r, k) }
+    else      { Cell(push_max(rest, k, r, col), cx, rx, kx) }
+}
+
+fn build(c: Chain, i: Int, n: Int) : Chain =
+  if i >= n { c }
+  else { build(push_max(c, i + 1, int_to_real(i + 1) * 0.5, if i % 2 == 0 { Red } else { Black }), i + 1, n) }
+
+# Reuse-in-place rebuild: the arm consumes the scrutinee and rebuilds the
+# same shape with a flipped enum word and a shifted Real word (the recursive
+# call is let-bound, so this is the plain KConReuse route, not TRMC).
+fn recolor(c: Chain) : Chain = match c {
+  End -> End
+  Cell(rest, cx, rx, kx) -> {
+    let nr = recolor(rest)
+    Cell(nr, flip(cx), rx + 0.25, kx)
+  }
+}
+
+fn count_red(c: Chain, acc: Int) : Int = match c {
+  End -> acc
+  Cell(rest, Red, _, _) -> count_red(rest, acc + 1)
+  Cell(rest, _, _, _)   -> count_red(rest, acc)
+}
+
+fn sum_reals(c: Chain, acc: Real) : Real = match c {
+  End -> acc
+  Cell(rest, _, r, _) -> sum_reals(rest, acc + r)
+}
+
+fn sum_keys(c: Chain, acc: Int) : Int = match c {
+  End -> acc
+  Cell(rest, _, _, k) -> sum_keys(rest, acc + k)
+}
+
+# Shared-tag discrimination over the enum slot, a Real literal slot and an
+# Int literal slot in one match family — the static-test shapes.
+fn classify(c: Chain) : Int = match c {
+  End -> 0
+  Cell(_, Red, 0.5, _)   -> 1
+  Cell(_, Red, _, 7)     -> 2
+  Cell(_, Red, _, _)     -> 3
+  Cell(_, Black, 1.0, _) -> 4
+  Cell(_, Black, _, _)   -> 5
+}
+
+fn depth(c: Chain, acc: Int) : Int = match c {
+  End -> acc
+  Cell(rest, _, _, _) -> depth(rest, acc + 1)
+}
+
+fn main() = {
+  let n = 200000
+  let c = push_max(build(End, 0, n), 0, 0.125, Red)
+  print("depth: " ++ int_to_string(depth(c, 0)))
+  print("reds: " ++ int_to_string(count_red(c, 0)))
+  print("keys: " ++ int_to_string(sum_keys(c, 0)))
+  print("reals: " ++ real_to_string(sum_reals(c, 0.0)))
+  # `c2` stays live across the recolor, so the rebuild takes the SHARED
+  # donor route; the chain below takes the unique in-place route. The
+  # recolor recursion is deliberately NOT modulo-cons (the let keeps it a
+  # plain KConReuse), so its depth stays stack-friendly at 2000.
+  let c2 = build(End, 0, 2000)
+  let d = recolor(c2)
+  print("reds after shared recolor: " ++ int_to_string(count_red(d, 0)))
+  print("reals after shared recolor: " ++ real_to_string(sum_reals(d, 0.0)))
+  print("reds original intact: " ++ int_to_string(count_red(c2, 0)))
+  let e = recolor(build(End, 0, 5))
+  print("unique recolor reds: " ++ int_to_string(count_red(e, 0)))
+  print("unique recolor reals: " ++ real_to_string(sum_reals(e, 0.0)))
+  print("classify red first: " ++ int_to_string(classify(build(End, 0, 1))))
+  print("classify red key7: " ++ int_to_string(classify(push_max(End, 7, 9.0, Red))))
+  print("classify black: " ++ int_to_string(classify(push_max(End, 3, 4.0, Black))))
+  print("classify black r1: " ++ int_to_string(classify(push_max(End, 3, 1.0, Black))))
+  print("classify end: " ++ int_to_string(classify(End)))
+}
