@@ -35,14 +35,14 @@
  * Koka runtime while the trailing stage0 dir still supplies any header
  * the shim needs that stage2 lacks.
  *
- * Soundness: the emitted IR declares `%KaiValue = type opaque` and
- * every `getelementptr` is over `%KaiValue**` arrays (arg/capture/
- * buffer), NEVER over a cell's `as.*`/`tag`/`rc` interior — verified
- * across the rb-tree IR (1056 GEPs, all `%KaiValue*`, zero
- * inttoptr/ptrtoint). One runtime behind two ABIs is therefore sound:
- * the IR cannot observe the value representation. The only place that
- * reads a cell's Int payload is this shim, and every such read now
- * goes through `kai_intf` (tagged-immediate-safe), not raw `->as.i`.
+ * Layout coupling: the emitted IR reads cell interiors directly (the
+ * variant tag word and the inline slot array) through typed GEPs the
+ * emitter lays against the VANILLA packed header — see
+ * stage2/compiler/emit_native_slot.kai, the one module that owns that
+ * layout. The static asserts below pin `struct KaiValue` to the exact
+ * offsets the emitter hardcodes; a header change (or a build defining
+ * KAI_TRACE_RC* for this TU, which grows the header) fails here at
+ * compile time instead of miscompiling every slot read.
  *
  * Angle brackets, not quotes: this file LIVES in stage0/, next to the
  * old stage0/runtime.h. A quoted `#include "runtime.h"` searches the
@@ -52,6 +52,16 @@
  * lines place stage2 ahead of stage0 — exactly the resolution the
  * C-backend already relies on. */
 #include <runtime.h>
+#include <stddef.h>
+
+/* The native emitter's layout module (emit_native_slot.kai) models the
+ * cell as `{ i32 rc, i8 tag, i8 var_n_args, i16 variant_tag, [N x i64] }`
+ * with the slot array at the union offset. These pins are that contract. */
+_Static_assert(offsetof(KaiValue, rc) == 0, "native emitter layout: rc at 0");
+_Static_assert(offsetof(KaiValue, tag) == 4, "native emitter layout: tag at 4");
+_Static_assert(offsetof(KaiValue, var_n_args) == 5, "native emitter layout: var_n_args at 5");
+_Static_assert(offsetof(KaiValue, variant_tag) == 6, "native emitter layout: variant_tag at 6");
+_Static_assert(offsetof(KaiValue, as) == 8, "native emitter layout: slot array at 8");
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
