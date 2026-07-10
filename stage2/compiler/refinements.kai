@@ -805,11 +805,10 @@ fn ac_contains(loose: AnchoredClass, strict: AnchoredClass) : Bool {
   }
 }
 
-# Substitute every free `self` in `e` with `EVar(name)`. The
-# refinement grammar only uses `self` as a stand-in for the value
-# being refined, so we do not chase shadowing — `self` is never
-# rebound by `let` / lambda / match inside a predicate.
-fn subst_self(e: Expr, name: String) : Expr = match e.kind {
+# `self` is never rebound by `let` / lambda / match inside a
+# predicate, so no shadowing chase is needed.
+#[doc("Substitute every free `self` in a predicate Expr with `EVar(name)`.")]
+pub fn subst_self(e: Expr, name: String) : Expr = match e.kind {
   EVar(s) -> if s == "self" { mk_expr(EVar(name), e.line, e.col) } else { e }
   EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self(a, name), subst_self(b, name)), e.line, e.col)
   EUnop(op, x) -> mk_expr(EUnop(op, subst_self(x, name)), e.line, e.col)
@@ -1022,9 +1021,9 @@ pub fn try_eval_pred(e: Expr) : Option[Bool] {
         }
       } else if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
         match try_eval_int(a) {
-          None    -> None
+          None    -> try_eval_real_cmp(op, a, b)
           Some(ai) -> match try_eval_int(b) {
-            None    -> None
+            None    -> try_eval_real_cmp(op, a, b)
             Some(bi) -> Some(eval_int_cmp(op, ai, bi))
           }
         }
@@ -1066,6 +1065,58 @@ fn eval_int_op(op: String, a: Int, b: Int) : Option[Int] {
 }
 
 fn eval_int_cmp(op: String, a: Int, b: Int) : Bool {
+  if op == "==" { a == b }
+  else if op == "!=" { a != b }
+  else if op == "<" { a < b }
+  else if op == "<=" { a <= b }
+  else if op == ">" { a > b }
+  else if op == ">=" { a >= b }
+  else { false }
+}
+
+# Real fallback for the comparison arms of `try_eval_pred`. Fires only
+# when at least one side is a genuine Real literal — an all-Int
+# comparison already folded exactly via `try_eval_int`.
+fn try_eval_real_cmp(op: String, a: Expr, b: Expr) : Option[Bool] {
+  match try_eval_real(a) {
+    None -> None
+    Some(ar) -> match try_eval_real(b) {
+      None -> None
+      Some(br) -> Some(eval_real_cmp(op, ar, br))
+    }
+  }
+}
+
+#[doc("Fold a closed Real Expr (Real/Int literals, +/-/*, unary negation) to its value; None when it is not closed.")]
+pub fn try_eval_real(e: Expr) : Option[Real] {
+  match e.kind {
+    EReal(r, _) -> Some(r)
+    EInt(n) -> Some(int_to_real(n))
+    EUnop(op, x) -> if op == "-" {
+      match try_eval_real(x) {
+        Some(v) -> Some(0.0 - v)
+        None    -> None
+      }
+    } else { None }
+    EBinop(op, a, b) -> match try_eval_real(a) {
+      None    -> None
+      Some(av) -> match try_eval_real(b) {
+        None    -> None
+        Some(bv) -> eval_real_op(op, av, bv)
+      }
+    }
+    _ -> None
+  }
+}
+
+fn eval_real_op(op: String, a: Real, b: Real) : Option[Real] {
+  if op == "+" { Some(a + b) }
+  else if op == "-" { Some(a - b) }
+  else if op == "*" { Some(a * b) }
+  else { None }
+}
+
+fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
   if op == "==" { a == b }
   else if op == "!=" { a != b }
   else if op == "<" { a < b }
@@ -1229,14 +1280,14 @@ fn pred_starts_with_loop(s: String, soff: Int, prefix: String, poff: Int, n: Int
 }
 
 # Refinement bindings visible inside a function body: each entry
-# pairs a binding name with the (canonicalised, self-substituted)
-# predicate the typer would attach to its TyRefine. Built from the
-# enclosing fn's parameter list; `let` bindings without explicit
-# refinement annotations contribute nothing (interval inference is
-# the lattice's job, not this analysis).
-type RefBinding = RBind(String, Expr)
+# pairs a binding name with its self-substituted refinement predicate.
+# `let` bindings without explicit refinement annotations contribute
+# nothing (interval inference is the lattice's job, not this analysis).
+#[doc("A binding name paired with its self-substituted refinement predicate.")]
+pub type RefBinding = RBind(String, Expr)
 
-fn collect_caller_refinements(params: [Param], acc: [RefBinding]) : [RefBinding] {
+#[doc("Collect the refinement predicates of a param list as RefBindings (self already substituted to the param name).")]
+pub fn collect_caller_refinements(params: [Param], acc: [RefBinding]) : [RefBinding] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> match p.ptype {
@@ -1259,9 +1310,9 @@ fn lookup_caller_refinement(refs: [RefBinding], name: String) : Option[Expr] {
   }
 }
 
-# A single classification of a call-site relative to one of the
-# callee's requirements. Fixtures pin these via `--dump-call-elision`.
-type CallSiteStatus = CSElided | CSRuntime | CSLoose(String)
+# Fixtures pin these via `--dump-call-elision`.
+#[doc("Classification of a predicate discharge attempt: elided (proven), runtime (undecided), or loose (statically refuted, with reason).")]
+pub type CallSiteStatus = CSElided | CSRuntime | CSLoose(String)
 
 # Outcome record: callee name, param name (or "__requires"), the
 # discharged predicate as it was tested, and the status.
@@ -1273,14 +1324,15 @@ type CallSiteReport = CSR(String, String, Expr, CallSiteStatus, Int, Int)
 # name baked in (already substituted from `self`). `arg` is the AST
 # expression at the call site. `caller_refs` is the refinement
 # environment built from the enclosing fn's parameters.
-fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
+#[doc("Classify one predicate-vs-value discharge: CSElided when provable, CSLoose when a closed value refutes it, CSRuntime otherwise.")]
+pub fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
                         caller_refs: [RefBinding]) : CallSiteStatus {
-  match try_eval_int(arg) {
-    Some(k) -> {
-      let folded = pred_canon(subst_var(req_pred, pname, mk_int(k, arg.line, arg.col)))
+  match try_eval_num_lit(arg) {
+    Some(lit) -> {
+      let folded = pred_canon(subst_var(req_pred, pname, lit))
       match try_eval_pred(folded) {
         Some(true) -> CSElided
-        Some(false) -> CSLoose(concat_all(["literal ", int_to_string(k), " violates `", expr_show_pred(req_pred), "`"]))
+        Some(false) -> CSLoose(concat_all(["literal ", expr_show_pred(lit), " violates `", expr_show_pred(req_pred), "`"]))
         None -> CSRuntime
       }
     }
@@ -1309,6 +1361,19 @@ fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
 fn mk_int(n: Int, line: Int, col: Int) : Expr = mk_expr(EInt(n), line, col)
 fn mk_var(s: String, line: Int, col: Int) : Expr = mk_expr(EVar(s), line, col)
 
+# Fold a closed numeric value to a literal node for substitution into
+# a predicate: exact Int when possible, Real when a Real literal
+# participates.
+fn try_eval_num_lit(e: Expr) : Option[Expr] {
+  match try_eval_int(e) {
+    Some(k) -> Some(mk_int(k, e.line, e.col))
+    None -> match try_eval_real(e) {
+      Some(r) -> Some(mk_expr(EReal(r, real_to_string(r)), e.line, e.col))
+      None -> None
+    }
+  }
+}
+
 # Substitute every free `EVar(from)` in `e` with `to`. Mirrors
 # `subst_self` but for an arbitrary name. Used to push a literal /
 # binding into a callee's predicate before discharging it.
@@ -1325,12 +1390,13 @@ fn subst_var_list(es: [Expr], from: String, to: Expr) : [Expr] = match es {
   [h, ...t] -> [subst_var(h, from, to), ...subst_var_list(t, from, to)]
 }
 
-# Pretty-print a predicate Expr in the canonical comparison form used
-# by `--dump-call-elision`. Falls back to `<expr>` for shapes outside
-# the decidable subset so the output stays grep-friendly.
-fn expr_show_pred(e: Expr) : String = match e.kind {
+# Falls back to `<expr>` for shapes outside the decidable subset so
+# the output stays grep-friendly.
+#[doc("Pretty-print a predicate Expr for diagnostics and elision reports.")]
+pub fn expr_show_pred(e: Expr) : String = match e.kind {
   EInt(n) -> int_to_string(n)
-  EReal(r, _) -> real_to_string(r)
+  # The raw span preserves the user's spelling (`0.0`, not `0`).
+  EReal(_, s) -> s
   EFixed(s, _) -> s
   EVar(s) -> s
   EBool(b) -> if b { "true" } else { "false" }
