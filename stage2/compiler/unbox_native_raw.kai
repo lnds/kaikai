@@ -27,32 +27,74 @@ import compiler.ast
 # literal), so the emitter lowers the WHOLE binop raw (`icmp`/`iadd` over two
 # raw i64), never the tagged `kaix_eq` shim that would read `nm` as a
 # `KaiValue *`. This is the READ-side use that drives the rb-tree descent win
-# (`k < kx` → `nemit_proj_slot` reads the key `.i64` inline). Any other use —
-# a call arg, a variant ctor slot, a field read, an index, a pipe, a
-# mixed-operand compare, a nested-match pattern — is boxed on the native's
+# (`k < kx` → `nemit_proj_slot` reads the key `.i64` inline). The WRITE-side
+# use is also raw-safe: `nm` as a direct argument of a variant constructor in
+# a kind-1 Int slot position (the rebuild `RBNode(..,kx,..)`) — the ctor's
+# reuse-in-place slot init lowers that `SIInt64` through `nemit_atom_raw`,
+# which loads `nm` at its OWN register slot (raw i64 direct, boxed unbox-
+# borrowed), so a raw binder lands in the raw slot with no deref hazard. `cis`
+# resolves the constructed ctor's Int-slot flags for that check, and carries
+# the same builtin-tag guard as `typed_inits` (`build_ctor_int_slots`), so a
+# mixed-writer ctor is never marked raw here. Any other use — a non-ctor call arg, a field read, an index, a pipe,
+# a mixed-operand compare, a nested-match pattern — is boxed on the native's
 # non-total border, so the binder stays boxed. Conservative by exclusion: an
-# unmodelled form forces boxed. STRICTER than the C oracle's mode-slave seeding,
-# which the native's non-total load-border cannot match. (The WRITE-side
-# ctor-slot raw permit — a reuse-in-place rebuild `RBNode(..,kx,..)` — is a
-# separate write-side optimization that still crashes the native self-compile
-# with no reduced repro; it stays boxed here, a #1110 follow-up.)
-pub fn native_arm_binder_raw_safe(nm: String, e: Expr) : Bool / Console = match e.kind {
+# unmodelled form forces boxed. STRICTER than the C oracle's mode-slave
+# seeding, which the native's non-total load-border cannot match.
+pub fn native_arm_binder_raw_safe(nm: String, e: Expr, cis: [CtorIntSlots]) : Bool / Console = match e.kind {
   EUnit -> false
-  _     -> nab_uses_ok(nm, e)
+  _     -> nab_uses_ok(nm, e, cis)
 }
 
-fn nab_uses_ok(nm: String, e: Expr) : Bool / Console = match e.kind {
+fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots]) : Bool / Console = match e.kind {
   EVar(n)          -> n != nm
   EInt(_)          -> true
   EReal(_, _)      -> true
   EBinop(op, l, r) ->
     if nab_op_is_raw(op) and (nab_is_var(nm, l) or nab_is_var(nm, r)) {
-      nab_operand(nm, l) and nab_operand(nm, r)
-    } else { nab_uses_ok(nm, l) and nab_uses_ok(nm, r) }
-  EUnop(_, x)      -> nab_uses_ok(nm, x)
-  EIf(c, t, oe)    -> nab_uses_ok(nm, c) and nab_uses_ok(nm, t) and nab_opt(nm, oe)
-  EBlock(ss, tl)   -> nab_stmts(nm, ss) and nab_opt(nm, tl)
+      nab_operand(nm, l, cis) and nab_operand(nm, r, cis)
+    } else { nab_uses_ok(nm, l, cis) and nab_uses_ok(nm, r, cis) }
+  EUnop(_, x)      -> nab_uses_ok(nm, x, cis)
+  EIf(c, t, oe)    -> nab_uses_ok(nm, c, cis) and nab_uses_ok(nm, t, cis) and nab_opt(nm, oe, cis)
+  EBlock(ss, tl)   -> nab_stmts(nm, ss, cis) and nab_opt(nm, tl, cis)
+  ECall(f, xs)     -> match nab_ctor_flags(f, cis) {
+    Some(flags) -> nab_ctor_args_ok(nm, flags, xs, cis)
+    None        -> not nab_mentions(nm, e)
+  }
   _                -> not nab_mentions(nm, e)
+}
+
+# `nm` in a variant-ctor call: safe as a DIRECT arg in a kind-1 Int slot
+# (the `SIInt64` init stores the register raw); any other position recurses
+# (and forces boxed on an unmodelled shape as usual). `flags` is consumed in
+# lockstep with the args, so each arg sees its own slot's flag.
+fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots]) : Bool / Console = match xs {
+  []           -> true
+  [x, ...rest] -> match flags {
+    [f, ...fr] -> {
+      let ok = if nab_is_var(nm, x) { f } else { nab_uses_ok(nm, x, cis) }
+      ok and nab_ctor_args_ok(nm, fr, rest, cis)
+    }
+    # More args than declared slots: never raw here, but keep walking the
+    # remaining args for other uses of `nm`.
+    [] -> not nab_is_var(nm, x) and nab_uses_ok(nm, x, cis) and nab_ctor_args_ok(nm, [], rest, cis)
+  }
+}
+
+# The Int-slot flags of a constructor call head: an uppercase-initial `EVar`
+# resolved through the same `CtorIntSlots` registry the seeding reads, so the
+# permit and the ctor's write layout share one source. A ctor with no entry
+# has no Int slots — `None` keeps the conservative path.
+fn nab_ctor_flags(f: Expr, cis: [CtorIntSlots]) : Option[[Bool]] = match f.kind {
+  EVar(n) -> match char_at(n, 0) {
+    Some(c) -> if c >= 'A' and c <= 'Z' { nab_cis_lookup(cis, n) } else { None }
+    None    -> None
+  }
+  _       -> None
+}
+
+fn nab_cis_lookup(m: [CtorIntSlots], target: String) : Option[[Bool]] = match m {
+  []               -> None
+  [CIS(n, fl), ...rest] -> if n == target { Some(fl) } else { nab_cis_lookup(rest, target) }
 }
 
 # The arith / comparison operators the native lowers to a raw `i`-family op
@@ -65,22 +107,22 @@ fn nab_op_is_raw(op: String) : Bool =
 # A binop operand: `EVar(nm)` (the raw use) is safe iff its SIBLING is a
 # raw-Int form; a non-`nm` operand must be a raw-Int form too (var / Int lit)
 # for the whole binop to lower raw. Anything else keeps the binder boxed.
-fn nab_operand(nm: String, e: Expr) : Bool / Console = match e.kind {
+fn nab_operand(nm: String, e: Expr, cis: [CtorIntSlots]) : Bool / Console = match e.kind {
   EVar(_)    -> true
   EInt(_)    -> true
   EIntLit(_) -> true
-  _          -> nab_uses_ok(nm, e)
+  _          -> nab_uses_ok(nm, e, cis)
 }
 
 fn nab_is_var(nm: String, e: Expr) : Bool = match e.kind { EVar(n) -> n == nm _ -> false }
-fn nab_opt(nm: String, oe: Option[Expr]) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e) }
-fn nab_stmts(nm: String, ss: [Stmt]) : Bool / Console = match ss {
+fn nab_opt(nm: String, oe: Option[Expr], cis: [CtorIntSlots]) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e, cis) }
+fn nab_stmts(nm: String, ss: [Stmt], cis: [CtorIntSlots]) : Bool / Console = match ss {
   []           -> true
-  [s, ...rest] -> nab_stmt(nm, s) and nab_stmts(nm, rest)
+  [s, ...rest] -> nab_stmt(nm, s, cis) and nab_stmts(nm, rest, cis)
 }
-fn nab_stmt(nm: String, s: Stmt) : Bool / Console = match s {
-  SExprStmt(e)    -> nab_uses_ok(nm, e)
-  SLet(_, _, rhs) -> nab_uses_ok(nm, rhs)
+fn nab_stmt(nm: String, s: Stmt, cis: [CtorIntSlots]) : Bool / Console = match s {
+  SExprStmt(e)    -> nab_uses_ok(nm, e, cis)
+  SLet(_, _, rhs) -> nab_uses_ok(nm, rhs, cis)
   _               -> not nab_stmt_mentions(nm, s)
 }
 

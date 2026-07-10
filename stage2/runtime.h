@@ -4919,9 +4919,9 @@ static inline void kai_reuse_free(KaiReuse at) {
  * insert reuses the cells it walked instead of paired free+alloc,
  * approaching Koka's in-place cost. Koka's unique gate is rc==0;
  * kaikai's is rc==1 (kai_check_unique). */
-static inline KaiValue *kai_variant_reuse_at(KaiValue *_scr, int32_t tag,
-                                             const char *name, int n,
-                                             uint32_t mask, KaiVarSlot *slots) {
+__attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiValue *_scr, int32_t tag,
+                                                                            const char *name, int n,
+                                                                            uint32_t mask, KaiVarSlot *slots) {
     if (_scr != NULL && !kai_is_value(_scr) && _scr->tag == KAI_VARIANT &&
         _scr->var_n_args == n && kai_check_unique(_scr)) {
         for (int i = 0; i < n; ++i) kai_var_slots(_scr)[i] = slots[i];
