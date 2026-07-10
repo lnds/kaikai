@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.3 (2026-07-10)
+
+### Added
+
+- **vec**: Vec surface stage 3 — O(1) slices, literal minting, fused pipeline collect (#1159)
+
+### Fixed
+
+- **emit**: re-land the write-side raw ctor-slot permit + root-cause the native self-compile escape (#1156) (#1161)
+
+### Changed
+
+- **emit**: de-opaque %KaiValue in the native emitter — inline tag tests, static-kind slot reads, tagged compares (closes #1160) (#1165)
+- **emit**: full variant_slot_mask parity on native — enum and Real slots lay raw (closes #1157) (#1162)
+- **runtime,kir**: sized-exact variant blocks + static-kind slot tests + inlined native ctors (closes #1136) (#1155)
+
 ## v0.99.2 (2026-07-09)
 
 ### Added
