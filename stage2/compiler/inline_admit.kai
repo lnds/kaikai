@@ -1,0 +1,94 @@
+# compiler/inline_admit.kai — template admission and inline census for
+# the pre-Perceus small-function inliner.
+#
+# Admission is the soundness gate: a monomorphic DFn admits as a paste
+# template only when it declares an empty effect row, takes no borrowed
+# (`^`) param, is not an extern body, is not self-recursive (its own
+# name among its free vars), and its Koka-style body cost is within
+# inl_max_cost(). Synthetic (`__`-prefixed) names never admit — they
+# carry pass-specific call protocols the paste cannot honour.
+#
+# The census is a sorted multiset: one row per inlined fn with the
+# count of call sites that pasted it, built in a single fold over the
+# hit list the caller walk accumulates.
+
+import compiler.util
+import compiler.ast
+import compiler.inline_scan
+
+#[doc("Maximum Koka-style body cost a fn may have to be inlined at its call sites.")]
+pub fn inl_max_cost() : Int = 1
+
+#[doc("One census row: fn name and how many call sites inlined it.")]
+pub type InlCensus = { iname: String, isites: Int }
+
+# One admitted template. `bound` gates direct variable substitution;
+# `fv` gates against caller binders shadowing the body's globals.
+# TRMC-caller protection is a per-caller predicate (inl_caller_is_trmc),
+# not a template property — the template list is the same everywhere.
+pub type InlTmpl = { tname: String, tmo: Option[String], params: [Param],
+                     body: Expr, fv: [String], bound: [String], arity: Int }
+
+#[doc("Admit a just-rewritten DFn as a paste template if it clears every soundness fence and its body cost is within the threshold; otherwise return the template list unchanged.")]
+pub fn inl_admit(n: String, tps: [String], ps: [Param], row: RowExpr, body: Expr,
+                 mo: Option[String], tmpls: [InlTmpl]) : [InlTmpl] = match tps {
+  [_t, ..._r] -> tmpls
+  [] ->
+    if inl_name_ok(n) and inl_row_empty(row) and inl_params_ok(ps) and inl_body_ok(body) {
+      let an = inl_analyze(body, inl_param_names(ps))
+      if an.cost <= inl_max_cost() and not list_has(an.fv, n) and inl_uses_linear(an.uses) {
+        [InlTmpl { tname: n, tmo: mo, params: ps, body: body,
+                   fv: an.fv, bound: an.bound, arity: list_length(ps) }, ...tmpls]
+      } else { tmpls }
+    } else { tmpls }
+}
+
+# Synthetic (`__`-prefixed) names carry pass-specific call protocols.
+fn inl_name_ok(n: String) : Bool =
+  not (char_at_or_zero(n, 0) == '_' and char_at_or_zero(n, 1) == '_')
+
+fn inl_row_empty(row: RowExpr) : Bool = match row {
+  REmpty -> true
+  _      -> false
+}
+
+fn inl_params_ok(ps: [Param]) : Bool = match ps {
+  []           -> true
+  [p, ...rest] -> if p.pborrow { false } else { inl_params_ok(rest) }
+}
+
+fn inl_body_ok(body: Expr) : Bool = match body.kind {
+  EExternBody(_) -> false
+  _              -> true
+}
+
+# ---- lookup --------------------------------------------------------
+
+#[doc("Find an admitted template matching a call's callee name, arity, and module origin.")]
+pub fn inl_lookup(tmpls: [InlTmpl], f: String, mo: Option[String], arity: Int) : Option[InlTmpl] = match tmpls {
+  [] -> None
+  [t, ...rest] ->
+    if t.arity == arity and t.tname == f and inl_mo_eq(t.tmo, mo) { Some(t) }
+    else { inl_lookup(rest, f, mo, arity) }
+}
+
+fn inl_mo_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { Some(y) -> x == y  None -> false }
+}
+
+# ---- census --------------------------------------------------------
+
+#[doc("Fold a flat list of inlined-fn-name hits into a name-sorted census multiset.")]
+pub fn inl_census(hits: [String], acc: [InlCensus]) : [InlCensus] = match hits {
+  []           -> acc
+  [h, ...rest] -> inl_census(rest, inl_census_add(h, acc))
+}
+
+fn inl_census_add(n: String, acc: [InlCensus]) : [InlCensus] = match acc {
+  [] -> [InlCensus { iname: n, isites: 1 }]
+  [c, ...rest] ->
+    if c.iname == n { [InlCensus { iname: n, isites: c.isites + 1 }, ...rest] }
+    else if n < c.iname { [InlCensus { iname: n, isites: 1 }, c, ...rest] }
+    else { [c, ...inl_census_add(n, rest)] }
+}

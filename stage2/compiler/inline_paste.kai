@@ -1,0 +1,165 @@
+# compiler/inline_paste.kai — argument binding and capture-safe
+# substitution for the pre-Perceus small-function inliner.
+#
+# Pasting a template at a call site is two moves. First bind the
+# arguments: a plain-variable or literal argument (re-evaluable,
+# effect-free) substitutes directly, provided no template-local binder
+# would capture the name; anything else let-binds to a fresh
+# site-keyed name in call order, so evaluation order and effect order
+# survive. Then substitute the parameter map through the body with
+# `inl_subst`, which narrows the map at every binder form so an
+# argument variable can never be captured by a lambda / match-arm /
+# let inside the template.
+
+import compiler.util
+import compiler.ast
+import compiler.desugar
+import compiler.inline_scan
+import compiler.inline_admit
+
+pub type InlSub = { from: String, to: Expr }
+
+#[doc("Paste an admitted template at a call site: bind its arguments (direct or let-bound) then substitute the parameter map through the body, wrapping in a block only when some argument needed a let-binding.")]
+pub fn inl_paste(t: InlTmpl, args_: [Expr], site: Expr) : Expr = {
+  let pb = inl_bind_params(t.params, args_, t.bound, site, InlBind { stmts: [], subs: [] })
+  let body2 = inl_subst(t.body, pb.subs)
+  match pb.stmts {
+    [] -> body2
+    _  -> Expr { kind: EBlock(list_reverse(pb.stmts), Some(body2)),
+                 line: site.line, col: site.col, ty: site.ty, mode: site.mode }
+  }
+}
+
+# ---- argument binding ----------------------------------------------
+
+type InlBind = { stmts: [Stmt], subs: [InlSub] }
+
+# Only a literal argument substitutes directly: it carries no refcount
+# and no boxing mode, so pasting it at every parameter occurrence is
+# free of RC-recount and unbox-mode hazards. A variable argument is NOT
+# substituted directly — even a plain one — because the parameter's
+# occurrences in the body carry the parameter's boxing mode, not the
+# argument's, and a direct swap would let a raw value reach a boxed use
+# (or vice versa). Every non-literal let-binds to a fresh name, so unbox
+# and perceus treat it as an ordinary binding, exactly as a real call.
+fn inl_direct_ok(arg: Expr) : Bool = match arg.kind {
+  EInt(_)  -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  EUnit    -> true
+  _        -> false
+}
+
+# An argument whose root is a caller name with a pending drop-at-exit —
+# `x` or `x.field` for a param/binder `x` — must be `__perceus_dup`-wrapped
+# in its let-binding. The out-of-line call would have crossed a consume
+# boundary that perceus counts as a non-last use of `x` (so it dups `x`
+# while the drop-at-exit still consumes it); pasting the body collapses
+# that boundary, so without the wrap perceus MOVES `x` into the fresh
+# binder and the drop-at-exit double-frees. A fresh argument (call /
+# literal / constructor) carries no exit-drop, so wrapping it would leak;
+# it binds plain. The wrap self-corrects: if the template's callee borrows
+# the slot, the emit strips the dup (perceus.kai's borrowed-slot strip).
+fn inl_arg_needs_dup(arg: Expr) : Bool = match arg.kind {
+  EVar(_)     -> true
+  EField(b, _) -> inl_arg_needs_dup(b)
+  _           -> false
+}
+
+# The `__perceus_dup(x)` token perceus defines to mean "not the last use,
+# bump the refcount"; the emit balances it against the drop-at-exit.
+fn inl_wrap_dup(a: Expr) : Expr =
+  Expr { kind: ECall(Expr { kind: EVar("__perceus_dup"), line: a.line, col: a.col,
+                            ty: None, mode: MUnknown }, [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
+
+fn inl_bind_params(ps: [Param], args_: [Expr], bound: [String], site: Expr, b: InlBind) : InlBind = match ps {
+  [] -> b
+  [p, ...prest] -> match args_ {
+    [] -> b
+    [arg, ...arest] ->
+      if inl_direct_ok(arg) {
+        inl_bind_params(prest, arest, bound, site,
+          InlBind { stmts: b.stmts, subs: [InlSub { from: p.pname, to: arg }, ...b.subs] })
+      } else {
+        let fresh = concat_all(["__inl", int_to_string(site.line), "_",
+                                int_to_string(site.col), "_", p.pname])
+        let pat = Pattern { pkind: PBind(fresh), line: arg.line, col: arg.col }
+        let evar = Expr { kind: EVar(fresh), line: arg.line, col: arg.col,
+                          ty: arg.ty, mode: arg.mode }
+        let rhs = if inl_arg_needs_dup(arg) { inl_wrap_dup(arg) } else { arg }
+        inl_bind_params(prest, arest, bound, site,
+          InlBind { stmts: [SLet(pat, None, rhs), ...b.stmts],
+                    subs: [InlSub { from: p.pname, to: evar }, ...b.subs] })
+      }
+  }
+}
+
+# ---- substitution --------------------------------------------------
+
+# Scope-aware parameter substitution over a template body. Binder
+# forms narrow the map; shapes the analysis saturates on (EHandle,
+# EBang, intrinsics, interpolation) never reach here, so the generic
+# arm's binder-free recursion is exhaustive for admitted bodies.
+fn inl_subst(e: Expr, subs: [InlSub]) : Expr = match subs {
+  [] -> e
+  _  -> inl_subst_go(e, subs)
+}
+
+fn inl_subst_go(e: Expr, subs: [InlSub]) : Expr = match e.kind {
+  EVar(n) -> match inl_sub_find(subs, n) { Some(to) -> to  None -> e }
+  ELambda(ps, b) ->
+    inl_remk(e, ELambda(ps, inl_subst(b, inl_sub_drop(subs, inl_param_names(ps)))))
+  EMatch(scr, arms) ->
+    inl_remk(e, EMatch(inl_subst_go(scr, subs), map(arms, (arm) => inl_subst_arm(arm, subs))))
+  EBlock(stmts, tail) -> {
+    let r = inl_subst_stmts(stmts, subs, [])
+    inl_remk(e, EBlock(list_reverse(r.ss), inl_subst_opt(tail, r.subs)))
+  }
+  _ -> inl_remk(e, dsg_map_expr_kind(e.kind, (sub) => inl_subst_go(sub, subs)))
+}
+
+#[doc("Rebuild an expr with a new kind, preserving source span, type, and mode.")]
+pub fn inl_remk(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn inl_sub_find(subs: [InlSub], n: String) : Option[Expr] = match subs {
+  []           -> None
+  [s, ...rest] -> if s.from == n { Some(s.to) } else { inl_sub_find(rest, n) }
+}
+
+fn inl_sub_drop(subs: [InlSub], names: [String]) : [InlSub] = match subs {
+  []           -> []
+  [s, ...rest] ->
+    if list_has(names, s.from) { inl_sub_drop(rest, names) }
+    else { [s, ...inl_sub_drop(rest, names)] }
+}
+
+fn inl_subst_opt(o: Option[Expr], subs: [InlSub]) : Option[Expr] = match o {
+  Some(x) -> Some(inl_subst(x, subs))
+  None    -> None
+}
+
+fn inl_subst_arm(arm: Arm, subs: [InlSub]) : Arm = match arm {
+  Arm(p, g, b) -> {
+    let narrowed = inl_sub_drop(subs, inl_pat_binds(p, []))
+    Arm(p, inl_subst_opt(g, narrowed), inl_subst(b, narrowed))
+  }
+}
+
+type SubstStmts = { ss: [Stmt], subs: [InlSub] }
+
+fn inl_subst_stmts(stmts: [Stmt], subs: [InlSub], acc: [Stmt]) : SubstStmts = match stmts {
+  [] -> SubstStmts { ss: acc, subs: subs }
+  [s, ...rest] -> match s {
+    SLet(p, ann, rhs) -> {
+      let rhs2 = inl_subst(rhs, subs)
+      inl_subst_stmts(rest, inl_sub_drop(subs, inl_pat_binds(p, [])), [SLet(p, ann, rhs2), ...acc])
+    }
+    SAssert(c, m) ->
+      inl_subst_stmts(rest, subs, [SAssert(inl_subst(c, subs), inl_subst_opt(m, subs)), ...acc])
+    SExprStmt(x) ->
+      inl_subst_stmts(rest, subs, [SExprStmt(inl_subst(x, subs)), ...acc])
+    _ -> inl_subst_stmts(rest, subs, [s, ...acc])
+  }
+}

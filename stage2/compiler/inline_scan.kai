@@ -1,0 +1,209 @@
+# compiler/inline_scan.kai — template analysis for the pre-Perceus
+# inliner: one scope-aware walk computes the Koka-style body cost, the
+# free variables, and the locally-bound names of a candidate body.
+#
+# The cost model follows Koka Core (applications and allocations cost
+# 1, a match costs arms-1, variables and literals cost 0). Shapes the
+# inliner must never duplicate — handlers, `!` propagation (its
+# short-circuit `return` targets the enclosing fn), intrinsics,
+# interpolated strings (their `#{...}` slots hide identifier
+# references from every AST walker), holes — saturate the cost to
+# inl_cost_inf() so they can never pass a threshold.
+
+import compiler.util
+import compiler.ast
+
+#[doc("Saturating cost of a body shape the inliner must never duplicate.")]
+pub fn inl_cost_inf() : Int = 1000
+
+#[doc("Template analysis result: Koka-style body cost, free variables (lowercase, scope-aware), locally-bound names, and per-parameter use counts.")]
+pub type InlAn = { cost: Int, fv: [String], bound: [String], uses: [PUse] }
+
+#[doc("One parameter's use count in a template body.")]
+pub type PUse = { pn: String, cnt: Int }
+
+#[doc("Analyse a candidate body under its parameter scope: cost, free variables, bound names, and parameter uses in one walk.")]
+pub fn inl_analyze(body: Expr, params: [String]) : InlAn =
+  an_expr(body, params, InlAn { cost: 0, fv: [], bound: [], uses: pu_init(params) })
+
+fn pu_init(params: [String]) : [PUse] = match params {
+  []           -> []
+  [p, ...rest] -> [PUse { pn: p, cnt: 0 }, ...pu_init(rest)]
+}
+
+fn pu_bump(uses: [PUse], n: String) : [PUse] = match uses {
+  []           -> []
+  [u, ...rest] -> if u.pn == n { [PUse { pn: n, cnt: u.cnt + 1 }, ...rest] }
+                  else { [u, ...pu_bump(rest, n)] }
+}
+
+#[doc("True if every parameter is used exactly once in the body — a linear template, safe to paste without RC recount.")]
+pub fn inl_uses_linear(uses: [PUse]) : Bool = match uses {
+  []           -> true
+  [u, ...rest] -> if u.cnt == 1 { inl_uses_linear(rest) } else { false }
+}
+
+#[doc("Collect every name a pattern binds, prepended to acc.")]
+pub fn inl_pat_binds(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PWild            -> acc
+  PLit(_)          -> acc
+  PRange(_, _)     -> acc
+  PBind(n)         -> [n, ...acc]
+  PList(ps, rest)  -> {
+    let acc2 = inl_pats_binds(ps, acc)
+    match rest { Some(n) -> [n, ...acc2]  None -> acc2 }
+  }
+  PVariant(_, ps)       -> inl_pats_binds(ps, acc)
+  PVariantRecord(_, fs) -> inl_pfields_binds(fs, acc)
+  PRecord(fs)           -> inl_pfields_binds(fs, acc)
+  PHole(no)             -> match no { Some(n) -> [n, ...acc]  None -> acc }
+  PAs(n, sub)           -> inl_pat_binds(sub, [n, ...acc])
+  PNarrow(n, _)         -> [n, ...acc]
+}
+
+fn inl_pats_binds(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> inl_pats_binds(rest, inl_pat_binds(p, acc))
+}
+
+fn inl_pfields_binds(fs: [PField], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f {
+    PField(_, sub, _) -> inl_pfields_binds(rest, inl_pat_binds(sub, acc))
+  }
+}
+
+#[doc("Parameter names of a param list, in order.")]
+pub fn inl_param_names(ps: [Param]) : [String] = map(ps, (p) => p.pname)
+
+#[doc("Prepend every name onto a scope list.")]
+pub fn inl_push_all(names: [String], sc: [String]) : [String] = match names {
+  []           -> sc
+  [n, ...rest] -> inl_push_all(rest, [n, ...sc])
+}
+
+# `#{` anywhere in a string span means interpolation: the slot hides
+# identifier references from the AST, so the analysis rejects the body.
+fn inl_has_interp(span: String) : Bool = inl_interp_from(span, 0, string_length(span))
+
+fn inl_interp_from(span: String, i: Int, n: Int) : Bool =
+  if i + 1 >= n { false }
+  else if char_at_or_zero(span, i) == '#' and char_at_or_zero(span, i + 1) == '{' { true }
+  else { inl_interp_from(span, i + 1, n) }
+
+fn an_cost(k: Int, a: InlAn) : InlAn =
+  InlAn { cost: a.cost + k, fv: a.fv, bound: a.bound, uses: a.uses }
+
+# Only lowercase / underscore heads can ever be shadowed by a caller
+# local; uppercase heads are constructors and never enter the fence.
+# A reference to a name in `sc` that is a parameter bumps that
+# parameter's use count (gating template linearity); a name neither in
+# scope nor already recorded is a free variable.
+fn an_use(n: String, sc: [String], a: InlAn) : InlAn = {
+  let c = char_at_or_zero(n, 0)
+  if (c >= 'a' and c <= 'z') or c == '_' {
+    if list_has(sc, n) { InlAn { cost: a.cost, fv: a.fv, bound: a.bound, uses: pu_bump(a.uses, n) } }
+    else if list_has(a.fv, n) { a }
+    else { InlAn { cost: a.cost, fv: [n, ...a.fv], bound: a.bound, uses: a.uses } }
+  } else { a }
+}
+
+fn an_bound(names: [String], a: InlAn) : InlAn =
+  InlAn { cost: a.cost, fv: a.fv, bound: inl_push_all(names, a.bound), uses: a.uses }
+
+fn an_opt(o: Option[Expr], sc: [String], a: InlAn) : InlAn = match o {
+  Some(x) -> an_expr(x, sc, a)
+  None    -> a
+}
+
+fn an_exprs(xs: [Expr], sc: [String], a: InlAn) : InlAn = match xs {
+  []           -> a
+  [x, ...rest] -> an_exprs(rest, sc, an_expr(x, sc, a))
+}
+
+fn an_expr(e: Expr, sc: [String], a: InlAn) : InlAn = match e.kind {
+  EInt(_)         -> a
+  EReal(_, _)     -> a
+  EIntLit(_)      -> a
+  EDecimalLit(_)  -> a
+  EFixed(_, _)    -> a
+  EBool(_)        -> a
+  EChar(_)        -> a
+  EUnit           -> a
+  EUnder          -> a
+  EPlaceholder    -> a
+  EStr(span, _)   -> if inl_has_interp(span) { an_cost(inl_cost_inf(), a) } else { a }
+  EVar(n)         -> an_use(n, sc, a)
+  EHole(_)        -> an_cost(inl_cost_inf(), a)
+  ETodo(_)        -> an_cost(inl_cost_inf(), a)
+  EExternBody(_)  -> an_cost(inl_cost_inf(), a)
+  EBang(_)        -> an_cost(inl_cost_inf(), a)
+  EIntrinsic(_, _) -> an_cost(inl_cost_inf(), a)
+  EHandle(_, _, _, _, _, _, _) -> an_cost(inl_cost_inf(), a)
+  EVariantsOf(_, _) -> an_cost(1, a)
+  EModCall(_, _)  -> a
+  ECall(callee, args_) -> an_exprs(args_, sc, an_expr(callee, sc, an_cost(1, a)))
+  EField(b, _)    -> an_expr(b, sc, an_cost(1, a))
+  EIndex(x, i)    -> an_expr(i, sc, an_expr(x, sc, an_cost(1, a)))
+  EBinop(_, x, y) -> an_expr(y, sc, an_expr(x, sc, an_cost(1, a)))
+  EUnop(_, x)     -> an_expr(x, sc, an_cost(1, a))
+  EIf(c, t_, eo)  -> an_opt(eo, sc, an_expr(t_, sc, an_expr(c, sc, an_cost(1, a))))
+  EMatch(scr, arms) ->
+    an_arms(arms, sc, an_expr(scr, sc, an_cost(list_length(arms) - 1, a)))
+  ELambda(ps, b)  -> {
+    let names = inl_param_names(ps)
+    an_expr(b, inl_push_all(names, sc), an_bound(names, an_cost(1, a)))
+  }
+  ERecordLit(_, fs) -> an_fields(fs, sc, an_cost(1, a))
+  EList(els)      -> an_elems(els, sc, a)
+  ERange(x, y, step) -> an_opt(step, sc, an_expr(y, sc, an_expr(x, sc, an_cost(1, a))))
+  EBlock(stmts, tail) -> an_block(stmts, tail, sc, a)
+  EPipe(x, f)        -> an_expr(f, sc, an_expr(x, sc, an_cost(1, a)))
+  EMapPipe(x, f)     -> an_expr(f, sc, an_expr(x, sc, an_cost(1, a)))
+  EFlatMapPipe(x, f) -> an_expr(f, sc, an_expr(x, sc, an_cost(1, a)))
+  EFilterPipe(x, f)  -> an_expr(f, sc, an_expr(x, sc, an_cost(1, a)))
+  ELitUnit(x, _)     -> an_expr(x, sc, a)
+}
+
+fn an_arms(arms: [Arm], sc: [String], a: InlAn) : InlAn = match arms {
+  []             -> a
+  [arm, ...rest] -> an_arms(rest, sc, an_arm(arm, sc, a))
+}
+
+fn an_arm(arm: Arm, sc: [String], a: InlAn) : InlAn = match arm {
+  Arm(p, g, b) -> {
+    let binds = inl_pat_binds(p, [])
+    let sc2 = inl_push_all(binds, sc)
+    an_expr(b, sc2, an_opt(g, sc2, an_bound(binds, a)))
+  }
+}
+
+fn an_fields(fs: [FieldInit], sc: [String], a: InlAn) : InlAn = match fs {
+  []           -> a
+  [f, ...rest] -> match f { FI(_, x) -> an_fields(rest, sc, an_expr(x, sc, a)) }
+}
+
+fn an_elems(els: [ListElem], sc: [String], a: InlAn) : InlAn = match els {
+  []            -> a
+  [el, ...rest] -> match el {
+    ElPlain(x)  -> an_elems(rest, sc, an_expr(x, sc, an_cost(1, a)))
+    ElSpread(x) -> an_elems(rest, sc, an_expr(x, sc, an_cost(1, a)))
+  }
+}
+
+fn an_block(stmts: [Stmt], tail: Option[Expr], sc: [String], a: InlAn) : InlAn = match stmts {
+  [] -> an_opt(tail, sc, a)
+  [s, ...rest] -> match s {
+    SLet(p, _, rhs) -> {
+      let a2 = an_expr(rhs, sc, a)
+      let binds = inl_pat_binds(p, [])
+      an_block(rest, tail, inl_push_all(binds, sc), an_bound(binds, a2))
+    }
+    SAssert(c, m) -> an_block(rest, tail, sc, an_opt(m, sc, an_expr(c, sc, an_cost(1, a))))
+    SExprStmt(x)  -> an_block(rest, tail, sc, an_expr(x, sc, a))
+    # Desugared away before the typer; if one survives, refuse to copy it.
+    SIndexAssign(_, _, _, _, _) -> an_block(rest, tail, sc, an_cost(inl_cost_inf(), a))
+    SVar(_, _, _, _, _)         -> an_block(rest, tail, sc, an_cost(inl_cost_inf(), a))
+    SUse(_, _, _)               -> an_block(rest, tail, sc, an_cost(inl_cost_inf(), a))
+  }
+}

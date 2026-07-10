@@ -1,0 +1,92 @@
+# compiler/inline_trmc.kai — TRMC-caller protection for the pre-Perceus
+# inliner.
+#
+# The TRMC lowering (kir_lower_walk `body_has_trmc_step`) classifies a
+# tail constructor as part of a caller's modulo-cons spine by SYNTACTIC
+# tail-position, not by whether it holds a self-call. So ANY paste that
+# perturbs a TRMC-eligible caller's body — even inlining a Bool helper
+# into an `if` condition — reclassifies the sibling tail branches and
+# corrupts the spine accumulator (infinite loop). The only robust fence
+# is: never paste inside a caller whose ORIGINAL body is TRMC-eligible.
+
+import compiler.util
+import compiler.ast
+import compiler.inline_scan
+
+# A body is TRMC-eligible if some tail position is a data constructor
+# (uppercase-head call, record, non-empty list) with a self-recursive
+# call among its arguments — directly or via a `let` binder in the same
+# block. Evaluated on the pre-inline body so the predicate is stable
+# (inlining could otherwise make a caller newly eligible). Descends
+# BOTH branches of every if/match without short-circuiting: one
+# modulo-cons arm makes the whole body TRMC-lowered.
+#[doc("True if the caller's original body is TRMC-eligible (a tail data constructor carrying a self-recursive call) — the inliner must paste nothing inside it.")]
+pub fn inl_caller_is_trmc(body: Expr, self_name: String) : Bool =
+  inl_trmc_tail(body, self_name, [])
+
+# `binds` maps a let-bound name to whether its RHS is (or contains) a
+# self-call, so `let l2 = ins(l,...); Ctor(.., l2, ..)` counts.
+fn inl_trmc_tail(e: Expr, sn: String, binds: [String]) : Bool = match e.kind {
+  ECall(callee, args_) ->
+    inl_callee_is_ctor(callee) and inl_any_self_arg(args_, sn, binds)
+  ERecordLit(_, fs)     -> inl_fields_self(fs, sn, binds)
+  EList(els)            -> inl_elems_self(els, sn, binds)
+  EIf(_, t_, eo)        -> inl_trmc_tail(t_, sn, binds) or match eo { Some(x) -> inl_trmc_tail(x, sn, binds)  None -> false }
+  EMatch(_, arms)       -> inl_trmc_arms(arms, sn, binds)
+  EBlock(stmts, tail)   -> match tail {
+    Some(x) -> inl_trmc_tail(x, sn, inl_trmc_binds(stmts, sn, binds))
+    None    -> false
+  }
+  ELitUnit(x, _)        -> inl_trmc_tail(x, sn, binds)
+  _                     -> false
+}
+
+fn inl_callee_is_ctor(callee: Expr) : Bool = match callee.kind {
+  EVar(c)        -> inl_head_upper(c)
+  EModCall(_, c) -> inl_head_upper(c)
+  _              -> false
+}
+
+fn inl_head_upper(n: String) : Bool = {
+  let c = char_at_or_zero(n, 0)
+  c >= 'A' and c <= 'Z'
+}
+
+# Does an argument list carry a self-call — a direct `sn(...)` call or a
+# reference to a let-bound name whose RHS held one?
+fn inl_any_self_arg(args_: [Expr], sn: String, binds: [String]) : Bool = match args_ {
+  []           -> false
+  [a, ...rest] -> inl_has_self(a, sn, binds) or inl_any_self_arg(rest, sn, binds)
+}
+
+fn inl_has_self(e: Expr, sn: String, binds: [String]) : Bool = match e.kind {
+  ECall(callee, _) -> match callee.kind { EVar(f) -> f == sn  _ -> false }
+  EVar(n)          -> list_has(binds, n)
+  _                -> false
+}
+
+fn inl_trmc_binds(stmts: [Stmt], sn: String, binds: [String]) : [String] = match stmts {
+  [] -> binds
+  [s, ...rest] -> match s {
+    SLet(p, _, rhs) ->
+      if inl_has_self(rhs, sn, binds) { inl_trmc_binds(rest, sn, inl_push_all(inl_pat_binds(p, []), binds)) }
+      else { inl_trmc_binds(rest, sn, binds) }
+    _ -> inl_trmc_binds(rest, sn, binds)
+  }
+}
+
+fn inl_trmc_arms(arms: [Arm], sn: String, binds: [String]) : Bool = match arms {
+  []             -> false
+  [Arm(_, _, b), ...rest] -> inl_trmc_tail(b, sn, binds) or inl_trmc_arms(rest, sn, binds)
+}
+
+fn inl_fields_self(fs: [FieldInit], sn: String, binds: [String]) : Bool = match fs {
+  []           -> false
+  [FI(_, x), ...rest] -> inl_has_self(x, sn, binds) or inl_fields_self(rest, sn, binds)
+}
+
+fn inl_elems_self(els: [ListElem], sn: String, binds: [String]) : Bool = match els {
+  []            -> false
+  [ElPlain(x), ...rest]  -> inl_has_self(x, sn, binds) or inl_elems_self(rest, sn, binds)
+  [ElSpread(x), ...rest] -> inl_has_self(x, sn, binds) or inl_elems_self(rest, sn, binds)
+}

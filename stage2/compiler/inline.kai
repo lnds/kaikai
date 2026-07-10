@@ -1,0 +1,388 @@
+# compiler/inline.kai — pre-Perceus small-function inliner (driver).
+#
+# Runs post-monomorph, pre-unbox/pre-perceus, so the RC-insertion pass
+# sees through small helpers: a match on a just-inlined body keeps its
+# reuse token inside one function instead of dying at a call boundary.
+#
+# Cheap and bounded by construction: a single pass over the decls in
+# program order. Each body is rewritten against the templates admitted
+# so far (inl_admit / inline_admit.kai), then the rewritten body is
+# itself considered for admission — so a call site grows by at most one
+# bounded template and there is no fixpoint re-inlining.
+#
+# Soundness fences (admission in inline_admit.kai, capture-safe paste
+# in inline_paste.kai):
+#   - templates are monomorphic DFns with an empty declared row, no
+#     borrowed (`^`) params, and no shape the analysis saturates on
+#     (handlers, `!`, intrinsics, interpolation — see inline_scan);
+#   - self-recursive fns never admit; mutual recursion terminates
+#     because a pasted body is never re-walked;
+#   - a site only rewrites when the callee resolves in the caller's
+#     namespace: same module origin, callee name not shadowed by a
+#     caller local, and none of the template's free variables shadowed
+#     by a caller binder in scope at the site;
+#   - only saturated calls rewrite; a fn passed as a value keeps the
+#     out-of-line definition (which always remains in the program).
+
+import compiler.util
+import compiler.ast
+import compiler.desugar
+import compiler.inline_scan
+import compiler.inline_trmc
+import compiler.inline_admit
+import compiler.inline_paste
+
+#[doc("Result of the inline pass: rewritten decls plus the per-fn inline census.")]
+pub type InlOut = { decls: [Decl], census: [InlCensus] }
+
+type RwE  = { e: Expr, hits: [String] }
+type RwEs = { es: [Expr], hits: [String] }
+type InlDs = { ds: [Decl], hits: [String] }
+type RwD  = { d: Decl, hits: [String] }
+
+#[doc("Inline every saturated call to a small non-recursive same-module fn (cost model in inline_scan) into its caller, post-monomorph / pre-perceus.")]
+pub fn inline_small_fns(decls: [Decl]) : InlOut = {
+  let r = inl_decls(decls, [], [], [])
+  InlOut { decls: list_reverse(r.ds), census: inl_census(r.hits, []) }
+}
+
+#[doc("Print the inline census, one `inline: <fn> sites=<n>` line per inlined fn, sorted by name.")]
+pub fn dump_inline_census(census: [InlCensus]) : Unit / Console = match census {
+  []           -> ()
+  [c, ...rest] -> {
+    print(concat_all(["inline: ", c.iname, " sites=", int_to_string(c.isites)]))
+    dump_inline_census(rest)
+  }
+}
+
+# A TRMC-eligible caller keeps its body verbatim: pasting anything
+# inside it — even a Bool helper into an `if` condition — perturbs the
+# syntactic shape the modulo-cons lowering classifies on and corrupts
+# the spine (inl_caller_is_trmc). `tmpls_for` returns an empty template
+# list for such a caller, so the walk still runs (uniform) but pastes
+# nothing.
+fn tmpls_for(body: Expr, n: String, tmpls: [InlTmpl]) : [InlTmpl] =
+  if inl_caller_is_trmc(body, n) { [] } else { tmpls }
+
+fn inl_decls(decls: [Decl], tmpls: [InlTmpl], hits: [String], acc: [Decl]) : InlDs = match decls {
+  [] -> InlDs { ds: acc, hits: hits }
+  [d, ...rest] -> match d {
+    DFn(is_pub, n, tps, ps, ret, row, body, l, c, mo) -> {
+      let r = irw_expr(body, inl_param_names(ps), tmpls_for(body, n, tmpls), mo, hits)
+      let d2 = DFn(is_pub, n, tps, ps, ret, row, r.e, l, c, mo)
+      inl_decls(rest, inl_admit(n, tps, ps, row, r.e, mo, tmpls), r.hits, [d2, ...acc])
+    }
+    _ -> {
+      let r = irw_decl(d, tmpls, hits)
+      inl_decls(rest, tmpls, r.hits, [r.d, ...acc])
+    }
+  }
+}
+
+# Bodies inside non-DFn decls are rewrite targets but never templates
+# (impl methods dispatch via `__pimpl_*` keys, not bare EVar names).
+fn irw_decl(d: Decl, tmpls: [InlTmpl], hits: [String]) : RwD = match d {
+  DFn(is_pub, n, tps, ps, ret, row, body, l, c, mo) -> {
+    let r = irw_expr(body, inl_param_names(ps), tmpls_for(body, n, tmpls), mo, hits)
+    RwD { d: DFn(is_pub, n, tps, ps, ret, row, r.e, l, c, mo), hits: r.hits }
+  }
+  DTest(desc, body, l, c) -> {
+    let r = irw_expr(body, [], tmpls, None, hits)
+    RwD { d: DTest(desc, r.e, l, c), hits: r.hits }
+  }
+  DBench(desc, body, l, c) -> {
+    let r = irw_expr(body, [], tmpls, None, hits)
+    RwD { d: DBench(desc, r.e, l, c), hits: r.hits }
+  }
+  DCheck(desc, ps, body, l, c) -> {
+    let r = irw_expr(body, inl_param_names(ps), tmpls, None, hits)
+    RwD { d: DCheck(desc, ps, r.e, l, c), hits: r.hits }
+  }
+  DImpl(pname, pargs, target, ms, l, c) -> {
+    let r = irw_impl_decls(ms, tmpls, hits, [])
+    RwD { d: DImpl(pname, pargs, target, r.ds, l, c), hits: r.hits }
+  }
+  DDerive(names, inner, l, c) -> {
+    let r = irw_decl(inner, tmpls, hits)
+    RwD { d: DDerive(names, r.d, l, c), hits: r.hits }
+  }
+  DUnstable(inner, l, c) -> {
+    let r = irw_decl(inner, tmpls, hits)
+    RwD { d: DUnstable(r.d, l, c), hits: r.hits }
+  }
+  DConstructor(inner, l, c) -> {
+    let r = irw_decl(inner, tmpls, hits)
+    RwD { d: DConstructor(r.d, l, c), hits: r.hits }
+  }
+  _ -> RwD { d: d, hits: hits }
+}
+
+fn irw_impl_decls(ds: [Decl], tmpls: [InlTmpl], hits: [String], acc: [Decl]) : InlDs = match ds {
+  [] -> InlDs { ds: list_reverse(acc), hits: hits }
+  [d, ...rest] -> {
+    let r = irw_decl(d, tmpls, hits)
+    irw_impl_decls(rest, tmpls, r.hits, [r.d, ...acc])
+  }
+}
+
+# ---- caller walk ---------------------------------------------------
+
+fn irw_list(xs: [Expr], sc: [String], tmpls: [InlTmpl], mo: Option[String], hits: [String]) : RwEs =
+  irw_list_go(xs, sc, tmpls, mo, hits, [])
+
+fn irw_list_go(xs: [Expr], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+              hits: [String], acc: [Expr]) : RwEs = match xs {
+  [] -> RwEs { es: list_reverse(acc), hits: hits }
+  [x, ...rest] -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    irw_list_go(rest, sc, tmpls, mo, r.hits, [r.e, ...acc])
+  }
+}
+
+# A saturated `f(args…)` rewrites when `f` is an admitted template that
+# resolves in the caller's namespace (not a local, its free vars not
+# shadowed here) and every argument is a real value (not `_`/`?`). A
+# TRMC-eligible caller reaches here with an empty template list, so no
+# paste fires inside it (tmpls_for).
+fn irw_call(e: Expr, callee: Expr, args_: [Expr], sc: [String],
+            tmpls: [InlTmpl], mo: Option[String], hits: [String]) : RwE = {
+  let ra = irw_list(args_, sc, tmpls, mo, hits)
+  match callee.kind {
+    EVar(f) ->
+      if list_has(sc, f) { RwE { e: inl_remk(e, ECall(callee, ra.es)), hits: ra.hits } }
+      else { irw_call_var(e, callee, f, ra, sc, tmpls, mo) }
+    _ -> {
+      let rc = irw_expr(callee, sc, tmpls, mo, ra.hits)
+      RwE { e: inl_remk(e, ECall(rc.e, ra.es)), hits: rc.hits }
+    }
+  }
+}
+
+fn irw_call_var(e: Expr, callee: Expr, f: String, ra: RwEs, sc: [String],
+                tmpls: [InlTmpl], mo: Option[String]) : RwE =
+  match inl_lookup(tmpls, f, mo, list_length(ra.es)) {
+    Some(t) ->
+      if inl_fv_clear(t.fv, sc) and inl_args_plain(ra.es) {
+        RwE { e: inl_paste(t, ra.es, e), hits: [f, ...ra.hits] }
+      } else { RwE { e: inl_remk(e, ECall(callee, ra.es)), hits: ra.hits } }
+    None -> RwE { e: inl_remk(e, ECall(callee, ra.es)), hits: ra.hits }
+  }
+
+fn inl_fv_clear(fv: [String], sc: [String]) : Bool = match fv {
+  []           -> true
+  [n, ...rest] -> if list_has(sc, n) { false } else { inl_fv_clear(rest, sc) }
+}
+
+fn inl_args_plain(args_: [Expr]) : Bool = match args_ {
+  [] -> true
+  [x, ...rest] -> match x.kind {
+    EPlaceholder -> false
+    EUnder       -> false
+    _            -> inl_args_plain(rest)
+  }
+}
+
+# A handler is never a template body, but its sub-expressions are
+# rewrite targets: the init, the alias-scoped body, each clause (which
+# binds `resume`), and the return clause.
+fn irw_handle(e: Expr, body: Expr, eff: String, tyargs: [TypeExpr], init: Option[Expr],
+              alias: Option[String], clauses: [HClause], ret: Option[HReturn],
+              sc: [String], tmpls: [InlTmpl], mo: Option[String], hits: [String]) : RwE = {
+  let ri = match init {
+    Some(ix) -> irw_expr(ix, sc, tmpls, mo, hits)
+    None     -> RwE { e: body, hits: hits }
+  }
+  let init2 = match init { Some(_) -> Some(ri.e)  None -> None }
+  let body_sc = match alias { Some(a) -> [a, ...sc]  None -> sc }
+  let rb = irw_expr(body, body_sc, tmpls, mo, ri.hits)
+  let rc = irw_clauses(clauses, sc, tmpls, mo, rb.hits, [])
+  match ret {
+    Some(HR(n, rx, l, c)) -> {
+      let rr = irw_expr(rx, [n, ...sc], tmpls, mo, rc.hits)
+      RwE { e: inl_remk(e, EHandle(rb.e, eff, tyargs, init2, alias, rc.cs, Some(HR(n, rr.e, l, c)))),
+            hits: rr.hits }
+    }
+    None -> RwE { e: inl_remk(e, EHandle(rb.e, eff, tyargs, init2, alias, rc.cs, None)), hits: rc.hits }
+  }
+}
+
+fn irw_expr(e: Expr, sc: [String], tmpls: [InlTmpl], mo: Option[String], hits: [String]) : RwE = match e.kind {
+  ECall(callee, args_) -> irw_call(e, callee, args_, sc, tmpls, mo, hits)
+  EHandle(body, eff, tyargs, init, alias, clauses, ret) ->
+    irw_handle(e, body, eff, tyargs, init, alias, clauses, ret, sc, tmpls, mo, hits)
+  EMatch(scr, arms) -> {
+    let rs = irw_expr(scr, sc, tmpls, mo, hits)
+    let ra = irw_arms(arms, sc, tmpls, mo, rs.hits, [])
+    RwE { e: inl_remk(e, EMatch(rs.e, ra.arms)), hits: ra.hits }
+  }
+  ELambda(ps, b) -> {
+    let r = irw_expr(b, inl_push_all(inl_param_names(ps), sc), tmpls, mo, hits)
+    RwE { e: inl_remk(e, ELambda(ps, r.e)), hits: r.hits }
+  }
+  EBlock(stmts, tail) -> {
+    let rb = irw_block(stmts, sc, tmpls, mo, hits, [])
+    match tail {
+      Some(t_) -> {
+        let rt = irw_expr(t_, rb.sc, tmpls, mo, rb.hits)
+        RwE { e: inl_remk(e, EBlock(list_reverse(rb.ss), Some(rt.e))), hits: rt.hits }
+      }
+      None -> RwE { e: inl_remk(e, EBlock(list_reverse(rb.ss), None)), hits: rb.hits }
+    }
+  }
+  EField(b, n) -> {
+    let r = irw_expr(b, sc, tmpls, mo, hits)
+    RwE { e: inl_remk(e, EField(r.e, n)), hits: r.hits }
+  }
+  EIndex(x, i) -> {
+    let rx = irw_expr(x, sc, tmpls, mo, hits)
+    let ri = irw_expr(i, sc, tmpls, mo, rx.hits)
+    RwE { e: inl_remk(e, EIndex(rx.e, ri.e)), hits: ri.hits }
+  }
+  EBinop(op, x, y) -> {
+    let rx = irw_expr(x, sc, tmpls, mo, hits)
+    let ry = irw_expr(y, sc, tmpls, mo, rx.hits)
+    RwE { e: inl_remk(e, EBinop(op, rx.e, ry.e)), hits: ry.hits }
+  }
+  EUnop(op, x) -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    RwE { e: inl_remk(e, EUnop(op, r.e)), hits: r.hits }
+  }
+  EIf(c, t_, eo) -> {
+    let rc = irw_expr(c, sc, tmpls, mo, hits)
+    let rt = irw_expr(t_, sc, tmpls, mo, rc.hits)
+    match eo {
+      Some(ex) -> {
+        let re = irw_expr(ex, sc, tmpls, mo, rt.hits)
+        RwE { e: inl_remk(e, EIf(rc.e, rt.e, Some(re.e))), hits: re.hits }
+      }
+      None -> RwE { e: inl_remk(e, EIf(rc.e, rt.e, None)), hits: rt.hits }
+    }
+  }
+  ERecordLit(nm, fs) -> {
+    let r = irw_fields(fs, sc, tmpls, mo, hits, [])
+    RwE { e: inl_remk(e, ERecordLit(nm, r.fs)), hits: r.hits }
+  }
+  EList(els) -> {
+    let r = irw_elems(els, sc, tmpls, mo, hits, [])
+    RwE { e: inl_remk(e, EList(r.els)), hits: r.hits }
+  }
+  ERange(x, y, step) -> {
+    let rx = irw_expr(x, sc, tmpls, mo, hits)
+    let ry = irw_expr(y, sc, tmpls, mo, rx.hits)
+    match step {
+      Some(sx) -> {
+        let rs = irw_expr(sx, sc, tmpls, mo, ry.hits)
+        RwE { e: inl_remk(e, ERange(rx.e, ry.e, Some(rs.e))), hits: rs.hits }
+      }
+      None -> RwE { e: inl_remk(e, ERange(rx.e, ry.e, None)), hits: ry.hits }
+    }
+  }
+  EPipe(x, f)        -> irw_pipe(e, x, f, sc, tmpls, mo, hits, (a, b) => EPipe(a, b))
+  EMapPipe(x, f)     -> irw_pipe(e, x, f, sc, tmpls, mo, hits, (a, b) => EMapPipe(a, b))
+  EFlatMapPipe(x, f) -> irw_pipe(e, x, f, sc, tmpls, mo, hits, (a, b) => EFlatMapPipe(a, b))
+  EFilterPipe(x, f)  -> irw_pipe(e, x, f, sc, tmpls, mo, hits, (a, b) => EFilterPipe(a, b))
+  ELitUnit(x, u) -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    RwE { e: inl_remk(e, ELitUnit(r.e, u)), hits: r.hits }
+  }
+  EBang(x) -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    RwE { e: inl_remk(e, EBang(r.e)), hits: r.hits }
+  }
+  EIntrinsic(nm, args_) -> {
+    let r = irw_list(args_, sc, tmpls, mo, hits)
+    RwE { e: inl_remk(e, EIntrinsic(nm, r.es)), hits: r.hits }
+  }
+  _ -> RwE { e: e, hits: hits }
+}
+
+fn irw_pipe(e: Expr, x: Expr, f: Expr, sc: [String], tmpls: [InlTmpl], mo: Option[String],
+            hits: [String], mk: (Expr, Expr) -> ExprKind) : RwE = {
+  let rx = irw_expr(x, sc, tmpls, mo, hits)
+  let rf = irw_expr(f, sc, tmpls, mo, rx.hits)
+  RwE { e: inl_remk(e, mk(rx.e, rf.e)), hits: rf.hits }
+}
+
+type RwArms = { arms: [Arm], hits: [String] }
+
+fn irw_arms(arms: [Arm], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+           hits: [String], acc: [Arm]) : RwArms = match arms {
+  [] -> RwArms { arms: list_reverse(acc), hits: hits }
+  [Arm(p, g, b), ...rest] -> {
+    let sc2 = inl_push_all(inl_pat_binds(p, []), sc)
+    let rg = match g {
+      Some(gx) -> irw_expr(gx, sc2, tmpls, mo, hits)
+      None     -> RwE { e: b, hits: hits }
+    }
+    let g2 = match g { Some(_) -> Some(rg.e)  None -> None }
+    let rb = irw_expr(b, sc2, tmpls, mo, rg.hits)
+    irw_arms(rest, sc, tmpls, mo, rb.hits, [Arm(p, g2, rb.e), ...acc])
+  }
+}
+
+type RwBlock = { ss: [Stmt], sc: [String], hits: [String] }
+
+fn irw_block(stmts: [Stmt], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+            hits: [String], acc: [Stmt]) : RwBlock = match stmts {
+  [] -> RwBlock { ss: acc, sc: sc, hits: hits }
+  [s, ...rest] -> match s {
+    SLet(p, ann, rhs) -> {
+      let r = irw_expr(rhs, sc, tmpls, mo, hits)
+      irw_block(rest, inl_push_all(inl_pat_binds(p, []), sc), tmpls, mo, r.hits,
+               [SLet(p, ann, r.e), ...acc])
+    }
+    SAssert(c, m) -> {
+      let rc = irw_expr(c, sc, tmpls, mo, hits)
+      match m {
+        Some(mx) -> {
+          let rm = irw_expr(mx, sc, tmpls, mo, rc.hits)
+          irw_block(rest, sc, tmpls, mo, rm.hits, [SAssert(rc.e, Some(rm.e)), ...acc])
+        }
+        None -> irw_block(rest, sc, tmpls, mo, rc.hits, [SAssert(rc.e, None), ...acc])
+      }
+    }
+    SExprStmt(x) -> {
+      let r = irw_expr(x, sc, tmpls, mo, hits)
+      irw_block(rest, sc, tmpls, mo, r.hits, [SExprStmt(r.e), ...acc])
+    }
+    _ -> irw_block(rest, sc, tmpls, mo, hits, [s, ...acc])
+  }
+}
+
+type RwFields = { fs: [FieldInit], hits: [String] }
+
+fn irw_fields(fs: [FieldInit], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+              hits: [String], acc: [FieldInit]) : RwFields = match fs {
+  [] -> RwFields { fs: list_reverse(acc), hits: hits }
+  [FI(n, x), ...rest] -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    irw_fields(rest, sc, tmpls, mo, r.hits, [FI(n, r.e), ...acc])
+  }
+}
+
+type RwElems = { els: [ListElem], hits: [String] }
+
+fn irw_elems(els: [ListElem], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+             hits: [String], acc: [ListElem]) : RwElems = match els {
+  [] -> RwElems { els: list_reverse(acc), hits: hits }
+  [ElPlain(x), ...rest] -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    irw_elems(rest, sc, tmpls, mo, r.hits, [ElPlain(r.e), ...acc])
+  }
+  [ElSpread(x), ...rest] -> {
+    let r = irw_expr(x, sc, tmpls, mo, hits)
+    irw_elems(rest, sc, tmpls, mo, r.hits, [ElSpread(r.e), ...acc])
+  }
+}
+
+type RwClauses = { cs: [HClause], hits: [String] }
+
+fn irw_clauses(cs: [HClause], sc: [String], tmpls: [InlTmpl], mo: Option[String],
+              hits: [String], acc: [HClause]) : RwClauses = match cs {
+  [] -> RwClauses { cs: list_reverse(acc), hits: hits }
+  [HC(op, ps, body, l, cl), ...rest] -> {
+    let sc2 = ["resume", ...inl_push_all(inl_param_names(ps), sc)]
+    let r = irw_expr(body, sc2, tmpls, mo, hits)
+    irw_clauses(rest, sc, tmpls, mo, r.hits, [HC(op, ps, r.e, l, cl), ...acc])
+  }
+}

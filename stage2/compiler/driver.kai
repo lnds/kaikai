@@ -42,6 +42,11 @@ import compiler.perceus
 import compiler.purity
 import compiler.protos
 import compiler.fwd_inline
+import compiler.inline_scan
+import compiler.inline_trmc
+import compiler.inline_admit
+import compiler.inline_paste
+import compiler.inline
 import compiler.emit_shared
 import compiler.emit_c
 import compiler.monomorph
@@ -1188,6 +1193,9 @@ pub type Mode
   # top-level fn, computed over the post-perceus / post-tcrec AST (the
   # same lowered form the backends stamp from). Read-only; no binary.
   | MDumpPurity
+  # `--dump-inline` — the pre-Perceus inliner census: one line per fn
+  # that inlined into at least one call site. Read-only; no binary.
+  | MDumpInline
   | MDumpLastUse
   # `--dump=evidence-obligations` — per function, the distinct effect-
   # instance evidence obligations the row demands and which supplier
@@ -1484,6 +1492,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpBorrowSafe))
       } else if a == "--dump-purity" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpPurity))
+      } else if a == "--dump-inline" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpInline))
       } else if a == "--dump-last-use" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--dump-intervals" {
@@ -1655,6 +1665,7 @@ fn usage() : Unit / Console {
   eprint("  --dump-rawsafe     Phase 1.B.0: dump cons-head raw-safe analysis marks (load/store sites)")
   eprint("  --dump-borrowsafe  Phase 1.B.1: dump cons-head borrow-safe analysis marks (per match arm)")
   eprint("  --dump-purity      dump the confirmed purity verdict per top-level fn (issue #1139)")
+  eprint("  --dump-inline      dump the pre-Perceus inliner census (fn name + inlined site count)")
   eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --dump-brands      list nursery cap-binding brand allocations + per-call attributions (issue #71 option (b))")
@@ -4667,11 +4678,18 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # slot); the C oracle's mode-slave border is total, so it
                       # keeps the wider promotion (#1110).
                       let unbox_native = match backend { BkNative -> true BkNativeModular -> true _ -> false }
+                      # Pre-Perceus inliner: small non-recursive fns
+                      # paste into their call sites so unbox and
+                      # perceus see through the former call boundary
+                      # (reuse tokens and borrow reads stay
+                      # intra-procedural).
+                      let inl_out = inline_small_fns(mono_decls)
+                      let inl_decls = inl_out.decls
                       # Unbox analysis. Runs between monomorphisation
                       # and perceus so the perceus pass sees post-unbox
                       # modes (it only inserts dup/drop on `MBoxed`
                       # nodes).
-                      let unboxed_decls = unbox_pass(mono_decls, build_ctor_int_slots(mono_decls), unbox_native)
+                      let unboxed_decls = unbox_pass(inl_decls, build_ctor_int_slots(inl_decls), unbox_native)
                       let bmode = match mode {
                         MTest -> BMTest
                         MBench -> BMBench
@@ -4733,9 +4751,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       let cons_ok = true
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok)
                       let use_purity = match mode { MDumpPurity -> true _ -> false }
+                      let use_inline_dump = match mode { MDumpInline -> true _ -> false }
                       if mono_bound_errs != 0 { mono_bound_errs }
                       else if mono_inv_errs != 0 { mono_inv_errs }
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
+                      else if use_inline_dump { dump_inline_census(inl_out.census); 0 }
                       else if use_purity {
                         # Confirmed-purity side table over the same
                         # post-perceus / post-tcrec AST the backends stamp
