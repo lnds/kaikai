@@ -104,12 +104,41 @@ KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
    so div-by-zero and INT64_MIN/-1 trap instead of hitting hardware UB. */
 int64_t kaix_idiv_chk(int64_t a, int64_t b)    { return kai_idiv_chk(a, b); }
 int64_t kaix_imod_chk(int64_t a, int64_t b)    { return kai_imod_chk(a, b); }
-KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_op_eq_v(a, b); }
-KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_op_ne_v(a, b); }
-KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_op_lt(a, b); }
-KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_op_gt(a, b); }
-KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_op_le(a, b); }
-KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_op_ge(a, b); }
+/* Comparison shims carry the tagged-Int fast path INLINE: two immediates
+   compare as one signed word compare (the n*2+1 encoding is monotonic, and
+   two tagged words are numerically equal iff bit-equal), yielding the
+   interned Bool singleton. Everything the generic kai_op_* would do for
+   this shape — consume both operands (no-op on immediates), mint a Bool —
+   is preserved. The point is fold visibility: these shims inline into the
+   emitted module, so a comparison over inline-boxed slot reads reduces to
+   load+cmp, where the out-of-line kai_op_* call froze the whole chain. */
+static inline int kaix_both_tagged(KaiValue *a, KaiValue *b) {
+    return (((intptr_t) a) & ((intptr_t) b) & KAI_INT_TAG_BIT) != 0;
+}
+KaiValue *kaix_eq(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool(a == b);
+    return kai_op_eq_v(a, b);
+}
+KaiValue *kaix_ne(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool(a != b);
+    return kai_op_ne_v(a, b);
+}
+KaiValue *kaix_lt(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a < (intptr_t) b);
+    return kai_op_lt(a, b);
+}
+KaiValue *kaix_gt(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a > (intptr_t) b);
+    return kai_op_gt(a, b);
+}
+KaiValue *kaix_le(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a <= (intptr_t) b);
+    return kai_op_le(a, b);
+}
+KaiValue *kaix_ge(KaiValue *a, KaiValue *b) {
+    if (kaix_both_tagged(a, b)) return kai_bool((intptr_t) a >= (intptr_t) b);
+    return kai_op_ge(a, b);
+}
 KaiValue *kaix_neg(KaiValue *a)                { return kai_op_neg(a); }
 KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) { return kai_op_pow_int(a, b); }
 /* Route through kai_op_boolnot so the LLVM backend's `not` matches the
