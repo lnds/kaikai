@@ -1,0 +1,421 @@
+# compiler/kir_inline_beta.kai — indirect-call beta reduction on KIR.
+#
+# After the direct-call inliner pastes a loop combinator into its
+# caller, the loop's `KCallIndirect(pred/body)` sites sit next to the
+# `KClosure` bindings that feed them. This pass resolves such a site to
+# its lambda and pastes the lambda body, binding `PDirect` params to
+# the call args and `PCapture` params to the closure's capture atoms.
+# A consuming apply's closure ref is retired by a `KDrop` in the JOIN
+# block — after the pasted body — so the captures outlive every read.
+#
+# The dead-closure sweep then removes a `KClosure` binding whose only
+# remaining uses are its own dup/drop RC ops, PROVIDED every capture is
+# an `__alias_id__*` register (a tagged handler id, RC-free), so
+# deleting the build orphans no capture refs.
+
+import compiler.util
+import compiler.kir
+import compiler.kir_inline_clone
+
+# One resolvable closure binding: register name, lambda sym, capture atoms.
+pub type KinClo = KCl(String, String, [KVal])
+
+# A processed block list plus the threaded per-fn site counter.
+type KinBBlks = KBB([KBlock], Int)
+
+#[doc("Beta-reduce a fn's KCallIndirect sites over its single-assignment KClosure bindings, pasting admitted lambda bodies; then sweep closures left dead by the reduction.")]
+pub fn kin_beta_fn(f: KFn, lams: [KinTmpl]) : KFn = {
+  let env = kin_clo_env(f.blocks)
+  match env {
+    [] -> f
+    _  -> match kin_beta_blocks(f.blocks, env, lams, 0, []) {
+      KBB(bs, _) -> KFn { sym: f.sym, kind: f.kind, params: f.params, ret: f.ret,
+                          blocks: kin_dce_closures(bs), region_id: f.region_id,
+                          stateful: f.stateful, mo: f.mo }
+    }
+  }
+}
+
+# --- Closure environment -------------------------------------------------
+
+# Every `KLet(n, _, KClosure)` whose register is never re-stored (the
+# binding is single-assignment, so a later read sees exactly this
+# closure), plus the single-assignment `KLitOp` register aliases that
+# resolve to one — the shape the loop-template paste leaves behind
+# (`pred$in0: box = .t6`). Alias chains are short; three rounds cover
+# a paste-of-paste.
+fn kin_clo_env(bs: [KBlock]) : [KinClo] = {
+  let stores = kin_store_names(bs, [])
+  let direct = kin_clo_collect(bs, stores, [])
+  kin_clo_alias_round(bs, stores, kin_clo_alias_round(bs, stores, kin_clo_alias_round(bs, stores, direct)))
+}
+
+fn kin_clo_alias_round(bs: [KBlock], stores: [String], env: [KinClo]) : [KinClo] =
+  kin_clo_alias_blocks(bs, stores, env, env)
+
+fn kin_clo_alias_blocks(bs: [KBlock], stores: [String], env: [KinClo], acc: [KinClo]) : [KinClo] = match bs {
+  []           -> acc
+  [b, ...rest] -> kin_clo_alias_blocks(rest, stores, env, kin_clo_alias_stmts(b.stmts, stores, env, acc))
+}
+
+fn kin_clo_alias_stmts(ss: [KStmt], stores: [String], env: [KinClo], acc: [KinClo]) : [KinClo] = match ss {
+  []           -> acc
+  [s, ...rest] -> kin_clo_alias_stmts(rest, stores, env, match s {
+    KLet(n, _, KLitOp(KVar(m)), _) ->
+      if list_has(stores, n) { acc }
+      else { match kin_clo_find(acc, n) {
+        Some(_) -> acc
+        None -> match kin_clo_find(env, m) {
+          Some(KCl(_, sym, caps)) -> [KCl(n, sym, caps), ...acc]
+          None                    -> acc
+        }
+      } }
+    _ -> acc
+  })
+}
+
+fn kin_store_names(bs: [KBlock], acc: [String]) : [String] = match bs {
+  []           -> acc
+  [b, ...rest] -> kin_store_names(rest, kin_store_names_stmts(b.stmts, acc))
+}
+
+fn kin_store_names_stmts(ss: [KStmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> kin_store_names_stmts(rest, match s {
+    KStore(n, _, _) -> [n, ...acc]
+    _               -> acc
+  })
+}
+
+fn kin_clo_collect(bs: [KBlock], stores: [String], acc: [KinClo]) : [KinClo] = match bs {
+  []           -> list_reverse(acc)
+  [b, ...rest] -> kin_clo_collect(rest, stores, kin_clo_stmts(b.stmts, stores, acc))
+}
+
+fn kin_clo_stmts(ss: [KStmt], stores: [String], acc: [KinClo]) : [KinClo] = match ss {
+  []           -> acc
+  [s, ...rest] -> kin_clo_stmts(rest, stores, match s {
+    KLet(n, _, KClosure(sym, _, caps), _) ->
+      if list_has(stores, n) { acc } else { [KCl(n, sym, caps), ...acc] }
+    _ -> acc
+  })
+}
+
+fn kin_clo_find(env: [KinClo], n: String) : Option[KinClo] = match env {
+  [] -> None
+  [KCl(cn, sym, caps), ...rest] ->
+    if cn == n { Some(KCl(cn, sym, caps)) } else { kin_clo_find(rest, n) }
+}
+
+# --- Site scan ------------------------------------------------------------
+
+fn kin_beta_blocks(bs: [KBlock], env: [KinClo], lams: [KinTmpl], c: Int, acc: [KBlock]) : KinBBlks = match bs {
+  []           -> KBB(list_reverse(acc), c)
+  [b, ...rest] -> match kin_beta_scan(b.label, b.stmts, b.term, env, lams, c, []) {
+    KBB(nbs, c2) -> kin_beta_blocks(rest, env, lams, c2, kin_prepend_rev_b(nbs, acc))
+  }
+}
+
+fn kin_prepend_rev_b(xs: [KBlock], acc: [KBlock]) : [KBlock] = match xs {
+  []           -> acc
+  [x, ...rest] -> kin_prepend_rev_b(rest, [x, ...acc])
+}
+
+# Mirror of the direct-call scan: head block → alpha-renamed lambda
+# clone → join block. The join opens with the closure-consuming `KDrop`
+# (a borrowing apply skips it), then the site's remaining statements.
+fn kin_beta_scan(label: String, ss: [KStmt], term: KTerm, env: [KinClo],
+                 lams: [KinTmpl], c: Int, pre_rev: [KStmt]) : KinBBlks = match ss {
+  [] -> KBB([KBlock { label: label, stmts: list_reverse(pre_rev), term: term, region_id: None }], c)
+  [s, ...rest] -> match kin_beta_site(s, env, lams) {
+    Some(hit) -> match hit { KBH(x, slot, cn, lam, caps, args, consuming, pos) -> {
+      let sfx  = cat2("$bt", int_to_string(c))
+      let ordered = kin_origin_args(lam.params, args, caps, [])
+      let sub  = KinSub { pargs: kin_bind_boxed_args(lam.params, ordered, []),
+                          sfx: sfx, params: lam.params, entry: kin_beta_entry(lam) }
+      let plets = kin_param_lets(lam.params, ordered, sfx, false, pos, [])
+      let join = cat2("Lj", sfx)
+      let head = KBlock { label: label,
+                          stmts: list_reverse([KLet(x, slot, KLitOp(kin_zero(slot)), pos), ...list_append(plets, pre_rev)]),
+                          term: KBr(kin_lbl(sub, kin_beta_entry(lam)), pos),
+                          region_id: None }
+      let cloned = kin_clone_blocks(lam.blocks, sub, x, join, [])
+      let jdrop = if consuming { [KRC(KDrop(KVar(cn)), pos)] } else { [] }
+      match kin_beta_scan(join, rest, term, env, lams, c + 1, list_reverse(jdrop)) {
+        KBB(tail, c2) -> KBB([head, ...list_append(cloned, tail)], c2)
+      }
+    } }
+    None -> kin_beta_scan(label, rest, term, env, lams, c, [s, ...pre_rev])
+  }
+}
+
+# One matched site: result register + slot, the closure register, the
+# lambda template, the closure's capture atoms, the call args, whether
+# the apply consumes the closure, and the site position.
+type KinBetaHit = KBH(String, KSlot, String, KFn, [KVal], [KVal], Bool, KPos)
+
+fn kin_beta_site(s: KStmt, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] = match s {
+  KLet(x, slot, KCallIndirect(KVar(cn), args), pos) ->
+    kin_beta_resolve(x, slot, cn, args, true, pos, env, lams)
+  KLet(x, slot, KCallIndirectBorrow(KVar(cn), args), pos) ->
+    kin_beta_resolve(x, slot, cn, args, false, pos, env, lams)
+  _ -> None
+}
+
+fn kin_beta_resolve(x: String, slot: KSlot, cn: String, args: [KVal], consuming: Bool,
+                    pos: KPos, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] =
+  match kin_clo_find(env, cn) {
+    None -> None
+    Some(KCl(_, sym, caps)) -> match kin_tmpl_find(lams, sym) {
+      None      -> None
+      Some(lam) ->
+        if kin_beta_arity_ok(lam.params, args, caps) and kin_lam_alias_site_ok(lam, caps) {
+          Some(KBH(x, slot, cn, lam, caps, args, consuming, pos))
+        } else { None }
+    }
+  }
+
+fn kin_tmpl_find(ts: [KinTmpl], sym: String) : Option[KFn] = match ts {
+  [] -> None
+  [KT(s, f), ...rest] -> if s == sym { Some(f) } else { kin_tmpl_find(rest, sym) }
+}
+
+fn kin_beta_entry(f: KFn) : String = match f.blocks {
+  [b, ..._] -> b.label
+  []        -> ""
+}
+
+# Each param must resolve through its origin: `PDirect(i)` within the
+# args, `PCapture(j)` within the captures.
+fn kin_beta_arity_ok(ps: [KParam], args: [KVal], caps: [KVal]) : Bool = match ps {
+  [] -> true
+  [p, ...rest] -> match p.origin {
+    PDirect(i)  -> i >= 0 and i < list_length(args) and kin_beta_arity_ok(rest, args, caps)
+    PCapture(j) -> j >= 0 and j < list_length(caps) and kin_beta_arity_ok(rest, args, caps)
+    _           -> false
+  }
+}
+
+# The params in template order, each resolved to its site atom.
+fn kin_origin_args(ps: [KParam], args: [KVal], caps: [KVal], acc: [KVal]) : [KVal] = match ps {
+  [] -> list_reverse(acc)
+  [p, ...rest] -> kin_origin_args(rest, args, caps, [match p.origin {
+    PDirect(i)  -> kin_val_at(args, i)
+    PCapture(j) -> kin_val_at(caps, j)
+    _           -> KUnitV
+  }, ...acc])
+}
+
+fn kin_val_at(vs: [KVal], i: Int) : KVal = match vs {
+  []           -> KUnitV
+  [v, ...rest] -> if i == 0 { v } else { kin_val_at(rest, i - 1) }
+}
+
+# --- Aliased performs -----------------------------------------------------
+
+# An `op@a` perform resolves through the `__alias_id__a` register BY
+# NAME at emission (the op string carries the alias, not an atom). The
+# paste is sound only when the lambda captured that register under the
+# SAME name and the site's capture atom IS that register — then the
+# pasted perform reads the caller's own alias id.
+
+#[doc("Template-side alias shape: every `op@a` perform names a `__alias_id__a` param captured (not direct) by the lambda.")]
+pub fn kin_lam_alias_shape_ok(f: KFn) : Bool =
+  kin_alias_names_ok(kin_perform_aliases(f.blocks, []), f.params)
+
+# Site-side: the capture atom bound to each `__alias_id__a` param is
+# the caller register of the same name.
+fn kin_lam_alias_site_ok(f: KFn, caps: [KVal]) : Bool =
+  kin_alias_caps_ok(kin_perform_aliases(f.blocks, []), f.params, caps)
+
+fn kin_perform_aliases(bs: [KBlock], acc: [String]) : [String] = match bs {
+  []           -> acc
+  [b, ...rest] -> kin_perform_aliases(rest, kin_perform_aliases_stmts(b.stmts, acc))
+}
+
+fn kin_perform_aliases_stmts(ss: [KStmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> kin_perform_aliases_stmts(rest, match s {
+    KLet(_, _, KPerform(_, op, _), _) -> kin_alias_of(op, acc)
+    KDo(KPerform(_, op, _), _)        -> kin_alias_of(op, acc)
+    _                                 -> acc
+  })
+}
+
+fn kin_alias_of(op: String, acc: [String]) : [String] = {
+  let i = string_index_of_char(op, '@')
+  if i < 0 { acc }
+  else { [string_slice(op, i + 1, string_length(op) - i - 1), ...acc] }
+}
+
+fn kin_alias_names_ok(aliases: [String], ps: [KParam]) : Bool = match aliases {
+  []           -> true
+  [a, ...rest] -> kin_alias_param_ok(cat2("__alias_id__", a), ps) and kin_alias_names_ok(rest, ps)
+}
+
+fn kin_alias_param_ok(nm: String, ps: [KParam]) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> if p.name == nm {
+    match p.origin { PCapture(_) -> true  _ -> false }
+  } else { kin_alias_param_ok(nm, rest) }
+}
+
+fn kin_alias_caps_ok(aliases: [String], ps: [KParam], caps: [KVal]) : Bool = match aliases {
+  []           -> true
+  [a, ...rest] -> kin_alias_cap_is_self(cat2("__alias_id__", a), ps, caps) and kin_alias_caps_ok(rest, ps, caps)
+}
+
+fn kin_alias_cap_is_self(nm: String, ps: [KParam], caps: [KVal]) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> if p.name == nm {
+    match p.origin {
+      PCapture(j) -> match kin_val_at(caps, j) {
+        KVar(cv) -> cv == nm
+        _        -> false
+      }
+      _ -> false
+    }
+  } else { kin_alias_cap_is_self(nm, rest, caps) }
+}
+
+# --- Dead-closure sweep ---------------------------------------------------
+
+# A closure binding (or a register alias of one) whose only remaining
+# uses are its own dup/drop RC ops is dead. The build consumed one ref
+# per capture, so removal is sound only when every capture is an
+# `__alias_id__*` register — a tagged handler id whose RC ops are
+# no-ops. Runs to a bounded fixpoint: removing an alias exposes the
+# closure build it read.
+fn kin_dce_closures(bs: [KBlock]) : [KBlock] = kin_dce_fix(bs, 4)
+
+fn kin_dce_fix(bs: [KBlock], fuel: Int) : [KBlock] =
+  if fuel <= 0 { bs }
+  else {
+    let dead = kin_dce_candidates(kin_clo_env(bs), bs, [])
+    match dead {
+      [] -> bs
+      _  -> kin_dce_fix(kin_dce_rewrite(bs, dead, []), fuel - 1)
+    }
+  }
+
+fn kin_dce_candidates(env: [KinClo], bs: [KBlock], acc: [String]) : [String] = match env {
+  [] -> acc
+  [KCl(n, _, caps), ...rest] ->
+    kin_dce_candidates(rest, bs,
+      if kin_caps_all_alias(caps) and not kin_name_used(bs, n) { [n, ...acc] } else { acc })
+}
+
+fn kin_caps_all_alias(caps: [KVal]) : Bool = match caps {
+  []           -> true
+  [c, ...rest] -> match c {
+    KVar(n) -> kin_is_alias_name(n) and kin_caps_all_alias(rest)
+    _       -> false
+  }
+}
+
+fn kin_is_alias_name(n: String) : Bool =
+  string_length(n) > 11 and string_slice(n, 0, 11) == "__alias_id_"
+
+# Any non-RC use of register `n` across the fn (op atoms, store values,
+# terminator atoms). The closure's own `KLet` and its dup/drop do not
+# count.
+fn kin_name_used(bs: [KBlock], n: String) : Bool = match bs {
+  []           -> false
+  [b, ...rest] -> kin_name_used_stmts(b.stmts, n) or kin_term_uses(b.term, n) or kin_name_used(rest, n)
+}
+
+fn kin_name_used_stmts(ss: [KStmt], n: String) : Bool = match ss {
+  []           -> false
+  [s, ...rest] -> kin_stmt_uses(s, n) or kin_name_used_stmts(rest, n)
+}
+
+fn kin_stmt_uses(s: KStmt, n: String) : Bool = match s {
+  KLet(_, _, op, _)   -> kin_op_uses(op, n)
+  KDo(op, _)          -> kin_op_uses(op, n)
+  KRC(_, _)           -> false
+  KStore(_, v, _)     -> kin_val_is(v, n)
+  KInstall(_, _, iv, _, _) -> match iv { Some(v) -> kin_val_is(v, n) None -> false }
+  _                   -> false
+}
+
+fn kin_op_uses(op: KOp, n: String) : Bool = match op {
+  KCall(_, vs)               -> kin_vals_use(vs, n)
+  KCallIndirect(f2, vs)      -> kin_val_is(f2, n) or kin_vals_use(vs, n)
+  KCallIndirectBorrow(f2, vs) -> kin_val_is(f2, n) or kin_vals_use(vs, n)
+  KPrim(_, vs)               -> kin_vals_use(vs, n)
+  KCon(_, _, _, inits)       -> kin_inits_use(inits, n)
+  KConReuse(_, d, _, _, inits) -> kin_val_is(d, n) or kin_inits_use(inits, n)
+  KRecord(fs)                -> kin_fields_use(fs, n)
+  KRecordReuse(d, fs)        -> kin_val_is(d, n) or kin_fields_use(fs, n)
+  KTokenSteal(v, _)          -> kin_val_is(v, n)
+  KProj(v, _)                -> kin_val_is(v, n)
+  KProjBorrow(v, _)          -> kin_val_is(v, n)
+  KProjKind(v, _, _)         -> kin_val_is(v, n)
+  KTagOf(v)                  -> kin_val_is(v, n)
+  KClosure(_, _, caps)       -> kin_vals_use(caps, n)
+  KPerform(_, _, vs)         -> kin_vals_use(vs, n)
+  KSetjmp(_, _)              -> false
+  KResumeOp(k, v)            -> kin_val_is(k, n) or kin_val_is(v, n)
+  KResume2Op(k, v, s2)       -> kin_val_is(k, n) or kin_val_is(v, n) or kin_val_is(s2, n)
+  KLitOp(v)                  -> kin_val_is(v, n)
+}
+
+fn kin_term_uses(t: KTerm, n: String) : Bool = match t {
+  KRet(v, _)              -> kin_val_is(v, n)
+  KCondBr(v, _, _, _)     -> kin_val_is(v, n)
+  KSwitch(v, _, _, _)     -> kin_val_is(v, n)
+  KTailCall(_, vs, _)     -> kin_vals_use(vs, n)
+  KTcrecGoto(_, asg, _, _) -> kin_asg_use(asg, n)
+  KTrmcStep(_, _, _, _, _, _, hs, asg, _, _) -> kin_vals_use(hs, n) or kin_asg_use(asg, n)
+  KTrmcApply(v, _)        -> kin_val_is(v, n)
+  _                       -> false
+}
+
+fn kin_asg_use(asg: [KAssign], n: String) : Bool = match asg {
+  []                   -> false
+  [KAsg(_, v), ...rest] -> kin_val_is(v, n) or kin_asg_use(rest, n)
+}
+
+fn kin_val_is(v: KVal, n: String) : Bool = match v {
+  KVar(m) -> m == n
+  _       -> false
+}
+
+fn kin_vals_use(vs: [KVal], n: String) : Bool = match vs {
+  []           -> false
+  [v, ...rest] -> kin_val_is(v, n) or kin_vals_use(rest, n)
+}
+
+fn kin_inits_use(inits: [KSlotInit], n: String) : Bool = match inits {
+  []            -> false
+  [si, ...rest] -> match si {
+    SIBoxed(v) -> kin_val_is(v, n) or kin_inits_use(rest, n)
+    SIInt64(v) -> kin_val_is(v, n) or kin_inits_use(rest, n)
+    SIReal(v)  -> kin_val_is(v, n) or kin_inits_use(rest, n)
+    SIEnum(v)  -> kin_val_is(v, n) or kin_inits_use(rest, n)
+  }
+}
+
+fn kin_fields_use(fs: [KFieldInit], n: String) : Bool = match fs {
+  []                   -> false
+  [KFI(_, v), ...rest] -> kin_val_is(v, n) or kin_fields_use(rest, n)
+}
+
+# Drop the dead closures' KLets and their dup/drop RC statements.
+fn kin_dce_rewrite(bs: [KBlock], dead: [String], acc: [KBlock]) : [KBlock] = match bs {
+  []           -> list_reverse(acc)
+  [b, ...rest] -> kin_dce_rewrite(rest, dead,
+    [KBlock { label: b.label, stmts: kin_dce_stmts(b.stmts, dead, []), term: b.term,
+              region_id: b.region_id }, ...acc])
+}
+
+fn kin_dce_stmts(ss: [KStmt], dead: [String], acc: [KStmt]) : [KStmt] = match ss {
+  []           -> list_reverse(acc)
+  [s, ...rest] -> kin_dce_stmts(rest, dead, match s {
+    KLet(n, _, KClosure(_, _, _), _)  -> if list_has(dead, n) { acc } else { [s, ...acc] }
+    KLet(n, _, KLitOp(KVar(_)), _)    -> if list_has(dead, n) { acc } else { [s, ...acc] }
+    KRC(KDup(KVar(n)), _)             -> if list_has(dead, n) { acc } else { [s, ...acc] }
+    KRC(KDrop(KVar(n)), _)            -> if list_has(dead, n) { acc } else { [s, ...acc] }
+    _                                 -> [s, ...acc]
+  })
+}

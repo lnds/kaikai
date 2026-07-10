@@ -11,10 +11,35 @@
 import compiler.util
 import compiler.kir
 
-# Clone context for one paste: param name → argument atom, plus the
-# site-unique suffix every local binder and label takes.
+# Clone context for one paste: param name → argument atom, the
+# site-unique suffix every local binder and label takes, the template's
+# param list + entry label (consumed by the `KTcrecGoto` back-edge
+# rewrite; empty/params-unused for straight-line templates).
 pub type KinArg = KA(String, KVal)
-pub type KinSub = { pargs: [KinArg], sfx: String }
+pub type KinSub = { pargs: [KinArg], sfx: String, params: [KParam], entry: String }
+
+#[doc("One admitted template, keyed by its resolved symbol.")]
+pub type KinTmpl = KT(String, KFn)
+
+#[doc("The declared-slot zero init for a paste's result register, so every path through the clone stores over an initialised alloca of the right width.")]
+pub fn kin_zero(s: KSlot) : KVal = match s {
+  SInt64 -> KIntV(0)
+  SReal  -> KRealV(0.0)
+  SBool  -> KBoolV(false)
+  _      -> KUnitV
+}
+
+#[doc("Head-block KLets for the materialised params, REVERSED (the head accumulator is a reversed list): `param+sfx: slot = arg`. `all` takes every param (loop templates); otherwise only the raw ones.")]
+pub fn kin_param_lets(ps: [KParam], cargs: [KVal], sfx: String, all: Bool, pos: KPos, acc: [KStmt]) : [KStmt] = match ps {
+  [] -> acc
+  [p, ...prest] -> match cargs {
+    []            -> acc
+    [a, ...arest] -> kin_param_lets(prest, arest, sfx, all, pos, match p.slot {
+      SBoxed -> if all { [KLet(cat2(p.name, sfx), p.slot, KLitOp(a), pos), ...acc] } else { acc }
+      _      -> [KLet(cat2(p.name, sfx), p.slot, KLitOp(a), pos), ...acc]
+    })
+  }
+}
 
 # Bind only the BOXED params to their argument atoms; a raw param is
 # left unbound so the fallback rename reads its head-block materialised
@@ -35,17 +60,93 @@ pub fn kin_clone_blocks(bs: [KBlock], sub: KinSub, x: String, join: String, acc:
   [b, ...rest] -> kin_clone_blocks(rest, sub, x, join, [kin_clone_block(b, sub, x, join), ...acc])
 }
 
-# `KRet v` becomes `x <- v; br join`; every other terminator renames its
-# labels in place.
+# `KRet v` becomes `x <- v; br join`; a `KTcrecGoto` back-edge becomes
+# the same eval → masked-drop → store sequence the backend lowers it to,
+# closed by a branch to the clone's entry (the pasted loop header);
+# every other terminator renames its labels in place.
 fn kin_clone_block(b: KBlock, sub: KinSub, x: String, join: String) : KBlock = match b.term {
   KRet(v, p) -> KBlock { label: kin_lbl(sub, b.label),
                          stmts: list_append(kin_sub_stmts(b.stmts, sub, []),
                                             [KStore(x, kin_sub_val(sub, v), p)]),
                          term: KBr(join, p), region_id: None }
+  KTcrecGoto(_, asg, mask, p) ->
+    KBlock { label: kin_lbl(sub, b.label),
+             stmts: list_append(kin_sub_stmts(b.stmts, sub, []), kin_reloop_stmts(sub, asg, mask, p)),
+             term: KBr(kin_lbl(sub, sub.entry), p), region_id: None }
   _          -> KBlock { label: kin_lbl(sub, b.label),
                          stmts: kin_sub_stmts(b.stmts, sub, []),
                          term: kin_sub_term(sub, b.term), region_id: None }
 }
+
+# The pasted back-edge, mirroring `nemit_tcrec`: every non-identity
+# reloop value is evaluated FIRST (it reads the OLD param registers)
+# into a fresh temp at the destination param's slot; the dropmask then
+# releases each dead BOXED old param (raw scalars are never dropped);
+# the temps store last. An identity assign (`p <- p`) skips its eval
+# and store but keeps its masked drop — the block's own `dup` minted
+# the ref the back-edge retires.
+fn kin_reloop_stmts(sub: KinSub, asg: [KAssign], mask: Int, p: KPos) : [KStmt] =
+  list_append(kin_reloop_evals(sub, asg, p, []),
+              list_append(kin_reloop_drops(sub, asg, mask, p, []),
+                          kin_reloop_stores(sub, asg, p, [])))
+
+fn kin_reloop_evals(sub: KinSub, asg: [KAssign], p: KPos, acc: [KStmt]) : [KStmt] = match asg {
+  [] -> list_reverse(acc)
+  [KAsg(idx, v), ...rest] -> kin_reloop_evals(sub, rest, p,
+    if kin_asg_identity(sub, idx, v) { acc }
+    else { [KLet(kin_reloop_tmp(sub, idx), kin_param_slot(sub, idx), KLitOp(kin_sub_val(sub, v)), p), ...acc] })
+}
+
+fn kin_reloop_drops(sub: KinSub, asg: [KAssign], mask: Int, p: KPos, acc: [KStmt]) : [KStmt] = match asg {
+  [] -> list_reverse(acc)
+  [KAsg(idx, _), ...rest] -> kin_reloop_drops(sub, rest, mask, p,
+    if kin_mask_bit(mask, idx) and kin_param_is_boxed(sub, idx) {
+      [KRC(KDrop(KVar(kin_param_reg(sub, idx))), p), ...acc]
+    } else { acc })
+}
+
+fn kin_reloop_stores(sub: KinSub, asg: [KAssign], p: KPos, acc: [KStmt]) : [KStmt] = match asg {
+  [] -> list_reverse(acc)
+  [KAsg(idx, v), ...rest] -> kin_reloop_stores(sub, rest, p,
+    if kin_asg_identity(sub, idx, v) { acc }
+    else { [KStore(kin_param_reg(sub, idx), KVar(kin_reloop_tmp(sub, idx)), p), ...acc] })
+}
+
+fn kin_asg_identity(sub: KinSub, idx: Int, v: KVal) : Bool = match v {
+  KVar(n) -> n == kin_param_name(sub, idx)
+  _       -> false
+}
+
+fn kin_reloop_tmp(sub: KinSub, idx: Int) : String =
+  concat_all([kin_param_name(sub, idx), sub.sfx, "$re"])
+
+# The cloned register carrying param `idx` (the head block materialised
+# it as `name+sfx`).
+fn kin_param_reg(sub: KinSub, idx: Int) : String = cat2(kin_param_name(sub, idx), sub.sfx)
+
+fn kin_param_name(sub: KinSub, idx: Int) : String = match kin_param_at(sub.params, idx) {
+  Some(pp) -> pp.name
+  None     -> ""
+}
+
+fn kin_param_slot(sub: KinSub, idx: Int) : KSlot = match kin_param_at(sub.params, idx) {
+  Some(pp) -> pp.slot
+  None     -> SBoxed
+}
+
+fn kin_param_is_boxed(sub: KinSub, idx: Int) : Bool = match kin_param_slot(sub, idx) {
+  SBoxed -> true
+  _      -> false
+}
+
+fn kin_param_at(ps: [KParam], idx: Int) : Option[KParam] = match ps {
+  []            -> None
+  [pp, ...rest] -> if idx == 0 { Some(pp) } else { kin_param_at(rest, idx - 1) }
+}
+
+fn kin_mask_bit(mask: Int, i: Int) : Bool = (mask / kin_pow2(i)) % 2 == 1
+
+fn kin_pow2(n: Int) : Int = if n <= 0 { 1 } else { 2 * kin_pow2(n - 1) }
 
 pub fn kin_lbl(sub: KinSub, l: String) : String = cat2(l, sub.sfx)
 
@@ -105,6 +206,9 @@ fn kin_sub_op(sub: KinSub, op: KOp) : KOp = match op {
   KRecordReuse(d, fs)        -> KRecordReuse(kin_sub_val(sub, d), kin_sub_fields(fs, sub, []))
   KTokenSteal(v, n)          -> KTokenSteal(kin_sub_val(sub, v), n)
   KCall(nm, vs)              -> KCall(nm, kin_sub_vals(vs, sub, []))
+  KCallIndirect(f, vs)       -> KCallIndirect(kin_sub_val(sub, f), kin_sub_vals(vs, sub, []))
+  KCallIndirectBorrow(f, vs) -> KCallIndirectBorrow(kin_sub_val(sub, f), kin_sub_vals(vs, sub, []))
+  KPerform(eff, o, vs)       -> KPerform(eff, o, kin_sub_vals(vs, sub, []))
   _                          -> op
 }
 
