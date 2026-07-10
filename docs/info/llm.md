@@ -46,6 +46,7 @@ effects     algebraic effects and handlers
 fibers      structured concurrency, Spawn/await/cancel
 actors      send/receive/self over Actor[Msg]
 match       pattern matching, exhaustiveness
+contracts   requires / ensures + refinement-type predicates
 pipes       the four pipe operators and their intent
 units       units of measure on Real
 protocols   single-dispatch protocols

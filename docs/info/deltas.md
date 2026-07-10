@@ -48,8 +48,13 @@ Every entry is verified against the compiler; when in doubt,
   `xs.map(f)` is UFCS sugar for `map(xs, f)`.
 - No module header (`mod` / `package` / `module`). The file path is
   the package; bring code in with `import loop`.
-- No `do { ... }` blocks, no `where` clauses — use a block body
-  with `let`.
+- No `do { ... }` blocks, and no Haskell-style `where` clause for
+  trailing local bindings — use a block body with `let`. (`where`
+  *does* exist, but for refinement predicates: `Int where self >= 0`.)
+- Preconditions and postconditions are `requires` / `ensures` on the
+  function, and value constraints are `type T = Base where P`
+  refinement types — both checked, both panic-on-violation. Not
+  assertions, not comments. See `kai info contracts`.
 - Side effects are in the type: printing needs `/ Stdout` in the
   signature. An effectful call inside a pure signature is a type
   error, not a warning.
