@@ -2090,8 +2090,7 @@ static inline size_t kai_var_block_size(int n) {
      * member access on a misaligned bogus pointer that -fsanitize=undefined
      * flags on every variant alloc under the ASAN tier. */
     size_t base = offsetof(KaiValue, as);
-    size_t need = base + (size_t) n * sizeof(KaiVarSlot);
-    return need < sizeof(KaiValue) ? sizeof(KaiValue) : need;
+    return base + (size_t) n * sizeof(KaiVarSlot);
 }
 
 /* FAM lane: allocate a KAI_VARIANT block with `n` payload slots stored
