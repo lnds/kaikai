@@ -207,6 +207,21 @@ noise of the recorded baseline).
   binder has ZERO variable reads afterwards: the unbox lambda-capture
   demotion never fires, Perceus never dups it, and the residual-use
   check reduces to "any `EVar(x)` left anywhere = revert".
+- **User-written cells match the desugar's slot shape.** The pass was
+  designed against desugar-minted slots, whose escape check already
+  vetoed closure captures — but `let fed = array_make(1, false)` written
+  BY HAND (stream_mock_disk) matches the same triple, and its get/set
+  sites sat inside handler clauses, which emit as separate functions.
+  The promoted register was undeclared there (CI compile failure). The
+  rewriter now stops at every function-emission boundary (closures,
+  handler clauses/returns), with the loop wrapper lambdas as the one
+  pasted-inline exception.
+- **The parity ratchet can mask an oracle-build regression as flaky.**
+  The same bug made 8 fixtures' ORACLE (C) builds fail during the local
+  parity runs, and the ratchet classified them "failed to build on
+  recheck; cannot judge, not counted as a new gap" — a green ratchet
+  over a real regression. When the ratchet reports oracle-build
+  failures, compile one of them standalone before trusting the OK.
 - **Rewrite-then-verify beats prove-then-rewrite.** Shadowing (nested
   same-named vars, handler aliases, lambda params) needs no scope
   analysis: the rewriter refuses to enter binding constructs that rebind
