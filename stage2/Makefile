@@ -1166,7 +1166,7 @@ test-issue-248-loop-sugars: $(TARGET) build
 # to the golden; the negative (`each` closure) must KEEP its clauses.
 test-issue-1179-var-slot-loop: $(TARGET) build
 	@set -e; \
-	for f in issue_1179_var_slot_loops issue_1179_each_closure_state; do \
+	for f in issue_1179_var_slot_loops issue_1179_each_closure_state issue_1179_cell_register; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
 	  ./$(TARGET) --path ../stdlib $$src > build/$$f.c \
@@ -1184,7 +1184,19 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	done; \
 	grep -q "kai_each_sum__clause" build/issue_1179_each_closure_state.c \
 	  || { echo "issue_1179 FAIL (each_sum lost its State clauses)"; exit 1; }; \
-	echo "issue-1179-var-slot-loop OK (loops slot + inline, each keeps State)"
+	for cell in acc_int acc_real flag post; do \
+	  grep -q "kair_$${cell}__slot" build/issue_1179_cell_register.c \
+	    || { echo "issue_1179 FAIL ($$cell not promoted to a raw cell)"; exit 1; }; \
+	  grep -q "kai_$${cell}__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	    && { echo "issue_1179 FAIL ($$cell still an array slot)"; exit 1; } || true; \
+	done; \
+	grep -q "kai_s_txt__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	  || { echo "issue_1179 FAIL (String var lost its array slot)"; exit 1; }; \
+	./$(TARGET) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
+	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
+	grep -q "acc_int__slot: i64" build/issue_1179_cell_register.kir \
+	  || { echo "issue_1179 FAIL (acc_int not a raw i64 register in KIR)"; exit 1; }; \
+	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, each keeps State)"
 
 # Tier 1-ASAN counterpart: same fixture, but the linked binary is
 # instrumented with AddressSanitizer + UndefinedBehaviorSanitizer

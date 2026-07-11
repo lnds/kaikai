@@ -124,34 +124,19 @@ Self-tail calls are MANDATORY-OPTIMISED (Tier 1 #2). A function
 whose final expression is a call to itself uses constant stack.
 Non-self tail calls do not generally get TCO.
 
-## Performance: `while`/`until` cost in a tight loop
+## Performance
 
-`while` and `until` take their predicate and body as lambdas, so each
-iteration pays two indirect closure calls. Worse, a `var` mutated inside
-those lambdas escapes into a closure, which disqualifies the `var`→stack-slot
-specialisation — the cell falls back to a dispatched `State` effect, so every
-read and write of the counter is an effect operation, not a load/store.
+`while`/`until`/`repeat` written with literal blocks compile to inline
+loops on both backends: the lambdas never become runtime closures, and
+a local scalar `var` (Int/Real/Bool) mutated by the loop lowers to a
+plain register, not a heap cell or a dispatched `State` handler. A
+tight numeric `while`+`var` loop runs at the same speed as the
+equivalent self-tail-recursive function, so pick whichever form reads
+better.
 
-For a tight numeric loop this is large. The same computation written as a
-direct self-tail-recursive function — where the accumulator is a plain
-parameter that never escapes — keeps the `var`→slot form and drops the
-closures, and runs on the order of tens of times faster in the current
-compiler.
-
-Rule of thumb: reach for `while`/`until` for readability and I/O-bound or
-coarse-grained loops; for a hot numeric inner loop, write a self-tail-recursive
-helper with the state as parameters:
-
-```kaikai
-fn go(n: Int, i: Int, acc: Int) : Int =
-  if i < n { go(n, i + 1, acc + i) } else { acc }
-
-fn main() : Int = go(1000, 0, 0)
-```
-
-The gap closes on its own once the small-function inliner fuses the loop
-combinator's lambdas at the call site (the same move Koka makes) — at which
-point the counter stops escaping and the slot form applies again.
+The inline lowering applies to the literal trailing-lambda form. A
+combinator name that is shadowed, or a loop whose pred/body arrive as
+closure VALUES, keeps the ordinary closure-calling combinator.
 
 ## NOT IN KAIKAI
 
