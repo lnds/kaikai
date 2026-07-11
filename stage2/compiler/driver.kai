@@ -38,6 +38,7 @@ import compiler.evidence_scan
 import compiler.evidence
 import compiler.evidence_inject
 import compiler.fnreg
+import compiler.cell_promote
 import compiler.unbox
 import compiler.rawsafe
 import compiler.perceus
@@ -4336,15 +4337,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # never see a dangling cap read.
             let cell_low = lower_cell_reads_decls(indexed_decls, path)
             if cell_low.errs > 0 { cell_low.errs } else {
-            # C-backend loop lowering: dissolve literal `while`/`until`/
-            # `repeat` combinator calls into loop intrinsics so the var→slot
-            # specialisation below sees no capturing closure. The native
-            # backend gets the same effect later from the KIR inliner +
-            # var-slot pass, so it keeps the combinator calls; the KIR dump
-            # modes must match the native pipeline byte-for-byte.
-            let loop_low_bk = match backend { BkC -> true BkCModular -> true _ -> false }
-            let loop_low_md = match mode { MEmitKir -> false MEmitKirNoInline -> false MDumpPurity -> false _ -> true }
-            let loop_low = if loop_low_bk and loop_low_md { lower_loop_intrinsics(cell_low.decls) }
+            # Loop lowering (both backends): dissolve literal `while`/
+            # `until`/`repeat` combinator calls into loop intrinsics so the
+            # var→slot specialisation below sees no capturing closure. The
+            # C emitter pastes the bodies into an inline `for (;;)`; the
+            # KIR lowering builds the equivalent block loop, so the KIR
+            # dump modes keep matching the native pipeline byte-for-byte.
+            let loop_low_md = match mode { MDumpPurity -> false _ -> true }
+            let loop_low = if loop_low_md { lower_loop_intrinsics(cell_low.decls) }
                            else { cell_low.decls }
             let var_decls = desugar_var_decls(loop_low)
             # `use Effect` desugar. Strips DUse / SUse and rewrites bare
@@ -4733,11 +4733,16 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # slot); the C oracle's mode-slave border is total, so it
                       # keeps the wider promotion (#1110).
                       let unbox_native = match backend { BkNative -> true BkNativeModular -> true _ -> false }
+                      # Scalar var cells: rewrite non-escaping scalar
+                      # slots (`array_make(1, lit)`) to raw local cells
+                      # so the unbox pass below marks arithmetic over
+                      # their reads raw on both backends.
+                      let cell_decls = promote_scalar_cells(mono_decls)
                       # Unbox analysis. Runs between monomorphisation
                       # and perceus so the perceus pass sees post-unbox
                       # modes (it only inserts dup/drop on `MBoxed`
                       # nodes).
-                      let unboxed_decls = unbox_pass(mono_decls, build_ctor_int_slots(mono_decls), unbox_native)
+                      let unboxed_decls = unbox_pass(cell_decls, build_ctor_int_slots(cell_decls), unbox_native)
                       let bmode = match mode {
                         MTest -> BMTest
                         MBench -> BMBench

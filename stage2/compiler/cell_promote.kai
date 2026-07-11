@@ -1,0 +1,312 @@
+# compiler/cell_promote.kai — scalar var slots to raw local cells.
+#
+# The var desugar lowers a non-escaping `var` to a 1-cell array slot
+# (`let x__slot = array_make(1, init)` + `array_get(x__slot, 0)` /
+# `array_set(x__slot, 0, v)`). The cell is heap memory: every access
+# is an array call over boxed values. When the element is a raw scalar
+# and the binder never leaves the get/set protocol, the cell can be a
+# plain mutable local instead — no allocation, no RC — and the unbox
+# pass then marks arithmetic over its reads raw, so both backends
+# compile the enclosing loop over registers.
+#
+# The rewrite maps the slot triple onto three intrinsics the emitters
+# lower to a raw mutable local (the cell name rides mangled into the
+# intrinsic name, `__kai_tcrec|`-style, so the binder has zero
+# variable reads after the rewrite):
+#   let x = array_make(1, lit)  →  let x = __cell_init(lit)
+#   array_get(x, 0)             →  __cell_get|x ()
+#   array_set(x, 0, v)          →  __cell_set|x (v)
+#
+# Runs post-monomorph / pre-unbox, on typed AST. Conditions:
+#   * the init is a scalar literal of type Int, Real or Bool;
+#   * every use of the binder in its scope is a whole-cell
+#     `array_get(x, 0)` / `array_set(x, 0, v)` call.
+# The check is rewrite-then-verify: sanctioned uses are rewritten to
+# the name-mangled intrinsics (which carry no `EVar(x)`), and any
+# `EVar(x)` left in the scope — an unsanctioned use, or a read of a
+# shadowing binder the rewriter refused to enter — reverts the slot to
+# its array form (correct, just unpromoted).
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.desugar
+import compiler.loop_lower
+import compiler.cell_scan
+
+#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get|`/`__cell_set|` intrinsics).")]
+pub fn promote_scalar_cells(ds: [Decl]) : [Decl] = map(ds, cp_decl)
+
+#[doc("True for the cell intrinsics this pass mints (`__cell_init`, `__cell_get|x`, `__cell_set|x`).")]
+pub fn is_cell_intrinsic(nm: String) : Bool =
+  nm == "__cell_init" or is_cell_get(nm) or is_cell_set(nm)
+
+#[doc("True for a mangled cell read (`__cell_get|<name>`).")]
+pub fn is_cell_get(nm: String) : Bool = string_starts_with_q(nm, "__cell_get|")
+
+#[doc("True for a mangled cell write (`__cell_set|<name>`).")]
+pub fn is_cell_set(nm: String) : Bool = string_starts_with_q(nm, "__cell_set|")
+
+#[doc("The cell name carried by a mangled `__cell_get|`/`__cell_set|` intrinsic name.")]
+pub fn cell_intrinsic_name(nm: String) : String = {
+  let i = string_index_of_char(nm, '|')
+  string_slice(nm, i + 1, string_length(nm) - i - 1)
+}
+
+# --- decl walk -------------------------------------------------------
+
+fn cp_decl(d: Decl) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(pub_, n, tps, ps, ret, row, cp_expr(body), l, c, mo)
+  DTest(desc, body, l, c)         -> DTest(desc, cp_expr(body), l, c)
+  DBench(desc, body, l, c)        -> DBench(desc, cp_expr(body), l, c)
+  DCheck(desc, ps, body, l, c)    -> DCheck(desc, ps, cp_expr(body), l, c)
+  DImpl(p, tas, tgt, inner, l, c) -> DImpl(p, tas, tgt, map(inner, cp_decl), l, c)
+  DDerive(ns, inner, l, c)        -> DDerive(ns, cp_decl(inner), l, c)
+  DUnstable(inner, l, c)          -> DUnstable(cp_decl(inner), l, c)
+  DConstructor(inner, l, c)       -> DConstructor(cp_decl(inner), l, c)
+  DDoc(a, b, inner, l, c)         -> DDoc(a, b, cp_decl(inner), l, c)
+  DConst(pub_, n, ty, init, mo, l, c) -> DConst(pub_, n, ty, cp_expr(init), mo, l, c)
+  _ -> d
+}
+
+# --- promotion walk --------------------------------------------------
+
+fn cp_expr(e: Expr) : Expr =
+  Expr { kind: cp_kind(e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn cp_kind(k: ExprKind) : ExprKind = match k {
+  EBlock(stmts, tail) -> cp_block(stmts, tail, [])
+  _ -> dsg_map_expr_kind(k, cp_expr)
+}
+
+fn cp_opt(o: Option[Expr]) : Option[Expr] = match o {
+  Some(e) -> Some(cp_expr(e))
+  None    -> None
+}
+
+# Scan a block for promotable slot decls. On a hit, the rest of the
+# block (the binder's whole scope) is tentatively rewritten; a leftover
+# `EVar(x)` reverts to the original statements. Promoted or not, the
+# fold continues over the (possibly rewritten) remainder so sibling and
+# nested slots get their own chance.
+fn cp_block(stmts: [Stmt], tail: Option[Expr], acc: [Stmt]) : ExprKind = match stmts {
+  [] -> EBlock(list_reverse(acc), cp_opt(tail))
+  [s, ...rest] -> match cp_slot_decl(s) {
+    Some(hit) -> cp_block_slot(hit, s, rest, tail, acc)
+    None      -> cp_block(rest, tail, [cp_stmt(s), ...acc])
+  }
+}
+
+# One slot decl found at the head: rewrite its scope tentatively and
+# promote, or revert on a residual mention.
+fn cp_block_slot(hit: CpSlot, s: Stmt, rest: [Stmt], tail: Option[Expr], acc: [Stmt]) : ExprKind = match hit {
+  CpSlot(pat, ann, nm, init, rhs_line, rhs_col) -> {
+    let rw_rest = map(rest, (st) => cp_rw_stmt(nm, st))
+    let rw_tail = cp_rw_opt(nm, tail)
+    if cp_stmts_use(nm, rw_rest) or cp_opt_uses(nm, rw_tail) {
+      cp_block(rest, tail, [cp_stmt(s), ...acc])
+    } else {
+      let cell = mk_cell_expr(EIntrinsic("__cell_init", [init]),
+                              init.ty, rhs_line, rhs_col)
+      cp_block(rw_rest, rw_tail, [SLet(pat, ann, cell), ...acc])
+    }
+  }
+}
+
+fn cp_stmt(s: Stmt) : Stmt = match s {
+  SLet(p, ann, rhs)           -> SLet(p, ann, cp_expr(rhs))
+  SAssert(c, m)               -> SAssert(cp_expr(c), cp_opt(m))
+  SExprStmt(x)                -> SExprStmt(cp_expr(x))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(cp_expr(b), cp_expr(i), cp_expr(v), l, c)
+  SVar(n, ty, rhs, l, c)      -> SVar(n, ty, cp_expr(rhs), l, c)
+  SUse(n, l, c)               -> SUse(n, l, c)
+}
+
+fn mk_cell_expr(k: ExprKind, ty: Option[Ty], line: Int, col: Int) : Expr =
+  Expr { kind: k, line: line, col: col, ty: ty, mode: MBoxed }
+
+# --- slot-decl recognition -------------------------------------------
+
+type CpSlot = CpSlot(Pattern, Option[TypeExpr], String, Expr, Int, Int)
+
+# `let x = array_make(1, <scalar literal>)`. The literal gate keeps the
+# cell's raw initialisation trivial on both backends; a non-literal
+# init stays an array slot.
+fn cp_slot_decl(s: Stmt) : Option[CpSlot] = match s {
+  SLet(pat, ann, rhs) -> match pat.pkind {
+    PBind(nm) -> match cp_one_cell_init(rhs) {
+      Some(init) -> Some(CpSlot(pat, ann, nm, init, rhs.line, rhs.col))
+      None       -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+# The scalar-literal init of an `array_make(1, lit)` rhs, or None.
+fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match rhs.kind {
+  ECall(callee, args_) ->
+    if cp_is_var(callee, "array_make") { cp_one_cell_args(args_) } else { None }
+  _ -> None
+}
+
+fn cp_one_cell_args(args_: [Expr]) : Option[Expr] = match args_ {
+  [n, init] ->
+    if cp_is_lit_one(n) and cp_init_is_scalar_lit(init) { Some(init) } else { None }
+  _ -> None
+}
+
+fn cp_is_lit_one(e: Expr) : Bool = match e.kind {
+  EInt(1) -> true
+  _ -> false
+}
+
+fn cp_init_is_scalar_lit(e: Expr) : Bool = match e.kind {
+  EInt(_)     -> cp_ty_is_cell_scalar(e.ty)
+  EReal(_, _) -> cp_ty_is_cell_scalar(e.ty)
+  EBool(_)    -> cp_ty_is_cell_scalar(e.ty)
+  EUnop(op, x) -> if op == "-" { match x.kind {
+    EInt(_)     -> cp_ty_is_cell_scalar(e.ty)
+    EReal(_, _) -> cp_ty_is_cell_scalar(e.ty)
+    _           -> false
+  } } else { false }
+  _ -> false
+}
+
+# Int / Real / Bool only: the exact scalars both backends hold in raw
+# registers (`int64_t`/`double`/`int`, `SInt64`/`SReal`/`SBool`).
+fn cp_ty_is_cell_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> match t {
+    TyInt  -> true
+    TyReal -> true
+    TyBool -> true
+    _      -> false
+  }
+  None -> false
+}
+
+# --- sanctioned-use rewrite ------------------------------------------
+
+# Rewrite `array_get(x, 0)` / `array_set(x, 0, v)` into the mangled
+# cell intrinsics. Constructs that rebind `x` (a shadowing let, a
+# lambda param, a pattern or clause binder) are left unrewritten: their
+# `EVar(x)` mentions then surface in the use-check and revert the
+# promotion — conservative over clever.
+fn cp_rw(nm: String, e: Expr) : Expr =
+  Expr { kind: cp_rw_kind(nm, e.kind, e.line, e.col), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
+
+fn cp_rw_kind(nm: String, k: ExprKind, line: Int, col: Int) : ExprKind = match k {
+  ECall(callee, args_) -> match cp_getset_hit(nm, callee, args_) {
+    CpGet -> EIntrinsic(cat2("__cell_get|", nm), [])
+    CpSet(v) -> EIntrinsic(cat2("__cell_set|", nm), [cp_rw(nm, v)])
+    CpMiss -> ECall(cp_rw(nm, callee), map(args_, (a) => cp_rw(nm, a)))
+  }
+  # FUNCTION-EMISSION BOUNDARIES. A promoted cell is a local of the
+  # declaring frame; a construct whose body emits as a SEPARATE fn
+  # (a closure, a handler clause / return clause) cannot read it. The
+  # rewrite stops at those boundaries, so a cell use inside one stays
+  # an `array_get(EVar(x), ...)` — and the residual-use check reverts
+  # the promotion. The ONE exception is a loop intrinsic's own wrapper
+  # lambdas: both emitters paste those bodies inline into the
+  # enclosing frame, so the rewrite must follow them.
+  ELambda(_, _) -> k
+  EIntrinsic(inm, args_) ->
+    if is_loop_intrinsic(inm) { EIntrinsic(inm, map(args_, (a) => cp_rw_loop_arg(nm, a))) }
+    else { EIntrinsic(inm, map(args_, (a) => cp_rw(nm, a))) }
+  EMatch(scr, arms) -> EMatch(cp_rw(nm, scr), map(arms, (a) => cp_rw_arm(nm, a)))
+  EBlock(stmts, tail) -> cp_rw_block(nm, stmts, tail, [])
+  EHandle(body, eff, tys, init, alias, cs, ret) ->
+    EHandle(cp_rw(nm, body), eff, tys, cp_rw_opt(nm, init), alias, cs, ret)
+  _ -> dsg_map_expr_kind(k, (sub) => cp_rw(nm, sub))
+}
+
+# A loop intrinsic's arg: the pred/body wrapper lambdas are pasted
+# inline, so the rewrite descends their bodies (a shadowing param still
+# stops it); any other arg is an ordinary expression.
+fn cp_rw_loop_arg(nm: String, a: Expr) : Expr = match a.kind {
+  ELambda(ps, b) ->
+    if cp_params_bind(ps, nm) { a }
+    else { Expr { kind: ELambda(ps, cp_rw(nm, b)), line: a.line, col: a.col,
+                  ty: a.ty, mode: a.mode } }
+  _ -> cp_rw(nm, a)
+}
+
+type CpHit = CpGet | CpSet(Expr) | CpMiss
+
+fn cp_getset_hit(nm: String, callee: Expr, args_: [Expr]) : CpHit =
+  if cp_is_var(callee, "array_get") { cp_get_hit(nm, args_) }
+  else if cp_is_var(callee, "array_set") { cp_set_hit(nm, args_) }
+  else { CpMiss }
+
+fn cp_get_hit(nm: String, args_: [Expr]) : CpHit = match args_ {
+  [a, i] -> if cp_cell_at_zero(nm, a, i) { CpGet } else { CpMiss }
+  _      -> CpMiss
+}
+
+fn cp_set_hit(nm: String, args_: [Expr]) : CpHit = match args_ {
+  [a, i, v] -> if cp_cell_at_zero(nm, a, i) { CpSet(v) } else { CpMiss }
+  _         -> CpMiss
+}
+
+fn cp_cell_at_zero(nm: String, a: Expr, i: Expr) : Bool =
+  cp_is_var(a, nm) and cp_is_zero(i)
+
+fn cp_is_var(e: Expr, nm: String) : Bool = match e.kind {
+  EVar(n) -> n == nm
+  _ -> false
+}
+
+fn cp_is_zero(e: Expr) : Bool = match e.kind {
+  EInt(0) -> true
+  _ -> false
+}
+
+fn cp_params_bind(ps: [Param], nm: String) : Bool = match ps {
+  []           -> false
+  [p, ...rest] -> if p.pname == nm { true } else { cp_params_bind(rest, nm) }
+}
+
+fn cp_rw_arm(nm: String, a: Arm) : Arm = match a {
+  Arm(pat, guard, body) ->
+    if list_has(pat_binders(pat, []), nm) { a }
+    else { Arm(pat, cp_rw_opt(nm, guard), cp_rw(nm, body)) }
+}
+
+# A block statement that rebinds `nm` shuts the rewrite off for the
+# rest of the block — the remaining mentions belong to the shadow.
+fn cp_rw_block(nm: String, stmts: [Stmt], tail: Option[Expr], acc: [Stmt]) : ExprKind = match stmts {
+  [] -> EBlock(list_reverse(acc), cp_rw_opt(nm, tail))
+  [s, ...rest] -> {
+    let s2 = cp_rw_stmt(nm, s)
+    if cp_stmt_binds(s, nm) {
+      EBlock(list_append(list_reverse([s2, ...acc]), rest), tail)
+    } else {
+      cp_rw_block(nm, rest, tail, [s2, ...acc])
+    }
+  }
+}
+
+fn cp_rw_stmt(nm: String, s: Stmt) : Stmt = match s {
+  SLet(p, ann, rhs)           -> SLet(p, ann, cp_rw(nm, rhs))
+  SAssert(c, m)               -> SAssert(cp_rw(nm, c), cp_rw_opt(nm, m))
+  SExprStmt(x)                -> SExprStmt(cp_rw(nm, x))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(cp_rw(nm, b), cp_rw(nm, i), cp_rw(nm, v), l, c)
+  SVar(n, ty, rhs, l, c)      -> SVar(n, ty, cp_rw(nm, rhs), l, c)
+  SUse(n, l, c)               -> SUse(n, l, c)
+}
+
+fn cp_stmt_binds(s: Stmt, nm: String) : Bool = match s {
+  SLet(p, _, _)          -> list_has(pat_binders(p, []), nm)
+  SVar(n, _, _, _, _)    -> n == nm
+  SAssert(_, _)          -> false
+  SExprStmt(_)           -> false
+  SIndexAssign(_, _, _, _, _) -> false
+  SUse(_, _, _)          -> false
+}
+
+fn cp_rw_opt(nm: String, o: Option[Expr]) : Option[Expr] = match o {
+  Some(e) -> Some(cp_rw(nm, e))
+  None    -> None
+}

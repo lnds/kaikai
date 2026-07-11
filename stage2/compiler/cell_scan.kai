@@ -1,0 +1,117 @@
+# compiler/cell_scan.kai — residual-use scan for the var-cell promotion.
+#
+# After `cell_promote` rewrites a slot's sanctioned `array_get`/`array_set`
+# uses into name-mangled `__cell_*` intrinsics, any `EVar` mention of the
+# binder left in its scope is an unsanctioned use (or a read of a shadow
+# the rewriter refused to enter) and must revert the promotion. This walk
+# answers exactly that question.
+
+import compiler.util
+import compiler.ast
+import compiler.desugar
+
+# --- residual-use check ----------------------------------------------
+
+# True when `nm` is still mentioned as a value after the sanctioned-use
+# rewrite. The match is EXHAUSTIVE on purpose — a defaulted `_ -> false`
+# here would silently skip uses hiding in a future ExprKind (the trap
+# the loop-lowering scanners hit). An interp span mention counts: the
+# emitter re-parses `#{...}` segments at codegen time, so a name inside
+# one is a read this walk cannot otherwise see.
+pub fn cp_uses(nm: String, e: Expr) : Bool = match e.kind {
+  EInt(_)           -> false
+  EReal(_, _)       -> false
+  EIntLit(_)        -> false
+  EDecimalLit(_)    -> false
+  EFixed(_, _)      -> false
+  EBool(_)          -> false
+  EChar(_)          -> false
+  EStr(span, trip)  -> interp_span_reads_cap(span, trip, nm)
+  EUnit             -> false
+  EVar(n)           -> n == nm
+  EUnder            -> false
+  EPlaceholder      -> false
+  EHole(_)          -> false
+  ETodo(_)          -> false
+  EExternBody(_)    -> false
+  EVariantsOf(_, _) -> false
+  EModCall(_, _)    -> false
+  EIntrinsic(_, xs) -> cp_exprs_use(nm, xs)
+  ECall(c, xs)      -> cp_uses(nm, c) or cp_exprs_use(nm, xs)
+  EField(b, _)      -> cp_uses(nm, b)
+  EIndex(a, b)      -> cp_exprs_use(nm, [a, b])
+  EBinop(_, a, b)   -> cp_exprs_use(nm, [a, b])
+  EUnop(_, x)       -> cp_uses(nm, x)
+  EIf(c, t, eo)     -> cp_exprs_use(nm, [c, t]) or cp_opt_uses(nm, eo)
+  EMatch(scr, arms) -> cp_uses(nm, scr) or cp_arms_use(nm, arms)
+  ELambda(_, b)     -> cp_uses(nm, b)
+  ERecordLit(_, fs) -> cp_fields_use(nm, fs)
+  EList(els)        -> cp_elems_use(nm, els)
+  ERange(a, b, st)  -> cp_exprs_use(nm, [a, b]) or cp_opt_uses(nm, st)
+  EBlock(ss, tl)    -> cp_stmts_use(nm, ss) or cp_opt_uses(nm, tl)
+  EPipe(a, b)       -> cp_exprs_use(nm, [a, b])
+  EMapPipe(a, b)    -> cp_exprs_use(nm, [a, b])
+  EFlatMapPipe(a, b) -> cp_exprs_use(nm, [a, b])
+  EFilterPipe(a, b) -> cp_exprs_use(nm, [a, b])
+  EHandle(body, _, _, init, _, cs, ret) -> cp_handle_uses(nm, body, init, cs, ret)
+  ELitUnit(x, _)    -> cp_uses(nm, x)
+  EBang(x)          -> cp_uses(nm, x)
+}
+
+fn cp_handle_uses(nm: String, body: Expr, init: Option[Expr], cs: [HClause],
+                  ret: Option[HReturn]) : Bool =
+  cp_uses(nm, body) or cp_opt_uses(nm, init) or cp_clauses_use(nm, cs) or cp_ret_uses(nm, ret)
+
+fn cp_exprs_use(nm: String, es: [Expr]) : Bool = match es {
+  []           -> false
+  [h, ...rest] -> cp_uses(nm, h) or cp_exprs_use(nm, rest)
+}
+
+pub fn cp_opt_uses(nm: String, o: Option[Expr]) : Bool = match o {
+  Some(e) -> cp_uses(nm, e)
+  None    -> false
+}
+
+fn cp_arms_use(nm: String, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> (match a {
+    Arm(_, g, b) -> cp_opt_uses(nm, g) or cp_uses(nm, b)
+  }) or cp_arms_use(nm, rest)
+}
+
+fn cp_fields_use(nm: String, fs: [FieldInit]) : Bool = match fs {
+  []            -> false
+  [fi, ...rest] -> (match fi { FI(_, v) -> cp_uses(nm, v) }) or cp_fields_use(nm, rest)
+}
+
+fn cp_elems_use(nm: String, els: [ListElem]) : Bool = match els {
+  []            -> false
+  [el, ...rest] -> (match el {
+    ElPlain(e)  -> cp_uses(nm, e)
+    ElSpread(e) -> cp_uses(nm, e)
+  }) or cp_elems_use(nm, rest)
+}
+
+fn cp_clauses_use(nm: String, cs: [HClause]) : Bool = match cs {
+  []           -> false
+  [c, ...rest] -> (match c { HC(_, _, b, _, _) -> cp_uses(nm, b) }) or cp_clauses_use(nm, rest)
+}
+
+fn cp_ret_uses(nm: String, ret: Option[HReturn]) : Bool = match ret {
+  None -> false
+  Some(hr) -> match hr { HR(_, b, _, _) -> cp_uses(nm, b) }
+}
+
+pub fn cp_stmts_use(nm: String, ss: [Stmt]) : Bool = match ss {
+  []           -> false
+  [s, ...rest] -> cp_stmt_uses(nm, s) or cp_stmts_use(nm, rest)
+}
+
+fn cp_stmt_uses(nm: String, s: Stmt) : Bool = match s {
+  SLet(_, _, rhs)             -> cp_uses(nm, rhs)
+  SAssert(c, m)               -> cp_uses(nm, c) or cp_opt_uses(nm, m)
+  SExprStmt(x)                -> cp_uses(nm, x)
+  SIndexAssign(b, i, v, _, _) -> cp_uses(nm, b) or cp_uses(nm, i) or cp_uses(nm, v)
+  SVar(_, _, rhs, _, _)       -> cp_uses(nm, rhs)
+  SUse(_, _, _)               -> false
+}

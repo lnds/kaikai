@@ -48,6 +48,7 @@ import compiler.ast
 import compiler.kinds
 import compiler.home_tu
 import compiler.loop_lower
+import compiler.cell_promote
 import compiler.purity
 import compiler.chars
 import compiler.diag
@@ -6552,6 +6553,18 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # The scrutinee axis is orthogonal (typically a boxed variant); only
     # the result is raw.
     EMatch(scr, arms) -> emit_match_raw(src, scr, arms, x.ty, cx)
+    # A promoted var cell: the read is the raw mutable local itself;
+    # the init forwards its (literal) raw form.
+    EIntrinsic(inm, iargs) ->
+      if is_cell_get(inm) { cat2("kair_", cell_intrinsic_name(inm)) }
+      else if inm == "__cell_init" { match iargs {
+        [init] -> emit_expr_raw(src, init, cx)
+        _      -> "0 /* malformed cell init */"
+      } }
+      else {
+        let boxed = emit_expr_boxed(src, x, cx)
+        unbox_boxed_scalar(boxed, x.ty)
+      }
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
@@ -6951,6 +6964,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # recognises them and emits a bridge.
     EIntrinsic(name, args_) ->
       if is_loop_intrinsic(name) { emit_loop_intrinsic(src, name, args_, cx) }
+      else if is_cell_set(name) { emit_cell_set(src, name, args_, cx) }
+      else if is_cell_get(name) { box_wrap(x.ty, cat2("kair_", cell_intrinsic_name(name))) }
       else { cat3("kai_unit() /* unreachable: intrinsic $", name, " in value position */") }
   }
 }
@@ -6994,6 +7009,24 @@ fn emit_loop_intrinsic(src: String, name: String, args_: [Expr], cx: EmitCtx) : 
 
 fn emit_loop_bad(name: String) : String =
   cat3("kai_unit() /* malformed loop intrinsic $", name, " */")
+
+# A promoted var cell's write: assign the raw mutable local. A raw
+# value stores directly; a boxed value is unwrapped and consumed (the
+# store owns it, and a raw local carries no RC to hand it to).
+fn emit_cell_set(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+
+  let cell = cat2("kair_", cell_intrinsic_name(name))
+  match args_ {
+    [v] -> match v.mode {
+      MUnboxed -> concat_all(["({ ", cell, " = (", emit_expr_raw(src, v, cx), "); kai_unit(); })"])
+      _ -> concat_all([
+        "({ KaiValue *_cv = ", emit_expr(src, v, cx), "; ", cell, " = ",
+        unbox_boxed_scalar("_cv", v.ty), "; kai_decref(_cv); kai_unit(); })"
+      ])
+    }
+    _ -> cat3("kai_unit() /* malformed cell set $", name, " */")
+  }
+}
 
 # The loop's condition check. `stop_when_true` selects the `until`
 # polarity (exit when the predicate holds) vs `while` (exit when it
