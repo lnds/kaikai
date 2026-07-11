@@ -268,13 +268,13 @@ uint32_t kaix_to_char(KaiValue *v)             { return v->as.c; }
 KaiValue *kaix_internal_dup(KaiValue *v)       { return kai_internal_dup(v); }
 KaiValue *kaix_internal_drop(KaiValue *v)      { return kai_internal_drop(v); }
 
-/* ---------- prelude subset used by M3b ---------- */
-KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
-KaiValue *kaix_prelude_eprint(KaiValue *v)         { return kai_prelude_eprint(v); }
-KaiValue *kaix_prelude_write_stdout(KaiValue *v)   { return kai_prelude_write_stdout(v); }
-KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_string(v); }
+/* ---------- core subset used by M3b ---------- */
+KaiValue *kaix_core_print(KaiValue *v)          { return kai_core_print(v); }
+KaiValue *kaix_core_eprint(KaiValue *v)         { return kai_core_eprint(v); }
+KaiValue *kaix_core_write_stdout(KaiValue *v)   { return kai_core_write_stdout(v); }
+KaiValue *kaix_core_int_to_string(KaiValue *v)  { return kai_core_int_to_string(v); }
 
-/* ---------- M3c: strings, ranges, higher-order prelude ---------- */
+/* ---------- M3c: strings, ranges, higher-order core ---------- */
 KaiValue *kaix_string_concat(KaiValue *a, KaiValue *b)         { return kai_string_concat(a, b); }
 KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_string(v); }
 
@@ -293,11 +293,11 @@ void      kaix_assert_check_with_value(KaiValue *cond, const char *base_msg,
 KaiValue *kaix_range(KaiValue *from, KaiValue *to)              { return kai_range(from, to); }
 KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s){ return kai_range_step(f, t, s); }
 
-KaiValue *kaix_prelude_map(KaiValue *xs, KaiValue *f)          { return kai_prelude_map(xs, f); }
-KaiValue *kaix_prelude_flat_map(KaiValue *xs, KaiValue *f)     { return kai_prelude_flat_map(xs, f); }
-KaiValue *kaix_prelude_each(KaiValue *xs, KaiValue *f)         { return kai_prelude_each(xs, f); }
-KaiValue *kaix_prelude_filter(KaiValue *xs, KaiValue *p)       { return kai_prelude_filter(xs, p); }
-KaiValue *kaix_prelude_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) { return kai_prelude_reduce(xs, i, f); }
+KaiValue *kaix_core_map(KaiValue *xs, KaiValue *f)          { return kai_core_map(xs, f); }
+KaiValue *kaix_core_flat_map(KaiValue *xs, KaiValue *f)     { return kai_core_flat_map(xs, f); }
+KaiValue *kaix_core_each(KaiValue *xs, KaiValue *f)         { return kai_core_each(xs, f); }
+KaiValue *kaix_core_filter(KaiValue *xs, KaiValue *p)       { return kai_core_filter(xs, p); }
+KaiValue *kaix_core_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) { return kai_core_reduce(xs, i, f); }
 
 /* Closure construction. Accepts a KaiFn-compatible function pointer
    (passed as a void* from the LLVM IR for opaque-pointer mode). */
@@ -322,13 +322,13 @@ KaiValue *kaix_apply_borrow(KaiValue *clo, int32_t n, KaiValue **args) {
     return kai_apply_borrow(clo, n, args);
 }
 
-/* Prelude thunks exported as regular symbols so LLVM IR can take
-   their address to build closures passed into higher-order prelude
-   calls. One per prelude entry we may reference as a value. */
-KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n)            { (void)s; (void)n; return kai_prelude_print(a[0]); }
-KaiValue *kaix_eprint_thunk(KaiValue *s, KaiValue **a, int n)           { (void)s; (void)n; return kai_prelude_eprint(a[0]); }
-KaiValue *kaix_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)     { (void)s; (void)n; return kai_prelude_write_stdout(a[0]); }
-KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)s; (void)n; return kai_prelude_int_to_string(a[0]); }
+/* Core thunks exported as regular symbols so LLVM IR can take
+   their address to build closures passed into higher-order core
+   calls. One per core entry we may reference as a value. */
+KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n)            { (void)s; (void)n; return kai_core_print(a[0]); }
+KaiValue *kaix_eprint_thunk(KaiValue *s, KaiValue **a, int n)           { (void)s; (void)n; return kai_core_eprint(a[0]); }
+KaiValue *kaix_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)     { (void)s; (void)n; return kai_core_write_stdout(a[0]); }
+KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)s; (void)n; return kai_core_int_to_string(a[0]); }
 
 /* ---------- M3d: variants + match ---------- */
 KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args) {
@@ -530,11 +530,11 @@ KaiValue *kaix_tag_eq(KaiValue *v, int32_t tag) {
 /* Panic with a message. The LLVM match lowering calls this in the
    fall-through block of the last arm when no pattern matches, so the
    generated IR then drops into `unreachable`. Named distinctly from
-   `kaix_prelude_panic` below to keep the prelude-dispatch symbol
-   free for user calls to the `panic` prelude fn. */
-KaiValue *kaix_match_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
+   `kaix_core_panic` below to keep the core-dispatch symbol
+   free for user calls to the `panic` core fn. */
+KaiValue *kaix_match_panic(KaiValue *msg) { return kai_core_panic(msg); }
 
-KaiValue *kaix_prelude_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
+KaiValue *kaix_core_panic(KaiValue *msg) { return kai_core_panic(msg); }
 
 /* ---------- refcounting ---------- */
 /* Used by the LLVM backend's tail-spread fast path: `[x, ...xs]` emits
@@ -855,9 +855,9 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
    closure's self parameter. i is the capture's index. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
 
-KaiValue *kaix_prelude_list_length(KaiValue *xs)          { return kai_prelude_list_length(xs); }
-KaiValue *kaix_prelude_list_append(KaiValue *a, KaiValue *b) { return kai_prelude_list_append(a, b); }
-KaiValue *kaix_prelude_list_reverse(KaiValue *xs)         { return kai_prelude_list_reverse(xs); }
+KaiValue *kaix_core_list_length(KaiValue *xs)          { return kai_core_list_length(xs); }
+KaiValue *kaix_core_list_append(KaiValue *a, KaiValue *b) { return kai_core_list_append(a, b); }
+KaiValue *kaix_core_list_reverse(KaiValue *xs)         { return kai_core_list_reverse(xs); }
 
 /* ---------- M12: chars, reals, records, fields ---------- */
 KaiValue *kaix_char(uint32_t c)                           { return kai_char(c); }
@@ -937,95 +937,95 @@ KaiValue  *kaix_foreign(void *p)         { return kai_foreign(p); }
 
 /* ---------- m13: bit operations (compiler intrinsics) ----------
    The C-direct oracle (emit_c.kai) lowers each `bit_*` call INLINE to
-   the matching C operator. The native backend routes a prelude callee
-   to `kaix_prelude_<nm>`, so it needs a linkable shim per bit op — there
-   is no `kai_prelude_bit_*` static body to forward to (the oracle never
+   the matching C operator. The native backend routes a core callee
+   to `kaix_core_<nm>`, so it needs a linkable shim per bit op — there
+   is no `kai_core_bit_*` static body to forward to (the oracle never
    created one). These reproduce the oracle's operator + refcount shape
    exactly: read both KaiInts (`kai_intf`), apply the operator, box the
    result, then decref each input once (the caller hands us values we own,
    mirroring `kai_op_add` in runtime.h). Slot/repr identical to the oracle
    keeps native byte-identical with the C path. */
-KaiValue *kaix_prelude_bit_and(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_or(KaiValue *a, KaiValue *b)   { KaiValue *r = kai_int(kai_intf(a) | kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_xor(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_not(KaiValue *a)               { KaiValue *r = kai_int(~ kai_intf(a)); kai_decref(a); return r; }
-KaiValue *kaix_prelude_bit_shl(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) << kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_or(KaiValue *a, KaiValue *b)   { KaiValue *r = kai_int(kai_intf(a) | kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_not(KaiValue *a)               { KaiValue *r = kai_int(~ kai_intf(a)); kai_decref(a); return r; }
+KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) << kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
 /* Arithmetic shift: signed `>>` preserves the sign bit. */
-KaiValue *kaix_prelude_bit_shr(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
 /* Logical shift: cast through uint64_t to zero-fill, back to int64_t. */
-KaiValue *kaix_prelude_bit_ushr(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_count(KaiValue *a)             { KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a))); kai_decref(a); return r; }
-KaiValue *kaix_prelude_bit_test(KaiValue *a, KaiValue *b) { KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_set(KaiValue *a, KaiValue *b)    { KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_clear(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_prelude_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_count(KaiValue *a)             { KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a))); kai_decref(a); return r; }
+KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b) { KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b)    { KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
 
-/* Full prelude set — anything the compiler (stage 2's own source)
+/* Full core set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */
-KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
-KaiValue *kaix_prelude_program_name(void)                   { return kai_prelude_program_name(); }
-KaiValue *kaix_prelude_stdlib_path(void)                    { return kai_prelude_stdlib_path(); }
-KaiValue *kaix_prelude_abspath(KaiValue *p)                 { return kai_prelude_abspath(p); }
-KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude_exit(v); }
-/* kaix_prelude_panic is defined above near kaix_match_panic. */
-KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
-KaiValue *kaix_prelude_write_file(KaiValue *p, KaiValue *c) { return kai_prelude_write_file(p, c); }
-KaiValue *kaix_prelude_file_exists(KaiValue *p)             { return kai_prelude_file_exists(p); }
-KaiValue *kaix_prelude_file_delete(KaiValue *p)             { return kai_prelude_file_delete(p); }
-KaiValue *kaix_prelude_file_rename(KaiValue *f, KaiValue *t){ return kai_prelude_file_rename(f, t); }
+KaiValue *kaix_core_args(void)                           { return kai_core_args(); }
+KaiValue *kaix_core_program_name(void)                   { return kai_core_program_name(); }
+KaiValue *kaix_core_stdlib_path(void)                    { return kai_core_stdlib_path(); }
+KaiValue *kaix_core_abspath(KaiValue *p)                 { return kai_core_abspath(p); }
+KaiValue *kaix_core_exit(KaiValue *v)                    { return kai_core_exit(v); }
+/* kaix_core_panic is defined above near kaix_match_panic. */
+KaiValue *kaix_core_read_file(KaiValue *p)               { return kai_core_read_file(p); }
+KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c) { return kai_core_write_file(p, c); }
+KaiValue *kaix_core_file_exists(KaiValue *p)             { return kai_core_file_exists(p); }
+KaiValue *kaix_core_file_delete(KaiValue *p)             { return kai_core_file_delete(p); }
+KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_rename(f, t); }
 /* Issue #513: Array[Byte] file round-trip. Same shape as the
  * exists/delete/rename wrappers above — the C-side statics live
  * in runtime.h; the LLVM emit references the `kaix_` names. */
-KaiValue *kaix_prelude_file_read_bytes(KaiValue *p)              { return kai_prelude_file_read_bytes(p); }
-KaiValue *kaix_prelude_file_write_bytes(KaiValue *p, KaiValue *b){ return kai_prelude_file_write_bytes(p, b); }
-KaiValue *kaix_prelude_dir_list_dir(KaiValue *p)            { return kai_prelude_dir_list_dir(p); }
-KaiValue *kaix_prelude_dir_create_dir(KaiValue *p)          { return kai_prelude_dir_create_dir(p); }
-KaiValue *kaix_prelude_dir_remove_dir(KaiValue *p)          { return kai_prelude_dir_remove_dir(p); }
-KaiValue *kaix_prelude_dir_walk(KaiValue *p)                { return kai_prelude_dir_walk(p); }
-KaiValue *kaix_prelude_read_line(void)                      { return kai_prelude_read_line(); }
-KaiValue *kaix_prelude_read_bytes(KaiValue *n)              { return kai_prelude_read_bytes(n); }
-KaiValue *kaix_prelude_real_to_string(KaiValue *v)          { return kai_prelude_real_to_string(v); }
-KaiValue *kaix_prelude_int_to_real(KaiValue *v)             { return kai_prelude_int_to_real(v); }
-KaiValue *kaix_prelude_real_to_int(KaiValue *v)             { return kai_prelude_real_to_int(v); }
-KaiValue *kaix_prelude_string_to_int(KaiValue *s)           { return kai_prelude_string_to_int(s); }
-KaiValue *kaix_prelude_string_to_real(KaiValue *s)          { return kai_prelude_string_to_real(s); }
-KaiValue *kaix_prelude_string_length(KaiValue *s)           { return kai_prelude_string_length(s); }
-KaiValue *kaix_prelude_string_concat(KaiValue *a, KaiValue *b) { return kai_prelude_string_concat(a, b); }
-KaiValue *kaix_prelude_string_concat_all(KaiValue *xs)         { return kai_prelude_string_concat_all(xs); }
-KaiValue *kaix_prelude_string_join(KaiValue *xs, KaiValue *sep){ return kai_prelude_string_join(xs, sep); }
-KaiValue *kaix_prelude_string_slice(KaiValue *s, KaiValue *i, KaiValue *n) { return kai_prelude_string_slice(s, i, n); }
-KaiValue *kaix_prelude_string_split(KaiValue *s, KaiValue *d)  { return kai_prelude_string_split(s, d); }
-KaiValue *kaix_prelude_string_contains(KaiValue *s, KaiValue *sub) { return kai_prelude_string_contains(s, sub); }
-KaiValue *kaix_prelude_char_at(KaiValue *s, KaiValue *i)       { return kai_prelude_char_at(s, i); }
-KaiValue *kaix_prelude_char_to_int(KaiValue *c)                { return kai_prelude_char_to_int(c); }
-KaiValue *kaix_prelude_int_to_char(KaiValue *i)                { return kai_prelude_int_to_char(i); }
-KaiValue *kaix_prelude_int_to_byte_string(KaiValue *i)         { return kai_prelude_int_to_byte_string(i); }
-KaiValue *kaix_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_prelude_string_byte_at_int(s, i); }
-KaiValue *kaix_prelude_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_prelude_string_cp_at(s, off); }
-KaiValue *kaix_prelude_string_cp_len(KaiValue *s, KaiValue *off) { return kai_prelude_string_cp_len(s, off); }
-KaiValue *kaix_prelude_string_reverse(KaiValue *s)            { return kai_prelude_string_reverse(s); }
-KaiValue *kaix_prelude_string_hash(KaiValue *s)                { return kai_prelude_string_hash(s); }
-KaiValue *kaix_prelude_real_bits(KaiValue *v)                  { return kai_prelude_real_bits(v); }
-KaiValue *kaix_prelude_array_make(KaiValue *n, KaiValue *init)           { return kai_prelude_array_make(n, init); }
-KaiValue *kaix_prelude_array_empty(void)                                 { return kai_prelude_array_empty(); }
-KaiValue *kaix_prelude_array_length(KaiValue *a)                         { return kai_prelude_array_length(a); }
-KaiValue *kaix_prelude_array_length_borrow(KaiValue *a)                  { return kai_prelude_array_length_borrow(a); }
-KaiValue *kaix_prelude_array_get(KaiValue *a, KaiValue *i)               { return kai_prelude_array_get(a, i); }
-KaiValue *kaix_prelude_array_get_borrow(KaiValue *a, KaiValue *i)        { return kai_prelude_array_get_borrow(a, i); }
-KaiValue *kaix_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_prelude_array_set(a, i, v); }
-KaiValue *kaix_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_prelude_array_grow(a, n, init); }
-KaiValue *kaix_prelude_vec_make(KaiValue *n, KaiValue *init)             { return kai_prelude_vec_make(n, init); }
-KaiValue *kaix_prelude_vec_empty(void)                                   { return kai_prelude_vec_empty(); }
-KaiValue *kaix_prelude_vec_length(KaiValue *v)                           { return kai_prelude_vec_length(v); }
-KaiValue *kaix_prelude_vec_get(KaiValue *v, KaiValue *i)                 { return kai_prelude_vec_get(v, i); }
-KaiValue *kaix_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { return kai_prelude_vec_set(v, i, x); }
-KaiValue *kaix_prelude_vec_push(KaiValue *v, KaiValue *x)                { return kai_prelude_vec_push(v, x); }
-KaiValue *kaix_prelude_vec_length_borrow(KaiValue *v)                    { return kai_prelude_vec_length_borrow(v); }
-KaiValue *kaix_prelude_vec_get_borrow(KaiValue *v, KaiValue *i)          { return kai_prelude_vec_get_borrow(v, i); }
-KaiValue *kaix_prelude_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n)  { return kai_prelude_vec_slice(v, s, n); }
-KaiValue *kaix_prelude_vec_tail_from(KaiValue *v, KaiValue *s)           { return kai_prelude_vec_tail_from(v, s); }
-KaiValue *kaix_prelude_vec_reserve(KaiValue *n)                          { return kai_prelude_vec_reserve(n); }
-KaiValue *kaix_prelude_vec_from_list(KaiValue *xs)                       { return kai_prelude_vec_from_list(xs); }
+KaiValue *kaix_core_file_read_bytes(KaiValue *p)              { return kai_core_file_read_bytes(p); }
+KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b){ return kai_core_file_write_bytes(p, b); }
+KaiValue *kaix_core_dir_list_dir(KaiValue *p)            { return kai_core_dir_list_dir(p); }
+KaiValue *kaix_core_dir_create_dir(KaiValue *p)          { return kai_core_dir_create_dir(p); }
+KaiValue *kaix_core_dir_remove_dir(KaiValue *p)          { return kai_core_dir_remove_dir(p); }
+KaiValue *kaix_core_dir_walk(KaiValue *p)                { return kai_core_dir_walk(p); }
+KaiValue *kaix_core_read_line(void)                      { return kai_core_read_line(); }
+KaiValue *kaix_core_read_bytes(KaiValue *n)              { return kai_core_read_bytes(n); }
+KaiValue *kaix_core_real_to_string(KaiValue *v)          { return kai_core_real_to_string(v); }
+KaiValue *kaix_core_int_to_real(KaiValue *v)             { return kai_core_int_to_real(v); }
+KaiValue *kaix_core_real_to_int(KaiValue *v)             { return kai_core_real_to_int(v); }
+KaiValue *kaix_core_string_to_int(KaiValue *s)           { return kai_core_string_to_int(s); }
+KaiValue *kaix_core_string_to_real(KaiValue *s)          { return kai_core_string_to_real(s); }
+KaiValue *kaix_core_string_length(KaiValue *s)           { return kai_core_string_length(s); }
+KaiValue *kaix_core_string_concat(KaiValue *a, KaiValue *b) { return kai_core_string_concat(a, b); }
+KaiValue *kaix_core_string_concat_all(KaiValue *xs)         { return kai_core_string_concat_all(xs); }
+KaiValue *kaix_core_string_join(KaiValue *xs, KaiValue *sep){ return kai_core_string_join(xs, sep); }
+KaiValue *kaix_core_string_slice(KaiValue *s, KaiValue *i, KaiValue *n) { return kai_core_string_slice(s, i, n); }
+KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d)  { return kai_core_string_split(s, d); }
+KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub) { return kai_core_string_contains(s, sub); }
+KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i)       { return kai_core_char_at(s, i); }
+KaiValue *kaix_core_char_to_int(KaiValue *c)                { return kai_core_char_to_int(c); }
+KaiValue *kaix_core_int_to_char(KaiValue *i)                { return kai_core_int_to_char(i); }
+KaiValue *kaix_core_int_to_byte_string(KaiValue *i)         { return kai_core_int_to_byte_string(i); }
+KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_core_string_byte_at_int(s, i); }
+KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_core_string_cp_at(s, off); }
+KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off) { return kai_core_string_cp_len(s, off); }
+KaiValue *kaix_core_string_reverse(KaiValue *s)            { return kai_core_string_reverse(s); }
+KaiValue *kaix_core_string_hash(KaiValue *s)                { return kai_core_string_hash(s); }
+KaiValue *kaix_core_real_bits(KaiValue *v)                  { return kai_core_real_bits(v); }
+KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init)           { return kai_core_array_make(n, init); }
+KaiValue *kaix_core_array_empty(void)                                 { return kai_core_array_empty(); }
+KaiValue *kaix_core_array_length(KaiValue *a)                         { return kai_core_array_length(a); }
+KaiValue *kaix_core_array_length_borrow(KaiValue *a)                  { return kai_core_array_length_borrow(a); }
+KaiValue *kaix_core_array_get(KaiValue *a, KaiValue *i)               { return kai_core_array_get(a, i); }
+KaiValue *kaix_core_array_get_borrow(KaiValue *a, KaiValue *i)        { return kai_core_array_get_borrow(a, i); }
+KaiValue *kaix_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v)  { return kai_core_array_set(a, i, v); }
+KaiValue *kaix_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) { return kai_core_array_grow(a, n, init); }
+KaiValue *kaix_core_vec_make(KaiValue *n, KaiValue *init)             { return kai_core_vec_make(n, init); }
+KaiValue *kaix_core_vec_empty(void)                                   { return kai_core_vec_empty(); }
+KaiValue *kaix_core_vec_length(KaiValue *v)                           { return kai_core_vec_length(v); }
+KaiValue *kaix_core_vec_get(KaiValue *v, KaiValue *i)                 { return kai_core_vec_get(v, i); }
+KaiValue *kaix_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { return kai_core_vec_set(v, i, x); }
+KaiValue *kaix_core_vec_push(KaiValue *v, KaiValue *x)                { return kai_core_vec_push(v, x); }
+KaiValue *kaix_core_vec_length_borrow(KaiValue *v)                    { return kai_core_vec_length_borrow(v); }
+KaiValue *kaix_core_vec_get_borrow(KaiValue *v, KaiValue *i)          { return kai_core_vec_get_borrow(v, i); }
+KaiValue *kaix_core_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n)  { return kai_core_vec_slice(v, s, n); }
+KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s)           { return kai_core_vec_tail_from(v, s); }
+KaiValue *kaix_core_vec_reserve(KaiValue *n)                          { return kai_core_vec_reserve(n); }
+KaiValue *kaix_core_vec_from_list(KaiValue *xs)                       { return kai_core_vec_from_list(xs); }
 /* Vec raw element paths (compiler-fused): field read without record
  * rebuild, push/set of an unpacked record literal. */
 KaiValue *kaix_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx)        { return kai_vec_get_field(v, i, fidx); }
@@ -1033,73 +1033,73 @@ KaiValue *kaix_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) { re
 KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) { return kai_vec_push_rec_raw(v, n, xs, names); }
 KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) { return kai_vec_set_rec_raw(v, i, n, xs); }
 /* Issue #364: `impl Rem for Real` in stdlib/protocols.kai delegates
- * to this libm fmod binding. Listed in the LLVM prelude table so the
+ * to this libm fmod binding. Listed in the LLVM core table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */
-KaiValue *kaix_prelude_real_rem(KaiValue *a, KaiValue *b)                { return kai_prelude_real_rem(a, b); }
+KaiValue *kaix_core_real_rem(KaiValue *a, KaiValue *b)                { return kai_core_real_rem(a, b); }
 /* Issue #522: stdlib/math/real libm bindings. Mirrors the C-side
- * prelude table libm block; needed at link time when the LLVM emit
- * references @kaix_prelude_real_<libm-op>. */
-KaiValue *kaix_prelude_real_sqrt(KaiValue *x)                            { return kai_prelude_real_sqrt(x); }
-KaiValue *kaix_prelude_real_cbrt(KaiValue *x)                            { return kai_prelude_real_cbrt(x); }
-KaiValue *kaix_prelude_real_exp(KaiValue *x)                             { return kai_prelude_real_exp(x); }
-KaiValue *kaix_prelude_real_log(KaiValue *x)                             { return kai_prelude_real_log(x); }
-KaiValue *kaix_prelude_real_log2(KaiValue *x)                            { return kai_prelude_real_log2(x); }
-KaiValue *kaix_prelude_real_log10(KaiValue *x)                           { return kai_prelude_real_log10(x); }
-KaiValue *kaix_prelude_real_sin(KaiValue *x)                             { return kai_prelude_real_sin(x); }
-KaiValue *kaix_prelude_real_cos(KaiValue *x)                             { return kai_prelude_real_cos(x); }
-KaiValue *kaix_prelude_real_tan(KaiValue *x)                             { return kai_prelude_real_tan(x); }
-KaiValue *kaix_prelude_real_asin(KaiValue *x)                            { return kai_prelude_real_asin(x); }
-KaiValue *kaix_prelude_real_acos(KaiValue *x)                            { return kai_prelude_real_acos(x); }
-KaiValue *kaix_prelude_real_atan(KaiValue *x)                            { return kai_prelude_real_atan(x); }
-KaiValue *kaix_prelude_real_sinh(KaiValue *x)                            { return kai_prelude_real_sinh(x); }
-KaiValue *kaix_prelude_real_cosh(KaiValue *x)                            { return kai_prelude_real_cosh(x); }
-KaiValue *kaix_prelude_real_tanh(KaiValue *x)                            { return kai_prelude_real_tanh(x); }
-KaiValue *kaix_prelude_real_signum(KaiValue *x)                          { return kai_prelude_real_signum(x); }
-KaiValue *kaix_prelude_real_is_nan(KaiValue *x)                          { return kai_prelude_real_is_nan(x); }
-KaiValue *kaix_prelude_real_is_inf(KaiValue *x)                          { return kai_prelude_real_is_inf(x); }
-KaiValue *kaix_prelude_real_pow(KaiValue *a, KaiValue *b)                { return kai_prelude_real_pow(a, b); }
-KaiValue *kaix_prelude_real_atan2(KaiValue *a, KaiValue *b)              { return kai_prelude_real_atan2(a, b); }
+ * core table libm block; needed at link time when the LLVM emit
+ * references @kaix_core_real_<libm-op>. */
+KaiValue *kaix_core_real_sqrt(KaiValue *x)                            { return kai_core_real_sqrt(x); }
+KaiValue *kaix_core_real_cbrt(KaiValue *x)                            { return kai_core_real_cbrt(x); }
+KaiValue *kaix_core_real_exp(KaiValue *x)                             { return kai_core_real_exp(x); }
+KaiValue *kaix_core_real_log(KaiValue *x)                             { return kai_core_real_log(x); }
+KaiValue *kaix_core_real_log2(KaiValue *x)                            { return kai_core_real_log2(x); }
+KaiValue *kaix_core_real_log10(KaiValue *x)                           { return kai_core_real_log10(x); }
+KaiValue *kaix_core_real_sin(KaiValue *x)                             { return kai_core_real_sin(x); }
+KaiValue *kaix_core_real_cos(KaiValue *x)                             { return kai_core_real_cos(x); }
+KaiValue *kaix_core_real_tan(KaiValue *x)                             { return kai_core_real_tan(x); }
+KaiValue *kaix_core_real_asin(KaiValue *x)                            { return kai_core_real_asin(x); }
+KaiValue *kaix_core_real_acos(KaiValue *x)                            { return kai_core_real_acos(x); }
+KaiValue *kaix_core_real_atan(KaiValue *x)                            { return kai_core_real_atan(x); }
+KaiValue *kaix_core_real_sinh(KaiValue *x)                            { return kai_core_real_sinh(x); }
+KaiValue *kaix_core_real_cosh(KaiValue *x)                            { return kai_core_real_cosh(x); }
+KaiValue *kaix_core_real_tanh(KaiValue *x)                            { return kai_core_real_tanh(x); }
+KaiValue *kaix_core_real_signum(KaiValue *x)                          { return kai_core_real_signum(x); }
+KaiValue *kaix_core_real_is_nan(KaiValue *x)                          { return kai_core_real_is_nan(x); }
+KaiValue *kaix_core_real_is_inf(KaiValue *x)                          { return kai_core_real_is_inf(x); }
+KaiValue *kaix_core_real_pow(KaiValue *a, KaiValue *b)                { return kai_core_real_pow(a, b); }
+KaiValue *kaix_core_real_atan2(KaiValue *a, KaiValue *b)              { return kai_core_real_atan2(a, b); }
 /* Issue #523: m8 mailbox runtime bindings. Mirrors the C-side
- * prelude table mailbox block; needed at link time when the LLVM
- * emit references @kaix_prelude_mailbox_* (e.g. via
+ * core table mailbox block; needed at link time when the LLVM
+ * emit references @kaix_core_mailbox_* (e.g. via
  * stdlib/actor.kai's spawn_actor / send / receive surface). */
-KaiValue *kaix_prelude_mailbox_alloc(void)                               { return kai_prelude_mailbox_alloc(); }
-KaiValue *kaix_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { return kai_prelude_mailbox_alloc_bounded(cap, overflow); }
-KaiValue *kaix_prelude_mailbox_alloc_unowned(void)                       { return kai_prelude_mailbox_alloc_unowned(); }
-KaiValue *kaix_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) { return kai_prelude_mailbox_alloc_bounded_unowned(cap, overflow); }
-KaiValue *kaix_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_prelude_mailbox_assign_owner(pid, fiber); }
-KaiValue *kaix_prelude_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_prelude_mailbox_send(pid, msg); }
-KaiValue *kaix_prelude_mailbox_recv(KaiValue *pid)                       { return kai_prelude_mailbox_recv(pid); }
-KaiValue *kaix_prelude_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns) { return kai_prelude_mailbox_recv_timeout(pid, ns); }
-KaiValue *kaix_prelude_mailbox_free(KaiValue *pid)                       { return kai_prelude_mailbox_free(pid); }
-/* Lane 4 (#473) Byte primitive ops. Mirrors the C-side prelude
+KaiValue *kaix_core_mailbox_alloc(void)                               { return kai_core_mailbox_alloc(); }
+KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { return kai_core_mailbox_alloc_bounded(cap, overflow); }
+KaiValue *kaix_core_mailbox_alloc_unowned(void)                       { return kai_core_mailbox_alloc_unowned(); }
+KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) { return kai_core_mailbox_alloc_bounded_unowned(cap, overflow); }
+KaiValue *kaix_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_core_mailbox_assign_owner(pid, fiber); }
+KaiValue *kaix_core_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_core_mailbox_send(pid, msg); }
+KaiValue *kaix_core_mailbox_recv(KaiValue *pid)                       { return kai_core_mailbox_recv(pid); }
+KaiValue *kaix_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns) { return kai_core_mailbox_recv_timeout(pid, ns); }
+KaiValue *kaix_core_mailbox_free(KaiValue *pid)                       { return kai_core_mailbox_free(pid); }
+/* Lane 4 (#473) Byte primitive ops. Mirrors the C-side core
  * table; needed at link time when the LLVM emit references
- * @kaix_prelude_byte_* (e.g. via stdlib/protocols.kai's
+ * @kaix_core_byte_* (e.g. via stdlib/protocols.kai's
  * BinSerialize impls calling byte_to_int / int_to_byte). */
-KaiValue *kaix_prelude_int_to_byte(KaiValue *v)                          { return kai_prelude_int_to_byte(v); }
-KaiValue *kaix_prelude_byte_to_int(KaiValue *v)                          { return kai_prelude_byte_to_int(v); }
-KaiValue *kaix_prelude_byte_add(KaiValue *a, KaiValue *b)                { return kai_prelude_byte_add(a, b); }
-KaiValue *kaix_prelude_byte_sub(KaiValue *a, KaiValue *b)                { return kai_prelude_byte_sub(a, b); }
-KaiValue *kaix_prelude_byte_eq(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_eq(a, b); }
-KaiValue *kaix_prelude_byte_lt(KaiValue *a, KaiValue *b)                 { return kai_prelude_byte_lt(a, b); }
-KaiValue *kaix_prelude_byte_to_string(KaiValue *v)                       { return kai_prelude_byte_to_string(v); }
+KaiValue *kaix_core_int_to_byte(KaiValue *v)                          { return kai_core_int_to_byte(v); }
+KaiValue *kaix_core_byte_to_int(KaiValue *v)                          { return kai_core_byte_to_int(v); }
+KaiValue *kaix_core_byte_add(KaiValue *a, KaiValue *b)                { return kai_core_byte_add(a, b); }
+KaiValue *kaix_core_byte_sub(KaiValue *a, KaiValue *b)                { return kai_core_byte_sub(a, b); }
+KaiValue *kaix_core_byte_eq(KaiValue *a, KaiValue *b)                 { return kai_core_byte_eq(a, b); }
+KaiValue *kaix_core_byte_lt(KaiValue *a, KaiValue *b)                 { return kai_core_byte_lt(a, b); }
+KaiValue *kaix_core_byte_to_string(KaiValue *v)                       { return kai_core_byte_to_string(v); }
 
 /* Fixed-width integer prims (numeric lane A). */
-KaiValue *kaix_prelude_int32_to_string(KaiValue *v)   { return kai_prelude_int32_to_string(v); }
-KaiValue *kaix_prelude_uint32_to_string(KaiValue *v)  { return kai_prelude_uint32_to_string(v); }
-KaiValue *kaix_prelude_uint64_to_string(KaiValue *v)  { return kai_prelude_uint64_to_string(v); }
-KaiValue *kaix_prelude_int128_to_string(KaiValue *v)  { return kai_prelude_int128_to_string(v); }
-KaiValue *kaix_prelude_int_to_int32(KaiValue *v)      { return kai_prelude_int_to_int32(v); }
-KaiValue *kaix_prelude_int_to_uint32(KaiValue *v)     { return kai_prelude_int_to_uint32(v); }
-KaiValue *kaix_prelude_int_to_uint64(KaiValue *v)     { return kai_prelude_int_to_uint64(v); }
-KaiValue *kaix_prelude_int_to_int128(KaiValue *v)     { return kai_prelude_int_to_int128(v); }
-KaiValue *kaix_prelude_int32_to_int(KaiValue *v)      { return kai_prelude_int32_to_int(v); }
-KaiValue *kaix_prelude_uint32_to_int(KaiValue *v)     { return kai_prelude_uint32_to_int(v); }
-KaiValue *kaix_prelude_uint64_to_int(KaiValue *v)     { return kai_prelude_uint64_to_int(v); }
-KaiValue *kaix_prelude_int128_to_int(KaiValue *v)     { return kai_prelude_int128_to_int(v); }
-KaiValue *kaix_prelude_ref_make(KaiValue *init)                          { return kai_prelude_ref_make(init); }
-KaiValue *kaix_prelude_ref_get(KaiValue *r)                              { return kai_prelude_ref_get(r); }
-KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { return kai_prelude_ref_set(r, v); }
+KaiValue *kaix_core_int32_to_string(KaiValue *v)   { return kai_core_int32_to_string(v); }
+KaiValue *kaix_core_uint32_to_string(KaiValue *v)  { return kai_core_uint32_to_string(v); }
+KaiValue *kaix_core_uint64_to_string(KaiValue *v)  { return kai_core_uint64_to_string(v); }
+KaiValue *kaix_core_int128_to_string(KaiValue *v)  { return kai_core_int128_to_string(v); }
+KaiValue *kaix_core_int_to_int32(KaiValue *v)      { return kai_core_int_to_int32(v); }
+KaiValue *kaix_core_int_to_uint32(KaiValue *v)     { return kai_core_int_to_uint32(v); }
+KaiValue *kaix_core_int_to_uint64(KaiValue *v)     { return kai_core_int_to_uint64(v); }
+KaiValue *kaix_core_int_to_int128(KaiValue *v)     { return kai_core_int_to_int128(v); }
+KaiValue *kaix_core_int32_to_int(KaiValue *v)      { return kai_core_int32_to_int(v); }
+KaiValue *kaix_core_uint32_to_int(KaiValue *v)     { return kai_core_uint32_to_int(v); }
+KaiValue *kaix_core_uint64_to_int(KaiValue *v)     { return kai_core_uint64_to_int(v); }
+KaiValue *kaix_core_int128_to_int(KaiValue *v)     { return kai_core_int128_to_int(v); }
+KaiValue *kaix_core_ref_make(KaiValue *init)                          { return kai_core_ref_make(init); }
+KaiValue *kaix_core_ref_get(KaiValue *r)                              { return kai_core_ref_get(r); }
+KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v)                 { return kai_core_ref_set(r, v); }
 /* `unit_name(x)` is a COMPILE-TIME intrinsic in the C-direct backend
  * (emit_c resolves it to the value's unit-of-measure name as a string
  * literal). The native backend lowers it as a plain call, so it needs a
@@ -1107,7 +1107,7 @@ KaiValue *kaix_prelude_ref_set(KaiValue *r, KaiValue *v)                 { retur
  * current native subset reaches — e.g. `Show[Real]`) yields the empty
  * string, matching the C-direct constant. A UoM-carrying value would need
  * the static resolution; that lands when the native walk grows UoM. */
-KaiValue *kaix_prelude_unit_name(KaiValue *x)                            { if (x) kai_decref(x); return kai_str(""); }
+KaiValue *kaix_core_unit_name(KaiValue *x)                            { if (x) kai_decref(x); return kai_str(""); }
 
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
  * helpers in runtime.h. The LLVM IR can only see externally-

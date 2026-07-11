@@ -443,70 +443,70 @@ static const struct {
     const char *c;
     int         arity;
 } PRELUDE[] = {
-    { "print",          "kai_prelude_print",          1 },
-    { "eprint",         "kai_prelude_eprint",         1 },
-    { "write_stdout",   "kai_prelude_write_stdout",   1 },
-    { "panic",          "kai_prelude_panic",          1 },
-    { "exit",           "kai_prelude_exit",           1 },
-    { "int_to_string",  "kai_prelude_int_to_string",  1 },
-    { "real_to_string", "kai_prelude_real_to_string", 1 },
-    { "int_to_real",    "kai_prelude_int_to_real",    1 },
-    { "real_to_int",    "kai_prelude_real_to_int",    1 },
+    { "print",          "kai_core_print",          1 },
+    { "eprint",         "kai_core_eprint",         1 },
+    { "write_stdout",   "kai_core_write_stdout",   1 },
+    { "panic",          "kai_core_panic",          1 },
+    { "exit",           "kai_core_exit",           1 },
+    { "int_to_string",  "kai_core_int_to_string",  1 },
+    { "real_to_string", "kai_core_real_to_string", 1 },
+    { "int_to_real",    "kai_core_int_to_real",    1 },
+    { "real_to_int",    "kai_core_real_to_int",    1 },
     /* libm bindings (issue #343) — pass-through NaN/Inf semantics. */
-    { "real_sqrt",      "kai_prelude_real_sqrt",      1 },
-    { "real_cbrt",      "kai_prelude_real_cbrt",      1 },
-    { "real_exp",       "kai_prelude_real_exp",       1 },
-    { "real_log",       "kai_prelude_real_log",       1 },
-    { "real_log2",      "kai_prelude_real_log2",      1 },
-    { "real_log10",     "kai_prelude_real_log10",     1 },
-    { "real_sin",       "kai_prelude_real_sin",       1 },
-    { "real_cos",       "kai_prelude_real_cos",       1 },
-    { "real_tan",       "kai_prelude_real_tan",       1 },
-    { "real_asin",      "kai_prelude_real_asin",      1 },
-    { "real_acos",      "kai_prelude_real_acos",      1 },
-    { "real_atan",      "kai_prelude_real_atan",      1 },
-    { "real_sinh",      "kai_prelude_real_sinh",      1 },
-    { "real_cosh",      "kai_prelude_real_cosh",      1 },
-    { "real_tanh",      "kai_prelude_real_tanh",      1 },
-    { "real_signum",    "kai_prelude_real_signum",    1 },
-    { "real_is_nan",    "kai_prelude_real_is_nan",    1 },
-    { "real_is_inf",    "kai_prelude_real_is_inf",    1 },
-    { "real_pow",       "kai_prelude_real_pow",       2 },
-    { "real_atan2",     "kai_prelude_real_atan2",     2 },
-    { "string_length",  "kai_prelude_string_length",  1 },
-    { "string_concat",  "kai_prelude_string_concat",  2 },
-    { "string_concat_all", "kai_prelude_string_concat_all", 1 },
-    { "string_join",    "kai_prelude_string_join",    2 },
-    { "list_length",    "kai_prelude_list_length",    1 },
-    { "list_append",    "kai_prelude_list_append",    2 },
-    { "list_reverse",   "kai_prelude_list_reverse",   1 },
-    { "map",            "kai_prelude_map",            2 },
-    { "flat_map",       "kai_prelude_flat_map",       2 },
-    { "filter",         "kai_prelude_filter",         2 },
-    { "reduce",         "kai_prelude_reduce",         3 },
-    { "each",           "kai_prelude_each",           2 },
-    { "args",           "kai_prelude_args",           0 },
-    { "read_file",      "kai_prelude_read_file",      1 },
-    { "write_file",     "kai_prelude_write_file",     2 },
-    { "read_line",      "kai_prelude_read_line",      0 },
-    { "read_bytes",     "kai_prelude_read_bytes",     1 },
-    { "string_to_int",  "kai_prelude_string_to_int",  1 },
-    { "string_to_real", "kai_prelude_string_to_real", 1 },
-    { "char_at",        "kai_prelude_char_at",        2 },
-    { "string_split",   "kai_prelude_string_split",   2 },
-    { "string_contains","kai_prelude_string_contains",2 },
-    { "string_slice",   "kai_prelude_string_slice",   3 },
-    { "char_to_int",    "kai_prelude_char_to_int",    1 },
-    { "int_to_char",    "kai_prelude_int_to_char",    1 },
-    { "int_to_byte_string", "kai_prelude_int_to_byte_string", 1 },
-    { "string_byte_at_int", "kai_prelude_string_byte_at_int", 2 },
-    { "string_cp_at",   "kai_prelude_string_cp_at",   2 },
-    { "string_cp_len",  "kai_prelude_string_cp_len",  2 },
-    { "array_make",     "kai_prelude_array_make",     2 },
-    { "array_length",   "kai_prelude_array_length",   1 },
-    { "array_get",      "kai_prelude_array_get",      2 },
-    { "array_set",      "kai_prelude_array_set",      3 },
-    { "array_grow",     "kai_prelude_array_grow",     3 }
+    { "real_sqrt",      "kai_core_real_sqrt",      1 },
+    { "real_cbrt",      "kai_core_real_cbrt",      1 },
+    { "real_exp",       "kai_core_real_exp",       1 },
+    { "real_log",       "kai_core_real_log",       1 },
+    { "real_log2",      "kai_core_real_log2",      1 },
+    { "real_log10",     "kai_core_real_log10",     1 },
+    { "real_sin",       "kai_core_real_sin",       1 },
+    { "real_cos",       "kai_core_real_cos",       1 },
+    { "real_tan",       "kai_core_real_tan",       1 },
+    { "real_asin",      "kai_core_real_asin",      1 },
+    { "real_acos",      "kai_core_real_acos",      1 },
+    { "real_atan",      "kai_core_real_atan",      1 },
+    { "real_sinh",      "kai_core_real_sinh",      1 },
+    { "real_cosh",      "kai_core_real_cosh",      1 },
+    { "real_tanh",      "kai_core_real_tanh",      1 },
+    { "real_signum",    "kai_core_real_signum",    1 },
+    { "real_is_nan",    "kai_core_real_is_nan",    1 },
+    { "real_is_inf",    "kai_core_real_is_inf",    1 },
+    { "real_pow",       "kai_core_real_pow",       2 },
+    { "real_atan2",     "kai_core_real_atan2",     2 },
+    { "string_length",  "kai_core_string_length",  1 },
+    { "string_concat",  "kai_core_string_concat",  2 },
+    { "string_concat_all", "kai_core_string_concat_all", 1 },
+    { "string_join",    "kai_core_string_join",    2 },
+    { "list_length",    "kai_core_list_length",    1 },
+    { "list_append",    "kai_core_list_append",    2 },
+    { "list_reverse",   "kai_core_list_reverse",   1 },
+    { "map",            "kai_core_map",            2 },
+    { "flat_map",       "kai_core_flat_map",       2 },
+    { "filter",         "kai_core_filter",         2 },
+    { "reduce",         "kai_core_reduce",         3 },
+    { "each",           "kai_core_each",           2 },
+    { "args",           "kai_core_args",           0 },
+    { "read_file",      "kai_core_read_file",      1 },
+    { "write_file",     "kai_core_write_file",     2 },
+    { "read_line",      "kai_core_read_line",      0 },
+    { "read_bytes",     "kai_core_read_bytes",     1 },
+    { "string_to_int",  "kai_core_string_to_int",  1 },
+    { "string_to_real", "kai_core_string_to_real", 1 },
+    { "char_at",        "kai_core_char_at",        2 },
+    { "string_split",   "kai_core_string_split",   2 },
+    { "string_contains","kai_core_string_contains",2 },
+    { "string_slice",   "kai_core_string_slice",   3 },
+    { "char_to_int",    "kai_core_char_to_int",    1 },
+    { "int_to_char",    "kai_core_int_to_char",    1 },
+    { "int_to_byte_string", "kai_core_int_to_byte_string", 1 },
+    { "string_byte_at_int", "kai_core_string_byte_at_int", 2 },
+    { "string_cp_at",   "kai_core_string_cp_at",   2 },
+    { "string_cp_len",  "kai_core_string_cp_len",  2 },
+    { "array_make",     "kai_core_array_make",     2 },
+    { "array_length",   "kai_core_array_length",   1 },
+    { "array_get",      "kai_core_array_get",      2 },
+    { "array_set",      "kai_core_array_set",      3 },
+    { "array_grow",     "kai_core_array_grow",     3 }
 };
 static const size_t N_PRELUDE = sizeof(PRELUDE) / sizeof(PRELUDE[0]);
 
@@ -1035,7 +1035,7 @@ static void emit_list_tail(E *e, Node *lit, size_t i) {
             emit_expr(e, elt->children[0]);
             fputc(')', e->out);
         } else {
-            fputs("kai_prelude_list_append(", e->out);
+            fputs("kai_core_list_append(", e->out);
             emit_expr(e, elt->children[0]);
             fputs(", ", e->out);
             emit_list_tail(e, lit, i + 1);
@@ -1270,7 +1270,7 @@ static void emit_match(E *e, Node *m) {
         }
         ls_pop_mark(e);
     }
-    fputs("    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
+    fputs("    kai_core_panic(kai_str(\"non-exhaustive match\"));\n", e->out);
     /* m5.x §4b: consume `_scr` linearly. Stage 0's eager-dup retrofit
        wraps every multi-use local read in kai_internal_dup, so when the
        scrutinee is a bare binding read it arrives as a fresh ref;
@@ -1511,7 +1511,7 @@ static void emit_assert(E *e, Node *n) {
         /* Outside tests, a failed assertion panics. */
         fputs("{ KaiValue *_c = ", e->out);
         emit_expr(e, n->children[0]);
-        fputs("; if (!kai_op_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
+        fputs("; if (!kai_op_truthy(_c)) { kai_core_panic(kai_str(\"assertion failed\")); } }", e->out);
         return;
     }
     fputs("{ KaiValue *_c = ", e->out);

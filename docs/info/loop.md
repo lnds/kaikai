@@ -14,7 +14,7 @@ the row.
 
 kaikai has NO `for x in xs` form. Iterate via a map-pipe with a
 lambda (`xs | (x => body)`) or, for side effects only, via `foreach`
-/ `each` (the prelude alias). The `for` keyword is reserved
+/ `each` (the core alias). The `for` keyword is reserved
 exclusively for the `impl Proto for T` declaration form.
 
 There is no `break` or `continue`. Loops terminate when their
@@ -109,7 +109,7 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-…or with the prelude `each` helper (auto-loaded, returns `Unit`;
+…or with the core `each` helper (auto-loaded, returns `Unit`;
 `foreach` is the spelled-out stdlib equivalent in `core/list`):
 
 ```kaikai

@@ -292,7 +292,7 @@ let h_cm : Real<cm> = h_m * cm_per_m   # OK: m * cm/m = cm
 let raw : Real = unitless(h_m)         # explicit drop
 ```
 
-`unitless` is a prelude function (`unitless[u: Measure](x: Real<u>) : Real`).
+`unitless` is a core function (`unitless[u: Measure](x: Real<u>) : Real`).
 There is NO implicit unit→no-unit conversion.
 
 ### 8. Pretty-printing

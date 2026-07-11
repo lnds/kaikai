@@ -2,7 +2,7 @@
 #
 # This module is the apex of the compiler pipeline: it orchestrates
 # every stage beneath it (lex → parse → resolve → infer → monomorph →
-# perceus → emit) plus the CLI surface, prelude loading, builtin-effect
+# perceus → emit) plus the CLI surface, core loading, builtin-effect
 # injection, module-import resolution, the library-query mode, the
 # AST/token/diagnostic dumpers, and the `compile_source`/`run` drivers.
 #
@@ -1038,7 +1038,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
                   # imported module's decls join the global stream.
-                  # Mirrors the check in `load_prelude` for core
+                  # Mirrors the check in `load_core_file` for core
                   # auto-load — without it, an `import` of a module
                   # with a duplicate `fn foo` silently keeps the
                   # second definition and the codegen emits two C
@@ -1136,18 +1136,18 @@ fn rekey_fn_bounds(fbs: [FnBoundsRec], mod: String) : [FnBoundsRec] {
 # prepended in topological order and with every DImport stripped,
 # plus the module table for the qualified-call resolver.
 #
-# `prelude_paths` carries the absolute paths of every prelude file
+# `core_paths` carries the absolute paths of every core file
 # already merged into the program. Pre-seeding the resolver's
 # `visited` set with those paths makes any user `import X`
-# whose resolved file matches a prelude entry a no-op, instead of
+# whose resolved file matches a core entry a no-op, instead of
 # concatenating the same module a second time and producing a
 # duplicate-symbol C output (`import encoding.toml` against the
-# prelude-loaded `stdlib/encoding/toml.kai` was the trigger).
-fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl], prelude_paths: [String], cache_on: Bool) : ExpandedProgram / Console + File {
+# core-loaded `stdlib/encoding/toml.kai` was the trigger).
+fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl], core_paths: [String], cache_on: Bool) : ExpandedProgram / Console + File {
 
 
   let base_dir = dir_of(root_path)
-  # Canonicalise root + prelude paths so the resolver's `visited`
+  # Canonicalise root + core paths so the resolver's `visited`
   # dedup compares against the same shape `resolve_module` will
   # produce for each import candidate (`abspath` of the raw path
   # `find_module_file` returns). Without this, a core auto-loaded
@@ -1156,8 +1156,8 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
   # `stdlib/math/complex.kai` (relative) are treated as different
   # files and the module gets loaded twice.
   let canon_root = abspath(root_path)
-  let canon_preludes = canon_paths(prelude_paths)
-  let rs0 = ResolveState { visited: [canon_root, ...canon_preludes], in_progress: [canon_root], decls: [], modules: [], errs: 0 }
+  let canon_cores = canon_paths(core_paths)
+  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], decls: [], modules: [], errs: 0 }
   let rs1 = process_imports(base_dir, root_decls, search_paths, cache_on, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
@@ -1174,7 +1174,7 @@ fn canon_paths(ps: [String]) : [String] = match ps {
 # cli + driver
 # ====================================================================
 
-#[doc("The CLI mode selected by parse_cli: build/run/test/check/fmt, the dump variants, the library-query modes, and the prelude-cache emitter.")]
+#[doc("The CLI mode selected by parse_cli: build/run/test/check/fmt, the dump variants, the library-query modes, and the core-cache emitter.")]
 pub type Mode
   = MDefault
   | MTokens
@@ -1301,19 +1301,19 @@ pub type Mode
   # [Decl] fragment, serialises it, deserialises it, re-serialises,
   # compares the two hex blobs, prints "OK ..." on success or
   # "FAIL ..." on mismatch. Exit 0 on OK, 1 on FAIL. The mode ignores
-  # `path` and any preludes.
+  # `path` and any cores.
   | MCacheRoundtrip
   # Emit a .kab cache blob for a single source file to stdout. Reads
   # `path`, lexes, parses, strips
-  # prelude tests, stamps module_origin, serialises the resulting
+  # core tests, stamps module_origin, serialises the resulting
   # `[Decl]` against the source's sha256 (supplied by the caller).
   # Used by bin/kai's cache MISS path; the driver redirects stdout
   # to a temp file and atomically renames into the cache dir.
-  | MEmitPreludeCache
+  | MEmitCoreCache
   # Internal batch driver. `path` names a list file whose lines are
   # `<input.kai>\t<output>` pairs. Loads (lexes + parses) the core
   # module set once, then compiles every input against that shared
-  # `PreludesLoaded`, writing each result to its `<output>`. Amortises
+  # `CoresLoaded`, writing each result to its `<output>`. Amortises
   # the core's lex + parse — the ~90ms fixed cost every standalone
   # invocation re-pays — across N fixtures; the per-file typecheck +
   # codegen still runs fresh, so each output is byte-identical to a
@@ -1321,7 +1321,7 @@ pub type Mode
   # uses it to avoid forking once per fixture.
   | MBatchList
 
-#[doc("Parsed CLI configuration: mode, target path, preludes, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
+#[doc("Parsed CLI configuration: mode, target path, cores, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
 # The codegen backend, ORTHOGONAL to `Mode`. `Mode` carries the
 # build-shape (build / test / bench / prop-check) plus every read-only
 # dump; `Backend` carries the destination. Keeping them separate lets
@@ -1332,8 +1332,8 @@ pub type Mode
 # already default to; `BkCModular` is the separate-compilation C path.
 pub type Backend = BkC | BkNative | BkCModular | BkNativeModular
 
-pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], preludes: [String],
-                    prelude_caches: [String], cache_sha: String,
+pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], cores: [String],
+                    core_caches: [String], cache_sha: String,
                     strict_holes: Bool, search_paths: [String],
                     # Identity of the consuming package (from
                     # `name = ...` in the user's kai.toml; empty when no
@@ -1361,8 +1361,8 @@ pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], prel
                     user_cache: Bool }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
-  CliOptions { mode: m, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: m, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
@@ -1370,8 +1370,8 @@ fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
 # `--emit=c-modular` set this instead of `mode`, so they compose with
 # `--test`/`--bench`/`--prop-check`.
 fn cli_with_backend(opts: CliOptions, bk: Backend) : CliOptions =
-  CliOptions { mode: opts.mode, backend: bk, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: bk, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
@@ -1379,48 +1379,48 @@ fn cli_with_backend(opts: CliOptions, bk: Backend) : CliOptions =
 # `--user-cache`, which `bin/kai` passes only under `KAI_CACHE=1`
 # after creating `<project>/.kai-cache/`.
 fn cli_with_user_cache(opts: CliOptions) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: true }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: Some(p), preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: Some(p), cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
-fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
+fn cli_with_core(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
-               preludes: list_append(opts.preludes, [p]),
-               prelude_caches: list_append(opts.prelude_caches, [""]),
+               cores: list_append(opts.cores, [p]),
+               core_caches: list_append(opts.core_caches, [""]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
-fn cli_with_prelude_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
+fn cli_with_core_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
-               preludes: list_append(opts.preludes, [src]),
-               prelude_caches: list_append(opts.prelude_caches, [cache]),
+               cores: list_append(opts.cores, [src]),
+               core_caches: list_append(opts.core_caches, [cache]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
                package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
@@ -1429,8 +1429,8 @@ fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
 # through to the qualified-call rewriter so self-imports from a
 # package's own modules never emit the unstable warning.
 fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
 
@@ -1441,8 +1441,8 @@ fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
 # as the oldest edition (tongariki) so flagless invocations and old
 # fixture harnesses keep working.
 fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins,
                edition: n, user_cache: opts.user_cache }
@@ -1463,8 +1463,8 @@ fn edition_is_known(n: String) : Bool = edition_is_known_loop(known_editions(), 
 # (tongariki) defensively; the CLI rejects unknown values before any
 # rank lookup runs.
 fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
-  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, preludes: opts.preludes,
-               prelude_caches: opts.prelude_caches, cache_sha: opts.cache_sha,
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name,
                unstable_optins: list_append(opts.unstable_optins, [pkg]),
@@ -1564,8 +1564,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MLintJson))
       } else if a == "--cache-roundtrip-test" {
         parse_cli_loop(more, cli_with_mode(opts, MCacheRoundtrip))
-      } else if a == "--emit-prelude-cache" {
-        parse_cli_loop(more, cli_with_mode(opts, MEmitPreludeCache))
+      } else if a == "--emit-core-cache" {
+        parse_cli_loop(more, cli_with_mode(opts, MEmitCoreCache))
       } else if a == "--batch-list" {
         parse_cli_loop(more, cli_with_mode(opts, MBatchList))
       } else if a == "--test" {
@@ -1578,8 +1578,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MHelp))
       } else if a == "-V" or a == "--version" {
         parse_cli_loop(more, cli_with_mode(opts, MVersion))
-      } else if a == "--prelude" or a == "--prelude-cache" {
-        # --prelude and --prelude-cache are retired: core is
+      } else if a == "--core" or a == "--core-cache" {
+        # --core and --core-cache are retired: core is
         # hard-coded. The compiler loads core/*, protocols, effects and
         # array from the compile-time KAI_STDLIB_PATH on every run. The
         # flags are accepted only to surface a clear error; reject on
@@ -1651,11 +1651,11 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   }
 }
 
-#[doc("Parse argv into CliOptions: mode, path, preludes, search paths, edition, and feature flags. Driver entry point called by fn main().")]
+#[doc("Parse argv into CliOptions: mode, path, cores, search paths, edition, and feature flags. Driver entry point called by fn main().")]
 pub fn parse_cli(argv: [String]) : CliOptions / Console {
 
-  parse_cli_loop(argv, CliOptions { mode: MDefault, backend: BkC, path: None, preludes: [],
-                                    prelude_caches: [], cache_sha: "",
+  parse_cli_loop(argv, CliOptions { mode: MDefault, backend: BkC, path: None, cores: [],
+                                    core_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
                                     edition: "", user_cache: false })
@@ -1663,12 +1663,12 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
 
 fn usage() : Unit / Console {
   eprint("usage: kaic2 [options] <file.kai>")
-  eprint("  --prelude <file>   include <file>'s decls before the input")
+  eprint("  --core <file>   include <file>'s decls before the input")
   eprint("  --path <dir>       add <dir> to the module search path (repeatable)")
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --types            print declared top-level signatures and exit")
-  eprint("  --env              print the full type environment (prelude + variants + decls)")
+  eprint("  --env              print the full type environment (core + variants + decls)")
   eprint("  --infer            run HM inference over each fn body and dump the inferred type")
   eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
@@ -1701,19 +1701,19 @@ fn usage() : Unit / Console {
   eprint("  -V, --version      print version and exit")
 }
 
-# A prelude file's contribution to compile_source — its decls
+# A core file's contribution to compile_source — its decls
 # (concat'd into the global flat list) and a `ModuleEntry`
 # registering its public surface under its file's
 # basename so user code can call `list.take(xs, n)` without an
 # explicit `import list`. Without this, qualified calls into the
 # stdlib would error with "module 'list' is not imported".
-type PreludeLoaded = PL([Decl], ModuleEntry)
+type CoreLoaded = PL([Decl], ModuleEntry)
 
-# Strip directory + ".kai" extension from a prelude path. Used as
+# Strip directory + ".kai" extension from a core path. Used as
 # the qualified-call surface name. "stdlib/core/list.kai" -> "list".
 # Files lacking the ".kai" suffix keep their full basename — there
 # is no fallback path that ships such files today.
-fn prelude_module_name(path: String) : String {
+fn core_module_name(path: String) : String {
   let total = string_length(path)
   let i = last_slash(path, total - 1)
   let after_slash = if i < 0 { path } else { string_slice(path, i + 1, total - i - 1) }
@@ -1735,7 +1735,7 @@ fn prelude_module_name(path: String) : String {
 # unaffected: it passes the stdlib file as the *target* (which keeps
 # its own test blocks intact through `compile_source`) and only the
 # OTHER core modules are loaded as context.
-fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
+fn load_core_file(path: String) : Option[CoreLoaded] / Console + File {
   match read_file(path) {
     Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -1748,13 +1748,13 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
           None -> None
           Some(ds_raw) -> {
             # Strip `#[doc(...)]` wrappers (and the module doc) at load
-            # time — prelude decls join the global stream doc-free.
-            # `kai doc` collects prelude docs on its own dedicated path.
+            # time — core decls join the global stream doc-free.
+            # `kai doc` collects core docs on its own dedicated path.
             let pre_docs = doc_strip_all(path, src, ds_raw)
             if pre_docs.errs > 0 { None } else {
             let ds = pre_docs.decls
-            let mod_name = prelude_module_name(path)
-            let kept = strip_prelude_tests(ds, [])
+            let mod_name = core_module_name(path)
+            let kept = strip_core_tests(ds, [])
             # Validate same-module name collisions before the module's
             # decls join the global stream. Without this, a duplicate
             # `fn foo` inside a stdlib module silently overwrites the
@@ -1766,7 +1766,7 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
             else {
               let exports = collect_pub_exports(kept, [])
               let unstable_exports = collect_unstable_exports(kept, [])
-              # Tag every DFn coming from this prelude file with
+              # Tag every DFn coming from this core file with
               # `module_origin = Some(<basename>)` so the codegen mints
               # `kai_<basename>__<name>` for it. Decls authored in the
               # root file keep `None` (set by the parser).
@@ -1781,17 +1781,17 @@ fn load_prelude(path: String) : Option[PreludeLoaded] / Console + File {
   }
 }
 
-# Drop every `test`/`bench`/`check` block from a prelude file's
+# Drop every `test`/`bench`/`check` block from a core file's
 # parsed decls. Public exports, types, effects, protocols,
 # imports etc. all pass through untouched. Tail-recursive accumulator
 # keeps the original order.
-fn strip_prelude_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+fn strip_core_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
-    DTest(_, _, _, _)         -> strip_prelude_tests(rest, acc)
-    DBench(_, _, _, _)        -> strip_prelude_tests(rest, acc)
-    DCheck(_, _, _, _, _)     -> strip_prelude_tests(rest, acc)
-    _                          -> strip_prelude_tests(rest, [d, ...acc])
+    DTest(_, _, _, _)         -> strip_core_tests(rest, acc)
+    DBench(_, _, _, _)        -> strip_core_tests(rest, acc)
+    DCheck(_, _, _, _, _)     -> strip_core_tests(rest, acc)
+    _                          -> strip_core_tests(rest, [d, ...acc])
   }
 }
 
@@ -1834,9 +1834,9 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # tagging the inner methods, `validate_pub_access_decls` would
   # treat their home module as the root file's basename and flag
   # every bare-name reference to a non-`pub` helper authored in
-  # the same prelude (e.g. `show_char_ascii_table` inside
+  # the same core (e.g. `show_char_ascii_table` inside
   # `impl Show for Char`). Recurse so each method's `mo` matches
-  # the enclosing prelude.
+  # the enclosing core.
   DImpl(name, proto_args, target, sub_decls, l, c) ->
     DImpl(name, proto_args, target,
           tag_decls_module_origin(sub_decls, mod), l, c)
@@ -1857,16 +1857,16 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
 }
 
 # Partition a post-cascade `[Decl]` stream back into the
-# (prelude_decls, user_decls) segments a cache loader needs. The
+# (core_decls, user_decls) segments a cache loader needs. The
 # post-cascade stream is positionally `[user_renamed, impl_renamed,
 # dispatchers]` (per `lower_protocols`'s final concat) with
 # synthesised refinement-predicate fns interleaved inline at their
-# declaring DType's position; the positional boundary between prelude
+# declaring DType's position; the positional boundary between core
 # and user decls is destroyed there. This function rebuilds the
 # partition by inspecting each decl's `module_origin`:
 #
-# - Decls whose home is one of `prelude_mods` go to `prelude_decls`.
-# - Decls whose home is `None` (root-file) OR not in `prelude_mods`
+# - Decls whose home is one of `core_mods` go to `core_decls`.
+# - Decls whose home is `None` (root-file) OR not in `core_mods`
 #   (an imported user module) go to `user_decls`.
 #
 # Every synthesis site in the cascade propagates `module_origin`
@@ -1874,34 +1874,34 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
 # `tag_decl_module_origin` pre-lowering of DConst / DAxiom), so this
 # partition is exhaustive: no post-cascade decl is in an
 # indeterminate state.
-type PartitionedDecls = { prelude_decls: [Decl], user_decls: [Decl] }
+type PartitionedDecls = { core_decls: [Decl], user_decls: [Decl] }
 
 fn partition_decls_by_origin(decls: [Decl],
-                                prelude_mods: [String]) : PartitionedDecls = {
-  let acc = partition_decls_loop(decls, prelude_mods, [], [])
-  PartitionedDecls { prelude_decls: list_reverse(acc.prelude_decls),
+                                core_mods: [String]) : PartitionedDecls = {
+  let acc = partition_decls_loop(decls, core_mods, [], [])
+  PartitionedDecls { core_decls: list_reverse(acc.core_decls),
                       user_decls: list_reverse(acc.user_decls) }
 }
 
 # Internal accumulator carries the partition in reverse-source order
 # so each `[h, ...acc]` cons is `O(1)`; `partition_decls_by_origin`
 # reverses both lists once at the boundary.
-type PartitionAcc = { prelude_decls: [Decl], user_decls: [Decl] }
+type PartitionAcc = { core_decls: [Decl], user_decls: [Decl] }
 
-fn partition_decls_loop(decls: [Decl], prelude_mods: [String],
+fn partition_decls_loop(decls: [Decl], core_mods: [String],
                           p_acc: [Decl], u_acc: [Decl]) : PartitionAcc =
   match decls {
-    [] -> PartitionAcc { prelude_decls: p_acc, user_decls: u_acc }
+    [] -> PartitionAcc { core_decls: p_acc, user_decls: u_acc }
     [d, ...rest] -> {
       let home = decl_partition_home(d)
-      let is_prelude = match home {
-        Some(m) -> list_has(prelude_mods, m)
+      let is_core = match home {
+        Some(m) -> list_has(core_mods, m)
         None    -> false
       }
-      if is_prelude {
-        partition_decls_loop(rest, prelude_mods, [d, ...p_acc], u_acc)
+      if is_core {
+        partition_decls_loop(rest, core_mods, [d, ...p_acc], u_acc)
       } else {
-        partition_decls_loop(rest, prelude_mods, p_acc, [d, ...u_acc])
+        partition_decls_loop(rest, core_mods, p_acc, [d, ...u_acc])
       }
     }
   }
@@ -1921,7 +1921,7 @@ fn decl_partition_home(d: Decl) : Option[String] = match d {
 }
 
 # Tag the target file's PUB DFns with the target's basename — the
-# same way `tag_decls_module_origin` tags every DFn in a prelude, but
+# same way `tag_decls_module_origin` tags every DFn in a core, but
 # restricted to the public surface. Three carve-outs:
 #
 # 1. Only `pub` DFns get tagged. Non-pub helpers in the target stay
@@ -1982,18 +1982,18 @@ fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
 }
 
 # `segments` retains the per-file `(mod_name, decls)` split so the
-# pub-access validator can treat each prelude as its own home module.
+# pub-access validator can treat each core as its own home module.
 # Without this, the flat `decls` append loses the boundary between
-# prelude files and a DType / DEffect at the head of one prelude
-# inherits the previous prelude's tagged module via the streaming
+# core files and a DType / DEffect at the head of one core
+# inherits the previous core's tagged module via the streaming
 # hint.
-type PreludesLoaded = PLS([Decl], [ModuleEntry], [PreludeSegment])
-# `PreludeSegment` lives in compiler/modules.kai: it is the
-# per-prelude-file `(mod_name, decls)` split the pub-access validator
+type CoresLoaded = PLS([Decl], [ModuleEntry], [CoreSegment])
+# `CoreSegment` lives in compiler/modules.kai: it is the
+# per-core-file `(mod_name, decls)` split the pub-access validator
 # (also in modules.kai) consumes. The driver constructs `PSeg` values
 # here and passes them downward into `validate_pub_access`.
 
-# Load every prelude file in `paths`, concatenating their decls in
+# Load every core file in `paths`, concatenating their decls in
 # argument order and accumulating one ModuleEntry per file. Returns
 # None if any single load fails. Empty list yields Some(PLS([], [])).
 #
@@ -2094,7 +2094,7 @@ fn builtins_doc_loop(rels: [String], paths: [String],
 }
 
 # Load the core module set: every program gets `core/*` + protocols +
-# effects + array, no negotiation. Mirrors load_preludes' return
+# effects + array, no negotiation. Mirrors load_core_files' return
 # shape so downstream callers (`PLS`, segments, module entries)
 # do not change.
 #
@@ -2103,27 +2103,27 @@ fn builtins_doc_loop(rels: [String], paths: [String],
 # per-module post-parse cache (core_cache.kai). On a warm build every
 # core module deserialises from its blob instead of being re-lexed and
 # re-parsed. When the cache is off the default path is byte-for-byte
-# unchanged: it goes through `load_preludes` with no cache lookup.
+# unchanged: it goes through `load_core_files` with no cache lookup.
 fn load_core(proj_dir: String, cache_on: Bool)
-             : Option[PreludesLoaded] / Console + File =
+             : Option[CoresLoaded] / Console + File =
   if cache_on and proj_dir != "" {
     load_core_cached(core_module_paths(), proj_dir, [], [], [])
   } else {
-    load_preludes(core_module_paths(), [], [], [], [])
+    load_core_files(core_module_paths(), [], [], [], [])
   }
 
 # The cached core loader. Per module: read the source, try the
 # post-parse cache (cc_lookup), and on a hit reconstruct the
 # ModuleEntry from the deserialised decls - exactly as
-# load_prelude_cached does. On a miss,
-# parse via load_prelude and write the resulting decls to the cache
+# load_core_file_cached does. On a miss,
+# parse via load_core_file and write the resulting decls to the cache
 # (write-on-miss self-populates the blob the next build hits). The
-# accumulators mirror load_preludes so the PLS return shape and the
+# accumulators mirror load_core_files so the PLS return shape and the
 # downstream cascade are identical to the non-cached path.
 fn load_core_cached(paths: [String], proj_dir: String,
                     acc_decls: [Decl], acc_mods: [ModuleEntry],
-                    acc_segs: [PreludeSegment])
-                    : Option[PreludesLoaded] / Console + File = match paths {
+                    acc_segs: [CoreSegment])
+                    : Option[CoresLoaded] / Console + File = match paths {
   [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
   [p, ...rest] -> match load_core_module(p, proj_dir) {
     None -> None
@@ -2145,23 +2145,23 @@ fn load_core_cached(paths: [String], proj_dir: String,
 # corruption, or a content edit that changed the hash) falls back to
 # a full parse and writes the fresh blob. The decls a hit reconstructs
 # and the decls a miss parses are identical (the write stores exactly
-# load_prelude's post-parse output), so the merged stream - and the C
+# load_core_file's post-parse output), so the merged stream - and the C
 # the cascade+typer emit from it - is byte-identical warm vs cold.
 fn load_core_module(path: String, proj_dir: String)
-                    : Option[PreludeLoaded] / Console + File =
+                    : Option[CoreLoaded] / Console + File =
   match read_file(path) {
     Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
     Ok(src) -> match cc_lookup(proj_dir, src) {
       CcHit(decls) -> {
         # Reconstruct the ModuleEntry from the cached decls. The blob
         # already holds the doc- and test-stripped, origin-tagged decls
-        # load_prelude produces, so only the export tables are rebuilt.
-        let mod_name = prelude_module_name(path)
+        # load_core_file produces, so only the export tables are rebuilt.
+        let mod_name = core_module_name(path)
         let exports = collect_pub_exports(decls, [])
         let unstable_exports = collect_unstable_exports(decls, [])
         Some(PL(decls, ME(mod_name, exports, path, unstable_exports)))
       }
-      CcMiss(content_hex) -> match load_prelude(path) {
+      CcMiss(content_hex) -> match load_core_file(path) {
         None -> None
         Some(pl) -> match pl {
           PL(ds, _) -> {
@@ -2173,29 +2173,29 @@ fn load_core_module(path: String, proj_dir: String)
     }
   }
 
-fn load_preludes(paths: [String], caches: [String], acc_decls: [Decl],
-                   acc_mods: [ModuleEntry], acc_segs: [PreludeSegment])
-                   : Option[PreludesLoaded] / Console + File = match paths {
+fn load_core_files(paths: [String], caches: [String], acc_decls: [Decl],
+                   acc_mods: [ModuleEntry], acc_segs: [CoreSegment])
+                   : Option[CoresLoaded] / Console + File = match paths {
   [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
   [p, ...rest] -> match caches {
-    [] -> match load_prelude(p) {
+    [] -> match load_core_file(p) {
       None -> None
       Some(pl) -> match pl {
         PL(ds, me) -> {
           let mod_name = match me { ME(m, _, _, _) -> m }
-          load_preludes(rest, [],
+          load_core_files(rest, [],
                          list_append(acc_decls, ds),
                          list_append(acc_mods, [me]),
                          list_append(acc_segs, [PSeg(mod_name, ds)]))
         }
       }
     }
-    [c, ...rest_caches] -> match load_prelude_cached(p, c) {
+    [c, ...rest_caches] -> match load_core_file_cached(p, c) {
       None -> None
       Some(pl) -> match pl {
         PL(ds, me) -> {
           let mod_name = match me { ME(m, _, _, _) -> m }
-          load_preludes(rest, rest_caches,
+          load_core_files(rest, rest_caches,
                          list_append(acc_decls, ds),
                          list_append(acc_mods, [me]),
                          list_append(acc_segs, [PSeg(mod_name, ds)]))
@@ -2207,26 +2207,26 @@ fn load_preludes(paths: [String], caches: [String], acc_decls: [Decl],
 
 # Try the cache file `cache_path` first; on any failure (empty path,
 # missing file, header mismatch,
-# truncated payload) fall back to the full parse via `load_prelude`.
-# The cache stores already-tagged decls with prelude tests stripped,
-# so reconstructing the `ModuleEntry` only needs `prelude_module_name`
+# truncated payload) fall back to the full parse via `load_core_file`.
+# The cache stores already-tagged decls with core tests stripped,
+# so reconstructing the `ModuleEntry` only needs `core_module_name`
 # + `collect_pub_exports` over the deserialised decls.
-fn load_prelude_cached(source_path: String, cache_path: String)
-                       : Option[PreludeLoaded] / Console + File = {
+fn load_core_file_cached(source_path: String, cache_path: String)
+                       : Option[CoreLoaded] / Console + File = {
   if cache_path == "" {
-    load_prelude(source_path)
+    load_core_file(source_path)
   } else {
     match read_file(cache_path) {
-      Err(_) -> load_prelude(source_path)
+      Err(_) -> load_core_file(source_path)
       Ok(blob) -> match cache_deserialize_module(blob) {
         None -> {
           eprint("kaic2: cache miss (header/payload mismatch): #{cache_path} — re-parsing #{source_path}")
-          load_prelude(source_path)
+          load_core_file(source_path)
         }
         Some(cds) -> match cds {
           CDs(decls, _) -> {
-            let mod_name = prelude_module_name(source_path)
-            let kept = strip_prelude_tests(decls, [])
+            let mod_name = core_module_name(source_path)
+            let kept = strip_core_tests(decls, [])
             let exports = collect_pub_exports(kept, [])
             let unstable_exports = collect_unstable_exports(kept, [])
             Some(PL(kept, ME(mod_name, exports, source_path, unstable_exports)))
@@ -3264,7 +3264,7 @@ fn find_var_at_hclauses(cs: [HClause], ql: Int, qc: Int, acc: Option[String]) : 
 # imported `pub fn foo` shows up here exactly like a local one).
 fn find_decl_def(ds: [Decl], name: String) : Option[DefLoc] {
   # Two-pass scan: prefer decls authored in the root file
-  # (module_origin = None) over preloaded prelude / stdlib decls.
+  # (module_origin = None) over preloaded core / stdlib decls.
   # Without this preference, `def_at` for a user-authored `add`
   # resolves to the protocol-impl `add` in stdlib/protocols.kai
   # because it appears first in the typed-module decl list. The
@@ -3384,7 +3384,7 @@ fn compile_to_module_with_diags(file: String, decls: [Decl]) : ModuleWithDiags /
   # Unbound-name diagnostics live on `Env` during the lexical-scope
   # walk; run that pre-pass so they surface alongside the typer's.
   let e0 = env_new(file)
-  let e1 = add_all(e0, prelude_names())
+  let e1 = add_all(e0, core_names())
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls(e2, decls)
   let t3_diags = finalize_diags(e3.diags)
@@ -3467,7 +3467,7 @@ fn lib_run_probe(tm: TypedModule, raw_decls: [Decl], p: LibProbe) : String {
           "}"])
       } else if kind == "complete" {
         # LSP completion. Enumerate every callable name in scope at
-        # the cursor: top-level decls in the root file plus prelude /
+        # the cursor: top-level decls in the root file plus core /
         # stdlib decls (origin != None). Local bindings are out of
         # scope — covering 90% of editor autocomplete cases.
         #
@@ -3516,7 +3516,7 @@ fn lib_run_probes(tm: TypedModule, raw_decls: [Decl], ps: [LibProbe]) : [String]
 
 # documentSymbol. Walk the typed-module decls and emit a JSON entry
 # per top-level decl authored in the root
-# file. Module origin filters out preloaded prelude / stdlib decls
+# file. Module origin filters out preloaded core / stdlib decls
 # — the editor only wants the user's own declarations in the
 # outline panel.
 fn lib_collect_symbols(ds: [Decl]) : [String] =
@@ -3561,7 +3561,7 @@ fn lib_decl_to_symbol(d: Decl) : Option[String] {
   }
 }
 
-# Compiler-injected decls (builtin effects, root prelude, anonymous
+# Compiler-injected decls (builtin effects, root core, anonymous
 # axioms) carry line/col = 0 to mark their non-source origin. A
 # decl with a real source position has line ≥ 1.
 fn is_user_pos(line: Int, col: Int) : Bool = line >= 1
@@ -3581,27 +3581,27 @@ fn lib_symbol_json(kind: String, name: String, line: Int, col: Int) : String =
 # ----- completion -----
 #
 # Enumerate every top-level decl visible from the cursor: user decls
-# (origin = None) followed by prelude / stdlib decls (origin != None).
+# (origin = None) followed by core / stdlib decls (origin != None).
 # Each entry carries the decl kind so the LSP shim can map it to the
 # right LSP CompletionItemKind, plus a render-friendly "detail" string
 # the editor shows next to the candidate.
 fn lib_collect_completions(ds: [Decl]) : [String] = {
   let user_and_stdlib = list_reverse(lib_collect_completions_loop(ds, []))
-  let prelude = lib_collect_prelude_completions()
-  list_append(user_and_stdlib, prelude)
+  let core = lib_collect_core_completions()
+  list_append(user_and_stdlib, core)
 }
 
-# Builtins injected by `add_prelude_sigs` do NOT live as DFn in the
+# Builtins injected by `add_core_sigs` do NOT live as DFn in the
 # typed-module decl list — they're TyEntry rows added directly to the
 # initial type env. We synthesise CompletionItem-shaped JSON for them
 # from the same env shape, so editors see `print`, `int_to_string`,
 # `read_line`, etc. alongside the user-authored and stdlib decls.
-fn lib_collect_prelude_completions() : [String] = {
-  let env = add_prelude_sigs(ty_env_empty())
-  prelude_entries_to_completions(env.entries, [])
+fn lib_collect_core_completions() : [String] = {
+  let env = add_core_sigs(ty_env_empty())
+  core_entries_to_completions(env.entries, [])
 }
 
-fn prelude_entries_to_completions(entries: [TyEntry], acc: [String]) : [String] {
+fn core_entries_to_completions(entries: [TyEntry], acc: [String]) : [String] {
   match entries {
     []           -> list_reverse(acc)
     [e, ...rest] -> {
@@ -3609,7 +3609,7 @@ fn prelude_entries_to_completions(entries: [TyEntry], acc: [String]) : [String] 
         Scheme(_, _, _, _, t) -> ty_to_string(t)
       }
       let item = lib_completion_json("Function", e.name, ty_str)
-      prelude_entries_to_completions(rest, [item, ...acc])
+      core_entries_to_completions(rest, [item, ...acc])
     }
   }
 }
@@ -3936,7 +3936,7 @@ fn run_migrate_ok(out: String, reps: [MigRep]) : Int / Console = {
 # keeps the stdout path every standalone invocation uses; the native
 # backend writes its `.o` to `native_object_path(path)` regardless, so
 # only the C sink changes here.
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl], prelude_mods: [ModuleEntry], prelude_segs: [PreludeSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String]) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String]) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -4002,12 +4002,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # module table; rqc_decls then walks every body and
             # rewrites `EField(EVar(mod), fn)` to `EModCall(mod, fn)`
             # when `mod` is in the module table and not shadowed
-            # locally. Prelude-module paths feed into the resolver's
+            # locally. Core-module paths feed into the resolver's
             # `visited` set so `import encoding.toml`
-            # (or any other prelude-loaded module) does not load the
+            # (or any other core-loaded module) does not load the
             # same file twice.
-            let prelude_paths = collect_module_origins(prelude_mods, [])
-            let expanded = expand_imports(path, search_paths, own_decls_no_holes, prelude_paths, user_cache)
+            let core_paths = collect_module_origins(core_mods, [])
+            let expanded = expand_imports(path, search_paths, own_decls_no_holes, core_paths, user_cache)
             let expanded_decls_raw = match expanded { EP_Mod(ds, _, _, _) -> ds }
             let n_imports_raw = match expanded { EP_Mod(_, _, n, _) -> n }
             # Count of import-resolution failures (e.g.
@@ -4015,24 +4015,24 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # path). Folded into the exit-code aggregator below.
             let import_resolve_errs = match expanded { EP_Mod(_, _, _, e) -> e }
             # Register the target file itself in the module table under
-            # its own basename, mirroring what `load_prelude` does for
-            # prelude files. Without this, an intrinsic test block
+            # its own basename, mirroring what `load_core_file` does for
+            # core files. Without this, an intrinsic test block
             # inside `stdlib/core/option.kai` cannot say
             # `option.map(o, f)` — rqc rejects the qualifier when only
-            # prelude files are registered. Tag the target's DFns with
+            # core files are registered. Tag the target's DFns with
             # `module_origin = Some(<basename>)` (skipping only `main`
             # so the C harness's `kai_main()` call still links) so
             # `add_decls_loop` registers them under the qualified key
-            # `<mod>::<fname>`, matching the prelude path. This makes
+            # `<mod>::<fname>`, matching the core path. This makes
             # self-qualified calls inside the target route through the
             # qualified env without depending on bare-name shadow
             # ordering.
-            let target_mod_name = prelude_module_name(path)
+            let target_mod_name = core_module_name(path)
             let target_exports = collect_pub_exports(expanded_decls_raw, [])
             let target_unstable = collect_unstable_exports(expanded_decls_raw, [])
             let target_me = ME(target_mod_name, target_exports, path, target_unstable)
             let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name)
-            # Free-fn protocol bounds for the root file. Stdlib/prelude
+            # Free-fn protocol bounds for the root file. Stdlib/core
             # bounded aggregates already dispatch their op via a `_loop`
             # helper, so the existing post-mono validator covers them;
             # only root-file fns whose body never dispatches the bound
@@ -4040,23 +4040,23 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `tag_target_decls_module_origin` re-keys the decls, so the
             # records match the monomorphiser's `mo`.
             let fn_bounds = rekey_fn_bounds(parsed.fn_bounds, target_mod_name)
-            # Every prelude file is also registered as a module under
+            # Every core file is also registered as a module under
             # its basename, so qualified calls into the stdlib
             # (`list.take(xs, n)`, `string.trim(s)`) resolve without an
-            # explicit `import list`. Prelude entries come first so an
+            # explicit `import list`. Core entries come first so an
             # `import` of a same-named module can still shadow with rule
             # B. The target's own ME comes last so its bare name shadows
-            # any same-named prelude (intentional: the file is
+            # any same-named core (intentional: the file is
             # "itself").
             let module_table = list_append(
-              list_append(prelude_mods, match expanded { EP_Mod(_, mt, _, _) -> mt }),
+              list_append(core_mods, match expanded { EP_Mod(_, mt, _, _) -> mt }),
               [target_me])
-            # Run rqc on the prelude decls with the same module table
-            # the main file uses, so `list.foo` calls inside a prelude
+            # Run rqc on the core decls with the same module table
+            # the main file uses, so `list.foo` calls inside a core
             # file reach the EField->EModCall rewrite (otherwise the
             # typer rejects them as "undefined name `list`"). Entries
-            # are collected before any prelude file is parsed so
-            # cross-prelude qualified calls (e.g. `set.kai` calling
+            # are collected before any core file is parsed so
+            # cross-core qualified calls (e.g. `set.kai` calling
             # `list.length`) resolve.
             # Rewrite qualified types `mod.T` to bare `T` (validated
             # against module_table) before rqc walks the bodies. Runs
@@ -4071,48 +4071,48 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # (no lowering to a disguised zero-arg fn). `qualtype_decl`
             # handles the DConst arm directly, so the const reaches the
             # qualified-type rewrite, the typer, and emit as a const.
-            let qualtype_errs = qtchk_decls(prelude_decls, module_table) +
+            let qualtype_errs = qtchk_decls(core_decls, module_table) +
                                 qtchk_decls(expanded_decls, module_table)
-            let qt_prelude = qualtype_decls(prelude_decls, module_table, path)
+            let qt_core = qualtype_decls(core_decls, module_table, path)
             let qt_expanded = qualtype_decls(expanded_decls, module_table, path)
-            let qualified_prelude = rqc_decls(qt_prelude, module_table, path)
+            let qualified_core = rqc_decls(qt_core, module_table, path)
             let qualified_decls = rqc_decls(qt_expanded, module_table, path)
             # Emit warnings for consumed `#unstable` exports the user
             # hasn't opted into. Runs over the user
-            # decls only (preludes are part of the stdlib and the
+            # decls only (cores are part of the stdlib and the
             # consumer never owns them, but stdlib has no unstable
-            # decls today; including the prelude here keeps the
+            # decls today; including the core here keeps the
             # behaviour consistent if that ever changes).
             unstable_check_decls(qualified_decls, module_table,
                                   package_name, unstable_optins, path)
-            # Mangle non-`pub` prelude DType names
+            # Mangle non-`pub` core DType names
             # (`crypto.hash::SplitN`, `regexp::NB_FragR`, etc.) so
             # the variant-table lookup cannot collide with a
             # user-side redeclaration of the same bare name. The
-            # `prelude_segs` accumulator from `load_preludes`
+            # `core_segs` accumulator from `load_core_files`
             # carries the per-file `(mod_name, decls)` split that
             # the post-`load` flatten erases — we use it to
-            # establish each prelude decl's home module
+            # establish each core decl's home module
             # unambiguously, since `DType` has no `module_origin`
             # field of its own and the streaming
             # `decl_home_hint_reset` heuristic would carry the
-            # previous prelude's home into a DType at the head of
+            # previous core's home into a DType at the head of
             # the next file. The root-file decls
             # (`qualified_decls`) are left untouched: they cannot
-            # reference a mangled prelude private type (those
+            # reference a mangled core private type (those
             # names are not exported) and the user is free to
             # redeclare the same bare name.
-            let qualified_prelude_mangled =
-              mangle_prelude_segments(qualified_prelude, prelude_segs,
-                                         list_length(qualified_prelude))
-            let merged_raw = list_append(qualified_prelude_mangled, qualified_decls)
-            # `pub` enforcement at module + prelude boundaries. After
+            let qualified_core_mangled =
+              mangle_core_segments(qualified_core, core_segs,
+                                         list_length(qualified_core))
+            let merged_raw = list_append(qualified_core_mangled, qualified_decls)
+            # `pub` enforcement at module + core boundaries. After
             # `rqc_decls` has rewritten every
             # `EField(EVar(mod), fn)` into `EModCall(mod, fn)`
             # (which carries qualified-export gating via
             # `me_has_export`), the remaining `EVar(nm)` bare-name
             # references are unqualified lookups. The validator
-            # consumes the prelude / import / root decl streams
+            # consumes the core / import / root decl streams
             # as three contiguous segments so the home-module
             # tracker can reset cleanly at each boundary —
             # untagged DType / DEffect decls at the head of the
@@ -4125,27 +4125,27 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # root-file tail (own decls, untagged-or-target-tagged).
             let imports_decls = pae_take(qualified_decls, n_imports_raw)
             let root_only_decls = pae_drop(qualified_decls, n_imports_raw)
-            # `prelude_segs` retains the per-file (mod, decls) split
-            # from `load_preludes`. The validator builds the
+            # `core_segs` retains the per-file (mod, decls) split
+            # from `load_core_files`. The validator builds the
             # `(name, home, is_pub)` table from these segments
             # (so per-file home boundaries are unambiguous for
             # DType / DEffect / DProtocol that carry no
             # `module_origin` of their own) and walks the
-            # post-rqc `qualified_prelude` bodies — those carry the
+            # post-rqc `qualified_core` bodies — those carry the
             # `EField(mod, fn) -> EModCall(mod, fn)` rewrite. Both
-            # views of the prelude have the same shape because
+            # views of the core have the same shape because
             # `rqc_decls` only rewrites Expr trees; the Decl
             # `module_origin` annotation and the `is_pub` flag
             # survive.
             let pub_access_errs = validate_pub_access(
-              prelude_segs, qualified_prelude,
+              core_segs, qualified_core,
               imports_decls, root_only_decls,
               target_mod_name, path)
             # Reject two `type T = ...` with the same name in the
             # root file, and the reserved builtin type names. A name
-            # that merely collides with a prelude / imported module is
+            # that merely collides with a core / imported module is
             # NOT rejected — that is shadowing, resolved at the merge
-            # point where a local decl drops the prelude one.
+            # point where a local decl drops the core one.
             let type_name_coll_errs = validate_type_name_collisions_decls(
               root_only_decls, path)
             # Reject two `fn foo` decls in the same root file. Mirrors
@@ -4208,7 +4208,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let merged = strip_kind_decls(merged_kr)
             # Validate that every contract predicate calls only
             # effect-pure fns (declared row `REmpty`). `merged`
-            # carries prelude + every imported module, so cross-module
+            # carries core + every imported module, so cross-module
             # callees resolve. Errors accumulate; the count is folded
             # into the exit code further below.
             let pred_errs = validate_contract_predicates_decls(
@@ -4606,7 +4606,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 else {
                   # Build the per-compile head-owner cache once from the
                   # post-`expand_imports` decl stream + the
-                  # full module table (preludes + transitively imported +
+                  # full module table (cores + transitively imported +
                   # the target file itself). The typer threads this cache
                   # into `synth_pipe_dispatch` so any in-scope `pub type`
                   # whose declaring module exports the canonical
@@ -4655,7 +4655,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # Emit a warning for each ambiguous bare-name that the
                   # root file ACTUALLY references. Firing one per
                   # ambiguous export regardless of usage produces
-                  # spurious warnings on hello-world once the prelude
+                  # spurious warnings on hello-world once the core
                   # exports `map`, `repeat`, etc. from two modules, so
                   # the body walk is bounded by the root file's AST
                   # (decls with mo == None).
@@ -4665,7 +4665,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # Warn on unused local `let` and pattern bindings in
                   # the root file's decls. Scoped to root
                   # decls (mo == None) by `report_unused_in_decl` so
-                  # prelude code can keep its own conventions. Warnings
+                  # core code can keep its own conventions. Warnings
                   # only — they never fail compilation.
                   report_unused_in_decls(path, typed_prog.decls)
                   if typed_prog.errs != 0 { typed_prog.errs }
@@ -4899,7 +4899,7 @@ fn parse_batch_entries_loop(lines: [String], acc: [BatchEntry]) : [BatchEntry] =
 
 # Internal batch driver. Loads (lexes + parses) the core module set
 # ONCE and compiles every listed input against that shared
-# `PreludesLoaded`, so the core's lex + parse is paid a single time for
+# `CoresLoaded`, so the core's lex + parse is paid a single time for
 # the whole batch instead of once per file. The per-file typecheck and
 # codegen still run fresh — only the core load is amortised — so each
 # output is byte-identical to a standalone build. Each input's `.c` is
@@ -4925,11 +4925,11 @@ fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
     }
   }
 
-# Compile each entry against the shared preludes. Failures accumulate
+# Compile each entry against the shared cores. Failures accumulate
 # into `nfail`; a per-file failure is reported but does not abort the
 # batch, so the harness sees every result in one pass.
 fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
-                       psegs: [PreludeSegment], opts: CliOptions,
+                       psegs: [CoreSegment], opts: CliOptions,
                        nfail: Int) : Int / Console + File = match entries {
   [] -> nfail
   [BE(inp, outp), ...rest] -> {
@@ -4945,7 +4945,7 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
   }
 }
 
-#[doc("Run the compiler for the given CliOptions: load preludes, dispatch the mode (build/test/check/fmt/library/dump), and return the process exit code. Driver entry point called by fn main().")]
+#[doc("Run the compiler for the given CliOptions: load cores, dispatch the mode (build/test/check/fmt/library/dump), and return the process exit code. Driver entry point called by fn main().")]
 pub fn run(opts: CliOptions) : Int / Console + File {
   match opts.mode {
     MHelp -> { usage(); 0 }
@@ -4959,12 +4959,12 @@ pub fn run(opts: CliOptions) : Int / Console + File {
         _         -> 1
       }
     }
-    MEmitPreludeCache -> match opts.path {
+    MEmitCoreCache -> match opts.path {
       None -> {
-        eprint("kaic2: --emit-prelude-cache requires a source .kai file")
+        eprint("kaic2: --emit-core-cache requires a source .kai file")
         2
       }
-      Some(p) -> emit_prelude_cache_for(p, opts.cache_sha)
+      Some(p) -> emit_core_cache_for(p, opts.cache_sha)
     }
     MBatchList -> match opts.path {
       None -> {
@@ -4978,14 +4978,14 @@ pub fn run(opts: CliOptions) : Int / Console + File {
       Some(p) -> {
         # The core module set (core/* + protocols + effects + array) is
         # loaded automatically from the compile-time `stdlib_path()`.
-        # No `--prelude` flag, no driver assistance: every program
+        # No `--core` flag, no driver assistance: every program
         # receives core. To swap which stdlib feeds the compiler,
         # rebuild with a different KAI_STDLIB_PATH macro.
         # The core cache lives in the same per-project .kai-cache
         # directory the user cache uses (the user file's directory),
         # under the same `--user-cache` opt-in.
-        let prelude_loaded = load_core(dir_of(p), opts.user_cache)
-        match prelude_loaded {
+        let core_loaded = load_core(dir_of(p), opts.user_cache)
+        match core_loaded {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
@@ -4999,13 +4999,13 @@ pub fn run(opts: CliOptions) : Int / Console + File {
   }
 }
 
-# Lex+parse a single prelude source, strip its tests, tag every DFn
+# Lex+parse a single core source, strip its tests, tag every DFn
 # with module_origin, then emit the KAB1 cache blob to stdout. The
 # driver (bin/kai) captures stdout,
 # writes it to a `.tmp` file, fsyncs, and renames atomically into the
 # cache directory. `sha_arg` is the 64-char hex sha256 of the source
 # (caller-supplied); empty string emits the all-zero placeholder.
-fn emit_prelude_cache_for(source_path: String, sha_arg: String) : Int / Console + File {
+fn emit_core_cache_for(source_path: String, sha_arg: String) : Int / Console + File {
   match read_file(source_path) {
     Err(msg) -> { eprint("kaic2: #{source_path}: #{msg}"); 1 }
     Ok(src) -> {
@@ -5018,13 +5018,13 @@ fn emit_prelude_cache_for(source_path: String, sha_arg: String) : Int / Console 
           None -> 1
           Some(ds_raw) -> {
             # Cache blobs never carry doc wrappers — strip them exactly
-            # like the non-cached `load_prelude` path so both loaders
+            # like the non-cached `load_core_file` path so both loaders
             # produce the same decl stream.
             let pre_docs = doc_strip_all(source_path, src, ds_raw)
             if pre_docs.errs > 0 { 1 } else {
             let ds = pre_docs.decls
-            let mod_name = prelude_module_name(source_path)
-            let kept = strip_prelude_tests(ds, [])
+            let mod_name = core_module_name(source_path)
+            let kept = strip_core_tests(ds, [])
             let tagged = tag_decls_module_origin(kept, mod_name)
             let sha = if sha_arg == "" {
               "0000000000000000000000000000000000000000000000000000000000000000"

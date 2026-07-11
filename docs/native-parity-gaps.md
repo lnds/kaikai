@@ -227,8 +227,8 @@
 >     `ls_fresh_reg` acuña `.t<rc>` (`.` is lexer-rejected in a surface
 >     ident, so no collision is possible) + `rspec_add` widens to box on a
 >     slot conflict (soundness floor). jwt_encoder reclassified (char/hex).
->   - **bit-op prelude shims** (missing-symbols, 2 closed: bits_basic,
->     bits_dotted). The native runtime never defined `kaix_prelude_bit_*`;
+>   - **bit-op core shims** (missing-symbols, 2 closed: bits_basic,
+>     bits_dotted). The native runtime never defined `kaix_core_bit_*`;
 >     12 additive shims in runtime_llvm.c reproduce the C oracle's inline
 >     operator + refcount exactly. crypto_hash reclassified (flaky SIGSEGV).
 >   - **stateful return-clause `state`/`log` bind** (unbound-register
@@ -289,7 +289,7 @@ fixtures surfaced their masked runtime bug.
 | no-effect-handler | 0 | **CLOSED (burn-down 6 + np-handlers).** Burn-down 6 closed the Spawn/Clock/NetTcp slice (actors/mailbox/http_server/date) — those effects carry a default block, so the synth-handler superset (`kir_synth_handler_effects`) gave their dead-code perform a dispatch shape. The np-handlers lane closed the last residual: `ReadFault` (NO default block, dragged into a `from_list`-only stream program via `stdlib/stream.kai`'s dead `pump_lines : … / File + ReadFault`) — `kir_synth_handler_effects` now iterates DECLARED effects (not `install_order`) and synthesises an op→field-index map straight from the `effect` decl for a no-default-block effect, so the dead `KPerform` lowers to the C-direct dispatch shape instead of aborting the build. The whole-corpus no-handler abort count is now 0. `stream_early_stop` itself stays a gap, RECLASSIFIED to **pipe-lowering** (its `|?`/`|`/`|>` lower to no-op unit → `count=0`); the handler abort that masked it is gone. |
 | clause-param-origin | 7 | `unsupported KIR node (subset gap): clause param origin` — the subset-2b alias-dispatch clause shape the native walk rejects. Includes `ctor_field_effect_row` (#801) and the remaining `stream_*` (`stream_abort_leak`/`stream_mock_disk`/`stream_skip_policy`) whose carrier hits the alias-dispatch clause. |
 | jwt char/hex decode | 1 | (reclassified from Call-param-mismatch) `jwt_encoder` now BUILDS + RUNS after burn-down 5 closed the namespace-collision root cause for the 5 map/fx modules; its decode diverges (char/hex, the regex/json family). |
-| crypto flaky SIGSEGV | 1 | (reclassified from missing-symbols) `crypto_hash_basic` LINKS after burn-down 5's `kaix_prelude_bit_*` shims closed bits_basic/bits_dotted; it SIGSEGVs intermittently (a flaky native memory bug). |
+| crypto flaky SIGSEGV | 1 | (reclassified from missing-symbols) `crypto_hash_basic` LINKS after burn-down 5's `kaix_core_bit_*` shims closed bits_basic/bits_dotted; it SIGSEGVs intermittently (a flaky native memory bug). |
 
 > Several fixtures show more than one signature (e.g. `free_fall` shows
 > both a `^` type-mismatch and an exit-diff); each is listed once below
@@ -317,7 +317,7 @@ that appears all over the corpus.
    native `nprim_op_sym` maps `neg` → `kaix_neg` (the one-arg helper,
    mirror of emit_c's `kai_op_neg`).
 
-2. **locals-shadow-imports.** `lower_var` consulted the EFn / prelude
+2. **locals-shadow-imports.** `lower_var` consulted the EFn / core
    fn-value table BEFORE the local-binder check, so a param / `let` /
    match binder named like a stdlib `pub fn` (`init` vs `list.init`,
    `sum`, `head`, `acc`, …) lowered to a `KClosure` over the stdlib thunk
@@ -546,7 +546,7 @@ examples/packages/cross_package_effects/consumer/main.kai
 #  (char/hex, the regex/json family)]
 examples/stdlib/jwt_encoder.kai
 # crypto flaky SIGSEGV (reclassified from missing-symbols) (1)
-# [burn-down 5 added the kaix_prelude_bit_* shims, closing bits_basic +
+# [burn-down 5 added the kaix_core_bit_* shims, closing bits_basic +
 #  bits_dotted; crypto_hash_basic now links but SIGSEGVs intermittently]
 examples/stdlib/crypto_hash_basic.kai
 # cross-platform Linux-only SIGSEGV (pass on macOS) (2)

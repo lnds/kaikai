@@ -186,9 +186,9 @@ Tier 2 boundary (no demo a user would try in a tutorial hits them).
   short-circuit phi returns `lhs` in the early-exit branch, so consuming
   the truthy probe's argument would alias-free a value still referenced
   downstream.
-- **`kai_prelude_*` C helpers that borrow** — `9fe6f6d` flipped 12 of
+- **`kai_core_*` C helpers that borrow** — `9fe6f6d` flipped 12 of
   them to callee-consume (print/eprint, int/real string conversion,
-  array & list ops). The remaining hand-written prelude helpers in
+  array & list ops). The remaining hand-written core helpers in
   `runtime.h` still borrow rather than consume.
 - **Stage 0 eager-dup retrofit** — `emit_ident_value` in `stage0/emit.c`
   still emits `kai_internal_dup` on every multi-use / captured /
@@ -230,7 +230,7 @@ Remaining Tier 2 polish (perf, not honesty):
 
 | Item | Status |
 |---|---|
-| Remaining `kai_prelude_*` borrowing helpers | open — audit `runtime.h`, mirror the `9fe6f6d` 12-helper callee-consume pattern |
+| Remaining `kai_core_*` borrowing helpers | open — audit `runtime.h`, mirror the `9fe6f6d` 12-helper callee-consume pattern |
 | Stage 0 eager-dup retrofit (lambda-body lets) | open — per-lambda-body counter to extend the `7ab3d64`/`b3b1e2f` fast path |
 
 ## Unboxing — Phases 1–4

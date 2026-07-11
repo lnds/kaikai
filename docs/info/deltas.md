@@ -58,6 +58,16 @@ Every entry is verified against the compiler; when in doubt,
 - Side effects are in the type: printing needs `/ Stdout` in the
   signature. An effectful call inside a pure signature is a type
   error, not a warning.
+- How many elements? `length` on the ordered/indexable ones (`list`,
+  `string`, `vec`, `string_builder`); `size` on the unordered ones
+  whose abstraction is cardinality (`map`, `set`, `hashmap`, `hashset`,
+  `queue`, `stack`). Not `len` everywhere: the name tells you whether
+  positions exist. `list.count(p)` is count-*if* (how many satisfy `p`),
+  and `stream.count` drains a lazy stream — neither is a length.
+- Left fold is `foldl` on every collection (`list`, `vec`, `stream`,
+  `map`), with `foldl`/`foldr` where both directions exist. `fold` is a
+  deprecated alias for `foldl`; `reduce` is the list-builtin sibling of
+  `map`/`filter`/`each` and stays.
 
 If a form is not in `kai info syntax`, it does not exist — check
 there before inventing syntax. To look up one API, use

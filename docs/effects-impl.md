@@ -1067,8 +1067,8 @@ exercise the per-op generics machinery end to end.
 
 m7b #2c was de-scoped to docs (this section + the §`Mutable`
 §*Migration plan* in `docs/effects-stdlib.md`). The original
-plan called for dropping `array_*` from `prelude_names` /
-`prelude_table`; the implementation kept them so the array-
+plan called for dropping `array_*` from `core_names` /
+`core_table`; the implementation kept them so the array-
 index sugar (m7b #6) and the `var` specialisation (m7b #16)
 can emit bare calls without minting `Mutable.*` chains. The
 bare and `Mutable.*` paths share the runtime, so the
@@ -1102,9 +1102,9 @@ preserved below for posterity.
 - `EffectOp = EOp(name, params, ret, line, col)` — no slot for
   per-op tparams. ~10 pattern-match sites across the file.
 - `array_make / array_get / array_set / array_length / array_grow`
-  are **prelude builtins** (`prelude_table` line ~4714, type
+  are **core builtins** (`core_table` line ~4714, type
   schemes in `infer_initial_env` line ~7666, listed in
-  `prelude_names` line ~4067). Their type schemes already use
+  `core_names` line ~4067). Their type schemes already use
   HM polymorphism (`scheme([0], …)`) — what is missing is the
   `Mutable` row.
 - `Mutable` is **not** declared and **not** builtin-injected. No
@@ -1169,7 +1169,7 @@ Test fixtures (new, under `examples/effects/m7b_2a_*.kai`):
   not declared at the op (should be a clear resolver error).
 
 Scope envelope: ~6–8 commits, comparable to m7b #11 a-h. **Do
-not** touch `Mutable`, prelude, or stage 2 self-host code paths.
+not** touch `Mutable`, core, or stage 2 self-host code paths.
 
 ##### m7b #2b — `Mutable` migration
 
@@ -1191,11 +1191,11 @@ Touches:
    user-written `with Mutable { … }`.
 3. **Default handler** — emit a default handler for `Mutable`
    whose clauses call directly into the existing
-   `kai_prelude_array_*` C entry points and `resume`. The runtime
+   `kai_core_array_*` C entry points and `resume`. The runtime
    piece is small because the C side already exists.
-4. **Prelude removal** — drop `array_make / array_length /
+4. **Core removal** — drop `array_make / array_length /
    array_get / array_set / array_grow / ref_*` from
-   `prelude_names` and `prelude_table`. They no longer exist as
+   `core_names` and `core_table`. They no longer exist as
    bare names; the only path is through `Mutable`.
 5. **Compiler self-call rewrite** — every `array_make(…)` /
    `array_get(…)` / etc. inside `stage2/compiler.kai` becomes
@@ -1210,7 +1210,7 @@ Touches:
 The self-host break is the load-bearing risk. Mitigation: land
 this sub-PR as one atomic commit (or a tightly-grouped pair
 where #1 = decl + injection + default handler runtime, #2 =
-prelude removal + compiler rewrite + Mutable.* migration).
+core removal + compiler rewrite + Mutable.* migration).
 Self-host gate (`make selfhost` + `make -C stage2 selfhost-llvm`)
 must be green before the second commit.
 
@@ -1581,26 +1581,26 @@ page the way they are written.
      `m7b_2a_op_in_parametric` (op tparam stacked on a
      parametric effect).
    - **#2b — `Mutable` introduction** (declaration + unconditional
-     injection + default handler wrapping the prelude
-     `kai_prelude_array_*` helpers). **Landed.** Diverges from the
-     original plan in one important way: the prelude `array_*`
+     injection + default handler wrapping the core
+     `kai_core_array_*` helpers). **Landed.** Diverges from the
+     original plan in one important way: the core `array_*`
      calls inside `stage2/compiler.kai` itself are NOT migrated to
      `Mutable.array_*`. Reason: Doc B specifies
      `array_set : (Array[T], Int, T) -> Unit`, but stage 2's
-     prelude returns `Array[T]` so internal
+     core returns `Array[T]` so internal
      `xs = array_set(xs, i, v)` chains type-check. Migrating the
      compiler's call sites would require either rewriting every
-     such chain (~hundreds of sites) or matching the prelude shape
+     such chain (~hundreds of sites) or matching the core shape
      in the Mutable signature (which then diverges from Doc B at
      the user surface). The Mutable op signatures here mirror the
-     prelude (Array[T] return) so the compiler sources stay
+     core (Array[T] return) so the compiler sources stay
      untouched and stage 2 keeps no `Mutable` in its row.
      Verified by `m7b_2b_mutable_default` (runtime default) and
      `m7b_2b_mutable_intercept` (user handler). `ref_*` ops
      deferred — kaikai has no surface `Ref[T]` type today.
    - **#2c — Mutable internal migration audit**. **Landed as
      "no migration" decision.** Doc B §`Mutable` *Migration plan*
-     anticipated migrating every prelude `array_*` call inside
+     anticipated migrating every core `array_*` call inside
      `stage2/compiler.kai` to `Mutable.array_*` so the compiler's
      internal helpers also pay `Mutable` in their row (with the
      runtime default making it transparent). The audit here
@@ -1623,7 +1623,7 @@ page the way they are written.
         choice — see CLAUDE.md "Three-stage bootstrap").
 
      Neither is in scope for m7. Decision: keep the current shape
-     (compiler uses prelude `array_*` raw, with no Mutable in its
+     (compiler uses core `array_*` raw, with no Mutable in its
      row; users get `Mutable.array_*` with full effect tracking).
      The "two parallel APIs for mutation" cost is transitory —
      when stage 2 stops being bootstrapped from stage 0, the
@@ -1825,18 +1825,18 @@ page the way they are written.
     — always true; `name` does not escape into a closure or
     function argument — `body_escapes` walks the body checking;
     `init` is a normal expression — `init_is_safe` allows
-    literals, EVar, prelude arithmetic, and non-effect calls)
+    literals, EVar, core arithmetic, and non-effect calls)
     the desugar swaps the `with State[T] as name { ... }`
     handler for `let name__slot = array_make(1, init); body'`
     where `body'` rewrites every `name.get()` to
     `array_get(name__slot, 0)` and every `name.set(v)` to
-    `{ let _ = array_set(name__slot, 0, v); () }`. Uses prelude
+    `{ let _ = array_set(name__slot, 0, v); () }`. Uses core
     `array_*` (stage 0 visible, no `Mutable` row) so the
     surrounding row stays clean. When any trigger fails the
     canonical handler runs — verified by
     `m7b_16_var_escape_falls_back`. Specialisation verified by
     `m7b_16_var_specialised`: the generated C calls
-    `kai_prelude_array_*` directly with no `EvState` evidence
+    `kai_core_array_*` directly with no `EvState` evidence
     struct or push/pop, exactly the "stack slot" Doc B promised.
     **Landed.**
 17. **Alias-rewrite shadow tracking** — the pre-emit

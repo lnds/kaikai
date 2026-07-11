@@ -414,7 +414,7 @@ HEAD bullet for the full 0.79 → 0.94 arc.
    stdlib re-parsing on every `kai build` invocation. Required
    lanes (prerequisite chain):
 
-   - ✅ #453 — runtime `prelude_read_bytes` (LSP precursor) — **shipped**.
+   - ✅ #453 — runtime `core_read_bytes` (LSP precursor) — **shipped**.
    - ✅ #454 — compiler library mode (typed AST retention + span index
      for queries, selfhost waiver). **Shipped** as the
      `--library-mode` flag + `compile_to_module` in-process API; see

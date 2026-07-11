@@ -135,7 +135,7 @@ Match function returns the leftmost-longest match (greedy semantics).
 
 - **Performance**: pure-kaikai NFA simulator allocates list-of-states per input char. For pathological regexes + long inputs, this can be slow. RE2 is O(n·m); our constant factor will be higher than C, but acceptable for typical use (URLs, log lines, tokens). Bench at the end.
 - **Memory**: capture groups copy position maps on NFA branching. Cap at "match" granularity (don't capture across `find_all` iterations).
-- **Selfhost stability**: regexp is an optional prelude. Drop-in if anything breaks.
+- **Selfhost stability**: regexp is an optional core. Drop-in if anything breaks.
 - **Edge cases in pattern parser**: empty alternation `(|)`, nested classes, backslash escapes inside classes. Test heavily.
 
 ## Open questions

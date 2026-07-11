@@ -1187,10 +1187,10 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	for cell in acc_int acc_real flag post; do \
 	  grep -q "kair_$${cell}__slot" build/issue_1179_cell_register.c \
 	    || { echo "issue_1179 FAIL ($$cell not promoted to a raw cell)"; exit 1; }; \
-	  grep -q "kai_$${cell}__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	  grep -q "kai_$${cell}__slot = kai_core_array_make" build/issue_1179_cell_register.c \
 	    && { echo "issue_1179 FAIL ($$cell still an array slot)"; exit 1; } || true; \
 	done; \
-	grep -q "kai_s_txt__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	grep -q "kai_s_txt__slot = kai_core_array_make" build/issue_1179_cell_register.c \
 	  || { echo "issue_1179 FAIL (String var lost its array slot)"; exit 1; }; \
 	./$(TARGET) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
 	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
@@ -6237,7 +6237,7 @@ test-tco-param-shadow: $(TARGET) build
 # discipline gaps that survived the m5.x flip: match-scrutinee
 # decref at exit, kai_op_truthy on fresh `if` conds, kai_field
 # borrowing reads in record-pattern test paths, and the
-# kai_prelude_mailbox_* helpers consuming their KaiValue * params.
+# kai_core_mailbox_* helpers consuming their KaiValue * params.
 # A regression in any of these surfaces under the asan sibling as
 # a UAF (decref of a singly-held value the runtime later double-
 # frees) or as a stdout diff against the golden.
@@ -6256,7 +6256,7 @@ test-perceus-issue82: $(TARGET) build
 
 # ASAN+UBSan sibling for the issue #82 leak-audit. The fixes
 # touch emit-side decref discipline (stages 1/2 plus LLVM if) and
-# the kai_prelude_mailbox_* helpers in stage0/runtime.h; ASan
+# the kai_core_mailbox_* helpers in stage0/runtime.h; ASan
 # catches a regression that double-frees the cond / scrutinee /
 # message, UBSan flags any signed-overflow that slips through the
 # new mailbox transfer paths.

@@ -117,7 +117,7 @@ exactly the same way as `panic` and unfilled `?`.
 Predicates are **decidable**. The constraints that keep them so:
 
 1. **Pure**: no effects, no user-defined function calls except
-   prelude predicates explicitly marked `[<refinement_pure>]`
+   core predicates explicitly marked `[<refinement_pure>]`
    (e.g. `is_finite`, `is_nan`, regex constants).
 2. **Linear in the AST**: interval propagation over comparisons,
    constant-folding over `&&` / `||` / `!`.
@@ -265,7 +265,7 @@ Allowed:
 - Boolean operators: `&&`, `||`, `!`.
 - Constants and `self` / arguments / `result`.
 - Field access on records (`acc.balance`).
-- Prelude predicates marked `[<refinement_pure>]`: `is_finite`,
+- Core predicates marked `[<refinement_pure>]`: `is_finite`,
   `is_nan`, `length` (on lists/strings), `is_some`, `is_none`,
   string `matches ~r/regex/` (regex literals lex as the
   Elixir-style sigil `~r/.../`; full-match semantics).
@@ -512,7 +512,7 @@ matching its predicate without re-checking.
    Predicate = PCmp(CmpOp, PExpr, PExpr)
              | PAnd(Predicate, Predicate) | POr | PNot
              | PMatches(PExpr, Regex)
-             | PCall(PreludePred, [PExpr])
+             | PCall(CorePred, [PExpr])
    PExpr = PVar(Name) | PSelf | PResult | PLit | PField(PExpr, Name)
          | PArith(ArithOp, PExpr, PExpr)
    ```
@@ -571,7 +571,7 @@ matching its predicate without re-checking.
 
 ### Stdlib changes
 
-A small set of `[<refinement_pure>]` prelude predicates:
+A small set of `[<refinement_pure>]` core predicates:
 
 ```kai
 fn is_finite(x: Real) : Bool [<refinement_pure>]

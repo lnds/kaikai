@@ -514,7 +514,7 @@ and stays untouched as the oracle. Everything else is off the critical path.**
 >   native-vs-C parity its frozen `.ll` path was dead weight whose stale
 >   failures kept a gate red without protecting anything. `emit_llvm.kai`,
 >   `--emit=llvm`, `--backend=llvm`, and the C↔LLVM-text parity gate were
->   removed. `stage0/runtime_llvm.c` stays — it is the shared `kaix_prelude_*`
+>   removed. `stage0/runtime_llvm.c` stays — it is the shared `kaix_core_*`
 >   forwarder the native backend links against.
 > - **C-direct is the sufficient oracle.** It is mature (1.78 fix/KLOC), already
 >   the differential safety net, and validates behaviour ("same program, same
@@ -579,7 +579,7 @@ grow, not after.
   `LLVMBuildCall2`, `LLVMBuildBr`, `LLVMBuildCondBr`, the switch/phi builders, …)
   to construct the module IN MEMORY, runs the pass pipeline, and emits the object
   file directly — **no `.ll` text, no `clang` subprocess, one process.** Wired
-  through the Path-1 prelude-primitive mechanism (§7.2): ~30–60 forwarders to the
+  through the Path-1 core-primitive mechanism (§7.2): ~30–60 forwarders to the
   C API in `stage2/runtime.h`, with stage2 linked against `libLLVM` (discovered
   via `llvm-config`, static-linked into the binary so brew users need no LLVM —
   the Rust/Zig/Julia model). Enters behind an opt-in flag (e.g.
@@ -636,7 +636,7 @@ grow, not after.
   kaic2 is compiled by kaic1 (type-blind), which (a) emitted the `llvm_*` prims
   through the generic `kai_apply` closure path (a non-callable forwarder → runtime
   panic) and (b) ran Perceus dup/drop over raw handles (RC corruption). Fixed by a
-  stage1 `rprelude_table` (per-arg marshalling + result-box) and a syntactic
+  stage1 `rcore_table` (per-arg marshalling + result-box) and a syntactic
   Perceus exclusion of handle params + handle-prim lets. `main → 42` now emits →
   links → runs reproducibly (exit code + stdout == C-direct; both 0 — the return
   value is NOT an exit code, the brief's "exit 42" was a wrong observable). Wired
@@ -815,8 +815,8 @@ stated goal.
 
 **Feasibility verdict (asu review, 2026-06-08): viable today, with one repr fix.**
 
-1. **Vehicle: Path-1 prelude primitives — but handles are a non-RC newtype, NOT
-   `Int`.** The compiler-internal prelude mechanism (`docs/ffi.md` Path 1: runtime
+1. **Vehicle: Path-1 core primitives — but handles are a non-RC newtype, NOT
+   `Int`.** The compiler-internal core mechanism (`docs/ffi.md` Path 1: runtime
    forwarder + thunk + typer registration, the 3-site pattern stdlib already uses
    for libm/POSIX) is the right vehicle, and the wiring does not explode — the LLVM
    C API surface KIR needs is ~30–60 functions, not hundreds. **But** passing an
@@ -896,9 +896,9 @@ backend's libLLVM dependency is opt-in; it never enters the bootstrap chain.
   gates extend.
 
 For the §7.2 in-process backend (Lane 1):
-- `docs/ffi.md` Path 1 — the compiler-internal prelude-primitive mechanism (runtime
+- `docs/ffi.md` Path 1 — the compiler-internal core-primitive mechanism (runtime
   forwarder + thunk + typer registration) that the libLLVM C-API binding rides.
-- `stage0/runtime_llvm.c` (1243 LOC) — the `kaix_prelude_*` C forwarders the native
+- `stage0/runtime_llvm.c` (1243 LOC) — the `kaix_core_*` C forwarders the native
   object links against (originally the llvm-text backend's, now shared with and
   owned by the in-process backend).
 - the in-process backend links stage2 against an `llvm-config`-driven static

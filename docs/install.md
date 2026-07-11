@@ -53,7 +53,7 @@ export KAI_BACKEND=c
 | `CC`            | C compiler invoked by the C backend / the native object link (default: `cc`). |
 | `CFLAGS`        | Extra flags appended to `CC`. |
 | `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
-| `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib preludes. |
+| `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib core modules. |
 
 ## The native backend and libLLVM
 

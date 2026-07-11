@@ -4,7 +4,7 @@
 #
 # stdlib is normally pulled into user programs via core auto-load or
 # `import`, both of which route the file through `expand_imports`. The
-# same-module name-collision validators run inside `load_prelude` and
+# same-module name-collision validators run inside `load_core_file` and
 # `resolve_module` (per-module, before the decls join the global
 # stream), so a duplicate `fn foo` (or `type T`, `effect E`, `const N`,
 # `axiom A`) inside a stdlib file is caught at load time.

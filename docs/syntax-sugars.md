@@ -468,7 +468,7 @@ both; a missing `Mutable` produces the standard
 `with Mutable { ... }` or adding `Mutable` to the signature.
 
 Out-of-bounds access (`i < 0` or `i >= Mutable.array_length(a)`)
-panics via the runtime's audited escape (`kai_prelude_panic`);
+panics via the runtime's audited escape (`kai_core_panic`);
 `Mutable` ops do not return `Option[T]` for out-of-bounds. Same
 semantics in the sugar as in the underlying ops — see Doc B
 §`Mutable` for the full statement.
@@ -682,7 +682,7 @@ unchanged. The sugar is purely additive.
 
 **Stdlib types**: `stdlib/core/tuple.kai` declares
 `Pair[a, b]`, `Triple[a, b, c]`, `Quad[a, b, c, d]`. They
-load automatically as part of the core prelude.
+load automatically as part of the core.
 
 **Why named accessors, not `.0 / .1`**: the lexer accepts
 only identifiers (and a few keywords) after `.`; numeric
@@ -913,7 +913,7 @@ ECall(EField(EVar("complex"), "mk"), [EReal(0.0), EReal(im)])
 `complex.mk(0.0, im)` by hand. The resolver later rewrites the
 qualified call to an `EModCall` once the `complex` module is
 bound. `bin/kai` auto-imports `stdlib/math/complex.kai` as part
-of the prelude (issue #245), so the desugared call resolves
+of the core (issue #245), so the desugared call resolves
 without an explicit `import math.complex`.
 
 ### What is **not** supported (Phase 2 of #267, blocked by #180)
