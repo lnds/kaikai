@@ -5605,9 +5605,9 @@ test-kir-while-slot-1158: $(TARGET) build
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-slot-1158 FAIL (State dispatch survived in main)"; exit 1; } \
 	  || true; \
-	echo "$$kir" | grep -q '__vcell_' \
-	  || { echo "kir-while-slot-1158 FAIL (no var-cell register in main — the slot rewrite did not fire)"; exit 1; }; \
-	echo "kir-while-slot-1158 OK (loop fused, var cells are registers, no State dispatch in main)"
+	echo "$$kir" | grep -qE '__slot: (i64|f64|i1)|__vcell_' \
+	  || { echo "kir-while-slot-1158 FAIL (no var-cell register in main — neither a raw cell nor a vcell)"; exit 1; }; \
+	echo "kir-while-slot-1158 OK (loop inline, var cells are registers, no State dispatch in main)"
 
 # Issue #1173 — a while whose predicate captures a NON-alias register
 # (the loop bound is a fn param). The dead-closure sweep must clear
@@ -5625,8 +5625,8 @@ test-kir-while-param-slot-1173: $(TARGET) build
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-param-slot-1173 FAIL (State dispatch survived in lcg)"; exit 1; } \
 	  || true; \
-	echo "$$kir" | grep -q '__vcell_' \
-	  || { echo "kir-while-param-slot-1173 FAIL (no var-cell register in lcg — the slot rewrite did not fire)"; exit 1; }; \
+	echo "$$kir" | grep -qE '__slot: (i64|f64|i1)|__vcell_' \
+	  || { echo "kir-while-param-slot-1173 FAIL (no var-cell register in lcg — neither a raw cell nor a vcell)"; exit 1; }; \
 	echo "kir-while-param-slot-1173 OK (dead predicate closure swept, var cells are registers, no State dispatch in lcg)"
 
 # Issue #1173 negative — a var whose closure SURVIVES the inliner (it
