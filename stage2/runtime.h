@@ -4596,12 +4596,21 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
         case KAI_VARIANT: {
             int n = v->var_n_args;
             if (n <= 0) return kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), 0, 0, NULL);
+            uint32_t mask = kai_slot_mask_of(v->variant_tag);
             KaiVarSlot *slots = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
             if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
-            for (int i = 0; i < n; ++i)
-                slots[i].ptr = kai_deep_copy_out(kai_var_slots(v)[i].ptr);
+            /* Respect the per-slot kind: a primitive slot (Int/Real/Enum)
+             * holds a raw scalar, NOT a pointer — deep-copying it as a
+             * pointer dereferences the integer as an address (UAF/segfault).
+             * Only pointer slots recurse. */
+            for (int i = 0; i < n; ++i) {
+                if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
+                    slots[i].ptr = kai_deep_copy_out(kai_var_slots(v)[i].ptr);
+                else
+                    slots[i] = kai_var_slots(v)[i];
+            }
             KaiValue *c = kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), n,
-                                        kai_slot_mask_of(v->variant_tag), slots);
+                                        mask, slots);
             free(slots);
             return c;
         }
