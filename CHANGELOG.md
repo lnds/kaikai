@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.5 (2026-07-11)
+
+### Added
+
+- **kinds**: kind Region — arenas as a kind over the Structural theory (closes #1123) (#1192)
+
+### Fixed
+
+- **typer**: roll back terminal-fusion purity-probe deferred fields (closes #1186) (#1190)
+
 ## v0.99.4 (2026-07-11)
 
 ### Fixed
