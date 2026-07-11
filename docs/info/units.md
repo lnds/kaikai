@@ -86,39 +86,70 @@ fn bad(a: Real<m>, b: Real<ft>) : Real<m> = a + b   # Metric vs Imperial
 fn main() : Unit / Stdout = { Stdout.print("unreachable") }
 ```
 
-A symbol may live in more than one kind (`unit USD` *and* `cur USD` from
-`kind Currency : AbelianGroup with cur`); they are distinct habitants
-that share the spelling `USD`.
+A symbol may live in more than one kind (`unit pt` *and* `fiat pt` from
+`kind Fiat : AbelianGroup with fiat`); they are distinct habitants
+that share the spelling `pt`.
 
 ### Resolving a shared symbol
 
-A bare `<USD>` that lives in several kinds resolves by a fixed
+A bare `<pt>` that lives in several kinds resolves by a fixed
 precedence — never order-of-declaration:
 
-1. **Qualification** — `<Currency.USD>` (or `<cur.USD>`, the introducer
+1. **Qualification** — `<Fiat.pt>` (or `<fiat.pt>`, the introducer
    form) names the kind explicitly.
-2. **`use kind Currency`** — a file-level default for bare habitants,
+2. **`use kind Fiat`** — a file-level default for bare habitants,
    the same `use` that opens an effect's ops.
 3. **Unique** — a symbol in exactly one kind needs no qualification.
 
-If none apply, a bare ambiguous `<USD>` is a compile error demanding
+If none apply, a bare ambiguous `<pt>` is a compile error demanding
 disambiguation.
 
 ```kaikai
-kind Currency : AbelianGroup with cur
-unit USD                                    # USD in Measure
-cur  USD                                    # USD also in Currency
-use kind Currency
+kind Fiat : AbelianGroup with fiat
+unit pt                                     # pt in Measure
+fiat pt                                     # pt also in Fiat
+use kind Fiat
 
 fn main() : Unit / Stdout = {
-  let a : Real<Currency.USD> = 10.0<Currency.USD>   # qualified → Currency
-  let b : Real<USD>          = 10.0<USD>            # bare → Currency (used)
+  let a : Real<Fiat.pt> = 10.0<Fiat.pt>     # qualified → Fiat
+  let b : Real<pt>      = 10.0<pt>          # bare → Fiat (used)
   Stdout.print("ok")
 }
 ```
 
 Because money and physics can share one abelian kind, `USD/kWh` (price
-per energy) type-checks when both inhabit `Measure`: `(USD/kWh)·kWh = USD`.
+per energy) type-checks when both inhabit `Measure` (`unit USD`):
+`(USD/kWh)·kWh = USD`.
+
+## Module kinds — `Currency` and money
+
+`Module` is the additive-only theory: habitants add and subtract
+within one kind and scale by a bare number, but have **no products
+or powers** — `USD^2`, `USD*EUR`, and `1/USD` are compile errors at
+the operator or annotation that would form them. The catalog
+declares `kind Currency : Module with currency`; the habitants
+(`USD`, `EUR`, ...) ship in `stdlib/money.kai`, where
+`Money[c: Currency]` is `Decimal<c>`:
+
+```kaikai
+import money
+import decimal as dec
+import decimal_proto
+
+fn main() : Unit / Stdout = {
+  let a: Money[USD] = 10.50<USD>
+  let total = a + 4.50<USD>          # same currency → Money[USD]
+  let k: dec.Decimal = 3
+  let scaled = total * k             # scalar action → Money[USD]
+  Stdout.print(money.to_string(scaled))
+}
+```
+
+`Money[USD] + Money[EUR]` is a unit mismatch; `Money[USD] *
+Money[USD]` cannot be formed. Cross-currency conversion is an
+explicit door: `money.convert(m, rate)` with the target currency
+pinned by annotation. Declaring your own additive kind works the
+same way (`kind Points : Module with points`).
 
 ## Caveats
 
