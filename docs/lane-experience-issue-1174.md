@@ -103,6 +103,15 @@ pre-map because they only became visible on contact:
 - The sugars harness greps `.err.expected` lines as *regex* — an
   `operator `*`` substring silently never matches. Golden lines
   avoid metacharacters.
+- The formatter's tparam decoder recognised the `#Unit` kind marker
+  only as a *suffix*, so a user-kind tparam (`c#Unit:Cur`) printed
+  its encoded name verbatim and the fmt_selfhost re-parse died on
+  the `#`. Pre-existing for every `[u: Metric]`-style signature, but
+  no formatted corpus contained one until this lane's fixtures.
+  Fixed by routing the decode through compiler/kinds.kai's real
+  `tp_kind_*` decoders (fmt already imports the module; the local
+  suffix-only duplicates dated from when the decoders lived beside
+  the typer).
 
 ## Fixtures
 
