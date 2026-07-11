@@ -31,6 +31,7 @@ import compiler.util
 import compiler.ast
 import compiler.modules
 import compiler.desugar
+import compiler.loop_lower
 import compiler.cell_scan
 
 #[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get|`/`__cell_set|` intrinsics).")]
@@ -202,14 +203,34 @@ fn cp_rw_kind(nm: String, k: ExprKind, line: Int, col: Int) : ExprKind = match k
     CpSet(v) -> EIntrinsic(cat2("__cell_set|", nm), [cp_rw(nm, v)])
     CpMiss -> ECall(cp_rw(nm, callee), map(args_, (a) => cp_rw(nm, a)))
   }
-  ELambda(ps, b) ->
-    if cp_params_bind(ps, nm) { k } else { ELambda(ps, cp_rw(nm, b)) }
+  # FUNCTION-EMISSION BOUNDARIES. A promoted cell is a local of the
+  # declaring frame; a construct whose body emits as a SEPARATE fn
+  # (a closure, a handler clause / return clause) cannot read it. The
+  # rewrite stops at those boundaries, so a cell use inside one stays
+  # an `array_get(EVar(x), ...)` — and the residual-use check reverts
+  # the promotion. The ONE exception is a loop intrinsic's own wrapper
+  # lambdas: both emitters paste those bodies inline into the
+  # enclosing frame, so the rewrite must follow them.
+  ELambda(_, _) -> k
+  EIntrinsic(inm, args_) ->
+    if is_loop_intrinsic(inm) { EIntrinsic(inm, map(args_, (a) => cp_rw_loop_arg(nm, a))) }
+    else { EIntrinsic(inm, map(args_, (a) => cp_rw(nm, a))) }
   EMatch(scr, arms) -> EMatch(cp_rw(nm, scr), map(arms, (a) => cp_rw_arm(nm, a)))
   EBlock(stmts, tail) -> cp_rw_block(nm, stmts, tail, [])
   EHandle(body, eff, tys, init, alias, cs, ret) ->
-    EHandle(cp_rw(nm, body), eff, tys, cp_rw_opt(nm, init), alias,
-            map(cs, (c) => cp_rw_clause(nm, c)), cp_rw_ret(nm, ret))
+    EHandle(cp_rw(nm, body), eff, tys, cp_rw_opt(nm, init), alias, cs, ret)
   _ -> dsg_map_expr_kind(k, (sub) => cp_rw(nm, sub))
+}
+
+# A loop intrinsic's arg: the pred/body wrapper lambdas are pasted
+# inline, so the rewrite descends their bodies (a shadowing param still
+# stops it); any other arg is an ordinary expression.
+fn cp_rw_loop_arg(nm: String, a: Expr) : Expr = match a.kind {
+  ELambda(ps, b) ->
+    if cp_params_bind(ps, nm) { a }
+    else { Expr { kind: ELambda(ps, cp_rw(nm, b)), line: a.line, col: a.col,
+                  ty: a.ty, mode: a.mode } }
+  _ -> cp_rw(nm, a)
 }
 
 type CpHit = CpGet | CpSet(Expr) | CpMiss
@@ -251,19 +272,6 @@ fn cp_rw_arm(nm: String, a: Arm) : Arm = match a {
   Arm(pat, guard, body) ->
     if list_has(pat_binders(pat, []), nm) { a }
     else { Arm(pat, cp_rw_opt(nm, guard), cp_rw(nm, body)) }
-}
-
-fn cp_rw_clause(nm: String, c: HClause) : HClause = match c {
-  HC(op, ps, body, l, cl) ->
-    if cp_params_bind(ps, nm) { c } else { HC(op, ps, cp_rw(nm, body), l, cl) }
-}
-
-fn cp_rw_ret(nm: String, ret: Option[HReturn]) : Option[HReturn] = match ret {
-  None -> None
-  Some(hr) -> match hr {
-    HR(x, body, l, c) ->
-      if x == nm { ret } else { Some(HR(x, cp_rw(nm, body), l, c)) }
-  }
 }
 
 # A block statement that rebinds `nm` shuts the rewrite off for the
