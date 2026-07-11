@@ -1,0 +1,454 @@
+# compiler/refine_enforce.kai — refinement-type enforcement at the
+# three downcast sites: annotated bindings (`let x: T = v`, `var`),
+# refined parameters, and refined returns.
+#
+# Runs right after transparent-alias expansion, so every refinement
+# reaches this pass as the inline `TyRefine(base, pred)` shape. Two
+# passes over the program:
+#
+# - `report_refinement_statics` rejects at compile time any binding or
+#   return whose closed value refutes the predicate (the mirror of the
+#   existing call-site literal check).
+# - `enforce_refinements_decls` inserts a structured runtime assert
+#   (same panic shape as requires/ensures) wherever the predicate is
+#   not statically proven. Predicates proven by constant folding or by
+#   entailment from the value's own refined binding insert no check.
+#
+# `__ref_pred_*` fns are skipped: match-arm narrowing calls them to
+# TEST a predicate, so an inserted check would turn a false guard into
+# a panic.
+
+import compiler.util
+import compiler.ast
+import compiler.refinements
+import compiler.desugar
+
+# ---- shared helpers ----
+
+fn renf_preds_of(t: TypeExpr) : [Expr] = match t.tkind {
+  TyRefine(base, pred) -> [pred, ...renf_preds_of(base)]
+  _ -> []
+}
+
+fn renf_ann_preds(ann: Option[TypeExpr]) : [Expr] = match ann {
+  Some(t) -> renf_preds_of(t)
+  None -> []
+}
+
+fn renf_skip_fn(name: String) : Bool =
+  string_length(name) >= 11 and string_slice(name, 0, 11) == "__ref_pred_"
+
+# A refinement over a dimensioned base (`Real<USD> where >= 0.0`)
+# checks the bare numeric value: the inserted assert compares
+# `__strip_unit(self)`, since the predicate's literals carry no unit
+# and a dimensioned operand would be a unit mismatch in the typer.
+fn renf_ty_is_dim(t: TypeExpr) : Bool = match t.tkind {
+  TyRefine(base, _) -> renf_ty_is_dim(base)
+  TyDim(_, _) -> true
+  _ -> false
+}
+
+fn renf_ann_is_dim(ann: Option[TypeExpr]) : Bool = match ann {
+  Some(t) -> renf_ty_is_dim(t)
+  None -> false
+}
+
+fn renf_self_expr(name: String, strip: Bool, line: Int, col: Int) : Expr {
+  let v = mk_expr(EVar(name), line, col)
+  if strip {
+    mk_expr(ECall(mk_expr(EVar("__strip_unit"), line, col), [v]), line, col)
+  } else { v }
+}
+
+fn renf_violation_span(ctx: String, pred: Expr) : String =
+  concat_all([
+    "\"refinement violated in `", escape_str_body_for_c(ctx), "`",
+    "\\npredicate: ", escape_str_body_for_c(expr_show_pred(pred)),
+    "\\ndeclared at line ", int_to_string(pred.line),
+    ", col ", int_to_string(pred.col), "\""
+  ])
+
+fn renf_assert(name: String, pred: Expr, ctx: String, strip: Bool) : Stmt {
+  let msg = mk_expr(EStr(renf_violation_span(ctx, pred), false), pred.line, pred.col)
+  SAssert(subst_var(pred, "self", renf_self_expr(name, strip, pred.line, pred.col)), Some(msg))
+}
+
+fn renf_asserts_for(name: String, preds: [Expr], ctx: String, strip: Bool) : [Stmt] =
+  map(preds, (p) => renf_assert(name, p, ctx, strip))
+
+# Predicates that still need a runtime check for `value`. Proven ones
+# drop; statically-refuted ones stay — the reporter pass raises the
+# compile error for those, and the kept assert covers any refuted site
+# in a shape the reporter does not walk.
+fn renf_runtime_preds(preds: [Expr], value: Expr, refs: [RefBinding]) : [Expr] = match preds {
+  [] -> []
+  [p, ...rest] -> match classify_arg_vs_pred(p, "self", value, refs) {
+    CSElided -> renf_runtime_preds(rest, value, refs)
+    _ -> [p, ...renf_runtime_preds(rest, value, refs)]
+  }
+}
+
+fn renf_extend_refs(refs: [RefBinding], name: String, preds: [Expr]) : [RefBinding] = match preds {
+  [] -> refs
+  [p, ...rest] -> renf_extend_refs([RBind(name, subst_self(p, name)), ...refs], name, rest)
+}
+
+# Refinement bindings in scope after a statement list: params plus
+# every `let`-bound name with a refined annotation. `var` cells are
+# excluded — reassignment can invalidate the initial proof.
+fn renf_refs_after(stmts: [Stmt], refs: [RefBinding]) : [RefBinding] = match stmts {
+  [] -> refs
+  [s, ...rest] -> match s {
+    SLet(pat, ann, _) -> match pat.pkind {
+      PBind(name) -> renf_refs_after(rest, renf_extend_refs(refs, name, renf_ann_preds(ann)))
+      _ -> renf_refs_after(rest, refs)
+    }
+    _ -> renf_refs_after(rest, refs)
+  }
+}
+
+# The value a refined return actually checks: a block body checks its
+# tail expression (with the block's refined lets in scope), any other
+# body checks itself.
+type RenfRetView = RenfRV(Expr, [RefBinding])
+
+fn renf_return_view(body: Expr, refs: [RefBinding]) : RenfRetView = match body.kind {
+  EBlock(stmts, Some(t)) -> RenfRV(t, renf_refs_after(stmts, refs))
+  _ -> RenfRV(body, refs)
+}
+
+# ---- rewrite pass (pure) ----
+
+#[doc("Insert refinement runtime checks at annotated bindings, refined params, and refined returns across a program.")]
+pub fn enforce_refinements_decls(decls: [Decl]) : [Decl] =
+  map(decls, renf_decl)
+
+fn renf_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tps, params, ret, row, body, l, c, mo) ->
+    if renf_skip_fn(n) { d } else {
+      let refs = collect_caller_refinements(params, [])
+      let body1 = renf_walk(body, refs, n)
+      let body2 = renf_wrap_return(n, ret, body1, refs)
+      let body3 = renf_add_param_checks(params, body2, n)
+      DFn(p, n, tps, params, ret, row, body3, l, c, mo)
+    }
+  DTest(desc, body, l, c) -> DTest(desc, renf_walk(body, [], desc), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, renf_walk(body, [], desc), l, c)
+  DCheck(desc, ps, body, l, c) ->
+    DCheck(desc, ps, renf_walk(body, collect_caller_refinements(ps, []), desc), l, c)
+  DUnstable(inner, l, c) -> DUnstable(renf_decl(inner), l, c)
+  DConstructor(inner, l, c) -> DConstructor(renf_decl(inner), l, c)
+  _ -> d
+}
+
+fn renf_walk(e: Expr, refs: [RefBinding], ctx: String) : Expr = match e.kind {
+  EBlock(stmts, tail) -> {
+    let stmts1 = renf_stmts(stmts, refs, ctx)
+    let tail1 = match tail {
+      Some(t) -> Some(renf_walk(t, renf_refs_after(stmts, refs), ctx))
+      None -> None
+    }
+    mk_expr(EBlock(stmts1, tail1), e.line, e.col)
+  }
+  _ -> mk_expr(dsg_map_expr_kind(e.kind, (s) => renf_walk(s, refs, ctx)), e.line, e.col)
+}
+
+fn renf_walk_opt(opt: Option[Expr], refs: [RefBinding], ctx: String) : Option[Expr] = match opt {
+  Some(e) -> Some(renf_walk(e, refs, ctx))
+  None -> None
+}
+
+fn renf_stmts(stmts: [Stmt], refs: [RefBinding], ctx: String) : [Stmt] = match stmts {
+  [] -> []
+  [s, ...rest] -> match s {
+    SLet(pat, ann, rhs) -> {
+      let rhs1 = renf_walk(rhs, refs, ctx)
+      let preds = renf_ann_preds(ann)
+      if preds == [] { [SLet(pat, ann, rhs1), ...renf_stmts(rest, refs, ctx)] }
+      else { match pat.pkind {
+        PBind(name) -> {
+          let rt = renf_runtime_preds(preds, rhs1, refs)
+          let refs1 = renf_extend_refs(refs, name, preds)
+          [SLet(pat, ann, rhs1),
+           ...list_append(renf_asserts_for(name, rt, ctx, renf_ann_is_dim(ann)),
+                          renf_stmts(rest, refs1, ctx))]
+        }
+        _ -> {
+          let rt = renf_runtime_preds(preds, rhs1, refs)
+          [SLet(pat, ann, renf_wrap_value(rhs1, rt, ctx, renf_ann_is_dim(ann))),
+           ...renf_stmts(rest, refs, ctx)]
+        }
+      } }
+    }
+    SVar(n, ann, rhs, l, c) -> {
+      let rhs1 = renf_walk(rhs, refs, ctx)
+      let rt = renf_runtime_preds(renf_ann_preds(ann), rhs1, refs)
+      [SVar(n, ann, renf_wrap_value(rhs1, rt, ctx, renf_ann_is_dim(ann)), l, c),
+       ...renf_stmts(rest, refs, ctx)]
+    }
+    SAssert(cnd, m) ->
+      [SAssert(renf_walk(cnd, refs, ctx), renf_walk_opt(m, refs, ctx)), ...renf_stmts(rest, refs, ctx)]
+    SExprStmt(x) -> [SExprStmt(renf_walk(x, refs, ctx)), ...renf_stmts(rest, refs, ctx)]
+    SIndexAssign(b, i, v, l, c) ->
+      [SIndexAssign(renf_walk(b, refs, ctx), renf_walk(i, refs, ctx), renf_walk(v, refs, ctx), l, c),
+       ...renf_stmts(rest, refs, ctx)]
+    SUse(_, _, _) -> [s, ...renf_stmts(rest, refs, ctx)]
+  }
+}
+
+# Wrap a value expression so its refinement checks run before the
+# value flows on: `{ let __ref_val = v; assert ...; __ref_val }`.
+fn renf_wrap_value(value: Expr, rt: [Expr], ctx: String, strip: Bool) : Expr {
+  if rt == [] { value } else {
+    let bind = SLet(mk_pat(PBind("__ref_val"), value.line, value.col), None, value)
+    mk_expr(EBlock([bind, ...renf_asserts_for("__ref_val", rt, ctx, strip)],
+                    Some(mk_expr(EVar("__ref_val"), value.line, value.col))),
+            value.line, value.col)
+  }
+}
+
+fn renf_wrap_return(fnname: String, ret_opt: Option[TypeExpr], body: Expr,
+                     refs: [RefBinding]) : Expr {
+  let preds = renf_ann_preds(ret_opt)
+  if preds == [] { body } else {
+    match renf_return_view(body, refs) {
+      RenfRV(value, refs2) -> {
+        let rt = renf_runtime_preds(preds, value, refs2)
+        if rt == [] { body }
+        else { renf_rebuild_return(body, value, rt, fnname, renf_ann_is_dim(ret_opt)) }
+      }
+    }
+  }
+}
+
+# Rebuild a fn body so the return checks run on the tail value. The
+# checks append to an existing block (leaving any requires-assert
+# prefix untouched for the call-site analysis); a non-EVar tail binds
+# `__ref_ret` first so the value is evaluated exactly once.
+fn renf_rebuild_return(body: Expr, value: Expr, rt: [Expr], fnname: String,
+                        strip: Bool) : Expr {
+  let pre = match body.kind {
+    EBlock(ss, Some(_)) -> ss
+    _ -> []
+  }
+  match value.kind {
+    EVar(x) ->
+      mk_expr(EBlock(list_append(pre, renf_asserts_for(x, rt, fnname, strip)), Some(value)),
+              body.line, body.col)
+    _ -> {
+      let bind = SLet(mk_pat(PBind("__ref_ret"), value.line, value.col), None, value)
+      mk_expr(EBlock(list_append(pre, [bind, ...renf_asserts_for("__ref_ret", rt, fnname, strip)]),
+                      Some(mk_expr(EVar("__ref_ret"), value.line, value.col))),
+              body.line, body.col)
+    }
+  }
+}
+
+fn renf_add_param_checks(params: [Param], body: Expr, fnname: String) : Expr {
+  let asserts = renf_param_asserts(params, fnname)
+  if asserts == [] { body } else { renf_insert_after_requires(body, asserts) }
+}
+
+fn renf_param_asserts(params: [Param], fnname: String) : [Stmt] = match params {
+  [] -> []
+  [p, ...rest] -> match p.ptype {
+    Some(t) -> {
+      let live = renf_drop_trivial(renf_preds_of(t))
+      list_append(renf_asserts_for(p.pname, live, fnname, renf_ty_is_dim(t)),
+                  renf_param_asserts(rest, fnname))
+    }
+    None -> renf_param_asserts(rest, fnname)
+  }
+}
+
+fn renf_drop_trivial(preds: [Expr]) : [Expr] = match preds {
+  [] -> []
+  [p, ...rest] -> match try_eval_pred(p) {
+    Some(true) -> renf_drop_trivial(rest)
+    _ -> [p, ...renf_drop_trivial(rest)]
+  }
+}
+
+# Param checks slot in after the requires-assert prefix so
+# `extract_requires_asserts` (which stops at the first non-requires
+# statement) still sees every requires clause.
+fn renf_insert_after_requires(body: Expr, asserts: [Stmt]) : Expr = match body.kind {
+  EBlock(stmts, tail) -> match renf_split_requires(stmts, []) {
+    RenfRSP(reqs, rest) ->
+      mk_expr(EBlock(list_append(reqs, list_append(asserts, rest)), tail), body.line, body.col)
+  }
+  _ -> mk_expr(EBlock(asserts, Some(body)), body.line, body.col)
+}
+
+type RenfReqSplit = RenfRSP([Stmt], [Stmt])
+
+fn renf_split_requires(stmts: [Stmt], acc: [Stmt]) : RenfReqSplit = match stmts {
+  [] -> RenfRSP(list_reverse(acc), [])
+  [s, ...rest] -> match s {
+    SAssert(_, Some(m)) -> match m.kind {
+      EStr(span, _) ->
+        if assert_span_is_requires(span) { renf_split_requires(rest, [s, ...acc]) }
+        else { RenfRSP(list_reverse(acc), [s, ...rest]) }
+      _ -> RenfRSP(list_reverse(acc), [s, ...rest])
+    }
+    _ -> RenfRSP(list_reverse(acc), [s, ...rest])
+  }
+}
+
+# ---- static reporter ----
+
+#[doc("Report compile-time refinement violations at annotated bindings and refined returns; returns the error count.")]
+pub fn report_refinement_statics(decls: [Decl], file: String) : Int / Console =
+  rrs_decls(decls, file, 0)
+
+fn rrs_decls(decls: [Decl], file: String, acc: Int) : Int / Console = match decls {
+  [] -> acc
+  [d, ...rest] -> rrs_decls(rest, file, acc + rrs_decl(d, file))
+}
+
+fn rrs_decl(d: Decl, file: String) : Int / Console = match d {
+  DFn(_, n, _, params, ret, _, body, _, _, _) ->
+    if renf_skip_fn(n) { 0 } else {
+      let refs = collect_caller_refinements(params, [])
+      rrs_return(n, ret, body, refs, file) + rrs_expr(body, refs, file)
+    }
+  DTest(_, body, _, _) -> rrs_expr(body, [], file)
+  DBench(_, body, _, _) -> rrs_expr(body, [], file)
+  DCheck(_, ps, body, _, _) -> rrs_expr(body, collect_caller_refinements(ps, []), file)
+  DUnstable(inner, _, _) -> rrs_decl(inner, file)
+  DConstructor(inner, _, _) -> rrs_decl(inner, file)
+  _ -> 0
+}
+
+fn rrs_return(fnname: String, ret_opt: Option[TypeExpr], body: Expr,
+               refs: [RefBinding], file: String) : Int / Console {
+  let preds = renf_ann_preds(ret_opt)
+  if preds == [] { 0 } else {
+    match renf_return_view(body, refs) {
+      RenfRV(value, refs2) ->
+        rrs_loose_count(preds, value, refs2, file, value.line, value.col,
+                        concat_all(["return of `", fnname, "`"]))
+    }
+  }
+}
+
+fn rrs_loose_count(preds: [Expr], value: Expr, refs: [RefBinding], file: String,
+                    l: Int, c: Int, what: String) : Int / Console = match preds {
+  [] -> 0
+  [p, ...rest] -> match classify_arg_vs_pred(p, "self", value, refs) {
+    CSLoose(reason) -> {
+      eprint(concat_all([file, ":", int_to_string(l), ":", int_to_string(c),
+                          ": error: ", what, ": ", reason, "\n"]))
+      1 + rrs_loose_count(rest, value, refs, file, l, c, what)
+    }
+    _ -> rrs_loose_count(rest, value, refs, file, l, c, what)
+  }
+}
+
+fn rrs_expr(e: Expr, refs: [RefBinding], file: String) : Int / Console = match e.kind {
+  EBlock(stmts, tail) -> {
+    let se = rrs_stmts(stmts, refs, file)
+    match tail {
+      Some(t) -> se + rrs_expr(t, renf_refs_after(stmts, refs), file)
+      None -> se
+    }
+  }
+  EIf(c1, t1, eo) -> rrs_expr(c1, refs, file) + rrs_expr(t1, refs, file) + rrs_opt(eo, refs, file)
+  EMatch(scr, arms) -> rrs_expr(scr, refs, file) + rrs_arms(arms, refs, file)
+  ELambda(_, b) -> rrs_expr(b, refs, file)
+  ECall(callee, args_) -> rrs_expr(callee, refs, file) + rrs_exprs(args_, refs, file)
+  EIntrinsic(_, args_) -> rrs_exprs(args_, refs, file)
+  EBinop(_, a, b) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file)
+  EUnop(_, x) -> rrs_expr(x, refs, file)
+  EField(b, _) -> rrs_expr(b, refs, file)
+  EIndex(a, i) -> rrs_expr(a, refs, file) + rrs_expr(i, refs, file)
+  EPipe(a, b) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file)
+  EMapPipe(a, b) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file)
+  EFlatMapPipe(a, b) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file)
+  EFilterPipe(a, b) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file)
+  EBang(x) -> rrs_expr(x, refs, file)
+  ELitUnit(x, _) -> rrs_expr(x, refs, file)
+  ERange(a, b, st) -> rrs_expr(a, refs, file) + rrs_expr(b, refs, file) + rrs_opt(st, refs, file)
+  EList(els) -> rrs_elems(els, refs, file)
+  ERecordLit(_, fs) -> rrs_fields(fs, refs, file)
+  EHandle(b, _, _, init, _, clauses, retc) ->
+    rrs_expr(b, refs, file) + rrs_opt(init, refs, file) +
+    rrs_clauses(clauses, refs, file) + rrs_hreturn(retc, refs, file)
+  _ -> 0
+}
+
+fn rrs_opt(opt: Option[Expr], refs: [RefBinding], file: String) : Int / Console = match opt {
+  Some(e) -> rrs_expr(e, refs, file)
+  None -> 0
+}
+
+fn rrs_exprs(es: [Expr], refs: [RefBinding], file: String) : Int / Console = match es {
+  [] -> 0
+  [e, ...rest] -> rrs_expr(e, refs, file) + rrs_exprs(rest, refs, file)
+}
+
+fn rrs_arms(arms: [Arm], refs: [RefBinding], file: String) : Int / Console = match arms {
+  [] -> 0
+  [a, ...rest] -> match a {
+    Arm(_, g, b) -> rrs_opt(g, refs, file) + rrs_expr(b, refs, file) + rrs_arms(rest, refs, file)
+  }
+}
+
+fn rrs_elems(els: [ListElem], refs: [RefBinding], file: String) : Int / Console = match els {
+  [] -> 0
+  [el, ...rest] -> match el {
+    ElPlain(x) -> rrs_expr(x, refs, file) + rrs_elems(rest, refs, file)
+    ElSpread(x) -> rrs_expr(x, refs, file) + rrs_elems(rest, refs, file)
+  }
+}
+
+fn rrs_fields(fs: [FieldInit], refs: [RefBinding], file: String) : Int / Console = match fs {
+  [] -> 0
+  [f, ...rest] -> match f {
+    FI(_, v) -> rrs_expr(v, refs, file) + rrs_fields(rest, refs, file)
+  }
+}
+
+fn rrs_clauses(cs: [HClause], refs: [RefBinding], file: String) : Int / Console = match cs {
+  [] -> 0
+  [c, ...rest] -> match c {
+    HC(_, _, b, _, _) -> rrs_expr(b, refs, file) + rrs_clauses(rest, refs, file)
+  }
+}
+
+fn rrs_hreturn(r: Option[HReturn], refs: [RefBinding], file: String) : Int / Console = match r {
+  Some(hr) -> match hr { HR(_, b, _, _) -> rrs_expr(b, refs, file) }
+  None -> 0
+}
+
+fn rrs_stmts(stmts: [Stmt], refs: [RefBinding], file: String) : Int / Console = match stmts {
+  [] -> 0
+  [s, ...rest] -> match s {
+    SLet(pat, ann, rhs) -> {
+      let e1 = rrs_expr(rhs, refs, file)
+      let preds = renf_ann_preds(ann)
+      let what = match pat.pkind {
+        PBind(nm) -> concat_all(["binding `", nm, "`"])
+        _ -> "binding"
+      }
+      let e2 = rrs_loose_count(preds, rhs, refs, file, pat.line, pat.col, what)
+      let refs1 = match pat.pkind {
+        PBind(nm) -> renf_extend_refs(refs, nm, preds)
+        _ -> refs
+      }
+      e1 + e2 + rrs_stmts(rest, refs1, file)
+    }
+    SVar(nm, ann, rhs, l, c) -> {
+      let e1 = rrs_expr(rhs, refs, file)
+      let e2 = rrs_loose_count(renf_ann_preds(ann), rhs, refs, file, l, c,
+                                concat_all(["var `", nm, "`"]))
+      e1 + e2 + rrs_stmts(rest, refs, file)
+    }
+    SAssert(cnd, m) -> rrs_expr(cnd, refs, file) + rrs_opt(m, refs, file) + rrs_stmts(rest, refs, file)
+    SExprStmt(x) -> rrs_expr(x, refs, file) + rrs_stmts(rest, refs, file)
+    SIndexAssign(b, i, v, _, _) ->
+      rrs_expr(b, refs, file) + rrs_expr(i, refs, file) + rrs_expr(v, refs, file) +
+      rrs_stmts(rest, refs, file)
+    SUse(_, _, _) -> rrs_stmts(rest, refs, file)
+  }
+}
