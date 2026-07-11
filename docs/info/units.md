@@ -138,12 +138,17 @@ import decimal_proto
 
 fn main() : Unit / Stdout = {
   let a: Money[USD] = 10.50<USD>
-  let total = a + 4.50<USD>          # same currency → Money[USD]
+  let b: Money[USD] = 4.50<USD>
+  let total = a + b                  # same currency → Money[USD]
   let k: dec.Decimal = 3
   let scaled = total * k             # scalar action → Money[USD]
   Stdout.print(money.to_string(scaled))
 }
 ```
+
+A money literal takes its `Decimal` carrier from the annotation
+(`10.50<USD>` alone is `Real<USD>`), so bind constants with a
+`Money[...]` annotation before operating on them.
 
 `Money[USD] + Money[EUR]` is a unit mismatch; `Money[USD] *
 Money[USD]` cannot be formed. Cross-currency conversion is an
