@@ -2282,27 +2282,67 @@ fn parse_variants_of(p: Parser, t: Token) : PExpr / Console {
   }
 }
 
-# Parse `region { ... }`. `p` is positioned at the `{`; `t`
-# is the original `region` token (used for line/col so the pre-typer
-# region pass can key the side table on the `region` keyword's
-# position). The block is parsed as an ordinary `EBlock`, then wrapped
-# in the marker `ECall(EVar("region"), [block])`. The block is the
-# DIRECT single argument — NOT a thunk lambda — so it stays inline in
-# the enclosing scope: no closure capture, no codegen perturbation. The
-# pre-typer region pass (compiler.region) recognises this marker by
-# shape, records the region, runs escape analysis, and unwraps it back
-# to the bare block, so the typer and emitter see a normal block (P2a
-# lowers to ordinary RC alloc; P1 consults the side table to bump-arena
-# the region's constructors). `region` is NOT a fn and NOT an effect —
-# the marker exists only between parse and the region pass.
+# Parse `region { ... }` or the named form `region { r -> ... }`. `p`
+# is positioned at the `{`; `t` is the original `region` token (line/col
+# key for the side table). The bare form parses as an ordinary `EBlock`
+# wrapped in the marker `ECall(EVar("region"), [block])` — the block is
+# the DIRECT single argument (NOT a thunk lambda), so it stays inline:
+# no closure capture, no codegen perturbation. The named form skolemizes
+# a fresh region `r` and wraps the block in `ELambda([Param(r)], block)`
+# inside the same marker, so the region pass can read the region's name
+# off the binder (the nursery rhyme: `nursery { n -> }` names a cap the
+# same way). The pre-typer region pass (compiler.region) recognises the
+# marker by shape, records the region and its name, runs escape
+# analysis, and unwraps it back to the bare block — the typer and
+# emitter see a normal block; the `ELambda` never reaches them. `region`
+# is NOT a fn and NOT an effect — the marker exists only between parse
+# and the region pass.
 fn parse_region(p: Parser, t: Token) : PExpr / Console {
-  let r = parse_block(p, t)
-  match r.r {
-    None -> err_e(r.p)
-    Some(block) -> {
-      let callee = mk_expr(EVar("region"), t.line, t.col)
-      ok_e(r.p, mk_expr(ECall(callee, [block]), t.line, t.col))
+  # `{` at p_peek(p). Peek past it (and whitespace) to test for `r ->`.
+  let after_lbrace = p_skip_newlines(p_advance(p))
+  match region_binder_name(after_lbrace) {
+    Some(bres) -> {
+      let body_r = parse_lambda_block_body(bres.p, t)
+      match body_r.r {
+        None -> err_e(body_r.p)
+        Some(body) -> {
+          let param = Param { pname: bres.name, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
+          let lam = mk_expr(ELambda([param], body), t.line, t.col)
+          let callee = mk_expr(EVar("region"), t.line, t.col)
+          ok_e(body_r.p, mk_expr(ECall(callee, [lam]), t.line, t.col))
+        }
+      }
     }
+    None -> {
+      let r = parse_block(p, t)
+      match r.r {
+        None -> err_e(r.p)
+        Some(block) -> {
+          let callee = mk_expr(EVar("region"), t.line, t.col)
+          ok_e(r.p, mk_expr(ECall(callee, [block]), t.line, t.col))
+        }
+      }
+    }
+  }
+}
+
+# Result of the region-binder probe: the parser positioned after `->`
+# and the region's name.
+type RegionBinder = { p: Parser, name: String }
+
+# Bounded, side-effect-free lookahead for the `region { r -> ... }`
+# binder: a single `Ident` immediately followed by `->`. A tuple
+# pattern or multi-param list is not a region binder (a region names one
+# arena), so those and the bare `{ ... }` form return None and fall
+# through to the plain-block path.
+fn region_binder_name(p: Parser) : Option[RegionBinder] / Console {
+  if not p_at(p, TkIdent) { None }
+  else {
+    let t = p_peek(p)
+    let p1 = p_advance(p)
+    if p_at(p1, TkArrow) {
+      Some(RegionBinder { p: p_advance(p1), name: tok_source(p.src, t) })
+    } else { None }
   }
 }
 
@@ -4589,6 +4629,15 @@ fn cmp_op_name(k: TokKind) : String {
   else { "==" }
 }
 
+# A type head may carry a `<habitant>` annotation when it is a numeric
+# head that takes a unit (`Real`/`Int`/`Decimal`), or any user-declared
+# nominal head (an uppercase identifier) — the latter for a kind
+# habitant like a region brand (`Tree<r>`). A lowercase head is a type
+# variable and never takes a habitant, so `t < u` in a signature stays a
+# refinement comparison, not a mis-parsed annotation.
+fn ty_head_takes_habitant(src: String, t: Token, name: String) : Bool =
+  name == "Real" or name == "Int" or name == "Decimal" or is_upper_ident(src, t)
+
 fn parse_type_base(p: Parser) : PTy / Console {
 
   let t = p_peek(p)
@@ -4642,13 +4691,15 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
     # Generic type: Name[T1, T2, ...]
     let p2 = p_skip_newlines(p_advance(p1))
     parse_type_args_loop(p2, [], name, t)
-  } else if (name == "Real" or name == "Int" or name == "Decimal") and p_at(p1, TkLt) {
-    # Dimensioned numeric — `Real<unit-expr>` / `Int<unit-expr>` /
-    # `Decimal<unit-expr>`. `Decimal` is the stdlib alias that ledger /
-    # finance demos reach for; the parser accepts the annotation here so
-    # record fields (`balance: Decimal<USD>`) and top-level positions
-    # share one route. The typer collapses TyDim to the head TyName at
-    # protocol-dispatch time (see `proto_type_name`).
+  } else if ty_head_takes_habitant(p.src, t, name) and p_at(p1, TkLt) {
+    # Dimensioned type — a habitant in angle brackets on the head.
+    # Numeric heads (`Real<m/s>`, `Decimal<USD>`) carry a unit-expr; a
+    # user head carries a kind habitant too — `Tree<r>` brands the type
+    # with region `r`, the same notation Measure/Currency use. Both share
+    # one route: `parse_unit_expr` reads the `<...>` and `TyDim` carries
+    # it. The typer collapses `TyDim` to the head `TyName` at
+    # protocol-dispatch time (see `proto_type_name`), so the brand rides
+    # the type without disturbing structural unification of the head.
     let p2 = p_skip_newlines(p_advance(p1))
     let ru = parse_unit_expr(p2)
     match ru.r {
@@ -4656,7 +4707,7 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
       Some(u) -> {
         let p3 = p_skip_newlines(ru.p)
         if not p_at(p3, TkGt) {
-          err_t(p_error_here(p3, "expected `>` to close the unit annotation"))
+          err_t(p_error_here(p3, "expected `>` to close the habitant annotation"))
         } else {
           let base = mk_ty(TyName(name, []), t.line, t.col)
           ok_t(p_advance(p3), mk_ty(TyDim(base, u), t.line, t.col))
