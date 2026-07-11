@@ -23,7 +23,7 @@ the LSP wave added):
 | `type`     | What is the inferred type of the innermost node at L:C?                        |
 | `def`      | Where is the identifier at L:C declared?                                       |
 | `enc`      | What is the innermost node enclosing L:C? (kind + start)                       |
-| `complete` | Which top-level names (user fns + stdlib + prelude) are in scope at L:C?       |
+| `complete` | Which top-level names (user fns + stdlib + core) are in scope at L:C?       |
 | `sig`      | What is the callee type of the innermost enclosing call at L:C? (signature help) |
 | `symbols`  | What top-level decls does this file declare? (documentSymbol outline)          |
 

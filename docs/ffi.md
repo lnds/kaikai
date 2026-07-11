@@ -2,7 +2,7 @@
 
 kaikai bridges to C through two distinct mechanisms:
 
-1. **Prelude primitives** — compiler-internal C bindings used by
+1. **Core primitives** — compiler-internal C bindings used by
    the standard library (libm, filesystem, process, time, …).
    Wired in `stage0/runtime.h`, registered in the resolver as
    globally-available identifiers. Users do not see them; the
@@ -14,53 +14,53 @@ kaikai bridges to C through two distinct mechanisms:
    doesn't own (raylib, sqlite3, libcurl, your own .so).
    Carries the `Ffi` effect capability.
 
-This document covers both paths: the prelude primitives mechanism
+This document covers both paths: the core primitives mechanism
 for compiler-dev, and the `extern "C"` user-facing surface
 including its current limits, the canonical workaround (C
 shims), and the planned scope for FFI v2.
 
-## Path 1 — Prelude primitives (compiler-internal)
+## Path 1 — Core primitives (compiler-internal)
 
 Used by every stdlib module that needs to call C: `stdlib/math/real.kai`
 (libm), `stdlib/fs/file.kai` (POSIX file ops), `stdlib/os/process.kai`
 (fork/exec/wait), `stdlib/time.kai` (clock_gettime), and so on.
 Users never write `extern "C"` for these — the names are
 **globally available** because the resolver pre-loads them as
-prelude-level identifiers.
+core-level identifiers.
 
 ### Mechanism
 
-Three pieces wire a prelude primitive end-to-end:
+Three pieces wire a core primitive end-to-end:
 
 1. **Runtime function** in `stage0/runtime.h`:
 
    ```c
-   static KaiValue *kai_prelude_real_sqrt(KaiValue *x) {
+   static KaiValue *kai_core_real_sqrt(KaiValue *x) {
      return kai_real(sqrt(kai_real_get(x)));
    }
    ```
 
-2. **Thunk** registered in `stage0/runtime.h`'s prelude table so
+2. **Thunk** registered in `stage0/runtime.h`'s core table so
    the call site can dispatch:
 
    ```c
-   static KaiValue *_kai_prelude_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n) {
+   static KaiValue *_kai_core_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n) {
      (void) s; (void) n;
-     return kai_prelude_real_sqrt(a[0]);
+     return kai_core_real_sqrt(a[0]);
    }
    ```
 
 3. **Compiler entry** in `stage2/compiler.kai` registering the
-   identifier in the prelude environment with its `Ty` schema:
+   identifier in the core environment with its `Ty` schema:
 
    ```kai
    TyEntry { name: "real_sqrt", scheme: mono(fn_ty([TyReal], TyReal)) }
-   EP("real_sqrt", "kai_prelude_real_sqrt", 1)
+   EP("real_sqrt", "kai_core_real_sqrt", 1)
    ```
 
-   Three locations to keep in sync: the prelude name list, the
+   Three locations to keep in sync: the core name list, the
    type-environment entry (so the typer knows the schema), and
-   the EP (Emit-Prelude) record (so the C emit dispatches to the
+   the EP (Emit-Core) record (so the C emit dispatches to the
    right thunk).
 
 ### libm bindings macro
@@ -76,11 +76,11 @@ KAI_LIBM_REAL2(rem,  fmod)
 ```
 
 Each `KAI_LIBM_REAL1(name, c_fn)` expands into a thunk plus a
-prelude-table entry. Adding a new libm binding is a 3-line
-change in `stage0/runtime.h` plus the compiler-side prelude
+core-table entry. Adding a new libm binding is a 3-line
+change in `stage0/runtime.h` plus the compiler-side core
 registration.
 
-### When to add a prelude primitive
+### When to add a core primitive
 
 Add one when:
 
@@ -91,7 +91,7 @@ Add one when:
   themselves — wrong for stdlib).
 - The cost is a single C function with primitive args and return.
 
-Do **not** add a prelude primitive when:
+Do **not** add a core primitive when:
 
 - It's a third-party library (raylib, sqlite3) — that's
   user-facing FFI v1, the user declares the `extern "C"`.
@@ -100,11 +100,11 @@ Do **not** add a prelude primitive when:
 
 ### Examples in stdlib
 
-| stdlib module | Prelude primitives it uses |
+| stdlib module | Core primitives it uses |
 | --- | --- |
 | `stdlib/math/real.kai` | `real_sqrt`, `real_sin`, `real_pow`, `real_rem`, … (libm) |
 | `stdlib/math/int.kai` | `int_to_string`, arithmetic builtins |
-| `stdlib/fs/file.kai` | `kai_prelude_read_file`, `kai_prelude_write_file`, `kai_prelude_file_exists`, `kai_prelude_file_delete`, `kai_prelude_file_rename`, `kai_prelude_file_append` |
+| `stdlib/fs/file.kai` | `kai_core_read_file`, `kai_core_write_file`, `kai_core_file_exists`, `kai_core_file_delete`, `kai_core_file_rename`, `kai_core_file_append` |
 | `stdlib/os/process.kai` | `kai_default_process_start`, `kai_default_process_wait`, `kai_default_process_kill`, `kai_default_process_exit` |
 | `stdlib/encoding/json.kai` | `string_to_real`, `string_to_int` |
 | `stdlib/time.kai` | clock primitives |

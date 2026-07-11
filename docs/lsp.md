@@ -34,7 +34,7 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
   `type_at` query in `--library-mode` (issue #454).
 * **Goto-definition** points at the source line of the resolved
   identifier. User-authored decls always win over preloaded
-  prelude / stdlib decls — `find_decl_def` prefers
+  core / stdlib decls — `find_decl_def` prefers
   `module_origin = None` matches.
 * **publishDiagnostics** fires on `didOpen` and `didChange`. Driven
   by `--diags-json` for compile errors and by `--holes-json` for
@@ -162,7 +162,7 @@ remain:
   file. Acceptable while compile time stays under 20 ms for
   sub-1 kLOC files; #452 Phase B (user-file incremental cache)
   is the long-term answer.
-* **Completion is top-level only.** User fns + stdlib + prelude
+* **Completion is top-level only.** User fns + stdlib + core
   builtins (~445 items by default). Locals, params, and field
   completion after `.` are not yet wired — `.` is announced as a
   trigger but the server returns the same top-level set.

@@ -3,8 +3,8 @@
 #
 # The native backend compiles `stage2/main.kai` to a self-contained object
 # (runtime bitcode linked in-process), but that object references the
-# in-process libLLVM C-API prims as `kaix_prelude_llvm_*` /
-# `kaix_prelude_native_ctx_*` / `kaix_prelude_native_di_*`. Those linkable
+# in-process libLLVM C-API prims as `kaix_core_llvm_*` /
+# `kaix_core_native_ctx_*` / `kaix_core_native_di_*`. Those linkable
 # forwarders live in `stage0/runtime_llvm.c` under `-DKAI_LLVM`, over the
 # `static kai_<name>` bodies in `runtime.h`. So the link is:
 #
@@ -32,7 +32,7 @@ SHIM_C="$ROOT/stage0/runtime_llvm_native_shim.c"
 [ -f "$SHIM_C" ] || { echo "native-selfhost-link: missing $SHIM_C" >&2; exit 1; }
 [ -f "$OBJ" ] || { echo "native-selfhost-link: missing object $OBJ" >&2; exit 1; }
 
-# Compile the KAI_LLVM shim TU: it exports the kaix_prelude_llvm_* /
+# Compile the KAI_LLVM shim TU: it exports the kaix_core_llvm_* /
 # native_ctx_* / native_di_* forwarders the object calls (over runtime.h's
 # `static kai_*`). The bitcode-self-contained object already carries `main`
 # + every other kaix_* (runtime_llvm.bc), so this TU adds ONLY the 88
