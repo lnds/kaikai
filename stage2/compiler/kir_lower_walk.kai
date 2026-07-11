@@ -570,7 +570,7 @@ fn lower_raw_binop(x: Expr, prim: String, slot: KSlot, a: Expr, b: Expr, st: Low
 # `KVar` the native walk aborted on as `unbound register`.
 fn lower_var(name: String, st: LowerSt) : LRes / Console =
   if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
-    bind_op(st, KCon(name, ls_variant_tag(st, name), 0, []), KNoPos)
+    bind_op(st, KCon(name, ls_variant_tag(st, name), 0, [], false), KNoPos)
   } else if ls_is_local(st, name) {
     # #846 — a read inside a block that shadowed `name` resolves to the
     # fresh register the shadowing `let` was alpha-renamed to; outside any
@@ -661,17 +661,20 @@ fn tcrec_mask_of(sig: Option[UFnSig]) : [Bool] = match sig {
 # tail, `kai_cons(h, t)` for a plain head, `kai_core_list_append(h, t)`
 # for a mid-list spread, and a `kai_incref(h)` fast-path for a trailing
 # spread (O(1) ownership transfer, not an O(n) spine copy). Head is
-# lowered before the tail to keep left-to-right evaluation order.
-# Region-arena cons (`kai_arena_cons`) is a later milestone (#120): the
-# block carries no region_id yet, so the default (RC) allocator is used.
+# lowered before the tail to keep left-to-right evaluation order. Inside
+# a region the cons cells bump-allocate: `kai_cons` becomes `kai_arena_cons`.
 fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = match elems {
   [] -> bind_op(st, KPrim("kai_nil", []), pos)
   [el] -> lower_list_last(el, pos, st)
   [el, ...rest] -> match el {
-    ElPlain(x)  -> lower_list_cons(x, rest, "kai_cons", pos, st)
+    ElPlain(x)  -> lower_list_cons(x, rest, region_cons_prim(st), pos, st)
     ElSpread(x) -> lower_list_cons(x, rest, "kai_core_list_append", pos, st)
   }
 }
+
+# The cons prim for the current allocation context: the bump-arena ctor
+# inside a region, the RC-heap ctor otherwise.
+fn region_cons_prim(st: LowerSt) : String = if st.in_region { "kai_arena_cons" } else { "kai_cons" }
 
 # The final element: a plain head conses onto `nil`; a trailing spread is
 # `kai_incref(xs)` — unless `xs` is a `__perceus_dup(...)` (already owned;
@@ -680,7 +683,7 @@ fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = matc
 fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = match el {
   ElPlain(x) -> match lower_expr(x, st) { LRes(hdv, st1) ->
     match bind_op(st1, KPrim("kai_nil", []), pos) { LRes(nilv, st2) ->
-      bind_op(st2, KPrim("kai_cons", [hdv, nilv]), pos) } }
+      bind_op(st2, KPrim(region_cons_prim(st2), [hdv, nilv]), pos) } }
   ElSpread(x) -> if is_perceus_dup_expr(x) { lower_expr(x, st) }
     else { match lower_expr(x, st) { LRes(spv, st1) ->
       bind_op(st1, KPrim("kai_incref", [spv]), pos) } }
@@ -729,7 +732,7 @@ fn lower_variants_of(names: [String], pos: KPos, st: LowerSt) : LRes / Console =
   [] -> bind_op(st, KPrim("kai_nil", []), pos)
   [n, ...rest] -> {
     let tag = ls_variant_tag(st, n)
-    match bind_op(st, KCon(n, tag, 0, []), pos) { LRes(hdv, st1) ->
+    match bind_op(st, KCon(n, tag, 0, [], false), pos) { LRes(hdv, st1) ->
       match lower_variants_of(rest, pos, st1) { LRes(tlv, st2) ->
         bind_op(st2, KPrim("kai_cons", [hdv, tlv]), pos) } }
   }
@@ -742,7 +745,7 @@ fn lower_variants_of(names: [String], pos: KPos, st: LowerSt) : LRes / Console =
 # let-bind), so the layout reaching here is canonical — KIR does not reorder.
 fn lower_record_lit(fis: [FieldInit], pos: KPos, st: LowerSt) : LRes / Console =
   match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
-    bind_op(st1, KRecord(pairs), pos) }
+    bind_op(st1, KRecord(pairs, st1.in_region), pos) }
 
 fn lower_field_inits(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match fis {
   [] -> RecPlan(acc, st)
@@ -762,7 +765,7 @@ fn lower_range(lo: Expr, hi: Expr, stp: Option[Expr], pos: KPos, st: LowerSt) : 
 # A qualified name as a value: a nullary ctor → the ctor value; otherwise
 # a fn-value closure over the qualified thunk (emit_c's EModCall arm).
 fn lower_modcall_value(modn: String, name: String, pos: KPos, st: LowerSt) : LRes / Console =
-  if kir_name_is_ctor(name) { bind_op(st, KCon(name, ls_variant_tag(st, name), 0, []), pos) }
+  if kir_name_is_ctor(name) { bind_op(st, KCon(name, ls_variant_tag(st, name), 0, [], false), pos) }
   else { match ls_fn_value_qualified(st, modn, name) {
     FV(thunk, arity) -> bind_op(st, KClosure(thunk, arity, []), pos) } }
 
@@ -804,7 +807,11 @@ fn lower_capture_atoms(caps: [String], st: LowerSt, acc: [KVal]) : LResMany / Co
 # `__pcs_arm_ret` per-arm churn). `rc` is NOT restored (see
 # `ls_set_renames` / `ls_set_locals`), so distinct fresh regs are minted
 # monotonically and never alias.
-fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
+fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
+  if block_is_region(st.regions, x.line, x.col) { lower_region_block(x, stmts, tail, st) }
+  else { lower_plain_block(x, stmts, tail, st) }
+
+fn lower_plain_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
   let snap = st.renames
   let lsnap = st.locals
   let st1 = lower_stmts(stmts, st)
@@ -817,6 +824,44 @@ fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes /
     Some(e) -> match lower_expr(e, st2) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
     None    -> LRes(KUnitV, ls_set_locals(ls_set_renames(st2, snap), lsnap))
   }
+}
+
+# A lexical `region { }` block: bump-allocate the body's ctors into a fresh
+# arena, then free it wholesale at the brace. `in_region` is set for the
+# body's extent, so every ctor lowered here routes to the arena. The tail
+# value is deep-copied OUT of the arena (rc = 1) BEFORE the arena is popped
+# — copy-before-pop is load-bearing (the arena free would dangle it). A
+# scalar tail crosses the border as an immediate: `kaix_deep_copy_out` is a
+# no-op on non-pointers, so the whole arena frees with zero copy traffic.
+# The copy-out + pop are emitted AT THE JOIN — the point `lower_expr(tail)`
+# returns to, which post-dominates any `if`/`match` fork inside the tail —
+# so an early fork cannot skip the pop or free the value before the copy.
+fn lower_region_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
+  let snap = st.renames
+  let lsnap = st.locals
+  let osnap = st.in_region
+  let stp = ls_emit(ls_set_in_region(st, true), KDo(KCall("kaix_arena_push", []), kpos_of(x)))
+  let st1 = lower_stmts(stmts, stp)
+  let st2 = lower_block_exit_drops(stmts, tail, st1)
+  match tail {
+    Some(e) -> match lower_expr(e, st2) { LRes(v, st3) -> {
+      match bind_op(st3, KCall("kaix_deep_copy_out", [v]), kpos_of(x)) { LRes(cv, st4) -> {
+        let st5 = ls_emit(ls_set_in_region(st4, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
+        LRes(cv, ls_set_locals(ls_set_renames(st5, snap), lsnap))
+      } }
+    } }
+    None -> {
+      let st3 = ls_emit(ls_set_in_region(st2, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
+      LRes(KUnitV, ls_set_locals(ls_set_renames(st3, snap), lsnap))
+    }
+  }
+}
+
+fn block_is_region(ms: [RegionMark], line: Int, col: Int) : Bool = match ms {
+  [] -> false
+  [m, ...rest] ->
+    if rmark_line(m) == line and rmark_col(m) == col { true }
+    else { block_is_region(rest, line, col) }
 }
 
 # Emit a `KDrop` for each dead `let`-binding whose RHS is a fresh boxed
@@ -2448,7 +2493,7 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
           let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
           let st_ub = match bind_op(st_fork, KConReuse(RkVariantMove, donor, cn, ls_variant_tag(st_fork, cn), typed_inits(avs, cn, st_fork)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) }
-          let st_sb = match bind_op(st_ub, KCon(cn, ls_variant_tag(st_ub, cn), ls_ctor_mask(st_ub, cn), typed_inits(avs, cn, st_ub)), pos) { LRes(rs, st_s2) ->
+          let st_sb = match bind_op(st_ub, KCon(cn, ls_variant_tag(st_ub, cn), ls_ctor_mask(st_ub, cn), typed_inits(avs, cn, st_ub), st_ub.in_region), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
           LRes(KVar(rjoin), st_sb)
         } } }
@@ -2467,7 +2512,7 @@ fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st: LowerSt) : L
   match lower_reuse_args_donate(cargs, "", 0, true, false, st, []) { LResDon(avs, _, st1) -> {
     let tag = ls_variant_tag(st1, cn)
     let st_dup = emit_reuse_leaf_dups(reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
-    bind_op(st_dup, KCon(cn, tag, ls_ctor_mask(st1, cn), typed_inits(avs, cn, st1)), kpos_of(x))
+    bind_op(st_dup, KCon(cn, tag, ls_ctor_mask(st1, cn), typed_inits(avs, cn, st1), st1.in_region), kpos_of(x))
   } }
 
 # Rebuild args + the lowered atoms, plus whether the inner token was donated.
@@ -2655,12 +2700,12 @@ fn reuse_neutralise_exit_drop(st: LowerSt, pos: KPos) : LowerSt =
 # ctor otherwise.
 fn reuse_fresh_op(rk: KReuseKind, cn: String, avs: [KVal], st: LowerSt) : KOp = match rk {
   RkCons    -> KPrim("kai_cons", avs)
-  RkVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st))
+  RkVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st), st.in_region)
   # A token/donor/move rebuild never forks (kai_variant_at handles its own
   # null case; the move is minted inside the unique branch only).
-  RkTokenVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st))
-  RkDonorVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st))
-  RkVariantMove  -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st))
+  RkTokenVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st), st.in_region)
+  RkDonorVariant -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st), st.in_region)
+  RkVariantMove  -> KCon(cn, ls_variant_tag(st, cn), ls_ctor_mask(st, cn), typed_inits(avs, cn, st), st.in_region)
 }
 
 # Dup each direct scrutinee slot (head `PBind` / `...rest`) for the shared
@@ -2778,7 +2823,7 @@ fn lower_reuse_record(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / 
 fn lower_ctor_call(x: Expr, name: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let tys = match evar_payload_tys(st.vs, name) { Some(t) -> t None -> [] }
   match lower_ctor_args(cargs, name, tys, st, []) { LCtorInits(inits, st1) ->
-    bind_op(st1, KCon(name, ls_variant_tag(st1, name), ls_ctor_mask(st1, name), inits), kpos_of(x)) }
+    bind_op(st1, KCon(name, ls_variant_tag(st1, name), ls_ctor_mask(st1, name), inits, st1.in_region), kpos_of(x)) }
 }
 
 # Per-slot ctor-arg lowering result: the slot inits + threaded state.
