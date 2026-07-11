@@ -38,15 +38,21 @@ pre-map because they only became visible on contact:
    identity at runtime (same emit shape as `__strip_unit`), typed
    kind-agnostic (`(t) -> t<?u>` / `(t<?u>) -> t`).
 4. **`core/kinds.kai` was never auto-loaded by kaic2.** `bin/kai`
-   globs `stdlib/core/*.kai`; the compiler's internal core list did
+   globs `stdlib/core/*.kai`; the compiler's internal core list does
    not include the catalog, so the catalog's decls (including
-   `Currency`) were invisible to harness-driven raw `kaic2` runs.
-   Added to `core_module_files()`. The parser side is covered by
-   hardcoding `currency`/`Currency` in `kind_reg_base()` — the same
-   catalog-mirrors-builtin pattern `unit`/`Measure` already uses,
-   necessary because the parser's kind registry is a per-file
-   pre-scan and money.kai's habitants live in a different file from
-   the kind declaration.
+   `Currency`) are invisible to harness-driven raw `kaic2` runs.
+   First fix attempt added the file to `core_module_files()` — and
+   promptly broke the user cache, whose codec panics on a `DKind`
+   reaching serialization (`cache_decl_to_hex`), caught by
+   `userb_cold_warm_identical` in CI. Final mechanism: the catalog
+   stays out of the decl stream entirely, and `Currency` ships as a
+   hardcoded base entry — `currency`/`Currency` in `kind_reg_base()`
+   (the parser's registry is a per-file pre-scan, and money.kai's
+   habitants live in a different file from the kind declaration) plus
+   `base_module_kind_names()` seeding the formation guard. That is
+   the same catalog-mirrors-builtin pattern `unit`/`Measure`,
+   `Type`, and `Effect` already use: the catalog file is declarative
+   surface, never input.
 
 ## Design decisions
 
