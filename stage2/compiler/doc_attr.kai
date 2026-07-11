@@ -34,6 +34,7 @@
 import compiler.util
 import compiler.diag
 import compiler.ast
+import compiler.kinds
 
 # ---- doc text helpers ----
 
@@ -177,12 +178,6 @@ fn doc_label(l: RowLabel) : String =
       else { concat_all([n, "[", join_with(map(args, doc_te), ", "), "]"]) }
   }
 
-# True when `file` is the one compilation unit allowed to declare a
-# `theory`: the canonical kind catalog `<stdlib_path()>/core/kinds.kai`.
-# Both paths are canonicalised via `abspath` so a relative input path
-# and the absolute `stdlib_path()` compare by identity of the real file.
-fn theory_here_ok(file: String) : Bool =
-  abspath(file) == abspath(string_concat(stdlib_path(), "/core/kinds.kai"))
 
 #[doc("Post-parse strip for the root file: unwrap DDoc into the side table, keep the first DModuleDoc decl in the stream for the typer.")]
 pub fn doc_strip_collect(file: String, src: String, decls: [Decl]) : DocStrip / Console =
@@ -211,25 +206,43 @@ fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
       # `theory` decl is legal in exactly one file, the kind catalog;
       # anywhere else is a hard error surfaced here (the sole pass that
       # sees a `DTheory` with its source file in hand).
-      DTheory(_, _, ln, col) ->
-        if theory_here_ok(file) {
+      DTheory(_, props, ln, col) ->
+        if kind_catalog_file(file) {
           dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs)
         } else {
-          diag_error_from_src(file, src, ln, col,
-            "`theory` declarations are only allowed in the kind catalog (core/kinds.kai)")
+          diag_error_from_src(file, src, ln, col, theory_reject_msg(props))
           dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
         }
       # `DKind` is kept past the doc strip: the kind-resolution pass
       # reads its introducer->kind map (over the merged stream) before
-      # stripping it. `DTheory` still goes here (it carries no
-      # downstream data — only the module-restriction check above).
-      DKind(_, _, _, _, _, _) ->
-        dsc_loop(file, src, rest, keep_mod, [d, ...acc],
-                 dsc_push_item(items, d, None), module_doc, errs)
+      # stripping it. Builtin kinds (`Type`, `Effect`) and kinds over a
+      # builtin theory are closed — legal only in the catalog file, so
+      # the check anchors here beside the `theory` gate.
+      DKind(_, kname, kthy, _, kln, kcol) ->
+        dsc_kind_arm(file, src, d, kname, kthy, kln, kcol, rest, keep_mod,
+                     acc, items, module_doc, errs)
       _ ->
         dsc_loop(file, src, rest, keep_mod, [d, ...acc],
                  dsc_push_item(items, d, None), module_doc, errs)
     }
+  }
+}
+
+# The DKind arm of dsc_loop: a closed-kind violation drops the decl
+# with its diagnostic; a legal decl is kept for the kind-resolution
+# pass.
+fn dsc_kind_arm(file: String, src: String, d: Decl, kname: String,
+                kthy: String, kln: Int, kcol: Int, rest: [Decl],
+                keep_mod: Bool, acc: [Decl], items: [DocItem],
+                module_doc: Option[String], errs: Int) : DocStrip / Console {
+  match kind_closed_msg(file, kname, kthy) {
+    Some(msg) -> {
+      diag_error_from_src(file, src, kln, kcol, msg)
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
+    }
+    None ->
+      dsc_loop(file, src, rest, keep_mod, [d, ...acc],
+               dsc_push_item(items, d, None), module_doc, errs)
   }
 }
 
