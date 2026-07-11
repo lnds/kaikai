@@ -591,8 +591,8 @@ KaiValue *kaix_deep_copy_out(KaiValue *v)                                 { retu
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }
-int       kaix_is_cons(KaiValue *v)                       { return v && v->tag == KAI_CONS; }
-int       kaix_is_nil(KaiValue *v)                        { return !v || v->tag == KAI_NIL; }
+int       kaix_is_cons(KaiValue *v)                       { return kai_seq_norm(v) && v->tag == KAI_CONS; }
+int       kaix_is_nil(KaiValue *v)                        { return !kai_seq_norm(v) || v->tag == KAI_NIL; }
 /* Boxed-Bool list-cell predicates for the in-process native walk's
  * KIR list-match decision tree. The walk lowers a `kai_is_cons_b` /
  * `kai_is_nil_b` prim through its uniform boxed-prim path (a
@@ -601,11 +601,14 @@ int       kaix_is_nil(KaiValue *v)                        { return !v || v->tag 
  * `i32` `kaix_is_cons`/`kaix_is_nil` the .ll-text emitter compares
  * inline. Reads the runtime `->tag` (the cons/nil discriminant); the
  * variant `variant_tag` field is meaningless for a list cell. Borrowing
- * (no incref/decref of `v`). */
-KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(v && v->tag == KAI_CONS); }
-KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!v || v->tag == KAI_NIL); }
-KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(v->as.cons.head); }
-KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(v->as.cons.tail); }
+ * (no incref/decref of `v`). The kai_seq_norm behind every test is the
+ * range border: it rewrites a lazy KAI_RANGE into one real cell in
+ * place, so the KProj slot reads that follow see cons fields, never
+ * raw generator ints. */
+KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(kai_seq_norm(v) && v->tag == KAI_CONS); }
+KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!kai_seq_norm(v) || v->tag == KAI_NIL); }
+KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.head); }
+KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.tail); }
 
 /* issue #118 — LLVM mirror of the C-side reuse-in-place runtime.
  * Stage 2's recogniser emits `__perceus_reuse_cons` calls inside
