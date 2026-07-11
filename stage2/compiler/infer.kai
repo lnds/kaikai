@@ -2851,12 +2851,14 @@ fn edition_at_least(have: String, target: String) : Bool =
 # fresh-variable counter used later. Lookups are linear — fine at this
 # stage (a few dozen entries).
 
-#[doc("infer: a quantified type scheme (bound ty/row/unit vars + the Ty).")]
-pub type TyScheme = Scheme([Int], [Int], [Int], Ty)
+#[doc("infer: a quantified type scheme (bound ty/row/unit vars + unit-var kinds + the Ty).")]
+pub type TyScheme = Scheme([Int], [Int], [Int], [String], Ty)
 # third parameter `bound_uvars` lists unit-var ids quantified
 # by the scheme. Instantiation allocates a fresh UVar per bound id
 # (parallel to bound_vars / bound_rvars). Empty for non-unit-poly
-# schemes — preserves prior behaviour.
+# schemes. The fourth parameter is parallel to `bound_uvars`: the
+# kind each unit tparam ranges over (`Measure`, `Currency`, ...);
+# `""` leaves the var unconstrained (kind-agnostic builtins).
 
 #[doc("infer: a (name, scheme) entry in the typing environment.")]
 pub type TyEntry = { name: String, scheme: TyScheme }
@@ -3168,16 +3170,18 @@ fn uppercase_names_loop(es: [TyEntry], acc: [String]) : [String] {
 
 # ---- small constructors ----
 
-fn mono(ty: Ty) : TyScheme = Scheme([], [], [], ty)
+fn mono(ty: Ty) : TyScheme = Scheme([], [], [], [], ty)
 
-fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], [], ty)
+fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], [], [], ty)
 
-fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, [], ty)
+fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, [], [], ty)
 
 # scheme generalising over type-, row-, and unit-vars all at once.
 # Used by fn_scheme_of_decl when the signature has [u: Measure] tparams.
-fn scheme_uvars(vars: [Int], rvars: [Int], uvars: [Int], ty: Ty) : TyScheme =
-  Scheme(vars, rvars, uvars, ty)
+# `ukinds` is parallel to `uvars`: the kind each unit tparam ranges
+# over ("" = unconstrained).
+fn scheme_uvars(vars: [Int], rvars: [Int], uvars: [Int], ukinds: [String], ty: Ty) : TyScheme =
+  Scheme(vars, rvars, uvars, ukinds, ty)
 
 fn tv(n: Int) : Ty = TyVarT(n)
 
@@ -3456,7 +3460,7 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # machinery). When the arg's unit is still a UVar
     # (the protocol-impl-generic case), the empty string is emitted.
     TyEntry { name: "unit_name",
-              scheme: scheme_uvars([], [], [0],
+              scheme: scheme_uvars([], [], [0], [""],
                 fn_ty([TyDimT(TyReal, UVar(0))], TyString)) },
     # typer-internal erasure of the unit annotation on
     # a dimensioned Real. Polymorphic in the unit-var so the call site
@@ -3465,8 +3469,19 @@ pub fn add_prelude_sigs(env: TyEnv) : TyEnv {
     # surface (the `__` prefix is the convention for compiler-internal
     # names).
     TyEntry { name: "__strip_unit",
-              scheme: scheme_uvars([], [], [0],
+              scheme: scheme_uvars([], [], [0], [""],
                 fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) },
+    # typer-internal unit tag/untag over any carrier, identity at
+    # runtime. The mint/erase door for non-literal dimensioned values
+    # (`money.of` / `money.amount` route a runtime Decimal in and out
+    # of `Decimal<c>`). Kind-agnostic: the unit var takes its kind
+    # from the context that binds it.
+    TyEntry { name: "__attach_unit",
+              scheme: scheme_uvars([0], [], [0], [""],
+                fn_ty([tv(0)], TyDimT(tv(0), UVar(0)))) },
+    TyEntry { name: "__detach_unit",
+              scheme: scheme_uvars([0], [], [0], [""],
+                fn_ty([TyDimT(tv(0), UVar(0))], tv(0))) },
     # bit operations on Int as compiler intrinsics. The typer
     # records the signatures here; `emit_call_value` lowers each call
     # to the matching C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
@@ -3588,6 +3603,20 @@ fn tparam_unit_count_loop(tparams: [String], acc: Int) : Int {
       let next = if tp_kind_is_unit(n) { acc + 1 } else { acc }
       tparam_unit_count_loop(rest, next)
     }
+  }
+}
+
+# The kind each unit tparam ranges over, in tparam order — parallel
+# to `tparam_id_split`'s uvars, so uvar id i has kind element i.
+fn tparam_unit_kinds(tparams: [String]) : [String] =
+  tparam_unit_kinds_loop(tparams, [])
+
+fn tparam_unit_kinds_loop(tparams: [String], acc: [String]) : [String] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [n, ...rest] ->
+      if tp_kind_is_unit(n) { tparam_unit_kinds_loop(rest, [tp_kind_name(n), ...acc]) }
+      else { tparam_unit_kinds_loop(rest, acc) }
   }
 }
 
@@ -5346,7 +5375,8 @@ pub fn fn_scheme_of_decl_rk(d: Decl, row_kind_table: [RowKindEntry]) : Option[Ty
       } else {
         rvbind_ids(rbinds)
       }
-      Some(scheme_uvars(tvars, rvars, split.uvars, body))
+      Some(scheme_uvars(tvars, rvars, split.uvars,
+                        tparam_unit_kinds(effective_tparams), body))
     }
     _ -> None
   }
@@ -5855,7 +5885,7 @@ pub fn build_ty_env(decls: [Decl]) : BuiltEnv {
 
 fn scheme_to_string(sc: TyScheme) : String {
   match sc {
-    Scheme(vars, rvars, uvars, ty) -> {
+    Scheme(vars, rvars, uvars, _, ty) -> {
       let tv_part = map(vars, (n) => cat2("?t", int_to_string(n)))
       let rv_part = map(rvars, (n) => cat2("?r", int_to_string(n)))
       let uv_part = map(uvars, (n) => cat2("?u", int_to_string(n)))
@@ -5937,8 +5967,17 @@ type Subst = {
   # group closure, so unit formation (`*`, `/`, `^`) rejects any
   # combination where such a habitant survives other than alone with
   # exponent 1. Program-wide, read-only after seeding.
-  module_kinds: [String]
+  module_kinds: [String],
+  # the kind each constrained unit var ranges over: seeded from the
+  # decl's unit tparams and copied to fresh vars at instantiation.
+  # A var absent here is unconstrained. The abelian pivot consults
+  # this before binding, so a habitant of one kind cannot bind a
+  # tparam declared over another.
+  unit_var_kinds: [UVKind]
 }
+
+#[doc("infer: a (unit-var id, kind name) constraint entry.")]
+pub type UVKind = UVK(Int, String)
 
 fn subst_empty() : Subst = Subst {
   slots:     array_make(64, None),
@@ -5946,12 +5985,42 @@ fn subst_empty() : Subst = Subst {
   row_fresh: 0,
   unit_slots: array_make(16, None),
   unit_fresh: 0,
-  module_kinds: []
+  module_kinds: [],
+  unit_var_kinds: []
 }
 
 fn subst_seed_module_kinds(s: Subst, mks: [String]) : Subst = Subst {
   slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
-  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh, module_kinds: mks
+  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh, module_kinds: mks,
+  unit_var_kinds: s.unit_var_kinds
+}
+
+fn subst_unit_kind_lookup(s: Subst, v: Int) : Option[String] =
+  uvk_lookup(s.unit_var_kinds, v)
+
+fn uvk_lookup(xs: [UVKind], v: Int) : Option[String] = match xs {
+  [] -> None
+  [h, ...rest] -> match h {
+    UVK(id, k) -> if id == v { Some(k) } else { uvk_lookup(rest, v) }
+  }
+}
+
+# Constrain unit var `v` to kind `k`. `""` (kind-agnostic) adds nothing.
+fn subst_add_unit_kind(s: Subst, v: Int, k: String) : Subst =
+  if k == "" { s }
+  else { Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+                 unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
+                 module_kinds: s.module_kinds,
+                 unit_var_kinds: [UVK(v, k), ...s.unit_var_kinds] } }
+
+fn subst_add_unit_kinds(s: Subst, ids: [Int], kinds: [String]) : Subst {
+  match ids {
+    [] -> s
+    [i, ...irest] -> match kinds {
+      [] -> s
+      [k, ...krest] -> subst_add_unit_kinds(subst_add_unit_kind(s, i, k), irest, krest)
+    }
+  }
 }
 
 fn subst_lookup(s: Subst, v: Int) : Option[Ty] {
@@ -5968,7 +6037,7 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst / Mutable {
   let slots2 = array_set(slots1, v, Some(ty))
   Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds }
+          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
 }
 
 # Row-var substitution (parallel to subst_lookup / subst_extend, but
@@ -5994,7 +6063,7 @@ fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst / Mutable {
   let rs2 = array_set(rs1, v, Some(r))
   Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh,
           unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds }
+          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
 }
 
 # Allocate a fresh row variable id and bump the counter. Returned in
@@ -6005,7 +6074,7 @@ fn subst_fresh_row(s: Subst) : FreshRow {
   let id = s.row_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1,
                    unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                   module_kinds: s.module_kinds }
+                   module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
   FreshRow { id: id, subst: s1 }
 }
 
@@ -6025,7 +6094,7 @@ fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst / Mutable {
   let us2 = array_set(us1, v, Some(u))
   Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: us2, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds }
+          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
 }
 
 type FreshUnit = { id: Int, subst: Subst }
@@ -6034,7 +6103,7 @@ fn subst_fresh_unit(s: Subst) : FreshUnit {
   let id = s.unit_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
                    unit_slots: s.unit_slots, unit_fresh: id + 1,
-                   module_kinds: s.module_kinds }
+                   module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
   FreshUnit { id: id, subst: s1 }
 }
 
@@ -6393,7 +6462,12 @@ fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
           # self-cycle (would be unusual since we removed the var).
           let bound = utable_to_tree(utable_negdiv(rest, k))
           if occurs_unit(pick.id, bound, s) { None }
-          else { Some(subst_unit_extend(s, pick.id, bound)) }
+          else {
+            match unit_kind_gate(s, pick.id, bound) {
+              None -> None
+              Some(s1) -> Some(subst_unit_extend(s1, pick.id, bound))
+            }
+          }
         } else {
           # Pivot does not cleanly divide the remainder. The classical
           # Kennedy/Stuckey fix introduces a fresh unit-var w and
@@ -6405,6 +6479,44 @@ fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
           None
         }
       }
+    }
+  }
+}
+
+# The kind a habitant symbol inhabits: its qualifier when present,
+# Measure for a bare symbol (default-kind habitants stay bare by
+# construction — see kind_qualify_nondefault).
+fn unit_sym_kind_name(sym: String) : String =
+  if kind_sym_is_qualified(sym) { kind_sym_kind(sym) } else { measure_kind_name() }
+
+# Kind gate on a pivot bind `?v := bound`: when `v` is constrained to
+# kind K, every habitant symbol in `bound` must inhabit K, and every
+# unit var in `bound` inherits the constraint. A cross-kind habitant
+# or a conflicting var constraint refuses the bind (None), surfacing
+# as the ordinary unification mismatch at the source position.
+fn unit_kind_gate(s: Subst, v: Int, bound: UnitExprT) : Option[Subst] {
+  match subst_unit_kind_lookup(s, v) {
+    None -> Some(s)
+    Some(k) -> {
+      let t = unit_to_table(bound)
+      if uk_syms_ok(t.syms, k) { uk_constrain_vars(t.vars, k, s) } else { None }
+    }
+  }
+}
+
+fn uk_syms_ok(xs: [USymEntry], k: String) : Bool = match xs {
+  [] -> true
+  [h, ...rest] -> match h {
+    USE(sym, _) -> if unit_sym_kind_name(sym) == k { uk_syms_ok(rest, k) } else { false }
+  }
+}
+
+fn uk_constrain_vars(xs: [UVarEntry], k: String, s: Subst) : Option[Subst] = match xs {
+  [] -> Some(s)
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      None -> uk_constrain_vars(rest, k, subst_add_unit_kind(s, v, k))
+      Some(k2) -> if k2 == k { uk_constrain_vars(rest, k, s) } else { None }
     }
   }
 }
@@ -7315,7 +7427,7 @@ fn max_id_loop(vs: [Int], acc: Int) : Int {
 # clamping up to `max(vars) + 1`, fresh vars never alias any bound id.
 fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
   match sc {
-    Scheme(vars, _, _, body) -> {
+    Scheme(vars, _, _, _, body) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
@@ -7354,7 +7466,7 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: need,
                               unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                              module_kinds: s.module_kinds } }
+                              module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds } }
   mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
 }
 
@@ -7383,7 +7495,7 @@ fn mk_fresh_unit_subst(uvars: [Int], s: Subst) : FreshUnitSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: s.row_fresh,
                               unit_slots: s.unit_slots, unit_fresh: need,
-                              module_kinds: s.module_kinds } }
+                              module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds } }
   mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed, [])
 }
 
@@ -7397,7 +7509,7 @@ fn advance_row_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh + n,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh,
-                     module_kinds: st.sub.module_kinds }
+                     module_kinds: st.sub.module_kinds, unit_var_kinds: st.sub.unit_var_kinds }
     st_set_sub(st, s1)
   }
 }
@@ -7410,7 +7522,7 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh + n,
-                     module_kinds: st.sub.module_kinds }
+                     module_kinds: st.sub.module_kinds, unit_var_kinds: st.sub.unit_var_kinds }
     st_set_sub(st, s1)
   }
 }
@@ -8757,7 +8869,7 @@ fn st_instantiate(st: InferState, sc: TyScheme) : TyRes / Mutable {
 
 fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
   match sc {
-    Scheme(vars, rvars, uvars, _) -> {
+    Scheme(vars, rvars, uvars, ukinds, _) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if st.env.fresh >= need { st.env.fresh } else { need }
@@ -8788,7 +8900,10 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
         _  -> {
           let fus = mk_fresh_unit_subst(uvars, mid.st.sub)
           let body2 = apply_ty(fus.temp, mid.ty)
-          let st_out2 = st_set_sub(mid.st, fus.sub)
+          # each fresh var inherits its scheme tparam's kind, so the
+          # abelian pivot can refuse a cross-kind habitant bind.
+          let sub2 = subst_add_unit_kinds(fus.sub, fus.fresh_ids, ukinds)
+          let st_out2 = st_set_sub(mid.st, sub2)
           TyInstRes { st: st_out2, ty: body2, fresh: mid.fresh,
                       unit_fresh: fus.fresh_ids }
         }
@@ -9615,7 +9730,7 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
   match ty_env_lookup(st.env, key) {
     None     -> st
     Some(sc) -> match sc {
-      Scheme(_, _, _, body) -> match body {
+      Scheme(_, _, _, _, body) -> match body {
         TyFnT(arg_tys, _, _) -> {
           let expected = list_length(arg_tys) + 1
           let got = list_length(params)
@@ -10908,7 +11023,7 @@ fn cap_eff_of_var(st: InferState, name: String) : Option[Label] =
   match ty_env_lookup(st.env, name) {
     None     -> None
     Some(sc) -> match sc {
-      Scheme(_, _, _, ty) -> match apply_ty(st.sub, ty) {
+      Scheme(_, _, _, _, ty) -> match apply_ty(st.sub, ty) {
         TyCon(None, ename, args) ->
           if is_effect_in_env(st.env, ename) { Some(Label { eff: ename, ty_args: args }) }
           else { None }
@@ -11551,7 +11666,16 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let lty_now = apply_ty(rr.st.sub, rl.ty)
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      if binop_same_head_dimmed(lty_now, rty_now) {
+        # dimensioned protocol operands (`Decimal<USD>`): the impl
+        # erases units (its signature is the bare carrier), so combine
+        # them here exactly as the primitive dim path does — the
+        # Module guard rejects habitant products, and the result
+        # carries the combined unit.
+        synth_binop_proto_dim_mul(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+      } else {
+        synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      }
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
       # heterogeneous prim<->nonprim or cross-nonprim
       # routing, gated on impl-existence in the snapshot.
@@ -11580,7 +11704,14 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let lty_now = apply_ty(rr.st.sub, rl.ty)
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      # dimensioned protocol operands keep the primitive rule: `+` and
+      # `-` demand unit equality. The impl signature is the bare
+      # carrier and would silently swallow a unit mismatch.
+      let st_d = if binop_same_head_dimmed(lty_now, rty_now) {
+        let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+        st_unify(rr.st, rl.ty, rr.ty, what, line, col)
+      } else { rr.st }
+      synth_binop_proto(st_d, op, rl.expr, rr.expr, line, col)
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
       # heterogeneous routing.
       synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
@@ -11788,6 +11919,38 @@ fn synth_binop_proto(st: InferState, op: String, le: Expr, re: Expr,
   let dispatcher = inf_proto_dispatcher_name(binop_proto_method(op))
   let callee = mk_expr(EVar(dispatcher), line, col)
   synth_call(st, callee, [le, re], line, col)
+}
+
+# both operands share a concrete TyCon head and at least one carries
+# a unit decoration — the shapes where protocol dispatch would
+# otherwise erase the units (the impl signature is the bare carrier).
+fn binop_same_head_dimmed(lt: Ty, rt: Ty) : Bool =
+  ty_same_head(lt, rt) and (ty_is_dimmed(lt) or ty_is_dimmed(rt))
+
+fn ty_is_dimmed(t: Ty) : Bool = match t {
+  TyDimT(_, _) -> true
+  TyRefineT(inner, _) -> ty_is_dimmed(inner)
+  _ -> false
+}
+
+# `*` / `/` over dimensioned protocol operands: combine the units the
+# way the primitive dim path does, run the Module formation guard on
+# the combined unit, dispatch to the impl on the bare carriers, and
+# stamp the combined unit back onto the impl's result. `USD·USD` dies
+# in the guard; `Decimal<USD> · Decimal` keeps the habitant; a full
+# cancellation (`USD/USD`) yields the bare carrier.
+fn synth_binop_proto_dim_mul(st: InferState, op: String,
+                             le: Expr, lt: Ty, re: Expr, rt: Ty,
+                             line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let ls = ty_split_dim(lt, st.sub)
+  let rs = ty_split_dim(rt, st.sub)
+  let combined = if op == "*" { UMul(ls.dim, rs.dim) }
+                 else { UMul(ls.dim, UInv(rs.dim)) }
+  let s1 = st_check_module_unit(st, op, combined, line, col)
+  let inf = synth_binop_proto(s1, op, le, re, line, col)
+  let base = (ty_split_dim(inf.ty, inf.st.sub)).base
+  let ty = dim_collapse(base, unit_canon(combined))
+  mk_inferred(inf.st, ty, with_ty(inf.expr, ty))
 }
 
 # Try to extract a compile-time integer literal from an expression.
@@ -13906,8 +14069,10 @@ fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
 # stamp it with the unit-decorated type. Unit info is erased at the
 # carrier level — this is the same pattern existing UoM literals
 # follow (`Real<USD>` is a TyDimT decoration over a plain Real).
+# `raw` rides an `EFixed` typed `Int128` (the carrier's field type);
+# a bare `EInt` would emit a 64-bit Int and trap in boxed arithmetic.
 fn mk_decimal_record(raw: Int, scale: Int, line: Int, col: Int, ty: Ty) : Expr {
-  let raw_lit = mk_expr(EInt(raw), line, col)
+  let raw_lit = with_ty(mk_expr(EFixed(int_to_string(raw), TyInt128), line, col), TyInt128)
   let scale_lit = mk_expr(EInt(scale), line, col)
   let fields = [FI("raw", raw_lit), FI("scale", scale_lit)]
   with_ty(mk_expr(ERecordLit("Decimal", fields), line, col), ty)
@@ -15810,7 +15975,7 @@ fn arms_cover_variant(arms: [Arm], target: String) : Bool {
 
 fn extract_return_tycon(sc: TyScheme) : Option[String] {
   match sc {
-    Scheme(_, _, _, ty) -> match ty {
+    Scheme(_, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyCon(_, nm, _) -> Some(nm)
         _            -> None
@@ -15970,7 +16135,7 @@ fn ty_env_decl_marker_name(tname: String, arity: Int) : String =
               int_to_string(arity), "__"])
 
 fn ty_env_add_decl_marker(env: TyEnv, tname: String, arity: Int) : TyEnv = {
-  # The sentinel's scheme is a closed `Scheme([], [], [], TyAny)`
+  # The sentinel's scheme is a closed `Scheme([], [], [], [], TyAny)`
   # so any accidental read returns `None` from
   # `extract_return_tycon_arity`. The walker keys on the name
   # alone and never dereferences the scheme.
@@ -15984,7 +16149,7 @@ fn extract_return_tycon_arity(sc: TyScheme) : Option[TyConArity] {
   # closure instead of the local binding (see CLAUDE.md / global
   # feedback memo on the `args` shadow).
   match sc {
-    Scheme(_, _, _, ty) -> match ty {
+    Scheme(_, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyCon(_, nm, tas) -> Some(TCA(nm, list_length(tas)))
         _              -> None
@@ -16167,7 +16332,7 @@ fn check_variants_nullary_loop(es: [TyEntry], target: String,
       }
       if first_upper and not string_contains_dot(visible_name) {
         match e.scheme {
-          Scheme(_, _, _, ty) -> match ty {
+          Scheme(_, _, _, _, ty) -> match ty {
             # Zero-arg variant: scheme is the bare TyCon (e.g. `Hearts`
             # for `type Suit = Hearts | ...`).
             TyCon(_, nm, _) ->
@@ -17013,7 +17178,14 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
       # one. The post-finalise canonicalisation pass below redirects
       # the chain endpoint back to the bound id.
       let unit_tpcount = tparam_unit_count(effective_tparams)
-      let st0b = if unit_tpcount > 0 { advance_unit_fresh(st0a, unit_tpcount) } else { st0a }
+      let st0b0 = if unit_tpcount > 0 { advance_unit_fresh(st0a, unit_tpcount) } else { st0a }
+      # constrain the reserved tparam uvar ids (0..n-1, in tparam
+      # order) to their declared kinds, so body-side binds of the
+      # tparam var refuse habitants of another kind.
+      let st0b = if unit_tpcount > 0 {
+        st_set_sub(st0b0, subst_add_unit_kinds(st0b0.sub,
+          range_ids(0, unit_tpcount), tparam_unit_kinds(effective_tparams)))
+      } else { st0b0 }
       let added = add_infer_params_with_binds(st0b, ps, tpbinds, rbinds)
       # when the user omits the return-type
       # annotation, infer it from the body's actual type. The
@@ -18082,7 +18254,17 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
     }
     e1 + validate_unit_refs_expr(body, local_scope, file)
   }
-  DType(_, _, _, body, _, _, _) -> validate_unit_refs_typebody(body, scope, file)
+  # a type decl's unit-kind tparams scope over its body
+  # (`type Money[c: Currency] = Decimal<c>`), same as fn tparams.
+  DType(_, _, tparams, body, _, _, _) ->
+    validate_unit_refs_typebody(body,
+      unit_scope_add_locals(scope, collect_unit_tparam_names(tparams)), file)
+  # a unit alias body is shape-checked at its declaration —
+  # expansion happens after this pass, so a Module-kind product could
+  # otherwise ride in through the alias name.
+  DUnit(_, _, Some(body), _, line, col) ->
+    validate_unit_expr(body, scope, file, line, col) +
+    validate_module_unit_shape(body, scope, file, line, col)
   DTest(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
   DBench(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
   DCheck(_, ps, body, _, _) ->
@@ -18350,7 +18532,8 @@ fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
   [] -> acc
   [s, ...rest] -> {
     let e1 = match s {
-      SLet(_, _, rhs)             -> acc + validate_unit_refs_expr(rhs, scope, file)
+      SLet(_, ann, rhs)           -> acc + validate_unit_refs_opt_te(ann, scope, file) +
+                                           validate_unit_refs_expr(rhs, scope, file)
       SAssert(c, m) -> match m {
         Some(me) -> acc + validate_unit_refs_expr(c, scope, file) +
                           validate_unit_refs_expr(me, scope, file)
@@ -18360,7 +18543,8 @@ fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
       SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, scope, file) +
                                             validate_unit_refs_expr(i, scope, file) +
                                             validate_unit_refs_expr(v, scope, file)
-      SVar(_, _, rhs, _, _)       -> acc + validate_unit_refs_expr(rhs, scope, file)
+      SVar(_, ann, rhs, _, _)     -> acc + validate_unit_refs_opt_te(ann, scope, file) +
+                                           validate_unit_refs_expr(rhs, scope, file)
       SUse(_, _, _)               -> acc
     }
     validate_unit_refs_stmts(rest, scope, file, e1)
@@ -18376,6 +18560,12 @@ fn validate_unit_refs_clauses(cs: [HClause], scope: UnitScope, file: String,
       validate_unit_refs_clauses(rest, scope, file, e1)
     }
   }
+}
+
+fn validate_unit_refs_opt_te(opt: Option[TypeExpr], scope: UnitScope,
+                             file: String) : Int / Console + File = match opt {
+  None -> 0
+  Some(te) -> validate_unit_refs_te(te, scope, file)
 }
 
 fn validate_unit_refs_opt_return(opt: Option[HReturn], scope: UnitScope,
@@ -19477,9 +19667,14 @@ fn bucket_append(acc: [ModuleDecls], home: String, d: Decl,
 # single-module input. Every legacy caller of
 # infer_program_with_protos goes through here; the per-module fold
 # entry point is `typecheck_program`.
+# Module-kind names are derived from the decl stream itself so the
+# library/LSP entry points get the formation guard too; the driver's
+# main path passes its pre-strip capture through the cached variant
+# instead (kind decls are stripped before the typer there).
 fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
                                proto_impls: [ProtoImplReg]) : TypedProgram / Console + File =
-  infer_program_with_protos_cached(file, decls, verbose, proto_impls, [], [])
+  infer_program_with_protos_cached(file, decls, verbose, proto_impls, [],
+                                   module_kind_names(decls))
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
@@ -19973,7 +20168,7 @@ pub fn list_has_int(xs: [Int], n: Int) : Bool {
 # which still constrain the substitution meaningfully.
 fn synth_return_structural(sc: TyScheme) : Bool {
   match sc {
-    Scheme(vars, _, _, ty) -> match ty {
+    Scheme(vars, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyVarT(v) -> not list_has_int(vars, v)
         _         -> true
