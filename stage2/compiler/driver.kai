@@ -30,6 +30,7 @@ import compiler.modules
 import compiler.user_cache
 import compiler.core_cache
 import compiler.desugar
+import compiler.refine_enforce
 import compiler.region
 import compiler.infer
 import compiler.evidence_scan
@@ -4233,13 +4234,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
             let raw_decls_post_eff = expand_aliases_in_decls(injected, alias_res.aliases)
             # Expand transparent type aliases. `type Foo = T`
-            # (single-component, RHS not refinement, name not an effect)
-            # is structural — every TyName("Foo", args) rewrites to the
-            # alias body with tparams substituted. Multi-component
-            # `type X = A | B` (TBSum) keeps nominal-union semantics.
-            # Refinement-aliases (`type Pos = Int where _ > 0`) are
-            # filtered out so synthesize_refine_pred_fns + pattern
-            # narrowing keep working.
+            # (single-component, name not an effect) is structural —
+            # every TyName("Foo", args) rewrites to the alias body with
+            # tparams substituted. Multi-component `type X = A | B`
+            # (TBSum) keeps nominal-union semantics. Refinement-aliases
+            # (`type Pos = Int where p`) expand to their inline
+            # `TyRefine` form at every use site (the synthesised
+            # `__ref_pred_X` fns and the pattern-narrow lowering have
+            # already run).
             let ta_table = collect_transparent_aliases(raw_decls_post_eff,
                                                         eff_names_for_alias)
             # Re-run effect-alias expansion after transparent type-alias
@@ -4253,6 +4255,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               expand_aliases_in_decls(expand_ta_decls(raw_decls_post_eff, ta_table,
                                                        alias_res.aliases),
                                        alias_res.aliases)
+            # Refinement-type enforcement at the downcast sites
+            # (annotated binding, refined param, refined return), now
+            # that every refinement is the inline `TyRefine` form: a
+            # closed value refuting the predicate is a compile error;
+            # a dynamic value gets a structured runtime check.
+            let renf_static_errs = report_refinement_statics(raw_decls_pre_pos, path)
+            let raw_decls_enforced = enforce_refinements_decls(raw_decls_pre_pos)
             # Rewrite `T { v1, v2 }` (parser tags fields with
             # `__pos_<i>__` sentinels) into `T { f1: v1, f2: v2 }`
             # using the record's declared field order. Runs before any
@@ -4260,7 +4269,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # sentinel field name. Reports unknown-record + arity
             # diagnostics; on errs > 0 we short-circuit before
             # invariants downstream can panic on the still-tagged AST.
-            let pos_rec = desugar_pos_records_decls(raw_decls_pre_pos, path)
+            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, path)
             let raw_decls_with_regions = pos_rec.decls
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
@@ -4408,6 +4417,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             else if proto_errs > 0 { proto_errs }
             else if import_hole_errs > 0 { import_hole_errs }
             else if pred_errs > 0 { pred_errs }
+            else if renf_static_errs > 0 { renf_static_errs }
             else if unit_ref_errs > 0 { unit_ref_errs }
             else if nominal_row_errs > 0 { nominal_row_errs }
             else if pub_sig_errs > 0 { pub_sig_errs }

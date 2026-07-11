@@ -696,6 +696,20 @@ both UoM and refinements together.
 
 ## Implementation status — 2026-04-27
 
+> **Enforcement status (2026-07-10, refs #1169):** refinement-type
+> predicates are now **enforced at the three downcast sites** —
+> annotated bindings (`let x: Refined = v`, `var`), refined
+> parameters, and refined returns. A closed value that refutes the
+> predicate is a **compile error** (mirror of the call-site literal
+> check); a dynamic value gets a runtime check that panics with the
+> structured diagnostic (`refinement violated in ... / predicate: ...
+> / declared at ...`, same shape as `requires`/`ensures`). Checks are
+> **omitted** where the predicate is proven — constant folding, or
+> entailment from the value's own refined binding — so proven happy
+> paths pay nothing. `var` cell *reassignment* is not re-checked
+> (only the initial value); that follow-up belongs to the typer-side
+> narrowing work.
+
 **Parser-side landed (sub-lanes a–e).** `BaseT where Pred`,
 `requires` / `ensures` clauses, the `result` binding, parse-time
 constant folding, and the `ensure(value) where pred` primary
