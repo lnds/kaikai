@@ -64,12 +64,14 @@ import compiler.util
 # an ordinal so two regions sharing (line,col) after a span-copying
 # desugar never collide (the indexed-by-position bug-class — same key
 # discipline as rawsafe.kai's RSMark).
-#[doc("A recorded `region { }` block: file, line, col, nth (ordinal disambiguator).")]
-pub type RegionMark = RM(String, Int, Int, Int)
+#[doc("A recorded `region { }` block: file, line, col, nth (ordinal disambiguator), and the region's binder name (empty for the bare form).")]
+pub type RegionMark = RM(String, Int, Int, Int, String)
 
-pub fn rmark_line(m: RegionMark) : Int = match m { RM(_, l, _, _) -> l }
-pub fn rmark_col(m: RegionMark) : Int = match m { RM(_, _, c, _) -> c }
-pub fn rmark_nth(m: RegionMark) : Int = match m { RM(_, _, _, n) -> n }
+pub fn rmark_line(m: RegionMark) : Int = match m { RM(_, l, _, _, _) -> l }
+pub fn rmark_col(m: RegionMark) : Int = match m { RM(_, _, c, _, _) -> c }
+pub fn rmark_nth(m: RegionMark) : Int = match m { RM(_, _, _, n, _) -> n }
+#[doc("The region's binder name (`region { r -> }` → `\"r\"`), or empty for the bare `region { }` form.")]
+pub fn rmark_name(m: RegionMark) : String = match m { RM(_, _, _, _, nm) -> nm }
 
 # Result of the region rewrite: the unwrapped decls plus the region
 # side table (consumed by the emitter in P1 for arena lowering).
@@ -154,13 +156,13 @@ fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr {
   match e.kind {
     ECall(callee, call_args) -> {
       match rw_region_marker(callee, call_args) {
-        Some(block) -> {
+        Some(rm) -> {
           # Recurse into the block first (nested regions, inner markers).
-          let inner = rw_expr(block, file, w)
+          let inner = rw_expr(rm.block, file, w)
           # Record this region. The marker's own line/col is the
           # `region` keyword position; nth disambiguates duplicates.
           let nth = inner.w.nth
-          let mark = RM(file, e.line, e.col, nth)
+          let mark = RM(file, e.line, e.col, nth, rm.name)
           let w2 = RWalk { regions: [mark, ...inner.w.regions], nth: nth + 1 }
           # Unwrap: the region's value IS the block's value. Downstream
           # sees a plain block (P2a normal alloc; P1 arena via the side
@@ -277,19 +279,31 @@ fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr {
 fn rebuild(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-# Is `callee`/`call_args` the region marker `ECall(EVar("region"), [block])`?
-# Returns the block when it matches. The parameter is `call_args`, NOT
-# `args`: a binding/param named `args` in a compiler module shadows the
-# core `args()` and stage 1 mis-compiles it into a spurious
-# "non-exhaustive match" runtime panic far from this call site (memory
-# feedback_kaikai_param_args_shadow; every other compiler module spells
-# the ECall arg list `args_` for the same reason).
-fn rw_region_marker(callee: Expr, call_args: [Expr]) : Option[Expr] {
+# The recognised region marker: the block body plus the region's binder
+# name (empty for the bare form).
+type RegionMarker = { block: Expr, name: String }
+
+# Is `callee`/`call_args` a region marker? Two shapes:
+#   bare   `ECall(EVar("region"), [block])`              — name = ""
+#   named  `ECall(EVar("region"), [ELambda([r], block)])` — name = "r"
+# Returns the block and name when it matches. The parameter is
+# `call_args`, NOT `args`: a binding/param named `args` in a compiler
+# module shadows the core `args()` and stage 1 mis-compiles it into a
+# spurious "non-exhaustive match" runtime panic far from this call site
+# (memory feedback_kaikai_param_args_shadow; every other compiler module
+# spells the ECall arg list `args_` for the same reason).
+fn rw_region_marker(callee: Expr, call_args: [Expr]) : Option[RegionMarker] {
   match callee.kind {
     EVar(nm) ->
       if nm == "region" {
         match call_args {
-          [block] -> Some(block)
+          [arg] -> match arg.kind {
+            ELambda(ps, body) -> match ps {
+              [p0] -> Some(RegionMarker { block: body, name: p0.pname })
+              _ -> None
+            }
+            _ -> Some(RegionMarker { block: arg, name: "" })
+          }
           _ -> None
         }
       } else { None }

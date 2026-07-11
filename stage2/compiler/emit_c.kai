@@ -312,6 +312,65 @@ fn emit_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
   }
 }
 
+# True when a resolved type carries a region brand: a `TyDimT` whose
+# base is a heap-allocated user aggregate (a nominal `TyCon` or a list),
+# not a numeric carrier. Measure/Currency brand numeric heads
+# (`TyDimT(TyReal, m)`, `Decimal<USD>`); a region brands an aggregate
+# (`Tree<r>` = `TyDimT(TyCon("Tree"), r)`). Routing a ctor of such a
+# type to the arena is what makes `insert[r]`'s `Node(...)` bump-allocate
+# in `r` even across a fn boundary — the by-type routing that lexical
+# `in_region` cannot reach. Safe when no arena is live: the arena ctors
+# fall back to the RC ctor when `kai_arena_current()` is NULL.
+fn ty_has_region_brand(ty: Ty) : Bool = match ty {
+  TyDimT(base, _) -> match base {
+    TyCon(_, name, _) -> not ty_is_numeric_carrier_name(name)
+    TyListT(_)        -> true
+    _                 -> false
+  }
+  _ -> false
+}
+
+fn ty_is_numeric_carrier_name(name: String) : Bool =
+  name == "Decimal" or name == "DecimalBig" or name == "BigInt"
+
+# True when a fn takes or returns a region-branded aggregate — a param
+# or return `Tree<r>` (surface `TyDim` on a user head). Unlike the
+# tparam list, the parameter's surface type survives monomorphization
+# (mono changes the mangle, not the written `ptype`), so this is the
+# reliable region-polymorphism test at the post-mono emit / tcrec sites
+# where the tparam list has been emptied.
+fn params_have_region(params: [Param], ret_opt: Option[TypeExpr]) : Bool =
+  if any_param_region(params) { true }
+  else { match ret_opt { Some(te) -> te_is_region_branded(te)  None -> false } }
+
+fn any_param_region(params: [Param]) : Bool = match params {
+  [] -> false
+  [p, ...rest] -> match p.ptype {
+    Some(te) -> if te_is_region_branded(te) { true } else { any_param_region(rest) }
+    None     -> any_param_region(rest)
+  }
+}
+
+# A surface `TyDim` whose base is a user head (not a numeric carrier) is
+# a region brand — `Tree<r>`, not `Real<m>` / `Decimal<USD>`.
+fn te_is_region_branded(te: TypeExpr) : Bool = match te.tkind {
+  TyDim(base, _) -> match base.tkind {
+    TyName(n, _) -> not (n == "Real" or n == "Int" or n == "Decimal")
+    _            -> true
+  }
+  _ -> false
+}
+
+# Region-brand routing for a ctor whose resolved type is `ty`: an
+# aggregate branded with a region bump-allocates in the current arena.
+# Combines with the lexical `in_region` flag — either lands the ctor in
+# the arena.
+fn emit_ctx_route_brand(cx: EmitCtx, ty_opt: Option[Ty]) : EmitCtx =
+  match ty_opt {
+    Some(ty) -> if ty_has_region_brand(ty) { emit_ctx_with_in_region(cx, true) } else { cx }
+    None     -> cx
+  }
+
 # The C cons constructor a region-lexical site emits: arena-bump inside
 # a region body, ordinary RC otherwise.
 fn emit_cons_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_cons(" } else { "kai_cons(" }
@@ -1976,6 +2035,35 @@ fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
 # `slots[i].ptr` and assumes `slot_mask == 0`, which would mismatch
 # the typed extract (`slots[i].i64`). Reuse-for-typed-cells is a
 # follow-up lane.
+# A region rebuild that would otherwise reuse-in-place: bump-allocate a
+# fresh cell in the current arena. Mirrors the two `emit_variant_call_typed`
+# shapes — typed slots + mask when the variant has a primitive payload,
+# boxed slots otherwise — but always `kai_arena_variant`.
+fn emit_arena_variant_rebuild(src: String, cname: String, cargs: [Expr], n: Int,
+                              tys_opt: Option[[TypeExpr]], has_prim: Bool,
+                              cx: EmitCtx) : String / Console {
+  let tag_str = int_to_string(evar_find_tag(cx.variants, cname))
+  if has_prim {
+    match tys_opt {
+      Some(ts) -> {
+        let mask = variant_slot_mask(ts, cx.enums)
+        let slot_inits = emit_variant_slot_init_list(src, cargs, ts, cx)
+        concat_all([
+          "kai_arena_variant(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+          ", ", int_to_string(mask), ", (KaiVarSlot[]){", slot_inits, "})"
+        ])
+      }
+      None -> "kai_unit() /* arena reuse: typed lookup vanished */"
+    }
+  } else {
+    let slot_strs = emit_call_args_slots(src, cargs, cx)
+    concat_all([
+      "kai_arena_variant(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+      ", 0, (KaiVarSlot[]){", slot_strs, "})"
+    ])
+  }
+}
+
 fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
                            cx: EmitCtx) : String / Console {
   let n = list_length(cargs)
@@ -1984,7 +2072,15 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
     Some(ts) -> variant_has_primitive_slot(ts, cx.enums)
     None     -> false
   }
-  if has_prim {
+  # In a region, reuse-in-place is off (arena cells carry the immortal
+  # sentinel rc, so `kai_check_unique` returns 0 and no rebuild recycles
+  # them); the ctor bump-allocates fresh in the arena and the whole
+  # region frees at once. Route the rebuild to the arena ctor instead of
+  # `kai_variant_reuse_at` / `kai_reuse_or_alloc_variant`, both of which
+  # target the RC heap.
+  if cx.in_region {
+    emit_arena_variant_rebuild(src, cname, cargs, n, tys_opt, has_prim, cx)
+  } else if has_prim {
     match tys_opt {
       Some(ts) -> {
         let mask = variant_slot_mask(ts, cx.enums)
@@ -6668,7 +6764,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       else { emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core) }
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
-    ECall(f, args_e) -> emit_call_expr(src, f, args_e, cx)
+    ECall(f, args_e) -> emit_call_expr(src, f, args_e, emit_ctx_route_brand(cx, x.ty))
     EField(base, fname) -> {
       # #293 Phase 1.2 — record field access RC discipline.
       # `base` is owned by the time it lands here: perceus_pass wraps
@@ -6820,8 +6916,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     }
     EMatch(scr, arms) -> emit_match_expr(src, scr, arms, cx)
     ELambda(_, _) -> emit_lambda_ref(x, cx)
-    ERecordLit(_, fields) -> emit_record_lit(src, fields, cx)
-    EList(elems) -> emit_list_expr(src, elems, cx)
+    ERecordLit(_, fields) -> emit_record_lit(src, fields, emit_ctx_route_brand(cx, x.ty))
+    EList(elems) -> emit_list_expr(src, elems, emit_ctx_route_brand(cx, x.ty))
     ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, cx)
     EBlock(stmts, opt_final) -> {
       # issue #120 (P1): a block recorded as a `region { }` lowers to a
@@ -7881,7 +7977,7 @@ fn emit_thunk_forward(d: Decl) : String {
 fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_syms: [String]) : String / Console {
 
   match d {
-    DFn(_, name, _, params, ret_ty_opt, _, body, _, _, mo) -> {
+    DFn(_, name, tps, params, ret_ty_opt, _, body, _, _, mo) -> {
       let opt_sig = lookup_ufn_sig(cx.fns, name, mo)
       let evf_slots = frame_slots_of(cx.evf, c_sym(name, mo))
       # Interprocedural reuse donation: a fn whose body rebuilds a variant
@@ -7941,8 +8037,17 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # EFn table; the other three context fields are unchanged.
         # `cur_enc_fn` becomes THIS fn's mangled symbol so a nested
         # ELambda in the body resolves to its own module's LamInfo.
+        # A region-polymorphic fn (a `Tree<r>` param or return) allocates
+        # its aggregates in the ambient arena: its ctors bump-allocate in
+        # `kai_arena_current()`, which is the region's arena during the
+        # dynamic extent of the `region { r -> }` that called it, and
+        # NULL (→ RC fallback) otherwise. Routing keys on the SIGNATURE
+        # types (which survive mono), not the tparam list (emptied by
+        # mono) nor the per-ctor `.ty` (the brand does not survive the
+        # unit normaliser on every ctor), so every ctor in the body routes.
+        let body_in_region = cx.in_region or params_have_region(params, ret_ty_opt)
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable }
+                                regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -14944,6 +15049,21 @@ fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String]
   ])
 }
 
+# The fresh-alloc brick for a TRMC spine node. In a region, bump-allocate
+# in the current arena (`kai_arena_variant`, `_trmc_sl` already holds the
+# NULL-hole slots); the cctx plugs the child pointer into the hole exactly
+# as on the RC heap. Outside a region, the inlined `kai_variant_u_fast`.
+# In a region the `_arm_ru` reuse branch above is dead anyway: an arena
+# scrutinee carries the immortal sentinel rc, so `kai_drop_reuse_token`
+# yields null and control always reaches this fresh path.
+fn trmc_fresh_alloc(cname: String, tag_str: String, n: Int, mask: Int, cx: EmitCtx) : String =
+  if cx.in_region {
+    concat_all(["kai_arena_variant(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+                ", ", int_to_string(mask), ", _trmc_sl)"])
+  } else {
+    concat_all(["kai_variant_u_fast(", tag_str, ", ", int_to_string(n), ", _trmc_sl)"])
+  }
+
 fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String,
                   dropmask: Int, pnames: [String], args_e: [Expr],
                   cx: EmitCtx) : String / Console {
@@ -14996,7 +15116,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     "_trmc_node = _arm_ru; ", slot_stores,
     "_trmc_node->variant_tag = ", tag_str, "; _trmc_node->rc = 1; ",
     "} else { KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
-    "_trmc_node = kai_variant_u_fast(", tag_str, ", ", int_to_string(n), ", _trmc_sl); } ",
+    "_trmc_node = ", trmc_fresh_alloc(cname, tag_str, n, mask, cx), "; } ",
     "_arm_ru = kai_reuse_null; ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
     "kai_field_addr_create(&kai_var_slots(_trmc_node)[", int_to_string(holeslot), "].ptr)); ",
