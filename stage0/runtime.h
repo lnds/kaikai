@@ -15,7 +15,7 @@
  * decref them or keep them alive as part of the returned value). The
  * return value is owned by the caller.
  *
- * Closures and higher-order prelude helpers (map/filter/reduce/each)
+ * Closures and higher-order core helpers (map/filter/reduce/each)
  * go through a dynamic dispatch path `kai_apply(closure, argc, argv)`
  * to keep the generated code uniform.
  */
@@ -141,7 +141,7 @@
 #  pragma clang diagnostic pop
 #endif
 
-/* Not every program uses every prelude function; silence the
+/* Not every program uses every core function; silence the
    unused-function warnings that would otherwise pile up in `cc` output
    when stage 0 links only the parts a given program needs. */
 #if defined(__GNUC__) || defined(__clang__)
@@ -1013,7 +1013,7 @@ static void kai_rc_site_register_once(void) {
  *    set by the emitter via `kai_set_scope_fn(<name>)` at the top
  *    of every generated body. Static (the kaic2 self-compile is
  *    single-threaded). Inherits from the caller for fns that don't
- *    yet carry the hook (dispatch from prelude / FFI), so the
+ *    yet carry the hook (dispatch from core / FFI), so the
  *    attribution remains stable across mixed call paths.
  *  - allocator tag (KAI_VARIANT, KAI_RECORD, …): captured from
  *    `kai_alloc_traced`'s `tag` parameter.
@@ -2962,7 +2962,7 @@ static void kai_decref(KaiValue *v) {
  * `__perceus_dup` and `__perceus_drop` are AST-level magic names the
  * `perceus_pass` rewrites onto non-last EVar reads (dup) and unused-
  * binding scope ends (drop). The emitter lowers them to these
- * wrappers so the pass operates entirely through the prelude path
+ * wrappers so the pass operates entirely through the core path
  * without bespoke C generation.
  *
  * `kai_internal_dup` is `kai_incref` with a typed return; the AST
@@ -3113,8 +3113,8 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
 
 /* Lane FIX (top-3 leak sites): short-string interning.
  *
- * `prelude_table()` (DIAG rank #1) reallocates ~50 strings per call —
- * every call to `prelude_find` rebuilds the same `.rodata`-pointed
+ * `core_table()` (DIAG rank #1) reallocates ~50 strings per call —
+ * every call to `core_find` rebuilds the same `.rodata`-pointed
  * literals. The strings are content-deduped by the C compiler, so
  * repeat `kai_str("print")` calls receive the *same* `cstr` pointer.
  * Interning by pointer-then-content gives an immortal singleton per
@@ -3296,10 +3296,10 @@ static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
  * sentinel, so installs silently fail and every later invocation
  * falls back to a fresh alloc. The 16384-bucket sizing originally
  * landed for #293 turned out to be ~16x too small for kaic2's
- * self-compile: the typer's `prelude_table` rebuilds 47 EP variants
+ * self-compile: the typer's `core_table` rebuilds 47 EP variants
  * per call × ~13K calls (issue #297 EP wave, 2026-05-07), and
  * Some/Ok/TyCon-shaped immortal-payload combinations push the
- * working set past 16K well before the prelude entries land. The
+ * working set past 16K well before the core entries land. The
  * larger 262144-bucket sizing absorbs the EP table outright (642K
  * leaks → 45 cached chunks, 99.99% drop) and adds ~16 MB of static
  * .bss to the binary. Collisions still degrade to a fresh non-cached
@@ -4391,7 +4391,7 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
  * KaiValue * passed to kai_apply is OWNED by the call. The dispatched
  * fn body cannot read `self` after its own return (it cannot — that
  * pointer is freed before the result hits the caller), and runtime
- * helpers (kai_prelude_map / _filter / _flat_map / _reduce / _each,
+ * helpers (kai_core_map / _filter / _flat_map / _reduce / _each,
  * kai_fiber_trampoline) now incref the closure ahead of every loop
  * iteration so each kai_apply gets its own ref to consume; their
  * post-loop decref releases the original ref the helper was handed. */
@@ -4755,15 +4755,15 @@ static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *se
     return v;
 }
 
-/* ---------- prelude: IO ---------- */
+/* ---------- core: IO ---------- */
 
 /*
- * Calling convention for the prelude: borrow semantics. Arguments are
+ * Calling convention for the core: borrow semantics. Arguments are
  * borrowed from the caller (no incref / no decref on them). Return
  * values are owned by the caller.
  */
 
-static KaiValue *kai_prelude_print(KaiValue *arg) {
+static KaiValue *kai_core_print(KaiValue *arg) {
     if (!arg) { fputc('\n', stdout); return kai_unit(); }
     if (arg->tag == KAI_STR) {
         fwrite(arg->as.s.bytes, 1, arg->as.s.len, stdout);
@@ -4777,7 +4777,7 @@ static KaiValue *kai_prelude_print(KaiValue *arg) {
     return kai_unit();
 }
 
-static KaiValue *kai_prelude_eprint(KaiValue *arg) {
+static KaiValue *kai_core_eprint(KaiValue *arg) {
     if (!arg) { fputc('\n', stderr); return kai_unit(); }
     if (arg->tag == KAI_STR) {
         fwrite(arg->as.s.bytes, 1, arg->as.s.len, stderr);
@@ -4798,7 +4798,7 @@ static KaiValue *kai_prelude_eprint(KaiValue *arg) {
  * extra '\n' that breaks strict clients. Non-String args fall through
  * `kai_to_string` for safety.
  */
-static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
+static KaiValue *kai_core_write_stdout(KaiValue *arg) {
     if (!arg) { fflush(stdout); return kai_unit(); }
     if (arg->tag == KAI_STR) {
         fwrite(arg->as.s.bytes, 1, arg->as.s.len, stdout);
@@ -4812,7 +4812,7 @@ static KaiValue *kai_prelude_write_stdout(KaiValue *arg) {
     return kai_unit();
 }
 
-static KaiValue *kai_prelude_panic(KaiValue *msg) {
+static KaiValue *kai_core_panic(KaiValue *msg) {
     KaiFiber *f = kai_current_fiber();
     if (f && f->cancel_pad_set) {
         static char buf[256];
@@ -4834,15 +4834,15 @@ static KaiValue *kai_prelude_panic(KaiValue *msg) {
     return kai_unit();
 }
 
-static KaiValue *kai_prelude_exit(KaiValue *code) {
+static KaiValue *kai_core_exit(KaiValue *code) {
     int c = (code && code->tag == KAI_INT) ? (int) code->as.i : 0;
     exit(c);
     return kai_unit();
 }
 
-/* ---------- prelude: conversions ---------- */
+/* ---------- core: conversions ---------- */
 
-static KaiValue *kai_prelude_int_to_string(KaiValue *v) {
+static KaiValue *kai_core_int_to_string(KaiValue *v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long) v->as.i);
     KaiValue *r = kai_str(buf);
@@ -4850,7 +4850,7 @@ static KaiValue *kai_prelude_int_to_string(KaiValue *v) {
     return r;
 }
 
-static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
+static KaiValue *kai_core_real_to_string(KaiValue *v) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", v->as.r);
     KaiValue *r = kai_str(buf);
@@ -4858,7 +4858,7 @@ static KaiValue *kai_prelude_real_to_string(KaiValue *v) {
     return r;
 }
 
-static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
+static KaiValue *kai_core_int_to_real(KaiValue *v) {
     int64_t n = (v && v->tag == KAI_INT) ? v->as.i : 0;
     KaiValue *r = kai_real((double) n);
     kai_decref(v);
@@ -4869,7 +4869,7 @@ static KaiValue *kai_prelude_int_to_real(KaiValue *v) {
  * 0 — kaikai has no IEEE 754 surface for the user yet, so the safer
  * default beats a UB conversion. Revisit when the math/real lane
  * adds NaN-aware predicates. */
-static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
+static KaiValue *kai_core_real_to_int(KaiValue *v) {
     if (!v || v->tag != KAI_REAL) { if (v) kai_decref(v); return kai_int(0); }
     double r = v->as.r;
     KaiValue *out;
@@ -4886,7 +4886,7 @@ static KaiValue *kai_prelude_real_to_int(KaiValue *v) {
 /* `int_to_byte(n)` returns `Result[String, Byte]` — Err if n is outside
  * 0..255, Ok otherwise. The Result is encoded as a KAI_VARIANT (Ok /
  * Err) with one payload. */
-static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
+static KaiValue *kai_core_int_to_byte(KaiValue *v) {
     if (!v || v->tag != KAI_INT) {
         if (v) kai_decref(v);
         KaiValue *err = kai_str("int_to_byte: not an Int");
@@ -4904,7 +4904,7 @@ static KaiValue *kai_prelude_int_to_byte(KaiValue *v) {
     return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = ok_payload}});
 }
 
-static KaiValue *kai_prelude_byte_to_int(KaiValue *v) {
+static KaiValue *kai_core_byte_to_int(KaiValue *v) {
     if (!v || v->tag != KAI_BYTE) { if (v) kai_decref(v); return kai_int(0); }
     int64_t n = (int64_t) v->as.byte_val;
     kai_decref(v);
@@ -4912,7 +4912,7 @@ static KaiValue *kai_prelude_byte_to_int(KaiValue *v) {
 }
 
 /* Wrapping arithmetic per uint8_t C semantics. Overflow is defined. */
-static KaiValue *kai_prelude_byte_add(KaiValue *a, KaiValue *b) {
+static KaiValue *kai_core_byte_add(KaiValue *a, KaiValue *b) {
     uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
     uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
@@ -4920,7 +4920,7 @@ static KaiValue *kai_prelude_byte_add(KaiValue *a, KaiValue *b) {
     return kai_byte((uint8_t) (av + bv));
 }
 
-static KaiValue *kai_prelude_byte_sub(KaiValue *a, KaiValue *b) {
+static KaiValue *kai_core_byte_sub(KaiValue *a, KaiValue *b) {
     uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
     uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
@@ -4928,7 +4928,7 @@ static KaiValue *kai_prelude_byte_sub(KaiValue *a, KaiValue *b) {
     return kai_byte((uint8_t) (av - bv));
 }
 
-static KaiValue *kai_prelude_byte_eq(KaiValue *a, KaiValue *b) {
+static KaiValue *kai_core_byte_eq(KaiValue *a, KaiValue *b) {
     uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
     uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
@@ -4936,7 +4936,7 @@ static KaiValue *kai_prelude_byte_eq(KaiValue *a, KaiValue *b) {
     return kai_bool(av == bv);
 }
 
-static KaiValue *kai_prelude_byte_lt(KaiValue *a, KaiValue *b) {
+static KaiValue *kai_core_byte_lt(KaiValue *a, KaiValue *b) {
     uint8_t av = (a && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
     uint8_t bv = (b && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
     if (a) kai_decref(a);
@@ -4944,7 +4944,7 @@ static KaiValue *kai_prelude_byte_lt(KaiValue *a, KaiValue *b) {
     return kai_bool(av < bv);
 }
 
-static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
+static KaiValue *kai_core_byte_to_string(KaiValue *v) {
     if (!v || v->tag != KAI_BYTE) { if (v) kai_decref(v); return kai_str("0"); }
     char buf[16];
     snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
@@ -4952,12 +4952,12 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
     return kai_str(buf);
 }
 
-/* ---------- prelude: math/real libm bindings (issue #343) ----------
+/* ---------- core: math/real libm bindings (issue #343) ----------
  * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
- * Inspect with kai_prelude_real_is_nan / kai_prelude_real_is_inf. */
+ * Inspect with kai_core_real_is_nan / kai_core_real_is_inf. */
 
 #define KAI_LIBM_REAL1(name, fn)                                         \
-    static KaiValue *kai_prelude_real_##name(KaiValue *x) {              \
+    static KaiValue *kai_core_real_##name(KaiValue *x) {              \
         double r = (x && x->tag == KAI_REAL) ? fn(x->as.r) : 0.0;        \
         KaiValue *out = kai_real(r);                                     \
         if (x) kai_decref(x);                                            \
@@ -4965,7 +4965,7 @@ static KaiValue *kai_prelude_byte_to_string(KaiValue *v) {
     }
 
 #define KAI_LIBM_REAL2(name, fn)                                         \
-    static KaiValue *kai_prelude_real_##name(KaiValue *a, KaiValue *b) { \
+    static KaiValue *kai_core_real_##name(KaiValue *a, KaiValue *b) { \
         double av = (a && a->tag == KAI_REAL) ? a->as.r : 0.0;           \
         double bv = (b && b->tag == KAI_REAL) ? b->as.r : 0.0;           \
         KaiValue *out = kai_real(fn(av, bv));                            \
@@ -4998,7 +4998,7 @@ KAI_LIBM_REAL2(rem,   fmod)
 #undef KAI_LIBM_REAL2
 
 /* signum: -1.0 / 0.0 / +1.0; NaN passes through as NaN. */
-static KaiValue *kai_prelude_real_signum(KaiValue *x) {
+static KaiValue *kai_core_real_signum(KaiValue *x) {
     double r = (x && x->tag == KAI_REAL) ? x->as.r : 0.0;
     double s;
     if (r != r)        s = r;          /* NaN */
@@ -5010,7 +5010,7 @@ static KaiValue *kai_prelude_real_signum(KaiValue *x) {
     return out;
 }
 
-static KaiValue *kai_prelude_real_is_nan(KaiValue *x) {
+static KaiValue *kai_core_real_is_nan(KaiValue *x) {
     int yes = 0;
     if (x && x->tag == KAI_REAL) { double r = x->as.r; yes = (r != r); }
     KaiValue *out = kai_bool(yes);
@@ -5018,7 +5018,7 @@ static KaiValue *kai_prelude_real_is_nan(KaiValue *x) {
     return out;
 }
 
-static KaiValue *kai_prelude_real_is_inf(KaiValue *x) {
+static KaiValue *kai_core_real_is_inf(KaiValue *x) {
     int yes = 0;
     if (x && x->tag == KAI_REAL) {
         double r = x->as.r;
@@ -5029,38 +5029,38 @@ static KaiValue *kai_prelude_real_is_inf(KaiValue *x) {
     return out;
 }
 
-/* ---------- prelude: strings ---------- */
+/* ---------- core: strings ---------- */
 
-static KaiValue *kai_prelude_string_length(KaiValue *s) {
+static KaiValue *kai_core_string_length(KaiValue *s) {
     int64_t n = (s && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
     KaiValue *r = kai_int(n);
     if (s) kai_decref(s);
     return r;
 }
 
-static KaiValue *kai_prelude_string_concat(KaiValue *a, KaiValue *b) {
+static KaiValue *kai_core_string_concat(KaiValue *a, KaiValue *b) {
     KaiValue *r = kai_string_concat(a, b);
     if (a) kai_decref(a);
     if (b) kai_decref(b);
     return r;
 }
 
-static KaiValue *kai_prelude_string_concat_all(KaiValue *xs) {
+static KaiValue *kai_core_string_concat_all(KaiValue *xs) {
     KaiValue *r = kai_string_concat_all_impl(xs);
     if (xs) kai_decref(xs);
     return r;
 }
 
-static KaiValue *kai_prelude_string_join(KaiValue *xs, KaiValue *sep) {
+static KaiValue *kai_core_string_join(KaiValue *xs, KaiValue *sep) {
     KaiValue *r = kai_string_join_impl(xs, sep);
     if (xs) kai_decref(xs);
     if (sep) kai_decref(sep);
     return r;
 }
 
-/* ---------- prelude: arrays ---------- */
+/* ---------- core: arrays ---------- */
 
-static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
+static KaiValue *kai_core_array_make(KaiValue *n, KaiValue *init) {
     int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
     /* impl increfs `init` once per slot; consume our own input
      * refs (n and init) at the boundary. */
@@ -5073,11 +5073,11 @@ static KaiValue *kai_prelude_array_make(KaiValue *n, KaiValue *init) {
 /* Length-0 array of any element type. `kai_array_make(0, NULL)` is
    sound only because the fill loop never runs at len 0 — NULL is
    never dereferenced. */
-static KaiValue *kai_prelude_array_empty(void) {
+static KaiValue *kai_core_array_empty(void) {
     return kai_array_make(0, NULL);
 }
 
-static KaiValue *kai_prelude_array_length(KaiValue *a) {
+static KaiValue *kai_core_array_length(KaiValue *a) {
     int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
     KaiValue *r = kai_int(len);
     if (a) kai_decref(a);
@@ -5085,12 +5085,12 @@ static KaiValue *kai_prelude_array_length(KaiValue *a) {
 }
 
 /* Borrow variant (issue #1120): read the length without consuming `a`. */
-static KaiValue *kai_prelude_array_length_borrow(KaiValue *a) {
+static KaiValue *kai_core_array_length_borrow(KaiValue *a) {
     int64_t len = (a && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
     return kai_int(len);
 }
 
-static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
+static KaiValue *kai_core_array_get(KaiValue *a, KaiValue *i) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
     KaiValue *r = kai_array_get_impl(a, idx);
     if (a) kai_decref(a);
@@ -5102,12 +5102,12 @@ static KaiValue *kai_prelude_array_get(KaiValue *a, KaiValue *i) {
    the caller kept its ref (Perceus stripped the dup), so we must NOT decref
    `a`. The element still leaves the array with +1 (it escapes to the
    caller). `i` is a tagged Int and is not rc-touched. */
-static KaiValue *kai_prelude_array_get_borrow(KaiValue *a, KaiValue *i) {
+static KaiValue *kai_core_array_get_borrow(KaiValue *a, KaiValue *i) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
     return kai_array_get_impl(a, idx);
 }
 
-static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
+static KaiValue *kai_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
     /* impl returns kai_incref(a) — a fresh ref the caller owns.
      * Our input `a` ref is therefore redundant under the callee-
@@ -5121,7 +5121,7 @@ static KaiValue *kai_prelude_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
     return r;
 }
 
-static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
+static KaiValue *kai_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
     int64_t new_len = (n && n->tag == KAI_INT) ? n->as.i : 0;
     /* impl returns kai_incref(a) — caller owns the new ref. The
      * input `a` ref is consumed under the callee-consumes
@@ -5133,14 +5133,14 @@ static KaiValue *kai_prelude_array_grow(KaiValue *a, KaiValue *n, KaiValue *init
     return r;
 }
 
-/* ---------- prelude: Vec (pure value vector) ----------
+/* ---------- core: Vec (pure value vector) ----------
  *
- * Callee-consumes at the boundary, like every prelude fn. The impls
+ * Callee-consumes at the boundary, like every core fn. The impls
  * for set/push take the vec ref itself as the ownership transfer:
  * a last-use caller arrives with rc == 1 (in-place is unobservable),
  * a caller that kept the vec arrives with rc > 1 (copy-on-write). */
 
-static KaiValue *kai_prelude_vec_make(KaiValue *n, KaiValue *init) {
+static KaiValue *kai_core_vec_make(KaiValue *n, KaiValue *init) {
     int64_t len = (n && n->tag == KAI_INT) ? n->as.i : 0;
     KaiValue *r = kai_vec_make(len, init);
     if (n) kai_decref(n);
@@ -5148,18 +5148,18 @@ static KaiValue *kai_prelude_vec_make(KaiValue *n, KaiValue *init) {
     return r;
 }
 
-static KaiValue *kai_prelude_vec_empty(void) {
+static KaiValue *kai_core_vec_empty(void) {
     return kai_vec_empty();
 }
 
-static KaiValue *kai_prelude_vec_length(KaiValue *v) {
+static KaiValue *kai_core_vec_length(KaiValue *v) {
     int64_t len = (v && v->tag == KAI_VEC) ? v->as.vec.len : 0;
     KaiValue *r = kai_int(len);
     if (v) kai_decref(v);
     return r;
 }
 
-static KaiValue *kai_prelude_vec_get(KaiValue *v, KaiValue *i) {
+static KaiValue *kai_core_vec_get(KaiValue *v, KaiValue *i) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
     KaiValue *r = kai_vec_get_impl(v, idx);
     if (v) kai_decref(v);
@@ -5167,17 +5167,17 @@ static KaiValue *kai_prelude_vec_get(KaiValue *v, KaiValue *i) {
     return r;
 }
 
-static KaiValue *kai_prelude_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
+static KaiValue *kai_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
     int64_t idx = (i && i->tag == KAI_INT) ? i->as.i : 0;
     if (i) kai_decref(i);
     return kai_vec_set_impl(v, idx, x);   /* consumes v and x */
 }
 
-static KaiValue *kai_prelude_vec_push(KaiValue *v, KaiValue *x) {
+static KaiValue *kai_core_vec_push(KaiValue *v, KaiValue *x) {
     return kai_vec_push_impl(v, x);       /* consumes v and x */
 }
 
-static KaiValue *kai_prelude_vec_slice(KaiValue *v, KaiValue *start, KaiValue *n) {
+static KaiValue *kai_core_vec_slice(KaiValue *v, KaiValue *start, KaiValue *n) {
     int64_t s_ = (start && start->tag == KAI_INT) ? start->as.i : 0;
     int64_t sl = (n && n->tag == KAI_INT) ? n->as.i : 0;
     if (start) kai_decref(start);
@@ -5185,23 +5185,23 @@ static KaiValue *kai_prelude_vec_slice(KaiValue *v, KaiValue *start, KaiValue *n
     return kai_vec_slice_impl(v, s_, sl);   /* consumes v */
 }
 
-static KaiValue *kai_prelude_vec_tail_from(KaiValue *v, KaiValue *start) {
+static KaiValue *kai_core_vec_tail_from(KaiValue *v, KaiValue *start) {
     int64_t s_ = (start && start->tag == KAI_INT) ? start->as.i : 0;
     if (start) kai_decref(start);
     return kai_vec_tail_from_impl(v, s_);   /* consumes v */
 }
 
-static KaiValue *kai_prelude_vec_reserve(KaiValue *n) {
+static KaiValue *kai_core_vec_reserve(KaiValue *n) {
     int64_t cap = (n && n->tag == KAI_INT) ? n->as.i : 0;
     if (n) kai_decref(n);
     return kai_vec_reserve_impl(cap);
 }
 
-static KaiValue *kai_prelude_vec_from_list(KaiValue *xs) {
+static KaiValue *kai_core_vec_from_list(KaiValue *xs) {
     return kai_vec_from_list_impl(xs);      /* consumes xs */
 }
 
-/* ---------- prelude: refs (issue #257) ----------
+/* ---------- core: refs (issue #257) ----------
  *
  * `Ref[T]` is a single-cell mutable reference in the `Mutable`
  * effect (docs/effects-stdlib.md §Mutable). Surface ops:
@@ -5216,7 +5216,7 @@ static KaiValue *kai_prelude_vec_from_list(KaiValue *xs) {
  * (The earlier length-1 KAI_ARRAY hack from #257 is replaced here.)
  * RC: a Ref owns one strong reference to its cell. All three ops obey
  * the callee-consumes convention. */
-static KaiValue *kai_prelude_ref_make(KaiValue *init) {
+static KaiValue *kai_core_ref_make(KaiValue *init) {
     /* Steal `init` straight into the cell — no incref/decref dance
      * (the array-backed version did one of each; this is strictly less
      * RC work, which matters on the hot path of Front A). */
@@ -5225,14 +5225,14 @@ static KaiValue *kai_prelude_ref_make(KaiValue *init) {
     return r;
 }
 
-static KaiValue *kai_prelude_ref_get(KaiValue *r) {
+static KaiValue *kai_core_ref_get(KaiValue *r) {
     /* Hand back a fresh strong reference to the cell; consume `r`. */
     KaiValue *v = r ? kai_incref(r->as.ref.cell) : NULL;
     if (r) kai_decref(r);
     return v;
 }
 
-static KaiValue *kai_prelude_ref_set(KaiValue *r, KaiValue *v) {
+static KaiValue *kai_core_ref_set(KaiValue *r, KaiValue *v) {
     /* Drop the old contents, steal `v` into the cell; consume `r`.
      * Surface contract is Unit-typed. No bounds check, no index. */
     if (r) {
@@ -5245,9 +5245,9 @@ static KaiValue *kai_prelude_ref_set(KaiValue *r, KaiValue *v) {
     return kai_unit();
 }
 
-/* ---------- prelude: lists ---------- */
+/* ---------- core: lists ---------- */
 
-static KaiValue *kai_prelude_list_length(KaiValue *xs) {
+static KaiValue *kai_core_list_length(KaiValue *xs) {
     int64_t n = 0;
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
@@ -5258,7 +5258,7 @@ static KaiValue *kai_prelude_list_length(KaiValue *xs) {
 
 /* Recursive helper: borrows `xs` (does NOT decref it), so the
  * recursion can walk the cons chain without consuming on the way
- * down. The public `kai_prelude_list_append` wraps this and
+ * down. The public `kai_core_list_append` wraps this and
  * decrefs `xs`/`ys` after the chain is built. */
 static KaiValue *kai_list_append_borrow(KaiValue *xs, KaiValue *ys) {
     if (!xs || xs->tag == KAI_NIL) return kai_incref(ys);
@@ -5266,14 +5266,14 @@ static KaiValue *kai_list_append_borrow(KaiValue *xs, KaiValue *ys) {
     return kai_cons(kai_incref(xs->as.cons.head), rest);
 }
 
-static KaiValue *kai_prelude_list_append(KaiValue *xs, KaiValue *ys) {
+static KaiValue *kai_core_list_append(KaiValue *xs, KaiValue *ys) {
     KaiValue *r = kai_list_append_borrow(xs, ys);
     if (xs) kai_decref(xs);
     if (ys) kai_decref(ys);
     return r;
 }
 
-static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
+static KaiValue *kai_core_list_reverse(KaiValue *xs) {
     KaiValue *acc = kai_nil();
     KaiValue *p   = xs;
     while (p && p->tag == KAI_CONS) {
@@ -5284,7 +5284,7 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
     return acc;
 }
 
-/* ---------- prelude: higher order ---------- */
+/* ---------- core: higher order ---------- */
 /*
  * Iterative refactor (Perceus Tier 2 part 3, 2026-04-29). Pre-flip
  * these were recursive over `xs->as.cons.tail`, which forced the
@@ -5303,13 +5303,13 @@ static KaiValue *kai_prelude_list_reverse(KaiValue *xs) {
  * that once, post-loop.
  *
  * `_map` / `_filter` build their result reversed (each iteration
- * cons-prepends) and call `kai_prelude_list_reverse` once to
+ * cons-prepends) and call `kai_core_list_reverse` once to
  * restore order. `list_reverse` consumes its arg, so the
  * intermediate reversed list is freed in the same step that
  * produces the final list — no extra retention.
  */
 
-static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
+static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
@@ -5319,20 +5319,20 @@ static KaiValue *kai_prelude_map(KaiValue *xs, KaiValue *f) {
         acc = kai_cons(head, acc);
         p = p->as.cons.tail;
     }
-    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
     return result;
 }
 
 /* issue #201: runtime backing for the flat-map-pipe operator (`||`).
- * Mirrors `kai_prelude_map` but each `f(elem)` produces a list that
+ * Mirrors `kai_core_map` but each `f(elem)` produces a list that
  * gets cons-prepended onto the reversed accumulator; the per-element
  * piece is decref'd in the same step. The final reverse + decref loop
  * matches `_map`'s ownership story so RC stays balanced regardless of
  * the input shape. Empty pieces are a no-op for the inner loop.
  */
-static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
+static KaiValue *kai_core_flat_map(KaiValue *xs, KaiValue *f) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
@@ -5340,7 +5340,7 @@ static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
         /* kai_apply consumes (#298): incref f for each iter. */
         KaiValue *piece = kai_apply(kai_incref(f), 1, &arg0);
         /* Each `piece` is owned; append it onto `acc` (which is in
-         * reverse order). `kai_prelude_list_append` consumes both
+         * reverse order). `kai_core_list_append` consumes both
          * arguments. We append `acc` onto the front of `piece`'s
          * reversed form by reversing piece into acc cons-by-cons.
          */
@@ -5352,13 +5352,13 @@ static KaiValue *kai_prelude_flat_map(KaiValue *xs, KaiValue *f) {
         if (piece) kai_decref(piece);
         p = p->as.cons.tail;
     }
-    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
     return result;
 }
 
-static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
+static KaiValue *kai_core_filter(KaiValue *xs, KaiValue *pred) {
     KaiValue *acc = kai_nil();
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
@@ -5372,13 +5372,13 @@ static KaiValue *kai_prelude_filter(KaiValue *xs, KaiValue *pred) {
         }
         p = p->as.cons.tail;
     }
-    KaiValue *result = kai_prelude_list_reverse(acc);  /* consumes acc */
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
     if (xs)   kai_decref(xs);
     if (pred) kai_decref(pred);
     return result;
 }
 
-static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
+static KaiValue *kai_core_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
     /* acc starts as the caller's `init` ref (transferred). Each
      * iteration hands acc to the closure (which consumes it) and
      * receives a freshly-owned `next` back. If `xs` is empty we
@@ -5399,7 +5399,7 @@ static KaiValue *kai_prelude_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
     return acc;
 }
 
-static KaiValue *kai_prelude_each(KaiValue *xs, KaiValue *f) {
+static KaiValue *kai_core_each(KaiValue *xs, KaiValue *f) {
     KaiValue *p = xs;
     while (p && p->tag == KAI_CONS) {
         KaiValue *arg0 = kai_incref(p->as.cons.head);
@@ -5697,7 +5697,7 @@ static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
     return acc;
 }
 
-/* ---------- prelude: args (set by generated `int main`) ---------- */
+/* ---------- core: args (set by generated `int main`) ---------- */
 
 static int          kai_g_argc = 0;
 static char       **kai_g_argv = NULL;
@@ -5724,7 +5724,7 @@ static void kai_set_args(int argc, char **argv) {
 #endif
 }
 
-static KaiValue *kai_prelude_args(void) {
+static KaiValue *kai_core_args(void) {
     KaiValue *acc = kai_nil();
     for (int i = kai_g_argc - 1; i >= 1; --i) {
         acc = kai_cons(kai_str(kai_g_argv[i]), acc);
@@ -5732,12 +5732,12 @@ static KaiValue *kai_prelude_args(void) {
     return acc;
 }
 
-/* Issue #127: argv[0] as a kaikai String. Mirrors `kai_prelude_args`
+/* Issue #127: argv[0] as a kaikai String. Mirrors `kai_core_args`
  * in routing through the `kai_g_argv` snapshot installed by
  * `kai_set_args` at process entry. Returns the empty string when
  * argv was never captured (unit tests linking the runtime without
  * a generated `int main` wrapper) — leaves the surface total. */
-static KaiValue *kai_prelude_program_name(void) {
+static KaiValue *kai_core_program_name(void) {
     if (kai_g_argv == NULL || kai_g_argv[0] == NULL) return kai_str("");
     return kai_str(kai_g_argv[0]);
 }
@@ -5760,7 +5760,7 @@ static KaiValue *kai_prelude_program_name(void) {
  * rebuilding from source. Direct `kaic2` invocations from a source
  * checkout leave the env unset and fall back to the macro.
  */
-static KaiValue *kai_prelude_stdlib_path(void) {
+static KaiValue *kai_core_stdlib_path(void) {
     const char *env = getenv("KAIKAI_STDLIB_PATH");
     if (env && *env) {
         return kai_str(env);
@@ -5774,7 +5774,7 @@ static KaiValue *kai_prelude_stdlib_path(void) {
  * stays correct: only paths that resolve to real files get folded
  * to their canonical form. Backed by POSIX realpath; falls back to
  * the input string when realpath fails (errno != 0). */
-static KaiValue *kai_prelude_abspath(KaiValue *path) {
+static KaiValue *kai_core_abspath(KaiValue *path) {
     if (!path || path->tag != KAI_STR) {
         return path;
     }
@@ -5789,34 +5789,34 @@ static KaiValue *kai_prelude_abspath(KaiValue *path) {
     return kai_str(resolved);
 }
 
-/* ---------- prelude: mailbox runtime (m8 #7) ---------- */
+/* ---------- core: mailbox runtime (m8 #7) ---------- */
 
-/* User code reaches the mailbox runtime through these prelude
+/* User code reaches the mailbox runtime through these core
  * functions. They are wrapped in stdlib/actor.kai's `with_mailbox`
  * helper, which also installs the user-facing Actor[Msg] handler.
  * The polymorphic surface uses Nothing → TyAny so a single set of
  * runtime entries serves every Msg type. */
 
-static KaiValue *kai_prelude_mailbox_alloc(void) {
+static KaiValue *kai_core_mailbox_alloc(void) {
     return kai_pid_value(kai_mailbox_alloc());
 }
 
 /* Tier 2 spawn_actor — allocate a mailbox without stamping any
- * owner. Pair with kai_prelude_mailbox_assign_owner to wire the
+ * owner. Pair with kai_core_mailbox_assign_owner to wire the
  * mailbox onto the spawned fiber before its body runs. */
-static KaiValue *kai_prelude_mailbox_alloc_unowned(void) {
+static KaiValue *kai_core_mailbox_alloc_unowned(void) {
     return kai_pid_value(kai_mailbox_alloc_unowned());
 }
 
 /* Tier 2 spawn_actor — set `pid->as.mb->owner_fiber = fiber->as.fib`
  * AND `fiber->as.fib->mailbox = pid->as.mb`. Used after
- * kai_prelude_mailbox_alloc_unowned + fiber_spawn so the spawned
+ * kai_core_mailbox_alloc_unowned + fiber_spawn so the spawned
  * fiber owns the mailbox for monitor / link / trap-exit lookups.
  *
  * Safe under the cooperative scheduler because fiber_spawn enqueues
  * the spawned fiber but does not yield — the parent runs through to
  * this assign call before the spawned trampoline gets the CPU. */
-static KaiValue *kai_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
+static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
         pid->as.mb->owner_fiber = fiber->as.fib;
@@ -5828,7 +5828,7 @@ static KaiValue *kai_prelude_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber
     return kai_unit();
 }
 
-static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
+static KaiValue *kai_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
     int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
     int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
     KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded(c, o));
@@ -5839,9 +5839,9 @@ static KaiValue *kai_prelude_mailbox_alloc_bounded(KaiValue *cap, KaiValue *over
 }
 
 /* Issue #763 spawn_actor_policy — bounded alloc without stamping an
- * owner. Pair with kai_prelude_mailbox_assign_owner, same protocol
- * as kai_prelude_mailbox_alloc_unowned. */
-static KaiValue *kai_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) {
+ * owner. Pair with kai_core_mailbox_assign_owner, same protocol
+ * as kai_core_mailbox_alloc_unowned. */
+static KaiValue *kai_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) {
     int c = (cap && cap->tag == KAI_INT) ? (int) cap->as.i : 0;
     int o = (overflow && overflow->tag == KAI_INT) ? (int) overflow->as.i : 0;
     KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded_unowned(c, o));
@@ -5851,7 +5851,7 @@ static KaiValue *kai_prelude_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiVal
     return r;
 }
 
-static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
+static KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg) {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
@@ -5865,7 +5865,7 @@ static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
     return kai_unit();
 }
 
-static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
+static KaiValue *kai_core_mailbox_recv(KaiValue *pid) {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
         exit(1);
@@ -5880,9 +5880,9 @@ static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
 
 /* Receive within a deadline. `timeout_nanos` is a relative nanosecond
  * budget; returns `Some(msg)` if a message arrives in time, `None` if
- * the deadline elapses first. Mirrors `kai_prelude_mailbox_recv`'s
+ * the deadline elapses first. Mirrors `kai_core_mailbox_recv`'s
  * callee-consumes-clean discipline for the input `pid` ref. */
-static KaiValue *kai_prelude_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos) {
+static KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos) {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
         exit(1);
@@ -5899,7 +5899,7 @@ static KaiValue *kai_prelude_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeo
 
 /* Free the mailbox attached to a Pid. Called by `with_mailbox` when
  * the scope exits; the Pid value itself is RC-managed independently. */
-static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
+static KaiValue *kai_core_mailbox_free(KaiValue *pid) {
     if (pid && pid->tag == KAI_PID && pid->as.mb) {
         kai_mailbox_free(pid->as.mb);
         pid->as.mb = NULL;
@@ -5909,9 +5909,9 @@ static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
     return kai_unit();
 }
 
-/* ---------- prelude: file io ---------- */
+/* ---------- core: file io ---------- */
 
-static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
+static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
@@ -5957,7 +5957,7 @@ static KAI_RC_NOINLINE KaiValue *kai_prelude_read_file(KaiValue *path) {
     return r;
 }
 
-static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
+static KaiValue *kai_core_write_file(KaiValue *path, KaiValue *content) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("write_file: path is not a String");
@@ -5991,7 +5991,7 @@ static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
     return r;
 }
 
-/* ---------- prelude: chunked / streaming file io (issue #771) ----------
+/* ---------- core: chunked / streaming file io (issue #771) ----------
  *
  * Five primitives behind the new `File` ops `open_read` / `read_chunk` /
  * `open_write` / `write_chunk` / `close_file`. Unlike the bulk
@@ -6042,7 +6042,7 @@ static KaiValue *_kai_file_ok(KaiValue *payload) {
 
 /* open_read(path) -> Result[String, FileHandle]. Opens `path` read-only
  * and hands back an owning FileHandle. */
-static KaiValue *kai_prelude_file_open_read(KaiValue *path) {
+static KaiValue *kai_core_file_open_read(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         r = _kai_file_err("open_read: argument is not a String");
@@ -6063,7 +6063,7 @@ static KaiValue *kai_prelude_file_open_read(KaiValue *path) {
  * from the handle's fd into a fresh String. `Ok("")` signals EOF. A
  * short read (fewer than `max` bytes, but more than zero) is normal and
  * returned as-is; the caller loops until it sees the empty string. */
-static KaiValue *kai_prelude_file_read_chunk(KaiValue *h, KaiValue *max) {
+static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
     KaiValue *r = NULL;
     int fd = _kai_file_handle_fd(h);
     int64_t cap = (max && max->tag == KAI_INT) ? max->as.i : -1;
@@ -6101,7 +6101,7 @@ static KaiValue *kai_prelude_file_read_chunk(KaiValue *h, KaiValue *max) {
 /* open_write(path) -> Result[String, FileHandle]. Opens `path` for
  * writing, creating it (mode 0644) and truncating any existing
  * contents, then hands back an owning FileHandle. */
-static KaiValue *kai_prelude_file_open_write(KaiValue *path) {
+static KaiValue *kai_core_file_open_write(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         r = _kai_file_err("open_write: argument is not a String");
@@ -6120,7 +6120,7 @@ static KaiValue *kai_prelude_file_open_write(KaiValue *path) {
 
 /* write_chunk(h, data) -> Result[String, Unit]. Writes every byte of
  * `data` to the handle's fd, looping over partial writes. */
-static KaiValue *kai_prelude_file_write_chunk(KaiValue *h, KaiValue *data) {
+static KaiValue *kai_core_file_write_chunk(KaiValue *h, KaiValue *data) {
     KaiValue *r = NULL;
     int fd = _kai_file_handle_fd(h);
     if (fd < 0) {
@@ -6151,7 +6151,7 @@ static KaiValue *kai_prelude_file_write_chunk(KaiValue *h, KaiValue *data) {
 /* close_file(h) -> Unit. Closes the underlying fd; a bad handle or a
  * close error is swallowed (there is no Result register on close — the
  * fd is gone either way). */
-static KaiValue *kai_prelude_file_close(KaiValue *h) {
+static KaiValue *kai_core_file_close(KaiValue *h) {
     int fd = _kai_file_handle_fd(h);
     if (fd >= 0) close(fd);
     if (h) kai_decref(h);
@@ -6160,9 +6160,9 @@ static KaiValue *kai_prelude_file_close(KaiValue *h) {
 
 /* Issue #345: file_exists / file_delete / file_rename. Each consumes
  * its String args linearly (kai_decref before allocating the result),
- * matching the prelude convention used by read_file/write_file above. */
+ * matching the core convention used by read_file/write_file above. */
 
-static KaiValue *kai_prelude_file_exists(KaiValue *path) {
+static KaiValue *kai_core_file_exists(KaiValue *path) {
     int present = 0;
     if (path && path->tag == KAI_STR) {
         char pbuf[KAI_PATH_BUF];
@@ -6175,7 +6175,7 @@ static KaiValue *kai_prelude_file_exists(KaiValue *path) {
     return kai_bool(present);
 }
 
-static KaiValue *kai_prelude_file_delete(KaiValue *path) {
+static KaiValue *kai_core_file_delete(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_delete: path is not a String");
@@ -6197,7 +6197,7 @@ static KaiValue *kai_prelude_file_delete(KaiValue *path) {
     return r;
 }
 
-static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
+static KaiValue *kai_core_file_rename(KaiValue *from, KaiValue *to) {
     KaiValue *r = NULL;
     if (!from || from->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_rename: from is not a String");
@@ -6232,7 +6232,7 @@ static KaiValue *kai_prelude_file_rename(KaiValue *from, KaiValue *to) {
  * before allocating the result), matching the convention used by the
  * text variants. */
 
-static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
+static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_read_bytes: argument is not a String");
@@ -6287,7 +6287,7 @@ static KaiValue *kai_prelude_file_read_bytes(KaiValue *path) {
     return r;
 }
 
-static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
+static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("file_write_bytes: path is not a String");
@@ -6356,7 +6356,7 @@ static KaiValue *kai_prelude_file_write_bytes(KaiValue *path, KaiValue *bytes) {
  * args() can be empty); use dir_create_dir / dir_remove_dir when an
  * explicit Result is wanted. */
 
-static KaiValue *kai_prelude_dir_list_dir(KaiValue *path) {
+static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
     KaiValue *acc = kai_nil();
     if (path && path->tag == KAI_STR) {
         char pbuf[KAI_PATH_BUF];
@@ -6400,7 +6400,7 @@ static KaiValue *kai_prelude_dir_list_dir(KaiValue *path) {
     return acc;
 }
 
-static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
+static KaiValue *kai_core_dir_create_dir(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("dir_create_dir: path is not a String");
@@ -6422,7 +6422,7 @@ static KaiValue *kai_prelude_dir_create_dir(KaiValue *path) {
     return r;
 }
 
-static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
+static KaiValue *kai_core_dir_remove_dir(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("dir_remove_dir: path is not a String");
@@ -6449,7 +6449,7 @@ static KaiValue *kai_prelude_dir_remove_dir(KaiValue *path) {
  * (v1 contract): use lstat + S_ISLNK skip so a symlink loop can't
  * trap the walker. Only regular files are emitted; directories are
  * traversed but not reported. */
-static KaiValue *kai_prelude_dir_walk(KaiValue *root) {
+static KaiValue *kai_core_dir_walk(KaiValue *root) {
     KaiValue *acc = kai_nil();
     if (!root || root->tag != KAI_STR) {
         if (root) kai_decref(root);
@@ -6566,7 +6566,7 @@ static KaiValue *kai_prelude_dir_walk(KaiValue *root) {
     return acc;
 }
 
-static KaiValue *kai_prelude_read_line(void) {
+static KaiValue *kai_core_read_line(void) {
     size_t cap = KAI_READ_BUF_INIT, n = 0;
     char *buf = (char *) malloc(cap);
     if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
@@ -6591,15 +6591,15 @@ static KaiValue *kai_prelude_read_line(void) {
  * Used by LSP-style framed protocols where the body length is known
  * up front and may contain newlines.
  *
- * R3 unification: this prelude entry and the `Stdin.read_bytes`
+ * R3 unification: this core entry and the `Stdin.read_bytes`
  * default handler both go through `read(STDIN_FILENO, …)` so that a
  * program mixing the two forms (flat `read_bytes(n)` and qualified
  * `Stdin.read_bytes(n)`) consumes the input stream byte-for-byte
- * without libc's stdio buffer in the middle. The flat prelude path
+ * without libc's stdio buffer in the middle. The flat core path
  * stays blocking (it predates the reactor and is reachable from
  * stage 0 binaries that have no fibers); the qualified handler
  * parks the fiber on EAGAIN. */
-static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
+static KaiValue *kai_core_read_bytes(KaiValue *n) {
     int64_t want = 0;
     if (n && n->tag == KAI_INT && n->as.i > 0) want = n->as.i;
     if (n) kai_decref(n);
@@ -6617,7 +6617,7 @@ static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* fd 0 is O_NONBLOCK because the R3 reactor handler
-             * flipped it earlier in this process. The flat prelude
+             * flipped it earlier in this process. The flat core
              * has no fiber to park; emulate blocking semantics by
              * polling until the fd is readable, then retry. */
             struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
@@ -6633,12 +6633,12 @@ static KaiValue *kai_prelude_read_bytes(KaiValue *n) {
     return s;
 }
 
-/* ---------- prelude: parsing and string helpers ---------- */
+/* ---------- core: parsing and string helpers ---------- */
 
 /* m5.x flip Phase 3 closeout (Perceus Tier 2 audit, 2026-04-29):
  * the next 8 helpers consume their args linearly. Result computed
  * first, args decref'd before the constructor allocates. */
-static KaiValue *kai_prelude_string_to_int(KaiValue *s) {
+static KaiValue *kai_core_string_to_int(KaiValue *s) {
     int ok = 0;
     int64_t value = 0;
     if (s && s->tag == KAI_STR && s->as.s.len > 0 && s->as.s.len < 64) {
@@ -6660,7 +6660,7 @@ static KaiValue *kai_prelude_string_to_int(KaiValue *s) {
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
 
-static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
+static KaiValue *kai_core_string_to_real(KaiValue *s) {
     int ok = 0;
     double value = 0.0;
     if (s && s->tag == KAI_STR && s->as.s.len > 0 && s->as.s.len < 64) {
@@ -6682,7 +6682,7 @@ static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
 
-static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
+static KaiValue *kai_core_char_at(KaiValue *s, KaiValue *i) {
     int ok = 0;
     uint32_t value = 0;
     if (s && s->tag == KAI_STR && i && i->tag == KAI_INT) {
@@ -6724,7 +6724,7 @@ static int kai_utf8_seq_len(unsigned char b0) {
 
 /* Byte-width (1..4) of the UTF-8 sequence starting at byte index `off`.
  * Returns 0 on out-of-range / wrong type so a kaikai walk terminates. */
-static KaiValue *kai_prelude_string_cp_len(KaiValue *s, KaiValue *off) {
+static KaiValue *kai_core_string_cp_len(KaiValue *s, KaiValue *off) {
     int64_t w = 0;
     if (s && s->tag == KAI_STR && off && off->tag == KAI_INT) {
         int64_t i = off->as.i;
@@ -6745,7 +6745,7 @@ static KaiValue *kai_prelude_string_cp_len(KaiValue *s, KaiValue *off) {
  * `off`. Returns -1 on out-of-range / wrong type. Continuation bytes
  * beyond the buffer are skipped (lenient, matches `string_cp_len`'s
  * clamp). */
-static KaiValue *kai_prelude_string_cp_at(KaiValue *s, KaiValue *off) {
+static KaiValue *kai_core_string_cp_at(KaiValue *s, KaiValue *off) {
     int64_t cp = -1;
     if (s && s->tag == KAI_STR && off && off->tag == KAI_INT) {
         int64_t i = off->as.i;
@@ -6786,7 +6786,7 @@ static KaiValue *kai_prelude_string_cp_at(KaiValue *s, KaiValue *off) {
  * within a codepoint is preserved; codepoint order is reversed. O(n), no
  * intermediate `[Char]`, no per-char re-encode. A truncated trailing
  * sequence (malformed input) is copied as-is via the clamped width. */
-static KaiValue *kai_prelude_string_reverse(KaiValue *s) {
+static KaiValue *kai_core_string_reverse(KaiValue *s) {
     if (!s || s->tag != KAI_STR) {
         if (s) kai_decref(s);
         return kai_str("");
@@ -6812,7 +6812,7 @@ static KaiValue *kai_prelude_string_reverse(KaiValue *s) {
     return out;
 }
 
-static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
+static KaiValue *kai_core_string_split(KaiValue *s, KaiValue *sep) {
     KaiValue *acc;
     if (!s || s->tag != KAI_STR) {
         acc = kai_nil();
@@ -6857,7 +6857,7 @@ static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
     return acc;
 }
 
-static KaiValue *kai_prelude_string_slice(KaiValue *s, KaiValue *from, KaiValue *len) {
+static KaiValue *kai_core_string_slice(KaiValue *s, KaiValue *from, KaiValue *len) {
     KaiValue *r;
     if (!s || s->tag != KAI_STR) {
         r = kai_str("");
@@ -6877,7 +6877,7 @@ static KaiValue *kai_prelude_string_slice(KaiValue *s, KaiValue *from, KaiValue 
     return r;
 }
 
-static KaiValue *kai_prelude_char_to_int(KaiValue *c) {
+static KaiValue *kai_core_char_to_int(KaiValue *c) {
     int64_t value = (c && c->tag == KAI_CHAR) ? (int64_t) c->as.c : 0;
     if (c) kai_decref(c);
     return kai_int(value);
@@ -6888,7 +6888,7 @@ static KaiValue *kai_prelude_char_to_int(KaiValue *c) {
  * U+D800..U+DFFF, is not a codepoint — panic (audited escape, Tier 1
  * #1) rather than build a garbage Char. Byte values 0..255 are all
  * valid scalar values and pass unchanged. */
-static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
+static KaiValue *kai_core_int_to_char(KaiValue *n) {
     int64_t cp = (n && n->tag == KAI_INT) ? n->as.i : 0;
     if (n) kai_decref(n);
     if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
@@ -6896,7 +6896,7 @@ static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
         snprintf(msg, sizeof msg,
                  "int_to_char: %lld is not a Unicode scalar value "
                  "(0..0x10FFFF excluding surrogates)", (long long) cp);
-        kai_prelude_panic(kai_str(msg));
+        kai_core_panic(kai_str(msg));
     }
     return kai_char((uint32_t) cp);
 }
@@ -6910,7 +6910,7 @@ static KaiValue *kai_prelude_int_to_char(KaiValue *n) {
  * it for the KAB2 binary on-disk format. Documented limitation
  * sidebar in `stdlib/protocols.kai` (BinSerialize String/Real ASCII-
  * only) closes once Phase A/B serdes routes through this. */
-static KaiValue *kai_prelude_int_to_byte_string(KaiValue *n) {
+static KaiValue *kai_core_int_to_byte_string(KaiValue *n) {
     int64_t v = (n && n->tag == KAI_INT) ? n->as.i : 0;
     if (n) kai_decref(n);
     unsigned char b = (unsigned char) (v & 0xff);
@@ -6925,7 +6925,7 @@ static KaiValue *kai_prelude_int_to_byte_string(KaiValue *n) {
  * + tag check). The KAB2 cache decoder (#592) calls this ~1M times
  * per warm load; replacing Option-wrapped char_at cuts decoder wall
  * from ~0.26s to under 0.04s. */
-static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
+static KaiValue *kai_core_string_byte_at_int(KaiValue *s, KaiValue *i) {
     int64_t v = -1;
     if (s && s->tag == KAI_STR && i && i->tag == KAI_INT) {
         int64_t idx = i->as.i;
@@ -6949,7 +6949,7 @@ static KaiValue *kai_prelude_string_byte_at_int(KaiValue *s, KaiValue *i) {
  * a kaikai byte loop, because the kaikai loop would box an Int per
  * byte (one alloc + decref per character) — catastrophic for the hot
  * path a HashMap exercises. */
-static KaiValue *kai_prelude_string_hash(KaiValue *s) {
+static KaiValue *kai_core_string_hash(KaiValue *s) {
     uint64_t h = 1469598103934665603ull;
     if (s && s->tag == KAI_STR) {
         const char *bytes = s->as.s.bytes;
@@ -6970,7 +6970,7 @@ static KaiValue *kai_prelude_string_hash(KaiValue *s) {
  * separates every distinct double. Note +0.0 and -0.0 have different
  * bit patterns (and NaN payloads vary) — acceptable for a hash, since
  * Hash↔Eq consistency on Real is the caller's concern, not ours. */
-static KaiValue *kai_prelude_real_bits(KaiValue *v) {
+static KaiValue *kai_core_real_bits(KaiValue *v) {
     uint64_t bits = 0;
     if (v && v->tag == KAI_REAL) {
         double r = v->as.r;
@@ -6980,7 +6980,7 @@ static KaiValue *kai_prelude_real_bits(KaiValue *v) {
     return kai_int((int64_t) bits);
 }
 
-static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
+static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
     int yes = 0;
     if (s && s->tag == KAI_STR && sub && sub->tag == KAI_STR) {
         if (sub->as.s.len == 0) {
@@ -6999,97 +6999,97 @@ static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
     return kai_bool(yes);
 }
 
-/* ---------- prelude thunks for first-class function refs ---------- */
+/* ---------- core thunks for first-class function refs ---------- */
 
-static KaiValue *_kai_prelude_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_print(a[0]); }
-static KaiValue *_kai_prelude_eprint_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_eprint(a[0]); }
-static KaiValue *_kai_prelude_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_write_stdout(a[0]); }
-static KaiValue *_kai_prelude_panic_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_panic(a[0]); }
-static KaiValue *_kai_prelude_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_exit(a[0]); }
-static KaiValue *_kai_prelude_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_int_to_string(a[0]); }
-static KaiValue *_kai_prelude_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_to_string(a[0]); }
-static KaiValue *_kai_prelude_int_to_real_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_real(a[0]); }
-static KaiValue *_kai_prelude_real_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_to_int(a[0]); }
-static KaiValue *_kai_prelude_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_sqrt(a[0]); }
-static KaiValue *_kai_prelude_real_cbrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_cbrt(a[0]); }
-static KaiValue *_kai_prelude_real_exp_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_exp(a[0]); }
-static KaiValue *_kai_prelude_real_log_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_log(a[0]); }
-static KaiValue *_kai_prelude_real_log2_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_log2(a[0]); }
-static KaiValue *_kai_prelude_real_log10_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_real_log10(a[0]); }
-static KaiValue *_kai_prelude_real_sin_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_sin(a[0]); }
-static KaiValue *_kai_prelude_real_cos_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_cos(a[0]); }
-static KaiValue *_kai_prelude_real_tan_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_tan(a[0]); }
-static KaiValue *_kai_prelude_real_asin_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_asin(a[0]); }
-static KaiValue *_kai_prelude_real_acos_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_acos(a[0]); }
-static KaiValue *_kai_prelude_real_atan_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_atan(a[0]); }
-static KaiValue *_kai_prelude_real_sinh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_sinh(a[0]); }
-static KaiValue *_kai_prelude_real_cosh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_cosh(a[0]); }
-static KaiValue *_kai_prelude_real_tanh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_real_tanh(a[0]); }
-static KaiValue *_kai_prelude_real_signum_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_signum(a[0]); }
-static KaiValue *_kai_prelude_real_is_nan_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_is_nan(a[0]); }
-static KaiValue *_kai_prelude_real_is_inf_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_real_is_inf(a[0]); }
-static KaiValue *_kai_prelude_real_pow_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_pow(a[0], a[1]); }
-static KaiValue *_kai_prelude_real_atan2_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_real_atan2(a[0], a[1]); }
-static KaiValue *_kai_prelude_real_rem_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_real_rem(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_length(a[0]); }
-static KaiValue *_kai_prelude_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_concat(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_concat_all(a[0]); }
-static KaiValue *_kai_prelude_string_join_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_join(a[0], a[1]); }
-static KaiValue *_kai_prelude_array_make_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_make(a[0], a[1]); }
-static KaiValue *_kai_prelude_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_array_empty(); }
-static KaiValue *_kai_prelude_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_array_length(a[0]); }
-static KaiValue *_kai_prelude_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_get(a[0], a[1]); }
-static KaiValue *_kai_prelude_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_array_set(a[0], a[1], a[2]); }
-static KaiValue *_kai_prelude_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_array_grow(a[0], a[1], a[2]); }
-static KaiValue *_kai_prelude_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_ref_make(a[0]); }
-static KaiValue *_kai_prelude_ref_get_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_ref_get(a[0]); }
-static KaiValue *_kai_prelude_ref_set_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_ref_set(a[0], a[1]); }
-static KaiValue *_kai_prelude_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_length(a[0]); }
-static KaiValue *_kai_prelude_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_list_append(a[0], a[1]); }
-static KaiValue *_kai_prelude_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_list_reverse(a[0]); }
-static KaiValue *_kai_prelude_map_thunk(KaiValue *s, KaiValue **a, int n)            { (void) s; (void) n; return kai_prelude_map(a[0], a[1]); }
-static KaiValue *_kai_prelude_flat_map_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_flat_map(a[0], a[1]); }
-static KaiValue *_kai_prelude_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_filter(a[0], a[1]); }
-static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_reduce(a[0], a[1], a[2]); }
-static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
-static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_prelude_args(); }
-static KaiValue *_kai_prelude_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_prelude_program_name(); }
-static KaiValue *_kai_prelude_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_prelude_stdlib_path(); }
-static KaiValue *_kai_prelude_abspath_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_abspath(a[0]); }
-static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
-static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
-static KaiValue *_kai_prelude_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_exists(a[0]); }
-static KaiValue *_kai_prelude_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_delete(a[0]); }
-static KaiValue *_kai_prelude_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_file_rename(a[0], a[1]); }
-static KaiValue *_kai_prelude_file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_file_read_bytes(a[0]); }
-static KaiValue *_kai_prelude_file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_file_write_bytes(a[0], a[1]); }
-static KaiValue *_kai_prelude_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_dir_list_dir(a[0]); }
-static KaiValue *_kai_prelude_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_create_dir(a[0]); }
-static KaiValue *_kai_prelude_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_dir_remove_dir(a[0]); }
-static KaiValue *_kai_prelude_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_prelude_dir_walk(a[0]); }
-static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
-static KaiValue *_kai_prelude_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_read_bytes(a[0]); }
-static KaiValue *_kai_prelude_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_to_int(a[0]); }
-static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_to_real(a[0]); }
-static KaiValue *_kai_prelude_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_char_at(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_split_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_split(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, int n){ (void) s; (void) n; return kai_prelude_string_contains(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_slice(a[0], a[1], a[2]); }
-static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
-static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
-static KaiValue *_kai_prelude_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_int_to_byte_string(a[0]); }
-static KaiValue *_kai_prelude_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_byte_at_int(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_cp_at(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_cp_len(a[0], a[1]); }
-static KaiValue *_kai_prelude_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_reverse(a[0]); }
-static KaiValue *_kai_prelude_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_hash(a[0]); }
-static KaiValue *_kai_prelude_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_real_bits(a[0]); }
-static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
-static KaiValue *_kai_prelude_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_alloc_bounded(a[0], a[1]); }
-static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
-static KaiValue *_kai_prelude_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_recv(a[0]); }
-static KaiValue *_kai_prelude_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_mailbox_recv_timeout(a[0], a[1]); }
-static KaiValue *_kai_prelude_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_free(a[0]); }
+static KaiValue *_kai_core_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_core_print(a[0]); }
+static KaiValue *_kai_core_eprint_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_eprint(a[0]); }
+static KaiValue *_kai_core_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_write_stdout(a[0]); }
+static KaiValue *_kai_core_panic_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_core_panic(a[0]); }
+static KaiValue *_kai_core_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_core_exit(a[0]); }
+static KaiValue *_kai_core_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_int_to_string(a[0]); }
+static KaiValue *_kai_core_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_real_to_string(a[0]); }
+static KaiValue *_kai_core_int_to_real_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_int_to_real(a[0]); }
+static KaiValue *_kai_core_real_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_to_int(a[0]); }
+static KaiValue *_kai_core_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_sqrt(a[0]); }
+static KaiValue *_kai_core_real_cbrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_cbrt(a[0]); }
+static KaiValue *_kai_core_real_exp_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_exp(a[0]); }
+static KaiValue *_kai_core_real_log_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_log(a[0]); }
+static KaiValue *_kai_core_real_log2_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_log2(a[0]); }
+static KaiValue *_kai_core_real_log10_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_real_log10(a[0]); }
+static KaiValue *_kai_core_real_sin_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_sin(a[0]); }
+static KaiValue *_kai_core_real_cos_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_cos(a[0]); }
+static KaiValue *_kai_core_real_tan_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_tan(a[0]); }
+static KaiValue *_kai_core_real_asin_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_asin(a[0]); }
+static KaiValue *_kai_core_real_acos_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_acos(a[0]); }
+static KaiValue *_kai_core_real_atan_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_atan(a[0]); }
+static KaiValue *_kai_core_real_sinh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_sinh(a[0]); }
+static KaiValue *_kai_core_real_cosh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_cosh(a[0]); }
+static KaiValue *_kai_core_real_tanh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_tanh(a[0]); }
+static KaiValue *_kai_core_real_signum_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_signum(a[0]); }
+static KaiValue *_kai_core_real_is_nan_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_is_nan(a[0]); }
+static KaiValue *_kai_core_real_is_inf_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_is_inf(a[0]); }
+static KaiValue *_kai_core_real_pow_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_pow(a[0], a[1]); }
+static KaiValue *_kai_core_real_atan2_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_real_atan2(a[0], a[1]); }
+static KaiValue *_kai_core_real_rem_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_rem(a[0], a[1]); }
+static KaiValue *_kai_core_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_length(a[0]); }
+static KaiValue *_kai_core_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_concat(a[0], a[1]); }
+static KaiValue *_kai_core_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_concat_all(a[0]); }
+static KaiValue *_kai_core_string_join_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_join(a[0], a[1]); }
+static KaiValue *_kai_core_array_make_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_make(a[0], a[1]); }
+static KaiValue *_kai_core_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_array_empty(); }
+static KaiValue *_kai_core_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_array_length(a[0]); }
+static KaiValue *_kai_core_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_get(a[0], a[1]); }
+static KaiValue *_kai_core_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_set(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_grow(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_ref_make(a[0]); }
+static KaiValue *_kai_core_ref_get_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_get(a[0]); }
+static KaiValue *_kai_core_ref_set_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_set(a[0], a[1]); }
+static KaiValue *_kai_core_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_length(a[0]); }
+static KaiValue *_kai_core_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_append(a[0], a[1]); }
+static KaiValue *_kai_core_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_list_reverse(a[0]); }
+static KaiValue *_kai_core_map_thunk(KaiValue *s, KaiValue **a, int n)            { (void) s; (void) n; return kai_core_map(a[0], a[1]); }
+static KaiValue *_kai_core_flat_map_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_flat_map(a[0], a[1]); }
+static KaiValue *_kai_core_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_filter(a[0], a[1]); }
+static KaiValue *_kai_core_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_reduce(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_core_each(a[0], a[1]); }
+static KaiValue *_kai_core_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_core_args(); }
+static KaiValue *_kai_core_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_program_name(); }
+static KaiValue *_kai_core_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_core_stdlib_path(); }
+static KaiValue *_kai_core_abspath_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_core_abspath(a[0]); }
+static KaiValue *_kai_core_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_read_file(a[0]); }
+static KaiValue *_kai_core_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_write_file(a[0], a[1]); }
+static KaiValue *_kai_core_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_exists(a[0]); }
+static KaiValue *_kai_core_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_delete(a[0]); }
+static KaiValue *_kai_core_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_rename(a[0], a[1]); }
+static KaiValue *_kai_core_file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_file_read_bytes(a[0]); }
+static KaiValue *_kai_core_file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_write_bytes(a[0], a[1]); }
+static KaiValue *_kai_core_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_dir_list_dir(a[0]); }
+static KaiValue *_kai_core_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_create_dir(a[0]); }
+static KaiValue *_kai_core_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_remove_dir(a[0]); }
+static KaiValue *_kai_core_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_dir_walk(a[0]); }
+static KaiValue *_kai_core_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_core_read_line(); }
+static KaiValue *_kai_core_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_read_bytes(a[0]); }
+static KaiValue *_kai_core_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_to_int(a[0]); }
+static KaiValue *_kai_core_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_real(a[0]); }
+static KaiValue *_kai_core_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_core_char_at(a[0], a[1]); }
+static KaiValue *_kai_core_string_split_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_split(a[0], a[1]); }
+static KaiValue *_kai_core_string_contains_thunk(KaiValue *s, KaiValue **a, int n){ (void) s; (void) n; return kai_core_string_contains(a[0], a[1]); }
+static KaiValue *_kai_core_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_slice(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_char_to_int(a[0]); }
+static KaiValue *_kai_core_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_int_to_char(a[0]); }
+static KaiValue *_kai_core_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_int_to_byte_string(a[0]); }
+static KaiValue *_kai_core_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_byte_at_int(a[0], a[1]); }
+static KaiValue *_kai_core_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_cp_at(a[0], a[1]); }
+static KaiValue *_kai_core_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_cp_len(a[0], a[1]); }
+static KaiValue *_kai_core_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_reverse(a[0]); }
+static KaiValue *_kai_core_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_hash(a[0]); }
+static KaiValue *_kai_core_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_real_bits(a[0]); }
+static KaiValue *_kai_core_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_core_mailbox_alloc(); }
+static KaiValue *_kai_core_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_alloc_bounded(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_send(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_recv(a[0]); }
+static KaiValue *_kai_core_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_recv_timeout(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_free(a[0]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
@@ -7588,7 +7588,7 @@ static void kai_check_fail_shrunk(int iter_at) {
 /* Runtime-aware assert: called from every emitted `assert`. Inside an
    active test (kai_test_in_progress) it prints a failure and longjmps
    back to the test harness so the next test can run. Otherwise it
-   aborts the process via kai_prelude_panic, matching stage 0's
+   aborts the process via kai_core_panic, matching stage 0's
    non-test-mode behaviour. */
 static void kai_assert_check(KaiValue *cond, const char *msg) {
     int ok = kai_op_truthy(cond);
@@ -7598,7 +7598,7 @@ static void kai_assert_check(KaiValue *cond, const char *msg) {
         kai_test_fail(kai_test_current, msg ? msg : "assertion failed");
         longjmp(kai_test_jmp, 1);
     } else {
-        kai_prelude_panic(kai_str(msg ? msg : "assertion failed"));
+        kai_core_panic(kai_str(msg ? msg : "assertion failed"));
     }
 }
 
@@ -7636,7 +7636,7 @@ static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
         kai_decref(full);
         longjmp(kai_test_jmp, 1);
     } else {
-        kai_prelude_panic(full);
+        kai_core_panic(full);
     }
 }
 
@@ -7892,12 +7892,12 @@ static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *
     return kai_cont_resume(k, s);
 }
 
-/* m7a #7: default Env handlers. `args()` reuses kai_prelude_args
+/* m7a #7: default Env handlers. `args()` reuses kai_core_args
  * (returns a [String] of argv[1..]); `var(name)` wraps getenv:
  * present → Some(value), absent → None. */
 static KaiValue *kai_default_env_args(void *self, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_args());
+    return kai_cont_resume(k, kai_core_args());
 }
 
 static KaiValue *kai_default_env_get(void *self, KaiValue *name, KaiCont *k) {
@@ -7992,7 +7992,7 @@ static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
     /* Build the list head-down via list_append so the surface order
      * matches the libc enumeration order (first entry of `environ`
      * appears as head). cons-then-reverse would also work; this
-     * shape mirrors how `kai_prelude_args` walks argv. */
+     * shape mirrors how `kai_core_args` walks argv. */
     KaiValue *acc = kai_nil();
     int count = 0;
     for (char **ep = environ; ep && *ep; ++ep) ++count;
@@ -8013,7 +8013,7 @@ static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
     return kai_cont_resume(k, acc);
 }
 
-/* m7a #7: default File handlers. Each reuses the prelude helper —
+/* m7a #7: default File handlers. Each reuses the core helper —
  * which already produces `Result[T, String]` shapes per Doc B
  * §`File` error model — but routes the call through the Phase R1
  * reactor's file-pool worker (issue #611) so the blocking `fopen`
@@ -8023,13 +8023,13 @@ static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
  *
  * Each `_arg` struct lives on the calling fiber's stack for the
  * lifetime of the work; the `_thunk` runs on a pool worker thread
- * and returns the KaiValue * the prelude produced. */
+ * and returns the KaiValue * the core produced. */
 typedef struct {
     KaiValue *path;
 } KaiFileReadFileArg;
 static KaiValue *_kai_file_read_file_thunk(void *arg) {
     KaiFileReadFileArg *a = (KaiFileReadFileArg *) arg;
-    return kai_prelude_read_file(a->path);
+    return kai_core_read_file(a->path);
 }
 static KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
     (void) self;
@@ -8045,7 +8045,7 @@ typedef struct {
 } KaiFileWriteFileArg;
 static KaiValue *_kai_file_write_file_thunk(void *arg) {
     KaiFileWriteFileArg *a = (KaiFileWriteFileArg *) arg;
-    return kai_prelude_write_file(a->path, a->contents);
+    return kai_core_write_file(a->path, a->contents);
 }
 static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
                                               KaiValue *contents, KaiCont *k) {
@@ -8061,10 +8061,10 @@ static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
  * parks the fiber, identical to read_file/write_file above — regular
  * files are not epoll-pollable, so the pool is the readiness path. The
  * `_arg` struct lives on the fiber stack for the duration of the work;
- * the `_thunk` runs on a pool thread and returns the prelude's value. */
+ * the `_thunk` runs on a pool thread and returns the core's value. */
 typedef struct { KaiValue *path; } KaiFileOpenArg;
 static KaiValue *_kai_file_open_read_thunk(void *arg) {
-    return kai_prelude_file_open_read(((KaiFileOpenArg *) arg)->path);
+    return kai_core_file_open_read(((KaiFileOpenArg *) arg)->path);
 }
 static KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont *k) {
     (void) self;
@@ -8077,7 +8077,7 @@ static KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont 
 typedef struct { KaiValue *h; KaiValue *max; } KaiFileReadChunkArg;
 static KaiValue *_kai_file_read_chunk_thunk(void *arg) {
     KaiFileReadChunkArg *a = (KaiFileReadChunkArg *) arg;
-    return kai_prelude_file_read_chunk(a->h, a->max);
+    return kai_core_file_read_chunk(a->h, a->max);
 }
 static KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k) {
     (void) self;
@@ -8088,7 +8088,7 @@ static KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *
 }
 
 static KaiValue *_kai_file_open_write_thunk(void *arg) {
-    return kai_prelude_file_open_write(((KaiFileOpenArg *) arg)->path);
+    return kai_core_file_open_write(((KaiFileOpenArg *) arg)->path);
 }
 static KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont *k) {
     (void) self;
@@ -8101,7 +8101,7 @@ static KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont
 typedef struct { KaiValue *h; KaiValue *data; } KaiFileWriteChunkArg;
 static KaiValue *_kai_file_write_chunk_thunk(void *arg) {
     KaiFileWriteChunkArg *a = (KaiFileWriteChunkArg *) arg;
-    return kai_prelude_file_write_chunk(a->h, a->data);
+    return kai_core_file_write_chunk(a->h, a->data);
 }
 static KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k) {
     (void) self;
@@ -8113,7 +8113,7 @@ static KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue 
 
 typedef struct { KaiValue *h; } KaiFileCloseArg;
 static KaiValue *_kai_file_close_thunk(void *arg) {
-    return kai_prelude_file_close(((KaiFileCloseArg *) arg)->h);
+    return kai_core_file_close(((KaiFileCloseArg *) arg)->h);
 }
 static KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
     (void) self;
@@ -8123,58 +8123,58 @@ static KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k
     return kai_cont_resume(k, r);
 }
 
-/* m7b #2b: default Mutable handler — wraps the prelude `array_*`
+/* m7b #2b: default Mutable handler — wraps the core `array_*`
  * helpers and resumes with the result. Doc B §`Mutable` *Default
  * handler* says the trivial wrapping default is installed for any
  * main row that mentions Mutable. The op signatures here mirror
- * the prelude's Array[T] return shape (see compiler.kai
+ * the core's Array[T] return shape (see compiler.kai
  * builtin_mutable_decl for the divergence note from Doc B). */
 static KaiValue *kai_default_mutable_array_make(void *self, KaiValue *n,
                                                  KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_array_make(n, init));
+    return kai_cont_resume(k, kai_core_array_make(n, init));
 }
 
 static KaiValue *kai_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_array_length(a));
+    return kai_cont_resume(k, kai_core_array_length(a));
 }
 
 static KaiValue *kai_default_mutable_array_get(void *self, KaiValue *a,
                                                 KaiValue *i, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_array_get(a, i));
+    return kai_cont_resume(k, kai_core_array_get(a, i));
 }
 
 static KaiValue *kai_default_mutable_array_set(void *self, KaiValue *a,
                                                 KaiValue *i, KaiValue *v, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_array_set(a, i, v));
+    return kai_cont_resume(k, kai_core_array_set(a, i, v));
 }
 
 static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
                                                  KaiValue *n, KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
+    return kai_cont_resume(k, kai_core_array_grow(a, n, init));
 }
 
 /* Issue #257: Ref[T] ops in the default Mutable handler. Each
- * trampolines to its prelude helper and resumes with the result,
+ * trampolines to its core helper and resumes with the result,
  * mirroring the array_* clauses above. */
 static KaiValue *kai_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_ref_make(init));
+    return kai_cont_resume(k, kai_core_ref_make(init));
 }
 
 static KaiValue *kai_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_ref_get(r));
+    return kai_cont_resume(k, kai_core_ref_get(r));
 }
 
 static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
                                               KaiValue *v, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_prelude_ref_set(r, v));
+    return kai_cont_resume(k, kai_core_ref_set(r, v));
 }
 
 /* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
@@ -9311,7 +9311,7 @@ static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
              * identity, so two concurrent waiters would race over
              * who picks it up. Mirrors the R3 stdin-multiplex
              * panic. */
-            kai_prelude_panic(kai_str(
+            kai_core_panic(kai_str(
                 "signal_await: a fiber is already awaiting a signal — "
                 "concurrent Signal.await() is undefined; "
                 "serialize via an actor or supervisor"));
@@ -11109,7 +11109,7 @@ static void kai_fiber_trampoline(void) {
  * RC contract: op handlers borrow their KaiValue* args (the call site
  * decrefs after the call per Perceus). Handlers that need to retain
  * an arg `kai_incref` before storing — same pattern the m8 v1 handlers
- * used and that `kai_prelude_map` documents at runtime.h:1031-1040.
+ * used and that `kai_core_map` documents at runtime.h:1031-1040.
  * R1 Phase 3 flipped only the 13 primitives named in CHANGELOG v0.2.0
  * step C; effect-op handlers were not touched, so the call-site / op
  * contract stayed "callee borrows".
