@@ -1,12 +1,13 @@
 # The kind system
 
-> Status: `Type` and `Measure` are the two *operational* kinds.
-> The kind system is no longer closed: the `kind` / `theory`
-> declaration surface is shipped (catalog in
-> `stdlib/core/kinds.kai`), and the generalized engine — user
-> kinds over `AbelianGroup`, per-kind isolation, use-site
-> resolution — is in progress (#1108). The authoritative design
-> is `docs/kind-system-design.md`; this page is the primer.
+> Status: the catalog (`stdlib/core/kinds.kai`) declares three
+> kinds — `Type` and `Effect` (builtin, closed) and `Measure`
+> (open engine) — with `Module` and `Structural` as candidate
+> theories under design. The `kind` / `theory` declaration surface
+> and the generalized engine (user kinds over `AbelianGroup`,
+> per-kind isolation, use-site resolution) are shipped. The
+> authoritative design is `docs/kind-system-design.md`; this page
+> is the primer.
 
 ## What is a kind?
 
@@ -20,21 +21,36 @@ concept stays invisible. kaikai exposes a second kind so the
 type system can keep units of measure separate from ordinary
 types.
 
-## The two operational kinds
+## The catalog kinds
 
-| Kind      | Inhabits | Examples |
-|-----------|----------|----------|
-| `Type`    | ordinary types | `Int`, `String`, `Bool`, `[T]`, `Option[T]`, `Result[E, T]`, user records, user variants |
-| `Measure` | units of measure | `USD`, `EUR`, `m`, `kg`, `m/s`, `m^2` |
+Every kind is declared in the catalog over a **theory** — the
+unification discipline that decides how its habitants unify:
 
-There is no `Effect` kind, no `Row` kind, no higher-order kinds.
-Effects and rows live in their own machinery (see
-`docs/effects.md`); they do not show up at the kind level.
+| Kind      | Theory | Engine | Introducer | Inhabits |
+|-----------|--------|--------|------------|----------|
+| `Type`    | `HindleyMilner` | builtin (the compiler's HM unifier) | `type` | ordinary types: `Int`, `String`, `[T]`, `Option[T]`, user records and variants |
+| `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
+| `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `USD`, `m`, `kg`, `m/s`, `m^2` |
 
-`Measure` is itself declared in the catalog —
-`kind Measure : AbelianGroup with unit` in `stdlib/core/kinds.kai`
-— rather than hardcoded; `unit m` mints its habitants. Further
-kinds follow the same shape once the generalized engine lands.
+A `builtin` theory (`theory HindleyMilner = builtin`) names an
+engine that is the compiler core itself rather than a property
+set with a hand-written `unify_<theory>`. `Type` and `Effect` are
+**closed**: the language provides them, and user code can neither
+redeclare them nor declare a new `builtin` theory. The catalog is
+declarative surface — HM and row-unification run exactly where
+they always did, not through a kind dispatcher.
+
+The introducer column is the symmetry that makes the catalog the
+whole truth: `type Foo = ...` mints a habitant of `Type` the same
+way `effect Stdout { ... }` mints one of `Effect` and `unit m`
+mints one of `Measure`.
+
+Effect *rows* (the `/ Console + State` part of a signature) stay
+in their own machinery (see `docs/effects.md`); `Effect` classifies
+the labels, and only `Measure`-style kinds appear in tparam
+annotations (`[u: Measure]`). Candidate theories under design:
+`Module` (currency/money — no internal product, so `USD^2` cannot
+arise) and `Structural` (identity — regions).
 
 ## Kind annotation syntax
 
@@ -116,12 +132,11 @@ the use site by qualification > `use kind` > uniqueness — see
 `docs/kind-system-design.md` § *Habitant resolution at the use
 site*.
 
-> **v1 status (2026-07-08):** the declaration surface is shipped;
-> user kinds beyond the built-in `Measure` activate with the
-> generalized engine (#1108, in progress). Candidate theories
-> under design: `Structural` (identity — regions, #1123) and
-> `Module` (currency/money — no internal product, so `USD^2`
-> cannot arise).
+`Type` and `Effect` are **not** user-declarable. Only kinds over
+the open catalog theories (`AbelianGroup` today) can be declared;
+a `kind Type : ...` redeclaration, a user `theory X = builtin`,
+and a user kind over a builtin theory (`kind Foo : EffectRow`)
+are all hard errors.
 
 ## Cross-references
 

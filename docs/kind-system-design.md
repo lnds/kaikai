@@ -93,6 +93,17 @@ unify under. The compiler recognises which *combinations* have a terminating eng
 (abelian group = assoc+commut+inverse+identity; semilattice = assoc+commut+idempotent;
 etc.). A combination with no known-decidable engine is rejected at the declaration.
 
+**The `builtin` body.** Two theories have no property set at all:
+`theory HindleyMilner = builtin` and `theory EffectRow = builtin`. A `builtin` body
+means the engine is the compiler core itself — HM unification for `Type`, row
+unification for `Effect` — rather than a hand-written `unify_<theory>`. This is the
+same hardcoded-engine discipline taken to its root: the compiler *is* the hardcode.
+`builtin` theories and the kinds over them (`kind Type : HindleyMilner with type`,
+`kind Effect : EffectRow with effect`) are provided by the language, closed, and not
+user-declarable; declaring `theory X = builtin` or redeclaring `kind Type` /
+`kind Effect` in user code is a compile error. The catalog entries are declarative
+surface only — type and effect unification do not route through a kind dispatcher.
+
 **A future user can create a theory — by assembling, never by writing algebra.**
 `theory Mine = { assoc, commut, idempotent }` is legal (the compiler recognises it
 as a semilattice engine); `theory Bad = { assoc, distributes_over(...) }` is a
