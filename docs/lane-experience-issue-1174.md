@@ -129,6 +129,11 @@ pre-map because they only became visible on contact:
   `Rate[from, to]` is inexpressible as a unit (`USD/EUR` is exactly
   the product Module forbids) and would need its own nominal type.
 
+- The serial backend-parity sweep surfaced one failing fixture
+  (`demos/vs/python`, a C-oracle build failure in a map-pipe lambda's
+  deferred field). It reproduces identically with a fresh kaic2 on
+  main — pre-existing, filed as #1186, not introduced here.
+
 ## Cost vs estimate
 
 The spike's "the lane is direct" held for blocks 1 and 3; the two
