@@ -23,6 +23,8 @@ import compiler.kir_lower
 import compiler.kir_pat_alias
 import compiler.kir_lower_reuse
 import compiler.kir_lower_raw
+import compiler.cell_promote
+import compiler.loop_lower
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
@@ -197,6 +199,18 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # shrinking input).
   EPipe(lhs, rhs)    -> lower_pipe(x, lhs, rhs, st)
 
+  # A promoted var cell in boxed position: a read boxes the raw register
+  # at its scalar type; a write stores the raw value and yields unit. A
+  # loop intrinsic pastes its pred/body lambda bodies into an inline
+  # block loop in the enclosing fn (the C emitter's `for (;;)` mirror).
+  EIntrinsic(inm, iargs) ->
+    if is_cell_get(inm) {
+      bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(inm, st))]), kpos_of(x))
+    }
+    else if is_cell_set(inm) { lower_cell_set(x, inm, iargs, st) }
+    else if is_loop_intrinsic(inm) { lower_loop_intrinsic(x, inm, iargs, st) }
+    else { lower_unhandled(x, st) }
+
   # Forms the resolve / desugar / typer passes rewrite away before codegen
   # (`EMapPipe`/`EFlatMapPipe`/`EFilterPipe` → ECall, `EIndex` → call,
   # `EUnder`/`EPlaceholder` pattern-only). These never reach a post-perceus
@@ -366,11 +380,154 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
       [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_scalar_unbox_border(x, st) }
       _  -> lower_scalar_unbox_border(x, st)
     }
+  # A promoted var cell: a read is the raw register itself (resolving an
+  # active shadow rename, like an `EVar` read); the init forwards its raw
+  # literal.
+  EIntrinsic(inm, iargs) ->
+    if is_cell_get(inm) { LRes(KVar(lower_cell_reg(inm, st)), st) }
+    else if inm == "__cell_init" { match iargs {
+      [init] -> lower_expr_raw(init, st)
+      _      -> lower_scalar_unbox_border(x, st)
+    } }
+    else { lower_scalar_unbox_border(x, st) }
   # The guard (`kir_node_is_raw`) only admits the FORMS above, so this arm is
   # reached only via internal recursion on a sub-operand the unbox pass left
   # boxed — lower it boxed and unbox-borrow its raw scalar (the box→raw
   # border, by type).
   _ -> lower_scalar_unbox_border(x, st)
+}
+
+# A promoted var cell's register: the surface binder name, resolving an
+# active shadow rename exactly like an `EVar` read of a local.
+fn lower_cell_reg(inm: String, st: LowerSt) : String = {
+  let nm = cell_intrinsic_name(inm)
+  match ls_lookup_rename(st, nm) { Some(reg) -> reg None -> nm }
+}
+
+fn cell_slot_of_ty(opt_t: Option[Ty]) : KSlot =
+  if kir_ty_is_real(opt_t) { SReal }
+  else if kir_ty_is_bool(opt_t) { SBool }
+  else { SInt64 }
+
+fn cell_unbox_prim(slot: KSlot) : String = match slot {
+  SReal -> "real.unbox"
+  SBool -> "bool.unbox"
+  _     -> "int.unbox"
+}
+
+# A promoted var cell's write: store the raw value into the cell's
+# register (an alloca — the same mutation KStore performs for TCO loop
+# assigns). A raw value stores directly; a boxed value crosses the
+# border (borrowing unbox) and is then dropped — the store owns the
+# scalar, and a raw register carries no RC to hand the box to.
+fn lower_cell_set(x: Expr, inm: String, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
+  [v] -> {
+    let reg = lower_cell_reg(inm, st)
+    match v.mode {
+      MUnboxed -> match lower_expr_raw(v, st) {
+        LRes(rv, st1) -> LRes(KUnitV, ls_emit(st1, KStore(reg, rv, kpos_of(x))))
+      }
+      _ -> {
+        let slot = cell_slot_of_ty(v.ty)
+        match lower_expr_boxed(v, st) {
+          LRes(bv, st1) -> match bind_op_slot(st1, KPrim(cell_unbox_prim(slot), [bv]), slot, kpos_of(x)) {
+            LRes(rv, st2) ->
+              LRes(KUnitV, ls_emit(ls_emit(st2, KStore(reg, rv, kpos_of(x))),
+                                   KRC(KDrop(bv), kpos_of(x))))
+          }
+        }
+      }
+    }
+  }
+  _ -> lower_unhandled(x, st)
+}
+
+# --- loop intrinsics (inline block loops) -------------------------------
+#
+# The loop combinator's pred/body arrive as literal nullary lambdas the
+# collector never lifted (they are not closures); their bodies lower
+# INLINE into cond/body blocks with a backedge, in the enclosing fn's
+# frame — so a promoted var cell mutated by the loop is a plain alloca
+# the backedge re-reads. RC inside the pasted bodies was computed under
+# the closure discipline (per-iteration balance), same as the C paste.
+
+fn lower_loop_intrinsic(x: Expr, inm: String, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
+  [_, a, b] ->
+    if inm == "__loop_while" { lower_loop_while(x, loop_lam_body(a), loop_lam_body(b), st) }
+    else if inm == "__loop_until" { lower_loop_until(x, loop_lam_body(a), loop_lam_body(b), st) }
+    else if inm == "__loop_repeat" { lower_loop_repeat(x, a, loop_lam_body(b), st) }
+    else { lower_unhandled(x, st) }
+  _ -> lower_unhandled(x, st)
+}
+
+fn loop_lam_body(e: Expr) : Expr = match e.kind {
+  ELambda(_, b) -> b
+  _             -> e
+}
+
+# `while { pred } { body }`: cond block (backedge target) evaluates the
+# pred and forks to body/exit; the body block re-enters the cond.
+fn lower_loop_while(x: Expr, pred: Expr, body: Expr, st: LowerSt) : LRes / Console =
+  match three_labels(st) { LSL3(lcond, lbody, lcont, st1) -> {
+    let st2 = ls_seal(st1, KBr(lcond, kpos_of(x)), lcond)
+    match lower_loop_cond(pred, st2) { LRes(cv, st3) -> {
+      let st4 = ls_seal(st3, KCondBr(cv, lbody, lcont, kpos_of(x)), lbody)
+      let st5 = lower_loop_body(body, st4)
+      LRes(KUnitV, ls_seal(st5, KBr(lcond, kpos_of(x)), lcont))
+    } }
+  } }
+
+# `until { pred } { body }`: body runs first, then the pred in the same
+# block; exit when it holds.
+fn lower_loop_until(x: Expr, pred: Expr, body: Expr, st: LowerSt) : LRes / Console =
+  match three_labels(st) { LSL3(lbody, _, lcont, st1) -> {
+    let st2 = ls_seal(st1, KBr(lbody, kpos_of(x)), lbody)
+    let st3 = lower_loop_body(body, st2)
+    match lower_loop_cond(pred, st3) { LRes(cv, st4) ->
+      LRes(KUnitV, ls_seal(st4, KCondBr(cv, lcont, lbody, kpos_of(x)), lcont))
+    }
+  } }
+
+# `repeat(n) { body }`: a raw i64 count-down register.
+fn lower_loop_repeat(x: Expr, n: Expr, body: Expr, st: LowerSt) : LRes / Console =
+  match lower_loop_count(n, st) { LRes(nv, st1) ->
+    match ls_fresh_reg(st1) { LSReg(reg, st2) -> {
+      let st3 = ls_emit(st2, KLet(reg, SInt64, KLitOp(nv), kpos_of(x)))
+      match three_labels(st3) { LSL3(lcond, lbody, lcont, st4) -> {
+        let st5 = ls_seal(st4, KBr(lcond, kpos_of(x)), lcond)
+        match bind_op_slot(st5, KPrim("i>", [KVar(reg), KIntV(0)]), SBool, kpos_of(x)) { LRes(cv, st6) -> {
+          let st7 = ls_seal(st6, KCondBr(cv, lbody, lcont, kpos_of(x)), lbody)
+          let st8 = lower_loop_body(body, st7)
+          match bind_op_slot(st8, KPrim("i-", [KVar(reg), KIntV(1)]), SInt64, kpos_of(x)) { LRes(dv, st9) -> {
+            let st10 = ls_emit(st9, KStore(reg, dv, kpos_of(x)))
+            LRes(KUnitV, ls_seal(st10, KBr(lcond, kpos_of(x)), lcont))
+          } }
+        } }
+      } }
+    } }
+  }
+
+# The loop condition: raw when the unbox pass marked it (an i1 the
+# condbr reads directly), else boxed (the condbr truthy path) — the
+# same split `lower_if` applies.
+fn lower_loop_cond(pred: Expr, st: LowerSt) : LRes / Console =
+  if kir_node_is_raw(pred) { lower_expr_raw(pred, st) }
+  else { lower_expr(pred, st) }
+
+# The loop body in statement position: its per-iteration value is
+# discarded (a `KDo`, the SExprStmt shape).
+fn lower_loop_body(body: Expr, st: LowerSt) : LowerSt / Console =
+  match lower_expr(body, st) { LRes(v, st1) -> ls_emit(st1, KDo(KLitOp(v), kpos_of(body))) }
+
+# The repeat count: raw when marked, else a boxed Int crossed at the
+# border (borrowing unbox) and dropped — the count is consumed here.
+fn lower_loop_count(n: Expr, st: LowerSt) : LRes / Console = match n.mode {
+  MUnboxed -> lower_expr_raw(n, st)
+  _ -> match lower_expr_boxed(n, st) {
+    LRes(bv, st1) -> match bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(n)) {
+      LRes(rv, st2) -> LRes(rv, ls_emit(st2, KRC(KDrop(bv), kpos_of(n))))
+    }
+  }
 }
 
 # `a <op> b` raw binary op → one native instruction over two raw operands.

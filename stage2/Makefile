@@ -124,7 +124,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/kinds.kai compiler/unit_walk.kai compiler/kind_resolve.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/migrate_rules.kai compiler/migrate_walk.kai compiler/migrate_scan.kai compiler/migrate.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/loop_lower.kai compiler/desugar.kai compiler/refine_enforce.kai compiler/region.kai compiler/infer_index.kai compiler/pipe_fusion.kai compiler/lit_mint.kai compiler/vec_surface.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox_native_raw.kai compiler/unbox.kai compiler/rawsafe.kai compiler/borrow_escape.kai compiler/borrow_infer.kai compiler/perceus.kai compiler/purity.kai compiler/impl_index.kai compiler/protos.kai compiler/fwd_inline.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/vec_raw.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_uses.kai compiler/kir_varslot.kai compiler/kir_inline_clone.kai compiler/kir_inline_beta.kai compiler/kir_inline.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_reuse.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_slot.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_native_modular.kai compiler/emit_ffi_c.kai compiler/emit_reuse_donate.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/kinds.kai compiler/unit_walk.kai compiler/kind_resolve.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/migrate_rules.kai compiler/migrate_walk.kai compiler/migrate_scan.kai compiler/migrate.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/loop_lower.kai compiler/desugar.kai compiler/cell_scan.kai compiler/cell_promote.kai compiler/refine_enforce.kai compiler/region.kai compiler/infer_index.kai compiler/pipe_fusion.kai compiler/lit_mint.kai compiler/vec_surface.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox_native_raw.kai compiler/unbox.kai compiler/rawsafe.kai compiler/borrow_escape.kai compiler/borrow_infer.kai compiler/perceus.kai compiler/purity.kai compiler/impl_index.kai compiler/protos.kai compiler/fwd_inline.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/vec_raw.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_uses.kai compiler/kir_varslot.kai compiler/kir_inline_clone.kai compiler/kir_inline_beta.kai compiler/kir_inline.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_reuse.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_slot.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_native_modular.kai compiler/emit_ffi_c.kai compiler/emit_reuse_donate.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -1166,7 +1166,7 @@ test-issue-248-loop-sugars: $(TARGET) build
 # to the golden; the negative (`each` closure) must KEEP its clauses.
 test-issue-1179-var-slot-loop: $(TARGET) build
 	@set -e; \
-	for f in issue_1179_var_slot_loops issue_1179_each_closure_state; do \
+	for f in issue_1179_var_slot_loops issue_1179_each_closure_state issue_1179_cell_register; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
 	  ./$(TARGET) --path ../stdlib $$src > build/$$f.c \
@@ -1184,7 +1184,19 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	done; \
 	grep -q "kai_each_sum__clause" build/issue_1179_each_closure_state.c \
 	  || { echo "issue_1179 FAIL (each_sum lost its State clauses)"; exit 1; }; \
-	echo "issue-1179-var-slot-loop OK (loops slot + inline, each keeps State)"
+	for cell in acc_int acc_real flag post; do \
+	  grep -q "kair_$${cell}__slot" build/issue_1179_cell_register.c \
+	    || { echo "issue_1179 FAIL ($$cell not promoted to a raw cell)"; exit 1; }; \
+	  grep -q "kai_$${cell}__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	    && { echo "issue_1179 FAIL ($$cell still an array slot)"; exit 1; } || true; \
+	done; \
+	grep -q "kai_s_txt__slot = kai_prelude_array_make" build/issue_1179_cell_register.c \
+	  || { echo "issue_1179 FAIL (String var lost its array slot)"; exit 1; }; \
+	./$(TARGET) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
+	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
+	grep -q "acc_int__slot: i64" build/issue_1179_cell_register.kir \
+	  || { echo "issue_1179 FAIL (acc_int not a raw i64 register in KIR)"; exit 1; }; \
+	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, each keeps State)"
 
 # Tier 1-ASAN counterpart: same fixture, but the linked binary is
 # instrumented with AddressSanitizer + UndefinedBehaviorSanitizer
@@ -5593,9 +5605,9 @@ test-kir-while-slot-1158: $(TARGET) build
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-slot-1158 FAIL (State dispatch survived in main)"; exit 1; } \
 	  || true; \
-	echo "$$kir" | grep -q '__vcell_' \
-	  || { echo "kir-while-slot-1158 FAIL (no var-cell register in main — the slot rewrite did not fire)"; exit 1; }; \
-	echo "kir-while-slot-1158 OK (loop fused, var cells are registers, no State dispatch in main)"
+	echo "$$kir" | grep -qE '__slot: (i64|f64|i1)|__vcell_' \
+	  || { echo "kir-while-slot-1158 FAIL (no var-cell register in main — neither a raw cell nor a vcell)"; exit 1; }; \
+	echo "kir-while-slot-1158 OK (loop inline, var cells are registers, no State dispatch in main)"
 
 # Issue #1173 — a while whose predicate captures a NON-alias register
 # (the loop bound is a fn param). The dead-closure sweep must clear
@@ -5613,8 +5625,8 @@ test-kir-while-param-slot-1173: $(TARGET) build
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-param-slot-1173 FAIL (State dispatch survived in lcg)"; exit 1; } \
 	  || true; \
-	echo "$$kir" | grep -q '__vcell_' \
-	  || { echo "kir-while-param-slot-1173 FAIL (no var-cell register in lcg — the slot rewrite did not fire)"; exit 1; }; \
+	echo "$$kir" | grep -qE '__slot: (i64|f64|i1)|__vcell_' \
+	  || { echo "kir-while-param-slot-1173 FAIL (no var-cell register in lcg — neither a raw cell nor a vcell)"; exit 1; }; \
 	echo "kir-while-param-slot-1173 OK (dead predicate closure swept, var cells are registers, no State dispatch in lcg)"
 
 # Issue #1173 negative — a var whose closure SURVIVES the inliner (it

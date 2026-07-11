@@ -135,3 +135,135 @@ density of a full-ExprKind structural walk is the limiting dimension.
   hold non-trivial payloads.
 - `loud_sum`-shape hybrids (interp read keeps the handler) would slot
   too if the interp scan lowered reads instead of vetoing.
+
+---
+
+# Gap 2: scalar var slots to raw register cells (both backends)
+
+## Scope as planned vs shipped
+
+Planned: promote a var that already lowered to a 1-cell array slot
+(`array_make(1, init)` + `array_get`/`array_set`) to a raw scalar local
+when it does not escape, on both backends — the Koka `local-var` floor.
+The brief left the level open (emitter-side vs a KIR pass).
+
+Shipped at a THIRD level neither option named: a shared AST pass
+(post-monomorph / pre-unbox) that rewrites the slot triple into three
+intrinsics (`__cell_init` / `__cell_get|x` / `__cell_set|x`), plus the
+small arms each downstream layer needs. The decisive observation: the
+baseline the gate compares against (tail recursion) is fast because the
+*mode machinery* (unbox → MUnboxed → perceus skip-RC → raw emission)
+makes the whole loop body raw — so the promotion must happen BEFORE
+unbox, where that machinery can see it. An emitter-side rewrite (option
+A) or a KIR pass (option B) would have removed the heap cell but kept
+`kai_op_add`/`kaix_add` calls per iteration: measured, that path could
+not reach the ~1x target. Post-hoc KIR untagging was drafted and
+discarded — it fights baked-in Perceus RC with pattern surgery, where
+the pre-unbox rewrite gets soundness from the existing mode discipline
+for free.
+
+Also shipped (required for the native half): `lower_loop_intrinsics`
+un-gated for ALL backends, and the KIR lowering grew inline block-loop
+lowering for `__loop_while`/`__loop_until`/`__loop_repeat` (cond/body
+blocks + backedge, mirroring the C emitter's `for (;;)` paste). The
+native pipeline previously recovered loops via KIR inline + kvs var-cell
+rewrite; loops now arrive pre-dissolved and the cells are raw allocas.
+
+## Measured
+
+LCG keystream loop (wrapping mul+add, observable result), n=1e8,
+best-of-5, Mac arm64:
+
+| form | C before | C after | native before | native after |
+|---|---|---|---|---|
+| `while`+`var` | 2.62s | 0.10s | 1.73s | 0.09s |
+| tail-rec (baseline) | 0.10s | 0.10s | 0.10s | 0.10s |
+
+Both backends land at tail-rec parity (the issue's "done" bar). The
+emitted C for `sum_to` is `int64_t kair_i__slot = 0` + raw wrapping
+adds; the KIR is `i__slot: i64` + `prim i+` + `KStore` in a block loop.
+rb-tree @1M unchanged (its source has zero vars/loops; measured within
+noise of the recorded baseline).
+
+## Structural surprises
+
+- **The fourth `_ ->` scanner.** `body_kind_has_lambda` (fnreg) missed
+  lambdas under `EIntrinsic` args, so removing the array ops from a loop
+  fn's body let it classify for a RAW UFn SIGNATURE while its pasted
+  loop bodies still emitted boxed `kai_<p>` param reads — an undeclared
+  identifier only visible when compiling the emitted C standalone. Gap
+  1's retro counted three defaulted use-scanners; this lane found and
+  closed the fourth. The new scan in `cell_scan.kai` is exhaustive (no
+  `_ ->`) for exactly this reason.
+- **`kai run <file> --backend=c` silently runs the DEFAULT backend.**
+  The wrapper ignores flags placed after the file argument (verified
+  with `--backend=bogus`: no error, native run), so a "C backend"
+  validation can silently validate native instead. Standalone-compiling
+  the emitted C is the honest check. Reported for a follow-up lane, not
+  fixed here.
+- **Name-carrying intrinsics beat EVar args.** Carrying the cell name
+  mangled into the intrinsic name (`__cell_get|x`, the `__kai_tcrec|`
+  precedent) rather than as an `EVar(x)` argument means the promoted
+  binder has ZERO variable reads afterwards: the unbox lambda-capture
+  demotion never fires, Perceus never dups it, and the residual-use
+  check reduces to "any `EVar(x)` left anywhere = revert".
+- **User-written cells match the desugar's slot shape.** The pass was
+  designed against desugar-minted slots, whose escape check already
+  vetoed closure captures — but `let fed = array_make(1, false)` written
+  BY HAND (stream_mock_disk) matches the same triple, and its get/set
+  sites sat inside handler clauses, which emit as separate functions.
+  The promoted register was undeclared there (CI compile failure). The
+  rewriter now stops at every function-emission boundary (closures,
+  handler clauses/returns), with the loop wrapper lambdas as the one
+  pasted-inline exception.
+- **The parity ratchet can mask an oracle-build regression as flaky.**
+  The same bug made 8 fixtures' ORACLE (C) builds fail during the local
+  parity runs, and the ratchet classified them "failed to build on
+  recheck; cannot judge, not counted as a new gap" — a green ratchet
+  over a real regression. When the ratchet reports oracle-build
+  failures, compile one of them standalone before trusting the OK.
+- **Rewrite-then-verify beats prove-then-rewrite.** Shadowing (nested
+  same-named vars, handler aliases, lambda params) needs no scope
+  analysis: the rewriter refuses to enter binding constructs that rebind
+  the name, and any mention that survives reverts the promotion.
+
+## Conditions and negatives
+
+Promotion requires: scalar literal init (Int/Real/Bool), every use a
+whole-cell get/set at index 0. A String/boxed var keeps the array slot;
+an escaping var (each-closure) keeps its State handler (gap 1's negative
+fixture still holds). A boxed store value crosses the border with an
+explicit consume (`kai_decref` / KIR `KRC(KDrop)`), so RC stays balanced
+— the LCG bench runs 1e8 iterations at the hello-world RC baseline
+(zero allocations, zero RC traffic from the cells).
+
+## Fixtures
+
+`examples/sugars/loop/issue_1179_cell_register.kai` (+ golden): Int
+accumulator, Real accumulator, Bool flag, writes under both `if` arms,
+reads after the loop, and the String negative. The harness greps the
+emitted C for the raw cells (`kair_*__slot`), for the String var's
+RETAINED `array_make`, and the KIR dump for `acc_int__slot: i64` —
+wired into the existing `test-issue-1179-var-slot-loop` target.
+
+## Cost vs estimate
+
+One session. The C half landed almost entirely on existing machinery
+(the raw-local SLet arm, `box_wrap`, `prc_pat_bindings_skip_raw` — all
+mode-keyed, zero perceus edits). The native half cost the loop lowering
+(~90 lines) plus cell arms; the fnreg scanner hole cost one
+diagnose-fix-rebuild cycle.
+
+## Follow-ups
+
+- Non-literal scalar inits (`var i := n`) keep the array slot; the
+  border unbox at the decl is straightforward if a hot case appears.
+- The loop condition on native still evaluates boxed when it mixes a
+  raw cell with a boxed param (`i < n`: `int.box` + `kaix_lt` per
+  iteration); measured irrelevant here (LLVM hoists/folds the tagged
+  path) but a raw-cmp border for mixed operands is the next micro-win.
+- The `__pcs_ret` wrap binder still round-trips box→unbox once per call
+  on native when a raw block feeds a boxed return (`int.box(int_field)`)
+  — once per call, cosmetic.
+- The slot-array exit drop gap gap 1's retro noted is unchanged for the
+  vars that still slot (String cells).

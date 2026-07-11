@@ -41,6 +41,7 @@
 # `try_eval_int` (the `^` raw-inline exponent gate).
 
 import compiler.ast
+import compiler.cell_promote
 import compiler.refinements
 import compiler.infer
 import compiler.fnreg
@@ -612,6 +613,11 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]
       # `.mode` is final here. Exhaustivity (a raw `_r` cannot be left
       # uninitialised) is the emitter's gate.
       EMatch(_, arms) -> if arms_all_raw(arms) { MUnboxed } else { MBoxed }
+      # A promoted var cell (`cell_promote`): the init and every read
+      # are raw by construction — the cell's type is a raw scalar and
+      # the emitters own both border directions.
+      EIntrinsic(inm, _) ->
+        if inm == "__cell_init" or is_cell_get(inm) { MUnboxed } else { MBoxed }
       _ -> MBoxed
     }
   }
@@ -848,7 +854,13 @@ fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], f
       let rhs1 = unbox_expr_aware(rhs, env, fns, cis, nat)
       match pat.pkind {
         PBind(nm) -> match rhs1.mode {
-          MUnboxed -> {
+          MUnboxed -> if stmt_rhs_is_cell_init(rhs1) {
+            # A promoted var cell never demotes: its reads/writes ride
+            # the name-mangled `__cell_*` intrinsics (no `EVar(nm)`
+            # exists for the capture/interp scans to find), and the
+            # emitters declare it as a raw mutable local.
+            UbStmt(SLet(pat, ann, rhs1), [LB(nm, MUnboxed), ...env])
+          } else {
             # Closure capture stays boxed (Phase 2 non-goal table:
             # `Closure capture (ELambda free var) → boxed`). If `nm`
             # is referenced from within any subsequent ELambda, the
@@ -887,6 +899,11 @@ fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], f
                           unbox_expr_aware(v, env, fns, cis, nat), l, c), env)
     SUse(n, l, c) -> UbStmt(SUse(n, l, c), env)
   }
+}
+
+fn stmt_rhs_is_cell_init(e: Expr) : Bool = match e.kind {
+  EIntrinsic(inm, _) -> inm == "__cell_init"
+  _ -> false
 }
 
 # Demote an Expr's outer mode to MBoxed. Children retain their own
