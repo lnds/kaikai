@@ -1,0 +1,302 @@
+# compiler/loop_lower.kai — loop combinators to loop intrinsics (C backend).
+#
+# Rewrites a literal double-trailing-lambda call to the stdlib loop
+# combinators (`while {c} {b}`, `until {c} {b}`, `repeat(n) {b}`) into
+# `EIntrinsic("__loop_*", args)`, keeping the lambda wrappers. The
+# lambdas never become runtime closures: the C emitter pastes their
+# bodies into an inline C loop in the enclosing frame, so a `var`
+# mutated only by the loop stops escaping and the var→slot
+# specialisation fires instead of the dispatched State handler.
+#
+# Pre-resolve pass, so callee identity is lexical. It bails
+# program-wide when any non-`loop`-module declaration binds one of the
+# combinator names, and skips any call site where the combinator name
+# (or the `loop` qualifier) is locally shadowed.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+
+# The intrinsic keeps the ORIGINAL CALLEE as arg 0 (`EVar("while")` or
+# `EField(EVar("loop"), "while")`), followed by the combinator's args.
+# The resolver checks the callee's visibility exactly as it would the
+# call's, and the typer types the intrinsic by delegating to the plain
+# call typing with that callee — so a missing `import loop` still
+# errors, and the intrinsic's type/row equal the original call's by
+# construction. Perceus and the emitter ignore arg 0.
+
+#[doc("True for the loop-intrinsic names this pass mints (`__loop_while` / `__loop_until` / `__loop_repeat`).")]
+pub fn is_loop_intrinsic(nm: String) : Bool =
+  nm == "__loop_while" or nm == "__loop_until" or nm == "__loop_repeat"
+
+fn ll_is_base(nm: String) : Bool =
+  nm == "while" or nm == "until" or nm == "repeat"
+
+#[doc("Rewrite literal `while`/`until`/`repeat` combinator calls into loop intrinsics across a program; a combinator name rebound by a non-`loop` declaration is left alone.")]
+pub fn lower_loop_intrinsics(ds: [Decl]) : [Decl] = {
+  let blocked = ll_blocked_names(ds, [])
+  map(ds, (d) => ll_decl(d, blocked))
+}
+
+# --- blocked-name scan ------------------------------------------------
+
+# Names the rewrite must not touch, program-wide: a combinator name
+# bound by a root-file fn, a const, an effect or protocol op, or a
+# module fn whose signature could actually receive the trailing-lambda
+# call (second param a function type). A module fn like `list.repeat(x,
+# n: Int)` does NOT block: a `repeat(n) { … }` call could never have
+# typed against it, so a well-typed program's call is the combinator's.
+# `import x as loop` blocks the qualifier name instead.
+fn ll_blocked_names(ds: [Decl], acc: [String]) : [String] = match ds {
+  []           -> acc
+  [d, ...rest] -> ll_blocked_names(rest, ll_decl_blocked(d, acc))
+}
+
+fn ll_decl_blocked(d: Decl, acc: [String]) : [String] = match d {
+  DFn(_, n, _, ps, _, _, _, _, _, mo) ->
+    if ll_is_base(n) and not ll_mo_is_loop(mo) {
+      let root = match mo { None -> true _ -> false }
+      if root or ll_params_lambda_compatible(ps) { [n, ...acc] } else { acc }
+    } else { acc }
+  DAxiom(_, _, _, n, _, ps, _, _, _, _) ->
+    if ll_is_base(n) and ll_params_lambda_compatible(ps) { [n, ...acc] } else { acc }
+  DConst(_, n, _, _, _, _, _) -> if ll_is_base(n) { [n, ...acc] } else { acc }
+  DProtocol(_, _, _, ops, _, _) -> ll_proto_ops_blocked(ops, acc)
+  # An effect op named like a combinator would be rewritten by the
+  # `use Effect` desugar into an op call; the intrinsic must not eat it.
+  DEffect(_, _, _, ops, _, _, _, _) -> ll_eff_ops_blocked(ops, acc)
+  DImport(ik, _, _) -> match ik { IkAlias(_, a) -> if a == "loop" { ["loop", ...acc] } else { acc } _ -> acc }
+  DImpl(_, _, _, inner, _, _) -> ll_blocked_names(inner, acc)
+  DDerive(_, inner, _, _)     -> ll_decl_blocked(inner, acc)
+  DUnstable(inner, _, _)      -> ll_decl_blocked(inner, acc)
+  DConstructor(inner, _, _)   -> ll_decl_blocked(inner, acc)
+  DDoc(_, _, inner, _, _)     -> ll_decl_blocked(inner, acc)
+  _ -> acc
+}
+
+# Could a `name(...) { lambda }` call have typed against these params?
+# Two params with the second a function type (or unannotated) — the
+# combinator shape. Anything else cannot take the trailing lambda.
+fn ll_params_lambda_compatible(ps: [Param]) : Bool = match ps {
+  [_, p2] -> match p2.ptype {
+    None     -> true
+    Some(te) -> match te.tkind { TyFn(_, _, _) -> true _ -> false }
+  }
+  _ -> false
+}
+
+fn ll_mo_is_loop(mo: Option[String]) : Bool = match mo {
+  Some(m) -> m == "loop"
+  None    -> false
+}
+
+fn ll_proto_ops_blocked(ops: [ProtoOp], acc: [String]) : [String] = match ops {
+  []            -> acc
+  [op, ...rest] -> match op {
+    POp(n, _, _, _, _, _) ->
+      ll_proto_ops_blocked(rest, if ll_is_base(n) { [n, ...acc] } else { acc })
+  }
+}
+
+fn ll_eff_ops_blocked(ops: [EffectOp], acc: [String]) : [String] = match ops {
+  []            -> acc
+  [op, ...rest] -> match op {
+    EOp(n, _, _, _, _, _) ->
+      ll_eff_ops_blocked(rest, if ll_is_base(n) { [n, ...acc] } else { acc })
+  }
+}
+
+# --- decl walk -------------------------------------------------------
+
+# `seed` is the blocked-name set; it rides as the walk's initial scope,
+# so a blocked name is skipped exactly like a locally shadowed one.
+fn ll_decl(d: Decl, seed: [String]) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+    if ll_mo_is_loop(mo) { d }
+    else { DFn(pub_, n, tps, ps, ret, row, ll_expr(body, ll_param_names(ps, seed)), l, c, mo) }
+  DTest(desc, body, l, c)       -> DTest(desc, ll_expr(body, seed), l, c)
+  DBench(desc, body, l, c)      -> DBench(desc, ll_expr(body, seed), l, c)
+  DCheck(desc, ps, body, l, c)  -> DCheck(desc, ps, ll_expr(body, ll_param_names(ps, seed)), l, c)
+  DImpl(p, tas, tgt, inner, l, c) -> DImpl(p, tas, tgt, map(inner, (i) => ll_decl(i, seed)), l, c)
+  DDerive(ns, inner, l, c)      -> DDerive(ns, ll_decl(inner, seed), l, c)
+  DUnstable(inner, l, c)        -> DUnstable(ll_decl(inner, seed), l, c)
+  DConstructor(inner, l, c)     -> DConstructor(ll_decl(inner, seed), l, c)
+  DDoc(a, b, inner, l, c)       -> DDoc(a, b, ll_decl(inner, seed), l, c)
+  DConst(pub_, n, ty, init, mo, l, c) -> DConst(pub_, n, ty, ll_expr(init, seed), mo, l, c)
+  DEffect(pub_, n, tps, ops, dflt, l, c, mo) ->
+    DEffect(pub_, n, tps, ops, ll_default_block(dflt, seed), l, c, mo)
+  _ -> d
+}
+
+fn ll_param_names(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> ll_param_names(rest, [p.pname, ...acc])
+}
+
+fn ll_default_block(dflt: Option[DefaultBlock], seed: [String]) : Option[DefaultBlock] = match dflt {
+  None      -> None
+  Some(blk) -> match blk {
+    DBlk(cs, ret, l, c) -> Some(DBlk(ll_clauses(cs, seed), ll_hreturn_scoped(ret, seed), l, c))
+  }
+}
+
+# --- expr walk (scope = locally bound names; a hit shadows) ----------
+
+fn ll_expr(e: Expr, scope: [String]) : Expr =
+  Expr { kind: ll_kind(e.kind, scope), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn ll_opt(o: Option[Expr], scope: [String]) : Option[Expr] = match o {
+  Some(e) -> Some(ll_expr(e, scope))
+  None    -> None
+}
+
+fn ll_exprs(es: [Expr], scope: [String]) : [Expr] = match es {
+  []           -> []
+  [h, ...rest] -> [ll_expr(h, scope), ...ll_exprs(rest, scope)]
+}
+
+fn ll_elems(les: [ListElem], scope: [String]) : [ListElem] = match les {
+  []           -> []
+  [h, ...rest] -> {
+    let h2 = match h {
+      ElPlain(e)  -> ElPlain(ll_expr(e, scope))
+      ElSpread(e) -> ElSpread(ll_expr(e, scope))
+    }
+    [h2, ...ll_elems(rest, scope)]
+  }
+}
+
+fn ll_fields(fis: [FieldInit], scope: [String]) : [FieldInit] = match fis {
+  []           -> []
+  [fi, ...rest] -> match fi {
+    FI(n, v) -> [FI(n, ll_expr(v, scope)), ...ll_fields(rest, scope)]
+  }
+}
+
+# A call rewrites when the callee is an unshadowed bare combinator name
+# (or `loop.<name>` with `loop` unshadowed) and the args are the literal
+# trailing-lambda shape the parser mints. Args are rewritten first so
+# nested loops in the bodies lower too.
+fn ll_kind(k: ExprKind, scope: [String]) : ExprKind = match k {
+  ECall(f, args_)    -> ll_call(f, args_, scope)
+  ELambda(ps, b)     -> ELambda(ps, ll_expr(b, ll_param_names(ps, scope)))
+  EBlock(stmts, tail) -> ll_block(stmts, tail, scope)
+  EMatch(scr, arms)  -> EMatch(ll_expr(scr, scope), ll_arms(arms, scope))
+  EField(b, f)       -> EField(ll_expr(b, scope), f)
+  EIndex(a, b)       -> EIndex(ll_expr(a, scope), ll_expr(b, scope))
+  EBinop(op, a, b)   -> EBinop(op, ll_expr(a, scope), ll_expr(b, scope))
+  EUnop(op, x)       -> EUnop(op, ll_expr(x, scope))
+  EIf(c, t, eo)      -> EIf(ll_expr(c, scope), ll_expr(t, scope), ll_opt(eo, scope))
+  EPipe(a, b)        -> EPipe(ll_expr(a, scope), ll_expr(b, scope))
+  EMapPipe(a, b)     -> EMapPipe(ll_expr(a, scope), ll_expr(b, scope))
+  EFlatMapPipe(a, b) -> EFlatMapPipe(ll_expr(a, scope), ll_expr(b, scope))
+  EFilterPipe(a, b)  -> EFilterPipe(ll_expr(a, scope), ll_expr(b, scope))
+  EList(elems)       -> EList(ll_elems(elems, scope))
+  ERange(a, b, st)   -> ERange(ll_expr(a, scope), ll_expr(b, scope), ll_opt(st, scope))
+  ERecordLit(n, fis) -> ERecordLit(n, ll_fields(fis, scope))
+  EHandle(body, eff, tys, init, alias, cs, ret) ->
+    ll_handle(body, eff, tys, init, alias, cs, ret, scope)
+  EBang(inner)       -> EBang(ll_expr(inner, scope))
+  ELitUnit(inner, u) -> ELitUnit(ll_expr(inner, scope), u)
+  EIntrinsic(n, args_) -> EIntrinsic(n, ll_exprs(args_, scope))
+  _ -> k
+}
+
+fn ll_call(f: Expr, args_: [Expr], scope: [String]) : ExprKind = {
+  let args2 = ll_exprs(args_, scope)
+  match ll_callee_base(f, scope) {
+    Some(base) ->
+      if ll_shape_ok(base, args2) {
+        EIntrinsic(string_concat("__loop_", base), [f, ...args2])
+      } else { ECall(ll_expr(f, scope), args2) }
+    None -> ECall(ll_expr(f, scope), args2)
+  }
+}
+
+fn ll_handle(body: Expr, eff: String, tys: [TypeExpr], init: Option[Expr],
+             alias: Option[String], cs: [HClause], ret: Option[HReturn],
+             scope: [String]) : ExprKind = {
+  let scope2 = match alias { Some(a) -> [a, ...scope] None -> scope }
+  EHandle(ll_expr(body, scope2), eff, tys, ll_opt(init, scope),
+          alias, ll_clauses(cs, scope), ll_hreturn_scoped(ret, scope))
+}
+
+fn ll_callee_base(f: Expr, scope: [String]) : Option[String] = match f.kind {
+  EVar(nm) ->
+    if ll_is_base(nm) and not list_has(scope, nm) { Some(nm) } else { None }
+  EField(b, nm) -> match b.kind {
+    EVar(q) ->
+      if q == "loop" and ll_is_base(nm) and not list_has(scope, "loop") { Some(nm) }
+      else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# while/until: two nullary literal lambdas. repeat: a count expression
+# plus a nullary literal lambda. Anything else keeps the combinator
+# call (closures passed by value stay closures).
+fn ll_shape_ok(base: String, args_: [Expr]) : Bool = match args_ {
+  [a, b] ->
+    if base == "repeat" { ll_is_nullary_lam(b) }
+    else { ll_is_nullary_lam(a) and ll_is_nullary_lam(b) }
+  _ -> false
+}
+
+fn ll_is_nullary_lam(e: Expr) : Bool = match e.kind {
+  ELambda(ps, _) -> match ps { [] -> true _ -> false }
+  _ -> false
+}
+
+# --- stmt / arm / clause walks ---------------------------------------
+
+fn ll_block(stmts: [Stmt], tail: Option[Expr], scope: [String]) : ExprKind =
+  ll_block_loop(stmts, tail, scope, [])
+
+fn ll_block_loop(stmts: [Stmt], tail: Option[Expr], scope: [String], acc: [Stmt]) : ExprKind = match stmts {
+  [] -> EBlock(list_reverse(acc), ll_opt(tail, scope))
+  [s, ...rest] -> match s {
+    SLet(pat, ann, rhs) ->
+      ll_block_loop(rest, tail, pat_binders(pat, scope),
+                    [SLet(pat, ann, ll_expr(rhs, scope)), ...acc])
+    SVar(n, ty, rhs, l, c) ->
+      ll_block_loop(rest, tail, [n, ...scope],
+                    [SVar(n, ty, ll_expr(rhs, scope), l, c), ...acc])
+    SAssert(cnd, m) ->
+      ll_block_loop(rest, tail, scope,
+                    [SAssert(ll_expr(cnd, scope), ll_opt(m, scope)), ...acc])
+    SExprStmt(x) ->
+      ll_block_loop(rest, tail, scope, [SExprStmt(ll_expr(x, scope)), ...acc])
+    SIndexAssign(b, i, v, l, c) ->
+      ll_block_loop(rest, tail, scope,
+                    [SIndexAssign(ll_expr(b, scope), ll_expr(i, scope),
+                                  ll_expr(v, scope), l, c), ...acc])
+    SUse(n, l, c) ->
+      ll_block_loop(rest, tail, scope, [SUse(n, l, c), ...acc])
+  }
+}
+
+fn ll_arms(arms: [Arm], scope: [String]) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, guard, body) -> {
+      let scope2 = pat_binders(pat, scope)
+      [Arm(pat, ll_opt(guard, scope2), ll_expr(body, scope2)), ...ll_arms(rest, scope)]
+    }
+  }
+}
+
+fn ll_clauses(cs: [HClause], scope: [String]) : [HClause] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(n, ps, body, l, cl) ->
+      [HC(n, ps, ll_expr(body, ll_param_names(ps, scope)), l, cl), ...ll_clauses(rest, scope)]
+  }
+}
+
+fn ll_hreturn_scoped(ret: Option[HReturn], scope: [String]) : Option[HReturn] = match ret {
+  None    -> None
+  Some(hr) -> match hr {
+    HR(n, body, l, c) -> Some(HR(n, ll_expr(body, [n, ...scope]), l, c))
+  }
+}

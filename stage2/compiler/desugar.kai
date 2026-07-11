@@ -66,6 +66,7 @@ import compiler.diag
 import compiler.ast
 import compiler.modules
 import compiler.refinements
+import compiler.loop_lower
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -1965,6 +1966,13 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       let r = lcr_expr(inner, caps, reject_at, file, errs)
       VLExpr { expr: mk_expr(ELitUnit(r.expr, u), line, col), errs: r.errs }
     }
+    # A loop intrinsic's lambdas read cells like any eagerly-applied
+    # closure; the post-interp relower must reach the reads the interp
+    # lift plants inside them.
+    EIntrinsic(nm, args_) -> {
+      let r = lcr_exprs(args_, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(EIntrinsic(nm, r.exprs), line, col), errs: r.errs }
+    }
     _ -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
   }
 }
@@ -2782,7 +2790,26 @@ fn body_escapes(name: String, e: Expr) : Bool {
     # Qualified module call mentions a module name and a function name
     # as plain strings, never the local `name`.
     EModCall(_, _) -> false
-    EIntrinsic(_, args_) -> args_escape(name, args_)
+    # A loop intrinsic's lambda args are applied in place (the C emitter
+    # pastes their bodies into an inline loop in the enclosing frame), so
+    # a cell name under them is judged by the get/set-only rule, not the
+    # closure-capture rule — the whole point of the loop lowering.
+    EIntrinsic(nm, args_) ->
+      if is_loop_intrinsic(nm) { loop_args_escape(name, args_) }
+      else { args_escape(name, args_) }
+  }
+}
+
+fn loop_args_escape(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> {
+      let here = match h.kind {
+        ELambda(ps, b) -> match ps { [] -> body_escapes(name, b) _ -> body_escapes(name, h) }
+        _ -> body_escapes(name, h)
+      }
+      if here { true } else { loop_args_escape(name, rest) }
+    }
   }
 }
 

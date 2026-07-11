@@ -20,6 +20,7 @@ import compiler.refinements
 import compiler.parse
 import compiler.resolve
 import compiler.modules
+import compiler.loop_lower
 import compiler.desugar
 import compiler.doc_attr
 import compiler.native_prims
@@ -9021,17 +9022,42 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # has them without re-walking the env. Errors yield a TyAny
     # stub so cascade is graceful.
     EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
-    # (Stage 3 wires this fully): a `$<name>(args)` reaching
-    # `synth` outside its allowed context is an error. The clause-body
-    # path that legitimately admits `$extern_handler` short-circuits
-    # before reaching this arm; any leak to here is user code with a
-    # misplaced intrinsic call.
-    EIntrinsic(nm, _) -> {
-      diag_error(st.file, e.line, e.col,
-        concat_all(["compiler intrinsic `$", nm,
-                    "` is not valid in this position"]))
-      inferred_leaf(st_bump_err(st), TyAny, e)
-    }
+    # A loop intrinsic types exactly as the combinator call it replaced:
+    # arg 0 is the original callee, so delegating to `synth_call` gives
+    # the same scheme lookup, lambda checking, and row join. The stamped
+    # pieces are re-wrapped; a non-call rewrite (e.g. a dispatch rewrite
+    # that changes the node shape) falls back to the rewritten call,
+    # dropping the intrinsic rather than guessing at its semantics.
+    #
+    # Any other `$<name>(args)` reaching `synth` is an error. The
+    # clause-body path that legitimately admits `$extern_handler`
+    # short-circuits before reaching this arm.
+    EIntrinsic(nm, args_) ->
+      if is_loop_intrinsic(nm) {
+        match args_ {
+          [callee, ...rest] -> {
+            let r = synth_call(st, callee, rest, e.line, e.col)
+            match r.expr.kind {
+              ECall(callee2, rest2) ->
+                Inferred { st: r.st, ty: r.ty,
+                           expr: Expr { kind: EIntrinsic(nm, [callee2, ...rest2]),
+                                        line: e.line, col: e.col,
+                                        ty: r.expr.ty, mode: r.expr.mode } }
+              _ -> r
+            }
+          }
+          _ -> {
+            diag_error(st.file, e.line, e.col,
+              concat_all(["compiler intrinsic `$", nm, "` has a malformed argument list"]))
+            inferred_leaf(st_bump_err(st), TyAny, e)
+          }
+        }
+      } else {
+        diag_error(st.file, e.line, e.col,
+          concat_all(["compiler intrinsic `$", nm,
+                      "` is not valid in this position"]))
+        inferred_leaf(st_bump_err(st), TyAny, e)
+      }
     # qualified call. rqc rewrites
     # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
     # checking `fname` is in `mod`'s exports. Module fns register
