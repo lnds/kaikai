@@ -4534,15 +4534,24 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
                                    uint32_t mask, KaiVarSlot *slots) {
     KaiArena *ar = kai_arena_current();
     if (!ar) return kai_variant_u(tag, name, n, mask, slots);
-    KaiValue *v = kai_arena_alloc(ar, KAI_VARIANT);
+    /* Slots live INLINE at `&v->as` (kai_var_slots), so the cell must
+     * reserve `kai_var_block_size(n)` bytes — NOT just sizeof(KaiValue).
+     * kai_arena_alloc only sizes a bare header; a variant with n>0 read
+     * back through kai_var_slots would land past the allocation. Bump the
+     * full block, stamp the immortal sentinel, and write the slots where
+     * the reader expects them. */
+    KaiValue *v = (KaiValue *) kai_arena_raw(ar, kai_var_block_size(n));
+    memset(v, 0, kai_var_block_size(n));
+    v->rc  = INT32_MAX;
+    v->tag = (uint8_t) KAI_VARIANT;
     v->variant_tag = tag;
-    v->var_n_args = n;
-    kai_slotmask_register(v->variant_tag, mask);
-    if (n > 0) {
-        KaiVarSlot *as = (KaiVarSlot *) kai_arena_raw(ar, (size_t) n * sizeof(KaiVarSlot));
-        for (int i = 0; i < n; ++i) as[i] = slots[i];
-    } else {
-    }
+    v->var_n_args = (uint8_t) n;
+    ar->n_live++;
+    kai_arena_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    kai_slotmask_register(tag, mask);
+    for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
     return v;
 }
 
