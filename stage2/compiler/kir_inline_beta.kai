@@ -9,9 +9,10 @@
 # block — after the pasted body — so the captures outlive every read.
 #
 # The dead-closure sweep then removes a `KClosure` binding whose only
-# remaining uses are its own dup/drop RC ops, PROVIDED every capture is
-# an `__alias_id__*` register (a tagged handler id, RC-free), so
-# deleting the build orphans no capture refs.
+# remaining uses are its own dup/drop RC ops. The build BORROWS its
+# capture atoms (the runtime closure ctor increfs each one; the
+# closure's free decrefs them), so deleting a dead build orphans no
+# capture refs and frees nothing early.
 
 import compiler.util
 import compiler.kir
@@ -282,11 +283,11 @@ fn kin_alias_cap_is_self(nm: String, ps: [KParam], caps: [KVal]) : Bool = match 
 # --- Dead-closure sweep ---------------------------------------------------
 
 # A closure binding (or a register alias of one) whose only remaining
-# uses are its own dup/drop RC ops is dead. The build consumed one ref
-# per capture, so removal is sound only when every capture is an
-# `__alias_id__*` register — a tagged handler id whose RC ops are
-# no-ops. Runs to a bounded fixpoint: removing an alias exposes the
-# closure build it read.
+# uses are its own dup/drop RC ops is dead: nothing calls, stores,
+# passes or returns it. The build borrows its captures (see the module
+# head), so removal — build, alias copies, and the register's own
+# dup/drops together — is RC-neutral for every capture. Runs to a
+# bounded fixpoint: removing an alias exposes the closure build it read.
 fn kin_dce_closures(bs: [KBlock]) : [KBlock] = kin_dce_fix(bs, 4)
 
 fn kin_dce_fix(bs: [KBlock], fuel: Int) : [KBlock] =
@@ -301,21 +302,10 @@ fn kin_dce_fix(bs: [KBlock], fuel: Int) : [KBlock] =
 
 fn kin_dce_candidates(env: [KinClo], bs: [KBlock], acc: [String]) : [String] = match env {
   [] -> acc
-  [KCl(n, _, caps), ...rest] ->
+  [KCl(n, _, _), ...rest] ->
     kin_dce_candidates(rest, bs,
-      if kin_caps_all_alias(caps) and not kin_name_used(bs, n) { [n, ...acc] } else { acc })
+      if kin_name_used(bs, n) { acc } else { [n, ...acc] })
 }
-
-fn kin_caps_all_alias(caps: [KVal]) : Bool = match caps {
-  []           -> true
-  [c, ...rest] -> match c {
-    KVar(n) -> kin_is_alias_name(n) and kin_caps_all_alias(rest)
-    _       -> false
-  }
-}
-
-fn kin_is_alias_name(n: String) : Bool =
-  string_length(n) > 11 and string_slice(n, 0, 11) == "__alias_id_"
 
 # Any non-RC use of register `n` across the fn (op atoms, store
 # values, terminator atoms). The closure's own dup/drop do not count.
