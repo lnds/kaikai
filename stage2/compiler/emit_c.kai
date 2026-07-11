@@ -47,6 +47,7 @@
 import compiler.ast
 import compiler.kinds
 import compiler.home_tu
+import compiler.loop_lower
 import compiler.purity
 import compiler.chars
 import compiler.diag
@@ -6939,11 +6940,89 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
         None -> cat2("kai_", fname)
       }
     }
-    # Issue #556: intrinsic calls in value position should never reach
-    # emit_expr_boxed — the typer rejects them outside the clause-body
-    # context where Stage 4 codegen recognises them and emits a bridge.
-    # If we get here, that constraint was violated upstream.
-    EIntrinsic(name, _) -> cat3("kai_unit() /* unreachable: intrinsic $", name, " in value position */")
+    # A loop intrinsic emits an inline C loop: its cond/body lambdas are
+    # pasted into the enclosing frame, so cell slots and locals are read
+    # directly (no closure, no combinator call). Any other intrinsic in
+    # value position should never reach emit_expr_boxed — the typer
+    # rejects them outside the clause-body context where Stage 4 codegen
+    # recognises them and emits a bridge.
+    EIntrinsic(name, args_) ->
+      if is_loop_intrinsic(name) { emit_loop_intrinsic(src, name, args_, cx) }
+      else { cat3("kai_unit() /* unreachable: intrinsic $", name, " in value position */") }
+  }
+}
+
+# ---- loop intrinsics (C-backend loop lowering) ----------------------
+#
+# RC inside the pasted bodies was computed under the closure discipline
+# (in-lam reads dup, the outer frame keeps ownership and its exit drop),
+# which is exactly the per-iteration balance an inline loop needs; the
+# closure's create-incref / drop-decref pair vanishes together with the
+# closure.
+
+fn emit_loop_intrinsic(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+
+  match name {
+    "__loop_while" -> match args_ {
+      [_, cnd, body] -> concat_all([
+        "({ for (;;) { ", emit_loop_cond_break(src, cnd, cx, false),
+        " ", emit_loop_body_stmt(src, body, cx), " } kai_unit(); })"
+      ])
+      _ -> emit_loop_bad(name)
+    }
+    "__loop_until" -> match args_ {
+      [_, cnd, body] -> concat_all([
+        "({ for (;;) { ", emit_loop_body_stmt(src, body, cx),
+        " ", emit_loop_cond_break(src, cnd, cx, true), " } kai_unit(); })"
+      ])
+      _ -> emit_loop_bad(name)
+    }
+    "__loop_repeat" -> match args_ {
+      [_, n, body] -> concat_all([
+        "({ int64_t _lk = ", emit_loop_count(src, n, cx),
+        "; for (; _lk > 0; _lk--) { ", emit_loop_body_stmt(src, body, cx),
+        " } kai_unit(); })"
+      ])
+      _ -> emit_loop_bad(name)
+    }
+    _ -> emit_loop_bad(name)
+  }
+}
+
+fn emit_loop_bad(name: String) : String =
+  cat3("kai_unit() /* malformed loop intrinsic $", name, " */")
+
+# The loop's condition check. `stop_when_true` selects the `until`
+# polarity (exit when the predicate holds) vs `while` (exit when it
+# stops holding). Mirrors the EIf condition tiers: raw int-order
+# comparison, raw (unboxed) bool, then the boxed truthy path.
+fn emit_loop_cond_break(src: String, cnd: Expr, cx: EmitCtx, stop_when_true: Bool) : String / Console {
+
+  let cb = match cnd.kind { ELambda(_, b) -> b _ -> cnd }
+  let neg = if stop_when_true { "" } else { "!" }
+  if expr_is_int_order_cmp(cb) {
+    concat_all(["if (", neg, "(", emit_int_order_cmp_raw(src, cb, cx), ")) break;"])
+  } else { match cb.mode {
+    MUnboxed -> concat_all(["if (", neg, "(", emit_expr_raw(src, cb, cx), ")) break;"])
+    _ -> concat_all([
+      "{ KaiValue *_lc = ", emit_expr(src, cb, cx),
+      "; if (", neg, "kai_op_truthy(_lc)) { kai_decref(_lc); break; } kai_decref(_lc); }"
+    ])
+  } }
+}
+
+fn emit_loop_body_stmt(src: String, body: Expr, cx: EmitCtx) : String / Console {
+
+  let bb = match body.kind { ELambda(_, b) -> b _ -> body }
+  cat3("{ KaiValue *_lb = ", emit_expr(src, bb, cx), "; kai_decref(_lb); }")
+}
+
+fn emit_loop_count(src: String, n: Expr, cx: EmitCtx) : String / Console {
+
+  match n.mode {
+    MUnboxed -> cat3("(", emit_expr_raw(src, n, cx), ")")
+    _ -> cat3("({ KaiValue *_ln = ", emit_expr(src, n, cx),
+              "; int64_t _lnv = kai_intf(_ln); kai_decref(_ln); _lnv; })")
   }
 }
 
