@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.4 (2026-07-11)
+
+### Fixed
+
+- **refinements**: enforce refinement predicates at binding, param, and return downcasts (closes #1169) (#1171)
+
+### Changed
+
+- local scalar var costs a register — slot to raw cell on both backends (closes #1179) (#1188)
+- **runtime**: lazy [a..b] ranges — O(1) representation of [Int], zero-materialisation consumers (closes #1180) (#1185)
+- **emit**: C backend erases the State handler for loop-local vars (#1179 gap 1) (#1184)
+- **kir**: let the dead-closure sweep clear any-capture closures so var->slot fires after inlining (closes #1173) (#1175)
+- **kir**: small-function inliner on lowered KIR — reuse-class templates, loop fusion, var-cell slots (closes #1158) (#1172)
+- **emit**: cross-call reuse-token donation + move reuse on KIR/native (closes #1164) (#1170)
+
 ## v0.99.3 (2026-07-10)
 
 ### Added
