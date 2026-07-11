@@ -1,10 +1,10 @@
 # The kind system
 
-> Status: the catalog (`stdlib/core/kinds.kai`) declares four
+> Status: the catalog (`stdlib/core/kinds.kai`) declares five
 > kinds — `Type` and `Effect` (builtin, closed), `Measure`
-> (`AbelianGroup`), and `Currency` (`Module`) — with `Structural`
-> as a candidate theory under design. The `kind` / `theory`
-> declaration surface and the generalized engine (user kinds over
+> (`AbelianGroup`), `Currency` (`Module`), and `Region`
+> (`Structural`, identity). The `kind` / `theory` declaration
+> surface and the generalized engine (user kinds over
 > `AbelianGroup` or `Module`, per-kind isolation, use-site
 > resolution, cross-kind bind rejection) are shipped. The
 > authoritative design is `docs/kind-system-design.md`; this page
@@ -33,6 +33,7 @@ unification discipline that decides how its habitants unify:
 | `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
 | `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
 | `Currency` | `Module` | abelian unifier + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
+| `Region`  | `Structural` | builtin (symbol identity) | `region` | memory arenas: each `r` is skolemized fresh by a `region { r -> }` block; `Tree<r>` carries it |
 
 A `builtin` theory (`theory HindleyMilner = builtin`) names an
 engine that is the compiler core itself rather than a property
@@ -50,8 +51,38 @@ mints one of `Measure`.
 Effect *rows* (the `/ Console + State` part of a signature) stay
 in their own machinery (see `docs/effects.md`); `Effect` classifies
 the labels, and only unit-shaped kinds appear in tparam
-annotations (`[u: Measure]`, `[c: Currency]`). Candidate theory
-still under design: `Structural` (identity — regions).
+annotations (`[u: Measure]`, `[c: Currency]`, `[r: Region]`).
+
+### The `Structural` theory
+
+`theory Structural = builtin` decides habitants by **identity
+alone**: two habitants unify iff they are the same symbol. No
+product, no inverse, no sum — a habitant stands only for itself.
+The compiler core already gives this (symbol equality in the
+dimension unifier), so it is `builtin`. `Region` is its one kind.
+
+A region habitant is never declared at item scope the way
+`unit m` declares a measure; each is skolemized fresh by a
+`region { r -> ... }` block (the cap-binding form, the nursery
+rhyme). A branded type `Tree<r>` reads region-free code unchanged
+(`Tree` ≡ `Tree<heap>`), and the habitant distributes over
+recursive occurrences — a `Node` in `r` has children in `r`, so a
+tree lives wholly in one region and cross-region trees are
+inexpressible. A region-polymorphic fn (`fn insert[r: Region](t:
+Tree<r>, k: Int) : Tree<r>`) bump-allocates its ctors in `r`'s
+arena; its signature stays pure. When the region does not escape
+the block frees the whole arena in one shot — zero per-node
+refcount. A value that does escape the brace is deep-copied onto
+the RC heap before the arena frees, so it never dangles.
+
+The honest trade — when *not* to put a structure in a region: an
+arena has **no recycling**, so a functional `insert` that rebuilds
+the spine abandons its old nodes until the region dies. Build →
+query heavily → drop (indexes, parsers, snapshots) wins in an
+arena (zero RC for the whole cycle, one free); long-lived churn
+wins on the RC heap (Perceus recycles; the arena would grow
+without bound). The type (`Tree<r>` vs `Tree`) documents which is
+which.
 
 ### The `Module` theory
 
