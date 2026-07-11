@@ -100,7 +100,7 @@ status* section below for the per-module summary and the small set
 of flat aliases that survive on a typer-resolver gap (#219).
 
 The four ubiquitous list operations — `map`, `filter`, `reduce`,
-`each` — keep a flat prelude alias post-migration so common pipelines
+`each` — keep a flat core alias post-migration so common pipelines
 read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 `list.map` / etc. The full set is reached only via `list.*`.
 
@@ -108,7 +108,7 @@ read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 
 | Module                  | Bare-name surface | Flat aliases removed | Flat aliases surviving | Reason for survivors                                              |
 | ----------------------- | ----------------: | -------------------: | ---------------------: | ----------------------------------------------------------------- |
-| `stdlib/core/list.kai`  |               29+ |                   29 |                      0 | none — final 5 retired in #227 after PR #218 closed the prelude-scope (#216) and string-interpolation (#217) resolver gaps |
+| `stdlib/core/list.kai`  |               29+ |                   29 |                      0 | none — final 5 retired in #227 after PR #218 closed the core-scope (#216) and string-interpolation (#217) resolver gaps |
 | `stdlib/core/string.kai`|               13+ |                  ~14 |                      1 | `string_repeat` — typer EModCall name-only lookup (#219) collides with `list.repeat` |
 | `stdlib/core/option.kai`|                10 |                    6 |                      4 | `opt_map`, `opt_filter`, `opt_zip` — typer EModCall (#219) collides with `list.{map,filter,zip}`; `opt_or` — `or` is a reserved keyword (`TkOr`) |
 | `stdlib/core/result.kai`|                12 |                    6 |                      6 | `result_map`, `result_and_then`, `result_unwrap_or`, `result_or_else`, `result_unwrap_or_else`, `result_collect` — all #219 collisions with `list` / `option` exports |
@@ -163,7 +163,7 @@ description of how the qualified surface works today (#769).
 
 The 5 `list_*` survivors documented in the m14 Phase 1 retro
 (`docs/lane-experience-issue-203-phase1-list.md`) were retired
-in #227 once PR #218 closed the prelude-scope (#216) and
+in #227 once PR #218 closed the core-scope (#216) and
 string-interpolation (#217) resolver gaps that had blocked the
 qualified form. `stdlib/core/list.kai` now has zero flat aliases.
 
@@ -190,7 +190,7 @@ Modules are tagged by which compiler stage they require:
 
 The `stdlib/` directory does not reshuffle itself between stages; the
 stage 1 driver (`kaic0` / `kaic1`) prepends only `core/*.kai` as
-preludes, the stage 2 driver (`bin/kai`) prepends the full chain
+core modules, the stage 2 driver (`bin/kai`) prepends the full chain
 (`core/*.kai` + `protocols.kai` + `effects.kai` + `random.kai` +
 `encoding/*.kai` + `collections/*.kai`).
 
@@ -211,13 +211,13 @@ The same boundary applies to the test fixtures under
   They use `Stdout.print` with the `/ Stdout` row, the `++`
   operator, and other m7+ features. Validation lives in
   `make test-stdlib`, which routes through kaic2 with the full
-  prelude chain.
+  core chain.
 
 The `make test-stdlib` target validates the full-kaikai layer
-end-to-end (kaic2 + complete prelude chain). The bootstrap-safe
+end-to-end (kaic2 + complete core chain). The bootstrap-safe
 subset is validated indirectly by `make selfhost`, which compiles
 `stage2/compiler.kai` through kaic1 with `core/*` as the only
-prelude — if any `core/*.kai` file picks up a full-kaikai-only
+core — if any `core/*.kai` file picks up a full-kaikai-only
 construct, selfhost breaks.
 
 > Why this split is intentional: kaikai-minimal is **the bootstrap
@@ -368,7 +368,7 @@ covers `list.*`. Listed here as shipped:
   returns a length-0 array.
 
 The empty case is served by the `array_empty[a]() : Array[a]`
-prelude prim: `array_make` always demands an `init: T` to reify the
+core prim: `array_make` always demands an `init: T` to reify the
 element slot even at `n == 0`, which a polymorphic empty input has
 no element to supply, so `array_empty` builds the length-0 array
 directly (`kai_array_make(0, NULL)` — the fill loop never runs).
@@ -417,14 +417,14 @@ Single top-level module. Per-function effects: `print` / `println` /
 `eprint` / `eprintln` declare `/ Console`; `read_line` / `read_all`
 declare `/ Stdin`.
 
-- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` prelude builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
+- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` core builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
 
 ### fs (`/ File`)
 
-- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename` *(shipped via #345 as prelude builtins; module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423)*; `metadata`, `read_bytes`, `write_bytes` *(deferred — follow-up to #345)*
+- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename` *(shipped via #345 as core builtins; module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423)*; `metadata`, `read_bytes`, `write_bytes` *(deferred — follow-up to #345)*
 - `File` chunked / streaming ops — `open_read`, `read_chunk`, `open_write`, `write_chunk`, `close_file` *(shipped via PR #804, issue #771 Phase 1: five `File` effect ops + `FileHandle` opaque handle + R1-pool default handlers; `read_chunk` returns `Ok("")` at EOF.)*
 - `stream` — lazy push streams over the chunked `File` ops *(shipped via issue #801: `stdlib/stream.kai`. Carrier `Stream[t, e]` (single-ctor variant); sources `from_list` / `read_lines`; pipe-canonical stages `map` / `flat_map` / `filter` / `take` / `take_while`; sinks `fold` / `each` / `count` / `to_list` / `write_lines`. Recoverable faults ride the `ReadFault` effect — `bad_chunk` resumable (skip), `open_fault : Nothing` abort-only. `import stream`. Supersedes #771 Phase 2's `with_lines` / `fold_lines` / `each_line` bracket surface.)*
-- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(shipped via #344: `kai_prelude_dir_*` runtime primitives + `pub fn` wrappers in `stdlib/fs/dir.kai`. All four ride the `File` effect. v1 limits: symlinks are not followed in `walk`; `create_dir` uses fixed `0755`; `list_dir` / `walk` return `[]` on read error.)*
+- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(shipped via #344: `kai_core_dir_*` runtime primitives + `pub fn` wrappers in `stdlib/fs/dir.kai`. All four ride the `File` effect. v1 limits: symlinks are not followed in `walk`; `create_dir` uses fixed `0755`; `list_dir` / `walk` return `[]` on read error.)*
 - `fs.path` — pure helpers: `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — but the file lives at `stdlib/path.kai`, not `stdlib/fs/path.kai`; the catalog name `fs.path` reflects the planned move, not today's import path. Today: `import path`.)*
 
 ### os (`/ Env + Process`)
@@ -581,7 +581,7 @@ spec lands, it is added to this header.
   above lists the per-module result. The handful of surviving
   flat aliases (16 total across `list` / `string` / `option` /
   `result`) are blocked on resolver gaps (#219 for typer
-  EModCall, plus prelude-scope and string-interpolation gaps for
+  EModCall, plus core-scope and string-interpolation gaps for
   the `list_*` survivors) and retire once those gaps close.
   Stage 1 code (kaikai-minimal) keeps the `list_*` / `string_*`
   prefixes — the migration only applies to stage 2 code where

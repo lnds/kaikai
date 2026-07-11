@@ -303,7 +303,7 @@ effect Console {
 ```
 
 Two ops, both appending `\n` to the string before writing. Match
-the minimal prelude's `print`/`eprint`. Neither carries a failure
+the minimal core's `print`/`eprint`. Neither carries a failure
 type: under the default handler, the common recoverable fault
 (pipe closed on the other side, `EPIPE`) is absorbed silently,
 and any remaining fault is catastrophic enough to panic.
@@ -547,7 +547,7 @@ as data, not as `Fail`.
 > thread-pool offload is the portable shape — the worker count
 > is fixed at 4 for v1; `io_uring` and dynamic pool sizing are
 > post-MVP. `read_bytes` / `write_bytes` and the
-> `exists`/`delete`/`rename` prelude builtins are *not* yet on
+> `exists`/`delete`/`rename` core builtins are *not* yet on
 > the parking path — they still run inline; routing the rest
 > through the pool queues for the file-bytes follow-up lane.
 
@@ -1618,7 +1618,7 @@ site. Row polymorphism at the call site remains out of scope.
 ### Out-of-bounds behaviour
 
 `array_get`, `array_set`, and `array_grow` panic via the
-runtime's audited escape (`kai_prelude_panic`) when `i < 0` or
+runtime's audited escape (`kai_core_panic`) when `i < 0` or
 `i >= array_length(a)`. None of the ops returns `Option[T]` or
 otherwise signals the condition as a value — the contract is
 "the caller is responsible for staying in bounds". This is the
@@ -1645,9 +1645,9 @@ arguments and decides whether to forward to the default
 behaviour (call `resume(...)` with the appropriate return value)
 or short-circuit.
 
-> **v1 status (2026-05-13):** bare prelude `array_set` /
+> **v1 status (2026-05-13):** bare core `array_set` /
 > `array_grow` calls (and the `a[i] := v` desugar that emits
-> them) route directly to the runtime `kai_prelude_array_*`
+> them) route directly to the runtime `kai_core_array_*`
 > helpers; they DO NOT travel through the handler stack. A user-
 > installed `with Mutable { ... }` therefore observes only the
 > qualified `Mutable.array_*` form. Stdlib-internal `array_*`
@@ -1819,7 +1819,7 @@ through `State[T]`'s handler.
 ships the effect as a real `DEffect` declaration (see
 `builtin_mutable_decl`) with per-op generics over `T`, and a
 default handler whose clauses delegate to the existing
-`kai_prelude_array_*` runtime entry points.
+`kai_core_array_*` runtime entry points.
 
 Issue #251 + #252 (2026-05) added the demand-collection +
 provenance-masking pass: bare `array_set` / `array_grow` calls
@@ -1827,7 +1827,7 @@ raise a Mutable demand, the masking pass at the end of each
 function body classifies the demand as local-non-escaping or
 external, and the row is computed accordingly. Bare
 `array_make / array_length / array_get / array_set / array_grow`
-remain reachable as prelude builtins because the desugars for
+remain reachable as core builtins because the desugars for
 array-index sugar (`a[i]` / `a[i] := v`, m7b #6) and the `var`
 specialisation (m7b #16) emit bare calls. Users may still write
 the explicit `Mutable.array_*` form — it routes through the
@@ -2269,7 +2269,7 @@ Ffi                                   (always innermost, compiler-synthesised)
    *Decided:* allow nested observation handlers, scoped to the
    qualified `Mutable.array_*` / `Mutable.ref_*` form only. The
    innermost handler wins (Doc A semantics) for those qualified
-   calls. Bare prelude `array_set` / `array_grow` and the
+   calls. Bare core `array_set` / `array_grow` and the
    `a[i] := v` desugar bypass the handler stack and route
    directly to the runtime — see §`Mutable` *Default handler*
    v1-status sidebar for the gap. A test harness that needs to

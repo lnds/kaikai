@@ -15,7 +15,7 @@ Two forms:
 
 A hole is a legal expression **and** a legal pattern. It has no
 runtime representation: reaching an unfilled hole at runtime aborts
-via `kai_prelude_panic("unfilled hole: ?name")`.
+via `kai_core_panic("unfilled hole: ?name")`.
 
 ## Behaviour at check time
 
@@ -26,7 +26,7 @@ For each hole the compiler produces a **report**, not an error:
   its type.
 - **Candidates** — expressions the compiler can synthesise that
   match the expected type. Synthesis considers: in-scope bindings,
-  variant constructors, prelude functions of matching result type,
+  variant constructors, core functions of matching result type,
   `None` / `Ok(·)` / `Err(·)` wrappers, and 1-level applications.
 
 If the file contains unfilled holes, compilation still **succeeds**
@@ -87,7 +87,7 @@ where each element describes one hole. Stable schema:
 
 `in_scope` carries the local bindings; `scope_elided` counts the
 reachable bindings not listed. `kai build --holes-json-scope` lists
-everything in `in_scope` (prelude included) with `scope_elided: 0`.
+everything in `in_scope` (core included) with `scope_elided: 0`.
 
 `kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
 which share the typed-hole pipeline (see *Implementation notes*).
@@ -154,12 +154,12 @@ The flags are `--holes` (human-readable report), `--holes-json`
 their `--holes-scope` / `--holes-json-scope` variants that list the
 full reachable scope instead of the local slice. They are exposed at
 two levels: the underlying `kaic2 --holes` / `kaic2 --holes-json`
-(no implicit stdlib preludes — used by `make test-holes`), and the
+(no implicit stdlib core modules — used by `make test-holes`), and the
 driver-level `kai build --holes` / `kai build --holes-json`
-(auto-loads the same stdlib preludes as a normal `kai build` so the
+(auto-loads the same stdlib core modules as a normal `kai build` so the
 in-scope dump matches what the user actually sees at compile time). Both surfaces print the
 report and exit without producing a binary. Unfilled holes that
 reach codegen compile to a runtime panic via the existing
-`kai_prelude_panic` helper; no codegen impact beyond a stub for
+`kai_core_panic` helper; no codegen impact beyond a stub for
 unfilled positions. The JSON schema is validated by
 `scripts/validate_holes_json.py`.

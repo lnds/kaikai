@@ -115,8 +115,8 @@ gated by `tools/test-negative.sh`, wired into Tier 1 via the
 
 Two optional siblings:
 
-- `<name>.prelude.kai` — implicit `--prelude` invocation.
-- `<name>.flags` — extra CLI args (e.g. `--prelude stdlib/protocols.kai`
+- `<name>.core.kai` — implicit `--core` invocation.
+- `<name>.flags` — extra CLI args (e.g. `--core stdlib/protocols.kai`
   for derive fixtures, `--path stdlib` for actor fixtures).
 
 When a fixture is authored and the language SILENTLY ACCEPTS the

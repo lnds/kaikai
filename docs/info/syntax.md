@@ -239,7 +239,7 @@ fn main() : Int / Stdout = {
 at the top of the file makes them available.
 
 There is no `for x in xs` loop. Iterate with the map-pipe (`xs | (x =>
-...)`) or `xs |> each(f)` from the prelude.
+...)`) or `xs |> each(f)` from the core.
 
 ## Pipes
 

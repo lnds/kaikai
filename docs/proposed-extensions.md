@@ -440,7 +440,7 @@ must be bound earlier in the same pattern.
   as ordinary functions over the parsed fragments.
 
 **Depends on**: parser, match exhaustiveness, `[Byte]` type in
-prelude. Independent of effects/fibers — cleanly post-m12.
+core. Independent of effects/fibers — cleanly post-m12.
 
 **Decision posture**: candidate for its own milestone in the
 m13–m14 range, with a dedicated design doc once the

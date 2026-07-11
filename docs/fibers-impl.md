@@ -320,7 +320,7 @@ question. None is on the roadmap.
 
 R1 Phase 3 (`fbb532c`) flipped the runtime to linear-consume: every
 primitive consumes its args, every producer increfs on extraction,
-hand-written runtime helpers (`kai_prelude_map/_filter/_reduce/_each`)
+hand-written runtime helpers (`kai_core_map/_filter/_reduce/_each`)
 incref each arg before `kai_apply`. R2's Spawn handlers must respect
 this contract.
 
@@ -345,7 +345,7 @@ Specifically:
 
 If a handler reuses an arg across multiple call sites (e.g. a
 `select` that re-enqueues a thunk), it must `kai_incref` between
-uses, mirroring the pattern in `kai_prelude_map` (CHANGELOG v0.2.0
+uses, mirroring the pattern in `kai_core_map` (CHANGELOG v0.2.0
 line 54-56).
 
 ## Phasing

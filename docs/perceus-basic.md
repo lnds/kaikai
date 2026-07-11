@@ -330,7 +330,7 @@ infrastructure but stop short of flipping the runtime:
   exports for the LLVM backend. Special cases in `emit_call_expr`
   and `llvm_emit_call` lower `ECall(EVar("__perceus_dup"), [a])`
   → `kai_internal_dup(a)` and `__perceus_drop` analogously. The
-  magic names are added to `prelude_names()` so the closure
+  magic names are added to `core_names()` so the closure
   free-var collector treats them as globals, not captures.
 
 - **`3a148e7` (step 2/4 — scope-aware rewrite):** replaces
@@ -592,9 +592,9 @@ should not rediscover them from scratch.
    to `core.ordering` or `math.int`). The corresponding test
    fixtures (`examples/stdlib/list_*.kai`) need their call sites
    updated and re-validated against `kaic2 --path stdlib` once
-   the kaic2 prelude-polymorphism issue (item 3 below) is fixed.
-3. **kaic2 typer rejects polymorphic prelude calls from foreign
-   files.** Historical: `kaic2 --prelude stdlib/core.kai` plus a
+   the kaic2 core-polymorphism issue (item 3 below) is fixed.
+3. **kaic2 typer rejects polymorphic core calls from foreign
+   files.** Historical: `kaic2 --core stdlib/core.kai` plus a
    fresh file that calls `list_take([1,2,3], 2)` failed with
    `expected: ([a], Int) -> [a], found: ([Int], Int) -> ?t1 / ?e0`.
    Empirically resolved by 2026-04-27 — `test-stdlib` now routes

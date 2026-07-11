@@ -36,14 +36,14 @@ spawn it. See *Editor configuration* below.
 - **Hover** returns the inferred kaikai type for the AST node under
   the cursor, formatted as a fenced markdown block.
 - **Goto-definition** points at the source line of the resolved
-  identifier; user-authored decls win over prelude / stdlib.
+  identifier; user-authored decls win over core / stdlib.
 - **publishDiagnostics** fires on `didOpen` and `didChange`. Driven
   by `--diags-json` for compile errors and by `--holes-json` for
   unfilled typed holes (each hole becomes one Warning-severity
   diagnostic carrying the inferred type).
 - **documentSymbol** surfaces `DFn` (incl. lowered `const`),
   `DEffect`, `DProtocol`, `DUnit`, `DTest`, `DBench`.
-- **completion** offers user fns + stdlib + prelude builtins
+- **completion** offers user fns + stdlib + core builtins
   (~445 items by default; top-level only — locals / params /
   field completion are LSP v4 work).
 - **signatureHelp** highlights the callee signature; `activeParameter`
