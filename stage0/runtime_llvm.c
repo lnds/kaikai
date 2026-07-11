@@ -547,27 +547,23 @@ KaiValue *kaix_incref(KaiValue *v)                        { return kai_incref(v)
    the binding when last-use analysis proves the name is unread. */
 void      kaix_decref(KaiValue *v)                        { kai_decref(v); }
 
-/* ---------- issue #120: opt-in Perceus regions ----------
- * The LLVM backend lowers `region { ... }` to kaix_arena_push on entry,
- * kaix_arena_pop on exit, and routes every constructor inside the block
- * through kaix_arena_alloc — the SAME C arena helpers the C backend
- * calls inline (docs/issue-120-regions-design.md: one helper, both
+/* ---------- Perceus regions: arena forwarders ----------
+ * A region-branded constructor lowered by the native backend routes to
+ * kaix_arena_* instead of kaix_variant/kaix_cons/kaix_record; the region
+ * block brackets its body with kaix_arena_push / kaix_arena_pop and
+ * deep-copies escaping values out before the pop. These forward to the
+ * SAME C arena helpers the C backend calls inline (one helper, both
  * backends, no separate LLVM bump-alloc). The arena stack is a runtime
  * global, so push/pop/alloc need no KaiArena* across the IR boundary.
- * P0 links these even though no lowering emits them yet — the
- * build-release.sh LLVM smoke gate verifies the symbols resolve. */
+ * Each forwarder falls back to the RC heap when no arena is live, so a
+ * branded ctor reached outside any region stays sound. */
 void      kaix_arena_push(void)                          { (void) kai_arena_push(); }
 void      kaix_arena_pop(void)                           { kai_arena_pop(); }
 KaiValue *kaix_arena_alloc(KaiTag tag) {
     KaiArena *a = kai_arena_current();
-    /* Defensive: if codegen ever calls this outside a region (a bug),
-     * fall back to the normal RC heap rather than dereference NULL. */
     return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
 }
 
-/* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
- * constructor + deep-copy-out shims, mirroring the C-backend helpers so
- * both emitters call the SAME runtime code (no separate LLVM path). */
 KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t)                       { return kai_arena_cons(h, t); }
 KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) { return kai_arena_record(n, fields, names); }
 KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
@@ -585,6 +581,14 @@ KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **ar
     KaiValue *r = kai_arena_variant(tag, name, n, 0, slots);
     if (heap) free(heap);
     return r;
+}
+/* Arena mirror of kaix_variant_masked: `slots` aliases the IR's [n x i64]
+ * word buffer (a KaiVarSlot* — the union is one machine word). The mask is
+ * the tag's startup-registered slot layout, the same source the drop walker
+ * reads, so a raw Int slot bump-allocated here drops correctly at the pop. */
+KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots) {
+    if (n <= 0) return kai_arena_variant(tag, name, 0, 0, NULL);
+    return kai_arena_variant(tag, name, n, kai_slot_mask_of(tag), slots);
 }
 KaiValue *kaix_deep_copy_out(KaiValue *v)                                 { return kai_deep_copy_out(v); }
 

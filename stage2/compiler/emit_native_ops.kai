@@ -101,8 +101,8 @@ pub fn nemit_op(ctx: Handle, op: KOp, fns: [KFn]) : Handle / Console = match op 
   KCall(sym, cargs)    -> nemit_call_direct(ctx, sym, cargs, fns, SBoxed)
   KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
   KCallIndirectBorrow(fv, cargs) -> nemit_call_indirect_borrow(ctx, fv, cargs)
-  KCon(nm, tag, mask, inits) -> nemit_con(ctx, nm, tag, mask, inits)
-  KRecord(fields)      -> nemit_record(ctx, fields)
+  KCon(nm, tag, mask, inits, rgn) -> nemit_con(ctx, nm, tag, mask, inits, rgn)
+  KRecord(fields, rgn) -> nemit_record(ctx, fields, rgn)
   # A boxed read of a TYPED slot: the pure path has no ctor name to classify
   # the kind, so it keeps the mask-consulting shim (which re-boxes a raw i64 /
   # real correctly). The typed binder path (`nemit_proj_slot`) reads raw inline.
@@ -801,11 +801,11 @@ fn nemit_push_inits(ctx: Handle, buf: Handle, inits: [KSlotInit]) : Unit / Conso
 
 # A record literal: `kaix_record(n, fieldbuf, namebuf)` — parallel C
 # buffers, names as `i8*` globals (no [Handle] lists).
-fn nemit_record(ctx: Handle, fields: [KFieldInit]) : Handle / Console = {
+fn nemit_record(ctx: Handle, fields: [KFieldInit], rgn: Bool) : Handle / Console = {
   let vals = llvm_buf_new()
   let names = llvm_buf_new()
   nemit_push_fields(ctx, vals, names, fields)
-  nemit_record_call(ctx, vals, names)
+  nemit_record_call_sym(ctx, if rgn { "kaix_arena_record" } else { "kaix_record" }, vals, names)
 }
 fn nemit_push_fields(ctx: Handle, vals: Handle, names: Handle, fs: [KFieldInit]) : Unit / Console = match fs {
   [] -> ()
@@ -899,12 +899,15 @@ pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Hand
 #   - all-pointer payload → `kaix_variant`: its immortal-args interning is a win
 #     the fast path would drop.
 # Mirror of emit_c's `emit_ident_value` (nullary) + `emit_variant_call_typed`.
-fn nemit_con(ctx: Handle, nm: String, tag: Int, mask: Int, inits: [KSlotInit]) : Handle / Console = match inits {
+fn nemit_con(ctx: Handle, nm: String, tag: Int, mask: Int, inits: [KSlotInit], rgn: Bool) : Handle / Console = match inits {
+  # Nullary ctors are shared immortal singletons; they never enter the arena
+  # (a wholesale free would dangle the singleton), so `rgn` does not apply.
   [] -> nemit_nullary_fast(ctx, tag, nm)
   # `mask != 0` gates the raw route; the mask VALUE is not passed — the runtime
-  # reads it from the tag's startup-registered mask (`kai_slot_mask_of`).
-  _  -> if mask == 0 { nemit_variant_call(ctx, "kaix_variant", tag, nm, nemit_init_buf(ctx, inits)) }
-        else { nemit_variant_masked_call(ctx, tag, nm, inits) }
+  # reads it from the tag's startup-registered mask (`kai_slot_mask_of`). A
+  # region-branded ctor routes to the arena mirror of each entry.
+  _  -> if mask == 0 { nemit_variant_call(ctx, if rgn { "kaix_arena_variant" } else { "kaix_variant" }, tag, nm, nemit_init_buf(ctx, inits)) }
+        else { nemit_variant_masked_call(ctx, if rgn { "kaix_arena_variant_masked" } else { "kaix_variant_masked" }, tag, nm, inits) }
 }
 
 # `kaix_nullary_fast(i32 tag, i8* name) -> ptr` — read the startup-seeded
@@ -1003,7 +1006,8 @@ fn nemit_enum_slot_word(ctx: Handle, v: KVal) : Handle / Console = match v {
 # typed ctor over the `[n x i64]` word buffer. No mask arg: the runtime reads
 # the slot layout from the tag's startup-registered mask (`kai_slot_mask_of`),
 # so the drop walker + this ctor share one source and the CallInst stays narrow.
-fn nemit_variant_masked_call(ctx: Handle, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
+# `sym` is `kaix_variant_masked` or its arena mirror `kaix_arena_variant_masked`.
+fn nemit_variant_masked_call(ctx: Handle, sym: String, tag: Int, nm: String, inits: [KSlotInit]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
@@ -1011,7 +1015,7 @@ fn nemit_variant_masked_call(ctx: Handle, tag: Int, nm: String, inits: [KSlotIni
   let argarr = nemit_i64_slot_array(ctx, inits)
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
   let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, argarr)
-  ncall_finish(ctx, "kaix_variant_masked", p, ptb, ab)
+  ncall_finish(ctx, sym, p, ptb, ab)
 }
 
 # `kaix_variant(i32 tag, i8* name, i32 n, ptr* args) -> ptr`. The `args`
@@ -1158,7 +1162,12 @@ fn nemit_record_reuse(ctx: Handle, scr: Handle, fields: [KFieldInit]) : Handle /
 
 # `kaix_record(i32 n, ptr* fields, ptr* names) -> ptr`. `vals`/`names` are
 # the parallel C buffers of field atoms / name globals.
-pub fn nemit_record_call(ctx: Handle, vals: Handle, names: Handle) : Handle / Console = {
+pub fn nemit_record_call(ctx: Handle, vals: Handle, names: Handle) : Handle / Console =
+  nemit_record_call_sym(ctx, "kaix_record", vals, names)
+
+# `<sym>(i32 n, ptr* fields, ptr* names) -> ptr` — `sym` is `kaix_record` or
+# its arena mirror `kaix_arena_record` for a record literal built in a region.
+pub fn nemit_record_call_sym(ctx: Handle, sym: String, vals: Handle, names: Handle) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let n = llvm_buf_len(vals)
@@ -1167,7 +1176,7 @@ pub fn nemit_record_call(ctx: Handle, vals: Handle, names: Handle) : Handle / Co
   llvm_buf_free(vals); llvm_buf_free(names)
   let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
   let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, farr); llvm_buf_push(ab, narr)
-  ncall_finish(ctx, "kaix_record", p, ptb, ab)
+  ncall_finish(ctx, sym, p, ptb, ab)
 }
 
 # `<sym>(ptr clo, i32 n, ptr* args) -> ptr`. `argvalbuf` carries the

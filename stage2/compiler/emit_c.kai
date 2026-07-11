@@ -196,7 +196,7 @@ fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
             hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
 
-# issue #120 — opt-in Perceus regions (Phase P1): set/clear in_region.
+# Set/clear the arena-routing flag for a region body.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
@@ -333,33 +333,9 @@ fn ty_has_region_brand(ty: Ty) : Bool = match ty {
 fn ty_is_numeric_carrier_name(name: String) : Bool =
   name == "Decimal" or name == "DecimalBig" or name == "BigInt"
 
-# True when a fn takes or returns a region-branded aggregate — a param
-# or return `Tree<r>` (surface `TyDim` on a user head). Unlike the
-# tparam list, the parameter's surface type survives monomorphization
-# (mono changes the mangle, not the written `ptype`), so this is the
-# reliable region-polymorphism test at the post-mono emit / tcrec sites
-# where the tparam list has been emptied.
-fn params_have_region(params: [Param], ret_opt: Option[TypeExpr]) : Bool =
-  if any_param_region(params) { true }
-  else { match ret_opt { Some(te) -> te_is_region_branded(te)  None -> false } }
-
-fn any_param_region(params: [Param]) : Bool = match params {
-  [] -> false
-  [p, ...rest] -> match p.ptype {
-    Some(te) -> if te_is_region_branded(te) { true } else { any_param_region(rest) }
-    None     -> any_param_region(rest)
-  }
-}
-
-# A surface `TyDim` whose base is a user head (not a numeric carrier) is
-# a region brand — `Tree<r>`, not `Real<m>` / `Decimal<USD>`.
-fn te_is_region_branded(te: TypeExpr) : Bool = match te.tkind {
-  TyDim(base, _) -> match base.tkind {
-    TyName(n, _) -> not (n == "Real" or n == "Int" or n == "Decimal")
-    _            -> true
-  }
-  _ -> false
-}
+# The signature-brand predicate (`fn_has_region_brand`) and
+# `te_is_region_branded` live in `compiler.region`, shared with the native
+# lowering so both backends route region ctors off ONE verdict.
 
 # Region-brand routing for a ctor whose resolved type is `ty`: an
 # aggregate branded with a region bump-allocates in the current arena.
@@ -375,17 +351,17 @@ fn emit_ctx_route_brand(cx: EmitCtx, ty_opt: Option[Ty]) : EmitCtx =
 # a region body, ordinary RC otherwise.
 fn emit_cons_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_cons(" } else { "kai_cons(" }
 
-# issue #120 (P1): record literal constructor — bump-arena `kai_arena_record`
-# in-region, else RC-heap `kai_record`. Both take `(int n, KaiValue **fields,
-# const char **names)`; the C array-literal args decay to those pointer types
-# identically, so the swap is behaviour-identical outside a region.
+# Record literal constructor — bump-arena `kai_arena_record` in-region, else
+# RC-heap `kai_record`. Both take `(int n, KaiValue **fields, const char
+# **names)`; the C array-literal args decay to those pointer types identically,
+# so the swap is behaviour-identical outside a region.
 fn emit_record_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_record(" } else { "kai_record(" }
 
-# issue #120 (P1): n-ary variant constructor — bump-arena `kai_arena_variant`
-# in-region, else RC-heap `kai_variant_u`. Both take `(tag, name, n, mask,
-# slots)` in the same order. NULLARY variants are shared singletons and are
-# NOT routed (they must stay on the RC heap, never the arena — the arena
-# free would dangle the shared singleton).
+# N-ary variant constructor — bump-arena `kai_arena_variant` in-region, else
+# RC-heap `kai_variant_u`. Both take `(tag, name, n, mask, slots)` in the same
+# order. NULLARY variants are shared singletons and are NOT routed (they must
+# stay on the RC heap, never the arena — the arena free would dangle the shared
+# singleton).
 fn emit_variant_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_variant(" } else { "kai_variant_u(" }
 
 # Issue #452 Phase A.0 step 3: `core_caches` is parallel to
@@ -3164,8 +3140,8 @@ fn is_perceus_dup_call(e: Expr) : Bool = match e.kind {
 }
 
 fn emit_list_tail(src: String, elems: [ListElem], cx: EmitCtx) : String / Console {
-  # issue #120 (P1): cons cells built lexically inside a `region { }`
-  # bump-allocate into the arena; outside, ordinary RC `kai_cons`.
+  # Cons cells built lexically inside a `region { }` bump-allocate into the
+  # arena; outside, ordinary RC `kai_cons`.
   let cons_c = emit_cons_ctor(cx)
   match elems {
     [] -> "kai_nil()"
@@ -6920,12 +6896,12 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EList(elems) -> emit_list_expr(src, elems, emit_ctx_route_brand(cx, x.ty))
     ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, cx)
     EBlock(stmts, opt_final) -> {
-      # issue #120 (P1): a block recorded as a `region { }` lowers to a
-      # bump-arena scope. `bcx` carries in_region = true so constructors
-      # lexically inside the body bump-allocate into the arena; the
-      # block's value is deep-copied OUT of the arena (rc=1) BEFORE the
-      # arena is freed (copy-before-pop is load-bearing), so it survives.
-      # A non-region block emits the ordinary statement-expression.
+      # A block recorded as a `region { }` lowers to a bump-arena scope.
+      # `bcx` carries in_region = true so constructors lexically inside the
+      # body bump-allocate into the arena; the block's value is deep-copied
+      # OUT of the arena (rc=1) BEFORE the arena is freed (copy-before-pop is
+      # load-bearing), so it survives. A non-region block emits the ordinary
+      # statement-expression.
       let is_region = emit_block_is_region(cx, x.line, x.col)
       let bcx = if is_region { emit_ctx_with_in_region(cx, true) } else { cx }
       match stmts {
@@ -8045,7 +8021,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # types (which survive mono), not the tparam list (emptied by
         # mono) nor the per-ctor `.ty` (the brand does not survive the
         # unit normaliser on every ctor), so every ctor in the body routes.
-        let body_in_region = cx.in_region or params_have_region(params, ret_ty_opt)
+        let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                                 regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable }
         # Phase 3 unboxing — UFn body emits a raw return expression

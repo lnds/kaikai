@@ -1,6 +1,6 @@
-# compiler/region.kai — issue #120 opt-in Perceus regions: surface
-# recognition + region side-table (Phase P2a). Drives arena lowering +
-# deep-copy-out in the emitter (Phase P1).
+# compiler/region.kai — opt-in Perceus regions: surface recognition +
+# the region side-table, plus the signature-brand predicate both backends
+# route ctors off. Drives arena lowering + deep-copy-out in the emitters.
 #
 # THE SHAPE. The parser lowers `region { ... }` to the marker
 # `ECall(EVar("region"), [block])` where `block` is an `EBlock`
@@ -10,50 +10,45 @@
 #   1. recognises the marker by shape (exactly as the nursery rewrite
 #      recognises `ECall(EVar("nursery"), ...)` in desugar.kai),
 #   2. records each region's (file,line,col,nth) in a side table so the
-#      emitter (P1) can bump-allocate the region's constructors into an
+#      emitters can bump-allocate the region's constructors into an
 #      arena, free the arena at block exit, and deep-copy-out any value
 #      that crosses the block boundary,
 #   3. UNWRAPS the marker back to the bare `block`, so the typer and
-#      both emitters see an ordinary block. In P2a the block lowers to
-#      ordinary RC alloc (selfhost stays byte-identical for non-region
-#      code; region code is just a normal block). P1 flips the lowering
-#      to arena alloc by consulting the side table.
+#      both emitters see an ordinary block. The block keyed by its source
+#      position in the side table lowers to arena alloc; every other block
+#      is an ordinary RC block, so selfhost stays byte-identical for
+#      non-region code.
 #
 # WHY A MARKER + UNWRAP, NOT A NEW AST NODE. A dedicated `ERegion`
-# variant would force a new arm at ~98 exhaustive ExprKind-matcher
-# sites across 18 modules (the `EHandle` matcher count). The marker
-# reuses ECall/EVar/EBlock — every matcher already handles those — so
-# there is zero byte-identity risk and zero non-exhaustive-match risk.
-# See docs/issue-120-regions-design.md.
+# variant would force a new arm at every exhaustive ExprKind-matcher site
+# across the modules that walk the AST. The marker reuses ECall/EVar/
+# EBlock — every matcher already handles those — so there is zero
+# non-exhaustive-match risk.
 #
-# ESCAPE SEMANTICS (v1, asu + linus design doc, confirmed by Eduardo):
-# DEEP-COPY-OUT, not compile-time rejection. A value allocated inside a
-# `region { }` is bump-allocated in the region's arena. When such a
-# value crosses the block boundary — the block's final expression
-# value, a store into an outer binding, a closure capture, a fn-arg —
-# the EMITTER (P1) deep-copies it OUT of the arena with rc = 1 (NOT the
-# INT32_MAX arena sentinel; a sentinel-inheriting copy would never
-# free = leak). So `let x = region { [1, 2, 3] }` is LEGAL: the list is
-# built in the arena and copied out as an ordinary rc=1 value when it
-# leaves. For pure LIFO scratch (a buffer consumed and discarded inside
-# the block — issue #120's target) nothing crosses the border, so the
-# copy never fires and the whole region frees in one shot with zero RC
-# traffic. The PRECISE zero-copy escape (brand-in-signature + region
-# polymorphism via the deferred TyBranded work) is a documented v1.x
-# follow-up — see docs/lane-experience-issue-120.md.
+# ESCAPE SEMANTICS: DEEP-COPY-OUT, not compile-time rejection. A value
+# allocated inside a `region { }` is bump-allocated in the region's arena.
+# When such a value crosses the block boundary — the block's final
+# expression value, a store into an outer binding, a closure capture, a
+# fn-arg — the emitter deep-copies it OUT of the arena with rc = 1 (NOT the
+# INT32_MAX arena sentinel; a sentinel-inheriting copy would never free =
+# leak). So `let x = region { [1, 2, 3] }` is legal: the list is built in
+# the arena and copied out as an ordinary rc=1 value when it leaves. For
+# pure LIFO scratch (a buffer consumed and discarded inside the block)
+# nothing crosses the border, so the copy never fires and the whole region
+# frees in one shot with zero RC traffic.
 #
 # Therefore THIS PASS does NO escape checking and emits NO diagnostics.
-# Its whole job is to mark which blocks are regions (the side table)
-# and to strip the surface marker. The border-crossing detection +
-# deep-copy-out lives in the emitter (P1), where the lowering of each
-# region constructor and each block exit is generated.
+# Its whole job is to mark which blocks are regions (the side table) and to
+# strip the surface marker. The border-crossing detection + deep-copy-out
+# lives in the emitters, where the lowering of each region constructor and
+# each block exit is generated.
 #
-# PIPELINE POSITION. Pre-typer, a sibling of the nursery rewrite in
-# the driver (driver.kai, just after the const-ref desugar, before
-# inference). Lexical only — no resolved binders needed, so it runs
-# before the fused resolve/infer. Perceus is NOT touched: P0's
-# `rc = INT32_MAX` arena sentinel already makes Perceus's reuse-in-place
-# auto-disable on region values for free (kai_check_unique returns 0).
+# PIPELINE POSITION. Pre-typer, a sibling of the nursery rewrite in the
+# driver (just after the const-ref desugar, before inference). Lexical
+# only — no resolved binders needed, so it runs before the fused resolve/
+# infer. Perceus is NOT touched: the `rc = INT32_MAX` arena sentinel
+# already makes Perceus's reuse-in-place auto-disable on region values for
+# free (kai_check_unique returns 0).
 
 import compiler.ast
 import compiler.util
@@ -74,7 +69,7 @@ pub fn rmark_nth(m: RegionMark) : Int = match m { RM(_, _, _, n, _) -> n }
 pub fn rmark_name(m: RegionMark) : String = match m { RM(_, _, _, _, nm) -> nm }
 
 # Result of the region rewrite: the unwrapped decls plus the region
-# side table (consumed by the emitter in P1 for arena lowering).
+# side table (consumed by the emitters for arena lowering).
 #[doc("Result of the region rewrite: unwrapped decls and the region side table.")]
 pub type RegionRwProgram = { decls: [Decl], regions: [RegionMark] }
 
@@ -88,7 +83,7 @@ fn rw0() : RWalk = RWalk { regions: [], nth: 0 }
 
 # ---- entry point ---------------------------------------------------
 
-#[doc("issue #120: recognise `region { }` markers, record the region side table, and unwrap markers to bare blocks.")]
+#[doc("Recognise `region { }` markers, record the region side table, and unwrap markers to bare blocks.")]
 pub fn rewrite_regions_decls(decls: [Decl], file: String) : RegionRwProgram {
   let r = rw_decls_loop(decls, file, rw0(), [])
   RegionRwProgram { decls: r.decls, regions: list_reverse(r.w.regions) }
@@ -165,8 +160,8 @@ fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr {
           let mark = RM(file, e.line, e.col, nth, rm.name)
           let w2 = RWalk { regions: [mark, ...inner.w.regions], nth: nth + 1 }
           # Unwrap: the region's value IS the block's value. Downstream
-          # sees a plain block (P2a normal alloc; P1 arena via the side
-          # table keyed on this RegionMark).
+          # sees a plain block; the emitters route it to the arena via the
+          # side table keyed on this RegionMark's source position.
           RWExpr { expr: inner.expr, w: w2 }
         }
         None -> {
@@ -443,4 +438,40 @@ fn rw_stmt(s: Stmt, file: String, w: RWalk) : RWStmt {
     }
     _ -> RWStmt { stmt: s, w: w }
   }
+}
+
+# --- Region-brand detection (shared by both backends) ------------------
+#
+# A fn whose signature carries a region-branded aggregate allocates its
+# ctors in the ambient arena: `tree_insert(t: Tree<r>) : Tree<r>` bump-
+# allocates its `Node(...)` in whatever arena is live at the call, even
+# though the ctor sits outside the `region { }` lexically. Routing keys on
+# the SIGNATURE types — a surface `Tree<r>` survives monomorphisation
+# (mono rewrites the mangle, not the written type), whereas the tparam
+# list is emptied by mono and the per-ctor brand does not survive the unit
+# normaliser. The C backend reads the same predicate inline (`in_region`);
+# the native backend consults it to flag each `KCon`.
+
+#[doc("True when a fn's signature (a param or its return) carries a region-branded aggregate.")]
+pub fn fn_has_region_brand(params: [Param], ret_opt: Option[TypeExpr]) : Bool =
+  if any_param_region(params) { true }
+  else { match ret_opt { Some(te) -> te_is_region_branded(te)  None -> false } }
+
+fn any_param_region(params: [Param]) : Bool = match params {
+  [] -> false
+  [p, ...rest] -> match p.ptype {
+    Some(te) -> if te_is_region_branded(te) { true } else { any_param_region(rest) }
+    None     -> any_param_region(rest)
+  }
+}
+
+# A surface `TyDim` whose base is a user head (not a numeric carrier) is a
+# region brand — `Tree<r>`, not `Real<m>` / `Decimal<USD>`.
+#[doc("True when a surface type is a region brand (`TyDim` over a non-numeric user head).")]
+pub fn te_is_region_branded(te: TypeExpr) : Bool = match te.tkind {
+  TyDim(base, _) -> match base.tkind {
+    TyName(n, _) -> not (n == "Real" or n == "Int" or n == "Decimal")
+    _            -> true
+  }
+  _ -> false
 }
