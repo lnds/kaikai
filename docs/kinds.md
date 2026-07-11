@@ -1,11 +1,12 @@
 # The kind system
 
-> Status: the catalog (`stdlib/core/kinds.kai`) declares three
-> kinds — `Type` and `Effect` (builtin, closed) and `Measure`
-> (open engine) — with `Module` and `Structural` as candidate
-> theories under design. The `kind` / `theory` declaration surface
-> and the generalized engine (user kinds over `AbelianGroup`,
-> per-kind isolation, use-site resolution) are shipped. The
+> Status: the catalog (`stdlib/core/kinds.kai`) declares four
+> kinds — `Type` and `Effect` (builtin, closed), `Measure`
+> (`AbelianGroup`), and `Currency` (`Module`) — with `Structural`
+> as a candidate theory under design. The `kind` / `theory`
+> declaration surface and the generalized engine (user kinds over
+> `AbelianGroup` or `Module`, per-kind isolation, use-site
+> resolution, cross-kind bind rejection) are shipped. The
 > authoritative design is `docs/kind-system-design.md`; this page
 > is the primer.
 
@@ -30,7 +31,8 @@ unification discipline that decides how its habitants unify:
 |-----------|--------|--------|------------|----------|
 | `Type`    | `HindleyMilner` | builtin (the compiler's HM unifier) | `type` | ordinary types: `Int`, `String`, `[T]`, `Option[T]`, user records and variants |
 | `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
-| `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `USD`, `m`, `kg`, `m/s`, `m^2` |
+| `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
+| `Currency` | `Module` | abelian unifier + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
 
 A `builtin` theory (`theory HindleyMilner = builtin`) names an
 engine that is the compiler core itself rather than a property
@@ -47,10 +49,27 @@ mints one of `Measure`.
 
 Effect *rows* (the `/ Console + State` part of a signature) stay
 in their own machinery (see `docs/effects.md`); `Effect` classifies
-the labels, and only `Measure`-style kinds appear in tparam
-annotations (`[u: Measure]`). Candidate theories under design:
-`Module` (currency/money — no internal product, so `USD^2` cannot
-arise) and `Structural` (identity — regions).
+the labels, and only unit-shaped kinds appear in tparam
+annotations (`[u: Measure]`, `[c: Currency]`). Candidate theory
+still under design: `Structural` (identity — regions).
+
+### The `Module` theory
+
+`theory Module = { assoc, commut, inverse, identity }` — an
+additive abelian group with **no multiplicative closure**. A
+well-formed quantity is either a scalar or carries exactly one
+habitant with exponent 1, so `USD^2`, `USD*EUR`, and `1/USD` are
+rejected where they would be *formed* (`*`, `/`, `^`, or a written
+annotation) rather than by a separate unifier: on well-formed
+inputs the abelian engine already behaves as symbol equality plus
+variable binding. Scalar multiplication (`Money * Decimal`) is the
+module's external action and lives in protocols, not in the kind
+engine. Same-habitant addition unifies; a cross-habitant sum is an
+ordinary unit mismatch.
+
+A habitant binds a unit tparam only within its own kind: passing
+`Real<USD>` to `fn sq[u: Measure]` is a type error — without that
+check the generic body would mint `USD^2` behind the guard's back.
 
 ## Kind annotation syntax
 
@@ -122,21 +141,25 @@ catalog may declare theories):
 kind Metric : AbelianGroup with metric   # user kind, own habitants
 metric m
 metric s
+
+kind Points : Module with points         # additive-only user kind
+points pt
 ```
 
 The theory decides how the kind's habitants unify (`AbelianGroup`
-gives Measure-style exponent algebra); the optional `with`
-introducer mints habitants. Habitants in different kinds never
-unify, and the same symbol may inhabit several kinds, resolved at
-the use site by qualification > `use kind` > uniqueness — see
+gives Measure-style exponent algebra; `Module` is additive-only —
+no habitant products or powers); the optional `with` introducer
+mints habitants. Habitants in different kinds never unify, and the
+same symbol may inhabit several kinds, resolved at the use site by
+qualification > `use kind` > uniqueness — see
 `docs/kind-system-design.md` § *Habitant resolution at the use
 site*.
 
 `Type` and `Effect` are **not** user-declarable. Only kinds over
-the open catalog theories (`AbelianGroup` today) can be declared;
-a `kind Type : ...` redeclaration, a user `theory X = builtin`,
-and a user kind over a builtin theory (`kind Foo : EffectRow`)
-are all hard errors.
+the open catalog theories (`AbelianGroup`, `Module`) can be
+declared; a `kind Type : ...` redeclaration, a user
+`theory X = builtin`, and a user kind over a builtin theory
+(`kind Foo : EffectRow`) are all hard errors.
 
 ## Cross-references
 

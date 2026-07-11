@@ -61,9 +61,9 @@ fs/  file.kai dir.kai path.kai
 net/  tcp.kai http.kai
 os/  args.kai env.kai
 top-level: actor.kai array.kai date.kai decimal.kai effects.kai
-           log.kai loop.kai path.kai protocols.kai random.kai
-           random_secure.kai reader.kai regexp.kai spawn.kai time.kai
-           trace.kai uuid.kai writer.kai
+           log.kai loop.kai money.kai path.kai protocols.kai
+           random.kai random_secure.kai reader.kai regexp.kai
+           spawn.kai time.kai trace.kai uuid.kai writer.kai
 ```
 
 What landed since the previous snapshot (2026-05-02 → 2026-05-08):
