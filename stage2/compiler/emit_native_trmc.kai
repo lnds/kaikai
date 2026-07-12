@@ -104,7 +104,7 @@ fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
   [b, ...rest] -> if ntrmc_term_is_step(b.term) { true } else { ntrmc_blocks_have_step(rest) }
 }
 fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
-  KTrmcStep(_, _, _, _, _, _, _, _, _, _) -> true
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -125,7 +125,7 @@ fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
 # and the C oracle's `tcrec_emit_drops_masked`: a BOXED param marked dead is
 # dropped before its alloca is overwritten; a raw scalar param is skipped.
 pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, slot_mask: Int, dropmask: Int,
-                       head_vals: [KVal], asg: [KAssign], scr_drop: String) : Unit / Console =
+                       head_vals: [KVal], asg: [KAssign], scr_drop: String, in_region: Bool) : Unit / Console =
   match ntrmc_cname_is_cons(cname) {
     # `__kai_cons_s` (s = has a scrutinee to drop): the reuse-cons arm
     # (`map`) consumes the scrutinee, but the back-edge jumps over the
@@ -134,7 +134,7 @@ pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, slo
     # literal that aliased nested matches) — the native mirror of the C
     # oracle's `scr_drop` (`emit_trmc_cons_step`, emit_c.kai). `__kai_cons`
     # (raw EList, `build`) has no scrutinee to free (issue #860).
-    true  -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, ntrmc_cname_drops_scr(cname), scr_drop)
+    true  -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, ntrmc_cname_drops_scr(cname), scr_drop, in_region)
     # native variant reuse leak (#872): a self-modulo-cons variant step
     # (`Node(c, insert_loop(l,..), ..)`) CONSUMES the matched scrutinee but the
     # back-edge jumps over the match-exit drop. The C oracle reclaims it via an
@@ -143,13 +143,16 @@ pub fn nemit_trmc_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, slo
     # leaked ~10x over-alloc). The kept pointer children were already incref'd
     # by the arm's `dup` binds, so they outlive the scrutinee's recursive
     # decref — the same discipline the cons `_s` step uses.
-    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, slot_mask, head_vals, asg, dropmask, scr_drop)
+    false -> ntrmc_variant_step(ctx, hole_slot, cname, tag, slot_mask, head_vals, asg, dropmask, scr_drop, in_region)
   }
 
-# Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr.
-fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int, drop_scr: Bool, scr_drop: String) : Unit / Console = {
+# Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr. Under a
+# region the cell bump-allocates in the arena (`kaix_arena_cons`); the arena
+# frees it wholesale and no per-node RC accrues.
+fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int, drop_scr: Bool, scr_drop: String, in_region: Bool) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
-  let node = ncall_sig2(ctx, "kaix_cons", p, p, p, ntrmc_head_val(ctx, head_vals), llvm_const_null(p))
+  let cons_fn = if in_region { "kaix_arena_cons" } else { "kaix_cons" }
+  let node = ncall_sig2(ctx, cons_fn, p, p, p, ntrmc_head_val(ctx, head_vals), llvm_const_null(p))
   ntrmc_extend_and_loop_scr(ctx, node, ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node), asg, dropmask, drop_scr, scr_drop)
 }
 
@@ -170,7 +173,7 @@ fn ntrmc_cons_step(ctx: Handle, head_vals: [KVal], asg: [KAssign], dropmask: Int
 # immediate (materialise-and-store per slot, no `[Handle]` buffer holding an
 # ncall-result handle across a frame return) is what avoids the kaic1 RC UAF.
 fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, slot_mask: Int,
-                      head_vals: [KVal], asg: [KAssign], dropmask: Int, scr_drop: String) : Unit / Console = {
+                      head_vals: [KVal], asg: [KAssign], dropmask: Int, scr_drop: String, in_region: Bool) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   # The node CallInst is SPILLED to an alloca the instant it is born and read
@@ -180,13 +183,60 @@ fn ntrmc_variant_step(ctx: Handle, hole_slot: Int, cname: String, tag: Int, slot
   # load handle, off the RC regime, so the CallInst is never clobbered. The
   # boxed original tolerated a direct 2-use because its frame carried no other
   # live handles; the i64 build does, so the spill is the robust form.
+  # Under a region the spine cell bump-allocates FRESH in the arena — the arm-
+  # top reuse token is always null (an arena scrutinee's immortal rc blocks the
+  # steal), so the token path is dead; building it fresh keeps every node in the
+  # arena and drops per-node RC to zero.
   let nodeslot = llvm_build_alloca_entry(ctx, p, "node")
-  llvm_build_store(native_ctx_b(ctx), ntrmc_variant_build(ctx, tag, cname, slot_mask, hole_slot, head_vals), nodeslot)
+  let node = if in_region { ntrmc_variant_build_arena(ctx, tag, cname, slot_mask, hole_slot, head_vals) }
+             else { ntrmc_variant_build(ctx, tag, cname, slot_mask, hole_slot, head_vals) }
+  llvm_build_store(native_ctx_b(ctx), node, nodeslot)
   let node1 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
   let hole = ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node1, llvm_const_i32(i32t, hole_slot))
   let node2 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
   ntrmc_extend_and_loop(ctx, node2, hole, asg, dropmask)
 }
+
+# The region spine cell: bump-allocate a fresh variant in the current arena via
+# `kaix_arena_variant_masked` over an `[nslots x i64]` word buffer (the hole a
+# NULL word, every other slot at its mask kind). No arm-top reuse token — the
+# arena frees the cell wholesale, so there is no cell to donate and no per-node
+# RC. Mirrors the C oracle's `trmc_fresh_alloc` under `cx.in_region`.
+fn ntrmc_variant_build_arena(ctx: Handle, tag: Int, nm: String, slot_mask: Int, hole_slot: Int, head_vals: [KVal]) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let nslots = list_length(head_vals) + 1
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), nslots)
+  let arr = llvm_build_alloca_entry(ctx, arrty, "aslots")
+  ntrmc_store_arena_slots(ctx, arr, arrty, head_vals, hole_slot, slot_mask, 0)
+  let gname = llvm_build_global_string(native_ctx_b(ctx), nm)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, llvm_const_i32(i32t, tag)); llvm_buf_push(ab, gname); llvm_buf_push(ab, llvm_const_i32(i32t, nslots)); llvm_buf_push(ab, arr)
+  ncall_finish(ctx, "kaix_arena_variant_masked", p, ptb, ab)
+}
+
+# Store each variant slot word into `arr[i]` (no token offset — the arena build
+# carries no reuse token): the `hole_slot` a NULL pointer word (the cctx fills
+# it), every other slot at its mask kind. Store-immediate (kaic1 RC UAF).
+fn ntrmc_store_arena_slots(ctx: Handle, arr: Handle, arrty: Handle, head_vals: [KVal], hole_slot: Int, slot_mask: Int, i: Int) : Unit / Console =
+  match i == hole_slot {
+    true -> {
+      let holep = llvm_const_null(native_ctx_ptrt(ctx))
+      let holew = llvm_build_ptrtoint(native_ctx_b(ctx), holep, native_ctx_i64t(ctx))
+      let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i))
+      llvm_build_store(native_ctx_b(ctx), holew, slot)
+      ntrmc_store_arena_slots(ctx, arr, arrty, head_vals, hole_slot, slot_mask, i + 1)
+    }
+    false -> match head_vals {
+      [] -> ()
+      [h, ...rest] -> {
+        let w = ntrmc_slot_word(ctx, h, ntrmc_mask_kind(slot_mask, i))
+        let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i))
+        llvm_build_store(native_ctx_b(ctx), w, slot)
+        ntrmc_store_arena_slots(ctx, arr, arrty, rest, hole_slot, slot_mask, i + 1)
+      }
+    }
+  }
 
 # Build the `[1+nslots x i64]` word buffer (STORE-IMMEDIATE: `slots[0]` the
 # reuse-token word, `slots[1+j]` each ctor slot) AND emit the
