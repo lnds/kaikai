@@ -1533,7 +1533,7 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # so the `KConReuse` shared path increfs them (the C oracle's
       # shared-branch `incref(_scr->head/tail)`), else the match-exit drop
       # frees them.
-      let st_dup = if not arm_body_uses_reuse(body) {
+      let st_dup = if not arm_reuses(body, st_body) {
         # Owned OR borrowed (issue #1127 rule 4): dup every alias binder so a
         # bound child carries its own ref before flowing to an owned position.
         # Only a reuse arm (else) hands that RC to `__perceus_reuse_*`.
@@ -1804,8 +1804,17 @@ fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
 # exactly the C oracle's unconditional `is_alias` incref). Only a reuse arm
 # suppresses it (the reuse helper owns the kept children's RC). `owned` still
 # gates the exit-drop elsewhere; it must NOT gate this dup.
+# A ctor under a live region never reuses a cell in place — it bump-allocates
+# fresh so the arena frees it wholesale, and per-node RC vanishes. So the reuse
+# recognisers (dual-branch `KConReuse`, arm-top token) are inert under a region:
+# every arm takes the plain alias-dup path and `lower_reuse` emits a fresh arena
+# ctor. Reusing in place would fresh-alloc the shared branch on the RC heap,
+# reintroducing the per-node incref the region exists to eliminate.
+fn arm_reuses(body: Expr, st: LowerSt) : Bool =
+  arm_body_uses_reuse(body) and not st.in_region
+
 fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : LowerSt / Console =
-  if not arm_body_uses_reuse(body) {
+  if not arm_reuses(body, st) {
     lm_dup_alias_binders(pat_alias_binders(p, st.vs), KAt(p.line, p.col), st)
   } else { st }
 
@@ -1816,7 +1825,7 @@ fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : L
 # top-level slots AND one-level nested grand-children (the rotation kept
 # children) — exactly the borrowed leaves the rebuild embeds.
 fn set_reuse_gc_for_arm(p: Pattern, body: Expr, st: LowerSt) : LowerSt =
-  if arm_body_uses_reuse(body) {
+  if arm_reuses(body, st) {
     ls_set_rnested(ls_set_reuse_gc(st, reuse_scrutinee_binders(p, st.vs)),
                    pat_reuse_nested(p, st.vs))
   } else { ls_set_rnested(ls_set_reuse_gc(st, []), RNInone) }
@@ -1842,7 +1851,7 @@ fn reuse_scrutinee_binders(p: Pattern, vs: [EVar]) : [String] = match p.pkind {
 # token in place; a non-step tail (`balance_left(ins(l,..),..)`) frees it. The C
 # oracle's `try_arm_top_reuse` predicate.
 fn arm_is_top_reuse(p: Pattern, body: Expr, st: LowerSt) : Bool = match p.pkind {
-  PVariant(_, _) -> body_has_trmc_step(body) and not list_is_empty_s(pat_direct_alias_slots(p, st.vs))
+  PVariant(_, _) -> not st.in_region and body_has_trmc_step(body) and not list_is_empty_s(pat_direct_alias_slots(p, st.vs))
   _              -> false
 }
 
@@ -2396,14 +2405,31 @@ fn lower_unit_name(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
 # variant/cons forms share the slot-init `KConReuse`. (The original native
 # bug routed every reuse — record included — through the variant helper.)
 fn lower_reuse(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [scr, ...rbld] -> match lower_expr(scr, st) { LRes(donor, st1) ->
-    if callee == "__perceus_reuse_record" { lower_reuse_record(x, donor, rbld, st1) }
-    else { lower_reuse_rebuild(x, reuse_kind_of(callee), donor, rbld, st1) } }
+  [scr, ...rbld] ->
+    # Under a live region the donor is never reused in place: the rebuild
+    # bump-allocates a fresh cell in the arena (`KCon` carries `in_region`),
+    # and the old donor dies wholesale with the arena — no `KConReuse`, no
+    # per-node RC. The donor is a scrutinee alias (`__pcs_scr`), not an owned
+    # ref, so it needs no lowering here; the match's exit drop reclaims it
+    # (a no-op on the arena's immortal-rc cells).
+    if st.in_region { lower_reuse_fresh(x, rbld, st) }
+    else { match lower_expr(scr, st) { LRes(donor, st1) ->
+      if callee == "__perceus_reuse_record" { lower_reuse_record(x, donor, rbld, st1) }
+      else { lower_reuse_rebuild(x, reuse_kind_of(callee), donor, rbld, st1) } } }
   _ -> LRes(KUnitV, st)
 }
 
 fn reuse_kind_of(callee: String) : KReuseKind =
   if callee == "__perceus_reuse_cons" { RkCons } else { RkVariant }
+
+# The region rebuild: lower the reconstruction expression as an ordinary ctor.
+# `st.in_region` is live, so the `KCon`/cons/record it emits routes to the
+# arena — a fresh bump-alloc, no donor reuse. The rebuild is always a single
+# expression (a ctor call or a record literal), the same shape perceus wraps.
+fn lower_reuse_fresh(x: Expr, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
+  [one] -> lower_expr(one, st)
+  _     -> LRes(KUnitV, st)
+}
 
 # A single-element rebuild whose head is an `EVar`/`EModCall` constructor is
 # a variant reuse; otherwise it is a cons reuse (`reuse_cons` passes
@@ -3022,7 +3048,7 @@ fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int
       # `__pcs_scr_drop` literal (which aliased nested matches in the native
       # flat table). `__kai_cons` (no `_s`) has nothing to free → "".
       seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, slot_mask, dropmask,
-                               heads, assigns_of(reb, 0, []), st1.mscr, kpos_of(x)))
+                               heads, assigns_of(reb, 0, []), st1.mscr, st1.in_region, kpos_of(x)))
     }
   }
 
