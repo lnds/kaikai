@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.6 (2026-07-11)
+
+### Fixed
+
+- **typer**: resolve reassigned record var's field read inside interpolation (closes #1194) (#1196)
+- **emit**: route native region ctors to the arena (closes #1193) (#1195)
+
 ## v0.99.5 (2026-07-11)
 
 ### Added
