@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.8 (2026-07-12)
+
+### Fixed
+
+- **emit**: incref owned guard-chain arm binders in native KIR lowering (closes #1201) (#1203)
+
 ## v0.99.7 (2026-07-12)
 
 ### Added
