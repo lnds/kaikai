@@ -148,6 +148,18 @@ elif [ "$count" -eq 0 ]; then
   printf 'fn main() : Unit / Console = println("kaikai self-host")\n' > "$SAMPLE"
   nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ncrc=$?
   oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ocrc=$?
+  # The trivial sample has no `Layout` type, so `rewrite_layout_calls` early-
+  # returns and the native layout-rewrite walk never runs. Re-run the SAME
+  # native binary over a Layout-BEARING program (non-empty `layout_types`) so
+  # the full walk lowers under the native backend, and assert byte-identical C
+  # vs the oracle — a native codegen bug in that walk (crash or corruption)
+  # fails here. Reuses `$BIN`, so it costs a `--emit=c` + diff, not a rebuild.
+  LAYOUT="$ROOT/examples/sugars/kinds_layout_encode_decode.kai"
+  lnc=""; loc=""; lncrc=0; locrc=0
+  if [ -f "$LAYOUT" ]; then
+    lnc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)"; lncrc=$?
+    loc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)"; locrc=$?
+  fi
   rm -f "$BIN"
   if [ "$ncrc" -ne 0 ]; then
     echo "::error::native-selfhost-gate FAIL — the native-built compiler failed to compile the sample program (exit $ncrc)."
@@ -163,6 +175,22 @@ elif [ "$count" -eq 0 ]; then
     exit 1
   fi
   echo "native-selfhost-gate: SELF-COMPILE OK — the native-built compiler emits byte-identical C to the oracle."
+  if [ -f "$LAYOUT" ]; then
+    if [ "$lncrc" -ne 0 ]; then
+      echo "::error::native-selfhost-gate FAIL — the native-built compiler failed on a Layout-bearing program (exit $lncrc). This is the #1201 native layout-rewrite crash class."
+      exit 1
+    fi
+    if [ "$locrc" -ne 0 ]; then
+      echo "::error::native-selfhost-gate FAIL — the C-direct oracle failed on the Layout program (exit $locrc). Unexpected — the oracle is the trusted reference."
+      exit 1
+    fi
+    if [ "$lnc" != "$loc" ]; then
+      echo "::error::native-selfhost-gate FAIL — the native-built compiler's emitted C DIVERGES from the oracle on a Layout-bearing input."
+      diff <(printf '%s' "$loc") <(printf '%s' "$lnc") | head -20 | sed 's/^/    /'
+      exit 1
+    fi
+    echo "native-selfhost-gate: LAYOUT SELF-COMPILE OK — byte-identical C for a Layout-bearing program (the native layout-rewrite walk lowers cleanly)."
+  fi
   echo "native-selfhost-gate: COMPILE + LINK + RUN + SELF-COMPILE achieved — the circle closes (issue #1021)."
   exit 0
 elif [ "$count" -lt "$baseline" ]; then
