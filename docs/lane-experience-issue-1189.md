@@ -179,6 +179,18 @@ ways the code made obvious:
 - The `layout_rewrite` child walk hand-mirrors `dsg_map_expr_kind`'s composite arms;
   if a new `ExprKind` composite is added, both must be updated. Noted at the walk site.
 
+- **Both layout passes now no-op when no Layout type is in scope.**
+  `rewrite_layout_calls` skips the walk when `layout_types` is empty, and
+  `synthesize_layout_fns` skips when no record carries a Layout field
+  (`any_layout_record`). This keeps the feature at ~zero cost for every program
+  without a Layout record — the self-compile included, which was running
+  `tier1-shard-1`'s costly self-compile slice close to its CI ceiling. The synth
+  loop's accumulator also went from a per-step `list_append` (O(n²) over the
+  compiler's thousands of decls) to prepend+reverse (O(n)). The shard's
+  `timeout-minutes` was raised 25→35: the slice is pre-existing at the edge (main
+  has hit 24m+ and been cancelled at 25), so the headroom guards the merge against
+  a slow runner, independent of this lane.
+
 - **The native backend SIGSEGVs when the *self-hosted native* compiler runs the
   layout rewrite over a program that carries a Layout type.** Root cause is in the
   native lowering, not the feature: the identical walker, compiled by the C
