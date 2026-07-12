@@ -4881,6 +4881,20 @@ fn rv_old_slot_drops(subs: [Pattern], tys: [TypeExpr], i: Int, enums: [String]) 
   }
 }
 
+# A ctor under a live region never reuses a cell in place — it bump-allocates
+# fresh so the arena frees it wholesale. So the reuse-arm dual-path (whose
+# fallback branch would fresh-alloc on the RC heap and reintroduce per-node
+# RC) is suppressed under a region, dropping every arm to the plain ctor path
+# (which routes through the arena ctor when `in_region`).
+fn reuse_cons_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseConsArm] =
+  if cx.in_region { None } else { try_reuse_cons_arm(pat, body) }
+
+fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] =
+  if cx.in_region { None } else { try_reuse_variant_arm(pat, body, cx) }
+
+fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] =
+  if cx.in_region { None } else { try_arm_top_reuse(pat, body, cx) }
+
 fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
 
   match a {
@@ -4898,21 +4912,22 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
       # (not inherited by siblings) — `emit_ctx_with_kind1_raw` overwrites.
       let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
                                            list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, [])))
-      # Issue #209 — reuse-arm dual-path emit. Only viable when there
-      # is no guard (a guard might reject the unique branch after we
-      # already committed to overwriting `_scr`'s slots).
+      # Reuse-arm dual-path emit. Only viable when there is no guard (a
+      # guard might reject the unique branch after we already committed to
+      # overwriting `_scr`'s slots); a live region additionally forces every
+      # arm off the reuse path (see `reuse_*_here`).
       match opt_guard {
-        None -> match try_reuse_cons_arm(pat, body) {
+        None -> match reuse_cons_arm_here(pat, body, cx) {
           Some(rca) -> {
             let arm_body = emit_match_arm_reuse_cons(src, arm_lcs, rca, cx)
             concat_all(["    if (", pt, ") { ", arm_body, " break; }\n"])
           }
-          None -> match try_reuse_variant_arm(pat, body, cx) {
+          None -> match reuse_variant_arm_here(pat, body, cx) {
             Some(rva) -> {
               let arm_body = emit_match_arm_reuse_variant(src, arm_lcs, rva, cx)
               concat_all(["    if (", pt, ") { ", arm_body, " break; }\n"])
             }
-          None -> match try_arm_top_reuse(pat, body, cx) {
+          None -> match arm_top_reuse_here(pat, body, cx) {
             Some(atr) ->
               concat_all(["    if (", pt, ") { ",
                           emit_arm_top_reuse(src, atr, body, arm_cx, cx),
