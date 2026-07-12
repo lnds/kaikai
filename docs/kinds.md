@@ -1,14 +1,14 @@
 # The kind system
 
-> Status: the catalog (`stdlib/core/kinds.kai`) declares five
+> Status: the catalog (`stdlib/core/kinds.kai`) declares six
 > kinds — `Type` and `Effect` (builtin, closed), `Measure`
-> (`AbelianGroup`), `Currency` (`Module`), and `Region`
-> (`Structural`, identity). The `kind` / `theory` declaration
-> surface and the generalized engine (user kinds over
-> `AbelianGroup` or `Module`, per-kind isolation, use-site
-> resolution, cross-kind bind rejection) are shipped. The
-> authoritative design is `docs/kind-system-design.md`; this page
-> is the primer.
+> (`AbelianGroup`), `Currency` (`Module`), `Region`
+> (`Structural`, identity), and `Layout` (`Composition`). The
+> `kind` / `theory` declaration surface and the generalized engine
+> (user kinds over `AbelianGroup`, `Module`, or `Composition`,
+> per-kind isolation, use-site resolution, cross-kind bind
+> rejection) are shipped. The authoritative design is
+> `docs/kind-system-design.md`; this page is the primer.
 
 ## What is a kind?
 
@@ -34,6 +34,7 @@ unification discipline that decides how its habitants unify:
 | `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
 | `Currency` | `Module` | abelian unifier + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
 | `Region`  | `Structural` | builtin (symbol identity) | `region` | memory arenas: each `r` is skolemized fresh by a `region { r -> }` block; `Tree<r>` carries it |
+| `Layout`  | `Composition` | atomic-habitant guard (identity) + codegen | `layout` | byte-order modifiers: `be`, `le` — `U32<be>` is a 4-byte big-endian field |
 
 A `builtin` theory (`theory HindleyMilner = builtin`) names an
 engine that is the compiler core itself rather than a property
@@ -101,6 +102,26 @@ ordinary unit mismatch.
 A habitant binds a unit tparam only within its own kind: passing
 `Real<USD>` to `fn sq[u: Measure]` is a type error — without that
 check the generic body would mint `USD^2` behind the guard's back.
+
+### The `Composition` theory
+
+`theory Composition = { assoc, measure }` — composes elements in
+declaration order (associative, but **not commutative**: order is
+load-bearing) and sums a per-element measure. A habitant is a single
+identity symbol, so it carries no product or power, and `be^2` /
+`be*le` are rejected at formation by the same atomic-habitant guard
+`Module` uses. The measure (a record's byte size, a waterfall's
+total) is exact by construction: it lives in the element types and
+codegen, never in a floating sum — verifying a total with IEEE floats
+is unsound (`0.1 + 0.2 ≠ 0.3`).
+
+`Layout` is its shipped kind: `U32<be>` and `U32<le>` are the same
+base `U32` but distinct representations (the `be`/`le` habitant is a
+byte-order modifier; the width comes from the base type), so they
+never unify. Because `Composition` is public, a user can declare their
+own summed-measure kind over it — `kind Waterfall : Composition with
+pct` for fintech tranche splits, for example — exactly as they can
+over `AbelianGroup`/`Module`.
 
 ## Kind annotation syntax
 
@@ -175,11 +196,16 @@ metric s
 
 kind Points : Module with points         # additive-only user kind
 points pt
+
+kind Frame : Composition with frame       # summed-measure user kind
+frame hdr
+frame body
 ```
 
 The theory decides how the kind's habitants unify (`AbelianGroup`
 gives Measure-style exponent algebra; `Module` is additive-only —
-no habitant products or powers); the optional `with` introducer
+no habitant products or powers; `Composition` composes in order and
+sums a measure, habitants atomic); the optional `with` introducer
 mints habitants. Habitants in different kinds never unify, and the
 same symbol may inhabit several kinds, resolved at the use site by
 qualification > `use kind` > uniqueness — see
@@ -187,8 +213,8 @@ qualification > `use kind` > uniqueness — see
 site*.
 
 `Type` and `Effect` are **not** user-declarable. Only kinds over
-the open catalog theories (`AbelianGroup`, `Module`) can be
-declared; a `kind Type : ...` redeclaration, a user
+the open catalog theories (`AbelianGroup`, `Module`, `Composition`)
+can be declared; a `kind Type : ...` redeclaration, a user
 `theory X = builtin`, and a user kind over a builtin theory
 (`kind Foo : EffectRow`) are all hard errors.
 

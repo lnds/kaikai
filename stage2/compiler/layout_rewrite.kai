@@ -1,0 +1,173 @@
+# compiler.layout_rewrite - redirect encode/decode calls to the
+# generated per-type serialiser. Runs post-inference, pre-monomorphise.
+# lr_-prefixed helpers avoid fn-vs-binder shadows in the single-TU bundle.
+
+import compiler.util
+import compiler.ast
+import compiler.layout_synth
+
+#[doc("""
+Rewrite every global-`encode`/`decode` call to its generated per-type
+serialiser. `layout_types` is the set of record names a
+`__layout_encode_/decode_` fn was synthesised for; only a call whose
+concrete target is in that set is the Layout builtin and gets redirected.
+Any other `encode`/`decode` in scope (a module's `toml.decode`, a user fn
+of the same bare name) targets a non-Layout type and is left untouched.
+""")]
+# No Layout types means no `encode`/`decode` call can resolve to the
+# builtin, so the whole walk is a no-op — skip it.
+pub fn rewrite_layout_calls(decls: [Decl], layout_types: [String]) : [Decl] =
+  match layout_types { [] -> decls  _ -> lr_decls(decls, layout_types, []) }
+
+fn lr_decls(decls: [Decl], lt: [String], acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> lr_decls(rest, lt, [lr_decl(d, lt), ...acc])
+}
+
+fn lr_decl(d: Decl, lt: [String]) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(pub_, n, tps, ps, ret, row, lr_expr(body, lt), l, c, mo)
+  DTest(desc, body, l, c) -> DTest(desc, lr_expr(body, lt), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, lr_expr(body, lt), l, c)
+  DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, lr_expr(body, lt), l, c)
+  _ -> d
+}
+
+# Bottom-up rewrite: recurse into sub-exprs first, then redirect this
+# node if it is the global `encode`/`decode` builtin on a Layout type.
+fn lr_expr(e: Expr, lt: [String]) : Expr = match lr_children(e, lt) {
+  ce -> match ce.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar("encode") -> lr_redirect(ce, args_, lr_head(lr_arg_ty(args_)), lt, "encode")
+      EVar("decode") -> lr_redirect(ce, args_, lr_opt_inner(ce.ty), lt, "decode")
+      _ -> ce
+    }
+    _ -> ce
+  }
+}
+
+# The resolved type of the sole argument (encode's target), or None.
+fn lr_arg_ty(args_: [Expr]) : Option[Ty] = match args_ {
+  [a] -> a.ty
+  _ -> None
+}
+
+# Redirect to `__layout_<kind>_T` only when `T` is a synthesised Layout
+# type — the sole shape the global `encode`/`decode` builtin targets.
+fn lr_redirect(e: Expr, args_: [Expr], target: Option[String], lt: [String], name: String) : Expr =
+  match target {
+    Some(t) -> if list_has(lt, t) { lr_retarget(e, lr_fn_for(name, t), args_) } else { e }
+    None -> e
+  }
+
+fn lr_fn_for(name: String, t: String) : String =
+  if name == "encode" { layout_encode_fn_name(t) } else { layout_decode_fn_name(t) }
+
+fn lr_retarget(e: Expr, fn_name: String, args_: [Expr]) : Expr =
+  lr_rebuild(e, ECall(mk_expr(EVar(fn_name), e.line, e.col), args_))
+
+# The nominal head name of a resolved type: `TyCon(_, "Header", _)` ->
+# `Some("Header")`. A list, function, var, or primitive is None.
+fn lr_head(ot: Option[Ty]) : Option[String] = match ot {
+  Some(t) -> match t { TyCon(_, name, _) -> Some(name) _ -> None }
+  None -> None
+}
+
+# The `T` of an `Option[T]` result type, for the decode target. `decode`
+# always resolves to `Option[T]`, so the first type-arg of the head
+# TyCon is `T`; the con name is bound with a wildcard (never the literal
+# `"Option"`) so the list pattern is not in a mixed variant slot the
+# native backend cannot lower.
+fn lr_opt_inner(ot: Option[Ty]) : Option[String] = match ot {
+  Some(t) -> match t {
+    TyCon(_, _, [a, ...]) -> lr_head(Some(a))
+    _ -> None
+  }
+  None -> None
+}
+
+fn lr_rebuild(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# --- child recursion ---
+# A hand-written walk over the ExprKinds that carry sub-exprs; mirrors
+# `dsg_map_expr_kind`'s composite arms. A new composite `ExprKind` must
+# be added here too or its children go un-rewritten.
+
+fn lr_children(e: Expr, lt: [String]) : Expr = lr_rebuild(e, lr_kind(e.kind, lt))
+
+fn lr_one(x: Expr, lt: [String], mk: (Expr) -> ExprKind) : ExprKind = mk(lr_expr(x, lt))
+
+fn lr_pair(a: Expr, b: Expr, lt: [String], mk: (Expr, Expr) -> ExprKind) : ExprKind =
+  mk(lr_expr(a, lt), lr_expr(b, lt))
+
+fn lr_kind(k: ExprKind, lt: [String]) : ExprKind = match k {
+  ECall(callee, args_) -> ECall(lr_expr(callee, lt), lr_list(args_, lt, []))
+  EField(base, name) -> lr_one(base, lt, (x) => EField(x, name))
+  EIndex(a, b) -> lr_pair(a, b, lt, (x, y) => EIndex(x, y))
+  EBinop(op, a, b) -> lr_pair(a, b, lt, (x, y) => EBinop(op, x, y))
+  EUnop(op, x) -> lr_one(x, lt, (x1) => EUnop(op, x1))
+  EIf(c, t_, eo) -> EIf(lr_expr(c, lt), lr_expr(t_, lt), lr_opt(eo, lt))
+  EMatch(scr, arms) -> EMatch(lr_expr(scr, lt), lr_arms(arms, lt, []))
+  ELambda(ps, b) -> lr_one(b, lt, (b1) => ELambda(ps, b1))
+  ERecordLit(name, fs) -> ERecordLit(name, lr_fields(fs, lt, []))
+  EList(els) -> EList(lr_elems(els, lt, []))
+  ERange(a, b, step) -> ERange(lr_expr(a, lt), lr_expr(b, lt), lr_opt(step, lt))
+  EBlock(stmts, tail) -> EBlock(lr_stmts(stmts, lt, []), lr_opt(tail, lt))
+  EPipe(a, b) -> lr_pair(a, b, lt, (x, y) => EPipe(x, y))
+  EMapPipe(a, b) -> lr_pair(a, b, lt, (x, y) => EMapPipe(x, y))
+  EFlatMapPipe(a, b) -> lr_pair(a, b, lt, (x, y) => EFlatMapPipe(x, y))
+  EFilterPipe(a, b) -> lr_pair(a, b, lt, (x, y) => EFilterPipe(x, y))
+  ELitUnit(inner, u) -> lr_one(inner, lt, (i1) => ELitUnit(i1, u))
+  EBang(inner) -> lr_one(inner, lt, (i1) => EBang(i1))
+  EIntrinsic(name, args_) -> EIntrinsic(name, lr_list(args_, lt, []))
+  EHandle(body, en, et, io, ao, cls, ro) ->
+    lr_one(body, lt, (b1) => EHandle(b1, en, et, io, ao, cls, ro))
+  _ -> k
+}
+
+fn lr_list(es: [Expr], lt: [String], acc: [Expr]) : [Expr] = match es {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> lr_list(rest, lt, [lr_expr(e, lt), ...acc])
+}
+
+fn lr_opt(o: Option[Expr], lt: [String]) : Option[Expr] = match o {
+  None -> None
+  Some(e) -> Some(lr_expr(e, lt))
+}
+
+fn lr_arms(arms: [Arm], lt: [String], acc: [Arm]) : [Arm] = match arms {
+  [] -> list_reverse(acc)
+  [a, ...rest] -> match a {
+    Arm(p, guard, body) -> lr_arms(rest, lt, [Arm(p, lr_opt(guard, lt), lr_expr(body, lt)), ...acc])
+  }
+}
+
+fn lr_fields(fs: [FieldInit], lt: [String], acc: [FieldInit]) : [FieldInit] = match fs {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> match f {
+    FI(n, e) -> lr_fields(rest, lt, [FI(n, lr_expr(e, lt)), ...acc])
+  }
+}
+
+fn lr_elems(els: [ListElem], lt: [String], acc: [ListElem]) : [ListElem] = match els {
+  [] -> list_reverse(acc)
+  [el, ...rest] -> match el {
+    ElPlain(e) -> lr_elems(rest, lt, [ElPlain(lr_expr(e, lt)), ...acc])
+    ElSpread(e) -> lr_elems(rest, lt, [ElSpread(lr_expr(e, lt)), ...acc])
+  }
+}
+
+fn lr_stmts(stmts: [Stmt], lt: [String], acc: [Stmt]) : [Stmt] = match stmts {
+  [] -> list_reverse(acc)
+  [s, ...rest] -> lr_stmts(rest, lt, [lr_stmt(s, lt), ...acc])
+}
+
+fn lr_stmt(s: Stmt, lt: [String]) : Stmt = match s {
+  SLet(p, ann, rhs) -> SLet(p, ann, lr_expr(rhs, lt))
+  SVar(n, ann, rhs, l, c) -> SVar(n, ann, lr_expr(rhs, lt), l, c)
+  SExprStmt(e) -> SExprStmt(lr_expr(e, lt))
+  SAssert(c, m) -> SAssert(lr_expr(c, lt), lr_opt(m, lt))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(lr_expr(b, lt), lr_expr(i, lt), lr_expr(v, lt), l, c)
+  SUse(_, _, _) -> s
+}
