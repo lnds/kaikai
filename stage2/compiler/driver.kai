@@ -44,6 +44,8 @@ import compiler.rawsafe
 import compiler.perceus
 import compiler.purity
 import compiler.protos
+import compiler.layout_synth
+import compiler.layout_rewrite
 import compiler.fwd_inline
 import compiler.emit_shared
 import compiler.emit_c
@@ -4174,7 +4176,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
             # emits an ECall to this name).
-            let merged_raw_synth0 = synthesize_refine_pred_fns(merged_raw, target_mod_name)
+            let merged_raw_synth_ref = synthesize_refine_pred_fns(merged_raw, target_mod_name)
+            # Synthesise `__layout_encode_T` / `__layout_decode_T` for
+            # every Layout-bearing record so `encode`/`decode` calls can
+            # be redirected to them post-inference (layout_rewrite).
+            let merged_raw_synth0 = synthesize_layout_fns(merged_raw_synth_ref)
             # Rewrite `PNarrow(name, T)` where `T` is a
             # refinement-type alias back into `PBind(name)` +
             # `__ref_pred_T(name)` guard so match-arm narrowing keeps
@@ -4199,11 +4205,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let kind_reg = kind_reg_from_decls(merged_pre_kinds)
             let merged_kr = resolve_kinds_decls(merged_pre_kinds, kind_reg)
             let kind_ctx = build_kind_ctx(merged_kr, kind_reg)
-            # Module-theory kind names, captured before the catalog
-            # decls are stripped; the typer's unit-formation guard
-            # reads them (a Module habitant admits no product/power).
-            let module_kinds = list_append(base_module_kind_names(),
-                                           module_kind_names(merged_kr))
+            # Atomic-kind names (Module + Composition), captured before
+            # the catalog decls are stripped; the typer's unit-formation
+            # guard reads them (an atomic habitant admits no product/power).
+            let module_kinds =
+              list_append(list_append(base_module_kind_names(),
+                                      base_composition_kind_names()),
+                          list_append(module_kind_names(merged_kr),
+                                      composition_kind_names(merged_kr)))
             let unit_ref_errs = validate_unit_refs_decls(merged_kr, unit_scope(kind_ctx), path)
             let merged = strip_kind_decls(merged_kr)
             # Validate that every contract predicate calls only
@@ -4630,8 +4639,15 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # rewrite, breaking the local-wins shadow rule the
                   # pre-typer `filter_shadowed_ops` already established.
                   let post_local_arities = collect_local_fn_arities(typed_prog0.decls)
-                  let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg,
+                  let typed_prog1 = resolve_protocol_calls(typed_prog0, proto_reg,
                                                             post_local_arities)
+                  # Redirect `encode(v)` / `decode(b)` to the generated
+                  # `__layout_encode_T` / `__layout_decode_T`. Post-
+                  # inference so every arg/result type is concrete; only a
+                  # call whose target is a Layout record is redirected.
+                  let layout_decls = rewrite_layout_calls(typed_prog1.decls,
+                                       layout_type_names(all_decls))
+                  let typed_prog = typed_prog_with_decls(typed_prog1, layout_decls)
                   # Walk the post-rewrite AST and report any
                   # `__proto_<op>` call whose receiver type is concrete
                   # but has no matching impl. Polymorphic helpers whose

@@ -1,9 +1,11 @@
-# The `Layout` kind — declarative binary representation (design proposal)
+# The `Layout` kind — declarative binary representation
 
-**Status:** proposal, not accepted. Design doc for a candidate third kind, written
-per `docs/kinds.md` ("adding a new kind requires a separate design doc … that
-proposal must motivate why the existing two are insufficient and what concrete
-program patterns the new kind enables"). This doc is that motivation.
+**Status:** shipped. `Layout` is a kind over the public `Composition`
+theory (`stdlib/core/kinds.kai`). The kind, its `<be>`/`<le>` surface, the
+byte-order habitants, and the atomic-habitant formation guard are live;
+`U32<be>` and `U32<le>` classify as distinct representations that never
+unify. This doc is the design and the motivation; where a piece is a
+declared follow-up rather than shipped, the section says so.
 
 **Scope of this spec.** The kind, its surface syntax, `decode`/`encode`, and —
 added after design review — **data-dependent size (TLV)** via intra-record backward
@@ -142,46 +144,67 @@ a real format needs them, the same discipline the raw layer follows.
 
 ## Operations — `decode` / `encode`, safe, no `Unsafe`
 
-Two polymorphic operations over layout-bearing types, both total (no UB, no
-`/Unsafe`):
+Two operations over Layout-bearing records:
 
 ```kaikai
-decode[l: Layout](bytes: Array[U8]) : Option[l]         # None if bytes too short
-encode[l: Layout](value: l)         : Array[U8]         # always succeeds
+encode(value)  : Array[Byte]           # total — always serialises
+decode(bytes)  : Option[T]             # None when the buffer is too short
 ```
 
-Then binary parsing is **ordinary record destructuring** of a decoded value — the
-`{ magic, version, id }` pattern that already exists, no special "binary pattern"
-form:
+**The signature is `encode[t](value: t)` / `decode[t](bytes) : Option[t]` over an
+ordinary `[t: Type]`, NOT `[l: Layout]`.** This is deliberate and load-bearing: the
+`Layout` kind classifies *habitants* (`be`/`le`), not record types. `Header` is a
+plain `Type` whose *fields* carry Layout habitants. A `[l: Layout]` bound would make
+`l` a habitant variable (the thing that goes in `<l>`), not a type usable in
+`Option[l]` — and a kind bound over a type is exactly the constraint-propagation the
+language rules out (CLAUDE.md Tier 1 #3). Instead the compiler checks a concrete
+call's target *is* Layout-bearing (every field carries `<be>`/`<le>`) and rejects it
+otherwise; the same phantom-habitant shape `unit_name` uses. Do not "fix" the
+signature back to `[l: Layout]`.
+
+`T` comes from the call's type context — an annotation or the surrounding
+expression:
 
 ```kaikai
-fn parse_header(buf: Array[U8]) : Result[Header, ParseError] =
-  match decode[Header](buf) {
+fn parse_header(buf: Array[Byte]) : Result[Header, ParseError] = {
+  let decoded : Option[Header] = decode(buf)
+  match decoded {
     Some(h) if h.magic == 0xCAFEBABE -> Ok(h)
     Some(h)                          -> Err(BadMagic(h.magic))
     None                             -> Err(Truncated)
   }
+}
 ```
 
 `decode` returning `Option` is the safety story: too-short input yields `None`,
-never a garbage read. Truncation and bad-magic are ordinary `Result` values. This
-is safer than Rust's `nom` (which needs `unsafe` for zero-copy) and needs no new
+never a garbage read. Truncation and bad-magic are ordinary `Result` values, no new
 match machinery — the layout is in the type, the match is `match`.
 
-### Codegen sketch
+### How it lowers
 
-`decode[Header]` monomorphises per concrete layout (like every kaikai generic).
-For each field the compiler emits a width-sized load from the running offset, plus
-a byte-swap iff the field's endianness differs from the host's, then a bounds check
-against `bytes.length()` up front (one check for the fixed total size). No cursor
-object, no per-field bounds check, no allocation beyond the result record. `encode`
-is the mirror. Both are straight-line code the optimizer handles well.
+For each Layout-bearing record the compiler synthesises `__layout_encode_T` /
+`__layout_decode_T` (before the typer, same slot as refinement predicates), and a
+post-inference pass redirects each concrete `encode`/`decode` call to them. The
+generated bodies are ordinary kaikai — a fold of `bin.put_uint_be/le` /
+`bin.get_uint_be/le` over the fields in declaration order — so **both backends (C
+and native) lower them for free, byte-identical, with no per-backend codegen.** The
+width comes from the base type (`U32` = 4 bytes); the `<be>`/`<le>` habitant picks
+the byte order. `encode` folds an `Array[Byte]`; `decode` is a match tower that
+short-circuits to `None` on any truncated read and rebuilds the record at the
+innermost success.
 
-## Data-dependent size (TLV) — IN scope, via intra-record backward dependency
+## Data-dependent size (TLV) — declared follow-up, not shipped
 
-This is the axis Elixir wins with `payload::binary-size(count)`, and Layout closes
-it. A field's byte length may refer to a **prior field of the same record**, read
-first in the sequential decode:
+> **Status:** the shipped cut is byte-aligned fixed-width fields only. TLV
+> (`Bytes<len>`) and nested Layout records are a **follow-up**: a record with any
+> field that is not a fixed-width `U8..U64` carrying `<be>`/`<le>` is not
+> Layout-bearing, so `encode`/`decode` reject it up front rather than mis-encode it.
+> `Bytes<len>` also fails earlier — `len` is not a `Layout` habitant, so it is an
+> unknown-unit error. The design below is the intended shape for that follow-up.
+
+This is the axis Elixir wins with `payload::binary-size(count)`. A field's byte
+length may refer to a **prior field of the same record**, read first in the
+sequential decode:
 
 ```kaikai
 type Packet = {
@@ -239,21 +262,25 @@ bitwise ops.
 
 | Piece | Status |
 |---|---|
-| `Type`, `Measure` kinds | shipped (`docs/kinds.md`) |
-| kind machinery (parser `parse_optional_kind_annotation`, separate ID namespace) | exists for `Measure`; `Layout` extends the same slot |
-| `Layout` kind + `<be>`/`<le>` inhabitants | new |
-| `decode`/`encode` codegen | new |
-| imperative predecessor to migrate | `stdlib/bin.kai` + `bin_*` in `stdlib/protocols.kai` |
+| `Type`, `Measure`, `Currency`, `Region` kinds | shipped (`docs/kinds.md`) |
+| `Composition` theory (public, user-declarable) | shipped |
+| `Layout` kind + `<be>`/`<le>` habitants + formation guard | shipped |
+| `encode`/`decode` over fixed-width fields (C + native, byte-identical) | shipped |
+| TLV (`Bytes<len>`), nested Layout records, signed heads, sub-byte | follow-up (rejected, not mis-encoded) |
+| imperative predecessor | `stdlib/bin.kai` + `bin_*` in `stdlib/protocols.kai` (`encode`/`decode` compose the new `bin.put_uint_*` / `bin.get_uint_*` bricks) |
 
-## Open questions for evaluation
+## Resolved during implementation
 
-- Is `Layout` worth a third kind now, or does the imperative `bin.*` surface
-  suffice until a real format-heavy program (a protocol impl, a file parser) exists
-  to justify it? (The same "wait for a measured case" discipline the raw layer got.)
-- Should `decode`/`encode` be free functions, or methods behind a `Serialize`-style
-  protocol keyed on the `Layout`? (Protocol dispatch on a *type property* with no
-  value is exactly what a kind, not a protocol, is for — leaning free functions.)
-- Default-width layout of an un-annotated integer field (Boundary 3).
+- **`decode`/`encode` are free functions**, not a protocol — protocol dispatch is on
+  a value, and a layout is a property of the *type* with no value to dispatch on;
+  that is exactly what a kind, not a protocol, is for.
+- **The signature is over `[t: Type]`, not `[l: Layout]`** — see *Operations*: a kind
+  bound over a type is constraint-propagation the language forbids; `Layout`
+  classifies habitants, and the emitter checks the concrete target is Layout-bearing.
+- **Un-annotated fixed-width fields are not Layout-bearing** (Boundary 3): a record is
+  Layout-bearing only when *every* field carries `<be>`/`<le>`. An un-annotated `U32`
+  makes the record plain, so `encode`/`decode` on it are rejected — no implicit
+  host-endian default.
 
 ## References
 

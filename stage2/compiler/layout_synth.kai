@@ -1,0 +1,284 @@
+#[doc("""
+compiler.layout_synth - synthesise `encode`/`decode` bodies for a
+`Layout`-bearing record.
+
+A `type Header = { magic: U32<be>, port: U16<le> }` gets two generated
+functions injected into the decl stream before the typer:
+
+  __layout_encode_Header(v: Header) : [U8]
+  __layout_decode_Header(b: [U8])   : Option[Header]
+
+The bodies are ordinary kaikai - a fold of `bin.put_uint_*` /
+`bin.get_uint_*` calls over the fields, in declaration order - so both
+backends lower them for free (paridad by construction; no per-backend
+codegen). This module builds the AST; the driver injects it and the
+typer rewrites a concrete `encode(v)` / `decode(b)` call to the right
+generated fn.
+
+A field is Layout-bearing when its type is `U<N><be>` or `U<N><le>`:
+a fixed-width unsigned integer head carrying a `be`/`le` habitant. A
+record with at least one such field is a Layout record. TLV
+(`Bytes<len>`) and nested Layout records are a declared follow-up and
+are rejected up front, not silently mis-encoded.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.diag
+
+# One Layout field: its name, byte width, and byte order.
+pub type LayoutField = LFld(String, Int, Bool)
+#                         name    width  is_be
+
+fn lf_name(f: LayoutField) : String = match f { LFld(n, _, _) -> n }
+fn lf_width(f: LayoutField) : Int = match f { LFld(_, w, _) -> w }
+fn lf_is_be(f: LayoutField) : Bool = match f { LFld(_, _, be) -> be }
+
+#[doc("The Layout fields of a record body, or None if the record is not Layout-bearing (no field carries a `be`/`le` habitant) or mixes a non-Layout field in.")]
+pub fn layout_fields_of(fields: [FieldDecl]) : Option[[LayoutField]] =
+  lfo_loop(fields, [], false)
+
+# Fold the field list. A record is Layout-bearing iff EVERY field is a
+# Layout field and there is at least one - a single non-Layout field
+# (a plain `Int`, a nested record, a TLV `Bytes<len>`) makes the whole
+# record non-Layout, so it is left to the plain-record path and any
+# `encode`/`decode` on it is rejected. A partial encoder is never
+# generated.
+fn lfo_loop(fields: [FieldDecl], acc: [LayoutField], saw: Bool) : Option[[LayoutField]] =
+  match fields {
+    [] -> if saw { Some(list_reverse(acc)) } else { None }
+    [f, ...rest] -> match layout_field_of(f) {
+      Some(lf) -> lfo_loop(rest, [lf, ...acc], true)
+      None -> None
+    }
+  }
+
+# A single field: `FD(_, name, TyDim(TyName("U32"), USym("be")))` ->
+# `LFld("magic", 4, true)`. Any other shape is not a Layout field.
+fn layout_field_of(fd: FieldDecl) : Option[LayoutField] = match fd {
+  FD(_, name, te) -> match te.tkind {
+    TyDim(base, u) -> match base.tkind {
+      TyName(headname, _) -> match layout_order_of(u) {
+        Some(is_be) -> match layout_width_of(headname) {
+          Some(w) -> Some(LFld(name, w, is_be))
+          None -> None
+        }
+        None -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# The byte order of a habitant expr: `be` -> Some(true), `le` ->
+# Some(false), anything else (a compound, a non-order symbol) -> None.
+# Kind resolution qualifies the habitant (`be` -> `Layout$be`) before
+# this runs at rewrite time, so strip the qualifier first; pre-
+# resolution (synthesis) the symbol is already bare.
+fn layout_order_of(u: UnitExprT) : Option[Bool] = match u {
+  USym(s) -> {
+    let bare = kind_sym_bare(s)
+    if bare == "be" { Some(true) } else if bare == "le" { Some(false) } else { None }
+  }
+  _ -> None
+}
+
+# Byte width of a fixed-width unsigned head name (`U32` -> 4). Only the
+# unsigned heads carry a decode-clean unsigned round-trip; signed heads
+# are a follow-up (sign extension), so they are not Layout-bearing yet.
+fn layout_width_of(name: String) : Option[Int] =
+  if name == "U8" { Some(1) }
+  else if name == "U16" { Some(2) }
+  else if name == "U32" { Some(4) }
+  else if name == "U64" { Some(8) }
+  else { None }
+
+#[doc("The generated encoder fn name for a record type (`Header` -> `__layout_encode_Header`).")]
+pub fn layout_encode_fn_name(tyname: String) : String =
+  concat_all(["__layout_encode_", tyname])
+
+#[doc("The generated decoder fn name for a record type (`Header` -> `__layout_decode_Header`).")]
+pub fn layout_decode_fn_name(tyname: String) : String =
+  concat_all(["__layout_decode_", tyname])
+
+# --- AST construction helpers (all at line/col 0: generated code) ---
+
+fn le0(k: ExprKind) : Expr = mk_expr(k, 0, 0)
+fn evar(n: String) : Expr = le0(EVar(n))
+fn eint(n: Int) : Expr = le0(EInt(n))
+fn ecall(callee: String, args: [Expr]) : Expr = le0(ECall(evar(callee), args))
+fn efield(base: Expr, name: String) : Expr = le0(EField(base, name))
+fn ty0(k: TyKind) : TypeExpr = mk_ty(k, 0, 0)
+fn mk_tyname(n: String) : TypeExpr = ty0(TyName(n, []))
+fn tylist(inner: TypeExpr) : TypeExpr = ty0(TyList(inner))
+
+fn ls_param(name: String, ty: TypeExpr) : Param =
+  Param { pname: name, ptype: Some(ty), pline: 0, pcol: 0, pborrow: false }
+
+# The empty byte buffer `array_make(0, bin_byte(0))` an encoder folds
+# onto, and the `Array[Byte]` type the `bin_*` bricks operate on.
+fn empty_buf() : Expr = ecall("array_make", [eint(0), ecall("bin_byte", [eint(0)])])
+fn u8_list_ty() : TypeExpr = ty0(TyName("Array", [mk_tyname("Byte")]))
+
+#[doc("""
+The generated encoder: `fn __layout_encode_T(v: T) : [U8] = <fold>`,
+where the fold wraps the empty buffer with one `bin_put_uint_be/le`
+call per field in declaration order - a straight-line expression both
+backends lower with no per-backend codegen.
+""")]
+pub fn build_encode_fn(tyname_s: String, fields: [LayoutField], mo: Option[String]) : Decl {
+  let body = enc_fold(fields, empty_buf())
+  DFn(false, layout_encode_fn_name(tyname_s), [],
+      [ls_param("v", mk_tyname(tyname_s))], Some(u8_list_ty()),
+      REmpty, body, 0, 0, mo)
+}
+
+# Left fold: `bin_put_uint_ORDER(acc, unbrand(v.field), width)` per
+# field. `__detach_unit` erases the `<be>`/`<le>` brand (identity at
+# runtime) so the plain-`Int` helper accepts the field value.
+fn enc_fold(fields: [LayoutField], acc: Expr) : Expr = match fields {
+  [] -> acc
+  [f, ...rest] -> {
+    let putter = if lf_is_be(f) { "bin_put_uint_be" } else { "bin_put_uint_le" }
+    let raw = ecall("__detach_unit", [efield(evar("v"), lf_name(f))])
+    let step = ecall(putter, [acc, raw, eint(lf_width(f))])
+    enc_fold(rest, step)
+  }
+}
+
+fn pvariant(ctor: String, subs: [Pattern]) : Pattern = mk_pat(PVariant(ctor, subs), 0, 0)
+fn pbind(n: String) : Pattern = mk_pat(PBind(n), 0, 0)
+fn esome(x: Expr) : Expr = ecall("Some", [x])
+fn enone() : Expr = evar("None")
+
+#[doc("""
+The generated decoder: `fn __layout_decode_T(b: [U8]) : Option[T]`.
+The body is a match tower - one `match bin_get_uint_ORDER(b, off, w)`
+per field, binding the field on `Some` and threading the running byte
+offset, short-circuiting to `None` on any truncated read, and
+building `Some(T { ... })` at the innermost success. Straight-line,
+both backends lower it for free.
+""")]
+pub fn build_decode_fn(tyname_s: String, fields: [LayoutField], mo: Option[String]) : Decl {
+  let body = dec_tower(tyname_s, fields, 0)
+  DFn(false, layout_decode_fn_name(tyname_s), [],
+      [ls_param("b", u8_list_ty())], Some(ty0(TyName("Option", [mk_tyname(tyname_s)]))),
+      REmpty, body, 0, 0, mo)
+}
+
+# The match tower. At the base (no fields left) build the record from
+# every bound field name. Otherwise read the current field at `off`,
+# bind it on Some, recurse at `off + width`, and fail to None.
+fn dec_tower(tyname_s: String, fields: [LayoutField], off: Int) : Expr = match fields {
+  [] -> esome(le0(ERecordLit(tyname_s, [])))
+  _  -> dec_tower_fields(tyname_s, fields, off, [])
+}
+
+fn dec_tower_fields(tyname_s: String, fields: [LayoutField], off: Int,
+                    bound: [String]) : Expr = match fields {
+  [] -> esome(le0(ERecordLit(tyname_s, rec_field_inits(list_reverse(bound)))))
+  [f, ...rest] -> {
+    let getter = if lf_is_be(f) { "bin_get_uint_be" } else { "bin_get_uint_le" }
+    let read = ecall(getter, [evar("b"), eint(off), eint(lf_width(f))])
+    let ok_body = dec_tower_fields(tyname_s, rest, off + lf_width(f),
+                                   [lf_name(f), ...bound])
+    let some_arm = Arm(pvariant("Some", [pbind(lf_name(f))]), None, ok_body)
+    let none_arm = Arm(pvariant("None", []), None, enone())
+    le0(EMatch(read, [some_arm, none_arm]))
+  }
+}
+
+# `{ magic: brand(magic), ... }` - a field-init per bound name.
+# `__attach_unit` re-applies the field's `<be>`/`<le>` brand (identity
+# at runtime) so the plain-`Int` the getter returned fits the branded
+# record field.
+fn rec_field_inits(names: [String]) : [FieldInit] = match names {
+  [] -> []
+  [n, ...rest] -> [FI(n, ecall("__attach_unit", [evar(n)])), ...rec_field_inits(rest)]
+}
+
+#[doc("""
+Inject `__layout_encode_T` / `__layout_decode_T` into the decl stream
+for every Layout-bearing record `T`. Runs before the typer (same slot
+as `synthesize_refine_pred_fns`); the generated fns then monomorphise
+and emit like any user fn, so both backends serialise for free.
+""")]
+pub fn synthesize_layout_fns(decls: [Decl]) : [Decl] =
+  if any_layout_record(decls) { syn_loop(decls, []) } else { decls }
+
+# True when some record carries a Layout field. When none does, nothing is
+# synthesised, so the caller skips the walk and its per-decl allocation —
+# the common case (any program without a Layout record, self-compile included).
+fn any_layout_record(decls: [Decl]) : Bool = match decls {
+  [] -> false
+  [d, ...rest] -> if decl_has_layout_record(d) { true } else { any_layout_record(rest) }
+}
+
+fn decl_has_layout_record(d: Decl) : Bool = match d {
+  DType(_, _, _, TBRecord(fields), _, _, _) -> match layout_fields_of(fields) {
+    Some(_) -> true
+    None -> false
+  }
+  DUnstable(inner, _, _) -> decl_has_layout_record(inner)
+  DConstructor(inner, _, _) -> decl_has_layout_record(inner)
+  _ -> false
+}
+
+fn syn_loop(decls: [Decl], acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> syn_loop(rest, ls_prepend_all(syn_for_decl(d), acc))
+}
+
+# Push each element of `xs` onto `acc` (reversing `xs`); paired with a
+# final `list_reverse` this keeps `syn_loop` O(n), not O(n^2) as a
+# per-step `list_append` onto the accumulator would be.
+fn ls_prepend_all(xs: [Decl], acc: [Decl]) : [Decl] = match xs {
+  [] -> acc
+  [h, ...rest] -> ls_prepend_all(rest, [h, ...acc])
+}
+
+fn syn_for_decl(d: Decl) : [Decl] = match d {
+  DType(_, name, _, body, _, _, mo) -> match body {
+    TBRecord(fields) -> match layout_fields_of(fields) {
+      Some(lfs) -> [d, build_encode_fn(name, lfs, mo), build_decode_fn(name, lfs, mo)]
+      None -> [d]
+    }
+    _ -> [d]
+  }
+  DUnstable(inner, _, _) -> wrap_synth(syn_for_decl(inner), d)
+  DConstructor(inner, _, _) -> wrap_synth(syn_for_decl(inner), d)
+  _ -> [d]
+}
+
+# A wrapped `DType` (`#[unstable]` / constructor node) keeps the
+# original wrapper as its first element; the generated fns follow bare
+# so they resolve at module scope like the refinement-pred fns do.
+fn wrap_synth(inner_result: [Decl], original: Decl) : [Decl] = match inner_result {
+  [_, ...gen] -> [original, ...gen]
+  [] -> [original]
+}
+
+#[doc("The names of every Layout-bearing record in the decl stream - the types `encode`/`decode` may target. Drives the rewrite's redirect vs. reject decision.")]
+pub fn layout_type_names(decls: [Decl]) : [String] = ltn_loop(decls, [])
+
+fn ltn_loop(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match ltn_of(d) {
+    Some(n) -> ltn_loop(rest, [n, ...acc])
+    None -> ltn_loop(rest, acc)
+  }
+}
+
+fn ltn_of(d: Decl) : Option[String] = match d {
+  DType(_, name, _, body, _, _, _) -> match body {
+    TBRecord(fields) -> match layout_fields_of(fields) { Some(_) -> Some(name) None -> None }
+    _ -> None
+  }
+  DUnstable(inner, _, _) -> ltn_of(inner)
+  DConstructor(inner, _, _) -> ltn_of(inner)
+  _ -> None
+}
+
+
