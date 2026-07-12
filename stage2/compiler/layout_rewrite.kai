@@ -1,0 +1,307 @@
+# compiler.layout_rewrite - redirect encode/decode calls to the
+# generated per-type serialiser. Runs post-inference, pre-monomorphise.
+# Sum-type variants (LRE/LRK/...) are positional to avoid bundle-wide
+# field collisions; lr_-prefixed helpers avoid fn-vs-binder shadows.
+
+import compiler.util
+import compiler.ast
+import compiler.diag
+import compiler.layout_synth
+
+# A bare `encode`/`decode` call the rewrite could not redirect: its
+# name, source position, and which slot (argument/result) was wrong.
+#[doc("A non-redirectable `encode`/`decode` call: op name, slot (argument/result), and source line/col.")]
+pub type BadLayoutCall = BLC(String, String, Int, Int)
+#                            name    slot    line col
+
+#[doc("The op name (`encode`/`decode`) of a bad layout call.")]
+pub fn blc_name(b: BadLayoutCall) : String = match b { BLC(n, _, _, _) -> n }
+#[doc("Which slot (argument/result) failed the Layout-bearing check.")]
+pub fn blc_slot(b: BadLayoutCall) : String = match b { BLC(_, s, _, _) -> s }
+#[doc("Source line of a bad layout call.")]
+pub fn blc_line(b: BadLayoutCall) : Int = match b { BLC(_, _, l, _) -> l }
+#[doc("Source column of a bad layout call.")]
+pub fn blc_col(b: BadLayoutCall) : Int = match b { BLC(_, _, _, c) -> c }
+
+# The rewritten decls plus the calls that could not be redirected.
+# Keyed on `[Decl]` (not `TypedProgram`) so this module need not import
+# `infer` - importing it pulled the module past `infer` in the bundle
+# and miscompiled the typer's refinement-narrowing. The driver wraps
+# the decls back into its `TypedProgram`.
+#[doc("The rewrite result: the transformed decls plus every call that could not be redirected.")]
+pub type RewriteOut = RWO([Decl], [BadLayoutCall])
+
+#[doc("The rewritten decl stream of a `RewriteOut`.")]
+pub fn rwo_decls(r: RewriteOut) : [Decl] = match r { RWO(d, _) -> d }
+#[doc("The non-redirectable calls collected by a `RewriteOut`.")]
+pub fn rwo_bad(r: RewriteOut) : [BadLayoutCall] = match r { RWO(_, b) -> b }
+
+# Per-payload result variants (positional, collision-proof).
+type LrDecls = LRD([Decl], [BadLayoutCall])
+type LrDecl  = LR1(Decl, [BadLayoutCall])
+type LrExpr  = LRE(Expr, [BadLayoutCall])
+type LrKind  = LRK(ExprKind, [BadLayoutCall])
+type LrList  = LRL([Expr], [BadLayoutCall])
+type LrOpt   = LRO(Option[Expr], [BadLayoutCall])
+type LrArms  = LRA([Arm], [BadLayoutCall])
+type LrFlds  = LRF([FieldInit], [BadLayoutCall])
+type LrElms  = LRM([ListElem], [BadLayoutCall])
+type LrStmts = LRSS([Stmt], [BadLayoutCall])
+type LrStmt  = LRS(Stmt, [BadLayoutCall])
+
+#[doc("""
+Rewrite every `encode`/`decode` call to its generated per-type
+serialiser. `layout_types` is the set of record names a
+`__layout_encode_/decode_` fn was synthesised for; a call whose target
+is not in that set is left bare and returned in the bad list for the
+driver to report.
+""")]
+pub fn rewrite_layout_calls(decls: [Decl], layout_types: [String]) : RewriteOut {
+  match lr_decls(decls, layout_types, [], []) {
+    LRD(ds, bad) -> RWO(ds, list_reverse(bad))
+  }
+}
+
+#[doc("Report every non-redirectable `encode`/`decode` call against its source position; returns the error count for the driver's gate.")]
+pub fn report_bad_layout_calls(file: String, bad: [BadLayoutCall]) : Int / Console + File =
+  lr_report(file, bad, 0)
+
+fn lr_report(file: String, bad: [BadLayoutCall], errs: Int) : Int / Console + File = match bad {
+  [] -> errs
+  [b, ...rest] -> {
+    diag_error(file, blc_line(b), blc_col(b),
+      concat_all(["`", blc_name(b), "` needs a Layout-bearing record: the ", blc_slot(b),
+                  " is not a record whose fields all carry a `<be>`/`<le>` byte-order habitant"]))
+    lr_report(file, rest, errs + 1)
+  }
+}
+
+fn lr_decls(decls: [Decl], lt: [String], acc: [Decl], bad: [BadLayoutCall]) : LrDecls = match decls {
+  [] -> LRD(list_reverse(acc), bad)
+  [d, ...rest] -> match lr_decl(d, lt, bad) {
+    LR1(d1, bad1) -> lr_decls(rest, lt, [d1, ...acc], bad1)
+  }
+}
+
+fn lr_decl(d: Decl, lt: [String], bad: [BadLayoutCall]) : LrDecl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) -> match lr_expr(body, lt, bad) {
+    LRE(e1, bad1) -> LR1(DFn(pub_, n, tps, ps, ret, row, e1, l, c, mo), bad1)
+  }
+  DTest(desc, body, l, c) -> match lr_expr(body, lt, bad) {
+    LRE(e1, bad1) -> LR1(DTest(desc, e1, l, c), bad1) }
+  DBench(desc, body, l, c) -> match lr_expr(body, lt, bad) {
+    LRE(e1, bad1) -> LR1(DBench(desc, e1, l, c), bad1) }
+  DCheck(desc, ps, body, l, c) -> match lr_expr(body, lt, bad) {
+    LRE(e1, bad1) -> LR1(DCheck(desc, ps, e1, l, c), bad1) }
+  _ -> LR1(d, bad)
+}
+
+# Bottom-up rewrite: recurse into sub-exprs first (threading the bad
+# list), then redirect this node if it is an `encode`/`decode` call.
+fn lr_expr(e: Expr, lt: [String], bad: [BadLayoutCall]) : LrExpr = match lr_children(e, lt, bad) {
+  LRE(ce, cbad) -> match ce.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar("encode") -> lr_redirect(ce, args_, lr_head(lr_arg_ty(args_)), lt, "encode", "argument", cbad)
+      EVar("decode") -> lr_redirect(ce, args_, lr_opt_inner(ce.ty), lt, "decode", "result", cbad)
+      _ -> LRE(ce, cbad)
+    }
+    _ -> LRE(ce, cbad)
+  }
+}
+
+# The resolved type of the sole argument (encode's target), or None.
+fn lr_arg_ty(args_: [Expr]) : Option[Ty] = match args_ {
+  [a] -> a.ty
+  _ -> None
+}
+
+# Redirect to `__layout_<kind>_T` when `T` is a synthesised Layout
+# type; otherwise record the call as bad for the driver to report.
+fn lr_redirect(e: Expr, args_: [Expr], target: Option[String], lt: [String],
+               name: String, slot: String, bad: [BadLayoutCall]) : LrExpr = match target {
+  Some(t) -> if list_has(lt, t) {
+    LRE(lr_retarget(e, lr_fn_for(name, t), args_), bad)
+  } else { LRE(e, [BLC(name, slot, e.line, e.col), ...bad]) }
+  None -> LRE(e, [BLC(name, slot, e.line, e.col), ...bad])
+}
+
+fn lr_fn_for(name: String, t: String) : String =
+  if name == "encode" { layout_encode_fn_name(t) } else { layout_decode_fn_name(t) }
+
+fn lr_retarget(e: Expr, fn_name: String, args_: [Expr]) : Expr =
+  lr_rebuild(e, ECall(mk_expr(EVar(fn_name), e.line, e.col), args_))
+
+# The nominal head name of a resolved type: `TyCon(_, "Header", _)` ->
+# `Some("Header")`. A list, function, var, or primitive is None.
+fn lr_head(ot: Option[Ty]) : Option[String] = match ot {
+  Some(t) -> match t { TyCon(_, name, _) -> Some(name) _ -> None }
+  None -> None
+}
+
+# The `T` of an `Option[T]` result type, for the decode target.
+fn lr_opt_inner(ot: Option[Ty]) : Option[String] = match ot {
+  Some(t) -> match t {
+    TyCon(_, "Option", [inner]) -> lr_head(Some(inner))
+    _ -> None
+  }
+  None -> None
+}
+
+fn lr_rebuild(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# --- child recursion, threading the bad-call list ---
+# A hand-written walk over the ExprKinds that carry sub-exprs. It
+# mirrors `dsg_map_expr_kind` but accumulates the bad list; the two
+# stay in sync because both enumerate the same composite arms.
+
+fn lr_children(e: Expr, lt: [String], bad: [BadLayoutCall]) : LrExpr = match lr_kind(e.kind, lt, bad) {
+  LRK(k1, bad1) -> LRE(lr_rebuild(e, k1), bad1)
+}
+
+# One-sub-expr arm: recurse into `x`, rebuild `k` from the result via
+# `mk`, thread the bad list. Collapses the ~10 single-child arms.
+fn lr_one(x: Expr, lt: [String], bad: [BadLayoutCall], mk: (Expr) -> ExprKind) : LrKind =
+  match lr_expr(x, lt, bad) { LRE(x1, bad1) -> LRK(mk(x1), bad1) }
+
+fn lr_kind(k: ExprKind, lt: [String], bad: [BadLayoutCall]) : LrKind = match k {
+  ECall(callee, args_) -> lr_ecall(callee, args_, lt, bad)
+  EField(base, name) -> lr_one(base, lt, bad, (x) => EField(x, name))
+  EIndex(a, b) -> lr_pair(a, b, lt, bad, (x, y) => EIndex(x, y))
+  EBinop(op, a, b) -> lr_pair(a, b, lt, bad, (x, y) => EBinop(op, x, y))
+  EUnop(op, x) -> lr_one(x, lt, bad, (x1) => EUnop(op, x1))
+  EIf(c, t_, eo) -> lr_eif(c, t_, eo, lt, bad)
+  EMatch(scr, arms) -> lr_ematch(scr, arms, lt, bad)
+  ELambda(ps, b) -> lr_one(b, lt, bad, (b1) => ELambda(ps, b1))
+  ERecordLit(name, fs) -> match lr_fields(fs, lt, bad, []) {
+    LRF(f1, bad1) -> LRK(ERecordLit(name, f1), bad1) }
+  EList(els) -> match lr_elems(els, lt, bad, []) {
+    LRM(e1, bad1) -> LRK(EList(e1), bad1) }
+  ERange(a, b, step) -> lr_erange(a, b, step, lt, bad)
+  EBlock(stmts, tail) -> lr_eblock(stmts, tail, lt, bad)
+  EPipe(a, b) -> lr_pair(a, b, lt, bad, (x, y) => EPipe(x, y))
+  EMapPipe(a, b) -> lr_pair(a, b, lt, bad, (x, y) => EMapPipe(x, y))
+  EFlatMapPipe(a, b) -> lr_pair(a, b, lt, bad, (x, y) => EFlatMapPipe(x, y))
+  EFilterPipe(a, b) -> lr_pair(a, b, lt, bad, (x, y) => EFilterPipe(x, y))
+  ELitUnit(inner, u) -> lr_one(inner, lt, bad, (i1) => ELitUnit(i1, u))
+  EBang(inner) -> lr_one(inner, lt, bad, (i1) => EBang(i1))
+  EIntrinsic(name, args_) -> match lr_list(args_, lt, bad, []) {
+    LRL(a1, bad1) -> LRK(EIntrinsic(name, a1), bad1) }
+  EHandle(body, en, et, io, ao, cls, ro) ->
+    lr_one(body, lt, bad, (b1) => EHandle(b1, en, et, io, ao, cls, ro))
+  _ -> LRK(k, bad)
+}
+
+fn lr_ecall(callee: Expr, args_: [Expr], lt: [String], bad: [BadLayoutCall]) : LrKind =
+  match lr_expr(callee, lt, bad) {
+    LRE(c1, bad1) -> match lr_list(args_, lt, bad1, []) {
+      LRL(a1, bad2) -> LRK(ECall(c1, a1), bad2)
+    }
+  }
+
+fn lr_eif(c: Expr, t_: Expr, eo: Option[Expr], lt: [String], bad: [BadLayoutCall]) : LrKind =
+  match lr_expr(c, lt, bad) {
+    LRE(c1, bad1) -> match lr_expr(t_, lt, bad1) {
+      LRE(t1, bad2) -> match lr_opt(eo, lt, bad2) {
+        LRO(e1, bad3) -> LRK(EIf(c1, t1, e1), bad3)
+      }
+    }
+  }
+
+fn lr_ematch(scr: Expr, arms: [Arm], lt: [String], bad: [BadLayoutCall]) : LrKind =
+  match lr_expr(scr, lt, bad) {
+    LRE(s1, bad1) -> match lr_arms(arms, lt, bad1, []) {
+      LRA(a1, bad2) -> LRK(EMatch(s1, a1), bad2)
+    }
+  }
+
+fn lr_erange(a: Expr, b: Expr, step: Option[Expr], lt: [String], bad: [BadLayoutCall]) : LrKind =
+  match lr_expr(a, lt, bad) {
+    LRE(a1, bad1) -> match lr_expr(b, lt, bad1) {
+      LRE(b1, bad2) -> match lr_opt(step, lt, bad2) {
+        LRO(s1, bad3) -> LRK(ERange(a1, b1, s1), bad3)
+      }
+    }
+  }
+
+fn lr_eblock(stmts: [Stmt], tail: Option[Expr], lt: [String], bad: [BadLayoutCall]) : LrKind =
+  match lr_stmts(stmts, lt, bad, []) {
+    LRSS(s1, bad1) -> match lr_opt(tail, lt, bad1) {
+      LRO(t1, bad2) -> LRK(EBlock(s1, t1), bad2)
+    }
+  }
+
+fn lr_list(es: [Expr], lt: [String], bad: [BadLayoutCall], acc: [Expr]) : LrList = match es {
+  [] -> LRL(list_reverse(acc), bad)
+  [e, ...rest] -> match lr_expr(e, lt, bad) {
+    LRE(e1, bad1) -> lr_list(rest, lt, bad1, [e1, ...acc]) }
+}
+
+fn lr_pair(a: Expr, b: Expr, lt: [String], bad: [BadLayoutCall],
+           mk: (Expr, Expr) -> ExprKind) : LrKind = match lr_expr(a, lt, bad) {
+  LRE(a1, bad1) -> match lr_expr(b, lt, bad1) {
+    LRE(b1, bad2) -> LRK(mk(a1, b1), bad2)
+  }
+}
+
+fn lr_opt(o: Option[Expr], lt: [String], bad: [BadLayoutCall]) : LrOpt = match o {
+  None -> LRO(None, bad)
+  Some(e) -> match lr_expr(e, lt, bad) {
+    LRE(e1, bad1) -> LRO(Some(e1), bad1) }
+}
+
+fn lr_arms(arms: [Arm], lt: [String], bad: [BadLayoutCall], acc: [Arm]) : LrArms = match arms {
+  [] -> LRA(list_reverse(acc), bad)
+  [a, ...rest] -> match a {
+    Arm(p, guard, body) -> match lr_opt(guard, lt, bad) {
+      LRO(g1, bad1) -> match lr_expr(body, lt, bad1) {
+        LRE(b1, bad2) -> lr_arms(rest, lt, bad2, [Arm(p, g1, b1), ...acc])
+      }
+    }
+  }
+}
+
+fn lr_fields(fs: [FieldInit], lt: [String], bad: [BadLayoutCall], acc: [FieldInit]) : LrFlds = match fs {
+  [] -> LRF(list_reverse(acc), bad)
+  [f, ...rest] -> match f {
+    FI(n, e) -> match lr_expr(e, lt, bad) {
+      LRE(e1, bad1) -> lr_fields(rest, lt, bad1, [FI(n, e1), ...acc]) }
+  }
+}
+
+fn lr_elems(els: [ListElem], lt: [String], bad: [BadLayoutCall], acc: [ListElem]) : LrElms = match els {
+  [] -> LRM(list_reverse(acc), bad)
+  [el, ...rest] -> match el {
+    ElPlain(e) -> match lr_expr(e, lt, bad) {
+      LRE(e1, bad1) -> lr_elems(rest, lt, bad1, [ElPlain(e1), ...acc]) }
+    ElSpread(e) -> match lr_expr(e, lt, bad) {
+      LRE(e1, bad1) -> lr_elems(rest, lt, bad1, [ElSpread(e1), ...acc]) }
+  }
+}
+
+fn lr_stmts(stmts: [Stmt], lt: [String], bad: [BadLayoutCall], acc: [Stmt]) : LrStmts = match stmts {
+  [] -> LRSS(list_reverse(acc), bad)
+  [s, ...rest] -> match lr_stmt(s, lt, bad) {
+    LRS(s1, bad1) -> lr_stmts(rest, lt, bad1, [s1, ...acc]) }
+}
+
+fn lr_stmt(s: Stmt, lt: [String], bad: [BadLayoutCall]) : LrStmt = match s {
+  SLet(p, ann, rhs) -> match lr_expr(rhs, lt, bad) {
+    LRE(r1, bad1) -> LRS(SLet(p, ann, r1), bad1) }
+  SVar(n, ann, rhs, l, c) -> match lr_expr(rhs, lt, bad) {
+    LRE(r1, bad1) -> LRS(SVar(n, ann, r1, l, c), bad1) }
+  SExprStmt(e) -> match lr_expr(e, lt, bad) {
+    LRE(e1, bad1) -> LRS(SExprStmt(e1), bad1) }
+  SAssert(c, m) -> match lr_expr(c, lt, bad) {
+    LRE(c1, bad1) -> match lr_opt(m, lt, bad1) {
+      LRO(m1, bad2) -> LRS(SAssert(c1, m1), bad2) }
+  }
+  SIndexAssign(b, i, v, l, c) -> match lr_expr(b, lt, bad) {
+    LRE(b1, bad1) -> match lr_expr(i, lt, bad1) {
+      LRE(i1, bad2) -> match lr_expr(v, lt, bad2) {
+        LRE(v1, bad3) -> LRS(SIndexAssign(b1, i1, v1, l, c), bad3)
+      }
+    }
+  }
+  SUse(_, _, _) -> LRS(s, bad)
+}
