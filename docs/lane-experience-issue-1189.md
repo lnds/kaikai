@@ -87,6 +87,34 @@ ways the code made obvious:
   `import compiler.layout_synth` / `layout_rewrite`. A bundle-only test would have
   missed this; tier0's stage2 selfhost caught it.
 
+- **The bare `encode`/`decode` builtin collides with a module's same-named fn.**
+  `encode`/`decode` are global builtins, so `import encoding.toml` brings a
+  `decode`/`encode` into scope that the resolver leaves as `EVar("decode")` —
+  indistinguishable by name from the Layout builtin. The rewrite must key on the
+  *resolved target type*, not the name: redirect only when the concrete target is
+  a synthesised Layout record (`list_has(layout_types, t)`); leave every other
+  `encode`/`decode` untouched. Keying on the name rejected `toml.decode` as
+  "not Layout-bearing" and broke the modular self-compile. This also deleted the
+  whole bad-call reporting path (`BadLayoutCall`, `report_bad_layout_calls`): a
+  non-Layout `encode`/`decode` is simply not ours to reject.
+
+- **A con-name literal in a list-pattern arm is outside the native subset.**
+  `TyCon(_, "Option", [inner])` — testing the con name AND binding the arg list in
+  the *same* arm — is a "mixed variant slot" the native backend cannot lower
+  (`list-in-multi-slot`, `interleaved test+bind`). The native-safe form is a
+  wildcard con name plus a head+spread on the arg list: `TyCon(_, _, [a, ...])`,
+  the exact shape `pipe_elem_ty` uses. `decode` always resolves to `Option[T]`, so
+  the first type-arg is `T` — the con name never needs testing. (A `[h, ...rest]`
+  helper factored out of the arm miscompiled the bundle a different way; the
+  inline `[a, ...]` in the arm is the one that lowers on both backends.)
+
+- **The bundle-single-TU miscompile bit twice more, both from short helper names.**
+  A `fn lr_first_ty` helper — perfectly exhaustive — made the *self-compiled*
+  compiler panic `non-exhaustive match` on any program that hit the layout rewrite.
+  Inlining its body into the arm fixed it. The recurring lesson: in the single-TU
+  bundle, prefer inlining a two-line pattern over a named helper when the helper
+  name is short and generic.
+
 - **The big time-sink: two bundle-namespacing miscompiles that broke an unrelated
   feature.** The stage2 bundle is ONE translation unit with no inter-module
   namespacing, so a name in a new module can collide globally and *silently
@@ -129,15 +157,39 @@ ways the code made obvious:
 - Native byte-exactness is asserted by the same fixture that runs on C; a dedicated
   native `.out.expected` is not separate (the sugars harness is C-only), but the
   roundtrip was verified on native manually and both print identical bytes.
-- The `layout_rewrite` child walk hand-mirrors `dsg_map_expr_kind`'s composite arms
-  (to thread the bad-call list); if a new `ExprKind` composite is added, both must be
-  updated. Noted at the walk site.
+- The `layout_rewrite` child walk hand-mirrors `dsg_map_expr_kind`'s composite arms;
+  if a new `ExprKind` composite is added, both must be updated. Noted at the walk site.
+
+- **The native backend SIGSEGVs when the *self-hosted native* compiler runs the
+  layout rewrite over a program that carries a Layout type.** Root cause is in the
+  native lowering, not the feature: the identical walker, compiled by the C
+  backend, runs flawlessly (all fixtures + decode byte-exact on both backends); the
+  native-built `kaic2-native` null-derefs (`EXC_BAD_ACCESS at 0x10`, offset-16 read
+  of a NULL node) while emitting C for any `.kai` with a non-empty `layout_types`.
+  The `rewrite_layout_calls` early-return (`layout_types == []` → `decls` untouched)
+  is correct on its own and covers every layout-free program — so the self-host
+  gate (whose sample has no layout) is green, byte-identical to the oracle. The
+  residual hole is the intersection *self-host × native × layout-bearing input*.
+  Repro is deterministic: build `kaic2-native` (the gate's link path), then
+  `kaic2-native --emit=c examples/sugars/kinds_layout_encode_decode.kai` → SIGSEGV;
+  the same file through the C-backed `kaic2` is byte-exact. The flat native stack
+  (`_kai_lam_28`, no frame pointers) and the offset-16 NULL read match the
+  raw-binder-into-boxed-consumer pattern the native boxing border has hit before.
+  This is a native-backend follow-up (issue #1201), not a feature defect; a fixture
+  that runs the above repro under CI is the gate the follow-up lane should land with.
 
 ## Cost vs. estimate
 
 The engine the brief budgeted (~150-200 LOC unifier) was **zero** — the biggest
 saving. The cost moved entirely to the codegen half the brief under-weighted:
-`layout_synth` (254 LOC, A) synthesises the fns, `layout_rewrite` (312 LOC, A+)
-redirects and rejects, plus the `bin_*` width/endian bricks in `protocols.kai`. The
+`layout_synth` (254 LOC, A) synthesises the fns, `layout_rewrite` (143 LOC, A+)
+redirects, plus the `bin_*` width/endian bricks in `protocols.kai`. The
 "generated kaikai, not per-backend codegen" decision is what kept native parity from
 doubling the work.
+
+`layout_rewrite` shrank from 312 to 143 LOC once the reject/report path went away:
+keying the rewrite on the resolved target type (redirect iff it is a Layout record)
+made a non-Layout `encode`/`decode` a non-event, so the whole `BadLayoutCall`
+threading — a tuple `(payload, bad-list)` woven through every walk helper — was dead
+weight. Removing it took the file from B- back to A+ and the walk from a
+result-variant maze to a plain structural map.
