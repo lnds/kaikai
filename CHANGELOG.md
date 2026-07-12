@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.7 (2026-07-12)
+
+### Added
+
+- **kinds**: public Composition theory + Layout kind with byte-exact encode/decode (#1199)
+
+### Fixed
+
+- **perceus**: converge native/C on the region RC/arena model (closes #1197) (#1198)
+
 ## v0.99.6 (2026-07-11)
 
 ### Fixed
