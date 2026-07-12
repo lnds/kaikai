@@ -1,7 +1,7 @@
 # Borrow annotations — `^` on parameters (design)
 
 **Status:** accepted design, pre-implementation. Consolidates the 2026-07-08
-design conversation. Part of the Orongo (1.0) scope together with the kind
+design conversation. Part of the Orongo scope together with the kind
 system (#1108). Prim-level borrowing already shipped (#1120); this document
 covers the generalization to user function parameters.
 

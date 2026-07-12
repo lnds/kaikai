@@ -13,7 +13,8 @@ A **functional**, **statically typed** programming language that compiles to
 
 Pre-1.0, **Hanga Roa** edition. The language is self-hosting and
 runs the full toolchain today; it is unstable until the Orongo
-(1.0) edition lands — see `docs/editions.md`.
+edition lands (Orongo ships as 0.100.x; the 1.0 label is postponed
+indefinitely) — see `docs/editions.md`.
 
 - **Bootstrap** (landed): the 3-stage chain builds from any `cc`.
   `stage1/kaic1` is the self-hosting kaikai-minimal compiler;

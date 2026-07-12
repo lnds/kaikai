@@ -5,7 +5,7 @@ Reviewed by asu (language architect), linus (pragmatism), eric (systems design).
 
 ## Why now
 
-LLVM is the definitive backend for 1.0 (Orongo); the C backend
+LLVM is the definitive backend for Orongo; the C backend
 (`stage0/runtime.h`) is the maturity oracle. Every LLVM-only divergence
 is a site where the production backend is wrong and the reference is
 right. The `tier1-backend-parity` gate (#575) is diagnostic, not a

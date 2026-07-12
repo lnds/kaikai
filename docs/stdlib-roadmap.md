@@ -224,9 +224,9 @@ critical path but needed for production-quality services.
    - Acceptance: `examples/stdlib/log_basic.kai` emits four
      levels, golden checks the stderr format.
 
-### Tier S3 — post-1.0 (Orongo era)
+### Tier S3 — post-Orongo
 
-Defer until after Orongo (1.0.0) ships. Each is significant
+Defer until after Orongo (0.100.x) ships. Each is significant
 design surface on its own.
 
 - ~~`net/udp` — `NetUdp` effect; `bind`, `send`, `recv`.~~
@@ -255,7 +255,7 @@ design surface on its own.
 ```
                   Hanga Roa milestone
                   ┌──────────────────────────────────┐
-  ──── 0.37.0 ───►│ m11 │ kai lsp ✓ │ reuse-IP ✓   │──► 1.0.0 (Orongo)
+  ──── 0.37.0 ───►│ m11 │ kai lsp ✓ │ reuse-IP ✓   │──► 0.100.0 (Orongo)
                   └──────────────────────────────────┘
                           │              │
         Tier S1 ──────────┘              │
@@ -265,7 +265,7 @@ design surface on its own.
         Tier S2 ─────────────────────────┘
         (crypto/hash+mac, random_secure, log)
 
-        Tier S3 ───────────────────────────────────► (post-1.0)
+        Tier S3 ───────────────────────────────────► (post-Orongo)
         (net/udp, net/dns, http2/3, crypto/aead, sql, parallel)
 ```
 
