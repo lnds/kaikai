@@ -77,14 +77,19 @@ path diverging from the oracle, not the feature being backend-specific.
 
 ## Fixtures added
 
-- `tools/test-native-selfhost-layout.sh` — feeds the native-built `kaic2` a
-  Layout-bearing program (`examples/sugars/kinds_layout_encode_decode.kai`,
-  non-empty `layout_types`), forcing the full layout-rewrite walk under the
-  native backend, and asserts the emitted C is byte-identical to the C-direct
-  oracle. Wired as `make -C stage2 test-native-selfhost-layout` and a
-  `tier1-native.yml` step in the `build-native` job.
-- This closes the self-host gate's blind spot: its sample (`println`) has no
-  Layout type, so `rewrite_layout_calls` early-returns and the walk never ran.
+- Extended `tools/test-native-selfhost-gate.sh`: after its trivial-sample
+  SELF-COMPILE, it re-runs the SAME native binary over a Layout-bearing program
+  (`examples/sugars/kinds_layout_encode_decode.kai`, non-empty `layout_types`),
+  forcing the full layout-rewrite walk under the native backend, and asserts
+  byte-identical C vs the oracle. This closes the gate's blind spot: its sample
+  (`println`) has no Layout type, so `rewrite_layout_calls` early-returns and the
+  walk never ran.
+- Folded INTO the existing gate rather than a separate step/script — the first
+  cut was a standalone `test-native-selfhost-layout.sh` that rebuilt kaic2 +
+  main.o + link from scratch, doubling the native build in the same job and
+  blowing the 25-min budget (CI timeout on PR #1203). Reusing the binary the
+  gate already links costs a `--emit=c` + diff (seconds), not minutes. Also
+  bumped `build-native` timeout 25 → 35 as headroom.
 
 Coverage gap: the gate is native-only (SKIPs without libLLVM), so it lives in
 `tier1-native.yml`, never in tier1's `TEST_LIGHT_TARGETS` (tier1 runs on Linux
