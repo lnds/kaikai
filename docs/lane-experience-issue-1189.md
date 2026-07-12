@@ -115,6 +115,21 @@ ways the code made obvious:
   bundle, prefer inlining a two-line pattern over a named helper when the helper
   name is short and generic.
 
+- **Seeding `encode`/`decode` as core names mis-routed a user fn on the native
+  emit.** The rewrite fix keys on the resolved *type* (a bare `encode`/`decode`
+  reaching the emitter is a user fn), but the native emitter's `ncall_is_core`
+  keys on the *name*: it maps any `core_names` entry to `kaix_core_<nm>`, and I
+  had added `encode`/`decode` to `core_names` for resolution. So a user's own
+  `fn decode` (e.g. the huffman demo) lowered to `kaix_core_decode` — a forwarder
+  that does not exist — and the native link failed with an undefined symbol. The C
+  emitter never hit this because its core-prim table (`EP`) is a *separate* list of
+  prims-with-a-real-symbol, and `encode`/`decode` were never in it. The two
+  emitters disagreed on what "core" means: resolution-visible vs.
+  has-a-runtime-shim. Fix: `ncall_is_core` excludes `encode`/`decode` — they are
+  typer builtins the rewrite consumes, never runtime prims, so a bare one at the
+  emitter is always the user symbol. This is the native-emit half of the same
+  shadowing the type-keyed rewrite already gives `toml.decode`.
+
 - **The big time-sink: two bundle-namespacing miscompiles that broke an unrelated
   feature.** The stage2 bundle is ONE translation unit with no inter-module
   namespacing, so a name in a new module can collide globally and *silently
@@ -149,6 +164,10 @@ ways the code made obvious:
   byte-exact roundtrip + short-input-None (test 3), run through the C backend by the
   sugars harness.
 - `docs/info/kinds.md` code blocks (positive + `kaikai-neg`) under test-info-blocks.
+- `examples/minimal/encode_decode_user_fn.kai` — a user `fn encode`/`fn decode`
+  with no Layout type in scope, run through the C/native parity harness so the
+  native emit lowers the shadowing call to the user symbol on both backends (the
+  regression that broke the huffman demo on the native shard).
 
 ## Coverage gaps / follow-ups
 
