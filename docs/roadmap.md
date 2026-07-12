@@ -16,16 +16,17 @@ the arc from public face → daily life → ceremonial culmination →
 horizon beyond.
 
 **Version-to-edition map** (kept explicit so there is no ambiguity
-when discussing 1.0 readiness):
+when discussing Orongo readiness):
 
 - **Tongariki** — pre-1.0 MVP edition, closed 2026-05-02.
 - **Hanga Roa** — current pre-1.0 edition. HEAD `0.79.0` sits inside
-  it. Spans the `0.30.0` → `<1.0` arc.
-- **Orongo** — **1.0.0** ships under this edition name. The edition
+  it. Spans the `0.30.0` → `<0.100.0` arc.
+- **Orongo** — ships as **0.100.x** under this edition name (the 1.0
+  label is postponed indefinitely). The edition
   boundary is the public stability commitment: surface code written
   against Orongo is preserved across patch / minor bumps within the
   edition.
-- **Anakena** — post-1.0 horizon.
+- **Anakena** — post-Orongo horizon.
 
 ## Status snapshot
 
@@ -280,8 +281,7 @@ hole warning diagnostics) shipped v0.77.0 → v0.79.0
 per-call-site dropmask`, closed; #120 is `Perceus: opt-in
 regions for parser/lexer scratch buffers`, open) and have been
 removed. **REPL is removed permanently** — see #406 and
-`docs/decisions/repl-removal-2026-05-09.md`. Not in v1.0, not in
-v1.x, not on the roadmap. `kai run` + `kai watch` cover the
+`docs/decisions/repl-removal-2026-05-09.md`. Not in any edition, not on the roadmap. `kai run` + `kai watch` cover the
 ad-hoc evaluation workflow.
 
 **Scope — precondition work (landed early, 2026-05-03 → 2026-05-05)**:
@@ -443,21 +443,22 @@ all six DoD items met, Hanga Roa's original scope is closed; the
 modularization, streams) is additional edition-window work, not a
 blocker. Remaining notes:
 
-- **DoD #3b** RB-tree perf is **explicitly v1.0-trajectory**, not
+- **DoD #3b** RB-tree perf is **explicitly Orongo-trajectory**, not
   Hanga Roa (decided 2026-05-09; see the §DoD #3b note). Its three
   levers all shipped: #383 (Int unboxing), #384 (variant-reuse
   borrowed-binds, closed 2026-06-03), #593 (primitive-slot extract
   raw, closed 2026-06-03). Current measured state: 2.64× C wall.
 
-### Orongo — 1.0.0
+### Orongo — 0.100.x
 
 The ceremonial village on Rano Kau, where the birdman cult
-sealed the year's transitions. Mark the language as 1.0.0.
+sealed the year's transitions. Ships as 0.100.0; the 1.0 label is
+postponed indefinitely.
 
 The scope below supersedes the original draft (which gated 1.0 on a
 multi-thread scheduler and a package registry); the authoritative
 remaining-gates list lives in `docs/editions.md` and this section
-mirrors it. The two 1.0 pillars the edition was re-scoped around
+mirrors it. The two Orongo pillars the edition was re-scoped around
 (2026-07-08) have both **shipped**:
 
 - **Kind engine** (#1108, PR #1133) — user abelian kinds, per-kind
@@ -467,7 +468,7 @@ mirrors it. The two 1.0 pillars the edition was re-scoped around
   non-consuming indirect calls (closure RC eliminated), relaxed
   read-path inference, modular-safe.
 
-**Remaining scope (the real 1.0 gates):**
+**Remaining scope (the real Orongo gates):**
 
 - **The surface pin + `EDITION` flip** — the deliberate act. Two
   surface decisions are explicitly deferred to this moment, to be
@@ -489,7 +490,7 @@ mirrors it. The two 1.0 pillars the edition was re-scoped around
   `Vec` surface stage 3 (#1150, shipped: O(1) slices with in-place re-slice, literal minting, fused pipeline collect).
 - **The authorability benchmark** — the Tier 3 acceptance measured
   head-to-head (kaikai vs Rust vs Go, success rate per compile
-  round; harness repo exists, task set in authoring). 1.0 ships
+  round; harness repo exists, task set in authoring). Orongo ships
   with the number published, not asserted.
 
 **Definition of Done:**
