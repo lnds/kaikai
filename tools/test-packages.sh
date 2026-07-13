@@ -200,6 +200,10 @@ run_check_script "add_failure"        "add_failure/check.sh"
 run_check_script "init_invalid_names" "init_invalid_names/check.sh"
 run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
 
+# git/tag documented alias resolves; unrecognised dep table bails loudly.
+run_check_script "git_tag_alias"      "git_tag_alias/check.sh"
+run_check_script "unknown_dep_form"   "unknown_dep_form/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
@@ -232,6 +236,7 @@ run_parity  "parity-cross_pkg_effects"  "cross_package_effects/consumer"
 run_parity  "parity-same_name_shadow"   "same_name_shadowing"
 run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
 run_parity  "parity-auto_install"       "auto_install"
+run_parity  "parity-git_tag_alias"      "git_tag_alias"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then

@@ -30,5 +30,6 @@ render simple_dep
 render transitive
 render lockfile_reproducibility
 render auto_install
+render git_tag_alias
 
 echo "render-fixtures.sh: OK"
