@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.9 (2026-07-13)
+
+### Changed
+
+- **emit**: per-module native codegen with content-addressed object cache (closes #989) (#1204)
+- **ci**: route shard-1 self-hosts through the cached c-modular path (#1206)
+
 ## v0.99.8 (2026-07-12)
 
 ### Fixed
