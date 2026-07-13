@@ -1875,7 +1875,10 @@ int main(int argc, char **argv) {
     kai_set_args(argc, argv);
     _kai_proto_init_llvm();
     kai_main_install_defaults();
-    KaiValue *result = kai_main();
+    /* M:N — under KAI_THREADS>1 kai_main runs as a fiber across the
+     * worker pool; at N=1 kai_sched_bootstrap is exactly kai_main().
+     * Mirrors the C backend's emit_main_wrapper. */
+    KaiValue *result = kai_sched_bootstrap(kai_main);
     kai_main_teardown_defaults();
     kai_decref(result);
     return 0;
