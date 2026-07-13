@@ -1,0 +1,451 @@
+# compiler/closure_spec.kai — specialise higher-order calls on known
+# env-empty pure closures. When a root-file call passes a pure lambda (or
+# a top-level fn) to a higher-order callee, emit a per-call-site copy with
+# the functional parameter beta-reduced into the body: the per-element
+# indirect closure call inside the monomorphised loop collapses to the
+# inlined body, and the fold's accumulator unboxes like hand-written
+# recursion.
+#
+# Runs before monomorphise on the typed AST. The spec closes its effect
+# row to pure (the inlined stage performs nothing), so mono grounds it to
+# concrete types and unbox lands the loop's scalars; the caller's TCO/TRMC
+# shape is recomputed downstream. An effectful or capturing stage, or one
+# reached from a non-root call site, is left indirect.
+
+import compiler.ast
+import compiler.util
+import compiler.chars
+import compiler.pipe_fusion
+import compiler.closure_spec_ast
+import compiler.closure_spec_emit
+
+#[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
+pub fn closure_spec_pass(ds: [Decl]) : [Decl] = {
+  let hofns = collect_hofns(ds)
+  if list_length(hofns) == 0 { ds }
+  else { cspec_fixpoint(ds, hofns, [], cspec_fuel()) }
+}
+
+# Specialisation propagates across fn boundaries: specialising `foldl`
+# on lambda L rewrites its body's `foldl_loop(..., f)` — where `f` is
+# now bound to L — into a fresh higher-order call that discovers a new
+# request. A bounded fixpoint drains the worklist; the fuel is a
+# runaway backstop, never reached for real programs (the (fn, site)
+# key set is finite).
+fn cspec_fuel() : Int = 64
+
+# Discover + emit specs to a fixpoint over the UN-rewritten decls, then
+# rewrite once at the end. A newly emitted spec's body still carries
+# the raw `inner(..., L)` call whose request the next round must find;
+# rewriting inside the loop would retarget it away before it is seen,
+# stranding the transitive spec (`foldl → foldl_loop`).
+fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int) : [Decl] =
+  if fuel <= 0 { rewrite_all(ds, ds, hofns) }
+  else {
+    let reqs = dedup_reqs(cs_collect_decls(ds, ds, hofns), emitted, [])
+    if list_length(reqs) == 0 { rewrite_all(ds, ds, hofns) }
+    else {
+      let specs = map(reqs, emit_cspec)
+      let ds1 = list_append(ds, specs)
+      let hofns1 = list_append(hofns, filter_hofns(specs))
+      let emitted1 = list_append(emitted, map(reqs, req_spec_name))
+      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1)
+    }
+  }
+
+fn req_spec_name(r: CSpecReq) : String =
+  match r { CSReq(callee, _, ca, _, _) -> cspec_name(cs_decl_name(callee), closure_disc(ca)) }
+
+fn dedup_reqs(reqs: [CSpecReq], emitted: [String], seen: [String]) : [CSpecReq] =
+  match reqs {
+    [] -> []
+    [r, ...rest] -> {
+      let nm = req_spec_name(r)
+      if list_has(emitted, nm) or list_has(seen, nm) { dedup_reqs(rest, emitted, seen) }
+      else { [r, ...dedup_reqs(rest, emitted, [nm, ...seen])] }
+    }
+  }
+
+fn filter_hofns(specs: [Decl]) : [Decl] =
+  match specs {
+    [] -> []
+    [d, ...rest] -> if decl_is_hofn(d) { [d, ...filter_hofns(rest)] } else { filter_hofns(rest) }
+  }
+
+# ---- higher-order fn discovery ----
+
+fn collect_hofns(ds: [Decl]) : [Decl] =
+  match ds {
+    [] -> []
+    [d, ...rest] -> if decl_is_hofn(d) { [d, ...collect_hofns(rest)] } else { collect_hofns(rest) }
+  }
+
+# A higher-order fn declares at least one parameter whose annotated
+# type is a function type. That parameter is the inlining target.
+fn decl_is_hofn(d: Decl) : Bool =
+  first_fn_param_idx(decl_params(d), 0) >= 0
+
+fn is_fn_param(p: Param) : Bool =
+  match p.ptype {
+    Some(te) -> match te.tkind { TyFn(_, _, _) -> true  _ -> false }
+    None     -> false
+  }
+
+# Index of the first functional parameter, or -1 if none.
+fn first_fn_param_idx(ps: [Param], i: Int) : Int =
+  match ps {
+    [] -> 0 - 1
+    [p, ...rest] -> if is_fn_param(p) { i } else { first_fn_param_idx(rest, i + 1) }
+  }
+
+# Find the higher-order fn a call resolves to. A qualified call
+# `mod.foldl` binds to the `foldl` DFn declared in `mod` — the same
+# name in another module (`vec.foldl` vs `list.foldl`) is a different
+# fn with its own functional-param index, so the module must match.
+fn lookup_hofn(hofns: [Decl], modn: Option[String], name: String) : Option[Decl] =
+  match modn {
+    Some(m) -> match lookup_hofn_in(hofns, m, name) {
+      Some(d) -> Some(d)
+      None    -> lookup_hofn_any(hofns, name)
+    }
+    None -> lookup_hofn_any(hofns, name)
+  }
+
+fn lookup_hofn_in(hofns: [Decl], modn: String, name: String) : Option[Decl] =
+  match hofns {
+    [] -> None
+    [d, ...rest] ->
+      if cs_decl_name(d) == name and mo_is(cs_decl_mo(d), modn) { Some(d) }
+      else { lookup_hofn_in(rest, modn, name) }
+  }
+
+fn lookup_hofn_any(hofns: [Decl], name: String) : Option[Decl] =
+  match hofns {
+    [] -> None
+    [d, ...rest] -> if cs_decl_name(d) == name { Some(d) } else { lookup_hofn_any(rest, name) }
+  }
+
+# A bare-reference argument specialises only against a top-level
+# (tparam-free) fn: it has no capture environment.
+# Resolve a bare fn reference to its single top-level decl. A name with
+# MORE THAN ONE definition is a protocol op (`cmp`, `show` — one `fn cmp`
+# per impl type) that reifies into a runtime dispatcher; inlining one
+# impl's body would break dispatch for every other type. Only a name with
+# exactly one tparam-free decl is a plain fn safe to inline.
+fn lookup_named_fn(ds: [Decl], name: String) : Option[Decl] =
+  if count_named_fn(ds, name, 0) == 1 { first_named_fn(ds, name) } else { None }
+
+fn count_named_fn(ds: [Decl], name: String, acc: Int) : Int =
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, n, tps, _, _, _, _, _, _, _) ->
+        if n == name and list_length(tps) == 0 { count_named_fn(rest, name, acc + 1) }
+        else { count_named_fn(rest, name, acc) }
+      _ -> count_named_fn(rest, name, acc)
+    }
+  }
+
+fn first_named_fn(ds: [Decl], name: String) : Option[Decl] =
+  match ds {
+    [] -> None
+    [d, ...rest] -> match d {
+      DFn(_, n, tps, _, _, _, _, _, _, _) ->
+        if n == name and list_length(tps) == 0 { Some(d) } else { first_named_fn(rest, name) }
+      _ -> first_named_fn(rest, name)
+    }
+  }
+
+# ---- request collection (read-only walk) ----
+
+# Only root-file decls (`mo == None`) seed specialisation requests: the
+# stdlib/compiler's own internal higher-order call sites (`mo != None`)
+# carry elaborate types whose specs miscompile, and the user's win comes
+# entirely from root call sites. A generated spec is itself `mo == None`,
+# so the transitive chain (a fold's spec calling its loop) is still walked.
+fn cs_collect_decls(ds: [Decl], all: [Decl], hofns: [Decl]) : [CSpecReq] =
+  match ds {
+    [] -> []
+    [d, ...rest] -> {
+      let here = match cs_decl_mo(d) { None -> cs_collect_expr(decl_body(d), all, hofns)  Some(_) -> [] }
+      list_append(here, cs_collect_decls(rest, all, hofns))
+    }
+  }
+
+# Bottom-up read walk: a request per specialisable `G(args)`. Children
+# first so nested folds are discovered too.
+fn cs_collect_expr(e: Expr, all: [Decl], hofns: [Decl]) : [CSpecReq] = {
+  let kid_reqs = collect_kids(cspec_kids(e), all, hofns)
+  list_append(kid_reqs, site_req(e, all, hofns))
+}
+
+fn collect_kids(es: [Expr], all: [Decl], hofns: [Decl]) : [CSpecReq] =
+  match es {
+    [] -> []
+    [k, ...rest] -> list_append(cs_collect_expr(k, all, hofns), collect_kids(rest, all, hofns))
+  }
+
+# A specialisation request for this node when it is a higher-order call
+# on an env-empty closure; empty otherwise.
+fn site_req(e: Expr, all: [Decl], hofns: [Decl]) : [CSpecReq] =
+  match e.kind {
+    ECall(callee, args_) -> match callee_ref(callee) {
+      Some(CRef(modn, name)) -> match lookup_hofn(hofns, modn, name) {
+        Some(hd) -> req_of(e, args_, hd, all)
+        None     -> []
+      }
+      None -> []
+    }
+    _ -> []
+  }
+
+fn req_of(e: Expr, args_: [Expr], hd: Decl, all: [Decl]) : [CSpecReq] = {
+  let idx = first_fn_param_idx(decl_params(hd), 0)
+  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { [] }
+  else {
+    match classify_closure(elem_at(args_, idx), all) {
+      Some(ca) -> [CSReq(hd, idx, ca, e.line, e.col)]
+      None     -> []
+    }
+  }
+}
+
+# ---- call-site rewrite (pure map) ----
+
+fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl]) : [Decl] =
+  map(ds, (d) => rewrite_decl(d, all, hofns))
+
+# Retarget call sites only in the decls that seeded requests — root-file
+# decls and the generated specs (all `mo == None`). A stdlib/compiler
+# decl is left untouched: no spec was discovered for its internal calls.
+fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl]) : Decl =
+  match d {
+    DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> match mo {
+      None    -> DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, None)
+      Some(_) -> d
+    }
+    _ -> d
+  }
+
+# Rewrite bottom-up: children via the shared functor, then this node.
+fn rewrite_expr(e: Expr, all: [Decl], hofns: [Decl]) : Expr = {
+  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, all, hofns)),
+                  line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+  retarget_site(e1, all, hofns)
+}
+
+# A specialisable higher-order call `G(args)` becomes `G__cspec__L_C(rest)`
+# with the functional argument dropped; other nodes pass through.
+fn retarget_site(e: Expr, all: [Decl], hofns: [Decl]) : Expr =
+  match e.kind {
+    ECall(callee, args_) -> match callee_ref(callee) {
+      Some(CRef(modn, name)) -> match lookup_hofn(hofns, modn, name) {
+        Some(hd) -> retarget_call(e, callee, args_, hd, all)
+        None     -> e
+      }
+      None -> e
+    }
+    _ -> e
+  }
+
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, all: [Decl]) : Expr = {
+  let idx = first_fn_param_idx(decl_params(hd), 0)
+  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { e }
+  else {
+    match classify_closure(elem_at(args_, idx), all) {
+      Some(ca) -> {
+        let nm = cspec_name(cs_decl_name(hd), closure_disc(ca))
+        Expr { kind: ECall(retarget_callee(callee, nm), drop_at(args_, idx)),
+               line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+      }
+      None -> e
+    }
+  }
+}
+
+# A callee is safe to specialise only if every type variable in its
+# result is grounded by mono from an argument — i.e. it also appears in a
+# surviving parameter's type. A type variable that lives ONLY in the
+# result (`b` in `map_sum: (a)->b : b`, a collect's or `flat_map`'s
+# element type) stays a tyvar after the spec closes its row, so mono
+# cannot land it; the loop boxes, and an arity-0 protocol op resolved
+# through it (`zero()`) or an RC-shape it disturbs then misbehaves.
+# Declining keeps those calls indirect (correct). Type variables are
+# lowercase-initial names (declared `[a, b]` OR implicit); concrete types
+# (`Int`, `Vec`) are capital and never match. The effect row is exempt —
+# it lives in the row, not a `TyName`, and the spec closes it.
+fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
+  match hd {
+    DFn(_, n, _, ps, rt, _, body, _, _, _) -> {
+      let mono_ok = not any_return_only(drop_param_at(ps, idx), rt)
+      let flow_ok = functional_param_safe(body, param_name_at(ps, idx), n)
+      mono_ok and flow_ok
+    }
+    _ -> false
+  }
+
+# The functional parameter's flow must not fork across a function
+# boundary. Within one callee body, if the param is BOTH applied
+# (`key(h)`) AND passed as a value to a DIFFERENT fn (`group_by_loop`),
+# specialising forces a second independent specialisation that re-inlines
+# the same closure transitively; the two specialisations' RC bookkeeping
+# does not reconcile and a use-after-free results. A body that only passes
+# it to another fn (a fold's `foldl_loop(..., f)` — no application) is
+# safe: the value flows through untouched and the inner spec inlines it
+# once. A body that applies it and passes it only to its OWN recursion (a
+# fold's loop step `foldl_loop(..., f(acc,x), f)`) is safe too, since
+# `retarget_self` folds that into the same spec.
+fn functional_param_safe(body: Expr, fname: String, self_name: String) : Bool =
+  not (param_applied(body, fname) and passed_to_other(body, fname, self_name))
+
+# `fname` appears in callee position (`fname(...)`).
+fn param_applied(e: Expr, fname: String) : Bool =
+  match e.kind {
+    ECall(callee, args_) ->
+      callee_is(callee, fname) or param_applied(callee, fname) or kids_applied(args_, fname)
+    _ -> kids_applied(cspec_kids(e), fname)
+  }
+
+fn kids_applied(es: [Expr], fname: String) : Bool =
+  match es {
+    [] -> false
+    [k, ...rest] -> param_applied(k, fname) or kids_applied(rest, fname)
+  }
+
+# `fname` appears as a plain argument in a call to a fn OTHER than
+# `self_name`.
+fn passed_to_other(e: Expr, fname: String, self_name: String) : Bool =
+  match e.kind {
+    ECall(callee, args_) -> call_passes_to_other(callee, args_, fname, self_name)
+    _ -> kids_passed(cspec_kids(e), fname, self_name)
+  }
+
+fn call_passes_to_other(callee: Expr, args_: [Expr], fname: String, self_name: String) : Bool = {
+  let here = not callee_is(callee, self_name) and args_have_var(args_, fname)
+  here or passed_to_other(callee, fname, self_name) or kids_passed(args_, fname, self_name)
+}
+
+fn kids_passed(es: [Expr], fname: String, self_name: String) : Bool =
+  match es {
+    [] -> false
+    [k, ...rest] -> passed_to_other(k, fname, self_name) or kids_passed(rest, fname, self_name)
+  }
+
+fn callee_is(callee: Expr, name: String) : Bool =
+  match callee.kind {
+    EVar(n)        -> n == name
+    EModCall(_, n) -> n == name
+    _              -> false
+  }
+
+fn args_have_var(args_: [Expr], fname: String) : Bool =
+  match args_ {
+    [] -> false
+    [a, ...rest] -> arg_is_var(a, fname) or args_have_var(rest, fname)
+  }
+
+fn arg_is_var(a: Expr, fname: String) : Bool =
+  match a.kind { EVar(n) -> n == fname  _ -> false }
+
+# True when some lowercase type-variable name appears in the result type
+# but in no surviving parameter type — a return-only tparam.
+fn any_return_only(ps: [Param], rt: Option[TypeExpr]) : Bool = {
+  let in_params = sig_tparam_names(ps, None)
+  return_only_exists(opt_te_names(rt), in_params)
+}
+
+fn return_only_exists(in_ret: [String], in_params: [String]) : Bool =
+  match in_ret {
+    [] -> false
+    [t, ...rest] ->
+      (is_tyvar_name(t) and not list_has(in_params, t)) or return_only_exists(rest, in_params)
+  }
+
+# A type-variable name is lowercase-initial (a concrete type ctor is
+# capital). Empty names never occur in a resolved signature.
+fn is_tyvar_name(n: String) : Bool = not name_is_global(n)
+
+# A functional argument qualifies iff it is a syntactic lambda that
+# captures nothing beyond its own params, or a bare reference to a
+# top-level fn — and its resolved row is PURE. An effectful closure is
+# left alone: a `map`/pipe over it observes per-element effect ordering
+# that inlining the stage into the loop would reorder (soundness, the
+# same gate pipe fusion applies).
+fn classify_closure(a: Expr, all: [Decl]) : Option[ClosureArg] =
+  if not fn_ty_pure(a.ty) { None }
+  else {
+    match a.kind {
+      ELambda(ps, b) ->
+        if captures_free(b, cs_param_names(ps)) { None } else { Some(CaLambda(ps, b)) }
+      # A `__`-prefixed name is a compiler-synthesised symbol — a protocol
+      # dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare
+      # op reference. Inlining one impl's body breaks dispatch for every
+      # other type, so these are never specialised.
+      EVar(name) ->
+        if is_synthesised(name) { None }
+        else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
+      _ -> None
+    }
+  }
+
+fn is_synthesised(n: String) : Bool =
+  match char_at(n, 1) {
+    Some(c) -> match char_at(n, 0) { Some(z) -> z == '_' and c == '_'  None -> false }
+    None    -> false
+  }
+
+# The closure's resolved type is a function whose effect row is pure —
+# empty, or masked to pure (only `Mutable`, per pipe fusion's rule). A
+# non-function or effectful type declines specialisation.
+fn fn_ty_pure(t: Option[Ty]) : Bool =
+  match t {
+    Some(TyFnT(_, _, row)) -> pipe_fusion_labels_pure(row.labels)
+    _                      -> false
+  }
+
+# ---- capture analysis (scoped) ----
+
+# True when the body reads a name bound neither by its own params nor
+# by a binder introduced inside it, and which is not a global. Such a
+# name is a captured caller local, so the closure carries an env.
+fn captures_free(e: Expr, bound: [String]) : Bool =
+  match e.kind {
+    EVar(n)           -> not list_has(bound, n) and not name_is_global(n)
+    ELambda(ps, b)    -> captures_free(b, list_append(bound, cs_param_names(ps)))
+    EBlock(ss, t)     -> block_captures(ss, t, bound)
+    EMatch(scr, arms) -> captures_free(scr, bound) or arms_capture(arms, bound)
+    _                 -> kids_capture(cspec_kids(e), bound)
+  }
+
+fn kids_capture(es: [Expr], bound: [String]) : Bool =
+  match es {
+    [] -> false
+    [c, ...rest] -> captures_free(c, bound) or kids_capture(rest, bound)
+  }
+
+# A `let` binder extends `bound` for the rest of the block; the rhs
+# sees the pre-binding scope. A stmt shape we do not model (index-
+# assign, var, use) is treated as a capture — err strict, skip.
+fn block_captures(ss: [Stmt], t: Option[Expr], bound: [String]) : Bool =
+  match ss {
+    [] -> opt_captures(t, bound)
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) ->
+        captures_free(rhs, bound) or block_captures(rest, t, list_append(bound, cs_pat_binders(pat, [])))
+      SExprStmt(x)  -> captures_free(x, bound) or block_captures(rest, t, bound)
+      SAssert(c, m) -> captures_free(c, bound) or opt_captures(m, bound) or block_captures(rest, t, bound)
+      _ -> true
+    }
+  }
+
+fn opt_captures(o: Option[Expr], bound: [String]) : Bool =
+  match o { Some(e) -> captures_free(e, bound)  None -> false }
+
+fn arms_capture(arms: [Arm], bound: [String]) : Bool =
+  match arms {
+    [] -> false
+    [Arm(pat, g, b), ...rest] -> {
+      let b2 = list_append(bound, cs_pat_binders(pat, []))
+      opt_captures(g, b2) or captures_free(b, b2) or arms_capture(rest, bound)
+    }
+  }
