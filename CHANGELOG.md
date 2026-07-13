@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.10 (2026-07-13)
+
+### Changed
+
+- **mono**: specialise higher-order calls on known pure closures — inline the stage into the loop (closes #1205) (#1209)
+- **runtime**: classify runtime state for M:N — TLS partition + immutability gate + isolated reactor (part of #1207) (#1210)
+
 ## v0.99.9 (2026-07-13)
 
 ### Changed
