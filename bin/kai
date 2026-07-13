@@ -397,6 +397,28 @@ modular_hasher() {
   fi
 }
 
+# Compile runtime_llvm.c to a cached `.o` under the native-modular cache root and
+# echo its path. The native-modular link owns exactly one runtime TU; without this
+# cache the link recompiles the ~1.9K-LOC runtime at -O2 on every build — the
+# dominant warm-build cost. The key folds the runtime source, CC, CFLAGS and the
+# target arch, so a toolchain or runtime edit invalidates it. Echoes nothing on a
+# hasher-less system (the caller then compiles runtime_llvm.c inline as before).
+resolve_native_modular_runtime_obj() {
+  _rt_src="$1"
+  _rt_hasher="$(modular_hasher || true)"
+  [ -n "$_rt_hasher" ] || return 0
+  _rt_cache="$(resolve_native_modular_cache_dir)/runtime"
+  mkdir -p "$_rt_cache" 2>/dev/null || return 0
+  _rt_key="$( { printf '%s\n%s\n%s\n' "$CC" "$CFLAGS" "$(uname -sm)"; cat "$_rt_src"; } | $_rt_hasher | awk '{print $1}' )"
+  _rt_obj="$_rt_cache/$_rt_key.o"
+  if [ ! -f "$_rt_obj" ]; then
+    # shellcheck disable=SC2086
+    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
+      && mv "$_rt_obj.$$" "$_rt_obj" 2>/dev/null || { rm -f "$_rt_obj.$$" 2>/dev/null; return 0; }
+  fi
+  printf '%s' "$_rt_obj"
+}
+
 # Walk up from $1 looking for a kai.toml. Echoes the directory
 # containing the manifest, or empty if none found before /.
 find_manifest_dir() {
@@ -1233,17 +1255,19 @@ compile_to_binary() {
     mkdir -p "$cache_proj_dir/.kai-cache" 2>/dev/null || true
     user_cache_flag="--user-cache"
   fi
-  if [ "$backend" = "native" ] && [ "${KAI_NATIVE_MODULAR:-0}" = "1" ]; then
-    # Native separate compilation. `kaic2 --emit=native-modular` partitions the
-    # whole-program KIR by module into one object per module (root + each mo),
-    # content-addressed under a per-project cache dir so an unchanged partition
-    # reuses its object across builds, and prints one object path per line. We
-    # link every object with the runtime owner (runtime_llvm.c) — the L1 model:
-    # one runtime TU, every generated object calls it extern. The frontend is
-    # whole-program; only the codegen + link fan out.
-    if [ -z "$RUNTIME_LLVM_C" ]; then
-      die "native-modular backend: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
-    fi
+  # Native separate compilation is the DEFAULT native path. `kaic2
+  # --emit=native-modular` partitions the whole-program KIR by module into one
+  # object per module (root + each mo), content-addressed under a per-project
+  # cache dir so an unchanged partition reuses its object across builds, and
+  # prints one object path per line. We link every partition + one cached runtime
+  # object (the L1 model: one runtime TU, every generated object calls it extern).
+  # The frontend stays whole-program; only codegen + link fan out.
+  #
+  # Two cases stay on the whole-program native path below: `--debug` (it emits a
+  # .dSYM the partitioned link does not), and a kaic2 built without libLLVM (the
+  # sentinel below degrades to C). KAI_NATIVE_MODULAR=0 forces whole-program too.
+  if [ "$backend" = "native" ] && [ "${KAI_NATIVE_MODULAR:-1}" != "0" ] \
+     && [ "${KAI_BUILD_MODE:-default}" != "debug" ] && [ -n "$RUNTIME_LLVM_C" ]; then
     src_base="$(basename "$src")"
     # Per-project object directory: a stable subdir of the cache root keyed by
     # the entry file's absolute path, so kaic2's content-addressed objects
@@ -1255,25 +1279,31 @@ compile_to_binary() {
     cp "$src" "$nm_dir/$src_base"
     nmerr="$tmp/native-modular.err"
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr"; then
+    if (unset KAI_TRACE_RC; "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr" \
+       && [ -s "$tmp/native-modular.objs" ]; then
+      nm_ldstack=""
+      [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
+      # Link every partition object + one runtime object. The runtime `.o` is
+      # cached (compiled once per toolchain), so the warm link no longer pays the
+      # -O2 runtime recompile — the dominant warm-build cost the whole-program
+      # path avoids via its in-process bitcode merge.
+      nm_objs="$(tr '\n' ' ' < "$tmp/native-modular.objs")"
+      nm_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C")"
+      # shellcheck disable=SC2086
+      if [ -n "$nm_rt_obj" ]; then
+        $CC $nm_ldstack $nm_objs "$nm_rt_obj" -o "$out" -lm -ldl || die "native-modular link failed"
+      else
+        $CC $CFLAGS $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl || die "native-modular link failed"
+      fi
+      return 0
+    fi
+    # native-modular did not produce objects. A kaic2 without libLLVM prints the
+    # known sentinel — fall through to the whole-program native path below, which
+    # degrades to C. Any other failure is a real error we surface there too, so
+    # the whole-program path re-runs the compile and reports it verbatim.
+    if ! grep -q "not built into this compiler" "$nmerr" 2>/dev/null; then
       cat "$nmerr" >&2
-      exit 1
     fi
-    # The compiler prints one object path per line. Empty = a codegen failure it
-    # already reported.
-    if [ ! -s "$tmp/native-modular.objs" ]; then
-      cat "$nmerr" >&2
-      die "native-modular backend: no objects produced"
-    fi
-    nm_ldstack=""
-    [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
-    # Link every partition object + the runtime owner (one TU compiled here).
-    nm_objs="$(tr '\n' ' ' < "$tmp/native-modular.objs")"
-    # shellcheck disable=SC2086
-    if ! $CC $CFLAGS $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl; then
-      die "native-modular link failed"
-    fi
-    return 0
   fi
   if [ "$backend" = "native" ]; then
     # KIR Lane 1.5: the in-process libLLVM native backend is the default.
