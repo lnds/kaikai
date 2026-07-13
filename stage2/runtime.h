@@ -1956,25 +1956,26 @@ static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
  * keep the recycle hit-rate high; beyond it we fall through to
  * malloc/free. */
 #define KAI_CELL_POOL_CAP 1048576
-/* The free-list pools are multi-MB .bss. Under separate compilation (one
- * TU per module) the default file-local `static` replicates every pool
- * into every TU, blowing the combined .bss past the small-code-model
- * ADRP reach at the compiler's TU count. KAI_SEPARATE_COMPILATION shares
- * one copy: every TU sees an `extern` declaration; the single owner TU
- * (KAI_RUNTIME_OWNER) carries the definition. Each pool's index counter
- * moves with its array — they address one shared backing store and must
- * not diverge per-TU. With both macros undefined the preprocessor yields
- * the original `static` lines verbatim, so the single-TU build is
- * byte-identical. */
+/* The free-list pools are multi-MB per thread. As a `_Thread_local` ARRAY
+ * the whole table joins the TLS image, which the thread runtime
+ * zero-materialises (faulting in every page) at thread creation — so the
+ * full 8/72/72 MiB became resident per thread even for a program that
+ * never allocates (issue #1212/#1213: hello-world 2 MiB → 162 MiB). A
+ * `_Thread_local` POINTER instead is 8 bytes of TLS; the backing store is
+ * a single `calloc` on first push (kai_cell_pool_ensure), which the OS
+ * backs with lazy zero pages — RSS grows only with entries actually
+ * written, restoring the pre-M:N footprint. Separate-compilation sharing
+ * is unchanged: every TU sees the `extern` pointer; the owner TU defines
+ * it; the index counter moves with the pointer. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+extern KAI_TLS KaiValue **kai_cell_pool;
 extern KAI_TLS int kai_cell_pool_n;
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+KAI_TLS KaiValue **kai_cell_pool = NULL;
 KAI_TLS int kai_cell_pool_n = 0;
 #  endif
 #else
-static KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+static KAI_TLS KaiValue **kai_cell_pool = NULL;
 static KAI_TLS int kai_cell_pool_n = 0;
 #endif
 
@@ -1985,15 +1986,19 @@ static KAI_TLS int kai_cell_pool_n = 0;
  * set so slot reuse does not become the spill bottleneck. */
 #define KAI_SLOT_POOL_MAXN 8
 #define KAI_SLOT_POOL_CAP  1048576
+/* Per-arity free-list. TLS holds only (MAXN+1) pointers; each arity's
+ * CAP-entry backing store is calloc'd lazily on first push of that arity
+ * (kai_slot_pool_ensure). Restores the lazy footprint the huge
+ * `_Thread_local` 2D array destroyed — see the cell-pool note above. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+extern KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
 extern KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
 KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #  endif
 #else
-static KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+static KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
 static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #endif
 
@@ -2007,17 +2012,46 @@ static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
  * construction (the reuse recognisers only ever rewrite same-arity). */
 #define KAI_VAR_BLOCK_POOL_MAXN 8
 #define KAI_VAR_BLOCK_POOL_CAP  1048576
+/* Per-arity free-list of whole variant blocks. TLS holds (MAXN+1)
+ * pointers; each arity's backing store is calloc'd lazily on first push
+ * (kai_var_block_pool_ensure). Restores the lazy footprint — see the
+ * cell-pool note above. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+extern KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
 extern KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
 KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  endif
 #else
-static KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+static KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
 static KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #endif
+
+/* Lazy backing-store materialisation for the free-list pools. Each pool's
+ * table (CAP pointers) is calloc'd on first push into it, not at thread
+ * startup — the OS backs the calloc with zero pages that only become
+ * resident as entries are written, so a program that allocates little
+ * pays little (issue #1212/#1213). calloc failure degrades to "no pool"
+ * (the caller falls through to libc malloc/free), never a crash. */
+static inline int kai_cell_pool_ensure(void) {
+    if (!kai_cell_pool) {
+        kai_cell_pool = (KaiValue **) calloc(KAI_CELL_POOL_CAP, sizeof(KaiValue *));
+    }
+    return kai_cell_pool != NULL;
+}
+static inline int kai_slot_pool_ensure(int n) {
+    if (!kai_slot_pool[n]) {
+        kai_slot_pool[n] = (KaiVarSlot **) calloc(KAI_SLOT_POOL_CAP, sizeof(KaiVarSlot *));
+    }
+    return kai_slot_pool[n] != NULL;
+}
+static inline int kai_var_block_pool_ensure(int n) {
+    if (!kai_var_block_pool[n]) {
+        kai_var_block_pool[n] = (KaiValue **) calloc(KAI_VAR_BLOCK_POOL_CAP, sizeof(KaiValue *));
+    }
+    return kai_var_block_pool[n] != NULL;
+}
 
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
  *
@@ -2124,7 +2158,8 @@ static KaiVarSlot *kai_slots_alloc(int n) {
 static void kai_slots_free(KaiVarSlot *slots, int n) {
     if (slots == NULL) return;
 #ifndef KAI_NO_SLOT_POOL
-    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] < KAI_SLOT_POOL_CAP) {
+    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] < KAI_SLOT_POOL_CAP
+        && kai_slot_pool_ensure(n)) {
         kai_slot_pool[n][kai_slot_pool_n[n]++] = slots;
         return;
     }
@@ -2330,7 +2365,8 @@ static void kai_var_block_free(KaiValue *v, int n) {
     (void) v;
 #ifdef KAI_CELL_POOL_ACTIVE
     if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
-        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP) {
+        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP
+        && kai_var_block_pool_ensure(n)) {
         kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
         return;
     }
@@ -3546,7 +3582,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
 #define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
     if ((_kc)->tag == (int32_t) KAI_VARIANT) {                              \
         kai_var_block_free((_kc), (_kc)->var_n_args);                        \
-    } else if (kai_cell_pool_n < KAI_CELL_POOL_CAP) {                        \
+    } else if (kai_cell_pool_n < KAI_CELL_POOL_CAP && kai_cell_pool_ensure()) { \
         kai_cell_pool[kai_cell_pool_n++] = (_kc);                            \
     } else {                                                                 \
         free(_kc);                                                           \
