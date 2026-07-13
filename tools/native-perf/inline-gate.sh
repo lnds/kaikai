@@ -48,6 +48,23 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/rb_native"
 
+# The default native path (native-modular) needs the sep-comp runtime bitcode to
+# inline the hot ops; without it every partition falls back to runtime-owner
+# calls and this gate fails on the un-inlined count. Fail LOUD and specific if
+# the bc is missing (a build/artifact gap) rather than as a confusing high count.
+if [ "${KAI_NATIVE_MODULAR:-1}" != "0" ]; then
+  BC_INLINE=""
+  for _c in "$ROOT/stage0/runtime_inline.bc" "$ROOT/share/kaikai/include/runtime_inline.bc"; do
+    [ -f "$_c" ] && { BC_INLINE="$_c"; break; }
+  done
+  if [ -z "$BC_INLINE" ]; then
+    echo "::error::native-perf/inline-gate FAIL — runtime_inline.bc missing;"
+    echo "  the native-modular default cannot inline the runtime (run gen-runtime-bc.sh /"
+    echo "  ship stage0/runtime_inline.bc in the build artifact)."
+    exit 1
+  fi
+fi
+
 "$KAI" build --backend=native "$SRC" -o "$BIN" >/dev/null 2>"$TMP/build.err" || {
   echo "native-perf/inline-gate FAIL — native build failed:"; cat "$TMP/build.err"; exit 1
 }
