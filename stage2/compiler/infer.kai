@@ -12891,6 +12891,15 @@ fn pipe_rejection_reason(head: String, op: String) : Option[String] {
 #   * the standard call-inference signature mismatch (when `mod::op`
 #     exists but its declared shape does not unify with the pipe's
 #     expected `(T[A], (A) -> ...) -> T[B]`).
+# True when some protocol impl for type `head` supplies operation `op`
+# (`impl Sequence for Chain` provides `map`/`foldl` for head `Chain`),
+# so a pipe over that head routes through the protocol.
+fn pipe_op_has_impl(impls: [ProtoImplReg], head: String, op: String) : Bool = match impls {
+  [] -> false
+  [PIR(_, t, o, _, _, _), ...rest] ->
+    if t == head and o == op { true } else { pipe_op_has_impl(rest, head, op) }
+}
+
 fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -12948,6 +12957,11 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           # `HLOk` for a user head implies the module IS loaded
           # and the missing qualified entry IS the user's bug.
           let qualified = ty_env_lookup_qualified(rl.st.env, module_name, op)
+          # A `Shape`-protocol impl (`impl Sequence for Chain { map, ... }`)
+          # provides the pipe op even when the head's module ships no
+          # `map` function: emit the bare op so `resolve_protocol_calls`
+          # dispatches it to `__pimpl_<P>_<head>_<op>` post-typing.
+          let head_proto_op = pipe_op_has_impl(rl.st.proto_impls, head, op)
           let callee_kind = match qualified {
             Some(_) -> EModCall(module_name, op)
             None    -> EVar(op)
@@ -12962,7 +12976,7 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           let st_after_diag = match qualified {
             Some(_) -> rl.st
             None ->
-              if head == "List" { rl.st }
+              if head == "List" or head_proto_op { rl.st }
               else {
                 diag_error(rl.st.file, line, col,
                   concat_all(["module `", module_name, "` declares `", head,
@@ -13104,10 +13118,30 @@ fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
     Some(ff) -> {
       let g = fuse_terminal_gate(st, ff)
       if g.ok {
-        FuseAttempt { st: g.st, fused: Some(synth(g.st, pipe_fusion_fold_rewrite(ff, line, col))) }
+        # Peek the source head on a throwaway synth (state discarded) so
+        # the real rewrite synth below is the source's first synth and
+        # `try_bare_call_narrow` sees an unpolluted tvar frontier.
+        let rewrite = if fuse_source_is_protocol_seq(g.st, ff) {
+          pipe_fusion_generic_fold_rewrite(ff, inf_proto_dispatcher_name("foldl"), line, col)
+        } else {
+          pipe_fusion_fold_rewrite(ff, line, col)
+        }
+        FuseAttempt { st: g.st, fused: Some(synth(g.st, rewrite)) }
       } else { FuseAttempt { st: g.st, fused: None } }
     }
   }
+
+# A non-`List` source whose head type has a protocol `foldl` impl fuses
+# via the generic single-traversal rewrite, not the `list.map_foldl`
+# fast-path. The source is synthesised on a probe whose state is
+# discarded (the caller re-synths it in the rewrite).
+fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : Bool / Console + File + Mutable {
+  let r = synth(st, ff.source)
+  match inf_ty_head_name(apply_ty(r.st.sub, r.ty)) {
+    Some(head) -> head != "List" and pipe_op_has_impl(st.proto_impls, head, "foldl")
+    None -> false
+  }
+}
 
 # An explicit `foldl` keeps the Mutable-masked purity gate — its stage
 # and combine still run, only reordered. An implicit terminal (`sum`,
