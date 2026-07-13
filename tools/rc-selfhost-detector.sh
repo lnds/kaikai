@@ -58,11 +58,19 @@ have_native=0
 if command -v "$LLVM_CONFIG" >/dev/null 2>&1; then have_native=1; fi
 
 # Native ASAN needs the legacy link path (runtime_llvm.c compiled by cc so
-# ASAN instruments it). Hide the bitcode for the whole run; restore on any
-# exit so a failing fixture never leaves the tree stripped.
+# ASAN instruments it). Hide BOTH bitcodes for the whole run — the P2
+# whole-program bc AND the sep-comp inline bc (the native-modular default merges
+# it per partition); hiding both forces the runtime to be the cc-compiled owner
+# TU, which ASAN instruments. Restore on any exit so a failing fixture never
+# leaves the tree stripped.
 BC="$ROOT/stage0/runtime_llvm.bc"
 BC_HIDDEN="$WORK/runtime_llvm.bc.hidden"
-restore_bc() { [ -f "$BC_HIDDEN" ] && mv "$BC_HIDDEN" "$BC" 2>/dev/null || true; }
+BC_INLINE="$ROOT/stage0/runtime_inline.bc"
+BC_INLINE_HIDDEN="$WORK/runtime_inline.bc.hidden"
+restore_bc() {
+  [ -f "$BC_HIDDEN" ] && mv "$BC_HIDDEN" "$BC" 2>/dev/null || true
+  [ -f "$BC_INLINE_HIDDEN" ] && mv "$BC_INLINE_HIDDEN" "$BC_INLINE" 2>/dev/null || true
+}
 trap restore_bc EXIT INT TERM
 
 fixtures="$(grep -vE '^[[:space:]]*(#|$)' "$CORPUS")"
@@ -121,6 +129,7 @@ done
 if [ "$have_native" -eq 1 ]; then
   echo "rc-detector: native backend (ASAN + no-cell-pool, runtime instrumented)"
   [ -f "$BC" ] && mv "$BC" "$BC_HIDDEN"
+  [ -f "$BC_INLINE" ] && mv "$BC_INLINE" "$BC_INLINE_HIDDEN"
   for name in $fixtures; do
     check_one native "$name"
   done
