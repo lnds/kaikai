@@ -175,6 +175,23 @@ Two dead ends and the root cause:
   never-read state is not free — remove dead synchronization, don't keep
   it "just in case."
 
+### The race macOS TSAN missed and Linux CI caught
+
+The first CI run of `tier1-tsan.yml` (Linux) reported a real data race the
+macOS TSAN runs never hit: `KaiSchedSlot.live` was a plain `int`, written
+by a worker at startup (`slots[me].live = 1`) and read by every thief in
+`kai_sched_steal_from` (`if (!s->live) return`) **outside the slot lock**
+(the thief reads `live` to decide *whether* to lock). macOS TSAN's
+scheduling never interleaved the startup write against a concurrent steal;
+Linux's did on the first run. `live` is the one piece of slot metadata read
+lock-free, so it becomes `_Atomic int` — the store publishes and every
+thief acquire-loads it. Only the *deque metadata* went atomic, never the
+object RC: `live` is off the RC hot path (read once per steal attempt, and
+never at all at N=1 where no steal runs), so the rb-tree canary is
+unaffected. Validated by running the TSAN stress in a 20-iteration loop
+(15× N=4 + 5× N=8) with zero races — the interleaving that macOS missed
+needs repetition to surface. **The gate paid for itself on day one.**
+
 ## Follow-ups (F2 and beyond)
 
 - **F2 — multi-scheduler reactor:** the reactor is fixed on thread 0 for

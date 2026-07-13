@@ -2902,12 +2902,14 @@ static KAI_TLS int kai_thread_id = 0;
  * source of truth at N>1. The owner pushes/pops both ends and a thief
  * pulls the head, all under `mu` — the mutex is touched only on
  * enqueue/dequeue/steal/remote-unpark, never on the per-op RC path.
- * `live` marks the slot as a steal target once its thread is running. */
+ * `live` marks the slot as a steal target once its thread is running; a
+ * thief reads it outside `mu` (before deciding to lock), so it is atomic:
+ * a worker publishes `live=1` at startup and every thief acquire-loads it. */
 typedef struct KaiSchedSlot {
     pthread_mutex_t mu;
     KaiFiber       *steal_head;   /* fibers available to steal (FIFO) */
     KaiFiber       *steal_tail;
-    int             live;         /* slot participates in stealing */
+    _Atomic int     live;         /* slot participates in stealing */
 } KaiSchedSlot;
 
 #define KAI_MAX_THREADS 256
