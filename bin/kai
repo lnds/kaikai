@@ -1290,24 +1290,50 @@ compile_to_binary() {
   # Two cases stay on the whole-program native path below: `--debug` (it emits a
   # .dSYM the partitioned link does not), and a kaic2 built without libLLVM (the
   # sentinel below degrades to C). KAI_NATIVE_MODULAR=0 forces whole-program too.
-  if [ "$backend" = "native" ] && [ "${KAI_NATIVE_MODULAR:-1}" != "0" ] \
+  nm_inline_bc_env=""
+  [ -n "$RUNTIME_INLINE_BC" ] && nm_inline_bc_env="$RUNTIME_INLINE_BC"
+  # The partitioned path only earns its per-object codegen + bc-merge + O2 cost
+  # when the incremental cache pays it back: editing one module of a MULTI-module
+  # project re-emits one partition and reuses the rest. For a SINGLE-module
+  # program (one user `.kai`) there is nothing to reuse — every build re-emits
+  # the whole thing — and partitioning just pays ~3x the single-module
+  # whole-program codegen on the cold build that dominates (mono makes the stdlib
+  # partitions depend on the user program, so cross-program reuse is low by
+  # construction). So the default routes a single-module program through the fast
+  # whole-program path and only multi-module projects through partitioning. This
+  # also keeps a first build — and every one-shot ratchet/parity fixture — on the
+  # whole-program path, so cold never regresses. KAI_NATIVE_MODULAR=1 forces
+  # partitioning regardless (the tests that assert the partitioned path); =0
+  # forces whole-program.
+  # "Multi-module" = the entry file imports at least one LOCAL module (a sibling
+  # `.kai` in the source dir), the only shape partitioning helps. A standalone
+  # fixture (imports only stdlib, or nothing) has no local module to reuse, so it
+  # takes whole-program. Counting sibling-resolving imports — not files in the
+  # dir — keeps a fixture that happens to sit in a big shared corpus dir
+  # (examples/perceus/) on the whole-program path. `import a.b` also counts (its
+  # first segment names the sibling).
+  nm_local_imports=0
+  if [ "$backend" = "native" ]; then
+    nm_local_imports="$(
+      awk '/^[[:space:]]*import[[:space:]]/ { n=$2; sub(/\..*/,"",n); sub(/;.*/,"",n); print n }' "$src" 2>/dev/null \
+        | while read -r _m; do [ -f "$src_dir/$_m.kai" ] && echo x; done | wc -l | tr -d ' '
+    )"
+    [ -n "$nm_local_imports" ] || nm_local_imports=0
+  fi
+  nm_want=0
+  case "${KAI_NATIVE_MODULAR:-auto}" in
+    0) nm_want=0 ;;
+    1) nm_want=1 ;;
+    *) [ "$nm_local_imports" -gt 0 ] 2>/dev/null && nm_want=1 ;;
+  esac
+  if [ "$backend" = "native" ] && [ "$nm_want" = "1" ] \
      && [ "${KAI_BUILD_MODE:-default}" != "debug" ] && [ -n "$RUNTIME_LLVM_C" ]; then
     src_base="$(basename "$src")"
-    # When the separate-compilation runtime bitcode is present, hand it to kaic2
-    # so each partition merges it and O2 inlines the `kaix_*` hot ops (state
-    # globals stay external, owned by the runtime TU below — no duplication).
-    # Absent → each partition calls the runtime owner extern (no inlining).
-    nm_inline_bc_env=""
-    [ -n "$RUNTIME_INLINE_BC" ] && nm_inline_bc_env="$RUNTIME_INLINE_BC"
-    # Per-project object directory: a stable subdir of the cache root keyed by
-    # the entry file's absolute path AND the inline-bc digest, so kaic2's
-    # content-addressed objects persist across builds of THIS project without
-    # colliding with another's. Folding the inline-bc digest into the dir key
-    # invalidates the whole project cache when the runtime bitcode changes: a
-    # partition's `.o` has the runtime `kaix_*` INLINED into it, so a runtime
-    # edit (a new `kaix_decref`) must re-emit every partition even though the
-    # projected KIR is unchanged — without this the cache would serve a stale
-    # object carrying the old runtime body.
+    # Per-project object cache dir, keyed by the entry file's absolute path AND
+    # the inline-bc digest: a project's objects persist across builds without
+    # colliding with another's, and a runtime-bitcode change invalidates the whole
+    # project cache (each partition `.o` has the runtime `kaix_*` inlined in, so a
+    # runtime edit must re-emit every partition even though the KIR is unchanged).
     nm_abs="$(cd "$src_dir" && pwd)/$src_base"
     nm_bc_tag="none"
     [ -n "$nm_inline_bc_env" ] && nm_bc_tag="$( { sha256sum "$nm_inline_bc_env" 2>/dev/null || shasum -a 256 "$nm_inline_bc_env" 2>/dev/null || cksum "$nm_inline_bc_env"; } | awk '{print $1}' )"

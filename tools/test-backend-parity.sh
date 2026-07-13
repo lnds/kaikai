@@ -233,7 +233,13 @@ process_one() {
     return 0
   fi
 
-  if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
+  # Pin whole-program for the native target: this ratchet proves native-vs-C
+  # SEMANTIC parity over hundreds of one-shot fixtures, and the partitioned path
+  # would pay partition + per-object codegen + bc-merge on every one with no
+  # cache to amortise it (a 30-min shard timeout). The modular path's own
+  # equivalence is proved byte-for-byte by `test-native-modular`; this harness
+  # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
+  if ! KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
     {
       echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
       tail -10 "$t_blog" | sed 's/^/    /'

@@ -5963,11 +5963,16 @@ test-native-static-slot-read: $(TARGET) build
 # allocating fn carries only `nounwind`. Binary acceptance: `opt -O2`
 # CSEs two identical pure calls to one. Native-gated: a C-only kaic2
 # cannot dump the native IR. Requires `opt` (LLVM 18).
+# KAI_NATIVE_MODULAR=0: the purity attributes are a property of the emitter,
+# identical on both native paths, but this gate INSPECTS the dumped IR for the
+# user fns `@heavy`/`@noisy` — which the native-modular default splits across
+# partition modules (the dumped module then carries them only as `declare`).
+# Pin the whole-program path so the dump is the single module that DEFINES them.
 test-native-purity-attrs: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/purity_licm.kai; \
 	exp=../examples/perceus/purity_licm.out.expected; \
-	KAI_NATIVE_DUMP_IR=build/s2-purity.ll KAI_BACKEND=native ../bin/kai build $$src -o build/s2-purity 2> build/s2-purity.err \
+	KAI_NATIVE_DUMP_IR=build/s2-purity.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build $$src -o build/s2-purity 2> build/s2-purity.err \
 	  || { echo "native-purity FAIL (native build errored)"; cat build/s2-purity.err; exit 1; }; \
 	./build/s2-purity > build/s2-purity.out 2>&1; \
 	diff -q $$exp build/s2-purity.out > /dev/null \
