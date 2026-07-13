@@ -94,6 +94,71 @@ import compiler.modules
 import compiler.infer
 
 # ====================================================================
+# Law wrappers (`laws <Theory>` / `axiom <Theory>`).
+#
+# The parser emits `DProtoLaws(theory, DProtocol, …)` and
+# `DImplAxiom(theory, DImpl, …)` wrappers. `strip_law_wrappers` unwraps
+# them to the bare protocol/impl and records the associations, so no
+# downstream pass ever sees the wrapper — the same discipline
+# `lower_axioms` uses for `DAxiom`. The law engine reads the registry to
+# autogenerate per-impl property checks (except impls marked `axiom`).
+# ====================================================================
+
+# `protocol_name -> theory` and the impls exempted by `axiom <Theory>`.
+pub type LawReg = LR([ProtoLaw], [AxiomImpl])
+pub type ProtoLaw = PL(String, String)          # protocol, theory
+pub type AxiomImpl = AI(String, String, String) # protocol, type-head, theory
+
+pub fn law_reg_protocols(r: LawReg) : [ProtoLaw] = match r { LR(ps, _) -> ps }
+pub fn law_reg_axioms(r: LawReg) : [AxiomImpl] = match r { LR(_, xs) -> xs }
+
+#[doc("The theory a protocol declares its ops obey via `laws`, if any.")]
+pub fn law_theory_of(r: LawReg, proto: String) : Option[String] =
+  law_theory_loop(law_reg_protocols(r), proto)
+
+fn law_theory_loop(ps: [ProtoLaw], proto: String) : Option[String] = match ps {
+  [] -> None
+  [PL(p, thy), ...rest] -> if p == proto { Some(thy) } else { law_theory_loop(rest, proto) }
+}
+
+#[doc("True when `impl P for <head>` is exempted from law-checks by an `axiom` clause.")]
+pub fn law_impl_axiomed(r: LawReg, proto: String, head: String) : Bool =
+  law_axiom_loop(law_reg_axioms(r), proto, head)
+
+fn law_axiom_loop(xs: [AxiomImpl], proto: String, head: String) : Bool = match xs {
+  [] -> false
+  [AI(p, t, _), ...rest] -> if p == proto and t == head { true } else { law_axiom_loop(rest, proto, head) }
+}
+
+#[doc("""
+Unwrap every `DProtoLaws` / `DImplAxiom` wrapper to its bare inner decl,
+returning the flattened decl stream and the law registry. Runs before
+any other Decl walker so downstream passes see only plain
+protocols/impls, mirroring `lower_axioms`.
+""")]
+pub fn strip_law_wrappers(decls: [Decl]) : StrippedLaws =
+  strip_law_loop(decls, [], [], [])
+
+pub type StrippedLaws = SL([Decl], LawReg)
+
+pub fn strip_sl_decls(s: StrippedLaws) : [Decl] = match s { SL(ds, _) -> ds }
+pub fn strip_sl_reg(s: StrippedLaws) : LawReg = match s { SL(_, r) -> r }
+
+fn strip_law_loop(decls: [Decl], acc: [Decl], laws: [ProtoLaw],
+                  axioms: [AxiomImpl]) : StrippedLaws = match decls {
+  [] -> SL(list_reverse(acc), LR(list_reverse(laws), list_reverse(axioms)))
+  [d, ...rest] -> match d {
+    DProtoLaws(thy, DProtocol(a, name, b, c, l, cc), _, _) ->
+      strip_law_loop(rest, [DProtocol(a, name, b, c, l, cc), ...acc],
+                     [PL(name, thy), ...laws], axioms)
+    DImplAxiom(thy, DImpl(pname, pa, target, ms, l, cc), _, _) ->
+      strip_law_loop(rest, [DImpl(pname, pa, target, ms, l, cc), ...acc],
+                     laws, [AI(pname, proto_type_name(target), thy), ...axioms])
+    _ -> strip_law_loop(rest, [d, ...acc], laws, axioms)
+  }
+}
+
+# ====================================================================
 # Downward glue mirrors (proto_ prefix) — copied verbatim from the
 # canonical definitions still resident in main / infer. Mirrored rather
 # than sunk because each has a single consumer in this module.
@@ -379,6 +444,8 @@ fn proto_home_record(d: Decl, home: String, target_mod: String,
   }
   DDerive(_, inner, _, _)  -> proto_home_record(inner, home, target_mod, acc)
   DUnstable(inner, _, _)   -> proto_home_record(inner, home, target_mod, acc)
+  DProtoLaws(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
+  DImplAxiom(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
   DConstructor(inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
   _ -> acc
 }
@@ -423,6 +490,10 @@ fn collect_proto_decls_h(ds: [Decl], reg: ProtocolReg,
       DDerive(_, inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
       DUnstable(inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      DProtoLaws(_, inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      DImplAxiom(_, inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
       DConstructor(inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
@@ -515,6 +586,8 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
       DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       _ -> collect_proto_names(rest, acc)
     }
@@ -528,6 +601,8 @@ fn collect_local_type_names(ds: [Decl], acc: [String]) : [String] {
       DType(_, name, _, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       _ -> collect_local_type_names(rest, acc)
     }
@@ -603,6 +678,10 @@ fn validate_impls_loop(ds: [Decl], file: String,
       DDerive(_, inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
       DUnstable(inner, _, _) ->
+        validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
       DConstructor(inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
@@ -681,6 +760,10 @@ fn validate_impl_methods_loop(ds: [Decl], file: String,
       DDerive(_, inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
       DUnstable(inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
       DConstructor(inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
@@ -980,6 +1063,8 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
+      DProtoLaws(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
+      DImplAxiom(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       DConstructor(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       _ -> lower_impls(rest, reg, acc_fns)
     }
@@ -1168,6 +1253,10 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_future_impl_keys([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_future_impl_keys([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_future_impl_keys([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_future_impl_keys([inner, ...rest], acc)
       _ -> collect_future_impl_keys(rest, acc)
@@ -1212,6 +1301,10 @@ fn validate_derives_loop(ds: [Decl], file: String,
         validate_derives_loop(rest, file, future_impls, errs1)
       }
       DUnstable(inner, _, _) ->
+        validate_derives_loop([inner, ...rest], file, future_impls, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derives_loop([inner, ...rest], file, future_impls, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derives_loop([inner, ...rest], file, future_impls, errs)
       DConstructor(inner, _, _) ->
         validate_derives_loop([inner, ...rest], file, future_impls, errs)
@@ -1318,6 +1411,8 @@ fn expand_derives_loop(ds: [Decl], acc: [Decl]) : [Decl] {
       # Preserve the wrapper: the `#[constructor]` registry is collected
       # in the typer, so unwrapping here (as DUnstable does) would lose
       # it. The inner is a plain fn — no derives to expand.
+      DProtoLaws(_, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
+      DImplAxiom(_, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
       DConstructor(_, _, _) -> expand_derives_loop(rest, [d, ...acc])
       _ -> expand_derives_loop(rest, [d, ...acc])
     }
@@ -2630,6 +2725,10 @@ fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_binser_providers([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_binser_providers([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_binser_providers([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_binser_providers([inner, ...rest], acc)
       _ -> collect_binser_providers(rest, acc)
@@ -2655,6 +2754,10 @@ fn validate_derive_binser_loop(decls: [Decl], file: String,
         _ -> validate_derive_binser_loop(rest, file, providers, errs)
       }
       DUnstable(inner, _, _) ->
+        validate_derive_binser_loop([inner, ...rest], file, providers, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_binser_loop([inner, ...rest], file, providers, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derive_binser_loop([inner, ...rest], file, providers, errs)
       DConstructor(inner, _, _) ->
         validate_derive_binser_loop([inner, ...rest], file, providers, errs)
@@ -2846,6 +2949,10 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_ord_providers([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_ord_providers([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_ord_providers([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_ord_providers([inner, ...rest], acc)
       _ -> collect_ord_providers(rest, acc)
@@ -2871,6 +2978,10 @@ fn validate_derive_ord_loop(decls: [Decl], file: String,
         _ -> validate_derive_ord_loop(rest, file, providers, errs)
       }
       DUnstable(inner, _, _) ->
+        validate_derive_ord_loop([inner, ...rest], file, providers, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_ord_loop([inner, ...rest], file, providers, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derive_ord_loop([inner, ...rest], file, providers, errs)
       DConstructor(inner, _, _) ->
         validate_derive_ord_loop([inner, ...rest], file, providers, errs)
