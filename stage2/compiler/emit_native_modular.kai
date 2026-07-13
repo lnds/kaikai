@@ -28,6 +28,7 @@ import compiler.util
 import compiler.ast
 import compiler.kir
 import compiler.kir_dump
+import compiler.emit_native_modkey
 import compiler.native_prims
 import compiler.emit_native_fn
 import compiler.emit_native
@@ -142,28 +143,15 @@ fn nmod_build(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
   }
 }
 
-# The content-addressed cache key of a partition: a hash of the KIR text that
-# feeds its codegen — the fns this TU DEFINES plus every program fn's SIGNATURE
-# (its cross-TU callee shapes). A producer changing a signature or ownership
-# flips the consumer's key and forces its re-emit; a body-only change in another
-# module leaves this key untouched. There is no serialised ABI to go stale,
-# because the KIR text itself carries every callee shape.
+# The partition's content-addressed cache key: the fns it DEFINES plus the
+# signatures of the cross-TU callees they invoke (see emit_native_modkey). Keying
+# on referenced callees, not every program signature, keeps the cache
+# incremental — an unrelated fn added elsewhere leaves this key untouched.
 fn nmod_cache_key(kp: KProgram, define_fns: [KFn], role: NModRole) : String =
-  nmod_hash(concat_all([
-    nmod_role_tag(role), "\n",
-    kir_dump_fns_pub(define_fns),
-    "; externs\n", nmod_dump_sigs(kp.fns, "")
-  ]))
+  nmodkey_of(kp, define_fns, nmod_role_tag(role))
 
 fn nmod_role_tag(role: NModRole) : String = match role {
   NModWhole -> "whole"  NModRoot -> "root"  NModLeaf -> "leaf"
-}
-
-# Every program fn's signature (name + kind + param/return slots), no bodies —
-# the external-declaration slice each object emits for its cross-TU calls.
-fn nmod_dump_sigs(fns: [KFn], acc: String) : String = match fns {
-  [] -> acc
-  [f, ...rest] -> nmod_dump_sigs(rest, concat_all([acc, kir_dump_fn_sig_pub(f), "\n"]))
 }
 
 # Sanitise a module origin into an object-file stem (`geo.shapes` -> `geo_shapes`).
@@ -174,14 +162,3 @@ fn nmod_dots(s: String, i: Int, n: Int, acc: String) : String =
     let c = string_slice(s, i, 1)
     nmod_dots(s, i + 1, n, cat2(acc, if c == "." { "_" } else { c }))
   }
-
-# A stable, platform-independent content hash (djb2 over the bytes). The key
-# only needs to change whenever the projected KIR changes; the masked 48-bit
-# accumulator keeps it a compact decimal string and avoids native-int wrap
-# diverging between the C oracle and the native backend.
-fn nmod_hash(s: String) : String = int_to_string(nmod_djb2(s, 0, string_length(s), 5381))
-fn nmod_djb2(s: String, i: Int, n: Int, h: Int) : Int =
-  if i >= n { h }
-  else { nmod_djb2(s, i + 1, n, nmod_mask(h * 33 + char_to_int(char_at_or_zero(s, i)))) }
-
-fn nmod_mask(h: Int) : Int = h % 281474976710656

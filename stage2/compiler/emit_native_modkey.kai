@@ -1,0 +1,89 @@
+# compiler/emit_native_modkey.kai — the native-modular cache key.
+#
+# A partition's content-addressed object key is a hash of the KIR text that
+# feeds ITS codegen: the fns the partition DEFINES, plus the signatures of the
+# cross-TU callees those fns actually invoke. Keying on the referenced callees
+# (not every program signature) is what makes the cache INCREMENTAL: adding an
+# unrelated fn elsewhere leaves this partition's key untouched, so only the
+# partitions that changed re-emit.
+#
+# The anti-ABI-skew property is preserved. A callee's ownership/signature flip
+# changes its dumped signature, which changes the key of EVERY partition that
+# calls it, forcing their re-emit. There is no serialised ABI to go stale: the
+# key text itself carries every referenced callee's shape.
+
+import compiler.util
+import compiler.kir
+import compiler.kir_dump
+
+#[doc("The content-addressed cache key of a native-modular partition: a hash of the fns it defines plus the signatures of the cross-TU callees they invoke, in program order.")]
+pub fn nmodkey_of(kp: KProgram, define_fns: [KFn], role_tag: String) : String =
+  nmodkey_hash(concat_all([
+    role_tag, "\n",
+    kir_dump_fns_pub(define_fns),
+    "; externs\n", nmodkey_dump_referenced_sigs(kp.fns, nmodkey_callees(define_fns))
+  ]))
+
+# The direct-call symbols the partition's fns invoke, across every block. Only
+# `KCall` / `KTailCall` / `KClosure` name a symbol; indirect calls carry a value,
+# and `KPerform` dispatches through the runtime — neither pins a cross-TU sig.
+fn nmodkey_callees(fns: [KFn]) : [String] = nmodkey_callees_loop(fns, [])
+fn nmodkey_callees_loop(fns: [KFn], acc: [String]) : [String] = match fns {
+  [] -> acc
+  [f, ...rest] -> nmodkey_callees_loop(rest, nmodkey_blocks(f.blocks, acc))
+}
+
+fn nmodkey_blocks(bs: [KBlock], acc: [String]) : [String] = match bs {
+  [] -> acc
+  [b, ...rest] -> nmodkey_blocks(rest, nmodkey_term(b.term, nmodkey_stmts(b.stmts, acc)))
+}
+
+fn nmodkey_stmts(ss: [KStmt], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> nmodkey_stmts(rest, nmodkey_stmt(s, acc))
+}
+
+fn nmodkey_stmt(s: KStmt, acc: [String]) : [String] = match s {
+  KLet(_, _, op, _) -> nmodkey_op(op, acc)
+  KDo(op, _)        -> nmodkey_op(op, acc)
+  _                 -> acc
+}
+
+fn nmodkey_op(op: KOp, acc: [String]) : [String] = match op {
+  KCall(sym, _)       -> nmodkey_add(acc, sym)
+  KClosure(sym, _, _) -> nmodkey_add(acc, sym)
+  _                   -> acc
+}
+
+fn nmodkey_term(t: KTerm, acc: [String]) : [String] = match t {
+  KTailCall(sym, _, _) -> nmodkey_add(acc, sym)
+  _                    -> acc
+}
+
+fn nmodkey_add(acc: [String], sym: String) : [String] =
+  if list_has(acc, sym) { acc } else { [sym, ...acc] }
+
+# Dump the signature of every program fn WHOSE SYMBOL a partition references,
+# walking `kp.fns` in program order so the text is deterministic regardless of
+# the callee-set discovery order.
+fn nmodkey_dump_referenced_sigs(fns: [KFn], callees: [String]) : String =
+  nmodkey_dump_loop(fns, callees, "")
+fn nmodkey_dump_loop(fns: [KFn], callees: [String], acc: String) : String = match fns {
+  [] -> acc
+  [f, ...rest] ->
+    if list_has(callees, f.sym) {
+      nmodkey_dump_loop(rest, callees, concat_all([acc, kir_dump_fn_sig_pub(f), "\n"]))
+    } else {
+      nmodkey_dump_loop(rest, callees, acc)
+    }
+}
+
+# A stable, platform-independent content hash (djb2 over the bytes), masked to
+# 48 bits so it stays a compact decimal string and its accumulator never wraps
+# differently between the C oracle and the native backend.
+fn nmodkey_hash(s: String) : String = int_to_string(nmodkey_djb2(s, 0, string_length(s), 5381))
+fn nmodkey_djb2(s: String, i: Int, n: Int, h: Int) : Int =
+  if i >= n { h }
+  else { nmodkey_djb2(s, i + 1, n, nmodkey_mask(h * 33 + char_to_int(char_at_or_zero(s, i)))) }
+
+fn nmodkey_mask(h: Int) : Int = h % 281474976710656
