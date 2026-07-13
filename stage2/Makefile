@@ -5178,7 +5178,7 @@ test-perceus-1131-modular-escape: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_modular_escape_1131.kai; \
 	out=$$(pwd)/build/s2-1131modesc.bin; rm -f $$out; \
-	( cd .. && KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_NO_CACHE=1 bin/kai build stage2/main.kai -o $$out ) \
+	( cd .. && KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 bin/kai build stage2/main.kai -o $$out ) \
 	  2> build/s2-1131modesc.log \
 	  || { echo "perceus-1131-modular-escape FAIL (modular compiler build/link)"; cat build/s2-1131modesc.log; exit 1; }; \
 	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $$out $$src > build/s2-1131modesc.c 2> build/s2-1131modesc.err \
@@ -7502,6 +7502,16 @@ test-modular-cache: $(TARGET) build
 	echo "modular-cache OK incr (one-module edit -> $$c recompiled vs $$cc0 cold)"; \
 	echo "modular-cache OK"
 
+# Shared c-modular .o cache dir for the two full-compiler self-hosts below
+# (test-modular-selfhost, test-perceus-1131-modular-escape). Build-local
+# (gitignored), so it survives across both gates within a run and, when a
+# harness persists it (CI's actions/cache), across runs. The cache keys each
+# .o by a content hash folding the compiler, its flags, the target arch, the
+# shared headers, and the emitted .c — a stale hit is impossible, so the cache
+# only elides recompiling byte-identical emitted C. The link (which exercises
+# the shared-pool guard) and the byte-identity checks below always run.
+CMODULAR_SELFHOST_CACHE := $(CURDIR)/build/cmodular-selfhost-cache
+
 # The WHOLE self-hosted compiler links under --emit=c-modular. runtime.h's
 # RC free-list pools (~159 MB) are file-local `static` in the single-TU
 # build; the ~86-TU modular split would replicate them into every TU and
@@ -7512,13 +7522,15 @@ test-modular-cache: $(TARGET) build
 # program, byte-compared against $(TARGET)'s output — linking and
 # answering --version is not evidence the binary works (per-TU runtime
 # state can corrupt the first real compile while leaving --version
-# intact). Hermetic: a fresh .o cache each run.
+# intact). The .o cache never masks a regression: byte-identity is checked
+# against the single-TU compiler on every run; the content hash guarantees a
+# hit reproduces the exact object a fresh compile would.
 test-modular-selfhost: $(TARGET) build
 	@set -e; \
 	out=$$(pwd)/build/modular-selfhost.bin; \
 	rm -f $$out; \
 	echo "== test-modular-selfhost: full compiler links under --emit=c-modular =="; \
-	( cd .. && KAI_MODULAR=1 KAI_MODULAR_NO_CACHE=1 bin/kai build stage2/main.kai -o $$out ) \
+	( cd .. && KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 bin/kai build stage2/main.kai -o $$out ) \
 	  2> build/modular-selfhost.log \
 	  || { echo "modular-selfhost FAIL (build/link)"; cat build/modular-selfhost.log; exit 1; }; \
 	[ -x $$out ] || { echo "modular-selfhost FAIL (no binary produced)"; exit 1; }; \
