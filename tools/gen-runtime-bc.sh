@@ -42,6 +42,12 @@ RUNTIME_C="$ROOT/stage0/runtime_llvm.c"
 RUNTIME_H="$ROOT/stage2/runtime.h"      # runtime_llvm.c resolves <runtime.h> here (stage2 -I leads)
 BC_OUT="$ROOT/stage0/runtime_llvm.bc"
 STAMP="$ROOT/stage0/runtime_llvm.bc.stamp"   # input hash the current .bc was built from
+# Separate-compilation twin of the bitcode: same source, compiled with
+# KAI_SEPARATE_COMPILATION so the runtime's state globals are `external`
+# (owned by the runtime TU at link). The native-modular backend merges THIS
+# into each partition so O2 inlines the `kaix_*` hot ops without duplicating
+# runtime state across the N partition objects.
+BC_INLINE="$ROOT/stage0/runtime_inline.bc"
 
 mode="${1:-}"
 
@@ -95,14 +101,14 @@ CLANG="$(resolve_clang || true)"
 if [ -z "$CLANG" ]; then
   # No clang 18 — clean opt-out. Drop any stale .bc so the native link does
   # not pick up a runtime that no longer matches the sources.
-  rm -f "$BC_OUT" "$STAMP"
+  rm -f "$BC_OUT" "$BC_INLINE" "$STAMP"
   echo "gen-runtime-bc: no clang 18 found; native P2 bitcode disabled (build falls back to cc-links-runtime_llvm.c)." >&2
   echo "gen-runtime-bc:   install one to enable P2 — brew install llvm@18  /  apt-get install clang-18" >&2
   exit 0
 fi
 
 want="$(input_hash)"
-if [ "$mode" != "--force" ] && [ -f "$BC_OUT" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$want" ]; then
+if [ "$mode" != "--force" ] && [ -f "$BC_OUT" ] && [ -f "$BC_INLINE" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$want" ]; then
   exit 0    # fresh — nothing to do
 fi
 
@@ -115,5 +121,14 @@ fi
   -I "$ROOT/stage2" -I "$ROOT/stage0" \
   "$RUNTIME_C" -o "$BC_OUT"
 
+# The separate-compilation twin: identical flags plus KAI_SEPARATE_COMPILATION,
+# so the state globals are `external` and the native-modular merge does not
+# duplicate them per partition. The runtime owner object (compiled by bin/kai
+# with KAI_RUNTIME_OWNER) defines them.
+"$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -emit-llvm -c \
+  -DKAI_SEPARATE_COMPILATION=1 \
+  -I "$ROOT/stage2" -I "$ROOT/stage0" \
+  "$RUNTIME_C" -o "$BC_INLINE"
+
 echo "$want" > "$STAMP"
-echo "gen-runtime-bc: generated $BC_OUT ($("$CLANG" --version | sed -n 1p))" >&2
+echo "gen-runtime-bc: generated $BC_OUT + $BC_INLINE ($("$CLANG" --version | sed -n 1p))" >&2

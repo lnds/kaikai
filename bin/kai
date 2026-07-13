@@ -195,6 +195,25 @@ else
   RUNTIME_LLVM_BC=""
 fi
 
+# The separate-compilation runtime bitcode (state globals `external`), merged
+# into each native-modular partition so O2 inlines the `kaix_*` hot ops without
+# duplicating runtime state. Sits next to runtime_llvm.bc (gen-runtime-bc.sh
+# produces both). Absent → the modular path falls back to the runtime-owner-call
+# model (correct, just no per-partition inlining).
+#
+# GATED on the whole-program bc being present too: an ASAN test that wants the
+# runtime cc-compiled-with-ASAN hides runtime_llvm.bc (the established pattern);
+# honouring that single toggle here disables the inline merge as well, so those
+# tests get the instrumented runtime owner without also having to hide the
+# inline bc. When runtime_llvm.bc is present, use the inline bc if present.
+if [ -n "$RUNTIME_LLVM_BC" ] && [ -f "$RUNTIME_INC/runtime_inline.bc" ]; then
+  RUNTIME_INLINE_BC="$RUNTIME_INC/runtime_inline.bc"
+elif [ -n "$RUNTIME_LLVM_BC" ] && [ -f "$ROOT/stage0/runtime_inline.bc" ]; then
+  RUNTIME_INLINE_BC="$ROOT/stage0/runtime_inline.bc"
+else
+  RUNTIME_INLINE_BC=""
+fi
+
 die() {
   echo "kai: error: $*" >&2
   exit 2
@@ -395,6 +414,33 @@ modular_hasher() {
   elif command -v shasum >/dev/null 2>&1; then printf 'shasum -a 256'
   elif command -v cksum >/dev/null 2>&1; then printf 'cksum'
   fi
+}
+
+# Compile runtime_llvm.c to a cached `.o` under the native-modular cache root and
+# echo its path. The native-modular link owns exactly one runtime TU; without this
+# cache the link recompiles the ~1.9K-LOC runtime at -O2 on every build — the
+# dominant warm-build cost. $2 = extra defines: when the partitions merge the
+# separate-compilation runtime bitcode (KAI_SEPARATE_COMPILATION), this TU is the
+# OWNER that DEFINES the now-external state globals + main, so it compiles with
+# `-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1`; otherwise (legacy path,
+# no bitcode) it is the self-contained runtime with internal state. The key folds
+# those defines, so the two variants never collide. Echoes nothing on a
+# hasher-less system (the caller then compiles runtime_llvm.c inline as before).
+resolve_native_modular_runtime_obj() {
+  _rt_src="$1"
+  _rt_defs="${2:-}"
+  _rt_hasher="$(modular_hasher || true)"
+  [ -n "$_rt_hasher" ] || return 0
+  _rt_cache="$(resolve_native_modular_cache_dir)/runtime"
+  mkdir -p "$_rt_cache" 2>/dev/null || return 0
+  _rt_key="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; } | $_rt_hasher | awk '{print $1}' )"
+  _rt_obj="$_rt_cache/$_rt_key.o"
+  if [ ! -f "$_rt_obj" ]; then
+    # shellcheck disable=SC2086
+    $CC $CFLAGS $_rt_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
+      && mv "$_rt_obj.$$" "$_rt_obj" 2>/dev/null || { rm -f "$_rt_obj.$$" 2>/dev/null; return 0; }
+  fi
+  printf '%s' "$_rt_obj"
 }
 
 # Walk up from $1 looking for a kai.toml. Echoes the directory
@@ -1233,47 +1279,104 @@ compile_to_binary() {
     mkdir -p "$cache_proj_dir/.kai-cache" 2>/dev/null || true
     user_cache_flag="--user-cache"
   fi
-  if [ "$backend" = "native" ] && [ "${KAI_NATIVE_MODULAR:-0}" = "1" ]; then
-    # Native separate compilation. `kaic2 --emit=native-modular` partitions the
-    # whole-program KIR by module into one object per module (root + each mo),
-    # content-addressed under a per-project cache dir so an unchanged partition
-    # reuses its object across builds, and prints one object path per line. We
-    # link every object with the runtime owner (runtime_llvm.c) — the L1 model:
-    # one runtime TU, every generated object calls it extern. The frontend is
-    # whole-program; only the codegen + link fan out.
-    if [ -z "$RUNTIME_LLVM_C" ]; then
-      die "native-modular backend: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
-    fi
+  # Native separate compilation is the DEFAULT native path. `kaic2
+  # --emit=native-modular` partitions the whole-program KIR by module into one
+  # object per module (root + each mo), content-addressed under a per-project
+  # cache dir so an unchanged partition reuses its object across builds, and
+  # prints one object path per line. We link every partition + one cached runtime
+  # object (the L1 model: one runtime TU, every generated object calls it extern).
+  # The frontend stays whole-program; only codegen + link fan out.
+  #
+  # Two cases stay on the whole-program native path below: `--debug` (it emits a
+  # .dSYM the partitioned link does not), and a kaic2 built without libLLVM (the
+  # sentinel below degrades to C). KAI_NATIVE_MODULAR=0 forces whole-program too.
+  nm_inline_bc_env=""
+  [ -n "$RUNTIME_INLINE_BC" ] && nm_inline_bc_env="$RUNTIME_INLINE_BC"
+  # The partitioned path only earns its per-object codegen + bc-merge + O2 cost
+  # when the incremental cache pays it back: editing one module of a MULTI-module
+  # project re-emits one partition and reuses the rest. For a SINGLE-module
+  # program (one user `.kai`) there is nothing to reuse — every build re-emits
+  # the whole thing — and partitioning just pays ~3x the single-module
+  # whole-program codegen on the cold build that dominates (mono makes the stdlib
+  # partitions depend on the user program, so cross-program reuse is low by
+  # construction). So the default routes a single-module program through the fast
+  # whole-program path and only multi-module projects through partitioning. This
+  # also keeps a first build — and every one-shot ratchet/parity fixture — on the
+  # whole-program path, so cold never regresses. KAI_NATIVE_MODULAR=1 forces
+  # partitioning regardless (the tests that assert the partitioned path); =0
+  # forces whole-program.
+  # "Multi-module" = the entry file imports at least one LOCAL module (a sibling
+  # `.kai` in the source dir), the only shape partitioning helps. A standalone
+  # fixture (imports only stdlib, or nothing) has no local module to reuse, so it
+  # takes whole-program. Counting sibling-resolving imports — not files in the
+  # dir — keeps a fixture that happens to sit in a big shared corpus dir
+  # (examples/perceus/) on the whole-program path. `import a.b` also counts (its
+  # first segment names the sibling).
+  nm_local_imports=0
+  if [ "$backend" = "native" ]; then
+    nm_local_imports="$(
+      awk '/^[[:space:]]*import[[:space:]]/ { n=$2; sub(/\..*/,"",n); sub(/;.*/,"",n); print n }' "$src" 2>/dev/null \
+        | while read -r _m; do [ -f "$src_dir/$_m.kai" ] && echo x; done | wc -l | tr -d ' '
+    )"
+    [ -n "$nm_local_imports" ] || nm_local_imports=0
+  fi
+  nm_want=0
+  case "${KAI_NATIVE_MODULAR:-auto}" in
+    0) nm_want=0 ;;
+    1) nm_want=1 ;;
+    *) [ "$nm_local_imports" -gt 0 ] 2>/dev/null && nm_want=1 ;;
+  esac
+  if [ "$backend" = "native" ] && [ "$nm_want" = "1" ] \
+     && [ "${KAI_BUILD_MODE:-default}" != "debug" ] && [ -n "$RUNTIME_LLVM_C" ]; then
     src_base="$(basename "$src")"
-    # Per-project object directory: a stable subdir of the cache root keyed by
-    # the entry file's absolute path, so kaic2's content-addressed objects
-    # persist across builds of THIS project without colliding with another's.
+    # Per-project object cache dir, keyed by the entry file's absolute path AND
+    # the inline-bc digest: a project's objects persist across builds without
+    # colliding with another's, and a runtime-bitcode change invalidates the whole
+    # project cache (each partition `.o` has the runtime `kaix_*` inlined in, so a
+    # runtime edit must re-emit every partition even though the KIR is unchanged).
     nm_abs="$(cd "$src_dir" && pwd)/$src_base"
-    nm_key="$(printf '%s' "$nm_abs" | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null || cksum; } | awk '{print $1}')"
+    nm_bc_tag="none"
+    [ -n "$nm_inline_bc_env" ] && nm_bc_tag="$( { sha256sum "$nm_inline_bc_env" 2>/dev/null || shasum -a 256 "$nm_inline_bc_env" 2>/dev/null || cksum "$nm_inline_bc_env"; } | awk '{print $1}' )"
+    nm_key="$(printf '%s\n%s' "$nm_abs" "$nm_bc_tag" | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null || cksum; } | awk '{print $1}')"
     nm_dir="$(resolve_native_modular_cache_dir)/$nm_key"
     mkdir -p "$nm_dir" 2>/dev/null || nm_dir="$tmp"
     cp "$src" "$nm_dir/$src_base"
     nmerr="$tmp/native-modular.err"
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr"; then
+    if (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_INLINE_BC="$nm_inline_bc_env" "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr" \
+       && [ -s "$tmp/native-modular.objs" ]; then
+      nm_ldstack=""
+      [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
+      # Link every partition object + one runtime owner object. The runtime `.o`
+      # is cached (compiled once per toolchain, with $CFLAGS), so the warm link
+      # no longer recompiles the runtime source — the dominant warm-build cost.
+      # $CFLAGS rides the link: -O2 is free on already-compiled objects, and any
+      # sanitiser flags ($CFLAGS under ASAN/UBSAN) MUST reach the link so the
+      # sanitiser runtime resolves — dropping them left __asan_* undefined.
+      #
+      # When the inline bc was merged, the partitions reference the runtime's
+      # state globals as external, so the owner must EXPORT them: compile it with
+      # KAI_SEPARATE_COMPILATION + KAI_RUNTIME_OWNER. Without the inline bc the
+      # owner is the self-contained runtime (internal state), as before.
+      nm_owner_defs=""
+      [ -n "$nm_inline_bc_env" ] && nm_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1"
+      nm_objs="$(tr '\n' ' ' < "$tmp/native-modular.objs")"
+      nm_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$nm_owner_defs")"
+      # shellcheck disable=SC2086
+      if [ -n "$nm_rt_obj" ]; then
+        $CC $CFLAGS $nm_ldstack $nm_objs "$nm_rt_obj" -o "$out" -lm -ldl || die "native-modular link failed"
+      else
+        $CC $CFLAGS $nm_owner_defs $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl || die "native-modular link failed"
+      fi
+      return 0
+    fi
+    # native-modular did not produce objects. A kaic2 without libLLVM prints the
+    # known sentinel — fall through to the whole-program native path below, which
+    # degrades to C. Any other failure is a real error we surface there too, so
+    # the whole-program path re-runs the compile and reports it verbatim.
+    if ! grep -q "not built into this compiler" "$nmerr" 2>/dev/null; then
       cat "$nmerr" >&2
-      exit 1
     fi
-    # The compiler prints one object path per line. Empty = a codegen failure it
-    # already reported.
-    if [ ! -s "$tmp/native-modular.objs" ]; then
-      cat "$nmerr" >&2
-      die "native-modular backend: no objects produced"
-    fi
-    nm_ldstack=""
-    [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
-    # Link every partition object + the runtime owner (one TU compiled here).
-    nm_objs="$(tr '\n' ' ' < "$tmp/native-modular.objs")"
-    # shellcheck disable=SC2086
-    if ! $CC $CFLAGS $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl; then
-      die "native-modular link failed"
-    fi
-    return 0
   fi
   if [ "$backend" = "native" ]; then
     # KIR Lane 1.5: the in-process libLLVM native backend is the default.
