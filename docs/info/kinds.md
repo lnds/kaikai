@@ -44,6 +44,7 @@ Every kind is declared in `stdlib/core/kinds.kai` over a theory:
 | `Currency` | `Module` | currencies (`USD`, `EUR`) |
 | `Region` | `Structural` | memory arenas (each `region { r -> }` mints one) |
 | `Layout` | `Composition` | byte-order modifiers (`be`, `le`) |
+| `Shape` | `Structural` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
 
 `Type` and `Effect` are `builtin`: their engine is the compiler core
 itself (HM unification, row unification), and they are closed — user
@@ -120,6 +121,57 @@ a composed annotation is rejected at the spot that writes it:
 
 ```kaikai-neg
 fn bad(x: U32<be^2>) : Int = 0        # be^2 does not exist
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+## Shape — the kind of arity-1 constructors
+
+`Shape` classifies **arity-1 type constructors** — `List`, `Vec`,
+`Option`, or a user `Tree[a]`. Its habitants are *derived*: every
+`type T[a] = ...` of exactly one type parameter is automatically a
+`Shape` habitant (its bare constructor `T`), so `Shape` takes no
+`with` introducer. `Structural` gives identity — two shapes unify iff
+they are the same constructor symbol.
+
+A `[s: Shape]` type parameter is applied as `s[A]`, letting a protocol
+quantify over the container itself — the expressiveness a functor
+gives, without HKT's cost. `s[A] ~ List[Int]` unifies first-order
+(`s := List, A := Int`); after monomorphisation the dispatch is an
+`O(1)` static call, no runtime indirection:
+
+```kaikai
+protocol Container[s: Shape] {
+  first(xs: s[Int]) : Int
+}
+
+type Box[a] = Box(a)
+
+impl Container for Box {
+  fn first(xs: Box[Int]) : Int = match xs {
+    Box(v) -> v
+  }
+}
+
+impl Container for List {
+  fn first(xs: [Int]) : Int = match xs {
+    []          -> 0
+    [h, ..._t]  -> h
+  }
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(int_to_string(first(Box(7))))
+  Stdout.print(int_to_string(first([3, 4, 5])))
+}
+```
+
+A shape is atomic: it applies to exactly one type. Arity-2 (`Map`) is
+not a `Shape`, and composition `s[t[..]]` (two stacked shape variables)
+is rejected at formation — the cases that would reintroduce
+higher-order unification:
+
+```kaikai-neg
+fn bad[s: Shape, t: Shape](xs: s[t[Int]]) : Int = 0   # composition
 fn main() : Unit / Stdout = Stdout.print("no")
 ```
 

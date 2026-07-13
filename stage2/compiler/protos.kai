@@ -944,15 +944,17 @@ fn sig_head_subst(t: TypeExpr, tname: String,
 # Position-aligned lookup: `proto_tps[i]` -> `arg_heads[i]`. When
 # `arg_heads == []` (legacy un-parametrised impl), every protocol
 # tparam falls back to the target head — the homogeneous default
-# encoded in `lower_impls`.
+# encoded in `lower_impls`. A tparam's stored name may carry a kind
+# marker (`s#Shape`); the surface name is compared, so a `[s: Shape]`
+# carrier binds `s := <target head>` exactly as a bare `[a]` does.
 fn tparam_subst(n: String, tps: [String], heads: [String],
                 tname: String) : Option[String] {
   match tps {
     [] -> None
     [t, ...trest] -> match heads {
-      [] -> if t == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
+      [] -> if tp_strip_kind(t) == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
       [h, ...hrest] ->
-        if t == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
+        if tp_strip_kind(t) == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
     }
   }
 }
@@ -4797,7 +4799,8 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         # return head would misroute a no-impl receiver (e.g. `Bare`
         # with no `impl Show`) onto an unrelated impl whose head happens
         # to equal the concrete return head (`String`).
-        else if not proto_op_self_only_in_return(params, ret_te) {
+        else if not proto_op_self_only_in_return(params, ret_te,
+                       proto_shape_carriers(reg.tparams, pname)) {
           try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
         } else {
           match self_head_in_ret(ret_te, ret_ty) {
@@ -4870,10 +4873,12 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
         if list_length(params) != list_length(args_) {
           try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
         }
-        # When Self appears only in the op's return position (e.g.
-        # `from(x: a) : Self`), the args carry no Self information —
-        # defer to the caller-provided ret_ty (the `_with_ret` wrapper).
-        else if proto_op_self_only_in_return(params, ret) {
+        # When Self (or the protocol's `Shape` carrier) appears only in
+        # the op's return position (e.g. `from(x: a) : Self`), the args
+        # carry no dispatch information — defer to the caller-provided
+        # ret_ty (the `_with_ret` wrapper).
+        else if proto_op_self_only_in_return(params, ret,
+                  proto_shape_carriers(reg.tparams, pname)) {
           try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
         } else {
           match find_proto_impl_for_args(reg, pname, opname, args_) {
@@ -4890,14 +4895,28 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
 }
 
 # Issue #180: returns true when none of the op's parameter types
-# contains `Self`, i.e. Self is only informed by the return type.
-# Such ops can only be dispatched via the surrounding expected type
-# (typed-hole error otherwise).
-fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr) : Bool {
+# contains `Self` (nor the protocol's `Shape` carrier), i.e. dispatch
+# is informed only by the return type. Such ops can only be dispatched
+# via the surrounding expected type (typed-hole error otherwise).
+fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
+                                carriers: [String]) : Bool {
   not list_any(params, (p) => match p.ptype {
-    Some(te) -> te_mentions_self(te)
+    Some(te) -> te_mentions_self_or_carrier(te, carriers)
     None -> false
   })
+}
+
+# The surface names of a protocol's `Shape`-kind tparams — the dispatch
+# carriers whose applied form `s[A]` a call resolves against, mirroring
+# how `Self` informs an ordinary protocol's dispatch.
+fn proto_shape_carriers(tps: [ProtoTPReg], pname: String) : [String] =
+  shape_carrier_names(proto_tparams_for(tps, pname), [])
+
+fn shape_carrier_names(names: [String], acc: [String]) : [String] = match names {
+  [] -> list_reverse(acc)
+  [n, ...rest] ->
+    if tp_kind_is_shape(n) { shape_carrier_names(rest, [tp_strip_kind(n), ...acc]) }
+    else { shape_carrier_names(rest, acc) }
 }
 
 fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
@@ -4919,6 +4938,32 @@ fn te_kind_mentions_self(k: TyKind) : Bool {
     # issue #772: a compound row carries effect labels, never `Self`.
     TyRow(_) -> false
   }
+}
+
+# As `te_mentions_self` but also treats a `Shape`-carrier head as a
+# dispatch informant: `xs: s[A]` with `s` the protocol carrier makes the
+# op arg-dispatched, exactly as `xs: Self` would.
+fn te_mentions_self_or_carrier(te: TypeExpr, carriers: [String]) : Bool =
+  te_kind_mentions_self_or_carrier(te.tkind, carriers)
+
+fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [String]) : Bool {
+  match k {
+    TyName(name, targs) ->
+      if name == "Self" or list_has(carriers, name) { true }
+      else { te_list_mentions_self_or_carrier(targs, carriers) }
+    TyList(inner) -> te_mentions_self_or_carrier(inner, carriers)
+    TyFn(ps, r, _) -> te_list_mentions_self_or_carrier(ps, carriers) or
+                      te_mentions_self_or_carrier(r, carriers)
+    TyDim(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRefine(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRow(_) -> false
+  }
+}
+
+fn te_list_mentions_self_or_carrier(tes: [TypeExpr], carriers: [String]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self_or_carrier(t, carriers) { true }
+                  else { te_list_mentions_self_or_carrier(rest, carriers) }
 }
 
 fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
@@ -5142,6 +5187,9 @@ pub fn ty_head_name(t: Ty) : Option[String] {
     # — `Int where >= 0` and `Int` resolve to the same `impl`.
     TyRefineT(base, _) -> ty_head_name(base)
     TyVarT(_)      -> None
+    # an unresolved shape app has no concrete head; dispatch is post-mono
+    # once the shape var binds to a constructor, exactly like `TyVarT`.
+    TyShapeApp(_, _) -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None
     # issue #187 phase 1: a union has no single head type, so

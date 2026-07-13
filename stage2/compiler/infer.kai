@@ -453,6 +453,9 @@ fn inf_mangle_ty(t: Ty) : String {
       }
     }
     TyVarT(_) -> "TVAR"
+    # a resolved shape app is erased to its constructor before mangling;
+    # an unresolved one signals a bug, flagged like `TVAR`.
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", inf_mangle_ty(arg)])
     TyAny     -> "Any"
     # units are erased at codegen time. The mangled name for a
     # dimensioned type is the same as its base type's mangle — so a
@@ -1342,6 +1345,10 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
     TyRefineT(ab, _) -> match b { TyRefineT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
+    TyShapeApp(asv, aa) -> match b {
+      TyShapeApp(bsv, ba) -> asv == bsv and inf_ty_eq(aa, ba)
+      _ -> false
+    }
     # two unions are equal iff their canonical
     # component lists are point-wise equal. Callers that hand us a
     # `TyUnion` constructed via `normalize_union` get this for free;
@@ -1413,6 +1420,8 @@ fn inf_ty_head_name(t: Ty) : Option[String] {
     # — `Int where >= 0` and `Int` resolve to the same `impl`.
     TyRefineT(base, _) -> inf_ty_head_name(base)
     TyVarT(_)      -> None
+    # an unresolved shape app has no concrete head — dispatch is post-mono.
+    TyShapeApp(_, _) -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None
     # a union has no single head type, so
@@ -1492,6 +1501,8 @@ pub fn inf_ty_to_string(t: Ty) : String {
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
+    # a still-unresolved shape application prints as `?sN[Arg]`.
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", inf_ty_to_string(arg), "]"])
     TyAny -> "?"
     # render dimensioned base types as `Real<u>` / `Int<u>`.
     # The unit goes through unit_canon so the printed form matches
@@ -3717,6 +3728,8 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_uvars_ty(p, m)),
                                   canon_uvars_ty(ret, m), canon_uvars_row(row, m))
     TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => canon_uvars_ty(a, m)))
+    # the shape var id is a tvar, not a unit var — leave it, recurse arg.
+    TyShapeApp(sv, arg) -> TyShapeApp(sv, canon_uvars_ty(arg, m))
     TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
     TyRefineT(base, p) -> TyRefineT(canon_uvars_ty(base, m), p)
     # a union's components are unit-vars-free
@@ -3785,6 +3798,11 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
                                   canon_tvars_ty(ret, m), canon_tvars_row(row, m))
     TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => canon_tvars_ty(a, m)))
+    # the shape var id shares the tvar pool, so renumber it too.
+    TyShapeApp(sv, arg) -> match intpair_lookup(m, sv) {
+      Some(b) -> TyShapeApp(b, canon_tvars_ty(arg, m))
+      None    -> TyShapeApp(sv, canon_tvars_ty(arg, m))
+    }
     TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
     TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
     # see `canon_uvars_ty`. Renumbering tvars
@@ -3877,7 +3895,12 @@ fn tpbind_lookup(binds: [TPBind], name: String) : Option[Int] {
 pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
   match t.tkind {
     TyName(name, tas) -> {
-      match tpbind_lookup(binds, name) {
+      match shape_tparam_lookup(binds, name) {
+        Some(sid) -> match tas {
+          [arg] -> TyShapeApp(sid, resolve_ty_with_tparams(arg, binds))
+          _ -> tv(sid)
+        }
+        None -> match tpbind_lookup(binds, name) {
         Some(i) -> tv(i)
         None -> {
           if name == "Int"    { TyInt }
@@ -3900,6 +3923,7 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind]) : Ty {
           else if name == "Nothing" { TyAny }
           else { TyCon(None, name, resolve_tas_with(tas, binds)) }
         }
+      }
       }
     }
     TyList(inner) -> list_ty(resolve_ty_with_tparams(inner, binds))
@@ -5138,7 +5162,15 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
 fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
   match t.tkind {
     TyName(name, tas) -> {
-      match tpbind_lookup(tpbinds, name) {
+      match shape_tparam_lookup(tpbinds, name) {
+        # A shape tparam applied to its single type argument forms `s[A]`.
+        # A bare `s` (no args) is the unapplied shape variable. More than
+        # one arg is an arity violation caught by the formation validator.
+        Some(sid) -> match tas {
+          [arg] -> TyShapeApp(sid, resolve_ty_with_binds_rk(arg, tpbinds, rbinds, rk))
+          _ -> tv(sid)
+        }
+        None -> match tpbind_lookup(tpbinds, name) {
         Some(i) -> tv(i)
         None -> {
           if name == "Int" { TyInt }
@@ -5163,6 +5195,7 @@ fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk
           # logic in one place.
           else { TyCon(None, name, resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk)) }
         }
+      }
       }
     }
     TyList(inner) -> TyListT(resolve_ty_with_binds_rk(inner, tpbinds, rbinds, rk))
@@ -5251,6 +5284,21 @@ fn unit_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
       TPB(stored, id) -> {
         if tp_kind_is_unit(stored) and tp_strip_kind(stored) == surface { Some(id) }
         else { unit_tparam_lookup(rest, surface) }
+      }
+    }
+  }
+}
+
+# Look up a shape-kind tparam by its surface name. Shape params store a
+# `#Shape` suffix, so the surface name in constructor position (`s` in
+# `s[A]`) is matched against the stripped stored name.
+fn shape_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      TPB(stored, id) -> {
+        if tp_kind_is_shape(stored) and tp_strip_kind(stored) == surface { Some(id) }
+        else { shape_tparam_lookup(rest, surface) }
       }
     }
   }
@@ -6579,6 +6627,14 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     TyListT(inner) -> TyListT(apply_ty(s, inner))
     TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), apply_row(s, row))
     TyCon(mo_, name, atys) -> TyCon(mo_, name, apply_tys(s, atys))
+    # Once the shape var binds to a constructor witness, reconstruct the
+    # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
+    # a resolved `TyShapeApp` never survives past substitution. Unbound,
+    # only the argument is walked.
+    TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
+      Some(wit) -> shape_reapply(apply_ty(s, wit), apply_ty(s, arg))
+      None      -> TyShapeApp(sv, apply_ty(s, arg))
+    }
     # applying a substitution to a dimensioned type recurses into
     # both the base type and the unit expression. Unit-vars chase
     # through unit_slots; everything else passes through unchanged.
@@ -7152,6 +7208,10 @@ fn apply_ty_keep_row_labels(s: Subst, t: Ty) : Ty {
             apply_ty_keep_row_labels(s, ret),
             apply_row_tail_only(s, row))
     TyCon(mo_, name, atys) -> TyCon(mo_, name, apply_ty_keep_row_labels_list(s, atys))
+    TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
+      Some(wit) -> shape_reapply(apply_ty_keep_row_labels(s, wit), apply_ty_keep_row_labels(s, arg))
+      None      -> TyShapeApp(sv, apply_ty_keep_row_labels(s, arg))
+    }
     TyDimT(base, u) -> dim_collapse(apply_ty_keep_row_labels(s, base), apply_unit(s, u))
     TyRefineT(base, p) -> TyRefineT(apply_ty_keep_row_labels(s, base), p)
     TyUnion(parts) -> normalize_union(apply_ty_keep_row_labels_list(s, parts))
@@ -7182,6 +7242,9 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyListT(inner) -> occurs(v, inner, s)
     TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
     TyCon(_, _, atys) -> occurs_any(v, atys, s)
+    # the shape var id shares the tvar pool, so `v` may be the head; it
+    # also occurs inside the argument.
+    TyShapeApp(sv, arg) -> v == sv or occurs(v, arg, s)
     # TyDimT carries a base Ty to recurse into; the unit side
     # has its own occurs_unit guard inside unify_abelian.
     TyDimT(base, _) -> occurs(v, base, s)
@@ -7242,6 +7305,11 @@ fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
         }
         _ -> match b {
           TyVarT(m) -> if occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
+          # a shape application on the right is normalised to the left so
+          # the single `TyShapeApp` arm in `unify_heads` handles both
+          # directions symmetrically.
+          TyShapeApp(_, _) -> match a { TyShapeApp(_, _) -> unify_heads(env, a, b, s)
+                                        _ -> unify_heads(env, b, a, s) }
           _ -> unify_heads(env, a, b, s)
         }
       }
@@ -7395,8 +7463,58 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       TyUnion(bps) -> unify_list(env, aps, bps, s)
       _ -> None
     }
+    # First-order shape application: `s[A] ~ D[B]` binds `s := D`
+    # (a nullary constructor witness) and unifies `A ~ B`. The witness
+    # carries the constructor head only; `apply_ty` reconstructs `D[A]`.
+    # A `List` head witnesses as `TyCon(None,"List",[])` and rebuilds to
+    # `TyListT`. No witness (`Int`, arity-2 `Map`) fails cleanly — the
+    # strict-arity-1, no-higher-order rule.
+    TyShapeApp(sv, a1) -> match shape_witness_of(b) {
+      Some(wit) -> match shape_bind(sv, wit, a1, s) {
+        None -> None
+        Some(s1) -> unify_env(env, a1, shape_arg_of(b), s1)
+      }
+      None -> None
+    }
   }
 }
+
+# The unapplied-constructor witness of a saturated arity-1 type, or None
+# when it is not a single-arg constructor a `Shape` variable may bind to
+# (`Int`, arity-2 `Map`, functions). `List` witnesses as a nullary
+# `TyCon(None,"List",[])`; `reapply` maps that head back to `TyListT`.
+#[doc("The nullary constructor witness a `Shape` variable binds to when applied against a saturated arity-1 type.")]
+pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
+  TyListT(_) -> Some(TyCon(None, "List", []))
+  TyCon(m, n, args) -> match args { [_one] -> Some(TyCon(m, n, [])) _ -> None }
+  _ -> None
+}
+
+# The single type argument of a saturated arity-1 type.
+#[doc("The single type argument of a saturated arity-1 type (for shape-app decomposition).")]
+pub fn shape_arg_of(t: Ty) : Ty = match t {
+  TyListT(inner) -> inner
+  TyCon(_, _, [a]) -> a
+  _ -> TyAny
+}
+
+# Reapply a resolved constructor witness to an argument, reversing
+# `shape_witness_of`. INVARIANT: the `List` witness always rebuilds to
+# the dedicated `TyListT` node, never `TyCon(_,"List",[a])` — those two
+# are distinct in the unifier and must not diverge. A witness that is
+# not a nullary constructor (a stray binding) passes the argument
+# through unchanged.
+#[doc("Reconstruct a concrete applied type from a resolved shape witness and its argument.")]
+pub fn shape_reapply(wit: Ty, arg: Ty) : Ty = match wit {
+  TyCon(_, "List", []) -> TyListT(arg)
+  TyCon(m, n, []) -> TyCon(m, n, [arg])
+  _ -> wit
+}
+
+# Bind a shape variable to its constructor witness with an occurs-check
+# over the pending argument, then record `sv := witness` in the subst.
+fn shape_bind(sv: Int, wit: Ty, arg: Ty, s: Subst) : Option[Subst] / Mutable =
+  if occurs(sv, arg, s) { None } else { Some(subst_extend(s, sv, wit)) }
 
 # ---- instantiation ----
 #
@@ -18709,6 +18827,148 @@ fn ambig_first_kind(kinds: [String]) : String = match kinds {
 # (e.g. SI base units shipped as part of the language) without
 # editing the per-fixture declaration list.
 fn is_builtin_unit_symbol(_s: String) : Bool = false
+
+# ----------------------------------------------------------------------
+# Shape-application formation pass.
+#
+# A `[s: Shape]` tparam is an arity-1 constructor applied as `s[A]`.
+# Formation is strict: `s` takes exactly one type argument, and that
+# argument may not itself be a bare shape variable (no `s[t[A]]`
+# composition — the case that would reintroduce higher-order
+# unification). Both are rejected here with a clear diagnostic, at the
+# signature that writes them, so the user gets a recipe rather than a
+# downstream unification failure.
+
+#[doc("infer: validate `Shape`-tparam application formation across the decl stream; returns the error count.")]
+pub fn validate_shape_refs_decls(decls: [Decl], file: String) : Int / Console + File =
+  validate_shape_refs_loop(decls, file, 0)
+
+fn validate_shape_refs_loop(decls: [Decl], file: String, errs: Int) : Int / Console + File =
+  match decls {
+    [] -> errs
+    [d, ...rest] -> validate_shape_refs_loop(rest, file, errs + validate_shape_refs_decl(d, file))
+  }
+
+fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = match d {
+  DFn(_, _, tparams, ps, ret, _, _, _, _, _) -> {
+    let shapes = collect_shape_tparam_names(tparams)
+    let e0 = validate_shape_refs_params(ps, shapes, file, 0)
+    match ret {
+      Some(te) -> e0 + validate_shape_refs_te(te, shapes, file)
+      None -> e0
+    }
+  }
+  DProtocol(_, _, tparams, ops, _, _) -> {
+    let shapes = collect_shape_tparam_names(tparams)
+    validate_shape_refs_protoops(ops, shapes, file, 0)
+  }
+  DEffect(_, _, _, ops, _, _, _, _) -> validate_shape_refs_eops(ops, [], file, 0)
+  DImpl(_, _, _, sub_decls, _, _) -> validate_shape_refs_loop(sub_decls, file, 0)
+  DDerive(_, inner, _, _) -> validate_shape_refs_decl(inner, file)
+  DUnstable(inner, _, _) -> validate_shape_refs_decl(inner, file)
+  DConstructor(inner, _, _) -> validate_shape_refs_decl(inner, file)
+  _ -> 0
+}
+
+# The surface names of a decl's `Shape`-kind tparams (the applied
+# constructor variables valid in its signature).
+fn collect_shape_tparam_names(tparams: [String]) : [String] =
+  collect_shape_tparam_names_loop(tparams, [])
+
+fn collect_shape_tparam_names_loop(tparams: [String], acc: [String]) : [String] = match tparams {
+  [] -> list_reverse(acc)
+  [n, ...rest] ->
+    if tp_kind_is_shape(n) { collect_shape_tparam_names_loop(rest, [tp_strip_kind(n), ...acc]) }
+    else { collect_shape_tparam_names_loop(rest, acc) }
+}
+
+fn validate_shape_refs_params(ps: [Param], shapes: [String], file: String,
+                              acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [p, ...rest] -> {
+    let e1 = match p.ptype {
+      Some(te) -> acc + validate_shape_refs_te(te, shapes, file)
+      None -> acc
+    }
+    validate_shape_refs_params(rest, shapes, file, e1)
+  }
+}
+
+fn validate_shape_refs_protoops(ops: [ProtoOp], shapes: [String], file: String,
+                                acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [POp(_, _, ps, ret, _, _), ...rest] -> {
+    let e1 = acc + validate_shape_refs_params(ps, shapes, file, 0) +
+              validate_shape_refs_te(ret, shapes, file)
+    validate_shape_refs_protoops(rest, shapes, file, e1)
+  }
+}
+
+fn validate_shape_refs_eops(ops: [EffectOp], shapes: [String], file: String,
+                            acc: Int) : Int / Console + File = match ops {
+  [] -> acc
+  [EOp(_, _, ps, ret, _, _), ...rest] -> {
+    let e1 = acc + validate_shape_refs_params(ps, shapes, file, 0) +
+              validate_shape_refs_te(ret, shapes, file)
+    validate_shape_refs_eops(rest, shapes, file, e1)
+  }
+}
+
+# Walk a signature TypeExpr; a `TyName(s, args)` whose head is a shape
+# variable must apply it to exactly one argument, and that argument may
+# not be a bare shape variable (composition). Nested positions recurse.
+fn validate_shape_refs_te(te: TypeExpr, shapes: [String], file: String) : Int / Console + File =
+  match te.tkind {
+    TyName(name, targs) ->
+      if list_has(shapes, name) {
+        let e_arity = if list_length(targs) == 1 { 0 } else {
+          eprint(concat_all([file, ":", int_to_string(te.line), ":", int_to_string(te.col),
+            ": error: shape `", name, "` must be applied to exactly one type argument (`",
+            name, "[A]`); it is an arity-1 constructor"]))
+          1
+        }
+        e_arity + validate_shape_refs_te_list(targs, shapes, file, 0)
+      } else {
+        # a concrete head whose argument is a bare shape var is
+        # composition `t[s[..]]` only when the arg head is itself a
+        # shape variable — checked as we recurse below.
+        validate_shape_refs_te_composition(targs, shapes, file, 0)
+      }
+    TyList(inner) -> validate_shape_refs_te(inner, shapes, file)
+    TyFn(ps, ret, _) -> validate_shape_refs_te_list(ps, shapes, file, 0) +
+                        validate_shape_refs_te(ret, shapes, file)
+    TyDim(base, _) -> validate_shape_refs_te(base, shapes, file)
+    TyRefine(base, _) -> validate_shape_refs_te(base, shapes, file)
+    TyRow(_) -> 0
+  }
+
+# The argument of a shape application must not be a bare shape variable:
+# `s[t[Int]]` with `t` a shape var is composition, rejected at formation.
+fn validate_shape_refs_te_list(tes: [TypeExpr], shapes: [String], file: String,
+                               acc: Int) : Int / Console + File = match tes {
+  [] -> acc
+  [t, ...rest] -> {
+    let e_comp = match t.tkind {
+      TyName(hn, _) ->
+        if list_has(shapes, hn) {
+          eprint(concat_all([file, ":", int_to_string(t.line), ":", int_to_string(t.col),
+            ": error: shape composition `s[t[..]]` is not supported: `", hn,
+            "` is a shape variable and may not stand under another shape application"]))
+          1
+        } else { 0 }
+      _ -> 0
+    }
+    validate_shape_refs_te_list(rest, shapes, file, acc + e_comp + validate_shape_refs_te(t, shapes, file))
+  }
+}
+
+fn validate_shape_refs_te_composition(tes: [TypeExpr], shapes: [String], file: String,
+                                      acc: Int) : Int / Console + File = match tes {
+  [] -> acc
+  [t, ...rest] ->
+    validate_shape_refs_te_composition(rest, shapes, file,
+      acc + validate_shape_refs_te(t, shapes, file))
+}
 
 # ----------------------------------------------------------------------
 # Pub-signature privacy pass (Hanga Roa import-filter lane, step 1).
