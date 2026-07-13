@@ -93,6 +93,20 @@
  * (tools/runtime-globals.allow). */
 #define KAI_TLS _Thread_local
 
+/* Number of OS scheduler threads (M:N). Read once from KAI_THREADS at
+ * startup (kai_sched_bootstrap), immutable after — published before any
+ * worker spawns, so no lock. Class B. Declared here, ahead of the
+ * allocator, because the slab/pool hot paths branch on it (N==1 keeps
+ * the pre-M:N single-thread behaviour byte-identical). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_nthreads;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_nthreads = 1;
+#  endif
+#else
+static int kai_nthreads = 1;
+#endif
+
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
  * blocking-only: the m8.x cooperative scheduler (landed v0.4.0)
@@ -117,6 +131,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* Stack buffer size for filesystem path operations (realpath, dirname,
  * join, etc.). Replaces the bare 4096 literal that was copy-pasted across
@@ -2081,7 +2096,16 @@ static void *kai_slab_alloc(size_t sz) {
         kai_slab_list[kai_slab_count++] = slab;
         kai_slab_cur = slab;
         kai_slab_off = 0;
-        if (!kai_slab_atexit) { atexit(kai_slab_teardown); kai_slab_atexit = 1; }
+        /* At N>1 a variant block allocated on this thread's slab can
+         * migrate (with a cross-thread message copy) into another
+         * thread's block pool and be reused there, so a per-thread slab
+         * free at exit would pull the ground out from under a live block
+         * on another thread. Under M:N the OS reclaims all slabs at
+         * process exit instead; the teardown (whose only purpose is a
+         * clean ASAN "0 still-reachable" at N=1) is not registered. */
+        if (!kai_slab_atexit && kai_nthreads <= 1) {
+            atexit(kai_slab_teardown); kai_slab_atexit = 1;
+        }
     }
     void *p = kai_slab_cur + kai_slab_off;
     kai_slab_off += sz;
@@ -2594,7 +2618,12 @@ typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined bel
 
 struct KaiFiber {
     KaiEvidence    *evidence_top;
-    int             cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
+    /* M:N — the ONE per-fiber field that goes atomic. A cross-thread
+     * Spawn.cancel writes it (relaxed) while the target reads it at its
+     * own yield points (acquire); making it _Atomic keeps that the sole
+     * synchronized field and leaves the object-RC hot path atomic-free.
+     * At N=1 an _Atomic int on this platform is a plain aligned int. */
+    _Atomic int     cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
     int             cancel_delivered;  /* Cancel.raise() injected once (#4)   */
     KaiFiber       *sched_next;        /* intrusive ready-queue link          */
     KaiFiber       *parent;            /* spawning fiber, NULL for the root   */
@@ -2721,6 +2750,23 @@ struct KaiFiber {
      * nursery is open (bare spawns then have no scope to join). */
     struct KaiNursery *nursery_top;
     KaiFiber          *scope_sibling_next;
+    /* M:N scheduler — the OS scheduler thread that owns this fiber's
+     * heap and runs it. A fiber runs on exactly one thread at a time;
+     * `home_thread` is where it was spawned and where it parks. A
+     * cross-thread `Actor.send` reads it (lock-free) to decide copy vs
+     * pointer transfer, and a thief writes it (lock-free) when it steals
+     * the fiber — so it is atomic: the store publishes the new owner and
+     * every reader acquire-loads it, matching the `live`-slot discipline.
+     * Under N=1 every fiber's home_thread is 0, the copy branch is never
+     * taken, and an _Atomic int is a plain aligned int on our targets. */
+    _Atomic int home_thread;
+    /* M:N — a cross-thread wake that arrives while this fiber is still
+     * RUNNING (it enqueued its recv-waiter but has not yet reached the
+     * park swap) is recorded here instead of lost. The park path checks
+     * it after marking PARKED and re-readies itself if non-zero, closing
+     * the enqueue-waiter / park lost-wakeup window. Touched only under
+     * the owner slot lock. */
+    int wake_pending;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -2766,7 +2812,9 @@ struct KaiNursery {
     NULL,                /* mailbox — set by with_mailbox if main uses one */ \
     NULL,                /* monitor_head — Monitor.monitor(...) appends here */ \
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
-    NULL, NULL           /* nursery_top, scope_sibling_next */           \
+    NULL, NULL,          /* nursery_top, scope_sibling_next */           \
+    0,                   /* home_thread — thread 0 is the main scheduler */ \
+    0                    /* wake_pending */                              \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -2832,6 +2880,71 @@ static KAI_TLS KaiFiber *kai_ready_tail = NULL;
 static KAI_TLS int       kai_parked_count = 0;  /* deadlock detection */
 #endif
 
+/* ==================================================================
+ * M:N work-stealing scheduler — cross-thread infrastructure.
+ * docs/mn-scheduler-design.md §2. Off entirely at N=1 (the default):
+ * kai_nthreads==1 makes every cross-thread branch below inert, so the
+ * single-thread scheduler runs byte-identically to the pre-M:N runtime.
+ * ================================================================== */
+
+/* This scheduler thread's id: 0 is the main thread, 1..N-1 the workers.
+ * Class A (per-thread). A freshly spawned fiber inherits its spawner's
+ * id as home_thread. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS int kai_thread_id;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS int kai_thread_id = 0;
+#  endif
+#else
+static KAI_TLS int kai_thread_id = 0;
+#endif
+
+/* Per-thread scheduler slot: this thread's ready deque, the single
+ * source of truth at N>1. The owner pushes/pops both ends and a thief
+ * pulls the head, all under `mu` — the mutex is touched only on
+ * enqueue/dequeue/steal/remote-unpark, never on the per-op RC path.
+ * `live` marks the slot as a steal target once its thread is running; a
+ * thief reads it outside `mu` (before deciding to lock), so it is atomic:
+ * a worker publishes `live=1` at startup and every thief acquire-loads it. */
+typedef struct KaiSchedSlot {
+    pthread_mutex_t mu;
+    KaiFiber       *steal_head;   /* fibers available to steal (FIFO) */
+    KaiFiber       *steal_tail;
+    _Atomic int     live;         /* slot participates in stealing */
+} KaiSchedSlot;
+
+#define KAI_MAX_THREADS 256
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#  endif
+#else
+static KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#endif
+
+/* Count of threads currently idle (blocked on their cv). A cross-thread
+ * producer reads it to decide whether a wakeup signal is worth sending;
+ * The workers poll `kai_sched_shutting_down` at the top of their loop, so
+ * it is atomic (a single writer at shutdown, many lock-free readers) and
+ * needs no lock — the scheduler has no other cross-thread global state
+ * beyond the per-slot deques. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_sched_shutting_down;   /* main returned → workers exit */
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_sched_shutting_down = 0;
+#  endif
+#else
+static _Atomic int kai_sched_shutting_down = 0;
+#endif
+
+/* M:N forward decls — bodies live alongside the scheduler primitives.
+ * `kai_sched_remote_unpark` promotes a fiber owned by another thread:
+ * it enqueues onto that thread's steal deque and wakes it. Used by the
+ * cross-thread mailbox send path (which runs on the sender's thread but
+ * must resume a receiver parked on the owner's thread). */
+static void kai_sched_remote_unpark(KaiFiber *target);
+static void kai_sched_wake_thread(int tid);
 /* Single-slot pending-free for fiber structs whose wrappers went to RC=0
  * while the fiber itself was still the current fiber (the trampoline tail's
  * kai_decref(self->value) is the producer). Drained at every entry point
@@ -2938,6 +3051,13 @@ struct KaiMailbox {
      * lands in m8.x #6) will set owner_fiber to the spawned
      * fiber instead. */
     KaiFiber    *owner_fiber;
+    /* M:N — guards the node list against a cross-thread `Actor.send`.
+     * A same-thread send (owner on the sender's thread, the only case
+     * at N=1) takes the fast path and never locks. A cross-thread send
+     * deep-copies the message into the sender's heap, then appends the
+     * node under this lock and wakes the owner's scheduler thread. */
+    pthread_mutex_t mu;
+    int             mu_inited;
 };
 
 /* Phase 5 — intrusive linked-peer chain on KaiFiber. A bidirectional
@@ -3039,9 +3159,28 @@ static int       kai_reactor_park_signal(KaiFiber *f);
  * the reactor block (~line 7030, alongside kai_reactor_sigchld_handler). */
 static void      kai_reactor_signal_handler(int sig);
 
+/* M:N — arm the per-mailbox cross-thread lock. The mailbox is created
+ * on one thread (its allocating fiber), so this init never races. At
+ * N=1 the lock is armed but never taken (every send is same-thread). */
+static void kai_mailbox_init_mu(KaiMailbox *mb) {
+    if (kai_nthreads > 1 && !mb->mu_inited) {
+        pthread_mutex_init(&mb->mu, NULL);
+        mb->mu_inited = 1;
+    }
+}
+
+/* Serialize a mailbox op against cross-thread senders. A no-op unless
+ * the lock was armed (N>1), so the single-thread pop/push paths stay
+ * lock-free and byte-identical. The owner's pop and same-thread pushes
+ * run on one thread cooperatively — they need the lock only to exclude
+ * a concurrent cross-thread send, never each other. */
+static inline void kai_mbox_lock(KaiMailbox *mb)   { if (mb->mu_inited) pthread_mutex_lock(&mb->mu); }
+static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_mutex_unlock(&mb->mu); }
+
 static KaiMailbox *kai_mailbox_alloc(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    kai_mailbox_init_mu(mb);
     /* default policy: unbounded — matches m8 #7 behaviour. */
     mb->cap          = 0;
     mb->overflow     = KAI_OVERFLOW_UNBOUNDED;
@@ -3067,6 +3206,7 @@ static KaiMailbox *kai_mailbox_alloc(void) {
 static KaiMailbox *kai_mailbox_alloc_unowned(void) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    kai_mailbox_init_mu(mb);
     mb->cap         = 0;
     mb->overflow    = KAI_OVERFLOW_UNBOUNDED;
     mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
@@ -3076,6 +3216,7 @@ static KaiMailbox *kai_mailbox_alloc_unowned(void) {
 static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    kai_mailbox_init_mu(mb);
     /* Phase 4: BlockSender now supported via the per-mailbox sender
      * waiter queue + cooperative parking on full push. */
     mb->cap          = cap;
@@ -3095,6 +3236,7 @@ static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
 static KaiMailbox *kai_mailbox_alloc_bounded_unowned(int cap, int overflow) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    kai_mailbox_init_mu(mb);
     mb->cap         = cap;
     mb->overflow    = overflow;
     mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
@@ -3150,18 +3292,21 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
             return;
         } else if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
             /* Pop and discard the head; fall through to enqueue. */
+            kai_mbox_lock(mb);
             KaiMboxNode *old = mb->head;
             mb->head = old->next;
             if (!mb->head) { mb->tail = NULL; }
             kai_decref(old->msg);
             free(old);
             mb->len--;
+            kai_mbox_unlock(mb);
         } else if (mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
             /* Park sender until a receiver pops a slot. The cooperative
              * scheduler guarantees forward progress: the receiver that
              * eventually pops will wake one parked sender (FIFO). The
              * loop re-checks because between unpark and resume another
-             * sender could have refilled the slot. */
+             * sender could have refilled the slot. The lock is never
+             * held across the park. */
             while (mb->len >= mb->cap) {
                 kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
                                             &mb->send_waiter_tail,
@@ -3174,6 +3319,7 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     node->msg  = msg;
     node->next = NULL;
+    kai_mbox_lock(mb);
     if (mb->tail) { mb->tail->next = node; }
     else          { mb->head       = node; }
     mb->tail = node;
@@ -3181,32 +3327,82 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     /* Phase 4: wake one parked receiver if any. */
     KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
                                                     &mb->recv_waiter_tail);
+    kai_mbox_unlock(mb);
     if (waiter) kai_sched_unpark(waiter);
+}
+
+/* M:N cross-thread send. `msg` has already been deep-copied into the
+ * SENDER's heap by the caller — the copied tree is single-owner (rc=1)
+ * and migrates to the receiver like a fiber does (freed on the
+ * receiver's thread, into its own TLS pools). We take the mailbox lock,
+ * append the node, and — if the owner is parked waiting to receive —
+ * promote it on ITS scheduler thread and wake that thread. Bounded
+ * policies degrade to drop-on-full here: cross-thread BlockSender
+ * back-pressure (parking the sender on another thread's mailbox) is a
+ * refinement beyond F1; an unbounded mailbox (the actor default) has no
+ * such branch. */
+static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
+    pthread_mutex_lock(&mb->mu);
+    if (mb->cap > 0 && mb->len >= mb->cap &&
+        mb->overflow != KAI_OVERFLOW_DROP_OLDEST) {
+        /* full + (DropNewest | BlockSender): drop the newest. */
+        pthread_mutex_unlock(&mb->mu);
+        kai_decref(msg);
+        return;
+    }
+    if (mb->cap > 0 && mb->len >= mb->cap &&
+        mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
+        KaiMboxNode *old = mb->head;
+        mb->head = old->next;
+        if (!mb->head) mb->tail = NULL;
+        kai_decref(old->msg);
+        free(old);
+        mb->len--;
+    }
+    KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    node->msg  = msg;
+    node->next = NULL;
+    if (mb->tail) mb->tail->next = node;
+    else          mb->head       = node;
+    mb->tail = node;
+    mb->len++;
+    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
+                                                  &mb->recv_waiter_tail);
+    pthread_mutex_unlock(&mb->mu);
+    if (waiter) kai_sched_remote_unpark(waiter);
 }
 
 static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
     /* Phase 4: park the calling fiber until a sender enqueues. The
      * loop handles the case where another receiver took the slot
      * between our unpark and resume (rare but possible if multiple
-     * fibers race on the same mailbox). */
-    while (!mb->head) {
+     * fibers race on the same mailbox). Under M:N the empty-check and
+     * the waiter-enqueue happen under the lock so a concurrent
+     * cross-thread send cannot slip a message in and signal a wake
+     * between our check and our park (lost-wakeup); the lock is
+     * released before the park itself. */
+    for (;;) {
+        kai_mbox_lock(mb);
+        if (mb->head) {
+            KaiMboxNode *node = mb->head;
+            mb->head = node->next;
+            if (!mb->head) { mb->tail = NULL; }
+            KaiValue *msg = node->msg;
+            free(node);
+            mb->len--;
+            KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                          &mb->send_waiter_tail);
+            kai_mbox_unlock(mb);
+            if (waiter) kai_sched_unpark(waiter);
+            return msg;
+        }
         kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
                                     &mb->recv_waiter_tail,
                                     kai_current_fiber());
+        kai_mbox_unlock(mb);
         kai_sched_park();
     }
-    KaiMboxNode *node = mb->head;
-    mb->head = node->next;
-    if (!mb->head) { mb->tail = NULL; }
-    KaiValue *msg = node->msg;
-    free(node);
-    mb->len--;
-    /* Phase 4: wake one parked sender if any (only meaningful for
-     * BlockSender; unbounded and Drop* mailboxes never park senders). */
-    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
-                                                    &mb->send_waiter_tail);
-    if (waiter) kai_sched_unpark(waiter);
-    return msg;
 }
 
 /* Receive with a deadline: park the caller on BOTH the recv-waiter
@@ -3223,6 +3419,7 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
  * A spurious message-wake (another receiver drained the slot first)
  * re-parks for the remaining time; an elapsed deadline returns NULL. */
 static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos) {
+    kai_mbox_lock(mb);
     if (mb->head) {
         KaiMboxNode *node = mb->head;
         mb->head = node->next;
@@ -3232,24 +3429,30 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
         mb->len--;
         KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
                                                    &mb->send_waiter_tail);
+        kai_mbox_unlock(mb);
         if (sw) kai_sched_unpark(sw);
         return msg;
     }
+    kai_mbox_unlock(mb);
     uint64_t deadline = kai_reactor_now_ns() + timeout_nanos;
     for (;;) {
         if (kai_reactor_now_ns() >= deadline) return NULL;
         KaiFiber *me = kai_current_fiber();
+        kai_mbox_lock(mb);
         kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
                                    &mb->recv_waiter_tail, me);
+        kai_mbox_unlock(mb);
         kai_reactor_park_timer(me, deadline);
 
         /* park_timer's drain already spliced us off the wheel on a
          * deadline wake. Disarm it on a message wake; in both cases
          * remove ourselves from the chain we are still linked into. */
+        kai_mbox_lock(mb);
         int still_waiting = kai_mailbox_waiter_remove(&mb->recv_waiter_head,
                                                       &mb->recv_waiter_tail, me);
         if (still_waiting) {
             /* Deadline fired: we were never dequeued by a send. */
+            kai_mbox_unlock(mb);
             return NULL;
         }
         /* A send dequeued us; disarm the still-armed deadline timer. */
@@ -3263,9 +3466,11 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
             mb->len--;
             KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
                                                       &mb->send_waiter_tail);
+            kai_mbox_unlock(mb);
             if (sw) kai_sched_unpark(sw);
             return msg;
         }
+        kai_mbox_unlock(mb);
         /* Spurious: another receiver took the slot. Loop re-checks the
          * deadline and re-parks for whatever time remains. */
     }
@@ -3287,6 +3492,7 @@ static void kai_mailbox_free(KaiMailbox *mb) {
         free(node);
         node = next;
     }
+    if (mb->mu_inited) pthread_mutex_destroy(&mb->mu);
     free(mb);
 }
 
@@ -7556,11 +7762,26 @@ static KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
     }
-    /* m5.x flip Phase 3 closeout (issue #82): transfer the caller's
-     * `msg` ref directly into the mailbox (kai_mailbox_push takes
-     * ownership) and consume the `pid` ref. Pre-fix the helper did
-     * `kai_incref(msg)` then dropped the caller's ref on the floor. */
-    kai_mailbox_push(pid->as.mb, msg);
+    KaiMailbox *mb = pid->as.mb;
+    /* M:N — a send whose destination fiber lives on another scheduler
+     * thread must not share this fiber's non-atomic-RC heap object with
+     * that thread. Deep-copy the message into the SENDER's heap (rc=1,
+     * single-owner) and enqueue the copy under the mailbox lock; the
+     * receiver adopts and later frees it on its own thread. A mailbox
+     * with no owner yet (spawn_actor before assign) is on this thread by
+     * construction. At N=1 owner_thread==my thread always, so the fast
+     * pointer transfer (issue #82 callee-consumes) is unchanged. */
+    int dst = (mb->owner_fiber) ? mb->owner_fiber->home_thread : kai_thread_id;
+    if (kai_nthreads > 1 && dst != kai_thread_id) {
+        KaiValue *copy = kai_deep_copy_out(msg);
+        kai_decref(msg);
+        kai_mailbox_push_cross_thread(mb, copy);
+    } else {
+        /* m5.x flip Phase 3 closeout (issue #82): transfer the caller's
+         * `msg` ref directly into the mailbox (kai_mailbox_push takes
+         * ownership) and consume the `pid` ref. */
+        kai_mailbox_push(mb, msg);
+    }
     kai_decref(pid);
     return kai_unit();
 }
@@ -12675,7 +12896,26 @@ static void kai_reactor_wait(void) {
     if (heap_alloced) free(pfds);
 }
 
+/* This thread's scheduler slot. */
+static inline KaiSchedSlot *kai_sched_slot(void) {
+    return &kai_sched_slots[kai_thread_id];
+}
+
+/* At N>1 the ready queue lives in the slot (`steal_head`/`steal_tail`),
+ * one source of truth shared between the owner (both ends) and thieves
+ * (head only), serialized by the slot lock. At N=1 it is the plain TLS
+ * FIFO the pre-M:N runtime used — lock-free and byte-identical. */
 static void kai_sched_enqueue(KaiFiber *f) {
+    if (kai_nthreads > 1) {
+        KaiSchedSlot *s = kai_sched_slot();
+        pthread_mutex_lock(&s->mu);
+        f->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = f;
+        else               s->steal_head = f;
+        s->steal_tail = f;
+        pthread_mutex_unlock(&s->mu);
+        return;
+    }
     f->sched_next = NULL;
     if (kai_ready_tail) {
         kai_ready_tail->sched_next = f;
@@ -12686,11 +12926,45 @@ static void kai_sched_enqueue(KaiFiber *f) {
 }
 
 static KaiFiber *kai_sched_dequeue(void) {
+    if (kai_nthreads > 1) {
+        KaiSchedSlot *s = kai_sched_slot();
+        pthread_mutex_lock(&s->mu);
+        KaiFiber *f = s->steal_head;
+        if (f) {
+            s->steal_head = f->sched_next;
+            if (!s->steal_head) s->steal_tail = NULL;
+            f->sched_next = NULL;
+        }
+        pthread_mutex_unlock(&s->mu);
+        return f;
+    }
     KaiFiber *f = kai_ready_head;
     if (!f) return NULL;
     kai_ready_head = f->sched_next;
     if (!kai_ready_head) kai_ready_tail = NULL;
     f->sched_next = NULL;
+    return f;
+}
+
+/* Steal one fiber from the head of thread `victim`'s ready queue,
+ * serialized against that thread's owner by the slot lock. Steal
+ * granularity is one fiber (a pointer move). The stolen fiber's
+ * home_thread is retargeted to the thief: it now runs, parks, and frees
+ * on the thief's thread, so its non-atomic-RC heap stays single-threaded.
+ * A fiber only migrates while READY — never mid-run — so nothing on its
+ * suspended stack references the victim thread's TLS. */
+static KaiFiber *kai_sched_steal_from(int victim) {
+    KaiSchedSlot *s = &kai_sched_slots[victim];
+    if (!s->live) return NULL;
+    pthread_mutex_lock(&s->mu);
+    KaiFiber *f = s->steal_head;
+    if (f) {
+        s->steal_head = f->sched_next;
+        if (!s->steal_head) s->steal_tail = NULL;
+        f->sched_next = NULL;
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (f) f->home_thread = kai_thread_id;
     return f;
 }
 
@@ -12761,6 +13035,121 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
 }
 
+/* ==================================================================
+ * M:N work-stealing core — the per-thread scheduler loop.
+ * docs/mn-scheduler-design.md §2, §4. Off at N=1.
+ * ================================================================== */
+
+/* Reactor ownership is fixed on thread 0 for F1 (F0 left the reactor
+ * single-owner; F2 shards it). Any thread may register a reactor waiter,
+ * but only thread 0 runs `kai_reactor_wait` — a scheduler thread that
+ * finds its own local queue empty and is NOT the owner steals or parks
+ * on its condvar; it never touches the poll set. */
+#define KAI_REACTOR_OWNER_THREAD 0
+
+/* Find one runnable fiber for this thread: its own queue first (LIFO
+ * locality preserved by the FIFO order the owner maintains), then a
+ * round-robin steal sweep over the other live threads. Returns NULL when
+ * nothing is runnable anywhere this instant. */
+static KaiFiber *kai_worker_find_work(void) {
+    KaiFiber *f = kai_sched_dequeue();
+    if (f) return f;
+    for (int i = 1; i < kai_nthreads; i++) {
+        int victim = (kai_thread_id + i) % kai_nthreads;
+        f = kai_sched_steal_from(victim);
+        if (f) return f;
+    }
+    return NULL;
+}
+
+/* Wake a scheduler thread that may be idle. Idle workers poll their
+ * deque on a short nanosleep, so a pushed fiber is picked up on the next
+ * retry with no explicit signal needed. The reactor owner instead blocks
+ * in poll(); a byte on its self-pipe (the filepool pipe, already drained
+ * by kai_reactor_wait) breaks that so a cross-thread wake reaches a fiber
+ * whose home is the owner even while it is waiting on I/O. */
+static void kai_sched_wake_thread(int tid) {
+    if (tid == KAI_REACTOR_OWNER_THREAD && kai_reactor_filepool_pipe[1] >= 0) {
+        unsigned char b = 1;
+        ssize_t w = write(kai_reactor_filepool_pipe[1], &b, 1);
+        (void) w;
+    }
+}
+
+/* Promote a fiber owned by another thread from PARKED to READY and make
+ * it runnable on its home thread, then wake that thread. Called from a
+ * cross-thread mailbox send (the sender runs here, the receiver's home
+ * is elsewhere). The state flip is serialized on the target's slot lock
+ * so it composes with the target's own park path (which sets PARKED
+ * under the same lock via kai_sched_park_remote_safe below). */
+static void kai_sched_remote_unpark(KaiFiber *target) {
+    if (!target) return;
+    int home = target->home_thread;
+    KaiSchedSlot *s = &kai_sched_slots[home];
+    pthread_mutex_lock(&s->mu);
+    /* The target may still be RUNNING (it enqueued its recv-waiter and
+     * dropped the mailbox lock but has not yet reached park) — record a
+     * pending wake so its park path does not sleep through the message.
+     * If it is already PARKED, flip it READY and enqueue on its slot. */
+    if (target->state == KAI_FIBER_PARKED) {
+        target->state = KAI_FIBER_READY;
+        target->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = target;
+        else               s->steal_head = target;
+        s->steal_tail = target;
+        pthread_mutex_unlock(&s->mu);
+    } else {
+        target->wake_pending++;
+        pthread_mutex_unlock(&s->mu);
+    }
+    kai_sched_wake_thread(home);
+}
+
+/* The per-thread scheduler loop, run ON this thread's kai_main_fiber
+ * (the OS-thread context). A worker thread enters here after startup; the
+ * main thread enters it only implicitly (its main_fiber IS the program's
+ * initial context, and park/trampoline swap back here when the local
+ * queue drains). The loop: run everything runnable locally or stolen; if
+ * the owner, drive the reactor; else block on the idle condvar until a
+ * cross-thread push signals work. Exits when the program has terminated
+ * (all threads idle, nothing runnable, reactor empty) — only the workers
+ * exit here; the main thread's loop returns control to `main` via the
+ * root fiber finishing. */
+static void kai_worker_loop(void) {
+    KaiFiber *self_root = &kai_main_fiber;
+    for (;;) {
+        if (kai_sched_shutting_down) return;
+        KaiFiber *next = kai_worker_find_work();
+        if (next) {
+            next->state = KAI_FIBER_RUNNING;
+            kai_active_fiber = next;
+            swapcontext(&self_root->ctx, &next->ctx);
+            kai_active_fiber = self_root;
+            kai_drain_pending_free();
+            continue;
+        }
+        /* No local or stealable work. The owner drives I/O; a byte on its
+         * pipe (kai_sched_wake_thread) or a reactor event makes a fiber
+         * runnable and breaks the poll. */
+        if (kai_thread_id == KAI_REACTOR_OWNER_THREAD &&
+            kai_reactor_parked_count > 0) {
+            kai_reactor_wait();
+            continue;
+        }
+        /* Idle: no runnable work anywhere. Sleep briefly, then retry the
+         * steal sweep. A short nanosleep (not a condvar wait) is the
+         * portable choice: a cross-thread push is observed on the next
+         * retry within the sleep bound, and shutdown is observed at the
+         * top of the loop — neither depends on a wakeup that could be
+         * lost, and there is no `pthread_cond_timedwait` timeout to rely
+         * on (its behaviour under some sanitizer/OS combinations is
+         * unreliable). 200µs bounds both wake latency and idle CPU.
+         * A condvar-driven idle is a later energy refinement. */
+        struct timespec nap = { 0, 200 * 1000 };   /* 200µs */
+        nanosleep(&nap, NULL);
+    }
+}
+
 /* Yield: caller stays READY and goes back on the run queue; control
  * swaps to the head of the queue. No-op if the queue is empty (caller
  * is the only ready fiber, nothing to switch to). */
@@ -12794,6 +13183,46 @@ static void kai_sched_yield(void) {
  * means no path to forward progress. */
 static void kai_sched_park(void) {
     KaiFiber *current = kai_active_fiber;
+
+    /* M:N path: a fiber that parks with no local work returns to this
+     * thread's scheduler loop (kai_main_fiber) — never runs poll() or a
+     * condvar wait on its own stack (asu invariant: nothing that blocks
+     * the OS thread runs on a user fiber's stack). While local work
+     * exists, switch directly fiber→fiber (Go's gogo, not a trip through
+     * the loop). The lost-wakeup window between a mailbox recv-waiter
+     * enqueue and this park is closed by `wake_pending`. */
+    if (kai_nthreads > 1) {
+        KaiSchedSlot *s = kai_sched_slot();
+        pthread_mutex_lock(&s->mu);
+        current->state = KAI_FIBER_PARKED;
+        if (current->wake_pending > 0) {
+            /* A cross-thread send already tried to wake us; do not park. */
+            current->wake_pending--;
+            current->state = KAI_FIBER_RUNNING;
+            pthread_mutex_unlock(&s->mu);
+            kai_check_cancel_yield_point();
+            return;
+        }
+        pthread_mutex_unlock(&s->mu);
+
+        KaiFiber *next = kai_sched_dequeue();
+        if (next && next != current) {
+            next->state = KAI_FIBER_RUNNING;
+            kai_active_fiber = next;
+            swapcontext(&current->ctx, &next->ctx);
+        } else {
+            /* No local work: hand control back to the scheduler loop on
+             * this thread's root context, which steals / drives I/O /
+             * idles. We resume here when someone re-readies us. */
+            kai_active_fiber = &kai_main_fiber;
+            swapcontext(&current->ctx, &kai_main_fiber.ctx);
+        }
+        kai_active_fiber = current;
+        kai_drain_pending_free();
+        kai_check_cancel_yield_point();
+        return;
+    }
+
     /* Mark the caller PARKED up front so the reactor drain helpers
      * (which may run inside kai_reactor_wait below) can promote us
      * back to READY via kai_sched_unpark. The unpark path bails out
@@ -12845,9 +13274,18 @@ static void kai_sched_park(void) {
 /* Unpark: target PARKED → READY, enqueue at run queue tail. Caller
  * stays RUNNING (does not yield); the unparked fiber runs whenever
  * the scheduler reaches it. No-op if target is not currently
- * PARKED (defensive against double-unpark). */
+ * PARKED (defensive against double-unpark).
+ *
+ * Under M:N the target may be owned by another thread (it was stolen, or
+ * this is a same-thread wake of a fiber whose home is elsewhere): route
+ * through the slot-locked remote path, which flips its state on its own
+ * slot and wakes its home thread. A target on this very thread takes the
+ * remote path too — same slot, same lock — so there is one unpark path
+ * at N>1 and the lost-wakeup guard (wake_pending) applies uniformly. */
 static void kai_sched_unpark(KaiFiber *target) {
-    if (!target || target->state != KAI_FIBER_PARKED) return;
+    if (!target) return;
+    if (kai_nthreads > 1) { kai_sched_remote_unpark(target); return; }
+    if (target->state != KAI_FIBER_PARKED) return;
     target->state = KAI_FIBER_READY;
     kai_parked_count--;
     kai_sched_enqueue(target);
@@ -12943,6 +13381,23 @@ static void kai_fiber_trampoline(void) {
      * remain (timer wheel, pid map, file-pool list), block in
      * kai_reactor_wait until a wake event promotes someone before
      * declaring deadlock. */
+    /* M:N — a finished fiber with no local successor returns to this
+     * thread's scheduler loop (kai_main_fiber), which steals or idles.
+     * `uc_link` on the fiber's context is already kai_main_fiber.ctx,
+     * but we setcontext explicitly so the loop resumes at its swap point
+     * rather than falling off the end of the context. */
+    if (kai_nthreads > 1) {
+        KaiFiber *next = kai_sched_dequeue();
+        if (next) {
+            next->state = KAI_FIBER_RUNNING;
+            kai_active_fiber = next;
+            setcontext(&next->ctx);
+        }
+        kai_active_fiber = &kai_main_fiber;
+        setcontext(&kai_main_fiber.ctx);
+        /* setcontext does not return. */
+    }
+
     KaiFiber *next = kai_sched_dequeue();
     while (!next) {
         if (kai_reactor_parked_count > 0) {
@@ -12963,6 +13418,145 @@ static void kai_fiber_trampoline(void) {
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic pop
 #endif
+
+/* ==================================================================
+ * M:N bootstrap — start the worker pool and run `kai_main` as a fiber.
+ * ================================================================== */
+
+/* The user's `kai_main` (void→KaiValue*), captured by kai_sched_bootstrap
+ * so the root fiber's trampoline can invoke it. Immutable after startup. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *(*kai_user_main_fn)(void);
+extern KaiValue  *kai_user_main_result;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *(*kai_user_main_fn)(void) = NULL;
+KaiValue  *kai_user_main_result = NULL;
+#  endif
+#else
+static KaiValue *(*kai_user_main_fn)(void) = NULL;
+static KaiValue  *kai_user_main_result = NULL;
+#endif
+
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+/* Root-fiber trampoline for the user's main under M:N. Runs kai_main on
+ * a spawned fiber's stack (so main can park/steal like any actor),
+ * publishes the result, flips the shutdown flag, wakes every worker, and
+ * returns to thread 0's scheduler loop. */
+static void kai_bootstrap_trampoline(void) {
+    KaiFiber *self = kai_active_fiber;
+    kai_drain_pending_free();
+    self->state = KAI_FIBER_RUNNING;
+    kai_user_main_result = kai_user_main_fn();
+    self->state = KAI_FIBER_DONE;
+    /* Program is over: flip the shutdown flag. Every worker polls it at
+     * the top of its loop within one nanosleep tick and returns, so no
+     * explicit wake is needed; the owner is woken from a possible poll()
+     * via its self-pipe. */
+    kai_sched_shutting_down = 1;
+    kai_sched_wake_thread(KAI_REACTOR_OWNER_THREAD);
+    /* Hand back to thread 0's scheduler loop, which sees the shutdown
+     * flag and returns to kai_sched_bootstrap. */
+    kai_active_fiber = &kai_main_fiber;
+    setcontext(&kai_main_fiber.ctx);
+}
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#  endif
+#else
+static pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#endif
+
+/* Worker thread entry: adopt an id, anchor this thread's root fiber,
+ * mark the slot live, and run the scheduler loop until shutdown. */
+static void *kai_worker_thread_main(void *arg) {
+    kai_thread_id = (int) (intptr_t) arg;
+    kai_active_fiber_anchor();
+    kai_main_fiber.home_thread = kai_thread_id;
+    kai_sched_slots[kai_thread_id].live = 1;
+    kai_worker_loop();
+    return NULL;
+}
+
+/* Parse KAI_THREADS. Default 1 (byte-identical). "0" or unset → 1;
+ * a positive count is clamped to [1, KAI_MAX_THREADS]. */
+static int kai_read_nthreads(void) {
+    const char *e = getenv("KAI_THREADS");
+    if (!e || !*e) return 1;
+    long n = strtol(e, NULL, 10);
+    if (n <= 1) return 1;
+    if (n > KAI_MAX_THREADS) n = KAI_MAX_THREADS;
+    return (int) n;
+}
+
+/* Run the program. At N=1 this is exactly `kai_main()` — no threads, no
+ * fibers spawned for main, byte-identical. At N>1 it starts the worker
+ * pool, runs kai_main as a fiber on thread 0, drives thread 0's
+ * scheduler loop until the program quiesces, then joins the workers. */
+static KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void)) {
+    kai_nthreads = kai_read_nthreads();
+    if (kai_nthreads <= 1) {
+        kai_nthreads = 1;
+        return user_main();
+    }
+
+    kai_user_main_fn = user_main;
+    for (int i = 0; i < kai_nthreads; i++) {
+        pthread_mutex_init(&kai_sched_slots[i].mu, NULL);
+        kai_sched_slots[i].steal_head = NULL;
+        kai_sched_slots[i].steal_tail = NULL;
+        kai_sched_slots[i].live = 0;
+    }
+    kai_thread_id = 0;
+    kai_active_fiber_anchor();
+    kai_main_fiber.home_thread = 0;
+    kai_sched_slots[0].live = 1;
+
+    /* Spawn kai_main as a fiber on thread 0's deque. */
+    KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
+    if (!root) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    root->home_thread = 0;
+    root->evidence_top = NULL;
+    kai_fiber_init_ctx(root);
+    /* Re-point its makecontext entry from the generic trampoline to the
+     * bootstrap trampoline (kai_fiber_init_ctx installed the former). */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    makecontext(&root->ctx, kai_bootstrap_trampoline, 0);
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+    root->state = KAI_FIBER_READY;
+    kai_sched_enqueue(root);
+
+    /* Start workers 1..N-1. */
+    for (int i = 1; i < kai_nthreads; i++) {
+        if (pthread_create(&kai_worker_threads[i], NULL,
+                           kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
+            fprintf(stderr, "kai: scheduler pthread_create failed: %s\n",
+                    strerror(errno));
+            exit(1);
+        }
+    }
+
+    /* Thread 0 runs the scheduler loop (its kai_main_fiber is the loop
+     * context) until the bootstrap trampoline flips the shutdown flag. */
+    kai_worker_loop();
+
+    for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
+    free(root);
+    return kai_user_main_result;
+}
 
 /* m8.x: default Spawn handlers backed by the cooperative scheduler.
  * spawn(thunk)        — alloc fiber + enqueue; thunk runs later.
@@ -13376,6 +13970,22 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
  * In either branch, remove our back-link from the peer's chain so
  * the peer's own future termination doesn't re-enter our (now-
  * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
+/* Deliver a system message (link trap-exit reason, monitor pid) into a
+ * mailbox owned by an arbitrary fiber, consuming `msg`. Same thread →
+ * plain push (byte-identical at N=1). Cross-thread → deep-copy into this
+ * thread's heap and enqueue under the mailbox lock, exactly like a
+ * cross-thread Actor.send, so the peer's heap stays single-threaded. */
+static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
+    int dst = (mb->owner_fiber) ? mb->owner_fiber->home_thread : kai_thread_id;
+    if (kai_nthreads > 1 && dst != kai_thread_id) {
+        KaiValue *copy = kai_deep_copy_out(msg);
+        kai_decref(msg);
+        kai_mailbox_push_cross_thread(mb, copy);
+    } else {
+        kai_mailbox_push(mb, msg);
+    }
+}
+
 static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
     KaiLinkNode *ln = self->linked_head;
     self->linked_head = NULL;
@@ -13394,16 +14004,22 @@ static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
                     char buf[256];
                     snprintf(buf, sizeof(buf), "Trapped: %s",
                              self->trap_msg ? self->trap_msg : "runtime trap");
-                    kai_mailbox_push(peer->mailbox, kai_str(buf));
+                    kai_deliver_to_mailbox(peer->mailbox, kai_str(buf));
                 } else {
                     const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
-                    kai_mailbox_push(peer->mailbox, kai_str(txt));
+                    kai_deliver_to_mailbox(peer->mailbox, kai_str(txt));
                 }
             } else {
                 peer->cancel_requested = 1;
             }
             /* Remove our back-link from peer's chain (linear scan;
-             * v1 chains are short — typically 1-2 entries). */
+             * v1 chains are short — typically 1-2 entries). At N>1 a
+             * link straddling two threads mutates the peer's chain from
+             * this thread; cross-thread link teardown as a peer-owned
+             * system message (design §5) is deferred — the propagation
+             * signal itself is safe (cancel_requested is atomic, mailbox
+             * delivery copies), only the far chain edit is unsynchronized.
+             * Same-thread links (the N=1 case) are unaffected. */
             KaiLinkNode **slot = &peer->linked_head;
             while (*slot) {
                 if ((*slot)->peer == self) {
@@ -13538,10 +14154,10 @@ static void kai_monitor_propagate_terminate(KaiFiber *self) {
         KaiMonitorNode *next = mn->next;
         KaiFiber *observer = mn->observer;
         if (observer && observer->mailbox && mn->target_pid) {
-            /* kai_mailbox_push takes ownership of the incref we
-             * stamped at kai_monitor_add time — we hand the ref
-             * to the mailbox and don't decref locally. */
-            kai_mailbox_push(observer->mailbox, mn->target_pid);
+            /* The mailbox takes ownership of the incref we stamped at
+             * kai_monitor_add time; kai_deliver_to_mailbox consumes it
+             * (copying across a thread boundary when needed). */
+            kai_deliver_to_mailbox(observer->mailbox, mn->target_pid);
         } else if (mn->target_pid) {
             /* No mailbox to deliver into — drop our owning ref so
              * the pid value can be reclaimed. */
