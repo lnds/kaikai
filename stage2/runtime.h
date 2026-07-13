@@ -218,6 +218,11 @@ typedef enum {
                      * Ref with a length-1 KAI_ARRAY (issue #257); this is the
                      * "clean fix" the #257 retro flagged. ML/OCaml `ref`,
                      * Haskell `IORef` lineage. */
+    /* Cross-thread-handle rule: KAI_FIBER and KAI_PID are runtime-owned
+     * handles to a unit of execution or a channel reachable from more than
+     * one scheduler thread, so their rc is atomic (fiber) or the box
+     * immortal (pid) by construction. Everything the user's program builds
+     * as data stays non-atomic and crosses threads only by copy-on-send. */
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
@@ -2606,6 +2611,18 @@ static inline KaiValue *kai_incref(KaiValue *v) {
 #endif
         return v;
     }
+    /* Fiber[T] wrappers carry atomic rc — cross-thread scheduler handles
+     * (the rule at KaiValue). At N=1 no worker thread exists, so the plain
+     * increment below stays byte-identical. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
+                                  memory_order_relaxed);
+        kai_rc_incref_total++;
+#ifdef KAI_TRACE_RC
+        kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+        return v;
+    }
     v->rc++;
     /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
      * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
@@ -3888,6 +3905,18 @@ static inline void kai_decref(KaiValue *v) {
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
+    /* A Fiber[T] wrapper is a scheduler-owned handle to a unit of
+     * execution running on another thread: the spawner drops the caller
+     * ref while the trampoline drops the scheduler ref, on two threads at
+     * once. Its rc is atomic — handle metadata, not the jewel (the user
+     * data inside the fiber's private heap stays non-atomic). See the
+     * cross-thread-handle rule at KaiValue. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        if (atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                      memory_order_acq_rel) == 1)
+            kai_decref_free(v);
+        return;
+    }
     if (--v->rc == 0) kai_decref_free(v);
 }
 
