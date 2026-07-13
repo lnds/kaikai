@@ -97,6 +97,26 @@ fiber's own Cancel handlers so the supervisor observes the child's
 termination through its mailbox (see `kai info actors` §*Trap-exit
 semantics*).
 
+## Parallelism — `KAI_THREADS`
+
+Fibers and actors run in parallel across N OS threads with a
+work-stealing scheduler. Opt-in at runtime, no code changes:
+
+```sh
+KAI_THREADS=8 ./my_program
+```
+
+- `KAI_THREADS=1` (the default) is byte-identical to the cooperative
+  single-thread scheduler.
+- Semantics are unchanged at any N: messages crossing a thread
+  boundary are physically copied (same-thread sends still transfer
+  ownership), each actor's mailbox is processed serially, and
+  per-fiber RC stays non-atomic — parallelism costs nothing on the
+  object hot path.
+- A blocking FFI call stalls one worker thread, not the program.
+- The I/O reactor is shared: heavily mixed I/O+CPU workloads may
+  serialize on it.
+
 ## NOT IN KAIKAI
 
 - `async` / `await` keywords. Concurrency is an effect, not syntax.
