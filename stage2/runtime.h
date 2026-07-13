@@ -3539,6 +3539,14 @@ static void kai_mailbox_free(KaiMailbox *mb) {
 static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *v = kai_alloc(KAI_PID);
     v->as.mb = mb;
+    /* A Pid is a shared, non-owning identity: the mailbox outlives every
+     * handle to it and is freed by its allocating scope, never by rc. One
+     * mailbox is shared across the scheduler threads that send to it (that
+     * is the point of an actor), so its handle boxes are duplicated and
+     * dropped on many threads at once. Marking the box immortal keeps those
+     * touches off the non-atomic rc field — no cross-thread rc race, and the
+     * decref-to-free path was already a no-op here. */
+    v->rc = INT32_MAX;
     return v;
 }
 
@@ -9707,18 +9715,20 @@ typedef unsigned long long KaiHandlerId;
 
 /* Handler ids must be unique per process: a handler installed in one TU and
  * one in another would draw colliding ids from a per-TU counter (both start
- * at 1). One shared counter (owner defines, others extern). */
+ * at 1). One shared counter (owner defines, others extern). Under M:N every
+ * scheduler thread installs handlers, so the bump is atomic — colliding ids
+ * across threads would alias distinct handler frames in effect dispatch. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiHandlerId kai_next_handler_id;
+extern _Atomic KaiHandlerId kai_next_handler_id;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiHandlerId kai_next_handler_id = 1;
+_Atomic KaiHandlerId kai_next_handler_id = 1;
 #  endif
 #else
-static KaiHandlerId kai_next_handler_id = 1;
+static _Atomic KaiHandlerId kai_next_handler_id = 1;
 #endif
 
 static KaiHandlerId kai_fresh_handler_id(void) {
-    return kai_next_handler_id++;
+    return atomic_fetch_add(&kai_next_handler_id, 1);
 }
 
 /* m7a #6d: continuation closure, stack-allocated at every op call
