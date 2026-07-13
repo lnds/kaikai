@@ -1,0 +1,287 @@
+# compiler/closure_spec_ast.kai — shared data model + AST helpers for
+# closure specialisation. The request/closure-arg types and the pure
+# sub-expression enumeration / substitution-scaffolding helpers the
+# discovery, rewrite, and emission modules all walk. Split out to keep
+# each closure-spec file small.
+
+import compiler.ast
+import compiler.util
+import compiler.chars
+
+# A specialisable functional argument: a syntactic lambda, or a bare
+# reference to a top-level fn resolved to its decl. Both have empty
+# capture environments — the only shapes v1 inlines.
+pub type ClosureArg
+  = CaLambda([Param], Expr)
+  | CaNamedFn(Decl)
+
+# One discovered specialisation request: the higher-order callee, the
+# index of its functional parameter among the call args, the closure to
+# inline, and the call-site position that keys the emitted spec.
+pub type CSpecReq = CSReq(Decl, Int, ClosureArg, Int, Int)
+
+# A resolved callee reference: optional home module + fn name.
+pub type CRef = CRef(Option[String], String)
+
+
+
+pub fn remap(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# Direct sub-Exprs of a node, in evaluation order. Enumerated purely
+# rather than via a side-effecting functor: the read walks (capture
+# analysis, request collection) need the child list, and a mutable
+# accumulator over `map_expr_kind` would leak a `Mutable` label into
+# the compiler's own build.
+pub fn cspec_kids(e: Expr) : [Expr] =
+  match e.kind {
+    ECall(callee, args_)   -> [callee, ...args_]
+    EField(base, _)        -> [base]
+    EIndex(a, b)           -> [a, b]
+    EBinop(_, a, b)        -> [a, b]
+    EUnop(_, x)            -> [x]
+    EIf(c, t_, eo)         -> [c, t_, ...cs_opt_list(eo)]
+    EMatch(scr, arms)      -> [scr, ...cs_arm_exprs(arms)]
+    ELambda(_, b)          -> [b]
+    ERecordLit(_, fs)      -> cs_field_exprs(fs)
+    EList(els)             -> cs_elem_exprs(els)
+    ERange(a, b, os)       -> [a, b, ...cs_opt_list(os)]
+    EBlock(ss, t)          -> list_append(cs_stmt_exprs(ss), cs_opt_list(t))
+    EPipe(a, b)            -> [a, b]
+    EMapPipe(a, b)         -> [a, b]
+    EFlatMapPipe(a, b)     -> [a, b]
+    EFilterPipe(a, b)      -> [a, b]
+    ELitUnit(inner, _)     -> [inner]
+    EBang(inner)           -> [inner]
+    EIntrinsic(_, args_)   -> args_
+    EHandle(body, _, _, io, _, cls, ro) ->
+      [body, ...cs_opt_list(io), ...clause_exprs(cls), ...ret_exprs(ro)]
+    _ -> []
+  }
+
+fn cs_opt_list(o: Option[Expr]) : [Expr] =
+  match o { Some(x) -> [x]  None -> [] }
+
+fn cs_arm_exprs(arms: [Arm]) : [Expr] =
+  match arms {
+    [] -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(cs_opt_list(g), [b]), cs_arm_exprs(rest))
+  }
+
+fn cs_field_exprs(fs: [FieldInit]) : [Expr] =
+  match fs {
+    [] -> []
+    [FI(_, v), ...rest] -> [v, ...cs_field_exprs(rest)]
+  }
+
+fn cs_elem_exprs(els: [ListElem]) : [Expr] =
+  match els {
+    [] -> []
+    [ElPlain(x), ...rest]  -> [x, ...cs_elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...cs_elem_exprs(rest)]
+  }
+
+fn cs_stmt_exprs(ss: [Stmt]) : [Expr] =
+  match ss {
+    [] -> []
+    [s, ...rest] -> list_append(one_stmt_exprs(s), cs_stmt_exprs(rest))
+  }
+
+fn one_stmt_exprs(s: Stmt) : [Expr] =
+  match s {
+    SLet(_, _, rhs)           -> [rhs]
+    SAssert(c, m)             -> [c, ...cs_opt_list(m)]
+    SExprStmt(x)              -> [x]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SVar(_, _, rhs, _, _)     -> [rhs]
+    SUse(_, _, _)             -> []
+  }
+
+fn clause_exprs(cls: [HClause]) : [Expr] =
+  match cls {
+    [] -> []
+    [HC(_, _, b, _, _), ...rest] -> [b, ...clause_exprs(rest)]
+  }
+
+fn ret_exprs(ro: Option[HReturn]) : [Expr] =
+  match ro { Some(HR(_, b, _, _)) -> [b]  None -> [] }
+
+# The callee's optional home module + name — `mod.foldl` carries
+# `Some("mod")`, a bare `foldl` carries `None`.
+pub fn callee_ref(callee: Expr) : Option[CRef] =
+  match callee.kind {
+    EVar(n)          -> Some(CRef(None, n))
+    EModCall(m, n)   -> Some(CRef(Some(m), n))
+    _                -> None
+  }
+
+# The retargeted callee is always a bare `EVar` of the spec's unique
+# mangled name — the spec is emitted with `mo = None`, so a `mod.f`
+# call becomes a bare reference to the module-free spec symbol.
+pub fn retarget_callee(callee: Expr, nm: String) : Expr =
+  remap(callee, EVar(nm))
+
+pub fn cs_param_names(ps: [Param]) : [String] =
+  match ps {
+    [] -> []
+    [p, ...rest] -> [p.pname, ...cs_param_names(rest)]
+  }
+
+pub fn param_name_at(ps: [Param], n: Int) : String =
+  match ps {
+    [] -> ""
+    [p, ...rest] -> if n == 0 { p.pname } else { param_name_at(rest, n - 1) }
+  }
+
+pub fn drop_param_at(ps: [Param], n: Int) : [Param] =
+  match ps {
+    [] -> []
+    [p, ...rest] -> if n == 0 { rest } else { [p, ...drop_param_at(rest, n - 1)] }
+  }
+
+pub fn drop_at(xs: [Expr], n: Int) : [Expr] =
+  match xs {
+    [] -> []
+    [x, ...rest] -> if n == 0 { rest } else { [x, ...drop_at(rest, n - 1)] }
+  }
+
+pub fn elem_at(xs: [Expr], n: Int) : Expr =
+  match xs {
+    [] -> mk_expr(EUnit, 0, 0)
+    [x, ...rest] -> if n == 0 { x } else { elem_at(rest, n - 1) }
+  }
+
+pub fn car_arg(xs: [Expr]) : Expr =
+  match xs {
+    [x, ..._] -> x
+    [] -> mk_expr(EUnit, 0, 0)
+  }
+
+pub fn cdr_args(xs: [Expr]) : [Expr] =
+  match xs {
+    [_, ...rest] -> rest
+    [] -> []
+  }
+
+pub fn index_of(xs: [String], target: String, i: Int) : Option[Int] =
+  match xs {
+    [] -> None
+    [x, ...rest] -> if x == target { Some(i) } else { index_of(rest, target, i + 1) }
+  }
+
+pub fn map_opt(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] =
+  match o { Some(x) -> Some(f(x))  None -> None }
+
+pub fn cs_pat_binders(p: Pattern, acc: [String]) : [String] =
+  match p.pkind {
+    PBind(n)              -> [n, ...acc]
+    PAs(n, sub)           -> cs_pat_binders(sub, [n, ...acc])
+    PList(subs, rest)     -> pats_binders(subs, opt_bind(rest, acc))
+    PVariant(_, subs)     -> pats_binders(subs, acc)
+    PVariantRecord(_, fs) -> pfields_binders(fs, acc)
+    PRecord(fs)           -> pfields_binders(fs, acc)
+    PNarrow(n, _)         -> [n, ...acc]
+    _                     -> acc
+  }
+
+fn opt_bind(o: Option[String], acc: [String]) : [String] =
+  match o { Some(n) -> [n, ...acc]  None -> acc }
+
+fn pats_binders(ps: [Pattern], acc: [String]) : [String] =
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pats_binders(rest, cs_pat_binders(p, acc))
+  }
+
+fn pfields_binders(fs: [PField], acc: [String]) : [String] =
+  match fs {
+    [] -> acc
+    [PField(_, sub, _), ...rest] -> pfields_binders(rest, cs_pat_binders(sub, acc))
+  }
+
+pub fn cs_decl_name(d: Decl) : String =
+  match d { DFn(_, n, _, _, _, _, _, _, _, _) -> n  _ -> "" }
+
+pub fn decl_body(d: Decl) : Expr =
+  match d { DFn(_, _, _, _, _, _, b, _, _, _) -> b  _ -> mk_expr(EUnit, 0, 0) }
+
+pub fn decl_params(d: Decl) : [Param] =
+  match d { DFn(_, _, _, ps, _, _, _, _, _, _) -> ps  _ -> [] }
+
+pub fn cs_decl_mo(d: Decl) : Option[String] =
+  match d { DFn(_, _, _, _, _, _, _, _, _, mo) -> mo  _ -> None }
+
+pub fn mo_is(mo: Option[String], modn: String) : Bool =
+  match mo { Some(m) -> m == modn  None -> false }
+
+# The mangled spec name for a higher-order fn `name` specialised on a
+# closure identified by `disc`. The discriminator — not the call site —
+# keys the spec: a transitive inner call (`group_by → group_by_loop`) has
+# the SAME `(line, col)` for two distinct outer closures, so keying on the
+# site alone would collide their specs onto one. Keying on the closure's
+# own identity keeps them apart.
+pub fn cspec_name(name: String, disc: String) : String =
+  concat_all([name, "__cspec__", disc])
+
+# A stable identity for a closure: a lambda's body position, or a named
+# fn's name. Distinct closures never share it; the same closure reused at
+# two sites shares one spec (benign dedup).
+pub fn closure_disc(ca: ClosureArg) : String =
+  match ca {
+    CaLambda(_, b) -> concat_all(["L", int_to_string(b.line), "_", int_to_string(b.col)])
+    CaNamedFn(d)   -> concat_all(["F", cs_decl_name(d)])
+  }
+
+# Keep only the tparams still referenced in the concretised signature —
+# the functional param's row tparam and any argument-pinned tparam (now a
+# concrete type name) drop out, so mono sees a concrete spec.
+pub fn keep_used(tp: [String], used: [String]) : [String] =
+  match tp {
+    [] -> []
+    [t, ...rest] -> if list_has(used, t) { [t, ...keep_used(rest, used)] } else { keep_used(rest, used) }
+  }
+
+pub fn sig_tparam_names(ps: [Param], rt: Option[TypeExpr]) : [String] =
+  list_append(params_tparam_names(ps), opt_te_names(rt))
+
+fn params_tparam_names(ps: [Param]) : [String] =
+  match ps {
+    [] -> []
+    [p, ...rest] -> list_append(opt_te_names(p.ptype), params_tparam_names(rest))
+  }
+
+pub fn opt_te_names(o: Option[TypeExpr]) : [String] =
+  match o { Some(te) -> te_names(te, [])  None -> [] }
+
+# Every `TyName(n, ...)` leaf name in a type expression — a superset of
+# the tparam names, which is fine: pruning keeps a name that appears,
+# and a concrete type name never matches a tparam string anyway.
+fn te_names(te: TypeExpr, acc: [String]) : [String] =
+  match te.tkind {
+    TyName(n, tas)    -> tes_names(tas, [n, ...acc])
+    TyList(inner)     -> te_names(inner, acc)
+    TyFn(pts, r, _)   -> te_names(r, tes_names(pts, acc))
+    TyDim(b, _)       -> te_names(b, acc)
+    TyRefine(b, _)    -> te_names(b, acc)
+    TyRow(_)          -> acc
+  }
+
+fn tes_names(tes: [TypeExpr], acc: [String]) : [String] =
+  match tes {
+    [] -> acc
+    [t, ...rest] -> tes_names(rest, te_names(t, acc))
+  }
+
+# A name that resolves without an environment: a capital-initial EVar is
+# a type ctor or nullary variant, never a captured local. Everything else
+# — including a `__`-prefixed compiler-synthesised binder like a pipe-
+# fusion `__fusev_*` stage — is treated as a possible capture, so a
+# lambda closing over one declines specialisation rather than beta-
+# reducing into a dangling reference.
+pub fn name_is_global(n: String) : Bool =
+  match char_at(n, 0) {
+    Some(c) -> ch_is_upper(c)
+    None    -> false
+  }
+
+# ---- spec emission (beta reduction) ----

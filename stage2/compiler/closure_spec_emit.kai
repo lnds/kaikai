@@ -1,0 +1,168 @@
+# compiler/closure_spec_emit.kai — spec emission: beta-reduce the
+# closure into the callee body, retarget the spec's own recursion, close
+# the effect row, and prune the now-unused row tparam. Consumes the
+# shared AST helpers in closure_spec_ast.
+
+import compiler.ast
+import compiler.util
+import compiler.emit_shared
+import compiler.closure_spec_ast
+
+type StAcc = StAcc([Stmt], [String], [Expr])
+
+type ShadowNA = { names: [String], vals: [Expr] }
+
+# Build the specialised decl: drop the functional parameter, beta-reduce
+# every `f(args)` in the body, then retarget the body's own recursive
+# `n(..., f)` calls onto this same spec so a self-recursive higher-order
+# (`foldl_loop`) becomes a self-recursive spec — TRMC then re-forms the
+# loop instead of a fresh one-iteration wrapper per recursion site.
+# The spec's `(name, line, col)` mangle is globally unique, so it needs
+# no module tag — emitting it with `mo = None` (bare symbol) keeps the
+# name in step with the bare `EVar` its call sites retarget to, whether
+# the original callee was `mod.f` or a bare `f`.
+pub fn emit_cspec(r: CSpecReq) : Decl =
+  match r {
+    CSReq(callee, idx, ca, _, _) -> match callee {
+      DFn(p, n, tp, ps, rt, _, body, dl, dc, _) -> {
+        let sname = cspec_name(n, closure_disc(ca))
+        let beta = beta_apply_all(body, param_name_at(ps, idx), ca)
+        let body1 = retarget_self(beta, n, idx, sname)
+        let ps1 = drop_param_at(ps, idx)
+        # Only pure closures reach here (classify_closure gate), so the
+        # spec carries no effect: close its row to empty and drop the
+        # now-unused row tparam. Mono then grounds every remaining tparam
+        # a data argument pins — `r` from a fold's `init`, so unbox lands
+        # the loop's accumulator; a return-only tparam (a collect's element
+        # type) stays polymorphic and boxed, but the per-element indirect
+        # call is gone regardless.
+        DFn(p, sname, keep_used(tp, sig_tparam_names(ps1, rt)), ps1, rt, REmpty, body1, dl, dc, None)
+      }
+      _ -> callee
+    }
+  }
+
+# Retarget a body's own recursive `n(args)` (arity matching the original,
+# with the closure re-substituted at `idx`) onto `sname` with the
+# functional argument dropped. The recursive call carries the same inlined
+# lambda at `idx` — a redundant argument the spec no longer takes.
+fn retarget_self(e: Expr, n: String, idx: Int, sname: String) : Expr =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let args1 = map(args_, (a) => retarget_self(a, n, idx, sname))
+      match callee.kind {
+        EVar(cn) ->
+          if cn == n and idx < list_length(args1) {
+            remap(e, ECall(remap(callee, EVar(sname)), drop_at(args1, idx)))
+          } else { remap(e, ECall(callee, args1)) }
+        _ -> remap(e, ECall(retarget_self(callee, n, idx, sname), args1))
+      }
+    }
+    _ -> remap(e, map_expr_kind(e.kind, (k) => retarget_self(k, n, idx, sname)))
+  }
+
+# Rewrite the functional parameter out of the body. A direct
+# application `f(args)` beta-reduces to the inlined closure body; any
+# OTHER use of `f` as a value (`foldl_loop(..., f)`) is replaced by the
+# closure's literal form so the next fixpoint round specialises that
+# inner higher-order call too — this is how the transitive chain
+# `foldl → foldl_loop` reaches the loop that carries the per-element
+# indirect call.
+fn beta_apply_all(e: Expr, fname: String, ca: ClosureArg) : Expr =
+  match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(n) ->
+        if n == fname { inline_apply(ca, map(args_, (a) => beta_apply_all(a, fname, ca))) }
+        else { beta_descend(e, fname, ca) }
+      _ -> beta_descend(e, fname, ca)
+    }
+    EVar(n) -> if n == fname { closure_literal(ca, e) } else { e }
+    _ -> beta_descend(e, fname, ca)
+  }
+
+fn beta_descend(e: Expr, fname: String, ca: ClosureArg) : Expr =
+  Expr { kind: map_expr_kind(e.kind, (k) => beta_apply_all(k, fname, ca)),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# The closure as a first-class value, to substitute for a bare use of
+# the functional param. A lambda is its own literal; a named fn is its
+# bare reference. `site` supplies the position/type of the replaced use.
+fn closure_literal(ca: ClosureArg, site: Expr) : Expr =
+  match ca {
+    CaLambda(ps, b) -> remap(site, ELambda(ps, b))
+    CaNamedFn(d)    -> remap(site, EVar(cs_decl_name(d)))
+  }
+
+# Beta-reduce one application of the closure to `args`: substitute the
+# closure's params by the args in its body.
+fn inline_apply(ca: ClosureArg, args_: [Expr]) : Expr =
+  match ca {
+    CaLambda(ps, b) -> subst_scoped(b, cs_param_names(ps), args_)
+    CaNamedFn(d)    -> subst_scoped(decl_body(d), cs_param_names(decl_params(d)), args_)
+  }
+
+# Substitute each closure parameter name by its argument expression,
+# respecting shadowing: a binder inside the body that re-binds a param
+# name stops substitution for that name within its scope. The bodies
+# are pure and env-empty, so no capture can occur.
+fn subst_scoped(e: Expr, names: [String], args_: [Expr]) : Expr =
+  match e.kind {
+    EVar(n) -> match index_of(names, n, 0) {
+      Some(i) -> elem_at(args_, i)
+      None    -> e
+    }
+    ELambda(ps, b) -> {
+      let sh = remove_shadowed(names, args_, cs_param_names(ps))
+      remap(e, ELambda(ps, subst_scoped(b, sh.names, sh.vals)))
+    }
+    EMatch(scr, arms) ->
+      remap(e, EMatch(subst_scoped(scr, names, args_), map(arms, (a) => subst_arm(a, names, args_))))
+    EBlock(ss, t) -> remap(e, subst_block(ss, t, names, args_))
+    _ -> remap(e, map_expr_kind(e.kind, (k) => subst_scoped(k, names, args_)))
+  }
+
+# Thread block-let shadowing: each binder removes its name from the
+# substitution for the rest of the block; the rhs sees the pre-binding
+# names.
+fn subst_block(ss: [Stmt], t: Option[Expr], names: [String], args_: [Expr]) : ExprKind = {
+  let done = subst_stmts(ss, names, args_)
+  match done { StAcc(ss1, n1, a1) -> EBlock(ss1, map_opt(t, (x) => subst_scoped(x, n1, a1))) }
+}
+
+fn subst_stmts(ss: [Stmt], names: [String], args_: [Expr]) : StAcc =
+  match ss {
+    [] -> StAcc([], names, args_)
+    [s, ...rest] -> match s {
+      SLet(pat, ann, rhs) -> {
+        let rhs1 = subst_scoped(rhs, names, args_)
+        let sh = remove_shadowed(names, args_, cs_pat_binders(pat, []))
+        match subst_stmts(rest, sh.names, sh.vals) {
+          StAcc(rs, rn, ra) -> StAcc([SLet(pat, ann, rhs1), ...rs], rn, ra)
+        }
+      }
+      _ -> match subst_stmts(rest, names, args_) {
+        StAcc(rs, rn, ra) -> StAcc([map_stmt_exprs(s, (x) => subst_scoped(x, names, args_)), ...rs], rn, ra)
+      }
+    }
+  }
+
+fn subst_arm(a: Arm, names: [String], args_: [Expr]) : Arm =
+  match a {
+    Arm(pat, g, b) -> {
+      let sh = remove_shadowed(names, args_, cs_pat_binders(pat, []))
+      Arm(pat, map_opt(g, (x) => subst_scoped(x, sh.names, sh.vals)), subst_scoped(b, sh.names, sh.vals))
+    }
+  }
+
+# Drop every (name, arg) pair whose name is re-bound by `shadow`.
+fn remove_shadowed(names: [String], args_: [Expr], shadow: [String]) : ShadowNA =
+  match names {
+    [] -> ShadowNA { names: [], vals: [] }
+    [n, ...rest] -> {
+      let tail = remove_shadowed(rest, cdr_args(args_), shadow)
+      if list_has(shadow, n) { tail }
+      else { ShadowNA { names: [n, ...tail.names], vals: [car_arg(args_), ...tail.vals] } }
+    }
+  }
+
+# ---- small AST helpers ----
