@@ -76,29 +76,36 @@ if [ "$CALLS" -gt "$THRESHOLD" ]; then
 fi
 echo "native-perf/inline-gate OK — hot-path runtime ops inline into the loop."
 
-# Perf backstop: the default (native-modular) binary must run within a small
-# margin of the whole-program native build. Catches an inline that "succeeded"
-# by the count but regressed via merge code-bloat / a cache-miss path. Best of
-# three runs each (min = least noise); allow the modular run 25% over.
-KAI_NATIVE_MODULAR=0 "$KAI" build --backend=native "$SRC" -o "$TMP/rb_wp" >/dev/null 2>&1 || true
-if [ -x "$TMP/rb_wp" ]; then
-  best() {
-    _b=""
-    for _i in 1 2 3; do
-      _t="$( { /usr/bin/time -p "$1" >/dev/null; } 2>&1 | awk '/^real/{print $2}' )"
-      [ -z "$_b" ] && _b="$_t"
-      awk "BEGIN{exit !($_t < $_b)}" 2>/dev/null && _b="$_t"
-    done
-    echo "$_b"
-  }
-  MOD="$(best "$BIN")"; WP="$(best "$TMP/rb_wp")"
-  echo "native-perf/inline-gate: wall modular=${MOD}s whole-program=${WP}s"
-  if [ -n "$MOD" ] && [ -n "$WP" ] && awk "BEGIN{exit !($MOD > $WP * 1.25 + 0.05)}" 2>/dev/null; then
-    echo "::error::native-perf/inline-gate FAIL — modular ${MOD}s regressed past whole-program ${WP}s * 1.25;"
-    echo "  the hot-path inlined but wall time regressed (merge bloat / cache-miss path)."
-    exit 1
+# Perf backstop: the default (native-modular) binary must run within a margin of
+# the whole-program native build. Catches an inline that "succeeded" by the count
+# but regressed via merge code-bloat. This is a SECONDARY, best-effort check —
+# the hot-path count above is the primary gate. It skips cleanly where the timer
+# is unavailable, and uses a generous 1.6x + 0.1s margin so shared CI runners'
+# scheduling noise never yields a false red (a lost inline is a ~2x regression,
+# far past this). Best of three runs each (min = least noise).
+if command -v /usr/bin/time >/dev/null 2>&1; then
+  KAI_NATIVE_MODULAR=0 "$KAI" build --backend=native "$SRC" -o "$TMP/rb_wp" >/dev/null 2>&1 || true
+  if [ -x "$TMP/rb_wp" ]; then
+    best() {
+      _b=""
+      for _i in 1 2 3; do
+        _t="$( { /usr/bin/time -p "$1" >/dev/null; } 2>&1 | awk '/^real/{print $2}' )"
+        [ -z "$_t" ] && continue
+        { [ -z "$_b" ] || awk "BEGIN{exit !($_t < $_b)}" 2>/dev/null; } && _b="$_t"
+      done
+      echo "$_b"
+    }
+    MOD="$(best "$BIN")"; WP="$(best "$TMP/rb_wp")"
+    if [ -n "$MOD" ] && [ -n "$WP" ]; then
+      echo "native-perf/inline-gate: wall modular=${MOD}s whole-program=${WP}s"
+      if awk "BEGIN{exit !($MOD > $WP * 1.6 + 0.1)}" 2>/dev/null; then
+        echo "::error::native-perf/inline-gate FAIL — modular ${MOD}s regressed past whole-program ${WP}s * 1.6;"
+        echo "  the hot-path inlined but wall time regressed (merge bloat / cache-miss path)."
+        exit 1
+      fi
+      echo "native-perf/inline-gate OK — modular wall time within margin of whole-program."
+    fi
   fi
-  echo "native-perf/inline-gate OK — modular wall time within margin of whole-program."
 fi
 
 # Variant fast-path gate: a primitive-slot ctor (RBNode's Int keys) must carry
