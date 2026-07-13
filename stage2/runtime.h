@@ -83,6 +83,16 @@
 #define KAI_CONST
 #endif
 
+/* M:N scheduler — Class A per-scheduler-thread state (docs/mn-scheduler-
+ * design.md §1). Each OS scheduler thread owns its own copy; a fiber runs on
+ * exactly one thread at a time and only ever touches that thread's copy, so
+ * the allocator pools, region arena stack, scheduler core, and RC/trace
+ * ledgers need no lock on the hot path. Under a single thread `_Thread_local`
+ * is semantically identical to a plain global, so N=1 stays byte-identical.
+ * Every global carrying KAI_TLS is classified `tls` in the audit gate
+ * (tools/runtime-globals.allow). */
+#define KAI_TLS _Thread_local
+
 /* net-tcp-v1 — sockets API for the NetTcp default handler.
  * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
  * blocking-only: the m8.x cooperative scheduler (landed v0.4.0)
@@ -770,14 +780,17 @@ static int       kai_op_truthy(KaiValue *v);
  * other cross-function state. `KAI_RT_COUNTER(decl, init)` expands to the right
  * linkage: extern everywhere + defined by the owner TU under sep-comp, else the
  * self-contained `static ... = init`. */
+/* The counters are Class A (per-thread ledgers, summed at exit), so every
+ * form carries KAI_TLS — a _Thread_local extern resolves per thread to the
+ * owner's per-thread instance. Under one thread this is byte-identical. */
 #if defined(KAI_SEPARATE_COMPILATION)
 #  if defined(KAI_RUNTIME_OWNER)
-#    define KAI_RT_COUNTER(decl, init) extern decl; decl = init
+#    define KAI_RT_COUNTER(decl, init) extern KAI_TLS decl; KAI_TLS decl = init
 #  else
-#    define KAI_RT_COUNTER(decl, init) extern decl
+#    define KAI_RT_COUNTER(decl, init) extern KAI_TLS decl
 #  endif
 #else
-#  define KAI_RT_COUNTER(decl, init) static decl = init
+#  define KAI_RT_COUNTER(decl, init) static KAI_TLS decl = init
 #endif
 
 /* Refcount tracing (m5 #0): always-compiled counters; the per-process
@@ -822,15 +835,15 @@ KAI_RT_COUNTER(int64_t kai_vec_cow_total, 0);
  * cell crosses a function boundary the token cannot. This counter is the
  * exact upper bound on what an interprocedural token-pass would recover —
  * if it is small relative to alloc_total, #2 is not worth the ABI cost. */
-static int64_t kai_rc_reuse_free_total = 0;
+static KAI_TLS int64_t kai_rc_reuse_free_total = 0;
 /* #2 parity probe — kai_drop_reuse_token outcome split. unique = shell
  * handed back (donatable); null_shared = rc>1 so cannot steal; null_mismatch
  * = wrong tag/arity (e.g. RBLeaf scrutinee). Tells whether the wasted fresh
  * allocs are a sharing problem (would need a different fix) or genuinely the
  * inter-frame balance case (token-pass). */
-static int64_t kai_rc_tok_unique = 0;
-static int64_t kai_rc_tok_null_shared = 0;
-static int64_t kai_rc_tok_null_mismatch = 0;
+static KAI_TLS int64_t kai_rc_tok_unique = 0;
+static KAI_TLS int64_t kai_rc_tok_null_shared = 0;
+static KAI_TLS int64_t kai_rc_tok_null_mismatch = 0;
 /* Phase 1.B.1 — incref/decref call counters (the ones that actually
  * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
  * borrow optimisation that elides incref/decref pairs show its effect
@@ -981,8 +994,8 @@ typedef struct {
     int32_t op;     /* 0=alloc, 1=incref, 2=decref, 3=free */
     int32_t tag;
 } KaiRcHistoryEntry;
-static KaiRcHistoryEntry kai_rc_history[KAI_RC_HISTORY_CAP];
-static uint64_t kai_rc_history_count = 0;
+static KAI_TLS KaiRcHistoryEntry kai_rc_history[KAI_RC_HISTORY_CAP];
+static KAI_TLS uint64_t kai_rc_history_count = 0;
 static int      kai_rc_history_enabled_cached = -1; /* lazy: -1 unread, 0 off, 1 on */
 
 static int kai_rc_history_enabled(void) {
@@ -1065,7 +1078,7 @@ static void kai_rc_strict_report(void) {
     }
 }
 
-static int kai_rc_strict_registered = 0;
+static KAI_TLS int kai_rc_strict_registered = 0;
 static void kai_rc_strict_register_once(void) {
     if (kai_rc_strict_registered) return;
     kai_rc_strict_registered = 1;
@@ -1103,9 +1116,9 @@ typedef struct {
     int64_t frees;
 } KaiRcSite;
 
-static KaiRcSite kai_rc_sites[KAI_RC_SITE_BUCKETS];
-static int       kai_rc_sites_count = 0;
-static int       kai_rc_sites_full  = 0;  /* sticky: a probe overflowed */
+static KAI_TLS KaiRcSite kai_rc_sites[KAI_RC_SITE_BUCKETS];
+static KAI_TLS int       kai_rc_sites_count = 0;
+static KAI_TLS int       kai_rc_sites_full  = 0;  /* sticky: a probe overflowed */
 
 /* Hash a pointer using a fast mix (Knuth-style). The high bits of
  * a return address carry the most variance, so we shift before
@@ -1225,7 +1238,7 @@ static void kai_rc_site_report(void) {
     free(flat);
 }
 
-static int kai_rc_site_registered = 0;
+static KAI_TLS int kai_rc_site_registered = 0;
 static void kai_rc_site_register_once(void) {
     if (kai_rc_site_registered) return;
     kai_rc_site_registered = 1;
@@ -1262,7 +1275,7 @@ static void kai_rc_site_register_once(void) {
  * ~8 % across (fn × 13 tags). */
 #ifdef KAI_TRACE_RC_LEAKSITE
 
-static const char *kai_current_scope_fn = "<root>";
+static KAI_TLS const char *kai_current_scope_fn = "<root>";
 
 static void kai_set_scope_fn(const char *name) {
     kai_current_scope_fn = (name != NULL) ? name : "<root>";
@@ -1277,9 +1290,9 @@ typedef struct {
     int64_t     frees;
 } KaiLeakSite;
 
-static KaiLeakSite kai_leaksites[KAI_LEAKSITE_BUCKETS];
-static int         kai_leaksites_count = 0;
-static int         kai_leaksites_full  = 0;
+static KAI_TLS KaiLeakSite kai_leaksites[KAI_LEAKSITE_BUCKETS];
+static KAI_TLS int         kai_leaksites_count = 0;
+static KAI_TLS int         kai_leaksites_full  = 0;
 
 static uint32_t kai_leaksite_hash(const char *scope, int32_t tag) {
     uintptr_t x = (uintptr_t) scope;
@@ -1424,7 +1437,7 @@ static void kai_leaksite_report(void) {
     free(flat);
 }
 
-static int kai_leaksite_registered = 0;
+static KAI_TLS int kai_leaksite_registered = 0;
 static void kai_leaksite_register_once(void) {
     if (kai_leaksite_registered) return;
     kai_leaksite_registered = 1;
@@ -1481,16 +1494,16 @@ static void kai_leaksite_register_once(void) {
 #ifdef KAI_PROFILE_RC
 #include <time.h>
 
-static int64_t kai_prof_alloc_ns   = 0;
-static int64_t kai_prof_free_ns    = 0;
-static int64_t kai_prof_incref_ns  = 0;
-static int64_t kai_prof_decref_ns  = 0;
-static int64_t kai_prof_alloc_n    = 0;
-static int64_t kai_prof_free_n     = 0;
-static int64_t kai_prof_incref_n   = 0;
-static int64_t kai_prof_decref_n   = 0;
-static int64_t kai_prof_decref_to_zero_n = 0;
-static struct timespec kai_prof_t0;
+static KAI_TLS int64_t kai_prof_alloc_ns   = 0;
+static KAI_TLS int64_t kai_prof_free_ns    = 0;
+static KAI_TLS int64_t kai_prof_incref_ns  = 0;
+static KAI_TLS int64_t kai_prof_decref_ns  = 0;
+static KAI_TLS int64_t kai_prof_alloc_n    = 0;
+static KAI_TLS int64_t kai_prof_free_n     = 0;
+static KAI_TLS int64_t kai_prof_incref_n   = 0;
+static KAI_TLS int64_t kai_prof_decref_n   = 0;
+static KAI_TLS int64_t kai_prof_decref_to_zero_n = 0;
+static KAI_TLS struct timespec kai_prof_t0;
 static int kai_prof_init_done = 0;
 static int kai_prof_enabled = 0;
 
@@ -1511,8 +1524,8 @@ typedef struct {
     int64_t start_ns;
     int64_t child_ns;
 } KaiProfFrame;
-static KaiProfFrame kai_prof_stack[KAI_PROF_STACK_CAP];
-static int kai_prof_sp = 0;
+static KAI_TLS KaiProfFrame kai_prof_stack[KAI_PROF_STACK_CAP];
+static KAI_TLS int kai_prof_sp = 0;
 
 static inline int64_t kai_prof_now_ns(void) {
     struct timespec ts;
@@ -1642,8 +1655,8 @@ typedef struct {
     int64_t frees;
 } KaiVarNameBucket;
 
-static KaiVarNameBucket kai_var_names[KAI_VAR_NAME_BUCKETS];
-static int kai_var_names_count;
+static KAI_TLS KaiVarNameBucket kai_var_names[KAI_VAR_NAME_BUCKETS];
+static KAI_TLS int kai_var_names_count;
 
 static KaiVarNameBucket *kai_var_name_lookup(const char *name) {
     if (name == NULL) return NULL;
@@ -1830,16 +1843,16 @@ static uint32_t kai_slot_mask_of(int32_t tag) {
 #if defined(KAI_SEPARATE_COMPILATION)
 extern size_t kai_heap_limit_cached;
 extern int    kai_heap_inited;
-extern size_t kai_heap_committed;
+extern KAI_TLS size_t kai_heap_committed;
 #  if defined(KAI_RUNTIME_OWNER)
 size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
 int    kai_heap_inited       = 0;
-size_t kai_heap_committed    = 0;
+KAI_TLS size_t kai_heap_committed    = 0;
 #  endif
 #else
 static size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
 static int    kai_heap_inited       = 0;
-static size_t kai_heap_committed    = 0;
+static KAI_TLS size_t kai_heap_committed    = 0;
 #endif
 
 static size_t kai_heap_limit(void) {
@@ -1939,15 +1952,15 @@ static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
  * the original `static` lines verbatim, so the single-TU build is
  * byte-identical. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
-extern int kai_cell_pool_n;
+extern KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+extern KAI_TLS int kai_cell_pool_n;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
-int kai_cell_pool_n = 0;
+KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+KAI_TLS int kai_cell_pool_n = 0;
 #  endif
 #else
-static KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
-static int kai_cell_pool_n = 0;
+static KAI_TLS KaiValue *kai_cell_pool[KAI_CELL_POOL_CAP];
+static KAI_TLS int kai_cell_pool_n = 0;
 #endif
 
 /* Companion free-list for the variant `slots[]` arrays, keyed by arity
@@ -1958,15 +1971,15 @@ static int kai_cell_pool_n = 0;
 #define KAI_SLOT_POOL_MAXN 8
 #define KAI_SLOT_POOL_CAP  1048576
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
-extern int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+extern KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+extern KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #  if defined(KAI_RUNTIME_OWNER)
-KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
-int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #  endif
 #else
-static KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
-static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+static KAI_TLS KaiVarSlot *kai_slot_pool[KAI_SLOT_POOL_MAXN + 1][KAI_SLOT_POOL_CAP];
+static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #endif
 
 /* FAM lane: free-list for whole variant BLOCKS (header + n inline slots
@@ -1980,15 +1993,15 @@ static int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #define KAI_VAR_BLOCK_POOL_MAXN 8
 #define KAI_VAR_BLOCK_POOL_CAP  1048576
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
-extern int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+extern KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+extern KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  if defined(KAI_RUNTIME_OWNER)
-KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
-int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  endif
 #else
-static KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
-static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+static KAI_TLS KaiValue *kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1][KAI_VAR_BLOCK_POOL_CAP];
+static KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #endif
 
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
@@ -2023,27 +2036,27 @@ static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
  * state must be ONE instance (external, owner-defined) — a per-partition copy
  * would bump-allocate into disjoint slabs. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern char  *kai_slab_cur;
-extern size_t kai_slab_off;
-extern char **kai_slab_list;
-extern int    kai_slab_count;
-extern int    kai_slab_cap;
-extern int    kai_slab_atexit;
+extern KAI_TLS char  *kai_slab_cur;
+extern KAI_TLS size_t kai_slab_off;
+extern KAI_TLS char **kai_slab_list;
+extern KAI_TLS int    kai_slab_count;
+extern KAI_TLS int    kai_slab_cap;
+extern KAI_TLS int    kai_slab_atexit;
 #  if defined(KAI_RUNTIME_OWNER)
-char  *kai_slab_cur    = NULL;
-size_t kai_slab_off    = 0;
-char **kai_slab_list   = NULL;
-int    kai_slab_count  = 0;
-int    kai_slab_cap    = 0;
-int    kai_slab_atexit = 0;
+KAI_TLS char  *kai_slab_cur    = NULL;
+KAI_TLS size_t kai_slab_off    = 0;
+KAI_TLS char **kai_slab_list   = NULL;
+KAI_TLS int    kai_slab_count  = 0;
+KAI_TLS int    kai_slab_cap    = 0;
+KAI_TLS int    kai_slab_atexit = 0;
 #  endif
 #else
-static char  *kai_slab_cur    = NULL;  /* current slab base */
-static size_t kai_slab_off    = 0;     /* bump offset into current slab */
-static char **kai_slab_list   = NULL;  /* all slabs, for teardown */
-static int    kai_slab_count  = 0;
-static int    kai_slab_cap    = 0;
-static int    kai_slab_atexit = 0;
+static KAI_TLS char  *kai_slab_cur    = NULL;  /* current slab base */
+static KAI_TLS size_t kai_slab_off    = 0;     /* bump offset into current slab */
+static KAI_TLS char **kai_slab_list   = NULL;  /* all slabs, for teardown */
+static KAI_TLS int    kai_slab_count  = 0;
+static KAI_TLS int    kai_slab_cap    = 0;
+static KAI_TLS int    kai_slab_atexit = 0;
 #endif
 
 static void kai_slab_teardown(void) {
@@ -2489,15 +2502,15 @@ static void kai_arena_free(KaiArena *a) {
  * (owner defines, others extern) — a per-TU copy would push and pop two
  * disjoint stacks and desync the region depth. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
-extern int      kai_arena_sp;
+extern KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+extern KAI_TLS int      kai_arena_sp;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
-int      kai_arena_sp = 0;
+KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+KAI_TLS int      kai_arena_sp = 0;
 #  endif
 #else
-static KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
-static int      kai_arena_sp = 0;
+static KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+static KAI_TLS int      kai_arena_sp = 0;
 #endif
 
 static KaiArena *kai_arena_push(void) {
@@ -2755,19 +2768,29 @@ struct KaiNursery {
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
     NULL, NULL           /* nursery_top, scope_sibling_next */           \
 }
+/* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
+ * now that both are `_Thread_local`: the address of a thread-local is not a
+ * compile-time constant. It is anchored to each thread's own `kai_main_fiber`
+ * on that thread's first entry (kai_active_fiber_anchor, run from
+ * kai_set_args and lazily from kai_current_fiber for the pre-main path). */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiFiber  kai_main_fiber;
-extern KaiFiber *kai_active_fiber;
+extern KAI_TLS KaiFiber  kai_main_fiber;
+extern KAI_TLS KaiFiber *kai_active_fiber;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
-KaiFiber *kai_active_fiber = &kai_main_fiber;
+KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
+KAI_TLS KaiFiber *kai_active_fiber = NULL;
 #  endif
 #else
-static KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
-static KaiFiber *kai_active_fiber = &kai_main_fiber;
+static KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
+static KAI_TLS KaiFiber *kai_active_fiber = NULL;
 #endif
 
+static inline void kai_active_fiber_anchor(void) {
+    if (kai_active_fiber == NULL) kai_active_fiber = &kai_main_fiber;
+}
+
 static KaiFiber *kai_current_fiber(void) {
+    kai_active_fiber_anchor();
     return kai_active_fiber;
 }
 
@@ -2795,18 +2818,18 @@ static void kai_trap_abort(const char *msg) {
  * detection panics when the queue is empty *and* parked fibers exist with
  * no wakeup path. Shared like the rest of the scheduler. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiFiber *kai_ready_head;
-extern KaiFiber *kai_ready_tail;
-extern int       kai_parked_count;
+extern KAI_TLS KaiFiber *kai_ready_head;
+extern KAI_TLS KaiFiber *kai_ready_tail;
+extern KAI_TLS int       kai_parked_count;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiFiber *kai_ready_head = NULL;
-KaiFiber *kai_ready_tail = NULL;
-int       kai_parked_count = 0;
+KAI_TLS KaiFiber *kai_ready_head = NULL;
+KAI_TLS KaiFiber *kai_ready_tail = NULL;
+KAI_TLS int       kai_parked_count = 0;
 #  endif
 #else
-static KaiFiber *kai_ready_head = NULL;
-static KaiFiber *kai_ready_tail = NULL;
-static int       kai_parked_count = 0;  /* deadlock detection */
+static KAI_TLS KaiFiber *kai_ready_head = NULL;
+static KAI_TLS KaiFiber *kai_ready_tail = NULL;
+static KAI_TLS int       kai_parked_count = 0;  /* deadlock detection */
 #endif
 
 /* Single-slot pending-free for fiber structs whose wrappers went to RC=0
@@ -2815,12 +2838,12 @@ static int       kai_parked_count = 0;  /* deadlock detection */
  * that follows a context switch (top of trampoline, post-swapcontext in
  * yield/park) so the freed stack is never the one we are running on. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiFiber *kai_pending_free;
+extern KAI_TLS KaiFiber *kai_pending_free;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiFiber *kai_pending_free = NULL;
+KAI_TLS KaiFiber *kai_pending_free = NULL;
 #  endif
 #else
-static KaiFiber *kai_pending_free = NULL;
+static KAI_TLS KaiFiber *kai_pending_free = NULL;
 #endif
 
 /* Forward decl — defined alongside the m8.x fiber stack allocator
@@ -7377,6 +7400,9 @@ static char       **kai_g_argv = NULL;
 #endif
 
 static void kai_set_args(int argc, char **argv) {
+    /* Anchor this thread's active fiber to its own root fiber before any
+     * fiber runs (the static initializer cannot, both being _Thread_local). */
+    kai_active_fiber_anchor();
     kai_g_argc = argc;
     kai_g_argv = argv;
     /* Issue #678: libc defaults stdout to fully-buffered when the fd
@@ -8775,11 +8801,11 @@ static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n) 
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
-static int         kai_test_count_total  = 0;
-static int         kai_test_count_passed = 0;
-static const char *kai_test_current      = NULL;
-static jmp_buf     kai_test_jmp;
-static int         kai_test_in_progress  = 0;
+static KAI_TLS int         kai_test_count_total  = 0;
+static KAI_TLS int         kai_test_count_passed = 0;
+static KAI_TLS const char *kai_test_current      = NULL;
+static KAI_TLS jmp_buf     kai_test_jmp;
+static KAI_TLS int         kai_test_in_progress  = 0;
 
 static void kai_test_begin(const char *desc) {
     kai_test_count_total++;
@@ -8842,7 +8868,7 @@ static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
 #define KAI_BENCH_ITERS_DEFAULT  1000
 #define KAI_BENCH_WARMUP_DEFAULT 50
 
-static int kai_bench_count_total = 0;
+static KAI_TLS int kai_bench_count_total = 0;
 
 static int kai_bench_iters_cached = -1;
 static int kai_bench_warmup_cached = -1;
@@ -8894,8 +8920,8 @@ static long long kai_bench_now_ns(void) {
    before the next one starts (the emitted main calls them in
    sequence), so a single shared buffer is enough — we just realloc
    it lazily to the high-water mark. */
-static long long *kai_bench_samples = NULL;
-static int kai_bench_samples_cap = 0;
+static KAI_TLS long long *kai_bench_samples = NULL;
+static KAI_TLS int kai_bench_samples_cap = 0;
 
 static void kai_bench_ensure_capacity(int n) {
     if (n <= kai_bench_samples_cap) return;
@@ -9015,18 +9041,18 @@ static void kai_bench_run_one(const char *desc, KaiValue *(*body)(void)) {
 
 #define KAI_CHECK_ITERS 100
 
-static int kai_check_count_total = 0;
-static int kai_check_count_passed = 0;
-static const char *kai_check_current_desc = NULL;
+static KAI_TLS int kai_check_count_total = 0;
+static KAI_TLS int kai_check_count_passed = 0;
+static KAI_TLS const char *kai_check_current_desc = NULL;
 
 #define KAI_CHECK_CX_BUF 1024
-static char kai_check_cx_buf[KAI_CHECK_CX_BUF];
-static size_t kai_check_cx_len = 0;
+static KAI_TLS char kai_check_cx_buf[KAI_CHECK_CX_BUF];
+static KAI_TLS size_t kai_check_cx_len = 0;
 
 /* xorshift64* PRNG. Seeded once per process with a constant so
    counterexample reports are reproducible run-to-run; reseed via
    KAI_CHECK_SEED env var lands in v1.x. */
-static uint64_t kai_check_seed = 0xC0DECAFE12345678ULL;
+static KAI_TLS uint64_t kai_check_seed = 0xC0DECAFE12345678ULL;
 
 static uint64_t kai_check_rand_u64(void) {
     kai_check_seed ^= kai_check_seed >> 12;
@@ -9288,8 +9314,8 @@ static int kai_check_shrink_iters_limit(void) {
    triggers shrinking, the runner first snapshots the original cx
    buffer here so the final report can show "<orig> shrunk to <min>".
    Bounded by the same KAI_CHECK_CX_BUF cap as the live buffer. */
-static char kai_check_orig_cx_buf[KAI_CHECK_CX_BUF];
-static int  kai_check_has_orig_cx = 0;
+static KAI_TLS char kai_check_orig_cx_buf[KAI_CHECK_CX_BUF];
+static KAI_TLS int  kai_check_has_orig_cx = 0;
 
 static void kai_check_cx_save_orig(void) {
     size_t n = kai_check_cx_len;
@@ -9927,18 +9953,18 @@ static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
 /* Per-process RNG stream: one shared state so a seed in one TU is observed
  * by random() in another (owner defines, others extern). */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern uint64_t _kai_pcg_state;
-extern uint64_t _kai_pcg_inc;
-extern int      _kai_pcg_seeded;
+extern KAI_TLS uint64_t _kai_pcg_state;
+extern KAI_TLS uint64_t _kai_pcg_inc;
+extern KAI_TLS int      _kai_pcg_seeded;
 #  if defined(KAI_RUNTIME_OWNER)
-uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
-uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
-int      _kai_pcg_seeded = 0;
+KAI_TLS uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+KAI_TLS uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+KAI_TLS int      _kai_pcg_seeded = 0;
 #  endif
 #else
-static uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
-static uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
-static int      _kai_pcg_seeded = 0;
+static KAI_TLS uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+static KAI_TLS uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+static KAI_TLS int      _kai_pcg_seeded = 0;
 #endif
 
 static uint32_t _kai_pcg32_next(void) {
@@ -11641,6 +11667,16 @@ static void kai_install_fiber_sigsegv_handler(void) {
  *   - Spawn.sleep(ns)        — timer wheel keyed on CLOCK_MONOTONIC.
  *   - File defaults          — thread-pool offload (4 workers).
  *   - Process.wait(child)    — SIGCHLD self-pipe + pid waiter map.
+ *
+ * OWNERSHIP INVARIANT (M:N §4, F2-ready boundary): all reactor state
+ * below — timer wheel, waiter lists, self-pipes, parked count, the file
+ * pool — is single-owner: it is read and mutated ONLY from inside
+ * `kai_reactor_wait` and its drain helpers (kai_reactor_*_drain), which
+ * are in turn called ONLY from `kai_reactor_wait`. No other code path
+ * touches it, and every ready-fiber handback goes through `kai_sched_unpark`
+ * from a drain. That single-owner discipline is what makes the F2 lift of
+ * `poll()` onto its own thread mechanical: only the handback (unpark →
+ * route to home_thread) changes; the state does not move.
  *
  * Wait primitive is `poll()` on two self-pipes (one for SIGCHLD,
  * one for file-pool completions) plus a deadline-derived timeout.
