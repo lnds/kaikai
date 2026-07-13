@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.11 (2026-07-13)
+
+### Added
+
+- **runtime**: M:N work-stealing scheduler with copy-on-cross-thread send (part of #1207) (#1211)
+
 ## v0.99.10 (2026-07-13)
 
 ### Changed
