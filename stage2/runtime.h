@@ -4870,6 +4870,7 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * arrays and recursively-copied children; scalar / singleton / opaque
  * leaves are kai_incref'd and shared (no interior pointers into the
  * arena, or already on the RC heap). */
+static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
 static KaiValue *kai_deep_copy_out(KaiValue *v) {
     if (!v) return v;
     /* Koka tagged-Int: an immediate small Int has no heap header, so
@@ -4954,6 +4955,27 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
                 KaiValue **dst = (KaiValue **) kai_vec_elems(c);
                 for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy_out(src[i]);
             }
+            return c;
+        }
+        case KAI_CLOSURE: {
+            /* A spawned fiber's thunk is a closure that crosses to the
+             * fiber's scheduler thread; sharing it would let two threads
+             * touch its (non-atomic) rc and the rc of its captures. Copy
+             * the closure — the fn pointer is code (immortal, no rc) and
+             * each capture is deep-copied so the migrated closure is a
+             * single-owner tree, like a copied message. */
+            int nc = v->as.clo.n_captures;
+            KaiValue **caps = NULL;
+            if (nc > 0) {
+                caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
+                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); exit(1); }
+                for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy_out(v->as.clo.captures[i]);
+            }
+            /* kai_closure increfs each capture; we already own a fresh
+             * rc=1 copy, so drop our transient ref after it takes its own. */
+            KaiValue *c = kai_closure(v->as.clo.fn, v->as.clo.arity, nc, caps);
+            for (int i = 0; i < nc; ++i) kai_decref(caps[i]);
+            free(caps);
             return c;
         }
         default:
@@ -13628,9 +13650,19 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     f->parent       = kai_current_fiber();
-    /* incref to retain a ref the fiber owns; the caller-side ref is
-     * still the caller's to manage (Perceus decrefs at call-site exit). */
-    f->thunk        = kai_incref(thunk);
+    /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
+     * suffices (one thread). At N>1 the fiber may run on another
+     * scheduler thread, so sharing the closure would race its non-atomic
+     * rc (and its captures') between the spawner and the fiber body —
+     * exactly the cross-thread-share the message copy path forbids. Copy
+     * the thunk into a single-owner tree that migrates with the fiber. */
+    if (kai_nthreads > 1) {
+        f->thunk = kai_deep_copy_out(thunk);
+    } else {
+        /* incref to retain a ref the fiber owns; the caller-side ref is
+         * still the caller's to manage (Perceus decrefs at call-site exit). */
+        f->thunk = kai_incref(thunk);
+    }
     /* Capabilities do not cross a spawn: a value-transportable effect
      * rides the child thunk's own evidence frame, and a fiber-local
      * effect resolves against this fiber's own disposition (cancel pad,
