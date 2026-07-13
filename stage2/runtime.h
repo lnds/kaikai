@@ -2753,12 +2753,13 @@ struct KaiFiber {
     /* M:N scheduler — the OS scheduler thread that owns this fiber's
      * heap and runs it. A fiber runs on exactly one thread at a time;
      * `home_thread` is where it was spawned and where it parks. A
-     * cross-thread `Actor.send` reads it to decide copy vs pointer
-     * transfer (destination on another thread → deep-copy into the
-     * sender's heap, migrate the tree with the message). Under N=1
-     * every fiber's home_thread is 0, so the copy branch is never
-     * taken and the send path is byte-identical to today. */
-    int home_thread;
+     * cross-thread `Actor.send` reads it (lock-free) to decide copy vs
+     * pointer transfer, and a thief writes it (lock-free) when it steals
+     * the fiber — so it is atomic: the store publishes the new owner and
+     * every reader acquire-loads it, matching the `live`-slot discipline.
+     * Under N=1 every fiber's home_thread is 0, the copy branch is never
+     * taken, and an _Atomic int is a plain aligned int on our targets. */
+    _Atomic int home_thread;
     /* M:N — a cross-thread wake that arrives while this fiber is still
      * RUNNING (it enqueued its recv-waiter but has not yet reached the
      * park swap) is recorded here instead of lost. The park path checks
