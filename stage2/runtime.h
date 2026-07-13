@@ -218,6 +218,11 @@ typedef enum {
                      * Ref with a length-1 KAI_ARRAY (issue #257); this is the
                      * "clean fix" the #257 retro flagged. ML/OCaml `ref`,
                      * Haskell `IORef` lineage. */
+    /* Cross-thread-handle rule: KAI_FIBER and KAI_PID are runtime-owned
+     * handles to a unit of execution or a channel reachable from more than
+     * one scheduler thread, so their rc is atomic (fiber) or the box
+     * immortal (pid) by construction. Everything the user's program builds
+     * as data stays non-atomic and crosses threads only by copy-on-send. */
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
@@ -2606,6 +2611,18 @@ static inline KaiValue *kai_incref(KaiValue *v) {
 #endif
         return v;
     }
+    /* Fiber[T] wrappers carry atomic rc — cross-thread scheduler handles
+     * (the rule at KaiValue). At N=1 no worker thread exists, so the plain
+     * increment below stays byte-identical. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
+                                  memory_order_relaxed);
+        kai_rc_incref_total++;
+#ifdef KAI_TRACE_RC
+        kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+        return v;
+    }
     v->rc++;
     /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
      * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
@@ -3539,6 +3556,14 @@ static void kai_mailbox_free(KaiMailbox *mb) {
 static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *v = kai_alloc(KAI_PID);
     v->as.mb = mb;
+    /* A Pid is a shared, non-owning identity: the mailbox outlives every
+     * handle to it and is freed by its allocating scope, never by rc. One
+     * mailbox is shared across the scheduler threads that send to it (that
+     * is the point of an actor), so its handle boxes are duplicated and
+     * dropped on many threads at once. Marking the box immortal keeps those
+     * touches off the non-atomic rc field — no cross-thread rc race, and the
+     * decref-to-free path was already a no-op here. */
+    v->rc = INT32_MAX;
     return v;
 }
 
@@ -3880,6 +3905,18 @@ static inline void kai_decref(KaiValue *v) {
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
+    /* A Fiber[T] wrapper is a scheduler-owned handle to a unit of
+     * execution running on another thread: the spawner drops the caller
+     * ref while the trampoline drops the scheduler ref, on two threads at
+     * once. Its rc is atomic — handle metadata, not the jewel (the user
+     * data inside the fiber's private heap stays non-atomic). See the
+     * cross-thread-handle rule at KaiValue. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        if (atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                      memory_order_acq_rel) == 1)
+            kai_decref_free(v);
+        return;
+    }
     if (--v->rc == 0) kai_decref_free(v);
 }
 
@@ -4870,6 +4907,7 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * arrays and recursively-copied children; scalar / singleton / opaque
  * leaves are kai_incref'd and shared (no interior pointers into the
  * arena, or already on the RC heap). */
+static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
 static KaiValue *kai_deep_copy_out(KaiValue *v) {
     if (!v) return v;
     /* Koka tagged-Int: an immediate small Int has no heap header, so
@@ -4954,6 +4992,27 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
                 KaiValue **dst = (KaiValue **) kai_vec_elems(c);
                 for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy_out(src[i]);
             }
+            return c;
+        }
+        case KAI_CLOSURE: {
+            /* A spawned fiber's thunk is a closure that crosses to the
+             * fiber's scheduler thread; sharing it would let two threads
+             * touch its (non-atomic) rc and the rc of its captures. Copy
+             * the closure — the fn pointer is code (immortal, no rc) and
+             * each capture is deep-copied so the migrated closure is a
+             * single-owner tree, like a copied message. */
+            int nc = v->as.clo.n_captures;
+            KaiValue **caps = NULL;
+            if (nc > 0) {
+                caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
+                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); exit(1); }
+                for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy_out(v->as.clo.captures[i]);
+            }
+            /* kai_closure increfs each capture; we already own a fresh
+             * rc=1 copy, so drop our transient ref after it takes its own. */
+            KaiValue *c = kai_closure(v->as.clo.fn, v->as.clo.arity, nc, caps);
+            for (int i = 0; i < nc; ++i) kai_decref(caps[i]);
+            free(caps);
             return c;
         }
         default:
@@ -7751,13 +7810,10 @@ static KaiValue *kai_core_mailbox_alloc_unowned(void) {
 }
 
 /* Tier 2 spawn_actor — set `pid->as.mb->owner_fiber = fiber->as.fib`
- * AND `fiber->as.fib->mailbox = pid->as.mb`. Used after
- * kai_core_mailbox_alloc_unowned + fiber_spawn so the spawned
- * fiber owns the mailbox for monitor / link / trap-exit lookups.
- *
- * Safe under the cooperative scheduler because fiber_spawn enqueues
- * the spawned fiber but does not yield — the parent runs through to
- * this assign call before the spawned trampoline gets the CPU. */
+ * AND `fiber->as.fib->mailbox = pid->as.mb`. Retained for callers that
+ * already hold a spawned Fiber; spawn_actor itself uses
+ * kai_core_spawn_actor_fiber, which stamps the owner before the fiber is
+ * enqueued so Monitor/Link resolve it synchronously with no race. */
 static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
@@ -7768,6 +7824,20 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid)   kai_decref(pid);
     if (fiber) kai_decref(fiber);
     return kai_unit();
+}
+
+/* Spawn a fiber for `thunk` and stamp `pid`'s mailbox onto it — owner
+ * wiring and enqueue happen together, before the fiber can be stolen, so
+ * there is no window where the child runs with an unwired mailbox and no
+ * cross-thread write to owner_fiber. Because the stamp completes before
+ * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
+ * synchronously. Consumes `pid` (the caller keeps its own Pid handle). */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
+static KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk) {
+    KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
+    KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
+    if (pid) kai_decref(pid);
+    return f;
 }
 
 static KaiValue *kai_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
@@ -9685,18 +9755,20 @@ typedef unsigned long long KaiHandlerId;
 
 /* Handler ids must be unique per process: a handler installed in one TU and
  * one in another would draw colliding ids from a per-TU counter (both start
- * at 1). One shared counter (owner defines, others extern). */
+ * at 1). One shared counter (owner defines, others extern). Under M:N every
+ * scheduler thread installs handlers, so the bump is atomic — colliding ids
+ * across threads would alias distinct handler frames in effect dispatch. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiHandlerId kai_next_handler_id;
+extern _Atomic KaiHandlerId kai_next_handler_id;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiHandlerId kai_next_handler_id = 1;
+_Atomic KaiHandlerId kai_next_handler_id = 1;
 #  endif
 #else
-static KaiHandlerId kai_next_handler_id = 1;
+static _Atomic KaiHandlerId kai_next_handler_id = 1;
 #endif
 
 static KaiHandlerId kai_fresh_handler_id(void) {
-    return kai_next_handler_id++;
+    return atomic_fetch_add(&kai_next_handler_id, 1);
 }
 
 /* m7a #6d: continuation closure, stack-allocated at every op call
@@ -13619,8 +13691,11 @@ static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
     return kai_cont_resume(k, kai_unit());
 }
 
-static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
-    (void) self;
+/* Shared spawn body for Spawn.spawn and spawn_actor. Builds the fiber,
+ * optionally stamps `stamp_mb` as its mailbox BEFORE enqueue (so the
+ * owner is wired before the child can be stolen and before this returns),
+ * and returns the RC=2 Fiber[T] wrapper. */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb) {
     if (!thunk || thunk->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
         exit(1);
@@ -13628,9 +13703,19 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     f->parent       = kai_current_fiber();
-    /* incref to retain a ref the fiber owns; the caller-side ref is
-     * still the caller's to manage (Perceus decrefs at call-site exit). */
-    f->thunk        = kai_incref(thunk);
+    /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
+     * suffices (one thread). At N>1 the fiber may run on another
+     * scheduler thread, so sharing the closure would race its non-atomic
+     * rc (and its captures') between the spawner and the fiber body —
+     * exactly the cross-thread-share the message copy path forbids. Copy
+     * the thunk into a single-owner tree that migrates with the fiber. */
+    if (kai_nthreads > 1) {
+        f->thunk = kai_deep_copy_out(thunk);
+    } else {
+        /* incref to retain a ref the fiber owns; the caller-side ref is
+         * still the caller's to manage (Perceus decrefs at call-site exit). */
+        f->thunk = kai_incref(thunk);
+    }
     /* Capabilities do not cross a spawn: a value-transportable effect
      * rides the child thunk's own evidence frame, and a fiber-local
      * effect resolves against this fiber's own disposition (cancel pad,
@@ -13640,6 +13725,14 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
      * on a stack frame the parent overwrites once it returns. */
     f->evidence_top          = NULL;
     kai_fiber_init_ctx(f);
+    /* Stamp the actor mailbox onto the fiber before it becomes runnable:
+     * owner_fiber must be set here, not after enqueue, or a Monitor/Link
+     * in the spawner would resolve a NULL owner and a stolen child could
+     * run (and free the mailbox) before the write landed. */
+    if (stamp_mb) {
+        stamp_mb->owner_fiber = f;
+        f->mailbox            = stamp_mb;
+    }
     /* R4 fix — allocate the wrapper before enqueue so the scheduler
      * can hold its own incref on the value. Without this second ref a
      * `let _ = fiber_spawn(…)` discard would drop the wrapper to
@@ -13662,6 +13755,12 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     }
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
+    return v;
+}
+
+static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+    (void) self;
+    KaiValue *v = kai_spawn_fiber_stamped(thunk, NULL);
     return kai_cont_resume(k, v);
 }
 

@@ -1072,6 +1072,7 @@ KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { r
 KaiValue *kaix_core_mailbox_alloc_unowned(void)                       { return kai_core_mailbox_alloc_unowned(); }
 KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) { return kai_core_mailbox_alloc_bounded_unowned(cap, overflow); }
 KaiValue *kaix_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_core_mailbox_assign_owner(pid, fiber); }
+KaiValue *kaix_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk) { return kai_core_spawn_actor_fiber(pid, thunk); }
 KaiValue *kaix_core_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_core_mailbox_send(pid, msg); }
 KaiValue *kaix_core_mailbox_recv(KaiValue *pid)                       { return kai_core_mailbox_recv(pid); }
 KaiValue *kaix_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns) { return kai_core_mailbox_recv_timeout(pid, ns); }
