@@ -1036,7 +1036,7 @@ test-native-modular: $(TARGET) build
 	work=build/nmod; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
 	cache=build/nmod-cache; rm -rf $$cache; mkdir -p $$cache; \
 	emit() { ./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai 2>build/nmod.err; }; \
-	link() { $(CC) $(CFLAGS) -Wl,-stack_size,0x8000000 $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
+	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
 	./$(TARGET) --emit=native --path ../stdlib --path $$work $$work/main.kai >/dev/null 2>build/nmod-whole.err \
 	  || { echo "native-modular: whole-program EMIT FAIL"; cat build/nmod-whole.err; exit 1; }; \
 	link "$$work/main.o" build/nmod-whole; ./build/nmod-whole > build/nmod-whole.out; \
