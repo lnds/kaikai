@@ -237,26 +237,57 @@ fn parse_dep(name: String, v: TomlValue) : Dep = {
           TStr(p) -> Dep { name: name, kind: DepLocal(p) }
           _       -> Dep { name: name, kind: DepUnknown("(non-string path)") }
         }
+        # `source`/`ref` are canonical (what `kai add` writes); `git`/`tag`
+        # are accepted aliases for the documented manifest form.
         None -> {
-          let src = toml.pairs_get(ps, "source")
-          let rf  = toml.pairs_get(ps, "ref")
+          let src = pairs_get_first(ps, "source", "git")
+          let rf  = pairs_get_first(ps, "ref", "tag")
           match src {
             Some(sv) -> match sv {
               TStr(ss) -> match rf {
                 Some(rv) -> match rv {
                   TStr(rs) -> Dep { name: name, kind: DepGit(ss, rs) }
-                  _ -> Dep { name: name, kind: DepUnknown("(non-string ref)") }
+                  _ -> Dep { name: name, kind: DepUnknown("(non-string ref/tag)") }
                 }
-                None -> Dep { name: name, kind: DepUnknown("(missing ref)") }
+                None -> Dep { name: name, kind: DepUnknown("(git source without ref/tag)") }
               }
-              _ -> Dep { name: name, kind: DepUnknown("(non-string source)") }
+              _ -> Dep { name: name, kind: DepUnknown("(non-string source/git)") }
             }
-            None -> Dep { name: name, kind: DepUnknown("(no source/path)") }
+            None -> Dep { name: name, kind: DepUnknown(unknown_keys_render(ps)) }
           }
         }
       }
     }
     _ -> Dep { name: name, kind: DepUnknown("(not a string or table)") }
+  }
+}
+
+# Look up `primary`; fall back to `alias` when it is absent. Lets the
+# canonical `source`/`ref` keys and their `git`/`tag` aliases resolve
+# through one lookup.
+fn pairs_get_first(ps: [Pair[String, TomlValue]], primary: String, alias: String)
+                   : Option[TomlValue] = {
+  match toml.pairs_get(ps, primary) {
+    Some(v) -> Some(v)
+    None    -> toml.pairs_get(ps, alias)
+  }
+}
+
+# Render the keys of an unrecognised dependency table for the
+# diagnostic, e.g. `(unrecognised keys: registry, version)`.
+fn unknown_keys_render(ps: [Pair[String, TomlValue]]) : String = {
+  match ps {
+    [] -> "(empty dependency table)"
+    _  -> string_concat("(unrecognised keys: ",
+            string_concat(join_keys(ps), ")"))
+  }
+}
+
+fn join_keys(ps: [Pair[String, TomlValue]]) : String = {
+  match ps {
+    [] -> ""
+    [p] -> p.fst
+    [p, ...rest] -> string_concat(p.fst, string_concat(", ", join_keys(rest)))
   }
 }
 
@@ -706,7 +737,14 @@ fn resolve_loop(pending: [Dep], acc: [Pkg])
     [d, ...rest] -> {
       match d.kind {
         DepLocal(_) -> resolve_loop(rest, acc)   # local deps not in lock
-        DepUnknown(_) -> resolve_loop(rest, acc)
+        # An unrecognised dependency table is a manifest error, not a
+        # no-op: silently locking it out turns a typo into a confusing
+        # `cannot open module` failure two commands later.
+        DepUnknown(why) -> {
+          Stderr.eprint("kai-pkg: dependency '#{d.name}': unrecognised form #{why}")
+          Stderr.eprint("kai-pkg: expected { path = \"...\" } or { source = \"...\", ref = \"...\" } (git/tag also accepted)")
+          process.exit(2)
+        }
         DepGit(source, ref) -> {
           # MVS: if we already resolved a pkg from the same source,
           # keep the larger ref (lexicographic — semver-aware
