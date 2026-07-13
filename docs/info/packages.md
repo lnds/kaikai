@@ -24,15 +24,27 @@ kai migrate [<file>] [--write]    # migrate source across an edition bump
 ## Manifest
 
 ```text
-[package]
-name = "mathlib"
+name = "mathlib"                  # top-level, not under a [section]
 version = "0.1.0"
 entry = "main.kai"                # optional; defaults to main.kai
 
 [dependencies]
-jsonlib = { git = "https://github.com/x/jsonlib", tag = "v1.2.0" }
+jsonlib = { source = "github.com/x/jsonlib", ref = "v1.2.0" }
 utilslib = { path = "../utilslib" }
 ```
+
+Dependency forms:
+
+- **Git**: `{ source = "<url>", ref = "<tag|branch|sha>" }` — the
+  canonical form `kai add <url>@<ref>` writes. `{ git = ..., tag = ... }`
+  is accepted as an alias for the same. The `ref` is pinned to a commit
+  SHA in `kai.lock` for reproducible builds.
+- **Local path**: `{ path = "../relative/or/absolute" }` — resolved
+  through the manifest directly, not locked.
+
+An unrecognised dependency table (neither `path` nor `source`/`ref`)
+is a manifest error: `kai install` reports it and exits non-zero
+rather than locking zero entries.
 
 ## Migrating across an edition
 
