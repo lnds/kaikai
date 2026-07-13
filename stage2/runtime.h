@@ -7784,10 +7784,9 @@ static KaiValue *kai_core_mailbox_alloc_unowned(void) {
  * AND `fiber->as.fib->mailbox = pid->as.mb`. Used after
  * kai_core_mailbox_alloc_unowned + fiber_spawn so the spawned
  * fiber owns the mailbox for monitor / link / trap-exit lookups.
- *
- * Safe under the cooperative scheduler because fiber_spawn enqueues
- * the spawned fiber but does not yield — the parent runs through to
- * this assign call before the spawned trampoline gets the CPU. */
+ * Cross-thread-unsafe under M:N (the spawner and the spawned fiber
+ * run on different threads); spawn_actor binds the owner from the
+ * body via kai_core_mailbox_bind_self instead. */
 static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
@@ -7797,6 +7796,23 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
     if (pid)   kai_decref(pid);
     if (fiber) kai_decref(fiber);
+    return kai_unit();
+}
+
+/* Bind the mailbox to the currently running fiber, from inside the
+ * spawned actor's own body. Under M:N the spawner and the spawned fiber
+ * run on different threads, so wiring the owner from the spawner (the old
+ * assign_owner-after-spawn) raced — and could even free the mailbox
+ * before the write landed. Binding from the body runs entirely on the
+ * fiber's own thread, so owner_fiber is written and later read (by
+ * kai_mailbox_free at actor exit) by one thread only. */
+static KaiValue *kai_core_mailbox_bind_self(KaiValue *pid) {
+    if (pid && pid->tag == KAI_PID && pid->as.mb) {
+        KaiFiber *self = kai_current_fiber();
+        pid->as.mb->owner_fiber = self;
+        if (self) self->mailbox = pid->as.mb;
+    }
+    if (pid) kai_decref(pid);
     return kai_unit();
 }
 
