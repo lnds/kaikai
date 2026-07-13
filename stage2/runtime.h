@@ -7810,12 +7810,10 @@ static KaiValue *kai_core_mailbox_alloc_unowned(void) {
 }
 
 /* Tier 2 spawn_actor — set `pid->as.mb->owner_fiber = fiber->as.fib`
- * AND `fiber->as.fib->mailbox = pid->as.mb`. Used after
- * kai_core_mailbox_alloc_unowned + fiber_spawn so the spawned
- * fiber owns the mailbox for monitor / link / trap-exit lookups.
- * Cross-thread-unsafe under M:N (the spawner and the spawned fiber
- * run on different threads); spawn_actor binds the owner from the
- * body via kai_core_mailbox_bind_self instead. */
+ * AND `fiber->as.fib->mailbox = pid->as.mb`. Retained for callers that
+ * already hold a spawned Fiber; spawn_actor itself uses
+ * kai_core_spawn_actor_fiber, which stamps the owner before the fiber is
+ * enqueued so Monitor/Link resolve it synchronously with no race. */
 static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
@@ -7828,21 +7826,18 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     return kai_unit();
 }
 
-/* Bind the mailbox to the currently running fiber, from inside the
- * spawned actor's own body. Under M:N the spawner and the spawned fiber
- * run on different threads, so wiring the owner from the spawner (the old
- * assign_owner-after-spawn) raced — and could even free the mailbox
- * before the write landed. Binding from the body runs entirely on the
- * fiber's own thread, so owner_fiber is written and later read (by
- * kai_mailbox_free at actor exit) by one thread only. */
-static KaiValue *kai_core_mailbox_bind_self(KaiValue *pid) {
-    if (pid && pid->tag == KAI_PID && pid->as.mb) {
-        KaiFiber *self = kai_current_fiber();
-        pid->as.mb->owner_fiber = self;
-        if (self) self->mailbox = pid->as.mb;
-    }
+/* Spawn a fiber for `thunk` and stamp `pid`'s mailbox onto it — owner
+ * wiring and enqueue happen together, before the fiber can be stolen, so
+ * there is no window where the child runs with an unwired mailbox and no
+ * cross-thread write to owner_fiber. Because the stamp completes before
+ * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
+ * synchronously. Consumes `pid` (the caller keeps its own Pid handle). */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
+static KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk) {
+    KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
+    KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
     if (pid) kai_decref(pid);
-    return kai_unit();
+    return f;
 }
 
 static KaiValue *kai_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
@@ -13696,8 +13691,11 @@ static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
     return kai_cont_resume(k, kai_unit());
 }
 
-static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
-    (void) self;
+/* Shared spawn body for Spawn.spawn and spawn_actor. Builds the fiber,
+ * optionally stamps `stamp_mb` as its mailbox BEFORE enqueue (so the
+ * owner is wired before the child can be stolen and before this returns),
+ * and returns the RC=2 Fiber[T] wrapper. */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb) {
     if (!thunk || thunk->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
         exit(1);
@@ -13727,6 +13725,14 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
      * on a stack frame the parent overwrites once it returns. */
     f->evidence_top          = NULL;
     kai_fiber_init_ctx(f);
+    /* Stamp the actor mailbox onto the fiber before it becomes runnable:
+     * owner_fiber must be set here, not after enqueue, or a Monitor/Link
+     * in the spawner would resolve a NULL owner and a stolen child could
+     * run (and free the mailbox) before the write landed. */
+    if (stamp_mb) {
+        stamp_mb->owner_fiber = f;
+        f->mailbox            = stamp_mb;
+    }
     /* R4 fix — allocate the wrapper before enqueue so the scheduler
      * can hold its own incref on the value. Without this second ref a
      * `let _ = fiber_spawn(…)` discard would drop the wrapper to
@@ -13749,6 +13755,12 @@ static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k
     }
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
+    return v;
+}
+
+static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+    (void) self;
+    KaiValue *v = kai_spawn_fiber_stamped(thunk, NULL);
     return kai_cont_resume(k, v);
 }
 
