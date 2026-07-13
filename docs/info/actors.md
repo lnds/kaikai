@@ -61,6 +61,14 @@ spawn/install surface:
 `Monitor` lets one actor observe another's lifecycle. See
 `docs/actors.md` for the full surface.
 
+## Parallelism
+
+Actors run in parallel across OS threads with `KAI_THREADS=N`
+(default 1; no code changes — see `kai info fibers` §*Parallelism*).
+The actor guarantee holds at any N: one mailbox, processed serially;
+messages that cross a thread boundary are copied, so no actor ever
+observes shared mutation.
+
 ## NOT IN KAIKAI
 
 - Erlang `unlink`. The `Link` effect exists with a `Link.link(peer)`

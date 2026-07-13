@@ -150,13 +150,13 @@ don't accidentally get pulled into a 1.0-scoped lane.
 | Item | Cost | Why post-MVP |
 |---|---:|---|
 | **Optimised context switch** | ~5–7d | `ucontext` is deprecated on macOS and ~1–2 µs per switch; production needs asm-level (~50–100 ns) like `boost.context`. v1 numbers are good enough for correctness. |
-| **Multi-threaded scheduler** | weeks | Work-stealing across N OS threads; cross-thread RC requires atomics; changes the memory model. Single-thread cooperative is correct and parallelisable later. |
+| ~~**Multi-threaded scheduler**~~ ✅ **shipped** | — | M:N work-stealing landed (design `docs/mn-scheduler-design.md`): `KAI_THREADS=N` opt-in, default 1 byte-identical; cross-thread sends physically copied so per-fiber RC stays non-atomic (the "requires atomics" concern was resolved by copy-at-the-boundary, not atomics); TSAN CI tier guards races. Shipped: state partition + isolated reactor, then the M:N scheduler itself. Remaining: reactor serving N schedulers (in flight), then the deliberate default-on flip — an owner decision. |
 | **Profiling + observability** | ~1w | Fiber lifetime traces, mailbox contention, richer deadlock detection. Tooling, not correctness. |
 
-CLAUDE.md should keep "do not design against multi-threaded scheduler
-now" pinned for the same reason it pins WASM and Windows: the cost of
-designing for it pre-1.0 dwarfs the cost of doing it after the
-single-threaded model is locked in.
+The old guidance to "not design against a multi-threaded scheduler"
+is retired: the scheduler exists. What stays pinned is its invariant —
+no shared mutation crosses a thread boundary; the copy at the crossing
+is what keeps object RC atomic-free.
 
 ## Residual m8.x items
 
