@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.12 (2026-07-13)
+
+### Fixed
+
+- **runtime**: lazy-materialise the RC free-list pools — restore ~2 MiB idle RSS (closes #1212, closes #1213) (#1216)
+
 ## v0.99.11 (2026-07-13)
 
 ### Added
