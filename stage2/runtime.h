@@ -761,17 +761,36 @@ static inline int32_t kai_head_tag(KaiValue *v) {
 /* Forward declarations used across sections. */
 static int       kai_op_truthy(KaiValue *v);
 
+/* Runtime tracing counters are written unconditionally (only the exit report
+ * is env-gated), and are READ across functions (the report, live-peak
+ * tracking). Under separate compilation the native-modular merge would inline
+ * counter-touching helpers into partitions, giving each its own copy —
+ * fragmenting the telemetry KAI_TRACE_RC prints. So they are ONE shared
+ * instance (external, owner-defined) under sep-comp, exactly like the runtime's
+ * other cross-function state. `KAI_RT_COUNTER(decl, init)` expands to the right
+ * linkage: extern everywhere + defined by the owner TU under sep-comp, else the
+ * self-contained `static ... = init`. */
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_RT_COUNTER(decl, init) extern decl; decl = init
+#  else
+#    define KAI_RT_COUNTER(decl, init) extern decl
+#  endif
+#else
+#  define KAI_RT_COUNTER(decl, init) static decl = init
+#endif
+
 /* Refcount tracing (m5 #0): always-compiled counters; the per-process
    report at exit is gated on the env var KAI_TRACE_RC. The counters
    add 4 increments per kai_alloc and 2 per kai_free_value — cheap
    enough that the always-on path costs ~ns per allocation, but small
    enough that we keep them on rather than ifdef'ing them in/out
    (otherwise a measurement run would need a runtime rebuild). */
-static int64_t kai_rc_alloc_total = 0;
-static int64_t kai_rc_free_total  = 0;
-static int64_t kai_rc_live_now    = 0;
-static int64_t kai_rc_live_peak   = 0;
-static int64_t kai_rc_alloc_by_tag[16] = {0};
+KAI_RT_COUNTER(int64_t kai_rc_alloc_total, 0);
+KAI_RT_COUNTER(int64_t kai_rc_free_total, 0);
+KAI_RT_COUNTER(int64_t kai_rc_live_now, 0);
+KAI_RT_COUNTER(int64_t kai_rc_live_peak, 0);
+KAI_RT_COUNTER(int64_t kai_rc_alloc_by_tag[16], {0});
 /* issue #120 — opt-in Perceus regions. Dedicated arena counters,
  * distinct from kai_rc_alloc_total / kai_rc_free_total so a region's
  * bulk lifecycle is visible without polluting the per-value RC ledger.
@@ -784,16 +803,16 @@ static int64_t kai_rc_alloc_by_tag[16] = {0};
  * so kai_rc_report() / kai_rc_strict_report() (below) can read them
  * without a forward declaration; the arena machinery itself lives
  * after the singletons. */
-static int64_t kai_arena_alloc_total = 0;
-static int64_t kai_arena_free_total  = 0;
+KAI_RT_COUNTER(int64_t kai_arena_alloc_total, 0);
+KAI_RT_COUNTER(int64_t kai_arena_free_total, 0);
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
-static int64_t kai_rc_reuse_total = 0;
+KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
 
 /* Vec uniqueness counters: writes that mutated a unique (rc == 1)
  * buffer in place vs. writes that had to copy a shared one. */
-static int64_t kai_vec_inplace_total = 0;
-static int64_t kai_vec_cow_total     = 0;
+KAI_RT_COUNTER(int64_t kai_vec_inplace_total, 0);
+KAI_RT_COUNTER(int64_t kai_vec_cow_total, 0);
 /* #2 parity probe — reuse-token DISPOSAL counter. Bumped by every
  * kai_reuse_free, i.e. every arm-top token captured (UNIQUE scrutinee
  * shell stolen) that the arm body could NOT donate to an in-frame
@@ -820,8 +839,8 @@ static int64_t kai_rc_tok_null_mismatch = 0;
  * (parallel to kai_rc_alloc_total), gated only by the KAI_TRACE_RC env var
  * at report time; previously they sat behind -DKAI_TRACE_RC, so any binary
  * built without that define (every `kai build` output) reported 0. */
-static int64_t kai_rc_incref_total = 0;
-static int64_t kai_rc_decref_total = 0;
+KAI_RT_COUNTER(int64_t kai_rc_incref_total, 0);
+KAI_RT_COUNTER(int64_t kai_rc_decref_total, 0);
 
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
@@ -906,7 +925,7 @@ static void kai_rc_report(void) {
     }
 }
 
-static int kai_rc_registered = 0;
+KAI_RT_COUNTER(int kai_rc_registered, 0);
 static void kai_rc_register_once(void) {
     if (kai_rc_registered) return;
     kai_rc_registered = 1;
@@ -948,7 +967,7 @@ static void kai_rc_register_once(void) {
  */
 #ifdef KAI_TRACE_RC
 
-static int64_t kai_rc_free_by_tag[16] = {0};
+KAI_RT_COUNTER(int64_t kai_rc_free_by_tag[16], {0});
 
 #define KAI_RC_SENTINEL_U64 ((uint64_t) 0xDEADBEEFDEADBEEFULL)
 
@@ -1999,12 +2018,33 @@ static int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
  * (kaic2b.c == kaic2c.c) proves no AST node — of any arity — was
  * corrupted by the size-classing. */
 #define KAI_SLAB_SIZE (256u * 1024u)   /* 256 KiB per slab */
+/* One shared slab allocator across a separate-compilation build: the native-
+ * modular merge inlines slab-touching helpers into partitions, so the slab
+ * state must be ONE instance (external, owner-defined) — a per-partition copy
+ * would bump-allocate into disjoint slabs. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern char  *kai_slab_cur;
+extern size_t kai_slab_off;
+extern char **kai_slab_list;
+extern int    kai_slab_count;
+extern int    kai_slab_cap;
+extern int    kai_slab_atexit;
+#  if defined(KAI_RUNTIME_OWNER)
+char  *kai_slab_cur    = NULL;
+size_t kai_slab_off    = 0;
+char **kai_slab_list   = NULL;
+int    kai_slab_count  = 0;
+int    kai_slab_cap    = 0;
+int    kai_slab_atexit = 0;
+#  endif
+#else
 static char  *kai_slab_cur    = NULL;  /* current slab base */
 static size_t kai_slab_off    = 0;     /* bump offset into current slab */
 static char **kai_slab_list   = NULL;  /* all slabs, for teardown */
 static int    kai_slab_count  = 0;
 static int    kai_slab_cap    = 0;
 static int    kai_slab_atexit = 0;
+#endif
 
 static void kai_slab_teardown(void) {
     for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
@@ -15153,6 +15193,106 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
     return 0;
 }
 
+/* Modular runtime-bc merge: link the SEPARATE-COMPILATION runtime bitcode (its
+ * state globals are `external`, owned by the one runtime TU at link) into a
+ * partition so O2 inlines the `kaix_*` hot ops, WITHOUT duplicating runtime
+ * STATE across the N partition objects.
+ *
+ * The whole-program path internalises everything-but-main, which would strip
+ * the external linkage a cross-partition user call depends on. This path
+ * instead internalises only the RUNTIME functions the merge brought in — a
+ * function is "from the runtime" iff it was NOT defined in the partition
+ * before the merge. Those runtime bodies go `internal` so O2 inlines + DCEs
+ * them per partition; the user's own fns keep their linkage (external for the
+ * cross-TU calls), and the runtime's state globals stay `external` references
+ * resolved by the runtime owner. The result: the `kaix_*` ops inline into the
+ * hot path, one runtime-state instance survives (identity across partitions is
+ * preserved), and cross-partition symbols still link. Returns 0 on success or
+ * no-op (bc path unset), non-zero only on a real parse/link failure. */
+static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
+    const char *bc_path = getenv("KAI_NATIVE_RUNTIME_INLINE_BC");
+    if (!bc_path || !bc_path[0]) return 0;             /* opt-out: runtime stays an owner-TU call */
+
+    LLVMModuleRef mod = (LLVMModuleRef) m;
+
+    /* Snapshot the partition's OWN function names before the merge, so the
+     * post-merge internaliser can tell a runtime body (to fold away) from a
+     * user body (to keep external for cross-TU linkage). A partition has a
+     * bounded fn count; a flat name set keeps the check simple and allocation
+     * a single grow-on-demand array. */
+    size_t pre_cap = 64, pre_n = 0;
+    char **pre = (char **) malloc(pre_cap * sizeof(char *));
+    if (!pre) { fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+    for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        const char *nm = LLVMGetValueName(f);
+        if (!nm) continue;
+        if (pre_n == pre_cap) {
+            pre_cap *= 2;
+            char **np = (char **) realloc(pre, pre_cap * sizeof(char *));
+            if (!np) { free(pre); fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+            pre = np;
+        }
+        pre[pre_n++] = strdup(nm);
+    }
+
+    LLVMMemoryBufferRef buf = NULL;
+    char *err = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+        fprintf(stderr, "kai: native runtime inline bitcode unreadable (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    LLVMModuleRef src = NULL;
+    err = NULL;
+    if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
+        fprintf(stderr, "kai: native runtime inline bitcode parse failed (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+    {
+        const char *dst_triple = LLVMGetTarget(mod);
+        if (dst_triple) LLVMSetTarget(src, dst_triple);
+        LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout(mod));
+    }
+    if (LLVMLinkModules2(mod, src)) {
+        fprintf(stderr, "kai: native runtime inline bitcode link failed (%s)\n", bc_path);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+
+    /* Internalise every DEFINED function that was not in the pre-merge set —
+     * i.e. the runtime bodies just merged in, INCLUDING `main`. O2 then inlines
+     * the always_inline `kaix_*` ops and globalDCE drops the rest (a partition
+     * never calls the runtime's `main`, so it is dropped). Unlike the
+     * whole-program path, `main` is NOT kept external here: the ONE OS entry
+     * point comes from the runtime owner TU, so a partition exporting its own
+     * merged copy would collide with the owner's at link. User fns (in the pre
+     * set) and the runtime's external state globals are untouched. */
+    for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        const char *nm = LLVMGetValueName(f);
+        if (!nm) continue;
+        int was_user = 0;
+        for (size_t i = 0; i < pre_n; i++) {
+            if (strcmp(pre[i], nm) == 0) { was_user = 1; break; }
+        }
+        if (!was_user) LLVMSetLinkage(f, LLVMInternalLinkage);
+    }
+
+    for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+    free(pre);
+    return 0;
+}
+
 /* Copy one function attribute (by name) from `src` onto `dst` if `dst` lacks it. */
 static void kai_llvm_copy_fn_str_attr(LLVMValueRef dst, LLVMValueRef src,
                                       const char *name, unsigned nlen) {
@@ -15245,12 +15385,16 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
      * triple/datalayout are set (they must match the bitcode's) and before
      * the pipeline. A real link failure aborts before EmitToFile.
      *
-     * The modular backend passes `link_runtime = 0`: each per-module object is
-     * a separate TU, so bitcode-merge-then-internalise would both duplicate
-     * the runtime in every object AND strip the external linkage a cross-TU
-     * call depends on. Modular links the runtime as one owner TU
-     * (runtime_llvm.c) at the final `cc` step — the L1 runtime-owner model. */
-    if (link_runtime && kai_llvm_link_runtime_bc(m)) {
+     * `link_runtime`: 1 = whole-program (merge the full runtime bc, internalise
+     * all-but-main); 2 = modular partition (merge the SEPARATE-COMPILATION
+     * runtime bc whose state globals are external-owned, internalise only the
+     * merged runtime FUNCTIONS so O2 inlines the `kaix_*` ops without
+     * duplicating runtime state or stripping cross-TU user linkage); 0 = no
+     * merge (the runtime is one owner TU linked by cc). */
+    int merge_rc = 0;
+    if (link_runtime == 1)      merge_rc = kai_llvm_link_runtime_bc(m);
+    else if (link_runtime == 2) merge_rc = kai_llvm_link_runtime_bc_modular(m);
+    if (merge_rc) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
         if (path) kai_decref(path);
@@ -15291,11 +15435,14 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
     return kai_llvm_emit_object_impl(m, path, 1);
 }
 
-/* One partition of a modular build: no runtime-bitcode merge, no internalise —
- * cross-TU symbols keep external linkage and the runtime is one owner TU at
- * link time. O2 still optimises this object's own bodies. */
+/* One partition of a modular build. With KAI_NATIVE_RUNTIME_INLINE_BC set,
+ * merges the separate-compilation runtime bc so O2 inlines the `kaix_*` hot
+ * ops into this partition (runtime state stays external, owned by the runtime
+ * TU — no per-partition duplication). Unset → no merge, the runtime is one
+ * owner TU linked by cc (the legacy path). Cross-TU user symbols keep external
+ * linkage either way. */
 static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) {
-    return kai_llvm_emit_object_impl(m, path, 0);
+    return kai_llvm_emit_object_impl(m, path, 2);
 }
 #else /* !KAI_LLVM */
 /* Default / bootstrap build: libLLVM is not linked, so the C-API

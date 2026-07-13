@@ -1673,8 +1673,20 @@ extern void _kai_proto_init_llvm(void);
 /* Variant-tag -> head-tag registration shim. The LLVM IR calls this
  * once per variant entry; we accumulate in a heap array and rebind
  * the runtime pointer + length each time. */
+/* Proto-dispatch state: one instance across a separate-compilation build (the
+ * merged runtime bodies must share the same variant-head + impl tables the
+ * root populated at startup). External + owner-defined under sep-comp. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int32_t *_kaix_v2h_heap;
+extern int32_t  _kaix_v2h_capacity;
+#  if defined(KAI_RUNTIME_OWNER)
+int32_t *_kaix_v2h_heap     = NULL;
+int32_t  _kaix_v2h_capacity = 0;
+#  endif
+#else
 static int32_t *_kaix_v2h_heap     = NULL;
 static int32_t  _kaix_v2h_capacity = 0;
+#endif
 
 void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag) {
     if (variant_tag >= _kaix_v2h_capacity) {
@@ -1703,9 +1715,20 @@ void kaix_register_one_reusable_tag(int32_t tag) {
  * with the resolved function pointer. Builds an in-place hashmap by
  * accumulating + reinserting on each call. Cheap because each
  * register call is O(1) amortised. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiImplEntry *_kaix_impls_heap;
+extern int32_t       _kaix_impls_capacity;
+extern int32_t       _kaix_impls_count;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiImplEntry *_kaix_impls_heap     = NULL;
+int32_t       _kaix_impls_capacity = 0;
+int32_t       _kaix_impls_count    = 0;
+#  endif
+#else
 static KaiImplEntry *_kaix_impls_heap     = NULL;
 static int32_t       _kaix_impls_capacity = 0;
 static int32_t       _kaix_impls_count    = 0;
+#endif
 
 void kaix_register_one_impl(int32_t proto_id, int32_t op_id, int32_t head_tag, void *fn) {
     if (_kaix_impls_count >= _kaix_impls_capacity) {
