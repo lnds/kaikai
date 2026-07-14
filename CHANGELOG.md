@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.17 (2026-07-14)
+
+### Fixed
+
+- **emit**: single-source the native match-arm Int binder rawness verdict (refs #1229) (#1233)
+
 ## v0.99.16 (2026-07-14)
 
 ### Added
