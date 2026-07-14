@@ -175,6 +175,36 @@ fn bad[s: Shape, t: Shape](xs: s[t[Int]]) : Int = 0   # composition
 fn main() : Unit / Stdout = Stdout.print("no")
 ```
 
+A Shape protocol may declare a **theory** in its header — reusing the
+`kind K : Theory` spelling — to state which laws its ops obey. A
+`Sequence[s: Shape] : Functorial` names the closed `Functorial` theory
+(`identity`, `fusion`); `kai check` / `kai test` then autogenerate
+property checks per impl, and a `map`-into-`foldl` pipeline over any
+lawful container fuses to a single traversal. An impl asserts
+`axiom Functorial` after its body to opt out of the checks:
+
+```kaikai
+protocol Sequence[s: Shape] : Functorial {
+  map(xs: s[Int], f: (Int) -> Int) : s[Int]
+  foldl(xs: s[Int], init: Int, f: (Int, Int) -> Int) : Int
+}
+
+type Chain[a] = Empty | Link(a, Chain[a])
+
+impl Sequence for Chain {
+  fn map(xs: Chain[Int], f: (Int) -> Int) : Chain[Int] = match xs {
+    Empty      -> Empty
+    Link(h, t) -> Link(f(h), map(t, f))
+  }
+  fn foldl(xs: Chain[Int], init: Int, f: (Int, Int) -> Int) : Int = match xs {
+    Empty      -> init
+    Link(h, t) -> foldl(t, f(init, h), f)
+  }
+}
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+```
+
 ## User-declared kinds
 
 `Measure`, `Currency`, and `Layout` are not special — declare your own
