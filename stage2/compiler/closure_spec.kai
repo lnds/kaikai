@@ -277,11 +277,46 @@ fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, all: [Decl]) : 
 fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
   match hd {
     DFn(_, n, _, ps, rt, _, body, _, _, _) -> {
-      let mono_ok = not any_return_only(drop_param_at(ps, idx), rt)
+      # A return-only tparam alone is fine — mono grounds it from the call
+      # site's resolved return type, and unbox lands the loop's element.
+      # The unsound case is narrower: a return-only tparam that the body
+      # resolves through an ARITY-0 protocol op (`zero()`/`one()`), whose
+      # result type IS that tparam and so cannot be pinned from any datum.
+      # A collect uses `vec_push`/`vec_reserve` (parametric, element opaque)
+      # and specialises; `map_sum`'s `zero()` still declines.
+      let unsound_ret = any_return_only(drop_param_at(ps, idx), rt) and body_has_arity0_proto_op(body)
       let flow_ok = functional_param_safe(body, param_name_at(ps, idx), n)
-      mono_ok and flow_ok
+      not unsound_ret and flow_ok
     }
     _ -> false
+  }
+
+# True when the body applies an arity-0 protocol op — a bare op reference
+# reified to a `__proto_*` dispatcher, called with no arguments. Such an
+# op's result type is the protocol's own tparam, unpinnable from any datum,
+# so inlining a callee that resolves one through a return-only tparam
+# leaves the op's runtime dispatch stranded (`no impl of … for runtime
+# head`). `zero()`/`one()` are the ring cases.
+fn body_has_arity0_proto_op(e: Expr) : Bool =
+  match e.kind {
+    ECall(callee, args_) -> arity0_proto_call(callee, args_) or body_has_arity0_proto_op(callee) or kids_have_arity0_proto_op(args_)
+    _ -> kids_have_arity0_proto_op(cspec_kids(e))
+  }
+
+fn arity0_proto_call(callee: Expr, args_: [Expr]) : Bool =
+  list_length(args_) == 0 and callee_is_proto_op(callee)
+
+fn kids_have_arity0_proto_op(es: [Expr]) : Bool =
+  match es {
+    [] -> false
+    [k, ...rest] -> body_has_arity0_proto_op(k) or kids_have_arity0_proto_op(rest)
+  }
+
+fn callee_is_proto_op(callee: Expr) : Bool =
+  match callee.kind {
+    EVar(n)        -> string_starts_with_q(n, "__proto_")
+    EModCall(_, n) -> string_starts_with_q(n, "__proto_")
+    _              -> false
   }
 
 # The functional parameter's flow must not fork across a function
