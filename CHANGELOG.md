@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.100.0 (2026-07-14)
+
+### Added
+
+- **typer**: kind Shape — arity-1 constructor kind with Shape-App formation (closes #1200) (#1220)
+
 ## v0.99.15 (2026-07-14)
 
 ### Fixed
