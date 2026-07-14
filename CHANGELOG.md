@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.15 (2026-07-14)
+
+### Fixed
+
+- **runtime**: consistent atomicity on thread-shared rc fields (part of #1207) (#1226)
+
+### Changed
+
+- **cell-promote**: lower a non-literal pure-scalar var init to a raw register (closes #1214) (#1227)
+
 ## v0.99.14 (2026-07-14)
 
 ### Fixed
