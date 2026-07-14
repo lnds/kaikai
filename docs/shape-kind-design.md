@@ -343,7 +343,7 @@ equations.**
 > writes equations — while spelling it as a post-body clause rather than the
 > `: Functorial` header the draft below sketched. The header spelling reuses
 > `kind K : Theory` with zero new tokens; aligning to it is a mechanical
-> follow-up that does not change semantics.
+> follow-up that does not change semantics (issue #1221).
 
 Rejecting the `laws { map(id) = id; ... }` form for three reasons, in weight order:
 
