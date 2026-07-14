@@ -1,0 +1,60 @@
+# F2 fixture — reactor serving N schedulers: I/O and CPU fibers make
+# progress concurrently, and the result is identical at N=1 and N=4.
+#
+# CPU-bound fibers keep the scheduler threads busy while I/O-bound
+# fibers sleep on the reactor timer wheel. Under F2 the reactor runs on
+# its own thread, so the poll() that waits for the sleepers never blocks
+# a scheduler thread's CPU work — I/O and CPU progress together. This
+# fixture asserts CORRECTNESS (every fiber completes, deterministic
+# total); the no-starvation *throughput* claim is measured separately by
+# tools/run-mn-reactor-bench.sh (wall-clock is not deterministic and has
+# no place in a golden-output fixture).
+#
+# The total is fixed, so the output is byte-identical at KAI_THREADS=1
+# and KAI_THREADS=4 (the determinism gate).
+
+import spawn
+import time
+
+# CPU-bound work: a pure recursive sum, returned so it cannot be elided.
+fn burn(n: Int, acc: Int) : Int =
+  if n <= 0 { acc } else { burn(n - 1, acc + (n % 7)) }
+
+# One CPU-bound fiber: repeats the burn to stay runnable across several
+# scheduling rounds, contending with the sleepers.
+fn cpu_worker(rounds: Int) : Int =
+  if rounds <= 0 { 0 } else { burn(50000, 0); cpu_worker(rounds - 1) }
+
+# One I/O-bound fiber: sleeps `ms` a total of `rounds` times on the
+# reactor timer wheel, then returns rounds (a fixed contribution).
+fn io_worker(rounds: Int, ms: Int) : Int / Spawn + Clock = {
+  sleep_n(rounds, ms)
+  rounds
+}
+
+fn sleep_n(rounds: Int, ms: Int) : Unit / Clock =
+  if rounds <= 0 { () } else { sleep(millis(ms)); sleep_n(rounds - 1, ms) }
+
+# Spawn CPU workers and I/O workers into one nursery; await all. The I/O
+# results are summed into a fixed total; the CPU workers run only to
+# contend for the scheduler threads (their result is discarded).
+fn run_mix() : Int / Spawn + Clock = {
+  nursery { nur ->
+    let cpu = [1, 2, 3, 4] | (i => { let _ = i; nur.spawn(() => cpu_worker(4)) })
+    let io  = [1, 2, 3, 4] | (i => { let _ = i; nur.spawn(() => io_worker(3, 5)) })
+    let _   = cpu | (f => nur.await(f))
+    let ns  = io  | (f => nur.await(f))
+    sum_list(ns, 0)
+  }
+}
+
+fn sum_list(xs: [Int], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> sum_list(rest, acc + x)
+}
+
+fn main() : Int / Spawn + Clock + Stdout = {
+  let total = run_mix()
+  Stdout.print("reactor io+cpu mix total: #{int_to_string(total)}")
+  0
+}
