@@ -95,112 +95,26 @@ pub fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
 # re-boxes at the border (a fresh owned box for Real, the interned immortal
 # singleton for enum), so the register always holds a `KaiValue *`.
 #
-# A kind-1 Int binder is `SInt64` iff the unbox pass ALREADY seeded it
-# `MUnboxed` (`seed_variant_int_binders`, unbox.kai). That single verdict is
-# authoritative: the emitter obeys the SAME mode when it lowers the binder's
-# uses (an `EBinop` becomes a raw `icmp` because the KIR lowered it raw from
-# the mode; a boxed use re-boxes at the mode-slave border). Re-deriving rawness
-# here with a separate predicate would produce a SECOND verdict that diverges
-# from the mode — a raw register loaded where the KIR planned boxed, or vice
-# versa, the #1110 self-compile SIGSEGV. One discriminant, no desync: `nm` is
-# `SInt64` exactly when its `EVar` reads carry mode `MUnboxed`.
-pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, body: Expr) : KSlot / Console =
+# A kind-1 Int binder is `SInt64` iff the unbox phase seeded it native-raw —
+# READ from the `st.raw_binders` side table by the binder's `PBind` position,
+# NOT re-derived here. The one verdict `native_raw_arm_binders` produced (the
+# same predicate the unbox seed applies) governs BOTH the perceus RC plan and
+# this KSlot; keyed by position, it survives perceus untouched, so mode and
+# KSlot can never desync (#1229). A body re-scan diverged when perceus dropped
+# the binder's `MUnboxed` reads — a raw register loaded where the plan decref'd
+# a boxed pointer, the self-compile SIGSEGV. A kind-2 Real / kind-3 enum binder
+# stays `SBoxed`: its `KProj` re-boxes at the border, so the register always
+# holds a `KaiValue *`.
+pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, line: Int, col: Int) : KSlot / Console =
   match slot_kind_of(st, cn, idx) {
-    1 -> if binder_mode_unboxed(nm, body) { SInt64 } else { SBoxed }
+    1 -> if raw_arm_binder_at(st.raw_binders, nm, line, col) { SInt64 } else { SBoxed }
     _ -> SBoxed
   }
 
-# True iff ANY `EVar(nm)` read in `body` carries mode `MUnboxed` — the unbox
-# pass's seed verdict for this binder. Existence (not first-node) because
-# later rewrites rebuild some reads with the default mode (see `evar_mode`);
-# a per-node mode/KSlot mismatch is absorbed by the emitter borders
-# (`nemit_load_reg_as_int` / `nemit_load_reg_boxed`).
-fn binder_mode_unboxed(nm: String, body: Expr) : Bool / Console = match evar_mode(nm, body) {
-  Some(_) -> true
-  None    -> false
-}
-
-# The first `EVar(nm)` read in `e` that carries mode `MUnboxed`, or None when
-# no read does. An existence scan, not a first-node scan: perceus rebuilds
-# some nodes (arm-top `__perceus_dup`, reuse-call args) with the default
-# boxed mode, so the first node reached is an accident of the rewrite. Walks
-# every sub-Expr AND nested match patterns / stmts so the search never misses
-# a use behind a form `scan_uses_expr` skips.
-fn evar_mode(nm: String, e: Expr) : Option[ValueMode] / Console = match e.kind {
-  EVar(n)              -> if n == nm { (match e.mode { MUnboxed -> Some(MUnboxed) _ -> None }) } else { None }
-  ECall(f, xs)         -> em_first(evar_mode(nm, f), em_exprs(nm, xs))
-  EIntrinsic(_, xs)    -> em_exprs(nm, xs)
-  EField(x, _)         -> evar_mode(nm, x)
-  EIndex(a, b)         -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EBinop(_, a, b)      -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EUnop(_, x)          -> evar_mode(nm, x)
-  EBang(x)             -> evar_mode(nm, x)
-  ELitUnit(x, _)       -> evar_mode(nm, x)
-  EIf(c, t, oe)        -> em_first(evar_mode(nm, c), em_first(evar_mode(nm, t), em_opt(nm, oe)))
-  EMatch(s, arms)      -> em_first(evar_mode(nm, s), em_arms(nm, arms))
-  ELambda(_, b)        -> evar_mode(nm, b)
-  ERecordLit(_, fis)   -> em_fields(nm, fis)
-  EList(els)           -> em_elems(nm, els)
-  ERange(a, b, ob)     -> em_first(evar_mode(nm, a), em_first(evar_mode(nm, b), em_opt(nm, ob)))
-  EBlock(ss, tl)       -> em_first(em_stmts(nm, ss), em_opt(nm, tl))
-  EPipe(a, b)          -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EMapPipe(a, b)       -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EFlatMapPipe(a, b)   -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EFilterPipe(a, b)    -> em_first(evar_mode(nm, a), evar_mode(nm, b))
-  EHandle(b, _, _, io, _, cls, ro) -> em_first(evar_mode(nm, b), em_first(em_opt(nm, io), em_first(em_clauses(nm, cls), em_ret(nm, ro))))
-  _                    -> None
-}
-
-fn em_first(a: Option[ValueMode], b: Option[ValueMode]) : Option[ValueMode] = match a { Some(_) -> a None -> b }
-fn em_exprs(nm: String, es: [Expr]) : Option[ValueMode] / Console = match es {
-  []           -> None
-  [e, ...rest] -> em_first(evar_mode(nm, e), em_exprs(nm, rest))
-}
-fn em_opt(nm: String, oe: Option[Expr]) : Option[ValueMode] / Console = match oe { None -> None Some(e) -> evar_mode(nm, e) }
-fn em_arms(nm: String, arms: [Arm]) : Option[ValueMode] / Console = match arms {
-  []           -> None
-  [a, ...rest] -> em_first(match a { Arm(p, g, b) -> em_first(em_pat(nm, p), em_first(em_opt(nm, g), evar_mode(nm, b))) }, em_arms(nm, rest))
-}
-fn em_fields(nm: String, fis: [FieldInit]) : Option[ValueMode] / Console = match fis {
-  []           -> None
-  [f, ...rest] -> em_first(match f { FI(_, e) -> evar_mode(nm, e) }, em_fields(nm, rest))
-}
-fn em_elems(nm: String, els: [ListElem]) : Option[ValueMode] / Console = match els {
-  []           -> None
-  [el, ...rest] -> em_first(match el { ElPlain(e) -> evar_mode(nm, e) ElSpread(e) -> evar_mode(nm, e) }, em_elems(nm, rest))
-}
-fn em_stmts(nm: String, ss: [Stmt]) : Option[ValueMode] / Console = match ss {
-  []           -> None
-  [s, ...rest] -> em_first(em_stmt(nm, s), em_stmts(nm, rest))
-}
-fn em_stmt(nm: String, s: Stmt) : Option[ValueMode] / Console = match s {
-  SExprStmt(e)                -> evar_mode(nm, e)
-  SLet(p, _, rhs)             -> em_first(em_pat(nm, p), evar_mode(nm, rhs))
-  SVar(_, _, rhs, _, _)       -> evar_mode(nm, rhs)
-  SAssert(e, oe)              -> em_first(evar_mode(nm, e), em_opt(nm, oe))
-  SIndexAssign(b, i, v, _, _) -> em_first(evar_mode(nm, b), em_first(evar_mode(nm, i), evar_mode(nm, v)))
-  _                           -> None
-}
-fn em_clauses(nm: String, cls: [HClause]) : Option[ValueMode] / Console = match cls {
-  []           -> None
-  [c, ...rest] -> em_first(match c { HC(_, _, b, _, _) -> evar_mode(nm, b) }, em_clauses(nm, rest))
-}
-fn em_ret(nm: String, ro: Option[HReturn]) : Option[ValueMode] / Console = match ro {
-  None     -> None
-  Some(hr) -> match hr { HR(_, b, _, _) -> evar_mode(nm, b) }
-}
-# A pattern mentioning `nm` is a re-BIND (shadow) or a literal read; either way
-# the mode carried in the pattern is not an `Expr.mode`, so patterns contribute
-# no mode. Its only role is that a nested match still gets its body/guards
-# walked (above); the pattern itself yields None.
-fn em_pat(nm: String, p: Pattern) : Option[ValueMode] / Console = match p.pkind {
-  PLit(e) -> evar_mode(nm, e)
-  _       -> None
-}
-
 # The conservative "no bounded arm body" sentinel — a bind path with no arm
-# body passes this so an Int/Real slot binder stays boxed (`evar_mode` finds no
-# `EVar` in the `EUnit` body → None → `SBoxed`).
+# position of its own passes `bind_body_none()`; a binder bound through it is
+# never in `st.raw_binders` (the table keys on real `PBind` positions), so an
+# Int/Real slot binder stays boxed.
 pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 
 # The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
@@ -239,7 +153,7 @@ fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, 
   # every other slot stays the mask-consulting `KProj`. The read op matches the
   # ctor's write layout (both via `variant_slot_kind(te, st.enums)`), so no tagged
   # pointer is ever read raw nor vice versa.
-  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, body), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, sp.line, sp.col), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
   PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, body, st)
   PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, body, st)
   PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, body, st) }
