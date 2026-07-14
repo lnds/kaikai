@@ -2598,6 +2598,18 @@ static void kai_arena_pop(void) {
     kai_arena_free(&kai_arena_stack[--kai_arena_sp]);
 }
 
+/* Immortal-sentinel test on the shared `rc` field. A Fiber[T] handle's rc
+ * is written atomically from two threads (kai_incref/kai_decref FIBER arm);
+ * the sentinel check runs before the tag is known, so on the same field it
+ * must use the same atomicity or TSAN reports a race (plain read vs atomic
+ * write). A relaxed load compiles to the same mov/ldr as a plain read on
+ * x86/arm — no branch on kai_nthreads, no barrier — so N=1 stays byte-for-
+ * byte the same hot path while TSAN still sees a synchronized access at N>1. */
+static inline int kai_rc_is_immortal(const KaiValue *v) {
+    return atomic_load_explicit((const _Atomic int32_t *) &v->rc,
+                                memory_order_relaxed) == INT32_MAX;
+}
+
 /* Increment a reference. Pure fast path — no free, no out-of-line case
  * — so the whole body is inlined into the caller. Previously a non-inline
  * `static KaiValue *` (a real call at every dup, the symmetric cost to
@@ -2605,7 +2617,7 @@ static void kai_arena_pop(void) {
  * bracketed a single increment and blocked the inline. Under tracing the
  * counters still fire. Koka's kk_block_dup is likewise inline. */
 static inline KaiValue *kai_incref(KaiValue *v) {
-    if (kai_is_value(v) || !v || v->rc == INT32_MAX) {
+    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) {
 #ifdef KAI_TRACE_RC
         if (v && !kai_is_value(v)) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
@@ -3899,7 +3911,7 @@ static void kai_decref_free(KaiValue *v) {
  * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
  * helper now, and the inline body must stay small to be inlined. */
 static inline void kai_decref(KaiValue *v) {
-    if (kai_is_value(v) || !v || v->rc == INT32_MAX) return;
+    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) return;
     /* #812 — always-compiled counter (see kai_incref). */
     kai_rc_decref_total++;
 #ifdef KAI_TRACE_RC
