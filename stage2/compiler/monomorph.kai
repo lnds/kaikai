@@ -254,6 +254,10 @@ fn mono_mangle_ty(t: Ty) : String {
       }
     }
     TyVarT(_) -> "TVAR"
+    # a resolved shape app never reaches the mangler (apply/subst erase
+    # it to the concrete constructor); an unresolved one in a key is a
+    # bug, flagged like `TVAR`.
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", mono_mangle_ty(arg)])
     TyAny     -> "Any"
     # m12.5: units are erased at codegen time. The mangled name for a
     # dimensioned type is the same as its base type's mangle — so a
@@ -356,6 +360,7 @@ fn mono_ty_to_string(t: Ty) : String {
     # is left as `<pred>` to keep the line short; full predicate text
     # lands with the diagnostics-quality pass (m12.6.x #8).
     TyRefineT(base, _) -> concat_all([mono_ty_to_string(base), " where <pred>"])
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", mono_ty_to_string(arg), "]"])
     # issue #187 phase 1: render unions inline as `A | B | C` to match
     # surface syntax. Components are already in canonical order when
     # the walker receives them via `normalize_union`.
@@ -1200,6 +1205,14 @@ fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings
       TyCon(_, _, aas) -> extract_bindings_tys(fas, aas, b)
       _ -> b
     }
+    # `s[A]` against a concrete arity-1 type binds the shape var to the
+    # constructor witness and recurses into the argument — the mono
+    # mirror of the first-order shape-app unification rule.
+    TyShapeApp(sv, fa) -> match shape_witness_of(actual) {
+      Some(wit) -> extract_bindings_ty(fa, shape_arg_of(actual),
+                     SubstBindings { tvars: [STP(sv, wit), ...b.tvars], uvars: b.uvars })
+      None -> b
+    }
     TyDimT(fb, fu) -> match actual {
       TyDimT(ab, au) -> extract_bindings_unit(fu, au,
                           extract_bindings_ty(fb, ab, b))
@@ -1453,6 +1466,7 @@ fn ty_eq(a: Ty, b: Ty) : Bool {
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> ty_eq(ab, bb) _ -> false }
     TyRefineT(ab, _) -> match b { TyRefineT(bb, _) -> ty_eq(ab, bb) _ -> false }
+    TyShapeApp(asv, aa) -> match b { TyShapeApp(bsv, ba) -> asv == bsv and ty_eq(aa, ba) _ -> false }
     # issue #187 phase 1: two unions are equal iff their canonical
     # component lists are point-wise equal. Callers that hand us a
     # `TyUnion` constructed via `normalize_union` get this for free;
@@ -1681,6 +1695,12 @@ fn subst_ty(t: Ty, sm: SubstMap) : Ty {
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => subst_ty(p, sm)),
                                   subst_ty(ret, sm), subst_row(row, sm))
     TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => subst_ty(a, sm)))
+    # a shape var resolved at this specialisation reconstructs the
+    # concrete applied type; unresolved, only the argument is walked.
+    TyShapeApp(sv, arg) -> match subst_map_lookup_ty(sm, sv) {
+      Some(wit) -> shape_reapply(subst_ty(wit, sm), subst_ty(arg, sm))
+      None      -> TyShapeApp(sv, subst_ty(arg, sm))
+    }
     TyDimT(base, u) -> dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm)))
     # issue #187 phase 1: same shape as `apply_ty` — substitute
     # inside each component and re-normalise.
@@ -2472,6 +2492,9 @@ fn ty_to_typeexpr(t: Ty) : TypeExpr {
     TyFnT(ps, ret, _) -> TyFn(map(ps, ty_to_typeexpr), ty_to_typeexpr(ret), REmpty)
     TyCon(_, cname, tas) -> TyName(cname, map(tas, ty_to_typeexpr))
     TyVarT(_) -> TyName("Any", [])
+    # a resolved shape app is erased before this conversion; an
+    # unresolved one has no surface constructor, like a bare tvar.
+    TyShapeApp(_, _) -> TyName("Any", [])
     TyDimT(base, u) -> TyDim(ty_to_typeexpr(base), u)
     TyRefineT(base, p) -> TyRefine(ty_to_typeexpr(base), p)
     TyUnion(parts) -> union_head_tkind(parts)
