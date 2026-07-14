@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.14 (2026-07-14)
+
+### Fixed
+
+- **emit**: stop the C bootstrap seeding builtin nullary variants as immortal cells (#1225)
+
 ## v0.99.13 (2026-07-14)
 
 ### Fixed
