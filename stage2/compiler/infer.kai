@@ -3798,11 +3798,11 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
                                   canon_tvars_ty(ret, m), canon_tvars_row(row, m))
     TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => canon_tvars_ty(a, m)))
-    # the shape var id shares the tvar pool, so renumber it too.
-    TyShapeApp(sv, arg) -> match intpair_lookup(m, sv) {
-      Some(b) -> TyShapeApp(b, canon_tvars_ty(arg, m))
-      None    -> TyShapeApp(sv, canon_tvars_ty(arg, m))
-    }
+    # Route through a helper taking `sv` as a plain param, not a match-arm
+    # sub-binder: the native rawness classifier only inspects match-arm Int
+    # binders, so keeping the kind-1 `sv` out of this hot match's arm avoids
+    # the reg-slot desync a raw arm-binder triggers in the native drop path.
+    TyShapeApp(sv, arg) -> canon_tvars_shapeapp(sv, arg, m)
     TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
     TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
     # see `canon_uvars_ty`. Renumbering tvars
@@ -3811,6 +3811,15 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyUnion(parts) -> normalize_union(map(parts, (a) => canon_tvars_ty(a, m)))
   }
 }
+
+# The shape var id shares the tvar pool, so renumber it too. Split out of
+# `canon_tvars_ty`'s hot match so `sv` is a plain param, not an arm binder
+# (see the call site).
+fn canon_tvars_shapeapp(sv: Int, arg: Ty, m: [IntPair]) : Ty =
+  match intpair_lookup(m, sv) {
+    Some(b) -> TyShapeApp(b, canon_tvars_ty(arg, m))
+    None    -> TyShapeApp(sv, canon_tvars_ty(arg, m))
+  }
 
 fn canon_tvars_row(r: Row, m: [IntPair]) : Row {
   let new_labels = map(r.labels, (l) => canon_tvars_label(l, m))
@@ -13130,29 +13139,43 @@ fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
     Some(ff) -> {
       let g = fuse_terminal_gate(st, ff)
       if g.ok {
-        # Peek the source head on a throwaway synth (state discarded) so
-        # the real rewrite synth below is the source's first synth and
-        # `try_bare_call_narrow` sees an unpolluted tvar frontier.
-        let rewrite = if fuse_source_is_protocol_seq(g.st, ff) {
+        # Peek the source head; the peek synth advances the fresh-tvar
+        # counter and binds in the shared `sub`, so the rewrite synth must
+        # continue from the RETURNED state (`peek.0`), not `g.st` — reusing
+        # the old counter re-mints the peek's already-bound ids (#1186).
+        let peek = fuse_source_is_protocol_seq(g.st, ff)
+        let st_after = match peek { FSP(s, _) -> s }
+        let is_seq = match peek { FSP(_, b) -> b }
+        let rewrite = if is_seq {
           pipe_fusion_generic_fold_rewrite(ff, inf_proto_dispatcher_name("foldl"), line, col)
         } else {
           pipe_fusion_fold_rewrite(ff, line, col)
         }
-        FuseAttempt { st: g.st, fused: Some(synth(g.st, rewrite)) }
+        FuseAttempt { st: st_after, fused: Some(synth(st_after, rewrite)) }
       } else { FuseAttempt { st: g.st, fused: None } }
     }
   }
 
 # A non-`List` source whose head type has a protocol `foldl` impl fuses
 # via the generic single-traversal rewrite, not the `list.map_foldl`
-# fast-path. The source is synthesised on a probe whose state is
-# discarded (the caller re-synths it in the rewrite).
-fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : Bool / Console + File + Mutable {
+# fast-path. Peeking the head SYNTHS the source, which mints fresh tvars and
+# binds them in the shared mutable `sub`. The verdict is returned WITH the
+# post-peek state so the real rewrite synth continues from the advanced
+# fresh counter — reusing the caller's OLD counter would re-mint the ids the
+# peek already bound, so the rewrite's stage lambda binds its param to the
+# peek's stale binding (`(r) => r.active` reads `r: [Record]` → spurious
+# "annotation needed", #1186). Deferred fields ARE rolled back: head
+# detection needs no field resolution, and the peek's orphan receiver must
+# not leak into the worklist.
+type FuseSeqPeek = FSP(InferState, Bool)
+
+fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : FuseSeqPeek / Console + File + Mutable {
   let r = synth(st, ff.source)
-  match inf_ty_head_name(apply_ty(r.st.sub, r.ty)) {
+  let head_ok = match inf_ty_head_name(apply_ty(r.st.sub, r.ty)) {
     Some(head) -> head != "List" and pipe_op_has_impl(st.proto_impls, head, "foldl")
     None -> false
   }
+  FSP(st_restore_deferred_fields(r.st, st.deferred_fields), head_ok)
 }
 
 # An explicit `foldl` keeps the Mutable-masked purity gate — its stage
