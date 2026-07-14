@@ -94,6 +94,71 @@ import compiler.modules
 import compiler.infer
 
 # ====================================================================
+# Law wrappers (`laws <Theory>` / `axiom <Theory>`).
+#
+# The parser emits `DProtoLaws(theory, DProtocol, …)` and
+# `DImplAxiom(theory, DImpl, …)` wrappers. `strip_law_wrappers` unwraps
+# them to the bare protocol/impl and records the associations, so no
+# downstream pass ever sees the wrapper — the same discipline
+# `lower_axioms` uses for `DAxiom`. The law engine reads the registry to
+# autogenerate per-impl property checks (except impls marked `axiom`).
+# ====================================================================
+
+# `protocol_name -> theory` and the impls exempted by `axiom <Theory>`.
+pub type LawReg = LR([ProtoLaw], [AxiomImpl])
+pub type ProtoLaw = PL(String, String)          # protocol, theory
+pub type AxiomImpl = AI(String, String, String) # protocol, type-head, theory
+
+pub fn law_reg_protocols(r: LawReg) : [ProtoLaw] = match r { LR(ps, _) -> ps }
+pub fn law_reg_axioms(r: LawReg) : [AxiomImpl] = match r { LR(_, xs) -> xs }
+
+#[doc("The theory a protocol declares its ops obey via `laws`, if any.")]
+pub fn law_theory_of(r: LawReg, proto: String) : Option[String] =
+  law_theory_loop(law_reg_protocols(r), proto)
+
+fn law_theory_loop(ps: [ProtoLaw], proto: String) : Option[String] = match ps {
+  [] -> None
+  [PL(p, thy), ...rest] -> if p == proto { Some(thy) } else { law_theory_loop(rest, proto) }
+}
+
+#[doc("True when `impl P for <head>` is exempted from law-checks by an `axiom` clause.")]
+pub fn law_impl_axiomed(r: LawReg, proto: String, head: String) : Bool =
+  law_axiom_loop(law_reg_axioms(r), proto, head)
+
+fn law_axiom_loop(xs: [AxiomImpl], proto: String, head: String) : Bool = match xs {
+  [] -> false
+  [AI(p, t, _), ...rest] -> if p == proto and t == head { true } else { law_axiom_loop(rest, proto, head) }
+}
+
+#[doc("""
+Unwrap every `DProtoLaws` / `DImplAxiom` wrapper to its bare inner decl,
+returning the flattened decl stream and the law registry. Runs before
+any other Decl walker so downstream passes see only plain
+protocols/impls, mirroring `lower_axioms`.
+""")]
+pub fn strip_law_wrappers(decls: [Decl]) : StrippedLaws =
+  strip_law_loop(decls, [], [], [])
+
+pub type StrippedLaws = SL([Decl], LawReg)
+
+pub fn strip_sl_decls(s: StrippedLaws) : [Decl] = match s { SL(ds, _) -> ds }
+pub fn strip_sl_reg(s: StrippedLaws) : LawReg = match s { SL(_, r) -> r }
+
+fn strip_law_loop(decls: [Decl], acc: [Decl], laws: [ProtoLaw],
+                  axioms: [AxiomImpl]) : StrippedLaws = match decls {
+  [] -> SL(list_reverse(acc), LR(list_reverse(laws), list_reverse(axioms)))
+  [d, ...rest] -> match d {
+    DProtoLaws(thy, DProtocol(a, name, b, c, l, cc), _, _) ->
+      strip_law_loop(rest, [DProtocol(a, name, b, c, l, cc), ...acc],
+                     [PL(name, thy), ...laws], axioms)
+    DImplAxiom(thy, DImpl(pname, pa, target, ms, l, cc), _, _) ->
+      strip_law_loop(rest, [DImpl(pname, pa, target, ms, l, cc), ...acc],
+                     laws, [AI(pname, proto_type_name(target), thy), ...axioms])
+    _ -> strip_law_loop(rest, [d, ...acc], laws, axioms)
+  }
+}
+
+# ====================================================================
 # Downward glue mirrors (proto_ prefix) — copied verbatim from the
 # canonical definitions still resident in main / infer. Mirrored rather
 # than sunk because each has a single consumer in this module.
@@ -280,7 +345,8 @@ fn proto_reg_empty() : ProtocolReg =
 # `List`. This gives a single impl per type-constructor — polymorphic
 # impls cover all instantiations, mirroring the spec's "monomorphises
 # per concrete instantiation just like any generic function" note.
-fn proto_type_name(te: TypeExpr) : String {
+#[doc("The single-dispatch head name of a `TypeExpr` (`Money[USD]` → `Money`, `[T]` → `List`).")]
+pub fn proto_type_name(te: TypeExpr) : String {
   match te.tkind {
     TyName(name, _) -> name
     TyList(_)       -> "List"
@@ -379,6 +445,8 @@ fn proto_home_record(d: Decl, home: String, target_mod: String,
   }
   DDerive(_, inner, _, _)  -> proto_home_record(inner, home, target_mod, acc)
   DUnstable(inner, _, _)   -> proto_home_record(inner, home, target_mod, acc)
+  DProtoLaws(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
+  DImplAxiom(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
   DConstructor(inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
   _ -> acc
 }
@@ -423,6 +491,10 @@ fn collect_proto_decls_h(ds: [Decl], reg: ProtocolReg,
       DDerive(_, inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
       DUnstable(inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      DProtoLaws(_, inner, _, _) ->
+        collect_proto_decls_h([inner, ...rest], reg, homes)
+      DImplAxiom(_, inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
       DConstructor(inner, _, _) ->
         collect_proto_decls_h([inner, ...rest], reg, homes)
@@ -515,6 +587,8 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
       DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       _ -> collect_proto_names(rest, acc)
     }
@@ -528,6 +602,8 @@ fn collect_local_type_names(ds: [Decl], acc: [String]) : [String] {
       DType(_, name, _, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       DConstructor(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
       _ -> collect_local_type_names(rest, acc)
     }
@@ -603,6 +679,10 @@ fn validate_impls_loop(ds: [Decl], file: String,
       DDerive(_, inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
       DUnstable(inner, _, _) ->
+        validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
       DConstructor(inner, _, _) ->
         validate_impls_loop([inner, ...rest], file, proto_names, local_types, seen, errs)
@@ -681,6 +761,10 @@ fn validate_impl_methods_loop(ds: [Decl], file: String,
       DDerive(_, inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
       DUnstable(inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_impl_methods_loop([inner, ...rest], file, reg, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
       DConstructor(inner, _, _) ->
         validate_impl_methods_loop([inner, ...rest], file, reg, errs)
@@ -944,15 +1028,17 @@ fn sig_head_subst(t: TypeExpr, tname: String,
 # Position-aligned lookup: `proto_tps[i]` -> `arg_heads[i]`. When
 # `arg_heads == []` (legacy un-parametrised impl), every protocol
 # tparam falls back to the target head — the homogeneous default
-# encoded in `lower_impls`.
+# encoded in `lower_impls`. A tparam's stored name may carry a kind
+# marker (`s#Shape`); the surface name is compared, so a `[s: Shape]`
+# carrier binds `s := <target head>` exactly as a bare `[a]` does.
 fn tparam_subst(n: String, tps: [String], heads: [String],
                 tname: String) : Option[String] {
   match tps {
     [] -> None
     [t, ...trest] -> match heads {
-      [] -> if t == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
+      [] -> if tp_strip_kind(t) == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
       [h, ...hrest] ->
-        if t == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
+        if tp_strip_kind(t) == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
     }
   }
 }
@@ -978,6 +1064,8 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
+      DProtoLaws(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
+      DImplAxiom(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       DConstructor(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
       _ -> lower_impls(rest, reg, acc_fns)
     }
@@ -1166,6 +1254,10 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_future_impl_keys([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_future_impl_keys([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_future_impl_keys([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_future_impl_keys([inner, ...rest], acc)
       _ -> collect_future_impl_keys(rest, acc)
@@ -1210,6 +1302,10 @@ fn validate_derives_loop(ds: [Decl], file: String,
         validate_derives_loop(rest, file, future_impls, errs1)
       }
       DUnstable(inner, _, _) ->
+        validate_derives_loop([inner, ...rest], file, future_impls, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derives_loop([inner, ...rest], file, future_impls, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derives_loop([inner, ...rest], file, future_impls, errs)
       DConstructor(inner, _, _) ->
         validate_derives_loop([inner, ...rest], file, future_impls, errs)
@@ -1316,6 +1412,8 @@ fn expand_derives_loop(ds: [Decl], acc: [Decl]) : [Decl] {
       # Preserve the wrapper: the `#[constructor]` registry is collected
       # in the typer, so unwrapping here (as DUnstable does) would lose
       # it. The inner is a plain fn — no derives to expand.
+      DProtoLaws(_, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
+      DImplAxiom(_, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
       DConstructor(_, _, _) -> expand_derives_loop(rest, [d, ...acc])
       _ -> expand_derives_loop(rest, [d, ...acc])
     }
@@ -2628,6 +2726,10 @@ fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_binser_providers([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_binser_providers([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_binser_providers([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_binser_providers([inner, ...rest], acc)
       _ -> collect_binser_providers(rest, acc)
@@ -2653,6 +2755,10 @@ fn validate_derive_binser_loop(decls: [Decl], file: String,
         _ -> validate_derive_binser_loop(rest, file, providers, errs)
       }
       DUnstable(inner, _, _) ->
+        validate_derive_binser_loop([inner, ...rest], file, providers, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_binser_loop([inner, ...rest], file, providers, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derive_binser_loop([inner, ...rest], file, providers, errs)
       DConstructor(inner, _, _) ->
         validate_derive_binser_loop([inner, ...rest], file, providers, errs)
@@ -2844,6 +2950,10 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
       }
       DUnstable(inner, _, _) ->
         collect_ord_providers([inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _) ->
+        collect_ord_providers([inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _) ->
+        collect_ord_providers([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
         collect_ord_providers([inner, ...rest], acc)
       _ -> collect_ord_providers(rest, acc)
@@ -2869,6 +2979,10 @@ fn validate_derive_ord_loop(decls: [Decl], file: String,
         _ -> validate_derive_ord_loop(rest, file, providers, errs)
       }
       DUnstable(inner, _, _) ->
+        validate_derive_ord_loop([inner, ...rest], file, providers, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_ord_loop([inner, ...rest], file, providers, errs)
+      DImplAxiom(_, inner, _, _) ->
         validate_derive_ord_loop([inner, ...rest], file, providers, errs)
       DConstructor(inner, _, _) ->
         validate_derive_ord_loop([inner, ...rest], file, providers, errs)
@@ -4797,7 +4911,8 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         # return head would misroute a no-impl receiver (e.g. `Bare`
         # with no `impl Show`) onto an unrelated impl whose head happens
         # to equal the concrete return head (`String`).
-        else if not proto_op_self_only_in_return(params, ret_te) {
+        else if not proto_op_self_only_in_return(params, ret_te,
+                       proto_shape_carriers(reg.tparams, pname)) {
           try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
         } else {
           match self_head_in_ret(ret_te, ret_ty) {
@@ -4870,10 +4985,12 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
         if list_length(params) != list_length(args_) {
           try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
         }
-        # When Self appears only in the op's return position (e.g.
-        # `from(x: a) : Self`), the args carry no Self information —
-        # defer to the caller-provided ret_ty (the `_with_ret` wrapper).
-        else if proto_op_self_only_in_return(params, ret) {
+        # When Self (or the protocol's `Shape` carrier) appears only in
+        # the op's return position (e.g. `from(x: a) : Self`), the args
+        # carry no dispatch information — defer to the caller-provided
+        # ret_ty (the `_with_ret` wrapper).
+        else if proto_op_self_only_in_return(params, ret,
+                  proto_shape_carriers(reg.tparams, pname)) {
           try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
         } else {
           match find_proto_impl_for_args(reg, pname, opname, args_) {
@@ -4890,14 +5007,33 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
 }
 
 # Issue #180: returns true when none of the op's parameter types
-# contains `Self`, i.e. Self is only informed by the return type.
-# Such ops can only be dispatched via the surrounding expected type
-# (typed-hole error otherwise).
-fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr) : Bool {
+# contains `Self` (nor the protocol's `Shape` carrier), i.e. dispatch
+# is informed only by the return type. Such ops can only be dispatched
+# via the surrounding expected type (typed-hole error otherwise).
+fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
+                                carriers: [String]) : Bool {
   not list_any(params, (p) => match p.ptype {
-    Some(te) -> te_mentions_self(te)
+    Some(te) -> te_mentions_self_or_carrier(te, carriers)
     None -> false
   })
+}
+
+# The surface names of a protocol's `Shape`-kind tparams — the dispatch
+# carriers whose applied form `s[A]` a call resolves against, mirroring
+# how `Self` informs an ordinary protocol's dispatch.
+fn proto_shape_carriers(tps: [ProtoTPReg], pname: String) : [String] =
+  shape_carrier_names(proto_tparams_for(tps, pname), [])
+
+# True when a protocol quantifies over a `Shape` carrier — dispatch is
+# single on the container, so a two-arg op is not heterogeneous.
+fn proto_is_shape_carrier(tps: [ProtoTPReg], pname: String) : Bool =
+  match proto_shape_carriers(tps, pname) { [] -> false _ -> true }
+
+fn shape_carrier_names(names: [String], acc: [String]) : [String] = match names {
+  [] -> list_reverse(acc)
+  [n, ...rest] ->
+    if tp_kind_is_shape(n) { shape_carrier_names(rest, [tp_strip_kind(n), ...acc]) }
+    else { shape_carrier_names(rest, acc) }
 }
 
 fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
@@ -4919,6 +5055,32 @@ fn te_kind_mentions_self(k: TyKind) : Bool {
     # issue #772: a compound row carries effect labels, never `Self`.
     TyRow(_) -> false
   }
+}
+
+# As `te_mentions_self` but also treats a `Shape`-carrier head as a
+# dispatch informant: `xs: s[A]` with `s` the protocol carrier makes the
+# op arg-dispatched, exactly as `xs: Self` would.
+fn te_mentions_self_or_carrier(te: TypeExpr, carriers: [String]) : Bool =
+  te_kind_mentions_self_or_carrier(te.tkind, carriers)
+
+fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [String]) : Bool {
+  match k {
+    TyName(name, targs) ->
+      if name == "Self" or list_has(carriers, name) { true }
+      else { te_list_mentions_self_or_carrier(targs, carriers) }
+    TyList(inner) -> te_mentions_self_or_carrier(inner, carriers)
+    TyFn(ps, r, _) -> te_list_mentions_self_or_carrier(ps, carriers) or
+                      te_mentions_self_or_carrier(r, carriers)
+    TyDim(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRefine(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRow(_) -> false
+  }
+}
+
+fn te_list_mentions_self_or_carrier(tes: [TypeExpr], carriers: [String]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self_or_carrier(t, carriers) { true }
+                  else { te_list_mentions_self_or_carrier(rest, carriers) }
 }
 
 fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
@@ -4947,6 +5109,17 @@ fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
 
 fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
                              args_: [Expr]) : Option[String] {
+  # A `Shape`-carrier protocol dispatches single, on the container arg;
+  # its ops carry ordinary function parameters (`map(xs, f)`) whose types
+  # have no dispatch head. Read the head from the first container-typed
+  # argument and ignore the rest, so a function arg does not veto the
+  # lookup the way `args_head_names` (all-or-nothing) would.
+  if proto_is_shape_carrier(reg.tparams, pname) {
+    match first_container_head(args_) {
+      None -> None
+      Some(a) -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
+    }
+  } else {
   let names = args_head_names(args_)
   match names {
     None -> None
@@ -4954,7 +5127,12 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
       [] -> None
       [a] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
       [a, b] -> {
-        let proto_takes_args = proto_has_tparams(reg.tparams, pname)
+        # A `Shape` carrier is the single dispatch container, NOT a
+        # heterogeneous proto-arg — its ops (`map(xs, f)`) take an
+        # ordinary function as the second parameter, so dispatch stays
+        # single on the container `a`.
+        let proto_takes_args = proto_has_tparams(reg.tparams, pname) and
+                               not proto_is_shape_carrier(reg.tparams, pname)
         if not proto_takes_args {
           # Single-dispatch op whose second parameter is part of the
           # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
@@ -4981,6 +5159,21 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
       }
       [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
     }
+  }
+  }
+}
+
+# The head name of the first argument that carries a concrete type
+# constructor (a container), skipping function-typed and unresolved
+# args. This is the dispatch receiver for a `Shape`-carrier op.
+fn first_container_head(args_: [Expr]) : Option[String] = match args_ {
+  [] -> None
+  [e, ...rest] -> match e.ty {
+    Some(ty) -> match ty_head_name(ty) {
+      Some(n) -> Some(n)
+      None    -> first_container_head(rest)
+    }
+    None -> first_container_head(rest)
   }
 }
 
@@ -5142,6 +5335,9 @@ pub fn ty_head_name(t: Ty) : Option[String] {
     # — `Int where >= 0` and `Int` resolve to the same `impl`.
     TyRefineT(base, _) -> ty_head_name(base)
     TyVarT(_)      -> None
+    # an unresolved shape app has no concrete head; dispatch is post-mono
+    # once the shape var binds to a constructor, exactly like `TyVarT`.
+    TyShapeApp(_, _) -> None
     TyFnT(_, _, _) -> None
     TyAny          -> None
     # issue #187 phase 1: a union has no single head type, so
