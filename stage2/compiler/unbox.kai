@@ -778,6 +778,130 @@ fn list_nth_bool(xs: [Bool], i: Int) : Option[Bool] {
   }
 }
 
+# The `(name, line, col)` of every match-arm variant Int sub-binder the native
+# backend seeds `MUnboxed` — the SAME verdict `seed_variant_int_binders` applies
+# under `nat`, produced here as a position-keyed side table so perceus and
+# KIR-lowering READ it instead of re-deriving rawness from the mutated body
+# (#1229). One producer, three readers, no phase can disagree. Runs only under
+# the native backend (the C oracle's total re-box border needs no such table).
+pub fn native_raw_arm_binders(decls: [Decl], cis: [CtorIntSlots], fns: [EFn]) : [RawArmBinder] / Console =
+  nrab_decls(decls, cis, fns, [])
+
+fn nrab_decls(ds: [Decl], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ds {
+  []           -> acc
+  [d, ...rest] -> nrab_decls(rest, cis, fns, nrab_decl(d, cis, fns, acc))
+}
+
+fn nrab_decl(d: Decl, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> nrab_expr(body, cis, fns, acc)
+  DTest(_, body, _, _)                 -> nrab_expr(body, cis, fns, acc)
+  DBench(_, body, _, _)                -> nrab_expr(body, cis, fns, acc)
+  DCheck(_, _, body, _, _)             -> nrab_expr(body, cis, fns, acc)
+  _                                    -> acc
+}
+
+# Every arm of every `match` in `e`; a `PVariant` arm seeds its Int sub-binders,
+# then the arm body is descended for nested matches. Mirror of the emit-side
+# walk (`nab_mentions`) so no arm-carrying form is skipped.
+fn nrab_expr(e: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match e.kind {
+  EMatch(s, arms)      -> nrab_arms(arms, cis, fns, nrab_expr(s, cis, fns, acc))
+  ECall(f, xs)         -> nrab_exprs(xs, cis, fns, nrab_expr(f, cis, fns, acc))
+  EIntrinsic(_, xs)    -> nrab_exprs(xs, cis, fns, acc)
+  EField(x, _)         -> nrab_expr(x, cis, fns, acc)
+  EIndex(a, b)         -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EBinop(_, a, b)      -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EUnop(_, x)          -> nrab_expr(x, cis, fns, acc)
+  EBang(x)             -> nrab_expr(x, cis, fns, acc)
+  ELitUnit(x, _)       -> nrab_expr(x, cis, fns, acc)
+  EIf(c, t, oe)        -> nrab_opt(oe, cis, fns, nrab_expr(t, cis, fns, nrab_expr(c, cis, fns, acc)))
+  ELambda(_, b)        -> nrab_expr(b, cis, fns, acc)
+  ERecordLit(_, fis)   -> nrab_fields(fis, cis, fns, acc)
+  EList(els)           -> nrab_elems(els, cis, fns, acc)
+  ERange(a, b, ob)     -> nrab_opt(ob, cis, fns, nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc)))
+  EBlock(ss, tl)       -> nrab_opt(tl, cis, fns, nrab_stmts(ss, cis, fns, acc))
+  EPipe(a, b)          -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EMapPipe(a, b)       -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EFlatMapPipe(a, b)   -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EFilterPipe(a, b)    -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
+  EHandle(b, _, _, io, _, cls, ro) -> nrab_ret(ro, cis, fns, nrab_clauses(cls, cis, fns, nrab_opt(io, cis, fns, nrab_expr(b, cis, fns, acc))))
+  _                    -> acc
+}
+
+fn nrab_exprs(es: [Expr], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match es {
+  []           -> acc
+  [e, ...rest] -> nrab_exprs(rest, cis, fns, nrab_expr(e, cis, fns, acc))
+}
+fn nrab_opt(oe: Option[Expr], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match oe { None -> acc Some(e) -> nrab_expr(e, cis, fns, acc) }
+fn nrab_fields(fis: [FieldInit], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match fis {
+  []           -> acc
+  [f, ...rest] -> nrab_fields(rest, cis, fns, match f { FI(_, v) -> nrab_expr(v, cis, fns, acc) })
+}
+fn nrab_elems(els: [ListElem], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match els {
+  []            -> acc
+  [el, ...rest] -> nrab_elems(rest, cis, fns, match el { ElPlain(e) -> nrab_expr(e, cis, fns, acc) ElSpread(e) -> nrab_expr(e, cis, fns, acc) })
+}
+fn nrab_stmts(ss: [Stmt], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ss {
+  []           -> acc
+  [s, ...rest] -> nrab_stmts(rest, cis, fns, nrab_stmt(s, cis, fns, acc))
+}
+fn nrab_stmt(s: Stmt, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match s {
+  SExprStmt(e)                -> nrab_expr(e, cis, fns, acc)
+  SLet(_, _, rhs)             -> nrab_expr(rhs, cis, fns, acc)
+  SVar(_, _, rhs, _, _)       -> nrab_expr(rhs, cis, fns, acc)
+  SAssert(e, oe)              -> nrab_opt(oe, cis, fns, nrab_expr(e, cis, fns, acc))
+  SIndexAssign(b, i, v, _, _) -> nrab_expr(v, cis, fns, nrab_expr(i, cis, fns, nrab_expr(b, cis, fns, acc)))
+  _                           -> acc
+}
+fn nrab_clauses(cls: [HClause], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match cls {
+  []           -> acc
+  [c, ...rest] -> nrab_clauses(rest, cis, fns, match c { HC(_, _, b, _, _) -> nrab_expr(b, cis, fns, acc) })
+}
+fn nrab_ret(ro: Option[HReturn], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ro {
+  None     -> acc
+  Some(hr) -> match hr { HR(_, b, _, _) -> nrab_expr(b, cis, fns, acc) }
+}
+
+fn nrab_arms(arms: [Arm], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match arms {
+  []           -> acc
+  [a, ...rest] -> nrab_arms(rest, cis, fns, match a { Arm(p, _, b) -> nrab_expr(b, cis, fns, nrab_pat(p, b, cis, fns, acc)) })
+}
+
+# Seed the raw table for a `PVariant` arm's Int sub-binders — the SAME
+# condition `seed_variant_int_loop` applies under `nat`: a kind-1 Int slot,
+# not read via interp / a captured lambda, and `native_arm_binder_raw_safe`.
+# Recurses into nested `PVariant` sub-patterns, exactly as the seed does.
+fn nrab_pat(p: Pattern, body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match p.pkind {
+  PVariant(ctor, subs) -> nrab_variant(ctor, subs, body, cis, fns, acc)
+  _                    -> acc
+}
+fn nrab_variant(ctor: String, subs: [Pattern], body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = {
+  let flags = match ctor_int_slots_lookup(cis, ctor) { Some(fl) -> fl None -> [] }
+  nrab_slot_loop(subs, flags, 0, body, cis, fns, acc)
+}
+fn nrab_slot_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match subs {
+  []           -> acc
+  [sp, ...rest] -> {
+    let slot_is_int = match list_nth_bool(flags, i) { Some(b) -> b None -> false }
+    let acc1 = match sp.pkind {
+      PBind(nm) -> {
+        let boxed_free = slot_is_int and not expr_has_interp_use(body, nm) and not uses_have_in_lam(scan_uses_expr(body, false), nm)
+        if boxed_free and native_arm_binder_raw_safe(nm, body, cis, fns) { [RAB(nm, sp.line, sp.col), ...acc] } else { acc }
+      }
+      PVariant(inner_ctor, inner_subs) -> nrab_variant(inner_ctor, inner_subs, body, cis, fns, acc)
+      _ -> acc
+    }
+    nrab_slot_loop(rest, flags, i + 1, body, cis, fns, acc1)
+  }
+}
+
+# True iff the `PBind` at `(nm, line, col)` was seeded native-raw. Position is
+# the key: two same-named binders in different arms have distinct `PBind`
+# positions, so the lookup never confuses them (a name-only key would).
+pub fn raw_arm_binder_at(tbl: [RawArmBinder], nm: String, line: Int, col: Int) : Bool = match tbl {
+  []                     -> false
+  [RAB(n, l, c), ...rest] -> if n == nm and l == line and c == col { true } else { raw_arm_binder_at(rest, nm, line, col) }
+}
+
 fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit / Console = unbox_field_aware(fi, env, [], [], false)
 
 fn unbox_field_aware(fi: FieldInit, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : FieldInit / Console {
