@@ -26,7 +26,10 @@ export PATH="$HOME/.kaikai/bin:$PATH"   # this shell now; profile persists it
 kai --version
 ```
 
-Set `KAIKAI_HOME` to install somewhere other than `~/.kaikai`.
+Set `KAIKAI_HOME` to install somewhere other than `~/.kaikai`. Like
+`kai upgrade`, the installer resolves the version from git tags and
+honours `GITHUB_TOKEN`/`GH_TOKEN` if the unauthenticated API rate limit
+gets in the way.
 
 ## Homebrew
 
@@ -40,9 +43,18 @@ brew install kaikailang-org/kaikai/kaikai
 kai upgrade
 ```
 
-`kai upgrade` queries the latest release and, if it is newer than the
-running version, downloads + verifies + replaces the binaries in place
-under `~/.kaikai/`. If already current, it says so and exits.
+`kai upgrade` resolves the newest version from the repository's git
+tags and, if it is newer than the running version, downloads + verifies
++ replaces the binaries in place under `~/.kaikai/`. If already current,
+it says so and exits.
+
+Version discovery reads the GitHub *tags* API, not `releases/latest`.
+Tags are created by every release bump, so a published GitHub Release is
+not a prerequisite for `kai upgrade` (or `install.sh`) to see a new
+version — only for the tarball assets it then downloads. The
+unauthenticated GitHub API allows 60 requests/hour per IP; if you hit
+that limit, `kai upgrade` says so and suggests retrying or exporting
+`GITHUB_TOKEN` (or `GH_TOKEN`), which raises the limit to 5000/hour.
 
 On a Homebrew install, `kai upgrade` does not touch the Cellar — it
 prints a pointer to `brew upgrade kaikai` and exits. This is distinct

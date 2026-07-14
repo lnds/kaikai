@@ -43,13 +43,42 @@ detect_platform() {
 }
 
 # ---- release discovery -----------------------------------------------------
-# Resolve the latest published tag via the GitHub API, with no `gh`
-# dependency — `curl` is all an end user has. The tag_name field
-# carries the `v<ver>` prefix the release assets use.
+# Resolve the newest release tag via the GitHub tags API, with no `gh`
+# dependency — `curl` is all an end user has. Tags are created by every
+# `cz bump`, so they always exist, unlike releases/latest which 404s
+# until a Release is published. Honours GITHUB_TOKEN/GH_TOKEN to lift
+# the 60/h unauthenticated rate limit. On failure, writes the reason
+# (network|ratelimit|notag) to the file named by $2 so the caller can
+# diagnose across the command-substitution subshell.
 latest_tag() {
-  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1
+  hdr="$1"
+  err_file="$2"
+  url="https://api.github.com/repos/$REPO/tags?per_page=100"
+  token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  if [ -n "$token" ]; then
+    body="$(curl -sSL -H "Authorization: Bearer $token" -D "$hdr" "$url" 2>/dev/null)" || { printf 'network' >"$err_file"; return 1; }
+  else
+    body="$(curl -sSL -D "$hdr" "$url" 2>/dev/null)" || { printf 'network' >"$err_file"; return 1; }
+  fi
+
+  status="$(sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$hdr" | tail -n1)"
+  remaining="$(sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]emaining:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$hdr" | tail -n1)"
+  if [ "$status" = "403" ] || [ "$status" = "429" ] || [ "$remaining" = "0" ] \
+     || printf '%s' "$body" | grep -qi 'rate limit'; then
+    printf 'ratelimit' >"$err_file"
+    return 1
+  fi
+
+  # tr splits objects onto their own lines first: sed's greedy `.*`
+  # would otherwise grab the *last* tag when the JSON is minified.
+  tag="$(printf '%s' "$body" | tr ',' '\n' \
+    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+    | head -n1)"
+  if [ -z "$tag" ]; then
+    printf 'notag' >"$err_file"
+    return 1
+  fi
+  printf '%s\n' "$tag"
 }
 
 # ---- checksum verification -------------------------------------------------
@@ -72,16 +101,22 @@ main() {
 
   detect_platform
 
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-install.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
   info "==> resolving latest kaikai release"
-  tag="$(latest_tag)"
-  [ -n "$tag" ] || err "could not determine latest release tag from GitHub"
+  tag="$(latest_tag "$tmp/tags.hdr" "$tmp/tags.err")" || true
+  if [ -z "$tag" ]; then
+    case "$(cat "$tmp/tags.err" 2>/dev/null)" in
+      network)   err "cannot reach github.com — check your network connection" ;;
+      ratelimit) err "GitHub API rate limit reached (60/h unauthenticated). Retry in a few minutes, or set GITHUB_TOKEN." ;;
+      *)         err "could not find a release tag matching v<major>.<minor>.<patch> on GitHub" ;;
+    esac
+  fi
 
   tarball="kaikai-$tag-$PLATFORM.tar.gz"
   base="https://github.com/$REPO/releases/download/$tag"
   info "==> downloading $tarball"
-
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-install.XXXXXX")"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
 
   curl -fsSL -o "$tmp/$tarball" "$base/$tarball" \
     || err "failed to download $tarball"
