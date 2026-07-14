@@ -18,7 +18,8 @@
 #   array_set(x, 0, v)          →  __cell_set|x (v)
 #
 # Runs post-monomorph / pre-unbox, on typed AST. Conditions:
-#   * the init is a scalar literal of type Int, Real or Bool;
+#   * the init is a pure scalar of type Int, Real or Bool — a literal, a
+#     local read (`var m := n`), or builtin arithmetic over those;
 #   * every use of the binder in its scope is a whole-cell
 #     `array_get(x, 0)` / `array_set(x, 0, v)` call.
 # The check is rewrite-then-verify: sanctioned uses are rewritten to
@@ -130,9 +131,9 @@ fn mk_cell_expr(k: ExprKind, ty: Option[Ty], line: Int, col: Int) : Expr =
 
 type CpSlot = CpSlot(Pattern, Option[TypeExpr], String, Expr, Int, Int)
 
-# `let x = array_make(1, <scalar literal>)`. The literal gate keeps the
-# cell's raw initialisation trivial on both backends; a non-literal
-# init stays an array slot.
+# `let x = array_make(1, <pure scalar init>)`. A pure scalar init (literal,
+# local read, or builtin arithmetic over those) lowers to a raw register;
+# an effectful or non-scalar init keeps the array slot.
 fn cp_slot_decl(s: Stmt) : Option[CpSlot] = match s {
   SLet(pat, ann, rhs) -> match pat.pkind {
     PBind(nm) -> match cp_one_cell_init(rhs) {
@@ -144,7 +145,7 @@ fn cp_slot_decl(s: Stmt) : Option[CpSlot] = match s {
   _ -> None
 }
 
-# The scalar-literal init of an `array_make(1, lit)` rhs, or None.
+# The pure-scalar init of an `array_make(1, init)` rhs, or None.
 fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match rhs.kind {
   ECall(callee, args_) ->
     if cp_is_var(callee, "array_make") { cp_one_cell_args(args_) } else { None }
@@ -153,7 +154,7 @@ fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match rhs.kind {
 
 fn cp_one_cell_args(args_: [Expr]) : Option[Expr] = match args_ {
   [n, init] ->
-    if cp_is_lit_one(n) and cp_init_is_scalar_lit(init) { Some(init) } else { None }
+    if cp_is_lit_one(n) and cp_init_is_pure_scalar(init) { Some(init) } else { None }
   _ -> None
 }
 
@@ -162,17 +163,26 @@ fn cp_is_lit_one(e: Expr) : Bool = match e.kind {
   _ -> false
 }
 
-fn cp_init_is_scalar_lit(e: Expr) : Bool = match e.kind {
-  EInt(_)     -> cp_ty_is_cell_scalar(e.ty)
-  EReal(_, _) -> cp_ty_is_cell_scalar(e.ty)
-  EBool(_)    -> cp_ty_is_cell_scalar(e.ty)
-  EUnop(op, x) -> if op == "-" { match x.kind {
-    EInt(_)     -> cp_ty_is_cell_scalar(e.ty)
-    EReal(_, _) -> cp_ty_is_cell_scalar(e.ty)
-    _           -> false
-  } } else { false }
-  _ -> false
-}
+# A cell init the raw register can hold: a scalar-typed value with no
+# effects and a trivial box→raw border. Literals, a plain local read
+# (`var m := n`), and builtin arithmetic over such operands all qualify —
+# the result type being `Int`/`Real`/`Bool` (`cp_ty_is_cell_scalar`) rules
+# out a user protocol op returning a boxed type. A call, field, or index
+# init keeps the array slot: its lowering to raw is not locally provable.
+fn cp_init_is_pure_scalar(e: Expr) : Bool =
+  if not cp_ty_is_cell_scalar(e.ty) { false }
+  else { match e.kind {
+    EInt(_)         -> true
+    EReal(_, _)     -> true
+    EBool(_)        -> true
+    EVar(_)         -> true
+    EUnop(op, x)    -> cp_is_arith_op(op) and cp_init_is_pure_scalar(x)
+    EBinop(op, a, b) -> cp_is_arith_op(op) and cp_init_is_pure_scalar(a) and cp_init_is_pure_scalar(b)
+    _               -> false
+  } }
+
+fn cp_is_arith_op(op: String) : Bool =
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 
 # Int / Real / Bool only: the exact scalars both backends hold in raw
 # registers (`int64_t`/`double`/`int`, `SInt64`/`SReal`/`SBool`).
