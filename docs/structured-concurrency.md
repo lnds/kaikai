@@ -264,6 +264,18 @@ before `run_pipeline` returns. For the actor surface (mailbox
 policies, link/monitor supervision, `spawn_actor`,
 `with_mailbox`), see `docs/actors.md`.
 
+## Execution and parallelism
+
+Fibers are scheduled M:N over OS threads with work-stealing.
+`KAI_THREADS=N` selects the thread count at process start (default 1,
+which is byte-identical to the cooperative single-thread scheduler).
+None of the semantics in this document change with N: nurseries,
+cancellation and awaits behave identically; a message or spawned
+thunk that crosses a thread boundary is physically copied, which is
+what keeps per-fiber RC free of atomics. See
+`docs/mn-scheduler-design.md` for the scheduler design and
+`kai info fibers` for the user-facing summary.
+
 ## Root nursery
 
 `main` runs inside an implicit root nursery, so `spawn` is

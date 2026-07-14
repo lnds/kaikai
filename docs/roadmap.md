@@ -511,14 +511,18 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
    release; `docs/perceus-honesty-targets.md` and
    `docs/fibers-honesty-targets.md` reflect shipped reality.
 
-**Explicitly moved past 1.0** (tracked for Anakena, matching
-`docs/editions.md`): the multi-thread scheduler (work-stealing,
-atomics-free by fiber isolation — the architecture already paid
-for it), asm-level context switch, cross-fiber unboxed messages,
-type-erased layouts, the package registry and FFI binding
-generator, `check` v2, and the full region machinery (#1123,
-parked: `Vec` took the confined-bulk case; regions keep
-trees-in-arena, lifetime batching and the generational escape).
+**Shipped ahead of the original schedule** (both were listed here as
+post-Orongo): the multi-thread scheduler — M:N work-stealing, sends
+copied at thread crossings so object RC stays atomics-free,
+`KAI_THREADS=N` opt-in with the default flip pending reactor
+multi-scheduler maturity (`docs/mn-scheduler-design.md`) — and the
+region machinery (kind `Region`, trees-in-arena on both backends;
+generational escape still open).
+
+**Explicitly moved past Orongo** (tracked for Anakena, matching
+`docs/editions.md`): asm-level context switch, cross-fiber unboxed
+messages, type-erased layouts, the package registry and FFI binding
+generator, and `check` v2.
 
 ### Anakena — post-1.0 horizon
 
