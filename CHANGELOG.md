@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.13 (2026-07-14)
+
+### Fixed
+
+- **cli**: resolve kai upgrade via tags, not releases; graceful rate-limit handling (closes #1223) (#1224)
+- **runtime**: deep-copy the spawn thunk across threads — close the non-atomic-RC race on the closure (part of #1207) (#1218)
+- **pkg**: accept git/tag dep aliases and error loudly on unknown forms (#1217)
+
+### Changed
+
+- **mono**: ground return-only tparams from the resolved call-site return type (closes #1208) (#1222)
+
 ## v0.99.12 (2026-07-13)
 
 ### Fixed
