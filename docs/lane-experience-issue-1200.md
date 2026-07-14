@@ -123,8 +123,42 @@ pipeline) — as one continuous arc, no phasing stalls.
   `test-shape-laws-1200` — the law-check gate: a lawful impl passes 6/6, a
   non-functorial `map` is caught, and `axiom` exempts (0/0).
 
+## The native reg-slot desync (issue #1229) and its workaround
+
+The most expensive surprise: the native-built self-hosted compiler SIGSEGV'd on
+the CI runner while compiling *any* program, in `canon_tvars_ty`, decref'ing a
+raw i64 (read from a variant slot) as a boxed pointer. It reproduced ONLY on the
+GitHub runner — a local ubuntu:24.04 + LLVM 18 container self-compiled 30/30
+clean, even with `MALLOC_CHECK_=3` / `MALLOC_PERTURB_` and under ASAN (the RC
+allocator uses pools, not raw malloc, so ASAN's redzones don't cover the
+mis-dropped cells). The C backend stayed byte-identical, so every C-only gate was
+green — the crash was invisible to them.
+
+Getting the stack required a temporary `gdb` diagnostic wired into the CI gate
+(`gdb -batch -ex run -ex bt` around the crashing `--emit=c` call, `gdb` added to
+the `build-native` apt install), read off the CI log, then reverted. Root cause
+(asu): the #1110/#1201 class — adding the `TyShapeApp(Int, Ty)` arm to a hot
+`match ty {}` walker introduces a kind-1 Int match-arm binder and shifts the
+function's RSpec/alloca order, exposing a pre-existing reg-slot desync where a
+binder's slot classification and perceus's RC plan diverge. NOT tag renumbering:
+moving `TyShapeApp` to the end of the `Ty` type did not change the crash.
+
+Workaround (this lane): route `canon_tvars_ty`'s `TyShapeApp` arm through a
+helper taking `sv` as a plain param, so the kind-1 Int is not a match-arm
+sub-binder the native classifier inspects. The underlying hole is #1229.
+
+Second regression fixed here: the terminal-fold fusion probe
+(`fuse_source_is_protocol_seq`) peeked the source head via a synth that binds in
+the shared mutable substitution, but returned a bare Bool so the caller
+continued from the stale fresh-tvar counter — the rewrite re-minted the peek's
+ids and a stage lambda read its param at the peek's binding (`#1186`
+"annotation needed"). Fixed by returning the post-peek state.
+
 ## Coverage gaps / follow-ups (for the owner to schedule)
 
+- The native reg-slot desync #1229 — the lane workaround unblocks Shape but the
+  lowering hole survives; any future arm with a kind-1 Int match-arm binder in a
+  hot walker can re-trigger it.
 - Witness enumeration covers the nullary + cons ctor shape (the fixture-gate
   target). Containers whose constructors do not fit `nullary` + `Ctor(elem,
   recursive)` yield no witness and get a build note rather than a silent pass;
