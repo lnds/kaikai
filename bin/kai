@@ -3202,10 +3202,39 @@ upgrade_sha256_of() {
   fi
 }
 
+# Resolve the newest release tag from the GitHub tags API. Tags are
+# created by every `cz bump`, so they always exist — unlike
+# releases/latest, which 404s until someone publishes a Release.
+# $UPGRADE_HDR holds curl's response headers; on failure the reason
+# (network|ratelimit|notag) is written to $UPGRADE_HDR.err so the caller
+# can diagnose across the command-substitution subshell.
 upgrade_latest_tag() {
-  curl -fsSL "https://api.github.com/repos/kaikailang-org/kaikai/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1
+  url="https://api.github.com/repos/kaikailang-org/kaikai/tags?per_page=100"
+  token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  if [ -n "$token" ]; then
+    body="$(curl -sSL -H "Authorization: Bearer $token" -D "$UPGRADE_HDR" "$url" 2>/dev/null)" || { printf 'network' >"$UPGRADE_HDR.err"; return 1; }
+  else
+    body="$(curl -sSL -D "$UPGRADE_HDR" "$url" 2>/dev/null)" || { printf 'network' >"$UPGRADE_HDR.err"; return 1; }
+  fi
+
+  status="$(sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$UPGRADE_HDR" | tail -n1)"
+  remaining="$(sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]emaining:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$UPGRADE_HDR" | tail -n1)"
+  if [ "$status" = "403" ] || [ "$status" = "429" ] || [ "$remaining" = "0" ] \
+     || printf '%s' "$body" | grep -qi 'rate limit'; then
+    printf 'ratelimit' >"$UPGRADE_HDR.err"
+    return 1
+  fi
+
+  # tr splits objects onto their own lines first: sed's greedy `.*`
+  # would otherwise grab the *last* tag when the JSON is minified.
+  tag="$(printf '%s' "$body" | tr ',' '\n' \
+    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+    | head -n1)"
+  if [ -z "$tag" ]; then
+    printf 'notag' >"$UPGRADE_HDR.err"
+    return 1
+  fi
+  printf '%s\n' "$tag"
 }
 
 # True (0) when $1 (dotted X.Y.Z) is strictly greater than $2.
@@ -3267,9 +3296,19 @@ EOF
     die "cannot write to install prefix $prefix — not a curl|sh install?"
   fi
 
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-upgrade.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
   echo "==> checking for updates" >&2
+  UPGRADE_HDR="$tmp/tags.hdr"
   tag="$(upgrade_latest_tag)"
-  [ -n "$tag" ] || die "could not determine latest release tag from GitHub"
+  if [ -z "$tag" ]; then
+    case "$(cat "$UPGRADE_HDR.err" 2>/dev/null)" in
+      network)   die "cannot reach github.com — check your network connection" ;;
+      ratelimit) die "GitHub API rate limit reached (60/h unauthenticated). Retry in a few minutes, or set GITHUB_TOKEN." ;;
+      *)         die "could not find a release tag matching v<major>.<minor>.<patch> on GitHub" ;;
+    esac
+  fi
   latest="${tag#v}"
   current="$(read_version)"
 
@@ -3281,9 +3320,6 @@ EOF
   echo "==> upgrading kaikai $current -> $latest" >&2
   tarball="kaikai-$tag-$platform.tar.gz"
   base="https://github.com/kaikailang-org/kaikai/releases/download/$tag"
-
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-upgrade.XXXXXX")"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
 
   curl -fsSL -o "$tmp/$tarball" "$base/$tarball" \
     || die "failed to download $tarball"
