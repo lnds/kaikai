@@ -93,12 +93,87 @@ fn closure_literal(ca: ClosureArg, site: Expr) : Expr =
     CaNamedFn(d)    -> remap(site, EVar(cs_decl_name(d)))
   }
 
-# Beta-reduce one application of the closure to `args`: substitute the
-# closure's params by the args in its body.
+# Beta-reduce one application of the closure to `args`. A parameter read
+# MORE THAN ONCE whose value CARRIES RC (a boxed record/list/variant/String)
+# must NOT be substituted directly: duplicating the argument into every
+# occurrence makes perceus emit one `drop` per read, and the second read
+# then hits freed memory (`p => R { a: p.a, b: p.b }`). Such a parameter is
+# bound to a fresh `let` and the body reads that binder — restoring the
+# linear-occurrence shape perceus assumes and evaluating the argument once.
+# A parameter read at most once, or one whose value is a raw scalar (no RC),
+# substitutes directly: a raw scalar duplicated is harmless, and direct
+# substitution is what lets the collect's `k` stay unboxed.
 fn inline_apply(ca: ClosureArg, args_: [Expr]) : Expr =
   match ca {
-    CaLambda(ps, b) -> subst_scoped(b, cs_param_names(ps), args_)
-    CaNamedFn(d)    -> subst_scoped(decl_body(d), cs_param_names(decl_params(d)), args_)
+    CaLambda(ps, b) -> bind_once_apply(b, cs_param_names(ps), args_)
+    CaNamedFn(d)    -> bind_once_apply(decl_body(d), cs_param_names(decl_params(d)), args_)
+  }
+
+fn bind_once_apply(body: Expr, names: [String], args_: [Expr]) : Expr = {
+  let plan = plan_binds(body, names, args_, body.line, body.col)
+  let renamed = subst_scoped(body, names, plan.repls)
+  match plan.lets { [] -> renamed  _ -> mk_expr(EBlock(plan.lets, Some(renamed)), body.line, body.col) }
+}
+
+type BindPlan = { repls: [Expr], lets: [Stmt] }
+
+# For each closure param decide direct substitution vs a fresh let binder.
+# `repls` is what `subst_scoped` puts at each `EVar(param)` site (the arg
+# itself, or a fresh `EVar`); `lets` collects the `let fresh = arg` for the
+# bound-once params. The fresh name carries the body position so distinct
+# inline sites never collide with a callee-body binder.
+fn plan_binds(body: Expr, names: [String], args_: [Expr], line: Int, col: Int) : BindPlan =
+  match names {
+    [] -> BindPlan { repls: [], lets: [] }
+    [n, ...nrest] -> match args_ {
+      [] -> BindPlan { repls: [], lets: [] }
+      [a, ...arest] -> {
+        let rest = plan_binds(body, nrest, arest, line, col)
+        if bind_once_needed(body, n) {
+          let fresh = concat_all(["__csb_", int_to_string(line), "_", int_to_string(col), "_", n])
+          BindPlan { repls: [mk_expr(EVar(fresh), line, col), ...rest.repls],
+                     lets: [SLet(mk_pat(PBind(fresh), line, col), None, a), ...rest.lets] }
+        } else {
+          BindPlan { repls: [a, ...rest.repls], lets: rest.lets }
+        }
+      }
+    }
+  }
+
+# Bind-once is needed iff the param is read more than once AND its value
+# carries RC. Reads are counted syntactically over `EVar(param)`, rounding
+# up (both `if` arms count; an occurrence under a nested lambda counts) —
+# over-counting only adds a redundant `let`, never a UAF. RC-carrying is
+# the same representation predicate perceus uses for dup/drop, not a local
+# scalar whitelist.
+fn bind_once_needed(body: Expr, name: String) : Bool = {
+  let occ = count_param_reads(body, name)
+  occ.n > 1 and not opt_ty_unboxable(occ.ty)
+}
+
+fn opt_ty_unboxable(ot: Option[Ty]) : Bool =
+  match ot { Some(t) -> ty_is_unboxable_t(t)  None -> false }
+
+type ReadCount = { n: Int, ty: Option[Ty] }
+
+# Count syntactic `EVar(name)` reads in the body and capture one
+# occurrence's resolved type (they share it). Shadowing is not discounted —
+# an over-count only forces a redundant `let`, never a UAF, and
+# `subst_scoped` handles the actual shadowing at substitution time.
+fn count_param_reads(e: Expr, name: String) : ReadCount =
+  match e.kind {
+    EVar(n) -> if n == name { ReadCount { n: 1, ty: e.ty } } else { ReadCount { n: 0, ty: None } }
+    _       -> count_reads_kids(cspec_kids(e), name, ReadCount { n: 0, ty: None })
+  }
+
+fn count_reads_kids(es: [Expr], name: String, acc: ReadCount) : ReadCount =
+  match es {
+    [] -> acc
+    [k, ...rest] -> {
+      let c = count_param_reads(k, name)
+      let ty1 = match acc.ty { Some(_) -> acc.ty  None -> c.ty }
+      count_reads_kids(rest, name, ReadCount { n: acc.n + c.n, ty: ty1 })
+    }
   }
 
 # Substitute each closure parameter name by its argument expression,
