@@ -1059,13 +1059,13 @@ type GenSpecsResult = GenSpecsOut([Decl], [MonoTuple], [MLeakRecord])
 # args' `Expr.ty` and extracting bindings for both type-tparam ids
 # (TyVarT) and unit-tparam ids (UVar). Returns None if we cannot
 # resolve the impl's scheme or any arg lacks a `.ty` annotation.
-fn synthesize_inst_for_decl(d: Decl, args_: [Expr], line: Int, col: Int) : Option[ResolvedCS] {
+fn synthesize_inst_for_decl(d: Decl, args_: [Expr], ret_ty: Option[Ty], line: Int, col: Int) : Option[ResolvedCS] {
   match d {
     DFn(_, name, tparams, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
       None -> None
       Some(sc) -> match sc {
         Scheme(_, _, _, _, fnty) -> match fnty {
-          TyFnT(formal_pts, _, _) ->
+          TyFnT(formal_pts, formal_ret, _) ->
             # An arity mismatch means the call cannot be this generic:
             # decline so a same-named monomorphic root fn of a different
             # arity keeps winning the call site (#748 shadowing).
@@ -1074,8 +1074,14 @@ fn synthesize_inst_for_decl(d: Decl, args_: [Expr], line: Int, col: Int) : Optio
               let implicit = collect_implicit_tparams_in_decl(d, tparams)
               let effective = list_append(tparams, implicit)
               let split = tparam_id_split(effective)
-              let bindings = extract_bindings_args(formal_pts, args_,
-                                SubstBindings { tvars: [], uvars: [] })
+              # Ground a return-only tparam (a collect's element type in
+              # `Vec[b]`) from the call site's resolved return type: unify
+              # the formal return against `ret_ty` in the SAME binding set
+              # the args pin. An unresolved `ret_ty` (a tyvar) adds no
+              # binding, so this is purely additive.
+              let bindings = extract_bindings_from_ret(formal_ret, formal_pts, ret_ty,
+                                extract_bindings_args(formal_pts, args_,
+                                  SubstBindings { tvars: [], uvars: [] }))
               match collect_subst_tys(split.tvars, bindings.tvars) {
                 # An unbound type-tparam means the generic's formal shape
                 # did not unify with the call's actual arg types: this is
@@ -1110,6 +1116,71 @@ fn extract_bindings_args(formals: [Ty], args_: [Expr],
         None     -> extract_bindings_args(frest, arest, b)
       }
     }
+  }
+}
+
+# Add the binding a RETURN-ONLY tparam gets from the call site's resolved
+# return type. Only tparams absent from every parameter qualify: a tparam a
+# parameter mentions is the args' job to pin, and if the arg type did not
+# unify (`sum(tree)` against `list.sum[T](xs: [T]): T`) the call is not this
+# generic — grounding it from the return would steal a same-named local
+# fn's call site (#748 shadowing). Skips an absent or tyvar `ret_ty`
+# (nothing to add) — the whole step stays additive.
+fn extract_bindings_from_ret(formal_ret: Ty, formal_pts: [Ty], ret_ty: Option[Ty], b: SubstBindings) : SubstBindings =
+  match ret_ty {
+    None    -> b
+    Some(t) -> if ty_concrete(t) {
+                 let param_ids = collect_ty_tvar_ids_list(formal_pts, [])
+                 extract_ret_only_bindings(formal_ret, t, param_ids, b)
+               } else { b }
+  }
+
+# Like extract_bindings_ty but records a binding only for a TyVarT whose id
+# is NOT mentioned in any parameter — a genuine return-only tparam.
+fn extract_ret_only_bindings(formal: Ty, actual: Ty, param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match formal {
+    TyVarT(id) -> if list_has_int(param_ids, id) { b }
+                  else { SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars } }
+    TyListT(fi) -> match actual {
+      TyListT(ai) -> extract_ret_only_bindings(fi, ai, param_ids, b)
+      _ -> b
+    }
+    TyCon(_, _, fas) -> match actual {
+      TyCon(_, _, aas) -> extract_ret_only_bindings_list(fas, aas, param_ids, b)
+      _ -> b
+    }
+    _ -> b
+  }
+}
+
+fn extract_ret_only_bindings_list(fs: [Ty], a_s: [Ty], param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_ret_only_bindings_list(frest, arest, param_ids,
+                         extract_ret_only_bindings(f, a, param_ids, b))
+    }
+  }
+}
+
+# Every TyVarT id appearing anywhere in a list of formal parameter types.
+fn collect_ty_tvar_ids_list(ts: [Ty], acc: [Int]) : [Int] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_ty_tvar_ids_list(rest, collect_ty_tvar_ids(t, acc))
+  }
+}
+
+fn collect_ty_tvar_ids(t: Ty, acc: [Int]) : [Int] {
+  match t {
+    TyVarT(id)       -> if list_has_int(acc, id) { acc } else { [id, ...acc] }
+    TyListT(inner)   -> collect_ty_tvar_ids(inner, acc)
+    TyFnT(ps, r, _)  -> collect_ty_tvar_ids(r, collect_ty_tvar_ids_list(ps, acc))
+    TyCon(_, _, as_) -> collect_ty_tvar_ids_list(as_, acc)
+    TyDimT(base, _)  -> collect_ty_tvar_ids(base, acc)
+    TyRefineT(base, _) -> collect_ty_tvar_ids(base, acc)
+    _ -> acc
   }
 }
 
@@ -1860,7 +1931,7 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc, host_mo)
   match e.kind {
     ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> discover_call_tuple(name, None, callee, args_, insts, polys, existing, sm, acc1, host_mo)
+      EVar(name) -> discover_call_tuple(name, None, callee, args_, e.ty, insts, polys, existing, sm, acc1, host_mo)
       # A qualified call `mod.fn(...)` seeds a spec only when `fn` is a
       # `[T:P]` generic that `mod` actually defines. When the name is unique
       # to one module the tuple stays `None` (the bare-name `DFn` lookup
@@ -1870,7 +1941,7 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
       EModCall(modn, name) ->
         if poly_fn_has_module(polys, name, modn) {
           let cmo = if name_shared(polys, name) { Some(modn) } else { None }
-          discover_call_tuple(name, cmo, callee, args_, insts, polys, existing, sm, acc1, host_mo)
+          discover_call_tuple(name, cmo, callee, args_, e.ty, insts, polys, existing, sm, acc1, host_mo)
         } else { acc1 }
       _ -> acc1
     }
@@ -1879,7 +1950,7 @@ fn discover_new_tuples_expr(e: Expr, insts: [ResolvedCS], polys: [PolyFn],
 }
 
 fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [Expr],
-                        insts: [ResolvedCS], polys: [PolyFn],
+                        ret_ty: Option[Ty], insts: [ResolvedCS], polys: [PolyFn],
                         existing: TupleSet, sm: SubstMap,
                         acc1: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
   let is_user_poly = match lookup_poly_fn(polys, name) {
@@ -1887,7 +1958,7 @@ fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [
   }
   if not is_user_poly { acc1 }
   else {
-    match resolve_call_inst(insts, polys, name, callee, args_, sm) {
+    match resolve_call_inst(insts, polys, name, callee, args_, ret_ty, sm) {
       Some(p) -> match p {
         MIPair(tys, units) -> {
           let any_slot = list_length(tys) > 0 or list_length(units) > 0
@@ -2122,18 +2193,18 @@ fn rewrite_callsites_decl_sm(d: Decl, insts: [ResolvedCS],
 fn rewrite_callsites_expr_sm(e: Expr, insts: [ResolvedCS],
                               tuples: TupleSet, polys: [PolyFn],
                               sm: SubstMap, host_mo: Option[String]) : Expr =
-  Expr { kind: rewrite_callsites_kind_sm(e.kind, insts, tuples, polys, sm, host_mo),
+  Expr { kind: rewrite_callsites_kind_sm(e.kind, e.ty, insts, tuples, polys, sm, host_mo),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn rewrite_callsites_kind_sm(k: ExprKind, insts: [ResolvedCS],
+fn rewrite_callsites_kind_sm(k: ExprKind, ret_ty: Option[Ty], insts: [ResolvedCS],
                               tuples: TupleSet, polys: [PolyFn],
                               sm: SubstMap, host_mo: Option[String]) : ExprKind {
   match k {
     ECall(callee, args_) -> {
       let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm, host_mo))
       match callee.kind {
-        EVar(name) -> rewrite_bare_call(name, callee, new_args, insts, tuples, polys, sm, host_mo)
-        EModCall(modn, name) -> rewrite_qualified_call(modn, name, callee, new_args, insts, tuples, polys, sm)
+        EVar(name) -> rewrite_bare_call(name, callee, new_args, ret_ty, insts, tuples, polys, sm, host_mo)
+        EModCall(modn, name) -> rewrite_qualified_call(modn, name, callee, new_args, ret_ty, insts, tuples, polys, sm)
         _ -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm, host_mo), new_args)
       }
     }
@@ -2156,11 +2227,11 @@ fn rewrite_pointfree_callee(rhs: Expr, insts: [ResolvedCS], tuples: TupleSet,
                              polys: [PolyFn], sm: SubstMap,
                              host_mo: Option[String]) : Expr =
   match rhs.kind {
-    EVar(name) -> match rewrite_bare_call(name, rhs, [], insts, tuples, polys, sm, host_mo) {
+    EVar(name) -> match rewrite_bare_call(name, rhs, [], None, insts, tuples, polys, sm, host_mo) {
       ECall(c, _) -> c
       _           -> rhs
     }
-    EModCall(modn, name) -> match rewrite_qualified_call(modn, name, rhs, [], insts, tuples, polys, sm) {
+    EModCall(modn, name) -> match rewrite_qualified_call(modn, name, rhs, [], None, insts, tuples, polys, sm) {
       ECall(c, _) -> c
       _           -> rhs
     }
@@ -2170,10 +2241,10 @@ fn rewrite_pointfree_callee(rhs: Expr, insts: [ResolvedCS], tuples: TupleSet,
 # Retarget a bare call `f(args)` to its `__mono__` spec. A module-shared
 # name binds to the host module's spec via an `EModCall` callee (minting
 # `kai_<host>__…`); a unique name keeps the bare `EVar(mangled)` callee.
-fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr],
+fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr], ret_ty: Option[Ty],
                       insts: [ResolvedCS], tuples: TupleSet, polys: [PolyFn],
                       sm: SubstMap, host_mo: Option[String]) : ExprKind =
-  match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
+  match resolve_call_inst(insts, polys, name, callee, new_args, ret_ty, sm) {
     Some(MIPair(tys, units)) -> {
       let bmo = bare_callee_mo(polys, name, host_mo)
       if ts_mem(tuples, MT(bmo, name, tys, units)) {
@@ -2189,12 +2260,12 @@ fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr],
 # when the name is shared across modules (mirroring discovery); a tparam-less
 # qualified fn (`map.filter`) is not in `polys` and stays a generic call.
 fn rewrite_qualified_call(modn: String, name: String, callee: Expr, new_args: [Expr],
-                           insts: [ResolvedCS], tuples: TupleSet, polys: [PolyFn],
+                           ret_ty: Option[Ty], insts: [ResolvedCS], tuples: TupleSet, polys: [PolyFn],
                            sm: SubstMap) : ExprKind =
   if not poly_fn_has_module(polys, name, modn) { ECall(callee, new_args) }
   else {
     let cmo = if name_shared(polys, name) { Some(modn) } else { None }
-    match resolve_call_inst(insts, polys, name, callee, new_args, sm) {
+    match resolve_call_inst(insts, polys, name, callee, new_args, ret_ty, sm) {
       Some(MIPair(tys, units)) ->
         if ts_mem(tuples, MT(cmo, name, tys, units)) {
           let mangled = mono_mangle_name(name, tys, units)
@@ -2268,21 +2339,21 @@ fn mono_insts_collide_rest(t0: [Ty], u0: [UnitExprT], rest: [MonoInstPair]) : Bo
 # the position collides, synthesise from the call's actual arg types
 # so each site retargets its own spec.
 fn resolve_call_inst(insts: [ResolvedCS], polys: [PolyFn], name: String,
-                      callee: Expr, args_: [Expr],
+                      callee: Expr, args_: [Expr], ret_ty: Option[Ty],
                       sm: SubstMap) : Option[MonoInstPair] {
   let at_pos = find_mono_insts_at(insts, name, callee.line, callee.col)
   if mono_insts_collide(at_pos) {
-    match synth_inst_pair(polys, name, callee, args_, sm) {
+    match synth_inst_pair(polys, name, callee, args_, ret_ty, sm) {
       Some(p) -> Some(p)
-      None -> resolve_call_inst_first(at_pos, polys, name, callee, args_, sm)
+      None -> resolve_call_inst_first(at_pos, polys, name, callee, args_, ret_ty, sm)
     }
   } else {
-    resolve_call_inst_first(at_pos, polys, name, callee, args_, sm)
+    resolve_call_inst_first(at_pos, polys, name, callee, args_, ret_ty, sm)
   }
 }
 
 fn resolve_call_inst_first(at_pos: [MonoInstPair], polys: [PolyFn], name: String,
-                            callee: Expr, args_: [Expr],
+                            callee: Expr, args_: [Expr], ret_ty: Option[Ty],
                             sm: SubstMap) : Option[MonoInstPair] {
   match at_pos {
     [MIPair(tys0, units0), ..._] -> {
@@ -2290,14 +2361,14 @@ fn resolve_call_inst_first(at_pos: [MonoInstPair], polys: [PolyFn], name: String
       let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
       Some(MIPair(tys, units))
     }
-    [] -> synth_inst_pair(polys, name, callee, args_, sm)
+    [] -> synth_inst_pair(polys, name, callee, args_, ret_ty, sm)
   }
 }
 
 fn synth_inst_pair(polys: [PolyFn], name: String, callee: Expr,
-                    args_: [Expr], sm: SubstMap) : Option[MonoInstPair] {
+                    args_: [Expr], ret_ty: Option[Ty], sm: SubstMap) : Option[MonoInstPair] {
   match lookup_poly_fn(polys, name) {
-    Some(d) -> match synthesize_inst_for_decl(d, args_, callee.line, callee.col) {
+    Some(d) -> match synthesize_inst_for_decl(d, args_, ret_ty, callee.line, callee.col) {
       Some(rcs) -> match rcs {
         RCS(_, _, _, tys0, units0, _) -> {
           let tys = map(tys0, (t) => subst_ty(t, sm))

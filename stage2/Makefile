@@ -3857,8 +3857,8 @@ test-m4c: $(TARGET) build
 	  && grep -q "= kai_run_with__mono__String__Int(" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
-	@grep -q "= kai_process_with_log__mono__Int__Int(" build/s2-m4c_handler_in_body.c \
-	  && grep -q "= kai_process_with_log__mono__String__Int(" build/s2-m4c_handler_in_body.c \
+	@grep -qE "= kai_process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
+	  && grep -qE "= kai_process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
 	@grep -q "kai_outer__mono__Int" build/s2-m4c_flow_through.c \
@@ -4568,6 +4568,52 @@ test-closure-spec-1205: $(TARGET) build
 	  grep -F 'call_ind' build/s2-cs1205-loop.kir; exit 1; \
 	fi; \
 	echo "closure-spec-1205 OK (sum matches; specialised loop has zero per-element call_ind, lambda inlined into tcrec)"
+
+# Issue #1208 (native) — grounding a return-only tparam from the call
+# site. `let v: Vec[Point] = [a..b] | stage` collects into a Vec whose
+# element type is return-only; mono now grounds it from the annotated
+# return type, so the specialised collect loop unboxes (`i64` indices,
+# record ctor inlined) and carries zero per-element indirect calls.
+# Native-gated (tier1-native).
+test-collect-ground-1208: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/collect_ground_1208.kai; \
+	exp=../examples/perceus/collect_ground_1208.out.expected; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-cg1208 2> build/s2-cg1208.err \
+	  || { echo "collect-ground-1208 FAIL (native build errored)"; cat build/s2-cg1208.err; exit 1; }; \
+	./build/s2-cg1208 > build/s2-cg1208.out; \
+	diff -q $$exp build/s2-cg1208.out > /dev/null \
+	  || { echo "collect-ground-1208 FAIL (output diff)"; diff $$exp build/s2-cg1208.out; exit 1; }; \
+	./$(TARGET) --emit=kir --path ../stdlib --edition hanga-roa $$src > build/s2-cg1208.kir 2>/dev/null; \
+	awk '/^fn rmcv_loop__cspec.*mono__Point/,/^}/' build/s2-cg1208.kir > build/s2-cg1208-loop.kir; \
+	test -s build/s2-cg1208-loop.kir \
+	  || { echo "collect-ground-1208 FAIL (no grounded collect loop emitted — return-only tparam not grounded)"; exit 1; }; \
+	grep -E -q '^fn rmcv_loop__cspec.*mono__Point\(i: i64' build/s2-cg1208-loop.kir \
+	  || { echo "collect-ground-1208 FAIL (collect loop index not unboxed to i64)"; head -1 build/s2-cg1208-loop.kir; exit 1; }; \
+	if grep -F -q 'call_ind' build/s2-cg1208-loop.kir; then \
+	  echo "collect-ground-1208 FAIL (grounded collect loop still has a per-element indirect call)"; \
+	  grep -F 'call_ind' build/s2-cg1208-loop.kir; exit 1; \
+	fi; \
+	echo "collect-ground-1208 OK (sum matches; return-only element grounded from call site, collect loop unboxed with zero per-element call_ind)"
+
+# Issue #1208 (native) — bind-once in the beta-reducer. A specialised
+# stage that reads a BOXED param more than once (`p => R { a: p.a, b: p.b }`)
+# must bind it to one let, else naive substitution duplicates the value and
+# perceus drops it once per read (second read = freed memory). Every field
+# of every element must round-trip; the emitted spec must carry the `__csb`
+# bind-once binder (proof the guard fired). Native-gated (tier1-native).
+test-collect-multiread-1208: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/collect_multiread_1208.kai; \
+	exp=../examples/perceus/collect_multiread_1208.out.expected; \
+	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-mr1208 2> build/s2-mr1208.err \
+	  || { echo "collect-multiread-1208 FAIL (native build errored)"; cat build/s2-mr1208.err; exit 1; }; \
+	./build/s2-mr1208 > build/s2-mr1208.out; \
+	diff -q $$exp build/s2-mr1208.out > /dev/null \
+	  || { echo "collect-multiread-1208 FAIL (output diff — a boxed field was freed before its second read)"; diff $$exp build/s2-mr1208.out; exit 1; }; \
+	./$(TARGET) --path ../stdlib $$src 2>/dev/null | grep -F -q '__csb_' \
+	  || { echo "collect-multiread-1208 FAIL (no bind-once binder emitted — the multi-read guard did not fire)"; exit 1; }; \
+	echo "collect-multiread-1208 OK (every boxed field round-trips; bind-once binder present)"
 
 # Issue #1134 (native) — the range-headed terminal fold must fold a 1M-wide
 # range in O(1) stack on native (the counting loop is tail-recursive) and
