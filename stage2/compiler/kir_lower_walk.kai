@@ -1483,13 +1483,13 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
   match ls_fresh_reg(st) { LSReg(join, st1) -> {
     let sd = scr_drop_name(join)
     let st_alias = ls_emit(st1, KLet("__pcs_scr", SBoxed, KLitOp(scrv), kpos_of(x)))
-    # Publish this match's drop binder so a TRMC cons-modulo step lowered inside
-    # an arm body (via the `ECall` dispatch, far from here) drops the right
-    # register. A TRMC step always reads the `mscr` set by its OWN enclosing
-    # match (set here, before any arm body lowers); a sibling/outer match
-    # re-sets `mscr` in its own preamble before its TRMC, so no stale read can
-    # occur and no explicit restore is needed. Only an owned match has an exit
-    # drop; a borrowed match leaves `mscr` as the enclosing one.
+    # Publish this match's drop binder so a TRMC cons-modulo step (or a reuse
+    # fork's `reuse_neutralise_exit_drop`) lowered inside an arm body drops the
+    # right register. A sibling arm that runs a NESTED match leaves `mscr` at
+    # the nested `<join>$sd`; `lower_variant_groups` restores this match's `mscr`
+    # before each group so a later reuse-fork arm reads the enclosing binder, not
+    # the stale nested one (#1229). Only an owned match has an exit drop; a
+    # borrowed match leaves `mscr` as the enclosing one.
     let st_pub = if owned { ls_set_mscr(st_alias, sd) } else { st_alias }
     # Exit-drop binder. The C oracle consumes the scrutinee LINEARLY — `_scr = sc`
     # (no dup), one match-exit decref — and a live-binder scrutinee already
@@ -1645,7 +1645,7 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         # by one arm lowers its body directly in the case block; a tag SHARED
         # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
         # case block that discriminates on the payload (kir_lower_variant).
-        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, owned, sd, st7)
+        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, owned, sd, st6.mscr, st7)
         match_finish_tok(owned, sd, arms_have_arm_top(arms, st8), LRes(KVar(join), reopen(st8, lcont)))
       } } } }
 
@@ -1775,13 +1775,20 @@ fn arm_tag(p: Pattern, st: LowerSt) : Int = match (arm_disc_pat(p)).pkind {
 # default): "no arm of this tag matched" is exactly "fell through the
 # switch" — `ldef` carries the global `_` body or is `KUnreachable` when the
 # match is exhaustive (Linus review #3, mirror of `lower_default_arm`).
+# `mscr0` is this match's `mscr` as of the preamble (its own `<join>$sd` when
+# owned, else the enclosing match's). It is restored before EACH group: a prior
+# group's body may run a nested match that leaves `mscr` pointing at ITS
+# `<join>$sd`, and a reuse-fork arm (`condbr kaix_check_unique`, no
+# `match_preamble` of its own) reads the stale name in
+# `reuse_neutralise_exit_drop` — storing/dropping the wrong register, a raw
+# scalar from the nested arm freed as a pointer (#1229).
 fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
-                        lcont: String, ldef: String, owned: Bool, sd: String, st: LowerSt) : LowerSt / Console = match cases {
+                        lcont: String, ldef: String, owned: Bool, sd: String, mscr0: String, st: LowerSt) : LowerSt / Console = match cases {
   [] -> st
   [KC(tag, lbl), ...crest] -> {
     let group = arms_with_tag(arms, tag, st)
-    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, owned, sd, st)
-    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, owned, sd, st1)
+    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, ls_set_mscr(st, mscr0))
+    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, owned, sd, mscr0, st1)
   }
 }
 
@@ -1901,7 +1908,7 @@ fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
 # default = the global `_` body or `KUnreachable`). A shared tag (N>1 arms)
 # always opens the chain.
 fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
-                   lbl: String, ldef: String, owned: Bool, sd: String, st: LowerSt) : LowerSt / Console = match group {
+                   lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, st: LowerSt) : LowerSt / Console = match group {
   [Arm(p, g, body)] ->
     if var_arm_is_tag_catchall(p) {
       let st_arm = reopen(st, lbl)
@@ -1909,8 +1916,8 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st_rc = lower_arm_rc(p, body, sd, owned, st_bound)
       let st_drop = match_selftail_scr_drop(owned, sd, body, st_rc)
       lower_branch_into(body, join, lcont, st_drop)
-    } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, reopen(st, lbl)) }
-  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, reopen(st, lbl))
+    } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, mscr0, reopen(st, lbl)) }
+  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, reopen(st, lbl))
 }
 
 # The sub-fail-chain for a tag shared by N>1 arms. Each arm: if it
@@ -1920,9 +1927,9 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
 # the typer's redundancy check forbids). After binding its fields, the arm's
 # body lowers into the shared join. The last fail label routes to `ldef`.
 fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
-                     fail_lbl: String, ldef: String, owned: Bool, sd: String, st: LowerSt) : LowerSt / Console = match group {
+                     fail_lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, st: LowerSt) : LowerSt / Console = match group {
   [] -> ls_seal(reopen(st, fail_lbl), KBr(ldef, KNoPos), ldef)
-  [Arm(p, _, body), ...rest] -> match ls_fresh_label(reopen(st, fail_lbl)) { LSLabel(body_lbl, st1) ->
+  [Arm(p, _, body), ...rest] -> match ls_fresh_label(reopen(ls_set_mscr(st, mscr0), fail_lbl)) { LSLabel(body_lbl, st1) ->
     if var_arm_is_tag_catchall(p) {
       # Catch-all of this tag: branch straight to the body; later arms dead.
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
@@ -1936,7 +1943,7 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
         let st4d = lower_arm_rc(p, body, sd, owned, st4)
         let st4dd = match_selftail_scr_drop(owned, sd, body, st4d)
         let st5 = lower_branch_into(body, join, lcont, st4dd)
-        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, st5)
+        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, mscr0, st5)
       } }
     } }
 }
