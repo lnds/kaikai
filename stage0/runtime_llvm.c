@@ -311,12 +311,23 @@ KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_
    arm used to be a no-op (cond evaluated for effects, bool discarded),
    so contracts never fired under LLVM. These forwarders wire the same
    runtime entry points, with `kaix_assert_check_with_value` carrying
-   the offending binding's runtime value (issue #86 piece 2). */
+   the offending binding's runtime value (issue #86 piece 2).
+
+   KAI_HOT_ONLY: owner-only. A failed assert consults the test-runner's
+   fiber-local state (kai_test_current / kai_test_jmp) to longjmp back into
+   `kai_test_run_one` (also owner-only) instead of panicking. That state is
+   `static` in runtime.h, so it must NOT be duplicated: an assert compiled
+   into the hot bitcode would read the program object's private copy —
+   always NULL — and panic on a test failure the runner should have caught
+   and reported. Keeping the assert entry points in the owner TU keeps every
+   test-runner access on the one owner-side copy. */
+#if !defined(KAI_HOT_ONLY)
 void      kaix_assert_check(KaiValue *cond, const char *msg)    { kai_assert_check(cond, msg); }
 void      kaix_assert_check_with_value(KaiValue *cond, const char *base_msg,
                                        const char *ident_name, KaiValue *val) {
     kai_assert_check_with_value(cond, base_msg, ident_name, val);
 }
+#endif /* !KAI_HOT_ONLY */
 
 KaiValue *kaix_range(KaiValue *from, KaiValue *to)              { return kai_range(from, to); }
 KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s){ return kai_range_step(f, t, s); }
