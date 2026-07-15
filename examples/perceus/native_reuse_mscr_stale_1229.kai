@@ -1,0 +1,59 @@
+# A hot `Ty` walker that rebuilds nodes reusing the unique scrutinee in place
+# (the write-side of #1229). One arm (`Shape`) binds a kind-1 Int sub-binder
+# `sv` used raw (a call arg + a ctor Int slot) inside a NESTED match; a sibling
+# arm (`Dim`/`Refine`) rebuilds via a reuse fork with NO nested match of its
+# own. Before the fix, the nested match's `<join>$sd` exit-drop register leaked
+# into the sibling arms: their reuse fork read the stale `mscr` in
+# `reuse_neutralise_exit_drop`, so the sibling's exit drop freed the wrong
+# register — a raw i64 from the nested arm dropped as a pointer. Native must
+# rebuild every arm without a crash and match C.
+#
+# The `Var`/`Shape` arms are the read/write-side raw Int binders; `Dim` and
+# `Refine` are the boxed reuse-fork siblings whose exit drop desynced.
+
+type Ty
+  = Base
+  | ListT(Ty)
+  | Var(Int)
+  | Shape(Int, Ty)
+  | Dim(Ty, Int)
+  | Refine(Ty, Int)
+
+fn lookup(k: Int) : Option[Int] = if k > 0 { Some(k * 10) } else { None }
+
+# Rebuilds each node reusing the unique scrutinee. `Var`/`Shape` bind a kind-1
+# Int sub-binder through a nested `match lookup(..)`; `Dim`/`Refine` rebuild via
+# a plain reuse fork (no nested match) — the sibling shape that desynced.
+fn canon(t: Ty) : Ty = match t {
+  Base          -> Base
+  ListT(inner)  -> ListT(canon(inner))
+  Var(n)        -> match lookup(n) {
+    Some(b) -> Var(b)
+    None    -> Var(n)
+  }
+  Shape(sv, a)  -> match lookup(sv) {
+    Some(b) -> Shape(b, canon(a))
+    None    -> Shape(sv, canon(a))
+  }
+  Dim(a, u)     -> Dim(canon(a), u)
+  Refine(a, p)  -> Refine(canon(a), p)
+}
+
+fn sum(t: Ty) : Int = match t {
+  Base         -> 0
+  ListT(inner) -> sum(inner)
+  Var(n)       -> n
+  Shape(sv, a) -> sv + sum(a)
+  Dim(a, u)    -> u + sum(a)
+  Refine(a, p) -> p + sum(a)
+}
+
+fn main() : Unit / Console = {
+  # A tree exercising every arm, with the Refine/Dim reuse siblings wrapping
+  # the raw-Int Shape/Var arms so the desynced layout forms.
+  let t = Refine(Dim(Shape(3, ListT(Var(5))), 7), 100)
+  let c = canon(t)
+  # canon: Var(5)->Var(50), Shape(3,..)->Shape(30,..), Dim keeps 7, Refine 100.
+  # sum(c) = 100 + 7 + 30 + 50 = 187.
+  println(int_to_string(sum(c)))
+}
