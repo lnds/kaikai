@@ -159,6 +159,18 @@ fi
 CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
 
+# Optimisation level for the cc-compiled runtime OWNER object (the scheduler +
+# every fiber suspend point; see runtime_llvm.c's hot/owner-split note). It MUST
+# be built without the thread-pointer hoist: clang -O1/-O2 caches the %fs base
+# in a register across swapcontext, so a fiber work-stolen onto another OS
+# thread reads the CREATOR thread's _Thread_local scheduler state and a live
+# fiber's stack is freed under it (issue #1234). Only whole-TU -O0 is sound
+# under clang (gcc is sound at any -O, but $CC is not guaranteed to be gcc — CI
+# and macOS use clang). Appended AFTER $CFLAGS so it wins the -O race. The cost
+# is only cold effect/scheduler dispatch; the hot value/RC/arithmetic path is
+# the -O2 hot bitcode inlined into the program object, which this does not touch.
+KAI_RUNTIME_OWNER_OPT="-O0"
+
 # Resolve the runtime shim the in-process libLLVM `native` backend links
 # against (stage0/runtime_llvm.c holds the `kaix_prelude_*` forwarders the
 # native object calls). Dev checkout lives next to the C runtime under
@@ -439,11 +451,13 @@ resolve_native_modular_runtime_obj() {
   # TLS global) must invalidate the cached owner, or its definitions skew
   # against the partitions' extern declarations and the link mis-resolves.
   _rt_hdr="$RUNTIME_INC/runtime.h"
-  _rt_key="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
+  _rt_key="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$KAI_RUNTIME_OWNER_OPT" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
   _rt_obj="$_rt_cache/$_rt_key.o"
   if [ ! -f "$_rt_obj" ]; then
     # shellcheck disable=SC2086
-    $CC $CFLAGS $_rt_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
+    # $KAI_RUNTIME_OWNER_OPT trails $CFLAGS so its -O0 wins: the owner's
+    # swapcontext-crossing scheduler must not be thread-pointer-hoisted (#1234).
+    $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $_rt_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
       && mv "$_rt_obj.$$" "$_rt_obj" 2>/dev/null || { rm -f "$_rt_obj.$$" 2>/dev/null; return 0; }
   fi
   printf '%s' "$_rt_obj"
@@ -1482,7 +1496,22 @@ compile_to_binary() {
     # libSystem (both make `-ldl` a harmless no-op), but older glibc needs
     # the explicit lib — so request it everywhere.
     if [ -n "$RUNTIME_LLVM_BC" ]; then
-      $CC $CFLAGS "$obj" -o "$out" -lm -ldl
+      # The hot bitcode merged into $obj carries ONLY the leaf value/RC/
+      # arithmetic ops (KAI_HOT_ONLY): they inline into the hot loop, sound
+      # under clang -O2. `main`, the scheduler, and everything that suspends
+      # a fiber across swapcontext come from the cc-compiled runtime OWNER
+      # object — gcc does not hoist the thread pointer across a context
+      # switch, so a work-stolen fiber reads its own thread's scheduler state.
+      # Same owner object (and cache) the native-modular link uses.
+      wp_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1"
+      wp_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$wp_owner_defs")"
+      if [ -n "$wp_rt_obj" ]; then
+        $CC $CFLAGS "$obj" "$wp_rt_obj" -o "$out" -lm -ldl
+      else
+        # No object cache (hasher-less host): compile runtime_llvm.c inline as
+        # the owner. $KAI_RUNTIME_OWNER_OPT (-O0) keeps the scheduler sound (#1234).
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+      fi
     else
       $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
     fi

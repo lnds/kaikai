@@ -15920,11 +15920,25 @@ static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm) {
  * success OR no-op; non-zero only on a real parse/link failure (a corrupt or
  * incompatible bitcode), which the caller surfaces like a verify failure
  * rather than emitting a half-linked module. */
+/* The program-emitted entry points the runtime OWNER object (cc-compiled
+ * runtime_llvm.c) calls into this whole-program object: its `main` invokes
+ * these across the object boundary, so they MUST stay external through the
+ * internaliser or the final cc link cannot resolve them. Before the hot/owner
+ * split `main` lived in the merged bitcode and called `kai_main` intra-module,
+ * so internalising all-but-`main` was enough; now `main` is owner-only. */
+static int kai_llvm_is_owner_entry_point(const char *nm) {
+    if (!nm) return 0;
+    return strcmp(nm, "main") == 0                       /* OS entry (owner-defined now) */
+        || strcmp(nm, "kai_main") == 0                   /* program body the owner's main runs */
+        || strcmp(nm, "_kai_proto_init_llvm") == 0       /* proto table init */
+        || strcmp(nm, "kai_main_install_defaults") == 0  /* default-handler install */
+        || strcmp(nm, "kai_main_teardown_defaults") == 0;/* default-handler teardown */
+}
+
 static void kai_llvm_internalize_except_main(LLVMModuleRef m) {
     for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
         if (LLVMIsDeclaration(f)) continue;            /* nothing to internalise */
-        const char *nm = LLVMGetValueName(f);
-        if (nm && strcmp(nm, "main") == 0) continue;   /* OS entry point — keep external */
+        if (kai_llvm_is_owner_entry_point(LLVMGetValueName(f))) continue;
         LLVMSetLinkage(f, LLVMInternalLinkage);
     }
     /* Globals defined by the runtime (string/variant-head tables, the
