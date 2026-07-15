@@ -445,13 +445,18 @@ resolve_native_modular_runtime_obj() {
   [ -n "$_rt_hasher" ] || return 0
   _rt_cache="$(resolve_native_modular_cache_dir)/runtime"
   mkdir -p "$_rt_cache" 2>/dev/null || return 0
-  # The owner object DEFINES the runtime state globals, whose linkage
-  # (plain vs _Thread_local) is decided in runtime.h — which _rt_src
-  # #includes. Fold runtime.h into the key: a change there (e.g. a new
-  # TLS global) must invalidate the cached owner, or its definitions skew
-  # against the partitions' extern declarations and the link mis-resolves.
+  # The owner object DEFINES the runtime state globals AND the fiber
+  # suspend-point ops (linkage decided in runtime.h — which _rt_src
+  # #includes). Fold runtime.h into the key: a change there (a new TLS
+  # global, a newly-gated scheduler op) must invalidate the cached owner, or
+  # its definitions skew against the partitions' extern declarations and the
+  # link mis-resolves (a gated handler stays undefined). The compile below
+  # leads with $RUNTIME_INC_C (stage2), so `<runtime.h>` binds there — the key
+  # must hash the SAME header, stage2 ahead of stage0, or a stage2/runtime.h
+  # edit silently reuses a stale owner (#1238 lane hit this).
+  _rt_hdr_c="$RUNTIME_INC_C/runtime.h"
   _rt_hdr="$RUNTIME_INC/runtime.h"
-  _rt_key="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$KAI_RUNTIME_OWNER_OPT" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
+  _rt_key="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$KAI_RUNTIME_OWNER_OPT" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr_c" ] && cat "$_rt_hdr_c"; [ -f "$_rt_hdr" ] && [ "$_rt_hdr" != "$_rt_hdr_c" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
   _rt_obj="$_rt_cache/$_rt_key.o"
   if [ ! -f "$_rt_obj" ]; then
     # shellcheck disable=SC2086
@@ -1561,13 +1566,20 @@ compile_to_binary() {
     cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
     # runtime.h declares the multi-MB RC free-list pools `static`, so each
     # TU would replicate them and overflow .bss at the compiler's TU count.
-    # KAI_SEPARATE_COMPILATION turns the pools into one shared `extern`
-    # copy; the single owner TU (KAI_RUNTIME_OWNER) carries the definition.
-    # Owner is the root module; fall back to the first TU so there is always
-    # exactly one (a zero-owner build would fail to link the pool symbols).
+    # KAI_SEPARATE_COMPILATION turns the pools into one shared `extern` copy.
+    # The runtime OWNER TU (KAI_RUNTIME_OWNER) carries the definition — that
+    # owner is the cc runtime object linked below (runtime_llvm.c, which
+    # #includes runtime.h), NOT a program module: the program TUs reference the
+    # fiber suspend-point ops as external (KAI_SCHED_FN), so the scheduler stays
+    # in the -O0 owner and never compiles at -O2 into a program module (#1238).
+    # No program module is the owner (a hasher-less host with no runtime object
+    # keeps the legacy first-TU owner — see the fallback in the link below).
     mod_defs="-DKAI_SEPARATE_COMPILATION=1"
-    mod_owner="__root__.c"
-    [ -f "$moddir/$mod_owner" ] || mod_owner="$(basename "$(ls "$moddir"/*.c | head -1)")"
+    mod_owner=""
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      mod_owner="__root__.c"
+      [ -f "$moddir/$mod_owner" ] || mod_owner="$(basename "$(ls "$moddir"/*.c | head -1)")"
+    fi
     # A deeply-recursive program (the self-hosted compiler) overruns the
     # 8 MB default macOS main-thread stack, which is fixed at link time.
     # Match the single-TU compiler link. Linux grows the stack via ulimit,
@@ -1636,10 +1648,32 @@ compile_to_binary() {
       nhit=$(( ntu - nmiss ))
       echo "kai: c-modular: ${ntu} TUs, jobs=${jobs}, cache hits=${nhit} compiled=${nmiss}${cachedir:+ (${cachedir})}" >&2
     fi
-    # Link all module objects.
+    # Link all module objects + the runtime owner object. The program modules
+    # reference every fiber suspend-point op as external (KAI_SCHED_FN), so the
+    # scheduler lives in the cc owner object pinned to -O0, never in a module
+    # compiled at -O2 where clang would hoist the thread pointer across
+    # swapcontext (#1238). runtime_llvm.c (which #includes runtime.h) is the
+    # sole owner here: with KAI_RUNTIME_OWNER it defines every runtime state
+    # global AND the scheduler; the program modules reference all of it
+    # external. KAI_PROGRAM_PROVIDES_MAIN suppresses its `main` (modules carry one).
     # shellcheck disable=SC2086
-    $CC $CFLAGS $mod_ldstack "$moddir"/*.o -o "$out" -lm \
-      || die "modular link failed"
+    if [ -n "$RUNTIME_LLVM_C" ]; then
+      mod_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
+      mod_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$mod_owner_defs")"
+      if [ -n "$mod_rt_obj" ]; then
+        $CC $CFLAGS $mod_ldstack "$moddir"/*.o "$mod_rt_obj" -o "$out" -lm \
+          || die "modular link failed"
+      else
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $mod_owner_defs $mod_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$moddir"/*.o "$RUNTIME_LLVM_C" -o "$out" -lm \
+          || die "modular link failed"
+      fi
+    else
+      # Hasher-less host: no runtime object cache and no RUNTIME_LLVM_C, so a
+      # program module is the owner (legacy single-owner-module link). Sound
+      # under gcc; the clang residual this split closes needs the owner object.
+      $CC $CFLAGS $mod_ldstack "$moddir"/*.o -o "$out" -lm \
+        || die "modular link failed"
+    fi
   else
     # shellcheck disable=SC2086
     (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $user_cache_flag "$@" "$src") > "$tmp/out.c"
@@ -1673,7 +1707,52 @@ compile_to_binary() {
     # differ, in installed layout they are the same dir. `-I "$cincl"`
     # (the split subdir, when present) lets the emitted `#include
     # "kai_ffi.h"` AND a shim in $CFLAGS resolve the shared FFI header.
-    $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
+    #
+    # Two-object split (mirrors the native owner-object seam). Under
+    # KAI_SEPARATE_COMPILATION the runtime's fiber suspend points (mailbox
+    # recv/send, spawn_actor, kai_sched_bootstrap, and every parking effect
+    # default handler) are `extern` in the program, so they NEVER compile into
+    # this -O2 object — DCE drops their whole closure — and instead resolve to
+    # the cc owner object pinned to -O0. That is load-bearing: clang -O1+
+    # caches the thread pointer across swapcontext, so a scheduler compiled at
+    # -O2 mis-hoists it and a fiber work-stolen onto another OS thread reads
+    # the creator thread's TLS (issue #1238, the C residual of #1234). The
+    # owner (KAI_RUNTIME_OWNER) defines them, with KAI_PROGRAM_PROVIDES_MAIN so
+    # its `main` does not clash with the program's emitted one. The emitted
+    # `.c` stays self-contained (it references only kai_* the runtime.h it
+    # includes provides) — single-TU compiles keep working; only this real
+    # build path adds the -O0 owner.
+    #
+    # The split needs runtime_llvm.c as the owner. When it cannot be located
+    # (a stripped-down layout with only runtime.h), fall back to the legacy
+    # single-TU compile: sound under gcc, and the only exposure — clang at
+    # -O1+ with KAI_THREADS>1 — is the residual this split closes, which such
+    # a minimal host does not hit by construction.
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
+    else
+      prog_obj="$tmp/out.o"
+      $CC $CFLAGS -DKAI_SEPARATE_COMPILATION=1 -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$prog_obj" \
+        || die "C backend compile failed"
+      # Soundness gate (twin of gen-runtime-bc's llvm-nm check): no fiber
+      # suspend point may have compiled into the -O2 program object. A
+      # `swapcontext` reference means a scheduler op leaked in — a parking
+      # handler is missing its KAI_SCHED_FN gate in runtime.h. Fail loudly
+      # rather than ship an unsound binary. Skipped when `nm` is absent (the
+      # object still links; only the assertion is unavailable).
+      if command -v nm >/dev/null 2>&1 && nm "$prog_obj" 2>/dev/null | grep -q swapcontext; then
+        die "C backend: swapcontext leaked into the -O2 program object (a parking op is missing its KAI_SCHED_FN gate — #1238)"
+      fi
+      c_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
+      c_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$c_owner_defs")"
+      if [ -n "$c_rt_obj" ]; then
+        $CC $CFLAGS "$prog_obj" "$c_rt_obj" -o "$out" -lm || die "C backend link failed"
+      else
+        # No object cache (hasher-less host): compile the owner inline at -O0.
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_LLVM_C" -o "$out" -lm \
+          || die "C backend link failed"
+      fi
+    fi
   fi
 }
 

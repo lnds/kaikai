@@ -245,22 +245,27 @@ root already emits them external.
   sound (they never saw this native miscompile, which is how it shipped).
 - `llvm-nm` on both hot bitcodes: 0 `swapcontext` references.
 
-### Follow-up left for the next lane
+### Follow-up — the C residual (CLOSED as #1238)
 
-**The C backend under `CC=clang -O1+` is unsound the same way** (7/40 crash on
-the same fixture) and is NOT closed here. This lane fixes the native path — the
-reported #1234 — because native is the only path with a clean seam: the runtime
-already links as a separate object (the owner), so pinning that one object to
-`-O0` contains the scheduler without touching program code. The default C
-backend is a *single* TU (program + `runtime.h` inlined), and the vulnerable
-functions (`kai_core_mailbox_recv` ~7907, the reactor ~12000, the scheduler
-~13000, `kai_fiber_value` ~3059) are scattered across ~11k lines interleaved
-with the RC/arithmetic hot path — so there is no contiguous region to `-O0`, and
-whole-TU `-O0` would kill program perf. A proper fix compiles `runtime.h`'s
-scheduler as its own `-O0` object even on the C path (the `#748` separate-
-compilation path already has the machinery), or moves the migration-sensitive
-state off compiler-`_Thread_local`. Filed as #1238; not a regression (it was
-always latent) and sound in CI, where the C path uses gcc.
+**The C backend under `CC=clang -O1+` was unsound the same way** (7/40 crash on
+the same fixture) — filed as #1238 and **now closed**. This lane fixed the native
+path — the reported #1234 — because native had the only clean seam at the time:
+the runtime already links as a separate object (the owner), so pinning that one
+object to `-O0` contains the scheduler without touching program code. The default
+C backend is a *single* TU (program + `runtime.h` inlined), calling the runtime's
+`static` scheduler functions by name, inline at -O2.
+
+#1238 gave the C path the same owner-object seam by routing the suspend-point ops
+to the owner via a linkage macro (`KAI_SCHED_FN`): they are `static` in the
+self-contained single-TU compile (sound under gcc, byte-identical), and `extern`
+under separate compilation so the program TU references them and DCE drops the
+whole scheduler closure, leaving the -O0 owner to define them. The emitter did
+NOT change — the `.c` stays self-contained, so the 215 single-TU Makefile recipes
+keep working. See `docs/lane-experience-issue-1238.md` for the full mechanism
+(and why the tempting "emit → `kaix_*`" route was implemented, then reverted for
+breaking the self-contained `.c` contract). Both C paths (single-TU + modular #748)
+are covered by the new `test-mn-c-clang-soundness` gate. Not a regression — it was
+always latent, and sound in CI where the default `cc` is gcc.
 
 ## Traps that cost time (for the next lane)
 
