@@ -83,6 +83,21 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Since the #1234 hot/owner split the runtime bitcode is LEAF-ONLY: a native
+# object references main, the singletons, the scheduler, and every non-leaf
+# kaix_* as external — they come from the cc-compiled runtime OWNER object
+# (KAI_RUNTIME_OWNER), exactly as bin/kai's native link resolves them. Compile
+# it ONCE here (not per fixture). -O0 so the scheduler's swapcontext-crossing
+# code is not thread-pointer-hoisted under clang (issue #1234).
+OWNER_O=""
+if [ -n "$RUNTIME_LLVM_BC" ]; then
+  OWNER_O="$WORK/native-parity-owner.o"
+  "$CC" -std=c99 -Wno-unused-function -O0 \
+    -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
+    -I "$ROOT/stage2" -I "$ROOT/stage0" -c "$RUNTIME_LLVM_C" -o "$OWNER_O" \
+    || { echo "test-native-parity FAIL — runtime owner object build failed"; exit 1; }
+fi
+
 pass=0
 fail=0
 
@@ -109,11 +124,12 @@ for fix in "$FIXDIR"/*.kai; do
     fail=$((fail + 1))
     continue
   fi
-  # With the bitcode linked in-process, the object is self-contained (it
-  # defines main + every kaix_*), so re-adding runtime_llvm.c would be a
-  # duplicate symbol. Without it, link runtime_llvm.c as before.
+  # With the leaf-only hot bitcode linked in-process, the object needs the cc
+  # runtime OWNER object for main + the singletons + the scheduler + non-leaf
+  # kaix_* (compiled once above). Without the bitcode, link runtime_llvm.c
+  # whole as before (self-contained legacy path).
   if [ -n "$RUNTIME_LLVM_BC" ]; then
-    nlink_cmd='"$CC" "$obj" -o "$nbin" -lm'
+    nlink_cmd='"$CC" "$obj" "$OWNER_O" -o "$nbin" -lm'
   else
     nlink_cmd='"$CC" "$obj" "$RUNTIME_LLVM_C" -I "$ROOT/stage2" -I "$ROOT/stage0" -o "$nbin" -lm'
   fi

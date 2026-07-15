@@ -112,23 +112,52 @@ if [ "$mode" != "--force" ] && [ -f "$BC_OUT" ] && [ -f "$BC_INLINE" ] && [ -f "
   exit 0    # fresh — nothing to do
 fi
 
+# HOT/OWNER SPLIT. Both bitcodes are compiled -DKAI_HOT_ONLY: clang -O2
+# hoists the thread pointer across swapcontext, which is unsound for a fiber
+# work-stolen onto another OS thread (see runtime_llvm.c's header note). Under
+# KAI_HOT_ONLY this TU exposes ONLY the leaf value/RC/arithmetic ops that never
+# reach swapcontext — safe to inline. The scheduler + everything that suspends
+# a fiber comes from the cc-compiled runtime OWNER object (gcc keeps the thread
+# pointer honest), linked by bin/kai on both native paths. Because main + the
+# scheduler are now owner-only, the hot bitcode carries no internal runtime
+# state either, so both twins compile with KAI_SEPARATE_COMPILATION (state
+# `external`, owner-defined).
+#
 # Same -I order as the cc link (stage2 ahead of stage0) so <runtime.h> binds
 # to the Koka runtime, and the same -O2 the C path gets, so the runtime's own
 # static helpers are pre-optimised. The target data layout is the build
 # host's native one (clang's default) — exactly what the in-process module
 # carries on this platform, so the link is layout-correct by construction.
 "$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -emit-llvm -c \
+  -DKAI_HOT_ONLY=1 -DKAI_SEPARATE_COMPILATION=1 \
   -I "$ROOT/stage2" -I "$ROOT/stage0" \
   "$RUNTIME_C" -o "$BC_OUT"
 
-# The separate-compilation twin: identical flags plus KAI_SEPARATE_COMPILATION,
-# so the state globals are `external` and the native-modular merge does not
-# duplicate them per partition. The runtime owner object (compiled by bin/kai
-# with KAI_RUNTIME_OWNER) defines them.
+# The native-modular twin. Identical flags today (the split made the two
+# bitcodes content-identical), kept as a distinct artifact so the two native
+# link paths can evolve independently and their staleness keys stay separate.
 "$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -emit-llvm -c \
-  -DKAI_SEPARATE_COMPILATION=1 \
+  -DKAI_HOT_ONLY=1 -DKAI_SEPARATE_COMPILATION=1 \
   -I "$ROOT/stage2" -I "$ROOT/stage0" \
   "$RUNTIME_C" -o "$BC_INLINE"
+
+# Soundness gate for the split: the hot bitcode must contain NO function that
+# reaches swapcontext. If clang compiled a suspend-point op into it, that op
+# would be miscompiled under work-stealing. A defined-or-referenced swapcontext
+# in the bitcode means a KAI_HOT_ONLY gate is missing — fail the build loudly
+# rather than ship an unsound runtime.
+if command -v llvm-nm >/dev/null 2>&1; then LLVM_NM=llvm-nm
+elif command -v llvm-nm-18 >/dev/null 2>&1; then LLVM_NM=llvm-nm-18
+else LLVM_NM=""; fi
+if [ -n "$LLVM_NM" ]; then
+  for bc in "$BC_OUT" "$BC_INLINE"; do
+    if "$LLVM_NM" "$bc" 2>/dev/null | grep -q swapcontext; then
+      echo "gen-runtime-bc: FATAL — $bc references swapcontext; a KAI_HOT_ONLY gate is missing in runtime_llvm.c." >&2
+      rm -f "$BC_OUT" "$BC_INLINE" "$STAMP"
+      exit 3
+    fi
+  done
+fi
 
 echo "$want" > "$STAMP"
 echo "gen-runtime-bc: generated $BC_OUT + $BC_INLINE ($("$CLANG" --version | sed -n 1p))" >&2
