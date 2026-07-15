@@ -50,7 +50,35 @@
  * sibling stage0 runtime regardless of `-I` order. `<runtime.h>` skips
  * the file's directory and obeys the `-I` search path, where the link
  * lines place stage2 ahead of stage0 — exactly the resolution the
- * C-backend already relies on. */
+ * C-backend already relies on.
+ *
+ * HOT/OWNER SPLIT (KAI_HOT_ONLY). The native backend links a clang-O2
+ * copy of this TU as bitcode and MERGES it into the program module so O2
+ * inlines the hot value/RC/arithmetic ops. That is sound only for leaf
+ * ops: clang -O2 treats the thread pointer as call-invariant and caches
+ * it (in a callee-saved register, spilled) across any call — including
+ * swapcontext. Under M:N work-stealing a fiber resumes on a DIFFERENT OS
+ * thread, so a cached thread pointer then addresses the creator thread's
+ * _Thread_local scheduler state (kai_active_fiber, kai_pending_free,
+ * kai_main_fiber): two threads share one `active`, the scheduler
+ * cross-wires, and a live fiber's stack is freed under it. gcc does not
+ * hoist the thread pointer across swapcontext; the same header is sound
+ * built with cc.
+ *
+ * So the runtime splits in two, along one macro:
+ *   - KAI_HOT_ONLY (this file, compiled to bitcode): ONLY the leaf ops —
+ *     value/RC/arithmetic/string/list/variant/record/bit + TRMC — that
+ *     never reach swapcontext. Safe to inline via clang -O2.
+ *   - the OWNER TU (this file, compiled by cc): the full runtime,
+ *     including everything gated out below (effects, evidence,
+ *     continuations, handlers, the scheduler, actors, `main`). cc keeps
+ *     the thread pointer honest across every context switch.
+ * Both native link paths (whole-program and modular) merge the hot
+ * bitcode and link the cc owner object. The invariant is mechanical:
+ * `llvm-nm` on the hot bitcode must show NO reference to swapcontext.
+ * Over-gating an op is harmless (the owner TU still defines it; it just
+ * is not inlined); under-gating a suspend-point op is unsound, which the
+ * swapcontext check catches. */
 #include <runtime.h>
 #include <stddef.h>
 
@@ -1071,12 +1099,18 @@ KaiValue *kaix_core_mailbox_alloc(void)                               { return k
 KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) { return kai_core_mailbox_alloc_bounded(cap, overflow); }
 KaiValue *kaix_core_mailbox_alloc_unowned(void)                       { return kai_core_mailbox_alloc_unowned(); }
 KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) { return kai_core_mailbox_alloc_bounded_unowned(cap, overflow); }
+/* KAI_HOT_ONLY: these mailbox/actor ops reach the scheduler (recv parks
+ * through swapcontext, spawn_actor_fiber schedules a fiber). They must
+ * NOT be compiled into the inlinable hot bitcode — see the header note on
+ * the hot/owner split. The owner TU (cc, not clang) carries them. */
+#if !defined(KAI_HOT_ONLY)
 KaiValue *kaix_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) { return kai_core_mailbox_assign_owner(pid, fiber); }
 KaiValue *kaix_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk) { return kai_core_spawn_actor_fiber(pid, thunk); }
 KaiValue *kaix_core_mailbox_send(KaiValue *pid, KaiValue *msg)        { return kai_core_mailbox_send(pid, msg); }
 KaiValue *kaix_core_mailbox_recv(KaiValue *pid)                       { return kai_core_mailbox_recv(pid); }
 KaiValue *kaix_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns) { return kai_core_mailbox_recv_timeout(pid, ns); }
 KaiValue *kaix_core_mailbox_free(KaiValue *pid)                       { return kai_core_mailbox_free(pid); }
+#endif /* !KAI_HOT_ONLY */
 /* Lane 4 (#473) Byte primitive ops. Mirrors the C-side core
  * table; needed at link time when the LLVM emit references
  * @kaix_core_byte_* (e.g. via stdlib/protocols.kai's
@@ -1118,7 +1152,16 @@ KaiValue *kaix_core_unit_name(KaiValue *x)                            { if (x) k
  * helpers in runtime.h. The LLVM IR can only see externally-
  * linkable symbols, so these thin shims expose every helper the
  * effects ABI needs (push/pop, lookup, cont init/resume,
- * default-handler clauses for the catalog builtins). */
+ * default-handler clauses for the catalog builtins).
+ *
+ * KAI_HOT_ONLY: this whole effects/evidence/continuation/handler block
+ * (down to the TRMC section) is the runtime's suspend surface — its
+ * functions hold fiber-local scheduler state across calls that reach
+ * swapcontext. Under work-stealing a fiber resumes on a different OS
+ * thread, and clang -O2 caches the thread pointer across the switch, so
+ * this code MUST be compiled by cc (the owner TU), never into the
+ * inlinable hot bitcode. Gated out here; the owner TU carries it. */
+#if !defined(KAI_HOT_ONLY)
 KaiHandlerId kaix_fresh_handler_id(void) { return kai_fresh_handler_id(); }
 
 void kaix_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
@@ -1803,6 +1846,8 @@ KaiValue *kaix_proto_dispatch3(KaiValue *pid, KaiValue *op, KaiValue *pname, Kai
     return ((KaiValue *(*)(KaiValue *, KaiValue *, KaiValue *)) fn)(a0, a1, a2);
 }
 
+#endif /* !KAI_HOT_ONLY — end of effects/scheduler owner-only block */
+
 /* ---------- TRMC constructor-context (issue #668, LLVM backend) ----------
  *
  * The C backend lowers a modulo-cons tail leaf with the inline
@@ -1869,7 +1914,11 @@ KaiValue *kaix_cctx_extend(KaiValue *res, KaiValue **hole, KaiValue *child) {
 }
 
 /* Entry point: the LLVM output defines kai_main. Match what the C
-   backend's emit_main_wrapper does. */
+   backend's emit_main_wrapper does. `main` drives kai_sched_bootstrap
+   (the scheduler entry), so it belongs to the owner TU, not the hot
+   bitcode — gated out under KAI_HOT_ONLY like the rest of the scheduler
+   surface. */
+#if !defined(KAI_HOT_ONLY)
 extern KaiValue *kai_main(void);
 
 int main(int argc, char **argv) {
@@ -1884,3 +1933,4 @@ int main(int argc, char **argv) {
     kai_decref(result);
     return 0;
 }
+#endif /* !KAI_HOT_ONLY */
