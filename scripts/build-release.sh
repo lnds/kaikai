@@ -167,6 +167,10 @@ chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
 # share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
+# The minimal C-backend runtime owner (issue #1238): the C split's -O0 owner
+# object, next to runtime.h so bin/kai's RUNTIME_OWNER_C resolves it here in the
+# installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
+cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 
 # P2 (docs/native-codegen-perf-plan.md §P2): ship the native-runtime bitcode
 # so the installed `kai build --backend=native` links it before O2 and

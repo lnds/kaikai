@@ -90,8 +90,64 @@
  * ledgers need no lock on the hot path. Under a single thread `_Thread_local`
  * is semantically identical to a plain global, so N=1 stays byte-identical.
  * Every global carrying KAI_TLS is classified `tls` in the audit gate
- * (tools/runtime-globals.allow). */
+ * (tools/runtime-globals.allow).
+ *
+ * Under separate compilation (the -O0 owner split, #1238) these become `extern`
+ * across objects, which defaults to the general-dynamic TLS model (resolved via
+ * __tls_get_addr). Pin initial-exec: it resolves the address off the thread
+ * pointer directly (like the single-TU `static` local-exec), which TSAN models
+ * as thread-private — general-dynamic's opaque __tls_get_addr otherwise trips
+ * TSAN into a false cross-thread race on per-thread state. Sound because the
+ * owner links statically (initial-exec forbids dlopen, not static link), and
+ * orthogonal to the #1234 hoist (that cached the thread-pointer BASE across
+ * swapcontext; this pins the resolution MODE, not the base — the -O0 owner
+ * still closes the hoist). */
+#if defined(KAI_SEPARATE_COMPILATION) && (defined(__GNUC__) || defined(__clang__))
+#define KAI_TLS _Thread_local __attribute__((tls_model("initial-exec")))
+#else
 #define KAI_TLS _Thread_local
+#endif
+
+/* Linkage of the fiber suspend-point ops the C backend calls by name — the
+ * mailbox recv/send surface, spawn_actor, kai_sched_bootstrap, and every
+ * default effect handler that parks a fiber (Spawn, the reactor-backed NetTcp /
+ * Stdin / Clock / Process / Signal). Default `static` keeps the single-TU C
+ * path auto-contained and byte-identical (sound under gcc). Under separate
+ * compilation these move to the owner object: the owner defines them with
+ * external linkage, the program TU sees a prototype. Load-bearing for soundness
+ * — the owner is pinned to -O0 (KAI_RUNTIME_OWNER_OPT), because clang -O1+
+ * caches the thread pointer across swapcontext, and a fiber work-stolen onto
+ * another OS thread would then read the creator thread's scheduler TLS. A
+ * program TU compiled -O2 no longer holds these definitions — it references
+ * them, so DCE drops the whole suspend-point closure they anchor (kai_sched_park,
+ * the reactor, the trampoline), leaving nothing for the optimiser to mishoist.
+ * The set is exactly the ops reachable from emitted code that transitively hit
+ * swapcontext; a leaf op that slips in is caught by a build-time `nm` assert.
+ * The axis is KAI_SEPARATE_COMPILATION (linkage), orthogonal to KAI_HOT_ONLY
+ * (which governs the native bitcode's shim elision). */
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_SCHED_FN
+#  else
+#    define KAI_SCHED_FN extern
+#  endif
+#else
+#  define KAI_SCHED_FN static
+#endif
+/* Its body is present in the owner and single-TU builds, elided to a bare
+ * prototype in a non-owner separate-compilation TU:
+ *   KAI_SCHED_FN <ret> name(args)
+ *   #if KAI_SCHED_DECL_ONLY
+ *   ;
+ *   #else
+ *   { ...body... }
+ *   #endif
+ * The body is never wrapped in a macro — compiler errors and byte-id stay honest. */
+#if defined(KAI_SEPARATE_COMPILATION) && !defined(KAI_RUNTIME_OWNER)
+#  define KAI_SCHED_DECL_ONLY 1
+#else
+#  define KAI_SCHED_DECL_ONLY 0
+#endif
 
 /* Number of OS scheduler threads (M:N). Read once from KAI_THREADS at
  * startup (kai_sched_bootstrap), immutable after — published before any
@@ -7845,12 +7901,17 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
  * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
  * synchronously. Consumes `pid` (the caller keeps its own Pid handle). */
 static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
-static KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk) {
+KAI_SCHED_FN KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
     KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
     if (pid) kai_decref(pid);
     return f;
 }
+#endif
 
 static KaiValue *kai_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
     int c = (kai_is_int(cap)) ? (int) kai_intf(cap) : 0;
@@ -7875,7 +7936,11 @@ static KaiValue *kai_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue 
     return r;
 }
 
-static KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg) {
+KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
@@ -7903,8 +7968,13 @@ static KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg) {
     kai_decref(pid);
     return kai_unit();
 }
+#endif
 
-static KaiValue *kai_core_mailbox_recv(KaiValue *pid) {
+KAI_SCHED_FN KaiValue *kai_core_mailbox_recv(KaiValue *pid)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
         exit(1);
@@ -7916,12 +7986,17 @@ static KaiValue *kai_core_mailbox_recv(KaiValue *pid) {
     kai_decref(pid);
     return msg;
 }
+#endif
 
 /* Receive within a deadline. `timeout_nanos` is a relative nanosecond
  * budget; returns `Some(msg)` if a message arrives in time, `None` if
  * the deadline elapses first. Mirrors `kai_core_mailbox_recv`'s
  * callee-consumes-clean discipline for the input `pid` ref. */
-static KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos) {
+KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
         exit(1);
@@ -7936,6 +8011,7 @@ static KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_
     }
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
+#endif
 
 /* Free the mailbox attached to a Pid. Called by `with_mailbox` when
  * the scope exits; the Pid value itself is RC-managed independently. */
@@ -9891,7 +9967,11 @@ static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
  * it when POLLIN / POLLHUP arrives on STDIN_FILENO. Multiple
  * concurrent readers are a logic bug (the bytes shred between
  * fibers); the second reader panics with a clear diagnostic. */
-static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     kai_reactor_stdin_set_nonblocking();
@@ -9948,6 +10028,7 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
         }
     }
 }
+#endif
 
 /* Issue #453 + #620 — Phase R3: default Stdin.read_bytes handler.
  * Returns a String of at most `n` raw bytes; on EOF the returned
@@ -9957,7 +10038,11 @@ static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
  * R3 wiring: same shape as read_line — non-blocking read() loop
  * with reactor parking on EAGAIN. The buffer is sized once up
  * front so partial reads accumulate without realloc. */
-static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int64_t want = 0;
     if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
@@ -10000,6 +10085,7 @@ static KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *
     free(buf);
     return kai_cont_resume(k, s);
 }
+#endif
 
 /* m7a #7: default Env handlers. `args()` reuses kai_core_args
  * (returns a [String] of argv[1..]); `var(name)` wraps getenv:
@@ -10413,7 +10499,11 @@ static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
         (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
 }
 
-static KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
     if (ns_v > 0) {
@@ -10426,6 +10516,7 @@ static KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k
     }
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* =================================================================
  * NetTcp default handler (net-tcp-v1)
@@ -10511,7 +10602,11 @@ static int _kai_net_record_fd(KaiValue *v) {
  * connect() itself does not run a second time. EAGAIN/EWOULDBLOCK
  * is not a documented connect() outcome and is treated identically
  * to EINPROGRESS for safety. */
-static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
         return _kai_net_err_msg(k, "connect: bad arguments");
@@ -10581,6 +10676,7 @@ static KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue
     KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = conn}});
     return kai_cont_resume(k, ok);
 }
+#endif
 
 /* listen(host, port) -> Result[Listener, String]. host = "" or
  * "0.0.0.0" binds INADDR_ANY; specific IPv4 string also works.
@@ -10668,7 +10764,11 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
  * we set it explicitly via kai_socket_set_nonblock on the returned
  * fd so subsequent send/recv on the Conn also park rather than
  * blocking. */
-static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int lfd = _kai_net_record_fd(l);
     if (lfd < 0) return _kai_net_err_msg(k, "accept: invalid listener");
@@ -10698,6 +10798,7 @@ static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) 
         return _kai_net_err(k, errno);
     }
 }
+#endif
 
 /* send(c, data) -> Result[Int, String]. data is a [Byte] = [Int]
  * cons list; each element is taken mod 256. v1 walks the list once
@@ -10712,7 +10813,11 @@ static KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) 
  * bytes written — equal to the input length on success. The
  * pre-R2 contract that "callers may have to loop" is honoured
  * internally so user code never sees a short write. */
-static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "send: invalid conn");
@@ -10776,6 +10881,7 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
     KaiValue *ok  = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = cnt}});
     return kai_cont_resume(k, ok);
 }
+#endif
 
 /* recv(c, max) -> Result[[Byte], String]. max = 0 panics per spec
  * (no useful "read zero bytes"); negative max is treated the same.
@@ -10789,7 +10895,11 @@ static KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data
  * read-readiness and retries. A single recv call returns whatever
  * the kernel has buffered; callers loop at the user level if they
  * need an exact byte count (matches POSIX recv semantics). */
-static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
@@ -10827,6 +10937,7 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
     KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
     return kai_cont_resume(k, ok);
 }
+#endif
 
 /* recv_timeout(c, max, nanos) -> Option[Result[String, [Int]]]. The
  * socket-side dual of Actor.receive_timeout: park on read-readiness and
@@ -10834,9 +10945,13 @@ static KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max,
  * list dual-park). `None` = deadline elapsed before any byte; `Some(Ok
  * (bytes))` = data (or `Ok([])` on a clean EOF); `Some(Err(msg))` = a
  * transport error. Three-way distinguishable, as the DoS fix requires. */
-static KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
                                                  KaiValue *max, KaiValue *ns,
-                                                 KaiCont *k) {
+                                                 KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "recv_timeout: invalid conn");
@@ -10886,6 +11001,7 @@ static KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
     KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = ok}});
     return kai_cont_resume(k, some);
 }
+#endif
 
 /* close(c) -> Unit. Spec says errors from close(2) are logged and
  * swallowed — the user can do nothing useful with the value, and
@@ -11365,7 +11481,11 @@ static KaiValue *kai_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k)
  * still wakes the caller. R4 path: park on the singleton signal
  * waiter slot, yield to the scheduler, and resume when the reactor
  * drains the self-pipe. The signo arrives in reactor_wait_status. */
-static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     _kai_signal_init_subscribed();
     /* Defensive SIGINT subscription if nothing has been on()'d —
@@ -11408,6 +11528,7 @@ static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
         }
     }
 }
+#endif
 
 /* =================================================================
  * Process effect — issue #126. POSIX subprocess primitives.
@@ -11611,7 +11732,11 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
  * the parking fiber is mid-park is handled by the drain helper at
  * the next reactor wait (or immediately if the byte was already
  * pending in the self-pipe). */
-static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int pid = _kai_process_record_pid(child);
     if (pid <= 0) {
@@ -11647,6 +11772,7 @@ static KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *
     KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = exit_v}});
     return kai_cont_resume(k, ok);
 }
+#endif
 
 /* kill(c, sig) -> Result[Unit, String]. Maps directly to kill(2);
  * sig is taken as a raw signo Int (full POSIX set including
@@ -13621,7 +13747,11 @@ static int kai_read_nthreads(void) {
  * fibers spawned for main, byte-identical. At N>1 it starts the worker
  * pool, runs kai_main as a fiber on thread 0, drives thread 0's
  * scheduler loop until the program quiesces, then joins the workers. */
-static KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void)) {
+KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     kai_nthreads = kai_read_nthreads();
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
@@ -13677,6 +13807,7 @@ static KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void)) {
     free(root);
     return kai_user_main_result;
 }
+#endif
 
 /* m8.x: default Spawn handlers backed by the cooperative scheduler.
  * spawn(thunk)        — alloc fiber + enqueue; thunk runs later.
@@ -13697,11 +13828,16 @@ static KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void)) {
  * contract stayed "callee borrows".
  *
  * Spec: docs/fibers-impl.md §*Yield-point list* and §*Trampoline*. */
-static KaiValue *kai_default_spawn_yield(void *self, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_sched_yield();
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* Shared spawn body for Spawn.spawn and spawn_actor. Builds the fiber,
  * optionally stamps `stamp_mb` as its mailbox BEFORE enqueue (so the
@@ -13770,13 +13906,22 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMai
     return v;
 }
 
-static KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     KaiValue *v = kai_spawn_fiber_stamped(thunk, NULL);
     return kai_cont_resume(k, v);
 }
+#endif
 
-static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
         fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
@@ -13811,8 +13956,13 @@ static KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k
     KaiValue *r = f->result ? kai_incref(f->result) : kai_unit();
     return kai_cont_resume(k, r);
 }
+#endif
 
-static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     if (!fibs_v || (fibs_v->tag != KAI_CONS && fibs_v->tag != KAI_NIL)) {
         fprintf(stderr, "kai: Spawn.select called on non-list value\n");
@@ -13855,6 +14005,7 @@ static KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont 
     }
     return kai_cont_resume(k, kai_incref(head->result));
 }
+#endif
 
 /* Issue #679: detach `target` from whatever reactor waiter list it
  * sits on (if any). Returns 1 if the fiber was found and removed
@@ -13897,7 +14048,11 @@ static int kai_reactor_detach_fiber(KaiFiber *target) {
     return 0;
 }
 
-static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
         KaiFiber *target = fib_v->as.fib;
@@ -13929,6 +14084,7 @@ static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *
     }
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* Tier 2 trap-exit: set the current fiber's trap_exit flag from a
  * Bool argument. With trap_exit=1, a linked peer's termination
@@ -13937,19 +14093,28 @@ static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *
  * have a mailbox (typically via with_mailbox) for the delivery to
  * land; without one, the propagation falls back to cancel_requested.
  * Spec: docs/actors.md §*Trap-exit semantics*. */
-static KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     KaiFiber *f = kai_current_fiber();
     int v = (on && on->tag == KAI_BOOL && on->as.b) ? 1 : 0;
     f->trap_exit = v;
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* Issue #959 — open a structured-concurrency scope on the current
  * fiber. Subsequent `Spawn.spawn` calls register their child on this
  * scope's children list; `nursery_exit` joins them all. Scopes nest:
  * the new scope's `parent` is the fiber's previous `nursery_top`. */
-static KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     KaiFiber *f = kai_current_fiber();
     KaiNursery *n = (KaiNursery *) calloc(1, sizeof(KaiNursery));
@@ -13959,6 +14124,7 @@ static KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k) {
     f->nursery_top   = n;
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* Park the current fiber on `child`'s awaiter chain until it reaches
  * DONE or CANCELLED. Mirrors the await park; no result is read — the
@@ -13994,7 +14160,11 @@ static void kai_nursery_cancel_siblings(KaiFiber *head) {
  * scope's refs, and re-raise via the current fiber's cancel_pad so
  * the failure propagates out of the nursery body. On a clean drain
  * just release the refs and return unit. */
-static KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     KaiFiber   *f     = kai_current_fiber();
     KaiNursery *scope = f->nursery_top;
@@ -14050,6 +14220,7 @@ static KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k) {
     }
     return kai_cont_resume(k, kai_unit());
 }
+#endif
 
 /* m8 #4 + Phase 3: default Cancel.raise handler. Doc B §`Cancel`/
  * Default handler: an unhandled Cancel.raise() unwinds the fiber

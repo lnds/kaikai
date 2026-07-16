@@ -1928,8 +1928,10 @@ KaiValue *kaix_cctx_extend(KaiValue *res, KaiValue **hole, KaiValue *child) {
    backend's emit_main_wrapper does. `main` drives kai_sched_bootstrap
    (the scheduler entry), so it belongs to the owner TU, not the hot
    bitcode — gated out under KAI_HOT_ONLY like the rest of the scheduler
-   surface. */
-#if !defined(KAI_HOT_ONLY)
+   surface. Emitted only when this owner is the sole provider of the entry
+   point: the C backend's program TU emits its own `main`, so its owner
+   object declares KAI_PROGRAM_PROVIDES_MAIN to suppress this one. */
+#if !defined(KAI_HOT_ONLY) && !defined(KAI_PROGRAM_PROVIDES_MAIN)
 extern KaiValue *kai_main(void);
 
 int main(int argc, char **argv) {
