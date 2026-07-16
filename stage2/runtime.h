@@ -2729,7 +2729,12 @@ typedef enum {
     KAI_FIBER_RUNNING   = 2,  /* m8.x */
     KAI_FIBER_PARKED    = 3,  /* m8.x */
     KAI_FIBER_DONE      = 4,
-    KAI_FIBER_CANCELLED = 5
+    KAI_FIBER_CANCELLED = 5,
+    /* In transit RUNNING->PARKED: the owner is mid-park, ctx not yet
+     * saved. Not enqueueable — a cross-thread unpark that sees PARKING
+     * only latches wake_pending; the owner's post-swap commit publishes
+     * PARKED (or re-readies on the latch) once the ctx is provably saved. */
+    KAI_FIBER_PARKING   = 6
 } KaiFiberState;
 
 typedef struct KaiFiber   KaiFiber;
@@ -2882,12 +2887,16 @@ struct KaiFiber {
      * taken, and an _Atomic int is a plain aligned int on our targets. */
     _Atomic int home_thread;
     /* M:N — a cross-thread wake that arrives while this fiber is still
-     * RUNNING (it enqueued its recv-waiter but has not yet reached the
-     * park swap) is recorded here instead of lost. The park path checks
-     * it after marking PARKED and re-readies itself if non-zero, closing
-     * the enqueue-waiter / park lost-wakeup window. Touched only under
-     * the owner slot lock. */
+     * RUNNING or PARKING (not yet genuinely PARKED) is latched here. The
+     * post-swap commit consumes it to re-ready instead of publishing
+     * PARKED, closing the enqueue-waiter / park lost-wakeup window. */
     int wake_pending;
+    /* M:N — per-fiber lock for the life-state triple (state, wake_pending).
+     * park / commit_park / remote_unpark all take THIS lock, not the slot
+     * lock: a fiber can run a moment on a thread != home_thread, so keying
+     * off the slot would let those sites use different locks and lose the
+     * happens-before. Lock order is fiber->mu FIRST, slot->mu SECOND. */
+    pthread_mutex_t mu;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -2935,7 +2944,8 @@ struct KaiNursery {
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
     NULL, NULL,          /* nursery_top, scope_sibling_next */           \
     0,                   /* home_thread — thread 0 is the main scheduler */ \
-    0                    /* wake_pending */                              \
+    0,                   /* wake_pending */                              \
+    PTHREAD_MUTEX_INITIALIZER  /* mu — per-fiber life-state lock */       \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -3018,6 +3028,35 @@ KAI_TLS int kai_thread_id = 0;
 #  endif
 #else
 static KAI_TLS int kai_thread_id = 0;
+#endif
+
+/* Deferred slot-lock release for the park handoff. A parking fiber holds
+ * its slot lock across the swap that saves its ctx, then hands the lock
+ * to the scheduler loop (the swap target) to release once the ctx is
+ * saved — so the fiber is published READY/stealable only after it is
+ * safe to resume from another thread. Ordering "ctx saved" before
+ * "stealable" under one lock is what kills the cross-thread ctx race. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS pthread_mutex_t *kai_pending_unlock;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS pthread_mutex_t *kai_pending_unlock = NULL;
+#  endif
+#else
+static KAI_TLS pthread_mutex_t *kai_pending_unlock = NULL;
+#endif
+
+/* The fiber this thread just parked (RUNNING->PARKING) and swapped away
+ * from. The scheduler loop commits it (PARKED, or re-ready on a latched
+ * wake) right after the swap-in returns control here — the point where
+ * the parked fiber's ctx is provably saved. One pointer suffices: a
+ * thread cedes exactly one fiber per swap. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber *kai_last_parked;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber *kai_last_parked = NULL;
+#  endif
+#else
+static KAI_TLS KaiFiber *kai_last_parked = NULL;
 #endif
 
 /* Per-thread scheduler slot: this thread's ready deque, the single
@@ -13171,19 +13210,43 @@ static void kai_sched_enqueue(KaiFiber *f) {
     kai_ready_tail = f;
 }
 
-static KaiFiber *kai_sched_dequeue(void) {
-    if (kai_nthreads > 1) {
-        KaiSchedSlot *s = kai_sched_slot();
+/* Pop the head of slot `s` AND flip it READY->RUNNING as one indivisible
+ * act, returning a fiber this thread now owns and runs. Global lock order
+ * is fiber->mu FIRST, slot->mu nested: read the head pointer under the
+ * slot lock (no removal), then re-lock fiber->mu then slot->mu and confirm
+ * the head is unchanged and still READY before removing + flipping. A
+ * stale head (stolen/re-parked between the peek and re-lock) fails the
+ * confirm and we retry — never touching a fiber another thread already
+ * took. Making pop and the RUNNING flip atomic closes the "out of the
+ * deque but still READY" window that let commit/remote_unpark re-enqueue
+ * an already-dispatched fiber (double-dispatch). */
+static KaiFiber *kai_sched_pop_and_run(KaiSchedSlot *s) {
+    for (;;) {
         pthread_mutex_lock(&s->mu);
-        KaiFiber *f = s->steal_head;
-        if (f) {
-            s->steal_head = f->sched_next;
+        KaiFiber *head = s->steal_head;
+        pthread_mutex_unlock(&s->mu);
+        if (!head) return NULL;
+
+        pthread_mutex_lock(&head->mu);
+        pthread_mutex_lock(&s->mu);
+        if (s->steal_head == head && head->state == KAI_FIBER_READY) {
+            s->steal_head = head->sched_next;
             if (!s->steal_head) s->steal_tail = NULL;
-            f->sched_next = NULL;
+            head->sched_next = NULL;
+            head->home_thread = kai_thread_id;
+            head->state = KAI_FIBER_RUNNING;
+            pthread_mutex_unlock(&s->mu);
+            pthread_mutex_unlock(&head->mu);
+            return head;
         }
         pthread_mutex_unlock(&s->mu);
-        return f;
+        pthread_mutex_unlock(&head->mu);
+        /* head changed under us (stolen / re-parked): retry the peek. */
     }
+}
+
+static KaiFiber *kai_sched_dequeue(void) {
+    if (kai_nthreads > 1) return kai_sched_pop_and_run(kai_sched_slot());
     KaiFiber *f = kai_ready_head;
     if (!f) return NULL;
     kai_ready_head = f->sched_next;
@@ -13192,26 +13255,15 @@ static KaiFiber *kai_sched_dequeue(void) {
     return f;
 }
 
-/* Steal one fiber from the head of thread `victim`'s ready queue,
- * serialized against that thread's owner by the slot lock. Steal
- * granularity is one fiber (a pointer move). The stolen fiber's
- * home_thread is retargeted to the thief: it now runs, parks, and frees
- * on the thief's thread, so its non-atomic-RC heap stays single-threaded.
- * A fiber only migrates while READY — never mid-run — so nothing on its
- * suspended stack references the victim thread's TLS. */
+/* Steal one fiber from thread `victim`'s ready queue and start running it.
+ * Same pop+flip-RUNNING atomicity as the local dequeue (kai_sched_pop_and_run):
+ * the stolen fiber's home_thread is retargeted to the thief and its state
+ * goes RUNNING under both locks, so a concurrent unpark reading it sees a
+ * consistent RUNNING and never re-enqueues onto the slot it just left. */
 static KaiFiber *kai_sched_steal_from(int victim) {
     KaiSchedSlot *s = &kai_sched_slots[victim];
     if (!s->live) return NULL;
-    pthread_mutex_lock(&s->mu);
-    KaiFiber *f = s->steal_head;
-    if (f) {
-        s->steal_head = f->sched_next;
-        if (!s->steal_head) s->steal_tail = NULL;
-        f->sched_next = NULL;
-    }
-    pthread_mutex_unlock(&s->mu);
-    if (f) f->home_thread = kai_thread_id;
-    return f;
+    return kai_sched_pop_and_run(s);
 }
 
 /* Forward decl: the trampoline drives a fiber's body and walks its
@@ -13279,6 +13331,7 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
     f->ctx.uc_stack.ss_size = f->stack_size;
     f->ctx.uc_link          = &kai_main_fiber.ctx;
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
+    pthread_mutex_init(&f->mu, NULL);
 }
 
 /* ==================================================================
@@ -13322,23 +13375,23 @@ static void kai_sched_wake_thread(int tid) {
     }
 }
 
-/* Promote a fiber owned by another thread from PARKED to READY and make
- * it runnable on its home thread, then wake that thread. Called from a
- * cross-thread mailbox send (the sender runs here, the receiver's home
- * is elsewhere). The state flip is serialized on the target's slot lock
- * so it composes with the target's own park path (which sets PARKED
- * under the same lock via kai_sched_park_remote_safe below). */
+/* Promote a fiber owned by another thread and make it runnable on its
+ * home thread, then wake that thread. Called from a cross-thread mailbox
+ * send. Serialized on the target's OWN lock (target->mu), which park and
+ * commit_park also take, so the life-state triple composes even when the
+ * target briefly ran on a thread != its home. Only a genuinely PARKED
+ * target enqueues; PARKING (in transit, ctx not yet saved) or RUNNING
+ * only latch wake_pending — the target's post-swap commit rescues it,
+ * which is what keeps a fiber from being RUNNING-in-owner and READY-
+ * enqueued at once (the double-presence this whole path guards). */
 static void kai_sched_remote_unpark(KaiFiber *target) {
     if (!target) return;
+    pthread_mutex_lock(&target->mu);
     int home = target->home_thread;
-    KaiSchedSlot *s = &kai_sched_slots[home];
-    pthread_mutex_lock(&s->mu);
-    /* The target may still be RUNNING (it enqueued its recv-waiter and
-     * dropped the mailbox lock but has not yet reached park) — record a
-     * pending wake so its park path does not sleep through the message.
-     * If it is already PARKED, flip it READY and enqueue on its slot. */
     if (target->state == KAI_FIBER_PARKED) {
         target->state = KAI_FIBER_READY;
+        KaiSchedSlot *s = &kai_sched_slots[home];
+        pthread_mutex_lock(&s->mu);
         target->sched_next = NULL;
         if (s->steal_tail) s->steal_tail->sched_next = target;
         else               s->steal_head = target;
@@ -13346,9 +13399,34 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
         pthread_mutex_unlock(&s->mu);
     } else {
         target->wake_pending++;
-        pthread_mutex_unlock(&s->mu);
     }
+    pthread_mutex_unlock(&target->mu);
     kai_sched_wake_thread(home);
+}
+
+/* Commit a fiber that just parked (PARKING) and swapped back to this
+ * thread's root. Runs holding the fiber's own lock (kai_pending_unlock ==
+ * &f->mu), so it composes with remote_unpark on the same lock. The
+ * fiber's ctx is provably saved (the swap-out returned here), so a latched
+ * wake can now re-ready it safely; otherwise it becomes genuinely PARKED.
+ * ENQUEUE-ONCE: only the PARKING->READY transition enqueues. */
+static void kai_sched_commit_park(void) {
+    KaiFiber *f = kai_last_parked;
+    if (!f) return;
+    kai_last_parked = NULL;
+    if (f->wake_pending > 0) {
+        f->wake_pending--;
+        f->state = KAI_FIBER_READY;
+        KaiSchedSlot *s = &kai_sched_slots[f->home_thread];
+        pthread_mutex_lock(&s->mu);
+        f->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = f;
+        else               s->steal_head = f;
+        s->steal_tail = f;
+        pthread_mutex_unlock(&s->mu);
+    } else {
+        f->state = KAI_FIBER_PARKED;
+    }
 }
 
 /* The per-thread scheduler loop, run ON this thread's kai_main_fiber
@@ -13364,10 +13442,22 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
 static void kai_worker_loop(void) {
     KaiFiber *self_root = &kai_main_fiber;
     for (;;) {
+        /* Park handoff (gopark): commit the fiber that just parked while
+         * we still hold its lock — its ctx is saved now, so PARKED (or a
+         * latched re-ready) is published only here, never in the entry
+         * path. Then release the held lock. */
+        kai_sched_commit_park();
+        if (kai_pending_unlock) {
+            pthread_mutex_t *m = kai_pending_unlock;
+            kai_pending_unlock = NULL;
+            pthread_mutex_unlock(m);
+        }
         if (kai_sched_shutting_down) return;
+        /* find_work returns a fiber already flipped to RUNNING atomically
+         * with its pop (kai_sched_pop_and_run), so there is no re-flip and
+         * no window where it is out of the deque but still READY. */
         KaiFiber *next = kai_worker_find_work();
         if (next) {
-            next->state = KAI_FIBER_RUNNING;
             kai_active_fiber = next;
             swapcontext(&self_root->ctx, &next->ctx);
             kai_active_fiber = self_root;
@@ -13401,18 +13491,30 @@ static void kai_worker_loop(void) {
  * is the only ready fiber, nothing to switch to). */
 static void kai_sched_yield(void) {
     KaiFiber *current = kai_active_fiber;
-    KaiFiber *next    = kai_sched_dequeue();
+    if (kai_nthreads > 1) {
+        /* Same handoff as park: mark PARKING (not enqueueable yet), cede to
+         * the scheduler root, and let commit re-ready us AFTER the swap has
+         * saved our ctx — a pre-latched wake forces the READY+enqueue branch.
+         * Enqueueing here (before the swap) would publish us stealable with
+         * a half-saved ctx, the exact race park avoids. */
+        pthread_mutex_lock(&current->mu);
+        current->state = KAI_FIBER_PARKING;
+        current->wake_pending++;
+        kai_last_parked = current;
+        kai_pending_unlock = &current->mu;
+        kai_active_fiber = &kai_main_fiber;
+        swapcontext(&current->ctx, &kai_main_fiber.ctx);
+        kai_active_fiber = current;
+        kai_drain_pending_free();
+        return;
+    }
+    KaiFiber *next = kai_sched_dequeue();
     if (!next) return;  /* alone — nothing to yield to */
     current->state = KAI_FIBER_READY;
     kai_sched_enqueue(current);
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
     swapcontext(&current->ctx, &next->ctx);
-    /* Resumed: another fiber yielded/parked back to us; the swap
-     * source (current->ctx) holds the state that was just restored.
-     * R4 fix — if the fiber that swapped to us was the trampoline
-     * tail of a now-discarded fiber, `kai_pending_free` carries its
-     * deferred struct + stack. Reap before continuing. */
     kai_drain_pending_free();
 }
 
@@ -13438,31 +13540,19 @@ static void kai_sched_park(void) {
      * the loop). The lost-wakeup window between a mailbox recv-waiter
      * enqueue and this park is closed by `wake_pending`. */
     if (kai_nthreads > 1) {
-        KaiSchedSlot *s = kai_sched_slot();
-        pthread_mutex_lock(&s->mu);
-        current->state = KAI_FIBER_PARKED;
-        if (current->wake_pending > 0) {
-            /* A cross-thread send already tried to wake us; do not park. */
-            current->wake_pending--;
-            current->state = KAI_FIBER_RUNNING;
-            pthread_mutex_unlock(&s->mu);
-            kai_check_cancel_yield_point();
-            return;
-        }
-        pthread_mutex_unlock(&s->mu);
-
-        KaiFiber *next = kai_sched_dequeue();
-        if (next && next != current) {
-            next->state = KAI_FIBER_RUNNING;
-            kai_active_fiber = next;
-            swapcontext(&current->ctx, &next->ctx);
-        } else {
-            /* No local work: hand control back to the scheduler loop on
-             * this thread's root context, which steals / drives I/O /
-             * idles. We resume here when someone re-readies us. */
-            kai_active_fiber = &kai_main_fiber;
-            swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        }
+        /* gopark: mark PARKING (in transit, not enqueueable), hand the
+         * fiber lock to the scheduler loop, and swap ALWAYS to the thread
+         * root (never fiber->fiber). NO wake_pending check here — that
+         * check ran once in the entry path and reintroduced double-presence
+         * (RUNNING-in-owner + READY-enqueued). The post-swap commit rechecks
+         * wake_pending with the ctx provably saved, publishing PARKED or
+         * re-readying. See kai_sched_commit_park. */
+        pthread_mutex_lock(&current->mu);
+        current->state = KAI_FIBER_PARKING;
+        kai_last_parked = current;
+        kai_pending_unlock = &current->mu;
+        kai_active_fiber = &kai_main_fiber;
+        swapcontext(&current->ctx, &kai_main_fiber.ctx);
         kai_active_fiber = current;
         kai_drain_pending_free();
         kai_check_cancel_yield_point();
@@ -13633,12 +13723,11 @@ static void kai_fiber_trampoline(void) {
      * but we setcontext explicitly so the loop resumes at its swap point
      * rather than falling off the end of the context. */
     if (kai_nthreads > 1) {
-        KaiFiber *next = kai_sched_dequeue();
-        if (next) {
-            next->state = KAI_FIBER_RUNNING;
-            kai_active_fiber = next;
-            setcontext(&next->ctx);
-        }
+        /* Cede unconditionally to this thread's scheduler root — never a
+         * direct switch to `next`. The single dispatch site (kai_worker_loop)
+         * owns commit_park and the atomic READY->RUNNING flip; a second
+         * dispatcher here would run a fiber whose park commit hasn't been
+         * processed, reopening the double-dispatch window. */
         kai_active_fiber = &kai_main_fiber;
         setcontext(&kai_main_fiber.ctx);
         /* setcontext does not return. */
