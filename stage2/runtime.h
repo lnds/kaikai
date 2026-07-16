@@ -869,6 +869,17 @@ static int       kai_op_truthy(KaiValue *v);
 #  define KAI_RT_COUNTER(decl, init) static KAI_TLS decl = init
 #endif
 
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_RT_ATOMIC_COUNTER(n) extern _Atomic int64_t n; _Atomic int64_t n = 0
+#  else
+#    define KAI_RT_ATOMIC_COUNTER(n) extern _Atomic int64_t n
+#  endif
+#else
+#  define KAI_RT_ATOMIC_COUNTER(n) static _Atomic int64_t n = 0
+#endif
+#define KAI_CTR_INC(v) atomic_fetch_add_explicit(&(v), 1, memory_order_relaxed)
+
 /* Refcount tracing (m5 #0): always-compiled counters; the per-process
    report at exit is gated on the env var KAI_TRACE_RC. The counters
    add 4 increments per kai_alloc and 2 per kai_free_value — cheap
@@ -928,8 +939,8 @@ static KAI_TLS int64_t kai_rc_tok_null_mismatch = 0;
  * (parallel to kai_rc_alloc_total), gated only by the KAI_TRACE_RC env var
  * at report time; previously they sat behind -DKAI_TRACE_RC, so any binary
  * built without that define (every `kai build` output) reported 0. */
-KAI_RT_COUNTER(int64_t kai_rc_incref_total, 0);
-KAI_RT_COUNTER(int64_t kai_rc_decref_total, 0);
+KAI_RT_ATOMIC_COUNTER(kai_rc_incref_total);
+KAI_RT_ATOMIC_COUNTER(kai_rc_decref_total);
 
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
@@ -2685,7 +2696,7 @@ static inline KaiValue *kai_incref(KaiValue *v) {
     if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
         atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
                                   memory_order_relaxed);
-        kai_rc_incref_total++;
+        KAI_CTR_INC(kai_rc_incref_total);
 #ifdef KAI_TRACE_RC
         kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
@@ -2697,7 +2708,7 @@ static inline KaiValue *kai_incref(KaiValue *v) {
      * KAI_TRACE_RC` it stayed 0 in every `kai build` binary (the wrapper
      * does not pass -DKAI_TRACE_RC), so each "RC balanced" gate that read
      * incref_total passed vacuously on 0 == 0. */
-    kai_rc_incref_total++;
+    KAI_CTR_INC(kai_rc_incref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
@@ -2979,10 +2990,16 @@ static KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
 static KAI_TLS KaiFiber *kai_active_fiber = NULL;
 #endif
 
-static inline void kai_active_fiber_anchor(void) {
+/* noinline is load-bearing: inlined into a fiber body, clang materialises
+ * TP+offset and spills it across the park swapcontext, so a work-stolen
+ * fiber would resume reading the creator thread's TLS. Out of line the
+ * thread pointer is re-read on every call, on whatever thread now runs. */
+__attribute__((noinline))
+static void kai_active_fiber_anchor(void) {
     if (kai_active_fiber == NULL) kai_active_fiber = &kai_main_fiber;
 }
 
+__attribute__((noinline))
 static KaiFiber *kai_current_fiber(void) {
     kai_active_fiber_anchor();
     return kai_active_fiber;
@@ -3793,7 +3810,7 @@ static void kai_free_cons_spine(KaiValue *v) {
          * that called us; the loop charges the counter for each tail cell
          * it consumes here, so the total stays byte-identical to the
          * recursive version.) */
-        kai_rc_decref_total++;
+        KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
         kai_rc_history_log(tail, /* op=decref */ 2, tail->tag);
 #endif
@@ -3842,7 +3859,7 @@ static KAI_RC_NOINLINE void kai_free_variant_spine(KaiValue *v, int next_slot,
             }
             /* Shared: kai_decref's rc>1 arm unfolded — one rc load, no
              * re-checks. Must stay behaviourally identical to kai_decref. */
-            kai_rc_decref_total++;
+            KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
             kai_rc_history_log(c, /* op=decref */ 2, c->tag);
 #endif
@@ -3901,7 +3918,7 @@ static void kai_free_value(KaiValue *v) {
                     kai_decref(c);
                     continue;
                 }
-                kai_rc_decref_total++;
+                KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
                 kai_rc_history_log(c, /* op=decref */ 2, c->tag);
 #endif
@@ -4046,7 +4063,7 @@ static void kai_decref_free(KaiValue *v) {
 static inline void kai_decref(KaiValue *v) {
     if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) return;
     /* #812 — always-compiled counter (see kai_incref). */
-    kai_rc_decref_total++;
+    KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
