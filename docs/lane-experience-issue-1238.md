@@ -150,6 +150,49 @@ identical — same `.c` at clang -O0 is 100/100, at clang -O2 fails.
   config the native gate (#1234, `--backend=native` only) never covers.
   Self-skips on a clang-less host.
 
+## The two CI regressions the split caused (and their fixes)
+
+The functional gates were green locally, but the first CI run surfaced two
+failures the mac gates never exercised. Both were the split's doing (confirmed:
+main is green on both); neither was the copy-on-send or the #1234 hoist.
+
+- **`rc-detector` (strict build errored).** The split used `stage0/runtime_llvm.c`
+  — the NATIVE owner — as the C owner. That file carries native-only baggage:
+  the kaix_* ABI, an `int main`, and `_Static_assert(offsetof(KaiValue, as) == 8)`
+  (the layout `emit_native_slot.kai` assumes). Under `-DKAI_TRACE_RC=1` the struct
+  grows an `alloc_site` field → offset 16 → the assert fails. The C path never
+  compiled runtime_llvm.c before, so it never hit the assert. **Fix:** a minimal
+  C owner, `stage2/runtime_owner_c.c` — just `#include <runtime.h>` under
+  KAI_RUNTIME_OWNER, no native baggage. The scheduler already lives in runtime.h;
+  the owner only instantiates it. Each backend now owns via the file aligned to
+  it (native → runtime_llvm.c, C → runtime_owner_c.c), both deriving from
+  runtime.h. No `int main`, no kaix_ ABI, no native layout pin.
+- **`tier1-tsan` (data race on `kai_active_fiber`).** A FALSE POSITIVE of TSAN's
+  general-dynamic TLS tracking, not a real race — `kai_active_fiber` is
+  `_Thread_local`, per-thread by construction, physically impossible to write
+  cross-thread. The split flipped the scheduler TLS from `static` (local-exec,
+  which TSAN models as thread-private) to `extern` (default general-dynamic under
+  -fPIC → resolved via `__tls_get_addr`, whose shadow-tracking TSAN mis-models as
+  a shared access). **Fix:** pin `tls_model("initial-exec")` on the scheduler TLS
+  under separate compilation. Verified structurally: on x86_64-linux with -fPIC,
+  the default emits `@TLSGD` + `callq __tls_get_addr@PLT`; with initial-exec it
+  emits `@GOTTPOFF` + `%fs:(%rax)` (direct off the thread pointer, like the
+  single-TU local-exec TSAN trusts). Orthogonal to the #1234 hoist (that cached
+  the thread-pointer BASE across swapcontext; this pins the resolution MODE — the
+  -O0 owner still closes the hoist). Sound because the owner links statically
+  (initial-exec forbids dlopen, not static link). The native path used this
+  extern-TLS owner since #1234 but the TSAN gate only ran `--backend=c`, so the
+  false positive never surfaced there — the new C-under-clang exposure found it.
+
+**Trap for the next lane — TSAN mac vs Linux.** Neither race reproduces reliably
+on macOS arm64 (Mach-O TLS differs from ELF; the race is flaky, ~1/40). The fix
+was verified by *codegen inspection* (`clang --target=x86_64-linux-gnu -S`), not
+by running — mac cannot confirm an ELF-TLS-model fix. Also: the mac rc-detector
+throws a PREEXISTING UBSAN "insufficient space for KaiValue" on sized-variant
+fixtures (`variant_spine_free_1083` etc.) that main throws too — it is NOT the
+split's doing and NOT what CI (Linux gcc) fails on. CI failed on the strict
+*build*, which the minimal owner fixes; the mac UBSAN is environment noise.
+
 ## Follow-ups left for the next lane
 
 - The `nm`-based soundness gate lives in `bin/kai`, not in a build assert like

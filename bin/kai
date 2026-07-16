@@ -185,6 +185,24 @@ else
   RUNTIME_LLVM_C=""
 fi
 
+# Runtime owner object for the C backend (issue #1238). The C program TU
+# references the scheduler ops external (KAI_SCHED_FN); this owner, compiled at
+# -O0, provides them. It is a MINIMAL owner — just runtime.h instantiated under
+# KAI_RUNTIME_OWNER — NOT runtime_llvm.c, which is the native owner and carries
+# native-only baggage the C path rejects: the kaix_* ABI, an `int main`, and the
+# emit_native_slot layout pins (`_Static_assert(offsetof(KaiValue, as) == 8)`,
+# false when KAI_TRACE_RC grows the struct — the rc-detector strict build). Its
+# home is next to runtime.h (stage2 in a dev checkout, share/kaikai/include when
+# installed, both under $RUNTIME_INC_C). Empty when absent → the C split falls
+# back to the legacy single-TU compile (sound under gcc).
+if [ -f "$RUNTIME_INC_C/runtime_owner_c.c" ]; then
+  RUNTIME_OWNER_C="$RUNTIME_INC_C/runtime_owner_c.c"
+elif [ -f "$ROOT/stage2/runtime_owner_c.c" ]; then
+  RUNTIME_OWNER_C="$ROOT/stage2/runtime_owner_c.c"
+else
+  RUNTIME_OWNER_C=""
+fi
+
 # P2 (docs/native-codegen-perf-plan.md §P2): the precompiled runtime
 # BITCODE, sitting next to runtime_llvm.c. When present, kaic2 links it
 # into the in-process module BEFORE default<O2> (via KAI_NATIVE_RUNTIME_BC),
@@ -1576,7 +1594,7 @@ compile_to_binary() {
     # keeps the legacy first-TU owner — see the fallback in the link below).
     mod_defs="-DKAI_SEPARATE_COMPILATION=1"
     mod_owner=""
-    if [ -z "$RUNTIME_LLVM_C" ]; then
+    if [ -z "$RUNTIME_OWNER_C" ]; then
       mod_owner="__root__.c"
       [ -f "$moddir/$mod_owner" ] || mod_owner="$(basename "$(ls "$moddir"/*.c | head -1)")"
     fi
@@ -1652,23 +1670,24 @@ compile_to_binary() {
     # reference every fiber suspend-point op as external (KAI_SCHED_FN), so the
     # scheduler lives in the cc owner object pinned to -O0, never in a module
     # compiled at -O2 where clang would hoist the thread pointer across
-    # swapcontext (#1238). runtime_llvm.c (which #includes runtime.h) is the
-    # sole owner here: with KAI_RUNTIME_OWNER it defines every runtime state
-    # global AND the scheduler; the program modules reference all of it
-    # external. KAI_PROGRAM_PROVIDES_MAIN suppresses its `main` (modules carry one).
+    # swapcontext (#1238). runtime_owner_c.c (the minimal C owner — runtime.h
+    # under KAI_RUNTIME_OWNER, no native baggage) is the sole owner here: it
+    # defines every runtime state global AND the scheduler; the program modules
+    # reference all of it external. KAI_PROGRAM_PROVIDES_MAIN suppresses its
+    # `main` (modules carry one).
     # shellcheck disable=SC2086
-    if [ -n "$RUNTIME_LLVM_C" ]; then
+    if [ -n "$RUNTIME_OWNER_C" ]; then
       mod_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
-      mod_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$mod_owner_defs")"
+      mod_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_OWNER_C" "$mod_owner_defs")"
       if [ -n "$mod_rt_obj" ]; then
         $CC $CFLAGS $mod_ldstack "$moddir"/*.o "$mod_rt_obj" -o "$out" -lm \
           || die "modular link failed"
       else
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $mod_owner_defs $mod_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$moddir"/*.o "$RUNTIME_LLVM_C" -o "$out" -lm \
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $mod_owner_defs $mod_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$moddir"/*.o "$RUNTIME_OWNER_C" -o "$out" -lm \
           || die "modular link failed"
       fi
     else
-      # Hasher-less host: no runtime object cache and no RUNTIME_LLVM_C, so a
+      # Hasher-less host: no runtime object cache and no RUNTIME_OWNER_C, so a
       # program module is the owner (legacy single-owner-module link). Sound
       # under gcc; the clang residual this split closes needs the owner object.
       $CC $CFLAGS $mod_ldstack "$moddir"/*.o -o "$out" -lm \
@@ -1723,12 +1742,12 @@ compile_to_binary() {
     # includes provides) — single-TU compiles keep working; only this real
     # build path adds the -O0 owner.
     #
-    # The split needs runtime_llvm.c as the owner. When it cannot be located
-    # (a stripped-down layout with only runtime.h), fall back to the legacy
+    # The split needs the minimal C owner. When it cannot be located (a
+    # stripped-down layout with only runtime.h), fall back to the legacy
     # single-TU compile: sound under gcc, and the only exposure — clang at
     # -O1+ with KAI_THREADS>1 — is the residual this split closes, which such
     # a minimal host does not hit by construction.
-    if [ -z "$RUNTIME_LLVM_C" ]; then
+    if [ -z "$RUNTIME_OWNER_C" ]; then
       $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
     else
       prog_obj="$tmp/out.o"
@@ -1744,12 +1763,12 @@ compile_to_binary() {
         die "C backend: swapcontext leaked into the -O2 program object (a parking op is missing its KAI_SCHED_FN gate — #1238)"
       fi
       c_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
-      c_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$c_owner_defs")"
+      c_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_OWNER_C" "$c_owner_defs")"
       if [ -n "$c_rt_obj" ]; then
         $CC $CFLAGS "$prog_obj" "$c_rt_obj" -o "$out" -lm || die "C backend link failed"
       else
         # No object cache (hasher-less host): compile the owner inline at -O0.
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_LLVM_C" -o "$out" -lm \
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_OWNER_C" -o "$out" -lm \
           || die "C backend link failed"
       fi
     fi

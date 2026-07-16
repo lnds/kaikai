@@ -90,8 +90,23 @@
  * ledgers need no lock on the hot path. Under a single thread `_Thread_local`
  * is semantically identical to a plain global, so N=1 stays byte-identical.
  * Every global carrying KAI_TLS is classified `tls` in the audit gate
- * (tools/runtime-globals.allow). */
+ * (tools/runtime-globals.allow).
+ *
+ * Under separate compilation (the -O0 owner split, #1238) these become `extern`
+ * across objects, which defaults to the general-dynamic TLS model (resolved via
+ * __tls_get_addr). Pin initial-exec: it resolves the address off the thread
+ * pointer directly (like the single-TU `static` local-exec), which TSAN models
+ * as thread-private — general-dynamic's opaque __tls_get_addr otherwise trips
+ * TSAN into a false cross-thread race on per-thread state. Sound because the
+ * owner links statically (initial-exec forbids dlopen, not static link), and
+ * orthogonal to the #1234 hoist (that cached the thread-pointer BASE across
+ * swapcontext; this pins the resolution MODE, not the base — the -O0 owner
+ * still closes the hoist). */
+#if defined(KAI_SEPARATE_COMPILATION) && (defined(__GNUC__) || defined(__clang__))
+#define KAI_TLS _Thread_local __attribute__((tls_model("initial-exec")))
+#else
 #define KAI_TLS _Thread_local
+#endif
 
 /* Linkage of the fiber suspend-point ops the C backend calls by name — the
  * mailbox recv/send surface, spawn_actor, kai_sched_bootstrap, and every
