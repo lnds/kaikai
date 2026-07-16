@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.99.20 (2026-07-15)
+
+### Fixed
+
+- **runtime**: route the C-backend scheduler through the -O0 owner object under clang (closes #1238) (#1240)
+
 ## v0.99.19 (2026-07-15)
 
 ### Fixed
