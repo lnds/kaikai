@@ -81,7 +81,7 @@ fixture at `KAI_THREADS=4`:
 | **C backend** (`--backend=c`) via **clang** `-O2`  | **crash (7/40)** |
 
 So the C backend is **not** immune — it only looked immune because the earlier
-lane, Docker, and prodigy all default `cc` to **gcc**. Compile the SAME C
+lane, Docker, and the Linux CI runner all default `cc` to **gcc**. Compile the SAME C
 backend with `CC=clang -O2` and the scheduler hoists exactly the same way. The
 one true rule: **gcc does not cache the thread pointer across `swapcontext`;
 clang at `-O1+` does, in whatever TU carries the scheduler.** This is codegen,
@@ -235,7 +235,7 @@ root already emits them external.
   their home thread (drop work-stealing): largest scope, deferred — the split
   makes the existing design sound without touching scheduler logic.
 
-### Validation (prodigy, Ubuntu 24.04, 4 cores)
+### Validation (Linux x86_64, Ubuntu 24.04, 4 cores)
 
 - Baseline (pre-fix): the native stress fixture crashed 3/30 at `KAI_THREADS=4`.
 - Post-fix: `KAI_THREADS=4` 100/100, `KAI_THREADS=6` 60/60, `KAI_THREADS=8`
