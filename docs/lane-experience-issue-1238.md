@@ -124,7 +124,7 @@ until clean.
 
 ## Validation (macOS arm64, Homebrew clang 18)
 
-The bug reproduces on mac at a LOWER rate than prodigy's x86_64 (~33/40): mac
+The bug reproduces on mac at a LOWER rate than Linux x86_64 (~33/40): mac
 arm64 needed KAI_THREADS=8 to expose it (T4 was clean). Mechanism confirmed
 identical — same `.c` at clang -O0 is 100/100, at clang -O2 fails.
 
