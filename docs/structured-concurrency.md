@@ -265,6 +265,7 @@ policies, link/monitor supervision, `spawn_actor`,
 `with_mailbox`), see `docs/actors.md`.
 
 ## Execution and parallelism
+<!-- coverage: skip -->
 
 Fibers are scheduled M:N over OS threads with work-stealing.
 `KAI_THREADS=N` selects the thread count at process start (default 1,
