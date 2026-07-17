@@ -16,6 +16,12 @@ trap 'rm -rf "$TMP"' EXIT
 FIXTURES=(
   "demos/parallel_actors/main.kai"
   "examples/effects/mn_cross_thread_copy_stress.kai"
+  # F2 reactor: I/O (reactor timer wheel) and CPU fibers make progress
+  # concurrently, and the summed total is identical at N=1/N=4/N=8. Guards
+  # the dedicated-reactor handback against a scheduling-order divergence or
+  # a lost-wakeup that would strand a sleeper (the shutdown-hang check below
+  # catches the deadlock this lane closed).
+  "examples/effects/mn_reactor_io_cpu_mix.kai"
 )
 
 fail=0

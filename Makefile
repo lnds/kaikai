@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -225,6 +225,14 @@ test-mn-tsan: kaic2
 # a scheduling-order divergence trips it. Cheap enough for tier1.
 test-mn-determinism: kaic2
 	@bash tools/run-mn-determinism.sh
+
+# F2 no-starvation regression gate: a sleeper on the reactor timer wheel
+# wakes on time while CPU hogs occupy the other scheduler threads. Fails on
+# the F1 inline reactor (the poll is pinned to thread 0), passes once the
+# reactor runs on its own thread. Timing-based, so it rides the dedicated
+# concurrency tier (tier1-tsan.yml), not the fast tier1 path.
+test-mn-reactor-bench: kaic2
+	@bash tools/run-mn-reactor-bench.sh
 
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or

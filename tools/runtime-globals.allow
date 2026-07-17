@@ -20,9 +20,13 @@
 #                  because RC never applies, so there is no write to race.
 #   shared-locked  Class C — process-global mutable, touched by >1 thread;
 #                  guarded by a mutex or an atomic.
-#   reactor-owned  Class C — single reactor owner; mutated only through the
-#                  reactor interface (invariant: kai_reactor_wait is the sole
-#                  caller of kai_sched_unpark). Thread extraction is F2.
+#   reactor-owned  Class C — single reactor owner; touched by exactly one
+#                  thread (the F2 reactor thread) or written once at init,
+#                  so no lock is needed to preserve its identity. The wheel
+#                  and waiter lists moved to shared-locked when F2 landed
+#                  (scheduler threads now link/unlink them under
+#                  kai_reactor_mu); what stays here is init-once fds/flags,
+#                  the reactor's private ready-batch, and the file pool.
 #   scratch        per-function return/scratch buffer, referenced by exactly
 #                  one function; no cross-thread identity to preserve.
 
@@ -51,6 +55,10 @@ kai_ready_head                    tls
 kai_ready_tail                    tls
 kai_parked_count                  tls
 kai_pending_free                  tls
+# F2 — per-thread stacks drained on the scheduler root post-swap: fibers
+# waiting to be linked into the reactor (commit) or requeued after a yield.
+kai_commit_stack_head             tls
+kai_requeue_stack_head            tls
 
 # ── Class A — TLS: RC / arena / vec trace ledgers (summed at exit) ─────
 kai_rc_alloc_total                tls
@@ -59,8 +67,6 @@ kai_rc_live_now                   tls
 kai_rc_live_peak                  tls
 kai_rc_alloc_by_tag               tls
 kai_rc_free_by_tag                tls
-kai_rc_incref_total               tls
-kai_rc_decref_total               tls
 kai_rc_reuse_total                tls
 kai_rc_reuse_free_total           tls
 kai_rc_tok_unique                 tls
@@ -70,6 +76,14 @@ kai_arena_alloc_total             tls
 kai_arena_free_total              tls
 kai_vec_inplace_total             tls
 kai_vec_cow_total                 tls
+
+# ── Class C — shared-locked: RC traffic ledgers ────────────────────────
+# Not TLS: kai_incref/kai_decref are inlined into fiber bodies, where clang
+# materialises the thread-pointer and spills it across the park swapcontext.
+# A work-stolen fiber would then charge the creator thread's counter. Relaxed
+# atomics on a process-global instead — the address is thread-independent.
+kai_rc_incref_total               shared-locked
+kai_rc_decref_total               shared-locked
 
 # ── Class A — TLS: RC history / site / leak-site debug tables ─────────
 kai_rc_history                    tls
@@ -192,16 +206,31 @@ kai_user_main_result              shared-locked
 # ── Class B — immutable after init: worker pthread ids ────────────────
 kai_worker_threads                immutable
 
-# ── Class C — reactor-owned: timer wheel, waiters, self-pipes, pool ───
-kai_reactor_timer_head            reactor-owned
-kai_reactor_pid_waiters           reactor-owned
-kai_reactor_filepool_waiters      reactor-owned
-kai_reactor_stdin_waiter          reactor-owned
+# ── Class C — shared-locked: F2 reactor thread + its wheel/waiter lists ─
+# F2 moved the reactor onto its own thread. The timer wheel + waiter lists
+# + parked_count are now mutated by scheduler threads (kai_sched_commit_park
+# links a park, kai_reactor_detach_fiber unlinks a cancel) AND the reactor
+# thread (the drains), all under kai_reactor_mu — so they are shared-locked,
+# not single-owner. kai_reactor_mu is that guard; kai_reactor_thread is the
+# pthread id, written once at bootstrap.
+kai_reactor_mu                    shared-locked
+kai_reactor_thread                immutable
+kai_reactor_timer_head            shared-locked
+kai_reactor_pid_waiters           shared-locked
+kai_reactor_filepool_waiters      shared-locked
+kai_reactor_stdin_waiter          shared-locked
+kai_reactor_socket_read_waiters   shared-locked
+kai_reactor_socket_write_waiters  shared-locked
+kai_reactor_signal_waiter         shared-locked
+kai_reactor_parked_count          shared-locked
+# The reactor thread is the sole owner of the ready-batch: it collects
+# fibers a drain readied (under kai_reactor_mu) and unparks them after
+# releasing the lock. No other thread touches it.
+kai_reactor_ready_batch           reactor-owned
+kai_reactor_ready_n               reactor-owned
+kai_reactor_ready_cap             reactor-owned
+# ── Class C — reactor-owned: init-once fds/flags + the file thread pool ─
 kai_reactor_stdin_orig_flags      reactor-owned
-kai_reactor_socket_read_waiters   reactor-owned
-kai_reactor_socket_write_waiters  reactor-owned
-kai_reactor_signal_waiter         reactor-owned
-kai_reactor_parked_count          reactor-owned
 kai_reactor_inited                reactor-owned
 kai_reactor_sigchld_pipe          reactor-owned
 kai_reactor_filepool_pipe         reactor-owned
