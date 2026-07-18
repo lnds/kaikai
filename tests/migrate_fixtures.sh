@@ -9,6 +9,11 @@
 # A fixture with a <name>.report.expected file also asserts the
 # stderr `manual:` report matches, proving un-migratable changes are
 # reported, not silently dropped.
+#
+# A fixture with a <name>.oneshot marker skips the idempotency check
+# (step 2): a type-argument reorder like the Result Ok-first flip has
+# no post-flip marker, so re-running it would flip back — it is applied
+# exactly once per package, by design.
 
 set -eu
 
@@ -46,16 +51,19 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
     fail=$((fail + 1)); continue
   fi
 
-  # 2. idempotency: migrate(expected) == expected
-  if ! "$KAIC2" --migrate "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
-    echo "  FAIL $name — migrate rejected expected (idempotency):"
-    sed 's/^/      /' "$tmp/err"
-    fail=$((fail + 1)); continue
-  fi
-  if ! diff -u "$expected" "$tmp/out2.kai" > "$tmp/diff"; then
-    echo "  FAIL $name — migrate(expected) != expected (idempotency):"
-    sed 's/^/      /' "$tmp/diff"
-    fail=$((fail + 1)); continue
+  # 2. idempotency: migrate(expected) == expected (skipped for one-shot
+  #    rewrites, which have no post-flip marker to recognise).
+  if [ ! -f "${input%.input.kai}.oneshot" ]; then
+    if ! "$KAIC2" --migrate "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
+      echo "  FAIL $name — migrate rejected expected (idempotency):"
+      sed 's/^/      /' "$tmp/err"
+      fail=$((fail + 1)); continue
+    fi
+    if ! diff -u "$expected" "$tmp/out2.kai" > "$tmp/diff"; then
+      echo "  FAIL $name — migrate(expected) != expected (idempotency):"
+      sed 's/^/      /' "$tmp/diff"
+      fail=$((fail + 1)); continue
+    fi
   fi
 
   # 3. the migrated output re-parses (never emits non-parsing source)
