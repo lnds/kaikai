@@ -12,7 +12,7 @@ applies and how they compose.
 | Mechanism | When to use | Inspectable? | Recovers? |
 |---|---|---|---|
 | `Option[T]` | "no value" is routine, no motive worth keeping | no | yes |
-| `Result[E, T]` | failure has a motive callers branch on | yes (typed `E`) | yes |
+| `Result[T, E]` | failure has a motive callers branch on | yes (typed `E`) | yes |
 | `Fail` (effect) | abort with message; caller cannot recover meaningfully | string only | no, unhandled = compile error |
 | `panic` | programming error, contract violation, unreachable | string only | no, terminates the process |
 | `!` postfix | propagate `Option[None]` or `Result[Err]` to the caller | — | yes (lifts to caller) |
@@ -21,10 +21,10 @@ applies and how they compose.
 LLM / authoring affordance, not an error-handling mechanism. They
 panic at runtime if reached unfilled.)
 
-## Rule 1 — `Option[T]` vs `Result[E, T]`
+## Rule 1 — `Option[T]` vs `Result[T, E]`
 
 > Use `Option[T]` when "absent" is the only thing the caller needs
-> to know. Use `Result[E, T]` when the caller branches on the
+> to know. Use `Result[T, E]` when the caller branches on the
 > *motive*.
 
 Examples in stdlib:
@@ -42,7 +42,7 @@ on the error case of a `Result`, you should have used `Option`.
 Conversely, if you write `match opt { None -> Err("missing") }`,
 you should have used `Result` from the start.
 
-## Rule 2 — `Result[E, T]` vs `Fail`
+## Rule 2 — `Result[T, E]` vs `Fail`
 
 > Use `Result` when the caller can recover. Use `Fail` when there
 > is nothing reasonable for the caller to do.
@@ -52,7 +52,7 @@ caller until a handler catches it. The handler converts the failure
 into something else (a default value, a logged event, a process
 exit). Callers in between do **not** branch on the message.
 
-`Result[E, T]` is for failures the caller wants to inspect and
+`Result[T, E]` is for failures the caller wants to inspect and
 *continue*: retry the operation, fall back to a default, surface
 the error to a user, log structured detail to an audit trail.
 
@@ -77,7 +77,7 @@ with a string is too lossy.
 
 - Failed I/O (`File`, `Net`, `Stdin`) — use the `Result` / `Fail`
   shape declared by the effect.
-- Bad user input — surface it through `Result[InputError, T]`.
+- Bad user input — surface it through `Result[T, InputError]`.
 - Validation failures — same as above.
 
 **In fintech / regulated production code, `panic` should be
@@ -86,23 +86,25 @@ contract design, not in the input. (The runtime panic from the
 polymorphic-impl bug — issue #174 — is a counter-example that needs
 fixing precisely because it surfaces under user-reachable code.)
 
-## Rule 4 — `Result[E, T]` order: `E` first, `T` second
+## Rule 4 — `Result[T, E]` order: `T` first, `E` second (Ok-first)
 
 ```kai
-fn parse(s: String) : Result[ParseError, Int] = ...
-#                            ^^^^^^^^^^  ^^^
-#                            error type  value type
+fn parse(s: String) : Result[Int, ParseError] = ...
+#                            ^^^  ^^^^^^^^^^
+#                            value type  error type
+#                            (Ok slot)   (Err slot)
 ```
 
-`Ok(value)` and `Err(motive)` are the constructors. The `E`-first
-order is fixed in stage 2 and mirrors the source declaration in
-`stdlib/core/result.kai`.
+`Ok(value)` and `Err(motive)` are the constructors. The success type
+comes first, the error type second — the same order as Rust's
+`Result<T, E>`. This is fixed in stage 2 and mirrors the source
+declaration in `stdlib/core/result.kai`.
 
-> **Common mistake**: writing `Result[Int, String]` when you meant
-> "a parse that returns `Int` or fails with `String`". The typer
-> will not catch this — your function will compile and `Err(42)` /
-> `Ok("hello")` will be the constructors. Read the type aloud:
-> `Result[E, T]` is "a result that errors with `E` or carries `T`".
+> **Reading the type aloud**: `Result[T, E]` is "a result that
+> carries `T` or errors with `E`". Because `Ok`/`Err` are named
+> constructors, `Ok(value)` / `Err(motive)` are unambiguous
+> regardless of the type-argument order — but the annotation itself
+> now reads left-to-right success-then-error, matching Rust.
 
 ## Rule 5 — Composing errors across subsystems
 
@@ -126,7 +128,7 @@ type AppError =
   | Approval(ApprovalError)
   | Execution(ExecutionError)
 
-fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
+fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
   let v = validate(req).map_err(Validation)!
   let a = approve(v).map_err(Approval)!
   let e = execute(a).map_err(Execution)!
@@ -171,7 +173,7 @@ impl From[ValidationError] for AppError {
 }
 # ... analogous for ApprovalError, ExecutionError
 
-fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
+fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
   let v = validate(req)!     # ! invokes From::from automatically
   let a = approve(v)!
   let e = execute(a)!
@@ -196,10 +198,10 @@ type ExecutionError  = SettlementBackendDown | DoubleSpendDetected
 
 type AppError = ValidationError | ApprovalError | ExecutionError
 
-fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
-  let v = validate(req)!       # Result[ValidationError, _] — D3 upcast
-  let a = approve(v)!          # Result[ApprovalError, _]   — D3 upcast
-  let e = execute(a)!           # Result[ExecutionError, _]  — D3 upcast
+fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
+  let v = validate(req)!       # Result[_, ValidationError] — D3 upcast
+  let a = approve(v)!          # Result[_, ApprovalError]   — D3 upcast
+  let e = execute(a)!           # Result[_, ExecutionError]  — D3 upcast
   Ok(receipt(e))
 }
 ```
@@ -208,8 +210,8 @@ fn process_payment(req: PayReq) : Result[AppError, Receipt] = {
 - No `map_err(Wrapper)` at every boundary — the **implicit upcast**
   (D3 in `docs/unions-design.md`) accepts a value of a component
   type wherever the union is expected.
-- `!` propagates through the upcast: a `Result[ValidationError, _]`
-  flows into a function returning `Result[AppError, _]` directly.
+- `!` propagates through the upcast: a `Result[_, ValidationError]`
+  flows into a function returning `Result[_, AppError]` directly.
 - Pattern matching uses `bind : ComponentType` to delegate per
   subsystem:
 
@@ -240,7 +242,7 @@ across three bounded contexts.
 | The same component error participates in many app-level unions | **Pattern C** (no name mangling needed) |
 | You need a single-tag runtime layout (FFI, serialisation pinned to a tag enum) | Pattern A |
 | The wrapper is purely for type identity with no extra payload | **Pattern C** wins (less boilerplate) |
-| Generic over the error type (`F[T] = Option[T] | Result[String, T]`) | Neither yet — generic unions deferred |
+| Generic over the error type (`F[T] = Option[T] | Result[T, String]`) | Neither yet — generic unions deferred |
 
 Default to Pattern C for new code. Migrate Pattern A code only
 when the wrapper carries no extra structure and the migration is
@@ -262,13 +264,13 @@ in the natural path of other work (do not chase a clean-up).
 
 ## Rule 6 — Validation and accumulating errors
 
-`Result[E, T]` short-circuits at the first `Err`. For validations
+`Result[T, E]` short-circuits at the first `Err`. For validations
 that should report **all** failures (every rule that fired) — the
 typical fintech use case for transfer / order / portfolio
 validation — kaikai today requires manual accumulation:
 
 ```kai
-fn validate_transfer(req: TransferRequest) : Result[[TransferError], ValidatedTransfer] = {
+fn validate_transfer(req: TransferRequest) : Result[ValidatedTransfer, [TransferError]] = {
   let errors : [TransferError] = []
   let errors = if req.amount <= 0<USD>     { errors ++ [InvalidAmount] }     else { errors }
   let errors = if !is_account_active(req.from)  { errors ++ [SourceFrozen] }      else { errors }
@@ -290,8 +292,8 @@ follow-up.
 
 The current guidance: when validation rules are independent (the
 typical case), build a `[E]` list manually and return
-`Result[[E], T]`. When they cascade (later rules depend on earlier
-results), use `Result[E, T]` and `!` so the first failure
+`Result[T, [E]]`. When they cascade (later rules depend on earlier
+results), use `Result[T, E]` and `!` so the first failure
 short-circuits cleanly.
 
 ## Rule 7 — `Fail` is for the unhandleable
@@ -311,7 +313,7 @@ this.
 
 **`Fail` carries a `String` only.** This is intentional. If your
 error needs to be inspected, structured, branched on — it is not a
-`Fail`, it is a `Result[E, T]` with `E` a sum type.
+`Fail`, it is a `Result[T, E]` with `E` a sum type.
 
 The stdlib uses `Fail` in two places where the message is for human
 diagnosis, not for programmatic recovery:
@@ -335,7 +337,7 @@ proposal would be needed.
 Is the failure value worth keeping for the caller?
 ├── No, "absent" is enough → Option[T]
 └── Yes, motive matters
-    ├── Caller can recover meaningfully → Result[E, T]
+    ├── Caller can recover meaningfully → Result[T, E]
     │   └── Multiple subsystems' errors compose? → union (Pattern C, since #187)
     │       (Pattern A — wrapper sum + map_err — when the wrapper
     │        carries extra structure; Pattern B — auto-From — once

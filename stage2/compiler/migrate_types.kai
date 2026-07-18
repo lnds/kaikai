@@ -1,0 +1,194 @@
+#[doc("""
+compiler.migrate_types — type-annotation rewrites for `kai migrate`.
+
+The Ok-first `Result` flip changed the surface type-argument order
+from `Result[E, T]` (error first) to `Result[T, E]` (success first).
+`Ok`/`Err` are named constructors, so only the annotations move; this
+walk rebuilds every `Result[a, b]` node as `Result[b, a]` in return
+types, parameter types, `let`/`var` annotations, and any nested type.
+Line/col are preserved so the fmt-writer re-emits surrounding source
+unchanged.
+""")]
+
+import compiler.ast
+
+#[doc("Rewrite one type annotation, flipping the two arguments of every `Result[a, b]` (recursively through lists, functions, dimensioned, refinement, and row-argument types).")]
+pub fn mig_ty(t: TypeExpr) : TypeExpr =
+  with_tkind(t, mig_tykind(t.tkind))
+
+fn with_tkind(t: TypeExpr, k: TyKind) : TypeExpr = mk_ty(k, t.line, t.col)
+
+# The list-arg flip stays inside the fn that destructured `TyName`:
+# handing a variant's `[TypeExpr]` slot to a helper that re-matches it
+# corrupts under kaic1 (bundle miscompile), so `mig_result_args` runs
+# the `[a, b]` match on the already-`map`ped fresh list right here.
+fn mig_tykind(k: TyKind) : TyKind = match k {
+  TyName(name, targs) ->
+    if name == "Result" {
+      TyName("Result", mig_result_args(map(targs, mig_ty)))
+    } else {
+      TyName(name, map(targs, mig_ty))
+    }
+  TyList(el) -> TyList(mig_ty(el))
+  TyFn(ps, ret, row) -> TyFn(map(ps, mig_ty), mig_ty(ret), mig_row(row))
+  TyDim(base, u) -> TyDim(mig_ty(base), u)
+  TyRefine(base, pred) -> TyRefine(mig_ty(base), pred)
+  TyRow(row) -> TyRow(mig_row(row))
+}
+
+# Flip a two-element list; any other arity passes through. The input is
+# a fresh runtime list (post-`map`), so this list-match is safe.
+fn mig_result_args(ts: [TypeExpr]) : [TypeExpr] = match ts {
+  [a, b] -> [b, a]
+  _ -> ts
+}
+
+fn mig_row(row: RowExpr) : RowExpr = match row {
+  REmpty -> REmpty
+  RClosed(ls) -> RClosed(map(ls, mig_row_label))
+  ROpen(tail, ls) -> ROpen(tail, map(ls, mig_row_label))
+}
+
+fn mig_row_label(l: RowLabel) : RowLabel = match l {
+  RL(name, targs) -> RL(name, map(targs, mig_ty))
+}
+
+#[doc("Flip Result in an optional type annotation, leaving `None` untouched.")]
+pub fn mig_ty_opt(to: Option[TypeExpr]) : Option[TypeExpr] = match to {
+  None -> None
+  Some(t) -> Some(mig_ty(t))
+}
+
+#[doc("Flip Result in every parameter's declared type, preserving name/line/col/borrow.")]
+pub fn mig_params(ps: [Param]) : [Param] = map(ps, mig_param)
+
+fn mig_param(p: Param) : Param =
+  Param { pname: p.pname, ptype: mig_ty_opt(p.ptype),
+          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+
+#[doc("Flip Result in a list of type arguments (impl tparam-args, ctor arg types).")]
+pub fn mig_tys(ts: [TypeExpr]) : [TypeExpr] = map(ts, mig_ty)
+
+#[doc("Flip Result inside a type body: record field types, sum variant argument types, and alias targets.")]
+pub fn mig_type_body(b: TypeBody) : TypeBody = match b {
+  TBAlias(t) -> TBAlias(mig_ty(t))
+  TBRecord(fds) -> TBRecord(map(fds, mig_field_decl))
+  TBSum(vs) -> TBSum(map(vs, mig_variant))
+  TBEffectAlias(ls) -> TBEffectAlias(ls)
+}
+
+fn mig_field_decl(fd: FieldDecl) : FieldDecl = match fd {
+  FD(pub_, name, t) -> FD(pub_, name, mig_ty(t))
+}
+
+fn mig_variant(v: Variant) : Variant = match v {
+  Var(name, vargs) -> Var(name, mig_tys(vargs))
+}
+
+#[doc("Flip Result in an effect op's parameter and return types.")]
+pub fn mig_effect_op(op: EffectOp) : EffectOp = match op {
+  EOp(name, tps, ps, ret, l, c) -> EOp(name, tps, mig_params(ps), mig_ty(ret), l, c)
+}
+
+#[doc("Flip Result in a protocol op's parameter and return types.")]
+pub fn mig_proto_op(op: ProtoOp) : ProtoOp = match op {
+  POp(name, tps, ps, ret, l, c) -> POp(name, tps, mig_params(ps), mig_ty(ret), l, c)
+}
+
+# --- flip counter (report honesty) ------------------------------------
+# Count every two-argument `Result[_, _]` a flip visits, so the driver
+# reports the real number of annotation rewrites rather than only the
+# call renames.
+
+#[doc("Count the two-argument `Result` annotations inside one type (each is one flip).")]
+pub fn mig_ty_flips(t: TypeExpr) : Int = mig_tykind_flips(t.tkind)
+
+fn mig_tykind_flips(k: TyKind) : Int = match k {
+  TyName(name, targs) -> add_int(result_here(name, targs), sum_flips(map(targs, mig_ty_flips)))
+  TyList(el) -> mig_ty_flips(el)
+  TyFn(ps, ret, row) -> add_int(add_int(sum_flips(map(ps, mig_ty_flips)), mig_ty_flips(ret)), mig_row_flips(row))
+  TyDim(base, _) -> mig_ty_flips(base)
+  TyRefine(base, _) -> mig_ty_flips(base)
+  TyRow(row) -> mig_row_flips(row)
+}
+
+fn result_here(name: String, targs: [TypeExpr]) : Int =
+  if name == "Result" { if list_length(targs) == 2 { 1 } else { 0 } } else { 0 }
+
+fn mig_row_flips(row: RowExpr) : Int = match row {
+  REmpty -> 0
+  RClosed(ls) -> sum_flips(map(ls, mig_row_label_flips))
+  ROpen(_, ls) -> sum_flips(map(ls, mig_row_label_flips))
+}
+
+fn mig_row_label_flips(l: RowLabel) : Int = match l {
+  RL(_, targs) -> sum_flips(map(targs, mig_ty_flips))
+}
+
+fn add_int(a: Int, b: Int) : Int = a + b
+fn sum_flips(ns: [Int]) : Int = reduce(ns, 0, add_int)
+
+#[doc("Count Result flips in an optional annotation.")]
+pub fn mig_ty_opt_flips(to: Option[TypeExpr]) : Int = match to {
+  None -> 0
+  Some(t) -> mig_ty_flips(t)
+}
+
+#[doc("Count Result flips across a parameter list.")]
+pub fn mig_params_flips(ps: [Param]) : Int = sum_flips(map(ps, mig_param_flips))
+
+fn mig_param_flips(p: Param) : Int = mig_ty_opt_flips(p.ptype)
+
+# Count Result flips in type annotations that live inside an expression
+# body — `let`/`var` annotations and lambda parameter types. Mirrors the
+# rewrite walk's descent so the report count matches what changed.
+#[doc("Count Result flips in the type annotations nested inside one expression body.")]
+pub fn expr_flip_count(e: Expr) : Int = match e.kind {
+  EBlock(stmts, tail) -> add_int(sum_flips(map(stmts, stmt_flip_count)), opt_flip_count(tail))
+  ELambda(ps, body) -> add_int(mig_params_flips(ps), expr_flip_count(body))
+  EIf(c, t, eo) -> add_int(add_int(expr_flip_count(c), expr_flip_count(t)), opt_flip_count(eo))
+  EMatch(scrut, arms) -> add_int(expr_flip_count(scrut), sum_flips(map(arms, arm_flip_count)))
+  ECall(callee, cargs) -> add_int(expr_flip_count(callee), sum_flips(map(cargs, expr_flip_count)))
+  EField(obj, _) -> expr_flip_count(obj)
+  EIndex(o, i) -> add_int(expr_flip_count(o), expr_flip_count(i))
+  EBinop(_, l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
+  EUnop(_, x) -> expr_flip_count(x)
+  EBang(x) -> expr_flip_count(x)
+  EPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
+  EMapPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
+  EFlatMapPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
+  EFilterPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
+  ERecordLit(_, fields) -> sum_flips(map(fields, field_init_flip_count))
+  EList(elems) -> sum_flips(map(elems, elem_flip_count))
+  ERange(lo, hi, step) -> add_int(add_int(expr_flip_count(lo), expr_flip_count(hi)), opt_flip_count(step))
+  ELitUnit(inner, _) -> expr_flip_count(inner)
+  EIntrinsic(_, iargs) -> sum_flips(map(iargs, expr_flip_count))
+  _ -> 0
+}
+
+fn opt_flip_count(eo: Option[Expr]) : Int = match eo {
+  None -> 0
+  Some(x) -> expr_flip_count(x)
+}
+
+fn stmt_flip_count(s: Stmt) : Int = match s {
+  SLet(_, t, x) -> add_int(mig_ty_opt_flips(t), expr_flip_count(x))
+  SVar(_, t, x, _, _) -> add_int(mig_ty_opt_flips(t), expr_flip_count(x))
+  SExprStmt(x) -> expr_flip_count(x)
+  SAssert(x, mo) -> add_int(expr_flip_count(x), opt_flip_count(mo))
+  SIndexAssign(a, i, v, _, _) -> add_int(add_int(expr_flip_count(a), expr_flip_count(i)), expr_flip_count(v))
+  SUse(_, _, _) -> 0
+}
+
+fn arm_flip_count(a: Arm) : Int = match a {
+  Arm(_, g, body) -> add_int(opt_flip_count(g), expr_flip_count(body))
+}
+
+fn field_init_flip_count(fi: FieldInit) : Int = match fi {
+  FI(_, x) -> expr_flip_count(x)
+}
+
+fn elem_flip_count(el: ListElem) : Int = match el {
+  ElPlain(x) -> expr_flip_count(x)
+  ElSpread(x) -> expr_flip_count(x)
+}
