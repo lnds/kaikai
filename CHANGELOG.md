@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.100.0 (2026-07-18)
+
+### Added
+
+- **runtime**: dedicated reactor thread serving N schedulers (closes #1230, part of #1207) (#1241)
+
+### Fixed
+
+- **runtime**: defer park-commit and the tail's own scheduler-ref drop so the M:N scheduler is SIGSEGV-free under load (#1248)
+
 ## v0.99.20 (2026-07-15)
 
 ### Fixed
