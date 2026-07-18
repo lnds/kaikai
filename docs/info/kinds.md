@@ -103,6 +103,25 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+Serialization is opt-in via `#[derive(Layout)]`, which generates
+`to_bytes` plus a `<lower(T)>_from_bytes` shim. The bytes are
+positional and byte-exact: each field at its declared width in its
+declared order, nothing else. (`#[derive(BinSerialize)]` is the sibling
+for kaikai's own structural format.)
+
+```kaikai
+#[derive(Layout)]
+type Packet = { magic: U32<be>, port: U16<be> }
+
+fn main() : Unit / Stdout = {
+  let bytes = Packet { magic: 0<be>, port: 0<be> }.to_bytes()
+  match packet_from_bytes(bytes, 0) {
+    Ok(c)  -> Stdout.print("port #{c.value.port}")
+    Err(m) -> Stdout.print(m)
+  }
+}
+```
+
 A big-endian value cannot be passed where little-endian is expected —
 the habitant rides the type and the typer keeps them apart:
 
@@ -264,5 +283,5 @@ IEEE-754 would fail a legitimate waterfall on a rounding artefact.
 - `docs/kinds.md` — the kind-system primer.
 - `docs/kind-system-design.md` — theories, habitant resolution,
   the closed property menu.
-- `docs/layout-kind-design.md` — the `Layout` spec (encode/decode,
+- `docs/layout-kind-design.md` — the `Layout` spec (`#[derive(Layout)]`,
   TLV, nesting).

@@ -148,13 +148,13 @@ elif [ "$count" -eq 0 ]; then
   printf 'fn main() : Unit / Console = println("kaikai self-host")\n' > "$SAMPLE"
   nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ncrc=$?
   oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ocrc=$?
-  # The trivial sample has no `Layout` type, so `rewrite_layout_calls` early-
-  # returns and the native layout-rewrite walk never runs. Re-run the SAME
-  # native binary over a Layout-BEARING program (non-empty `layout_types`) so
-  # the full walk lowers under the native backend, and assert byte-identical C
-  # vs the oracle — a native codegen bug in that walk (crash or corruption)
-  # fails here. Reuses `$BIN`, so it costs a `--emit=c` + diff, not a rebuild.
-  LAYOUT="$ROOT/examples/sugars/kinds_layout_encode_decode.kai"
+  # The trivial sample derives nothing, so the `#[derive(Layout)]` impl
+  # builder never runs. Re-run the SAME native binary over a Layout-deriving
+  # program so that codegen lowers under the native backend, and assert
+  # byte-identical C vs the oracle — a native codegen bug in the derive
+  # (crash or corruption) fails here. Reuses `$BIN`, so it costs a
+  # `--emit=c` + diff, not a rebuild.
+  LAYOUT="$ROOT/examples/sugars/kinds_layout_derive.kai"
   lnc=""; loc=""; lncrc=0; locrc=0
   if [ -f "$LAYOUT" ]; then
     lnc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)"; lncrc=$?
@@ -189,7 +189,7 @@ elif [ "$count" -eq 0 ]; then
       diff <(printf '%s' "$loc") <(printf '%s' "$lnc") | head -20 | sed 's/^/    /'
       exit 1
     fi
-    echo "native-selfhost-gate: LAYOUT SELF-COMPILE OK — byte-identical C for a Layout-bearing program (the native layout-rewrite walk lowers cleanly)."
+    echo "native-selfhost-gate: LAYOUT SELF-COMPILE OK — byte-identical C for a Layout-deriving program (the native derive codegen lowers cleanly)."
   fi
   echo "native-selfhost-gate: COMPILE + LINK + RUN + SELF-COMPILE achieved — the circle closes (issue #1021)."
   exit 0
