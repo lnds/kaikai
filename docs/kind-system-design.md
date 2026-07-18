@@ -75,6 +75,73 @@ is out. This is the cheap admission filter: one op → candidate; two interactin
 `distributes_over` is deliberately absent from the property menu for exactly this
 reason.
 
+**One theory, one engine — no facades.** A theory in the catalog names a
+unification engine that exists. It is never a *label* over a formation-guard that
+reuses another theory's engine under a different name. Two theories may not share an
+engine while claiming to be distinct: either they are genuinely the same mechanism
+(then they are the *same theory*, one engine serving several kinds — as
+`AbelianGroup` serves `Measure`), or they need different engines (then they are
+different theories, each with its own). Reusing engine X for kind Y while presenting
+Y as a separate theory is the facade pattern, and it is forbidden. A kind whose theory
+has no engine of its own is not shippable — the engine is *built*, not faked. The one
+legitimate reuse is the **HM core itself**: the core is not a catalog theory, it is
+the substrate every theory extends (AbelianGroup adds AC; the shape engine adds
+witness-binding; EffectRow adds row unification). A kind whose engine *is* the core —
+first-order syntactic equality, nothing added — reuses the core the way `Type` does,
+and that is honest, not a facade.
+
+### Real engines vs. catalog claims (the honesty map)
+
+An audit of the compiler (`stage2/compiler/`) against the catalog found the catalog
+claimed more engines than exist. The truth, and the target:
+
+| Catalog entry | Engine status | Target |
+|---|---|---|
+| `HindleyMilner` (`Type`) | real — the core structural unifier | keep |
+| `EffectRow` (`Effect`) | real — row unification (`unify_row`) | keep |
+| `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_abelian`) | keep |
+| shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | keep as its **own** theory, out of the `Structural` label |
+| `Module` (`Currency`) | **facade** — body byte-identical to `AbelianGroup`; `unify_dim` delegates straight to `unify_abelian`; only a formation-guard is "Module" | **build** a real module engine (`scale` / `over R`) — a module over a ring adds scalar multiplication, an algebra the abelian group does not have |
+| `Composition` (`Layout`) | **facade** — same `unify_abelian`; the summed measure lives in codegen, not in unification | **build** a real composition engine (the measure participates in unification) |
+| `Structural`/`Region` | **no engine** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian`; `structural_kind_names` is dead code | **build** a real region-identity engine |
+| `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **not a theory** — it is a compiler mechanism (sibling of `derive`), a real feature the language keeps, moved out of the theory catalog to protocol-law verification |
+
+The principle is **build, not collapse**: a facade is paid down by writing the engine
+its theory always implied, not by deleting the theory from the design. The one entry
+that leaves the theory catalog is `Functorial` — not for lack of an engine, but
+because it is categorically not a unification theory. `Dim` (below) is the second kind
+whose engine *is* the HM core, honestly.
+
+### `Dim` — the shape-index kind, engine = the HM core
+
+`Dim` classifies static shape indices: its habitants are `Int` values (`<3>`), `with`
+form (b). `<3>` unifies with `<3>`, never with `<4>` — **first-order value
+equality**. `Vec`/`Matrix`/`Tensor` are *types over* `Dim`, not kinds
+(`type Matrix[T]<m: Dim, n: Dim>`), carrying one or more `Dim` habitants in `<>`,
+exactly as `Money` is a type over `Currency`.
+
+`Dim`'s engine is **not** the shape engine and **not** the abelian one:
+
+- Not shape: `shape_bind` binds a constructor *metavariable* by decomposing a type
+  application `D[A]` into head + argument (`shape_witness_of` yields an unapplied
+  constructor, `shape_reapply` re-applies it). `<3>` has no head, no argument, no
+  variable to bind — it is a closed value. Forcing a fake witness (`witness_of(<3>) =
+  TyCon("3",[])`) would be the forbidden makeup.
+- Not abelian: the `Real<m^2>` exponent is compared *inside* the abelian solver
+  (exponent subtraction, pivot division — Kennedy), not by a plain `Int ==`. Routing
+  `<3>` through it would model a dimension as a free abelian group on one generator
+  with exponent 3 — the `Module≡AbelianGroup` facade again.
+
+`Dim`'s engine is **first-order syntactic equality with variable binding** (Robinson,
+the thinnest fragment: constant ~ constant ⟹ equality; variable ~ constant ⟹ bind),
+which the HM core already provides — the same `==` the core uses on type-var ids,
+applied to the index *value*. So `Dim` reuses the core (legitimate, like `Type`), not
+a catalog theory (forbidden). The `<m,n>·<n,p> → <m,p>` shape rule lives in the
+operation's signature, not in a theory. The seam is `unify_dim`, which today delegates
+blindly to `unify_abelian` (`infer.kai:6499`): it must dispatch by kind — a value-index
+habitant goes to first-order equality, a product of measure symbols goes to abelian —
+which is exactly what the engine-selection comment there already anticipates.
+
 ## Theories are assembled from a closed property menu
 
 A theory is **not** an atomic primitive picked from a fixed list — it is a named
@@ -748,8 +815,21 @@ isolates habitants across kinds with no new engine and no kind-tag on
   cases, so user assembly can land later without redesign.
 - Whether `Effect`'s engine is even exposed as a `EffectRow` token, or is purely internal
   with `kind Effect` referencing it by a stdlib-core-only path.
-- Cost order: `Composition` is the cheapest new engine (trivial unification);
-  `AbelianGroup` already exists (Measure). `Semilattice` is the next real add.
+
+**Resolved (see the honesty map above), now engineering work, not open design:**
+
+- `Module`, `Composition`, `Region` each get a real engine of their own — the facade
+  audit settled *that* they must; the remaining work is to *build* them, not decide
+  whether to. `Module`'s is scalar multiplication (`scale`/`over R`); `Composition`'s
+  is measure-in-unification; `Region`'s is real identity/branding (`TyBranded`, which
+  the runtime comment admits "has not landed").
+- `Functorial` leaves the theory catalog for protocol-law verification (a compiler
+  mechanism); the language keeps the feature.
+- `Structural` dissolves: the shape engine becomes its own theory; region identity is
+  its own engine (above). `structural_kind_names`/`base_structural_kind_names` are dead
+  code to remove.
+- `Dim` stands on the HM core (first-order value equality), reached by dispatching
+  `unify_dim` on the kind rather than delegating to the abelian solver.
 
 ## References
 
