@@ -6937,7 +6937,7 @@ static KaiValue *kai_core_real_to_int(KaiValue *v) {
 
 /* ---------- Lane 4 (#473): Byte nominal scalar conversions + ops ----- */
 
-/* `int_to_byte(n)` returns `Result[String, Byte]` — Err if n is outside
+/* `int_to_byte(n)` returns `Result[Byte, String]` — Err if n is outside
  * 0..255, Ok otherwise. The Result is encoded as a KAI_VARIANT (Ok /
  * Err) with one payload. */
 static KaiValue *kai_core_int_to_byte(KaiValue *v) {
@@ -8243,7 +8243,7 @@ static KaiValue *kai_core_write_file(KaiValue *path, KaiValue *content) {
  * file chunk-by-chunk without materialising it. The handle is an opaque
  * `FileHandle` record `{ fd: Int }` — same shape as the net `Conn`.
  *
- * Error register is `Result[String, _]` (Err message first), mirroring
+ * Error register is `Result[_, String]` (Ok first), mirroring
  * `read_file`. `read_chunk` returns `Ok("")` at EOF (the spec'd
  * sentinel), never an error. Each primitive consumes its KaiValue *
  * args linearly, decref'ing before building the result.
@@ -8287,7 +8287,7 @@ static KaiValue *_kai_file_ok(KaiValue *payload) {
     return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = payload}});
 }
 
-/* open_read(path) -> Result[String, FileHandle]. Opens `path` read-only
+/* open_read(path) -> Result[FileHandle, String]. Opens `path` read-only
  * and hands back an owning FileHandle. */
 static KaiValue *kai_core_file_open_read(KaiValue *path) {
     KaiValue *r = NULL;
@@ -8345,7 +8345,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
     return r;
 }
 
-/* open_write(path) -> Result[String, FileHandle]. Opens `path` for
+/* open_write(path) -> Result[FileHandle, String]. Opens `path` for
  * writing, creating it (mode 0644) and truncating any existing
  * contents, then hands back an owning FileHandle. */
 static KaiValue *kai_core_file_open_write(KaiValue *path) {
@@ -8365,7 +8365,7 @@ static KaiValue *kai_core_file_open_write(KaiValue *path) {
     return r;
 }
 
-/* write_chunk(h, data) -> Result[String, Unit]. Writes every byte of
+/* write_chunk(h, data) -> Result[Unit, String]. Writes every byte of
  * `data` to the handle's fd, looping over partial writes. */
 static KaiValue *kai_core_file_write_chunk(KaiValue *h, KaiValue *data) {
     KaiValue *r = NULL;
@@ -8593,8 +8593,8 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
  * (macOS + Linux). Return shapes:
  *
  *   dir_list_dir(path)    : [String]              — entries (no . / ..)
- *   dir_create_dir(path)  : Result[String, Unit]  — Err message first
- *   dir_remove_dir(path)  : Result[String, Unit]
+ *   dir_create_dir(path)  : Result[Unit, String]  — Ok first
+ *   dir_remove_dir(path)  : Result[Unit, String]
  *   dir_walk(path)        : [String]              — files (not dirs),
  *                                                   depth-first; symlinks
  *                                                   are NOT followed in v1
@@ -11066,7 +11066,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
 }
 #endif
 
-/* recv_timeout(c, max, nanos) -> Option[Result[String, [Int]]]. The
+/* recv_timeout(c, max, nanos) -> Option[Result[[Int], String]]. The
  * socket-side dual of Actor.receive_timeout: park on read-readiness and
  * a `nanos` deadline, resume on whichever fires first (reactor single-
  * list dual-park). `None` = deadline elapsed before any byte; `Some(Ok
@@ -11183,7 +11183,7 @@ static KaiValue *_kai_net_ipaddr_list(struct addrinfo *p) {
     return kai_cons(_kai_net_make_ipaddr(p), tail);
 }
 
-/* resolve(host) -> Result[String, [IpAddr]] (Err-first). host is a
+/* resolve(host) -> Result[[IpAddr], String] (Ok-first). host is a
  * hostname or IPv4 dotted-quad; getaddrinfo handles both. An empty
  * result list (no AF_INET addresses) still resolves to `Ok([])` —
  * the stdlib `resolve_first` turns that into its own Err so the
