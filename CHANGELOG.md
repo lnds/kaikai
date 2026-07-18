@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.102.0 (2026-07-18)
+
+### Added
+
+- **typer**: suggest `|>` when `|` (map) fails because the fn takes the container (closes #1249) (#1262)
+
+### Fixed
+
+- **migrate**: make the Result Ok-first flip idempotent by gating it on the source edition (closes #1261) (#1264)
+
 ## v0.101.0 (2026-07-18)
 
 ### BREAKING CHANGE
