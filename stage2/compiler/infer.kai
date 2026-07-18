@@ -12909,6 +12909,67 @@ fn pipe_op_has_impl(impls: [ProtoImplReg], head: String, op: String) : Bool = ma
     if t == head and o == op { true } else { pipe_op_has_impl(rest, head, op) }
 }
 
+# `xs | f` where `f` takes the whole container instead of the element:
+# the pipe-stage parameter unifies with `lhs_ty` but not with its
+# element type. That is the `|` vs `|>` confusion, not a genuine type
+# error, so the caller swaps the raw `map` mismatch for a targeted
+# "did you mean `|>`" diagnostic. A stage that matches neither side is
+# a real mismatch and returns None.
+fn pipe_stage_wants_container(env: TyEnv, sub: Subst, lhs_ty: Ty,
+                                stage_ty: Ty) : Option[Ty] / Mutable {
+  match apply_ty(sub, stage_ty) {
+    TyFnT([p], _ret, _row) -> {
+      let param = apply_ty(sub, p)
+      let container = apply_ty(sub, lhs_ty)
+      # An open param (a bare lambda's, still a metavariable) unifies
+      # with the container for free; only a committed shape is evidence
+      # the user meant apply.
+      let param_open = match param {
+        TyVarT(_) -> true
+        TyAny     -> true
+        _         -> false
+      }
+      let takes_container = if param_open { false } else {
+        match unify_env(env, param, container, sub) {
+          Some(_) -> true
+          None    -> false
+        }
+      }
+      let takes_elem = match pipe_elem_ty(container) {
+        Some(et) -> match unify_env(env, param, apply_ty(sub, et), sub) {
+          Some(_) -> true
+          None    -> false
+        }
+        None -> false
+      }
+      if takes_container and not takes_elem { Some(param) } else { None }
+    }
+    _ -> None
+  }
+}
+
+# The operator the user typed, recovered from the op the pipe lowers to.
+fn pipe_surface_op(op: String) : String =
+  if op == "flat_map" { "||" } else if op == "filter" { "|?" } else { "|" }
+
+# The `|` → `|>` suggestion. Names the stage when it has one so the
+# message reads as the user's own code, not the desugared `map` call.
+fn emit_pipe_wants_apply(file: String, op: String, stage: Expr, param: Ty,
+                          lhs_ty: Ty, line: Int, col: Int) : Unit / Console + File {
+  let what = match callee_display_name(stage) {
+    Some(nm) -> "`#{nm}` takes"
+    None     -> "the stage takes"
+  }
+  let elem_txt = match pipe_elem_ty(lhs_ty) {
+    Some(et) -> inf_ty_to_string(et)
+    None     -> "the element"
+  }
+  diag_error(file, line, col,
+    concat_all(["`", pipe_surface_op(op), "` is element-wise; ", what, " `",
+      inf_ty_to_string(param), "`, not `", elem_txt, "`"]))
+  diag_help("did you mean `|>` (apply to the whole value)?")
+}
+
 fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -13006,7 +13067,15 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           # match identically — the surface-level lane should not
           # change unrelated diagnostic strings.
           let pipe_callee = mk_expr(callee_kind, line, col)
-          let st2 = st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
+          let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty) {
+            Some(param) -> {
+              emit_pipe_wants_apply(st_fresh.file, op, rhs, param,
+                                    apply_ty(st_fresh.sub, rl.ty), line, col)
+              st_bump_err(st_fresh)
+            }
+            None ->
+              st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
+          }
           let ty = apply_ty(st2.sub, rv.ty)
           let fused = try_fuse_map_pipe(st2, op, rc.expr, rl.expr, rf.expr, ty, line, col)
           mk_inferred(fused.st, ty, fused.root)
