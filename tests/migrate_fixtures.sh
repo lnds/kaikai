@@ -10,10 +10,11 @@
 # stderr `manual:` report matches, proving un-migratable changes are
 # reported, not silently dropped.
 #
-# A fixture with a <name>.oneshot marker skips the idempotency check
-# (step 2): a type-argument reorder like the Result Ok-first flip has
-# no post-flip marker, so re-running it would flip back — it is applied
-# exactly once per package, by design.
+# The rewrite runs as `--edition hanga-roa` (the origin edition of the
+# migration); the idempotency step re-runs it the way a user's second
+# `kai migrate` reaches the compiler — over a package that the first
+# run moved to orongo. That gate is what keeps the positional Result
+# flip from undoing itself.
 
 set -eu
 
@@ -40,7 +41,7 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
   fi
 
   # 1. rewrite matches the golden
-  if ! "$KAIC2" --migrate "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" --migrate --edition hanga-roa "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — migrate rejected input:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1)); continue
@@ -51,19 +52,17 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
     fail=$((fail + 1)); continue
   fi
 
-  # 2. idempotency: migrate(expected) == expected (skipped for one-shot
-  #    rewrites, which have no post-flip marker to recognise).
-  if [ ! -f "${input%.input.kai}.oneshot" ]; then
-    if ! "$KAIC2" --migrate "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
-      echo "  FAIL $name — migrate rejected expected (idempotency):"
-      sed 's/^/      /' "$tmp/err"
-      fail=$((fail + 1)); continue
-    fi
-    if ! diff -u "$expected" "$tmp/out2.kai" > "$tmp/diff"; then
-      echo "  FAIL $name — migrate(expected) != expected (idempotency):"
-      sed 's/^/      /' "$tmp/diff"
-      fail=$((fail + 1)); continue
-    fi
+  # 2. idempotency: the second run sees a package the first run moved
+  #    to orongo, and must be a byte-for-byte no-op.
+  if ! "$KAIC2" --migrate --edition orongo "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
+    echo "  FAIL $name — migrate rejected expected (idempotency):"
+    sed 's/^/      /' "$tmp/err"
+    fail=$((fail + 1)); continue
+  fi
+  if ! diff -u "$expected" "$tmp/out2.kai" > "$tmp/diff"; then
+    echo "  FAIL $name — migrate(expected) != expected (idempotency):"
+    sed 's/^/      /' "$tmp/diff"
+    fail=$((fail + 1)); continue
   fi
 
   # 3. the migrated output re-parses (never emits non-parsing source)
@@ -86,6 +85,29 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
   echo "  OK   $name"
   pass=$((pass + 1))
 done
+
+# The edition gate itself: the Result flip is a hanga-roa -> orongo
+# rewrite, so un-migrated Err-first source must pass through untouched
+# when the declared edition is already orongo. Without this the flip
+# would run on any input and could never converge.
+# Compared against `--fmt` of the same source, not the raw file: both
+# paths run the fmt-writer, so this isolates the rewrite from layout.
+err_first="$ROOT/examples/migrate/result_ok_first.input.kai"
+"$KAIC2" --fmt "$err_first" > "$tmp/orongo.want" 2> /dev/null
+if "$KAIC2" --migrate --edition orongo "$err_first" > "$tmp/orongo.kai" 2> "$tmp/err"; then
+  if diff -u "$tmp/orongo.want" "$tmp/orongo.kai" > "$tmp/diff"; then
+    echo "  OK   edition-gate (no Result flip under orongo)"
+    pass=$((pass + 1))
+  else
+    echo "  FAIL edition-gate — Result flip ran under orongo:"
+    sed 's/^/      /' "$tmp/diff"
+    fail=$((fail + 1))
+  fi
+else
+  echo "  FAIL edition-gate — migrate rejected --edition orongo:"
+  sed 's/^/      /' "$tmp/err"
+  fail=$((fail + 1))
+fi
 
 if [ "$fail" -gt 0 ]; then
   echo "migrate_fixtures: $pass passed, $fail failed"
