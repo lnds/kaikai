@@ -1,0 +1,189 @@
+#[doc("""
+compiler.layout_derive - the `#[derive(Layout)]` impl builder.
+
+Emits `impl Layout for T { fn to_bytes(self) ... fn from_bytes(buf, pos) ... }`
+for a record whose fields are all `U<N><be|le>`, plus a `<lower(T)>_from_bytes`
+shim (single dispatch cannot route on a return type; same rationale as
+BinSerialize's shim).
+
+The bytes are positional and byte-exact: field K lands at its declared width
+in its declared order, nothing else is written. That is the whole point of
+Layout as opposed to BinSerialize's structural format, so the encoder is the
+same `bin_put_uint_be/le` fold `layout_synth` builds - only the trigger
+(`#[derive]` instead of field shape) and the carrier (a protocol impl instead
+of a global fn) differ.
+
+`from_bytes` reads from `pos` rather than 0 and returns
+`Result[BinCursor[T], String]`, so a Layout record composes inside a
+cursor-threaded decode the same way a BinSerialize one does.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.layout_synth
+
+# Fixed byte length of a Layout record: the sum of its field widths. The
+# decoder bounds-checks once against this instead of per field.
+fn ld_total_width(fields: [LayoutField], acc: Int) : Int = match fields {
+  [] -> acc
+  [f, ...rest] -> ld_total_width(rest, acc + lf_width(f))
+}
+
+fn ld_expr(k: ExprKind, line: Int, col: Int) : Expr = mk_expr(k, line, col)
+fn ld_var(n: String, line: Int, col: Int) : Expr = ld_expr(EVar(n), line, col)
+fn ld_int(n: Int, line: Int, col: Int) : Expr = ld_expr(EInt(n), line, col)
+
+fn ld_call(callee: String, args: [Expr], line: Int, col: Int) : Expr =
+  ld_expr(ECall(ld_var(callee, line, col), args), line, col)
+
+fn ld_ty(n: String, args: [TypeExpr], line: Int, col: Int) : TypeExpr =
+  mk_ty(TyName(n, args), line, col)
+
+fn ld_param(name: String, ty: TypeExpr, line: Int, col: Int) : Param =
+  Param { pname: name, ptype: Some(ty), pline: line, pcol: col, pborrow: false }
+
+fn ld_byte_arr(line: Int, col: Int) : TypeExpr =
+  ld_ty("Array", [ld_ty("Byte", [], line, col)], line, col)
+
+# `Result[BinCursor[T], String]` — the from_bytes return shared with
+# BinSerialize.
+fn ld_result_ty(tname: String, line: Int, col: Int) : TypeExpr {
+  let self_ty = ld_ty(tname, [], line, col)
+  let cur_ty = ld_ty("BinCursor", [self_ty], line, col)
+  ld_ty("Result", [cur_ty, ld_ty("String", [], line, col)], line, col)
+}
+
+#[doc("The `#[derive(Layout)]` decls for `type T = { .. }`: the protocol impl plus the `from_bytes` shim. Empty when the body is not an all-Layout-fields record.")]
+pub fn derive_layout_impl(tname: String, body: TypeBody,
+                          line: Int, col: Int) : [Decl] = match body {
+  TBRecord(fields) -> match layout_fields_of(fields) {
+    Some(lfs) -> [ld_impl(tname, lfs, line, col), ld_shim(tname, line, col)]
+    None -> []
+  }
+  _ -> []
+}
+
+fn ld_impl(tname: String, lfs: [LayoutField], line: Int, col: Int) : Decl {
+  let self_ty = ld_ty(tname, [], line, col)
+  let to_params = [ld_param("self", self_ty, line, col)]
+  let from_params = [ld_param("buf", ld_byte_arr(line, col), line, col),
+                     ld_param("pos", ld_ty("Int", [], line, col), line, col)]
+  let to_method = DFn(false, "to_bytes", [], to_params,
+                      Some(ld_byte_arr(line, col)), REmpty,
+                      ld_to_bytes_body(lfs, line, col), line, col, None)
+  let from_method = DFn(false, "from_bytes", [], from_params,
+                        Some(ld_result_ty(tname, line, col)), REmpty,
+                        ld_from_bytes_body(tname, lfs, line, col), line, col, None)
+  DImpl("Layout", [], self_ty, [to_method, from_method], line, col)
+}
+
+# `fn <lower(T)>_from_bytes(buf, pos)` — the non-overloaded entry point.
+# Single dispatch picks the impl from the first argument, which here is the
+# buffer, so the user cannot call `from_bytes` directly.
+fn ld_shim(tname: String, line: Int, col: Int) : Decl {
+  let params = [ld_param("buf", ld_byte_arr(line, col), line, col),
+                ld_param("pos", ld_ty("Int", [], line, col), line, col)]
+  let mangled = concat_all(["__pimpl_Layout_", tname, "_from_bytes"])
+  let body = ld_call(mangled, [ld_var("buf", line, col), ld_var("pos", line, col)],
+                     line, col)
+  DFn(true, concat_all([ld_lower(tname, 0, string_length(tname), ""), "_from_bytes"]),
+      [], params, Some(ld_result_ty(tname, line, col)), REmpty, body, line, col, None)
+}
+
+# ASCII lowercaser for the shim name. Local rather than shared with
+# `protos` because this module precedes it in the bundle.
+fn ld_lower(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc } else { match char_at(s, i) {
+    None -> acc
+    Some(c) -> {
+      let nc = char_to_int(c)
+      let lc = if nc >= 65 and nc <= 90 { int_to_char(nc + 32) } else { c }
+      ld_lower(s, i + 1, n, string_concat(acc, "#{lc}"))
+    }
+  } }
+
+# --- to_bytes -------------------------------------------------------
+#
+# Left fold of `bin_put_uint_be/le(acc, __detach_unit(self.f), width)` in
+# declaration order, onto an empty buffer. `__detach_unit` erases the
+# `<be>`/`<le>` brand (identity at runtime) so the plain-`Int` helper
+# accepts the branded field.
+
+fn ld_to_bytes_body(lfs: [LayoutField], line: Int, col: Int) : Expr =
+  ld_enc_fold(lfs, ld_empty_buf(line, col), line, col)
+
+fn ld_empty_buf(line: Int, col: Int) : Expr =
+  ld_call("array_make", [ld_int(0, line, col),
+                         ld_call("bin_byte", [ld_int(0, line, col)], line, col)],
+          line, col)
+
+fn ld_enc_fold(lfs: [LayoutField], acc: Expr, line: Int, col: Int) : Expr =
+  match lfs {
+    [] -> acc
+    [f, ...rest] -> {
+      let putter = if lf_is_be(f) { "bin_put_uint_be" } else { "bin_put_uint_le" }
+      let fld = ld_expr(EField(ld_var("self", line, col), lf_name(f)), line, col)
+      let raw = ld_call("__detach_unit", [fld], line, col)
+      ld_enc_fold(rest, ld_call(putter, [acc, raw, ld_int(lf_width(f), line, col)],
+                                line, col), line, col)
+    }
+  }
+
+# --- from_bytes -----------------------------------------------------
+#
+# One length check, then a match tower of `bin_get_uint_be/le(buf, pos + off, w)`
+# reads. The reads cannot fail once the length check passes, but the getters
+# return `Option`, so each arm still threads a `None -> Err(..)` branch rather
+# than asserting.
+
+fn ld_from_bytes_body(tname: String, lfs: [LayoutField], line: Int, col: Int) : Expr {
+  let width = ld_total_width(lfs, 0)
+  let have = ld_call("array_length", [ld_var("buf", line, col)], line, col)
+  let need = ld_expr(EBinop("+", ld_var("pos", line, col), ld_int(width, line, col)),
+                     line, col)
+  let short = ld_expr(EBinop("<", have, need), line, col)
+  let err = ld_call("Err", [ld_expr(EStr(ld_short_msg(tname), false), line, col)], line, col)
+  ld_expr(EIf(short, err, Some(ld_tower(tname, lfs, 0, [], line, col))), line, col)
+}
+
+# `EStr` carries the raw source span, quotes included.
+fn ld_short_msg(tname: String) : String =
+  concat_all(["\"Layout ", tname, ": buffer too short\""])
+
+fn ld_tower(tname: String, lfs: [LayoutField], off: Int, bound: [String],
+            line: Int, col: Int) : Expr = match lfs {
+  [] -> ld_ok_cursor(tname, list_reverse(bound), off, line, col)
+  [f, ...rest] -> {
+    let getter = if lf_is_be(f) { "bin_get_uint_be" } else { "bin_get_uint_le" }
+    let at = ld_expr(EBinop("+", ld_var("pos", line, col), ld_int(off, line, col)),
+                     line, col)
+    let read = ld_call(getter, [ld_var("buf", line, col), at,
+                                ld_int(lf_width(f), line, col)], line, col)
+    let ok = ld_tower(tname, rest, off + lf_width(f), [lf_name(f), ...bound], line, col)
+    let some_arm = Arm(mk_pat(PVariant("Some", [mk_pat(PBind(lf_name(f)), line, col)]),
+                              line, col), None, ok)
+    let none_arm = Arm(mk_pat(PVariant("None", []), line, col), None,
+                       ld_call("Err", [ld_expr(EStr(ld_short_msg(tname), false), line, col)],
+                               line, col))
+    ld_expr(EMatch(read, [some_arm, none_arm]), line, col)
+  }
+}
+
+# `Ok(BinCursor { value: T { f: __attach_unit(f), .. }, pos: pos + width })`.
+# `__attach_unit` re-applies the field's brand so the plain `Int` the getter
+# returned fits the branded record field.
+fn ld_ok_cursor(tname: String, names: [String], width: Int,
+                line: Int, col: Int) : Expr {
+  let rec_e = ld_expr(ERecordLit(tname, ld_field_inits(names, line, col)), line, col)
+  let end = ld_expr(EBinop("+", ld_var("pos", line, col), ld_int(width, line, col)),
+                    line, col)
+  let cur = ld_expr(ERecordLit("BinCursor", [FI("value", rec_e), FI("pos", end)]),
+                    line, col)
+  ld_call("Ok", [cur], line, col)
+}
+
+fn ld_field_inits(names: [String], line: Int, col: Int) : [FieldInit] = match names {
+  [] -> []
+  [n, ...rest] -> [FI(n, ld_call("__attach_unit", [ld_var(n, line, col)], line, col)),
+                   ...ld_field_inits(rest, line, col)]
+}
