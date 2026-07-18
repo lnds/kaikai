@@ -143,15 +143,15 @@ Two layers:
    the standard property assemblies and gives each visibility:
 
    ```kaikai
-   priv theory Structural    = { }                                  # Type's engine — private
+   theory Structural    = builtin                                   # Type/Region/Shape's engine — closed
    pub  theory AbelianGroup = { assoc, commut, inverse, identity }
    pub  theory Semilattice   = { assoc, commut, idempotent }
    pub  theory Composition   = { assoc, measure }
-   priv theory Rows          = { assoc, commut, idempotent, rows }  # Effect's engine — private
+   theory EffectRow          = builtin                              # Effect's engine — closed
    ```
 
-   **Two theories are private** (`Structural`, `Rows`), for the same reason: their
-   only useful kind is already built-in and must not be user-replicated. `Type` is the
+   **Two theories are `builtin`** (`Structural`, `EffectRow`), for the same reason: their
+   engine is the compiler core and admits no user-declared kind. `Type` is the
    sole structural kind — a user-declared isolated type universe
    (`kind Validated : Structural`) would add only *isolation*, which phantom types /
    newtypes already approximate. `Effect` is the sole rows kind (its machinery is
@@ -159,8 +159,8 @@ Two layers:
    algebra nothing else gives — Money's abelian group, Perm's idempotent join,
    Waterfall's summed measure. The admission criterion:
 
-   > **A theory is public if declaring new kinds over it yields an algebra nothing else
-   > provides; private if its only useful kind is already built-in.**
+   > **A theory is assemblable if declaring new kinds over it yields an algebra nothing
+   > else provides; `builtin` if its only useful kind is already the compiler core.**
 
 ### The `theory` declaration is module-restricted
 
@@ -180,8 +180,8 @@ every other symbol. No new `intrinsic`/`builtin` marker: visibility is the barri
 
 ```kaikai
 # stdlib/core/kinds.kai
-pub  kind Type    : Structural                       # public: usable
-priv kind Effect  : Rows                              # DECLARED, but private → unusable
+kind Type    : HindleyMilner with type               # builtin engine, closed
+kind Effect  : EffectRow with effect                 # builtin engine, closed → user cannot classify a kind by it
 pub  kind Measure   : AbelianGroup with unit
 pub  kind Currency  : Module over T with currency        # NOT AbelianGroup; scalar is the carrier T — see below
 pub  kind Perm      : Semilattice  with perm
@@ -198,26 +198,27 @@ pub  kind Waterfall : Composition over Rational with pct
 > ring, no element×element product. See *The surface: `[carrier]`, `<habitant>`, `over`, `with`*
 > and *When to separate two abelian kinds* below.
 
-**Declared-but-unusable is just `priv`.** `Effect` *is* a first-class kind — real,
-declared, in the registry, listed by `kai info kinds` — but `priv`, so a user who writes
-`kind X : Rows` or references `Effect` gets a visibility error, the same one any
-`priv` symbol produces. `Rows` is likewise `priv`. The compiler knows `rows`/`Effect`
-exist (to give a clear error), but the pub-leak validator forbids their use outside
-`stdlib/core`. This answers "how is a kind declared yet unusable" without a bespoke
-concept: it is the visibility kaikai already has.
+**Declared-but-unusable because the engine is `builtin`.** `Effect` *is* a first-class
+kind — real, declared, in the registry, listed by `kai info kinds` — but its theory
+`EffectRow` is `builtin`: the engine is the compiler core (row unification), closed by
+construction. A user who writes `kind X : EffectRow` gets `EffectRow is a builtin theory
+and cannot classify a user-declared kind`. The same holds for `Type` over `HindleyMilner`.
+The compiler knows `Effect`/`EffectRow` exist (to give a clear error), but a `builtin`
+theory admits no new kinds over it. This answers "how is a kind declared yet unusable":
+the barrier is the closed builtin engine, not visibility.
 
-A user may declare kinds over **public** theories only:
+A user may declare kinds over **non-builtin** theories only:
 
 ```kaikai
-kind Metric : AbelianGroup with metric      # ✓ AbelianGroup is public
+kind Metric : AbelianGroup with metric      # ✓ AbelianGroup is assemblable
 kind Perm   : Semilattice with perm          # ✓
-# kind Access : Structural                   # ✗ pub-leak: Structural is private
-# kind Bad   : Rows                          # ✗ pub-leak: Rows is private
+# kind Access : Structural                   # ✗ Structural is builtin (closed)
+# kind Bad   : EffectRow                      # ✗ EffectRow is builtin (closed)
 ```
 
 Isolated type universes (a `Validated` vs `Unvalidated` kind) are **not** available —
-`Structural` is private, `Type` is its only kind. Use a phantom type / newtype for
-that isolation; the kind would add nothing a wrapper does not.
+`Structural` is builtin, so a user cannot declare a kind over it. Use a phantom type /
+newtype for that isolation; the kind would add nothing a wrapper does not.
 
 ## Habitants — the introducer and its policy
 
@@ -567,8 +568,8 @@ remains Measure-only.
    hung type checker. Engines live in the compiler.
 2. **Standard theories live in one module.** The `theory` form is legal only in
    `stdlib/core/theories`; a `Token` naming no decidable assembly is an error.
-3. **Some declared kinds are unusable.** `priv kind Effect : Rows` — real, registered,
-   `kai info`-visible, but the pub-leak validator forbids use outside `stdlib/core`.
+3. **Some declared kinds are unusable.** `kind Effect : EffectRow` — real, registered,
+   `kai info`-visible, but `EffectRow` is builtin so no user kind may be declared over it.
    Visibility is the barrier, not a new marker.
 
 ## When to separate two abelian kinds (Measure/Money was a trap)
@@ -726,8 +727,8 @@ isolates habitants across kinds with no new engine and no kind-tag on
   ship in the first cut or are deferred — the mechanism (closed property menu +
   decidable-combination check) is designed, but the standard aliases cover the known
   cases, so user assembly can land later without redesign.
-- Whether `Effect`'s engine is even exposed as a `Rows` token, or is purely internal
-  with `priv kind Effect` referencing it by a stdlib-core-only path.
+- Whether `Effect`'s engine is even exposed as a `EffectRow` token, or is purely internal
+  with `kind Effect` referencing it by a stdlib-core-only path.
 - Cost order: `Composition` is the cheapest new engine (trivial unification);
   `AbelianGroup` already exists (Measure). `Semilattice` is the next real add.
 
@@ -736,6 +737,6 @@ isolates habitants across kinds with no new engine and no kind-tag on
 - `docs/kinds.md` — the current two-kind system this generalises.
 - `docs/units-of-measure.md` — the `AbelianGroup` engine (`unify_unit`, Kennedy).
 - `docs/layout-kind-design.md` — `Composition` / `Layout` detail (incl. TLV).
-- `docs/effects.md` — the `Rows` machinery (why `Effect` is private, not a public
+- `docs/effects.md` — the `EffectRow` machinery (why `Effect` is builtin, not a catalog
   theory: row variables + runtime handlers exceed a catalog theory).
 - CLAUDE.md Tier 1 #3 — decidable HM, the constraint that closes the property menu.
