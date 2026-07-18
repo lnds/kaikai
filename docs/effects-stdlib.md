@@ -471,19 +471,6 @@ timing decided when the first real use case pushes them:
 
 ## `File`
 
-> **Cross-cutting note on `Result` type-arg order.** Throughout this
-> doc, ops return `Result[Ok, Err]` Rust-style (Ok-first). kaikai's
-> actual `Result[e, a]` type is **Err-first** — `e` is the error
-> payload, `a` is the success payload. See `stdlib/effects.kai:97-105`.
-> So the runtime emits `Result[String, String]` for `read_file` as
-> Err=String / Ok=String (which collapses), but `Result[Unit, String]`
-> for `write_file` actually means Err=Unit / Ok=String — the inverse
-> of what a Rust reader expects. Pattern-match `Ok`/`Err` by
-> constructor name (always unambiguous), do NOT rely on positional
-> type-arg order copied from this doc. The type-arg-order rewrite is
-> tracked separately and is not gating any user code today; the
-> constructors are the source of truth.
-
 ### Declaration
 
 ```kai
@@ -491,10 +478,10 @@ effect File {
   read_file(path: String)                       : Result[String, String]
   write_file(path: String, content: String)     : Result[Unit, String]
   # Issue #771 Phase 1 — chunked / streaming IO (shipped).
-  open_read(path: String)                       : Result[String, FileHandle]
+  open_read(path: String)                       : Result[FileHandle, String]
   read_chunk(h: FileHandle, max: Int)           : Result[String, String]
-  open_write(path: String)                      : Result[String, FileHandle]
-  write_chunk(h: FileHandle, data: String)      : Result[String, Unit]
+  open_write(path: String)                      : Result[FileHandle, String]
+  write_chunk(h: FileHandle, data: String)      : Result[Unit, String]
   close_file(h: FileHandle)                     : Unit
 }
 ```
@@ -562,14 +549,14 @@ chunked ops keep an OS file descriptor open across calls so a
 consumer can pull a large file piece-by-piece without holding it
 all in memory:
 
-- `open_read(path) : Result[String, FileHandle]` — open read-only.
+- `open_read(path) : Result[FileHandle, String]` — open read-only.
 - `read_chunk(h, max) : Result[String, String]` — read up to `max`
   bytes. `Ok("")` is the **EOF sentinel** (never an `Err`); a short
   read (fewer than `max` bytes but more than zero) is normal — the
   caller loops until it sees the empty string.
-- `open_write(path) : Result[String, FileHandle]` — open for
+- `open_write(path) : Result[FileHandle, String]` — open for
   writing, creating (mode 0644) and truncating any existing file.
-- `write_chunk(h, data) : Result[String, Unit]` — write every byte
+- `write_chunk(h, data) : Result[Unit, String]` — write every byte
   of `data`, looping over partial writes.
 - `close_file(h) : Unit` — close the descriptor. Single error
   channel collapses to none: the fd is gone either way.
@@ -579,7 +566,7 @@ the same shape as the net `Conn`. It is single-owner: sharing a
 `FileHandle` across fibers is undefined in v1, the same stance as
 the stdin singleton.
 
-The error register is `Result[String, _]` (Err message first),
+The error register is `Result[_, String]` (Ok first),
 mirroring `read_file` — callers branch on the motive (missing /
 permission / mid-stream fault). The ergonomic line surface layers on
 top of these primitives in `stdlib/stream.kai` (issue #801, shipped):
@@ -882,7 +869,7 @@ effect NetUdp {
 }
 
 effect NetDns {
-  resolve(host: String)                         : Result[String, [IpAddr]]
+  resolve(host: String)                         : Result[[IpAddr], String]
 }
 
 type Net = NetTcp + NetUdp + NetDns
@@ -1013,8 +1000,8 @@ pub fn tcp_connect_or_fail(host: String, port: Int) : Conn / NetTcp + Fail {
 ```
 
 `stdlib/net/dns.kai` (issue #352) ships the `NetDns` surface:
-`resolve(host) : Result[String, [IpAddr]] / NetDns` (thin pass-
-through to the op), `resolve_first(host) : Result[String, IpAddr] /
+`resolve(host) : Result[[IpAddr], String] / NetDns` (thin pass-
+through to the op), `resolve_first(host) : Result[IpAddr, String] /
 NetDns` (first address, or `Err` when the host resolves to none),
 and `with_dns(resolver, body)` — a handler installer that runs
 `body` against a caller-supplied resolver instead of the
