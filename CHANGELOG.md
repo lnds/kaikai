@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.101.0 (2026-07-18)
+
+### BREAKING CHANGE
+
+- `Result`'s type-argument order changes from
+`Result[Error, Ok]` to `Result[Ok, Error]` (Rust order). `Ok`/`Err`
+are position-independent, so only type annotations move; `kai migrate`
+rewrites them automatically.
+- stdlib ops that return `Result` now carry the success
+type first (Rust order). Match on `Ok`/`Err` by constructor as before.
+
+### Fixed
+
+- **kinds**: three quick-wins — contextual `unit`, Functorial doc-drift, closed property menu (#1259)
+
 ## v0.100.0 (2026-07-18)
 
 ### Added
