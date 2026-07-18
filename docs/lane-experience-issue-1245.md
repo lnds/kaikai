@@ -142,15 +142,16 @@ instead of a judgement call.
 
 ## Follow-ups left for next lanes
 
-1. **`DDerive` sibling wrappers in `unit_walk`** — `DUnstable`, `DProtoLaws`,
-   `DImplAxiom`, `DConstructor` pass through unchanged. Same latent bug, not
-   currently reachable. A sweep should either fix all or document why not.
-2. **`validate_derive_layout`** — reject `#[derive(Layout)]` on a non-Layout-bearing
-   record with a message naming the offending field, mirroring
+1. **`DDerive` sibling wrappers in `unit_walk`** (#1278) — `DUnstable`,
+   `DProtoLaws`, `DImplAxiom`, `DConstructor` pass through unchanged. Same latent
+   bug. A sweep should either fix all or document why not.
+2. **`validate_derive_layout`** (#1279) — reject `#[derive(Layout)]` on a
+   non-Layout-bearing record with a message naming the offending field, mirroring
    `validate_derive_binserialize`.
-3. **`#[derive(Json)]` / `#[derive(Xml)]`** — now unblocked;
-   `docs/json-derive-design.md` is the design and `derive_layout_impl` is the
-   second worked example of the pattern.
+3. **`#[derive(Json)]` / `#[derive(Xml)]`** (#1280) — mechanically unblocked;
+   `derive_layout_impl` is the second worked example of the pattern. The design
+   doc is still marked "proposal, not accepted", and the naming / null / error-shape
+   policy calls remain open.
 4. **Hoist `string_to_lower_ascii` to `util`** if a third derive needs it.
 5. **TLV / nested Layout records / signed heads** — unchanged from before this
    lane; still rejected up front rather than mis-encoded.
