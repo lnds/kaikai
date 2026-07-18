@@ -489,7 +489,7 @@ the operation crosses. Present exactly when the theory has two domains, absent o
   (a number). `over Int` (Layout, byte sizes) / `over Rational` (Waterfall, exact %s). Here
   `over` names the measure type, an additive second domain, not a multiplicative scalar.
 - Single-domain theories take **no** `over`: `AbelianGroup`/Measure (`unit × unit → unit`,
-  one domain — the rich `m/s²` algebra is still one domain), `Semilattice`, `Dimensional`.
+  one domain — the rich `m/s²` algebra is still one domain), `Semilattice`.
 
 The sharp line: **`over` is not "more than one operation" — it is "does the operation cross two
 distinct type domains?"** UoM has `·`, `/`, `^` but all within one domain (units) → no `over`.
@@ -504,7 +504,18 @@ behaves (opaque vs measure-carrying, open vs closed — the per-theory propertie
   symbol, open set. Money, Perm, Measure (`unit`).
 - **(b) type → value** — `with Int`, `with String`. Habitants **are values** of that type,
   written directly (`<3>`, `<"tag">`), not declared; the type restricts validity
-  (`Matrix[Real]<3,4>` ok, `<USD,4>` error). `Dim`, `Matrix`.
+  (`Matrix[Real]<3,4>` ok, `<USD,4>` error). The one kind here is `kind Dim : Structural with Int`
+  — a habitant is a single `Int`. `Vec`, `Matrix`, `Tensor` are **types over `Dim`**, not kinds:
+  `type Vec[T]<n: Dim>`, `type Matrix[T]<m: Dim, n: Dim>` — they carry one or more `Dim`
+  habitants in `<>`, exactly as `Money` is a type over `Currency` and `Real` a type over
+  `Measure`. `Dim` alone owns habitants (`Int` values); `Matrix` owns none, it consumes `Dim`'s.
+  `Dim`'s theory is `Structural`, not one of its own: two habitants unify iff they are the *same
+  value* — value-equality is exactly what `Structural` decides over symbols, now over a carrier
+  type's values. The inner-index cancellation of matmul (`<m,n>·<n,p>` needs `n ≡ n`) is that
+  equality, and the `<m,n>·<n,p> → <m,p>` shape rule lives in the operation's **signature**, like
+  `u^2` in `area`'s — not in the theory. So no `Dimensional` theory is introduced: value-equality
+  over `Int` yields no algebra `Structural` does not already give, which the admission criterion
+  below rejects.
 - **(c) introducer → symbol-with-measure** — `with pct` ⇒ `pct pct70 = 70`. A declared symbol
   that **carries a number** the theory sums. Waterfall. The `= N` is the habitant declaring
   its measure (a measure-carrying theory).
@@ -531,6 +542,14 @@ type, no parallel "dynamic Money"). For Matrix: static shapes `Matrix<3,4> * Mat
 at compile time (inner `4` cancels); a matrix of runtime-unknown shape checks at runtime (a trap
 like an out-of-bounds index). Same split both cases — this is the "practicidad" that makes
 indecidable structures usable without weakening Tier 1 #3's static core.
+
+The Matrix split falls out of its theory being `Structural`: `Structural` decides only
+equality, so the decidable half is exactly the equalities — shape identity, matmul's inner-index
+cancellation, transpose. Everything arithmetic — `reshape` (`m·n = p·q`), `concat` (`n+k`),
+broadcast — is *not* an equality, so it is not in the theory at all and lands on the runtime side.
+That is the tell that `Matrix` needs no theory beyond `Structural`: there is no type-level
+arithmetic engine to justify one, and inventing a `Dimensional` alias byte-equal to
+"`Structural` over values" would be the empty-alias trap the closed menu exists to prevent.
 
 ## Usage — uniform surface
 
