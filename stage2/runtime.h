@@ -3113,6 +3113,11 @@ static _Atomic int kai_sched_shutting_down = 0;
 #define KAI_PARK_STDIN         5
 #define KAI_PARK_SIGNAL        6
 #define KAI_PARK_FILEPOOL      7
+/* Non-reactor park (mailbox recv, await, send-block). Committed under the
+ * fiber's slot lock — not reactor_mu — by kai_sched_commit_park. Deferred
+ * like the reactor reasons so PARKED is set only after the exit swap saved
+ * the fiber's ctx, closing the steal-a-half-saved-context race at N>1. */
+#define KAI_PARK_SLOT          8
 
 /* F2 — per-thread head of the pending-commit stack (fibers that stamped a
  * reactor park and yielded, waiting for the root to link them). Drained by
@@ -3149,6 +3154,8 @@ static KAI_TLS KaiFiber *kai_requeue_stack_head = NULL;
  * scheduler primitives (drain_commit_stack). */
 static void kai_sched_commit_park(KaiFiber *f);
 static void kai_drain_commit_stack(void);
+static inline int  kai_fiber_slot_lock(KaiFiber *f);
+static inline void kai_fiber_slot_unlock_at(int home);
 static void kai_drain_requeue_stack(void);
 static void kai_reactor_mark_ready(KaiFiber *f);
 static void kai_reactor_wake(void);
@@ -3174,6 +3181,24 @@ KAI_TLS KaiFiber *kai_pending_free = NULL;
 static KAI_TLS KaiFiber *kai_pending_free = NULL;
 #endif
 
+/* Single-slot deferred drop of the trampoline tail's own scheduler ref
+ * (`self->value`) at N>1. The tail keeps running on its private stack after
+ * dropping that ref (dequeue + setcontext below), so dropping it inline would
+ * let a peer thread holding the last other ref (a discarded Fiber[T] handle)
+ * take RC to 0 and munmap the stack out from under the still-running tail.
+ * Stashing the ref keeps RC >= 1 across the tail; the next context drops it
+ * once the setcontext has left the doomed stack. Same drain sites and
+ * single-slot discipline as kai_pending_free (every consumer drains before the
+ * next produce). N=1 has no peer thread and decrefs inline (byte-identical). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiValue *kai_pending_sched_drop;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
+#  endif
+#else
+static KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
+#endif
+
 /* Forward decl — defined alongside the m8.x fiber stack allocator
  * later in the file, but used here by the free path (munmap needs the
  * stack_size + page_size total). */
@@ -3188,6 +3213,14 @@ static size_t kai_page_size(void);
 #endif
 
 static void kai_drain_pending_free(void) {
+    /* Drop a trampoline tail's deferred scheduler ref first: we are now on
+     * the next context's stack, so the doomed tail's stack is abandoned and
+     * this decref (which may take RC to 0 and munmap that stack) is safe. */
+    KaiValue *sv = kai_pending_sched_drop;
+    if (sv) {
+        kai_pending_sched_drop = NULL;
+        kai_decref(sv);
+    }
     KaiFiber *f = kai_pending_free;
     if (!f) return;
     kai_pending_free = NULL;
@@ -13416,6 +13449,28 @@ static void kai_reactor_wait(void) {
  * timeout (the residual-deadlock fix: a timer linked while poll slept was
  * never drained). Only reached at N>1 (the N=1 park sites link inline). */
 static void kai_sched_commit_park(KaiFiber *f) {
+    /* Non-reactor park: commit under f's slot lock, not reactor_mu. Its ctx
+     * is now saved (the exit swap completed), so publishing it PARKED is
+     * safe. Re-check wake_pending: a send that raced the pre-commit window
+     * saw us RUNNING and bumped it instead of enqueuing — honour that here
+     * by going straight to READY on the steal deque rather than parking. */
+    if (f->pending_park == KAI_PARK_SLOT) {
+        int home = kai_fiber_slot_lock(f);
+        KaiSchedSlot *s = &kai_sched_slots[home];
+        if (f->wake_pending > 0) {
+            f->wake_pending--;
+            f->state = KAI_FIBER_READY;
+            f->sched_next = NULL;
+            if (s->steal_tail) s->steal_tail->sched_next = f;
+            else               s->steal_head = f;
+            s->steal_tail = f;
+        } else {
+            f->state = KAI_FIBER_PARKED;
+        }
+        kai_fiber_slot_unlock_at(home);
+        f->pending_park = KAI_PARK_NONE;
+        return;
+    }
     kai_reactor_lock();
     f->state = KAI_FIBER_PARKED;
     switch (f->pending_park) {
@@ -13811,70 +13866,28 @@ static void kai_drain_requeue_stack(void) {
 static void kai_sched_park(void) {
     KaiFiber *current = kai_active_fiber;
 
-    /* M:N path: a fiber that parks with no local work returns to this
-     * thread's scheduler loop (kai_main_fiber) — never runs poll() or a
-     * condvar wait on its own stack (asu invariant: nothing that blocks
-     * the OS thread runs on a user fiber's stack). While local work
-     * exists, switch directly fiber→fiber (Go's gogo, not a trip through
-     * the loop). The lost-wakeup window between a mailbox recv-waiter
-     * enqueue and this park is closed by `wake_pending`. */
+    /* M:N path: a parking fiber returns to this thread's scheduler loop
+     * (kai_main_fiber) — never runs poll() or a condvar wait on its own
+     * stack (asu invariant: nothing that blocks the OS thread runs on a
+     * user fiber's stack).
+     *
+     * Both reactor parks (pending_park already stamped by the site) and
+     * non-reactor parks (mailbox recv, await, send-block) yield
+     * UNCONDITIONALLY to the root and let it mark PARKED — from the root's
+     * stack, after this swap has finished saving our ctx. Setting PARKED
+     * inline, before the save, would let a cross-thread remote_unpark flip
+     * us READY onto the steal deque while our ctx is still being written,
+     * and a thief could then resume a half-saved context (garbage RIP).
+     * State stays RUNNING across the swap; a wake that races the commit
+     * takes remote_unpark's wake_pending path, which kai_sched_commit_park
+     * re-checks (reactor reasons under reactor_mu, KAI_PARK_SLOT under the
+     * slot lock) before it commits. */
     if (kai_nthreads > 1) {
-        /* F2 reactor park: the site stamped a park reason but touched no
-         * shared reactor structure. Push onto this thread's commit stack
-         * and yield UNCONDITIONALLY to the root (never a direct fiber→fiber
-         * switch) — the root links us into the wheel/waiter list from
-         * kai_main_fiber's stack, after this swap has finished saving our
-         * ctx, so no reactor drain resumes a half-written context. State
-         * stays RUNNING until commit_park marks it PARKED under reactor_mu.
-         * There is no wake_pending race here: a reactor-parked fiber is
-         * never on a mailbox waiter list, and a cancel detach that could
-         * wake us also runs under reactor_mu, serialized with the commit. */
-        if (current->pending_park) {
-            current->commit_next   = kai_commit_stack_head;
-            kai_commit_stack_head  = current;
-            kai_active_fiber = &kai_main_fiber;
-            swapcontext(&current->ctx, &kai_main_fiber.ctx);
-            kai_active_fiber = current;
-            kai_drain_pending_free();
-            kai_check_cancel_yield_point();
-            return;
-        }
-        KaiSchedSlot *s = kai_sched_slot();
-        pthread_mutex_lock(&s->mu);
-        current->state = KAI_FIBER_PARKED;
-        if (current->wake_pending > 0) {
-            /* A cross-thread send already tried to wake us; do not park. */
-            current->wake_pending--;
-            current->state = KAI_FIBER_RUNNING;
-            pthread_mutex_unlock(&s->mu);
-            kai_check_cancel_yield_point();
-            return;
-        }
-        pthread_mutex_unlock(&s->mu);
-
-        KaiFiber *next = kai_sched_dequeue();
-        if (next == current) {
-            /* A concurrent remote_unpark enqueued us in the window between
-             * the unlock above and this dequeue (it saw state==PARKED and
-             * flipped us READY onto our own steal list). We are runnable and
-             * now off the queue, so resume instead of parking — swapping to
-             * the root here would strand a READY fiber off every queue, a
-             * lost wakeup. */
-            current->state = KAI_FIBER_RUNNING;
-            kai_check_cancel_yield_point();
-            return;
-        }
-        if (next) {
-            next->state = KAI_FIBER_RUNNING;
-            kai_active_fiber = next;
-            swapcontext(&current->ctx, &next->ctx);
-        } else {
-            /* No local work: hand control back to the scheduler loop on
-             * this thread's root context, which steals / drives I/O /
-             * idles. We resume here when someone re-readies us. */
-            kai_active_fiber = &kai_main_fiber;
-            swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        }
+        if (!current->pending_park) current->pending_park = KAI_PARK_SLOT;
+        current->commit_next   = kai_commit_stack_head;
+        kai_commit_stack_head  = current;
+        kai_active_fiber = &kai_main_fiber;
+        swapcontext(&current->ctx, &kai_main_fiber.ctx);
         kai_active_fiber = current;
         kai_drain_pending_free();
         kai_check_cancel_yield_point();
@@ -14027,15 +14040,21 @@ static void kai_fiber_trampoline(void) {
 
     /* R4 fix — drop the scheduler-side incref on our wrapper, taken
      * by `kai_default_spawn_spawn` before enqueue. Pairs `enqueue`
-     * with this single decref. If the user already discarded their
-     * Fiber[T] handle, this brings RC to 0 and `kai_free_value`
-     * defers the struct/stack free into `kai_pending_free` (we are
-     * still standing on this fiber's stack); the next fiber's drain
-     * hook reaps it. If awaiters or the user still hold the handle,
-     * the wrapper survives this decref and is freed later by their
-     * own drops. */
+     * with this single decref.
+     *
+     * At N>1 we must NOT drop it inline: the tail keeps running on this
+     * fiber's private stack below (dequeue + setcontext), and a peer thread
+     * holding the last other ref (a discarded Fiber[T] handle) could take RC
+     * to 0 and munmap this stack the instant we drop ours. Stash the ref so
+     * RC stays >= 1 across the tail; the next context drops it once the
+     * setcontext has left this stack (folded into the pending-free drain).
+     * At N=1 there is no peer thread, so decref inline — if RC hits 0,
+     * kai_free_value defers the struct/stack free into kai_pending_free (we
+     * are still on this stack) and the next drain reaps it; byte-identical to
+     * the pre-M:N path. */
     if (self->value) {
-        kai_decref(self->value);
+        if (kai_nthreads > 1) kai_pending_sched_drop = self->value;
+        else                  kai_decref(self->value);
     }
 
     /* Hand control to the next ready fiber. Awaiters we just woke
