@@ -463,7 +463,7 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
 
 - **Kind engine** (#1108, PR #1133) — user abelian kinds, per-kind
   habitant isolation, use-site resolution, the `unify_<theory>`
-  dispatch seam for future theories (`Structural`, `Module`).
+  dispatch seam for future theories (`Nominal`, `Module`).
 - **Borrow** (#1129/#1130/#1138) — `^` surface + interface ABI,
   non-consuming indirect calls (closure RC eliminated), relaxed
   read-path inference, modular-safe.

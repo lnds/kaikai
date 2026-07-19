@@ -1,9 +1,11 @@
 # The kind system
 
-> Status: the catalog (`stdlib/core/kinds.kai`) declares six
+> Status: the catalog (`stdlib/core/kinds.kai`) declares seven
 > kinds — `Type` and `Effect` (builtin, closed), `Measure`
-> (`AbelianGroup`), `Currency` (`Module`), `Region`
-> (`Structural`, identity), and `Layout` (`Composition`). The
+> (`AbelianGroup`), `Currency` (`Module`), `Region` (`Nominal`,
+> identity), `Layout` (`Composition`), and `Shape`
+> (`ConstructorApp`). One theory names one engine: a theory is
+> never a label over a guard reusing another theory's engine. The
 > `kind` / `theory` declaration surface and the generalized engine
 > (user kinds over `AbelianGroup`, `Module`, or `Composition`,
 > per-kind isolation, use-site resolution, cross-kind bind
@@ -33,8 +35,9 @@ unification discipline that decides how its habitants unify:
 | `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
 | `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
 | `Currency` | `Module` | abelian unifier + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
-| `Region`  | `Structural` | builtin (symbol identity) | `region` | memory arenas: each `r` is skolemized fresh by a `region { r -> }` block; `Tree<r>` carries it |
+| `Region`  | `Nominal` | builtin (symbol identity) | `region` | memory arenas: each `r` is skolemized fresh by a `region { r -> }` block; `Tree<r>` carries it |
 | `Layout`  | `Composition` | atomic-habitant guard (identity) + codegen | `layout` | byte-order modifiers: `be`, `le` — `U32<be>` is a 4-byte big-endian field |
+| `Shape`   | `ConstructorApp` | builtin (constructor witness-binding) | *(derived)* | arity-1 type constructors: `List`, `Option`, a user `Tree[a]` — every arity-1 `type` is a habitant |
 
 A `builtin` theory (`theory HindleyMilner = builtin`) names an
 engine that is the compiler core itself rather than a property
@@ -54,13 +57,17 @@ in their own machinery (see `docs/effects.md`); `Effect` classifies
 the labels, and only unit-shaped kinds appear in tparam
 annotations (`[u: Measure]`, `[c: Currency]`, `[r: Region]`).
 
-### The `Structural` theory
+### The `Nominal` theory
 
-`theory Structural = builtin` decides habitants by **identity
-alone**: two habitants unify iff they are the same symbol. No
+`theory Nominal = builtin` decides habitants by **identity
+alone**: two habitants unify iff they are the same habitant. No
 product, no inverse, no sum — a habitant stands only for itself.
-The compiler core already gives this (symbol equality in the
-dimension unifier), so it is `builtin`. `Region` is its one kind.
+`Region` is its one kind.
+
+`Shape` was once grouped under a shared `Structural` label with
+`Region`. It is not: shape unification binds a constructor
+witness by decomposing `s[A]`, which region identity never does.
+`Shape` carries its own theory, `ConstructorApp`.
 
 A region habitant is never declared at item scope the way
 `unit m` declares a measure; each is skolemized fresh by a
