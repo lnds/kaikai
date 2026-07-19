@@ -1,0 +1,73 @@
+# Issue #1295 — a binder read through a COMPOUND arg in a borrowed callee
+# slot must still count as a consuming use.
+#
+# `keep_by_mo` mirrors the compiler's `decls_of_origin_loop`: a guard-less
+# goto-tail arm binds `r`, reads it NESTED inside slot 0 of `opt_same`
+# (non-pub, both params inferred borrowed), then stores `r` in the
+# accumulator on the kept path. The borrow-aware max-path count discounted
+# the whole slot-0 subtree, so `r` looked single-read: every read went raw,
+# `rec_mo` (pub, owned param) consumed the binder's only ref, and each
+# element's rc hit zero while the input list still held it — the
+# second-generation-compiler heap-use-after-free. The discount is only
+# sound for a BARE var in the borrowed slot. Each element owns a heap
+# string in a direct slot; re-reading those strings after two filter
+# passes turns the over-free into an ASAN-visible read of freed payload.
+
+pub type Rec = RA(Option[String], String, Int) | RB(Int)
+
+pub fn rec_mo(r: Rec) : Option[String] = match r {
+  RA(mo, _, _) -> mo
+  _            -> None
+}
+
+pub fn rec_name(r: Rec) : String = match r {
+  RA(_, n, _) -> n
+  _           -> ""
+}
+
+fn opt_same(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true   Some(_) -> false }
+  Some(x) -> match b { None -> false  Some(y) -> x == y }
+}
+
+fn keep_by_mo(rs: [Rec], mo: Option[String], acc: [Rec]) : [Rec] = match rs {
+  [] -> list_reverse(acc)
+  [r, ...rest] ->
+    if opt_same(rec_mo(r), mo) { keep_by_mo(rest, mo, [r, ...acc]) }
+    else                       { keep_by_mo(rest, mo, acc) }
+}
+
+fn rec_val(r: Rec) : Int = match r {
+  RA(_, _, v) -> v
+  RB(v)       -> v
+}
+
+fn sum_vals(rs: [Rec], acc: Int) : Int = match rs {
+  [] -> acc
+  [r, ...rest] -> sum_vals(rest, acc + rec_val(r))
+}
+
+fn names(rs: [Rec], acc: String) : String = match rs {
+  [] -> acc
+  [r, ...rest] -> names(rest, string_concat(acc, rec_name(r)))
+}
+
+# Heap payloads (built at runtime, past any inline capacity) so the
+# over-free cascade frees bytes ASAN can see re-read.
+fn mk_tag(i: Int) : String =
+  string_concat("module_origin_tag_padded_well_past_any_inline_string_capacity_", int_to_string(i))
+
+fn mk_name(i: Int) : String =
+  string_concat("element_name_padded_well_past_any_inline_string_capacity_prefix_", int_to_string(i))
+
+fn main() : Int / Stdout = {
+  let rs = [RA(Some(mk_tag(0)), mk_name(0), 1), RB(2), RA(None, mk_name(1), 4),
+            RA(Some(mk_tag(0)), mk_name(2), 8), RB(16)]
+  let kept_m    = keep_by_mo(rs, Some(mk_tag(0)), [])
+  let kept_none = keep_by_mo(rs, None, [])
+  Stdout.print(int_to_string(sum_vals(kept_m, 0)))
+  Stdout.print(int_to_string(sum_vals(kept_none, 0)))
+  Stdout.print(int_to_string(sum_vals(rs, 0)))
+  Stdout.print(int_to_string(string_length(names(rs, ""))))
+  0
+}
