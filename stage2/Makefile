@@ -198,6 +198,16 @@ ifeq ($(KAI_LLVM),1)
 	@../tools/gen-runtime-bc.sh || true
 endif
 
+# --- Dev fast rebuild: whole-bundle at -O0 ----------------------------
+# Same trust path as kaic2 (kaic1 regenerates stage2.c from the bundle),
+# but cc compiles the 17 MB TU at -O0 instead of -O2. The cc step drops
+# from ~70 s to ~5 s; the resulting binary self-compiles slower, so this
+# is for the edit-check loop only, never for CI or the selfhost oracle.
+CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
+kaic2-dev: build/stage2.c
+	$(CC) $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
+
 # --- Dev fast rebuild: modular self-compile ---------------------------
 # An existing kaic2 recompiles the compiler from main.kai directly,
 # resolving imports — no kaic1, no bundle. Rides bin/kai's c-modular
