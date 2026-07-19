@@ -1218,10 +1218,6 @@ fn list_head_or(xs: [String], fallback: String) : String = match xs {
   [h, ..._rest] -> h
 }
 
-fn vs_to_evars(vs: [Variant], next_tag: Int, acc: [EVar]) : [EVar] = match vs_to_evars_count(vs, next_tag, acc) {
-  CUVStep(_, a) -> a
-}
-
 type ECore = EP(String, String, Int)     # kai name, c name, arity
 
 fn core_table() : [ECore] {
@@ -5563,7 +5559,7 @@ fn emit_string_expr(src: String, span: String, is_triple: Bool, cx: EmitCtx) : S
 # We pre-walk the program building a list of LamInfo entries; each entry
 # gets a unique id and records the lambda's params, its free variables
 # (its closure captures), and its body. At emit time the lambda
-# expression is replaced with `kai_closure(&_kai_lam_<id>, arity,
+# expression is replaced with `kai_closure(&lam_symbol, arity,
 # n_caps, captures)`; the body is emitted as a separate function later.
 
 fn pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] {
@@ -5769,16 +5765,16 @@ fn emit_lam_param_decrefs(params: [Param]) : String = match params {
 fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
 
   match l {
-    LamInfo(id, _, _, _, params, caps, body) -> {
+    LamInfo(_, _, _, _, params, caps, body) -> {
       let arg_reads = emit_lam_arg_reads(params, 0)
       let cap_reads = emit_lam_cap_reads(caps, 0)
       # Lambda body sees its params + captures as locals — same
       # contract as `emit_fn_body` for top-level fn params. Its enc_fn
-      # is `_kai_lam_<id>` (the same key the collector stamped), so an
-      # ELambda nested inside this body resolves to its own LamInfo.
+      # is its own lam_symbol (the same key the collector stamped), so
+      # an ELambda nested inside this body resolves to its own LamInfo.
       let body_lcs = list_append(list_append(cx.lcs, fn_param_names(params)), caps)
       let lam_cx = emit_ctx_with_lcs(cx, body_lcs)
-      let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, concat_all(["_kai_lam_", int_to_string(id)])))
+      let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, lam_symbol(l)))
       let tail = match params {
         [] -> concat_all(["    return ", body_c, ";\n}\n\n"])
         _  -> concat_all([
@@ -5788,7 +5784,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
         ])
       }
       concat_all([
-        "static KaiValue *_kai_lam_", int_to_string(id),
+        "static KaiValue *", lam_symbol(l),
         "(KaiValue *self, KaiValue **args, int n) {\n",
         "    (void) self; (void) n;\n",
         arg_reads, cap_reads, tail
@@ -5806,10 +5802,7 @@ fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], 
                                                                 regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, core: core, rcore: rcore, evf: evf, rd_active: false, rd_capable: [] })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
-  match l {
-    LamInfo(id, _, _, _, _, _, _) ->
-      concat_all(["static KaiValue *_kai_lam_", int_to_string(id), "(KaiValue *, KaiValue **, int);\n"])
-  }
+  concat_all(["static KaiValue *", lam_symbol(l), "(KaiValue *, KaiValue **, int);\n"])
 
 fn emit_lam_forward_decls(lams: [LamInfo]) : String =
   concat_all(map(lams, emit_one_lam_forward))
@@ -6073,17 +6066,17 @@ fn emit_lambda_ref(x: Expr, cx: EmitCtx) : String {
   match find_lam(cx.lams, cx.cur_enc_fn, x.line, x.col) {
     None -> "kai_unit() /* lambda: missing info */"
     Some(l) -> match l {
-      LamInfo(id, _, _, _, params, caps, _) -> {
+      LamInfo(_, _, _, _, params, caps, _) -> {
         let arity = list_length(params)
         let n_caps = list_length(caps)
         if n_caps == 0 {
           concat_all([
-            "kai_closure(&_kai_lam_", int_to_string(id),
+            "kai_closure(&", lam_symbol(l),
             ", ", int_to_string(arity), ", 0, NULL)"
           ])
         } else {
           concat_all([
-            "kai_closure(&_kai_lam_", int_to_string(id),
+            "kai_closure(&", lam_symbol(l),
             ", ", int_to_string(arity), ", ", int_to_string(n_caps),
             ", (KaiValue *[]){", emit_closure_caps(caps, cx), "})"
           ])
@@ -9351,9 +9344,8 @@ fn emit_payload_ctor_rows(variants: [EVar], enums: [String]) : String = match va
   }
 }
 
-# `kai_variant_to_head` is rebuilt the same way: every entry in
-# `variants` (the global EVar table) gets its head tag derived from
-# the constructor->sum mapping in the user's declarations.
+# `kai_variant_to_head` is registered as flattened (tag, head) pairs —
+# tags are sparse (name-keyed), so the runtime builds the dense lookup.
 fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn], enums: [String]) : String {
   let impl_rows = collect_pimpl_rows(decls, fns, [])
   let v2h       = collect_variant_to_head(variants, decls)
@@ -9382,7 +9374,7 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn], enums:
   let pctor_arr  = if n_pctor == 0 { "{-1, \"\", 0}" } else { pctor_rows }
   concat_all([
     fwds,
-    "static const int32_t _kai_variant_to_head_tbl[] = {",
+    "static const int32_t _kai_variant_to_head_pairs[] = {",
     v2h_arr,
     "};\n",
     "static const KaiImplEntry _kai_impl_table_entries[] = {",
@@ -9395,7 +9387,7 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn], enums:
     pctor_arr,
     "};\n",
     "static void _kai_register_proto_tables(void) {\n",
-    "    kai_register_variant_heads(_kai_variant_to_head_tbl, ",
+    "    kai_register_variant_head_pairs(_kai_variant_to_head_pairs, ",
     int_to_string(n_v2h), ");\n",
     "    kai_register_impls(_kai_impl_table_entries, ",
     int_to_string(n_impl), ");\n",
