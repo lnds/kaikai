@@ -405,6 +405,22 @@ static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
     kai_variant_to_head_len = len;
 }
 
+/* Sparse registration: `pairs` is (variant_tag, head_tag) flattened, n
+ * total ints. Tags are name-keyed (sparse), so codegen cannot emit a
+ * dense table; build it here sized to the max tag present. Unclaimed
+ * slots stay 0 (KAI_HEAD_ANON). Called once at startup; the table is
+ * intentionally immortal. */
+static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
+    int32_t max_tag = 10;
+    int32_t i;
+    int32_t *tbl;
+    for (i = 0; i + 1 < n; i += 2) if (pairs[i] > max_tag) max_tag = pairs[i];
+    tbl = (int32_t *) calloc((size_t) max_tag + 1, sizeof(int32_t));
+    if (!tbl) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    for (i = 0; i + 1 < n; i += 2) tbl[pairs[i]] = pairs[i + 1];
+    kai_register_variant_heads(tbl, max_tag + 1);
+}
+
 /* Impl-table entry — emitted by codegen as a static const array, then
  * loaded into the runtime hashmap at startup by kai_register_impls. */
 typedef struct {
@@ -4659,11 +4675,12 @@ static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
  * variant slot holding only the immediate `variant_tag` of an
  * all-nullary sum type can be re-boxed back into its interned
  * KaiValue* without knowing the ctor name at the read site. Tags are
- * dense small ints (>= 11 for user ctors); a flat array indexed by tag
- * is the cheapest lookup. Populated lazily by kai_nullary_install as
- * each nullary ctor is first constructed. Singletons are immortal
- * (rc == INT32_MAX), so the stored pointer never dangles. */
-#define KAI_ENUM_TAG_MAX 1024
+ * name-keyed sparse ints spanning the full uint16 space; a flat array
+ * indexed by tag is still the cheapest lookup (512 KiB of .bss).
+ * Populated lazily by kai_nullary_install as each nullary ctor is
+ * first constructed. Singletons are immortal (rc == INT32_MAX), so
+ * the stored pointer never dangles. */
+#define KAI_ENUM_TAG_MAX 65536
 #if defined(KAI_SEPARATE_COMPILATION)
 extern KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX];
 #  if defined(KAI_RUNTIME_OWNER)

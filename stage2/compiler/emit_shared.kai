@@ -377,86 +377,99 @@ pub fn builtin_variants() : [EVar] =
    EV("Exited", 1, [es_ty_name_zero("Int")], 9),
    EV("Signaled", 1, [es_ty_name_zero("Int")], 10)]
 
-# First tag assigned to a user-declared variant. Mirrors
-# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
-# user_variant_tag_base() in stage1/compiler.kai.
-
-# First tag assigned to a user-declared variant. Mirrors
-# KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and
-# user_variant_tag_base() in stage1/compiler.kai.
 #[doc("First tag assigned to a user-declared variant. Mirrors KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and user_variant_tag_base() in stage1/compiler.kai.")]
 pub fn user_variant_tag_base() : Int = 11
 
-# Walk the declarations and accumulate the variants table; returns
-# the new table plus the consumed counter so subsequent decls keep
-# the assignment monotonic. Sum-typed DTypes whose constructors are
-# already in `acc` are skipped (typical case: the Sig/ProcessExit
-# DTypes the core-inject pass synthesises so the typer sees them
-# — they overlap with the reserved builtins).
+# User tags are name-keyed, not declaration-ordered: slot = base +
+# FNV(name) mod range, linear probe on collision, names inserted in
+# sorted order. A constructor's tag is therefore a function of the
+# program's SET of ctor names — adding or moving a type in one module
+# cannot renumber the tags baked into other modules' emitted code.
+# Range is the uint16 tag space above the reserved builtins.
+fn user_variant_tag_range() : Int = 65525
 
-# Walk the declarations and accumulate the variants table; returns
-# the new table plus the consumed counter so subsequent decls keep
-# the assignment monotonic. Sum-typed DTypes whose constructors are
-# already in `acc` are skipped (typical case: the Sig/ProcessExit
-# DTypes the core-inject pass synthesises so the typer sees them
-# — they overlap with the reserved builtins).
-#[doc("Walk the declarations and accumulate the variants table; returns the new table plus the consumed counter so subsequent decls keep the assignment monotonic. Sum-typed DTypes…")]
-pub fn collect_user_variants_loop(ds: [Decl], next_tag: Int, acc: [EVar]) : [EVar] = match collect_user_variants_count(ds, next_tag, acc) {
-  CUV(t) -> t
+#[doc("Register a declaration's variant constructors into the EVar table with name-keyed stable tags.")]
+pub fn register_variants(decls: [Decl]) : [EVar] {
+  let pending = suv_pending_decls(decls, [])
+  if list_length(pending) > 60000 {
+    panic("too many variant constructors for the uint16 tag space")
+  } else {
+    suv_assign(suv_sort(pending), [], builtin_variants())
+  }
 }
 
-#[doc("Collected user-variant scan result (the EVar table entries found).")]
-pub type CUVResult = CUV([EVar])
-
-#[doc("AST collector walking user variants count.")]
-pub fn collect_user_variants_count(ds: [Decl], next_tag: Int, acc: [EVar]) : CUVResult {
+# Collect user ctors in declaration order — first occurrence wins its
+# arity/payload — skipping names already present (builtins re-emitted
+# as synthetic DTypes by the core-inject pass). Tags are assigned later.
+fn suv_pending_decls(ds: [Decl], acc: [EVar]) : [EVar] {
   match ds {
-    [] -> CUV(acc)
+    [] -> acc
     [d, ...rest] -> match d {
       DType(_, _, _, body, _, _, _) -> match body {
-        TBSum(vs) -> match vs_to_evars_count(vs, next_tag, acc) {
-          CUVStep(nt, acc1) -> collect_user_variants_count(rest, nt, acc1)
-        }
-        _ -> collect_user_variants_count(rest, next_tag, acc)
+        TBSum(vs) -> suv_pending_decls(rest, suv_pending_vs(vs, acc))
+        _         -> suv_pending_decls(rest, acc)
       }
-      _ -> collect_user_variants_count(rest, next_tag, acc)
+      _ -> suv_pending_decls(rest, acc)
     }
   }
 }
 
-#[doc("One step of the user-variant collection fold (next tag + accumulated entries).")]
-pub type CUVStep = CUVStep(Int, [EVar])
-
-# Acc accumulates with head-cons; we still pre-pend each EV but feed
-# it the correct tag value `next_tag + i` for its index in `vs`,
-# skipping names that already resolve in acc (builtins re-emitted as
-# synthetic DTypes by the core-inject pass).
-
-# Acc accumulates with head-cons; we still pre-pend each EV but feed
-# it the correct tag value `next_tag + i` for its index in `vs`,
-# skipping names that already resolve in acc (builtins re-emitted as
-# synthetic DTypes by the core-inject pass).
-#[doc("Acc accumulates with head-cons; we still pre-pend each EV but feed it the correct tag value `next_tag + i` for its index in `vs`, skipping names that already resolve in acc…")]
-pub fn vs_to_evars_count(vs: [Variant], next_tag: Int, acc: [EVar]) : CUVStep {
+fn suv_pending_vs(vs: [Variant], acc: [EVar]) : [EVar] {
   match vs {
-    [] -> CUVStep(next_tag, acc)
+    [] -> acc
     [v, ...rest] -> match v {
-      Var(n, tys) -> match evar_find_tag_opt(acc, n) {
-        Some(_) -> vs_to_evars_count(rest, next_tag, acc)
-        None    -> vs_to_evars_count(rest, next_tag + 1, [EV(n, list_length(tys), tys, next_tag), ...acc])
+      Var(n, tys) -> match evar_find_tag_opt(builtin_variants(), n) {
+        Some(_) -> suv_pending_vs(rest, acc)
+        None    -> match evar_find_tag_opt(acc, n) {
+          Some(_) -> suv_pending_vs(rest, acc)
+          None    -> suv_pending_vs(rest, [EV(n, list_length(tys), tys, 0), ...acc])
+        }
       }
     }
   }
 }
 
-# Legacy entry kept for callers that still construct an [EVar]
-# from `[Variant]` with no acc threading; emits the same shape but
-# does not preserve builtin tags. Internal callers go through
-# vs_to_evars_count to keep the convention.
+fn suv_sort(vs: [EVar]) : [EVar] = match vs {
+  [] -> []
+  [h, ...rest] -> suv_insert(h, suv_sort(rest))
+}
 
-#[doc("Register a declaration's variant constructors into the EVar table with head tags.")]
-pub fn register_variants(decls: [Decl]) : [EVar] =
-  collect_user_variants_loop(decls, user_variant_tag_base(), builtin_variants())
+fn suv_insert(v: EVar, sorted: [EVar]) : [EVar] = match sorted {
+  [] -> [v]
+  [h, ...rest] -> match v {
+    EV(vn, _, _, _) -> match h {
+      EV(hn, _, _, _) ->
+        if string_lt(vn, hn) { [v, h, ...rest] } else { [h, ...suv_insert(v, rest)] }
+    }
+  }
+}
+
+fn suv_assign(vs: [EVar], used: [Int], acc: [EVar]) : [EVar] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    EV(n, ar, tys, _) -> {
+      let t = suv_slot(n, used)
+      suv_assign(rest, [t, ...used], [EV(n, ar, tys, t), ...acc])
+    }
+  }
+}
+
+fn suv_slot(name: String, used: [Int]) : Int {
+  let h = string_hash(name)
+  let n = user_variant_tag_range()
+  suv_probe(user_variant_tag_base() + ((h % n) + n) % n, used)
+}
+
+fn suv_probe(slot: Int, used: [Int]) : Int {
+  if suv_taken(slot, used) {
+    suv_probe(if slot >= 65535 { user_variant_tag_base() } else { slot + 1 }, used)
+  } else { slot }
+}
+
+fn suv_taken(s: Int, used: [Int]) : Bool = match used {
+  [] -> false
+  [h, ...rest] -> if h == s { true } else { suv_taken(s, rest) }
+}
 
 #[doc("The AST `ExprKind` constructor name as a string (e.g. `EInt(0)` → \"EInt\"). Used by the typed-hole / library-mode enclosing-node walk in the driver to label nodes by kind.")]
 pub fn expr_kind_name(k: ExprKind) : String {
@@ -597,6 +610,18 @@ pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
 # multi-module emit), so `find_lam` keys on `(enc_fn, line, col)`.
 #[doc("Lifted lambda descriptor (id, enc_fn, line, col, params, caps, body) for closure emission.")]
 pub type LamInfo = LamInfo(Int, String, Int, Int, [Param], [String], Expr)
+
+# The lambda's C symbol derives from (enc_fn, line, col) — the same key
+# find_lam resolves — not from a program-global counter, so a lambda
+# added in one module cannot rename the lifted symbols of another.
+#[doc("C symbol of a lifted lambda at (enc_fn, line, col).")]
+pub fn lam_symbol_at(enc_fn: String, line: Int, col: Int) : String =
+  concat_all(["_kai_lam_", enc_fn, "_", int_to_string(line), "_", int_to_string(col)])
+
+#[doc("C symbol of a lifted lambda from its LamInfo.")]
+pub fn lam_symbol(l: LamInfo) : String = match l {
+  LamInfo(_, ef, ln, cl, _, _, _) -> lam_symbol_at(ef, ln, cl)
+}
 
 # m7a #6c: each handler op clause becomes a top-level C function.
 # The id pair (handle_line, handle_col) plus op_name uniquely names
@@ -1166,13 +1191,13 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       let caps = fv_expr(body, own, effective_globals, [])
       let info = LamInfo(id, st.cur_enc_fn, x.line, x.col, params, caps, body)
       # m4c #4: the lambda body is its own enclosing scope for clause
-      # symbols (lifted to `_kai_lam_<id>` at emit). Push the new
+      # symbols (lifted to `lam_symbol` at emit). Push the new
       # enc_fn for the body walk; restore the outer enc_fn on the way
       # out so a sibling expression keeps stamping against its own
       # enclosing fn.
       let outer_enc_fn = st.cur_enc_fn
       let outer_locals = st.local_scope
-      let lam_enc_fn = concat_all(["_kai_lam_", int_to_string(id)])
+      let lam_enc_fn = lam_symbol_at(outer_enc_fn, x.line, x.col)
       # Inside the lambda body, the lambda's own params shadow outer
       # globals too — extend `local_scope` so a nested lambda nested
       # again inside this body sees the shadowing chain.
@@ -2237,34 +2262,17 @@ pub fn find_substring(hay: String, needle: String, from: Int) : Int {
 
 # `kai_variant_to_head[]` — one int32_t per variant tag, mapping each
 # constructor to its sum-type head. The runtime indexes this array by
-# `variant_tag` (runtime.h `kai_head_tag` for KAI_VARIANT), so slot i
-# MUST hold the head of the constructor whose tag == i — NOT the i-th
-# entry of the (head-consed, tag-unsorted) EVar list. We therefore walk
-# tags 0..N-1 in order and place each constructor's head in its own slot.
-# Variant tags are dense and contiguous (vs_to_evars_count only consumes
-# a tag when it emits an EVar; re-emitted builtins are skipped without
-# advancing), so N == list_length(variants) and there are no gaps.
-#[doc("`kai_variant_to_head[]` — one int32_t per variant tag, mapping each constructor to its sum-type head. Indexed by `variant_tag` (slot i = head of the ctor with tag i).")]
+# Tags are sparse (name-keyed), so no dense slot-per-tag array exists;
+# the runtime builds its indexed lookup from explicit (tag, head) pairs.
+#[doc("Variant-to-head map as flattened (variant_tag, head_tag) pairs, one pair per EVar entry. The runtime rebuilds its dense lookup from these; pairs impose no density assumption on the tag space.")]
 pub fn collect_variant_to_head(variants: [EVar], decls: [Decl]) : [Int] =
-  collect_v2h_by_tag(0, list_length(variants), variants, decls, [])
+  collect_v2h_pairs(variants, decls, [])
 
-#[doc("Build the variant-to-head array slot-by-slot in tag order; slot `tag` gets the head of the EVar whose tag == `tag`.")]
-pub fn collect_v2h_by_tag(tag: Int, n: Int, variants: [EVar], decls: [Decl], acc: [Int]) : [Int] {
-  if tag >= n { list_reverse(acc) }
-  else {
-    let head = match evar_name_for_tag(variants, tag) {
-      Some(name) -> variant_head_tag_for(name, decls)
-      None       -> 0   # KAI_HEAD_ANON — defensive; tags are dense so this is unreached
-    }
-    collect_v2h_by_tag(tag + 1, n, variants, decls, [head, ...acc])
-  }
-}
-
-#[doc("Name of the constructor whose variant tag == `tag`, or None.")]
-pub fn evar_name_for_tag(vs: [EVar], tag: Int) : Option[String] {
+fn collect_v2h_pairs(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
   match vs {
-    [] -> None
-    [EV(name, _, _, t), ...rest] -> if t == tag { Some(name) } else { evar_name_for_tag(rest, tag) }
+    [] -> list_reverse(acc)
+    [EV(name, _, _, tag), ...rest] ->
+      collect_v2h_pairs(rest, decls, [variant_head_tag_for(name, decls), tag, ...acc])
   }
 }
 
@@ -2436,20 +2444,27 @@ pub fn enum_names_has(enums: [String], name: String) : Bool {
   }
 }
 
+# Two-phase on purpose: find the owning sum first, then resolve its
+# head tag in a separate walk. A single loop threading the full decl
+# list alongside its own recursion tail aliases the list against its
+# sub-spine, which the RC pass over-frees.
 #[doc("Head tag for the sum type owning constructor `ctor`, or -1 if no user sum declares it.")]
 pub fn user_ctor_type_head_tag(ctor: String, decls: [Decl]) : Int =
-  user_ctor_type_head_tag_loop(ctor, decls, decls)
+  match ctor_owner_sum(ctor, decls) {
+    Some(dn) -> user_type_head_tag(dn, decls)
+    None     -> 0 - 1
+  }
 
-#[doc("Backing loop for user_ctor_type_head_tag; `all` is the full decl list (so the dense index is computed over all decls, not the recursion tail).")]
-pub fn user_ctor_type_head_tag_loop(ctor: String, rem: [Decl], all: [Decl]) : Int {
-  match rem {
-    [] -> 0 - 1
+#[doc("Name of the sum type declaring constructor `ctor`, or None.")]
+pub fn ctor_owner_sum(ctor: String, ds: [Decl]) : Option[String] {
+  match ds {
+    [] -> None
     [d, ...rest] -> match d {
       DType(_, dn, _, body, _, _, _) -> match body {
-        TBSum(vs) -> if ctor_in_variants(ctor, vs) { user_type_head_tag(dn, all) } else { user_ctor_type_head_tag_loop(ctor, rest, all) }
-        _         -> user_ctor_type_head_tag_loop(ctor, rest, all)
+        TBSum(vs) -> if ctor_in_variants(ctor, vs) { Some(dn) } else { ctor_owner_sum(ctor, rest) }
+        _         -> ctor_owner_sum(ctor, rest)
       }
-      _ -> user_ctor_type_head_tag_loop(ctor, rest, all)
+      _ -> ctor_owner_sum(ctor, rest)
     }
   }
 }
