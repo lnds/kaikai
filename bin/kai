@@ -157,7 +157,34 @@ else
 fi
 
 CC="${CC:-cc}"
+_cflags_from_env=""
+[ -n "${CFLAGS+x}" ] && _cflags_from_env=1
 CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
+
+# CFLAGS may carry `.c` shim sources (the FFI pattern — `kai info ffi`). They
+# ride the executable link lines, where cc accepts sources next to flags in
+# the user's own order — but a source is illegal on a `-c … -o` compile line
+# (clang: "cannot specify -o when generating multiple output files") and must
+# not compile into the cached runtime/module objects. The `-c` lines therefore
+# use $CFLAGS_COMPILE: $CFLAGS with bare `.c` tokens dropped. A `.c` that is
+# the argument of a separated-argument flag (-include, -I, …) is not a source.
+CFLAGS_COMPILE=""
+_cf_prev=""
+for _cf in $CFLAGS; do
+  _cf_keep=1
+  case "$_cf" in
+    -*) ;;
+    *.c)
+      case "$_cf_prev" in
+        -include|-imacros|-x|-Xclang|-Xlinker|-Xpreprocessor|-MT|-MQ|-MF|-I|-L|-D|-U|-isystem|-iquote|-idirafter|-o|-z|-T) ;;
+        *) _cf_keep=0 ;;
+      esac ;;
+  esac
+  [ "$_cf_keep" = 1 ] && CFLAGS_COMPILE="$CFLAGS_COMPILE $_cf"
+  _cf_prev="$_cf"
+done
+CFLAGS_COMPILE="${CFLAGS_COMPILE# }"
+unset _cf _cf_prev _cf_keep
 
 # Optimisation level for the cc-compiled runtime OWNER object (the scheduler +
 # every fiber suspend point; see runtime_llvm.c's hot/owner-split note). It MUST
@@ -276,6 +303,22 @@ read_baseline() {
   fi
 }
 
+# The bootstrap make must not compile a user shim source into the compiler:
+# hand it the flags-only CFLAGS. When that leaves nothing, unset the variable
+# so the stage Makefiles' `?=` defaults stay in force. Without a user CFLAGS
+# the environment is untouched (bin/kai's default is not exported).
+bootstrap_make() {
+  if [ -n "$_cflags_from_env" ]; then
+    if [ -n "$CFLAGS_COMPILE" ]; then
+      (cd "$1" && CFLAGS="$CFLAGS_COMPILE" make "$2") >&2
+    else
+      (cd "$1" && unset CFLAGS && make "$2") >&2
+    fi
+  else
+    (cd "$1" && make "$2") >&2
+  fi
+}
+
 ensure_built() {
   # Installed layout ships a prebuilt kaic2 — bootstrap chain is not needed.
   if [ "$KAI_LAYOUT" = "installed" ]; then
@@ -285,13 +328,13 @@ ensure_built() {
     return 0
   fi
   if [ ! -x "$KAIC0" ]; then
-    (cd "$ROOT/stage0" && make kaic0) >&2
+    bootstrap_make "$ROOT/stage0" kaic0
   fi
   if [ ! -x "$KAIC1" ]; then
-    (cd "$ROOT/stage1" && make kaic1) >&2
+    bootstrap_make "$ROOT/stage1" kaic1
   fi
   if [ ! -x "$KAIC2" ]; then
-    (cd "$ROOT/stage2" && make kaic2) >&2
+    bootstrap_make "$ROOT/stage2" kaic2
   fi
 }
 
@@ -474,13 +517,13 @@ resolve_native_modular_runtime_obj() {
   # edit silently reuses a stale owner (#1238 lane hit this).
   _rt_hdr_c="$RUNTIME_INC_C/runtime.h"
   _rt_hdr="$RUNTIME_INC/runtime.h"
-  _rt_key="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$KAI_RUNTIME_OWNER_OPT" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr_c" ] && cat "$_rt_hdr_c"; [ -f "$_rt_hdr" ] && [ "$_rt_hdr" != "$_rt_hdr_c" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
+  _rt_key="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS_COMPILE" "$KAI_RUNTIME_OWNER_OPT" "$_rt_defs" "$(uname -sm)"; cat "$_rt_src"; [ -f "$_rt_hdr_c" ] && cat "$_rt_hdr_c"; [ -f "$_rt_hdr" ] && [ "$_rt_hdr" != "$_rt_hdr_c" ] && cat "$_rt_hdr"; } | $_rt_hasher | awk '{print $1}' )"
   _rt_obj="$_rt_cache/$_rt_key.o"
   if [ ! -f "$_rt_obj" ]; then
     # shellcheck disable=SC2086
     # $KAI_RUNTIME_OWNER_OPT trails $CFLAGS so its -O0 wins: the owner's
     # swapcontext-crossing scheduler must not be thread-pointer-hoisted (#1234).
-    $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $_rt_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
+    $CC $CFLAGS_COMPILE $KAI_RUNTIME_OWNER_OPT $_rt_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$_rt_src" -o "$_rt_obj.$$" 2>/dev/null \
       && mv "$_rt_obj.$$" "$_rt_obj" 2>/dev/null || { rm -f "$_rt_obj.$$" 2>/dev/null; return 0; }
   fi
   printf '%s' "$_rt_obj"
@@ -813,7 +856,8 @@ Run 'kai <command> --help' for command-specific options.
 
 Environment:
   CC               C compiler to invoke (default: cc).
-  CFLAGS           Extra flags passed to CC.
+  CFLAGS           Extra flags passed to CC. \`.c\` sources listed here
+                   (FFI shims) are compiled into the final link.
   KAI_BACKEND      Default backend (c|native) for \`kai build\` /
                    \`kai run\` when --backend is not passed. Overridden by
                    --backend; defaults to \`native\` (the in-process libLLVM
@@ -1624,7 +1668,7 @@ compile_to_binary() {
       mkdir -p "$cachedir" 2>/dev/null || cachedir=""
     fi
     if [ -n "$cachedir" ]; then
-      common="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS" "$mod_defs" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
+      common="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS_COMPILE" "$mod_defs" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
     fi
     # Per-module worker (one cc per file, fanned out by xargs -P): a key
     # hit copies the cached .o; a miss compiles then stores it atomically
@@ -1635,7 +1679,7 @@ compile_to_binary() {
     # counted, so it is exact by construction — a fast all-hit burst on
     # some filesystems / shells drops a few of N concurrent marker writes,
     # but compiles are slow + spaced and the miss tally stays reliable.
-    export KAI_MC_CC="$CC" KAI_MC_CFLAGS="$CFLAGS" \
+    export KAI_MC_CC="$CC" KAI_MC_CFLAGS="$CFLAGS_COMPILE" \
       KAI_MC_INC="-I $moddir -I $RUNTIME_INC_C -I $RUNTIME_INC" \
       KAI_MC_CACHE="$cachedir" KAI_MC_COMMON="$common" \
       KAI_MC_HASHER="$hasher" \
@@ -1753,7 +1797,7 @@ compile_to_binary() {
       $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
     else
       prog_obj="$tmp/out.o"
-      $CC $CFLAGS -DKAI_SEPARATE_COMPILATION=1 -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$prog_obj" \
+      $CC $CFLAGS_COMPILE -DKAI_SEPARATE_COMPILATION=1 -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$prog_obj" \
         || die "C backend compile failed"
       # Soundness gate (twin of gen-runtime-bc's llvm-nm check): no fiber
       # suspend point may have compiled into the -O2 program object. A
@@ -1767,10 +1811,10 @@ compile_to_binary() {
       c_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
       c_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_OWNER_C" "$c_owner_defs")"
       if [ -n "$c_rt_obj" ]; then
-        $CC $CFLAGS "$prog_obj" "$c_rt_obj" -o "$out" -lm || die "C backend link failed"
+        $CC $CFLAGS -I "$cincl" "$prog_obj" "$c_rt_obj" -o "$out" -lm || die "C backend link failed"
       else
         # No object cache (hasher-less host): compile the owner inline at -O0.
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_OWNER_C" -o "$out" -lm \
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_OWNER_C" -o "$out" -lm \
           || die "C backend link failed"
       fi
     fi
