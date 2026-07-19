@@ -1598,13 +1598,14 @@ compile_to_binary() {
     fi
   elif [ "${KAI_MODULAR:-0}" = "1" ]; then
     # Issue #748: separate compilation. kaic2 emits a marker-delimited
-    # stream of per-module `.c` files + two shared headers
-    # (kai_types.h, kai_decls.h). We split the stream into files, compile
-    # each `.c` to its own `.o`, and link the `.o` files. Each module is
-    # its own translation unit with its own C symbol space; cross-module
-    # calls resolve at link time through the shared kai_decls.h
-    # prototypes. Opt-in via KAI_MODULAR=1 while the path is validated;
-    # the default C path below stays single-TU (and selfhost-identical).
+    # stream of per-module `.c` files + per-TU header slices
+    # (kai_types_<stem>.h, kai_decls_<stem>.h). We split the stream into
+    # files, compile each `.c` to its own `.o`, and link the `.o` files.
+    # Each module is its own translation unit with its own C symbol
+    # space; cross-module calls resolve at link time through the
+    # prototypes in each TU's decls slice. Opt-in via KAI_MODULAR=1 while
+    # the path is validated; the default C path below stays single-TU
+    # (and selfhost-identical).
     # shellcheck disable=SC2086
     (unset KAI_TRACE_RC; "$KAIC2" --emit=c-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/modular.stream"
     moddir="$tmp/mod"
@@ -1626,7 +1627,7 @@ compile_to_binary() {
     ' "$tmp/modular.stream"
     # Copy the runtime header next to the generated sources so the
     # emitted `#include "runtime.h"` resolves without an -I race against
-    # a stale system copy. (kai_types.h includes runtime.h by name.)
+    # a stale system copy. (Each types slice includes runtime.h by name.)
     cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
     # runtime.h declares the multi-MB RC free-list pools `static`, so each
     # TU would replicate them and overflow .bss at the compiler's TU count.
@@ -1652,9 +1653,9 @@ compile_to_binary() {
     [ "$(uname -s)" = "Darwin" ] && mod_ldstack="-Wl,-stack_size,0x8000000"
     # Backend incremental lever: compile the per-module .c in PARALLEL
     # and cache each .o by content hash. The key folds the compiler, its
-    # flags, the target arch and the shared headers (so any header edit
-    # invalidates every .o) with the module's own source — so editing one
-    # module recompiles exactly that .o and reuses the rest. The cache
+    # flags, the target arch and the runtime header with the module's own
+    # source AND its two per-TU header slices — so an edit re-keys only
+    # the TUs whose emitted C or referenced declarations changed. The cache
     # lives outside $tmp so it survives across builds; content keying
     # makes a stale hit impossible. Knobs: KAI_MODULAR_JOBS (parallelism),
     # KAI_MODULAR_CACHE_DIR (location), KAI_MODULAR_NO_CACHE=1 (off),
@@ -1668,7 +1669,7 @@ compile_to_binary() {
       mkdir -p "$cachedir" 2>/dev/null || cachedir=""
     fi
     if [ -n "$cachedir" ]; then
-      common="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS_COMPILE" "$mod_defs" "$(uname -sm)"; cat "$moddir"/*.h; } | $hasher | awk '{print $1}' )"
+      common="$( { printf '%s\n%s\n%s\n%s\n' "$CC" "$CFLAGS_COMPILE" "$mod_defs" "$(uname -sm)"; cat "$moddir/runtime.h" 2>/dev/null; } | $hasher | awk '{print $1}' )"
     fi
     # Per-module worker (one cc per file, fanned out by xargs -P): a key
     # hit copies the cached .o; a miss compiles then stores it atomically
@@ -1689,9 +1690,11 @@ compile_to_binary() {
       cf="$1"; of="${cf%.c}.o"
       defs="$KAI_MC_DEFS"
       [ "${cf##*/}" = "$KAI_MC_OWNER" ] && defs="$defs $KAI_MC_OWNER_DEF"
+      cfb="${cf##*/}"; stem="${cfb%.c}"; dirn="${cf%/*}"
+      th="$dirn/kai_types_$stem.h"; dh="$dirn/kai_decls_$stem.h"
       key=""
-      if [ -n "$KAI_MC_CACHE" ]; then
-        key="$( { printf "%s\n%s\n" "$KAI_MC_COMMON" "$defs"; cat "$cf"; } | $KAI_MC_HASHER | awk "{print \$1}" )"
+      if [ -n "$KAI_MC_CACHE" ] && [ -f "$th" ] && [ -f "$dh" ]; then
+        key="$( { printf "%s\n%s\n" "$KAI_MC_COMMON" "$defs"; cat "$th" "$dh" "$cf"; } | $KAI_MC_HASHER | awk "{print \$1}" )"
       fi
       if [ -n "$key" ] && [ -f "$KAI_MC_CACHE/$key.o" ]; then
         cp "$KAI_MC_CACHE/$key.o" "$of" || exit 1
