@@ -53,7 +53,11 @@ kai_timeout() {
   esac
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# No `[0]` subscript: this file is sourced by Makefile recipes running under
+# /bin/sh, which is dash on Debian/Ubuntu and errors on array syntax. Bare
+# ${BASH_SOURCE} still yields element 0 under bash, and expands empty under a
+# POSIX shell — where the direct-execution branch must not fire anyway.
+if [ "${BASH_SOURCE-}" = "$0" ]; then
   if [ "$KAI_TIMEOUT_KIND" = none ]; then
     echo "warning: no timeout implementation (timeout/gtimeout/perl); running unbounded" >&2
   fi
