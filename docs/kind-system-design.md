@@ -100,11 +100,11 @@ claimed more engines than exist. The truth, and the target:
 | `HindleyMilner` (`Type`) | real — the core structural unifier | keep |
 | `EffectRow` (`Effect`) | real — row unification (`unify_row`) | keep |
 | `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_abelian`) | keep |
-| shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | keep as its **own** theory, out of the `Structural` label |
+| shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | **shipped** as its own theory `ConstructorApp`; the `Structural` label is dissolved |
 | `Module` (`Currency`) | **facade** — body byte-identical to `AbelianGroup`; `unify_dim` delegates straight to `unify_abelian`; only a formation-guard is "Module" | **build** a real module engine (`scale` / `over R`) — a module over a ring adds scalar multiplication, an algebra the abelian group does not have |
 | `Composition` (`Layout`) | **facade** — same `unify_abelian`; the summed measure lives in codegen, not in unification | **build** a real composition engine (the measure participates in unification) |
-| `Structural`/`Region` | **no engine** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian`; `structural_kind_names` is dead code | **build** a real region-identity engine |
-| `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **not a theory** — it is a compiler mechanism (sibling of `derive`), a real feature the language keeps, moved out of the theory catalog to protocol-law verification |
+| `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
+| `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **shipped** — no longer a theory; a *protocol-law set* in its own namespace, verified by generated property checks |
 
 The principle is **build, not collapse**: a facade is paid down by writing the engine
 its theory always implied, not by deleting the theory from the design. The one entry
@@ -210,18 +210,19 @@ Two layers:
    the standard property assemblies and gives each visibility:
 
    ```kaikai
-   theory Structural    = builtin                                   # Type/Region/Shape's engine — closed
+   theory Nominal            = builtin                              # Region's engine — closed
+   theory ConstructorApp     = builtin                              # Shape's engine — closed
    pub  theory AbelianGroup = { assoc, commut, inverse, identity }
    pub  theory Semilattice   = { assoc, commut, idempotent }
    pub  theory Composition   = { assoc, measure }
    theory EffectRow          = builtin                              # Effect's engine — closed
    ```
 
-   **Two theories are `builtin`** (`Structural`, `EffectRow`), for the same reason: their
-   engine is the compiler core and admits no user-declared kind. `Type` is the
-   sole structural kind — a user-declared isolated type universe
-   (`kind Validated : Structural`) would add only *isolation*, which phantom types /
-   newtypes already approximate. `Effect` is the sole rows kind (its machinery is
+   **Four theories are `builtin`** (`HindleyMilner`, `EffectRow`, `Nominal`,
+   `ConstructorApp`), for the same reason: their engine is the compiler core and admits
+   no user-declared kind. `Type` is the sole kind over the HM core — a user-declared
+   isolated type universe (`kind Validated : HindleyMilner`) would add only
+   *isolation*, which phantom types / newtypes already approximate. `Effect` is the sole rows kind (its machinery is
    built-in). The **public** theories are exactly those where a new user kind adds an
    algebra nothing else gives — Money's abelian group, Perm's idempotent join,
    Waterfall's summed measure. The admission criterion:
@@ -279,12 +280,12 @@ A user may declare kinds over **non-builtin** theories only:
 ```kaikai
 kind Metric : AbelianGroup with metric      # ✓ AbelianGroup is assemblable
 kind Perm   : Semilattice with perm          # ✓
-# kind Access : Structural                   # ✗ Structural is builtin (closed)
+# kind Access : Nominal                       # ✗ Nominal is builtin (closed)
 # kind Bad   : EffectRow                      # ✗ EffectRow is builtin (closed)
 ```
 
 Isolated type universes (a `Validated` vs `Unvalidated` kind) are **not** available —
-`Structural` is builtin, so a user cannot declare a kind over it. Use a phantom type /
+every builtin theory is closed, so a user cannot declare a kind over one. Use a phantom type /
 newtype for that isolation; the kind would add nothing a wrapper does not.
 
 ## Habitants — the introducer and its policy
@@ -571,18 +572,17 @@ behaves (opaque vs measure-carrying, open vs closed — the per-theory propertie
   symbol, open set. Money, Perm, Measure (`unit`).
 - **(b) type → value** — `with Int`, `with String`. Habitants **are values** of that type,
   written directly (`<3>`, `<"tag">`), not declared; the type restricts validity
-  (`Matrix[Real]<3,4>` ok, `<USD,4>` error). The one kind here is `kind Dim : Structural with Int`
+  (`Matrix[Real]<3,4>` ok, `<USD,4>` error). The one kind here is `kind Dim with Int`
   — a habitant is a single `Int`. `Vec`, `Matrix`, `Tensor` are **types over `Dim`**, not kinds:
   `type Vec[T]<n: Dim>`, `type Matrix[T]<m: Dim, n: Dim>` — they carry one or more `Dim`
   habitants in `<>`, exactly as `Money` is a type over `Currency` and `Real` a type over
   `Measure`. `Dim` alone owns habitants (`Int` values); `Matrix` owns none, it consumes `Dim`'s.
-  `Dim`'s theory is `Structural`, not one of its own: two habitants unify iff they are the *same
-  value* — value-equality is exactly what `Structural` decides over symbols, now over a carrier
-  type's values. The inner-index cancellation of matmul (`<m,n>·<n,p>` needs `n ≡ n`) is that
-  equality, and the `<m,n>·<n,p> → <m,p>` shape rule lives in the operation's **signature**, like
-  `u^2` in `area`'s — not in the theory. So no `Dimensional` theory is introduced: value-equality
-  over `Int` yields no algebra `Structural` does not already give, which the admission criterion
-  below rejects.
+  `Dim`'s engine is the **HM core** (first-order value equality), not a catalog theory — see
+  *`Dim` — the shape-index kind* above. The inner-index cancellation of matmul (`<m,n>·<n,p>`
+  needs `n ≡ n`) is that equality, and the `<m,n>·<n,p> → <m,p>` shape rule lives in the
+  operation's **signature**, like `u^2` in `area`'s — not in a theory. So no `Dimensional`
+  theory is introduced: value-equality over `Int` yields no algebra the core does not already
+  give, which the admission criterion below rejects.
 - **(c) introducer → symbol-with-measure** — `with pct` ⇒ `pct pct70 = 70`. A declared symbol
   that **carries a number** the theory sums. Waterfall. The `= N` is the habitant declaring
   its measure (a measure-carrying theory).
@@ -610,13 +610,13 @@ at compile time (inner `4` cancels); a matrix of runtime-unknown shape checks at
 like an out-of-bounds index). Same split both cases — this is the "practicidad" that makes
 indecidable structures usable without weakening Tier 1 #3's static core.
 
-The Matrix split falls out of its theory being `Structural`: `Structural` decides only
+The Matrix split falls out of `Dim`'s engine being the HM core: the core decides only
 equality, so the decidable half is exactly the equalities — shape identity, matmul's inner-index
 cancellation, transpose. Everything arithmetic — `reshape` (`m·n = p·q`), `concat` (`n+k`),
-broadcast — is *not* an equality, so it is not in the theory at all and lands on the runtime side.
-That is the tell that `Matrix` needs no theory beyond `Structural`: there is no type-level
+broadcast — is *not* an equality, so no engine covers it and it lands on the runtime side.
+That is the tell that `Matrix` needs no theory at all: there is no type-level
 arithmetic engine to justify one, and inventing a `Dimensional` alias byte-equal to
-"`Structural` over values" would be the empty-alias trap the closed menu exists to prevent.
+"the core over values" would be the empty-alias trap the closed menu exists to prevent.
 
 ## Usage — uniform surface
 
@@ -823,11 +823,16 @@ isolates habitants across kinds with no new engine and no kind-tag on
   whether to. `Module`'s is scalar multiplication (`scale`/`over R`); `Composition`'s
   is measure-in-unification; `Region`'s is real identity/branding (`TyBranded`, which
   the runtime comment admits "has not landed").
-- `Functorial` leaves the theory catalog for protocol-law verification (a compiler
-  mechanism); the language keeps the feature.
-- `Structural` dissolves: the shape engine becomes its own theory; region identity is
-  its own engine (above). `structural_kind_names`/`base_structural_kind_names` are dead
-  code to remove.
+- ~~`Functorial` leaves the theory catalog~~ **shipped.** A protocol header names a
+  *law set*, not a theory, and the two namespaces are disjoint in the parser: a theory
+  in a protocol header and `Functorial` on a `kind` are both errors. `fusion` left the
+  theory property menu with it. The mechanism (`law_checks.kai`) is unchanged.
+- ~~`Structural` dissolves~~ **shipped.** `Shape` is classified by `ConstructorApp`
+  (witness-binding, the engine that already existed); `Region` by `Nominal`. They never
+  shared an engine, so they no longer share a theory.
+  `structural_kind_names`/`base_structural_kind_names` were dead and are removed.
+  `Nominal`'s own engine is still to build — the catalog now names what Region needs
+  rather than hiding it under a label shared with `Shape`.
 - `Dim` stands on the HM core (first-order value equality), reached by dispatching
   `unify_dim` on the kind rather than delegating to the abelian solver.
 

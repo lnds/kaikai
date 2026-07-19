@@ -42,13 +42,18 @@ Every kind is declared in `stdlib/core/kinds.kai` over a theory:
 | `Effect` | `EffectRow` | effect labels (`Stdout`, `State`, `Spawn`) |
 | `Measure` | `AbelianGroup` | units of measure (`m`, `kg`, `m/s`) |
 | `Currency` | `Module` | currencies (`USD`, `EUR`) |
-| `Region` | `Structural` | memory arenas (each `region { r -> }` mints one) |
+| `Region` | `Nominal` | memory arenas (each `region { r -> }` mints one) |
 | `Layout` | `Composition` | byte-order modifiers (`be`, `le`) |
-| `Shape` | `Structural` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
+| `Shape` | `ConstructorApp` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
+
+One theory names one unification engine. A theory is never a label over
+a guard that reuses another theory's engine, so two kinds share a theory
+only when they genuinely share the engine.
 
 `Type` and `Effect` are `builtin`: their engine is the compiler core
 itself (HM unification, row unification), and they are closed — user
-code can neither redeclare them nor declare a new `builtin` theory.
+code can neither redeclare them nor declare a new `builtin` theory. The
+same closure applies to `Nominal` and `ConstructorApp`.
 
 ## The theories
 
@@ -59,14 +64,19 @@ code can neither redeclare them nor declare a new `builtin` theory.
   habitants add within one kind but have no product, so `USD²` and
   `USD·EUR` are rejected at formation. Scalar multiplication
   (`Money · Decimal`) is external, a protocol impl.
-- `Structural = builtin` — identity alone: two habitants unify iff
-  they are the same symbol. No product, no sum. The engine for
-  regions, where each arena is distinct.
+- `Nominal = builtin` — identity alone: two habitants unify iff they
+  are the same habitant. No product, no sum. The engine for regions,
+  where each arena is distinct.
+- `ConstructorApp = builtin` — witness-binding of arity-1 type
+  constructors: `List ~ List` holds, `List ~ Vec` fails, and a shape
+  variable binds against an applied head (`s[a] ~ List[Int]`). The
+  engine for `Shape`, distinct from `Nominal`'s closed-identity
+  comparison.
 - `Composition = { assoc, measure }` — composes elements in
   declaration order (associative, **not** commutative — order is
   load-bearing) and sums a per-element measure. A habitant is a
   single identity symbol, so `be·le` and `be²` are rejected at
-  formation, exactly the `Module`/`Structural` shape.
+  formation, exactly the `Module` shape.
 
 ## Units — the `Measure` kind
 
@@ -149,8 +159,8 @@ fn main() : Unit / Stdout = Stdout.print("no")
 `Option`, or a user `Tree[a]`. Its habitants are *derived*: every
 `type T[a] = ...` of exactly one type parameter is automatically a
 `Shape` habitant (its bare constructor `T`), so `Shape` takes no
-`with` introducer. `Structural` gives identity — two shapes unify iff
-they are the same constructor symbol.
+`with` introducer. `ConstructorApp` binds constructor witnesses — two
+shapes unify iff they are the same constructor.
 
 A `[s: Shape]` type parameter is applied as `s[A]`, letting a protocol
 quantify over the container itself — the expressiveness a functor
@@ -194,10 +204,13 @@ fn bad[s: Shape, t: Shape](xs: s[t[Int]]) : Int = 0   # composition
 fn main() : Unit / Stdout = Stdout.print("no")
 ```
 
-A Shape protocol may declare a **theory** in its header — reusing the
-`kind K : Theory` spelling — to state which laws its ops obey. A
-`Sequence[s: Shape] : Functorial` names the closed `Functorial` theory
-(`identity`, `fusion`); `kai check` / `kai test` then autogenerate
+A Shape protocol may declare a **law set** in its header to state which
+laws its ops obey. `Sequence[s: Shape] : Functorial` names the functor
+laws (`map(xs, id) = xs`, `map(map(xs, f), g) = map(xs, g∘f)`). A law
+set is not a theory: it decides no type equality and touches no
+unifier, so it lives in its own namespace — a theory name in a protocol
+header, or `Functorial` on a `kind`, is an error. `kai check` /
+`kai test` then autogenerate
 property checks per impl, and a `map`-into-`foldl` pipeline over any
 lawful container fuses to a single traversal. An impl asserts
 `axiom Functorial` after its body to opt out of the checks:
