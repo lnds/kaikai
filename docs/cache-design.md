@@ -9,6 +9,22 @@ This is a **scope doc**, not implementation guide. It pins WHAT
 must hold for correctness; HOW each phase wires it is the lane's
 choice.
 
+> **Status (measured 2026-07-19).** What ships today is **post-parse
+> only**: A.0 wire format (#592) plus the post-parse `[Decl]` caches for
+> core (#825) and user files (#455). **A.1 (post-typecheck) and A.2
+> (post-perceus) were never built** — no `feat(cache)` commit exists for
+> either; the typer, monomorph, and perceus run in full on every build
+> (verified: cold vs warm emitted C is byte-identical). #461 (A.1/A.2)
+> closed as obsolete, not blocked: its `lower_protocols` boundary blocker
+> was real but fixed in #597, and a re-measure showed the whole `kaic2`
+> compile had fallen so far that a post-perceus cache "cannot move the
+> total wall while `cc` dominates." The typer is now ~4% of an
+> end-to-end build. **Do not revive A.2.** The A.1/A.2 sections below are
+> preserved as the original scope but describe levers whose premise has
+> evaporated; the live successor is a per-module typed-interface cache
+> (#1298), sequenced after the header-slicing work (#1296) and pursued
+> only if a re-measure shows the typer became the front-end bottleneck.
+
 ## Goal
 
 Move kaikai from "re-parse stdlib + user code on every `kai build`"
