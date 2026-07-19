@@ -1,0 +1,91 @@
+#[doc("""
+compiler.layout_validate - reject `#[derive(Layout)]` on a record that is
+not Layout-bearing, naming the field that disqualified it.
+
+`layout_fields_of` collapses every rejection into a single `None`, which is
+the right shape for synthesis but loses the reason. This module re-walks the
+same fields and classifies each one, so the three failures a user can hit -
+a missing `<be>`/`<le>` habitant, a type that is not a fixed-width unsigned,
+and a signed head awaiting sign extension - each get the fix that applies to
+them instead of one generic message.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.layout_synth
+
+# Why a field is not Layout-bearing. `LOk` keeps the walk total.
+pub type LayoutReject
+  = LOk
+  | LNoOrder(String)
+  | LSigned(String)
+  | LNotFixed(String)
+
+#[doc("Classify one record field against the Layout rule.")]
+pub fn layout_reject_of(fd: FieldDecl) : LayoutReject = match fd {
+  FD(_, _, te) -> match te.tkind {
+    TyDim(base, u) -> match base.tkind {
+      TyName(head, _) ->
+        if layout_order_name(u) { layout_head_reject(head) }
+        else { LNoOrder(head) }
+      _ -> LNotFixed(layout_head_name(te))
+    }
+    _ -> {
+      let head = layout_head_name(te)
+      if layout_is_signed_head(head) { LSigned(head) }
+      else if layout_is_unsigned_head(head) { LNoOrder(head) }
+      else { LNotFixed(head) }
+    }
+  }
+}
+
+# A habitant already carrying a byte order needs only a width check; a
+# signed head there is the declared follow-up, not a malformed field.
+fn layout_head_reject(head: String) : LayoutReject =
+  if layout_is_unsigned_head(head) { LOk }
+  else if layout_is_signed_head(head) { LSigned(head) }
+  else { LNotFixed(head) }
+
+fn layout_order_name(u: UnitExprT) : Bool = match u {
+  USym(s) -> {
+    let bare = kind_sym_bare(s)
+    bare == "be" or bare == "le"
+  }
+  _ -> false
+}
+
+fn layout_is_unsigned_head(n: String) : Bool =
+  n == "U8" or n == "U16" or n == "U32" or n == "U64"
+
+fn layout_is_signed_head(n: String) : Bool =
+  n == "I8" or n == "I16" or n == "I32" or n == "I64"
+
+# The head name as the user wrote it, for the diagnostic. Lists and
+# functions have no head name worth printing, so they render structurally.
+pub fn layout_head_name(te: TypeExpr) : String = match te.tkind {
+  TyName(n, _)   -> n
+  TyList(_)      -> "List"
+  TyFn(_, _, _)  -> "Fn"
+  TyDim(base, _) -> layout_head_name(base)
+  TyRefine(b, _) -> layout_head_name(b)
+  _              -> "?"
+}
+
+#[doc("The remedy sentence for a Layout rejection, or the empty string for `LOk`.")]
+pub fn layout_reject_why(r: LayoutReject) : String = match r {
+  LOk -> ""
+  LNoOrder(h) ->
+    concat_all(["`", h, "` carries no byte order; add `<be>` or `<le>`"])
+  LSigned(h) ->
+    concat_all(["`", h, "` is signed; Layout covers the unsigned heads ",
+                "`U8`/`U16`/`U32`/`U64` only"])
+  LNotFixed(h) ->
+    concat_all(["`", h, "` is not a fixed-width unsigned integer"])
+}
+
+#[doc("True when the rejection is a real failure.")]
+pub fn layout_reject_is_err(r: LayoutReject) : Bool = match r {
+  LOk -> false
+  _   -> true
+}

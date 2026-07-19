@@ -93,6 +93,7 @@ import compiler.impl_index
 import compiler.modules
 import compiler.infer
 import compiler.layout_derive
+import compiler.layout_validate
 
 # ====================================================================
 # Law wrappers (`laws <Theory>` / `axiom <Theory>`).
@@ -2865,6 +2866,95 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
 fn binser_collection_head(head: String) : Bool =
   head == "List" or head == "Option"
 
+# Pre-expansion validator for `#[derive(Layout)]`. `derive_layout_impl`
+# returns no decls when the record is not Layout-bearing, so without this
+# pass the omission surfaces only as a missing `to_bytes` at the first
+# call site. Walks the original decl stream and reports each offending
+# field with the remedy that applies to it.
+fn validate_derive_layout(decls: [Decl], file: String) : Int / Console =
+  validate_derive_layout_loop(decls, file, 0)
+
+fn validate_derive_layout_loop(decls: [Decl], file: String,
+                                 errs: Int) : Int / Console {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, body, line, col, _) ->
+          if list_has(names, "Layout") {
+            let errs1 = validate_derive_layout_body(file, tname, body,
+                                                     line, col, errs)
+            validate_derive_layout_loop(rest, file, errs1)
+          } else {
+            validate_derive_layout_loop(rest, file, errs)
+          }
+        _ -> validate_derive_layout_loop(rest, file, errs)
+      }
+      DUnstable(inner, _, _) ->
+        validate_derive_layout_loop([inner, ...rest], file, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_layout_loop([inner, ...rest], file, errs)
+      DImplAxiom(_, inner, _, _) ->
+        validate_derive_layout_loop([inner, ...rest], file, errs)
+      DConstructor(inner, _, _) ->
+        validate_derive_layout_loop([inner, ...rest], file, errs)
+      _ -> validate_derive_layout_loop(rest, file, errs)
+    }
+  }
+}
+
+fn validate_derive_layout_body(file: String, tname: String, body: TypeBody,
+                                 line: Int, col: Int, errs: Int) : Int / Console {
+  match body {
+    TBRecord(fields) -> match fields {
+      [] -> {
+        eprint(concat_all([
+          file, ":", int_to_string(line), ":", int_to_string(col),
+          ": error: cannot `#[derive(Layout)]` for `", tname,
+          "`: a Layout record needs at least one field"]))
+        errs + 1
+      }
+      _ -> validate_derive_layout_fields(file, tname, fields, line, col, errs)
+    }
+    _ -> {
+      eprint(concat_all([
+        file, ":", int_to_string(line), ":", int_to_string(col),
+        ": error: cannot `#[derive(Layout)]` for `", tname,
+        "`: Layout applies to records, not sum types"]))
+      errs + 1
+    }
+  }
+}
+
+fn validate_derive_layout_fields(file: String, tname: String,
+                                   fields: [FieldDecl], line: Int, col: Int,
+                                   errs: Int) : Int / Console {
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> {
+      let errs1 = validate_derive_layout_one(file, tname, fd, line, col, errs)
+      validate_derive_layout_fields(file, tname, rest, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_layout_one(file: String, tname: String, fd: FieldDecl,
+                                line: Int, col: Int, errs: Int) : Int / Console {
+  let rej = layout_reject_of(fd)
+  if layout_reject_is_err(rej) {
+    match fd {
+      FD(_, fname, ftype) -> {
+        eprint(concat_all([
+          file, ":", int_to_string(line), ":", int_to_string(col),
+          ": error: cannot `#[derive(Layout)]` for `", tname,
+          "`: field `", fname, "` of type `", layout_head_name(ftype),
+          "` is not Layout-bearing: ", layout_reject_why(rej)]))
+        errs + 1
+      }
+    }
+  } else { errs }
+}
+
 # `TyList(elem)` and `Option[elem]` are valid only when `elem` is
 # itself a builtin, a collection (recursive case for `[[Foo]]`), or a
 # provider in scope. Anything else is reported as missing — but the
@@ -3104,7 +3194,8 @@ pub fn lower_protocols(decls: [Decl], file: String,
   # (DDerive nodes still intact) and emits a clear typer-time error
   # naming the offending field/payload.
   let derive_errs = validate_derive_ord(decls, file) +
-                    validate_derive_binserialize(decls, file)
+                    validate_derive_binserialize(decls, file) +
+                    validate_derive_layout(decls, file)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
