@@ -134,7 +134,7 @@ SRC     := main.kai
 # dependencies. kaic1 parses `import` lines (stage1/compiler.kai
 # `parse_import_decl`) and ignores them downstream, so the bundle
 # compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/kinds.kai compiler/unit_walk.kai compiler/kind_resolve.kai compiler/layout_synth.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/migrate_rules.kai compiler/migrate_types.kai compiler/migrate_walk.kai compiler/migrate_scan.kai compiler/migrate.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/loop_lower.kai compiler/desugar.kai compiler/cell_scan.kai compiler/cell_promote.kai compiler/refine_enforce.kai compiler/region.kai compiler/infer_index.kai compiler/pipe_fusion.kai compiler/lit_mint.kai compiler/vec_surface.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox_native_raw.kai compiler/unbox.kai compiler/rawsafe.kai compiler/borrow_escape.kai compiler/borrow_infer.kai compiler/perceus.kai compiler/purity.kai compiler/impl_index.kai compiler/layout_derive.kai compiler/layout_validate.kai compiler/protos.kai compiler/fwd_inline.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/vec_raw.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_uses.kai compiler/kir_varslot.kai compiler/kir_inline_clone.kai compiler/kir_inline_beta.kai compiler/kir_inline.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_reuse.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_slot.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_native_modkey.kai compiler/emit_native_modular.kai compiler/emit_ffi_c.kai compiler/emit_reuse_donate.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/closure_spec_ast.kai compiler/closure_spec_emit.kai compiler/closure_spec.kai compiler/law_checks.kai compiler/driver.kai main.kai
+BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/kinds.kai compiler/unit_walk.kai compiler/kind_resolve.kai compiler/layout_synth.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/resolve.kai compiler/fmt_writer.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/migrate_rules.kai compiler/migrate_types.kai compiler/migrate_walk.kai compiler/migrate_scan.kai compiler/migrate.kai compiler/cache.kai compiler/modules.kai compiler/user_cache.kai compiler/core_cache.kai compiler/loop_lower.kai compiler/desugar.kai compiler/cell_scan.kai compiler/cell_promote.kai compiler/refine_enforce.kai compiler/region.kai compiler/infer_index.kai compiler/pipe_fusion.kai compiler/lit_mint.kai compiler/vec_surface.kai compiler/infer.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/unbox_native_raw.kai compiler/unbox.kai compiler/rawsafe.kai compiler/borrow_escape.kai compiler/borrow_infer.kai compiler/perceus.kai compiler/purity.kai compiler/impl_index.kai compiler/layout_derive.kai compiler/layout_validate.kai compiler/protos.kai compiler/fwd_inline.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/vec_raw.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_uses.kai compiler/kir_varslot.kai compiler/kir_inline_clone.kai compiler/kir_inline_beta.kai compiler/kir_inline.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_reuse.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_slot.kai compiler/emit_native_ops.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_native_modkey.kai compiler/emit_native_modular.kai compiler/emit_ffi_c.kai compiler/emit_reuse_donate.kai compiler/emit_slices.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/closure_spec_ast.kai compiler/closure_spec_emit.kai compiler/closure_spec.kai compiler/law_checks.kai compiler/driver.kai main.kai
 
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
@@ -7678,8 +7678,9 @@ test-shadowing: $(TARGET) build
 	done
 
 # Issue #748 — separate compilation (`--emit=c-modular`). Emits a
-# program as per-module `.c` translation units + shared kai_types.h /
-# kai_decls.h, splits the marker-delimited stream into files, compiles
+# program as per-module `.c` translation units + per-TU header slices
+# (kai_types_<stem>.h / kai_decls_<stem>.h), splits the marker-delimited
+# stream into files, compiles
 # each `.c` to its own `.o`, links the `.o` files, and diffs the run
 # against the single-TU golden. Proves a USER program with its own
 # modules (math.kai, shapes.kai, ...) plus stdlib core modules each
@@ -7864,16 +7865,32 @@ test-modular-cache: $(TARGET) build
 	[ "$$c" -ge 1 ] && [ "$$c" -lt "$$cc0" ] \
 	  || { echo "modular-cache FAIL incr (want 1<=compiled<$$cc0, got compiled=$$c)"; exit 1; }; \
 	echo "modular-cache OK incr (one-module edit -> $$c recompiled vs $$cc0 cold)"; \
+	cp ../examples/multi-module/math.kai $$src/; \
+	printf '\npub type CacheProbe = CPA | CPB\n' >> $$src/math.kai; \
+	build_run typeadd; \
+	c=$$(num typeadd compiled); \
+	[ "$$c" -ge 1 ] && [ "$$c" -le 3 ] && [ "$$c" -lt "$$cc0" ] \
+	  || { echo "modular-cache FAIL typeadd (want 1<=compiled<=3, got compiled=$$c of $$cc0 — a type-add must not re-key unreferencing TUs)"; exit 1; }; \
+	echo "modular-cache OK typeadd (new sum type -> $$c recompiled vs $$cc0 cold)"; \
+	cp ../examples/multi-module/math.kai $$src/; \
+	printf '\npub fn cache_probe(xs: [Int]) : [Int] = map(xs, (x) => x + 1)\n' >> $$src/math.kai; \
+	build_run fnadd; \
+	c=$$(num fnadd compiled); \
+	[ "$$c" -ge 1 ] && [ "$$c" -le 4 ] && [ "$$c" -lt "$$cc0" ] \
+	  || { echo "modular-cache FAIL fnadd (want 1<=compiled<=4, got compiled=$$c of $$cc0 — a fn-add must not re-key uncalling TUs)"; exit 1; }; \
+	echo "modular-cache OK fnadd (new fn -> $$c recompiled vs $$cc0 cold)"; \
 	echo "modular-cache OK"
 
 # Per-module emit hermeticity — the property the .o cache reuse rests on:
-# an edit to one module must leave every sibling module's emitted .c
-# byte-identical (variant tags are name-keyed, lambda symbols are
-# (enc_fn, line, col)-keyed, spec order is name-sorted — none of them
-# global counters). Three edit shapes are pinned: a body-only edit
-# (only that module's TU changes), a new sum type (only __root__.c's
-# registration tables + kai_types.h change), and a new fn with a
-# lambda (only that module's TU + __root__.c + kai_decls.h change).
+# an edit to one module must leave every sibling module's emitted .c AND
+# every sibling's header slices byte-identical (variant tags are
+# name-keyed, lambda symbols are (enc_fn, line, col)-keyed, spec order
+# is name-sorted — none of them global counters; header slices carry
+# only referenced declarations). Three edit shapes are pinned: a
+# body-only edit (only that module's TU changes), a new sum type (only
+# that module's TU + __root__.c's registration tables change — the new
+# type's structs are referenced nowhere, so no slice moves), and a new
+# fn with a lambda (that module's TU + __root__.c + their decls slices).
 test-modular-hermetic: $(TARGET) build
 	@set -e; \
 	src=build/modular-hermetic.src; rm -rf $$src; mkdir -p $$src/geo; \
@@ -7909,13 +7926,13 @@ test-modular-hermetic: $(TARGET) build
 	cp ../examples/multi-module/math.kai $$src/; \
 	printf '\npub type HermProbe = HPA | HPB\n' >> $$src/math.kai; \
 	emit_split sum; \
-	assert_only sum math.c __root__.c kai_types.h; \
-	echo "modular-hermetic OK sum-add (only math.c/__root__.c/kai_types.h changed)"; \
+	assert_only sum math.c __root__.c; \
+	echo "modular-hermetic OK sum-add (only math.c/__root__.c changed; no header slice moved)"; \
 	cp ../examples/multi-module/math.kai $$src/; \
 	printf '\npub fn herm_lam(xs: [Int]) : [Int] = map(xs, (x) => x + 1)\n' >> $$src/math.kai; \
 	emit_split lam; \
-	assert_only lam math.c __root__.c kai_decls.h; \
-	echo "modular-hermetic OK lambda-add (only math.c/__root__.c/kai_decls.h changed)"; \
+	assert_only lam math.c __root__.c kai_decls_math.h kai_decls___root__.h; \
+	echo "modular-hermetic OK lambda-add (only math.c/__root__.c + their decls slices changed)"; \
 	echo "modular-hermetic OK"
 
 # Shared c-modular .o cache dir for the two full-compiler self-hosts below
@@ -7923,7 +7940,7 @@ test-modular-hermetic: $(TARGET) build
 # (gitignored), so it survives across both gates within a run and, when a
 # harness persists it (CI's actions/cache), across runs. The cache keys each
 # .o by a content hash folding the compiler, its flags, the target arch, the
-# shared headers, and the emitted .c — a stale hit is impossible, so the cache
+# TU's header slices, and the emitted .c — a stale hit is impossible, so the cache
 # only elides recompiling byte-identical emitted C. The link (which exercises
 # the shared-pool guard) and the byte-identity checks below always run.
 CMODULAR_SELFHOST_CACHE := $(CURDIR)/build/cmodular-selfhost-cache
