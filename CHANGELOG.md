@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.103.0 (2026-07-18)
+
+### BREAKING CHANGE
+
+- `encode(v)` / `decode(b)` are removed. Records opt in
+with `#[derive(Layout)]` and use `v.to_bytes()` /
+`<lower(T)>_from_bytes(buf, pos)`, which returns
+`Result[BinCursor[T], String]` where `decode` returned `Option[T]`.
+`encode` and `decode` are now ordinary identifiers.
+
+### Added
+
+- **kinds**: implement the over <domain> surface for theories, contextual keyword to preserve let over (closes #1244) (#1287)
+- **compiler**: reject #[derive(Layout)] on a non-Layout-bearing record with a field-level diagnostic (closes #1279) (#1285)
+- **kinds**: dissolve Structural and reclassify Functorial out of the theory catalog (closes #1270, #1265) (#1282)
+- **compiler**: consolidate Layout serialization under #[derive(Layout)] (closes #1245) (#1277)
+
+### Fixed
+
+- **runtime**: restore the missing KAI_SCHED_FN gate and correct fiber thread-affinity across work-stealing (closes #1273, #1274; unblocks #1238 release gate) (#1286)
+
 ## v0.102.0 (2026-07-18)
 
 ### Added
