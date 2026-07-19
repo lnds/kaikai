@@ -1,5 +1,36 @@
 # CI time analysis — where the PR wall-clock goes (2026-06-22)
 
+> **Addendum (2026-07-19).** The baseline below drifted: by mid-July the PR
+> critical path had degraded from ~20 to ~36-40 min, and the required checks
+> are now `tier1` AND `tier1-native` (five workflows total, plus path-gated
+> `tier1-asan`/`tier1-tsan`/`rc-detector`). Measured causes and the fixes
+> shipped in response:
+>
+> - **tier1-native** grew to ~38.5 min: the native self-host gate (~13 min)
+>   ran serially inside `build-native`, delaying the artifact the corpus
+>   shards wait on. Fixed: the gate is its own job, parallel to the shards.
+> - **tier1** grew to ~36 min: shard-1 carried the two whole-compiler
+>   modular self-hosts (~15 min combined) on top of the non-light tail while
+>   the light slices ran ~18 min each — and the light pool itself doubled in
+>   under a month (~15 min total in June, ~36 min by mid-July; watch this).
+>   Fixed: the modular self-hosts moved to shard-4, the light pool split
+>   three ways (shards 2/3/5).
+> - **Timeout-ceiling flakes**: tier0 (16-18 min nominal) ran against a
+>   20-min timeout and shard-1 against 35; both died at their ceilings and
+>   the resulting re-runs produced 59- and 71-min PR waits. Fixed: headroom.
+> - **Main pushes never skipped**: doc merges and `cz bump` commits ran the
+>   full gate (~2 h of runner time each). Fixed: push triggers now
+>   `paths-ignore` docs/root-md/LICENSE/VERSION/.cz.toml; the PR-side
+>   `changes` job is unchanged (required checks must always report).
+> - The `build` jobs cache the bootstrap chain on an exact source-hash key
+>   (no restore-keys — a near-miss plus the mtime touch would present a
+>   stale kaic2 as fresh).
+>
+> Expected post-fix critical path: ~build + max(shard) ≈ 21-26 min per
+> required check. The sections below keep the 2026-06-22 measurements as the
+> methodology reference; per-phase numbers no longer reflect the current
+> layout.
+
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
 come from `/usr/bin/time -p` on a 14-core / 24 GB macOS host with no
