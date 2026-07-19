@@ -14,9 +14,12 @@ name: tier1-native
 # Structure (docs/ci-time-analysis.md §7): a single `build-native` job
 # builds the libLLVM kaic2 + P2 bitcode ONCE and publishes them; the corpus
 # ratchet (~620 fixtures, the dominant cost) is sharded across two runners
-# via $BACKEND_PARITY_DIRS (disjoint subsets whose union is the full corpus).
-# native is the DEFAULT backend and deserves equal-or-better coverage than
-# the C oracle — sharding cuts wall-clock without dropping a single fixture.
+# via $BACKEND_PARITY_DIRS (disjoint subsets whose union is the full corpus),
+# and the native self-host gate runs as a third parallel consumer of the same
+# artifact — nothing downstream depends on its output, so keeping it inside
+# build-native would only delay the artifact upload (~13 min off the critical
+# path). native is the DEFAULT backend and deserves equal-or-better coverage
+# than the C oracle — sharding cuts wall-clock without dropping a fixture.
 on:
   pull_request:
   push:
@@ -68,7 +71,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,19 +91,6 @@ jobs:
           rm -f stage2/kaic2
           make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >/dev/null 2>&1
           tools/assert-runtime-bc.sh
-      # Native self-host gate: compile the compiler itself with the native
-      # backend and ratchet the `unbound register` subset-gap count against
-      # tools/native-selfhost-baseline.txt — green at baseline, red only on
-      # regression (count rises). tier1-native is not a required check (only
-      # tier1 gates the merge), so a red here is visible on the PR but does
-      # not block an unrelated merge. Runs here because build-native already
-      # produced the KAI_LLVM=1 kaic2 + P2 bitcode; the gate relinks kaic2
-      # itself (seconds). Native-only — does not touch the C bootstrap.
-      # Also asserts byte-identical C for a Layout-bearing program (reusing the
-      # native binary it already built) — the #1201 blind spot the trivial
-      # sample missed.
-      - name: "Native self-host gate (ratchet — fails only on regression)"
-        run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-selfhost-gate.sh
       - name: Upload native artifact
         uses: actions/upload-artifact@v4
         with:
@@ -118,6 +108,46 @@ jobs:
             stage0/runtime_inline.bc
           retention-days: 1
           if-no-files-found: error
+
+  # Native self-host gate: compile the compiler itself with the native
+  # backend and ratchet the `unbound register` subset-gap count against
+  # tools/native-selfhost-baseline.txt — green at baseline, red only on
+  # regression (count rises). Also asserts byte-identical C for a
+  # Layout-bearing program. Native-only — does not touch the C bootstrap.
+  # Runs parallel to the shards on the shared artifact: nothing consumes its
+  # output, and the aggregator (a Required check) gates on it. The gate
+  # script rebuilds kaic2 from the artifact's stage2.c before self-compiling
+  # (the rm+make inside the script), so it pays one cc pass, off the
+  # critical path.
+  native-selfhost-gate:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: "Native self-host gate (ratchet — fails only on regression)"
+        run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-selfhost-gate.sh
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after native-selfhost-gate"; git status; exit 1
+          fi
 
   # Shard 1 — first corpus subset + the curated smoke. Subset chosen to
   # balance fixture count against shard 2 (~289 vs ~257 entry points).
@@ -307,25 +337,26 @@ jobs:
             echo "::error::working tree dirty after native-shard-2"; git status; exit 1
           fi
 
-  # Aggregator (mirrors tier1's). Not a Required check, but keeps the PR's
-  # check list to one tidy `tier1-native` status that is green iff both
-  # shards pass.
+  # Aggregator (mirrors tier1's). This is the Required check branch
+  # protection gates on: one tidy `tier1-native` status, green iff both
+  # shards and the self-host gate pass.
   tier1-native:
-    needs: [changes, native-shard-1, native-shard-2]
+    needs: [changes, native-shard-1, native-shard-2, native-selfhost-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Gate on both native shards
+      - name: Gate on both native shards + self-host gate
         run: |
           if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
             echo "tier1-native OK — doc-only PR, shards skipped"; exit 0
           fi
           r1='${{ needs.native-shard-1.result }}'
           r2='${{ needs.native-shard-2.result }}'
-          echo "native shard results: 1=$r1 2=$r2"
-          if [ "$r1" = "success" ] && [ "$r2" = "success" ]; then
-            echo "tier1-native OK — both shards green (full corpus parity)"
+          r3='${{ needs.native-selfhost-gate.result }}'
+          echo "native results: shard1=$r1 shard2=$r2 selfhost-gate=$r3"
+          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ]; then
+            echo "tier1-native OK — both shards + self-host gate green (full corpus parity)"
           else
-            echo "::error::tier1-native FAIL — a shard did not succeed"; exit 1
+            echo "::error::tier1-native FAIL — a shard or the self-host gate did not succeed"; exit 1
           fi
