@@ -4,6 +4,18 @@ on:
   pull_request:
   push:
     branches: [main]
+    # Doc-only pushes (merged doc PRs) and `cz bump` release commits
+    # (VERSION + .cz.toml + CHANGELOG.md, the latter covered by '*.md')
+    # change nothing the gate tests; the merge commit that introduced code
+    # already ran the full gate. No status is required on main pushes, so
+    # skipping the whole workflow here is safe — the PR side must instead
+    # use the `changes` job below.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - 'VERSION'
+      - '.cz.toml'
 
 concurrency:
   group: tier1-${{ github.ref }}
@@ -12,20 +24,21 @@ concurrency:
 permissions:
   contents: read
 
-# CI structure (docs/ci-time-analysis.md). The tier1 gate's ~15-min light
-# fixture pool is CPU-bound + independent, so it is sharded across SEPARATE
+# CI structure (docs/ci-time-analysis.md). The tier1 gate's light fixture
+# pool is CPU-bound + independent, so it is sharded across SEPARATE
 # runners (each with its own memory bus — in-job `-j` is bandwidth-capped).
 # A single `build` job bootstraps the C-only kaic2 ONCE and publishes it as
-# an artifact; tier0 + the three tier1 shards consume it (download + a
+# an artifact; tier0 + the four tier1 shards consume it (download + a
 # dependency-ordered mtime touch so `make` rebuilds nothing). The `tier1`
-# aggregator job gates on all three shards, so the REQUIRED check is still
+# aggregator job gates on all four shards, so the REQUIRED check is still
 # named `tier1` and branch protection needs no change.
 jobs:
-  # Shared doc-only detection. Pure-doc PRs short-circuit every downstream
-  # job with SUCCESS so the required `tier1` check is satisfied without
-  # spending build/test runners. (paths-ignore can't be used: branch
-  # protection lists `tier1` as required, so the workflow must always
-  # produce a status — paths-ignore would leave doc PRs BLOCKED forever.)
+  # Shared doc-only detection for PRs. Pure-doc PRs short-circuit every
+  # downstream job with SUCCESS so the required `tier1` check is satisfied
+  # without spending build/test runners. (paths-ignore can't be used on the
+  # PR side: branch protection lists `tier1` as required, so the workflow
+  # must always produce a status — paths-ignore would leave doc PRs BLOCKED
+  # forever. Pushes to main need no status, so they use paths-ignore above.)
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -98,7 +111,9 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Runs ~16-18 min nominal; a ceiling-adjacent timeout turned slow-runner
+    # runs into cancel + full re-run, which costs far more than headroom.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,10 +142,7 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
-    # The costly self-compile slice runs close to the ceiling (main has hit
-    # 24m+ and been cancelled at 25); give it headroom so a slow runner does
-    # not flake the merge.
-    timeout-minutes: 35
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,27 +158,7 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      # Persist the c-modular .o cache the two full-compiler self-hosts
-      # (test-modular-selfhost, test-perceus-1131-modular-escape) share. The
-      # cache keys each .o by a content hash of the emitted C + headers +
-      # toolchain, so a stale entry is impossible — a mismatch just misses and
-      # recompiles. actions/cache only ferries the objects; it cannot produce a
-      # false green. The key folds a compiler-source fingerprint (so a warm
-      # start correlates with reusable objects) and the clang identity (so a
-      # runner-image clang bump does not carry objects from the old compiler);
-      # restore-keys lets a run warm-start from the nearest prior cache and let
-      # the content hash sort out which objects survive.
-      - name: Fingerprint toolchain for cache key
-        id: cc-fp
-        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
-      - name: Cache c-modular .o objects (self-host self-compiles)
-        uses: actions/cache@v4
-        with:
-          path: stage2/build/cmodular-selfhost-cache
-          key: cmodular-selfhost-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('stage2/compiler/**', 'stage2/main.kai', 'stdlib/**', 'stage2/runtime*.h', 'stage0/runtime*.h') }}
-          restore-keys: |
-            cmodular-selfhost-${{ steps.cc-fp.outputs.id }}-
-      - name: tier1-shard-1 (costly self-compiles + caches)
+      - name: tier1-shard-1 (costly self-compiles + caches + tail)
         run: make CC=clang tier1-shard-1
       - name: Working tree clean check
         run: |
@@ -236,12 +228,64 @@ jobs:
             git status; exit 1
           fi
 
+  # Shard 4 — the two whole-compiler modular self-hosts, the slowest single
+  # phases in the gate (~15 min combined). Isolated so no shard dominates
+  # the critical path.
+  tier1-shard-4:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      # Persist the c-modular .o cache the two full-compiler self-hosts
+      # (test-modular-selfhost, test-perceus-1131-modular-escape) share. The
+      # cache keys each .o by a content hash of the emitted C + headers +
+      # toolchain, so a stale entry is impossible — a mismatch just misses and
+      # recompiles. actions/cache only ferries the objects; it cannot produce a
+      # false green. The key folds a compiler-source fingerprint (so a warm
+      # start correlates with reusable objects) and the clang identity (so a
+      # runner-image clang bump does not carry objects from the old compiler);
+      # restore-keys lets a run warm-start from the nearest prior cache and let
+      # the content hash sort out which objects survive.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache c-modular .o objects (self-host self-compiles)
+        uses: actions/cache@v4
+        with:
+          path: stage2/build/cmodular-selfhost-cache
+          key: cmodular-selfhost-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('stage2/compiler/**', 'stage2/main.kai', 'stdlib/**', 'stage2/runtime*.h', 'stage0/runtime*.h') }}
+          restore-keys: |
+            cmodular-selfhost-${{ steps.cc-fp.outputs.id }}-
+      - name: tier1-shard-4 (whole-compiler modular self-hosts)
+        run: make CC=clang tier1-shard-4
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-shard-4"
+            git status; exit 1
+          fi
+
   # Aggregator: the REQUIRED check. Green iff every shard is green. Keeping
   # the name `tier1` means branch protection needs no edit. A doc-only PR
   # reaches here via the skipped shards and still reports SUCCESS, satisfying
   # the required check.
   tier1:
-    needs: [changes, tier1-shard-1, tier1-shard-2, tier1-shard-3]
+    needs: [changes, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -254,8 +298,9 @@ jobs:
           r1='${{ needs.tier1-shard-1.result }}'
           r2='${{ needs.tier1-shard-2.result }}'
           r3='${{ needs.tier1-shard-3.result }}'
-          echo "shard results: 1=$r1 2=$r2 3=$r3"
-          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ]; then
+          r4='${{ needs.tier1-shard-4.result }}'
+          echo "shard results: 1=$r1 2=$r2 3=$r3 4=$r4"
+          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
             echo "tier1 OK — all shards green (full gate coverage)"
           else
             echo "::error::tier1 FAIL — a shard did not succeed"; exit 1
