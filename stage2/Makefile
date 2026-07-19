@@ -764,12 +764,6 @@ test-issue-1194-reassigned-record-field-in-interp: $(TARGET) build
 	  && echo "issue-1194 OK (reassigned record field in interp resolves)" \
 	  || { echo "issue-1194 DIFF"; diff ../examples/effects/$$f.out.expected build/$$f.out; exit 1; }
 
-# Bounded run for fixtures whose regression shape is a hang rather than a
-# wrong answer. GNU `timeout` on Linux, `gtimeout` where coreutils is a
-# brew keg, empty otherwise (the CI job timeout stays the backstop).
-TIMEOUT_BIN := $(shell command -v timeout || command -v gtimeout)
-RUN_TIMEOUT := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) 30,)
-
 # A clause that discards `resume` abandons the handle body by longjmping
 # to its handle, invalidating every evidence node the body pushed — the
 # abandoning handle's own included. Popping a single entry unwinds
@@ -778,14 +772,19 @@ RUN_TIMEOUT := $(if $(TIMEOUT_BIN),$(TIMEOUT_BIN) 30,)
 # next handle to reuse that stack storage becomes its own parent, cycling
 # every later lookup. Both backends emitted the lone pop, so the
 # native-vs-C parity sweep cannot see this shape — it needs a golden.
+#
+# The run is bounded through `kai_timeout`: the regression is a HANG, and
+# this gate must fail the shard rather than stall it on a host with no
+# GNU coreutils (the platform the bug was reported on).
 test-issue-1263-abandon-across-resumed-frame: $(TARGET) build
 	@set -e; \
+	. ../tools/lib/timeout.sh; \
 	f=issue_1263_abandon_across_resumed_frame; \
 	./$(TARGET) ../examples/effects/$$f.kai > build/s2-$$f.c \
 	  || { echo "issue-1263 FAIL (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$f.c -o build/s2-$$f-c $(LDLIBS_M) \
 	  || { echo "issue-1263 FAIL (cc)"; exit 1; }; \
-	$(RUN_TIMEOUT) ./build/s2-$$f-c > build/s2-$$f-c.out \
+	kai_timeout 30 ./build/s2-$$f-c > build/s2-$$f-c.out \
 	  || { echo "issue-1263 FAIL (C run — hang or nonzero exit)"; exit 1; }; \
 	diff -q ../examples/effects/$$f.out.expected build/s2-$$f-c.out > /dev/null \
 	  && echo "issue-1263 OK (C: abandon unwinds evidence past the resumed frame)" \
@@ -794,10 +793,11 @@ test-issue-1263-abandon-across-resumed-frame: $(TARGET) build
 # Native half of the same gate — the backend the hang was reported on.
 test-issue-1263-abandon-across-resumed-frame-native: $(TARGET) build
 	@set -e; \
+	. ../tools/lib/timeout.sh; \
 	f=issue_1263_abandon_across_resumed_frame; \
 	KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai -o build/s2-$$f-nat 2> build/s2-$$f-nat.err \
 	  || { echo "issue-1263-native FAIL (native build errored)"; cat build/s2-$$f-nat.err; exit 1; }; \
-	$(RUN_TIMEOUT) ./build/s2-$$f-nat > build/s2-$$f-nat.out \
+	kai_timeout 30 ./build/s2-$$f-nat > build/s2-$$f-nat.out \
 	  || { echo "issue-1263-native FAIL (run — hang or nonzero exit)"; exit 1; }; \
 	diff -q ../examples/effects/$$f.out.expected build/s2-$$f-nat.out > /dev/null \
 	  && echo "issue-1263-native OK (abandon unwinds evidence past the resumed frame)" \
