@@ -17,10 +17,10 @@ type IdentityError = AccountNotFound | KycExpired | Frozen
 type AuthError     = InsufficientBalance | OverDailyLimit
 type QueryBalanceErr = IdentityError | AuthError
 
-fn check_identity(req: Req) : Result[IdentityError, Account] = ...
-fn check_auth(acc: Account) : Result[AuthError, Approved] = ...
+fn check_identity(req: Req) : Result[Account, IdentityError] = ...
+fn check_auth(acc: Account) : Result[Approved, AuthError] = ...
 
-fn query_balance(req: Req) : Result[QueryBalanceErr, Balance] = {
+fn query_balance(req: Req) : Result[Balance, QueryBalanceErr] = {
   let acc = check_identity(req)!     # IdentityError <: QueryBalanceErr
   let app = check_auth(acc)!         # AuthError     <: QueryBalanceErr
   Ok(load_balance(app))
@@ -131,11 +131,11 @@ type ErrorB  = DivCero
 type ErrorAB = ErrorA | ErrorB
 
 # Before #379: the typer pinned the match's result type from the
-# first arm (`Result[ErrorA, _]`), and the recursive call's
-# `Result[ErrorAB, Real]` failed to unify.
+# first arm (`Result[_, ErrorA]`), and the recursive call's
+# `Result[Real, ErrorAB]` failed to unify.
 # After #379: the annotated return type reaches the match arms, so
-# `Result[ErrorA, _]` upcasts to `Result[ErrorAB, Real]` per D3.
-fn lookup(xs: [(String, Real)], k: String) : Result[ErrorAB, Real] =
+# `Result[_, ErrorA]` upcasts to `Result[Real, ErrorAB]` per D3.
+fn lookup(xs: [(String, Real)], k: String) : Result[Real, ErrorAB] =
   match xs {
     []                  -> Err(NoDefinida(k))
     [(n, v), ...rest]   -> if n == k { Ok(v) } else { lookup(rest, k) }
@@ -146,11 +146,11 @@ The same shape applies to `if/else`:
 
 ```kai
 # Before #382: the typer pinned the if's result type from the `then`
-# branch (`Result[ErrorA, _]`), and the recursive call's
-# `Result[ErrorAB, Real]` failed to unify against it.
+# branch (`Result[_, ErrorA]`), and the recursive call's
+# `Result[Real, ErrorAB]` failed to unify against it.
 # After #382: the annotated return type reaches both branches, so
-# `Result[ErrorA, _]` upcasts to `Result[ErrorAB, Real]` per D3.
-fn lookup(xs: [Real], i: Int) : Result[ErrorAB, Real] =
+# `Result[_, ErrorA]` upcasts to `Result[Real, ErrorAB]` per D3.
+fn lookup(xs: [Real], i: Int) : Result[Real, ErrorAB] =
   if i < 0 {
     Err(NoDefinida("neg"))
   } else {
@@ -228,9 +228,9 @@ returning `Result[U, T]` may freely propagate inner results whose
 error type is a component of `U`:
 
 ```kai
-fn run() : Result[QueryBalanceErr, Int] = {
-  let v1 = check_id(req)!        # Result[IdentityError, _]
-  let v2 = check_auth(v1)!       # Result[AuthError, _]
+fn run() : Result[Int, QueryBalanceErr] = {
+  let v1 = check_id(req)!        # Result[_, IdentityError]
+  let v2 = check_auth(v1)!       # Result[_, AuthError]
   Ok(v1 + v2)
 }
 ```

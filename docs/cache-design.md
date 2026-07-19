@@ -227,11 +227,11 @@ A.x lane from using Serialize today:
    would need ~30 hand-written impls today; with a derive_serialize
    pass analogous to derive_show, that drops to 30 one-line
    annotations.
-2. **`from_string : String → Result[String, Self]` is whole-string,
+2. **`from_string : String → Result[Self, String]` is whole-string,
    not cursor-based.** A list of records can't be parsed by calling
    `from_string` on a prefix and getting `(Self, rest)` back; the
    protocol consumes the full string or fails. AST serialisation
-   needs a cursor (`from_bytes : ([Byte], Int) → Result[E, (Self, Int)]`
+   needs a cursor (`from_bytes : ([Byte], Int) → Result[(Self, Int), E]`
    or similar).
 
 Both gaps are pre-blockers for the A.0 lane. The cache lane that

@@ -71,7 +71,7 @@ kaikai-minimal has records, sum types, and lists. It does *not* have mutable sta
 | hash map (symbol table) | association list `[(String, Entry)]` using a sum-type pair `type Binding = Bind(String, Entry)` |
 | array of tokens | linked list `[Token]`, built in reverse then reversed once (to keep building O(1)) |
 | string buffer (for emit) | accumulate `[String]` chunks, join at end via `list_reverse` + fold with `string_concat` |
-| early-exit in pass | return `Result[Error, AST]`, propagate by matching |
+| early-exit in pass | return `Result[AST, Error]`, propagate by matching |
 | AST mutated in place with types | return a new AST node. Since types are computed bottom-up, we just embed `Type` as a field of each node and construct the typed node fresh |
 
 This is slower than mutation-based C, but it is what the language gives us and is still O(n) per pass modulo the association-list symbol table (which is fine — programs are small).
@@ -124,7 +124,7 @@ type Type
   | TRecord(String, [(String, Type)])
   | TSum(String, [Variant])
   | TGen(String)                  (* generic parameter name *)
-  | TApp(Type, [Type])            (* Option[T], Result[E,T], etc. *)
+  | TApp(Type, [Type])            (* Option[T], Result[T,E], etc. *)
 ```
 
 The check pass resolves every `TGen` appearing at a call site by unifying against the argument types, exactly like stage 0.

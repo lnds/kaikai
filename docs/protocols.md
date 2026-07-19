@@ -313,7 +313,7 @@ The m12.8 milestone shipped five protocols; issue #258 added
 | `Default` | `default() : Self` | accumulators, container clearing, generic zero values |
 
 Stdlib provides default impls for all primitives (`Int`, `Real`,
-`Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[e, a]`,
+`Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[a, e]`,
 records auto-derived via #derive, sum types auto-derived). User-defined
 opaque types must `impl` themselves. The parametric containers carry
 `Show` / `Eq` / `Ord` / `Hash` (see `stdlib/protocols.kai`); `Serialize`
@@ -339,8 +339,8 @@ impl[T] Default for Option[T] { fn default() : Option[T] = None }
 ```
 
 Canonical defaults: numeric zero, false, empty string, empty list,
-absent option. `Result[E, T]` is intentionally absent — neither
-`Ok(default()) : Result[_, T]` nor `Err(default()) : Result[E, _]`
+absent option. `Result[T, E]` is intentionally absent — neither
+`Ok(default()) : Result[T, _]` nor `Err(default()) : Result[_, E]`
 is a privileged choice, so callers construct results explicitly.
 
 `default() : Self` has Self only in the return position, so v1
