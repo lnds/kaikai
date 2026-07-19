@@ -7716,7 +7716,7 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu "root pub fn"        "kai_main__badge"             "main.c"; \
 	assert_tu "root private fn"    "kai_helper"                  "__root__.c"; \
 	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
-	assert_tu "root lambda"        "_kai_lam_0"                  "__root__.c"; \
+	assert_tu "root lambda"        "_kai_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kai_widget__label"           "widget.c"; \
 	assert_tu "cross-module spec"  "kai_widget__wrap__mono__Int" "widget.c"; \
 	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
