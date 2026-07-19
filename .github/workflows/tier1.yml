@@ -2,6 +2,11 @@ name: tier1
 
 on:
   pull_request:
+  # merge_group makes the required checks run inside a GitHub merge queue
+  # (harmless while the queue is not enabled in repo settings). The queue
+  # tests the batched merge result, so enabling it replaces the
+  # require-branches-up-to-date re-run treadmill.
+  merge_group:
   push:
     branches: [main]
     # Doc-only pushes (merged doc PRs) and `cz bump` release commits
@@ -28,9 +33,9 @@ permissions:
 # pool is CPU-bound + independent, so it is sharded across SEPARATE
 # runners (each with its own memory bus — in-job `-j` is bandwidth-capped).
 # A single `build` job bootstraps the C-only kaic2 ONCE and publishes it as
-# an artifact; tier0 + the four tier1 shards consume it (download + a
+# an artifact; tier0 + the five tier1 shards consume it (download + a
 # dependency-ordered mtime touch so `make` rebuilds nothing). The `tier1`
-# aggregator job gates on all four shards, so the REQUIRED check is still
+# aggregator job gates on all five shards, so the REQUIRED check is still
 # named `tier1` and branch protection needs no change.
 jobs:
   # Shared doc-only detection for PRs. Pure-doc PRs short-circuit every
@@ -51,7 +56,7 @@ jobs:
       - name: Detect doc-only diff
         id: doc-only
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
@@ -84,8 +89,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang
+      # Exact-match cache of the whole bootstrap chain: a hit means the
+      # sources that feed kaic2 are byte-identical to a prior green build,
+      # so the ~5-min bootstrap is skipped (docs/CI/examples-only PRs).
+      # Deliberately NO restore-keys: a near-miss chain plus the mtime touch
+      # would masquerade as fresh and make would rebuild nothing — a stale
+      # kaic2 presented as current. Exact hit or full bootstrap, nothing
+      # in between.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache bootstrap chain (exact source match only)
+        id: bootstrap-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+          key: kaic2-c-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('Makefile', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh') }}
       - name: Bootstrap C-only kaic2
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
         run: make CC=clang kaic2
+      - name: Mark cached chain fresh (no rebuild)
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
       - name: Upload bootstrap artifact
         uses: actions/upload-artifact@v4
         with:
@@ -189,7 +223,7 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      - name: tier1-shard-2 (light slice 1/2 + demos)
+      - name: tier1-shard-2 (light slice 1/3)
         run: make CC=clang tier1-shard-2
       - name: Working tree clean check
         run: |
@@ -219,7 +253,7 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      - name: tier1-shard-3 (light slice 2/2 + rest)
+      - name: tier1-shard-3 (light slice 2/3)
         run: make CC=clang tier1-shard-3
       - name: Working tree clean check
         run: |
@@ -280,12 +314,42 @@ jobs:
             git status; exit 1
           fi
 
+  # Shard 5 — light slice 3/3.
+  tier1-shard-5:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier1-shard-5 (light slice 3/3)
+        run: make CC=clang tier1-shard-5
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-shard-5"
+            git status; exit 1
+          fi
+
   # Aggregator: the REQUIRED check. Green iff every shard is green. Keeping
   # the name `tier1` means branch protection needs no edit. A doc-only PR
   # reaches here via the skipped shards and still reports SUCCESS, satisfying
   # the required check.
   tier1:
-    needs: [changes, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4]
+    needs: [changes, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4, tier1-shard-5]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -299,8 +363,9 @@ jobs:
           r2='${{ needs.tier1-shard-2.result }}'
           r3='${{ needs.tier1-shard-3.result }}'
           r4='${{ needs.tier1-shard-4.result }}'
-          echo "shard results: 1=$r1 2=$r2 3=$r3 4=$r4"
-          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
+          r5='${{ needs.tier1-shard-5.result }}'
+          echo "shard results: 1=$r1 2=$r2 3=$r3 4=$r4 5=$r5"
+          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ] && [ "$r5" = "success" ]; then
             echo "tier1 OK — all shards green (full gate coverage)"
           else
             echo "::error::tier1 FAIL — a shard did not succeed"; exit 1

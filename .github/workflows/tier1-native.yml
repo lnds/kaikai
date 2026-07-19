@@ -22,6 +22,9 @@ name: tier1-native
 # than the C oracle — sharding cuts wall-clock without dropping a fixture.
 on:
   pull_request:
+  # merge_group makes this required check run inside a GitHub merge queue
+  # (harmless while the queue is not enabled in repo settings).
+  merge_group:
   push:
     branches: [main]
     # Doc-only pushes and `cz bump` release commits change nothing this
@@ -55,7 +58,7 @@ jobs:
       - name: Detect doc-only diff
         id: doc-only
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
@@ -96,11 +99,41 @@ jobs:
           fi
           echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
           echo "using $LLVM_CONFIG ($($LLVM_CONFIG --version))"
-      - name: Build native kaic2 + assert P2 bitcode
+      # Exact-match cache of the native bootstrap chain (same discipline as
+      # tier1's build job: no restore-keys — a near-miss chain plus the mtime
+      # touch would present a stale kaic2 as fresh). The key folds the clang
+      # AND libLLVM identities so a runner-image LLVM bump misses cleanly.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$( (clang --version | head -1; "$LLVM_CONFIG" --version) | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native bootstrap chain (exact source match only)
+        id: bootstrap-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('Makefile', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/assert-runtime-bc.sh') }}
+      - name: Build native kaic2
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
         run: |
           rm -f stage2/kaic2
           make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >/dev/null 2>&1
-          tools/assert-runtime-bc.sh
+      - name: Mark cached chain fresh (no rebuild)
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Assert P2 bitcode
+        run: tools/assert-runtime-bc.sh
       - name: Upload native artifact
         uses: actions/upload-artifact@v4
         with:
