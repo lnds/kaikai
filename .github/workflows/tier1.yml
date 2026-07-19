@@ -49,6 +49,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       doc-only: ${{ steps.doc-only.outputs.skip }}
+      compiler-touch: ${{ steps.compiler-touch.outputs.touch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,6 +72,28 @@ jobs:
             echo "Doc-only PR; skipping tier1 build + shards."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Gates the shard-4 whole-compiler self-hosts: they only detect
+      # regressions introduced by changes to the sources they compile.
+      # PR-only — on push/merge_group the self-hosts always run.
+      - name: Detect compiler-source diff
+        id: compiler-touch
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if [ -z "$CHANGED" ]; then
+            echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          COMPILER=$(echo "$CHANGED" | grep -E '^(stage2/compiler/|stdlib/|stage2/main\.kai$|stage2/Makefile$|stage2/runtime[^/]*\.h$|stage0/runtime[^/]*\.h$)' || true)
+          if [ -z "$COMPILER" ]; then
+            echo "touch=false" >> "$GITHUB_OUTPUT"
+            echo "No compiler-source changes; shard-4 skips the self-hosts."
+          else
+            echo "touch=true" >> "$GITHUB_OUTPUT"
           fi
 
   # Build the C-only kaic2 once and publish the bootstrap chain. Every
@@ -264,24 +287,35 @@ jobs:
 
   # Shard 4 — the two whole-compiler modular self-hosts, the slowest single
   # phases in the gate (~15 min combined). Isolated so no shard dominates
-  # the critical path.
+  # the critical path. On PRs that touch no compiler source the self-hosts
+  # prove nothing, so every step is gated on `compiler-touch` — the job
+  # still runs and reports SUCCESS with all steps skipped. The gate MUST
+  # stay at step level: a job-level if would mark shard-4 `skipped`, the
+  # aggregator requires `success`, and the required check would hang red.
   tier1-shard-4:
     needs: [changes, build]
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Self-hosts skipped (no compiler-source changes in PR diff)
+        if: needs.changes.outputs.compiler-touch != 'true'
+        run: echo "tier1-shard-4 OK — PR touches no compiler sources; self-hosts not exercised."
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.compiler-touch == 'true'
         with:
           fetch-depth: 0
       - name: Install toolchain
+        if: needs.changes.outputs.compiler-touch == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang
       - uses: actions/download-artifact@v4
+        if: needs.changes.outputs.compiler-touch == 'true'
         with:
           name: kaic2-c
       - name: Restore artifact mtimes (no rebuild)
+        if: needs.changes.outputs.compiler-touch == 'true'
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
@@ -297,8 +331,10 @@ jobs:
       # the content hash sort out which objects survive.
       - name: Fingerprint toolchain for cache key
         id: cc-fp
+        if: needs.changes.outputs.compiler-touch == 'true'
         run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache c-modular .o objects (self-host self-compiles)
+        if: needs.changes.outputs.compiler-touch == 'true'
         uses: actions/cache@v4
         with:
           path: stage2/build/cmodular-selfhost-cache
@@ -306,8 +342,10 @@ jobs:
           restore-keys: |
             cmodular-selfhost-${{ steps.cc-fp.outputs.id }}-
       - name: tier1-shard-4 (whole-compiler modular self-hosts)
+        if: needs.changes.outputs.compiler-touch == 'true'
         run: make CC=clang tier1-shard-4
       - name: Working tree clean check
+        if: needs.changes.outputs.compiler-touch == 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier1-shard-4"
