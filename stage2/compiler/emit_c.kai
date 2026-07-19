@@ -70,6 +70,7 @@ import compiler.vec_raw
 import compiler.ffi_v2
 import compiler.emit_ffi_c
 import compiler.emit_slices
+import compiler.emit_tcrec_live
 import compiler.modular_linkage
 import compiler.region
 
@@ -182,12 +183,16 @@ type EmitCtx = { lcs: [String], fns: [EFn], variants: [EVar], lams: [LamInfo], c
                  # Names of every donation-capable top-level fn, pre-scanned
                  # once. A call site consults it (with a live arm token, i.e.
                  # `reuse_donor` set) to donate that token across the call.
-                 rd_capable: [String] }
+                 rd_capable: [String],
+                 # Pending releases the tcrec goto-tail path must emit before
+                 # jumping: enclosing owned match scrutinee aliases plus
+                 # not-yet-consumed arm-binder increfs (emit_tcrec_live ledger).
+                 tcpend: [String] }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
 # keys on this + (line, col) so a nested ELambda resolves to its own
@@ -195,25 +200,44 @@ fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
 fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # Set/clear the arena-routing flag for a region body.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
+
+# Replace the tcrec pending-release ledger (entering a match arm body /
+# refining across a branch point).
+fn emit_ctx_with_tcpend(cx: EmitCtx, l: [String]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l }
+
+# Refine the ledger across an already-evaluated expression — a no-op
+# (and no scan) when the ledger is empty, the overwhelmingly common case.
+fn emit_ctx_tcpend_after(cx: EmitCtx, e: Expr) : EmitCtx = match cx.tcpend {
+  [] -> cx
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.tcpend, e))
+}
+
+fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcpend {
+  [] -> cx
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.tcpend, ss))
+}
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # Set the donation-active flag (entering/leaving a `_donor`-taking body).
 fn emit_ctx_with_rd_active(cx: EmitCtx, a: Bool) : EmitCtx =
@@ -225,7 +249,7 @@ fn emit_ctx_with_rd_active(cx: EmitCtx, a: Bool) : EmitCtx =
 fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # i64-inline (Lane B): set the kind-1 raw-bound binder name set for an arm
 # body. Entering a match arm whose pattern binds kind-1 Int slots, the
@@ -235,7 +259,7 @@ fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
 fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
 
 # True when `nm` is a kind-1 raw-bound binder in the current arm scope.
 fn emit_ctx_kind1_raw_has(cx: EmitCtx, nm: String) : Bool = list_has(cx.kind1_raw, nm)
@@ -3847,9 +3871,9 @@ fn pat_is_destructuring(p: Pattern) : Bool {
   }
 }
 
-fn emit_match_arms(src: String, arms: [Arm], cx: EmitCtx) : String / Console =
+fn emit_match_arms(src: String, arms: [Arm], scr_alias: Option[String], cx: EmitCtx) : String / Console =
 
-  concat_all(map(arms, (a) => emit_match_arm(src, a, cx)))
+  concat_all(map(arms, (a) => emit_match_arm(src, a, scr_alias, cx)))
 
 # Issue #209 — detect a cons reuse-arm whose body is the synthetic
 # `__perceus_reuse_cons(__pcs_scr, h_new, t_new)` produced by
@@ -4893,7 +4917,7 @@ fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseV
 fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] =
   if cx.in_region { None } else { try_arm_top_reuse(pat, body, cx) }
 
-fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
+fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], cx: EmitCtx) : String / Console {
 
   match a {
     Arm(pat, opt_guard, body) -> {
@@ -4936,30 +4960,21 @@ fn emit_match_arm(src: String, a: Arm, cx: EmitCtx) : String / Console {
             # this arm may consume the binding (e.g. const-pattern desugar's
             # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
             let binds = emit_pat_binds(src, pat, "_scr", true, cx)
-            # Issue #309 — when every tail leaf of `body` is a tcrec
-            # sentinel call, the goto leaves the enclosing
-            # statement-expression and the post-do-while
-            # `kai_decref(_scr)` is unreachable. Pre-inject the drop
-            # inside the body's statement-expression so it executes
-            # before the goto fires. Safe because the predicate
-            # guarantees control NEVER reaches the post-do-while
-            # decref via this arm — no double-decref is possible.
-            let body_c = emit_expr(src, body, arm_cx)
-            if tcrec_tail_always_sentinel(body) {
-              concat_all([
-                "    if (", pt, ") { ", binds,
-                "_r = ({ kai_decref(_scr); ", body_c, "; }); break; }\n"
-              ])
-            } else {
-              concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
-            }
+            # A tcrec goto in the body leaves every enclosing match
+            # statement-expression, skipping the post-do-while
+            # `kai_decref(_scr)` releases and this arm's bind-increfs.
+            # The ledger carries them down to the goto site, which
+            # emits the skipped releases just before the jump.
+            let body_c = emit_expr(src, body, tcp_arm_body_cx(arm_cx, scr_alias, pat, body, cx))
+            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
           }
           }
           }
         }
         Some(g) -> {
           let binds = emit_pat_binds(src, pat, "_scr", true, cx)
-          let body_c = emit_expr(src, body, arm_cx)
+          let bcx = emit_ctx_tcpend_after(tcp_arm_body_cx(arm_cx, scr_alias, pat, body, cx), g)
+          let body_c = emit_expr(src, body, bcx)
           let gc = emit_expr(src, g, arm_cx)
           concat_all([
             "    if (", pt, ") { ", binds,
@@ -5282,12 +5297,13 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
   match match_borrow_inner(scrut) {
     Some(inner) -> {
       let sc = emit_expr(src, inner, cx)
-      let hs = match_hoist_slots(arms, cx)
-      let arm_cx = emit_ctx_with_hoisted(cx, hs)
+      let cx1 = emit_ctx_tcpend_after(cx, inner)
+      let hs = match_hoist_slots(arms, cx1)
+      let arm_cx = emit_ctx_with_hoisted(cx1, hs)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-        emit_hoist_decls(hs, arms, cx),
-        emit_match_arms(src, arms, arm_cx),
+        emit_hoist_decls(hs, arms, cx1),
+        emit_match_arms(src, arms, None, arm_cx),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
@@ -5295,6 +5311,55 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
     None -> emit_match_default_owned(src, scrut, arms, cx)
   }
 }
+
+# True when any arm body can reach a tcrec/TRMC goto — the gate for
+# declaring this match's scrutinee-release alias.
+fn match_arms_have_sentinel(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, body) ->
+      if tcrec_body_has_sentinel(body) { true } else { match_arms_have_sentinel(rest) }
+  }
+}
+
+# This pattern's RC-carrying binders: every bound name except raw
+# kind-1 scalars and `_`-prefixed names (which bind no C local).
+fn tcp_rc_binders(pat: Pattern, cx: EmitCtx) : [String] =
+  tcp_rc_binders_loop(pat_binders(pat, []), pat_kind1_binders(pat, cx, []))
+
+fn tcp_rc_binders_loop(all: [String], raw: [String]) : [String] = match all {
+  [] -> []
+  [n, ...rest] ->
+    if list_has(raw, n) or name_is_unused(n) { tcp_rc_binders_loop(rest, raw) }
+    else { [n, ...tcp_rc_binders_loop(rest, raw)] }
+}
+
+# Ledger entering a non-reuse arm body: enclosing pending entries plus
+# this match's scrutinee alias plus this pattern's RC binders — only
+# when the body can actually reach a goto. A goto-free body never reads
+# the ledger, so it is cleared to skip the branch-refinement scans.
+fn tcp_arm_body_cx(arm_cx: EmitCtx, scr_alias: Option[String], pat: Pattern,
+                   body: Expr, cx: EmitCtx) : EmitCtx =
+  if tcrec_body_has_sentinel(body) {
+    let with_scr = match scr_alias {
+      Some(a) -> list_append(arm_cx.tcpend, [tcl_scr_entry(a)])
+      None    -> arm_cx.tcpend
+    }
+    emit_ctx_with_tcpend(arm_cx, tcl_push_binders(with_scr, tcp_rc_binders(pat, cx)))
+  } else { match arm_cx.tcpend {
+    [] -> arm_cx
+    _  -> emit_ctx_with_tcpend(arm_cx, [])
+  } }
+
+fn tcp_scr_alias_decl(scr_alias: Option[String]) : String = match scr_alias {
+  Some(a) -> concat_all(["KaiValue *", a, " = _scr; (void) ", a, "; "])
+  None    -> ""
+}
+
+fn tcp_new_scr_alias(arms: [Arm], cx: EmitCtx) : Option[String] =
+  if match_arms_have_sentinel(arms) {
+    Some(cat2("_kai_tcs", int_to_string(tcl_scr_count(cx.tcpend))))
+  } else { None }
 
 # match-raw unboxing (asu design). Lower a `match` whose result is a
 # raw scalar — `_r` has the native C type (`raw_c_type(ty)`), each arm
@@ -5334,18 +5399,22 @@ fn emit_match_raw_arms(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx
   match match_borrow_inner(scrut) {
     Some(inner) -> {
       let sc = emit_expr(src, inner, cx)
+      let cx1 = emit_ctx_tcpend_after(cx, inner)
       concat_all([
         "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
-        emit_match_arms_raw(src, arms, false, cx),
+        emit_match_arms_raw(src, arms, None, cx1),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
     }
     None -> {
       let sc = emit_expr(src, scrut, cx)
+      let cx1 = emit_ctx_tcpend_after(cx, scrut)
+      let scr_alias = tcp_new_scr_alias(arms, cx1)
       concat_all([
-        "({ KaiValue *_scr = ", sc, "; ", rty, " _r = ", raw_zero(ty), "; do {\n",
-        emit_match_arms_raw(src, arms, true, cx),
+        "({ KaiValue *_scr = ", sc, "; ", tcp_scr_alias_decl(scr_alias),
+        rty, " _r = ", raw_zero(ty), "; do {\n",
+        emit_match_arms_raw(src, arms, scr_alias, cx1),
         match_tail_panic(arms),
         "} while (0); kai_decref(_scr); _r; })"
       ])
@@ -5366,16 +5435,14 @@ fn raw_zero(ty: Option[Ty]) : String = match ty {
   None -> "0"
 }
 
-# `scr_owned` records whether the enclosing `emit_match_raw_arms` owns
-# `_scr` (its `None`/non-borrow branch emits the post-`do/while`
-# `kai_decref(_scr)`). Threaded so a self-tail-recursive arm whose `goto`
-# leaves the statement-expression can pre-inject that drop before the
-# goto fires — the raw mirror of the boxed #309 fix. The borrowed branch
-# passes `false`: there is no post-loop decref to mirror, and injecting
-# one would free a value the match does not own (UAF).
-fn emit_match_arms_raw(src: String, arms: [Arm], scr_owned: Bool, cx: EmitCtx) : String / Console = match arms {
+# `scr_alias` is Some for an owned scrutinee whose arms can reach a
+# tcrec goto — the ledger entry a goto uses to release the `_scr` ref
+# whose post-`do/while` decref it skips. The borrowed branch passes
+# None: there is no post-loop decref to mirror, and releasing a borrow
+# would be a UAF.
+fn emit_match_arms_raw(src: String, arms: [Arm], scr_alias: Option[String], cx: EmitCtx) : String / Console = match arms {
   [] -> ""
-  [a, ...rest] -> cat2(emit_match_arm_raw(src, a, scr_owned, cx), emit_match_arms_raw(src, rest, scr_owned, cx))
+  [a, ...rest] -> cat2(emit_match_arm_raw(src, a, scr_alias, cx), emit_match_arms_raw(src, rest, scr_alias, cx))
 }
 
 # One raw arm: `if (test) { binds; _r = <raw body>; break; }`, plus the
@@ -5383,12 +5450,13 @@ fn emit_match_arms_raw(src: String, arms: [Arm], scr_owned: Bool, cx: EmitCtx) :
 # emits the body via `emit_expr_raw` into a raw `_r`. Pattern binders
 # (incl. kind-1 raw Int slots) are bound exactly as the boxed path does,
 # so an arm reading a payload sees the same `kair_<n>` / `kai_<n>` locals.
-fn emit_match_arm_raw(src: String, a: Arm, scr_owned: Bool, cx: EmitCtx) : String / Console = match a {
+fn emit_match_arm_raw(src: String, a: Arm, scr_alias: Option[String], cx: EmitCtx) : String / Console = match a {
   Arm(pat, opt_guard, body) -> {
     let pt = emit_pat_test(src, pat, "_scr", cx)
     let arm_lcs = list_append(cx.lcs, pat_binders(pat, []))
-    let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
-                                         list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, [])))
+    let arm_cx0 = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
+                                          list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, [])))
+    let arm_cx = tcp_arm_body_cx(arm_cx0, scr_alias, pat, body, cx)
     let binds = emit_pat_binds(src, pat, "_scr", true, cx)
     # A divergent arm (`panic`/`exit`) never assigns `_r` — emit the
     # call boxed (it aborts) and `break`. Without this, `emit_expr_raw`
@@ -5404,25 +5472,16 @@ fn emit_match_arm_raw(src: String, a: Arm, scr_owned: Bool, cx: EmitCtx) : Strin
         }
       }
     } else {
-      let body_c = emit_expr_raw(src, body, arm_cx)
+      # A goto in the body releases the skipped `_scr` decrefs and
+      # bind-increfs via the ledger `tcp_arm_body_cx` seeded above.
       match opt_guard {
-        # Issue #309 (raw mirror) — when the scrutinee is owned and every
-        # tail leaf of `body` is a tcrec sentinel call, the `goto` leaves
-        # the enclosing statement-expression and the post-`do/while`
-        # `kai_decref(_scr)` is unreachable: the consumed cons cell leaks
-        # one per loop iteration. Pre-inject the drop inside the body's
-        # statement-expression so it runs before the goto fires. The
-        # boxed `emit_match_arm` does the same; gated to `scr_owned`
-        # because the borrowed branch emits no post-loop decref to mirror
-        # (injecting one would free a borrow → UAF).
-        None    ->
-          if scr_owned and tcrec_tail_always_sentinel(body) {
-            concat_all(["    if (", pt, ") { ", binds, "_r = ({ kai_decref(_scr); ", body_c, "; }); break; }\n"])
-          } else {
-            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
-          }
+        None    -> {
+          let body_c = emit_expr_raw(src, body, arm_cx)
+          concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+        }
         Some(g) -> {
           let gc = emit_expr_raw(src, g, arm_cx)
+          let body_c = emit_expr_raw(src, body, emit_ctx_tcpend_after(arm_cx, g))
           concat_all(["    if (", pt, ") { ", binds, "if (", gc, ") { _r = ", body_c, "; break; } }\n"])
         }
       }
@@ -5441,11 +5500,14 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
   # time the match sees it; the match decref consumes the ref it owns
   # without touching the producer's slot.
   let hs = match_hoist_slots(arms, cx)
-  let arm_cx = emit_ctx_with_hoisted(cx, hs)
+  let cx1 = emit_ctx_tcpend_after(cx, scrut)
+  let arm_cx = emit_ctx_with_hoisted(cx1, hs)
+  let scr_alias = tcp_new_scr_alias(arms, cx1)
   concat_all([
-    "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
-    emit_hoist_decls(hs, arms, cx),
-    emit_match_arms(src, arms, arm_cx),
+    "({ KaiValue *_scr = ", sc, "; ", tcp_scr_alias_decl(scr_alias),
+    "KaiValue *_r = kai_unit(); do {\n",
+    emit_hoist_decls(hs, arms, cx1),
+    emit_match_arms(src, arms, scr_alias, arm_cx),
     match_tail_panic(arms),
     "} while (0); kai_decref(_scr); _r; })"
   ])
@@ -5471,7 +5533,8 @@ fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String 
   let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
   let stmt_out = match stmt_acc { EBSA(_, t) -> t }
   let block_lcs = match stmt_acc { EBSA(l, _) -> l }
-  let tail_c = emit_expr_raw(src, tail, emit_ctx_with_lcs(cx, block_lcs))
+  let tail_c = emit_expr_raw(src, tail,
+                             emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts))
   cat4("({ ", stmt_out, tail_c, "; })")
 }
 
@@ -5800,7 +5863,7 @@ fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar], 
   # inside one fills a frame-carrying callee's evidence (the by-name walk
   # stays the fallback for any effect the frame does not carry).
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, core: core, rcore: rcore, evf: evf, rd_active: false, rd_capable: [] })))
+                                                                regions: [], in_region: false, borrowed: [], enums: enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, core: core, rcore: rcore, evf: evf, rd_active: false, rd_capable: [], tcpend: [] })))
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   concat_all(["static KaiValue *", lam_symbol(l), "(KaiValue *, KaiValue **, int);\n"])
@@ -6588,8 +6651,9 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EIf(cnd, ath, opt_eth) -> match opt_eth {
       Some(eth) -> {
         let cnd_c = emit_expr_raw(src, cnd, cx)
-        let a_c = emit_expr_raw(src, ath, cx)
-        let b_c = emit_expr_raw(src, eth, cx)
+        let bcx = emit_ctx_tcpend_after(cx, cnd)
+        let a_c = emit_expr_raw(src, ath, bcx)
+        let b_c = emit_expr_raw(src, eth, bcx)
         concat_all(["(", cnd_c, " ? ", a_c, " : ", b_c, ")"])
       }
       None -> {
@@ -6869,27 +6933,30 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       # checked before the mode split. Load-bearing on the rb-tree descent.
       if expr_is_int_order_cmp(c) {
         let cc = emit_int_order_cmp_raw(src, c, cx)
-        let tc = emit_expr(src, a, cx)
+        let bcx = emit_ctx_tcpend_after(cx, c)
+        let tc = emit_expr(src, a, bcx)
         let ec = match opt_b {
-          Some(eb) -> emit_expr(src, eb, cx)
+          Some(eb) -> emit_expr(src, eb, bcx)
           None -> "kai_unit()"
         }
         concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
       } else { match c.mode {
         MUnboxed -> {
           let cc = emit_expr_raw(src, c, cx)
-          let tc = emit_expr(src, a, cx)
+          let bcx = emit_ctx_tcpend_after(cx, c)
+          let tc = emit_expr(src, a, bcx)
           let ec = match opt_b {
-            Some(eb) -> emit_expr(src, eb, cx)
+            Some(eb) -> emit_expr(src, eb, bcx)
             None -> "kai_unit()"
           }
           concat_all(["(", cc, " ? ", tc, " : ", ec, ")"])
         }
         _ -> {
           let cb = emit_expr(src, c, cx)
-          let tc = emit_expr(src, a, cx)
+          let bcx = emit_ctx_tcpend_after(cx, c)
+          let tc = emit_expr(src, a, bcx)
           let ec = match opt_b {
-            Some(eb) -> emit_expr(src, eb, cx)
+            Some(eb) -> emit_expr(src, eb, bcx)
             None -> "kai_unit()"
           }
           concat_all([
@@ -6950,7 +7017,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
                         " kai_arena_pop(); __rout; })"])
           } else {
             let final_out = match opt_final {
-              Some(fe) -> cat2(emit_expr(src, fe, emit_ctx_with_lcs(cx, block_lcs)), "; ")
+              Some(fe) -> cat2(emit_expr(src, fe,
+                                         emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts)),
+                               "; ")
               None -> "kai_unit(); "
             }
             cat4("({ ", stmt_out, final_out, "})")
@@ -8034,7 +8103,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # unit normaliser on every ctor), so every ctor in the body routes.
         let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable }
+                                regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable, tcpend: [] }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -8750,7 +8819,7 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # lambda otherwise looked up under the wrong enc_fn → "non-callable").
   let test_enc = concat_all(["__test__", int_to_string(test_line), "_", int_to_string(test_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -8840,7 +8909,7 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
   # inside a bench body resolve in `find_lam`.
   let bench_enc = concat_all(["__bench__", int_to_string(bench_line), "_", int_to_string(bench_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -9192,7 +9261,7 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
   # inside a check body resolve in `find_lam`.
   let check_enc = concat_all(["__check__", int_to_string(check_line), "_", int_to_string(check_col)])
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -10576,7 +10645,7 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   # separate compilation needs the capability encoded in the callee's
   # exported signature, not its body — a later lane.
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), core: core_tbl, rcore: rcore_tbl, evf: build_evidence_frames(decls), rd_active: false, rd_capable: [] }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), core: core_tbl, rcore: rcore_tbl, evf: build_evidence_frames(decls), rd_active: false, rd_capable: [], tcpend: [] }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
@@ -10728,7 +10797,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   let core_tbl = core_table()
   let rcore_tbl = rcore_table()
   let cx = EmitCtx { lcs: [], fns: fns, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), core: core_tbl, rcore: rcore_tbl, evf: build_evidence_frames(decls), rd_active: false, rd_capable: rd_cap_set }
+                     regions: regions, in_region: false, borrowed: [], enums: enum_names, hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), core: core_tbl, rcore: rcore_tbl, evf: build_evidence_frames(decls), rd_active: false, rd_capable: rd_cap_set, tcpend: [] }
   let bodies = fn_bodies(src, decls, cx, const_syms)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants, cls, enum_names, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), core_tbl, rcore_tbl, cx.evf)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
@@ -14807,66 +14876,6 @@ fn trmc_scan_step_stmts(stmts: [Stmt]) : Bool {
   }
 }
 
-# Issue #309 — recognise expressions whose every tail position is a
-# tcrec sentinel call. Stricter than `tcrec_body_has_sentinel`: only
-# returns true when control-flow guarantees the goto fires (i.e. no
-# tail leaf evaluates to a normal value). Used by `emit_match_arm`
-# to decide whether it is safe to inject a `kai_decref(_scr)` before
-# evaluating the arm body — when the goto is guaranteed, the arm's
-# normal post-do-while `kai_decref(_scr)` is unreachable and the
-# pre-injected drop closes the leak without risking a double-decref.
-# Conservative: ECall checks only the head EVar; recurses through
-# EIf / EMatch / EBlock tail. Anything else returns false.
-
-# Issue #309 — recognise expressions whose every tail position is a
-# tcrec sentinel call. Stricter than `tcrec_body_has_sentinel`: only
-# returns true when control-flow guarantees the goto fires (i.e. no
-# tail leaf evaluates to a normal value). Used by `emit_match_arm`
-# to decide whether it is safe to inject a `kai_decref(_scr)` before
-# evaluating the arm body — when the goto is guaranteed, the arm's
-# normal post-do-while `kai_decref(_scr)` is unreachable and the
-# pre-injected drop closes the leak without risking a double-decref.
-# Conservative: ECall checks only the head EVar; recurses through
-# EIf / EMatch / EBlock tail. Anything else returns false.
-fn tcrec_tail_always_sentinel(body: Expr) : Bool =
-  tcrec_tail_is_sentinel_kind(body.kind)
-
-fn tcrec_tail_is_sentinel_kind(k: ExprKind) : Bool {
-  match k {
-    ECall(f, _) -> match f.kind {
-      EVar(callee) -> tcrec_is_sentinel(callee)
-      _ -> false
-    }
-    EIf(_, t, opt_e) -> match opt_e {
-      None -> false
-      Some(e2) -> if tcrec_tail_always_sentinel(t) {
-        tcrec_tail_always_sentinel(e2)
-      } else { false }
-    }
-    EMatch(_, arms) -> tcrec_tail_arms_always_sentinel(arms)
-    EBlock(_, opt_tail) -> match opt_tail {
-      None -> false
-      Some(e) -> tcrec_tail_always_sentinel(e)
-    }
-    _ -> false
-  }
-}
-
-fn tcrec_tail_arms_always_sentinel(arms: [Arm]) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> match a {
-      Arm(_, _, body) ->
-        if tcrec_tail_always_sentinel(body) {
-          match rest {
-            [] -> true
-            _  -> tcrec_tail_arms_always_sentinel(rest)
-          }
-        } else { false }
-    }
-  }
-}
-
 fn tcrec_scan_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
@@ -15312,6 +15321,10 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
       # reference old param values); drops and rebinds go through the
       # `_kai_tcrp<N>` param pointers, immune to same-name binder shadow.
       let arg_lets = tcrec_emit_arg_lets_masked(src, args_e, pts, mask, 0, cx)
+      # Releases the goto skips: enclosing owned-scrutinee refs + this
+      # path's unconsumed bind-increfs. After arg_lets (args may still
+      # dup-read the binders), before the rebinds.
+      let live     = tcl_goto_drops(cx.tcpend, args_e)
       let drops    = tcrec_emit_drops_masked(pnames, mask, dropmask, 0)
       let rebinds  = tcrec_emit_rebinds(pnames, 0)
       # The statement-expression's value type must match the enclosing
@@ -15320,16 +15333,17 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
       # `_r = ({ ...; (KaiValue *)0; })` assignment type-checks.
       let sentinel = if ty_is_unboxable_t(rt) { "0" } else { "(KaiValue *)0" }
       concat_all([
-        "({ ", arg_lets, drops, rebinds,
+        "({ ", arg_lets, live, drops, rebinds,
         "goto _kai_", sym, "_entry; ", sentinel, "; })"
       ])
     }
     None -> {
       let arg_lets = tcrec_emit_arg_lets(src, args_e, 0, cx)
+      let live     = tcl_goto_drops(cx.tcpend, args_e)
       let drops    = tcrec_emit_drops(pnames, dropmask, 0)
       let rebinds  = tcrec_emit_rebinds(pnames, 0)
       concat_all([
-        "({ ", arg_lets, drops, rebinds,
+        "({ ", arg_lets, live, drops, rebinds,
         "goto _kai_", sym, "_entry; (KaiValue *)0; })"
       ])
     }

@@ -1,0 +1,230 @@
+#[doc("""
+Live-release ledger for the tcrec goto-tail path.
+
+A TCO'd self-tail-call lowers to a rebind-and-goto block that jumps out
+of every enclosing match statement-expression, skipping their trailing
+`kai_decref(_scr)` releases and any not-yet-consumed pattern-binder
+bind-increfs. The emit threads a ledger of those pending releases down
+to the goto site, which emits them just before the jump.
+
+Ledger entries are strings: `@scr:<cvar>` names a C alias of an
+enclosing owned match scrutinee (always released at the goto); any
+other entry is a kaikai pattern-binder name whose bind-incref is
+released at the goto unless the goto path already consumed it.
+
+Consumption is judged syntactically over the post-perceus AST: a bare
+`EVar(name)` read transfers the binding's ref (Perceus discipline), a
+`__perceus_dup(name)` wrap does not. The scan is conservative — any
+mention that MIGHT consume (lambda capture, interpolation span, either
+branch of an already-evaluated conditional) counts as consumed, so a
+stale entry can only under-release (a bounded leak), never
+over-release (a double-free).
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.modules
+
+#[doc("Ledger entry for an owned-scrutinee C alias `cvar`.")]
+pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
+
+#[doc("True when a ledger entry names a scrutinee alias (never filtered).")]
+pub fn tcl_is_scr(e: String) : Bool = string_starts_with_q(e, "@scr:")
+
+#[doc("The C lvalue a ledger entry releases: the alias itself, or `kai_<binder>`.")]
+pub fn tcl_cname(e: String) : String =
+  if tcl_is_scr(e) { string_slice(e, 5, string_length(e) - 5) }
+  else { cat2("kai_", e) }
+
+#[doc("Number of scrutinee-alias entries in the ledger — the next alias suffix.")]
+pub fn tcl_scr_count(pend: [String]) : Int = tcl_scr_count_loop(pend, 0)
+
+fn tcl_scr_count_loop(pend: [String], acc: Int) : Int = match pend {
+  [] -> acc
+  [e, ...rest] -> tcl_scr_count_loop(rest, if tcl_is_scr(e) { acc + 1 } else { acc })
+}
+
+#[doc("Append binder entries, dropping same-name earlier entries a new binder shadows.")]
+pub fn tcl_push_binders(pend: [String], names: [String]) : [String] = match names {
+  [] -> pend
+  [n, ...rest] -> tcl_push_binders(list_append(tcl_remove(pend, n), [n]), rest)
+}
+
+fn tcl_remove(pend: [String], n: String) : [String] = match pend {
+  [] -> []
+  [e, ...rest] -> if e == n { tcl_remove(rest, n) } else { [e, ...tcl_remove(rest, n)] }
+}
+
+fn tcl_remove_all(pend: [String], names: [String]) : [String] = match names {
+  [] -> pend
+  [n, ...rest] -> tcl_remove_all(tcl_remove(pend, n), rest)
+}
+
+#[doc("Drop the binder entries that expression `e` consumes (or might consume).")]
+pub fn tcl_filter(pend: [String], e: Expr) : [String] = match pend {
+  [] -> []
+  [p, ...rest] ->
+    if not tcl_is_scr(p) and tcl_consumes(e, p) { tcl_filter(rest, e) }
+    else { [p, ...tcl_filter(rest, e)] }
+}
+
+#[doc("`tcl_filter` over a statement list, also dropping entries a `let`/`var` rebinds.")]
+pub fn tcl_filter_stmts(pend: [String], stmts: [Stmt]) : [String] = match stmts {
+  [] -> pend
+  [s, ...rest] -> tcl_filter_stmts(tcl_filter_stmt(pend, s), rest)
+}
+
+fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
+  SLet(pat, _, rhs)        -> tcl_remove_all(tcl_filter(pend, rhs), pat_binders(pat, []))
+  SAssert(c, om)           -> match om {
+    Some(m) -> tcl_filter(tcl_filter(pend, c), m)
+    None    -> tcl_filter(pend, c)
+  }
+  SExprStmt(e)             -> tcl_filter(pend, e)
+  SIndexAssign(a, i, v, _, _) -> tcl_filter(tcl_filter(tcl_filter(pend, a), i), v)
+  SVar(n, _, init, _, _)   -> tcl_remove(tcl_filter(pend, init), n)
+  SUse(_, _, _)            -> pend
+}
+
+#[doc("""
+Release statements for the goto site: every scrutinee alias, plus every
+binder entry the tail-call arguments do not themselves consume.
+""")]
+pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String = match pend {
+  [] -> ""
+  [p, ...rest] -> {
+    let here =
+      if tcl_is_scr(p) or not tcl_args_consume(args, p) {
+        concat_all(["kai_decref(", tcl_cname(p), "); "])
+      } else { "" }
+    cat2(here, tcl_goto_drops(rest, args))
+  }
+}
+
+fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
+  [] -> false
+  [a, ...rest] -> tcl_consumes(a, nm) or tcl_args_consume(rest, nm)
+}
+
+#[doc("""
+True when evaluating `e` consumes (or might consume) binder `nm`'s ref:
+a bare `EVar(nm)` read anywhere in `e`, any mention under a lambda or
+in an interpolation span. A `__perceus_dup(nm)` wrap alone does not
+consume. Shadowing inside `e` is ignored — that only biases toward
+"consumed", the safe direction.
+""")]
+pub fn tcl_consumes(e: Expr, nm: String) : Bool = tcl_scan(e, nm, false)
+
+# `every_read` false = Perceus consume scan (dup wraps are transparent
+# reads, interp spans only count when they interpolate). true = capture
+# scan under a lambda: any appearance keeps the entry conservatively.
+fn tcl_scan(e: Expr, nm: String, every_read: Bool) : Bool =
+  tcl_scan_kind(e.kind, nm, every_read)
+
+fn tcl_scan_kind(k: ExprKind, nm: String, ev: Bool) : Bool = match k {
+  EVar(n)          -> n == nm
+  ECall(f, xs)     -> tcl_scan_call(f, xs, nm, ev)
+  EField(b, _)     -> tcl_scan(b, nm, ev)
+  EIndex(a, b)     -> tcl_scan2(a, b, nm, ev)
+  EBinop(_, a, b)  -> tcl_scan2(a, b, nm, ev)
+  EUnop(_, x)      -> tcl_scan(x, nm, ev)
+  EIf(c, t, oe)    -> tcl_scan2(c, t, nm, ev) or tcl_scan_opt(oe, nm, ev)
+  EMatch(s, arms)  -> tcl_scan(s, nm, ev) or tcl_scan_arms(arms, nm, ev)
+  ELambda(_, body) -> tcl_scan(body, nm, true)
+  ERecordLit(_, fs) -> tcl_scan_fields(fs, nm, ev)
+  EList(els)       -> tcl_scan_elems(els, nm, ev)
+  ERange(a, b, os) -> tcl_scan2(a, b, nm, ev) or tcl_scan_opt(os, nm, ev)
+  EBlock(ss, ot)   -> tcl_scan_stmts(ss, nm, ev) or tcl_scan_opt(ot, nm, ev)
+  EPipe(a, b)         -> tcl_scan2(a, b, nm, ev)
+  EMapPipe(a, b)      -> tcl_scan2(a, b, nm, ev)
+  EFlatMapPipe(a, b)  -> tcl_scan2(a, b, nm, ev)
+  EFilterPipe(a, b)   -> tcl_scan2(a, b, nm, ev)
+  EBang(x)         -> tcl_scan(x, nm, ev)
+  EHandle(body, _, _, oi, _, cls, oret) ->
+    tcl_scan(body, nm, ev) or tcl_scan_opt(oi, nm, ev) or tcl_scan_clauses(cls, nm, ev) or tcl_scan_hret(oret, nm, ev)
+  ELitUnit(x, _)   -> tcl_scan(x, nm, ev)
+  EIntrinsic(_, xs) -> tcl_scan_list(xs, nm, ev)
+  EStr(span, _)    -> tcl_scan_span(span, nm, ev)
+  _ -> false
+}
+
+fn tcl_scan2(a: Expr, b: Expr, nm: String, ev: Bool) : Bool =
+  tcl_scan(a, nm, ev) or tcl_scan(b, nm, ev)
+
+# A dup wrap is a transparent read on the consume scan; a bare callee
+# read of the binder (a closure held in a local) consumes like any EVar.
+fn tcl_scan_call(f: Expr, xs: [Expr], nm: String, ev: Bool) : Bool = match f.kind {
+  EVar(cn) ->
+    if cn == "__perceus_dup" and not ev { false }
+    else { cn == nm or tcl_scan_list(xs, nm, ev) }
+  _ -> tcl_scan(f, nm, ev) or tcl_scan_list(xs, nm, ev)
+}
+
+fn tcl_scan_span(span: String, nm: String, ev: Bool) : Bool =
+  if ev or has_interp(span, 0, string_length(span)) { tcl_span_mentions(span, nm) }
+  else { false }
+
+fn tcl_scan_opt(o: Option[Expr], nm: String, ev: Bool) : Bool = match o {
+  Some(x) -> tcl_scan(x, nm, ev)
+  None    -> false
+}
+
+fn tcl_scan_list(xs: [Expr], nm: String, ev: Bool) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> tcl_scan(x, nm, ev) or tcl_scan_list(rest, nm, ev)
+}
+
+fn tcl_scan_arms(arms: [Arm], nm: String, ev: Bool) : Bool = match arms {
+  [] -> false
+  [Arm(_, og, body), ...rest] ->
+    tcl_scan_opt(og, nm, ev) or tcl_scan(body, nm, ev) or tcl_scan_arms(rest, nm, ev)
+}
+
+fn tcl_scan_fields(fs: [FieldInit], nm: String, ev: Bool) : Bool = match fs {
+  [] -> false
+  [FI(_, x), ...rest] -> tcl_scan(x, nm, ev) or tcl_scan_fields(rest, nm, ev)
+}
+
+fn tcl_scan_elems(els: [ListElem], nm: String, ev: Bool) : Bool = match els {
+  [] -> false
+  [el, ...rest] -> {
+    let inner = match el { ElPlain(x) -> x ElSpread(x) -> x }
+    tcl_scan(inner, nm, ev) or tcl_scan_elems(rest, nm, ev)
+  }
+}
+
+fn tcl_scan_stmts(ss: [Stmt], nm: String, ev: Bool) : Bool = match ss {
+  [] -> false
+  [s, ...rest] -> tcl_scan_stmt(s, nm, ev) or tcl_scan_stmts(rest, nm, ev)
+}
+
+fn tcl_scan_stmt(s: Stmt, nm: String, ev: Bool) : Bool = match s {
+  SLet(_, _, rhs)             -> tcl_scan(rhs, nm, ev)
+  SAssert(c, om)              -> tcl_scan(c, nm, ev) or tcl_scan_opt(om, nm, ev)
+  SExprStmt(x)                -> tcl_scan(x, nm, ev)
+  SIndexAssign(a, i, v, _, _) -> tcl_scan(a, nm, ev) or tcl_scan(i, nm, ev) or tcl_scan(v, nm, ev)
+  SVar(_, _, init, _, _)      -> tcl_scan(init, nm, ev)
+  SUse(_, _, _)               -> false
+}
+
+fn tcl_scan_clauses(cls: [HClause], nm: String, ev: Bool) : Bool = match cls {
+  [] -> false
+  [HC(_, _, body, _, _), ...rest] ->
+    tcl_scan(body, nm, ev) or tcl_scan_clauses(rest, nm, ev)
+}
+
+fn tcl_scan_hret(o: Option[HReturn], nm: String, ev: Bool) : Bool = match o {
+  Some(HR(_, b, _, _)) -> tcl_scan(b, nm, ev)
+  None -> false
+}
+
+# An interpolation span is raw source; a substring hit is the
+# conservative stand-in for "the span reads this binder".
+fn tcl_span_mentions(span: String, nm: String) : Bool =
+  tcl_contains_loop(span, nm, 0, string_length(span), string_length(nm))
+
+fn tcl_contains_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =
+  if i + nn > hn { false }
+  else if string_slice(hay, i, nn) == needle { true }
+  else { tcl_contains_loop(hay, needle, i + 1, hn, nn) }
