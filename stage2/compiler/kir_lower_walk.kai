@@ -1383,15 +1383,76 @@ fn match_finish_tok(owned: Bool, sd: String, free_tok: Bool, r: LRes) : LRes =
 # `pend0` (captured at match entry — a sibling arm's body lowering clobbers
 # `st.tcpend`, so the enclosing value travels as a parameter, like `mscr0`).
 # A goto-free body clears the ledger (it is never read there, and an empty
-# ledger skips every refinement scan). A reuse arm consumes the scrutinee
-# through `__perceus_reuse_*` and its binders ride the reuse-gc discipline,
-# so it inherits `pend0` unchanged.
-fn tcp_seed_arm(owned: Bool, sd: String, p: Pattern, body: Expr, pend0: [String], st: LowerSt) : LowerSt =
+# ledger skips every refinement scan).
+#
+# `binders` MUST be exactly the set this arm structurally dup'd
+# (`lm_dup_alias_binders`): the ledger releases a ref the bind took, so a
+# binder bound WITHOUT a dup (a literal/record arm's whole-value alias, an
+# arm-top token's children) must never be seeded — releasing it would free
+# a live value (the over-release the C emitter cannot hit, because its
+# `emit_pat_binds` increfs every alias bind).
+#
+# This match's OWN exit-drop register is seeded only when the arm is NOT
+# all-tails-sentinel: an all-tails arm gets the pre-body drop
+# (`match_selftail_scr_drop`), keeping its emission byte-identical to the
+# pre-ledger lowering; seeding it too would release the scrutinee twice.
+fn tcp_seed_arm(owned: Bool, sd: String, binders: [String], body: Expr, pend0: [String], st: LowerSt) : LowerSt =
   if not tcl_has_goto(body) { ls_set_tcpend(st, []) }
-  else if arm_reuses(body, st) { ls_set_tcpend(st, pend0) }
   else {
-    let with_scr = if owned { list_append(pend0, [tcl_scr_entry(sd)]) } else { pend0 }
-    ls_set_tcpend(st, tcl_push_binders(with_scr, pat_alias_binders(p, st.vs)))
+    let with_scr = if owned and not arm_body_all_tail_self_tcrec(body) {
+      list_append(pend0, [tcl_scr_entry(sd)])
+    } else { pend0 }
+    ls_set_tcpend(st, tcl_push_binders(with_scr, binders))
+  }
+
+# Pre-body drop of the owned scrutinee for an arm whose EVERY tail leaf is
+# a pure self-tail sentinel — such an arm never reaches the continuation
+# drop, and the pre-body position keeps its emission identical to the C
+# oracle's pre-injected `kai_decref(_scr)`. Arms with a non-goto tail keep
+# the drop at the goto site via the ledger (the continuation still runs on
+# their normal paths, so a pre-body drop would double-release there).
+fn match_selftail_scr_drop(owned: Bool, sd: String, body: Expr, st: LowerSt) : LowerSt =
+  if owned and arm_body_all_tail_self_tcrec(body) {
+    ls_emit(st, KRC(KDrop(KVar(sd)), kpos_of(body)))
+  } else { st }
+
+# True iff EVERY tail leaf of `body` is a pure self-tail-call sentinel
+# (`__kai_tcrec|`, the C oracle's `tcrec_tail_always_sentinel`). A
+# `__kai_trmc|` step is NOT a leaf here, so a cons-modulo arm never
+# satisfies this (its cell is consumed by the TRMC reuse + dropmask).
+fn arm_body_all_tail_self_tcrec(body: Expr) : Bool = match body.kind {
+  ECall(f, _) -> match f.kind { EVar(callee) -> es_tcrec_is_sentinel(callee) _ -> false }
+  EIf(_, t, oe) -> match oe {
+    None    -> false
+    Some(e) -> arm_body_all_tail_self_tcrec(t) and arm_body_all_tail_self_tcrec(e)
+  }
+  EMatch(_, arms) -> arms_all_tail_self_tcrec(arms)
+  EBlock(_, ot) -> match ot { None -> false Some(e) -> arm_body_all_tail_self_tcrec(e) }
+  _ -> false
+}
+
+fn arms_all_tail_self_tcrec(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, body)] -> arm_body_all_tail_self_tcrec(body)
+  [Arm(_, _, body), ...rest] -> arm_body_all_tail_self_tcrec(body) and arms_all_tail_self_tcrec(rest)
+}
+
+# Seed for an arm whose scrutinee/binder RC rides another discipline (a
+# reuse arm's `__perceus_reuse_*` consumption, an arm-top token): only the
+# ENCLOSING entries survive into the body — this match adds nothing.
+fn tcp_seed_inherit(body: Expr, pend0: [String], st: LowerSt) : LowerSt =
+  if tcl_has_goto(body) { ls_set_tcpend(st, pend0) } else { ls_set_tcpend(st, []) }
+
+# Seed mirroring `lower_arm_rc`'s three branches: an arm-top-reuse arm and
+# a `__perceus_reuse_*` arm add nothing (their RC rides the token / the
+# reuse-gc set); only the structural-dup branch seeds this match's exit
+# drop + its dup'd alias binders.
+fn tcp_seed_after_arm_rc(owned: Bool, sd: String, p: Pattern, body: Expr,
+                         pend0: [String], st: LowerSt) : LowerSt =
+  if (owned and arm_is_top_reuse(p, body, st)) or arm_reuses(body, st) {
+    tcp_seed_inherit(body, pend0, st)
+  } else {
+    tcp_seed_arm(owned, sd, pat_alias_binders(p, st.vs), body, pend0, st)
   }
 
 # Refine the ledger across an already-evaluated expression / statement
@@ -1557,8 +1618,9 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         let st_decon = lm_dup_alias_binders(pat_decon_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
         set_reuse_gc_for_arm(p, body, st_decon)
       }
-      let st_drop = tcp_seed_arm(owned, sd, p, body, pend0, st_dup)
-      let st_done = lower_branch_into(body, join, lcont, st_drop)
+      let st_drop = if arm_reuses(body, st_dup) { tcp_seed_inherit(body, pend0, st_dup) }
+                    else { tcp_seed_arm(owned, sd, pat_alias_binders(p, st_dup.vs), body, pend0, st_dup) }
+      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if list_arm_is_catchall(p) { st_done }
       else { lower_list_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
     } } }
@@ -1591,8 +1653,10 @@ fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_drop = tcp_seed_arm(owned, sd, p, body, pend0, st_body)
-      let st_done = lower_branch_into(body, join, lcont, st_drop)
+      # A literal arm's catch-all binder aliases the scrutinee with NO
+      # bind-incref (lit_emit_arm), so only the exit-drop entry is seeded.
+      let st_drop = tcp_seed_arm(owned, sd, [], body, pend0, st_body)
+      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if lit_arm_is_catchall(p) { st_done }
       else { lower_lit_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
     } } }
@@ -1628,8 +1692,11 @@ fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_drop = tcp_seed_arm(owned, sd, p, body, pend0, st_body)
-      let st_done = lower_branch_into(body, join, lcont, st_drop)
+      # Record-arm field binds arrive OWNED (`kai_op_field` increfs) but are
+      # not part of the structural-dup set; seed only the exit-drop entry
+      # (an unconsumed field binder on a goto path stays a bounded leak).
+      let st_drop = tcp_seed_arm(owned, sd, [], body, pend0, st_body)
+      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if rec_arm_is_catchall(p) { st_done }
       else { lower_record_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
     } } }
@@ -1714,8 +1781,8 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # destructure) aliases the scrutinee like a variant arm; restore the
       # oracle's structural pointer-slot incref so the owned exit drop balances.
       let st_rc = lower_arm_rc(p, body, sd, owned, st_def)
-      let st_drop = tcp_seed_arm(owned, sd, p, body, pend0, st_rc)
-      lower_branch_into(body, join, lcont, st_drop)
+      let st_drop = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
+      lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
     }
     None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
   }
@@ -1925,8 +1992,8 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st_arm = reopen(st, lbl)
       let st_bound = bind_pattern_fields(p, scrv, body, st_arm)
       let st_rc = lower_arm_rc(p, body, sd, owned, st_bound)
-      let st_drop = tcp_seed_arm(owned, sd, p, body, pend0, st_rc)
-      lower_branch_into(body, join, lcont, st_drop)
+      let st_drop = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
+      lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
     } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl)) }
   _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl))
 }
@@ -1946,14 +2013,14 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
       let st3 = bind_pattern_fields(p, scrv, body, reopen(st2, body_lbl))
       let st3d = lower_arm_rc(p, body, sd, owned, st3)
-      let st3dd = tcp_seed_arm(owned, sd, p, body, pend0, st3d)
-      lower_branch_into(body, join, lcont, st3dd)
+      let st3dd = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st3d)
+      lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st3dd))
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
         let st4 = emit_arm_subtests_and_binds(p, scrv, body, body_lbl, next_fail, st2)
         let st4d = lower_arm_rc(p, body, sd, owned, st4)
-        let st4dd = tcp_seed_arm(owned, sd, p, body, pend0, st4d)
-        let st5 = lower_branch_into(body, join, lcont, st4dd)
+        let st4dd = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st4d)
+        let st5 = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st4dd))
         lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, mscr0, pend0, st5)
       } }
     } }
@@ -2053,9 +2120,9 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         # variant + default arms already emit) the match-exit `KDrop(sd)` frees
         # the cell the binder transfers to the result — a use-after-free.
         let st_rc = lower_arm_rc(p, body, sd, owned, st_alias)
-        let st_bound = tcp_seed_arm(owned, sd, p, body, pend0, st_rc)
+        let st_bound = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
         let st_done = match opt_guard {
-          None -> lower_branch_into(body, join, lcont, st_bound)
+          None -> lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_bound))
           Some(g) -> match ls_fresh_label(st_bound) { LSLabel(run_lbl, stg) ->
             match lower_expr(g, stg) { LRes(gv, stg1) -> {
               # Guard truthy → run the body; falsy → `next_fail` (next arm).
@@ -2063,7 +2130,8 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
               # condbr lowering reads it through `kaix_truthy`, as `lower_if`).
               # The guard's reads refine the ledger before the body lowers.
               let st_fork = ls_seal(stg1, KCondBr(gv, run_lbl, next_fail, kpos_of(g)), run_lbl)
-              lower_branch_into(body, join, lcont, tcp_after(reopen(st_fork, run_lbl), g))
+              lower_branch_into(body, join, lcont,
+                                match_selftail_scr_drop(owned, sd, body, tcp_after(reopen(st_fork, run_lbl), g)))
             } } }
         }
         # The next arm continues at `next_fail`. If this arm always matched
