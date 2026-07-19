@@ -1,0 +1,92 @@
+name: tier1-macos-mn
+
+# M:N determinism gate on macOS/arm64. Every other tier runs on
+# ubuntu-latest, so the scheduler is gated on exactly one platform and one
+# thread-library implementation. The M:N failures that reproduce on macOS
+# ARM64 and not on Linux are invisible to CI as a result: a green
+# Linux-only M:N gate says less than it appears to.
+#
+# Running here also exercises the only Mach-O build of the runtime's
+# thread-locals: `KAI_TLS` expands to tls_model("initial-exec") under clang,
+# and no other job links that attribute for a Mach-O target.
+#
+# Path-gated like the other concurrency tiers, and deliberately narrower
+# than tier1-tsan: `stage2/Makefile` is excluded (build plumbing, touched
+# several times a day, and a real scheduler change also touches a runtime
+# header). No push-to-main trigger either — the PR run already covered the
+# same diff, and macOS is the scarcest runner pool.
+on:
+  pull_request:
+    paths:
+      - 'stage0/runtime.h'
+      - 'stage0/runtime_llvm.c'
+      - 'stage2/runtime.h'
+      - 'stdlib/actor.kai'
+      - 'stdlib/spawn.kai'
+      - 'demos/parallel_actors/**'
+      - 'examples/effects/mn_*'
+      - 'tools/run-mn-determinism.sh'
+      - 'tools/lib/timeout.sh'
+      - '.github/workflows/tier1-macos-mn.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: tier1-macos-mn-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tier1-macos-mn:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      # Bounds the worst case: a wedged fixture burns the full deadline on
+      # every repeat, and the harness runs 3 fixtures x N in {4,8} x repeats.
+      MN_RUN_TIMEOUT: 30
+      LOG: mn-determinism.log
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bootstrap C-only kaic2
+        run: make kaic2
+
+      # Advisory, not blocking: the gate is known-red on macOS today, and a
+      # check that is red on arrival trains readers to ignore it. The result
+      # still reaches the log, an annotation and the job summary, which is
+      # the coverage this platform had none of. Drop the `|| true` and the
+      # warning branch to make it a real gate once macOS runs clean.
+      - name: M:N determinism gate (macOS/arm64, advisory)
+        run: |
+          set -o pipefail
+          if make test-mn-determinism 2>&1 | tee "$RUNNER_TEMP/$LOG"; then
+            echo "macOS M:N determinism gate PASSED"
+          else
+            echo "::warning::M:N determinism gate FAILED on macOS/arm64 (advisory, not blocking)"
+          fi
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## M:N determinism — macOS/arm64 (advisory)"
+            echo
+            echo '```'
+            if [ -f "$RUNNER_TEMP/$LOG" ]; then
+              grep -E '^(OK|FAIL|BUILD FAILED|run-mn-determinism)' "$RUNNER_TEMP/$LOG" \
+                || tail -40 "$RUNNER_TEMP/$LOG"
+            else
+              echo "gate did not run (bootstrap failed)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-macos-mn"
+            git status; exit 1
+          fi
