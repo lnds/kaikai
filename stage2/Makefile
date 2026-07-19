@@ -14,6 +14,16 @@ else
 LDFLAGS_STACK :=
 endif
 
+# `timeout(1)` is GNU coreutils: present on Linux, absent from a stock macOS
+# (Homebrew coreutils ships it as `gtimeout`). Hosts with neither use the
+# shim, which bounds via perl or — with no implementation at all — warns and
+# runs unbounded rather than aborting on `command not found`.
+TIMEOUT := $(shell command -v timeout >/dev/null 2>&1 && echo timeout \
+  || { command -v gtimeout >/dev/null 2>&1 && echo gtimeout; })
+ifeq ($(TIMEOUT),)
+TIMEOUT := $(abspath $(CURDIR)/../tools/lib/timeout.sh)
+endif
+
 # C++ runtime for the native (libLLVM) link. LLVM is C++, so the static
 # link needs the C++ runtime explicitly (`cc` does not add it). The library
 # is platform-specific: macOS ships libc++ (`-lc++`), but a Linux libLLVM —
@@ -5421,17 +5431,17 @@ test-heap-limit: $(TARGET) build
 	./$(TARGET) --path ../stdlib $$src > build/s2-878hl.c \
 	  || { echo "heap-limit FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-878hl.c -o build/s2-878hl $(LDLIBS_M); \
-	lo=0; KAI_MAX_HEAP=64m timeout 30 ./build/s2-878hl > build/s2-878hl.lo.out 2> build/s2-878hl.lo.err || lo=$$?; \
+	lo=0; KAI_MAX_HEAP=64m $(TIMEOUT) 30 ./build/s2-878hl > build/s2-878hl.lo.out 2> build/s2-878hl.lo.err || lo=$$?; \
 	[ "$$lo" -eq 1 ] \
 	  || { echo "heap-limit FAIL (low cap exit $$lo, want 1)"; cat build/s2-878hl.lo.err; exit 1; }; \
 	grep -q 'heap limit exceeded' build/s2-878hl.lo.err \
 	  || { echo "heap-limit FAIL (low cap: no 'heap limit exceeded' message)"; cat build/s2-878hl.lo.err; exit 1; }; \
 	[ -s build/s2-878hl.lo.out ] \
 	  && { echo "heap-limit FAIL (low cap printed result before aborting)"; cat build/s2-878hl.lo.out; exit 1; }; \
-	hi=0; KAI_MAX_HEAP=2g timeout 60 ./build/s2-878hl > build/s2-878hl.hi.out 2> build/s2-878hl.hi.err || hi=$$?; \
+	hi=0; KAI_MAX_HEAP=2g $(TIMEOUT) 60 ./build/s2-878hl > build/s2-878hl.hi.out 2> build/s2-878hl.hi.err || hi=$$?; \
 	{ [ "$$hi" -eq 0 ] && grep -q 'len=268435456' build/s2-878hl.hi.out; } \
 	  || { echo "heap-limit FAIL (high cap exit $$hi, output:)"; cat build/s2-878hl.hi.out build/s2-878hl.hi.err; exit 1; }; \
-	un=0; timeout 60 ./build/s2-878hl > build/s2-878hl.un.out 2> build/s2-878hl.un.err || un=$$?; \
+	un=0; $(TIMEOUT) 60 ./build/s2-878hl > build/s2-878hl.un.out 2> build/s2-878hl.un.err || un=$$?; \
 	{ [ "$$un" -eq 0 ] && grep -q 'len=268435456' build/s2-878hl.un.out; } \
 	  || { echo "heap-limit FAIL (unset cap exit $$un, output:)"; cat build/s2-878hl.un.out build/s2-878hl.un.err; exit 1; }; \
 	echo "heap-limit OK (64m -> clean abort exit 1; 2g + unset -> complete len=268435456; cap contains, unset unchanged)"
@@ -5968,7 +5978,7 @@ test-kir-inline-trmc-1158: $(TARGET) build
 	src=../examples/perceus/kir_inline_trmc_tail_1158.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1158trmc 2> build/s2-1158trmc.err \
 	  || { echo "kir-inline-trmc-1158 FAIL (native build errored)"; cat build/s2-1158trmc.err; exit 1; }; \
-	timeout 60 ./build/s2-1158trmc > build/s2-1158trmc.out \
+	$(TIMEOUT) 60 ./build/s2-1158trmc > build/s2-1158trmc.out \
 	  || { echo "kir-inline-trmc-1158 FAIL (run crashed/hung — TRMC spine broke under the paste)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out > /dev/null \
 	  || { echo "kir-inline-trmc-1158 FAIL (output diff)"; diff ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out; exit 1; }; \
@@ -6041,7 +6051,7 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	src=../examples/perceus/gap3_balance_minimal.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-882rot 2> build/s2-882rot.err \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native build errored)"; cat build/s2-882rot.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g timeout 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
+	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g $(TIMEOUT) 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native run crashed/hung — exit $$?)"; exit 1; }; \
 	diff -q ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out > /dev/null \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (output diff)"; diff ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out; exit 1; }; \
@@ -6348,12 +6358,12 @@ test-native-test-runner-950: $(TARGET) build
 	src=../examples/native/test_runner_parity.kai; \
 	gold=../examples/native/test_runner_parity.out.expected; \
 	cexit=0; \
-	KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
+	KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
 	diff -q $$gold build/s2-950tr-c.out > /dev/null \
 	  || { echo "native-test-runner-950 FAIL (C output diff)"; diff $$gold build/s2-950tr-c.out; exit 1; }; \
 	[ "$$cexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (C exit $$cexit != 1)"; exit 1; }; \
 	nexit=0; \
-	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g timeout 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
+	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
 	grep -E '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.rc 2>/dev/null || true; \
 	grep -vE '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.out 2>/dev/null || true; \
 	diff -q $$gold build/s2-950tr-n.out > /dev/null \

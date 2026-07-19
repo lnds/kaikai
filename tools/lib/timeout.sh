@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Portable bounded-run shim. Sourced, not executed.
+# Portable bounded-run shim. Source it for `kai_timeout`, or execute it
+# directly as a drop-in `timeout <seconds> <cmd> [args...]`.
 #
 # `timeout(1)` is GNU coreutils: present on Linux CI, absent from a stock
 # macOS. A harness that shells out to it there gets exit 127 (command not
@@ -51,3 +52,10 @@ kai_timeout() {
     *)        "$@" ;;
   esac
 }
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  if [ "$KAI_TIMEOUT_KIND" = none ]; then
+    echo "warning: no timeout implementation (timeout/gtimeout/perl); running unbounded" >&2
+  fi
+  kai_timeout "$@"
+fi
