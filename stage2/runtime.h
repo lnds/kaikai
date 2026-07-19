@@ -10354,13 +10354,18 @@ static KaiValue *_kai_file_read_file_thunk(void *arg) {
     KaiFileReadFileArg *a = (KaiFileReadFileArg *) arg;
     return kai_core_read_file(a->path);
 }
-static KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileReadFileArg a = { path };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_file_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 typedef struct {
     KaiValue *path;
@@ -10370,14 +10375,19 @@ static KaiValue *_kai_file_write_file_thunk(void *arg) {
     KaiFileWriteFileArg *a = (KaiFileWriteFileArg *) arg;
     return kai_core_write_file(a->path, a->contents);
 }
-static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
-                                              KaiValue *contents, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
+                                              KaiValue *contents, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileWriteFileArg a = { path, contents };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 /* Issue #771 Phase 1: default handlers for the five chunked `File`
  * ops. Each offloads its blocking syscall to the R1 pool worker and
@@ -10389,62 +10399,87 @@ typedef struct { KaiValue *path; } KaiFileOpenArg;
 static KaiValue *_kai_file_open_read_thunk(void *arg) {
     return kai_core_file_open_read(((KaiFileOpenArg *) arg)->path);
 }
-static KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileOpenArg a = { path };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_read_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 typedef struct { KaiValue *h; KaiValue *max; } KaiFileReadChunkArg;
 static KaiValue *_kai_file_read_chunk_thunk(void *arg) {
     KaiFileReadChunkArg *a = (KaiFileReadChunkArg *) arg;
     return kai_core_file_read_chunk(a->h, a->max);
 }
-static KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileReadChunkArg a = { h, max };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_chunk_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 static KaiValue *_kai_file_open_write_thunk(void *arg) {
     return kai_core_file_open_write(((KaiFileOpenArg *) arg)->path);
 }
-static KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileOpenArg a = { path };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_write_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 typedef struct { KaiValue *h; KaiValue *data; } KaiFileWriteChunkArg;
 static KaiValue *_kai_file_write_chunk_thunk(void *arg) {
     KaiFileWriteChunkArg *a = (KaiFileWriteChunkArg *) arg;
     return kai_core_file_write_chunk(a->h, a->data);
 }
-static KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileWriteChunkArg a = { h, data };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_chunk_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 typedef struct { KaiValue *h; } KaiFileCloseArg;
 static KaiValue *_kai_file_close_thunk(void *arg) {
     return kai_core_file_close(((KaiFileCloseArg *) arg)->h);
 }
-static KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
+KAI_SCHED_FN KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     kai_reactor_init();
     KaiFileCloseArg a = { h };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_close_thunk, &a);
     return kai_cont_resume(k, r);
 }
+#endif
 
 /* m7b #2b: default Mutable handler — wraps the core `array_*`
  * helpers and resumes with the result. Doc B §`Mutable` *Default
@@ -13562,6 +13597,11 @@ static void kai_sched_enqueue(KaiFiber *f) {
     if (kai_nthreads > 1) {
         KaiSchedSlot *s = kai_sched_slot();
         pthread_mutex_lock(&s->mu);
+        /* Publish ownership under the same lock that publishes the fiber
+         * onto this slot's steal list: a reader that finds `f` here must
+         * see home_thread pointing at this slot, or a cross-thread unpark
+         * would lock a slot the fiber is not queued on. */
+        f->home_thread = kai_thread_id;
         f->sched_next = NULL;
         if (s->steal_tail) s->steal_tail->sched_next = f;
         else               s->steal_head = f;
@@ -13628,6 +13668,14 @@ static KaiFiber *kai_sched_steal_from(int victim) {
  * scheduler primitives + kai_apply. */
 static void kai_fiber_trampoline(void);
 
+/* Fall-off-the-end landing for a fiber context. `uc_link` cannot name a
+ * scheduler root directly: `kai_main_fiber` is thread-local, so the address
+ * baked at spawn belongs to the spawning thread and a stolen fiber would
+ * resume a root another thread is running on. Resolve the executing
+ * thread's root here instead. */
+static void kai_fiber_uc_link_landing(void);
+static ucontext_t *kai_uc_link_target(void);
+
 /* Phase 5 forward decl: link propagation runs in the trampoline's
  * termination tail; the helper itself is defined alongside the
  * Link default handler further down. The reason argument distinguishes
@@ -13686,7 +13734,7 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
     f->stack_base = region;
     f->ctx.uc_stack.ss_sp   = (char *) region + page;
     f->ctx.uc_stack.ss_size = f->stack_size;
-    f->ctx.uc_link          = &kai_main_fiber.ctx;
+    f->ctx.uc_link          = kai_uc_link_target();
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
 }
 
@@ -13979,6 +14027,48 @@ static void kai_sched_unpark(KaiFiber *target) {
  * before each invocation to keep f->thunk's lifetime independent of
  * the call. kai_free_value's KAI_FIBER branch decrefs both thunk and
  * result when f's RC drops. */
+static void kai_fiber_uc_link_landing(void) {
+    kai_active_fiber = &kai_main_fiber;
+    setcontext(&kai_main_fiber.ctx);
+    fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
+    exit(1);
+}
+
+/* Per-thread context whose entry point is the landing above. Every fiber
+ * spawned on this thread links here, so a fall-off-the-end resolves the
+ * root of whichever thread is executing rather than the spawner's.
+ *
+ * The stack size is a literal, not SIGSTKSZ: glibc defines that as a
+ * sysconf() call, which makes a file-scope array a VLA and fails to
+ * compile. The landing only runs setcontext, so this is generous. */
+#define KAI_UC_LINK_STACK_SIZE 65536
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS ucontext_t kai_uc_link_ctx;
+extern KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+extern KAI_TLS int kai_uc_link_ready;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS ucontext_t kai_uc_link_ctx;
+KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+KAI_TLS int kai_uc_link_ready = 0;
+#  endif
+#else
+static KAI_TLS ucontext_t kai_uc_link_ctx;
+static KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+static KAI_TLS int kai_uc_link_ready = 0;
+#endif
+
+static ucontext_t *kai_uc_link_target(void) {
+    if (!kai_uc_link_ready) {
+        if (getcontext(&kai_uc_link_ctx) != 0) return &kai_main_fiber.ctx;
+        kai_uc_link_ctx.uc_stack.ss_sp   = kai_uc_link_stack;
+        kai_uc_link_ctx.uc_stack.ss_size = sizeof(kai_uc_link_stack);
+        kai_uc_link_ctx.uc_link          = NULL;
+        makecontext(&kai_uc_link_ctx, kai_fiber_uc_link_landing, 0);
+        kai_uc_link_ready = 1;
+    }
+    return &kai_uc_link_ctx;
+}
+
 static void kai_fiber_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
     /* First entry follows a setcontext from another fiber's
@@ -14068,9 +14158,8 @@ static void kai_fiber_trampoline(void) {
      * declaring deadlock. */
     /* M:N — a finished fiber with no local successor returns to this
      * thread's scheduler loop (kai_main_fiber), which steals or idles.
-     * `uc_link` on the fiber's context is already kai_main_fiber.ctx,
-     * but we setcontext explicitly so the loop resumes at its swap point
-     * rather than falling off the end of the context. */
+     * We setcontext explicitly so the loop resumes at its swap point
+     * rather than falling off the end into the uc_link landing. */
     if (kai_nthreads > 1) {
         KaiFiber *next = kai_sched_dequeue();
         if (next) {
