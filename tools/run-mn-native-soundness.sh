@@ -22,6 +22,8 @@ ITERS="${1:-40}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+. "$ROOT/tools/lib/timeout.sh"
+
 FIXTURES=(
   "examples/effects/mn_cross_thread_copy_stress.kai"
 )
@@ -48,7 +50,7 @@ for src in "${FIXTURES[@]}"; do
   for n in 4 8; do
     crashes=0; bad=0; hangs=0
     for r in $(seq 1 "$ITERS"); do
-      if got="$(timeout -s KILL 30 env KAI_THREADS="$n" "$bin" 2>/dev/null)"; then
+      if got="$(kai_timeout 30 env KAI_THREADS="$n" "$bin" 2>/dev/null)"; then
         [ "$got" = "$ref" ] || { bad=$((bad+1)); ok=0; }
       else
         ec=$?

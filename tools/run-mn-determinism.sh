@@ -5,6 +5,11 @@
 # or a latent scheduling-order dependence, and this gate surfaces it. Also
 # asserts the cross-thread run terminates (no shutdown hang) and is stable
 # across repeats.
+#
+# Every run is classified into exactly one bucket — ok / diverge / empty /
+# crash / hang. Collapsing them loses the distinction between a wedged
+# scheduler and a fiber that dropped its output, which is the difference
+# between two unrelated bugs.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,6 +17,11 @@ ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+. "$ROOT/tools/lib/timeout.sh"
+
+RUN_TIMEOUT="${MN_RUN_TIMEOUT:-60}"
+REPEATS="${MN_REPEATS:-3}"
 
 FIXTURES=(
   "demos/parallel_actors/main.kai"
@@ -24,6 +34,11 @@ FIXTURES=(
   "examples/effects/mn_reactor_io_cpu_mix.kai"
 )
 
+if [ "$KAI_TIMEOUT_KIND" = none ]; then
+  echo "run-mn-determinism: WARNING — no timeout(1), gtimeout or perl on this host;"
+  echo "  a wedged run will block instead of being counted as a hang."
+fi
+
 fail=0
 for src in "${FIXTURES[@]}"; do
   name="$(basename "$(dirname "$src")")/$(basename "$src")"
@@ -31,16 +46,35 @@ for src in "${FIXTURES[@]}"; do
   "$KAI" build "$src" -o "$bin" >/dev/null 2>"$TMP/b.log" \
     || { echo "BUILD FAILED $name"; cat "$TMP/b.log"; exit 1; }
 
-  ref="$(KAI_THREADS=1 "$bin")"
-  ok=1
+  ref="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS=1 "$bin")" \
+    || { echo "FAIL $name: reference run at N=1 did not complete"; fail=1; continue; }
+
   for n in 4 8; do
-    for r in 1 2 3; do
-      got="$(timeout 60 env KAI_THREADS=$n "$bin")" || { echo "HANG/FAIL $name N=$n"; ok=0; break; }
-      [ "$got" = "$ref" ] || { echo "DIVERGE $name N=$n: '$got' != N=1 '$ref'"; ok=0; break; }
+    ok=0; diverge=0; empty=0; crash=0; hang=0; witness=""
+    for _ in $(seq 1 "$REPEATS"); do
+      ec=0
+      got="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" "$bin" 2>"$TMP/run.err")" || ec=$?
+      if [ "$ec" = 124 ]; then
+        hang=$((hang+1))
+      elif [ "$ec" != 0 ]; then
+        crash=$((crash+1))
+        [ -n "$witness" ] || witness="$(head -1 "$TMP/run.err")"
+      elif [ -z "$got" ]; then
+        empty=$((empty+1))
+      elif [ "$got" != "$ref" ]; then
+        diverge=$((diverge+1))
+        [ -n "$witness" ] || witness="got '$got'"
+      else
+        ok=$((ok+1))
+      fi
     done
-    [ "$ok" = "1" ] || break
+    if [ "$ok" = "$REPEATS" ]; then
+      echo "OK   $name N=$n ($REPEATS/$REPEATS == N=1: $ref)"
+    else
+      echo "FAIL $name N=$n: ok=$ok diverge=$diverge empty=$empty crash=$crash hang=$hang of $REPEATS${witness:+ — $witness}"
+      fail=1
+    fi
   done
-  [ "$ok" = "1" ] && echo "OK $name (N=1==N=4==N=8: $ref)" || fail=1
 done
 
 [ "$fail" = "0" ] && echo "run-mn-determinism: OK" || { echo "run-mn-determinism: FAIL"; exit 1; }

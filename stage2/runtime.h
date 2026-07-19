@@ -2821,16 +2821,17 @@ struct KaiFiber {
      * freed during the propagation walk and as a safety net in
      * kai_free_value's KAI_FIBER branch. */
     KaiLinkNode    *linked_head;
-    /* m8 bug #12 (per-fiber dispatch state). Points at the evidence
-     * node whose clause body is currently on this fiber's stack, or
-     * NULL otherwise. `kai_evidence_lookup_node` skips it so a
-     * `Eff.op(...)` invoked from inside the clause resolves to the
-     * outer handler instead of recursing. Lives on the fiber (not
-     * the node) because spawned fibers inherit the parent's
-     * evidence_top — the same node is shared across fibers, so the
-     * "in dispatch right now" state must be per-fiber. The op-call
-     * site saves the previous value, sets this to its own node,
-     * runs the clause, then restores. */
+    /* Per-fiber dispatch state. Points at the evidence node whose clause
+     * body is currently on this fiber's stack, or NULL otherwise.
+     * `kai_evidence_lookup_node` skips it so a `Eff.op(...)` invoked from
+     * inside the clause resolves to the outer handler instead of recursing.
+     * The op-call site saves the previous value, sets this to its own node,
+     * runs the clause, then restores.
+     *
+     * Trap: the skip rule makes a stale value here MASK a live handler —
+     * the walk then reports the effect as unhandled even though the node is
+     * on the chain with a valid handler. A non-local exit out of a clause
+     * (a longjmp past the restore) leaves exactly that state. */
     KaiEvidence    *in_dispatch_node;
     /* R4 fix — back-pointer to the KaiValue wrapper that owns this
      * fiber struct. Set in kai_fiber_value when the wrapper is
@@ -15379,12 +15380,45 @@ static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvi
  * op (Actor/Cancel/Link/Monitor/Spawn) performed in a fiber whose own body
  * installed no handler for it has no disposition to bind. Report it instead of
  * dereferencing the NULL node. */
+/* KAI_DEBUG_EVIDENCE=1 dumps the fiber and scheduler state behind an
+ * unhandled fiber-local effect. Under M:N the one message covers causes that
+ * need opposite fixes — the executing thread resolved the wrong fiber, the
+ * right fiber with an empty chain, or a live handler masked by a stale
+ * in_dispatch_node — and they are indistinguishable from the message alone.
+ * noinline so the thread pointer is re-read here rather than hoisted from
+ * the caller. Failure path only; no cost on the lookup. */
+__attribute__((noinline))
+static void kai_evidence_diag(KaiEvidence *node, const char *eff_label) {
+    KaiFiber *f = kai_current_fiber();
+    struct KaiMailbox *mb = f ? f->mailbox : NULL;
+    fprintf(stderr,
+        "kai: evidence-diag eff=%s node=%p handler=%p\n"
+        "  fiber=%p is_main=%d state=%d home_thread=%d thread_id=%d nthreads=%d\n"
+        "  evidence_top=%p in_dispatch=%p parent=%p\n"
+        "  mailbox=%p mb_owner=%p mb_owner_is_self=%d\n",
+        eff_label, (void *)node, node ? (void *)node->handler : NULL,
+        (void *)f, f == &kai_main_fiber, f ? (int)f->state : -1,
+        f ? (int)f->home_thread : -1, kai_thread_id, kai_nthreads,
+        f ? (void *)f->evidence_top : NULL, f ? (void *)f->in_dispatch_node : NULL,
+        f ? (void *)f->parent : NULL,
+        (void *)mb, mb ? (void *)mb->owner_fiber : NULL,
+        mb ? (mb->owner_fiber == f) : 0);
+    int depth = 0;
+    for (KaiEvidence *n = f ? f->evidence_top : NULL; n && depth < 16; n = n->parent) {
+        fprintf(stderr, "  [%d] node=%p eff=%s handler=%p%s\n", depth, (void *)n,
+                n->eff_label ? n->eff_label : "(null)", (void *)n->handler,
+                n == f->in_dispatch_node ? "  <-- masked by in_dispatch" : "");
+        depth++;
+    }
+}
+
 static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_label) {
     /* A NULL node (empty evidence stack) or a node whose handler slot was never
      * filled (a default global minted for a fiber-local effect that has no real
      * default) both mean "no disposition to bind here". Report either, instead
      * of letting a later `node->handler` deref segfault. */
     if (node == NULL || node->handler == NULL) {
+        if (getenv("KAI_DEBUG_EVIDENCE")) kai_evidence_diag(node, eff_label);
         fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
         exit(1);
     }
