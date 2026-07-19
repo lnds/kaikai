@@ -1998,7 +1998,11 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # (`skip_set`) deliberately excludes them: the base arm still frees
         # the container. Keep the two sets distinct.
         let rewrite_skip_set = pcs_list_union(skip_set, borrow_move_params)
-        let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, [], bmap, move_last_set)
+        # Single-use params whose only read sits on some-but-not-all paths:
+        # forced to dup at the read (force_set) and released by a forced
+        # exit drop, so the paths that skip the read stay balanced.
+        let branchy_single = pcs_branchy_single_use_params(name, pnames, body, uses, rewrite_skip_set)
+        let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, branchy_single, bmap, move_last_set)
         let new_body = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         # Plant the branch-local drop for each `owned_moves` param in the arms
@@ -2022,7 +2026,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # reads ARE rewritten to the borrow variant.
         let bl_names = pcs_list_union(pnames, pcs_let_binder_names(body, []))
         let borrow_last = pcs_collect_borrow_last_set(bl_names, body, prim_bmap)
-        let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set)
+        let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set, branchy_single)
         # Callee flip: wrap borrowed scrutinees so emit_match skips the
         # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
         # keeping the last-use of a borrow-only container consuming.
@@ -4838,9 +4842,9 @@ fn pcs_render_with_marks(esrc: String, toks: [Token], marks: [DupMark],
 # incref-on-extract / Step A here is the prerequisite for this pass)
 # is recoverable from `git log` on the m5.x runtime flip commits
 # (atomic A+B+C+D, 2026-04-28).
-fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use], skip_set: [String]) : Expr {
+fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use], skip_set: [String], forced_exit: [String]) : Expr {
   let entry = pcs_collect_entry_drops(params, uses, [])
-  let exit_ = pcs_collect_exit_drops(params, uses, skip_set, [])
+  let exit_ = pcs_collect_exit_drops(params, uses, skip_set, forced_exit, [])
   match entry {
     [] -> match exit_ {
       [] -> body
@@ -4882,7 +4886,7 @@ fn pcs_collect_entry_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
   }
 }
 
-fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], acc: [Stmt]) : [Stmt] {
+fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], forced_exit: [String], acc: [Stmt]) : [Stmt] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> {
@@ -4895,13 +4899,90 @@ fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], acc:
           # raw and the consumer must be linear. Emitting an exit
           # drop here would double-free.
           if list_has(skip_set, p.pname) { acc }
-          else if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
+          else if list_has(forced_exit, p.pname) or
+                  pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
             [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
           } else { acc }
         }
         _ -> acc
       }
-      pcs_collect_exit_drops(rest, uses, skip_set, acc1)
+      pcs_collect_exit_drops(rest, uses, skip_set, forced_exit, acc1)
+    }
+  }
+}
+
+# A single-use owned param whose only read sits on some-but-not-all
+# execution paths would transfer raw at the read with no exit drop —
+# every path that skips the read leaks the birth ref. Select such
+# params so the rewriter dups their read (via force_set) and
+# `pcs_collect_exit_drops` releases the original unconditionally.
+# Self-recursive fns are excluded: the goto/TRMC rewrites bypass the
+# exit wrap per iteration and their site dropmask mirrors the flat
+# use-count criterion, so forcing a dup there would unbalance the
+# loop. The exclusion over-approximates (any self-call anywhere, bare
+# or module-qualified); a false hit merely withholds the treatment.
+fn pcs_branchy_single_use_params(fn_name: String, pnames: [String],
+                                 body: Expr, uses: [Use], skip: [String]) : [String] =
+  if pcs_body_has_tail_self_call(fn_name, body) or
+     pcs_arm_self_modulo_cons(fn_name, body) or
+     pcs_body_has_cons_self_tail(fn_name, body) or
+     pcs_name_in_expr(fn_name, body) { [] }
+  else { pcs_branchy_single_loop(pnames, body, uses, skip) }
+
+# The builtin-cons TRMC tail (`[h, ...self(t)]`): a tail-position list
+# one of whose elements is a self-call. Goto-lowered like the ctor
+# modcons shape, so it joins the self-recursion fence above.
+fn pcs_body_has_cons_self_tail(self_name: String, e: Expr) : Bool =
+  pcs_bhcst_kind(self_name, e.kind)
+
+fn pcs_bhcst_kind(self_name: String, k: ExprKind) : Bool = match k {
+  EList(els) -> pcs_bhcst_els(self_name, els)
+  EIf(_, t, opt_e) ->
+    pcs_body_has_cons_self_tail(self_name, t) or
+    (match opt_e { None -> false Some(e2) -> pcs_body_has_cons_self_tail(self_name, e2) })
+  EMatch(_, arms) -> pcs_bhcst_arms(self_name, arms)
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> false
+    Some(t) -> pcs_body_has_cons_self_tail(self_name, t)
+  }
+  _ -> false
+}
+
+fn pcs_bhcst_els(self_name: String, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    let hit = match inner.kind {
+      ECall(f, _) -> match f.kind {
+        EVar(c)        -> c == self_name
+        EModCall(_, c) -> c == self_name
+        _              -> false
+      }
+      _ -> false
+    }
+    hit or pcs_bhcst_els(self_name, rest)
+  }
+}
+
+fn pcs_bhcst_arms(self_name: String, arms: [Arm]) : Bool = match arms {
+  []                      -> false
+  [Arm(_, _, b), ...rest] ->
+    pcs_body_has_cons_self_tail(self_name, b) or pcs_bhcst_arms(self_name, rest)
+}
+
+fn pcs_branchy_single_loop(pnames: [String], body: Expr, uses: [Use],
+                           skip: [String]) : [String] = match pnames {
+  []           -> []
+  [p, ...rest] -> {
+    let r = pcs_branchy_single_loop(rest, body, uses, skip)
+    if list_has(skip, p) { r }
+    else if pcs_count_non_lam_uses(p, uses, 0) != 1 { r }
+    else {
+      match last_use_for(p, uses) {
+        LUAt(_, _, _) ->
+          if pcs_consumed_on_every_path(p, body) { r } else { [p, ...r] }
+        _ -> r
+      }
     }
   }
 }

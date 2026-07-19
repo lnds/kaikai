@@ -53,9 +53,14 @@ kai_timeout() {
   esac
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  if [ "$KAI_TIMEOUT_KIND" = none ]; then
-    echo "warning: no timeout implementation (timeout/gtimeout/perl); running unbounded" >&2
-  fi
-  kai_timeout "$@"
-fi
+# Direct-execution detection must stay POSIX: Makefile recipes source this
+# file under /bin/sh (dash on Linux), where ${BASH_SOURCE[0]} is a parse
+# error, not just an empty value.
+case "$0" in
+  *timeout.sh)
+    if [ "$KAI_TIMEOUT_KIND" = none ]; then
+      echo "warning: no timeout implementation (timeout/gtimeout/perl); running unbounded" >&2
+    fi
+    kai_timeout "$@"
+    ;;
+esac
