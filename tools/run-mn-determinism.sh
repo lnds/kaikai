@@ -32,6 +32,12 @@ FIXTURES=(
   # a lost-wakeup that would strand a sleeper (the shutdown-hang check below
   # catches the deadlock this lane closed).
   "examples/effects/mn_reactor_io_cpu_mix.kai"
+  # Work-stealing must not corrupt a parked fiber's identity: the resume
+  # store of kai_active_fiber has to re-resolve its thread-local slot on the
+  # thread that now runs, not the one that parked. Many short sleepers +
+  # CPU contention maximise park -> steal -> resume hops; a rotated identity
+  # truncates the timer wheel (hang) or reports Actor unhandled.
+  "examples/effects/mn_park_resume_steal.kai"
 )
 
 if [ "$KAI_TIMEOUT_KIND" = none ]; then
