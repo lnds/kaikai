@@ -15196,6 +15196,20 @@ static void kai_evidence_pop(void) {
     }
 }
 
+/* Unwind the evidence stack past `node` — the abandon path, where a
+ * clause discarded `resume` and the op site longjmps to `node`'s handle.
+ * That jump destroys every frame the handle body pushed, `node` included,
+ * so popping a single entry is only correct when `node` is already the
+ * top. With a resumed handler frame still between the op site and its
+ * handle, a lone pop leaves the dead node linked as top: the next handle
+ * to reuse that stack storage links itself as its own parent, and every
+ * later lookup walks the resulting cycle forever. */
+static void kai_evidence_unwind_to(KaiEvidence *node) {
+    if (node != NULL) {
+        kai_current_fiber()->evidence_top = node->parent;
+    }
+}
+
 /* Walk the current fiber's stack and return the innermost handler
  * for `eff_label`. Returns NULL if no matching handler is in
  * scope — which would indicate a compiler bug, since the type
@@ -15308,7 +15322,7 @@ static void kai_check_cancel_yield_point(void) {
 
     if (k.status == KAI_CONT_UNRESUMED && user_node->handle_jmp != NULL) {
         *user_node->discard_slot = op_r;
-        kai_evidence_pop();
+        kai_evidence_unwind_to(user_node);
         longjmp(*user_node->handle_jmp, 1);
         /* Unreachable. */
     }
