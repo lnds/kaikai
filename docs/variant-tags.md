@@ -57,23 +57,27 @@ not variants in kaikai; they are primitive `Bool`).
 ## User-variant assignment
 
 When the compiler resolves a `type Foo = A | B(Int) | C` declaration,
-it appends `A`, `B`, `C` to the global variants table in that order.
-Each one receives the next free tag starting from
-`KAI_USER_VARIANT_TAG_BASE` (11 today). Tags monotonically increase as
-declarations are processed; tags are stable within a single compilation
-of a given source.
+it adds `A`, `B`, `C` to the global variants table. In **stage 2** each
+user constructor's tag is **name-keyed**: `tag = KAI_USER_VARIANT_TAG_BASE
++ (FNV-1a(name) mod 65525)`, linear probe on collision, names inserted
+in sorted order. A constructor's tag is therefore a function of the
+program's *set* of constructor names — sparse in the uint16 space, not
+dense — and stays stable when unrelated declarations are added, moved,
+or removed. This is what keeps per-module emitted code byte-identical
+under sibling-module edits (the `.o`-cache hermeticity the c-modular
+and native-modular builds rely on; pinned by `test-modular-hermetic`).
 
-Tags are **not** stable across compilations of different programs. A
-change in the order of `type` declarations or the addition of a new
-constructor shifts subsequent tags. The compiler must therefore emit
-the tag literal from the table at the call site, not assume a fixed
-value for any user constructor.
+**Stages 0 and 1** keep the older dense declaration-order assignment
+(next free tag from `KAI_USER_VARIANT_TAG_BASE`, monotonically
+increasing). Their tables only ever cover the bootstrap chain's own
+programs, which never hit a per-module cache, and each compiled program
+is self-consistent — stage1's and stage2's tables do not need to agree
+on user tags, only on the reserved builtin range.
 
-Each stage keeps its own variants table; the assignment must be
-deterministic in declaration order so that stage1's table and stage2's
-table agree on tags for any source they both compile. This is the same
-discipline `make selfhost` already protects (per-compiler determinism;
-see `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
+Within any single stage the assignment is deterministic for a given
+source set. Tags are still **not** ABI: the compiler emits the tag
+literal from the table at the call site, and no compiled artefact may
+assume a fixed value for any user constructor.
 
 ## Where the convention is encoded
 
@@ -89,9 +93,11 @@ see `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
   reserved `EV` entries with their tags baked in;
   `collect_user_variants_loop` threads the next-free counter starting at
   11. Emit sites use `evar_find_tag(variants, name)`.
-- **`stage2/compiler.kai`**: same shape as stage1; the EVar AST node
-  carries a `tag` field populated at resolve time. `emit_variant_call_*`
-  consult `evar_find_tag(variants, name)` instead of emitting `0`.
+- **`stage2/compiler/emit_shared.kai`**: `register_variants` seeds the
+  reserved builtins, then assigns each user constructor its name-keyed
+  slot (`string_hash` mod the uint16 user range, linear probe, sorted
+  insertion). Emit sites consult `evar_find_tag(variants, name)`; the
+  variant→head map is registered as sparse `(tag, head)` pairs.
 
 ## Invariants
 
