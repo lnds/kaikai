@@ -1346,14 +1346,14 @@ int kaix_op_discarded(void *node_v, void *k_v) {
     return (k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) ? 1 : 0;
 }
 
-/* Op-site discard unwind, mirroring the C triple
- * `*discard_slot = op_r; kai_evidence_pop(); longjmp(*handle_jmp, 1);`.
- * Only called when `kaix_op_discarded` returned 1, so `handle_jmp` and
+/* Op-site discard unwind: deposit the discarded value, drop the evidence
+ * the jump is about to invalidate, and land on the handle's pad. Only
+ * called when `kaix_op_discarded` returned 1, so `handle_jmp` and
  * `discard_slot` are both live. Does not return. */
 void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
     KaiEvidence *node = (KaiEvidence *) node_v;
     *node->discard_slot = op_r;
-    kai_evidence_pop();
+    kai_evidence_unwind_to(node);
     longjmp(*node->handle_jmp, 1);
 }
 
@@ -1370,7 +1370,7 @@ KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
     if (node != NULL && k != NULL &&
         k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) {
         *node->discard_slot = op_r;
-        kai_evidence_pop();
+        kai_evidence_unwind_to(node);
         longjmp(*node->handle_jmp, 1);
     }
     return op_r;
