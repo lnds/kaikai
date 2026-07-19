@@ -697,6 +697,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1180 fixture passes under ASAN+UBSan (lazy-range norm / fallback gate)"
 	@$(MAKE) -C stage2 test-perceus-1295-borrow-slot-nested-arg-asan
 	@echo "tier1-asan OK — issue #1295 fixture passes under ASAN+UBSan (borrowed-slot nested-arg use-count gate)"
+	@$(MAKE) -C stage2 test-perceus-1303-single-use-branch-leak-asan
+	@echo "tier1-asan OK — issue #1303 fixture passes under ASAN+UBSan (branchy single-use param exit-drop gate)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
