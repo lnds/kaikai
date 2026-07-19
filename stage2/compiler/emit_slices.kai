@@ -1,0 +1,305 @@
+# compiler/emit_slices.kai -- per-TU header slices for the c-modular split.
+#
+# The two whole-program headers the split used to share (types + decls)
+# defeat the per-.o content cache: one added type or prototype rewrites
+# the shared text and re-keys every translation unit. This module
+# projects those headers into per-TU slices (kai_types_<stem>.h /
+# kai_decls_<stem>.h) holding only the declarations the TU's C body
+# references, closed transitively over the selected declarations' own
+# text (a ctor struct pulls its base struct, a prototype pulls the
+# evidence struct types in its signature).
+#
+# Selection is by C identifier token, which makes under-inclusion
+# impossible: C code can only reference a symbol through its identifier,
+# so any needed declaration's name occurs in the TU body or in an
+# already-selected declaration. Over-inclusion (a name that only occurs
+# in a string literal) merely widens a slice and costs nothing.
+#
+# A header line whose declared name cannot be recognised lands in EVERY
+# slice -- the sound fallback is to over-include, never to drop.
+#
+# Single-line #[doc(...)] only -- kaic1 still consumes the bundle.
+
+import compiler.util
+import compiler.chars
+
+#[doc("One translation-unit input to the header slicer: filename stem + emitted C body.")]
+pub type SliceTU = { stem: String, body: String }
+
+#[doc("The sliced pair for one TU: the kai_types_<stem>.h and kai_decls_<stem>.h texts.")]
+pub type SlicedHeaders = { stem: String, types_h: String, decls_h: String }
+
+# One shared-header declaration unit: the declared C identifier (empty
+# means unrecognised shape -> include everywhere) and the unit's text.
+type SlUnit = { uname: String, utext: String }
+
+# Unit store + name index. Types units occupy [0, ntypes), decls units
+# [ntypes, nunits); each range keeps its header's original order, which
+# is what makes the sliced output define-before-use like the whole text.
+type SlIndex = { unames: Array[String], utexts: Array[String],
+                 nunits: Int, ntypes: Int,
+                 buckets: Array[[Int]], nbuckets: Int }
+
+# Selection in progress: the per-unit chosen flags plus the worklist of
+# freshly selected units whose text still awaits the closure scan.
+type SlState = { sel: Array[Bool], work: [Int] }
+
+#[doc("Project the two shared c-modular headers into per-TU slices, one pair per input TU, each holding only the declarations that TU references.")]
+pub fn slice_headers(types_h: String, decls_h: String, tus: [SliceTU]) : [SlicedHeaders] / Mutable {
+  let ix = sl_build_index(sl_type_units(types_h), sl_decl_units(decls_h))
+  let alw = sl_always_units(ix, 0, [])
+  sl_slice_tus(tus, ix, alw, [])
+}
+
+fn sl_slice_tus(tus: [SliceTU], ix: SlIndex, alw: [Int], acc: [SlicedHeaders]) : [SlicedHeaders] / Mutable = match tus {
+  [] -> list_reverse(acc)
+  [tu, ...rest] -> {
+    let sel = sl_select(tu.body, ix, alw)
+    let sh = SlicedHeaders { stem: tu.stem,
+                             types_h: sl_types_header(tu.stem, ix, sel),
+                             decls_h: sl_decls_header(tu.stem, ix, sel) }
+    sl_slice_tus(rest, ix, alw, [sh, ...acc])
+  }
+}
+
+# ---- shared-header parsing into units ------------------------------
+
+# Decls header: every unit is one line (a prototype `RET name(args);` or
+# an `extern <type> name;`). Guard/include/comment/blank lines drop --
+# the per-TU assembly writes its own guard and include.
+fn sl_decl_units(decls_h: String) : [SlUnit] =
+  list_reverse(sl_decl_units_go(string_split(decls_h, "\n"), []))
+
+fn sl_decl_units_go(lns: [String], acc: [SlUnit]) : [SlUnit] = match lns {
+  [] -> acc
+  [ln, ...rest] ->
+    if sl_skip_line(ln) { sl_decl_units_go(rest, acc) }
+    else { sl_decl_units_go(rest, [SlUnit { uname: sl_decl_name(ln), utext: ln }, ...acc]) }
+}
+
+# A prototype is named by the identifier before its `(`; an extern data
+# decl by the identifier before its `;`.
+fn sl_decl_name(ln: String) : String {
+  let p = string_index_of_char(ln, '(')
+  let n = string_length(ln)
+  if p >= 0 { sl_ident_before(ln, p) }
+  else if n >= 2 and char_at_or_zero(ln, n - 1) == ';' { sl_ident_before(ln, n - 1) }
+  else { "" }
+}
+
+# Types header: units are struct blocks (`struct X {` ... `};`),
+# one-line struct defs, `typedef struct X X;` forwards, and anonymous
+# `typedef struct {` ... `} Name;` blocks (named at the close line).
+# The fold state carries the units built so far (reversed) plus the
+# open block, if any: its name and its reversed lines.
+type SlParse = { units: [SlUnit], bname: String, blines: [String] }
+
+fn sl_type_units(types_h: String) : [SlUnit] {
+  let st = sl_type_units_go(string_split(types_h, "\n"),
+                            SlParse { units: [], bname: "", blines: [] })
+  list_reverse(st.units)
+}
+
+fn sl_type_units_go(lns: [String], st: SlParse) : SlParse = match lns {
+  [] -> st
+  [ln, ...rest] -> sl_type_units_go(rest, sl_type_line(ln, st))
+}
+
+fn sl_type_line(ln: String, st: SlParse) : SlParse =
+  if not list_is_empty(st.blines) { sl_block_line(ln, st) }
+  else if sl_has_prefix(ln, "struct ") or sl_has_prefix(ln, "typedef struct") { sl_open_line(ln, st) }
+  else if sl_skip_line(ln) { st }
+  else { sl_push_unit(st, "", ln) }
+
+fn sl_block_line(ln: String, st: SlParse) : SlParse =
+  if sl_has_prefix(ln, "}") {
+    let nm = if st.bname == "" { sl_close_name(ln) } else { st.bname }
+    sl_push_unit(SlParse { units: st.units, bname: "", blines: [] },
+                 nm, join_with(list_reverse([ln, ...st.blines]), "\n"))
+  }
+  else { SlParse { units: st.units, bname: st.bname, blines: [ln, ...st.blines] } }
+
+fn sl_open_line(ln: String, st: SlParse) : SlParse {
+  let nm = sl_struct_name(ln)
+  if sl_line_ends_semi(ln) { sl_push_unit(st, nm, ln) }
+  else { SlParse { units: st.units, bname: nm, blines: [ln] } }
+}
+
+fn sl_push_unit(st: SlParse, nm: String, txt: String) : SlParse =
+  SlParse { units: [SlUnit { uname: nm, utext: txt }, ...st.units], bname: "", blines: [] }
+
+# The struct tag: the identifier after the (possibly typedef'd) `struct`
+# keyword. Empty for an anonymous `typedef struct {`.
+fn sl_struct_name(ln: String) : String {
+  let s = if sl_has_prefix(ln, "typedef ") { 15 } else { 7 }
+  let e = sl_ident_end(ln, s, string_length(ln))
+  if e <= s { "" } else { string_slice(ln, s, e - s) }
+}
+
+# The typedef name on an anonymous block's `} Name;` close line.
+fn sl_close_name(ln: String) : String {
+  let n = string_length(ln)
+  if n >= 2 and char_at_or_zero(ln, n - 1) == ';' { sl_ident_before(ln, n - 1) }
+  else { "" }
+}
+
+fn sl_skip_line(ln: String) : Bool {
+  let n = string_length(ln)
+  if n == 0 { true }
+  else {
+    let c0 = char_at_or_zero(ln, 0)
+    c0 == '#' or c0 == '/'
+  }
+}
+
+fn sl_line_ends_semi(ln: String) : Bool {
+  let n = string_length(ln)
+  n >= 1 and char_at_or_zero(ln, n - 1) == ';'
+}
+
+fn sl_has_prefix(ln: String, pfx: String) : Bool {
+  let pl = string_length(pfx)
+  if pl > string_length(ln) { false }
+  else { string_slice(ln, 0, pl) == pfx }
+}
+
+# ---- identifier helpers --------------------------------------------
+
+fn sl_ident_before(ln: String, endp: Int) : String {
+  let s = sl_ident_start(ln, endp)
+  if s >= endp { "" } else { string_slice(ln, s, endp - s) }
+}
+
+fn sl_ident_start(ln: String, i: Int) : Int =
+  if i <= 0 { 0 }
+  else if ch_is_alnum(char_at_or_zero(ln, i - 1)) { sl_ident_start(ln, i - 1) }
+  else { i }
+
+fn sl_ident_end(txt: String, i: Int, n: Int) : Int =
+  if i >= n { i }
+  else if ch_is_alnum(char_at_or_zero(txt, i)) { sl_ident_end(txt, i + 1, n) }
+  else { i }
+
+# ---- unit index ----------------------------------------------------
+
+# Fixed power-of-two bucket count, comfortably above the ~16k units a
+# self-compile produces, so buckets stay short and lookups cheap.
+fn sl_nbuckets() : Int = 32768
+
+# string_hash may be negative; land in [0, n) for any sign.
+fn sl_slot(h: Int, n: Int) : Int = ((h % n) + n) % n
+
+fn sl_build_index(tunits: [SlUnit], dunits: [SlUnit]) : SlIndex / Mutable {
+  let nt = list_length(tunits)
+  let n = nt + list_length(dunits)
+  let unames = array_make(n, "")
+  let utexts = array_make(n, "")
+  let n1 = sl_fill_units(tunits, 0, unames, utexts)
+  let n2 = sl_fill_units(dunits, n1, unames, utexts)
+  let nb = sl_nbuckets()
+  let buckets = array_make(nb, [])
+  let n3 = sl_fill_buckets(0, n2, unames, buckets, nb)
+  SlIndex { unames: unames, utexts: utexts, nunits: n3, ntypes: nt,
+            buckets: buckets, nbuckets: nb }
+}
+
+fn sl_fill_units(us: [SlUnit], i: Int, unames: Array[String], utexts: Array[String]) : Int / Mutable = match us {
+  [] -> i
+  [u, ...rest] -> {
+    let a1 = array_set(unames, i, u.uname)
+    let a2 = array_set(utexts, i, u.utext)
+    sl_fill_units(rest, i + 1, a1, a2)
+  }
+}
+
+fn sl_fill_buckets(i: Int, n: Int, unames: Array[String], buckets: Array[[Int]], nb: Int) : Int / Mutable =
+  if i >= n { i }
+  else {
+    let nm = array_get(unames, i)
+    if nm == "" { sl_fill_buckets(i + 1, n, unames, buckets, nb) }
+    else {
+      let s = sl_slot(string_hash(nm), nb)
+      let b1 = array_set(buckets, s, list_append(array_get(buckets, s), [i]))
+      sl_fill_buckets(i + 1, n, unames, b1, nb)
+    }
+  }
+
+# Units with no recognised name are selected for every TU.
+fn sl_always_units(ix: SlIndex, i: Int, acc: [Int]) : [Int] =
+  if i >= ix.nunits { list_reverse(acc) }
+  else if array_get(ix.unames, i) == "" { sl_always_units(ix, i + 1, [i, ...acc]) }
+  else { sl_always_units(ix, i + 1, acc) }
+
+# ---- per-TU selection ----------------------------------------------
+
+fn sl_select(body: String, ix: SlIndex, alw: [Int]) : Array[Bool] / Mutable {
+  let st0 = sl_mark_always(alw, SlState { sel: array_make(ix.nunits, false), work: [] })
+  let st1 = sl_close(ix, sl_scan(body, ix, st0))
+  st1.sel
+}
+
+fn sl_mark_always(uis: [Int], st: SlState) : SlState / Mutable = match uis {
+  [] -> st
+  [ui, ...rest] ->
+    sl_mark_always(rest, SlState { sel: array_set(st.sel, ui, true), work: [ui, ...st.work] })
+}
+
+# Scan one text for identifier tokens, selecting every unit whose name
+# matches; fresh selections queue for the closure scan.
+fn sl_scan(txt: String, ix: SlIndex, st: SlState) : SlState / Mutable =
+  sl_scan_go(txt, 0, string_length(txt), ix, st)
+
+fn sl_scan_go(txt: String, i: Int, n: Int, ix: SlIndex, st: SlState) : SlState / Mutable =
+  if i >= n { st }
+  else if ch_is_alpha(char_at_or_zero(txt, i)) {
+    let e = sl_ident_end(txt, i + 1, n)
+    sl_scan_go(txt, e, n, ix, sl_mark(string_slice(txt, i, e - i), ix, st))
+  }
+  else { sl_scan_go(txt, i + 1, n, ix, st) }
+
+fn sl_mark(tok: String, ix: SlIndex, st: SlState) : SlState / Mutable =
+  sl_mark_bucket(array_get(ix.buckets, sl_slot(string_hash(tok), ix.nbuckets)), tok, ix, st)
+
+fn sl_mark_bucket(bk: [Int], tok: String, ix: SlIndex, st: SlState) : SlState / Mutable = match bk {
+  [] -> st
+  [ui, ...rest] -> {
+    let st2 = if array_get(ix.unames, ui) == tok and not array_get(st.sel, ui) {
+      SlState { sel: array_set(st.sel, ui, true), work: [ui, ...st.work] }
+    } else { st }
+    sl_mark_bucket(rest, tok, ix, st2)
+  }
+}
+
+# Transitive closure: scan each freshly selected unit's own text, so a
+# selected declaration pulls the declarations it references.
+fn sl_close(ix: SlIndex, st: SlState) : SlState / Mutable = match st.work {
+  [] -> st
+  [ui, ...rest] ->
+    sl_close(ix, sl_scan(array_get(ix.utexts, ui), ix, SlState { sel: st.sel, work: rest }))
+}
+
+# ---- per-TU header assembly ----------------------------------------
+
+fn sl_gather(ix: SlIndex, sel: Array[Bool], lo: Int, hi: Int, b: SB) : SB / Mutable =
+  if lo >= hi { b }
+  else {
+    let b2 = if array_get(sel, lo) { sb_append(sb_append(b, array_get(ix.utexts, lo)), "\n") }
+             else { b }
+    sl_gather(ix, sel, lo + 1, hi, b2)
+  }
+
+fn sl_types_header(stem: String, ix: SlIndex, sel: Array[Bool]) : String / Mutable {
+  let b = sb_append(sb_new(), concat_all([
+    "/* generated by kaikai stage 2 - per-TU types slice */\n",
+    "#ifndef KAI_TYPES_", stem, "_H\n#define KAI_TYPES_", stem, "_H\n",
+    "#include \"runtime.h\"\n\n"]))
+  sb_build(sb_append(sl_gather(ix, sel, 0, ix.ntypes, b), "\n#endif\n"))
+}
+
+fn sl_decls_header(stem: String, ix: SlIndex, sel: Array[Bool]) : String / Mutable {
+  let b = sb_append(sb_new(), concat_all([
+    "/* generated by kaikai stage 2 - per-TU decls slice */\n",
+    "#ifndef KAI_DECLS_", stem, "_H\n#define KAI_DECLS_", stem, "_H\n",
+    "#include \"kai_types_", stem, ".h\"\n\n"]))
+  sb_build(sb_append(sl_gather(ix, sel, ix.ntypes, ix.nunits, b), "\n#endif\n"))
+}
