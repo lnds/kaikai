@@ -3023,6 +3023,18 @@ static KaiFiber *kai_current_fiber(void) {
     return kai_active_fiber;
 }
 
+/* Assign kai_active_fiber from OUT OF LINE. Load-bearing across a
+ * swapcontext resume: an inline `kai_active_fiber = f` resolves the TLS slot
+ * address once (a tlv_get_addr call on darwin) and, even at -O0, spills that
+ * address to the stack across the swap. A fiber that parks on one thread and
+ * resumes on another (work-stealing) would then store through the parking
+ * thread's slot, rotating every thread's active pointer. Out of line the slot
+ * is re-resolved on whatever thread now runs. Mirrors kai_active_fiber_anchor. */
+__attribute__((noinline))
+static void kai_set_active_fiber(KaiFiber *f) {
+    kai_active_fiber = f;
+}
+
 /* A recoverable runtime trap (index out of range, divide by zero,
  * non-exhaustive match). With a fiber pad installed, unwind to it
  * like Cancel — the trampoline reports the fiber TRAPPED and a
@@ -13887,7 +13899,7 @@ static void kai_sched_yield(void) {
         kai_requeue_stack_head = current;
         kai_active_fiber = &kai_main_fiber;
         swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        kai_active_fiber = current;
+        kai_set_active_fiber(current);
         kai_drain_pending_free();
         return;
     }
@@ -13955,7 +13967,7 @@ static void kai_sched_park(void) {
         kai_commit_stack_head  = current;
         kai_active_fiber = &kai_main_fiber;
         swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        kai_active_fiber = current;
+        kai_set_active_fiber(current);
         kai_drain_pending_free();
         kai_check_cancel_yield_point();
         return;

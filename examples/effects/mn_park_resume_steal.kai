@@ -1,0 +1,56 @@
+# Regression: work-stealing must not corrupt a fiber's identity across a park.
+#
+# A parking fiber saves `kai_active_fiber = current` right after the resume
+# swapcontext. If that store resolves the thread-local slot address BEFORE the
+# swap and reuses it after, a fiber that parks on one thread and resumes on
+# another (a steal) writes through the PARKING thread's slot — rotating every
+# thread's active pointer, which truncates the reactor timer wheel and hangs.
+#
+# This fixture forces the hazard: many short-lived fibers that each park on the
+# reactor timer wheel several times, with CPU-bound fibers keeping the workers
+# busy so idle threads steal the woken sleepers. The summed total is fixed, so
+# the output is byte-identical at KAI_THREADS=1, 4, and 8 (the determinism gate)
+# and a rotated identity shows up as either a hang or a wrong total.
+
+import spawn
+import time
+
+fn burn(n: Int, acc: Int) : Int =
+  if n <= 0 { acc } else { burn(n - 1, acc + (n % 7)) }
+
+fn cpu_worker(rounds: Int) : Int =
+  if rounds <= 0 { 0 } else { burn(40000, 0); cpu_worker(rounds - 1) }
+
+fn sleep_n(rounds: Int, ms: Int) : Unit / Clock =
+  if rounds <= 0 { () } else { sleep(millis(ms)); sleep_n(rounds - 1, ms) }
+
+# Each I/O fiber parks `rounds` times on the timer wheel, then returns a fixed
+# contribution — the count, so the total is deterministic regardless of order.
+fn io_worker(rounds: Int, ms: Int) : Int / Spawn + Clock = {
+  sleep_n(rounds, ms)
+  rounds
+}
+
+fn sum_list(xs: [Int], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> sum_list(rest, acc + x)
+}
+
+# Twelve I/O fibers (each parks 4 times) contend with eight CPU fibers for the
+# scheduler threads, maximising park -> steal -> resume hops. I/O total is fixed
+# at 12 * 4 = 48; the CPU results are discarded.
+fn run_steal() : Int / Spawn + Clock = {
+  nursery { nur ->
+    let cpu = [1, 2, 3, 4, 5, 6, 7, 8] | (i => { let _ = i; nur.spawn(() => cpu_worker(3)) })
+    let io  = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] | (i => { let _ = i; nur.spawn(() => io_worker(4, 5)) })
+    let _   = cpu | (f => nur.await(f))
+    let ns  = io  | (f => nur.await(f))
+    sum_list(ns, 0)
+  }
+}
+
+fn main() : Int / Spawn + Clock + Stdout = {
+  let total = run_steal()
+  Stdout.print("park/resume steal total: #{int_to_string(total)}")
+  0
+}
