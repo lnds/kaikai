@@ -48,16 +48,16 @@ surface:
 
 ```kai
 fn transfer(req: TransferRequest)
-  : Result[???, Receipt]    # crosses Identity + Auth + Routing + Settlement + Audit
+  : Result[Receipt, ???]    # crosses Identity + Auth + Routing + Settlement + Audit
 
 fn query_balance(account_id: AccountId)
-  : Result[???, Balance]    # crosses Identity + Auth
+  : Result[Balance, ???]    # crosses Identity + Auth
 
 fn reconcile(period: Period)
-  : Result[???, Reconciliation]   # crosses Settlement + Audit
+  : Result[Reconciliation, ???]   # crosses Settlement + Audit
 
 fn refund(tx_id: TxId)
-  : Result[???, Refund]     # crosses Identity + Auth + Settlement + Audit
+  : Result[Refund, ???]     # crosses Identity + Auth + Settlement + Audit
 ```
 
 Today kaikai requires a **wrapper sum type** per operation:
@@ -103,9 +103,9 @@ type AppError =
   | Settlement(SettlementError)
   | Audit(AuditError)
 
-fn transfer(req)    : Result[AppError, Receipt]
-fn query_balance()  : Result[AppError, Balance]    # lies: cannot fail with Routing
-fn reconcile()      : Result[AppError, _]          # lies: cannot fail with Identity
+fn transfer(req)    : Result[Receipt, AppError]
+fn query_balance()  : Result[Balance, AppError]    # lies: cannot fail with Routing
+fn reconcile()      : Result[_, AppError]          # lies: cannot fail with Identity
 ```
 
 The error type **lies**: it claims `query_balance` may fail with
@@ -159,9 +159,9 @@ union QueryBalanceErr = IdentityError | AuthError
 union TransferErr     = IdentityError | AuthError | RoutingError | SettlementError | AuditError
 union RefundErr       = IdentityError | AuthError | SettlementError | AuditError
 
-fn query_balance() : Result[QueryBalanceErr, Balance]
-fn transfer()      : Result[TransferErr, Receipt]
-fn refund()        : Result[RefundErr, Refund]
+fn query_balance() : Result[Balance, QueryBalanceErr]
+fn transfer()      : Result[Receipt, TransferErr]
+fn refund()        : Result[Refund, RefundErr]
 ```
 
 The function signatures now declare **exactly** which errors can
@@ -366,14 +366,14 @@ missing variants. With unions, the report identifies the
 component-of-origin: `"missing variant InsufficientBalance from
 AuthError in QueryBalanceErr"`.
 
-### With `Result[E, T]` + `!` propagation
+### With `Result[T, E]` + `!` propagation
 
 ```kai
-fn outer() : Result[QueryBalanceErr, Balance] = {
-  let v = check_identity(req)?         # returns Result[IdentityError, _]
+fn outer() : Result[Balance, QueryBalanceErr] = {
+  let v = check_identity(req)?         # returns Result[_, IdentityError]
   #       ^^^^^^^^^^^^^^^^^^^^
   #       IdentityError <: QueryBalanceErr, so ! propagates correctly
-  let b = check_auth(v)?               # returns Result[AuthError, _]
+  let b = check_auth(v)?               # returns Result[_, AuthError]
   Ok(b)
 }
 ```

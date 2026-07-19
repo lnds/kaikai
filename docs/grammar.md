@@ -1077,7 +1077,7 @@ expr!                  ≡  match expr {
 
 The dispatch (Option vs Result) is by the type the typer assigns to
 `expr`. Used in any expression position; the enclosing function's
-return type must be `Option[U]` or `Result[E, U]` accordingly.
+return type must be `Option[U]` or `Result[U, E]` accordingly.
 
 ### 4.13 As-pattern — `name @ pattern`
 

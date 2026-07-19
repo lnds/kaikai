@@ -102,7 +102,7 @@ struct KaiValue {
 Why uniform boxing:
 
 - Every function signature in the emitted C becomes `KaiValue*(...)` — no specialization per type.
-- Generics (`map`, `filter`, `reduce`, `each`, `Option[T]`, `Result[E, T]`) just work because `KaiValue*` is opaque.
+- Generics (`map`, `filter`, `reduce`, `each`, `Option[T]`, `Result[T, E]`) just work because `KaiValue*` is opaque.
 - RC is trivial: the header is in the same place for every value.
 - We can literally write the runtime in a single header with <500 lines of C.
 

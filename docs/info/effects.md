@@ -190,7 +190,7 @@ network effect available today.
   block; the row type carries the discipline.
 - Multi-shot resume. One-shot only.
 - Effect polymorphism via type classes. kaikai uses row variables.
-- Throwing/catching exceptions. Use `Fail` effect or `Result[e, a]`.
+- Throwing/catching exceptions. Use `Fail` effect or `Result[a, e]`.
 
 ## See also
 

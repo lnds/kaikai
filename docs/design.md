@@ -244,7 +244,7 @@ cc stage0/*.c -o kaic0
 - Tagged sum types (for AST representation): `type Expr = Lit(Int) | Add(Expr, Expr)`.
 - Basic records.
 - Minimal file IO (`read_file`, `write_file`, `print`).
-- `Result[E, T]` and `Option[T]` for error handling.
+- `Result[T, E]` and `Option[T]` for error handling.
 - Pattern matching over sum types and lists.
 - Mandatory type annotations (no inference yet).
 - Simple RC (no full Perceus).
