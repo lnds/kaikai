@@ -89,13 +89,13 @@ Full map in **`docs/build-system.md`** (Makefile structure, the bundle, bootstra
 
 ## Testing discipline
 
-Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI in `.github/workflows/tier1.yml` (and `tier1-asan.yml`).
+Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `docs/ci-time-analysis.md`. Five workflows: `tier1.yml` and `tier1-native.yml` are always-on and their aggregator jobs are the two REQUIRED checks; `tier1-asan.yml`, `tier1-tsan.yml`, and `rc-detector.yml` are path-gated.
 
 - **Tier 0** — pre-commit fast sanity (~30–60 s): `make tier0`. Run before each commit when iterating on compiler code; CI catches what local skips miss.
-- **Tier 1** — gated by CI on every PR: `make tier0 && make tier1` runs on `ubuntu-latest` for every PR and every push to `main`. **CI green is the merge gate.** Optional locally for faster feedback (~2–4 min on mac).
-- **Tier 1-ASAN** — path-gated CI on PRs touching `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`, `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or `examples/perceus/**`. Catches non-portable fixes that pass on macOS but fail on Linux.
+- **Tier 1** — gated by CI on every PR: the `tier1` workflow shards `make tier0 && make tier1` across parallel runners; `tier1-native` gates the default native backend (build + self-host gate + ~620-fixture parity corpus). **CI green on both required checks is the merge gate.** Optional locally for faster feedback (~2–4 min on mac).
+- **Tier 1-ASAN** — path-gated CI on PRs touching `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`, `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or `examples/perceus/**`. Catches non-portable fixes that pass on macOS but fail on Linux. `tier1-tsan` (M:N data races) and `rc-detector` (RC ledger, also daily cron) gate their own path sets similarly.
 - **Tier 2** — `make daily`: maintainer / cron only, ~10–20 min. Tier 1 + stress + coverage probe + RC budget. Failures are diagnostics, not blockers — `main` already gated by Tier 1.
-- **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI via `paths-ignore`. Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, `VERSION`, build scripts) always trigger tiers.
+- **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI (the PR-side `changes` job short-circuits the required checks; pushes to main additionally skip via `paths-ignore`, which also covers `VERSION`/`.cz.toml` bump commits). Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, build scripts) always trigger tiers.
 
 ## Code-quality bar — the differential is A− at least, B at worst
 

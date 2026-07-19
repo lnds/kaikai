@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
 
 all: kaic1 kaic2 bin/kai
 
@@ -243,56 +243,68 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-ben
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
 # grout dominates the PR critical path; it is CPU-bound + independent, so we
 # split it across SEPARATE runners (each with its own memory bus — in-job
-# `-j` is bandwidth-capped). These three shards PARTITION the `tier1` work:
+# `-j` is bandwidth-capped). These four shards PARTITION the `tier1` work:
 # every phase of `tier1` above appears in exactly one shard, so the union is
 # the full gate with identical coverage. The CI workflow runs them in
 # parallel on a shared pre-built kaic2 and an aggregator job (`tier1`)
-# gates on all three — the Required check name is unchanged.
+# gates on all four — the Required check name is unchanged.
 #
 #  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), then,
 #            after they free their RSS, demos + every non-light phase. These
 #            are CPU-light, so the runner that finishes the costly compiles
 #            fastest absorbs the tail instead of sitting idle.
-#  shard 2 — light slice 1/2.
-#  shard 3 — light slice 2/2.
-# Why the non-light tail lives on shard 1 and the light pool stays split two
-# ways: the light pool divides evenly in two (~600 s each), but the tail and
-# demos piled onto a light shard is what made it the slowest. Round-robin
-# splits by target COUNT, not cost, and the families differ ~50x (stdlib 158
-# fixtures vs 1-fixture targets) — so a finer light split must be weighted by
-# measured cost, not just a larger SHARDS value.
+#  shard 2 — light slice 1/3.
+#  shard 3 — light slice 2/3.
+#  shard 4 — the two whole-compiler modular self-hosts. Each is a full
+#            compiler self-compile (the slowest single phases in the gate);
+#            isolating them keeps every shard's wall-clock near the light
+#            slices instead of one shard dominating the critical path.
+#  shard 5 — light slice 3/3.
+# Why the non-light tail lives on shard 1, NOT on a light shard: an earlier
+# 3-way light split measured worse, but the culprit was the tail + demos
+# piled onto a light slice, not the round-robin itself. Round-robin splits
+# by target COUNT, not cost, and the families differ ~50x (stdlib 158
+# fixtures vs 1-fixture targets) — if the slices measure unbalanced, weight
+# the split by measured cost instead of raising SHARDS further.
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
-#     light(1/2), light(2/2),
+#     light(1/3), light(2/3), light(3/3),
 #     demos-no-regression, test-fmt, test-fmt-selfhost, test-bench,
 #     test-check, test-library-mode, test-diagnostics-collected,
 #     test-negative, test-stdlib-modules, test-packages,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
 #     test-canonical-aliases, test-info, test-doc,
 #     test-upgrade-resolver }
-# equals exactly the prerequisites of `tier1` (light(1/2) ∪ light(2/2)
-# == TEST_LIGHT_TARGETS, proven by the round-robin partition in
+# equals exactly the prerequisites of `tier1` (the three light slices union
+# to TEST_LIGHT_TARGETS, proven by the round-robin partition in
 # stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
 tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-costly-parallel
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
-	$(MAKE) -C stage2 test-modular-selfhost
-	$(MAKE) -C stage2 test-perceus-1131-modular-escape
 	$(MAKE) demos-no-regression
 	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + whole-compiler c-modular link + #1131 modular-escape gate + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver)"
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver)"
 
 tier1-shard-2: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=2
-	@echo "tier1-shard-2 OK — light slice 1/2"
+	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=3
+	@echo "tier1-shard-2 OK — light slice 1/3"
 
 tier1-shard-3: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=2
-	@echo "tier1-shard-3 OK — light slice 2/2"
+	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=3
+	@echo "tier1-shard-3 OK — light slice 2/3"
+
+tier1-shard-4: kaic2
+	$(MAKE) -C stage2 test-modular-selfhost
+	$(MAKE) -C stage2 test-perceus-1131-modular-escape
+	@echo "tier1-shard-4 OK — whole-compiler c-modular link + #1131 modular-escape gate"
+
+tier1-shard-5: kaic2
+	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=3
+	@echo "tier1-shard-5 OK — light slice 3/3"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
