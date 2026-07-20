@@ -198,6 +198,23 @@ unset _cf _cf_prev _cf_keep
 # the -O2 hot bitcode inlined into the program object, which this does not touch.
 KAI_RUNTIME_OWNER_OPT="-O0"
 
+# Linker flags that drop unreferenced functions from a native binary. The
+# prebuilt core object carries the whole stdlib core, so without dead-strip
+# every program pays its full size. Mach-O strips per atom (LLVM emits
+# subsections-via-symbols); ELF strips per section, using the .text.<sym>
+# sections the native emitter stamps. Dispatch-reachable fns survive: every
+# impl-table / thunk fn-ptr is materialised in registration code reached from
+# main, an edge the linker follows. KAI_NATIVE_DEAD_STRIP=0 disables; debug
+# builds skip it so every symbol stays for the debugger.
+native_dead_strip_ldflags() {
+  [ "${KAI_NATIVE_DEAD_STRIP:-1}" = "0" ] && return 0
+  [ "${KAI_BUILD_MODE:-default}" = "debug" ] && return 0
+  case "$(uname -s)" in
+    Darwin) printf '%s' "-Wl,-dead_strip" ;;
+    *)      printf '%s' "-Wl,--gc-sections" ;;
+  esac
+}
+
 # Shared core cache: two content-keyed layers inside a toolchain-scoped
 # directory — post-parse core blobs (KAB2) and emitted-C core TU bodies
 # (KCT1). The directory embeds the toolchain id (kaic2 mtime+size), so a
@@ -918,6 +935,9 @@ Environment:
                    native build links instead of re-emitting the core).
                    On by default whenever the shared core cache is active;
                    KAI_CORE_CACHE=0 disables it along with the rest.
+  KAI_NATIVE_DEAD_STRIP  Set to 0 to keep unreferenced functions in a
+                   native binary (skip the link-time dead-strip). On by
+                   default; \`--debug\` builds always skip it.
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
                    stdlib/ if running from a dev checkout).
@@ -1485,6 +1505,7 @@ compile_to_binary() {
        && [ -s "$tmp/native-modular.objs" ]; then
       nm_ldstack=""
       [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
+      nm_gc="$(native_dead_strip_ldflags)"
       # Link every partition object + one runtime owner object. The runtime `.o`
       # is cached (compiled once per toolchain, with $CFLAGS), so the warm link
       # no longer recompiles the runtime source — the dominant warm-build cost.
@@ -1502,9 +1523,9 @@ compile_to_binary() {
       nm_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$nm_owner_defs")"
       # shellcheck disable=SC2086
       if [ -n "$nm_rt_obj" ]; then
-        $CC $CFLAGS $nm_ldstack $nm_objs "$nm_rt_obj" -o "$out" -lm -ldl || die "native-modular link failed"
+        $CC $CFLAGS $nm_ldstack $nm_gc $nm_objs "$nm_rt_obj" -o "$out" -lm -ldl || die "native-modular link failed"
       else
-        $CC $CFLAGS $nm_owner_defs $nm_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl || die "native-modular link failed"
+        $CC $CFLAGS $nm_owner_defs $nm_ldstack $nm_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl || die "native-modular link failed"
       fi
       return 0
     fi
@@ -1628,6 +1649,7 @@ compile_to_binary() {
     # de-slide PIE frames. On modern glibc it lives in libc and on macOS in
     # libSystem (both make `-ldl` a harmless no-op), but older glibc needs
     # the explicit lib — so request it everywhere.
+    nat_gc="$(native_dead_strip_ldflags)"
     if [ -n "$RUNTIME_LLVM_BC" ]; then
       # The hot bitcode merged into $obj carries ONLY the leaf value/RC/
       # arithmetic ops (KAI_HOT_ONLY): they inline into the hot loop, sound
@@ -1640,15 +1662,15 @@ compile_to_binary() {
       wp_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$wp_owner_defs")"
       # shellcheck disable=SC2086
       if [ -n "$wp_rt_obj" ]; then
-        $CC $CFLAGS $nat_objs "$wp_rt_obj" -o "$out" -lm -ldl
+        $CC $CFLAGS $nat_gc $nat_objs "$wp_rt_obj" -o "$out" -lm -ldl
       else
         # No object cache (hasher-less host): compile runtime_llvm.c inline as
         # the owner. $KAI_RUNTIME_OWNER_OPT (-O0) keeps the scheduler sound (#1234).
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
       fi
     else
       # shellcheck disable=SC2086
-      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+      $CC $CFLAGS $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
     fi
     # --debug DWARF (#500): the native object carries the .debug_* sections.
     # On ELF (Linux) the linker copies them straight into the executable, so
