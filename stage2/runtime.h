@@ -62,6 +62,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>      /* sched_getaffinity() — CPU count for the KAI_THREADS default */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -14764,12 +14765,39 @@ static void *kai_reactor_thread_main(void *arg) {
     }
 }
 
-/* Parse KAI_THREADS. Default 1 (byte-identical). "0" or unset → 1;
- * a positive count is clamped to [1, KAI_MAX_THREADS-1] so the reactor
- * thread's id (kai_nthreads) stays a valid slot index. */
+/* CPUs this process may actually run on. sysconf reports the whole
+ * machine, which over-subscribes a process pinned by an affinity mask
+ * (containers, CI runners), so the mask wins where it exists. */
+static int kai_host_ncpu(void) {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int) n : 1;
+}
+
+/* Ceiling on the *implicit* default only. Past this the per-process cost
+ * of spawning workers outgrows the scaling they buy, and a short-lived
+ * program on a many-core host pays it for nothing. An explicit
+ * KAI_THREADS is honoured up to KAI_MAX_THREADS-1. */
+#define KAI_DEFAULT_MAX_THREADS 32
+
+/* Parse KAI_THREADS. Unset → the host CPU count (capped); an explicit
+ * value wins, with "0"/"1"/garbage → 1, the single-thread escape hatch.
+ * Any count is clamped to [1, KAI_MAX_THREADS-1] so the reactor thread's
+ * id (kai_nthreads) stays a valid slot index. */
 static int kai_read_nthreads(void) {
     const char *e = getenv("KAI_THREADS");
-    if (!e || !*e) return 1;
+    if (!e || !*e) {
+        int n = kai_host_ncpu();
+        if (n > KAI_DEFAULT_MAX_THREADS) n = KAI_DEFAULT_MAX_THREADS;
+        if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
+        return n < 1 ? 1 : n;
+    }
     long n = strtol(e, NULL, 10);
     if (n <= 1) return 1;
     if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
