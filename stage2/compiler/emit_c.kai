@@ -3657,7 +3657,12 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
                        cur: String, i: Int, cx: EmitCtx) : String {
   match pats {
     [] -> match opt_rest {
-      Some(name) -> concat_all(["KaiValue *kai_", name, " = kai_incref(", cur, "); "])
+      # `_`-prefixed rest binder: unused by convention (same treatment as
+      # PBind). Binding it would incref a ref nothing releases; the
+      # scrutinee's own release covers the tail cells.
+      Some(name) ->
+        if name_is_unused(name) { "" }
+        else { concat_all(["KaiValue *kai_", name, " = kai_incref(", cur, "); "]) }
       None -> ""
     }
     [p, ...rest] -> {
@@ -6744,20 +6749,35 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
         # `KaiValue *`, raw params pass scalars.
         Some(EFn(_, _, mo, Some(US(_, rt, mask)))) ->
           if ty_is_unboxable_t(rt) {
-            let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-            Some(emit_user_call(c_sym(callee, mo), raw_args, cx))
+            Some(emit_ufn_raw_call_go(src, c_sym(callee, mo), args_e, mask, rt, cx))
           } else { None }
         _ -> None
       } }
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
       Some(US(_, rt, mask)) ->
         if ty_is_unboxable_t(rt) {
-          let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-          Some(emit_user_call(c_sym(fname, Some(mod)), raw_args, cx))
+          Some(emit_ufn_raw_call_go(src, c_sym(fname, Some(mod)), args_e, mask, rt, cx))
         } else { None }
       None -> None
     }
     _ -> None
+  }
+}
+
+# Raw-return UFn call: plain when no arg carries the
+# `__perceus_owned_borrow` mark; else bind each marked arg to a temp,
+# call, and drop the temps after — the raw-context mirror of
+# emit_call_with_owned_borrow_drops.
+fn emit_ufn_raw_call_go(src: String, sym: String, args_e: [Expr], mask: [Bool], rt: Ty, cx: EmitCtx) : String / Console {
+  if emit_args_have_owned_borrow(args_e) {
+    let names = emit_ob_names(args_e, 0)
+    let cx2 = emit_ctx_with_lcs(cx, list_append(cx.lcs, names))
+    let binds = emit_ob_binds(src, args_e, 0, cx)
+    let raw_args = emit_call_args_masked(src, emit_ob_rewrite_args(args_e, 0), mask, cx2)
+    let drops = emit_ob_drops(args_e, 0)
+    concat_all(["({ ", binds, raw_c_type(Some(rt)), " _bcr = ", emit_user_call(sym, raw_args, cx2), "; ", drops, "_bcr; })"])
+  } else {
+    emit_user_call(sym, emit_call_args_masked(src, args_e, mask, cx), cx)
   }
 }
 
