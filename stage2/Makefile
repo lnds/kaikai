@@ -1235,9 +1235,9 @@ endif
 ifeq ($(KAI_LLVM),1)
 test-native-dead-strip: $(TARGET) build
 	@set -e; \
-	KAI_BACKEND=native ../bin/kai build ../examples/native/dead_strip_dispatch.kai -o build/dead-strip-on 2> build/dead-strip-on.err \
+	KAI_BACKEND=native ../bin/kai build ../examples/stdlib/dead_strip_dispatch.kai -o build/dead-strip-on 2> build/dead-strip-on.err \
 	  || { echo "native-dead-strip BUILD FAIL (default)"; cat build/dead-strip-on.err; exit 1; }; \
-	KAI_NATIVE_DEAD_STRIP=0 KAI_BACKEND=native ../bin/kai build ../examples/native/dead_strip_dispatch.kai -o build/dead-strip-off 2> build/dead-strip-off.err \
+	KAI_NATIVE_DEAD_STRIP=0 KAI_BACKEND=native ../bin/kai build ../examples/stdlib/dead_strip_dispatch.kai -o build/dead-strip-off 2> build/dead-strip-off.err \
 	  || { echo "native-dead-strip BUILD FAIL (KAI_NATIVE_DEAD_STRIP=0)"; cat build/dead-strip-off.err; exit 1; }; \
 	./build/dead-strip-on > build/dead-strip-on.out; \
 	./build/dead-strip-off > build/dead-strip-off.out; \
