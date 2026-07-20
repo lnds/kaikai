@@ -1,0 +1,80 @@
+# Regression: disarming a receive deadline must not mutate the reactor timer
+# wheel outside the reactor mutex.
+#
+# `Actor.receive_timeout` is the one dual-park in the runtime: the caller links
+# itself onto the mailbox recv-waiter chain AND onto the reactor timer wheel. A
+# send wakes it off the chain while it is still linked into the wheel, so on
+# resume it splices itself out. At KAI_THREADS>1 that splice runs on a
+# scheduler thread while the dedicated reactor thread owns the wheel, so it has
+# to take the reactor lock like every other writer.
+#
+# The fixture drives that path exclusively: every message arrives well inside
+# the deadline, so each of the 48 receives takes the disarm branch, while CPU
+# fibers and independent sleepers keep the wheel churning under the reactor
+# thread. A None is a lost wakeup rather than a result — it retries, so the
+# total stays deterministic at KAI_THREADS=1, 4 and 8, and a corrupted wheel
+# shows up as a stranded sleeper (hang) instead of a wrong total.
+
+import spawn
+import actor
+import time
+
+fn burn(n: Int, acc: Int) : Int =
+  if n <= 0 { acc } else { burn(n - 1, acc + (n % 7)) }
+
+fn cpu_worker(rounds: Int) : Int =
+  if rounds <= 0 { 0 } else { burn(40000, 0); cpu_worker(rounds - 1) }
+
+# Independent sleepers: pure timer-wheel traffic for the reactor to insert and
+# drain while the receivers are splicing themselves out of it.
+fn sleep_n(rounds: Int, ms: Int) : Unit / Clock =
+  if rounds <= 0 { () } else { sleep(millis(ms)); sleep_n(rounds - 1, ms) }
+
+fn consume(n: Int, acc: Int) : Int / Actor[Int] + Clock =
+  if n <= 0 { acc }
+  else {
+    match receive_timeout(millis(500)) {
+      Some(v) -> consume(n - 1, acc + v)
+      None    -> consume(n, acc)
+    }
+  }
+
+fn consumer(sup: Pid[Int], n: Int) : Unit / Actor[Int] + Clock + Spawn = {
+  let total = consume(n, 0)
+  Actor.send(sup, total)
+}
+
+# Paced sends: the receiver is always parked on both structures by the time
+# the message lands, which is what makes the wake take the disarm branch.
+fn producer(to: Pid[Int], n: Int) : Unit / Actor[Int] + Clock + Spawn =
+  if n <= 0 { () }
+  else {
+    sleep(millis(2))
+    Actor.send(to, 1)
+    producer(to, n - 1)
+  }
+
+fn spawn_pairs(sup: Pid[Int], p: Int, n: Int) : Unit / Spawn + Actor[Int] + Clock =
+  if p <= 0 { () }
+  else {
+    let c = spawn_actor(() => consumer(sup, n))
+    let _ = spawn_actor(() => producer(c, n))
+    spawn_pairs(sup, p - 1, n)
+  }
+
+fn collect(remaining: Int, acc: Int) : Int / Actor[Int] =
+  if remaining <= 0 { acc } else { collect(remaining - 1, acc + Actor.receive()) }
+
+fn main() : Int / Spawn + Clock + Stdout = {
+  let total = with_mailbox {
+    let me = Actor.self()
+    nursery { nur ->
+      let _ = [1, 2, 3, 4] | (i => { let _ = i; nur.spawn(() => cpu_worker(4)) })
+      let _ = [1, 2, 3, 4] | (i => { let _ = i; nur.spawn(() => sleep_n(20, 3)) })
+      spawn_pairs(me, 6, 8)
+      collect(6, 0)
+    }
+  }
+  Stdout.print("recv timeout wheel total: #{int_to_string(total)}")
+  0
+}
