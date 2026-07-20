@@ -3396,6 +3396,9 @@ static uint64_t kai_reactor_now_ns(void);
  * and disarm it if a message wins. Bodies sit with the timer wheel. */
 static void     kai_reactor_timer_insert(KaiFiber *f);
 static int      kai_reactor_timer_remove(KaiFiber *f);
+/* Every writer of the wheel takes these, the disarm above included. */
+static inline void kai_reactor_lock(void);
+static inline void kai_reactor_unlock(void);
 
 /* Issue #620 — Phase R3 reactor forward decls. The default Stdin
  * handlers live ~1700 lines above the reactor implementation. They
@@ -3728,13 +3731,21 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
         kai_mbox_lock(mb);
         int still_waiting = kai_mailbox_waiter_remove(&mb->recv_waiter_head,
                                                       &mb->recv_waiter_tail, me);
+        kai_mbox_unlock(mb);
         if (still_waiting) {
             /* Deadline fired: we were never dequeued by a send. */
-            kai_mbox_unlock(mb);
             return NULL;
         }
-        /* A send dequeued us; disarm the still-armed deadline timer. */
+        /* A send dequeued us; disarm the still-armed deadline timer. The
+         * wheel belongs to the reactor, so splice under its lock — and hold
+         * that lock alone: the mailbox lock is released above so the two
+         * never nest, keeping the runtime's one-lock-at-a-time discipline.
+         * Re-acquiring the mailbox below can find the slot already drained
+         * by another receiver, which is the spurious case the loop handles. */
+        kai_reactor_lock();
         kai_reactor_timer_remove(me);
+        kai_reactor_unlock();
+        kai_mbox_lock(mb);
         if (mb->head) {
             KaiMboxNode *node = mb->head;
             mb->head = node->next;
@@ -12513,13 +12524,12 @@ static int kai_reactor_parked_count = 0;
  * under the lock (`kai_sched_commit_park`) and pokes the reactor's
  * self-pipe so a poll() already asleep with a stale timeout re-arms.
  *
- * Lock order: `kai_reactor_mu` (wheel + waiter lists + parked_count) and
- * a slot lock (state + steal list + home_thread + wake_pending) are
- * disjoint — commit and the drains take exactly one, never both nested.
- * A reactor-parked fiber is never simultaneously on a mailbox waiter
- * list, so the only cross-thread state writer it races is a cancel
- * detach, which also runs under `kai_reactor_mu`; the phantom-wheel
- * window that needed a fused lock in the inline design cannot arise. */
+ * Lock order: `kai_reactor_mu` (wheel + waiter lists + parked_count), a slot
+ * lock (state + steal list + home_thread + wake_pending) and a mailbox lock
+ * are disjoint — every site takes exactly one, never two nested, so there is
+ * no order to get wrong. Timeout-receive is the one fiber on two structures
+ * at once (recv-waiter chain plus timer wheel): it disarms the wheel after
+ * releasing the mailbox lock, never under it. */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern pthread_mutex_t kai_reactor_mu;
 extern pthread_t       kai_reactor_thread;
