@@ -139,5 +139,6 @@ TARGET_BACKEND=native ORACLE_BACKEND=c BACKEND_PARITY_JOBS=1 \
 - **`stage2/main.kai` is a stub**, not the compiler. The compiler is the `BUNDLE_SRCS` bundle.
 - **`kai fmt` is in-place destructive** — never run it on compiler/stdlib sources; redirect output to `/tmp`.
 - **`runtime.h` has TWO copies** (`stage0/runtime.h` + `stage2/runtime.h`). A runtime prim/handler added to one must be added to BOTH; they change together.
+- **Header prerequisites are hand-declared.** Stage 1 and stage 2 compile a *generated* `.c` whose `#include "runtime.h"` make cannot see, so each rule names the header it actually binds under its own `-I` order (`stage2` → `stage2/runtime.h`, `stage1` → `stage0/runtime.h`). Adding a rule that compiles either translation unit means adding that prerequisite too, and only that one — naming a header the TU never reaches turns unrelated edits into a ~70 s `-O2` rebuild. `make test-header-deps` (tier 0) asserts both directions.
 - **mtime trap**: make decides rebuilds by timestamps, which don't survive a checkout or artifact download. After such, the binary chain may look stale; `make` rebuilds what it thinks is needed.
 - **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally and in CI (`paths-ignore`). Code paths always trigger tiers.

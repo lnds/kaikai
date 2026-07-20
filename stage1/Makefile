@@ -14,6 +14,11 @@ CPPFLAGS_CORE := -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 STAGE0  := ../stage0/kaic0
 TARGET  := kaic1
 SRC     := compiler.kai
+# The generated C emits a bare `#include "runtime.h"`, which the sole
+# `-I ../stage0` on the link line below binds to stage0/runtime.h. make
+# cannot see through the generated file, so the rule must name the header
+# or a runtime-only edit leaves a stale kaic1 in place.
+RUNTIME_H := ../stage0/runtime.h
 
 .PHONY: all clean test
 
@@ -28,7 +33,7 @@ build:
 build/stage1.c: $(SRC) $(STAGE0) | build
 	$(STAGE0) $(SRC) > $@
 
-$(TARGET): build/stage1.c
+$(TARGET): build/stage1.c $(RUNTIME_H)
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 $< -o $@ $(LDLIBS_M)
 
 # Compare stage 1's --tokens output against stage 0's (normalized to
