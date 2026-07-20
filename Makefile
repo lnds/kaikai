@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -233,6 +233,14 @@ test-mn-determinism: kaic2
 # concurrency tier (tier1-tsan.yml), not the fast tier1 path.
 test-mn-reactor-bench: kaic2
 	@bash tools/run-mn-reactor-bench.sh
+
+# M:N throughput comparison against the BEAM (issue #1207 step 5). Prints
+# the kaikai KAI_THREADS=1..16 scaling curve beside Elixir's, for the same
+# multi-actor workload. REPORTED, NEVER A GATE: wall-clock on a developer
+# box is noisy, and a perf regression should be visible without blocking
+# merges on host noise. Skips the BEAM columns when elixirc is absent.
+bench-mn-throughput: kaic2
+	@bash benchmarks/mn-throughput/run.sh
 
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
