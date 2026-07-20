@@ -10221,7 +10221,6 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
     (void) self;
     int64_t want = 0;
     if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
-    if (n) kai_decref(n);
     if (want <= 0) {
         return kai_cont_resume(k, kai_str_from_bytes("", 0));
     }
@@ -10408,7 +10407,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_read_file(void *self, KaiValue *path, Ka
 {
     (void) self;
     kai_reactor_init();
-    KaiFileReadFileArg a = { path };
+    KaiFileReadFileArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_file_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10430,13 +10429,18 @@ KAI_SCHED_FN KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
 {
     (void) self;
     kai_reactor_init();
-    KaiFileWriteFileArg a = { path, contents };
+    KaiFileWriteFileArg a = { kai_incref(path), kai_incref(contents) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
     return kai_cont_resume(k, r);
 }
 #endif
 
-/* Issue #771 Phase 1: default handlers for the five chunked `File`
+/* The `_thunk`s below reach `kai_core_*` helpers that consume their
+ * arguments, so each op arg is increfed into the `_arg` struct: the ref
+ * the call site handed over is the one the extern-handler bridge
+ * releases (see the op-argument ABI note at `kai_default_spawn_yield`).
+ *
+ * Issue #771 Phase 1: default handlers for the five chunked `File`
  * ops. Each offloads its blocking syscall to the R1 pool worker and
  * parks the fiber, identical to read_file/write_file above — regular
  * files are not epoll-pollable, so the pool is the readiness path. The
@@ -10453,7 +10457,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_open_read(void *self, KaiValue *path, Ka
 {
     (void) self;
     kai_reactor_init();
-    KaiFileOpenArg a = { path };
+    KaiFileOpenArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_read_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10471,7 +10475,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiV
 {
     (void) self;
     kai_reactor_init();
-    KaiFileReadChunkArg a = { h, max };
+    KaiFileReadChunkArg a = { kai_incref(h), kai_incref(max) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_chunk_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10487,7 +10491,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_open_write(void *self, KaiValue *path, K
 {
     (void) self;
     kai_reactor_init();
-    KaiFileOpenArg a = { path };
+    KaiFileOpenArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_write_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10505,7 +10509,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, Kai
 {
     (void) self;
     kai_reactor_init();
-    KaiFileWriteChunkArg a = { h, data };
+    KaiFileWriteChunkArg a = { kai_incref(h), kai_incref(data) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_chunk_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10522,7 +10526,7 @@ KAI_SCHED_FN KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiC
 {
     (void) self;
     kai_reactor_init();
-    KaiFileCloseArg a = { h };
+    KaiFileCloseArg a = { kai_incref(h) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_close_thunk, &a);
     return kai_cont_resume(k, r);
 }
@@ -10533,34 +10537,39 @@ KAI_SCHED_FN KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiC
  * handler* says the trivial wrapping default is installed for any
  * main row that mentions Mutable. The op signatures here mirror
  * the core's Array[T] return shape (see compiler.kai
- * builtin_mutable_decl for the divergence note from Doc B). */
+ * builtin_mutable_decl for the divergence note from Doc B).
+ *
+ * The `kai_core_*` helpers consume their arguments, so each op arg is
+ * increfed into the call: the ref the call site handed over is the one
+ * the extern-handler bridge releases (see the op-argument ABI note at
+ * `kai_default_spawn_yield`). */
 static KaiValue *kai_default_mutable_array_make(void *self, KaiValue *n,
                                                  KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_array_make(n, init));
+    return kai_cont_resume(k, kai_core_array_make(kai_incref(n), kai_incref(init)));
 }
 
 static KaiValue *kai_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_array_length(a));
+    return kai_cont_resume(k, kai_core_array_length(kai_incref(a)));
 }
 
 static KaiValue *kai_default_mutable_array_get(void *self, KaiValue *a,
                                                 KaiValue *i, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_array_get(a, i));
+    return kai_cont_resume(k, kai_core_array_get(kai_incref(a), kai_incref(i)));
 }
 
 static KaiValue *kai_default_mutable_array_set(void *self, KaiValue *a,
                                                 KaiValue *i, KaiValue *v, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_array_set(a, i, v));
+    return kai_cont_resume(k, kai_core_array_set(kai_incref(a), kai_incref(i), kai_incref(v)));
 }
 
 static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
                                                  KaiValue *n, KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_array_grow(a, n, init));
+    return kai_cont_resume(k, kai_core_array_grow(kai_incref(a), kai_incref(n), kai_incref(init)));
 }
 
 /* Issue #257: Ref[T] ops in the default Mutable handler. Each
@@ -10568,18 +10577,18 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
  * mirroring the array_* clauses above. */
 static KaiValue *kai_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_ref_make(init));
+    return kai_cont_resume(k, kai_core_ref_make(kai_incref(init)));
 }
 
 static KaiValue *kai_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_ref_get(r));
+    return kai_cont_resume(k, kai_core_ref_get(kai_incref(r)));
 }
 
 static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
                                               KaiValue *v, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_ref_set(r, v));
+    return kai_cont_resume(k, kai_core_ref_set(kai_incref(r), kai_incref(v)));
 }
 
 /* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
@@ -14451,13 +14460,16 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
  *                       alongside Cancel delivery (Phase 3).
  * cancel(fiber)       — set cancel_requested; delivery is Phase 3.
  *
- * RC contract: op handlers borrow their KaiValue* args (the call site
- * decrefs after the call per Perceus). Handlers that need to retain
- * an arg `kai_incref` before storing — same pattern the m8 v1 handlers
- * used and that `kai_core_map` documents at runtime.h:1031-1040.
- * R1 Phase 3 flipped only the 13 primitives named in CHANGELOG v0.2.0
- * step C; effect-op handlers were not touched, so the call-site / op
- * contract stayed "callee borrows".
+ * Op-argument ABI (all effects, not just Spawn): a call site hands each
+ * op argument over as an OWNED reference, and the handler entry point
+ * consumes it. For a compiler-emitted user clause that is the ordinary
+ * function-parameter discipline; for a `$extern_handler` bridge the
+ * release lives in the generated shim (`_kai_default_<eff>_<op>_shim`
+ * in the C backend, `kaix_default_<eff>_<op>` in the native one). The
+ * bodies below therefore BORROW their args and `kai_incref` whatever
+ * they retain — same pattern `kai_core_map` documents. A body that
+ * forwards to a consuming `kai_core_*` helper increfs into that call,
+ * since the shim still owes one release.
  *
  * Spec: docs/fibers-impl.md §*Yield-point list* and §*Trampoline*. */
 KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
