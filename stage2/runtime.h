@@ -17125,6 +17125,31 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
         return 1;
     }
 
+    /* ELF garbage-collects at section granularity, and the C API has no
+     * FunctionSections toggle, so stamp every defined function into its own
+     * .text.<name> section; the executable link then passes --gc-sections.
+     * Mach-O needs nothing here: LLVM emits subsections-via-symbols and the
+     * link dead-strips per atom. Unconditional so a content-addressed object
+     * never depends on the linker flag being on. */
+#if !defined(__APPLE__) && !defined(_WIN32)
+    for (LLVMValueRef fsec = LLVMGetFirstFunction((LLVMModuleRef) m); fsec;
+         fsec = LLVMGetNextFunction(fsec)) {
+        if (LLVMIsDeclaration(fsec)) continue;
+        const char *cursec = LLVMGetSection(fsec);
+        if (cursec && cursec[0]) continue;
+        size_t fnlen = 0;
+        const char *fname = LLVMGetValueName2(fsec, &fnlen);
+        if (!fname || fnlen == 0) continue;
+        char *secname = (char *) malloc(fnlen + 7);
+        if (!secname) continue;
+        memcpy(secname, ".text.", 6);
+        memcpy(secname + 6, fname, fnlen);
+        secname[fnlen + 6] = '\0';
+        LLVMSetSection(fsec, secname);
+        free(secname);
+    }
+#endif
+
     /* Atomic publish: emit to a pid-suffixed sibling, then rename() onto the
      * final path. A content-addressed object (the shared core cache) can be
      * read by a concurrent build the moment it exists, so it must never be
