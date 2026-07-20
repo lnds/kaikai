@@ -1,0 +1,67 @@
+# Regression: releasing a fiber wrapper must never munmap a stack that is
+# still being run on.
+#
+# kai_free_value's KAI_FIBER branch decides between deferring the struct/stack
+# free and releasing it immediately by asking whether the dying wrapper belongs
+# to the fiber currently executing. Under M:N "not the current fiber" is only
+# safe because the scheduler holds its own ref on the wrapper from spawn until
+# the trampoline tail has left the stack; if that ref is ever dropped early the
+# else branch releases a live stack.
+#
+# This fixture maximises the shape: eight parent fibers, each running waves of
+# short-lived children whose lifetimes differ by an order of magnitude, half
+# with their handles kept alive in a list past the child's death and half
+# discarded at spawn. The last ref therefore drops on a parent's thread while
+# other children are dying on other threads. The total is fixed, so the output
+# is byte-identical at KAI_THREADS=1, 4 and 8 and a released live stack shows
+# up as a crash or a wrong total.
+
+import spawn
+import time
+
+fn burn(n: Int, acc: Int) : Int =
+  if n <= 0 { acc } else { burn(n - 1, acc + (n % 7)) }
+
+# Lifetimes spread over two orders of magnitude so a death on one thread lands
+# inside another thread's handle drop rather than always after it.
+fn child(i: Int) : Int = {
+  burn(120 * (i % 17), 0)
+  1
+}
+
+fn sum_list(xs: [Int], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> sum_list(rest, acc + x)
+}
+
+fn range_from(n: Int, acc: [Int]) : [Int] =
+  if n <= 0 { acc } else { range_from(n - 1, [n, ...acc]) }
+
+# One wave: `k` children whose handles stay alive in `fs` across every child's
+# death, plus `k` whose handles are discarded at spawn and whose wrappers are
+# released by the nursery join walk on whatever thread owns the scope.
+fn wave(k: Int) : Int / Spawn + Clock = {
+  nursery { nur ->
+    let ids = range_from(k, [])
+    let fs  = ids | (i => nur.spawn(() => child(i)))
+    let _   = ids | (i => { let _ = nur.spawn(() => child(i + 7)); 0 })
+    # Park before dropping anything: the scope resumes on whichever thread
+    # steals it, so every handle release below lands on a thread other than
+    # the one each child was spawned and died on.
+    sleep(millis(1))
+    sum_list(fs | (f => nur.await(f)), 0) + k
+  }
+}
+
+fn waves(n: Int, k: Int, acc: Int) : Int / Spawn + Clock =
+  if n <= 0 { acc } else { waves(n - 1, k, acc + wave(k)) }
+
+fn main() : Int / Spawn + Clock + Stdout = {
+  let total = nursery { nur ->
+    let ps = [1, 2, 3, 4, 5, 6, 7, 8]
+      | (i => { let _ = i; nur.spawn(() => waves(6, 10, 0)) })
+    sum_list(ps | (f => nur.await(f)), 0)
+  }
+  Stdout.print("fiber free race total: #{int_to_string(total)}")
+  0
+}

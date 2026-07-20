@@ -44,6 +44,9 @@ FIXTURES=(
   # thread while the reactor owns it — unsynchronized, that strands a sleeper
   # (hang) or corrupts the parked count.
   "examples/effects/mn_recv_timeout_wheel.kai"
+  # Fiber wrappers dropping to RC=0 on a thread other than the one each fiber
+  # ran on: the free path must not release a stack that is still live.
+  "examples/effects/mn_fiber_free_race.kai"
 )
 
 if [ "$KAI_TIMEOUT_KIND" = none ]; then
