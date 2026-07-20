@@ -60,7 +60,7 @@ fi
 classify_run() {
   local ec=0 got
   got="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$1" "$BIN" 2>"$TMP/run.err")" || ec=$?
-  if   [ "$ec" = 124 ];           then BUCKET=hang
+  if   [ "$ec" = 124 ] || [ "$ec" = 137 ]; then BUCKET=hang
   elif [ "$ec" != 0 ];            then BUCKET=crash; : "${WITNESS:=$(head -1 "$TMP/run.err")}"
   elif [ "$got" != "$expected" ]; then BUCKET=bad;   : "${WITNESS:=got '$got'}"
   else                                 BUCKET=ok

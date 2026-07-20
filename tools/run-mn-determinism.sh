@@ -69,7 +69,7 @@ for src in "${FIXTURES[@]}"; do
     for _ in $(seq 1 "$REPEATS"); do
       ec=0
       got="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" "$bin" 2>"$TMP/run.err")" || ec=$?
-      if [ "$ec" = 124 ]; then
+      if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
         hang=$((hang+1))
       elif [ "$ec" != 0 ]; then
         crash=$((crash+1))
