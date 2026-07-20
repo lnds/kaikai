@@ -1,0 +1,68 @@
+# Multi-actor CPU throughput load for the M:N scheduler.
+#
+# `workers` actor fibers each grind a pure tail-recursive sum with no
+# yield point inside, then send the partial to the collector, which adds
+# them. One grind call therefore pins its scheduler thread for the whole
+# burst: at KAI_THREADS=1 the workers run one after another, at N>1 the
+# work-stealing scheduler spreads them across OS threads.
+#
+# The total depends only on (workers, load), never on KAI_THREADS. A
+# differing total means the runtime lost or duplicated work, and the
+# wall-clock printed beside it measures nothing.
+#
+# Usage: mn_throughput [workers] [load]
+
+import spawn
+import actor
+import time
+import os.args
+
+type Params = { workers: Int, load: Int }
+
+# Pure and tail-recursive, with no effect op in the loop: nothing here
+# reaches a suspend point, so the burst never yields its thread.
+fn grind(i: Int, acc: Int) : Int =
+  if i <= 0 { acc }
+  else { grind(i - 1, acc + (i % 7)) }
+
+fn worker(parent: Pid[Int], load: Int) : Unit / Actor[Int] + Spawn = {
+  let partial = grind(load, 0)
+  Actor.send(parent, partial)
+}
+
+fn spawn_workers(parent: Pid[Int], n: Int, load: Int) : Unit / Spawn + Actor[Int] =
+  if n <= 0 { () }
+  else {
+    let _ = spawn_actor(() => worker(parent, load))
+    spawn_workers(parent, n - 1, load)
+  }
+
+fn collect(remaining: Int, acc: Int) : Int / Actor[Int] =
+  if remaining <= 0 { acc }
+  else { collect(remaining - 1, acc + Actor.receive()) }
+
+fn run(p: Params) : Int / Spawn + Actor[Int] = {
+  let me = Actor.self()
+  spawn_workers(me, p.workers, p.load)
+  collect(p.workers, 0)
+}
+
+fn positive_or(raw: String, fallback: Int) : Int = match string.to_int(raw) {
+  Some(n) -> if n > 0 { n } else { fallback }
+  None    -> fallback
+}
+
+fn parse_params(av: [String]) : Params = match av {
+  [w, l, ..._] -> Params { workers: positive_or(w, 16), load: positive_or(l, 100000000) }
+  [w]          -> Params { workers: positive_or(w, 16), load: 100000000 }
+  []           -> Params { workers: 16, load: 100000000 }
+}
+
+fn main() : Int / Spawn + Clock + Stdout + Env = {
+  let p = parse_params(args.argv())
+  let start = monotonic()
+  let total = with_mailbox { run(p) }
+  let elapsed = instant_to_nanos(monotonic()) - instant_to_nanos(start)
+  println("workers=#{int_to_string(p.workers)} load=#{int_to_string(p.load)} total=#{int_to_string(total)} elapsed_ns=#{int_to_string(elapsed)}")
+  0
+}
