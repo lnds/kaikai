@@ -1135,8 +1135,10 @@ test-mn-native-soundness: $(TARGET)
 
 # C-backend soundness under clang (issue #1238). The native gate above runs
 # --backend=native only; this one builds the same stress fixture on the C
-# backend (single-TU + KAI_MODULAR) with CC=clang, the config the native gate
-# never covers. Self-skips on a clang-less host. Loops KAI_THREADS=4/8.
+# backend with CC=clang — both `bin/kai` link shapes (single-TU + KAI_MODULAR)
+# plus a raw single-TU -O2 build with no scheduler owner object, the shape
+# these recipes themselves use. Self-skips on a clang-less host. Loops
+# KAI_THREADS=4/8.
 test-mn-c-clang-soundness: $(TARGET)
 	@../tools/run-mn-c-clang-soundness.sh $(MN_SOUNDNESS_ITERS)
 
