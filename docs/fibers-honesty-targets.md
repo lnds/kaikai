@@ -110,7 +110,7 @@ The two bugs a curious visitor hits in five minutes:
 | Item | Cost | Why |
 |---|---:|---|
 | ~~**R4 — fiber-discard deadlock**~~ ✅ shipped 2026-04-29 | ~0.5d | First thing anyone tries (`let _ = fiber_spawn(…)`); fixed via scheduler-side fiber RC discipline |
-| ~~**Stack guard pages**~~ ✅ shipped 2026-04-29 | ~0.5d | Overflow now hits a `PROT_NONE` page; handler prints `kai: fiber stack overflow at <ptr>` and re-raises (`m8_fiber_stack_overflow.kai`) |
+| ~~**Stack guard pages**~~ ✅ shipped 2026-04-29 | ~0.5d | Overflow now hits a `PROT_NONE` page; handler prints `kai: fiber stack overflow at <ptr>` and re-raises (`m8_fiber_stack_overflow.kai`). Holds on any scheduler thread: each installs its own `sigaltstack`, gated at `KAI_THREADS` 1/4/8/16 |
 
 **Tier 1 closed 2026-04-29.** The two bugs that *would*  show up in a
 30-minute live demo on unfamiliar code are both addressed. Everything
