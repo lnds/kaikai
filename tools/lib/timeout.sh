@@ -10,10 +10,16 @@
 #
 #   kai_timeout <seconds> <cmd> [args...]
 #
-# Exit status: 124 if the deadline fired, otherwise the command's own status
-# (128+N when it died on signal N). The child is killed with SIGKILL, not
-# SIGTERM: a fiber runtime wedged in a scheduler loop may never reach a
-# handler, and this shim is used to prove termination.
+# Exit status: 124 if the deadline fired, 137 if the child had to be killed
+# with SIGKILL, otherwise the command's own status (128+N when it died on
+# signal N).
+#
+# The deadline sends SIGTERM and escalates to SIGKILL after a 2s grace, so a
+# fiber runtime wedged in a scheduler loop still cannot outlive it. `-s KILL`
+# is simpler but coreutils reports 137 for ANY SIGKILLed child, which makes
+# 124 unreachable and collapses "deadline fired" into "had to be killed" —
+# including a kill from elsewhere, e.g. the OOM killer. The perl fallback has
+# no escalation phase: it kills outright and always reports 124.
 #
 # KAI_TIMEOUT_KIND names the backing implementation (gnu|gtimeout|perl|none)
 # so a caller can report degraded coverage instead of silently mismeasuring.
@@ -46,8 +52,8 @@ exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
 kai_timeout() {
   local secs="$1"; shift
   case "$KAI_TIMEOUT_KIND" in
-    gnu)      timeout -s KILL "$secs" "$@" ;;
-    gtimeout) gtimeout -s KILL "$secs" "$@" ;;
+    gnu)      timeout -k 2 "$secs" "$@" ;;
+    gtimeout) gtimeout -k 2 "$secs" "$@" ;;
     perl)     perl -e "$_KAI_TIMEOUT_PERL" "$secs" "$@" ;;
     *)        "$@" ;;
   esac
