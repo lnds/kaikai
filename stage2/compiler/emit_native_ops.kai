@@ -565,15 +565,28 @@ fn nemit_raw_fcmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = ma
   _ -> { nemit_unsupported(ctx, "raw fcmp arity"); nemit_null(ctx) }
 }
 
+# A divisor whose value makes both `sdiv`/`srem` traps statically
+# impossible: a literal that is neither `0` (divide by zero) nor `-1`
+# (the `INT64_MIN / -1` overflow). Anything else — including a
+# non-literal — must keep the checked helper.
+fn ndiv_trapless(b: KVal) : Bool = match b {
+  KIntV(n) -> n != 0 and n != -1
+  _        -> false
+}
+
 # `<op>(a, b)` raw `i64` arithmetic. `+`/`-`/`*` (op 0/1/2) are one wrapping
-# `ibinop` instruction (NO nsw/nuw); `/`/`%` (op 3/4) call the checked helper
+# `ibinop` instruction (NO nsw/nuw). `/`/`%` (op 3/4) call the checked helper
 # `kai_idiv_chk`/`kai_imod_chk` so a zero divisor or INT64_MIN/-1 traps clean
-# instead of running the UB `sdiv`/`srem` would. Both atoms load raw at
-# `SInt64`. No RC: a raw `i64` has no refcount, so a multi-use Int operand
-# never double-frees (the `let`-binder family's bug, here for arith).
+# instead of running the UB `sdiv`/`srem` would — EXCEPT against a trapless
+# literal divisor, where neither trap can fire and the direct `sdiv`/`srem`
+# lets LLVM strength-reduce it to multiply-shift. The helper is an opaque
+# external call here (the C backend gets it inlined by `cc`), so keeping it
+# in a hot loop costs a call per iteration. Both atoms load raw at `SInt64`.
+# No RC: a raw `i64` has no refcount, so a multi-use Int operand never
+# double-frees (the `let`-binder family's bug, here for arith).
 fn nemit_raw_ibinop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
   [a, b] ->
-    if op == 3 or op == 4 {
+    if (op == 3 or op == 4) and not ndiv_trapless(b) {
       let sym = if op == 3 { "kaix_idiv_chk" } else { "kaix_imod_chk" }
       let i64t = native_ctx_i64t(ctx)
       ncall_sig2(ctx, sym, i64t, i64t, i64t, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
