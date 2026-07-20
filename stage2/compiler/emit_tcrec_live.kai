@@ -25,6 +25,7 @@ import compiler.ast
 import compiler.util
 import compiler.fnreg
 import compiler.modules
+import compiler.emit_shared
 
 #[doc("Ledger entry for an owned-scrutinee C alias `cvar`.")]
 pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
@@ -32,10 +33,13 @@ pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
 #[doc("True when a ledger entry names a scrutinee alias (never filtered).")]
 pub fn tcl_is_scr(e: String) : Bool = string_starts_with_q(e, "@scr:")
 
+#[doc("The bare name a ledger entry releases: the scrutinee register, or the binder name.")]
+pub fn tcl_reg(e: String) : String =
+  if tcl_is_scr(e) { string_slice(e, 5, string_length(e) - 5) } else { e }
+
 #[doc("The C lvalue a ledger entry releases: the alias itself, or `kai_<binder>`.")]
 pub fn tcl_cname(e: String) : String =
-  if tcl_is_scr(e) { string_slice(e, 5, string_length(e) - 5) }
-  else { cat2("kai_", e) }
+  if tcl_is_scr(e) { tcl_reg(e) } else { cat2("kai_", e) }
 
 #[doc("Number of scrutinee-alias entries in the ledger — the next alias suffix.")]
 pub fn tcl_scr_count(pend: [String]) : Int = tcl_scr_count_loop(pend, 0)
@@ -88,19 +92,19 @@ fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
 }
 
 #[doc("""
-Release statements for the goto site: every scrutinee alias, plus every
-binder entry the tail-call arguments do not themselves consume.
+Ledger entries the goto site must release: every scrutinee entry, plus
+every binder entry the tail-call arguments do not themselves consume.
 """)]
-pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String = match pend {
-  [] -> ""
-  [p, ...rest] -> {
-    let here =
-      if tcl_is_scr(p) or not tcl_args_consume(args, p) {
-        concat_all(["kai_decref(", tcl_cname(p), "); "])
-      } else { "" }
-    cat2(here, tcl_goto_drops(rest, args))
-  }
+pub fn tcl_goto_entries(pend: [String], args: [Expr]) : [String] = match pend {
+  [] -> []
+  [p, ...rest] ->
+    if tcl_is_scr(p) or not tcl_args_consume(args, p) { [p, ...tcl_goto_entries(rest, args)] }
+    else { tcl_goto_entries(rest, args) }
 }
+
+#[doc("C release statements for the goto site, one per `tcl_goto_entries` entry.")]
+pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String =
+  concat_all(map(tcl_goto_entries(pend, args), (p) => concat_all(["kai_decref(", tcl_cname(p), "); "])))
 
 fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
   [] -> false
@@ -228,3 +232,68 @@ fn tcl_contains_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bo
   if i + nn > hn { false }
   else if string_slice(hay, i, nn) == needle { true }
   else { tcl_contains_loop(hay, needle, i + 1, hn, nn) }
+
+#[doc("""
+True when `body` contains a tcrec/TRMC goto sentinel anywhere — the gate
+for seeding the ledger on an arm body. Recurses into every sub-expression,
+not just tail position, matching the C emitter's goto-label recogniser.
+""")]
+pub fn tcl_has_goto(body: Expr) : Bool = tcl_goto_scan_kind(body.kind)
+
+fn tcl_goto_scan_kind(k: ExprKind) : Bool = match k {
+  ECall(f, xs) -> match f.kind {
+    EVar(callee) ->
+      if es_tcrec_is_sentinel(callee) { true }
+      else if es_trmc_is_step_sentinel(callee) { true }
+      else { tcl_goto_scan_exprs(xs) }
+    _ -> if tcl_has_goto(f) { true } else { tcl_goto_scan_exprs(xs) }
+  }
+  EIf(c, t, opt_e) ->
+    if tcl_has_goto(c) { true }
+    else if tcl_has_goto(t) { true }
+    else { match opt_e { None -> false Some(e2) -> tcl_has_goto(e2) } }
+  EMatch(s, arms) -> if tcl_has_goto(s) { true } else { tcl_goto_scan_arms(arms) }
+  EBlock(stmts, opt_tail) ->
+    if tcl_goto_scan_stmts(stmts) { true }
+    else { match opt_tail { None -> false Some(e) -> tcl_has_goto(e) } }
+  EBinop(_, l, r) -> if tcl_has_goto(l) { true } else { tcl_has_goto(r) }
+  EUnop(_, x) -> tcl_has_goto(x)
+  EField(x, _) -> tcl_has_goto(x)
+  EIndex(x, i) -> if tcl_has_goto(x) { true } else { tcl_has_goto(i) }
+  EPipe(l, r) -> if tcl_has_goto(l) { true } else { tcl_has_goto(r) }
+  EMapPipe(l, r) -> if tcl_has_goto(l) { true } else { tcl_has_goto(r) }
+  EFlatMapPipe(l, r) -> if tcl_has_goto(l) { true } else { tcl_has_goto(r) }
+  EFilterPipe(l, r) -> if tcl_has_goto(l) { true } else { tcl_has_goto(r) }
+  _ -> false
+}
+
+fn tcl_goto_scan_exprs(es: [Expr]) : Bool = match es {
+  [] -> false
+  [h, ...rest] -> if tcl_has_goto(h) { true } else { tcl_goto_scan_exprs(rest) }
+}
+
+fn tcl_goto_scan_arms(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(_, _, body), ...rest] ->
+    if tcl_has_goto(body) { true } else { tcl_goto_scan_arms(rest) }
+}
+
+fn tcl_goto_scan_stmts(stmts: [Stmt]) : Bool = match stmts {
+  [] -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e) -> tcl_has_goto(e)
+      SVar(_, _, e, _, _) -> tcl_has_goto(e)
+      SAssert(c, opt_m) ->
+        if tcl_has_goto(c) { true }
+        else { match opt_m { None -> false Some(m) -> tcl_has_goto(m) } }
+      SExprStmt(e) -> tcl_has_goto(e)
+      SIndexAssign(b, i, v, _, _) ->
+        if tcl_has_goto(b) { true }
+        else if tcl_has_goto(i) { true }
+        else { tcl_has_goto(v) }
+      SUse(_, _, _) -> false
+    }
+    if here { true } else { tcl_goto_scan_stmts(rest) }
+  }
+}
