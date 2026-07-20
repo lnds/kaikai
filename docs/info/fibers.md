@@ -100,14 +100,19 @@ semantics*).
 ## Parallelism — `KAI_THREADS`
 
 Fibers and actors run in parallel across N OS threads with a
-work-stealing scheduler. Opt-in at runtime, no code changes:
+work-stealing scheduler. On by default, no code changes — set
+`KAI_THREADS` only to override:
 
 ```sh
+./my_program              # N = host CPU count (capped at 32)
 KAI_THREADS=8 ./my_program
+KAI_THREADS=1 ./my_program
 ```
 
-- `KAI_THREADS=1` (the default) is byte-identical to the cooperative
-  single-thread scheduler.
+- `KAI_THREADS=1` is byte-identical to the cooperative single-thread
+  scheduler — the escape hatch when you want one.
+- Output that depends on the *order* independent fibers interleave is
+  not stable above one thread; only causally ordered output is.
 - Semantics are unchanged at any N: messages crossing a thread
   boundary are physically copied (same-thread sends still transfer
   ownership), each actor's mailbox is processed serially, and
