@@ -3017,6 +3017,12 @@ static void kai_active_fiber_anchor(void) {
     if (kai_active_fiber == NULL) kai_active_fiber = &kai_main_fiber;
 }
 
+/* Every read of the active fiber goes through here, never through a bare
+ * `kai_active_fiber`. A bare read inlined into a frame that spans a park lets
+ * the compiler resolve the TLS slot address once and spill it across the swap;
+ * a work-stolen fiber then resumes reading the parking thread's slot and gets
+ * some other thread's active fiber. Out of line the slot is re-resolved on
+ * whatever thread now runs. */
 __attribute__((noinline))
 static KaiFiber *kai_current_fiber(void) {
     kai_active_fiber_anchor();
@@ -13894,7 +13900,7 @@ static void kai_worker_loop(void) {
  * swaps to the head of the queue. No-op if the queue is empty (caller
  * is the only ready fiber, nothing to switch to). */
 static void kai_sched_yield(void) {
-    KaiFiber *current = kai_active_fiber;
+    KaiFiber *current = kai_current_fiber();
 
     /* M:N: never enqueue `current` on the steal list before its ctx is
      * saved — a thief could resume a half-written context. Defer the
@@ -13953,7 +13959,7 @@ static void kai_drain_requeue_stack(void) {
  * `ready queue empty AND reactor empty` — only that combination
  * means no path to forward progress. */
 static void kai_sched_park(void) {
-    KaiFiber *current = kai_active_fiber;
+    KaiFiber *current = kai_current_fiber();
 
     /* M:N path: a parking fiber returns to this thread's scheduler loop
      * (kai_main_fiber) — never runs poll() or a condvar wait on its own
@@ -14549,7 +14555,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiC
     int f_hl = 0;
     if (kai_nthreads > 1) f_hl = kai_fiber_slot_lock(f);
     int terminal = (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED);
-    KaiFiber *me = kai_active_fiber;
+    KaiFiber *me = kai_current_fiber();
     if (!terminal) {
         me->awaiters_next = f->awaiters_head;
         f->awaiters_head  = me;
@@ -14616,7 +14622,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     int head_hl = 0;
     if (kai_nthreads > 1) head_hl = kai_fiber_slot_lock(head);
     int head_done = (head->state == KAI_FIBER_DONE);
-    KaiFiber *me = kai_active_fiber;
+    KaiFiber *me = kai_current_fiber();
     if (!head_done) {
         me->awaiters_next = head->awaiters_head;
         head->awaiters_head = me;
@@ -14774,7 +14780,7 @@ static void kai_nursery_join_child(KaiFiber *child) {
     int child_hl = 0;
     if (kai_nthreads > 1) child_hl = kai_fiber_slot_lock(child);
     int terminal = (child->state == KAI_FIBER_DONE || child->state == KAI_FIBER_CANCELLED);
-    KaiFiber *me = kai_active_fiber;
+    KaiFiber *me = kai_current_fiber();
     if (!terminal) {
         me->awaiters_next  = child->awaiters_head;
         child->awaiters_head = me;
@@ -15046,7 +15052,7 @@ static int kai_fiber_has_trap_exit_link(KaiFiber *f) {
  * trap-exit'd link still dispatches through user handlers as before,
  * preserving the cleanup-on-cancel idiom for non-supervised work. */
 static void kai_check_trap_exit_cancel_bypass(void) {
-    KaiFiber *f = kai_active_fiber;
+    KaiFiber *f = kai_current_fiber();
     if (!f || !f->cancel_pad_set) return;
     if (!kai_fiber_has_trap_exit_link(f)) return;
     f->cancel_delivered = 1;
