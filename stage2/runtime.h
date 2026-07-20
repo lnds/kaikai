@@ -14199,15 +14199,20 @@ static void kai_fiber_trampoline(void) {
     /* M:N — a finished fiber with no local successor returns to this
      * thread's scheduler loop (kai_main_fiber), which steals or idles.
      * We setcontext explicitly so the loop resumes at its swap point
-     * rather than falling off the end into the uc_link landing. */
+     * rather than falling off the end into the uc_link landing.
+     *
+     * Both handoffs write kai_active_fiber out of line. This frame spans the
+     * fiber's whole body, so an inline store reuses the slot address resolved
+     * in the prologue — on the thread that first dispatched the fiber, not the
+     * one the tail runs on after a steal. */
     if (kai_nthreads > 1) {
         KaiFiber *next = kai_sched_dequeue();
         if (next) {
             next->state = KAI_FIBER_RUNNING;
-            kai_active_fiber = next;
+            kai_set_active_fiber(next);
             setcontext(&next->ctx);
         }
-        kai_active_fiber = &kai_main_fiber;
+        kai_set_active_fiber(&kai_main_fiber);
         setcontext(&kai_main_fiber.ctx);
         /* setcontext does not return. */
     }
@@ -14271,9 +14276,11 @@ static void kai_bootstrap_trampoline(void) {
      * via its self-pipe. */
     kai_sched_shutting_down = 1;
     kai_sched_wake_thread(KAI_REACTOR_OWNER_THREAD);
-    /* Hand back to thread 0's scheduler loop, which sees the shutdown
-     * flag and returns to kai_sched_bootstrap. */
-    kai_active_fiber = &kai_main_fiber;
+    /* Hand back to this thread's scheduler loop, which sees the shutdown
+     * flag and returns to kai_sched_bootstrap. Out of line: this frame spans
+     * the whole user main, so an inline store would reuse the slot address
+     * resolved before main ever parked. */
+    kai_set_active_fiber(&kai_main_fiber);
     setcontext(&kai_main_fiber.ctx);
 }
 #if defined(__APPLE__) || defined(__clang__)

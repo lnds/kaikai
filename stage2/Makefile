@@ -1124,6 +1124,12 @@ ifeq ($(KAI_LLVM),1)
 # KAI_THREADS=4 and 8 — a sound runtime crashes 0 times every run. Self-skips on
 # a C-only kaic2. Rides tier1-native (needs the libLLVM native backend).
 MN_SOUNDNESS_ITERS ?= 40
+
+# Repeats for the trampoline-tail identity fixture inside test-effects. The
+# window is narrow (~1 run in 4 unfixed) and each run costs a few ms, so the
+# count buys a decisive signal for free.
+MN_TAIL_STEAL_ITERS ?= 40
+
 test-mn-native-soundness: $(TARGET)
 	@../tools/run-mn-native-soundness.sh $(MN_SOUNDNESS_ITERS)
 
@@ -3223,6 +3229,23 @@ test-effects: $(TARGET) build
 	  diff -u $$exp_out build/s2-$$name.out \
 	    && echo "effects OK $$name (R4: fiber-discard does not deadlock)" \
 	    || { echo "effects FAIL $$name (output diff)"; exit 1; }; \
+	done; \
+	for f in ../examples/effects/mn_trampoline_tail_steal.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/effects/$$name.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  bad=0; \
+	  for r in $$(seq 1 $(MN_TAIL_STEAL_ITERS)); do \
+	    KAI_THREADS=8 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	      || { bad=$$((bad+1)); continue; }; \
+	    cmp -s $$exp_out build/s2-$$name.out || bad=$$((bad+1)); \
+	  done; \
+	  test "$$bad" = 0 \
+	    && echo "effects OK $$name (trampoline tail keeps fiber identity across a steal: $(MN_TAIL_STEAL_ITERS)/$(MN_TAIL_STEAL_ITERS) clean at KAI_THREADS=8)" \
+	    || { echo "effects FAIL $$name ($$bad of $(MN_TAIL_STEAL_ITERS) bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_fiber_stack_overflow.kai; do \
 	  name=$$(basename $$f .kai); \
