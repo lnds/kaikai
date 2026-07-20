@@ -2187,11 +2187,13 @@ fn builtins_doc_loop(rels: [String], paths: [String],
 # core module deserialises from its blob instead of being re-lexed and
 # re-parsed. When the cache is off the default path is byte-for-byte
 # unchanged: it goes through `load_core_files` with no cache lookup.
-fn load_core(cache_dir: String)
+# `stats` prints the per-layer hit/miss line for this (parse) layer.
+fn load_core(cache_dir: String, stats: Bool)
              : Option[CoresLoaded] / Console + File =
   if cache_dir != "" {
-    load_core_cached(core_module_paths(), cache_dir, [], [], [])
+    load_core_cached(core_module_paths(), cache_dir, stats, 0, 0, [], [], [])
   } else {
+    let _s = if stats { eprint("kaic2: core-parse-cache: off") } else { () }
     load_core_files(core_module_paths(), [], [], [], [])
   }
 
@@ -2204,6 +2206,10 @@ fn core_cache_dir_for(opts: CliOptions, target: String) : String =
     concat_all([dir_of(target), "/", uc_cache_dir_name()])
   } else { "" }
 
+# A core module loaded through the cache, tagged with whether the blob
+# hit (true: deserialised, lex+parse skipped) or the source was parsed.
+type CoreCacheLoaded = CclLoaded(CoreLoaded, Bool)
+
 # The cached core loader. Per module: read the source, try the
 # post-parse cache (cc_lookup), and on a hit reconstruct the
 # ModuleEntry from the deserialised decls - exactly as
@@ -2213,19 +2219,30 @@ fn core_cache_dir_for(opts: CliOptions, target: String) : String =
 # accumulators mirror load_core_files so the PLS return shape and the
 # downstream cascade are identical to the non-cached path.
 fn load_core_cached(paths: [String], cache_dir: String,
+                    stats: Bool, n_hit: Int, n_miss: Int,
                     acc_decls: [Decl], acc_mods: [ModuleEntry],
                     acc_segs: [CoreSegment])
                     : Option[CoresLoaded] / Console + File = match paths {
-  [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
+  [] -> {
+    let _s = if stats {
+      if n_miss == 0 { eprint("kaic2: core-parse-cache: hit (#{n_hit} modules)") }
+      else { eprint("kaic2: core-parse-cache: miss (parsed #{n_miss} of #{n_hit + n_miss} modules)") }
+    } else { () }
+    Some(PLS(acc_decls, acc_mods, acc_segs))
+  }
   [p, ...rest] -> match load_core_module(p, cache_dir) {
     None -> None
-    Some(pl) -> match pl {
-      PL(ds, me) -> {
-        let mod_name = match me { ME(m, _, _, _) -> m }
-        load_core_cached(rest, cache_dir,
-                          list_append(acc_decls, ds),
-                          list_append(acc_mods, [me]),
-                          list_append(acc_segs, [PSeg(mod_name, ds)]))
+    Some(cl) -> match cl {
+      CclLoaded(pl, was_hit) -> match pl {
+        PL(ds, me) -> {
+          let mod_name = match me { ME(m, _, _, _) -> m }
+          let n_hit1 = if was_hit { n_hit + 1 } else { n_hit }
+          let n_miss1 = if was_hit { n_miss } else { n_miss + 1 }
+          load_core_cached(rest, cache_dir, stats, n_hit1, n_miss1,
+                            list_append(acc_decls, ds),
+                            list_append(acc_mods, [me]),
+                            list_append(acc_segs, [PSeg(mod_name, ds)]))
+        }
       }
     }
   }
@@ -2240,7 +2257,7 @@ fn load_core_cached(paths: [String], cache_dir: String,
 # load_core_file's post-parse output), so the merged stream - and the C
 # the cascade+typer emit from it - is byte-identical warm vs cold.
 fn load_core_module(path: String, cache_dir: String)
-                    : Option[CoreLoaded] / Console + File =
+                    : Option[CoreCacheLoaded] / Console + File =
   match read_file(path) {
     Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
     Ok(src) -> match cc_lookup(cache_dir, src) {
@@ -2251,14 +2268,14 @@ fn load_core_module(path: String, cache_dir: String)
         let mod_name = core_module_name(path)
         let exports = collect_pub_exports(decls, [])
         let unstable_exports = collect_unstable_exports(decls, [])
-        Some(PL(decls, ME(mod_name, exports, path, unstable_exports)))
+        Some(CclLoaded(PL(decls, ME(mod_name, exports, path, unstable_exports)), true))
       }
       CcMiss(content_hex) -> match load_core_file(path) {
         None -> None
         Some(pl) -> match pl {
           PL(ds, _) -> {
             let _w = cc_write(cache_dir, content_hex, ds)
-            Some(pl)
+            Some(CclLoaded(pl, false))
           }
         }
       }
@@ -5227,7 +5244,7 @@ fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
       match entries {
         [] -> 0
         [BE(first_in, _), ..._] ->
-          match load_core(core_cache_dir_for(opts, first_in)) {
+          match load_core(core_cache_dir_for(opts, first_in), opts.core_cache.stats) {
             None -> 1
             Some(pls) -> match pls {
               PLS(pds, pmods, psegs) ->
@@ -5298,7 +5315,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
         # The core cache directory comes from `--core-cache-dir`
         # (shared, bin/kai-resolved) or the legacy per-project
         # `.kai-cache` under `--user-cache`.
-        let core_loaded = load_core(core_cache_dir_for(opts, p))
+        let core_loaded = load_core(core_cache_dir_for(opts, p), opts.core_cache.stats)
         match core_loaded {
           None -> 1
           Some(pls) -> match pls {
