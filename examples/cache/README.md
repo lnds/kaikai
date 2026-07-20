@@ -97,3 +97,22 @@ Run alone with:
 
     make -C stage2 test-core-cache
     # or: for f in examples/cache/corec_*.sh; do sh "$f" || exit 1; done
+
+## Core emit-cache fixtures (`emitc_*.sh`)
+
+Pin the contract of the **emitted-C core TU cache**
+(`<core-cache-dir>/core-emit-<key>.kct`, written by
+`stage2/compiler/emit_cache.kai`): on the c-modular backend a warm
+entry splices the 13 core TU bodies into the marker stream instead of
+re-emitting them. The key covers the core sources, the toolchain id,
+the edition, and the program's name-level surface (types, impls,
+protocols, effects, units, fn name/arity), so a body-only edit hits
+while any surface change misses safely.
+
+- `emitc_cold_warm_identical.sh` — the load-bearing positive gate:
+  stream byte-identical across no-cache (oracle), cold, and warm
+  builds of a program using generics + a protocol impl + a user
+  effect + units; a different toolchain id misses; a body-only edit
+  hits; adding an impl misses; a `--test` build skips the cache.
+
+Both families run under `make -C stage2 test-core-cache`.

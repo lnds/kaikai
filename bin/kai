@@ -198,6 +198,49 @@ unset _cf _cf_prev _cf_keep
 # the -O2 hot bitcode inlined into the program object, which this does not touch.
 KAI_RUNTIME_OWNER_OPT="-O0"
 
+# Shared core cache: two content-keyed layers inside a toolchain-scoped
+# directory — post-parse core blobs (KAB2) and emitted-C core TU bodies
+# (KCT1). The directory embeds the toolchain id (kaic2 mtime+size), so a
+# rebuilt compiler never reads another build's entries; entries are
+# additionally content-addressed, so a stale hit is impossible. The first
+# build populates the cache; every later build skips the core re-parse
+# (and, on the c-modular path, the core re-emit). KAI_CORE_CACHE=0
+# disables; KAI_CORE_CACHE_DIR overrides the root; KAI_CORE_CACHE_STATS=1
+# prints per-layer hit/miss lines.
+resolve_core_cache_root() {
+  if [ -n "${KAI_CORE_CACHE_DIR:-}" ]; then
+    printf '%s' "$KAI_CORE_CACHE_DIR"
+    return
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/core' "$XDG_CACHE_HOME"
+    return
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/core' "$HOME" ;;
+    *)      printf '%s/.cache/kai/core' "$HOME" ;;
+  esac
+}
+
+kaic2_toolchain_id() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%m-%z' "$KAIC2" 2>/dev/null ;;
+    *)      stat -c '%Y-%s' "$KAIC2" 2>/dev/null ;;
+  esac
+}
+
+core_cache_flags=""
+if [ "${KAI_CORE_CACHE:-1}" != "0" ]; then
+  _cc_tid="$(kaic2_toolchain_id || true)"
+  if [ -n "$_cc_tid" ]; then
+    _cc_dir="$(resolve_core_cache_root)/$_cc_tid"
+    if mkdir -p "$_cc_dir" 2>/dev/null; then
+      core_cache_flags="--core-cache-dir $_cc_dir --toolchain-id $_cc_tid"
+      [ "${KAI_CORE_CACHE_STATS:-0}" = "1" ] && core_cache_flags="$core_cache_flags --core-cache-stats"
+    fi
+  fi
+fi
+
 # Resolve the runtime shim the in-process libLLVM `native` backend links
 # against (stage0/runtime_llvm.c holds the `kaix_prelude_*` forwarders the
 # native object calls). Dev checkout lives next to the C runtime under
@@ -1433,7 +1476,7 @@ compile_to_binary() {
     cp "$src" "$nm_dir/$src_base"
     nmerr="$tmp/native-modular.err"
     # shellcheck disable=SC2086
-    if (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_INLINE_BC="$nm_inline_bc_env" "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr" \
+    if (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_INLINE_BC="$nm_inline_bc_env" "$KAIC2" --emit=native-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr" \
        && [ -s "$tmp/native-modular.objs" ]; then
       nm_ldstack=""
       [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
@@ -1509,7 +1552,7 @@ compile_to_binary() {
     dbg_src="$src"
     case "$dbg_src" in /*) ;; *) dbg_src="$(cd "$src_dir" && pwd)/$src_base" ;; esac
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; KAI_DEBUG_SRC="$dbg_src" KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+    if ! (unset KAI_TRACE_RC; KAI_DEBUG_SRC="$dbg_src" KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
       # Distinguish "this kaic2 has no native backend" (actionable: the
       # build was C-only) from a real compile error in the user program.
       # The C-only stub aborts with a known sentinel string; anything
@@ -1607,7 +1650,7 @@ compile_to_binary() {
     # the path is validated; the default C path below stays single-TU
     # (and selfhost-identical).
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --emit=c-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/modular.stream"
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=c-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$@" "$src") > "$tmp/modular.stream"
     moddir="$tmp/mod"
     mkdir -p "$moddir"
     # Split the stream on the column-0 `//KAIFILE:<nonce>::<name>`
@@ -1744,7 +1787,7 @@ compile_to_binary() {
     fi
   else
     # shellcheck disable=SC2086
-    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $user_cache_flag "$@" "$src") > "$tmp/out.c"
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $user_cache_flag $core_cache_flags "$@" "$src") > "$tmp/out.c"
     # struct-by-value FFI emits a marker stream (line 1 `//KAIDELIM:`)
     # carrying a shared `kai_ffi.h` + `out.c`. Split it INTO A SUBDIR (the
     # awk input is `$tmp/out.c`, so writing the split `out.c` back to
@@ -1966,7 +2009,7 @@ run_report_mode() {
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
   # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$flag" "$src")
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$flag" "$src")
 }
 
 # Back-compat alias — older internal call sites referenced this name.

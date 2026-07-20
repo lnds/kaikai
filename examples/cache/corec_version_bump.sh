@@ -25,7 +25,7 @@ fn main() : Unit / Console = print(int_to_string(list.sum([4, 5, 6])))
 EOF
 
 # Warm the core cache.
-out1="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out1="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out1" != "15" ]; then
   echo "corec_version_bump FAIL — warm run did not print 15 (got '$out1')"
   exit 1
@@ -43,7 +43,7 @@ fi
 # correct.
 printf '\377' | dd of="$blob" bs=1 seek=8 count=1 conv=notrunc 2>/dev/null
 
-out2="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out2="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out2" != "15" ]; then
   echo "corec_version_bump FAIL — version-mismatched core blob not rejected (got '$out2')"
   exit 1

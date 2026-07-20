@@ -45,8 +45,10 @@ import compiler.perceus
 import compiler.purity
 import compiler.protos
 import compiler.layout_synth
+import compiler.home_tu
 import compiler.fwd_inline
 import compiler.emit_shared
+import compiler.emit_cache
 import compiler.emit_c
 import compiler.monomorph
 import compiler.kir
@@ -1359,6 +1361,15 @@ pub type Mode
 # already default to; `BkCModular` is the separate-compilation C path.
 pub type Backend = BkC | BkNative | BkCModular | BkNativeModular
 
+# Shared core-cache configuration. `dir` is the writable cache
+# directory bin/kai resolves (empty = caching off); `toolchain` is an
+# opaque id folded into every content key so a rebuilt compiler misses
+# cleanly; `stats` prints one hit/miss line per layer to stderr.
+pub type CoreCacheOpt = { dir: String, toolchain: String, stats: Bool }
+
+fn cc_opt_off() : CoreCacheOpt =
+  CoreCacheOpt { dir: "", toolchain: "", stats: false }
+
 pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], cores: [String],
                     core_caches: [String], cache_sha: String,
                     strict_holes: Bool, search_paths: [String],
@@ -1385,13 +1396,16 @@ pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], core
                     # unchanged and pays no lookup cost. When true,
                     # resolve_module + compile_source consult
                     # compiler.user_cache before lexing each file.
-                    user_cache: Bool }
+                    user_cache: Bool,
+                    # Shared core-cache configuration (post-parse core
+                    # blobs + emitted-C core TUs). Off when dir is "".
+                    core_cache: CoreCacheOpt }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { mode: m, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 # Select the codegen backend, orthogonal to `mode`. `--emit=native` and
 # `--emit=c-modular` set this instead of `mode`, so they compose with
@@ -1400,7 +1414,7 @@ fn cli_with_backend(opts: CliOptions, bk: Backend) : CliOptions =
   CliOptions { mode: opts.mode, backend: bk, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 # Enable the user-file incremental cache for this invocation. Set by
 # `--user-cache`, which `bin/kai` passes only under `KAI_CACHE=1`
@@ -1409,13 +1423,28 @@ fn cli_with_user_cache(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: true }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: true, core_cache: opts.core_cache }
+
+fn cli_with_cc_opt(opts: CliOptions, cc: CoreCacheOpt) : CliOptions =
+  CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
+               core_caches: opts.core_caches, cache_sha: opts.cache_sha,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths,
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: cc }
+
+fn cli_with_cc_opt_dir(opts: CliOptions, d: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { dir: d, toolchain: opts.core_cache.toolchain, stats: opts.core_cache.stats })
+
+fn cli_with_toolchain_id(opts: CliOptions, t: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { dir: opts.core_cache.dir, toolchain: t, stats: opts.core_cache.stats })
+
+fn cli_with_cc_opt_stats(opts: CliOptions) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { dir: opts.core_cache.dir, toolchain: opts.core_cache.toolchain, stats: true })
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: Some(p), cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn cli_with_core(opts: CliOptions, p: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
@@ -1423,7 +1452,7 @@ fn cli_with_core(opts: CliOptions, p: String) : CliOptions =
                core_caches: list_append(opts.core_caches, [""]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn cli_with_core_cache(opts: CliOptions, src: String, cache: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path,
@@ -1431,26 +1460,26 @@ fn cli_with_core_cache(opts: CliOptions, src: String, cache: String) : CliOption
                core_caches: list_append(opts.core_caches, [cache]),
                cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: true, search_paths: opts.search_paths,
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes,
                search_paths: list_append(opts.search_paths, [sp]),
-               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: opts.package_name, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 # Set the consumer-package name parsed from kai.toml. The value flows
 # through to the qualified-call rewriter so self-imports from a
@@ -1459,7 +1488,7 @@ fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
   CliOptions { mode: opts.mode, backend: opts.backend, path: opts.path, cores: opts.cores,
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
-               package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache }
+               package_name: n, unstable_optins: opts.unstable_optins, edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 # Set the consumer-declared edition (parsed from `--edition <name>`
 # which `bin/kai` derives from kai.toml's `edition = "..."` field,
@@ -1472,7 +1501,7 @@ fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
                core_caches: opts.core_caches, cache_sha: opts.cache_sha,
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name, unstable_optins: opts.unstable_optins,
-               edition: n, user_cache: opts.user_cache }
+               edition: n, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 # The canonical lowercase set of edition names the compiler accepts.
 # Adding a new edition (Orongo) flips this list AND adds an
@@ -1495,7 +1524,7 @@ fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
                strict_holes: opts.strict_holes, search_paths: opts.search_paths,
                package_name: opts.package_name,
                unstable_optins: list_append(opts.unstable_optins, [pkg]),
-               edition: opts.edition, user_cache: opts.user_cache }
+               edition: opts.edition, user_cache: opts.user_cache, core_cache: opts.core_cache }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
   match rest {
@@ -1557,6 +1586,24 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MBuiltinsDocJson))
       } else if a == "--strict-holes" {
         parse_cli_loop(more, cli_with_strict_holes(opts))
+      } else if a == "--core-cache-dir" {
+        match more {
+          [d, ...rest2] -> parse_cli_loop(rest2, cli_with_cc_opt_dir(opts, d))
+          [] -> {
+            eprint("kaic2: --core-cache-dir requires a directory argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
+      } else if a == "--toolchain-id" {
+        match more {
+          [t, ...rest2] -> parse_cli_loop(rest2, cli_with_toolchain_id(opts, t))
+          [] -> {
+            eprint("kaic2: --toolchain-id requires an argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
+      } else if a == "--core-cache-stats" {
+        parse_cli_loop(more, cli_with_cc_opt_stats(opts))
       } else if a == "--user-cache" {
         # Opt-in user-file incremental cache.
         parse_cli_loop(more, cli_with_user_cache(opts))
@@ -1685,13 +1732,16 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
                                     core_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
-                                    edition: "", user_cache: false })
+                                    edition: "", user_cache: false, core_cache: cc_opt_off() })
 }
 
 fn usage() : Unit / Console {
   eprint("usage: kaic2 [options] <file.kai>")
   eprint("  --core <file>   include <file>'s decls before the input")
   eprint("  --path <dir>       add <dir> to the module search path (repeatable)")
+  eprint("  --core-cache-dir <dir>  enable the shared core cache (post-parse blobs + emitted-C core TUs) under <dir>")
+  eprint("  --toolchain-id <id>     opaque toolchain id folded into core-cache keys (bin/kai supplies it)")
+  eprint("  --core-cache-stats      print one core-cache hit/miss line per layer to stderr")
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --types            print declared top-level signatures and exit")
@@ -2131,19 +2181,27 @@ fn builtins_doc_loop(rels: [String], paths: [String],
 # shape so downstream callers (`PLS`, segments, module entries)
 # do not change.
 #
-# When `cache_on` is set (opt-in `--user-cache` under `KAI_CACHE=1`)
-# and a writable project dir is known, route the load through the
+# When `cache_dir` is non-empty, route the load through the
 # per-module post-parse cache (core_cache.kai). On a warm build every
 # core module deserialises from its blob instead of being re-lexed and
 # re-parsed. When the cache is off the default path is byte-for-byte
 # unchanged: it goes through `load_core_files` with no cache lookup.
-fn load_core(proj_dir: String, cache_on: Bool)
+fn load_core(cache_dir: String)
              : Option[CoresLoaded] / Console + File =
-  if cache_on and proj_dir != "" {
-    load_core_cached(core_module_paths(), proj_dir, [], [], [])
+  if cache_dir != "" {
+    load_core_cached(core_module_paths(), cache_dir, [], [], [])
   } else {
     load_core_files(core_module_paths(), [], [], [], [])
   }
+
+# The cache directory the core loader should use for this invocation:
+# the shared `--core-cache-dir` when supplied, else the per-project
+# `.kai-cache` under the legacy `--user-cache` opt-in, else "" (off).
+fn core_cache_dir_for(opts: CliOptions, target: String) : String =
+  if opts.core_cache.dir != "" { opts.core_cache.dir }
+  else if opts.user_cache {
+    concat_all([dir_of(target), "/", uc_cache_dir_name()])
+  } else { "" }
 
 # The cached core loader. Per module: read the source, try the
 # post-parse cache (cc_lookup), and on a hit reconstruct the
@@ -2153,17 +2211,17 @@ fn load_core(proj_dir: String, cache_on: Bool)
 # (write-on-miss self-populates the blob the next build hits). The
 # accumulators mirror load_core_files so the PLS return shape and the
 # downstream cascade are identical to the non-cached path.
-fn load_core_cached(paths: [String], proj_dir: String,
+fn load_core_cached(paths: [String], cache_dir: String,
                     acc_decls: [Decl], acc_mods: [ModuleEntry],
                     acc_segs: [CoreSegment])
                     : Option[CoresLoaded] / Console + File = match paths {
   [] -> Some(PLS(acc_decls, acc_mods, acc_segs))
-  [p, ...rest] -> match load_core_module(p, proj_dir) {
+  [p, ...rest] -> match load_core_module(p, cache_dir) {
     None -> None
     Some(pl) -> match pl {
       PL(ds, me) -> {
         let mod_name = match me { ME(m, _, _, _) -> m }
-        load_core_cached(rest, proj_dir,
+        load_core_cached(rest, cache_dir,
                           list_append(acc_decls, ds),
                           list_append(acc_mods, [me]),
                           list_append(acc_segs, [PSeg(mod_name, ds)]))
@@ -2180,11 +2238,11 @@ fn load_core_cached(paths: [String], proj_dir: String,
 # and the decls a miss parses are identical (the write stores exactly
 # load_core_file's post-parse output), so the merged stream - and the C
 # the cascade+typer emit from it - is byte-identical warm vs cold.
-fn load_core_module(path: String, proj_dir: String)
+fn load_core_module(path: String, cache_dir: String)
                     : Option[CoreLoaded] / Console + File =
   match read_file(path) {
     Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
-    Ok(src) -> match cc_lookup(proj_dir, src) {
+    Ok(src) -> match cc_lookup(cache_dir, src) {
       CcHit(decls) -> {
         # Reconstruct the ModuleEntry from the cached decls. The blob
         # already holds the doc- and test-stripped, origin-tagged decls
@@ -2198,7 +2256,7 @@ fn load_core_module(path: String, proj_dir: String)
         None -> None
         Some(pl) -> match pl {
           PL(ds, _) -> {
-            let _w = cc_write(proj_dir, content_hex, ds)
+            let _w = cc_write(cache_dir, content_hex, ds)
             Some(pl)
           }
         }
@@ -4016,7 +4074,120 @@ fn run_migrate_ok(out: String, reps: [MigRep], flips: Int) : Int / Console = {
 # keeps the stdout path every standalone invocation uses; the native
 # backend writes its `.o` to `native_object_path(path)` regardless, so
 # only the C sink changes here.
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String]) : Int / Console + File {
+# Module-origin names of the auto-loaded core set, in load order.
+fn core_mod_names(mods: [ModuleEntry], acc: [String]) : [String] = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> match m { ME(nm, _, _, _) -> core_mod_names(rest, [nm, ...acc]) }
+}
+
+# Content hexes of the core sources, in load order. None on any read
+# failure, which disables the emit cache for this invocation.
+fn core_src_hexes(paths: [String], acc: [String]) : Option[[String]] / Console + File = match paths {
+  [] -> Some(list_reverse(acc))
+  [p, ...rest] -> match read_file(p) {
+    Err(_) -> None
+    Ok(s) -> core_src_hexes(rest, [uc_content_hex(s), ...acc])
+  }
+}
+
+# Span-free identity of one decl for the emit-cache key. Core TU
+# emission is fn-body-independent (a user body only shapes the root
+# TU), but the program's NAME-LEVEL surface — types, impls (as their
+# lowered `__pimpl_*` fn names), protocols, effects, units, fn
+# name/arity pairs — can perturb synthetic decls or renames attributed
+# to a core TU. Names and arities capture that surface without spans,
+# so a plain body edit keeps the key while any surface change is a
+# safe miss.
+# The target file's basename is NOT part of the surface: a root pub
+# fn (and an impl's lowered `__pimpl_*` method) carries the target
+# module as its origin, and keying on it would make an identical
+# program under a different filename miss.
+fn ec_key_mo(mo: Option[String], target: String) : String = match mo {
+  None -> ""
+  Some(m) -> if m == target { "" } else { m }
+}
+
+fn ec_key_decl_id(d: Decl, target: String) : String = match d {
+  DFn(_, n, _, ps, _, _, _, _, _, mo) ->
+    concat_all(["fn ", n, "/", int_to_string(list_length(ps)), "@", ec_key_mo(mo, target)])
+  DType(_, n, _, _, _, _, mo) -> concat_all(["type ", n, "@", ec_key_mo(mo, target)])
+  DEffect(_, n, _, _, _, _, _, mo) -> concat_all(["effect ", n, "@", ec_key_mo(mo, target)])
+  DProtocol(_, n, _, _, _, _) -> concat_all(["protocol ", n])
+  DImpl(p, _, _, _, _, _) -> concat_all(["impl ", p])
+  DUnit(_, n, _, _, _, _) -> concat_all(["unit ", n])
+  DConst(_, n, _, _, mo, _, _) -> concat_all(["const ", n, "@", ec_key_mo(mo, target)])
+  DUse(n, _, _) -> concat_all(["use ", n])
+  _ -> "."
+}
+
+fn ec_key_user_ids(decls: [Decl], core_names: [String], target: String, acc: [String]) : [String] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let is_core = match home_tu(d) {
+      None -> false
+      Some(m) -> list_has(core_names, m)
+    }
+    if is_core { ec_key_user_ids(rest, core_names, target, acc) }
+    else { ec_key_user_ids(rest, core_names, target, [ec_key_decl_id(d, target), ...acc]) }
+  }
+}
+
+fn ec_key_surface_hex(decls: [Decl], core_names: [String], target: String) : String =
+  uc_content_hex(string_join(ec_key_user_ids(decls, core_names, target, []), "\n"))
+
+# The emit-cache entry key: content hash over the format tag, the
+# toolchain id, the edition, every core source, and the program's
+# type-level surface. "" means the cache does not participate; a
+# missing toolchain id disables it so a rebuilt dev compiler can never
+# splice another build's C.
+fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
+                 core_names: [String], target: String) : String / Console + File =
+  if cc.dir == "" or cc.toolchain == "" { "" }
+  else {
+    match core_src_hexes(core_module_paths(), []) {
+      None -> ""
+      Some(hexes) -> uc_content_hex(concat_all([
+        ec_format_tag(), "\n", cc.toolchain, "\n", edition, "\n",
+        ec_key_surface_hex(decls, core_names, target), "\n",
+        string_join(hexes, "\n")]))
+    }
+  }
+
+# c-modular emit with the core emit cache threaded through. On a warm
+# entry the core TU bodies splice from the cache; on a miss the fresh
+# core TU bodies are persisted for the next build. Only plain builds
+# participate: test/bench shapes skip the cache instead of folding the
+# shape into the key.
+fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
+                             bmode: BuildMode, target_mod_name: String,
+                             regions: [RegionMark], cc: CoreCacheOpt,
+                             core_mods: [ModuleEntry], edition: String)
+                             : String / Console + File = {
+  let plain = match bmode { BMBuild -> true _ -> false }
+  let cacheable = core_mod_names(core_mods, [])
+  let key = if plain { core_emit_key(cc, edition, decls, cacheable, target_mod_name) } else { "" }
+  if key == "" {
+    let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
+    emit_program_modular(path, src, decls, bmode, Some(target_mod_name), regions)
+  } else {
+    let cached = match ec_lookup(cc.dir, key) { None -> [] Some(tus) -> tus }
+    match emit_program_modular_cached(path, src, decls, bmode, Some(target_mod_name), regions, cached, cacheable) {
+      EMO(stream, fresh) -> {
+        let n_hit = list_length(cached)
+        let _w = if n_hit == 0 and list_length(fresh) > 0 {
+          ec_write(cc.dir, key, fresh)
+        } else { () }
+        let _s = if cc.stats {
+          if n_hit > 0 { eprint("kaic2: core-emit-cache: hit (#{n_hit} TUs)") }
+          else { eprint("kaic2: core-emit-cache: miss (wrote #{list_length(fresh)} TUs)") }
+        } else { () }
+        stream
+      }
+    }
+  }
+}
+
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -4966,7 +5137,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, region_marks, kir_inline_on)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_program_modular(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
+                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods, edition)
                         } else {
                           emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
@@ -5030,7 +5201,7 @@ fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
       match entries {
         [] -> 0
         [BE(first_in, _), ..._] ->
-          match load_core(dir_of(first_in), opts.user_cache) {
+          match load_core(core_cache_dir_for(opts, first_in)) {
             None -> 1
             Some(pls) -> match pls {
               PLS(pds, pmods, psegs) ->
@@ -5054,7 +5225,8 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
       Ok(src) -> compile_source(inp, opts.mode, opts.backend, opts.strict_holes,
                                  opts.search_paths, src, pds, pmods, psegs,
                                  opts.package_name, opts.unstable_optins,
-                                 opts.edition, opts.user_cache, Some(outp))
+                                 opts.edition, opts.user_cache, Some(outp),
+                                 opts.core_cache)
     }
     let nfail1 = if rc == 0 { nfail } else { nfail + 1 }
     batch_compile_loop(rest, pds, pmods, psegs, opts, nfail1)
@@ -5097,15 +5269,15 @@ pub fn run(opts: CliOptions) : Int / Console + File {
         # No `--core` flag, no driver assistance: every program
         # receives core. To swap which stdlib feeds the compiler,
         # rebuild with a different KAI_STDLIB_PATH macro.
-        # The core cache lives in the same per-project .kai-cache
-        # directory the user cache uses (the user file's directory),
-        # under the same `--user-cache` opt-in.
-        let core_loaded = load_core(dir_of(p), opts.user_cache)
+        # The core cache directory comes from `--core-cache-dir`
+        # (shared, bin/kai-resolved) or the legacy per-project
+        # `.kai-cache` under `--user-cache`.
+        let core_loaded = load_core(core_cache_dir_for(opts, p))
         match core_loaded {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None)
+              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache)
               Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
             }
           }

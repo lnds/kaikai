@@ -29,6 +29,31 @@ Practical map of the build. Read this before running the compiler or touching a 
 
 A C-only `kaic2` prints `note: native backend unavailable … using the C backend` and falls back — harmless. Subcommands: `build`, `run`, `test`, `bench`, `check`, plus `--holes-json` / `--diags-json` / `--effects-json` for structured output.
 
+### The shared core cache
+
+Every `bin/kai` build passes `--core-cache-dir` + `--toolchain-id` to
+kaic2, enabling two persistent, content-addressed cache layers for the
+auto-loaded stdlib core under `~/Library/Caches/kai/core/<toolchain-id>/`
+(Linux: `~/.cache/kai/core/…`; `XDG_CACHE_HOME` honoured):
+
+- **post-parse blobs** (KAB2, one per core module) — a warm build skips
+  the core's lex+parse entirely;
+- **emitted-C core TU bodies** (KCT1, c-modular backend, plain builds
+  only) — a warm build splices the 13 core `.c` bodies into the marker
+  stream instead of re-emitting them.
+
+The directory embeds the toolchain id (kaic2 mtime+size), so a rebuilt
+compiler never reads another build's entries; entries are additionally
+keyed on core source content + edition, so a stale hit is impossible —
+any mismatch is a miss that falls back to the full compile. The first
+build populates the cache (lazy warm); `make warm-core` pre-warms it
+explicitly (useful as an install or CI-init step). Knobs:
+`KAI_CORE_CACHE=0` disables, `KAI_CORE_CACHE_DIR` moves the root,
+`KAI_CORE_CACHE_STATS=1` prints per-layer hit/miss lines. Raw `kaic2`
+invocations (Makefile gates, selfhost, parity) pass no cache flags and
+are byte-for-byte unaffected. Fixtures: `examples/cache/emitc_*.sh` +
+`corec_*.sh`, run by `make -C stage2 test-core-cache` (tier 1).
+
 ## The five Makefiles — recursive delegation
 
 ```

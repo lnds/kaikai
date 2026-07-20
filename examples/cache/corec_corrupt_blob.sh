@@ -20,7 +20,7 @@ cat > "$PROJ/main.kai" <<'EOF'
 fn main() : Unit / Console = print(int_to_string(list.sum([7, 8])))
 EOF
 
-out1="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out1="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out1" != "15" ]; then
   echo "corec_corrupt_blob FAIL — warm run did not print 15 (got '$out1')"
   exit 1
@@ -38,7 +38,7 @@ fi
 head -c 80 "$blob" > "$blob.trunc"
 mv "$blob.trunc" "$blob"
 
-out2="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out2="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out2" != "15" ]; then
   echo "corec_corrupt_blob FAIL — truncated core blob not rejected (got '$out2')"
   exit 1
