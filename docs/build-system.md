@@ -40,7 +40,17 @@ auto-loaded stdlib core under `~/Library/Caches/kai/core/<toolchain-id>/`
   the core's lex+parse entirely;
 - **emitted-C core TU bodies** (KCT1, c-modular backend, plain builds
   only) — a warm build splices the 13 core `.c` bodies into the marker
-  stream instead of re-emitting them.
+  stream instead of re-emitting them;
+- **the native core object** (`ncore-<key>.o`, native backend) — the
+  whole-program native build splits into a user object plus one prebuilt
+  object carrying the entire auto-loaded core (fns, their thunks, their
+  boxed proto adapters, core-lifted lambdas); a warm build links the
+  stored object and feeds LLVM only the user partition. The key folds
+  the projected core KIR, the toolchain id, the edition, the target
+  triple, the opt level, the runtime-bitcode ids, and the core source
+  hashes. `KAI_NATIVE_CORE_OBJ=0` disables just this layer; `--debug`
+  (non-default opt level) skips it automatically. Test:
+  `make -C stage2 KAI_LLVM=1 test-native-core-obj`.
 
 The directory embeds the toolchain id (kaic2 mtime+size), so a rebuilt
 compiler never reads another build's entries; entries are additionally

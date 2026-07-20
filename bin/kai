@@ -913,6 +913,11 @@ Environment:
                    LLVM pipeline: 0|1|2|3|s|z (default: 2). Set by
                    \`--debug\` (0) / \`--release\` (2); the C backend
                    ignores it.
+  KAI_NATIVE_CORE_OBJ  Set to 0 to disable the native core-object cache
+                   (the content-addressed prebuilt stdlib-core object a
+                   native build links instead of re-emitting the core).
+                   On by default whenever the shared core cache is active;
+                   KAI_CORE_CACHE=0 disables it along with the rest.
   KAI_STDLIB       Override the stdlib root directory (default: auto-detected
                    from the script's location — share/kaikai/stdlib if installed,
                    stdlib/ if running from a dev checkout).
@@ -1551,8 +1556,17 @@ compile_to_binary() {
     # file. Only consulted in --debug; harmless otherwise.
     dbg_src="$src"
     case "$dbg_src" in /*) ;; *) dbg_src="$(cd "$src_dir" && pwd)/$src_base" ;; esac
+    # The inline (separate-compilation) bitcode rides along for the
+    # core-object split: when kaic2 partitions the build into a user + a
+    # cached core object, each partition is a raw emission that merges THIS
+    # bitcode (the native-modular model), while the whole-program fallback
+    # keeps reading KAI_NATIVE_RUNTIME_BC. kaic2 prints one object path per
+    # line; extra lines beyond the derived $obj are cached-core objects the
+    # link below must include.
+    wp_inline_bc_env=""
+    [ -n "$RUNTIME_INLINE_BC" ] && wp_inline_bc_env="$RUNTIME_INLINE_BC"
     # shellcheck disable=SC2086
-    if ! (unset KAI_TRACE_RC; KAI_DEBUG_SRC="$dbg_src" KAI_NATIVE_RUNTIME_BC="$nbc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+    if ! (unset KAI_TRACE_RC; KAI_DEBUG_SRC="$dbg_src" KAI_NATIVE_RUNTIME_BC="$nbc_env" KAI_NATIVE_RUNTIME_INLINE_BC="$wp_inline_bc_env" "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$@" "$tmp/$src_base") >"$tmp/native.objs" 2>"$nerr"; then
       # Distinguish "this kaic2 has no native backend" (actionable: the
       # build was C-only) from a real compile error in the user program.
       # The C-only stub aborts with a known sentinel string; anything
@@ -1591,6 +1605,13 @@ compile_to_binary() {
     if [ ! -f "$obj" ]; then
       die "native backend: no object produced (expected $obj)"
     fi
+    # The program objects to link: every path kaic2 printed (user object +
+    # any cached core object), or the derived $obj when stdout was empty
+    # (older kaic2 / defensive).
+    nat_objs="$obj"
+    if [ -s "$tmp/native.objs" ]; then
+      nat_objs="$(tr '\n' ' ' < "$tmp/native.objs")"
+    fi
     # shellcheck disable=SC2086
     # Same runtime-include precedence as the C path: the shim's
     # `#include "runtime.h"` must bind to stage2's Koka runtime
@@ -1617,15 +1638,17 @@ compile_to_binary() {
       # Same owner object (and cache) the native-modular link uses.
       wp_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1"
       wp_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$wp_owner_defs")"
+      # shellcheck disable=SC2086
       if [ -n "$wp_rt_obj" ]; then
-        $CC $CFLAGS "$obj" "$wp_rt_obj" -o "$out" -lm -ldl
+        $CC $CFLAGS $nat_objs "$wp_rt_obj" -o "$out" -lm -ldl
       else
         # No object cache (hasher-less host): compile runtime_llvm.c inline as
         # the owner. $KAI_RUNTIME_OWNER_OPT (-O0) keeps the scheduler sound (#1234).
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
       fi
     else
-      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+      # shellcheck disable=SC2086
+      $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
     fi
     # --debug DWARF (#500): the native object carries the .debug_* sections.
     # On ELF (Linux) the linker copies them straight into the executable, so
