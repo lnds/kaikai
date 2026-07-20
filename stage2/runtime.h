@@ -12265,17 +12265,21 @@ static size_t kai_fiber_stack_size(void) {
  * decorate the stack-overflow case. The handler runs on a sigaltstack
  * so the overflowed stack is never used to format the message. Spec:
  * `docs/fibers-honesty-targets.md` Tier 1. */
-/* The stack-guard SIGSEGV handler is installed once per process on a shared
- * sigaltstack; the install flag is shared so no TU re-installs it. */
+/* Two different scopes live here, and conflating them loses the diagnostic:
+ * the SIGSEGV/SIGBUS disposition is process-wide (installed once, guarded by
+ * kai_sigsegv_installed), while sigaltstack is PER-THREAD. A thread without
+ * an alternate stack gives SA_ONSTACK nothing to switch to, so the handler
+ * would run on the stack that just overflowed, fault again, and the process
+ * dies with no message. Every thread that can run a fiber installs its own. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern void *kai_sigalt_stack;
+extern KAI_TLS void *kai_sigalt_stack;
 extern int   kai_sigsegv_installed;
 #  if defined(KAI_RUNTIME_OWNER)
-void *kai_sigalt_stack = NULL;
+KAI_TLS void *kai_sigalt_stack = NULL;
 int   kai_sigsegv_installed = 0;
 #  endif
 #else
-static void *kai_sigalt_stack = NULL;
+static KAI_TLS void *kai_sigalt_stack = NULL;
 static int   kai_sigsegv_installed = 0;
 #endif
 
@@ -12304,20 +12308,28 @@ static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
     raise(sig);
 }
 
-static void kai_install_fiber_sigsegv_handler(void) {
-    if (kai_sigsegv_installed) return;
-    kai_sigsegv_installed = 1;
+/* Give the calling thread its own alternate signal stack. Idempotent; the
+ * allocation stays owned by the thread-local pointer for the thread's life. */
+static void kai_install_thread_sigaltstack(void) {
+    if (kai_sigalt_stack) return;
 
     size_t altsize = (size_t) SIGSTKSZ;
     if (altsize < 32 * 1024) altsize = 32 * 1024;
-    kai_sigalt_stack = malloc(altsize);
-    if (kai_sigalt_stack) {
-        stack_t ss;
-        ss.ss_sp    = kai_sigalt_stack;
-        ss.ss_size  = altsize;
-        ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
-    }
+    void *sp = malloc(altsize);
+    if (!sp) return;
+    kai_sigalt_stack = sp;
+
+    stack_t ss;
+    ss.ss_sp    = sp;
+    ss.ss_size  = altsize;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+}
+
+static void kai_install_fiber_sigsegv_handler(void) {
+    kai_install_thread_sigaltstack();
+    if (kai_sigsegv_installed) return;
+    kai_sigsegv_installed = 1;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -14300,6 +14312,8 @@ static pthread_t kai_worker_threads[KAI_MAX_THREADS];
  * mark the slot live, and run the scheduler loop until shutdown. */
 static void *kai_worker_thread_main(void *arg) {
     kai_thread_id = (int) (intptr_t) arg;
+    /* Per-thread: without it a fiber overflowing here dies undiagnosed. */
+    kai_install_thread_sigaltstack();
     kai_active_fiber_anchor();
     kai_main_fiber.home_thread = kai_thread_id;
     kai_sched_slots[kai_thread_id].live = 1;
@@ -14317,6 +14331,9 @@ static void *kai_worker_thread_main(void *arg) {
 static void *kai_reactor_thread_main(void *arg) {
     (void) arg;
     kai_thread_id = kai_nthreads;
+    /* Never dispatches fibers, but keeps the scheduler threads uniform: a
+     * fault here reaches the handler instead of compounding on this stack. */
+    kai_install_thread_sigaltstack();
     for (;;) {
         if (kai_sched_shutting_down) return NULL;
         kai_reactor_wait();
