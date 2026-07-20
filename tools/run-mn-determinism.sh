@@ -118,11 +118,15 @@ for src in "${FIXTURES[@]}"; do
     kai_timeout "$RUN_TIMEOUT" env KAI_THREADS=1 "$bin" >"$ref" 2>/dev/null \
       || { echo "FAIL $tag: reference run at N=1 did not complete"; fail=1; continue; }
 
-    for n in 4 8; do
+    # `default` is the unset arm: KAI_THREADS absent resolves to the host
+    # CPU count, so it is what a user actually runs. Gating only the
+    # explicit counts would leave the shipped configuration untested.
+    for n in default 4 8; do
+      if [ "$n" = default ]; then run_env=(env -u KAI_THREADS); else run_env=(env KAI_THREADS="$n"); fi
       ok=0; diverge=0; empty=0; crash=0; hang=0; witness=""
       for _ in $(seq 1 "$REPEATS"); do
         ec=0
-        kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" "$bin" \
+        kai_timeout "$RUN_TIMEOUT" "${run_env[@]}" "$bin" \
           >"$TMP/run.out" 2>"$TMP/run.err" || ec=$?
         if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
           hang=$((hang+1))
