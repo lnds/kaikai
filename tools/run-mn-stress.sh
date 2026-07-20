@@ -51,20 +51,30 @@ if [ "$KAI_TIMEOUT_KIND" = none ]; then
   echo "  a wedged run will block instead of being counted as a hang."
 fi
 
+# One run -> $BUCKET, plus the first non-ok run's evidence in $WITNESS. Sets
+# globals rather than echoing: a command substitution would run this in a
+# subshell and lose the witness.
+classify_run() {
+  local ec=0 got
+  got="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$1" "$BIN" 2>"$TMP/run.err")" || ec=$?
+  if   [ "$ec" = 124 ];           then BUCKET=hang
+  elif [ "$ec" != 0 ];            then BUCKET=crash; : "${WITNESS:=$(head -1 "$TMP/run.err")}"
+  elif [ "$got" != "$expected" ]; then BUCKET=bad;   : "${WITNESS:=got '$got'}"
+  else                                 BUCKET=ok
+  fi
+}
+
 fail=0
 for n in "${THREADS[@]}"; do
-  ok=0; bad=0; crash=0; hang=0; witness=""
+  declare -A count=([ok]=0 [bad]=0 [crash]=0 [hang]=0)
+  WITNESS=""
   for _ in $(seq 1 "$RUNS"); do
-    ec=0
-    got="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" "$BIN" 2>"$TMP/run.err")" || ec=$?
-    if   [ "$ec" = 124 ];    then hang=$((hang+1))
-    elif [ "$ec" != 0 ];     then crash=$((crash+1)); [ -n "$witness" ] || witness="$(head -1 "$TMP/run.err")"
-    elif [ "$got" != "$expected" ]; then bad=$((bad+1)); [ -n "$witness" ] || witness="got '$got'"
-    else ok=$((ok+1))
-    fi
+    classify_run "$n"
+    count[$BUCKET]=$(( count[$BUCKET] + 1 ))
   done
-  echo "N=$n runs=$RUNS ok=$ok bad=$bad crash=$crash hang=$hang${witness:+ — $witness}"
-  [ "$ok" = "$RUNS" ] || fail=1
+  echo "N=$n runs=$RUNS ok=${count[ok]} bad=${count[bad]} crash=${count[crash]}" \
+       "hang=${count[hang]}${WITNESS:+ — $WITNESS}"
+  [ "${count[ok]}" = "$RUNS" ] || fail=1
 done
 
 [ "$fail" = 0 ] && echo "run-mn-stress: OK $(basename "$SRC")" \
