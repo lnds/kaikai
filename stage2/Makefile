@@ -150,6 +150,15 @@ STDLIB_ABS := $(abspath ../stdlib)
 # the real programs (and the rb-tree benchmark).
 CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 
+# The only project header the generated C pulls in: it emits a bare
+# `#include "runtime.h"`, which the `-I .` above binds to stage2/runtime.h,
+# and that header includes no other project header. make cannot see through
+# the generated file, so every rule compiling it must name this explicitly
+# or a runtime-only edit leaves a stale binary in place. Deliberately NOT
+# ../stage0/runtime.h: this translation unit never reaches it, and listing
+# it would force the ~70 s -O2 rebuild on unrelated stage 0 edits.
+RUNTIME_H := runtime.h
+
 # Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
 # inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle
 # stage2/compiler.kai's ~32 k tokens. With both stage 0 and stage 1
@@ -193,7 +202,7 @@ build/stage2.c: build/bundle.kai $(KAIC1) | build
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
 # answer is always: llvm-config in PATH or not). Lane 1.5 capability line.
-$(TARGET): build/stage2.c
+$(TARGET): build/stage2.c $(RUNTIME_H)
 ifeq ($(KAI_LLVM),1)
 	@echo "building stage2: native backend ENABLED ($(LLVM_CONFIG) found)"
 else
@@ -220,7 +229,7 @@ endif
 # from ~70 s to ~5 s; the resulting binary self-compiles slower, so this
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
-kaic2-dev: build/stage2.c
+kaic2-dev: build/stage2.c $(RUNTIME_H)
 	$(CC) $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 

@@ -8,6 +8,12 @@ LDLIBS_M := -lm
 SRCS    := main.c lexer.c ast.c parser.c parser_expr.c check.c emit.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := kaic0
+# Every header the sources above include. Listed explicitly rather than
+# wildcarded so a new header has to be declared, and coarsely rather than
+# per-object because the whole stage builds at -O0 in about a second.
+# runtime.h is absent on purpose: it is emitted into generated programs,
+# never compiled into kaic0.
+HDRS    := ast.h check.h emit.h lexer.h parser.h parser_internal.h
 
 .PHONY: all clean test test-run test-blocks
 
@@ -16,7 +22,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-%.o: %.c
+%.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
