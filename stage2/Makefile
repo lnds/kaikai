@@ -2935,7 +2935,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Cancel delivered at yield-point hook unwinds fiber)" \
@@ -2948,7 +2948,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Actor.receive parks on empty; sender wakeup unblocks)" \
@@ -2961,7 +2961,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (two-actor request/reply: client parks on receive, server replies, client resumes)" \
@@ -2974,7 +2974,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Bounded(_, BlockSender) parks sender on full; receiver wakeup unblocks)" \
@@ -2988,7 +2988,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (spawn_actor_policy: explicit MailboxPolicy reaches the spawned actor's mailbox)" \
@@ -3115,7 +3115,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
 	  diff -q ../examples/effects/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (nursery auto-join: both children before return, no explicit await)" \
@@ -3127,7 +3127,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.run.err || true; \
+	  ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.run.err || true; \
 	  grep -q "^before nursery$$" build/s2-$$name.out \
 	    && ! grep -q "sibling finished" build/s2-$$name.out \
 	    && ! grep -q "after nursery" build/s2-$$name.out \
