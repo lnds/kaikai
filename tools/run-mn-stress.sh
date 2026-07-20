@@ -15,6 +15,9 @@
 #
 #   tools/run-mn-stress.sh <fixture.kai> [runs] [threads...]
 #
+# `bin/kai` honours CFLAGS, so a sanitizer arm is the same command with
+# CFLAGS="-std=c11 -g -O1 -fsanitize=address" in front.
+#
 # The expected output is the fixture's .out.expected when present, otherwise
 # the fixture's own KAI_THREADS=1 run.
 
