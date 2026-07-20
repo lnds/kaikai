@@ -187,8 +187,8 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-timeout-shim
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, timeout shim honours its exit-code contract"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-timeout-shim test-p2-status
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, timeout shim honours its exit-code contract, P2 status distinguishes its three states"
 
 # Exit-code contract of the bounded-run shim every M:N gate classifies hangs
 # with: deadline -> 124, child that survived SIGTERM -> 137. Seconds, no
@@ -196,6 +196,14 @@ tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-fra
 # Linux, perl on macOS).
 test-timeout-shim:
 	@bash tools/test-timeout-shim.sh
+
+# `gen-runtime-bc.sh --status` must tell "no clang 18 here" apart from
+# "clang 18 is here, the bitcode was never generated": the second is one
+# command from active, and reporting it as a plain opt-out is what let a
+# ~2x slower native compiler pass for a codegen defect. Hermetic, seconds,
+# no kaic2 dependency.
+test-p2-status:
+	@bash tools/test-p2-status.sh
 
 # #820 — KAI_EVIDENCE_FRAME_ONLY gate. A user effect's named instance must
 # resolve through its capability slot, never the by-name walk (retained only for

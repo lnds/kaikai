@@ -310,6 +310,27 @@ not Int arith).
 bitcode to be built reproducibly in both dev and release (the static-LLVM
 release path already vendors LLVM; bitcode is an added artefact).
 
+**Telling whether P2 is on.** The opt-out stays clean by design — stage 0's
+zero-dependency promise needs the fallback — but a host running without it
+emits heap-bound native code several times slower than CI and the release do
+(measured 2026-07-20 on `d425a904`, same kaic2, P2 the only variable:
+`list_fold` 10.14 s → 16.83 s, `rbtree_corpus` 1.29 s → 4.87 s; arithmetic
+that never calls a runtime op is unaffected). So every surface reports the
+state:
+
+```sh
+tools/gen-runtime-bc.sh --status       # active | optout needs-regen | optout no-clang18
+tools/gen-runtime-bc.sh --status-line  # the same state as one line, with the remedy
+make KAI_LLVM=1 kaic2                  # last line of the build is the P2 banner
+bin/kai --version                       # `native p2:` field
+benchmarks/mn-throughput/run.sh         # `p2:` line in the environment banner
+```
+
+`optout needs-regen` means clang 18 resolves but the `.bc` was never built —
+one `make KAI_LLVM=1 kaic2` away from active. `optout no-clang18` needs an
+install. Distinguishing the two is what keeps a recoverable state from being
+read as a native-codegen defect.
+
 ### P3 — alloca-everything → mem2reg · **do not pursue** (correctly not pursued)
 
 > Not to be confused with the *shipped* "P3" in project memory / CHANGELOG,
