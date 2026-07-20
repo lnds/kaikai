@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -173,6 +173,18 @@ clean:
 
 # ---- testing tiers (see docs/testing-tiers.md) ----------------------
 #
+# Pre-warm the shared core cache (post-parse blobs + emitted-C core
+# TUs) by building a throwaway program once per available backend, so
+# the first real build pays no core compile. Lazy warm on first build
+# is the fallback; this target is for install / CI-init steps.
+warm-core: kaic2
+	@tmp=$$(mktemp -d); \
+	printf 'fn main() {\n  print("warm")\n}\n' > $$tmp/warm.kai; \
+	KAI_MODULAR=1 ./bin/kai build --backend=c $$tmp/warm.kai -o $$tmp/warm-c >/dev/null 2>&1 || true; \
+	./bin/kai build $$tmp/warm.kai -o $$tmp/warm-n >/dev/null 2>&1 || true; \
+	rm -rf $$tmp; \
+	echo "core cache warmed (post-parse blobs + c-modular emit entries)"
+
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
 tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit

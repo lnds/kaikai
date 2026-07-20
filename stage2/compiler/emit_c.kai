@@ -65,6 +65,7 @@ import compiler.unbox
 import compiler.perceus
 import compiler.protos
 import compiler.emit_shared
+import compiler.emit_cache
 import compiler.emit_reuse_donate
 import compiler.vec_raw
 import compiler.ffi_v2
@@ -10581,7 +10582,16 @@ fn dots_to_underscores_loop(s: String, i: Int, n: Int, acc: String) : String =
 type CModuleTU = { stem: String, body: String }
 
 #[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
-pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console + Mutable {
+pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console + Mutable =
+  match emit_program_modular_cached(file, src, raw_decls, bmode, target_origin, regions, [], []) {
+    EMO(stream, _) -> stream
+  }
+
+#[doc("The c-modular emitter's result: the marker-delimited stream plus the freshly emitted bodies of the cache-eligible TUs (for the emit cache's write path; empty when none were eligible).")]
+pub type EmitModularOut = EMO(String, [CTU])
+
+#[doc("As `emit_program_modular`, with the core emit cache threaded through: TUs whose stem appears in `cached` splice the cached body instead of emitting; freshly emitted TUs whose module origin appears in `cacheable` are returned for the caller to persist.")]
+pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String]) : EmitModularOut / Console + Mutable {
 
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let eff_names = collect_effect_names(alias_resolved)
@@ -10666,7 +10676,10 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   # module's fn bodies. `fn_bodies` carries the `Console` effect, so we
   # fold with an explicit loop rather than `map` (which is pure).
   let mod_names = distinct_module_origins(decls)
-  let mod_tus = emit_module_tus_loop(src, decls, mod_names, cx, const_syms, [])
+  let mto = emit_module_tus_loop(src, decls, mod_names, cx, const_syms,
+                                 cached, cacheable, [], [])
+  let mod_tus = match mto { MTO(tus, _) -> tus }
+  let fresh_tus = match mto { MTO(_, fresh) -> fresh }
   let all_tus = [root_tu, ...mod_tus]
 
   # ---- assemble the marker-delimited multi-file stream --------------
@@ -10679,16 +10692,33 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
   let ext_tus = map(all_tus, (tu) => CModuleTU { stem: tu.stem, body: externalize_modular_linkage(tu.body) })
   let slice_in = map(ext_tus, (tu) => SliceTU { stem: tu.stem, body: tu.body })
   let sliced = slice_headers(types_h, ext_decls_h, slice_in)
-  assemble_modular_output(nonce, sliced, ext_tus)
+  EMO(assemble_modular_output(nonce, sliced, ext_tus), fresh_tus)
 }
 
-#[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
-fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_syms: [String], acc: [CModuleTU]) : [CModuleTU] / Console + Mutable = match mod_names {
-  [] -> list_reverse(acc)
+# Module TU loop result: the TUs in document order plus the freshly
+# emitted cache-eligible bodies.
+type ModTusOut = MTO([CModuleTU], [CTU])
+
+#[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies; a stem present in `cached` splices the cached body instead of emitting. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
+fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_syms: [String], cached: [CTU], cacheable: [String], acc: [CModuleTU], acc_fresh: [CTU]) : ModTusOut / Console + Mutable = match mod_names {
+  [] -> MTO(list_reverse(acc), list_reverse(acc_fresh))
   [m, ...rest] -> {
-    let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx, const_syms)
-    let tu = CModuleTU { stem: tu_stem(Some(m)), body: body }
-    emit_module_tus_loop(src, decls, rest, cx, const_syms, [tu, ...acc])
+    let stem = tu_stem(Some(m))
+    match ec_find(cached, stem) {
+      Some(body) ->
+        emit_module_tus_loop(src, decls, rest, cx, const_syms, cached,
+                             cacheable,
+                             [CModuleTU { stem: stem, body: body }, ...acc],
+                             acc_fresh)
+      None -> {
+        let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx, const_syms)
+        let tu = CModuleTU { stem: stem, body: body }
+        let fresh1 = if list_has(cacheable, m) { [CTU(stem, body), ...acc_fresh] }
+                     else { acc_fresh }
+        emit_module_tus_loop(src, decls, rest, cx, const_syms, cached,
+                             cacheable, [tu, ...acc], fresh1)
+      }
+    }
   }
 }
 
