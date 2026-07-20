@@ -1,0 +1,133 @@
+# Structural child-mapping over the AST.
+#
+# One `f: (Expr) -> Expr` applied to every direct sub-expression of a node,
+# leaving the node's own shape alone. A pass that only cares about a handful
+# of constructs gets its recursion for free instead of restating thirty arms
+# it has no opinion about — and a new `ExprKind` variant is a compile error
+# here, in one place, rather than a silently skipped subtree in each pass.
+#
+# `f` is pure: the mapper is used by passes that rewrite structure, not by
+# ones that need to report while they walk.
+
+import compiler.ast
+
+pub fn prc_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, prc_map_opt_expr(g, f), f(b))
+  }
+}
+
+
+pub fn prc_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+
+pub fn prc_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+
+pub fn prc_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    # Leaves: no sub-Expr to recurse into.
+    EInt(_)        -> k
+    EReal(_, _)       -> k
+    EIntLit(_)        -> k
+    EDecimalLit(_)    -> k
+    EFixed(_, _)      -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EVar(_)        -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EExternBody(_) -> k
+    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
+    # TypeExpr and a resolved-names list, neither of which the
+    # visitor traverses). Same shape as EHole/ETodo for the
+    # purposes of the structural recursion.
+    EVariantsOf(_, _) -> k
+    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
+    # (both fields are plain Strings), so `f` has nothing to apply.
+    EModCall(_, _) -> k
+    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    # Composites: apply f to every direct sub-Expr.
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), prc_map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => prc_map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(name, fs) -> ERecordLit(name, map(fs, (fi) => prc_map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => prc_map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), prc_map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => prc_map_stmt_exprs(s, f)),
+                                    prc_map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
+    EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff_name, eff_tyargs,
+              prc_map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => prc_map_clause_exprs(c, f)),
+              prc_map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+
+pub fn prc_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+
+pub fn prc_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+
+pub fn prc_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(prc_map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+
+pub fn prc_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
+
+
+pub fn prc_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), prc_map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+    # m7e §25: SUse has no sub-expression — pass through unchanged.
+    SUse(n, l, c)               -> SUse(n, l, c)
+  }
+}
