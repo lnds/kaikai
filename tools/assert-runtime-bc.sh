@@ -18,9 +18,7 @@ if [ "$status" != "active" ]; then
   echo "::error::native P2 runtime bitcode is NOT active (status: $status)." >&2
   echo "  This build links runtime_llvm.c with cc (legacy, no O2 inlining) instead" >&2
   echo "  of linking the bitcode before O2. A release/CI build MUST run P2." >&2
-  echo "  Cause is almost always a missing clang 18 on the build image." >&2
-  echo "  Fix: ensure clang 18 is installed (brew install llvm@18 / apt-get install clang-18)" >&2
-  echo "  and that 'make -C stage2 KAI_LLVM=1 kaic2' regenerated stage0/runtime_llvm.bc." >&2
+  echo "  $("$ROOT/tools/gen-runtime-bc.sh" --status-line)" >&2
   exit 1
 fi
 echo "assert-runtime-bc: native P2 bitcode is active."

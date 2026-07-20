@@ -206,6 +206,11 @@ ifeq ($(KAI_LLVM),1)
 	@# out cleanly (native falls back to linking runtime_llvm.c with cc). The
 	@# script is idempotent — a no-op when the .bc is fresh.
 	@../tools/gen-runtime-bc.sh || true
+	@# Terminal banner, deliberately the last line of the build: the P2
+	@# opt-out notice above scrolls past mid-run, and a dev who misses it
+	@# emits native code several times slower than CI and the release do on
+	@# heap-bound work, without ever being told.
+	@echo "building stage2: native P2 bitcode: $$(../tools/gen-runtime-bc.sh --status-line)"
 endif
 
 # --- Dev fast rebuild: whole-bundle at -O0 ----------------------------
