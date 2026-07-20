@@ -3255,16 +3255,18 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  rc=0; ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.stderr || rc=$$?; \
-	  if [ $$rc -eq 0 ]; then \
-	    echo "effects FAIL $$name (expected non-zero exit from guard-page SIGSEGV, got 0)"; \
-	    cat build/s2-$$name.out; exit 1; \
-	  fi; \
-	  grep -q "fiber stack overflow" build/s2-$$name.stderr \
-	    && echo "effects OK $$name (guard page caught overflow with diagnostic, exit=$$rc)" \
-	    || { echo "effects FAIL $$name (no overflow diagnostic on stderr; exit=$$rc)"; \
-	         echo '--- stderr:'; cat build/s2-$$name.stderr; \
-	         echo '--- stdout:'; cat build/s2-$$name.out; exit 1; }; \
+	  for n in 1 4 8 16; do \
+	    rc=0; KAI_THREADS=$$n ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.stderr || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "effects FAIL $$name (KAI_THREADS=$$n: expected non-zero exit from guard-page SIGSEGV, got 0)"; \
+	      cat build/s2-$$name.out; exit 1; \
+	    fi; \
+	    grep -q "fiber stack overflow" build/s2-$$name.stderr \
+	      && echo "effects OK $$name (KAI_THREADS=$$n: guard page caught overflow with diagnostic, exit=$$rc)" \
+	      || { echo "effects FAIL $$name (KAI_THREADS=$$n: no overflow diagnostic on stderr; exit=$$rc)"; \
+	           echo '--- stderr:'; cat build/s2-$$name.stderr; \
+	           echo '--- stdout:'; cat build/s2-$$name.out; exit 1; }; \
+	  done; \
 	done; \
 	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
 	  [ -e $$f ] || continue; \
