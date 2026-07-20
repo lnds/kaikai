@@ -1,0 +1,142 @@
+# compiler/emit_cache.kai - persistent cache of the core module set's
+# emitted C translation units (the c-modular backend's per-TU bodies).
+#
+# The core's emitted C is a pure function of (core sources, toolchain,
+# edition, build mode): monomorphised instances of core generics land
+# in the root TU, protocol dispatch resolves through runtime impl
+# tables, and the modular emitter builds every TU body independently
+# from a shared immutable context. A warm entry therefore lets
+# `emit_program_modular` skip the body emission for every core TU and
+# splice the cached text into the stream unchanged; everything
+# downstream (linkage externalisation, header slicing, the wrapper's
+# content-hashed `.o` cache) runs identically, so a warm build is
+# byte-identical to a cold one.
+#
+# INVALIDATION mirrors core_cache.kai: the entry filename embeds a key
+# hashed over the core source contents, the toolchain id, the edition,
+# and the build mode; the header echoes the key as a second line of
+# defense. A stale entry can never be spliced: it would have to be a
+# valid entry for a DIFFERENT (core, toolchain) pair, and the key is
+# exactly what distinguishes them. Any IO or parse failure is a miss,
+# never an error - the cache is a performance layer only.
+
+#[doc("One cached translation unit: the TU stem (module origin with dots as underscores) and its pre-externalisation C body text.")]
+pub type CTU = CTU(String, String)
+
+# A parsed header/stem line: the text and the position past its newline.
+type EcLine = EL(String, Int)
+
+#[doc("Bump on any change to the entry format or key derivation so old entries miss after an upgrade.")]
+pub fn ec_format_tag() : String = "KCT1"
+
+# ---- entry path ------------------------------------------------------
+
+#[doc("Absolute path of the emit-cache entry for a key, under the given cache directory.")]
+pub fn ec_entry_path(dir: String, key: String) : String =
+  concat_all([dir, "/core-emit-", key, ".kct"])
+
+# ---- serialisation ---------------------------------------------------
+
+# Entry layout (text header, length-prefixed bodies):
+#   KCT1\n<key>\n<n_tus>\n
+#   then per TU: <stem>\n<byte_len>\n<body bytes>
+# Length prefixes make the body split exact - no marker can collide
+# with emitted C.
+
+fn ec_render_tus(tus: [CTU], acc: [String]) : [String] = match tus {
+  [] -> list_reverse(acc)
+  [t, ...rest] -> match t {
+    CTU(stem, body) ->
+      ec_render_tus(rest, [concat_all([stem, "\n",
+                                       int_to_string(string_length(body)),
+                                       "\n", body]), ...acc])
+  }
+}
+
+#[doc("Serialise the cached TU set into one entry blob for the given key.")]
+pub fn ec_serialize(key: String, tus: [CTU]) : String =
+  concat_all([ec_format_tag(), "\n", key, "\n",
+              int_to_string(list_length(tus)), "\n",
+              concat_all(ec_render_tus(tus, []))])
+
+# Read the line starting at `pos`. `EL("", -1)` on a missing
+# terminator - the -1 position poisons every downstream bounds check,
+# so a truncated blob decodes to None without per-call Option nesting.
+fn ec_read_line(buf: String, pos: Int) : EcLine =
+  if pos < 0 { EL("", 0 - 1) }
+  else { ec_scan_nl(buf, pos, pos, string_length(buf)) }
+
+fn ec_scan_nl(buf: String, start: Int, i: Int, n: Int) : EcLine =
+  if i >= n { EL("", 0 - 1) }
+  else if string_byte_at_int(buf, i) == 10 {
+    EL(string_slice(buf, start, i - start), i + 1)
+  }
+  else { ec_scan_nl(buf, start, i + 1, n) }
+
+# A non-negative int parsed from a line's text; -1 on malformation.
+fn ec_nat_of(s: String) : Int = match string_to_int(s) {
+  None -> 0 - 1
+  Some(n) -> if n < 0 { 0 - 1 } else { n }
+}
+
+fn ec_line_nat(l: EcLine) : Int = match l {
+  EL(s, p) -> if p < 0 { 0 - 1 } else { ec_nat_of(s) }
+}
+
+fn ec_line_pos(l: EcLine) : Int = match l { EL(_, p) -> p }
+
+fn ec_line_is(l: EcLine, want: String) : Bool = match l {
+  EL(s, p) -> p >= 0 and s == want
+}
+
+fn ec_parse_tus(buf: String, pos: Int, left: Int, acc: [CTU]) : Option[[CTU]] =
+  if pos < 0 { None }
+  else if left == 0 { Some(list_reverse(acc)) }
+  else { ec_parse_one(buf, ec_read_line(buf, pos), left, acc) }
+
+fn ec_parse_one(buf: String, stem_l: EcLine, left: Int, acc: [CTU]) : Option[[CTU]] = {
+  let len_l = ec_read_line(buf, ec_line_pos(stem_l))
+  let len = ec_line_nat(len_l)
+  let body_at = ec_line_pos(len_l)
+  if len < 0 or body_at + len > string_length(buf) { None }
+  else {
+    let stem = match stem_l { EL(s, _) -> s }
+    let tu = CTU(stem, string_slice(buf, body_at, len))
+    ec_parse_tus(buf, body_at + len, left - 1, [tu, ...acc])
+  }
+}
+
+#[doc("Deserialise an entry blob back into its TU set. None on any format drift, key mismatch, or truncation - the caller treats None as a miss.")]
+pub fn ec_deserialize(blob: String, key: String) : Option[[CTU]] = {
+  let tag_l = ec_read_line(blob, 0)
+  let key_l = ec_read_line(blob, ec_line_pos(tag_l))
+  let n_l = ec_read_line(blob, ec_line_pos(key_l))
+  if ec_line_is(tag_l, ec_format_tag()) and ec_line_is(key_l, key) {
+    ec_parse_tus(blob, ec_line_pos(n_l), ec_line_nat(n_l), [])
+  } else { None }
+}
+
+# ---- lookup / write --------------------------------------------------
+
+#[doc("Look up the emit cache: the deserialised TU set on a present, key-valid entry, or None on any miss.")]
+pub fn ec_lookup(dir: String, key: String) : Option[[CTU]] / Console + File =
+  match read_file(ec_entry_path(dir, key)) {
+    Err(_) -> None
+    Ok(blob) -> ec_deserialize(blob, key)
+  }
+
+#[doc("Write the TU set to its content-addressed entry. IO failures are swallowed - an unwritable cache is a performance loss, never a correctness one.")]
+pub fn ec_write(dir: String, key: String, tus: [CTU]) : Unit / Console + File = {
+  match write_file(ec_entry_path(dir, key), ec_serialize(key, tus)) {
+    Err(_) -> ()
+    Ok(_) -> ()
+  }
+}
+
+#[doc("Find a cached TU body by stem. None when the stem is not in the set.")]
+pub fn ec_find(tus: [CTU], stem: String) : Option[String] = match tus {
+  [] -> None
+  [t, ...rest] -> match t {
+    CTU(s, body) -> if s == stem { Some(body) } else { ec_find(rest, stem) }
+  }
+}
