@@ -2426,11 +2426,10 @@ fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : 
     # use), so no per-call KDup/KDrop of the closure. Lower `f` as the
     # closure value and the rest as owned call args → `KCallIndirectBorrow`.
     CkApplyBorrow -> lower_apply_borrow(x, cargs, st)
-    # `__perceus_owned_borrow(g)` (#1130 rule 1) — a freshly materialised
-    # closure in a borrowed slot whose birth ref the C emit drops after the
-    # call. On native it lowers transparently (materialise `g`); the
-    # post-call KDrop is a follow-up, so the closure keeps a bounded leak
-    # here (the C oracle carries the full fix).
+    # `__perceus_owned_borrow(g)` — an owned value in a borrowed slot whose
+    # birth ref the caller drops after the call. The mark itself lowers
+    # transparently to the inner value; the enclosing call site emits the
+    # post-call KDrop (`ob_drop_after`).
     CkOwnedBorrow -> lower_borrow_through(cargs, st)
     CkCtor      -> lower_ctor_call(x, callee, cargs, st)
     # A bare callee that resolves to a top-level fn is a direct call; one
@@ -3034,7 +3033,35 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
 fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let sig = lookup_ufn_by_csym(st.fns, sym)
   match lower_tcrec_args(cargs, sig, st) { LResMany(avs, st1) ->
-    bind_op_slot(st1, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x)) }
+    ob_drop_after(bind_op_slot(st1, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x)),
+                  cargs, avs, kpos_of(x)) }
+}
+
+# A `__perceus_owned_borrow`-marked arg lowered to its inner value: the
+# callee borrows it and no binder holds it, so the caller releases the
+# birth ref right after the call (the C oracle's statement-expression
+# decref). The drop must follow the call op — before it is a UAF.
+fn ob_is_marked(a: Expr) : Bool = match a.kind {
+  ECall(callee, _) -> match callee.kind {
+    EVar(nm) -> nm == "__perceus_owned_borrow"
+    _        -> false
+  }
+  _ -> false
+}
+
+fn ob_drop_after(r: LRes, cargs: [Expr], avs: [KVal], pos: KPos) : LRes = match r {
+  LRes(v, st) -> LRes(v, ob_drop_go(st, cargs, avs, pos))
+}
+
+fn ob_drop_go(st: LowerSt, cargs: [Expr], avs: [KVal], pos: KPos) : LowerSt = match cargs {
+  []           -> st
+  [c, ...crest] -> match avs {
+    []           -> st
+    [v, ...vrest] -> {
+      let st1 = if ob_is_marked(c) { ls_emit(st, KRC(KDrop(v), pos)) } else { st }
+      ob_drop_go(st1, crest, vrest, pos)
+    }
+  }
 }
 
 # Route a bare-name call: a top-level fn or a core builtin is a direct
@@ -3049,7 +3076,8 @@ fn lower_callee_dispatch(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : 
     lower_direct_call(x, c_sym_of_callee_st(st, callee), cargs, st)
   } else {
     match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
-      bind_op(st1, KCallIndirect(KVar(callee), avs), kpos_of(x)) }
+      ob_drop_after(bind_op(st1, KCallIndirect(KVar(callee), avs), kpos_of(x)),
+                    cargs, avs, kpos_of(x)) }
   }
 
 # --- Resume / sentinels → typed terminators ----------------------------
