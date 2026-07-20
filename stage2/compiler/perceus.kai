@@ -811,9 +811,8 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # otherwise reset a raw sibling param's unbox scope. The borrow win lives
 # in the loop shape (container re-threaded, not last-use), which this
 # does not touch.
-fn pcs_strip_borrow_args(e: Expr, bmap: [BorrowEntry]) : Expr =
-  pcs_strip_borrow_args_c(e, bmap, [], [])
-
+# Context for the caller-side borrow strip.
+#
 # `bclosures` (issue #1130) — the current fn's borrowed function-typed
 # params. They live in the skip-set (never dup'd on a read), so when one
 # flows to an OWNED argument slot of a callee it would reach a consuming
@@ -821,21 +820,31 @@ fn pcs_strip_borrow_args(e: Expr, bmap: [BorrowEntry]) : Expr =
 # `parcBorrowApp`): re-insert `__perceus_dup(f)` at that owned-exit. The
 # decision is local — it uses only the callee's `bmap` positions, so the
 # balance closes inside this decl regardless of partition grouping.
-fn pcs_strip_borrow_args_b(e: Expr, bmap: [BorrowEntry], borrow_last: [String]) : Expr =
-  pcs_strip_borrow_args_d(e, bmap, borrow_last, [], [])
-
-fn pcs_strip_borrow_args_c(e: Expr, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String]) : Expr =
-  pcs_strip_borrow_args_d(e, bmap, borrow_last, bclosures, [])
-
+#
 # `fn_names` (issue #1130 rule 1) — the known top-level fns. A bare fn name
 # in a borrowed slot materialises a fresh `kai_closure` the callee borrows
 # but no one drops; it is marked `__perceus_owned_borrow` here for the emit
 # to balance after the call.
-fn pcs_strip_borrow_args_d(e: Expr, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : Expr =
-  Expr { kind: pcs_strip_borrow_kind(e.kind, bmap, borrow_last, bclosures, fn_names),
+#
+# `no_wrap` — names whose bare (un-dup'd) reads are NOT owned moves even
+# at their last-use position: borrowed params (borrow-through), raw
+# scalars, the move/reuse binder sets, exit-dropped locals.
+#
+# `uses` — the rewrite's use records, so the strip can recognise a
+# SINGLE-use name: its one bare read is a MOVE by the dup predicate's
+# own rule, and in a borrowed slot that move has no taker — it is
+# marked `__perceus_owned_borrow` so the emit drops the ref after the
+# call. Multi-use names are never marked: their bare borrowed reads are
+# stripped dups (net-zero), and per-read reclassification is unsound
+# where sugar clones share one source position.
+type StripCx = { bmap: [BorrowEntry], borrow_last: [String], bclosures: [String],
+                 fn_names: [String], no_wrap: [String], uses: [Use] }
+
+fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
+  Expr { kind: pcs_strip_borrow_kind(e.kind, scx),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : ExprKind = match k {
+fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
   ECall(callee, args_) -> {
     let key = pcs_callee_key(callee)
     # `__perceus_apply_borrow(f, args…)` — arg0 is the borrowed closure
@@ -843,22 +852,22 @@ fn pcs_strip_borrow_kind(k: ExprKind, bmap: [BorrowEntry], borrow_last: [String]
     # must not take the dup-on-consume. Its remaining args keep the owned
     # convention. Treat position 0 as borrowed for this call.
     if key == "__perceus_apply_borrow" {
-      let args2 = pcs_strip_args_at_d(args_, [0], 0, bmap, borrow_last, bclosures, fn_names)
-      ECall(pcs_strip_borrow_args_d(callee, bmap, borrow_last, bclosures, fn_names), args2)
+      let args2 = pcs_strip_args_at_d(args_, [0], 0, scx)
+      ECall(pcs_strip_borrow_args_d(callee, scx), args2)
     } else {
     # A prim call whose container arg0 is its LAST borrowed use stays
     # consuming: suppress the dup strip and the rename so the runtime
     # decref reclaims the container. Earlier borrowed reads are rewritten.
-    let keep_consuming = pcs_arg0_is_borrow_last(args_, borrow_last) and
+    let keep_consuming = pcs_arg0_is_borrow_last(args_, scx.borrow_last) and
                          (match pcs_prim_borrow_variant(key) { Some(_) -> true None -> false })
-    let positions = if keep_consuming { [] } else { pcs_borrow_lookup(bmap, key) }
-    let args2 = pcs_strip_args_at_d(args_, positions, 0, bmap, borrow_last, bclosures, fn_names)
+    let positions = if keep_consuming { [] } else { pcs_borrow_lookup(scx.bmap, key) }
+    let args2 = pcs_strip_args_at_d(args_, positions, 0, scx)
     let callee2 = if keep_consuming { callee }
                   else { pcs_maybe_rename_borrow_prim(callee, key, positions) }
-    ECall(pcs_strip_borrow_args_d(callee2, bmap, borrow_last, bclosures, fn_names), args2)
+    ECall(pcs_strip_borrow_args_d(callee2, scx), args2)
     }
   }
-  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_d(sub, bmap, borrow_last, bclosures, fn_names))
+  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_d(sub, scx))
 }
 
 # The arg0 var name, seeing through a `__perceus_dup(x)` wrap the rewrite
@@ -900,19 +909,10 @@ fn pcs_callee_key(callee: Expr) : String = match callee.kind {
 
 # For each arg: if its index is in `positions` (borrowed slot) and it is
 # `__perceus_dup(x)`, strip to `x`. Recurse into every arg either way.
-fn pcs_strip_args_at(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry]) : [Expr] =
-  pcs_strip_args_at_d(args_, positions, i, bmap, [], [], [])
-
-fn pcs_strip_args_at_b(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String]) : [Expr] =
-  pcs_strip_args_at_d(args_, positions, i, bmap, borrow_last, [], [])
-
-fn pcs_strip_args_at_c(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String]) : [Expr] =
-  pcs_strip_args_at_d(args_, positions, i, bmap, borrow_last, bclosures, [])
-
-fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEntry], borrow_last: [String], bclosures: [String], fn_names: [String]) : [Expr] = match args_ {
+fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : [Expr] = match args_ {
   []           -> []
   [a, ...rest] -> {
-    let a1 = pcs_strip_borrow_args_d(a, bmap, borrow_last, bclosures, fn_names)
+    let a1 = pcs_strip_borrow_args_d(a, scx)
     let borrowed_slot = pcs_has_int(positions, i)
     # Borrowed slot: strip the dup (callee borrows, no incref needed). A
     # freshly-materialised closure (a bare top-level fn name → kai_closure)
@@ -921,17 +921,55 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, bmap: [BorrowEnt
     # for the emit to recognise. The mark is a plain arg wrapper (like
     # `__perceus_dup`), NOT an EBlock — the emit unwraps it and balances the
     # ref in a local C statement-expression, invisible to tcrec/TCO.
+    # A bare read the rewrite classified as a MOVE takes the same mark:
+    # its delegated release never happens in a borrowing callee.
     # Owned slot carrying a bare borrowed closure: dup-on-consume (#1130,
     # rule 3) — the callee consumes it, so pay the incref here so the
     # borrowed param's single exit-drop still balances.
     let a2 = if borrowed_slot {
                let s = pcs_strip_dup_wrap(a1)
-               if pcs_arg_is_fn_name(s, fn_names) { pcs_wrap_owned_borrow(s) } else { s }
+               if pcs_arg_is_fn_name(s, scx.fn_names) and pcs_arg_is_untracked(s, scx.uses) { pcs_wrap_owned_borrow(s) }
+               else if pcs_arg_is_owned_move(a1, scx) { pcs_wrap_owned_borrow(s) }
+               else { s }
              }
-             else if pcs_arg_is_bare_borrowed_closure(a1, bclosures) { pcs_wrap_dup(a1) }
+             else if pcs_arg_is_bare_borrowed_closure(a1, scx.bclosures) { pcs_wrap_dup(a1) }
              else { a1 }
-    [a2, ...pcs_strip_args_at_d(rest, positions, i + 1, bmap, borrow_last, bclosures, fn_names)]
+    [a2, ...pcs_strip_args_at_d(rest, positions, i + 1, scx)]
   }
+}
+
+# A tracked name has recorded reads; a bare top-level fn name never
+# enters the use collector's scope, so it is LUUnused. Guards the
+# fn-name mark against a LOCAL that shadows a top-level fn's name —
+# its stripped-dup read is a borrow, and dropping it would over-free.
+fn pcs_arg_is_untracked(a: Expr, uses: [Use]) : Bool = match a.kind {
+  EVar(nm) -> match last_use_for(nm, uses) {
+    LUUnused(_) -> true
+    _           -> false
+  }
+  _ -> false
+}
+
+# A bare `EVar` argument (no dup wrap) naming a SINGLE-use value: the
+# rewrite's dup rule moves a sole read raw, delegating the release to
+# the callee — in a borrowed slot that transfer has no taker. Excludes
+# `no_wrap` names (their bare reads balance elsewhere: borrow-through,
+# skip/move sets, exit-dropped locals), lambda-blocked names, and
+# unboxable-typed reads (raw scalars with no rc — a drop temp against
+# one would reference a raw local the emit never declares).
+fn pcs_arg_is_owned_move(a: Expr, scx: StripCx) : Bool = match a.kind {
+  EVar(nm) ->
+    if list_has(scx.no_wrap, nm) { false }
+    else if pcs_count_non_lam_uses(nm, scx.uses, 0) != 1 { false }
+    else { match last_use_for(nm, scx.uses) {
+      LUAt(_, _, _) -> match a.ty {
+        Some(t) -> not ty_is_unboxable_t(t)
+        None    -> false
+      }
+      LUBlocked(_) -> false
+      LUUnused(_)  -> false
+    } }
+  _ -> false
 }
 
 # A bare `EVar(f)` argument (no dup wrap — it was suppressed by the skip-
@@ -1896,7 +1934,16 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
-        DFn(is_pub, name, tparams, params, opt_ret, row, reused_body, ln, cl, mo)
+        # Boxed LOCALS can still flow to borrowed callee slots; without the
+        # caller-side strip a bare last-use arg is a move no borrowing
+        # callee releases. Same strip as the mixed path — no params, so no
+        # borrowed/raw/skip sets and no `no_wrap` names.
+        let prim_bmap = pcs_prim_only_bmap(bmap)
+        let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
+        let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: [],
+                            fn_names: pcs_efn_names(fns), no_wrap: [], uses: uses }
+        let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
       else {
         # Boxed and MIXED-signature fns share this path. A mixed-sig fn
@@ -2041,7 +2088,14 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # owned callee slot re-dups here, so `map`/`filter` that delegate to
         # an owned private loop stay sound (the loop gets a genuinely owned
         # ref). Threaded into the strip so it fires per owned-exit.
-        let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, bmap, borrow_last, borrowed_closures, pcs_efn_names(fns))
+        # Bare-move detection: names whose bare reads are NOT owned moves —
+        # the skip/move/reuse sets (union already includes borrowed + raw
+        # params) plus the exit-dropped opaque locals and force-dup'd
+        # branchy singles.
+        let no_wrap = pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single)
+        let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: borrowed_closures,
+                            fn_names: pcs_efn_names(fns), no_wrap: no_wrap, uses: uses }
+        let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
     }
