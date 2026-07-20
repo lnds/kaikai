@@ -26,8 +26,18 @@
 # USAGE
 #   tools/gen-runtime-bc.sh                 # (re)generate if stale; no-op if fresh
 #   tools/gen-runtime-bc.sh --force         # always regenerate
-#   tools/gen-runtime-bc.sh --status        # print "active" / "optout"; exit 0
+#   tools/gen-runtime-bc.sh --status        # machine state (see below); exit 0
+#   tools/gen-runtime-bc.sh --status-line   # same state as one human line + remedy
 #   CLANG18=/path/to/clang-18 tools/gen-runtime-bc.sh
+#
+# THREE STATES, NOT TWO. "optout" alone hides whether the host CAN run P2:
+# a host with clang 18 and no .bc is one `make` away from active, while a
+# host without clang 18 needs an install. --status prints
+#   active                 the .bc is fresh; the native link inlines the runtime
+#   optout needs-regen     clang 18 resolvable, .bc missing or stale
+#   optout no-clang18      no clang 18 on this host
+# The first word keeps the original active/optout vocabulary, so callers that
+# test it are unaffected by the added reason field.
 #
 # EXIT: 0 on success OR clean opt-out (no clang 18). Non-zero only on a real
 # generation error (clang present but the compile failed). The build treats
@@ -88,14 +98,33 @@ resolve_clang() {
   return 1
 }
 
-if [ "$mode" = "--status" ]; then
+p2_state() {
   if [ -f "$BC_OUT" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$(input_hash)" ]; then
     echo "active"
+  elif [ -n "$(resolve_clang || true)" ]; then
+    echo "optout needs-regen"
   else
-    echo "optout"
+    echo "optout no-clang18"
   fi
-  exit 0
-fi
+}
+
+# One line a build banner / version field / benchmark header can print
+# verbatim: the state, what it costs, and the single command that fixes it.
+p2_status_line() {
+  case "$(p2_state)" in
+    active)
+      echo "ACTIVE (the native link inlines the runtime before O2)" ;;
+    "optout needs-regen")
+      echo "OPTOUT: bitcode not generated, but clang 18 IS installed ($(resolve_clang || true)) — heap-bound native code runs several times slower than CI's until you run: make KAI_LLVM=1 kaic2" ;;
+    *)
+      echo "OPTOUT: no clang 18 on this host — heap-bound native code runs several times slower than CI's; install one: brew install llvm@18 / apt-get install clang-18" ;;
+  esac
+}
+
+case "$mode" in
+  --status)      p2_state;       exit 0 ;;
+  --status-line) p2_status_line; exit 0 ;;
+esac
 
 CLANG="$(resolve_clang || true)"
 if [ -z "$CLANG" ]; then

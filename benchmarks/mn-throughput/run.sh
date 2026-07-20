@@ -53,6 +53,9 @@ fi
 echo "host:     $(uname -sm), $(getconf _NPROCESSORS_ONLN) cpu"
 echo "kaikai:   $("$ROOT/bin/kai" --version 2>/dev/null | head -1)"
 echo "commit:   $(git -C "$ROOT" rev-parse --short HEAD)"
+# The native backend runs ~2x slower without the P2 runtime bitcode, so a
+# native table taken with P2 off measures the opt-out, not the backend.
+echo "p2:       $("$ROOT/bin/kai" --version 2>/dev/null | sed -n 's/^native p2: *//p')"
 if [ "$HAVE_BEAM" = 1 ]; then
   elixir --version 2>/dev/null | grep -E '^(Elixir|Erlang)' | sed 's/^/          /'
 else

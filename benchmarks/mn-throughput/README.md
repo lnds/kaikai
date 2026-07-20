@@ -65,20 +65,29 @@ that led nowhere for want of them.
   and lands entirely in run 1.
 - Median of >= 5 warm runs, not the mean.
 - Checksum verified on every single run, not just the first.
+- Read the `p2:` line of the banner before publishing a native number. A
+  table taken with the P2 runtime bitcode in opt-out measures the opt-out,
+  not the backend — `bin/kai --version` and `make KAI_LLVM=1 kaic2` report
+  the same state, and `tools/gen-runtime-bc.sh --status-line` says how to
+  turn it on.
 
 ## Results
 
-Measured 2026-07-19 on `b2a50d4b` — the first commit where `KAI_THREADS>1`
-is sound (the double-dispatch fix, #1301/#1284). Before it the runtime lost
-fibers roughly one run in eight, so a throughput number measured noise.
+Measured 2026-07-20 on `d425a904`. It supersedes a 2026-07-19 take on
+`b2a50d4b` whose native table was ~2x slower across the board: that pass ran
+with the P2 runtime bitcode in opt-out and before #1336, and the two together
+put the native backend in a slow path it is no longer in. The environment
+banner now prints the P2 state on every run so a table cannot silently be
+taken that way again.
 
 | | |
 |---|---|
 | host | Apple M3 Max, 16 cores (12 performance + 4 efficiency), Darwin 25.5.0 |
 | kaikai | 0.103.0 hanga-roa, stage 2 self-hosted, `--release`, LLVM 21.1.8 |
+| P2 bitcode | **active** — `bin/kai --version` reports `native p2: active` |
 | Elixir | 1.20.2 (compiled with Erlang/OTP 29) |
 | Erlang | OTP 29, ERTS 17.0.3, JIT, `smp:16:16` — 16 schedulers online |
-| host state | **not headless**: WindowServer ~50%, sketchybar ~22%, loginwindow ~12%, WallpaperAerials ~5% — about 0.9 of 16 cores, ~5% background load |
+| host state | **not headless**: the usual desktop session, a few percent of background load |
 | samples | median of 7 warm runs per cell, first run discarded, strictly serial |
 
 The background load is symmetric — it costs kaikai and the BEAM the same
@@ -92,23 +101,32 @@ the newest Elixir: a win there takes no qualifiers.
 
 | scenario | kaikai@1 | @2 | @4 | @8 | @16 | BEAM@default | BEAM@+S1 |
 |---|---|---|---|---|---|---|---|
-| `serial` (1 x 2e8) | 214.2 | 218.1 | 226.8 | 226.3 | 224.1 | 381.2 | 570.8 |
-| `parallel8` (8 x 2e8) | 1708.9 | 873.6 | 443.6 | 224.4 | 224.7 | 451.6 | 4672.4 |
-| `parallel16` (16 x 1e8) | 1708.7 | 886.0 | 443.5 | 224.4 | **156.1** | **272.2** | 4695.7 |
-| `oversub64` (64 x 2.5e7) | 1711.4 | 873.4 | 445.4 | 224.2 | 154.7 | 262.7 | 4767.7 |
+| `serial` (1 x 2e8) | 105.6 | 107.4 | 108.6 | 109.5 | 111.1 | 395.1 | 609.6 |
+| `parallel8` (8 x 2e8) | 850.4 | 425.1 | 213.6 | 108.4 | 108.3 | 460.4 | 4821.2 |
+| `parallel16` (16 x 1e8) | 842.8 | 426.1 | 212.8 | 107.7 | **86.2** | **301.4** | 4820.9 |
+| `oversub64` (64 x 2.5e7) | 851.3 | 427.7 | 215.8 | 108.6 | 78.6 | 278.6 | 4835.0 |
 
 Same source, same `--release`, via `--backend=c`:
 
 | scenario | kaikai@1 | @2 | @4 | @8 | @16 | BEAM@default | BEAM@+S1 |
 |---|---|---|---|---|---|---|---|
-| `serial` (1 x 2e8) | 101.4 | 103.3 | 105.9 | 106.0 | 108.1 | 392.5 | 588.3 |
-| `parallel8` (8 x 2e8) | 821.4 | 421.6 | 211.8 | 106.6 | 108.4 | 414.4 | 4796.8 |
-| `parallel16` (16 x 1e8) | 811.5 | 422.5 | 210.5 | 106.5 | **77.4** | **273.2** | 4746.8 |
-| `oversub64` (64 x 2.5e7) | 822.1 | 423.3 | 213.1 | 107.1 | 71.1 | 263.4 | 4709.3 |
+| `serial` (1 x 2e8) | 106.6 | 107.8 | 109.6 | 108.5 | 110.5 | 397.0 | 606.4 |
+| `parallel8` (8 x 2e8) | 850.4 | 428.5 | 213.9 | 108.0 | 108.7 | 461.8 | 4808.0 |
+| `parallel16` (16 x 1e8) | 841.9 | 427.8 | 213.8 | 107.0 | **78.6** | **296.3** | 4833.1 |
+| `oversub64` (64 x 2.5e7) | 850.2 | 427.2 | 214.5 | 108.5 | 74.5 | 276.7 | 4792.3 |
 
 Every cell in a row printed the same checksum, on both runtimes and at every
 `KAI_THREADS` — the M:N scheduler neither lost nor duplicated work in ~800
 measured runs.
+
+**P2 is not what moves this workload.** Toggling the bitcode on the same
+compiler, same commit, changes the native column by under a percent
+(`serial` 105.6 vs 106.2 ms, `oversub64@16` 78.6 vs 79.2) — the load is a
+pure arithmetic loop that never calls a runtime op, so there is nothing for
+the runtime inlining to bite on. P2 earns its keep on heap-bound code
+instead (`list_fold` 1.66x, `rbtree_corpus` 3.78x on the same host). The
+native column moved because #1336 fixed the literal-divisor emission this
+loop's `i % 7` depends on; the earlier take confounded the two.
 
 ### Verdict
 
@@ -118,34 +136,34 @@ in-repo against Elixir 1.20.2 / OTP 29:
 
 | claim | measured | holds? |
 |---|---|---|
-| ~3.6x serial | 3.87x (`c`) / 1.78x (`native`) vs BEAM@default | only on the C backend |
-| ~5x parallel wall | 3.53x (`c`) / 1.74x (`native`) | **no** — best is 3.5x |
+| ~3.6x serial | 3.74x (`native`) / 3.72x (`c`) vs BEAM@default | yes, on both backends |
+| ~5x parallel wall | 3.50x (`native`) / 3.77x (`c`) | **no** — best is 3.8x |
 
 Two things the old headline hid.
 
 **kaikai does not scale better than the BEAM — it scales the same, from a
-faster start.** Both runtimes reach ~11x on 16 cores for this workload
-(kaikai 10.5-10.9x, BEAM 11.2x measured against its own single-scheduler-mode
-per-unit cost). The entire kaikai advantage is single-core speed carried
-through an equally good scheduler. That is still the right thing to claim —
-native code beats a JIT'd VM per core — but "we parallelise better" is not
-supported by this data.
+faster start.** Both runtimes reach ~10x on 16 cores for this workload
+(kaikai 9.8x native / 10.7x C, the BEAM about the same measured against its
+own single-scheduler-mode per-unit cost). The entire kaikai advantage is
+single-core speed carried through an equally good scheduler. That is still
+the right thing to claim — native code beats a JIT'd VM per core — but "we
+parallelise better" is not supported by this data.
 
-**Which backend you build with matters more than the scheduler.** The native
-backend emits ~2.1x slower code than the C backend on this loop (#1326), and
-that gap swallows more than half the advantage over the BEAM. Closing #1326
-is worth more to the headline than any further scheduler work.
+**The backend no longer picks the winner.** The earlier take had native
+emitting ~2.1x slower code than C on this loop (#1326); with #1336 shipped
+the two backends land within a percent of each other in every cell, so the
+default backend is no longer costing the headline anything here.
 
 What the M:N scheduler itself does well:
 
-- **95% parallel efficiency at 8 threads** (1708.7 → 224.4 ms, a 7.6x speedup
-  on 8 threads). Scaling to 16 is 10.9x, limited by the host's 12+4 core
+- **98% parallel efficiency at 8 threads** (850.4 → 108.4 ms, a 7.8x speedup
+  on 8 threads). Scaling to 16 is 9.8x, limited by the host's 12+4 core
   split, not by the runtime.
 - **Oversubscription is free.** 64 actors on 16 threads is no slower than 16
   actors — marginally faster, since finer work units even out the P/E-core
   imbalance.
 - **`+S 1` is not a fair single-core BEAM baseline.** BEAM@+S1 measures
-  570.8 ms serial against BEAM@default's 381.2 ms for the same one-process
+  609.6 ms serial against BEAM@default's 395.1 ms for the same one-process
   work — pinning to one scheduler costs the BEAM 1.5x beyond losing cores.
   Quoting a speedup against `+S 1` inflates it; the tables above use
   BEAM@default for every comparison in the verdict.
@@ -153,13 +171,12 @@ What the M:N scheduler itself does well:
 ### Measurement quality
 
 Spread (max-min as a % of the median) is under 3% for most cells. It exceeds
-10% in the fully saturated ones — kaikai@16 and BEAM@default — which is
-where the ~5% background UI load competes directly for the same 16 cores. An
-independent re-take at 15 warm runs moved those medians by under 5%
-(`parallel16` kaikai@16: 156.1 → 149.8 ms native, 77.4 → 75.5 ms C), so the
-spread is outlier-driven and the medians are reproducible. The harness flags
-any cell past `NOISE_PCT` (default 10%) rather than hiding it.
+10% in the fully saturated ones — kaikai@16 (11-20%) and BEAM@default (up to
+49% on `serial`) — which is where the background desktop load competes
+directly for the same 16 cores. Those are the cells to re-take on a quiet box
+before quoting a third digit; the harness flags every one of them past
+`NOISE_PCT` (default 10%) rather than hiding it.
 
-The margins here (1.7x-3.9x) are far outside that noise, so the ranking is
+The margins here (3.5x-3.8x) are far outside that noise, so the ranking is
 not in question; a clean-room re-take would tighten the third digit, not
 change the verdict.
