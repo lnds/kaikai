@@ -1061,10 +1061,11 @@ test-ffi-v2-struct: $(TARGET) build
 	  && echo "ffi-v2-struct OK (C backend)" \
 	  || { echo "ffi-v2-struct DIFF (C backend)"; diff ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-asan $(LDLIBS_M); \
-	./build/v2_struct-asan > build/v2_struct.asan.out 2>&1; \
+	./build/v2_struct-asan > build/v2_struct.asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/v2_struct.asan.raw > build/v2_struct.asan.out || true; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.asan.out > /dev/null \
 	  && echo "ffi-v2-struct OK (ASAN clean)" \
-	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.out; exit 1; }
+	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.raw; exit 1; }
 
 # FFI v2 (#417) — opaque handles. A handle is used in three consuming
 # calls (two bumps + the destructor), pinning the no-Drop ownership rule
@@ -1080,10 +1081,11 @@ test-ffi-v2-opaque: $(TARGET) build
 	  && echo "ffi-v2-opaque OK (C backend)" \
 	  || { echo "ffi-v2-opaque DIFF (C backend)"; diff ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_opaque.c ../examples/ffi/v2_shim.c -o build/v2_opaque-asan $(LDLIBS_M); \
-	./build/v2_opaque-asan > build/v2_opaque.asan.out 2>&1; \
+	./build/v2_opaque-asan > build/v2_opaque.asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/v2_opaque.asan.raw > build/v2_opaque.asan.out || true; \
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.asan.out > /dev/null \
 	  && echo "ffi-v2-opaque OK (ASAN clean)" \
-	  || { echo "ffi-v2-opaque ASAN DIFF"; cat build/v2_opaque.asan.out; exit 1; }
+	  || { echo "ffi-v2-opaque ASAN DIFF"; cat build/v2_opaque.asan.raw; exit 1; }
 
 # FFI v2 (#1030) — native backend marshals struct-by-value with the
 # platform C-ABI classification done in the emitter (AAPCS64 / x86-64
@@ -1487,10 +1489,12 @@ test-ffi-extern-c-asan: $(TARGET) build
 	      -I ../stage2 -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.out 2>&1; \
+	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/ffi_extern_c_basic-asan.raw \
+	  > build/ffi_extern_c_basic-asan.out || true; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-asan.out > /dev/null \
 	  && echo "ffi-extern-c-asan OK (C backend, ASAN+UBSan clean)" \
-	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.out; exit 1; }
+	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.raw; exit 1; }
 
 # Issue #933 / #934 regression — a non-libc user-symbol scalar extern
 # (#933) and the `Char` boundary type (#934), linked against
@@ -1499,6 +1503,12 @@ test-ffi-extern-c-asan: $(TARGET) build
 # regression cannot hide behind the undocumented `-Wno-implicit-...`
 # flag). Both fixtures run on the C backend + ASAN; the native backend
 # is exercised by the parity ratchet.
+#
+# ASAN prints a makecontext/swapcontext support warning on its own
+# stderr for every fibered program, which these recipes fold into the
+# compared output. It is not a finding — a real report still exits
+# non-zero and trips `set -e` — so it is filtered out of the diff and
+# kept in the `.raw` capture the failure branch prints.
 test-ffi-scalar-char: $(TARGET) build
 	@set -e; \
 	for f in extern_c_user_symbol extern_c_char; do \
@@ -1516,10 +1526,11 @@ test-ffi-scalar-char: $(TARGET) build
 	    -I ../stage2 -I ../stage0 build/$$f.c ../examples/ffi/scalar_shim.c -o build/$$f-c-asan; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$f-c-asan > build/$$f-asan.out 2>&1; \
+	    ./build/$$f-c-asan > build/$$f-asan.raw 2>&1; \
+	  grep -v "makecontext/swapcontext" build/$$f-asan.raw > build/$$f-asan.out || true; \
 	  diff -q $$exp build/$$f-asan.out > /dev/null \
 	    && echo "$$f OK (ASAN+UBSan clean)" \
-	    || { echo "$$f ASAN DIFF"; cat build/$$f-asan.out; exit 1; }; \
+	    || { echo "$$f ASAN DIFF"; cat build/$$f-asan.raw; exit 1; }; \
 	done
 
 # Issue #216 regression — qualified-call resolver inside a stdlib file.
@@ -5080,7 +5091,7 @@ test-perceus-1135-vec-value: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1135-vec FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5145,7 +5156,7 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec-raw FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1135-vec-raw FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5229,6 +5240,11 @@ test-perceus-1151-vec-push-growth-asan: $(TARGET) build
 # (modcall_linear_1153) and on the idiomatic stdlib surface
 # (vec_module_surface_1153, whose emitted C must also reach the raw
 # record-push fuse the forwarder inline exposes).
+#
+# The KAI_TRACE_RC ledgers are per-thread and the report prints only
+# the reporting thread's copy, so a total is complete on one scheduler
+# thread only. Every recipe asserting an exact counter pins
+# KAI_THREADS=1 until the ledgers sum across threads at exit.
 PERCEUS_1153_FIXTURES := modcall_linear_1153 vec_module_surface_1153
 
 test-perceus-1153-modcall-linear: $(TARGET) build
@@ -5238,7 +5254,7 @@ test-perceus-1153-modcall-linear: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	  grep -q 'vec_inplace=2000 vec_cow=0' build/s2-$$name.rc \
@@ -5305,7 +5321,7 @@ test-perceus-1150-vec-surface: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1150-vec-surface FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1150-vec-surface FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5376,7 +5392,7 @@ test-perceus-1126-read-loop-drop: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1126-read-loop-drop FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1126-read-loop-drop FAIL ($$name: output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name.rc | head -1 | cut -d= -f2); \
