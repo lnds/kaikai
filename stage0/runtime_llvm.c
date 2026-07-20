@@ -1438,40 +1438,72 @@ KaiValue *kaix_clause_env_get(void *self, int j) {
  * statics use the typed Ev<Eff> *self but the layout is the
  * same KaiHandlerId-leading prefix so the cast is safe. */
 KaiValue *kaix_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
-    return kai_default_stdout_print(self, s, k);
+    KaiValue *_op_r = kai_default_stdout_print(self, s, k);
+    kai_decref(s);
+    return _op_r;
 }
 KaiValue *kaix_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
-    return kai_default_stderr_eprint(self, s, k);
+    KaiValue *_op_r = kai_default_stderr_eprint(self, s, k);
+    kai_decref(s);
+    return _op_r;
 }
 KaiValue *kaix_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
-    return kai_default_fail_fail(self, msg, k);
+    KaiValue *_op_r = kai_default_fail_fail(self, msg, k);
+    kai_decref(msg);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_array_make(void *self, KaiValue *n, KaiValue *init, KaiCont *k) {
-    return kai_default_mutable_array_make(self, n, init, k);
+    KaiValue *_op_r = kai_default_mutable_array_make(self, n, init, k);
+    kai_decref(n);
+    kai_decref(init);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
-    return kai_default_mutable_array_length(self, a, k);
+    KaiValue *_op_r = kai_default_mutable_array_length(self, a, k);
+    kai_decref(a);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_array_get(void *self, KaiValue *a, KaiValue *i, KaiCont *k) {
-    return kai_default_mutable_array_get(self, a, i, k);
+    KaiValue *_op_r = kai_default_mutable_array_get(self, a, i, k);
+    kai_decref(a);
+    kai_decref(i);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_array_set(void *self, KaiValue *a, KaiValue *i, KaiValue *v, KaiCont *k) {
-    return kai_default_mutable_array_set(self, a, i, v, k);
+    KaiValue *_op_r = kai_default_mutable_array_set(self, a, i, v, k);
+    kai_decref(a);
+    kai_decref(i);
+    kai_decref(v);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_array_grow(void *self, KaiValue *a, KaiValue *n, KaiValue *init, KaiCont *k) {
-    return kai_default_mutable_array_grow(self, a, n, init, k);
+    KaiValue *_op_r = kai_default_mutable_array_grow(self, a, n, init, k);
+    kai_decref(a);
+    kai_decref(n);
+    kai_decref(init);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
-    return kai_default_mutable_ref_make(self, init, k);
+    KaiValue *_op_r = kai_default_mutable_ref_make(self, init, k);
+    kai_decref(init);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
-    return kai_default_mutable_ref_get(self, r, k);
+    KaiValue *_op_r = kai_default_mutable_ref_get(self, r, k);
+    kai_decref(r);
+    return _op_r;
 }
 KaiValue *kaix_default_mutable_ref_set(void *self, KaiValue *r, KaiValue *v, KaiCont *k) {
-    return kai_default_mutable_ref_set(self, r, v, k);
+    KaiValue *_op_r = kai_default_mutable_ref_set(self, r, v, k);
+    kai_decref(r);
+    kai_decref(v);
+    return _op_r;
 }
 KaiValue *kaix_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
-    return kai_default_random_int_range(self, lo, hi, k);
+    KaiValue *_op_r = kai_default_random_int_range(self, lo, hi, k);
+    kai_decref(lo);
+    kai_decref(hi);
+    return _op_r;
 }
 
 /* Clock default handler — LLVM-visible wrappers around the static
@@ -1483,39 +1515,63 @@ KaiValue *kaix_default_clock_monotonic_now(void *self, KaiCont *k) {
     return kai_default_clock_monotonic_now(self, k);
 }
 KaiValue *kaix_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k) {
-    return kai_default_clock_sleep_ns(self, ns, k);
+    KaiValue *_op_r = kai_default_clock_sleep_ns(self, ns, k);
+    kai_decref(ns);
+    return _op_r;
 }
 
 /* net-tcp-v1 — LLVM-visible wrappers around the static NetTcp
  * default handlers in runtime.h. The LLVM emitter installs these
  * by name from `kai_main_install_defaults`. */
 KaiValue *kaix_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
-    return kai_default_nettcp_connect(self, host, port, k);
+    KaiValue *_op_r = kai_default_nettcp_connect(self, host, port, k);
+    kai_decref(host);
+    kai_decref(port);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
-    return kai_default_nettcp_listen(self, host, port, k);
+    KaiValue *_op_r = kai_default_nettcp_listen(self, host, port, k);
+    kai_decref(host);
+    kai_decref(port);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k) {
-    return kai_default_nettcp_accept(self, l, k);
+    KaiValue *_op_r = kai_default_nettcp_accept(self, l, k);
+    kai_decref(l);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
-    return kai_default_nettcp_send(self, c, data, k);
+    KaiValue *_op_r = kai_default_nettcp_send(self, c, data, k);
+    kai_decref(c);
+    kai_decref(data);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
-    return kai_default_nettcp_recv(self, c, max, k);
+    KaiValue *_op_r = kai_default_nettcp_recv(self, c, max, k);
+    kai_decref(c);
+    kai_decref(max);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_recv_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k) {
-    return kai_default_nettcp_recv_timeout(self, c, max, ns, k);
+    KaiValue *_op_r = kai_default_nettcp_recv_timeout(self, c, max, ns, k);
+    kai_decref(c);
+    kai_decref(max);
+    kai_decref(ns);
+    return _op_r;
 }
 KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
-    return kai_default_nettcp_close(self, c, k);
+    KaiValue *_op_r = kai_default_nettcp_close(self, c, k);
+    kai_decref(c);
+    return _op_r;
 }
 
 /* Issue #352 — LLVM-visible forwarder for the NetDns default handler
  * (getaddrinfo shim in runtime.h). Installed by name from
  * `kai_main_install_defaults` when `NetDns` appears in main's row. */
 KaiValue *kaix_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
-    return kai_default_netdns_resolve(self, host, k);
+    KaiValue *_op_r = kai_default_netdns_resolve(self, host, k);
+    kai_decref(host);
+    return _op_r;
 }
 
 /* issue #354 — LLVM-visible wrappers around the static NetUdp
@@ -1523,16 +1579,28 @@ KaiValue *kaix_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
  * name from `kai_main_install_defaults` when `NetUdp` appears in
  * main's row. */
 KaiValue *kaix_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
-    return kai_default_netudp_bind(self, host, port, k);
+    KaiValue *_op_r = kai_default_netudp_bind(self, host, port, k);
+    kai_decref(host);
+    kai_decref(port);
+    return _op_r;
 }
 KaiValue *kaix_default_netudp_send(void *self, KaiValue *sock, KaiValue *dst, KaiValue *data, KaiCont *k) {
-    return kai_default_netudp_send(self, sock, dst, data, k);
+    KaiValue *_op_r = kai_default_netudp_send(self, sock, dst, data, k);
+    kai_decref(sock);
+    kai_decref(dst);
+    kai_decref(data);
+    return _op_r;
 }
 KaiValue *kaix_default_netudp_recv(void *self, KaiValue *sock, KaiValue *max, KaiCont *k) {
-    return kai_default_netudp_recv(self, sock, max, k);
+    KaiValue *_op_r = kai_default_netudp_recv(self, sock, max, k);
+    kai_decref(sock);
+    kai_decref(max);
+    return _op_r;
 }
 KaiValue *kaix_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
-    return kai_default_netudp_close(self, sock, k);
+    KaiValue *_op_r = kai_default_netudp_close(self, sock, k);
+    kai_decref(sock);
+    return _op_r;
 }
 
 /* Issue #141 — LLVM-visible wrappers around the static Log default
@@ -1540,25 +1608,38 @@ KaiValue *kaix_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
  * from `kai_main_install_defaults` when `Log` appears in main's
  * row. */
 KaiValue *kaix_default_log_debug(void *self, KaiValue *msg, KaiCont *k) {
-    return kai_default_log_debug(self, msg, k);
+    KaiValue *_op_r = kai_default_log_debug(self, msg, k);
+    kai_decref(msg);
+    return _op_r;
 }
 KaiValue *kaix_default_log_info(void *self, KaiValue *msg, KaiCont *k) {
-    return kai_default_log_info(self, msg, k);
+    KaiValue *_op_r = kai_default_log_info(self, msg, k);
+    kai_decref(msg);
+    return _op_r;
 }
 KaiValue *kaix_default_log_warn(void *self, KaiValue *msg, KaiCont *k) {
-    return kai_default_log_warn(self, msg, k);
+    KaiValue *_op_r = kai_default_log_warn(self, msg, k);
+    kai_decref(msg);
+    return _op_r;
 }
 KaiValue *kaix_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
-    return kai_default_log_error(self, msg, k);
+    KaiValue *_op_r = kai_default_log_error(self, msg, k);
+    kai_decref(msg);
+    return _op_r;
 }
 
 /* issue #140 — LLVM-visible wrappers around the static SecureRandom
  * default handlers in runtime.h. */
 KaiValue *kaix_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
-    return kai_default_securerandom_int_range(self, min_v, max_v, k);
+    KaiValue *_op_r = kai_default_securerandom_int_range(self, min_v, max_v, k);
+    kai_decref(min_v);
+    kai_decref(max_v);
+    return _op_r;
 }
 KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
-    return kai_default_securerandom_bytes(self, n_v, k);
+    KaiValue *_op_r = kai_default_securerandom_bytes(self, n_v, k);
+    kai_decref(n_v);
+    return _op_r;
 }
 
 /* Issue #570 — LLVM-visible wrappers around the static Spawn default
@@ -1571,19 +1652,29 @@ KaiValue *kaix_default_spawn_yield(void *self, KaiCont *k) {
     return kai_default_spawn_yield(self, k);
 }
 KaiValue *kaix_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k) {
-    return kai_default_spawn_spawn(self, thunk, k);
+    KaiValue *_op_r = kai_default_spawn_spawn(self, thunk, k);
+    kai_decref(thunk);
+    return _op_r;
 }
 KaiValue *kaix_default_spawn_await(void *self, KaiValue *fib, KaiCont *k) {
-    return kai_default_spawn_await(self, fib, k);
+    KaiValue *_op_r = kai_default_spawn_await(self, fib, k);
+    kai_decref(fib);
+    return _op_r;
 }
 KaiValue *kaix_default_spawn_select(void *self, KaiValue *fibs, KaiCont *k) {
-    return kai_default_spawn_select(self, fibs, k);
+    KaiValue *_op_r = kai_default_spawn_select(self, fibs, k);
+    kai_decref(fibs);
+    return _op_r;
 }
 KaiValue *kaix_default_spawn_cancel(void *self, KaiValue *fib, KaiCont *k) {
-    return kai_default_spawn_cancel(self, fib, k);
+    KaiValue *_op_r = kai_default_spawn_cancel(self, fib, k);
+    kai_decref(fib);
+    return _op_r;
 }
 KaiValue *kaix_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k) {
-    return kai_default_spawn_set_trap_exit(self, on, k);
+    KaiValue *_op_r = kai_default_spawn_set_trap_exit(self, on, k);
+    kai_decref(on);
+    return _op_r;
 }
 KaiValue *kaix_default_spawn_scope_enter(void *self, KaiCont *k) {
     return kai_default_spawn_scope_enter(self, k);
@@ -1608,13 +1699,19 @@ KaiValue *kaix_default_cancel_raise(void *self, KaiCont *k) {
  * returned NULL for Link/Monitor and any fiber body that called
  * `Link.link(_)` or `Monitor.monitor(_)` segfaulted on the first op. */
 KaiValue *kaix_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
-    return kai_default_link_link(self, peer, k);
+    KaiValue *_op_r = kai_default_link_link(self, peer, k);
+    kai_decref(peer);
+    return _op_r;
 }
 KaiValue *kaix_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
-    return kai_default_monitor_monitor(self, target, k);
+    KaiValue *_op_r = kai_default_monitor_monitor(self, target, k);
+    kai_decref(target);
+    return _op_r;
 }
 KaiValue *kaix_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
-    return kai_default_monitor_demonitor(self, ref, k);
+    KaiValue *_op_r = kai_default_monitor_demonitor(self, ref, k);
+    kai_decref(ref);
+    return _op_r;
 }
 
 /* Parity lane B (#622) — LLVM-visible wrappers around the static
@@ -1630,65 +1727,105 @@ KaiValue *kaix_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) 
  * segfaulting fixtures; Env/Signal share the same gap and are wired
  * here for completeness so the AST walk never re-opens it. */
 KaiValue *kaix_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
-    return kai_default_file_read_file(self, path, k);
+    KaiValue *_op_r = kai_default_file_read_file(self, path, k);
+    kai_decref(path);
+    return _op_r;
 }
 KaiValue *kaix_default_file_write_file(void *self, KaiValue *path, KaiValue *contents, KaiCont *k) {
-    return kai_default_file_write_file(self, path, contents, k);
+    KaiValue *_op_r = kai_default_file_write_file(self, path, contents, k);
+    kai_decref(path);
+    kai_decref(contents);
+    return _op_r;
 }
 /* Issue #771 Phase 1: chunked File ops — same forwarder shape. */
 KaiValue *kaix_default_file_open_read(void *self, KaiValue *path, KaiCont *k) {
-    return kai_default_file_open_read(self, path, k);
+    KaiValue *_op_r = kai_default_file_open_read(self, path, k);
+    kai_decref(path);
+    return _op_r;
 }
 KaiValue *kaix_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k) {
-    return kai_default_file_read_chunk(self, h, max, k);
+    KaiValue *_op_r = kai_default_file_read_chunk(self, h, max, k);
+    kai_decref(h);
+    kai_decref(max);
+    return _op_r;
 }
 KaiValue *kaix_default_file_open_write(void *self, KaiValue *path, KaiCont *k) {
-    return kai_default_file_open_write(self, path, k);
+    KaiValue *_op_r = kai_default_file_open_write(self, path, k);
+    kai_decref(path);
+    return _op_r;
 }
 KaiValue *kaix_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k) {
-    return kai_default_file_write_chunk(self, h, data, k);
+    KaiValue *_op_r = kai_default_file_write_chunk(self, h, data, k);
+    kai_decref(h);
+    kai_decref(data);
+    return _op_r;
 }
 KaiValue *kaix_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
-    return kai_default_file_close_file(self, h, k);
+    KaiValue *_op_r = kai_default_file_close_file(self, h, k);
+    kai_decref(h);
+    return _op_r;
 }
 KaiValue *kaix_default_stdin_read_line(void *self, KaiCont *k) {
     return kai_default_stdin_read_line(self, k);
 }
 KaiValue *kaix_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
-    return kai_default_stdin_read_bytes(self, n, k);
+    KaiValue *_op_r = kai_default_stdin_read_bytes(self, n, k);
+    kai_decref(n);
+    return _op_r;
 }
 KaiValue *kaix_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
-    return kai_default_process_start(self, cmd, args, k);
+    KaiValue *_op_r = kai_default_process_start(self, cmd, args, k);
+    kai_decref(cmd);
+    kai_decref(args);
+    return _op_r;
 }
 KaiValue *kaix_default_process_wait(void *self, KaiValue *child, KaiCont *k) {
-    return kai_default_process_wait(self, child, k);
+    KaiValue *_op_r = kai_default_process_wait(self, child, k);
+    kai_decref(child);
+    return _op_r;
 }
 KaiValue *kaix_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) {
-    return kai_default_process_kill(self, child, sig, k);
+    KaiValue *_op_r = kai_default_process_kill(self, child, sig, k);
+    kai_decref(child);
+    kai_decref(sig);
+    return _op_r;
 }
 KaiValue *kaix_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
-    return kai_default_process_exit(self, code, k);
+    KaiValue *_op_r = kai_default_process_exit(self, code, k);
+    kai_decref(code);
+    return _op_r;
 }
 KaiValue *kaix_default_env_args(void *self, KaiCont *k) {
     return kai_default_env_args(self, k);
 }
 KaiValue *kaix_default_env_get(void *self, KaiValue *name, KaiCont *k) {
-    return kai_default_env_get(self, name, k);
+    KaiValue *_op_r = kai_default_env_get(self, name, k);
+    kai_decref(name);
+    return _op_r;
 }
 KaiValue *kaix_default_env_set_var(void *self, KaiValue *name, KaiValue *value, KaiCont *k) {
-    return kai_default_env_set_var(self, name, value, k);
+    KaiValue *_op_r = kai_default_env_set_var(self, name, value, k);
+    kai_decref(name);
+    kai_decref(value);
+    return _op_r;
 }
 KaiValue *kaix_default_env_unset_var(void *self, KaiValue *name, KaiCont *k) {
-    return kai_default_env_unset_var(self, name, k);
+    KaiValue *_op_r = kai_default_env_unset_var(self, name, k);
+    kai_decref(name);
+    return _op_r;
 }
 KaiValue *kaix_default_env_vars(void *self, KaiCont *k) {
     return kai_default_env_vars(self, k);
 }
 KaiValue *kaix_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) {
-    return kai_default_signal_on(self, sig_v, k);
+    KaiValue *_op_r = kai_default_signal_on(self, sig_v, k);
+    kai_decref(sig_v);
+    return _op_r;
 }
 KaiValue *kaix_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) {
-    return kai_default_signal_off(self, sig_v, k);
+    KaiValue *_op_r = kai_default_signal_off(self, sig_v, k);
+    kai_decref(sig_v);
+    return _op_r;
 }
 KaiValue *kaix_default_signal_await(void *self, KaiCont *k) {
     return kai_default_signal_await(self, k);

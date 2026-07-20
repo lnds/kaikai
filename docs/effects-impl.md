@@ -774,6 +774,22 @@ a runtime witness) is pinned in §*Per-op type generics*.
 Perceus reuse analysis treats the CPS continuation closure as a
 first-class allocation. Three cases:
 
+### Op arguments are owned by the handler
+
+A call site hands every op argument over as an OWNED reference, and the
+handler entry point consumes it. A compiler-emitted user clause does that
+through the ordinary function-parameter discipline; a `$extern_handler`
+bridge does it in the generated shim (`_kai_default_<eff>_<op>_shim` on the
+C backend, `kaix_default_<eff>_<op>` on the native one), which keeps the
+runtime C bodies free to borrow and to `incref` only what they retain.
+
+The convention has to be fixed rather than inferred: an op call is
+dynamically dispatched, so the call site cannot know whether the handler
+that runs will be a user clause or a runtime default, and therefore cannot
+use the per-callee borrow map an ordinary call resolves against. Owned is
+the sound default — it is what Perceus already emits for every argument
+shape except a borrowed binder, which is duped into the slot.
+
 ### One-shot, unique (default)
 
 `resume` is called at most once; the continuation closure's RC

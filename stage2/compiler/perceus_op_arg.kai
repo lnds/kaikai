@@ -1,0 +1,49 @@
+# An effect-op argument is handed to its handler as an owned reference.
+#
+# Every other shape already produces one: a temporary is fresh, a multi-read
+# local dups, a single-read local moves its birth ref in. The one shape that
+# does not is a BORROWED binder — the function never owned it, so perceus
+# deliberately leaves its rc alone. Passing that read straight into an op would
+# have the handler side release a reference the caller still owns, and the next
+# read of the borrowed value is then a use-after-free.
+#
+# This pass dups those reads, and only those. A dotted callee is an op call by
+# the same rule codegen uses; a module call carries its own `EModCall` node.
+
+import compiler.ast
+import compiler.ast_map
+import compiler.infer
+
+pub fn poa_own_op_args(e: Expr, borrowed: [String]) : Expr = match borrowed {
+  []       -> e
+  [_, ...__] -> poa_expr(e, borrowed)
+}
+
+fn poa_expr(e: Expr, borrowed: [String]) : Expr =
+  Expr { kind: poa_kind(e.kind, borrowed), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
+
+fn poa_kind(k: ExprKind, borrowed: [String]) : ExprKind = match k {
+  ECall(f, args_) -> match f.kind {
+    EVar(callee) ->
+      if string_contains_dot(callee) {
+        ECall(f, map(args_, (a) => poa_arg(a, borrowed)))
+      } else { poa_generic(k, borrowed) }
+    _ -> poa_generic(k, borrowed)
+  }
+  _ -> poa_generic(k, borrowed)
+}
+
+fn poa_generic(k: ExprKind, borrowed: [String]) : ExprKind =
+  prc_map_expr_kind(k, (x) => poa_expr(x, borrowed))
+
+# A bare read of a borrowed binder is the only arg shape that arrives without
+# a reference of its own; anything else keeps whatever perceus decided.
+fn poa_arg(a: Expr, borrowed: [String]) : Expr = match a.kind {
+  EVar(nm) -> if list_has(borrowed, nm) { poa_dup(a) } else { a }
+  _        -> poa_expr(a, borrowed)
+}
+
+fn poa_dup(a: Expr) : Expr =
+  Expr { kind: ECall(mk_expr(EVar("__perceus_dup"), a.line, a.col), [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
