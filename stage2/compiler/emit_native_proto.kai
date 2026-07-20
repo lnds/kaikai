@@ -47,12 +47,23 @@ import compiler.emit_shared
 import compiler.native_prims
 import compiler.emit_native_ops
 
+#[doc("Which raw impls a TU defines boxed adapters for: every row (whole-program, modular root), or only the rows whose impl symbol is in the given set (a split partition — its sibling defines the rest, referenced extern at registration).")]
+pub type NAdapters = NAdaptAll | NAdaptOnly([String])
+
+fn nadapt_allows(a: NAdapters, csym: String) : Bool = match a {
+  NAdaptAll        -> true
+  NAdaptOnly(syms) -> list_has(syms, csym)
+}
+
 # Build `void _kai_proto_init_llvm()` with a real body: the variant-head +
 # impl-table register calls, then `ret void`. Called from `native_build_
 # runtime_hooks` in place of the old no-op. `decls`/`variants`/`fns` are the
 # post-perceus AST tables the driver already builds for the KIR lowering.
+# Registration always covers EVERY row; `adapters` only restricts which
+# adapter DEFINITIONS this TU emits (`nproto_impl_fnptr` get-or-declares, so
+# a row whose adapter lives in the sibling partition resolves at link).
 pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [EVar],
-                         fns: [EFn]) : Unit / Console = {
+                         fns: [EFn], adapters: NAdapters) : Unit / Console = {
   let rows = collect_pimpl_rows(decls, fns, [])
   let v2h  = collect_variant_to_head(variants, decls)
   # P3: emit every raw impl's `_kai_<csym>__boxed` adapter FIRST, each as a
@@ -60,7 +71,7 @@ pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [EVar],
   # `_kai_proto_init_llvm` below can take each adapter's address by symbol.
   # Emitting them inside the init hook would need a save/restore of the
   # builder's insert point; a separate up-front pass is cleaner.
-  nproto_emit_adapters(ctx, rows, decls)
+  nproto_emit_adapters(ctx, rows, decls, adapters)
   nproto_open_init(ctx)
   nproto_register_variants(ctx, v2h)
   nproto_register_impls(ctx, rows, decls)
@@ -68,6 +79,11 @@ pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [EVar],
   nproto_seed_nullary(ctx, variants)
   llvm_build_ret_void(native_ctx_b(ctx))
 }
+
+#[doc("Emit ONLY the boxed adapters whose impl symbol is in `only` — the split-core partition's share of the P3 shims. No init hook, no registration: the split root registers every row and resolves these definitions extern at link.")]
+pub fn nproto_emit_adapters_of(ctx: Handle, decls: [Decl], fns: [EFn],
+                               only: [String]) : Unit / Console =
+  nproto_emit_adapters(ctx, collect_pimpl_rows(decls, fns, []), decls, NAdaptOnly(only))
 
 # Seed every USER nullary ctor's immortal singleton at startup, so the steady-
 # state `kaix_nullary_fast` array load always hits (Red/Black/RBLeaf) and a
@@ -127,20 +143,21 @@ fn nproto_register_one_payload_ctor(ctx: Handle, tag: Int, nm: String, mask: Int
   ()
 }
 
-# Emit a boxed adapter for each raw impl (skip boxed impls + unknown-head
-# rows). Done before the init hook opens, so each adapter owns the builder
-# while it is filled.
-fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / Console =
+# Emit a boxed adapter for each raw impl (skip boxed impls, unknown-head
+# rows, and rows outside this TU's adapter share). Done before the init hook
+# opens, so each adapter owns the builder while it is filled.
+fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl],
+                        adapters: NAdapters) : Unit / Console =
   match rows {
     [] -> ()
     [pr, ...rest] -> {
       match pr {
         PR(csym, _, t, arity, sig, _) ->
-          if stdlib_head_tag_int(t, decls) >= 0 and pimpl_row_is_unboxed(pr) {
+          if stdlib_head_tag_int(t, decls) >= 0 and pimpl_row_is_unboxed(pr) and nadapt_allows(adapters, csym) {
             nproto_emit_boxed_adapter(ctx, csym, sig, arity)
           } else { () }
       }
-      nproto_emit_adapters(ctx, rest, decls)
+      nproto_emit_adapters(ctx, rest, decls, adapters)
     }
   }
 

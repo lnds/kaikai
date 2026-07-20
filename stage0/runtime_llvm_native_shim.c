@@ -130,4 +130,5 @@ KaiValue * kaix_core_native_di_finalize(void *cv) { return kai_native_di_finaliz
 KaiValue * kaix_core_native_di_set_loc(void *cv, int64_t line, int64_t col) { return kai_native_di_set_loc(cv, line, col); }
 KaiValue * kaix_core_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) { return kai_native_di_subprogram(cv, fnval, namev, line); }
 int64_t kaix_core_native_target_abi(void) { return kai_native_target_abi(); }
+KaiValue * kaix_core_llvm_backend_tag(void) { return kai_llvm_backend_tag(); }
 #endif /* KAI_LLVM */

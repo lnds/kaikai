@@ -183,7 +183,7 @@ warm-core: kaic2
 	KAI_MODULAR=1 ./bin/kai build --backend=c $$tmp/warm.kai -o $$tmp/warm-c >/dev/null 2>&1 || true; \
 	./bin/kai build $$tmp/warm.kai -o $$tmp/warm-n >/dev/null 2>&1 || true; \
 	rm -rf $$tmp; \
-	echo "core cache warmed (post-parse blobs + c-modular emit entries)"
+	echo "core cache warmed (post-parse blobs + c-modular emit entries + native core object)"
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.

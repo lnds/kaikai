@@ -117,19 +117,44 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [E
   # none of them. The `else ()` is load-bearing: kaic1 (which compiles stage2)
   # runs a bodied `if` WITHOUT an else unconditionally, so an if-expression is
   # the only form that actually gates the block.
-  # The owner emits the fn thunks over EVERY program fn, not just its own: a
-  # `KClosure` over `char.to_lower` in the `string` module references
+  # The modular owner emits the fn thunks over EVERY program fn, not just its
+  # own: a `KClosure` over `char.to_lower` in the `string` module references
   # `_kai_char__to_lower_thunk`, so all thunks must live in one TU (the owner)
   # for every module's closure to resolve one definition. Whole-program passes
-  # its own `define_fns` (== the emit set) so its byte shape is unchanged.
+  # its own `define_fns` (== the emit set) so its byte shape is unchanged. The
+  # SPLIT pair distributes instead: each side thunks its own define set, so
+  # every thunk still has exactly one (external) definition across the pair.
   let thunk_fns = match role { NModRoot -> all_fns _ -> define_fns }
+  let _t = match role {
+    NModLeaf -> ()
+    _        -> nemit_fn_thunks(ctx, thunk_fns)
+  }
   let _s = if nmod_owns_singletons(role) {
-    nemit_fn_thunks(ctx, thunk_fns)
-    native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns)
+    native_build_runtime_hooks(ctx, kp.defaults, decls, variants, fns,
+                               nadapters_for(role, define_fns))
     nemit_build_runner_driver(ctx, kp.runners, bmode)
   } else { () }
+  # The split core's share of the P3 boxed adapters (the split root registers
+  # every row and resolves these extern).
+  let _a = match role {
+    NModSplitCore -> nproto_emit_adapters_of(ctx, decls, fns, nemit_syms_of(define_fns))
+    _             -> ()
+  }
   # Resolve DWARF temporaries before verify (a no-op when DI is off).
   ndi_finalize(ctx)
+}
+
+# The adapter share of a singleton-owning TU: the split root defines only its
+# own partition's adapters; whole-program and the modular root define all.
+fn nadapters_for(role: NModRole, define_fns: [KFn]) : NAdapters = match role {
+  NModSplitRoot -> NAdaptOnly(nemit_syms_of(define_fns))
+  _             -> NAdaptAll
+}
+
+fn nemit_syms_of(fns: [KFn]) : [String] = nemit_syms_loop(fns, [])
+fn nemit_syms_loop(fns: [KFn], acc: [String]) : [String] = match fns {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> nemit_syms_loop(rest, [f.sym, ...acc])
 }
 
 # Replay the AST-derived evidence-frame table into the ctx, one slot per
@@ -239,10 +264,10 @@ fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl], all_fns: [K
 # `variants`/`fns` are the post-perceus AST tables the driver already
 # builds for the KIR lowering; the pure collectors live in `emit_shared`.
 fn native_build_runtime_hooks(ctx: Handle, defaults: [KDefault], decls: [Decl],
-                              variants: [EVar], fns: [EFn]) : Unit / Console = {
+                              variants: [EVar], fns: [EFn], adapters: NAdapters) : Unit / Console = {
   nemit_build_install_defaults(ctx, defaults)
   nemit_build_teardown_defaults(ctx, defaults)
-  nproto_build_init(ctx, decls, variants, fns)
+  nproto_build_init(ctx, decls, variants, fns, adapters)
 }
 
 # Derive the object-file path from the source path: `foo.kai` -> `foo.o`.

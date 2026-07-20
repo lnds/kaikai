@@ -1,0 +1,182 @@
+# compiler/emit_native_core.kai — the whole-program native build split into a
+# cached CORE object plus a per-build USER object.
+#
+# Every fn homing to an auto-loaded core module (plus the lambdas those fns
+# lift, whose symbols embed their enclosing module) emits into ONE core
+# object, content-addressed under the shared core cache dir. The core's KIR
+# is a pure function of the core sources — monomorphised instances of core
+# generics home to the root, so a user program cannot perturb the partition —
+# and the key folds everything else that shapes the object (toolchain id,
+# edition, target triple, opt level, runtime-bitcode ids, core source
+# hashes). A warm build therefore links the stored object and only lowers,
+# optimises and emits the user's own partition.
+#
+# Soundness is the modular-cache model: a stale object cannot be linked
+# because the key IS the content — any drift in what would be emitted (or in
+# what emits it) produces a different filename, and a miss re-emits. Both
+# partitions are raw (external-linkage) emissions of the SAME whole-program
+# tables, so their ABIs agree by construction, exactly like native-modular
+# partitions.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.user_cache
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.emit_native_modkey
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_test
+import compiler.emit_native
+
+#[doc("Configuration of the native core-object cache: the writable cache dir, the toolchain id, the edition, the backend tag (triple, opt level, bitcode ids), the joined core source hashes, and the stats toggle.")]
+pub type NCoreCfg = { dir: String, toolchain: String, edition: String,
+                      tag: String, srcs_hex: String, stats: Bool }
+
+#[doc("Emit the program as a user object at `obj_path` plus a content-addressed core object under the cache dir, reusing the stored core object on a key hit. Returns the object paths to link (user first), or empty on a codegen failure. Falls back to the single whole-program object when the core partition is empty or its emit fails.")]
+pub fn build_native_core_split(kp: KProgram, decls: [Decl], variants: [EVar],
+                               fns: [EFn], bmode: BuildMode, obj_path: String,
+                               src_path: String, cfg: NCoreCfg,
+                               core_names: [String]) : [String] / Console + File = {
+  let emit_fns = ncore_filter_main(kp.fns, bmode)
+  let stems = ncore_stems(core_names)
+  let core_fns = ncore_core_fns(emit_fns, stems)
+  if list_length(core_fns) == 0 {
+    ncore_whole(kp, decls, variants, fns, bmode, obj_path, src_path)
+  } else {
+    # A failed core emit (an unwritable cache dir, or a codegen failure)
+    # degrades to the whole-program object: an IO-only failure still builds,
+    # and a real codegen failure re-surfaces its diagnostics there.
+    match ncore_obtain(kp, decls, variants, fns, bmode, src_path, core_fns, cfg) {
+      None -> ncore_whole(kp, decls, variants, fns, bmode, obj_path, src_path)
+      Some(co) -> ncore_emit_user(kp, decls, variants, fns, bmode, src_path,
+                                  ncore_user_fns(emit_fns, stems), obj_path, co)
+    }
+  }
+}
+
+# Empty core partition: the plain whole-program object, single path.
+fn ncore_whole(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+               bmode: BuildMode, obj_path: String, src_path: String) : [String] / Console =
+  if build_native_object(kp, decls, variants, fns, bmode, obj_path, src_path) == 0 {
+    [obj_path]
+  } else { [] }
+
+# The core object to link: the cached one on a key hit, a freshly emitted one
+# on a miss, `None` on a codegen failure.
+fn ncore_obtain(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+                bmode: BuildMode, src_path: String, core_fns: [KFn],
+                cfg: NCoreCfg) : Option[String] / Console + File = {
+  let core_obj = concat_all([cfg.dir, "/ncore-", ncore_key(kp, core_fns, cfg), ".o"])
+  let hit = match read_file(core_obj) { Ok(_) -> true Err(_) -> false }
+  let _s = if cfg.stats {
+    eprint(cat2("kaic2: native-core-obj: ", if hit { "hit" } else { "miss" }))
+  } else { () }
+  if hit { Some(core_obj) }
+  else if ncore_emit(kp, decls, variants, fns, bmode, src_path, core_fns, NModSplitCore, "kai_native_core", core_obj) { Some(core_obj) }
+  else { None }
+}
+
+# Emit the user partition and return the pair to link (user first).
+fn ncore_emit_user(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+                   bmode: BuildMode, src_path: String, user_fns: [KFn],
+                   obj_path: String, core_obj: String) : [String] / Console =
+  if ncore_emit(kp, decls, variants, fns, bmode, src_path, user_fns, NModSplitRoot, "kai_native", obj_path) {
+    [obj_path, core_obj]
+  } else { [] }
+
+# Drop the user `fn main` in runner mode (the synthetic driver owns
+# `kai_main`), matching the whole-program emitter's filter.
+fn ncore_filter_main(fns: [KFn], bmode: BuildMode) : [KFn] =
+  if nemit_is_runner_mode(bmode) { filter(fns, (f) => not (f.sym == "main")) } else { fns }
+
+# Build one partition module and emit it raw (external linkage, the
+# separate-compilation runtime-bc merge). True on success. The core object's
+# path is content-addressed, so a concurrent build racing on the same key
+# writes byte-identical bytes.
+fn ncore_emit(kp: KProgram, decls: [Decl], variants: [EVar], fns: [EFn],
+              bmode: BuildMode, src_path: String, define_fns: [KFn],
+              role: NModRole, mod_name: String, obj: String) : Bool / Console = {
+  let m = llvm_module_new(mod_name)
+  let ctx = native_ctx_new(m)
+  nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path,
+                     define_fns, kp.fns, role)
+  if native_ctx_ok(ctx) == 1 { llvm_emit_object_raw(m, obj) == 0 }
+  else {
+    eprint("native: core-split partition not emitted — a KIR node is outside the current subset (see above)")
+    false
+  }
+}
+
+# ---- partition ---------------------------------------------------------
+
+# Core-module stems as they appear in mangled symbols (dots → underscores).
+fn ncore_stems(core_names: [String]) : [String] = ncore_stems_loop(core_names, [])
+fn ncore_stems_loop(ms: [String], acc: [String]) : [String] = match ms {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> ncore_stems_loop(rest, [ncore_dots(m, 0, string_length(m), ""), ...acc])
+}
+
+fn ncore_dots(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else {
+    let c = string_slice(s, i, 1)
+    ncore_dots(s, i + 1, n, cat2(acc, if c == "." { "_" } else { c }))
+  }
+
+fn ncore_core_fns(fns: [KFn], stems: [String]) : [KFn] =
+  filter(fns, (f) => ncore_is_core(f, stems))
+
+fn ncore_user_fns(fns: [KFn], stems: [String]) : [KFn] =
+  filter(fns, (f) => not (ncore_is_core(f, stems)))
+
+# A fn belongs to the core partition when it homes to a core module, or when
+# it is a lambda lifted from a core fn — a lambda's `mo` is None, but its
+# symbol (`_kai_lam_<enc_fn>_<line>_<col>`) embeds the enclosing fn's
+# module-mangled name, which is derived from the core source alone.
+#
+# Monomorphised instances are EXCLUDED even when they home to a core module:
+# which instances exist depends on the program's call sites, so keeping them
+# in the partition would fork the core key per program. They ride the user
+# object instead (the baseline core carries essentially none, so the user
+# partition stays small and the core object is program-invariant).
+fn ncore_is_core(f: KFn, stems: [String]) : Bool =
+  if ncore_is_mono(f.sym) { false }
+  else { match f.mo {
+    Some(m) -> list_has(stems, ncore_dots(m, 0, string_length(m), ""))
+    None -> match f.kind {
+      KFnLambda -> ncore_lam_is_core(f.sym, stems)
+      _         -> false
+    }
+  } }
+
+# One scan for `mono__` covers both mangles (`__mono__` and `__umono__`);
+# no core identifier contains that fragment (only comments do).
+fn ncore_is_mono(sym: String) : Bool =
+  ncore_scan(sym, "mono__", 0, string_length(sym), 6)
+
+fn ncore_scan(s: String, needle: String, i: Int, n: Int, m: Int) : Bool =
+  if i + m > n { false }
+  else if string_slice(s, i, m) == needle { true }
+  else { ncore_scan(s, needle, i + 1, n, m) }
+
+fn ncore_lam_is_core(sym: String, stems: [String]) : Bool = match stems {
+  [] -> false
+  [s, ...rest] ->
+    if string_starts_with_q(sym, concat_all(["_kai_lam_", s, "__"])) { true }
+    else { ncore_lam_is_core(sym, rest) }
+}
+
+# ---- content key -------------------------------------------------------
+
+# The cached core object's key: the projected KIR (fns defined + referenced
+# signatures, the modular-cache discipline) plus every out-of-KIR input that
+# shapes the emitted object — toolchain id, edition, backend tag (triple, opt
+# level, runtime-bitcode ids), and the core source hashes (evidence frames
+# and effect rows derive from the sources without necessarily showing in the
+# KIR dump). Any drift in any component misses; a hit is exact.
+fn ncore_key(kp: KProgram, core_fns: [KFn], cfg: NCoreCfg) : String =
+  uc_content_hex(concat_all([
+    "NCO1\n", cfg.toolchain, "\n", cfg.edition, "\n", cfg.tag, "\n", cfg.srcs_hex, "\n",
+    nmodkey_of(kp, core_fns, "splitcore")]))

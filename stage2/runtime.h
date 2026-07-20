@@ -15999,6 +15999,37 @@ static int64_t kai_native_target_abi(void) {
     }
     return plat;
 }
+/* Identity of everything OUTSIDE the KIR that shapes an emitted native
+ * object: the target triple, the opt level, and the runtime bitcodes the
+ * emit step merges. Folded into the cached core object's content key so a
+ * toolchain-, target- or bitcode-level change can never resurrect a stale
+ * object whose KIR text happens to match. Empty string when the split
+ * cache must not engage: an explicit KAI_NATIVE_CORE_OBJ=0, or a
+ * non-default opt level (`--debug` keeps the single-object path and its
+ * dSYM flow). Bitcode identity is mtime-size (the kaic2 toolchain-id
+ * discipline), not a content hash: a regenerated identical bitcode costs
+ * one spurious miss, never a stale hit. */
+static void kai_llvm_bc_id(const char *env, char *out, size_t outsz) {
+    const char *p = getenv(env);
+    struct stat st;
+    if (p && p[0] && stat(p, &st) == 0)
+        snprintf(out, outsz, "%lld-%lld", (long long) st.st_mtime, (long long) st.st_size);
+    else
+        snprintf(out, outsz, "none");
+}
+static KaiValue *kai_llvm_backend_tag(void) {
+    const char *off = getenv("KAI_NATIVE_CORE_OBJ");
+    if (off && strcmp(off, "0") == 0) return kai_str("");
+    const char *lvl = getenv("KAI_NATIVE_OPT");
+    if (lvl && lvl[0] && strcmp(lvl, "2") != 0) return kai_str("");
+    char *triple = LLVMGetDefaultTargetTriple();
+    char bc[64], inlbc[64], tag[512];
+    kai_llvm_bc_id("KAI_NATIVE_RUNTIME_BC", bc, sizeof bc);
+    kai_llvm_bc_id("KAI_NATIVE_RUNTIME_INLINE_BC", inlbc, sizeof inlbc);
+    snprintf(tag, sizeof tag, "%s|O2|bc:%s|inlbc:%s", triple ? triple : "?", bc, inlbc);
+    if (triple) LLVMDisposeMessage(triple);
+    return kai_str(tag);
+}
 /* `n` copies of one pointer type, for the all-boxed fn signatures the
  * KIR lowers (every param/return is `ptr`). */
 static void *kai_llvm_fn_type_boxed(void *ptr_t, int64_t n) {
@@ -17087,10 +17118,23 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
         return 1;
     }
 
-    if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, out, LLVMObjectFile, &err)) {
-        fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
-        if (err) LLVMDisposeMessage(err);
-        rc = 1;
+    /* Atomic publish: emit to a pid-suffixed sibling, then rename() onto the
+     * final path. A content-addressed object (the shared core cache) can be
+     * read by a concurrent build the moment it exists, so it must never be
+     * observable half-written; rename within one directory is atomic. */
+    {
+        char tmp_out[4096];
+        snprintf(tmp_out, sizeof tmp_out, "%s.tmp%ld", out, (long) getpid());
+        if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, tmp_out, LLVMObjectFile, &err)) {
+            fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
+            if (err) LLVMDisposeMessage(err);
+            unlink(tmp_out);
+            rc = 1;
+        } else if (rename(tmp_out, out) != 0) {
+            fprintf(stderr, "kai: native object publish failed: %s -> %s\n", tmp_out, out);
+            unlink(tmp_out);
+            rc = 1;
+        }
     }
 
     LLVMDisposeTargetMachine(tm);
@@ -17181,6 +17225,9 @@ static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (
 static KaiValue *kai_llvm_add_nounwind(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_memory_none(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
+/* Silent (no abort): the driver probes this to decide whether the split
+ * core-object cache can engage; "" means it cannot on a C-only kaic2. */
+static KaiValue *kai_llvm_backend_tag(void) { return kai_str(""); }
 static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_zext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
