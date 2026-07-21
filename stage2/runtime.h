@@ -2940,6 +2940,14 @@ struct KaiFiber {
      * drains the stack post-swap and commits each. A stack (not a single
      * slot) because two parks can interpose before the root drains. */
     KaiFiber *commit_next;
+    /* ThreadSanitizer's per-fiber bookkeeping handle, or NULL outside a TSAN
+     * build. TSAN tracks a shadow stack and a sync clock per OS thread and
+     * cannot see a ucontext switch, so without this every fiber's function
+     * entries and exits land on whichever thread happens to run it; a fiber
+     * that migrates pushes on one thread and pops on another, and the
+     * imbalance eventually walks a shadow stack off its fixed-size mapping.
+     * See KAI_TSAN_SWITCH_TO. */
+    void *tsan_fiber;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -2989,7 +2997,8 @@ struct KaiNursery {
     0,                   /* home_thread — thread 0 is the main scheduler */ \
     0,                   /* wake_pending */                              \
     0,                   /* pending_park — not a reactor park */          \
-    NULL                 /* commit_next */                               \
+    NULL,                /* commit_next */                               \
+    NULL                 /* tsan_fiber — bound on this thread's first switch */ \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -3006,6 +3015,93 @@ KAI_TLS KaiFiber *kai_active_fiber = NULL;
 #else
 static KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
 static KAI_TLS KaiFiber *kai_active_fiber = NULL;
+#endif
+
+/* ---------- ThreadSanitizer fiber annotations ----------
+ *
+ * TSAN keys its shadow stack and sync clocks to the OS thread. A ucontext
+ * switch is invisible to it, so an unannotated fiber runtime feeds one
+ * thread's bookkeeping with another fiber's entries: under work stealing a
+ * fiber pushes frames on the thread that started it and pops them on the
+ * thread that resumed it, and the drift eventually walks a shadow stack off
+ * its mapping — a store fault inside the sanitizer, which the process then
+ * spins on rather than dying. The annotations below give
+ * each fiber (and each thread's scheduler root) its own TSAN state, which is
+ * what makes race reports meaningful under M:N at all.
+ *
+ * Every swapcontext/setcontext in the scheduler is immediately preceded by
+ * KAI_TSAN_SWITCH_TO / KAI_TSAN_SWITCH_TO_ROOT. Outside a TSAN build all of
+ * this compiles away.
+ *
+ * The switch itself is a macro, not a function, and that is load-bearing.
+ * TSAN pushes a frame record on entry to every instrumented function and pops
+ * one on return; a helper that changed fiber identity in its middle would push
+ * onto the outgoing fiber's shadow stack and pop from the incoming one,
+ * leaking a record per switch until a shadow stack ran off the end of its
+ * mapping — the very failure these annotations exist to prevent. Expanded at
+ * the call site, the identity change happens inside a frame that enters and
+ * leaves on one fiber, so the bookkeeping stays balanced. The two out-of-line
+ * accessors below run entirely on the outgoing fiber, before the switch. */
+#if defined(__SANITIZE_THREAD__)
+#  define KAI_TSAN_FIBERS 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define KAI_TSAN_FIBERS 1
+#  endif
+#endif
+
+#if defined(KAI_TSAN_FIBERS)
+void *__tsan_get_current_fiber(void);
+void *__tsan_create_fiber(unsigned flags);
+void  __tsan_destroy_fiber(void *fiber);
+void  __tsan_switch_to_fiber(void *fiber, unsigned flags);
+
+/* This thread's scheduler root adopts the thread's own TSAN state rather than
+ * a fresh one, so a root never looks like a fiber. It must be captured while
+ * the thread is still running AS the root — `__tsan_get_current_fiber()` from
+ * inside a fiber would alias the root's handle onto that fiber's state, and
+ * every later "switch back to root" would then land on a fiber. Hence the
+ * eager bind at the top of each scheduler loop rather than a lazy one at the
+ * first switch. noinline for the same reason kai_current_fiber is: the
+ * thread-local slot must be re-resolved on whatever thread runs this, never
+ * spilled across a swap by a caller whose frame spans one (the trampoline's
+ * does). */
+__attribute__((noinline))
+static void kai_tsan_bind_root(void) {
+    if (!kai_main_fiber.tsan_fiber) {
+        kai_main_fiber.tsan_fiber = __tsan_get_current_fiber();
+    }
+}
+
+__attribute__((noinline))
+static void *kai_tsan_root_fiber(void) {
+    return kai_main_fiber.tsan_fiber;
+}
+
+/* A fiber's own state, created on first dispatch. */
+__attribute__((noinline))
+static void *kai_tsan_fiber_of(KaiFiber *f) {
+    if (!f->tsan_fiber) f->tsan_fiber = __tsan_create_fiber(0);
+    return f->tsan_fiber;
+}
+
+#define KAI_TSAN_BIND_ROOT()      kai_tsan_bind_root()
+#define KAI_TSAN_SWITCH_TO(f)     __tsan_switch_to_fiber(kai_tsan_fiber_of(f), 0)
+#define KAI_TSAN_SWITCH_TO_ROOT() __tsan_switch_to_fiber(kai_tsan_root_fiber(), 0)
+
+/* Release a finished fiber's TSAN state. Called from the deferred-free drain,
+ * which runs on another context, so the state being dropped is never current. */
+static void kai_tsan_fiber_free(KaiFiber *f) {
+    if (f->tsan_fiber) {
+        __tsan_destroy_fiber(f->tsan_fiber);
+        f->tsan_fiber = NULL;
+    }
+}
+#else
+#define KAI_TSAN_BIND_ROOT()      ((void) 0)
+#define KAI_TSAN_SWITCH_TO(f)     ((void) 0)
+#define KAI_TSAN_SWITCH_TO_ROOT() ((void) 0)
+static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 #endif
 
 /* noinline is load-bearing: inlined into a fiber body, clang materialises
@@ -3267,6 +3363,7 @@ static void kai_drain_pending_free(void) {
     if (f->stack_base) {
         munmap(f->stack_base, f->stack_size + kai_page_size());
     }
+    kai_tsan_fiber_free(f);
     free(f);
 }
 
@@ -13917,12 +14014,14 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
  * root fiber finishing. */
 static void kai_worker_loop(void) {
     KaiFiber *self_root = &kai_main_fiber;
+    KAI_TSAN_BIND_ROOT();
     for (;;) {
         if (kai_sched_shutting_down) return;
         KaiFiber *next = kai_worker_find_work();
         if (next) {
             next->state = KAI_FIBER_RUNNING;
             kai_active_fiber = next;
+            KAI_TSAN_SWITCH_TO(next);
             swapcontext(&self_root->ctx, &next->ctx);
             kai_active_fiber = self_root;
             kai_drain_pending_free();
@@ -13968,6 +14067,7 @@ static void kai_sched_yield(void) {
         current->commit_next  = kai_requeue_stack_head;
         kai_requeue_stack_head = current;
         kai_active_fiber = &kai_main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT();
         swapcontext(&current->ctx, &kai_main_fiber.ctx);
         kai_set_active_fiber(current);
         kai_drain_pending_free();
@@ -13980,6 +14080,7 @@ static void kai_sched_yield(void) {
     kai_sched_enqueue(current);
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
     swapcontext(&current->ctx, &next->ctx);
     /* Resumed: another fiber yielded/parked back to us; the swap
      * source (current->ctx) holds the state that was just restored.
@@ -14036,6 +14137,7 @@ static void kai_sched_park(void) {
         current->commit_next   = kai_commit_stack_head;
         kai_commit_stack_head  = current;
         kai_active_fiber = &kai_main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT();
         swapcontext(&current->ctx, &kai_main_fiber.ctx);
         kai_set_active_fiber(current);
         kai_drain_pending_free();
@@ -14078,6 +14180,7 @@ static void kai_sched_park(void) {
     }
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
     swapcontext(&current->ctx, &next->ctx);
     /* R4 fix — see kai_sched_yield: drain pending free on resume. */
     kai_drain_pending_free();
@@ -14129,6 +14232,7 @@ static void kai_sched_unpark(KaiFiber *target) {
  * result when f's RC drops. */
 static void kai_fiber_uc_link_landing(void) {
     kai_active_fiber = &kai_main_fiber;
+    KAI_TSAN_SWITCH_TO_ROOT();
     setcontext(&kai_main_fiber.ctx);
     fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
     exit(1);
@@ -14270,9 +14374,11 @@ static void kai_fiber_trampoline(void) {
         if (next) {
             next->state = KAI_FIBER_RUNNING;
             kai_set_active_fiber(next);
+            KAI_TSAN_SWITCH_TO(next);
             setcontext(&next->ctx);
         }
         kai_set_active_fiber(&kai_main_fiber);
+        KAI_TSAN_SWITCH_TO_ROOT();
         setcontext(&kai_main_fiber.ctx);
         /* setcontext does not return. */
     }
@@ -14291,6 +14397,7 @@ static void kai_fiber_trampoline(void) {
     }
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
     setcontext(&next->ctx);
     /* setcontext does not return. */
 }
@@ -14341,6 +14448,7 @@ static void kai_bootstrap_trampoline(void) {
      * the whole user main, so an inline store would reuse the slot address
      * resolved before main ever parked. */
     kai_set_active_fiber(&kai_main_fiber);
+    KAI_TSAN_SWITCH_TO_ROOT();
     setcontext(&kai_main_fiber.ctx);
 }
 #if defined(__APPLE__) || defined(__clang__)
@@ -14413,6 +14521,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     kai_nthreads = kai_read_nthreads();
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
+        KAI_TSAN_BIND_ROOT();
         return user_main();
     }
 

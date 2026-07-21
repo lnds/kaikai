@@ -68,6 +68,11 @@ FIXTURES=(
   # complete, which is a hang, and the sum witness makes a partial delivery
   # visible even if it somehow completed.
   "examples/effects/mn_cross_thread_block_sender.kai"
+  # Yield points deep inside a non-tail call chain, so every steal migrates a
+  # tall stack of live frames. Nothing on a suspended stack may reference the
+  # thread that built it — depth is what makes a violation reachable rather
+  # than theoretical.
+  "examples/effects/mn_deep_stack_migration.kai"
 )
 
 # kai: the shipped build path (separate -O0 scheduler owner).
