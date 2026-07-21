@@ -139,6 +139,16 @@ run_with_timeout() {
   fi
 }
 
+# Rewrite ISO-8601 UTC timestamps (the stdlib Log default handler's
+# `[YYYY-MM-DDTHH:MM:SSZ] LEVEL message` form, docs/log.kai) to a fixed
+# placeholder before any oracle/target comparison. Applied identically to
+# both sides, so a real content divergence still fails; only the
+# wall-clock second — which can differ between two runs straddling a
+# second boundary under parallel load — is masked.
+normalize_timestamps() {
+  sed -E 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[TIMESTAMP]/g'
+}
+
 # Collect entry points into $tmp/entry-points (one path per line).
 #
 # `quarantine/` subdirs hold fixtures that DOCUMENT broken/accidental
@@ -255,6 +265,8 @@ process_one() {
   run_with_timeout "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
   t_rc=0
   run_with_timeout "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
+  normalize_timestamps <"$o_out_file" >"$o_out_file.norm" && mv "$o_out_file.norm" "$o_out_file"
+  normalize_timestamps <"$t_out_file" >"$t_out_file.norm" && mv "$t_out_file.norm" "$t_out_file"
 
   if [ "$o_rc" != "$t_rc" ]; then
     {
@@ -286,7 +298,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results SKIPS_FILE RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one is_skipped run_with_timeout
+export -f process_one is_skipped run_with_timeout normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
@@ -351,14 +363,14 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
     rf="$1"
     rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
     KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 2
-    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null)" || oref=$?
+    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null | normalize_timestamps)" || oref=$?
     attempt=0
     while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
       if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
-      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null)" || rt=$?
+      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | normalize_timestamps)" || rt=$?
       if [ "$rt" != "$oref" ] || [ "$rtout" != "$orefout" ]; then
         return 0   # diverged on a recheck => a real (new) gap.
       fi
