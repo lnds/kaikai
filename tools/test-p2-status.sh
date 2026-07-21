@@ -52,6 +52,11 @@ make_sandbox() {
       -e 's#/usr/lib/llvm-18/bin/clang#/nonexistent/c#' \
       "$ROOT/tools/gen-runtime-bc.sh" > "$dir/tools/gen-runtime-bc.sh"
   chmod +x "$dir/tools/gen-runtime-bc.sh"
+  # The generator runs the thread-local hoist gate on what it produced. That
+  # gate has its own test; here it is stubbed, so this sandbox exercises status
+  # resolution and nothing else (the stub clang emits an empty .bc anyway).
+  printf '#!/bin/sh\nexit 0\n' > "$dir/tools/tls-hoist-gate.sh"
+  chmod +x "$dir/tools/tls-hoist-gate.sh"
   # `clang-18` and `cc` are the two PATH-resolved candidates left; both stub
   # to the same reported version so a host clang cannot leak into the test.
   for name in clang-18 cc; do
