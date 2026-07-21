@@ -20,6 +20,20 @@ KAI="$ROOT/bin/kai"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+. "$ROOT/tools/lib/timeout.sh"
+
+# A scheduler deadlock wedges the fixture instead of failing it, and an
+# unbounded run then burns the whole CI job ceiling and reports `cancelled`
+# — indistinguishable from a routine supersede. Bound each run so a wedge
+# fails here, naming the fixture. TSAN slows execution ~30-50x and the
+# fixture still finishes in seconds, so the default is ~10x headroom.
+RUN_TIMEOUT="${MN_TSAN_RUN_TIMEOUT:-120}"
+
+if [ "$KAI_TIMEOUT_KIND" = none ]; then
+  echo "run-mn-tsan: WARNING — no timeout(1), gtimeout or perl on this host;"
+  echo "  a wedged run will block instead of being reported as a hang."
+fi
+
 # TSAN-instrumented, C backend (the portable oracle runtime).
 TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitize=thread"
 
@@ -42,16 +56,26 @@ for src in "${FIXTURES[@]}"; do
     >/dev/null 2>"$TMP/build.log" || { echo "BUILD FAILED"; cat "$TMP/build.log"; exit 1; }
 
   # N=1 reference output (no threads, no TSAN cross-thread reports).
-  out1="$(KAI_THREADS=1 "$bin")"
+  ec=0
+  out1="$(kai_timeout "$RUN_TIMEOUT" env KAI_THREADS=1 "$bin")" || ec=$?
+  if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
+    echo "HANG: $name wedged at KAI_THREADS=1 (no exit within ${RUN_TIMEOUT}s)"; fail=1; continue
+  elif [ "$ec" != 0 ]; then
+    echo "FAIL: $name exited $ec at KAI_THREADS=1"; fail=1; continue
+  fi
 
   # N=4 under TSAN: exitcode=99 makes a data race fail the process.
   echo "== running $name at KAI_THREADS=4 under TSAN =="
-  set +e
-  out4="$(TSAN_OPTIONS='halt_on_error=0 exitcode=99' KAI_THREADS=4 "$bin" 2>"$TMP/tsan.log")"
-  ec=$?
-  set -e
+  ec=0
+  out4="$(kai_timeout "$RUN_TIMEOUT" \
+      env TSAN_OPTIONS='halt_on_error=0 exitcode=99' KAI_THREADS=4 "$bin" \
+      2>"$TMP/tsan.log")" || ec=$?
   races="$(grep -c 'WARNING: ThreadSanitizer' "$TMP/tsan.log" || true)"
 
+  if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
+    echo "HANG: $name wedged at KAI_THREADS=4 under TSAN (no exit within ${RUN_TIMEOUT}s)"
+    sed -n '1,40p' "$TMP/tsan.log"; fail=1; continue
+  fi
   if [ "$races" != "0" ] || [ "$ec" = "99" ]; then
     echo "TSAN: $races race(s) in $name"; sed -n '1,80p' "$TMP/tsan.log"; fail=1; continue
   fi

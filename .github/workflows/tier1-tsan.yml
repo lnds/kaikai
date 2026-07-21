@@ -7,24 +7,21 @@ name: tier1-tsan
 # every stdout-diff at N=1 and corrupts nondeterministically under load;
 # only ThreadSanitizer sees it. Zero races is the merge gate for M:N.
 #
-# Structurally narrower than tier1 (path-gated to the code that can produce
-# a race) and off the tier1 TEST_LIGHT path entirely — TSAN is slow, so a
+# Structurally narrower than tier1 (scoped to the code that can produce a
+# race) and off the tier1 TEST_LIGHT path entirely — TSAN is slow, so a
 # typer- or fmt-only PR does not pay the tax.
+#
+# The scoping is a STEP-level gate, not `on: pull_request: paths:`. A
+# path-filtered workflow does not run at all for a non-matching PR, so a
+# required check would never report and every such PR would sit blocked
+# forever. This workflow instead runs on every PR and self-skips with
+# SUCCESS when the diff touches none of the paths below — the same shape
+# tier1.yml's `changes` job uses.
 on:
   pull_request:
-    paths:
-      - 'stage0/runtime.h'
-      - 'stage0/runtime_llvm.c'
-      - 'stage2/runtime.h'
-      - 'stage2/Makefile'
-      - 'stdlib/actor.kai'
-      - 'stdlib/spawn.kai'
-      - 'examples/effects/mn_cross_thread_copy_stress.kai'
-      - 'examples/effects/mn_reactor_io_cpu_mix.kai'
-      - 'demos/parallel_actors/**'
-      - 'tools/run-mn-tsan.sh'
-      - 'tools/run-mn-reactor-bench.sh'
-      - '.github/workflows/tier1-tsan.yml'
+  # merge_group keeps the required check reporting inside a GitHub merge
+  # queue (harmless while the queue is not enabled in repo settings).
+  merge_group:
   push:
     branches: [main]
     # Doc-only pushes and `cz bump` release commits cannot introduce a race.
@@ -35,9 +32,12 @@ on:
       - 'VERSION'
       - '.cz.toml'
 
+# Cancel a superseded PR run; never cancel a main run — on main
+# `github.ref` is constant, so superseding would kill the previous
+# commit's verification, its only record of being tested (see tier1.yml).
 concurrency:
   group: tier1-tsan-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -51,23 +51,60 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The gate's scope, as a diff filter instead of a trigger filter. A
+      # non-matching PR leaves every step below skipped and the job green,
+      # so the check reports on every PR and can be branch-protection
+      # required. Non-PR events always run: pushes to main are already
+      # filtered by paths-ignore above, and a merge-queue ref has no PR
+      # diff to inspect.
+      - name: Scope gate to the M:N surface
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          MATCHED=$(echo "$CHANGED" | grep -E \
+            '^(stage0/runtime\.h|stage0/runtime_llvm\.c|stage2/runtime.*\.h|stage2/Makefile|stdlib/(actor|spawn)\.kai|examples/effects/mn_.*|demos/parallel_actors/.*|tools/(run-mn-tsan|run-mn-reactor-bench|ci-bounded-step)\.sh|tools/lib/timeout\.sh|\.github/workflows/tier1-tsan\.yml)$' \
+            || true)
+          if [ -z "$MATCHED" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "tier1-tsan OK — PR touches no M:N surface; the race gate is not exercised."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "M:N surface touched:"; echo "$MATCHED"
+          fi
+
       - name: Install toolchain
+        if: steps.scope.outputs.run == 'true'
         run: |
           command -v clang >/dev/null 2>&1 || {
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends clang
           }
 
+      # Every step below is bounded well under `timeout-minutes`: the gate
+      # exists to catch a scheduler that wedges, and an unbounded wedge
+      # reports the job as `cancelled` — the same conclusion a routine
+      # force-push supersede produces. Nominal is ~5.5 min build, ~10 s per
+      # gate; the deadlines are multiples of that, so they cost nothing on a
+      # healthy run.
       - name: Build kaic2 (C backend)
-        run: make CC=clang kaic2
+        if: steps.scope.outputs.run == 'true'
+        run: ./tools/ci-bounded-step.sh 1200 "tier1-tsan build (kaic2, C backend)" make CC=clang kaic2
 
       - name: M:N ThreadSanitizer + determinism gate
-        run: make CC=clang test-mn-tsan
+        if: steps.scope.outputs.run == 'true'
+        run: ./tools/ci-bounded-step.sh 600 "tier1-tsan M:N ThreadSanitizer gate" make CC=clang test-mn-tsan
 
       - name: F2 reactor no-starvation gate
-        run: make CC=clang test-mn-reactor-bench
+        if: steps.scope.outputs.run == 'true'
+        run: ./tools/ci-bounded-step.sh 300 "tier1-tsan F2 reactor no-starvation gate" make CC=clang test-mn-reactor-bench
 
       - name: Working tree clean check
+        if: steps.scope.outputs.run == 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier1-tsan"
