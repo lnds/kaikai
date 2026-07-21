@@ -13,9 +13,9 @@ name: tier1-native
 #
 # Structure (docs/ci-time-analysis.md §7): a single `build-native` job
 # builds the libLLVM kaic2 + P2 bitcode ONCE and publishes them; the corpus
-# ratchet (~620 fixtures, the dominant cost) is sharded across two runners
+# ratchet (~620 fixtures, the dominant cost) is sharded across three runners
 # via $BACKEND_PARITY_DIRS (disjoint subsets whose union is the full corpus),
-# and the native self-host gate runs as a third parallel consumer of the same
+# and the native self-host gate runs as a fourth parallel consumer of the same
 # artifact — nothing downstream depends on its output, so keeping it inside
 # build-native would only delay the artifact upload (~13 min off the critical
 # path). native is the DEFAULT backend and deserves equal-or-better coverage
@@ -195,8 +195,9 @@ jobs:
             echo "::error::working tree dirty after native-selfhost-gate"; git status; exit 1
           fi
 
-  # Shard 1 — first corpus subset + the curated smoke. Subset chosen to
-  # balance fixture count against shard 2 (~289 vs ~257 entry points).
+  # Shard 1 — effects corpus subset + the curated smoke. The smoke
+  # (examples/native, a separate corpus from the ratchet dirs) runs in
+  # exactly one shard; duplicating it elsewhere buys nothing.
   native-shard-1:
     needs: [changes, build-native]
     if: needs.changes.outputs.doc-only != 'true'
@@ -221,16 +222,52 @@ jobs:
           ./tools/ci-touch-build.sh
       - name: "Smoke: every examples/native fixture (emit -> link -> run -> diff)"
         run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-parity.sh
-      - name: "Ratchet shard 1 (effects/actors/spawn/perceus/refinements/llvm vs C-direct)"
+      - name: "Ratchet shard 1 (effects vs C-direct)"
         run: |
           CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
             TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
-            BACKEND_PARITY_DIRS="examples/effects examples/actors examples/spawn examples/perceus examples/refinements examples/llvm" \
+            BACKEND_PARITY_DIRS="examples/effects" \
             tools/test-backend-parity.sh
       - name: Working tree clean check
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after native-shard-1"; git status; exit 1
+          fi
+
+  # Shard 1b — the rest of the former shard-1 subset, split out so the
+  # two ratchets run in parallel (~230 vs ~216 fixtures).
+  native-shard-1b:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: "Ratchet shard 1b (perceus/refinements/actors/llvm/spawn vs C-direct)"
+        run: |
+          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
+            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_DIRS="examples/perceus examples/refinements examples/actors examples/llvm examples/spawn" \
+            tools/test-backend-parity.sh
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after native-shard-1b"; git status; exit 1
           fi
 
   # Shard 2 — remaining corpus subset + the #860 cons-RC and #882
@@ -396,25 +433,26 @@ jobs:
           fi
 
   # Aggregator (mirrors tier1's). This is the Required check branch
-  # protection gates on: one tidy `tier1-native` status, green iff both
+  # protection gates on: one tidy `tier1-native` status, green iff all
   # shards and the self-host gate pass.
   tier1-native:
-    needs: [changes, native-shard-1, native-shard-2, native-selfhost-gate]
+    needs: [changes, native-shard-1, native-shard-1b, native-shard-2, native-selfhost-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Gate on both native shards + self-host gate
+      - name: Gate on all native shards + self-host gate
         run: |
           if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
             echo "tier1-native OK — doc-only PR, shards skipped"; exit 0
           fi
           r1='${{ needs.native-shard-1.result }}'
+          r1b='${{ needs.native-shard-1b.result }}'
           r2='${{ needs.native-shard-2.result }}'
           r3='${{ needs.native-selfhost-gate.result }}'
-          echo "native results: shard1=$r1 shard2=$r2 selfhost-gate=$r3"
-          if [ "$r1" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ]; then
-            echo "tier1-native OK — both shards + self-host gate green (full corpus parity)"
+          echo "native results: shard1=$r1 shard1b=$r1b shard2=$r2 selfhost-gate=$r3"
+          if [ "$r1" = "success" ] && [ "$r1b" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ]; then
+            echo "tier1-native OK — all three shards + self-host gate green (full corpus parity)"
           else
             echo "::error::tier1-native FAIL — a shard or the self-host gate did not succeed"; exit 1
           fi
