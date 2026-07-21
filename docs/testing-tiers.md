@@ -210,6 +210,102 @@ into this gate. New fixtures that fail on one backend but not the
 other should not merge until the divergence is resolved or
 explicitly skipped with a tracking issue.
 
+## M:N corpus-determinism discipline (issue #1207)
+
+Backend parity asks whether two backends agree. This gate asks a
+different question of the same corpus: whether **one** backend agrees
+with **itself** when the scheduler is given more than one thread.
+
+Nothing asked it before. The `KAI_THREADS` default was 1, so every
+gate in the repo measured the single-threaded scheduler; the M:N
+coverage was ~9 hand-authored `mn_*` stress fixtures, none of which
+asks whether an ordinary program prints the same thing at N=4 that it
+prints at N=1. The consequence was self-referential: shipping the
+multi-threaded default was blocked on "no known M:N bug", and the only
+thing discovering M:N bugs was the PR raising the default. The blast
+radius was never confined to scheduler code either — at
+`KAI_THREADS>1` `main` itself becomes a fiber, so allocator and
+scheduler paths change for **every** program.
+
+`tools/run-mn-corpus-determinism.sh` walks the same entry-point corpus
+as backend parity (shared walk: `tools/lib/corpus.sh`) on both
+backends. Per fixture it takes the `KAI_THREADS=1` run as the
+reference, then runs at each higher thread count and requires the
+stdout **and** the exit code to reproduce it.
+
+**Six buckets, never collapsed.** A hang, an empty output, an
+exit-code mismatch and a stdout divergence are four different bugs;
+merging them into "failed" cost an earlier lane three useless rounds.
+
+| bucket | meaning |
+|---|---|
+| `ok` | stdout and exit code reproduce the N=1 reference |
+| `hang` | the bounded run hit its deadline (124/137) |
+| `crash` | exit code differs from the reference (SIGSEGV, trap, abort) |
+| `empty` | exit code matched, stdout empty, reference non-empty |
+| `diverge` | exit code matched, stdout non-empty, contents differ |
+| `reorder` | same lines as the reference, different order, on a fixture that declares its interleaving unspecified |
+
+**`diverge` and `empty` clear two adjudications before they are believed.**
+First N=1 self-stability: a fixture whose own N=1 output varies cannot
+witness anything about thread count. Then reproduction — the divergence must
+reappear on at least one of N further runs at the same thread count. That
+second check exists because `Stdout.print` is not line-atomic across
+scheduler threads (#1388), so any multi-fiber program can occasionally emit
+a torn line; it tears a different fixture every run, and a byte-exact gate
+that believed each one would be red at random. A held flake is still
+announced loudly, with a CI annotation. `crash` and `hang` clear neither
+adjudication: re-running a one-in-many SIGSEGV until it behaves is how a
+gate learns to lie.
+
+**Two observation conditions are load-bearing.** stdout goes to a
+FILE, never a pipe — a pipe (like a tty) changes the buffering enough
+to close the window on a whole family of races. And every run is
+bounded via `tools/lib/timeout.sh`, so a wedged scheduler is counted
+as a hang instead of being absorbed into the job ceiling, where it
+reads as a cancelled run.
+
+**Order-dependence, declared not assumed.** A demo that prints from
+two fibers has no specified line *order*: at N=1 the round-robin
+scheduler alternates, at N=4 the fibers really run at once. Such a
+fixture is listed in `tools/mn-corpus-order-dependent.txt` with a
+reason, and the gate then compares the **multiset** of its output
+lines instead of the sequence. Every line must still appear exactly
+once, so lost work, a duplicated message and a torn line all remain
+findings. The file forgives interleaving and nothing else; a fixture
+that prints a *result* does not belong in it, and neither does one
+that gains or loses a line (#1384, #1389 are both that family, and
+are findings). Every entry names an open issue — the declaration is
+the bookmark, the issue is the work, and these goldens also break
+tier1's own byte-for-byte comparison once `KAI_THREADS` defaults to
+ncpu (#1390).
+
+**Known findings ratchet.** `tools/mn-corpus-baseline.txt` holds the
+(fixture, backend) pairs that were already broken above one thread
+when the gate first walked the corpus, each line naming an open
+issue. A pair failing that is not listed fails the gate; the queue
+may only shrink. These defects are timing- and platform-dependent —
+a pair reproduces on one runner and not another — so the file is the
+union over the platforms measured, and a quiet run is not evidence
+an entry is fixed.
+
+**What the gate refuses to judge, it names.** Fixtures that fail to
+build, fixtures whose N=1 reference does not complete, and fixtures
+whose N=1 output varies between runs are each listed by name in the
+summary rather than folded into the pass. The walk also checks its own
+arithmetic: if it did not reach every fixture on every arm it fails
+outright, because a truncated walk otherwise produces a tidy and
+entirely false "no findings".
+
+**Where it runs.** `.github/workflows/tier1-mn-corpus.yml`, always-on
+(a path filter would encode the false assumption that the blast radius
+is local), sharded per `tools/mn-corpus-shards.txt`. The shard split is
+asserted to partition the corpus before any fixture runs — a shard list
+that quietly stopped naming a directory would leave the gate green over
+a smaller corpus. PR path: N=4, 2 repeats. Nightly cron and manual
+dispatch: N in {2,4,8}, 3 repeats. Locally: `make test-mn-corpus`,
+scoped with `MN_CORPUS_DIRS` while iterating.
+
 ## Tier 2 — `make daily` (end of day / cron)
 
 ~10-20 minutes. Runs once a day on `main` HEAD, not on each PR.

@@ -1,0 +1,251 @@
+name: tier1-mn-corpus
+
+# M:N corpus-determinism gate — the whole fixture corpus above one thread.
+#
+# The other M:N gates run ~9 hand-authored `mn_*` stress fixtures. None of
+# them asks whether an ORDINARY program prints the same thing at N=4 that it
+# prints at N=1, and while the KAI_THREADS default was 1, nothing else did
+# either — so the only thing discovering M:N defects was the PR raising the
+# default, and raising it was blocked on there being none. This gate breaks
+# that loop: discovery runs on every PR, independent of the ship decision.
+#
+# Always-on, not path-gated: at KAI_THREADS>1 `main` itself becomes a fiber,
+# so the allocator and scheduler paths change for EVERY program. The blast
+# radius is not confined to the files a scheduler change touches, and a
+# path filter would encode the opposite assumption.
+#
+# Shape (see docs/ci-time-analysis.md §7 for the sharding precedent): one
+# `build-native` job publishes the libLLVM kaic2 once, and the shards walk
+# disjoint corpus subsets. The split is NOT written out here — it comes from
+# tools/mn-corpus-shards.txt via tools/mn-corpus-plan.sh, which asserts the
+# shards partition the corpus before a single fixture runs. A matrix written
+# longhand drifts silently, and a coverage gate green over a shrunken corpus
+# is worse than no gate.
+#
+# Two shapes, one workflow. On a PR: N=4, 2 repeats — the cheapest sweep
+# that still asks the question of every fixture on both backends. On the
+# nightly cron and on manual dispatch: N in {2,4,8}, 3 repeats, which is
+# ~4.5x the runs and does not fit a PR. It rides here rather than in `make
+# daily` because that target has a 30-min budget it has already overrun
+# once (see the comment on `daily:` in the Makefile).
+on:
+  pull_request:
+  # merge_group makes this required check run inside a GitHub merge queue
+  # (harmless while the queue is not enabled in repo settings).
+  merge_group:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - 'VERSION'
+      - '.cz.toml'
+  # Offset from daily.yml (02:00) and rc-detector.yml (02:30): the deep
+  # sweep is measurement, and a co-scheduled cron competing for the runner
+  # perturbs the timing it measures.
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+# Cancel a superseded PR run; never cancel a main run — on main
+# `github.ref` is constant, so superseding would kill the previous
+# commit's verification, its only record of being tested (see tier1.yml).
+concurrency:
+  group: tier1-mn-corpus-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # A wedged fixture must be counted as a hang, not absorbed into the job
+  # ceiling where it reads as a cancelled run.
+  MN_CORPUS_RUN_TIMEOUT: 30
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      doc-only: ${{ steps.doc-only.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect doc-only diff
+        id: doc-only
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if [ -z "$CHANGED" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          NON_DOC=$(echo "$CHANGED" | grep -Ev '^(docs/|[^/]+\.md$|LICENSE$)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Doc-only PR; skipping tier1-mn-corpus."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Single source of truth for the shard split, asserted to partition the
+  # corpus. Runs before the shards so a coverage drift fails fast and loud
+  # rather than producing a green run over fewer fixtures.
+  plan:
+    needs: changes
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: tools/mn-corpus-plan.sh
+
+  # Build the libLLVM-capable kaic2 once and publish it: the gate runs both
+  # the C and the native arm from the same binary, and #1380 is the standing
+  # proof that a C-only arm would have missed a native-only SIGSEGV.
+  build-native:
+    needs: changes
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$LLVM_CONFIG" ]; then
+            echo "::error::no llvm-config found after installing llvm-dev"; exit 1
+          fi
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      # Exact-match cache of the native bootstrap chain, same key discipline
+      # as tier1-native: no restore-keys, because a near-miss chain plus the
+      # mtime touch would present a stale kaic2 as fresh.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$( (clang --version | head -1; "$LLVM_CONFIG" --version) | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native bootstrap chain (exact source match only)
+        id: bootstrap-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('Makefile', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/assert-runtime-bc.sh') }}
+      - name: Build native kaic2
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -f stage2/kaic2
+          make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >/dev/null 2>&1
+      - name: Mark cached chain fresh (no rebuild)
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaic2-mn-corpus
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/bundle.kai
+            stage2/build/stage2.c
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          retention-days: 1
+          if-no-files-found: error
+
+  mn-corpus-shard:
+    needs: [changes, plan, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-mn-corpus
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      # Bounded below the job ceiling so a wedge fails as THIS step, named,
+      # instead of burning the ceiling and reporting `cancelled` — which is
+      # indistinguishable from a routine force-push supersede.
+      - name: "M:N corpus determinism — ${{ matrix.name }} (both backends)"
+        env:
+          DEEP: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$DEEP" = "true" ]; then
+            export MN_CORPUS_THREADS="2 4 8" MN_CORPUS_REPEATS=3
+            deadline=6600
+          else
+            export MN_CORPUS_THREADS=4 MN_CORPUS_REPEATS=2
+            deadline=2100
+          fi
+          MN_CORPUS_DIRS="${{ matrix.dirs }}" \
+            tools/ci-bounded-step.sh "$deadline" "mn-corpus/${{ matrix.name }}" \
+            tools/run-mn-corpus-determinism.sh
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after mn-corpus/${{ matrix.name }}"; git status; exit 1
+          fi
+
+  # Aggregator. This is the Required check branch protection gates on: one
+  # tidy `tier1-mn-corpus` status, green iff the coverage plan held and every
+  # shard passed.
+  tier1-mn-corpus:
+    needs: [changes, plan, mn-corpus-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on the plan and all shards
+        run: |
+          if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
+            echo "tier1-mn-corpus OK — doc-only PR, shards skipped"; exit 0
+          fi
+          p='${{ needs.plan.result }}'
+          r='${{ needs.mn-corpus-shard.result }}'
+          echo "mn-corpus: plan=$p shards=$r"
+          if [ "$p" = "success" ] && [ "$r" = "success" ]; then
+            echo "tier1-mn-corpus OK — the corpus reproduces its N=1 behaviour at N=4 on both backends"
+          else
+            echo "::error::tier1-mn-corpus FAIL — the coverage plan or a shard did not succeed"; exit 1
+          fi
