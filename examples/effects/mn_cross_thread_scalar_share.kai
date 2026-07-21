@@ -1,0 +1,66 @@
+# M:N cross-thread scalar leaves — a message's scalar fields must be COPIED
+# at the thread border, not shared by pointer.
+#
+# The deep-copy walk used to end in `default: return kai_incref(v)`, so only
+# the structural spine was rebuilt: Real, Char, Byte, the fixed-width Int
+# boxes, Ref and Foreign crossed by pointer. A sender that keeps its own
+# reference — the second send below makes Perceus dup the payload — then
+# leaves one non-atomic rc being incremented and decremented by two OS
+# threads at once. The lost update either frees a leaf the receiver is still
+# reading or leaks it.
+#
+# The record spine is rebuilt under either behaviour, so the bug is visible
+# only through the LEAVES: `score` reads every scalar field back. Total is
+# order-independent, so one golden holds at every KAI_THREADS.
+#
+# Real / Char / Int32 stand in for the whole shared-leaf class here. A Byte
+# field belongs in this payload too, but a record carrying one segfaults
+# under --backend=native (issue #1394), which is unrelated to this invariant.
+
+import spawn
+import actor
+
+type Payload = { r: Real, c: Char, w: Int32 }
+
+fn payload_of(n: Int) : Payload =
+  Payload { r: int_to_real(n), c: 'k', w: int_to_int32(n) }
+
+fn score(p: Payload) : Int =
+  real_to_int(p.r) + char_to_int(p.c) + int32_to_int(p.w)
+
+# Reading a field dups the leaf and consuming it drops the leaf again, so
+# `churn` is a loop of incref/decref on exactly the objects the message copy
+# would be sharing. Running it AFTER the send is what makes the two threads
+# concurrent: the collector is draining its copy on its own thread while the
+# sender is still cycling the same rc here. `guard` feeds the second send so
+# the loop cannot be treated as dead.
+fn churn(p: Payload, k: Int, acc: Int) : Int =
+  if k <= 0 { acc } else { churn(p, k - 1, acc + score(p)) }
+
+fn worker(parent: Pid[Payload], n: Int) : Unit / Actor[Payload] + Spawn = {
+  let p = payload_of(n)
+  Actor.send(parent, p)
+  let guard = churn(p, 400, 0)
+  Actor.send(parent, payload_of(guard % 5))
+}
+
+fn collect(remaining: Int, acc: Int) : Int / Actor[Payload] =
+  if remaining <= 0 { acc }
+  else { collect(remaining - 1, acc + score(Actor.receive())) }
+
+fn spawn_n(parent: Pid[Payload], n: Int) : Unit / Spawn + Actor[Payload] =
+  if n <= 0 { () }
+  else {
+    let _ = spawn_actor(() => worker(parent, n))
+    spawn_n(parent, n - 1)
+  }
+
+fn main() : Int / Spawn + Console = {
+  let total = with_mailbox {
+    let me = Actor.self()
+    spawn_n(me, 24)
+    collect(48, 0)
+  }
+  Console.print(int_to_string(total))
+  0
+}

@@ -1,0 +1,46 @@
+# M:N string interning — the intern table is written from every thread.
+#
+# `kai_str_intern_table` is classified `shared-locked` in the runtime-global
+# audit but had no lock at all, and the insert published the bucket key
+# (`b->cstr`) BEFORE the value (`b->value`). A concurrent reader that matched
+# on the key could therefore return a NULL value — on the path of every
+# string literal and every short constructed string.
+#
+# Interpolation builds each label in a stack buffer, so it misses the
+# pointer-identity fast path and reaches the content-intern insert. Distinct
+# labels per worker keep every thread inserting at once rather than all
+# hitting one warm entry. Summing the lengths reads each value back, so a
+# NULL or half-published bucket is not merely a race but a crash.
+
+import spawn
+import actor
+
+fn label(n: Int) : String = "kaikai-intern-#{int_to_string(n)}"
+
+fn labels(base: Int, k: Int, acc: Int) : Int =
+  if k <= 0 { acc }
+  else { labels(base, k - 1, acc + label(base + k).length()) }
+
+fn worker(parent: Pid[Int], w: Int) : Unit / Actor[Int] + Spawn =
+  Actor.send(parent, labels(w * 100, 60, 0))
+
+fn spawn_n(parent: Pid[Int], n: Int) : Unit / Spawn + Actor[Int] =
+  if n <= 0 { () }
+  else {
+    let _ = spawn_actor(() => worker(parent, n))
+    spawn_n(parent, n - 1)
+  }
+
+fn collect(remaining: Int, acc: Int) : Int / Actor[Int] =
+  if remaining <= 0 { acc }
+  else { collect(remaining - 1, acc + Actor.receive()) }
+
+fn main() : Int / Spawn + Console = {
+  let total = with_mailbox {
+    let me = Actor.self()
+    spawn_n(me, 8)
+    collect(8, 0)
+  }
+  Console.print(int_to_string(total))
+  0
+}

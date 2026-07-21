@@ -1149,6 +1149,17 @@ endif
 # the content-addressed incremental; (3) a producer's signature change re-emits
 # its consumer — the anti-ABI-skew guarantee (a changed callee shape rewrites
 # the caller's key). Gated on KAI_LLVM (the native backend must be built).
+
+# Repeats for the cross-thread memory-invariant fixtures (scalar leaves,
+# await result, string interning). TSAN is the decisive detector for all
+# three — it reports the race whether or not the lost update manifests — so
+# this loop is the cheap always-on half: it catches the crash and the
+# corrupted total. Each fixture is ~60 ms, so 20 repeats cost ~4 s total.
+# Deliberately OUTSIDE the KAI_LLVM guard below: test-effects rides the
+# C-only tier1 shards too, and an unset count makes `seq 1 <empty>` fail,
+# which runs the loop zero times and passes vacuously.
+MN_INVARIANT_ITERS ?= 20
+
 ifeq ($(KAI_LLVM),1)
 # Issue #1234 — M:N native soundness. The work-stealing TLS-hoist miscompile is
 # NATIVE-only (the C backend + TSAN gates are sound and never saw it, which is
@@ -3341,6 +3352,25 @@ test-effects: $(TARGET) build
 	  test "$$bad" = 0 \
 	    && echo "effects OK $$name (trampoline tail keeps fiber identity across a steal: $(MN_TAIL_STEAL_ITERS)/$(MN_TAIL_STEAL_ITERS) clean at KAI_THREADS=8)" \
 	    || { echo "effects FAIL $$name ($$bad of $(MN_TAIL_STEAL_ITERS) bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/mn_cross_thread_scalar_share.kai \
+	         ../examples/effects/mn_await_result_share.kai \
+	         ../examples/effects/mn_str_intern_race.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/effects/$$name.out.expected; \
+	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  bad=0; \
+	  for r in $$(seq 1 $(MN_INVARIANT_ITERS)); do \
+	    KAI_THREADS=8 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	      || { bad=$$((bad+1)); continue; }; \
+	    cmp -s $$exp_out build/s2-$$name.out || bad=$$((bad+1)); \
+	  done; \
+	  test "$$bad" = 0 \
+	    && echo "effects OK $$name (cross-thread invariant: $(MN_INVARIANT_ITERS)/$(MN_INVARIANT_ITERS) clean at KAI_THREADS=8)" \
+	    || { echo "effects FAIL $$name ($$bad of $(MN_INVARIANT_ITERS) bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_fiber_stack_overflow.kai; do \
 	  name=$$(basename $$f .kai); \

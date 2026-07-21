@@ -4550,22 +4550,37 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
  * short-circuit; `kai_free_value` is never reached. */
 #define KAI_STR_INTERN_BUCKETS 1024
 #define KAI_STR_INTERN_MAXLEN  64
+/* `cstr` is the bucket's publication flag as well as its key, so it is the
+ * one field that must be atomic: an inserter fills `len` and `value` first
+ * and RELEASES `cstr` last, a reader ACQUIRES `cstr` and only then reads the
+ * other two. Without that order a reader can match a bucket whose `value` is
+ * still NULL and hand a NULL string back to the program — on the path of
+ * every string literal. */
 typedef struct {
-    const char *cstr;       /* NULL ⇒ empty bucket. Owned via strdup. */
-    size_t      len;
-    KaiValue   *value;
+    _Atomic(const char *) cstr;  /* NULL ⇒ empty bucket. Owned via strdup. */
+    size_t                len;
+    KaiValue             *value;
 } KaiStrInternBucket;
 /* The intern table's whole purpose is pointer-identity: equal strings map to
  * one immortal value. A per-TU table would give each TU its own dedup set,
  * so the same literal interned in two TUs would yield distinct pointers and
- * defeat the interning. One shared table (owner defines, others extern). */
+ * defeat the interning. One shared table (owner defines, others extern).
+ *
+ * Shared and mutable, so the mutex is real: it serializes inserts (probe,
+ * allocate, publish) against each other. Lookups stay lock-free — entries are
+ * never removed or rewritten, so a probe that acquires a published `cstr`
+ * sees a bucket that is already final. The mutex takes no other lock, so it
+ * enters no ordering relation with the reactor / slot / mailbox locks. */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+extern pthread_mutex_t    kai_str_intern_mu;
 #  if defined(KAI_RUNTIME_OWNER)
 KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+pthread_mutex_t    kai_str_intern_mu = PTHREAD_MUTEX_INITIALIZER;
 #  endif
 #else
 static KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+static pthread_mutex_t    kai_str_intern_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
@@ -4578,31 +4593,58 @@ static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
     return (size_t) (h & (KAI_STR_INTERN_BUCKETS - 1));
 }
 
-static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
-    size_t len = strlen(cstr);
-    if (len > KAI_STR_INTERN_MAXLEN) return kai_str_from_bytes(cstr, len);
+/* Slow path: this probe found an empty bucket, so the string is (probably)
+ * not interned yet. Re-probe under the mutex — a peer may have inserted the
+ * same string, or filled the bucket we picked — then publish. */
+static KaiValue *kai_str_intern_insert(const char *cstr, size_t len) {
+    if (kai_nthreads > 1) pthread_mutex_lock(&kai_str_intern_mu);
+    KaiValue *result = NULL;
     size_t i = kai_str_intern_hash(cstr, len);
     for (size_t probe = 0; probe < KAI_STR_INTERN_BUCKETS; probe++) {
         KaiStrInternBucket *b = &kai_str_intern_table[i];
-        if (b->cstr == NULL) {
-            /* Insert. Allocate the immortal value + own a copy of cstr
-             * (cstr arg may be a stack buffer that gets reused). */
+        const char *bc = atomic_load_explicit(&b->cstr, memory_order_relaxed);
+        if (bc == NULL) {
             KaiValue *v = kai_str_from_bytes(cstr, len);
             v->rc = INT32_MAX;
             char *owned = (char *) malloc(len + 1);
             if (owned) {
                 memcpy(owned, cstr, len);
                 owned[len] = '\0';
-                b->cstr = owned;
-                b->len = len;
+                b->len   = len;
                 b->value = v;
+                /* Publish last, with release: a reader that acquires this
+                 * pointer is guaranteed to see the `len` / `value` above. */
+                atomic_store_explicit(&b->cstr, (const char *) owned,
+                                      memory_order_release);
             }
-            /* Even if strdup failed, the value is still valid (just
-             * not cacheable). Subsequent calls re-alloc but stay
-             * correct. */
-            return v;
+            /* Even if the copy failed, the value is still valid (just not
+             * cacheable). Subsequent calls re-alloc but stay correct. */
+            result = v;
+            break;
         }
-        if (b->len == len && (b->cstr == cstr || memcmp(b->cstr, cstr, len) == 0)) {
+        if (b->len == len && (bc == cstr || memcmp(bc, cstr, len) == 0)) {
+            result = b->value;   /* a peer interned it first */
+            break;
+        }
+        i = (i + 1) & (KAI_STR_INTERN_BUCKETS - 1);
+    }
+    if (kai_nthreads > 1) pthread_mutex_unlock(&kai_str_intern_mu);
+    /* Table full — fall back to non-cached. */
+    return result ? result : kai_str_from_bytes(cstr, len);
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
+    size_t len = strlen(cstr);
+    if (len > KAI_STR_INTERN_MAXLEN) return kai_str_from_bytes(cstr, len);
+    size_t i = kai_str_intern_hash(cstr, len);
+    for (size_t probe = 0; probe < KAI_STR_INTERN_BUCKETS; probe++) {
+        KaiStrInternBucket *b = &kai_str_intern_table[i];
+        /* Acquire pairs with the release store in the insert path; entries are
+         * never removed or rewritten, so a published bucket is already final
+         * and the lock-free read needs nothing more. */
+        const char *bc = atomic_load_explicit(&b->cstr, memory_order_acquire);
+        if (bc == NULL) return kai_str_intern_insert(cstr, len);
+        if (b->len == len && (bc == cstr || memcmp(bc, cstr, len) == 0)) {
             return b->value;
         }
         i = (i + 1) & (KAI_STR_INTERN_BUCKETS - 1);
@@ -5250,29 +5292,61 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
     return v;
 }
 
-/* issue #120 — deep-copy-out at the region border (Phase P1). When a
- * value built inside a `region { }` crosses out of the block (its
- * final-expression value), the emitter calls this to clone it OUT of
- * the arena onto the ordinary RC heap with rc = 1, BEFORE the arena is
- * bulk-freed. Gate on TAG (not on rc == INT32_MAX, which singletons
- * share with arena values): structural CONS/RECORD/VARIANT/ARRAY/STR
- * are reallocated fresh via kai_alloc (rc = 1) with fresh interior
- * arrays and recursively-copied children; scalar / singleton / opaque
- * leaves are kai_incref'd and shared (no interior pointers into the
- * arena, or already on the RC heap). */
+/* Which border a deep copy is crossing. The structural walk is the same
+ * for both; the leaves are not, so the mode rides the recursion.
+ *
+ * KAI_COPY_REGION — the region border (issue #120). A value built inside
+ * a `region { }` is cloned OUT of the arena onto the ordinary RC heap
+ * with rc = 1 before the arena is bulk-freed. Gate on TAG (not on
+ * rc == INT32_MAX, which singletons share with arena values): structural
+ * nodes are reallocated fresh with recursively-copied children, while
+ * scalar / handle / opaque leaves are shared — `kai_alloc` never
+ * allocates out of the arena, so a leaf is already on the RC heap and
+ * survives the bulk free. A `Ref` MUST be shared here: `region { r }`
+ * has to hand back the very cell the block wrote through.
+ *
+ * KAI_COPY_CROSS — the thread border (Actor.send, spawn, await). This is
+ * what makes non-atomic RC sound: no heap object may be reachable from
+ * two scheduler threads, because two threads incrementing the same `rc`
+ * lose updates and then double-free. So nothing whose `rc` a second
+ * thread could touch may be shared — every leaf is rebuilt too. The only
+ * values that may cross by pointer are those RC does not apply to
+ * (immortal singletons) or whose rc is atomic by construction (the
+ * Fiber[T] handle, the immortal Pid box) — the cross-thread-handle rule
+ * at KaiTag.
+ *
+ * The switch is exhaustive over KaiTag on purpose and has NO `default:`.
+ * A sharing `default:` is how Real, Char, Ref, Foreign and the
+ * fixed-width Int boxes ended up crossing threads by pointer; without
+ * one, adding a tag is a compile error until it is classified here. */
+typedef enum { KAI_COPY_REGION = 0, KAI_COPY_CROSS = 1 } KaiCopyMode;
 static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
-static KaiValue *kai_deep_copy_out(KaiValue *v) {
+static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
     if (!v) return v;
     /* Koka tagged-Int: an immediate small Int has no heap header, so
      * `v->tag` would dereference a fake pointer. It is shared-nothing
-     * by construction — copy-out returns it verbatim (incref is a
-     * no-op for immediates, matching the default branch). */
+     * by construction — it carries no rc for a second thread to touch,
+     * so both modes return it verbatim. */
     if (kai_is_value(v)) return v;
     switch ((KaiTag) v->tag) {
+        /* Iterative down the tail. A list's length is unbounded, so one
+         * recursive frame per cell overflows the 64 KiB fiber stack long
+         * before the heap notices — and the margin is thin enough that
+         * frame size alone decides it. Heads still recurse: their depth is
+         * the value's nesting, not its length. `kai_cons` steals both refs,
+         * so each node is built with a placeholder tail and patched. */
         case KAI_CONS: {
-            KaiValue *h = kai_deep_copy_out(v->as.cons.head);
-            KaiValue *t = kai_deep_copy_out(v->as.cons.tail);
-            return kai_cons(h, t);
+            KaiValue *out  = kai_cons(kai_deep_copy(v->as.cons.head, mode), NULL);
+            KaiValue *last = out;
+            KaiValue *src  = v->as.cons.tail;
+            while (kai_is_ptr(src) && src->tag == KAI_CONS) {
+                KaiValue *node = kai_cons(kai_deep_copy(src->as.cons.head, mode), NULL);
+                last->as.cons.tail = node;
+                last = node;
+                src  = src->as.cons.tail;
+            }
+            last->as.cons.tail = kai_deep_copy(src, mode);
+            return out;
         }
         /* Sharing would be unsound here: kai_seq_norm rewrites a range
          * node in place, and that mutation must not cross the copy-out
@@ -5283,7 +5357,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             int n = v->as.rec.n_fields;
             KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
             if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
-            for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy_out(v->as.rec.fields[i]);
+            for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy(v->as.rec.fields[i], mode);
             KaiValue *c = kai_record(n, fields, v->as.rec.names);
             c->as.rec.head_type_tag = v->as.rec.head_type_tag;
             free(fields);
@@ -5301,7 +5375,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
              * Only pointer slots recurse. */
             for (int i = 0; i < n; ++i) {
                 if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
-                    slots[i].ptr = kai_deep_copy_out(kai_var_slots(v)[i].ptr);
+                    slots[i].ptr = kai_deep_copy(kai_var_slots(v)[i].ptr, mode);
                 else
                     slots[i] = kai_var_slots(v)[i];
             }
@@ -5317,7 +5391,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             c->as.arr.cap = len > 0 ? len : 1;
             c->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) c->as.arr.cap * sizeof(KaiValue *));
             for (int64_t i = 0; i < len; ++i)
-                c->as.arr.items[i] = kai_deep_copy_out(v->as.arr.items[i]);
+                c->as.arr.items[i] = kai_deep_copy(v->as.arr.items[i], mode);
             return c;
         }
         case KAI_STR: {
@@ -5343,7 +5417,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             if (m->ekind == KAI_VEC_EK_BOXED) {
                 KaiValue **src = (KaiValue **) kai_vec_elems(v);
                 KaiValue **dst = (KaiValue **) kai_vec_elems(c);
-                for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy_out(src[i]);
+                for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy(src[i], mode);
             }
             return c;
         }
@@ -5359,7 +5433,7 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             if (nc > 0) {
                 caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
                 if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); exit(1); }
-                for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy_out(v->as.clo.captures[i]);
+                for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy(v->as.clo.captures[i], mode);
             }
             /* kai_closure increfs each capture; we already own a fresh
              * rc=1 copy, so drop our transient ref after it takes its own. */
@@ -5368,9 +5442,77 @@ static KaiValue *kai_deep_copy_out(KaiValue *v) {
             free(caps);
             return c;
         }
-        default:
+
+        /* RC does not apply to these: rc is INT32_MAX, so incref/decref are
+         * no-ops and two threads touching them is not a race. */
+        case KAI_UNIT:
+        case KAI_BOOL:
+        case KAI_NIL:
             return kai_incref(v);
+
+        /* Handles to a unit of execution / a channel, not data. A Fiber[T]
+         * wrapper carries an atomic rc and a Pid box is immortal, so both are
+         * already sound to reach from two threads — and copying them would
+         * destroy the identity they exist to carry. */
+        case KAI_FIBER:
+        case KAI_PID:
+            return kai_incref(v);
+
+        /* Scalar leaves. Sharing at the region border is sound and cheaper
+         * (they live on the RC heap, not in the arena). At the thread border
+         * each must be rebuilt: the rc is non-atomic and the sender keeps its
+         * own reference whenever Perceus dup'd the value across the send.
+         * The constructors reuse the immortal Char/Int caches where they
+         * apply, so a cached leaf still crosses without allocating. */
+        case KAI_INT:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int(v->as.i);
+        case KAI_REAL:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_real(v->as.r);
+        case KAI_CHAR:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_char(v->as.c);
+        case KAI_BYTE:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_byte(v->as.byte_val);
+        case KAI_INT32:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int32(v->as.i32);
+        case KAI_UINT32:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_uint32(v->as.u32);
+        case KAI_UINT64:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_uint64(v->as.u64);
+        case KAI_INT128:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int128(kai_i128_load(v));
+
+        /* The box has an ordinary non-atomic rc, so the thread border needs a
+         * fresh one. The parked `void *` is borrowed external memory the FFI
+         * driver owns and RC never frees, so both boxes may name it. */
+        case KAI_FOREIGN:
+            return mode == KAI_COPY_REGION ? kai_incref(v)
+                                           : kai_foreign(v->as.foreign_ptr);
+
+        /* A Ref is one mutable cell. The region border shares it — the block
+         * must hand back the cell it wrote through. The thread border copies
+         * it: shape isolation gives the receiver its own cell, and sharing one
+         * would put both a non-atomic rc and a mutable cell under two threads. */
+        case KAI_REF: {
+            if (mode == KAI_COPY_REGION) return kai_incref(v);
+            KaiValue *c = kai_alloc(KAI_REF);
+            c->as.ref.cell = kai_deep_copy(v->as.ref.cell, mode);
+            return c;
+        }
     }
+    /* No `default:` above, so -Wswitch makes a new tag a compile error here
+     * rather than letting it inherit a sharing fallback. */
+    kai_trap_abort("deep-copy: unclassified value tag");
+    return v;
+}
+
+/* The region border (issue #120): scalar and handle leaves are shared. */
+static inline KaiValue *kai_deep_copy_out(KaiValue *v) {
+    return kai_deep_copy(v, KAI_COPY_REGION);
+}
+
+/* The thread border: nothing with a non-atomic rc crosses by pointer. */
+static inline KaiValue *kai_deep_copy_cross(KaiValue *v) {
+    return kai_deep_copy(v, KAI_COPY_CROSS);
 }
 
 /* Issue #440 Phase 2 — borrow a slot as a boxed `KaiValue *`. Used by
@@ -8231,17 +8373,30 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
         exit(1);
     }
     KaiMailbox *mb = pid->as.mb;
-    /* M:N — a send whose destination fiber lives on another scheduler
-     * thread must not share this fiber's non-atomic-RC heap object with
-     * that thread. Deep-copy the message into the SENDER's heap (rc=1,
-     * single-owner) and enqueue the copy under the mailbox lock; the
-     * receiver adopts and later frees it on its own thread. A mailbox
-     * with no owner yet (spawn_actor before assign) is on this thread by
-     * construction. At N=1 owner_thread==my thread always, so the fast
-     * pointer transfer (issue #82 callee-consumes) is unchanged. */
-    int dst = (mb->owner_fiber) ? mb->owner_fiber->home_thread : kai_thread_id;
-    if (kai_nthreads > 1 && dst != kai_thread_id) {
-        KaiValue *copy = kai_deep_copy_out(msg);
+    /* M:N — a message must not leave this fiber's non-atomic-RC heap
+     * reachable from a second scheduler thread. Deep-copy it into a
+     * single-owner tree (rc=1) and enqueue the copy under the mailbox
+     * lock; the receiver adopts it and later frees it on its own thread.
+     *
+     * The copy is unconditional at N>1 rather than gated on "is the
+     * receiver on another thread right now?", because no point-in-time
+     * answer to that question is sound:
+     *   - the receiver's `home_thread` can change the instant after it is
+     *     read — a thief retargets it under the VICTIM's slot lock
+     *     (kai_sched_steal_from), which a sender holding no lock at all
+     *     does not exclude; and
+     *   - even a decision that is right when it is made does not stay
+     *     right. Whenever Perceus dup'd the value across the send, the
+     *     sender keeps its own reference, so a same-thread pointer
+     *     transfer leaves one object owned by two fibers. Stealing then
+     *     moves one of them to another thread and the rc is shared across
+     *     threads after the fact.
+     * So the fast path cannot be rescued by locking the read; only by not
+     * taking it. This matches the unconditional thunk copy on the spawn
+     * path and the BEAM's copy-on-send. At N=1 no worker thread exists and
+     * the pointer transfer (issue #82 callee-consumes) is unchanged. */
+    if (kai_nthreads > 1) {
+        KaiValue *copy = kai_deep_copy_cross(msg);
         kai_decref(msg);
         kai_mailbox_push_cross_thread(mb, copy);
     } else {
@@ -14526,6 +14681,13 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     }
 
     kai_user_main_fn = user_main;
+    /* The Char cache is classified immortal — shared by every thread, never
+     * mutated after init. Lazy warming breaks the second half of that: the
+     * first `kai_char(c)` on a worker writes 128 cells while other workers
+     * are already reading them. Warm it here instead, before any worker
+     * exists, so pthread_create publishes it and it really is read-only for
+     * the rest of the process. At N=1 the lazy path still applies. */
+    kai_char_cache_warm();
     for (int i = 0; i < kai_nthreads; i++) {
         pthread_mutex_init(&kai_sched_slots[i].mu, NULL);
         kai_sched_slots[i].steal_head = NULL;
@@ -14644,7 +14806,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMai
      * exactly the cross-thread-share the message copy path forbids. Copy
      * the thunk into a single-owner tree that migrates with the fiber. */
     if (kai_nthreads > 1) {
-        f->thunk = kai_deep_copy_out(thunk);
+        f->thunk = kai_deep_copy_cross(thunk);
     } else {
         /* incref to retain a ref the fiber owns; the caller-side ref is
          * still the caller's to manage (Perceus decrefs at call-site exit). */
@@ -14703,6 +14865,26 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiC
 }
 #endif
 
+/* Hand a terminated fiber's result to an awaiter.
+ *
+ * `f->result` is produced on `f`'s own thread and the Fiber[T] wrapper goes
+ * on owning it, so an awaiter that just increfs puts one non-atomic rc under
+ * two threads — and two awaiters woken on different threads race each other
+ * outright, since the terminate walk unparks the whole chain. The result is a
+ * value crossing a thread boundary exactly like a message, so it gets the
+ * same treatment: at N>1 the awaiter takes a private copy and the producer's
+ * reference is left alone. The wrapper is kept alive by the awaiter's own
+ * Fiber[T] handle, so reading it here is safe.
+ *
+ * A CANCELLED target may have unwound before assigning, leaving `result`
+ * NULL; the caller's continuation still needs a well-typed value, so that
+ * yields unit. At N=1 the incref is unchanged. */
+static KaiValue *kai_fiber_result_for_awaiter(KaiFiber *f) {
+    if (!f->result) return kai_unit();
+    if (kai_nthreads > 1) return kai_deep_copy_cross(f->result);
+    return kai_incref(f->result);
+}
+
 KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k)
 #if KAI_SCHED_DECL_ONLY
 ;
@@ -14745,11 +14927,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiC
             exit(1);
         }
     }
-    /* For CANCELLED targets `f->result` may be NULL — fall back to
-     * unit so the caller's continuation receives a well-typed value
-     * regardless of how the target terminated. */
-    KaiValue *r = f->result ? kai_incref(f->result) : kai_unit();
-    return kai_cont_resume(k, r);
+    return kai_cont_resume(k, kai_fiber_result_for_awaiter(f));
 }
 #endif
 
@@ -14782,7 +14960,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
         KaiFiber *fib = elem->as.fib;
         if (!head) head = fib;
         if (fib->state == KAI_FIBER_DONE) {
-            return kai_cont_resume(k, kai_incref(fib->result));
+            return kai_cont_resume(k, kai_fiber_result_for_awaiter(fib));
         }
         cur = cur->as.cons.tail;
     }
@@ -14808,7 +14986,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
             exit(1);
         }
     }
-    return kai_cont_resume(k, kai_incref(head->result));
+    return kai_cont_resume(k, kai_fiber_result_for_awaiter(head));
 }
 #endif
 
@@ -15112,14 +15290,13 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
  * the peer's own future termination doesn't re-enter our (now-
  * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
 /* Deliver a system message (link trap-exit reason, monitor pid) into a
- * mailbox owned by an arbitrary fiber, consuming `msg`. Same thread →
- * plain push (byte-identical at N=1). Cross-thread → deep-copy into this
- * thread's heap and enqueue under the mailbox lock, exactly like a
- * cross-thread Actor.send, so the peer's heap stays single-threaded. */
+ * mailbox owned by an arbitrary fiber, consuming `msg`. Same copy rule as
+ * kai_core_mailbox_send: at N=1 a plain push (byte-identical), at N>1 an
+ * unconditional deep copy, because the peer's `home_thread` is not stable
+ * across the send and the peer's heap must stay single-threaded. */
 static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
-    int dst = (mb->owner_fiber) ? mb->owner_fiber->home_thread : kai_thread_id;
-    if (kai_nthreads > 1 && dst != kai_thread_id) {
-        KaiValue *copy = kai_deep_copy_out(msg);
+    if (kai_nthreads > 1) {
+        KaiValue *copy = kai_deep_copy_cross(msg);
         kai_decref(msg);
         kai_mailbox_push_cross_thread(mb, copy);
     } else {

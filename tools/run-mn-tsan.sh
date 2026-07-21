@@ -55,9 +55,21 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # frames between OS threads. That is the shape any per-OS-thread bookkeeping
 # gets wrong when it cannot see a ucontext switch — TSAN's included, which is
 # why the runtime annotates every fiber switch for it.
+#
+# The last three cover the cross-thread memory invariant itself — the rule
+# that makes non-atomic RC sound. Each targets one way a value used to stay
+# reachable from two threads: a message's scalar leaves (only the spine was
+# rebuilt), a terminated fiber's result handed to several awaiters at once,
+# and the string intern table. Their races are on `v->rc` and on the intern
+# buckets, which a stdout diff cannot see unless the lost update happens to
+# land — TSAN reports them either way, which is why these live here and not
+# only in the effects tier.
 FIXTURES=(
   "examples/effects/mn_cross_thread_copy_stress.kai"
   "examples/effects/mn_deep_stack_migration.kai"
+  "examples/effects/mn_cross_thread_scalar_share.kai"
+  "examples/effects/mn_await_result_share.kai"
+  "examples/effects/mn_str_intern_race.kai"
 )
 
 fail=0
