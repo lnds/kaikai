@@ -1388,10 +1388,9 @@ fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: [
 #     sole consumer the re-thread: base arms neither read nor consume
 #     `nm`, so the exit-drop on the base path is the only release and
 #     transferring the re-thread raw double-frees nothing.
-#   - every bare read of `nm` sits in a self-call arg or a BORROWED callee
-#     slot. A bare read anywhere else (an operator operand, a ctor slot, a
-#     scrutinee) reaches a CONSUMING position on a path that still runs
-#     the exit drop — two releases of one ref.
+#     Base-path BLOCK STATEMENTS are `nm`-free too: a read there (an
+#     operator operand, a consuming call) takes a ref while the exit
+#     wrap still drops `nm` on that path — two releases of one.
 # Excludes `borrowed` (never dup'd) and `skip_set` (already moves on
 # every use, exit drop suppressed).
 fn pcs_collect_borrow_move_last_params(self_name: String, pnames: [String], body: Expr, uses: [Use],
@@ -1412,8 +1411,7 @@ fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
         LUAt(_, _, _) ->
           if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and
              pcs_max_paths_b_expr(nm, body, bmap) == 1 and
-             pcs_nm_absent_from_nonrec_tails(self_name, nm, body) and
-             pcs_bmlp_reads_ok(self_name, nm, body, bmap) {
+             pcs_nm_absent_from_nonrec_tails(self_name, nm, body) {
             [nm, ...more]
           } else { more }
         _ -> more
@@ -1422,80 +1420,14 @@ fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
   }
 }
 
-# Every bare read of `nm` must be a DIRECT arg of a self-call (the
-# re-thread, moved raw) or a DIRECT arg in a BORROWED slot of a callee
-# (the strip nets it to zero). Any other read reaches a consuming
-# position while the exit wrap still drops `nm` on non-goto paths —
-# reject, falling back to the dup-per-read discipline. Structural forms
-# recurse; anything unrecognised is rejected when it mentions `nm`.
-fn pcs_bmlp_reads_ok(self_name: String, nm: String, e: Expr, bmap: [BorrowEntry]) : Bool / Console =
-  pcs_bro_kind(self_name, nm, e.kind, bmap)
-
-fn pcs_bro_kind(self_name: String, nm: String, k: ExprKind, bmap: [BorrowEntry]) : Bool / Console = match k {
-  EVar(u) -> u != nm
-  ECall(f, xs) -> {
-    let key = pcs_callee_key(f)
-    let selfish = key == self_name
-    pcs_bro_expr(self_name, nm, f, bmap) and
-      pcs_bro_args(self_name, nm, xs, 0, selfish, pcs_borrow_lookup(bmap, key), bmap)
-  }
-  EBinop(_, a, b) -> pcs_bro_expr(self_name, nm, a, bmap) and pcs_bro_expr(self_name, nm, b, bmap)
-  EUnop(_, x)     -> pcs_bro_expr(self_name, nm, x, bmap)
-  EIf(c, t, oe)   -> pcs_bro_expr(self_name, nm, c, bmap) and pcs_bro_expr(self_name, nm, t, bmap) and
-                     (match oe { None -> true Some(e2) -> pcs_bro_expr(self_name, nm, e2, bmap) })
-  EMatch(s, arms) -> pcs_bro_expr(self_name, nm, s, bmap) and pcs_bro_arms(self_name, nm, arms, bmap)
-  EBlock(stmts, ot) -> pcs_bro_stmts(self_name, nm, stmts, bmap) and
-                       (match ot { None -> true Some(t) -> pcs_bro_expr(self_name, nm, t, bmap) })
-  # A field/index read recurses into its children: a bare `nm` base is
-  # rejected by the EVar arm, while a borrowed-prim access underneath
-  # (`a[i]` desugared to `array_get(a, i)`) keeps its allowance.
-  EField(x, _)  -> pcs_bro_expr(self_name, nm, x, bmap)
-  EIndex(a, b)  -> pcs_bro_expr(self_name, nm, a, bmap) and pcs_bro_expr(self_name, nm, b, bmap)
-  EBang(x) -> pcs_bro_expr(self_name, nm, x, bmap)
-  _ -> not pcs_name_in_expr_k(nm, k)
-}
-
-fn pcs_bro_expr(self_name: String, nm: String, e: Expr, bmap: [BorrowEntry]) : Bool / Console =
-  pcs_bro_kind(self_name, nm, e.kind, bmap)
-
-fn pcs_bro_args(self_name: String, nm: String, xs: [Expr], i: Int, selfish: Bool,
-                bpos: [Int], bmap: [BorrowEntry]) : Bool / Console = match xs {
-  []           -> true
-  [a, ...rest] -> {
-    let ok = match a.kind {
-      EVar(u) -> if u == nm { selfish or pcs_has_int(bpos, i) } else { true }
-      _       -> pcs_bro_expr(self_name, nm, a, bmap)
-    }
-    ok and pcs_bro_args(self_name, nm, rest, i + 1, selfish, bpos, bmap)
-  }
-}
-
-fn pcs_bro_arms(self_name: String, nm: String, arms: [Arm], bmap: [BorrowEntry]) : Bool / Console = match arms {
-  []           -> true
-  [a, ...rest] -> match a {
-    Arm(_, og, b) ->
-      (match og { None -> true Some(g) -> pcs_bro_expr(self_name, nm, g, bmap) }) and
-      pcs_bro_expr(self_name, nm, b, bmap) and pcs_bro_arms(self_name, nm, rest, bmap)
-  }
-}
-
-fn pcs_bro_stmts(self_name: String, nm: String, stmts: [Stmt], bmap: [BorrowEntry]) : Bool / Console = match stmts {
-  []           -> true
-  [s, ...rest] -> {
-    let ok = match s {
-      SLet(_, _, rhs) -> pcs_bro_expr(self_name, nm, rhs, bmap)
-      SExprStmt(x)    -> pcs_bro_expr(self_name, nm, x, bmap)
-      SAssert(c, om)  -> pcs_bro_expr(self_name, nm, c, bmap) and
-                         (match om { None -> true Some(m) -> pcs_bro_expr(self_name, nm, m, bmap) })
-      _               -> true
-    }
-    ok and pcs_bro_stmts(self_name, nm, rest, bmap)
-  }
-}
-
 # True iff `nm` appears in no tail position that is not a self-call —
 # i.e. every base arm is `nm`-free. A tail self-call is skipped (that is
 # where the re-thread lives); any other tail is scanned for `nm`.
+# A block whose tail holds NO self-call is a pure base path: its
+# STATEMENTS must be `nm`-free too — a read there (an operator operand,
+# a consuming call) takes a ref while the exit wrap still drops `nm` on
+# that path, two releases of one. Statements ahead of a re-threading
+# tail stay allowed: they are the discounted prefix of the re-thread.
 fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr) : Bool / Console =
   pcs_nmant_kind(self_name, nm, e.kind)
 
@@ -1509,11 +1441,18 @@ fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind) : Bool / Console =
     pcs_nm_absent_from_nonrec_tails(self_name, nm, t) and
     (match opt_e { None -> true Some(e2) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, e2) })
   EMatch(_, arms) -> pcs_nmant_arms(self_name, nm, arms)
-  EBlock(_, opt_tail) -> match opt_tail {
-    None    -> true
-    Some(t) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, t)
+  EBlock(stmts, opt_tail) -> match opt_tail {
+    None    -> not pcs_name_in_stmts(nm, stmts)
+    Some(t) ->
+      if ppd_has_self_call(t, self_name) { pcs_nm_absent_from_nonrec_tails(self_name, nm, t) }
+      else { not pcs_name_in_stmts(nm, stmts) and pcs_nm_absent_from_nonrec_tails(self_name, nm, t) }
   }
   _ -> not pcs_name_in_expr_k(nm, k)
+}
+
+fn pcs_name_in_stmts(nm: String, stmts: [Stmt]) : Bool / Console = {
+  let us = pcs_collect_uses_in_block(stmts, None, [nm], false, [])
+  pcs_uses_has_name(us, nm)
 }
 
 fn pcs_nmant_arms(self_name: String, nm: String, arms: [Arm]) : Bool / Console = match arms {
