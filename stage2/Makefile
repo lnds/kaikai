@@ -5752,13 +5752,16 @@ test-perceus-1324-char-binder-goto: $(TARGET) build
 	  || { echo "perceus-1324-char-binder-goto FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1324cbg.out; exit 1; }
 
 # ASAN companion: the goto path must not over-release the Char binder or
-# the scrutinee cell (the #1324 corruption was a use-after-free).
+# the scrutinee cell (the #1324 corruption was a use-after-free). Leak
+# detection is OFF: the fence trades corruption for a bounded leak by
+# design; the leak bound is enforced by the -native KAI_TRACE_RC gate.
 test-perceus-1324-char-binder-goto-asan: $(TARGET) build
 	@set -e; \
 	name=tcrec_char_binder_goto_1324; \
 	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
+	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
 	  || { echo "perceus-1324-char-binder-goto-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
