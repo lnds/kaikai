@@ -3571,42 +3571,70 @@ static int kai_mailbox_waiter_remove(KaiFiber **head, KaiFiber **tail, KaiFiber 
     return 0;
 }
 
-static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
-    /* m8 #8 + Phase 4: enforce policy on full. */
+/* BlockSender back-pressure: park the calling fiber until a receiver frees a
+ * slot. Shared by both push paths, because which one a send takes depends
+ * only on where the receiver happens to be scheduled — a policy that applied
+ * on one and not the other would make delivery a function of placement.
+ *
+ * The full-check and the waiter-enqueue happen together under the mailbox
+ * lock, mirroring kai_mailbox_pop's recv side: a pop that frees a slot either
+ * runs before our check (we see room) or after our enqueue (it dequeues and
+ * wakes us). Dropping the lock before the park is what keeps that safe —
+ * kai_sched_park leaves the fiber RUNNING until the scheduler root commits it,
+ * and a wake landing in that window is recorded as wake_pending rather than
+ * lost. The loop re-checks because another sender can take the slot between
+ * our wake and our resume.
+ *
+ * Caller must NOT hold the mailbox lock. Returns holding it, with room in the
+ * mailbox — the caller enqueues under that same acquisition, so two senders
+ * racing on the last slot cannot both pass the check and overshoot `cap`. */
+static void kai_mailbox_await_slot(KaiMailbox *mb) {
+    for (;;) {
+        kai_mbox_lock(mb);
+        if (mb->len < mb->cap) return;   /* lock stays held */
+        kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
+                                   &mb->send_waiter_tail,
+                                   kai_current_fiber());
+        kai_mbox_unlock(mb);
+        kai_sched_park();
+    }
+}
+
+/* Enforce the overflow policy on a full mailbox and return holding the lock,
+ * or 0 if the message was dropped by policy (lock released, msg consumed).
+ * Shared by both push paths so a policy cannot mean two different things
+ * depending on which thread the receiver landed on. */
+static int kai_mailbox_reserve_slot(KaiMailbox *mb, KaiValue *msg) {
+    if (mb->cap > 0 && mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+        kai_mailbox_await_slot(mb);
+        return 1;
+    }
+    kai_mbox_lock(mb);
     if (mb->cap > 0 && mb->len >= mb->cap) {
         if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) {
+            kai_mbox_unlock(mb);
             kai_decref(msg);
-            return;
-        } else if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
-            /* Pop and discard the head; fall through to enqueue. */
-            kai_mbox_lock(mb);
+            return 0;
+        }
+        if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
             KaiMboxNode *old = mb->head;
             mb->head = old->next;
             if (!mb->head) { mb->tail = NULL; }
             kai_decref(old->msg);
             free(old);
             mb->len--;
-            kai_mbox_unlock(mb);
-        } else if (mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
-            /* Park sender until a receiver pops a slot. The cooperative
-             * scheduler guarantees forward progress: the receiver that
-             * eventually pops will wake one parked sender (FIFO). The
-             * loop re-checks because between unpark and resume another
-             * sender could have refilled the slot. The lock is never
-             * held across the park. */
-            while (mb->len >= mb->cap) {
-                kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
-                                            &mb->send_waiter_tail,
-                                            kai_current_fiber());
-                kai_sched_park();
-            }
         }
     }
+    return 1;
+}
+
+static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
+    /* m8 #8 + Phase 4: enforce policy on full. */
+    if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
     if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     node->msg  = msg;
     node->next = NULL;
-    kai_mbox_lock(mb);
     if (mb->tail) { mb->tail->next = node; }
     else          { mb->head       = node; }
     mb->tail = node;
@@ -3623,29 +3651,14 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
  * and migrates to the receiver like a fiber does (freed on the
  * receiver's thread, into its own TLS pools). We take the mailbox lock,
  * append the node, and — if the owner is parked waiting to receive —
- * promote it on ITS scheduler thread and wake that thread. Bounded
- * policies degrade to drop-on-full here: cross-thread BlockSender
- * back-pressure (parking the sender on another thread's mailbox) is a
- * refinement beyond F1; an unbounded mailbox (the actor default) has no
- * such branch. */
+ * promote it on ITS scheduler thread and wake that thread.
+ *
+ * Bounded policies mean the same thing here as on the same-thread path: a
+ * BlockSender mailbox parks the sender, it does not discard. The wake crosses
+ * threads on its own — kai_mailbox_pop already routes send-waiter wakes
+ * through kai_sched_unpark, which promotes on the target's home thread. */
 static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
-    pthread_mutex_lock(&mb->mu);
-    if (mb->cap > 0 && mb->len >= mb->cap &&
-        mb->overflow != KAI_OVERFLOW_DROP_OLDEST) {
-        /* full + (DropNewest | BlockSender): drop the newest. */
-        pthread_mutex_unlock(&mb->mu);
-        kai_decref(msg);
-        return;
-    }
-    if (mb->cap > 0 && mb->len >= mb->cap &&
-        mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
-        KaiMboxNode *old = mb->head;
-        mb->head = old->next;
-        if (!mb->head) mb->tail = NULL;
-        kai_decref(old->msg);
-        free(old);
-        mb->len--;
-    }
+    if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
     if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     node->msg  = msg;
@@ -3656,7 +3669,7 @@ static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
     mb->len++;
     KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
                                                   &mb->recv_waiter_tail);
-    pthread_mutex_unlock(&mb->mu);
+    kai_mbox_unlock(mb);
     if (waiter) kai_sched_remote_unpark(waiter);
 }
 
