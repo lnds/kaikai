@@ -5878,7 +5878,7 @@ test-perceus-1355-closure-temp-release-native: $(TARGET) build
 # mixed, plus an escaping return) whose real teeth are the ASAN twin.
 test-perceus-1328-selftail-borrowed-local: $(TARGET) build
 	@set -e; \
-	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328; do \
+	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	    || { echo "perceus-1328-selftail-borrowed-local FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
@@ -5899,7 +5899,7 @@ test-perceus-1328-selftail-borrowed-local: $(TARGET) build
 # and an escaping value keeps the ref its tail read pays for.
 test-perceus-1328-selftail-borrowed-local-asan: $(TARGET) build
 	@set -e; \
-	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328; do \
+	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -5921,7 +5921,7 @@ test-perceus-1328-selftail-borrowed-local-asan: $(TARGET) build
 # refs and keep the same output — leak flat on the native backend too.
 test-perceus-1328-selftail-borrowed-local-native: $(TARGET) build
 	@set -e; \
-	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328; do \
+	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
 	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
