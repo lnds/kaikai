@@ -20,30 +20,17 @@
 # lives). The two harnesses split on the package/file axis on purpose;
 # do not add package-mode logic here.
 #
-# Skip discipline:
-#   1. tools/backend-parity-skips.txt — one line per skipped
-#      fixture: <relative-path>:<issue-number>:<one-line-reason>
-#      File a separate issue first; the skip is the bookmark, the
-#      issue is the work.
-#   2. Inline annotation: a fixture whose first line contains
-#      "// skip-backend-parity" is skipped silently. Use only when
-#      the fixture is *intentionally* backend-specific (e.g. a
-#      feature only one backend implements by design).
-#
-# Entry-point detection: kaikai fixtures live in two shapes —
-#   - flat:    <dir>/<name>.kai is a standalone program with main.
-#   - package: <dir>/<pkg>/main.kai is the entry-point; sibling
-#              files are libraries loaded by main.
-# We walk depth-2 *.kai for flat shape and **/main.kai for the
-# package shape. Library files (e.g. lib_greet/greet.kai) are
-# never compiled standalone — they would always C-FAIL at link
-# time (no kai_main symbol) and that's not a backend-parity issue.
+# The entry-point walk and the skip discipline live in tools/lib/corpus.sh,
+# shared with the M:N corpus-determinism gate so the two cannot drift into
+# covering different corpora.
 
 set -eu
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
+
+. "$ROOT/tools/lib/corpus.sh"
 
 # Parametrised axis. The harness diffs a TARGET backend against an
 # ORACLE backend over the same corpus. The default gates the in-process
@@ -82,13 +69,9 @@ if [ ! -x "$KAI" ]; then
   exit 1
 fi
 
-# Directories to walk. examples/negative is intentionally absent:
-# those fixtures must reject at compile time, so backend-parity
-# (which assumes both build cleanly) does not apply.
-#
-# Overridable via $BACKEND_PARITY_DIRS (newline- or space-separated) so CI
-# can shard the corpus across runners (docs/ci-time-analysis.md §7). Each
-# shard runs a disjoint subset; the union must equal this default so the
+# Shard the corpus across runners via $BACKEND_PARITY_DIRS (newline- or
+# space-separated; docs/ci-time-analysis.md §7). Each shard runs a disjoint
+# subset; the union must equal the default in tools/lib/corpus.sh so the
 # gate's coverage is unchanged. Sharding is safe ONLY while the ratchet
 # baseline (native-parity-baseline.txt) is empty: the new-gap check is
 # per-fixture (a gap in a shard's subset fails that shard), but the
@@ -96,21 +79,7 @@ fi
 # so a non-empty baseline would mis-report baseline entries outside a
 # shard's subset as closed. Keep the baseline empty, or de-shard, if that
 # changes.
-DIRS="${BACKEND_PARITY_DIRS:-examples/effects
-examples/actors
-examples/spawn
-examples/perceus
-examples/refinements
-examples/llvm
-examples/packages
-examples/minimal
-examples/quickstart
-examples/stdlib
-examples/attributes
-examples/unstable
-demos}"
-
-SKIPS_FILE="$ROOT/tools/backend-parity-skips.txt"
+KAI_CORPUS_DIRS="${BACKEND_PARITY_DIRS:-$KAI_CORPUS_DEFAULT_DIRS}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -139,63 +108,7 @@ run_with_timeout() {
   fi
 }
 
-# Rewrite ISO-8601 UTC timestamps (the stdlib Log default handler's
-# `[YYYY-MM-DDTHH:MM:SSZ] LEVEL message` form, docs/log.kai) to a fixed
-# placeholder before any oracle/target comparison. Applied identically to
-# both sides, so a real content divergence still fails; only the
-# wall-clock second — which can differ between two runs straddling a
-# second boundary under parallel load — is masked.
-normalize_timestamps() {
-  sed -E 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[TIMESTAMP]/g'
-}
-
-# Collect entry points into $tmp/entry-points (one path per line).
-#
-# `quarantine/` subdirs hold fixtures that DOCUMENT broken/accidental
-# behaviour (no stable golden — silent corruption, segfault) and must
-# not enter the parity corpus. The flat walk's -maxdepth 1 already skips
-# any subdir, but the package walk is pruned explicitly so a future
-# quarantine/main.kai cannot leak in.
-collect_entry_points() {
-  for dir in $DIRS; do
-    [ -d "$dir" ] || continue
-    # Flat shape: *.kai immediately under $dir (depth 1 from $dir).
-    find "$dir" -maxdepth 1 -name "*.kai" -not -name "*.err.kai" 2>/dev/null
-    # Package shape: <dir>/<pkg>/main.kai (depth >= 2).
-    find "$dir" -mindepth 2 -name "main.kai" -not -path '*/quarantine/*' 2>/dev/null
-  done | sort -u > "$tmp/entry-points"
-}
-
-is_skipped() {
-  fixture="$1"
-  if [ -f "$SKIPS_FILE" ] && grep -q "^${fixture}:" "$SKIPS_FILE" 2>/dev/null; then
-    return 0
-  fi
-  # Inline annotation: first line contains "// skip-backend-parity".
-  if [ -r "$fixture" ] && head -1 "$fixture" | grep -q "// skip-backend-parity"; then
-    return 0
-  fi
-  # Negative-by-design: a sibling `.err.expected` file declares this
-  # fixture is meant to reject at compile time. Some negative fixtures
-  # live inside positive dirs (e.g. examples/stdlib/map_assign_error.kai
-  # documents the v1 rejection of indexed-map-write). They are exercised
-  # by tools/test-negative.sh against their golden — not by parity.
-  case "$fixture" in
-    */main.kai)
-      dir="${fixture%/main.kai}"
-      if [ -f "$dir/main.err.expected" ]; then
-        return 0
-      fi
-      ;;
-  esac
-  base="${fixture%.kai}"
-  if [ -f "$base.err.expected" ] || [ -f "$base.diag.expected" ] || [ -f "$base.run.err.expected" ]; then
-    return 0
-  fi
-  return 1
-}
-
-collect_entry_points
+kai_corpus_entry_points > "$tmp/entry-points"
 
 # Jobs: number of parallel workers. Defaults to the host's logical CPU count;
 # override via BACKEND_PARITY_JOBS. macOS uses sysctl, Linux uses nproc.
@@ -222,7 +135,7 @@ results="$tmp/results"   # one line per fixture: P|F|S
 # failure blocks both fit.
 process_one() {
   f="$1"
-  if is_skipped "$f"; then
+  if kai_corpus_is_skipped "$f"; then
     printf 'S\n' >> "$results"
     return 0
   fi
@@ -265,8 +178,8 @@ process_one() {
   run_with_timeout "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
   t_rc=0
   run_with_timeout "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
-  normalize_timestamps <"$o_out_file" >"$o_out_file.norm" && mv "$o_out_file.norm" "$o_out_file"
-  normalize_timestamps <"$t_out_file" >"$t_out_file.norm" && mv "$t_out_file.norm" "$t_out_file"
+  kai_corpus_normalize_timestamps <"$o_out_file" >"$o_out_file.norm" && mv "$o_out_file.norm" "$o_out_file"
+  kai_corpus_normalize_timestamps <"$t_out_file" >"$t_out_file.norm" && mv "$t_out_file.norm" "$t_out_file"
 
   if [ "$o_rc" != "$t_rc" ]; then
     {
@@ -296,9 +209,9 @@ process_one() {
 
 # Export the worker + the helpers and state it touches so xargs can
 # reach them from each forked subshell.
-export KAI tmp failures results SKIPS_FILE RUN_TIMEOUT TIMEOUT_CMD
+export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one is_skipped run_with_timeout normalize_timestamps
+export -f process_one kai_corpus_is_skipped run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
@@ -363,14 +276,14 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
     rf="$1"
     rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
     KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 2
-    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null | normalize_timestamps)" || oref=$?
+    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || oref=$?
     attempt=0
     while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
       if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
-      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | normalize_timestamps)" || rt=$?
+      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?
       if [ "$rt" != "$oref" ] || [ "$rtout" != "$orefout" ]; then
         return 0   # diverged on a recheck => a real (new) gap.
       fi
