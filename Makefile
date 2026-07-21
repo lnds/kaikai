@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,8 +187,8 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud"
 
 # A header-only edit must rebuild every artifact that embeds it, and must not
 # rebuild the ones that do not. Both directions are invisible to CI, which
@@ -420,6 +420,22 @@ test-canonical-aliases:
 # Pure shell, no compiler — runs fast, gates a source property.
 test-runtime-global-audit:
 	@./tools/runtime-global-audit.sh --self-test
+
+# The other half of the KAI_HOT_ONLY soundness argument. gen-runtime-bc.sh
+# proves no function IN the hot bitcode reaches swapcontext; this proves no
+# thread-local address is materialised by a function the optimiser can fold
+# into an emitted kaikai frame, whose activation does span a park and can
+# resume on another OS thread. `--self-test` is hermetic — hand-written IR, no
+# compiler — so the discriminator is gated on hosts where P2 is opted out too.
+#
+# The generator runs in the middle deliberately. It is a no-op when the .bc is
+# fresh and a clean exit when there is no clang 18, but when the gate rejects
+# what it built it DROPS the .bc — which would otherwise leave the third step
+# with nothing to inspect and the failure invisible. Here it propagates.
+test-tls-hoist-gate:
+	@./tools/tls-hoist-gate.sh --self-test
+	@./tools/gen-runtime-bc.sh
+	@./tools/tls-hoist-gate.sh
 
 # Tongariki — `kai fmt` fixture suite. Verifies that every fixture
 # in examples/fmt/ formats to its `.expected.kai` and is idempotent,
