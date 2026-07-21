@@ -57,6 +57,7 @@ import compiler.fnreg
 import compiler.ast_map
 import compiler.borrow_infer
 import compiler.perceus_op_arg
+import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 
 # ==================================================================
@@ -1843,7 +1844,13 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # body rewrite runs with an EMPTY param scope (issue #703) — no
         # boxed param to dup/drop, no borrow, no arm-move analysis.
         let uses = pcs_collect_uses_expr(body, [], false, [])
-        let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
+        let new_body0 = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
+        # A boxed local whose last read sits in the tail needs the same
+        # post-tail release as the mixed path — this body shape is where
+        # every read of a multi-use local can land in a borrowed slot and
+        # orphan the birth ref.
+        let new_body = ptd_tail_exit_drops(new_body0, name, uses, [],
+                                           pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
@@ -1965,8 +1972,11 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         # The block-exit collector below declines a binding whose last read
         # sits in the tail (the drop would have to run after the tail value
-        # exists). `ptd_tail_exit_drops` releases exactly those.
-        let new_body = ptd_tail_exit_drops(new_body1, name, uses, move_last_set)
+        # exists). `ptd_tail_exit_drops` releases exactly those. The fn's own
+        # borrowed positions gate the self-call arg hoist: a hoisted temp in
+        # a borrowed slot would lose the argument's ownership marking.
+        let new_body = ptd_tail_exit_drops(new_body1, name, uses, move_last_set,
+                                           pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         # Plant the branch-local drop for each `owned_moves` param in the arms
         # that never read it (their exit drop was skipped via `skip_set`).
@@ -5668,13 +5678,21 @@ fn pcs_arms_have_self_tail(arms: [Arm], fn_name: String) : Bool {
 fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool / Console {
 
   match body.kind {
-    EBlock(_, opt_tail) -> match opt_tail {
-      None -> false
-      Some(t) -> {
-        let us = pcs_collect_uses_expr(t, [nm], false, [])
+    # A self-call arg hoist IS the tail: its temps carry the call's args,
+    # so a read in the temps is a tail read (a pre-tail drop would fire
+    # between a moved read and the call that consumes it).
+    EBlock(stmts, opt_tail) ->
+      if ppd_is_hoist_block(stmts) {
+        let us = pcs_collect_uses_expr(body, [nm], false, [])
         pcs_uses_has_name(us, nm)
       }
-    }
+      else { match opt_tail {
+        None -> false
+        Some(t) -> {
+          let us = pcs_collect_uses_expr(t, [nm], false, [])
+          pcs_uses_has_name(us, nm)
+        }
+      } }
     _ -> {
       let us = pcs_collect_uses_expr(body, [nm], false, [])
       pcs_uses_has_name(us, nm)
