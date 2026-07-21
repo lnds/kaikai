@@ -9893,15 +9893,22 @@ static void kai_install_fiber_sigsegv_handler(void) {
     if (kai_sigsegv_installed) return;
     kai_sigsegv_installed = 1;
 
-    size_t altsize = (size_t) SIGSTKSZ;
-    if (altsize < 32 * 1024) altsize = 32 * 1024;
-    kai_sigalt_stack = malloc(altsize);
-    if (kai_sigalt_stack) {
-        stack_t ss;
-        ss.ss_sp    = kai_sigalt_stack;
-        ss.ss_size  = altsize;
-        ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
+    /* TRAP: adopt an alternate stack a sanitizer or embedding host already
+     * installed. Such an owner munmaps whatever `sigaltstack` reports back at
+     * thread exit, so displacing it makes it unmap our malloc'd pointer —
+     * EINVAL, and fatal under ASAN. */
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) != 0 || !cur.ss_sp || (cur.ss_flags & SS_DISABLE)) {
+        size_t altsize = (size_t) SIGSTKSZ;
+        if (altsize < 32 * 1024) altsize = 32 * 1024;
+        kai_sigalt_stack = malloc(altsize);
+        if (kai_sigalt_stack) {
+            stack_t ss;
+            ss.ss_sp    = kai_sigalt_stack;
+            ss.ss_size  = altsize;
+            ss.ss_flags = 0;
+            sigaltstack(&ss, NULL);
+        }
     }
 
     struct sigaction sa;

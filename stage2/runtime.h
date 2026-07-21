@@ -12288,13 +12288,16 @@ static size_t kai_fiber_stack_size(void) {
  * dies with no message. Every thread that can run a fiber installs its own. */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern KAI_TLS void *kai_sigalt_stack;
+extern KAI_TLS int   kai_sigalt_ready;
 extern int   kai_sigsegv_installed;
 #  if defined(KAI_RUNTIME_OWNER)
 KAI_TLS void *kai_sigalt_stack = NULL;
+KAI_TLS int   kai_sigalt_ready = 0;
 int   kai_sigsegv_installed = 0;
 #  endif
 #else
 static KAI_TLS void *kai_sigalt_stack = NULL;
+static KAI_TLS int   kai_sigalt_ready = 0;
 static int   kai_sigsegv_installed = 0;
 #endif
 
@@ -12323,16 +12326,33 @@ static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
     raise(sig);
 }
 
-/* Give the calling thread its own alternate signal stack. Idempotent; the
- * allocation stays owned by the thread-local pointer for the thread's life. */
+/* Give the calling thread an alternate signal stack, adopting one that is
+ * already installed rather than displacing it.
+ *
+ * TRAP: a sanitizer runtime (and any embedding host that follows the same
+ * pattern) installs its own alternate stack per thread and, at thread exit,
+ * munmaps whatever `sigaltstack` hands back. Displacing it therefore makes
+ * that owner unmap OUR allocation — a malloc'd, unaligned pointer — which
+ * fails with EINVAL and is fatal under ASAN. Adopting costs nothing:
+ * SA_ONSTACK only needs a stack that is not the one that overflowed.
+ *
+ * Idempotent; an allocation we make stays owned by the thread-local pointer
+ * for the thread's life. */
 static void kai_install_thread_sigaltstack(void) {
-    if (kai_sigalt_stack) return;
+    if (kai_sigalt_ready) return;
+
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) == 0 && cur.ss_sp && !(cur.ss_flags & SS_DISABLE)) {
+        kai_sigalt_ready = 1;
+        return;
+    }
 
     size_t altsize = (size_t) SIGSTKSZ;
     if (altsize < 32 * 1024) altsize = 32 * 1024;
     void *sp = malloc(altsize);
     if (!sp) return;
     kai_sigalt_stack = sp;
+    kai_sigalt_ready = 1;
 
     stack_t ss;
     ss.ss_sp    = sp;

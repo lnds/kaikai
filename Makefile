@@ -681,6 +681,8 @@ tier1-asan: kaic2 test-arena
 	  exit 1; \
 	fi; \
 	echo "tier1-asan OK — $$got/$$expected demos pass under ASAN+UBSan, no sanitizer diagnostics"
+	@$(MAKE) -C stage2 test-mn-sigaltstack-asan
+	@echo "tier1-asan OK — sigaltstack fixture passes under ASAN+UBSan at KAI_THREADS=1/2/8/16 (alternate-stack ownership gate)"
 	@$(MAKE) -C stage2 test-trace-asan
 	@echo "tier1-asan OK — trace fixtures pass under ASAN+UBSan (R10/R11 regression gate)"
 	@$(MAKE) -C stage2 test-runtime-shadow-asan
