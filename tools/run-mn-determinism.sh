@@ -60,6 +60,14 @@ FIXTURES=(
   # Fiber wrappers dropping to RC=0 on a thread other than the one each fiber
   # ran on: the free path must not release a stack that is still live.
   "examples/effects/mn_fiber_free_race.kai"
+  # A bounded mailbox must mean the same thing on both send paths. Which one a
+  # send takes depends only on where the work-stealer put the receiver, so a
+  # policy applied on one and not the other makes delivery a function of
+  # placement: under BlockSender the sender must park, never discard. A
+  # discarded message strands the receiver on a drain that can no longer
+  # complete, which is a hang, and the sum witness makes a partial delivery
+  # visible even if it somehow completed.
+  "examples/effects/mn_cross_thread_block_sender.kai"
 )
 
 # kai: the shipped build path (separate -O0 scheduler owner).
