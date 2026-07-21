@@ -34,6 +34,13 @@ KAI="$ROOT/bin/kai"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+. "$ROOT/tools/lib/timeout.sh"
+
+# A lost wakeup strands the sleeper forever rather than measuring late, so
+# every sample is bounded: a wedge fails the bench instead of burning the CI
+# job ceiling and reporting `cancelled`. A sample runs ~1s.
+RUN_TIMEOUT="${MN_BENCH_RUN_TIMEOUT:-60}"
+
 # Default to min(4, nproc): one hog per scheduler thread except one, plus
 # the reactor thread, must fit without oversubscribing the box — otherwise
 # the "free" scheduler thread that dispatches the woken sleeper competes for
@@ -84,8 +91,18 @@ EOF
 # samples than the old 3 so a startup-transient outlier cannot swing it)
 samples=()
 for i in 1 2 3 4 5; do
-  ms="$(KAI_THREADS=$NTH "$TMP/starve" 2>/dev/null | tail -1)"
-  samples+=("$ms")
+  ec=0
+  kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$NTH" "$TMP/starve" \
+    >"$TMP/run.out" 2>/dev/null || ec=$?
+  if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
+    echo "run-mn-reactor-bench: FAIL (run $i wedged — no exit within ${RUN_TIMEOUT}s; the sleeper never woke)"
+    exit 1
+  fi
+  if [ "$ec" != 0 ]; then
+    echo "run-mn-reactor-bench: FAIL (run $i exited $ec)"
+    exit 1
+  fi
+  samples+=("$(tail -1 "$TMP/run.out")")
 done
 med=$(printf '%s\n' "${samples[@]}" | sort -n | awk 'NR==3')
 
