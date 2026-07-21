@@ -74,8 +74,8 @@ pub type LMArm = LMArm(LowerSt, String)
 # catch-all arm emits no test (binds the whole scrutinee, branches straight
 # to the body) and its "fail" label is unreachable.
 pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
-                   st: LowerSt) : LMArm / Console = match p.pkind {
-  PList(pats, opt_rest) -> lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, st)
+                   reuse_arm: Bool, st: LowerSt) : LMArm / Console = match p.pkind {
+  PList(pats, opt_rest) -> lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, reuse_arm, st)
   # `name as [h, ...rest]`: an as-binding whose inner is a list-destructure
   # is NOT a catch-all — it carries the inner list's length test. Emit the
   # inner PList's cells (so h/tail registers exist), then bind `name` to the
@@ -83,7 +83,7 @@ pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
   # delegating to the inner (`PAs(_, sub) -> emit_pat_test(sub)`) plus its
   # `emit_pat_binds` binding the as-name to the scrutinee.
   PAs(name, inner) -> match inner.pkind {
-    PList(pats, opt_rest) -> match lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, st) {
+    PList(pats, opt_rest) -> match lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, reuse_arm, st) {
       LMArm(st_body, fail_lbl) ->
         LMArm(lm_bind_name(name, KLitOp(scrv), p, st_body), fail_lbl)
     }
@@ -95,9 +95,9 @@ pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
 # Emit the cons/nil discrimination + head/tail binds for one list arm,
 # sealing into `body_lbl` on a match and a fresh fail label on a mismatch.
 fn lm_emit_list_arm(pats: [Pattern], opt_rest: Option[String], scrv: KVal,
-                    body_lbl: String, p: Pattern, st: LowerSt) : LMArm / Console =
+                    body_lbl: String, p: Pattern, reuse_arm: Bool, st: LowerSt) : LMArm / Console =
   match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
-    let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, st1)
+    let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, reuse_arm, st1)
     LMArm(reopen(st2, body_lbl), fail_lbl)
   } }
 
@@ -128,14 +128,14 @@ fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind 
 # head test runs BEFORE the bind (the oracle's `emit_pat_test` precedes
 # `emit_pat_binds`), so `r` only binds once `snd` is confirmed `JReal`.
 pub fn lm_emit_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
-                 body_lbl: String, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+                 body_lbl: String, fail_lbl: String, reuse_arm: Bool, st: LowerSt) : LowerSt / Console =
   match pats {
-    [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, st)
+    [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, reuse_arm, st)
     [hp, ...rest] -> match lm_emit_cell_test(cur, prim_is_cons(), fail_lbl, st) {
       LMArm(st1, _) -> {
         let st2 = lm_emit_head(hp, cur, fail_lbl, st1)
         match bind_op(st2, KProj(cur, 1), KAt(hp.line, hp.col)) { LRes(tailv, st3) ->
-          lm_emit_cells(rest, opt_rest, tailv, body_lbl, fail_lbl, st3) }
+          lm_emit_cells(rest, opt_rest, tailv, body_lbl, fail_lbl, reuse_arm, st3) }
       }
     }
   }
@@ -173,7 +173,7 @@ fn lm_emit_head(hp: Pattern, cur: KVal, fail_lbl: String, st: LowerSt) : LowerSt
 fn lm_emit_head_list(pats: [Pattern], opt_rest: Option[String], headv: KVal,
                      fail_lbl: String, st: LowerSt) : LowerSt / Console =
   match ls_fresh_label(st) { LSLabel(cont, st1) -> {
-    let st2 = lm_emit_cells(pats, opt_rest, headv, cont, fail_lbl, st1)
+    let st2 = lm_emit_cells(pats, opt_rest, headv, cont, fail_lbl, false, st1)
     reopen(st2, cont)
   } }
 
@@ -294,11 +294,20 @@ fn lm_lit_atom(lit: Expr) : KVal = match lit.kind {
 
 # After the fixed heads: a rest binder accepts any tail (bind it, branch to
 # the body); no rest binder demands the tail be `KAI_NIL` (exact length).
+# An unused-by-convention rest binder is not bound at all (the C oracle's
+# elision); `pat_alias_binders` and the perceus binder sets skip it on the
+# same predicate, so no dup/drop ever references the missing name. The one
+# exception is a reuse arm: its dual-branch lowering increfs the direct
+# slots by name (as the C reuse emitter binds the rest unconditionally),
+# so there the bind stays.
 fn lm_close_tail(opt_rest: Option[String], cur: KVal, body_lbl: String,
-                 fail_lbl: String, st: LowerSt) : LowerSt / Console = match opt_rest {
+                 fail_lbl: String, reuse_arm: Bool, st: LowerSt) : LowerSt / Console = match opt_rest {
   Some(name) -> {
-    let st1 = lm_bind_name(name, KLitOp(cur), mk_pat(PWild, 0, 0), st)
-    ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
+    if name_is_unused_binder(name) and not reuse_arm { ls_seal(st, KBr(body_lbl, KNoPos), fail_lbl) }
+    else {
+      let st1 = lm_bind_name(name, KLitOp(cur), mk_pat(PWild, 0, 0), st)
+      ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
+    }
   }
   None -> match lm_emit_cell_test(cur, prim_is_nil(), fail_lbl, st) {
     LMArm(st1, _) -> ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
