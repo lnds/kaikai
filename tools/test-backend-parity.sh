@@ -311,9 +311,9 @@ echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND (oracle) — walki
 # everything; the final summary is deterministic.
 xargs -P "$JOBS" -n 1 -I{} bash -c 'process_one "$@"' _ {} < "$tmp/entry-points"
 
-pass=$(grep -c '^P$' "$results" 2>/dev/null || echo 0)
-fail=$(grep -c '^F$' "$results" 2>/dev/null || echo 0)
-skip=$(grep -c '^S$' "$results" 2>/dev/null || echo 0)
+pass=$(grep -c '^P$' "$results" 2>/dev/null || true)
+fail=$(grep -c '^F$' "$results" 2>/dev/null || true)
+skip=$(grep -c '^S$' "$results" 2>/dev/null || true)
 
 echo ""
 echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip total=$total"
