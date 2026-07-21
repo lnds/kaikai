@@ -246,6 +246,18 @@ merging them into "failed" cost an earlier lane three useless rounds.
 | `diverge` | exit code matched, stdout non-empty, contents differ |
 | `reorder` | same lines as the reference, different order, on a fixture that declares its interleaving unspecified |
 
+**`diverge` and `empty` clear two adjudications before they are believed.**
+First N=1 self-stability: a fixture whose own N=1 output varies cannot
+witness anything about thread count. Then reproduction — the divergence must
+reappear on at least one of N further runs at the same thread count. That
+second check exists because `Stdout.print` is not line-atomic across
+scheduler threads (#1388), so any multi-fiber program can occasionally emit
+a torn line; it tears a different fixture every run, and a byte-exact gate
+that believed each one would be red at random. A held flake is still
+announced loudly, with a CI annotation. `crash` and `hang` clear neither
+adjudication: re-running a one-in-many SIGSEGV until it behaves is how a
+gate learns to lie.
+
 **Two observation conditions are load-bearing.** stdout goes to a
 FILE, never a pipe — a pipe (like a tty) changes the buffering enough
 to close the window on a whole family of races. And every run is
@@ -261,7 +273,21 @@ reason, and the gate then compares the **multiset** of its output
 lines instead of the sequence. Every line must still appear exactly
 once, so lost work, a duplicated message and a torn line all remain
 findings. The file forgives interleaving and nothing else; a fixture
-that prints a *result* does not belong in it.
+that prints a *result* does not belong in it, and neither does one
+that gains or loses a line (#1384, #1389 are both that family, and
+are findings). Every entry names an open issue — the declaration is
+the bookmark, the issue is the work, and these goldens also break
+tier1's own byte-for-byte comparison once `KAI_THREADS` defaults to
+ncpu (#1390).
+
+**Known findings ratchet.** `tools/mn-corpus-baseline.txt` holds the
+(fixture, backend) pairs that were already broken above one thread
+when the gate first walked the corpus, each line naming an open
+issue. A pair failing that is not listed fails the gate; the queue
+may only shrink. These defects are timing- and platform-dependent —
+a pair reproduces on one runner and not another — so the file is the
+union over the platforms measured, and a quiet run is not evidence
+an entry is fixed.
 
 **What the gate refuses to judge, it names.** Fixtures that fail to
 build, fixtures whose N=1 reference does not complete, and fixtures

@@ -42,12 +42,22 @@
 # are all still findings. Only the order is forgiven, only where declared,
 # and every tolerated reorder is counted in the summary.
 #
-# `diverge` and `empty` are adjudicated against N=1 self-stability before
-# they are reported: a fixture whose own N=1 output varies between runs
-# (addresses, hash order, wall-clock) cannot witness anything about thread
-# count, so it is dropped and LOGGED rather than reported as a finding.
-# `crash` and `hang` stand regardless — no amount of output nondeterminism
-# explains a SIGSEGV that only appears above one thread.
+# `diverge` and `empty` clear two adjudications before they are reported:
+#
+#   1. N=1 SELF-STABILITY. A fixture whose own N=1 output varies between runs
+#      (addresses, hash order, wall-clock) cannot witness anything about
+#      thread count, so it is dropped and LOGGED, not reported.
+#   2. REPRODUCTION at N. The divergence must reappear on at least one of
+#      $RECHECKS further runs. This exists because stdout writes are not
+#      line-atomic across scheduler threads: any multi-fiber program can
+#      occasionally emit a torn line, it tears a different fixture every
+#      run, and a byte-exact gate that believed each one would be red at
+#      random. A held flake is still announced loudly — it is a divergence
+#      the harness could not pin, not a clean run.
+#
+# `crash` and `hang` clear neither: no amount of output nondeterminism
+# explains a SIGSEGV that only appears above one thread, and re-running a
+# one-in-many crash until it behaves is how a gate learns to lie.
 #
 # BOUNDED COVERAGE, stated rather than sampled silently. This gate walks the
 # {c, native} backends via the shipped `bin/kai` build path. The single-TU
@@ -74,6 +84,9 @@ RUN_TIMEOUT="${MN_CORPUS_RUN_TIMEOUT:-30}"
 # re-run is not evidence of stability, and a fixture that varies at N=1 is
 # dropped, not reported.
 REF_RECHECKS="${MN_CORPUS_REF_RECHECKS:-2}"
+# Consecutive re-runs at N a divergence must fail to reappear on before it is
+# held as a flake rather than a finding.
+RECHECKS="${MN_CORPUS_RECHECKS:-2}"
 KAI_CORPUS_DIRS="${MN_CORPUS_DIRS:-$KAI_CORPUS_DEFAULT_DIRS}"
 # Whether this run walks a subset. A shard cannot distinguish a baseline
 # entry that left the corpus from one that belongs to a sibling shard.
@@ -165,6 +178,7 @@ findings="$TMP/findings"; : > "$findings"
 reffail="$TMP/reffail"; : > "$reffail"
 nondet="$TMP/nondet"; : > "$nondet"
 reorders="$TMP/reorders"; : > "$reorders"
+flaky="$TMP/flaky"; : > "$flaky"
 
 # One line of witness, newlines folded so a multi-line stdout stays greppable.
 witness_of() { head -c 160 "$1" | tr '\n' '|'; }
@@ -209,6 +223,53 @@ ref_is_stable() {
   return 0
 }
 
+# The single place a run is turned into a bucket, so the first observation
+# and every recheck judge by identical rules.
+classify_run() {
+  local out="$1" ec="$2" ref="$3" ref_ec="$4" fixture="$5"
+  if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
+    echo hang
+  elif [ "$ec" != "$ref_ec" ]; then
+    echo crash
+  elif cmp -s "$out" "$ref"; then
+    echo ok
+  elif [ ! -s "$out" ] && [ -s "$ref" ]; then
+    echo empty
+  elif is_order_dependent "$fixture" && same_lines "$out" "$ref"; then
+    echo reorder
+  else
+    echo diverge
+  fi
+}
+
+# True when a divergence reproduces on ANY of $RECHECKS further runs at the
+# same thread count.
+#
+# The bar is asymmetric on purpose, matching tools/test-backend-parity.sh: a
+# single converging re-run is not evidence of a flake, so a divergence is
+# only withdrawn after it fails to reappear on EVERY recheck. What this is
+# for: stdout writes are not line-atomic across scheduler threads, so any
+# multi-fiber program can occasionally emit a torn line — that tears a
+# different fixture on every run, and a byte-exact gate that believed each
+# one would be red at random. A deterministic divergence reproduces well
+# within two extra runs; the rare genuine tear does not, and it is still
+# reported loudly rather than swallowed.
+#
+# crash and hang are deliberately NOT rechecked. A one-in-many SIGSEGV is a
+# real defect, and re-running until it behaves is how a gate learns to lie.
+diverges_again() {
+  local bin="$1" n="$2" ref="$3" ref_ec="$4" fixture="$5" i ec bucket
+  for ((i = 0; i < RECHECKS; i++)); do
+    ec="$(run_at "$bin" "$n" "$TMP/recheck")"
+    bucket="$(classify_run "$TMP/recheck" "$ec" "$ref" "$ref_ec" "$fixture")"
+    case "$bucket" in
+      ok|reorder) : ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # The fixture list is read on FD 3, never stdin: fixtures that read stdin
 # are part of the corpus, and on stdin one of them would swallow the rest of
 # the list mid-walk.
@@ -231,21 +292,16 @@ for backend in $BACKENDS; do
       ok=0; reorder=0; diverge=0; empty=0; crash=0; hang=0; witness=""
       for ((r = 0; r < REPEATS; r++)); do
         ec="$(run_at "$bin" "$n" "$TMP/run")"
-        if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then
-          hang=$((hang + 1))
-        elif [ "$ec" != "$ref_ec" ]; then
-          crash=$((crash + 1))
-          [ -n "$witness" ] || witness="exit $ec (N=1 exits $ref_ec): $(witness_of "$TMP/run.err")"
-        elif [ ! -s "$TMP/run" ] && [ -s "$ref" ]; then
-          empty=$((empty + 1))
-        elif cmp -s "$TMP/run" "$ref"; then
-          ok=$((ok + 1))
-        elif is_order_dependent "$f" && same_lines "$TMP/run" "$ref"; then
-          reorder=$((reorder + 1))
-        else
-          diverge=$((diverge + 1))
-          [ -n "$witness" ] || witness="got '$(witness_of "$TMP/run")' want '$(witness_of "$ref")'"
-        fi
+        case "$(classify_run "$TMP/run" "$ec" "$ref" "$ref_ec" "$f")" in
+          ok)      ok=$((ok + 1)) ;;
+          reorder) reorder=$((reorder + 1)) ;;
+          hang)    hang=$((hang + 1)) ;;
+          empty)   empty=$((empty + 1)) ;;
+          crash)   crash=$((crash + 1))
+                   [ -n "$witness" ] || witness="exit $ec (N=1 exits $ref_ec): $(witness_of "$TMP/run.err")" ;;
+          *)       diverge=$((diverge + 1))
+                   [ -n "$witness" ] || witness="got '$(witness_of "$TMP/run")' want '$(witness_of "$ref")'" ;;
+        esac
       done
       if [ "$reorder" != 0 ]; then
         printf '%s [%s] N=%s — %s/%s runs reordered the same lines (declared order-dependent)\n' \
@@ -266,6 +322,13 @@ for backend in $BACKENDS; do
         if ! ref_is_stable "$bin" "$ref" "$ref_ec"; then
           printf '%s [%s] — N=1 output varies between runs; %s at N=%s not judged\n' \
             "$f" "$backend" "$bucket" "$n" >> "$nondet"
+          continue
+        fi
+        if ! diverges_again "$bin" "$n" "$ref" "$ref_ec" "$f"; then
+          printf '%s [%s] N=%s — %s did not reappear on %s consecutive rechecks\n' \
+            "$f" "$backend" "$n" "$bucket" "$RECHECKS" >> "$flaky"
+          [ -z "${GITHUB_ACTIONS:-}" ] || \
+            echo "::warning title=mn-corpus flaky::$f [$backend] diverged from its N=1 reference at KAI_THREADS=$n but converged on $RECHECKS rechecks — held as a flake, not counted. A divergence this harness deems flaky is still a divergence."
           continue
         fi
       fi
@@ -314,6 +377,7 @@ report_dropped "$buildfail" "did not build — NOT JUDGED"
 report_dropped "$reffail" "N=1 reference unusable — NOT JUDGED"
 report_dropped "$nondet" "nondeterministic at N=1 — NOT JUDGED"
 report_dropped "$reorders" "line order forgiven — judged on the line multiset, no finding"
+report_dropped "$flaky" "diverged once, did not reproduce — HELD AS A FLAKE, still a divergence"
 
 nfind="$(wc -l < "$findings" | tr -d ' ')"
 if [ "$nfind" != 0 ]; then
@@ -388,10 +452,14 @@ fi
 
 if [ -n "$closed" ]; then
   echo ""
-  echo "run-mn-corpus-determinism OK (improved) — these baselined pairs now"
-  echo "reproduce their N=1 behaviour; tighten the ratchet:"
+  echo "run-mn-corpus-determinism OK (improved) — these baselined pairs did"
+  echo "NOT reproduce their finding in THIS run:"
   printf '%s\n' "$closed" | sed 's/^/    - /'
-  echo "  Remove the lines above from $BASELINE."
+  echo "  Candidates for tightening the ratchet — but confirm first. These"
+  echo "  defects are timing- and platform-dependent: a pair can pass on one"
+  echo "  runner and fail on another, and this run saw $REPEATS repeats at"
+  echo "  N in {$THREAD_COUNTS} on one platform. Remove a line from $BASELINE"
+  echo "  when the fix is understood, not because one run was quiet."
 fi
 echo ""
 echo "run-mn-corpus-determinism: OK ($nfind finding(s), all at baseline)"
