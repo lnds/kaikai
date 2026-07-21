@@ -754,6 +754,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1303 fixture passes under ASAN+UBSan (branchy single-use param exit-drop gate)"
 	@$(MAKE) -C stage2 test-perceus-1315-borrowed-match-release-asan
 	@echo "tier1-asan OK — issue #1315 fixtures pass under ASAN+UBSan (borrowed-scrutinee release gate)"
+	@$(MAKE) -C stage2 test-perceus-1328-selftail-borrowed-local-asan
+	@echo "tier1-asan OK — issue #1328 fixtures pass under ASAN+UBSan (multi-use borrowed-local exit-drop gate)"
 	@$(MAKE) -C stage2 test-issue-1331-op-arg-release-asan
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (op-arg + tail-read-local release gate)"
 	@$(MAKE) -C stage2 test-perceus-1355-closure-temp-release-asan
