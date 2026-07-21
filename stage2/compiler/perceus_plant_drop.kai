@@ -1,0 +1,203 @@
+# Per-path exit drops for a tail that holds a self-call.
+#
+# The post-tail wrap cannot release a binding when the tail is a
+# self-tail-call — binding the call to a temporary would hide it from the
+# TCO rewrite. Each tail path is closed individually instead: a direct
+# self-call leaf hoists its arguments into temporaries, drops after that
+# last read, and re-issues the call as the new block's tail (still a
+# self-tail-call, so the goto survives); a plain-value leaf binds its
+# value, drops, and yields. `None` declines the whole tail — the binding
+# keeps its leak — when a path shadows a dropped name or yields no
+# expression. Partial planting is never attempted.
+
+import compiler.ast
+import compiler.fnreg
+
+pub fn ppd_plant(e: Expr, self_name: String, names: [String]) : Option[Expr] =
+  if not ppd_has_self_call(e, self_name) { Some(ppd_wrap_leaf(e, names)) }
+  else { ppd_plant_kind(e, self_name, names) }
+
+fn ppd_plant_kind(e: Expr, self_name: String, names: [String]) : Option[Expr] = match e.kind {
+  ECall(f, xs)    -> Some(ppd_hoist_call(e, f, xs, names))
+  EIf(c, t, oe)   -> ppd_plant_if(e, c, t, oe, self_name, names)
+  EMatch(s, arms) -> match ppd_plant_arms(arms, self_name, names, []) {
+    None        -> None
+    Some(arms2) -> Some(ppd_rekind(e, EMatch(s, arms2)))
+  }
+  EBlock(bstmts, obt) -> ppd_plant_block(e, bstmts, obt, self_name, names)
+  _ -> None
+}
+
+fn ppd_plant_if(e: Expr, c: Expr, t: Expr, oe: Option[Expr],
+                self_name: String, names: [String]) : Option[Expr] = match oe {
+  None     -> None
+  Some(e2) -> ppd_both(ppd_plant(t, self_name, names), ppd_plant(e2, self_name, names),
+                       (t2, e22) => ppd_rekind(e, EIf(c, t2, Some(e22))))
+}
+
+fn ppd_plant_block(e: Expr, bstmts: [Stmt], obt: Option[Expr],
+                   self_name: String, names: [String]) : Option[Expr] = match obt {
+  None -> None
+  Some(bt) ->
+    # An inner planting already hoisted this call's args: every read is
+    # behind the temps, so these drops slot in before the tail. Hoisting
+    # again would bind a temp to its own name inside one C scope.
+    if ppd_is_hoist_block(bstmts) {
+      Some(ppd_rekind(e, EBlock(list_append(bstmts, ppd_drops(names, e.line, e.col)), Some(bt))))
+    }
+    else if ppd_shadows(ppd_stmt_binders(bstmts, []), names) { None }
+    else { ppd_map(ppd_plant(bt, self_name, names),
+                   (bt2) => ppd_rekind(e, EBlock(bstmts, Some(bt2)))) }
+}
+
+fn ppd_plant_arms(arms: [Arm], self_name: String, names: [String],
+                  acc: [Arm]) : Option[[Arm]] = match arms {
+  [] -> Some(list_reverse(acc))
+  [a, ...rest] -> match a {
+    Arm(pat, g, body) ->
+      if ppd_shadows(ppd_pat_binders(pat, []), names) { None }
+      else { match ppd_plant(body, self_name, names) {
+        None -> None
+        Some(b2) -> ppd_plant_arms(rest, self_name, names, [Arm(pat, g, b2), ...acc])
+      } }
+  }
+}
+
+fn ppd_map(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = match o {
+  None    -> None
+  Some(x) -> Some(f(x))
+}
+
+fn ppd_both(a: Option[Expr], b: Option[Expr], f: (Expr, Expr) -> Expr) : Option[Expr] = match a {
+  None    -> None
+  Some(x) -> match b { None -> None  Some(y) -> Some(f(x, y)) }
+}
+
+fn ppd_rekind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+# The plain-leaf wrap: bind the value, drop, yield. The read carries the
+# leaf's type and mode — an unboxed leaf binds a raw local.
+fn ppd_wrap_leaf(e: Expr, names: [String]) : Expr = {
+  let ret_let = SLet(mk_pat(PBind("__pcs_tret"), e.line, e.col), None, e)
+  let ret_var = Expr { kind: EVar("__pcs_tret"), line: e.line, col: e.col,
+                       ty: e.ty, mode: e.mode }
+  ppd_rekind(e, EBlock([ret_let, ...ppd_drops(names, e.line, e.col)], Some(ret_var)))
+}
+
+# Bind the args left-to-right (evaluation order unchanged), drop after
+# that last read, re-issue the call as the block tail. Each read carries
+# the argument's type and mode — an unboxed argument binds a raw local.
+fn ppd_hoist_call(e: Expr, f: Expr, xs: [Expr], names: [String]) : Expr {
+  let call = ppd_rekind(e, ECall(f, ppd_hoist_reads(xs, 0)))
+  ppd_rekind(e, EBlock(list_append(ppd_hoist_lets(xs, 0), ppd_drops(names, e.line, e.col)),
+                       Some(call)))
+}
+
+fn ppd_hoist_lets(xs: [Expr], i: Int) : [Stmt] = match xs {
+  []           -> []
+  [a, ...rest] -> [SLet(mk_pat(PBind(ppd_tmp(i)), a.line, a.col), None, a),
+                   ...ppd_hoist_lets(rest, i + 1)]
+}
+
+fn ppd_hoist_reads(xs: [Expr], i: Int) : [Expr] = match xs {
+  []           -> []
+  [a, ...rest] -> [Expr { kind: EVar(ppd_tmp(i)), line: a.line, col: a.col,
+                          ty: a.ty, mode: a.mode },
+                   ...ppd_hoist_reads(rest, i + 1)]
+}
+
+fn ppd_tmp(i: Int) : String = string_concat("__pcs_ta", int_to_string(i))
+
+# A block the planting pass built around a self-call: arg temps, drops,
+# then the call as tail. Consumers that reason about "reads in the tail"
+# must treat the whole block as the tail — the temps ARE the call's args.
+pub fn ppd_is_hoist_block(stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> match s {
+    SLet(pat, _, _) -> match pat.pkind {
+      PBind(nm) -> string_starts_with_q(nm, "__pcs_ta") or ppd_is_hoist_block(rest)
+      _         -> ppd_is_hoist_block(rest)
+    }
+    _ -> ppd_is_hoist_block(rest)
+  }
+}
+
+fn ppd_shadows(bound: [String], names: [String]) : Bool = match bound {
+  []           -> false
+  [b, ...rest] -> list_has(names, b) or ppd_shadows(rest, names)
+}
+
+fn ppd_stmt_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(pat, _, _)      -> ppd_pat_binders(pat, acc)
+      SVar(nm, _, _, _, _) -> [nm, ...acc]
+      _                    -> acc
+    }
+    ppd_stmt_binders(rest, a1)
+  }
+}
+
+fn ppd_pat_binders(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PBind(nm)             -> [nm, ...acc]
+  PList(ps, orest)      -> {
+    let a1 = ppd_pats_binders(ps, acc)
+    match orest { None -> a1  Some(r) -> [r, ...a1] }
+  }
+  PVariant(_, ps)       -> ppd_pats_binders(ps, acc)
+  PVariantRecord(_, fs) -> ppd_pfields_binders(fs, acc)
+  PRecord(fs)           -> ppd_pfields_binders(fs, acc)
+  PAs(nm, sub)          -> ppd_pat_binders(sub, [nm, ...acc])
+  PNarrow(nm, _)        -> [nm, ...acc]
+  PHole(onm)            -> match onm { None -> acc  Some(nm) -> [nm, ...acc] }
+  _                     -> acc
+}
+
+fn ppd_pats_binders(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> ppd_pats_binders(rest, ppd_pat_binders(p, acc))
+}
+
+fn ppd_pfields_binders(fs: [PField], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f {
+    PField(_, sub, _) -> ppd_pfields_binders(rest, ppd_pat_binders(sub, acc))
+  }
+}
+
+pub fn ppd_drops(names: [String], ln: Int, cl: Int) : [Stmt] = match names {
+  []            -> []
+  [nm, ...rest] -> [ppd_drop_stmt(nm, ln, cl), ...ppd_drops(rest, ln, cl)]
+}
+
+fn ppd_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
+  SExprStmt(mk_expr(
+    ECall(mk_expr(EVar("__perceus_drop"), ln, cl), [mk_expr(EVar(nm), ln, cl)]),
+    ln, cl))
+
+# A self-call anywhere in tail position, however deep the tails nest.
+pub fn ppd_has_self_call(e: Expr, self_name: String) : Bool = match e.kind {
+  ECall(f, _) -> match f.kind {
+    EVar(c)        -> c == self_name
+    EModCall(_, c) -> c == self_name
+    _              -> false
+  }
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> false
+    Some(t) -> ppd_has_self_call(t, self_name)
+  }
+  EIf(_, t, oe) ->
+    ppd_has_self_call(t, self_name) or
+    (match oe { None -> false  Some(e2) -> ppd_has_self_call(e2, self_name) })
+  EMatch(_, arms) -> ppd_arms_self_call(arms, self_name)
+  _ -> false
+}
+
+fn ppd_arms_self_call(arms: [Arm], self_name: String) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> ppd_has_self_call(b, self_name) or ppd_arms_self_call(rest, self_name)
+  }
+}

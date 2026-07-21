@@ -13420,7 +13420,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool) : Decl / Console
             # them (e.g. direct call args like `lex_next(l)`).
             let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
             let dm_table = tcrec_collect_dm_table(body, name, arity, mo, params,
-                                                   pnames, uses, borrow_flags, [], [])
+                                                   pnames, uses, borrow_flags, [], [], [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
             # derived set under-approximates on a rewritten body (the
             # reuse recogniser replaces the cons the classifier judged
@@ -13580,7 +13580,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             # Issue #92: same precomputation as the non-pcs-ret-wrap branch.
             let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
             let dm_table = tcrec_collect_dm_table(inner, name, arity, mo, params,
-                                                   pnames, uses, borrow_flags, [], [])
+                                                   pnames, uses, borrow_flags, [], [], [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
             # transfer), same as the non-wrap branch. Plus the #1127
@@ -13838,58 +13838,78 @@ type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, rule-3 mask
 fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int, own_mod: Option[String],
                           params: [Param], pnames: [String],
                           uses: [Use], borrow_flags: [Bool],
-                          scope: [String], acc: [TcrDm]) : [TcrDm] =
-  tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
+                          scope: [String], hoisted: [Expr], acc: [TcrDm]) : [TcrDm] =
+  tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc)
 
+# `hoisted` carries the RHS of the `__pcs_ta*` arg-hoist lets the perceus
+# tail-drop pass placed above a self-call. Rule 3's "param appears in the
+# args" test must see those exprs as args — they ARE the call's arguments,
+# evaluated one statement earlier — or the mask flips at hoisted sites.
 fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
                          params: [Param], pnames: [String], uses: [Use],
-                         borrow_flags: [Bool], scope: [String],
+                         borrow_flags: [Bool], scope: [String], hoisted: [Expr],
                          acc: [TcrDm]) : [TcrDm] {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          let mask = tcrec_rule3_mask(params, uses, xs, borrow_flags, 0, 0)
+          let mask = tcrec_rule3_mask(params, uses, list_append(xs, hoisted), borrow_flags, 0, 0)
           [TcrDm(f.line, f.col, mask), ...acc]
         } else { acc }
       # Same-module qualified self-call: same rule-3 mask as the bare shape.
       EModCall(callmod, callee) ->
         if callee == nm and tcrec_modcall_is_self(callmod, own_mod) and
            not list_has(scope, nm) and list_length(xs) == arity {
-          let mask = tcrec_rule3_mask(params, uses, xs, borrow_flags, 0, 0)
+          let mask = tcrec_rule3_mask(params, uses, list_append(xs, hoisted), borrow_flags, 0, 0)
           [TcrDm(f.line, f.col, mask), ...acc]
         } else { acc }
       _ -> acc
     }
     EIf(_, t, opt_e) -> {
-      let a1 = tcrec_collect_dm_table(t, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
+      let a1 = tcrec_collect_dm_table(t, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc)
       match opt_e {
         None -> a1
-        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, a1)
+        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, a1)
       }
     }
-    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, acc)
+    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
+      let hoisted1 = tcrec_hoisted_arg_rhs(stmts, hoisted)
       match opt_tail {
         None -> acc
-        Some(e) -> tcrec_collect_dm_table(e, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, acc)
+        Some(e) -> tcrec_collect_dm_table(e, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, hoisted1, acc)
       }
     }
     _ -> acc
   }
 }
 
+fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(bn) ->
+          if string_starts_with_q(bn, "__pcs_ta") { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
+          else { tcrec_hoisted_arg_rhs(rest, acc) }
+        _ -> tcrec_hoisted_arg_rhs(rest, acc)
+      }
+      _ -> tcrec_hoisted_arg_rhs(rest, acc)
+    }
+  }
+}
+
 fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], params: [Param],
                          pnames: [String], uses: [Use], borrow_flags: [Bool],
-                         scope: [String], acc: [TcrDm]) : [TcrDm] {
+                         scope: [String], hoisted: [Expr], acc: [TcrDm]) : [TcrDm] {
   match arms {
     [] -> acc
     [a, ...rest] -> match a {
       Arm(pat, _, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let a1 = tcrec_collect_dm_table(body, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, acc)
-        tcrec_collect_dm_arms(rest, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, a1)
+        let a1 = tcrec_collect_dm_table(body, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, hoisted, acc)
+        tcrec_collect_dm_arms(rest, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, a1)
       }
     }
   }

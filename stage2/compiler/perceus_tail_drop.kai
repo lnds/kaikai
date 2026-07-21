@@ -13,48 +13,68 @@
 # rewritten body and fires only on bindings that carry no drop yet, so the
 # two passes can never release the same binding twice.
 #
-# A tail holding a self-call is left alone. Wrapping it would move the call
-# out of tail position, hide it from the TCO rewrite, and turn a loop into
-# unbounded stack growth.
+# A tail holding a self-call cannot take that wrap — it would hide the call
+# from the TCO rewrite and turn a loop into unbounded stack growth. Those
+# tails go to `ppd_plant` (perceus_plant_drop), which closes each path
+# individually, hoisting a self-call's args so the drop lands after the
+# last read with the call still in tail position. The hoist is declined
+# when the function borrows any of its own parameters: a hoisted temp in a
+# borrowed slot would lose the argument's ownership marking.
 
 import compiler.ast
 import compiler.ast_map
 import compiler.infer
+import compiler.perceus_plant_drop
 
 pub fn ptd_tail_exit_drops(e: Expr, self_name: String, uses: [Use],
-                           move_last_set: [String]) : Expr =
-  ptd_expr(e, self_name, uses, move_last_set, [])
+                           move_last_set: [String], self_bpos: [Int]) : Expr =
+  ptd_expr(e, self_name, uses, move_last_set, self_bpos, [])
 
 # `scope` carries the binder names an enclosing block or lambda already owns.
 # A shadowed name is left alone: its reads cannot be attributed to this
 # block's binding, so a drop here could release a ref it does not own.
 fn ptd_expr(e: Expr, self_name: String, uses: [Use], mls: [String],
-            scope: [String]) : Expr =
-  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, scope),
+            sbp: [Int], scope: [String]) : Expr =
+  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, sbp, scope),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn ptd_kind(k: ExprKind, self_name: String, uses: [Use], mls: [String],
-            scope: [String]) : ExprKind = match k {
-  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, scope)
+            sbp: [Int], scope: [String]) : ExprKind = match k {
+  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, sbp, scope)
   ELambda(ps, b) -> {
     let inner = list_append(scope, map(ps, (p) => p.pname))
-    ELambda(ps, ptd_expr(b, self_name, uses, mls, inner))
+    ELambda(ps, ptd_expr(b, self_name, uses, mls, sbp, inner))
   }
-  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, scope))
+  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, sbp, scope))
 }
 
 fn ptd_block(stmts: [Stmt], opt_tail: Option[Expr], self_name: String,
-             uses: [Use], mls: [String], scope: [String]) : ExprKind {
+             uses: [Use], mls: [String], sbp: [Int], scope: [String]) : ExprKind {
   let inner  = list_append(scope, ptd_let_binders(stmts, []))
-  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, inner))
+  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, sbp, inner))
   match opt_tail {
     None    -> EBlock(stmts1, None)
     Some(t) -> {
-      let t1 = ptd_expr(t, self_name, uses, mls, inner)
-      if ptd_has_self_call(t, self_name) { EBlock(stmts1, Some(t1)) }
-      else { ptd_wrap(stmts1, t1, ptd_orphans(stmts, uses, mls, scope, [])) }
+      let t1 = ptd_expr(t, self_name, uses, mls, sbp, inner)
+      let orphans = ptd_orphans(stmts, uses, mls, scope, [])
+      if ppd_has_self_call(t, self_name) { ptd_selfcall_tail(stmts1, t1, self_name, orphans, sbp) }
+      else { ptd_wrap(stmts1, t1, orphans) }
     }
   }
+}
+
+fn ptd_selfcall_tail(stmts1: [Stmt], t1: Expr, self_name: String,
+                     orphans: [String], sbp: [Int]) : ExprKind =
+  if ptd_plant_ok(orphans, sbp) {
+    match ppd_plant(t1, self_name, orphans) {
+      Some(t2) -> EBlock(stmts1, Some(t2))
+      None     -> EBlock(stmts1, Some(t1))
+    }
+  } else { EBlock(stmts1, Some(t1)) }
+
+fn ptd_plant_ok(orphans: [String], sbp: [Int]) : Bool = match orphans {
+  []         -> false
+  [_, ...__] -> match sbp { [] -> true  _ -> false }
 }
 
 # The drops fire after the tail value is in hand, so the block still yields it.
@@ -66,7 +86,7 @@ fn ptd_wrap(stmts: [Stmt], tail: Expr, names: [String]) : ExprKind = match names
     # local, and a `ty: None` read would emit the boxed name for it.
     let ret_var = Expr { kind: EVar("__pcs_tret"), line: tail.line, col: tail.col,
                          ty: tail.ty, mode: tail.mode }
-    EBlock(list_append(stmts, list_append([ret_let], ptd_drops(names, tail.line, tail.col))),
+    EBlock(list_append(stmts, [ret_let, ...ppd_drops(names, tail.line, tail.col)]),
            Some(ret_var))
   }
 }
@@ -157,44 +177,9 @@ fn ptd_let_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
   }
 }
 
-fn ptd_drops(names: [String], ln: Int, cl: Int) : [Stmt] = match names {
-  []            -> []
-  [nm, ...rest] -> [ptd_drop_stmt(nm, ln, cl), ...ptd_drops(rest, ln, cl)]
-}
-
-fn ptd_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
-  SExprStmt(mk_expr(
-    ECall(mk_expr(EVar("__perceus_drop"), ln, cl), [mk_expr(EVar(nm), ln, cl)]),
-    ln, cl))
-
-# A self-call anywhere in tail position, however deep the tails nest.
-fn ptd_has_self_call(e: Expr, self_name: String) : Bool = match e.kind {
-  ECall(f, _) -> match f.kind {
-    EVar(c)        -> c == self_name
-    EModCall(_, c) -> c == self_name
-    _              -> false
-  }
-  EBlock(_, opt_tail) -> match opt_tail {
-    None    -> false
-    Some(t) -> ptd_has_self_call(t, self_name)
-  }
-  EIf(_, t, oe) ->
-    ptd_has_self_call(t, self_name) or
-    (match oe { None -> false  Some(e2) -> ptd_has_self_call(e2, self_name) })
-  EMatch(_, arms) -> ptd_arms_self_call(arms, self_name)
-  _ -> false
-}
-
-fn ptd_arms_self_call(arms: [Arm], self_name: String) : Bool = match arms {
-  []           -> false
-  [a, ...rest] -> match a {
-    Arm(_, _, b) -> ptd_has_self_call(b, self_name) or ptd_arms_self_call(rest, self_name)
-  }
-}
-
 fn ptd_stmt(s: Stmt, self_name: String, uses: [Use], mls: [String],
-            scope: [String]) : Stmt = match s {
-  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, scope))
-  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, scope))
+            sbp: [Int], scope: [String]) : Stmt = match s {
+  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, sbp, scope))
+  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, sbp, scope))
   _               -> s
 }
