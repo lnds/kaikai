@@ -296,3 +296,5 @@ target COUNT, and the families differ in cost ~50× (`stdlib` 158 fixtures vs
 slice (982 s). A correct sub-15-min split must weight targets by measured
 cost (LPT/greedy), not raise `SHARDS`. The `cc` opt level is a wash for
 fixtures; no shard rebuilds kaic2 (`make[2]: 'kaic2' is up to date.`).
+
+<!-- scratch: demonstrates the tier1-tsan self-skip; this branch is not for merge -->
