@@ -61,9 +61,10 @@ LDLIBS_M := -lm
 #     tier0 / tier1 gates green on a runner WITHOUT LLVM — they build a
 #     C-only kaic2 and never need a toolchain beyond `cc`. A dev WITH
 #     llvm-config gets native automatically, no flag.
-#   - `make KAI_LLVM=1 kaic2` FORCES native-capable: if llvm-config is
-#     missing the link line fails loudly (used by the release job, where
-#     a missing libLLVM MUST break, not silently ship a C-only binary).
+#   - `make KAI_LLVM=1 kaic2` FORCES native-capable: if llvm-config does
+#     not resolve, make stops with an error naming the fix (used by the
+#     release job, where a missing libLLVM MUST break, not silently ship
+#     a C-only binary).
 #   - `make KAI_LLVM=0 kaic2` forces C-only even where llvm-config exists
 #     (the C oracle build, e.g. for selfhost determinism in isolation).
 #
@@ -79,11 +80,15 @@ LDLIBS_M := -lm
 # runtime dep and the brew formula needs no `depends_on llvm`.
 LLVM_CONFIG ?= llvm-config
 # KAI_LLVM unset → auto-detect; =1 → force on (fail if absent); =0 → off.
+LLVM_CONFIG_RESOLVED := $(shell command -v $(LLVM_CONFIG) 2>/dev/null)
 ifeq ($(origin KAI_LLVM),undefined)
-KAI_LLVM := $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),1,0)
+KAI_LLVM := $(if $(LLVM_CONFIG_RESOLVED),1,0)
 KAI_LLVM_AUTO := 1
 endif
 ifeq ($(KAI_LLVM),1)
+ifeq ($(LLVM_CONFIG_RESOLVED),)
+$(error KAI_LLVM=1 but '$(LLVM_CONFIG)' was not found. Put llvm-config on PATH or pass LLVM_CONFIG=/path/to/llvm-config (Homebrew keg-only: LLVM_CONFIG=$$(brew --prefix llvm@18)/bin/llvm-config))
+endif
 LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # Component set is `nativecodegen` (NOT `native`): the backend EMITS code,
 # never disassembles, so it must not drag in the AArch64/X86 Disassembler
@@ -103,7 +108,20 @@ LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # on Linux (the apt libLLVM is libstdc++-built). The release-static path
 # (Rust/Zig/Julia model) thus links with no libLLVM runtime dep; the
 # dev-dynamic path links the right C++ lib for the host.
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(shell $(LLVM_CONFIG) --link-static --system-libs passes core analysis target nativecodegen bitwriter) $(LLVM_CXXLIB)
+LLVM_SYSLIBS  := $(shell $(LLVM_CONFIG) --link-static --system-libs passes core analysis target nativecodegen bitwriter)
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(LLVM_SYSLIBS) $(LLVM_CXXLIB)
+# Homebrew LLVM's --system-libs asks for -lzstd, but zstd is a separate
+# formula under the brew prefix, which the macOS linker does not search
+# by default. Gated on -lzstd actually appearing, so a vendored static
+# libLLVM (built without zstd) never picks up Homebrew lib dirs.
+ifeq ($(UNAME_S),Darwin)
+ifneq ($(filter -lzstd,$(LLVM_SYSLIBS)),)
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+ifneq ($(BREW_PREFIX),)
+LLVM_LDFLAGS += -L$(BREW_PREFIX)/lib
+endif
+endif
+endif
 else
 LLVM_CPPFLAGS :=
 LLVM_LDFLAGS  :=
@@ -205,7 +223,7 @@ build/stage2.c: build/bundle.kai $(KAIC1) | build
 # answer is always: llvm-config in PATH or not). Lane 1.5 capability line.
 $(TARGET): build/stage2.c $(RUNTIME_H)
 ifeq ($(KAI_LLVM),1)
-	@echo "building stage2: native backend ENABLED ($(LLVM_CONFIG) found)"
+	@echo "building stage2: native backend ENABLED ($(LLVM_CONFIG_RESOLVED))"
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
