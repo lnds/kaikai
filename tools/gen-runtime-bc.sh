@@ -28,6 +28,7 @@
 #   tools/gen-runtime-bc.sh --force         # always regenerate
 #   tools/gen-runtime-bc.sh --status        # machine state (see below); exit 0
 #   tools/gen-runtime-bc.sh --status-line   # same state as one human line + remedy
+#   tools/gen-runtime-bc.sh --clang         # the resolved clang 18; exit 1 if none
 #   CLANG18=/path/to/clang-18 tools/gen-runtime-bc.sh
 #
 # THREE STATES, NOT TWO. "optout" alone hides whether the host CAN run P2:
@@ -124,6 +125,10 @@ p2_status_line() {
 case "$mode" in
   --status)      p2_state;       exit 0 ;;
   --status-line) p2_status_line; exit 0 ;;
+  # The resolved clang, for tools that must reach the matching llvm-* binaries
+  # (bitcode readers are version-locked to their writer). Empty + exit 1 when
+  # there is none, so a caller can tell "no clang 18" from a resolution.
+  --clang)       resolve_clang || exit 1; exit 0 ;;
 esac
 
 CLANG="$(resolve_clang || true)"
@@ -186,6 +191,16 @@ if [ -n "$LLVM_NM" ]; then
       exit 3
     fi
   done
+fi
+
+# Second soundness gate for the split, on the other side of the call: no
+# thread-local address may be materialised by a function the optimiser can fold
+# into an emitted kaikai frame, because those frames span parks and a park can
+# migrate the fiber to another OS thread. See tools/tls-hoist-gate.sh.
+if ! CLANG18="$CLANG" "$ROOT/tools/tls-hoist-gate.sh"; then
+  echo "gen-runtime-bc: FATAL — the hot bitcode fails the thread-local hoist gate." >&2
+  rm -f "$BC_OUT" "$BC_INLINE" "$STAMP"
+  exit 4
 fi
 
 echo "$want" > "$STAMP"
