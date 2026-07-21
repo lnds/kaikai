@@ -1,0 +1,54 @@
+# M:N `Spawn.await` result — a terminated fiber's result must not be handed
+# to awaiters on other threads by pointer.
+#
+# `await` used to return `kai_incref(f->result)`. The producer's Fiber[T]
+# wrapper goes on owning that result, so the incref alone already puts one
+# non-atomic rc under two threads. Worse, the terminate walk unparks the
+# WHOLE awaiter chain at once, so several awaiters resume on different
+# threads and increment the same rc concurrently — a direct lost update.
+#
+# The shape forces exactly that: every awaiter parks on the SAME producer,
+# so they are woken together, and each then walks the list it received.
+# Pre-fix that is one shared spine being dup'd and dropped from N threads.
+# The total is a fixed multiple, so one golden holds at every KAI_THREADS.
+
+import spawn
+import actor
+
+fn build(n: Int, acc: [Int]) : [Int] =
+  if n <= 0 { acc } else { build(n - 1, [n, ...acc]) }
+
+fn sum_list(xs: [Int], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> sum_list(rest, acc + x)
+}
+
+# Repeated walks keep the awaiter increfing and decrefing the spine for long
+# enough to overlap the other awaiters doing the same on their threads.
+fn walk(xs: [Int], k: Int, acc: Int) : Int =
+  if k <= 0 { acc } else { walk(xs, k - 1, acc + sum_list(xs, 0)) }
+
+fn awaiter(f: Fiber[[Int]], parent: Pid[Int]) : Unit / Spawn + Actor[Int] =
+  Actor.send(parent, walk(spawn.await(f), 40, 0))
+
+fn spawn_awaiters(f: Fiber[[Int]], parent: Pid[Int], n: Int) : Unit / Spawn + Actor[Int] =
+  if n <= 0 { () }
+  else {
+    let _ = spawn_actor(() => awaiter(f, parent))
+    spawn_awaiters(f, parent, n - 1)
+  }
+
+fn collect(remaining: Int, acc: Int) : Int / Actor[Int] =
+  if remaining <= 0 { acc }
+  else { collect(remaining - 1, acc + Actor.receive()) }
+
+fn main() : Int / Spawn + Console = {
+  let total = with_mailbox {
+    let me = Actor.self()
+    let producer = spawn.spawn(() => build(60, []))
+    spawn_awaiters(producer, me, 8)
+    collect(8, 0)
+  }
+  Console.print(int_to_string(total))
+  0
+}

@@ -73,6 +73,15 @@ FIXTURES=(
   # thread that built it — depth is what makes a violation reachable rather
   # than theoretical.
   "examples/effects/mn_deep_stack_migration.kai"
+  # The cross-thread memory invariant: no value with a non-atomic rc may be
+  # reachable from two scheduler threads. One fixture per way that used to
+  # happen — a message's scalar leaves, a fiber result taken by several
+  # awaiters at once, the string intern table. TSAN is what proves each of
+  # them; here they assert the weaker but always-on property that the total
+  # is the same at N=1/4/8, so a lost update that does land is caught.
+  "examples/effects/mn_cross_thread_scalar_share.kai"
+  "examples/effects/mn_await_result_share.kai"
+  "examples/effects/mn_str_intern_race.kai"
 )
 
 # kai: the shipped build path (separate -O0 scheduler owner).
