@@ -942,6 +942,9 @@ KaiValue *kaix_enum_slot_box(int64_t tag) { return kai_enum_slot_box(tag); }
 /* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
    the box→raw border for a boxed Bool reaching the raw i1 path. */
 int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
+/* Borrow-read a boxed Char's raw codepoint without decref'ing — the
+   box→raw border for a boxed Char reaching the raw u32 path. */
+int32_t kaix_char_field(KaiValue *v) { return (int32_t) v->as.c; }
 
 /* FFI v1 (issue #260) box→raw borrows for the native `extern "C" fn`
    shim. A shim unboxes each boxed param to its raw C scalar, calls the

@@ -15,8 +15,8 @@
 # recursion into `lower_expr`); `lower_expr_raw` lives in the Expr-SCC
 # `kir_lower_walk.kai`.
 #
-# SCOPE: REAL + INT arith/cmp. A node is raw-promoted iff it is `MUnboxed`
-# AND a natively-raw FORM in one of two scalar families:
+# SCOPE: REAL + INT arith/cmp, CHAR literal/var. A node is raw-promoted iff
+# it is `MUnboxed` AND a natively-raw FORM in one of three scalar families:
 #   - REAL (asu, Camino A — the native-parity "Real box/unbox" family): a
 #     Real literal/var, Real arith (`+ - * /`), unary `-`, a Real comparison,
 #     or a logical over raw-Real comparisons.
@@ -29,10 +29,19 @@
 #     `kai_imod_chk` (not a bare `sdiv`/`srem`) so a zero divisor or
 #     INT64_MIN/-1 traps clean instead of running hardware UB. Bit-ops
 #     (`<<`, `&`, …) stay boxed (no raw `i`-prim lowering for them in v1).
-# Char/Bool nodes that are MUnboxed for OTHER reasons (a UFn call returning
-# Bool, a `Char == Char`) stay on the boxed path: boxed Char/Bool ride the
-# singleton cache (immortal, no double-free), and the scalar machinery
-# (`real.unbox`/`int.box`, `f==`/`i==`) is wrong for a Char/Bool operand.
+#   - CHAR (the under-ref fix): a Char literal or var, at the literal/var
+#     FORMS only. A `MUnboxed` Char read lowers to a raw `SChar` (i32
+#     codepoint) register and boxes a FRESH `kaix_char` at each boxed use —
+#     never a shared boxed cell whose ref the consuming prims
+#     (`kai_core_char_to_int`, `kai_op_eq_v`) eat N times against 1 ref.
+#     Only chars <= 0x7F are interned immortal; a heap Char (any byte >=
+#     0x80 out of `char_at`) freed by the first extra consumption leaves
+#     later uses reading recycled memory. Char comparisons and other forms
+#     stay boxed (each operand crosses the border as its own fresh box).
+# Bool nodes that are MUnboxed for OTHER reasons (a UFn call returning
+# Bool) stay on the boxed path: boxed Bool rides the singleton cache
+# (immortal, no double-free), and the scalar machinery
+# (`real.unbox`/`int.box`, `f==`/`i==`) is wrong for a Bool operand.
 # The gate is the OPERAND type for a comparison/logical node, never just the
 # result type — `kir_kind_is_raw` inspects the children, so a `bool or bool`
 # from two UFn calls never enters, and a comparison routes to the f-family
@@ -97,6 +106,21 @@ fn kir_ty_is_bool_t(t: Ty) : Bool = match t {
   _                   -> false
 }
 
+# True iff an optional type is `Char`. Routes the box→raw border through
+# `char.unbox` (→ `kaix_char_field`, slot `SChar`) and gates the raw
+# literal/var forms — a Char fed to the Int/Real prims would read the wrong
+# union member.
+pub fn kir_ty_is_char(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_char_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_char_t(t: Ty) : Bool = match t {
+  TyChar              -> true
+  TyRefineT(inner, _) -> kir_ty_is_char_t(inner)
+  _                   -> false
+}
+
 # An Expr the KIR raw path handles. ONLY the natively-raw FORMS — a Real
 # literal, a Real var, Real arith (`+ - * /`), unary `-`, a Real comparison,
 # or a logical / `not` over raw-Real comparisons. A Real-typed `MUnboxed`
@@ -121,7 +145,8 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EIntLit(_) -> kir_ty_is_real(x.ty)
   EDecimalLit(_) -> kir_ty_is_real(x.ty)
   EInt(_)     -> kir_ty_is_int(x.ty)
-  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty)
+  EChar(_)    -> kir_ty_is_char(x.ty)
+  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty) or kir_ty_is_char(x.ty)
   ELitUnit(inner, _) -> kir_node_is_raw(inner)
   # Arith routes by RESULT type, not op string: `+ - *` overlap the Real
   # (`f`) and Int (`i`) families, so a type-blind `if op_is_freal { real }`
@@ -153,6 +178,7 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
 pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
   if kir_ty_is_real(opt_t) { "real.box" }
   else if kir_ty_is_int(opt_t) { "int.box" }
+  else if kir_ty_is_char(opt_t) { "char.box" }
   else { "bool.box" }
 
 # The `fbinop` opcode for a raw-Real arithmetic operator (matches the
