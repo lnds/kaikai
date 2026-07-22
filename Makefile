@@ -789,6 +789,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1324 fixture passes under ASAN+UBSan (Char-binding match on the tcrec goto ledger)"
 	@$(MAKE) -C stage2 test-perceus-1395-char-param-raw-asan
 	@echo "tier1-asan OK — issue #1395 fixture passes under ASAN+UBSan (raw Char param, fresh box per consuming use)"
+	@$(MAKE) -C stage2 test-issue-1394-byte-box-asan
+	@echo "tier1-asan OK — issue #1394 fixture passes under ASAN+UBSan (Byte literal boxes through the Byte constructor)"
 	@$(MAKE) -C stage2 test-issue-1331-borrowed-op-arg-asan
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
 

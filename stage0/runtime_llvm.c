@@ -103,11 +103,9 @@ KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
  * arm; `true` (longjmp) → the discard arm, matching the C-direct
  * `setjmp(_jmp) == 0 ? body : landing`. */
 KaiValue *kaix_bool_of_i32(int32_t i)          { return kai_bool(i != 0); }
-/* Lane 4 (#473) Byte literal constructor. Mirrors `kaix_int` but
- * for the nominal `Byte` (KAI_BYTE) tag — needed when the LLVM
- * EInt emit targets `[Byte]` literal context (`let bs: [Byte] =
- * [65]`) and emits `@kaix_byte(i8 65)` instead of `kaix_int`. */
-KaiValue *kaix_byte(uint8_t b)                 { return kai_byte(b); }
+/* Box a Byte literal. Takes i32 like `kaix_char` (the emitter has no i8
+ * type handle); the value is already range-checked to 0..255. */
+KaiValue *kaix_byte(uint32_t b)                { return kai_byte((uint8_t) b); }
 KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
 
 /* Fixed-width integer literal constructors (numeric lane A). The native
