@@ -7034,30 +7034,31 @@ static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *se
  * values are owned by the caller.
  */
 
+/* Payload and trailing '\n' are separate stdio calls; each locks the
+ * stream individually but the pair does not. flockfile around the pair
+ * keeps a line atomic across scheduler threads. */
 static KaiValue *kai_core_print(KaiValue *arg) {
     if (!arg) { fputc('\n', stdout); return kai_unit(); }
-    if (arg->tag == KAI_STR) {
-        fwrite(arg->as.s.bytes, 1, arg->as.s.len, stdout);
-    } else {
-        KaiValue *s = kai_to_string(arg);
-        fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
-        kai_decref(s);
-    }
+    KaiValue *s = (arg->tag == KAI_STR) ? NULL : kai_to_string(arg);
+    KaiValue *src = s ? s : arg;
+    flockfile(stdout);
+    fwrite(src->as.s.bytes, 1, src->as.s.len, stdout);
     fputc('\n', stdout);
+    funlockfile(stdout);
+    if (s) kai_decref(s);
     kai_decref(arg);
     return kai_unit();
 }
 
 static KaiValue *kai_core_eprint(KaiValue *arg) {
     if (!arg) { fputc('\n', stderr); return kai_unit(); }
-    if (arg->tag == KAI_STR) {
-        fwrite(arg->as.s.bytes, 1, arg->as.s.len, stderr);
-    } else {
-        KaiValue *s = kai_to_string(arg);
-        fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
-        kai_decref(s);
-    }
+    KaiValue *s = (arg->tag == KAI_STR) ? NULL : kai_to_string(arg);
+    KaiValue *src = s ? s : arg;
+    flockfile(stderr);
+    fwrite(src->as.s.bytes, 1, src->as.s.len, stderr);
     fputc('\n', stderr);
+    funlockfile(stderr);
+    if (s) kai_decref(s);
     kai_decref(arg);
     return kai_unit();
 }
@@ -7207,11 +7208,13 @@ static KaiValue *kai_core_panic(KaiValue *msg) {
         buf[n] = '\0';
         kai_trap_abort(buf);
     }
+    flockfile(stderr);
     fprintf(stderr, "panic: ");
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    funlockfile(stderr);
     if (__kai_build_debug) kai_panic_backtrace();
     exit(1);
     return kai_unit();
@@ -10390,19 +10393,23 @@ static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
  * default behaviour. The minimal-but-useful path lands first. */
 static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
+    flockfile(stdout);
     if (kai_is_ptr(s) && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
     }
     fputc('\n', stdout);
+    funlockfile(stdout);
     return kai_cont_resume(k, kai_unit());
 }
 
 static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
+    flockfile(stderr);
     if (kai_is_ptr(s) && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    funlockfile(stderr);
     return kai_cont_resume(k, kai_unit());
 }
 
@@ -10416,11 +10423,13 @@ static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) 
 static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
     (void) self;
     (void) k;
+    flockfile(stderr);
     fputs("kai: Fail.fail: ", stderr);
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    funlockfile(stderr);
     exit(1);
 }
 
@@ -12371,6 +12380,7 @@ static void _kai_log_emit(const char *level_padded, KaiValue *msg) {
     /* Header `[<ts>] <LEVEL> ` then the message bytes then newline.
      * fputs on the prefix, fwrite on the message body so embedded
      * NULs in user strings don't truncate the line. */
+    flockfile(stderr);
     fputc('[', stderr);
     fputs(ts, stderr);
     fputs("] ", stderr);
@@ -12380,6 +12390,7 @@ static void _kai_log_emit(const char *level_padded, KaiValue *msg) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }
     fputc('\n', stderr);
+    funlockfile(stderr);
     fflush(stderr);
 }
 

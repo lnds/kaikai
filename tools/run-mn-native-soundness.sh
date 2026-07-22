@@ -67,4 +67,35 @@ for src in "${FIXTURES[@]}"; do
   [ "$ok" = "1" ] || fail=1
 done
 
+# Line-atomicity hammer: eight fibers race Stdout.print payload+newline
+# pairs across scheduler threads. Cross-fiber ORDER is unspecified, so the
+# judge is the sorted line multiset against the N=1 reference — a torn line
+# (fused payload + stray empty line) breaks it. Stdout goes to a file.
+HAMMER="examples/effects/mn_print_line_atomic_hammer.kai"
+hbin="$TMP/hammer"
+"$KAI" build --backend=native "$HAMMER" -o "$hbin" >/dev/null 2>"$TMP/hb.log" \
+  || { echo "BUILD FAILED $HAMMER"; cat "$TMP/hb.log"; exit 1; }
+KAI_THREADS=1 "$hbin" >"$TMP/href" 2>/dev/null \
+  || { echo "FAIL $HAMMER: reference run at N=1 did not complete"; exit 1; }
+sort "$TMP/href" >"$TMP/href.sorted"
+hok=1
+for n in 4 8; do
+  crashes=0; bad=0; hangs=0
+  for r in $(seq 1 "$ITERS"); do
+    if kai_timeout 30 env KAI_THREADS="$n" "$hbin" >"$TMP/hrun" 2>/dev/null; then
+      sort "$TMP/hrun" | cmp -s - "$TMP/href.sorted" || { bad=$((bad+1)); hok=0; }
+    else
+      ec=$?
+      if [ "$ec" = 124 ] || [ "$ec" = 137 ]; then hangs=$((hangs+1)); else crashes=$((crashes+1)); fi
+      hok=0
+    fi
+  done
+  if [ "$crashes" = 0 ] && [ "$bad" = 0 ] && [ "$hangs" = 0 ]; then
+    echo "OK  $HAMMER  KAI_THREADS=$n  $ITERS/$ITERS intact-line runs"
+  else
+    echo "FAIL $HAMMER KAI_THREADS=$n: $crashes crash, $hangs hang, $bad torn-output of $ITERS"
+  fi
+done
+[ "$hok" = 1 ] || fail=1
+
 [ "$fail" = "0" ] && echo "run-mn-native-soundness: OK" || { echo "run-mn-native-soundness: FAIL"; exit 1; }
