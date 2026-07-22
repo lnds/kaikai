@@ -1,36 +1,33 @@
-# m8.x #3 — Cancel delivered at yield points.
+# m8.x #3 — Cancel is delivered at a fiber's suspension point.
 #
-# Worker prints + yields in a loop. Main yields twice (giving worker
-# two rounds), then calls spawn.cancel(f), then yields once more.
-# When worker resumes from the post-cancel yield, its NEXT effect-op
-# lookup (Stdout.print) hits the yield-point hook in
-# kai_evidence_lookup_node: cancel_requested && !cancel_delivered &&
-# cancel_pad_set is true, so the hook longjmps to the trampoline's
-# cancel_pad. The trampoline's second-return path marks the fiber
-# CANCELLED instead of DONE and continues with the awaiter walk.
+# A spawned worker parks on a long sleep; main lets it reach the park,
+# requests cancellation, and awaits it. The cancel detaches the worker
+# from the reactor and unparks it, so its Cancel handler runs and the
+# guarded work after the park never executes.
 #
-# Under m8 v1 (and Phase 2 without Cancel delivery), the worker
-# would print "should not print"; under Phase 3, the hook unwinds
-# the body before the print runs.
+# How many yields a worker completes before a cancel lands is NOT part
+# of the contract: spawn.yield orders nothing across fibers, so counting
+# rounds is a single-thread scheduler artefact that stops holding at
+# KAI_THREADS>1. Delivery is pinned to a reactor park instead — the one
+# point deterministic at every thread count.
 
 import spawn
+import time
 
-fn worker() : Int / Spawn + Console = {
-  Stdout.print("worker: round 1")
-  spawn.yield()
-  Stdout.print("worker: round 2")
-  spawn.yield()
-  Stdout.print("worker: should not print")
-  spawn.yield()
-  99
-}
+fn worker() : Int / Cancel + Stdout + Clock =
+  handle {
+    time.sleep(time.seconds(60))
+    Stdout.print("worker: should not print")
+    99
+  } with Cancel {
+    raise(resume) -> { Stdout.print("worker: cancelled at suspension point"); 0 }
+  }
 
-fn main() : Int / Spawn + Console + Cancel = {
+fn main() : Int / Spawn + Cancel + Stdout + Clock = {
   let f = spawn.spawn(worker)
-  spawn.yield()       # worker prints round 1, yields back
-  spawn.yield()       # worker prints round 2, yields back
-  spawn.cancel(f)     # set cancel_requested
-  spawn.yield()       # gives worker the CPU; its next op sees the flag
+  time.sleep(time.millis(100))   # let the worker reach its park
+  spawn.cancel(f)
+  let _ = spawn.await(f)
   Stdout.print("main: cancel sent")
   0
 }

@@ -274,8 +274,9 @@ lines instead of the sequence. Every line must still appear exactly
 once, so lost work, a duplicated message and a torn line all remain
 findings. The file forgives interleaving and nothing else; a fixture
 that prints a *result* does not belong in it, and neither does one
-that gains or loses a line (#1384, #1389 are both that family, and
-are findings). Every entry names an open issue — the declaration is
+that gains or loses a line — that is a real divergence, fixed in the
+runtime or by making the fixture's delivery point deterministic, not
+declared here. Every entry names an open issue — the declaration is
 the bookmark, the issue is the work, and these goldens also break
 tier1's own byte-for-byte comparison once `KAI_THREADS` defaults to
 ncpu (#1390).
