@@ -786,7 +786,9 @@ tier1-asan: kaic2 test-arena
 	@$(MAKE) -C stage2 test-perceus-1355-closure-temp-release-asan
 	@echo "tier1-asan OK — issue #1355 fixture passes under ASAN+UBSan (closure temp in borrowed HOF slot, no double-free)"
 	@$(MAKE) -C stage2 test-perceus-1324-char-binder-goto-asan
-	@echo "tier1-asan OK — issue #1324 fixture passes under ASAN+UBSan (Char-binding match off the tcrec goto ledger)"
+	@echo "tier1-asan OK — issue #1324 fixture passes under ASAN+UBSan (Char-binding match on the tcrec goto ledger)"
+	@$(MAKE) -C stage2 test-perceus-1395-char-param-raw-asan
+	@echo "tier1-asan OK — issue #1395 fixture passes under ASAN+UBSan (raw Char param, fresh box per consuming use)"
 	@$(MAKE) -C stage2 test-issue-1331-borrowed-op-arg-asan
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
 
