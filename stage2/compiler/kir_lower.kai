@@ -689,32 +689,6 @@ pub fn capture_param(name: String, j: Int) : KParam =
 # the lowering consults the unbox classification.
 pub fn slot_of_ty(t: Option[TypeExpr]) : KSlot = SBoxed
 
-# Conservative Char gate for the tcrec goto ledger, from a match
-# scrutinee's type: any mention of Char (a Char scrutinee, Option[Char],
-# [Char], a record with a Char field) can surface a Char binder in some
-# arm. A Char binder sits outside the Perceus RC regime (unboxable, no
-# per-use dups) while the native backend keeps it a boxed borrow, so
-# deferred goto-site releases for such matches are unsound. Over-
-# approximating only costs a bounded leak on the goto path; missing type
-# info gates on.
-pub fn scr_char_unsafe(x: Expr) : Bool = match x.ty {
-  Some(t) -> ty_mentions_char(t)
-  None    -> true
-}
-
-fn ty_mentions_char(t: Ty) : Bool = match t {
-  TyChar              -> true
-  TyListT(i)          -> ty_mentions_char(i)
-  TyCon(_, _, targs)  -> reduce(targs, false, or_ty_mentions_char)
-  TyDimT(i, _)        -> ty_mentions_char(i)
-  TyRefineT(i, _)     -> ty_mentions_char(i)
-  TyUnion(parts)      -> reduce(parts, false, or_ty_mentions_char)
-  TyShapeApp(_, i)    -> ty_mentions_char(i)
-  _                   -> false
-}
-
-fn or_ty_mentions_char(acc: Bool, t: Ty) : Bool = acc or ty_mentions_char(t)
-
 # --- Raw scalar param/return slots from the UFnSig -----------------------
 #
 # The native backend's signature emitter reads `KParam.slot` / `KFn.ret`,
@@ -727,26 +701,25 @@ fn or_ty_mentions_char(acc: Bool, t: Ty) : Bool = acc or ty_mentions_char(t)
 # mask-raw params `MUnboxed` (`ufn_param_env`), so an `EVar(param)` lowers
 # through `lower_expr_raw` and the native register-load sees the raw slot.
 #
-# The KSlot maps the SAME scalar set the native register machinery has
-# load/box shims for: Int → `SInt64`, Real → `SReal`, Bool → `SBool`. Char
-# (`uint32_t` in the C oracle) has NO raw KIR register form (no
-# `kaix_char_field`/`kaix_char` native shim), so a Char param/return stays
-# `SBoxed` — the native simply does not raw-promote it, mirroring the body
-# path (kir_lower_raw never raw-promotes a Char node). This is consistent
-# WITHOUT matching the C IR byte-for-byte: the native decides raw by KSlot,
-# the C by the UFnSig mask; a Char that the C carries as `kair` the native
-# carries boxed, and each backend reads/writes it uniformly within itself.
+# The KSlot maps the SAME scalar set the UFnSig mask marks raw: Int →
+# `SInt64`, Real → `SReal`, Bool → `SBool`, Char → `SChar` (the raw `i32`
+# codepoint, the C oracle's `uint32_t`). The mapping must cover the whole
+# mask-raw set: the post-perceus dup/drop plan is SHARED by both backends
+# and calibrated for raw scalars (no dups for a mask-raw param's reads), so
+# a mask-raw type left `SBoxed` here hands consuming prims N owned reads
+# against one ref — the under-ref that freed live heap Chars.
 pub fn kslot_of_raw_ty(t: Ty) : KSlot = match t {
   TyInt               -> SInt64
   TyReal              -> SReal
   TyBool              -> SBool
+  TyChar              -> SChar
   TyDimT(inner, _)    -> kslot_of_raw_ty(inner)
   TyRefineT(inner, _) -> kslot_of_raw_ty(inner)
   _                   -> SBoxed
 }
 
 # The return slot for a UFn: raw iff the UFnSig's return type is unboxable
-# AND maps to a raw KIR slot (Int/Real/Bool — Char/Handle fall to SBoxed).
+# AND maps to a raw KIR slot (Int/Real/Bool/Char — Handle falls to SBoxed).
 # `None` (a fn with no raw signature) keeps the conservative boxed slot.
 pub fn ret_slot_of_sig(sig: Option[UFnSig]) : KSlot = match sig {
   Some(US(_, rt, _)) -> if ty_is_unboxable_t(rt) { kslot_of_raw_ty(rt) } else { SBoxed }
@@ -784,8 +757,8 @@ fn lower_params_sig_idx(ps: [Param], pts: [Ty], mask: [Bool], i: Int, acc: [KPar
 # `mask` is true, else `SBoxed`. Defensive on a short mask/tys list (a
 # lowering bug, never reached for a well-formed UFnSig). `pub` so the
 # call-site arg lowering (`lower_tcrec_args`) reads the SAME slot the param
-# declaration does — a `Char`/`Handle` param is `mask=true` but maps to
-# `SBoxed`, so the arg must NOT lower raw (the Char-param miscompile).
+# declaration does — a `Handle` param is `mask=true` but maps to `SBoxed`,
+# so its arg must NOT lower raw.
 pub fn param_slot_for(pts: [Ty], mask: [Bool]) : KSlot = match mask {
   [true, ..._] -> match pts {
     [t, ..._] -> kslot_of_raw_ty(t)
