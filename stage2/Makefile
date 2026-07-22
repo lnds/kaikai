@@ -2988,7 +2988,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (spawn_actor_policy: explicit MailboxPolicy reaches the spawned actor's mailbox)" \
