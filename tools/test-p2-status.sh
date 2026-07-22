@@ -93,6 +93,13 @@ check_mentions "needs-regen line" "make KAI_LLVM=1 kaic2" "$(status "$TMP/regen"
 status "$TMP/regen" >/dev/null 2>&1
 check "after generation" "active" "$(status "$TMP/regen" --status)"
 
+# 4. The whole-program bc alone is NOT active: without the inline twin the
+#    modular native path emits user code with every kaix_* op out-of-line.
+#    A tarball shipped in this state ran hot loops ~12x slower than a
+#    checkout while still reporting p2 active.
+rm -f "$TMP/regen/stage0/runtime_inline.bc"
+check "inline bc missing" "optout needs-regen" "$(status "$TMP/regen" --status)"
+
 # The first word stays the vocabulary callers already parse (tools/assert-runtime-bc.sh).
 for s in "$TMP/none" "$TMP/regen"; do
   case "$(status "$s" --status)" in

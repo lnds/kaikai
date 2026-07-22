@@ -99,8 +99,12 @@ resolve_clang() {
   return 1
 }
 
+# "active" requires BOTH bitcodes: the whole-program bc AND the
+# separate-compilation twin the native-modular path merges per partition.
+# A tree with only the former would report active yet build user code
+# with every kaix_* op out-of-line on the modular (default) path.
 p2_state() {
-  if [ -f "$BC_OUT" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$(input_hash)" ]; then
+  if [ -f "$BC_OUT" ] && [ -f "$BC_INLINE" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$(input_hash)" ]; then
     echo "active"
   elif [ -n "$(resolve_clang || true)" ]; then
     echo "optout needs-regen"

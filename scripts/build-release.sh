@@ -192,6 +192,11 @@ if ! "$ROOT/tools/assert-runtime-bc.sh" >&2; then
   exit 2
 fi
 cp stage0/runtime_llvm.bc  "$STAGE/share/kaikai/include/runtime_llvm.bc"
+# The separate-compilation twin: the native-modular path (the default
+# whenever the shared core cache is active) merges THIS bitcode into each
+# partition. Without it every kaix_* op in user code stays an out-of-line
+# call — an order-of-magnitude slowdown on hot loops.
+cp stage0/runtime_inline.bc "$STAGE/share/kaikai/include/runtime_inline.bc"
 
 # Metadata.
 cp VERSION             "$STAGE/share/kaikai/VERSION"
