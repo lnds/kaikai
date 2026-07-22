@@ -9,12 +9,12 @@ A functional language with static typing, LLVM native compilation, algebraic eff
 
 ## kaikai syntax — `kai info` is authoritative
 
-Before claiming a kaikai surface form exists in conversation, code suggestions, or examples, run `kai info <topic>`. `kai info` with no args lists the topics; `kai info syntax` is the one-page cheat sheet of every form kaikai actually has, including an explicit **NOT IN KAIKAI** section listing the false-friends that look plausible but do not exist (operator sections, `\x -> body`, list comprehensions, `do { }`, type classes, `throw/catch`, `return` statements, etc.). LLM agents in particular extrapolate from Haskell/Python/JS when uncertain — `kai info` is the cheap, always-correct way to check before writing. `kai info <topic> --json` returns the same content as structured JSON for programmatic consumption.
+Before claiming a kaikai surface form exists in conversation, code suggestions, or examples, run `kai info <topic>`. `kai info` with no args lists the topics; `kai info syntax` is the one-page cheat sheet of every form kaikai actually has, including an explicit **NOT IN KAIKAI** section listing the false-friends that look plausible but do not exist (operator sections, `\x -> body`, list comprehensions, `do { }`, `throw/catch`, `return` statements, etc.). LLM agents in particular extrapolate from Haskell/Python/JS when uncertain — `kai info` is the cheap, always-correct way to check before writing. `kai info <topic> --json` returns the same content as structured JSON for programmatic consumption.
 
 Use `kai info` as your first source of truth, ahead of any prior memory or guess:
 
 - **Before writing a `.kai` snippet** to demonstrate something — check `kai info syntax` and the relevant per-topic page (`kai info effects`, `kai info match`, `kai info protocols`, `kai info units`, `kai info pipes`, etc.). The check costs one shell call; a wrong snippet costs a parser-error round-trip plus credibility.
-- **Before adding a new arm** to a kaikai-AST consumer (a typer pass, a codegen path, a formatter helper) — check the corresponding `kai info` topic to confirm the surface syntax you are reproducing, AND read the AST type definition near the top of `stage2/compiler.kai` for the slot order. Past slip: implementing `DDerive` printer with `#derive(P)` because that was the legacy syntax (issue #608 removed it); the only accepted spelling is `#[derive(P)]`, and `kai info syntax` says so on a single line.
+- **Before adding a new arm** to a kaikai-AST consumer (a typer pass, a codegen path, a formatter helper) — check the corresponding `kai info` topic to confirm the surface syntax you are reproducing, AND read the AST type definition in `stage2/compiler/ast.kai` for the slot order. Past slip: implementing `DDerive` printer with `#derive(P)` because that was the legacy syntax (issue #608 removed it); the only accepted spelling is `#[derive(P)]`, and `kai info syntax` says so on a single line.
 - **When the user uses a kaikai keyword you have not seen recently** (e.g. `where`, `default {}`, `axiom`, `extern "C"`, `unit`, `Measure`, `variants[T]()`) — re-read the relevant topic instead of relying on stale memory. Topics drift toward correctness faster than agent memory does.
 
 The reference pages live at `docs/info/*.md` and travel with the binary (dev checkout reads from there; installed tarball ships `share/kaikai/info/`).
@@ -76,7 +76,7 @@ Bootstrap from any machine with `cc`:
 ```sh
 cc stage0/*.c -o kaic0
 ./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -I stage0 -o kaic1
-./kaic1 demos/fizzbuzz.kai -o fizzbuzz
+./kaic1 examples/minimal/fizzbuzz.kai -o fizzbuzz
 ./fizzbuzz
 ```
 
@@ -85,15 +85,15 @@ cc stage0/*.c -o kaic0
 Full map in **`docs/build-system.md`** (Makefile structure, the bundle, bootstrap chain, verification targets, parity harness, traps). The two rules that prevent the recurring time-sinks:
 
 - **To run/build kaikai code, use `./bin/kai run <file.kai>` / `./bin/kai build <file.kai> -o <out>`.** The wrapper resolves stdlib (`--path`), the backend, and the `cc`/link step. Do NOT call `kaic2` raw, pass `--path ../stdlib` yourself, or reconstruct a `cc … -I ../stage0` line from Makefile recipes.
-- **To rebuild the compiler after editing `stage2/compiler/*.kai`, run `make kaic2`** (C) or `make KAI_LLVM=1 kaic2` (native) from the repo root — it reassembles the `BUNDLE_SRCS` bundle and compiles. The root Makefile is a thin façade delegating to `stage0/1/2` via `$(MAKE) -C`; the compiler's own ~147 targets live in `stage2/Makefile` (`make -C stage2 <target>`). **`stage2/main.kai` is a 33-line stub, not the compiler** — the compiler is the concatenated `BUNDLE_SRCS` (~55 modules); a new module must be added there in dependency order.
+- **To rebuild the compiler after editing `stage2/compiler/*.kai`, run `make kaic2`** (C) or `make KAI_LLVM=1 kaic2` (native) from the repo root — it reassembles the `BUNDLE_SRCS` bundle and compiles. The root Makefile is a thin façade delegating to `stage0/1/2` via `$(MAKE) -C`; the compiler's own ~300 targets live in `stage2/Makefile` (`make -C stage2 <target>`). **`stage2/main.kai` is a 33-line stub, not the compiler** — the compiler is the concatenated `BUNDLE_SRCS` (~120 modules); a new module must be added there in dependency order.
 
 ## Testing discipline
 
-Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `docs/ci-time-analysis.md`. Five workflows: `tier1.yml` and `tier1-native.yml` are always-on and their aggregator jobs are the two REQUIRED checks; `tier1-asan.yml`, `tier1-tsan.yml`, and `rc-detector.yml` are path-gated.
+Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `docs/ci-time-analysis.md`. Eight tier workflows (plus `daily.yml`, `release.yml`, and the weekly `warm-llvm-cache.yml` crons): `tier1.yml`, `tier1-native.yml`, `tier1-tsan.yml`, and `tier1-mn-corpus.yml` are always-on and their aggregator jobs are the four REQUIRED checks; `tier1-asan.yml`, `tier1-macos-mn.yml`, and `rc-detector.yml` are path-gated (rc-detector also runs a daily cron).
 
 - **Tier 0** — pre-commit fast sanity (~30–60 s): `make tier0`. Run before each commit when iterating on compiler code; CI catches what local skips miss.
-- **Tier 1** — gated by CI on every PR: the `tier1` workflow shards `make tier0 && make tier1` across parallel runners; `tier1-native` gates the default native backend (build + self-host gate + ~620-fixture parity corpus). **CI green on both required checks is the merge gate.** Optional locally for faster feedback (~2–4 min on mac).
-- **Tier 1-ASAN** — path-gated CI on PRs touching `stage0/**`, `stage1/compiler.kai`, `stage2/compiler.kai`, `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or `examples/perceus/**`. Catches non-portable fixes that pass on macOS but fail on Linux. `tier1-tsan` (M:N data races) and `rc-detector` (RC ledger, also daily cron) gate their own path sets similarly.
+- **Tier 1** — gated by CI on every PR: the `tier1` workflow shards `make tier0 && make tier1` across parallel runners; `tier1-native` gates the default native backend (build + self-host gate + ~650-fixture parity corpus across three shards); `tier1-tsan` (M:N data races) and `tier1-mn-corpus` (whole corpus at `KAI_THREADS>1`, both backends) run on every PR. **CI green on all four required checks is the merge gate.** Optional locally for faster feedback (~2–4 min on mac).
+- **Tier 1-ASAN** — path-gated CI on PRs touching `stage0/**`, `stage1/compiler.kai`, `stage2/compiler/**`, `stage2/runtime.h`, `stage2/Makefile`, `stdlib/**`, `examples/effects/**`, or `examples/perceus/**`. Catches non-portable fixes that pass on macOS but fail on Linux (note: Linux ASAN runs LeakSanitizer; macOS does not — a leak-clean local run on mac proves nothing about the CI leak check). `tier1-macos-mn` (mac M:N determinism) and `rc-detector` (RC ledger, also daily cron) gate their own path sets similarly.
 - **Tier 2** — `make daily`: maintainer / cron only, ~10–20 min. Tier 1 + stress + coverage probe + RC budget. Failures are diagnostics, not blockers — `main` already gated by Tier 1.
 - **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI (the PR-side `changes` job short-circuits the required checks; pushes to main additionally skip via `paths-ignore`, which also covers `VERSION`/`.cz.toml` bump commits). Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, build scripts) always trigger tiers.
 
@@ -101,7 +101,7 @@ Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `d
 
 **Every new file a lane authors scores `km score` A− or better. B is the absolute floor; below B does not land.** This is the *differential* standard: it applies to code the lane writes from scratch, not to pre-existing files it merely edits. The existing F monoliths (`stage2/compiler/infer.kai`, `emit_c.kai`, `cache.kai`) are debt being paid down, NOT the baseline — never calibrate a new file's acceptable quality against them. "We're already at F" is never a reason to relax; new code is debt-free and has no excuse.
 
-The bar is real and met daily in this repo: all of `stdlib/` scores A+/A++, and even inside the compiler `chars.kai`/`diag.kai` are A, `intervals.kai`/`region.kai` A−. That is the example to follow.
+The bar is real and met daily in this repo: much of `stdlib/` scores A+/A++ (`array`, `money`, `spawn`, `time`, `string_builder`, …), and even inside the compiler `chars.kai`/`diag.kai` are A. That is the example to follow. (Some stdlib files have slipped below the bar — `regexp`, `encoding/json`, `net/http` — they are debt like the compiler monoliths, not license.)
 
 Concrete gate, measured with `km` on each file the lane adds (cross-check `km score` with `km cogcom`):
 
@@ -163,7 +163,7 @@ When reasoning about *current state* of the language, runtime, or stdlib, the **
 
 The **secondary / historical** sources are the lane retrospectives and audits:
 
-- `docs/lane-experience-*.md` (~90 files) — per-lane retros: what was attempted, what reworked, what got proposed and didn't ship, what surprised the lane.
+- `docs/lane-experience-*.md` (hundreds of files) — per-lane retros: what was attempted, what reworked, what got proposed and didn't ship, what surprised the lane.
 - `docs/lane-audit-*.md`, `docs/*-phase0-audit.md`, `docs/*-followups.md` — point-in-time audits, often pessimistic about features that have since shipped.
 - `docs/lane-experience-*-disclaimer-sweep.md` — the sweeps that aligned other docs to reality.
 
