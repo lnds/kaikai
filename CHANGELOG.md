@@ -84,6 +84,68 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.104.0 (2026-07-22)
+
+### Added
+
+- **runtime**: default KAI_THREADS to ncpu — F3, multi-threading on by default (closes #1207) (#1332)
+- **ci**: gate the whole fixture corpus at KAI_THREADS>1 on both backends (#1387)
+
+### Fixed
+
+- **runtime**: detect deadlock above one thread via global quiescence (#1403)
+- **native**: give root-private user functions internal linkage (#1380) (#1401)
+- **perceus**: exclude Char-binding matches from the native tcrec goto ledger (#1396)
+- **runtime**: close the cross-thread holes in the non-atomic-RC invariant (#1392)
+- **tools**: stop grep -c || echo 0 from doubling counts to two lines (#1393)
+- **perceus**: release multi-use borrowed locals when the block tail is a self-call (#1375)
+- stale binserialize Result order + parity harness timestamp flake (#1379)
+- **runtime**: annotate fiber switches for ThreadSanitizer (#1378)
+- **runtime**: apply the bounded-mailbox policy on the cross-thread send path (#1376)
+- **perceus**: release the un-specialised closure temp in a borrowed HOF slot (closes #1355) (#1374)
+- **typer**: recurse unit walk into the four sibling decl wrappers (closes #1278) (#1373)
+- **build**: stop loud on forced KAI_LLVM=1 without llvm-config, link Homebrew zstd (closes #1360) (#1372)
+- **build**: thread --user-cache into every kaic2 build invocation (closes #1341) (#1371)
+- **typer**: reject positional calls on record types (closes #1281) (#1370)
+- **perceus**: elide the unused list rest binder in the native lowering (closes #1329) (#1365)
+- **runtime**: adopt a pre-existing alternate signal stack instead of displacing it (#1364)
+- **build**: declare the header prerequisites the bootstrap rules compile against (#1362)
+- **perceus**: give effect-op arguments an owning ABI and release tail-read block locals (#1359)
+- **perceus**: drop owned call rvalues passed into borrowed slots (closes #1318) (#1358)
+- **build**: report the native P2 bitcode state instead of opting out silently (#1354)
+- **runtime**: read the active fiber out of line at every park-spanning site (#1353)
+- **build**: dead-strip the native link to reclaim core-object binary size (#1351)
+- **runtime**: per-thread sigaltstack so the fiber stack-overflow diagnostic survives worker threads (closes #1346) (#1349)
+- **runtime**: write kai_active_fiber out of line from the fiber trampoline tails (closes #1342) (#1343)
+- **cache**: emit the core-parse-cache stats line and fixture the monolithic-path hit (#1340)
+- **tools**: make the timeout shim honour its documented 124 deadline contract (#1333)
+- **perceus**: release borrowed-scrutinee moves and unused rest binders (closes #1315) (#1330)
+- **runtime**: lock the reactor timer wheel on the timeout-receive disarm, and verify the fiber-free guard (#1327)
+- **emit**: release skipped scrutinee and binder refs on the native tcrec goto-tail path (closes #1314) (#1319)
+- **runtime**: re-resolve kai_active_fiber TLS slot after park/yield resume (closes #1301, closes #1284) (#1320)
+- **emit**: release skipped scrutinee and binder refs on the tcrec goto-tail path (closes #1302) (#1316)
+- **perceus**: drop single-use owned params on paths that never reach their use (#1312)
+- **runtime**: unwind evidence past the abandoning handle on discard (closes #1263) (#1305)
+- **build**: resolve timeout portably in stage2 Makefile (closes #1283) (#1307)
+- **perceus**: count interior reads of compound args in borrowed callee slots (closes #1295) (#1304)
+- **tools**: recover the M:N determinism signal on macOS; diagnose #1284 (#1299)
+- **cli**: keep CFLAGS .c shim sources off -c compile lines (closes #1293) (#1294)
+
+### Changed
+
+- **ci**: enable the shared core-parse cache in the fixture-test loops (#1345)
+- **emit**: lower `/` and `%` by a trapless literal to sdiv/srem on native (#1336)
+- **build**: content-addressed native core object — warm native builds link a prebuilt stdlib core (refs #1323) (#1334)
+- **build**: persistent core cache — default-on post-parse blobs + emitted-C core TUs (closes #1317) (#1322)
+- **emit**: per-TU header slices for the c-modular .o cache (closes #1296) (#1310)
+- **emit**: hermetic per-module emission for the modular .o caches (#1297)
+- **ci**: path-gate shard-4 modular self-hosts to compiler-touching PRs (#1292)
+- **ci**: guard clang install behind command -v in daily/asan/tsan
+- **ci**: trim build job overhead (shallow checkout, skip redundant clang)
+- **release**: scope libLLVM cache key to mk/llvm.mk + warm-cache job
+- **build**: add kaic2-dev target compiling the bundle at -O0
+- **ci**: cut the PR critical path — parallel native gate, four tier1 shards, doc/bump push skip (#1289)
+
 ## v0.103.0 (2026-07-18)
 
 ### BREAKING CHANGE
