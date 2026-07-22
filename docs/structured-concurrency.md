@@ -268,8 +268,9 @@ policies, link/monitor supervision, `spawn_actor`,
 <!-- coverage: skip -->
 
 Fibers are scheduled M:N over OS threads with work-stealing.
-`KAI_THREADS=N` selects the thread count at process start (default 1,
-which is byte-identical to the cooperative single-thread scheduler).
+`KAI_THREADS=N` selects the thread count at process start; unset, it
+is the host CPU count. `KAI_THREADS=1` is byte-identical to the
+cooperative single-thread scheduler.
 None of the semantics in this document change with N: nurseries,
 cancellation and awaits behave identically; a message or spawned
 thunk that crosses a thread boundary is physically copied, which is

@@ -842,7 +842,7 @@ coverage-probe:
 # docs/perceus-honesty-targets.md. Today the threshold is "no
 # regression from 46.9 M leaked".
 rc-budget: kaic2
-	@KAI_TRACE_RC=1 stage2/kaic2 stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
+	@KAI_TRACE_RC=1 KAI_THREADS=1 stage2/kaic2 stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
 	leaked=$$(grep -E "alloc_total" /tmp/rc.log | head -1 | sed 's/.*leaked=\([0-9]*\).*/\1/'); \
 	if [ -z "$$leaked" ]; then \
 	  echo "rc-budget SKIP — KAI_TRACE_RC trace empty (kaic2 not built with trace)"; \

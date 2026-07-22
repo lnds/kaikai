@@ -744,7 +744,8 @@ Open work after v1:
   selection. Deferred to the Orongo edition; v1 receive is FIFO.
 
 - **Parallel execution**: actors run across OS threads under
-  `KAI_THREADS=N` (M:N work-stealing; default 1). The mailbox
+  `KAI_THREADS=N` (M:N work-stealing; unset means the host CPU
+  count). The mailbox
   guarantee is unchanged — one actor, one serially-processed
   mailbox — and cross-thread sends are copied, so no actor observes
   shared mutation at any N.

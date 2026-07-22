@@ -110,7 +110,7 @@ check_one() {
     if ! CFLAGS="$STRICT_CFLAGS" "$KAI" build --backend=c "$src" -o "$sbin" 2>/dev/null; then
       echo "  FAIL $tag — strict build errored"; fail=1; return
     fi
-    KAI_TRACE_RC=1 "$sbin" >/dev/null 2>"$WORK/$name-strict.err"
+    KAI_TRACE_RC=1 KAI_THREADS=1 "$sbin" >/dev/null 2>"$WORK/$name-strict.err"
     if grep -q 'DOUBLE' "$WORK/$name-strict.err"; then
       echo "  FAIL $tag — strict ledger DOUBLE (a tag freed more than allocated):"
       grep 'DOUBLE' "$WORK/$name-strict.err" | sed 's/^/      /'

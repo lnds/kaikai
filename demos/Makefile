@@ -8,6 +8,9 @@
 #   make -C demos list      # list discovered demos
 #   make -C demos clean
 #
+# A demo whose golden records one legal interleaving pins the scheduler
+# in a `main.env` beside it (`KAI_THREADS=1`), one VAR=value per line.
+#
 # Uses kaic2 directly (stage 2: full effects, m7a/m7b, --path, --prelude).
 # bin/kai wraps kaic1 (stage 1, no effects-in-types) and is unsuitable here.
 
@@ -69,7 +72,9 @@ verify:
 	    echo "FAIL cc: see $(BUILD)/$$d.err" > $(BUILD)/$$d.status; \
 	    continue; \
 	  fi; \
-	  if ! $(BUILD)/$$d-bin > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
+	  runenv=""; \
+	  if [ -f $$d/main.env ]; then runenv="env $$(tr '\n' ' ' < $$d/main.env)"; fi; \
+	  if ! $$runenv $(BUILD)/$$d-bin > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
 	    err=$$(tail -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="runtime error"; \
 	    echo "FAIL runtime: $$err" > $(BUILD)/$$d.status; \

@@ -1,5 +1,10 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O2
+# Recipes that read a KAI_TRACE_RC ledger run with KAI_THREADS=1. The
+# counters are per-thread and the exit report prints only the reporting
+# thread's copy, so a total is complete on one scheduler thread only —
+# across threads an assertion sees a short count, or zero. The pins come
+# off when the ledgers sum at exit.
 # macOS caps the main-thread stack at the LINKED size, not the ulimit
 # soft limit (ulimit -s only matters where the kernel is the
 # allocator — i.e. Linux). The Tongariki kai fmt lane (2026-05-01)
@@ -1061,10 +1066,11 @@ test-ffi-v2-struct: $(TARGET) build
 	  && echo "ffi-v2-struct OK (C backend)" \
 	  || { echo "ffi-v2-struct DIFF (C backend)"; diff ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-asan $(LDLIBS_M); \
-	./build/v2_struct-asan > build/v2_struct.asan.out 2>&1; \
+	./build/v2_struct-asan > build/v2_struct.asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/v2_struct.asan.raw > build/v2_struct.asan.out || true; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.asan.out > /dev/null \
 	  && echo "ffi-v2-struct OK (ASAN clean)" \
-	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.out; exit 1; }
+	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.raw; exit 1; }
 
 # FFI v2 (#417) — opaque handles. A handle is used in three consuming
 # calls (two bumps + the destructor), pinning the no-Drop ownership rule
@@ -1080,10 +1086,11 @@ test-ffi-v2-opaque: $(TARGET) build
 	  && echo "ffi-v2-opaque OK (C backend)" \
 	  || { echo "ffi-v2-opaque DIFF (C backend)"; diff ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_opaque.c ../examples/ffi/v2_shim.c -o build/v2_opaque-asan $(LDLIBS_M); \
-	./build/v2_opaque-asan > build/v2_opaque.asan.out 2>&1; \
+	./build/v2_opaque-asan > build/v2_opaque.asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/v2_opaque.asan.raw > build/v2_opaque.asan.out || true; \
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.asan.out > /dev/null \
 	  && echo "ffi-v2-opaque OK (ASAN clean)" \
-	  || { echo "ffi-v2-opaque ASAN DIFF"; cat build/v2_opaque.asan.out; exit 1; }
+	  || { echo "ffi-v2-opaque ASAN DIFF"; cat build/v2_opaque.asan.raw; exit 1; }
 
 # FFI v2 (#1030) — native backend marshals struct-by-value with the
 # platform C-ABI classification done in the emitter (AAPCS64 / x86-64
@@ -1487,10 +1494,12 @@ test-ffi-extern-c-asan: $(TARGET) build
 	      -I ../stage2 -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.out 2>&1; \
+	  ./build/ffi_extern_c_basic-c-asan > build/ffi_extern_c_basic-asan.raw 2>&1; \
+	grep -v "makecontext/swapcontext" build/ffi_extern_c_basic-asan.raw \
+	  > build/ffi_extern_c_basic-asan.out || true; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic-asan.out > /dev/null \
 	  && echo "ffi-extern-c-asan OK (C backend, ASAN+UBSan clean)" \
-	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.out; exit 1; }
+	  || { echo "ffi-extern-c-asan DIFF (C backend, ASAN+UBSan)"; cat build/ffi_extern_c_basic-asan.raw; exit 1; }
 
 # Issue #933 / #934 regression — a non-libc user-symbol scalar extern
 # (#933) and the `Char` boundary type (#934), linked against
@@ -1499,6 +1508,12 @@ test-ffi-extern-c-asan: $(TARGET) build
 # regression cannot hide behind the undocumented `-Wno-implicit-...`
 # flag). Both fixtures run on the C backend + ASAN; the native backend
 # is exercised by the parity ratchet.
+#
+# ASAN prints a makecontext/swapcontext support warning on its own
+# stderr for every fibered program, which these recipes fold into the
+# compared output. It is not a finding — a real report still exits
+# non-zero and trips `set -e` — so it is filtered out of the diff and
+# kept in the `.raw` capture the failure branch prints.
 test-ffi-scalar-char: $(TARGET) build
 	@set -e; \
 	for f in extern_c_user_symbol extern_c_char; do \
@@ -1516,10 +1531,11 @@ test-ffi-scalar-char: $(TARGET) build
 	    -I ../stage2 -I ../stage0 build/$$f.c ../examples/ffi/scalar_shim.c -o build/$$f-c-asan; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$f-c-asan > build/$$f-asan.out 2>&1; \
+	    ./build/$$f-c-asan > build/$$f-asan.raw 2>&1; \
+	  grep -v "makecontext/swapcontext" build/$$f-asan.raw > build/$$f-asan.out || true; \
 	  diff -q $$exp build/$$f-asan.out > /dev/null \
 	    && echo "$$f OK (ASAN+UBSan clean)" \
-	    || { echo "$$f ASAN DIFF"; cat build/$$f-asan.out; exit 1; }; \
+	    || { echo "$$f ASAN DIFF"; cat build/$$f-asan.raw; exit 1; }; \
 	done
 
 # Issue #216 regression — qualified-call resolver inside a stdlib file.
@@ -1724,10 +1740,10 @@ test-region-1197-parity: $(TARGET) build
 	    || { echo "region-1197-parity FAIL ($$name: C build errored)"; cat build/s2-1197-$$name-c.err; exit 1; }; \
 	  KAI_BACKEND=native ../bin/kai build $$f -o build/s2-1197-$$name-nat 2> build/s2-1197-$$name-nat.err \
 	    || { echo "region-1197-parity FAIL ($$name: native build errored)"; cat build/s2-1197-$$name-nat.err; exit 1; }; \
-	  ic=$$(KAI_TRACE_RC=1 ./build/s2-1197-$$name-c 2>&1 | grep -oE 'incref_total=[0-9]+' | head -1 | cut -d= -f2); \
-	  in=$$(KAI_TRACE_RC=1 ./build/s2-1197-$$name-nat 2>&1 | grep -oE 'incref_total=[0-9]+' | head -1 | cut -d= -f2); \
-	  ac=$$(KAI_TRACE_RC=1 ./build/s2-1197-$$name-c 2>&1 | grep -oE 'arena_alloc=[0-9]+' | head -1 | cut -d= -f2); \
-	  an=$$(KAI_TRACE_RC=1 ./build/s2-1197-$$name-nat 2>&1 | grep -oE 'arena_alloc=[0-9]+' | head -1 | cut -d= -f2); \
+	  ic=$$(KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1197-$$name-c 2>&1 | grep -oE 'incref_total=[0-9]+' | head -1 | cut -d= -f2); \
+	  in=$$(KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1197-$$name-nat 2>&1 | grep -oE 'incref_total=[0-9]+' | head -1 | cut -d= -f2); \
+	  ac=$$(KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1197-$$name-c 2>&1 | grep -oE 'arena_alloc=[0-9]+' | head -1 | cut -d= -f2); \
+	  an=$$(KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1197-$$name-nat 2>&1 | grep -oE 'arena_alloc=[0-9]+' | head -1 | cut -d= -f2); \
 	  [ "$$ic" = "0" ] || { echo "region-1197-parity FAIL ($$name: C incref_total=$$ic, expected 0 — per-node RC under region)"; exit 1; }; \
 	  [ "$$in" = "0" ] || { echo "region-1197-parity FAIL ($$name: native incref_total=$$in, expected 0 — per-node RC under region)"; exit 1; }; \
 	  [ "$$ic" = "$$in" ] || { echo "region-1197-parity FAIL ($$name: incref diverges C=$$ic native=$$in)"; exit 1; }; \
@@ -1771,7 +1787,7 @@ test-trace: $(TARGET) build
 	for name in $(TRACE_FIXTURES); do \
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
-	  ./build/$$name-c > build/$$name.out; \
+	  KAI_THREADS=1 ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "trace OK $$name" \
 	    || { echo "trace DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
@@ -1792,7 +1808,7 @@ test-trace-asan: $(TARGET) build
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" KAI_THREADS=1 \
 	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
 	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
 	    echo "trace-asan FAIL $$name — sanitizer diagnostic:"; \
@@ -2906,7 +2922,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (cooperative scheduler interleaves yielding fibers)" \
@@ -2932,7 +2948,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Actor.receive parks on empty; sender wakeup unblocks)" \
@@ -2958,7 +2974,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Bounded(_, BlockSender) parks sender on full; receiver wakeup unblocks)" \
@@ -3099,7 +3115,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	  KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
 	  diff -q ../examples/effects/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (nursery auto-join: both children before return, no explicit await)" \
@@ -4654,7 +4670,7 @@ test-perceus-812-tracer: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-812tr.c \
 	  || { echo "perceus-812-tracer FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-812tr.c -o build/s2-812tr $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-812tr > /dev/null 2> build/s2-812tr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-812tr > /dev/null 2> build/s2-812tr.rc; \
 	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-812tr.rc | head -1 | cut -d= -f2); \
 	dec=$$(grep -oE 'decref_total=[0-9]+' build/s2-812tr.rc | head -1 | cut -d= -f2); \
 	[ -n "$$inc" ] && [ -n "$$dec" ] \
@@ -4676,7 +4692,7 @@ test-perceus-1219-bootstrap-seed: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1219boot.c \
 	  || { echo "perceus-1219-bootstrap-seed FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1219boot.c -o build/s2-1219boot $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1219boot > build/s2-1219boot.out 2> build/s2-1219boot.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1219boot > build/s2-1219boot.out 2> build/s2-1219boot.rc; \
 	diff -q $$exp build/s2-1219boot.out > /dev/null \
 	  || { echo "perceus-1219-bootstrap-seed DIFF"; diff $$exp build/s2-1219boot.out; exit 1; }; \
 	if grep -qE 'tag variant' build/s2-1219boot.rc; then \
@@ -4700,7 +4716,7 @@ test-perceus-817-filter-leak: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-817fl.c \
 	  || { echo "perceus-817-filter-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-817fl.c -o build/s2-817fl $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-817fl > build/s2-817fl.out 2> build/s2-817fl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-817fl > build/s2-817fl.out 2> build/s2-817fl.rc; \
 	grep -q 'total=' build/s2-817fl.out \
 	  || { echo "perceus-817-filter-leak FAIL (wrong output)"; cat build/s2-817fl.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-817fl.rc | head -1 | cut -d= -f2); \
@@ -4725,7 +4741,7 @@ test-perceus-1117-map-pipe-record-leak: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1117mprl.c \
 	  || { echo "perceus-1117-map-pipe-record-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1117mprl.c -o build/s2-1117mprl $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1117mprl > build/s2-1117mprl.out 2> build/s2-1117mprl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1117mprl > build/s2-1117mprl.out 2> build/s2-1117mprl.rc; \
 	diff -q $$exp build/s2-1117mprl.out > /dev/null \
 	  || { echo "perceus-1117-map-pipe-record-leak FAIL (output diff)"; diff $$exp build/s2-1117mprl.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1117mprl.rc | head -1 | cut -d= -f2); \
@@ -4748,7 +4764,7 @@ test-perceus-1134-pipe-fusion: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pf.c \
 	  || { echo "perceus-1134-pipe-fusion FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pf.c -o build/s2-1134pf $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1134pf > build/s2-1134pf.out 2> build/s2-1134pf.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1134pf > build/s2-1134pf.out 2> build/s2-1134pf.rc; \
 	diff -q $$exp build/s2-1134pf.out > /dev/null \
 	  || { echo "perceus-1134-pipe-fusion FAIL (output diff)"; diff $$exp build/s2-1134pf.out; exit 1; }; \
 	cons=$$(grep -oE 'tag cons[[:space:]]+allocs=[0-9]+' build/s2-1134pf.rc | grep -oE '[0-9]+$$'); \
@@ -4789,7 +4805,7 @@ test-perceus-1134-pipe-fusion-terminal: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pft.c \
 	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pft.c -o build/s2-1134pft $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1134pft > build/s2-1134pft.out 2> build/s2-1134pft.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1134pft > build/s2-1134pft.out 2> build/s2-1134pft.rc; \
 	diff -q $$exp build/s2-1134pft.out > /dev/null \
 	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (output diff)"; diff $$exp build/s2-1134pft.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1134pft.rc | head -1 | cut -d= -f2); \
@@ -4810,7 +4826,7 @@ test-perceus-1143-pipe-fusion-lambda: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfl.c \
 	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfl.c -o build/s2-1143pfl $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1143pfl > build/s2-1143pfl.out 2> build/s2-1143pfl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfl > build/s2-1143pfl.out 2> build/s2-1143pfl.rc; \
 	diff -q $$exp build/s2-1143pfl.out > /dev/null \
 	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (output diff)"; diff $$exp build/s2-1143pfl.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfl.rc | head -1 | cut -d= -f2); \
@@ -4831,7 +4847,7 @@ test-perceus-1143-pipe-fusion-ring: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfr.c \
 	  || { echo "perceus-1143-pipe-fusion-ring FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfr.c -o build/s2-1143pfr $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1143pfr > build/s2-1143pfr.out 2> build/s2-1143pfr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfr > build/s2-1143pfr.out 2> build/s2-1143pfr.rc; \
 	diff -q $$exp build/s2-1143pfr.out > /dev/null \
 	  || { echo "perceus-1143-pipe-fusion-ring FAIL (output diff)"; diff $$exp build/s2-1143pfr.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfr.rc | head -1 | cut -d= -f2); \
@@ -4969,7 +4985,7 @@ test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) build
 	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfln 2> build/s2-1143pfln.err \
 	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (native build errored)"; cat build/s2-1143pfln.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1143pfln > build/s2-1143pfln.out 2> build/s2-1143pfln.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfln > build/s2-1143pfln.out 2> build/s2-1143pfln.rc; \
 	diff -q $$exp build/s2-1143pfln.out > /dev/null \
 	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (output diff)"; diff $$exp build/s2-1143pfln.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfln.rc | head -1 | cut -d= -f2); \
@@ -4985,7 +5001,7 @@ test-perceus-1143-pipe-fusion-ring-native: $(TARGET) build
 	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfrn 2> build/s2-1143pfrn.err \
 	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (native build errored)"; cat build/s2-1143pfrn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1143pfrn > build/s2-1143pfrn.out 2> build/s2-1143pfrn.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfrn > build/s2-1143pfrn.out 2> build/s2-1143pfrn.rc; \
 	diff -q $$exp build/s2-1143pfrn.out > /dev/null \
 	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (output diff)"; diff $$exp build/s2-1143pfrn.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfrn.rc | head -1 | cut -d= -f2); \
@@ -5004,7 +5020,7 @@ test-perceus-1117-native-map-pipe-record-leak: $(TARGET) build
 	exp=../examples/perceus/map_pipe_record_leak_1117.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1117mprln 2> build/s2-1117mprln.err \
 	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (native build errored)"; cat build/s2-1117mprln.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1117mprln > build/s2-1117mprln.out 2> build/s2-1117mprln.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1117mprln > build/s2-1117mprln.out 2> build/s2-1117mprln.rc; \
 	diff -q $$exp build/s2-1117mprln.out > /dev/null \
 	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (output diff)"; diff $$exp build/s2-1117mprln.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1117mprln.rc | head -1 | cut -d= -f2); \
@@ -5031,7 +5047,7 @@ test-perceus-1120-array-borrow: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1120ab.c \
 	  || { echo "perceus-1120-array-borrow FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1120ab.c -o build/s2-1120ab $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1120ab > build/s2-1120ab.out 2> build/s2-1120ab.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1120ab > build/s2-1120ab.out 2> build/s2-1120ab.rc; \
 	diff -q $$exp build/s2-1120ab.out > /dev/null \
 	  || { echo "perceus-1120-array-borrow FAIL (output diff)"; diff $$exp build/s2-1120ab.out; exit 1; }; \
 	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1120ab.rc | head -1 | cut -d= -f2); \
@@ -5047,7 +5063,7 @@ test-perceus-1120-array-borrow-native: $(TARGET) build
 	exp=../examples/perceus/array_borrow_read_1120.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1120abn 2> build/s2-1120abn.err \
 	  || { echo "perceus-1120-array-borrow-native FAIL (native build errored)"; cat build/s2-1120abn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1120abn > build/s2-1120abn.out 2> build/s2-1120abn.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1120abn > build/s2-1120abn.out 2> build/s2-1120abn.rc; \
 	diff -q $$exp build/s2-1120abn.out > /dev/null \
 	  || { echo "perceus-1120-array-borrow-native FAIL (output diff)"; diff $$exp build/s2-1120abn.out; exit 1; }; \
 	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1120abn.rc | head -1 | cut -d= -f2); \
@@ -5080,7 +5096,7 @@ test-perceus-1135-vec-value: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1135-vec FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5106,7 +5122,7 @@ test-perceus-1135-vec-value-native: $(TARGET) build
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
 	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1135-vec-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
 	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
 	    || { echo "perceus-1135-vec-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
 	done; \
@@ -5145,7 +5161,7 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec-raw FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1135-vec-raw FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5160,7 +5176,7 @@ test-perceus-1135-vec-raw-native: $(TARGET) build
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
 	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1135-vec-raw-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
 	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
 	    || { echo "perceus-1135-vec-raw-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
 	done; \
@@ -5229,6 +5245,9 @@ test-perceus-1151-vec-push-growth-asan: $(TARGET) build
 # (modcall_linear_1153) and on the idiomatic stdlib surface
 # (vec_module_surface_1153, whose emitted C must also reach the raw
 # record-push fuse the forwarder inline exposes).
+#
+# See the KAI_TRACE_RC note at the head of this file: every recipe
+# reading an RC ledger pins KAI_THREADS=1.
 PERCEUS_1153_FIXTURES := modcall_linear_1153 vec_module_surface_1153
 
 test-perceus-1153-modcall-linear: $(TARGET) build
@@ -5238,7 +5257,7 @@ test-perceus-1153-modcall-linear: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	  grep -q 'vec_inplace=2000 vec_cow=0' build/s2-$$name.rc \
@@ -5255,7 +5274,7 @@ test-perceus-1153-modcall-linear-native: $(TARGET) build
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
 	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1153-modcall-linear-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
 	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
 	    || { echo "perceus-1153-modcall-linear-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
 	  grep -q 'vec_inplace=2000 vec_cow=0' build/s2-$$name-n.rc \
@@ -5305,7 +5324,7 @@ test-perceus-1150-vec-surface: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1150-vec-surface FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1150-vec-surface FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
@@ -5329,7 +5348,7 @@ test-perceus-1150-vec-surface-native: $(TARGET) build
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
 	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1150-vec-surface-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
 	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
 	    || { echo "perceus-1150-vec-surface-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
 	done; \
@@ -5376,7 +5395,7 @@ test-perceus-1126-read-loop-drop: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1126-read-loop-drop FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1126-read-loop-drop FAIL ($$name: output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name.rc | head -1 | cut -d= -f2); \
@@ -5393,7 +5412,7 @@ test-perceus-1126-read-loop-drop-native: $(TARGET) build
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
 	  KAI_BACKEND=native ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
 	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
 	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
 	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
 	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
@@ -5421,7 +5440,7 @@ test-perceus-1127-borrow-closure: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127bc.c \
 	  || { echo "perceus-1127-borrow-closure FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127bc.c -o build/s2-1127bc $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1127bc > build/s2-1127bc.out 2> build/s2-1127bc.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127bc > build/s2-1127bc.out 2> build/s2-1127bc.rc; \
 	diff -q $$exp build/s2-1127bc.out > /dev/null \
 	  || { echo "perceus-1127-borrow-closure FAIL (output diff)"; diff $$exp build/s2-1127bc.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127bc.rc | head -1 | cut -d= -f2); \
@@ -5438,7 +5457,7 @@ test-perceus-1127-borrow-closure-native: $(TARGET) build
 	exp=../examples/perceus/borrow_closure_1127.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1127bcn 2> build/s2-1127bcn.err \
 	  || { echo "perceus-1127-borrow-closure-native FAIL (native build errored)"; cat build/s2-1127bcn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1127bcn > build/s2-1127bcn.out 2> build/s2-1127bcn.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127bcn > build/s2-1127bcn.out 2> build/s2-1127bcn.rc; \
 	diff -q $$exp build/s2-1127bcn.out > /dev/null \
 	  || { echo "perceus-1127-borrow-closure-native FAIL (output diff)"; diff $$exp build/s2-1127bcn.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127bcn.rc | head -1 | cut -d= -f2); \
@@ -5456,7 +5475,7 @@ test-perceus-1127-borrow-hof: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127hof.c \
 	  || { echo "perceus-1127-borrow-hof FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127hof.c -o build/s2-1127hof $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1127hof > build/s2-1127hof.out 2> build/s2-1127hof.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127hof > build/s2-1127hof.out 2> build/s2-1127hof.rc; \
 	diff -q $$exp build/s2-1127hof.out > /dev/null \
 	  || { echo "perceus-1127-borrow-hof FAIL (output diff)"; diff $$exp build/s2-1127hof.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127hof.rc | head -1 | cut -d= -f2); \
@@ -5518,7 +5537,7 @@ test-perceus-1130-borrow-pipe: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130bp.c \
 	  || { echo "perceus-1130-borrow-pipe FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1130bp.c -o build/s2-1130bp $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1130bp > build/s2-1130bp.out 2> build/s2-1130bp.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1130bp > build/s2-1130bp.out 2> build/s2-1130bp.rc; \
 	diff -q $$exp build/s2-1130bp.out > /dev/null \
 	  || { echo "perceus-1130-borrow-pipe FAIL (output diff — pipe-borrow UAF?)"; diff $$exp build/s2-1130bp.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1130bp.rc | head -1 | cut -d= -f2); \
@@ -5551,7 +5570,7 @@ test-perceus-1130-hof-tail-drop: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130htd.c \
 	  || { echo "perceus-1130-hof-tail-drop FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1130htd.c -o build/s2-1130htd $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1130htd > build/s2-1130htd.out 2> build/s2-1130htd.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1130htd > build/s2-1130htd.out 2> build/s2-1130htd.rc; \
 	diff -q $$exp build/s2-1130htd.out > /dev/null \
 	  || { echo "perceus-1130-hof-tail-drop FAIL (output diff)"; diff $$exp build/s2-1130htd.out; exit 1; }; \
 	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1130htd.rc | head -1 | cut -d= -f2); \
@@ -5579,7 +5598,7 @@ test-perceus-1131-borrow-descent: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1131desc.c \
 	  || { echo "perceus-1131-borrow-descent FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1131desc.c -o build/s2-1131desc $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1131desc > build/s2-1131desc.out 2> build/s2-1131desc.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1131desc > build/s2-1131desc.out 2> build/s2-1131desc.rc; \
 	diff -q $$exp build/s2-1131desc.out > /dev/null \
 	  || { echo "perceus-1131-borrow-descent FAIL (output diff)"; diff $$exp build/s2-1131desc.out; exit 1; }; \
 	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1131desc.rc | head -1 | cut -d= -f2); \
@@ -5664,7 +5683,7 @@ test-perceus-1303-single-use-branch-leak: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1303subl.c \
 	  || { echo "perceus-1303-single-use-branch-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1303subl.c -o build/s2-1303subl $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1303subl > build/s2-1303subl.out 2> build/s2-1303subl.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1303subl > build/s2-1303subl.out 2> build/s2-1303subl.rc \
 	  || { echo "perceus-1303-single-use-branch-leak FAIL (crash)"; exit 1; }; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1303subl.out > /dev/null \
 	  || { echo "perceus-1303-single-use-branch-leak FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1303subl.out; exit 1; }; \
@@ -5710,7 +5729,7 @@ test-perceus-1302-tcrec-goto-drops: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1302tgd.c \
 	  || { echo "perceus-1302-tcrec-goto-drops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1302tgd.c -o build/s2-1302tgd $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1302tgd > build/s2-1302tgd.out 2> build/s2-1302tgd.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1302tgd > build/s2-1302tgd.out 2> build/s2-1302tgd.rc \
 	  || { echo "perceus-1302-tcrec-goto-drops FAIL (crash)"; exit 1; }; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1302tgd.out > /dev/null \
 	  || { echo "perceus-1302-tcrec-goto-drops FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1302tgd.out; exit 1; }; \
@@ -5751,7 +5770,7 @@ test-perceus-1302-tcrec-goto-drops-native: $(TARGET) build
 	name=tcrec_goto_owned_binder_1302; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1302tgdn 2> build/s2-1302tgdn.err \
 	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (native build errored)"; cat build/s2-1302tgdn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1302tgdn > build/s2-1302tgdn.out 2> build/s2-1302tgdn.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1302tgdn > build/s2-1302tgdn.out 2> build/s2-1302tgdn.rc \
 	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (crash)"; exit 1; }; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1302tgdn.out > /dev/null \
 	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1302tgdn.out; exit 1; }; \
@@ -5827,7 +5846,7 @@ test-perceus-1315-borrowed-match-release: $(TARGET) build
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	    || { echo "perceus-1315-borrowed-match-release FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc \
 	    || { echo "perceus-1315-borrowed-match-release FAIL ($$name: crash)"; exit 1; }; \
 	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    || { echo "perceus-1315-borrowed-match-release FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
@@ -6063,7 +6082,7 @@ test-perceus-860-native-cons-leak: $(TARGET) build
 	src=../examples/perceus/native_cons_selftail_leak_860.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-860ncl 2> build/s2-860ncl.err \
 	  || { echo "perceus-860-native-cons-leak FAIL (native build errored)"; cat build/s2-860ncl.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-860ncl > build/s2-860ncl.out 2> build/s2-860ncl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-860ncl > build/s2-860ncl.out 2> build/s2-860ncl.rc; \
 	diff -q ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out > /dev/null \
 	  || { echo "perceus-860-native-cons-leak FAIL (output diff)"; diff ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-860ncl.rc | head -1 | cut -d= -f2); \
@@ -6122,7 +6141,7 @@ test-perceus-1048-native-record-leak: $(TARGET) build
 	src=../examples/perceus/native_record_scope_leak_1048.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1048nrl 2> build/s2-1048nrl.err \
 	  || { echo "perceus-1048-native-record-leak FAIL (native build errored)"; cat build/s2-1048nrl.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1048nrl > build/s2-1048nrl.out 2> build/s2-1048nrl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1048nrl > build/s2-1048nrl.out 2> build/s2-1048nrl.rc; \
 	diff -q ../examples/perceus/native_record_scope_leak_1048.out.expected build/s2-1048nrl.out > /dev/null \
 	  || { echo "perceus-1048-native-record-leak FAIL (output diff)"; diff ../examples/perceus/native_record_scope_leak_1048.out.expected build/s2-1048nrl.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1048nrl.rc | head -1 | cut -d= -f2); \
@@ -6149,7 +6168,7 @@ test-perceus-1112-native-discard-decref: $(TARGET) build
 	src=../examples/perceus/native_discard_decref_1112.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1112ndd 2> build/s2-1112ndd.err \
 	  || { echo "perceus-1112-native-discard-decref FAIL (native build errored)"; cat build/s2-1112ndd.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1112ndd > build/s2-1112ndd.out 2> build/s2-1112ndd.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1112ndd > build/s2-1112ndd.out 2> build/s2-1112ndd.rc; \
 	diff -q ../examples/perceus/native_discard_decref_1112.out.expected build/s2-1112ndd.out > /dev/null \
 	  || { echo "perceus-1112-native-discard-decref FAIL (output diff)"; diff ../examples/perceus/native_discard_decref_1112.out.expected build/s2-1112ndd.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1112ndd.rc | head -1 | cut -d= -f2); \
@@ -6175,7 +6194,7 @@ test-perceus-872-native-variant-reuse-leak: $(TARGET) build
 	src=../examples/perceus/native_variant_reuse_leak_872.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-872vrl 2> build/s2-872vrl.err \
 	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native build errored)"; cat build/s2-872vrl.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-872vrl > build/s2-872vrl.out 2> build/s2-872vrl.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-872vrl > build/s2-872vrl.out 2> build/s2-872vrl.rc; \
 	diff -q ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out > /dev/null \
 	  || { echo "perceus-872-native-variant-reuse-leak FAIL (output diff)"; diff ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-872vrl.rc | head -1 | cut -d= -f2); \
@@ -6197,7 +6216,7 @@ test-perceus-1053-native-trmc-spine-reuse: $(TARGET) build
 	src=../examples/perceus/trmc_variant_spine_reuse_1053.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1053sr 2> build/s2-1053sr.err \
 	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (native build errored)"; cat build/s2-1053sr.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1053sr > build/s2-1053sr.out 2> build/s2-1053sr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1053sr > build/s2-1053sr.out 2> build/s2-1053sr.rc; \
 	diff -q ../examples/perceus/trmc_variant_spine_reuse_1053.out.expected build/s2-1053sr.out > /dev/null \
 	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (output diff)"; diff ../examples/perceus/trmc_variant_spine_reuse_1053.out.expected build/s2-1053sr.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1053sr.rc | head -1 | cut -d= -f2); \
@@ -6217,7 +6236,7 @@ test-perceus-1053-nested-rotation-reuse: $(TARGET) build
 	src=../examples/perceus/nested_rotation_reuse_1053.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1053nr 2> build/s2-1053nr.err \
 	  || { echo "perceus-1053-nested-rotation-reuse FAIL (native build errored)"; cat build/s2-1053nr.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1053nr > build/s2-1053nr.out 2> build/s2-1053nr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1053nr > build/s2-1053nr.out 2> build/s2-1053nr.rc; \
 	diff -q ../examples/perceus/nested_rotation_reuse_1053.out.expected build/s2-1053nr.out > /dev/null \
 	  || { echo "perceus-1053-nested-rotation-reuse FAIL (output diff)"; diff ../examples/perceus/nested_rotation_reuse_1053.out.expected build/s2-1053nr.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1053nr.rc | head -1 | cut -d= -f2); \
@@ -6244,7 +6263,7 @@ test-perceus-1104-balance-token-donation: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104btd.c \
 	  || { echo "perceus-1104-balance-token-donation FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1104btd.c -o build/s2-1104btd $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1104btd > build/s2-1104btd.out 2> build/s2-1104btd.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1104btd > build/s2-1104btd.out 2> build/s2-1104btd.rc; \
 	diff -q ../examples/perceus/balance_token_donation_1104.out.expected build/s2-1104btd.out > /dev/null \
 	  || { echo "perceus-1104-balance-token-donation FAIL (output diff)"; diff ../examples/perceus/balance_token_donation_1104.out.expected build/s2-1104btd.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1104btd.rc | head -1 | cut -d= -f2); \
@@ -6268,7 +6287,7 @@ test-perceus-1164-cross-call-donation: $(TARGET) build
 	src=../examples/perceus/balance_token_donation_1104.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1164ccd 2> build/s2-1164ccd.err \
 	  || { echo "perceus-1164-cross-call-donation FAIL (native build errored)"; cat build/s2-1164ccd.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1164ccd > build/s2-1164ccd.out 2> build/s2-1164ccd.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1164ccd > build/s2-1164ccd.out 2> build/s2-1164ccd.rc; \
 	diff -q ../examples/perceus/balance_token_donation_1104.out.expected build/s2-1164ccd.out > /dev/null \
 	  || { echo "perceus-1164-cross-call-donation FAIL (output diff)"; diff ../examples/perceus/balance_token_donation_1104.out.expected build/s2-1164ccd.out; exit 1; }; \
 	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1164ccd.rc | head -1 | cut -d= -f2); \
@@ -6297,7 +6316,7 @@ test-perceus-1104-sibling-param-move: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104spm.c \
 	  || { echo "perceus-1104-sibling-param-move FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1104spm.c -o build/s2-1104spm $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-1104spm > build/s2-1104spm.out 2> build/s2-1104spm.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1104spm > build/s2-1104spm.out 2> build/s2-1104spm.rc; \
 	diff -q ../examples/perceus/balance_sibling_param_move_1104.out.expected build/s2-1104spm.out > /dev/null \
 	  || { echo "perceus-1104-sibling-param-move FAIL (output diff)"; diff ../examples/perceus/balance_sibling_param_move_1104.out.expected build/s2-1104spm.out; exit 1; }; \
 	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1104spm.rc | head -1 | cut -d= -f2); \
@@ -6355,7 +6374,7 @@ test-perceus-1180-range-lazy: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "perceus-1180-range-lazy FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-1180-range-lazy FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/range_step_zero_1180.kai > build/s2-1180-step0.c; \
@@ -6401,7 +6420,7 @@ test-perceus-1180-range-sum: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "perceus-1180-range-sum FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-1180-range-sum FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-$$name.rc | head -1 | cut -d= -f2); \
@@ -6416,7 +6435,7 @@ test-perceus-1180-range-sum-native: $(TARGET) build
 	name=range_lazy_sum_1180; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-nat 2> build/s2-$$name-nat.err \
 	  || { echo "perceus-1180-range-sum-native FAIL (native build errored)"; cat build/s2-$$name-nat.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-$$name-nat > build/s2-$$name-nat.out 2> build/s2-$$name-nat.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-nat > build/s2-$$name-nat.out 2> build/s2-$$name-nat.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out > /dev/null \
 	  || { echo "perceus-1180-range-sum-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-$$name-nat.rc | head -1 | cut -d= -f2); \
@@ -6439,7 +6458,7 @@ test-shape-fusion-1200: $(TARGET) build
 	if grep 'kai_build(100LL' build/s2-$$name.c | grep -q 'kai___pimpl_Sequence_Chain_map('; then \
 	  echo "shape-fusion-1200 FAIL (mapped chain materialised — not fused)"; exit 1; fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "shape-fusion-1200 FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-$$name.rc | head -1 | cut -d= -f2); \
@@ -6652,7 +6671,7 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 	src=../examples/perceus/gap3_balance_minimal.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-882rot 2> build/s2-882rot.err \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native build errored)"; cat build/s2-882rot.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g $(TIMEOUT) 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native run crashed/hung — exit $$?)"; exit 1; }; \
 	diff -q ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out > /dev/null \
 	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (output diff)"; diff ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out; exit 1; }; \
@@ -6691,7 +6710,7 @@ test-perceus-995-native-dead-donor-reuse: $(TARGET) build
 	src=../examples/perceus/native_dead_donor_reuse_995.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995dead 2> build/s2-995dead.err \
 	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native build errored)"; cat build/s2-995dead.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-995dead > build/s2-995dead.out 2> build/s2-995dead.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-995dead > build/s2-995dead.out 2> build/s2-995dead.rc \
 	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native run errored — exit $$?)"; exit 1; }; \
 	diff -q ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out > /dev/null \
 	  || { echo "perceus-995-native-dead-donor-reuse FAIL (output diff)"; diff ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out; exit 1; }; \
@@ -6747,7 +6766,7 @@ test-perceus-1083-variant-spine-free: $(TARGET) build
 	exp=../examples/perceus/variant_spine_free_1083.out.expected; \
 	../bin/kai build --backend=c $$src -o build/s2-1083spine-c 2> build/s2-1083spine.err \
 	  || { echo "perceus-1083-variant-spine-free FAIL (C build errored)"; cat build/s2-1083spine.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1083spine-c > build/s2-1083spine-c.out 2> build/s2-1083spine-c.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083spine-c > build/s2-1083spine-c.out 2> build/s2-1083spine-c.rc \
 	  || { echo "perceus-1083-variant-spine-free FAIL (C run errored — exit $$?)"; exit 1; }; \
 	diff -q $$exp build/s2-1083spine-c.out > /dev/null \
 	  || { echo "perceus-1083-variant-spine-free FAIL (C output diff)"; diff $$exp build/s2-1083spine-c.out; exit 1; }; \
@@ -6758,7 +6777,7 @@ test-perceus-1083-variant-spine-free: $(TARGET) build
 	  || { echo "perceus-1083-variant-spine-free FAIL (C decref_total=$$cdec >= 220000 — teardown pays the per-slot cascade again)"; exit 1; }; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1083spine-n 2> build/s2-1083spine-n.err \
 	  || { echo "perceus-1083-variant-spine-free FAIL (native build errored)"; cat build/s2-1083spine-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1083spine-n > build/s2-1083spine-n.out 2> build/s2-1083spine-n.rc \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083spine-n > build/s2-1083spine-n.out 2> build/s2-1083spine-n.rc \
 	  || { echo "perceus-1083-variant-spine-free FAIL (native run errored — exit $$?)"; exit 1; }; \
 	diff -q $$exp build/s2-1083spine-n.out > /dev/null \
 	  || { echo "perceus-1083-variant-spine-free FAIL (native output diff)"; diff $$exp build/s2-1083spine-n.out; exit 1; }; \
@@ -6791,13 +6810,13 @@ test-native-1083-field-read: $(TARGET) build
 	exp=../examples/perceus/native_field_read.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1083nfr 2> build/s2-1083nfr.err \
 	  || { echo "native-1083-field-read FAIL (native build errored)"; cat build/s2-1083nfr.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1083nfr > build/s2-1083nfr.out 2> build/s2-1083nfr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083nfr > build/s2-1083nfr.out 2> build/s2-1083nfr.rc; \
 	diff -q $$exp build/s2-1083nfr.out > /dev/null \
 	  || { echo "native-1083-field-read FAIL (native output diff)"; diff $$exp build/s2-1083nfr.out; exit 1; }; \
 	./$(TARGET) --path ../stdlib $$src > build/s2-1083nfr-c.c 2> build/s2-1083nfr-c.err \
 	  || { echo "native-1083-field-read FAIL (C build errored)"; cat build/s2-1083nfr-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1083nfr-c.c -o build/s2-1083nfr-c $(LDLIBS_M) ; \
-	KAI_TRACE_RC=1 ./build/s2-1083nfr-c > build/s2-1083nfr-c.out 2> build/s2-1083nfr-c.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083nfr-c > build/s2-1083nfr-c.out 2> build/s2-1083nfr-c.rc; \
 	diff -q build/s2-1083nfr-c.out build/s2-1083nfr.out > /dev/null \
 	  || { echo "native-1083-field-read FAIL (native vs C output diff)"; diff build/s2-1083nfr-c.out build/s2-1083nfr.out; exit 1; }; \
 	nalloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1083nfr.rc | head -1 | cut -d= -f2); \
@@ -6820,13 +6839,13 @@ test-native-static-slot-read: $(TARGET) build
 	exp=../examples/perceus/native_static_slot_read.out.expected; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-nssr 2> build/s2-nssr.err \
 	  || { echo "native-static-slot-read FAIL (native build errored)"; cat build/s2-nssr.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-nssr > build/s2-nssr.out 2> build/s2-nssr.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-nssr > build/s2-nssr.out 2> build/s2-nssr.rc; \
 	diff -q $$exp build/s2-nssr.out > /dev/null \
 	  || { echo "native-static-slot-read FAIL (native output diff)"; diff $$exp build/s2-nssr.out; exit 1; }; \
 	./$(TARGET) --path ../stdlib $$src > build/s2-nssr-c.c 2> build/s2-nssr-c.err \
 	  || { echo "native-static-slot-read FAIL (C build errored)"; cat build/s2-nssr-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-nssr-c.c -o build/s2-nssr-c $(LDLIBS_M) ; \
-	KAI_TRACE_RC=1 ./build/s2-nssr-c > build/s2-nssr-c.out 2> build/s2-nssr-c.rc; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-nssr-c > build/s2-nssr-c.out 2> build/s2-nssr-c.rc; \
 	diff -q build/s2-nssr-c.out build/s2-nssr.out > /dev/null \
 	  || { echo "native-static-slot-read FAIL (native vs C output diff)"; diff build/s2-nssr-c.out build/s2-nssr.out; exit 1; }; \
 	nalloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-nssr.rc | head -1 | cut -d= -f2); \
@@ -6964,7 +6983,7 @@ test-native-test-runner-950: $(TARGET) build
 	  || { echo "native-test-runner-950 FAIL (C output diff)"; diff $$gold build/s2-950tr-c.out; exit 1; }; \
 	[ "$$cexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (C exit $$cexit != 1)"; exit 1; }; \
 	nexit=0; \
-	KAI_TRACE_RC=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
 	grep -E '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.rc 2>/dev/null || true; \
 	grep -vE '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.out 2>/dev/null || true; \
 	diff -q $$gold build/s2-950tr-n.out > /dev/null \
@@ -8127,7 +8146,7 @@ test-rc-trace-callsite: $(TARGET) build
 	@set -e; \
 	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/rc_trace_callsite.kai > build/rc_trace_callsite.c; \
 	$(CC) $(CFLAGS) -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/rc_trace_callsite.c -o build/rc_trace_callsite-c $(LDLIBS_M) ; \
-	./build/rc_trace_callsite-c > build/rc_trace_callsite.out 2> build/rc_trace_callsite.err; \
+	KAI_THREADS=1 ./build/rc_trace_callsite-c > build/rc_trace_callsite.out 2> build/rc_trace_callsite.err; \
 	diff -q ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out > /dev/null \
 	  || { echo "rc-trace-callsite STDOUT DIFF"; diff ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out; exit 1; }; \
 	grep -q "top sites by leak" build/rc_trace_callsite.err \

@@ -513,9 +513,9 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
 
 **Shipped ahead of the original schedule** (both were listed here as
 post-Orongo): the multi-thread scheduler — M:N work-stealing, sends
-copied at thread crossings so object RC stays atomics-free,
-`KAI_THREADS=N` opt-in with the default flip pending reactor
-multi-scheduler maturity (`docs/mn-scheduler-design.md`) — and the
+copied at thread crossings so object RC stays atomics-free, on by
+default since the F3 flip, with `KAI_THREADS=1` kept as a
+byte-identical escape hatch (`docs/mn-scheduler-design.md`) — and the
 region machinery (kind `Region`, trees-in-arena on both backends;
 generational escape still open).
 

@@ -146,7 +146,7 @@ One real interaction to pin: `ucontext_t` on some platforms saves the signal mas
 
 ## 7. Rollout / gating
 
-**Position: `KAI_THREADS=N` env var, default `1`, byte-identical to today at `N=1`; flip default to `N=ncpu` only after the full gate ladder is green; new CI tiers for TSAN, messaging stress, and test determinism.**
+**Position: `KAI_THREADS=N` env var, byte-identical to the pre-M:N runtime at `N=1`; flip default to `N=ncpu` only after the full gate ladder is green; new CI tiers for TSAN, messaging stress, and test determinism.** The ladder went green and the default is `ncpu` (§9 F3); `KAI_THREADS=1` remains the escape hatch below.
 
 - **`KAI_THREADS=1` is the compatibility floor and the primary regression gate.** At `N=1`: one scheduler thread + one reactor thread, always-same-thread sends (never copy, pointer-enqueue as today), no steals. This must be **byte-identical** to the pre-lane runtime on every existing fixture. It is the proof that the partitioning did not change single-thread semantics. This is the gate that lets the lane land incrementally without risking the shipped runtime.
 - **New CI:**
@@ -193,8 +193,21 @@ Scope: reactor's ready-handback routes to the owning scheduler thread + wakes th
 - **Gate:** an I/O-heavy multi-fiber bench (N concurrent socket clients + M CPU actors) at `N=ncpu` shows both I/O progress and CPU parallelism (neither starves). TSAN-clean including the reactor-to-scheduler handoff. Determinism gate on all `kai test` fixtures.
 - **Why after F1:** the reactor handoff is only interesting once there are multiple schedulers to hand back *to*.
 
-### F3 — Default `N=ncpu`, case-3 won
-Scope: flip `KAI_THREADS` default to `ncpu`. Update `docs/fibers-honesty-targets.md` (Tier 3 multi-thread → shipped), `docs/memory-model.md`, and the kaikai-vs-rust comparison (case 3 flips from "kaikai's actor is serial" to "kaikai parallelises the actor across cores with no `Send`/`Sync` cost").
+### F3 — Default `N=ncpu`, case-3 won ✅ shipped
+Shipped. Unset `KAI_THREADS` resolves to the host CPU count (from the
+affinity mask where one exists), capped at 32 for the implicit default;
+an explicit value still reaches `KAI_MAX_THREADS-1`, and `KAI_THREADS=1`
+stays the byte-identical escape hatch. Gate met: determinism green on
+the unset arm, self-host byte-identical while itself running
+multi-threaded, demo corpus at parity with N=1, and
+`benchmarks/mn-throughput/` as the case-3 artifact (3.5–3.9x over
+Elixir 1.20.2/OTP29 on the C backend, 1.7–1.8x native, 10.5x on 16
+cores). One thing the flip exposed and fixed: the fiber running
+`kai_main` was inheriting the 64 KiB fiber stack default, so the thread
+count silently decided a program's main stack budget; it now sizes off
+`RLIMIT_STACK`.
+
+Original scope: flip `KAI_THREADS` default to `ncpu`. Update `docs/fibers-honesty-targets.md` (Tier 3 multi-thread → shipped), `docs/memory-model.md`, and the kaikai-vs-rust comparison (case 3 flips from "kaikai's actor is serial" to "kaikai parallelises the actor across cores with no `Send`/`Sync` cost").
 - **Gate:** the full ladder green under soak; the flip is one-line-revertible via `KAI_THREADS=1`. Publish the multi-core actor bench as the case-3 artifact.
 
 Each phase's gate is binary — byte-parity, TSAN-clean, a speedup number, a no-regression number — so a phase that goes wrong *shows* and reverts. No phase depends on a time estimate; each depends only on the prior phase's soundness gate being green.
