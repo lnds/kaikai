@@ -62,7 +62,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>      /* sched_getaffinity() — CPU count for the KAI_THREADS default */
 #include <sys/mman.h>
+#include <sys/resource.h>  /* getrlimit(RLIMIT_STACK) — stack budget for the kai_main fiber */
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -12565,6 +12567,26 @@ static size_t kai_fiber_stack_size(void) {
     return cached;
 }
 
+/* Stack budget for the fiber that runs kai_main. It is not an ordinary
+ * fiber: at one thread main runs directly on the OS thread stack, and at
+ * N>1 it runs as a fiber — so handing it the 64 KiB fiber default would
+ * make the thread count decide whether a deeply recursive program
+ * survives. Track the main thread instead (RLIMIT_STACK, floored at the
+ * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
+ * still win. */
+static size_t kai_main_fiber_stack_size(void) {
+    size_t sz = 8 * 1024 * 1024;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0
+        && rl.rlim_cur != RLIM_INFINITY
+        && (size_t) rl.rlim_cur > sz) {
+        sz = (size_t) rl.rlim_cur;
+    }
+    if (sz > 64 * 1024 * 1024) sz = 64 * 1024 * 1024;
+    size_t fiber = kai_fiber_stack_size();
+    return fiber > sz ? fiber : sz;
+}
+
 /* SIGSEGV / SIGBUS handler for fiber stack overflow. The fault lands
  * on the active fiber's guard page (PROT_NONE); we print a diagnostic
  * and re-raise with the default disposition. Faults outside any guard
@@ -14107,13 +14129,17 @@ static void kai_monitor_propagate_terminate(KaiFiber *self);
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-static void kai_fiber_init_ctx(KaiFiber *f) {
+static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for new fiber\n");
         exit(1);
     }
-    f->stack_size = kai_fiber_stack_size();
+    {
+        size_t ps = kai_page_size();
+        if (stack_size % ps != 0) stack_size = ((stack_size / ps) + 1) * ps;
+    }
+    f->stack_size = stack_size;
     /* Allocate stack + one guard page below it. Stack grows down on
      * x86_64 / arm64, so the lowest address is the overflow target.
      * stack_base points at the guard; the usable region starts one
@@ -14141,6 +14167,10 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
     f->ctx.uc_stack.ss_size = f->stack_size;
     f->ctx.uc_link          = kai_uc_link_target();
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
+}
+
+static void kai_fiber_init_ctx(KaiFiber *f) {
+    kai_fiber_init_ctx_sized(f, kai_fiber_stack_size());
 }
 
 /* ==================================================================
@@ -14764,12 +14794,39 @@ static void *kai_reactor_thread_main(void *arg) {
     }
 }
 
-/* Parse KAI_THREADS. Default 1 (byte-identical). "0" or unset → 1;
- * a positive count is clamped to [1, KAI_MAX_THREADS-1] so the reactor
- * thread's id (kai_nthreads) stays a valid slot index. */
+/* CPUs this process may actually run on. sysconf reports the whole
+ * machine, which over-subscribes a process pinned by an affinity mask
+ * (containers, CI runners), so the mask wins where it exists. */
+static int kai_host_ncpu(void) {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int) n : 1;
+}
+
+/* Ceiling on the *implicit* default only. Past this the per-process cost
+ * of spawning workers outgrows the scaling they buy, and a short-lived
+ * program on a many-core host pays it for nothing. An explicit
+ * KAI_THREADS is honoured up to KAI_MAX_THREADS-1. */
+#define KAI_DEFAULT_MAX_THREADS 32
+
+/* Parse KAI_THREADS. Unset → the host CPU count (capped); an explicit
+ * value wins, with "0"/"1"/garbage → 1, the single-thread escape hatch.
+ * Any count is clamped to [1, KAI_MAX_THREADS-1] so the reactor thread's
+ * id (kai_nthreads) stays a valid slot index. */
 static int kai_read_nthreads(void) {
     const char *e = getenv("KAI_THREADS");
-    if (!e || !*e) return 1;
+    if (!e || !*e) {
+        int n = kai_host_ncpu();
+        if (n > KAI_DEFAULT_MAX_THREADS) n = KAI_DEFAULT_MAX_THREADS;
+        if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
+        return n < 1 ? 1 : n;
+    }
     long n = strtol(e, NULL, 10);
     if (n <= 1) return 1;
     if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
@@ -14817,12 +14874,14 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     kai_main_fiber.home_thread = 0;
     kai_sched_slots[0].live = 1;
 
-    /* Spawn kai_main as a fiber on thread 0's deque. */
+    /* Spawn kai_main as a fiber on thread 0's deque. It gets a main-thread
+     * stack, not a fiber one: raising the thread count must not shrink the
+     * stack budget a working program already had. */
     KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!root) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     root->home_thread = 0;
     root->evidence_top = NULL;
-    kai_fiber_init_ctx(root);
+    kai_fiber_init_ctx_sized(root, kai_main_fiber_stack_size());
     /* Re-point its makecontext entry from the generic trampoline to the
      * bootstrap trampoline (kai_fiber_init_ctx installed the former). */
 #if defined(__APPLE__) || defined(__clang__)

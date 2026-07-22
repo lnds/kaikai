@@ -63,8 +63,9 @@ spawn/install surface:
 
 ## Parallelism
 
-Actors run in parallel across OS threads with `KAI_THREADS=N`
-(default 1; no code changes — see `kai info fibers` §*Parallelism*).
+Actors run in parallel across OS threads by default — as many as the
+host has cores, `KAI_THREADS=N` to override (see `kai info fibers`
+§*Parallelism*).
 The actor guarantee holds at any N: one mailbox, processed serially;
 messages that cross a thread boundary are copied, so no actor ever
 observes shared mutation.
