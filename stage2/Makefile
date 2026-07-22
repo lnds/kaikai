@@ -1167,6 +1167,13 @@ endif
 # which runs the loop zero times and passes vacuously.
 MN_INVARIANT_ITERS ?= 20
 
+# Repeats for the trampoline-tail identity fixture inside test-effects. The
+# window is narrow (~1 run in 4 unfixed) and each run costs a few ms, so the
+# count buys a decisive signal for free. Deliberately OUTSIDE the KAI_LLVM
+# guard below for the same reason as MN_INVARIANT_ITERS above: test-effects
+# is unconditional, and an unset count makes the gate pass vacuously.
+MN_TAIL_STEAL_ITERS ?= 40
+
 ifeq ($(KAI_LLVM),1)
 # Issue #1234 — M:N native soundness. The work-stealing TLS-hoist miscompile is
 # NATIVE-only (the C backend + TSAN gates are sound and never saw it, which is
@@ -1176,11 +1183,6 @@ ifeq ($(KAI_LLVM),1)
 # KAI_THREADS=4 and 8 — a sound runtime crashes 0 times every run. Self-skips on
 # a C-only kaic2. Rides tier1-native (needs the libLLVM native backend).
 MN_SOUNDNESS_ITERS ?= 40
-
-# Repeats for the trampoline-tail identity fixture inside test-effects. The
-# window is narrow (~1 run in 4 unfixed) and each run costs a few ms, so the
-# count buys a decisive signal for free.
-MN_TAIL_STEAL_ITERS ?= 40
 
 test-mn-native-soundness: $(TARGET)
 	@../tools/run-mn-native-soundness.sh $(MN_SOUNDNESS_ITERS)
@@ -3359,15 +3361,18 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  bad=0; \
+	  bad=0; ran=0; \
 	  for r in $$(seq 1 $(MN_TAIL_STEAL_ITERS)); do \
+	    ran=$$((ran+1)); \
 	    KAI_THREADS=8 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	      || { bad=$$((bad+1)); continue; }; \
 	    cmp -s $$exp_out build/s2-$$name.out || bad=$$((bad+1)); \
 	  done; \
+	  test "$$ran" -gt 0 \
+	    || { echo "effects FAIL $$name (gate ran 0 iterations — MN_TAIL_STEAL_ITERS is unset or empty)"; exit 1; }; \
 	  test "$$bad" = 0 \
-	    && echo "effects OK $$name (trampoline tail keeps fiber identity across a steal: $(MN_TAIL_STEAL_ITERS)/$(MN_TAIL_STEAL_ITERS) clean at KAI_THREADS=8)" \
-	    || { echo "effects FAIL $$name ($$bad of $(MN_TAIL_STEAL_ITERS) bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
+	    && echo "effects OK $$name (trampoline tail keeps fiber identity across a steal: $$ran/$$ran clean at KAI_THREADS=8)" \
+	    || { echo "effects FAIL $$name ($$bad of $$ran bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/mn_cross_thread_scalar_share.kai \
 	         ../examples/effects/mn_await_result_share.kai \
