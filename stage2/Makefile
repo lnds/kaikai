@@ -6856,10 +6856,10 @@ test-native-purity-attrs: $(TARGET) build
 	./build/s2-purity > build/s2-purity.out 2>&1; \
 	diff -q $$exp build/s2-purity.out > /dev/null \
 	  || { echo "native-purity FAIL (native output diff)"; diff $$exp build/s2-purity.out; exit 1; }; \
-	hgrp=$$(grep -oE 'define i64 @heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	hgrp=$$(grep -oE 'define (internal )?i64 @heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$hgrp = \{ nounwind memory\(none\) \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (heavy $$hgrp not nounwind memory(none))"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
-	ngrp=$$(grep -oE 'define ptr @noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	ngrp=$$(grep -oE 'define (internal )?ptr @noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$ngrp = \{ nounwind \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (noisy $$ngrp should be nounwind only)"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
 	if grep -q 'willreturn' build/s2-purity.ll; then echo "native-purity FAIL (willreturn stamped)"; exit 1; fi; \
