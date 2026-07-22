@@ -82,7 +82,30 @@ FIXTURES=(
   "examples/effects/mn_cross_thread_scalar_share.kai"
   "examples/effects/mn_await_result_share.kai"
   "examples/effects/mn_str_intern_race.kai"
+  # A printed line's payload and its trailing newline are separate stdio
+  # calls; the pair must land atomically when fibers print from different
+  # scheduler threads. Cross-fiber order is unspecified, so this fixture is
+  # judged on the line multiset below — a torn line (fused payload + stray
+  # empty line) still breaks it.
+  "examples/effects/mn_print_line_atomic_hammer.kai"
 )
+
+# Fixtures judged on the SORTED line multiset instead of the exact byte
+# sequence: same lines, exactly once each, any order.
+MULTISET_FIXTURES=(
+  "examples/effects/mn_print_line_atomic_hammer.kai"
+)
+
+is_multiset() {
+  local f
+  for f in "${MULTISET_FIXTURES[@]}"; do [ "$f" = "$1" ] && return 0; done
+  return 1
+}
+
+# $1=run-output $2=comparison-ref (pre-sorted for multiset fixtures) $3=src
+same_output() {
+  if is_multiset "$3"; then sort "$1" | cmp -s - "$2"; else cmp -s "$1" "$2"; fi
+}
 
 # kai: the shipped build path (separate -O0 scheduler owner).
 # single-tu-O2: emitted C as one TU, the stage2 Makefile's own path.
@@ -117,6 +140,8 @@ for src in "${FIXTURES[@]}"; do
     ref="$TMP/ref.out"
     kai_timeout "$RUN_TIMEOUT" env KAI_THREADS=1 "$bin" >"$ref" 2>/dev/null \
       || { echo "FAIL $tag: reference run at N=1 did not complete"; fail=1; continue; }
+    refcmp="$ref"
+    if is_multiset "$src"; then sort "$ref" >"$TMP/ref.sorted"; refcmp="$TMP/ref.sorted"; fi
 
     # `default` is the unset arm: KAI_THREADS absent resolves to the host
     # CPU count, so it is what a user actually runs. Gating only the
@@ -135,7 +160,7 @@ for src in "${FIXTURES[@]}"; do
           [ -n "$witness" ] || witness="$(head -1 "$TMP/run.err")"
         elif [ ! -s "$TMP/run.out" ]; then
           empty=$((empty+1))
-        elif ! cmp -s "$TMP/run.out" "$ref"; then
+        elif ! same_output "$TMP/run.out" "$refcmp" "$src"; then
           diverge=$((diverge+1))
           [ -n "$witness" ] || witness="got '$(witness_of "$TMP/run.out")'"
         else
