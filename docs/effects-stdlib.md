@@ -704,11 +704,10 @@ Runtime-installed around `main` when `Clock` is in the row.
   > `CLOCK_MONOTONIC`. The scheduler's `poll()` loop blocks with
   > the deadline-derived timeout and resumes every fiber whose
   > deadline has fired in a single drain. Pre-R1 the op blocked
-  > the OS thread inside `nanosleep`. Cancel mid-sleep still does
-  > NOT unwind the op — the wake source is the timer fire, not a
-  > Cancel signal — but the cancel pad fires at the next yield-
-  > point after resume. The cancel-aware mid-sleep redesign is R2
-  > territory in Orongo.
+  > the OS thread inside `nanosleep`. A `Spawn.cancel` delivered
+  > mid-sleep detaches the target from the timer wheel and unparks
+  > it directly, so the fiber wakes on the cancel rather than
+  > waiting for its deadline (`examples/effects/issue_679_cancel_reaches_parked.kai`).
 
 The handler never short-circuits; clock ops always resume.
 
