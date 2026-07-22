@@ -51,12 +51,38 @@ pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fns: [KFn]) : Uni
 # clause) without re-matching the KIR kind everywhere.
 pub type NFnAbi = NFnNormal | NFnLambda | NFnClause
 
+# Demote a root-private named user fn to internal linkage. A `mo = None`
+# `KFnNormal` (other than the entry `main`) is reachable only inside its own
+# partition — leaves and the split core reach a user fn through the proto
+# table / closure thunk by POINTER, never by symbol — so its bare source name
+# need not be link-visible. Left external, that bare name overrides a libc or
+# runtime symbol the C owner TU calls: issue #1380 was a user `fn read`
+# shadowing POSIX `read`, into which the reactor thread's filepool drain jumped
+# at KAI_THREADS>1 (native-only, since the whole-program path already
+# internalises all-but-entry after the runtime-bc merge; the modular/split root
+# emits raw so cross-TU stdlib calls keep external linkage). Lambdas, clauses
+# and FFI shims are excluded: their names are already decorated (no libc clash)
+# and a thunk can be referenced across the split pair.
+fn nfn_internalize_private(f: KFn, abi: NFnAbi, fnval: Handle) : Unit = match abi {
+  NFnNormal -> match f.mo {
+    None    -> if f.sym == "main" { () } else { nfn_mark_internal(fnval) }
+    Some(_) -> ()
+  }
+  _ -> ()
+}
+
+# The prim returns a handle-typed placeholder under kaic1's minimal typer, so
+# bind-and-discard (the `let _x = <prim>` shape the attribute stamps use) keeps
+# it out of statement position and returns `Unit`.
+fn nfn_mark_internal(fnval: Handle) : Unit = { let _il = llvm_set_internal_linkage(fnval); () }
+
 # Lower one fn. A normal fn takes its params directly (`ptr (ptr × n)`); a
 # lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)`; a clause
 # takes `ptr (ptr self, <args ptr>, ptr k)`. The block-building + alloca
 # prologue are identical; only the LLVM signature + the param seed differ.
 fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = {
   let fnval = nemit_declare_for_abi(ctx, f, abi)
+  nfn_internalize_private(f, abi, fnval)
   native_ctx_begin_fn(ctx, fnval)
   # DWARF (#500): open this fn's DISubprogram (the location scope every
   # statement attaches to) at the fn's first source line. A no-op when DI

@@ -15,8 +15,8 @@
  * so it already defines `main` + every other `kaix_*`. It lacks ONLY these
  * libLLVM prims, because `runtime_llvm.bc` is generated WITHOUT `-DKAI_LLVM`
  * (gen-runtime-bc.sh). Compiling all of `runtime_llvm.c` here would
- * duplicate `main` + the whole runtime; this TU carries the missing 88
- * symbols alone.
+ * duplicate `main` + the whole runtime; this TU carries the missing
+ * libLLVM-prim symbols alone.
  *
  * Only meaningful under `-DKAI_LLVM` (the whole `runtime.h` LLVM block is
  * `#ifdef KAI_LLVM`); without it this file is empty. Kept in lockstep with
@@ -39,6 +39,7 @@ KaiValue * kaix_core_llvm_add_sret_call(void *m, void *call, void *sty) { return
 KaiValue * kaix_core_llvm_add_sret_decl(void *m, void *fn, void *sty) { return kai_llvm_add_sret_decl(m, fn, sty); }
 KaiValue * kaix_core_llvm_add_nounwind(void *fn) { return kai_llvm_add_nounwind(fn); }
 KaiValue * kaix_core_llvm_add_memory_none(void *fn) { return kai_llvm_add_memory_none(fn); }
+KaiValue * kaix_core_llvm_set_internal_linkage(void *fn) { return kai_llvm_set_internal_linkage(fn); }
 void * kaix_core_llvm_append_block(void *m, void *fn, KaiValue *name) { return kai_llvm_append_block(m, fn, name); }
 void * kaix_core_llvm_array_type(void *elem, int64_t n) { return kai_llvm_array_type(elem, n); }
 KaiValue * kaix_core_llvm_buf_free(void *buf) { return kai_llvm_buf_free(buf); }

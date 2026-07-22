@@ -16342,6 +16342,16 @@ static KaiValue *kai_llvm_add_memory_none(void *fn) {
     kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "memory", 6, 0);
     return kai_unit();
 }
+/* Demote a DEFINED function to internal linkage. The modular/split root
+ * partitions emit user fns raw (external) so cross-TU stdlib calls link; a
+ * root-private user fn keeps a bare source name, which then overrides a libc
+ * or runtime symbol the C owner TU calls (issue #1380: a user `fn read`
+ * shadowed POSIX `read`). The emitter calls this on those fns so their name
+ * stops participating in link-wide resolution. */
+static KaiValue *kai_llvm_set_internal_linkage(void *fn) {
+    LLVMSetLinkage((LLVMValueRef) fn, LLVMInternalLinkage);
+    return kai_unit();
+}
 /* The target C-ABI class of the native backend's default triple: 1 =
  * AArch64 (AAPCS64), 2 = x86-64 SysV, 0 = anything else (the emitter keeps
  * the honest struct-by-value reject there). Read once at module build; the
@@ -17610,6 +17620,7 @@ static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *s) { (void) m; 
 static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (void) c; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_nounwind(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_memory_none(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_set_internal_linkage(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
 /* Silent (no abort): the driver probes this to decide whether the split
  * core-object cache can engage; "" means it cannot on a C-only kaic2. */
