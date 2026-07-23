@@ -1,0 +1,121 @@
+#[doc("Native (libLLVM) inline codegen for a fixed-width `Vec[t]<n>` — a flat, header-less `[n x elem]` aggregate, no dynamic `Vec`.")]
+# The KIR lowering plants a `__fixed_vec_lit@<elem>@<n>` handle binder and a
+# `__fixed_vec_get@<elem>@<n>` static read (kir_lower_walk). This module turns
+# them into IR: the literal allocas an `[n x elem]` array and stores each
+# element raw (returning the array pointer, the header-less value); the read
+# GEPs the static element and re-boxes it. No `vec_reserve`/`vec_push`/
+# `vec_get` — mirroring the C backend's inline `KaiFixedVec_<elem>_<n>`.
+#
+# HAZARD (#923): an LLVM `Type*`/`Value*` handle must never live in a `let`
+# binder unless its RHS is a native-prim call (kaic1 excludes only those from
+# the type-blind RC regime — a kaikai-fn result in a binder gets refcounted
+# and corrupts the raw pointer). So an element-type handle (`nfixed_elem_ty`,
+# a plain fn) is only ever passed INLINE as a prim-call argument, never bound;
+# an `arrty` from `llvm_array_type` (a prim call) is safe to bind. The
+# `[n x elem]` type is rebuilt on demand (LLVM dedups, so write and read
+# agree). Perceus already left the fixed-vec binder hands-off.
+
+import compiler.util
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+
+# `true` iff `nm` is a fixed-vec inline prim the emitter handles here.
+pub fn nprim_is_fixed_vec(nm: String) : Bool =
+  string_starts_with_q(nm, "__fixed_vec_lit@") or string_starts_with_q(nm, "__fixed_vec_get@")
+
+#[doc("Emit a fixed-vec inline prim: the literal yields the `[n x elem]` array pointer, the read yields a re-boxed element.")]
+pub fn nemit_fixed_vec_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
+  if string_starts_with_q(nm, "__fixed_vec_lit@") {
+    nemit_fixed_vec_lit(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_lit@"), cargs)
+  } else {
+    nemit_fixed_vec_get(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get@"), cargs)
+  }
+
+# `<elem-tag>@<n>` decoded from the prim name into `(elem-tag, n)`.
+type FVSpec = FVSpec(String, Int)
+
+fn fixed_vec_prim_spec(nm: String, prefix: String) : FVSpec = {
+  let rest = string_slice(nm, string_length(prefix), string_length(nm) - string_length(prefix))
+  let at = string_index_of_char(rest, '@')
+  if at < 0 { FVSpec(rest, 0) }
+  else {
+    let tag = string_slice(rest, 0, at)
+    let ndig = string_slice(rest, at + 1, string_length(rest) - (at + 1))
+    FVSpec(tag, decode_int(ndig))
+  }
+}
+
+# `[e0, ..., en]` → an entry-block `[n x elem]` alloca, each element stored
+# raw at its GEP; the array pointer is the value (a handle slot binds it).
+fn nemit_fixed_vec_lit(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Console = match spec {
+  FVSpec(tag, _) -> {
+    let arrty = llvm_array_type(nfixed_elem_ty(ctx, tag), list_length(cargs))
+    let slot  = llvm_build_alloca_entry(ctx, arrty, "fixedvec")
+    nfixed_store_elems(ctx, arrty, slot, tag, cargs, 0)
+    slot
+  }
+}
+
+fn nfixed_store_elems(ctx: Handle, arrty: Handle, slot: Handle, tag: String, es: [KVal], i: Int) : Unit / Console = match es {
+  []           -> ()
+  [e, ...rest] -> {
+    let raw = nemit_atom_raw(ctx, e, nfixed_elem_slot(tag))
+    let dst = llvm_build_array_gep(native_ctx_b(ctx), arrty, slot, llvm_const_i32(native_ctx_i32t(ctx), i))
+    let _s  = llvm_build_store(native_ctx_b(ctx), raw, dst)
+    nfixed_store_elems(ctx, arrty, slot, tag, rest, i + 1)
+  }
+}
+
+# `v[k]` → the base array pointer, a static-index GEP + raw load, re-boxed at
+# the element constructor. The typer proved `k` in range (no bounds check).
+fn nemit_fixed_vec_get(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Console = match spec {
+  FVSpec(tag, n) -> match cargs {
+    [base, idx] -> {
+      let arrty = llvm_array_type(nfixed_elem_ty(ctx, tag), n)
+      let ptr   = nemit_atom(ctx, base)
+      let gep   = llvm_build_array_gep(native_ctx_b(ctx), arrty, ptr, nfixed_idx_val(ctx, idx))
+      let raw   = llvm_build_load(native_ctx_b(ctx), nfixed_elem_ty(ctx, tag), gep)
+      nfixed_box(ctx, tag, raw)
+    }
+    _ -> nemit_null(ctx)
+  }
+}
+
+fn nfixed_idx_val(ctx: Handle, idx: KVal) : Handle / Console = match idx {
+  KIntV(k) -> llvm_const_i32(native_ctx_i32t(ctx), k)
+  _        -> llvm_const_i32(native_ctx_i32t(ctx), 0)
+}
+
+# The scalar LLVM type of one element, by tag. Only ever passed inline to a
+# prim call (never bound — see the HAZARD note).
+fn nfixed_elem_ty(ctx: Handle, tag: String) : Handle =
+  if tag == "Real" { native_ctx_f64t(ctx) }
+  else if tag == "Int" or tag == "UInt64" { native_ctx_i64t(ctx) }
+  else { native_ctx_i32t(ctx) }
+
+# The raw KSlot the element atom lowers to (drives `nemit_atom_raw`).
+fn nfixed_elem_slot(tag: String) : KSlot =
+  if tag == "Real" { SReal }
+  else if tag == "Int" { SInt64 }
+  else if tag == "Bool" { SBool }
+  else if tag == "Char" { SChar }
+  else if tag == "Byte" { SByte }
+  else if tag == "Int32" { SInt32T }
+  else if tag == "UInt32" { SUInt32 }
+  else if tag == "UInt64" { SUInt64 }
+  else { SInt64 }
+
+# Re-box one raw element by its constructor, mirroring the C backend's box of
+# a `.a[k]` load.
+fn nfixed_box(ctx: Handle, tag: String, raw: Handle) : Handle / Console =
+  if tag == "Real" { ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), raw) }
+  else if tag == "Int" { ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw) }
+  else if tag == "Bool" { ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), raw) }
+  else if tag == "Char" { ncall_sig1(ctx, "kaix_char", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), raw) }
+  else if tag == "Byte" { ncall_sig1(ctx, "kaix_byte", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), raw) }
+  else if tag == "Int32" { ncall_sig1(ctx, "kaix_int32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw) }
+  else if tag == "UInt32" { ncall_sig1(ctx, "kaix_uint32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw) }
+  else if tag == "UInt64" { ncall_sig1(ctx, "kaix_uint64", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw) }
+  else { ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), raw) }
