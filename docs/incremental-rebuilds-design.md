@@ -203,3 +203,65 @@ both paths" — the modular fold *and* `efn_resolve`); and **(c)** confirming th
 `TypecheckedModule.typed` blob a cache hit restores is byte-identical to a fresh
 infer's output, so the whole-program monomorph that always runs downstream sees
 no skew (the #1298 byte-identical-C property is the test to preserve).
+
+## Resolutions
+
+The foundation lane settled all three. The load-bearing observation is that the
+typed artifact is read two ways, with *opposite* serialization requirements:
+as the input to the **interface hash** it must be canonical (logically-equal
+interfaces must produce identical bytes), while as the input to **monomorph** it
+only needs round-trip fidelity. Splitting those two treatments is what keeps the
+canonicalization surface small enough to verify.
+
+**(a) Canonical serialization — resolved.** The interface hash is taken over a
+canonical rendering of the delta (`mdelta_canon_bytes`, `cache_delta.kai`):
+
+- *Var renumbering.* `TyVarT` ids, row tails, and `TyShapeApp` heads are numbered
+  by HM in inference-visit order, which is not stable across builds. Every var id
+  is remapped to its first-appearance index under a fixed structural walk before
+  hashing, so two schemes equal up to renaming render identically.
+- *Table order.* Each of the 8 tables is rendered sorted by a stable name key, so
+  insertion order never perturbs the hash. Compound keys (`op_to_eff`,
+  `constructors`) length-prefix their first field so two different splits of the
+  same characters cannot collide.
+- *Spans stay in.* A predicate `Expr` carried by `TyRefineT` keeps its span in the
+  canonical form. Including it can only *over*-invalidate — a needless miss, never
+  a stale hit — which is the sound side of the trade.
+
+Canonicalization applies to the hash **only**. A persisted typed blob keeps its
+original ids, because round-trip fidelity and interface identity are different
+properties and conflating them would put the harder proof obligation on both.
+
+**(b) Cross-module tables — whole-program invalidation (the conservative cut).**
+Effect aliases, transparent type aliases, and `proto_impls` stay *outside* the
+interface hash; any change to them invalidates every module's typed entry
+instead. They are threaded around the fold, so a fine-grained cut would have to
+model how each one reaches an importer's inference — and a fine cut that misses
+is a stale-interface hit, the one unsound failure mode. A coarse cut that never
+misses is correct; the finer attribution is an optimization to earn later, gated
+on the same hash contract. This makes the module key
+`hash(source) + hash(dep interfaces) + hash(cross-module tables)`: dropping that
+third term is exactly how a change to `proto_impls` would silently invalidate
+nothing.
+
+**(c) Byte-identity — the gate, not an assumption.** The property is a claim
+about the *codec*, not about the key: a matching key proves the inputs are the
+same, it does not prove that deserializing a blob reconstructs what a fresh
+infer produced. So it is gated directly. `examples/cache/typedc_iface_hash_gates.sh`
+runs the `Ty`/`TyScheme` round-trip plus the hash's determinism (order- and
+renumber-invariance), sensitivity (a changed scheme moves the hash), and
+idempotence. The end-to-end form of the gate — cold vs cache-hit emitting
+byte-identical C for a whole package — lands with the module cut itself, since
+there is no cache hit to compare until a hit exists.
+
+### What this lane shipped, and what it did not
+
+Shipped: the typed codec (`Ty` / `Row` / `TyScheme` / the 8 delta tables) and the
+canonical interface hash with its gates — the prerequisite the whole design rests
+on. **Not** shipped: serialization of the full `TypecheckedModule.typed`
+contribution, and the per-module driver restructure that would turn the hash into
+an actual rebuild cut. The front-end today still runs whole-program: the driver
+hands the typer one flattened post-cascade decl stream, so cutting per module
+means restructuring the passes between `expand_imports` and inference. That is
+tracked as follow-up work; until it lands, `mdelta_iface_hash` computes the right
+value but nothing consults it to skip work yet.
