@@ -114,6 +114,12 @@ while any surface change misses safely.
   builds of a program using generics + a protocol impl + a user
   effect + units; a different toolchain id misses; a body-only edit
   hits; adding an impl misses; a `--test` build skips the cache.
+- `corec_cspec_span_free_key.sh` — a body edit that adds a
+  HOF-with-lambda call (`list.map([..], (x) => ..)`) must HIT the warm
+  core emit cache. The per-call-site closure-spec decls
+  (`<fn>__cspec__L<line>_<col>`) are derived and root-homed, so their
+  span-bearing names stay out of the surface key; a genuine name-level
+  change (a new top-level fn) still misses.
 
 Both families run under `make -C stage2 test-core-cache`.
 
