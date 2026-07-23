@@ -42,6 +42,7 @@ Every kind is declared in `stdlib/core/kinds.kai` over a theory:
 | `Effect` | `EffectRow` | effect labels (`Stdout`, `State`, `Spawn`) |
 | `Measure` | `AbelianGroup` | units of measure (`m`, `kg`, `m/s`) |
 | `Currency` | `Module` | currencies (`USD`, `EUR`) |
+| `Perm` | `Semilattice` | typed capabilities (`read`, `write`, user perms) |
 | `Region` | `Nominal` | memory arenas (each `region { r -> }` mints one) |
 | `Layout` | `Composition` | byte-order modifiers (`be`, `le`) |
 | `Shape` | `ConstructorApp` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
@@ -73,6 +74,13 @@ same closure applies to `Nominal` and `ConstructorApp`.
   variable binds against an applied head (`s[a] ~ List[Int]`). The
   engine for `Shape`, distinct from `Nominal`'s closed-identity
   comparison.
+- `Semilattice = { assoc, commut, idempotent }` — an idempotent join
+  with no inverse: habitants union with `+` (`read + write`,
+  `read + read = read`) and nothing subtracts. Unification is
+  subsumption along the lattice order: the required set must be a
+  subset of the provided set, so more capabilities flow where fewer
+  are demanded, never the reverse. Products, inverses, and powers
+  are formation errors.
 - `Composition = { assoc, measure }` — composes elements in
   declaration order (associative, **not** commutative — order is
   load-bearing) and sums a per-element measure. A habitant is a
@@ -153,6 +161,50 @@ a composed annotation is rejected at the spot that writes it:
 fn bad(x: U32<be^2>) : Int = 0        # be^2 does not exist
 fn main() : Unit / Stdout = Stdout.print("no")
 ```
+
+## Perm — the `Semilattice` kind
+
+`Perm` classifies typed capabilities. The stdlib file API carries
+them: `open_read` returns `FileHandle<read>`, `open_write` returns
+`FileHandle<read + write>`, and each op requires only what it uses.
+Subsumption lets the joined handle flow into both:
+
+```kaikai
+fn first_chunk(h: FileHandle<read>) : String / File =
+  match File.read_chunk(h, 64) { Ok(s) -> s Err(e) -> e }
+
+fn main() : Unit / Stdout + File = {
+  match File.open_write("/tmp/kai_info_perm.txt") {
+    Ok(h) -> {
+      let _ = File.write_chunk(h, "hi")   # <read + write> ⊇ <write>
+      let _ = first_chunk(h)              # <read + write> ⊇ <read>
+      File.close_file(h)
+      Stdout.print("ok")
+    }
+    Err(e) -> Stdout.print(e)
+  }
+}
+```
+
+Writing through a read-only handle is a compile-time mismatch —
+`<read>` does not subsume into `<write>`:
+
+```kaikai-neg
+fn main() : Unit / Stdout + File = {
+  match File.open_read("/tmp/nope.txt") {
+    Ok(h)  -> { let _ = File.write_chunk(h, "x"); Stdout.print("no") }
+    Err(e) -> Stdout.print(e)
+  }
+}
+```
+
+The capability is what the code *declared* at open time, not the OS's
+runtime permission — a vanished file or a chmod still surfaces
+through each op's `Result`. Perm habitants are open: `perm read` /
+`perm write` ship with the file API, and each domain declares its own
+(`perm get`, `perm admin`, ...). Handler implementations and test
+doubles mint handles with `file_handle(fd)`, whose capability is
+chosen by the context's expected type.
 
 ## Shape — the kind of arity-1 constructors
 

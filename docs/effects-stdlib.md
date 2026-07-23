@@ -477,11 +477,11 @@ timing decided when the first real use case pushes them:
 effect File {
   read_file(path: String)                       : Result[String, String]
   write_file(path: String, content: String)     : Result[Unit, String]
-  # Issue #771 Phase 1 — chunked / streaming IO (shipped).
-  open_read(path: String)                       : Result[FileHandle, String]
-  read_chunk(h: FileHandle, max: Int)           : Result[String, String]
-  open_write(path: String)                      : Result[FileHandle, String]
-  write_chunk(h: FileHandle, data: String)      : Result[Unit, String]
+  # Chunked / streaming IO over a capability-carrying handle.
+  open_read(path: String)                       : Result[FileHandle<read>, String]
+  read_chunk(h: FileHandle<read>, max: Int)     : Result[String, String]
+  open_write(path: String)                      : Result[FileHandle<read + write>, String]
+  write_chunk(h: FileHandle<write>, data: String) : Result[Unit, String]
   close_file(h: FileHandle)                     : Unit
 }
 ```
@@ -549,22 +549,30 @@ chunked ops keep an OS file descriptor open across calls so a
 consumer can pull a large file piece-by-piece without holding it
 all in memory:
 
-- `open_read(path) : Result[FileHandle, String]` — open read-only.
-- `read_chunk(h, max) : Result[String, String]` — read up to `max`
-  bytes. `Ok("")` is the **EOF sentinel** (never an `Err`); a short
-  read (fewer than `max` bytes but more than zero) is normal — the
-  caller loops until it sees the empty string.
-- `open_write(path) : Result[FileHandle, String]` — open for
-  writing, creating (mode 0644) and truncating any existing file.
-- `write_chunk(h, data) : Result[Unit, String]` — write every byte
-  of `data`, looping over partial writes.
-- `close_file(h) : Unit` — close the descriptor. Single error
-  channel collapses to none: the fd is gone either way.
+- `open_read(path) : Result[FileHandle<read>, String]` — open
+  read-only.
+- `read_chunk(h, max) : Result[String, String]` — requires `<read>`;
+  read up to `max` bytes. `Ok("")` is the **EOF sentinel** (never an
+  `Err`); a short read (fewer than `max` bytes but more than zero) is
+  normal — the caller loops until it sees the empty string.
+- `open_write(path) : Result[FileHandle<read + write>, String]` —
+  open read-write (`O_RDWR`), creating (mode 0644) and truncating any
+  existing file.
+- `write_chunk(h, data) : Result[Unit, String]` — requires `<write>`;
+  write every byte of `data`, looping over partial writes.
+- `close_file(h) : Unit` — takes a bare handle (no capability
+  demanded); close the descriptor. Single error channel collapses to
+  none: the fd is gone either way.
 
 `FileHandle` is an opaque runtime handle — a record `{ fd: Int }`,
-the same shape as the net `Conn`. It is single-owner: sharing a
-`FileHandle` across fibers is undefined in v1, the same stance as
-the stdin singleton.
+the same shape as the net `Conn` — carrying its capability as a
+`Perm` habitant (`kai info kinds` §Perm). The capability is what the
+code declared at open time, so writing through a read-only handle is
+a compile-time mismatch; the OS's runtime verdict still rides each
+op's `Result`. Handler implementations and test doubles mint handles
+with `file_handle(fd)`, whose perm the context's expected type
+chooses. `FileHandle` is single-owner: sharing one across fibers is
+undefined in v1, the same stance as the stdin singleton.
 
 The error register is `Result[_, String]` (Ok first),
 mirroring `read_file` — callers branch on the motive (missing /

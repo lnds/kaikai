@@ -160,6 +160,32 @@ conversion is an explicit door: `money.convert(m, rate)` with the
 target currency pinned by annotation. Declaring your own additive
 kind works the same way (`kind Points : Module with points`).
 
+## Semilattice kinds — `Perm` and capabilities
+
+`Semilattice` is the idempotent-join theory: habitants union with `+`
+inside `<>` (`FileHandle<read + write>`, `read + read = read`) and
+nothing subtracts — no products, inverses, or powers. Unification is
+subsumption along the lattice order: the required set must be a subset
+of the provided one, so a handle with more capabilities flows where
+fewer are demanded, never the reverse. The catalog declares
+`kind Perm : Semilattice with perm`; the file API ships `perm read` /
+`perm write` and carries them on `FileHandle` (see `kai info kinds`
+§Perm). Declaring your own join kind works the same way:
+
+```kaikai
+kind Access : Semilattice with grant
+
+grant get
+grant post
+
+fn handle_get(r: Int<get>) : Int = 1
+
+fn main() : Unit / Stdout = {
+  let req = 3<get + post>
+  Stdout.print(int_to_string(handle_get(req)))   # <get + post> ⊇ <get>
+}
+```
+
 ## Caveats
 
 - `^` in unit expressions (`Real<m^2>`, `<m/s^2>`) denotes a unit-level
