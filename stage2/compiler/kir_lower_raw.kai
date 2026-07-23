@@ -15,8 +15,9 @@
 # recursion into `lower_expr`); `lower_expr_raw` lives in the Expr-SCC
 # `kir_lower_walk.kai`.
 #
-# SCOPE: REAL + INT arith/cmp, CHAR literal/var. A node is raw-promoted iff
-# it is `MUnboxed` AND a natively-raw FORM in one of three scalar families:
+# SCOPE: REAL + INT + BYTE arith/cmp, CHAR literal/var. A node is
+# raw-promoted iff it is `MUnboxed` AND a natively-raw FORM in one of four
+# scalar families:
 #   - REAL (asu, Camino A — the native-parity "Real box/unbox" family): a
 #     Real literal/var, Real arith (`+ - * /`), unary `-`, a Real comparison,
 #     or a logical over raw-Real comparisons.
@@ -38,6 +39,12 @@
 #     0x80 out of `char_at`) freed by the first extra consumption leaves
 #     later uses reading recycled memory. Char comparisons and other forms
 #     stay boxed (each operand crosses the border as its own fresh box).
+#   - BYTE (`u8` op family): a Byte literal/var, Byte arith (`+ - * / %`),
+#     or a Byte comparison. The register invariant is value 0..255: `+ - *`
+#     mask at 8 bits AFTER each op, `/`/`%` widen into the checked i64
+#     helper (zero divisor traps) and truncate, cmp is a plain `icmp` over
+#     the masked values. Boxed borders box fresh (`kaix_byte`) — a Byte box
+#     is heap-RC'd (no interning), so the Char under-ref hazard applies.
 # Bool nodes that are MUnboxed for OTHER reasons (a UFn call returning
 # Bool) stay on the boxed path: boxed Bool rides the singleton cache
 # (immortal, no double-free), and the scalar machinery
@@ -121,6 +128,21 @@ fn kir_ty_is_char_t(t: Ty) : Bool = match t {
   _                   -> false
 }
 
+# True iff an optional type is `Byte`. Routes the box→raw border through
+# `byte.unbox` (→ `kaix_byte_field`, slot `SByte`) and gates the raw
+# literal/var/arith forms — the `u8` op family masks at 8 bits where the
+# Int prims would compute at i64 width.
+pub fn kir_ty_is_byte(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_byte_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_byte_t(t: Ty) : Bool = match t {
+  TyByte              -> true
+  TyRefineT(inner, _) -> kir_ty_is_byte_t(inner)
+  _                   -> false
+}
+
 # An Expr the KIR raw path handles. ONLY the natively-raw FORMS — a Real
 # literal, a Real var, Real arith (`+ - * /`), unary `-`, a Real comparison,
 # or a logical / `not` over raw-Real comparisons. A Real-typed `MUnboxed`
@@ -144,9 +166,10 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EReal(_, _) -> kir_ty_is_real(x.ty)
   EIntLit(_) -> kir_ty_is_real(x.ty)
   EDecimalLit(_) -> kir_ty_is_real(x.ty)
-  EInt(_)     -> kir_ty_is_int(x.ty)
+  EInt(_)     -> kir_ty_is_int(x.ty) or kir_ty_is_byte(x.ty)
+  EFixed(_, _) -> kir_ty_is_byte(x.ty)
   EChar(_)    -> kir_ty_is_char(x.ty)
-  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty) or kir_ty_is_char(x.ty)
+  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty) or kir_ty_is_char(x.ty) or kir_ty_is_byte(x.ty)
   ELitUnit(inner, _) -> kir_node_is_raw(inner)
   # Arith routes by RESULT type, not op string: `+ - *` overlap the Real
   # (`f`) and Int (`i`) families, so a type-blind `if op_is_freal { real }`
@@ -156,9 +179,11 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EBinop(op, a, b) ->
     if kir_ty_is_real(x.ty) { kir_op_is_raw_freal_arith(op) }
     else if kir_ty_is_int(x.ty) { kir_op_is_raw_iint_arith(op) }
+    else if kir_ty_is_byte(x.ty) { kir_op_is_raw_iint_arith(op) }
     else if kir_op_is_raw_cmp(op) {
       (kir_ty_is_real(a.ty) and kir_ty_is_real(b.ty)) or
-      (kir_ty_is_int(a.ty) and kir_ty_is_int(b.ty))
+      (kir_ty_is_int(a.ty) and kir_ty_is_int(b.ty)) or
+      (kir_ty_is_byte(a.ty) and kir_ty_is_byte(b.ty))
     }
     else if kir_op_is_raw_logical(op) { kir_node_is_raw(a) and kir_node_is_raw(b) }
     else { false }
@@ -179,6 +204,7 @@ pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
   if kir_ty_is_real(opt_t) { "real.box" }
   else if kir_ty_is_int(opt_t) { "int.box" }
   else if kir_ty_is_char(opt_t) { "char.box" }
+  else if kir_ty_is_byte(opt_t) { "byte.box" }
   else { "bool.box" }
 
 # The `fbinop` opcode for a raw-Real arithmetic operator (matches the
@@ -262,3 +288,8 @@ pub fn kir_raw_cmp_prim(op: String) : String = cat2("f", op)
 pub fn kir_raw_logical_prim(op: String) : String = cat2("b", op)
 pub fn kir_raw_iarith_prim(op: String) : String = cat2("i", op)
 pub fn kir_raw_icmp_prim(op: String) : String = cat2("i", op)
+# The `u8` family: same operator set as the i-family, per-op 8-bit
+# masking (`+ - *` mask after the op; `/`/`%` widen into the checked i64
+# helper and truncate; cmp is an i32 `icmp` over the masked values).
+pub fn kir_raw_u8arith_prim(op: String) : String = cat2("u8", op)
+pub fn kir_raw_u8cmp_prim(op: String) : String = cat2("u8", op)
