@@ -1,0 +1,269 @@
+#[doc("The pinned-region gate: a `region { }` body may not reach a fiber suspension point. Errors when a region's body demands a suspending effect (Spawn/Actor/Cancel/Link/Monitor) directly or through a call, since an arena pointer that outlives a park would dangle after a migrating fiber resumes on another thread.")]
+
+import compiler.ast
+import compiler.region
+import compiler.util
+
+# The arena stack is a per-thread bump stack whose live pointer is the
+# region's `KaiArena*`. A fiber that parks between a region push and its
+# pop can resume on a different OS thread, where that pointer is stale —
+# so the invariant is that a region never spans a suspension point. This
+# gate proves it over the typed AST: reachability of a park inside a
+# region body is exactly the region body's effect row intersecting the
+# suspending set, and the typer already propagated that row through every
+# call. A syntactic scan would miss a park hidden behind a helper; the
+# row does not.
+
+#[doc("Effects whose ops are fiber suspension points — the ones that let a fiber migrate across a park.")]
+pub fn ry_suspending_effects() : [String] =
+  ["Spawn", "Actor", "Cancel", "Link", "Monitor"]
+
+#[doc("Fail the compile for every `region { }` whose body can reach a fiber suspension point; returns the error count.")]
+pub fn region_yield_findings(decls: [Decl], regions: [RegionMark], file: String) : Int / Console =
+  ry_decls(decls, regions, file, 0)
+
+fn ry_decls(decls: [Decl], regions: [RegionMark], file: String, acc: Int) : Int / Console {
+  match decls {
+    []           -> acc
+    [d, ...rest] -> ry_decls(rest, regions, file, acc + ry_decl(d, regions, file))
+  }
+}
+
+fn ry_decl(d: Decl, regions: [RegionMark], file: String) : Int / Console {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) -> ry_sites(body, regions, file)
+    DTest(_, body, _, _)                  -> ry_sites(body, regions, file)
+    DBench(_, body, _, _)                 -> ry_sites(body, regions, file)
+    DCheck(_, _, body, _, _)              -> ry_sites(body, regions, file)
+    DImpl(_, _, _, ms, _, _)              -> ry_decls(ms, regions, file, 0)
+    DDerive(_, inner, _, _)               -> ry_decl(inner, regions, file)
+    DUnstable(inner, _, _)                -> ry_decl(inner, regions, file)
+    DProtoLaws(_, inner, _, _)            -> ry_decl(inner, regions, file)
+    DImplAxiom(_, inner, _, _)            -> ry_decl(inner, regions, file)
+    DConstructor(inner, _, _)             -> ry_decl(inner, regions, file)
+    _                                     -> 0
+  }
+}
+
+# Visit every region site in `e`, including inside lambdas and nested
+# regions: a region within a spawned closure is still its own push/pop
+# bracket and must hold the invariant on its own. Each region found is
+# checked against its OWN body's suspending row.
+fn ry_sites(e: Expr, regions: [RegionMark], file: String) : Int / Console {
+  let here = match e.kind {
+    EBlock(_, _) ->
+      if ry_pos_is_region(regions, e.line, e.col) { ry_check_region(e, file) } else { 0 }
+    _ -> 0
+  }
+  here + ry_sites_children(ry_all_children(e.kind), regions, file)
+}
+
+fn ry_sites_children(xs: [Expr], regions: [RegionMark], file: String) : Int / Console {
+  match xs {
+    []           -> 0
+    [x, ...rest] -> ry_sites(x, regions, file) + ry_sites_children(rest, regions, file)
+  }
+}
+
+# A block at (line, col) is a region when the side table keys that
+# position (same match `kir_lower_walk`'s `block_is_region` uses to route
+# a block to the arena).
+fn ry_pos_is_region(ms: [RegionMark], line: Int, col: Int) : Bool {
+  match ms {
+    []            -> false
+    [m, ...rest]  ->
+      if rmark_line(m) == line and rmark_col(m) == col { true }
+      else { ry_pos_is_region(rest, line, col) }
+  }
+}
+
+# A region body reaching a suspending op. The suspending effect is the
+# first one demanded (deterministic diagnostic); the whole set is what
+# the invariant forbids.
+fn ry_check_region(e: Expr, file: String) : Int / Console {
+  match ry_first_suspend(ry_effects_in_expr(e, [])) {
+    Some(eff) -> {
+      eprint(concat_all([file, ":", int_to_string(e.line), ":", int_to_string(e.col),
+        ": error: a `region { }` block may not reach a `", eff,
+        "` suspension point — a region never spans a yield (the pinned-region invariant), so an arena pointer would dangle after a migrating fiber resumes on another thread\n"]))
+      1
+    }
+    None -> 0
+  }
+}
+
+fn ry_first_suspend(effs: [String]) : Option[String] {
+  match effs {
+    []             -> None
+    [eff, ...rest] -> if ry_mem(eff, ry_suspending_effects()) { Some(eff) } else { ry_first_suspend(rest) }
+  }
+}
+
+# ---- suspending effects demanded by a region body --------------------
+#
+# Same source as `lint_effects.effects_in_expr` — a direct op reference,
+# or a call whose resolved callee row carries the effect — but NOT
+# descending into lambda bodies: a closure's body runs when it is CALLED,
+# not where it is written, so a `spawn(() -> Actor.receive())` does not
+# make the enclosing region span a yield (the `Spawn` on the spawn call
+# itself does). Nested regions ARE walked: their ctors run inside this
+# body, so an effect they reach is reachable here too.
+
+fn ry_effects_in_expr(e: Expr, acc: [String]) : [String] {
+  let a1 = ry_effects_here(e, acc)
+  ry_effects_in_exprs(ry_body_children(e.kind), a1)
+}
+
+fn ry_effects_here(e: Expr, acc: [String]) : [String] {
+  match e.kind {
+    EVar(name)       -> ry_add_op_effect(name, acc)
+    ECall(callee, _) -> ry_add_callee_effects(callee, acc)
+    EHandle(_, eff, _, _, _, _, _) -> [eff, ...acc]
+    _                -> acc
+  }
+}
+
+fn ry_add_op_effect(name: String, acc: [String]) : [String] {
+  let pre = ry_upper_dotted_prefix(name)
+  if pre == "" { acc } else { [pre, ...acc] }
+}
+
+fn ry_upper_dotted_prefix(name: String) : String {
+  let n = string_length(name)
+  if n == 0 { "" }
+  else if ry_first_upper(name) { ry_take_to_dot(name, 0, n) } else { "" }
+}
+
+fn ry_first_upper(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None    -> false
+  }
+}
+
+fn ry_take_to_dot(name: String, i: Int, n: Int) : String {
+  if i >= n { "" }
+  else {
+    match char_at(name, i) {
+      Some('.') -> string_slice(name, 0, i)
+      Some(_)   -> ry_take_to_dot(name, i + 1, n)
+      None      -> ""
+    }
+  }
+}
+
+fn ry_add_callee_effects(callee: Expr, acc: [String]) : [String] {
+  match callee.ty {
+    Some(TyFnT(_, _, row)) -> ry_add_label_effects(row.labels, acc)
+    _                      -> acc
+  }
+}
+
+fn ry_add_label_effects(ls: [Label], acc: [String]) : [String] {
+  match ls {
+    []           -> acc
+    [l, ...rest] -> ry_add_label_effects(rest, [l.eff, ...acc])
+  }
+}
+
+fn ry_effects_in_exprs(xs: [Expr], acc: [String]) : [String] {
+  match xs {
+    []           -> acc
+    [x, ...rest] -> ry_effects_in_exprs(rest, ry_effects_in_expr(x, acc))
+  }
+}
+
+fn ry_mem(name: String, xs: [String]) : Bool {
+  match xs {
+    []           -> false
+    [x, ...rest] -> if x == name { true } else { ry_mem(name, rest) }
+  }
+}
+
+# ---- child extractors ------------------------------------------------
+#
+# `ry_body_children` powers the region-body effect walk: it drops lambda
+# bodies (deferred execution) but keeps everything else, nested regions
+# included. `ry_all_children` powers the region-site walk and keeps
+# lambda bodies too, so a region written inside a closure is still found.
+
+fn ry_body_children(k: ExprKind) : [Expr] {
+  match k {
+    ELambda(_, _) -> []
+    _             -> ry_children(k)
+  }
+}
+
+fn ry_all_children(k: ExprKind) : [Expr] = ry_children(k)
+
+fn ry_children(k: ExprKind) : [Expr] {
+  match k {
+    ECall(callee, xs)   -> [callee, ...xs]
+    EField(base, _)     -> [base]
+    EIndex(a, b)        -> [a, b]
+    EBinop(_, a, b)     -> [a, b]
+    EUnop(_, x)         -> [x]
+    EIf(c, t, eo)       -> [c, t, ...ry_opt(eo)]
+    EMatch(scr, arms)   -> [scr, ...ry_arm_exprs(arms)]
+    ELambda(_, body)    -> [body]
+    ERecordLit(_, fis)  -> ry_field_exprs(fis)
+    EList(els)          -> ry_elem_exprs(els)
+    ERange(a, b, so)    -> [a, b, ...ry_opt(so)]
+    EBlock(ss, tail)    -> list_append(ry_stmt_exprs(ss), ry_opt(tail))
+    EPipe(a, b)         -> [a, b]
+    EMapPipe(a, b)      -> [a, b]
+    EFlatMapPipe(a, b)  -> [a, b]
+    EFilterPipe(a, b)   -> [a, b]
+    ELitUnit(inner, _)  -> [inner]
+    EBang(inner)        -> [inner]
+    EHandle(body, _, _, init, _, _, _) -> [body, ...ry_opt(init)]
+    _                   -> []
+  }
+}
+
+fn ry_opt(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn ry_arm_exprs(arms: [Arm]) : [Expr] {
+  match arms {
+    []                      -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(ry_opt(g), [b]), ry_arm_exprs(rest))
+  }
+}
+
+fn ry_field_exprs(fis: [FieldInit]) : [Expr] {
+  match fis {
+    []                  -> []
+    [FI(_, v), ...rest] -> [v, ...ry_field_exprs(rest)]
+  }
+}
+
+fn ry_elem_exprs(els: [ListElem]) : [Expr] {
+  match els {
+    []                     -> []
+    [ElPlain(x), ...rest]  -> [x, ...ry_elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...ry_elem_exprs(rest)]
+  }
+}
+
+fn ry_stmt_exprs(ss: [Stmt]) : [Expr] {
+  match ss {
+    []           -> []
+    [s, ...rest] -> list_append(ry_stmt_expr_list(s), ry_stmt_exprs(rest))
+  }
+}
+
+fn ry_stmt_expr_list(s: Stmt) : [Expr] {
+  match s {
+    SExprStmt(x)                -> [x]
+    SLet(_, _, rhs)             -> [rhs]
+    SAssert(c, mo)              -> [c, ...ry_opt(mo)]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SVar(_, _, rhs, _, _)       -> [rhs]
+    SUse(_, _, _)               -> []
+  }
+}
