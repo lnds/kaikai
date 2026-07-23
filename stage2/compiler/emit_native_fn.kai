@@ -78,7 +78,7 @@ pub fn nfn_sym(sym: String) : String = if sym == "main" { "kai_main" } else { sy
 # loads/stores at this type, never re-derives it from the op.
 pub fn nslot_tag(s: KSlot) : Int = match s {
   SBoxed -> 0  SInt64 -> 1  SReal -> 2  SBool -> 3  SInt32 -> 4  SChar -> 5  SByte -> 6
-  SInt32T -> 7  SUInt32 -> 8  SUInt64 -> 9
+  SInt32T -> 7  SUInt32 -> 8  SUInt64 -> 9  SInt128 -> 10
 }
 
 # The LLVM element type for a slot tag (read back from the ctx table).
@@ -97,6 +97,7 @@ pub fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
   else if tag == 7 { native_ctx_i32t(ctx) }
   else if tag == 8 { native_ctx_i32t(ctx) }
   else if tag == 9 { native_ctx_i64t(ctx) }
+  else if tag == 10 { native_ctx_i128t(ctx) }
   else { native_ctx_ptrt(ctx) }
 
 pub fn nslot_type(ctx: Handle, s: KSlot) : Handle = nslot_type_of_tag(ctx, nslot_tag(s))
@@ -318,6 +319,15 @@ pub fn nemit_atom_raw(ctx: Handle, v: KVal, slot: KSlot) : Handle / Console = ma
     KVar(n)           -> nemit_load_reg_as_fixed(ctx, n, 9)
     _                 -> nemit_atom(ctx, v)
   }
+  # Int128 rides an i128 register. A literal materialises from its decimal
+  # text (`llvm_const_i128_str`) — the value may exceed the 64-bit
+  # `decode_int`, so it never routes through `llvm_const_int`.
+  SInt128 -> match v {
+    KIntV(n)          -> llvm_const_i128_str(native_ctx_i128t(ctx), int_to_string(n))
+    KFixedV(span, _)  -> llvm_const_i128_str(native_ctx_i128t(ctx), span)
+    KVar(n)           -> nemit_load_reg_as_fixed(ctx, n, 10)
+    _                 -> nemit_atom(ctx, v)
+  }
   _ -> nemit_atom(ctx, v)
 }
 
@@ -339,6 +349,7 @@ pub fn nemit_reloop_value(ctx: Handle, v: KVal, slot_tag: Int) : Handle / Consol
   else if slot_tag == 7 { nemit_atom_raw(ctx, v, SInt32T) }
   else if slot_tag == 8 { nemit_atom_raw(ctx, v, SUInt32) }
   else if slot_tag == 9 { nemit_atom_raw(ctx, v, SUInt64) }
+  else if slot_tag == 10 { nemit_atom_raw(ctx, v, SInt128) }
   else { nemit_atom(ctx, v) }
 
 # Load register `n` as a raw `f64`. A raw `SReal` register loads directly;
@@ -378,11 +389,13 @@ fn nemit_load_reg_as_byte(ctx: Handle, n: String) : Handle / Console =
   else { ncall_sig1(ctx, "kaix_byte_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
 
 # Load register `n` as a raw fixed-width value at the given slot tag
-# (7=Int32/i32, 8=UInt32/i32, 9=UInt64/i64). A register already at that
-# slot loads directly; a boxed register unbox-borrows its payload via the
-# per-type field shim (NO decref — the oracle's `(boxed)->as.i32/u32/u64`).
+# (7=Int32/i32, 8=UInt32/i32, 9=UInt64/i64, 10=Int128/i128). A register
+# already at that slot loads directly; a boxed register unbox-borrows its
+# payload via the per-type field shim (NO decref — the oracle's
+# `(boxed)->as.i32/u32/u64`; Int128 reads the alignment-safe halves).
 fn nemit_load_reg_as_fixed(ctx: Handle, n: String, want_tag: Int) : Handle / Console =
   if native_ctx_reg_slot(ctx, n) == want_tag { nemit_load_reg(ctx, n) }
+  else if want_tag == 10 { ncall_sig1(ctx, "kaix_int128_field", native_ctx_i128t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
   else if want_tag == 9 { ncall_sig1(ctx, "kaix_uint64_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
   else if want_tag == 8 { ncall_sig1(ctx, "kaix_uint32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
   else { ncall_sig1(ctx, "kaix_int32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, n)) }
@@ -414,6 +427,7 @@ fn nemit_load_reg_boxed(ctx: Handle, n: String) : Handle / Console = {
   else if slot == 7 { ncall_sig1(ctx, "kaix_int32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, nemit_load_reg(ctx, n), 1)) }
   else if slot == 8 { ncall_sig1(ctx, "kaix_uint32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, nemit_load_reg(ctx, n), 0)) }
   else if slot == 9 { ncall_sig1(ctx, "kaix_uint64", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_load_reg(ctx, n)) }
+  else if slot == 10 { ncall_sig1(ctx, "kaix_int128", native_ctx_ptrt(ctx), native_ctx_i128t(ctx), nemit_load_reg(ctx, n)) }
   else { nemit_load_reg(ctx, n) }
 }
 
@@ -630,6 +644,7 @@ pub fn nemit_store_reg_boxing(ctx: Handle, name: String, planned: KSlot, h: Hand
   else if reg == 0 and pt == 7 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 1))) }
   else if reg == 0 and pt == 8 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 0))) }
   else if reg == 0 and pt == 9 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint64", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), h)) }
+  else if reg == 0 and pt == 10 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int128", native_ctx_ptrt(ctx), native_ctx_i128t(ctx), h)) }
   # A raw `i32` (a widened variant-tag temporary) widens to i64 before boxing;
   # `kaix_int` takes an i64. Non-negative tag, so `zext`.
   else if reg == 0 and pt == 4 {
@@ -661,5 +676,6 @@ pub fn nemit_store_slot_aware(ctx: Handle, name: String, v: KVal) : Unit / Conso
   else if tag == 7 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SInt32T)) }
   else if tag == 8 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SUInt32)) }
   else if tag == 9 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SUInt64)) }
+  else if tag == 10 { nemit_store_reg(ctx, name, nemit_atom_raw(ctx, v, SInt128)) }
   else { nemit_store_reg(ctx, name, nemit_atom(ctx, v)) }
 }

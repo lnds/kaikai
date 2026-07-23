@@ -1,0 +1,106 @@
+# Fixed-width raw promotion (Int128) — the raw op family + every border a
+# raw Int128 value crosses. Int128 is a raw i128 register on both backends
+# (RC skip-set) for `+ - *` and the comparisons; its `/`/`%` stay boxed
+# (no i128 checked-div helper) and route through the trapping runtime.
+#
+# Covers: signed wrapping at the 128-bit boundary, div/mod (boxed), the six
+# comparisons, the call border (raw param/return + a multi-use param), the
+# record-field border, the effect-op border, list-of-Int128 literals, a
+# literal match over a raw scrutinee, context-driven minting, and — specific
+# to Int128 — a literal above 2^63 exercising the const-from-text path.
+
+effect Sink {
+  put128(x: Int128) : Unit
+}
+
+type Box128 = { tag: String, raw: Int128 }
+
+fn wrap_add128(x: Int128, y: Int128) : Int128 = x + y
+
+# The RC-scar shape: a param consumed by a boxed prim (show), then reused
+# raw. The arith/div-same-binder gate: `x` feeds both a raw `+` and a boxed
+# `/` in one function — the border must box a fresh cell for `/`, never
+# free the raw register.
+fn use_twice128(x: Int128) : String = {
+  let s = show(x)
+  let n = x + 1i128
+  let d = x / 2i128
+  "#{s}/#{show(n)}/#{show(d)}"
+}
+
+fn classify128(v: Int128) : String = match v {
+  0i128 -> "zero"
+  7i128 -> "seven"
+  _     -> "other"
+}
+
+fn sum128(xs: [Int128], acc: Int128) : Int128 = match xs {
+  []        -> acc
+  [h, ...t] -> sum128(t, acc + h)
+}
+
+fn main() : Unit / Stdout = {
+  # signed wrap at each op
+  Stdout.print(show(170141183460469231731687303715884105727i128 + 1i128))  # INT128_MIN
+  Stdout.print(show(5i128 - 10i128))                                        # -5
+  Stdout.print(show(1000000000000000000i128 * 1000000000000000000i128))    # 10^36, no wrap
+  Stdout.print(show(13043817825332782212i128 * 13043817825332782212i128))  # overflow wrap
+
+  # div/mod stay boxed, trap-guarded
+  Stdout.print(show(100i128 / 7i128))   # 14
+  Stdout.print(show(100i128 % 7i128))   # 2
+  Stdout.print(show(-100i128 / 7i128))  # -14 (signed)
+  Stdout.print(show(-100i128 % 7i128))  # -2
+
+  # a literal above 2^63 (the const-from-text path)
+  Stdout.print(show(9223372036854775808i128))              # 2^63
+  Stdout.print(show(18446744073709551616i128 + 1i128))     # 2^64 + 1
+
+  # comparisons over raw registers (signed)
+  let a = 100i128
+  let b = 7i128
+  if a > b and b < a and a != b and a == 100i128 and b <= 7i128 and a >= 100i128 {
+    Stdout.print("cmp128-ok")
+  } else {
+    Stdout.print("cmp128-bad")
+  }
+  # a negative-vs-positive comparison exercises the signed icmp
+  let neg = 0i128 - 1i128
+  if neg < 0i128 and neg < a {
+    Stdout.print("cmp128-signed-ok")
+  } else {
+    Stdout.print("cmp128-signed-bad")
+  }
+
+  # call border: raw param/return, wrap across the call
+  Stdout.print(show(wrap_add128(170141183460469231731687303715884105727i128, 1i128)))
+  # multi-use param: boxed consumer, then raw arith and boxed div on it
+  Stdout.print(use_twice128(a))  # 100/101/50
+
+  # record-field border: raw -> boxed field, boxed read -> arith
+  let c = Box128 { tag: "c", raw: 170141183460469231731687303715884105727i128 }
+  Stdout.print(show(c.raw + 1i128))  # INT128_MIN
+
+  # list of Int128 + fold via recursion (boxed elements, raw acc)
+  Stdout.print(show(sum128([1000000000000000000i128, 2000000000000000000i128, 3000000000000000000i128], 0i128)))
+
+  # literal match on a raw Int128 scrutinee
+  Stdout.print(classify128(0i128))
+  Stdout.print(classify128(7i128))
+  Stdout.print(classify128(a))
+
+  # context-driven minting: an unsuffixed literal in an Int128 slot mints
+  # through the i128 constructor (not a tagged Int immediate).
+  let m128 : Int128 = 100
+  Stdout.print(show(m128 + 1i128))  # 101
+
+  # effect-op border: a raw Int128 crosses into a handler clause boxed
+  let got = handle {
+    Sink.put128(42i128)
+    Sink.put128(170141183460469231731687303715884105727i128 + 1i128)
+    "done"
+  } with Sink {
+    put128(x, resume) -> { Stdout.print(show(x)); resume(()) }
+  }
+  Stdout.print(got)
+}
