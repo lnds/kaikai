@@ -31,6 +31,7 @@ import compiler.lit_mint
 import compiler.unit_walk
 import compiler.pipe_fusion
 import compiler.vec_surface
+import compiler.fixed_vec_match
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -12083,7 +12084,8 @@ fn synth_vec_index(st: InferState, coll: Expr, ix: Expr,
 # lowers to `__fixed_vec_get` — a bare struct field load, the bound
 # proved here at compile time so no runtime check is emitted. Out of
 # range is a compile error (strictly better than the dynamic vec's
-# runtime trap); a non-literal index is declined in v1.
+# runtime trap). A dynamic index lowers to `__fixed_vec_get_dyn`, the
+# same inline field load behind a bounds check against the static `n`.
 fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
                          line: Int, col: Int) : Inferred / Console + File + Mutable {
   let n = fixed_vec_n(coll_ty)
@@ -12091,21 +12093,27 @@ fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
   match ix.kind {
     EInt(k) ->
       if k >= 0 and k < n {
-        let cr = synth(st, coll)
-        let call = ECall(mk_expr(EVar("__fixed_vec_get"), line, col), [cr.expr, ix])
-        let node = Expr { kind: call, line: line, col: col, ty: Some(elem), mode: MUnboxed }
-        mk_inferred(cr.st, elem, node)
+        fixed_vec_index_node(st, coll, ix, "__fixed_vec_get", elem, line, col)
       } else {
         diag_error(st.file, line, col,
           concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]))
         mk_inferred(st_bump_err(st), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
       }
     _ -> {
-      diag_error(st.file, line, col,
-        "a dynamic index into a fixed-width `Vec[t]<n>` is not supported yet — bind it to a dynamic `Vec` first")
-      mk_inferred(st_bump_err(st), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+      let ir = check_expr_against(st, ix, TyInt, "index", ix.line, ix.col)
+      fixed_vec_index_node(ir.st, coll, ir.expr, "__fixed_vec_get_dyn", elem, line, col)
     }
   }
+}
+
+# The `__fixed_vec_get`/`_get_dyn` call node, typed at the element and
+# marked unboxed: the read yields a raw scalar out of the flat aggregate.
+fn fixed_vec_index_node(st: InferState, coll: Expr, ix: Expr, prim: String, elem: Ty,
+                        line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let cr = synth(st, coll)
+  let call = ECall(mk_expr(EVar(prim), line, col), [cr.expr, ix])
+  let node = Expr { kind: call, line: line, col: col, ty: Some(elem), mode: MUnboxed }
+  mk_inferred(cr.st, elem, node)
 }
 
 # Binop typing is deliberately coarse: numeric operators unify their
@@ -15765,7 +15773,10 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
 
   let st0 = check_arms_redundancy(st, arms, [], false, line, col)
   let rs_ = synth(st0, scr)
-  if vec_match_route(apply_ty(rs_.st.sub, rs_.ty), arms) {
+  let scr_ty0 = apply_ty(rs_.st.sub, rs_.ty)
+  if fixed_vec_match_route(scr_ty0, arms) {
+    synth_fixed_vec_match(rs_.st, rs_.expr, arms, scr_ty0, None, line, col)
+  } else if vec_match_route(scr_ty0, arms) {
     synth_vec_match(rs_.st, scr, arms, None, line, col)
   } else {
   let rv = st_fresh_ty(rs_.st)
@@ -15814,7 +15825,10 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 
   let st0 = check_arms_redundancy(st, arms, [], false, line, col)
   let rs_ = synth(st0, scr)
-  if vec_match_route(apply_ty(rs_.st.sub, rs_.ty), arms) {
+  let scr_ty0 = apply_ty(rs_.st.sub, rs_.ty)
+  if fixed_vec_match_route(scr_ty0, arms) {
+    synth_fixed_vec_match(rs_.st, rs_.expr, arms, scr_ty0, Some(expected), line, col)
+  } else if vec_match_route(scr_ty0, arms) {
     synth_vec_match(rs_.st, scr, arms, Some(expected), line, col)
   } else {
   # walk arms via `check_arms` so the expected type
@@ -15845,6 +15859,41 @@ fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
     TyCon(_, name, _) -> name == "Vec" and vec_match_has_list_arm(arms)
     _                 -> false
   }
+
+# A fixed-width `Vec[T]<n>` scrutinee routes to the static rewrite: the
+# length is the type, so `synth_fixed_vec_match` picks the one matching
+# arm at compile time — no if-chain, no dynamic-vec op.
+fn fixed_vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
+  ty_is_fixed_vec(scr_ty) and vec_match_has_list_arm(arms)
+
+# Rewrite a fixed-vec match to the selected arm's body. Arms ride the
+# same shape contract as the dynamic rewrite (no guards, simple head
+# binders); the length test is decided here instead of at runtime, so a
+# vec whose length no arm covers is a compile error, not a fallthrough.
+fn synth_fixed_vec_match(st: InferState, scr: Expr, arms: [Arm], scr_ty: Ty,
+                         expected: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let g = vec_match_check_arms(st, arms)
+  if g.ok {
+    let n = fixed_vec_n(scr_ty)
+    match fixed_vec_match_arm(arms, n) {
+      Some(a) -> {
+        let body = fixed_vec_arm_build(a, scr, scr_ty)
+        match expected {
+          None    -> synth(g.st, body)
+          Some(t) -> check_expr_against(g.st, body, t, "match arm", line, col)
+        }
+      }
+      None -> {
+        diag_error(g.st.file, line, col,
+          concat_all(["no arm matches a fixed-width `Vec` of length ", int_to_string(n)]))
+        diag_help("add an arm for that length, a spread pattern (`[a, ...rest]`), or a wildcard `_`")
+        mk_inferred(st_bump_err(g.st), TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
+      }
+    }
+  } else {
+    mk_inferred(g.st, TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
+  }
+}
 
 type VecMatchGate = { st: InferState, ok: Bool }
 
@@ -16069,10 +16118,12 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
     # position collects into a vec. Pure range-headed chains rewrite to
     # the pre-sized collect combinator (one buffer, zero intermediates);
     # anything else materialises once through `vec_from_list`.
-    EMapPipe(_, _) ->
-      if ty_is_vec_head(apply_ty(st.sub, expected)) {
-        check_map_pipe_vec_collect(st, e, e.line, e.col)
-      } else { synth(st, e) }
+    EMapPipe(_, _) -> {
+      let exp = apply_ty(st.sub, expected)
+      if ty_is_fixed_vec(exp) { check_map_pipe_fixed_collect(st, e, exp, e.line, e.col) }
+      else if ty_is_vec_head(exp) { check_map_pipe_vec_collect(st, e, e.line, e.col) }
+      else { synth(st, e) }
+    }
     # annotation-driven ctor disambiguation. When
     # the expected type is `TyCon(_, parent, _)` and the callee is a bare
     # `EVar(cname)` whose qualified `parent::cname` scheme exists,
@@ -16372,12 +16423,14 @@ fn fixed_vec_lit_inferred(r: Inferred, els: [ListElem], hargs: [Ty], bty: Ty,
 fn unboxed_expr(e: Expr) : Expr =
   Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MUnboxed }
 
-# True when `e` is a direct fixed-vec literal — the `__fixed_vec_lit`
-# intrinsic. Only such a value has the flat inline representation; any
-# other `Vec[e]<n>`-typed expression (a function return, a field read)
-# is a dynamic heap vec at runtime.
+# True when `e` already HOLDS the flat inline representation: the
+# `__fixed_vec_lit` intrinsic itself, or a read of a binder that holds
+# one (an aliasing `let`, the fixed-vec match's whole-vec binder). Any
+# other `Vec[e]<n>`-typed expression (a function return, a field read) is
+# a dynamic heap vec at runtime, so its binder de-brands.
 fn is_fixed_vec_lit(e: Expr) : Bool = match e.kind {
   ECall(callee, _) -> match callee.kind { EVar(nm) -> nm == "__fixed_vec_lit"  _ -> false }
+  EVar(_) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
   _ -> false
 }
 
@@ -16458,6 +16511,71 @@ fn check_map_pipe_vec_collect(st: InferState, e: Expr,
 
 fn vec_collect_via_list(e: Expr, line: Int, col: Int) : Expr =
   mk_expr(ECall(mk_expr(EVar("vec_from_list"), line, col), [e]), line, col)
+
+# A map-pipe chain in a `Vec[e]<n>` slot: a fixed vec has no runtime
+# length, so the chain may only collect there when its length is proved
+# HERE. A map is 1:1, so the length is the source's — provable for a
+# literal head (`[a, b, c] | f`), where the chain unrolls to one literal
+# of per-element stage applications and rides the fixed-vec literal path.
+# Any other head has a statically-unknown length and is declined loudly,
+# never silently collected into a wrong-length aggregate.
+fn check_map_pipe_fixed_collect(st: InferState, e: Expr, expected: Ty,
+                                line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match pipe_fusion_as_collect(e) {
+    None -> synth(st, e)
+    Some(fc) -> match fixed_collect_unroll(fc, line, col) {
+      Some(unrolled) -> check_expr_against(st, unrolled, expected, "fixed-width vector collect", line, col)
+      None -> {
+        diag_error(st.file, line, col,
+          concat_all(["a `|` chain cannot collect into a fixed-width `Vec[t]<",
+            int_to_string(fixed_vec_n(expected)),
+            ">`: its length is not known at compile time"]))
+        diag_help("start the chain from a vector literal, or collect into a dynamic `Vec` first")
+        mk_inferred(st_bump_err(st), expected, with_ty(e, expected))
+      }
+    }
+  }
+
+# Unroll `[e0, ..., ek] | f | g` into `[g(f(e0)), ..., g(f(ek))]`. Only a
+# spread-free literal head qualifies: its length is the count, and each
+# element is applied independently so no stage runs more than once per
+# element (the map semantics). The result is a bare literal, so it rides
+# the fixed-vec literal path unchanged.
+fn fixed_collect_unroll(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
+  match fc.source.kind {
+    EList(els) ->
+      if vec_lit_has_spread(els) { None }
+      else { Some(mk_expr(EList(fixed_collect_elems(els, fc.stages, line, col)), line, col)) }
+    _ -> None
+  }
+
+fn fixed_collect_elems(els: [ListElem], stages: [Expr], line: Int, col: Int) : [ListElem] =
+  fixed_collect_elems_at(els, stages, 0, line, col)
+
+# Every per-element copy of a stage takes its own column: perceus keys
+# last-use on node position, and a lambda stage lifts to a symbol named
+# after its position — duplicate positions would collide on both.
+fn fixed_collect_elems_at(els: [ListElem], stages: [Expr], i: Int,
+                          line: Int, col: Int) : [ListElem] =
+  match els {
+    [] -> []
+    [el, ...rest] -> {
+      let tail = fixed_collect_elems_at(rest, stages, i + 1, line, col)
+      match el {
+        ElPlain(x) -> [ElPlain(fixed_collect_apply(x, stages, i, 0, line, col)), ...tail]
+        ElSpread(_) -> tail
+      }
+    }
+  }
+
+fn fixed_collect_apply(x: Expr, stages: [Expr], i: Int, j: Int, line: Int, col: Int) : Expr =
+  match stages {
+    [] -> x
+    [s, ...rest] -> {
+      let sref = Expr { kind: s.kind, line: s.line, col: col + i * 100 + j, ty: s.ty, mode: s.mode }
+      fixed_collect_apply(mk_expr(ECall(sref, [x]), line, col), rest, i, j + 1, line, col)
+    }
+  }
 
 fn check_list_elems_against(st: InferState, els: [ListElem], elem_ty: Ty,
                             line: Int, col: Int) : Inferred / Console + File + Mutable {
