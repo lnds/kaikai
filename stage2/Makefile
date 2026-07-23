@@ -8665,10 +8665,12 @@ test-issue-1426-cross-module-derive-show: $(TARGET) build
 # `home_tu` per-case partition: one fixture whose c-modular split lands
 # each symbol in the TU `home_tu` names. Asserts every decl-to-TU case
 # from one stream — a root pub fn in main.c, a root private fn + main +
-# lambdas in __root__.c, an imported pub fn and its cross-module spec in
-# widget.c — then runs the whole-program build to pin the output. A shift
-# in any case (the empty-TU regression an over-broad `home_tu` causes)
-# fails an assertion; the run pins the partition link-correct.
+# lambdas in __root__.c, an imported pub fn in widget.c, and its
+# program-dependent mono spec in __root__.c (module TUs stay
+# program-independent for the core-TU cache) — then runs the
+# whole-program build to pin the output. A shift in any case (the
+# empty-TU regression an over-broad `home_tu` causes) fails an
+# assertion; the run pins the partition link-correct.
 test-home-tu-partition: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/home-tu-partition; \
@@ -8684,7 +8686,7 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
 	assert_tu "root lambda"        "_kai_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kai_widget__label"           "widget.c"; \
-	assert_tu "cross-module spec"  "kai_widget__wrap__mono__Int" "widget.c"; \
+	assert_tu "cross-module spec"  "kai_widget__wrap__mono__Int" "__root__.c"; \
 	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
 	./build/home_tu_partition > build/home_tu_partition.out; \
