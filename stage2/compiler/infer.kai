@@ -18603,7 +18603,7 @@ fn collect_unit_alias_table_loop(decls: [Decl], acc: [UAliasEntry]) : [UAliasEnt
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DUnit(_, name, Some(body), _, _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
+      DUnit(_, name, UBAlias(body), _, _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
       _ -> collect_unit_alias_table_loop(rest, acc)
     }
   }
@@ -18710,7 +18710,7 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
   # a unit alias body is shape-checked at its declaration —
   # expansion happens after this pass, so a Module-kind product could
   # otherwise ride in through the alias name.
-  DUnit(_, _, Some(body), _, line, col) ->
+  DUnit(_, _, UBAlias(body), _, line, col) ->
     validate_unit_expr(body, scope, file, line, col) +
     validate_module_unit_shape(body, scope, file, line, col)
   DTest(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
@@ -19033,23 +19033,37 @@ fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
                          file: String, line: Int, col: Int) : Int / Console + File = match u {
   UOne -> 0
   UVar(_) -> 0
-  USym(s) -> match scope_resolve_sym(scope, s) {
-    SRok(_) -> 0
-    SRunknown -> {
-      diag_error(file, line, col,
-        concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
-                    "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
-      1
-    }
-    SRambig(kinds) -> {
-      diag_error(file, line, col,
-        concat_all(["unit `", s, "` is ambiguous — it is declared in ",
-                    join_with(kinds, " and "),
-                    "; qualify it (`<", ambig_first_kind(kinds), ".", s,
-                    ">`) or add `use kind ", ambig_first_kind(kinds), "`"]))
-      1
-    }
-  }
+  USym(s) ->
+    if kind_sym_is_qualified(s) { validate_qualified_habitant(s, scope, file, line, col) }
+    else { match scope_resolve_sym(scope, s) {
+      SRok(_) -> 0
+      SRunknown -> {
+        let dom = unit_sym_value_domain(s)
+        if dom == "" {
+          diag_error(file, line, col,
+            concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
+                        "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
+        } else {
+          diag_error(file, line, col,
+            concat_all(["no kind in scope declares `", dom, "` value habitants — `<",
+                        s, ">` needs a `kind K : ... with ", dom, "` declaration"]))
+        }
+        1
+      }
+      SRambig(kinds) -> {
+        let hint =
+          if unit_sym_value_domain(s) == "" {
+            concat_all(["qualify it (`<", ambig_first_kind(kinds), ".", s,
+                        ">`) or add `use kind ", ambig_first_kind(kinds), "`"])
+          } else {
+            concat_all(["add `use kind ", ambig_first_kind(kinds), "`"])
+          }
+        diag_error(file, line, col,
+          concat_all(["unit `", s, "` is ambiguous — it is declared in ",
+                      join_with(kinds, " and "), "; ", hint]))
+        1
+      }
+    } }
   UMul(a, b) -> validate_unit_expr(a, scope, file, line, col) +
                 validate_unit_expr(b, scope, file, line, col)
   UInv(a) -> validate_unit_expr(a, scope, file, line, col)
@@ -19062,6 +19076,40 @@ fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
 fn ambig_first_kind(kinds: [String]) : String = match kinds {
   [] -> "Kind"
   [h, ..._] -> h
+}
+
+# A qualified habitant (`Kind$sym`) checked against its kind's own
+# habitant policy: a value-domain kind admits only values of its
+# domain; a closed-set kind admits only its fixed atoms. Every other
+# kind passes — the qualifier already pinned it.
+fn validate_qualified_habitant(s: String, scope: UnitScope, file: String,
+                               line: Int, col: Int) : Int / Console + File {
+  let kind = kind_sym_kind(s)
+  let bare = kind_sym_bare(s)
+  let dom = scope_value_domain_of(scope, kind)
+  if not (dom == "") {
+    if unit_sym_value_domain(bare) == dom { 0 }
+    else {
+      diag_error(file, line, col,
+        concat_all(["`", bare, "` is not a habitant of `", kind, "` — its habitants",
+                    " are `", dom, "` values written directly in `<>`",
+                    if dom == "Int" { " (e.g. `<3>`)" } else { " (e.g. `<\"tag\">`)" }]))
+      1
+    }
+  } else {
+    let atoms = scope_closed_atoms_of(scope, kind)
+    match atoms {
+      [] -> 0
+      _ ->
+        if list_has(atoms, bare) { 0 }
+        else {
+          diag_error(file, line, col,
+            concat_all(["`", bare, "` is not a habitant of the closed kind `", kind,
+                        "` — its habitants are: ", join_with(atoms, ", ")]))
+          1
+        }
+    }
+  }
 }
 
 # Reserved unit symbols the compiler treats as built-in (currently

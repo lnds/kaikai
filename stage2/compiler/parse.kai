@@ -5551,12 +5551,16 @@ fn parse_use_decl(p: Parser, t: Token) : PDecl / Console {
   }
 }
 
-# Parse a habitant declaration. Two shapes, either introducer word:
+# Parse a habitant declaration. Three shapes, either introducer word:
 #   `unit USD` / `metric m`                       — atomic
 #   `unit Newton = kg * m / sec^2`                — alias
-# `t` is the introducer token (`unit` or a user kind's word); its
-# source is stored verbatim so the formatter round-trips it and the
-# typer maps it to its kind through the KindReg.
+#   `pct pct70 = 70`                              — measure-carrying
+# The RHS disambiguates LL(1): an integer literal other than `1` is a
+# measure payload (`= 1` keeps its meaning as the dimensionless alias);
+# anything else is a unit alias expression. `t` is the introducer token
+# (`unit` or a user kind's word); its source is stored verbatim so the
+# formatter round-trips it and the typer maps it to its kind through
+# the KindReg.
 fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
 
   let intro = tok_source(p.src, t)
@@ -5568,14 +5572,35 @@ fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
     let p1 = p_advance(p)
     if p_at(p1, TkEq) {
       let p2 = p_skip_newlines(p_advance(p1))
-      let rb = parse_unit_expr(p2)
-      match rb.r {
-        None -> err_d(rb.p)
-        Some(u) -> ok_d(rb.p, DUnit(is_pub, name, Some(u), intro, t.line, t.col))
+      let mt = p_peek(p2)
+      if tk_is(mt.kind, TkInt) and not (decode_int(tok_source(p2.src, mt)) == 1) {
+        parse_unit_measure(p2, is_pub, name, intro, t)
+      } else {
+        let rb = parse_unit_expr(p2)
+        match rb.r {
+          None -> err_d(rb.p)
+          Some(u) -> ok_d(rb.p, DUnit(is_pub, name, UBAlias(u), intro, t.line, t.col))
+        }
       }
     } else {
-      ok_d(p1, DUnit(is_pub, name, None, intro, t.line, t.col))
+      ok_d(p1, DUnit(is_pub, name, UBNone, intro, t.line, t.col))
     }
+  }
+}
+
+# The measure payload of a habitant declaration: exactly one integer
+# literal. An operator after it means the user wrote an expression,
+# which a measure must not be — the sum a measure-carrying theory
+# verifies has to be exact, so the payload is a literal, not a term.
+fn parse_unit_measure(p: Parser, is_pub: Bool, name: String, intro: String,
+                      t: Token) : PDecl / Console {
+  let lit = tok_source(p.src, p_peek(p))
+  let p1 = p_advance(p)
+  if p_at(p1, TkStar) or p_at(p1, TkSlash) or p_at(p1, TkCaret) or
+     p_at(p1, TkPlus) or p_at(p1, TkMinus) or p_at(p1, TkPercent) {
+    err_d(p_error_here(p1, "a habitant measure must be a single exact numeric literal (e.g. `= 70`)"))
+  } else {
+    ok_d(p1, DUnit(is_pub, name, UBMeasure(lit), intro, t.line, t.col))
   }
 }
 
@@ -5778,28 +5803,67 @@ fn parse_kind_over(p: Parser, is_pub: Bool, name: String,
 fn parse_kind_with(p: Parser, is_pub: Bool, name: String, thy: String,
                    over: String, t: Token) : PDecl / Console {
   if not p_at(p, TkWith) {
-    ok_d(p, DKind(is_pub, name, thy, over, "", t.line, t.col))
+    ok_d(p, DKind(is_pub, name, thy, over, HabNone, t.line, t.col))
   } else {
     parse_kind_introducer(p_advance(p), is_pub, name, thy, over, t)
   }
 }
 
-# The `with <introducer>` tail of a `kind` decl. The introducer is
-# `type` / `effect` (the builtin kinds', spelled with their keywords),
-# or any identifier (`unit`, `metric`, `cur`, …) that becomes the
-# habitant-declaring word for this kind. Stored verbatim on the `DKind`.
+# The `with <habitant-form>` tail of a `kind` decl, LL(1) on the
+# token after `with`: `type` / `effect` keywords are the builtin
+# kinds' introducers; an uppercase ident is a value domain (form b);
+# a lowercase ident is an introducer word, and an immediately
+# following `{` opens the closed habitant set (form d).
 fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
                          thy: String, over: String, t: Token) : PDecl / Console {
   if p_at(p, TkType) {
-    ok_d(p_advance(p), DKind(is_pub, name, thy, over, "type", t.line, t.col))
+    ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("type"), t.line, t.col))
   } else if p_at(p, TkEffect) {
-    ok_d(p_advance(p), DKind(is_pub, name, thy, over, "effect", t.line, t.col))
+    ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("effect"), t.line, t.col))
   } else {
     let it = p_peek(p)
     if not tk_is(it.kind, TkIdent) {
-      err_d(p_error_here(p, "expected an introducer word after `with` (e.g. `with metric`)"))
+      err_d(p_error_here(p, "expected an introducer word or a value domain after `with` (e.g. `with metric`, `with Int`)"))
+    } else if is_upper_ident(p.src, it) {
+      let dom = tok_source(p.src, it)
+      if dom == "Int" or dom == "String" {
+        ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabDomain(dom), t.line, t.col))
+      } else {
+        err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
+      }
     } else {
-      ok_d(p_advance(p), DKind(is_pub, name, thy, over, tok_source(p.src, it), t.line, t.col))
+      let word = tok_source(p.src, it)
+      let p1 = p_advance(p)
+      if p_at(p1, TkLbrace) {
+        parse_kind_closed_set(p_skip_newlines(p_advance(p1)), is_pub, name, thy,
+                              over, word, t, [])
+      } else {
+        ok_d(p1, DKind(is_pub, name, thy, over, HabIntro(word), t.line, t.col))
+      }
+    }
+  }
+}
+
+# The atoms of a closed habitant set (`with layout { be le }`), bare
+# identifiers up to `}`. The parser accepts the block; resolution
+# validates each atom against the theory engine's known set.
+fn parse_kind_closed_set(p: Parser, is_pub: Bool, name: String, thy: String,
+                         over: String, word: String, t: Token,
+                         acc: [String]) : PDecl / Console {
+  if p_at(p, TkRbrace) {
+    match acc {
+      [] -> err_d(p_error_here(p, "a closed habitant set cannot be empty"))
+      _ -> ok_d(p_advance(p),
+                DKind(is_pub, name, thy, over, HabClosed(word, list_reverse(acc)),
+                      t.line, t.col))
+    }
+  } else {
+    let a = p_peek(p)
+    if not tk_is(a.kind, TkIdent) {
+      err_d(p_error_here(p, "expected a habitant atom or `}` in the closed habitant set"))
+    } else {
+      parse_kind_closed_set(p_skip_newlines(p_advance(p)), is_pub, name, thy,
+                            over, word, t, [tok_source(p.src, a), ...acc])
     }
   }
 }
@@ -5890,10 +5954,16 @@ fn parse_unit_factor(p: Parser) : PUnit / Console {
       ok_u(p_advance(p), USym(tok_source(p.src, t)))
     }
   } else if tk_is(t.kind, TkInt) {
-    # `<1>` is the dimensionless unit. Reject other ints.
+    # `<1>` is the dimensionless unit; any other integer is a value
+    # habitant, resolved by domain against the `with Int` kinds.
     let span = tok_source(p.src, t)
     if decode_int(span) == 1 { ok_u(p_advance(p), UOne) }
-    else { err_u(p_error(p, t, "only `1` is allowed as a unit literal (use a unit symbol or a parenthesised expression instead)")) }
+    else { ok_u(p_advance(p), USym(span)) }
+  } else if tk_is(t.kind, TkString) {
+    # A string literal is a value habitant of a `with String` kind.
+    # The quoted source text is the symbol, disjoint from every
+    # identifier habitant by its leading quote.
+    ok_u(p_advance(p), USym(tok_source(p.src, t)))
   } else if tk_is(t.kind, TkLparen) {
     let r = parse_unit_expr(p_advance(p))
     match r.r {

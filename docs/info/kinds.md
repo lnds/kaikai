@@ -272,24 +272,93 @@ frame body
 fn main() : Unit / Stdout = Stdout.print("ok")
 ```
 
-## Worked example — a `Waterfall` kind (design sketch)
+## Habitant forms — one `with`, four shapes
+
+The `with` clause declares what a habitant *is*. Four forms, selected
+by the token after `with` (uppercase = value domain, lowercase =
+introducer word, `{` after the word = closed set):
+
+- **(a) introducer → symbol** — `with metric` ⇒ `metric m`. An
+  opaque, user-declared symbol, open set. `Measure` (`unit`),
+  `Currency` (`currency`), and every example above.
+- **(b) type → value** — `with Int` or `with String`. Habitants are
+  **values** of that domain written directly in `<>` (`<3>`,
+  `<"tag">`), never declared; the domain restricts validity. `<3>`
+  unifies with `<3>` and never with `<4>` — first-order value
+  equality.
+- **(c) introducer → symbol-with-measure** — `with pct` ⇒
+  `pct pct70 = 70`. A declared symbol carrying an exact numeric
+  measure, legal only on a kind whose theory sums one
+  (`Composition`). The measure is a single integer literal, never an
+  expression — the sum the theory verifies must be exact.
+- **(d) closed set** — `with layout { be le }`. Habitants are a
+  **fixed** set of atoms the theory's engine ships with built-in
+  semantics; the user adds none. `Layout` is declared exactly this
+  way in the catalog. Naming an atom the engine does not know, or
+  declaring a habitant into a closed kind, is a compile error.
+
+A form-(b) kind in action — the value domain checks the habitant:
+
+```kaikai
+kind Slot : AbelianGroup with Int
+
+fn hold(x: Real<3>) : Real<3> = x
+
+fn main() : Unit / Stdout = {
+  let a : Real<3> = 5.0<3>
+  let _ = hold(a)
+  Stdout.print("ok")
+}
+```
+
+```kaikai-neg
+kind Slot : AbelianGroup with Int
+
+fn bad(x: Real<Slot.USD>) : Int = 0     # `Int` values only, `<3>`-style
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+A closed set may name only engine-known atoms, and admits no habitant
+declarations:
+
+```kaikai-neg
+kind Frame : Composition over Int with fr { be le xyz }   # xyz unknown
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+```kaikai-neg
+layout xyz          # Layout is closed: be, le are fixed
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+## Worked example — a `Waterfall` kind (form c)
 
 `Composition` being public means a user can build the
 *measure-in-the-habitant* shape too — a fintech waterfall where a
-CDO's tranches must sum to 100%, verified in the type. The habitant
-carries its measure and `Composition` sums it. This form (habitant
-`= N`) is a design sketch, not shipped surface:
+CDO's tranches must sum to 100%, verified in the type. Each habitant
+declares its measure and `Composition` sums it:
 
-```text
-kind Waterfall : Composition with pct
-pct senior   = 70          # each habitant declares its measure
-pct mezz     = 20
-pct equity   = 10          # Composition checks the sum closes to 100
+```kaikai
+kind Waterfall : Composition over Int with pct
+
+pct senior = 70
+pct mezz   = 20
+pct equity = 10
+
+fn main() : Unit / Stdout = Stdout.print("ok")
 ```
 
+The surface parses, registers, and validates the measures; the engine
+that *sums* them (the closes-to-100 check) is not wired yet.
+
 Because the measure must verify a total exactly, `Composition`
-measures are integer or rational, never float: `0.1 + 0.2 ≠ 0.3` in
-IEEE-754 would fail a legitimate waterfall on a rounding artefact.
+measures are integer, never float: `0.1 + 0.2 ≠ 0.3` in IEEE-754
+would fail a legitimate waterfall on a rounding artefact — so
+`pct bad = 70 * 2` (an expression) and `unit km = 1000` (a measure on
+an opaque theory) are both rejected at the declaration.
 
 ## See also
 
