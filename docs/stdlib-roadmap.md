@@ -61,7 +61,7 @@ fs/  file.kai dir.kai path.kai
 net/  tcp.kai http.kai
 os/  args.kai env.kai
 top-level: actor.kai array.kai date.kai decimal.kai effects.kai
-           log.kai loop.kai money.kai path.kai protocols.kai
+           json_bind.kai log.kai loop.kai money.kai path.kai protocols.kai
            random.kai random_secure.kai reader.kai regexp.kai
            spawn.kai time.kai trace.kai uuid.kai writer.kai
 ```
@@ -84,6 +84,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `actor` spawn with explicit policy      | shipped (closes #763): `spawn_actor_policy(policy, body)` in `stdlib/actor.kai` — spawned actor's mailbox honours an explicit `MailboxPolicy` (bounded back-pressure / drop policies); new runtime primitive `kai_mailbox_alloc_bounded_unowned` (owner-reassign protocol, no parent `mailbox`-slot clobber); fixtures `examples/effects/issue_763_spawn_actor_policy_{block_sender,drop_oldest}.kai` |
 | `math/real` libm bindings               | shipped via PR #359 (closes #343): sqrt, trig, exp/log, pow, atan2 over libm; `fmod` follow-up via #364 enables `Real % Real`  |
 | `encoding/json` Real numbers            | shipped (closes #361): decoder accepts decimals + scientific notation; new `JReal(Real)` variant alongside `JNum(Int)`         |
+| `#[derive(Json)]` typed struct binding  | shipped (closes #1280): `#[derive(Json)]` emits `impl Json for T` (`to_json` / `of_json`) plus a `<lower(T)>_of_json` shim, over records of `String`/`Int`/`Real`/`Bool`/`[T]`/`Option[T]`/nested-record fields. Four binding policies fixed in the derive: field names go to the wire verbatim (no case conversion); `Option[T]` accepts an explicit `null` and a missing key alike, every other field is required; failures are `Result[T, JsonError]` carrying the JSON path to the offending node (`address.boxes[2].zip`); unknown keys are ignored. `JsonValue`/`JsonError`/`protocol Json` in `stdlib/protocols.kai`, runtime in `stdlib/json_bind.kai`, impl builder in `stage2/compiler/json_derive.kai`. Sum types, `Option[Option[T]]`, and generic heads are rejected at the derive with a located diagnostic. Fixtures `examples/stdlib/json_derive_{roundtrip,absence,error_path}.kai` + `examples/negative/derive/derive_json_{sum_type,unbindable_field}.kai` |
 | `encoding/json` surrogate-pair UTF-8    | shipped (closes #362): decoder folds `\uD8xx\uDCxx` pairs into 4-byte UTF-8 sequences; BMP `\uXXXX` emits 1–3 UTF-8 bytes; encoder emits raw UTF-8 verbatim per RFC 8259 §8.1; lone or invalid surrogates yield `None` |
 | `core/tuple` helpers                    | shipped (closes #348): `tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`/`second`/`third`. `fst`/`snd` projections stay field-access only — adding bare `pub fn fst`/`snd` poisons every existing `record.fst` access whose receiver type isn't yet pinned by inference (see module header) |
 | `core/list` surface expansion           | shipped (closes #340): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. `group_by` uses Erlang/Elixir consecutive-key semantics; its key type is still `Int` for v1 (it carries no `: Eq` bound), unlike `uniq` which is now `[T : Eq]` (see the aggregate-generalisation row) |
