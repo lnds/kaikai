@@ -1,45 +1,37 @@
 # demos/stdin_concurrent — issue #620 Phase R3 reactor proof for
 # non-blocking stdin. One fiber reads lines from stdin until EOF
-# while a second fiber does compute work in parallel through a
-# nursery. With the R3 reactor wired the stdin reader parks the
-# *fiber* on POLLIN against `STDIN_FILENO`, leaving the OS thread
-# free to dispatch the compute fiber's yields. Pre-R3 the reader
-# blocked the OS thread on `fgetc(stdin)` and the compute fiber
-# starved until the read returned.
+# while a second fiber counts compute round-trips through a nursery.
+# With the R3 reactor wired the stdin reader parks the *fiber* on
+# POLLIN against `STDIN_FILENO`, leaving the OS thread free to
+# dispatch the compute fiber's yields. Pre-R3 the reader blocked the
+# OS thread on `fgetc(stdin)` and the compute fiber starved until the
+# read returned — which now fails as a hang at the nursery join.
 #
-# The golden records where `reader eof` lands relative to the compute
-# fiber's prints, which is fixed only while both fibers share one
-# scheduler thread — hence the `KAI_THREADS=1` in `main.env`.
+# How the compute steps interleave with the reader's park is
+# scheduler-dependent, so the compute fiber prints nothing; main
+# reports its step count after the join. Every printed line is then
+# ordered by happens-before ("reader eof" precedes the join that
+# main's prints wait on), so the output is identical at any
+# KAI_THREADS.
 #
 # The fixture is a correctness gate, not a wall-time gate. The
-# harness invokes `$d-bin` without piping anything to its stdin,
+# harness invokes the binary without piping anything to its stdin,
 # so `read_line()` resolves to `None` on the first iteration and
-# the reader exits cleanly. The compute fiber's "step" lines run
-# concurrently with the reader's single "reader eof" line; the
-# nursery join order pins the trailing "ok" so the golden is
-# stable.
-#
-# To observe the parking behaviour manually, run:
-#
-#   (sleep 0.5 && echo line1 && sleep 0.5 && echo line2) | \
-#     stage2/kaic2 ... demos/stdin_concurrent/main.kai > /tmp/out.c \
-#     && cc -I stage0 /tmp/out.c -o /tmp/demo && /tmp/demo
-#
-# The compute fiber's "step" lines should interleave with the
-# reader's "got: lineN" lines instead of all five steps printing
-# before the first read.
+# the reader exits cleanly. To observe the parking behaviour
+# manually, pipe slow input (`(sleep 0.5; echo line1) | ...`) into a
+# build of this file and watch the reader resume between waits.
 
 import spawn
 
-fn compute_step() : Unit / Spawn + Stdout = {
-  Stdout.print("compute step")
-  Spawn.yield()
-}
-
-fn compute_loop() : Unit / Spawn + Stdout = {
-  compute_step()
-  compute_step()
-  compute_step()
+# Each yield hands the CPU away; a step counts only when the scheduler
+# resumes this fiber, so the returned total witnesses real round-trips.
+fn compute_loop(step: Int, total: Int) : Int / Spawn = {
+  if step < total {
+    Spawn.yield()
+    compute_loop(step + 1, total)
+  } else {
+    step
+  }
 }
 
 fn stdin_reader() : Unit / Stdin + Stdout = {
@@ -50,12 +42,13 @@ fn stdin_reader() : Unit / Stdin + Stdout = {
 }
 
 fn main() : Int / Spawn + Stdin + Stdout = {
-  nursery { n ->
+  let steps = nursery { n ->
     let f1 = n.spawn(stdin_reader)
-    let f2 = n.spawn(compute_loop)
+    let f2 = n.spawn(() => compute_loop(0, 3))
     n.await(f1)
     n.await(f2)
   }
+  Stdout.print("compute steps: #{int_to_string(steps)}")
   Stdout.print("ok")
   0
 }
