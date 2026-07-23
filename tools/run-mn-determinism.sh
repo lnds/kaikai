@@ -36,6 +36,17 @@ trap 'rm -rf "$TMP"' EXIT
 RUN_TIMEOUT="${MN_RUN_TIMEOUT:-60}"
 REPEATS="${MN_REPEATS:-3}"
 
+# Per-fixture repeat override for the fixtures built to make a rare race
+# window collide constantly: at the default 3 repeats an intermittent that
+# reproduces on ~1/5 runs still slips through most gate invocations; ten
+# short rounds push the escape odds below a percent while staying bounded.
+repeats_for() {
+  case "$1" in
+    examples/effects/mn_recv_timeout_deadline_race.kai) echo 10 ;;
+    *) echo "$REPEATS" ;;
+  esac
+}
+
 FIXTURES=(
   "demos/parallel_actors/main.kai"
   "examples/effects/mn_cross_thread_copy_stress.kai"
@@ -57,6 +68,14 @@ FIXTURES=(
   # thread while the reactor owns it — unsynchronized, that strands a sleeper
   # (hang) or corrupts the parked count.
   "examples/effects/mn_recv_timeout_wheel.kai"
+  # The same dual-park with the deadline set EQUAL to the producer's pacing,
+  # so timer expiry and message arrival collide on nearly every receive. A
+  # wake landing on a later park of the same fiber (the reactor's batched
+  # unpark racing a send, or a consumed wake permit) must be treated as
+  # spurious and re-parked — mistaking it for the deadline returns a
+  # premature None while still wheel-linked, and the next park double-inserts
+  # the fiber, corrupting the wheel.
+  "examples/effects/mn_recv_timeout_deadline_race.kai"
   # Fiber wrappers dropping to RC=0 on a thread other than the one each fiber
   # ran on: the free path must not release a stack that is still live.
   "examples/effects/mn_fiber_free_race.kai"
@@ -151,10 +170,11 @@ for src in "${FIXTURES[@]}"; do
     # `default` is the unset arm: KAI_THREADS absent resolves to the host
     # CPU count, so it is what a user actually runs. Gating only the
     # explicit counts would leave the shipped configuration untested.
+    reps="$(repeats_for "$src")"
     for n in default 4 8; do
       if [ "$n" = default ]; then run_env=(env -u KAI_THREADS); else run_env=(env KAI_THREADS="$n"); fi
       ok=0; diverge=0; empty=0; crash=0; hang=0; witness=""
-      for _ in $(seq 1 "$REPEATS"); do
+      for _ in $(seq 1 "$reps"); do
         ec=0
         kai_timeout "$RUN_TIMEOUT" "${run_env[@]}" "$bin" \
           >"$TMP/run.out" 2>"$TMP/run.err" || ec=$?
@@ -172,10 +192,10 @@ for src in "${FIXTURES[@]}"; do
           ok=$((ok+1))
         fi
       done
-      if [ "$ok" = "$REPEATS" ]; then
-        echo "OK   $tag N=$n ($REPEATS/$REPEATS == N=1: $(witness_of "$ref"))"
+      if [ "$ok" = "$reps" ]; then
+        echo "OK   $tag N=$n ($reps/$reps == N=1: $(witness_of "$ref"))"
       else
-        echo "FAIL $tag N=$n: ok=$ok diverge=$diverge empty=$empty crash=$crash hang=$hang of $REPEATS${witness:+ — $witness}"
+        echo "FAIL $tag N=$n: ok=$ok diverge=$diverge empty=$empty crash=$crash hang=$hang of $reps${witness:+ — $witness}"
         fail=1
       fi
     done
