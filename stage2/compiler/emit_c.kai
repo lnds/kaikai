@@ -4998,6 +4998,7 @@ fn pat_lit_raw(p: Pattern) : String {
       EInt(n)  -> cat2(int_to_string(n), "LL")
       EBool(b) -> if b { "1" } else { "0" }
       EChar(c) -> int_to_string(char_to_int(c))
+      EFixed(span, _) -> int_to_string(decode_int(span))
       _ -> "0LL /* pat_lit_raw: unexpected lit */"
     }
     _ -> "0LL /* pat_lit_raw: not a literal pattern */"
@@ -5098,6 +5099,7 @@ fn box_for_raw_cty(cty: String, expr: String) : String =
   if cty == "int64_t" { concat_all(["kai_int(", expr, ")"]) }
   else if cty == "double" { concat_all(["kai_real(", expr, ")"]) }
   else if cty == "uint32_t" { concat_all(["kai_char(", expr, ")"]) }
+  else if cty == "uint8_t" { concat_all(["kai_byte(", expr, ")"]) }
   else { concat_all(["kai_int(", expr, ")"]) }
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
@@ -6170,6 +6172,7 @@ fn raw_c_type(opt_ty: Option[Ty]) : String {
       TyReal -> "double"
       TyBool -> "int"
       TyChar -> "uint32_t"
+      TyByte -> "uint8_t"
       TyInt32  -> "int32_t"
       TyUInt32 -> "uint32_t"
       TyUInt64 -> "uint64_t"
@@ -6200,6 +6203,7 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
       TyReal -> cat3("kai_real(", raw, ")")
       TyBool -> cat3("kai_bool(", raw, ")")
       TyChar -> cat3("kai_char(", raw, ")")
+      TyByte -> cat3("kai_byte(", raw, ")")
       TyInt32  -> cat3("kai_int32(",  raw, ")")
       TyUInt32 -> cat3("kai_uint32(", raw, ")")
       TyUInt64 -> cat3("kai_uint64(", raw, ")")
@@ -6242,10 +6246,11 @@ fn ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
 }
 
 # True when the optional type is one of the fixed-width integer
-# primitives. They share the raw-arithmetic wrapping discipline with
-# `Int`; the cast width differs (per `raw_signed_c_type`).
+# primitives (Byte included). They share the raw-arithmetic wrapping
+# discipline with `Int`; the cast width differs (per `raw_signed_c_type`).
 fn ty_opt_is_fixed_width(opt_ty: Option[Ty]) : Bool = match opt_ty {
   Some(t) -> match t {
+    TyByte -> true
     TyInt32 -> true   TyUInt32 -> true
     TyUInt64 -> true  TyInt128 -> true
     _ -> false
@@ -6258,12 +6263,22 @@ fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
   is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
 }
 
-# True when a raw EBinop is a signed-`Int` `/`/`%` — the one that must route
+# True when a raw EBinop is an `Int` or `Byte` `/`/`%` — those route
 # through the trapping helper (`kai_idiv_chk`/`kai_imod_chk`) rather than a
-# bare `a / b`. Only `Int` (i64) reaches the raw path for div/mod; fixed-width
-# div/mod stays boxed and already traps via `kai_fixed_div`.
+# bare `a / b`, so a zero divisor traps clean. A Byte operand widens into
+# the i64 helper losslessly (0..255) and the result is truncated back at
+# its own border. Fixed-width 32/64/128 div stays boxed (`kai_fixed_div`).
 fn raw_int_divmod_is_checked(op: String, opt_ty: Option[Ty]) : Bool {
-  (op == "/" or op == "%") and ty_opt_is_int(opt_ty)
+  (op == "/" or op == "%") and (ty_opt_is_int(opt_ty) or ty_opt_is_byte(opt_ty))
+}
+
+fn ty_opt_is_byte(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyByte -> true
+    TyRefineT(inner, _) -> match inner { TyByte -> true _ -> false }
+    _ -> false
+  }
+  None -> false
 }
 
 # The signed/unsigned C scalar type a raw integer slot computes in.
@@ -6271,6 +6286,7 @@ fn raw_int_divmod_is_checked(op: String, opt_ty: Option[Ty]) : Bool {
 # pick their exact width. The unsigned form drives the two's-complement
 # wrap (defined C, no UBSan trap); the signed form is the cast back.
 fn raw_signed_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyByte)   -> "uint8_t"
   Some(TyInt32)  -> "int32_t"
   Some(TyUInt32) -> "uint32_t"
   Some(TyUInt64) -> "uint64_t"
@@ -6281,6 +6297,7 @@ fn raw_signed_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
 }
 
 fn raw_unsigned_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyByte)   -> "uint8_t"
   Some(TyInt32)  -> "uint32_t"
   Some(TyUInt32) -> "uint32_t"
   Some(TyUInt64) -> "uint64_t"
@@ -6295,6 +6312,7 @@ fn raw_unsigned_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
 # values above 2^63 (which overflow `decode_int`), so they parse their
 # textual span at runtime via `kai_i128_parse` and cast to the width.
 fn fixed_raw_c_lit(span: String, ty: Ty) : String = match ty {
+  TyByte   -> cat3("((uint8_t)", int_to_string(decode_int(span)), ")")
   TyInt32  -> cat3("((int32_t)", int_to_string(decode_int(span)), "LL)")
   TyUInt32 -> cat3("((uint32_t)", int_to_string(decode_int(span)), "ULL)")
   TyUInt64 -> cat3("((uint64_t)kai_i128_parse(\"", span, "\"))")
@@ -6369,6 +6387,7 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
       TyReal -> "->as.r"
       TyBool -> "->as.b"
       TyChar -> "->as.c"
+      TyByte -> "->as.byte_val"
       TyInt32  -> "->as.i32"
       TyUInt32 -> "->as.u32"
       TyUInt64 -> "->as.u64"

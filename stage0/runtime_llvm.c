@@ -943,6 +943,9 @@ int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
 /* Borrow-read a boxed Char's raw codepoint without decref'ing — the
    box→raw border for a boxed Char reaching the raw u32 path. */
 int32_t kaix_char_field(KaiValue *v) { return (int32_t) v->as.c; }
+/* Borrow-read a boxed Byte's raw value without decref'ing — the box→raw
+   border for a boxed Byte reaching the raw u8 path. */
+int32_t kaix_byte_field(KaiValue *v) { return (int32_t) v->as.byte_val; }
 
 /* FFI v1 (issue #260) box→raw borrows for the native `extern "C" fn`
    shim. A shim unboxes each boxed param to its raw C scalar, calls the

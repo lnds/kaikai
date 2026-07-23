@@ -390,7 +390,10 @@ In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
 
 The `u8` suffix writes a `Byte` (`200u8`); a value outside `0..255` is a
-compile-time error. The `d` suffix writes a `Decimal` (`19.99d`, `42d`),
+compile-time error. Byte arithmetic (`+ - * / %`) wraps at 8 bits
+(`250u8 + 10u8` is `4`), comparisons work, and `/`/`%` trap on a zero
+divisor; Byte literals also match as patterns (`match b { 0u8 -> … }`).
+The `d` suffix writes a `Decimal` (`19.99d`, `42d`),
 folding the exact `{ raw, scale }` from the source digits; past the
 `Int128` carrier it errors, pointing at `DecimalBig`.
 

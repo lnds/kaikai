@@ -8102,15 +8102,17 @@ static KaiValue *kai_core_each(KaiValue *xs, KaiValue *f) {
  * silences the UB without changing any emitted output. Division and
  * comparison stay signed (their overflow is not part of the contract).
  */
-/* Fixed-width boxed arithmetic (numeric lane A). The native backend
- * boxes fixed-width literals, so `+`/`-`/`*` over two same-tag boxes land
- * here. Each computes in the unsigned of the width (defined two's-
- * complement wrap) and re-boxes. Returns NULL when the pair is not a
- * matching fixed-width pair, so the caller falls through to its Int/Real
- * path. (The C backend never reaches this — it keeps fixed-width raw.) */
+/* Fixed-width boxed arithmetic (numeric lane A). `+`/`-`/`*` over two
+ * same-tag fixed-width boxes land here on both backends. Each computes in
+ * the unsigned of the width (defined two's-complement wrap) and re-boxes.
+ * Returns NULL when the pair is not a matching fixed-width pair, so the
+ * caller falls through to its Int/Real path. Byte also has a raw path;
+ * this arm is its boxed border (a boxed operand keeps the binop boxed). */
 static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
     switch ((KaiTag) a->tag) {
+        case KAI_BYTE: { uint8_t x = a->as.byte_val, y = b->as.byte_val;
+            uint8_t r = op == '+' ? (uint8_t)(x + y) : op == '-' ? (uint8_t)(x - y) : (uint8_t)(x * y); return kai_byte(r); }
         case KAI_INT32: { uint32_t x = (uint32_t) a->as.i32, y = (uint32_t) b->as.i32;
             uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int32((int32_t) r); }
         case KAI_UINT32: { uint32_t x = a->as.u32, y = b->as.u32;
@@ -8130,6 +8132,7 @@ static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
 static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
     switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   { uint8_t  y = b->as.byte_val; if (y == 0) { kai_trap_abort("divide by zero"); } return kai_byte((uint8_t)(a->as.byte_val / y)); }
         case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int32(a->as.i32 / y); }
         case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint32(a->as.u32 / y); }
         case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint64(a->as.u64 / y); }
@@ -8200,6 +8203,9 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a) && kai_is_int(b)) {
         if (kai_intf(b) == 0) { kai_trap_abort("mod by zero"); }
         r = kai_int(kai_intf(a) % kai_intf(b));
+    } else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) {
+        if (b->as.byte_val == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_byte((uint8_t)(a->as.byte_val % b->as.byte_val));
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8227,6 +8233,7 @@ static int64_t kai_imod_chk(int64_t a, int64_t b) {
 static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
     switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   *out = a->as.byte_val < b->as.byte_val; return 1;
         case KAI_INT32:  *out = a->as.i32  < b->as.i32;  return 1;
         case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
         case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
@@ -8272,6 +8279,7 @@ static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) > kai_intf(b));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
     else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
+    else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) r = kai_bool(a->as.byte_val > b->as.byte_val);
     else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
