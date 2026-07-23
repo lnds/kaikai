@@ -82,6 +82,7 @@ void * kaix_core_llvm_build_zext(void *b, void *v, void *ty) { return kai_llvm_b
 void * kaix_core_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) { return kai_llvm_build_zext_i1_i32(b, v, i32ty); }
 void * kaix_core_llvm_const_i32(void *i32ty, int64_t v) { return kai_llvm_const_i32(i32ty, v); }
 void * kaix_core_llvm_const_int(void *i64ty, int64_t v) { return kai_llvm_const_int(i64ty, v); }
+void * kaix_core_llvm_const_i128_str(void *i128ty, KaiValue *s) { return kai_llvm_const_i128_str(i128ty, s); }
 void * kaix_core_llvm_const_null(void *ptr_t) { return kai_llvm_const_null(ptr_t); }
 void * kaix_core_llvm_const_real(void *f64ty, double d) { return kai_llvm_const_real(f64ty, d); }
 int64_t kaix_core_llvm_emit_object(void *m, KaiValue *path) { return kai_llvm_emit_object(m, path); }
@@ -115,6 +116,7 @@ KaiValue * kaix_core_native_ctx_frame_slot_eff(void *cv, KaiValue *symv, int64_t
 int64_t kaix_core_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValue *effv) { return kai_native_ctx_frame_slot_index(cv, symv, effv); }
 void * kaix_core_native_ctx_i32t(void *c) { return kai_native_ctx_i32t(c); }
 void * kaix_core_native_ctx_i64t(void *c) { return kai_native_ctx_i64t(c); }
+void * kaix_core_native_ctx_i128t(void *c) { return kai_native_ctx_i128t(c); }
 void * kaix_core_native_ctx_m(void *c) { return kai_native_ctx_m(c); }
 void * kaix_core_native_ctx_new(void *m) { return kai_native_ctx_new(m); }
 int64_t kaix_core_native_ctx_ok(void *c) { return kai_native_ctx_ok(c); }

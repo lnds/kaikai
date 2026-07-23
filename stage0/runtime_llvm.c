@@ -112,11 +112,15 @@ KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
  * backend boxes a fixed-width literal through these; arithmetic and
  * comparison ride the shared `kai_op_*` runtime, which dispatches on the
  * KAI_INT32/.../KAI_INT128 tags. Int32/UInt32/UInt64 take the value as a
- * 64-bit arg (the emitter sign/zero-extends the iN const); Int128 takes
- * its decimal/hex string global and parses it (no 128-bit LLVM arg). */
+ * 64-bit arg (the emitter sign/zero-extends the iN const); Int128 takes it
+ * as a 128-bit arg (LLVM lowers `i128` to a register pair matching the C
+ * `__int128` ABI) — `kai_int128` stores it through the alignment-safe
+ * halves. The `_str` form remains for literals above the compiler's 64-bit
+ * decode that the C backend materialises as a decimal span. */
 KaiValue *kaix_int32(int64_t v)                { return kai_int32((int32_t) v); }
 KaiValue *kaix_uint32(int64_t v)               { return kai_uint32((uint32_t) v); }
 KaiValue *kaix_uint64(int64_t v)               { return kai_uint64((uint64_t) v); }
+KaiValue *kaix_int128(__int128 v)              { return kai_int128(v); }
 KaiValue *kaix_uint64_str(const char *s)       { return kai_uint64((uint64_t) kai_i128_parse(s)); }
 KaiValue *kaix_int128_str(const char *s)       { return kai_int128(kai_i128_parse(s)); }
 
@@ -957,6 +961,10 @@ int32_t kaix_byte_field(KaiValue *v) { return (int32_t) v->as.byte_val; }
 int32_t kaix_int32_field(KaiValue *v)  { return v->as.i32; }
 int32_t kaix_uint32_field(KaiValue *v) { return (int32_t) v->as.u32; }
 int64_t kaix_uint64_field(KaiValue *v) { return (int64_t) v->as.u64; }
+/* Int128 rides an i128 register; its payload spans two 8-byte halves, so
+   the borrow reads through the alignment-safe load — never a bare
+   `->as.i128`, whose 16-byte alignment the 8-byte KaiValue does not meet. */
+__int128 kaix_int128_field(KaiValue *v) { return kai_i128_load(v); }
 
 /* FFI v1 (issue #260) box→raw borrows for the native `extern "C" fn`
    shim. A shim unboxes each boxed param to its raw C scalar, calls the
