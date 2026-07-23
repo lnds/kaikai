@@ -174,10 +174,11 @@ process_one() {
 
   o_out_file="$tmp/${slug}.oracle.out"
   t_out_file="$tmp/${slug}.target.out"
+  pin="$(kai_corpus_pinned_threads "$f")" || pin=""
   o_rc=0
-  run_with_timeout "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
+  run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
   t_rc=0
-  run_with_timeout "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
+  run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
   kai_corpus_normalize_timestamps <"$o_out_file" >"$o_out_file.norm" && mv "$o_out_file.norm" "$o_out_file"
   kai_corpus_normalize_timestamps <"$t_out_file" >"$t_out_file.norm" && mv "$t_out_file.norm" "$t_out_file"
 
@@ -211,7 +212,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one kai_corpus_is_skipped run_with_timeout kai_corpus_normalize_timestamps
+export -f process_one kai_corpus_is_skipped kai_corpus_pinned_threads run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')

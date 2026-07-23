@@ -4,33 +4,31 @@
 # spawned cell fiber inherited evidence_top from the worker's
 # stack, then the worker terminated and its mmap'd stack was
 # munmap'd before the cell ran — the cell's first effect lookup
-# walked the inherited evidence pointer into freed memory.
+# walked the inherited evidence pointer into freed memory. The fix
+# pins the spawn-ancestor chain alive while any descendant may walk
+# into its evidence frames; the cell's late effect dispatch below is
+# what exercises that walk.
 #
-# The fix pins the parent's wrapper (kai_incref) at spawn time
-# whenever the child inherits a non-empty evidence_top; the pin
-# is released at the child's free_value, which transitively keeps
-# the entire spawn-ancestor chain alive while any descendant may
-# walk into its evidence frames.
-#
-# This fixture runs under both tier1 (test-trace) and tier1-asan
-# (test-trace-asan). The reporter's program used `body` as the
-# top-level identifier, which independently collides with the
-# `body` parameter in stdlib's `with_mailbox` / `spawn_actor`
-# (a separate, known stage 2 shadowing concern). We use `worker`
-# here so the fixture asserts the runtime fix without leaning on
-# the orthogonal symbol-resolution bug.
+# The cell reports through the supervisor's mailbox rather than
+# printing: its fiber is causally unordered against the supervisor's
+# receive, so a direct print would land at a scheduler-dependent
+# position. The supervisor waits for both messages (the trap-exit
+# report and the cell's) and prints them in a canonical order, so the
+# output is identical at any KAI_THREADS.
 
 import actor
 import spawn
 
 type CellMsg = Tick | Ack
 
-fn cell_loop() : Unit / Actor[CellMsg] + Console = {
-  Stdout.print("cell: alive")
+# The nested String mailbox opened here is the cell's own late effect
+# dispatch on the inherited evidence chain — the shape that crashed.
+fn cell_loop(sup: Pid[String]) : Unit / Actor[CellMsg] + Console = {
+  with_mailbox { Actor.send(sup, "cell alive") }
 }
 
-fn nested_with_cell() : Unit / Spawn + Console + Actor[CellMsg] = {
-  let _pid = spawn_actor(() => cell_loop())
+fn nested_with_cell(sup: Pid[String]) : Unit / Spawn + Console + Actor[CellMsg] = {
+  let _pid = spawn_actor(() => cell_loop(sup))
   ()
 }
 
@@ -39,7 +37,7 @@ fn worker(parent: Pid[String])
 = {
   Link.link(parent)
   Stdout.print("worker: linked, opening nested mailbox")
-  let _ = with_mailbox { nested_with_cell() }
+  let _ = with_mailbox { nested_with_cell(parent) }
   Stdout.print("worker: nested closed, returning")
 }
 
@@ -47,7 +45,10 @@ fn run() : Unit / Actor[String] + Spawn + Console + Link = {
   let _ = spawn.set_trap_exit(true)
   let me = Actor.self()
   let _ = spawn.spawn(() => with_mailbox { worker(me) })
-  Stdout.print("supervisor got: " ++ Actor.receive())
+  let a = Actor.receive()
+  let b = Actor.receive()
+  Stdout.print("supervisor got: " ++ (if a == "cell alive" { b } else { a }))
+  Stdout.print("supervisor got: " ++ (if a == "cell alive" { a } else { b }))
 }
 
 fn main() : Int / Console + Spawn + Link = {

@@ -147,6 +147,7 @@ reffail="$TMP/reffail";   : > "$reffail"
 nondet="$TMP/nondet";     : > "$nondet"
 reorders="$TMP/reorders"; : > "$reorders"
 flaky="$TMP/flaky";       : > "$flaky"
+pinned="$TMP/pinned";     : > "$pinned"
 
 judged=0
 measure_start="$SECONDS"
@@ -193,6 +194,7 @@ echo "  wall-clock: ${build_secs}s building (parallel, $JOBS workers) + ${measur
 report_dropped "$buildfail" "did not build — NOT JUDGED"
 report_dropped "$reffail" "N=1 reference unusable — NOT JUDGED"
 report_dropped "$nondet" "nondeterministic at N=1 — NOT JUDGED"
+report_dropped "$pinned" "thread count pinned by the fixture's env file — measured at the pin, not at N>1"
 report_dropped "$reorders" "line order forgiven — judged on the line multiset, no finding"
 report_dropped "$flaky" "diverged once, did not reproduce — HELD AS A FLAKE, still a divergence"
 

@@ -81,13 +81,20 @@ mn_adjudicate() {
   return 0
 }
 
-# One (fixture, backend) pair across every requested thread count.
+# One (fixture, backend) pair across every requested thread count. A
+# fixture with a declared thread pin (kai_corpus_pinned_threads) is
+# measured at the pin on every arm — still fully gated for crash / hang /
+# self-reproduction, but never asked to reproduce above its pin.
 mn_measure_pair() {
-  local bin="$1" fixture="$2" backend="$3" ref ref_ec n
+  local bin="$1" fixture="$2" backend="$3" ref ref_ec n pin
   MN_JUDGED=0
 
+  pin="$(kai_corpus_pinned_threads "$fixture")" || pin=""
+  [ -z "$pin" ] || printf '%s [%s] — pinned to KAI_THREADS=%s by its env file\n' \
+    "$fixture" "$backend" "$pin" >> "$pinned"
+
   ref="$TMP/ref"
-  ref_ec="$(mn_run_at "$bin" 1 "$ref")"
+  ref_ec="$(mn_run_at "$bin" "${pin:-1}" "$ref")"
   if [ "$ref_ec" = 124 ] || [ "$ref_ec" = 137 ]; then
     printf '%s [%s] — N=1 reference did not complete within %ss\n' \
       "$fixture" "$backend" "$RUN_TIMEOUT" >> "$reffail"
@@ -96,6 +103,6 @@ mn_measure_pair() {
   MN_JUDGED=1
 
   for n in $THREAD_COUNTS; do
-    mn_measure_at "$bin" "$fixture" "$backend" "$ref" "$ref_ec" "$n"
+    mn_measure_at "$bin" "$fixture" "$backend" "$ref" "$ref_ec" "${pin:-$n}"
   done
 }

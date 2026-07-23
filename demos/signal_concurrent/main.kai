@@ -3,53 +3,50 @@
 # Two fibers in a nursery:
 #   • signal_loop parks on Signal.await() — pre-R4 this would
 #     freeze the entire OS thread inside sigwait().
-#   • compute_loop yields a fixed number of compute steps then
+#   • compute_loop counts a fixed number of yield round-trips, then
 #     cancels the signal_loop via Spawn.cancel.
 #
 # With the R4 reactor, Signal.await() parks the *fiber* on the
-# reactor's signal self-pipe and yields cleanly; the compute fiber
-# runs three steps concurrently and then issues Spawn.cancel,
-# which the scheduler delivers at the signal-await's park boundary.
-# Pre-R4 the whole nursery froze inside sigwait() and the compute
-# steps never ran (the demo would deadlock or hang at the harness
-# timeout).
+# reactor's signal self-pipe; the compute fiber keeps being resumed
+# and then issues Spawn.cancel, which the scheduler delivers at the
+# signal-await's park boundary. The proof is termination: without the
+# cancel reaching the parked fiber, the nursery's implicit join would
+# hang, and a resumed (rather than cancelled) await would print its
+# "unexpected" line. Pre-R4 the whole nursery froze inside sigwait().
 #
-# The fixture is self-terminating — no external signal needed —
-# because `make demos verify` runs the binary stand-alone with no
-# harness, just diffs stdout. The cancel path is the proof that
-# Spawn.cancel reaches a fiber parked in Signal.await().
+# Neither fiber prints while concurrent (how the compute steps
+# interleave with the park is scheduler-dependent); main reports the
+# step count after the join, so the output is identical at any
+# KAI_THREADS. The signal fiber deliberately has no Cancel handler:
+# the direct unwind keeps the demo clean under ASAN, which cannot
+# model a handler dispatch that longjmps across fiber stacks. The
+# fixture is self-terminating — no external signal needed.
 
 import spawn
 
 fn signal_loop() : Unit / Signal + Cancel + Stdout = {
-  Stdout.print("signal: parked on Signal.await")
   Signal.on(SigUsr1)
-  # Without R4, the next line freezes the OS thread until the OS
-  # delivers a signal. With R4, the fiber parks and the compute
-  # fiber gets the CPU. The cancel arrives at this park boundary.
   let _ = Signal.await()
   Stdout.print("signal: awoke (unexpected — should be cancelled)")
 }
 
-fn compute_loop(target: Fiber[Unit]) : Unit / Spawn + Stdout + Cancel = {
-  Stdout.print("compute: step 1")
-  Spawn.yield()
-  Stdout.print("compute: step 2")
-  Spawn.yield()
-  Stdout.print("compute: step 3")
-  Spawn.yield()
-  Stdout.print("compute: cancelling signal fiber")
-  Spawn.cancel(target)
+fn compute_loop(target: Fiber[Unit], step: Int, total: Int) : Int / Spawn + Cancel = {
+  if step < total {
+    Spawn.yield()
+    compute_loop(target, step + 1, total)
+  } else {
+    Spawn.cancel(target)
+    step
+  }
 }
 
 fn main() : Int / Spawn + Signal + Cancel + Stdout = {
-  nursery { n ->
+  let steps = nursery { n ->
     let sig = n.spawn(signal_loop)
-    let cmp = n.spawn(() => compute_loop(sig))
+    let cmp = n.spawn(() => compute_loop(sig, 0, 3))
     n.await(cmp)
-    # n.await(sig) is implicit on nursery exit; the cancel above
-    # makes sig unwind without raising the unhandled effect.
   }
+  Stdout.print("compute steps: #{int_to_string(steps)}")
   Stdout.print("ok")
   0
 }
