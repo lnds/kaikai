@@ -80,6 +80,22 @@ kai_corpus_is_skipped() {
   return 1
 }
 
+# A fixture whose documented property IS the one-thread cooperative
+# rotation pins its scheduler in a sibling env file (`main.env` beside a
+# package main.kai, `<name>.env` beside a flat fixture), `KAI_THREADS=1`
+# one VAR=value per line — the same declaration the demos harness reads.
+# Every corpus harness runs such a fixture at its pin. Prints the pinned
+# thread count; non-zero when the fixture declares none.
+kai_corpus_pinned_threads() {
+  local fixture="$1" envfile
+  case "$fixture" in
+    */main.kai) envfile="${fixture%main.kai}main.env" ;;
+    *)          envfile="${fixture%.kai}.env" ;;
+  esac
+  [ -f "$envfile" ] || return 1
+  sed -n 's/^KAI_THREADS=//p' "$envfile" | head -1 | grep .
+}
+
 # Rewrite ISO-8601 UTC timestamps (the stdlib Log default handler's
 # `[YYYY-MM-DDTHH:MM:SSZ] LEVEL message` form) to a fixed placeholder before
 # any comparison. Applied identically to both sides, so a real content
