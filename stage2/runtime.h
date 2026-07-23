@@ -13945,6 +13945,27 @@ static void kai_sched_commit_park(KaiFiber *f) {
         return;
     }
     kai_reactor_lock();
+    /* Cancel-vs-park race: the canceller sets cancel_requested and then
+     * detaches+unparks under this same lock. A cancel that lands in the
+     * pre-commit window finds no waiter to detach, so committing this park
+     * would sleep through the flag until the reactor event fires. Re-check
+     * under the lock and abort the park instead — hand the fiber straight
+     * back to its home deque; the resume path runs the cancel yield-point
+     * check. The gate mirrors kai_check_cancel_yield_point so a fiber whose
+     * cancel cannot be delivered (already delivered, no pad) still parks. */
+    if (f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set) {
+        kai_reactor_unlock();
+        f->pending_park = KAI_PARK_NONE;
+        int home = kai_fiber_slot_lock(f);
+        KaiSchedSlot *s = &kai_sched_slots[home];
+        f->state = KAI_FIBER_READY;
+        f->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = f;
+        else               s->steal_head = f;
+        s->steal_tail = f;
+        kai_fiber_slot_unlock_at(home);
+        return;
+    }
     f->state = KAI_FIBER_PARKED;
     atomic_fetch_add(&kai_blocked_fiber_count, 1);
     switch (f->pending_park) {
@@ -15191,7 +15212,8 @@ static int kai_reactor_detach_fiber(KaiFiber *target) {
     /* F2: walk + unlink under kai_reactor_mu — the reactor thread and other
      * schedulers touch these same lists. A target that stamped a park but
      * has not been committed yet is not on any list here (returns 0); the
-     * cancel flag still lands and is observed when the timer later wakes it.
+     * commit path re-checks the cancel flag under this same lock and aborts
+     * the park, so the flag set before this walk is never slept through.
      * reactor_mu is released before the caller's unpark takes a slot lock,
      * so the two locks are never nested. */
     kai_reactor_lock();
