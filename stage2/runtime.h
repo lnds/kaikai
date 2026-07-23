@@ -961,6 +961,143 @@ static KAI_TLS int64_t kai_rc_tok_null_mismatch = 0;
 KAI_RT_ATOMIC_COUNTER(kai_rc_incref_total);
 KAI_RT_ATOMIC_COUNTER(kai_rc_decref_total);
 
+#ifdef KAI_TRACE_RC
+KAI_RT_COUNTER(int64_t kai_rc_free_by_tag[16], {0});
+#endif
+
+/* ---------- cross-thread ledger reduction ----------
+ *
+ * The counters above are Class A: per-thread TLS ledgers, so any one
+ * thread's copy is a partial total. Each scheduler thread registers a
+ * block of pointers to its TLS ledger on start; a thread that exits
+ * before the report folds its values into the process-wide accumulator
+ * (its TLS storage dies with it) and leaves the walk; the exit report
+ * reduces the fold plus every still-registered block. The hot
+ * incref/decref path never synchronizes. A block whose owner is still
+ * running is read without synchronization — tolerable in a diagnostic
+ * report, never in program state. */
+typedef struct {
+    int64_t alloc_total, free_total, live_peak;
+    int64_t alloc_by_tag[16];
+    int64_t arena_alloc_total, arena_free_total;
+    int64_t reuse_total, vec_inplace_total, vec_cow_total;
+    int64_t reuse_free_total, tok_unique, tok_null_shared, tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    int64_t free_by_tag[16];
+#endif
+} KaiRcLedgerSum;
+
+typedef struct KaiRcLedgerBlock {
+    const int64_t *alloc_total, *free_total, *live_peak;
+    const int64_t *alloc_by_tag;
+    const int64_t *arena_alloc_total, *arena_free_total;
+    const int64_t *reuse_total, *vec_inplace_total, *vec_cow_total;
+    const int64_t *reuse_free_total, *tok_unique, *tok_null_shared, *tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    const int64_t *free_by_tag;
+#endif
+    struct KaiRcLedgerBlock *next;
+} KaiRcLedgerBlock;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiRcLedgerBlock *kai_rc_ledger_blocks;
+extern KaiRcLedgerSum kai_rc_ledger_folded;
+extern pthread_mutex_t kai_rc_ledger_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiRcLedgerBlock *kai_rc_ledger_blocks = NULL;
+KaiRcLedgerSum kai_rc_ledger_folded;
+pthread_mutex_t kai_rc_ledger_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiRcLedgerBlock *kai_rc_ledger_blocks = NULL;
+static KaiRcLedgerSum kai_rc_ledger_folded;
+static pthread_mutex_t kai_rc_ledger_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+KAI_RT_COUNTER(KaiRcLedgerBlock *kai_rc_ledger_block, NULL);
+KAI_RT_COUNTER(int kai_rc_ledger_done, 0);
+
+/* Pointers are captured on the owning thread — that is what binds each
+ * field to THIS thread's TLS instance. */
+static void kai_rc_ledger_fill(KaiRcLedgerBlock *b) {
+    b->alloc_total       = &kai_rc_alloc_total;
+    b->free_total        = &kai_rc_free_total;
+    b->live_peak         = &kai_rc_live_peak;
+    b->alloc_by_tag      = kai_rc_alloc_by_tag;
+    b->arena_alloc_total = &kai_arena_alloc_total;
+    b->arena_free_total  = &kai_arena_free_total;
+    b->reuse_total       = &kai_rc_reuse_total;
+    b->vec_inplace_total = &kai_vec_inplace_total;
+    b->vec_cow_total     = &kai_vec_cow_total;
+    b->reuse_free_total  = &kai_rc_reuse_free_total;
+    b->tok_unique        = &kai_rc_tok_unique;
+    b->tok_null_shared   = &kai_rc_tok_null_shared;
+    b->tok_null_mismatch = &kai_rc_tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    b->free_by_tag       = kai_rc_free_by_tag;
+#endif
+}
+
+static void kai_rc_ledger_add(KaiRcLedgerSum *s, const KaiRcLedgerBlock *b) {
+    s->alloc_total       += *b->alloc_total;
+    s->free_total        += *b->free_total;
+    s->live_peak         += *b->live_peak;
+    for (int i = 0; i < 16; i++) s->alloc_by_tag[i] += b->alloc_by_tag[i];
+    s->arena_alloc_total += *b->arena_alloc_total;
+    s->arena_free_total  += *b->arena_free_total;
+    s->reuse_total       += *b->reuse_total;
+    s->vec_inplace_total += *b->vec_inplace_total;
+    s->vec_cow_total     += *b->vec_cow_total;
+    s->reuse_free_total  += *b->reuse_free_total;
+    s->tok_unique        += *b->tok_unique;
+    s->tok_null_shared   += *b->tok_null_shared;
+    s->tok_null_mismatch += *b->tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    for (int i = 0; i < 16; i++) s->free_by_tag[i] += b->free_by_tag[i];
+#endif
+}
+
+static __attribute__((noinline)) void kai_rc_ledger_register(void) {
+    if (kai_rc_ledger_block || kai_rc_ledger_done) return;
+    KaiRcLedgerBlock *b = (KaiRcLedgerBlock *) calloc(1, sizeof *b);
+    if (!b) return;
+    kai_rc_ledger_fill(b);
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    b->next = kai_rc_ledger_blocks;
+    kai_rc_ledger_blocks = b;
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+    kai_rc_ledger_block = b;
+}
+
+/* Thread teardown: the ledger folds into the accumulator and the block
+ * leaves the walk, so an exited thread's counts survive it. */
+static __attribute__((noinline)) void kai_rc_ledger_fold(void) {
+    if (kai_rc_ledger_done) return;
+    kai_rc_ledger_done = 1;
+    KaiRcLedgerBlock own;
+    kai_rc_ledger_fill(&own);
+    KaiRcLedgerBlock *b = kai_rc_ledger_block;
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    kai_rc_ledger_add(&kai_rc_ledger_folded, &own);
+    if (b) {
+        KaiRcLedgerBlock **p = &kai_rc_ledger_blocks;
+        while (*p && *p != b) p = &(*p)->next;
+        if (*p) *p = b->next;
+    }
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+    free(b);
+    kai_rc_ledger_block = NULL;
+}
+
+static __attribute__((noinline)) void kai_rc_ledger_sum(KaiRcLedgerSum *s) {
+    kai_rc_ledger_register();
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    *s = kai_rc_ledger_folded;
+    for (KaiRcLedgerBlock *b = kai_rc_ledger_blocks; b; b = b->next) {
+        kai_rc_ledger_add(s, b);
+    }
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+}
+
 static const char *kai_rc_tag_name(int t) {
     switch (t) {
         case KAI_UNIT:    return "unit";
@@ -989,44 +1126,46 @@ static const char *kai_rc_tag_name(int t) {
 
 static void kai_rc_report(void) {
     if (!getenv("KAI_TRACE_RC")) return;
-    int64_t leaked = kai_rc_alloc_total - kai_rc_free_total;
+    KaiRcLedgerSum s;
+    kai_rc_ledger_sum(&s);
+    int64_t leaked = s.alloc_total - s.free_total;
     fprintf(stderr,
         "[KAI_TRACE_RC] alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
-        (long long) kai_rc_alloc_total,
-        (long long) kai_rc_free_total,
+        (long long) s.alloc_total,
+        (long long) s.free_total,
         (long long) leaked,
-        (long long) kai_rc_live_peak);
+        (long long) s.live_peak);
     for (int i = 0; i < 16; i++) {
-        if (kai_rc_alloc_by_tag[i] > 0) {
+        if (s.alloc_by_tag[i] > 0) {
             fprintf(stderr, "[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
                     kai_rc_tag_name(i),
-                    (long long) kai_rc_alloc_by_tag[i]);
+                    (long long) s.alloc_by_tag[i]);
         }
     }
     /* issue #118 — Perceus reuse-in-place counter. */
-    if (kai_rc_reuse_total > 0) {
+    if (s.reuse_total > 0) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
-                (long long) kai_rc_reuse_total);
+                (long long) s.reuse_total);
     }
-    if (kai_vec_inplace_total > 0 || kai_vec_cow_total > 0) {
+    if (s.vec_inplace_total > 0 || s.vec_cow_total > 0) {
         fprintf(stderr, "[KAI_TRACE_RC]   vec_inplace=%lld vec_cow=%lld\n",
-                (long long) kai_vec_inplace_total,
-                (long long) kai_vec_cow_total);
+                (long long) s.vec_inplace_total,
+                (long long) s.vec_cow_total);
     }
     /* #2 parity probe — tokens captured but freed (could not donate in
      * frame). Upper bound on interprocedural-token-pass recovery. */
-    if (kai_rc_reuse_free_total > 0) {
+    if (s.reuse_free_total > 0) {
         fprintf(stderr, "[KAI_TRACE_RC]   reuse_freed=%lld\n",
-                (long long) kai_rc_reuse_free_total);
+                (long long) s.reuse_free_total);
     }
     /* #2 parity probe — token-drop outcome split. */
-    if (kai_rc_tok_unique > 0 || kai_rc_tok_null_shared > 0 ||
-        kai_rc_tok_null_mismatch > 0) {
+    if (s.tok_unique > 0 || s.tok_null_shared > 0 ||
+        s.tok_null_mismatch > 0) {
         fprintf(stderr,
             "[KAI_TRACE_RC]   tok_unique=%lld tok_null_shared=%lld tok_null_mismatch=%lld\n",
-            (long long) kai_rc_tok_unique,
-            (long long) kai_rc_tok_null_shared,
-            (long long) kai_rc_tok_null_mismatch);
+            (long long) s.tok_unique,
+            (long long) s.tok_null_shared,
+            (long long) s.tok_null_mismatch);
     }
     /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
     fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
@@ -1035,12 +1174,12 @@ static void kai_rc_report(void) {
     /* issue #120 — region arena lifecycle. arena_live != 0 at exit
      * flags a wrong-codegen silent leak (a non-region value mistakenly
      * arena-allocated, which never frees and which ASAN cannot see). */
-    if (kai_arena_alloc_total > 0 || kai_arena_free_total > 0) {
+    if (s.arena_alloc_total > 0 || s.arena_free_total > 0) {
         fprintf(stderr,
             "[KAI_TRACE_RC]   arena_alloc=%lld arena_free=%lld arena_live=%lld\n",
-            (long long) kai_arena_alloc_total,
-            (long long) kai_arena_free_total,
-            (long long) (kai_arena_alloc_total - kai_arena_free_total));
+            (long long) s.arena_alloc_total,
+            (long long) s.arena_free_total,
+            (long long) (s.arena_alloc_total - s.arena_free_total));
     }
 }
 
@@ -1086,8 +1225,6 @@ static void kai_rc_register_once(void) {
  */
 #ifdef KAI_TRACE_RC
 
-KAI_RT_COUNTER(int64_t kai_rc_free_by_tag[16], {0});
-
 #define KAI_RC_SENTINEL_U64 ((uint64_t) 0xDEADBEEFDEADBEEFULL)
 
 /* Optional per-chunk history. Ring buffer; KAI_RC_HISTORY=1 enables
@@ -1132,16 +1269,18 @@ static const char *kai_rc_op_name(int32_t op) {
 
 static void kai_rc_strict_report(void) {
     if (getenv("KAI_TRACE_RC_QUIET")) return;
-    int64_t leaked = kai_rc_alloc_total - kai_rc_free_total;
+    KaiRcLedgerSum s;
+    kai_rc_ledger_sum(&s);
+    int64_t leaked = s.alloc_total - s.free_total;
     fprintf(stderr,
         "[KAI_TRACE_RC] STRICT alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
-        (long long) kai_rc_alloc_total,
-        (long long) kai_rc_free_total,
+        (long long) s.alloc_total,
+        (long long) s.free_total,
         (long long) leaked,
-        (long long) kai_rc_live_peak);
+        (long long) s.live_peak);
     for (int i = 0; i < 16; i++) {
-        int64_t a = kai_rc_alloc_by_tag[i];
-        int64_t f = kai_rc_free_by_tag[i];
+        int64_t a = s.alloc_by_tag[i];
+        int64_t f = s.free_by_tag[i];
         if (a == 0 && f == 0) continue;
         int64_t live = a - f;
         const char *flag =
@@ -1157,15 +1296,15 @@ static void kai_rc_strict_report(void) {
      * silent leak: arena memory is reclaimed in bulk without a free
      * walk, so ASAN sees no use-after-free and the per-tag table above
      * never moves for arena values. */
-    if (kai_arena_alloc_total > 0 || kai_arena_free_total > 0) {
-        int64_t arena_live = kai_arena_alloc_total - kai_arena_free_total;
+    if (s.arena_alloc_total > 0 || s.arena_free_total > 0) {
+        int64_t arena_live = s.arena_alloc_total - s.arena_free_total;
         const char *aflag = (arena_live != 0) ? " LEAK"
-                          : (kai_arena_free_total > kai_arena_alloc_total) ? " DOUBLE"
+                          : (s.arena_free_total > s.arena_alloc_total) ? " DOUBLE"
                           : "";
         fprintf(stderr,
             "[KAI_TRACE_RC] arena   allocs=%lld frees=%lld live=%lld%s\n",
-            (long long) kai_arena_alloc_total,
-            (long long) kai_arena_free_total,
+            (long long) s.arena_alloc_total,
+            (long long) s.arena_free_total,
             (long long) arena_live, aflag);
     }
     if (kai_rc_history_enabled() && kai_rc_history_count > 0) {
@@ -8312,6 +8451,7 @@ static void kai_set_args(int argc, char **argv) {
        gates a report, so the side effect is harmless when tracing is
        off. Keeps the emitter unchanged — no new emit site needed. */
     kai_rc_register_once();
+    kai_rc_ledger_register();
 #ifdef KAI_TRACE_RC
     kai_rc_strict_register_once();
 #endif
@@ -14955,7 +15095,9 @@ static void *kai_worker_thread_main(void *arg) {
     kai_active_fiber_anchor();
     kai_main_fiber.home_thread = kai_thread_id;
     kai_sched_slots[kai_thread_id].live = 1;
+    kai_rc_ledger_register();
     kai_worker_loop();
+    kai_rc_ledger_fold();
     return NULL;
 }
 
@@ -14972,10 +15114,13 @@ static void *kai_reactor_thread_main(void *arg) {
     /* Never dispatches fibers, but keeps the scheduler threads uniform: a
      * fault here reaches the handler instead of compounding on this stack. */
     kai_install_thread_sigaltstack();
+    kai_rc_ledger_register();
     for (;;) {
-        if (kai_sched_shutting_down) return NULL;
+        if (kai_sched_shutting_down) break;
         kai_reactor_wait();
     }
+    kai_rc_ledger_fold();
+    return NULL;
 }
 
 /* CPUs this process may actually run on. sysconf reports the whole
