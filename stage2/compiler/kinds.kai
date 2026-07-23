@@ -18,6 +18,7 @@ token source is sliced locally.
 """)]
 
 import compiler.util
+import compiler.chars
 import compiler.lex
 import compiler.ast
 
@@ -127,9 +128,30 @@ fn base_intros() : [KindIntro] =
   [KI("unit", measure_kind_name()), KI("currency", "Currency"),
    KI("region", "Region"), KI("layout", "Layout"), KI("", "Shape")]
 
-#[doc("The shipped `Layout` habitants (`be`/`le`), a closed byte-order set. Like `Measure`'s default kind, these resolve without importing a habitant file — the catalog's `layout be`/`layout le` lines are the declarative mirror. Each entry is a `(habitant, kind)` binding for the symbol->kinds map seed.")]
-pub fn base_layout_habitants() : [KindIntro] =
-  [KI("be", "Layout"), KI("le", "Layout")]
+#[doc("The habitant atoms the `Composition` engine ships with built-in semantics: the byte-order modifiers (`be` = big-endian, `le` = little-endian) Layout codegen keys on. A closed `with intro { ... }` set over Composition may name only these; `Layout`'s habitants are seeded from this list, so the engine is the single source the catalog's closed block is validated against.")]
+pub fn composition_engine_atoms() : [String] = ["be", "le"]
+
+#[doc("The habitant atoms a theory's engine ships, for closed-set (`with intro { ... }`) validation. Empty for a theory whose engine defines none — such a theory takes no closed set.")]
+pub fn engine_atoms_for_theory(thy: String) : [String] =
+  if thy == "Composition" { composition_engine_atoms() } else { [] }
+
+#[doc("The value domain of a value-habitant symbol: `Int` for an integer literal (`3`), `String` for a string literal (`\"tag\"`), empty for an ordinary identifier symbol.")]
+pub fn unit_sym_value_domain(s: String) : String {
+  if string_length(s) == 0 { "" }
+  else if sym_all_digits(s, 0) { "Int" }
+  else if string_slice(s, 0, 1) == "\"" { "String" }
+  else { "" }
+}
+
+fn sym_all_digits(s: String, i: Int) : Bool {
+  if i >= string_length(s) { true }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if ch_is_digit(c) { sym_all_digits(s, i + 1) } else { false }
+      None -> false
+    }
+  }
+}
 
 #[doc("The shipped kinds declared over the Composition theory (`Layout`). The catalog mirrors this list; programs get the formation guard without loading the catalog file.")]
 pub fn base_composition_kind_names() : [String] = ["Layout"]
@@ -253,7 +275,21 @@ pub fn kind_sym_mangle(s: String) : String {
     let kind = string_slice(s, 0, i)
     let bare = kind_sym_bare(s)
     if kind == measure_kind_name() { bare }
-    else { concat_all([kind, "_k_", bare]) }
+    else { concat_all([kind, "_k_", mangle_safe(bare, 0, "")]) }
+  }
+}
+
+# A value habitant's bare form may carry non-identifier chars (a
+# string habitant keeps its quotes); C identifiers cannot, so any
+# such char mangles to `_`. Identifier habitants pass unchanged.
+fn mangle_safe(s: String, i: Int, acc: String) : String {
+  if i >= string_length(s) { acc }
+  else {
+    let piece = match char_at(s, i) {
+      Some(c) -> if ch_is_alnum(c) { string_slice(s, i, 1) } else { "_" }
+      None -> "_"
+    }
+    mangle_safe(s, i + 1, string_concat(acc, piece))
   }
 }
 
@@ -299,9 +335,67 @@ pub fn kind_reg_from_decls(decls: [Decl]) : KindReg =
 fn kind_reg_from_decls_loop(decls: [Decl], acc: [KindIntro]) : [KindIntro] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    DKind(_, name, _, _, intro, _, _) -> kind_reg_from_decls_loop(rest, [KI(intro, name), ...acc])
+    # A form with no introducer word (derived habitants, value domain)
+    # still registers the kind name, like the base `Shape` entry.
+    DKind(_, name, _, _, hab, _, _) ->
+      kind_reg_from_decls_loop(rest, [KI(kind_hab_intro(hab), name), ...acc])
     _ -> kind_reg_from_decls_loop(rest, acc)
   }
+}
+
+#[doc("Every `kind -> value domain` pair declared by a `with <Domain>` (form-b) kind in the stream, as `KI(domain, kind)` bindings.")]
+pub fn value_domain_kinds(decls: [Decl]) : [KindIntro] = vdk_loop(decls, [])
+
+fn vdk_loop(decls: [Decl], acc: [KindIntro]) : [KindIntro] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, _, _, HabDomain(dom), _, _) -> vdk_loop(rest, [KI(dom, name), ...acc])
+    _ -> vdk_loop(rest, acc)
+  }
+}
+
+#[doc("Every closed-set kind in the stream plus the shipped `Layout`, as `(kind, atoms)` pairs. A closed kind's habitants are fixed: user habitant declarations into it are rejected.")]
+pub fn closed_kind_sets(decls: [Decl]) : [ClosedKind] =
+  cks_loop(decls, [CK("Layout", composition_engine_atoms())])
+
+# A closed-set kind and its fixed habitant atoms.
+pub type ClosedKind = CK(String, [String])
+
+#[doc("The kind name of a closed-set entry.")]
+pub fn ck_kind(c: ClosedKind) : String = match c { CK(k, _) -> k }
+
+#[doc("The fixed habitant atoms of a closed-set entry.")]
+pub fn ck_atoms(c: ClosedKind) : [String] = match c { CK(_, a) -> a }
+
+fn cks_loop(decls: [Decl], acc: [ClosedKind]) : [ClosedKind] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, _, _, HabClosed(_, atoms), _, _) -> cks_loop(rest, [CK(name, atoms), ...acc])
+    _ -> cks_loop(rest, acc)
+  }
+}
+
+#[doc("The fixed atom set of `kind` in a closed-set list, or empty when the kind is open.")]
+pub fn closed_atoms_lookup(cs: [ClosedKind], kind: String) : [String] = match cs {
+  [] -> []
+  [c, ...rest] -> if ck_kind(c) == kind { ck_atoms(c) } else { closed_atoms_lookup(rest, kind) }
+}
+
+#[doc("Every form-b kind in a `KI(domain, kind)` list whose value domain is `dom`.")]
+pub fn domain_kinds_of(ds: [KindIntro], dom: String) : [String] = dko_loop(ds, dom, [])
+
+fn dko_loop(ds: [KindIntro], dom: String, acc: [String]) : [String] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] ->
+    if ki_habitant(d) == dom { dko_loop(rest, dom, [ki_habitant_kind(d), ...acc]) }
+    else { dko_loop(rest, dom, acc) }
+}
+
+#[doc("The value domain `kind` declares in a `KI(domain, kind)` list, or empty when it is not a form-b kind.")]
+pub fn domain_of_kind(ds: [KindIntro], kind: String) : String = match ds {
+  [] -> ""
+  [d, ...rest] ->
+    if ki_habitant_kind(d) == kind { ki_habitant(d) } else { domain_of_kind(rest, kind) }
 }
 
 #[doc("""
@@ -357,9 +451,18 @@ fn scan_one_kind(src: String, rest: [Token]) : Option[KindIntro] = match rest {
 }
 
 # The introducer is either the `unit` keyword or a plain IDENT; both
-# render to their surface word.
-fn introducer_word(src: String, t: Token) : String =
-  if tk_named(t, "unit") { "unit" } else { ksrc(src, t) }
+# render to their surface word. An uppercase ident is a value DOMAIN
+# (`with Int`, form b), not an introducer: the binding keeps the kind
+# name reachable but registers no habitant-declaring word.
+fn introducer_word(src: String, t: Token) : String {
+  let w = if tk_named(t, "unit") { "unit" } else { ksrc(src, t) }
+  if word_is_upper(w) { "" } else { w }
+}
+
+fn word_is_upper(w: String) : Bool = match char_at(w, 0) {
+  Some(c) -> ch_is_upper(c)
+  None -> false
+}
 
 # Skip tokens up to and including the first `with`, bounded by the next
 # declaration head so a missing `with` does not run past its decl.

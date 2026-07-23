@@ -30,19 +30,22 @@ import compiler.unit_walk
 
 # Resolution context for one file: which kinds each atomic habitant
 # symbol inhabits, the kinds opened by `use kind`, the alias names
-# (left bare here for the later alias-expansion pass to resolve), and
-# the (kind, theory) pairs the unit formation check dispatches on.
-pub type KindCtx = KCtx([SymKinds], [String], [String], [KindTheory])
-#                       sym -> kinds  use-kinds  alias names  kind theories
+# (left bare here for the later alias-expansion pass to resolve), the
+# (kind, theory) pairs the unit formation check dispatches on, the
+# value-domain (form-b) kinds as `KI(domain, kind)`, and the
+# closed-set kinds.
+pub type KindCtx = KCtx([SymKinds], [String], [String], [KindTheory], [KindIntro], [ClosedKind])
 
 # The set of kinds a single habitant symbol inhabits.
 pub type SymKinds = SK(String, [String])
 #                      sym     kinds
 
-fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _) -> s }
-fn kc_uses(c: KindCtx) : [String] = match c { KCtx(_, u, _, _) -> u }
-fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _) -> a }
-fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m) -> m }
+fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _, _, _) -> s }
+fn kc_uses(c: KindCtx) : [String] = match c { KCtx(_, u, _, _, _, _) -> u }
+fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _, _, _) -> a }
+fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m, _, _) -> m }
+fn kc_doms(c: KindCtx) : [KindIntro] = match c { KCtx(_, _, _, _, ds, _) -> ds }
+fn kc_closed(c: KindCtx) : [ClosedKind] = match c { KCtx(_, _, _, _, _, cs) -> cs }
 
 # The unit-symbol scope threaded through the unit-hygiene validator: the
 # file's kind context plus the locally-bound unit-kind tparams
@@ -60,6 +63,14 @@ pub fn unit_scope_add_locals(s: UnitScope, locals: [String]) : UnitScope =
 pub fn scope_kind_theories(s: UnitScope) : [KindTheory] =
   match s { US(ctx, _) -> kc_theories(ctx) }
 
+#[doc("The value domain a kind declares (`with Int` -> `Int`), or empty when the kind is not a form-b kind.")]
+pub fn scope_value_domain_of(s: UnitScope, kind: String) : String =
+  match s { US(ctx, _) -> domain_of_kind(kc_doms(ctx), kind) }
+
+#[doc("The fixed atom set of a closed-set kind, or empty when the kind is open.")]
+pub fn scope_closed_atoms_of(s: UnitScope, kind: String) : [String] =
+  match s { US(ctx, _) -> closed_atoms_lookup(kc_closed(ctx), kind) }
+
 #[doc("Resolve a bare symbol within a unit scope (its kind context and local tparams).")]
 pub fn scope_resolve_sym(s: UnitScope, sym: String) : SymRes =
   match s { US(ctx, ls) -> resolve_sym(ctx, ls, sym) }
@@ -74,21 +85,23 @@ resolve without importing a habitant file.
 """)]
 pub fn build_kind_ctx(decls: [Decl], reg: KindReg) : KindCtx =
   KCtx(bkc_syms(decls, reg, base_habitant_syms()), bkc_uses(decls, []),
-       bkc_aliases(decls, []), atomic_kind_theories(decls))
+       bkc_aliases(decls, []), atomic_kind_theories(decls),
+       value_domain_kinds(decls), closed_kind_sets(decls))
 
-# The base habitant->kinds seed: the shipped `Layout` byte-order
-# habitants, folded into the symbol->kinds shape the resolver reads.
-fn base_habitant_syms() : [SymKinds] = bhs_loop(base_layout_habitants(), [])
+# The base habitant->kinds seed: the shipped `Layout` habitants,
+# taken straight from the Composition engine's atom set so the
+# declaration in the catalog and this seed cannot drift apart.
+fn base_habitant_syms() : [SymKinds] = bhs_loop(composition_engine_atoms(), [])
 
-fn bhs_loop(hs: [KindIntro], acc: [SymKinds]) : [SymKinds] = match hs {
+fn bhs_loop(atoms: [String], acc: [SymKinds]) : [SymKinds] = match atoms {
   [] -> acc
-  [h, ...rest] -> bhs_loop(rest, sym_kinds_add(acc, ki_habitant(h), ki_habitant_kind(h)))
+  [a, ...rest] -> bhs_loop(rest, sym_kinds_add(acc, a, "Layout"))
 }
 
 fn bkc_aliases(decls: [Decl], acc: [String]) : [String] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    DUnit(_, name, Some(_), _, _, _) -> bkc_aliases(rest, [name, ...acc])
+    DUnit(_, name, UBAlias(_), _, _, _) -> bkc_aliases(rest, [name, ...acc])
     DDerive(_, inner, _, _) -> bkc_aliases([inner, ...rest], acc)
     DUnstable(inner, _, _) -> bkc_aliases([inner, ...rest], acc)
     DProtoLaws(_, inner, _, _) -> bkc_aliases([inner, ...rest], acc)
@@ -101,15 +114,19 @@ fn bkc_aliases(decls: [Decl], acc: [String]) : [String] = match decls {
 fn bkc_syms(decls: [Decl], reg: KindReg, acc: [SymKinds]) : [SymKinds] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    # Alias habitants (`unit Newton = kg*m/s^2`, alias = Some) are left
-    # out of the map so kind rewriting skips them; alias expansion (a
-    # later pass) resolves the name to its body, whose atomic factors
-    # are the ones that carry a kind. Only atomic habitants are mapped.
-    DUnit(_, name, None, intro, _, _) -> {
-      let kind = match kind_of_introducer(reg, intro) { Some(k) -> k None -> measure_kind_name() }
-      bkc_syms(rest, reg, sym_kinds_add(acc, name, kind))
-    }
-    DUnit(_, _, Some(_), _, _, _) -> bkc_syms(rest, reg, acc)
+    # Alias habitants (`unit Newton = kg*m/s^2`) are left out of the
+    # map so kind rewriting skips them; alias expansion (a later
+    # pass) resolves the name to its body, whose atomic factors are
+    # the ones that carry a kind. Atomic and measure-carrying
+    # habitants are mapped; a closed-set kind's atoms register from
+    # its `kind` declaration, since it has no habitant decls.
+    DUnit(_, name, UBNone, intro, _, _) ->
+      bkc_syms(rest, reg, sym_kinds_add(acc, name, intro_kind(reg, intro)))
+    DUnit(_, name, UBMeasure(_), intro, _, _) ->
+      bkc_syms(rest, reg, sym_kinds_add(acc, name, intro_kind(reg, intro)))
+    DUnit(_, _, UBAlias(_), _, _, _) -> bkc_syms(rest, reg, acc)
+    DKind(_, name, _, _, HabClosed(_, atoms), _, _) ->
+      bkc_syms(rest, reg, closed_atom_syms(atoms, name, acc))
     DDerive(_, inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
     DUnstable(inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
     DProtoLaws(_, inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
@@ -117,6 +134,14 @@ fn bkc_syms(decls: [Decl], reg: KindReg, acc: [SymKinds]) : [SymKinds] = match d
     DConstructor(inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
     _ -> bkc_syms(rest, reg, acc)
   }
+}
+
+fn intro_kind(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) { Some(k) -> k None -> measure_kind_name() }
+
+fn closed_atom_syms(atoms: [String], kind: String, acc: [SymKinds]) : [SymKinds] = match atoms {
+  [] -> acc
+  [a, ...rest] -> closed_atom_syms(rest, kind, sym_kinds_add(acc, a, kind))
 }
 
 fn bkc_uses(decls: [Decl], acc: [String]) : [String] = match decls {
@@ -139,6 +164,10 @@ fn sym_kinds_add(acc: [SymKinds], sym: String, kind: String) : [SymKinds] = matc
 }
 
 fn sym_kinds_lookup(c: KindCtx, sym: String) : [String] = skl_loop(kc_syms(c), sym)
+
+# Every form-b kind whose declared value domain is `dom`.
+fn domain_kinds_lookup(c: KindCtx, dom: String) : [String] =
+  domain_kinds_of(kc_doms(c), dom)
 
 fn skl_loop(xs: [SymKinds], sym: String) : [String] = match xs {
   [] -> []
@@ -173,15 +202,24 @@ pub fn resolve_sym(c: KindCtx, locals: [String], sym: String) : SymRes {
   if kind_sym_is_qualified(sym) or list_has(locals, sym) or list_has(kc_aliases(c), sym) {
     SRok(sym)
   } else {
-    let candidates = sym_kinds_lookup(c, sym)
-    match candidates {
-      [] -> SRunknown
-      [only] -> SRok(kind_qualify_nondefault(only, sym))
-      _ -> match used_kind_for(c, candidates) {
-        Some(k) -> SRok(kind_qualify_nondefault(k, sym))
-        None -> SRambig(candidates)
-      }
-    }
+    # A value habitant (`<3>`, `<"tag">`) resolves by its literal's
+    # domain against the form-b (`with Int` / `with String`) kinds;
+    # a symbol resolves by name against the declared-habitant map.
+    let dom = unit_sym_value_domain(sym)
+    let candidates =
+      if dom == "" { sym_kinds_lookup(c, sym) } else { domain_kinds_lookup(c, dom) }
+    pick_candidate(c, sym, candidates)
+  }
+}
+
+# The precedence over a candidate-kind list: unique wins, `use kind`
+# breaks a tie, anything else is ambiguous.
+fn pick_candidate(c: KindCtx, sym: String, candidates: [String]) : SymRes = match candidates {
+  [] -> SRunknown
+  [only] -> SRok(kind_qualify_nondefault(only, sym))
+  _ -> match used_kind_for(c, candidates) {
+    Some(k) -> SRok(kind_qualify_nondefault(k, sym))
+    None -> SRambig(candidates)
   }
 }
 
