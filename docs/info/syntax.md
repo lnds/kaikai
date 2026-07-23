@@ -380,11 +380,13 @@ types written with a literal suffix: `42i32` (`Int32`), `42u32`
 kind-distinct from `Int` — an `Int32` does not unify with an `Int`, so
 mixing them is a type error; convert explicitly with `int_to_int32` /
 `int32_to_int` (and the `u32`/`u64`/`i128` analogues). Arithmetic
-(`+ - * < ==`) wraps two's-complement in the width, and `Show` / `Eq` /
-`Ord` / `Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at
-~19), so a literal above 2^63 is written `…i128` and round-trips
-exactly. The suffix attaches to a decimal/hex/bin literal with no
-intervening space; `42i` without a width stays a complex literal.
+(`+ - * / %`) wraps two's-complement in the width; `/`/`%` are signed for
+`Int32`, unsigned for `UInt32`/`UInt64`, and trap on a zero divisor.
+Comparisons are signed/unsigned per width, and `Show` / `Eq` / `Ord` /
+`Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at ~19), so a
+literal above 2^63 is written `…i128` and round-trips exactly. The suffix
+attaches to a decimal/hex/bin literal with no intervening space; `42i`
+without a width stays a complex literal.
 
 In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.

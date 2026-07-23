@@ -61,6 +61,7 @@ void * kaix_core_llvm_build_fpcast(void *b, void *v, void *ty) { return kai_llvm
 void * kaix_core_llvm_build_global_string(void *b, KaiValue *s) { return kai_llvm_build_global_string(b, s); }
 void * kaix_core_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) { return kai_llvm_build_ibinop(b, op, a, c); }
 void * kaix_core_llvm_build_icmp(void *b, int64_t pred, void *a, void *c) { return kai_llvm_build_icmp(b, pred, a, c); }
+void * kaix_core_llvm_build_ucmp(void *b, int64_t pred, void *a, void *c) { return kai_llvm_build_ucmp(b, pred, a, c); }
 void * kaix_core_llvm_build_icmp_ne_zero(void *b, void *v, void *i32ty) { return kai_llvm_build_icmp_ne_zero(b, v, i32ty); }
 void * kaix_core_llvm_build_lnot(void *b, void *a) { return kai_llvm_build_lnot(b, a); }
 void * kaix_core_llvm_build_load(void *b, void *ty, void *ptr) { return kai_llvm_build_load(b, ty, ptr); }

@@ -116,6 +116,7 @@ KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
  * its decimal/hex string global and parses it (no 128-bit LLVM arg). */
 KaiValue *kaix_int32(int64_t v)                { return kai_int32((int32_t) v); }
 KaiValue *kaix_uint32(int64_t v)               { return kai_uint32((uint32_t) v); }
+KaiValue *kaix_uint64(int64_t v)               { return kai_uint64((uint64_t) v); }
 KaiValue *kaix_uint64_str(const char *s)       { return kai_uint64((uint64_t) kai_i128_parse(s)); }
 KaiValue *kaix_int128_str(const char *s)       { return kai_int128(kai_i128_parse(s)); }
 
@@ -130,6 +131,10 @@ KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
    so div-by-zero and INT64_MIN/-1 trap instead of hitting hardware UB. */
 int64_t kaix_idiv_chk(int64_t a, int64_t b)    { return kai_idiv_chk(a, b); }
 int64_t kaix_imod_chk(int64_t a, int64_t b)    { return kai_imod_chk(a, b); }
+/* Unsigned raw `/` `%` for the UInt32/UInt64 raw path — operands widen to
+   u64 (zext), divide unsigned, truncate back. Zero divisor traps. */
+uint64_t kaix_udiv_chk(uint64_t a, uint64_t b) { return kai_udiv_chk(a, b); }
+uint64_t kaix_umod_chk(uint64_t a, uint64_t b) { return kai_umod_chk(a, b); }
 /* Comparison shims carry the tagged-Int fast path INLINE: two immediates
    compare as one signed word compare (the n*2+1 encoding is monotonic, and
    two tagged words are numerically equal iff bit-equal), yielding the
@@ -946,6 +951,12 @@ int32_t kaix_char_field(KaiValue *v) { return (int32_t) v->as.c; }
 /* Borrow-read a boxed Byte's raw value without decref'ing — the box→raw
    border for a boxed Byte reaching the raw u8 path. */
 int32_t kaix_byte_field(KaiValue *v) { return (int32_t) v->as.byte_val; }
+/* Borrow-read a boxed fixed-width integer's raw payload without decref'ing
+   — the box→raw border for a boxed Int32/UInt32/UInt64 reaching its raw
+   register. Int32/UInt32 ride an i32 register; UInt64 an i64. */
+int32_t kaix_int32_field(KaiValue *v)  { return v->as.i32; }
+int32_t kaix_uint32_field(KaiValue *v) { return (int32_t) v->as.u32; }
+int64_t kaix_uint64_field(KaiValue *v) { return (int64_t) v->as.u64; }
 
 /* FFI v1 (issue #260) box→raw borrows for the native `extern "C" fn`
    shim. A shim unboxes each boxed param to its raw C scalar, calls the
