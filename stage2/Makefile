@@ -1028,7 +1028,7 @@ test-numeric-div-by-zero-traps-native: $(TARGET) build
 # (point-to-int, Byte/u8/Decimal overflow).
 test-numeric-literal-mint: $(TARGET) build
 	@set -e; \
-	for f in literal_mint literal_suffix literal_principality; do \
+	for f in literal_mint literal_suffix literal_principality byte_call_arg; do \
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
