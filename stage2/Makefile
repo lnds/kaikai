@@ -3772,6 +3772,7 @@ test-sugars: $(TARGET) build
 	    complex_literal_*) extra_flags="--path ../stdlib" ;; \
 	    coll_literal_*) extra_flags="--path ../stdlib" ;; \
 	    shape_kind_*) extra_flags="--path ../stdlib" ;; \
+	    kinds_dim_*) extra_flags="--path ../stdlib" ;; \
 	    *) extra_flags="" ;; \
 	  esac; \
 	  if [ -f $$exp_err ]; then \

@@ -1609,7 +1609,14 @@ fn inf_unit_expr_display(u: UnitExprT) : String {
     UPow(a, n) -> concat_all([inf_unit_expr_display(a), "^", int_to_string(n)])
     UJoin(a, b) -> concat_all([inf_unit_expr_display(a), " + ", inf_unit_expr_display(b)])
     UVar(n) -> cat2("?u", int_to_string(n))
+    UDims(us) -> inf_unit_display_list(us)
   }
+}
+
+fn inf_unit_display_list(us: [UnitExprT]) : String = match us {
+  [] -> ""
+  [u] -> inf_unit_expr_display(u)
+  [u, ...rest] -> concat_all([inf_unit_expr_display(u), ", ", inf_unit_display_list(rest)])
 }
 
 # Extract just the eff names from a row's labels — useful for the
@@ -3751,7 +3758,13 @@ fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
     UInv(a)     -> UInv(canon_uvars_unit(a, m))
     UPow(a, n)  -> UPow(canon_uvars_unit(a, m), n)
     UJoin(a, b) -> UJoin(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
+    UDims(us)   -> UDims(canon_uvars_units(us, m))
   }
+}
+
+fn canon_uvars_units(us: [UnitExprT], m: [IntPair]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [canon_uvars_unit(u, m), ...canon_uvars_units(rest, m)]
 }
 
 fn canon_tvars_expr(e: Expr, m: [IntPair]) : Expr {
@@ -5264,7 +5277,13 @@ fn unit_resolve_tparams(u: UnitExprT, tpbinds: [TPBind]) : UnitExprT {
     UInv(a) -> UInv(unit_resolve_tparams(a, tpbinds))
     UPow(a, n) -> UPow(unit_resolve_tparams(a, tpbinds), n)
     UJoin(a, b) -> UJoin(unit_resolve_tparams(a, tpbinds), unit_resolve_tparams(b, tpbinds))
+    UDims(us) -> UDims(units_resolve_tparams(us, tpbinds))
   }
+}
+
+fn units_resolve_tparams(us: [UnitExprT], tpbinds: [TPBind]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [unit_resolve_tparams(u, tpbinds), ...units_resolve_tparams(rest, tpbinds)]
 }
 
 # Look up a unit-kind tparam by its surface name. The tparam list
@@ -6248,7 +6267,18 @@ fn unit_to_table_at(u: UnitExprT, scale: Int, t: UTable) : UTable {
     # a join contributes each side at the same scale; the semilattice
     # engine reads any positive multiplicity as membership.
     UJoin(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
+    # Positional lists are intercepted before any equality decision
+    # reaches a table (unify_dim, unit_canon, apply_unit). Merging the
+    # components here keeps the walk total for the two consumers that
+    # only read the table's sym/var SETS: the kind gate and the occurs
+    # check, for both of which the merged set is exactly right.
+    UDims(us) -> units_to_table_at(us, scale, t)
   }
+}
+
+fn units_to_table_at(us: [UnitExprT], scale: Int, t: UTable) : UTable = match us {
+  [] -> t
+  [u, ...rest] -> units_to_table_at(rest, scale, unit_to_table_at(u, scale, t))
 }
 
 fn unit_to_table(u: UnitExprT) : UTable = unit_to_table_at(u, 1, utable_empty())
@@ -6274,7 +6304,13 @@ fn unit_resolve_to_at(u: UnitExprT, scale: Int, t: UTable, s: Subst, seen: [Int]
     UInv(a) -> unit_resolve_to_at(a, 0 - scale, t, s, seen)
     UPow(a, n) -> unit_resolve_to_at(a, scale * n, t, s, seen)
     UJoin(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
+    UDims(us) -> units_resolve_to_at(us, scale, t, s, seen)
   }
+}
+
+fn units_resolve_to_at(us: [UnitExprT], scale: Int, t: UTable, s: Subst, seen: [Int]) : UTable = match us {
+  [] -> t
+  [u, ...rest] -> units_resolve_to_at(rest, scale, unit_resolve_to_at(u, scale, t, s, seen), s, seen)
 }
 
 # Rebuild a UnitExprT from a canonical table. The table is already
@@ -6333,19 +6369,54 @@ fn tree_chain(acc: UnitExprT, rest: [UnitExprT]) : UnitExprT {
 }
 
 # Public canonicaliser. Aliases are *not* expanded here; that's the
-# resolver's job (resolve_ty_with_units below).
+# resolver's job (resolve_ty_with_units below). A positional list
+# canonicalises point to point — its components never merge into one
+# abelian table.
 #[doc("infer: `unit_canon` — typer entry point invoked by the driver.")]
-pub fn unit_canon(u: UnitExprT) : UnitExprT = utable_to_tree(unit_to_table(u))
+pub fn unit_canon(u: UnitExprT) : UnitExprT = match u {
+  UDims(us) -> UDims(units_canon(us))
+  _ -> utable_to_tree(unit_to_table(u))
+}
 
-fn unit_is_one(u: UnitExprT) : Bool = utable_is_one(unit_to_table(u))
+fn units_canon(us: [UnitExprT]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [unit_canon(u), ...units_canon(rest)]
+}
+
+fn unit_is_one(u: UnitExprT) : Bool = match u {
+  UDims(_) -> false
+  _ -> utable_is_one(unit_to_table(u))
+}
 
 # Apply the unit substitution to a UnitExprT: each UVar(n) is chased
 # through unit_slots to its current binding (if any), and the resolved
 # tree is canonicalised. This is the unit-side analogue of apply_ty
 # and must be called before any structural decision about a unit.
+# The head is chased without table conversion first, so a variable
+# bound to a positional list surfaces intact.
 fn apply_unit(s: Subst, u: UnitExprT) : UnitExprT {
-  let tab = unit_to_table_resolved(u, s)
-  utable_to_tree(tab)
+  match unit_resolve_hab_head(s, u, []) {
+    UDims(us) -> UDims(apply_units(s, us))
+    r -> utable_to_tree(unit_to_table_resolved(r, s))
+  }
+}
+
+fn apply_units(s: Subst, us: [UnitExprT]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [apply_unit(s, u), ...apply_units(s, rest)]
+}
+
+# Chase a top-level UVar chain to its binding without converting to a
+# table, so a positional-list binding is seen as such. `seen` guards
+# against cycles (the occurs check is the real guard).
+fn unit_resolve_hab_head(s: Subst, u: UnitExprT, seen: [Int]) : UnitExprT = match u {
+  UVar(v) ->
+    if list_has_int(seen, v) { u }
+    else { match subst_unit_lookup(s, v) {
+      Some(b) -> unit_resolve_hab_head(s, b, [v, ...seen])
+      None -> u
+    } }
+  _ -> u
 }
 
 # Walk the unit, chasing UVar bindings through `s.unit_slots`. The
@@ -6489,43 +6560,87 @@ fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
   }
 }
 
-# Dimension-unification dispatch seam. The kind's theory selects the
-# unification engine: Module kinds ride nominal atom equality
-# (`unify_module`), Semilattice kinds the subsumption join
-# (`unify_semilattice`), everything else the abelian solver.
-# Composition's ordered engine and Dim's value equality plug in here
-# the same way.
+# Dimension-unification dispatch seam. Positional lists (`<m, n>`)
+# unify point to point before any table forms; after that the kind's
+# theory selects the engine: Semilattice kinds ride the subsumption
+# join (`unify_semilattice`), first-order kinds (Module's nominal
+# atoms, Dim's value indices) identity-plus-binding (`unify_module`),
+# everything else the abelian solver. Composition's ordered engine
+# plugs in here the same way.
 fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
-  let t1 = unit_to_table_resolved(u1, s)
-  let t2 = unit_to_table_resolved(u2, s)
-  if utable_semilattice_theory(t1, s) or utable_semilattice_theory(t2, s) {
-    unify_semilattice(t1, t2, s)
-  } else if utable_module_theory(t1, s) or utable_module_theory(t2, s) {
-    unify_module(t1, t2, s)
-  } else {
-    unify_abelian_diff(utable_diff(t1, t2), s)
+  let h1 = unit_resolve_hab_head(s, u1, [])
+  let h2 = unit_resolve_hab_head(s, u2, [])
+  match h1 {
+    UDims(xs) -> match h2 {
+      UDims(ys) -> unify_dims(xs, ys, s)
+      UVar(v) -> bind_unit_dims(v, xs, s)
+      _ -> None
+    }
+    _ -> match h2 {
+      UDims(ys) -> match h1 {
+        UVar(v) -> bind_unit_dims(v, ys, s)
+        _ -> None
+      }
+      _ -> {
+        let t1 = unit_to_table_resolved(h1, s)
+        let t2 = unit_to_table_resolved(h2, s)
+        if utable_semilattice_theory(t1, s) or utable_semilattice_theory(t2, s) {
+          unify_semilattice(t1, t2, s)
+        } else if utable_first_order(t1, s) or utable_first_order(t2, s) {
+          unify_module(t1, t2, s)
+        } else {
+          unify_abelian_diff(utable_diff(t1, t2), s)
+        }
+      }
+    }
   }
 }
 
-# A table rides the Module engine when any habitant's kind — or any
-# variable's kind constraint — is declared over the Module theory.
-fn utable_module_theory(t: UTable, s: Subst) : Bool =
-  usyms_any_module(t.syms, s.kind_theories) or uvars_any_module(t.vars, s)
+fn unify_dims(xs: [UnitExprT], ys: [UnitExprT], s: Subst) : Option[Subst] / Mutable = match xs {
+  [] -> match ys { [] -> Some(s) _ -> None }
+  [x, ...xr] -> match ys {
+    [] -> None
+    [y, ...yr] -> match unify_dim(x, y, s) {
+      None -> None
+      Some(s1) -> unify_dims(xr, yr, s1)
+    }
+  }
+}
 
-fn usyms_any_module(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
+# Bind a unit variable to a whole positional list. The occurs check
+# and the kind gate both read the merged component table, which
+# carries exactly the sym/var sets each needs.
+fn bind_unit_dims(v: Int, us: [UnitExprT], s: Subst) : Option[Subst] / Mutable {
+  let bound = UDims(us)
+  if occurs_unit(v, bound, s) { None }
+  else {
+    match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
+    }
+  }
+}
+
+# A table rides the first-order verdict when any habitant's kind — or
+# any variable's kind constraint — is declared over a first-order
+# theory (Module, or the HM core behind `Dim`).
+fn utable_first_order(t: UTable, s: Subst) : Bool =
+  usyms_any_first_order(t.syms, s.kind_theories) or uvars_any_first_order(t.vars, s)
+
+fn usyms_any_first_order(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
   [] -> false
   [h, ...rest] -> match h {
     USE(k, _) ->
-      kind_is_module(kts, kind_sym_kind(k)) or usyms_any_module(rest, kts)
+      kind_is_first_order(kts, kind_sym_kind(k)) or usyms_any_first_order(rest, kts)
   }
 }
 
-fn uvars_any_module(xs: [UVarEntry], s: Subst) : Bool = match xs {
+fn uvars_any_first_order(xs: [UVarEntry], s: Subst) : Bool = match xs {
   [] -> false
   [h, ...rest] -> match h {
     UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
-      Some(k) -> kind_is_module(s.kind_theories, k) or uvars_any_module(rest, s)
-      None -> uvars_any_module(rest, s)
+      Some(k) -> kind_is_first_order(s.kind_theories, k) or uvars_any_first_order(rest, s)
+      None -> uvars_any_first_order(rest, s)
     }
   }
 }
@@ -6757,7 +6872,11 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
 #[doc("infer: `dim_collapse` — typer entry point invoked by the driver.")]
 pub fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
   match base {
-    TyDimT(inner, u_inner) -> dim_collapse(inner, unit_canon(UMul(u_inner, u)))
+    # A positional list never merges into an abelian product: the
+    # nesting stays as written and unification decides its fate.
+    TyDimT(inner, u_inner) ->
+      if unit_is_dims(u_inner) or unit_is_dims(u) { TyDimT(base, unit_canon(u)) }
+      else { dim_collapse(inner, unit_canon(UMul(u_inner, u))) }
     TyRefineT(inner, p)    -> TyRefineT(dim_collapse(inner, u), p)
     _ -> {
       let uc = unit_canon(u)
@@ -6765,6 +6884,8 @@ pub fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
     }
   }
 }
+
+fn unit_is_dims(u: UnitExprT) : Bool = match u { UDims(_) -> true  _ -> false }
 
 fn apply_tys(s: Subst, ts: [Ty]) : [Ty] {
   match ts {
@@ -10455,9 +10576,10 @@ fn synth_threaded_arg(st: InferState, x: Expr,
 
 # A list literal / map-pipe chain in a Vec-typed parameter slot takes
 # the bidirectional check path so it mints / collects — a plain synth
-# would build the cons list and fail unification.
+# would build the cons list and fail unification. A fixed-width slot
+# (`Vec[T]<n>`) is Vec-typed under its brand.
 fn arg_wants_vec_context(x: Expr, et: Ty) : Bool =
-  if ty_is_vec_head(et) {
+  if ty_vec_headed(et) {
     match x.kind {
       EList(_)       -> true
       EMapPipe(_, _) -> true
@@ -11905,6 +12027,18 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
           else                       { mk_expr(EVar("array_get"), line, col) }
         synth(st, mk_expr(ECall(callee, [coll, ix]), line, col))
       }
+    # A fixed-width vec (`Vec[T]<n>`) indexes like its dynamic base:
+    # the brand is phantom, so reads flow through a detach.
+    TyDimT(inner, _) -> match inner {
+      TyCon(_, cname, _) ->
+        if cname == "Vec" {
+          let bare = mk_expr(ECall(mk_expr(EVar("__detach_unit"), line, col), [coll]), line, col)
+          synth_vec_index(probe.st, bare, ix, line, col)
+        } else {
+          synth(st, mk_expr(ECall(mk_expr(EVar("array_get"), line, col), [coll, ix]), line, col))
+        }
+      _ -> synth(st, mk_expr(ECall(mk_expr(EVar("array_get"), line, col), [coll, ix]), line, col))
+    }
     _ -> synth(st, mk_expr(ECall(mk_expr(EVar("array_get"), line, col), [coll, ix]), line, col))
   }
 }
@@ -15853,6 +15987,14 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       TyCon(_, hname, hargs) ->
         if hname == "Vec" { check_vec_lit_against(st, els, hargs, e.line, e.col) }
         else { synth(st, e) }
+      # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
+      # length by its habitant.
+      TyDimT(inner, u) -> match inner {
+        TyCon(_, hname, hargs) ->
+          if hname == "Vec" { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
+          else { synth(st, e) }
+        _ -> synth(st, e)
+      }
       _                -> synth(st, e)
     }
     # Vec-context pipeline collect: a map-pipe chain in Vec-expected
@@ -16116,6 +16258,54 @@ fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
   }
 }
 
+# `[e1, ..., en]` under a `Vec[T]<k>` expectation: the habitant IS
+# the length. A known value index must equal the element count; an
+# unbound index variable brands the literal with its own length and
+# the caller's trailing unify binds it (the kind gate rejects a
+# non-`Dim` variable there). A habitant that is no `Int` value index
+# cannot fix a length — the carrier guard at the formation site.
+fn check_fixed_vec_lit(st: InferState, els: [ListElem], hargs: [Ty], u: UnitExprT,
+                       line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let r = check_vec_lit_against(st, els, hargs, line, col)
+  let hab = apply_unit(r.st.sub, u)
+  let n = list_length(els)
+  match fixed_vec_hab(hab, n) {
+    FVOk(h) -> brand_vec_lit(r, h)
+    FVLen(k) -> {
+      diag_error(r.st.file, line, col,
+        concat_all(["vector literal has ", int_to_string(n), " elements, but its type fixes the length to ", int_to_string(k)]))
+      brand_vec_lit(mk_inferred(st_bump_err(r.st), r.ty, r.expr), hab)
+    }
+    FVCarrier -> {
+      diag_error(r.st.file, line, col,
+        concat_all(["`", inf_unit_canon_display(hab), "` cannot fix a `Vec` length — the index of a fixed-width `Vec` is an `Int` value habitant (`Dim`)"]))
+      brand_vec_lit(mk_inferred(st_bump_err(r.st), r.ty, r.expr), hab)
+    }
+  }
+}
+
+# The verdict on a fixed-Vec habitant against a literal of `n`
+# elements: the habitant to brand with, a length mismatch carrying
+# the fixed length, or a non-index habitant.
+type FixedVecHab = FVOk(UnitExprT) | FVLen(Int) | FVCarrier
+
+fn fixed_vec_hab(hab: UnitExprT, n: Int) : FixedVecHab = match hab {
+  UOne -> if n == 1 { FVOk(UOne) } else { FVLen(1) }
+  USym(s) -> {
+    let bare = kind_sym_bare(s)
+    if unit_sym_value_domain(bare) == "Int" {
+      if decode_int(bare) == n { FVOk(hab) } else { FVLen(decode_int(bare)) }
+    } else { FVCarrier }
+  }
+  UVar(_) -> FVOk(USym(kind_qualify_sym(dim_kind_name(), int_to_string(n))))
+  _ -> FVCarrier
+}
+
+fn brand_vec_lit(r: Inferred, hab: UnitExprT) : Inferred {
+  let bty = TyDimT(r.ty, hab)
+  mk_inferred(r.st, bty, with_ty(r.expr, bty))
+}
+
 type VecElems = { st: InferState, elems: [Expr] }
 
 fn check_vec_elems(st: InferState, els: [ListElem], elem_ty: Ty,
@@ -16213,18 +16403,34 @@ fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty,
         let s1 = st_unify(r.st, elem_ty, r.ty, "Byte literal out of range 0..255", line, col)
         mk_inferred(s1, elem_ty, r.expr)
       }
-      _ -> {
-        let r = synth(st, ex)
-        let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
-        mk_inferred(s1, elem_ty, r.expr)
-      }
+      _ -> elem_synth_unify(st, ex, elem_ty, line, col)
     }
-    _ -> {
-      let r = synth(st, ex)
-      let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
-      mk_inferred(s1, elem_ty, r.expr)
+    # A list literal against a Vec-typed element (a fixed-width
+    # matrix row) re-enters the bidirectional path, so the inner
+    # literal builds a vec and its length habitant binds.
+    _ -> match ex.kind {
+      EList(_) ->
+        if ty_vec_headed(elem_ty) {
+          let r = check_expr_against(st, ex, elem_ty, "list element", ex.line, ex.col)
+          let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
+          mk_inferred(s1, apply_ty(s1.sub, r.ty), r.expr)
+        } else { elem_synth_unify(st, ex, elem_ty, line, col) }
+      _ -> elem_synth_unify(st, ex, elem_ty, line, col)
     }
   }
+}
+
+fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
+                    line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let r = synth(st, ex)
+  let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
+  mk_inferred(s1, elem_ty, r.expr)
+}
+
+fn ty_vec_headed(t: Ty) : Bool = match t {
+  TyDimT(inner, _) -> ty_vec_headed(inner)
+  TyCon(_, name, _) -> name == "Vec"
+  _ -> false
 }
 
 # same idea but threaded through an EBlock when the tail
@@ -18888,6 +19094,23 @@ fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / C
 # rejected at the source position that wrote them.
 fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
                               line: Int, col: Int) : Int / Console + File {
+  match u {
+    # Each position of a habitant list stands alone; the shape check
+    # runs per component, never on their merged table.
+    UDims(us) -> validate_module_unit_shapes(us, scope, file, line, col)
+    _ -> validate_module_unit_shape_one(u, scope, file, line, col)
+  }
+}
+
+fn validate_module_unit_shapes(us: [UnitExprT], scope: UnitScope, file: String,
+                               line: Int, col: Int) : Int / Console + File = match us {
+  [] -> 0
+  [u, ...rest] -> validate_module_unit_shape(u, scope, file, line, col) +
+                  validate_module_unit_shapes(rest, scope, file, line, col)
+}
+
+fn validate_module_unit_shape_one(u: UnitExprT, scope: UnitScope, file: String,
+                                  line: Int, col: Int) : Int / Console + File {
   match scope_kind_theories(scope) {
     [] -> 0
     kts -> match utable_atom_violation(unit_to_table(u), kts) {
@@ -19171,6 +19394,14 @@ fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
   UPow(a, _) -> validate_unit_expr(a, scope, file, line, col)
   UJoin(a, b) -> validate_unit_expr(a, scope, file, line, col) +
                  validate_unit_expr(b, scope, file, line, col)
+  UDims(us) -> validate_unit_exprs(us, scope, file, line, col)
+}
+
+fn validate_unit_exprs(us: [UnitExprT], scope: UnitScope,
+                       file: String, line: Int, col: Int) : Int / Console + File = match us {
+  [] -> 0
+  [u, ...rest] -> validate_unit_expr(u, scope, file, line, col) +
+                  validate_unit_exprs(rest, scope, file, line, col)
 }
 
 # First candidate kind of an ambiguous symbol, for the "qualify as
@@ -19714,6 +19945,15 @@ fn vmps_uexpr(u: UnitExprT, decl_name: String, decl_kind: String,
     let eb = vmps_uexpr(b, decl_name, decl_kind, home, priv_table, file, line, col)
     ea + eb
   }
+  UDims(us) -> vmps_uexprs(us, decl_name, decl_kind, home, priv_table, file, line, col)
+}
+
+fn vmps_uexprs(us: [UnitExprT], decl_name: String, decl_kind: String,
+               home: String, priv_table: [PubLeakPriv], file: String,
+               line: Int, col: Int) : Int / Console + File = match us {
+  [] -> 0
+  [u, ...rest] -> vmps_uexpr(u, decl_name, decl_kind, home, priv_table, file, line, col) +
+                  vmps_uexprs(rest, decl_name, decl_kind, home, priv_table, file, line, col)
 }
 
 fn vmps_te_list(ts: [TypeExpr], decl_name: String, decl_kind: String,
@@ -19776,7 +20016,14 @@ fn expand_unit_aliases_in_unit(u: UnitExprT, aliases: [UAliasEntry], seen: [Stri
     UPow(a, n) -> UPow(expand_unit_aliases_in_unit(a, aliases, seen), n)
     UJoin(a, b) -> UJoin(expand_unit_aliases_in_unit(a, aliases, seen),
                          expand_unit_aliases_in_unit(b, aliases, seen))
+    UDims(us) -> UDims(expand_unit_aliases_in_units(us, aliases, seen))
   }
+}
+
+fn expand_unit_aliases_in_units(us: [UnitExprT], aliases: [UAliasEntry], seen: [String]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [expand_unit_aliases_in_unit(u, aliases, seen),
+                   ...expand_unit_aliases_in_units(rest, aliases, seen)]
 }
 
 fn expand_unit_aliases_decls(ds: [Decl], aliases: [UAliasEntry]) : [Decl] =
