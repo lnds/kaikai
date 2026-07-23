@@ -14,6 +14,7 @@ import compiler.chars
 import compiler.diag
 import compiler.ast
 import compiler.kinds
+import compiler.kind_theory
 import compiler.kind_resolve
 import compiler.intervals
 import compiler.refinements
@@ -6020,11 +6021,10 @@ type Subst = {
   # outside the inferencer.
   unit_slots: Array[Option[UnitExprT]],
   unit_fresh: Int,
-  # kinds declared over the Module theory: their habitants admit no
-  # group closure, so unit formation (`*`, `/`, `^`) rejects any
-  # combination where such a habitant survives other than alone with
-  # exponent 1. Program-wide, read-only after seeding.
-  module_kinds: [String],
+  # the atomic (kind, theory) pairs: unit formation and unify_dim
+  # dispatch on the theory of each habitant's kind. Program-wide,
+  # read-only after seeding.
+  kind_theories: [KindTheory],
   # the kind each constrained unit var ranges over: seeded from the
   # decl's unit tparams and copied to fresh vars at instantiation.
   # A var absent here is unconstrained. The abelian pivot consults
@@ -6042,13 +6042,13 @@ fn subst_empty() : Subst = Subst {
   row_fresh: 0,
   unit_slots: array_make(16, None),
   unit_fresh: 0,
-  module_kinds: [],
+  kind_theories: [],
   unit_var_kinds: []
 }
 
-fn subst_seed_module_kinds(s: Subst, mks: [String]) : Subst = Subst {
+fn subst_seed_kind_theories(s: Subst, kts: [KindTheory]) : Subst = Subst {
   slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
-  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh, module_kinds: mks,
+  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh, kind_theories: kts,
   unit_var_kinds: s.unit_var_kinds
 }
 
@@ -6067,7 +6067,7 @@ fn subst_add_unit_kind(s: Subst, v: Int, k: String) : Subst =
   if k == "" { s }
   else { Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
                  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                 module_kinds: s.module_kinds,
+                 kind_theories: s.kind_theories,
                  unit_var_kinds: [UVK(v, k), ...s.unit_var_kinds] } }
 
 fn subst_add_unit_kinds(s: Subst, ids: [Int], kinds: [String]) : Subst {
@@ -6094,7 +6094,7 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst / Mutable {
   let slots2 = array_set(slots1, v, Some(ty))
   Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
 }
 
 # Row-var substitution (parallel to subst_lookup / subst_extend, but
@@ -6120,7 +6120,7 @@ fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst / Mutable {
   let rs2 = array_set(rs1, v, Some(r))
   Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh,
           unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
 }
 
 # Allocate a fresh row variable id and bump the counter. Returned in
@@ -6131,7 +6131,7 @@ fn subst_fresh_row(s: Subst) : FreshRow {
   let id = s.row_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1,
                    unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                   module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
+                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
   FreshRow { id: id, subst: s1 }
 }
 
@@ -6151,7 +6151,7 @@ fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst / Mutable {
   let us2 = array_set(us1, v, Some(u))
   Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: us2, unit_fresh: s.unit_fresh,
-          module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
 }
 
 type FreshUnit = { id: Int, subst: Subst }
@@ -6160,7 +6160,7 @@ fn subst_fresh_unit(s: Subst) : FreshUnit {
   let id = s.unit_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
                    unit_slots: s.unit_slots, unit_fresh: id + 1,
-                   module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds }
+                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
   FreshUnit { id: id, subst: s1 }
 }
 
@@ -6482,12 +6482,71 @@ fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
 }
 
 # Dimension-unification dispatch seam. The kind's theory selects the
-# unification engine (`unify_<theory>`: abelian today; structural,
-# module, composition follow, each plugging in here without touching
-# the callers). Habitant symbols already carry their kind, so isolation
-# rides the symbol key, not a branch here.
-fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable =
-  unify_abelian(u1, u2, s)
+# unification engine: Module kinds ride nominal atom equality
+# (`unify_module`), everything else the abelian solver. Composition's
+# ordered engine and Dim's value equality plug in here the same way.
+fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
+  let t1 = unit_to_table_resolved(u1, s)
+  let t2 = unit_to_table_resolved(u2, s)
+  if utable_module_theory(t1, s) or utable_module_theory(t2, s) {
+    unify_module(t1, t2, s)
+  } else {
+    unify_abelian_diff(utable_diff(t1, t2), s)
+  }
+}
+
+# A table rides the Module engine when any habitant's kind — or any
+# variable's kind constraint — is declared over the Module theory.
+fn utable_module_theory(t: UTable, s: Subst) : Bool =
+  usyms_any_module(t.syms, s.kind_theories) or uvars_any_module(t.vars, s)
+
+fn usyms_any_module(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    USE(k, _) ->
+      kind_is_module(kts, kind_sym_kind(k)) or usyms_any_module(rest, kts)
+  }
+}
+
+fn uvars_any_module(xs: [UVarEntry], s: Subst) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      Some(k) -> kind_is_module(s.kind_theories, k) or uvars_any_module(rest, s)
+      None -> uvars_any_module(rest, s)
+    }
+  }
+}
+
+# The Module engine: classify each side (dimensionless, lone atom, lone
+# variable) and unify nominally. A variable bind still passes the kind
+# gate, so a habitant of another kind cannot bind a Module tparam.
+fn unify_module(t1: UTable, t2: UTable, s: Subst) : Option[Subst] / Mutable {
+  let v1 = module_side(utable_symexps(t1), utable_varexps(t1))
+  let v2 = module_side(utable_symexps(t2), utable_varexps(t2))
+  match module_unify_verdict(v1, v2) {
+    MEq -> Some(s)
+    MFail -> None
+    MBind(v, bound) -> match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
+    }
+  }
+}
+
+fn utable_symexps(t: UTable) : [SymExp] = use_to_symexps(t.syms)
+
+fn use_to_symexps(xs: [USymEntry]) : [SymExp] = match xs {
+  [] -> []
+  [h, ...rest] -> match h { USE(k, n) -> [SEx(k, n), ...use_to_symexps(rest)] }
+}
+
+fn utable_varexps(t: UTable) : [VarExp] = uve_to_varexps(t.vars)
+
+fn uve_to_varexps(xs: [UVarEntry]) : [VarExp] = match xs {
+  [] -> []
+  [h, ...rest] -> match h { UVE(v, n) -> [VEx(v, n), ...uve_to_varexps(rest)] }
+}
 
 # Unify two unit expressions under `s`. The classic equational view:
 # `u1 ≡ u2` iff `u1 * u2^-1 ≡ 1`. We solve the homogeneous form by
@@ -6578,26 +6637,10 @@ fn uk_constrain_vars(xs: [UVarEntry], k: String, s: Subst) : Option[Subst] = mat
   }
 }
 
-# Module-theory shape check on a canonical table: a Module-kind
-# habitant admits no group closure, so it must stand alone with
-# exponent 1 (or have cancelled out entirely). Returns the offending
-# qualified symbol otherwise. Unification itself needs no separate
-# engine — on shapes this guard admits, the abelian solver already
-# behaves as symbol equality plus variable binding.
-fn utable_module_violation(t: UTable, mks: [String]) : Option[String] =
-  umv_loop(t.syms, t, mks)
-
-fn umv_loop(xs: [USymEntry], t: UTable, mks: [String]) : Option[String] = match xs {
-  [] -> None
-  [h, ...rest] -> match h {
-    USE(k, n) ->
-      if list_has(mks, kind_sym_kind(k)) {
-        if n == 1 and list_length(t.syms) == 1 and list_length(t.vars) == 0 {
-          umv_loop(rest, t, mks)
-        } else { Some(k) }
-      } else { umv_loop(rest, t, mks) }
-  }
-}
+# Formation check on a canonical table, dispatched by each habitant
+# kind's theory (atom_form_violation in kind_theory).
+fn utable_atom_violation(t: UTable, kts: [KindTheory]) : Option[String] =
+  atom_form_violation(utable_symexps(t), list_length(t.vars), kts)
 
 # Apply the substitution to a type. Recurses structurally; resolves
 # `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
@@ -7593,7 +7636,7 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: need,
                               unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                              module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds } }
+                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds } }
   mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
 }
 
@@ -7622,7 +7665,7 @@ fn mk_fresh_unit_subst(uvars: [Int], s: Subst) : FreshUnitSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: s.row_fresh,
                               unit_slots: s.unit_slots, unit_fresh: need,
-                              module_kinds: s.module_kinds, unit_var_kinds: s.unit_var_kinds } }
+                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds } }
   mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed, [])
 }
 
@@ -7636,7 +7679,7 @@ fn advance_row_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh + n,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh,
-                     module_kinds: st.sub.module_kinds, unit_var_kinds: st.sub.unit_var_kinds }
+                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds }
     st_set_sub(st, s1)
   }
 }
@@ -7649,7 +7692,7 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh + n,
-                     module_kinds: st.sub.module_kinds, unit_var_kinds: st.sub.unit_var_kinds }
+                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds }
     st_set_sub(st, s1)
   }
 }
@@ -8102,9 +8145,9 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, core_len: Int,
                                   recs: [RecInfo], op_eff_arities: [OpEffArity],
                                   type_aliases: [AliasResult],
                                   op_to_eff: [OpToEff],
-                                  module_kinds: [String]) : InferState =
+                                  kind_theories: [KindTheory]) : InferState =
   InferState { file: file, env: env, core_len: core_len,
-               sub: subst_seed_module_kinds(subst_empty(), module_kinds),
+               sub: subst_seed_kind_theories(subst_empty(), kind_theories),
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
@@ -11942,8 +11985,9 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
       # checks the unit equality automatically.
       let what = string_concat("arithmetic operator '", string_concat(op, "'"))
       let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
-      let ty = apply_ty(s1.sub, rl.ty)
-      mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+      let s2 = st_check_arith_string(s1, op, rl.ty, line, col)
+      let ty = apply_ty(s2.sub, rl.ty)
+      mk_inferred(s2, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
     }
   }
 }
@@ -12261,6 +12305,25 @@ fn ty_split_dim(t: Ty, s: Subst) : DimSplit {
   }
 }
 
+# Primitive arithmetic never succeeds on a String operand (the runtime
+# add/sub/mul/div traps on non-numeric payloads), so reject it at the
+# operator. The dim wrapper is stripped first, so a String-carrier
+# monetary value hits this exactly like a bare String.
+fn st_check_arith_string(st: InferState, op: String, t: Ty,
+                         line: Int, col: Int) : InferState / Console + File + Mutable {
+  let split = ty_split_dim(t, st.sub)
+  match split.base {
+    TyString -> {
+      diag_error(st.file, line, col,
+        concat_all(["arithmetic operator `", op,
+                    "` requires a numeric operand, found `String`"]))
+      diag_help("string concatenation is `++`")
+      st_bump_err(st)
+    }
+    _ -> st
+  }
+}
+
 fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
                      rt: Ty, re: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -12268,7 +12331,8 @@ fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
   let ls = ty_split_dim(lt, st.sub)
   let rs = ty_split_dim(rt, st.sub)
   let what = string_concat("arithmetic operator '", string_concat(op, "'"))
-  let s1 = st_unify(st, ls.base, rs.base, what, line, col)
+  let s0 = st_check_arith_string(st, op, lt, line, col)
+  let s1 = st_unify(s0, ls.base, rs.base, what, line, col)
   let combined = if op == "*" {
     UMul(ls.dim, rs.dim)
   } else {
@@ -12287,11 +12351,11 @@ fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
 # declared.
 fn st_check_module_unit(st: InferState, op: String, u: UnitExprT,
                         line: Int, col: Int) : InferState / Console + File + Mutable {
-  match st.sub.module_kinds {
+  match st.sub.kind_theories {
     [] -> st
     _ -> {
       let t = unit_to_table_resolved(u, st.sub)
-      match utable_module_violation(t, st.sub.module_kinds) {
+      match utable_atom_violation(t, st.sub.kind_theories) {
         None -> st
         Some(sym) -> {
           let kind = kind_sym_kind(sym)
@@ -17458,7 +17522,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               sums: [SumInfo],
               proto_impls: [ProtoImplReg],
               all_decls: [Decl],
-              module_kinds: [String],
+              kind_theories: [KindTheory],
               d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable {
 
 
@@ -17494,7 +17558,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # target's recs in the same `RecInfo[]`.
       let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                     op_eff_arities, type_aliases, op_to_eff,
-                                                    module_kinds)
+                                                    kind_theories)
       # install the protocol impl table snapshot so
       # `synth_binop` can decide whether a (prim, nonprim) /
       # (nonprim, nonprim cross) pair routes to a registered impl.
@@ -17706,27 +17770,27 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
     # `print`/`assert` and effecting helpers type without a declared row.
     DTest(_, body, line, col) -> infer_test_body(file, env, core_len, recs,
       op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
-      module_kinds, [], body, d, line, col)
+      kind_theories, [], body, d, line, col)
     DBench(_, body, line, col) -> infer_test_body(file, env, core_len, recs,
       op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
-      module_kinds, [], body, d, line, col)
+      kind_theories, [], body, d, line, col)
     DCheck(_, ps, body, line, col) -> infer_test_body(file, env, core_len, recs,
       op_eff_arities, type_aliases, op_to_eff, sums, proto_impls, all_decls,
-      module_kinds, ps, body, d, line, col)
+      kind_theories, ps, body, d, line, col)
     # `#[constructor]` wrapper: type-check the inner fn and unwrap it —
     # the marker has done its job (the registry was built in
     # `add_decls_loop`), so the emitter sees a plain `DFn`.
     DProtoLaws(_, inner, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, proto_impls, all_decls, module_kinds,
+                                            sums, proto_impls, all_decls, kind_theories,
                                             inner, verbose)
     DImplAxiom(_, inner, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, proto_impls, all_decls, module_kinds,
+                                            sums, proto_impls, all_decls, kind_theories,
                                             inner, verbose)
     DConstructor(inner, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, proto_impls, all_decls, module_kinds,
+                                            sums, proto_impls, all_decls, kind_theories,
                                             inner, verbose)
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
   }
@@ -17743,12 +17807,12 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
                    recs: [RecInfo], op_eff_arities: [OpEffArity],
                    type_aliases: [AliasResult], op_to_eff: [OpToEff],
                    sums: [SumInfo], proto_impls: [ProtoImplReg],
-                   all_decls: [Decl], module_kinds: [String],
+                   all_decls: [Decl], kind_theories: [KindTheory],
                    ps: [Param], body: Expr,
                    d: Decl, line: Int, col: Int) : TypedDecl / Console + File + Mutable {
   let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                 op_eff_arities, type_aliases, op_to_eff,
-                                                module_kinds)
+                                                kind_theories)
   let st_init1 = st_set_proto_impls(st_init0, proto_impls)
   let st_init = st_set_sums(st_init1, sums)
   let added = add_infer_params_with_binds(st_init, ps, [], [])
@@ -18426,7 +18490,7 @@ fn infer_all_loop(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
                    sums: [SumInfo],
                    proto_impls: [ProtoImplReg],
                    all_decls: [Decl],
-                   module_kinds: [String]) : TypedProgram / Console + File {
+                   kind_theories: [KindTheory]) : TypedProgram / Console + File {
 
 
   match ds {
@@ -18448,7 +18512,7 @@ fn infer_all_loop(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
                           # consult source-level `default { }` blocks
                           # when deciding row absorption at `main`.
                           all_decls,
-                          module_kinds,
+                          kind_theories,
                           d, verbose)
       infer_all_loop(file, env, core_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
@@ -18459,7 +18523,7 @@ fn infer_all_loop(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
                      prepend_reverse_diags(r.diags, acc_diags),
                      prepend_reverse_op_res(r.op_res, acc_op_res),
                      type_aliases, op_to_eff, sums, proto_impls,
-                     all_decls, module_kinds)
+                     all_decls, kind_theories)
     }
   }
 }
@@ -18739,16 +18803,16 @@ fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / C
   TyRow(row) -> validate_unit_refs_row(row, scope, file)
 }
 
-# Module-theory shape check on a written unit (annotation or literal):
-# a Module-kind habitant stands alone with exponent 1 or not at all.
-# Runs on the canonical table of the whole expression, so `USD^1`
-# collapses cleanly and `USD^2`, `USD*m`, `USD/EUR` are rejected at
-# the source position that wrote them.
+# Atomic-kind shape check on a written unit (annotation or literal):
+# a Module or Composition habitant stands alone with exponent 1 or not
+# at all. Runs on the canonical table of the whole expression, so
+# `USD^1` collapses cleanly and `USD^2`, `USD*m`, `USD/EUR` are
+# rejected at the source position that wrote them.
 fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
                               line: Int, col: Int) : Int / Console + File {
-  match scope_module_kinds(scope) {
+  match scope_kind_theories(scope) {
     [] -> 0
-    mks -> match utable_module_violation(unit_to_table(u), mks) {
+    kts -> match utable_atom_violation(unit_to_table(u), kts) {
       None -> 0
       Some(sym) -> {
         let kind = kind_sym_kind(sym)
@@ -19739,7 +19803,7 @@ fn typecheck_module(file: String, mod: ModuleDecls,
                      all_program_decls: [Decl],
                      proto_impls: [ProtoImplReg],
                      head_owners: [HeadOwnerEntry],
-                     module_kinds: [String],
+                     kind_theories: [KindTheory],
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
@@ -19788,7 +19852,7 @@ fn typecheck_module(file: String, mod: ModuleDecls,
   let tp = infer_all_loop(file, data.built.env, data.built.core_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums, proto_impls,
-                 all_decls_for_typer, module_kinds)
+                 all_decls_for_typer, kind_theories)
   # Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved `EVar("Eff.op")`
   # callees the walker keys on. Adds its diagnostics directly to stderr
@@ -19887,7 +19951,7 @@ fn typecheck_program(file: String, modules: [ModuleDecls],
 fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
-                                       module_kinds: [String],
+                                       kind_theories: [KindTheory],
                                        verbose: Bool) : TypedProgram / Console + File {
 
 
@@ -19898,7 +19962,7 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
   let all_program_decls = flatten_module_decls(modules, [])
   typecheck_program_loop(file, modules, module_env_delta_empty(),
                           all_program_decls,
-                          proto_impls, head_owners, module_kinds, verbose,
+                          proto_impls, head_owners, kind_theories, verbose,
                           [], 0, [], [], [], [], [], 0, 0)
 }
 
@@ -19920,7 +19984,7 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                             all_program_decls: [Decl],
                             proto_impls: [ProtoImplReg],
                             head_owners: [HeadOwnerEntry],
-                            module_kinds: [String],
+                            kind_theories: [KindTheory],
                             verbose: Bool,
                             acc_decls: [Decl],
                             acc_errs: Int,
@@ -19948,14 +20012,14 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
     }
     [m, ...rest] -> {
       let r = typecheck_module(file, m, acc_delta, all_program_decls,
-                                  proto_impls, head_owners, module_kinds, verbose)
+                                  proto_impls, head_owners, kind_theories, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
       let next_core_len = match core_len_acc {
         0 -> r.typed.core_len
         _ -> core_len_acc
       }
       typecheck_program_loop(file, rest, next_delta, all_program_decls,
-                              proto_impls, head_owners, module_kinds, verbose,
+                              proto_impls, head_owners, kind_theories, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
@@ -20196,19 +20260,14 @@ fn bucket_append(acc: [ModuleDecls], home: String, d: Decl,
 # single-module input. Every legacy caller of
 # infer_program_with_protos goes through here; the per-module fold
 # entry point is `typecheck_program`.
-# Module-kind names: the shipped base set plus any the decl stream
-# declares, so the library/LSP entry points get the formation guard
-# too; the driver's main path passes its pre-strip capture through the
-# cached variant instead (kind decls are stripped before the typer
-# there).
+# Kind theories: recomputed from the decl stream so the library/LSP
+# entry points get the theory dispatch too; the driver's main path
+# passes its pre-strip capture through the cached variant instead
+# (kind decls are stripped before the typer there).
 fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
                                proto_impls: [ProtoImplReg]) : TypedProgram / Console + File =
   infer_program_with_protos_cached(file, decls, verbose, proto_impls, [],
-                                   list_append(
-                                     list_append(base_module_kind_names(),
-                                                 base_composition_kind_names()),
-                                     list_append(module_kind_names(decls),
-                                                 composition_kind_names(decls))))
+                                   atomic_kind_theories(decls))
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
@@ -20219,7 +20278,7 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
 pub fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bool,
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
-                                       module_kinds: [String]) : TypedProgram / Console + File {
+                                       kind_theories: [KindTheory]) : TypedProgram / Console + File {
 
 
   # Hanga Roa modular typecheck: partition the post-cascade decl
@@ -20239,7 +20298,7 @@ pub fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bo
     [_]          -> [ModuleDecls { name: None, decls: decls }]
     _            -> mods0
   }
-  typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, module_kinds, verbose)
+  typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, kind_theories, verbose)
 }
 
 #[doc("infer: --infer dump of inferred top-level signatures.")]
