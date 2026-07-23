@@ -123,13 +123,15 @@ per energy) type-checks when both inhabit `Measure` (`unit USD`):
 
 ## Module kinds — `Currency` and money
 
-`Module` is the additive-only theory: habitants add and subtract
-within one kind and scale by a bare number, but have **no products
-or powers** — `USD^2`, `USD*EUR`, and `1/USD` are compile errors at
-the operator or annotation that would form them. The catalog
-declares `kind Currency : Module with currency`; the habitants
-(`USD`, `EUR`, ...) ship in `stdlib/money.kai`, where
-`Money[c: Currency]` is `Decimal<c>`:
+`Module` is the additive-only theory: habitants unify by nominal
+atom equality, add and subtract within one kind, and scale by a bare
+number, but have **no products or powers** — `USD^2`, `USD*EUR`, and
+`1/USD` are compile errors at the operator or annotation that would
+form them. The catalog declares
+`kind Currency : Module over T with currency`; the habitants (`USD`,
+`EUR`, ...) ship in `stdlib/money.kai`, where `Money[t]<c>` is a
+carrier `t` (`Decimal`, `BigInt`, `Int`, ...) tagged with currency
+`c`:
 
 ```kaikai
 import money
@@ -137,24 +139,26 @@ import decimal as dec
 import decimal_proto
 
 fn main() : Unit / Stdout = {
-  let a: Money[USD] = 10.50<USD>
-  let b: Money[USD] = 4.50<USD>
-  let total = a + b                  # same currency → Money[USD]
+  let a: Money[dec.Decimal]<USD> = 10.50<USD>
+  let b: Money[dec.Decimal]<USD> = 4.50<USD>
+  let total = a + b                  # same currency → Money[Decimal]<USD>
   let k: dec.Decimal = 3
-  let scaled = total * k             # scalar action → Money[USD]
+  let scaled = total * k             # scalar action → Money[Decimal]<USD>
   Stdout.print(money.to_string(scaled))
 }
 ```
 
-A money literal takes its `Decimal` carrier from the annotation
-(`10.50<USD>` alone is `Real<USD>`), so bind constants with a
-`Money[...]` annotation before operating on them.
+A money literal takes its carrier from the annotation (`10.50<USD>`
+alone is `Real<USD>`), so bind constants with a `Money[...]<...>`
+annotation before operating on them. The carrier takes no protocol
+bound: `Money[String]<USD>` constructs, and arithmetic on it is
+rejected where the concrete instance meets a numeric operator.
 
-`Money[USD] + Money[EUR]` is a unit mismatch; `Money[USD] *
-Money[USD]` cannot be formed. Cross-currency conversion is an
-explicit door: `money.convert(m, rate)` with the target currency
-pinned by annotation. Declaring your own additive kind works the
-same way (`kind Points : Module with points`).
+`Money[t]<USD> + Money[t]<EUR>` is a type mismatch;
+`Money[t]<USD> * Money[t]<USD>` cannot be formed. Cross-currency
+conversion is an explicit door: `money.convert(m, rate)` with the
+target currency pinned by annotation. Declaring your own additive
+kind works the same way (`kind Points : Module with points`).
 
 ## Caveats
 

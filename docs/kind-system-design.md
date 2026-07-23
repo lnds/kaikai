@@ -101,7 +101,7 @@ claimed more engines than exist. The truth, and the target:
 | `EffectRow` (`Effect`) | real — row unification (`unify_row`) | keep |
 | `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_abelian`) | keep |
 | shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | **shipped** as its own theory `ConstructorApp`; the `Structural` label is dissolved |
-| `Module` (`Currency`) | **facade** — body byte-identical to `AbelianGroup`; `unify_dim` delegates straight to `unify_abelian`; only a formation-guard is "Module" | **build** a real module engine (`scale` / `over R`) — a module over a ring adds scalar multiplication, an algebra the abelian group does not have |
+| `Module` (`Currency`) | **real** — `unify_dim` dispatches by theory; Module kinds unify by nominal atom equality (`unify_module`) with structural formation (no products/powers), and `scale` lives in operation signatures, not the kind algebra | keep |
 | `Composition` (`Layout`) | **facade** — same `unify_abelian`; the summed measure lives in codegen, not in unification | **build** a real composition engine (the measure participates in unification) |
 | `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
 | `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **shipped** — no longer a theory; a *protocol-law set* in its own namespace, verified by generated property checks |
@@ -137,10 +137,10 @@ the thinnest fragment: constant ~ constant ⟹ equality; variable ~ constant ⟹
 which the HM core already provides — the same `==` the core uses on type-var ids,
 applied to the index *value*. So `Dim` reuses the core (legitimate, like `Type`), not
 a catalog theory (forbidden). The `<m,n>·<n,p> → <m,p>` shape rule lives in the
-operation's signature, not in a theory. The seam is `unify_dim`, which today delegates
-blindly to `unify_abelian` (`infer.kai:6499`): it must dispatch by kind — a value-index
-habitant goes to first-order equality, a product of measure symbols goes to abelian —
-which is exactly what the engine-selection comment there already anticipates.
+operation's signature, not in a theory. The seam is `unify_dim`, which now dispatches
+by the kind's theory (Module kinds go to nominal atom equality, measure symbols to
+abelian); a value-index habitant slots into the same dispatch with first-order
+equality.
 
 ## Theories are assembled from a closed property menu
 
@@ -502,6 +502,12 @@ type Money[Num]<Currency> = { amount: Num }
 fn sum(a, v : Money[Real]<USD>) = a + v          # a inferred Money[Real]<USD>; a+v needs same currency+carrier
 ```
 
+> **v1 status (2026-07-22):** the use-site surface (`Money[Decimal]<USD>`, carrier in
+> `[]`, habitant in `<>`) is shipped; the shipped declaration is the transparent
+> carrier alias `type Money[t] = t` with the habitant applied at the use site, so the
+> carrier's own arithmetic rides through unchanged. The declaration-side habitant slot
+> (`type M[T]<Kind> = { ... }` on a record body) has no surface yet.
+
 ### No protocol bound on the carrier — the theory restricts it
 
 The carrier takes **no** protocol bound in the surface. `type M[Num: Add]` is a parse error
@@ -820,9 +826,11 @@ isolates habitants across kinds with no new engine and no kind-tag on
 
 - `Module`, `Composition`, `Region` each get a real engine of their own — the facade
   audit settled *that* they must; the remaining work is to *build* them, not decide
-  whether to. `Module`'s is scalar multiplication (`scale`/`over R`); `Composition`'s
-  is measure-in-unification; `Region`'s is real identity/branding (`TyBranded`, which
-  the runtime comment admits "has not landed").
+  whether to. ~~`Module`'s~~ **shipped**: nominal atom equality + structural
+  formation, with `scale` in operation signatures (the `over T` on `Currency` names
+  the scalar domain declaratively). `Composition`'s is measure-in-unification;
+  `Region`'s is real identity/branding (`TyBranded`, which the runtime comment admits
+  "has not landed").
 - ~~`Functorial` leaves the theory catalog~~ **shipped.** A protocol header names a
   *law set*, not a theory, and the two namespaces are disjoint in the parser: a theory
   in a protocol header and `Functorial` on a `kind` are both errors. `fusion` left the

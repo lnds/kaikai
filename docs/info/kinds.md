@@ -61,9 +61,10 @@ same closure applies to `Nominal` and `ConstructorApp`.
   multiply and divide (`m·s`, `m/s²`). The engine solves linear
   integer equations to unify unit variables.
 - `Module = { assoc, commut, inverse, identity }` used additively:
-  habitants add within one kind but have no product, so `USD²` and
-  `USD·EUR` are rejected at formation. Scalar multiplication
-  (`Money · Decimal`) is external, a protocol impl.
+  habitants unify by nominal atom equality and have no product, so
+  `USD²` and `USD·EUR` are rejected at formation. Scaling lives in
+  operation signatures (`Money[t]<c> * t` keeps the currency), not
+  in the kind algebra.
 - `Nominal = builtin` — identity alone: two habitants unify iff they
   are the same habitant. No product, no sum. The engine for regions,
   where each arena is distinct.

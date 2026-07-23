@@ -253,7 +253,7 @@ stdlib/
     complex.kai  (shipped)
     bigint.kai   (shipped — arbitrary-precision integers, pure kaikai; +bigint_limbs/_convert/_proto)
   decimal.kai    pure, stage 2 (top-level module — shipped)
-  money.kai      pure, stage 2 (top-level module — shipped: `Money[c: Currency]` = `Decimal<c>` over the `Module` kind; of/amount/parse/to_string/convert/round)
+  money.kai      pure, stage 2 (top-level module — shipped: carrier-generic `Money[t]<c: Currency>` over the `Module` kind (`Money[Decimal]<USD>`, `Money[BigInt]<USD>`, ...); of/amount/parse/to_string/convert/round)
   decimal_big.kai pure, stage 2 (top-level module; BigInt carrier, no scale ceiling — shipped; +decimal_big_proto)
   rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped; +rational_proto)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
