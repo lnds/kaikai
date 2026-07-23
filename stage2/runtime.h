@@ -16580,11 +16580,14 @@ static int64_t kai_native_target_abi(void) {
  * emit step merges. Folded into the cached core object's content key so a
  * toolchain-, target- or bitcode-level change can never resurrect a stale
  * object whose KIR text happens to match. Empty string when the split
- * cache must not engage: an explicit KAI_NATIVE_CORE_OBJ=0, or a
+ * cache must not engage: an explicit KAI_NATIVE_CORE_OBJ=0, a
  * non-default opt level (`--debug` keeps the single-object path and its
- * dSYM flow). Bitcode identity is mtime-size (the kaic2 toolchain-id
- * discipline), not a content hash: a regenerated identical bitcode costs
- * one spurious miss, never a stale hit. */
+ * dSYM flow), or the whole-program runtime bitcode present without its
+ * inline twin — a split partition would then leave every `kaix_*` op an
+ * out-of-line call (an order of magnitude on hot loops), while the
+ * whole-program merge still inlines them. Bitcode identity is mtime-size
+ * (the kaic2 toolchain-id discipline), not a content hash: a regenerated
+ * identical bitcode costs one spurious miss, never a stale hit. */
 static void kai_llvm_bc_id(const char *env, char *out, size_t outsz) {
     const char *p = getenv(env);
     struct stat st;
@@ -16598,10 +16601,20 @@ static KaiValue *kai_llvm_backend_tag(void) {
     if (off && strcmp(off, "0") == 0) return kai_str("");
     const char *lvl = getenv("KAI_NATIVE_OPT");
     if (lvl && lvl[0] && strcmp(lvl, "2") != 0) return kai_str("");
-    char *triple = LLVMGetDefaultTargetTriple();
     char bc[64], inlbc[64], tag[512];
     kai_llvm_bc_id("KAI_NATIVE_RUNTIME_BC", bc, sizeof bc);
     kai_llvm_bc_id("KAI_NATIVE_RUNTIME_INLINE_BC", inlbc, sizeof inlbc);
+    if (strcmp(bc, "none") != 0 && strcmp(inlbc, "none") == 0) {
+        static int noted = 0;
+        if (!noted) {
+            noted = 1;
+            fprintf(stderr, "kai: native runtime inline bitcode unavailable — "
+                    "skipping the core-object split, using the whole-program "
+                    "runtime merge (slower build, runtime ops stay inlined)\n");
+        }
+        return kai_str("");
+    }
+    char *triple = LLVMGetDefaultTargetTriple();
     snprintf(tag, sizeof tag, "%s|O2|bc:%s|inlbc:%s", triple ? triple : "?", bc, inlbc);
     if (triple) LLVMDisposeMessage(triple);
     return kai_str(tag);

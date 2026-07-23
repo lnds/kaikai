@@ -116,3 +116,17 @@ while any surface change misses safely.
   hits; adding an impl misses; a `--test` build skips the cache.
 
 Both families run under `make -C stage2 test-core-cache`.
+
+## Native core-object split fixtures (`ncoreobj_*.sh`)
+
+Pin the engage/disengage contract of the native core-object split
+(`stage2/compiler/emit_native_core.kai` + `kai_llvm_backend_tag`).
+
+- `ncoreobj_inline_bc_fallback.sh` — with the whole-program runtime
+  bitcode present but `runtime_inline.bc` absent, kaic2 must disengage
+  the split and take the whole-program merge (runtime ops stay inlined)
+  with one `kai:` stderr note, instead of silently emitting every
+  `kaix_*` op out-of-line. The control run (both bitcodes) proves the
+  split still engages. Skips on a C-only kaic2 or ungenerated bitcodes.
+
+Runs under `make -C stage2 test-core-cache`.
