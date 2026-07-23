@@ -109,6 +109,44 @@ else
   fail=$((fail + 1))
 fi
 
+# Driver idempotency: the defect lived entirely in `bin/kai migrate`'s
+# --from default-resolution, which the raw-kaic2 fixtures above never
+# exercise. Run the real driver twice over a package directory whose
+# kai.toml declares the origin edition, and assert the second --write is
+# byte-stable. Run 1 flips to Ok-first and stamps orongo; run 2 must
+# resolve --from off the stamped manifest and apply no rule.
+KAI="$ROOT/bin/kai"
+pkg="$tmp/driver-pkg"
+mkdir -p "$pkg"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$pkg/kai.toml"
+cat > "$pkg/main.kai" <<'EOF'
+fn parse(s: String) : Result[String, Int] = Ok(1)
+
+fn main() : Unit / Stdout = match parse("x") {
+  Ok(n) -> println("ok")
+  Err(e) -> println(e)
+}
+EOF
+if "$KAI" migrate --write "$pkg/main.kai" > /dev/null 2>&1; then
+  cp "$pkg/main.kai" "$tmp/driver-after1.kai"
+  if "$KAI" migrate --write "$pkg/main.kai" > /dev/null 2>&1; then
+    if diff -u "$tmp/driver-after1.kai" "$pkg/main.kai" > "$tmp/diff"; then
+      echo "  OK   driver-idempotency (second --write is a no-op)"
+      pass=$((pass + 1))
+    else
+      echo "  FAIL driver-idempotency — second --write flipped the file back:"
+      sed 's/^/      /' "$tmp/diff"
+      fail=$((fail + 1))
+    fi
+  else
+    echo "  FAIL driver-idempotency — second migrate --write errored"
+    fail=$((fail + 1))
+  fi
+else
+  echo "  FAIL driver-idempotency — first migrate --write errored"
+  fail=$((fail + 1))
+fi
+
 if [ "$fail" -gt 0 ]; then
   echo "migrate_fixtures: $pass passed, $fail failed"
   exit 1
