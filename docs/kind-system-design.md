@@ -831,6 +831,13 @@ isolates habitants across kinds with no new engine and no kind-tag on
   the scalar domain declaratively). `Composition`'s is measure-in-unification;
   `Region`'s is real identity/branding (`TyBranded`, which the runtime comment admits
   "has not landed").
+- ~~`Semilattice` + `Perm`~~ **shipped**: the join engine (`kind_semilattice.kai`) —
+  `+` joins in `<>`, idempotent collapse, subsumption-ordered unification (required ⊆
+  provided, expected side first per `unify`'s contract), tree-level formation (no
+  products/inverses/powers on Semilattice habitants, joins only among one Semilattice
+  kind). `theory Semilattice = { assoc, commut, idempotent }` and
+  `kind Perm : Semilattice with perm` are in the catalog; the file API is the first
+  consumer (`FileHandle<read>` / `FileHandle<read + write>`).
 - ~~`Functorial` leaves the theory catalog~~ **shipped.** A protocol header names a
   *law set*, not a theory, and the two namespaces are disjoint in the parser: a theory
   in a protocol header and `Functorial` on a `kind` are both errors. `fusion` left the

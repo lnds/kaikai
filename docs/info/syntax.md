@@ -748,6 +748,14 @@ formed). `currency USD` declares a habitant; `import money` brings the
 ISO starter set and the carrier-generic `Money[t]<c>`
 (`Money[Decimal]<USD>`). See `kai info units` §Module kinds.
 
+Permissions are units of the `Perm` kind (`Semilattice` theory:
+idempotent join, no inverse). `perm read` declares a habitant; sets
+join with `+` inside `<>` (`FileHandle<read + write>`) and unify by
+subsumption — more capabilities flow where fewer are required. The
+file API carries them: `open_read` mints `FileHandle<read>`,
+`open_write` mints `FileHandle<read + write>`, `write_chunk` requires
+`<write>`. See `kai info kinds` §Perm.
+
 Inside `<...>` (unit expressions) `^` also denotes power, but the
 exponent there is a unit-level integer literal — see `kai info units`.
 

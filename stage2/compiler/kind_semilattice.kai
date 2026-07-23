@@ -1,0 +1,154 @@
+#[doc("""
+compiler.kind_semilattice — the join engine for Semilattice kinds.
+
+A Semilattice habitant set (`<read + write>`) is an idempotent,
+commutative, associative join with no inverse. Unification is
+subsumption along the lattice order: the required side must be a
+subset of the provided side, so a handle carrying more capabilities
+flows into a site demanding fewer, and `read + read` collapses to
+`read`. Joins are the only compound Semilattice habitants admit —
+products, inverses and powers are formation errors, checked on the
+surface tree (the canonical table cannot tell `read*write` from
+`read + write`).
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.kind_theory
+
+# One side of a Semilattice unification, classified from its canonical
+# table: a ground habitant set (possibly empty), a lone unit variable,
+# or an inadmissible mix.
+pub type SlSide = SlSet([String]) | SlVarSide(Int) | SlIll
+
+#[doc("Classify one side's canonical factors for the Semilattice engine: a ground set (any positive multiplicity collapses to membership), a lone variable, or an inadmissible mix (negative exponents, a variable joined with symbols).")]
+pub fn sl_side(syms: [SymExp], vars: [VarExp]) : SlSide = match vars {
+  [] -> sl_set_of(syms, [])
+  [VEx(v, n)] -> match syms {
+    [] -> if n > 0 { SlVarSide(v) } else { SlIll }
+    _ -> SlIll
+  }
+  _ -> SlIll
+}
+
+fn sl_set_of(syms: [SymExp], acc: [String]) : SlSide = match syms {
+  [] -> SlSet(list_reverse(acc))
+  [f, ...rest] ->
+    if sex_exp(f) > 0 { sl_set_of(rest, [sex_sym(f), ...acc]) } else { SlIll }
+}
+
+# The engine's verdict on two classified sides: subsumed, refuse, or
+# bind a variable to the other side's joined set.
+pub type SlVerdict = SlOk | SlFail | SlBind(Int, UnitExprT)
+
+#[doc("""
+Subsumption for Semilattice sides, required side first: a ground set
+unifies into any superset, a variable binds to the other side's join,
+and anything else refuses. The direction is the unifier's contract —
+`unify` always receives the expected side first.
+""")]
+pub fn sl_unify_verdict(req: SlSide, prov: SlSide) : SlVerdict = match req {
+  SlSet(a) -> match prov {
+    SlSet(b) -> if sl_subset(a, b) { SlOk } else { SlFail }
+    SlVarSide(v) -> SlBind(v, sl_join_tree(a))
+    SlIll -> SlFail
+  }
+  SlVarSide(v) -> match prov {
+    SlSet(b) -> SlBind(v, sl_join_tree(b))
+    SlVarSide(w) -> if v == w { SlOk } else { SlBind(v, UVar(w)) }
+    SlIll -> SlFail
+  }
+  SlIll -> SlFail
+}
+
+#[doc("True when every habitant of `a` is in `b`.")]
+pub fn sl_subset(a: [String], b: [String]) : Bool = match a {
+  [] -> true
+  [x, ...rest] -> if list_has(b, x) { sl_subset(rest, b) } else { false }
+}
+
+#[doc("Rebuild a habitant set as a join tree: empty is dimensionless, a singleton is its symbol, more chain `UJoin` left-to-right (the table order is canonical).")]
+pub fn sl_join_tree(names: [String]) : UnitExprT = match names {
+  [] -> UOne
+  [x, ...rest] -> sl_join_chain(USym(x), rest)
+}
+
+fn sl_join_chain(acc: UnitExprT, rest: [String]) : UnitExprT = match rest {
+  [] -> acc
+  [x, ...tl] -> sl_join_chain(UJoin(acc, USym(x)), tl)
+}
+
+# A formation violation on a written unit tree: a Semilattice habitant
+# under a product/inverse/power, a join leaf that is not a habitant
+# symbol of a Semilattice kind, or a join across two Semilattice kinds.
+pub type SlViolation = SlvProduct(String) | SlvJoinLeaf(String) | SlvJoinMix(String, String)
+
+#[doc("""
+Formation check on a written unit tree: Semilattice habitants may only
+compound through `+`, every join leaf must be a habitant symbol of one
+Semilattice kind, and two Semilattice kinds never join. Returns the
+first violation, `None` when the tree is clean. Symbols are expected
+already kind-qualified; a bare symbol counts as a Measure habitant.
+""")]
+pub fn sl_shape_violation(u: UnitExprT, kts: [KindTheory]) : Option[SlViolation] =
+  slv_walk(u, kts, false)
+
+fn slv_walk(u: UnitExprT, kts: [KindTheory], in_prod: Bool) : Option[SlViolation] = match u {
+  UOne -> None
+  UVar(_) -> None
+  USym(s) ->
+    if in_prod and kind_is_semilattice(kts, kind_sym_kind(s)) { Some(SlvProduct(s)) }
+    else { None }
+  UMul(a, b) -> match slv_walk(a, kts, true) {
+    Some(v) -> Some(v)
+    None -> slv_walk(b, kts, true)
+  }
+  UInv(a) -> slv_walk(a, kts, true)
+  UPow(a, _) -> slv_walk(a, kts, true)
+  UJoin(a, b) ->
+    if in_prod {
+      match sl_first_sym(u) {
+        Some(s) -> Some(SlvProduct(s))
+        None -> Some(SlvJoinLeaf("1"))
+      }
+    } else { slv_join_leaves(sl_join_collect(a, sl_join_collect(b, [])), kts, "") }
+}
+
+# Leaves of a join, collected through nested UJoin only — any other
+# compound stays whole and fails the leaf check below.
+fn sl_join_collect(u: UnitExprT, acc: [UnitExprT]) : [UnitExprT] = match u {
+  UJoin(a, b) -> sl_join_collect(a, sl_join_collect(b, acc))
+  _ -> [u, ...acc]
+}
+
+fn slv_join_leaves(leaves: [UnitExprT], kts: [KindTheory],
+                   kind: String) : Option[SlViolation] = match leaves {
+  [] -> None
+  [l, ...rest] -> match l {
+    USym(s) -> {
+      let k = kind_sym_kind(s)
+      if not kind_is_semilattice(kts, k) { Some(SlvJoinLeaf(kind_sym_bare(s))) }
+      else if kind == "" { slv_join_leaves(rest, kts, k) }
+      else if k == kind { slv_join_leaves(rest, kts, kind) }
+      else { Some(SlvJoinMix(kind, k)) }
+    }
+    UOne -> Some(SlvJoinLeaf("1"))
+    UVar(_) -> Some(SlvJoinLeaf("a unit variable"))
+    _ -> match sl_first_sym(l) {
+      Some(s) -> Some(SlvProduct(s))
+      None -> Some(SlvJoinLeaf("a compound unit"))
+    }
+  }
+}
+
+# First habitant symbol in a subtree, for diagnostics.
+fn sl_first_sym(u: UnitExprT) : Option[String] = match u {
+  UOne -> None
+  UVar(_) -> None
+  USym(s) -> Some(s)
+  UMul(a, b) -> match sl_first_sym(a) { Some(s) -> Some(s) None -> sl_first_sym(b) }
+  UInv(a) -> sl_first_sym(a)
+  UPow(a, _) -> sl_first_sym(a)
+  UJoin(a, b) -> match sl_first_sym(a) { Some(s) -> Some(s) None -> sl_first_sym(b) }
+}
