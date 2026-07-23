@@ -6166,11 +6166,191 @@ fn raw_c_type(opt_ty: Option[Ty]) : String {
       TyInt128 -> "__int128"
       # KIR Lane 1: an LLVM C-API handle is a raw opaque pointer.
       TyHandle -> "void *"
-      TyDimT(inner, _)    -> raw_c_type(Some(inner))
+      # A fixed-width `Vec[e]<n>` is a flat by-value C aggregate, not a
+      # boxed `KaiValue *`: no RC header, no `{len,cap}`, no heap block.
+      TyDimT(_, _)        -> if ty_is_fixed_vec(t) { fixed_vec_cname(t) }
+                             else { match t { TyDimT(inner, _) -> raw_c_type(Some(inner)) _ -> "int64_t" } }
       TyRefineT(inner, _) -> raw_c_type(Some(inner))
       _ -> "int64_t /* raw_c_type: unexpected ty */"
     }
     None -> "int64_t /* raw_c_type: missing ty */"
+  }
+}
+
+# The C typedef name of a fixed-width `Vec[e]<n>`: `KaiFixedVec_<elem>_<n>`,
+# one distinct type per element mangle and length. Callers gate on
+# `ty_is_fixed_vec`.
+fn fixed_vec_cname(t: Ty) : String =
+  concat_all(["KaiFixedVec_", mangle_ty(fixed_vec_elem(t)), "_", int_to_string(fixed_vec_n(t))])
+
+# Comma-joined raw C for the elements of a fixed-vec literal.
+fn emit_fixed_vec_elems(src: String, es: [Expr], cx: EmitCtx) : String / Console = match es {
+  []           -> ""
+  [e]          -> emit_expr_raw(src, e, cx)
+  [e, ...rest] -> concat_all([emit_expr_raw(src, e, cx), ", ", emit_fixed_vec_elems(src, rest, cx)])
+}
+
+# The include-guarded `typedef struct { <elem> a[n]; } <cname>;` for a
+# fixed-width vec, emitted at the first local declaration of that type.
+# The `#ifndef`/`#define` guard is preprocessor-global (block scope does
+# not apply), so a later declaration of the same `(elem, n)` skips it.
+fn fixed_vec_typedef(t: Ty) : String {
+  let cname = fixed_vec_cname(t)
+  concat_all([
+    "\n#ifndef ", cname, "_DEFINED\n#define ", cname, "_DEFINED\n",
+    "typedef struct { ", raw_c_type(Some(fixed_vec_elem(t))), " a[",
+    int_to_string(fixed_vec_n(t)), "]; } ", cname, ";\n#endif\n"
+  ])
+}
+
+# Pre-declare each fixed-vec `typedef` the program references, once, in
+# the shared types header. A fixed vec surfaces wherever a
+# `__fixed_vec_lit` is emitted (a let RHS, a materialised argument, a
+# nested literal), so the whole decl tree is scanned by node `.ty`. The
+# collector accumulates ready-rendered (include-guarded) typedef strings,
+# deduplicated, so this only concatenates them.
+pub fn collect_fixed_vec_typedefs(decls: [Decl]) : String =
+  concat_all(cfv_decls(decls, []))
+
+fn cfv_decls(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> cfv_decls(rest, cfv_decl(d, acc))
+}
+
+fn cfv_decl(d: Decl, acc: [String]) : [String] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> cfv_expr(body, acc)
+  DTest(_, body, _, _)     -> cfv_expr(body, acc)
+  DBench(_, body, _, _)    -> cfv_expr(body, acc)
+  DCheck(_, _, body, _, _) -> cfv_expr(body, acc)
+  _ -> acc
+}
+
+# Register this node's fixed-vec type (if any), then recurse into children.
+fn cfv_expr(e: Expr, acc: [String]) : [String] {
+  let acc1 = match e.ty {
+    Some(t) -> if ty_is_fixed_vec(t) { cfv_add(t, acc) } else { acc }
+    None    -> acc
+  }
+  cfv_children(e.kind, acc1)
+}
+
+fn cfv_add(t: Ty, acc: [String]) : [String] {
+  let td = fixed_vec_typedef(t)
+  if list_has(acc, td) { acc } else { [td, ...acc] }
+}
+
+fn cfv_list(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> cfv_list(rest, cfv_expr(h, acc))
+}
+
+fn cfv_children(k: ExprKind, acc: [String]) : [String] = match k {
+  ECall(callee, args_) -> cfv_list(args_, cfv_expr(callee, acc))
+  EIntrinsic(_, args_) -> cfv_list(args_, acc)
+  EField(base, _)      -> cfv_expr(base, acc)
+  EIndex(a, b)         -> cfv_expr(b, cfv_expr(a, acc))
+  EBinop(_, a, b)      -> cfv_expr(b, cfv_expr(a, acc))
+  EUnop(_, x)          -> cfv_expr(x, acc)
+  EIf(c, t, eo)        -> {
+    let a1 = cfv_expr(t, cfv_expr(c, acc))
+    match eo { Some(b) -> cfv_expr(b, a1) None -> a1 }
+  }
+  EMatch(scr, arms)    -> cfv_arms(arms, cfv_expr(scr, acc))
+  ELambda(_, body)     -> cfv_expr(body, acc)
+  ERecordLit(_, fs)    -> cfv_fields(fs, acc)
+  EList(els)           -> cfv_elems(els, acc)
+  ERange(a, b, opt)    -> {
+    let a1 = cfv_expr(b, cfv_expr(a, acc))
+    match opt { Some(s) -> cfv_expr(s, a1) None -> a1 }
+  }
+  EBlock(stmts, tail)  -> {
+    let a1 = cfv_stmts(stmts, acc)
+    match tail { Some(t) -> cfv_expr(t, a1) None -> a1 }
+  }
+  EPipe(a, b)          -> cfv_expr(b, cfv_expr(a, acc))
+  EMapPipe(a, b)       -> cfv_expr(b, cfv_expr(a, acc))
+  EFlatMapPipe(a, b)   -> cfv_expr(b, cfv_expr(a, acc))
+  EFilterPipe(a, b)    -> cfv_expr(b, cfv_expr(a, acc))
+  EBang(inner)         -> cfv_expr(inner, acc)
+  ELitUnit(inner, _)   -> cfv_expr(inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = cfv_expr(body, acc)
+    let a2 = match init_opt { Some(i) -> cfv_expr(i, a1) None -> a1 }
+    let a3 = cfv_clauses(clauses, a2)
+    match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> cfv_expr(b, a3) }  None -> a3 }
+  }
+  _ -> acc
+}
+
+fn cfv_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> {
+      let a1 = match og { Some(g) -> cfv_expr(g, acc) None -> acc }
+      cfv_arms(rest, cfv_expr(body, a1))
+    }
+  }
+}
+
+fn cfv_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f { FI(_, e) -> cfv_fields(rest, cfv_expr(e, acc)) }
+}
+
+fn cfv_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []            -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> cfv_elems(rest, cfv_expr(e, acc))
+    ElSpread(e) -> cfv_elems(rest, cfv_expr(e, acc))
+  }
+}
+
+fn cfv_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e)        -> cfv_stmts(rest, cfv_expr(e, acc))
+    SVar(_, _, e, _, _)  -> cfv_stmts(rest, cfv_expr(e, acc))
+    SAssert(e, og)       -> {
+      let a1 = cfv_expr(e, acc)
+      let a2 = match og { Some(g) -> cfv_expr(g, a1) None -> a1 }
+      cfv_stmts(rest, a2)
+    }
+    SExprStmt(e)         -> cfv_stmts(rest, cfv_expr(e, acc))
+    SIndexAssign(a, b, c, _, _) -> cfv_stmts(rest, cfv_expr(c, cfv_expr(b, cfv_expr(a, acc))))
+    SUse(_, _, _)        -> cfv_stmts(rest, acc)
+  }
+}
+
+fn cfv_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [c, ...rest] -> match c { HC(_, _, body, _, _) -> cfv_clauses(rest, cfv_expr(body, acc)) }
+}
+
+# The C index of a fixed-vec static read. The typer validated it as a
+# literal in range, so a bare `EInt` renders as a plain integer; any
+# other shape falls back to the raw emit (defensive — unreachable in v1).
+fn fixed_vec_idx_c(ix: Expr, src: String, cx: EmitCtx) : String / Console =
+  match ix.kind {
+    EInt(k) -> int_to_string(k)
+    _       -> emit_expr_raw(src, ix, cx)
+  }
+
+# Materialise a fixed-width vec (`raw`, a pure C local) into a dynamic
+# heap `Vec`: a pre-sized `vec_reserve` filled by one boxed `vec_push`
+# per element. Crosses the fixed→dynamic boundary at a boxed border.
+fn materialize_fixed_vec(t: Ty, raw: String) : String {
+  let n = fixed_vec_n(t)
+  let elem = fixed_vec_elem(t)
+  let base = concat_all(["kai_core_vec_reserve(kai_int(", int_to_string(n), "LL))"])
+  materialize_fixed_vec_push(base, raw, elem, 0, n)
+}
+
+fn materialize_fixed_vec_push(acc: String, raw: String, elem: Ty, i: Int, n: Int) : String {
+  if i >= n { acc }
+  else {
+    let elem_box = box_wrap(Some(elem), concat_all(["(", raw, ").a[", int_to_string(i), "]"]))
+    let push = concat_all(["kai_core_vec_push(", acc, ", ", elem_box, ")"])
+    materialize_fixed_vec_push(push, raw, elem, i + 1, n)
   }
 }
 
@@ -6201,7 +6381,13 @@ fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
       # `TyHandle` case: a handle crosses the boxed/raw boundary by cast,
       # never by RC-managed box/unbox.
       TyHandle -> cat3("(KaiValue *)(", raw, ")")
-      TyDimT(inner, _)    -> box_wrap(Some(inner), raw)
+      # A fixed-width `Vec[e]<n>` crossing to a boxed border (a `Vec`
+      # parameter, a record field) materialises into a dynamic heap vec:
+      # the flat inline layout is copied out element by element. The `raw`
+      # C expression is a pure local (`kair_x`), so re-reading its fields
+      # is side-effect-free.
+      TyDimT(_, _)        -> if ty_is_fixed_vec(t) { materialize_fixed_vec(t, raw) }
+                             else { match t { TyDimT(inner, _) -> box_wrap(Some(inner), raw) _ -> cat3("kai_int(", raw, ")") } }
       TyRefineT(inner, _) -> box_wrap(Some(inner), raw)
       _ -> cat3("kai_int(", raw, ") /* box_wrap: unexpected ty */")
     }
@@ -6656,7 +6842,21 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # to the boxed-then-unbox boundary form.
     ECall(callee_e, args_e) -> match callee_e.kind {
       EVar(callee) ->
-        if tcrec_is_sentinel(callee) {
+        if callee == "__fixed_vec_lit" {
+          # A fixed-width `Vec[e]<n>` literal: a flat by-value C aggregate
+          # `(<cname>){ .a = { e0, e1, ... } }`, no heap block, no header.
+          concat_all(["(", raw_c_type(x.ty), "){ .a = { ",
+                      emit_fixed_vec_elems(src, args_e, cx), " } }"])
+        } else if callee == "__fixed_vec_get" {
+          # Static-index read into a fixed vec: a bare struct field load,
+          # bounds already proved at compile time (no runtime check). The
+          # index is a compile-time literal, emitted directly.
+          match args_e {
+            [coll, ix] -> concat_all(["(", emit_expr_raw(src, coll, cx), ").a[",
+                                      fixed_vec_idx_c(ix, src, cx), "]"])
+            _ -> "0 /* __fixed_vec_get: arity mismatch */"
+          }
+        } else if tcrec_is_sentinel(callee) {
           let parts = tcrec_split_pipe(callee)
           match parts {
             [_, sym, dropmask_str, ...pnames] -> {
@@ -10790,11 +10990,12 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # C struct typedefs for every `extern "C" type`, so a struct-by-value
   # shim can name `struct __kai_ffi_<Name>`.
   let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls))
+  let fixed_vec_tds = collect_fixed_vec_typedefs(decls)
   let types_h = concat_all([
     "/* generated by kaikai stage 2 — shared types header */\n",
     "#ifndef KAI_TYPES_H\n#define KAI_TYPES_H\n",
     "#include \"runtime.h\"\n\n",
-    mono_structs, eff_structs, env_structs, ffi_structs,
+    mono_structs, eff_structs, env_structs, ffi_structs, fixed_vec_tds,
     "\n#endif /* KAI_TYPES_H */\n"
   ])
 
@@ -11018,7 +11219,8 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # call site supplying a default-bearing slot addresses an already-declared
   # symbol (single-TU: one definition, file scope).
   let default_ev_defs = emit_default_node_globals(effect_decls_only(decls))
-  let out_c = concat_all([header, mono_structs, eff_structs, env_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", default_ev_defs, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
+  let fixed_vec_tds = collect_fixed_vec_typedefs(decls)
+  let out_c = concat_all([header, mono_structs, eff_structs, env_structs, fixed_vec_tds, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", default_ev_defs, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
   if has_ffi_struct(extern_types) { emit_ffi_header_stream(src, ffi_structs, out_c) }
   else { out_c }
 }
@@ -12836,8 +13038,13 @@ fn mangle_ty(t: Ty) : String {
     # dimensioned type is the same as its base type's mangle — so a
     # call like `f(1.0<USD>)` and a call `f(1.0)` mangle into the same
     # specialisation. This is the codegen-erasure invariant manifest
-    # at the mangler level.
-    TyDimT(base, _) -> mangle_ty(base)
+    # at the mangler level. The exception is a fixed-width `Vec[e]<n>`:
+    # its inline layout differs per `n`, so it keeps a `_D<n>` suffix
+    # that splits its specialisation from the dynamic `Vec` and from
+    # every other length.
+    TyDimT(base, u) -> if ty_is_fixed_vec(t) {
+      concat_all([mangle_ty(base), "_D", int_to_string(fixed_vec_n(t))])
+    } else { mangle_ty(base) }
     # m12.6.x #1: refinements erase like units. `Int where >= 0` and
     # `Int` mangle the same — they share monomorphisations and
     # protocol-impl dispatch entries.

@@ -360,6 +360,15 @@ fn call_is_raw_core(callee: Expr) : Bool {
   }
 }
 
+# The `__fixed_vec_get` intrinsic reads one element out of a fixed vec as
+# a bare struct field load — always a raw scalar, so it rides MUnboxed.
+fn call_is_fixed_vec_get(callee: Expr) : Bool {
+  match callee.kind {
+    EVar(name) -> name == "__fixed_vec_get"
+    _          -> false
+  }
+}
+
 # `LocBind` records the chosen mode for a local binding so EVar
 # references resolve to the binding's mode. Function parameters
 # and unknown names default to MBoxed (Phase 2 non-goal #1).
@@ -381,6 +390,13 @@ fn lb_lookup(env: [LocBind], nm: String) : ValueMode {
 fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
   match opt_t {
     Some(t) -> ty_is_unboxable_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_fixed_vec_opt(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_fixed_vec(t)
     None    -> false
   }
 }
@@ -448,7 +464,12 @@ fn unbox_expr(e: Expr, env: [LocBind]) : Expr / Console = unbox_expr_aware(e, en
 fn unbox_expr_aware(e: Expr, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Expr / Console {
 
   let kind1 = unbox_kind_aware(e.kind, env, fns, cis, nat)
-  let mode1 = decide_mode_aware(kind1, e.ty, env, fns)
+  # The native backend has no fixed-width vec representation — the KIR
+  # lowering degrades a fixed-vec intrinsic to the dynamic Vec, which is
+  # boxed. So on the native path a fixed-vec node never rides MUnboxed;
+  # only the C backend keeps the inline (MUnboxed) form.
+  let mode1 = if nat and ty_is_fixed_vec_opt(e.ty) { MBoxed }
+              else { decide_mode_aware(kind1, e.ty, env, fns) }
   Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
 }
 
@@ -532,7 +553,23 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: [EFn], cis: [CtorIntSlots]
 fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode = decide_mode_aware(k, opt_ty, env, [])
 
 fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]) : ValueMode {
-  if not ty_is_unboxable(opt_ty) { MBoxed }
+  # A fixed-width `Vec[e]<n>` is a flat by-value C aggregate with no boxed
+  # form, but ONLY at its origin — the `__fixed_vec_lit` literal — and at
+  # an `EVar` read of a binder that already holds one (env mode). A
+  # fixed-vec-TYPED value from anything else (a function return) is a
+  # dynamic heap vec at runtime and stays MBoxed; the let-site de-brands
+  # its binder so the two never disagree.
+  if ty_is_fixed_vec_opt(opt_ty) {
+    match k {
+      ECall(callee, _) -> match callee.kind {
+        EVar(nm) -> if nm == "__fixed_vec_lit" { MUnboxed } else { MBoxed }
+        _        -> MBoxed
+      }
+      EVar(nm) -> lb_lookup(env, nm)
+      _        -> MBoxed
+    }
+  }
+  else if not ty_is_unboxable(opt_ty) { MBoxed }
   else {
     match k {
       EInt(_)  -> MUnboxed
@@ -550,7 +587,7 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]
       # promotion the call would round-trip through `kai_<T>`
       # boxing.
       ECall(callee, _) ->
-        if call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee) { MUnboxed }
+        if call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee) or call_is_fixed_vec_get(callee) { MUnboxed }
         else { MBoxed }
       # Conservative: only mark composite raw when both operands are
       # already raw. Mixing a boxed operand into a raw arithmetic

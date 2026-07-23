@@ -6882,7 +6882,12 @@ pub fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
     TyRefineT(inner, p)    -> TyRefineT(dim_collapse(inner, u), p)
     _ -> {
       let uc = unit_canon(u)
-      if unit_is_one(uc) { base } else { TyDimT(base, uc) }
+      # A `Vec[e]<1>` keeps its brand: a fixed-width-1 vec has a distinct
+      # inline layout, so it must NOT collapse into the dynamic `Vec[e]`
+      # the way a dimensionless `Real<1>` collapses into `Real`.
+      if unit_is_one(uc) {
+        if ty_vec_headed(base) { TyDimT(base, uc) } else { base }
+      } else { TyDimT(base, uc) }
     }
   }
 }
@@ -7630,7 +7635,11 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # named records do not.
       TyDimT(bb, bu) -> match bb {
         TyCon(_, bn, ba) ->
-          if an == bn { match unify_list(env, aa, ba, s) {
+          # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
+          # never collapses into a bare `Vec[t]` — even at `<1>`. The
+          # numeric `Real ≡ Real<1>` collapse below is untouched.
+          if bn == "Vec" { None }
+          else if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(UOne, bu, s1)
           } } else { None }
@@ -7655,7 +7664,10 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # cancel — anything else is a unit mismatch.
       TyCon(_, bn, ba) -> match ab {
         TyCon(_, an, aa) ->
-          if an == bn { match unify_list(env, aa, ba, s) {
+          # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
+          # (distinct inline layout); the numeric collapse above stays.
+          if an == "Vec" { None }
+          else if an == bn { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(au, UOne, s1)
           } } else { None }
@@ -12029,13 +12041,17 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
           else                       { mk_expr(EVar("array_get"), line, col) }
         synth(st, mk_expr(ECall(callee, [coll, ix]), line, col))
       }
-    # A fixed-width vec (`Vec[T]<n>`) indexes like its dynamic base:
-    # the brand is phantom, so reads flow through a detach.
+    # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
+    # is a bare struct field load with the bound proved at compile time
+    # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
       TyCon(_, cname, _) ->
         if cname == "Vec" {
-          let bare = mk_expr(ECall(mk_expr(EVar("__detach_unit"), line, col), [coll]), line, col)
-          synth_vec_index(probe.st, bare, ix, line, col)
+          if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, coll, ix, coll_ty, line, col) }
+          else {
+            let bare = mk_expr(ECall(mk_expr(EVar("__detach_unit"), line, col), [coll]), line, col)
+            synth_vec_index(probe.st, bare, ix, line, col)
+          }
         } else {
           synth(st, mk_expr(ECall(mk_expr(EVar("array_get"), line, col), [coll, ix]), line, col))
         }
@@ -12062,6 +12078,35 @@ fn synth_vec_index(st: InferState, coll: Expr, ix: Expr,
     }
     _ -> synth(st, mk_expr(ECall(mk_expr(EVar("vec_get"), line, col), [coll, ix]), line, col))
   }
+
+# `v[k]` on a fixed-width `Vec[e]<n>`: a static literal index in range
+# lowers to `__fixed_vec_get` — a bare struct field load, the bound
+# proved here at compile time so no runtime check is emitted. Out of
+# range is a compile error (strictly better than the dynamic vec's
+# runtime trap); a non-literal index is declined in v1.
+fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
+                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let n = fixed_vec_n(coll_ty)
+  let elem = fixed_vec_elem(coll_ty)
+  match ix.kind {
+    EInt(k) ->
+      if k >= 0 and k < n {
+        let cr = synth(st, coll)
+        let call = ECall(mk_expr(EVar("__fixed_vec_get"), line, col), [cr.expr, ix])
+        let node = Expr { kind: call, line: line, col: col, ty: Some(elem), mode: MUnboxed }
+        mk_inferred(cr.st, elem, node)
+      } else {
+        diag_error(st.file, line, col,
+          concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]))
+        mk_inferred(st_bump_err(st), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+      }
+    _ -> {
+      diag_error(st.file, line, col,
+        "a dynamic index into a fixed-width `Vec[t]<n>` is not supported yet — bind it to a dynamic `Vec` first")
+      mk_inferred(st_bump_err(st), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+    }
+  }
+}
 
 # Binop typing is deliberately coarse: numeric operators unify their
 # two operands and return the shared type (usually `Int`); comparison
@@ -15027,10 +15072,19 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
           st_unify(minted.st, declared, lower_pair.ty, "let annotation", pat.line, pat.col)
         }
       }
-      let binding_ty = match ann {
+      let binding_ty0 = match ann {
         None -> lower_pair.ty
         Some(te) -> inf_resolve_ty_rk(te, rr.st.env.row_kind)
       }
+      # The fixed-width inline representation is an optimisation of a
+      # LITERAL: a `let x : Vec[e]<n> = [ ... ]` binds a flat aggregate.
+      # A `<n>`-typed value that came from anything else (a function
+      # return, a field) is a dynamic heap `Vec` at runtime, so the
+      # binder de-brands to `Vec[e]` — otherwise codegen would cast a
+      # boxed value into a fixed struct.
+      let binding_ty = if ty_is_fixed_vec(binding_ty0) and not is_fixed_vec_lit(lower_pair.expr) {
+        fixed_vec_unbrand(binding_ty0)
+      } else { binding_ty0 }
       let dup_st = check_pattern_no_dup_binds(binding_st, pat)
       let after = check_pattern(dup_st, pat, binding_ty)
       OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
@@ -16284,7 +16338,11 @@ fn check_fixed_vec_lit(st: InferState, els: [ListElem], hargs: [Ty], u: UnitExpr
   let hab = apply_unit(r.st.sub, u)
   let n = list_length(els)
   match fixed_vec_hab(hab, n) {
-    FVOk(h) -> brand_vec_lit(r, h)
+    FVOk(h) -> {
+      let bty = TyDimT(r.ty, h)
+      if ty_is_fixed_vec(bty) { fixed_vec_lit_inferred(r, els, hargs, bty, line, col) }
+      else { brand_vec_lit(r, h) }
+    }
     FVLen(k) -> {
       diag_error(r.st.file, line, col,
         concat_all(["vector literal has ", int_to_string(n), " elements, but its type fixes the length to ", int_to_string(k)]))
@@ -16297,6 +16355,34 @@ fn check_fixed_vec_lit(st: InferState, els: [ListElem], hargs: [Ty], u: UnitExpr
     }
   }
 }
+
+# A concrete `Vec[e]<n>` literal builds the fixed inline representation:
+# the elements are re-checked (already coined once, so this only re-reads
+# the typed forms) and handed to the `__fixed_vec_lit` intrinsic the C
+# emitter lowers to a flat `(cname){ .a = {...} }` aggregate. The node is
+# MUnboxed — a fixed vec has no boxed form.
+fn fixed_vec_lit_inferred(r: Inferred, els: [ListElem], hargs: [Ty], bty: Ty,
+                          line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let elem_exp = match hargs { [t] -> apply_ty(r.st.sub, t)  _ -> TyAny }
+  let checked = check_vec_elems(r.st, els, elem_exp, line, col, [])
+  let call = fixed_vec_lit_build(list_reverse(checked.elems), bty, line, col)
+  mk_inferred(checked.st, bty, unboxed_expr(call))
+}
+
+fn unboxed_expr(e: Expr) : Expr =
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MUnboxed }
+
+# True when `e` is a direct fixed-vec literal — the `__fixed_vec_lit`
+# intrinsic. Only such a value has the flat inline representation; any
+# other `Vec[e]<n>`-typed expression (a function return, a field read)
+# is a dynamic heap vec at runtime.
+fn is_fixed_vec_lit(e: Expr) : Bool = match e.kind {
+  ECall(callee, _) -> match callee.kind { EVar(nm) -> nm == "__fixed_vec_lit"  _ -> false }
+  _ -> false
+}
+
+# Drop the `Dim` brand off a fixed vec, yielding the dynamic `Vec[e]`.
+fn fixed_vec_unbrand(t: Ty) : Ty = match t { TyDimT(base, _) -> base  _ -> t }
 
 # The verdict on a fixed-Vec habitant against a literal of `n`
 # elements: the habitant to brand with, a length mismatch carrying
@@ -16441,7 +16527,8 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
   mk_inferred(s1, elem_ty, r.expr)
 }
 
-fn ty_vec_headed(t: Ty) : Bool = match t {
+#[doc("True when a type is `Vec`-headed, seeing through any `Dim` brand — the fixed-width representation reads this to keep a `Vec<1>` distinct from the dynamic `Vec`.")]
+pub fn ty_vec_headed(t: Ty) : Bool = match t {
   TyDimT(inner, _) -> ty_vec_headed(inner)
   TyCon(_, name, _) -> name == "Vec"
   _ -> false

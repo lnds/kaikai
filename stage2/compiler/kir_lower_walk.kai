@@ -33,6 +33,47 @@ import compiler.kir_lower_variant
 import compiler.vec_raw
 import compiler.emit_tcrec_live
 
+# Degrade a fixed-width vec intrinsic to its dynamic form for the native
+# backend (which has no fixed representation). Returns `None` for any
+# other call. `__fixed_vec_lit(e0..en)` -> the `vec_reserve`/`vec_push`
+# chain over a dynamic `Vec[e]`; `__fixed_vec_get(v, i)` -> `vec_get(v, i)`.
+fn degrade_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr]) : Option[Expr] =
+  match f.kind {
+    EVar(nm) ->
+      if nm == "__fixed_vec_lit" {
+        let vty = match x.ty { Some(t) -> fixed_vec_unbrand_ty(t)  None -> TyCon(None, "Vec", [TyAny]) }
+        Some(dfv_lit_chain(cargs, vty, x.line, x.col))
+      } else if nm == "__fixed_vec_get" {
+        match cargs {
+          [v, i] -> Some(with_ty(mk_expr(ECall(mk_expr(EVar("vec_get"), x.line, x.col), [v, i]), x.line, x.col),
+                                 match x.ty { Some(t) -> t  None -> TyAny }))
+          _ -> None
+        }
+      } else { None }
+    _ -> None
+  }
+
+fn fixed_vec_unbrand_ty(t: Ty) : Ty = match t { TyDimT(base, _) -> base  _ -> t }
+
+fn dfv_lit_chain(elems: [Expr], vty: Ty, line: Int, col: Int) : Expr =
+  match elems {
+    [] -> with_ty(mk_expr(ECall(mk_expr(EVar("vec_empty"), line, col), []), line, col), vty)
+    _  -> {
+      let n = with_ty(mk_expr(EInt(list_length(elems)), line, col), TyInt)
+      let reserve = with_ty(mk_expr(ECall(mk_expr(EVar("vec_reserve"), line, col), [n]), line, col), vty)
+      dfv_lit_pushes(elems, reserve, vty, line, col)
+    }
+  }
+
+fn dfv_lit_pushes(elems: [Expr], acc: Expr, vty: Ty, line: Int, col: Int) : Expr =
+  match elems {
+    [] -> acc
+    [e, ...rest] -> {
+      let push = with_ty(mk_expr(ECall(mk_expr(EVar("vec_push"), line, col), [acc, e]), line, col), vty)
+      dfv_lit_pushes(rest, push, vty, line, col)
+    }
+  }
+
 # --- The Expr walk ------------------------------------------------------
 #
 # The program/fn-level orchestration (`lower_to_kir`, the per-decl walk,
@@ -75,9 +116,17 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EVar(name)         -> lower_var(name, st)
 
   # A call / constructor / perceus mark / sentinel — the dense dispatch.
-  ECall(f, cargs)    -> match lower_vec_write_rec_fused(x, f, cargs, st) {
-    Some(r) -> r
-    None    -> lower_call(x, f, cargs, st)
+  # The native backend has no fixed-width `Vec[t]<n>` representation, so a
+  # fixed-vec intrinsic degrades here to the dynamic form before lowering:
+  # `__fixed_vec_lit` becomes the `vec_reserve`/`vec_push` chain, and
+  # `__fixed_vec_get(v, i)` becomes `vec_get(v, i)`. (The C backend never
+  # reaches KIR, so its inline representation is untouched.)
+  ECall(f, cargs)    -> match degrade_fixed_vec_call(x, f, cargs) {
+    Some(dx) -> lower_expr(dx, st)
+    None -> match lower_vec_write_rec_fused(x, f, cargs, st) {
+      Some(r) -> r
+      None    -> lower_call(x, f, cargs, st)
+    }
   }
 
   # `e.field` → a field read over the base atom. When `base.ty` resolves to
