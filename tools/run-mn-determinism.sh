@@ -60,6 +60,11 @@ FIXTURES=(
   # Fiber wrappers dropping to RC=0 on a thread other than the one each fiber
   # ran on: the free path must not release a stack that is still live.
   "examples/effects/mn_fiber_free_race.kai"
+  # Cancel racing the target's FIRST reactor park: the canceller's detach
+  # finds nothing to unpark while the target is between stamping its park
+  # and committing it, so the commit must re-check the cancel flag or the
+  # fiber sleeps the full timer out (hang).
+  "examples/effects/mn_cancel_prepark.kai"
   # A bounded mailbox must mean the same thing on both send paths. Which one a
   # send takes depends only on where the work-stealer put the receiver, so a
   # policy applied on one and not the other makes delivery a function of
