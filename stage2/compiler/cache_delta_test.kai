@@ -1,0 +1,125 @@
+#[doc("""
+In-memory gates for the incremental-rebuild typed codec + interface
+hash. Two properties, each a `pub` entry the driver runs behind
+`--cache-typed-selftest`:
+
+1. **Ty/Scheme round-trip.** `deserialize(serialize(t)) == t` for a
+   spread of resolved `Ty` shapes and a `TyScheme`. A codec that drops
+   or reorders a node would restore a different typed artifact and break
+   the downstream byte-identical-C property.
+
+2. **Interface-hash contract.** The canonical delta hash must be
+   *deterministic* (same interface → same hash regardless of table order
+   and tyvar numbering) and *sensitive* (a changed scheme → a changed
+   hash). Determinism that misses a real change is a stale-interface
+   hit — the one unsound failure the propagation cut must never have.
+""")]
+
+import compiler.ast
+import compiler.infer
+import compiler.cache_ty
+import compiler.cache_delta
+
+# ---- Ty/Scheme round-trip ---------------------------------------------
+
+# The decoded value is unwrapped in two steps (`Some(c) -> match c`),
+# never `Some(Ctor(x, _))` in one — destructuring a constructor inside a
+# `Some` pattern panics under the stage1 bootstrap compiler.
+fn tyr_roundtrip_ok(t: Ty) : Bool {
+  let blob = cache_tyr_to_hex(t)
+  match cache_hex_to_tyr(blob, 0) {
+    None -> false
+    Some(c) -> match c { CTyRP(t2, _) -> cache_tyr_to_hex(t2) == blob }
+  }
+}
+
+fn scheme_roundtrip_ok(s: TyScheme) : Bool {
+  let blob = cache_scheme_to_hex(s)
+  match cache_hex_to_scheme(blob, 0) {
+    None -> false
+    Some(c) -> match c { CSchP(s2, _) -> cache_scheme_to_hex(s2) == blob }
+  }
+}
+
+# A spread of resolved Ty shapes checked one at a time: each compound
+# shape is built in its own `let` and round-tripped directly, never
+# collected into a `[Ty]` and iterated — building a variant into a list
+# element (or reading it back out via a list walk) corrupts it under the
+# stage1 bootstrap compiler, so the codec is exercised value-by-value.
+fn tys_roundtrip_ok() : Bool {
+  let vopt = TyCon(Some("option"), "Option", [TyVarT(3)])
+  let vlocal = TyCon(None, "Local", [TyVarT(1), TyVarT(2)])
+  let lbl = Label { eff: "Console", ty_args: [] }
+  let row = Row { labels: [lbl], tail: Some(7), display_alias: None }
+  let fnty = TyFnT([TyInt, vopt], TyBool, row)
+  let uni = TyUnion([TyInt, TyString])
+  let lst = TyListT(TyReal)
+  tyr_roundtrip_ok(TyInt) and tyr_roundtrip_ok(TyString) and
+  tyr_roundtrip_ok(TyByte) and tyr_roundtrip_ok(TyVarT(42)) and
+  tyr_roundtrip_ok(lst) and tyr_roundtrip_ok(vopt) and
+  tyr_roundtrip_ok(vlocal) and tyr_roundtrip_ok(fnty) and
+  tyr_roundtrip_ok(uni)
+}
+
+fn sample_scheme() : TyScheme {
+  let ret = TyCon(Some("option"), "Option", [TyVarT(3)])
+  let row = Row { labels: [], tail: Some(7), display_alias: None }
+  let body = TyFnT([TyVarT(3), TyVarT(5)], ret, row)
+  Scheme([3, 5], [7], [], ["Measure"], body)
+}
+
+# ---- interface-hash contract ------------------------------------------
+# Build a delta with two ty_entries; a permuted-and-renumbered twin that
+# is logically equal; and a mutated twin whose scheme differs.
+
+fn mk_entry(nm: String, s: TyScheme) : TyEntry = TyEntry { name: nm, scheme: s }
+
+fn delta_of(entries: [TyEntry]) : ModuleEnvDelta = ModuleEnvDelta {
+  name: Some("m"), ty_entries: entries, unions: [], op_eff_arities: [],
+  recs: [], sums: [], op_to_eff: [], unit_aliases: [], constructors: []
+}
+
+# `id[a]: (a) -> a` and `pair[a,b]: (a, b) -> a`, two exported schemes.
+fn empty_row() : Row = Row { labels: [], tail: None, display_alias: None }
+
+fn scheme_id(v: Int) : TyScheme {
+  let body = TyFnT([TyVarT(v)], TyVarT(v), empty_row())
+  Scheme([v], [], [], [], body)
+}
+
+fn scheme_pair(a: Int, b: Int) : TyScheme {
+  let body = TyFnT([TyVarT(a), TyVarT(b)], TyVarT(a), empty_row())
+  Scheme([a, b], [], [], [], body)
+}
+
+#[doc("Run the typed-codec + interface-hash gates. Returns \"OK ...\" on success or \"FAIL: ...\" on the first failing property. The driver maps a leading 'O' to exit 0.")]
+pub fn cache_typed_selftest() : String {
+  # 1. Ty/Scheme round-trip.
+  if not tys_roundtrip_ok() { "FAIL: Ty round-trip mismatch" }
+  else if not scheme_roundtrip_ok(sample_scheme()) { "FAIL: Scheme round-trip mismatch" }
+  else {
+    # 2a. Determinism: the same interface with its tables in a different
+    # order and its tyvars numbered differently must hash equal.
+    let base = delta_of([mk_entry("id", scheme_id(1)),
+                         mk_entry("pair", scheme_pair(2, 3))])
+    let twin = delta_of([mk_entry("pair", scheme_pair(90, 91)),
+                         mk_entry("id", scheme_id(42))])
+    let hb = mdelta_iface_hash(base)
+    let ht = mdelta_iface_hash(twin)
+    if hb != ht {
+      concat_all(["FAIL: iface hash not order/renumber invariant: ", hb, " vs ", ht])
+    } else {
+      # 2b. Sensitivity: a changed scheme must move the hash.
+      let mutated = delta_of([mk_entry("id", scheme_id(1)),
+                              mk_entry("pair", scheme_id(2))])
+      let hm = mdelta_iface_hash(mutated)
+      if hb == hm {
+        concat_all(["FAIL: iface hash insensitive to scheme change: ", hb])
+      } else if mdelta_iface_hash(base) != hb {
+        "FAIL: iface hash not idempotent"
+      } else {
+        concat_all(["OK typed codec + iface hash: base=", hb, " mutated=", hm])
+      }
+    }
+  }
+}
