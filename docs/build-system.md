@@ -62,7 +62,21 @@ explicitly (useful as an install or CI-init step). Knobs:
 `KAI_CORE_CACHE_STATS=1` prints per-layer hit/miss lines. Raw `kaic2`
 invocations (Makefile gates, selfhost, parity) pass no cache flags and
 are byte-for-byte unaffected. Fixtures: `examples/cache/emitc_*.sh` +
-`corec_*.sh`, run by `make -C stage2 test-core-cache` (tier 1).
+`corec_*.sh` (kaic2 invoked directly) and `wrapper_backend_hit_stats.sh`
+(same gate through `bin/kai build`, C and native backends), run by
+`make -C stage2 test-core-cache` (tier 1).
+
+**Stats line contract.** With `KAI_CORE_CACHE_STATS=1`, kaic2 prints
+one line per cache layer to stderr, prefixed `kaic2: <layer>: `. The
+only layer wired to `--core-cache-stats` today is the core-parse
+cache: `kaic2: core-parse-cache: hit (N modules)`, `kaic2:
+core-parse-cache: miss (parsed N of M modules)`, or `kaic2:
+core-parse-cache: off` (cache dir empty/unavailable). This line format
+is a stable contract other tooling may grep for. `bin/kai` forwards
+`--core-cache-stats` on every backend, including native and
+native-modular, whose kaic2 stderr it otherwise captures to a file and
+only surfaces on failure — the stats line is re-emitted to the user's
+stderr on success too so it is never silently swallowed there.
 
 ## The five Makefiles — recursive delegation
 
