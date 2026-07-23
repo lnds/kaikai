@@ -23,12 +23,14 @@ import compiler.emit_native_ops
 
 # `true` iff `nm` is a fixed-vec inline prim the emitter handles here.
 pub fn nprim_is_fixed_vec(nm: String) : Bool =
-  string_starts_with_q(nm, "__fixed_vec_lit@") or string_starts_with_q(nm, "__fixed_vec_get@")
+  string_starts_with_q(nm, "__fixed_vec_")
 
-#[doc("Emit a fixed-vec inline prim: the literal yields the `[n x elem]` array pointer, the read yields a re-boxed element.")]
+#[doc("Emit a fixed-vec inline prim: the literal yields the `[n x elem]` array pointer, the read yields a re-boxed element, the materialise yields a dynamic `Vec`.")]
 pub fn nemit_fixed_vec_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   if string_starts_with_q(nm, "__fixed_vec_lit@") {
     nemit_fixed_vec_lit(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_lit@"), cargs)
+  } else if string_starts_with_q(nm, "__fixed_vec_materialize@") {
+    nemit_fixed_vec_materialize(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_materialize@"), cargs)
   } else {
     nemit_fixed_vec_get(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get@"), cargs)
   }
@@ -82,6 +84,35 @@ fn nemit_fixed_vec_get(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Cons
     _ -> nemit_null(ctx)
   }
 }
+
+# The inline `[n x elem]` aggregate → a dynamic heap `Vec`: one pre-sized
+# `vec_reserve` filled by a boxed `vec_push` per element. The boxed border
+# a fixed vec crosses when it flows to a `KaiValue *` consumer — one copy,
+# mirroring the C backend's `materialize_fixed_vec`.
+fn nemit_fixed_vec_materialize(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Console = match spec {
+  FVSpec(tag, n) -> match cargs {
+    [base] -> {
+      let ptr = nemit_atom(ctx, base)
+      let cap = ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx),
+                           llvm_const_int(native_ctx_i64t(ctx), n))
+      let vec = ncall_sig1(ctx, "kaix_core_vec_reserve", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), cap)
+      nfixed_push_elems(ctx, tag, n, ptr, vec, 0)
+    }
+    _ -> nemit_null(ctx)
+  }
+}
+
+fn nfixed_push_elems(ctx: Handle, tag: String, n: Int, ptr: Handle, vec: Handle, i: Int) : Handle / Console =
+  if i >= n { vec }
+  else {
+    let arrty = llvm_array_type(nfixed_elem_ty(ctx, tag), n)
+    let gep   = llvm_build_array_gep(native_ctx_b(ctx), arrty, ptr, llvm_const_i32(native_ctx_i32t(ctx), i))
+    let raw   = llvm_build_load(native_ctx_b(ctx), nfixed_elem_ty(ctx, tag), gep)
+    let boxed = nfixed_box(ctx, tag, raw)
+    let next  = ncall_sig2(ctx, "kaix_core_vec_push", native_ctx_ptrt(ctx),
+                           native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), vec, boxed)
+    nfixed_push_elems(ctx, tag, n, ptr, next, i + 1)
+  }
 
 fn nfixed_idx_val(ctx: Handle, idx: KVal) : Handle / Console = match idx {
   KIntV(k) -> llvm_const_i32(native_ctx_i32t(ctx), k)
