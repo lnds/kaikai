@@ -45,6 +45,7 @@ Every kind is declared in `stdlib/core/kinds.kai` over a theory:
 | `Perm` | `Semilattice` | typed capabilities (`read`, `write`, user perms) |
 | `Region` | `Nominal` | memory arenas (each `region { r -> }` mints one) |
 | `Layout` | `Composition` | byte-order modifiers (`be`, `le`) |
+| `Dim` | `HindleyMilner` | static shape indices (`<3>`, any `Int` value) |
 | `Shape` | `ConstructorApp` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
 
 One theory names one unification engine. A theory is never a label over
@@ -205,6 +206,56 @@ through each op's `Result`. Perm habitants are open: `perm read` /
 (`perm get`, `perm admin`, ...). Handler implementations and test
 doubles mint handles with `file_handle(fd)`, whose capability is
 chosen by the context's expected type.
+
+## Dim — the shape-index kind
+
+`Dim` classifies **static shape indices**. Its habitants are `Int`
+**values** written directly in `<>` (form (b), `with Int`): `<3>` is
+a habitant because `3 : Int`. The engine is the HM core's first-order
+equality — `<3>` unifies with `<3>`, never `<4>` — and the index is
+erased at runtime. A list literal against a `Vec[t]<n>` annotation
+must have exactly `n` elements; a `[n: Dim]` type parameter threads
+the index through calls:
+
+```kaikai
+fn head_of[n: Dim](v: Vec[Real]<n>) : Real = v[0]
+
+fn main() : Unit / Stdout = {
+  let a : Vec[Real]<3> = [1.0, 2.0, 3.0]
+  Stdout.print(real_to_string(head_of(a)))
+}
+```
+
+`Matrix[t]<m, n>` (in `stdlib/math/linalg.kai`) carries **two**
+positional habitants — the `<>` slot is a comma-separated list that
+unifies point to point, so shape rules live in operation signatures:
+`matmul(a: Matrix[Real]<m,n>, b: Matrix[Real]<n,p>) : Matrix[Real]<m,p>`
+cancels the inner index by value equality.
+
+```kaikai
+import math.linalg
+
+fn main() : Unit / Stdout = {
+  let a : linalg.Matrix[Real]<2, 3> = linalg.of([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+  let b : linalg.Matrix[Real]<3, 2> = linalg.of([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+  let c : linalg.Matrix[Real]<2, 2> = linalg.matmul(a, b)
+  Stdout.print(real_to_string(linalg.at(c, 0, 0)))
+}
+```
+
+A wrong-length literal, a mismatched inner index, or a habitant of
+another kind in an index slot are all compile errors:
+
+```kaikai-neg
+fn main() : Unit / Stdout = {
+  let a : Vec[Real]<3> = [1.0, 2.0]     # 2 elements cannot inhabit <3>
+  Stdout.print("no")
+}
+```
+
+`Dim` is atomic — a value index has no products or powers (`<3*4>`
+and `<3^2>` do not exist). Type-level arithmetic (`concat` as `n+k`,
+`reshape` as `m*n = p*q`) is deliberately outside the theory.
 
 ## Shape — the kind of arity-1 constructors
 

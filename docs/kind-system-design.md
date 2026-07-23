@@ -104,6 +104,7 @@ claimed more engines than exist. The truth, and the target:
 | `Module` (`Currency`) | **real** — `unify_dim` dispatches by theory; Module kinds unify by nominal atom equality (`unify_module`) with structural formation (no products/powers), and `scale` lives in operation signatures, not the kind algebra | keep |
 | `Composition` (`Layout`) | **facade** — same `unify_abelian`; the summed measure lives in codegen, not in unification | **build** a real composition engine (the measure participates in unification) |
 | `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
+| `Dim` (engine = the HM core) | **real** — `unify_dim` dispatches first-order kinds (Module, `Dim`) to identity-plus-binding; positional `<m, n>` lists (`UDims`) unify point to point and never touch the abelian table | **shipped** — the typer half; the fixed-width `Vec[t]<n>` representation is the codegen follow-up |
 | `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **shipped** — no longer a theory; a *protocol-law set* in its own namespace, verified by generated property checks |
 
 The principle is **build, not collapse**: a facade is paid down by writing the engine
