@@ -8912,10 +8912,10 @@ test-user-cache: $(TARGET)
 # invoke bin/kai (which uses it) and kaic2 directly.
 test-core-cache: $(TARGET)
 	@set -e; \
-	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh; do \
+	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh ../examples/cache/wrapper_*.sh; do \
 	  sh "$$f" || { echo "core-cache FAIL: $$f"; exit 1; }; \
 	done; \
-	echo "core-cache OK (post-parse + emit-cache fixtures passed)"
+	echo "core-cache OK (post-parse + emit-cache + wrapper-stats fixtures passed)"
 
 # KIR Lane 0 — KIR dumper goldens + determinism gate. Goldens pin the RAW
 # lowering (`--emit=kir-noinline`), decoupled from inline thresholds; the
