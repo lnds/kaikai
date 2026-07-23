@@ -101,8 +101,8 @@ claimed more engines than exist. The truth, and the target:
 | `EffectRow` (`Effect`) | real — row unification (`unify_row`) | keep |
 | `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_abelian`) | keep |
 | shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | **shipped** as its own theory `ConstructorApp`; the `Structural` label is dissolved |
-| `Module` (`Currency`) | **real** — `unify_dim` dispatches by theory; Module kinds unify by nominal atom equality (`unify_module`) with structural formation (no products/powers), and `scale` lives in operation signatures, not the kind algebra | keep |
-| `Composition` (`Layout`) | **facade** — same `unify_abelian`; the summed measure lives in codegen, not in unification | **build** a real composition engine (the measure participates in unification) |
+| `Module` (`Currency`) | **real** — `unify_dim` dispatches by theory; Module kinds unify by nominal atom equality (`unify_nominal`) with structural formation (no products/powers), and `scale` lives in operation signatures, not the kind algebra | keep |
+| `Composition` (`Layout`) | **real** — `unify_dim` dispatches Composition kinds to the nominal slot verdict (`unify_nominal`, shared with Module) with structural formation (no products/powers); load-bearing order and the summed measure are formation invariants of the composed type, not part of the slot's unification identity | keep |
 | `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
 | `Dim` (engine = the HM core) | **real** — `unify_dim` dispatches first-order kinds (Module, `Dim`) to identity-plus-binding; positional `<m, n>` lists (`UDims`) unify point to point and never touch the abelian table | **shipped** — the typer half; the fixed-width `Vec[t]<n>` representation is the codegen follow-up |
 | `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **shipped** — no longer a theory; a *protocol-law set* in its own namespace, verified by generated property checks |
@@ -829,9 +829,11 @@ isolates habitants across kinds with no new engine and no kind-tag on
   audit settled *that* they must; the remaining work is to *build* them, not decide
   whether to. ~~`Module`'s~~ **shipped**: nominal atom equality + structural
   formation, with `scale` in operation signatures (the `over T` on `Currency` names
-  the scalar domain declaratively). `Composition`'s is measure-in-unification;
-  `Region`'s is real identity/branding (`TyBranded`, which the runtime comment admits
-  "has not landed").
+  the scalar domain declaratively). ~~`Composition`'s~~ **shipped**: the same nominal
+  slot verdict (`unify_nominal`) + structural formation, with load-bearing order and
+  the summed measure as formation invariants of the composed type — not part of the
+  slot's unification identity. `Region`'s is real identity/branding (`TyBranded`, which
+  the runtime comment admits "has not landed").
 - ~~`Semilattice` + `Perm`~~ **shipped**: the join engine (`kind_semilattice.kai`) —
   `+` joins in `<>`, idempotent collapse, subsumption-ordered unification (required ⊆
   provided, expected side first per `unify`'s contract), tree-level formation (no
