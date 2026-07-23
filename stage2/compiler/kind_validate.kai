@@ -1,0 +1,108 @@
+#[doc("""
+compiler.kind_validate — declaration-stream checks for kind habitants.
+
+Three rules, all decided by the kind declarations themselves:
+
+  1. a closed habitant set (`with intro { ... }`) may name only atoms
+     the theory's engine ships — the engine owns their semantics, so
+     an unknown atom cannot mean anything;
+  2. a habitant declaration cannot target a closed-set kind — the set
+     is fixed by the engine, the user adds none;
+  3. a measure payload (`pct pct70 = 70`) is legal only on a kind
+     whose theory sums a measure (`Composition`); an opaque theory's
+     habitants are bare symbols.
+
+Runs over the merged decl stream, before the catalog decls are
+stripped, alongside the unit-hygiene validator.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.diag
+
+#[doc("Validate habitant declarations and closed habitant sets across the decl stream; returns the error count.")]
+pub fn validate_habitant_decls(decls: [Decl], reg: KindReg, file: String) : Int / Console + File {
+  let comps = list_append(base_composition_kind_names(), composition_kind_names(decls))
+  let closed = closed_kind_sets(decls)
+  vhd_loop(decls, reg, comps, closed, file, 0)
+}
+
+fn vhd_loop(decls: [Decl], reg: KindReg, comps: [String], closed: [ClosedKind],
+            file: String, acc: Int) : Int / Console + File = match decls {
+  [] -> acc
+  [d, ...rest] ->
+    vhd_loop(rest, reg, comps, closed, file, acc + vhd_decl(d, reg, comps, closed, file))
+}
+
+fn vhd_decl(d: Decl, reg: KindReg, comps: [String], closed: [ClosedKind],
+            file: String) : Int / Console + File = match d {
+  DKind(_, _, thy, _, HabClosed(_, atoms), line, col) ->
+    check_closed_set(thy, atoms, file, line, col)
+  DUnit(_, name, body, intro, line, col) ->
+    check_habitant(name, body, intro_kind_of(reg, intro), comps, closed, file, line, col)
+  DDerive(_, inner, _, _) -> vhd_decl(inner, reg, comps, closed, file)
+  DUnstable(inner, _, _) -> vhd_decl(inner, reg, comps, closed, file)
+  DProtoLaws(_, inner, _, _) -> vhd_decl(inner, reg, comps, closed, file)
+  DImplAxiom(_, inner, _, _) -> vhd_decl(inner, reg, comps, closed, file)
+  DConstructor(inner, _, _) -> vhd_decl(inner, reg, comps, closed, file)
+  _ -> 0
+}
+
+# Rule 1: every named atom must be engine-known for the theory.
+fn check_closed_set(thy: String, atoms: [String], file: String,
+                    line: Int, col: Int) : Int / Console + File {
+  let known = engine_atoms_for_theory(thy)
+  match known {
+    [] -> {
+      diag_error(file, line, col,
+        concat_all(["theory `", thy, "` ships no engine-known habitants, so it",
+                    " takes no closed habitant set"]))
+      1
+    }
+    _ -> match first_unknown_atom(atoms, known) {
+      None -> 0
+      Some(a) -> {
+        diag_error(file, line, col,
+          concat_all(["unknown habitant `", a, "` in the closed set — the `", thy,
+                      "` engine's habitants are: ", join_with(known, ", ")]))
+        1
+      }
+    }
+  }
+}
+
+fn first_unknown_atom(atoms: [String], known: [String]) : Option[String] = match atoms {
+  [] -> None
+  [a, ...rest] -> if list_has(known, a) { first_unknown_atom(rest, known) } else { Some(a) }
+}
+
+# Rules 2 + 3 on one habitant declaration.
+fn check_habitant(name: String, body: UnitBody, kind: String, comps: [String],
+                  closed: [ClosedKind], file: String,
+                  line: Int, col: Int) : Int / Console + File {
+  let atoms = closed_atoms_lookup(closed, kind)
+  match atoms {
+    [_, ..._] -> {
+      diag_error(file, line, col,
+        concat_all(["`", kind, "` is a closed kind — its habitants are fixed (",
+                    join_with(atoms, ", "), ") and `", name, "` cannot be added"]))
+      1
+    }
+    [] -> match body {
+      UBMeasure(_) ->
+        if list_has(comps, kind) { 0 }
+        else {
+          diag_error(file, line, col,
+            concat_all(["habitant `", name, "` declares a measure, but kind `", kind,
+                        "`'s theory does not sum one — only a `Composition` kind's",
+                        " habitants carry `= N`"]))
+          1
+        }
+      _ -> 0
+    }
+  }
+}
+
+fn intro_kind_of(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) { Some(k) -> k None -> measure_kind_name() }
