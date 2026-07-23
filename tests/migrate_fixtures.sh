@@ -147,6 +147,69 @@ else
   fail=$((fail + 1))
 fi
 
+# Dot-slash file argument: `kai migrate ./main.kai` must be treated as a
+# FILE, not a package spec — a `./`-prefixed file path routed through
+# resolve_package_spec died with "is not a directory", breaking the
+# obvious `find . -exec kai migrate {}` sweep. Assert the dry-run over a
+# dot-slash file emits the same rewrite as the bare filename.
+dsp="$tmp/dotslash-pkg"
+mkdir -p "$dsp"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$dsp/kai.toml"
+cat > "$dsp/main.kai" <<'EOF'
+fn parse(s: String) : Result[String, Int] = Ok(1)
+
+fn main() : Unit / Stdout = match parse("x") {
+  Ok(n) -> println("ok")
+  Err(e) -> println(e)
+}
+EOF
+( cd "$dsp"
+  "$KAI" migrate main.kai   > "$tmp/bare.out"    2>/dev/null
+  "$KAI" migrate ./main.kai > "$tmp/dotslash.out" 2>"$tmp/dotslash.err" )
+if [ ! -s "$tmp/dotslash.out" ]; then
+  echo "  FAIL dotslash-file — migrate ./main.kai produced no output:"
+  sed 's/^/      /' "$tmp/dotslash.err"
+  fail=$((fail + 1))
+elif diff -u "$tmp/bare.out" "$tmp/dotslash.out" > "$tmp/diff"; then
+  echo "  OK   dotslash-file (./main.kai == main.kai)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL dotslash-file — ./main.kai != main.kai:"
+  sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+
+# The package-directory case must still resolve: `kai migrate .` and
+# `kai migrate ./<pkg>` route through resolve_package_spec to the
+# manifest entry point. Both must produce the same rewrite as the file.
+( cd "$dsp"; "$KAI" migrate . > "$tmp/dot.out" 2>"$tmp/dot.err" )
+if [ ! -s "$tmp/dot.out" ]; then
+  echo "  FAIL dot-package — migrate . produced no output:"
+  sed 's/^/      /' "$tmp/dot.err"
+  fail=$((fail + 1))
+elif diff -u "$tmp/bare.out" "$tmp/dot.out" > "$tmp/diff"; then
+  echo "  OK   dot-package (migrate . resolves the manifest entry)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL dot-package — migrate . != file rewrite:"
+  sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+
+( cd "$tmp"; "$KAI" migrate ./dotslash-pkg > "$tmp/subpkg.out" 2>"$tmp/subpkg.err" )
+if [ ! -s "$tmp/subpkg.out" ]; then
+  echo "  FAIL subdir-package — migrate ./dotslash-pkg produced no output:"
+  sed 's/^/      /' "$tmp/subpkg.err"
+  fail=$((fail + 1))
+elif diff -u "$tmp/bare.out" "$tmp/subpkg.out" > "$tmp/diff"; then
+  echo "  OK   subdir-package (migrate ./<pkg> resolves the manifest entry)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL subdir-package — migrate ./<pkg> != file rewrite:"
+  sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+
 if [ "$fail" -gt 0 ]; then
   echo "migrate_fixtures: $pass passed, $fail failed"
   exit 1
