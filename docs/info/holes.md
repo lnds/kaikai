@@ -50,7 +50,9 @@ local report plus `kai doc <module>.<symbol>` is usually cheaper.
 ## JSON output
 
 `kai build --holes-json` emits a JSON array, one record per hole,
-designed for LLM consumption. Record fields:
+designed for LLM consumption. `kai typecheck --holes-json` mounts the
+same report on the front-end-only verb (no codegen paid). Record
+fields:
 
 ```text
 file            string         source file path

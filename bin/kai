@@ -881,6 +881,10 @@ Commands:
   bench [--iters N] [<spec>]    Compile with --bench and run.
   check [<spec>]                Compile with --prop-check and run property
                                 blocks (issue #44).
+  typecheck [<spec>]            Front-end only: report type/effect errors
+                                and stop. No codegen, no link — the fast
+                                edit-loop answer. JSON report flags ride
+                                here (see 'kai typecheck --help').
   lint  [<spec>] [--json]       Clippy-style linter over the typed AST;
                                 flags suspect-but-valid code. Warnings
                                 only — never blocks a build.
@@ -1169,6 +1173,41 @@ Options:
 
 Examples:
   kai check examples/stdlib/check_basic.kai
+EOF
+}
+
+usage_typecheck() {
+  cat <<EOF
+usage: kai typecheck [<spec>] [<report-flag>]
+
+Typecheck only — the fastest "does this compile?" answer. Runs the
+full compiler front-end (lex, parse, resolve, HM + effect-row
+inference, kind/unit machinery, protocol-dispatch validation) and
+stops: no monomorphisation, no codegen, no link, no binary. Exit 0
+on a well-typed program; on any front-end error, the exit code and
+diagnostics are identical to what 'kai build' would report.
+
+Scope (honest limits): errors that only surface in later phases are
+NOT covered — monomorphisation-time errors (e.g. a protocol bound
+violated at a concrete instantiation) and backend subset gaps. A
+typecheck-clean program can still fail a full build there.
+
+Imports are resolved and sibling modules typechecked the same way a
+build's front-end does, with the same module search paths.
+
+Report flags (mutually exclusive; same mounts as 'kai build'):
+  --diags-json         structured diagnostics as JSON
+  --holes / --holes-json / --holes-scope / --holes-json-scope
+                       typed-hole reports
+  --effects-json       per-fn effects + handlers as JSON
+  --effect-holes-json  typed effect-hole resolutions as JSON
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai typecheck main.kai
+  kai typecheck main.kai --diags-json
 EOF
 }
 
@@ -2090,8 +2129,17 @@ run_report_mode() {
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
+  # Opt-in user-file incremental cache, same gate as compile_to_binary:
+  # every wrapper invocation carries the flags the build path carries.
+  user_cache_flag=""
+  if [ "${KAI_CACHE:-0}" = "1" ]; then
+    cache_proj_dir="${manifest_dir:-$src_dir}"
+    mkdir -p "$cache_proj_dir/.kai-cache" 2>/dev/null || true
+    user_cache_flag="--user-cache"
+    [ -z "$core_cache_flags" ] && user_cache_flag="--user-cache --core-cache-dir $cache_proj_dir/.kai-cache"
+  fi
   # shellcheck disable=SC2086
-  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $core_cache_flags "$flag" "$src")
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag $user_cache_flag $core_cache_flags "$flag" "$src")
 }
 
 # Back-compat alias — older internal call sites referenced this name.
@@ -2473,6 +2521,29 @@ cmd_check() {
   # requires `cc`.
   compile_to_binary --backend c --backend-origin explicit "$src" "$tmp" "$bin" "check" --prop-check
   "$bin"
+}
+
+# kai typecheck — front-end only. Runs the same lex / parse / resolve /
+# infer (+ protocol/kind/effect checks) a build runs, then stops: no
+# monomorphisation, no codegen, no link. Errors that only surface in
+# those later phases are out of its scope by design. The JSON report
+# modes ride here too — they are the same front-end products `kai
+# build` mounts, and backend selection is irrelevant to all of them.
+cmd_typecheck() {
+  src=""; report_mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_typecheck; return 0 ;;
+      --holes|--holes-json|--holes-scope|--holes-json-scope|--diags-json|--effects-json|--effect-holes-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="$1"; shift ;;
+      -*) die "unknown flag: $1 (see 'kai typecheck --help')" ;;
+      *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
+    esac
+  done
+  src="$(resolve_package_spec "$src")"
+  [ -n "$src" ] || die "missing input file (see 'kai typecheck --help')"
+  run_report_mode "$src" "${report_mode:---check}"
 }
 
 # kai lint — Clippy-style linter over the typed AST. A report mode (no
@@ -3686,6 +3757,7 @@ case "${1:-}" in
   test)      shift; cmd_test  "$@" ;;
   bench)     shift; cmd_bench "$@" ;;
   check)     shift; cmd_check "$@" ;;
+  typecheck) shift; cmd_typecheck "$@" ;;
   lint)      shift; cmd_lint  "$@" ;;
   fmt)       shift; cmd_fmt   "$@" ;;
   migrate)   shift; cmd_migrate "$@" ;;
