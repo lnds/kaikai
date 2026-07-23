@@ -8293,6 +8293,9 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     } else if (kai_is_ptr(a) && a->tag == KAI_UINT64 && kai_is_ptr(b) && b->tag == KAI_UINT64) {
         if (b->as.u64 == 0) { kai_trap_abort("mod by zero"); }
         r = kai_uint64(a->as.u64 % b->as.u64);
+    } else if (kai_is_ptr(a) && a->tag == KAI_INT128 && kai_is_ptr(b) && b->tag == KAI_INT128) {
+        __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_int128(kai_i128_load(a) % y);
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8495,6 +8498,10 @@ static KaiValue *kai_op_neg(KaiValue *a) {
     KaiValue *r;
     if (kai_is_int(a))       r = kai_int(-kai_intf(a));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL) r = kai_real(-a->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_INT32)  r = kai_int32((int32_t)(-(uint32_t) a->as.i32));
+    else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
+    else if (kai_is_ptr(a) && a->tag == KAI_UINT64) r = kai_uint64((uint64_t)(-a->as.u64));
+    else if (kai_is_ptr(a) && a->tag == KAI_INT128) r = kai_int128((__int128)(-(unsigned __int128) kai_i128_load(a)));
     else { fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1); }
     kai_decref(a);
     return r;
@@ -16576,7 +16583,7 @@ typedef struct { char *label; void *bb; } KaiNBlk;
  * signature, call site, and perform. */
 typedef struct { char *sym; char **slots; int nslots; } KaiNFrame;
 typedef struct {
-    void *m, *b, *ptrt, *i64t, *i32t, *voidt, *f64t, *fnval;
+    void *m, *b, *ptrt, *i64t, *i32t, *i128t, *voidt, *f64t, *fnval;
     KaiNReg *regs; int nregs, regcap;
     KaiNBlk *blks; int nblks, blkcap;
     KaiNFrame *frames; int nframes, framecap;
@@ -16599,6 +16606,7 @@ static void *kai_native_ctx_new(void *m) {
     c->ptrt = LLVMPointerTypeInContext(ctx, 0);
     c->i64t = LLVMInt64TypeInContext(ctx);
     c->i32t = LLVMInt32TypeInContext(ctx);
+    c->i128t = LLVMInt128TypeInContext(ctx);
     c->voidt = LLVMVoidTypeInContext(ctx);
     c->f64t = LLVMDoubleTypeInContext(ctx);
     c->fnval = NULL;
@@ -16672,6 +16680,7 @@ static void *kai_native_ctx_m(void *c)     { return ((KaiNativeCtx *) c)->m; }
 static void *kai_native_ctx_ptrt(void *c)  { return ((KaiNativeCtx *) c)->ptrt; }
 static void *kai_native_ctx_i64t(void *c)  { return ((KaiNativeCtx *) c)->i64t; }
 static void *kai_native_ctx_i32t(void *c)  { return ((KaiNativeCtx *) c)->i32t; }
+static void *kai_native_ctx_i128t(void *c) { return ((KaiNativeCtx *) c)->i128t; }
 static void *kai_native_ctx_voidt(void *c) { return ((KaiNativeCtx *) c)->voidt; }
 static void *kai_native_ctx_f64t(void *c) { return ((KaiNativeCtx *) c)->f64t; }
 /* An f64 constant from a raw `double` (the caller unboxes the `KRealV`
@@ -16838,6 +16847,17 @@ static KaiValue *kai_llvm_position_at_end(void *b, void *bb) {
 /* --- values / instructions --- */
 static void *kai_llvm_const_int(void *i64ty, int64_t v) {
     return (void *) LLVMConstInt((LLVMTypeRef) i64ty, (unsigned long long) v, 1);
+}
+/* A raw i128 constant from its decimal text. Int128 literals may exceed the
+ * compiler's 64-bit `decode_int`, so the register const is materialised from
+ * the textual span (base 10, optional leading `-`) — the 128-bit value LLVM
+ * cannot take through the i64 `const_int`. */
+static void *kai_llvm_const_i128_str(void *i128ty, KaiValue *s) {
+    const char *txt = s->as.s.bytes;
+    size_t len = s->as.s.len;
+    void *r = (void *) LLVMConstIntOfStringAndSize((LLVMTypeRef) i128ty, txt, (unsigned) len, 10);
+    kai_decref(s);
+    return r;
 }
 static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) {
     return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
@@ -18246,6 +18266,7 @@ static void *kai_native_ctx_m(void *c) { (void) c; return kai_llvm_native_unavai
 static void *kai_native_ctx_ptrt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_i64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_i32t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i128t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_voidt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_f64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_const_real(void *t, double d) { (void) t; (void) d; return kai_llvm_native_unavailable(); }
@@ -18311,6 +18332,7 @@ static void *kai_llvm_append_block(void *m, void *fn, KaiValue *name) { (void) m
 static void *kai_llvm_builder_new(void *m) { (void) m; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_position_at_end(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_const_int(void *i64ty, int64_t v) { (void) i64ty; (void) v; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_i128_str(void *i128ty, KaiValue *s) { (void) i128ty; (void) s; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) { (void) b; (void) fn; (void) fnty; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) { (void) b; (void) fn; (void) fnty; (void) a0; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_llvm_build_ret(void *b, void *v) { (void) b; (void) v; kai_llvm_native_unavailable(); return kai_unit(); }

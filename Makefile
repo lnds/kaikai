@@ -832,6 +832,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1410 fixture passes under ASAN+UBSan (raw Byte op family, fresh box per boxed border)"
 	@$(MAKE) -C stage2 test-perceus-1457-fixed-raw-ops-asan
 	@echo "tier1-asan OK — issue #1457 fixture passes under ASAN+UBSan (raw Int32/UInt32/UInt64 op family, fresh box per boxed border)"
+	@$(MAKE) -C stage2 test-perceus-1464-fixed-raw-ops-asan
+	@echo "tier1-asan OK — issue #1464 fixture passes under ASAN+UBSan (raw Int128 op family, boxed div/mod, fresh box per boxed border)"
 	@$(MAKE) -C stage2 test-issue-1331-borrowed-op-arg-asan
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
 
