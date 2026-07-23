@@ -27,7 +27,9 @@ Practical map of the build. Read this before running the compiler or touching a 
 ./bin/kai test ./...                     # walk every kai.toml, compile --test, run
 ```
 
-A C-only `kaic2` prints `note: native backend unavailable … using the C backend` and falls back — harmless. Subcommands: `build`, `run`, `test`, `bench`, `check`, plus `--holes-json` / `--diags-json` / `--effects-json` for structured output.
+A C-only `kaic2` prints `note: native backend unavailable … using the C backend` and falls back — harmless. Subcommands: `build`, `run`, `test`, `bench`, `check`, `typecheck`, plus `--holes-json` / `--diags-json` / `--effects-json` for structured output.
+
+`./bin/kai typecheck <file.kai>` is the fast edit-loop answer to "does this compile?": it runs the full front-end (resolve + infer + protocol/kind/effect checks) and stops — no monomorph, no codegen, no `cc`, no link, so it behaves identically on a C-only and a native `kaic2`. Front-end diagnostics and exit code are identical to a build's (gate: `make test-check-parity`); errors that only surface at monomorphisation or in a backend subset gap are out of its scope by design. The JSON report flags ride it (`kai typecheck f.kai --diags-json`).
 
 ### The shared core cache
 

@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -297,7 +297,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -346,7 +346,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver
+	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver)"
 
 tier1-shard-2: kaic2
@@ -562,6 +562,44 @@ test-check: kaic2
 	  cat /tmp/kaikai-check-shrinking.out; exit 1; \
 	fi; \
 	echo "test-check OK — $$matched property blocks passed; shrinking produced $$shrunk minimised counterexamples"
+
+# `kai typecheck` (issue #1427) — verb smoke. Front-end only: a clean
+# program exits 0 with silent streams, a broken one exits non-zero
+# with the same diagnostic a build prints (the corpus-wide identity
+# gate is test-check-parity), and the JSON report mounts ride the verb.
+# The --holes-json step uses a pipe-free fixture: the hole driver
+# re-infers without the head-owner cache and phantom-fails on
+# convention-pipe programs (#1432).
+test-typecheck: kaic2
+	@./bin/kai typecheck examples/typecheck/clean.kai > /tmp/kaikai-typecheck.out 2> /tmp/kaikai-typecheck.err; \
+	rc=$$?; \
+	if [ $$rc -ne 0 ] || [ -s /tmp/kaikai-typecheck.out ] || [ -s /tmp/kaikai-typecheck.err ]; then \
+	  echo "test-typecheck FAIL — clean fixture: rc=$$rc (want 0, silent streams)"; \
+	  cat /tmp/kaikai-typecheck.out /tmp/kaikai-typecheck.err; exit 1; \
+	fi; \
+	neg=examples/negative/type_invariants/arith_string.kai; \
+	./bin/kai typecheck $$neg > /dev/null 2> /tmp/kaikai-typecheck-neg.err; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  echo "test-typecheck FAIL — negative fixture accepted (want non-zero exit)"; exit 1; \
+	fi; \
+	if ! grep -qF "$$(head -1 $${neg%.kai}.err.expected)" /tmp/kaikai-typecheck-neg.err; then \
+	  echo "test-typecheck FAIL — negative diagnostic missing the golden first line"; \
+	  cat /tmp/kaikai-typecheck-neg.err; exit 1; \
+	fi; \
+	./bin/kai typecheck examples/typecheck/clean.kai --diags-json > /tmp/kaikai-typecheck-dj.out 2>&1 \
+	  && grep -q '"diagnostics": \[\]' /tmp/kaikai-typecheck-dj.out \
+	  || { echo "test-typecheck FAIL — --diags-json mount broken"; cat /tmp/kaikai-typecheck-dj.out; exit 1; }; \
+	./bin/kai typecheck examples/minimal/fizzbuzz.kai --holes-json > /tmp/kaikai-typecheck-hj.out 2>&1 \
+	  && grep -q '^\[\]$$' /tmp/kaikai-typecheck-hj.out \
+	  || { echo "test-typecheck FAIL — --holes-json mount broken"; cat /tmp/kaikai-typecheck-hj.out; exit 1; }; \
+	echo "test-typecheck OK — clean exit 0, negative rejected with build-identical diagnostic, JSON mounts live"
+
+# Check-vs-build diagnostic identity (issue #1427): every compile-time
+# negative fixture must be rejected by `kaic2 --check` with the same
+# exit code and byte-identical stderr as a full build.
+test-check-parity: kaic2
+	@./tools/test-check-parity.sh
 
 # Issue #454 — `--library-mode` regression. Each fixture under
 # examples/library_mode/ embeds `# @probe <kind> L:C` markers; kaic2

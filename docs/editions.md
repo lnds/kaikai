@@ -52,8 +52,8 @@ An edition pins the user-visible interface:
   function signatures, exposed types, effect rows. Internal
   helpers (non-`pub`) are not part of the edition contract.
 - **kai CLI.** `kai build`, `kai run`, `kai test`, `kai bench`,
-  `kai check`, `kai fmt` — flags and behaviour. New flags
-  non-breaking; flag removal or behaviour change breaking.
+  `kai check`, `kai typecheck`, `kai fmt` — flags and behaviour.
+  New flags non-breaking; flag removal or behaviour change breaking.
 - **`kai.toml` schema.** Field names, validation rules. Additions
   non-breaking; removals or semantic changes breaking.
 
