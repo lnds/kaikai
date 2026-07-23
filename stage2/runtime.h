@@ -2909,6 +2909,12 @@ struct KaiFiber {
      * nursery is open (bare spawns then have no scope to join). */
     struct KaiNursery *nursery_top;
     KaiFiber          *scope_sibling_next;
+    /* The nursery this fiber was spawned into (NULL for bare spawns).
+     * Read by the trampoline's cancel branch to cancel siblings
+     * eagerly; valid there because the owner cannot free the scope
+     * until it has joined this fiber, which requires the terminal
+     * state store that follows the walk. */
+    struct KaiNursery *scope_nursery;
     /* M:N scheduler — the OS scheduler thread that owns this fiber's
      * heap and runs it. A fiber runs on exactly one thread at a time;
      * `home_thread` is where it was spawned and where it parks. A
@@ -2966,10 +2972,24 @@ struct KaiFiber {
  * `parent` chains to the enclosing nursery so a nested `nursery { }`
  * restores it on exit. The scope holds one extra ref on each child's
  * wrapper (taken at registration, released at join) so a discarded
- * `Fiber[T]` handle cannot free the struct before the scope joins it. */
+ * `Fiber[T]` handle cannot free the struct before the scope joins it.
+ *
+ * `children_head` is atomic because a failing child walks the list
+ * from its own thread (eager cancel-on-fail) while the owner may
+ * still be pushing spawns; the owner's store publishes the new
+ * node's `scope_sibling_next` to that walker.
+ *
+ * `failed_child` latches the first child that terminated CANCELLED
+ * without a requested cancellation. The latch elects a single eager
+ * walker when two children fail at once, and it is what `scope_exit`
+ * trusts for failure: the eager walk sets `cancel_requested` on
+ * peers, so a concurrently-failing peer can terminate flagged and
+ * would otherwise read as an expected cancellation, swallowing the
+ * failure. */
 struct KaiNursery {
-    KaiFiber   *children_head;
-    KaiNursery *parent;
+    _Atomic(KaiFiber *) children_head;
+    KaiNursery         *parent;
+    _Atomic(KaiFiber *) failed_child;
 };
 
 /* kai_main_fiber starts as the OS-thread context, representing the
@@ -3003,7 +3023,7 @@ struct KaiNursery {
     NULL,                /* mailbox — set by with_mailbox if main uses one */ \
     NULL,                /* monitor_head — Monitor.monitor(...) appends here */ \
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
-    NULL, NULL,          /* nursery_top, scope_sibling_next */           \
+    NULL, NULL, NULL,    /* nursery_top, scope_sibling_next, scope_nursery */ \
     0,                   /* home_thread — thread 0 is the main scheduler */ \
     0,                   /* wake_pending */                              \
     0,                   /* pending_park — not a reactor park */          \
@@ -14228,6 +14248,9 @@ static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
  * single push of `target_pid` into observer->mailbox. Defined
  * alongside the Monitor default handler further down. */
 static void kai_monitor_propagate_terminate(KaiFiber *self);
+/* Eager nursery cancel-on-fail — defined alongside the nursery ops
+ * further down. */
+static void kai_nursery_propagate_failure(KaiFiber *self);
 
 /* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
  * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
@@ -14728,8 +14751,12 @@ static void kai_fiber_trampoline(void) {
         /* Cancel or trap landing: the yield-point hook, the default
          * Cancel handler, or kai_trap_abort longjmped here. The body
          * did not finish; result stays NULL. `trapped` distinguishes
-         * a runtime trap (a bug) from cooperative cancellation. */
+         * a runtime trap (a bug) from cooperative cancellation.
+         * Sibling cancellation must precede the terminal state store:
+         * the store is what lets the nursery owner join this fiber,
+         * finish its drain, and free the scope. */
         self->cancel_pad_set = 0;
+        kai_nursery_propagate_failure(self);
         self->state = KAI_FIBER_CANCELLED;
     }
 
@@ -15175,6 +15202,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMai
     KaiNursery *scope = kai_current_fiber()->nursery_top;
     if (scope) {
         kai_incref(v);
+        f->scope_nursery      = scope;
         f->scope_sibling_next = scope->children_head;
         scope->children_head  = f;
     }
@@ -15457,10 +15485,14 @@ static void kai_nursery_join_child(KaiFiber *child) {
 
 /* Cancel every not-yet-terminated child still on the scope list: set
  * the flag, and if the child is parked on the reactor, detach + unpark
- * so the cancel is delivered at its next op boundary. Idempotent. */
-static void kai_nursery_cancel_siblings(KaiFiber *head) {
+ * so the cancel is delivered at its next op boundary. Idempotent, so
+ * the eager walk and the scope_exit walk may both visit a sibling.
+ * `skip` excludes the failing child itself, which is mid-trampoline
+ * and must not be flagged as a requested cancellation. */
+static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
+        if (c == skip
+            || c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
             continue;
         }
         c->cancel_requested = 1;
@@ -15468,6 +15500,23 @@ static void kai_nursery_cancel_siblings(KaiFiber *head) {
             kai_sched_unpark(c);
         }
     }
+}
+
+/* Eager cancel-on-fail: a child terminating CANCELLED without a
+ * requested cancellation cancels its siblings here, at its own
+ * termination, instead of when the owner's join loop reaches it.
+ * Runs before the terminal state store — see `scope_nursery` for why
+ * that keeps the scope pointer alive across threads. The latch makes
+ * one failing child the sole walker; a loser's failure is already
+ * recorded, so its skipped walk changes nothing. */
+static void kai_nursery_propagate_failure(KaiFiber *self) {
+    KaiNursery *scope = self->scope_nursery;
+    if (!scope || self->cancel_requested) return;
+    KaiFiber *expected = NULL;
+    if (!atomic_compare_exchange_strong(&scope->failed_child, &expected, self)) {
+        return;
+    }
+    kai_nursery_cancel_siblings(scope->children_head, self);
 }
 
 /* Issue #959 — close the innermost scope: join every child, then on
@@ -15507,9 +15556,14 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
          * outcome. */
         if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
             failed = 1;
-            kai_nursery_cancel_siblings(head);
+            kai_nursery_cancel_siblings(head, NULL);
         }
     }
+    /* A failure the loop's flag test cannot see: a child that failed
+     * concurrently with a peer's cancel walk terminates flagged, and
+     * only the latch records it. All children are joined by now, so
+     * no further cancel walk is needed. */
+    if (!failed && scope->failed_child != NULL) failed = 1;
     /* Release the scope's refs and clear the intrusive links. The
      * children are all terminated now; their wrappers may still be
      * held by the user's `Fiber[T]` handles, so decref (not free). */
@@ -15517,6 +15571,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
     while (c) {
         KaiFiber *nx = c->scope_sibling_next;
         c->scope_sibling_next = NULL;
+        c->scope_nursery      = NULL;
         if (c->value) kai_decref(c->value);
         c = nx;
     }

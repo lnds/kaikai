@@ -51,7 +51,9 @@ nursery { n ->
   no explicit `await` is required.
 - If a child raises `Cancel` on its own (a crash that is not a
   requested cancellation), the nursery cancels the remaining
-  children, drains them, and re-raises out of the scope. A child
+  children eagerly — at the failing child's termination, not when
+  the scope's join reaches it — drains them, and re-raises out of
+  the scope. A child
   cancelled on request (`n.cancel`) is an expected outcome and does
   not propagate. (`panic` is a process-terminating escape, not a
   scope-recoverable failure.)
