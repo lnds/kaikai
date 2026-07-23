@@ -513,17 +513,37 @@ fn lower_loop_repeat(x: Expr, n: Expr, body: Expr, st: LowerSt) : LRes / Console
     } }
   }
 
-# The loop condition: raw when the unbox pass marked it (an i1 the
-# condbr reads directly), else boxed (the condbr truthy path) — the
-# same split `lower_if` applies.
+# The loop condition: raw when its tail is a raw-marked node (an i1 the
+# condbr reads directly), else boxed (the condbr truthy path) — the same
+# split `lower_if` applies. The pred arrives as the literal lambda's body,
+# usually a single-tail block wrapping the comparison; the block itself is
+# not a raw FORM, so peel transparent wrappers before consulting the mark
+# (`lower_expr_raw`'s block arm recurses to the same tail).
 fn lower_loop_cond(pred: Expr, st: LowerSt) : LRes / Console =
-  if kir_node_is_raw(pred) { lower_expr_raw(pred, st) }
+  if loop_cond_is_raw(pred) { lower_expr_raw(pred, st) }
   else { lower_expr(pred, st) }
 
+fn loop_cond_is_raw(p: Expr) : Bool =
+  if kir_node_is_raw(p) { true }
+  else { match p.kind {
+    EBlock(stmts, tail) -> match stmts {
+      [] -> match tail { Some(t) -> loop_cond_is_raw(t) None -> false }
+      _  -> false
+    }
+    _ -> false
+  } }
+
 # The loop body in statement position: its per-iteration value is
-# discarded (a `KDo`, the SExprStmt shape).
+# discarded (the SExprStmt shape). A `()` value owns nothing and needs no
+# `KDo` — eliding it keeps loop bodies free of dead unit ops; any other
+# atom keeps the `KDo`, whose emitter drops an owned boxed discard. The
+# unit test happens HERE, at the `LRes` destructure: an atom passed on to
+# a helper that matches it hits the stage1 variant-read miscompile.
 fn lower_loop_body(body: Expr, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, st) { LRes(v, st1) -> ls_emit(st1, KDo(KLitOp(v), kpos_of(body))) }
+  match lower_expr(body, st) { LRes(v, st1) -> match v {
+    KUnitV -> st1
+    _      -> ls_emit(st1, KDo(KLitOp(v), kpos_of(body)))
+  } }
 
 # The repeat count: raw when marked, else a boxed Int crossed at the
 # border (borrowing unbox) and dropped — the count is consumed here.
@@ -1035,8 +1055,19 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
       LRes(v, st1) -> lower_let_bind(pat, v, st1)
     }
   }
-  SExprStmt(x) -> match lower_expr(x, st) {
-    LRes(v, st1) -> ls_emit(st1, KDo(KLitOp(v), kpos_of(x)))
+  # A discarded `if` needs no join register: each branch discards its own
+  # value in place, so no unit init / stores / `do join` survive per
+  # iteration in loop bodies. Other shapes discard their lowered atom —
+  # a `()` value elides the `KDo` (nothing to drop), tested at the
+  # destructure (see `lower_loop_body`'s stage1 note).
+  SExprStmt(x) -> match x.kind {
+    EIf(c, t, e_opt) -> lower_if_discard(x, c, t, e_opt, st)
+    _ -> match lower_expr(x, st) {
+      LRes(v, st1) -> match v {
+        KUnitV -> st1
+        _      -> ls_emit(st1, KDo(KLitOp(v), kpos_of(x)))
+      }
+    }
   }
   # `assert cond` / `assert cond, "msg"` → `kai_assert_check(cond, msg)`,
   # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits
@@ -1086,7 +1117,10 @@ fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
 # alloca and `EVar(name)` loads it raw. No RC: a raw scalar is not tracked.
 fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt / Console = match pat.pkind {
   PBind(name) -> lower_let_pbind(name, slot, v, pat, st)
-  _           -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  _           -> match v {
+    KUnitV -> st
+    _      -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  }
 }
 
 # Bind a pattern to an already-lowered value. A plain `PBind(name)` aliases
@@ -1121,7 +1155,12 @@ fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = matc
   PVariant(_, _)       -> bind_pattern_fields_any(pat, v, bind_body_none(), st)
   PVariantRecord(_, _) -> bind_pattern_fields_any(pat, v, bind_body_none(), st)
   PAs(name, _)         -> bind_let_as(pat, name, v, st)
-  _                    -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  # A wildcard let discards its value: a `()` needs no `KDo` (nothing to
+  # drop) — the shape every desugared cell write takes.
+  _                    -> match v {
+    KUnitV -> st
+    _      -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  }
 }
 
 # A `let name @ pat = v`: alias `name` to the whole value, then bind the
@@ -1181,6 +1220,34 @@ fn lower_if_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt)
     } }
   } }
 }
+
+# A statement-position `if` whose value is discarded: same block fork as
+# `lower_if_blocks`, but with NO join register — each branch discards its
+# own value in place (`ls_emit_discard` keeps the owned-box drop and elides
+# the unit noise). A missing else is an empty block.
+fn lower_if_discard(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LowerSt / Console {
+  if kir_node_is_raw(c) {
+    match lower_expr_raw(c, st) { LRes(cv, st1) -> lower_if_discard_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
+  } else {
+    match lower_expr(c, st) { LRes(cv, st1) -> lower_if_discard_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
+  }
+}
+
+fn lower_if_discard_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LowerSt / Console =
+  match three_labels(st) { LSL3(lt, le, lcont, st1) -> {
+    let st2 = ls_seal(st1, KCondBr(cv, lt, le, kpos_of(x)), lt)
+    let st3 = lower_branch_discard(t, lcont, st2)
+    match e_opt {
+      Some(e) -> lower_branch_discard(e, lcont, reopen(st3, le))
+      None    -> ls_seal(reopen(st3, le), KBr(lcont, KNoPos), lcont)
+    }
+  } }
+
+fn lower_branch_discard(e: Expr, lcont: String, st: LowerSt) : LowerSt / Console =
+  match lower_expr(e, st) { LRes(v, st1) -> match v {
+    KUnitV -> ls_seal(st1, KBr(lcont, kpos_of(e)), lcont)
+    _      -> ls_seal(ls_emit(st1, KDo(KLitOp(v), kpos_of(e))), KBr(lcont, kpos_of(e)), lcont)
+  } }
 
 # The join register's slot: raw (`SInt64`/`SReal`) when the `if`-node is a
 # raw-promoted Int/Real expression (`x.mode == MUnboxed` — both arms raw),

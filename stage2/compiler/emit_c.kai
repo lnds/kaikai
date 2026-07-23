@@ -6311,16 +6311,18 @@ fn fixed_box_c_lit(span: String, ty: Ty) : String = match ty {
   _        -> cat3("kai_int(", int_to_string(decode_int(span)), "LL)")
 }
 
-# C operator for an order-comparison op, when both operands are Int and the
+# C operator for a comparison op, when both operands are Int and the
 # comparison can lower to a direct `kai_intf(a) <op> kai_intf(b)` instead of
-# the boxed kai_op_lt/gt/le/ge dispatch (type-test + boxed-bool + truthy +
-# decref). Only the four ORDER comparisons — `==`/`!=` keep structural
-# semantics (Eq dispatch) and are not lowered here.
+# the boxed kai_op dispatch (type-test + boxed-bool + truthy + decref).
+# `==`/`!=` are included: structural equality over two statically-Int
+# operands IS the numeric comparison, so no Eq dispatch is lost.
 fn int_cmp_c_op(op: String) : Option[String] {
   if op == "<"       { Some("<") }
   else if op == ">"  { Some(">") }
   else if op == "<=" { Some("<=") }
   else if op == ">=" { Some(">=") }
+  else if op == "==" { Some("==") }
+  else if op == "!=" { Some("!=") }
   else { None }
 }
 
@@ -7152,30 +7154,41 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
 fn emit_loop_intrinsic(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
 
+  match emit_loop_core(src, name, args_, cx) {
+    Some(core) -> concat_all(["({ ", core, " kai_unit(); })"])
+    None       -> emit_loop_bad(name)
+  }
+}
+
+# The loop's C statement core (no value). Shared by the expression form
+# (which appends the `kai_unit()` result) and the statement-discard form
+# (which drops it — a loop's value is always unit).
+fn emit_loop_core(src: String, name: String, args_: [Expr], cx: EmitCtx) : Option[String] / Console {
+
   match name {
     "__loop_while" -> match args_ {
-      [_, cnd, body] -> concat_all([
-        "({ for (;;) { ", emit_loop_cond_break(src, cnd, cx, false),
-        " ", emit_loop_body_stmt(src, body, cx), " } kai_unit(); })"
-      ])
-      _ -> emit_loop_bad(name)
+      [_, cnd, body] -> Some(concat_all([
+        "for (;;) { ", emit_loop_cond_break(src, cnd, cx, false),
+        " ", emit_loop_body_stmt(src, body, cx), " }"
+      ]))
+      _ -> None
     }
     "__loop_until" -> match args_ {
-      [_, cnd, body] -> concat_all([
-        "({ for (;;) { ", emit_loop_body_stmt(src, body, cx),
-        " ", emit_loop_cond_break(src, cnd, cx, true), " } kai_unit(); })"
-      ])
-      _ -> emit_loop_bad(name)
+      [_, cnd, body] -> Some(concat_all([
+        "for (;;) { ", emit_loop_body_stmt(src, body, cx),
+        " ", emit_loop_cond_break(src, cnd, cx, true), " }"
+      ]))
+      _ -> None
     }
     "__loop_repeat" -> match args_ {
-      [_, n, body] -> concat_all([
-        "({ int64_t _lk = ", emit_loop_count(src, n, cx),
+      [_, n, body] -> Some(concat_all([
+        "{ int64_t _lk = ", emit_loop_count(src, n, cx),
         "; for (; _lk > 0; _lk--) { ", emit_loop_body_stmt(src, body, cx),
-        " } kai_unit(); })"
-      ])
-      _ -> emit_loop_bad(name)
+        " } }"
+      ]))
+      _ -> None
     }
-    _ -> emit_loop_bad(name)
+    _ -> None
   }
 }
 
@@ -7222,7 +7235,108 @@ fn emit_loop_cond_break(src: String, cnd: Expr, cx: EmitCtx, stop_when_true: Boo
 fn emit_loop_body_stmt(src: String, body: Expr, cx: EmitCtx) : String / Console {
 
   let bb = match body.kind { ELambda(_, b) -> b _ -> body }
-  cat3("{ KaiValue *_lb = ", emit_expr(src, bb, cx), "; kai_decref(_lb); }")
+  emit_stmt_discard_or_drop(src, bb, cx)
+}
+
+# --- statement-position discard ---------------------------------------
+#
+# A value-discarded expression (an SExprStmt, a loop body) emitted as a
+# plain C statement: no discarded-value materialisation, no `kai_unit()`
+# tails, no bind+decref of the unit singleton. Forms that cannot drop
+# their value structurally return None and keep the bind+decref path,
+# which preserves the owned-box release.
+
+fn emit_expr_discard(src: String, x: Expr, cx: EmitCtx) : Option[String] / Console {
+
+  match x.kind {
+    EUnit -> Some("")
+    EIntrinsic(name, args_) ->
+      if is_cell_set(name) { Some(emit_cell_set_discard(src, name, args_, cx)) }
+      else if is_loop_intrinsic(name) { emit_loop_core(src, name, args_, cx) }
+      else { None }
+    EIf(c, t, e_opt) -> Some(emit_if_discard(src, c, t, e_opt, cx))
+    EBlock(stmts, opt_final) ->
+      if emit_block_is_region(cx, x.line, x.col) { None }
+      else { emit_block_discard(src, stmts, opt_final, cx) }
+    _ -> None
+  }
+}
+
+fn emit_stmt_discard_or_drop(src: String, x: Expr, cx: EmitCtx) : String / Console {
+
+  match emit_expr_discard(src, x, cx) {
+    Some(s) -> s
+    None ->
+      if expr_is_perceus_drop_call(x) {
+        cat3("{ KaiValue *_ = ", emit_expr(src, x, cx), "; (void) _; } ")
+      } else {
+        cat3("{ KaiValue *_ = ", emit_expr(src, x, cx), "; kai_decref(_); } ")
+      }
+  }
+}
+
+# A discarded cell write: assign the raw local, no unit materialisation.
+fn emit_cell_set_discard(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+
+  let cell = cat2("kair_", cell_intrinsic_name(name))
+  match args_ {
+    [v] -> match v.mode {
+      MUnboxed -> concat_all([cell, " = (", emit_expr_raw(src, v, cx), "); "])
+      _ -> concat_all([
+        "{ KaiValue *_cv = ", emit_expr(src, v, cx), "; ", cell, " = ",
+        unbox_boxed_scalar("_cv", v.ty), "; kai_decref(_cv); } "
+      ])
+    }
+    _ -> cat3("/* malformed cell set $", name, " */ ")
+  }
+}
+
+# A discarded `if`: a plain C `if` statement, each branch discarding its
+# own value. Same condition tiers as the expression form (raw Int cmp,
+# raw bool, boxed truthy); the boxed cond's decref moves before the
+# branches — safe, `kai_op_truthy` is non-consuming and the branches
+# never reference the condition value.
+fn emit_if_discard(src: String, c: Expr, t: Expr, e_opt: Option[Expr], cx: EmitCtx) : String / Console {
+
+  let bcx = emit_ctx_tcpend_after(cx, c)
+  let tc = emit_stmt_discard_or_drop(src, t, bcx)
+  let ec = match e_opt {
+    Some(eb) -> concat_all([" else { ", emit_stmt_discard_or_drop(src, eb, bcx), "}"])
+    None -> ""
+  }
+  if expr_is_int_order_cmp(c) {
+    concat_all(["if (", emit_int_order_cmp_raw(src, c, cx), ") { ", tc, "}", ec, " "])
+  } else { match c.mode {
+    MUnboxed -> concat_all(["if (", emit_expr_raw(src, c, cx), ") { ", tc, "}", ec, " "])
+    _ -> concat_all([
+      "{ KaiValue *_c = ", emit_expr(src, c, cx),
+      "; int _ct = kai_op_truthy(_c); kai_decref(_c); if (_ct) { ", tc, "}", ec, " } "
+    ])
+  } }
+}
+
+# A discarded non-region block: emit the statements and discard the tail
+# in place. The lcs threading mirrors the expression form's block arm.
+fn emit_block_discard(src: String, stmts: [Stmt], opt_final: Option[Expr], cx: EmitCtx) : Option[String] / Console {
+
+  match stmts {
+    [] -> match opt_final {
+      Some(fe) -> Some(emit_stmt_discard_or_drop(src, fe, cx))
+      None     -> Some("")
+    }
+    _ -> {
+      let drops = block_unused_lets(stmts, opt_final)
+      let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
+      let stmt_out = match stmt_acc { EBSA(_, t) -> t }
+      let block_lcs = match stmt_acc { EBSA(l, _) -> l }
+      let final_out = match opt_final {
+        Some(fe) -> emit_stmt_discard_or_drop(src, fe,
+                      emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts))
+        None -> ""
+      }
+      Some(cat4("{ ", stmt_out, final_out, "} "))
+    }
+  }
 }
 
 fn emit_loop_count(src: String, n: Expr, cx: EmitCtx) : String / Console {
@@ -7504,20 +7618,11 @@ fn emit_stmt(src: String, s: Stmt, cx: EmitCtx) : String / Console {
   match s {
     SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, cx)
     SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, cx)
-    # Issue #403: when the SExprStmt is `__perceus_drop(name)`,
-    # `kai_internal_drop` already decrements the value's rc and
-    # returns the unit singleton (rc == INT32_MAX). The general
-    # path's trailing `kai_decref(_)` short-circuits on that
-    # singleton, but the call + branch still cost on every
-    # invocation — and the issue-#350 arm-drop pass emits ~18 M
-    # of these on the RB-tree workload. Mirrors the `(void) _;`
-    # pattern the tcrec rule-3 emission already uses.
-    SExprStmt(x) ->
-      if expr_is_perceus_drop_call(x) {
-        cat3("{ KaiValue *_ = ", emit_expr(src, x, cx), "; (void) _; } ")
-      } else {
-        cat3("{ KaiValue *_ = ", emit_expr(src, x, cx), "; kai_decref(_); } ")
-      }
+    # A discarded expression emits as a plain C statement where the form
+    # allows (cell writes, ifs, blocks, loops — no unit materialisation),
+    # else binds and decrefs the discarded value. `__perceus_drop` skips
+    # even the decref: `kai_internal_drop` returns the unit singleton.
+    SExprStmt(x) -> emit_stmt_discard_or_drop(src, x, cx)
     # m7b #6: index-assign desugars away pre-resolve; this arm is dead
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, _, _) -> "/* SIndexAssign: should have been desugared */ "
@@ -7624,13 +7729,11 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
         }
       }
     }
-    # `let _ = expr` discards the value. #293 Phase 2.1: emit_expr
-    # always returns an owned reference (perceus_pass dups non-last
-    # reads), so the discard site can unconditionally decref.
-    PWild -> {
-      let rhs_c = emit_expr(src, rhs, cx)
-      cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
-    }
+    # `let _ = expr` discards the value: a plain C statement where the
+    # form allows (a cell write, an if, a block — no unit
+    # materialisation), else bind + decref (#293 Phase 2.1: emit_expr
+    # returns an owned reference, so the discard site decrefs).
+    PWild -> emit_stmt_discard_or_drop(src, rhs, cx)
     _ -> {
       # m7d §28: same shape as emit_let_stmt's destructuring path —
       # bind a unique temp and emit pattern binds INTO the enclosing
@@ -7686,10 +7789,7 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, cx: EmitCtx) : String / C
         } else { concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "]) }
       }
     }
-    PWild -> {
-      let rhs_c = emit_expr(src, rhs, cx)
-      cat3("{ KaiValue *_w = ", rhs_c, "; kai_decref(_w); } ")
-    }
+    PWild -> emit_stmt_discard_or_drop(src, rhs, cx)
     _ -> {
       # m7d §28: destructuring let. Bind a unique temp and emit the
       # pattern's binds INTO THE ENCLOSING BLOCK (no `{...}`
