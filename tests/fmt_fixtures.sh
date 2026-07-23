@@ -103,6 +103,61 @@ for f in "$ROOT"/examples/minimal/*.kai \
   pass=$((pass + 1))
 done
 
+# Argument-routing regression: `kai fmt ./main.kai` must be treated as a
+# FILE, not a package spec — a `./`-prefixed file path routed through
+# resolve_package_spec died with "is not a directory", breaking the
+# obvious `find . -exec kai fmt {}` sweep. These checks drive the shell
+# driver (bin/kai), where the routing lives, not kaic2 directly.
+KAI="$ROOT/bin/kai"
+dsp="$tmp/dotslash-pkg"
+mkdir -p "$dsp"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$dsp/kai.toml"
+cat > "$dsp/unformatted.kai" <<'EOF'
+fn   main( ) : Unit / Stdout   =   println( "hi" )
+EOF
+# The canonical formatting the driver should apply, independent of path.
+"$KAIC2" --fmt "$dsp/unformatted.kai" > "$tmp/canonical.kai"
+
+# In-place fmt over `./main.kai` must apply the same rewrite as the bare
+# filename does over `main.kai` — no "is not a directory" death.
+cp "$dsp/unformatted.kai" "$tmp/bare.kai"
+cp "$dsp/unformatted.kai" "$tmp/dotslash.kai"
+( cd "$tmp"; "$KAI" fmt bare.kai 2>"$tmp/bare.err"; "$KAI" fmt ./dotslash.kai 2>"$tmp/dotslash.err" )
+if diff -u "$tmp/bare.kai" "$tmp/dotslash.kai" > "$tmp/diff" \
+   && diff -u "$tmp/canonical.kai" "$tmp/dotslash.kai" >> "$tmp/diff"; then
+  echo "  OK   dotslash-file (fmt ./main.kai == fmt main.kai)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL dotslash-file — ./main.kai != main.kai (or != canonical):"
+  sed 's/^/      /' "$tmp/diff"
+  sed 's/^/      /' "$tmp/dotslash.err"
+  fail=$((fail + 1))
+fi
+
+# The package-directory case must still resolve: `kai fmt .` and
+# `kai fmt ./<pkg>` route through resolve_package_spec to the manifest
+# entry point and format it in place (exit 0, entry rewritten).
+cp "$dsp/unformatted.kai" "$dsp/main.kai"
+if ( cd "$dsp"; "$KAI" fmt . ) 2>"$tmp/dot.err" && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff"; then
+  echo "  OK   dot-package (fmt . resolves + formats the manifest entry)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL dot-package — fmt . did not resolve/format the entry:"
+  sed 's/^/      /' "$tmp/dot.err"
+  sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+cp "$dsp/unformatted.kai" "$dsp/main.kai"
+if ( cd "$tmp"; "$KAI" fmt ./dotslash-pkg ) 2>"$tmp/subpkg.err" && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff"; then
+  echo "  OK   subdir-package (fmt ./<pkg> resolves + formats the manifest entry)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL subdir-package — fmt ./<pkg> did not resolve/format the entry:"
+  sed 's/^/      /' "$tmp/subpkg.err"
+  sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+
 if [ "$fail" -gt 0 ]; then
   echo "fmt_fixtures: $pass passed, $fail failed"
   exit 1
