@@ -669,7 +669,7 @@ KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
 KaiValue *kaix_cons_reuse_move(KaiValue *scr, KaiValue *h, KaiValue *t) {
   scr->as.cons.head = h;
   scr->as.cons.tail = t;
-  kai_rc_reuse_total++;
+  kai_rc_count_reuse();
   return kai_incref(scr);
 }
 
@@ -886,7 +886,7 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
       scr->var_n_args == n && kai_check_unique(scr)) {
     for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
     scr->variant_tag = tag;
-    kai_rc_reuse_total++;
+    kai_rc_count_reuse();
     return scr;
   }
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);

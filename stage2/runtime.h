@@ -932,6 +932,39 @@ KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
  * buffer in place vs. writes that had to copy a shared one. */
 KAI_RT_COUNTER(int64_t kai_vec_inplace_total, 0);
 KAI_RT_COUNTER(int64_t kai_vec_cow_total, 0);
+
+/* The RC/vec trace ledgers are per-thread and summed at exit. A stale slot
+ * mis-attributes counts between threads — wrong telemetry, not corruption —
+ * but the address resolves exactly as the allocator slots do, so the
+ * bookkeeping is routed through noinline accessors on the same discipline: the
+ * slot is materialised and updated inside one activation, never spilled across
+ * a park. Grouped per event (one call per alloc/free) so the hot path pays one
+ * out-of-line hop, not one per counter. */
+__attribute__((noinline))
+static void kai_rc_count_alloc(int tag) {
+    kai_rc_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    if (tag >= 0 && tag < 16) kai_rc_alloc_by_tag[tag]++;
+}
+__attribute__((noinline))
+static void kai_rc_count_free(void) {
+    kai_rc_free_total++;
+    kai_rc_live_now--;
+}
+__attribute__((noinline))
+static void kai_rc_count_live_inc(void) {
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+}
+__attribute__((noinline))
+static void kai_rc_count_live_sub(int64_t n) { kai_rc_live_now -= n; }
+__attribute__((noinline))
+static void kai_rc_count_reuse(void) { kai_rc_reuse_total++; }
+__attribute__((noinline))
+static void kai_vec_count_inplace(void) { kai_vec_inplace_total++; }
+__attribute__((noinline))
+static void kai_vec_count_cow(void) { kai_vec_cow_total++; }
 /* #2 parity probe — reuse-token DISPOSAL counter. Bumped by every
  * kai_reuse_free, i.e. every arm-top token captured (UNIQUE scrutinee
  * shell stolen) that the arm body could NOT donate to an in-frame
@@ -2125,6 +2158,10 @@ static size_t kai_heap_limit(void) {
     return kai_heap_limit_cached;
 }
 
+/* noinline: kai_heap_committed is a per-thread accumulator; keeping the slot
+ * address inside this activation stops the optimiser from carrying it across a
+ * park into a work-stolen frame, which would charge the wrong thread's ledger. */
+__attribute__((noinline))
 static void kai_heap_charge(size_t sz) {
     size_t limit = kai_heap_limit();
     if (limit && kai_heap_committed + sz > limit) {
@@ -2283,6 +2320,45 @@ static inline int kai_var_block_pool_ensure(int n) {
     return kai_var_block_pool[n] != NULL;
 }
 
+/* Free-list pool ops routed through noinline accessors: the pool base and
+ * index are thread-local, so their addresses must be materialised and consumed
+ * inside one activation. Inlined into an emitted kaikai frame that spans a
+ * park, the optimiser could hoist the slot address across the swap and let a
+ * work-stolen fiber push a freed cell onto — or pop from — the parking
+ * thread's free list, corrupting the heap. Out of line the slot is re-resolved
+ * on whatever thread now runs. Each returns/takes only the value, never a slot
+ * address, so nothing escapes the frame. */
+__attribute__((noinline))
+static KaiValue *kai_cell_pool_pop(void) {
+    if (kai_cell_pool_n > 0) return kai_cell_pool[--kai_cell_pool_n];
+    return NULL;
+}
+__attribute__((noinline))
+static int kai_cell_pool_push(KaiValue *v) {
+    if (kai_cell_pool_n < KAI_CELL_POOL_CAP && kai_cell_pool_ensure()) {
+        kai_cell_pool[kai_cell_pool_n++] = v;
+        return 1;
+    }
+    return 0;
+}
+__attribute__((noinline))
+static KaiValue *kai_var_block_pool_pop(int n) {
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
+        return kai_var_block_pool[n][--kai_var_block_pool_n[n]];
+    }
+    return NULL;
+}
+__attribute__((noinline))
+static int kai_var_block_pool_push(KaiValue *v, int n) {
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
+        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP
+        && kai_var_block_pool_ensure(n)) {
+        kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
+        return 1;
+    }
+    return 0;
+}
+
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
  *
  * A fresh variant block used to be `malloc(kai_var_block_size(n))` — one
@@ -2338,6 +2414,11 @@ static KAI_TLS int    kai_slab_cap    = 0;
 static KAI_TLS int    kai_slab_atexit = 0;
 #endif
 
+/* noinline: the slab bump state (cur/off/list/count/cap) is thread-local, so
+ * both functions must keep the slot address inside one activation — inlined
+ * into a park-spanning frame the optimiser could carry it across the swap and
+ * bump-allocate into, or free, the parking thread's slabs after a work-steal. */
+__attribute__((noinline))
 static void kai_slab_teardown(void) {
     for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
     free(kai_slab_list);
@@ -2345,6 +2426,7 @@ static void kai_slab_teardown(void) {
     kai_slab_cur = NULL; kai_slab_off = 0;
 }
 
+__attribute__((noinline))
 static void *kai_slab_alloc(size_t sz) {
     sz = (sz + 7u) & ~(size_t) 7u;            /* 8-byte align */
     if (sz > KAI_SLAB_SIZE) return kai_heap_malloc(sz); /* oversized: standalone (never freed individually either) */
@@ -2407,9 +2489,8 @@ static KaiValue *kai_alloc(KaiTag tag) {
 #endif
     KAI_PROF_ENTER();
 #ifdef KAI_CELL_POOL_ACTIVE
-    KaiValue *v;
-    if (kai_cell_pool_n > 0) {
-        v = kai_cell_pool[--kai_cell_pool_n];
+    KaiValue *v = kai_cell_pool_pop();
+    if (v) {
         /* Zero the struct so callers see calloc-equivalent state (the
          * union, slots ptr, etc. must start clean). */
         memset(v, 0, sizeof(KaiValue));
@@ -2425,10 +2506,7 @@ static KaiValue *kai_alloc(KaiTag tag) {
     v->rc = 1;
     v->tag = (uint8_t) tag;
     /* trace */
-    kai_rc_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
-    if ((int) tag >= 0 && (int) tag < 16) kai_rc_alloc_by_tag[(int) tag]++;
+    kai_rc_count_alloc((int) tag);
 #ifdef KAI_TRACE_RC
     v->alloc_site = site;
     kai_rc_site_record_alloc(site, (int32_t) tag);
@@ -2481,8 +2559,8 @@ static KaiValue *kai_alloc_var(int n) {
     KaiValue *v;
     size_t bsz = kai_var_block_size(n);
 #ifdef KAI_CELL_POOL_ACTIVE
-    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
-        v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
+    v = kai_var_block_pool_pop(n);
+    if (v) {
         memset(v, 0, bsz);
     } else {
         v = (KaiValue *) kai_slab_alloc(bsz);
@@ -2499,10 +2577,7 @@ static KaiValue *kai_alloc_var(int n) {
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
-    kai_rc_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
-    kai_rc_alloc_by_tag[(int) KAI_VARIANT]++;
+    kai_rc_count_alloc((int) KAI_VARIANT);
 #ifdef KAI_TRACE_RC
     v->alloc_site = site;
     kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
@@ -2543,10 +2618,9 @@ static KaiValue *kai_alloc_var_nz(int n) {
     KAI_PROF_ENTER();
     KaiValue *v;
 #ifdef KAI_CELL_POOL_ACTIVE
-    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
-        v = kai_var_block_pool[n][--kai_var_block_pool_n[n]];
-        /* pool block: no memset — caller overwrites every slot */
-    } else {
+    v = kai_var_block_pool_pop(n);
+    if (!v) {
+        /* pool miss: fresh slab block, no memset — caller overwrites every slot */
         v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
     }
 #else
@@ -2557,10 +2631,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
-    kai_rc_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
-    kai_rc_alloc_by_tag[(int) KAI_VARIANT]++;
+    kai_rc_count_alloc((int) KAI_VARIANT);
 #ifdef KAI_TRACE_RC
     v->alloc_site = site;
     kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
@@ -2594,12 +2665,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
 static void kai_var_block_free(KaiValue *v, int n) {
     (void) v;
 #ifdef KAI_CELL_POOL_ACTIVE
-    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
-        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP
-        && kai_var_block_pool_ensure(n)) {
-        kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
-        return;
-    }
+    if (kai_var_block_pool_push(v, n)) return;
     /* spill: drop into the slab; teardown reclaims it at exit. */
 #else
     /* No cell pool: blocks come from plain malloc/calloc (kai_alloc_var
@@ -2757,8 +2823,7 @@ static KaiValue *kai_arena_alloc(KaiArena *a, KaiTag tag) {
     v->tag = (uint8_t) tag;
     a->n_live++;
     kai_arena_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    kai_rc_count_live_inc();
     return v;
 }
 
@@ -2776,7 +2841,7 @@ static void kai_arena_free(KaiArena *a) {
         c = next;
     }
     kai_arena_free_total += a->n_live;
-    kai_rc_live_now      -= a->n_live;
+    kai_rc_count_live_sub(a->n_live);
     a->head   = NULL;
     a->n_live = 0;
 }
@@ -3528,6 +3593,28 @@ KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
 static KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
 #endif
 
+/* The pending-free slots are thread-local. Routed through noinline accessors
+ * so the slot address is materialised and consumed inside one activation:
+ * inlined into an emitted frame that spans a park, the store could land in the
+ * parking thread's slot after a work-steal, and a peer's drain would then
+ * munmap a stack this thread still owns. Take/set exchange only the value. */
+__attribute__((noinline))
+static void kai_pending_free_set(KaiFiber *f) { kai_pending_free = f; }
+__attribute__((noinline))
+static KaiFiber *kai_pending_free_take(void) {
+    KaiFiber *f = kai_pending_free;
+    if (f) kai_pending_free = NULL;
+    return f;
+}
+__attribute__((noinline))
+static void kai_pending_sched_drop_set(KaiValue *v) { kai_pending_sched_drop = v; }
+__attribute__((noinline))
+static KaiValue *kai_pending_sched_drop_take(void) {
+    KaiValue *v = kai_pending_sched_drop;
+    if (v) kai_pending_sched_drop = NULL;
+    return v;
+}
+
 /* Forward decl — defined alongside the m8.x fiber stack allocator
  * later in the file, but used here by the free path (munmap needs the
  * stack_size + page_size total). */
@@ -3545,14 +3632,10 @@ static void kai_drain_pending_free(void) {
     /* Drop a trampoline tail's deferred scheduler ref first: we are now on
      * the next context's stack, so the doomed tail's stack is abandoned and
      * this decref (which may take RC to 0 and munmap that stack) is safe. */
-    KaiValue *sv = kai_pending_sched_drop;
-    if (sv) {
-        kai_pending_sched_drop = NULL;
-        kai_decref(sv);
-    }
-    KaiFiber *f = kai_pending_free;
+    KaiValue *sv = kai_pending_sched_drop_take();
+    if (sv) kai_decref(sv);
+    KaiFiber *f = kai_pending_free_take();
     if (!f) return;
-    kai_pending_free = NULL;
     /* thunk / result / linked_head were handled at wrapper-free time;
      * only stack + struct remain. The stack is an mmap region of
      * size stack_size + one guard page; pair the call with munmap
@@ -4164,8 +4247,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *_kc = (cell);                                                  \
     KAI_RC_RECYCLE_TRACE(_kc);                                               \
     KAI_RC_RECYCLE_POOL(_kc);                                                \
-    kai_rc_free_total++;                                                     \
-    kai_rc_live_now--;                                                       \
+    kai_rc_count_free();                                                     \
 } while (0)
 
 #ifdef KAI_TRACE_RC
@@ -4192,9 +4274,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
 #define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
     if ((_kc)->tag == (int32_t) KAI_VARIANT) {                              \
         kai_var_block_free((_kc), (_kc)->var_n_args);                        \
-    } else if (kai_cell_pool_n < KAI_CELL_POOL_CAP && kai_cell_pool_ensure()) { \
-        kai_cell_pool[kai_cell_pool_n++] = (_kc);                            \
-    } else {                                                                 \
+    } else if (!kai_cell_pool_push(_kc)) {                                    \
         free(_kc);                                                           \
     }                                                                        \
 } while (0)
@@ -4425,7 +4505,7 @@ static void kai_free_value(KaiValue *v) {
                  * any other produce can run. */
                 if (v->as.fib == kai_current_fiber()) {
                     v->as.fib->value = NULL;
-                    kai_pending_free = v->as.fib;
+                    kai_pending_free_set(v->as.fib);
                 } else {
                     /* m8.x: release the private stack. Main fiber has
                      * stack_base == NULL (uses the OS thread stack)
@@ -5518,8 +5598,7 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
     v->var_n_args = (uint8_t) n;
     ar->n_live++;
     kai_arena_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    kai_rc_count_live_inc();
     kai_slotmask_register(tag, mask);
     for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
     return v;
@@ -5866,7 +5945,7 @@ static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
         _scr->as.cons.tail = tail;
         if (old_h != head) kai_decref(old_h);
         if (old_t != tail) kai_decref(old_t);
-        kai_rc_reuse_total++;
+        kai_rc_count_reuse();
         return kai_incref(_scr);   /* survive enclosing match-exit decref */
     }
     return kai_cons(head, tail);
@@ -5890,7 +5969,7 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
             _scr->as.rec.names[i]  = names[i];
             if (old_f != fields[i]) kai_decref(old_f);
         }
-        kai_rc_reuse_total++;
+        kai_rc_count_reuse();
         return kai_incref(_scr);
     }
     return kai_record(n, fields, names);
@@ -5945,7 +6024,7 @@ static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
             }
         }
         _scr->variant_tag  = tag;
-        kai_rc_reuse_total++;
+        kai_rc_count_reuse();
         return kai_incref(_scr);
     }
     return kai_variant_u(tag, name, n, mask, slots);
@@ -6093,7 +6172,7 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
          * exists under tracing; gate it so the steady path is store-only. */
         at->rc = 1;
 #ifdef KAI_TRACE_RC
-        kai_rc_reuse_total++;
+        kai_rc_count_reuse();
 #endif
         (void) mask; (void) name;
         return at;
@@ -6130,8 +6209,7 @@ static inline void kai_reuse_free(KaiReuse at) {
      * kai_free_value would bump are handled here too. */
     KAI_VAR_NAME_FREE(kai_variant_name_of(at->variant_tag));
     kai_var_block_free(at, at->var_n_args);
-    kai_rc_free_total++;
-    kai_rc_live_now--;
+    kai_rc_count_free();
 #ifdef KAI_TRACE_RC
     kai_rc_reuse_free_total++;
     /* Per-tag free accounting (issue #296 table). `kai_var_block_free`
@@ -6170,7 +6248,7 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
         for (int i = 0; i < n; ++i) kai_var_slots(_scr)[i] = slots[i];
         _scr->variant_tag = tag;
         kai_slotmask_register(_scr->variant_tag, mask);
-        kai_rc_reuse_total++;
+        kai_rc_count_reuse();
         return kai_incref(_scr);   /* survive the match-exit kai_decref(_scr) */
     }
     return kai_variant_u(tag, name, n, mask, slots);
@@ -6473,10 +6551,10 @@ static KaiValue *kai_vec_ensure_unique(KaiValue *v, int64_t need_cap) {
     if (v->as.vec.view_of || !kai_check_unique(v)) {
         KaiValue *c = kai_vec_clone(v, need_cap);
         kai_decref(v);
-        kai_vec_cow_total++;
+        kai_vec_count_cow();
         return c;
     }
-    kai_vec_inplace_total++;
+    kai_vec_count_inplace();
     return v;
 }
 
@@ -6677,7 +6755,7 @@ static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
         v->as.vec.data = (char *) v->as.vec.data + (size_t) start * (size_t) m->stride;
         v->as.vec.len = slen;
         v->as.vec.cap = slen;
-        kai_vec_inplace_total++;
+        kai_vec_count_inplace();
         return v;
     }
     KaiValue *owner = v->as.vec.view_of ? v->as.vec.view_of : v;
@@ -14980,7 +15058,7 @@ static void kai_fiber_trampoline(void) {
      * are still on this stack) and the next drain reaps it; byte-identical to
      * the pre-M:N path. */
     if (self->value) {
-        if (kai_nthreads > 1) kai_pending_sched_drop = self->value;
+        if (kai_nthreads > 1) kai_pending_sched_drop_set(self->value);
         else                  kai_decref(self->value);
     }
 
