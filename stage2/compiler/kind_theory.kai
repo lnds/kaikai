@@ -1,5 +1,5 @@
 #[doc("""
-compiler.kind_theory — per-theory engines for the atomic kinds.
+compiler.kind_theory — per-theory engines for the engine-dispatched kinds.
 
 An atomic kind (`Module`, `Composition`) admits no habitant products
 or powers: a well-formed unit over one is a single habitant with
@@ -7,9 +7,10 @@ exponent 1, or dimensionless. Beyond that shared formation shape, each
 theory owns its unification: `Module` habitants unify by nominal atom
 equality — identity plus variable binding, no exponent arithmetic —
 while `Composition` still rides the abelian solver until its ordered
-engine lands. The (kind, theory) pairs collected here feed both
-dispatch points: unit formation (annotation and operator sites) and
-`unify_dim`'s theory dispatch.
+engine lands. `Semilattice` kinds compound through joins instead; their
+engine lives in `kind_semilattice`. The (kind, theory) pairs collected
+here feed both dispatch points: unit formation (annotation and operator
+sites) and `unify_dim`'s theory dispatch.
 """)]
 
 import compiler.util
@@ -31,25 +32,31 @@ pub fn module_theory_name() : String = "Module"
 #[doc("The theory name of the ordered Composition engine.")]
 pub fn composition_theory_name() : String = "Composition"
 
-#[doc("The shipped atomic kinds: `Currency` over Module, plus the shipped Composition kinds. The catalog mirrors these entries, so programs get the engines without loading the catalog file.")]
+#[doc("The theory name of the idempotent-join Semilattice engine.")]
+pub fn semilattice_theory_name() : String = "Semilattice"
+
+#[doc("The shipped engine-dispatched kinds: `Currency` over Module, `Perm` over Semilattice, plus the shipped Composition kinds. The catalog mirrors these entries, so programs get the engines without loading the catalog file.")]
 pub fn base_kind_theories() : [KindTheory] =
-  list_append([KTh("Currency", module_theory_name())],
+  list_append([KTh("Currency", module_theory_name()),
+               KTh("Perm", semilattice_theory_name())],
               named_kind_theories(base_composition_kind_names(), composition_theory_name()))
 
-#[doc("Every atomic (Module + Composition) kind visible to the unit pipeline: the shipped base pairs plus the decl stream's `kind K : Thy` declarations.")]
+#[doc("Every engine-dispatched (Module + Composition + Semilattice) kind visible to the unit pipeline: the shipped base pairs plus the decl stream's `kind K : Thy` declarations.")]
 pub fn atomic_kind_theories(decls: [Decl]) : [KindTheory] =
   list_append(base_kind_theories(),
-              list_append(module_kind_theories(decls),
+              list_append(declared_kind_theories(decls),
                           named_kind_theories(composition_kind_names(decls),
                                               composition_theory_name())))
 
-fn module_kind_theories(decls: [Decl]) : [KindTheory] = mkt_loop(decls, [])
+# Module and Semilattice kinds from the decl stream (Composition kinds
+# are collected by name elsewhere and joined by the caller).
+fn declared_kind_theories(decls: [Decl]) : [KindTheory] = mkt_loop(decls, [])
 
 fn mkt_loop(decls: [Decl], acc: [KindTheory]) : [KindTheory] = match decls {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DKind(_, name, thy, _, _, _, _) ->
-      if thy == module_theory_name() {
+      if thy == module_theory_name() or thy == semilattice_theory_name() {
         mkt_loop(rest, [KTh(name, thy), ...acc])
       } else { mkt_loop(rest, acc) }
     _ -> mkt_loop(rest, acc)
@@ -72,9 +79,14 @@ pub fn theory_of_kind(kts: [KindTheory], kind: String) : String = match kts {
 pub fn kind_is_module(kts: [KindTheory], kind: String) : Bool =
   theory_of_kind(kts, kind) == module_theory_name()
 
-#[doc("True when `kind` is atomic: its habitants stand alone with exponent 1.")]
+#[doc("True when `kind` is declared over the Semilattice theory.")]
+pub fn kind_is_semilattice(kts: [KindTheory], kind: String) : Bool =
+  theory_of_kind(kts, kind) == semilattice_theory_name()
+
+#[doc("True when `kind` is atomic: its habitants stand alone with exponent 1. Semilattice kinds are excluded — their habitants compound, but through joins.")]
 pub fn kind_is_atomic(kts: [KindTheory], kind: String) : Bool =
-  theory_of_kind(kts, kind) != ""
+  theory_of_kind(kts, kind) == module_theory_name() or
+  theory_of_kind(kts, kind) == composition_theory_name()
 
 # One (habitant symbol, exponent) factor of a canonical unit table.
 pub type SymExp = SEx(String, Int)
@@ -97,16 +109,23 @@ have no products or powers; for `Composition` it is the same shape,
 enforced here until that engine exists.
 """)]
 pub fn atom_form_violation(syms: [SymExp], nvars: Int, kts: [KindTheory]) : Option[String] =
-  afv_loop(syms, list_length(syms), nvars, kts)
+  afv_loop(syms, list_length(syms), nvars, kts, false)
 
-fn afv_loop(xs: [SymExp], nsyms: Int, nvars: Int, kts: [KindTheory]) : Option[String] = match xs {
+#[doc("Operator-site formation: like `atom_form_violation`, but Semilattice habitants also count — joins are written in annotations, never produced by `*`/`/`.")]
+pub fn product_form_violation(syms: [SymExp], nvars: Int, kts: [KindTheory]) : Option[String] =
+  afv_loop(syms, list_length(syms), nvars, kts, true)
+
+fn afv_loop(xs: [SymExp], nsyms: Int, nvars: Int, kts: [KindTheory],
+            with_sl: Bool) : Option[String] = match xs {
   [] -> None
-  [f, ...rest] ->
-    if kind_is_atomic(kts, kind_sym_kind(sex_sym(f))) {
+  [f, ...rest] -> {
+    let k = kind_sym_kind(sex_sym(f))
+    if kind_is_atomic(kts, k) or (with_sl and kind_is_semilattice(kts, k)) {
       if sex_exp(f) == 1 and nsyms == 1 and nvars == 0 {
-        afv_loop(rest, nsyms, nvars, kts)
+        afv_loop(rest, nsyms, nvars, kts, with_sl)
       } else { Some(sex_sym(f)) }
-    } else { afv_loop(rest, nsyms, nvars, kts) }
+    } else { afv_loop(rest, nsyms, nvars, kts, with_sl) }
+  }
 }
 
 # One side of a Module-theory unification, classified: dimensionless,

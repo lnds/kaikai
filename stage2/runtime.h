@@ -8907,7 +8907,9 @@ static KaiValue *kai_core_file_open_write(KaiValue *path) {
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
-        int fd = open(pbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        /* O_RDWR, not O_WRONLY: the handle's typed capability is
+         * read + write, so reads through it must be valid. */
+        int fd = open(pbuf, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) r = _kai_file_err("open_write: cannot open file");
         else        r = _kai_file_ok(_kai_file_make_handle(fd));
     }

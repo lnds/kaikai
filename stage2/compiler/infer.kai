@@ -15,6 +15,7 @@ import compiler.diag
 import compiler.ast
 import compiler.kinds
 import compiler.kind_theory
+import compiler.kind_semilattice
 import compiler.kind_resolve
 import compiler.intervals
 import compiler.refinements
@@ -1606,6 +1607,7 @@ fn inf_unit_expr_display(u: UnitExprT) : String {
     }
     UInv(a) -> concat_all(["1/", inf_unit_expr_display(a)])
     UPow(a, n) -> concat_all([inf_unit_expr_display(a), "^", int_to_string(n)])
+    UJoin(a, b) -> concat_all([inf_unit_expr_display(a), " + ", inf_unit_expr_display(b)])
     UVar(n) -> cat2("?u", int_to_string(n))
   }
 }
@@ -3748,6 +3750,7 @@ fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
     UMul(a, b)  -> UMul(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
     UInv(a)     -> UInv(canon_uvars_unit(a, m))
     UPow(a, n)  -> UPow(canon_uvars_unit(a, m), n)
+    UJoin(a, b) -> UJoin(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
   }
 }
 
@@ -5260,6 +5263,7 @@ fn unit_resolve_tparams(u: UnitExprT, tpbinds: [TPBind]) : UnitExprT {
     UMul(a, b) -> UMul(unit_resolve_tparams(a, tpbinds), unit_resolve_tparams(b, tpbinds))
     UInv(a) -> UInv(unit_resolve_tparams(a, tpbinds))
     UPow(a, n) -> UPow(unit_resolve_tparams(a, tpbinds), n)
+    UJoin(a, b) -> UJoin(unit_resolve_tparams(a, tpbinds), unit_resolve_tparams(b, tpbinds))
   }
 }
 
@@ -6241,6 +6245,9 @@ fn unit_to_table_at(u: UnitExprT, scale: Int, t: UTable) : UTable {
     UMul(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
     UInv(a) -> unit_to_table_at(a, 0 - scale, t)
     UPow(a, n) -> unit_to_table_at(a, scale * n, t)
+    # a join contributes each side at the same scale; the semilattice
+    # engine reads any positive multiplicity as membership.
+    UJoin(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
   }
 }
 
@@ -6266,6 +6273,7 @@ fn unit_resolve_to_at(u: UnitExprT, scale: Int, t: UTable, s: Subst, seen: [Int]
     UMul(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
     UInv(a) -> unit_resolve_to_at(a, 0 - scale, t, s, seen)
     UPow(a, n) -> unit_resolve_to_at(a, scale * n, t, s, seen)
+    UJoin(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
   }
 }
 
@@ -6483,12 +6491,16 @@ fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
 
 # Dimension-unification dispatch seam. The kind's theory selects the
 # unification engine: Module kinds ride nominal atom equality
-# (`unify_module`), everything else the abelian solver. Composition's
-# ordered engine and Dim's value equality plug in here the same way.
+# (`unify_module`), Semilattice kinds the subsumption join
+# (`unify_semilattice`), everything else the abelian solver.
+# Composition's ordered engine and Dim's value equality plug in here
+# the same way.
 fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
   let t1 = unit_to_table_resolved(u1, s)
   let t2 = unit_to_table_resolved(u2, s)
-  if utable_module_theory(t1, s) or utable_module_theory(t2, s) {
+  if utable_semilattice_theory(t1, s) or utable_semilattice_theory(t2, s) {
+    unify_semilattice(t1, t2, s)
+  } else if utable_module_theory(t1, s) or utable_module_theory(t2, s) {
     unify_module(t1, t2, s)
   } else {
     unify_abelian_diff(utable_diff(t1, t2), s)
@@ -6514,6 +6526,48 @@ fn uvars_any_module(xs: [UVarEntry], s: Subst) : Bool = match xs {
     UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
       Some(k) -> kind_is_module(s.kind_theories, k) or uvars_any_module(rest, s)
       None -> uvars_any_module(rest, s)
+    }
+  }
+}
+
+# A table rides the Semilattice engine when any habitant's kind — or
+# any variable's kind constraint — is declared over the Semilattice
+# theory.
+fn utable_semilattice_theory(t: UTable, s: Subst) : Bool =
+  usyms_any_semilattice(t.syms, s.kind_theories) or uvars_any_semilattice(t.vars, s)
+
+fn usyms_any_semilattice(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    USE(k, _) ->
+      kind_is_semilattice(kts, kind_sym_kind(k)) or usyms_any_semilattice(rest, kts)
+  }
+}
+
+fn uvars_any_semilattice(xs: [UVarEntry], s: Subst) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      Some(k) -> kind_is_semilattice(s.kind_theories, k) or uvars_any_semilattice(rest, s)
+      None -> uvars_any_semilattice(rest, s)
+    }
+  }
+}
+
+# The Semilattice engine: classify each side (ground habitant set,
+# lone variable) and unify by subsumption — the required (expected)
+# side must be a subset of the provided side. A variable bind still
+# passes the kind gate, so a habitant of another kind cannot bind a
+# Semilattice tparam.
+fn unify_semilattice(t1: UTable, t2: UTable, s: Subst) : Option[Subst] / Mutable {
+  let v1 = sl_side(utable_symexps(t1), utable_varexps(t1))
+  let v2 = sl_side(utable_symexps(t2), utable_varexps(t2))
+  match sl_unify_verdict(v1, v2) {
+    SlOk -> Some(s)
+    SlFail -> None
+    SlBind(v, bound) -> match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
     }
   }
 }
@@ -12355,10 +12409,11 @@ fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
 }
 
 # Atomic-kind formation guard. Habitants of Module and Composition kinds
-# have no product or power, so the combined unit an operator would produce
-# must keep every such habitant alone with exponent 1 (full
+# have no product or power — and Semilattice habitants compound only
+# through `+` in annotations — so the combined unit an operator would
+# produce must keep every such habitant alone with exponent 1 (full
 # cancellation is fine: `USD/USD` is a scalar ratio). Reports against
-# the operator's source position; a no-op when no atomic kind is
+# the operator's source position; a no-op when no such kind is
 # declared.
 fn st_check_module_unit(st: InferState, op: String, u: UnitExprT,
                         line: Int, col: Int) : InferState / Console + File + Mutable {
@@ -12366,7 +12421,8 @@ fn st_check_module_unit(st: InferState, op: String, u: UnitExprT,
     [] -> st
     _ -> {
       let t = unit_to_table_resolved(u, st.sub)
-      match utable_atom_violation(t, st.sub.kind_theories) {
+      match product_form_violation(utable_symexps(t), list_length(t.vars),
+                                   st.sub.kind_theories) {
         None -> st
         Some(sym) -> {
           let kind = kind_sym_kind(sym)
@@ -12375,8 +12431,14 @@ fn st_check_module_unit(st: InferState, op: String, u: UnitExprT,
                         "` quantities: the result unit `",
                         inf_unit_expr_display(utable_to_tree(t)),
                         "` does not exist"]))
-          diag_note(concat_all(["`", kind,
-            "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1 — habitant products and powers are not expressible"]))
+          diag_note(
+            if kind_is_semilattice(st.sub.kind_theories, kind) {
+              concat_all(["`", kind,
+                "` habitants join with `+` inside `<>` annotations; operators never combine them"])
+            } else {
+              concat_all(["`", kind,
+                "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1 — habitant products and powers are not expressible"])
+            })
           st_bump_err(st)
         }
       }
@@ -18712,7 +18774,8 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
   # otherwise ride in through the alias name.
   DUnit(_, _, UBAlias(body), _, line, col) ->
     validate_unit_expr(body, scope, file, line, col) +
-    validate_module_unit_shape(body, scope, file, line, col)
+    validate_module_unit_shape(body, scope, file, line, col) +
+    validate_semilattice_unit_shape(body, scope, file, line, col)
   DTest(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
   DBench(_, body, _, _) -> validate_unit_refs_expr(body, scope, file)
   DCheck(_, ps, body, _, _) ->
@@ -18807,7 +18870,8 @@ fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / C
                        validate_unit_refs_te(ret, scope, file)
   TyDim(base, u) -> validate_unit_refs_te(base, scope, file) +
                      validate_unit_expr(u, scope, file, te.line, te.col) +
-                     validate_module_unit_shape(u, scope, file, te.line, te.col)
+                     validate_module_unit_shape(u, scope, file, te.line, te.col) +
+                     validate_semilattice_unit_shape(u, scope, file, te.line, te.col)
   TyRefine(base, _) -> validate_unit_refs_te(base, scope, file)
   # a compound row as a type argument — validate units
   # inside any parameterised labels it carries (`Reader[Int<m>]`).
@@ -18833,6 +18897,39 @@ fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
                       "` habitants have no products or powers"]))
         diag_note(concat_all(["`", kind,
           "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1"]))
+        1
+      }
+    }
+  }
+}
+
+# Semilattice shape check on a written unit tree (annotation or
+# literal): habitants of a Semilattice kind compound only through `+`,
+# and a join admits only habitant symbols of one Semilattice kind.
+# Tree-based on purpose: the canonical table cannot tell `read*write`
+# from `read + write`.
+fn validate_semilattice_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
+                                   line: Int, col: Int) : Int / Console + File {
+  match scope_kind_theories(scope) {
+    [] -> 0
+    kts -> match sl_shape_violation(u, kts) {
+      None -> 0
+      Some(v) -> {
+        match v {
+          SlvProduct(sym) ->
+            diag_error(file, line, col,
+              concat_all(["`", kind_sym_bare(sym), "` is a `", kind_sym_kind(sym),
+                          "` habitant: it joins with `+` and admits no product,",
+                          " inverse, or power"]))
+          SlvJoinLeaf(what) ->
+            diag_error(file, line, col,
+              concat_all(["`+` joins habitants of a Semilattice kind, and `",
+                          what, "` is not one"]))
+          SlvJoinMix(k1, k2) ->
+            diag_error(file, line, col,
+              concat_all(["habitants of `", k1, "` and `", k2,
+                          "` belong to different kinds and cannot join"]))
+        }
         1
       }
     }
@@ -18923,7 +19020,8 @@ fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
     validate_unit_refs_opt_return(ret_opt, scope, file)
   ELitUnit(inner, u) -> validate_unit_refs_expr(inner, scope, file) +
                          validate_unit_expr(u, scope, file, line, col) +
-                         validate_module_unit_shape(u, scope, file, line, col)
+                         validate_module_unit_shape(u, scope, file, line, col) +
+                         validate_semilattice_unit_shape(u, scope, file, line, col)
   EBang(inner) -> validate_unit_refs_expr(inner, scope, file)
 }
 
@@ -19068,6 +19166,8 @@ fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
                 validate_unit_expr(b, scope, file, line, col)
   UInv(a) -> validate_unit_expr(a, scope, file, line, col)
   UPow(a, _) -> validate_unit_expr(a, scope, file, line, col)
+  UJoin(a, b) -> validate_unit_expr(a, scope, file, line, col) +
+                 validate_unit_expr(b, scope, file, line, col)
 }
 
 # First candidate kind of an ambiguous symbol, for the "qualify as
@@ -19606,6 +19706,11 @@ fn vmps_uexpr(u: UnitExprT, decl_name: String, decl_kind: String,
   }
   UInv(a) -> vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
   UPow(a, _) -> vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
+  UJoin(a, b) -> {
+    let ea = vmps_uexpr(a, decl_name, decl_kind, home, priv_table, file, line, col)
+    let eb = vmps_uexpr(b, decl_name, decl_kind, home, priv_table, file, line, col)
+    ea + eb
+  }
 }
 
 fn vmps_te_list(ts: [TypeExpr], decl_name: String, decl_kind: String,
@@ -19666,6 +19771,8 @@ fn expand_unit_aliases_in_unit(u: UnitExprT, aliases: [UAliasEntry], seen: [Stri
                       expand_unit_aliases_in_unit(b, aliases, seen))
     UInv(a) -> UInv(expand_unit_aliases_in_unit(a, aliases, seen))
     UPow(a, n) -> UPow(expand_unit_aliases_in_unit(a, aliases, seen), n)
+    UJoin(a, b) -> UJoin(expand_unit_aliases_in_unit(a, aliases, seen),
+                         expand_unit_aliases_in_unit(b, aliases, seen))
   }
 }
 
