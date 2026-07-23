@@ -5177,11 +5177,11 @@ fn parse_extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
       if not p_at(p2, TkLbrace) {
         err_d(p_error_here(p2, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`"))
       } else {
-        let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], t)
+        let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], [], t)
         match body_r.r {
           None -> body_r
           Some(d) -> match d {
-            DType(_, _, _, TBRecord(fields), _, _, _) ->
+            DType(_, _, _, TBRecord(fields), _, _, _, _) ->
               validate_extern_struct_decl(name, fields, body_r.p, t)
             _ -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
           }
@@ -7276,12 +7276,68 @@ fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
     match tparams_r.r {
       None -> err_d(tparams_r.p)
       Some(tparams) -> {
-        let p2 = p_skip_newlines(tparams_r.p)
-        if not p_at(p2, TkEq) {
-          err_d(p_error_here(p2, "expected `=` in type declaration"))
+        # Optional habitant-slot declaration `<m: Dim, n: Dim>` after the
+        # tparam bracket: fixes the per-slot kind and arity of the type's
+        # `<>` annotation. LL(1): a `<` here in decl position.
+        let slots_r =
+          if p_at(tparams_r.p, TkLt) {
+            parse_habitant_slots_loop(p_skip_newlines(p_advance(tparams_r.p)), [])
+          } else {
+            PHSlots { p: tparams_r.p, r: Some([]) }
+          }
+        match slots_r.r {
+          None -> err_d(slots_r.p)
+          Some(slots) -> {
+            let p2 = p_skip_newlines(slots_r.p)
+            if not p_at(p2, TkEq) {
+              err_d(p_error_here(p2, "expected `=` in type declaration"))
+            } else {
+              let p3 = p_skip_newlines(p_advance(p2))
+              parse_type_body(p3, is_pub, name, tparams, slots, t)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Result of parsing a `<name: Kind, ...>` habitant-slot list: one
+# `"name:Kind"` string per slot (name kept so `kai fmt` round-trips
+# the surface, kind read by the annotation validator).
+type PHSlots = { p: Parser, r: Option[[String]] }
+
+# Parse one `name: Kind` slot and recurse over `, ...` until `>`. The
+# kind must name a registered kind (`Dim`, `Measure`, a user kind).
+fn parse_habitant_slots_loop(p: Parser, acc: [String]) : PHSlots / Console {
+
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PHSlots { p: p_error(p, t, "expected a slot name in the `<...>` habitant list"), r: None }
+  } else {
+    let sname = tok_source(p.src, t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkColon) {
+      PHSlots { p: p_error_here(p1, "expected `:` after a habitant-slot name (`<n: Dim>`)"), r: None }
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let kt = p_peek(p2)
+      if not tk_is(kt.kind, TkIdent) {
+        PHSlots { p: p_error_here(p2, "expected a kind after `:` in the habitant slot"), r: None }
+      } else {
+        let kind = tok_source(p2.src, kt)
+        if not (kind == measure_kind_name() or kind_reg_has_kind(p2.kind_reg, kind)) {
+          PHSlots { p: p_error(p2, kt, concat_all(["habitant-slot kind must be a declared kind — `", kind, "` is not a kind"])), r: None }
         } else {
+          let slot = concat_all([sname, ":", kind])
           let p3 = p_skip_newlines(p_advance(p2))
-          parse_type_body(p3, is_pub, name, tparams, t)
+          if p_at(p3, TkComma) {
+            parse_habitant_slots_loop(p_skip_newlines(p_advance(p3)), [slot, ...acc])
+          } else if p_at(p3, TkGt) {
+            PHSlots { p: p_advance(p3), r: Some(list_reverse([slot, ...acc])) }
+          } else {
+            PHSlots { p: p_error_here(p3, "expected `,` or `>` after a habitant slot"), r: None }
+          }
         }
       }
     }
@@ -7553,11 +7609,11 @@ fn parse_optional_kind_annotation(p: Parser) : PKind / Console {
   }
 }
 
-fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl / Console {
+fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
 
   if p_at(p, TkLbrace) {
     let p1 = p_skip_newlines(p_advance(p))
-    parse_record_body(p1, [], is_pub, name, tparams, t)
+    parse_record_body(p1, [], is_pub, name, tparams, slots, t)
   } else {
     # Sum or alias: check for an uppercase ident followed by `(` OR
     # followed eventually by `|` to decide. Simpler approach: try to
@@ -7575,16 +7631,16 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: 
       let nxt = p_peek1(p)
       if tk_is(nxt.kind, TkPlus) {
         let nm = tok_source(p.src, hd)
-        parse_effect_alias_body(p_advance(p_advance(p)), [nm], is_pub, name, tparams, t)
+        parse_effect_alias_body(p_advance(p_advance(p)), [nm], is_pub, name, tparams, slots, t)
       } else {
         let is_sum = looks_like_sum(p)
         if is_sum {
-          parse_sum_body(p, [], is_pub, name, tparams, t)
+          parse_sum_body(p, [], is_pub, name, tparams, slots, t)
         } else {
           let rt = parse_type(p)
           match rt.r {
             None -> err_d(rt.p)
-            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None))
+            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None, slots))
           }
         }
       }
@@ -7592,7 +7648,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: 
       let rt = parse_type(p)
       match rt.r {
         None -> err_d(rt.p)
-        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None))
+        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None, slots))
       }
     }
   }
@@ -7641,11 +7697,11 @@ fn looks_like_sum_after_nl(toks: [Token]) : Bool {
   }
 }
 
-fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl / Console {
+fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None))
+    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots))
   } else {
     # Optional `priv` qualifier marks the field private to the
     # declaring module. Default visibility for record fields is
@@ -7673,9 +7729,9 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
             let fd = FD(field_is_pub, fname, ty)
             let p2 = p_skip_newlines(rt.p)
             if p_at(p2, TkComma) {
-              parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, t)
+              parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, slots, t)
             } else if p_at(p2, TkRbrace) {
-              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None))
+              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots))
             } else {
               err_d(p_error_here(p2, "expected `,` or `}` in record type"))
             }
@@ -7691,7 +7747,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
 # order. Subsequent labels must be uppercase idents separated by `+`.
 # Validation that each label refers to a declared effect, plus cycle
 # detection, happens at resolve time.
-fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl / Console {
+fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
 
   let hd = p_peek(p)
   if not tk_is(hd.kind, TkIdent) or not is_upper_ident(p.src, hd) {
@@ -7701,14 +7757,14 @@ fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String,
     let p1 = p_advance(p)
     let acc1 = [nm, ...acc]
     if p_at(p1, TkPlus) {
-      parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, t)
+      parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, slots, t)
     } else {
-      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col, None))
+      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col, None, slots))
     }
   }
 }
 
-fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl / Console {
+fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
   let vt = p_peek(p0)
@@ -7729,9 +7785,9 @@ fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams
         let vnode = Var(vname, vargs)
         let p2 = p_skip_newlines(args_r.p)
         if p_at(p2, TkPipe) {
-          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, t)
+          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, slots, t)
         } else {
-          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col, None))
+          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col, None, slots))
         }
       }
     }
