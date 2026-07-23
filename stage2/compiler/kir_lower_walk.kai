@@ -13,6 +13,7 @@
 
 import compiler.ast
 import compiler.util
+import compiler.kinds
 import compiler.fnreg
 import compiler.emit_shared
 import compiler.infer
@@ -33,46 +34,86 @@ import compiler.kir_lower_variant
 import compiler.vec_raw
 import compiler.emit_tcrec_live
 
-# Degrade a fixed-width vec intrinsic to its dynamic form for the native
-# backend (which has no fixed representation). Returns `None` for any
-# other call. `__fixed_vec_lit(e0..en)` -> the `vec_reserve`/`vec_push`
-# chain over a dynamic `Vec[e]`; `__fixed_vec_get(v, i)` -> `vec_get(v, i)`.
-fn degrade_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr]) : Option[Expr] =
+# Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
+# `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
+# `None` for any other call. The element mangle rides the prim name (the
+# emitter recovers the scalar LLVM type + box constructor from it, mirroring
+# the C `KaiFixedVec_<elem>_<n>` typedef), so the aggregate op carries its
+# full type without a KOp variant. `__fixed_vec_lit(e0..en)` binds the flat
+# aggregate at a `SBoxed` handle slot (the alloca pointer, no RC); a static
+# `__fixed_vec_get(v, i)` is a GEP+load re-box.
+fn lower_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
   match f.kind {
     EVar(nm) ->
-      if nm == "__fixed_vec_lit" {
-        let vty = match x.ty { Some(t) -> fixed_vec_unbrand_ty(t)  None -> TyCon(None, "Vec", [TyAny]) }
-        Some(dfv_lit_chain(cargs, vty, x.line, x.col))
-      } else if nm == "__fixed_vec_get" {
-        match cargs {
-          [v, i] -> Some(with_ty(mk_expr(ECall(mk_expr(EVar("vec_get"), x.line, x.col), [v, i]), x.line, x.col),
-                                 match x.ty { Some(t) -> t  None -> TyAny }))
-          _ -> None
-        }
-      } else { None }
+      if nm == "__fixed_vec_lit" { Some(lower_fixed_vec_lit(x, cargs, st)) }
+      else if nm == "__fixed_vec_get" { lower_fixed_vec_get(x, cargs, st) }
+      else { None }
     _ -> None
   }
 
-fn fixed_vec_unbrand_ty(t: Ty) : Ty = match t { TyDimT(base, _) -> base  _ -> t }
+# `[e0, ..., en]` typed `Vec[elem]<n>` → each element lowered raw at the
+# element scalar slot, then a `__fixed_vec_lit@<elem>@<n>` prim binding the
+# flat aggregate at a handle slot. `<elem>@<n>` is the aggregate shape the
+# emitter rebuilds the `[n x elem]` LLVM type from (LLVM dedups it with the
+# read side's).
+fn lower_fixed_vec_lit(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let vty = match x.ty { Some(t) -> t  None -> TyReal }
+  let elem = if ty_is_fixed_vec(vty) { fixed_vec_elem(vty) } else { TyReal }
+  let eslot = kslot_of_raw_ty(elem)
+  let re = lower_fixed_vec_elems(cargs, eslot, st, [])
+  match re { LRes2(raws, st1) ->
+    bind_op_slot(st1, KPrim(fixed_vec_prim("__fixed_vec_lit@", elem, list_length(cargs)), raws), SBoxed, kpos_of(x)) }
+}
 
-fn dfv_lit_chain(elems: [Expr], vty: Ty, line: Int, col: Int) : Expr =
-  match elems {
-    [] -> with_ty(mk_expr(ECall(mk_expr(EVar("vec_empty"), line, col), []), line, col), vty)
-    _  -> {
-      let n = with_ty(mk_expr(EInt(list_length(elems)), line, col), TyInt)
-      let reserve = with_ty(mk_expr(ECall(mk_expr(EVar("vec_reserve"), line, col), [n]), line, col), vty)
-      dfv_lit_pushes(elems, reserve, vty, line, col)
+# `__fixed_vec_get(v, i)` → the base handle atom + a static-index prim,
+# re-boxed at the element's box constructor. `i` is a compile-time literal
+# (the typer proved it in range and elided the bounds check). The `<n>` in
+# the prim name comes from the base's fixed-vec type so the emitter rebuilds
+# the same `[n x elem]` type the write side alloca'd.
+fn lower_fixed_vec_get(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
+  match cargs {
+    [v, i] -> {
+      let elem = match x.ty { Some(t) -> t  None -> TyReal }
+      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
+      let rv = lower_expr_boxed(v, st)
+      match rv { LRes(vv, st1) ->
+        Some(bind_op_slot(st1, KPrim(fixed_vec_prim("__fixed_vec_get@", elem, n), [vv, fixed_vec_idx_atom(i)]), SBoxed, kpos_of(x))) }
     }
+    _ -> None
   }
 
-fn dfv_lit_pushes(elems: [Expr], acc: Expr, vty: Ty, line: Int, col: Int) : Expr =
-  match elems {
-    [] -> acc
-    [e, ...rest] -> {
-      let push = with_ty(mk_expr(ECall(mk_expr(EVar("vec_push"), line, col), [acc, e]), line, col), vty)
-      dfv_lit_pushes(rest, push, vty, line, col)
-    }
+# `<prefix><elem-tag>@<n>` — the aggregate shape rides the prim name.
+fn fixed_vec_prim(prefix: String, elem: Ty, n: Int) : String =
+  concat_all([prefix, fixed_vec_elem_tag(elem), "@", int_to_string(n)])
+
+fn fixed_vec_idx_atom(i: Expr) : KVal = match i.kind {
+  EInt(k) -> KIntV(k)
+  _       -> KIntV(0)
+}
+
+# The scalar-element tag carried in a fixed-vec prim name — the same short
+# mangle the C typedef uses (`Real`/`Int`/`Bool`/`Char`/`Byte`/…).
+fn fixed_vec_elem_tag(t: Ty) : String = match t {
+  TyReal   -> "Real"
+  TyInt    -> "Int"
+  TyBool   -> "Bool"
+  TyChar   -> "Char"
+  TyByte   -> "Byte"
+  TyInt32  -> "Int32"
+  TyUInt32 -> "UInt32"
+  TyUInt64 -> "UInt64"
+  _        -> "Int"
+}
+
+fn lower_fixed_vec_elems(es: [Expr], eslot: KSlot, st: LowerSt, acc: [KVal]) : LRes2 / Console = match es {
+  []           -> LRes2(acc, st)
+  [e, ...rest] -> match lower_expr_raw_at(e, eslot, st) {
+    LRes(ev, st1) -> lower_fixed_vec_elems(rest, eslot, st1, list_append(acc, [ev]))
   }
+}
+
+# The atom-accumulating result of the element walk.
+type LRes2 = LRes2([KVal], LowerSt)
 
 # --- The Expr walk ------------------------------------------------------
 #
@@ -116,13 +157,11 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EVar(name)         -> lower_var(name, st)
 
   # A call / constructor / perceus mark / sentinel — the dense dispatch.
-  # The native backend has no fixed-width `Vec[t]<n>` representation, so a
-  # fixed-vec intrinsic degrades here to the dynamic form before lowering:
-  # `__fixed_vec_lit` becomes the `vec_reserve`/`vec_push` chain, and
-  # `__fixed_vec_get(v, i)` becomes `vec_get(v, i)`. (The C backend never
-  # reaches KIR, so its inline representation is untouched.)
-  ECall(f, cargs)    -> match degrade_fixed_vec_call(x, f, cargs) {
-    Some(dx) -> lower_expr(dx, st)
+  # A fixed-width `Vec[t]<n>` intrinsic lowers inline (a flat header-less
+  # aggregate), NOT to the dynamic `vec_*` chain — mirroring the C backend's
+  # inline representation.
+  ECall(f, cargs)    -> match lower_fixed_vec_call(x, f, cargs, st) {
+    Some(r) -> r
     None -> match lower_vec_write_rec_fused(x, f, cargs, st) {
       Some(r) -> r
       None    -> lower_call(x, f, cargs, st)
