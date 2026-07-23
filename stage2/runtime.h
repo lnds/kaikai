@@ -8284,6 +8284,15 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     } else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) {
         if (b->as.byte_val == 0) { kai_trap_abort("mod by zero"); }
         r = kai_byte((uint8_t)(a->as.byte_val % b->as.byte_val));
+    } else if (kai_is_ptr(a) && a->tag == KAI_INT32 && kai_is_ptr(b) && b->tag == KAI_INT32) {
+        if (b->as.i32 == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_int32(a->as.i32 % b->as.i32);
+    } else if (kai_is_ptr(a) && a->tag == KAI_UINT32 && kai_is_ptr(b) && b->tag == KAI_UINT32) {
+        if (b->as.u32 == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_uint32(a->as.u32 % b->as.u32);
+    } else if (kai_is_ptr(a) && a->tag == KAI_UINT64 && kai_is_ptr(b) && b->tag == KAI_UINT64) {
+        if (b->as.u64 == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_uint64(a->as.u64 % b->as.u64);
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8306,6 +8315,18 @@ static int64_t kai_imod_chk(int64_t a, int64_t b) {
     return a % b;
 }
 
+/* Unsigned `/` and `%` with the zero-divisor trap. UInt32/UInt64 widen
+ * their operands into u64 and divide unsigned; there is no INT_MIN/-1
+ * overflow in the unsigned domain, so only the zero divisor traps. */
+static uint64_t kai_udiv_chk(uint64_t a, uint64_t b) {
+    if (b == 0) { kai_trap_abort("divide by zero"); }
+    return a / b;
+}
+static uint64_t kai_umod_chk(uint64_t a, uint64_t b) {
+    if (b == 0) { kai_trap_abort("mod by zero"); }
+    return a % b;
+}
+
 /* Less-than for two same-tag fixed-width boxes; signedness per the
  * width. Sets `*out` and returns 1 on a match, 0 otherwise. */
 static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
@@ -8316,6 +8337,20 @@ static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
         case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
         case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
         case KAI_INT128: *out = kai_i128_load(a) < kai_i128_load(b); return 1;
+        default: return 0;
+    }
+}
+
+/* Greater-than for two same-tag fixed-width boxes; signedness per the
+ * width. Mirror of `kai_fixed_lt`. */
+static int kai_fixed_gt(KaiValue *a, KaiValue *b, int *out) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   *out = a->as.byte_val > b->as.byte_val; return 1;
+        case KAI_INT32:  *out = a->as.i32  > b->as.i32;  return 1;
+        case KAI_UINT32: *out = a->as.u32  > b->as.u32;  return 1;
+        case KAI_UINT64: *out = a->as.u64  > b->as.u64;  return 1;
+        case KAI_INT128: *out = kai_i128_load(a) > kai_i128_load(b); return 1;
         default: return 0;
     }
 }
@@ -8354,10 +8389,11 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
+    int _fgt;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) > kai_intf(b));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
     else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
-    else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) r = kai_bool(a->as.byte_val > b->as.byte_val);
+    else if (kai_fixed_gt(a, b, &_fgt)) r = kai_bool(_fgt);
     else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
         size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
         int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
@@ -17362,6 +17398,23 @@ static void *kai_llvm_build_icmp(void *b, int64_t pred, void *a, void *c) {
     }
     return (void *) LLVMBuildICmp(bld, p, la, lc, "");
 }
+/* Raw UNSIGNED comparison → an `i1`, for the UInt32/UInt64 raw path.
+ * `pred`: 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — the unsigned
+ * (`U*`) family (`==`/`!=` are signedness-agnostic). */
+static void *kai_llvm_build_ucmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMIntPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMIntULT; break;
+        case 1:  p = LLVMIntUGT; break;
+        case 2:  p = LLVMIntULE; break;
+        case 3:  p = LLVMIntUGE; break;
+        case 4:  p = LLVMIntEQ;  break;
+        default: p = LLVMIntNE;  break;
+    }
+    return (void *) LLVMBuildICmp(bld, p, la, lc, "");
+}
 
 /* --- constants + globals --- */
 static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
@@ -18204,6 +18257,7 @@ static void *kai_llvm_build_lnot(void *b, void *a) { (void) b; (void) a; return 
 static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_icmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ucmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
 static void *kai_native_ctx_fnval(void *c) { (void) c; return kai_llvm_native_unavailable(); }
 static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }

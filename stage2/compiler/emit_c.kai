@@ -5020,12 +5020,12 @@ fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Strin
   let cty = raw_c_type(scrut.ty)
   concat_all([
     "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
-    emit_switch_arms(src, arms, cty, cx, false),
+    emit_switch_arms(src, arms, cty, scrut.ty, cx, false),
     "} _r; })"
   ])
 }
 
-fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_default: Bool) : String / Console {
+fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, scr_ty: Option[Ty], cx: EmitCtx, saw_default: Bool) : String / Console {
 
   match arms {
     [] -> if saw_default { "" }
@@ -5039,7 +5039,7 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_
         match p.pkind {
           PWild -> {
             let head = concat_all(["    default: _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, scr_cty, cx, true))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, scr_ty, cx, true))
           }
           # Issue #91 — `PBind(name)` catch-all binds the raw
           # scalar `_scr` as `kair_<name>` for the body. Body
@@ -5067,19 +5067,19 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_
             # no local decref is emitted. Perceus dups it for multi-use.
             let boxed_decl = concat_all([
               "KaiValue *kai_", name, " = ",
-              box_for_raw_cty(scr_cty, concat_all(["kair_", name])), "; "])
+              box_wrap(scr_ty, concat_all(["kair_", name])), "; "])
             let head = concat_all([
               "    default: { ", scr_cty, " kair_", name, " = _scr; ",
               boxed_decl,
               "(void) kair_", name, "; (void) kai_", name, "; _r = ",
               body_c, "; } break;\n"
             ])
-            cat2(head, emit_switch_arms(src, rest, scr_cty, cx, true))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, scr_ty, cx, true))
           }
           _ -> {
             # PLit literal arm.
             let head = concat_all(["    case ", pat_lit_raw(p), ": _r = ", body_c, "; break;\n"])
-            cat2(head, emit_switch_arms(src, rest, scr_cty, cx, saw_default))
+            cat2(head, emit_switch_arms(src, rest, scr_cty, scr_ty, cx, saw_default))
           }
         }
       }
@@ -5088,19 +5088,6 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, cx: EmitCtx, saw_
 }
 
 fn cty_for_bind(opt_ty: Option[Ty]) : String = raw_c_type(opt_ty)
-
-# Box a raw C scalar expression back to a `KaiValue *` based on its C
-# type string. Used by the switch-on-raw default PBind to provide a
-# boxed alias (`kai_<name>`) alongside the raw binder for body uses the
-# unbox pass kept boxed (e.g. string interpolation). The switch fast
-# path only fires for integral-raw scrutinees, so int64_t (Int) is the
-# common case; double / char covered for completeness.
-fn box_for_raw_cty(cty: String, expr: String) : String =
-  if cty == "int64_t" { concat_all(["kai_int(", expr, ")"]) }
-  else if cty == "double" { concat_all(["kai_real(", expr, ")"]) }
-  else if cty == "uint32_t" { concat_all(["kai_char(", expr, ")"]) }
-  else if cty == "uint8_t" { concat_all(["kai_byte(", expr, ")"]) }
-  else { concat_all(["kai_int(", expr, ")"]) }
 
 fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
@@ -6263,19 +6250,42 @@ fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
   is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
 }
 
-# True when a raw EBinop is an `Int` or `Byte` `/`/`%` — those route
-# through the trapping helper (`kai_idiv_chk`/`kai_imod_chk`) rather than a
-# bare `a / b`, so a zero divisor traps clean. A Byte operand widens into
-# the i64 helper losslessly (0..255) and the result is truncated back at
-# its own border. Fixed-width 32/64/128 div stays boxed (`kai_fixed_div`).
+# True when a raw EBinop is an `Int`/`Byte`/`Int32`/`UInt32`/`UInt64`
+# `/`/`%` — those route through the trapping helper rather than a bare
+# `a / b`, so a zero divisor traps clean. The unsigned widths use the
+# `kai_udiv_chk`/`kai_umod_chk` pair (`ty_opt_is_checked_unsigned`); the
+# signed ones use `kai_idiv_chk`/`kai_imod_chk`. Int128 div stays boxed
+# (`kai_fixed_div`).
 fn raw_int_divmod_is_checked(op: String, opt_ty: Option[Ty]) : Bool {
-  (op == "/" or op == "%") and (ty_opt_is_int(opt_ty) or ty_opt_is_byte(opt_ty))
+  (op == "/" or op == "%") and
+  (ty_opt_is_int(opt_ty) or ty_opt_is_byte(opt_ty) or
+   ty_opt_is_int32(opt_ty) or ty_opt_is_checked_unsigned(opt_ty))
 }
 
 fn ty_opt_is_byte(opt_ty: Option[Ty]) : Bool = match opt_ty {
   Some(t) -> match t {
     TyByte -> true
     TyRefineT(inner, _) -> match inner { TyByte -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+fn ty_opt_is_int32(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt32 -> true
+    TyRefineT(inner, _) -> match inner { TyInt32 -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+# UInt32/UInt64 `/`/`%` route through the UNSIGNED checked helper. Their
+# operands widen (zext) into the u64 helper; only the zero divisor traps.
+fn ty_opt_is_checked_unsigned(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyUInt32 -> true   TyUInt64 -> true
+    TyRefineT(inner, _) -> match inner { TyUInt32 -> true  TyUInt64 -> true  _ -> false }
     _ -> false
   }
   None -> false
@@ -6596,9 +6606,17 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
                     emit_expr_raw(src, b, cx),
                     ")))"])
       } else if raw_int_divmod_is_checked(op, x.ty) {
-        # Raw i64 `/`/`%` trap on a zero divisor and on INT64_MIN/-1
-        # instead of the bare `a / b` the hardware would run as UB.
-        concat_all([if op == "/" { "kai_idiv_chk(" } else { "kai_imod_chk(" },
+        # Raw `/`/`%` trap on a zero divisor (and the signed helper on
+        # INT64_MIN/-1) instead of the bare `a / b` the hardware would run
+        # as UB. Signed widths widen into the signed i64 helper; unsigned
+        # widths (UInt32/UInt64) into the u64 one — the operand promotes
+        # (sext/zext) at the call and the result truncates back at its slot.
+        let checked = if ty_opt_is_checked_unsigned(x.ty) {
+          if op == "/" { "kai_udiv_chk(" } else { "kai_umod_chk(" }
+        } else {
+          if op == "/" { "kai_idiv_chk(" } else { "kai_imod_chk(" }
+        }
+        concat_all([checked,
                     emit_expr_raw(src, a, cx), ", ",
                     emit_expr_raw(src, b, cx), ")"])
       } else if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
