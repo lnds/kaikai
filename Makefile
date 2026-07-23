@@ -567,9 +567,8 @@ test-check: kaic2
 # program exits 0 with silent streams, a broken one exits non-zero
 # with the same diagnostic a build prints (the corpus-wide identity
 # gate is test-check-parity), and the JSON report mounts ride the verb.
-# The --holes-json step uses a pipe-free fixture: the hole driver
-# re-infers without the head-owner cache and phantom-fails on
-# convention-pipe programs (#1432).
+# The --holes-json step reuses the clean fixture: its convention-pipe
+# dispatch pins that the hole driver sees the build's front-end.
 test-typecheck: kaic2
 	@./bin/kai typecheck examples/typecheck/clean.kai > /tmp/kaikai-typecheck.out 2> /tmp/kaikai-typecheck.err; \
 	rc=$$?; \
@@ -590,7 +589,7 @@ test-typecheck: kaic2
 	./bin/kai typecheck examples/typecheck/clean.kai --diags-json > /tmp/kaikai-typecheck-dj.out 2>&1 \
 	  && grep -q '"diagnostics": \[\]' /tmp/kaikai-typecheck-dj.out \
 	  || { echo "test-typecheck FAIL — --diags-json mount broken"; cat /tmp/kaikai-typecheck-dj.out; exit 1; }; \
-	./bin/kai typecheck examples/minimal/fizzbuzz.kai --holes-json > /tmp/kaikai-typecheck-hj.out 2>&1 \
+	./bin/kai typecheck examples/typecheck/clean.kai --holes-json > /tmp/kaikai-typecheck-hj.out 2>&1 \
 	  && grep -q '^\[\]$$' /tmp/kaikai-typecheck-hj.out \
 	  || { echo "test-typecheck FAIL — --holes-json mount broken"; cat /tmp/kaikai-typecheck-hj.out; exit 1; }; \
 	echo "test-typecheck OK — clean exit 0, negative rejected with build-identical diagnostic, JSON mounts live"

@@ -2544,6 +2544,14 @@ test-driver-holes: $(TARGET) build
 	  build/driver-hole-json-scope.out \
 	  || { echo "driver-holes FAIL hole_json_scope (full scope missing)"; exit 1; }; \
 	echo "driver-holes OK hole_json_scope (--holes-json bounded vs -scope full)"; \
+	pipe=../examples/typed_holes/hole_pipe.kai; \
+	$$KAI build --holes-json $$pipe > build/driver-hole-pipe.json; \
+	python3 ../scripts/validate_holes_json.py build/driver-hole-pipe.json \
+	  || { echo "driver-holes FAIL hole_pipe (schema)"; cat build/driver-hole-pipe.json; exit 1; }; \
+	python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d)==1, d; r=d[0]; assert r['name']=='factor', r; assert r['expected_type']=='Int', r; assert r['line']==1, r" \
+	  build/driver-hole-pipe.json \
+	  || { echo "driver-holes FAIL hole_pipe (content)"; cat build/driver-hole-pipe.json; exit 1; }; \
+	echo "driver-holes OK hole_pipe (--holes-json rides the build front-end: convention-pipe dispatch)"; \
 	echo "driver-holes OK"
 
 # m7a #3 — parser-level smoke tests for `effect` declarations and
