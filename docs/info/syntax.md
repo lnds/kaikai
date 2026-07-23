@@ -745,8 +745,8 @@ helper (e.g. `Numeric.pow_int` for the `Int`-exponent case in
 Currencies are units of the `Currency` kind (`Module` theory:
 additive-only — no habitant products or powers, so `USD^2` cannot be
 formed). `currency USD` declares a habitant; `import money` brings the
-ISO starter set and `Money[c: Currency]` (= `Decimal<c>`). See
-`kai info units` §Module kinds.
+ISO starter set and the carrier-generic `Money[t]<c>`
+(`Money[Decimal]<USD>`). See `kai info units` §Module kinds.
 
 Inside `<...>` (unit expressions) `^` also denotes power, but the
 exponent there is a unit-level integer literal — see `kai info units`.

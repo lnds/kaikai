@@ -1,0 +1,157 @@
+#[doc("""
+compiler.kind_theory — per-theory engines for the atomic kinds.
+
+An atomic kind (`Module`, `Composition`) admits no habitant products
+or powers: a well-formed unit over one is a single habitant with
+exponent 1, or dimensionless. Beyond that shared formation shape, each
+theory owns its unification: `Module` habitants unify by nominal atom
+equality — identity plus variable binding, no exponent arithmetic —
+while `Composition` still rides the abelian solver until its ordered
+engine lands. The (kind, theory) pairs collected here feed both
+dispatch points: unit formation (annotation and operator sites) and
+`unify_dim`'s theory dispatch.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+
+# One (kind name, theory name) pair the unit pipeline dispatches on.
+pub type KindTheory = KTh(String, String)
+
+#[doc("The kind name of a (kind, theory) pair.")]
+pub fn kth_kind(k: KindTheory) : String = match k { KTh(n, _) -> n }
+
+#[doc("The theory name of a (kind, theory) pair.")]
+pub fn kth_theory(k: KindTheory) : String = match k { KTh(_, t) -> t }
+
+#[doc("The theory name of the nominal-atom Module engine.")]
+pub fn module_theory_name() : String = "Module"
+
+#[doc("The theory name of the ordered Composition engine.")]
+pub fn composition_theory_name() : String = "Composition"
+
+#[doc("The shipped atomic kinds: `Currency` over Module, plus the shipped Composition kinds. The catalog mirrors these entries, so programs get the engines without loading the catalog file.")]
+pub fn base_kind_theories() : [KindTheory] =
+  list_append([KTh("Currency", module_theory_name())],
+              named_kind_theories(base_composition_kind_names(), composition_theory_name()))
+
+#[doc("Every atomic (Module + Composition) kind visible to the unit pipeline: the shipped base pairs plus the decl stream's `kind K : Thy` declarations.")]
+pub fn atomic_kind_theories(decls: [Decl]) : [KindTheory] =
+  list_append(base_kind_theories(),
+              list_append(module_kind_theories(decls),
+                          named_kind_theories(composition_kind_names(decls),
+                                              composition_theory_name())))
+
+fn module_kind_theories(decls: [Decl]) : [KindTheory] = mkt_loop(decls, [])
+
+fn mkt_loop(decls: [Decl], acc: [KindTheory]) : [KindTheory] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, thy, _, _, _, _) ->
+      if thy == module_theory_name() {
+        mkt_loop(rest, [KTh(name, thy), ...acc])
+      } else { mkt_loop(rest, acc) }
+    _ -> mkt_loop(rest, acc)
+  }
+}
+
+fn named_kind_theories(names: [String], thy: String) : [KindTheory] = match names {
+  [] -> []
+  [n, ...rest] -> [KTh(n, thy), ...named_kind_theories(rest, thy)]
+}
+
+#[doc("The theory of `kind`, or empty when the kind is not atomic.")]
+pub fn theory_of_kind(kts: [KindTheory], kind: String) : String = match kts {
+  [] -> ""
+  [k, ...rest] ->
+    if kth_kind(k) == kind { kth_theory(k) } else { theory_of_kind(rest, kind) }
+}
+
+#[doc("True when `kind` is declared over the Module theory.")]
+pub fn kind_is_module(kts: [KindTheory], kind: String) : Bool =
+  theory_of_kind(kts, kind) == module_theory_name()
+
+#[doc("True when `kind` is atomic: its habitants stand alone with exponent 1.")]
+pub fn kind_is_atomic(kts: [KindTheory], kind: String) : Bool =
+  theory_of_kind(kts, kind) != ""
+
+# One (habitant symbol, exponent) factor of a canonical unit table.
+pub type SymExp = SEx(String, Int)
+
+#[doc("The symbol of a (symbol, exponent) factor.")]
+pub fn sex_sym(f: SymExp) : String = match f { SEx(s, _) -> s }
+
+#[doc("The exponent of a (symbol, exponent) factor.")]
+pub fn sex_exp(f: SymExp) : Int = match f { SEx(_, n) -> n }
+
+# One (unit-variable id, exponent) factor of a canonical unit table.
+pub type VarExp = VEx(Int, Int)
+
+#[doc("""
+Formation rule shared by the atomic theories, on a canonical table's
+factors: a habitant of an atomic kind stands alone with exponent 1 or
+has cancelled out entirely. Returns the offending qualified symbol.
+For `Module` this is the engine's structural formation — habitants
+have no products or powers; for `Composition` it is the same shape,
+enforced here until that engine exists.
+""")]
+pub fn atom_form_violation(syms: [SymExp], nvars: Int, kts: [KindTheory]) : Option[String] =
+  afv_loop(syms, list_length(syms), nvars, kts)
+
+fn afv_loop(xs: [SymExp], nsyms: Int, nvars: Int, kts: [KindTheory]) : Option[String] = match xs {
+  [] -> None
+  [f, ...rest] ->
+    if kind_is_atomic(kts, kind_sym_kind(sex_sym(f))) {
+      if sex_exp(f) == 1 and nsyms == 1 and nvars == 0 {
+        afv_loop(rest, nsyms, nvars, kts)
+      } else { Some(sex_sym(f)) }
+    } else { afv_loop(rest, nsyms, nvars, kts) }
+}
+
+# One side of a Module-theory unification, classified: dimensionless,
+# a single atom, a unit variable, or an inadmissible compound.
+pub type ModSide = MOne | MAtom(String) | MVarSide(Int) | MIll
+
+#[doc("Classify one side's canonical factors for the Module engine: `1`, a lone atom, a lone variable, or an inadmissible compound (which formation already rejects).")]
+pub fn module_side(syms: [SymExp], vars: [VarExp]) : ModSide = match syms {
+  [] -> match vars {
+    [] -> MOne
+    [VEx(v, n)] -> if n == 1 { MVarSide(v) } else { MIll }
+    _ -> MIll
+  }
+  [SEx(s, n)] -> match vars {
+    [] -> if n == 1 { MAtom(s) } else { MIll }
+    _ -> MIll
+  }
+  _ -> MIll
+}
+
+# The Module engine's verdict on two classified sides: already equal,
+# refuse, or bind a variable to the other side's unit.
+pub type ModVerdict = MEq | MFail | MBind(Int, UnitExprT)
+
+#[doc("""
+Nominal unification for Module-theory units: an atom unifies only with
+itself, a variable binds to the other side, and nothing else unifies —
+no exponents, no cancellation, no abelian normalisation.
+""")]
+pub fn module_unify_verdict(a: ModSide, b: ModSide) : ModVerdict = match a {
+  MAtom(x) -> match b {
+    MAtom(y) -> if x == y { MEq } else { MFail }
+    MVarSide(v) -> MBind(v, USym(x))
+    _ -> MFail
+  }
+  MOne -> match b {
+    MOne -> MEq
+    MVarSide(v) -> MBind(v, UOne)
+    _ -> MFail
+  }
+  MVarSide(v) -> match b {
+    MAtom(y) -> MBind(v, USym(y))
+    MOne -> MBind(v, UOne)
+    MVarSide(w) -> if v == w { MEq } else { MBind(v, UVar(w)) }
+    MIll -> MFail
+  }
+  MIll -> MFail
+}
