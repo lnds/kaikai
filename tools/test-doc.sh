@@ -9,10 +9,15 @@
 #   4. `kai doc <module>.<symbol>` shows the signature + doc body.
 #   5. The extended --doc-json carries the `sig` field for a fn.
 #   6. A bad symbol / bad module exits non-zero with an actionable hint.
+#   8. `impl` blocks render as rows in the module page and resolve
+#      via drill-down (issue #1425).
+#   9. The module/item synopsis is the first SENTENCE, not physical
+#      line 1 (issue #1425).
 #
 # Catches: heredoc backtick regressions in usage(), broken cmd_doc
 # dispatch, JSON-field offset drift in the awk extractor, a dropped
-# `sig` field in doc_attr.kai.
+# `sig` field in doc_attr.kai, impl blocks silently dropped from the
+# doc index, a synopsis cut mid-sentence.
 
 set -eu
 
@@ -110,4 +115,43 @@ echo "$pkg_imp_out" | grep -q "Imports a stdlib module" \
 echo "$pkg_imp_out" | grep -q "go" \
   || fail "'kai doc pkg/withimport' did not list the go item"
 
-echo "test-doc: OK — --help clean, doc list/module/symbol views, sig field, error paths, package-module stdlib import"
+# 8. `impl` blocks render in the module page and resolve via drill-down.
+#    A `_proto` stdlib module's ENTIRE content is impls — before the
+#    fix its page rendered an empty item list.
+proto_out="$("$KAI" doc decimal_proto 2>&1)" || fail "'kai doc decimal_proto' exited non-zero"
+echo "$proto_out" | grep -q "Add_for_Decimal" \
+  || fail "'kai doc decimal_proto' did not list the Add impl"
+echo "$proto_out" | grep -q "Div_for_Decimal" \
+  || fail "'kai doc decimal_proto' did not list the Div impl"
+
+impl_sym_out="$("$KAI" doc decimal_proto.Add_for_Decimal 2>&1)" \
+  || fail "'kai doc decimal_proto.Add_for_Decimal' exited non-zero"
+echo "$impl_sym_out" | grep -q "^# decimal_proto.Add_for_Decimal" \
+  || fail "impl drill-down missing header"
+echo "$impl_sym_out" | grep -q "add(self: dec.Decimal, rhs: dec.Decimal) -> dec.Decimal" \
+  || fail "impl drill-down missing method signature"
+
+# Mixed module (fns + impls): the fns render as before, PLUS its impl.
+decimal_out="$("$KAI" doc decimal 2>&1)" || fail "'kai doc decimal' exited non-zero"
+echo "$decimal_out" | grep -q "add " \
+  || fail "'kai doc decimal' lost its fn listing"
+echo "$decimal_out" | grep -q "Numeric_for_Decimal" \
+  || fail "'kai doc decimal' did not list its Numeric impl"
+
+# 9. Synopsis = first sentence, not physical line 1. `spawn`'s module
+#    doc wraps its first sentence across a line break; a "cut at line
+#    1" renderer truncates mid-phrase ("New code should" with no verb).
+spawn_out="$("$KAI" doc spawn 2>&1)" || fail "'kai doc spawn' exited non-zero"
+echo "$spawn_out" | grep -q "wrappers around the .Spawn. effect ops\.$" \
+  || fail "'kai doc spawn' synopsis truncated mid-sentence"
+echo "$spawn_out" | grep -q "New code should" \
+  && fail "'kai doc spawn' synopsis bled into the second sentence"
+
+# decimal.add's doc wraps "Panics on \`Int128\` carrier overflow..." onto
+# a second line — the per-item synopsis must not cut before the period.
+echo "$decimal_out" | grep -q "aligning them to the larger scale (exact)\.$" \
+  || fail "'kai doc decimal' add() synopsis truncated mid-sentence"
+echo "$decimal_out" | grep -q "Panics" \
+  && fail "'kai doc decimal' add() synopsis bled into the second sentence"
+
+echo "test-doc: OK — --help clean, doc list/module/symbol views, sig field, error paths, package-module stdlib import, impl rendering, sentence synopsis"
