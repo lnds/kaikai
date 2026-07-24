@@ -299,6 +299,10 @@ double   kaix_to_real(KaiValue *v)             { return v->as.r; }
 const char *kaix_to_str_data(KaiValue *v)      { return v->as.s.bytes; }
 uint32_t kaix_to_char(KaiValue *v)             { return v->as.c; }
 
+/* Bounds gate for a dynamic index into a fixed-width `Vec[t]<n>`; traps
+ * out of range, returns the index so the GEP consumes it inline. */
+int64_t kaix_fixed_vec_idx(int64_t i, int64_t n) { return kai_fixed_vec_idx(i, n); }
+
 /* ---------- m5 #4 — Perceus dup/drop wrappers for LLVM backend ---------- */
 KaiValue *kaix_internal_dup(KaiValue *v)       { return kai_internal_dup(v); }
 KaiValue *kaix_internal_drop(KaiValue *v)      { return kai_internal_drop(v); }

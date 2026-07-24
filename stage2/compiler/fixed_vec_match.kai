@@ -1,0 +1,115 @@
+#[doc("Match lowering for a fixed-width `Vec[e]<n>` scrutinee — direct element reads and a compile-time length test, no dynamic `Vec` op.")]
+# A fixed vec is a flat header-less aggregate: it has no `vec_length`,
+# no `vec_get`, no `vec_tail_from`. But its length IS the type, so the
+# whole match collapses at compile time — exactly one arm can match, and
+# it is picked here. Element binders are literal-index reads; a `...rest`
+# binder is itself a fixed vec (`Vec[e]<n-k>`) rebuilt as a literal, so
+# the rewrite never leaves the inline world.
+#
+# Everything built here is SURFACE syntax, re-synthesised once by the
+# typer. The `__fixed_vec_*` intrinsics carry no scheme, so a node naming
+# one directly would not survive that re-synth.
+
+import compiler.ast
+import compiler.kinds
+import compiler.vec_surface
+
+#[doc("The arm a fixed-width `Vec` of length `n` selects, or `None` when no arm covers it.")]
+pub fn fixed_vec_match_arm(arms: [Arm], n: Int) : Option[Arm] = match arms {
+  [] -> None
+  [a, ...rest] -> if fixed_vec_arm_matches(a, n) { Some(a) } else { fixed_vec_match_arm(rest, n) }
+}
+
+fn fixed_vec_arm_matches(a: Arm, n: Int) : Bool = match a {
+  Arm(p, _, _) -> match vec_arm_kind(p) {
+    VArmList(pats, rest)  -> fixed_vec_len_ok(list_length(pats), rest, n)
+    VArmAs(_, pats, rest) -> fixed_vec_len_ok(list_length(pats), rest, n)
+    VArmCatch(_)          -> true
+    VArmUnsupported       -> false
+  }
+}
+
+fn fixed_vec_len_ok(k: Int, rest: Option[String], n: Int) : Bool =
+  match rest { None -> k == n  Some(_) -> k <= n }
+
+#[doc("Build the body of the one arm a fixed `Vec[e]<n>` selects: element binds as literal-index reads, a rest binder as the trailing fixed-vec literal.")]
+pub fn fixed_vec_arm_build(a: Arm, scr: Expr, vty: Ty) : Expr = match a {
+  Arm(p, _, body) -> match vec_arm_kind(p) {
+    VArmList(pats, rest)   -> fvm_block(fvm_binds(pats, rest, scr, vty, p), body, p)
+    VArmAs(nm, pats, rest) ->
+      fvm_block([fvm_let(nm, scr, p), ...fvm_binds(pats, rest, scr, vty, p)], body, p)
+    VArmCatch(Some(nm)) -> fvm_block([fvm_let(nm, scr, p)], body, p)
+    VArmCatch(None)     -> body
+    VArmUnsupported     -> body
+  }
+}
+
+fn fvm_block(binds: [Stmt], body: Expr, p: Pattern) : Expr = match binds {
+  [] -> body
+  _  -> mk_expr(EBlock(binds, Some(body)), p.line, p.col)
+}
+
+fn fvm_let(nm: String, rhs: Expr, p: Pattern) : Stmt =
+  SLet(Pattern { pkind: PBind(nm), line: p.line, col: p.col }, None, rhs)
+
+fn fvm_binds(pats: [Pattern], rest: Option[String], scr: Expr, vty: Ty, p: Pattern) : [Stmt] {
+  let heads = fvm_head_binds(pats, 0, scr, p)
+  match rest {
+    None -> heads
+    Some(rnm) -> list_append(heads, [fvm_rest_bind(rnm, scr, vty, list_length(pats), p)])
+  }
+}
+
+fn fvm_head_binds(pats: [Pattern], i: Int, scr: Expr, arm_p: Pattern) : [Stmt] =
+  match pats {
+    [] -> []
+    [p, ...rest] -> {
+      let tail = fvm_head_binds(rest, i + 1, scr, arm_p)
+      match p.pkind {
+        PBind(nm) -> [fvm_let(nm, fvm_elem_read(scr, i, p), p), ...tail]
+        _         -> tail
+      }
+    }
+  }
+
+# One element read as `v[i]`: the typer's index path routes a literal
+# index on a fixed vec to the bare field load.
+fn fvm_elem_read(scr: Expr, i: Int, p: Pattern) : Expr =
+  mk_expr(EIndex(scr, mk_expr(EInt(i), p.line, p.col)), p.line, p.col)
+
+# `...rest` over a fixed vec of length `n` after `k` heads is itself a
+# fixed vec of length `n - k`: an annotated literal over the trailing
+# element reads, so the descent stays inline (no heap vec, no slice op).
+fn fvm_rest_bind(rnm: String, scr: Expr, vty: Ty, k: Int, p: Pattern) : Stmt {
+  let n = fixed_vec_n(vty)
+  let elems = fvm_rest_elems(scr, k, n, p)
+  let lit = mk_expr(EList(elems), p.line, p.col)
+  let ann = fvm_rest_ann(fixed_vec_elem(vty), n - k, p)
+  SLet(Pattern { pkind: PBind(rnm), line: p.line, col: p.col }, Some(ann), lit)
+}
+
+fn fvm_rest_elems(scr: Expr, i: Int, n: Int, p: Pattern) : [ListElem] =
+  if i >= n { [] }
+  else { [ElPlain(fvm_elem_read(scr, i, p)), ...fvm_rest_elems(scr, i + 1, n, p)] }
+
+# The `Vec[e]<m>` annotation the rest binder carries, so the literal is
+# checked in fixed-vec context and mints the inline aggregate. The element
+# is a flat scalar (the fixed-vec representation gate), so its type always
+# has a surface name.
+fn fvm_rest_ann(elem: Ty, m: Int, p: Pattern) : TypeExpr {
+  let en = TypeExpr { tkind: TyName(fvm_scalar_name(elem), []), line: p.line, col: p.col }
+  let vt = TypeExpr { tkind: TyName("Vec", [en]), line: p.line, col: p.col }
+  TypeExpr { tkind: TyDim(vt, USym(int_to_string(m))), line: p.line, col: p.col }
+}
+
+fn fvm_scalar_name(t: Ty) : String = match t {
+  TyReal   -> "Real"
+  TyInt    -> "Int"
+  TyBool   -> "Bool"
+  TyChar   -> "Char"
+  TyByte   -> "Byte"
+  TyInt32  -> "Int32"
+  TyUInt32 -> "UInt32"
+  TyUInt64 -> "UInt64"
+  _        -> "Int"
+}

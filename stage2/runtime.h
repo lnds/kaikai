@@ -6534,6 +6534,19 @@ static void kai_vec_bounds(KaiValue *v, int64_t i, const char *op) {
     }
 }
 
+/* Bounds gate for a dynamic index into a fixed-width `Vec[t]<n>`: the
+ * length is a compile-time constant, so only the index needs checking.
+ * Returns the index so the caller can use it inline as the subscript. */
+static int64_t kai_fixed_vec_idx(int64_t i, int64_t n) {
+    if (i < 0 || i >= n) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) n);
+        kai_trap_abort(buf);
+    }
+    return i;
+}
+
 /* O(1) read; the element leaves the vec owned by the caller. */
 static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
     kai_vec_bounds(v, i, "vec_get");

@@ -47,6 +47,7 @@ fn lower_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[L
     EVar(nm) ->
       if nm == "__fixed_vec_lit" { Some(lower_fixed_vec_lit(x, cargs, st)) }
       else if nm == "__fixed_vec_get" { lower_fixed_vec_get(x, cargs, st) }
+      else if nm == "__fixed_vec_get_dyn" { lower_fixed_vec_get_dyn(x, cargs, st) }
       else { None }
     _ -> None
   }
@@ -87,6 +88,50 @@ fn lower_fixed_vec_get(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Con
       let rv = lower_expr_boxed(v, st)
       match rv { LRes(vv, st1) ->
         Some(bind_op_slot(st1, KPrim(fixed_vec_prim(prefix, elem, n), [vv, fixed_vec_idx_atom(i)]), SBoxed, kpos_of(x))) }
+    }
+    _ -> None
+  }
+
+# `__fixed_vec_get_dyn(v, i)` → the base handle atom plus the index lowered
+# RAW at `SInt64`: the emitter gates it against the static `<n>` before the
+# GEP, so the index must reach it as a machine word, not a boxed value.
+fn lower_fixed_vec_get_dyn(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
+  match cargs {
+    [v, i] -> {
+      let elem = match x.ty { Some(t) -> t  None -> TyReal }
+      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
+      match lower_expr_boxed(v, st) { LRes(vv, st1) ->
+        match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
+          Some(bind_op_slot(st2, KPrim(fixed_vec_prim("__fixed_vec_get_dyn@", elem, n), [vv, iv]), SBoxed, kpos_of(x))) } }
+    }
+    _ -> None
+  }
+
+# A fixed-vec element read in RAW position: the same GEP+load, bound at the
+# element's scalar slot with no re-box. The `raw` prefix tells the emitter to
+# stop at the loaded word. Only the reads qualify — a fixed-vec LITERAL is an
+# aggregate pointer, never a raw scalar.
+fn lower_fixed_vec_read_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
+  match f.kind {
+    EVar(nm) ->
+      if nm == "__fixed_vec_get" { lower_fixed_vec_get_at(x, cargs, "__fixed_vec_getraw@", false, st) }
+      else if nm == "__fixed_vec_get_dyn" { lower_fixed_vec_get_at(x, cargs, "__fixed_vec_getraw_dyn@", true, st) }
+      else { None }
+    _ -> None
+  }
+
+fn lower_fixed_vec_get_at(x: Expr, cargs: [Expr], prefix: String, dyn: Bool,
+                          st: LowerSt) : Option[LRes] / Console =
+  match cargs {
+    [v, i] -> {
+      let elem = match x.ty { Some(t) -> t  None -> TyReal }
+      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
+      match lower_expr_boxed(v, st) { LRes(vv, st1) -> {
+        let ri = if dyn { lower_expr_raw_at(i, SInt64, st1) } else { LRes(fixed_vec_idx_atom(i), st1) }
+        match ri { LRes(iv, st2) ->
+          Some(bind_op_slot(st2, KPrim(fixed_vec_prim(prefix, elem, n), [vv, iv]),
+                            kslot_of_raw_ty(elem), kpos_of(x))) }
+      } }
     }
     _ -> None
   }
@@ -162,6 +207,10 @@ fn fixed_vec_needs_materialize(x: Expr) : Bool =
     MUnboxed -> match x.kind { EVar(_) -> ty_is_fixed_vec_opt(x.ty)  _ -> false }
     _        -> false
   }
+
+# The same read seen from a `let` RHS whose binder is itself the inline
+# form: an alias, not a border crossing.
+fn fixed_vec_alias_rhs(rhs: Expr) : Bool = fixed_vec_needs_materialize(rhs)
 
 # The inline aggregate → a dynamic heap `Vec`, one copy at the border
 # (`vec_reserve` + one `vec_push` per element). Mirrors the C backend's
@@ -521,7 +570,13 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # of the oracle's `emit_kind_raw` ECall arm → `emit_ufn_raw_call`. RC: a
   # raw call result carries no refcount; perceus already skipped it (the
   # node is `MUnboxed`), so no KDup/KDrop lands on the raw register.
-  ECall(f, cargs) -> lower_call(x, f, cargs, st)
+  # A fixed-vec read has no core symbol to call: on the raw path it lowers
+  # to the inline prim at the element's SCALAR slot, skipping the re-box the
+  # boxed path needs.
+  ECall(f, cargs) -> match lower_fixed_vec_read_raw(x, f, cargs, st) {
+    Some(r) -> r
+    None    -> lower_call(x, f, cargs, st)
+  }
   # A single-tail block transparently wraps its raw tail (no preceding
   # statements). A multi-statement block, or any other shape, is not a
   # natively-raw form: lower it boxed then unbox-borrow at the border.
@@ -1195,8 +1250,14 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
     Some(slot) -> match lower_expr_raw(rhs, st) {
       LRes(v, st1) -> lower_let_bind_raw(pat, v, slot, st1)
     }
-    None -> match lower_expr(rhs, st) {
-      LRes(v, st1) -> lower_let_bind(pat, v, st1)
+    # An inline fixed-vec binder aliased to another binder crosses no boxed
+    # border: both hold the same header-less aggregate, so the read must NOT
+    # materialise (the alias would then be a dynamic vec its own reads still
+    # index as an aggregate). Every other read of one boxes at its border.
+    None -> if fixed_vec_alias_rhs(rhs) {
+      match lower_expr_boxed(rhs, st) { LRes(v, st1) -> lower_let_bind(pat, v, st1) }
+    } else {
+      match lower_expr(rhs, st) { LRes(v, st1) -> lower_let_bind(pat, v, st1) }
     }
   }
   # A discarded `if` needs no join register: each branch discards its own
