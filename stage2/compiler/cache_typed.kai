@@ -1,0 +1,382 @@
+#[doc("""
+`TypedProgram` serde — the per-module typed artifact an incremental
+rebuild restores instead of re-inferring.
+
+Skipping a module's inference is only sound if the cache hands back
+exactly what the typer would have produced: whole-program monomorph
+consumes every module's typed decls, so a restored artifact that
+differs anywhere changes the emitted C. The contract here is therefore
+**round-trip fidelity**, not canonicalization — `emit(deserialize(
+serialize(tp)))` must be byte-identical to `emit(tp)`. Interface
+identity is a separate contract and lives in `compiler.cache_delta`.
+
+Wire conventions follow `compiler.cache`: sum types open with a 1-byte
+tag (never 0x00), records emit fields in declaration order, lists emit
+`u32 length + each element`. Every decoder returns
+`Option[Cache<T>Pos]` whose second slot is the cursor past the
+consumed bytes.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.cache
+import compiler.cache_ast
+import compiler.infer
+
+pub type CacheUnitLPos = CULP([UnitExprT], Int)
+pub type CacheRCSPos   = CRCSP(ResolvedCS, Int)
+pub type CacheRCSLPos  = CRCSLP([ResolvedCS], Int)
+pub type CacheHKPos    = CHKP(HoleKind, Int)
+pub type CacheTEPos    = CTEP(TyEntry, Int)
+pub type CacheTELPos   = CTELP([TyEntry], Int)
+pub type CacheRHPos    = CRHP(ResolvedHole, Int)
+pub type CacheRHLPos   = CRHLP([ResolvedHole], Int)
+pub type CacheRRHPos   = CRRHP(ResolvedRowHole, Int)
+pub type CacheRRHLPos  = CRRHLP([ResolvedRowHole], Int)
+
+fn ct_len_prefixed(chunks: [String]) : String =
+  concat_all([cache_u32_to_hex(list_length(chunks)), concat_all(chunks)])
+
+# ---- [UnitExprT] ------------------------------------------------------
+
+fn cache_unit_list_to_hex(xs: [UnitExprT]) : String =
+  ct_len_prefixed(map(xs, (u) => cache_unit_to_hex(u)))
+
+fn cache_hex_to_unit_list(buf: String, pos: Int) : Option[CacheUnitLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_units(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_units(buf: String, pos: Int, remaining: Int,
+                     acc: [UnitExprT]) : Option[CacheUnitLPos] {
+  if remaining <= 0 { Some(CULP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_unit(buf, pos) {
+      None -> None
+      Some(c) -> match c { CUP(u, p2) ->
+        ct_collect_units(buf, p2, remaining - 1, [u, ...acc]) }
+    }
+  }
+}
+
+# ---- ResolvedCS -------------------------------------------------------
+# RCS(name, line, col, [Ty], [UnitExprT], module_origin).
+#
+# A list slot read from a variant is consumed with `map` inside the arm
+# that destructured it; passing it positionally to a `match`-driven
+# helper corrupts the list under the stage1 bootstrap compiler.
+
+#[doc("Serialise one `ResolvedCS` (a resolved call-site instantiation) to its payload chunk.")]
+pub fn cache_rcs_to_hex(r: ResolvedCS) : String = match r {
+  RCS(nm, line, col, tys, units, mo) -> {
+    let tychunks = map(tys, (t) => cache_tyr_to_hex(t))
+    let uchunks = map(units, (u) => cache_unit_to_hex(u))
+    concat_all([cache_string_to_hex(nm), cache_int_to_hex(line),
+                cache_int_to_hex(col), ct_len_prefixed(tychunks),
+                ct_len_prefixed(uchunks), cache_opt_string_to_hex(mo)])
+  }
+}
+
+#[doc("Decode one `ResolvedCS` at `pos`.")]
+pub fn cache_hex_to_rcs(buf: String, pos: Int) : Option[CacheRCSPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> rcs_after_name(buf, p, nm) }
+  }
+}
+
+fn rcs_after_name(buf: String, pos: Int, nm: String) : Option[CacheRCSPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(line, p) -> rcs_after_line(buf, p, nm, line) }
+  }
+}
+
+fn rcs_after_line(buf: String, pos: Int, nm: String, line: Int) : Option[CacheRCSPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(col, p) -> rcs_after_col(buf, p, nm, line, col) }
+  }
+}
+
+fn rcs_after_col(buf: String, pos: Int, nm: String, line: Int,
+                  col: Int) : Option[CacheRCSPos] {
+  match cache_hex_to_tyr_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTyRLP(tys, p) -> rcs_after_tys(buf, p, nm, line, col, tys) }
+  }
+}
+
+fn rcs_after_tys(buf: String, pos: Int, nm: String, line: Int, col: Int,
+                  tys: [Ty]) : Option[CacheRCSPos] {
+  match cache_hex_to_unit_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CULP(us, p) -> rcs_after_units(buf, p, nm, line, col, tys, us) }
+  }
+}
+
+fn rcs_after_units(buf: String, pos: Int, nm: String, line: Int, col: Int,
+                    tys: [Ty], us: [UnitExprT]) : Option[CacheRCSPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(mo, p) ->
+      Some(CRCSP(RCS(nm, line, col, tys, us, mo), p)) }
+  }
+}
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_rcs_list_to_hex(xs: [ResolvedCS]) : String =
+  ct_len_prefixed(map(xs, (r) => cache_rcs_to_hex(r)))
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_hex_to_rcs_list(buf: String, pos: Int) : Option[CacheRCSLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_rcs(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_rcs(buf: String, pos: Int, remaining: Int,
+                   acc: [ResolvedCS]) : Option[CacheRCSLPos] {
+  if remaining <= 0 { Some(CRCSLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_rcs(buf, pos) {
+      None -> None
+      Some(c) -> match c { CRCSP(r, p2) ->
+        ct_collect_rcs(buf, p2, remaining - 1, [r, ...acc]) }
+    }
+  }
+}
+
+# ---- HoleKind / TyEntry / ResolvedHole --------------------------------
+
+fn cache_holekind_to_hex(k: HoleKind) : String = match k {
+  HKHole(nm) -> concat_all([cache_byte_to_hex(1), cache_opt_string_to_hex(nm)])
+  HKTodo(msg) -> concat_all([cache_byte_to_hex(2), cache_string_to_hex(msg)])
+}
+
+fn cache_hex_to_holekind(buf: String, pos: Int) : Option[CacheHKPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(1) -> match cache_hex_to_opt_string(buf, pos + 1) {
+      None -> None
+      Some(c) -> match c { COSP(nm, p) -> Some(CHKP(HKHole(nm), p)) }
+    }
+    Some(2) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(c) -> match c { CSP(msg, p) -> Some(CHKP(HKTodo(msg), p)) }
+    }
+    Some(_) -> None
+  }
+}
+
+fn cache_tyentry_to_hex2(e: TyEntry) : String =
+  concat_all([cache_string_to_hex(e.name), cache_scheme_to_hex(e.scheme)])
+
+fn cache_hex_to_tyentry(buf: String, pos: Int) : Option[CacheTEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> te_after_name(buf, p, nm) }
+  }
+}
+
+fn te_after_name(buf: String, pos: Int, nm: String) : Option[CacheTEPos] {
+  match cache_hex_to_scheme(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSchP(s, p) ->
+      Some(CTEP(TyEntry { name: nm, scheme: s }, p)) }
+  }
+}
+
+fn cache_tyentry_list_to_hex(xs: [TyEntry]) : String =
+  ct_len_prefixed(map(xs, (e) => cache_tyentry_to_hex2(e)))
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_hex_to_tyentry_list(buf: String, pos: Int) : Option[CacheTELPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_tyentries(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_tyentries(buf: String, pos: Int, remaining: Int,
+                         acc: [TyEntry]) : Option[CacheTELPos] {
+  if remaining <= 0 { Some(CTELP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_tyentry(buf, pos) {
+      None -> None
+      Some(c) -> match c { CTEP(e, p2) ->
+        ct_collect_tyentries(buf, p2, remaining - 1, [e, ...acc]) }
+    }
+  }
+}
+
+# RH(HoleKind, line, col, Ty, [TyEntry], env_fresh)
+
+#[doc("Serialise one `ResolvedHole` to its payload chunk.")]
+pub fn cache_rh_to_hex(h: ResolvedHole) : String = match h {
+  RH(kind, line, col, ty, scope, fresh) -> {
+    let schunks = map(scope, (e) => cache_tyentry_to_hex2(e))
+    concat_all([cache_holekind_to_hex(kind), cache_int_to_hex(line),
+                cache_int_to_hex(col), cache_tyr_to_hex(ty),
+                ct_len_prefixed(schunks), cache_int_to_hex(fresh)])
+  }
+}
+
+#[doc("Decode one `ResolvedHole` at `pos`.")]
+pub fn cache_hex_to_rh(buf: String, pos: Int) : Option[CacheRHPos] {
+  match cache_hex_to_holekind(buf, pos) {
+    None -> None
+    Some(c) -> match c { CHKP(k, p) -> rh_after_kind(buf, p, k) }
+  }
+}
+
+fn rh_after_kind(buf: String, pos: Int, k: HoleKind) : Option[CacheRHPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(line, p) -> rh_after_line(buf, p, k, line) }
+  }
+}
+
+fn rh_after_line(buf: String, pos: Int, k: HoleKind, line: Int) : Option[CacheRHPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(col, p) -> rh_after_col(buf, p, k, line, col) }
+  }
+}
+
+fn rh_after_col(buf: String, pos: Int, k: HoleKind, line: Int,
+                 col: Int) : Option[CacheRHPos] {
+  match cache_hex_to_tyr(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTyRP(ty, p) -> rh_after_ty(buf, p, k, line, col, ty) }
+  }
+}
+
+fn rh_after_ty(buf: String, pos: Int, k: HoleKind, line: Int, col: Int,
+                ty: Ty) : Option[CacheRHPos] {
+  match cache_hex_to_tyentry_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTELP(scope, p) -> rh_after_scope(buf, p, k, line, col, ty, scope) }
+  }
+}
+
+fn rh_after_scope(buf: String, pos: Int, k: HoleKind, line: Int, col: Int,
+                   ty: Ty, scope: [TyEntry]) : Option[CacheRHPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(fresh, p) ->
+      Some(CRHP(RH(k, line, col, ty, scope, fresh), p)) }
+  }
+}
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_rh_list_to_hex(xs: [ResolvedHole]) : String =
+  ct_len_prefixed(map(xs, (h) => cache_rh_to_hex(h)))
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_hex_to_rh_list(buf: String, pos: Int) : Option[CacheRHLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_rh(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_rh(buf: String, pos: Int, remaining: Int,
+                  acc: [ResolvedHole]) : Option[CacheRHLPos] {
+  if remaining <= 0 { Some(CRHLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_rh(buf, pos) {
+      None -> None
+      Some(c) -> match c { CRHP(h, p2) ->
+        ct_collect_rh(buf, p2, remaining - 1, [h, ...acc]) }
+    }
+  }
+}
+
+# ---- ResolvedRowHole --------------------------------------------------
+# RRH(name, line, col, fn_name, Row, body_row_labels)
+
+#[doc("Serialise one `ResolvedRowHole` to its payload chunk.")]
+pub fn cache_rrh_to_hex(h: ResolvedRowHole) : String = match h {
+  RRH(nm, line, col, fnm, row, body) -> {
+    let bchunks = map(body, (s) => cache_string_to_hex(s))
+    concat_all([cache_opt_string_to_hex(nm), cache_int_to_hex(line),
+                cache_int_to_hex(col), cache_string_to_hex(fnm),
+                cache_rowr_to_hex(row), ct_len_prefixed(bchunks)])
+  }
+}
+
+#[doc("Decode one `ResolvedRowHole` at `pos`.")]
+pub fn cache_hex_to_rrh(buf: String, pos: Int) : Option[CacheRRHPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(nm, p) -> rrh_after_name(buf, p, nm) }
+  }
+}
+
+fn rrh_after_name(buf: String, pos: Int, nm: Option[String]) : Option[CacheRRHPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(line, p) -> rrh_after_line(buf, p, nm, line) }
+  }
+}
+
+fn rrh_after_line(buf: String, pos: Int, nm: Option[String],
+                   line: Int) : Option[CacheRRHPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(col, p) -> rrh_after_col(buf, p, nm, line, col) }
+  }
+}
+
+fn rrh_after_col(buf: String, pos: Int, nm: Option[String], line: Int,
+                  col: Int) : Option[CacheRRHPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(fnm, p) -> rrh_after_fn(buf, p, nm, line, col, fnm) }
+  }
+}
+
+fn rrh_after_fn(buf: String, pos: Int, nm: Option[String], line: Int, col: Int,
+                 fnm: String) : Option[CacheRRHPos] {
+  match cache_hex_to_rowr(buf, pos) {
+    None -> None
+    Some(c) -> match c { CRowRP(row, p) -> rrh_after_row(buf, p, nm, line, col, fnm, row) }
+  }
+}
+
+fn rrh_after_row(buf: String, pos: Int, nm: Option[String], line: Int, col: Int,
+                  fnm: String, row: Row) : Option[CacheRRHPos] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSLP(body, p) ->
+      Some(CRRHP(RRH(nm, line, col, fnm, row, body), p)) }
+  }
+}
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_rrh_list_to_hex(xs: [ResolvedRowHole]) : String =
+  ct_len_prefixed(map(xs, (h) => cache_rrh_to_hex(h)))
+
+#[doc("KAB2 typed-codec helper.")]
+pub fn cache_hex_to_rrh_list(buf: String, pos: Int) : Option[CacheRRHLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_rrh(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_rrh(buf: String, pos: Int, remaining: Int,
+                   acc: [ResolvedRowHole]) : Option[CacheRRHLPos] {
+  if remaining <= 0 { Some(CRRHLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_rrh(buf, pos) {
+      None -> None
+      Some(c) -> match c { CRRHP(h, p2) ->
+        ct_collect_rrh(buf, p2, remaining - 1, [h, ...acc]) }
+    }
+  }
+}

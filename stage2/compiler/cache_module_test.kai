@@ -1,0 +1,91 @@
+#[doc("""
+In-memory round-trip gate for the per-module typed cache blob.
+
+A cache hit restores a `TypecheckedModule` instead of re-inferring it,
+and whole-program monomorph then consumes the restored typed decls. So
+`serialize(deserialize(serialize(m))) == serialize(m)` is the property
+that keeps the emitted C byte-identical between a cold build and a
+cache hit — a codec that drops a field, reorders a list, or loses a var
+id would silently change codegen.
+
+The gate is round-trip fidelity only. Interface *identity* (which
+modules a change propagates to) is the separate canonical-hash contract
+gated in `compiler.cache_delta_test`.
+""")]
+
+import compiler.ast
+import compiler.infer
+import compiler.cache
+import compiler.cache_ast
+import compiler.cache_typed
+import compiler.cache_module
+
+# The decoded value is unwrapped in two steps (`Some(c) -> match c`),
+# never `Some(Ctor(x, _))` in one — destructuring a constructor inside a
+# `Some` pattern panics under the stage1 bootstrap compiler.
+
+fn tm_empty_row() : Row = Row { labels: [], tail: None, display_alias: None }
+
+fn tm_sample_scheme() : TyScheme {
+  let body = TyFnT([TyVarT(4)], TyListT(TyVarT(4)), tm_empty_row())
+  Scheme([4], [], [], [], body)
+}
+
+fn tm_sample_decl() : Decl {
+  let int_ty = TypeExpr { tkind: TyName("Int", []), line: 1, col: 1 }
+  let body = Expr { kind: EInt(7), line: 1, col: 20, ty: Some(TyInt), mode: MUnknown }
+  DFn(true, "seven", [], [], Some(int_ty), REmpty, body, 1, 1, Some("m"))
+}
+
+fn tm_sample_typed() : TypedProgram {
+  let inst = RCS("map", 3, 9, [TyInt, TyString], [], Some("m"))
+  let hole = RH(HKHole(Some("h")), 5, 2, TyBool, [], 11)
+  let rowh = RRH(Some("e"), 6, 4, "run",
+                 Row { labels: [Label { eff: "Console", ty_args: [] }],
+                       tail: Some(2), display_alias: None },
+                 ["Console"])
+  let opr = OPR("run", "log", ["Console", "Logger"], "Console", None, false, 6, 8)
+  TypedProgram {
+    decls: [tm_sample_decl()], errs: 0, insts: [inst], holes: [hole],
+    row_holes: [rowh], core_len: 12, toplevel_len: 3,
+    module_doc: Some("module m"), diags: [], op_res: [opr]
+  }
+}
+
+fn tm_sample_delta() : ModuleEnvDelta = ModuleEnvDelta {
+  name: Some("m"),
+  ty_entries: [TyEntry { name: "singleton", scheme: tm_sample_scheme() }],
+  unions: [UI("Num", [TyInt, TyReal], 2, 1)],
+  op_eff_arities: [OEA("log", 1)],
+  recs: [RI("Pt", ["T"],
+            [FD(true, "x", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }, [])],
+            Some("m"))],
+  sums: [SI("Color", [], [Var("Red", []), Var("Green", [])], Some("m"))],
+  op_to_eff: [OEFP("log", "Console")],
+  unit_aliases: [UAE("hz", UMul(UOne, UInv(USym("s"))))],
+  constructors: [CtorE("Color", "m", "Red")]
+}
+
+fn tm_roundtrip_report(blob1: String, m2: TypecheckedModule) : String {
+  let blob2 = cache_serialize_tcmodule(m2, tm_header_sha("0000000000000000"))
+  if string_length(blob1) != string_length(blob2) {
+    concat_all(["FAIL: typed-module blob length differs: ",
+                int_to_string(string_length(blob1)), " vs ",
+                int_to_string(string_length(blob2))])
+  } else if blob1 != blob2 { "FAIL: typed-module blob content differs" }
+  else {
+    concat_all(["OK typed module round-trip; blob=",
+                int_to_string(string_length(blob1)), " bytes"])
+  }
+}
+
+#[doc("Round-trip gate for the per-module typed blob: serialise a synthetic `TypecheckedModule`, restore it, re-serialise, and report whether the two blobs match. Returns \"OK ...\" or \"FAIL: ...\".")]
+pub fn cache_module_roundtrip_test() : String {
+  let m = TypecheckedModule { typed: tm_sample_typed(), delta: tm_sample_delta() }
+  let sha = tm_header_sha("0000000000000000")
+  let blob1 = cache_serialize_tcmodule(m, sha)
+  match cache_deserialize_tcmodule(blob1) {
+    None -> "FAIL: typed-module deserialize returned None"
+    Some(m2) -> tm_roundtrip_report(blob1, m2)
+  }
+}

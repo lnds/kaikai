@@ -1,0 +1,195 @@
+#[doc("""
+The per-module typed cache blob: a `TypecheckedModule` (its
+`TypedProgram` contribution plus the `ModuleEnvDelta` it exports)
+serialized whole, keyed by content so a rebuild restores it instead of
+re-inferring the module.
+
+The soundness contract is round-trip fidelity: a restored module must
+feed whole-program monomorph exactly what a fresh infer would, so the
+emitted C is byte-identical whether the module was inferred or loaded.
+Interface *identity* — which modules a change propagates to — is the
+separate canonical-hash contract in `compiler.cache_delta`.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.cache
+import compiler.cache_ast
+import compiler.infer
+import compiler.cache_delta
+import compiler.cache_typed
+import compiler.cache_typedprog
+import compiler.cache_delta_io
+import compiler.user_cache
+
+#[doc("Bump on any change to the typed-module key derivation or blob layout so entries written by an older compiler miss instead of being reinterpreted. Distinct from the KAB2 codec format_version and from `uc_key_version`.")]
+pub fn uc_typed_key_version() : Int = 1
+
+fn cm_len_prefixed(chunks: [String]) : String =
+  concat_all([cache_u32_to_hex(list_length(chunks)), concat_all(chunks)])
+
+# ---- ModuleEnvDelta ---------------------------------------------------
+# Fields in declaration order: name + the 8 tables. Original ids and
+# original table order — fidelity, not canonical form.
+
+#[doc("Serialise a whole `ModuleEnvDelta` faithfully (original var ids, original table order) so a restored delta seeds an importer's typer env exactly as the fresh one would.")]
+pub fn cache_mdelta_to_hex(d: ModuleEnvDelta) : String =
+  concat_all([cache_opt_string_to_hex(d.name),
+              cm_len_prefixed(map(d.ty_entries, (e) => cache_tyentry_to_hex(e))),
+              cm_len_prefixed(map(d.unions, (u) => cache_unioninfo_to_hex(u))),
+              cm_len_prefixed(map(d.op_eff_arities, (a) => cache_opeffarity_to_hex(a))),
+              cm_len_prefixed(map(d.recs, (r) => cache_recinfo_to_hex(r))),
+              cm_len_prefixed(map(d.sums, (s) => cache_suminfo_to_hex(s))),
+              cm_len_prefixed(map(d.op_to_eff, (o) => cache_optoeff_to_hex(o))),
+              cm_len_prefixed(map(d.unit_aliases, (u) => cache_ualias_to_hex(u))),
+              cm_len_prefixed(map(d.constructors, (c) => cache_ctorentry_to_hex(c)))])
+
+# Decoded through one-step continuations; the record is assembled at the
+# last step so no function carries the whole nine-level nest.
+type MDAcc = MDA(Option[String], [TyEntry], [UnionInfo], [OpEffArity], [RecInfo])
+
+#[doc("Decode a `ModuleEnvDelta` payload chunk at `pos`; the second slot is the cursor past the consumed bytes.")]
+pub fn cache_hex_to_mdelta(buf: String, pos: Int) : Option[CacheMDPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(nm, p) -> md_after_name(buf, p, nm) }
+  }
+}
+
+fn md_after_name(buf: String, pos: Int, nm: Option[String]) : Option[CacheMDPos] {
+  match cache_hex_to_tyentry_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTELP(es, p) -> md_after_entries(buf, p, nm, es) }
+  }
+}
+
+fn md_after_entries(buf: String, pos: Int, nm: Option[String],
+                     es: [TyEntry]) : Option[CacheMDPos] {
+  match cache_hex_to_unioninfo_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CUILP(us, p) -> md_after_unions(buf, p, nm, es, us) }
+  }
+}
+
+fn md_after_unions(buf: String, pos: Int, nm: Option[String], es: [TyEntry],
+                    us: [UnionInfo]) : Option[CacheMDPos] {
+  match cache_hex_to_opeffarity_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { COEALP(as_, p) -> md_after_arities(buf, p, nm, es, us, as_) }
+  }
+}
+
+fn md_after_arities(buf: String, pos: Int, nm: Option[String], es: [TyEntry],
+                     us: [UnionInfo], as_: [OpEffArity]) : Option[CacheMDPos] {
+  match cache_hex_to_recinfo_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CRILP2(rs, p) ->
+      md_after_recs(buf, p, MDA(nm, es, us, as_, rs)) }
+  }
+}
+
+fn md_after_recs(buf: String, pos: Int, a: MDAcc) : Option[CacheMDPos] {
+  match cache_hex_to_suminfo_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSILP(ss, p) -> md_after_sums(buf, p, a, ss) }
+  }
+}
+
+fn md_after_sums(buf: String, pos: Int, a: MDAcc, ss: [SumInfo]) : Option[CacheMDPos] {
+  match cache_hex_to_optoeff_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { COTELP(os, p) -> md_after_optoeff(buf, p, a, ss, os) }
+  }
+}
+
+fn md_after_optoeff(buf: String, pos: Int, a: MDAcc, ss: [SumInfo],
+                     os: [OpToEff]) : Option[CacheMDPos] {
+  match cache_hex_to_ualias_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CUAELP(uas, p) -> md_after_ualias(buf, p, a, ss, os, uas) }
+  }
+}
+
+fn md_after_ualias(buf: String, pos: Int, a: MDAcc, ss: [SumInfo], os: [OpToEff],
+                    uas: [UAliasEntry]) : Option[CacheMDPos] {
+  match cache_hex_to_ctorentry_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CCELP(cs, p) ->
+      Some(CMDP(md_assemble(a, ss, os, uas, cs), p)) }
+  }
+}
+
+fn md_assemble(a: MDAcc, ss: [SumInfo], os: [OpToEff], uas: [UAliasEntry],
+                cs: [CtorEntry]) : ModuleEnvDelta = match a {
+  MDA(nm, es, us, ars, rs) -> ModuleEnvDelta {
+    name: nm, ty_entries: es, unions: us, op_eff_arities: ars, recs: rs,
+    sums: ss, op_to_eff: os, unit_aliases: uas, constructors: cs
+  }
+}
+
+# ---- TypecheckedModule ------------------------------------------------
+
+#[doc("Serialise a `TypecheckedModule` — its typed program then its exported delta.")]
+pub fn cache_tcmodule_to_hex(m: TypecheckedModule) : String =
+  concat_all([cache_typedprog_to_hex(m.typed), cache_mdelta_to_hex(m.delta)])
+
+#[doc("Decode a `TypecheckedModule` payload chunk at `pos`.")]
+pub fn cache_hex_to_tcmodule(buf: String, pos: Int) : Option[CacheTCMPos] {
+  match cache_hex_to_typedprog(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTPP(tp, p) -> tcm_after_typed(buf, p, tp) }
+  }
+}
+
+fn tcm_after_typed(buf: String, pos: Int, tp: TypedProgram) : Option[CacheTCMPos] {
+  match cache_hex_to_mdelta(buf, pos) {
+    None -> None
+    Some(c) -> match c { CMDP(d, p) ->
+      Some(CTCMP(TypecheckedModule { typed: tp, delta: d }, p)) }
+  }
+}
+
+# ---- blob + key -------------------------------------------------------
+#
+# The key is `hash(module decls) + hash(inherited interface) +
+# hash(cross-module tables)`. The third term is the conservative cut:
+# effect aliases, transparent type aliases and `proto_impls` are threaded
+# around the modular fold, so a change to any of them can alter an
+# importer's inference even when every delta is unchanged. Hashing them
+# into every module's key over-invalidates rather than risking a stale
+# interface — the one unsound failure mode.
+
+#[doc("Serialise a `TypecheckedModule` into a KAB2 blob under the given 64-char key sha.")]
+pub fn cache_serialize_tcmodule(m: TypecheckedModule, key_sha: String) : String =
+  concat_all([cache_file_header(key_sha), cache_tcmodule_to_hex(m)])
+
+#[doc("Deserialise a KAB2 typed-module blob; `None` on any header or payload mismatch, which the caller treats as a miss.")]
+pub fn cache_deserialize_tcmodule(buf: String) : Option[TypecheckedModule] {
+  match cache_read_header(buf) {
+    None -> None
+    Some(chdr) -> match chdr { CHdr(_, payload_pos) ->
+      match cache_hex_to_tcmodule(buf, payload_pos) {
+        None -> None
+        Some(c) -> match c { CTCMP(m, _) -> Some(m) }
+      }
+    }
+  }
+}
+
+#[doc("Content hash of one module's decl stream — the `source changed` term of the typed-module key. Taken over the serialized decls rather than the source text, so a formatting-only edit that parses identically still hits.")]
+pub fn tm_decls_hex(ds: [Decl]) : String =
+  uc_content_hex(cache_decl_list_to_hex(ds))
+
+#[doc("The typed-module cache key as 16 hex chars: the module's own decls, the interface it inherits, and the cross-module tables, folded together with the key-version stamp.")]
+pub fn tm_key_hex(decls_hex: String, iface_hex: String, xmod_hex: String) : String =
+  uc_content_hex(concat_all([decls_hex, ":", iface_hex, ":", xmod_hex, ":",
+                             int_to_string(uc_typed_key_version())]))
+
+#[doc("The 64-char header sha for a typed-module blob: the key padded out, so a blob renamed onto a different key still fails the header check.")]
+pub fn tm_header_sha(key_hex: String) : String =
+  concat_all([key_hex, key_hex,
+              "00000000000000000000000000000000"])
+
+#[doc("Path of the typed-module blob for a key inside the given cache directory.")]
+pub fn tm_blob_path(cache_dir: String, key_hex: String) : String =
+  concat_all([cache_dir, "/tm-", key_hex, ".kab"])
