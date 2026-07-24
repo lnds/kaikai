@@ -67,7 +67,39 @@ fn main() : Unit / Stdout = {
 ```
 
 Derivable: Show, Eq, Ord, Hash, BinSerialize (partial — see
-`docs/binserialize-collections-design.md`).
+`docs/binserialize-collections-design.md`), Layout (records of
+`U<N><be|le>` fields — `kai info kinds`), Json.
+
+`#[derive(Json)]` binds a record to the JSON DOM: it generates
+`to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
+Result[T, JsonError]` entry point.
+
+```kaikai
+import encoding.json.{json_decode, json_encode}
+
+#[derive(Json)]
+type Person = { name: String, age: Int, nick: Option[String] }
+
+fn main() : Unit / Stdout = {
+  let p = Person { name: "ana", age: 30, nick: None }
+  Stdout.print(json_encode(to_json(p)))
+  match json_decode("{\"name\":\"bo\",\"age\":7}") {
+    None -> Stdout.print("bad json")
+    Some(v) -> match person_of_json(v, "") {
+      Ok(q)  -> Stdout.print(q.name)
+      Err(e) -> Stdout.print(json_error_show(e))
+    }
+  }
+}
+```
+
+Field names go to the wire verbatim — no case conversion. An
+`Option[T]` field accepts an explicit `null` and a missing key alike,
+both decoding to `None`; every other field is required. Keys the record
+does not declare are ignored. A failure carries the JSON path to the
+offending node (`address.boxes[2].zip: expected String, got Number`).
+Sum types are not derivable: a tagged-union encoding is a convention
+the derive does not pick for you. See `docs/json-derive-design.md`.
 
 ## NOT IN KAIKAI
 

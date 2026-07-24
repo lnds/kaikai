@@ -352,7 +352,8 @@ typedef enum {
 #define KAI_PROTO_REM          11
 #define KAI_PROTO_NUMERIC      12
 #define KAI_PROTO_LAYOUT       13
-#define KAI_USER_PROTO_ID_BASE 14
+#define KAI_PROTO_JSON         14
+#define KAI_USER_PROTO_ID_BASE 15
 
 /* Operation index within a protocol (declaration order in
  * stdlib/protocols.kai). The impl table keys on (proto_id, op_id, head_tag):

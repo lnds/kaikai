@@ -1,0 +1,219 @@
+#[doc("""
+compiler.json_derive - the `#[derive(Json)]` impl builder.
+
+Emits `impl Json for T { fn to_json(self) ... fn of_json(v, path) ... }`
+for a record, plus a `<lower(T)>_of_json` shim (single dispatch cannot
+route on a return type; same rationale as BinSerialize's and Layout's).
+
+`to_json` builds a `JObj` whose keys are the kaikai field names verbatim.
+`of_json` reads each key back through the `json_bind_*` leaf readers in
+`stdlib/json_bind.kai`, threading the JSON path so a failure names the
+node it happened at. The absent/required and unknown-key policies live
+in those readers, not here — the emitted code only picks which reader a
+field's type calls for, and `compiler.json_shape` is what decides which
+one that is.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.json_shape
+
+fn jd_expr(k: ExprKind, line: Int, col: Int) : Expr = mk_expr(k, line, col)
+fn jd_var(n: String, line: Int, col: Int) : Expr = jd_expr(EVar(n), line, col)
+
+fn jd_call(callee: String, targs: [Expr], line: Int, col: Int) : Expr =
+  jd_expr(ECall(jd_var(callee, line, col), targs), line, col)
+
+# `EStr` carries the raw source span, quotes included.
+fn jd_str(s: String, line: Int, col: Int) : Expr =
+  jd_expr(EStr(concat_all(["\"", s, "\""]), false), line, col)
+
+fn jd_ty(n: String, targs: [TypeExpr], line: Int, col: Int) : TypeExpr =
+  mk_ty(TyName(n, targs), line, col)
+
+fn jd_param(name: String, ty: TypeExpr, line: Int, col: Int) : Param =
+  Param { pname: name, ptype: Some(ty), pline: line, pcol: col, pborrow: false }
+
+fn jd_result_ty(tname: String, line: Int, col: Int) : TypeExpr =
+  jd_ty("Result", [jd_ty(tname, [], line, col),
+                   jd_ty("JsonError", [], line, col)], line, col)
+
+#[doc("The `#[derive(Json)]` decls for `type T = { .. }`: the protocol impl plus the `of_json` shim. Empty when the body is not a record of JSON-bindable fields.")]
+pub fn derive_json_impl(tname: String, body: TypeBody,
+                        line: Int, col: Int) : [Decl] = match body {
+  TBRecord(fields) -> match jd_fields_of(fields) {
+    Some(jfs) -> match jfs {
+      []  -> []
+      _   -> [jd_impl(tname, jfs, line, col), jd_shim(tname, line, col)]
+    }
+    None -> []
+  }
+  _ -> []
+}
+
+# ASCII lowercaser for the shim name. Local rather than shared with
+# `protos` because this module precedes it in the bundle.
+fn jd_lower(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc } else { match char_at(s, i) {
+    None -> acc
+    Some(c) -> {
+      let nc = char_to_int(c)
+      let lc = if nc >= 65 and nc <= 90 { int_to_char(nc + 32) } else { c }
+      jd_lower(s, i + 1, n, string_concat(acc, "#{lc}"))
+    }
+  } }
+
+fn jd_shim_name(tname: String) : String =
+  concat_all([jd_lower(tname, 0, string_length(tname), ""), "_of_json"])
+
+fn jd_impl(tname: String, jfs: [JsonField], line: Int, col: Int) : Decl {
+  let self_ty = jd_ty(tname, [], line, col)
+  let str_ty = jd_ty("String", [], line, col)
+  let json_ty = jd_ty("JsonValue", [], line, col)
+  let to_params = [jd_param("self", self_ty, line, col)]
+  let of_params = [jd_param("v", json_ty, line, col),
+                   jd_param("path", str_ty, line, col)]
+  let to_method = DFn(false, "to_json", [], to_params, Some(json_ty), REmpty,
+                      jd_to_json_body(jfs, line, col), line, col, None)
+  let of_method = DFn(false, "of_json", [], of_params,
+                      Some(jd_result_ty(tname, line, col)), REmpty,
+                      jd_of_json_body(tname, jfs, line, col), line, col, None)
+  DImpl("Json", [], self_ty, [to_method, of_method], line, col)
+}
+
+# `fn <lower(T)>_of_json(v, path)` — the non-overloaded entry point.
+# Single dispatch picks the impl from the first argument, which here is
+# the DOM node, so the user cannot call `of_json` directly.
+fn jd_shim(tname: String, line: Int, col: Int) : Decl {
+  let params = [jd_param("v", jd_ty("JsonValue", [], line, col), line, col),
+                jd_param("path", jd_ty("String", [], line, col), line, col)]
+  let mangled = concat_all(["__pimpl_Json_", tname, "_of_json"])
+  let body = jd_call(mangled, [jd_var("v", line, col), jd_var("path", line, col)],
+                     line, col)
+  DFn(true, jd_shim_name(tname),
+      [], params, Some(jd_result_ty(tname, line, col)), REmpty, body, line, col, None)
+}
+
+# ---- to_json -------------------------------------------------------
+#
+# `JObj([Pair { fst: "<name>", snd: <encode(self.<name>)> }, ...])` in
+# declaration order. Keys are the kaikai field names verbatim: the wire
+# name is what the type says, with no case conversion.
+
+fn jd_to_json_body(jfs: [JsonField], line: Int, col: Int) : Expr =
+  jd_call("JObj", [jd_expr(EList(jd_pairs(jfs, line, col)), line, col)], line, col)
+
+fn jd_pairs(jfs: [JsonField], line: Int, col: Int) : [ListElem] = match jfs {
+  [] -> []
+  [f, ...rest] -> match f {
+    JF(name, shape) -> {
+      let read = jd_expr(EField(jd_var("self", line, col), name), line, col)
+      let pair = jd_expr(ERecordLit("Pair",
+                   [FI("fst", jd_str(name, line, col)),
+                    FI("snd", jd_encode(shape, read, line, col))]), line, col)
+      [ElPlain(pair), ...jd_pairs(rest, line, col)]
+    }
+  }
+}
+
+fn jd_encode(shape: JsonShape, v: Expr, line: Int, col: Int) : Expr = match shape {
+  JSStr  -> jd_call("JStr", [v], line, col)
+  JSInt  -> jd_call("JNum", [v], line, col)
+  JSReal -> jd_call("JReal", [v], line, col)
+  JSBool -> jd_call("JBool", [v], line, col)
+  JSRecord(rt) -> jd_call(concat_all(["__pimpl_Json_", rt, "_to_json"]), [v], line, col)
+  JSList(inner) -> jd_call("json_of_list", [v, jd_encoder_fn(inner, line, col)], line, col)
+  JSOpt(inner)  -> jd_call("json_of_opt", [v, jd_encoder_fn(inner, line, col)], line, col)
+}
+
+# The element encoder a list / option hands to its combinator: `(x) =>
+# <encode(x)>`, so the same `jd_encode` covers nesting to any depth.
+fn jd_encoder_fn(shape: JsonShape, line: Int, col: Int) : Expr {
+  let p = Param { pname: "x", ptype: None, pline: line, pcol: col, pborrow: false }
+  jd_expr(ELambda([p], jd_encode(shape, jd_var("x", line, col), line, col)), line, col)
+}
+
+# ---- of_json -------------------------------------------------------
+#
+# An object check, then a match tower with one arm per field: read the
+# key, bind it or return the located error, then build the record from
+# the bound names. Absence and unknown keys are the readers' business —
+# the tower only threads paths. The object check comes first so a node
+# of the wrong shape reports as itself instead of as every field
+# going missing at once.
+
+fn jd_of_json_body(tname: String, jfs: [JsonField], line: Int, col: Int) : Expr {
+  let guard = jd_call("json_bind_object",
+                [jd_var("v", line, col), jd_var("path", line, col)], line, col)
+  let ok_arm = Arm(mk_pat(PVariant("Ok", [mk_pat(PWild, line, col)]), line, col),
+                   None, jd_tower(tname, jfs, [], line, col))
+  let err_arm = Arm(mk_pat(PVariant("Err", [mk_pat(PBind("e"), line, col)]),
+                           line, col), None,
+                    jd_call("Err", [jd_var("e", line, col)], line, col))
+  jd_expr(EMatch(guard, [ok_arm, err_arm]), line, col)
+}
+
+fn jd_tower(tname: String, jfs: [JsonField], bound: [String],
+            line: Int, col: Int) : Expr = match jfs {
+  [] -> jd_call("Ok", [jd_record(tname, list_reverse(bound), line, col)], line, col)
+  [f, ...rest] -> match f {
+    JF(name, shape) -> {
+      let node = jd_call("json_bind_field",
+                   [jd_var("v", line, col), jd_str(name, line, col)], line, col)
+      let sub = jd_call("json_path_field",
+                  [jd_var("path", line, col), jd_str(name, line, col)], line, col)
+      let read = jd_decode(shape, node, sub, line, col)
+      let ok_arm = Arm(mk_pat(PVariant("Ok", [mk_pat(PBind(name), line, col)]),
+                              line, col), None,
+                       jd_tower(tname, rest, [name, ...bound], line, col))
+      let err_arm = Arm(mk_pat(PVariant("Err", [mk_pat(PBind("e"), line, col)]),
+                               line, col), None,
+                        jd_call("Err", [jd_var("e", line, col)], line, col))
+      jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
+    }
+  }
+}
+
+fn jd_decode(shape: JsonShape, node: Expr, path: Expr,
+             line: Int, col: Int) : Expr = match shape {
+  JSStr  -> jd_call("json_bind_string", [node, path], line, col)
+  JSInt  -> jd_call("json_bind_int", [node, path], line, col)
+  JSReal -> jd_call("json_bind_real", [node, path], line, col)
+  JSBool -> jd_call("json_bind_bool", [node, path], line, col)
+  JSRecord(rt) ->
+    jd_call(jd_shim_name(rt), [node, path], line, col)
+  JSList(inner) ->
+    jd_call("json_bind_list", [node, path, jd_decoder_fn(inner, line, col)], line, col)
+  JSOpt(inner) -> jd_opt_decode(inner, node, path, line, col)
+}
+
+# The optional readers are per-leaf so `null` short-circuits before the
+# leaf's shape check; a nested record or list under `Option` has no
+# dedicated reader, so it goes through the generic combinator instead.
+fn jd_opt_decode(inner: JsonShape, node: Expr, path: Expr,
+                 line: Int, col: Int) : Expr = match inner {
+  JSStr  -> jd_call("json_bind_opt_string", [node, path], line, col)
+  JSInt  -> jd_call("json_bind_opt_int", [node, path], line, col)
+  JSReal -> jd_call("json_bind_opt_real", [node, path], line, col)
+  JSBool -> jd_call("json_bind_opt_bool", [node, path], line, col)
+  JSList(elem) ->
+    jd_call("json_bind_opt_list", [node, path, jd_decoder_fn(elem, line, col)], line, col)
+  _ -> jd_call("json_bind_opt", [node, path, jd_decoder_fn(inner, line, col)], line, col)
+}
+
+# The element decoder a list hands to its combinator: `(x, p) =>
+# <decode(x, p)>`, taking the per-element path the combinator built.
+fn jd_decoder_fn(shape: JsonShape, line: Int, col: Int) : Expr {
+  let px = Param { pname: "x", ptype: None, pline: line, pcol: col, pborrow: false }
+  let pp = Param { pname: "p", ptype: None, pline: line, pcol: col, pborrow: false }
+  let body = jd_decode(shape, jd_var("x", line, col), jd_var("p", line, col), line, col)
+  jd_expr(ELambda([px, pp], body), line, col)
+}
+
+fn jd_record(tname: String, names: [String], line: Int, col: Int) : Expr =
+  jd_expr(ERecordLit(tname, jd_field_inits(names, line, col)), line, col)
+
+fn jd_field_inits(names: [String], line: Int, col: Int) : [FieldInit] = match names {
+  [] -> []
+  [n, ...rest] -> [FI(n, jd_var(n, line, col)), ...jd_field_inits(rest, line, col)]
+}

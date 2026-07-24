@@ -283,6 +283,7 @@ stdlib/
     url.kai      pure URL parsing (planned — folded into http.kai parser today)
     http.kai     (shipped, client only — `http_get/post/put/delete/request`; uses NetTcp + Cancel; still uses libc `getaddrinfo` via NetTcp.connect's implicit path — splitting resolve→connect onto NetDns is the #352 follow-up, not yet done)
   encoding/      pure, stage 2
+    json_bind.kai (shipped — the JSON DOM + the `#[derive(Json)]` runtime; `encoding.json` imports it)
     json.kai     (shipped — Real number parsing landed via #361, surrogate-pair UTF-8 via #362)
     utf8.kai     (planned — no tracking issue)
     base64.kai   (shipped)
@@ -514,6 +515,7 @@ manutara's first design pass exercises them.
 ### encoding (pure, stage 2)
 
 - `encoding.json` — `encode`, `decode` *(shipped — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`; surrogate-pair `\uD8xx\uDCxx` decode + UTF-8 emit via #362)*
+- `#[derive(Json)]` — typed struct binding over the same DOM *(shipped: `to_json` / `<lower(T)>_of_json` for records; field names verbatim, `Option` accepts null-or-missing, unknown keys ignored, failures are `Result[T, JsonError]` carrying the JSON path. `protocol Json` in `stdlib/protocols.kai`; `JsonValue` / `JsonError` / runtime in `stdlib/encoding/json_bind.kai`, kept out of the core so `JNull` does not offset every binary's RC baseline. See `docs/json-derive-design.md`.)*
 - `encoding.toml` — `decode`, `encode`, `round_trip` *(shipped subset for the package manager (#405): top-level scalars, `[name]` and `[[name]]` headers, basic strings, ints/bools, inline tables, comments. Encoder emits a canonical form so `kai.lock` round-trips byte-identical. Floats / datetimes / dotted keys / multi-line strings deferred until a user-facing TOML need lands.)*
 - `encoding.utf8` — `validate`, `decode`, `encode`, `chars` *(planned — no `stdlib/encoding/utf8.kai` file)*
 - `encoding.base64` — `encode`, `decode` (standard + URL-safe) *(shipped)*

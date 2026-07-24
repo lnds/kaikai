@@ -94,6 +94,8 @@ import compiler.modules
 import compiler.infer
 import compiler.layout_derive
 import compiler.layout_validate
+import compiler.json_shape
+import compiler.json_derive
 
 # ====================================================================
 # Law wrappers (`laws <Theory>` / `axiom <Theory>`).
@@ -1497,6 +1499,8 @@ fn derive_impl_for_protocol(pname: String, tname: String, body: TypeBody,
     derive_binserialize_impl(tname, body, line, col)
   } else if pname == "Layout" {
     derive_layout_impl(tname, body, line, col)
+  } else if pname == "Json" {
+    derive_json_impl(tname, body, line, col)
   } else {
     []
   }
@@ -2963,6 +2967,92 @@ fn validate_derive_layout_one(file: String, tname: String, fd: FieldDecl,
   } else { errs }
 }
 
+# Pre-expansion validator for `#[derive(Json)]`. Same shape as the
+# Layout one: `derive_json_impl` returns no decls when a field has no
+# JSON denotation, so without this pass the omission surfaces only as a
+# missing `to_json` at the first call site.
+fn validate_derive_json(decls: [Decl], file: String) : Int / Console =
+  validate_derive_json_loop(decls, file, 0)
+
+fn validate_derive_json_loop(decls: [Decl], file: String,
+                              errs: Int) : Int / Console {
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, _, body, line, col, _, _) ->
+          if list_has(names, "Json") {
+            let errs1 = validate_derive_json_body(file, tname, body, line, col, errs)
+            validate_derive_json_loop(rest, file, errs1)
+          } else {
+            validate_derive_json_loop(rest, file, errs)
+          }
+        _ -> validate_derive_json_loop(rest, file, errs)
+      }
+      DUnstable(inner, _, _) ->
+        validate_derive_json_loop([inner, ...rest], file, errs)
+      DProtoLaws(_, inner, _, _) ->
+        validate_derive_json_loop([inner, ...rest], file, errs)
+      DImplAxiom(_, inner, _, _) ->
+        validate_derive_json_loop([inner, ...rest], file, errs)
+      DConstructor(inner, _, _) ->
+        validate_derive_json_loop([inner, ...rest], file, errs)
+      _ -> validate_derive_json_loop(rest, file, errs)
+    }
+  }
+}
+
+fn validate_derive_json_body(file: String, tname: String, body: TypeBody,
+                              line: Int, col: Int, errs: Int) : Int / Console {
+  match body {
+    TBRecord(fields) -> match fields {
+      [] -> {
+        eprint(concat_all([
+          file, ":", int_to_string(line), ":", int_to_string(col),
+          ": error: cannot `#[derive(Json)]` for `", tname,
+          "`: a Json record needs at least one field"]))
+        errs + 1
+      }
+      _ -> validate_derive_json_fields(file, tname, fields, line, col, errs)
+    }
+    _ -> {
+      eprint(concat_all([
+        file, ":", int_to_string(line), ":", int_to_string(col),
+        ": error: cannot `#[derive(Json)]` for `", tname,
+        "`: Json applies to records, not sum types (a tagged-union encoding is a separate choice)"]))
+      errs + 1
+    }
+  }
+}
+
+fn validate_derive_json_fields(file: String, tname: String, fields: [FieldDecl],
+                                line: Int, col: Int, errs: Int) : Int / Console {
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> {
+      let errs1 = validate_derive_json_one(file, tname, fd, line, col, errs)
+      validate_derive_json_fields(file, tname, rest, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_json_one(file: String, tname: String, fd: FieldDecl,
+                             line: Int, col: Int, errs: Int) : Int / Console {
+  match fd {
+    FD(_, fname, ftype) -> match json_field_reject(ftype) {
+      None -> errs
+      Some(why) -> {
+        eprint(concat_all([
+          file, ":", int_to_string(line), ":", int_to_string(col),
+          ": error: cannot `#[derive(Json)]` for `", tname,
+          "`: field `", fname, "` of type `", json_head_name(ftype),
+          "` is not JSON-bindable: ", why]))
+        errs + 1
+      }
+    }
+  }
+}
+
 # `TyList(elem)` and `Option[elem]` are valid only when `elem` is
 # itself a builtin, a collection (recursive case for `[[Foo]]`), or a
 # provider in scope. Anything else is reported as missing — but the
@@ -3203,7 +3293,8 @@ pub fn lower_protocols(decls: [Decl], file: String,
   # naming the offending field/payload.
   let derive_errs = validate_derive_ord(decls, file) +
                     validate_derive_binserialize(decls, file) +
-                    validate_derive_layout(decls, file)
+                    validate_derive_layout(decls, file) +
+                    validate_derive_json(decls, file)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
