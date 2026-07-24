@@ -96,6 +96,8 @@ type PExpr   = { p: Parser, r: Option[Expr] }
 type PStmt   = { p: Parser, r: Option[Stmt] }
 type PPat    = { p: Parser, r: Option[Pattern] }
 type PTy     = { p: Parser, r: Option[TypeExpr] }
+type PFAttrs = { p: Parser, r: Option[[FieldAttr]] }
+type PFAttr  = { p: Parser, r: Option[FieldAttr] }
 type PDecl   = { p: Parser, r: Option[Decl], bounds: [FnTPBound] }
 type PArm    = { p: Parser, r: Option[Arm] }
 type PParam  = { p: Parser, r: Option[Param] }
@@ -5289,7 +5291,7 @@ fn validate_extern_struct_decl(name: String, fields: [FieldDecl],
                                p: Parser, t: Token) : PDecl / Console {
   match first_non_c_field(fields) {
     Some(fd) -> match fd {
-      FD(_, fname, fty) -> {
+      FD(_, fname, fty, _) -> {
         let msg = concat_all([
           "`extern \"C\" type ", name, "` field `", fname,
           "` has type `", type_surface(fty),
@@ -5306,7 +5308,7 @@ fn first_non_c_field(fields: [FieldDecl]) : Option[FieldDecl] {
   match fields {
     [] -> None
     [fd, ...rest] -> match fd {
-      FD(_, _, fty) ->
+      FD(_, _, fty, _) ->
         if is_c_field_type(fty) { first_non_c_field(rest) }
         else { Some(fd) }
     }
@@ -7705,41 +7707,143 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
   if p_at(p0, TkRbrace) {
     ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots))
   } else {
-    # Optional `priv` qualifier marks the field private to the
-    # declaring module. Default visibility for record fields is
-    # public (record fields are the value's representation, not
-    # its API — the module is the unit of encapsulation in kaikai;
-    # the record is the unit of representation). Marking `priv`
-    # is the opt-out used when a field carries an invariant the
-    # module wants to enforce — e.g. `Map.root: Tree` where `Tree`
-    # is private to the `map` module.
-    let field_is_pub = not tk_is(p_peek(p0).kind, TkPriv)
-    let p_after_priv = if field_is_pub { p0 } else { p_advance(p0) }
-    let ft = p_peek(p_after_priv)
-    if not tk_is(ft.kind, TkIdent) {
-      err_d(p_error(p_after_priv, ft, "expected field name in record type"))
-    } else {
-      let fname = tok_source(p_after_priv.src, ft)
-      let p1 = p_advance(p_after_priv)
-      if not p_at(p1, TkColon) {
-        err_d(p_error_here(p1, "expected `:` after field name"))
-      } else {
-        let rt = parse_type(p_advance(p1))
-        match rt.r {
-          None -> err_d(rt.p)
-          Some(ty) -> {
-            let fd = FD(field_is_pub, fname, ty)
-            let p2 = p_skip_newlines(rt.p)
-            if p_at(p2, TkComma) {
-              parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, slots, t)
-            } else if p_at(p2, TkRbrace) {
-              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots))
-            } else {
-              err_d(p_error_here(p2, "expected `,` or `}` in record type"))
+    # A field may carry zero or more `#[json(...)]` overrides before its
+    # `priv`/name; they parse to `[FieldAttr]` on the FieldDecl.
+    let fa = parse_field_attrs(p0, [])
+    match fa.r {
+      None -> err_d(fa.p)
+      Some(attrs) -> {
+        let pa = p_skip_newlines(fa.p)
+        # Optional `priv` qualifier marks the field private to the
+        # declaring module. Default visibility for record fields is
+        # public (record fields are the value's representation, not
+        # its API — the module is the unit of encapsulation in kaikai;
+        # the record is the unit of representation). Marking `priv`
+        # is the opt-out used when a field carries an invariant the
+        # module wants to enforce — e.g. `Map.root: Tree` where `Tree`
+        # is private to the `map` module.
+        let field_is_pub = not tk_is(p_peek(pa).kind, TkPriv)
+        let p_after_priv = if field_is_pub { pa } else { p_advance(pa) }
+        let ft = p_peek(p_after_priv)
+        if not tk_is(ft.kind, TkIdent) {
+          err_d(p_error(p_after_priv, ft, "expected field name in record type"))
+        } else {
+          let fname = tok_source(p_after_priv.src, ft)
+          let p1 = p_advance(p_after_priv)
+          if not p_at(p1, TkColon) {
+            err_d(p_error_here(p1, "expected `:` after field name"))
+          } else {
+            let rt = parse_type(p_advance(p1))
+            match rt.r {
+              None -> err_d(rt.p)
+              Some(ty) -> {
+                let fd = FD(field_is_pub, fname, ty, attrs)
+                let p2 = p_skip_newlines(rt.p)
+                if p_at(p2, TkComma) {
+                  parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, slots, t)
+                } else if p_at(p2, TkRbrace) {
+                  ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots))
+                } else {
+                  err_d(p_error_here(p2, "expected `,` or `}` in record type"))
+                }
+              }
             }
           }
         }
       }
+    }
+  }
+}
+
+# Zero or more `#[json(...)]` field attributes ahead of a record field.
+# The lexer emits `#[` as one `TkHashOpen`; the only field-level
+# attribute is `json`, so a `#[jsom]`-style typo (or `#[derive]` etc.
+# on a field) is a located error rather than a silent miss.
+fn parse_field_attrs(p: Parser, acc: [FieldAttr]) : PFAttrs / Console {
+  if not p_at(p, TkHashOpen) { PFAttrs { p: p, r: Some(list_reverse(acc)) } }
+  else {
+    let p0 = p_skip_newlines(p_advance(p))
+    let id = p_peek(p0)
+    if not tk_is(id.kind, TkIdent) {
+      PFAttrs { p: p_error(p0, id, "expected attribute name after `#[` on a record field"), r: None }
+    } else if tok_source(p0.src, id) != "json" {
+      PFAttrs { p: p_error(p0, id, "unknown field attribute — only `#[json(...)]` applies to a record field"), r: None }
+    } else {
+      let jr = parse_json_field_attr(p_advance(p0))
+      match jr.r {
+        None -> PFAttrs { p: jr.p, r: None }
+        Some(a) -> parse_field_attrs(p_skip_newlines(jr.p), [a, ...acc])
+      }
+    }
+  }
+}
+
+# The body of a `#[json(...)]` field attribute after the `json` ident:
+# `(rename = "wire")`, `(default = <expr>)`, or `(skip)`, followed by
+# the closing `]`.
+fn parse_json_field_attr(p: Parser) : PFAttr / Console {
+  if not p_at(p, TkLparen) {
+    PFAttr { p: p_error_here(p, "expected `(` after `#[json`"), r: None }
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    let kw = p_peek(p1)
+    if not tk_is(kw.kind, TkIdent) {
+      PFAttr { p: p_error(p1, kw, "expected `rename`, `default`, or `skip` in `#[json(...)]`"), r: None }
+    } else {
+      let key = tok_source(p1.src, kw)
+      let p2 = p_advance(p1)
+      if key == "skip" {
+        parse_json_attr_close(p_skip_newlines(p2), FAJsonSkip)
+      } else if key == "rename" {
+        parse_json_rename_attr(p2)
+      } else if key == "default" {
+        parse_json_default_attr(p2)
+      } else {
+        PFAttr { p: p_error(p1, kw, "unknown `#[json(...)]` key — expected `rename`, `default`, or `skip`"), r: None }
+      }
+    }
+  }
+}
+
+fn parse_json_rename_attr(p: Parser) : PFAttr / Console {
+  let p0 = p_skip_newlines(p)
+  if not p_at(p0, TkEq) {
+    PFAttr { p: p_error_here(p0, "expected `=` after `rename` in `#[json(rename = \"...\")]`"), r: None }
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    let st = p_peek(p1)
+    if not tk_is(st.kind, TkString) {
+      PFAttr { p: p_error(p1, st, "expected a string literal after `rename =`"), r: None }
+    } else {
+      let wire = doc_unquote(tok_source(p1.src, st))
+      parse_json_attr_close(p_skip_newlines(p_advance(p1)), FAJsonRename(wire))
+    }
+  }
+}
+
+fn parse_json_default_attr(p: Parser) : PFAttr / Console {
+  let p0 = p_skip_newlines(p)
+  if not p_at(p0, TkEq) {
+    PFAttr { p: p_error_here(p0, "expected `=` after `default` in `#[json(default = <expr>)]`"), r: None }
+  } else {
+    let er = parse_expr(p_skip_newlines(p_advance(p0)))
+    match er.r {
+      None -> PFAttr { p: er.p, r: None }
+      Some(e) -> parse_json_attr_close(p_skip_newlines(er.p), FAJsonDefault(e))
+    }
+  }
+}
+
+# Consume the `)` closing `#[json(...)]` and the `]` closing `#[`.
+fn parse_json_attr_close(p: Parser, a: FieldAttr) : PFAttr / Console {
+  if not p_at(p, TkRparen) {
+    PFAttr { p: p_error_here(p, "expected `)` to close `#[json(...)]`"), r: None }
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkRbracket) {
+      PFAttr { p: p_error_here(p1, "expected `]` to close `#[json(...)]`"), r: None }
+    } else {
+      PFAttr { p: p_advance(p1), r: Some(a) }
     }
   }
 }
