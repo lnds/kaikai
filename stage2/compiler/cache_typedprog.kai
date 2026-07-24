@@ -1,0 +1,235 @@
+#[doc("""
+`OpResolution` + `TypedProgram` serde — the outer frame of the typed
+artifact a per-module cache hit restores.
+
+Split from `compiler.cache_typed` (which carries the `ResolvedCS` /
+hole / `TyEntry` codecs) purely for file size. Same contract:
+round-trip fidelity, so `emit(deserialize(serialize(tp)))` matches
+`emit(tp)` byte for byte.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.cache
+import compiler.cache_ast
+import compiler.infer
+import compiler.cache_typed
+
+pub type CacheOPRPos   = COPRP(OpResolution, Int)
+pub type CacheOPRLPos  = COPRLP([OpResolution], Int)
+pub type CacheTPPos    = CTPP(TypedProgram, Int)
+
+fn ctp_len_prefixed(chunks: [String]) : String =
+  concat_all([cache_u32_to_hex(list_length(chunks)), concat_all(chunks)])
+
+# ---- OpResolution -----------------------------------------------------
+# OPR(fn_name, op, candidates, chosen, alias, runtime_tagged, line, col)
+
+#[doc("Serialise one `OpResolution` to its payload chunk.")]
+pub fn cache_opr_to_hex(o: OpResolution) : String = match o {
+  OPR(fnm, op, cands, chosen, alias, tagged, line, col) -> {
+    let cchunks = map(cands, (s) => cache_string_to_hex(s))
+    concat_all([cache_string_to_hex(fnm), cache_string_to_hex(op),
+                ctp_len_prefixed(cchunks), cache_string_to_hex(chosen),
+                cache_opt_string_to_hex(alias), cache_bool_to_hex(tagged),
+                cache_int_to_hex(line), cache_int_to_hex(col)])
+  }
+}
+
+#[doc("Decode one `OpResolution` at `pos`.")]
+pub fn cache_hex_to_opr(buf: String, pos: Int) : Option[CacheOPRPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(fnm, p) -> opr_after_fn(buf, p, fnm) }
+  }
+}
+
+fn opr_after_fn(buf: String, pos: Int, fnm: String) : Option[CacheOPRPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(op, p) -> opr_after_op(buf, p, fnm, op) }
+  }
+}
+
+fn opr_after_op(buf: String, pos: Int, fnm: String, op: String) : Option[CacheOPRPos] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSLP(cands, p) -> opr_after_cands(buf, p, fnm, op, cands) }
+  }
+}
+
+fn opr_after_cands(buf: String, pos: Int, fnm: String, op: String,
+                    cands: [String]) : Option[CacheOPRPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(chosen, p) -> opr_after_chosen(buf, p, fnm, op, cands, chosen) }
+  }
+}
+
+fn opr_after_chosen(buf: String, pos: Int, fnm: String, op: String,
+                     cands: [String], chosen: String) : Option[CacheOPRPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(alias, p) ->
+      opr_after_alias(buf, p, fnm, op, cands, chosen, alias) }
+  }
+}
+
+fn opr_after_alias(buf: String, pos: Int, fnm: String, op: String,
+                    cands: [String], chosen: String,
+                    alias: Option[String]) : Option[CacheOPRPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(c) -> match c { CBP(tagged, p) ->
+      opr_after_tagged(buf, p, fnm, op, cands, chosen, alias, tagged) }
+  }
+}
+
+fn opr_after_tagged(buf: String, pos: Int, fnm: String, op: String,
+                     cands: [String], chosen: String, alias: Option[String],
+                     tagged: Bool) : Option[CacheOPRPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(line, p) ->
+      opr_after_line(buf, p, fnm, op, cands, chosen, alias, tagged, line) }
+  }
+}
+
+fn opr_after_line(buf: String, pos: Int, fnm: String, op: String,
+                   cands: [String], chosen: String, alias: Option[String],
+                   tagged: Bool, line: Int) : Option[CacheOPRPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(col, p) ->
+      Some(COPRP(OPR(fnm, op, cands, chosen, alias, tagged, line, col), p)) }
+  }
+}
+
+fn cache_opr_list_to_hex(xs: [OpResolution]) : String =
+  ctp_len_prefixed(map(xs, (o) => cache_opr_to_hex(o)))
+
+fn cache_hex_to_opr_list(buf: String, pos: Int) : Option[CacheOPRLPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> ct_collect_opr(buf, p2, n, []) }
+  }
+}
+
+fn ct_collect_opr(buf: String, pos: Int, remaining: Int,
+                   acc: [OpResolution]) : Option[CacheOPRLPos] {
+  if remaining <= 0 { Some(COPRLP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_opr(buf, pos) {
+      None -> None
+      Some(c) -> match c { COPRP(o, p2) ->
+        ct_collect_opr(buf, p2, remaining - 1, [o, ...acc]) }
+    }
+  }
+}
+
+# ---- TypedProgram -----------------------------------------------------
+# Fields in declaration order: decls, errs, insts, holes, row_holes,
+# core_len, toplevel_len, module_doc, diags, op_res.
+
+#[doc("Serialise a whole `TypedProgram` to its payload chunk. Round-trip fidelity is the contract: a restored program must emit the same C as the original.")]
+pub fn cache_typedprog_to_hex(tp: TypedProgram) : String =
+  concat_all([cache_decl_list_to_hex(tp.decls), cache_int_to_hex(tp.errs),
+              cache_rcs_list_to_hex(tp.insts), cache_rh_list_to_hex(tp.holes),
+              cache_rrh_list_to_hex(tp.row_holes),
+              cache_int_to_hex(tp.core_len), cache_int_to_hex(tp.toplevel_len),
+              cache_opt_string_to_hex(tp.module_doc),
+              cache_diag_list_to_hex(tp.diags),
+              cache_opr_list_to_hex(tp.op_res)])
+
+# Decoded field-by-field through one-step continuations; the record is
+# assembled only at the last step, so no function carries the whole
+# ten-level nest.
+type TPAcc1 = TPA1([Decl], Int, [ResolvedCS], [ResolvedHole], [ResolvedRowHole])
+
+#[doc("Decode a `TypedProgram` payload chunk at `pos`; the result's second slot is the cursor past the consumed bytes.")]
+pub fn cache_hex_to_typedprog(buf: String, pos: Int) : Option[CacheTPPos] {
+  match cache_hex_to_decl_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CDLP(decls, p) -> tp_after_decls(buf, p, decls) }
+  }
+}
+
+fn tp_after_decls(buf: String, pos: Int, decls: [Decl]) : Option[CacheTPPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(errs, p) -> tp_after_errs(buf, p, decls, errs) }
+  }
+}
+
+fn tp_after_errs(buf: String, pos: Int, decls: [Decl], errs: Int) : Option[CacheTPPos] {
+  match cache_hex_to_rcs_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CRCSLP(insts, p) -> tp_after_insts(buf, p, decls, errs, insts) }
+  }
+}
+
+fn tp_after_insts(buf: String, pos: Int, decls: [Decl], errs: Int,
+                   insts: [ResolvedCS]) : Option[CacheTPPos] {
+  match cache_hex_to_rh_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CRHLP(holes, p) -> tp_after_holes(buf, p, decls, errs, insts, holes) }
+  }
+}
+
+fn tp_after_holes(buf: String, pos: Int, decls: [Decl], errs: Int,
+                   insts: [ResolvedCS], holes: [ResolvedHole]) : Option[CacheTPPos] {
+  match cache_hex_to_rrh_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CRRHLP(rhs, p) ->
+      tp_after_rowholes(buf, p, TPA1(decls, errs, insts, holes, rhs)) }
+  }
+}
+
+fn tp_after_rowholes(buf: String, pos: Int, a: TPAcc1) : Option[CacheTPPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(core_len, p) -> tp_after_corelen(buf, p, a, core_len) }
+  }
+}
+
+fn tp_after_corelen(buf: String, pos: Int, a: TPAcc1, core_len: Int) : Option[CacheTPPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(tl, p) -> tp_after_toplevel(buf, p, a, core_len, tl) }
+  }
+}
+
+fn tp_after_toplevel(buf: String, pos: Int, a: TPAcc1, core_len: Int,
+                      tl: Int) : Option[CacheTPPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(doc, p) -> tp_after_doc(buf, p, a, core_len, tl, doc) }
+  }
+}
+
+fn tp_after_doc(buf: String, pos: Int, a: TPAcc1, core_len: Int, tl: Int,
+                 doc: Option[String]) : Option[CacheTPPos] {
+  match cache_hex_to_diag_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CDgLP(diags, p) ->
+      tp_after_diags(buf, p, a, core_len, tl, doc, diags) }
+  }
+}
+
+fn tp_after_diags(buf: String, pos: Int, a: TPAcc1, core_len: Int, tl: Int,
+                   doc: Option[String], diags: [Diagnostic]) : Option[CacheTPPos] {
+  match cache_hex_to_opr_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { COPRLP(ops, p) ->
+      Some(CTPP(tp_assemble(a, core_len, tl, doc, diags, ops), p)) }
+  }
+}
+
+fn tp_assemble(a: TPAcc1, core_len: Int, tl: Int, doc: Option[String],
+                diags: [Diagnostic], ops: [OpResolution]) : TypedProgram = match a {
+  TPA1(decls, errs, insts, holes, rhs) -> TypedProgram {
+    decls: decls, errs: errs, insts: insts, holes: holes, row_holes: rhs,
+    core_len: core_len, toplevel_len: tl, module_doc: doc,
+    diags: diags, op_res: ops
+  }
+}
