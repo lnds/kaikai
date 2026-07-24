@@ -1,0 +1,151 @@
+#[doc("""
+compiler.json_shape - which JSON shape a `#[derive(Json)]` field has.
+
+Classifies a field's declared type into the `JsonShape` the impl builder
+reads and encodes it as, and explains the classification's refusals so
+the pre-expansion validator can report an unbindable field at the derive
+rather than leaving it to surface as a missing `to_json` at the first
+call site.
+""")]
+
+import compiler.util
+import compiler.ast
+
+#[doc("The JSON shape a field's declared type binds as. `JSOpt` wraps the inner shape rather than being a leaf of its own: `Option[[Int]]` needs both the optional reader and the element reader the list would have used.")]
+pub type JsonShape = JSStr | JSInt | JSReal | JSBool
+                   | JSList(JsonShape)
+                   | JSOpt(JsonShape)
+                   | JSRecord(String)
+
+#[doc("A record field reduced to its name and the JSON shape it binds as.")]
+pub type JsonField = JF(String, JsonShape)
+
+# ---- field-shape classification ------------------------------------
+#
+# A field's declared type decides which reader/encoder pair it gets. An
+# unrecognised head yields `None`, which drops the whole derive — the
+# validator turns that into a located error naming the field.
+
+# The sole type argument of `Name[T]`, or `None` for any other arity.
+# Read with `map` inside the arm that destructured the variant: kaic1
+# miscompiles a variant's list payload passed positionally to a helper
+# that matches on it, so the payload is reduced here and only the
+# reduced value travels.
+fn jd_sole_arg(t: TypeExpr) : Option[TypeExpr] = match t.tkind {
+  TyName(_, targs) -> match map(targs, (a: TypeExpr) => a) {
+    [a] -> Some(a)
+    _   -> None
+  }
+  _ -> None
+}
+
+pub fn jd_shape_of(t: TypeExpr) : Option[JsonShape] = match t.tkind {
+  TyList(elem) -> jd_wrap_list(jd_shape_of(elem))
+  TyName(n, _) ->
+    if n == "String" { Some(JSStr) }
+    else if n == "Int" { Some(JSInt) }
+    else if n == "Real" { Some(JSReal) }
+    else if n == "Bool" { Some(JSBool) }
+    else if n == "Option" { jd_wrap_opt(jd_shape_inner(t)) }
+    else if n == "List" { jd_wrap_list(jd_shape_inner(t)) }
+    else if jd_is_user_type(n) and jd_arity(t) == 0 { Some(JSRecord(n)) }
+    else { None }
+  _ -> None
+}
+
+# A generic head is not a JSON-bindable record: the derive emits a call
+# to the monomorphic `<lower(T)>_of_json` shim, which a parameterised
+# type has none of.
+fn jd_arity(t: TypeExpr) : Int = match t.tkind {
+  TyName(_, targs) -> jd_count(map(targs, (a: TypeExpr) => a), 0)
+  _ -> 0
+}
+
+fn jd_count(xs: [TypeExpr], acc: Int) : Int = match xs {
+  []          -> acc
+  [_, ...rest] -> jd_count(rest, acc + 1)
+}
+
+fn jd_shape_inner(t: TypeExpr) : Option[JsonShape] = match jd_sole_arg(t) {
+  None    -> None
+  Some(a) -> jd_shape_of(a)
+}
+
+# A nested record is any capitalised head that is not a builtin leaf —
+# whether it actually derives Json is checked at the call site the
+# emitted body makes, which is where the user gets the better message.
+fn jd_is_user_type(n: String) : Bool = match char_at(n, 0) {
+  None    -> false
+  Some(c) -> {
+    let nc = char_to_int(c)
+    nc >= 65 and nc <= 90
+  }
+}
+
+fn jd_wrap_list(inner: Option[JsonShape]) : Option[JsonShape] = match inner {
+  None    -> None
+  Some(s) -> Some(JSList(s))
+}
+
+# `Option[Option[T]]` has no JSON denotation — one `null` cannot mean two
+# different absences — so it is rejected rather than silently flattened.
+fn jd_wrap_opt(inner: Option[JsonShape]) : Option[JsonShape] = match inner {
+  None    -> None
+  Some(s) -> match s {
+    JSOpt(_) -> None
+    _        -> Some(JSOpt(s))
+  }
+}
+
+pub fn jd_fields_of(fields: [FieldDecl]) : Option[[JsonField]] =
+  jd_fields_loop(fields, [])
+
+fn jd_fields_loop(fields: [FieldDecl], acc: [JsonField]) : Option[[JsonField]] =
+  match fields {
+    [] -> Some(list_reverse(acc))
+    [fd, ...rest] -> match fd {
+      FD(_, fname, ftype) -> match jd_shape_of(ftype) {
+        None    -> None
+        Some(s) -> jd_fields_loop(rest, [JF(fname, s), ...acc])
+      }
+    }
+  }
+
+#[doc("Why `ftype` cannot be a `#[derive(Json)]` field, or `None` when it can. The pre-expansion validator turns the reason into a located error.")]
+pub fn json_field_reject(ftype: TypeExpr) : Option[String] = match jd_shape_of(ftype) {
+  Some(_) -> None
+  None    -> Some(jd_reject_why(ftype))
+}
+
+fn jd_reject_why(t: TypeExpr) : String = match t.tkind {
+  TyName(n, _) ->
+    if n == "Option" or n == "List" { jd_arg_reject_why(t, n) }
+    else if jd_arity(t) > 0 {
+      concat_all(["`", n, "` is generic; only a monomorphic record can derive Json"])
+    }
+    else { concat_all(["`", n, "` has no JSON denotation"]) }
+  TyList(elem) -> concat_all(["its element type: ", jd_reject_why(elem)])
+  _ -> "only records of JSON-bindable fields can derive Json"
+}
+
+fn jd_arg_reject_why(t: TypeExpr, head: String) : String = match jd_sole_arg(t) {
+  None    -> concat_all(["`", head, "` without a single type argument"])
+  Some(a) ->
+    if head == "Option" and jd_head_is(a, "Option") {
+      "`Option[Option[T]]` cannot be told apart from `Option[T]`: one JSON `null` denotes one absence"
+    } else {
+      concat_all(["its ", head, " element type: ", jd_reject_why(a)])
+    }
+}
+
+fn jd_head_is(t: TypeExpr, name: String) : Bool = match t.tkind {
+  TyName(n, _) -> n == name
+  _            -> false
+}
+
+#[doc("The head type name of `ftype` as written, for a diagnostic that names the offending field's type.")]
+pub fn json_head_name(ftype: TypeExpr) : String = match ftype.tkind {
+  TyName(n, _) -> n
+  TyList(elem) -> concat_all(["[", json_head_name(elem), "]"])
+  _            -> "?"
+}

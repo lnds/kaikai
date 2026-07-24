@@ -1,13 +1,13 @@
-# JSON `#[derive(Json)]` — typed struct binding (design proposal)
+# JSON `#[derive(Json)]` — typed struct binding
 
-**Status:** proposal, not accepted. A lateral discovery: the gap between kaikai's
-JSON today and Go's struct binding. Not a kind, not a theory — plain
-derive-over-`Type`, the same mechanism as `#[derive(Eq)]`.
+**Status:** accepted and shipped. `#[derive(Json)]` generates the typed
+binding between a record type and the JSON DOM — the Go-struct-tags side
+of JSON, which kaikai previously lacked.
 
-## What exists today (verified, runs)
+## What exists today
 
-`stdlib/encoding/json.kai` is a **dynamic DOM** — Go's `map[string]interface{}`
-side, not Go's struct-tags side:
+`stdlib/encoding/json.kai` is the **dynamic DOM** — Go's
+`map[string]interface{}` side:
 
 ```kaikai
 pub type JsonValue = JNull | JBool(Bool) | JNum(Int) | JReal(Real)
@@ -17,8 +17,8 @@ pub fn json_encode(v: JsonValue) : String
 # navigators: get(v, key), at(v, i), as_string / as_int / as_real / as_bool → Option
 ```
 
-Binding a `JsonValue` to a domain type is **manual** today — you write the walk by
-hand (verified working, `/tmp/json_demo.kai`):
+`#[derive(Json)]` is the **typed** side over that same tree. Binding a
+`JsonValue` to a domain type used to be a hand-written walk:
 
 ```kaikai
 type Person = { name: String, age: Int, active: Bool }
@@ -26,105 +26,144 @@ type Person = { name: String, age: Int, active: Bool }
 fn person_of(v: JsonValue) : Person / Fail = {
   let name = match json.as_string(json.get(v, "name")) {
     Some(s) -> s ; None -> Fail.fail("missing/invalid 'name'") }
-  let age  = match json.as_int(json.get(v, "age")) {
-    Some(n) -> n ; None -> Fail.fail("missing/invalid 'age'") }
-  let active = match json.as_bool(json.get(v, "active")) {
-    Some(b) -> b ; None -> Fail.fail("missing/invalid 'active'") }
-  Person { name: name, age: age, active: active }
+  # ... one such block per field
 }
 ```
 
-That 15-line walk is exactly what Go's reflection generates from struct tags — for
-free. kaikai writes it by hand. That is the gap.
-
-## The gap: Go's struct binding
-
-Go has two JSON APIs; kaikai has only the first:
-
-```go
-// 1. dynamic — kaikai HAS this (JsonValue)
-var v interface{}; json.Unmarshal(data, &v)
-
-// 2. struct binding by reflection — kaikai LACKS this
-type Person struct {
-    Name string `json:"name"`
-    Age  int    `json:"age"`
-}
-json.Unmarshal(data, &p)   // fills the struct automatically
-```
-
-## Proposal: `#[derive(Json)]`, not a kind
-
-Binding JSON to a type is **derive dirigido por la forma del tipo** — the same
-compile-time codegen as `#[derive(Eq)]`, driven by the record's fields. It is NOT
-a theory or a kind: JSON is a name-keyed tree (commutative in keys —
-`{a,b} == {b,a}`), which is ordinary structural typing (kind `Type`), and the
-binding is codegen over that structure.
+That walk is what the derive now generates:
 
 ```kaikai
 #[derive(Json)]
 type Person = { name: String, age: Int, active: Bool }
 
-let p : Person = json.from_json(src)?      # generated; replaces person_of by hand
-let s : String = json.to_json(p)           # generated
+let doc : JsonValue = json_decode(src)?
+let p : Result[Person, JsonError] = person_of_json(doc, "")
+let s : String      = json_encode(to_json(p))
 ```
 
-The compiler walks `Person`'s fields and generates the `get`/`as_*`/`match` chain
-you write by hand today. `from_json` / `to_json` derive from the field structure.
+`JsonValue` and `JsonError` live in `stdlib/encoding/json_bind.kai`
+alongside the runtime the derive lowers onto; only `protocol Json` sits
+in `stdlib/protocols.kai`, where the compiler pins its protocol id.
 
-### Field overrides — attributes, NOT Go's magic-string tags
+The types deliberately stay out of the auto-loaded core: the C emitter
+eager-seeds every user nullary constructor as an immortal singleton in
+each binary's `main` (the direct-tag enum slot store needs it — a slot
+read can precede any construction), so `JNull` in the core would offset
+the RC trace baseline of every program that never touches JSON. A
+protocol may name types it does not declare, so the core still compiles.
+`encoding/json.kai` imports `json_bind`, so one `import encoding.json`
+brings the DOM, the codec, and the derive runtime into scope together.
 
-Go's `json:"name"` is an **untyped string** the reflection parses at runtime — a
-`jsom:"name"` typo fails silently at runtime. kaikai's overrides are **attributes**
-the parser validates:
+## Shape
 
 ```kaikai
-#[derive(Json)]
-type Config = {
-  #[json(rename = "user_name")]  host: String,   # Go's tag, but compiler-checked
-  #[json(default = 30)]          retries: Int,    # missing key → default
-  #[json(skip)]                  cache: [Int],    # excluded from JSON
+protocol Json {
+  to_json(self: Self) : JsonValue
+  of_json(v: JsonValue, path: String) : Result[Self, JsonError]
 }
 ```
 
-`#[json(rename/default/skip)]` covers Go's tag surface — but a `#[jsom(...)]` typo
-is a **compile error**, not a silent runtime miss, and the override is structured
-(`rename`, `default`, `skip` are fields with shape) not text re-parsed by
-reflection. Same mechanism as `#[derive]` / `#[doc]`; zero new surface. Backticks
-were considered and **rejected** — copying Go's magic string is copying its worst
-part; the backtick is for embedded grammars (bit-scope), not field metadata.
+`of_json` takes the path of the node it is decoding so a nested failure
+can name its position. Single dispatch selects on the first argument,
+which for a decode is the DOM node, so the derive also emits a
+`<lower(T)>_of_json(v, path)` shim as the user-facing entry point — the
+same trick BinSerialize and Layout use for `from_bytes`.
 
-## Where kaikai beats Go
+## The four binding policies
 
-**Failure is in the type.** `from_json : Person / Fail` (or `: Option[Person]`) —
-a malformed document is a typed failure the caller must handle. Go returns an
-`error` that can be ignored, and a wrong tag fails silently. kaikai's derive puts
-the parse failure in the signature and the field override under compiler check. The
-whole-session theme (types don't lie) applied to JSON.
+Binding JSON to a type forces four choices that are not mechanical.
+These are decided once, in the derive, and are not per-type
+configurable.
+
+### 1. Field naming — verbatim
+
+The kaikai field name goes to the wire exactly as written. There is no
+automatic `snake_case` → `camelCase` conversion: a silent renaming rule
+is a rule the reader of the type declaration cannot see, and the wire
+format is not the place for a convention the compiler invents. What the
+type says is what the document says.
+
+A per-field `#[json(rename = "...")]` attribute is the natural extension
+when a document's names cannot be spelled as kaikai identifiers; it is
+not part of this landing.
+
+### 2. Null and missing — `Option` accepts both, everything else is required
+
+An `Option[T]` field accepts an explicit JSON `null` **and** a missing
+key, both decoding to `None`. Any other field is required: a missing key
+is a deserialization error, not a zero value. This is the serde/Go
+model — `Option` is genuinely optional and everything else is not, so
+the type declaration alone tells the reader which fields a document must
+carry.
+
+A field whose key is present but carries the wrong shape is an error
+even under `Option`: `null` means absent, `7` does not mean absent.
+
+### 3. Failure shape — `Result[T, JsonError]`, located
+
+Decoding returns `Result[T, JsonError]`, where `JsonError` carries the
+JSON path to the offending node:
+
+```kaikai
+pub type JsonError = { path: String, expected: String, found: String }
+```
+
+A failure three levels into a document reports `address.boxes[2].zip:
+expected String, got Number` rather than one flat message about the
+whole payload. That location is the point: a plain `String` error is
+much less useful for nested documents, which is exactly where a typed
+binding earns its keep. A record decode checks that its node is an
+object *before* reading keys, so a wrong node reports as itself
+(`address: expected Object, got Array`) rather than as every field
+going missing at once.
+
+### 4. Unknown fields — ignored
+
+Keys the type does not declare are skipped, not rejected. This is
+tolerant to schema evolution: a producer may add a field without
+breaking every existing reader, which is serde-without-`deny_unknown_fields`
+and Go's `encoding/json` default. Strict rejection is the rarer need and
+would be an opt-in, not the default.
+
+## Why derive and not a kind
+
+JSON is derive-only and **never a kind**. Naming and null policy are
+choices *about* a type rather than properties *of* one — unlike
+`Layout`, where byte order genuinely must live in the type system
+because two records with the same fields and different endianness are
+different types. Two records with the same fields and different JSON
+key-casing are the same type with different serializers. That
+distinction is what keeps `Json` out of the kind system.
 
 ## Scope
 
-- **In:** `#[derive(Json)]` generating `from_json : T / Fail` and `to_json : T ->
-  String` over records; `#[json(rename/default/skip)]` field overrides.
-- **Out:** sum-type / enum encoding strategy (tagged unions — a real question, Go
-  punts on it too); streaming decode (that would ride effects, `/ Read`); schema
-  validation beyond structural shape.
+- **In:** `#[derive(Json)]` over records, generating `to_json` and
+  `of_json`; fields of type `String`, `Int`, `Real`, `Bool`, `[T]`,
+  `Option[T]`, and nested records that themselves derive `Json`.
+- **Out:** sum-type / enum encoding (tagged unions are a separate
+  convention choice — Go punts on it too, and the derive rejects sum
+  types rather than inventing one); `#[json(rename/default/skip)]`
+  field overrides; streaming decode; schema validation beyond
+  structural shape.
 
-## Open questions
+## Rejections the derive reports
 
-- Sum types: how does `type Shape = Circle(Real) | Square(Real)` encode? Tagged
-  (`{"tag":"Circle","value":1.0}`) vs other conventions — needs a decision, out of
-  the record-first scope.
-- Does `from_json` return `Option[T]` or `/ Fail`? `/ Fail` carries a message
-  (which field, why); `Option` is simpler. Lean `/ Fail` for diagnostics.
-- Reuse `Serialize` protocol (`stdlib/protocols.kai`) or a dedicated `Json`
-  derive? `Serialize` is whole-string round-trip; JSON needs per-field structure.
-  Likely a dedicated derive that leans on `Serialize` for leaves.
+A field with no JSON denotation is reported at the derive site naming
+the field, rather than surfacing later as a missing `to_json` at the
+first call site:
+
+- a sum type — needs a tagged-union encoding the derive does not choose;
+- `Option[Option[T]]` — one JSON `null` cannot denote two absences;
+- a generic head (`Result[Int, String]`) — the emitted decode calls a
+  monomorphic shim a parameterised type has none of;
+- any other type with no denotation in the DOM.
 
 ## References
 
+- `stdlib/protocols.kai` §Json — the protocol.
+- `stdlib/encoding/json_bind.kai` — `JsonValue`, `JsonError`, and the
+  runtime the derive lowers onto.
 - `stdlib/encoding/json.kai` — the dynamic DOM this builds on.
-- `stdlib/protocols.kai` §Serialize — the leaf-serialization protocol.
-- `/tmp/json_demo.kai` — the hand-written binding this would generate (verified
-  running: `name=ana age=30 active=true`).
-- CLAUDE.md — `#[derive]` / `#[doc]` attribute mechanism this reuses.
+- `stage2/compiler/json_derive.kai` — the impl builder.
+- `examples/stdlib/json_derive_*.kai` — round-trip, absence, and
+  error-path fixtures.

@@ -1,0 +1,237 @@
+#[doc("""
+stdlib/encoding/json_bind.kai — the JSON DOM plus the runtime
+`#[derive(Json)]` lowers onto.
+
+A derived `to_json` builds a `JObj` from the record's fields; a derived
+`of_json` reads each field back out through the `json_bind_*` leaf
+readers here. The readers carry the JSON path of the node they are
+reading so a failure deep inside a nested document reports its position
+rather than the whole payload.
+
+Two policies live in these readers rather than in the emitted code, so
+every derived impl agrees on them:
+
+  - a missing key and an explicit `null` are the same absence, which
+    `json_bind_opt_*` turns into `None` and every other reader rejects;
+  - a key the record does not declare is never looked at, so unknown
+    fields are ignored.
+
+`JsonValue` and `JsonError` are declared here rather than in
+`stdlib/protocols.kai`, where the `Json` protocol itself lives: a sum
+type in an auto-loaded core module gets every nullary constructor
+eager-seeded as an immortal singleton in each binary's `main`, so
+`JNull` in the core would offset the RC trace baseline of every program
+that never touches JSON.
+
+A derived impl names these types unqualified, so a deriving user
+imports this module. `encoding/json.kai` — the dynamic half, text in
+and tree out — reads the same `JsonValue`.
+""")]
+
+#[doc("A parsed JSON value: null, bool, integer, real, string, array, or object.")]
+pub type JsonValue
+  = JNull
+  | JBool(Bool)
+  | JNum(Int)
+  | JReal(Real)
+  | JStr(String)
+  | JArr([JsonValue])
+  | JObj([Pair[String, JsonValue]])
+
+#[doc("""
+Why a typed decode failed, located in the document.
+
+`path` is the dotted/indexed route from the document root to the
+offending node (`user.address[2].zip`, or `""` at the root), so a
+failure deep inside a nested document names the node rather than the
+whole payload. `expected` is the shape the type demanded and `found`
+the shape the document carried, both as display names (`String`,
+`Number`, `missing`).
+""")]
+pub type JsonError = { path: String, expected: String, found: String }
+
+#[doc("Renders a `JsonError` as `path: expected X, got Y` (the leading `path: ` is dropped at the document root).")]
+pub fn json_error_show(e: JsonError) : String = {
+  let what = string_concat_all(["expected ", e.expected, ", got ", e.found])
+  if e.path == "" { what } else { string_concat_all([e.path, ": ", what]) }
+}
+
+#[doc("Extends a JSON path with a record field: `user` + `zip` -> `user.zip`.")]
+pub fn json_path_field(base: String, name: String) : String =
+  if base == "" { name } else { string_concat_all([base, ".", name]) }
+
+#[doc("Extends a JSON path with an array index: `items` + 2 -> `items[2]`.")]
+pub fn json_path_index(base: String, i: Int) : String =
+  string_concat_all([base, "[", int_to_string(i), "]"])
+
+# The DOM's own display names, used for both halves of a `JsonError`.
+# `absent` covers a missing key and an explicit `null` alike: they are
+# the same thing to a reader, and the message reads the same either way.
+#[doc("Display name of a `JsonValue`'s shape (`String`, `Number`, `Object`, …); `null` renders as `absent`.")]
+pub fn json_shape_name(v: JsonValue) : String = match v {
+  JNull    -> "absent"
+  JBool(_) -> "Bool"
+  JNum(_)  -> "Number"
+  JReal(_) -> "Number"
+  JStr(_)  -> "String"
+  JArr(_)  -> "Array"
+  JObj(_)  -> "Object"
+}
+
+fn json_bind_err(path: String, expected: String, v: JsonValue) : JsonError =
+  JsonError { path: path, expected: expected, found: json_shape_name(v) }
+
+#[doc("Checks that `v` is a JSON object before a record decode reads keys out of it, so a wrong node reports as itself rather than as every field going missing.")]
+pub fn json_bind_object(v: JsonValue, path: String) : Result[Unit, JsonError] = match v {
+  JObj(_) -> Ok(())
+  _       -> Err(json_bind_err(path, "Object", v))
+}
+
+#[doc("Looks up `key` in a JSON object; a miss and a non-object both yield `JNull`, which reads as absent.")]
+pub fn json_bind_field(v: JsonValue, key: String) : JsonValue = match v {
+  JObj(pairs) -> json_bind_lookup(pairs, key)
+  _           -> JNull
+}
+
+fn json_bind_lookup(pairs: [Pair[String, JsonValue]], key: String) : JsonValue = match pairs {
+  []           -> JNull
+  [p, ...rest] -> if p.fst == key { p.snd } else { json_bind_lookup(rest, key) }
+}
+
+# ---- leaf readers -------------------------------------------------
+#
+# One per primitive the derive supports. Each returns the value or a
+# located `JsonError`; `JNull` reaches them only when the field was not
+# declared `Option`, so it is a genuine error there and reports as
+# `absent`.
+
+#[doc("Reads a `String` leaf at `path`, or reports what the document carried instead.")]
+pub fn json_bind_string(v: JsonValue, path: String) : Result[String, JsonError] = match v {
+  JStr(s) -> Ok(s)
+  _       -> Err(json_bind_err(path, "String", v))
+}
+
+#[doc("Reads an `Int` leaf at `path`; a JSON real is rejected because the caller asked for a lossless integer.")]
+pub fn json_bind_int(v: JsonValue, path: String) : Result[Int, JsonError] = match v {
+  JNum(n) -> Ok(n)
+  _       -> Err(json_bind_err(path, "Int", v))
+}
+
+#[doc("Reads a `Real` leaf at `path`, widening a JSON integer to `Real`.")]
+pub fn json_bind_real(v: JsonValue, path: String) : Result[Real, JsonError] = match v {
+  JReal(r) -> Ok(r)
+  JNum(n)  -> Ok(int_to_real(n))
+  _        -> Err(json_bind_err(path, "Real", v))
+}
+
+#[doc("Reads a `Bool` leaf at `path`.")]
+pub fn json_bind_bool(v: JsonValue, path: String) : Result[Bool, JsonError] = match v {
+  JBool(b) -> Ok(b)
+  _        -> Err(json_bind_err(path, "Bool", v))
+}
+
+# ---- optional leaves ----------------------------------------------
+#
+# `Option[T]` is the one field shape that accepts absence. A missing key
+# and an explicit `null` both arrive as `JNull` and both decode to
+# `None`; anything else must still be a well-typed `T`, so a wrong shape
+# under an `Option` field is an error rather than a silent `None`.
+
+# Lift a leaf reader's success into `Some`. Kept bare rather than going
+# through `result.map` so these helpers stay usable on a core-load chain
+# that does not carry `stdlib/core/result.kai`.
+fn json_bind_some[a](r: Result[a, JsonError]) : Result[Option[a], JsonError] = match r {
+  Ok(x)  -> Ok(Some(x))
+  Err(e) -> Err(e)
+}
+
+#[doc("Reads an optional `String` leaf: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt_string(v: JsonValue, path: String) : Result[Option[String], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(json_bind_string(v, path))
+}
+
+#[doc("Reads an optional `Int` leaf: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt_int(v: JsonValue, path: String) : Result[Option[Int], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(json_bind_int(v, path))
+}
+
+#[doc("Reads an optional `Real` leaf: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt_real(v: JsonValue, path: String) : Result[Option[Real], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(json_bind_real(v, path))
+}
+
+#[doc("Reads an optional `Bool` leaf: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt_bool(v: JsonValue, path: String) : Result[Option[Bool], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(json_bind_bool(v, path))
+}
+
+# ---- lists --------------------------------------------------------
+#
+# A `[T]` field decodes element-wise, each element carrying its index in
+# the path, so `items[2]` names the offending element. The first failure
+# wins: a document is either the shape the type declares or it is not,
+# and reporting one located cause beats accumulating a list of them.
+
+#[doc("Reads a `[T]` leaf at `path`, decoding each element with `f` and locating a failure by index.")]
+pub fn json_bind_list(v: JsonValue, path: String,
+                      f: (JsonValue, String) -> Result[a, JsonError]) : Result[[a], JsonError] =
+  match v {
+    JArr(items) -> json_bind_elems(items, path, 0, f, [])
+    _           -> Err(json_bind_err(path, "Array", v))
+  }
+
+fn json_bind_elems(items: [JsonValue], path: String, i: Int,
+                   f: (JsonValue, String) -> Result[a, JsonError],
+                   acc: [a]) : Result[[a], JsonError] = match items {
+  [] -> Ok(json_bind_reverse(acc, []))
+  [x, ...rest] -> match f(x, json_path_index(path, i)) {
+    Ok(y)  -> json_bind_elems(rest, path, i + 1, f, [y, ...acc])
+    Err(e) -> Err(e)
+  }
+}
+
+fn json_bind_reverse[a](xs: [a], acc: [a]) : [a] = match xs {
+  []           -> acc
+  [x, ...rest] -> json_bind_reverse(rest, [x, ...acc])
+}
+
+#[doc("Reads any optional field through `f`: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt(v: JsonValue, path: String,
+                     f: (JsonValue, String) -> Result[a, JsonError])
+                     : Result[Option[a], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(f(v, path))
+}
+
+#[doc("Reads an optional `[T]` leaf: absent or `null` gives `None`, a wrong shape still errors.")]
+pub fn json_bind_opt_list(v: JsonValue, path: String,
+                          f: (JsonValue, String) -> Result[a, JsonError])
+                          : Result[Option[[a]], JsonError] = match v {
+  JNull -> Ok(None)
+  _     -> json_bind_some(json_bind_list(v, path, f))
+}
+
+# ---- encode side --------------------------------------------------
+#
+# The `to_json` half needs no dispatch for leaves — the derive emits the
+# constructor directly — but `Option` and lists do, because their
+# element encoder is only known at the field's type.
+
+#[doc("Encodes an `Option[T]` field: `None` becomes JSON `null`, `Some(x)` becomes `f(x)`.")]
+pub fn json_of_opt(o: Option[a], f: (a) -> JsonValue) : JsonValue = match o {
+  None    -> JNull
+  Some(x) -> f(x)
+}
+
+#[doc("Encodes a `[T]` field as a JSON array, mapping each element through `f`.")]
+pub fn json_of_list(xs: [a], f: (a) -> JsonValue) : JsonValue =
+  JArr(json_of_elems(xs, f, []))
+
+fn json_of_elems[a](xs: [a], f: (a) -> JsonValue, acc: [JsonValue]) : [JsonValue] = match xs {
+  []           -> json_bind_reverse(acc, [])
+  [x, ...rest] -> json_of_elems(rest, f, [f(x), ...acc])
+}
