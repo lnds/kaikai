@@ -83,9 +83,9 @@ is a rule the reader of the type declaration cannot see, and the wire
 format is not the place for a convention the compiler invents. What the
 type says is what the document says.
 
-A per-field `#[json(rename = "...")]` attribute is the natural extension
-when a document's names cannot be spelled as kaikai identifiers; it is
-not part of this landing.
+A per-field `#[json(rename = "...")]` attribute overrides the wire name
+when a document's names cannot be spelled as kaikai identifiers or are
+fixed by an external spec; see *Field overrides* below.
 
 ### 2. Null and missing — `Option` accepts both, everything else is required
 
@@ -125,6 +125,42 @@ breaking every existing reader, which is serde-without-`deny_unknown_fields`
 and Go's `encoding/json` default. Strict rejection is the rarer need and
 would be an opt-in, not the default.
 
+## Field overrides — `#[json(rename/default/skip)]`
+
+Three per-field attributes layer on top of the four base policies without
+changing them. They are compiler-checked structured attributes, not Go's
+reflection-read magic strings: a `#[jsom(...)]` typo, an unknown key, or a
+`#[json]` on a shape it cannot serve is a compile error, so an override
+that silently misses the wire is impossible.
+
+```kaikai
+#[derive(Json)]
+type Config = {
+  #[json(rename = "user-name")] host: String,
+  #[json(default = 30)]         retries: Int,
+  #[json(skip)] #[json(default = [])] cache: [Int],
+}
+```
+
+- **`rename = "wire"`** — the field encodes and decodes under `"wire"`
+  instead of its kaikai identifier. This is what binds a document whose
+  keys are not spellable as kaikai identifiers, or whose casing an
+  external spec fixes. Verbatim naming stays the default when no rename
+  is given.
+- **`default = <expr>`** — a missing key takes `<expr>` instead of
+  erroring. This is the sole opt-out from the required-field policy: only
+  a field carrying `default` may be absent without error; every other
+  non-`Option` field still errors when its key is missing. The
+  expression is inlined into the generated decoder, so the typer checks
+  it like any other code.
+- **`skip`** — the field is never written to the wire, and on decode has
+  no value to read back, so it *requires* either a `default` or an
+  `Option` type; a bare `skip` on a required field is a compile error at
+  the derive, since decode cannot invent a value.
+
+Each `#[json(...)]` carries one override; a field needing two (a skipped
+field with a default) writes two attributes. `kai fmt` round-trips them.
+
 ## Why derive and not a kind
 
 JSON is derive-only and **never a kind**. Naming and null policy are
@@ -139,12 +175,12 @@ distinction is what keeps `Json` out of the kind system.
 
 - **In:** `#[derive(Json)]` over records, generating `to_json` and
   `of_json`; fields of type `String`, `Int`, `Real`, `Bool`, `[T]`,
-  `Option[T]`, and nested records that themselves derive `Json`.
+  `Option[T]`, and nested records that themselves derive `Json`; the
+  `#[json(rename/default/skip)]` field overrides.
 - **Out:** sum-type / enum encoding (tagged unions are a separate
   convention choice — Go punts on it too, and the derive rejects sum
-  types rather than inventing one); `#[json(rename/default/skip)]`
-  field overrides; streaming decode; schema validation beyond
-  structural shape.
+  types rather than inventing one); streaming decode; schema validation
+  beyond structural shape.
 
 ## Rejections the derive reports
 
@@ -165,5 +201,8 @@ first call site:
   runtime the derive lowers onto.
 - `stdlib/encoding/json.kai` — the dynamic DOM this builds on.
 - `stage2/compiler/json_derive.kai` — the impl builder.
-- `examples/stdlib/json_derive_*.kai` — round-trip, absence, and
-  error-path fixtures.
+- `stage2/compiler/json_shape.kai` — field-shape classification and the
+  `JsonField` reduction that carries the wire name, default, and skip.
+- `examples/stdlib/json_derive_*.kai` — round-trip, absence, error-path,
+  and override (`json_derive_overrides`, `json_derive_jsom_typo`,
+  `json_derive_skip_no_default`) fixtures.
