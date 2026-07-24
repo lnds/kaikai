@@ -4185,6 +4185,17 @@ static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
     return kai_vec_read_elem(m, kai_vec_elems(v) + (size_t) i * (size_t) m->stride);
 }
 
+/* The raw 8-byte payload of a scalar element, no box, no RC on either
+ * side. The dynamic twin of a fixed vec's `(v).a[i]` inline load: the
+ * read a `Vec[t]<n>` value takes once it has crossed the boxed border
+ * and is a heap vec, where the caller still wants a bare scalar. Only
+ * valid on a RAW-kind vec (flat scalar elements). */
+static const void *kai_vec_raw_slot(KaiValue *v, int64_t i) {
+    kai_vec_bounds(v, i, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    return kai_vec_elems(v) + (size_t) i * (size_t) m->stride;
+}
+
 /* Pure write. Consumes `v` and `x`; returns the result vec (in place
  * when `v` was unique, a copy when shared). */
 static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {

@@ -1088,6 +1088,7 @@ KaiValue *kaix_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x)    { return k
 KaiValue *kaix_core_vec_push(KaiValue *v, KaiValue *x)                { return kai_core_vec_push(v, x); }
 KaiValue *kaix_core_vec_length_borrow(KaiValue *v)                    { return kai_core_vec_length_borrow(v); }
 KaiValue *kaix_core_vec_get_borrow(KaiValue *v, KaiValue *i)          { return kai_core_vec_get_borrow(v, i); }
+const void *kaix_vec_raw_slot(KaiValue *v, int64_t i)                 { return kai_vec_raw_slot(v, i); }
 KaiValue *kaix_core_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n)  { return kai_core_vec_slice(v, s, n); }
 KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s)           { return kai_core_vec_tail_from(v, s); }
 KaiValue *kaix_core_vec_reserve(KaiValue *n)                          { return kai_core_vec_reserve(n); }
