@@ -25,7 +25,7 @@ import compiler.emit_native_ops
 pub fn nprim_is_fixed_vec(nm: String) : Bool =
   string_starts_with_q(nm, "__fixed_vec_")
 
-#[doc("Emit a fixed-vec inline prim: the literal yields the `[n x elem]` array pointer, the read yields a re-boxed element, the materialise yields a dynamic `Vec`.")]
+#[doc("Emit a fixed-vec inline prim: the literal yields the `[n x elem]` array pointer, a read yields the element (re-boxed, or raw for a `getraw` read), the materialise yields a dynamic `Vec`.")]
 pub fn nemit_fixed_vec_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   if string_starts_with_q(nm, "__fixed_vec_lit@") {
     nemit_fixed_vec_lit(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_lit@"), cargs)
@@ -33,8 +33,14 @@ pub fn nemit_fixed_vec_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / C
     nemit_fixed_vec_materialize(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_materialize@"), cargs)
   } else if string_starts_with_q(nm, "__fixed_vec_dget@") {
     nemit_fixed_vec_dget(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_dget@"), cargs)
+  } else if string_starts_with_q(nm, "__fixed_vec_getraw_dyn@") {
+    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_getraw_dyn@"), cargs, true, true)
+  } else if string_starts_with_q(nm, "__fixed_vec_getraw@") {
+    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_getraw@"), cargs, false, true)
+  } else if string_starts_with_q(nm, "__fixed_vec_get_dyn@") {
+    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get_dyn@"), cargs, true, false)
   } else {
-    nemit_fixed_vec_get(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get@"), cargs)
+    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get@"), cargs, false, false)
   }
 
 # `<elem-tag>@<n>` decoded from the prim name into `(elem-tag, n)`.
@@ -72,16 +78,21 @@ fn nfixed_store_elems(ctx: Handle, arrty: Handle, slot: Handle, tag: String, es:
   }
 }
 
-# `v[k]` → the base array pointer, a static-index GEP + raw load, re-boxed at
-# the element constructor. The typer proved `k` in range (no bounds check).
-fn nemit_fixed_vec_get(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Console = match spec {
+# `v[k]` → the base array pointer, a GEP + raw load. A static index is used
+# as-is (the typer proved it in range); a dynamic one is first gated by
+# `kaix_fixed_vec_idx`, which traps out of range and returns the word — an
+# i64 GEP index is as valid as an i32 one. `raw_out` keeps the loaded scalar
+# for a raw-position consumer; otherwise it re-boxes at the element ctor.
+fn nemit_fixed_vec_read(ctx: Handle, spec: FVSpec, cargs: [KVal],
+                        dyn: Bool, raw_out: Bool) : Handle / Console = match spec {
   FVSpec(tag, n) -> match cargs {
     [base, idx] -> {
       let arrty = llvm_array_type(nfixed_elem_ty(ctx, tag), n)
       let ptr   = nemit_atom(ctx, base)
-      let gep   = llvm_build_array_gep(native_ctx_b(ctx), arrty, ptr, nfixed_idx_val(ctx, idx))
+      let ix    = if dyn { nfixed_idx_checked(ctx, idx, n) } else { nfixed_idx_val(ctx, idx) }
+      let gep   = llvm_build_array_gep(native_ctx_b(ctx), arrty, ptr, ix)
       let raw   = llvm_build_load(native_ctx_b(ctx), nfixed_elem_ty(ctx, tag), gep)
-      nfixed_box(ctx, tag, raw)
+      if raw_out { raw } else { nfixed_box(ctx, tag, raw) }
     }
     _ -> nemit_null(ctx)
   }
@@ -139,6 +150,11 @@ fn nfixed_push_elems(ctx: Handle, tag: String, n: Int, ptr: Handle, vec: Handle,
                            native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), vec, boxed)
     nfixed_push_elems(ctx, tag, n, ptr, next, i + 1)
   }
+
+fn nfixed_idx_checked(ctx: Handle, idx: KVal, n: Int) : Handle / Console =
+  ncall_sig2(ctx, "kaix_fixed_vec_idx", native_ctx_i64t(ctx),
+             native_ctx_i64t(ctx), native_ctx_i64t(ctx),
+             nemit_atom_raw(ctx, idx, SInt64), llvm_const_int(native_ctx_i64t(ctx), n))
 
 fn nfixed_idx_val(ctx: Handle, idx: KVal) : Handle / Console = match idx {
   KIntV(k) -> llvm_const_i32(native_ctx_i32t(ctx), k)
