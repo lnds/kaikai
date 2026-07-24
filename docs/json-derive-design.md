@@ -161,6 +161,39 @@ type Config = {
 Each `#[json(...)]` carries one override; a field needing two (a skipped
 field with a default) writes two attributes. `kai fmt` round-trips them.
 
+## Sum types — adjacently tagged
+
+`#[derive(Json)]` binds a sum type under a fixed **adjacently-tagged**
+envelope:
+
+```json
+{"tag": "<VariantName>", "value": <payload>}
+```
+
+The payload mirrors the variant's arity:
+
+- a nullary variant → `"value": null`;
+- a single-payload variant `Circle(Real)` → `"value": 1.5`;
+- a multi-payload variant `Rect(Real, Real)` → `"value": [w, h]`, the
+  payload tuple as a JSON array.
+
+Decode reads `tag`, routes to the variant, and decodes `value` against
+that variant's payload shape. An unknown tag is a located `JsonError`
+naming the accepted variants (`root.tag: expected one of …`); a
+payload of the wrong shape locates at `root.value` (or `root.value[i]`
+for a multi-payload element). The payload itself still follows the four
+record policies above — verbatim field naming, `Option` = null-or-
+missing, structured located failures, unknown fields ignored — so a
+record nested in a variant and a sum nested in a record compose in both
+directions.
+
+The choice is **fixed, not selectable per type**, coherent with the
+record policies. Adjacent tagging is the one convention that works
+uniformly across every kaikai variant shape: internal tagging breaks on
+`Circle(Real)` (the payload is not an object), external tagging and
+untagged both degrade error reporting. `#[derive(Xml)]` is the same
+shape and follows this resolution.
+
 ## Why derive and not a kind
 
 JSON is derive-only and **never a kind**. Naming and null policy are
@@ -173,22 +206,20 @@ distinction is what keeps `Json` out of the kind system.
 
 ## Scope
 
-- **In:** `#[derive(Json)]` over records, generating `to_json` and
-  `of_json`; fields of type `String`, `Int`, `Real`, `Bool`, `[T]`,
-  `Option[T]`, and nested records that themselves derive `Json`; the
-  `#[json(rename/default/skip)]` field overrides.
-- **Out:** sum-type / enum encoding (tagged unions are a separate
-  convention choice — Go punts on it too, and the derive rejects sum
-  types rather than inventing one); streaming decode; schema validation
-  beyond structural shape.
+- **In:** `#[derive(Json)]` over records and sum types, generating
+  `to_json` and `of_json`; fields/payloads of type `String`, `Int`,
+  `Real`, `Bool`, `[T]`, `Option[T]`, and nested records/sums that
+  themselves derive `Json`; the `#[json(rename/default/skip)]` field
+  overrides; the adjacently-tagged sum envelope.
+- **Out:** per-type selectable tagging (the envelope is fixed);
+  streaming decode; schema validation beyond structural shape.
 
 ## Rejections the derive reports
 
-A field with no JSON denotation is reported at the derive site naming
-the field, rather than surfacing later as a missing `to_json` at the
-first call site:
+A field or variant payload with no JSON denotation is reported at the
+derive site naming the field/variant, rather than surfacing later as a
+missing `to_json` at the first call site:
 
-- a sum type — needs a tagged-union encoding the derive does not choose;
 - `Option[Option[T]]` — one JSON `null` cannot denote two absences;
 - a generic head (`Result[Int, String]`) — the emitted decode calls a
   monomorphic shim a parameterised type has none of;
@@ -203,6 +234,7 @@ first call site:
 - `stage2/compiler/json_derive.kai` — the impl builder.
 - `stage2/compiler/json_shape.kai` — field-shape classification and the
   `JsonField` reduction that carries the wire name, default, and skip.
-- `examples/stdlib/json_derive_*.kai` — round-trip, absence, error-path,
-  and override (`json_derive_overrides`, `json_derive_jsom_typo`,
+- `examples/stdlib/json_derive_*.kai` — round-trip, sum round-trip
+  (`json_derive_sum_roundtrip`), absence, error-path, and override
+  (`json_derive_overrides`, `json_derive_jsom_typo`,
   `json_derive_skip_no_default`) fixtures.
