@@ -41,9 +41,18 @@ let p : Result[Person, JsonError] = person_of_json(doc, "")
 let s : String      = json_encode(to_json(p))
 ```
 
-`JsonValue` and `JsonError` live in `stdlib/protocols.kai` alongside the
-`Json` protocol, for the same reason `BinCursor` does: a derived impl
-names them in its signature, so they must resolve without an import.
+`JsonValue` and `JsonError` live in `stdlib/encoding/json_bind.kai`
+alongside the runtime the derive lowers onto; only `protocol Json` sits
+in `stdlib/protocols.kai`, where the compiler pins its protocol id.
+
+The types deliberately stay out of the auto-loaded core: the C emitter
+eager-seeds every user nullary constructor as an immortal singleton in
+each binary's `main` (the direct-tag enum slot store needs it — a slot
+read can precede any construction), so `JNull` in the core would offset
+the RC trace baseline of every program that never touches JSON. A
+protocol may name types it does not declare, so the core still compiles.
+`encoding/json.kai` imports `json_bind`, so one `import encoding.json`
+brings the DOM, the codec, and the derive runtime into scope together.
 
 ## Shape
 
@@ -151,8 +160,9 @@ first call site:
 
 ## References
 
-- `stdlib/protocols.kai` §Json — the protocol, `JsonValue`, `JsonError`.
-- `stdlib/json_bind.kai` — the runtime the derive lowers onto.
+- `stdlib/protocols.kai` §Json — the protocol.
+- `stdlib/encoding/json_bind.kai` — `JsonValue`, `JsonError`, and the
+  runtime the derive lowers onto.
 - `stdlib/encoding/json.kai` — the dynamic DOM this builds on.
 - `stage2/compiler/json_derive.kai` — the impl builder.
 - `examples/stdlib/json_derive_*.kai` — round-trip, absence, and
