@@ -254,14 +254,42 @@ idempotence. The end-to-end form of the gate — cold vs cache-hit emitting
 byte-identical C for a whole package — lands with the module cut itself, since
 there is no cache hit to compare until a hit exists.
 
-### What this lane shipped, and what it did not
+### What the foundation lane shipped
 
-Shipped: the typed codec (`Ty` / `Row` / `TyScheme` / the 8 delta tables) and the
-canonical interface hash with its gates — the prerequisite the whole design rests
-on. **Not** shipped: serialization of the full `TypecheckedModule.typed`
-contribution, and the per-module driver restructure that would turn the hash into
-an actual rebuild cut. The front-end today still runs whole-program: the driver
-hands the typer one flattened post-cascade decl stream, so cutting per module
-means restructuring the passes between `expand_imports` and inference. That is
-tracked as follow-up work; until it lands, `mdelta_iface_hash` computes the right
-value but nothing consults it to skip work yet.
+The typed codec (`Ty` / `Row` / `TyScheme` / the 8 delta tables) and the canonical
+interface hash with its gates — the prerequisite the whole design rests on.
+
+### What the codec + cut lane shipped
+
+The `TypecheckedModule` contribution serde (`compiler.cache_typed`,
+`compiler.cache_typedprog`, `compiler.cache_delta_io`, `compiler.cache_module`)
+and the per-module fold restructure that turns the interface hash into an actual
+cut (`compiler.typed_cut`):
+
+- **Full `TypedProgram` + `ModuleEnvDelta` round-trip.** The KAB2 codec was
+  post-parse only; using it as a *typed*-artifact codec forced two changes. `Ty`
+  and `Expr` are mutually recursive (`TyRefineT(Ty, Expr)` one way, `Expr.ty:
+  Option[Ty]` the other), so their codecs were pulled into one module
+  (`compiler.cache_ast`, split out of `compiler.cache`), and `Expr.ty` now rides
+  the wire — a post-parse node encodes `None`, a typed node its inferred type.
+  `format_version` bumped to 5. `--cache-typed-selftest` proves
+  `serialize(deserialize(serialize(m)))` is byte-identical for a synthetic
+  `TypecheckedModule`.
+- **The fold + key.** `tcut_typecheck_program` mirrors `typecheck_program_loop`
+  but looks each module up by key first — `hash(module decls) + hash(inherited
+  interface) + hash(cross-module tables)`, per resolution (b) — inferring only on
+  a miss. A build in which every module misses is byte-identical to the uncut
+  fold. Verified: the restored `TypedProgram` and `ModuleEnvDelta` are
+  byte-identical to a fresh infer's (17/17 modules of a multi-module package).
+
+### What remains — the cut is not wired to a build path yet
+
+The blob a hit restores is byte-identical *in its serialized form* to a fresh
+infer, yet *using* that hit still trips a `non-exhaustive match` downstream. The
+serialized delta and typed program match byte-for-byte, so the gap is a codec
+node that renders two distinct values to the same bytes — a residual lossy arm in
+the surface-AST codec (`DProtoLaws`/`DImplAxiom` collapse to their inner; the
+21-arm `Decl` codec needs an audit for typed use). Until that audit closes, the
+cut is not consulted by `compile_source`; `compiler.typed_cut` is exercised only
+by its round-trip selftest. The end-to-end headline (cold vs cache-hit
+byte-identical C) lands once the codec audit finishes.

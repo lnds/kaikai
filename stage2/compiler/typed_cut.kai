@@ -1,0 +1,265 @@
+#[doc("""
+The per-module rebuild cut: decide whether a module can be restored
+from its typed blob instead of re-inferred, and publish the blob when
+it is.
+
+A module is restorable only when every input its inference reads is
+unchanged. Those inputs are three, and the key folds all three:
+
+1. **The module's own post-cascade decls.** Keyed over the serialized
+   decls, not the source text, so the ~15 whole-program passes that run
+   before the typer are already baked in.
+2. **The interface it inherits.** The accumulated `ModuleEnvDelta` of
+   every module folded before it, via the canonical interface hash — so
+   an upstream edit that leaves its interface unchanged does not
+   invalidate this module.
+3. **The cross-module context** — protocol impls, kind theories, the
+   head-owner table, and the program-wide type/effect declarations the
+   typer looks up across the partition. These are threaded around the
+   fold, so a fine-grained attribution would have to model how each
+   reaches an importer's inference; a change to any of them
+   invalidates every module instead. Over-invalidating costs a miss;
+   under-invalidating serves a stale interface, which is the one
+   unsound failure.
+
+Function *bodies* outside the module are deliberately excluded from
+term 3: the whole-program lookups the typer performs across the
+partition read type, effect and protocol declarations only. That
+exclusion is what makes a one-line body edit stop at its own module.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.cache
+import compiler.infer
+import compiler.cache_delta
+import compiler.cache_module
+import compiler.user_cache
+
+#[doc("Per-module cut context: the cache directory (empty disables the cut) and the cross-module context hash folded into every module key.")]
+pub type TypedCutCtx = TCC(String, String)
+
+#[doc("A disabled cut — every module is inferred and nothing is published.")]
+pub fn tcut_off() : TypedCutCtx = TCC("", "")
+
+#[doc("Whether the cut is live. A cut with no cache directory infers every module, which is the behaviour every non-build entry point wants.")]
+pub fn tcut_on(ctx: TypedCutCtx) : Bool = match ctx { TCC(dir, _) -> dir != "" }
+
+# ---- cross-module context hash ----------------------------------------
+#
+# The projection of the whole-program decl stream that the typer can
+# reach across the module partition: type, effect, protocol, impl and
+# unit declarations. A `DFn` contributes its name and signature shape
+# only through its own module's term, so its body is not hashed here —
+# that is the whole point of the cut.
+
+fn xdecl_chunk(d: Decl) : String = match d {
+  DType(_, _, _, _, _, _, _, _) -> cache_decl_list_to_hex([d])
+  DEffect(_, _, _, _, _, _, _, _) -> cache_decl_list_to_hex([d])
+  DProtocol(_, _, _, _, _, _) -> cache_decl_list_to_hex([d])
+  DUnit(_, _, _, _, _, _) -> cache_decl_list_to_hex([d])
+  _ -> ""
+}
+
+fn xdecls_bytes(ds: [Decl]) : String = concat_all(map(ds, (d) => xdecl_chunk(d)))
+
+# The three tables are rendered field-by-field, not by length: an impl
+# retargeted onto a different type keeps the table's length and would
+# otherwise slip through as an unchanged context. Each field is
+# length-prefixed so no two different splits of the same characters
+# render identically.
+
+fn tc_field(s: String) : String =
+  concat_all([int_to_string(string_length(s)), ":", s])
+
+fn tc_fields(xs: [String]) : String =
+  concat_all([int_to_string(list_length(xs)), "[",
+              concat_all(map(xs, (x) => tc_field(x))), "]"])
+
+fn pir_chunk(p: ProtoImplReg) : String = match p {
+  PIR(a, b, c, d, es, f) -> {
+    let echunk = tc_fields(map(es, (e) => e))
+    concat_all([tc_field(a), tc_field(b), tc_field(c), tc_field(d),
+                echunk, tc_field(f)])
+  }
+}
+
+fn hoe_chunk(h: HeadOwnerEntry) : String = match h {
+  HOE(nm, owners) -> {
+    let ochunk = tc_fields(map(owners, (o) => o))
+    concat_all([tc_field(nm), ochunk])
+  }
+}
+
+fn kth_chunk(k: KindTheory) : String = match k {
+  KTh(a, b) -> concat_all([tc_field(a), tc_field(b)])
+}
+
+#[doc("Build the cut context for one compile: the cache directory plus a hash over the cross-module inputs the typer reads around the fold — the protocol-impl, kind-theory and head-owner tables, and the program-wide type/effect declarations. Pass an empty directory to disable the cut.")]
+pub fn tcut_ctx(cache_dir: String, all_program_decls: [Decl],
+                 proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
+                 kind_theories: [KindTheory]) : TypedCutCtx = {
+  let xhex = uc_content_hex(concat_all([xdecls_bytes(all_program_decls), "|",
+                                        concat_all(map(proto_impls, (p) => pir_chunk(p))), "|",
+                                        concat_all(map(head_owners, (h) => hoe_chunk(h))), "|",
+                                        concat_all(map(kind_theories, (k) => kth_chunk(k)))]))
+  TCC(cache_dir, xhex)
+}
+
+# ---- key + lookup + publish -------------------------------------------
+
+#[doc("The typed-module cache key for one module folded against an inherited delta, under the given cut context.")]
+pub fn tcut_key(ctx: TypedCutCtx, mod_decls: [Decl],
+                 inherited: ModuleEnvDelta) : String = match ctx {
+  TCC(_, xhex) -> tm_key_hex(tm_decls_hex(mod_decls),
+                              mdelta_iface_hash(inherited), xhex)
+}
+
+#[doc("Look up a module's typed blob by key; `None` on a disabled cut, a missing blob, or any header/payload drift.")]
+pub fn tcut_lookup(ctx: TypedCutCtx,
+                    key: String) : Option[TypecheckedModule] / Console + File =
+  match ctx {
+    TCC(dir, _) -> if dir == "" { None }
+                   else { tcut_read(dir, key) }
+  }
+
+fn tcut_read(dir: String, key: String) : Option[TypecheckedModule] / Console + File =
+  match read_file(tm_blob_path(dir, key)) {
+    Err(_) -> None
+    Ok(blob) -> cache_deserialize_tcmodule(blob)
+  }
+
+#[doc("Publish a module's typed blob for its key. A write failure is swallowed — a cache that cannot be written is a performance loss, never a correctness one.")]
+pub fn tcut_publish(ctx: TypedCutCtx, key: String,
+                     m: TypecheckedModule) : Unit / Console + File = match ctx {
+  TCC(dir, _) -> if dir == "" { () }
+                 else {
+                   cache_publish(tm_blob_path(dir, key),
+                                  cache_serialize_tcmodule(m, tm_header_sha(key)))
+                 }
+}
+
+# ---- the fold, with the cut -------------------------------------------
+#
+# Mirrors `typecheck_program_loop` in `compiler.infer`, with one
+# difference: each module is looked up by key first and only inferred on
+# a miss. The accumulators, their order, and the terminal `TypedProgram`
+# assembly are identical, so a build in which every module misses is
+# byte-identical to the uncut fold.
+
+type TCFold = TCF([Decl], Int, [ResolvedCS], [ResolvedHole], [ResolvedRowHole],
+                   [Diagnostic], [OpResolution], Int, Int)
+
+fn tcf_empty() : TCFold = TCF([], 0, [], [], [], [], [], 0, 0)
+
+fn tcf_step(acc: TCFold, tm: TypecheckedModule) : TCFold = match acc {
+  TCF(ds, errs, insts, holes, rhs, diags, ops, core_len, _) -> {
+    let tp = tm.typed
+    let next_core_len = match core_len { 0 -> tp.core_len
+                                         _ -> core_len }
+    TCF(prepend_reverse_decls(tp.decls, ds), errs + tp.errs,
+        llvm_prepend_reverse(tp.insts, insts),
+        prepend_reverse_holes(tp.holes, holes),
+        prepend_reverse_row_holes(tp.row_holes, rhs),
+        prepend_reverse_diags(tp.diags, diags),
+        prepend_reverse_op_res(tp.op_res, ops),
+        next_core_len, tp.toplevel_len)
+  }
+}
+
+fn tcf_finish(acc: TCFold, all_program_decls: [Decl]) : TypedProgram = match acc {
+  TCF(ds, errs, insts, holes, rhs, diags, ops, core_len, toplevel_len) ->
+    TypedProgram {
+      decls: list_reverse(ds), errs: errs, insts: list_reverse(insts),
+      holes: list_reverse(holes), row_holes: list_reverse(rhs),
+      core_len: core_len, toplevel_len: toplevel_len,
+      module_doc: doc_module_doc_text(all_program_decls),
+      diags: list_reverse(diags), op_res: list_reverse(ops)
+    }
+}
+
+#[doc("Fold the per-module typechecker across a partitioned decl stream, restoring each module from its typed blob when the cut's key matches and inferring it otherwise. With the cut disabled every module is inferred, which is byte-identical to the uncut fold.")]
+pub fn tcut_typecheck_program(file: String, modules: [ModuleDecls],
+                               ctx: TypedCutCtx,
+                               proto_impls: [ProtoImplReg],
+                               head_owners: [HeadOwnerEntry],
+                               kind_theories: [KindTheory],
+                               verbose: Bool) : TypedProgram / Console + File = {
+  let all_program_decls = flatten_module_decls(modules, [])
+  let acc = tcut_loop(file, modules, module_env_delta_empty(), all_program_decls,
+                       ctx, proto_impls, head_owners, kind_theories, verbose,
+                       tcf_empty())
+  tcf_finish(acc, all_program_decls)
+}
+
+fn tcut_loop(file: String, modules: [ModuleDecls], inherited: ModuleEnvDelta,
+              all_program_decls: [Decl], ctx: TypedCutCtx,
+              proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
+              kind_theories: [KindTheory], verbose: Bool,
+              acc: TCFold) : TCFold / Console + File = match modules {
+  [] -> acc
+  [m, ...rest] -> {
+    let tm = tcut_module(file, m, inherited, all_program_decls, ctx,
+                          proto_impls, head_owners, kind_theories, verbose)
+    tcut_loop(file, rest, merge_env_deltas(inherited, tm.delta),
+               all_program_decls, ctx, proto_impls, head_owners, kind_theories,
+               verbose, tcf_step(acc, tm))
+  }
+}
+
+# One module: restore it when its key hits, infer and publish otherwise.
+# The key is computed once and reused for the publish, so a hit and the
+# miss that would have replaced it name the same blob.
+fn tcut_module(file: String, m: ModuleDecls, inherited: ModuleEnvDelta,
+                all_program_decls: [Decl], ctx: TypedCutCtx,
+                proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
+                kind_theories: [KindTheory],
+                verbose: Bool) : TypecheckedModule / Console + File = {
+  if not tcut_on(ctx) {
+    typecheck_module(file, m, inherited, all_program_decls, proto_impls,
+                      head_owners, kind_theories, verbose)
+  } else {
+    let key = tcut_key(ctx, m.decls, inherited)
+    match tcut_lookup(ctx, key) {
+      Some(hit) -> hit
+      None -> tcut_infer_publish(file, m, inherited, all_program_decls, ctx, key,
+                                  proto_impls, head_owners, kind_theories, verbose)
+    }
+  }
+}
+
+fn tcut_infer_publish(file: String, m: ModuleDecls, inherited: ModuleEnvDelta,
+                       all_program_decls: [Decl], ctx: TypedCutCtx, key: String,
+                       proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
+                       kind_theories: [KindTheory],
+                       verbose: Bool) : TypecheckedModule / Console + File = {
+  let tm = typecheck_module(file, m, inherited, all_program_decls, proto_impls,
+                             head_owners, kind_theories, verbose)
+  # A module that produced errors is not published: its typed artifact is
+  # a partial result the next build must reproduce, diagnostics and all.
+  if tm.typed.errs == 0 { tcut_publish(ctx, key, tm) } else { () }
+  tm
+}
+
+#[doc("The cut-aware counterpart of `infer_program_with_protos_cached`: partition the post-cascade decl stream by home module, then fold the per-module typechecker across it under the cut. An empty cache directory disables the cut and reproduces the uncut path exactly.")]
+pub fn tcut_infer_program(file: String, decls: [Decl], cache_dir: String,
+                           proto_impls: [ProtoImplReg],
+                           head_owners: [HeadOwnerEntry],
+                           kind_theories: [KindTheory],
+                           verbose: Bool) : TypedProgram / Console + File = {
+  let mods0 = partition_decls_by_home(decls, inf_core_module_name(file))
+  # One bucket (or none) means there is nothing to cut: the fold would
+  # re-infer the whole program on any edit anyway, so run it uncut.
+  match mods0 {
+    []  -> infer_program_with_protos_cached(file, decls, verbose, proto_impls,
+                                             head_owners, kind_theories)
+    [_] -> infer_program_with_protos_cached(file, decls, verbose, proto_impls,
+                                             head_owners, kind_theories)
+    _   -> {
+      let ctx = tcut_ctx(cache_dir, flatten_module_decls(mods0, []), proto_impls,
+                          head_owners, kind_theories)
+      tcut_typecheck_program(file, mods0, ctx, proto_impls, head_owners,
+                              kind_theories, verbose)
+    }
+  }
+}
