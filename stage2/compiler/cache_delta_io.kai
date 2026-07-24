@@ -1,0 +1,330 @@
+#[doc("""
+Round-trip serde for a whole `ModuleEnvDelta` and for the
+`TypecheckedModule` a per-module cache hit restores.
+
+`compiler.cache_delta` renders a delta *canonically*, for the interface
+hash. This module renders it *faithfully*: original var ids, original
+table order, so a restored delta seeds an importer's typer env exactly
+as the fresh one would. The two treatments are deliberately separate —
+canonicalization proves interface identity, fidelity proves the restored
+artifact emits the same C.
+
+Wire conventions follow `compiler.cache`: lists emit `u32 length + each
+element`, records emit fields in declaration order.
+""")]
+
+import compiler.ast
+import compiler.cache
+import compiler.cache_ast
+import compiler.infer
+import compiler.cache_delta
+import compiler.cache_typed
+
+pub type CacheMDPos  = CMDP(ModuleEnvDelta, Int)
+pub type CacheTCMPos = CTCMP(TypecheckedModule, Int)
+
+pub type CacheUIPos   = CUIP(UnionInfo, Int)
+pub type CacheUILPos  = CUILP([UnionInfo], Int)
+pub type CacheOEAPos  = COEAP(OpEffArity, Int)
+pub type CacheOEALPos = COEALP([OpEffArity], Int)
+pub type CacheRIPos2  = CRIP2(RecInfo, Int)
+pub type CacheRILPos2 = CRILP2([RecInfo], Int)
+pub type CacheSIPos   = CSIP(SumInfo, Int)
+pub type CacheSILPos  = CSILP([SumInfo], Int)
+pub type CacheOTEPos  = COTEP(OpToEff, Int)
+pub type CacheOTELPos = COTELP([OpToEff], Int)
+pub type CacheUAEPos  = CUAEP(UAliasEntry, Int)
+pub type CacheUAELPos = CUAELP([UAliasEntry], Int)
+pub type CacheCEPos   = CCEP(CtorEntry, Int)
+pub type CacheCELPos  = CCELP([CtorEntry], Int)
+
+fn di_len_prefixed(chunks: [String]) : String =
+  concat_all([cache_u32_to_hex(list_length(chunks)), concat_all(chunks)])
+
+# ---- UnionInfo --------------------------------------------------------
+
+fn cache_hex_to_unioninfo(buf: String, pos: Int) : Option[CacheUIPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> ui_after_name(buf, p, nm) }
+  }
+}
+
+fn ui_after_name(buf: String, pos: Int, nm: String) : Option[CacheUIPos] {
+  match cache_hex_to_tyr_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CTyRLP(tys, p) -> ui_after_tys(buf, p, nm, tys) }
+  }
+}
+
+fn ui_after_tys(buf: String, pos: Int, nm: String, tys: [Ty]) : Option[CacheUIPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(l, p) -> ui_after_line(buf, p, nm, tys, l) }
+  }
+}
+
+fn ui_after_line(buf: String, pos: Int, nm: String, tys: [Ty],
+                  l: Int) : Option[CacheUIPos] {
+  match cache_hex_to_int(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(col, p) -> Some(CUIP(UI(nm, tys, l, col), p)) }
+  }
+}
+
+#[doc("Decode a `[UnionInfo]` payload chunk at `pos`.")]
+pub fn cache_hex_to_unioninfo_list(buf: String, pos: Int) : Option[CacheUILPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_ui(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_ui(buf: String, pos: Int, remaining: Int,
+                  acc: [UnionInfo]) : Option[CacheUILPos] {
+  if remaining <= 0 { Some(CUILP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_unioninfo(buf, pos) {
+      None -> None
+      Some(c) -> match c { CUIP(u, p2) ->
+        di_collect_ui(buf, p2, remaining - 1, [u, ...acc]) }
+    }
+  }
+}
+
+# ---- OpEffArity -------------------------------------------------------
+
+fn cache_hex_to_opeffarity(buf: String, pos: Int) : Option[CacheOEAPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> match cache_hex_to_int(buf, p) {
+      None -> None
+      Some(c2) -> match c2 { CIP(n, p2) -> Some(COEAP(OEA(nm, n), p2)) }
+    } }
+  }
+}
+
+#[doc("Decode an `[OpEffArity]` payload chunk at `pos`.")]
+pub fn cache_hex_to_opeffarity_list(buf: String, pos: Int) : Option[CacheOEALPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_oea(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_oea(buf: String, pos: Int, remaining: Int,
+                   acc: [OpEffArity]) : Option[CacheOEALPos] {
+  if remaining <= 0 { Some(COEALP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_opeffarity(buf, pos) {
+      None -> None
+      Some(c) -> match c { COEAP(a, p2) ->
+        di_collect_oea(buf, p2, remaining - 1, [a, ...acc]) }
+    }
+  }
+}
+
+# ---- RecInfo ----------------------------------------------------------
+
+fn cache_hex_to_recinfo(buf: String, pos: Int) : Option[CacheRIPos2] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> ri_after_name(buf, p, nm) }
+  }
+}
+
+fn ri_after_name(buf: String, pos: Int, nm: String) : Option[CacheRIPos2] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSLP(tps, p) -> ri_after_tps(buf, p, nm, tps) }
+  }
+}
+
+fn ri_after_tps(buf: String, pos: Int, nm: String, tps: [String]) : Option[CacheRIPos2] {
+  match cache_hex_to_fd_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CFDLP(fds, p) -> ri_after_fields(buf, p, nm, tps, fds) }
+  }
+}
+
+fn ri_after_fields(buf: String, pos: Int, nm: String, tps: [String],
+                    fds: [FieldDecl]) : Option[CacheRIPos2] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(mo, p) -> Some(CRIP2(RI(nm, tps, fds, mo), p)) }
+  }
+}
+
+#[doc("Decode a `[RecInfo]` payload chunk at `pos`.")]
+pub fn cache_hex_to_recinfo_list(buf: String, pos: Int) : Option[CacheRILPos2] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_ri(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_ri(buf: String, pos: Int, remaining: Int,
+                  acc: [RecInfo]) : Option[CacheRILPos2] {
+  if remaining <= 0 { Some(CRILP2(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_recinfo(buf, pos) {
+      None -> None
+      Some(c) -> match c { CRIP2(r, p2) ->
+        di_collect_ri(buf, p2, remaining - 1, [r, ...acc]) }
+    }
+  }
+}
+
+# ---- SumInfo ----------------------------------------------------------
+
+fn cache_hex_to_suminfo(buf: String, pos: Int) : Option[CacheSIPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> si_after_name(buf, p, nm) }
+  }
+}
+
+fn si_after_name(buf: String, pos: Int, nm: String) : Option[CacheSIPos] {
+  match cache_hex_to_string_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSLP(tps, p) -> si_after_tps(buf, p, nm, tps) }
+  }
+}
+
+fn si_after_tps(buf: String, pos: Int, nm: String, tps: [String]) : Option[CacheSIPos] {
+  match cache_hex_to_var_list(buf, pos) {
+    None -> None
+    Some(c) -> match c { CVarLP(vs, p) -> si_after_vars(buf, p, nm, tps, vs) }
+  }
+}
+
+fn si_after_vars(buf: String, pos: Int, nm: String, tps: [String],
+                  vs: [Variant]) : Option[CacheSIPos] {
+  match cache_hex_to_opt_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { COSP(mo, p) -> Some(CSIP(SI(nm, tps, vs, mo), p)) }
+  }
+}
+
+#[doc("Decode a `[SumInfo]` payload chunk at `pos`.")]
+pub fn cache_hex_to_suminfo_list(buf: String, pos: Int) : Option[CacheSILPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_si(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_si(buf: String, pos: Int, remaining: Int,
+                  acc: [SumInfo]) : Option[CacheSILPos] {
+  if remaining <= 0 { Some(CSILP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_suminfo(buf, pos) {
+      None -> None
+      Some(c) -> match c { CSIP(s, p2) ->
+        di_collect_si(buf, p2, remaining - 1, [s, ...acc]) }
+    }
+  }
+}
+
+# ---- OpToEff / UAliasEntry / CtorEntry --------------------------------
+
+fn cache_hex_to_optoeff(buf: String, pos: Int) : Option[CacheOTEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(op, p) -> match cache_hex_to_string(buf, p) {
+      None -> None
+      Some(c2) -> match c2 { CSP(eff, p2) -> Some(COTEP(OEFP(op, eff), p2)) }
+    } }
+  }
+}
+
+#[doc("Decode an `[OpToEff]` payload chunk at `pos`.")]
+pub fn cache_hex_to_optoeff_list(buf: String, pos: Int) : Option[CacheOTELPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_ote(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_ote(buf: String, pos: Int, remaining: Int,
+                   acc: [OpToEff]) : Option[CacheOTELPos] {
+  if remaining <= 0 { Some(COTELP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_optoeff(buf, pos) {
+      None -> None
+      Some(c) -> match c { COTEP(o, p2) ->
+        di_collect_ote(buf, p2, remaining - 1, [o, ...acc]) }
+    }
+  }
+}
+
+fn cache_hex_to_ualias(buf: String, pos: Int) : Option[CacheUAEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(nm, p) -> match cache_hex_to_unit(buf, p) {
+      None -> None
+      Some(c2) -> match c2 { CUP(u, p2) -> Some(CUAEP(UAE(nm, u), p2)) }
+    } }
+  }
+}
+
+#[doc("Decode a `[UAliasEntry]` payload chunk at `pos`.")]
+pub fn cache_hex_to_ualias_list(buf: String, pos: Int) : Option[CacheUAELPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_uae(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_uae(buf: String, pos: Int, remaining: Int,
+                   acc: [UAliasEntry]) : Option[CacheUAELPos] {
+  if remaining <= 0 { Some(CUAELP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_ualias(buf, pos) {
+      None -> None
+      Some(c) -> match c { CUAEP(u, p2) ->
+        di_collect_uae(buf, p2, remaining - 1, [u, ...acc]) }
+    }
+  }
+}
+
+fn cache_hex_to_ctorentry(buf: String, pos: Int) : Option[CacheCEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(ty, p) -> ce_after_ty(buf, p, ty) }
+  }
+}
+
+fn ce_after_ty(buf: String, pos: Int, ty: String) : Option[CacheCEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(home, p) -> ce_after_home(buf, p, ty, home) }
+  }
+}
+
+fn ce_after_home(buf: String, pos: Int, ty: String, home: String) : Option[CacheCEPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(c) -> match c { CSP(fn_, p) -> Some(CCEP(CtorE(ty, home, fn_), p)) }
+  }
+}
+
+#[doc("Decode a `[CtorEntry]` payload chunk at `pos`.")]
+pub fn cache_hex_to_ctorentry_list(buf: String, pos: Int) : Option[CacheCELPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(c) -> match c { CIP(n, p2) -> di_collect_ce(buf, p2, n, []) }
+  }
+}
+
+fn di_collect_ce(buf: String, pos: Int, remaining: Int,
+                  acc: [CtorEntry]) : Option[CacheCELPos] {
+  if remaining <= 0 { Some(CCELP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_ctorentry(buf, pos) {
+      None -> None
+      Some(c) -> match c { CCEP(e, p2) ->
+        di_collect_ce(buf, p2, remaining - 1, [e, ...acc]) }
+    }
+  }
+}
