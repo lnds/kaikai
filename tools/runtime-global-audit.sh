@@ -85,11 +85,19 @@ enumerate() {
     | sort -u
 }
 
+# Sets are sorted flat files rather than associative arrays: macOS ships
+# bash 3.2, where `declare -A` does not exist, and this gate must run in
+# the stock-mac pre-commit path.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+ALLOWED_SYMS="$WORK/allowed"
+SEEN_SYMS="$WORK/seen"
+
 # The allow-list is `<symbol> <class>` lines; `#` comments and blank lines
 # are ignored. Build the set of allowed symbols and validate the class.
-declare -A ALLOWED_CLASS
 VALID_CLASSES="tls immutable immortal shared-locked reactor-owned scratch"
 bad_class=0
+: > "$ALLOWED_SYMS"
 while IFS= read -r line; do
   line="${line%%#*}"
   # shellcheck disable=SC2086
@@ -102,40 +110,37 @@ while IFS= read -r line; do
   fi
   sym="$1"; cls="$2"
   case " $VALID_CLASSES " in
-    *" $cls "*) ALLOWED_CLASS["$sym"]="$cls" ;;
+    *" $cls "*) echo "$sym" >> "$ALLOWED_SYMS" ;;
     *) echo "runtime-global-audit: unknown class '$cls' for '$sym'" >&2; bad_class=1 ;;
   esac
 done < "$ALLOW"
+sort -u -o "$ALLOWED_SYMS" "$ALLOWED_SYMS"
 
 # Enumerate every global across the runtimes (deduped across files: the
 # same symbol appears in stage2 and its stage0 mirror).
-declare -A SEEN
+: > "$SEEN_SYMS"
 for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
-  while IFS= read -r sym; do
-    [ -z "$sym" ] && continue
-    SEEN["$sym"]=1
-  done < <(enumerate "$f")
+  enumerate "$f" >> "$SEEN_SYMS"
 done
+sort -u -o "$SEEN_SYMS" "$SEEN_SYMS"
 
 unclassified=0
-for sym in "${!SEEN[@]}"; do
-  if [ -z "${ALLOWED_CLASS[$sym]:-}" ]; then
-    echo "runtime-global-audit: UNCLASSIFIED mutable global '$sym'" >&2
-    echo "  → add it to tools/runtime-globals.allow with one of: $VALID_CLASSES" >&2
-    unclassified=$((unclassified + 1))
-  fi
-done
+while IFS= read -r sym; do
+  [ -z "$sym" ] && continue
+  echo "runtime-global-audit: UNCLASSIFIED mutable global '$sym'" >&2
+  echo "  → add it to tools/runtime-globals.allow with one of: $VALID_CLASSES" >&2
+  unclassified=$((unclassified + 1))
+done < <(comm -23 "$SEEN_SYMS" "$ALLOWED_SYMS")
 
 stale=0
-for sym in "${!ALLOWED_CLASS[@]}"; do
-  if [ -z "${SEEN[$sym]:-}" ]; then
-    echo "runtime-global-audit: STALE allow-list entry '$sym' (no longer defined)" >&2
-    stale=$((stale + 1))
-  fi
-done
+while IFS= read -r sym; do
+  [ -z "$sym" ] && continue
+  echo "runtime-global-audit: STALE allow-list entry '$sym' (no longer defined)" >&2
+  stale=$((stale + 1))
+done < <(comm -13 "$SEEN_SYMS" "$ALLOWED_SYMS")
 
-total="${#SEEN[@]}"
+total="$(grep -c . "$SEEN_SYMS" || true)"
 echo "runtime-global-audit: globals=$total classified=$((total - unclassified)) unclassified=$unclassified stale=$stale"
 main_ok=0
 { [ "$unclassified" -eq 0 ] && [ "$stale" -eq 0 ] && [ "$bad_class" -eq 0 ]; } || main_ok=1
@@ -144,15 +149,13 @@ main_ok=0
 # into a scratch copy of the primary runtime, re-enumerate, and require the
 # probe to surface as unclassified. A gate that cannot fail is not a gate.
 if [ "$MODE" = "--self-test" ]; then
-  tmp="$(mktemp)"
+  tmp="$WORK/selftest.h"
   cp "stage2/runtime.h" "$tmp"
   printf '\nstatic int kai_audit_selftest_probe = 0;\n' >> "$tmp"
   if enumerate "$tmp" | grep -qx 'kai_audit_selftest_probe'; then
     echo "runtime-global-audit: self-test OK (an unclassified global is detected)"
-    rm -f "$tmp"
   else
     echo "runtime-global-audit: SELF-TEST FAILED — enumerator missed an injected global" >&2
-    rm -f "$tmp"
     exit 1
   fi
 fi
