@@ -470,6 +470,8 @@ type CacheDeclLPos  = CDLP([Decl], Int)
 type CacheFDPos     = CFDP(FieldDecl, Int)
 type CacheVarPos    = CVarP(Variant, Int)
 type CacheFDLPos    = CFDLP([FieldDecl], Int)
+type CacheFAPos     = CFAP([FieldAttr], Int)
+type CacheFA1Pos    = CFA1(FieldAttr, Int)
 type CacheVarLPos   = CVarLP([Variant], Int)
 type CacheTBPos     = CTBP(TypeBody, Int)
 type CacheIKPos     = CIKP(ImportKind, Int)
@@ -2230,9 +2232,10 @@ fn cache_hex_to_opt_db(buf: String, pos: Int) : Option[CacheOptDBPos] {
 # ---- FieldDecl / Variant / TypeBody ---------------------------------------
 
 fn cache_fd_to_hex(fd: FieldDecl) : String = match fd {
-  FD(is_pub, n, t) -> concat_all([cache_bool_to_hex(is_pub),
+  FD(is_pub, n, t, attrs) -> concat_all([cache_bool_to_hex(is_pub),
                                    cache_string_to_hex(n),
-                                   cache_typeexpr_to_hex(t)])
+                                   cache_typeexpr_to_hex(t),
+                                   cache_fattrs_to_hex(attrs)])
 }
 
 fn cache_hex_to_fd(buf: String, pos: Int) : Option[CacheFDPos] {
@@ -2244,9 +2247,80 @@ fn cache_hex_to_fd(buf: String, pos: Int) : Option[CacheFDPos] {
         Some(csp) -> match csp { CSP(n, p1) ->
           match cache_hex_to_typeexpr(buf, p1) {
             None -> None
-            Some(ct) -> match ct { CTyP(t, p2) -> Some(CFDP(FD(is_pub, n, t), p2)) }
+            Some(ct) -> match ct { CTyP(t, p2) ->
+              match cache_hex_to_fattrs(buf, p2) {
+                None -> None
+                Some(cfap) -> match cfap { CFAP(attrs, p3) ->
+                  Some(CFDP(FD(is_pub, n, t, attrs), p3))
+                }
+              }
+            }
           }
         }
+      }
+    }
+  }
+}
+
+# `[FieldAttr]` round-trip: a u32 length, then one tag byte per attr
+# (0=rename, 1=default, 2=skip) with its payload. The default's Expr
+# rides the shared expr codec, so a `default = 0` -> `default = 1` edit
+# changes the serialised bytes and invalidates the incremental rebuild.
+#[doc("Serialise a field's `[FieldAttr]` list for the module cache and the delta hash, including the default expression so a default-value edit invalidates the rebuild.")]
+pub fn cache_fattrs_to_hex(attrs: [FieldAttr]) : String =
+  concat_all([cache_u32_to_hex(list_length(attrs)),
+              concat_all(list_reverse(cache_fattrs_loop(attrs, [])))])
+
+fn cache_fattrs_loop(attrs: [FieldAttr], acc: [String]) : [String] = match attrs {
+  [] -> acc
+  [a, ...t] -> cache_fattrs_loop(t, [cache_fattr_to_hex(a), ...acc])
+}
+
+fn cache_fattr_to_hex(a: FieldAttr) : String = match a {
+  FAJsonRename(n)  -> concat_all([cache_byte_to_hex(0), cache_string_to_hex(n)])
+  FAJsonDefault(e) -> concat_all([cache_byte_to_hex(1), cache_expr_to_hex(e)])
+  FAJsonSkip       -> cache_byte_to_hex(2)
+}
+
+fn cache_hex_to_fattrs(buf: String, pos: Int) : Option[CacheFAPos] {
+  match cache_hex_to_u32(buf, pos) {
+    None -> None
+    Some(cip) -> match cip { CIP(n, p2) ->
+      cache_hex_collect_fattrs(buf, p2, n, [])
+    }
+  }
+}
+
+fn cache_hex_collect_fattrs(buf: String, pos: Int, remaining: Int,
+                             acc: [FieldAttr]) : Option[CacheFAPos] {
+  if remaining <= 0 { Some(CFAP(list_reverse(acc), pos)) }
+  else {
+    match cache_hex_to_fattr(buf, pos) {
+      None -> None
+      Some(cfa) -> match cfa { CFA1(a, p2) ->
+        cache_hex_collect_fattrs(buf, p2, remaining - 1, [a, ...acc])
+      }
+    }
+  }
+}
+
+fn cache_hex_to_fattr(buf: String, pos: Int) : Option[CacheFA1Pos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(tag) -> {
+      let p1 = pos + 1
+      if tag == 0 {
+        match cache_hex_to_string(buf, p1) {
+          None -> None
+          Some(csp) -> match csp { CSP(n, p2) -> Some(CFA1(FAJsonRename(n), p2)) }
+        }
+      } else if tag == 1 {
+        match cache_hex_to_expr(buf, p1) {
+          None -> None
+          Some(cep) -> match cep { CEP(e, p2) -> Some(CFA1(FAJsonDefault(e), p2)) }
+        }
+      } else {
+        Some(CFA1(FAJsonSkip, p1))
       }
     }
   }
@@ -3547,8 +3621,8 @@ pub fn cache_roundtrip_self_test() : String {
           TBSum([Var("Red", []), Var("Green", []), Var("Blue", [])]),
           1, 1, None, []),
     DType(true, "Pair", ["T"],
-          TBRecord([FD(true, "fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }),
-                    FD(true, "snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 })]),
+          TBRecord([FD(true, "fst", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }, []),
+                    FD(true, "snd", TypeExpr { tkind: TyName("T", []), line: 1, col: 1 }, [])]),
           2, 1, None, []),
     DFn(true, "answer", [], [], Some(int_ty), row, body, 3, 1, None),
     DConst(true, "PI",

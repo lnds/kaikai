@@ -106,13 +106,16 @@ fn jd_to_json_body(jfs: [JsonField], line: Int, col: Int) : Expr =
 fn jd_pairs(jfs: [JsonField], line: Int, col: Int) : [ListElem] = match jfs {
   [] -> []
   [f, ...rest] -> match f {
-    JF(name, shape) -> {
-      let read = jd_expr(EField(jd_var("self", line, col), name), line, col)
-      let pair = jd_expr(ERecordLit("Pair",
-                   [FI("fst", jd_str(name, line, col)),
-                    FI("snd", jd_encode(shape, read, line, col))]), line, col)
-      [ElPlain(pair), ...jd_pairs(rest, line, col)]
-    }
+    # A `#[json(skip)]` field is not written to the wire.
+    JF(name, wire, shape, _, skip) ->
+      if skip { jd_pairs(rest, line, col) }
+      else {
+        let read = jd_expr(EField(jd_var("self", line, col), name), line, col)
+        let pair = jd_expr(ERecordLit("Pair",
+                     [FI("fst", jd_str(wire, line, col)),
+                      FI("snd", jd_encode(shape, read, line, col))]), line, col)
+        [ElPlain(pair), ...jd_pairs(rest, line, col)]
+      }
   }
 }
 
@@ -157,21 +160,56 @@ fn jd_tower(tname: String, jfs: [JsonField], bound: [String],
             line: Int, col: Int) : Expr = match jfs {
   [] -> jd_call("Ok", [jd_record(tname, list_reverse(bound), line, col)], line, col)
   [f, ...rest] -> match f {
-    JF(name, shape) -> {
-      let node = jd_call("json_bind_field",
-                   [jd_var("v", line, col), jd_str(name, line, col)], line, col)
-      let sub = jd_call("json_path_field",
-                  [jd_var("path", line, col), jd_str(name, line, col)], line, col)
-      let read = jd_decode(shape, node, sub, line, col)
-      let ok_arm = Arm(mk_pat(PVariant("Ok", [mk_pat(PBind(name), line, col)]),
-                              line, col), None,
-                       jd_tower(tname, rest, [name, ...bound], line, col))
-      let err_arm = Arm(mk_pat(PVariant("Err", [mk_pat(PBind("e"), line, col)]),
-                               line, col), None,
-                        jd_call("Err", [jd_var("e", line, col)], line, col))
-      jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
-    }
+    JF(name, wire, shape, dflt, skip) ->
+      if skip {
+        # No wire value: reconstruct from the default, or `None` for an
+        # `Option`. `let name = <value>` then continue the tower.
+        let value = jd_skip_value(shape, dflt, line, col)
+        jd_expr(EBlock([SLet(mk_pat(PBind(name), line, col), None, value)],
+                       Some(jd_tower(tname, rest, [name, ...bound], line, col))),
+                line, col)
+      } else {
+        let node = jd_call("json_bind_field",
+                     [jd_var("v", line, col), jd_str(wire, line, col)], line, col)
+        let sub = jd_call("json_path_field",
+                    [jd_var("path", line, col), jd_str(wire, line, col)], line, col)
+        # A `#[json(default)]` field substitutes the default when the key
+        # is absent (`JNull`); an absent field with no default still errors
+        # in the leaf reader, preserving #1280's required-field policy.
+        let read = match dflt {
+          None    -> jd_decode(shape, node, sub, line, col)
+          Some(d) -> jd_default_read(shape, node, sub, d, line, col)
+        }
+        let ok_arm = Arm(mk_pat(PVariant("Ok", [mk_pat(PBind(name), line, col)]),
+                                line, col), None,
+                         jd_tower(tname, rest, [name, ...bound], line, col))
+        let err_arm = Arm(mk_pat(PVariant("Err", [mk_pat(PBind("e"), line, col)]),
+                                 line, col), None,
+                          jd_call("Err", [jd_var("e", line, col)], line, col))
+        jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
+      }
   }
+}
+
+# The value a `#[json(skip)]` field takes on decode: its `#[json(default)]`
+# expression, or `None` when it has none (the validator guarantees a bare
+# skip is an `Option`).
+fn jd_skip_value(shape: JsonShape, dflt: Option[Expr], line: Int, col: Int) : Expr =
+  match dflt {
+    Some(d) -> d
+    None    -> jd_var("None", line, col)
+  }
+
+# `match json_bind_field(v, wire) { JNull -> Ok(<default>) ; node -> <decode> }`
+# — the default stands in for an absent key, the leaf reader still handles
+# a present-but-wrong-shape value.
+fn jd_default_read(shape: JsonShape, node: Expr, sub: Expr, dflt: Expr,
+                   line: Int, col: Int) : Expr {
+  let null_arm = Arm(mk_pat(PVariant("JNull", []), line, col), None,
+                     jd_call("Ok", [dflt], line, col))
+  let some_arm = Arm(mk_pat(PBind("__jn"), line, col), None,
+                     jd_decode(shape, jd_var("__jn", line, col), sub, line, col))
+  jd_expr(EMatch(node, [null_arm, some_arm]), line, col)
 }
 
 fn jd_decode(shape: JsonShape, node: Expr, path: Expr,
