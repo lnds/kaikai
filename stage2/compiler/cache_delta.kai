@@ -67,26 +67,36 @@ type CanonVar = CV(Int, VarRemap)   # canonical index, grown remap
 type CanonTy = CT(Ty, VarRemap)
 type CanonTyL = CTL([Ty], VarRemap)
 
+# Every arm reading a `[Ty]` list slot out of the matched variant copies
+# that slot with `map` before the `match`-driven walk: a list slot read
+# from a restored value and handed straight to `canon_ty_list` is
+# corrupted by the stage1 bootstrap compiler, so a restored `TyCon` /
+# `TyUnion` / `TyFnT` / effect `Label` mis-reads its own arg list. Same
+# idiom `canon_scheme` / `canon_unioninfo` already use for their slots.
 fn canon_ty(t: Ty, vr: VarRemap) : CanonTy = match t {
   TyVarT(id) -> match vr_index(vr, id) { CV(ci, vr2) -> CT(TyVarT(ci), vr2) }
   TyListT(inner) -> match canon_ty(inner, vr) { CT(ci, vr2) -> CT(TyListT(ci), vr2) }
   TyFnT(as_, ret, row) -> canon_ty_fn(as_, ret, row, vr)
-  TyCon(mo, nm, targs) -> match canon_ty_list(targs, vr) {
+  TyCon(mo, nm, targs) -> match canon_ty_list(map(targs, (a) => a), vr) {
     CTL(cargs, vr2) -> CT(TyCon(mo, nm, cargs), vr2)
   }
   TyDimT(inner, u) -> match canon_ty(inner, vr) { CT(ci, vr2) -> CT(TyDimT(ci, u), vr2) }
   TyRefineT(base, pred) -> match canon_ty(base, vr) {
     CT(cb, vr2) -> CT(TyRefineT(cb, pred), vr2)
   }
-  TyUnion(cs) -> match canon_ty_list(cs, vr) { CTL(ccs, vr2) -> CT(TyUnion(ccs), vr2) }
+  TyUnion(cs) -> match canon_ty_list(map(cs, (a) => a), vr) { CTL(ccs, vr2) -> CT(TyUnion(ccs), vr2) }
   TyShapeApp(id, arg) -> canon_ty_shape(id, arg, vr)
   _ -> CT(t, vr)
 }
 
 # Args, then return, then row — each step threads the grown remap so a
-# var shared between them keeps one canonical id.
-fn canon_ty_fn(as_: [Ty], ret: Ty, row: Row, vr: VarRemap) : CanonTy =
-  match canon_ty_list(as_, vr) { CTL(cas, vr2) -> canon_ty_fn_ret(cas, ret, row, vr2) }
+# var shared between them keeps one canonical id. `as_` and the `row`'s
+# label list are copied up front for the same slot-corruption reason.
+fn canon_ty_fn(as_: [Ty], ret: Ty, row: Row, vr: VarRemap) : CanonTy = {
+  let row2 = Row { labels: map(row.labels, (l) => l),
+                   tail: row.tail, display_alias: row.display_alias }
+  match canon_ty_list(map(as_, (a) => a), vr) { CTL(cas, vr2) -> canon_ty_fn_ret(cas, ret, row2, vr2) }
+}
 
 fn canon_ty_fn_ret(cas: [Ty], ret: Ty, row: Row, vr: VarRemap) : CanonTy =
   match canon_ty(ret, vr) { CT(cret, vr2) -> canon_ty_fn_row(cas, cret, row, vr2) }
@@ -126,7 +136,7 @@ type CanonLabelL = CLL([Label], VarRemap)
 
 fn canon_label_list(ls: [Label], vr: VarRemap) : CanonLabelL = match ls {
   [] -> CLL([], vr)
-  [l, ...rest] -> match canon_ty_list(l.ty_args, vr) {
+  [l, ...rest] -> match canon_ty_list(map(l.ty_args, (a) => a), vr) {
     CTL(cargs, vr2) -> match canon_label_list(rest, vr2) {
       CLL(crest, vr3) -> CLL([Label { eff: l.eff, ty_args: cargs }, ...crest], vr3)
     }
@@ -287,37 +297,54 @@ fn ctorentry_key(c: CtorEntry) : String = match c { CtorE(ty, _, fn_) -> joined_
 # takes the table already turned into (key, canonical-chunk) pairs.
 type KV = KV(String, String)
 
-fn render_table(pairs: [KV]) : String =
-  concat_all(kv_chunks(kv_sort(pairs, [])))
+# A large core delta carries hundreds of entries per table (~900 for
+# `ty_entries` in a full-stdlib build). Every list walk below is
+# accumulator-tail-recursive so the depth stays O(1): a plain
+# `[h, ...recurse(t)]` cons-after-call recurses once per element and
+# overflows the stack on that scale, surfacing as a spurious
+# `non-exhaustive match` far from here. The pair order is irrelevant —
+# `render_table` sorts by key — so building reversed costs nothing.
 
-fn kv_chunks(pairs: [KV]) : [String] = match pairs {
-  [] -> []
-  [KV(_, chunk), ...t] -> [chunk, ...kv_chunks(t)]
+fn render_table(pairs: [KV]) : String =
+  concat_all(kv_chunks(kv_sort(pairs, []), []))
+
+fn kv_chunks(pairs: [KV], acc: [String]) : [String] = match pairs {
+  [] -> list_reverse(acc)
+  [KV(_, chunk), ...t] -> kv_chunks(t, [chunk, ...acc])
 }
 
 fn kv_sort(xs: [KV], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [h, ...t] -> kv_sort(t, kv_ins(h, acc))
+  [h, ...t] -> kv_sort(t, kv_ins(h, acc, []))
 }
 
-fn kv_ins(x: KV, sorted: [KV]) : [KV] = match x { KV(xk, _) -> match sorted {
-  [] -> [x]
-  [KV(hk, hc), ...t] -> if string_lt(xk, hk) { [x, KV(hk, hc), ...t] }
-                        else { [KV(hk, hc), ...kv_ins(x, t)] }
+# Insertion is tail-recursive too: the `before` prefix is accumulated
+# reversed and spliced back on when the insertion point is found, so a
+# 900-element sorted list never nests 900 frames.
+fn kv_ins(x: KV, sorted: [KV], before: [KV]) : [KV] = match x { KV(xk, _) -> match sorted {
+  [] -> kv_prepend_reverse(before, [x])
+  [KV(hk, hc), ...t] -> if string_lt(xk, hk) {
+                          kv_prepend_reverse(before, [x, KV(hk, hc), ...t])
+                        } else { kv_ins(x, t, [KV(hk, hc), ...before]) }
 } }
+
+fn kv_prepend_reverse(xs: [KV], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [h, ...t] -> kv_prepend_reverse(t, [h, ...acc])
+}
 
 # per-table pair builders (canonicalize the element, pair with its key).
 
-fn tyentry_pairs(xs: [TyEntry]) : [KV] = match xs {
-  [] -> []
-  [e, ...t] -> [KV(tyentry_key(e),
+fn tyentry_pairs(xs: [TyEntry], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [e, ...t] -> tyentry_pairs(t, [KV(tyentry_key(e),
                    cache_tyentry_to_hex(TyEntry { name: e.name, scheme: canon_scheme(e.scheme) })),
-                ...tyentry_pairs(t)]
+                ...acc])
 }
 
-fn unioninfo_pairs(xs: [UnionInfo]) : [KV] = match xs {
-  [] -> []
-  [u, ...t] -> [KV(unioninfo_key(u), cache_unioninfo_to_hex(canon_unioninfo(u))), ...unioninfo_pairs(t)]
+fn unioninfo_pairs(xs: [UnionInfo], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [u, ...t] -> unioninfo_pairs(t, [KV(unioninfo_key(u), cache_unioninfo_to_hex(canon_unioninfo(u))), ...acc])
 }
 
 fn canon_unioninfo(u: UnionInfo) : UnionInfo = match u {
@@ -329,46 +356,46 @@ fn canon_unioninfo(u: UnionInfo) : UnionInfo = match u {
   }
 }
 
-fn opeffarity_pairs(xs: [OpEffArity]) : [KV] = match xs {
-  [] -> []
-  [a, ...t] -> [KV(opeffarity_key(a), cache_opeffarity_to_hex(a)), ...opeffarity_pairs(t)]
+fn opeffarity_pairs(xs: [OpEffArity], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [a, ...t] -> opeffarity_pairs(t, [KV(opeffarity_key(a), cache_opeffarity_to_hex(a)), ...acc])
 }
 
-fn recinfo_pairs(xs: [RecInfo]) : [KV] = match xs {
-  [] -> []
-  [r, ...t] -> [KV(recinfo_key(r), cache_recinfo_to_hex(r)), ...recinfo_pairs(t)]
+fn recinfo_pairs(xs: [RecInfo], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [r, ...t] -> recinfo_pairs(t, [KV(recinfo_key(r), cache_recinfo_to_hex(r)), ...acc])
 }
 
-fn suminfo_pairs(xs: [SumInfo]) : [KV] = match xs {
-  [] -> []
-  [s, ...t] -> [KV(suminfo_key(s), cache_suminfo_to_hex(s)), ...suminfo_pairs(t)]
+fn suminfo_pairs(xs: [SumInfo], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [s, ...t] -> suminfo_pairs(t, [KV(suminfo_key(s), cache_suminfo_to_hex(s)), ...acc])
 }
 
-fn optoeff_pairs(xs: [OpToEff]) : [KV] = match xs {
-  [] -> []
-  [o, ...t] -> [KV(optoeff_key(o), cache_optoeff_to_hex(o)), ...optoeff_pairs(t)]
+fn optoeff_pairs(xs: [OpToEff], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [o, ...t] -> optoeff_pairs(t, [KV(optoeff_key(o), cache_optoeff_to_hex(o)), ...acc])
 }
 
-fn ualias_pairs(xs: [UAliasEntry]) : [KV] = match xs {
-  [] -> []
-  [u, ...t] -> [KV(ualias_key(u), cache_ualias_to_hex(u)), ...ualias_pairs(t)]
+fn ualias_pairs(xs: [UAliasEntry], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [u, ...t] -> ualias_pairs(t, [KV(ualias_key(u), cache_ualias_to_hex(u)), ...acc])
 }
 
-fn ctorentry_pairs(xs: [CtorEntry]) : [KV] = match xs {
-  [] -> []
-  [c, ...t] -> [KV(ctorentry_key(c), cache_ctorentry_to_hex(c)), ...ctorentry_pairs(t)]
+fn ctorentry_pairs(xs: [CtorEntry], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [c, ...t] -> ctorentry_pairs(t, [KV(ctorentry_key(c), cache_ctorentry_to_hex(c)), ...acc])
 }
 
 #[doc("The canonical serialized form of a `ModuleEnvDelta`'s interface: each of the 8 tables rendered sorted-by-name with var ids renumbered to appearance rank. The `name` field is excluded — a module's interface identity is its exported shapes, not its own name. Two logically-equal interfaces produce byte-identical output.")]
 pub fn mdelta_canon_bytes(d: ModuleEnvDelta) : String =
-  concat_all([render_table(tyentry_pairs(d.ty_entries)),
-              render_table(unioninfo_pairs(d.unions)),
-              render_table(opeffarity_pairs(d.op_eff_arities)),
-              render_table(recinfo_pairs(d.recs)),
-              render_table(suminfo_pairs(d.sums)),
-              render_table(optoeff_pairs(d.op_to_eff)),
-              render_table(ualias_pairs(d.unit_aliases)),
-              render_table(ctorentry_pairs(d.constructors))])
+  concat_all([render_table(tyentry_pairs(d.ty_entries, [])),
+              render_table(unioninfo_pairs(d.unions, [])),
+              render_table(opeffarity_pairs(d.op_eff_arities, [])),
+              render_table(recinfo_pairs(d.recs, [])),
+              render_table(suminfo_pairs(d.sums, [])),
+              render_table(optoeff_pairs(d.op_to_eff, [])),
+              render_table(ualias_pairs(d.unit_aliases, [])),
+              render_table(ctorentry_pairs(d.constructors, []))])
 
 #[doc("Interface hash of a `ModuleEnvDelta`, as 16 lowercase hex chars over its canonical bytes. Stable across inference order; the value the incremental-rebuild propagation cut compares. A source edit that leaves the interface unchanged yields the same hash, so importers are not invalidated.")]
 pub fn mdelta_iface_hash(d: ModuleEnvDelta) : String =
