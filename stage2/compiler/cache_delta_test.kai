@@ -10,16 +10,21 @@ hash. Two properties, each a `pub` entry the driver runs behind
 
 2. **Interface-hash contract.** The canonical delta hash must be
    *deterministic* (same interface → same hash regardless of table order
-   and tyvar numbering) and *sensitive* (a changed scheme → a changed
-   hash). Determinism that misses a real change is a stale-interface
-   hit — the one unsound failure the propagation cut must never have.
+   and tyvar numbering), *sensitive* (a changed scheme → a changed hash),
+   and *stable across a blob round-trip* (a delta restored from its cache
+   blob hashes the same as the original, even when a scheme carries a
+   concrete effect row). Determinism that misses a real change is a
+   stale-interface hit — the one unsound failure the propagation cut must
+   never have.
 """)]
 
 import compiler.ast
 import compiler.infer
 import compiler.cache_ast
 import compiler.cache_delta
+import compiler.cache_module
 import compiler.cache_module_test
+import compiler.protos
 
 # ---- Ty/Scheme round-trip ---------------------------------------------
 
@@ -93,8 +98,110 @@ fn scheme_pair(a: Int, b: Int) : TyScheme {
   Scheme([a, b], [], [], [], body)
 }
 
+# A scheme carrying a CONCRETE effect row — `(String) -> Unit / Stdout`,
+# a label with no tail, the shape `pub fn println` exports. The delta is
+# serialized to a blob, restored, and its interface hash recomputed from
+# the restored value. A codec that mis-reads a restored effect label's
+# arg slot makes canonicalization of the restored scheme diverge from the
+# original — the shape that broke the per-module cut for any importer of a
+# module exporting an effectful function.
+fn effrow_scheme() : TyScheme {
+  let lbl = Label { eff: "Stdout", ty_args: [] }
+  let row = Row { labels: [lbl], tail: None, display_alias: None }
+  Scheme([], [], [], [], TyFnT([TyString], TyUnit, row))
+}
+
+# `(a, b) -> Pair[a, b]` — the tuple-constructor shape: a `TyCon` with
+# type arguments in both the body's arg list and return, quantified over
+# two vars. Its restored form exercises the `TyCon` arg-slot walk under
+# canonicalization, the sibling of the effect-label case.
+fn tycon_args_scheme() : TyScheme {
+  let pair = TyCon(Some("tuple"), "Pair", [TyVarT(1), TyVarT(2)])
+  Scheme([1, 2], [], [], [], TyFnT([TyVarT(1), TyVarT(2)], pair, empty_row()))
+}
+
+fn iface_survives_roundtrip(d: ModuleEnvDelta) : Bool {
+  let h0 = mdelta_iface_hash(d)
+  let blob = cache_mdelta_to_hex(d)
+  match cache_hex_to_mdelta(blob, 0) {
+    None -> false
+    Some(c) -> match c { CMDP(d2, _) -> mdelta_iface_hash(d2) == h0 }
+  }
+}
+
+# `(Char) -> Bool / e` — an open effect row (a bare row var, no labels),
+# the shape a pure `char` predicate exports. Restoring a scheme with an
+# open row exercises the row-tail var path under canonicalization.
+fn openrow_scheme() : TyScheme {
+  let row = Row { labels: [], tail: Some(7), display_alias: None }
+  Scheme([], [7], [], [], TyFnT([TyChar], TyBool, row))
+}
+
+fn many_openrow_entries(n: Int, acc: [TyEntry]) : [TyEntry] =
+  if n <= 0 { acc }
+  else { many_openrow_entries(n - 1, [mk_entry(concat_all(["p", int_to_string(n)]), openrow_scheme()), ...acc]) }
+
+# Heterogeneous entries cycling through the shapes a real core delta
+# carries — effect rows, open rows, tycon args — so the decoder walks a
+# mixed stream at scale, the condition under which one shape's asymmetry
+# desyncs the next entry's scheme.
+fn many_mixed_entries(n: Int, acc: [TyEntry]) : [TyEntry] =
+  if n <= 0 { acc }
+  else {
+    let s = match n - (n / 3) * 3 { 0 -> effrow_scheme() 1 -> openrow_scheme() _ -> tycon_args_scheme() }
+    many_mixed_entries(n - 1, [mk_entry(concat_all(["m", int_to_string(n)]), s), ...acc])
+  }
+
+fn effrow_iface_survives_roundtrip() : Bool =
+  iface_survives_roundtrip(delta_of([mk_entry("println", effrow_scheme())])) and
+  iface_survives_roundtrip(delta_of([mk_entry("pair", tycon_args_scheme())])) and
+  iface_survives_roundtrip(delta_of([mk_entry("is_digit", openrow_scheme())])) and
+  iface_survives_roundtrip(delta_of([mk_entry("a", effrow_scheme()),
+                                      mk_entry("b", openrow_scheme()),
+                                      mk_entry("c", tycon_args_scheme())])) and
+  iface_survives_roundtrip(delta_of(many_openrow_entries(900, []))) and
+  iface_survives_roundtrip(delta_of(many_mixed_entries(900, [])))
+
+# A `TypedProgram.decls`-shaped stream: a record type + an effectful fn
+# whose body is a block of qualified calls — the shape a cache HIT
+# restores and the driver then walks. The decoder must rebuild it so a
+# re-serialization is byte-identical AND a consumer walk does not trip a
+# `non-exhaustive match` (the warm-build failure of the per-module cut).
+fn decl_stream_survives_roundtrip() : Bool / Console + File {
+  let e = mk_expr(EInt(7), 1, 1)
+  let call = mk_expr(ECall(mk_expr(EModCall("a", "shout"), 2, 3),
+                           [mk_expr(EVar("s"), 2, 9)]), 2, 3)
+  let body = mk_expr(EBlock([SExprStmt(call)], Some(e)), 2, 1)
+  let stdout_te = mk_ty(TyName("String", []), 1, 1)
+  let dfn = DFn(true, "twice", [], [Param { pname: "s", ptype: Some(stdout_te), pline: 1, pcol: 1, pborrow: false }],
+                Some(mk_ty(TyName("Unit", []), 1, 1)), REmpty, body, 2, 1, Some("b"))
+  let dtype = DType(true, "Rec", [],
+                    TBRecord([FD(true, "x", mk_ty(TyName("Int", []), 1, 1), [])]),
+                    1, 1, Some("b"), [])
+  let blob = cache_decl_list_to_hex([dtype, dfn])
+  match cache_hex_to_decl_list(blob, 0) {
+    None -> false
+    Some(c) -> match c { CDLP(ds2, _) ->
+      # Byte round-trip AND a consumer walk over the restored decls: the
+      # warm-build failure is a `non-exhaustive match` when the driver
+      # walks a restored decl's body, not a serialization diff.
+      if cache_decl_list_to_hex(ds2) != blob { false }
+      else { decl_stream_consumable(ds2) }
+    }
+  }
+}
+
+fn decl_stream_consumable(ds: [Decl]) : Bool / Console + File = {
+  let tp = TypedProgram {
+    decls: ds, errs: 0, insts: [], holes: [], row_holes: [],
+    core_len: 0, toplevel_len: 0, module_doc: None, diags: [], op_res: []
+  }
+  let _e = validate_typer_invariants(tp, "<selftest>")
+  true
+}
+
 #[doc("Run the typed-codec + interface-hash gates. Returns \"OK ...\" on success or \"FAIL: ...\" on the first failing property. The driver maps a leading 'O' to exit 0.")]
-pub fn cache_typed_selftest() : String {
+pub fn cache_typed_selftest() : String / Console + File {
   # 1. Ty/Scheme round-trip.
   if not tys_roundtrip_ok() { "FAIL: Ty round-trip mismatch" }
   else if not scheme_roundtrip_ok(sample_scheme()) { "FAIL: Scheme round-trip mismatch" }
@@ -118,6 +225,10 @@ pub fn cache_typed_selftest() : String {
         concat_all(["FAIL: iface hash insensitive to scheme change: ", hb])
       } else if mdelta_iface_hash(base) != hb {
         "FAIL: iface hash not idempotent"
+      } else if not effrow_iface_survives_roundtrip() {
+        "FAIL: iface hash of a concrete-effect-row scheme diverges after blob round-trip"
+      } else if not decl_stream_survives_roundtrip() {
+        "FAIL: restored decl stream re-serializes differently (decoder desync)"
       } else {
         # 3. Per-module blob round-trip: the fidelity contract that keeps
         # a cache hit's emitted C byte-identical to a cold build's.
