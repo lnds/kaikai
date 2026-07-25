@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,8 +187,14 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-stage1-rejections
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, kaic1 rejects its negative fixtures"
+
+# kaic1 must reject every `examples/negative/stage1_rejections/*.kai`
+# with the diagnostic its `.kaic1.err.expected` pins. Bootstrap-only
+# (kaic1, no kaic2), ~0.1s.
+test-stage1-rejections: kaic1
+	@./tools/test-stage1-rejections.sh
 
 # A header-only edit must rebuild every artifact that embeds it, and must not
 # rebuild the ones that do not. Both directions are invisible to CI, which
