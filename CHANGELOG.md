@@ -84,6 +84,73 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.105.0 (2026-07-25)
+
+### Added
+
+- **compiler**: activate the per-module typed rebuild cut (#1504)
+- **compiler**: TypedProgram/TypecheckedModule codec + per-module cut fold (#1496)
+- **compiler**: adjacently-tagged JSON encoding for #[derive(Json)] sum types (#1497)
+- **compiler**: #[json(rename/default/skip)] field overrides for #[derive(Json)] (#1494)
+- **codegen**: support the three fixed-width Vec[t]<n> access shapes (#1490)
+- **stdlib**: #[derive(Json)] typed struct binding over the JSON DOM (#1489)
+- **compiler**: typed-interface codec + canonical delta hash for incremental rebuilds (#1485)
+- **codegen**: native inline representation for fixed-width Vec[t]<n> (#1482)
+- **codegen**: fixed-width inline representation for Vec[t]<n> (#1478)
+- **unbox**: raw-promote Int128 over the fixed-width slot template (closes #1464) (#1471)
+- **kinds**: habitant-parameter declarations on type decls (#1470)
+- **compiler**: enforce the pinned-region invariant with a lowering-time gate (#1468)
+- **kinds**: the Composition engine — nominal slot unification, order and summed measure as formation invariants (closes #1256) (#1467)
+- **unbox**: raw-promote Int32/UInt32/UInt64 over the fixed-width slot template (#1457) (#1465)
+- **kinds**: the Dim engine — Int value indices on the HM core, positional <m, n> slots, shape-checked linalg (#1456)
+- **unbox**: raw-promote Byte to an SByte slot with a u8 op family (#1410, follow-up #1457) (#1458)
+- **kinds**: build the Semilattice engine and the Perm kind — typed capabilities on FileHandle (closes #1251) (#1452)
+- **kinds**: complete the with habitant forms — value domain, measure payload, closed set (#1424)
+- **cli**: add kai typecheck — front-end-only mode with build-identical diagnostics (closes #1427) (#1434)
+- **kinds**: build the Module engine and restore Money's generic carrier (closes #1243) (#1423)
+
+### Fixed
+
+- **compiler**: reject pattern binders that shadow a stage0 prelude name (#1503)
+- **build**: drop a stray git-log fragment from stage2/Makefile (#1500)
+- **compiler**: typed-cut canon stack-overflow + slot-corruption; cut wired-but-inactive (#1499)
+- **codegen**: read a concrete fixed-vec parameter through the runtime slot (#1493)
+- **tools**: keep runtime-global-audit bash 3 compatible (#1492)
+- **codegen**: materialise the native fixed-vec boxed border (#1483)
+- **fmt**: treat ./file.kai as a file, not a package spec (#1476) (#1477)
+- **migrate**: treat ./file.kai as a file, not a package spec (#1475)
+- **migrate**: default --from to the package edition, not the toolchain EDITION (#1473)
+- **runtime**: route hot-path thread-locals through noinline accessors (closes #1381) (#1462)
+- **emit**: keep c-modular core TUs program-independent and make cache publishes atomic (closes #1453) (#1459)
+- **runtime**: sum KAI_TRACE_RC ledgers across scheduler threads at exit (closes #1338) (#1450)
+- **cli**: fold the kaic2 toolchain id into the native-modular cache-dir key (closes #1446) (#1449)
+- **fixtures**: make the stdin_concurrent and cancel_raise goldens deterministic at any thread count (#1447)
+- **runtime**: propagate nursery cancel-on-fail eagerly at the failing child's termination (closes #1400) (#1448)
+- **native**: keep external linkage on derived protocol impls called by cross-TU monos (closes #1426) (#1445)
+- **fixtures**: assert program invariants instead of scheduler timing in concurrency goldens (#1444)
+- **runtime**: survive spurious M:N wakes and close the deadlock detector's dispatch window (closes #1418) (#1420)
+- **native**: fall back to the whole-program merge when the inline runtime bitcode is absent (closes #1413) (#1442)
+- **compiler**: ride the build front-end in hole/effect report modes (closes #1432) (#1441)
+- **typer**: keep Byte type on u8-suffixed literals in argument position (closes #1416) (#1438)
+- **fmt**: keep kind qualifier on qualified habitant annotations (closes #1422) (#1436)
+- **perceus**: carry the tail's type and mode onto the opaque-exit-drop rebind (#1437)
+- **cli**: surface core-cache stats on the native wrapper path, add a wrapper-level liveness gate (#1431)
+- **doc**: render impl blocks and cut synopsis at the first sentence (#1433)
+- **runtime**: re-check the cancel flag at reactor park commit so a pre-park cancel is not slept through (closes #1398) (#1419)
+- **release**: ship runtime_inline.bc so installed native builds inline the runtime (#1415)
+- **native**: box Byte literals through the Byte constructor in KIR lowering (closes #1394) (#1417)
+- **ci**: loud MN_TAIL_STEAL_ITERS gate + stale Clock.sleep cancel sidebar (#1412)
+- **runtime**: make print payload+newline pairs line-atomic across scheduler threads (#1409)
+- **native**: raw-promote Char to an SChar slot, honouring the no-RC contract (closes #1395) (#1408)
+- **ci**: repoint tier1-asan paths from dead stage2/compiler.kai to stage2/compiler/** (#1407)
+
+### Changed
+
+- **build**: key core emit-cache span-free over closure-spec decls (closes #1460) (#1466)
+- **build**: default the warm-cache C path to separate compilation (closes #1429) (#1463)
+- **emit**: key c-modular emission on the real donation capable set (#1451)
+- **emit**: lower inlined loop predicates raw and elide dead unit discards (closes #1414) (#1421)
+
 ## v0.104.0 (2026-07-22)
 
 ### Added
