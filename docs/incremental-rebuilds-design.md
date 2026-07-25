@@ -282,14 +282,46 @@ cut (`compiler.typed_cut`):
   fold. Verified: the restored `TypedProgram` and `ModuleEnvDelta` are
   byte-identical to a fresh infer's (17/17 modules of a multi-module package).
 
-### What remains — the cut is not wired to a build path yet
+### What the codec-audit lane shipped — and why the cut stays inactive
 
-The blob a hit restores is byte-identical *in its serialized form* to a fresh
-infer, yet *using* that hit still trips a `non-exhaustive match` downstream. The
-serialized delta and typed program match byte-for-byte, so the gap is a codec
-node that renders two distinct values to the same bytes — a residual lossy arm in
-the surface-AST codec (`DProtoLaws`/`DImplAxiom` collapse to their inner; the
-21-arm `Decl` codec needs an audit for typed use). Until that audit closes, the
-cut is not consulted by `compile_source`; `compiler.typed_cut` is exercised only
-by its round-trip selftest. The end-to-end headline (cold vs cache-hit
-byte-identical C) lands once the codec audit finishes.
+The cut is wired into `compile_source` through `tcut_infer_program`, but held
+**inactive**: `tcut_dir` is `""`, which routes every module through the uncut
+fold, byte-identical to `infer_program_with_protos_cached`. Activation waits on a
+stage1-bootstrap-compiler fault the audit ran to ground.
+
+The hypothesis that a residual *lossy codec arm* rendered two distinct values to
+the same bytes was **disproven**. The codec is faithful: `cache_tcmodule_to_hex`
+of a restored module equals that of a fresh infer for **17/17 modules**, and the
+`Ty` / `Row` / `TyScheme` / `Decl` codecs were audited symmetric byte-for-byte.
+Two real defects were found and fixed on the way (both gated in
+`--cache-typed-selftest`):
+
+- **Stack overflow in the interface-hash canonicalizer.** The eight per-table
+  `*_pairs` builders in `compiler.cache_delta` were non-tail-recursive; over the
+  ~900-entry `ty_entries` table of a full-stdlib delta the stack overflowed,
+  surfacing as a spurious `non-exhaustive match`. Rewritten accumulator-tail-
+  recursive (order is irrelevant — `render_table` sorts by key).
+- **Slot corruption in `canon_ty`.** A `[Ty]` list slot read from a *restored*
+  `TyCon` / `TyUnion` / `TyFnT` / effect `Label` and handed straight into a
+  `match`-driven walk is corrupted by the stage1 compiler; a concrete-effect-row
+  or tycon-args scheme then mis-canonicalizes. Fixed with the `map(slot,(a)=>a)`
+  copy idiom `canon_scheme` / `canon_unioninfo` already use.
+
+The **residual** fault is not in the codec at all. A restored `TypecheckedModule`
+is byte-identical to a fresh infer (`hit == fresh` serialized, 17/17), yet
+*consuming* the restored value — a downstream pass walking its `[Decl]` — trips a
+`non-exhaustive match`, while a re-inferred module never does. It is a heap-layout
+fault the stage1 bootstrap compiler exhibits when it walks a deeply-nested
+structure the decoder rebuilt: same content, different layout. No kaikai-level
+reconstruction cures it (re-decode, shallow list copy, deep body rebuild, and a
+full field-by-field re-map were all tried and all fail — the rebuild code, itself
+compiled by stage1, inherits the same fault). The fix is below the cut's kaikai
+code: either the stage1 codegen, or a blob representation that restores a flat IR
+stage1 consumes without corruption (the more promising path, since it does not
+touch the bootstrap compiler). Tracked as a follow-up.
+
+Until then, the cut is wired-but-inactive and `--user-cache` builds route through
+the uncut fold, byte-identical to a plain build (guarded by
+`examples/cache/typedc_cut_inactive_byte_identical.sh`). The end-to-end headline
+(cold vs cache-hit byte-identical C, and the edit-loop delta) lands once the
+stage1 fault is resolved.
