@@ -282,12 +282,7 @@ cut (`compiler.typed_cut`):
   fold. Verified: the restored `TypedProgram` and `ModuleEnvDelta` are
   byte-identical to a fresh infer's (17/17 modules of a multi-module package).
 
-### What the codec-audit lane shipped — and why the cut stays inactive
-
-The cut is wired into `compile_source` through `tcut_infer_program`, but held
-**inactive**: `tcut_dir` is `""`, which routes every module through the uncut
-fold, byte-identical to `infer_program_with_protos_cached`. Activation waits on a
-stage1-bootstrap-compiler fault the audit ran to ground.
+### What the codec-audit lane shipped, and what actually blocked activation
 
 The hypothesis that a residual *lossy codec arm* rendered two distinct values to
 the same bytes was **disproven**. The codec is faithful: `cache_tcmodule_to_hex`
@@ -307,21 +302,46 @@ Two real defects were found and fixed on the way (both gated in
   or tycon-args scheme then mis-canonicalizes. Fixed with the `map(slot,(a)=>a)`
   copy idiom `canon_scheme` / `canon_unioninfo` already use.
 
-The **residual** fault is not in the codec at all. A restored `TypecheckedModule`
-is byte-identical to a fresh infer (`hit == fresh` serialized, 17/17), yet
-*consuming* the restored value — a downstream pass walking its `[Decl]` — trips a
-`non-exhaustive match`, while a re-inferred module never does. It is a heap-layout
-fault the stage1 bootstrap compiler exhibits when it walks a deeply-nested
-structure the decoder rebuilt: same content, different layout. No kaikai-level
-reconstruction cures it (re-decode, shallow list copy, deep body rebuild, and a
-full field-by-field re-map were all tried and all fail — the rebuild code, itself
-compiled by stage1, inherits the same fault). The fix is below the cut's kaikai
-code: either the stage1 codegen, or a blob representation that restores a flat IR
-stage1 consumes without corruption (the more promising path, since it does not
-touch the bootstrap compiler). Tracked as a follow-up.
+The **residual** fault was neither the codec nor a heap-layout effect, though it
+presented as one: consuming a restored module tripped a `non-exhaustive match`,
+and the byte-identity of `hit` and `fresh` made the value look sound. It was a
+**prelude-captured binder**. `TyCon(mo, nm, args)` names its type-argument slot
+`args`, which collides with a nullary stage0 PRELUDE entry: under kaic1 the slot
+binds correctly but every *read* of the name lowers to the builtin, so the
+encoder serialized the builtin's value and the decoder stored it into the
+restored `TyCon`. Byte-identity held precisely because both sides were equally
+wrong. The capture reached fourteen other functions besides the codec; #1503
+fixed them and made kaic1 reject a pattern binder that shadows a prelude name, so
+the class cannot recur silently. What matters for this design is the negative
+result: the cut's blocker was never the codec, the fold, or the heap.
 
-Until then, the cut is wired-but-inactive and `--user-cache` builds route through
-the uncut fold, byte-identical to a plain build (guarded by
-`examples/cache/typedc_cut_inactive_byte_identical.sh`). The end-to-end headline
-(cold vs cache-hit byte-identical C, and the edit-loop delta) lands once the
-stage1 fault is resolved.
+The cut is therefore **active** under `--user-cache`. Cold, warm and post-edit
+builds emit C byte-identical to a plain build, and a body-only edit re-infers
+exactly its own module — guarded by
+`examples/cache/typedc_cut_active_byte_identical.sh`.
+
+### The cut is correct but does not yet pay
+
+Correctness and speedup are separate claims, and only the first one holds today.
+Measured on the native backend over a 12-module × 40-function package (3889
+lines), serial A/B, front-end only (`--emit=c`, no link):
+
+| scenario | front-end |
+| --- | --- |
+| plain, no cache | 1833 ms |
+| `--user-cache`, cut off, warm | 1834 ms |
+| `--user-cache`, cut on, cold | 3285 ms |
+| `--user-cache`, cut on, warm after a one-body edit | 2751 ms |
+
+The cut saves 16% against its own cold build and still loses ~900 ms against the
+same warm build with the cut off. The cost is in the blob: 27 typed blobs total
+**1.6 MB** for 3889 lines of source, because every `Decl` is serialized with its
+typed body as hex (two chars per byte). Decoding ~1.5 MB of hex costs more than
+re-inferring twelve small modules.
+
+So the win is gated on the blob representation, not on the fold. Restoring a flat
+IR instead of reconstructing nested `[Decl]` — the shape originally proposed as a
+way around the (misdiagnosed) stage1 fault — is the promising direction, now for
+a different reason: size and decode cost, not corruption. Until a representation
+lands whose decode is cheaper than inference, `--user-cache` builds pay the cut
+rather than profit from it.
