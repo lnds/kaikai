@@ -1,0 +1,85 @@
+#[doc("""
+Incremental interface hashing across the per-module fold.
+
+Each module in the fold hashes the interface it *inherits* — the merged
+`ModuleEnvDelta` of every module folded before it. Recomputing
+`mdelta_canon_bytes` per module re-canonicalises the whole accumulated
+delta, which on a full-stdlib inherited env is hundreds of entries per
+table walked once per module.
+
+The accumulator keeps the tables already reduced to their canonical
+(key, chunk) pairs, so folding a module in canonicalises only that
+module's own contribution.
+
+The identity contract is exact, not approximate: `merge_env_deltas`
+appends `child ++ parent` per table and the pair builders accumulate in
+reverse, so `pairs(child ++ parent, []) == pairs(parent, []) ++ pairs(child, [])`
+— the newly folded module's pairs land *after* the accumulated ones.
+Threading the accumulator through the fold therefore yields the very
+list `mdelta_canon_bytes` would have built, and `iface_acc_hash` renders
+it through the same `render_table`. `cache_delta_test` pins the
+equivalence, duplicate keys across modules included: both entries
+survive the merge, so their order under the stable sort is load-bearing.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.infer
+import compiler.user_cache
+import compiler.cache_delta
+
+# Each table is held as its per-module blocks, most recent first: a
+# module's pairs belong at the END of the accumulated list, and appending
+# per module would walk the whole accumulation each time — the cost the
+# accumulator exists to remove. `iface_acc_table` splices the blocks back
+# into fold order in one linear pass at hash time.
+#[doc("The 8 interface tables of an accumulated interface, each held as the per-module blocks of canonical (key, chunk) pairs, most recently folded first.")]
+pub type IfaceAcc = IFA([[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]])
+
+#[doc("The accumulator for an empty inherited interface.")]
+pub fn iface_acc_empty() : IfaceAcc = IFA([], [], [], [], [], [], [], [])
+
+#[doc("Fold one module's exported delta into the accumulated interface, canonicalising only that module's own entries.")]
+pub fn iface_acc_extend(a: IfaceAcc, d: ModuleEnvDelta) : IfaceAcc = match a {
+  IFA(tys, uns, ars, recs, sums, ops, uas, ctors) ->
+    IFA([tyentry_pairs(d.ty_entries, []), ...tys],
+        [unioninfo_pairs(d.unions, []), ...uns],
+        [opeffarity_pairs(d.op_eff_arities, []), ...ars],
+        [recinfo_pairs(d.recs, []), ...recs],
+        [suminfo_pairs(d.sums, []), ...sums],
+        [optoeff_pairs(d.op_to_eff, []), ...ops],
+        [ualias_pairs(d.unit_aliases, []), ...uas],
+        [ctorentry_pairs(d.constructors, []), ...ctors])
+}
+
+# Blocks are stored newest-first and each is already in fold order, so
+# prepending them front-to-back rebuilds oldest-first. Every walk is
+# accumulator-tail-recursive: a table carries hundreds of entries and a
+# cons-after-call would recurse once per entry.
+fn iface_acc_table(blocks: [[KV]], acc: [KV]) : [KV] = match blocks {
+  [] -> acc
+  [b, ...t] -> iface_acc_table(t, kv_prepend(kv_rev(b, []), acc))
+}
+
+fn kv_rev(xs: [KV], acc: [KV]) : [KV] = match xs {
+  [] -> acc
+  [h, ...t] -> kv_rev(t, [h, ...acc])
+}
+
+fn kv_prepend(rev: [KV], acc: [KV]) : [KV] = match rev {
+  [] -> acc
+  [h, ...t] -> kv_prepend(t, [h, ...acc])
+}
+
+#[doc("Interface hash of an accumulated interface — the same 16 hex chars `mdelta_iface_hash` derives from the equivalent merged delta.")]
+pub fn iface_acc_hash(a: IfaceAcc) : String = match a {
+  IFA(tys, uns, ars, recs, sums, ops, uas, ctors) ->
+    uc_content_hex(concat_all([render_table(iface_acc_table(tys, [])),
+                               render_table(iface_acc_table(uns, [])),
+                               render_table(iface_acc_table(ars, [])),
+                               render_table(iface_acc_table(recs, [])),
+                               render_table(iface_acc_table(sums, [])),
+                               render_table(iface_acc_table(ops, [])),
+                               render_table(iface_acc_table(uas, [])),
+                               render_table(iface_acc_table(ctors, []))]))
+}
