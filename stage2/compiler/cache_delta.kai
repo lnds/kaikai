@@ -273,8 +273,7 @@ pub fn cache_ctorentry_to_hex(c: CtorEntry) : String = match c {
 }
 
 # ---- interface hash ---------------------------------------------------
-# Tables are rendered sorted-by-name via `kv_sort` below (insertion
-# sort; a module's export count keeps it small).
+# Tables are rendered sorted-by-name via `kv_sort` below.
 # The hash covers a canonical rendering of the delta: each table's
 # elements sorted by name, var ids renumbered, concatenated in a fixed
 # table order, hashed with the same FNV-1a digest the user cache uses.
@@ -302,35 +301,63 @@ type KV = KV(String, String)
 # accumulator-tail-recursive so the depth stays O(1): a plain
 # `[h, ...recurse(t)]` cons-after-call recurses once per element and
 # overflows the stack on that scale, surfacing as a spurious
-# `non-exhaustive match` far from here. The pair order is irrelevant —
-# `render_table` sorts by key — so building reversed costs nothing.
+# `non-exhaustive match` far from here. The pair builders accumulate
+# reversed; `kv_sort` is stable over exactly that order, so the tie
+# order it produces is part of the canonical bytes.
 
 fn render_table(pairs: [KV]) : String =
-  concat_all(kv_chunks(kv_sort(pairs, []), []))
+  concat_all(kv_chunks(kv_sort(pairs), []))
 
 fn kv_chunks(pairs: [KV], acc: [String]) : [String] = match pairs {
   [] -> list_reverse(acc)
   [KV(_, chunk), ...t] -> kv_chunks(t, [chunk, ...acc])
 }
 
-fn kv_sort(xs: [KV], acc: [KV]) : [KV] = match xs {
-  [] -> acc
-  [h, ...t] -> kv_sort(t, kv_ins(h, acc, []))
+# Bottom-up merge sort. The inherited delta a module hashes carries every
+# export folded before it — hundreds of entries per table on a
+# full-stdlib build — and the hash is recomputed once per module, so an
+# O(n^2) sort here is quadratic twice over across the fold.
+#
+# Stability matters: the order of equal keys is part of the canonical
+# bytes. `kv_merge` takes from the left run on a tie, which reproduces
+# what an insertion sort over the same input yields.
+fn kv_sort(xs: [KV]) : [KV] = match xs {
+  [] -> []
+  _ -> kv_merge_rounds(kv_runs(kv_prepend_reverse(xs, []), []))
 }
-
-# Insertion is tail-recursive too: the `before` prefix is accumulated
-# reversed and spliced back on when the insertion point is found, so a
-# 900-element sorted list never nests 900 frames.
-fn kv_ins(x: KV, sorted: [KV], before: [KV]) : [KV] = match x { KV(xk, _) -> match sorted {
-  [] -> kv_prepend_reverse(before, [x])
-  [KV(hk, hc), ...t] -> if string_lt(xk, hk) {
-                          kv_prepend_reverse(before, [x, KV(hk, hc), ...t])
-                        } else { kv_ins(x, t, [KV(hk, hc), ...before]) }
-} }
 
 fn kv_prepend_reverse(xs: [KV], acc: [KV]) : [KV] = match xs {
   [] -> acc
   [h, ...t] -> kv_prepend_reverse(t, [h, ...acc])
+}
+
+# The seed runs are singletons taken from the reversed input, so
+# `kv_runs` restores the original order while building them.
+fn kv_runs(xs: [KV], acc: [[KV]]) : [[KV]] = match xs {
+  [] -> acc
+  [h, ...t] -> kv_runs(t, [[h], ...acc])
+}
+
+fn kv_merge_rounds(runs: [[KV]]) : [KV] = match runs {
+  [] -> []
+  [only] -> only
+  _ -> kv_merge_rounds(kv_merge_pass(runs, []))
+}
+
+fn kv_merge_pass(runs: [[KV]], acc: [[KV]]) : [[KV]] = match runs {
+  [] -> list_reverse(acc)
+  [a] -> list_reverse([a, ...acc])
+  [a, b, ...t] -> kv_merge_pass(t, [kv_merge(a, b, []), ...acc])
+}
+
+fn kv_merge(a: [KV], b: [KV], acc: [KV]) : [KV] = match a {
+  [] -> kv_prepend_reverse(acc, b)
+  [KV(ak, ac), ...at] -> match b {
+    [] -> kv_prepend_reverse(acc, a)
+    [KV(bk, bc), ...bt] -> if string_lt(bk, ak) {
+                             kv_merge(a, bt, [KV(bk, bc), ...acc])
+                           } else { kv_merge(at, b, [KV(ak, ac), ...acc]) }
+  }
 }
 
 # per-table pair builders (canonicalize the element, pair with its key).
