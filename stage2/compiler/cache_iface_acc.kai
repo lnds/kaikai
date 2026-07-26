@@ -1,25 +1,24 @@
 #[doc("""
 Incremental interface hashing across the per-module fold.
 
-Each module in the fold hashes the interface it *inherits* — the merged
-`ModuleEnvDelta` of every module folded before it. Recomputing
-`mdelta_canon_bytes` per module re-canonicalises the whole accumulated
-delta, which on a full-stdlib inherited env is hundreds of entries per
-table walked once per module.
+Each module in the fold hashes the interface it *inherits* — every export
+of every module folded before it. Deriving that from the merged delta
+costs a full canonicalise-sort-hash of the accumulation once per module,
+which is quadratic in the module count: the dominant cost of the cut on
+anything but a tiny package, and more than the inference it replaces.
 
-The accumulator keeps the tables already reduced to their canonical
-(key, chunk) pairs, so folding a module in canonicalises only that
-module's own contribution.
+So the accumulator folds the hash instead of rebuilding it. Each entry
+contributes `string_hash(key ++ canonical chunk)` and the interface hash
+is the wrapping sum of those contributions per table. Extending by one
+module is then proportional to that module's own exports, not to the
+accumulation.
 
-The identity contract is exact, not approximate: `merge_env_deltas`
-appends `child ++ parent` per table and the pair builders accumulate in
-reverse, so `pairs(child ++ parent, []) == pairs(parent, []) ++ pairs(child, [])`
-— the newly folded module's pairs land *after* the accumulated ones.
-Threading the accumulator through the fold therefore yields the very
-list `mdelta_canon_bytes` would have built, and `iface_acc_hash` renders
-it through the same `render_table`. `cache_delta_test` pins the
-equivalence, duplicate keys across modules included: both entries
-survive the merge, so their order under the stable sort is load-bearing.
+Summing is what makes the fold possible, and it is also exactly the
+contract `mdelta_canon_bytes` bought with its sort: interface identity
+must not depend on the order entries were inserted in. A commutative
+combine gets that by construction rather than by canonicalising first.
+Multiplicity survives — two equal entries sum, they do not cancel as
+they would under xor — so a duplicated export still moves the hash.
 """)]
 
 import compiler.ast
@@ -28,58 +27,44 @@ import compiler.infer
 import compiler.user_cache
 import compiler.cache_delta
 
-# Each table is held as its per-module blocks, most recent first: a
-# module's pairs belong at the END of the accumulated list, and appending
-# per module would walk the whole accumulation each time — the cost the
-# accumulator exists to remove. `iface_acc_table` splices the blocks back
-# into fold order in one linear pass at hash time.
-#[doc("The 8 interface tables of an accumulated interface, each held as the per-module blocks of canonical (key, chunk) pairs, most recently folded first.")]
-pub type IfaceAcc = IFA([[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]], [[KV]])
+# Per-table running sums. Kept apart rather than summed into one number
+# so an entry moving between tables still moves the hash.
+#[doc("The 8 interface tables of an accumulated interface, each reduced to the running sum of its entry hashes.")]
+pub type IfaceAcc = IFA(Int, Int, Int, Int, Int, Int, Int, Int)
 
 #[doc("The accumulator for an empty inherited interface.")]
-pub fn iface_acc_empty() : IfaceAcc = IFA([], [], [], [], [], [], [], [])
+pub fn iface_acc_empty() : IfaceAcc = IFA(0, 0, 0, 0, 0, 0, 0, 0)
 
-#[doc("Fold one module's exported delta into the accumulated interface, canonicalising only that module's own entries.")]
+# A pair's contribution length-prefixes the key so no two different
+# splits of the same characters hash alike.
+fn kv_hash(p: KV) : Int = match p {
+  KV(k, chunk) -> string_hash(concat_all([int_to_string(string_length(k)), ":",
+                                          k, chunk]))
+}
+
+fn kv_sum(ps: [KV], acc: Int) : Int = match ps {
+  [] -> acc
+  [p, ...t] -> kv_sum(t, acc + kv_hash(p))
+}
+
+#[doc("Fold one module's exported delta into the accumulated interface, hashing only that module's own entries.")]
 pub fn iface_acc_extend(a: IfaceAcc, d: ModuleEnvDelta) : IfaceAcc = match a {
   IFA(tys, uns, ars, recs, sums, ops, uas, ctors) ->
-    IFA([tyentry_pairs(d.ty_entries, []), ...tys],
-        [unioninfo_pairs(d.unions, []), ...uns],
-        [opeffarity_pairs(d.op_eff_arities, []), ...ars],
-        [recinfo_pairs(d.recs, []), ...recs],
-        [suminfo_pairs(d.sums, []), ...sums],
-        [optoeff_pairs(d.op_to_eff, []), ...ops],
-        [ualias_pairs(d.unit_aliases, []), ...uas],
-        [ctorentry_pairs(d.constructors, []), ...ctors])
+    IFA(kv_sum(tyentry_pairs(d.ty_entries, []), tys),
+        kv_sum(unioninfo_pairs(d.unions, []), uns),
+        kv_sum(opeffarity_pairs(d.op_eff_arities, []), ars),
+        kv_sum(recinfo_pairs(d.recs, []), recs),
+        kv_sum(suminfo_pairs(d.sums, []), sums),
+        kv_sum(optoeff_pairs(d.op_to_eff, []), ops),
+        kv_sum(ualias_pairs(d.unit_aliases, []), uas),
+        kv_sum(ctorentry_pairs(d.constructors, []), ctors))
 }
 
-# Blocks are stored newest-first and each is already in fold order, so
-# prepending them front-to-back rebuilds oldest-first. Every walk is
-# accumulator-tail-recursive: a table carries hundreds of entries and a
-# cons-after-call would recurse once per entry.
-fn iface_acc_table(blocks: [[KV]], acc: [KV]) : [KV] = match blocks {
-  [] -> acc
-  [b, ...t] -> iface_acc_table(t, kv_prepend(kv_rev(b, []), acc))
-}
-
-fn kv_rev(xs: [KV], acc: [KV]) : [KV] = match xs {
-  [] -> acc
-  [h, ...t] -> kv_rev(t, [h, ...acc])
-}
-
-fn kv_prepend(rev: [KV], acc: [KV]) : [KV] = match rev {
-  [] -> acc
-  [h, ...t] -> kv_prepend(t, [h, ...acc])
-}
-
-#[doc("Interface hash of an accumulated interface — the same 16 hex chars `mdelta_iface_hash` derives from the equivalent merged delta.")]
+#[doc("Interface hash of an accumulated interface, as 16 hex chars: the value the per-module cut keys on.")]
 pub fn iface_acc_hash(a: IfaceAcc) : String = match a {
   IFA(tys, uns, ars, recs, sums, ops, uas, ctors) ->
-    uc_content_hex(concat_all([render_table(iface_acc_table(tys, [])),
-                               render_table(iface_acc_table(uns, [])),
-                               render_table(iface_acc_table(ars, [])),
-                               render_table(iface_acc_table(recs, [])),
-                               render_table(iface_acc_table(sums, [])),
-                               render_table(iface_acc_table(ops, [])),
-                               render_table(iface_acc_table(uas, [])),
-                               render_table(iface_acc_table(ctors, []))]))
+    uc_content_hex(concat_all([int_to_string(tys), ":", int_to_string(uns), ":",
+                               int_to_string(ars), ":", int_to_string(recs), ":",
+                               int_to_string(sums), ":", int_to_string(ops), ":",
+                               int_to_string(uas), ":", int_to_string(ctors)]))
 }
