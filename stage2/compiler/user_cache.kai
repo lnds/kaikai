@@ -100,18 +100,73 @@ pub fn uc_blob_path(root_dir: String, content_hex: String, dep_hex: String) : St
 
 # ---- transitive dependency hashing -----------------------------------
 
+# Memoising transitive closures is what keeps the walk linear: without
+# it, module i on an import chain re-tokenises its i dependencies.
+#
+# A memoised closure keeps each dependency's path, not just its hex,
+# because replaying one still filters against the caller's `visited`.
+# That filter is what makes the memo substitutable for a fresh walk: in
+# a diamond (a -> b, c -> leaf) the hash must see leaf once, at its
+# first discovery, and replay-with-filter reproduces exactly that
+# position. Storing bare hexes would append leaf twice and change the
+# key.
+#[doc("One memoised transitive closure: the absolute path it was entered from, and that path's dependency pairs in discovery order.")]
+pub type UcDepEntry = UDE(String, [UcDepPair])
+
+#[doc("A dependency's absolute path paired with its content hash.")]
+pub type UcDepPair = UDPair(String, String)
+
+#[doc("Memo of transitive dependency closures keyed by absolute path, threaded across one compile so each file is tokenised once regardless of how many modules import it.")]
+pub type UcDepMemo = UDM([UcDepEntry])
+
+#[doc("An empty dependency memo, for the start of a compile.")]
+pub fn uc_memo_empty() : UcDepMemo = UDM([])
+
+fn uc_memo_get(m: UcDepMemo, p: String) : Option[[UcDepPair]] = match m {
+  UDM(es) -> uc_memo_find(es, p)
+}
+
+fn uc_memo_find(es: [UcDepEntry], p: String) : Option[[UcDepPair]] = match es {
+  [] -> None
+  [e, ...rest] -> match e {
+    UDE(q, pairs) -> if q == p { Some(pairs) } else { uc_memo_find(rest, p) }
+  }
+}
+
+fn uc_memo_put(m: UcDepMemo, p: String, pairs: [UcDepPair]) : UcDepMemo =
+  match m { UDM(es) -> UDM([UDE(p, pairs), ...es]) }
+
 # State threaded through the dependency walk: paths already hashed
-# (cycle + diamond dedup, mirroring the driver's ResolveState.visited)
-# and the accumulated content hashes in discovery order.
-type UcDepState = UDS([String], [String])
-#                     visited   dep_content_hexes
+# (cycle + diamond dedup, mirroring the driver's ResolveState.visited),
+# the accumulated (path, hash) pairs in discovery order, and the
+# cross-compile memo.
+type UcDepState = UDS([String], [UcDepPair], UcDepMemo)
+#                     visited   dep_pairs     memo
 
 fn uds_seen(st: UcDepState, p: String) : Bool = match st {
-  UDS(v, _) -> list_has(v, p)
+  UDS(v, _, _) -> list_has(v, p)
 }
 
 fn uds_push(st: UcDepState, p: String, hex: String) : UcDepState = match st {
-  UDS(v, hexes) -> UDS([p, ...v], list_append(hexes, [hex]))
+  UDS(v, pairs, m) -> UDS([p, ...v], list_append(pairs, [UDPair(p, hex)]), m)
+}
+
+fn uds_memo(st: UcDepState) : UcDepMemo = match st { UDS(_, _, m) -> m }
+
+fn uds_with_memo(st: UcDepState, m: UcDepMemo) : UcDepState =
+  match st { UDS(v, ps, _) -> UDS(v, ps, m) }
+
+# Fold a memoised closure into the walk, skipping pairs whose path the
+# caller already visited. This is what keeps the memo faithful to a
+# fresh walk: discovery order is the caller's, dedup is the caller's,
+# only the tokenisation is reused.
+fn uds_replay(st: UcDepState, pairs: [UcDepPair]) : UcDepState = match pairs {
+  [] -> st
+  [p, ...rest] -> match p {
+    UDPair(path, hex) ->
+      uds_replay(if uds_seen(st, path) { st } else { uds_push(st, path, hex) },
+                 rest)
+  }
 }
 
 # Module paths a source imports, as dotted strings, recovered by
@@ -180,6 +235,12 @@ fn uc_scan_dot(src: String, toks: [Token], acc: String) : UcDottedPath = match t
 # Reuses find_module_file for search-path resolution and abspath for the
 # visited-set canonicalisation the driver's resolver also does, so cache
 # invalidation tracks exactly the files the compiler loads.
+#
+# The closure of `abs` is computed in a state isolated from the caller's
+# (empty visited, own pair list) so it depends only on `abs` and is safe
+# to memo; it is then replayed into the caller under the caller's dedup.
+# Walking in the caller's state directly would bake that caller's
+# already-visited set into the memo and make it unsound to reuse.
 fn uc_hash_dep(base_dir: String, mod_path: String,
                search_paths: [String], st: UcDepState)
                : UcDepState / Console + File =
@@ -187,18 +248,32 @@ fn uc_hash_dep(base_dir: String, mod_path: String,
     CF(raw_path, opt_src) -> {
       let abs = abspath(raw_path)
       if uds_seen(st, abs) { st }
-      else { match opt_src {
-        # A missing dep hashes to empty but is still recorded distinct
-        # from a present one, so its later appearance reinvalidates.
-        None -> uds_push(st, abs, "")
-        Some(src) -> {
-          let st1 = uds_push(st, abs, uc_content_hex(src))
-          let imports = uc_import_paths(src, tokenize(src))
-          uc_hash_deps(dir_of(abs), imports, search_paths, st1)
+      else { match uc_memo_get(uds_memo(st), abs) {
+        Some(pairs) -> uds_replay(st, pairs)
+        None -> {
+          let sub = uc_hash_dep_fresh(abs, opt_src, search_paths,
+                                      UDS([], [], uds_memo(st)))
+          match sub { UDS(_, pairs, m) ->
+            uds_replay(uds_with_memo(st, uc_memo_put(m, abs, pairs)), pairs)
+          }
         }
       } }
     }
   }
+
+# Walk one file's own closure from an isolated state.
+fn uc_hash_dep_fresh(abs: String, opt_src: Option[String],
+                     search_paths: [String], st: UcDepState)
+                     : UcDepState / Console + File = match opt_src {
+  # A missing dep hashes to empty but is still recorded distinct
+  # from a present one, so its later appearance reinvalidates.
+  None -> uds_push(st, abs, "")
+  Some(src) -> {
+    let st1 = uds_push(st, abs, uc_content_hex(src))
+    let imports = uc_import_paths(src, tokenize(src))
+    uc_hash_deps(dir_of(abs), imports, search_paths, st1)
+  }
+}
 
 fn uc_hash_deps(base_dir: String, mods: [String],
                 search_paths: [String], st: UcDepState)
@@ -208,14 +283,23 @@ fn uc_hash_deps(base_dir: String, mods: [String],
                                 uc_hash_dep(base_dir, m, search_paths, st))
 }
 
-#[doc("Transitive dependency hash for a file: string_hash over the concatenated content hashes of every import reachable from it, in stable discovery order, as 16 hex chars. Imports are recovered by token scan, so this never parses. Changes when any transitive import changes.")]
-pub fn uc_dep_hex(root_path: String, src: String, toks: [Token],
-                  search_paths: [String]) : String / Console + File = {
+#[doc("Transitive dependency hash for a file: string_hash over the concatenated content hashes of every import reachable from it, in stable discovery order, as 16 hex chars. Imports are recovered by token scan, so this never parses. Changes when any transitive import changes. Returns the hash alongside the memo, grown with every closure walked, for the next file in the same compile.")]
+pub fn uc_dep_hex_memo(root_path: String, src: String, toks: [Token],
+                       search_paths: [String], memo: UcDepMemo)
+                       : UcDepHex / Console + File = {
   let st = uc_hash_deps(dir_of(root_path), uc_import_paths(src, toks),
-                         search_paths, UDS([], []))
-  match st { UDS(_, hexes) ->
-    uc_hash_hex16(string_hash(concat_all(hexes)))
+                         search_paths, UDS([], [], memo))
+  match st { UDS(_, pairs, m) ->
+    UDHex(uc_hash_hex16(string_hash(concat_all(uc_pair_hexes(pairs, [])))), m)
   }
+}
+
+#[doc("A dependency hash paired with the memo the walk that produced it grew.")]
+pub type UcDepHex = UDHex(String, UcDepMemo)
+
+fn uc_pair_hexes(pairs: [UcDepPair], acc: [String]) : [String] = match pairs {
+  [] -> list_reverse(acc)
+  [p, ...rest] -> match p { UDPair(_, hex) -> uc_pair_hexes(rest, [hex, ...acc]) }
 }
 
 # ---- lookup + atomic write -------------------------------------------
@@ -225,17 +309,24 @@ pub type UcLookup
   = UcHit([Decl])
   | UcMiss(String, String)   # content_hex, dep_hex
 
-#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over src, dep over the imports the tokens name), reads the matching blob, and returns UcHit(decls) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise.")]
+#[doc("A lookup result paired with the memo the dependency walk grew, to thread into the next lookup of the same compile.")]
+pub type UcLookupMemo = UcLM(UcLookup, UcDepMemo)
+
+#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over src, dep over the imports the tokens name), reads the matching blob, and returns UcHit(decls) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise. The memo carries dependency closures across the compile; pass uc_memo_empty() for the first file and thread the returned one onward.")]
 pub fn uc_lookup(root_path: String, src: String, toks: [Token],
-                 search_paths: [String]) : UcLookup / Console + File = {
+                 search_paths: [String], memo: UcDepMemo)
+                 : UcLookupMemo / Console + File = {
   let content_hex = uc_content_hex(src)
-  let dep_hex = uc_dep_hex(root_path, src, toks, search_paths)
-  let blob_path = uc_blob_path(dir_of(root_path), content_hex, dep_hex)
-  match read_file(blob_path) {
-    Err(_) -> UcMiss(content_hex, dep_hex)
-    Ok(blob) -> match cache_deserialize_module(blob) {
-      None -> UcMiss(content_hex, dep_hex)
-      Some(cds) -> match cds { CDs(decls, _) -> UcHit(decls) }
+  match uc_dep_hex_memo(root_path, src, toks, search_paths, memo) {
+    UDHex(dep_hex, memo1) -> {
+      let blob_path = uc_blob_path(dir_of(root_path), content_hex, dep_hex)
+      UcLM(match read_file(blob_path) {
+        Err(_) -> UcMiss(content_hex, dep_hex)
+        Ok(blob) -> match cache_deserialize_module(blob) {
+          None -> UcMiss(content_hex, dep_hex)
+          Some(cds) -> match cds { CDs(decls, _) -> UcHit(decls) }
+        }
+      }, memo1)
     }
   }
 }
