@@ -275,6 +275,12 @@ test-mn-tsan: kaic2
 test-mn-determinism: kaic2
 	@bash tools/run-mn-determinism.sh
 
+# Deadlock-banner determinism: the wedged-scheduler report is claimed by one
+# worker, so a deadlocking fixture prints exactly one banner and exits 1 on
+# every run. Repetition IS the gate — a race passes a single run by luck.
+test-mn-deadlock-banner: kaic2
+	@bash tools/run-mn-deadlock-banner.sh
+
 # M:N corpus determinism: the whole fixture corpus at N=1 vs N>1, both
 # backends. Deliberately NOT in `tier1` — it is the heaviest gate in the
 # repo and owns its own workflow (.github/workflows/tier1-mn-corpus.yml),
