@@ -9304,11 +9304,12 @@ test-packages: $(TARGET)
 	@$(STACK) ../tools/test-packages.sh
 
 # Issue #455 Phase B — user-file incremental cache invalidation gate.
-# Runs the five negative fixtures (edit source / edit import / edit
+# Runs the negative fixtures (edit source / edit import / edit
 # transitive import / version bump / corrupt blob) plus the positive
-# cold==warm==oracle differential. A stale-serving cache is a
-# correctness bug worse than no cache, so this is a hard gate, not a
-# smoke test. Each script is self-contained under /tmp and exits 0/1.
+# cold==warm==oracle differential and the chain/diamond dependency-memo
+# key-stability fixture. A stale-serving cache is a correctness bug
+# worse than no cache, so this is a hard gate, not a smoke test. Each
+# script is self-contained under /tmp and exits 0/1.
 # The kaic2 binary must be built first because the fixtures invoke
 # bin/kai (which uses it) and kaic2 directly.
 test-user-cache: $(TARGET)
