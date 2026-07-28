@@ -84,6 +84,26 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.105.1 (2026-07-28)
+
+### Fixed
+
+- **codegen**: materialise a fixed-vec literal crossing the boxed border (#1522)
+- **driver**: warn when a manifest selects an edition the compiler lacks (#1519)
+- **codegen**: read a fixed-vec parameter through the runtime slot in raw position (#1521)
+- **runtime**: report the M:N deadlock banner exactly once (#1516)
+- **emit**: namespace user C symbols as `kaiu_` and reject builtin shadowing (#1510)
+
+### Changed
+
+- **driver**: ride the shared core-cache dir for the typed cut (#1523)
+- **cache**: pin the typed cut's blobs to the project on the native path (#1525)
+- **driver**: route dotted subdirectory imports onto the partitioned native path (#1524)
+- **native**: drop the codegen level on unqualified builds (#1520)
+- **perceus**: hoist loop-invariant fn-name set and prim borrow map (#1515)
+- **cache**: memoise transitive dep closures across a compile (#1506) (#1509)
+- **cache**: make the per-module typed cut faster warm than no cut (#1507)
+
 ## v0.105.0 (2026-07-25)
 
 ### Added
