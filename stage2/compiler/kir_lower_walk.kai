@@ -209,22 +209,32 @@ pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console =
   } else if fixed_vec_needs_materialize(x) { lower_fixed_vec_materialize(x, st) }
   else { lower_expr_boxed(x, st) }
 
-# A read of an INLINE fixed-vec binder in boxed position — the value is a
-# header-less `[n x elem]` aggregate, and the consumer wants a `KaiValue *`.
-# `__fixed_vec_get` reads its base through `lower_expr_boxed`, so the static
-# read never reaches here and stays heap-free; every OTHER read crosses the
-# boxed border and must materialise. `MUnboxed` is the unbox pass's record
-# that this binder holds the inline form (a fixed-vec-typed value from a
-# function return is already a dynamic heap vec and stays `MBoxed`).
+# An INLINE fixed-vec value in boxed position — a header-less `[n x elem]`
+# aggregate where the consumer wants a `KaiValue *`, so it must materialise.
+# The predicate is `MUnboxed` + a fixed-vec type and nothing else: that pair
+# IS the record that the value holds the inline form, and it holds for a
+# LITERAL as much as for a read of an inline binder. Gating on the node shape
+# instead would store the bare aggregate pointer into a boxed slot — a value
+# with no `KaiValue` header, which every later read type-confuses.
+# `__fixed_vec_get` reads its base through `lower_expr_boxed`, so a static
+# read never reaches here and stays heap-free.
 fn fixed_vec_needs_materialize(x: Expr) : Bool =
   match x.mode {
-    MUnboxed -> match x.kind { EVar(_) -> ty_is_fixed_vec_opt(x.ty)  _ -> false }
+    MUnboxed -> ty_is_fixed_vec_opt(x.ty)
     _        -> false
   }
 
-# The same read seen from a `let` RHS whose binder is itself the inline
-# form: an alias, not a border crossing.
-fn fixed_vec_alias_rhs(rhs: Expr) : Bool = fixed_vec_needs_materialize(rhs)
+# A `let` RHS whose binder itself holds the inline form crosses no boxed
+# border: an alias between two inline binders, or the literal that CREATES
+# one. Both must stay inline — materialising here would leave the binder a
+# dynamic vec while its own reads still index it as an aggregate.
+fn fixed_vec_alias_rhs(rhs: Expr) : Bool =
+  fixed_vec_needs_materialize(rhs) and
+  match rhs.kind {
+    EVar(_)        -> true
+    ECall(f, _)    -> match f.kind { EVar(nm) -> nm == "__fixed_vec_lit"  _ -> false }
+    _              -> false
+  }
 
 # The inline aggregate → a dynamic heap `Vec`, one copy at the border
 # (`vec_reserve` + one `vec_push` per element). Mirrors the C backend's
