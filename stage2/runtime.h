@@ -3482,18 +3482,25 @@ static _Atomic int kai_sched_shutting_down = 0;
  *   kai_blocked_fiber_count — fibers currently in KAI_FIBER_PARKED (mailbox
  *                             recv / await / send-block AND reactor waiters);
  *                             the count the deadlock banner reports.
+ *   kai_deadlock_reported   — claimed by CAS so exactly one worker prints the
+ *                             banner. Quiescence is observable by every idle
+ *                             worker at once, so without it the banner count
+ *                             is a scheduling race.
  * The reactor's own idle state is kai_reactor_idle, beside the reactor
  * globals below. Untouched at N=1 (that path keeps the TLS kai_parked_count). */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern _Atomic int kai_sched_idle_count;
 extern _Atomic int kai_blocked_fiber_count;
+extern _Atomic int kai_deadlock_reported;
 #  if defined(KAI_RUNTIME_OWNER)
 _Atomic int kai_sched_idle_count = 0;
 _Atomic int kai_blocked_fiber_count = 0;
+_Atomic int kai_deadlock_reported = 0;
 #  endif
 #else
 static _Atomic int kai_sched_idle_count = 0;
 static _Atomic int kai_blocked_fiber_count = 0;
+static _Atomic int kai_deadlock_reported = 0;
 #endif
 
 /* F2 — reactor park reasons stamped into KaiFiber.pending_park. Zero is
@@ -14727,6 +14734,19 @@ static void kai_sched_check_deadlock(void) {
               && kai_all_deques_empty();
     pthread_mutex_unlock(&kai_reactor_mu);
     if (!wedged) return;
+
+    /* Wedged is a whole-scheduler state, so every idle worker observes it at
+     * once. Claim the report with a CAS: the winner prints and exits, the
+     * losers nap until that exit() lands. No mutex — the reporter must not be
+     * able to block on a peer in the very state it is reporting, and a loser
+     * spinning here holds nothing a peer could need. */
+    int unreported = 0;
+    if (!atomic_compare_exchange_strong(&kai_deadlock_reported, &unreported, 1)) {
+        for (;;) {
+            struct timespec nap = { 0, 200 * 1000 };
+            nanosleep(&nap, NULL);
+        }
+    }
 
     fprintf(stderr,
         "kai: all workers idle with fibers parked (%d parked) — deadlock\n",
