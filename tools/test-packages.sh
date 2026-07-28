@@ -204,6 +204,9 @@ run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
 run_check_script "git_tag_alias"      "git_tag_alias/check.sh"
 run_check_script "unknown_dep_form"   "unknown_dep_form/check.sh"
 
+# An edition newer than the compiler implements warns but still builds.
+run_check_script "edition_ahead"      "edition_ahead/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
