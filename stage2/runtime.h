@@ -17075,6 +17075,32 @@ static void kai_llvm_bc_id(const char *env, char *out, size_t outsz) {
     else
         snprintf(out, outsz, "none");
 }
+
+/* Codegen level for the TargetMachine — instruction selection, scheduling
+ * and register allocation, a budget separate from the IR pass pipeline.
+ * `None` still emits correct code; it trades register allocation quality
+ * for a ~4x faster emit, which dominates a default build's back-half.
+ *
+ * `--release` and `--debug` keep `Default`: release must not lose codegen
+ * quality, and debug already pays O0's larger module. Only an unqualified
+ * `kai build` — the edit loop — takes the fast level. `KAI_NATIVE_CGLEVEL`
+ * overrides for measurement.
+ *
+ * The chosen level shapes the emitted object, so it rides the backend tag
+ * that keys the shared core-object cache; otherwise a default build and a
+ * release build would collide on one key. */
+static const char *kai_llvm_cgen_level_id(void) {
+    const char *e = getenv("KAI_NATIVE_CGLEVEL");
+    if (e && e[0]) return (strcmp(e, "0") == 0) ? "none" : "default";
+    const char *m = getenv("KAI_BUILD_MODE");
+    if (m && strcmp(m, "default") == 0) return "none";
+    return "default";
+}
+
+static LLVMCodeGenOptLevel kai_llvm_cgen_level(void) {
+    return (strcmp(kai_llvm_cgen_level_id(), "none") == 0)
+        ? LLVMCodeGenLevelNone : LLVMCodeGenLevelDefault;
+}
 static KaiValue *kai_llvm_backend_tag(void) {
     const char *off = getenv("KAI_NATIVE_CORE_OBJ");
     if (off && strcmp(off, "0") == 0) return kai_str("");
@@ -17094,7 +17120,8 @@ static KaiValue *kai_llvm_backend_tag(void) {
         return kai_str("");
     }
     char *triple = LLVMGetDefaultTargetTriple();
-    snprintf(tag, sizeof tag, "%s|O2|bc:%s|inlbc:%s", triple ? triple : "?", bc, inlbc);
+    snprintf(tag, sizeof tag, "%s|O2|cg:%s|bc:%s|inlbc:%s",
+             triple ? triple : "?", kai_llvm_cgen_level_id(), bc, inlbc);
     if (triple) LLVMDisposeMessage(triple);
     return kai_str(tag);
 }
@@ -18159,7 +18186,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     char *features = LLVMGetHostCPUFeatures();
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
         target, triple, cpu ? cpu : "", features ? features : "",
-        LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
+        kai_llvm_cgen_level(), LLVMRelocPIC, LLVMCodeModelDefault);
     if (cpu) LLVMDisposeMessage(cpu);
     if (features) LLVMDisposeMessage(features);
     LLVMSetTarget((LLVMModuleRef) m, triple);

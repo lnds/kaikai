@@ -47,6 +47,29 @@ rel_size=$(wc -c < "$WORK/rel")
 "$WORK/rel" >/dev/null 2>&1 || true   # must still run (panics, so non-zero is fine)
 echo "build-modes check: release $rel_size < default $def_size bytes (stripped) OK"
 
+# --- default and --release must not share a cached core object ---
+# They emit at different codegen levels, so their objects differ. The shared
+# core-object cache is keyed by the backend tag; if the tag omitted the
+# codegen level, whichever profile built first would serve its object to the
+# other and silently hand a release build unoptimised core code. Interleaving
+# the profiles must not perturb either one's output.
+#
+# Both baselines are taken warm (each profile has already populated its own
+# cache entry above), because a cold-cache and a warm-cache link of the same
+# input differ in bytes anyway — the Mach-O link stamps a build UUID — while
+# keeping the same size. Size is what discriminates a served-from-the-wrong-
+# profile object here.
+"$KAI" build "$SRC" -o "$WORK/probe_w" 2>/dev/null || fail "default warm rebuild errored"
+"$KAI" build --release "$SRC" -o "$WORK/rel_w" 2>/dev/null || fail "release warm rebuild errored"
+def_warm=$(wc -c < "$WORK/probe_w"); rel_warm=$(wc -c < "$WORK/rel_w")
+"$KAI" build "$SRC" -o "$WORK/probe2" 2>"$WORK/probe2.err" || fail "default rebuild after release errored: $(cat "$WORK/probe2.err")"
+"$KAI" build --release "$SRC" -o "$WORK/rel2" 2>"$WORK/rel2.err" || fail "release rebuild after default errored: $(cat "$WORK/rel2.err")"
+[ "$(wc -c < "$WORK/probe2")" -eq "$def_warm" ] || fail "default build changed size after a release build interleaved (core-object cache key ignores the codegen level)"
+[ "$(wc -c < "$WORK/rel2")" -eq "$rel_warm" ] || fail "release build changed size after a default build interleaved (core-object cache key ignores the codegen level)"
+[ "$rel_warm" -ne "$def_warm" ] || fail "release and default produced identical-size binaries (the codegen level is not reaching the emitter)"
+echo "$("$WORK/probe2" 2>&1 || true)" | grep -q "panic: boom" || fail "default rebuild did not panic"
+echo "build-modes check: default and release keep distinct core objects across interleaved builds OK"
+
 # --- --debug: DWARF present + panic prints a .kai:line stack trace ---
 "$KAI" build --debug "$SRC" -o "$WORK/dbg" 2>"$WORK/dbg.err" || fail "debug build errored: $(cat "$WORK/dbg.err")"
 
