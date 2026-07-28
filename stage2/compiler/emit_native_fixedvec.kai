@@ -31,17 +31,26 @@ pub fn nemit_fixed_vec_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / C
     nemit_fixed_vec_lit(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_lit@"), cargs)
   } else if string_starts_with_q(nm, "__fixed_vec_materialize@") {
     nemit_fixed_vec_materialize(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_materialize@"), cargs)
-  } else if string_starts_with_q(nm, "__fixed_vec_dget@") {
-    nemit_fixed_vec_dget(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_dget@"), cargs)
-  } else if string_starts_with_q(nm, "__fixed_vec_getraw_dyn@") {
-    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_getraw_dyn@"), cargs, true, true)
-  } else if string_starts_with_q(nm, "__fixed_vec_getraw@") {
-    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_getraw@"), cargs, false, true)
-  } else if string_starts_with_q(nm, "__fixed_vec_get_dyn@") {
-    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get_dyn@"), cargs, true, false)
   } else {
-    nemit_fixed_vec_read(ctx, fixed_vec_prim_spec(nm, "__fixed_vec_get@"), cargs, false, false)
+    nemit_fixed_vec_any_read(ctx, nm, cargs)
   }
+
+# A read prim's name spells its three independent axes: `d` picks the boxed
+# base (runtime slot) over the inline aggregate (GEP), `raw` keeps the loaded
+# word unboxed, `_dyn` gates the subscript against the static length. Decoding
+# them beats enumerating the eight spellings.
+fn nemit_fixed_vec_any_read(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console = {
+  let boxed = string_starts_with_q(nm, "__fixed_vec_dget")
+  let stem  = if boxed { "__fixed_vec_dget" } else { "__fixed_vec_get" }
+  let rest  = string_slice(nm, string_length(stem), string_length(nm) - string_length(stem))
+  let raw   = string_starts_with_q(rest, "raw")
+  let tail  = if raw { string_slice(rest, 3, string_length(rest) - 3) } else { rest }
+  let dyn   = string_starts_with_q(tail, "_dyn@")
+  let spec  = fixed_vec_prim_spec(nm, concat_all([stem, if raw { "raw" } else { "" },
+                                                  if dyn { "_dyn@" } else { "@" }]))
+  if boxed { nemit_fixed_vec_dget(ctx, spec, cargs, dyn, raw) }
+  else { nemit_fixed_vec_read(ctx, spec, cargs, dyn, raw) }
+}
 
 # `<elem-tag>@<n>` decoded from the prim name into `(elem-tag, n)`.
 type FVSpec = FVSpec(String, Int)
@@ -103,15 +112,16 @@ fn nemit_fixed_vec_read(ctx: Handle, spec: FVSpec, cargs: [KVal],
 # through the runtime instead of GEPing into a `[n x elem]` aggregate that
 # is not there. The load and the re-box are the inline read's; the runtime
 # call touches no refcount, so the read stays RC-neutral.
-fn nemit_fixed_vec_dget(ctx: Handle, spec: FVSpec, cargs: [KVal]) : Handle / Console = match spec {
-  FVSpec(tag, _) -> match cargs {
+fn nemit_fixed_vec_dget(ctx: Handle, spec: FVSpec, cargs: [KVal],
+                        dyn: Bool, raw_out: Bool) : Handle / Console = match spec {
+  FVSpec(tag, n) -> match cargs {
     [base, idx] -> {
       let vec  = nemit_atom(ctx, base)
+      let ix   = if dyn { nfixed_idx_checked(ctx, idx, n) } else { nfixed_idx_i64(ctx, idx) }
       let slot = ncall_sig2(ctx, "kaix_vec_raw_slot", native_ctx_ptrt(ctx),
-                            native_ctx_ptrt(ctx), native_ctx_i64t(ctx),
-                            vec, nfixed_idx_i64(ctx, idx))
+                            native_ctx_ptrt(ctx), native_ctx_i64t(ctx), vec, ix)
       let raw  = llvm_build_load(native_ctx_b(ctx), nfixed_elem_ty(ctx, tag), slot)
-      nfixed_box(ctx, tag, raw)
+      if raw_out { raw } else { nfixed_box(ctx, tag, raw) }
     }
     _ -> nemit_null(ctx)
   }
