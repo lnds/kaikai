@@ -163,5 +163,54 @@ fi
 grep -q "type mismatch" "$WORK/baderr" \
   || fail "warm --check lost the type-mismatch diagnostic" cat "$WORK/baderr"
 
-echo "typedc_cut_shared_core_dir: OK — cut rides the shared core dir, cold/warm/edit == plain, no cross-project collision, --check diagnostics intact"
+# ---- 5: nodes the cut hashes BEFORE inference can normalise them -----
+#
+# Keying a module serialises its decls before inference runs, so any
+# node the pipeline only removes *during* inference reaches the codec.
+# Two such nodes, each of which turned a diagnostic into a codec panic:
+#
+#   - an out-of-range integer literal stays `EIntLit`, because failing
+#     to mint it IS the diagnostic under test;
+#   - the root file keeps its module doc so the typer can lift it into
+#     `TypedProgram.module_doc` (only imported modules drop it).
+#
+# Both must survive keying and still produce their normal output.
+
+cat > "$PROJ/overflow.kai" <<'EOF'
+fn main() : Int / Stdout = {
+  let x = 9223372036854775808
+  Stdout.print(show(x))
+  0
+}
+EOF
+# shellcheck disable=SC2046
+if "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+   "$PROJ/overflow.kai" >/dev/null 2>"$WORK/ovferr"; then
+  fail "--check accepted an out-of-range Int literal"
+fi
+grep -q "out of Int range" "$WORK/ovferr" \
+  || fail "out-of-range literal lost its diagnostic under the cut" \
+          cat "$WORK/ovferr"
+
+cat > "$PROJ/moddoc.kai" <<'EOF'
+#[doc("""
+Module-position doc on the root file.
+""")]
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+EOF
+# shellcheck disable=SC2046
+if ! "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+     "$PROJ/moddoc.kai" >/dev/null 2>"$WORK/docerr"; then
+  cat "$WORK/docerr"
+  fail "--check rejected a root file carrying a module doc"
+fi
+
+# A codec panic exits non-zero, but assert on the text too so a future
+# panic cannot masquerade as an ordinary rejection.
+for e in "$WORK/ovferr" "$WORK/docerr" "$WORK/baderr"; do
+  grep -q '^panic:' "$e" && fail "codec panicked instead of diagnosing" cat "$e"
+done
+
+echo "typedc_cut_shared_core_dir: OK — cut rides the shared core dir, cold/warm/edit == plain, no cross-project collision, pre-inference nodes keyed without panic, --check diagnostics intact"
 exit 0
