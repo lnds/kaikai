@@ -514,9 +514,13 @@ are gates for every sub-phase.
 The user-file analogue of A.0: a per-project, content-addressable cache
 of post-parse `[Decl]` for user modules, with correct transitive
 invalidation. New module `stage2/compiler/user_cache.kai`; the driver's
-import resolver consults it before lexing each imported module; opt-in
-via `KAI_CACHE=1` (the `bin/kai` wrapper creates `<project>/.kai-cache/`
-and passes `--user-cache`).
+import resolver consults it before lexing each imported module. The
+`bin/kai` wrapper creates `<project>/.kai-cache/` and passes
+`--user-cache` automatically when the entry sits under a `kai.toml`;
+`KAI_CACHE=0` disables it and `KAI_CACHE=1` forces it on for a loose
+file. The package gate is what makes the typed rebuild cut below pay:
+a loose file partitions into one bucket the cut cannot split, so it
+would pay the publish and never serve a hit.
 
 - **Composite key materialised as the blob filename**
   (`<content_hex>-<dep_hex>.kab`). Invalidation is a property of the
