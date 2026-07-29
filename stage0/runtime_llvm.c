@@ -1075,6 +1075,8 @@ KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_core_
 KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off) { return kai_core_string_cp_len(s, off); }
 KaiValue *kaix_core_string_reverse(KaiValue *s)            { return kai_core_string_reverse(s); }
 KaiValue *kaix_core_string_hash(KaiValue *s)                { return kai_core_string_hash(s); }
+KaiValue *kaix_core_int_to_le4(KaiValue *n)                 { return kai_core_int_to_le4(n); }
+KaiValue *kaix_core_int_to_le8(KaiValue *n)                 { return kai_core_int_to_le8(n); }
 KaiValue *kaix_core_real_bits(KaiValue *v)                  { return kai_core_real_bits(v); }
 KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init)           { return kai_core_array_make(n, init); }
 KaiValue *kaix_core_array_empty(void)                                 { return kai_core_array_empty(); }
