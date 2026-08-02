@@ -123,6 +123,18 @@ you care.
 
 ## Syntax note: trailing lambdas
 
+> **v1 status (2026-08-02):** of the helpers named in this section,
+> only `nursery` (`stdlib/spawn.kai`) exists. `try`, `with_default`,
+> `with_state`, `map_fail` and `File.read_file_or_fail` are **not
+> implemented** — they appear here, in §`Fail` and in §`State[T]` as
+> illustrations of the shape such a helper layer would take, not as
+> callable stdlib API. Writing `try(...)` today is a compile error.
+> See §`Fail` for the measured state and issue #1535, which decides
+> whether `Fail` gains such a layer, is redefined, or is removed.
+> The trailing-lambda *syntax* itself is real and shipped
+> (`kai info syntax` §*Trailing lambdas*); only these example
+> callees are fictional.
+
 Many of the stdlib helpers in this document take a lambda as
 their last argument (`try`, `with_default`, `with_state`,
 `map_fail`, `nursery`, and the like). Doc B writes them in one
@@ -502,9 +514,14 @@ lands on the `Result` side because callers branch on the
 motive. v1 keeps the payload as a raw `String` message; a
 structured `FileError` sum is deferred.
 
-### Stdlib helper
+### Stdlib helper — not implemented
 
-The common "abort if anything goes wrong" wrapper lifts `Result`
+> **v1 status (2026-08-02):** `read_file_or_fail` does not exist in
+> `stdlib/`; the shape below is a sketch pending the `Fail` decision
+> (issue #1535). `File.read_file` returns `Result[String, String]` —
+> propagate it with postfix `!`.
+
+The "abort if anything goes wrong" wrapper would lift `Result`
 into `Fail`:
 
 ```kai
@@ -992,9 +1009,13 @@ state visible to user code.
 > NetDns` alias is now definable; a follow-up lane can add the row
 > alias to `stdlib/effects.kai`.
 
-### Stdlib helper
+### Stdlib helper — not implemented
 
-The "abort if anything goes wrong" pattern lifts `Result` into
+> **v1 status (2026-08-02):** `tcp_connect_or_fail` does not exist in
+> `stdlib/`, for the same reason as `read_file_or_fail` above — no
+> stdlib API raises `Fail` (issue #1535).
+
+The "abort if anything goes wrong" pattern would lift `Result` into
 `Fail`, same shape as `read_file_or_fail`:
 
 ```kai
@@ -1339,7 +1360,25 @@ has a value of type `Nothing` to pass (impossible), so the
 handler *must* short-circuit. Doc A §*Discarding the continuation*
 covers this.
 
-### Stdlib helpers
+### Stdlib helpers — not implemented
+
+> **v1 status (2026-08-02):** none of the four helpers below exists in
+> `stdlib/`. `try`, `with_default`, `unwrap_or_fail` and `map_fail` are
+> **illustrations of a proposed helper layer**, not callable API —
+> calling any of them today is a compile error. `Fail` itself is
+> declared (`stdlib/effects.kai:49`) and its runtime default handler
+> works, but it has **no users**: `stdlib/` contains 174 `Result[...]`
+> occurrences across 17 files and **zero** `/ Fail` rows, and the only
+> other mention of `Fail` in `stdlib/` is one `#[doc]` prose reference
+> in `loop.kai`. The single failure-shaped effect the stdlib does use
+> is `ReadFault` (§*ReadFault*), declared where its skip policy is
+> domain knowledge.
+>
+> Issue #1535 decides the destination of `Fail` — implement this
+> layer, redefine `fail` as resumable, or remove the effect at an
+> edition boundary. Until it closes, treat this section as a design
+> sketch. Fallible stdlib APIs return `Result` and propagate with
+> postfix `!`.
 
 ```kai
 # Run a fallible computation and capture the error message.
@@ -1376,8 +1415,12 @@ pub fn map_fail[T](f: (String) -> String, body: () -> T / Fail) : T / Fail {
 }
 ```
 
-`try` is the idiomatic replacement for `try`/`catch`. The doc's
-own spec rejects a `try` keyword; this is a plain function.
+Were this layer to ship, `try` would be the replacement for
+`try`/`catch`: the spec rejects a `try` keyword, so it is a plain
+function. Today neither exists. `kai info syntax` §*NOT IN KAIKAI*
+lists `throw` / `try-catch` among the forms the language does not
+have and points at `Fail` or `Result[a, e]` as the substitutes; of
+those two only `Result` (with postfix `!`) is backed by stdlib API.
 
 ### Error payload shape
 
@@ -1402,7 +1445,12 @@ value via `with State[T](v0)` and threads `state` through
 `resume`'s optional second argument. See Doc A §*State: a handler
 with its own state* for the worked example.
 
-### Stdlib helpers
+### Stdlib helpers — not implemented
+
+> **v1 status (2026-08-02):** the effect itself is real
+> (`stdlib/effects/concurrent.kai:16`), but neither `modify` nor
+> `with_state` exists in `stdlib/`. Use `handle ... with State[T](v0)`
+> directly; the shapes below are the sketch such helpers would take.
 
 ```kai
 pub fn modify[T, e](f: (T) -> T / e) : Unit / State[T] + e {
@@ -1894,6 +1942,25 @@ resource closing (closing file handles, rolling back
 transactions) requires an explicit `Cancel` handler at the
 scope that owns the resource.
 
+> **v1 status (2026-08-02):** read "at the scope that owns the
+> resource" strictly — it is the whole guarantee, and the only one.
+> Measured on this checkout across six non-local-exit paths, a
+> handler installed *at* the resource scope does run its cleanup, on
+> the scheduler-driven `Spawn.cancel` path included. Every other path
+> skips it: a `Cancel` handler installed *outside* the resource
+> scope, an outer handler for any effect that abandons the
+> continuation while an inner scope holds the resource, the
+> `ReadFault` abort path (§*ReadFault*), and `panic`. The cause is
+> shared and mechanical — a non-local exit `longjmp`s past the
+> intervening C frames and truncates the evidence chain rather than
+> walking it — so no arrangement of user code recovers those frames.
+> A producer cannot defend itself by handling the fault effect: doing
+> so shadows the consumer's policy choice, which is why
+> `stdlib/stream.kai` routes faults out through the row.
+> `examples/effects/stream_abort_leak.kai` pins one instance as a
+> measured fact. The language has no `finally`-style construct;
+> issue #1537 decides whether one lands.
+
 ### Delivery points
 
 `Cancel.raise()` is delivered by the scheduler only at yield
@@ -2146,7 +2213,7 @@ error: main cannot have unhandled effect `Fail`
   |                        ^^^^
   = note: effects without a runtime-installed default handler
           must be handled inside the program.
-  = help: wrap the effectful code in `try { ... }` or `handle`.
+  = help: wrap the effectful code in `handle ... with Fail { ... }`.
 ```
 
 ### Installation order
