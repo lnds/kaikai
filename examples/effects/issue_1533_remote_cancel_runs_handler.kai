@@ -1,0 +1,75 @@
+# Remote-cancel handler-dispatch fixture.
+#
+# `Spawn.cancel(target)` from a sibling dispatches through the
+# innermost user `with Cancel { raise(_) -> ... }` on the target's
+# evidence stack; only a target with no user handler in scope unwinds
+# to the trampoline's cancel pad.
+#
+# Two properties beyond issue_682_cancel_sibling_handler, which covers
+# a single flat handler and stops at the first cleanup print:
+#
+#   1. Nested handlers resolve innermost-first. The worker wraps an
+#      inner Cancel frame in an outer one; only the inner clause runs,
+#      and the outer clause's line must never appear. A walk that
+#      picked the outermost frame, or that ran both, prints extra.
+#   2. The no-handler fallback still works in the same program: a
+#      sibling with no user Cancel frame in scope terminates through
+#      the trampoline pad and remains joinable.
+#
+# The clause runs to completion rather than merely being entered: it
+# prints AFTER doing work the unwind would otherwise skip.
+#
+# Ref cells are not used to observe the clause — a fiber's heap is
+# private and a captured Ref is copied across the spawn, so the parent
+# would read its own untouched copy either way.
+#
+# The workers' opening prints are staggered by a sleep: they are
+# causally independent, so above one thread their relative order is
+# not stable and an unstaggered golden would flake.
+
+import spawn
+import time
+
+fn handled_worker() : Unit / Cancel + Stdout + Clock =
+  handle {
+    handle {
+      Stdout.print("handled: parking")
+      time.sleep(time.seconds(10))
+      Stdout.print("handled: woke (unreachable)")
+    } with Cancel {
+      raise(resume) -> {
+        Stdout.print("handled: inner cleanup step 1")
+        Stdout.print("handled: inner cleanup step 2")
+      }
+    }
+    Stdout.print("handled: past inner handle")
+  } with Cancel {
+    raise(resume) -> Stdout.print("handled: outer cleanup (unreachable)")
+  }
+
+fn bare_worker() : Unit / Cancel + Stdout + Clock = {
+  time.sleep(time.millis(100))
+  Stdout.print("bare: parking")
+  time.sleep(time.seconds(10))
+  Stdout.print("bare: woke (unreachable)")
+}
+
+fn canceller(h: Fiber[Unit], b: Fiber[Unit])
+  : Unit / Clock + Spawn + Cancel + Stdout = {
+  time.sleep(time.millis(300))
+  Stdout.print("canceller: cancelling both")
+  Spawn.cancel(h)
+  Spawn.cancel(b)
+}
+
+fn main() : Int / Spawn + Cancel + Stdout + Clock = {
+  nursery { n ->
+    let h = n.spawn(handled_worker)
+    let b = n.spawn(bare_worker)
+    let _ = n.spawn(() => canceller(h, b))
+    n.await(h)
+    n.await(b)
+  }
+  Stdout.print("main: done")
+  0
+}
