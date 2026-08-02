@@ -9880,6 +9880,29 @@ static KaiValue *kai_core_int_to_byte_string(KaiValue *n) {
     return kai_str_from_bytes((const char *) &b, 1);
 }
 
+/* Encode an Int as its 4- / 8-byte little-endian block in one alloc.
+ * The kaikai spellings emitted the same bytes one at a time and joined
+ * them through a cons list, paying 5 and 10 allocations for a block
+ * that fits in a register. Mirrors what the decoder side already does
+ * with `string_byte_at_int`. */
+static KaiValue *kai_core_int_to_le4(KaiValue *n) {
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
+    unsigned char b[4];
+    int i;
+    if (n) kai_decref(n);
+    for (i = 0; i < 4; i++) b[i] = (unsigned char) ((uint64_t) v >> (i * 8));
+    return kai_str_from_bytes((const char *) b, 4);
+}
+
+static KaiValue *kai_core_int_to_le8(KaiValue *n) {
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
+    unsigned char b[8];
+    int i;
+    if (n) kai_decref(n);
+    for (i = 0; i < 8; i++) b[i] = (unsigned char) ((uint64_t) v >> (i * 8));
+    return kai_str_from_bytes((const char *) b, 8);
+}
+
 /* Read one byte at index `i` of String `s`, returning it as an Int
  * 0..255. Returns -1 on out-of-bounds or wrong type. Faster than
  * `match char_at(s, i) { Some(c) -> char_to_int(c); None -> -1 }`
