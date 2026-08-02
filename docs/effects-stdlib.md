@@ -1967,9 +1967,12 @@ effect captures the receiving-end semantics.
 ### Default handler
 
 The root nursery installed by the runtime when `main`'s row
-contains `Spawn`. Nested `nursery (n) => {...}` blocks desugar
-to `handle { ... } with Spawn as n { ... }`, as noted in
-`docs/structured-concurrency.md` §*Implementation notes*.
+contains `Spawn`. Nested `nursery { n -> ... }` blocks do not
+install a handler: the desugar rewrites each `n.<op>` to
+`Spawn.<op>` and strips the cap binder, leaving a plain thunk that
+`nursery` brackets with `scope_enter`/`scope_exit`. The cap binder
+exists to brand each scope for the mismatch diagnostic, not to
+introduce a new handler.
 
 ## `Ffi`
 
