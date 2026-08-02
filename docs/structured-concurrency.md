@@ -109,15 +109,25 @@ cross-nursery use),
 `m8x_8_brand_propagation_let_chain.kai` (negative — chain
 through three lets).
 
-The pragmatic v1 of this lane (issue #71 option (b)) lives as a
-side-table walker keyed on call-site `(line, col)`; the brief's
-spec'd long-term shape — `TyBranded(Ty, BrandId)` woven into the
-unifier so brands flow through generic helper instantiations — is
-documented in `docs/fibers-honesty-targets.md` §*Residual m8.x
-items* item 1 as the next refinement (helper-passthrough cases
-where a generic `fn id[T](x: T) : T = x` round-trip strips the
-brand). Direct-binding propagation (`let p = q`) and the
-spawn-site-to-consume-site loop are covered today.
+Brands also survive a round-trip through a helper that returns one
+of its parameters unchanged. Each fn is summarised as
+*brand-transparent at parameter `i`* or *opaque* on the surface
+AST, so `let g = id(f)` keeps `f`'s brand and a later
+cross-nursery `n2.await(g)` is still rejected. Coverage:
+`m8x_8_brand_through_generic.kai` (negative),
+`m8x_8_brand_generic_roundtrip_ok.kai` (positive).
+
+Where a brand cannot be followed — an opaque callee, a fiber
+stored in a record, list or closure — the checker emits a
+`warning:` naming the originating nursery instead of dropping the
+guarantee silently (`m8x_8_brand_opaque_helper_warns.kai`).
+
+Brands are deliberately NOT part of the type representation:
+`TyBranded(Ty, BrandId)` cannot unify soundly (a brand is a
+scope-instance property, and two brands meeting at one type
+variable have no correct answer), and the escape check it would
+need is rank-2. The reasoning is recorded in
+`docs/fibers-honesty-targets.md` §*Residual m8.x items* item 1.
 
 ### Debugging brand inference
 
