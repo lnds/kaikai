@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -369,14 +369,22 @@ tier1-shard-3: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=3
 	@echo "tier1-shard-3 OK — light slice 2/3"
 
+# The two modular self-hosts sit in separate shards: each rebuilds the whole
+# compiler, and a PR touching stage2/compiler/** misses the warm cache by
+# construction, so the pair no longer fits one job's budget.
 tier1-shard-4: kaic2
 	$(MAKE) -C stage2 test-modular-selfhost
-	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	@echo "tier1-shard-4 OK — whole-compiler c-modular link + #1131 modular-escape gate"
+	@echo "tier1-shard-4 OK — whole-compiler c-modular link"
 
 tier1-shard-5: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=3
 	@echo "tier1-shard-5 OK — light slice 3/3"
+
+# Split out of shard-4 so CI can gate and time it on its own; it shares
+# shard-4's object cache but is a separate job.
+tier1-shard-6: kaic2
+	$(MAKE) -C stage2 test-perceus-1131-modular-escape
+	@echo "tier1-shard-6 OK — #1131 modular-escape gate"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
