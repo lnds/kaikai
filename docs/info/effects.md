@@ -25,6 +25,12 @@ callable; calling it continues the body with a value. Not calling it
 abandons the continuation (e.g. `Fail`). Calling it more than once
 is currently a runtime error.
 
+Abandoning the continuation runs NO cleanup in the frames it jumps
+over: `return` clauses of intermediate handlers are skipped, and any
+non-memory resource an inner scope holds (an open fd, a transaction)
+is never released. There is no `finally`. Perceus still frees memory.
+To release a resource, install the handler at the scope owning it.
+
 ## Declaring
 
 ```kaikai
