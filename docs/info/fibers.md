@@ -91,11 +91,23 @@ This makes "wrap the body in `handle { ... } with Cancel { raise(_)
 SIGINT-driven supervisor that calls `Spawn.cancel(server)` runs the
 server's cleanup before the fiber terminates.
 
+Nested handles resolve innermost-first, exactly as a synchronous
+`Cancel.raise()` would: only the innermost `with Cancel` in scope
+runs, and an outer one wrapping it does not.
+
 The exception is a fiber that is `Link.link`'d to a peer with
 `Spawn.set_trap_exit(true)`: in that case the runtime bypasses the
 fiber's own Cancel handlers so the supervisor observes the child's
 termination through its mailbox (see `kai info actors` §*Trap-exit
 semantics*).
+
+That exception is a deliberate hole in lexical handler scoping: under
+trap-exit the bypass crosses *every* `with Cancel` in the chain, so a
+`handle` you can see in the source provably does not run. It is the
+price of OTP-style layered supervision composing — without it, any
+intermediate cleanup handler between a supervisor's spawn and its
+worker would keep the supervisor's `receive` from ever waking. Cancel
+handlers in a fiber holding no trap-exit'd link are unaffected.
 
 ## Parallelism — `KAI_THREADS`
 
