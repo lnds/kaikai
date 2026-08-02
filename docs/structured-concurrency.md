@@ -15,12 +15,18 @@ reason about when tied to lexical scopes. Trio, Kotlin coroutines,
 Swift structured concurrency, and OCaml 5's Eio all converged on the
 same answer.
 
-kaikai takes it further by making the scope **the handler for a
-`Spawn` effect capability**. `spawn`/`await`/`select` are not
-built-in primitives; they are operations you can only invoke inside
-an active nursery. `nursery` itself is a stdlib helper that
-installs the `Spawn` handler — also not a built-in: the language
-core has no scheduling concepts, only the effect system.
+kaikai takes it further by making the scope **a bracketed region of
+the `Spawn` effect**. `spawn`/`await`/`select` are not built-in
+primitives; they are operations you can only invoke inside an active
+nursery. `nursery` itself is a stdlib helper — also not a built-in:
+the language core has no scheduling concepts, only the effect system.
+
+`nursery` does not handle `Spawn`; it brackets a scheduler-owned
+scope, and `Spawn` stays in the row on both sides of its signature.
+Fiber lifetime is owned by the runtime: `Spawn` is a fiber-local
+effect whose evidence the scheduler installs per fiber, so it cannot
+travel in a frame slot and no user handler can own its ops. See
+`docs/effects-stdlib.md` §*Three classes of builtin effect*.
 
 ## Syntax
 
@@ -363,10 +369,10 @@ Requires:
 - A scheduler in the runtime: per-fiber stacks (segmented or
   heap-allocated), a cooperative scheduler loop, and a
   cancellation flag every yield-point op checks.
-- `nursery` as a stdlib helper installed as an effect handler;
+- `nursery` as a stdlib helper bracketing a scheduler-owned scope;
   the trailing-lambda form `nursery { n -> ... }` desugars (per
-  `docs/syntax-sugars.md` §1) to a call passing the body to
-  the handler.
+  `docs/syntax-sugars.md` §1) to a call passing the body as a
+  thunk, with `n.<op>` rewritten to `Spawn.<op>`.
 
 ## References
 
