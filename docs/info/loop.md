@@ -30,7 +30,7 @@ import loop
 fn count_up(n: Int) : Int / Stdout = {
   var i := 0
   while { i < n } {                             # naked cell read
-    Stdout.print("#{int_to_string(i)}")
+    Stdout.print("#{i}")
     i := i + 1
   }
   i
@@ -45,7 +45,7 @@ fn main() : Int / Stdout = {
   let _ = count_up(3)
 
   # iterating a range for side effects:
-  [1..3] |> each((i) => Stdout.print("range #{int_to_string(i)}"))
+  [1..3] |> each((i) => Stdout.print("range #{i}"))
 
   # `if` is an expression — both branches must type:
   let n = 5
@@ -105,7 +105,7 @@ with `|` to an each-like fn:
 ```kaikai
 fn main() : Unit / Stdout = {
   # `|` produces a [Unit]; discard it to keep `main : Unit`.
-  let _ = [1..5] | (i => Stdout.print("#{int_to_string(i)}"))
+  let _ = [1..5] | (i => Stdout.print("#{i}"))
 }
 ```
 

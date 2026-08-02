@@ -150,7 +150,7 @@ fn main() : Int / Stdout = {
                                                # (State[Int] handler)
   counter := counter + 1                       # write needs `:=`
   let result = counter                         # naked read
-  Stdout.print("x=#{int_to_string(x)} y=#{int_to_string(y)} c=#{int_to_string(result)}")
+  Stdout.print("x=#{x} y=#{y} c=#{result}")
   0
 }
 ```
@@ -180,7 +180,7 @@ fn each_of[a, e](xs: [a], f: (a) -> Unit / e) : Unit / e = match xs {
 
 fn main() : Unit / Stdout = {
   each_of([1, 2, 3]) { x ->                    # block lambda
-    Stdout.print("got #{int_to_string(x)}")
+    Stdout.print("got #{x}")
   }
 }
 ```
@@ -192,7 +192,7 @@ A block lambda's parameter may be a tuple pattern, destructuring a
 fn main() : Unit / Stdout = {
   let rows = ["a", "b", "c"]
   foreach(rows.enumerate()) { (row, line) ->   # binds row, line from the Pair
-    Stdout.print("#{int_to_string(row)}: #{line}")
+    Stdout.print("#{row}: #{line}")
   }
 }
 ```
@@ -221,7 +221,7 @@ fn classify(n: Int) : String = {
 fn count_to(n: Int) : Int / Stdout = {
   var i := 0
   while { i < n } {
-    Stdout.print("#{int_to_string(i)}")
+    Stdout.print("#{i}")
     i := i + 1
   }
   i
@@ -258,7 +258,7 @@ fn main() : Unit / Stdout = {
   let c = [1, 2] || single                     # || flat-map
   let d = [1, 2, 3] |? gt1                     # |? filter
   let e = 5 |> sub(7, _)                       # _ placeholder
-  Stdout.print("a=#{int_to_string(a)} b len=#{int_to_string(b.length())} c len=#{int_to_string(c.length())} d len=#{int_to_string(d.length())} e=#{int_to_string(e)}")
+  Stdout.print("a=#{a} b len=#{b.length()} c len=#{c.length()} d len=#{d.length()} e=#{e}")
 }
 ```
 
@@ -328,7 +328,7 @@ fn main() : Unit / Stdout = {
   let c = 'A'                                  # chars (Unicode scalar
   let acc = 'á'                                #   value; 'á' '▸'
   let emo = '\u{1F389}'                        #   '\u{1F389}' all lex)
-  let s = "hello, #{int_to_string(n)}"         # interpolation
+  let s = "hello, #{n}"         # interpolation
   let xs = [1, 2, 3]                           # list
   let r1 = [1..10]                             # range
   let r2 = [1..10..2]                          # range w/ step
@@ -336,9 +336,9 @@ fn main() : Unit / Stdout = {
   let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
   let all = variants[Color]()                  # enumerate ctors of a
                                                #   nullary sum type
-  Stdout.print("n=#{int_to_string(n)} s=#{s} xs len=#{int_to_string(xs.length())} r1 len=#{int_to_string(r1.length())} r2 len=#{int_to_string(r2.length())} combined len=#{int_to_string(combined.length())} colors=#{int_to_string(all.length())}")
+  Stdout.print("n=#{n} s=#{s} xs len=#{xs.length()} r1 len=#{r1.length()} r2 len=#{r2.length()} combined len=#{combined.length()} colors=#{all.length()}")
   match opt {
-    Some(v) -> Stdout.print("v=#{int_to_string(v)}")
+    Some(v) -> Stdout.print("v=#{v}")
     None    -> Stdout.print("none")
   }
 }
@@ -607,7 +607,7 @@ fn area_at_origin(p: Point) : Int = match p {
 fn main() : Int / Stdout = {
   let p = Point { x: 3, y: 4 }                               # type prefix REQUIRED
                                                              # in expression position
-  Stdout.print("p.x=#{int_to_string(p.x)}")
+  Stdout.print("p.x=#{p.x}")
   area_at_origin(p)
 }
 ```
@@ -624,8 +624,8 @@ fn make_triple() : (Int, Int, Int) = (1, 2, 3)
 fn main() : Unit / Stdout = {
   let pr = make_pair()
   let tr = make_triple()
-  Stdout.print("pair=#{int_to_string(pr.fst)},#{int_to_string(pr.snd)}")
-  Stdout.print("triple=#{int_to_string(tr.fst)},#{int_to_string(tr.snd)},#{int_to_string(tr.trd)}")
+  Stdout.print("pair=#{pr.fst},#{pr.snd}")
+  Stdout.print("triple=#{tr.fst},#{tr.snd},#{tr.trd}")
 }
 ```
 
@@ -658,7 +658,7 @@ fn swap(pr: (Int, Int)) : (Int, Int) = match pr {
 }
 
 fn list_info(xs: [Int]) : String = match xs {
-  whole @ [_, ..._] -> "non-empty len=#{int_to_string(whole.length())}"
+  whole @ [_, ..._] -> "non-empty len=#{whole.length()}"
                                                 # `whole` binds the
                                                 # entire scrutinee
   []                -> "empty"
@@ -666,7 +666,7 @@ fn list_info(xs: [Int]) : String = match xs {
 
 fn main() : Unit / Stdout = {
   match first([1, 2, 3]) {
-    Some(n) -> Stdout.print("first=#{int_to_string(n)}")
+    Some(n) -> Stdout.print("first=#{n}")
     None    -> Stdout.print("empty")
   }
   Stdout.print(sign(-1))
@@ -694,7 +694,7 @@ fn add_them() : Option[Int] = {
 }
 
 fn main() : Unit / Stdout = match add_them() {
-  Some(n) -> Stdout.print("sum=#{int_to_string(n)}")
+  Some(n) -> Stdout.print("sum=#{n}")
   None    -> Stdout.print("none")
 }
 ```
@@ -714,7 +714,7 @@ fn main() : Unit / Stdout = {
   let xs = [1, 2, 3]
   let n = xs.length()
   let label = if b { "yes" } else { "no" }
-  Stdout.print("ok=#{label} n=#{int_to_string(n)}")
+  Stdout.print("ok=#{label} n=#{n}")
 }
 ```
 
@@ -774,7 +774,7 @@ fn main() : Int / Stdout = {
   tally := tally + 1                           # `:=` writes
   tally := tally + 1                           # `tally` reads naked
   let v = tally
-  Stdout.print("tally=#{int_to_string(v)}")
+  Stdout.print("tally=#{v}")
   v
 }
 ```
@@ -790,7 +790,7 @@ fn main() : Unit / Stdout = {
   let arr = array_make(3, 0)                   # local array
   arr[0] := 42                                 # array index write
   let n = arr[0]                               # array index read
-  Stdout.print("arr[0]=#{int_to_string(n)}")
+  Stdout.print("arr[0]=#{n}")
 }
 ```
 
@@ -829,7 +829,7 @@ fn main() : Unit / Stdout = {
     let b = [10, 20, 30]                         # built in the arena
     sum_list(a) + sum_list(b)                    # scalar result
   }                                              # whole arena freed here
-  Stdout.print("#{int_to_string(total)}")
+  Stdout.print("#{total}")
 }
 ```
 

@@ -72,7 +72,7 @@ fn dbl(x: Int) : Int = x * 2
 
 fn main() : Unit / Stdout = {
   let total = [1..10] |? even | dbl |> sum
-  Stdout.print("total=#{int_to_string(total)}")
+  Stdout.print("total=#{total}")
 }
 ```
 
@@ -88,7 +88,7 @@ fn main() : Unit / Stdout = {
   let evens = filter([1..10], even)
   let doubled = map(evens, dbl)
   let total = sum(doubled)
-  Stdout.print("total=#{int_to_string(total)}")
+  Stdout.print("total=#{total}")
 }
 ```
 
@@ -191,7 +191,7 @@ fn minmax(xs: [Int]) : (Int, Int) = (1, 9)
 fn main() : Unit / Stdout = {
   let mm = minmax([3, 1, 9])
   let p = Point { x: 2, y: 5 }
-  Stdout.print("lo=#{int_to_string(mm.fst)} hi=#{int_to_string(mm.snd)} px=#{int_to_string(p.x)}")
+  Stdout.print("lo=#{mm.fst} hi=#{mm.snd} px=#{p.x}")
 }
 ```
 
@@ -209,7 +209,7 @@ fn bounds() : (Int, Int) = (2, 8)
 
 fn main() : Unit / Stdout = {
   let (lo, hi) = bounds()
-  Stdout.print("lo=#{int_to_string(lo)} hi=#{int_to_string(hi)}")
+  Stdout.print("lo=#{lo} hi=#{hi}")
 }
 ```
 
@@ -299,7 +299,7 @@ fn find_pos(xs: [Int], target: Int) : Option[Int] = match xs {
 }
 
 fn main() : Unit / Stdout = match find_pos([3, 7, 9], 7) {
-  Some(v) -> Stdout.print("found #{int_to_string(v)}")
+  Some(v) -> Stdout.print("found #{v}")
   None    -> Stdout.print("absent")
 }
 ```
@@ -317,7 +317,7 @@ fn square(x: Int) : Int = x * x
 
 fn describe(x: Int) : String = {
   let s = square(x)
-  "#{int_to_string(x)}^2 = #{int_to_string(s)}"
+  "#{x}^2 = #{s}"
 }
 
 fn main() : Unit / Stdout = Stdout.print(describe(4))
@@ -336,7 +336,7 @@ import loop
 fn main() : Int / Stdout = {
   var i := 0
   while { i < 3 } {
-    Stdout.print("tick #{int_to_string(i)}")
+    Stdout.print("tick #{i}")
     i := i + 1
   }
   i
@@ -356,7 +356,7 @@ typed-hole reports.
 #[doc("Returns the smaller of two integers.")]
 pub fn imin(a: Int, b: Int) : Int = if a < b { a } else { b }
 
-fn main() : Unit / Stdout = Stdout.print("#{int_to_string(imin(3, 8))}")
+fn main() : Unit / Stdout = Stdout.print("#{imin(3, 8)}")
 ```
 
 Rust-style `///` / `//!` doc comments do not exist — `#[doc]` is the
