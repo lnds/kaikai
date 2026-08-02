@@ -1477,11 +1477,6 @@ KaiValue *kaix_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
     kai_decref(s);
     return _op_r;
 }
-KaiValue *kaix_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
-    KaiValue *_op_r = kai_default_fail_fail(self, msg, k);
-    kai_decref(msg);
-    return _op_r;
-}
 KaiValue *kaix_default_mutable_array_make(void *self, KaiValue *n, KaiValue *init, KaiCont *k) {
     KaiValue *_op_r = kai_default_mutable_array_make(self, n, init, k);
     kai_decref(n);

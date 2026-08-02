@@ -145,7 +145,7 @@ Why push wins over the pull-thunk (`() -> Option[t]`) sketch:
   (`take`'s counter, the chunk buffer position) lives and dies inside a
   single activation of the stream function — the cell never escapes, so
   masking it is *sound* under the #251/#252 discipline. File streams are
-  `/ File + Fail`, list streams are pure. The alias debate (`Lines`,
+  `/ File + ReadFault`, list streams are pure. The alias debate (`Lines`,
   `Reader`...) evaporates: the rows are short enough to write plainly.
 - **Use-after-pipe corruption disappears.** A pull stream piped twice
   shares a cursor → silent interleaved garbage (the v1 review's worst
@@ -194,7 +194,7 @@ or abandon to abort. `open_fault` returns `Nothing`: a stream whose
 source cannot open has nothing to resume into, so it is abort-only by
 construction. One effect for both faults keeps the row to `File +
 ReadFault` (the open-design point in #801 — resolved as a second
-non-resumable op on the same effect, not a separate `Fail`).
+non-resumable op on the same effect, not a separate abort effect).
 
 Combinator bodies are one-liners — `map` is
 `(yield) => s((x) => yield(f(x)))` — which keeps the module small and
@@ -208,12 +208,13 @@ sinks force the pipeline, so there is nothing left to kick.
 ### Errors: clean elements, per-element recovery (the flagship)
 
 The element type is `String` — never `Result[String, String]`. Faults
-travel in the row as `Fail`. The producer performs `fail` *at the point
-of the fault*, and the handler's typed resume decides the policy:
+travel in the row as `ReadFault`. The producer performs the fault op *at
+the point of the fault*, and the handler's typed resume decides the
+policy:
 
-- **abort** (default): no handler between the pipe and `main` → the
-  `Fail` default conventions apply; the producer's cleanup still runs on
-  unwind.
+- **abort**: a handler that abandons the continuation. `ReadFault` has
+  no default handler, so a forcing consumer must install one; the
+  producer's cleanup still runs on unwind.
 - **skip and continue**: a handler that resumes. The producer is written
   so that resuming a chunk-read fault means "drop that chunk, keep
   going".
@@ -390,9 +391,9 @@ carrier confirmed.** Findings, in decreasing weight:
   the faulted element and continues; cleanup runs; count is correct.
   Gallery (e) is real. **Op shape pinned:** the recoverable fault must
   be a dedicated effect with a resumable return type
-  (`effect ReadFault { bad_chunk(msg: String) : Unit }`) — stdlib
-  `Fail.fail` returns `Nothing` and is non-resumable by construction,
-  so `read_lines` carries `File + ReadFault`, not `File + Fail`.
+  (`effect ReadFault { bad_chunk(msg: String) : Unit }`) — a
+  `Nothing`-returning op is non-resumable by construction, so
+  `read_lines` carries `File + ReadFault`.
   (§Surface and the gallery need this row update.)
 - **S2 — abort policy: cleanup does NOT run.** Abandoning the
   continuation (handler that doesn't resume) skips the producer's
@@ -425,7 +426,7 @@ carrier confirmed.** Findings, in decreasing weight:
   pipeline) — `write_lines` covers the streaming case; a follow-up if
   demand appears.
 - Network sources, `Stream` over actors/channels — post-1.0, same shape
-  expected (`Stream[t, NetTcp + Fail]`).
+  expected (`Stream[t, NetTcp + ReadFault]`).
 - Parallel/fused execution — Perceus + monomorphisation already erase
   most intermediate structure; measure before designing more.
 

@@ -570,7 +570,7 @@ spec lands, it is added to this header.
 
 ### testing
 
-- `testing` *(planned — no `stdlib/testing.kai` module file exists; the `test "..." { ... }` block syntax and the `assert` builtin are wired in the compiler/runtime, but a stdlib module exposing assertion helpers does not exist yet)* — assertions (`assert`, `assert_eq`, `assert_ne`, `assert_raises`) and integration with the `test "..." { ... }` block syntax and `kai test` subcommand. Effect: `/ Fail` for failing assertions (caught by the test runner handler).
+- `testing` *(planned — no `stdlib/testing.kai` module file exists; the `test "..." { ... }` block syntax and the `assert` builtin are wired in the compiler/runtime, but a stdlib module exposing assertion helpers does not exist yet)* — assertions (`assert`, `assert_eq`, `assert_ne`, `assert_raises`) and integration with the `test "..." { ... }` block syntax and `kai test` subcommand. Effect: a module-declared abort effect for failing assertions (caught by the test runner handler).
 
 ## Naming conventions
 

@@ -113,6 +113,26 @@ The current edition name is in the `EDITION` file at repo root.
 This table is updated when an edition transitions; the historical
 record stays.
 
+### Breaking changes accumulated for the Orongo cut
+
+Changes that alter the pinned surface land here as they are made, so
+the Orongo release notes and the `kai migrate` rule set can be
+assembled from one list rather than reconstructed from git.
+
+- **`Fail` removed from the stdlib** (issue #1535). `pub effect Fail`
+  and its runtime default handler are gone from `stdlib/effects.kai`.
+  Migration: a `/ Fail` row becomes `Result[T, String]` propagated
+  with postfix `!`; a failure whose policy the consumer must choose
+  becomes a domain effect whose op returns `Unit` (so a handler can
+  resume and skip); a deep non-local exit uses `Cancel.raise()`. Code
+  that wants the old shape verbatim declares the effect itself —
+  `effect Fail { fail(msg: String) : Nothing }` — with the one
+  behavioural difference that a locally declared effect has no default
+  handler, so an unhandled `fail` is now the compile error `effect not
+  handled: Fail` instead of a runtime abort with an exit-1 banner.
+  Not mechanical: `kai migrate` reports it as `manual:`, because the
+  right replacement depends on whether the caller can recover.
+
 ## Edition selection in user packages
 
 A `kai.toml` declares which edition its source compiles against:

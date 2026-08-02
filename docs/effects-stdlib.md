@@ -31,7 +31,6 @@ and used by the stdlib sparingly.
 | `NetDns`        | DNS resolution                                | yes (runtime, if in `main`'s row) |
 | `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
 | `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — Posix only in v1 |
-| `Fail`          | abort with a message                          | no (unhandled = compile error) |
 | `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
 | `Reader[T]`     | read-only ambient value                       | no (user supplies)    |
 | `Writer[W]`     | accumulating log / output                     | no (user supplies)    |
@@ -124,20 +123,16 @@ you care.
 ## Syntax note: trailing lambdas
 
 > **v1 status (2026-08-02):** of the helpers named in this section,
-> only `nursery` (`stdlib/spawn.kai`) exists. `try`, `with_default`,
-> `with_state`, `map_fail` and `File.read_file_or_fail` are **not
-> implemented** — they appear here, in §`Fail` and in §`State[T]` as
-> illustrations of the shape such a helper layer would take, not as
-> callable stdlib API. Writing `try(...)` today is a compile error.
-> See §`Fail` for the measured state and issue #1535, which decides
-> whether `Fail` gains such a layer, is redefined, or is removed.
-> The trailing-lambda *syntax* itself is real and shipped
-> (`kai info syntax` §*Trailing lambdas*); only these example
-> callees are fictional.
+> only `nursery` (`stdlib/spawn.kai`) exists. `with_state` and
+> `File.read_file_or_fail` are **not implemented** — they appear here
+> and in §`State[T]` as illustrations of the shape such a helper layer
+> would take, not as callable stdlib API. The trailing-lambda *syntax*
+> itself is real and shipped (`kai info syntax` §*Trailing lambdas*);
+> only these example callees are fictional.
 
 Many of the stdlib helpers in this document take a lambda as
-their last argument (`try`, `with_default`, `with_state`,
-`map_fail`, `nursery`, and the like). Doc B writes them in one
+their last argument (`with_state`, `nursery`, and the like). Doc B
+writes them in one
 of two equivalent forms:
 
 ```kai
@@ -370,27 +365,26 @@ effect in scope.
 
 ```kai
 effect Stdin {
-  read_line()        : Option[String] / Fail
+  read_line()        : Option[String]
   read_bytes(n: Int) : String                  # issue #453
 }
 ```
 
 Two ops. `read_line()` returns `None` on EOF/closed pipe
-(routine, not an error); a real I/O fault escalates through
-`Fail`. `read_bytes(n)` returns a `String` of at most `n` raw
-bytes (newlines included); on EOF the returned string is shorter
-than `n` — possibly empty. No `Fail` wrapper: the LSP framing
-use case treats a short read as the protocol's own end-of-stream
-signal. See §*Error model* below for the rule.
+(routine, not an error). `read_bytes(n)` returns a `String` of at
+most `n` raw bytes (newlines included); on EOF the returned string
+is shorter than `n` — possibly empty. The LSP framing use case
+treats a short read as the protocol's own end-of-stream signal.
+See §*Error model* below for the rule.
 
 ### Error model
 
-`Option[T] / Fail` is the pattern for ops where the caller wants
-to stop on absence but never to inspect a fault message in
-detail. `read_line` fits because "no more input" is structural
-and every real fault reduces to "the terminal is broken, bail".
-`File` uses `Result` instead for the opposite reason (callers
-branch on the motive).
+`Option[T]` is the shape for ops where the caller wants to stop on
+absence but never to inspect a fault message in detail.
+`read_line` fits because "no more input" is structural and every
+real fault reduces to "the terminal is broken, bail". `File` uses
+`Result` instead for the opposite reason (callers branch on the
+motive).
 
 ### Default handler
 
@@ -403,9 +397,9 @@ clause calls `fgets`. Cases:
   with no final newline, or a terminal peer that closed mid-
   line): resume with `Some(line)` as-is.
 - Zero bytes and EOF: resume with `None`.
-- `ferror`: invoke `Fail.fail("read_line: …")` and do not
-  resume. This is the one exception to "every default-handler
-  clause resumes" across the stdlib.
+- `ferror`: indistinguishable from EOF at this layer; resumes
+  with `None`. A caller that must tell a fault from end-of-input
+  reads with `read_bytes` and interprets the short read itself.
 
 The caller cannot distinguish "line ended with `\n`" from "line
 ended at EOF without `\n`" — matches Python's `input()`, Rust's
@@ -509,29 +503,11 @@ or distinguish only "nothing more" from "real fault". Keeping
 ### Error model
 
 Both ops return `Result[_, String]`. See §`Stdin` *Error model*
-for the rule that picks `Result` vs `Option + Fail`: `File`
-lands on the `Result` side because callers branch on the
-motive. v1 keeps the payload as a raw `String` message; a
-structured `FileError` sum is deferred.
-
-### Stdlib helper — not implemented
-
-> **v1 status (2026-08-02):** `read_file_or_fail` does not exist in
-> `stdlib/`; the shape below is a sketch pending the `Fail` decision
-> (issue #1535). `File.read_file` returns `Result[String, String]` —
-> propagate it with postfix `!`.
-
-The "abort if anything goes wrong" wrapper would lift `Result`
-into `Fail`:
-
-```kai
-pub fn read_file_or_fail(path: String) : String / File + Fail {
-  match File.read_file(path) {
-    Ok(s)  -> s
-    Err(m) -> Fail.fail("read #{path}: #{m}")
-  }
-}
-```
+for the rule that picks `Result` vs `Option`: `File` lands on the
+`Result` side because callers branch on the motive. v1 keeps the
+payload as a raw `String` message; a structured `FileError` sum is
+deferred. Callers that want to abort on any fault propagate with
+postfix `!`.
 
 ### Default handler
 
@@ -539,7 +515,7 @@ Runtime-installed around `main` when `main`'s row contains
 `File`. Each clause delegates to `Ffi` (`fopen`/`fread`/`fwrite`/
 `fclose`) and resumes with an `Ok` or `Err` value depending on
 the C call's return. No clause ever short-circuits — errors flow
-as data, not as `Fail`.
+as data, not through the row.
 
 > **v1 status (R1 reactor, 2026-05-15):** `read_file` and
 > `write_file` park the *fiber* and offload the blocking stdio
@@ -617,9 +593,9 @@ effect ReadFault {
 chunk and continues (skip policy); a handler that abandons the
 continuation aborts. `open_fault` returns `Nothing`: a stream whose
 source cannot open has nothing to resume into, so it is abort-only by
-construction. This is why `read_lines` carries `File + ReadFault` rather
-than `File + Fail` — stdlib `Fail.fail : Nothing` is non-resumable, so
-it cannot express the skip policy (spike S2). `ReadFault` is a stdlib
+construction. This is why `read_lines` carries `File + ReadFault`: a
+single `Nothing`-returning op cannot express the skip policy, and the
+policy itself is domain knowledge (spike S2). `ReadFault` is a stdlib
 user effect (no runtime default handler): a forcing consumer must
 `handle ... with ReadFault` to choose a policy, or the typer reports
 `effect not handled: ReadFault`.
@@ -803,7 +779,7 @@ a fixed seed, in the same shape as the `Console` capture pattern.
 ### Error model
 
 PRNG ops are infallible. `int_range(l, h)` with `l >= h` is a
-panic (programming error), not a `Fail`.
+panic (programming error), not a recoverable fault.
 
 ### What's not in v1 (planned extensions)
 
@@ -859,7 +835,7 @@ as panics, the same as `Console` and `Clock`.
 ### Error model
 
 Infallible in v1 from the caller's perspective. The handler may
-panic if the OS RNG is unavailable, but no `Result` / `Fail`
+panic if the OS RNG is unavailable, but no `Result`
 shape is exposed — code that needs cryptographic randomness
 cannot run if the OS cannot provide it.
 
@@ -1008,24 +984,6 @@ state visible to user code.
 > NetUdp, and NetDns all installed, the `Net = NetTcp + NetUdp +
 > NetDns` alias is now definable; a follow-up lane can add the row
 > alias to `stdlib/effects.kai`.
-
-### Stdlib helper — not implemented
-
-> **v1 status (2026-08-02):** `tcp_connect_or_fail` does not exist in
-> `stdlib/`, for the same reason as `read_file_or_fail` above — no
-> stdlib API raises `Fail` (issue #1535).
-
-The "abort if anything goes wrong" pattern would lift `Result` into
-`Fail`, same shape as `read_file_or_fail`:
-
-```kai
-pub fn tcp_connect_or_fail(host: String, port: Int) : Conn / NetTcp + Fail {
-  match NetTcp.connect(host, port) {
-    Ok(c)  -> c
-    Err(m) -> Fail.fail("connect #{host}:#{port}: #{m}")
-  }
-}
-```
 
 `stdlib/net/dns.kai` (issue #352) ships the `NetDns` surface:
 `resolve(host) : Result[[IpAddr], String] / NetDns` (thin pass-
@@ -1344,90 +1302,33 @@ Drove the reopening of lnds/ahu's `run_app` Tongariki lane (issue
 #107). The shape above is what `ahu.run_app(root)` wraps once the
 nursery integration lands.
 
-## `Fail`
+## `Fail` — retired from the stdlib
 
-### Declaration
+`Fail` was a builtin effect (`fail(msg: String) : Nothing`) with a
+runtime default handler that printed a banner and exited 1. It is no
+longer part of the stdlib.
 
-```kai
-effect Fail {
-  fail(msg: String) : Nothing
-}
-```
+The removal ratifies what the stdlib had already converged on: every
+fallible API returns `Result` and propagates with postfix `!`. `Fail`
+had zero `/ Fail` rows across `stdlib/`, and the only failure-shaped
+effect the stdlib does declare is `ReadFault` (§*ReadFault*), placed
+where its skip policy is domain knowledge.
 
-Declared in Doc A. `Nothing` is the empty type; any clause
-handling `Fail.fail` must either not call `resume`, or prove it
-has a value of type `Nothing` to pass (impossible), so the
-handler *must* short-circuit. Doc A §*Discarding the continuation*
-covers this.
+What to use instead:
 
-### Stdlib helpers — not implemented
+- **Inspectable failure** — `Result[T, E]` with postfix `!`. This is
+  what the stdlib does, and what `Fail` could express nothing beyond.
+- **A failure whose policy the consumer chooses** — declare a domain
+  effect whose op returns `Unit`, so a handler can resume and skip.
+  `Fail.fail : Nothing` structurally could not do this.
+- **Deep non-local exit** — `Cancel.raise() : Nothing`.
+- **Programming errors** — `panic`.
 
-> **v1 status (2026-08-02):** none of the four helpers below exists in
-> `stdlib/`. `try`, `with_default`, `unwrap_or_fail` and `map_fail` are
-> **illustrations of a proposed helper layer**, not callable API —
-> calling any of them today is a compile error. `Fail` itself is
-> declared (`stdlib/effects.kai:49`) and its runtime default handler
-> works, but it has **no users**: `stdlib/` contains 174 `Result[...]`
-> occurrences across 17 files and **zero** `/ Fail` rows, and the only
-> other mention of `Fail` in `stdlib/` is one `#[doc]` prose reference
-> in `loop.kai`. The single failure-shaped effect the stdlib does use
-> is `ReadFault` (§*ReadFault*), declared where its skip policy is
-> domain knowledge.
->
-> Issue #1535 decides the destination of `Fail` — implement this
-> layer, redefine `fail` as resumable, or remove the effect at an
-> edition boundary. Until it closes, treat this section as a design
-> sketch. Fallible stdlib APIs return `Result` and propagate with
-> postfix `!`.
-
-```kai
-# Run a fallible computation and capture the error message.
-pub fn try[T](body: () -> T / Fail) : Result[T, String] {
-  handle { body() } with Fail {
-    fail(msg, resume) -> Err(msg)
-    return(x)         -> Ok(x)
-  }
-}
-
-# Run with a default on failure; swallows the message.
-pub fn with_default[T](default: T, body: () -> T / Fail) : T {
-  handle { body() } with Fail {
-    fail(msg, resume) -> default
-    return(x)         -> x
-  }
-}
-
-# Lift a Result into Fail.
-pub fn unwrap_or_fail[T](r: Result[T, String]) : T / Fail {
-  match r {
-    Ok(v)  -> v
-    Err(m) -> Fail.fail(m)
-  }
-}
-
-# Rewrite the message of any Fail.fail raised by body, then
-# re-raise. Common case: add context ("while parsing X: …").
-pub fn map_fail[T](f: (String) -> String, body: () -> T / Fail) : T / Fail {
-  handle { body() } with Fail {
-    fail(msg, resume) -> Fail.fail(f(msg))
-    return(x)         -> x
-  }
-}
-```
-
-Were this layer to ship, `try` would be the replacement for
-`try`/`catch`: the spec rejects a `try` keyword, so it is a plain
-function. Today neither exists. `kai info syntax` §*NOT IN KAIKAI*
-lists `throw` / `try-catch` among the forms the language does not
-have and points at `Fail` or `Result[a, e]` as the substitutes; of
-those two only `Result` (with postfix `!`) is backed by stdlib API.
-
-### Error payload shape
-
-v1 `Fail` carries `String`. Richer payloads (structured errors,
-error chains) would need `Error[E]` — an effect parameterised by
-the payload type. Deferred to a later doc; the `String` form
-covers the 80th-percentile case and lets stdlib helpers compose.
+`Fail` remains a good teaching example of a `Nothing`-returning op, and
+several fixtures declare it locally for exactly that. A locally declared
+`effect Fail` has no default handler, so an unhandled `fail` is a
+compile error (`effect not handled: Fail`) rather than a runtime abort.
+See `docs/editions.md` for the migration note.
 
 ## `State[T]`
 
@@ -1885,8 +1786,8 @@ effect Cancel {
 }
 ```
 
-A single operation: `raise` behaves like `Fail.fail` — no value
-to pass, so any handler must short-circuit. Unlike `Fail`, the
+A single operation: `raise` returns `Nothing` — no value to pass,
+so any handler must short-circuit. Unlike an ordinary op, the
 *caller* rarely invokes `raise` directly; it is the scheduler
 (via `Spawn`) that injects `Cancel.raise()` into a fiber marked
 for cancellation at its next effect op.
@@ -2086,7 +1987,7 @@ Direct `Ffi` use is an **audited escape** (CLAUDE.md Tier 1). It
 appears in the `runtime/` directory and in the default handlers
 for `Console`, `Stdin`, `Env`, `File`, `Mutable`, and `Spawn` —
 every effect whose behaviour ultimately touches the OS. Pure
-effects (`Fail`, `State[T]`, `Reader[T]`, `Writer[W]`) and
+effects (`State[T]`, `Reader[T]`, `Writer[W]`) and
 `Cancel` do not use `Ffi`. Userland almost never writes
 `extern "C"` directly, because the stdlib exposes `Console` /
 `File` / `Mutable` etc. for the common cases.
@@ -2106,7 +2007,7 @@ provides. Specifically:
   lifetime managed by the caller — the RC walker sees kaikai
   values, not C-side allocations.
 - Effects other than `Ffi` are not preserved across the call.
-  A C callback that wants to raise `Fail` has to go through an
+  A C callback that wants to raise an effect has to go through an
   explicit bridge back into a handler; it cannot invoke a
   kaikai operation directly.
 
@@ -2127,7 +2028,7 @@ post-effects form.
 |-----------------------------------------------|--------------------------------------------|------------|
 | `print(s)`                                    | `Console.print(s)`                         | `Console` |
 | `eprint(s)`                                   | `Console.eprint(s)`                        | `Console` |
-| `read_line()`                                 | `Stdin.read_line()`                        | `Stdin + Fail` (real I/O faults) |
+| `read_line()`                                 | `Stdin.read_line()`                        | `Stdin` |
 | `read_bytes(n)` (issue #453)                  | `Stdin.read_bytes(n)`                      | `Stdin` |
 | `read_file(path)`                             | `File.read_file(path)`                     | `File` |
 | `write_file(p, c)`                            | `File.write_file(p, c)`                    | `File` |
@@ -2165,7 +2066,7 @@ remain audited escapes per CLAUDE.md Tier 1.
   to surface which effects a function uses, so the explicit
   form is required from m7a onward.
 - Public signatures gain the effects their body now names:
-  `/ Console`, `/ File + Fail`, `/ Console + Env`, or the
+  `/ Console`, `/ File`, `/ Console + Env`, or the
   umbrella `/ Io`. Existing signatures without `/` become
   *pure* and will fail to type-check if their body calls any
   effect op — this is the intended failure mode.
@@ -2203,8 +2104,9 @@ Prefer the granular effects when only one or two apply (they
 document the program's actual surface); reach for `/ Io` when
 the program does essentially all of `Console + Stdin + Env +
 File`. Any effect without a runtime-installed default handler
-(`Fail`, `State[T]`, `Reader[T]`, `Writer[W]`) in `main`'s row
-is rejected by the compiler:
+(`State[T]`, `Reader[T]`, `Writer[W]`, or any user-declared
+effect) in `main`'s row is rejected by the compiler — here a
+user-declared `effect Fail { fail(msg: String) : Nothing }`:
 
 ```
 error: main cannot have unhandled effect `Fail`
@@ -2324,7 +2226,7 @@ Ffi                                   (always innermost, compiler-synthesised)
    *Decided:* accept both. The style guide prefers `Int` return
    for the normal case — clearer, composes with testing — and
    keeps `exit(code)` as the escape hatch for early exits from
-   deep call trees that do not want to propagate through `Fail`.
+   deep call trees that do not want to propagate a `Result`.
 
 6. **Multiple `Mutable` scopes.** v1 has one global `Mutable`
    handler (the runtime default). Do we allow user-nested

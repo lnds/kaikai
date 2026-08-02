@@ -761,9 +761,9 @@ in #1542.
   No "default Io handler" baked into the language itself — the
   stdlib provides one, installed by the runtime when `main` has
   `Io` in its row.
-- **Exceptions as a separate feature.** `Fail` (or a sibling
-  `Error[E]`) subsumes try/catch idioms. There is no `try`
-  keyword.
+- **Exceptions as a separate feature.** `Result[T, E]` with postfix
+  `!`, or a user-declared `Nothing`-returning effect, subsumes
+  try/catch idioms. There is no `try` keyword.
 - **`raise` / `throw` / `catch` keywords.** The only surface
   verb is `handle`; operation calls happen through plain
   method-call syntax (e.g., `Io.print(s)`).
@@ -850,7 +850,7 @@ they first need to be acted on.
 ## Next steps
 
 - **Doc B** — `docs/effects-stdlib.md`: concrete stdlib effects
-  (`Io`, `Fail`, `State[T]`, `Mutable`, `Cancel`, `Spawn`),
+  (`Io`, `State[T]`, `Mutable`, `Cancel`, `Spawn`),
   migration of the existing `print`/`read_file`/`array_*`
   builtins, Io default-handler implementation, interaction with
   the `bin/kai run` entry.

@@ -22,7 +22,7 @@ idempotent.
 
 Resume is ONE-SHOT and EXPLICIT: a clause receives `resume` as a
 callable; calling it continues the body with a value. Not calling it
-abandons the continuation (e.g. `Fail`). Calling it more than once
+abandons the continuation (e.g. an op returning `Nothing`). Calling it more than once
 is currently a runtime error.
 
 Abandoning the continuation runs NO cleanup in the frames it jumps
@@ -117,7 +117,7 @@ Coverage rules (typer):
 
 For builtin effects, the 18 canonical handlers (Stdout, Stderr,
 Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal,
-Process, Log, Mutable, Cancel, Link, Monitor, Spawn, Fail) ship
+Process, Log, Mutable, Cancel, Link, Monitor, Spawn) ship
 default installation paths in the runtime — `Log` is one of them
 and its default writes to stderr in ISO-8601 form without a literal
 `default { }` block in `stdlib/log.kai`. The full catalog lives in
@@ -181,7 +181,7 @@ not provided — name the outer instance instead.
 
 Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,
 SecureRandom, NetTcp, Process, Spawn, Cancel, Actor[Msg],
-Signal, Mutable, State, Reader, Writer, Fail, Log, Link,
+Signal, Mutable, State, Reader, Writer, Log, Link,
 Monitor, Ffi.
 
 Full catalog: `docs/effects-stdlib.md`. The main effect at the
@@ -196,7 +196,8 @@ network effect available today.
   block; the row type carries the discipline.
 - Multi-shot resume. One-shot only.
 - Effect polymorphism via type classes. kaikai uses row variables.
-- Throwing/catching exceptions. Use `Fail` effect or `Result[a, e]`.
+- Throwing/catching exceptions. Use `Result[a, e]` with postfix `!`,
+  or declare an effect whose op returns `Nothing`.
 
 ## See also
 

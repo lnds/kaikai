@@ -95,12 +95,12 @@ shape.
   (A) -> B / e) : [B] / e`.
 - **Stdlib effect catalog** (Doc B): `Console`, `Stdin`, `Env`,
   `File` (granularised from a coarse `Io`, with `type Io =
-  Console + Stdin + Env + File` as a closed alias); `Fail`,
+  Console + Stdin + Env + File` as a closed alias);
   `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`,
   `Spawn`, `Ffi`. Mailboxes (`Actor[Msg]`) live in
   `docs/actors.md`. The runtime installs default handlers for
   `Console`/`Stdin`/`Env`/`File`/`Mutable`/`Cancel`/`Spawn`/`Ffi`
-  when `main`'s row contains them; `Fail`/`State[T]`/`Reader[T]`/
+  when `main`'s row contains them; `State[T]`/`Reader[T]`/
   `Writer[W]` always require an explicit handler.
 
 ### 4. Fibers + scheduler
@@ -361,7 +361,7 @@ in.
    - **m7a — mechanics**: row unification, `TyFnT` with
      effect-row slot, CPS transform, handler-stack runtime,
      default handlers for `Console`/`Stdin`/`Env`/`File`/
-     `Mutable`/`Cancel`/`Spawn`/`Fail`/`Ffi`, basic
+     `Mutable`/`Cancel`/`Spawn`/`Ffi`, basic
      diagnostics for row-mismatch and effect-not-handled.
      End state: `fn main() : Unit / Console { Console.print("hi") }`
      compiles and runs end-to-end.
@@ -406,7 +406,7 @@ in.
      `docs/proposed-extensions.md` once `Option` / `Result`
      stabilise in prelude:
      - §13 `!` postfix — `expr!` propagates `Option` /
-       `Result` errors to the enclosing `Fail` handler.
+       `Result` errors to the caller.
        Syntax already reserved in `kaikai-minimal.md`.
      - §11 `variants[T]()` builtin — enumerate sum-type
        constructors at compile time; useful for

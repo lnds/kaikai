@@ -275,8 +275,8 @@ type-representation refactor. Documented in
 
 ### 2. Other minor items left behind by the R2 lane
 
-- `Fail`-at-nursery-level recovery. A child that fails through the
-  modelled `Fail` effect (rather than `Cancel`) is not yet caught
+- Failure-at-nursery-level recovery. A child that fails through a
+  user-declared abort effect (rather than `Cancel`) is not yet caught
   and re-raised by the scope — that needs the nursery to reshape the
   body's inferred row, which is its own type-design lane.
 
