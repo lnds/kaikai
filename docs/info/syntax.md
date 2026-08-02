@@ -943,7 +943,7 @@ Use instead:
 - angle generics `Foo<T>` → bracket generics `Foo[T]` (angles are reserved for `Real<m>`)
 - `/// doc` / `//! doc` / `#: doc` → `#[doc("...")]` above the declaration
 - `null` / `undefined` / `nil` → `Option[T]`
-- `throw` / `try-catch` → `Fail` effect or `Result[a, e]` (with `expr!`)
+- `throw` / `try-catch` → `Result[a, e]` (with `expr!`) or an effect op returning `Nothing`
 - `async` / `await` → `Spawn` effect (see `kai info fibers`)
 - `interface I { ... }` → `protocol P { ... }`
 - `for x in xs { ... }` → `xs | (x => ...)` or `xs |> each(f)`

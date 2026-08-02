@@ -180,5 +180,5 @@ explicit `= match { ... }` would just add a wrapper.
 
 ## See also
 
-`kai info syntax`, `kai info effects` (for `Fail` in handlers),
+`kai info syntax`, `kai info effects` (for patterns in handlers),
 `docs/grammar.md` §match

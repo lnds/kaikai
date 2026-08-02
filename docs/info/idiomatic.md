@@ -379,8 +379,8 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 - `Foo<T>` angle generics → `Foo[T]` (angles are reserved for units,
   `Real<m>`)
 - `null` / `nil` / `undefined` → `Option[T]`
-- `throw` / `try` / `catch` → the `Fail` effect or `Result[a, e]`
-  with postfix `!`
+- `throw` / `try` / `catch` → `Result[a, e]` with postfix `!`, or an
+  effect whose op returns `Nothing`
 - `async` / `await` → the `Spawn` effect (see `kai info fibers`)
 - `for x in xs { ... }` → `xs | (x => ...)` or `xs |> each(f)`
 - `return expr` → the last expression of a block IS its value

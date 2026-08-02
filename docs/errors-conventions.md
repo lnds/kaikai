@@ -13,7 +13,7 @@ applies and how they compose.
 |---|---|---|---|
 | `Option[T]` | "no value" is routine, no motive worth keeping | no | yes |
 | `Result[T, E]` | failure has a motive callers branch on | yes (typed `E`) | yes |
-| `Fail` (effect) | abort with message; caller cannot recover meaningfully | string only | no, unhandled = compile error |
+| abort effect (user-declared, op returns `Nothing`) | abort with message; caller cannot recover meaningfully | string only | no, unhandled = compile error |
 | `panic` | programming error, contract violation, unreachable | string only | no, terminates the process |
 | `!` postfix | propagate `Option[None]` or `Result[Err]` to the caller | — | yes (lifts to caller) |
 
@@ -29,9 +29,9 @@ panic at runtime if reached unfilled.)
 
 Examples in stdlib:
 
-- `Stdin.read_line() : Option[String] / Fail` — `None` means EOF
-  (routine), `Fail` means the terminal is broken (no message worth
-  keeping).
+- `Stdin.read_line() : Option[String]` — `None` means EOF, and a
+  broken terminal is indistinguishable from it at this layer (no
+  message worth keeping).
 - `File.read_file(path) : Result[String, String]` — every motive
   matters: "no such file" is a different recovery path from
   "permission denied".
@@ -42,23 +42,23 @@ on the error case of a `Result`, you should have used `Option`.
 Conversely, if you write `match opt { None -> Err("missing") }`,
 you should have used `Result` from the start.
 
-## Rule 2 — `Result[T, E]` vs `Fail`
+## Rule 2 — `Result[T, E]` vs an abort effect
 
-> Use `Result` when the caller can recover. Use `Fail` when there
-> is nothing reasonable for the caller to do.
+> Use `Result` when the caller can recover. Use an abort effect when
+> there is nothing reasonable for the caller to do.
 
-`Fail.fail("...")` is a one-way exit. It propagates through every
-caller until a handler catches it. The handler converts the failure
-into something else (a default value, a logged event, a process
-exit). Callers in between do **not** branch on the message.
+An op returning `Nothing` is a one-way exit. It propagates through
+every caller until a handler catches it. The handler converts the
+failure into something else (a default value, a logged event, a
+process exit). Callers in between do **not** branch on the message.
 
 `Result[T, E]` is for failures the caller wants to inspect and
 *continue*: retry the operation, fall back to a default, surface
 the error to a user, log structured detail to an audit trail.
 
 **Litmus test**: would you ever write `if err == "specific message"
-{ ... }`? If yes, you need `Result` with a structured `E`. `Fail`
-with a string is too lossy.
+{ ... }`? If yes, you need `Result` with a structured `E`. An abort
+message is too lossy.
 
 ## Rule 3 — Never use `panic` for recoverable errors
 
@@ -75,7 +75,7 @@ with a string is too lossy.
 
 `panic` is **not** for:
 
-- Failed I/O (`File`, `Net`, `Stdin`) — use the `Result` / `Fail`
+- Failed I/O (`File`, `Net`, `Stdin`) — use the `Result` / `Option`
   shape declared by the effect.
 - Bad user input — surface it through `Result[T, InputError]`.
 - Validation failures — same as above.
@@ -296,40 +296,37 @@ typical case), build a `[E]` list manually and return
 results), use `Result[T, E]` and `!` so the first failure
 short-circuits cleanly.
 
-## Rule 7 — `Fail` is for the unhandleable
+## Rule 7 — an abort effect is for the unhandleable
 
-`Fail` is a stdlib effect declared as:
+There is no stdlib abort effect. When a failure is genuinely
+unrecoverable *and* must escape through frames that do not mention
+it, declare the effect where the policy belongs:
 
 ```kai
-effect Fail {
-  fail(msg: String) : !          # never returns
+effect Abort {
+  fail(msg: String) : Nothing    # Nothing = empty type, never returns
 }
 ```
 
-Calling `Fail.fail("...")` does not return; control jumps to the
-nearest installed `handle ... with Fail { fail(msg, _) -> ... }`.
-There is no resume. The signature `: !` (the bottom type) reflects
-this.
+`Nothing` is uninhabited, so a clause cannot resume: control jumps
+to the nearest `handle ... with Abort { fail(msg, _) -> ... }` and
+the rest of the body is abandoned. Because the effect is
+user-declared, no default handler exists — an unhandled abort is a
+compile error (`effect not handled`), not a runtime banner.
 
-**`Fail` carries a `String` only.** This is intentional. If your
-error needs to be inspected, structured, branched on — it is not a
-`Fail`, it is a `Result[T, E]` with `E` a sum type.
+**Such an effect should carry a `String` only.** If the error needs
+to be inspected, structured, branched on, it is a `Result[T, E]`
+with `E` a sum type.
 
-The stdlib uses `Fail` in two places where the message is for human
-diagnosis, not for programmatic recovery:
+The stdlib itself declares no such effect: every fallible API
+returns `Result`, and the one failure-shaped effect it does declare
+(`ReadFault` in `stdlib/stream.kai`) exists because its skip policy
+is domain knowledge. Prefer `Result` with postfix `!`; reach for an
+abort effect only when the short-circuit must cross frames that
+have no business returning a `Result`.
 
-- `Stdin.read_line` escalates real I/O faults via `Fail.fail`.
-- `Console` writes that fail at `write(2)` panic via `Fail.fail`.
-
-User code should follow the same rule: only call `Fail.fail` when
-there is genuinely no useful recovery path.
-
-A typed-error variant of `Fail` (`Fail[E]` parameterised by a sum
-type) has been considered and is **not** proposed in v1. If a
-real fintech case demands it, the analysis lives in
-`docs/protocols.md` §*Multi-method dispatch — analysis* (the
-`protocol P[A]` mechanism that would underpin it) and a fresh
-proposal would be needed.
+For deep non-local exit that the scheduler already models, use
+`Cancel.raise()`.
 
 ## Quick decision tree
 
@@ -342,7 +339,8 @@ Is the failure value worth keeping for the caller?
     │       (Pattern A — wrapper sum + map_err — when the wrapper
     │        carries extra structure; Pattern B — auto-From — once
     │        #180 lands and only if a per-conversion impl is wanted.)
-    └── Caller cannot recover (broken terminal, OOM, ...) → Fail.fail(msg)
+    └── Caller cannot recover (broken terminal, OOM, ...) → abort effect
+        (user-declared, op returns Nothing) or Cancel.raise()
 
 Does it indicate a programming bug or invariant violation?
 └── Yes → panic (never in fintech production paths)
@@ -350,10 +348,10 @@ Does it indicate a programming bug or invariant violation?
 
 ## Cross-references
 
-- `docs/effects-stdlib.md` §`Fail` — effect declaration, default
-  handler.
+- `docs/effects-stdlib.md` §`Fail` — why the stdlib abort effect was
+  retired, and what replaces it.
 - `docs/effects-stdlib.md` §`Stdin` *Error model* — first
-  documented `Option + Fail` rule.
+  documented `Option` rule.
 - `docs/effects-stdlib.md` §`File` *Error model* — first
   documented `Result` rule.
 - `docs/typed-holes.md` — `?` and `?name` are typed holes, not
