@@ -222,20 +222,54 @@ of issue #71 are now closed:
   `--dump-brands` flag (with `m8x_8_brand_dump.brands.expected`
   golden) lets fixtures pin the registry deterministically.
 
-**Pragmatic implementation note.** The brief prescribed
-`TyBranded(Ty, BrandId)` woven into the unifier so brands flow
-through generic helper instantiations automatically. This lane
-ships the user-visible behaviour (sibling-nursery mismatch
-rejection, escape detection, `--dump-brands` diagnostic) via a
-side-table walker keyed on call-site `(line, col)` rather than
-threading a new `Ty` variant through ~70 pattern-match
-touchpoints in the typer / mangler / emitter / Perceus passes.
-The trade-off is brand propagation through generic helpers
-(`fn id[T](x: T) : T = x`) where the round-trip strips the
-brand — direct-binding propagation (`let p = q`) and the
-spawn-site-to-consume-site loop are covered today; helper-
-passthrough is the next refinement and is now the only piece
-of option (b) outstanding. Documented in
+- **Brand propagation through helper calls.** Each top-level fn
+  is summarised as *brand-transparent at parameter `i`* when its
+  body is syntactically that parameter (`fn id[T](x: T) : T = x`,
+  including a block body whose tail is the parameter and whose
+  statements do not rebind it), and *opaque* otherwise. The
+  mismatch checker follows a brand across a transparent call, so
+  `let g = id(f)` keeps `f`'s brand and the sibling-nursery
+  breach at `n2.await(g)` is still rejected. Coverage:
+  `examples/effects/m8x_8_brand_through_generic.kai` (negative —
+  breach survives the round-trip),
+  `m8x_8_brand_generic_roundtrip_ok.kai` (positive — a
+  same-nursery round-trip is not a false mismatch).
+
+- **Brand-tracking loss is announced, not silent.** When a value
+  with a known brand flows into a call whose result the checker
+  cannot attribute (an opaque callee), a `warning:` names the
+  fiber's originating nursery and states that sibling-nursery
+  misuse of the result is not detected. Coverage:
+  `examples/effects/m8x_8_brand_opaque_helper_warns.kai`.
+
+**Implementation note — why brands are not in `Ty`.** The
+original brief prescribed `TyBranded(Ty, BrandId)` woven into
+the unifier. That design does not hold up, for reasons of
+soundness rather than size:
+
+- A brand is a *scope-instance* property, not a type property.
+  A constant `BrandId` inside `Ty` has no way to unify: given
+  `fn pick[T](a: T, b: T) : T` applied to two different brands,
+  the unifier must either reject a legal program, or join to
+  "unbranded" — which silently launders the brand and detects
+  nothing. Doing it soundly requires brands to be a fourth
+  quantified sort with their own unification (alongside tyvars,
+  rowvars and unitvars), i.e. brand polymorphism.
+- Even with that, escape ("brand outlives its scope") is not a
+  unification property. It needs a skolem escape check in the
+  style of `runST`, which is rank-2 and therefore not inferable
+  under the Tier-1 "HM + effect rows, decidable" constraint.
+- A brand inside `Ty` would also enter `mangle_ty`, the
+  monomorphisation key, splitting one function into per-brand
+  symbols for a distinction that does not exist at runtime.
+
+So brands stay a pre-typer side-table, and propagation is
+carried by the transparency summaries above. What remains
+uncovered — a fiber stored in a record, list or closure, or
+crossing a module — is uncovered by design, and now warns
+instead of failing silently. Closing it is a language-design
+question (mandatory annotation on `nursery`?), not a
+type-representation refactor. Documented in
 `docs/structured-concurrency.md` §*Type system* and
 §*Debugging brand inference*.
 

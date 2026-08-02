@@ -67,6 +67,7 @@ import compiler.ast
 import compiler.modules
 import compiler.refinements
 import compiler.loop_lower
+import compiler.brand_transp
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -4475,11 +4476,15 @@ fn split_last_loop(args_: [Expr], acc: [Expr]) : SplitLast {
 #     and where each was allocated (`nursery { n -> ... }`'s
 #     file:line:col), so the user can trace the breach.
 #
+#   - A call to a brand-transparent helper (one that returns a
+#     parameter unchanged, per `brand_transp.kai`) carries the
+#     brand of the argument it returns, so `let g = id(f)` keeps
+#     `f`'s brand.
+#
 # Limitations:
-#   - Brand propagation through generic helper fns
-#     (`fn id[T](x: T) : T = x`) is not wired through the typer's
-#     TyVarT instantiation. The check sees direct let-chains
-#     (`let g = f`); a helper round-trip strips the brand.
+#   - A brand that leaves through an opaque callee is not followed:
+#     the fiber may sit in a record, list or closure the walker
+#     cannot attribute. Those sites warn rather than pass silently.
 #   - Escape detection at the nursery boundary (returning a branded
 #     fiber as the body's value) is served by the `check_no_fiber_
 #     escape` walker, which catches Fiber/Pid in return types and sum
@@ -4512,16 +4517,25 @@ fn brand_rec_lookup(brs: [BrandRec], bid: Int) : Option[BrandRec] {
 # Brand environment: a list of (binding name, brand id) pairs.
 # Innermost entries first so shadowing works naturally.
 type BrandBinding = BB(String, Int)
-type BrandEnv = BEnv([BrandBinding])
+# The bindings plus the program-wide brand-transparency table, which
+# `expr_brand` consults to follow a brand through a pass-through
+# helper call.
+type BrandEnv = BEnv([BrandBinding], [BrandTranspRec])
 
-fn benv_empty() : BrandEnv = BEnv([])
+fn benv_empty() : BrandEnv = BEnv([], [])
+
+fn benv_with_transp(ts: [BrandTranspRec]) : BrandEnv = BEnv([], ts)
+
+fn benv_transp(e: BrandEnv) : [BrandTranspRec] {
+  match e { BEnv(_, ts) -> ts }
+}
 
 fn benv_push(e: BrandEnv, name: String, bid: Int) : BrandEnv {
-  match e { BEnv(xs) -> BEnv([BB(name, bid), ...xs]) }
+  match e { BEnv(xs, ts) -> BEnv([BB(name, bid), ...xs], ts) }
 }
 
 fn benv_remove(e: BrandEnv, name: String) : BrandEnv {
-  match e { BEnv(xs) -> BEnv(benv_remove_loop(xs, name, [])) }
+  match e { BEnv(xs, ts) -> BEnv(benv_remove_loop(xs, name, []), ts) }
 }
 
 fn benv_remove_loop(xs: [BrandBinding], name: String,
@@ -4544,7 +4558,7 @@ fn benv_remove_all(e: BrandEnv, names: [String]) : BrandEnv {
 }
 
 fn benv_lookup(e: BrandEnv, name: String) : Option[Int] {
-  match e { BEnv(xs) -> benv_lookup_loop(xs, name) }
+  match e { BEnv(xs, _) -> benv_lookup_loop(xs, name) }
 }
 
 fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
@@ -4569,7 +4583,7 @@ fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
 fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
   match e.kind {
     EVar(name) -> benv_lookup(env, name)
-    ECall(callee, _) -> match callee.kind {
+    ECall(callee, args_) -> match callee.kind {
       EField(base, op_name) -> match base.kind {
         EVar(eff_name) ->
           if eff_name == "Spawn" and op_name == "spawn" {
@@ -4585,9 +4599,23 @@ fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
           } else { None }
         _ -> None
       }
+      # A call to a brand-transparent helper carries the brand of the
+      # argument it returns, so `let g = id(f)` keeps `f`'s brand.
+      EVar(fname) -> transp_call_brand(fname, args_, env, calls)
       _ -> None
     }
     _ -> None
+  }
+}
+
+fn transp_call_brand(fname: String, args_: [Expr], env: BrandEnv,
+                       calls: [BrandCall]) : Option[Int] {
+  match brand_transp_lookup(benv_transp(env), fname) {
+    None -> None
+    Some(t) -> match transp_passthrough_arg(t, args_) {
+      None -> None
+      Some(arg) -> expr_brand(arg, env, calls)
+    }
   }
 }
 
@@ -4644,7 +4672,8 @@ pub fn check_nursery_brand_mismatch_decls(ds: [Decl], file: String,
                                         calls: [BrandCall],
                                         brs: [BrandRec]) : Int / Console + File {
 
-  check_brand_decls_loop(ds, file, calls, brs, 0)
+  check_brand_decls_loop(ds, file, calls, brs, 0,
+                           benv_with_transp(brand_transp_decls(ds)))
 }
 
 # `--dump-brands`: print the brand registry plus per-call
@@ -4693,41 +4722,43 @@ fn dump_brand_calls(calls: [BrandCall]) : Unit / Console {
 }
 
 fn check_brand_decls_loop(ds: [Decl], file: String, calls: [BrandCall],
-                            brs: [BrandRec], errs: Int) : Int / Console + File {
+                            brs: [BrandRec], errs: Int,
+                            seed: BrandEnv) : Int / Console + File {
 
   match ds {
     [] -> errs
     [d, ...rest] -> {
-      let e1 = check_brand_decl(d, file, calls, brs, errs)
-      check_brand_decls_loop(rest, file, calls, brs, e1)
+      let e1 = check_brand_decl(d, file, calls, brs, errs, seed)
+      check_brand_decls_loop(rest, file, calls, brs, e1, seed)
     }
   }
 }
 
 fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
-                      brs: [BrandRec], errs: Int) : Int / Console + File {
+                      brs: [BrandRec], errs: Int,
+                      seed: BrandEnv) : Int / Console + File {
 
   match d {
     DFn(_, _, _, _, _, _, body, _, _, _) ->
-      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+      check_brand_expr(body, seed, file, calls, brs, errs)
     DTest(_, body, _, _) ->
-      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+      check_brand_expr(body, seed, file, calls, brs, errs)
     DBench(_, body, _, _) ->
-      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+      check_brand_expr(body, seed, file, calls, brs, errs)
     DCheck(_, _, body, _, _) ->
-      check_brand_expr(body, benv_empty(), file, calls, brs, errs)
+      check_brand_expr(body, seed, file, calls, brs, errs)
     DImpl(_, _, _, ms, _, _) ->
-      check_brand_decls_loop(ms, file, calls, brs, errs)
+      check_brand_decls_loop(ms, file, calls, brs, errs, seed)
     DDerive(_, inner, _, _) ->
-      check_brand_decl(inner, file, calls, brs, errs)
+      check_brand_decl(inner, file, calls, brs, errs, seed)
     DUnstable(inner, _, _) ->
-      check_brand_decl(inner, file, calls, brs, errs)
+      check_brand_decl(inner, file, calls, brs, errs, seed)
     DProtoLaws(_, inner, _, _) ->
-      check_brand_decl(inner, file, calls, brs, errs)
+      check_brand_decl(inner, file, calls, brs, errs, seed)
     DImplAxiom(_, inner, _, _) ->
-      check_brand_decl(inner, file, calls, brs, errs)
+      check_brand_decl(inner, file, calls, brs, errs, seed)
     DConstructor(inner, _, _) ->
-      check_brand_decl(inner, file, calls, brs, errs)
+      check_brand_decl(inner, file, calls, brs, errs, seed)
     _ -> errs
   }
 }
@@ -4778,6 +4809,7 @@ fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
           check_brand_exprs(args_, env, file, calls, brs, e1)
         }
         None -> {
+          warn_brand_opaque_call(callee, args_, env, file, calls, brs)
           let e1 = check_brand_expr(callee, env, file, calls, brs, errs)
           check_brand_exprs(args_, env, file, calls, brs, e1)
         }
@@ -4843,6 +4875,58 @@ fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
     EBang(inner) -> check_brand_expr(inner, env, file, calls, brs, errs)
     _ -> errs
   }
+}
+
+# A branded fiber flowing into a call the checker cannot follow is
+# where brand tracking ends. Saying so turns a silent false negative
+# into an announced one: sibling-nursery misuse past this point is
+# not detected. Brand-transparent helpers are followed, so they do
+# not warn.
+fn warn_brand_opaque_call(callee: Expr, args_: [Expr], env: BrandEnv,
+                            file: String, calls: [BrandCall],
+                            brs: [BrandRec]) : Unit / Console + File {
+
+  match callee.kind {
+    EVar(fname) -> match brand_transp_lookup(benv_transp(env), fname) {
+      Some(BTParam(_)) -> ()
+      _ -> warn_branded_args(fname, args_, env, file, calls, brs)
+    }
+    _ -> ()
+  }
+}
+
+fn warn_branded_args(fname: String, args_: [Expr], env: BrandEnv,
+                       file: String, calls: [BrandCall],
+                       brs: [BrandRec]) : Unit / Console + File {
+
+  match args_ {
+    [] -> ()
+    [a, ...rest] -> {
+      match expr_brand(a, env, calls) {
+        Some(bid) -> emit_brand_opaque_warning(file, a.line, a.col, bid, fname, brs)
+        None -> ()
+      }
+      warn_branded_args(fname, rest, env, file, calls, brs)
+    }
+  }
+}
+
+fn emit_brand_opaque_warning(file: String, line: Int, col: Int, bid: Int,
+                               fname: String, brs: [BrandRec]) : Unit / Console + File {
+
+  diag_warning(file, line, col,
+    concat_all(["branded fiber escapes brand tracking through `", fname, "`"]))
+  match brand_rec_lookup(brs, bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["fiber carries brand from nursery `", name,
+                                "` at ", bf, ":", int_to_string(bl), ":",
+                                int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  diag_help(concat_all(["`", fname,
+    "` does not return one of its parameters unchanged, so sibling-nursery misuse of the result is not detected"]))
 }
 
 fn call_op_name(calls: [BrandCall], line: Int, col: Int) : String {
