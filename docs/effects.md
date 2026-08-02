@@ -692,9 +692,53 @@ The inferencer already runs HM over types with `TyVarT` and a
 - New substitution slot for row variables.
 - `apply_ty` / `unify` extended with a row case.
 
-Effect rows do **not** appear inside ordinary types — they only
-appear in the effect position of function types (`TyFnT` gains a
-third slot for the effect row).
+### Rows inside ordinary types
+
+A row is not itself a type, but a **type constructor may take a row
+as a parameter** and store it in a data value. `stdlib/stream.kai`
+is built on this:
+
+```kaikai
+pub type Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)
+```
+
+The mechanism is a **row carrier**: a row-kind argument slot resolves
+to a `TyFnT([], TyUnit, row)` rather than an ordinary type, so the
+existing `TyFnT` arm of `unify` routes the slot to `unify_row`. The
+carrier is keyed on the same row-variable id as the constructor
+field's `/ e`, which is what makes the head's `e` slot and the field's
+row one variable. Mangling erases the row, so two `Stream[t, e]`
+differing only in `e` share a single monomorphisation.
+
+Verified to work (`examples/effects/row_in_ordinary_type.kai`):
+single-constructor variants, multi-constructor sums where only some
+arms carry the row, a type nesting another row carrier, and a
+recursive type whose row travels through its own occurrence.
+Decidability holds — these unify and terminate; a recursive carrier
+and a self-applied one both settle without diverging.
+
+**Which slots are row-kind.** A tparam counts as row-kind only when
+the declaring type mentions it **after a `/`** in some constructor
+field. Passing it on as a type argument alone is not enough:
+
+```kaikai
+pub type Pair[t, e] = Pair(Box[t, e], Box[t, e])   # `e` NOT row-kind
+pub type Pair[t, e] = Pair(Box[t, e], () -> Unit / e)   # `e` row-kind
+```
+
+The first form still builds values, but the `e` slot resolves as an
+ordinary type parameter, and passing the value to a generic function
+fails to unify. Give the type a field whose row position mentions `e`.
+
+**Row-kind slots are not yet checked at a `fn` signature.** Inside
+the effect position of a function type, rows unify as specified —
+`() -> Unit / Beep` is rejected where `() -> Unit / Log` is expected.
+In a row-kind *slot* of a nominal type reached through a function
+signature, the slot is not resolved as a row: `Box[Beep]` is accepted
+where `Box[Log]` is expected, and even `Box[Int]` is accepted, with
+the unhandled effect surfacing at runtime instead of compile time.
+Ordinary type parameters of the same type are still checked. Tracked
+in #1542.
 
 ## Out of scope for v1
 
