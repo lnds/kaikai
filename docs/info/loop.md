@@ -74,8 +74,8 @@ fn main() : Unit / Stdout = {
 
   # `forever` returns `Nothing`: the type system knows there is no
   # normal-completion path. The only exits are `Cancel` (cooperative
-  # cancellation) or an effect that unwinds (e.g. `Fail.fail`). In a
-  # real program the body would `Cancel.cancel()` or call a Fail op.
+  # cancellation) or an effect op returning `Nothing`. In a real
+  # program the body would call `Cancel.cancel()`.
   if maybe_done() {
     forever {
       Stdout.print("tick")

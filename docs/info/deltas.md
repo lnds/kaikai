@@ -23,8 +23,8 @@ Every entry is verified against the compiler; when in doubt,
   not `|x| ...`.
 - No `return` — the last expression of a block is the value.
 - No `null` / `nil` / `undefined` — `Option[T]` (`Some(x)` / `None`).
-- No `throw` / `try` / `catch` — use the `Fail` effect or
-  `Result[a, e]` with the `expr!` propagation postfix.
+- No `throw` / `try` / `catch` — use `Result[a, e]` with the `expr!`
+  propagation postfix, or an effect whose op returns `Nothing`.
 - No `for x in xs`, no C-style `for (;;)`, no `break` / `continue`.
   Iterate with pipes — `xs | (x => ...)` or `xs |> each(f)`. The
   `for` keyword appears only in `impl Proto for T`.

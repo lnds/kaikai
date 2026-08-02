@@ -340,7 +340,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 2. `kai build`, `kai run`, `kai test` working against stage 1.
 3. Demos rewritten under the new design, running.
 
-`Map[K, V]` and full effects-aware stdlib (`Mutable`, `State[T]`, `Reader[T]`, `Writer[W]`, `Fail`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[Msg]`, `Pid[Msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
+`Map[K, V]` and full effects-aware stdlib (`Mutable`, `State[T]`, `Reader[T]`, `Writer[W]`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[Msg]`, `Pid[Msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
 
 **Post-MVP** (out of immediate scope at the time this section
 was first pinned; many items below have since shipped — see
@@ -348,7 +348,7 @@ was first pinned; many items below have since shipped — see
 - Stage 2 with LLVM backend directly, full Perceus, effect inference, fibers, BEAM-style scheduler.
 - **Effects system** — three pinned design docs:
   - `docs/effects.md` (Doc A): rows, unification, syntax, `handle` / `resume`, inference. The mental model.
-  - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `Fail`, `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
+  - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
   - `docs/effects-impl.md` (Doc C, in progress): CPS transform, handler-stack runtime, codemod for migrating bare builtins.
 - **Syntax sugars** (`docs/syntax-sugars.md`): trailing lambdas, naked cell read / `cap := v`, local `var x := init` cells, array indexing `a[i]` / `a[i] := v`. m7b ships these alongside the effects mechanics.
 - **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing. *Landed in stage 2 m10.*

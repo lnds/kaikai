@@ -28,7 +28,7 @@ cannot do. The four wins, in order of leverage:
 3. **Derived encode from the same Layout** — one type declares the representation
    once; `decode`/`encode` both derive from it, *impossible to desync*. Elixir
    writes parser and serializer separately.
-4. **Effects in the decode signature** — `decode[T] : T / Read + Fail` puts
+4. **Effects in the decode signature** — `decode[T] : T / Read + Abort` puts
    streaming and failure in the signature, composable with the rest of the effect
    system. Elixir has no typed effects.
 
@@ -232,7 +232,7 @@ Why this beats Elixir on the same case: the result is a **typed `Packet`** — `
 is a checked `Array[U8]` field, `len` a checked `U16`, and a typo `p.ln` is a
 compile error. Elixir's `<<len::16, body::binary-size(len)>>` gives untyped
 bindings and a runtime `MatchError` on a bad length; `decode[Packet]` returns
-`Option[Packet]` (or `/ Fail`), failing safely, statically typed.
+`Option[Packet]` (or an abort effect), failing safely, statically typed.
 
 Restriction (keeps it decidable): the reference is a **plain prior field name** (or
 a simple arithmetic expression over prior fields, e.g. `Bytes<len - 4>`), never a
