@@ -38,7 +38,7 @@ fn fetch_all(urls: [String]) : [String] / Spawn + Stdout = {
 
 fn main() : Int / Spawn + Stdout = {
   let results = fetch_all(["a", "b", "c"])
-  Stdout.print("got #{int_to_string(results.length())}")
+  Stdout.print("got #{results.length()}")
   0
 }
 ```

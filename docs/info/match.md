@@ -74,7 +74,7 @@ fn area_at_origin(p: Point) : Int = match p {
 }
 
 fn list_info(xs: [Int]) : String = match xs {
-  whole @ [_, ..._] -> "non-empty len=#{int_to_string(whole.length())}"
+  whole @ [_, ..._] -> "non-empty len=#{whole.length()}"
   []                -> "empty"
 }
 
@@ -84,7 +84,7 @@ fn main() : Unit / Stdout = {
   Stdout.print(classify(8))
   Stdout.print(classify(9))
   match first([1, 2, 3]) {
-    Some(n) -> Stdout.print("first=#{int_to_string(n)}")
+    Some(n) -> Stdout.print("first=#{n}")
     None    -> Stdout.print("empty")
   }
   Stdout.print(int_to_string(area_at_origin(Point { x: 3, y: 4 })))
