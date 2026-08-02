@@ -207,6 +207,14 @@ contract this enforces (issue #103).
 
 ### Race (first result wins)
 
+> **v1 status (2026-08-02):** `Spawn.select` now races — it parks on
+> every candidate, returns the first to terminate, and requests cancel
+> on the losers (issue #1539). The two wrappers below are still not
+> writable as shown: `nursery` brackets `Spawn` rather than
+> discharging it, so `Spawn` stays in the row and these signatures do
+> not typecheck (issue #1532). Call `Spawn.select` directly until
+> #1532 lands.
+
 ```kai
 pub fn race[T, e](options: [() -> T / e]) : T / e + Spawn + Cancel {
   nursery { n ->
@@ -219,7 +227,21 @@ pub fn race[T, e](options: [() -> T / e]) : T / e + Spawn + Cancel {
 Polymorphic in `e` so the candidate functions can carry any
 effect set (`Console`, `File`, `Io`, etc.).
 
+Selection is by completion order. A candidate that terminates first
+wins regardless of its position in the list; position breaks ties only
+when several have already terminated. Losers are cancelled
+cooperatively — the flag lands and each unwinds at its next yield
+point — so the enclosing nursery can join them at scope exit instead
+of waiting out work whose result nobody can observe.
+
 ### Timeout
+
+> **v1 status (2026-08-02):** the race half works — `Spawn.select`
+> returns whichever of the two children finishes first and cancels the
+> other. The wrapper below still does not typecheck as written, for
+> the same reason `race` does not: `nursery` leaves `Spawn` in the row
+> (issue #1532). Spawn the task and the timer into a nursery and call
+> `Spawn.select` on them directly until #1532 lands.
 
 ```kai
 type Outcome[T] =
@@ -241,10 +263,10 @@ pub fn with_timeout[T, e](
 }
 ```
 
-`Time.sleep(ms)` is an op of a `Time` effect (deferred to a
-later doc; for v1, treat `Time` as a placeholder for whatever
-clock capability the runtime exposes — likely `Spawn` or a
-dedicated `Time` effect).
+The clock capability the sketch calls `Time` ships as `Clock`
+(`stdlib/time.kai`): `time.sleep(time.millis(n))` parks the fiber on
+the reactor timer, so a timer child cancelled by `select` unwinds
+rather than sleeping out its deadline.
 
 ### Actor supervision
 
