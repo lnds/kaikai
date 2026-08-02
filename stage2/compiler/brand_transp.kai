@@ -1,0 +1,125 @@
+# Brand-transparency summaries for nursery fiber brands.
+#
+# A function is *brand-transparent* at parameter `i` when its result
+# is syntactically the `i`-th parameter, so a branded fiber passed in
+# comes back out unchanged. The brand-mismatch checker consults these
+# summaries to follow a brand across a helper call instead of losing
+# it at the call boundary.
+#
+# Transparency is decided on the surface AST alone, so this runs
+# before the typer alongside the cap-binding rewrite. Anything not
+# provably a pass-through is opaque: the brand is not followed, and
+# the checker warns rather than staying silent.
+
+import compiler.util
+import compiler.ast
+
+# `BTOpaque` is the conservative default for every shape that is not
+# provably a pass-through.
+#[doc("Whether a function returns one of its parameters unchanged, and which one.")]
+pub type BrandTransp = BTOpaque | BTParam(Int)
+
+#[doc("A brand-transparency summary for one function: its name and which parameter (if any) it returns unchanged.")]
+pub type BrandTranspRec = BTR(String, BrandTransp)
+
+#[doc("Summarise every top-level fn as brand-transparent at a parameter index or opaque.")]
+pub fn brand_transp_decls(ds: [Decl]) : [BrandTranspRec] {
+  brand_transp_loop(ds, [])
+}
+
+fn brand_transp_loop(ds: [Decl], acc: [BrandTranspRec]) : [BrandTranspRec] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> brand_transp_loop(rest, brand_transp_decl(d, acc))
+  }
+}
+
+fn brand_transp_decl(d: Decl, acc: [BrandTranspRec]) : [BrandTranspRec] {
+  match d {
+    DFn(_, name, _, ps, _, _, body, _, _, _) ->
+      [BTR(name, btr_transp_of_body(body, ps)), ...acc]
+    _ -> acc
+  }
+}
+
+# The result is the parameter index when the body reduces to a bare
+# `EVar` naming a parameter. A block body counts only when its tail is
+# that var and no statement rebinds the name — a rebinding would make
+# the returned value a different one than the argument.
+fn btr_transp_of_body(body: Expr, ps: [Param]) : BrandTransp {
+  match body.kind {
+    EVar(n) -> btr_param_index(ps, n, 0)
+    EBlock(stmts, tail) -> match tail {
+      Some(t) -> match t.kind {
+        EVar(n) ->
+          if btr_stmts_rebind(stmts, n) { BTOpaque } else { btr_param_index(ps, n, 0) }
+        _ -> BTOpaque
+      }
+      None -> BTOpaque
+    }
+    _ -> BTOpaque
+  }
+}
+
+fn btr_param_index(ps: [Param], name: String, i: Int) : BrandTransp {
+  match ps {
+    [] -> BTOpaque
+    [p, ...rest] -> if p.pname == name { BTParam(i) } else { btr_param_index(rest, name, i + 1) }
+  }
+}
+
+fn btr_stmts_rebind(ss: [Stmt], name: String) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if btr_stmt_binds(s, name) { true } else { btr_stmts_rebind(rest, name) }
+  }
+}
+
+fn btr_stmt_binds(s: Stmt, name: String) : Bool {
+  match s {
+    SLet(pat, _, _) -> btr_pat_binds(pat, name)
+    SVar(n, _, _, _, _) -> n == name
+    _ -> false
+  }
+}
+
+# Conservative: only the shapes that provably bind nothing named
+# `name` answer false. Every destructuring form is treated as a
+# possible rebinding, which can only cost transparency, never
+# invent it.
+fn btr_pat_binds(pat: Pattern, name: String) : Bool {
+  match pat.pkind {
+    PWild -> false
+    PLit(_) -> false
+    PRange(_, _) -> false
+    PHole(_) -> false
+    PBind(n) -> n == name
+    PNarrow(n, _) -> n == name
+    _ -> true
+  }
+}
+
+#[doc("Look up a function's brand-transparency summary by name.")]
+pub fn brand_transp_lookup(rs: [BrandTranspRec], name: String) : Option[BrandTransp] {
+  match rs {
+    [] -> None
+    [r, ...rest] -> match r {
+      BTR(n, t) -> if n == name { Some(t) } else { brand_transp_lookup(rest, name) }
+    }
+  }
+}
+
+#[doc("Select the argument a brand-transparent callee returns, if the call supplies it.")]
+pub fn transp_passthrough_arg(t: BrandTransp, args_: [Expr]) : Option[Expr] {
+  match t {
+    BTOpaque -> None
+    BTParam(i) -> btr_nth_expr(args_, i)
+  }
+}
+
+fn btr_nth_expr(xs: [Expr], i: Int) : Option[Expr] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> if i == 0 { Some(h) } else { btr_nth_expr(rest, i - 1) }
+  }
+}
