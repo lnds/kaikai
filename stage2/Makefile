@@ -3024,6 +3024,19 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (spawn_actor_policy: explicit MailboxPolicy reaches the spawned actor's mailbox)" \
 	    || { echo "effects FAIL $$name (issue #763 spawn_actor_policy output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
+	for f in ../examples/effects/issue_763_drop_oldest_invariant.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  KAI_THREADS=8 ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (DropOldest sheds the oldest; the newest cap sends survive in order, thread-count independent)" \
+	    || { echo "effects FAIL $$name (drop-oldest invariant violated)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m8_trap_exit.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
