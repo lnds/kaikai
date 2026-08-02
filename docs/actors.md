@@ -268,6 +268,17 @@ caller needs to know, wire an acknowledgement into the protocol
 on the payload side, or switch to `BlockSender` so that
 delivery is guaranteed (at the cost of backpressure).
 
+The eviction rule is defined against the mailbox contents at
+the instant the full `send` runs, not against the sender's
+history: `DropOldest` evicts the oldest entry *then present*.
+Nothing pins which entries those are. A running consumer drains
+slots concurrently, so how many sends a bounded mailbox sheds —
+or whether it sheds any at all — depends on the interleaving,
+and only the surviving set's shape is a property worth asserting.
+A test that fixes *which* messages a drop policy discards is
+really testing a scheduler rotation, and must pin its thread
+count to mean anything.
+
 ### No multi-instance policies in v1
 
 Per-priority queues, fair-share schedulers, and pluggable
