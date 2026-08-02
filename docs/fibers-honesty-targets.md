@@ -244,19 +244,22 @@ of option (b) outstanding. Documented in
 - Real race + cancel-losers semantics for `Spawn.select`. v1
   (Phase 2) returns the head deterministically; the spec's race
   semantics (lose-then-cancel-the-rest) is queued.
-- User-installed `with Cancel { raise(_) -> cleanup }` handlers on
-  runtime-triggered cancel. Phase 3 longjmps through the
-  trampoline `cancel_pad` directly; user cleanup clauses are not
-  invoked. Documented in the `kai_check_cancel_yield_point`
-  comment.
 - `Fail`-at-nursery-level recovery. A child that fails through the
   modelled `Fail` effect (rather than `Cancel`) is not yet caught
   and re-raised by the scope — that needs the nursery to reshape the
   body's inferred row, which is its own type-design lane.
 
-These three are notes for future agents — none of them surface to
-user code as runtime errors today, and none of them block the issue
-#59 close.
+Both are notes for future agents — neither surfaces to user code as a
+runtime error today, and neither blocks the issue #59 close.
+
+A third item lived here and is now shipped: user-installed
+`with Cancel { raise(_) -> cleanup }` handlers DO run on a
+runtime-triggered cancel. `kai_check_cancel_yield_point` walks the
+target fiber's evidence stack for the innermost live Cancel frame and
+dispatches through its clause exactly as a synchronous `Cancel.raise()`
+would; the `cancel_pad` longjmp is the fallback taken only when no user
+handler is in scope. This entry claimed the opposite well after the fix
+landed — see §*Cancel-handler dispatch on remote cancel* below.
 
 ### 3. Structured auto-join + cancel-on-fail in `nursery` (shipped)
 
@@ -273,6 +276,31 @@ expected, non-propagating outcome. The scope state is a per-fiber
 stack of `KaiNursery` so nested nurseries compose. Coverage:
 `examples/effects/m8x_9_nursery_autojoin.kai` (auto-join order),
 `m8x_10_nursery_cancel_on_fail.kai` (sibling cancel + re-raise).
+
+### 4. Cancel-handler dispatch on remote cancel (shipped)
+
+A user `with Cancel { raise(_) -> cleanup }` installed in a fiber runs
+when a sibling calls `Spawn.cancel` on it — the same clause the
+synchronous `Cancel.raise()` path runs. `kai_check_cancel_yield_point`
+walks the target's evidence stack for the innermost frame carrying a
+live `handle_jmp`, dispatches the clause, then longjmps to that
+handle's landing pad. The trampoline `cancel_pad` is the fallback for a
+target with no user Cancel frame in scope. This makes wrapping a fiber
+body in a Cancel handle the working pattern for graceful shutdown, as
+`kai info fibers` §*Cancellation* describes.
+
+Measured identically on both backends at `KAI_THREADS=1` and above —
+the dispatch is in the shared runtime, not in either emitter. Coverage:
+`examples/effects/issue_682_cancel_sibling_handler.kai` (flat handler)
+and `issue_1533_remote_cancel_runs_handler.kai` (innermost-first with
+nested handles, plus the no-handler pad fallback in the same program).
+
+The one documented bypass is trap-exit: a fiber linked to a peer with
+`Spawn.set_trap_exit(true)` unwinds straight to the pad, crossing every
+`with Cancel` in the chain, so the supervisor observes the termination
+through its mailbox. That is deliberate — OTP-style layered supervision
+would not compose otherwise — and is specified in `docs/actors.md`
+§*Trap-exit semantics* (issue #103).
 
 ## Sequencing recommendation
 
