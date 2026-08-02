@@ -39,8 +39,8 @@ fn main() : Unit / Stdout = {
                                                # → sub(5, 7) = -2
   let f = 5 |> sub(7, _)                       # placeholder `_`
                                                # → sub(7, 5) = 2
-  Stdout.print("a=#{int_to_string(a)} f=#{int_to_string(f)}")
-  Stdout.print("b len=#{int_to_string(b.length())} c len=#{int_to_string(c.length())} d len=#{int_to_string(d.length())} e=#{int_to_string(e)}")
+  Stdout.print("a=#{a} f=#{f}")
+  Stdout.print("b len=#{b.length()} c len=#{c.length()} d len=#{d.length()} e=#{e}")
 
   # |> into an effect op needs an explicit lambda — capability ops
   # (`Stdout.print`, etc.) are NOT first-class values you can bare-
@@ -49,7 +49,7 @@ fn main() : Unit / Stdout = {
 
   # Composing pipes (left-assoc):
   let chain = [1..10] |? gt1 | (n => n * 2) |> sum
-  Stdout.print("chain=#{int_to_string(chain)}")
+  Stdout.print("chain=#{chain}")
 }
 ```
 

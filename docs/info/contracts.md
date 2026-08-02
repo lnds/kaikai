@@ -27,7 +27,7 @@ fn divide(a: Int, b: Int) : Int
 }
 
 fn main() : Unit / Stdout {
-  Stdout.print("q=#{int_to_string(divide(10, 2))}")
+  Stdout.print("q=#{divide(10, 2)}")
 }
 ```
 
