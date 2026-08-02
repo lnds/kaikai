@@ -241,18 +241,15 @@ of option (b) outstanding. Documented in
 
 ### 2. Other minor items left behind by the R2 lane
 
-- Real race + cancel-losers semantics for `Spawn.select`. v1
-  (Phase 2) returns the head deterministically; the spec's race
-  semantics (lose-then-cancel-the-rest) is queued.
 - `Fail`-at-nursery-level recovery. A child that fails through the
   modelled `Fail` effect (rather than `Cancel`) is not yet caught
   and re-raised by the scope — that needs the nursery to reshape the
   body's inferred row, which is its own type-design lane.
 
-Both are notes for future agents — neither surfaces to user code as a
-runtime error today, and neither blocks the issue #59 close.
+That is a note for future agents — it does not surface to user code as
+a runtime error today, and it does not block the issue #59 close.
 
-A third item lived here and is now shipped: user-installed
+Two items lived here and are now shipped. User-installed
 `with Cancel { raise(_) -> cleanup }` handlers DO run on a
 runtime-triggered cancel. `kai_check_cancel_yield_point` walks the
 target fiber's evidence stack for the innermost live Cancel frame and
@@ -260,6 +257,8 @@ dispatches through its clause exactly as a synchronous `Cancel.raise()`
 would; the `cancel_pad` longjmp is the fallback taken only when no user
 handler is in scope. This entry claimed the opposite well after the fix
 landed — see §*Cancel-handler dispatch on remote cancel* below.
+`Spawn.select` likewise races now: it parks on every candidate, returns
+the first to terminate, and cancel-requests the losers (issue #1539).
 
 ### 3. Structured auto-join + cancel-on-fail in `nursery` (shipped)
 

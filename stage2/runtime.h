@@ -2969,6 +2969,15 @@ typedef enum {
 
 typedef struct KaiFiber   KaiFiber;
 typedef struct KaiNursery KaiNursery;     /* issue #959 — defined below */
+
+/* One selector's membership in one candidate's select chain. A fiber in
+ * Spawn.select allocates an array of these on its own stack and links one
+ * into every candidate, so N candidates can each reach the selector. */
+typedef struct KaiSelectWaiter KaiSelectWaiter;
+struct KaiSelectWaiter {
+    KaiFiber        *waiter;   /* the fiber parked in select      */
+    KaiSelectWaiter *next;     /* next node in the candidate chain */
+};
 typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
 typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
 
@@ -3002,6 +3011,13 @@ struct KaiFiber {
     size_t          stack_size;        /* set per fiber (env-configurable) */
     KaiFiber       *awaiters_head;     /* per-fiber awaiter chain head    */
     KaiFiber       *awaiters_next;     /* link into another fiber's chain */
+    /* Spawn.select waiters. Separate from the awaiter chain because
+     * `awaiters_next` is a single link: a selector waits on every
+     * candidate at once, so its membership cannot be one pointer in
+     * its own struct. Each node is owned by the selector's stack frame
+     * and lives only while it is parked. Guarded by the candidate's
+     * slot lock, exactly like `awaiters_head`. */
+    KaiSelectWaiter *select_waiters_head;
     /* m8.x Phase 3 — Cancel delivery at yield points. The trampoline
      * sets up cancel_pad with setjmp before running the body; the
      * yield-point hook in kai_evidence_lookup* longjmps here when the
@@ -3219,6 +3235,7 @@ struct KaiNursery {
     {0},                 /* ctx — getcontext fills it on first swap */   \
     NULL, 0,             /* stack_base, stack_size — main uses OS stack */ \
     NULL, NULL,          /* awaiters_head, awaiters_next */              \
+    NULL,                /* select_waiters_head */                       \
     {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */ \
     0, NULL,             /* trapped, trap_msg — main starts untrapped */  \
     NULL,                /* linked_head */                               \
@@ -3771,6 +3788,9 @@ static void kai_sched_unpark(KaiFiber *target);
  * observe a sibling-triggered cancel before retrying their syscall.
  * Body lives near the op-call lookup prologue at line 8868+. */
 static void kai_check_cancel_yield_point(void);
+/* Splice a fiber off whatever reactor waiter list holds it; defined with
+ * the reactor below, needed above by the select loser-cancel walk. */
+static int kai_reactor_detach_fiber(KaiFiber *target);
 
 /* Issue #611 — Phase R1 reactor forward decls. The default Clock /
  * File / Process handlers live above the reactor implementation
@@ -3957,6 +3977,26 @@ static void kai_awaiter_unlink(KaiFiber *owner, KaiFiber *me) {
             return;
         }
         link = &(*link)->awaiters_next;
+    }
+}
+
+/* Select-chain membership. Both sides run under `owner`'s slot lock, so a
+ * candidate's terminate walk cannot snapshot the chain between a selector's
+ * state read and its link. `node` belongs to the selector's stack frame and
+ * must be unlinked from every candidate before that frame returns. */
+static void kai_select_link(KaiFiber *owner, KaiSelectWaiter *node) {
+    node->next = owner->select_waiters_head;
+    owner->select_waiters_head = node;
+}
+static void kai_select_unlink(KaiFiber *owner, KaiSelectWaiter *node) {
+    KaiSelectWaiter **link = &owner->select_waiters_head;
+    while (*link) {
+        if (*link == node) {
+            *link = node->next;
+            node->next = NULL;
+            return;
+        }
+        link = &(*link)->next;
     }
 }
 
@@ -15150,7 +15190,35 @@ static void kai_fiber_trampoline(void) {
         }
         self->awaiters_head = NULL;
     }
+    /* Selectors parked on us. Each node lives on its selector's stack
+     * frame, so the chain must be walked to fibers HERE, under the lock:
+     * once a selector is unparked it can win, return, and reclaim its
+     * frame, and a `sel->next` read after that is a use-after-free.
+     * Collecting the fibers first means the unpark loop below touches no
+     * node memory. Each selector re-scans every candidate on resume, so
+     * detaching the chain is all we owe it. */
+    KaiFiber  *swake_stack[8];
+    KaiFiber **swake = swake_stack;
+    int        swake_n = 0;
+    {
+        int n = 0;
+        for (KaiSelectWaiter *c = self->select_waiters_head; c; c = c->next) n++;
+        if (n > 8) {
+            swake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
+            if (!swake) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        }
+        KaiSelectWaiter *s = self->select_waiters_head;
+        while (s) {
+            KaiSelectWaiter *nx = s->next;
+            s->next = NULL;
+            swake[swake_n++] = s->waiter;
+            s = nx;
+        }
+        self->select_waiters_head = NULL;
+    }
     if (kai_nthreads > 1) kai_fiber_slot_unlock_at(self_hl);
+    for (int i = 0; i < swake_n; i++) kai_sched_unpark(swake[i]);
+    if (swake != swake_stack) free(swake);
     for (int i = 0; i < wake_n; i++) kai_sched_unpark(wake[i]);
     if (wake != wake_stack) free(wake);
 
@@ -15458,10 +15526,8 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
  * spawn(thunk)        — alloc fiber + enqueue; thunk runs later.
  * await(fiber)        — park on the fiber's awaiter chain until DONE.
  * yield()             — rotate run queue (no-op if alone).
- * select([fiber])     — Phase 2 simplification: head-of-list, parking
- *                       on the head if not yet DONE. Real race +
- *                       cancel-losers semantics land in Phase 4
- *                       alongside Cancel delivery (Phase 3).
+ * select([fiber])     — race: park on every candidate, return the first
+ *                       to terminate, request cancel on the losers.
  * cancel(fiber)       — set cancel_requested; delivery is Phase 3.
  *
  * Op-argument ABI (all effects, not just Spawn): a call site hands each
@@ -15636,42 +15702,101 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
         fprintf(stderr, "kai: Spawn.select called on empty list\n");
         exit(1);
     }
-    /* v1 (Phase 2): walk once for an already-DONE fiber. If none,
-     * park on the head. Real race + cancel-losers needs Phase 3
-     * (Cancel delivery to losers' yield points) and lands in
-     * Phase 4 together with the blocking-mailbox primitives. */
-    KaiValue *cur   = fibs_v;
-    KaiFiber *head  = NULL;
-    while (kai_is_ptr(cur) && cur->tag == KAI_CONS) {
-        KaiValue *elem = cur->as.cons.head;
-        if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
-            fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
-            exit(1);
-        }
-        KaiFiber *fib = elem->as.fib;
-        if (!head) head = fib;
-        if (fib->state == KAI_FIBER_DONE) {
-            return kai_cont_resume(k, kai_fiber_result_for_awaiter(fib));
-        }
-        cur = cur->as.cons.tail;
+    /* Collect the candidates once: the list is walked repeatedly below and
+     * a cons cell read is not cheaper than an array index. */
+    int n = 0;
+    for (KaiValue *c = fibs_v; kai_is_ptr(c) && c->tag == KAI_CONS; c = c->as.cons.tail) n++;
+    KaiFiber  *fibs_stack[8];
+    KaiFiber **fibs = fibs_stack;
+    if (n > 8) {
+        fibs = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
+        if (!fibs) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     }
-    /* No fiber DONE on entry. Park on the head until it terminates.
-     * Check-and-link under head's slot lock so its terminate walk cannot
-     * snapshot the chain between our read and our link (the lost wakeup);
-     * loop so a spurious resume re-parks instead of mistaking the wake. */
+    {
+        int i = 0;
+        for (KaiValue *c = fibs_v; kai_is_ptr(c) && c->tag == KAI_CONS; c = c->as.cons.tail) {
+            KaiValue *elem = c->as.cons.head;
+            if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
+                fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
+                exit(1);
+            }
+            fibs[i++] = elem->as.fib;
+        }
+    }
+
+    /* Race. The selector links a node into EVERY candidate's select chain,
+     * so whichever terminates first wakes it; on resume it re-scans and
+     * takes the first candidate found terminated. Order within one wake is
+     * list order, which only decides ties — two fibers that finished before
+     * the selector ran are both winners by any honest reading.
+     *
+     * Link-then-recheck is the same lost-wakeup discipline await uses, one
+     * candidate at a time: a fiber that terminates while we are still
+     * linking later candidates has already put us on its chain (so the
+     * unpark is recorded, not lost) or set its terminal state before we
+     * read it (so the rescan sees it and we never park). */
+    KaiSelectWaiter  nodes_stack[8];
+    KaiSelectWaiter *nodes = nodes_stack;
+    if (n > 8) {
+        nodes = (KaiSelectWaiter *) malloc((size_t) n * sizeof(KaiSelectWaiter));
+        if (!nodes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    }
+    KaiFiber *me     = kai_current_fiber();
+    KaiFiber *winner = NULL;
+    for (int i = 0; i < n; i++) { nodes[i].waiter = me; nodes[i].next = NULL; }
+
     for (;;) {
-        int head_hl = 0;
-        if (kai_nthreads > 1) head_hl = kai_fiber_slot_lock(head);
-        int head_done = (head->state == KAI_FIBER_DONE ||
-                         head->state == KAI_FIBER_CANCELLED);
-        KaiFiber *me = kai_current_fiber();
-        if (head_done) kai_awaiter_unlink(head, me);
-        else           kai_awaiter_link_if_absent(head, me);
-        if (kai_nthreads > 1) kai_fiber_slot_unlock_at(head_hl);
-        if (head_done) break;
-        kai_sched_park();
+        int linked_upto = 0;
+        for (int i = 0; i < n && !winner; i++) {
+            KaiFiber *f = fibs[i];
+            int hl = 0;
+            if (kai_nthreads > 1) hl = kai_fiber_slot_lock(f);
+            if (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED) {
+                winner = f;
+            } else {
+                kai_select_link(f, &nodes[i]);
+                linked_upto = i + 1;
+            }
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
+        }
+        /* Park only while still linked: a candidate that terminates now
+         * finds us on its chain and the unpark is recorded rather than
+         * lost. Unlinking before the park would leave nobody able to wake
+         * us — the whole race would hang on the first sleeper. */
+        if (!winner) kai_sched_park();
+        /* Unlink every node we linked this round, whether we won, lost the
+         * tie, or woke spuriously: the nodes live in this frame, so no
+         * candidate may hold a pointer into it past the return, and the
+         * next round must be able to re-link the same node cleanly. */
+        for (int i = 0; i < linked_upto; i++) {
+            KaiFiber *f = fibs[i];
+            int hl = 0;
+            if (kai_nthreads > 1) hl = kai_fiber_slot_lock(f);
+            kai_select_unlink(f, &nodes[i]);
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
+        }
+        if (winner) break;
     }
-    return kai_cont_resume(k, kai_fiber_result_for_awaiter(head));
+
+    /* Cancel the losers. `select` returns one result and the nursery joins
+     * every child at scope exit, so a loser left running would stall the
+     * scope on work whose result nobody can observe. Delivery is the
+     * ordinary cooperative path: the flag lands and the fiber unwinds at
+     * its next yield point; a loser parked on the reactor gets detached and
+     * unparked so it reaches that point instead of sleeping until an
+     * external event it no longer needs. */
+    for (int i = 0; i < n; i++) {
+        KaiFiber *f = fibs[i];
+        if (f == winner) continue;
+        if (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED) continue;
+        f->cancel_requested = 1;
+        if (kai_reactor_detach_fiber(f)) kai_sched_unpark(f);
+    }
+
+    KaiValue *res = kai_fiber_result_for_awaiter(winner);
+    if (nodes != nodes_stack) free(nodes);
+    if (fibs  != fibs_stack)  free(fibs);
+    return kai_cont_resume(k, res);
 }
 #endif
 
