@@ -1473,6 +1473,13 @@ starts empty; accumulating onto a pre-existing list is
 concatenation at the call site (`prefix ++ snd(with_writer {
 ...})`).
 
+`state` and `log` are two spellings of the same slot, and both are
+bound in every clause of a stateful handler — including the `return`
+clause. An **enclosing binding of either name wins**: a clause inside a
+`handle` that sits under `let log = ...` reads that `log`, not the
+handler state, and the compiler warns that the alias is unavailable
+there. Rename the enclosing binding to reach the state under its alias.
+
 ### Telling two effects apart by their type parameter
 
 `Reader[DbConfig]` and `Reader[HttpConfig]` are distinct
