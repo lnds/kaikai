@@ -182,6 +182,34 @@ and its default writes to stderr in ISO-8601 form without a literal
 `docs/effects-stdlib.md`; the runtime implementation rationale and
 the Stage A/B/C trilogy live in `docs/effects.md`.
 
+## Handler state — `state` and `log`
+
+A stateful handler (`with State[T](init)`, `with Writer[W]([])`, any
+`with Eff(init)`) binds its state slot in every clause under two
+spellings: `state` and `log`. They name the same slot — `state` reads
+naturally for `State[T]`, `log` for accumulator-shaped handlers. The
+`return` clause sees them too.
+
+```kaikai
+effect Res { acquire() : Int }
+
+fn main() : Int / Stdout = {
+  let r = handle {
+    Res.acquire()
+  } with Res(6) {
+    acquire(resume) -> resume(state)
+    return(x)       -> x + log            # same slot as `state`
+  }
+  Stdout.print(int_to_string(r))
+  0
+}
+```
+
+An enclosing binding of either name **wins over the alias**: a clause
+under `let log = ...` reads that `log`, and the compiler warns that the
+handler state is not reachable under that name there. Rename the
+enclosing binding if the clause needs the state.
+
 ## Rebinding the capability name
 
 When two handlers of the same effect nest, use `as`. The rebinding

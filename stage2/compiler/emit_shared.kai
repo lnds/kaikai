@@ -715,6 +715,10 @@ pub fn lam_symbol(l: LamInfo) : String = match l {
 #[doc("a #6c: each handler op clause becomes a top-level C function. The id pair (handle_line, handle_col) plus op_name uniquely names the clause (HCs do not nest within the same…")]
 pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String])
 
+#[doc("The handler-state aliases a stateful handler actually binds, given the enclosing local scope.")]
+pub fn live_state_aliases(stateful: Bool, local_scope: [String]) : [String] =
+  if stateful { list_minus(handler_state_aliases(), local_scope) } else { [] }
+
 #[doc("Look up a lifted lambda by enclosing fn + source position. The (enc_fn, line, col) triple is unique even when two modules share a lambda at the same line/col.")]
 pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[LamInfo] {
   match lams {
@@ -883,13 +887,13 @@ pub fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String
     [] -> acc
     [c, ...rest] -> match c {
       HC(_, params, body, _, _) -> {
-        # m7b #18: stateful handler clauses see two magic bindings —
-        # `state` and `log` — that the codegen aliases to the
-        # evidence struct's slot. Always include them in `own` so the
-        # free-var collector does not promote them to lambda captures
-        # when the whole `with State[T]` sits inside a closure body
-        # (e.g. desugared `var` inside a lambda).
-        let own_magic = ["state", "log", ...own]
+        # Stateful handler clauses see the `state` / `log` bindings the
+        # codegen aliases to the evidence struct's slot. Include them in
+        # `own` so the free-var collector does not promote them to lambda
+        # captures when the whole `with State[T]` sits inside a closure
+        # body (e.g. desugared `var` inside a lambda). A name already in
+        # `own` is an enclosing binding and stays bound either way.
+        let own_magic = list_concat_strings(handler_state_aliases(), own)
         let own1 = list_concat_strings(map(params, (pm) => pm.pname), own_magic)
         let acc1 = fv_expr(body, own1, globals, acc)
         fv_hclauses(rest, own, globals, acc1)
@@ -902,10 +906,10 @@ pub fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String
 pub fn fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] / Console {
 
   match r {
-    # m7b #18: same `state` / `log` magic bindings as in
-    # `fv_hclauses` apply here (Doc C §m7b #11l: stateful return
-    # clauses see the handler-state alias too).
-    HR(name, body, _, _) -> fv_expr(body, [name, "state", "log", ...own], globals, acc)
+    # Same state aliases as in `fv_hclauses` — a stateful return clause
+    # sees them too.
+    HR(name, body, _, _) ->
+      fv_expr(body, [name, ...list_concat_strings(handler_state_aliases(), own)], globals, acc)
   }
 }
 
@@ -1356,14 +1360,13 @@ pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
         # R9: compute the clause's free-variable set, treating its own
-        # params plus the magic `state` / `log` aliases as bound. The
-        # resulting names are the captures the env channel must thread
-        # in from the surrounding handle frame. Mirrors `fv_hclauses`.
-        # `state` / `log` are bound only when the handler is stateful;
-        # otherwise they are ordinary outer bindings a user may have
-        # named, and must ride the env channel like any other capture.
-        let magic = if stateful { ["state", "log"] } else { [] }
-        let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), magic)
+        # params plus the live magic aliases as bound. The resulting
+        # names are the captures the env channel must thread in from the
+        # surrounding handle frame. Mirrors `fv_hclauses`. A stateless
+        # handler binds no alias, and a name the enclosing scope already
+        # binds rides the env channel like any other capture.
+        let live_aliases = live_state_aliases(stateful, st.local_scope)
+        let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), live_aliases)
         # issue #285: filter globals shadowed by enclosing-fn / outer
         # let-var bindings, so a clause body capturing e.g. `count`
         # (parameter shadowing `list.count`) is added to env captures.

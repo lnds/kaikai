@@ -407,6 +407,7 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
         Some(_) -> env_pop(e1)
         None    -> e1
       }
+      if stateful { warn_shadowed_aliases(restored, handler_state_aliases(), x.line, x.col) } else { () }
       let e2 = chk_handler_clauses(restored, clauses, stateful)
       match ret_opt {
         Some(r) -> chk_handler_return(e2, r, stateful)
@@ -432,6 +433,45 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
   }
 }
 
+# The magic aliases a stateful handler exposes inside its clauses.
+# Both read the same evidence slot — `state` is the `State[T]` spelling,
+# `log` the accumulator spelling used by `Writer[W]`.
+#[doc("The handler-state alias names a stateful handler binds inside its clause bodies.")]
+pub fn handler_state_aliases() : [String] = ["state", "log"]
+
+# An alias is bound only when the surrounding scope has no binding of
+# that name: an outer `log` array must stay reachable from the clause
+# rather than being silently replaced by the state slot.
+fn bind_state_aliases(e: Env, outer: Env) : Env =
+  bind_state_aliases_loop(e, outer, handler_state_aliases())
+
+fn bind_state_aliases_loop(e: Env, outer: Env, names: [String]) : Env {
+  match names {
+    [] -> e
+    [nm, ...rest] ->
+      bind_state_aliases_loop(if env_has(outer, nm) { e } else { env_add(e, nm) },
+                              outer, rest)
+  }
+}
+
+# Announce every alias the enclosing scope takes over, so the alias
+# going dark is never a silent surprise. Emitted once per handler, at
+# the `handle` site, not once per clause.
+fn warn_shadowed_aliases(e: Env, names: [String], line: Int, col: Int) : Unit / Console + File {
+  match names {
+    [] -> ()
+    [nm, ...rest] -> {
+      if env_has(e, nm) {
+        diag_warning(e.file, line, col,
+          "`#{nm}` inside this handler's clauses is the enclosing binding, not the handler state")
+        diag_note("a stateful handler binds `#{nm}` as an alias of its state slot; an enclosing binding of that name takes precedence")
+        diag_help("rename the enclosing binding to reach the handler state under `#{nm}`")
+      } else { () }
+      warn_shadowed_aliases(e, rest, line, col)
+    }
+  }
+}
+
 fn chk_handler_clauses(e: Env, cs: [HClause], stateful: Bool) : Env / Console + File {
 
 
@@ -440,12 +480,7 @@ fn chk_handler_clauses(e: Env, cs: [HClause], stateful: Bool) : Env / Console + 
     [c, ...rest] -> match c {
       HC(_, params, body, _, _) -> {
         let e1 = env_push(e)
-        # Parameterised handlers (`with State[T](init)`) expose the
-        # current handler-state inside every clause as
-        # `state` (and the alias `log` for accumulator-shaped handlers
-        # like `Writer[W]`). They are aliases of the same slot — the
-        # codegen layer resolves both to `self->state`.
-        let e1s = if stateful { env_add(env_add(e1, "state"), "log") } else { e1 }
+        let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
         let e2 = add_params(e1s, params)
         let e3 = chk_expr(e2, body)
         chk_handler_clauses(env_pop(e3), rest, stateful)
@@ -461,7 +496,7 @@ fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : Env / Console + File
     HR(name, body, _, _) -> {
       let e1 = env_push(e)
       let e2 = env_add(e1, name)
-      let e2s = if stateful { env_add(env_add(e2, "state"), "log") } else { e2 }
+      let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
       let e3 = chk_expr(e2s, body)
       env_pop(e3)
     }
