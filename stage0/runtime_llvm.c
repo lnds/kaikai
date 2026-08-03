@@ -1364,6 +1364,17 @@ void kaix_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
                                (jmp_buf *) jmp, (KaiValue **) discard_slot);
 }
 
+/* `finally { }` — arm the node's cleanup, and run it on the normal exit.
+ * Every unwind path runs it through the evidence walk instead; the node's
+ * `cleanup_done` flag makes the two idempotent. */
+void kaix_evidence_set_cleanup(KaiEvidence *node, void *fn, void *env) {
+    kai_evidence_set_cleanup(node, (KaiValue *(*)(void *)) fn, env);
+}
+
+void kaix_evidence_run_cleanup(KaiEvidence *node) {
+    kai_evidence_run_cleanup(node);
+}
+
 /* Op-site discard test, mirroring the C branch condition
  * `_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL`.
  * Returns 1 when the clause discarded `resume` AND a handle pad is in

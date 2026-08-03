@@ -25,11 +25,11 @@ callable; calling it continues the body with a value. Not calling it
 abandons the continuation (e.g. an op returning `Nothing`). Calling it more than once
 is currently a runtime error.
 
-Abandoning the continuation runs NO cleanup in the frames it jumps
-over: `return` clauses of intermediate handlers are skipped, and any
-non-memory resource an inner scope holds (an open fd, a transaction)
-is never released. There is no `finally`. Perceus still frees memory.
-To release a resource, install the handler at the scope owning it.
+Abandoning the continuation skips the `return` clauses of the handlers
+it jumps over — those do not run. What DOES run on every such path is
+a handler's `finally { }` clause (see *Cleanup* below), which is how a
+scope releases a non-memory resource it holds. Perceus frees memory
+regardless.
 
 ## Declaring
 
@@ -75,6 +75,64 @@ fn main() : Int / Stdout = {
 - `return(x) -> ...` is optional. Default is identity.
 - Calling `resume(v)` continues the body with `v`.
 - Outside the `with { ... }`, `Greeter` is no longer in the row.
+
+## Cleanup — `initially` / `finally`
+
+A handler may carry an `initially { }` and a `finally { }` clause. The
+pair is the acquire/release bracket: `initially` runs once when the
+handler is installed and its value becomes the handler state, readable
+as `state`; `finally` runs when the scope exits, however it exits.
+
+```kaikai
+effect Guard {
+  step() : Unit
+}
+
+fn risky() : Int / Guard = { Guard.step(); 1 }
+
+fn main() : Int / File + Stdout = {
+  let r = handle {
+    risky()
+  } with Guard {
+    # acquire — once, at installation; its value becomes `state`
+    initially { File.open_read("data.txt") }
+    # release — on every exit path
+    finally   { match state { Ok(h) -> File.close_file(h) Err(_) -> () } }
+    step(resume) -> resume(())
+    return(x)    -> x
+  }
+  Stdout.print("r=#{int_to_string(r)}")
+  0
+}
+```
+
+`finally` runs on every path that UNWINDS the scope:
+
+- normal exit off the end of the body,
+- a handler clause that abandons `resume` (including one installed
+  further out, whose jump skips this scope's frame entirely),
+- cooperative cancellation delivered to the fiber.
+
+It does NOT run on `panic`, which aborts the process rather than
+unwinding it — the OS reclaims fds and memory at exit.
+
+Two rules make the pair usable:
+
+- **`finally` runs in its INSTALL-time evidence context.** An effect it
+  performs dispatches to the handlers that were live when the handler
+  was installed, not to those at the jump site — which the unwind has
+  already torn down. So `finally` cannot perform the very effect its own
+  handler discharges; that is a compile-time "effect not handled".
+- **`initially` and the `(init)` form are the same slot**, so a handler
+  writes one or the other, never both. `with State[Int](0)` is the terse
+  spelling; `initially { 0 }` is the block form that may bind and perform.
+
+`finally` takes no parameters and its value is discarded — it runs for
+its effect. To transform the handle's result, use `return(x) -> ...`.
+
+This is what lets a producer release a resource without interpreting the
+consumer's effect: interpreting it would shadow the consumer's policy,
+whereas `finally` only brackets the scope.
 
 ## Default handlers
 

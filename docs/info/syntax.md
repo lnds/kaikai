@@ -315,6 +315,26 @@ fn main() : Int / Stdout = {
 In a function type, the row appears after `/`: `: T / E1 + E2`.
 Empty row means pure.
 
+A handler may also carry `initially { }` (runs once at installation; its
+value becomes the handler state, read as `state`) and `finally { }`
+(runs on every path that unwinds the scope — normal exit, an abandoned
+`resume`, cancellation; not `panic`). `initially` and the `(init)` form
+fill the same slot, so a handler uses one or the other.
+
+```kaikai
+effect Guard { step() : Unit }
+
+fn main() : Int / Stdout = handle {
+  Guard.step()
+  0
+} with Guard {
+  initially { 7 }
+  finally   { Stdout.print("closed #{int_to_string(state)}") }
+  step(resume) -> resume(())
+  return(x)    -> x
+}
+```
+
 ## Literals and operators
 
 ```kaikai

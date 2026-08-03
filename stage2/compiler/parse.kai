@@ -1970,26 +1970,9 @@ fn parse_handle(p: Parser, t: Token) : PExpr / Console {
                   let cr = parse_handle_clauses(p5, [], None, [])
                   match cr.r {
                     None -> err_e(cr.p)
-                    Some(_) -> {
-                      let handle_e = mk_expr(
-                        EHandle(body, eff_name, eff_tyargs, init_r.r,
-                                alias_r.r, cr.clauses, cr.return_clause),
-                        t.line, t.col)
-                      # A `var` or `let` decl at the top of the clause
-                      # list lifts to a sibling block whose tail is the
-                      # handler. The
-                      # existing `desugar_var_block` pass then converts
-                      # each `SVar` into a wrapping `with State[T] as
-                      # name` handler. When the prelude is empty we emit
-                      # the bare `EHandle` so handlers without `var` pay
-                      # no wrapping overhead.
-                      match cr.prelude {
-                        [] -> ok_e(cr.p, handle_e)
-                        _  -> ok_e(cr.p,
-                                mk_expr(EBlock(cr.prelude, Some(handle_e)),
-                                        t.line, t.col))
-                      }
-                    }
+                    Some(_) ->
+                      finish_handle(p4, t, body, eff_name, eff_tyargs,
+                                    init_r, alias_r.r, cr)
                   }
                 }
                 }
@@ -2111,6 +2094,8 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelud
     } else if not tk_is(id_t.kind, TkIdent) {
       PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
                  clauses: [], return_clause: None, prelude: [], r: None }
+    } else if is_lifecycle_clause_at(p0, id_t) {
+      parse_lifecycle_clause(p0, id_t, acc, rret, prelude)
     } else {
       let name = tok_source(p0.src, id_t)
       let p1 = p_advance(p0)
@@ -2156,6 +2141,110 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelud
         }
       }
     }
+  }
+}
+
+# `initially { }` / `finally { }` — the acquire/release pair inside a
+# handler. Contextual idents, not lexer keywords: an op clause always
+# has `(` after the name, so the `{` lookahead disambiguates and user
+# code may still declare an op called `finally`.
+fn is_lifecycle_clause_at(p: Parser, id_t: Token) : Bool {
+  let name = tok_source(p.src, id_t)
+  if name == "initially" or name == "finally" {
+    p_at(p_skip_newlines(p_advance(p)), TkLbrace)
+  } else { false }
+}
+
+# Both lower to an `HClause` with no params. `initially` is unwrapped by
+# `parse_handle` into the handler-state slot the `(init)` form already
+# fills; `finally` stays in the clause list and is recognised by name.
+fn parse_lifecycle_clause(p: Parser, id_t: Token, acc: [HClause],
+                          rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+
+  let name = tok_source(p.src, id_t)
+  let p1 = p_skip_newlines(p_advance(p))
+  let bt = p_peek(p1)
+  let rb = parse_block(p1, bt)
+  match rb.r {
+    None -> PClauses { p: rb.p, clauses: [], return_clause: None,
+                       prelude: [], r: None }
+    Some(body) ->
+      if lifecycle_clause_seen(acc, name) {
+        PClauses { p: p_error(p, id_t,
+                     string_concat("duplicate `",
+                       string_concat(name, "` clause in handler"))),
+                   clauses: [], return_clause: None, prelude: [], r: None }
+      } else {
+        parse_handle_clauses(rb.p, [HC(name, [], body, id_t.line, id_t.col), ...acc],
+                             rret, prelude)
+      }
+  }
+}
+
+# Assemble the `EHandle` once the clause block has parsed: lift
+# `initially` into the handler-state slot, then wrap in the `var`/`let`
+# prelude block if the clause list opened with one.
+fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
+                 eff_tyargs: [TypeExpr], init_r: PInit,
+                 alias: Option[String], cr: PClauses) : PExpr / Console {
+
+  # `initially { }` fills the same handler-state slot as the `(init)`
+  # form, so the two are mutually exclusive.
+  let init_cl = find_clause_named(cr.clauses, "initially")
+  let dup_init = match init_cl { Some(_) -> init_r.has_init None -> false }
+  if dup_init {
+    err_e(p_error(p4, t, "a handler takes either `(init)` or `initially { }`, not both"))
+  } else {
+    let eff_init = match init_cl {
+      Some(HC(_, _, ib, _, _)) -> Some(ib)
+      None                     -> init_r.r
+    }
+    let handle_e = mk_expr(
+      EHandle(body, eff_name, eff_tyargs, eff_init, alias,
+              drop_clause_named(cr.clauses, "initially"), cr.return_clause),
+      t.line, t.col)
+    # A `var` / `let` prelude lifts to a sibling block whose tail is the
+    # handler; `desugar_var_block` then wraps each `SVar` in its own
+    # `with State[T] as name`. An empty prelude emits the bare `EHandle`.
+    match cr.prelude {
+      [] -> ok_e(cr.p, handle_e)
+      _  -> ok_e(cr.p, mk_expr(EBlock(cr.prelude, Some(handle_e)), t.line, t.col))
+    }
+  }
+}
+
+# A lifecycle clause is parsed with no params; an op clause always has at
+# least `resume`. The emptiness check is what keeps an effect free to
+# declare an op called `initially` / `finally`.
+fn list_is_empty_params(ps: [Param]) : Bool = match ps { [] -> true _ -> false }
+
+fn find_clause_named(cs: [HClause], name: String) : Option[HClause] {
+  match cs {
+    [] -> None
+    [c, ...rest] -> match c {
+      HC(n, ps, _, _, _) ->
+        if n == name and list_is_empty_params(ps) { Some(c) }
+        else { find_clause_named(rest, name) }
+    }
+  }
+}
+
+fn drop_clause_named(cs: [HClause], name: String) : [HClause] {
+  match cs {
+    [] -> []
+    [c, ...rest] -> match c {
+      HC(n, ps, _, _, _) ->
+        if n == name and list_is_empty_params(ps) { drop_clause_named(rest, name) }
+        else { [c, ...drop_clause_named(rest, name)] }
+    }
+  }
+}
+
+fn lifecycle_clause_seen(acc: [HClause], name: String) : Bool {
+  match acc {
+    [] -> false
+    [HC(n, _, _, _, _), ...rest] ->
+      if n == name { true } else { lifecycle_clause_seen(rest, name) }
   }
 }
 
