@@ -31,5 +31,6 @@ render transitive
 render lockfile_reproducibility
 render auto_install
 render git_tag_alias
+render stale_cache_detect
 
 echo "render-fixtures.sh: OK"
