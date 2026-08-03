@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,8 +187,8 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-stage1-rejections
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, kaic1 rejects its negative fixtures"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures"
 
 # kaic1 must reject every `examples/negative/stage1_rejections/*.kai`
 # with the diagnostic its `.kaic1.err.expected` pins. Bootstrap-only
@@ -211,6 +211,14 @@ test-llvm-force-guard:
 	[ $$rc -ne 0 ] || { echo "llvm-force-guard FAIL — forced KAI_LLVM=1 without llvm-config did not stop"; exit 1; }; \
 	echo "$$out" | grep -q "was not found" || { echo "llvm-force-guard FAIL — stop lacked the actionable error:"; echo "$$out"; exit 1; }; \
 	echo "llvm-force-guard OK — forced KAI_LLVM=1 without llvm-config stops with the actionable error"
+
+# `tier1-backend-parity`'s rebuild must never LOWER the tree's backend
+# capability: a keg-only llvm-config (the mac default) makes stage2's
+# auto-detect answer C-only, and the harness then SKIPs with exit 0 over a
+# native backend the same invocation just relinked away. Hermetic sandbox,
+# seconds, no kaic2 dependency.
+test-parity-preserve-native:
+	@bash tools/test-parity-preserve-native.sh
 
 # Exit-code contract of the bounded-run shim every M:N gate classifies hangs
 # with: deadline -> 124, child that survived SIGTERM -> 137. Seconds, no
@@ -872,7 +880,15 @@ tier1-asan: kaic2 test-arena
 # target — not invoked from `tier1` because the cost (~15-30 min) does
 # not belong on every PR locally. SKIPs when kaic2 lacks libLLVM (build
 # it with `make -C stage2 KAI_LLVM=1`).
-tier1-backend-parity: kaic2
+#
+# The rebuild is NOT a declared prerequisite. `stage2/Makefile` auto-detects
+# KAI_LLVM from llvm-config on PATH, and a keg-only LLVM (Homebrew's default)
+# is off PATH — so a plain prerequisite relinks an existing native kaic2 as
+# C-only, and the harness then SKIPs (exit 0) on the very capability the
+# rebuild just removed. Probing first keeps the C-only SKIP intact while
+# making a silent downgrade impossible.
+tier1-backend-parity:
+	@bash tools/parity-preserve-native.sh
 	@TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh
 
 # Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
