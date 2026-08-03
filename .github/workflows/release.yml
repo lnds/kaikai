@@ -165,11 +165,29 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Only the manifest generator is needed here; a full checkout would
+      # pull the whole tree to run one shell script.
+      - name: Checkout the manifest generator
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          sparse-checkout: scripts/gen-latest-json.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # The manifest ships as a release asset, so it is generated from the
+      # same dist/ that is about to be uploaded and lands in the same
+      # `gh release` call. A platform whose build failed is absent from
+      # both, so the manifest can never advertise a missing tarball.
+      - name: Generate latest.json
+        run: |
+          ./scripts/gen-latest-json.sh "${{ steps.tag.outputs.tag }}" dist dist/latest.json
 
       - name: List artifacts
         run: ls -lh dist/
@@ -196,77 +214,6 @@ jobs:
               --generate-notes \
               dist/*
           fi
-
-  publish-manifest:
-    name: Publish latest.json to the site
-    needs: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      # persist-credentials: false keeps this checkout's ephemeral
-      # GITHUB_TOKEN out of a global http.extraheader, which would
-      # otherwise override the site checkout's PAT on push.
-      - name: Checkout work repo at tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          persist-credentials: false
-
-      # Read the assets back from the published release rather than from
-      # the build job's artifacts: the manifest must describe what users
-      # can actually download, so an upload that silently dropped a
-      # platform produces a smaller manifest, never a broken URL.
-      - name: Download published assets
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-        run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          mkdir -p dist
-          gh release download "$tag" --repo kaikailang-org/kaikai \
-            --pattern '*.tar.gz.sha256' --dir dist
-          # The tarballs themselves are ~18 MB each and the manifest only
-          # needs their names; stub them so the generator's per-platform
-          # scan sees the same set without the download cost.
-          for sum in dist/*.tar.gz.sha256; do
-            : > "${sum%.sha256}"
-          done
-          ls -l dist/
-
-      - name: Generate latest.json
-        run: |
-          ./scripts/gen-latest-json.sh "${{ steps.tag.outputs.tag }}" dist latest.json
-
-      - name: Checkout site
-        uses: actions/checkout@v4
-        with:
-          repository: kaikailang-org/kaikai-site
-          token: ${{ secrets.TAP_PAT }}
-          path: site
-
-      - name: Commit and push manifest
-        run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          cp latest.json site/public/latest.json
-          cd site
-          if git diff --quiet -- public/latest.json; then
-            echo "manifest already current for $tag; nothing to push"
-            exit 0
-          fi
-          git config user.name "kaikai-release-bot"
-          git config user.email "kaikai-release-bot@users.noreply.github.com"
-          git add public/latest.json
-          git commit -m "chore(dist): publish latest.json for ${tag}"
-          git push origin HEAD
 
   update-tap:
     name: Update Homebrew tap formula
@@ -440,43 +387,3 @@ jobs:
           git push public HEAD:refs/heads/main --force
           git tag -f "$tag"
           git push public "refs/tags/${tag}" --force
-
-  verify-manifest:
-    name: Verify latest.json is served
-    needs: publish-manifest
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      # A pushed commit is not a served file: the site still has to
-      # redeploy. Poll until the live manifest names this tag, and fail
-      # the release if it never does — a release whose manifest never
-      # went live is the same silent-staleness bug in another form, and
-      # `kai upgrade` would keep resolving the previous version.
-      - name: Poll the live manifest
-        run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          url="https://kaikai-lang.org/latest.json"
-          for attempt in $(seq 1 20); do
-            served="$(curl -fsSL --max-time 20 "$url" 2>/dev/null \
-              | tr -d ' \n\r\t' \
-              | sed -n 's/.*"tag":"\([^"]*\)".*/\1/p')" || served=""
-            if [ "$served" = "$tag" ]; then
-              echo "latest.json serves $tag after $attempt attempt(s)"
-              curl -fsSL "$url"
-              exit 0
-            fi
-            echo "attempt $attempt: serving '${served:-<unreachable>}', want $tag"
-            sleep 30
-          done
-          echo "::error::latest.json at $url never served $tag — kai upgrade will keep resolving the previous version until the site redeploys"
-          exit 1
