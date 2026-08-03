@@ -49,11 +49,12 @@ detect_platform() {
 }
 
 # ---- release discovery -----------------------------------------------------
-# Preferred path: a static manifest on the project site, which costs no
-# GitHub API quota and works on a network that throttles api.github.com.
+# Preferred path: a static manifest published as an asset of the newest
+# release. This is github.com, not api.github.com, so it costs no API
+# quota and works on a network that throttles api.github.com.
 # KAIKAI_DIST_BASE repoints it at a mirror.
 dist_base() {
-  printf '%s\n' "${KAIKAI_DIST_BASE:-https://kaikai-lang.org}"
+  printf '%s\n' "${KAIKAI_DIST_BASE:-https://github.com/$REPO/releases/latest/download}"
 }
 
 # Print "<tag>\t<url>\t<sha256>" for platform $1, or fail quietly so the

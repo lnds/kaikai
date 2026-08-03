@@ -85,11 +85,19 @@ supported path.
 (default `~/.kaikai`). A Homebrew-managed install is refused with a
 pointer to `brew upgrade kaikai`.
 
-The version is resolved from a static manifest published at
-`https://kaikai-lang.org/latest.json` — one file, no API call, so the
-unauthenticated GitHub API's 60-requests-per-hour-per-IP quota is not on
-the install path. Tarballs are still hosted on GitHub Releases; only the
-version lookup moved.
+The version is resolved from a static manifest published as a release
+asset, reached through the `latest` redirect:
+
+```
+https://github.com/kaikailang-org/kaikai/releases/latest/download/latest.json
+```
+
+One file, no API call. That URL is on `github.com`, not
+`api.github.com`, so the unauthenticated API's
+60-requests-per-hour-per-IP quota is not on the install path — the same
+unmetered path the tarball download already used. GitHub repoints
+`latest` at the newest non-draft release automatically, so the manifest
+follows each version bump with no separate publishing step.
 
 The manifest names the current release and, per platform, the tarball URL
 and its SHA-256:
@@ -118,14 +126,15 @@ GitHub tags API, which is how they resolved the version before.
 
 | Variable            | Effect |
 |---------------------|--------|
-| `KAIKAI_DIST_BASE`  | Base URL serving `latest.json` (default `https://kaikai-lang.org`). Point it at a mirror to install from your own host. |
+| `KAIKAI_DIST_BASE`  | Base URL serving `latest.json` (default: the newest release's assets). Point it at a mirror to resolve *and* download from your own host. |
 | `GITHUB_TOKEN`      | Lifts the 60/h rate limit on the fallback path. |
 | `KAIKAI_HOME`       | Install prefix (default `~/.kaikai`). |
 
-`release.yml` generates the manifest from the assets it just published
-and pushes it to the site, then polls until the live file names the new
-tag — a manifest that never goes live fails the release rather than
-leaving `kai upgrade` silently pinned to the previous version.
+`release.yml` generates the manifest from the very tarballs it is about
+to publish and uploads it alongside them in the same `gh release` call.
+Manifest and artifacts are therefore always the same release: there is
+no window in which they disagree, and no separate publishing step that
+could leave `kai upgrade` pinned to the previous version.
 
 ## Verifying the install
 
