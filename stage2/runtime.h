@@ -3146,6 +3146,14 @@ struct KaiFiber {
      * Under N=1 every fiber's home_thread is 0, the copy branch is never
      * taken, and an _Atomic int is a plain aligned int on our targets. */
     _Atomic int home_thread;
+    /* M:N — when set, this fiber may only ever run on thread 0, the OS
+     * thread `main` entered on. Thread-affine C libraries (AppKit, and
+     * through it GLFW/SDL/GTK) trap if initialised or pumped off the
+     * process main thread, so the entry fiber carries the pin and every
+     * other fiber keeps migrating freely. Read by the thief (skip) and by
+     * enqueue (route to thread 0 instead of the caller's slot); never
+     * written after spawn. */
+    int pinned_main;
     /* M:N — a cross-thread wake that arrives while this fiber is still
      * RUNNING (it enqueued its recv-waiter but has not yet reached the
      * park swap) is recorded here instead of lost. The park path checks
@@ -3247,6 +3255,7 @@ struct KaiNursery {
     NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
     NULL, NULL, NULL,    /* nursery_top, scope_sibling_next, scope_nursery */ \
     0,                   /* home_thread — thread 0 is the main scheduler */ \
+    0,                   /* pinned_main — a scheduler root never migrates */ \
     0,                   /* wake_pending */                              \
     0,                   /* pending_park — not a reactor park */          \
     0,                   /* reactor_fired */                              \
@@ -14497,13 +14506,17 @@ static inline void kai_fiber_slot_unlock_at(int home) {
  * FIFO the pre-M:N runtime used — lock-free and byte-identical. */
 static void kai_sched_enqueue(KaiFiber *f) {
     if (kai_nthreads > 1) {
-        KaiSchedSlot *s = kai_sched_slot();
+        /* A main-pinned fiber goes on thread 0's deque wherever the enqueue
+         * runs from — routing it to the caller's slot would hand it to that
+         * thread, which is exactly the migration the pin forbids. */
+        int owner = f->pinned_main ? 0 : kai_thread_id;
+        KaiSchedSlot *s = &kai_sched_slots[owner];
         pthread_mutex_lock(&s->mu);
         /* Publish ownership under the same lock that publishes the fiber
          * onto this slot's steal list: a reader that finds `f` here must
          * see home_thread pointing at this slot, or a cross-thread unpark
          * would lock a slot the fiber is not queued on. */
-        f->home_thread = kai_thread_id;
+        f->home_thread = owner;
         f->sched_next = NULL;
         if (s->steal_tail) s->steal_tail->sched_next = f;
         else               s->steal_head = f;
@@ -14553,6 +14566,12 @@ static KaiFiber *kai_sched_steal_from(int victim) {
     if (!s->live) return NULL;
     pthread_mutex_lock(&s->mu);
     KaiFiber *f = s->steal_head;
+    /* A main-pinned fiber is not stealable: taking it would run it here.
+     * Only the head is a steal candidate, so a pinned head just makes this
+     * victim unstealable for now — thread 0 dequeues it next. Thread 0
+     * never reaches this (it is never its own victim), so no thread-id
+     * test is needed: `pinned_main` implies victim 0. */
+    if (f && f->pinned_main) f = NULL;
     if (f) {
         s->steal_head = f->sched_next;
         if (!s->steal_head) s->steal_tail = NULL;
@@ -15456,6 +15475,11 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!root) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     root->home_thread = 0;
+    /* Thread 0 IS the OS thread the process entered `main` on, so pinning
+     * the entry fiber here is what makes `main` observably main-thread —
+     * the guarantee a thread-affine C library (AppKit/GLFW/SDL/GTK) needs
+     * from its caller. Every fiber `main` spawns stays freely stealable. */
+    root->pinned_main = 1;
     root->evidence_top = NULL;
     kai_fiber_init_ctx_sized(root, kai_main_fiber_stack_size());
     /* Re-point its makecontext entry from the generic trampoline to the

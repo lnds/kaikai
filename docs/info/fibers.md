@@ -141,6 +141,10 @@ KAI_THREADS=1 ./my_program
 - A blocking FFI call stalls one worker thread, not the program.
 - The I/O reactor is shared: heavily mixed I/O+CPU workloads may
   serialize on it.
+- `main` is pinned to the OS thread the process entered on and never
+  migrates, so a thread-affine C library (AppKit/GLFW/SDL/GTK) can be
+  driven straight from `main` at any N — see `kai info ffi`. Spawned
+  fibers migrate freely; only the entry fiber carries the pin.
 
 ## NOT IN KAIKAI
 
