@@ -177,6 +177,22 @@ to `stage*/`, `stdlib/`, `examples/`, `demos/`, `bin/kai`, the
 script itself, or the workflow). Locally it runs as
 `tools/test-backend-parity.sh` from the repo root after `make all`.
 
+The `make tier1-backend-parity` convenience target rebuilds `kaic2`
+through `tools/parity-preserve-native.sh` rather than as a plain
+prerequisite. `stage2/Makefile` resolves an unset `KAI_LLVM` from
+`llvm-config` on PATH, and a keg-only LLVM (Homebrew's default) is
+off PATH — so a plain prerequisite relinks an existing *native*
+`kaic2` as C-only, after which the harness probes native, finds it
+gone, and exits 0 with SKIP: a green that verified nothing, over a
+capability the same invocation destroyed. The wrapper probes the
+tree's backend capability *before* the rebuild and never lowers it:
+a native tree rebuilds with `KAI_LLVM=1` (resolving a keg-only
+`llvm-config` via `brew --prefix`) or stops loud; a C-only tree
+rebuilds C-only and reaches the intended SKIP; and `KAI_LLVM=1`
+that does not yield native fails rather than reporting SKIP over an
+explicit request. `make test-parity-preserve-native` (tier 0,
+hermetic) locks all four.
+
 **Skip discipline.** Two skip mechanisms, used differently:
 
 - `tools/backend-parity-skips.txt` — one line per fixture:

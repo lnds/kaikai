@@ -46,7 +46,10 @@ case "$TARGET_BACKEND" in
     # the capability instead of clang: a C-only kaic2 rejects --emit=native
     # with a known sentinel. SKIP (success) when native is unavailable —
     # the native gate runs only where libLLVM is present (tier1-native),
-    # never silently degrading a C-only checkout to a pass.
+    # never silently degrading a C-only checkout to a pass. This SKIP is
+    # only honest when nothing upstream REMOVED native first; the
+    # `tier1-backend-parity` target guarantees that via
+    # tools/parity-preserve-native.sh.
     probe="$(mktemp)"; mv "$probe" "$probe.kai"; probe="$probe.kai"
     printf 'fn main() : Int = 0\n' > "$probe"
     if ! "$KAI" build --backend=native "$probe" -o "${probe%.kai}.bin" >/dev/null 2>&1; then
