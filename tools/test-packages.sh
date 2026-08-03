@@ -193,6 +193,11 @@ run_positive  "8-stdlib_across_deps"  "stdlib_across_deps/consumer" "stdlib_acro
 # #9 — auto-install on first compile (regression guard for #512)
 run_check_script "9-auto_install"     "auto_install/check.sh"
 
+# The other arm of the same check: a lock naming a cache dir that is
+# gone must re-resolve. auto_install covers no-lock; this covers the
+# lock walk, which fails open when the host awk rejects its regex.
+run_check_script "stale_cache_detect" "stale_cache_detect/check.sh"
+
 # Pre-existing driver-level checks — keep them green to confirm
 # the broader package surface still works.
 run_check_script "lockfile_repro"     "lockfile_reproducibility/check.sh"
