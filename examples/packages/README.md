@@ -122,7 +122,14 @@ issue's coverage matrix.
   isolates the cache, and asserts `kai run` recreates the lock
   + produces the expected output on the very first call.
 
-Run the whole 14-fixture harness:
+- **`stale_cache_reinstall/`** (regression guard for #1557) — the
+  other half of `needs_auto_install`: the lock exists but the dep's
+  cache dir was pruned. `check.sh` primes the cache, deletes it, and
+  asserts the rebuild both re-installs the dep and emits no `awk:`
+  diagnostics — the detector's awk regex must stay portable across
+  BSD and GNU awk.
+
+Run the whole harness:
 
 ```sh
 tools/test-packages.sh
