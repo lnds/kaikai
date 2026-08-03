@@ -7,10 +7,10 @@
 # verifies its SHA-256, extracts it to ~/.kaikai/, and adds
 # ~/.kaikai/bin to PATH. Independent of Homebrew; the two coexist.
 #
-# This iteration supports macOS arm64 (darwin-arm64) only. Other
-# platforms exit with a clear message — Linux/x86_64 are a later
-# iteration. The binary is self-contained (libLLVM linked), so no
-# system LLVM is required.
+# Supported platforms are the ones the release matrix publishes:
+# darwin-arm64 and linux-x86_64. Anything else exits with a clear
+# message rather than a 404. The binary is self-contained (libLLVM
+# linked statically), so no system LLVM is required.
 
 set -eu
 
@@ -26,18 +26,24 @@ need() {
 }
 
 # ---- platform detection ----------------------------------------------------
-# Only darwin-arm64 is published today. Anything else gets a clear
-# exit, not a half-working install.
+# Sets PLATFORM to the "<os>-<arch>" token naming the release tarball.
+# The token MUST match what scripts/build-release.sh emits on the release
+# runner, which uses a raw `uname -m`. Hence aarch64 is NOT folded into
+# arm64: a Linux arm64 tarball would be named linux-aarch64, so folding
+# would build a 404. Only Darwin's spelling is normalised.
+# tools/test-release-platforms.sh asserts both sides agree.
 detect_platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
   case "$os" in
     Darwin) os_name="darwin" ;;
-    *) err "unsupported OS '$os'. Only macOS (darwin-arm64) is supported in this iteration." ;;
+    Linux)  os_name="linux" ;;
+    *) err "unsupported OS '$os'. kaikai publishes macOS and Linux tarballs." ;;
   esac
-  case "$arch" in
-    arm64|aarch64) arch_name="arm64" ;;
-    *) err "unsupported architecture '$arch'. Only arm64 is supported in this iteration (Linux/x86_64 come later)." ;;
+  case "$os_name-$arch" in
+    darwin-arm64|darwin-aarch64) arch_name="arm64" ;;
+    linux-x86_64)                arch_name="x86_64" ;;
+    *) err "unsupported platform '$os_name-$arch'. Published tarballs: darwin-arm64, linux-x86_64." ;;
   esac
   PLATFORM="$os_name-$arch_name"
 }

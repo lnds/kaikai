@@ -85,9 +85,10 @@ brew upgrade kaikai     # to update
 A `kai upgrade` on a Homebrew install defers to `brew upgrade` rather
 than touching the Cellar.
 
-> Linux and x86_64 are a later iteration; the installer reports clearly
-> when run on an unsupported platform. To run kaikai on those platforms
-> today, build the compiler from source (path **B**).
+> Released tarballs cover **darwin-arm64** and **linux-x86_64**. The
+> Homebrew formula is macOS-only. On any other platform (macOS Intel,
+> Linux arm64) the installer reports the gap rather than failing on a
+> 404 — build the compiler from source there (path **B**).
 
 ## Quickstart
 

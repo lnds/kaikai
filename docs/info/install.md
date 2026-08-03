@@ -83,7 +83,11 @@ kai build --debug   app.kai    # -O0, full DWARF line tables, source debug
 
 ## Platforms
 
-This iteration ships darwin-arm64 only. On any other platform the
-installer and `kai upgrade` exit with a clear message; build from
-source (see the README) meanwhile. Linux and x86_64 are a later
-iteration.
+Released tarballs cover `darwin-arm64` and `linux-x86_64`. The
+platform token comes from `uname`, and names the release asset
+`kaikai-v<version>-<platform>.tar.gz`.
+
+On a platform with no published tarball — macOS Intel, Linux arm64 —
+the installer and `kai upgrade` exit with a clear message instead of
+downloading a URL that does not exist; build from source (see the
+README) meanwhile. The Homebrew formula is macOS-only.
