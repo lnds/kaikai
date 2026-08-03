@@ -91,13 +91,15 @@ This makes "wrap the body in `handle { ... } with Cancel { raise(_)
 SIGINT-driven supervisor that calls `Spawn.cancel(server)` runs the
 server's cleanup before the fiber terminates.
 
-The handler must sit AT the scope holding the resource. A non-local
-exit destroys the intervening frames, so a `Cancel` handler installed
-further out never sees the inner scope, and its resource leaks. The
-same applies to any handler clause that abandons the continuation
-while an inner scope holds a resource: there is no `finally`, and
-nothing releases non-memory resources on those paths. Perceus still
-frees memory.
+A `Cancel` handler only fires at the scope where it is installed, so
+one placed further out does not see an inner scope's resource. To
+release a resource regardless of where the cancel is handled, give the
+owning scope's handler a `finally { }` clause: it runs on every
+unwinding exit, cancellation included, and `initially { }` acquires
+into the handler state so both halves live in one construct
+(`kai info effects` §*Cleanup*). The same applies to any clause that
+abandons the continuation over an inner scope. Perceus frees memory on
+all these paths regardless.
 
 Nested handles resolve innermost-first, exactly as a synchronous
 `Cancel.raise()` would: only the innermost `with Cancel` in scope

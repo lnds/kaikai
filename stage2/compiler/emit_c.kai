@@ -5889,7 +5889,12 @@ fn emit_clause_sig(c: ClauseInfo, effs: [Decl]) : String {
 }
 
 fn emit_clause_forward(c: ClauseInfo, effs: [Decl]) : String =
-  cat2(emit_clause_sig(c, effs), ";\n")
+  match c {
+    CI(line, col, _, op_name, cps, _, _, enc_fn, _) ->
+      if is_lifecycle_clause(op_name, cps) {
+        cat2(emit_cleanup_sig(enc_fn, line, col), ";\n")
+      } else { cat2(emit_clause_sig(c, effs), ";\n") }
+  }
 
 fn emit_clause_forwards(cs: [ClauseInfo], effs: [Decl]) : String =
   concat_all(map(cs, (c) => emit_clause_forward(c, effs)))
@@ -5974,7 +5979,57 @@ fn clause_state_prologue(stateful: Bool) : String {
   } else { "" }
 }
 
+# Stable C symbol for a handler's `finally` thunk. Same
+# (enc_fn, line, col) triple the clause-fn and env-struct names use.
+fn handle_cleanup_sym(enc_fn: String, line: Int, col: Int) : String =
+  concat_all([
+    "_kai_", enc_fn, "__finally_",
+    int_to_string(line), "_", int_to_string(col)
+  ])
+
+# Signature of the `finally` thunk. Emitted `static`; modular linkage
+# strips the keyword from definition and prototype alike. Returns the
+# block's value, which the runtime drops.
+fn emit_cleanup_sig(enc_fn: String, line: Int, col: Int) : String =
+  concat_all(["static KaiValue *", handle_cleanup_sym(enc_fn, line, col), "(void *_self)"])
+
+# `finally` compiles to a `void(void *)` thunk instead of an op clause:
+# it takes no args, resumes nothing, and returns nothing. The `void *`
+# is the handler's `Ev`, so a stateful handler's cleanup reads the
+# resource `initially` put in `state`.
+fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Console {
+
+  match c {
+    CI(line, col, eff, _, _, body, stateful, enc_fn, caps) -> {
+      let stateful_locals = if stateful { ["state", "log"] } else { [] }
+      let body_lcs = list_append(list_append(cx.lcs, stateful_locals), caps)
+      let body_c = emit_expr(src, body, emit_ctx_with_lcs(cx, body_lcs))
+      let hmo = eff_mo(cx.effs, eff)
+      let self_bind = concat_all([
+        "    ", ev_name(eff, hmo), " *self = (", ev_name(eff, hmo), " *) _self; (void) self;\n"
+      ])
+      concat_all([
+        emit_cleanup_sig(enc_fn, line, col), " {\n",
+        self_bind,
+        clause_state_prologue(stateful),
+        emit_clause_env_prologue(cx.cls, line, col, enc_fn, caps),
+        "    return ", body_c, ";\n",
+        "}\n\n"
+      ])
+    }
+  }
+}
+
 fn emit_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Console {
+
+  match c {
+    CI(_, _, _, op_name, cps, _, _, _, _) ->
+      if is_lifecycle_clause(op_name, cps) { emit_cleanup_thunk(src, c, cx) }
+      else { emit_op_clause_body(src, c, cx) }
+  }
+}
+
+fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Console {
 
   match c {
     CI(line, col, _, _, _, body, stateful, enc_fn, caps) -> {
@@ -7753,6 +7808,20 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
   # unless it has volatile-qualified type — under `-O2` the else
   # branch otherwise reads a stale NULL and the consumer segfaults.
   let hmo = eff_mo(cx.effs, eff_name)
+  # `finally { }`: armed on the node so every unwind path runs it, and
+  # called explicitly on the normal exit (which never touches the node).
+  # `cleanup_done` makes the pair idempotent when both fire.
+  let fin_c = match find_hclause(clauses, "finally") {
+    Some(_) -> {
+      # Keyed on the HANDLE's position, like every other clause symbol.
+      let thunk = handle_cleanup_sym(handle_enc_fn_at(cx.cls, hline, hcol), hline, hcol)
+      Cleanup {
+        arm: concat_all(["kai_evidence_set_cleanup(&_node, &", thunk, ", (void *) &_ev); "]),
+        run: concat_all(["kai_evidence_run_cleanup(&_node); "])
+      }
+    }
+    None -> Cleanup { arm: "", run: "" }
+  }
   concat_all([
     "({ ", ev_name(eff_name, hmo), " _ev = {0}; ",
     "_ev.handler_id = kai_fresh_handler_id(); ",
@@ -7767,7 +7836,9 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     alias_id_c,
     "if (setjmp(_jmp) == 0) { ",
       "kai_evidence_push_with_jmp(&_node, \"", eff_name, "\", &_ev, &_jmp, (KaiValue **) &_discard); ",
+      fin_c.arm,
       "_body_result = ", body_c, "; ",
+      fin_c.run,
       "kai_evidence_pop(); ",
     "} else { ",
       "_body_result = _discard; ",
@@ -7775,6 +7846,21 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     ret_c,
     " })"
   ])
+}
+
+type Cleanup = { arm: String, run: String }
+
+# The lifecycle `finally { }` only — an op clause that happens to be named
+# `finally` carries params and is not one.
+fn find_hclause(cs: [HClause], name: String) : Option[HClause] {
+  match cs {
+    [] -> None
+    [c, ...rest] -> match c {
+      HC(n, ps, _, _, _) ->
+        if n == name and is_lifecycle_clause(n, ps) { Some(c) }
+        else { find_hclause(rest, name) }
+    }
+  }
 }
 
 # R9: keep only the names that are actually in scope at the install
@@ -7868,13 +7954,20 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
   match cs {
     [] -> ""
     [c, ...rest] -> match c {
-      HC(op_name, _, _, _, _) -> {
-        let enc_fn = lookup_clause_enc_fn(cls, hline, hcol, op_name)
-        concat_all([
-          "_ev.", op_name, " = &", clause_fn_name(enc_fn, hline, hcol, op_name), "; ",
+      HC(op_name, cps, _, _, _) ->
+        # `finally` is not an op: it has no `Ev` slot and is wired to the
+        # evidence node instead.
+        if is_lifecycle_clause(op_name, cps) {
           emit_clause_assignments(eff_name, rest, hline, hcol, cls)
-        ])
-      }
+        } else {
+        {
+          let enc_fn = lookup_clause_enc_fn(cls, hline, hcol, op_name)
+          concat_all([
+            "_ev.", op_name, " = &", clause_fn_name(enc_fn, hline, hcol, op_name), "; ",
+            emit_clause_assignments(eff_name, rest, hline, hcol, cls)
+          ])
+        }
+        }
     }
   }
 }

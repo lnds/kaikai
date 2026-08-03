@@ -3399,6 +3399,8 @@ static void kai_set_active_fiber(KaiFiber *f) {
     kai_active_fiber = f;
 }
 
+static void kai_evidence_unwind_all(void);
+
 /* A recoverable runtime trap (index out of range, divide by zero,
  * non-exhaustive match). With a fiber pad installed, unwind to it
  * like Cancel — the trampoline reports the fiber TRAPPED and a
@@ -3410,6 +3412,7 @@ static void kai_trap_abort(const char *msg) {
     if (f && f->cancel_pad_set) {
         f->trapped  = 1;
         f->trap_msg = msg;
+        kai_evidence_unwind_all();
         longjmp(f->cancel_pad, 1);
         /* Unreachable. */
     }
@@ -16366,7 +16369,34 @@ struct KaiEvidence {
      * handlers always resume, so they never longjmp). */
     jmp_buf     *handle_jmp;
     KaiValue   **discard_slot;
+    /* `finally { }`: run when the scope exits, however it exits. The
+     * thunk runs with `evidence_top` restored to this node's parent, so
+     * it sees the handlers that were live when the handler was
+     * installed — not those at the jump site, which are already dead.
+     * NULL on every handler that declares no `finally`, which is what
+     * keeps the unwind walk free for them. Returns the block's value,
+     * which the caller drops — the clause is run for its effect. */
+    KaiValue  *(*cleanup)(void *);
+    void        *cleanup_env;
+    /* Guards against running the same cleanup twice when a normal exit
+     * races an unwind through the same node. */
+    int          cleanup_done;
 };
+
+/* Run one node's `finally` in its installation-time evidence context.
+ * Restoring `evidence_top` to `node->parent` is load-bearing: a cleanup
+ * that performs an effect must dispatch against the handlers live when
+ * the node was pushed, otherwise it walks a chain of dead frames. */
+static void kai_evidence_run_cleanup(KaiEvidence *node) {
+    if (node == NULL || node->cleanup == NULL || node->cleanup_done) return;
+    node->cleanup_done = 1;
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *saved = f->evidence_top;
+    f->evidence_top = node->parent;
+    KaiValue *r = node->cleanup(node->cleanup_env);
+    f->evidence_top = saved;
+    if (r != NULL) kai_decref(r);
+}
 
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
@@ -16379,6 +16409,9 @@ static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *ha
     node->handler      = handler;
     node->handle_jmp   = NULL;
     node->discard_slot = NULL;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
     f->evidence_top    = node;
 }
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
@@ -16391,6 +16424,9 @@ static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, 
     node->handler      = handler;
     node->handle_jmp   = NULL;
     node->discard_slot = NULL;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
 }
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
@@ -16407,7 +16443,19 @@ static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
     node->handler      = handler;
     node->handle_jmp   = jmp;
     node->discard_slot = discard_slot;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
     f->evidence_top    = node;
+}
+
+/* Arm a pushed node's `finally`. Separate from the push so the common
+ * handler — no `finally` — keeps the existing two-call prologue and the
+ * cleanup fields stay NULL. */
+static void kai_evidence_set_cleanup(KaiEvidence *node, KaiValue *(*fn)(void *), void *env) {
+    node->cleanup      = fn;
+    node->cleanup_env  = env;
+    node->cleanup_done = 0;
 }
 
 /* Pop the topmost Evidence node. The compiled `handle` epilogue
@@ -16431,9 +16479,28 @@ static void kai_evidence_pop(void) {
  * to reuse that stack storage links itself as its own parent, and every
  * later lookup walks the resulting cycle forever. */
 static void kai_evidence_unwind_to(KaiEvidence *node) {
-    if (node != NULL) {
-        kai_current_fiber()->evidence_top = node->parent;
+    if (node == NULL) return;
+    /* Run every `finally` between the jump site and the target, innermost
+     * first, before the chain is truncated. `node` itself is included:
+     * the jump lands past its handler, so its scope is exiting too.
+     * Bounded by the same chain the truncation already walked implicitly;
+     * a handler with no `finally` costs one NULL check. */
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *stop = node->parent;
+    for (KaiEvidence *n = f->evidence_top; n != NULL && n != stop; n = n->parent) {
+        kai_evidence_run_cleanup(n);
     }
+    f->evidence_top = stop;
+}
+
+/* Cancellation longjmps straight to the fiber's `cancel_pad` without a
+ * target node, so it needs the whole remaining chain drained. */
+static void kai_evidence_unwind_all(void) {
+    KaiFiber *f = kai_current_fiber();
+    for (KaiEvidence *n = f->evidence_top; n != NULL; n = n->parent) {
+        kai_evidence_run_cleanup(n);
+    }
+    f->evidence_top = NULL;
 }
 
 /* Walk the current fiber's stack and return the innermost handler
@@ -16525,6 +16592,7 @@ static void kai_check_cancel_yield_point(void) {
     f->cancel_delivered = 1;
 
     if (user_node == NULL) {
+        kai_evidence_unwind_all();
         longjmp(f->cancel_pad, 1);
         /* Unreachable. */
     }
@@ -16557,6 +16625,7 @@ static void kai_check_cancel_yield_point(void) {
      * compiler bug (raise() returns Nothing — there is no Nothing
      * value to feed back). If it ever happens, fall back to the
      * pad so the fiber still terminates cleanly. */
+    kai_evidence_unwind_all();
     longjmp(f->cancel_pad, 1);
     /* Unreachable. */
 }

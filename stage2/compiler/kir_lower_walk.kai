@@ -362,8 +362,8 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # (install + setjmp-split + inline body + return clause), the same
   # block-building discipline as if/match (asu review). The clause bodies
   # are separate `KFnClause`s generated in `lower_to_kir`.
-  EHandle(body, eff, _, init_opt, alias_opt, _, ret_opt) ->
-    lower_handle(x, body, eff, init_opt, alias_opt, ret_opt, st)
+  EHandle(body, eff, _, init_opt, alias_opt, clauses, ret_opt) ->
+    lower_handle(x, body, eff, init_opt, alias_opt, clauses, ret_opt, st)
 
   # Postfix `!` — Option/Result propagation. `expr!` unwraps the success
   # payload, or EARLY-RETURNS the whole `None`/`Err` from the enclosing fn
@@ -2570,12 +2570,19 @@ fn match_has_discriminating_pattern(arms: [Arm]) : Bool = match arms {
 # inline over `result` at the merge. The clause bodies are separate
 # `KFnClause`s (generated in `lower_to_kir`).
 fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
-                alias_opt: Option[String], ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
+                alias_opt: Option[String], clauses: [HClause],
+                ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
   let sym = cat3("_kai_handler_", int_to_string(x.line), cat2("_", int_to_string(x.col)))
+  let has_fin = handle_has_finally(clauses)
   match lower_init_opt(init_opt, st) { LResOpt(initv, st1) ->
     match ls_fresh_reg(st1) { LSReg(result, st2) -> {
       let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
-      let st4 = ls_emit(st3, KInstall(eff, sym, initv, alias_opt, kpos_of(x)))
+      let st3b = ls_emit(st3, KInstall(eff, sym, initv, alias_opt, kpos_of(x)))
+      # Arm the cleanup right after the push, so every unwind past this
+      # node runs it; the normal exit runs it explicitly before the pop.
+      let st4 = if has_fin {
+        ls_emit(st3b, KSetCleanup(eff, sym, kir_cleanup_sym(x.line, x.col), kpos_of(x)))
+      } else { st3b }
       # A handle carrying `init` state is stateful — its return clause sees
       # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
       let stateful = match initv { Some(_) -> true None -> false }
@@ -2583,8 +2590,14 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
       # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
       # the second push self-cycles the parent chain (refs #789).
-      lower_handle_fork(x, body, eff, sym, result, stateful, ret_opt, st4)
+      lower_handle_fork(x, body, eff, sym, result, stateful, has_fin, ret_opt, st4)
     } } }
+}
+
+fn handle_has_finally(cs: [HClause]) : Bool = match cs {
+  [] -> false
+  [HC(n, ps, _, _, _), ...rest] ->
+    if is_lifecycle_clause(n, ps) { true } else { handle_has_finally(rest) }
 }
 
 # The setjmp split: `condbr (setjmp eff) ? Ldiscard : Lbody`. Lbody runs
@@ -2593,11 +2606,11 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
 # `stateful` (the handle carries `init` state) gates the return clause's
 # `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
 fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
-                     stateful: Bool, ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
+                     stateful: Bool, has_fin: Bool, ret_opt: Option[HReturn], st: LowerSt) : LRes / Console =
   match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, lret, st3)
+      let st4 = lower_handle_body(body, eff, sym, result, has_fin, lret, st3)
       let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
       lower_handle_ret(eff, sym, result, stateful, ret_opt, lret, st5)
     } } }
@@ -2605,10 +2618,13 @@ fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: Stri
 # Lbody: lower the body inline, store it into result, pop the evidence,
 # branch to the merge. The pop sits on the NORMAL exit only — the
 # discard path's longjmp already unwound past it (asu soundness note).
-fn lower_handle_body(body: Expr, eff: String, sym: String, result: String, lret: String, st: LowerSt) : LowerSt / Console =
+fn lower_handle_body(body: Expr, eff: String, sym: String, result: String,
+                     has_fin: Bool, lret: String, st: LowerSt) : LowerSt / Console =
   match lower_expr(body, st) { LRes(bv, st1) -> {
     let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
-    let st3 = ls_emit(st2, KPop(eff, sym, kpos_of(body)))
+    # The cleanup runs BEFORE the pop, so it still sees its own node.
+    let st2b = if has_fin { ls_emit(st2, KRunCleanup(eff, sym, kpos_of(body))) } else { st2 }
+    let st3 = ls_emit(st2b, KPop(eff, sym, kpos_of(body)))
     ls_seal(st3, KBr(lret, kpos_of(body)), lret)
   } }
 

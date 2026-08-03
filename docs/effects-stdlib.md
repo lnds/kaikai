@@ -600,14 +600,13 @@ user effect (no runtime default handler): a forcing consumer must
 `handle ... with ReadFault` to choose a policy, or the typer reports
 `effect not handled: ReadFault`.
 
-> **v1 limitation (issue #801, 2026-06-10):** on the abort path (a
-> `bad_chunk` handler that does not resume), the producer's
-> `close_file` — which runs after the read loop the fault unwound — is
-> skipped, so the fd leaks. Same honesty class as #771's cancel-safety
-> note; there is no `finally`, and producer-side interception would
-> shadow the consumer's skip handler. Closed later by cancel-aware
-> bracket work. `examples/effects/stream_abort_leak.kai` documents it as
-> a measured fact.
+The abort path (a `bad_chunk` handler that does not resume) still
+releases the producer's handle: `read_lines` and `write_lines` bracket
+the file with a handler carrying `initially` / `finally`, so
+`close_file` runs on the unwind even though the fault jumps clean over
+the read loop. The producer does not interpret `ReadFault` to achieve
+this — doing so would shadow the consumer's skip-or-abort policy.
+`examples/effects/stream_abort_leak.kai` pins the balance.
 
 > **v1 status (issue #771, 2026-06-09):** the five chunked ops park
 > the *fiber* and offload their blocking `open`/`read`/`write`/
@@ -1843,24 +1842,29 @@ resource closing (closing file handles, rolling back
 transactions) requires an explicit `Cancel` handler at the
 scope that owns the resource.
 
-> **v1 status (2026-08-02):** read "at the scope that owns the
-> resource" strictly — it is the whole guarantee, and the only one.
-> Measured on this checkout across six non-local-exit paths, a
-> handler installed *at* the resource scope does run its cleanup, on
-> the scheduler-driven `Spawn.cancel` path included. Every other path
-> skips it: a `Cancel` handler installed *outside* the resource
-> scope, an outer handler for any effect that abandons the
-> continuation while an inner scope holds the resource, the
-> `ReadFault` abort path (§*ReadFault*), and `panic`. The cause is
-> shared and mechanical — a non-local exit `longjmp`s past the
-> intervening C frames and truncates the evidence chain rather than
-> walking it — so no arrangement of user code recovers those frames.
-> A producer cannot defend itself by handling the fault effect: doing
-> so shadows the consumer's policy choice, which is why
-> `stdlib/stream.kai` routes faults out through the row.
-> `examples/effects/stream_abort_leak.kai` pins one instance as a
-> measured fact. The language has no `finally`-style construct;
-> issue #1537 decides whether one lands.
+Handling `Cancel` at the resource scope is one way to release a
+resource, but it is no longer the only one, and it is not the general
+one: it ties cleanup to interpreting a particular effect. A handler's
+`finally { }` clause runs on every path that unwinds its scope — normal
+exit, a clause that abandons `resume` (including one installed further
+out, whose jump skips this scope entirely), and cooperative
+cancellation — with `initially { }` acquiring into the handler state so
+acquisition and release sit in the same construct. `kai info effects`
+§*Cleanup* is the reference.
+
+The mechanism is a walk, not a truncation: a non-local exit runs each
+node's cleanup before unlinking it, and each cleanup runs in the
+evidence context of its own installation point, so an effect it
+performs dispatches to handlers that were live then rather than to the
+torn-down frames at the jump site.
+
+`panic` is the exception, by design: it aborts the process rather than
+unwinding it, so no cleanup runs and the OS reclaims fds at exit.
+
+This is what lets a producer defend itself without handling the
+consumer's fault effect — interpreting it would shadow the consumer's
+policy choice, which is why `stdlib/stream.kai` still routes faults out
+through the row while bracketing its own handle.
 
 ### Delivery points
 
