@@ -306,6 +306,8 @@ not shadow-and-hide it.
 
 ```kai
 handle { body } with Effect {
+  initially { expr }                     # optional
+  finally   { expr }                     # optional
   op_1(args..., resume) -> expr
   op_2(args..., resume) -> expr
   return(x)             -> expr          # optional
@@ -323,6 +325,27 @@ handle { body } with Effect {
   not an oversight (`docs/decisions/handler-return-clause-optional-2026-05-12.md`).
   Handlers that transform the body result (e.g. `State[S]` returning
   `(x, state)`) must write the clause explicitly.
+- `initially { }` runs once when the handler is installed, before
+  `body`. Its value is the handler state, readable as `state` in the
+  clauses. It fills the same slot as the `with Eff(init)` form, so a
+  handler writes one or the other, never both.
+- `finally { }` runs when the scope exits, on **every** path that
+  unwinds it: normal return, a clause that abandons `resume`
+  (including one installed further out, whose non-local exit jumps
+  over this scope), and cooperative cancellation. It does not run on
+  `panic`, which aborts the process rather than unwinding it. The
+  clause takes no parameters and its value is discarded — `return(x)`
+  is the clause that transforms the result.
+  Together with `initially` it is the acquire/release bracket: the
+  acquisition lives inside the construct that guarantees the release,
+  so there is no window where the resource exists un-armed.
+- **A cleanup runs in its installation-time evidence context.** Its
+  `evidence_top` is restored to its own node's parent, so an effect it
+  performs dispatches to the handlers that were live when the handler
+  was installed, not to those at the jump site — the unwind has already
+  destroyed those frames. A consequence worth stating: `finally` cannot
+  perform the effect its own handler discharges; that is a static
+  "effect not handled", not a runtime loop.
 - Outside the `with` block, `Effect` is no longer in the row.
 
 `handle { body } with Eff { clauses }` is a **control-flow

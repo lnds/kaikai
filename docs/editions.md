@@ -133,6 +133,19 @@ assembled from one list rather than reconstructed from git.
   Not mechanical: `kai migrate` reports it as `manual:`, because the
   right replacement depends on whether the caller can recover.
 
+- **`initially` / `finally` clauses on a handler** (issue #1537).
+  Additive to the surface — existing handlers keep parsing and behaving
+  unchanged — but recorded here because it changes the *semantics* of
+  paths that previously ran no user code: a non-local exit now runs the
+  `finally` of every scope it unwinds, where before it truncated the
+  evidence chain silently. Programs that leaked a resource on an abort
+  or cancellation path now release it. `initially` and the existing
+  `with Eff(init)` form fill the same handler-state slot and are
+  mutually exclusive; writing both is a parse error. No migration:
+  nothing that compiled before stops compiling, and the names are
+  contextual, so a user effect may still declare an op called
+  `finally`.
+
 ## Edition selection in user packages
 
 A `kai.toml` declares which edition its source compiles against:

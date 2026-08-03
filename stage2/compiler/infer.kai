@@ -10001,7 +10001,14 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
   match cs {
     [] -> ClausesTyped { st: st, clauses: list_reverse(acc) }
     [c, ...rest] -> match c {
-      HC(op_name, params, body, line, col) -> {
+      HC(op_name, params, body, line, col) ->
+        if is_lifecycle_clause(op_name, params) {
+          let ft = check_finally_clause(st, op_name, params, body, line, col,
+                                         stateful, state_ty)
+          check_clauses_types_loop(ft.st, eff_name, rest, stateful, state_ty,
+                                    eff_tyargs, [ft.clause, ...acc])
+        } else {
+      {
         let outer = st
         # clause shape: the clause's positional parameter
         # count must equal the op's declared arity plus one (the
@@ -10062,8 +10069,44 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         check_clauses_types_loop(st_out, eff_name, rest, stateful, state_ty,
                                   eff_tyargs, [new_clause, ...acc])
       }
+        }
     }
   }
+}
+
+type ClauseTyped1 = { st: InferState, clause: HClause }
+
+# `finally { }` runs with `evidence_top` restored to its own node's
+# parent, so its body is typed in the OUTER scope: performing the very
+# effect this handler discharges is an "effect not handled" error, not a
+# runtime loop. It carries no params and its value is discarded, so it
+# is checked against `Unit`. A stateful handler exposes `state`, which is
+# what connects an `initially`-acquired resource to its release.
+fn check_finally_clause(st: InferState, name: String, params: [Param], body: Expr,
+                        line: Int, col: Int, stateful: Bool,
+                        state_ty: Option[Ty]) : ClauseTyped1 / Console + File + Mutable {
+
+  let st_arity = match params {
+    [] -> st
+    _  -> {
+      diag_error(st.file, line, col,
+        string_concat("`", string_concat(name, " { }` takes no parameters")))
+      diag_note("`finally` runs for its effect only; use `return(x) -> ...` to transform the result")
+      st_bump_err(st)
+    }
+  }
+  let outer = st_arity
+  let sty = match state_ty { Some(t) -> t None -> TyAny }
+  let env1 =
+    if stateful {
+      ty_env_add(ty_env_add(outer.env, "state", mono(sty)), "log", mono(sty))
+    } else { outer.env }
+  # Same alias-tag boundary as the op and return clauses: the body
+  # compiles to its own C function with no access to outer
+  # `kai_alias_<a>_id` locals.
+  let rb = synth(st_disable_alias_tag(st_set_env(outer, env1)), body)
+  let st_out = st_restore_entries(outer, rb.st)
+  ClauseTyped1 { st: st_out, clause: HC(name, params, rb.expr, line, col) }
 }
 
 # bind clause params; also returns the answer type recovered
@@ -10189,8 +10232,11 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
   match cs {
     [] -> st
     [c, ...rest] -> match c {
-      HC(name, _, _, cline, ccol) -> {
+      HC(name, cparams, _, cline, ccol) -> {
         let key = string_concat(eff, string_concat(".", name))
+        if is_lifecycle_clause(name, cparams) {
+          check_clause_names(st, eff, rest, line, col)
+        } else {
         match ty_env_lookup(st.env, key) {
           Some(_) -> check_clause_names(st, eff, rest, line, col)
           None -> {
@@ -10204,10 +10250,24 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
             check_clause_names(st_bump_err(st), eff, rest, line, col)
           }
         }
+        }
       }
     }
   }
 }
+
+# `finally` is a handler lifecycle clause, not an op of the effect.
+# (`initially` never reaches the typer — the parser lifts it into the
+# handler-state slot.)
+pub fn is_lifecycle_clause_name(name: String) : Bool = name == "finally"
+
+# The lifecycle form is `finally { }` — parsed with NO params, where an op
+# clause always carries at least `resume`. Keying on the shape, not the
+# name alone, is what lets an effect still declare an op called `finally`
+# and handle it as `finally(v, resume) -> ...`.
+pub fn is_lifecycle_clause(name: String, params: [Param]) : Bool =
+  if is_lifecycle_clause_name(name) { match params { [] -> true _ -> false } }
+  else { false }
 
 # verify a handler clause's positional parameter count
 # matches the op signature plus one for `resume`. Unknown ops fall

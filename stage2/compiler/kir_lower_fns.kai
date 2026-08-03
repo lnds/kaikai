@@ -476,15 +476,19 @@ fn lower_clause_fns(clauses: [ClauseInfo], all_cls: [ClauseInfo], st0: LowerSt, 
 
 fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt) : KFn / Console = match c {
   CI(line, col, _, op, params, body, stateful, enc_fn, caps) -> {
-    let sym = clause_sym(line, col, op)
+    let is_fin = is_lifecycle_clause(op, params)
+    let sym = if is_fin { kir_cleanup_sym(line, col) } else { clause_sym(line, col, op) }
     let st = ls_enter_fn(st0, enc_fn, param_local_names(params, caps))
     # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
     let env_caps = kir_handle_captures_at(all_cls, line, col)
-    let kparams = list_append(lower_clause_params(params), lower_env_captures(caps, env_caps, []))
+    # A `finally` has no surface params and never resumes: captures only.
+    let own_params = if is_fin { [] } else { lower_clause_params(params) }
+    let kparams = list_append(own_params, lower_env_captures(caps, env_caps, []))
     match lower_expr(body, st) { LRes(val, st1) -> {
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
-      KFn { sym: sym, kind: KFnClause, params: kparams, ret: SBoxed,
+      KFn { sym: sym, kind: if is_fin { KFnCleanup } else { KFnClause },
+            params: kparams, ret: SBoxed,
             blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false }
     } }
   }
@@ -587,12 +591,17 @@ fn find_op_thunk(thunks: [KOpThunk], op: String) : Option[KOpThunk] = match thun
 # (the union must see every clause of the handle, not just the head).
 fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
   [] -> acc
-  [CI(line, col, eff, op, _, _, _, _, _), ...rest] -> {
-    let sym = cat3("_kai_handler_", int_to_string(line), cat2("_", int_to_string(col)))
-    let ot  = KOT(op, clause_sym(line, col, op))
-    let ecaps = kir_handle_captures_at(all_cls, line, col)
-    lower_handler_decls(rest, all_cls, hdecl_add(acc, eff, sym, ot, ecaps))
-  }
+  [CI(line, col, eff, op, cps, _, _, _, _), ...rest] ->
+    # `finally` carries no Ev field — it is armed on the evidence node, not
+    # stored as an op thunk — so it never joins `op_thunks`.
+    if is_lifecycle_clause(op, cps) {
+      lower_handler_decls(rest, all_cls, acc)
+    } else {
+      let sym = cat3("_kai_handler_", int_to_string(line), cat2("_", int_to_string(col)))
+      let ot  = KOT(op, clause_sym(line, col, op))
+      let ecaps = kir_handle_captures_at(all_cls, line, col)
+      lower_handler_decls(rest, all_cls, hdecl_add(acc, eff, sym, ot, ecaps))
+    }
 }
 
 # Add an op-thunk to the matching handler decl, or create the decl. The
@@ -608,6 +617,10 @@ fn hdecl_add(acc: [KHandlerDecl], eff: String, sym: String, ot: KOpThunk, ecaps:
 # The clause-thunk symbol for an op clause (mirror of emit_c's
 # `_kai_clause_<line>_<col>_<op>`). `pub` so the handle site
 # (`kir_lower_walk`) mints the matching `KInstall` handler symbol.
+#[doc("The cleanup-thunk symbol for a handler's `finally { }`, keyed on the handle's position.")]
+pub fn kir_cleanup_sym(line: Int, col: Int) : String =
+  concat_all(["_kai_finally_", int_to_string(line), "_", int_to_string(col)])
+
 pub fn clause_sym(line: Int, col: Int, op: String) : String =
   concat_all(["_kai_clause_", int_to_string(line), "_", int_to_string(col), "_", op])
 

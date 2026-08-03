@@ -42,6 +42,7 @@ pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fns: [KFn]) : Uni
   KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers, fns)
   KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers, fns)
   KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers, fns)
+  KFnCleanup -> nemit_fn_with(ctx, f, NFnCleanup, handlers, fns)
   # An `extern "C" fn` carries no lowered body — the shim is synthesised
   # here from the marshalling kinds the KIR classified (emit_native_ffi.kai).
   KFnFfi(csym, pks, rk) -> nemit_ffi_fn(ctx, f, csym, pks, rk)
@@ -50,7 +51,7 @@ pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fns: [KFn]) : Uni
 # The native frame ABI a KFn emits — distinct from `KFnKind` so this file
 # carries the backend's three concrete signatures (normal / lambda-thunk /
 # clause) without re-matching the KIR kind everywhere.
-pub type NFnAbi = NFnNormal | NFnLambda | NFnClause
+pub type NFnAbi = NFnNormal | NFnLambda | NFnClause | NFnCleanup
 
 # Demote a root-private named user fn to internal linkage. A `mo = None`
 # `KFnNormal` (other than the entry `main`) is reachable only inside its own
@@ -138,7 +139,16 @@ fn nemit_declare_for_abi(ctx: Handle, f: KFn, abi: NFnAbi) : Handle = match abi 
   NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), nfn_llvm_type(ctx, f))
   NFnLambda -> nemit_declare_thunk(ctx, f.sym)
   NFnClause -> nemit_declare_clause(ctx, f.sym, f.params)
+  NFnCleanup -> nemit_declare_cleanup(ctx, f.sym)
 }
+
+# A `finally` thunk: `ptr (ptr self)`. `self` is the handler's Ev, so a
+# stateful cleanup reads the resource `initially` left in `state`. The
+# result is the block's value and is discarded by the caller — returning
+# `ptr` (not void) keeps the body's ordinary `KRet` lowering.
+pub fn nemit_declare_cleanup(ctx: Handle, sym: String) : Handle =
+  llvm_get_or_declare_fn(native_ctx_m(ctx), sym,
+                         llvm_fn_type_boxed(native_ctx_ptrt(ctx), 1))
 
 # Seed the params for the ABI: normal stores each arg into its alloca;
 # lambda reads `args[i]` / captures; clause reads `args[i]` directly +
@@ -155,6 +165,13 @@ fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / 
   }
   NFnLambda -> nemit_seed_thunk_params(ctx, f.params, fnval)
   NFnClause -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
+  # The cleanup takes only `self` (the Ev). Bind `state`/`log` from it when
+  # the handler is stateful, and read any captures out of its env array —
+  # the same two sources a clause prologue uses, minus args and `k`.
+  # The cleanup takes only `self` (the Ev): no direct args, no `k`. Binding
+  # `__self` + `state`/`log` + the env captures reuses the clause seeding
+  # unchanged, since `PEnvCapture` is the only param origin it carries.
+  NFnCleanup -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
 }
 
 # A clause `ptr (ptr self, <PDirect args ptr>, ptr k)`: self + one ptr per
@@ -364,6 +381,8 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   # return clause's `list_length(log)` reads them. Shares `nemit_bind_ev_state`
   # with the clause prologue; the only difference is the address source.
   KBindEvState(_, sym, _) -> nemit_bind_ev_state(ctx, native_ctx_find_reg(ctx, nfx_ev_reg(sym)))
+  KSetCleanup(_, sym, thunk, _) -> nemit_set_cleanup(ctx, sym, thunk)
+  KRunCleanup(_, sym, _) -> nemit_run_cleanup(ctx, sym)
 }
 
 # A `KDo` evaluates an op for effect and discards its result. When that
