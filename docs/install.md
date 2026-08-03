@@ -79,6 +79,54 @@ Force it on with `make -C stage2 KAI_LLVM=1`.
 Out of scope for the MVP. WSL with the Linux instructions above is the
 supported path.
 
+## Upgrading
+
+`kai upgrade` self-updates a `curl | sh` install under `$KAIKAI_HOME`
+(default `~/.kaikai`). A Homebrew-managed install is refused with a
+pointer to `brew upgrade kaikai`.
+
+The version is resolved from a static manifest published at
+`https://kaikai-lang.org/latest.json` — one file, no API call, so the
+unauthenticated GitHub API's 60-requests-per-hour-per-IP quota is not on
+the install path. Tarballs are still hosted on GitHub Releases; only the
+version lookup moved.
+
+The manifest names the current release and, per platform, the tarball URL
+and its SHA-256:
+
+```json
+{
+  "schema": 1,
+  "version": "0.106.0",
+  "tag": "v0.106.0",
+  "platforms": {
+    "darwin-arm64": {
+      "url": "https://github.com/kaikailang-org/kaikai/releases/download/v0.106.0/kaikai-v0.106.0-darwin-arm64.tar.gz",
+      "sha256": "68f6534af84834b6b52033a9d399593c2bcc6b12e5130dd839401b5ee2f738d2"
+    }
+  }
+}
+```
+
+`platforms` carries only what the release actually built, so a platform
+absent from the manifest is one with no artifact — not a broken URL. The
+digest is always verified before anything is unpacked, on either path.
+
+If the manifest is unreachable — a mirror without one, or a release
+predating it — both `kai upgrade` and `install.sh` fall back to the
+GitHub tags API, which is how they resolved the version before.
+
+| Variable            | Effect |
+|---------------------|--------|
+| `KAIKAI_DIST_BASE`  | Base URL serving `latest.json` (default `https://kaikai-lang.org`). Point it at a mirror to install from your own host. |
+| `GITHUB_TOKEN`      | Lifts the 60/h rate limit on the fallback path. |
+| `KAIKAI_HOME`       | Install prefix (default `~/.kaikai`). |
+
+`release.yml` generates the manifest from the assets it just published
+and pushes it to the site, then polls until the live file names the new
+tag — a manifest that never goes live fails the release rather than
+leaving `kai upgrade` silently pinned to the previous version.
+
 ## Verifying the install
 
 ```sh

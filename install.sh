@@ -49,6 +49,36 @@ detect_platform() {
 }
 
 # ---- release discovery -----------------------------------------------------
+# Preferred path: a static manifest on the project site, which costs no
+# GitHub API quota and works on a network that throttles api.github.com.
+# KAIKAI_DIST_BASE repoints it at a mirror.
+dist_base() {
+  printf '%s\n' "${KAIKAI_DIST_BASE:-https://kaikai-lang.org}"
+}
+
+# Print "<tag>\t<url>\t<sha256>" for platform $1, or fail quietly so the
+# caller falls back to the API — a release predating the manifest must
+# still install exactly as before.
+manifest_entry() {
+  platform="$1"
+  json="$2"
+  curl -fsSL --max-time 20 -o "$json" "$(dist_base)/latest.json" 2>/dev/null || return 1
+
+  m_tag="$(tr -d ' \n\r\t' <"$json" | sed -n 's/.*"tag":"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p')"
+  [ -n "$m_tag" ] || return 1
+
+  # Isolate the platform's object first: reading "url" from the whole
+  # document would match whichever platform happens to come last.
+  entry="$(tr -d ' \n\r\t' <"$json" | sed -n 's/.*"'"$platform"'":{\([^}]*\)}.*/\1/p')"
+  [ -n "$entry" ] || return 1
+
+  m_url="$(printf '%s' "$entry" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
+  m_sha="$(printf '%s' "$entry" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p')"
+  [ -n "$m_url" ] && [ -n "$m_sha" ] || return 1
+
+  printf '%s\t%s\t%s\n' "$m_tag" "$m_url" "$m_sha"
+}
+
 # Resolve the newest release tag via the GitHub tags API, with no `gh`
 # dependency — `curl` is all an end user has. Tags are created by every
 # `cz bump`, so they always exist, unlike releases/latest which 404s
@@ -111,26 +141,41 @@ main() {
   trap 'rm -rf "$tmp"' EXIT INT TERM
 
   info "==> resolving latest kaikai release"
-  tag="$(latest_tag "$tmp/tags.hdr" "$tmp/tags.err")" || true
-  if [ -z "$tag" ]; then
-    case "$(cat "$tmp/tags.err" 2>/dev/null)" in
-      network)   err "cannot reach github.com — check your network connection" ;;
-      ratelimit) err "GitHub API rate limit reached (60/h unauthenticated). Retry in a few minutes, or set GITHUB_TOKEN." ;;
-      *)         err "could not find a release tag matching v<major>.<minor>.<patch> on GitHub" ;;
-    esac
+  tarball_url=""
+  want=""
+  entry=""
+  entry="$(manifest_entry "$PLATFORM" "$tmp/latest.json")" || true
+  if [ -n "$entry" ]; then
+    tag="$(printf '%s' "$entry" | cut -f1)"
+    tarball_url="$(printf '%s' "$entry" | cut -f2)"
+    want="$(printf '%s' "$entry" | cut -f3)"
+  else
+    tag="$(latest_tag "$tmp/tags.hdr" "$tmp/tags.err")" || true
+    if [ -z "$tag" ]; then
+      case "$(cat "$tmp/tags.err" 2>/dev/null)" in
+        network)   err "cannot reach $(dist_base) or github.com — check your network connection" ;;
+        ratelimit) err "GitHub API rate limit reached (60/h unauthenticated). Retry in a few minutes, or set GITHUB_TOKEN." ;;
+        *)         err "could not find a release tag matching v<major>.<minor>.<patch> on GitHub" ;;
+      esac
+    fi
   fi
 
   tarball="kaikai-$tag-$PLATFORM.tar.gz"
-  base="https://github.com/$REPO/releases/download/$tag"
+  if [ -z "$tarball_url" ]; then
+    tarball_url="https://github.com/$REPO/releases/download/$tag/$tarball"
+  fi
   info "==> downloading $tarball"
 
-  curl -fsSL -o "$tmp/$tarball" "$base/$tarball" \
-    || err "failed to download $tarball"
-  curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256" \
-    || err "failed to download $tarball.sha256"
+  curl -fsSL -o "$tmp/$tarball" "$tarball_url" \
+    || err "failed to download $tarball from $tarball_url"
+
+  if [ -z "$want" ]; then
+    curl -fsSL -o "$tmp/$tarball.sha256" "$tarball_url.sha256" \
+      || err "failed to download $tarball.sha256"
+    want="$(awk '{print $1}' "$tmp/$tarball.sha256")"
+  fi
 
   info "==> verifying checksum"
-  want="$(awk '{print $1}' "$tmp/$tarball.sha256")"
   got="$(sha256_of "$tmp/$tarball")"
   if [ "$want" != "$got" ]; then
     err "checksum mismatch for $tarball
