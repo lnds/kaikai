@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.107.0 (2026-08-03)
+
+### Added
+
+- **dist**: publish latest.json as a release asset (#1578)
+- **dist**: resolve the release version from a static latest.json (#1572)
+- **release**: publish a linux-x86_64 artifact (#1571)
+
+### Fixed
+
+- **ci**: stop tier1-backend-parity from downgrading a native kaic2 (#1584)
+- **typer**: check a handler clause parameter's annotation against the op (#1583)
+- **typer**: compare impl-method parameters at argument depth (#1582)
+- **typer**: check a `var` cell's annotation against its initialiser (#1581)
+- **typer**: check a const's annotation against its initialiser (#1579)
+
 ## v0.106.0 (2026-08-03)
 
 ### BREAKING CHANGE
