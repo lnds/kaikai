@@ -5968,16 +5968,14 @@ fn emit_handle_env_typedef_fields(caps: [String]) : String {
 # normal ident lookup and resolves to the local C alias.
 
 # m7b #11: stateful-clause prologue. `state` and `log` are aliases of
-# `self->state`. Both names are bound (the two are aliases of the same
-# slot — the spec uses `state` for `State[T]` and `log` for `Writer[W]`,
-# but at this layer they read the same field). The clause body is then
-# emitted unchanged: any `state` / `log` reference falls through the
-# normal ident lookup and resolves to the local C alias.
-fn clause_state_prologue(stateful: Bool) : String {
-  if stateful {
-    "    KaiValue *kai_state = self->state; KaiValue *kai_log = self->state;\n"
-  } else { "" }
-}
+# `self->state`. Both names read the same field — the spec uses
+# `state` for `State[T]` and `log` for `Writer[W]`. An alias the
+# enclosing scope already binds arrives through `caps` instead and is
+# declared by the env prologue, so emitting it here too would
+# redeclare the C local and shadow the capture.
+fn clause_state_prologue(stateful: Bool, caps: [String]) : String =
+  concat_all(map(live_state_aliases(stateful, caps),
+                 (nm) => "    KaiValue *kai_#{nm} = self->state;\n"))
 
 # Stable C symbol for a handler's `finally` thunk. Same
 # (enc_fn, line, col) triple the clause-fn and env-struct names use.
@@ -6001,7 +5999,7 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
 
   match c {
     CI(line, col, eff, _, _, body, stateful, enc_fn, caps) -> {
-      let stateful_locals = if stateful { ["state", "log"] } else { [] }
+      let stateful_locals = live_state_aliases(stateful, caps)
       let body_lcs = list_append(list_append(cx.lcs, stateful_locals), caps)
       let body_c = emit_expr(src, body, emit_ctx_with_lcs(cx, body_lcs))
       let hmo = eff_mo(cx.effs, eff)
@@ -6011,7 +6009,7 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
       concat_all([
         emit_cleanup_sig(enc_fn, line, col), " {\n",
         self_bind,
-        clause_state_prologue(stateful),
+        clause_state_prologue(stateful, caps),
         emit_clause_env_prologue(cx.cls, line, col, enc_fn, caps),
         "    return ", body_c, ";\n",
         "}\n\n"
@@ -6033,20 +6031,18 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
 
   match c {
     CI(line, col, _, _, _, body, stateful, enc_fn, caps) -> {
-      # Clause body sees `self` and `k` (always), `kai_state` /
-      # `kai_log` (when stateful), the clause's params (params
-      # come into scope through the surrounding handle's lcs),
-      # and — R9 — every capture that travels through `self->env`.
-      # `state` / `log` are spelled with `kai_` prefix in the
-      # generated C, but the kaikai-side names are `state` / `log`.
-      let stateful_locals = if stateful { ["state", "log"] } else { [] }
+      # Clause body sees `self` and `k` (always), the live state
+      # aliases, the clause's params (params come into scope through
+      # the surrounding handle's lcs), and — R9 — every capture that
+      # travels through `self->env`.
+      let stateful_locals = live_state_aliases(stateful, caps)
       let body_lcs = list_append(list_append(list_append(cx.lcs, ["self", "k"]), stateful_locals), caps)
       let body_c = emit_expr_in_clause(src, body, emit_ctx_with_lcs(cx, body_lcs), stateful)
       let env_prologue = emit_clause_env_prologue(cx.cls, line, col, enc_fn, caps)
       concat_all([
         emit_clause_sig(c, cx.effs), " {\n",
         "    (void) self; (void) k;\n",
-        clause_state_prologue(stateful),
+        clause_state_prologue(stateful, caps),
         env_prologue,
         "    return ", body_c, ";\n",
         "}\n\n"
@@ -7777,13 +7773,14 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
   let ret_c = match ret_opt {
     Some(r) -> match r {
       HR(pname, rexpr, _, _) -> {
-        # m7b #11: when the handler is stateful, the return clause
-        # also sees `state` / `log` (so `return(x) -> (x, state)` works).
+        # A stateful handler's return clause sees the state aliases too
+        # (so `return(x) -> (x, state)` works). The clause is emitted
+        # inline in the enclosing function, so an alias whose name is
+        # already an enclosing local keeps that local: redeclaring it
+        # would shadow the user's binding in the same C block.
         let stateful = match init_opt { Some(_) -> true None -> false }
-        let prologue = if stateful {
-          # _node is a KaiEvidence; its `handler` field is `&_ev`.
-          "KaiValue *kai_state = _ev.state; KaiValue *kai_log = _ev.state; "
-        } else { "" }
+        let prologue = concat_all(map(live_state_aliases(stateful, cx.lcs),
+                                      (nm) => "KaiValue *kai_#{nm} = _ev.state; "))
         concat_all([
           "KaiValue *kai_", pname, " = _body_result; ",
           prologue,
