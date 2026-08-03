@@ -84,6 +84,39 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.106.0 (2026-08-03)
+
+### BREAKING CHANGE
+
+- `Fail` is no longer a stdlib effect. A `/ Fail` row
+becomes `Result[T, String]` with postfix `!`, a domain effect whose op
+returns `Unit` when the consumer must choose a resume policy, or
+`Cancel.raise()` for deep non-local exit. Code wanting the old shape
+declares `effect Fail { fail(msg: String) : Nothing }` itself, with no
+default handler.
+
+### Added
+
+- **effects**: guaranteed cleanup via initially/finally on a handler (#1563)
+- **stdlib**: remove the Fail effect from the stdlib (#1555)
+
+### Fixed
+
+- **typer**: let an enclosing binding win over a handler's state alias (#1565) (#1567)
+- **compiler**: keep a scalar cell out of a handle body (#1564) (#1566)
+- **lint**: give the linter the head-owner cache a build uses (#1558) (#1562)
+- **kai**: escape the slash in the lock-walk awk class for BSD awk (#1557) (#1561)
+- **runtime**: pin the entry fiber to the process main thread (#1556) (#1559)
+- **typer**: check a nominal type's arguments in a let annotation (#1547) (#1553)
+- **typer**: keep a concrete effect rigid in a row-kind slot (#1542) (#1549)
+- **typer**: propagate nursery brands through pass-through helpers (#1550)
+- **runtime**: Spawn.select races on completion order instead of returning the head (#1548)
+
+### Changed
+
+- **cache**: encode KAB2 integers in one alloc instead of a cons list (#1531)
+- **driver**: serve the typed rebuild cut by default inside a package (#1530)
+
 ## v0.105.1 (2026-07-28)
 
 ### Fixed
