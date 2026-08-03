@@ -765,7 +765,7 @@ fn validate_impl_methods_loop(ds: [Decl], file: String,
           let e1 = check_missing_methods(proto_ops, methods, pname, tname,
                                          all_op_names,
                                          file, line, col, errs)
-          let e2 = check_impl_methods(methods, proto_ops, pname, tname,
+          let e2 = check_impl_methods(methods, proto_ops, pname, tname, target,
                                        proto_tps, arg_heads, file, e1)
           validate_impl_methods_loop(rest, file, reg, e2)
         }
@@ -862,10 +862,10 @@ fn impl_has_method(methods: [Decl], opname: String) : Bool {
 }
 
 # Shapes 2 + 3: walk each impl method; if it matches a protocol op,
-# check arity and head-name compatibility. Methods that match no
+# check arity and signature compatibility. Methods that match no
 # protocol op are reported as unknown.
 fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
-                      pname: String, tname: String,
+                      pname: String, tname: String, target: TypeExpr,
                       proto_tps: [String], arg_heads: [String],
                       file: String, errs: Int) : Int / Console {
   match methods {
@@ -898,17 +898,17 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
                 }
               if pa == pp {
                 check_sig_heads(params, proto_params, ret_opt, proto_ret,
-                                op_name, pname, tname,
+                                op_name, pname, tname, target,
                                 proto_tps, arg_heads,
                                 file, line, col, e_ar)
               } else { e_ar }
             }
           }
         }
-        check_impl_methods(rest, proto_ops, pname, tname, proto_tps, arg_heads,
-                           file, errs1)
+        check_impl_methods(rest, proto_ops, pname, tname, target,
+                           proto_tps, arg_heads, file, errs1)
       }
-      _ -> check_impl_methods(rest, proto_ops, pname, tname,
+      _ -> check_impl_methods(rest, proto_ops, pname, tname, target,
                               proto_tps, arg_heads, file, errs)
     }
   }
@@ -924,19 +924,22 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
   }
 }
 
-# Head-name comparison of impl vs protocol signature. `Self` in the
-# protocol substitutes to `tname`; each protocol tparam `Ai`
-# substitutes to `arg_heads[i]` (or `tname` when `arg_heads == []`,
-# the homogeneous default per the lower_impls rule). Unannotated impl
-# params (`ptype == None`) are not checked — the typer infers them; a
-# pre-typer pass has no signal to compare against.
+# Compare an impl signature against the protocol's. `Self` in the
+# protocol substitutes to the impl target; each protocol tparam `Ai`
+# substitutes to `arg_heads[i]` (or the target when `arg_heads == []`,
+# the homogeneous default per the lower_impls rule). Parameters are
+# compared structurally, so two instantiations of one constructor are
+# distinguished; the return below still compares head names only.
+# Unannotated impl params (`ptype == None`) are not checked — the
+# typer infers them; a pre-typer pass has no signal to compare against.
 fn check_sig_heads(impl_params: [Param], proto_params: [Param],
                    impl_ret_opt: Option[TypeExpr], proto_ret: TypeExpr,
                    op_name: String, pname: String, tname: String,
+                   target: TypeExpr,
                    proto_tps: [String], arg_heads: [String],
                    file: String, line: Int, col: Int,
                    errs: Int) : Int / Console {
-  let e_params = check_sig_param_heads(impl_params, proto_params, tname,
+  let e_params = check_sig_param_heads(impl_params, proto_params, tname, target,
                                         proto_tps, arg_heads,
                                         op_name, pname, file, errs)
   # Return-type check applies only when the impl is homogeneous w.r.t.
@@ -983,6 +986,7 @@ fn heterogeneous_impl(arg_heads: [String], tname: String) : Bool {
 }
 
 fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
+                         target: TypeExpr,
                          proto_tps: [String], arg_heads: [String],
                          op_name: String, pname: String,
                          file: String, errs: Int) : Int / Console {
@@ -993,29 +997,86 @@ fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
       [pp, ...prest] -> {
         let errs1 = match ip.ptype {
           None -> errs
-          Some(it) -> {
-            let ih = proto_type_name(it)
-            let ph = match pp.ptype {
-              None -> ih
-              Some(pt) -> sig_head_subst(pt, tname, proto_tps, arg_heads)
-            }
-            if ih == ph { errs }
-            else {
-              eprint(concat_all([
-                file, ":", int_to_string(ip.pline), ":", int_to_string(ip.pcol),
-                ": error: impl method `", op_name, "` in `",
-                pname, " for ", tname,
-                "`: parameter `", ip.pname,
-                "` has type `", proto_type_expr_display(it),
-                "` but protocol declares `", ph, "`"]))
-              errs + 1
+          Some(it) -> match pp.ptype {
+            None -> errs
+            Some(pt) -> {
+              let ps = sig_subst(pt, tname, target, proto_tps, arg_heads)
+              if sig_type_matches(it, ps) { errs }
+              else {
+                eprint(concat_all([
+                  file, ":", int_to_string(ip.pline), ":", int_to_string(ip.pcol),
+                  ": error: impl method `", op_name, "` in `",
+                  pname, " for ", tname,
+                  "`: parameter `", ip.pname,
+                  "` has type `", proto_type_expr_display(it),
+                  "` but protocol declares `", proto_type_expr_display(ps), "`"]))
+                errs + 1
+              }
             }
           }
         }
-        check_sig_param_heads(irest, prest, tname, proto_tps, arg_heads,
+        check_sig_param_heads(irest, prest, tname, target,
+                              proto_tps, arg_heads,
                               op_name, pname, file, errs1)
       }
     }
+  }
+}
+
+# Structural comparison of an impl parameter against its substituted
+# protocol counterpart. Arguments are compared at depth, so two
+# instantiations of the same constructor (`Pair[String, Bool]` vs
+# `Pair[Int, Bool]`) do not compare equal. Either side left
+# argument-free stays permissive and matches on the head alone,
+# preserving the pre-existing tolerance for unresolved variables.
+fn sig_type_matches(impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
+  match proto_t.tkind {
+    TyName(pn, pargs) -> match impl_t.tkind {
+      TyName(inm, iargs) ->
+        if pn != inm { false }
+        else if pargs == [] or iargs == [] { true }
+        else { sig_types_match(iargs, pargs) }
+      _ -> proto_type_name(impl_t) == pn
+    }
+    TyList(pinner) -> match impl_t.tkind {
+      TyList(iinner) -> sig_type_matches(iinner, pinner)
+      _ -> false
+    }
+    _ -> proto_type_name(impl_t) == proto_type_name(proto_t)
+  }
+}
+
+fn sig_types_match(its: [TypeExpr], pts: [TypeExpr]) : Bool {
+  match pts {
+    [] -> match its { [] -> true  _ -> false }
+    [p, ...prest] -> match its {
+      [] -> false
+      [i, ...irest] -> if sig_type_matches(i, p) { sig_types_match(irest, prest) } else { false }
+    }
+  }
+}
+
+# Structural counterpart of `sig_head_subst`: `Self` becomes the whole
+# impl target (arguments included), and a protocol tparam becomes its
+# aligned bracket argument. A tparam applied to arguments (`s[Int]`
+# with `s := Chain`) substitutes at the head and keeps its arguments,
+# yielding `Chain[Int]` — the Shape-carrier form.
+fn sig_subst(t: TypeExpr, tname: String, target: TypeExpr,
+             proto_tps: [String], arg_heads: [String]) : TypeExpr {
+  match t.tkind {
+    TyName(n, targs) -> {
+      let sargs = map(targs, (a) => sig_subst(a, tname, target, proto_tps, arg_heads))
+      if n == "Self" {
+        match targs { [] -> target  _ -> mk_ty(TyName(proto_type_name(target), sargs), t.line, t.col) }
+      } else {
+        match tparam_subst(n, proto_tps, arg_heads, tname) {
+          Some(h) -> mk_ty(TyName(h, sargs), t.line, t.col)
+          None    -> mk_ty(TyName(n, sargs), t.line, t.col)
+        }
+      }
+    }
+    TyList(inner) -> mk_ty(TyList(sig_subst(inner, tname, target, proto_tps, arg_heads)), t.line, t.col)
+    _ -> t
   }
 }
 
