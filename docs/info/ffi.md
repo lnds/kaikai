@@ -129,6 +129,20 @@ A `char *` a C function returns while borrowing from a live handle
 (same as a returned `String`), so it never dangles when the handle is
 later destroyed.
 
+## Thread affinity
+
+`main` runs on the OS thread the process entered on, at every
+`KAI_THREADS`. That is a guarantee, not an accident of scheduling: a
+thread-affine C library refuses to work anywhere else. AppKit — and
+through it GLFW, raylib, SDL, GTK — traps outright if a window is
+created or events are pumped off the process main thread.
+
+So the calls those libraries demand be made "on the main thread" can
+be made directly from `main`, with the parallel scheduler on. The
+fibers `main` spawns are NOT covered: they migrate across the worker
+pool by design, so a thread-affine call belongs in `main` itself, not
+in a spawned fiber.
+
 ## Still rejected
 
 These are out of scope and rejected at compile time:
