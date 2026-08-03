@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -309,7 +309,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -348,7 +348,7 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-migrate test-ben
 #     test-negative, test-stdlib-modules, test-packages,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
 #     test-canonical-aliases, test-info, test-doc,
-#     test-upgrade-resolver }
+#     test-upgrade-resolver, test-release-platforms }
 # equals exactly the prerequisites of `tier1` (the three light slices union
 # to TEST_LIGHT_TARGETS, proven by the round-robin partition in
 # stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
@@ -358,8 +358,8 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver)"
+	$(MAKE) test-fmt test-fmt-selfhost test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
 tier1-shard-2: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=3
@@ -411,6 +411,13 @@ test-doc: kaic2
 # minified-JSON greedy-sed trap against regression.
 test-upgrade-resolver:
 	@tools/test-upgrade-resolver.sh
+
+# Release platform tokens (pure shell, no compiler). The release matrix
+# names the tarball; install.sh and `kai upgrade` rebuild that name from
+# uname to fetch it. A one-character disagreement ships a release whose
+# every download 404s, so the correspondence is asserted, not assumed.
+test-release-platforms:
+	@tools/test-release-platforms.sh
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every

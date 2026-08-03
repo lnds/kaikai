@@ -306,7 +306,16 @@ fi
 # Pack the tarball.
 echo "==> packing $NAME.tar.gz"
 (cd "$DIST" && tar -czf "$NAME.tar.gz" "$NAME")
-(cd "$DIST" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+# `shasum` is the macOS spelling, `sha256sum` the coreutils one. Both emit
+# "<hash>  <filename>", which install.sh and `kai upgrade` parse with awk.
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$DIST" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+elif command -v sha256sum >/dev/null 2>&1; then
+  (cd "$DIST" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+else
+  echo "build-release.sh: no sha256 tool (shasum or sha256sum) found" >&2
+  exit 2
+fi
 
 # Drop the staging tree — the tarball is the artifact.
 rm -rf "$STAGE"
