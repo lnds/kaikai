@@ -1,7 +1,7 @@
 #!/bin/sh
-# gen-latest-json.sh — build the static release manifest served at
-# https://kaikai-lang.org/latest.json, so `kai upgrade` and install.sh
-# can resolve the current version without touching api.github.com.
+# gen-latest-json.sh — build the static release manifest published as a
+# release asset, so `kai upgrade` and install.sh can resolve the current
+# version without touching api.github.com.
 #
 #   gen-latest-json.sh <tag> <dist-dir> <out-file>
 #
