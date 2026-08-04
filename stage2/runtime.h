@@ -8670,6 +8670,16 @@ static void kai_set_args(int argc, char **argv) {
 #endif
 }
 
+/* `main`'s value as the process exit status. An Int return is the status
+ * (POSIX keeps the low 8 bits); any other return type — Unit, String — is 0.
+ * `main` is excluded from unboxing (classify_unbox_sig), so the result is
+ * always a KaiValue* here. Both backends' entry points share this rule.
+ * Returning the code lets libc run the full exit path; unlike
+ * `os.process.exit`'s _exit(2), buffered stdio is still flushed. */
+static int kai_main_exit_status(KaiValue *result) {
+    return kai_is_int(result) ? (int) (kai_intf(result) & 0xff) : 0;
+}
+
 static KaiValue *kai_core_args(void) {
     KaiValue *acc = kai_nil();
     for (int i = kai_g_argc - 1; i >= 1; --i) {
