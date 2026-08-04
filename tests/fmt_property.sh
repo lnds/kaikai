@@ -100,18 +100,9 @@ examples/perceus/shape_fusion_1200.kai
 examples/sugars/if_cond_record_lit_delimited.kai
 examples/protocols/free_fn_interp_mono_collision.kai
 examples/stdlib/hashmap_collision.kai
-"
-
-# (c) AST equality — output parses but denotes something else.
-# #1606 — 'requires' erased from the signature into a body 'assert',
-# which silently stops the compiler checking the contract at call sites.
-KNOWN_AST="
-examples/intervals/call_site_literal.kai
-examples/intervals/call_site_refined.kai
-examples/intervals/call_site_too_loose.kai
-examples/intervals/call_site_unproven.kai
+# #1617 — a preserved 'requires' clause is collapsed onto the signature
+# line before a block body, a shape the parser does not accept.
 examples/refinements/contracts_passing.kai
-examples/refinements/ensures_violation_diagnostic.kai
 examples/refinements/requires_complex_predicate.kai
 examples/refinements/requires_help_narrow.kai
 examples/refinements/requires_help_narrow_int.kai
@@ -122,22 +113,14 @@ examples/refinements/requires_violation_char.kai
 examples/refinements/requires_violation_diagnostic.kai
 examples/refinements/requires_violation_real.kai
 examples/refinements/requires_violation_string.kai
-examples/sugars/m12_6_const_basic.kai
-examples/sugars/m12_6_contract_basic.kai
-examples/sugars/m12_6_contract_const_fold.kai
-examples/sugars/m12_6_contract_result.kai
+"
+
+# (c) AST equality — output parses but denotes something else.
+KNOWN_AST="
+# #1606 — 'ensures' erased from the signature into a body 'assert'. The
+# 'requires' half of this was fixed in #1614; the postcondition was not.
+examples/refinements/ensures_violation_diagnostic.kai
 examples/sugars/m12_6_param_entail.kai
-examples/sugars/m12_6_pred_pure_ok.kai
-examples/sugars/m12_6_pred_pure_user_fn.kai
-examples/sugars/m12_6_pure_attr_inline.kai
-examples/sugars/m12_6_pure_attr_no_collision.kai
-examples/sugars/m12_6_pure_attr_ok.kai
-# #1607 — hex/binary literals re-rendered as decimal; the emitted '-1'
-# re-parses as a unop over a literal, not the single literal it was.
-examples/numeric/hex_literal.kai
-# #1608 — imaginary literal emitted as its 'complex.mk' desugar, with an
-# Int where the call needs a Real, so the output no longer type-checks.
-examples/sugars/complex_literal_basic.kai
 # #1610 — regex literal '~r/.../' in a where-refinement replaced by a
 # malformed desugar that names a module not yet in scope.
 examples/stdlib/regex_anchors_repetition.kai

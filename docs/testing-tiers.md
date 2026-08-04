@@ -347,6 +347,13 @@ literals re-rendered as decimal: `0xFFFFFFFFFFFFFFFF` comes back as
 `~r/.../` regex literal emitted as a malformed desugar). The last two
 produce files that no longer compile.
 
+The gate then caught the fix for those: #1614 restored the `requires`
+clause but emitted it on the signature line ahead of a block body, a
+shape the parser rejects, so eleven `examples/refinements/` files went
+from failing (c) to failing (b) — #1617. That is the loop working as
+intended: the net moves a silent corruption into a loud one, and then
+holds the fix to the same standard.
+
 The missing assertion is the central property of a formatter: **`fmt`
 preserves meaning**. `tests/fmt_property.sh` (target `test-fmt-property`)
 asserts four things per source:
@@ -363,7 +370,7 @@ asserts four things per source:
 ~1780 files against the selfhost corpus's 214, and more importantly it
 exercises surface the compiler's own sources never use — rest-patterns,
 kind-annotated type parameters, record literals delimited in condition
-position. That is where the six bugs lived. A run covers 1537 files;
+position. That is where the six bugs lived. A run covers 1573 files;
 193 are dropped because the parser rejects them (negative fixtures,
 by design) and the rest are excused against an open issue.
 
