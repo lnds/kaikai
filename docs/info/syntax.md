@@ -68,6 +68,13 @@ extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
 fn main() : Int = fib(10) + classify(0, 5) + MAX
 ```
 
+`main` is the program entry point. When it returns `Int`, that value is
+the process exit status (POSIX keeps the low 8 bits), so `Err(_) -> 1`
+signals failure to a shell, `set -e`, or a CI gate; any other return
+type exits 0. Buffered output is flushed on the way out — unlike
+`os.process.exit(code)`, which terminates via `_exit(2)` and drops
+anything still buffered.
+
 The clause-block body (`{ case <pat> (when <guard>)? -> <body> ... }`)
 desugars to a `match` over the parameter(s) — it is the kaikai form
 for Elixir/Haskell-style multi-clause function heads. One parameter

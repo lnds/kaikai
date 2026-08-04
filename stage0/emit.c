@@ -2073,8 +2073,9 @@ int kai_emit(Node *program, FILE *out, int test_mode) {
         fputs("int main(int argc, char **argv) {\n"
               "    kai_set_args(argc, argv);\n"
               "    KaiValue *_result = kai_main();\n"
+              "    int _status = kai_main_exit_status(_result);\n"
               "    kai_decref(_result);\n"
-              "    return 0;\n"
+              "    return _status;\n"
               "}\n", out);
     }
 

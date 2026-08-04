@@ -2116,7 +2116,8 @@ int main(int argc, char **argv) {
      * Mirrors the C backend's emit_main_wrapper. */
     KaiValue *result = kai_sched_bootstrap(kai_main);
     kai_main_teardown_defaults();
+    int status = kai_main_exit_status(result);
     kai_decref(result);
-    return 0;
+    return status;
 }
 #endif /* !KAI_HOT_ONLY */
