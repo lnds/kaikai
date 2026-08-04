@@ -1,0 +1,126 @@
+# compiler/fmt_contracts.kai — `requires` / `ensures` recovery for
+# `kai fmt`.
+#
+# The parser desugars contract clauses into asserts inside the fn body
+# (`wrap_with_contracts`), so by the time the formatter walks a `DFn`
+# the clauses are gone from the signature. Printing that body verbatim
+# would move the contract from the signature into the body, which drops
+# the call-site obligation the typer enforces — a silent downgrade from
+# a static guarantee to a runtime check.
+#
+# This module undoes the desugar: it peels the contract asserts back off
+# a body and hands `fmt_decl` the predicates to re-emit in signature
+# position, plus the body that remains. The recogniser is deliberately
+# exact — a body that does not match the desugar's shape is returned
+# untouched, so a user-written `assert` is never mistaken for a contract.
+
+import compiler.util
+import compiler.ast
+import compiler.fmt_writer
+import compiler.fmt_expr
+
+#[doc("A fn body split into its recovered `requires` predicates, `ensures` predicates, and the remaining body.")]
+pub type FmtContracts = FC([Expr], [Expr], Expr)
+
+#[doc("Peel the contract asserts off a fn body, recovering the `requires` / `ensures` predicates; a body that is not the contract desugar comes back unchanged.")]
+pub fn fmt_split_contracts(body: Expr) : FmtContracts = match body.kind {
+  EBlock(stmts, tail) -> {
+    let reqs = fmt_leading_contract_preds(stmts, "requires", [])
+    if list_is_empty(reqs) { FC([], [], body) }
+    else { fmt_contracts_rest(reqs, fmt_drop_n(stmts, list_length(reqs)), tail, body) }
+  }
+  _ -> FC([], [], body)
+}
+
+#[doc("Emit `kw <pred>` for each contract predicate, in signature position.")]
+pub fn fmt_contract_clauses(kw: String, preds: [Expr], s: FmtSt) : FmtSt = match preds {
+  [] -> s
+  [p, ...rest] -> {
+    let s1 = fmt_emit(s, concat_all([" ", kw, " "]))
+    fmt_contract_clauses(kw, rest, fmt_expr(p, s1))
+  }
+}
+
+# What follows the `requires` asserts: either the `ensures` shape, or a
+# plain remainder that becomes the body. An empty remainder with no tail
+# cannot be re-formed into a body, so the whole split is abandoned.
+fn fmt_contracts_rest(reqs: [Expr], rest: [Stmt], tail: Option[Expr], body: Expr) : FmtContracts {
+  match fmt_ensures_shape(rest, tail) {
+    Some(es) -> match es { FC(_, enss, inner) -> FC(reqs, enss, inner) }
+    None     -> match rest {
+      [] -> fmt_contracts_tail_only(reqs, tail, body)
+      _  -> FC(reqs, [], mk_expr(EBlock(rest, tail), body.line, body.col))
+    }
+  }
+}
+
+fn fmt_contracts_tail_only(reqs: [Expr], tail: Option[Expr], body: Expr) : FmtContracts =
+  match tail {
+    Some(t) -> FC(reqs, [], t)
+    None    -> FC([], [], body)
+  }
+
+# The `ensures` tail: `let result = <body>; ens_asserts...; result`.
+# Every statement after the binding must be an `ensures` assert; a
+# trailing user statement means this is not the desugar's shape.
+fn fmt_ensures_shape(stmts: [Stmt], tail: Option[Expr]) : Option[FmtContracts] = match stmts {
+  [SLet(pat, None, inner), ...rest] ->
+    if fmt_pat_is_result(pat) and fmt_tail_is_result(tail) {
+      fmt_ensures_preds(rest, inner)
+    } else { None }
+  _ -> None
+}
+
+fn fmt_ensures_preds(rest: [Stmt], inner: Expr) : Option[FmtContracts] {
+  let enss = fmt_leading_contract_preds(rest, "ensures", [])
+  if list_is_empty(enss) { None }
+  else if list_length(enss) == list_length(rest) { Some(FC([], enss, inner)) }
+  else { None }
+}
+
+fn fmt_pat_is_result(p: Pattern) : Bool = match p.pkind {
+  PBind(n) -> n == "result"
+  _        -> false
+}
+
+fn fmt_tail_is_result(tail: Option[Expr]) : Bool = match tail {
+  Some(t) -> match t.kind { EVar(n) -> n == "result" _ -> false }
+  None    -> false
+}
+
+# Collect the predicates of the leading contract asserts of `kind`,
+# stopping at the first statement that is not one.
+fn fmt_leading_contract_preds(stmts: [Stmt], kind: String, acc: [Expr]) : [Expr] {
+  match stmts {
+    [SAssert(pred, Some(msg)), ...rest] ->
+      if fmt_assert_msg_kind(msg) == kind {
+        fmt_leading_contract_preds(rest, kind, [pred, ...acc])
+      } else { list_reverse(acc) }
+    _ -> list_reverse(acc)
+  }
+}
+
+# The contract kind a desugared assert message names, or "" when the
+# assert is user-written.
+fn fmt_assert_msg_kind(msg: Expr) : String = match msg.kind {
+  EStr(span, false) ->
+    if fmt_span_starts_with(span, "\"requires violated") { "requires" }
+    else if fmt_span_starts_with(span, "\"ensures violated") { "ensures" }
+    else { "" }
+  _ -> ""
+}
+
+fn fmt_span_starts_with(s: String, prefix: String) : Bool {
+  let n = string_length(prefix)
+  if string_length(s) < n { false } else { string_slice(s, 0, n) == prefix }
+}
+
+fn fmt_drop_n(xs: [Stmt], n: Int) : [Stmt] {
+  if n <= 0 { xs }
+  else {
+    match xs {
+      [] -> []
+      [_, ...rest] -> fmt_drop_n(rest, n - 1)
+    }
+  }
+}
