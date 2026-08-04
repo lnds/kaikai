@@ -209,6 +209,23 @@ recursive or example-only chains never produce a false positive. `pub`
 functions are reachable from other modules and `main` is the entry
 point, so both are exempt; only the sound private case fires.
 
+Only a function the **source declares at top level** is a candidate. An
+`impl` method and a `#[derive(...)]` impl both become ordinary top-level
+functions by the time the lint runs, but neither remedy the message
+proposes applies to them — you cannot remove a function the compiler
+synthesised, nor export it — so they are exempt:
+
+```kaikai
+#[derive(Eq, Show)]
+pub type Color = Red | Green | Blue    # not flagged: derive writes the impls
+
+fn main() : Int = if Red == Red { 0 } else { 1 }
+```
+
+The exemption is about **provenance, not spelling**: a private function
+you write yourself is flagged whatever you name it, including a name
+that mimics the compiler's own mangling.
+
 ### effect_over_declared
 
 A `pub` signature whose declared effect row carries a label its own body

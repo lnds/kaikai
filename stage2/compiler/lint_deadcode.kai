@@ -5,10 +5,38 @@ import compiler.ast
 # `LintFinding` is defined in `compiler.lint_idiom` and shared by every
 # lint module.
 
-#[doc("dead_code_unused_priv findings over a typed program's root-file decls; one finding per unreferenced private function.")]
-pub fn deadcode_findings(decls: [Decl]) : [LintFinding] {
+#[doc("dead_code_unused_priv findings over a typed program's root-file decls; one finding per unreferenced private function. `declared` lists the top-level fn names the source actually declares — a lowered decl absent from it was synthesised and is exempt.")]
+pub fn deadcode_findings(decls: [Decl], declared: [String]) : [LintFinding] {
   let used = collect_used(decls, [])
-  scan_unused(decls, used, [])
+  scan_unused(decls, used, declared, [])
+}
+
+# ---- the declared set ------------------------------------------------
+#
+# Names of fns the source declares at top level, read off the AST as the
+# parser produced it (before protocol lowering synthesises its own).
+# Attribute wrappers are transparent; an `impl`/`derive` body is not
+# descended into, because its methods are not top-level declarations.
+
+#[doc("Top-level fn names a source AST declares, seeing through attribute wrappers. Methods inside `impl` / `derive` are excluded: they are lowered into top-level DFns but the user never declared them as such.")]
+pub fn deadcode_declared_fns(decls: [Decl]) : [String] =
+  declared_loop(decls, [])
+
+fn declared_loop(decls: [Decl], acc: [String]) : [String] {
+  match decls {
+    []           -> acc
+    [d, ...rest] -> declared_loop(rest, declared_in_decl(d, acc))
+  }
+}
+
+fn declared_in_decl(d: Decl, acc: [String]) : [String] {
+  match d {
+    DFn(_, name, _, _, _, _, _, _, _, _) -> [name, ...acc]
+    DUnstable(inner, _, _)               -> declared_in_decl(inner, acc)
+    DConstructor(inner, _, _)            -> declared_in_decl(inner, acc)
+    DDoc(_, _, inner, _, _)              -> declared_in_decl(inner, acc)
+    _                                    -> acc
+  }
 }
 
 # ---- the reference set -----------------------------------------------
@@ -56,20 +84,21 @@ fn names_in_exprs(xs: [Expr], acc: [String]) : [String] {
 
 # ---- the unused scan -------------------------------------------------
 
-fn scan_unused(decls: [Decl], used: [String], acc: [LintFinding]) : [LintFinding] {
+fn scan_unused(decls: [Decl], used: [String], declared: [String],
+                acc: [LintFinding]) : [LintFinding] {
   match decls {
     []           -> list_reverse(acc)
-    [d, ...rest] -> scan_unused(rest, used, dc_decl(d, used, acc))
+    [d, ...rest] -> scan_unused(rest, used, declared, dc_decl(d, used, declared, acc))
   }
 }
 
 # A private root-file function (mo = None, not pub, not `main`) whose name
 # never appears in the reference set is dead code. pub functions are
 # reachable from other modules; `main` is the entry point.
-fn dc_decl(d: Decl, used: [String], acc: [LintFinding]) : [LintFinding] {
+fn dc_decl(d: Decl, used: [String], declared: [String], acc: [LintFinding]) : [LintFinding] {
   match d {
     DFn(is_pub, name, _, _, _, _, _, line, col, mo) ->
-      if dc_is_dead(is_pub, name, mo, used) {
+      if dc_is_dead(is_pub, name, mo, used, declared) {
         [LF("dead_code_unused_priv", line, col,
             concat_all(["private function `", name, "` is never used; remove it or export it"])), ...acc]
       } else { acc }
@@ -77,8 +106,14 @@ fn dc_decl(d: Decl, used: [String], acc: [LintFinding]) : [LintFinding] {
   }
 }
 
-fn dc_is_dead(is_pub: Bool, name: String, mo: Option[String], used: [String]) : Bool =
-  is_root(mo) and not is_pub and name != "main" and not mem(name, used)
+# The lint runs on the lowered AST, where an `impl`/`derive` method has
+# already become a top-level `__pimpl_*` DFn indistinguishable from a
+# private fn. Requiring the name in `declared` — the fn names the source
+# text itself declares at top level — is what keeps the two apart: the
+# remedies the message proposes only exist for a fn the user wrote.
+fn dc_is_dead(is_pub: Bool, name: String, mo: Option[String],
+               used: [String], declared: [String]) : Bool =
+  is_root(mo) and not is_pub and name != "main" and mem(name, declared) and not mem(name, used)
 
 fn is_root(mo: Option[String]) : Bool {
   match mo {
