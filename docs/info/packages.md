@@ -91,6 +91,11 @@ fn helper() : Int = 42                         # private to file
 fn main() : Int = add(helper(), 1)
 ```
 
+`pub` marks every top-level form the same way — `fn`, `type` (which
+also exports its variant constructors), `effect`, `protocol`, `unit`,
+`axiom` and `const`. A `pub const` is read from an importing module
+qualified (`lib.LIMIT`), unqualified, or in match-pattern position.
+
 Private items cannot be imported by other packages. Public items in
 internal packages do NOT leak to consumers if the public package
 re-exports them through a public surface; the typer's pub-leak
