@@ -1717,8 +1717,15 @@ pub fn strip_import_holes(decls: [Decl], acc: [Decl]) : [Decl] {
 # `validate_pub_access` / `collect_pub_access_table`.
 pub type CoreSegment = PSeg(String, [Decl])
 
-type PubAccessEntry = PAE(String, String, Bool)
-#                          name    home    is_pub
+type PubAccessEntry = PAE(String, String, Bool, Bool)
+#                          name    home    is_pub  is_type
+#
+# `is_type` separates the two namespaces the table would otherwise
+# conflate. A name in type position (`Pair[a, b]`) must never resolve
+# against a value entry: type variables are not always declared in the
+# `tparams` list (`fn swap(p: Pair[a, b])` binds `a`/`b` implicitly),
+# so an undeclared one falls through to the table and would match any
+# same-named `fn` in another module.
 
 # Build the table of every top-level declaration in the merged
 # decl stream. Each entry records the decl's name, the module
@@ -1835,19 +1842,19 @@ fn impl_home_hint(ms: [Decl], cur_mod: String) : String = match ms {
 fn priv_one(d: Decl, home_mod: String, acc: [PubAccessEntry]) : [PubAccessEntry] =
   match d {
     DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, false), ...acc]
     DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, false), ...acc]
     DConst(is_pub, name, _, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, false), ...acc]
     DType(is_pub, name, _, body, _, _, _, _) ->
       pae_with_variants(name, body, home_mod, is_pub, acc)
     DEffect(is_pub, name, _, _, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, true), ...acc]
     DProtocol(is_pub, name, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, true), ...acc]
     DUnit(is_pub, name, _, _, _, _) ->
-      [PAE(name, home_mod, is_pub), ...acc]
+      [PAE(name, home_mod, is_pub, true), ...acc]
     DDerive(_, inner, _, _)  -> priv_one(inner, home_mod, acc)
     DUnstable(inner, _, _)   -> priv_one(inner, home_mod, acc)
     DProtoLaws(_, inner, _, _) -> priv_one(inner, home_mod, acc)
@@ -1872,7 +1879,7 @@ fn impl_methods_pub(ms: [Decl], home_mod: String,
   [] -> acc
   [m, ...rest] -> match m {
     DFn(_, name, _, _, _, _, _, _, _, _) ->
-      impl_methods_pub(rest, home_mod, [PAE(name, home_mod, true), ...acc])
+      impl_methods_pub(rest, home_mod, [PAE(name, home_mod, true, false), ...acc])
     _ -> impl_methods_pub(rest, home_mod, acc)
   }
 }
@@ -1891,16 +1898,19 @@ fn pae_with_variants(name: String, body: TypeBody, mod: String,
                        is_pub: Bool, acc: [PubAccessEntry]) : [PubAccessEntry] =
   match body {
     TBSum(vs) -> pae_variants(vs, mod, is_pub,
-                                [PAE(name, mod, is_pub), ...acc])
-    _         -> [PAE(name, mod, is_pub), ...acc]
+                                [PAE(name, mod, is_pub, true), ...acc])
+    _         -> [PAE(name, mod, is_pub, true), ...acc]
   }
 
+# Variant ctors sit in both namespaces: `Some(x)` is a value in an
+# expression and `Option[a]` reaches them through the type name. They
+# are registered as type entries so signature checks keep seeing them.
 fn pae_variants(vs: [Variant], mod: String, is_pub: Bool,
                   acc: [PubAccessEntry]) : [PubAccessEntry] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
     Var(cname, _) -> pae_variants(rest, mod, is_pub,
-                                    [PAE(cname, mod, is_pub), ...acc])
+                                    [PAE(cname, mod, is_pub, true), ...acc])
   }
 }
 
@@ -1919,9 +1929,17 @@ type PubAccessVerdict
   | Unknown
 
 fn pae_decide(table: [PubAccessEntry], name: String, home: String) : PubAccessVerdict =
-  pae_decide_loop(table, name, home, None)
+  pae_decide_loop(table, name, home, false, None)
+
+# `types_only` restricts the scan to the type namespace, for names read
+# out of a signature. Without it an implicitly-bound type variable
+# matches a same-named `fn` from an unrelated module.
+fn pae_decide_types(table: [PubAccessEntry], name: String,
+                      home: String) : PubAccessVerdict =
+  pae_decide_loop(table, name, home, true, None)
 
 fn pae_decide_loop(table: [PubAccessEntry], name: String, home: String,
+                     types_only: Bool,
                      first_private: Option[String]) : PubAccessVerdict =
   match table {
     [] -> match first_private {
@@ -1929,18 +1947,18 @@ fn pae_decide_loop(table: [PubAccessEntry], name: String, home: String,
       None    -> Unknown
     }
     [e, ...rest] -> match e {
-      PAE(n, h, p) ->
-        if n == name {
+      PAE(n, h, p, is_ty) ->
+        if n == name and (is_ty or not types_only) {
           if h == home or p { Visible }
           else {
             let fp = match first_private {
               Some(_) -> first_private
               None    -> Some(h)
             }
-            pae_decide_loop(rest, name, home, fp)
+            pae_decide_loop(rest, name, home, types_only, fp)
           }
         } else {
-          pae_decide_loop(rest, name, home, first_private)
+          pae_decide_loop(rest, name, home, types_only, first_private)
         }
     }
   }
@@ -2441,7 +2459,7 @@ fn vpa_sig_check_name(n: String, table: [PubAccessEntry], home: String,
   # constructor or type from an unrelated module.
   if list_has(tparams, n) { 0 }
   else {
-    match pae_decide(table, n, home) {
+    match pae_decide_types(table, n, home) {
       Visible -> 0
       Unknown -> 0
       PrivateTo(other_home) -> {
