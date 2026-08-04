@@ -323,6 +323,76 @@ a smaller corpus. PR path: N=4, 2 repeats. Nightly cron and manual
 dispatch: N in {2,4,8}, 3 repeats. Locally: `make test-mn-corpus`,
 scoped with `MN_CORPUS_DIRS` while iterating.
 
+## Formatter meaning-preservation discipline (issue #1605)
+
+`kai fmt` had two nets and neither checked the property that matters.
+`tests/fmt_fixtures.sh` compares 54 fixtures against goldens — it covers
+what somebody thought to write down. `tests/fmt_selfhost.sh` requires
+exit 0 and byte-identical idempotency over `stdlib/` + `stage2/compiler/`
+— which sounds total but only ever sees **code that already exists in
+the repo**. A surface form no repo file happens to use is invisible to
+both. Six writer bugs shipped through that gap in a single week
+(#1597, #1599, #1600, #1601, #1602, #1603); three of them left the file
+**unparseable**, after a rewrite that is in-place, silent, and inherited
+by `kai migrate` through the shared writer (`kai migrate` re-emits via
+`fmt_program`, so a package with nothing to migrate takes pure damage).
+
+The first run of the property gate found four more the two older nets
+could not see, because all four produce output that **parses**: #1606
+(a `requires`/`ensures` clause erased from the signature into a body
+`assert`, so the compiler stops checking the contract at call sites —
+a compile-time error becomes a runtime failure), #1607 (hex and binary
+literals re-rendered as decimal: `0xFFFFFFFFFFFFFFFF` comes back as
+`-1`), #1608 (`3i` emitted as its `complex.mk` desugar) and #1610 (a
+`~r/.../` regex literal emitted as a malformed desugar). The last two
+produce files that no longer compile.
+
+The missing assertion is the central property of a formatter: **`fmt`
+preserves meaning**. `tests/fmt_property.sh` (target `test-fmt-property`)
+asserts four things per source:
+
+- **(a) exit 0** — fmt does not refuse the file.
+- **(b) re-parse** — the output is still valid kaikai. Catches a writer
+  emitting an internal encoding (`s#Shape`, `...__list_rest_10_10__`).
+- **(c) AST equality** — `parse(fmt(src))` equals `parse(src)` modulo
+  source position. Catches output that parses but denotes something
+  else.
+- **(d) idempotency** — `fmt(fmt(x)) == fmt(x)`.
+
+**The corpus is `examples/**`, and that is the whole point.** It is
+~1780 files against the selfhost corpus's 214, and more importantly it
+exercises surface the compiler's own sources never use — rest-patterns,
+kind-annotated type parameters, record literals delimited in condition
+position. That is where the six bugs lived. A run covers 1537 files;
+193 are dropped because the parser rejects them (negative fixtures,
+by design) and the rest are excused against an open issue.
+
+Cost is four `kaic2` invocations per file, ~18 minutes serial. That does
+not fit a Tier 1 shard, so the script fans out over `$(nproc)` workers
+(`FMT_PROPERTY_JOBS` overrides) — the work is per-file independent. Note
+the harness passes `--path stdlib`: without it most of the corpus fails
+to resolve its imports and is silently dropped as unparseable, which
+costs about a quarter of the coverage.
+
+(c) compares `kaic2 --ast` output with `@line:col` suffixes stripped;
+normalising position is mandatory, since reformatting moves every token
+and an unnormalised dump would differ for every file. The dumper is
+structural and exhaustive over Expr/Pattern/TypeExpr/Decl with no
+catch-all arm, but it is a **proxy**, not structural equality on the AST
+type, and it drops three slots: the `TyRefine` where-predicate, the
+`DDoc` text, and lambda parameter annotations. Comments are not in the
+AST at all, so (c) cannot see a comment re-attached to the wrong element
+(#1597) except when the move also perturbs structure. **This is why the
+property gate does not retire the golden fixtures** — goldens remain the
+only net over comment placement and layout, and the two are complements.
+
+Exception lists inside the script are keyed by issue number and waive
+**one property for one file**; an excused file must still satisfy the
+other three, so an exception cannot mask a total refusal. A file that
+stops failing while still listed fails the run as a stale exception —
+that is what forces the list to empty instead of rot. **The lists must
+reach zero**, exactly like the skip-list in `tests/fmt_selfhost.sh`.
+
 ## Tier 2 — `make daily` (end of day / cron)
 
 ~10-20 minutes. Runs once a day on `main` HEAD, not on each PR.

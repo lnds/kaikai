@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -317,7 +317,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -351,7 +351,8 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope t
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
 #     light(1/3), light(2/3), light(3/3),
-#     demos-no-regression, test-fmt, test-fmt-selfhost, test-bench,
+#     demos-no-regression, test-fmt, test-fmt-selfhost,
+#     test-fmt-help-scope, test-fmt-property, test-bench,
 #     test-check, test-library-mode, test-diagnostics-collected,
 #     test-negative, test-stdlib-modules, test-packages,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
@@ -366,7 +367,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms
+	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
 tier1-shard-2: kaic2
@@ -508,6 +509,24 @@ test-fmt-selfhost: kaic2
 # re-acquire the stale "refused with an explicit error" promise.
 test-fmt-help-scope: kaic2
 	@./tests/fmt_help_scope.sh
+# `kai fmt` meaning-preservation gate. The fixture suite covers shapes
+# somebody wrote down; the selfhost ratchet covers shapes that occur in
+# stdlib/ + stage2/compiler/. Neither checks that fmt PRESERVES MEANING,
+# which is how a run of writer bugs shipped that left files unparseable
+# after an in-place, silent rewrite. Over every examples/**/*.kai this
+# asserts: fmt exits 0, its output re-parses, the parsed AST matches the
+# input's modulo position, and fmt is idempotent. examples/ is the point
+# — it exercises surface (rest-patterns, kind-annotated type params,
+# delimited record literals in condition position) that the selfhost
+# corpus never uses. The exception lists inside the script are numbered
+# by issue and must reach zero.
+#
+# Cost: four kaic2 invocations per file over ~1800 files. Serial that is
+# ~18 min, which does not fit a shard; the work is per-file independent,
+# so the script fans out over $(nproc) workers (FMT_PROPERTY_JOBS to
+# override). It rides shard-1 alongside its two sibling fmt gates.
+test-fmt-property: kaic2
+	@./tests/fmt_property.sh
 
 # bench v1.x (issues #40 + #437) — smoke for `kai bench`. Builds +
 # runs the `examples/stdlib/bench_basic.kai` and
