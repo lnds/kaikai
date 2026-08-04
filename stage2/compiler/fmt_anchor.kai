@@ -1,0 +1,188 @@
+# compiler/fmt_anchor.kai — source lines for a type decl's inner
+# elements, recovered from the token stream.
+#
+# `Variant` and `FieldDecl` carry no source location, so the writer
+# cannot tell which sum variant or record field a trailing `# ...`
+# followed. This module walks the raw token stream and yields, for a
+# type decl starting at a given line, the source line of each variant
+# (or field) in declaration order. `fmt_decl` zips that list against
+# the AST elements and drains each element's trailing comment inline.
+#
+# Scanning tokens rather than threading a line through the AST keeps
+# the fix inside the fmt cluster: the alternative touches `Var` / `FD`
+# at ~120 construction sites across the typer, the emitters and the
+# cache codec, for information only the formatter consumes.
+#
+# The scan is deliberately shallow — it records the line of the token
+# opening each element, where elements are separated by a depth-0 `|`
+# (sum) or `,` (record). A payload's own commas and pipes sit at
+# depth > 0 and are skipped.
+
+import compiler.util
+import compiler.lex
+
+#[doc("Source lines of a type declaration's variants or record fields, in declaration order.")]
+pub type ElemLines = EL([Int])
+
+#[doc("Line of the `i`-th element, or 0 when unknown.")]
+pub fn elem_line_at(e: ElemLines, i: Int) : Int = match e {
+  EL(xs) -> elem_line_nth(xs, i)
+}
+
+# The 0 sentinel means "unknown": every caller falls back to the
+# decl-level behaviour rather than anchoring against a guess.
+fn elem_line_nth(xs: [Int], i: Int) : Int = match xs {
+  [] -> 0
+  [x, ...rest] -> if i <= 0 { x } else { elem_line_nth(rest, i - 1) }
+}
+
+#[doc("Scan `tokens` for the type declaration opening at `line` and return its element lines.")]
+pub fn scan_elem_lines(tokens: [Token], line: Int) : ElemLines =
+  EL(anchor_reverse(anchor_from_type(tokens, line), []))
+
+fn anchor_reverse(xs: [Int], acc: [Int]) : [Int] = match xs {
+  [] -> acc
+  [x, ...rest] -> anchor_reverse(rest, [x, ...acc])
+}
+
+fn anchor_from_type(tokens: [Token], line: Int) : [Int] = match tokens {
+  [] -> []
+  [t, ...rest] ->
+    if anchor_is_type(t.kind) and (t.line >= line) {
+      anchor_head(rest, 0)
+    } else {
+      anchor_from_type(rest, line)
+    }
+}
+
+# Skip the type head (name, `[tparams]`, `<slots>`) up to the `=`,
+# then pick the body shape: `{` opens a record, anything else a sum
+# or alias. A record's `{` follows the `=`, so the `=` alone cannot
+# discriminate — the token after it does.
+fn anchor_head(tokens: [Token], depth: Int) : [Int] = match tokens {
+  [] -> []
+  [t, ...rest] -> {
+    let k = t.kind
+    if anchor_head_opens(k) {
+      anchor_head(rest, depth + 1)
+    } else if anchor_head_closes(k) {
+      anchor_head(rest, depth - 1)
+    } else if depth > 0 {
+      anchor_head(rest, depth)
+    } else if anchor_is_lbrace(k) {
+      anchor_elems(rest, 0, [], true, true)
+    } else if anchor_is_eq(k) {
+      anchor_body(rest)
+    } else if anchor_is_eof(k) {
+      []
+    } else {
+      anchor_head(rest, depth)
+    }
+  }
+}
+
+# Dispatch on the first significant token after the body's `=`.
+fn anchor_body(tokens: [Token]) : [Int] = match tokens {
+  [] -> []
+  [t, ...rest] -> {
+    let k = t.kind
+    if anchor_is_newline(k) {
+      anchor_body(rest)
+    } else if anchor_is_lbrace(k) {
+      anchor_elems(rest, 0, [], true, true)
+    } else {
+      anchor_elems(tokens, 0, [], true, false)
+    }
+  }
+}
+
+# Walk one body, recording the line of each element's opening token.
+# `want` marks that the next significant token opens an element;
+# `rec` selects the record separator (`,` and a closing `}`) over the
+# sum one (`|`, ending at a decl keyword).
+fn anchor_elems(tokens: [Token], depth: Int, acc: [Int], want: Bool, rec: Bool) : [Int] = match tokens {
+  [] -> acc
+  [t, ...rest] ->
+    if anchor_stops(t.kind, depth, rec) {
+      acc
+    } else if anchor_is_newline(t.kind) {
+      anchor_elems(rest, depth, acc, want, rec)
+    } else {
+      anchor_elems(rest, depth + anchor_depth_delta(t.kind),
+                   anchor_take(acc, t.line, want and not anchor_closes(t.kind)),
+                   anchor_next_want(t.kind, depth, rec), rec)
+    }
+}
+
+fn anchor_stops(k: TokKind, depth: Int, rec: Bool) : Bool =
+  anchor_is_eof(k) or ((depth == 0) and anchor_body_ends(k, rec))
+
+fn anchor_depth_delta(k: TokKind) : Int =
+  if anchor_opens(k) { 1 } else if anchor_closes(k) { 0 - 1 } else { 0 }
+
+# The token after a depth-0 separator opens the next element. A
+# separator nested inside a payload belongs to that payload, not to
+# the body being walked.
+fn anchor_next_want(k: TokKind, depth: Int, rec: Bool) : Bool =
+  (depth == 0) and anchor_is_sep(k, rec)
+
+fn anchor_take(acc: [Int], line: Int, want: Bool) : [Int] =
+  if want { [line, ...acc] } else { acc }
+
+fn anchor_body_ends(k: TokKind, rec: Bool) : Bool =
+  if rec { anchor_is_rbrace(k) } else { anchor_starts_decl(k) }
+
+fn anchor_is_sep(k: TokKind, rec: Bool) : Bool =
+  if rec { anchor_is_comma(k) } else { anchor_is_pipe(k) }
+
+fn anchor_opens(k: TokKind) : Bool = match k {
+  TkLparen -> true
+  TkLbracket -> true
+  TkLbrace -> true
+  _ -> false
+}
+
+fn anchor_closes(k: TokKind) : Bool = match k {
+  TkRparen -> true
+  TkRbracket -> true
+  TkRbrace -> true
+  _ -> false
+}
+
+# `<` / `[` in the type head: habitant slots and type params.
+fn anchor_head_opens(k: TokKind) : Bool = match k {
+  TkLbracket -> true
+  TkLt -> true
+  _ -> false
+}
+
+fn anchor_head_closes(k: TokKind) : Bool = match k {
+  TkRbracket -> true
+  TkGt -> true
+  _ -> false
+}
+
+fn anchor_is_type(k: TokKind) : Bool = match k { TkType -> true _ -> false }
+fn anchor_is_eof(k: TokKind) : Bool = match k { TkEof -> true _ -> false }
+fn anchor_is_newline(k: TokKind) : Bool = match k { TkNewline -> true _ -> false }
+fn anchor_is_lbrace(k: TokKind) : Bool = match k { TkLbrace -> true _ -> false }
+fn anchor_is_rbrace(k: TokKind) : Bool = match k { TkRbrace -> true _ -> false }
+fn anchor_is_eq(k: TokKind) : Bool = match k { TkEq -> true _ -> false }
+fn anchor_is_comma(k: TokKind) : Bool = match k { TkComma -> true _ -> false }
+fn anchor_is_pipe(k: TokKind) : Bool = match k { TkPipe -> true _ -> false }
+
+# Keywords that can only open a new top-level declaration, so a sum
+# body has ended by the time one appears.
+fn anchor_starts_decl(k: TokKind) : Bool = match k {
+  TkPub -> true
+  TkFn -> true
+  TkType -> true
+  TkTest -> true
+  TkImport -> true
+  TkEffect -> true
+  TkProtocol -> true
+  TkImpl -> true
+  TkConst -> true
+  TkTheory -> true
+  _ -> false
+}

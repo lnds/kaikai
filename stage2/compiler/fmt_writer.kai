@@ -37,10 +37,13 @@ pub type Cmt
 # end); `cmts` is the suffix of yet-to-emit comments (sorted by line);
 # `indent` is the current nesting in 2-space units; `at_line_start`
 # tracks whether the writer is positioned at column 1 (so emit_token
-# can prepend indentation lazily).
-pub type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool }
+# can prepend indentation lazily). `toks` is the source token stream,
+# consulted to recover the source line of AST nodes that carry none
+# (sum variants, record fields) so their trailing comments anchor to
+# the right element.
+pub type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool, toks: [Token] }
 
-pub fn fmt_init(cmts: [Cmt]) : FmtSt = FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true }
+pub fn fmt_init(cmts: [Cmt], toks: [Token]) : FmtSt = FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true, toks: toks }
 
 pub fn fmt_finish(s: FmtSt) : String {
   # The accumulator ends with one trailing newline (every decl
@@ -74,7 +77,7 @@ fn fmt_indent_str(s: FmtSt) : String = spaces(s.indent * 2)
 # Push a raw chunk into the output. Caller is responsible for
 # indentation handling — most call sites should go through
 # `fmt_emit` / `fmt_newline`.
-fn fmt_push(s: FmtSt, chunk: String) : FmtSt = FmtSt { out: [chunk, ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: false }
+fn fmt_push(s: FmtSt, chunk: String) : FmtSt = FmtSt { out: [chunk, ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: false, toks: s.toks }
 
 # Emit `chunk`, prepending the current indent if we are at line start.
 pub fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
@@ -85,7 +88,7 @@ pub fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
   }
 }
 
-pub fn fmt_newline(s: FmtSt) : FmtSt = FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true }
+pub fn fmt_newline(s: FmtSt) : FmtSt = FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true, toks: s.toks }
 
 # Position the writer at column 1 without emitting a blank line: a
 # no-op when already at line start, one newline otherwise.
@@ -99,9 +102,9 @@ pub fn fmt_blank_line(s: FmtSt) : FmtSt {
   }
 }
 
-pub fn fmt_indent_in(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent + 1, at_line_start: s.at_line_start }
+pub fn fmt_indent_in(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent + 1, at_line_start: s.at_line_start, toks: s.toks }
 
-pub fn fmt_indent_out(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent - 1, at_line_start: s.at_line_start }
+pub fn fmt_indent_out(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent - 1, at_line_start: s.at_line_start, toks: s.toks }
 
 # Emit one full-line comment (`# text` + newline) at the current
 # indent. The writer is assumed already at line start.
@@ -142,7 +145,7 @@ fn fmt_drain_before_loop(s: FmtSt, target_line: Int, prev: Int) : FmtSt {
       } else {
         let s1 = fmt_ensure_newline(s)
         let s2 = drain_blank_between(s1, prev, cl)
-        let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+        let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
         let s4 = fmt_emit_comment_line(s3, text)
         fmt_drain_before_loop(s4, target_line, cl)
       }
@@ -159,7 +162,7 @@ fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
     [Cmt(cl, _, text, _), ...rest] -> {
       let s1 = fmt_ensure_newline(s)
       let s2 = drain_blank_between(s1, prev, cl)
-      let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+      let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
       let s4 = fmt_emit_comment_line(s3, text)
       fmt_drain_rest_loop(s4, cl)
     }
@@ -191,9 +194,10 @@ fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
 # Only one trailing is drained per call. If multiple trailings
 # remain pending in the gap (rare: inner-record + outer
 # trailings), the rest fall back to leading-position via
-# `fmt_drain_before`. v1 design — fixing inner-position trailings
-# would require walking the token stream alongside the AST, the
-# bigger refactor option (a) the issue mentioned.
+# `fmt_drain_before`. Elements that carry no source line of their own
+# (sum variants, record fields) anchor through
+# `fmt_drain_trailing_on_line` instead, using the line the token scan
+# recovered for them.
 pub fn fmt_drain_trailing_after(s: FmtSt, limit: Int) : FmtSt {
   match s.cmts {
     [] -> s
@@ -201,7 +205,29 @@ pub fn fmt_drain_trailing_after(s: FmtSt, limit: Int) : FmtSt {
       if is_tr and ((limit == 0) or (cl < limit)) {
         let s1 = fmt_emit(s, "  #")
         let s2 = fmt_emit(s1, text)
-        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start }
+        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
+      } else {
+        s
+      }
+    }
+  }
+}
+
+# Drain the pending trailing comment that sits on source line `line`,
+# emitting it inline. Unlike `fmt_drain_trailing_after`'s upper-bound
+# form this demands an exact match, so a comment can only land on the
+# element it actually followed: a variant with no comment of its own
+# leaves the next variant's comment pending. `line == 0` (the unknown
+# sentinel from the token scan) never matches, so the caller silently
+# keeps the decl-level behaviour.
+pub fn fmt_drain_trailing_on_line(s: FmtSt, line: Int) : FmtSt {
+  match s.cmts {
+    [] -> s
+    [Cmt(cl, _, text, is_tr), ...rest] -> {
+      if (is_tr and (line > 0)) and (cl == line) {
+        let s1 = fmt_emit(s, "  #")
+        let s2 = fmt_emit(s1, text)
+        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
       } else {
         s
       }

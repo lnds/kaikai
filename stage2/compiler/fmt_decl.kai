@@ -13,6 +13,7 @@ import compiler.chars
 import compiler.ast
 import compiler.parse
 import compiler.fmt_writer
+import compiler.fmt_anchor
 import compiler.fmt_expr
 import compiler.fmt_effect
 
@@ -23,8 +24,8 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DImport(ik, _, _) -> fmt_import(ik, s)
     DFn(is_pub, name, tparams, params, ret, row, body, _, _, _) ->
       fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
-    DType(is_pub, name, tparams, body, _, _, _, slots) ->
-      fmt_type_decl(is_pub, name, tparams, body, slots, s)
+    DType(is_pub, name, tparams, body, line, _, _, slots) ->
+      fmt_type_decl(is_pub, name, tparams, body, slots, line, s)
     DTest(label, body, _, _) -> fmt_test(label, body, s)
     DBench(label, body, _, _) -> fmt_bench(label, body, s)
     DCheck(label, ps, body, _, _) -> fmt_check(label, ps, body, s)
@@ -276,7 +277,7 @@ pub fn fmt_fn_body(body: Expr, s: FmtSt) : FmtSt {
 
 # ---- type decls -----------------------------------------------------
 
-pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBody, slots: [String], s: FmtSt) : FmtSt {
+pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBody, slots: [String], line: Int, s: FmtSt) : FmtSt {
   let s1 = if is_pub {
     fmt_emit(s, "pub ")
   } else {
@@ -291,12 +292,20 @@ pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBo
       let a = fmt_emit(s4, " = ")
       fmt_type(t, a)
     }
+    # A record whose fields carry comments cannot render on one line —
+    # a comment swallows the rest of its line — so it expands to one
+    # field per line, each keeping the comments that documented it.
     TBRecord(fields) -> {
-      let a = fmt_emit(s4, " = { ")
-      let b = fmt_field_decls(fields, a)
-      fmt_emit(b, " }")
+      let el = scan_elem_lines(s4.toks, line)
+      if elem_lines_commented(fields, el, s4.cmts, 0) {
+        fmt_record_expanded(fields, el, s4)
+      } else {
+        let a = fmt_emit(s4, " = { ")
+        let b = fmt_field_decls(fields, a)
+        fmt_emit(b, " }")
+      }
     }
-    TBSum(variants) -> fmt_sum_variants(variants, s4)
+    TBSum(variants) -> fmt_sum_variants(variants, scan_elem_lines(s4.toks, line), s4)
     TBEffectAlias(labels) -> {
       let a = fmt_emit(s4, " = ")
       fmt_emit(a, string_join(labels, " + "))
@@ -319,6 +328,51 @@ fn fmt_habitant_slots_inner(slots: [String], s: FmtSt) : FmtSt = match slots {
 
 fn fmt_one_slot(slot: String, s: FmtSt) : FmtSt =
   fmt_emit(fmt_emit(fmt_emit(s, habitant_slot_name_of(slot)), ": "), habitant_slot_kind_of(slot))
+
+# True when any of the record's fields carries a comment of its own —
+# a trailing on its line, or a leading block above it. Drives the
+# one-field-per-line layout: the single-line form has nowhere to put a
+# mid-record comment, so it would push every one of them past the
+# closing brace.
+fn elem_lines_commented(fs: [FieldDecl], el: ElemLines, cmts: [Cmt], i: Int) : Bool = match fs {
+  [] -> false
+  [_, ...rest] ->
+    if cmt_within_elem(cmts, elem_line_at(el, i)) {
+      true
+    } else {
+      elem_lines_commented(rest, el, cmts, i + 1)
+    }
+}
+
+# Any pending comment at or above `line` belongs inside the record:
+# `fmt_drain_before` has already emitted everything preceding the decl,
+# so what remains at this point starts at the decl's own body.
+fn cmt_within_elem(cmts: [Cmt], line: Int) : Bool = match cmts {
+  [] -> false
+  [Cmt(cl, _, _, _), ..._rest] -> (line > 0) and (cl <= line)
+}
+
+# `= {` / one field per line / `}`, each field keeping the comments
+# that documented it. Trailing comma is omitted on the last field,
+# matching the single-line form's separator discipline.
+fn fmt_record_expanded(fs: [FieldDecl], el: ElemLines, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, " = {")
+  let s2 = fmt_indent_in(fmt_newline(s1))
+  let s3 = fmt_record_expanded_loop(fs, el, 0, s2)
+  fmt_emit(fmt_indent_out(s3), "}")
+}
+
+fn fmt_record_expanded_loop(fs: [FieldDecl], el: ElemLines, i: Int, s: FmtSt) : FmtSt = match fs {
+  [] -> s
+  [f, ...rest] -> {
+    let line = elem_line_at(el, i)
+    let s0 = fmt_drain_before(s, line)
+    let s1 = fmt_field_decl(f, s0)
+    let s2 = match rest { [] -> s1 _ -> fmt_emit(s1, ",") }
+    let s3 = fmt_drain_trailing_on_line(s2, line)
+    fmt_record_expanded_loop(rest, el, i + 1, fmt_newline(s3))
+  }
+}
 
 pub fn fmt_field_decls(fs: [FieldDecl], s: FmtSt) : FmtSt {
   match fs {
@@ -362,26 +416,28 @@ fn fmt_field_attr(a: FieldAttr, s: FmtSt) : FmtSt = match a {
   }
 }
 
-pub fn fmt_sum_variants(vs: [Variant], s: FmtSt) : FmtSt {
+pub fn fmt_sum_variants(vs: [Variant], el: ElemLines, s: FmtSt) : FmtSt {
   let s0 = fmt_newline(s)
   let s1 = fmt_indent_in(s0)
   let s2 = fmt_emit(s1, "= ")
-  let s3 = fmt_sum_variants_loop(vs, s2, true)
+  let s3 = fmt_sum_variants_loop(vs, el, 0, s2, true)
   fmt_indent_out(s3)
 }
 
-pub fn fmt_sum_variants_loop(vs: [Variant], s: FmtSt, first: Bool) : FmtSt {
+pub fn fmt_sum_variants_loop(vs: [Variant], el: ElemLines, i: Int, s: FmtSt, first: Bool) : FmtSt {
   match vs {
     [] -> s
     [v, ...rest] -> {
+      let line = elem_line_at(el, i)
       let s1 = if first {
         s
       } else {
-        let n = fmt_newline(s)
+        let n = fmt_drain_before(fmt_newline(s), line)
         fmt_emit(n, "| ")
       }
       let s2 = fmt_variant(v, s1)
-      fmt_sum_variants_loop(rest, s2, false)
+      let s3 = fmt_drain_trailing_on_line(s2, line)
+      fmt_sum_variants_loop(rest, el, i + 1, s3, false)
     }
   }
 }
