@@ -1,0 +1,389 @@
+# Declaration and expression reference enumeration for module-privacy
+# validation. `pa_decl_refs` yields every free name a declaration
+# references — value and type namespace, signature and body position —
+# so the privacy decision is made per symbol at a single point
+# (`validate_pub_access`), never per syntactic category. The matches
+# over `Decl`, `ExprKind`, `Stmt` and `PatKind` carry no catch-all arm
+# on purpose: a new AST form fails this file's compile until its
+# privacy story is decided.
+
+import compiler.util
+import compiler.ast
+import compiler.parse
+import compiler.modules
+import compiler.fnreg
+import compiler.pub_access_refs
+
+type PaScope = { bound: [String], refs: [PaRef] }
+
+#[doc("Every free name referenced by `d`, in both namespaces and every syntactic position. Locals, pattern binders and type parameters are already excluded; qualified (dotted) references are excluded because the qualified resolver validates them.")]
+pub fn pa_decl_refs(d: Decl) : [PaRef] / Console = match d {
+  DFn(_, _, tps0, ps, ret, row, body, line, col, _) -> {
+    let tps = pa_tparam_names(tps0)
+    let a1 = par_params(ps, tps, pa_bound_refs(tps0, line, col, []))
+    let a2 = par_opt_te(ret, tps, true, a1)
+    let a3 = par_row(row, tps, true, true, line, col, a2)
+    par_expr(body, fn_param_names(ps), tps, a3)
+  }
+  DAxiom(_, _, _, _, tps0, ps, ret, row, line, col) -> {
+    let tps = pa_tparam_names(tps0)
+    let a1 = par_params(ps, tps, pa_bound_refs(tps0, line, col, []))
+    par_row(row, tps, true, true, line, col, par_te(ret, tps, true, true, a1))
+  }
+  DConst(_, _, te, body, _, _, _) ->
+    par_expr(body, [], [], par_te(te, [], true, true, []))
+  DType(_, _, tps0, body, line, col, _, _) ->
+    par_typebody(body, pa_tparam_names(tps0), line, col, [])
+  DEffect(_, _, tps0, ops, defblk, _, _, _) ->
+    par_default_opt(defblk, par_eops(ops, pa_tparam_names(tps0), []))
+  DProtocol(_, _, tps0, ops, _, _) ->
+    par_pops(ops, ["Self", ...pa_tparam_names(tps0)], [])
+  DImpl(pname, targs, target, subs, line, col, impl_tps) -> {
+    let tps = pa_tparam_names(impl_tps)
+    let a1 = pa_bound_refs(impl_tps, line, col,
+      [pa_ref(pname, true, false, false, line, col)])
+    let a2 = par_te(target, tps, false, false, a1)
+    par_sub_decls(subs, par_te_list(targs, tps, false, false, a2))
+  }
+  DTest(_, body, _, _)  -> par_expr(body, [], [], [])
+  DBench(_, body, _, _) -> par_expr(body, [], [], [])
+  DCheck(_, ps, body, _, _) ->
+    par_expr(body, fn_param_names(ps), [], par_params(ps, [], []))
+  DUnit(_, _, ub, _, line, col) -> match ub {
+    UBAlias(u)   -> par_uexpr(u, [], true, true, line, col, [])
+    UBNone       -> []
+    UBMeasure(_) -> []
+  }
+  DUse(name, line, col) -> [pa_ref(name, true, false, false, line, col)]
+  DExternType(_, body, _, _) -> match body {
+    ETStruct(fs) -> par_fdecls(fs, [], [])
+    ETOpaque     -> []
+  }
+  DDerive(_, inner, _, _)    -> pa_decl_refs(inner)
+  DUnstable(inner, _, _)     -> pa_decl_refs(inner)
+  DConstructor(inner, _, _)  -> pa_decl_refs(inner)
+  DProtoLaws(_, inner, _, _) -> pa_decl_refs(inner)
+  DImplAxiom(_, inner, _, _) -> pa_decl_refs(inner)
+  DDoc(_, _, inner, _, _)    -> pa_decl_refs(inner)
+  DImport(_, _, _)       -> []
+  DModuleDoc(_, _, _, _) -> []
+  DUseKind(_, _, _)      -> []
+  DKind(_, _, _, _, _, _, _) -> []
+  DTheory(_, _, _, _)    -> []
+}
+
+fn par_sub_decls(ds: [Decl], acc: [PaRef]) : [PaRef] / Console = match ds {
+  [] -> acc
+  [d, ...rest] -> par_sub_decls(rest, list_append(pa_decl_refs(d), acc))
+}
+
+# ==== signature positions ====
+
+fn par_opt_te(t: Option[TypeExpr], tps: [String], in_sig: Bool,
+      acc: [PaRef]) : [PaRef] = match t {
+  Some(te) -> par_te(te, tps, in_sig, in_sig, acc)
+  None     -> acc
+}
+
+fn par_params(ps: [Param], tps: [String], acc: [PaRef]) : [PaRef] = match ps {
+  [] -> acc
+  [p, ...rest] -> par_params(rest, tps, par_opt_te(p.ptype, tps, true, acc))
+}
+
+fn par_params_body(ps: [Param], tps: [String], acc: [PaRef]) : [PaRef] = match ps {
+  [] -> acc
+  [p, ...rest] -> par_params_body(rest, tps, par_opt_te(p.ptype, tps, false, acc))
+}
+
+fn par_typebody(b: TypeBody, tps: [String], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match b {
+  TBAlias(te)  -> par_te(te, tps, true, true, acc)
+  TBRecord(fs) -> par_fdecls(fs, tps, acc)
+  TBSum(vs)    -> par_variants(vs, tps, acc)
+  TBEffectAlias(ls) -> pa_bound_names(ls, line, col, acc)
+}
+
+# A `priv` field's type is still a cross-module reference, but it
+# never escapes to consumers — leakable clears.
+fn par_fdecls(fs: [FieldDecl], tps: [String], acc: [PaRef]) : [PaRef] = match fs {
+  [] -> acc
+  [FD(is_pub_f, _, te, _), ...rest] ->
+    par_fdecls(rest, tps, par_te(te, tps, true, is_pub_f, acc))
+}
+
+fn par_variants(vs: [Variant], tps: [String], acc: [PaRef]) : [PaRef] = match vs {
+  [] -> acc
+  [Var(_, tes), ...rest] -> par_variants(rest, tps, par_te_list(tes, tps, true, true, acc))
+}
+
+fn par_eops(ops: [EffectOp], tps: [String], acc: [PaRef]) : [PaRef] = match ops {
+  [] -> acc
+  [EOp(_, op_tps, ps, ret, _, _), ...rest] -> {
+    let local = list_append(pa_tparam_names(op_tps), tps)
+    par_eops(rest, tps, par_te(ret, local, true, true, par_params(ps, local, acc)))
+  }
+}
+
+fn par_pops(ops: [ProtoOp], tps: [String], acc: [PaRef]) : [PaRef] = match ops {
+  [] -> acc
+  [POp(_, op_tps, ps, ret, _, _), ...rest] -> {
+    let local = list_append(pa_tparam_names(op_tps), tps)
+    par_pops(rest, tps, par_te(ret, local, true, true, par_params(ps, local, acc)))
+  }
+}
+
+fn par_default_opt(db: Option[DefaultBlock], acc: [PaRef]) : [PaRef] / Console =
+  match db {
+    Some(DBlk(clauses, ret, _, _)) ->
+      par_hreturn_opt(ret, [], [], par_hclauses(clauses, [], [], acc))
+    None -> acc
+  }
+
+# ==== expression / statement / pattern positions ====
+
+fn par_expr(e: Expr, locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match e.kind {
+  EVar(nm) ->
+    if list_has(locals, nm) or pa_dotted(nm) { acc }
+    else { [pa_ref(nm, false, false, false, e.line, e.col), ...acc] }
+  ECall(callee, args_) ->
+    par_exprs(args_, locals, tps, par_expr(callee, locals, tps, acc))
+  EField(obj, _)   -> par_expr(obj, locals, tps, acc)
+  EIndex(coll, ix) -> par_expr(ix, locals, tps, par_expr(coll, locals, tps, acc))
+  EBinop(_, l, r)  -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EUnop(_, x)      -> par_expr(x, locals, tps, acc)
+  EIf(c, t_, eo) ->
+    par_opt_expr(eo, locals, tps,
+      par_expr(t_, locals, tps, par_expr(c, locals, tps, acc)))
+  EMatch(scr, arms) -> par_arms(arms, locals, tps, par_expr(scr, locals, tps, acc))
+  ELambda(ps, body) ->
+    par_expr(body, list_append(locals, fn_param_names(ps)), tps,
+      par_params_body(ps, tps, acc))
+  ERecordLit(name, fis) -> {
+    let a1 = if name == "" or pa_dotted(name) or list_has(tps, name) { acc }
+      else { [pa_ref(name, true, false, false, e.line, e.col), ...acc] }
+    par_fis(fis, locals, tps, a1)
+  }
+  EList(els) -> par_elems(els, locals, tps, acc)
+  ERange(lo, hi, stp) ->
+    par_opt_expr(stp, locals, tps,
+      par_expr(hi, locals, tps, par_expr(lo, locals, tps, acc)))
+  EBlock(stmts, tail) -> {
+    let sc = par_stmts(stmts, locals, tps, acc)
+    par_opt_expr(tail, sc.bound, tps, sc.refs)
+  }
+  EPipe(l, r)        -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EMapPipe(l, r)     -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EFlatMapPipe(l, r) -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EFilterPipe(l, r)  -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EBang(inner)       -> par_expr(inner, locals, tps, acc)
+  ELitUnit(inner, u) ->
+    par_uexpr(u, tps, false, false, e.line, e.col,
+      par_expr(inner, locals, tps, acc))
+  EHandle(body, ename, tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+    par_handle(body, ename, tyargs, init_opt, alias_opt, clauses, ret_opt,
+      locals, tps, e.line, e.col, acc)
+  EVariantsOf(te, _) -> par_te(te, tps, false, false, acc)
+  EIntrinsic(_, args_) -> par_exprs(args_, locals, tps, acc)
+  # Interpolation regions are still raw string spans at validation
+  # time — re-parse each `#{...}` and walk it, re-anchoring the refs
+  # to the string literal.
+  EStr(span, is_triple) ->
+    if pa_str_has_interp(span) {
+      par_interp(span, is_triple, locals, tps, e.line, e.col, acc)
+    } else { acc }
+  # Surface-fidelity wrappers are dissolved by `surface_lower_decls`
+  # before validation; walk their children in case one ever survives.
+  ESurface(sf) -> par_exprs(surface_children(sf), locals, tps, acc)
+  # Qualified calls: the qualified resolver validated the export.
+  EModCall(_, _) -> acc
+  EInt(_, _) -> acc
+  EReal(_, _) -> acc
+  EFixed(_, _) -> acc
+  EIntLit(_) -> acc
+  EDecimalLit(_) -> acc
+  EBool(_) -> acc
+  EChar(_) -> acc
+  EUnit -> acc
+  EUnder -> acc
+  EPlaceholder -> acc
+  EHole(_) -> acc
+  ETodo(_) -> acc
+  EExternBody(_) -> acc
+}
+
+fn par_opt_expr(o: Option[Expr], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match o {
+  Some(e) -> par_expr(e, locals, tps, acc)
+  None    -> acc
+}
+
+fn par_exprs(xs: [Expr], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match xs {
+  [] -> acc
+  [x, ...rest] -> par_exprs(rest, locals, tps, par_expr(x, locals, tps, acc))
+}
+
+fn par_handle(body: Expr, ename: String, tyargs: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[String],
+      clauses: [HClause], ret_opt: Option[HReturn],
+      locals: [String], tps: [String], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] / Console = {
+  let a1 = if pa_dotted(ename) { acc }
+      else { [pa_ref(ename, true, false, false, line, col), ...acc] }
+  let a2 = par_opt_expr(init_opt, locals, tps,
+      par_te_list(tyargs, tps, false, false, a1))
+  let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+  let a3 = par_hclauses(clauses, inner, tps, par_expr(body, inner, tps, a2))
+  par_hreturn_opt(ret_opt, inner, tps, a3)
+}
+
+fn par_arms(arms: [Arm], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match arms {
+  [] -> acc
+  [Arm(pat, guard, body), ...rest] -> {
+    let inner = pat_binders(pat, locals)
+    let a1 = par_opt_expr(guard, inner, tps, par_pat(pat, locals, tps, acc))
+    par_arms(rest, locals, tps, par_expr(body, inner, tps, a1))
+  }
+}
+
+fn pa_pat_name(name: String, line: Int, col: Int, acc: [PaRef]) : [PaRef] =
+  if pa_dotted(name) { acc }
+  else { [pa_ref(name, false, false, false, line, col), ...acc] }
+
+fn par_pat(p: Pattern, locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match p.pkind {
+  PWild    -> acc
+  PBind(_) -> acc
+  PHole(_) -> acc
+  PLit(e)  -> par_expr(e, locals, tps, acc)
+  PRange(lo, hi) -> par_expr(hi, locals, tps, par_expr(lo, locals, tps, acc))
+  PList(subs, _) -> par_pats(subs, locals, tps, acc)
+  PVariant(name, subs) ->
+    par_pats(subs, locals, tps, pa_pat_name(name, p.line, p.col, acc))
+  PVariantRecord(name, pfs) ->
+    par_pfields(pfs, locals, tps, pa_pat_name(name, p.line, p.col, acc))
+  PRecord(pfs)   -> par_pfields(pfs, locals, tps, acc)
+  PAs(_, inner)  -> par_pat(inner, locals, tps, acc)
+  PNarrow(_, te) -> par_te(te, tps, false, false, acc)
+}
+
+fn par_pats(ps: [Pattern], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match ps {
+  [] -> acc
+  [p, ...rest] -> par_pats(rest, locals, tps, par_pat(p, locals, tps, acc))
+}
+
+fn par_pfields(pfs: [PField], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match pfs {
+  [] -> acc
+  [PField(_, sub, _), ...rest] ->
+    par_pfields(rest, locals, tps, par_pat(sub, locals, tps, acc))
+}
+
+fn par_fis(fis: [FieldInit], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match fis {
+  [] -> acc
+  [FI(_, v), ...rest] -> par_fis(rest, locals, tps, par_expr(v, locals, tps, acc))
+}
+
+fn par_elems(els: [ListElem], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match els {
+  [] -> acc
+  [el, ...rest] -> {
+    let a1 = match el {
+      ElPlain(x)  -> par_expr(x, locals, tps, acc)
+      ElSpread(x) -> par_expr(x, locals, tps, acc)
+    }
+    par_elems(rest, locals, tps, a1)
+  }
+}
+
+fn par_stmts(stmts: [Stmt], locals: [String], tps: [String],
+      acc: [PaRef]) : PaScope / Console = match stmts {
+  [] -> PaScope { bound: locals, refs: acc }
+  [s, ...rest] -> {
+    let sc = par_stmt(s, locals, tps, acc)
+    par_stmts(rest, sc.bound, tps, sc.refs)
+  }
+}
+
+fn pa_scope(bound: [String], refs: [PaRef]) : PaScope =
+  PaScope { bound: bound, refs: refs }
+
+fn par_stmt(s: Stmt, locals: [String], tps: [String],
+      acc: [PaRef]) : PaScope / Console = match s {
+  SLet(pat, tyo, e) -> {
+    let a1 = par_opt_annot(tyo, tps, acc)
+    pa_scope(pat_binders(pat, locals),
+      par_expr(e, locals, tps, par_pat(pat, locals, tps, a1)))
+  }
+  SVar(name, tyo, init, _, _) ->
+    pa_scope([name, ...locals],
+      par_expr(init, locals, tps, par_opt_annot(tyo, tps, acc)))
+  SAssert(cond, msgo) ->
+    pa_scope(locals, par_opt_expr(msgo, locals, tps,
+      par_expr(cond, locals, tps, acc)))
+  SExprStmt(e) -> pa_scope(locals, par_expr(e, locals, tps, acc))
+  SIndexAssign(obj, ix, v, _, _) ->
+    pa_scope(locals,
+      par_expr(v, locals, tps,
+      par_expr(ix, locals, tps,
+      par_expr(obj, locals, tps, acc))))
+  SAssign(lhs, v, _, _) ->
+    pa_scope(locals, par_expr(v, locals, tps, par_expr(lhs, locals, tps, acc)))
+  SUse(name, line, col) ->
+    pa_scope(locals,
+      if pa_dotted(name) { acc }
+      else { [pa_ref(name, true, false, false, line, col), ...acc] })
+}
+
+fn par_opt_annot(tyo: Option[TypeExpr], tps: [String],
+      acc: [PaRef]) : [PaRef] = match tyo {
+  Some(te) -> par_te(te, tps, false, false, acc)
+  None     -> acc
+}
+
+fn par_hclauses(cs: [HClause], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match cs {
+  [] -> acc
+  [HC(_, ps, body, _, _), ...rest] ->
+    par_hclauses(rest, locals, tps,
+      par_expr(body, list_append(locals, fn_param_names(ps)),
+      tps, acc))
+}
+
+fn par_hreturn_opt(r: Option[HReturn], locals: [String], tps: [String],
+      acc: [PaRef]) : [PaRef] / Console = match r {
+  Some(HR(pname, body, _, _)) -> par_expr(body, [pname, ...locals], tps, acc)
+  None -> acc
+}
+
+# ==== string interpolation ====
+
+fn par_interp(span: String, is_triple: Bool, locals: [String], tps: [String],
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] / Console = {
+  let n = string_length(span)
+  let bs = if is_triple { 3 } else { 1 }
+  let be = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, be, IScan { parts: [], lit_start: bs, i: bs })
+  par_interp_parts(parts, locals, tps, line, col, acc)
+}
+
+fn par_interp_parts(ps: [IPart], locals: [String], tps: [String],
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] / Console =
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let a1 = match p {
+        IpLit(_, _) -> acc
+        IpExp(src) -> match parse_interp_expr(src) {
+      Some(ie) -> list_append(pa_repos(par_expr(ie, locals, tps, []),
+      line, col), acc)
+      None -> acc
+        }
+      }
+      par_interp_parts(rest, locals, tps, line, col, a1)
+    }
+  }

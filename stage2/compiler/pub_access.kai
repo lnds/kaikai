@@ -1,0 +1,223 @@
+# Module privacy, decided at one point. The table records every
+# top-level symbol with its home module and `pub`-ness; every free
+# reference the enumerator yields (`pub_access_decl.kai`) is resolved
+# through `pa_decide` and diagnosed with one wording. Two rules share
+# the one resolution:
+#   - reference privacy: a name whose every carrier is non-`pub` in a
+#     foreign module cannot be referenced;
+#   - signature leak: a `pub` declaration's exported surface cannot
+#     name a non-`pub` type / effect / protocol / unit of its own
+#     module.
+# Qualified references (`mod.name`) are validated earlier, where the
+# qualified path is resolved against the module's export list.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.parse
+import compiler.modules
+import compiler.pub_access_refs
+import compiler.pub_access_decl
+import compiler.pub_access_table
+
+type PaVerdict = PaVisible | PaPrivateTo(String) | PaUnknown
+
+type PaMeta = { name: String, kind: String, is_pub: Bool }
+
+#[doc("Validate module privacy over the per-module decl segments; returns the number of violations reported. `root_bounds` carries the root file's fn tparam bounds (the parser strips them from the stored tparams into a side table).")]
+pub fn validate_pub_access(segs: [CoreSegment], root_bounds: [FnBoundsRec],
+      target_mod: String,
+      file: String) : Int / Console + File {
+  let table = pa_table(segs)
+  let e1 = pa_check_segs(segs, table, file, 0)
+  pa_check_bound_segs(segs, root_bounds, target_mod, table, file, e1)
+}
+
+#[doc("Rebuild per-module segments from a rewritten flat decl stream, taking each segment's length from `orig`. The rewrite passes map decls 1:1, so slicing by length restores the module boundaries.")]
+pub fn pa_reseg(orig: [CoreSegment], flat: [Decl]) : [CoreSegment] = match orig {
+  [] -> []
+  [PSeg(mod_name, ds), ...rest] -> {
+    let n = list_length(ds)
+    [PSeg(mod_name, pae_take(flat, n)), ...pa_reseg(rest, pae_drop(flat, n))]
+  }
+}
+
+#[doc("Slice the flat imported-decl stream into per-module segments using the (module, count) marks the resolver recorded. An empty module name means the decls belong to the root file.")]
+pub fn pa_import_segs(marks: [ImportSeg], flat: [Decl],
+      target_mod: String) : [CoreSegment] = match marks {
+  [] -> []
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    [PSeg(home, pae_take(flat, n)),
+     ...pa_import_segs(rest, pae_drop(flat, n), target_mod)]
+  }
+}
+
+# ==== decision ====
+
+# A reference is admissible when at least one same-named entry is
+# same-home or `pub` (locals-shadow-imports and root-shadows-core rely
+# on this); it is private when every carrier is foreign and non-`pub`;
+# it is unknown when no entry exists (the typer reports unbound names).
+fn pa_decide(table: [PaEntry], name: String, home: String,
+      types_only: Bool) : PaVerdict =
+  pa_decide_loop(table, name, home, types_only, None)
+
+fn pa_decide_loop(table: [PaEntry], name: String, home: String,
+      types_only: Bool,
+      first_private: Option[String]) : PaVerdict = match table {
+  [] -> match first_private {
+    Some(m) -> PaPrivateTo(m)
+    None    -> PaUnknown
+  }
+  [e, ...rest] ->
+    if e.name != name or (types_only and not e.is_ty) {
+      pa_decide_loop(rest, name, home, types_only, first_private)
+    } else if e.home == home or e.is_pub { PaVisible }
+    else {
+      let fp = match first_private { Some(_) -> first_private
+      None -> Some(e.home) }
+      pa_decide_loop(rest, name, home, types_only, fp)
+    }
+}
+
+# The signature-leak lookup: a same-home non-`pub` entry in the type
+# namespace, returned with its kind word for the diagnostic.
+fn pa_leak_kind(table: [PaEntry], name: String,
+      home: String) : Option[String] = match table {
+  [] -> None
+  [e, ...rest] ->
+    if e.name == name and e.home == home and not e.is_pub and e.is_ty and e.kind != "ctor" { Some(e.kind) }
+    else { pa_leak_kind(rest, name, home) }
+}
+
+# ==== walk + diagnostics ====
+
+fn pa_check_segs(segs: [CoreSegment], table: [PaEntry], file: String,
+      errs: Int) : Int / Console + File = match segs {
+  [] -> errs
+  [PSeg(mod_name, ds), ...rest] ->
+    pa_check_segs(rest, table, file, pa_check_decls(ds, mod_name, table, file, errs))
+}
+
+fn pa_check_decls(ds: [Decl], home: String, table: [PaEntry], file: String,
+      errs: Int) : Int / Console + File = match ds {
+  [] -> errs
+  [d, ...rest] ->
+    pa_check_decls(rest, home, table, file,
+      errs + pa_check_refs(pa_decl_refs(d), pa_decl_meta(d),
+      home, table, file, 0))
+}
+
+fn pa_meta(name: String, kind: String, is_pub: Bool) : PaMeta =
+  PaMeta { name: name, kind: kind, is_pub: is_pub }
+
+fn pa_decl_meta(d: Decl) : PaMeta = match d {
+  DFn(is_pub, name, _, _, _, _, _, _, _, _)  -> pa_meta(name, "fn", is_pub)
+  DAxiom(is_pub, _, name, _, _, _, _, _, _, _) -> pa_meta(name, "axiom", is_pub)
+  DConst(is_pub, name, _, _, _, _, _)        -> pa_meta(name, "const", is_pub)
+  DType(is_pub, name, _, _, _, _, _, _)      -> pa_meta(name, "type", is_pub)
+  DEffect(is_pub, name, _, _, _, _, _, _)    -> pa_meta(name, "effect", is_pub)
+  DProtocol(is_pub, name, _, _, _, _)        -> pa_meta(name, "protocol", is_pub)
+  DUnit(is_pub, name, _, _, _, _)            -> pa_meta(name, "unit", is_pub)
+  DDerive(_, inner, _, _)    -> pa_decl_meta(inner)
+  DUnstable(inner, _, _)     -> pa_decl_meta(inner)
+  DProtoLaws(_, inner, _, _) -> pa_decl_meta(inner)
+  DImplAxiom(_, inner, _, _) -> pa_decl_meta(inner)
+  DConstructor(inner, _, _)  -> pa_decl_meta(inner)
+  DDoc(_, _, inner, _, _)    -> pa_decl_meta(inner)
+  # An impl is not an exported signature of its own; its references
+  # get the cross-module check but never the leak rule.
+  _ -> pa_meta("", "", false)
+}
+
+fn pa_check_refs(refs: [PaRef], meta: PaMeta, home: String,
+      table: [PaEntry], file: String,
+      errs: Int) : Int / Console + File = match refs {
+  [] -> errs
+  [r, ...rest] ->
+    pa_check_refs(rest, meta, home, table, file,
+      errs + pa_check_ref(r, meta, home, table, file))
+}
+
+fn pa_check_ref(r: PaRef, meta: PaMeta, home: String, table: [PaEntry],
+      file: String) : Int / Console + File =
+  match pa_decide(table, r.name, home, r.is_ty) {
+    PaPrivateTo(m) -> pa_diag_private(file, r, m)
+    PaUnknown -> 0
+    PaVisible ->
+      if pa_leak_position(r, meta) { pa_check_leak(r, meta, home, table, file) }
+      else { 0 }
+  }
+
+# The leak rule fires only for type-namespace references on the
+# exported surface of a `pub` declaration.
+fn pa_leak_position(r: PaRef, meta: PaMeta) : Bool =
+  meta.is_pub and r.in_sig and r.leakable and r.is_ty
+
+fn pa_diag_private(file: String, r: PaRef, owner: String) : Int / Console + File = {
+  diag_error(file, r.line, r.col,
+    concat_all(["`", r.name, "` is private to module `", owner,
+      "`; declare it `pub` in `", owner,
+      "` to use it from other modules"]))
+  1
+}
+
+fn pa_check_leak(r: PaRef, meta: PaMeta, home: String, table: [PaEntry],
+      file: String) : Int / Console + File =
+  match pa_leak_kind(table, r.name, home) {
+    None -> 0
+    Some(kind_word) -> {
+      diag_error(file, r.line, r.col,
+        concat_all(["pub ", meta.kind, " `", meta.name,
+      "` exposes non-pub ", kind_word, " `", r.name,
+      "` from module `", home, "`; mark `", r.name,
+      "` as `pub` or remove it from the signature"]))
+      1
+    }
+  }
+
+# ==== fn tparam bounds ====
+
+# A bound (`fn f[T: Sneaky]`) references the protocol by name, but the
+# parser stores fn-decl bounds in a side table instead of the tparam
+# string — walk the root file's fn decls against that table.
+fn pa_check_bound_segs(segs: [CoreSegment], bounds: [FnBoundsRec],
+      target_mod: String, table: [PaEntry], file: String,
+      errs: Int) : Int / Console + File = match segs {
+  [] -> errs
+  [PSeg(mod_name, ds), ...rest] -> {
+    let e1 = if mod_name == target_mod {
+      pa_check_bound_decls(ds, bounds, mod_name, table, file, errs)
+    } else { errs }
+    pa_check_bound_segs(rest, bounds, target_mod, table, file, e1)
+  }
+}
+
+fn pa_check_bound_decls(ds: [Decl], bounds: [FnBoundsRec], home: String,
+      table: [PaEntry], file: String,
+      errs: Int) : Int / Console + File = match ds {
+  [] -> errs
+  [d, ...rest] -> match d {
+    DFn(is_pub, name, _, _, _, _, _, line, col, _) ->
+      pa_check_bound_decls(rest, bounds, home, table, file,
+        pa_check_refs(pa_bound_table_refs(bounds, name, line, col),
+      pa_meta(name, "fn", is_pub), home, table, file, errs))
+    _ -> pa_check_bound_decls(rest, bounds, home, table, file, errs)
+  }
+}
+
+fn pa_bound_table_refs(bounds: [FnBoundsRec], fname: String,
+      line: Int, col: Int) : [PaRef] = match bounds {
+  [] -> []
+  [FBR(name, _, ftbs), ...rest] ->
+    if name == fname { pa_ftb_refs(ftbs, line, col, []) }
+    else { pa_bound_table_refs(rest, fname, line, col) }
+}
+
+fn pa_ftb_refs(ftbs: [FnTPBound], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match ftbs {
+  [] -> acc
+  [FTB(_, names), ...rest] ->
+    pa_ftb_refs(rest, line, col, pa_bound_names(names, line, col, acc))
+}

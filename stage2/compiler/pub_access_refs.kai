@@ -1,0 +1,168 @@
+# Type-level reference enumeration for module-privacy validation:
+# the `PaRef` shape plus the walks over `TyKind`, `RowExpr` and
+# `UnitExprT`. The declaration and expression walks build on these in
+# `pub_access_decl.kai`; the decision point consuming the refs is
+# `validate_pub_access` in `pub_access.kai`. Matches carry no
+# catch-all arm on purpose: a new AST form fails this file's compile
+# until its privacy story is decided.
+
+import compiler.util
+import compiler.chars
+import compiler.ast
+import compiler.kinds
+import compiler.parse
+
+#[doc("""
+One free-name reference found in a declaration.
+
+`is_ty` selects the namespace the privacy table resolves the name in;
+`in_sig` marks references that belong to the declaration's exported
+surface (params, return, row, type body); `leakable` clears for
+surface positions invisible to consumers (a `priv` field's type),
+which the pub-signature leak rule skips.
+""")]
+pub type PaRef = { name: String, is_ty: Bool, in_sig: Bool,
+      leakable: Bool, line: Int, col: Int }
+
+#[doc("Construct a `PaRef`.")]
+pub fn pa_ref(name: String, is_ty: Bool, in_sig: Bool, leakable: Bool,
+      line: Int, col: Int) : PaRef =
+  PaRef { name: name, is_ty: is_ty, in_sig: in_sig, leakable: leakable,
+      line: line, col: col }
+
+#[doc("True for a dotted (`mod.name`) reference — those are resolved and gated by the qualified resolver, not the privacy table.")]
+pub fn pa_dotted(n: String) : Bool = pa_dotted_loop(n, 0, string_length(n))
+
+fn pa_dotted_loop(n: String, i: Int, len: Int) : Bool =
+  if i >= len { false }
+  else if string_slice(n, i, 1) == "." { true }
+  else { pa_dotted_loop(n, i + 1, len) }
+
+# Stored tparam names carry kind / bound markers (`u#Unit:Metric`,
+# `T#b:Show`); the skip list wants the surface names.
+#[doc("Surface names of a stored tparam list, kind / bound markers stripped.")]
+pub fn pa_tparam_names(tps0: [String]) : [String] = match tps0 {
+  [] -> []
+  [t, ...rest] -> [tp_strip_bounds(tp_strip_kind(t)), ...pa_tparam_names(rest)]
+}
+
+# A bound (`T: Sneaky`) references the protocol by name.
+#[doc("Type-namespace refs for every protocol bound carried in a stored tparam list.")]
+pub fn pa_bound_refs(tps0: [String], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match tps0 {
+  [] -> acc
+  [t, ...rest] ->
+    if tp_has_bounds(t) {
+      pa_bound_refs(rest, line, col,
+      pa_bound_names(tp_bounds_of(t), line, col, acc))
+    } else { pa_bound_refs(rest, line, col, acc) }
+}
+
+#[doc("Type-namespace refs for a plain list of bound names.")]
+pub fn pa_bound_names(bs: [String], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match bs {
+  [] -> acc
+  [b, ...rest] -> pa_bound_names(rest, line, col,
+      [pa_ref(b, true, true, true, line, col), ...acc])
+}
+
+fn pa_te_name(n: String, tps: [String], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] =
+  if list_has(tps, n) or pa_dotted(n) { acc }
+  else { [pa_ref(n, true, in_sig, leakable, line, col), ...acc] }
+
+#[doc("Type-namespace refs of a type expression, skipping the in-scope tparams.")]
+pub fn par_te(te: TypeExpr, tps: [String], in_sig: Bool, leakable: Bool,
+      acc: [PaRef]) : [PaRef] = match te.tkind {
+  TyName(n, targs) ->
+    par_te_list(targs, tps, in_sig, leakable,
+      pa_te_name(n, tps, in_sig, leakable, te.line, te.col, acc))
+  TyList(inner) -> par_te(inner, tps, in_sig, leakable, acc)
+  TyFn(ps, ret, row) -> {
+    let a1 = par_te_list(ps, tps, in_sig, leakable, acc)
+    let a2 = par_te(ret, tps, in_sig, leakable, a1)
+    par_row(row, tps, in_sig, leakable, te.line, te.col, a2)
+  }
+  TyDim(base, u) -> {
+    let a1 = par_te(base, tps, in_sig, leakable, acc)
+    par_uexpr(u, tps, in_sig, leakable, te.line, te.col, a1)
+  }
+  # The refinement predicate is an expression over `self`, checked by
+  # the refinement pipeline; only the base type is a name reference.
+  TyRefine(base, _) -> par_te(base, tps, in_sig, leakable, acc)
+  TyRow(row) -> par_row(row, tps, in_sig, leakable, te.line, te.col, acc)
+}
+
+#[doc("Type-namespace refs of a type-expression list.")]
+pub fn par_te_list(ts: [TypeExpr], tps: [String], in_sig: Bool, leakable: Bool,
+      acc: [PaRef]) : [PaRef] = match ts {
+  [] -> acc
+  [t, ...rest] -> par_te_list(rest, tps, in_sig, leakable,
+      par_te(t, tps, in_sig, leakable, acc))
+}
+
+#[doc("Effect-label refs of a row expression.")]
+pub fn par_row(row: RowExpr, tps: [String], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match row {
+  REmpty -> acc
+  RClosed(ls)  -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
+  ROpen(_, ls) -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
+}
+
+fn par_row_labels(ls: [RowLabel], tps: [String], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match ls {
+  [] -> acc
+  [RL(name, targs), ...rest] ->
+    par_row_labels(rest, tps, in_sig, leakable, line, col,
+      par_te_list(targs, tps, in_sig, leakable,
+      pa_te_name(name, tps, in_sig, leakable, line, col, acc)))
+}
+
+#[doc("Unit-symbol refs of a unit expression.")]
+pub fn par_uexpr(u: UnitExprT, tps: [String], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match u {
+  UOne    -> acc
+  UVar(_) -> acc
+  USym(s) -> pa_te_name(s, tps, in_sig, leakable, line, col, acc)
+  UMul(a, b)  -> par_uexpr(b, tps, in_sig, leakable, line, col,
+      par_uexpr(a, tps, in_sig, leakable, line, col, acc))
+  UInv(a)     -> par_uexpr(a, tps, in_sig, leakable, line, col, acc)
+  UPow(a, _)  -> par_uexpr(a, tps, in_sig, leakable, line, col, acc)
+  UJoin(a, b) -> par_uexpr(b, tps, in_sig, leakable, line, col,
+      par_uexpr(a, tps, in_sig, leakable, line, col, acc))
+  UDims(us)   -> par_uexprs(us, tps, in_sig, leakable, line, col, acc)
+}
+
+fn par_uexprs(us: [UnitExprT], tps: [String], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match us {
+  [] -> acc
+  [u, ...rest] -> par_uexprs(rest, tps, in_sig, leakable, line, col,
+      par_uexpr(u, tps, in_sig, leakable, line, col, acc))
+}
+
+# Reparsed interp sub-expressions carry positions relative to the
+# snippet; point their refs at the enclosing string literal instead.
+#[doc("Re-anchor a ref list to the given position.")]
+pub fn pa_repos(refs: [PaRef], line: Int, col: Int) : [PaRef] = match refs {
+  [] -> []
+  [r, ...rest] ->
+    [pa_ref(r.name, r.is_ty, r.in_sig, r.leakable, line, col),
+     ...pa_repos(rest, line, col)]
+}
+
+#[doc("True when a raw string span contains a `#{...}` interpolation region.")]
+pub fn pa_str_has_interp(span: String) : Bool =
+  pa_interp_scan(span, 0, string_length(span) - 1)
+
+fn pa_interp_scan(s: String, i: Int, last: Int) : Bool =
+  if i >= last { false }
+  else {
+    match char_at(s, i) {
+      None -> false
+      Some(c) -> {
+        let nxt = match char_at(s, i + 1) { Some(c2) -> c2 None -> ' ' }
+        if c == '#' and nxt == '{' { true }
+        else { pa_interp_scan(s, i + 1, last) }
+      }
+    }
+  }
