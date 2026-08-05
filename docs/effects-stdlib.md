@@ -315,15 +315,23 @@ type: under the default handler, the common recoverable fault
 (pipe closed on the other side, `EPIPE`) is absorbed silently,
 and any remaining fault is catastrophic enough to panic.
 
+Each stream effect additionally exposes `is_tty() : Bool` —
+whether the stream is a terminal, per `isatty(3)` on the
+stream's own fd (`Stdout` asks fd 1, `Stderr` fd 2, `Stdin`
+fd 0). It is the standard gate for ANSI colour: emit escapes
+when `Stdout.is_tty()`, plain text under a pipe or redirection.
+`Env.get("NO_COLOR")` covers the user-override half of that
+convention.
+
 > **v1 vs target shape (2026-05-08).** The monolithic `Console`
 > declaration above is the **v1** shape — a single effect with
 > `print` + `eprint`. The post-Phase-4b target is a 3-way split
 > documented in `stdlib/effects.kai:36-46`:
 >
 > ```kai
-> effect Stdout { print(s: String) : Unit }
-> effect Stderr { eprint(s: String) : Unit }
-> effect Stdin  { read_line() : Result[String, String] }
+> effect Stdout { print(s: String) : Unit ; is_tty() : Bool }
+> effect Stderr { eprint(s: String) : Unit ; is_tty() : Bool }
+> effect Stdin  { read_line() : Result[String, String] ; is_tty() : Bool }
 > type Console = Stdout + Stderr + Stdin
 > ```
 >
@@ -367,6 +375,7 @@ effect in scope.
 effect Stdin {
   read_line()        : Option[String]
   read_bytes(n: Int) : String                  # issue #453
+  is_tty()           : Bool
 }
 ```
 
