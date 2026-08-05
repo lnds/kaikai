@@ -349,9 +349,8 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope t
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
-#     test-core-cache, test-modular-selfhost,
-#     test-perceus-1131-modular-escape, test-fmt-property,
-#     light(1/3), light(2/3), light(3/3),
+#     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
+#     light(1/3), light(2/3) + test-fmt-property, light(3/3),
 #     demos-no-regression, test-fmt, test-fmt-selfhost,
 #     test-fmt-help-scope, test-bench,
 #     test-check, test-library-mode, test-diagnostics-collected,
@@ -377,7 +376,8 @@ tier1-shard-2: kaic2
 
 tier1-shard-3: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=3
-	@echo "tier1-shard-3 OK — light slice 2/3"
+	$(MAKE) test-fmt-property
+	@echo "tier1-shard-3 OK — light slice 2/3 + fmt meaning-preservation"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
 # compiler, and a PR touching stage2/compiler/** misses the warm cache by
@@ -394,8 +394,7 @@ tier1-shard-5: kaic2
 # shard-4's object cache but is a separate job.
 tier1-shard-6: kaic2
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	$(MAKE) test-fmt-property
-	@echo "tier1-shard-6 OK — #1131 modular-escape gate + fmt meaning-preservation"
+	@echo "tier1-shard-6 OK — #1131 modular-escape gate"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -525,10 +524,16 @@ test-fmt-help-scope: kaic2
 #
 # Cost: four kaic2 invocations per file over ~1800 files. Serial that is
 # ~18 min, so the script fans out over $(nproc) workers
-# (FMT_PROPERTY_JOBS to override). Even fanned out it costs minutes,
-# which is why it rides shard-6 rather than shard-1 with its sibling fmt
-# gates: shard-1 was already the long pole and adding this to it blew the
-# job's 30-minute ceiling.
+# (FMT_PROPERTY_JOBS to override).
+#
+# Shard placement has two constraints, and both bite. It cannot ride
+# shard-1 (its sibling fmt gates): that shard already runs ~30 min, the
+# job's ceiling, and this gate pushes it over. It cannot ride shard-4 or
+# shard-6 either: those are gated on `compiler-touch`, so on a PR that
+# changes no compiler source they skip — and a formatter gate that goes
+# quiet exactly when the formatter was not touched still has to run,
+# because the corpus it checks can regress from a stdlib or fixture
+# change. shard-3 is unconditional and has headroom.
 test-fmt-property: kaic2
 	@./tests/fmt_property.sh
 

@@ -376,11 +376,15 @@ by design) and the rest are excused against an open issue.
 
 Cost is four `kaic2` invocations per file, ~18 minutes serial, so the
 script fans out over `$(nproc)` workers (`FMT_PROPERTY_JOBS` overrides) —
-the work is per-file independent. Even fanned out it costs minutes, so it
-rides `tier1-shard-6` rather than shard-1 with its sibling fmt gates:
-shard-1 was already the long pole at ~30 minutes and adding this to it
-hit the job's ceiling, cancelling the shard. Shard-6 ran in well under a
-minute. Note
+the work is per-file independent. It rides `tier1-shard-3`, and the
+placement took two corrections worth recording. It cannot ride shard-1
+with its sibling fmt gates: that shard already ran ~30 minutes, the job
+ceiling, and adding this gate cancelled it — after the gate itself had
+passed. It cannot ride shard-4 or shard-6 either: those are gated on
+`compiler-touch` and skip on a PR that changes no compiler source, which
+would leave a formatter gate silently inert exactly when nobody touched
+the formatter — and the corpus it checks can still regress from a stdlib
+or fixture change. shard-3 is unconditional and has headroom. Note
 the harness passes `--path stdlib`: without it most of the corpus fails
 to resolve its imports and is silently dropped as unparseable, which
 costs about a quarter of the coverage.
