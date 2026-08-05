@@ -1039,6 +1039,11 @@ effect Process {
   wait(c: Child)                      : Result[Exit, String]
   kill(c: Child, sig: Signal)         : Result[Unit, String]
   exit(code: Int)                     : Nothing
+  start_piped(cmd: String, args: [String],
+              pipe_stdin: Bool, pipe_stdout: Bool) : Result[Child, String]
+  write_stdin(c: Child, data: String) : Result[Unit, String]
+  close_stdin(c: Child)               : Result[Unit, String]
+  read_stdout(c: Child)               : Result[String, String]
 }
 ```
 
@@ -1059,8 +1064,21 @@ effect Process {
   Deliberately not named `spawn` to avoid clash with the `Spawn`
   effect (kaikai fibers); see §*Why `Process` and not `Spawn`*.
   Standard fds (stdin/stdout/stderr) inherit from the parent
-  unless the caller redirects them via the `os.process` module's
-  pipe helpers, which build on top of these ops.
+  unless the child is started via `start_piped`, which attaches a
+  pipe to the child's stdin and/or stdout (stderr always inherits).
+- `start_piped` is the popen-shaped redirection family.
+  `write_stdin` writes every byte or reports the OS error — a
+  reader that already died surfaces as `Err("Broken pipe")`, never
+  a fatal SIGPIPE. `close_stdin` EOFs the child (required before a
+  filter that reads stdin to exhaustion can finish). `read_stdout`
+  returns one chunk, `Ok("")` at EOF — chunked reads are what let a
+  caller drain output larger than the OS pipe capacity (~64 KiB
+  Linux, ~16 KiB macOS) without deadlocking the child. `wait` on a
+  piped child is pclose-shaped: it closes surviving pipe ends
+  before reaping. The `os.process` surface adds `pipe_to` (stdin
+  only — the pager shape), `pipe_from` (stdout only — the capture
+  shape), and `read_all` (drain to EOF). All pipe IO blocks the OS
+  thread, not the fiber.
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
   (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).
@@ -1114,6 +1132,12 @@ Runtime-installed around `main` when `Process` is in the row.
 
 - `start` on POSIX is `fork(2)` + `execvp(3)`; on Windows
   (post-MVP) `CreateProcess`.
+- `start_piped` adds `pipe(2)` + `dup2(2)` around the same fork.
+  Parent-side ends are `FD_CLOEXEC` so a sibling fork cannot hold a
+  stray write end open and starve a reader of EOF. SIGPIPE on
+  `write_stdin` is suppressed per fd where the OS allows
+  (`F_SETNOSIGPIPE`) and per write elsewhere (mask + drain), so a
+  dead reader is an `Err`, not a process kill.
 - `wait` blocks via the scheduler's reactor: on Linux, register
   the child's `pidfd` with epoll and yield; on macOS / *BSD, a
   SIGCHLD handler wakes the awaiting fiber. Cancellation

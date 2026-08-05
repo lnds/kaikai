@@ -1,6 +1,10 @@
 #[doc("""
 Surface helpers on top of the `Process` effect. Module path:
-`import process`; qualified calls land as `process.start(...)`.
+`import os.process`; qualified calls land as `process.start(...)`.
+
+Standard fds inherit from the parent by default; the piped variants
+(`start_piped`, `pipe_to`, `pipe_from`) attach pipes to the child's
+stdin/stdout instead. stderr always inherits.
 
 POSIX only.
 """)]
@@ -8,16 +12,94 @@ POSIX only.
 #[doc("""
 Start a child process via `fork(2)` + `execvp(3)`. Returns an
 opaque `Child` carrying the OS pid; standard fds inherit from the
-parent. Panics if the fork or exec fails.
+parent (use `start_piped` / `pipe_to` / `pipe_from` to attach
+pipes instead). Panics if the fork or exec fails.
 """)]
 pub fn start(cmd: String, args: [String]) : Child / Process =
   Process.start(cmd, args)
+
+#[doc("""
+Start a child with BOTH stdin and stdout attached to pipes, for
+driving a filter (`sort`, `wc`, ...). stderr inherits. Write with
+`write_stdin`, then `close_stdin` so the child sees EOF, then drain
+with `read_all` / `read_stdout` before `wait`.
+""")]
+pub fn start_piped(cmd: String, args: [String]) : Result[Child, String] / Process =
+  Process.start_piped(cmd, args, true, true)
+
+#[doc("""
+Start a child with only its stdin piped; stdout and stderr inherit.
+The pager shape: `pipe_to("less", ["-r"])`, `write_stdin` the
+content, then `wait` (which closes the pipe so the pager sees EOF).
+A pager quit early by the user surfaces as `Err` on the next
+`write_stdin`, never as a fatal SIGPIPE.
+""")]
+pub fn pipe_to(cmd: String, args: [String]) : Result[Child, String] / Process =
+  Process.start_piped(cmd, args, true, false)
+
+#[doc("""
+Start a child with only its stdout piped; stdin and stderr inherit.
+The capture shape: `pipe_from("git", ["rev-parse", "HEAD"])`, then
+`read_all` for the output, then `wait` for the exit status.
+""")]
+pub fn pipe_from(cmd: String, args: [String]) : Result[Child, String] / Process =
+  Process.start_piped(cmd, args, false, true)
+
+#[doc("""
+Write every byte of `data` to a piped child's stdin. `Err` when the
+child's stdin is not piped, or with the OS error when the write
+fails — a reader that already exited yields `Err("Broken pipe")`,
+never a fatal SIGPIPE. Blocks the OS thread while the pipe is full,
+so a child that never reads its stdin deadlocks the writer.
+""")]
+pub fn write_stdin(c: Child, data: String) : Result[Unit, String] / Process =
+  Process.write_stdin(c, data)
+
+#[doc("""
+Close a piped child's stdin so it sees EOF. Idempotent — closing an
+already-closed end is `Ok(())`. Required before draining a filter
+that reads stdin to exhaustion (`sort`, `wc`, ...).
+""")]
+pub fn close_stdin(c: Child) : Result[Unit, String] / Process =
+  Process.close_stdin(c)
+
+#[doc("""
+Read one chunk (up to 64 KiB) from a piped child's stdout. `Ok("")`
+is EOF. Loop until EOF — or use `read_all` — to drain output larger
+than the OS pipe capacity without deadlocking the child. Blocks the
+OS thread, not the fiber.
+""")]
+pub fn read_stdout(c: Child) : Result[String, String] / Process =
+  Process.read_stdout(c)
+
+#[doc("""
+Drain a piped child's stdout to EOF and return everything read.
+Safe for output of any size: it reads chunk by chunk, so the child
+is never blocked on a full pipe. For a filter fed via `write_stdin`,
+call `close_stdin` first or the child never reaches EOF.
+""")]
+pub fn read_all(c: Child) : Result[String, String] / Process =
+  read_all_go(c, "")
+
+fn read_all_go(c: Child, acc: String) : Result[String, String] / Process =
+  match Process.read_stdout(c) {
+    Err(e) -> Err(e)
+    Ok(s)  ->
+      if string_length(s) == 0 { Ok(acc) }
+      else { read_all_go(c, string_concat(acc, s)) }
+  }
 
 #[doc("""
 Wait for a child process to terminate and return its exit status
 as an `Exit` variant (`Exited(code)` or `Signaled(signo)`).
 Returns `Err(strerror)` if `waitpid` itself fails (e.g. ECHILD if
 the child was already reaped). Blocks the OS thread, not the fiber.
+
+For a piped child this is `pclose`-shaped: any pipe ends still open
+are closed first, so a pager or filter fed via `write_stdin` sees
+EOF without an explicit `close_stdin`. Drain stdout (`read_all`)
+BEFORE waiting — a child still writing when its reader disappears
+takes a SIGPIPE instead of blocking forever.
 """)]
 pub fn wait(c: Child) : Result[Exit, String] / Process =
   Process.wait(c)

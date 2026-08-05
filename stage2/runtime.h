@@ -3813,6 +3813,7 @@ typedef struct KaiFilepoolItem KaiFilepoolItem;
 static void     kai_reactor_init(void);
 static void     kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns);
 static void     kai_reactor_park_pid(KaiFiber *f, int pid);
+static int      kai_reactor_take_child_exit(int pid, int *status);
 static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
 static uint64_t kai_reactor_now_ns(void);
 /* Timeout-receive dual-park: arm a deadline alongside the mailbox park
@@ -12522,9 +12523,10 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
  *     plug that registers the pid and wakes the fiber when the
  *     child terminates. Tier 2 follow-up tracked in
  *     docs/fibers-honesty-targets.md §Reactor.
- *   - No stdio pipe plumbing. `pipe_stdout` / `pipe_stdin` and the
- *     surface helpers (wait_or_kill, signal) live in the follow-up
- *     `stdlib/os/process.kai` lane on top of these four ops.
+ *   - Stdio plumbing is popen-shaped: `start_piped` attaches pipes
+ *     to the child's stdin/stdout; `write_stdin` / `read_stdout` /
+ *     `close_stdin` drive them; `wait` closes whatever is still open
+ *     before reaping (pclose semantics). stderr always inherits.
  *   - SIGCHLD handling is implicit through blocking waitpid; the
  *     Signal effect intentionally omits SIGCHLD per its catalog
  *     comment so the two effects don't fight over the disposition.
@@ -12587,12 +12589,20 @@ static KaiValue *_kai_process_make_exit_signaled(int signo) {
     return kai_variant_u(10, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
 }
 
-static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
-    const char *msg = strerror(saved_errno);
-    if (!msg) msg = "unknown error";
+static KaiValue *_kai_process_err_msg(KaiCont *k, const char *msg) {
     KaiValue *m = kai_str(msg);
     KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
     return kai_cont_resume(k, err);
+}
+
+static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
+    const char *msg = strerror(saved_errno);
+    return _kai_process_err_msg(k, msg ? msg : "unknown error");
+}
+
+static KaiValue *_kai_process_ok(KaiCont *k, KaiValue *payload) {
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = payload}});
+    return kai_cont_resume(k, ok);
 }
 
 /* Walk a [String] cons list once to count entries, then again to
@@ -12625,6 +12635,112 @@ static void _kai_process_free_argv(char **argv, int n) {
     if (!argv) return;
     for (int i = 0; i < n; ++i) free(argv[i]);
     free(argv);
+}
+
+/* Parent-side pipe ends of a piped child, keyed by pid. `start_piped`
+ * registers, the stdio ops look up, and `wait` closes whatever is
+ * still open before reaping (pclose semantics) — an unclosed parent
+ * end would keep the child from ever seeing EOF. Shared process
+ * state for the same reason as kai_signal_subscribed: the ops may
+ * run from different TUs under separate compilation. */
+typedef struct KaiProcPipe {
+    int pid;
+    int in_fd;   /* parent writes the child's stdin; -1 = not piped / closed */
+    int out_fd;  /* parent reads the child's stdout; -1 = not piped */
+    struct KaiProcPipe *next;
+} KaiProcPipe;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiProcPipe    *kai_proc_pipes;
+extern pthread_mutex_t kai_proc_pipes_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiProcPipe    *kai_proc_pipes = NULL;
+pthread_mutex_t kai_proc_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiProcPipe    *kai_proc_pipes = NULL;
+static pthread_mutex_t kai_proc_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd) {
+    KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
+    if (!e) { fputs("kai: out of memory\n", stderr); exit(1); }
+    e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd;
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    e->next = kai_proc_pipes;
+    kai_proc_pipes = e;
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+}
+
+/* Fetch one end (0 = in_fd, 1 = out_fd) under the lock. The blocking
+ * IO itself runs unlocked so a parked write cannot stall unrelated
+ * process ops. */
+static int _kai_proc_pipe_fd(int pid, int which) {
+    int fd = -1;
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
+        if (e->pid == pid) { fd = which ? e->out_fd : e->in_fd; break; }
+    }
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+    return fd;
+}
+
+static void _kai_proc_pipe_close_stdin(int pid) {
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
+        if (e->pid == pid) {
+            if (e->in_fd >= 0) { close(e->in_fd); e->in_fd = -1; }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+}
+
+static void _kai_proc_pipe_drop(int pid) {
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    KaiProcPipe **p = &kai_proc_pipes;
+    while (*p && (*p)->pid != pid) p = &(*p)->next;
+    KaiProcPipe *e = *p;
+    if (e) *p = e->next;
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+    if (e) {
+        if (e->in_fd  >= 0) close(e->in_fd);
+        if (e->out_fd >= 0) close(e->out_fd);
+        free(e);
+    }
+}
+
+/* Write all of buf; returns 0 or the failing errno. A dead reader
+ * must surface as EPIPE, not kill the process: where the OS has a
+ * per-fd opt-out (F_SETNOSIGPIPE) start_piped already set it; else
+ * block SIGPIPE for this thread around the write and drain the
+ * pending signal so the default disposition never fires. */
+static int _kai_proc_write_all(int fd, const char *buf, size_t len) {
+#if !defined(F_SETNOSIGPIPE)
+    sigset_t pipe_set, prev_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &prev_set);
+#endif
+    int err = 0;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            err = errno;
+            break;
+        }
+        off += (size_t) w;
+    }
+#if !defined(F_SETNOSIGPIPE)
+    if (err == EPIPE) {
+        struct timespec zero = { 0, 0 };
+        while (sigtimedwait(&pipe_set, NULL, &zero) >= 0) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+#endif
+    return err;
 }
 
 /* start(cmd, args) -> Child. fork + execvp; on failure of either
@@ -12698,29 +12814,40 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
     (void) self;
     int pid = _kai_process_record_pid(child);
     if (pid <= 0) {
-        KaiValue *m = kai_str("wait: invalid Child");
-        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
-        return kai_cont_resume(k, err);
+        return _kai_process_err_msg(k, "wait: invalid Child");
     }
+    /* pclose semantics: EOF the child's stdin and release both parent
+     * ends before reaping — a still-open write end would deadlock a
+     * child that reads stdin to exhaustion. Drain stdout BEFORE wait;
+     * closing the read end here means an undrained child still writing
+     * takes EPIPE instead of blocking forever. */
+    _kai_proc_pipe_drop(pid);
     kai_reactor_init();
     /* Race: the child may have terminated before we registered the
-     * waiter. Try a non-blocking waitpid first; if it succeeds we
-     * report the status without parking. */
+     * waiter — reaped either by us here (non-blocking waitpid) or by
+     * the reactor drain's waitpid(-1), in which case the status sits
+     * in the pending-exits buffer. Check the buffer on both sides of
+     * our own waitpid: the drain can win between the two calls. */
     int status = 0;
-    pid_t rc = waitpid((pid_t) pid, &status, WNOHANG);
-    if (rc == 0) {
-        /* Child still running; park on the pid map and let the
-         * SIGCHLD drain wake us with the status. Re-park on a spurious
-         * resume — only the drain's own splice carries a real status. */
-        KaiFiber *me = kai_current_fiber();
-        do {
-            kai_reactor_park_pid(me, pid);
-        } while (!me->reactor_fired);
-        status = me->reactor_wait_status;
-        me->reactor_wait_pid    = 0;
-        me->reactor_wait_status = 0;
-    } else if (rc < 0) {
-        return _kai_process_err(k, errno);
+    if (!kai_reactor_take_child_exit(pid, &status)) {
+        pid_t rc = waitpid((pid_t) pid, &status, WNOHANG);
+        if (rc == 0) {
+            /* Child still running; park on the pid map and let the
+             * SIGCHLD drain wake us with the status. Re-park on a spurious
+             * resume — only the drain's own splice carries a real status. */
+            KaiFiber *me = kai_current_fiber();
+            do {
+                kai_reactor_park_pid(me, pid);
+            } while (!me->reactor_fired);
+            status = me->reactor_wait_status;
+            me->reactor_wait_pid    = 0;
+            me->reactor_wait_status = 0;
+        } else if (rc < 0) {
+            int e = errno;
+            if (!kai_reactor_take_child_exit(pid, &status)) {
+                return _kai_process_err(k, e);
+            }
+        }
     }
     KaiValue *exit_v;
     if (WIFEXITED(status)) {
@@ -12730,8 +12857,7 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
     } else {
         exit_v = _kai_process_make_exit_exited(-1);
     }
-    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = exit_v}});
-    return kai_cont_resume(k, ok);
+    return _kai_process_ok(k, exit_v);
 }
 #endif
 
@@ -12742,17 +12868,13 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
     (void) self;
     int pid = _kai_process_record_pid(child);
     if (pid <= 0) {
-        KaiValue *m = kai_str("kill: invalid Child");
-        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
-        return kai_cont_resume(k, err);
+        return _kai_process_err_msg(k, "kill: invalid Child");
     }
     int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill((pid_t) pid, signo) < 0) {
         return _kai_process_err(k, errno);
     }
-    KaiValue *u  = kai_unit();
-    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
-    return kai_cont_resume(k, ok);
+    return _kai_process_ok(k, kai_unit());
 }
 
 /* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
@@ -12765,6 +12887,142 @@ static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k
     _exit(c);
     /* unreachable */
     return NULL;
+}
+
+/* start_piped(cmd, args, pipe_stdin, pipe_stdout) -> Result[Child, String].
+ * popen-shaped: attach a pipe to the child's stdin and/or stdout;
+ * stderr always inherits. Unlike `start`, primitive failure surfaces
+ * as Err — a missing binary is an ordinary outcome when shelling out.
+ * Parent ends are FD_CLOEXEC so a later fork cannot hold a stray
+ * write end open and starve a sibling reader of EOF. */
+static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args,
+                                                 KaiValue *pipe_in_v, KaiValue *pipe_out_v,
+                                                 KaiCont *k) {
+    (void) self;
+    if (!cmd || cmd->tag != KAI_STR) {
+        return _kai_process_err_msg(k, "start_piped: cmd must be a String");
+    }
+    int want_in  = pipe_in_v  && pipe_in_v->tag  == KAI_BOOL && pipe_in_v->as.b;
+    int want_out = pipe_out_v && pipe_out_v->tag == KAI_BOOL && pipe_out_v->as.b;
+    int in_p[2]  = { -1, -1 };
+    int out_p[2] = { -1, -1 };
+    if (want_in && pipe(in_p) < 0) {
+        return _kai_process_err(k, errno);
+    }
+    if (want_out && pipe(out_p) < 0) {
+        int e = errno;
+        if (want_in) { close(in_p[0]); close(in_p[1]); }
+        return _kai_process_err(k, e);
+    }
+    const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
+    int argc = 0;
+    char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
+    if (!argv) { fputs("kai: out of memory\n", stderr); exit(1); }
+    kai_reactor_init();
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        _kai_process_free_argv(argv, argc);
+        if (want_in)  { close(in_p[0]);  close(in_p[1]); }
+        if (want_out) { close(out_p[0]); close(out_p[1]); }
+        return _kai_process_err(k, e);
+    }
+    if (pid == 0) {
+        if (want_in) {
+            if (in_p[0] != 0) { dup2(in_p[0], 0); close(in_p[0]); }
+            close(in_p[1]);
+        }
+        if (want_out) {
+            if (out_p[1] != 1) { dup2(out_p[1], 1); close(out_p[1]); }
+            close(out_p[0]);
+        }
+        execvp(cmd_cstr, argv);
+        /* Async-signal-safe writers only. 127 = command not found. */
+        const char *prefix = "kai: Process.start_piped: execvp: ";
+        const char *msg    = strerror(errno);
+        ssize_t w;
+        w = write(2, prefix, strlen(prefix)); (void) w;
+        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
+        w = write(2, "\n", 1); (void) w;
+        _exit(127);
+    }
+    _kai_process_free_argv(argv, argc);
+    int wr = -1, rd = -1;
+    if (want_in) {
+        close(in_p[0]);
+        wr = in_p[1];
+        fcntl(wr, F_SETFD, FD_CLOEXEC);
+#if defined(F_SETNOSIGPIPE)
+        fcntl(wr, F_SETNOSIGPIPE, 1);
+#endif
+    }
+    if (want_out) {
+        close(out_p[1]);
+        rd = out_p[0];
+        fcntl(rd, F_SETFD, FD_CLOEXEC);
+    }
+    _kai_proc_pipe_add((int) pid, wr, rd);
+    return _kai_process_ok(k, _kai_process_make_child((int) pid));
+}
+
+/* write_stdin(c, data) -> Result[Unit, String]. Writes every byte or
+ * reports the failing errno; a reader that died early is Err("Broken
+ * pipe"), never a fatal SIGPIPE. Blocks the OS thread while the pipe
+ * is full — a child that never reads its stdin deadlocks the writer. */
+static KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 0) : -1;
+    if (fd < 0) {
+        return _kai_process_err_msg(k, "write_stdin: stdin is not piped");
+    }
+    if (data && data->tag == KAI_STR && data->as.s.bytes && data->as.s.len > 0) {
+        int err = _kai_proc_write_all(fd, data->as.s.bytes, data->as.s.len);
+        if (err) return _kai_process_err(k, err);
+    }
+    return _kai_process_ok(k, kai_unit());
+}
+
+/* close_stdin(c) -> Result[Unit, String]. EOFs the child's stdin.
+ * Idempotent — closing an already-closed end is Ok, matching pclose's
+ * tolerance; only a malformed Child is an error. */
+static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        return _kai_process_err_msg(k, "close_stdin: invalid Child");
+    }
+    _kai_proc_pipe_close_stdin(pid);
+    return _kai_process_ok(k, kai_unit());
+}
+
+/* read_stdout(c) -> Result[String, String]. One blocking read of up
+ * to 64 KiB; Ok("") is EOF. Reading chunk-by-chunk (rather than one
+ * read-to-end op) is what lets a caller drain output larger than the
+ * OS pipe capacity without deadlocking the child. Blocks the OS
+ * thread, not the fiber. */
+static KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 1) : -1;
+    if (fd < 0) {
+        return _kai_process_err_msg(k, "read_stdout: stdout is not piped");
+    }
+    enum { KAI_PROC_READ_CHUNK = 65536 };
+    char *buf = (char *) malloc(KAI_PROC_READ_CHUNK);
+    if (!buf) { fputs("kai: out of memory\n", stderr); exit(1); }
+    ssize_t n;
+    do {
+        n = read(fd, buf, KAI_PROC_READ_CHUNK);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        int e = errno;
+        free(buf);
+        return _kai_process_err(k, e);
+    }
+    KaiValue *s = kai_str_from_bytes(buf, (size_t) n);
+    free(buf);
+    return _kai_process_ok(k, s);
 }
 
 /* =================================================================
@@ -13253,6 +13511,28 @@ static KaiFiber *kai_reactor_pid_waiters     = NULL;
 static KaiFiber *kai_reactor_filepool_waiters = NULL;
 #endif
 
+/* Exit statuses reaped by the SIGCHLD drain before any fiber parked
+ * on the pid. A child can die inside the window between the wait
+ * op's non-blocking waitpid and its park (or before wait is called
+ * at all — start → work → wait is the normal piped-child shape);
+ * the drain's waitpid(-1) wins that race and the status would be
+ * lost. Buffered nodes are consumed by `kai_reactor_take_child_exit`
+ * or by the drain's reconcile pass once the fiber does park. */
+typedef struct KaiPendingExit {
+    int pid;
+    int status;
+    struct KaiPendingExit *next;
+} KaiPendingExit;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiPendingExit *kai_reactor_pending_exits;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiPendingExit *kai_reactor_pending_exits = NULL;
+#  endif
+#else
+static KaiPendingExit *kai_reactor_pending_exits = NULL;
+#endif
+
 /* Issue #620 — Phase R3 reactor: stdin slot. Singleton because
  * STDIN_FILENO is process-shared; multiple fibers reading the same
  * pipe concurrently is a logic bug (the bytes would shred). The
@@ -13595,6 +13875,27 @@ static int kai_reactor_timer_remove(KaiFiber *f) {
     return 0;
 }
 
+/* Splice the fiber parked on `pid` (if any) off the waiter list and
+ * wake it with `status`. Caller holds the reactor lock. */
+static int kai_reactor_wake_pid_waiter(int pid, int status) {
+    KaiFiber **link = &kai_reactor_pid_waiters;
+    while (*link) {
+        if ((*link)->reactor_wait_pid == pid) {
+            KaiFiber *f = *link;
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_status = status;
+            /* Leave reactor_wait_pid intact so the wait op
+             * can confirm it matches on resume; clear elsewhere. */
+            kai_reactor_parked_count--;
+            kai_reactor_mark_ready(f);
+            return 1;
+        }
+        link = &(*link)->reactor_next;
+    }
+    return 0;
+}
+
 /* Drain SIGCHLD self-pipe and waitpid(-1, ..., WNOHANG) until no
  * more children have terminated, waking the fiber parked on each
  * pid. Idempotent — safe to call when no children are pending. */
@@ -13612,28 +13913,57 @@ static int kai_reactor_sigchld_drain(void) {
         int status = 0;
         pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) break;  /* 0 = none ready, -1 = ECHILD/EINTR */
-        KaiFiber **link = &kai_reactor_pid_waiters;
-        while (*link) {
-            if ((*link)->reactor_wait_pid == (int) pid) {
-                KaiFiber *f = *link;
-                *link = f->reactor_next;
-                f->reactor_next = NULL;
-                f->reactor_wait_status = status;
-                /* Leave reactor_wait_pid intact so the wait op
-                 * can confirm it matches on resume; clear elsewhere. */
-                kai_reactor_parked_count--;
-                kai_reactor_mark_ready(f);
-                woken++;
-                break;
-            }
-            link = &(*link)->reactor_next;
+        if (kai_reactor_wake_pid_waiter((int) pid, status)) {
+            woken++;
+            continue;
         }
-        /* If no fiber was parked on this pid the exit status is
-         * lost. v1 contract: callers always spawn-then-wait. A
-         * future "wait_any" or detached spawn would need a small
-         * pending-exits buffer here; not on the R1 critical path. */
+        /* No fiber parked on this pid yet — the exit raced the wait
+         * op's own WNOHANG/park window, or wait has not been called.
+         * Buffer the status; `kai_reactor_take_child_exit` or the
+         * reconcile below hands it over. */
+        KaiPendingExit *pe = (KaiPendingExit *) malloc(sizeof(KaiPendingExit));
+        if (!pe) continue;  /* status lost only under OOM */
+        pe->pid    = (int) pid;
+        pe->status = status;
+        pe->next   = kai_reactor_pending_exits;
+        kai_reactor_pending_exits = pe;
+    }
+    /* Reconcile: wake any waiter whose status was buffered before it
+     * finished parking. Runs on every reactor pass with live pid
+     * waiters, so a fiber that lost the race is woken one pass later. */
+    KaiPendingExit **pp = &kai_reactor_pending_exits;
+    while (*pp) {
+        if (kai_reactor_wake_pid_waiter((*pp)->pid, (*pp)->status)) {
+            KaiPendingExit *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            woken++;
+        } else {
+            pp = &(*pp)->next;
+        }
     }
     return woken;
+}
+
+/* Consume a buffered exit for `pid`. Called by the wait op before
+ * and after its own non-blocking waitpid, outside the reactor lock. */
+static int kai_reactor_take_child_exit(int pid, int *status) {
+    int found = 0;
+    kai_reactor_lock();
+    KaiPendingExit **pp = &kai_reactor_pending_exits;
+    while (*pp) {
+        if ((*pp)->pid == pid) {
+            KaiPendingExit *e = *pp;
+            *pp = e->next;
+            *status = e->status;
+            free(e);
+            found = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    kai_reactor_unlock();
+    return found;
 }
 
 /* Drain the file-pool completion pipe and promote every fiber whose
