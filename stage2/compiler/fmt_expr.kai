@@ -17,6 +17,7 @@ import compiler.diag
 import compiler.ast
 import compiler.parse
 import compiler.fmt_writer
+import compiler.fmt_refine
 
 # Emit a UnitExprT in surface form the parser accepts. This is
 # stricter than `unit_expr_display` (which uses bare juxtaposition
@@ -315,11 +316,16 @@ pub fn fmt_type(t: TypeExpr, s: FmtSt) : FmtSt {
       fmt_emit(s3, ">")
     }
     # m12.6: `Base where <pred>` — refinement. The predicate prints
-    # through the normal expression formatter.
+    # through the normal expression formatter, except for the two
+    # receiver elisions (`where >= 0`, `where matches p`) the parser
+    # expands into an explicit `self`, which are restored first.
     TyRefine(base, pred) -> {
       let s1 = fmt_type(base, s)
       let s2 = fmt_emit(s1, " where ")
-      fmt_expr(pred, s2)
+      match fmt_refine_elision(base, pred) {
+        Some(RE(lead, rhs)) -> fmt_expr(rhs, fmt_emit(s2, lead))
+        None                -> fmt_expr(pred, s2)
+      }
     }
     # issue #772: a compound row as a type argument — `Stream[Int,
     # Stdout + Fail]`. Render the labels (and open tail, if any) bare,
@@ -400,9 +406,9 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
       let s1 = fmt_expr_atom(inner, s0)
       fmt_emit(s1, "!")
     }
-    ECall(callee, call_args) -> match fmt_imaginary_span(callee, call_args) {
-      Some(im) -> fmt_emit(s0, string_concat(im, "i"))
-      None     -> fmt_call(callee, call_args, s0)
+    ECall(callee, call_args) -> match fmt_call_literal(callee, call_args) {
+      Some(lit) -> fmt_emit(s0, lit)
+      None      -> fmt_call(callee, call_args, s0)
     }
     EField(obj, fld) -> {
       let s1 = fmt_expr_atom(obj, s0)
@@ -457,7 +463,10 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
       let s2 = fmt_type(ty, s1)
       fmt_emit(s2, "]()")
     }
-    EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname, "()"]))
+    # A module-qualified name, not a call: the argument list belongs to
+    # the enclosing `ECall`, if there is one. Printing `()` here turned
+    # every such callee into a zero-arg call applied to its own arguments.
+    EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname]))
     EIntrinsic(name, args_) -> fmt_call(
       Expr { kind: EVar(string_concat("$", name)), line: e.line, col: e.col, ty: None, mode: MUnknown },
       args_, s0)
@@ -497,6 +506,7 @@ pub fn expr_is_atomic(e: Expr) : Bool {
     EExternBody(_) -> true
     ECall(_, _) -> true
     EField(_, _) -> true
+    EModCall(_, _) -> true
     EIndex(_, _) -> true
     ERecordLit(_, _) -> true
     EList(_) -> true
@@ -514,6 +524,15 @@ pub fn fmt_call(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt {
   let s3 = fmt_call_args(call_args, s2)
   fmt_emit(s3, ")")
 }
+
+# The surface literal a call node stands for, when the call is one the
+# parser minted from a single literal token rather than something the
+# author wrote as a call.
+fn fmt_call_literal(callee: Expr, call_args: [Expr]) : Option[String] =
+  match fmt_imaginary_span(callee, call_args) {
+    Some(im) -> Some(string_concat(im, "i"))
+    None     -> fmt_regex_sigil(callee, call_args)
+  }
 
 # Recover the `<digits>i` literal behind the parser's
 # `complex.mk(0.0, <digits>)` desugar, so the surface form round-trips.
@@ -547,11 +566,6 @@ fn fmt_same_pos(a: Expr, b: Expr) : Bool = a.line == b.line and a.col == b.col
 fn fmt_callee_is_complex_mk(callee: Expr) : Bool = match callee.kind {
   EField(obj, fld) -> fld == "mk" and fmt_var_is(obj, "complex")
   _                -> false
-}
-
-fn fmt_var_is(e: Expr, name: String) : Bool = match e.kind {
-  EVar(n) -> n == name
-  _       -> false
 }
 
 pub fn fmt_call_args(call_args: [Expr], s: FmtSt) : FmtSt {

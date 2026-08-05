@@ -1,0 +1,97 @@
+# compiler/fmt_refine.kai — surface-form recovery for `kai fmt` over the
+# regex sigil and the `where`-refinement receiver elisions.
+#
+# Three parse-time desugars reach the writer with the surface form gone:
+#
+#   ~r/pat/           ->  regexp.compile_or_panic("pat")   (an EModCall callee)
+#   where >= 0        ->  self >= 0
+#   where matches p   ->  matches(self, p)
+#
+# Re-printing the desugar is not merely verbose. `EModCall` prints as
+# `m.f()`, so the regex desugar came out as `(regexp.compile_or_panic())("pat")`
+# — malformed, and naming a module that need not be in scope at that point
+# in the file. A clean program stopped compiling after formatting.
+#
+# Each recogniser here is exact: a shape that is not the desugar is left
+# for the ordinary expression path, so hand-written code that happens to
+# call `matches` or compare against `self` keeps its own spelling.
+
+import compiler.util
+import compiler.ast
+import compiler.refinements
+
+#[doc("A recovered `where` elision: the leading keyword or operator, and the expression that follows it.")]
+pub type RefineElision = RE(String, Expr)
+
+#[doc("The `~r/.../` sigil behind a `regexp.compile_or_panic(\"...\")` desugar, or None for any other call.")]
+pub fn fmt_regex_sigil(callee: Expr, call_args: [Expr]) : Option[String] =
+  match call_args {
+    [arg0] -> if fmt_callee_is_regex_compile(callee) { fmt_sigil_of(arg0) } else { None }
+    _      -> None
+  }
+
+#[doc("The receiver elision behind a `where` predicate refining `base`, or None when the predicate was written in full.")]
+pub fn fmt_refine_elision(base: TypeExpr, pred: Expr) : Option[RefineElision] = match pred.kind {
+  EBinop(op, lhs, rhs) ->
+    if fmt_is_cmp_op(op) and fmt_is_elided_self(lhs, base) {
+      Some(RE(concat_all([op, " "]), rhs))
+    } else { None }
+  ECall(callee, cargs) -> fmt_matches_elision(callee, cargs, base)
+  _ -> None
+}
+
+# `matches(self, rhs)`, where the sugar minted the receiver. The callee
+# sits at the `matches` token, so it is the `self` argument alone that
+# betrays the elision.
+fn fmt_matches_elision(callee: Expr, cargs: [Expr], base: TypeExpr) : Option[RefineElision] =
+  match cargs {
+    [recv, rhs] ->
+      if fmt_var_is(callee, "matches") and fmt_is_elided_self(recv, base) {
+        Some(RE("matches ", rhs))
+      } else { None }
+    _ -> None
+  }
+
+# The synthetic receiver is minted at the base type's own position — the
+# one place inside the refinement no operand can occupy, since every
+# operand is written after the `where` that follows the base. A
+# written-out `self` therefore never lands on it.
+fn fmt_is_elided_self(e: Expr, base: TypeExpr) : Bool =
+  fmt_var_is(e, "self") and e.line == base.line and e.col == base.col
+
+#[doc("True when the expression is the bare identifier `name`.")]
+pub fn fmt_var_is(e: Expr, name: String) : Bool = match e.kind {
+  EVar(n) -> n == name
+  _       -> false
+}
+
+fn fmt_is_cmp_op(op: String) : Bool =
+  op == "<" or op == "<=" or op == "==" or op == "!=" or op == ">" or op == ">="
+
+# Only the sigil parser mints an `EModCall` this early — a hand-written
+# `regexp.compile_or_panic(p)` is still an `EField` when the writer runs,
+# since the qualified-call resolver has not yet rewritten it.
+fn fmt_callee_is_regex_compile(callee: Expr) : Bool = match callee.kind {
+  EModCall(m, fname) -> m == "regexp" and fname == "compile_or_panic"
+  _                  -> false
+}
+
+# Re-wrap the desugared pattern in its sigil delimiters. The string span
+# holds the pattern escaped as a kaikai string literal; decoding it
+# recovers the bytes that stood between `~r/` and `/`. A pattern
+# containing `/` could not have been written as a sigil in the first
+# place, so it stays a call.
+fn fmt_sigil_of(arg0: Expr) : Option[String] = match arg0.kind {
+  EStr(span, false) -> {
+    let pat = decode_regex_str_span(span)
+    if pat == "" or fmt_has_slash(pat, 0, string_length(pat)) { None }
+    else { Some(concat_all(["~r/", pat, "/"])) }
+  }
+  _ -> None
+}
+
+fn fmt_has_slash(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else if char_at_or_zero(s, i) == '/' { true }
+  else { fmt_has_slash(s, i + 1, n) }
+}
