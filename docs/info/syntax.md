@@ -13,15 +13,77 @@ handlers, fibers, holes) is novel by design.
 Comments start with `#`. Files have no module header — the path is
 the package name (see `kai info packages`).
 
+## Newlines and statement termination
+
+A newline TERMINATES a statement when the line is syntactically
+complete at that point. A newline is whitespace (the expression
+continues) only while the parser still expects more:
+
+- an unclosed `(`, `[`, or `{`;
+- the line ends in a binary operator (`+`, `*`, `==`, `and`, `or`,
+  `++`, …), an assignment/arrow (`=`, `:=`, `->`, `=>`), or a
+  separator (`,`, `:`).
+
+So continuation puts the operator at the END of the line. A binary
+operator LEADING the next line is a parse error (`expected
+expression`) — except the four pipes `|>` `|` `||` `|?`, which also
+continue from leading position:
+
+```kaikai
+fn dbl(x: Int) : Int = x * 2
+fn main() : Unit / Stdout = {
+  let a = 1 +                                  # trailing op continues
+    2
+  let b = 5
+    |> dbl                                     # leading pipe continues
+  Stdout.print("a=#{a} b=#{b}")
+}
+```
+
+```kaikai-neg
+fn main() : Int = {
+  let r = true
+    and false                                  # leading `and`: parse error
+  if r { 1 } else { 0 }
+}
+```
+
+Trap: a leading `-` does NOT error — it parses as a fresh unary
+expression whose value is discarded, so the split silently changes
+meaning:
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let x = 1
+    - 2                                        # separate statement `-2`,
+  Stdout.print("x=#{x}")                       #   discarded: x is 1, not -1
+}
+```
+
+`;` is always a valid statement terminator; use it only to put several
+statements on one line (`{ f(h); each_of(t, f) }`). A single-quoted
+`"..."` string must close on its own line — an embedded newline is
+`unterminated string`; use `"""` (see Literals).
+
 ## Declarations
 
 ```kaikai
 type Color = Red | Green | Blue                # sum type
 type Point = { x: Int, y: Int }                # record type
+type Wallet = { owner: String,                 # `priv` hides a field
+                priv pin: Int }                #   outside the module
+type Shade = Light | Dark                      # another sum
+type ColorErr = Color | Shade                  # union of PRE-DECLARED sums
+                                               #   (not new ctors; narrow
+                                               #   with `n : T ->` arms)
+type Web = Stdout + Mutable                    # effect alias (row)
 
 effect Logger {                                # effect declaration
   log(s: String) : Unit
 }
+effect Store {                                 # effect ops (and protocol
+  get[t](k: String) : Option[t]                #   ops) may take type
+}                                              #   params; so may effects
 
 unit m                                         # unit of measure
 unit s
@@ -68,6 +130,12 @@ extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
 fn main() : Int = fib(10) + classify(0, 5) + MAX
 ```
 
+FFI surface beyond `extern "C" fn` — extern structs (`extern "C"
+type Vec2 = { x: F32, y: F32 }`), opaque handles (`extern "C" opaque
+Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn
+connect(...)`), and the fixed-width marshal types (`U8`–`I64`,
+`F32`) — is covered in `kai info ffi`.
+
 `main` is the program entry point. When it returns `Int`, that value is
 the process exit status (POSIX keeps the low 8 bits), so `Err(_) -> 1`
 signals failure to a shell, `set -e`, or a CI gate; any other return
@@ -81,6 +149,53 @@ for Elixir/Haskell-style multi-clause function heads. One parameter
 matches it directly; 2–4 parameters match a comma-separated tuple per
 arm. A clause-block holds ONLY `case` arms: mixing a `let`/statement
 with `case` is a parse error.
+
+### Contracts and refinements
+
+A `fn` signature takes optional `requires` / `ensures` clauses before
+either body form (`ensures` binds `result`). A type alias takes a
+`where` refinement predicate over `self` — with a unary elision
+(`Int where >= 0` means `self >= 0`). `ensure(v) where <pred>`
+checks a value at runtime, yielding `Option[T]`. Full treatment:
+`kai info contracts`.
+
+```kaikai
+type NonNeg = Int where self >= 0
+
+fn bump(n: Int) : Int requires n > 0 ensures result > 1 = n + 1
+
+fn main() : Unit / Stdout = match ensure(5) where >= 0 {
+  Some(v) -> Stdout.print("v=#{v + bump(1)}")
+  None    -> Stdout.print("no")
+}
+```
+
+### Generic parameters and bounds
+
+Type params ride `[...]` on `fn` / `type` / `impl` / effect ops.
+A param may carry protocol bounds (`[t : Show + Eq]`) or a kind
+annotation (`[u: Measure]`, see `kai info units` / `kai info kinds`).
+Protocol methods may type the receiver as `Self`.
+
+```kaikai
+protocol Tagged {
+  tag(self: Self) : String
+}
+impl Tagged for Int {
+  fn tag(self: Int) : String = "int"
+}
+
+fn describe[t : Tagged + Eq](x: t, y: t) : String =
+  if x == y { "same #{x.tag()}" } else { "diff" }
+
+fn main() : Unit / Stdout = Stdout.print(describe(1, 1))
+```
+
+Kind-side declarations — `theory T = { assoc, ... }`, `kind K :
+Theory with <introducer>`, habitant introducers (`currency USD`,
+`perm read`, `unit Newton = kg * m / sec^2`), and habitant slots on a
+type head (`type Matrix[t]<m: Dim, n: Dim>`) — are covered in
+`kai info kinds` and `kai info units`.
 
 ## Imports and effect opening
 
@@ -101,7 +216,11 @@ fn main() : Int = 0
 
 `import` brings in a module (optionally aliased, or restricted to a
 selection); `use E` opens an effect's operations so they resolve by
-bare name. `use` takes an effect (PascalCase), never a module.
+bare name, at file top or inside any block. `use` takes an effect
+(PascalCase) or a kind (`use kind Fiat`, see `kai info kinds`) —
+never a module. `import ?name` is the dependency hole: the resolver
+searches packages for a symbol named `name` (`kai info holes`); a
+bare `import ?` is rejected.
 
 ## Tests
 
@@ -113,14 +232,20 @@ test "addition" {                               # builtin test block
 fn main() : Int = 0
 ```
 
-`test "..." { }` (and the parallel `bench` / `check` forms) are
-top-level declarations, not function calls. `assert cond` inside a
-test body checks a condition; see `kai info testing`.
+`test "..." { }`, `bench "..." { }`, and `check "..." with p: T { }`
+(property test; `with` binds the generated inputs) are top-level
+declarations, not function calls — see `kai info testing`.
+`assert cond` checks a condition and takes an optional message
+(`assert x == 42, "expected 42"`); it is a statement, legal in any
+block, not only in test bodies.
 
 ## Attributes
 
-Three `#[...]` meta-instructions exist: `#[derive(...)]`,
-`#[unstable]`, and `#[doc("...")]`. Attributes come BEFORE `pub`.
+Four declaration-level `#[...]` meta-instructions exist —
+`#[derive(...)]`, `#[unstable]`, `#[doc("...")]`, and
+`#[constructor]` — plus the field-level `#[json(...)]` family.
+Attributes come BEFORE `pub`. An unrecognised attribute parses and is
+silently discarded — `#[deprecated]` does nothing.
 
 ```kaikai
 #[doc("Adds one to its argument.")]            # item doc, single line
@@ -137,8 +262,17 @@ pub type Color = Red | Green | Blue
 #[unstable]                                    # outside edition stability
 pub fn experimental() : Int = 0
 
-fn main() : Int = addone(double(20)) + experimental()
+pub type Wallet = { owner: String, pin: Int }
+#[constructor]                                 # enables Wallet("ana") —
+pub fn wallet(owner: String) : Wallet          #   call syntax on the
+  = Wallet { owner: owner, pin: 0 }            #   TYPE name
+
+fn main() : Int = addone(double(20)) + experimental() + Wallet("ana").pin
 ```
+
+On a record field, `#[json(rename = "wire")]` / `#[json(default =
+<expr>)]` / `#[json(skip)]` steer `#[derive(Json)]` — a skipped field
+needs a `default` or an `Option` type to decode.
 
 A `#[doc(...)]` at file top, separated from the first declaration by a
 blank line, is the **module doc** — at most one per file. One doc per
@@ -208,6 +342,11 @@ The pattern binder is irrefutable: `(a, b)` over a `Pair` always
 matches. A refutable pattern (e.g. `(Some(n))`) is rejected with a
 non-exhaustive-match diagnostic. This destructuring is block-lambda
 only — the arrow form `(a, b) => ...` stays a two-parameter lambda.
+
+A call takes up to TWO trailing lambdas (`both { 1 } { 2 }` passes
+two thunks), and the parens are optional when the lambda is the only
+argument: `f { body }` is `f(() => body)` — the form `region { }` and
+`handle { }` ride on.
 
 ## Control flow
 
@@ -320,7 +459,22 @@ fn main() : Int / Stdout = {
 ```
 
 In a function type, the row appears after `/`: `: T / E1 + E2`.
-Empty row means pure.
+Empty row means pure. A row label takes type args (`/ State[Int] +
+Reader[String]`); a lowercase name is a row VARIABLE (`fn each[a, e](
+xs: [a], f: (a) -> Unit / e) : Unit / e` — the tail stays open and
+unifies with the caller's row); `/ ?e` is a row hole (`kai info
+holes`); and a composed row can sit in type-arg position
+(`Stream[Int, Stdout + Fail]`).
+
+More handler surface (all in `kai info effects`): `with E as name`
+rebinds the capability as a first-class value (ops go through the
+rebound name — the way to nest two handlers of one effect);
+`with State[Int](0)` passes type args and an initial state; clauses
+may be preceded by a `var`/`let` prelude; `state` and `log` are two
+spellings of the handler-state binder; and an `effect` declaration
+may close with `default { }` clauses (the handler of last resort,
+where the `$name(...)` compiler-intrinsic call form appears, e.g.
+`$extern_handler("sym")`).
 
 A handler may also carry `initially { }` (runs once at installation; its
 value becomes the handler state, read as `state`) and `finally { }`
@@ -348,10 +502,14 @@ fn main() : Int / Stdout = handle {
 type Color = Red | Green | Blue
 
 fn main() : Unit / Stdout = {
-  let n = 42 + 0xFF + 0b1010                   # numbers
+  let n = 42 + 0xFF + 0b1010                   # numbers (also 0XFF, 0B1010)
+  let sep = 1_000_000 + 0xDEAD_BEEF            # `_` digit separator, any base
   let r = 3.14 + 2.5e-2                        # reals
   let w = 42i32 + 7i32                         # fixed-width: i32/u32/
   let big : Int128 = 9223372036854775808i128   #   u64/i128 suffixes
+  let hx = 0xFFi32 + 0b1010i32                 # width suffix on any base
+  let z = 2.5i                                 # imaginary -> Complex
+                                               #   (42i, 1.0e3i also lex)
   let c = 'A'                                  # chars (Unicode scalar
   let acc = 'á'                                #   value; 'á' '▸'
   let emo = '\u{1F389}'                        #   '\u{1F389}' all lex)
@@ -371,18 +529,60 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-List destructuring (`[head, ...tail]`) only parses where a pattern
+A trailing comma is allowed in list, tuple, record, map, and set
+literals (`[1, 2, 3,]`).
+
+List-PATTERN destructuring (`[head, ...tail]`) parses where a pattern
 is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
-parameters. It is not an RHS expression form. See the
+parameters. In EXPRESSION position `...` is the list spread:
+`[...xs, 3, 4]` / `[0, ...xs]` build a new list splicing `xs` in
+place — multiple spreads, any position. See the
 [Patterns section](#patterns-highlights-see-kai-info-match).
 
 `Map` and `Set` have their own literals (`%{ }` / `%[ ]`) — see the
 [Collections section](#collections).
 
+### Multi-line strings (`"""`)
+
+`"""..."""` is a string literal that spans lines and interpolates
+`#{...}` like `"..."` does. It works in any expression position (not
+only inside `#[doc]`). Embedded `"` and `""` need no escaping.
+
+```kaikai
+fn help_text(version: Int) : String = """usage: mark v#{version}
+
+  mark <file.md>"""
+
+fn main() : Unit / Stdout = Stdout.print(help_text(2))
+```
+
+The literal is byte-exact: the newline after the opening `"""` is
+KEPT and nothing is dedented, so `"""` + newline + `AB"""` is
+`"\nAB"` (length 3). Start the text right after the opening
+delimiter to avoid a leading blank line, and column-0-align the body
+unless the indentation is wanted.
+
+### Regex literals (`~r/.../`)
+
+`~r/pattern/` compiles a regex at the use site (desugars to
+`regexp.compile_or_panic("pattern")`; `import regexp` required). A
+first-class expression in any position. `#` cannot appear in the
+body.
+
+```kaikai
+import regexp
+
+fn main() : Unit / Stdout = {
+  let re = ~r/^[a-z]+$/
+  let lbl = if regexp.matches("abc", re) { "yes" } else { "no" }
+  Stdout.print(lbl)
+}
+```
+
 Operators by precedence (looser at the bottom):
 
 ```text
-postfix       f(args)  a.b  a[i]  expr!  trailing-lambda
+postfix       f(args)  a.b  a[i]  a[i..j]  expr!  trailing-lambda
 power         a ^ b                                  (right-assoc)
 unary         -x  not x
 multiplicative *  /  %
@@ -397,7 +597,9 @@ pipes         |>  |  ||  |?                          (left-assoc)
 `a < b < c` is a syntax error (non-associative). Use `a < b and b < c`.
 Boolean operators are the keywords `and`, `or`, `not` — not `&&`,
 `||`, `!`. (`||` is the flat-map pipe; `!` is postfix Option/Result
-propagation.)
+propagation; prefix `&` and `@` are the `Ref` make/deref sigils —
+see [Capability sugar](#capability-sugar).) `a[i..j]` slices a `Vec`
+by range (`kai info vec`).
 
 ### Fixed-width integers
 
@@ -412,8 +614,10 @@ mixing them is a type error; convert explicitly with `int_to_int32` /
 Comparisons are signed/unsigned per width, and `Show` / `Eq` / `Ord` /
 `Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at ~19), so a
 literal above 2^63 is written `…i128` and round-trips exactly. The suffix
-attaches to a decimal/hex/bin literal with no intervening space; `42i`
-without a width stays a complex literal.
+attaches to a decimal/hex/bin literal with no intervening space
+(`0xFFi32`, `0b1010u8`); `42i` without a width stays a complex
+literal, and there is no `i64` suffix (`Int` is already 64-bit — a
+stray `42i64` reads as a complex literal, not an integer).
 
 In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
@@ -634,10 +838,18 @@ fn area_at_origin(p: Point) : Int = match p {
 fn main() : Int / Stdout = {
   let p = Point { x: 3, y: 4 }                               # type prefix REQUIRED
                                                              # in expression position
-  Stdout.print("p.x=#{p.x}")
+  let q = Point { 3, 4 }                                     # positional: fields in
+                                                             #   declaration order
+  let r = Point { ...p, x: 10 }                              # spread: one, first;
+                                                             #   named overrides win
+  Stdout.print("p.x=#{p.x} q.y=#{q.y} r.x=#{r.x}")
   area_at_origin(p)
 }
 ```
+
+A record literal may qualify the type through a module alias
+(`geo.Point { x: 1, y: 2 }`), and a record pattern may carry the
+type prefix too (`Point { x: 0, y } ->`).
 
 ## N-tuples
 
@@ -656,7 +868,8 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-`(e)` is grouping; never a 1-tuple. `()` is the unit value.
+`(e)` is grouping; never a 1-tuple. `()` is the unit value. Arity
+stops at 4 — a 5-tuple is an error; reach for a record.
 
 ## Patterns (highlights — see `kai info match`)
 
@@ -685,10 +898,25 @@ fn swap(pr: (Int, Int)) : (Int, Int) = match pr {
 }
 
 fn list_info(xs: [Int]) : String = match xs {
-  whole @ [_, ..._] -> "non-empty len=#{whole.length()}"
-                                                # `whole` binds the
-                                                # entire scrutinee
-  []                -> "empty"
+  whole as [_, ...]  -> "non-empty len=#{whole.length()}"
+                                                # `as` binds the entire
+                                                # scrutinee (`whole @ ...`
+                                                # is the legacy spelling;
+                                                # bare `...` ignores the
+                                                # tail without naming it)
+  []                 -> "empty"
+}
+
+fn size_class(n: Int) : String = match n {
+  1..9    -> "small"                            # range pattern (Int or
+  -9..0   -> "neg"                              #   Char literals, incl.
+  _       -> "big"                              #   negative bounds)
+}
+
+fn addboth(a: Int, b: Int) : Int = match a, b { # multi-scrutinee match:
+  0, y          -> y                            #   up to 4 scrutinees, one
+  x, y if x < 0 -> y                            #   pattern list per arm
+  x, y          -> x + y                        #   (plain-match `if` guard)
 }
 
 fn main() : Unit / Stdout = {
@@ -698,15 +926,28 @@ fn main() : Unit / Stdout = {
   }
   Stdout.print(sign(-1))
   Stdout.print(list_info([1, 2]))
+  Stdout.print(size_class(4))
+  let pr = (5, 7)
+  let { fst, snd } = pr                         # anonymous record pattern
+                                                #   on a let LHS
   let _ = origin(Point { x: 0, y: 0 })
   let _ = swap((1, 2))
+  Stdout.print("sum=#{addboth(fst, snd)}")
 }
 ```
 
-Literal patterns (`0`, `-1`, `"hi"`, `'c'`, `true`), record patterns
-(`{ x: 0, y }`), and tuple patterns (`(a, b)`) all appear in `match`
-arms, `let` LHS, and fn parameters. The guard keyword in a plain
-`match` arm is `if`; in a clause-block fn body it is `when`.
+Literal patterns (`0`, `-1`, `"hi"`, `'c'`, `true`, and fixed-width
+forms like `0u8` / `42i32`), record patterns (`{ x: 0, y }`), and
+tuple patterns (`(a, b)`) all appear in `match` arms, `let` LHS, and
+fn parameters. A variant pattern may be module-qualified
+(`geo.Ctor(x)`). The guard keyword in a plain `match` arm is `if`;
+in a clause-block fn body it is `when`.
+
+Over a union type (`type QueryErr = IdentityError | AuthError`) an
+arm may NARROW by type — `ie : IdentityError -> ...` binds `ie` at
+the narrowed component; an inline refinement also fits (`n : Int
+where > 0 ->`). Holes (`?` / `?name`) are legal in pattern position
+too (`kai info holes`, `kai info match`).
 
 ## Postfix `!` — Option/Result propagation
 
@@ -821,6 +1062,23 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+`Ref[T]` cells — prefix `&` makes one, prefix `@` dereferences
+(`@x.f.g` walks a field path), `r := v` writes, and a record field
+holding a `Ref` writes through `rec.field := v`. Observable `Ref`
+traffic rides the `Mutable` effect:
+
+```kaikai
+type Cfg = { counter: Ref[Int] }
+
+fn main() : Unit / Stdout + Mutable = {
+  let r = &10                                  # make a Ref[Int]
+  r := @r + 32                                 # deref-and-write
+  let cfg = Cfg { counter: &0 }
+  cfg.counter := 5                             # write through a field
+  Stdout.print("r=#{@r} c=#{@cfg.counter}")
+}
+```
+
 ## Typed holes
 
 ```kaikai
@@ -830,11 +1088,19 @@ fn maybe(s: String) : Int = {
   n + m
 }
 
+fn later(x: Int) : Int = todo!("write me")     # compiles at any type;
+                                               #   panics if reached.
+                                               #   Plain string only —
+                                               #   no interpolation
+
 fn main() : Int = 0
 ```
 
 The checker reports each hole with expected type and bindings in
 scope under `kai build --holes file.kai`. JSON via `--holes-json`.
+Holes also stand in pattern position (`match x { ?name -> ... }`),
+in an effect row (`/ ?e`), and as an import (`import ?name`) — see
+`kai info holes`.
 
 ## Regions
 
@@ -842,7 +1108,8 @@ scope under `kai build --holes file.kai`. JSON via `--holes-json`.
 constructors written **lexically inside** the block are bump-allocated
 in a per-region arena that frees in one shot at the closing brace,
 skipping reference counting entirely. Opt-in — you write `region`; the
-compiler never infers it.
+compiler never infers it. A named form `region { r -> ... }` binds the
+region itself for APIs that take one.
 
 ```kaikai
 fn sum_list(xs: [Int]) : Int = match xs {
@@ -981,4 +1248,6 @@ Use instead:
 
 `kai info effects`, `kai info fibers`, `kai info match`,
 `kai info pipes`, `kai info protocols`, `kai info units`,
-`kai info packages`, `kai info testing`, `kai info holes`
+`kai info kinds`, `kai info contracts`, `kai info ffi`,
+`kai info vec`, `kai info packages`, `kai info testing`,
+`kai info holes`
