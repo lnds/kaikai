@@ -349,10 +349,11 @@ tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope t
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
-#     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
+#     test-core-cache, test-modular-selfhost,
+#     test-perceus-1131-modular-escape, test-fmt-property,
 #     light(1/3), light(2/3), light(3/3),
 #     demos-no-regression, test-fmt, test-fmt-selfhost,
-#     test-fmt-help-scope, test-fmt-property, test-bench,
+#     test-fmt-help-scope, test-bench,
 #     test-check, test-library-mode, test-diagnostics-collected,
 #     test-negative, test-stdlib-modules, test-packages,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
@@ -367,7 +368,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms
+	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
 tier1-shard-2: kaic2
@@ -393,7 +394,8 @@ tier1-shard-5: kaic2
 # shard-4's object cache but is a separate job.
 tier1-shard-6: kaic2
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	@echo "tier1-shard-6 OK — #1131 modular-escape gate"
+	$(MAKE) test-fmt-property
+	@echo "tier1-shard-6 OK — #1131 modular-escape gate + fmt meaning-preservation"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -522,9 +524,11 @@ test-fmt-help-scope: kaic2
 # by issue and must reach zero.
 #
 # Cost: four kaic2 invocations per file over ~1800 files. Serial that is
-# ~18 min, which does not fit a shard; the work is per-file independent,
-# so the script fans out over $(nproc) workers (FMT_PROPERTY_JOBS to
-# override). It rides shard-1 alongside its two sibling fmt gates.
+# ~18 min, so the script fans out over $(nproc) workers
+# (FMT_PROPERTY_JOBS to override). Even fanned out it costs minutes,
+# which is why it rides shard-6 rather than shard-1 with its sibling fmt
+# gates: shard-1 was already the long pole and adding this to it blew the
+# job's 30-minute ceiling.
 test-fmt-property: kaic2
 	@./tests/fmt_property.sh
 

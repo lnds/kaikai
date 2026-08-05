@@ -374,9 +374,13 @@ position. That is where the six bugs lived. A run covers 1573 files;
 193 are dropped because the parser rejects them (negative fixtures,
 by design) and the rest are excused against an open issue.
 
-Cost is four `kaic2` invocations per file, ~18 minutes serial. That does
-not fit a Tier 1 shard, so the script fans out over `$(nproc)` workers
-(`FMT_PROPERTY_JOBS` overrides) — the work is per-file independent. Note
+Cost is four `kaic2` invocations per file, ~18 minutes serial, so the
+script fans out over `$(nproc)` workers (`FMT_PROPERTY_JOBS` overrides) —
+the work is per-file independent. Even fanned out it costs minutes, so it
+rides `tier1-shard-6` rather than shard-1 with its sibling fmt gates:
+shard-1 was already the long pole at ~30 minutes and adding this to it
+hit the job's ceiling, cancelling the shard. Shard-6 ran in well under a
+minute. Note
 the harness passes `--path stdlib`: without it most of the corpus fails
 to resolve its imports and is silently dropped as unparseable, which
 costs about a quarter of the coverage.
