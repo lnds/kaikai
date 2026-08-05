@@ -1,0 +1,153 @@
+# The privacy table: every top-level symbol with its home module,
+# `pub`-ness, namespace and kind word, collected from the per-module
+# decl segments. Consumed by the decision point in `pub_access.kai`.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+
+#[doc("""
+One privacy-table entry: a top-level symbol, its home module, its
+`pub`-ness, its namespace and its kind word.
+
+A name in type position must never resolve against a value entry:
+implicitly-bound type variables fall through to the table and would
+match a same-named `fn` of another module.
+""")]
+pub type PaEntry = { name: String, home: String, is_pub: Bool,
+      is_ty: Bool, kind: String }
+
+type PaProtoVis = PPV(String, Bool)
+
+#[doc("The privacy table for the given segments, in source order.")]
+pub fn pa_table(segs: [CoreSegment]) : [PaEntry] =
+  list_reverse(pa_entries_segs(segs, pa_protos_segs(segs, []), []))
+
+# ==== table ====
+
+fn pa_protos_segs(segs: [CoreSegment], acc: [PaProtoVis]) : [PaProtoVis] =
+  match segs {
+    [] -> acc
+    [PSeg(_, ds), ...rest] -> pa_protos_segs(rest, pa_protos_decls(ds, acc))
+  }
+
+fn pa_protos_decls(ds: [Decl], acc: [PaProtoVis]) : [PaProtoVis] = match ds {
+  [] -> acc
+  [d, ...rest] -> pa_protos_decls(rest, pa_proto_one(d, acc))
+}
+
+fn pa_proto_one(d: Decl, acc: [PaProtoVis]) : [PaProtoVis] = match d {
+  DProtocol(is_pub, name, _, _, _, _) -> [PPV(name, is_pub), ...acc]
+  DDerive(_, inner, _, _)    -> pa_proto_one(inner, acc)
+  DUnstable(inner, _, _)     -> pa_proto_one(inner, acc)
+  DProtoLaws(_, inner, _, _) -> pa_proto_one(inner, acc)
+  DImplAxiom(_, inner, _, _) -> pa_proto_one(inner, acc)
+  DConstructor(inner, _, _)  -> pa_proto_one(inner, acc)
+  DDoc(_, _, inner, _, _)    -> pa_proto_one(inner, acc)
+  _ -> acc
+}
+
+# `pub` wins across same-name protocols; an unknown protocol keeps
+# its impl methods visible (the impl itself is diagnosed separately).
+fn pa_proto_pub(protos: [PaProtoVis], name: String) : Bool =
+  pa_proto_pub_loop(protos, name, true, false)
+
+fn pa_proto_pub_loop(protos: [PaProtoVis], name: String,
+      verdict: Bool, seen: Bool) : Bool = match protos {
+  [] -> if seen { verdict } else { true }
+  [PPV(n, is_pub), ...rest] ->
+    if n != name { pa_proto_pub_loop(rest, name, verdict, seen) }
+    else if is_pub { true }
+    else { pa_proto_pub_loop(rest, name, false, true) }
+}
+
+fn pa_entries_segs(segs: [CoreSegment], protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match segs {
+  [] -> acc
+  [PSeg(mod_name, ds), ...rest] ->
+    pa_entries_segs(rest, protos, pa_entries_decls(ds, mod_name, protos, acc))
+}
+
+fn pa_entries_decls(ds: [Decl], home: String, protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match ds {
+  [] -> acc
+  [d, ...rest] -> pa_entries_decls(rest, home, protos,
+      pa_entry_one(d, home, protos, acc))
+}
+
+fn pa_entry(name: String, home: String, is_pub: Bool, is_ty: Bool,
+      kind: String) : PaEntry =
+  PaEntry { name: name, home: home, is_pub: is_pub, is_ty: is_ty, kind: kind }
+
+fn pa_entry_one(d: Decl, home: String, protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match d {
+  DFn(is_pub, name, _, _, _, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, false, "fn"), ...acc]
+  DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, false, "fn"), ...acc]
+  DConst(is_pub, name, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, false, "const"), ...acc]
+  # A sum type's variant ctors share the type's `pub`-ness. Ctors sit
+  # in both namespaces (`Some(x)` in expressions, reachable through
+  # the type in signatures) — registered as type entries so both
+  # resolution modes see them.
+  DType(is_pub, name, _, body, _, _, _, _) ->
+    pa_type_entries(name, body, home, is_pub, acc)
+  DEffect(is_pub, name, _, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, true, "effect"), ...acc]
+  # Protocol ops are callable by bare name through the dispatcher, so
+  # each op is a value entry carrying the protocol's `pub`-ness.
+  DProtocol(is_pub, name, _, ops, _, _) ->
+    pa_op_entries(ops, home, is_pub,
+      [pa_entry(name, home, is_pub, true, "protocol"), ...acc])
+  DUnit(is_pub, name, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, true, "unit"), ...acc]
+  # Impl methods dispatch cross-module through the protocol; they are
+  # as visible as the protocol they implement.
+  DImpl(pname, _, _, subs, _, _, _) ->
+    pa_method_entries(subs, home, pa_proto_pub(protos, pname), acc)
+  DDerive(_, inner, _, _)    -> pa_entry_one(inner, home, protos, acc)
+  DUnstable(inner, _, _)     -> pa_entry_one(inner, home, protos, acc)
+  DProtoLaws(_, inner, _, _) -> pa_entry_one(inner, home, protos, acc)
+  DImplAxiom(_, inner, _, _) -> pa_entry_one(inner, home, protos, acc)
+  DConstructor(inner, _, _)  -> pa_entry_one(inner, home, protos, acc)
+  DDoc(_, _, inner, _, _)    -> pa_entry_one(inner, home, protos, acc)
+  _ -> acc
+}
+
+fn pa_type_entries(name: String, body: TypeBody, home: String,
+      is_pub: Bool, acc: [PaEntry]) : [PaEntry] = {
+  let a1 = [pa_entry(name, home, is_pub, true, "type"), ...acc]
+  match body {
+    TBSum(vs) -> pa_ctor_entries(vs, home, is_pub, a1)
+    _ -> a1
+  }
+}
+
+fn pa_ctor_entries(vs: [Variant], home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match vs {
+  [] -> acc
+  [Var(cname, _), ...rest] ->
+    pa_ctor_entries(rest, home, is_pub,
+      [pa_entry(cname, home, is_pub, true, "ctor"), ...acc])
+}
+
+fn pa_op_entries(ops: [ProtoOp], home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match ops {
+  [] -> acc
+  [POp(name, _, _, _, _, _), ...rest] ->
+    pa_op_entries(rest, home, is_pub,
+      [pa_entry(name, home, is_pub, false, "op"), ...acc])
+}
+
+fn pa_method_entries(ms: [Decl], home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match ms {
+  [] -> acc
+  [m, ...rest] -> match m {
+    DFn(_, name, _, _, _, _, _, _, _, _) ->
+      pa_method_entries(rest, home, is_pub,
+      [pa_entry(name, home, is_pub, false, "method"), ...acc])
+    _ -> pa_method_entries(rest, home, is_pub, acc)
+  }
+}
+
