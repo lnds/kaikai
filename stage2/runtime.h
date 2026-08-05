@@ -17128,10 +17128,29 @@ static void *kai_llvm_const_int(void *i64ty, int64_t v) {
  * compiler's 64-bit `decode_int`, so the register const is materialised from
  * the textual span (base 10, optional leading `-`) — the 128-bit value LLVM
  * cannot take through the i64 `const_int`. */
+/* The span is the literal verbatim, so it may carry a `0x`/`0b` base
+ * prefix and `_` separators. LLVM parses neither: strip both and pass
+ * the matching radix, else the digits are read as decimal and silently
+ * yield a wrong constant. */
 static void *kai_llvm_const_i128_str(void *i128ty, KaiValue *s) {
     const char *txt = s->as.s.bytes;
     size_t len = s->as.s.len;
-    void *r = (void *) LLVMConstIntOfStringAndSize((LLVMTypeRef) i128ty, txt, (unsigned) len, 10);
+    char buf[64];
+    size_t i = 0, n = 0;
+    unsigned radix = 10;
+    if (i < len && (txt[i] == '-' || txt[i] == '+')) {
+        if (txt[i] == '-' && n < sizeof buf - 1) buf[n++] = '-';
+        i++;
+    }
+    if (i + 1 < len && txt[i] == '0') {
+        char b = txt[i + 1];
+        if (b == 'x' || b == 'X') { radix = 16; i += 2; }
+        else if (b == 'b' || b == 'B') { radix = 2; i += 2; }
+    }
+    for (; i < len && n < sizeof buf - 1; i++) {
+        if (txt[i] != '_') buf[n++] = txt[i];
+    }
+    void *r = (void *) LLVMConstIntOfStringAndSize((LLVMTypeRef) i128ty, buf, (unsigned) n, radix);
     kai_decref(s);
     return r;
 }
