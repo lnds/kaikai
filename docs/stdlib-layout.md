@@ -268,7 +268,7 @@ stdlib/
   os/            effects: Env, Process
     env.kai      (shipped via PR #131 + PR #143)
     args.kai     (shipped via PR #131 + PR #143)
-    process.kai  (shipped — closes #346; 4 public fns: `start`, `wait`, `kill`, `exit`)
+    process.kai  (shipped — closes #346 + #1591; `start`, `wait`, `kill`, `exit` plus the pipe family `start_piped`, `pipe_to`, `pipe_from`, `write_stdin`, `close_stdin`, `read_stdout`, `read_all`)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
   date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
   array.kai      pure (Array[T] / [T] bridge — shipped via #366)
@@ -435,7 +435,7 @@ declare `/ Stdin`.
 
 - `os.env` — `get`, `set`, `unset`, `entries` *(shipped via PR #131 + PR #143; closes #127 — `entries` was renamed from `all` because the bare `all` collided with `list.all` for any caller importing both)*
 - `os.args` — `argv`, `program_name` *(shipped via PR #131 + PR #143)*
-- `os.process` — `start(cmd, args)`, `wait`, `kill`, `exit` *(shipped — closes #346; 4 public fns wrapping the four ops of `Process`. `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal` still deferred — pipe redirection requires runtime work; `wait_or_kill` is now unblocked (R1 reactor shipped 2026-05-15, #611, parks the fiber on `Process.wait` via SIGCHLD self-pipe) and waits on the cancel-aware wrapper, see `docs/effects-stdlib.md` §`Process` v1-status sidebar.)*
+- `os.process` — `start(cmd, args)`, `wait`, `kill`, `exit` *(shipped — closes #346)*, plus the popen-shaped pipe family `start_piped`, `pipe_to`, `pipe_from`, `write_stdin`, `close_stdin`, `read_stdout`, `read_all` *(shipped — closes #1591; wraps the `start_piped`/`write_stdin`/`close_stdin`/`read_stdout` ops of `Process`. `wait_or_kill` and `signal` still deferred — `wait_or_kill` is unblocked (R1 reactor shipped 2026-05-15, #611, parks the fiber on `Process.wait` via SIGCHLD self-pipe) and waits on the cancel-aware wrapper, see `docs/effects-stdlib.md` §`Process` v1-status sidebar.)*
 - `os.exit` — physically `process.exit` *(shipped via #346)*. Takes an exit code. Effect: `/ Process` (exiting is observable). Top-level alias `os.exit` (calling `exit(7)` without the `process.` qualifier) is a module-system design decision pending in stage 2; until then, `process.exit(code)` is the surface.
 
 ### time (`/ Clock`)

@@ -74,8 +74,8 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `fs/dir`                                | shipped via #344: 4 public fns (`dir.list_dir`, `dir.create_dir`, `dir.remove_dir`, `dir.walk`) over `kai_core_dir_*` primitives; rides `File`; v1 walk does not follow symlinks |
 | `os/env`                                | shipped via PR #131 (partial) + PR #143 (close, closes #127); 4 public fns                                                     |
 | `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
-| `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126)                                                                          |
-| `os/process` (Kai wrapper)              | shipped (closes #346): 4 public fns (`process.start`, `process.wait`, `process.kill`, `process.exit`) over `builtin_process_decl` |
+| `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126); popen-shaped stdio pipes (`start_piped`/`write_stdin`/`close_stdin`/`read_stdout` ops, pclose-shaped `wait`) shipped via #1591 |
+| `os/process` (Kai wrapper)              | shipped (closes #346): `process.start`, `process.wait`, `process.kill`, `process.exit`; pipe surface (`start_piped`, `pipe_to`, `pipe_from`, `write_stdin`, `close_stdin`, `read_stdout`, `read_all`) shipped via #1591 |
 | `time` Clock default handler            | shipped via PR #134 — `kai_default_clock_wall_now`, `kai_default_clock_monotonic_now`, `kai_default_clock_sleep_ns` are wired  |
 | `crypto/hash`, `crypto/mac`             | shipped via PR #146 (S2 #5): 626 LOC pure-Kai SHA-256/SHA-512 + 83 LOC HMAC                                                    |
 | `random_secure`                         | shipped via PR #144 (closes #140): 44 LOC, 2 public fns over `getrandom(2)` / `arc4random_buf`                                 |
@@ -150,7 +150,7 @@ parallel with each other and with Hanga Roa's compiler-side work.
 2. **`os/`** — env / process / args on top of `Env` + `Process`.
    - Surface: `os.env.get/set/unset/all`,
      `os.args.argv/program_name`,
-     `os.process.start/wait/wait_or_kill/pipe_stdout/pipe_stdin/signal/kill`,
+     `os.process.start/wait/wait_or_kill/start_piped/pipe_to/pipe_from/signal/kill`,
      top-level `os.exit(code)`.
    - Why now: ahu's config loader pulls from env vars (OTP
      analogue of `:application.get_env/2`); manutara reads
