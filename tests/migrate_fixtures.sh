@@ -210,6 +210,28 @@ else
   fail=$((fail + 1))
 fi
 
+# Relative path with no manifest anywhere above the cwd: the driver's
+# manifest walk must terminate. dirname has fixed points on relative
+# paths ("." -> ".") that once spun find_manifest_dir forever — only the
+# real driver exercises that walk, and only bounded runs turn a
+# regression into a failure instead of a wedged CI job.
+nmp="$tmp/no-manifest"
+mkdir -p "$nmp/sub"
+printf 'fn main() : Unit = {}\n' > "$nmp/w.kai"
+printf 'fn main() : Unit = {}\n' > "$nmp/sub/inner.kai"
+BOUND="$ROOT/tools/lib/timeout.sh"
+if ( cd "$nmp" &&
+     "$BOUND" 30 "$KAI" migrate w.kai --write        > /dev/null 2>&1 &&
+     "$BOUND" 30 "$KAI" migrate sub/inner.kai --write > /dev/null 2>&1 &&
+     cd sub &&
+     "$BOUND" 30 "$KAI" migrate ../w.kai --write     > /dev/null 2>&1 ); then
+  echo "  OK   relative-no-manifest (manifest walk terminates)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL relative-no-manifest — driver hung or errored on a relative path with no kai.toml"
+  fail=$((fail + 1))
+fi
+
 if [ "$fail" -gt 0 ]; then
   echo "migrate_fixtures: $pass passed, $fail failed"
   exit 1
