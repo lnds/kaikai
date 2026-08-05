@@ -421,6 +421,7 @@ Single top-level module. Per-function effects: `print` / `println` /
 declare `/ Stdin`.
 
 - `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` core builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
+- TTY detection — `Stdout.is_tty()` / `Stderr.is_tty()` / `Stdin.is_tty()` effect ops bridging to `isatty(3)` on fd 1/2/0 *(shipped via #1590; the ANSI-colour gate, pairs with the `NO_COLOR` override via `Env.get`)*
 
 ### fs (`/ File`)
 

@@ -10866,6 +10866,21 @@ static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) 
     return kai_cont_resume(k, kai_unit());
 }
 
+static KaiValue *kai_default_stdout_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDOUT_FILENO) != 0));
+}
+
+static KaiValue *kai_default_stderr_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDERR_FILENO) != 0));
+}
+
+static KaiValue *kai_default_stdin_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDIN_FILENO) != 0));
+}
+
 /* m7a #7 + Issue #620 — Phase R3 reactor: default Stdin handler.
  * Doc B §`Stdin` declares `read_line() : Option[String] / Fail`;
  * m7a simplifies to `: Option[String]`. EOF maps to None; any byte

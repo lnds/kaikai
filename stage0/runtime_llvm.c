@@ -1804,6 +1804,15 @@ KaiValue *kaix_default_file_close_file(void *self, KaiValue *h, KaiCont *k) {
 KaiValue *kaix_default_stdin_read_line(void *self, KaiCont *k) {
     return kai_default_stdin_read_line(self, k);
 }
+KaiValue *kaix_default_stdout_is_tty(void *self, KaiCont *k) {
+    return kai_default_stdout_is_tty(self, k);
+}
+KaiValue *kaix_default_stderr_is_tty(void *self, KaiCont *k) {
+    return kai_default_stderr_is_tty(self, k);
+}
+KaiValue *kaix_default_stdin_is_tty(void *self, KaiCont *k) {
+    return kai_default_stdin_is_tty(self, k);
+}
 KaiValue *kaix_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k) {
     KaiValue *_op_r = kai_default_stdin_read_bytes(self, n, k);
     kai_decref(n);
