@@ -235,6 +235,69 @@ pub type ExprKind
   # takes exactly one string-literal arg and is only valid inside a
   # clause body that lives in a `default { }` block).
   | EIntrinsic(String, [Expr])
+  # A surface form the parser preserves verbatim so `kai fmt` prints
+  # what the author wrote. `surface_lower_decls` dissolves every
+  # ESurface before resolution; passes downstream of it treat the node
+  # as unreachable. Generic walkers recurse via `surface_children` /
+  # `surface_rebuild` / `surface_map` without naming the variants.
+  | ESurface(SurfaceForm)
+
+# The surface forms behind `ESurface`. Each variant is one parse-time
+# sugar whose lowering would otherwise erase the author's spelling.
+# Adding a variant forces (through match exhaustiveness) a printer arm
+# in fmt_expr and a lowering arm in surface_lower — a new surface form
+# cannot be lost by omission.
+pub type SurfaceForm
+  # `requires` / `ensures` clauses wrapping a fn body, in source order.
+  = SfContract([Expr], [Expr], Expr)
+  # `ensure(value) where pred` primary.
+  | SfEnsure(Expr, Expr)
+
+#[doc("Child expressions of a surface form, left to right; order is shared with `surface_rebuild`.")]
+pub fn surface_children(sf: SurfaceForm) : [Expr] = match sf {
+  SfContract(reqs, enss, body) -> list_append(reqs, list_append(enss, [body]))
+  SfEnsure(value, pred)        -> [value, pred]
+}
+
+#[doc("Rebuild a surface form from a transformed child list in `surface_children` order.")]
+pub fn surface_rebuild(sf: SurfaceForm, xs: [Expr]) : SurfaceForm = match sf {
+  SfContract(reqs, enss, _) -> {
+    let nr = list_length(reqs)
+    let ne = list_length(enss)
+    SfContract(sf_take(xs, nr), sf_take(sf_drop(xs, nr), ne),
+               sf_last(sf_drop(xs, nr + ne)))
+  }
+  SfEnsure(_, _) -> match xs {
+    [v, p, ..._] -> SfEnsure(v, p)
+    _            -> panic("surface_rebuild: child list does not match the form")
+  }
+}
+
+# Pure `f` only (kaic1 cannot compile a row-generic fn); an effectful
+# walker recurses via `surface_children` / `surface_rebuild` instead.
+#[doc("Apply a pure `f` to every child expression of a surface form.")]
+pub fn surface_map(sf: SurfaceForm, f: (Expr) -> Expr) : SurfaceForm = match sf {
+  SfContract(reqs, enss, body) -> SfContract(map(reqs, f), map(enss, f), f(body))
+  SfEnsure(value, pred)        -> SfEnsure(f(value), f(pred))
+}
+
+fn sf_take(xs: [Expr], n: Int) : [Expr] =
+  if n <= 0 { [] } else { match xs {
+    [] -> []
+    [x, ...rest] -> [x, ...sf_take(rest, n - 1)]
+  } }
+
+fn sf_drop(xs: [Expr], n: Int) : [Expr] =
+  if n <= 0 { xs } else { match xs {
+    [] -> []
+    [_, ...rest] -> sf_drop(rest, n - 1)
+  } }
+
+fn sf_last(xs: [Expr]) : Expr = match xs {
+  [x] -> x
+  [_, ...rest] -> sf_last(rest)
+  [] -> panic("surface_rebuild: child list does not match the form")
+}
 
 pub type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -252,6 +315,11 @@ pub type Stmt
   # field path). Lowered to a `Mutable.array_set`-style call by the
   # pre-resolve `desugar_index_assign` pass; never reaches the checker.
   | SIndexAssign(Expr, Expr, Expr, Int, Int)
+  # Scalar / field write `lhs := v` (lhs an `EVar` or a `.`-chain of
+  # fields rooted at an identifier). Surface form of the `.set` call;
+  # `surface_lower_decls` rewrites it before resolution, so no later
+  # pass sees one.
+  | SAssign(Expr, Expr, Int, Int)
   # m7b #5: local mutable cell `var name [: T] = init`. The parser
   # produces this node; the pre-resolve `desugar_var_decls` pass
   # rewrites every block containing an SVar into the canonical
@@ -276,7 +344,13 @@ pub type PatKind
   # fresh <= hi` guard before the typer, so nothing past desugar handles it.
   | PRange(Expr, Expr)
   | PBind(String)
-  | PList([Pattern], Option[String])         # fixed sub-patterns, optional rest binder name
+  # Fixed sub-patterns plus optional rest binder. The rest slot stores
+  # the SOURCE spelling: `Some("")` for bare `...`, `Some("_")` for
+  # `..._`, `Some(name)` for `...name`, `None` for no rest.
+  # `surface_lower_decls` replaces the two anonymous spellings with a
+  # unique `__list_rest_<line>_<col>__` sentinel, so every pass after
+  # it sees a real binder name.
+  | PList([Pattern], Option[String])
   | PVariant(String, [Pattern])
   | PVariantRecord(String, [PField])
   | PRecord([PField])
@@ -480,7 +554,13 @@ pub type Decl
   # `[A1, ...]` parameters monomorphised at this impl-site). Empty
   # list means the legacy un-parametrised form `impl P for X`, which
   # the resolver treats as `impl P[X] for X` (`Ai := Self`).
-  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int)
+  # The trailing `[String]` holds the impl-site tparams of
+  # `impl[T: Show + Eq, u: Measure] P for X` in `tp_make_with_bounds`
+  # encoding, exactly as the author wrote them. `surface_lower_decls`
+  # prepends them (bounds stripped) to each method's own tparams; the
+  # slot itself survives so `kai fmt` can print the impl head — no
+  # other pass reads it after lowering.
+  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int, [String])
   # m12.8: `#derive(P, ...) type T = ...` — opt-in structural impl
   # generator. The lower-protocols pass walks the type body and
   # synthesises one DImpl per derived protocol. The parser keeps the

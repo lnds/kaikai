@@ -534,6 +534,7 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EModCall(_, _) -> k
     # intrinsic args ARE sub-Exprs, so the visitor recurs.
     EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    ESurface(sf) -> ESurface(surface_map(sf, f))
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -599,6 +600,7 @@ fn inf_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
     SAssert(c, m)               -> SAssert(f(c), inf_map_opt_expr(m, f))
     SExprStmt(x)                -> SExprStmt(f(x))
     SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SAssign(b, v, l, c) -> SAssign(f(b), f(v), l, c)
     SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
     # SUse has no sub-expression — pass through unchanged.
     SUse(n, l, c)               -> SUse(n, l, c)
@@ -1157,6 +1159,8 @@ fn inf_scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool, acc: [Use]) : [Use] / Con
           let a2 = inf_scan_uses_expr_acc(idx, in_lam, a)
           inf_scan_uses_expr_acc(val, in_lam, a2)
         }
+        SAssign(lhs, val, _, _) ->
+          inf_scan_uses_expr_acc(val, in_lam, inf_scan_uses_expr_acc(lhs, in_lam, acc))
         SVar(_, _, init, _, _) -> inf_scan_uses_expr_acc(init, in_lam, acc)
         # SUse has no expression — no uses to scan.
         SUse(_, _, _) -> acc
@@ -1762,6 +1766,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   EVariantsOf(_, _)   -> acc
   EModCall(_, _)      -> acc
   EIntrinsic(_, args_) -> collect_call_labels_list(args_, acc)
+  ESurface(sf) -> collect_call_labels_list(surface_children(sf), acc)
   ECall(callee, args_) -> {
     let acc1 = match callee.ty {
       Some(t) -> match t {
@@ -1874,6 +1879,8 @@ fn collect_call_labels_stmts(ss: [Stmt], acc: [Label]) : [Label] = match ss {
       let a1 = collect_call_labels(c, collect_call_labels(b, collect_call_labels(a, acc)))
       collect_call_labels_stmts(rest, a1)
     }
+    SAssign(a, c, _, _) ->
+      collect_call_labels_stmts(rest, collect_call_labels(c, collect_call_labels(a, acc)))
     SUse(_, _, _)        -> collect_call_labels_stmts(rest, acc)
   }
 }
@@ -2147,6 +2154,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
   EVariantsOf(_, _) -> acc
   EModCall(_, _)    -> acc
   EIntrinsic(_, args_) -> walk_field_priv_list(file, home, all_decls, args_, acc)
+  ESurface(sf) -> walk_field_priv_list(file, home, all_decls, surface_children(sf), acc)
   ECall(callee, args_) -> {
     let a1 = walk_field_priv_expr(file, home, all_decls, callee, acc)
     walk_field_priv_list(file, home, all_decls, args_, a1)
@@ -2313,6 +2321,11 @@ fn walk_field_priv_stmts(file: String, home: Option[String],
       let a3 = walk_field_priv_expr(file, home, all_decls, c, a2)
       walk_field_priv_stmts(file, home, all_decls, rest, a3)
     }
+    SAssign(a, c, _, _) -> {
+      let a1 = walk_field_priv_expr(file, home, all_decls, a, acc)
+      let a3 = walk_field_priv_expr(file, home, all_decls, c, a1)
+      walk_field_priv_stmts(file, home, all_decls, rest, a3)
+    }
     SUse(_, _, _) -> walk_field_priv_stmts(file, home, all_decls, rest, acc)
   }
 }
@@ -2446,6 +2459,8 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     EModCall(_, _)    -> acc
     EIntrinsic(_, args_) ->
       walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc)
+    ESurface(sf) ->
+      walk_coverage_list(file, decls, eff_map, fname, surface_children(sf), stack, acc)
     ECall(callee, args_) -> {
       # Detect `Eff.op(...)` shape produced by synth_op_call_with_scheme.
       # The callee is `EVar("Eff.op")` (possibly with an `@alias` suffix on
@@ -2639,6 +2654,11 @@ fn walk_coverage_stmts(file: String, decls: [Decl], eff_map: [EffDefaultOps],
         let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
         let a2 = walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
         let a3 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, a2)
+        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a3)
+      }
+      SAssign(a, c, _, _) -> {
+        let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
+        let a3 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, a1)
         walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a3)
       }
       SUse(_, _, _) -> walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, acc)
@@ -9692,6 +9712,8 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # Any other `$<name>(args)` reaching `synth` is an error. The
     # clause-body path that legitimately admits `$extern_handler`
     # short-circuits before reaching this arm.
+    ESurface(_) ->
+      panic("infer: ESurface must be lowered by surface_lower before the typer")
     EIntrinsic(nm, args_) ->
       if is_loop_intrinsic(nm) {
         match args_ {
@@ -14113,6 +14135,8 @@ fn collect_local_in_stmt(s: Stmt, acc: [String], dmut: [String]) : [String] {
     SExprStmt(x)                -> collect_local_arrays(x, acc, dmut)
     SIndexAssign(b, i, v, _, _) ->
       collect_local_arrays(v, collect_local_arrays(i, collect_local_arrays(b, acc, dmut), dmut), dmut)
+    SAssign(b, v, _, _) ->
+      collect_local_arrays(v, collect_local_arrays(b, acc, dmut), dmut)
     SVar(_, _, rhs, _, _)       -> collect_local_arrays(rhs, acc, dmut)
     SUse(_, _, _)               -> acc
   }
@@ -14439,6 +14463,8 @@ fn collect_escaped_in_stmt(s: Stmt, acc: [String]) : [String] {
     SExprStmt(x)                -> collect_escaped_names(x, acc)
     SIndexAssign(b, i, v, _, _) ->
       collect_escaped_names(v, collect_escaped_names(i, collect_escaped_names(b, acc)))
+    SAssign(b, v, _, _) ->
+      collect_escaped_names(v, collect_escaped_names(b, acc))
     SVar(_, _, rhs, _, _)       -> collect_escaped_names(rhs, acc)
     SUse(_, _, _)               -> acc
   }
@@ -14797,6 +14823,9 @@ fn all_demands_local_in_stmt(s: Stmt, locals: [String], escaped: [String],
     SIndexAssign(b, i, v, _, _) ->
       if not all_demands_local(b, locals, escaped, params, dmut) { false }
       else if not all_demands_local(i, locals, escaped, params, dmut) { false }
+      else { all_demands_local(v, locals, escaped, params, dmut) }
+    SAssign(b, v, _, _) ->
+      if not all_demands_local(b, locals, escaped, params, dmut) { false }
       else { all_demands_local(v, locals, escaped, params, dmut) }
     SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, params, dmut)
     SUse(_, _, _)               -> true
@@ -15296,6 +15325,8 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
     # rejected with a typed error that points at `map_put`; the
     # node returned is harmless filler so downstream passes never
     # see a typed `SIndexAssign` survive.
+    SAssign(_, _, _, _) ->
+      panic("infer: SAssign must be lowered by surface_lower before the typer")
     SIndexAssign(b, i, v, line, col) -> {
       let probe = synth(st, b)
       let base_ty = apply_ty(probe.st.sub, probe.ty)
@@ -19435,7 +19466,7 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
     validate_unit_refs_params(ps, scope, file, 0) +
     validate_unit_refs_expr(body, scope, file)
   DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
-  DImpl(_, _, _, sub_decls, _, _) ->
+  DImpl(_, _, _, sub_decls, _, _, _) ->
     validate_unit_refs_decls_loop(sub_decls, scope, file, 0)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
@@ -19736,6 +19767,7 @@ fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
   EVariantsOf(_, _) -> 0
   EModCall(_, _) -> 0
   EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, scope, file, 0)
+  ESurface(sf) -> validate_unit_refs_expr_list(surface_children(sf), scope, file, 0)
   ECall(callee, args_) -> validate_unit_refs_expr(callee, scope, file) +
                            validate_unit_refs_expr_list(args_, scope, file, 0)
   EField(base, _) -> validate_unit_refs_expr(base, scope, file)
@@ -19842,6 +19874,8 @@ fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
       SExprStmt(x)                -> acc + validate_unit_refs_expr(x, scope, file)
       SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, scope, file) +
                                             validate_unit_refs_expr(i, scope, file) +
+                                            validate_unit_refs_expr(v, scope, file)
+      SAssign(b, v, _, _)         -> acc + validate_unit_refs_expr(b, scope, file) +
                                             validate_unit_refs_expr(v, scope, file)
       SVar(_, ann, rhs, _, _)     -> acc + validate_unit_refs_opt_te(ann, scope, file) +
                                            validate_unit_refs_expr(rhs, scope, file)
@@ -20014,7 +20048,7 @@ fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = matc
     validate_shape_refs_protoops(ops, shapes, file, 0)
   }
   DEffect(_, _, _, ops, _, _, _, _) -> validate_shape_refs_eops(ops, [], file, 0)
-  DImpl(_, _, _, sub_decls, _, _) -> validate_shape_refs_loop(sub_decls, file, 0)
+  DImpl(_, _, _, sub_decls, _, _, _) -> validate_shape_refs_loop(sub_decls, file, 0)
   DDerive(_, inner, _, _) -> validate_shape_refs_decl(inner, file)
   DUnstable(inner, _, _) -> validate_shape_refs_decl(inner, file)
   DProtoLaws(_, inner, _, _) -> validate_shape_refs_decl(inner, file)
@@ -20269,7 +20303,7 @@ fn vmps_decl(d: Decl, home: String, priv_table: [PubLeakPriv],
     if is_pub {
       vmps_pops(ops, name, home, priv_table, file, line, col, 0)
     } else { 0 }
-  DImpl(_, _, _, _, _, _) ->
+  DImpl(_, _, _, _, _, _, _) ->
     # Intra-module: an `impl P for T` does not expose T as a name
     # to other modules — the protocol dispatcher looks it up by
     # value type at the call site, not by syntactic reference. So
@@ -21123,7 +21157,7 @@ fn decide_partition_home(d: Decl, target_mod: String,
   DProtoLaws(_, inner, _, _)           -> decide_partition_home(inner, target_mod, anchor)
   DImplAxiom(_, inner, _, _)           -> decide_partition_home(inner, target_mod, anchor)
   DConstructor(inner, _, _)            -> decide_partition_home(inner, target_mod, anchor)
-  DImpl(_, _, _, sub, _, _)            -> match sub {
+  DImpl(_, _, _, sub, _, _, _)            -> match sub {
     [] -> anchor
     [m, ..._] -> decide_partition_home(m, target_mod, anchor)
   }
@@ -21144,7 +21178,7 @@ fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
   DProtoLaws(_, inner, _, _)      -> decl_explicit_module_origin(inner)
   DImplAxiom(_, inner, _, _)      -> decl_explicit_module_origin(inner)
   DConstructor(inner, _, _)       -> decl_explicit_module_origin(inner)
-  DImpl(_, _, _, sub, _, _)       -> match sub {
+  DImpl(_, _, _, sub, _, _, _)       -> match sub {
     [] -> None
     [m, ..._] -> decl_explicit_module_origin(m)
   }
@@ -21169,7 +21203,7 @@ fn partition_home_for(d: Decl, target_mod: String) : String = match d {
   DProtoLaws(_, inner, _, _)      -> partition_home_for(inner, target_mod)
   DImplAxiom(_, inner, _, _)      -> partition_home_for(inner, target_mod)
   DConstructor(inner, _, _)       -> partition_home_for(inner, target_mod)
-  DImpl(_, _, _, sub, _, _)       -> match sub {
+  DImpl(_, _, _, sub, _, _, _)       -> match sub {
     [] -> target_mod
     [m, ..._] -> partition_home_for(m, target_mod)
   }
@@ -21318,6 +21352,7 @@ fn tag_of_kind(k: ExprKind) : String {
     # qualified module call dump label.
     EModCall(m, fname) -> concat_all(["modcall ", m, ".", fname])
     EIntrinsic(name, _) -> concat_all(["intrinsic $", name])
+    ESurface(_) -> "surface"
   }
 }
 
@@ -21449,6 +21484,11 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit / Console {
       inf_emit_line(depth, "index-assign")
       dump_typed_expr(b, depth + 1)
       dump_typed_expr(i, depth + 1)
+      dump_typed_expr(v, depth + 1)
+    }
+    SAssign(b, v, _, _) -> {
+      inf_emit_line(depth, "assign")
+      dump_typed_expr(b, depth + 1)
       dump_typed_expr(v, depth + 1)
     }
     SVar(n, _, rhs, _, _) -> {
@@ -22154,6 +22194,11 @@ fn effects_collect_stmts(ss: [Stmt], acc: EffUseAcc) : EffUseAcc {
         let a1 = effects_collect_expr(b, acc)
         let a2 = effects_collect_expr(i, a1)
         let a3 = effects_collect_expr(v, a2)
+        effects_collect_stmts(rest, a3)
+      }
+      SAssign(b, v, _, _) -> {
+        let a1 = effects_collect_expr(b, acc)
+        let a3 = effects_collect_expr(v, a1)
         effects_collect_stmts(rest, a3)
       }
       SVar(_, _, rhs, _, _) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))

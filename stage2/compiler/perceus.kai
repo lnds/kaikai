@@ -1490,6 +1490,7 @@ fn pcs_all_arm_binders_kind(k: ExprKind, acc: [String]) : [String] = match k {
   ELambda(_, body)    -> pcs_all_arm_binders(body, acc)
   ECall(f, xs)        -> pcs_all_arm_binders_list(xs, pcs_all_arm_binders(f, acc))
   EIntrinsic(_, xs)   -> pcs_all_arm_binders_list(xs, acc)
+  ESurface(sf)   -> pcs_all_arm_binders_list(surface_children(sf), acc)
   EBinop(_, a, b)     -> pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc))
   EUnop(_, x)         -> pcs_all_arm_binders(x, acc)
   EField(x, _)        -> pcs_all_arm_binders(x, acc)
@@ -1531,6 +1532,7 @@ fn pcs_all_arm_binders_stmts(stmts: [Stmt], acc: [String]) : [String] = match st
       SExprStmt(e)        -> pcs_all_arm_binders(e, acc)
       SAssert(e, om)      -> match om { None -> pcs_all_arm_binders(e, acc) Some(m) -> pcs_all_arm_binders(m, pcs_all_arm_binders(e, acc)) }
       SIndexAssign(a, b, c, _, _) -> pcs_all_arm_binders(c, pcs_all_arm_binders(b, pcs_all_arm_binders(a, acc)))
+      SAssign(a, c, _, _) -> pcs_all_arm_binders(c, pcs_all_arm_binders(a, acc))
       _                   -> acc
     }
     pcs_all_arm_binders_stmts(rest, a1)
@@ -1713,6 +1715,7 @@ fn pcs_inspected_kind(nm: String, k: ExprKind) : Bool = match k {
   EVar(uname)         -> uname != nm   # a bare read NOT as scrutinee = owned use
   ECall(f, xs)        -> pcs_inspected(nm, f) and pcs_inspected_list(nm, xs)
   EIntrinsic(_, xs)   -> pcs_inspected_list(nm, xs)
+  ESurface(sf)   -> pcs_inspected_list(nm, surface_children(sf))
   EField(x, _)        -> pcs_name_absent(nm, x)   # field read of nm = owned
   EIndex(a, b)        -> pcs_name_absent(nm, a) and pcs_name_only_inspected(nm, b)
   EBinop(_, a, b)     -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
@@ -2439,6 +2442,7 @@ fn pcs_collect_uses_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # descent a name read only inside the loop would count as unused and
     # get freed before the loop runs.
     EIntrinsic(_, xs) -> pcs_collect_uses_in_exprs(xs, scope, in_lam, acc)
+    ESurface(sf) -> pcs_collect_uses_in_exprs(surface_children(sf), scope, in_lam, acc)
     ERecordLit(_, fis) -> pcs_collect_uses_in_field_inits(fis, scope, in_lam, acc)
     EList(elems) -> pcs_collect_uses_in_list_elems(elems, scope, in_lam, acc)
     ERange(lo, hi, opt_by) -> {
@@ -2574,6 +2578,11 @@ fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
           let a1 = pcs_collect_uses_expr(b, scope, in_lam, acc)
           let a2 = pcs_collect_uses_expr(i, scope, in_lam, a1)
           let a3 = pcs_collect_uses_expr(v, scope, in_lam, a2)
+          PcsBlockState { scope: scope, acc: a3 }
+        }
+        SAssign(b, v, _, _) -> {
+          let a1 = pcs_collect_uses_expr(b, scope, in_lam, acc)
+          let a3 = pcs_collect_uses_expr(v, scope, in_lam, a1)
           PcsBlockState { scope: scope, acc: a3 }
         }
         # m7e §25: SUse has no expression and binds nothing.
@@ -2766,6 +2775,8 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
       EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    ESurface(sf) ->
+      ESurface(surface_rebuild(sf, pcs_rewrite_expr_list(surface_children(sf), scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)))
     ECall(callee, args_) ->
       ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
             pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
@@ -2901,6 +2912,11 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
       let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
+    }
+    SAssign(b, v, ln, cl) -> {
+      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      PcsRwStmt { stmt: SAssign(b1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
     SUse(n, ln, cl) -> PcsRwStmt { stmt: SUse(n, ln, cl), scope: scope }
@@ -3082,6 +3098,7 @@ fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: [BorrowEntry]) : Int = ma
     pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
   }
   EIntrinsic(_, xs)   -> pcs_max_paths_b_seq(nm, xs, bmap)
+  ESurface(sf)   -> pcs_max_paths_b_seq(nm, surface_children(sf), bmap)
   EField(x, _)        -> pcs_max_paths_b_expr(nm, x, bmap)
   EIndex(a, b)        -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
   EBinop(_, a, b)     -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
@@ -3191,6 +3208,8 @@ fn pcs_max_paths_b_stmt(nm: String, s: Stmt, bmap: [BorrowEntry]) : Int = match 
   SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_b_expr(nm, a, bmap) +
                                      pcs_max_paths_b_expr(nm, b, bmap) +
                                      pcs_max_paths_b_expr(nm, c, bmap)
+  SAssign(a, c, _, _)            -> pcs_max_paths_b_expr(nm, a, bmap) +
+                                     pcs_max_paths_b_expr(nm, c, bmap)
   SUse(_, _, _)                  -> 0
 }
 
@@ -3217,6 +3236,7 @@ fn pcs_max_paths_in_kind(nm: String, k: ExprKind) : Int = match k {
                               # interpolation reads only.
   ECall(f, xs)        -> pcs_max_paths_in_expr(nm, f) + pcs_max_paths_seq(nm, xs)
   EIntrinsic(_, xs)   -> pcs_max_paths_seq(nm, xs)
+  ESurface(sf)   -> pcs_max_paths_seq(nm, surface_children(sf))
   EField(x, _)        -> pcs_max_paths_in_expr(nm, x)
   EIndex(a, b)        -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
   EBinop(_, a, b)     -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
@@ -3318,6 +3338,8 @@ fn pcs_max_paths_in_stmt(nm: String, s: Stmt) : Int = match s {
   SExprStmt(e)                   -> pcs_max_paths_in_expr(nm, e)
   SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_in_expr(nm, a) +
                                      pcs_max_paths_in_expr(nm, b) +
+                                     pcs_max_paths_in_expr(nm, c)
+  SAssign(a, c, _, _)            -> pcs_max_paths_in_expr(nm, a) +
                                      pcs_max_paths_in_expr(nm, c)
   SUse(_, _, _)                  -> 0
 }
@@ -4379,6 +4401,8 @@ fn pcs_consumers_linear_stmt(nm: String, s: Stmt) : Bool = match s {
   SIndexAssign(a, b, c, _, _)    -> pcs_all_consumers_linear(nm, a) and
                                      pcs_all_consumers_linear(nm, b) and
                                      pcs_all_consumers_linear(nm, c)
+  SAssign(a, c, _, _)            -> pcs_all_consumers_linear(nm, a) and
+                                     pcs_all_consumers_linear(nm, c)
   SUse(_, _, _)                  -> true
 }
 
@@ -4403,6 +4427,7 @@ fn pcs_consumed_kind(nm: String, k: ExprKind) : Bool = match k {
   ECall(f, xs)        -> pcs_consumed_on_every_path(nm, f) or
                           pcs_consumed_any(nm, xs)
   EIntrinsic(_, xs)   -> pcs_consumed_any(nm, xs)
+  ESurface(sf)   -> pcs_consumed_any(nm, surface_children(sf))
   EField(x, _)        -> pcs_consumed_on_every_path(nm, x)
   EIndex(a, b)        -> pcs_consumed_on_every_path(nm, a) or
                           pcs_consumed_on_every_path(nm, b)
@@ -4502,6 +4527,8 @@ fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
   SExprStmt(e)                   -> pcs_consumed_on_every_path(nm, e)
   SIndexAssign(a, b, c, _, _)    -> pcs_consumed_on_every_path(nm, a) or
                                      pcs_consumed_on_every_path(nm, b) or
+                                     pcs_consumed_on_every_path(nm, c)
+  SAssign(a, c, _, _)            -> pcs_consumed_on_every_path(nm, a) or
                                      pcs_consumed_on_every_path(nm, c)
   SUse(_, _, _)                  -> false
 }
@@ -4635,6 +4662,7 @@ fn pcs_dup_marks_subs(k: ExprKind, acc: [DupMark]) : [DupMark] {
     EVariantsOf(_, _) -> acc
     EModCall(_, _) -> acc
     EIntrinsic(_, args_) -> pcs_dup_marks_exprs(args_, acc)
+    ESurface(sf) -> pcs_dup_marks_exprs(surface_children(sf), acc)
     ECall(callee, args_) -> pcs_dup_marks_exprs(args_, pcs_dup_marks_expr(callee, acc))
     EField(base, _) -> pcs_dup_marks_expr(base, acc)
     EIndex(a, b) -> pcs_dup_marks_expr(b, pcs_dup_marks_expr(a, acc))
@@ -4752,6 +4780,7 @@ fn pcs_dup_marks_stmts(ss: [Stmt], acc: [DupMark]) : [DupMark] {
           let a2 = pcs_dup_marks_expr(i, a1)
           pcs_dup_marks_expr(v, a2)
         }
+        SAssign(b, v, _, _) -> pcs_dup_marks_expr(v, pcs_dup_marks_expr(b, acc))
         SUse(_, _, _) -> acc
       }
       pcs_dup_marks_stmts(rest, acc1)
@@ -5331,6 +5360,8 @@ fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
       EIntrinsic(name, pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
+    ESurface(sf) ->
+      ESurface(surface_rebuild(sf, pcs_arm_drop_expr_list(surface_children(sf), fn_name, outer_scope, uses)))
     ECall(callee, args_) ->
       ECall(pcs_arm_drop_pass(callee, fn_name, outer_scope, uses),
             pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
@@ -5416,6 +5447,9 @@ fn pcs_arm_drop_stmts(stmts: [Stmt], fn_name: String, outer_scope: [String],
           SIndexAssign(pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
                        pcs_arm_drop_pass(i, fn_name, outer_scope, uses),
                        pcs_arm_drop_pass(v, fn_name, outer_scope, uses), ln, cl)
+        SAssign(b, v, ln, cl) ->
+          SAssign(pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
+                   pcs_arm_drop_pass(v, fn_name, outer_scope, uses), ln, cl)
         SUse(n, ln, cl) -> SUse(n, ln, cl)
       }
       [s1, ...pcs_arm_drop_stmts(rest, fn_name, outer_scope, uses)]

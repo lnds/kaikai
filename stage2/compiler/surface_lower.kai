@@ -1,0 +1,166 @@
+#[doc("""
+Dissolve the parser's surface-fidelity nodes into their semantic
+lowerings, after `kai fmt` / `kai migrate` have printed and before
+resolution.
+
+The parser preserves what the author wrote — `ESurface` wrappers,
+`SAssign` writes, anonymous rest-binder spellings, impl-site tparams —
+so the writer can reproduce it verbatim. Everything downstream of this
+pass sees only the lowered shapes it always saw:
+
+  - `SfContract(reqs, enss, body)`  -> contract asserts in the body
+    (`wrap_with_contracts`, elision included).
+  - `SfEnsure(value, pred)`         -> `{ let self = value;
+    if pred { Some(self) } else { None } }`.
+  - `SAssign(lhs, v)`               -> `lhs.set(v)` statement.
+  - `PList` rest spelling `""`/`"_"` -> unique `__list_rest_L_C__`
+    sentinel binder.
+  - `DImpl` tparams                 -> prepended (bounds stripped) to
+    each method's own tparams; the raw slot stays for the writer.
+
+The driver runs `surface_lower_decls` once, on the flat post-import
+decl list; no `ESurface` / `SAssign` survives it.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_map
+import compiler.parse
+import compiler.refinements
+
+#[doc("Lower every surface-fidelity node in the decl list; the result is the AST the rest of the pipeline consumes.")]
+pub fn surface_lower_decls(ds: [Decl]) : [Decl] = map(ds, (d) => sfl_decl(d))
+
+fn sfl_decl(d: Decl) : Decl = match d {
+  DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, name, tps, ps, ret, row, sfl_fn_body(body, ps, name), l, c, mo)
+  DImpl(pn, pargs, tgt, ms, l, c, impl_tps) ->
+    DImpl(pn, pargs, tgt, sfl_impl_methods(impl_tps, ms), l, c, impl_tps)
+  DTest(label, body, l, c)      -> DTest(label, sfl_expr(body), l, c)
+  DBench(label, body, l, c)     -> DBench(label, sfl_expr(body), l, c)
+  DCheck(label, ps, body, l, c) -> DCheck(label, ps, sfl_expr(body), l, c)
+  DConst(is_pub, name, ty, body, mo, l, c) ->
+    DConst(is_pub, name, ty, sfl_expr(body), mo, l, c)
+  DEffect(is_pub, name, tps, ops, default_opt, l, c, mo) ->
+    DEffect(is_pub, name, tps, ops, sfl_default(default_opt), l, c, mo)
+  DDerive(names, inner, l, c)   -> DDerive(names, sfl_decl(inner), l, c)
+  DUnstable(inner, l, c)        -> DUnstable(sfl_decl(inner), l, c)
+  DConstructor(inner, l, c)     -> DConstructor(sfl_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c)  -> DProtoLaws(thy, sfl_decl(inner), l, c)
+  DImplAxiom(thy, inner, l, c)  -> DImplAxiom(thy, sfl_decl(inner), l, c)
+  DDoc(raw, syn, inner, l, c)   -> DDoc(raw, syn, sfl_decl(inner), l, c)
+  _ -> d
+}
+
+# Contract clauses are legal only at the top of a fn body, where the
+# owning decl supplies the params and name their lowering needs.
+fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kind {
+  ESurface(sf) -> match sf {
+    SfContract(reqs, enss, inner) ->
+      wrap_with_contracts(sfl_expr(inner), map(reqs, (e) => sfl_expr(e)),
+                          map(enss, (e) => sfl_expr(e)), ps, fn_name,
+                          body.line, body.col)
+    SfEnsure(_, _) -> sfl_expr(body)
+  }
+  _ -> sfl_expr(body)
+}
+
+# Prepend the impl-level tparams to each method's own tparams. Bounds
+# are stripped: the pipeline uses these strings as plain ident keys.
+fn sfl_impl_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
+  let stripped = map(impl_tps, tp_strip_bounds)
+  map(ms, (m) => sfl_impl_method(stripped, m))
+}
+
+fn sfl_impl_method(stripped: [String], m: Decl) : Decl = match sfl_decl(m) {
+  DFn(is_pub, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, n, list_append(stripped, tps), ps, ret, row, body, l, c, mo)
+  other -> other
+}
+
+fn sfl_default(o: Option[DefaultBlock]) : Option[DefaultBlock] = match o {
+  None -> None
+  Some(DBlk(cs, ret, l, c)) ->
+    Some(DBlk(map(cs, (cl) => prc_map_clause_exprs(cl, (x) => sfl_expr(x))),
+              prc_map_opt_return_exprs(ret, (x) => sfl_expr(x)), l, c))
+}
+
+fn sfl_expr(e: Expr) : Expr = match e.kind {
+  ESurface(sf) -> match sf {
+    SfEnsure(value, pred) -> sfl_ensure(sfl_expr(value), sfl_expr(pred), e.line, e.col)
+    SfContract(_, _, _) -> panic("surface_lower: contract clauses outside a fn body")
+  }
+  # EMatch and EBlock carry patterns / statement shapes the generic
+  # child-mapper does not rewrite, so they recurse here.
+  EMatch(scrut, arms) ->
+    sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => sfl_arm(a))))
+  EBlock(stmts, tail) ->
+    sfl_rebuild(e, EBlock(map(stmts, (st) => sfl_stmt(st)), sfl_opt(tail)))
+  _ -> sfl_rebuild(e, prc_map_expr_kind(e.kind, (x) => sfl_expr(x)))
+}
+
+fn sfl_rebuild(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn sfl_opt(o: Option[Expr]) : Option[Expr] = match o {
+  None -> None
+  Some(x) -> Some(sfl_expr(x))
+}
+
+# `ensure(value) where pred` expansion: `self` is bound to the value so
+# the predicate (which conventionally reads `self`) sees a regular
+# local.
+fn sfl_ensure(value: Expr, pred: Expr, line: Int, col: Int) : Expr {
+  let self_let = SLet(mk_pat(PBind("self"), line, col), None, value)
+  let some_call = mk_expr(ECall(mk_expr(EVar("Some"), line, col),
+                                [mk_expr(EVar("self"), line, col)]), line, col)
+  let if_expr = mk_expr(EIf(pred, some_call,
+                            Some(mk_expr(EVar("None"), line, col))), line, col)
+  mk_expr(EBlock([self_let], Some(if_expr)), line, col)
+}
+
+fn sfl_stmt(st: Stmt) : Stmt = match st {
+  SAssign(lhs, v, l, c) -> {
+    let setter = mk_expr(EField(sfl_expr(lhs), "set"), l, c)
+    SExprStmt(mk_expr(ECall(setter, [sfl_expr(v)]), l, c))
+  }
+  SLet(pat, ty, e)            -> SLet(sfl_pat(pat), ty, sfl_expr(e))
+  SAssert(e, msg)             -> SAssert(sfl_expr(e), sfl_opt(msg))
+  SExprStmt(e)                -> SExprStmt(sfl_expr(e))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(sfl_expr(b), sfl_expr(i), sfl_expr(v), l, c)
+  SVar(n, ty, e, l, c)        -> SVar(n, ty, sfl_expr(e), l, c)
+  SUse(_, _, _)               -> st
+}
+
+fn sfl_arm(a: Arm) : Arm = match a {
+  Arm(pat, guard, body) -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+}
+
+fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
+  PList(subs, rest) ->
+    mk_pat(PList(map(subs, (x) => sfl_pat(x)), sfl_rest(rest, p.line, p.col)),
+           p.line, p.col)
+  PVariant(n, subs) ->
+    mk_pat(PVariant(n, map(subs, (x) => sfl_pat(x))), p.line, p.col)
+  PVariantRecord(n, fs) ->
+    mk_pat(PVariantRecord(n, map(fs, (f) => sfl_pfield(f))), p.line, p.col)
+  PRecord(fs) -> mk_pat(PRecord(map(fs, (f) => sfl_pfield(f))), p.line, p.col)
+  PAs(n, sub) -> mk_pat(PAs(n, sfl_pat(sub)), p.line, p.col)
+  _ -> p
+}
+
+fn sfl_pfield(f: PField) : PField = match f {
+  PField(name, sub, is_short) -> PField(name, sfl_pat(sub), is_short)
+}
+
+# The anonymous rest spellings (`""` for `...`, `"_"` for `..._`) get a
+# binder the pipeline can key on. The owning PList's position makes it
+# unique: two rest binders can never share a `[` token.
+fn sfl_rest(rest: Option[String], line: Int, col: Int) : Option[String] = match rest {
+  Some(sp) ->
+    if sp == "" or sp == "_" {
+      Some(concat_all(["__list_rest_", int_to_string(line), "_",
+                       int_to_string(col), "__"]))
+    } else { rest }
+  None -> None
+}

@@ -181,11 +181,14 @@ pub fn fmt_hreturn(r: HReturn, s: FmtSt) : FmtSt = match r {
 #   "T"            -> "T"
 #   "T#Unit"       -> "T: Measure"
 #   "T#Unit:Cur"   -> "T: Cur"
+#   "s#Shape"      -> "s: Shape"
 #   "T#b:Show"     -> "T: Show"
 #   "T#b:Show,Eq"  -> "T: Show + Eq"
 pub fn fmt_tparam_decode(stored: String) : String {
   if tp_kind_is_unit(stored) {
     string_concat_all([tp_strip_kind(stored), ": ", tp_kind_name(stored)])
+  } else if tp_kind_is_shape(stored) {
+    string_concat_all([tp_strip_kind(stored), ": Shape"])
   } else {
     let name = tp_strip_bounds(stored)
     if tp_has_bounds(stored) {
@@ -470,7 +473,24 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     EIntrinsic(name, args_) -> fmt_call(
       Expr { kind: EVar(string_concat("$", name)), line: e.line, col: e.col, ty: None, mode: MUnknown },
       args_, s0)
+    ESurface(sf) -> fmt_surface(sf, e, s0)
   }
+}
+
+# Surface forms print exactly what the author wrote. `SfContract` is
+# body-position only and `fmt_fn` intercepts it before the expression
+# walker can reach one.
+fn fmt_surface(sf: SurfaceForm, e: Expr, s: FmtSt) : FmtSt = match sf {
+  SfEnsure(value, pred) -> {
+    let s1 = fmt_emit(s, "ensure(")
+    let s2 = fmt_expr(value, s1)
+    let s3 = fmt_emit(s2, ") where ")
+    match fmt_elision_at(e.line, e.col, pred) {
+      Some(RE(lead, rhs)) -> fmt_expr(rhs, fmt_emit(s3, lead))
+      None                -> fmt_expr(pred, s3)
+    }
+  }
+  SfContract(_, _, _) -> panic("kai fmt: contract clauses outside a fn body")
 }
 
 # Atomic-or-paren wrapper: if `e` would print as a non-atomic
@@ -590,7 +610,7 @@ pub fn fmt_binop(op: String, l: Expr, r: Expr, s: FmtSt) : FmtSt {
 
 pub fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt {
   let s1 = fmt_emit(s, "if ")
-  let s2 = fmt_expr(c, s1)
+  let s2 = fmt_stmt_head_expr(c, s1)
   let s3 = fmt_emit(s2, " ")
   let s4 = fmt_brace_body(then_e, s3)
   match else_opt {
@@ -603,6 +623,39 @@ pub fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt {
       }
     }
   }
+}
+
+# An if-condition / match-scrutinee whose leftmost constituent is a
+# record literal keeps delimiting parentheses: without them the
+# literal's `{` is read as the start of the `if` / `match` block.
+fn fmt_stmt_head_expr(e: Expr, s: FmtSt) : FmtSt {
+  if fmt_head_is_record_lit(e) {
+    let s1 = fmt_emit(s, "(")
+    let s2 = fmt_expr(e, s1)
+    fmt_emit(s2, ")")
+  } else {
+    fmt_expr(e, s)
+  }
+}
+
+# Leftmost-constituent descent: does this expression PRINT starting
+# with a `Name {` record literal? Postfix and infix forms inherit the
+# answer from their leftmost operand; everything else opens with its
+# own token and is safe.
+fn fmt_head_is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _)   -> true
+  EBlock(_, _)       -> true
+  EField(obj, _)     -> fmt_head_is_record_lit(obj)
+  EIndex(obj, _)     -> fmt_head_is_record_lit(obj)
+  ECall(callee, _)   -> fmt_head_is_record_lit(callee)
+  EBang(inner)       -> fmt_head_is_record_lit(inner)
+  EBinop(_, l, _)    -> fmt_head_is_record_lit(l)
+  EPipe(l, _)        -> fmt_head_is_record_lit(l)
+  EMapPipe(l, _)     -> fmt_head_is_record_lit(l)
+  EFlatMapPipe(l, _) -> fmt_head_is_record_lit(l)
+  EFilterPipe(l, _)  -> fmt_head_is_record_lit(l)
+  ELitUnit(inner, _) -> fmt_head_is_record_lit(inner)
+  _ -> false
 }
 
 # Wrap a non-block expression in `{ ... }`; pass-through if already a
@@ -620,7 +673,7 @@ pub fn fmt_brace_body(e: Expr, s: FmtSt) : FmtSt {
 
 pub fn fmt_match(scrut: Expr, arms: [Arm], s: FmtSt) : FmtSt {
   let s1 = fmt_emit(s, "match ")
-  let s2 = fmt_expr(scrut, s1)
+  let s2 = fmt_stmt_head_expr(scrut, s1)
   let s3 = fmt_emit(s2, " {")
   let s4 = fmt_newline(s3)
   let s5 = fmt_indent_in(s4)
@@ -771,7 +824,7 @@ pub fn fmt_range(lo: Expr, hi: Expr, step: Option[Expr], s: FmtSt) : FmtSt {
   let s4 = match step {
     None -> s3
     Some(st) -> {
-      let a = fmt_emit(s3, " by ")
+      let a = fmt_emit(s3, "..")
       fmt_expr_atom(st, a)
     }
   }
@@ -844,6 +897,7 @@ pub fn stmt_line(st: Stmt) : Int {
     SAssert(e, _) -> e.line
     SExprStmt(e) -> e.line
     SIndexAssign(_, _, _, line, _) -> line
+    SAssign(_, _, line, _) -> line
     SVar(_, _, _, line, _) -> line
     SUse(_, line, _) -> line
   }
@@ -877,6 +931,13 @@ pub fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
       let s3 = fmt_expr(idx, s2)
       let s4 = fmt_emit(s3, "] := ")
       fmt_expr(val, s4)
+    }
+    # Scalar / field write `lhs := v` — surface form of the `.set`
+    # call, printed as written.
+    SAssign(lhs, val, _, _) -> {
+      let s1 = fmt_expr(lhs, s)
+      let s2 = fmt_emit(s1, " := ")
+      fmt_expr(val, s2)
     }
     # m7b #5: local mutable cell `var name [: T] = init`.
     SVar(name, ty_opt, rhs, _, _) -> {
