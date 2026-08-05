@@ -2,16 +2,96 @@
 Surface helpers on top of the `Process` effect. Module path:
 `import process`; qualified calls land as `process.start(...)`.
 
+Two ways to launch a child. `start` lets it inherit the parent's
+standard fds, so it shares the terminal. `start_piped` instead
+attaches pipes to its stdin and stdout, which is what "page this
+output" and "shell out and capture" need; `write_stdin`,
+`read_stdout` and `close_stdin` move the bytes.
+
 POSIX only.
 """)]
 
 #[doc("""
 Start a child process via `fork(2)` + `execvp(3)`. Returns an
-opaque `Child` carrying the OS pid; standard fds inherit from the
-parent. Panics if the fork or exec fails.
+opaque `Child` carrying the OS pid; the child inherits the
+parent's standard fds, so it shares the terminal. Use
+`start_piped` to capture or feed them instead. Panics if the fork
+or exec fails.
 """)]
 pub fn start(cmd: String, args: [String]) : Child / Process =
   Process.start(cmd, args)
+
+#[doc("""
+Start a child process with pipes on its stdin and stdout instead
+of the parent's fds; stderr still inherits, so the child's
+diagnostics stay visible. Returns `Err(strerror)` if the pipe or
+fork fails.
+
+Feed it with `write_stdin`, drain it with `read_stdout`, signal
+end-of-input with `close_stdin`, then reap it with `wait`.
+
+A pipe holds a bounded amount of data — about 64 KB on Linux, 16 KB
+on macOS — and a child blocks once it fills. Drain `read_stdout`
+while the child runs rather than waiting first, or a child that
+outgrows the buffer deadlocks against a parent that never reads.
+""")]
+pub fn start_piped(cmd: String, args: [String]) : Result[Child, String] / Process =
+  Process.start_piped(cmd, args)
+
+#[doc("""
+Write a string to a piped child's stdin and return how many bytes
+went through. Returns `Err(strerror)` on failure — notably
+`Err("Broken pipe")` when the child already closed its read end
+(a pager the user quit), which is an error here rather than a
+fatal `SIGPIPE`.
+
+Blocks the OS thread, not the fiber, and blocks while the child is
+not draining a full pipe.
+""")]
+pub fn write_stdin(c: Child, s: String) : Result[Int, String] / Process =
+  Process.write_stdin(c, s)
+
+#[doc("""
+Read at most `n` bytes from a piped child's stdout. An empty
+string means end of output: the child closed its stdout, normally
+by exiting. Returns `Err(strerror)` on a read failure.
+
+This reads what is available up to `n` rather than filling the
+buffer, so loop until it returns `""` to consume everything.
+
+Blocks the OS thread, not the fiber, until at least one byte or
+EOF is available.
+""")]
+pub fn read_stdout(c: Child, n: Int) : Result[String, String] / Process =
+  Process.read_stdout(c, n)
+
+#[doc("""
+Close a piped child's stdin so it sees end-of-input. A child that
+reads until EOF — a pager, `sort`, `wc` — only finishes once this
+happens, so call it before `wait`. Idempotent, and `Ok` for a
+child started without pipes.
+""")]
+pub fn close_stdin(c: Child) : Result[Unit, String] / Process =
+  Process.close_stdin(c)
+
+#[doc("""
+Read a piped child's stdout to end of output and return it whole.
+Loops `read_stdout` in 64 KB chunks, so the child never blocks on
+a full pipe regardless of how much it emits.
+
+Returns `Err(strerror)` if any underlying read fails. Does not
+reap the child — call `wait` afterwards for its `Exit`.
+""")]
+pub fn read_all_stdout(c: Child) : Result[String, String] / Process =
+  read_all_loop(c, "")
+
+fn read_all_loop(c: Child, acc: String) : Result[String, String] / Process =
+  match Process.read_stdout(c, 65536) {
+    Err(msg) -> Err(msg)
+    Ok(chunk) ->
+      if string_length(chunk) == 0 { Ok(acc) }
+      else { read_all_loop(c, string_concat(acc, chunk)) }
+  }
 
 #[doc("""
 Wait for a child process to terminate and return its exit status

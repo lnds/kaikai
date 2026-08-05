@@ -1035,10 +1035,14 @@ the same caveats pinned in the v1-status sidebar above.
 
 ```kai
 effect Process {
-  start(cmd: String, args: [String])  : Result[Child, String]
-  wait(c: Child)                      : Result[Exit, String]
-  kill(c: Child, sig: Signal)         : Result[Unit, String]
-  exit(code: Int)                     : Nothing
+  start(cmd: String, args: [String])       : Result[Child, String]
+  start_piped(cmd: String, args: [String]) : Result[Child, String]
+  write_stdin(c: Child, s: String)         : Result[Int, String]
+  read_stdout(c: Child, n: Int)            : Result[String, String]
+  close_stdin(c: Child)                    : Result[Unit, String]
+  wait(c: Child)                           : Result[Exit, String]
+  kill(c: Child, sig: Signal)              : Result[Unit, String]
+  exit(code: Int)                          : Nothing
 }
 ```
 
@@ -1166,11 +1170,37 @@ clean exit, control flows past the `with` clause and the
 > Orongo (see `docs/fibers-honesty-targets.md` §*Residual m8.x
 > items*).
 
+### Stdio redirection
+
+`start_piped` is the `popen`-shaped counterpart to `start`: it
+attaches pipes to the child's stdin and stdout rather than letting
+them inherit, which is what paging output and capturing a command's
+result need. stderr still inherits, so a child's diagnostics stay
+visible. `write_stdin` feeds it, `read_stdout` drains it,
+`close_stdin` signals end-of-input, and `wait` reaps it as usual.
+
+Two properties are load-bearing:
+
+- **`read_stdout` is bounded**, returning at most `n` bytes and `""`
+  at EOF. A pipe holds only ~64 KB on Linux and ~16 KB on macOS, so
+  a child that outgrows the buffer blocks until the parent drains.
+  Callers loop rather than depending on the capacity;
+  `os.process.read_all_stdout` is that loop. Note the corollary: a
+  single-threaded parent cannot push more than one buffer *into* a
+  filter it is simultaneously reading from — both pipes fill and the
+  two processes deadlock. Feed a large payload via a file, or let
+  the child generate it.
+- **A dead reader is an error, not a signal.** Writing to a pipe
+  whose reader exited (a pager the user quit) would raise SIGPIPE
+  and kill the process under the default disposition; the runtime
+  neutralises it once, lazily, so `write_stdin` returns
+  `Err("Broken pipe")` instead. A SIGPIPE handler the program
+  installed itself is left alone.
+
 ### What's not in v1 (planned extensions)
 
-- Stdio redirection helpers: `start_with_pipes`, returning a
-  `Child` plus reader/writer endpoints for stdin/stdout/stderr.
-  Likely lives in `os.process` rather than as new `Process` ops.
+- Redirecting the child's *stderr*, separately or merged into
+  stdout. `start_piped` leaves it inherited.
 - Working-directory and environment overrides per start:
   `start_with_env`, `start_in_dir`. Same locality argument.
 - Process-group and session control (`setsid`, `setpgid`).

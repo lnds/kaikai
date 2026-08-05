@@ -1,0 +1,123 @@
+# Piped subprocess I/O — `Process.start_piped` and friends.
+#
+# Four shapes, each pinning a failure mode a naive pipe
+# implementation falls into:
+#
+#   1. capture   — read a command's stdout and check the bytes.
+#   2. filter    — write to a child, close its stdin so it sees EOF,
+#                  read what it produced. The pager shape.
+#   3. bulk      — a child emitting far more than one pipe buffer
+#                  (~64 KB Linux, ~16 KB macOS). Deadlocks unless the
+#                  parent drains while the child runs.
+#   4. dead peer — write to a child that already exited. Must report
+#                  Err, not die of SIGPIPE.
+#
+# `/bin/cat` and `/bin/echo` are the only externals; both are POSIX
+# and live at those paths on Linux and macOS alike.
+
+import os.process
+
+fn capture() : Int / Process + Stdout =
+  match process.start_piped("/bin/echo", ["captured"]) {
+    Err(msg)  -> { Stdout.print(string_concat("capture FAIL: ", msg)); 1 }
+    Ok(child) -> {
+      let got = process.read_all_stdout(child)
+      let _   = process.wait(child)
+      match got {
+        Err(msg) -> { Stdout.print(string_concat("capture FAIL: ", msg)); 1 }
+        Ok(text) ->
+          if text == "captured\n" { Stdout.print("capture ok"); 0 }
+          else { Stdout.print(string_concat("capture FAIL: got ", text)); 1 }
+      }
+    }
+  }
+
+# `cat` copies stdin to stdout and only exits once it reads EOF, so
+# this deadlocks if `close_stdin` does not actually close the parent's
+# write end.
+fn filter_case() : Int / Process + Stdout =
+  match process.start_piped("/bin/cat", []) {
+    Err(msg)  -> { Stdout.print(string_concat("filter FAIL: ", msg)); 1 }
+    Ok(child) -> {
+      match process.write_stdin(child, "through the pipe\n") {
+        Err(msg) -> { Stdout.print(string_concat("filter FAIL: ", msg)); 1 }
+        Ok(_)    -> {
+          let _   = process.close_stdin(child)
+          let got = process.read_all_stdout(child)
+          let _   = process.wait(child)
+          match got {
+            Err(msg) -> { Stdout.print(string_concat("filter FAIL: ", msg)); 1 }
+            Ok(text) ->
+              if text == "through the pipe\n" { Stdout.print("filter ok"); 0 }
+              else { Stdout.print(string_concat("filter FAIL: got ", text)); 1 }
+          }
+        }
+      }
+    }
+  }
+
+fn repeat(chunk: String, n: Int, acc: String) : String =
+  if n <= 0 { acc } else { repeat(chunk, n - 1, string_concat(acc, chunk)) }
+
+# Have `cat` emit a multi-megabyte file. The child fills the pipe and
+# blocks in write() long before it is done, so this only terminates
+# because the parent keeps draining — a `read_all_stdout` that tried
+# to collect everything in one read, or a parent that waited before
+# reading, hangs here on both platforms.
+#
+# The payload has to come from the child rather than from us: a
+# single-threaded parent that pushes megabytes INTO a filter it is
+# also reading from deadlocks by construction once both pipes fill,
+# which is why `filter` above stays under one buffer.
+fn bulk(path: String) : Int / Process + Stdout =
+  match process.start_piped("/bin/cat", [path]) {
+    Err(msg)  -> { Stdout.print(string_concat("bulk FAIL: ", msg)); 1 }
+    Ok(child) -> {
+      let got = process.read_all_stdout(child)
+      let _   = process.wait(child)
+      match got {
+        Err(msg) -> { Stdout.print(string_concat("bulk FAIL: ", msg)); 1 }
+        Ok(text) ->
+          if string_length(text) > 1048576 { Stdout.print("bulk ok"); 0 }
+          else { Stdout.print("bulk FAIL: short read"); 1 }
+      }
+    }
+  }
+
+# `/bin/echo` exits immediately, so its read end is gone. Writing more
+# than one pipe buffer at it is guaranteed to hit EPIPE rather than
+# being absorbed by kernel buffering. With SIGPIPE at its default
+# disposition this kills the program and the golden never prints.
+fn dead_peer() : Int / Process + Stdout = {
+  let payload = repeat("x", 65536, "")
+  match process.start_piped("/bin/echo", ["done"]) {
+    Err(msg)  -> { Stdout.print(string_concat("dead_peer FAIL: ", msg)); 1 }
+    Ok(child) -> {
+      let _ = process.wait(child)
+      match process.write_stdin(child, payload) {
+        Ok(_)  -> { Stdout.print("dead_peer FAIL: write to dead peer succeeded"); 1 }
+        Err(_) -> { Stdout.print("dead_peer ok"); 0 }
+      }
+    }
+  }
+}
+
+fn main() : Int / Process + Stdout + File = {
+  let a = capture()
+  let b = filter_case()
+  let c = bulk_with_payload()
+  let d = dead_peer()
+  let rc = a + b + c + d
+  if rc == 0 { Stdout.print("done"); 0 } else { Stdout.print("done with errors"); rc }
+}
+
+# ~1.6 MB, comfortably past both pipe capacities.
+fn bulk_with_payload() : Int / Process + Stdout + File = {
+  let line  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n"
+  let block = repeat(line, 256, "")
+  let path  = "build/process_piped_payload.txt"
+  match File.write_file(path, repeat(block, 100, "")) {
+    Err(msg) -> { Stdout.print(string_concat("bulk FAIL: ", msg)); 1 }
+    Ok(_)    -> bulk(path)
+  }
+}

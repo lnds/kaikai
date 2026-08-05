@@ -76,6 +76,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `os/args`                               | shipped via PR #131 + PR #143; 2 public fns (`args_argv`, `args_program_name`)                                                 |
 | `os/process` (runtime + effect)         | shipped via PR #142 (closes the runtime side of #126)                                                                          |
 | `os/process` (Kai wrapper)              | shipped (closes #346): 4 public fns (`process.start`, `process.wait`, `process.kill`, `process.exit`) over `builtin_process_decl` |
+| `os/process` (stdio pipes)              | shipped (closes #1591): `start_piped` plus `write_stdin` / `read_stdout` / `read_all_stdout` / `close_stdin`; bounded reads and EPIPE-not-SIGPIPE per `docs/effects-stdlib.md` §`Process` |
 | `time` Clock default handler            | shipped via PR #134 — `kai_default_clock_wall_now`, `kai_default_clock_monotonic_now`, `kai_default_clock_sleep_ns` are wired  |
 | `crypto/hash`, `crypto/mac`             | shipped via PR #146 (S2 #5): 626 LOC pure-Kai SHA-256/SHA-512 + 83 LOC HMAC                                                    |
 | `random_secure`                         | shipped via PR #144 (closes #140): 44 LOC, 2 public fns over `getrandom(2)` / `arc4random_buf`                                 |
@@ -148,7 +149,7 @@ parallel with each other and with Hanga Roa's compiler-side work.
 2. **`os/`** — env / process / args on top of `Env` + `Process`.
    - Surface: `os.env.get/set/unset/all`,
      `os.args.argv/program_name`,
-     `os.process.start/wait/wait_or_kill/pipe_stdout/pipe_stdin/signal/kill`,
+     `os.process.start/start_piped/write_stdin/read_stdout/close_stdin/wait/wait_or_kill/signal/kill`,
      top-level `os.exit(code)`.
    - Why now: ahu's config loader pulls from env vars (OTP
      analogue of `:application.get_env/2`); manutara reads

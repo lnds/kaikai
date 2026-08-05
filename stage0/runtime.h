@@ -9382,30 +9382,58 @@ static KaiValue *kai_default_signal_await(void *self, KaiCont *k) {
  *     comment so the two effects don't fight over the disposition.
  */
 
-/* Build a Child record `{ pid: Int }`. The "pid" field name is
- * load-bearing — `_kai_process_record_pid` reads the slot by
- * strcmp on the name pointer's contents, in lockstep with
- * `builtin_child_decl` in stage2/compiler.kai. */
-static KaiValue *_kai_process_make_child(int pid) {
-    KaiValue *pid_kv = kai_int((int64_t) pid);
-    KaiValue *fields[1] = { pid_kv };
-    static const char *names[1] = { "pid" };
-    return kai_record(1, fields, names);
+/* Build a Child record `{ pid, stdin_fd, stdout_fd }`. The field
+ * names are load-bearing — `_kai_process_record_field` reads slots
+ * by strcmp on the name pointer's contents, in lockstep with the
+ * `Child` declaration in stdlib/effects/os.kai. A child started
+ * without pipes carries -1 in both fd slots. */
+static KaiValue *_kai_process_make_child_fds(int pid, int in_fd, int out_fd) {
+    KaiValue *fields[3];
+    static const char *names[3] = { "pid", "stdin_fd", "stdout_fd" };
+    fields[0] = kai_int((int64_t) pid);
+    fields[1] = kai_int((int64_t) in_fd);
+    fields[2] = kai_int((int64_t) out_fd);
+    return kai_record(3, fields, names);
 }
 
-/* Pull the `pid` slot out of a Child record. Returns -1 on shape
+static KaiValue *_kai_process_make_child(int pid) {
+    return _kai_process_make_child_fds(pid, -1, -1);
+}
+
+/* Pull a named Int slot out of a Child record. Returns -1 on shape
  * mismatch — the caller surfaces that as an error path; v1 trusts
  * the typer to keep this honest in normal flows. */
-static int _kai_process_record_pid(KaiValue *v) {
+static int _kai_process_record_field(KaiValue *v, const char *want) {
     if (!v || v->tag != KAI_RECORD) return -1;
     for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "pid") == 0) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], want) == 0) {
             KaiValue *f = v->as.rec.fields[i];
             if (!f || f->tag != KAI_INT) return -1;
             return (int) f->as.i;
         }
     }
     return -1;
+}
+
+static int _kai_process_record_pid(KaiValue *v) {
+    return _kai_process_record_field(v, "pid");
+}
+
+/* Stamp a named Int slot back into a Child record. Used to retire a
+ * descriptor to -1 once closed: the fd number is reused by the OS the
+ * moment it is free, so a second close through a stale handle would
+ * shut down an unrelated file. */
+static void _kai_process_record_set(KaiValue *v, const char *want, int64_t val) {
+    int i;
+    if (!v || v->tag != KAI_RECORD) return;
+    for (i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], want) == 0) {
+            KaiValue *old = v->as.rec.fields[i];
+            v->as.rec.fields[i] = kai_int(val);
+            kai_decref(old);
+            return;
+        }
+    }
 }
 
 /* Mint Exited(code) / Signaled(signo) — variant *names* are the
@@ -9530,6 +9558,219 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     _kai_process_free_argv(argv, argc);
     KaiValue *child = _kai_process_make_child((int) pid);
     return kai_cont_resume(k, child);
+}
+
+/* Ok(v) / Err(strerror) for the piped ops. */
+static KaiValue *_kai_process_ok(KaiValue *v) {
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = v}});
+}
+
+static KaiValue *_kai_process_err_msg(const char *msg) {
+    KaiValue *m = kai_str(msg ? msg : "unknown error");
+    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+}
+
+static KaiValue *_kai_process_err_errno(int saved_errno) {
+    return _kai_process_err_msg(strerror(saved_errno));
+}
+
+/* Writing to a pipe whose reader is gone raises SIGPIPE, whose
+ * default disposition kills the process. That is exactly the pager
+ * case (`less` quit before consuming everything), where the write
+ * must surface as EPIPE instead. Pipes have no per-call MSG_NOSIGNAL
+ * — the disposition is process-wide — so neutralise it once, lazily,
+ * before the first pipe write. Only overrides SIG_DFL: a program
+ * that installed its own SIGPIPE handler keeps it. */
+static void _kai_process_ignore_sigpipe(void) {
+    static int done = 0;
+    struct sigaction cur;
+    if (done) return;
+    done = 1;
+    if (sigaction(SIGPIPE, NULL, &cur) == 0 && cur.sa_handler == SIG_DFL) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGPIPE, &sa, NULL);
+    }
+}
+
+/* start_piped(cmd, args) -> Result[Child, String]. Same fork+execvp
+ * as `start`, with pipe(2)+dup2(2) wiring the child's stdin and
+ * stdout to parent-held endpoints. stderr still inherits, so a
+ * child's diagnostics stay visible.
+ *
+ * Every unused end is closed on both sides. A leaked write end in
+ * the parent means the child never sees EOF on stdin, and a leaked
+ * read end means `read_stdout` never returns 0 after the child
+ * exits — both hang forever rather than fail. */
+static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
+    const char *cmd_cstr;
+    char **argv;
+    int argc = 0;
+    int in_pipe[2];
+    int out_pipe[2];
+    pid_t pid;
+    (void) self;
+    if (!cmd || cmd->tag != KAI_STR) {
+        return kai_cont_resume(k, _kai_process_err_msg("start_piped: cmd must be a String"));
+    }
+    kai_reactor_init();
+    _kai_process_ignore_sigpipe();
+
+    cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
+    argv = _kai_process_build_argv(cmd_cstr, args, &argc);
+    if (!argv) {
+        return kai_cont_resume(k, _kai_process_err_msg("start_piped: out of memory building argv"));
+    }
+
+    in_pipe[0]  = -1; in_pipe[1]  = -1;   /* parent writes [1], child reads [0] */
+    out_pipe[0] = -1; out_pipe[1] = -1;   /* child writes [1], parent reads [0] */
+    if (pipe(in_pipe) < 0) {
+        int e = errno;
+        _kai_process_free_argv(argv, argc);
+        return kai_cont_resume(k, _kai_process_err_errno(e));
+    }
+    if (pipe(out_pipe) < 0) {
+        int e = errno;
+        close(in_pipe[0]); close(in_pipe[1]);
+        _kai_process_free_argv(argv, argc);
+        return kai_cont_resume(k, _kai_process_err_errno(e));
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        close(in_pipe[0]);  close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        _kai_process_free_argv(argv, argc);
+        return kai_cont_resume(k, _kai_process_err_errno(e));
+    }
+    if (pid == 0) {
+        /* Child: install the pipe ends as fd 0 / 1, then drop every
+         * descriptor the parent side owns. dup2 is a no-op when the
+         * source already equals the target, so guard the close. */
+        if (dup2(in_pipe[0],  STDIN_FILENO)  < 0) _exit(127);
+        if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+        if (in_pipe[0]  != STDIN_FILENO)  close(in_pipe[0]);
+        if (out_pipe[1] != STDOUT_FILENO) close(out_pipe[1]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        /* SIGPIPE was only ignored in the parent; restore the default
+         * so the child behaves like any other program in a pipeline. */
+        signal(SIGPIPE, SIG_DFL);
+        execvp(cmd_cstr, argv);
+        {
+            const char *prefix = "kai: Process.start_piped: execvp: ";
+            const char *msg    = strerror(errno);
+            ssize_t w;
+            w = write(2, prefix, strlen(prefix)); (void) w;
+            if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
+            w = write(2, "\n", 1); (void) w;
+        }
+        _exit(127);
+    }
+    /* Parent: keep the write end of stdin and the read end of
+     * stdout; the opposite ends belong to the child alone. */
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    _kai_process_free_argv(argv, argc);
+    return kai_cont_resume(k, _kai_process_ok(
+        _kai_process_make_child_fds((int) pid, in_pipe[1], out_pipe[0])));
+}
+
+/* write_stdin(c, s) -> Result[Int, String]. Writes the whole string,
+ * looping over partial writes, and resumes with the byte count. A
+ * dead reader surfaces as Err("Broken pipe") thanks to the SIGPIPE
+ * disposition set in start_piped. */
+static KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *s, KaiCont *k) {
+    int fd;
+    const char *bytes;
+    size_t want, sent = 0;
+    (void) self;
+    fd = _kai_process_record_field(child, "stdin_fd");
+    if (fd < 0) {
+        return kai_cont_resume(k, _kai_process_err_msg("write_stdin: child has no piped stdin"));
+    }
+    if (!s || s->tag != KAI_STR) {
+        return kai_cont_resume(k, _kai_process_err_msg("write_stdin: expected a String"));
+    }
+    _kai_process_ignore_sigpipe();
+    bytes = s->as.s.bytes ? s->as.s.bytes : "";
+    want  = (size_t) s->as.s.len;
+    while (sent < want) {
+        ssize_t w = write(fd, bytes + sent, want - sent);
+        if (w > 0) {
+            sent += (size_t) w;
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else if (w < 0) {
+            return kai_cont_resume(k, _kai_process_err_errno(errno));
+        } else {
+            break;
+        }
+    }
+    return kai_cont_resume(k, _kai_process_ok(kai_int((int64_t) sent)));
+}
+
+/* read_stdout(c, n) -> Result[String, String]. Reads AT MOST n bytes
+ * and resumes with what arrived; an empty string means EOF.
+ *
+ * The bound is the whole point: a pipe holds only ~64 KB on Linux and
+ * ~16 KB on macOS, so a child emitting more than that blocks in write
+ * until the parent drains. Callers loop on this op until it yields ""
+ * and therefore never depend on the capacity, which is why the
+ * multi-megabyte fixture passes on both platforms. */
+static KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiValue *n, KaiCont *k) {
+    int fd;
+    int64_t want;
+    char *buf;
+    ssize_t got;
+    KaiValue *str;
+    (void) self;
+    fd = _kai_process_record_field(child, "stdout_fd");
+    if (fd < 0) {
+        return kai_cont_resume(k, _kai_process_err_msg("read_stdout: child has no piped stdout"));
+    }
+    want = (n && n->tag == KAI_INT) ? n->as.i : 0;
+    if (want <= 0) {
+        return kai_cont_resume(k, _kai_process_ok(kai_str_from_bytes("", 0)));
+    }
+    buf = (char *) malloc((size_t) want);
+    if (!buf) {
+        return kai_cont_resume(k, _kai_process_err_msg("read_stdout: out of memory"));
+    }
+    do {
+        got = read(fd, buf, (size_t) want);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        int e = errno;
+        free(buf);
+        return kai_cont_resume(k, _kai_process_err_errno(e));
+    }
+    str = kai_str_from_bytes(buf, (size_t) got);
+    free(buf);
+    return kai_cont_resume(k, _kai_process_ok(str));
+}
+
+/* close_stdin(c) -> Result[Unit, String]. The child reads EOF only
+ * once the parent's write end is gone, so a filter that consumes to
+ * end-of-input (sort, wc, a pager) needs this before `wait`.
+ * Idempotent: closing an already-closed stdin is Ok. */
+static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, KaiCont *k) {
+    int fd, rc, e;
+    (void) self;
+    fd = _kai_process_record_field(child, "stdin_fd");
+    if (fd < 0) {
+        return kai_cont_resume(k, _kai_process_ok(kai_unit()));
+    }
+    rc = close(fd);
+    e  = errno;
+    _kai_process_record_set(child, "stdin_fd", -1);
+    if (rc < 0 && e != EBADF) {
+        return kai_cont_resume(k, _kai_process_err_errno(e));
+    }
+    return kai_cont_resume(k, _kai_process_ok(kai_unit()));
 }
 
 /* wait(c) -> Result[Exit, String]. Issue #611 Phase R1: the wait
