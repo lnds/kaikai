@@ -76,6 +76,16 @@ KAIC2="$ROOT/stage2/kaic2"
 # coverage by roughly a quarter of the corpus before it was caught.
 KPATH="--path $ROOT/stdlib"
 
+# Package fixtures (examples/packages/**) import modules the driver
+# resolves through kai.toml; stdlib alone cannot parse them, which left
+# them unmeasured. pkg_paths() below reconstructs the search paths a
+# manifest implies, reading kai.toml.template ahead of kai.toml: the
+# rendered manifests are machine-local (gitignored, absolute bare-repo
+# paths), while the templates are in-repo, so a clean checkout works
+# without running render-fixtures.sh. The two git-source placeholders
+# map to the plain source dirs the bare repos are built from.
+GIT_FIX="$ROOT/tests/fixtures/git-fixtures"
+
 # ---------------------------------------------------------------
 # Known-failing files, by property, each tagged with its issue.
 # Remove an entry when its issue closes.
@@ -169,6 +179,77 @@ strip_pos() {
       -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*_\([0-9][0-9]*\)__/__\1_L_C_\2__/g' "$1"
 }
 
+# Nearest directory at or above $1 carrying a manifest (template
+# counts), stopping below $ROOT. Empty when none.
+manifest_dir_of() {
+  d="$1"
+  while [ "$d" != "$ROOT" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/kai.toml" ] || [ -f "$d/kai.toml.template" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+}
+
+# Dependency package dirs declared by the manifest in $1, one per line.
+# `source`/`path`/`git` all name a dep's location; the git-fixture
+# placeholders resolve to the in-repo source dirs the bare repos are
+# built from, so no rendering step is required.
+manifest_dep_dirs() {
+  m="$1/kai.toml.template"
+  [ -f "$m" ] || m="$1/kai.toml"
+  [ -f "$m" ] || return 0
+  { sed -n 's/.*source[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$m"
+    sed -n 's/.*path[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$m"
+    sed -n 's/.*git[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$m"; } |
+  while read -r p; do
+    case "$p" in
+      GREET_BARE|GREET_PATH_PLACEHOLDER) echo "$GIT_FIX/greet" ;;
+      UTIL_BARE)                         echo "$GIT_FIX/util" ;;
+      /*) ;;
+      *) (cd "$1" && cd "$p" 2>/dev/null && pwd) || true ;;
+    esac
+  done
+}
+
+# Extra `--path` flags a file needs beyond stdlib, mirroring what the
+# driver's manifest_path_flags passes to kaic2: the manifest dir, its
+# parent (for `import <pkgname>.<module>` from sibling dirs), and the
+# transitive closure of declared deps (a consumer's dep may itself
+# import its own dep, and the parse loads that module too).
+#
+# Two non-package families need one known search root each; the values
+# mirror their own harnesses (stage2/Makefile test-modules-path,
+# tools/independence-oracle.sh).
+pkg_paths() {
+  case "$1" in
+    "$ROOT"/examples/packages/*)
+      start="$(manifest_dir_of "$(dirname "$1")")"
+      [ -n "$start" ] || return 0
+      printf -- '--path %s --path %s ' "$start" "$(dirname "$start")"
+      queue="$start"; seen=""
+      while [ -n "$queue" ]; do
+        d="${queue%% *}"
+        rest="${queue#*"$d"}"; queue="${rest# }"
+        case " $seen " in *" $d "*) continue ;; esac
+        seen="$seen $d"
+        for dep in $(manifest_dep_dirs "$d"); do
+          case " $seen $queue " in *" $dep "*) ;; *)
+            printf -- '--path %s ' "$dep"
+            queue="${queue:+$queue }$dep" ;;
+          esac
+        done
+      done
+      ;;
+    "$ROOT"/examples/modules-path/*)
+      printf -- '--path %s ' "$ROOT/examples/modules-path-lib" ;;
+    "$ROOT"/examples/oracle/*)
+      d="$(dirname "$1")"
+      if [ -d "$d/lib" ]; then printf -- '--path %s ' "$d/lib"; fi ;;
+  esac
+}
+
 # Jobs: parallel workers. Four kaic2 invocations per file over ~1800
 # files is ~18 minutes serial, which does not fit a Tier 1 shard; the
 # work is per-file independent, so it fans out. Defaults to the host's
@@ -183,7 +264,7 @@ else
   JOBS=4
 fi
 
-results="$tmp/results"      # one char per file: P|F|E|U|S|R
+results="$tmp/results"      # one char per file: P|F|E|N|X|D|S|R
 failures="$tmp/failures"    # multi-line report block per failure
 
 # Only the parent truncates. A worker re-entered via xargs runs this
@@ -206,17 +287,43 @@ check_one() {
   dir="$(dirname "$abs")"
   p1="$dir/$SCRATCH_PREFIX.$$.p1.kai"
   p2="$dir/$SCRATCH_PREFIX.$$.p2.kai"
+  extra="$(pkg_paths "$abs")"
 
-  # A file the PARSER already rejects is not a formatter subject —
-  # negative fixtures deliberately contain syntax errors. Count it so
-  # the corpus reach stays auditable.
-  if ! "$KAIC2" $KPATH --ast "$abs" > "$b.ast0" 2> "$b.err"; then
-    printf 'U' >> "$results"
+  # A file the parser rejects is not a formatter subject, but WHY it
+  # was rejected must stay auditable — a deliberate negative is fine,
+  # a valid file the harness cannot resolve is unmeasured surface:
+  #
+  #   N  negative by design — an `.err.expected` golden (own name or a
+  #      sibling's: modules-family negatives diagnose at the importing
+  #      root, so their support modules fail as roots too and the
+  #      golden carries the root's name), the `.err.kai` spelling, or
+  #      the examples/negative/ tree.
+  #   X  non-subject by design — fmt golden-suite inputs (measured by
+  #      tests/fmt_fixtures.sh, deliberately not whole programs) and
+  #      aspirational code that does not compile yet.
+  #   D  coverage debt — everything else. FAILS the run: either the
+  #      harness learns to resolve the file or it gets classified.
+  if ! "$KAIC2" $KPATH $extra --ast "$abs" > "$b.ast0" 2> "$b.err"; then
+    case "$rel" in
+      *.err.kai)                printf 'N' >> "$results"; return 0 ;;
+      examples/negative/*)      printf 'N' >> "$results"; return 0 ;;
+      examples/fmt/*)           printf 'X' >> "$results"; return 0 ;;
+      examples/aspirational/*)  printf 'X' >> "$results"; return 0 ;;
+    esac
+    for g in "$dir"/*.err.expected; do
+      if [ -f "$g" ]; then
+        printf 'N' >> "$results"
+        return 0
+      fi
+    done
+    { echo "  UNCOVERED $rel — valid-looking file the harness cannot evaluate:"
+      sed 's/^/      /' "$b.err"; } >> "$failures"
+    printf 'D' >> "$results"
     return 0
   fi
 
   # (a) fmt must not refuse.
-  if ! "$KAIC2" $KPATH --fmt "$abs" > "$p1" 2> "$b.err"; then
+  if ! "$KAIC2" $KPATH $extra --fmt "$abs" > "$p1" 2> "$b.err"; then
     # An explicit `kai fmt:` refusal is a documented out-of-scope
     # construct, not a failure.
     if grep -q "kai fmt:" "$b.err"; then
@@ -231,7 +338,7 @@ check_one() {
   fi
 
   # (b) the output must re-parse.
-  if "$KAIC2" $KPATH --ast "$p1" > "$b.ast1" 2> "$b.err"; then
+  if "$KAIC2" $KPATH $extra --ast "$p1" > "$b.ast1" 2> "$b.err"; then
     reparsed=1
   else
     reparsed=0
@@ -277,7 +384,7 @@ check_one() {
   fi
 
   # (d) idempotency.
-  if ! "$KAIC2" $KPATH --fmt "$p1" > "$p2" 2> "$b.err"; then
+  if ! "$KAIC2" $KPATH $extra --fmt "$p1" > "$p2" 2> "$b.err"; then
     { echo "  FAIL $rel — (d) fmt refused its own output:"
       sed 's/^/      /' "$b.err"; } >> "$failures"
     printf 'F' >> "$results"
@@ -329,14 +436,20 @@ pass=$(tr -cd 'P' < "$results" | wc -c | tr -d ' ')
 fail=$(tr -cd 'F' < "$results" | wc -c | tr -d ' ')
 excused=$(tr -cd 'E' < "$results" | wc -c | tr -d ' ')
 stale=$(tr -cd 'S' < "$results" | wc -c | tr -d ' ')
-unparseable=$(tr -cd 'U' < "$results" | wc -c | tr -d ' ')
+negative=$(tr -cd 'N' < "$results" | wc -c | tr -d ' ')
+nonsubject=$(tr -cd 'X' < "$results" | wc -c | tr -d ' ')
+uncovered=$(tr -cd 'D' < "$results" | wc -c | tr -d ' ')
 refused=$(tr -cd 'R' < "$results" | wc -c | tr -d ' ')
 
 cat "$failures"
-echo "fmt_property: $pass passed, $excused excused (open issues), $refused refused (out of scope), $unparseable not parseable, $stale stale, $fail failed"
+echo "fmt_property: $pass passed, $excused excused (open issues), $refused refused (out of scope), $negative negative by design, $nonsubject non-subjects by design, $uncovered uncovered, $stale stale, $fail failed"
 
 if [ "$stale" -gt 0 ]; then
   echo "fmt_property: an exception is listed for a file that now passes — the list must shrink to zero, not rot" >&2
+  exit 1
+fi
+if [ "$uncovered" -gt 0 ]; then
+  echo "fmt_property: a corpus file is neither measured nor excluded by design — teach pkg_paths to resolve it (or give it its negative golden) instead of letting coverage shrink silently" >&2
   exit 1
 fi
 if [ "$fail" -gt 0 ]; then
