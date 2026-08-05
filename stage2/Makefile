@@ -2323,13 +2323,16 @@ test-trap-exit-cancel-asan: $(TARGET) build
 # the harness pattern matches the runtime-shadow-asan / signal-
 # trap-asan precedents — diagnostics on the parent are what gate
 # the lane. Wired into the top-level `tier1-asan` rule alongside
-# the other ASAN gates.
-PROCESS_BASIC_FIXTURES := process_basic
+# the other ASAN gates. The process_piped_* fixtures extend the
+# sweep over the stdio-pipe plumbing: pipe()/dup2 fd wiring, the
+# pid-keyed pipe table (malloc'd entries freed at wait), the
+# chunked read buffer, and the EPIPE dead-reader write path.
+PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big
 
 test-process-basic-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PROCESS_BASIC_FIXTURES); do \
-	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -3759,6 +3762,24 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Process.start + wait: /bin/echo hello → Exited(0))" \
+	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/process_piped_capture.kai \
+	         ../examples/effects/process_piped_pager.kai \
+	         ../examples/effects/process_piped_epipe.kai \
+	         ../examples/effects/process_piped_big.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp=$${f%.kai}.out.expected; \
+	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_process_start_piped" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default start_piped wiring missing)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (popen-shaped Process stdio pipes)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/issue_141_log_default.kai; do \

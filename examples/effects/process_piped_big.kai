@@ -1,0 +1,54 @@
+# Issue #1591 — pipe traffic far beyond the OS pipe capacity (~64 KiB
+# on Linux, ~16 KiB on macOS). Read side: the child emits 2,000,000
+# bytes and the chunked `read_all` drains them without deadlock. Write
+# side: 2 MiB into a filter that only acks after consuming everything —
+# `close_stdin` is what lets it reach EOF. A naive un-drained protocol
+# hangs here on either platform.
+import os.process
+
+fn mk_big(s: String, doublings: Int) : String =
+  if doublings == 0 { s } else { mk_big(string_concat(s, s), doublings - 1) }
+
+fn big_read() : Int / Process + Stdout =
+  match process.pipe_from("/bin/sh", ["-c", "yes 0123456789abcdef | head -c 2000000"]) {
+    Err(e) -> { Stdout.print(string_concat("read start FAIL: ", e)); 1 }
+    Ok(c)  -> match process.read_all(c) {
+      Err(e)  -> { Stdout.print(string_concat("read FAIL: ", e)); 1 }
+      Ok(out) -> match process.wait(c) {
+        Err(e)        -> { Stdout.print(string_concat("read wait FAIL: ", e)); 1 }
+        Ok(Exited(0)) ->
+          if string_length(out) == 2000000 { Stdout.print("big read ok"); 0 }
+          else { Stdout.print("big read FAIL: short output"); 1 }
+        Ok(_)         -> { Stdout.print("read wait FAIL: abnormal exit"); 1 }
+      }
+    }
+  }
+
+fn big_write() : Int / Process + Stdout =
+  match process.start_piped("/bin/sh", ["-c", "cat > /dev/null; printf done"]) {
+    Err(e) -> { Stdout.print(string_concat("write start FAIL: ", e)); 1 }
+    Ok(c)  ->
+      # 16 bytes doubled 17 times = 2 MiB
+      match process.write_stdin(c, mk_big("0123456789abcdef", 17)) {
+        Err(e) -> { Stdout.print(string_concat("write FAIL: ", e)); 1 }
+        Ok(_)  -> match process.close_stdin(c) {
+          Err(e) -> { Stdout.print(string_concat("close FAIL: ", e)); 1 }
+          Ok(_)  -> match process.read_all(c) {
+            Err(e)  -> { Stdout.print(string_concat("ack read FAIL: ", e)); 1 }
+            Ok(ack) -> match process.wait(c) {
+              Err(e)        -> { Stdout.print(string_concat("write wait FAIL: ", e)); 1 }
+              Ok(Exited(0)) ->
+                if ack == "done" { Stdout.print("big write ok"); 0 }
+                else { Stdout.print(string_concat("big write FAIL: ack ", ack)); 1 }
+              Ok(_)         -> { Stdout.print("write wait FAIL: abnormal exit"); 1 }
+            }
+          }
+        }
+      }
+  }
+
+fn main() : Int / Process + Stdout = {
+  let r1 = big_read()
+  if r1 != 0 { r1 }
+  else { big_write() }
+}

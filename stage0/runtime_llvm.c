@@ -1840,6 +1840,31 @@ KaiValue *kaix_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
     kai_decref(code);
     return _op_r;
 }
+KaiValue *kaix_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args,
+                                           KaiValue *pipe_stdin, KaiValue *pipe_stdout, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_start_piped(self, cmd, args, pipe_stdin, pipe_stdout, k);
+    kai_decref(cmd);
+    kai_decref(args);
+    kai_decref(pipe_stdin);
+    kai_decref(pipe_stdout);
+    return _op_r;
+}
+KaiValue *kaix_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_write_stdin(self, child, data, k);
+    kai_decref(child);
+    kai_decref(data);
+    return _op_r;
+}
+KaiValue *kaix_default_process_close_stdin(void *self, KaiValue *child, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_close_stdin(self, child, k);
+    kai_decref(child);
+    return _op_r;
+}
+KaiValue *kaix_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_read_stdout(self, child, k);
+    kai_decref(child);
+    return _op_r;
+}
 KaiValue *kaix_default_env_args(void *self, KaiCont *k) {
     return kai_default_env_args(self, k);
 }
