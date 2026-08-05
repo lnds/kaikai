@@ -12637,6 +12637,24 @@ static void _kai_process_free_argv(char **argv, int n) {
     free(argv);
 }
 
+/* Child-side, between fork and exec: reset the signal mask and the
+ * SIGPIPE disposition. Both survive execvp, and the runtime's own
+ * mask manipulation must not leak into the exec'd image — a child
+ * pipeline whose SIGPIPE is blocked reports EPIPE noise on stderr
+ * instead of dying silently when its reader closes (GNU `yes`
+ * observably differs between Linux CI and macOS without this).
+ * Async-signal-safe callees only. */
+static void _kai_process_child_reset_signals(void) {
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(SIGPIPE, &dfl, NULL);
+}
+
 /* Parent-side pipe ends of a piped child, keyed by pid. `start_piped`
  * registers, the stdio ops look up, and `wait` closes whatever is
  * still open before reaping (pclose semantics) — an unclosed parent
@@ -12779,6 +12797,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
         /* Child: replace image. execvp searches PATH for relative
          * names; absolute paths bypass the search. On any failure
          * exit 127, the shell convention for "command not found". */
+        _kai_process_child_reset_signals();
         execvp(cmd_cstr, argv);
         /* execvp only returns on failure. Async-signal-safe writers
          * only — keep the message minimal. */
@@ -12928,6 +12947,7 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
         return _kai_process_err(k, e);
     }
     if (pid == 0) {
+        _kai_process_child_reset_signals();
         if (want_in) {
             if (in_p[0] != 0) { dup2(in_p[0], 0); close(in_p[0]); }
             close(in_p[1]);
