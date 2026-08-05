@@ -20,6 +20,7 @@ import compiler.lex
 import compiler.ast
 import compiler.refinements
 import compiler.parse
+import compiler.surface_lower
 import compiler.resolve
 import compiler.fmt
 import compiler.fmt_writer
@@ -359,6 +360,19 @@ fn dump_expr(e: Expr, depth: Int) : Unit / Console {
       emit_line(depth, "intrinsic $#{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
       args_ |> each((a) => dump_expr(a, depth + 1))
     }
+    ESurface(sf) -> match sf {
+      SfContract(reqs, enss, body) -> {
+        emit_line(depth, "contract @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+        reqs |> each((r) => { emit_line(depth + 1, "requires"); dump_expr(r, depth + 2) })
+        enss |> each((en) => { emit_line(depth + 1, "ensures"); dump_expr(en, depth + 2) })
+        dump_expr(body, depth + 1)
+      }
+      SfEnsure(value, pred) -> {
+        emit_line(depth, "ensure-where @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+        dump_expr(value, depth + 1)
+        dump_expr(pred, depth + 1)
+      }
+    }
   }
 }
 
@@ -435,6 +449,11 @@ fn dump_stmt(s: Stmt, depth: Int) : Unit / Console {
       emit_line(depth, "index-assign @#{int_to_string(line)}:#{int_to_string(col)}")
       dump_expr(base, depth + 1)
       dump_expr(idx, depth + 1)
+      dump_expr(val, depth + 1)
+    }
+    SAssign(lhs, val, line, col) -> {
+      emit_line(depth, "assign @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(lhs, depth + 1)
       dump_expr(val, depth + 1)
     }
     SVar(name, opt_ty, rhs, line, col) -> {
@@ -695,7 +714,7 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       ops |> each((op) => dump_proto_op(op, depth + 1))
     }
-    DImpl(pname, proto_args, target, ms, line, col) -> {
+    DImpl(pname, proto_args, target, ms, line, col, impl_tps) -> {
       emit_line(depth, "impl \"#{pname}\" for @#{int_to_string(line)}:#{int_to_string(col)}")
       proto_args |> each((pa) => dump_type(pa, depth + 1))
       dump_type(target, depth + 1)
@@ -2027,9 +2046,9 @@ fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
   # the same core (e.g. `show_char_ascii_table` inside
   # `impl Show for Char`). Recurse so each method's `mo` matches
   # the enclosing core.
-  DImpl(name, proto_args, target, sub_decls, l, c) ->
+  DImpl(name, proto_args, target, sub_decls, l, c, tps) ->
     DImpl(name, proto_args, target,
-          tag_decls_module_origin(sub_decls, mod), l, c)
+          tag_decls_module_origin(sub_decls, mod), l, c, tps)
   # Tag `DType` with its module_origin too. Without this, the typer
   # cannot tell whether a `type Pair = ...` came from
   # `core/tuple.kai` or the user's root file, and same-name records
@@ -2108,7 +2127,7 @@ fn decl_partition_home(d: Decl) : Option[String] = match d {
   DProtoLaws(_, inner, _, _)           -> decl_partition_home(inner)
   DImplAxiom(_, inner, _, _)           -> decl_partition_home(inner)
   DConstructor(inner, _, _)            -> decl_partition_home(inner)
-  DImpl(_, _, _, sub_decls, _, _)      -> impl_first_fn_home(sub_decls)
+  DImpl(_, _, _, sub_decls, _, _, _)      -> impl_first_fn_home(sub_decls)
   _                                    -> None
 }
 
@@ -2709,7 +2728,7 @@ fn find_enc_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
     DImport(_, line, col)        -> enc_better(acc, line, col, "DImport", None, ql, qc)
     DEffect(_, _, _, _, _, line, col, _) -> enc_better(acc, line, col, "DEffect", None, ql, qc)
     DProtocol(_, _, _, _, line, col) -> enc_better(acc, line, col, "DProtocol", None, ql, qc)
-    DImpl(_, _, _, decls, line, col) -> {
+    DImpl(_, _, _, decls, line, col, _) -> {
       let a1 = enc_better(acc, line, col, "DImpl", None, ql, qc)
       find_enc_decls(decls, ql, qc, a1)
     }
@@ -2838,6 +2857,7 @@ fn find_enc_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[EncResult]) : O
     ELitUnit(inner, _) -> find_enc_expr(inner, ql, qc, acc)
     EVariantsOf(_, _)  -> acc
     EIntrinsic(_, args_) -> find_enc_exprs(args_, ql, qc, acc)
+    ESurface(sf) -> find_enc_exprs(surface_children(sf), ql, qc, acc)
   }
 }
 
@@ -2932,6 +2952,8 @@ fn find_enc_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[EncResult]) : Option[Enc
     SIndexAssign(arr, idx, v, _, _)  -> find_enc_expr(v, ql, qc,
                                           find_enc_expr(idx, ql, qc,
                                             find_enc_expr(arr, ql, qc, acc)))
+    SAssign(lhs, v, _, _)            -> find_enc_expr(v, ql, qc,
+                                          find_enc_expr(lhs, ql, qc, acc))
     SVar(_, _, init, line, col)      -> {
       let a1 = enc_better(acc, line, col, "SVar", None, ql, qc)
       find_enc_expr(init, ql, qc, a1)
@@ -3100,7 +3122,7 @@ fn find_local_at_decl(d: Decl, qname: String, ql: Int, qc: Int,
       let scope = push_params(params, [])
       find_local_at_expr(body, qname, ql, qc, scope, acc)
     }
-    DImpl(_, _, _, decls, _, _) -> find_local_at_decls(decls, qname, ql, qc, acc)
+    DImpl(_, _, _, decls, _, _, _) -> find_local_at_decls(decls, qname, ql, qc, acc)
     DDerive(_, inner, _, _)     -> find_local_at_decl(inner, qname, ql, qc, acc)
     DUnstable(inner, _, _)      -> find_local_at_decl(inner, qname, ql, qc, acc)
     DProtoLaws(_, inner, _, _)  -> find_local_at_decl(inner, qname, ql, qc, acc)
@@ -3203,6 +3225,7 @@ fn find_local_at_expr_kind(k: ExprKind, qname: String, ql: Int, qc: Int,
     ELitUnit(inner, _) -> find_local_at_expr(inner, qname, ql, qc, scope, acc)
     EVariantsOf(_, _)  -> acc
     EIntrinsic(_, args_) -> find_local_at_exprs(args_, qname, ql, qc, scope, acc)
+    ESurface(sf) -> find_local_at_exprs(surface_children(sf), qname, ql, qc, scope, acc)
   }
 }
 
@@ -3290,6 +3313,11 @@ fn find_local_at_stmt(s: Stmt, qname: String, ql: Int, qc: Int,
       let a3 = find_local_at_expr(v, qname, ql, qc, scope, a2)
       SR(scope, a3)
     }
+    SAssign(lhs, v, _, _) -> {
+      let a1 = find_local_at_expr(lhs, qname, ql, qc, scope, acc)
+      let a3 = find_local_at_expr(v, qname, ql, qc, scope, a1)
+      SR(scope, a3)
+    }
     SVar(name, _, init, line, col) -> {
       let a1 = find_local_at_expr(init, qname, ql, qc, scope, acc)
       let next = [SB("VarMut", name, line, col), ...scope]
@@ -3330,7 +3358,7 @@ fn find_var_at_decl(d: Decl, ql: Int, qc: Int, acc: Option[String]) : Option[Str
     DTest(_, body, _, _)                 -> find_var_at_expr(body, ql, qc, acc)
     DBench(_, body, _, _)                -> find_var_at_expr(body, ql, qc, acc)
     DCheck(_, _, body, _, _)             -> find_var_at_expr(body, ql, qc, acc)
-    DImpl(_, _, _, decls, _, _)          -> find_var_at_decls(decls, ql, qc, acc)
+    DImpl(_, _, _, decls, _, _, _)          -> find_var_at_decls(decls, ql, qc, acc)
     DDerive(_, inner, _, _)              -> find_var_at_decl(inner, ql, qc, acc)
     DUnstable(inner, _, _)               -> find_var_at_decl(inner, ql, qc, acc)
     DProtoLaws(_, inner, _, _)           -> find_var_at_decl(inner, ql, qc, acc)
@@ -3414,6 +3442,7 @@ fn find_var_at_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[String]) : O
     ELitUnit(inner, _) -> find_var_at_expr(inner, ql, qc, acc)
     EVariantsOf(_, _)  -> acc
     EIntrinsic(_, args_) -> find_var_at_exprs(args_, ql, qc, acc)
+    ESurface(sf) -> find_var_at_exprs(surface_children(sf), ql, qc, acc)
   }
 }
 
@@ -3474,6 +3503,8 @@ fn find_var_at_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[String]) : Option[Str
     SIndexAssign(arr, idx, v, _, _) -> find_var_at_expr(v, ql, qc,
                                           find_var_at_expr(idx, ql, qc,
                                             find_var_at_expr(arr, ql, qc, acc)))
+    SAssign(lhs, v, _, _)           -> find_var_at_expr(v, ql, qc,
+                                          find_var_at_expr(lhs, ql, qc, acc))
     SVar(_, _, init, _, _)          -> find_var_at_expr(init, ql, qc, acc)
     SUse(_, _, _)                   -> acc
   }
@@ -3989,7 +4020,7 @@ fn find_enc_call_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncCall]) : Option[
     DTest(_, body, _, _)                 -> find_enc_call_expr(body, ql, qc, acc)
     DBench(_, body, _, _)                -> find_enc_call_expr(body, ql, qc, acc)
     DCheck(_, _, body, _, _)             -> find_enc_call_expr(body, ql, qc, acc)
-    DImpl(_, _, _, inner, _, _)          -> find_enc_call(inner, ql, qc, acc)
+    DImpl(_, _, _, inner, _, _, _)          -> find_enc_call(inner, ql, qc, acc)
     DDerive(_, inner, _, _)              -> find_enc_call_decl(inner, ql, qc, acc)
     DUnstable(inner, _, _)               -> find_enc_call_decl(inner, ql, qc, acc)
     DProtoLaws(_, inner, _, _)           -> find_enc_call_decl(inner, ql, qc, acc)
@@ -4241,7 +4272,7 @@ fn ec_key_decl_id(d: Decl, target: String) : String = match d {
   DType(_, n, _, _, _, _, mo, _) -> concat_all(["type ", n, "@", ec_key_mo(mo, target)])
   DEffect(_, n, _, _, _, _, _, mo) -> concat_all(["effect ", n, "@", ec_key_mo(mo, target)])
   DProtocol(_, n, _, _, _, _) -> concat_all(["protocol ", n])
-  DImpl(p, _, _, _, _, _) -> concat_all(["impl ", p])
+  DImpl(p, _, _, _, _, _, _) -> concat_all(["impl ", p])
   DUnit(_, n, _, _, _, _) -> concat_all(["unit ", n])
   DConst(_, n, _, _, mo, _, _) -> concat_all(["const ", n, "@", ec_key_mo(mo, target)])
   DUse(n, _, _) -> concat_all(["use ", n])
@@ -4396,7 +4427,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # same file twice.
             let core_paths = collect_module_origins(core_mods, [])
             let expanded = expand_imports(path, search_paths, own_decls_no_holes, core_paths, user_cache)
-            let expanded_decls_raw0 = match expanded { EP_Mod(ds, _, _, _) -> ds }
+            # Dissolve the parser's surface-fidelity nodes (contract
+            # clauses, `ensure where`, `:=` writes, anonymous rest
+            # binders, impl tparams) into their semantic lowerings.
+            # Runs on the flat post-import list so imported modules are
+            # covered; only `kai fmt` / `kai migrate` (which short-
+            # circuit above) ever see the surface shapes.
+            let expanded_decls_raw0 = surface_lower_decls(
+              match expanded { EP_Mod(ds, _, _, _) -> ds })
             # Unwrap `laws`/`axiom` protocol/impl wrappers to their bare
             # decls before any Decl walker runs, recording the law
             # registry — the `lower_axioms` discipline. No later pass sees
@@ -4465,9 +4503,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # (no lowering to a disguised zero-arg fn). `qualtype_decl`
             # handles the DConst arm directly, so the const reaches the
             # qualified-type rewrite, the typer, and emit as a const.
-            let qualtype_errs = qtchk_decls(core_decls, module_table) +
+            # Core decls arrive parsed (possibly cache-restored), so
+            # they carry surface nodes too.
+            let core_decls_l = surface_lower_decls(core_decls)
+            let qualtype_errs = qtchk_decls(core_decls_l, module_table) +
                                 qtchk_decls(expanded_decls, module_table)
-            let qt_core = qualtype_decls(core_decls, module_table, path)
+            let qt_core = qualtype_decls(core_decls_l, module_table, path)
             let qt_expanded = qualtype_decls(expanded_decls, module_table, path)
             let qualified_core = rqc_decls(qt_core, module_table, path)
             let qualified_decls = rqc_decls(qt_expanded, module_table, path)

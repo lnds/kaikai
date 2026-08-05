@@ -83,64 +83,14 @@ KPATH="--path $ROOT/stdlib"
 
 # (b) re-parse — writer emits syntax the parser does not accept.
 KNOWN_REPARSE="
-examples/perceus/pipe_fusion_ring_1143.kai
-examples/perceus/range_lazy_1180.kai
-examples/perceus/range_lazy_sum_1180.kai
-examples/perceus/range_step_zero_1180.kai
-examples/perceus/vec_collect_1150.kai
-examples/sugars/shape_kind_dispatch.kai
-examples/sugars/shape_kind_fusion.kai
-examples/sugars/shape_kind_laws.kai
-examples/sugars/shape_kind_laws_axiom.kai
-examples/sugars/shape_kind_laws_violation.kai
-examples/sugars/shape_kind_arity_err.kai
-examples/sugars/shape_kind_composition_err.kai
-examples/sugars/shape_kind_scalar_err.kai
-examples/perceus/shape_fusion_1200.kai
-examples/sugars/if_cond_record_lit_delimited.kai
-examples/protocols/free_fn_interp_mono_collision.kai
-examples/stdlib/hashmap_collision.kai
-# #1617 — a preserved 'requires' clause is collapsed onto the signature
-# line before a block body, a shape the parser does not accept.
-examples/refinements/contracts_passing.kai
-examples/refinements/requires_complex_predicate.kai
-examples/refinements/requires_help_narrow.kai
-examples/refinements/requires_help_narrow_int.kai
-examples/refinements/requires_named_binding.kai
-examples/refinements/requires_value_boxed_real.kai
-examples/refinements/requires_value_reused_binding.kai
-examples/refinements/requires_violation_char.kai
-examples/refinements/requires_violation_diagnostic.kai
-examples/refinements/requires_violation_real.kai
-examples/refinements/requires_violation_string.kai
 "
 
 # (c) AST equality — output parses but denotes something else.
 KNOWN_AST="
-# #1606 — 'ensures' erased from the signature into a body 'assert'. The
-# 'requires' half of this was fixed in #1614; the postcondition was not.
-examples/refinements/ensures_violation_diagnostic.kai
-examples/sugars/m12_6_param_entail.kai
-# #1610 — regex literal '~r/.../' in a where-refinement replaced by a
-# malformed desugar that names a module not yet in scope.
-examples/stdlib/regex_anchors_repetition.kai
-examples/stdlib/regex_predicate_basic.kai
-examples/stdlib/regex_subsume_alpha.kai
-examples/stdlib/regex_subsume_basic.kai
-examples/stdlib/regex_subsume_unsupported.kai
-# #1603 — where-clause body collapses to one line then re-expands to a
-# block, which also shows up as a structural change.
-examples/sugars/m12_6_ensure_primary.kai
 "
 
 # (d) idempotency — no fixed point in one pass.
 KNOWN_IDEMPOTENT="
-examples/stdlib/regex_anchors_repetition.kai
-examples/stdlib/regex_predicate_basic.kai
-examples/stdlib/regex_subsume_alpha.kai
-examples/stdlib/regex_subsume_basic.kai
-examples/stdlib/regex_subsume_unsupported.kai
-examples/sugars/m12_6_ensure_primary.kai
 "
 
 if [ ! -x "$KAIC2" ]; then
