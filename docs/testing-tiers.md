@@ -370,9 +370,10 @@ asserts four things per source:
 ~1780 files against the selfhost corpus's 214, and more importantly it
 exercises surface the compiler's own sources never use — rest-patterns,
 kind-annotated type parameters, record literals delimited in condition
-position. That is where the six bugs lived. A run covers 1573 files;
+position. That is where the six bugs lived. A run covers ~1620 files;
 193 are dropped because the parser rejects them (negative fixtures,
-by design) and the rest are excused against an open issue.
+by design). The exception lists are empty; a new failure must either
+be fixed or excused against an open, numbered issue.
 
 Cost is four `kaic2` invocations per file, ~18 minutes serial, so the
 script fans out over `$(nproc)` workers (`FMT_PROPERTY_JOBS` overrides) —

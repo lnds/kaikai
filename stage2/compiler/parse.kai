@@ -43,8 +43,8 @@
 # - compiler.lex — tokenize (for parse_interp_expr).
 # - compiler.ast — the whole AST data model + mk_expr / mk_pat /
 #   mk_ty, the field-marker sentinels, and tp_unit_suffix.
-# - compiler.refinements — wrap_with_contracts (contract desugar) and
-#   try_eval_pred (used by check_pred_not_false).
+# - compiler.refinements — try_eval_pred (used by
+#   check_pred_not_false).
 #
 # Single-line `#[doc(...)]` only — kaic1 consumes the concatenated
 # bundle and does not accept triple-quoted strings inside attributes.
@@ -768,6 +768,7 @@ fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
 
 fn arg_has_placeholder(e: Expr) : Bool {
   match e.kind {
+    ESurface(sf)        -> any_arg_has_placeholder(surface_children(sf))
     EPlaceholder        -> true
     EInt(_, _)             -> false
     EReal(_, _)            -> false
@@ -868,6 +869,8 @@ fn stmt_has_placeholder(s: Stmt) : Bool = match s {
   SExprStmt(x)                -> arg_has_placeholder(x)
   SIndexAssign(b, i, v, _, _) ->
     arg_has_placeholder(b) or arg_has_placeholder(i) or arg_has_placeholder(v)
+  SAssign(b, v, _, _) ->
+    arg_has_placeholder(b) or arg_has_placeholder(v)
   SVar(_, _, rhs, _, _)       -> arg_has_placeholder(rhs)
   SUse(_, _, _)               -> false
 }
@@ -887,6 +890,7 @@ fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr {
 
 fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
   match k {
+    ESurface(sf)           -> ESurface(surface_map(sf, (x) => subst_placeholder_expr(x, repl)))
     EInt(_, _)             -> k
     EReal(_, _)            -> k
     EIntLit(_)            -> k
@@ -971,6 +975,8 @@ fn subst_placeholder_stmt(s: Stmt, repl: Expr) : Stmt = match s {
   SAssert(c, m)               -> SAssert(subst_placeholder_expr(c, repl),
                                           subst_placeholder_opt(m, repl))
   SExprStmt(x)                -> SExprStmt(subst_placeholder_expr(x, repl))
+  SAssign(b, v, l, c) -> SAssign(subst_placeholder_expr(b, repl),
+                                  subst_placeholder_expr(v, repl), l, c)
   SIndexAssign(b, i, v, l, c) -> SIndexAssign(subst_placeholder_expr(b, repl),
                                                 subst_placeholder_expr(i, repl),
                                                 subst_placeholder_expr(v, repl),
@@ -2430,13 +2436,10 @@ fn region_binder_name(p: Parser) : Option[RegionBinder] / Console {
 
 # Parse `ensure(value) where pred`. `p` is positioned at the
 # `(` of `ensure(...)`; `t` is the original `ensure` token. The form
-# desugars to:
-#   { let self = value
-#     if pred { Some(self) } else { None } }
-# `self` is bound to the value so the predicate (which conventionally
-# uses `self`, possibly elided in the leading-comparator form) sees it
-# as a regular local. Without a `where` suffix, `ensure(...)` falls
-# through to an ordinary call so user-defined `ensure` functions are
+# is preserved as an `SfEnsure` surface node; `surface_lower_decls`
+# expands it to `{ let self = value; if pred { Some(self) } else
+# { None } }`. Without a `where` suffix, `ensure(...)` falls through
+# to an ordinary call so user-defined `ensure` functions are
 # preserved.
 fn parse_ensure_primary(p: Parser, t: Token) : PExpr / Console {
 
@@ -2460,23 +2463,8 @@ fn parse_ensure_primary(p: Parser, t: Token) : PExpr / Console {
           let pred_r = parse_refinement_predicate(p4, t.line, t.col)
           match pred_r.r {
             None -> err_e(pred_r.p)
-            Some(pred) -> {
-              # Build the desugared block:
-              #   let self = value
-              #   if pred { Some(self) } else { None }
-              let self_let = SLet(mk_pat(PBind("self"), t.line, t.col),
-                                  None, value)
-              let self_var = mk_expr(EVar("self"), t.line, t.col)
-              let some_call = mk_expr(ECall(
-                mk_expr(EVar("Some"), t.line, t.col),
-                [self_var]), t.line, t.col)
-              let none_var = mk_expr(EVar("None"), t.line, t.col)
-              let if_expr = mk_expr(EIf(pred, some_call, Some(none_var)),
-                                    t.line, t.col)
-              let block = mk_expr(EBlock([self_let], Some(if_expr)),
-                                  t.line, t.col)
-              ok_e(pred_r.p, block)
-            }
+            Some(pred) -> ok_e(pred_r.p,
+              mk_expr(ESurface(SfEnsure(value, pred)), t.line, t.col))
           }
         }
       }
@@ -3440,30 +3428,26 @@ fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console {
         }
       }
     }
-    EVar(name) -> {
-      # `cap := v` — desugar inline to `cap.set(v)` as a statement.
-      # The alias rewrite remaps the resulting field expression to
+    EVar(_) -> {
+      # `cap := v` — preserved as SAssign; `surface_lower_decls`
+      # rewrites it to `cap.set(v)`, which the alias rewrite remaps to
       # `State.set(cap, v)`. Only `State[T].set(v)` is the semantic
-      # target; if cap is a Reader binding the desugar still produces
+      # target; if cap is a Reader binding the lowering still produces
       # `cap.set(v)`, the alias rewrite emits `Reader.set(v)`, and the
       # resolver rejects it ("Reader has no operation `set`").
       let p1 = p_skip_newlines(p_advance(p))
       let rv = parse_expr(p1)
       match rv.r {
         None -> err_s(rv.p)
-        Some(v) -> {
-          let cap = mk_expr(EVar(name), lhs.line, lhs.col)
-          let setter = mk_expr(EField(cap, "set"), lhs.line, lhs.col)
-          let call = mk_expr(ECall(setter, [v]), lhs.line, lhs.col)
-          ok_s(rv.p, SExprStmt(call))
-        }
+        Some(v) -> ok_s(rv.p, SAssign(lhs, v, lhs.line, lhs.col))
       }
     }
     EField(_, _) -> {
-      # `record.field := v` where `field : Ref[T]` — desugar to
-      # `record.field.set(v)`, the same `.set` shape as the `cap` arm.
-      # The typer's `try_ref_sugar_op` maps `.set` on a `Ref` receiver
-      # to `Mutable.ref_set(record.field, v)`; a non-`Ref` field falls
+      # `record.field := v` where `field : Ref[T]` — preserved as
+      # SAssign; the lowering produces `record.field.set(v)`, the same
+      # `.set` shape as the `cap` arm. The typer's `try_ref_sugar_op`
+      # maps `.set` on a `Ref` receiver to
+      # `Mutable.ref_set(record.field, v)`; a non-`Ref` field falls
       # through to the ordinary UFCS lookup and its "no method `set`"
       # diagnostic. Only a `.`-chain rooted at an identifier is a valid
       # write target, mirroring the indexed-write rule.
@@ -3475,11 +3459,7 @@ fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console {
         let rv = parse_expr(p1)
         match rv.r {
           None -> err_s(rv.p)
-          Some(v) -> {
-            let setter = mk_expr(EField(lhs, "set"), lhs.line, lhs.col)
-            let call = mk_expr(ECall(setter, [v]), lhs.line, lhs.col)
-            ok_s(rv.p, SExprStmt(call))
-          }
+          Some(v) -> ok_s(rv.p, SAssign(lhs, v, lhs.line, lhs.col))
         }
       }
     }
@@ -4245,11 +4225,12 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
     # Spread binder. `...` may stand alone (preferred form
     # `[h, ...]`) or be followed by `_` (uniform-with-`_` form
     # `[h, ..._]`); both discard the tail with no binding. The named
-    # form `[h, ...rest]` keeps the existing semantics. Bare/`_` spread
-    # uses a synthesized sentinel name (`__list_rest_<line>_<col>__`)
-    # that round-trips as `Some(name)` through the rest of the pipeline,
-    # preserving the spread-vs-no-spread distinction the typer needs
-    # for exhaustiveness while leaving the binding unread.
+    # form `[h, ...rest]` keeps the existing semantics. The rest slot
+    # stores the SOURCE spelling (`""` bare, `"_"` wildcard, or the
+    # name); `surface_lower_decls` replaces the anonymous spellings
+    # with a unique sentinel binder, preserving the spread-vs-no-spread
+    # distinction the typer needs for exhaustiveness while leaving the
+    # author's spelling recoverable by the writer.
     let p1 = p_advance(p)
     let id = p_peek(p1)
     if tk_is(id.kind, TkIdent) {
@@ -4261,18 +4242,14 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
         err_p(p_error_here(p2, "expected `]` after spread pattern"))
       }
     } else if tk_is(id.kind, TkUnderscore) {
-      let sentinel = concat_all(["__list_rest_", int_to_string(id.line), "_",
-                                  int_to_string(id.col), "__"])
       let p2 = p_skip_newlines(p_advance(p1))
       if p_at(p2, TkRbracket) {
-        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some(sentinel)), t.line, t.col))
+        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some("_")), t.line, t.col))
       } else {
         err_p(p_error_here(p2, "expected `]` after spread pattern"))
       }
     } else if tk_is(id.kind, TkRbracket) {
-      let sentinel = concat_all(["__list_rest_", int_to_string(id.line), "_",
-                                  int_to_string(id.col), "__"])
-      ok_p(p_advance(p1), mk_pat(PList(list_reverse(acc), Some(sentinel)), t.line, t.col))
+      ok_p(p_advance(p1), mk_pat(PList(list_reverse(acc), Some("")), t.line, t.col))
     } else {
       err_p(p_error_here(p1, "expected identifier, `_`, or `]` after `...` in list pattern"))
     }
@@ -6176,8 +6153,9 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
             # (with any error attached) threads on into the clauses.
             let attr = parse_optional_pure_attribute(p_skip_newlines(row_r.p))
             # Optional `requires` / `ensures` clauses between the
-            # signature and the body. They desugar to asserts in
-            # the body — see wrap_with_contracts.
+            # signature and the body. The parser preserves them as an
+            # `SfContract` surface wrapper around the body;
+            # `surface_lower_decls` desugars them to body asserts.
             let cc = parse_contracts_loop(p_skip_newlines(attr.p), [], [])
             let p4 = p_skip_newlines(cc.p)
             # Body: `= expr` or `{ block }`.
@@ -6187,7 +6165,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
               match rb.r {
                 None -> err_d(rb.p)
                 Some(body) -> {
-                  let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
+                  let body2 = contract_surface(body, cc.reqs, cc.enss, t)
                   let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                   ok_d_fn(rb.p, dfn, fn_bounds)
                 }
@@ -6205,7 +6183,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                 match rb.r {
                   None -> err_d(rb.p)
                   Some(body) -> {
-                    let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
+                    let body2 = contract_surface(body, cc.reqs, cc.enss, t)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                     ok_d_fn(rb.p, dfn, fn_bounds)
                   }
@@ -6215,7 +6193,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                 match rb.r {
                   None -> err_d(rb.p)
                   Some(body) -> {
-                    let body2 = wrap_with_contracts(body, cc.reqs, cc.enss, params, name, t.line, t.col)
+                    let body2 = contract_surface(body, cc.reqs, cc.enss, t)
                     let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
                     ok_d_fn(rb.p, dfn, fn_bounds)
                   }
@@ -6494,6 +6472,13 @@ fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts / Con
   } else {
     Contracts { p: p0, reqs: list_reverse(reqs), enss: list_reverse(enss) }
   }
+}
+
+# Wrap a fn body in its contract clauses, preserved verbatim for the
+# writer. `surface_lower_decls` performs the assert desugar.
+fn contract_surface(body: Expr, reqs: [Expr], enss: [Expr], t: Token) : Expr {
+  if list_is_empty(reqs) and list_is_empty(enss) { body }
+  else { mk_expr(ESurface(SfContract(reqs, enss, body)), t.line, t.col) }
 }
 
 
@@ -6958,8 +6943,11 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
                     match methods_r.r {
                       None -> err_d(methods_r.p)
                       Some(ms) -> {
-                        let ms2 = prepend_impl_tparams_to_methods(impl_tparams, ms)
-                        let impl_d = DImpl(pname, proto_args, target_ty, ms2, t.line, t.col)
+                        # Impl-site tparams are stored raw (bounds
+                        # included) so the writer can print the head;
+                        # `surface_lower_decls` prepends them (bounds
+                        # stripped) to each method's own tparams.
+                        let impl_d = DImpl(pname, proto_args, target_ty, ms, t.line, t.col, impl_tparams)
                         parse_trailing_axiom(methods_r.p, impl_d, t)
                       }
                     }
@@ -6971,33 +6959,6 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
         }
       }
     }
-  }
-}
-
-# Prepend the impl-level tparams to each method's own tparams.
-# Caller has already validated method shape (parse_impl_methods
-# only emits DFn nodes).
-fn prepend_impl_tparams_to_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
-  match impl_tps {
-    [] -> ms
-    _  -> {
-      # Tparams may carry bound suffixes (`T#b:Show`).
-      # Strip them before injecting into the method's tparam list so
-      # the rest of the pipeline (which uses these strings as plain
-      # ident keys) sees only `T`. Bounds inform compile-time
-      # diagnostics through a separate mechanism — they do not
-      # change the method's typing.
-      let stripped = map(impl_tps, tp_strip_bounds)
-      map(ms, (d) => prepend_impl_tparams_to_method(stripped, d))
-    }
-  }
-}
-
-fn prepend_impl_tparams_to_method(impl_tps: [String], d: Decl) : Decl {
-  match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(pub_, n, list_append(impl_tps, tps), ps, ret, row, body, l, c, mo)
-    _ -> d
   }
 }
 

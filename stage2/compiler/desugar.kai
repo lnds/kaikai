@@ -109,6 +109,7 @@ pub fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EModCall(_, _) -> k
     # Intrinsic args ARE sub-Exprs, so the visitor recurs.
     EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    ESurface(sf) -> ESurface(surface_map(sf, f))
     # Composites: apply f to every direct sub-Expr.
     ECall(callee, args_) -> ECall(f(callee), map(args_, f))
     EField(base, name)   -> EField(f(base), name)
@@ -150,6 +151,7 @@ fn dsg_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
     SAssert(c, m)               -> SAssert(f(c), dsg_map_opt_expr(m, f))
     SExprStmt(x)                -> SExprStmt(f(x))
     SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SAssign(b, v, l, c) -> SAssign(f(b), f(v), l, c)
     SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
     # SUse has no sub-expression — pass through unchanged.
     SUse(n, l, c)               -> SUse(n, l, c)
@@ -451,6 +453,11 @@ fn dpr_stmt(s: Stmt, recs: [RecInfo], file: String, errs: Int) : DPRStmt / Conso
       let ri = dpr_expr(i, recs, file, rb.errs)
       let rv = dpr_expr(v, recs, file, ri.errs)
       DPRStmt { stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, l, c), errs: rv.errs }
+    }
+    SAssign(b, v, l, c) -> {
+      let rb = dpr_expr(b, recs, file, errs)
+      let rv = dpr_expr(v, recs, file, rb.errs)
+      DPRStmt { stmt: SAssign(rb.expr, rv.expr, l, c), errs: rv.errs }
     }
     SVar(n, ty, rhs, l, c) -> {
       let r = dpr_expr(rhs, recs, file, errs)
@@ -1135,6 +1142,7 @@ fn dcp_stmt(s: Stmt, names: [String]) : Stmt = match s {
   SLet(pat, ty, rhs) -> SLet(pat, ty, dcp_expr(rhs, names))
   SExprStmt(x) -> SExprStmt(dcp_expr(x, names))
   SIndexAssign(b, i, v, l, c) -> SIndexAssign(dcp_expr(b, names), dcp_expr(i, names), dcp_expr(v, names), l, c)
+  SAssign(b, v, l, c) -> SAssign(dcp_expr(b, names), dcp_expr(v, names), l, c)
   _ -> s
 }
 
@@ -1564,6 +1572,9 @@ fn validate_contract_stmt(s: Stmt, ctx: [Decl], file: String) : Int / Console {
     SIndexAssign(b, i, v, _, _) ->
       validate_contract_expr(b, ctx, file) +
       validate_contract_expr(i, ctx, file) +
+      validate_contract_expr(v, ctx, file)
+    SAssign(b, v, _, _) ->
+      validate_contract_expr(b, ctx, file) +
       validate_contract_expr(v, ctx, file)
     _ -> 0
   }
@@ -2033,6 +2044,12 @@ fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool,
         let r4 = lcr_block(rest, tail, caps, reject_at, file, r3.errs)
         VLStmts { stmts: [SIndexAssign(r1.expr, r2.expr, r3.expr, l, c), ...r4.stmts], opt: r4.opt, errs: r4.errs }
       }
+      SAssign(b, v, l, c) -> {
+        let r1 = lcr_expr(b, caps, reject_at, file, errs)
+        let r3 = lcr_expr(v, caps, reject_at, file, r1.errs)
+        let r4 = lcr_block(rest, tail, caps, reject_at, file, r3.errs)
+        VLStmts { stmts: [SAssign(r1.expr, r3.expr, l, c), ...r4.stmts], opt: r4.opt, errs: r4.errs }
+      }
       SAssert(c, m) -> {
         let r1 = lcr_expr(c, caps, reject_at, file, errs)
         let r2 = lcr_opt(m, caps, reject_at, file, r1.errs)
@@ -2190,6 +2207,8 @@ fn spawn_stmts_escape_pos(stmts: [Stmt], n: String, tainted: [String]) : Option[
         SVar(_, _, rhs, _, _) -> spawn_escape_pos(rhs, n, tainted)
         SIndexAssign(b, i, v, _, _) -> first_pos(spawn_escape_pos(b, n, tainted),
           first_pos(spawn_escape_pos(i, n, tainted), spawn_escape_pos(v, n, tainted)))
+        SAssign(b, v, _, _) -> first_pos(spawn_escape_pos(b, n, tainted),
+          spawn_escape_pos(v, n, tainted))
         SAssert(c, m) -> first_pos(spawn_escape_pos(c, n, tainted),
           match m { Some(x) -> spawn_escape_pos(x, n, tainted)  None -> None })
         _ -> None
@@ -2357,6 +2376,8 @@ fn task_stmts_touch_cell(ss: [Stmt], n: String, tainted: [String], tail: Option[
         SVar(_, _, rhs, _, _) -> task_touches_cell(rhs, n, tainted)
         SIndexAssign(b, i, v, _, _) -> task_touches_cell(b, n, tainted) or
           task_touches_cell(i, n, tainted) or task_touches_cell(v, n, tainted)
+        SAssign(b, v, _, _) -> task_touches_cell(b, n, tainted) or
+          task_touches_cell(v, n, tainted)
         SAssert(c, m) -> task_touches_cell(c, n, tainted) or
           (match m { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
         _ -> false
@@ -2477,6 +2498,7 @@ fn stmts_contain_cell_access(ss: [Stmt], n: String) : Bool {
         SExprStmt(x) -> contains_cell_access(x, n)
         SAssert(c, m) -> contains_cell_access(c, n) or (match m { Some(x) -> contains_cell_access(x, n)  None -> false })
         SIndexAssign(b, i, v, _, _) -> contains_cell_access(b, n) or contains_cell_access(i, n) or contains_cell_access(v, n)
+        SAssign(b, v, _, _) -> contains_cell_access(b, n) or contains_cell_access(v, n)
         SVar(_, _, rhs, _, _) -> contains_cell_access(rhs, n)
         SUse(_, _, _) -> false
       }
@@ -2535,6 +2557,8 @@ fn desugar_var_stmt(s: Stmt) : Stmt {
     SIndexAssign(b, i, v, l, c) ->
       SIndexAssign(desugar_var_expr(b), desugar_var_expr(i),
                    desugar_var_expr(v), l, c)
+    SAssign(b, v, l, c) ->
+      SAssign(desugar_var_expr(b), desugar_var_expr(v), l, c)
     # SVar at this site means it sits at non-head position relative to
     # the wrapping pass. desugar_var_block consumes head-position SVars;
     # any residual one here is rewritten to a `let` so the resolver does
@@ -2821,6 +2845,7 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EIntrinsic(nm, args_) ->
       if is_loop_intrinsic(nm) { loop_args_escape(name, args_) }
       else { args_escape(name, args_) }
+    ESurface(sf) -> args_escape(name, surface_children(sf))
   }
 }
 
@@ -2865,6 +2890,8 @@ fn stmt_escapes(name: String, s: Stmt) : Bool {
     SExprStmt(x) -> body_escapes(name, x)
     SIndexAssign(b, i, v, _, _) ->
       body_escapes(name, b) or body_escapes(name, i) or body_escapes(name, v)
+    SAssign(b, v, _, _) ->
+      body_escapes(name, b) or body_escapes(name, v)
     SVar(_, _, rhs, _, _) -> body_escapes(name, rhs)
     # SUse has no expr — name cannot escape through it.
     SUse(_, _, _) -> false
@@ -2979,6 +3006,8 @@ fn stmt_contains(name: String, s: Stmt) : Bool {
     SExprStmt(x) -> contains_var(name, x)
     SIndexAssign(b, i, v, _, _) ->
       contains_var(name, b) or contains_var(name, i) or contains_var(name, v)
+    SAssign(b, v, _, _) ->
+      contains_var(name, b) or contains_var(name, v)
     SVar(_, _, rhs, _, _) -> contains_var(name, rhs)
     # SUse has no expression — never contains a value-level name.
     SUse(_, _, _) -> false
@@ -3407,6 +3436,10 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
       let ra = use_rewrite_exprs(args_, table, opens, bound, file, acc.errs, [])
       UseKindAcc { kind: EIntrinsic(name, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
     }
+    ESurface(sf) -> {
+      let ra = use_rewrite_exprs(surface_children(sf), table, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: ESurface(surface_rebuild(sf, ra.exprs)), acc: UseRwAcc { errs: ra.errs } }
+    }
     ECall(callee, args_) -> {
       let rc = use_rewrite_expr(callee, table, opens, bound, file, acc.errs)
       let ra = use_rewrite_exprs(args_, table, opens, bound, file, rc.errs, [])
@@ -3693,6 +3726,14 @@ fn use_rewrite_block(stmts: [Stmt], tail: Option[Expr], table: [EffOps],
                             [SIndexAssign(rb.expr, ri.expr, rv.expr, l, c),
                              ...acc], opens)
       }
+      SAssign(b, v, l, c) -> {
+        let rb = use_rewrite_expr(b, table, opens, bound, file, errs)
+        let rv = use_rewrite_expr(v, table, opens, bound, file, rb.errs)
+        use_rewrite_block(rest, tail, table, outer_opens, bound,
+                            file, rv.errs,
+                            [SAssign(rb.expr, rv.expr, l, c),
+                             ...acc], opens)
+      }
     }
   }
 }
@@ -3755,7 +3796,7 @@ fn use_decl_is_root(d: Decl) : Bool = match d {
   DTest(_, _, _, _)                     -> true
   DBench(_, _, _, _)                    -> true
   DCheck(_, _, _, _, _)                 -> true
-  DImpl(_, _, _, _, _, _)               -> true
+  DImpl(_, _, _, _, _, _, _)               -> true
   DDerive(_, inner, _, _)               -> use_decl_is_root(inner)
   DUnstable(inner, _, _)                -> use_decl_is_root(inner)
   DProtoLaws(_, inner, _, _)            -> use_decl_is_root(inner)
@@ -3809,9 +3850,9 @@ fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
       let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
       UseRwDecl { decl: DCheck(desc, ps, r.expr, l, c), errs: r.errs }
     }
-    DImpl(pname, proto_args, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c, tps) -> {
       let rms = use_rewrite_decls(ms, table, file_opens, file, errs, [])
-      UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
+      UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c, tps),
                   errs: rms.errs }
     }
     DDerive(names, inner, l, c) -> {
@@ -4033,9 +4074,9 @@ fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDe
       let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
       NurseryRwDecl { decl: DCheck(desc, ps, r.expr, l, c), bw: r.bw }
     }
-    DImpl(pname, proto_args, target, ms, l, c) -> {
+    DImpl(pname, proto_args, target, ms, l, c, tps) -> {
       let rms = rewrite_nursery_caps_loop(ms, file, bw, [])
-      NurseryRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c),
+      NurseryRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c, tps),
                        bw: rms.bw }
     }
     DDerive(names, inner, l, c) -> {
@@ -4328,6 +4369,12 @@ fn rewrite_nursery_caps_stmts(ss: [Stmt], s: NCapStack, file: String,
         let vr = rewrite_nursery_caps_expr(v, s, file, ir.bw)
         rewrite_nursery_caps_stmts(rest, s, file, vr.bw,
           [SIndexAssign(br.expr, ir.expr, vr.expr, l, c), ...acc])
+      }
+      SAssign(b, v, l, c) -> {
+        let br = rewrite_nursery_caps_expr(b, s, file, bw)
+        let vr = rewrite_nursery_caps_expr(v, s, file, br.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, vr.bw,
+          [SAssign(br.expr, vr.expr, l, c), ...acc])
       }
       SUse(n, l, c) ->
         rewrite_nursery_caps_stmts(rest, s, file, bw, [SUse(n, l, c), ...acc])
@@ -4763,7 +4810,7 @@ fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
       check_brand_expr(body, seed, file, calls, brs, errs)
     DCheck(_, _, body, _, _) ->
       check_brand_expr(body, seed, file, calls, brs, errs)
-    DImpl(_, _, _, ms, _, _) ->
+    DImpl(_, _, _, ms, _, _, _) ->
       check_brand_decls_loop(ms, file, calls, brs, errs, seed)
     DDerive(_, inner, _, _) ->
       check_brand_decl(inner, file, calls, brs, errs, seed)
@@ -5055,6 +5102,11 @@ fn check_brand_stmts(ss: [Stmt], env: BrandEnv, file: String,
       SExprStmt(x) -> {
         let e1 = check_brand_expr(x, env, file, calls, brs, errs)
         check_brand_stmts(rest, env, file, calls, brs, e1)
+      }
+      SAssign(b, v, _, _) -> {
+        let e1 = check_brand_expr(b, env, file, calls, brs, errs)
+        let e3 = check_brand_expr(v, env, file, calls, brs, e1)
+        check_brand_stmts(rest, env, file, calls, brs, e3)
       }
       SIndexAssign(b, i, v, _, _) -> {
         let e1 = check_brand_expr(b, env, file, calls, brs, errs)

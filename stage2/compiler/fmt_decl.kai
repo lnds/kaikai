@@ -16,7 +16,6 @@ import compiler.fmt_writer
 import compiler.fmt_anchor
 import compiler.fmt_expr
 import compiler.fmt_effect
-import compiler.fmt_contracts
 
 # Emit a single decl. Every Decl variant has an arm — a file is
 # refused only when it fails to parse, never by the writer.
@@ -34,8 +33,8 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       fmt_effect_decl(is_pub, name, tparams, ops, default_opt, s)
     DProtocol(is_pub, name, tparams, ops, _, _) ->
       fmt_protocol_decl(is_pub, name, tparams, ops, s)
-    DImpl(pname, proto_args, target_ty, methods, _, _) ->
-      fmt_impl_decl(pname, proto_args, target_ty, methods, s)
+    DImpl(pname, proto_args, target_ty, methods, _, _, impl_tps) ->
+      fmt_impl_decl(pname, proto_args, target_ty, methods, impl_tps, s)
     # `#[derive(P, ...)] <inner_type_decl>` — emit the annotation on
     # its own line, then the wrapped decl. Issue #608: the short
     # `#derive(...)` form was deprecated; only `#[derive(...)]` is
@@ -57,8 +56,13 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       let s2 = fmt_newline(s1)
       fmt_decl(inner, s2)
     }
-    # `protocol { } laws <Theory>` — format the protocol then the clause.
-    DProtoLaws(thy, inner, _, _) -> fmt_emit(fmt_decl(inner, s), concat_all([" laws ", thy]))
+    # A theory-bound protocol: the clause is spelled `: Theory` in the
+    # head (`protocol P[s: Shape] : Functorial { ... }`).
+    DProtoLaws(thy, inner, _, _) -> match inner {
+      DProtocol(is_pub, name, tparams, ops, _, _) ->
+        fmt_protocol_decl_thy(is_pub, name, tparams, thy, ops, s)
+      _ -> fmt_decl(inner, s)
+    }
     # `impl { } axiom <Theory>` — format the impl then the clause.
     DImplAxiom(thy, inner, _, _) -> fmt_emit(fmt_decl(inner, s), concat_all([" axiom ", thy]))
     # `#[doc("...")]` wrapping a documented declaration (issue #681).
@@ -191,11 +195,13 @@ pub fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: St
   fmt_row(row, s_rt)
 }
 
-# m12.8: `impl Pname[proto_args] for Target { method_decls... }`.
-# When `proto_args` is empty, the surface form drops the `[...]`.
-# Issue #180.
-pub fn fmt_impl_decl(pname: String, proto_args: [TypeExpr], target_ty: TypeExpr, methods: [Decl], s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, "impl ")
+# m12.8: `impl[tparams] Pname[proto_args] for Target { methods... }`.
+# When `proto_args` (or the impl-site tparam list) is empty, the
+# surface form drops that `[...]`. Issue #180.
+pub fn fmt_impl_decl(pname: String, proto_args: [TypeExpr], target_ty: TypeExpr, methods: [Decl], impl_tps: [String], s: FmtSt) : FmtSt {
+  let s0 = fmt_emit(s, "impl")
+  let s0b = fmt_tparams(impl_tps, s0)
+  let s1 = fmt_emit(s0b, " ")
   let s2 = fmt_emit(s1, pname)
   let s3 = if list_is_empty(proto_args) { s2 }
     else {
@@ -253,16 +259,67 @@ pub fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], re
     }
   }
   let s9 = fmt_row(row, s8)
-  # `requires` / `ensures` desugar to body asserts at parse time, so the
-  # clauses are recovered here and re-emitted in signature position.
-  # Lowering them into the body would drop the call-site obligation.
-  match fmt_split_contracts(body) {
-    FC(reqs, enss, inner) -> {
-      let s10 = fmt_contract_clauses("requires", reqs, s9)
-      let s11 = fmt_contract_clauses("ensures", enss, s10)
-      fmt_fn_body(inner, s11)
+  match body.kind {
+    ESurface(sf) -> match sf {
+      SfContract(reqs, enss, inner) -> fmt_fn_contracts(reqs, enss, inner, s9)
+      SfEnsure(_, _) -> fmt_fn_body(body, s9)
+    }
+    _ -> fmt_fn_body(body, s9)
+  }
+}
+
+# Contract clauses in signature position. Before an `= expr` body they
+# stay inline on the signature line; before a block body each clause
+# gets its own indented line and the `{` opens below them — the
+# collapsed `requires p {` shape does not re-parse (the pred swallows
+# the brace).
+fn fmt_fn_contracts(reqs: [Expr], enss: [Expr], inner: Expr, s: FmtSt) : FmtSt {
+  match inner.kind {
+    EBlock(_, _) -> {
+      let s1 = fmt_indent_in(s)
+      let s2 = fmt_clause_lines("requires", reqs, s1)
+      let s3 = fmt_clause_lines("ensures", enss, s2)
+      let s4 = fmt_newline(fmt_indent_out(s3))
+      fmt_fn_body_at_margin(inner, s4)
+    }
+    _ -> {
+      let s1 = fmt_contract_clauses("requires", reqs, s)
+      let s2 = fmt_contract_clauses("ensures", enss, s1)
+      fmt_fn_body(inner, s2)
     }
   }
+}
+
+# `kw <pred>` inline, in signature position.
+fn fmt_contract_clauses(kw: String, preds: [Expr], s: FmtSt) : FmtSt = match preds {
+  [] -> s
+  [p, ...rest] -> {
+    let s1 = fmt_emit(s, concat_all([" ", kw, " "]))
+    fmt_contract_clauses(kw, rest, fmt_expr(p, s1))
+  }
+}
+
+# One `kw <pred>` per line, indented under the signature.
+fn fmt_clause_lines(kw: String, preds: [Expr], s: FmtSt) : FmtSt = match preds {
+  [] -> s
+  [p, ...rest] -> {
+    let s1 = fmt_emit(fmt_newline(s), concat_all([kw, " "]))
+    fmt_clause_lines(kw, rest, fmt_expr(p, s1))
+  }
+}
+
+# Block body opening at the current line start (after multi-line
+# contract clauses), not appended to the signature line.
+fn fmt_fn_body_at_margin(body: Expr, s: FmtSt) : FmtSt = match body.kind {
+  EBlock(stmts, tail) -> {
+    let s1 = fmt_emit(s, "{")
+    let s2 = fmt_newline(s1)
+    let s3 = fmt_indent_in(s2)
+    let s4 = fmt_block_inner(stmts, tail, s3)
+    let s5 = fmt_indent_out(s4)
+    fmt_emit(s5, "}")
+  }
+  _ -> fmt_fn_body(body, s)
 }
 
 
