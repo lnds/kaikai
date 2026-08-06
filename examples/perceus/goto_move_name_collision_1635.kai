@@ -1,0 +1,69 @@
+# A goto-tail arm-binder move must not leak across arms that share the
+# binder NAME. `rhs` qualifies for move-on-every-use in the map-pipe-shaped
+# arm (single use, pure self-tail-call), but the apply-pipe-shaped arm binds
+# the same name with TWO uses on one path (an owned call scrutinee, then a
+# ctor slot). The move set is keyed by name, so both uses in the second arm
+# were emitted raw: one birth ref spent twice. The over-released node is
+# freed while the rebuilt tree still points at it, the cell pool recycles it,
+# and the walk reads a recycled cell (wrong sum, cyclic tree, or a
+# non-exhaustive-match trap).
+
+type NK = KNum(Int) | KPair(Node, Node)
+
+type Node = { kind: NK, tag: Int }
+
+type Res = RKeep | RSwap(Node)
+
+fn mk(k: NK, tag: Int) : Node = Node { kind: k, tag: tag }
+
+fn pair(a: Node, b: Node) : Node = mk(KPair(a, b), 0)
+
+# Inspects `n` but escapes it on one (never-taken here) path, so the
+# param stays owned — the callee releases its ref on every return.
+fn probe(n: Node) : Res {
+  match n.kind {
+    KNum(k) -> if k < 0 { RSwap(n) } else { RKeep }
+    KPair(_, _) -> RKeep
+  }
+}
+
+fn next_node(step: Int) : Option[Node] =
+  if step > 0 { Some(mk(KNum(step), step)) } else { None }
+
+fn drive(step: Int, lhs: Node) : Node {
+  if step == 0 { lhs }
+  else if step % 2 == 1 {
+    # Qualifying arm: single use of `rhs`, pure self-tail-call.
+    match next_node(step) {
+      Some(rhs) -> drive(step - 1, pair(lhs, rhs))
+      None      -> lhs
+    }
+  } else {
+    # Colliding arm: same binder name, two uses on the RKeep path —
+    # the owned `probe` scrutinee call and the `pair` ctor slot.
+    match next_node(step) {
+      Some(rhs) -> match probe(rhs) {
+        RSwap(e) -> drive(step - 1, e)
+        RKeep    -> drive(step - 1, pair(lhs, rhs))
+      }
+      None -> lhs
+    }
+  }
+}
+
+# Fuel-bounded sum: a corrupted tree may be cyclic, so never walk unbounded.
+fn sum_tree(n: Node, fuel: Int) : Int {
+  if fuel == 0 { 0 }
+  else {
+    match n.kind {
+      KNum(k)     -> k
+      KPair(a, b) -> sum_tree(a, fuel - 1) + sum_tree(b, fuel - 1)
+    }
+  }
+}
+
+fn main() : Int / Stdout = {
+  let t = drive(12, mk(KNum(100), 100))
+  Stdout.print("sum=#{int_to_string(sum_tree(t, 64))}")
+  0
+}
