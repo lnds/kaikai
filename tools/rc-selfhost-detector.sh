@@ -111,6 +111,11 @@ check_one() {
       echo "  FAIL $tag — strict build errored"; fail=1; return
     fi
     KAI_TRACE_RC=1 KAI_THREADS=1 "$sbin" >/dev/null 2>"$WORK/$name-strict.err"
+    local strict_rc=$?
+    if [ "$strict_rc" -ne 0 ]; then
+      echo "  FAIL $tag — strict run crashed (exit $strict_rc); a crash here is heap corruption even with no DOUBLE flag"
+      fail=1; return
+    fi
     if grep -q 'DOUBLE' "$WORK/$name-strict.err"; then
       echo "  FAIL $tag — strict ledger DOUBLE (a tag freed more than allocated):"
       grep 'DOUBLE' "$WORK/$name-strict.err" | sed 's/^/      /'
