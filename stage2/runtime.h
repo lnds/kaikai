@@ -8305,10 +8305,13 @@ static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
     switch ((KaiTag) a->tag) {
         case KAI_BYTE:   { uint8_t  y = b->as.byte_val; if (y == 0) { kai_trap_abort("divide by zero"); } return kai_byte((uint8_t)(a->as.byte_val / y)); }
-        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int32(a->as.i32 / y); }
+        /* i64 domain so INT32_MIN / -1 wraps back to INT32_MIN on the
+         * truncating narrow, matching the raw widen-divide-narrow path. */
+        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int32((int32_t)((int64_t) a->as.i32 / (int64_t) y)); }
         case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint32(a->as.u32 / y); }
         case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint64(a->as.u64 / y); }
-        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int128(kai_i128_load(a) / y); }
+        /* `/ -1` negates in the unsigned domain: I128_MIN / -1 is UB direct. */
+        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int128(y == -1 ? (__int128)(0 - (unsigned __int128) kai_i128_load(a)) : kai_i128_load(a) / y); }
         default: return NULL;
     }
 }
@@ -8346,7 +8349,10 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
 static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a) && kai_is_int(b)) {
+        /* Same trap discipline as the raw kai_idiv_chk: a boxed and a
+         * raw `/` on the same operands must agree. */
         if (kai_intf(b) == 0) { kai_trap_abort("divide by zero"); }
+        if (kai_intf(a) == INT64_MIN && kai_intf(b) == -1) { kai_trap_abort("divide overflow"); }
         r = kai_int(kai_intf(a) / kai_intf(b));
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
@@ -8374,13 +8380,15 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     if (kai_is_int(a) && kai_is_int(b)) {
         if (kai_intf(b) == 0) { kai_trap_abort("mod by zero"); }
+        if (kai_intf(a) == INT64_MIN && kai_intf(b) == -1) { kai_trap_abort("divide overflow"); }
         r = kai_int(kai_intf(a) % kai_intf(b));
     } else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) {
         if (b->as.byte_val == 0) { kai_trap_abort("mod by zero"); }
         r = kai_byte((uint8_t)(a->as.byte_val % b->as.byte_val));
     } else if (kai_is_ptr(a) && a->tag == KAI_INT32 && kai_is_ptr(b) && b->tag == KAI_INT32) {
         if (b->as.i32 == 0) { kai_trap_abort("mod by zero"); }
-        r = kai_int32(a->as.i32 % b->as.i32);
+        /* i64 domain so INT32_MIN % -1 is 0, matching the raw widen path. */
+        r = kai_int32((int32_t)((int64_t) a->as.i32 % (int64_t) b->as.i32));
     } else if (kai_is_ptr(a) && a->tag == KAI_UINT32 && kai_is_ptr(b) && b->tag == KAI_UINT32) {
         if (b->as.u32 == 0) { kai_trap_abort("mod by zero"); }
         r = kai_uint32(a->as.u32 % b->as.u32);
@@ -8389,7 +8397,8 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
         r = kai_uint64(a->as.u64 % b->as.u64);
     } else if (kai_is_ptr(a) && a->tag == KAI_INT128 && kai_is_ptr(b) && b->tag == KAI_INT128) {
         __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("mod by zero"); }
-        r = kai_int128(kai_i128_load(a) % y);
+        /* `x % -1` is 0 by definition; the direct op is UB at I128_MIN. */
+        r = kai_int128(y == -1 ? (__int128) 0 : kai_i128_load(a) % y);
     } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8571,10 +8580,11 @@ static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)) {
         if (e < 0) { r = kai_int(0); }
         else {
-            int64_t base = kai_intf(a);
-            int64_t acc = 1;
+            /* Unsigned accumulate: an overflowing power wraps like `*`. */
+            uint64_t base = (uint64_t) kai_intf(a);
+            uint64_t acc = 1;
             for (int64_t i = 0; i < e; i++) { acc *= base; }
-            r = kai_int(acc);
+            r = kai_int((int64_t) acc);
         }
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL) {
         double base = a->as.r;
@@ -8590,7 +8600,7 @@ static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
 
 static KaiValue *kai_op_neg(KaiValue *a) {
     KaiValue *r;
-    if (kai_is_int(a))       r = kai_int(-kai_intf(a));
+    if (kai_is_int(a))       r = kai_int((int64_t)(0 - (uint64_t) kai_intf(a)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL) r = kai_real(-a->as.r);
     else if (kai_is_ptr(a) && a->tag == KAI_INT32)  r = kai_int32((int32_t)(-(uint32_t) a->as.i32));
     else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
