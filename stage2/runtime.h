@@ -2543,7 +2543,14 @@ static inline size_t kai_var_block_size(int n) {
      * member access on a misaligned bogus pointer that -fsanitize=undefined
      * flags on every variant alloc under the ASAN tier. */
     size_t base = offsetof(KaiValue, as);
-    return base + (size_t) n * sizeof(KaiVarSlot);
+    size_t sz = base + (size_t) n * sizeof(KaiVarSlot);
+#ifndef KAI_CELL_POOL_ACTIVE
+    /* Diagnostic builds (trace/profile/no-pool) malloc each block
+     * individually and generic paths touch the cell through KaiValue*;
+     * honour the documented floor so those accesses stay in bounds. */
+    if (sz < sizeof(KaiValue)) sz = sizeof(KaiValue);
+#endif
+    return sz;
 }
 
 /* FAM lane: allocate a KAI_VARIANT block with `n` payload slots stored
@@ -4319,7 +4326,9 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     kai_rc_history_log((_kc), /* op=free */ 3, freed_tag);                   \
     KAI_RC_RECYCLE_LEAKSITE(_kc, freed_tag);                                 \
     { uint64_t *p64 = (uint64_t *) (_kc);                                    \
-      size_t nq = sizeof(KaiValue) / sizeof(uint64_t);                       \
+      size_t _psz = (freed_tag == (int32_t) KAI_VARIANT)                     \
+          ? kai_var_block_size((_kc)->var_n_args) : sizeof(KaiValue);        \
+      size_t nq = _psz / sizeof(uint64_t);                                   \
       for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64; }        \
 } while (0)
 #ifdef KAI_TRACE_RC_LEAKSITE
