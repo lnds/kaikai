@@ -139,13 +139,21 @@ if [ "$have_native" -eq 1 ]; then
     check_one native "$name"
   done
   restore_bc
+  native_ran=1
 else
   echo "rc-detector: native backend SKIP (llvm-config not in PATH)"
+  native_ran=0
 fi
 
 if [ "$fail" -ne 0 ]; then
   echo "rc-detector: FAIL — RC invariant violated (see diagnostics above)."
   exit 1
 fi
-echo "rc-detector: PASS — no double-free / use-after-free across the corpus on either backend."
+# Native is the default backend, so a C-only run must not claim to have
+# covered it: say which backends actually ran.
+if [ "$native_ran" -eq 1 ]; then
+  echo "rc-detector: PASS — no double-free / use-after-free across the corpus on either backend."
+else
+  echo "rc-detector: PASS (C backend only) — native NOT covered; rerun with llvm-config in PATH to gate the default backend."
+fi
 exit 0
