@@ -1087,6 +1087,13 @@ fn parse_or(p: Parser) : PExpr / Console {
   }
 }
 
+# Binary operators below the pipe level may also lead a continuation
+# line, same shape as `parse_pipe_rest`: peek past newlines and only
+# commit when the next token is the operator — otherwise parse from
+# the ORIGINAL parser, since those newlines belong to the enclosing
+# statement boundary. Only tokens that cannot start an expression are
+# eligible; `-` (unary prefix) and `%` (map/set literal opener) CAN,
+# so they never lead a continuation line.
 fn parse_or_rest(p: Parser, lhs: Expr) : PExpr / Console {
 
   if p_at(p, TkOr) {
@@ -1097,7 +1104,15 @@ fn parse_or_rest(p: Parser, lhs: Expr) : PExpr / Console {
       Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
     }
   } else {
-    ok_e(p, lhs)
+    let p_look = p_skip_newlines(p)
+    if p_at(p_look, TkOr) {
+      let t = p_peek(p_look)
+      let r = parse_and(p_skip_newlines(p_advance(p_look)))
+      match r.r {
+        None -> err_e(r.p)
+        Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
+      }
+    } else { ok_e(p, lhs) }
   }
 }
 
@@ -1120,7 +1135,15 @@ fn parse_and_rest(p: Parser, lhs: Expr) : PExpr / Console {
       Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
     }
   } else {
-    ok_e(p, lhs)
+    let p_look = p_skip_newlines(p)
+    if p_at(p_look, TkAnd) {
+      let t = p_peek(p_look)
+      let r = parse_cmp(p_skip_newlines(p_advance(p_look)))
+      match r.r {
+        None -> err_e(r.p)
+        Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
+      }
+    } else { ok_e(p, lhs) }
   }
 }
 
@@ -1140,25 +1163,47 @@ fn parse_cmp(p: Parser) : PExpr / Console {
   let r = parse_concat(p)
   match r.r {
     None -> r
-    Some(lhs) -> {
-      let t = p_peek(r.p)
-      if is_cmp_tok(t.kind) {
-        let op = op_of_tok(t.kind)
-        let r2 = parse_concat(p_skip_newlines(p_advance(r.p)))
-        match r2.r {
-          None -> err_e(r2.p)
-          Some(rhs) -> {
-            let after = p_peek(r2.p)
-            if is_cmp_tok(after.kind) {
-              let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
-              err_e(p_error(r2.p, after, hint))
-            } else {
-              ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
-            }
+    Some(lhs) -> parse_cmp_rest(r.p, lhs)
+  }
+}
+
+fn parse_cmp_rest(p: Parser, lhs: Expr) : PExpr / Console {
+
+  let t = p_peek(p)
+  if is_cmp_tok(t.kind) {
+    let op = op_of_tok(t.kind)
+    let r2 = parse_concat(p_skip_newlines(p_advance(p)))
+    match r2.r {
+      None -> err_e(r2.p)
+      Some(rhs) -> {
+        let after = p_peek(r2.p)
+        if is_cmp_tok(after.kind) {
+          let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
+          err_e(p_error(r2.p, after, hint))
+        } else {
+          ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+        }
+      }
+    }
+  } else {
+    let p_look = p_skip_newlines(p)
+    let t1 = p_peek(p_look)
+    if is_cmp_tok(t1.kind) {
+      let op = op_of_tok(t1.kind)
+      let r2 = parse_concat(p_skip_newlines(p_advance(p_look)))
+      match r2.r {
+        None -> err_e(r2.p)
+        Some(rhs) -> {
+          let after = p_peek(r2.p)
+          if is_cmp_tok(after.kind) {
+            let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
+            err_e(p_error(r2.p, after, hint))
+          } else {
+            ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t1.line, t1.col))
           }
         }
-      } else { ok_e(r.p, lhs) }
-    }
+      }
+    } else { ok_e(p, lhs) }
   }
 }
 
@@ -1180,7 +1225,17 @@ fn parse_concat(p: Parser) : PExpr / Console {
           None -> err_e(rr.p)
           Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("++", lhs, rhs), t.line, t.col))
         }
-      } else { ok_e(r.p, lhs) }
+      } else {
+        let p_look = p_skip_newlines(r.p)
+        if p_at(p_look, TkPlusPlus) {
+          let t = p_peek(p_look)
+          let rr = parse_concat(p_skip_newlines(p_advance(p_look)))
+          match rr.r {
+            None -> err_e(rr.p)
+            Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("++", lhs, rhs), t.line, t.col))
+          }
+        } else { ok_e(r.p, lhs) }
+      }
     }
   }
 }
@@ -1204,7 +1259,17 @@ fn parse_add_rest(p: Parser, lhs: Expr) : PExpr / Console {
       None -> err_e(r.p)
       Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
     }
-  } else { ok_e(p, lhs) }
+  } else {
+    let p_look = p_skip_newlines(p)
+    if p_at(p_look, TkPlus) {
+      let t2 = p_peek(p_look)
+      let r = parse_mul(p_skip_newlines(p_advance(p_look)))
+      match r.r {
+        None -> err_e(r.p)
+        Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop("+", lhs, rhs), t2.line, t2.col))
+      }
+    } else { ok_e(p, lhs) }
+  }
 }
 
 fn parse_mul(p: Parser) : PExpr / Console {
@@ -1226,7 +1291,18 @@ fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr / Console {
       None -> err_e(r.p)
       Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
     }
-  } else { ok_e(p, lhs) }
+  } else {
+    let p_look = p_skip_newlines(p)
+    let t2 = p_peek(p_look)
+    if tk_is(t2.kind, TkStar) or tk_is(t2.kind, TkSlash) {
+      let op = op_of_tok(t2.kind)
+      let r = parse_unary(p_skip_newlines(p_advance(p_look)))
+      match r.r {
+        None -> err_e(r.p)
+        Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t2.line, t2.col))
+      }
+    } else { ok_e(p, lhs) }
+  }
 }
 
 # Consume a `.field` chain after the base of a `@`-deref, building an
@@ -1323,16 +1399,29 @@ fn parse_pow(p: Parser) : PExpr / Console {
   let r = parse_postfix(p)
   match r.r {
     None -> r
-    Some(lhs) -> {
-      let t = p_peek(r.p)
-      if tk_is(t.kind, TkCaret) {
-        let rr = parse_unary(p_skip_newlines(p_advance(r.p)))
-        match rr.r {
-          None -> err_e(rr.p)
-          Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
-        }
-      } else { ok_e(r.p, lhs) }
+    Some(lhs) -> parse_pow_rest(r.p, lhs)
+  }
+}
+
+fn parse_pow_rest(p: Parser, lhs: Expr) : PExpr / Console {
+
+  if p_at(p, TkCaret) {
+    let t = p_peek(p)
+    let rr = parse_unary(p_skip_newlines(p_advance(p)))
+    match rr.r {
+      None -> err_e(rr.p)
+      Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
     }
+  } else {
+    let p_look = p_skip_newlines(p)
+    if p_at(p_look, TkCaret) {
+      let t = p_peek(p_look)
+      let rr = parse_unary(p_skip_newlines(p_advance(p_look)))
+      match rr.r {
+        None -> err_e(rr.p)
+        Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
+      }
+    } else { ok_e(p, lhs) }
   }
 }
 
@@ -2779,6 +2868,15 @@ fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr / Console {
               # (a, b, c) => Triple { ... }, (a, b, c, d) => Quad { ... }.
               # N capped at 4 — wider products should be a named record.
               parse_tuple_expr_rest(p_skip_newlines(p_advance(p2)), [e], t)
+            }
+            else if p_at(r.p, TkNewline) and (p_at(p2, TkMinus) or p_at(p2, TkPercent)) {
+              # `-` / `%` cannot lead a continuation line (they can
+              # start an expression), so the newline ended this one.
+              # Point the diagnostic at the newline, not the operator.
+              let bad = p_peek(p2)
+              let op = op_of_tok(bad.kind)
+              let nl = p_peek(r.p)
+              err_e(p_error(p2, nl, "expression ends at this newline: `#{op}` cannot lead a continuation line — keep `#{op}` at the end of the previous line to continue"))
             }
             else { err_e(p_error_here(p2, "expected `)` after expression")) }
           }
