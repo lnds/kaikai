@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.108.0 (2026-08-05)
+
+### Added
+
+- **stdlib**: add popen-shaped stdio pipes to the Process effect (#1633)
+- **stdlib**: add is_tty ops to Stdout/Stderr/Stdin bridging isatty(3) (#1630)
+- **stdlib**: add one-sided trim and from_chars to core.string (#1629)
+
+### Fixed
+
+- **parse**: let every safe binary operator lead a continuation line (#1634)
+- **cli**: normalise find_manifest_dir input so relative paths terminate (#1632)
+- **modules**: decide module privacy at one point over per-module segments (#1626)
+- **fmt**: print from a source-faithful AST via a surface_lower pass (#1625)
+- **parse**: accept contract clauses before a brace body, width suffixes on every base (#1620)
+- **fmt**: preserve the regex sigil and `where` receiver elisions (#1618)
+- **fmt**: preserve literal spelling, contracts and imaginary literals (#1614)
+- **typer**: keep signature pub-access checks in the type namespace (#1612)
+- **fmt**: anchor a trailing comment to the element it followed (#1609)
+- **runtime**: propagate main's Int return as the process exit status (#1594)
+- **modules**: export `pub const` from a module (#1596)
+- **lint**: stop dead_code_unused_priv firing on lowered impl methods (#1595)
+
 ## v0.107.0 (2026-08-03)
 
 ### Added
