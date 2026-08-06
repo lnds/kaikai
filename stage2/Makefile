@@ -2193,7 +2193,7 @@ test-issue-1542: $(TARGET) build
 # regression in the signo lookup. Wired into the top-level
 # `tier1-asan` rule so it runs alongside the trace-asan and
 # runtime-shadow-asan gates.
-SIGNAL_TRAP_FIXTURES := issue_107_signal_trap
+SIGNAL_TRAP_FIXTURES := issue_107_signal_trap signal_pending_before_await
 
 test-signal-trap-asan: $(TARGET) build
 	@set -e; \
@@ -3709,7 +3709,7 @@ test-effects: $(TARGET) build
 	    fi; \
 	  fi; \
 	done; \
-	for f in ../examples/effects/issue_107_signal_trap.kai; do \
+	for f in ../examples/effects/issue_107_signal_trap.kai ../examples/effects/signal_pending_before_await.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
