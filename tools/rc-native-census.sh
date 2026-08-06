@@ -95,15 +95,21 @@ run_bounded() {
   if [ -n "$TIMEOUT_CMD" ]; then "$TIMEOUT_CMD" "$RUN_TIMEOUT" "$@"; else "$@"; fi
 }
 
+# stdout+stderr with sanitizer WARNING chatter dropped: ASan warns freely
+# on fiber stacks and swapcontext (platform-dependent wording) without any
+# error having occurred; errors say ERROR and sanitizer_hit sees them.
+filtered_streams() {
+  cat "$1.out" "$1.err" | grep -vE '^==[0-9]+==WARNING: |^False positive error reports may follow|^For details see '
+}
+
 # Goldens follow two capture conventions: stdout only, or stdout+stderr
 # (runners that capture 2>&1 to see runtime diagnostics). Accept either,
-# with ASan's benign fiber-stack warning filtered from stderr and trailing
-# newlines normalised (the $(cat) substitutions strip them — several
-# goldens lack the final one).
+# trailing newlines normalised (the $(cat) substitutions strip them —
+# several goldens lack the final one).
 golden_matches() {
   local exp="$1" bin="$2"
   [ "$(cat "$exp")" = "$(cat "$bin.out")" ] && return 0
-  [ "$(cat "$exp")" = "$(cat "$bin.out" "$bin.err" | grep -vE '^==[0-9]+==WARNING: ASan is ignoring|^False positive error reports may follow|^For details see https://github.com/google/sanitizers')" ]
+  [ "$(cat "$exp")" = "$(filtered_streams "$bin")" ]
 }
 
 # One fixture: build + run + classify. Writes the verdict to
@@ -128,7 +134,7 @@ classify_one() {
   echo "$verdict" > "$bin.verdict"
   echo "  $verdict $dir/$name"
 }
-export -f classify_one nondet_exempt sanitizer_hit run_bounded golden_matches
+export -f classify_one nondet_exempt sanitizer_hit run_bounded golden_matches filtered_streams
 
 collect_fixtures() {
   for dir in perceus effects; do
@@ -147,7 +153,7 @@ print_failure_detail() {
   echo "FAIL $dir/$name — $verdict"
   case "$verdict" in
     SANITIZER)  grep -m4 -E 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|SUMMARY' "$bin.err" | sed 's/^/    /' ;;
-    DIFF)       diff "$ROOT/examples/$dir/$name.out.expected" "$bin.out" 2>/dev/null | head -6 | sed 's/^/    /' ;;
+    DIFF)       diff "$ROOT/examples/$dir/$name.out.expected" <(filtered_streams "$bin") 2>/dev/null | head -8 | sed 's/^/    /' ;;
     BUILD-FAIL) tail -4 "$bin.build" 2>/dev/null | sed 's/^/    /' ;;
   esac
 }
