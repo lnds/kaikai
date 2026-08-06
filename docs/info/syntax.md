@@ -24,10 +24,12 @@ continues) only while the parser still expects more:
   `++`, …), an assignment/arrow (`=`, `:=`, `->`, `=>`), or a
   separator (`,`, `:`).
 
-So continuation puts the operator at the END of the line. A binary
-operator LEADING the next line is a parse error (`expected
-expression`) — except the four pipes `|>` `|` `||` `|?`, which also
-continue from leading position:
+A binary operator also continues from LEADING position on the next
+line — the four pipes `|>` `|` `||` `|?` and every binary operator
+that cannot start an expression: `or`, `and`, `==` `!=` `<` `>` `<=`
+`>=`, `++`, `+`, `*`, `/`, `^`. The two that CAN start an expression
+are excluded: `-` (unary minus) and `%` (opens `%{ }` / `%[ ]`
+literals) — those must stay at the end of the previous line:
 
 ```kaikai
 fn dbl(x: Int) : Int = x * 2
@@ -36,21 +38,29 @@ fn main() : Unit / Stdout = {
     2
   let b = 5
     |> dbl                                     # leading pipe continues
-  Stdout.print("a=#{a} b=#{b}")
+  let c = a
+    + 2                                        # leading binop continues
+  let ok = c > 4
+    and b > 0                                  # multi-line predicate
+    or false
+  Stdout.print("a=#{a} b=#{b} c=#{c} ok=#{ok}")
 }
 ```
+
+Inside parens a leading `-` / `%` is rejected with a diagnostic
+pointing at the newline that ended the expression:
 
 ```kaikai-neg
 fn main() : Int = {
-  let r = true
-    and false                                  # leading `and`: parse error
-  if r { 1 } else { 0 }
+  let r = (1
+    - 2)                                       # error: expression ends at
+  r                                            #   this newline
 }
 ```
 
-Trap: a leading `-` does NOT error — it parses as a fresh unary
-expression whose value is discarded, so the split silently changes
-meaning:
+Trap: at statement level a leading `-` does NOT error — it parses as
+a fresh unary expression whose value is discarded, so the split
+silently changes meaning:
 
 ```kaikai
 fn main() : Unit / Stdout = {
