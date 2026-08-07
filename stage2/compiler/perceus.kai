@@ -1924,12 +1924,19 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # emit and moving its binders would double-free (the regexp UAF). This
         # is the half that lets insert_loop's Black arm move l/r instead of
         # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
-        let arm_moves = pcs_collect_arm_skip_binders(name, true, body, bmap, cmap, borrowed)
+        # Both move sets are keyed by NAME over the whole body while their
+        # gates run per arm. A name bound by several arms can qualify in one
+        # arm while another path reads it twice; moving every use would spend
+        # one birth ref twice (over-release). Keep only names no execution
+        # path reads more than once — the borrow-aware global max-path.
+        let arm_moves = pcs_global_single_path(
+          pcs_collect_arm_skip_binders(name, true, body, bmap, cmap, borrowed), body, bmap)
         # Issue #817 — goto-tail arm-binders (read once per branch, consumed
         # on every path, consuming slot): moved on EVERY use, the
         # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
         # (reuse-in-place); this is the free-cell-then-goto model.
-        let goto_moves = pcs_collect_goto_tail_moves(name, body, bmap, cmap, borrowed)
+        let goto_moves = pcs_global_single_path(
+          pcs_collect_goto_tail_moves(name, body, bmap, cmap, borrowed), body, bmap)
         let skip_set0 = pcs_list_union(
           pcs_list_union(
             pcs_list_union(
@@ -3428,6 +3435,16 @@ fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
 #[doc("Arm-level pattern binders that pass the branch-aware safety check over the arm body (max-path<=1, consumed-on-every-path, all-consumers-linear). Pub: emit_c's arm-top reuse consults it so the shared-branch dup set matches exactly the binders perceus moves — the two must agree or RC double-counts.")]
 pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] =
   pcs_branch_aware_skip_locals_b(binders, body, [], [], [])
+
+# Move-on-every-use is sound for a name only when NO execution path through
+# the whole body reads it more than once: the per-arm gates cannot see a
+# same-named binder in a sibling arm whose path reads it twice.
+fn pcs_global_single_path(names: [String], body: Expr, bmap: [BorrowEntry]) : [String] = match names {
+  []           -> []
+  [h, ...rest] ->
+    if pcs_max_paths_b_expr(h, body, bmap) <= 1 { [h, ...pcs_global_single_path(rest, body, bmap)] }
+    else { pcs_global_single_path(rest, body, bmap) }
+}
 
 # Borrow-aware variant: the max-path count discounts uses of a binder that
 # land in a borrowed callee slot (is_red(l) does not consume l). This is
