@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,14 +187,38 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures"
+tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
 
 # kaic1 must reject every `examples/negative/stage1_rejections/*.kai`
 # with the diagnostic its `.kaic1.err.expected` pins. Bootstrap-only
 # (kaic1, no kaic2), ~0.1s.
 test-stage1-rejections: kaic1
 	@./tools/test-stage1-rejections.sh
+
+# A prim whose forwarder returns an RC-managed String (llvm_backend_tag,
+# RBoxed in stage 1's rprelude) must keep its shared-let binder in Perceus
+# scope: every consuming read carries a dup. Misclassified as a raw handle,
+# the binder is Perceus-exempt, the first consuming use frees the value and
+# a later read dangles — silently, as an empty string. Asserts the emitted
+# C of BOTH emitters (kaic1 and self-hosted kaic2), positive and negative:
+# the dup-wrapped comparator read must exist, the raw one must not.
+test-rboxed-prim-scope: kaic1 kaic2
+	@set -e; \
+	tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; \
+	./stage1/kaic1 examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s1.c; \
+	grep -q 'kai_op_ne_v(kai_internal_dup(kai_ntag)' $$tmp/s1.c \
+	  || { echo "rboxed-prim FAIL kaic1: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
+	if grep -q 'kai_op_ne_v(kai_ntag,' $$tmp/s1.c; then \
+	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
+	fi; \
+	./stage2/kaic2 --path stdlib --backend=c examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
+	grep -q 'kai_op_ne_v(kai_internal_dup(kai_ntag)' $$tmp/s2.c \
+	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
+	if grep -q 'kai_op_ne_v(kai_ntag,' $$tmp/s2.c; then \
+	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
+	fi; \
+	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
 
 # A header-only edit must rebuild every artifact that embeds it, and must not
 # rebuild the ones that do not. Both directions are invisible to CI, which
