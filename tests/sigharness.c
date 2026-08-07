@@ -47,6 +47,55 @@
 
 #define READY_MARKER "ready"
 
+/* Whole-run deadline. A child that never prints "ready" or never
+ * exits after the signal must become an actionable failure, not an
+ * open-ended hang that eats a CI shard's wall clock with no
+ * diagnostic. Override with KAI_SIGHARNESS_TIMEOUT_S. On expiry the
+ * harness reports which phase stalled, SIGKILLs the child, and
+ * exits 124 (the timeout(1) convention). */
+#define DEFAULT_TIMEOUT_S 30
+
+static volatile sig_atomic_t timed_out = 0;
+
+static void on_alarm(int sig) {
+    (void) sig;
+    timed_out = 1;
+}
+
+/* SIGALRM must interrupt read()/waitpid(), so no SA_RESTART. */
+static void arm_deadline(unsigned int secs) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_alarm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(secs);
+}
+
+static int timeout_secs(void) {
+    const char *e = getenv("KAI_SIGHARNESS_TIMEOUT_S");
+    if (e && *e) {
+        int v = atoi(e);
+        if (v > 0) return v;
+    }
+    return DEFAULT_TIMEOUT_S;
+}
+
+/* Report the stalled phase, kill the child hard, reap it, exit 124. */
+static void give_up(pid_t cpid, const char *phase, const char *expected,
+                    const char *got) {
+    fprintf(stderr,
+            "sigharness: TIMEOUT after %ds %s\n"
+            "sigharness:   expected: %s\n"
+            "sigharness:   got:      %s\n"
+            "sigharness: sending SIGKILL to child pid %d\n",
+            timeout_secs(), phase, expected, got, (int) cpid);
+    kill(cpid, SIGKILL);
+    while (waitpid(cpid, NULL, 0) < 0 && errno == EINTR) {}
+    exit(124);
+}
+
 static int signal_for_name(const char *name) {
     if (!strcmp(name, "INT"))  return SIGINT;
     if (!strcmp(name, "TERM")) return SIGTERM;
@@ -102,12 +151,29 @@ int main(int argc, char **argv) {
      * READY_MARKER line is seen — then signal. A small line buffer is
      * enough; the marker is a whole line the fixtures print on its own. */
     close(pipefd[1]);
+    arm_deadline((unsigned int) timeout_secs());
     char    buf[256];
     char    line[512];
     size_t  linelen = 0;
     int     signalled = 0;
     ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+    for (;;) {
+        n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) {
+                if (!timed_out) continue;
+                line[linelen] = '\0';
+                give_up(cpid,
+                        signalled ? "waiting for output after signalling"
+                                  : "waiting for \"" READY_MARKER "\" line",
+                        signalled ? "child output then EOF"
+                                  : "a line reading \"" READY_MARKER "\"",
+                        linelen ? line : "(no partial line)");
+            }
+            perror("read");
+            break;
+        }
+        if (n == 0) break;
         if (forward(buf, n) != 0) { perror("write"); }
         if (signalled) continue;
         for (ssize_t i = 0; i < n && !signalled; i++) {
@@ -132,7 +198,15 @@ int main(int argc, char **argv) {
     close(pipefd[0]);
 
     int status = 0;
-    if (waitpid(cpid, &status, 0) < 0) { perror("waitpid"); return 2; }
+    while (waitpid(cpid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            if (!timed_out) continue;
+            give_up(cpid, "waiting for child to exit after the signal",
+                    "child exit status 0", "child still running");
+        }
+        perror("waitpid");
+        return 2;
+    }
     if (WIFEXITED(status))   return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 1;

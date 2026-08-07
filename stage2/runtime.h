@@ -13644,6 +13644,22 @@ KaiFiber *kai_reactor_signal_waiter = NULL;
 static KaiFiber *kai_reactor_signal_waiter = NULL;
 #endif
 
+/* Signo delivered while no fiber was parked on the Signal waiter
+ * slot. Sticky: the drain stashes it here instead of discarding, and
+ * the next `Signal.await()` consumes it without parking. Without this
+ * slot a signal landing between a subscriber announcing readiness and
+ * its park commit is lost and the waiter sleeps forever — the old
+ * sigwait body never had that window because the kernel queued
+ * blocked signals. Guarded by kai_reactor_mu at N>1. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_signal_pending;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_signal_pending = 0;
+#  endif
+#else
+static int kai_reactor_signal_pending = 0;
+#endif
+
 /* Aggregate count of fibers parked on any reactor structure.
  * kai_sched_park reads this to decide between "no one can wake us
  * up — deadlock" (count == 0) and "block on the reactor until a
@@ -14051,15 +14067,32 @@ static int kai_reactor_filepool_drain(void) {
     return woken;
 }
 
-/* Issue #671 — Phase R4: drain the Signal self-pipe and promote
- * the parked `Signal.await()` waiter (if any). The first byte
- * pulled is the delivered signo; subsequent bytes mean another
- * signal arrived while the first one was still queued — those
- * are discarded under v1's "single waiter, single fire" contract.
- * If no fiber is parked at drain time the signo is also discarded;
- * `signal_await` documents the race (a signal that arrived before
- * the first await call is lost). The matching `kai_reactor_signal_*`
- * design comment in stage0/runtime.h covers the trade-off. */
+/* Wake the parked Signal waiter if a signo is pending. Caller holds
+ * the reactor lock at N>1. Returns 1 if a fiber was promoted. */
+static int kai_reactor_signal_try_wake(void) {
+    if (kai_reactor_signal_pending == 0) return 0;
+    if (!kai_reactor_signal_waiter)      return 0;
+    KaiFiber *f = kai_reactor_signal_waiter;
+    kai_reactor_signal_waiter = NULL;
+    /* Stash the signo in reactor_wait_status so the await handler
+     * can recover it on resume. Re-use of the slot is safe: the
+     * fiber is parked on a singleton waiter, never simultaneously
+     * on a pid / socket waiter. */
+    f->reactor_wait_status = kai_reactor_signal_pending;
+    kai_reactor_signal_pending = 0;
+    kai_reactor_parked_count--;
+    kai_reactor_mark_ready(f);
+    return 1;
+}
+
+/* Drain the Signal self-pipe and promote the parked `Signal.await()`
+ * waiter. Concurrent deliveries collapse to the most recent signo
+ * under v1's "single waiter, single fire" contract. A signo arriving
+ * while no fiber is parked is NOT discarded: it stays in
+ * kai_reactor_signal_pending until the next await consumes it. The
+ * drain can run on a reactor thread between a waiter's "ready"
+ * handshake and its park commit — discarding here strands that
+ * waiter forever. */
 static int kai_reactor_signal_drain(void) {
     if (kai_reactor_signal_pipe[0] < 0) return 0;
     int signo = 0;
@@ -14067,22 +14100,10 @@ static int kai_reactor_signal_drain(void) {
     for (;;) {
         ssize_t n = read(kai_reactor_signal_pipe[0], buf, sizeof(buf));
         if (n <= 0) break;
-        /* Keep the most recent signo from this batch; v1 collapses
-         * concurrent deliveries to one wake. */
         if (n > 0) signo = (int) buf[n - 1];
     }
-    if (signo == 0)                 return 0;
-    if (!kai_reactor_signal_waiter) return 0;
-    KaiFiber *f = kai_reactor_signal_waiter;
-    kai_reactor_signal_waiter = NULL;
-    /* Stash the signo in reactor_wait_status so the await handler
-     * can recover it on resume. Re-use of the slot is safe: the
-     * fiber is parked on a singleton waiter, never simultaneously
-     * on a pid / socket waiter. */
-    f->reactor_wait_status = signo;
-    kai_reactor_parked_count--;
-    kai_reactor_mark_ready(f);
-    return 1;
+    if (signo != 0) kai_reactor_signal_pending = signo;
+    return kai_reactor_signal_try_wake();
 }
 
 /* File-pool worker loop. Pops items off the FIFO queue, runs the
@@ -14346,13 +14367,21 @@ static int kai_reactor_park_signal(KaiFiber *f) {
     if (kai_nthreads > 1) {
         kai_reactor_lock();
         int busy = (kai_reactor_signal_waiter != NULL);
+        int pend = busy ? 0 : kai_reactor_signal_pending;
+        if (pend != 0) kai_reactor_signal_pending = 0;
         kai_reactor_unlock();
         if (busy) return -1;
+        if (pend != 0) { f->reactor_wait_status = pend; return 0; }
         f->pending_park = KAI_PARK_SIGNAL;
         kai_sched_park();
         return 0;
     }
     if (kai_reactor_signal_waiter != NULL) return -1;
+    if (kai_reactor_signal_pending != 0) {
+        f->reactor_wait_status = kai_reactor_signal_pending;
+        kai_reactor_signal_pending = 0;
+        return 0;
+    }
     kai_reactor_signal_waiter = f;
     kai_reactor_parked_count++;
     kai_sched_park();
@@ -14849,6 +14878,10 @@ static void kai_sched_commit_park(KaiFiber *f) {
             break;
     }
     kai_reactor_parked_count++;
+    /* A signo delivered (and drained to `pending`) between the park
+     * request and this commit must wake the waiter now — the byte is
+     * gone from the self-pipe, so no future poll will re-deliver it. */
+    if (reason == KAI_PARK_SIGNAL) kai_reactor_signal_try_wake();
     kai_reactor_unlock();
     kai_reactor_wake();
 }
