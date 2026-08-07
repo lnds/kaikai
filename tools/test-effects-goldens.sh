@@ -22,6 +22,11 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
 
+# kai_corpus_pinned_threads: fixtures whose documented property IS the
+# one-thread cooperative rotation pin KAI_THREADS=1 in a sibling .env;
+# every corpus harness runs them at the pin.
+. "$ROOT/tools/lib/corpus.sh"
+
 TARGET_BACKEND="${TARGET_BACKEND:-c}"
 SKIPS="$ROOT/tools/effects-goldens-skips.txt"
 FIXDIR="examples/effects"
@@ -84,8 +89,10 @@ process_one() {
     return 0
   fi
 
+  local pin
+  pin="$(kai_corpus_pinned_threads "$f")" || pin=""
   rc=0
-  run_with_timeout "$bin" >"$out" 2>"$tmp/${slug}.err" </dev/null || rc=$?
+  run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$bin" >"$out" 2>"$tmp/${slug}.err" </dev/null || rc=$?
   if [ "$rc" != "0" ]; then
     tail -5 "$tmp/${slug}.err" > "$tmp/${slug}.detail"
     report_fail "$f — exit status $rc (want 0); stderr tail:" "$tmp/${slug}.detail"
@@ -117,7 +124,7 @@ results="$tmp/results"
 : > "$failures"
 : > "$results"
 
-export -f process_one run_with_timeout report_fail
+export -f process_one run_with_timeout report_fail kai_corpus_pinned_threads
 export tmp results failures SKIPS KAI TARGET_BACKEND TIMEOUT_CMD RUN_TIMEOUT
 
 for g in "$FIXDIR"/*.out.expected; do
