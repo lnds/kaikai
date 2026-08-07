@@ -297,13 +297,28 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
 
   # Binary / unary operators → a KPrim over their operand atoms. The
   # specific runtime helper is the translator's concern.
-  EBinop(op, a, b)   -> {
-    let ra = lower_expr(a, st)
-    match ra { LRes(av, st1) -> {
-      let rbv = lower_expr(b, st1)
-      match rbv { LRes(bv, st2) -> bind_op(st2, KPrim(binop_prim(op, a), [av, bv]), kpos_of(x)) }
-    } }
-  }
+  #
+  # `and`/`or` are the exception: a KPrim evaluates BOTH operand atoms
+  # before the helper runs, which destroys the short-circuit the surface
+  # language guarantees — `f != 0 and n % f == 0` would divide by zero on
+  # the very path the guard exists to prevent. (The C backend hides this:
+  # it emits a `?:` around the RHS. The native backend calls `kaix_and`,
+  # whose arguments are already materialised.) Route them through the
+  # branch machinery instead: `a and b` is `if a { b } else { false }`,
+  # `a or b` is `if a { true } else { b }`.
+  EBinop(op, a, b)   ->
+    if op == "and" or op == "or" {
+      let lit = mk_typed_bool(op == "or", x)
+      let t_br = if op == "and" { b } else { lit }
+      let e_br = if op == "and" { lit } else { b }
+      lower_if(x, a, t_br, Some(e_br), st)
+    } else {
+      let ra = lower_expr(a, st)
+      match ra { LRes(av, st1) -> {
+        let rbv = lower_expr(b, st1)
+        match rbv { LRes(bv, st2) -> bind_op(st2, KPrim(binop_prim(op, a), [av, bv]), kpos_of(x)) }
+      } }
+    }
   EUnop(op, a)       -> {
     let ra = lower_expr(a, st)
     match ra { LRes(av, st1) -> bind_op(st1, KPrim(unop_prim(op), [av]), kpos_of(x)) }
@@ -1418,6 +1433,11 @@ fn bind_let_as(pat: Pattern, name: String, v: KVal, st: LowerSt) : LowerSt / Con
 # header empties of calls. A non-raw (boxed Bool) condition keeps the boxed
 # path. The `bind_op_slot(SBool)` inside `lower_expr_raw` yields a `KVar` of
 # an `SBool` register; `nemit_condbr` reads the slot to pick its lowering.
+# The constant arm of a short-circuit `and`/`or`, carrying the whole
+# expression's Bool type and position so the join slot types cleanly.
+fn mk_typed_bool(v: Bool, x: Expr) : Expr =
+  Expr { kind: EBool(v), line: x.line, col: x.col, ty: x.ty, mode: MBoxed }
+
 fn lower_if(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console {
   # The condition's reads refine the tcrec pending-release ledger before
   # either branch (and any goto inside one) lowers.

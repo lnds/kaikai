@@ -438,9 +438,38 @@ pub fn op_is_raw_cmp(op: String) : Bool {
 
 # Tier 2.5 M4 — short-circuiting boolean operators. `and` / `or`
 # in kaikai mirror C `&&` / `||` (short-circuit, evaluate left
-# first). Safe to lower as raw when both operands are raw bools.
+# first).
 pub fn op_is_raw_logical(op: String) : Bool {
   op == "and" or op == "or"
+}
+
+# Can the RHS of an `and`/`or` be evaluated unconditionally? Marking the
+# node raw materialises BOTH operands: the C backend still emits `&&`, but
+# the native backend emits `LLVMBuildAnd`, which is strict — so `f != 0 and
+# n % f == 0` divides by zero on the very path the short-circuit exists to
+# protect. Raw is only sound when the RHS cannot fault.
+# Deliberately conservative: anything not obviously total stays boxed and
+# keeps its branch.
+fn rhs_is_trap_free(x: Expr) : Bool = match x.kind {
+  EInt(_, _)         -> true
+  EReal(_, _)        -> true
+  EFixed(_, _)       -> true
+  EChar(_)           -> true
+  EVar(_)            -> true
+  ELitUnit(inner, _) -> rhs_is_trap_free(inner)
+  # `/` and `%` trap on a zero divisor unless the divisor is a nonzero
+  # literal; the other raw binops over raw operands are total.
+  EBinop(op, a, b)   ->
+    rhs_is_trap_free(a) and rhs_is_trap_free(b) and
+    (if op == "/" or op == "%" { is_nonzero_literal(b) } else { true })
+  EUnop(_, a)        -> rhs_is_trap_free(a)
+  _                  -> false
+}
+
+fn is_nonzero_literal(x: Expr) : Bool = match x.kind {
+  EInt(n, _)  -> n != 0
+  EReal(r, _) -> r != 0.0
+  _           -> false
 }
 
 pub fn raw_op_str(op: String) : String {
@@ -617,7 +646,7 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]
         # is a raw `int` (0/1) which the boundary tactic re-boxes
         # via `kai_bool` if a consumer wants `KaiValue *`.
         else if op_is_raw_cmp(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
-        else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) { MUnboxed }
+        else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) and rhs_is_trap_free(b) { MUnboxed }
         else { MBoxed }
       EUnop(op, x) ->
         if op == "-" and child_is_raw(x) { MUnboxed }
