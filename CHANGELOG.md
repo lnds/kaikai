@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.109.0 (2026-08-07)
+
+### Added
+
+- **stdlib**: add non-ASCII case folding for Greek, Cyrillic and Latin-1
+
 ## v0.108.2 (2026-08-07)
 
 ### Fixed
