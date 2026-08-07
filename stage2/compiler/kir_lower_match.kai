@@ -270,8 +270,52 @@ fn lm_field_test_on(sub: Pattern, fv: KVal, ok_lbl: String, fail_lbl: String,
   PLit(lit)                -> lm_field_eq(fv, lm_lit_atom(lit), ok_lbl, fail_lbl, sub, st)
   PVariant(cn, subs)       -> var_seal_ctor_of(cn, subs, fv, ok_lbl, fail_lbl, sub, st)
   PVariantRecord(cn, flds) -> lm_seal_ctor_record(cn, flds, fv, ok_lbl, fail_lbl, sub, st)
+  # A LIST field (`match (xs, ys) { ([x, ...xt], [y, ...yt]) -> … }`, where the
+  # tuple sugar makes each side a `Pair` field) constrains the field's length,
+  # so the test must be emitted or the arm would capture lists of every length.
+  # ONLY the length test belongs here: `fv` is a BORROWED read shared across
+  # the arm chain, and binding names against it would hand Perceus references
+  # it never acquired. The binds run later, in `bind_field_pattern`, off an
+  # owning `kai_op_field`.
+  PList(pats, opt_rest)    -> lm_field_len_test(pats, opt_rest, fv, ok_lbl, fail_lbl, sub, st)
   _                        -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
 }
+
+# The LENGTH constraint of a list-valued record field, and nothing else: walk
+# `is_cons` per element, then `is_nil` when the pattern has no `...rest`.
+# Binds NOTHING — `fv` is borrowed, so a bind here would give Perceus a
+# reference it does not own (a use-after-free once the arm drops it). The
+# element and rest names are bound in `kir_lower_bind` off an owning read.
+fn lm_field_len_test(pats: [Pattern], opt_rest: Option[String], fv: KVal,
+                     ok_lbl: String, fail_lbl: String, sub: Pattern,
+                     st: LowerSt) : LowerSt / Console = match pats {
+  [] -> match opt_rest {
+    Some(_) -> ls_seal(st, KBr(ok_lbl, KNoPos), ok_lbl)
+    None    -> match lm_emit_cell_test(fv, prim_is_nil(), fail_lbl, st) {
+      LMArm(st1, _) -> ls_seal(st1, KBr(ok_lbl, KNoPos), ok_lbl)
+    }
+  }
+  [hp, ...rest] -> match lm_emit_cell_test(fv, prim_is_cons(), fail_lbl, st) {
+    LMArm(st1, _) -> {
+      # An element that discriminates (`['a']`, `[Some(x)]`) needs its own
+      # test: length alone would let this arm capture lists of the right
+      # shape but the wrong contents.
+      let st2 = lm_field_elem_test(hp, fv, fail_lbl, st1)
+      match bind_op(st2, KProj(fv, 1), KAt(sub.line, sub.col)) { LRes(tailv, st3) ->
+        lm_field_len_test(rest, opt_rest, tailv, ok_lbl, fail_lbl, sub, st3) }
+    }
+  }
+}
+
+# The discriminating test of one list element, against the borrowed cell.
+# Reuses the head-test machinery, which reads the element and tests it
+# without binding — the binds happen later off an owning read.
+fn lm_field_elem_test(hp: Pattern, cur: KVal, fail_lbl: String,
+                      st: LowerSt) : LowerSt / Console =
+  if psub_is_discriminating(hp) {
+    match bind_op(st, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st1) ->
+      lm_emit_head_test(hp, headv, fail_lbl, st1) }
+  } else { st }
 
 # `condbr (kai_eq_raw fv lit) ? ok : fail` — a literal field.
 fn lm_field_eq(fv: KVal, lit: KVal, ok_lbl: String, fail_lbl: String,
