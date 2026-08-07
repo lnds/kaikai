@@ -239,19 +239,20 @@ KaiValue *kaix_bit_not(KaiValue *a) {
     return r;
 }
 KaiValue *kaix_bit_shl(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) << kai_intf(b));
+    /* Shifted-out bits wrap (uint64_t compute); count masked `& 63`. */
+    KaiValue *r = kai_int((int64_t)((uint64_t) kai_intf(a) << (kai_intf(b) & 63)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_shr(KaiValue *a, KaiValue *b) {
     /* Arithmetic shift: signed `>>` preserves the sign bit. */
-    KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b));
+    KaiValue *r = kai_int(kai_intf(a) >> (kai_intf(b) & 63));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_ushr(KaiValue *a, KaiValue *b) {
     /* Logical shift: cast through uint64_t to zero-fill. */
-    KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b)));
+    KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> (kai_intf(b) & 63)));
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -261,22 +262,22 @@ KaiValue *kaix_bit_count(KaiValue *a) {
     return r;
 }
 KaiValue *kaix_bit_test(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0);
+    KaiValue *r = kai_bool(((kai_intf(a) >> (kai_intf(b) & 63)) & 1) != 0);
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_set(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b)));
+    KaiValue *r = kai_int(kai_intf(a) | (int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_clear(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b)));
+    KaiValue *r = kai_int(kai_intf(a) & ~(int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
     kai_decref(a); kai_decref(b);
     return r;
 }
 KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b)));
+    KaiValue *r = kai_int(kai_intf(a) ^ (int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -1019,16 +1020,19 @@ KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(k
 KaiValue *kaix_core_bit_or(KaiValue *a, KaiValue *b)   { KaiValue *r = kai_int(kai_intf(a) | kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
 KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
 KaiValue *kaix_core_bit_not(KaiValue *a)               { KaiValue *r = kai_int(~ kai_intf(a)); kai_decref(a); return r; }
-KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) << kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+/* Shift family: shifted-out bits wrap (uint64_t compute, the Int
+   wrapping discipline) and the count is masked `& 63`, so every shift
+   is defined C — mirrors the C backend's inline lowering exactly. */
+KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int((int64_t)((uint64_t) kai_intf(a) << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
 /* Arithmetic shift: signed `>>` preserves the sign bit. */
-KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) >> kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) >> (kai_intf(b) & 63)); kai_decref(a); kai_decref(b); return r; }
 /* Logical shift: cast through uint64_t to zero-fill, back to int64_t. */
-KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
 KaiValue *kaix_core_bit_count(KaiValue *a)             { KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a))); kai_decref(a); return r; }
-KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b) { KaiValue *r = kai_bool(((kai_intf(a) >> kai_intf(b)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b)    { KaiValue *r = kai_int(kai_intf(a) | ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & ~((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
-KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int(kai_intf(a) ^ ((int64_t)1 << kai_intf(b))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b) { KaiValue *r = kai_bool(((kai_intf(a) >> (kai_intf(b) & 63)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b)    { KaiValue *r = kai_int(kai_intf(a) | (int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b)  { KaiValue *r = kai_int(kai_intf(a) & ~(int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int(kai_intf(a) ^ (int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
 
 /* Full core set — anything the compiler (stage 2's own source)
    calls directly when compiled through the LLVM backend. */

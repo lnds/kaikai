@@ -2516,24 +2516,27 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           _ -> "kai_unit() /* bit_not: expected 1 arg */"
         }
       } else if callee == "bit_shl" {
+        # Shifted-out bits wrap (`Int` wrapping discipline, computed in
+        # `uint64_t`); the count is masked to `& 63` so every shift is
+        # defined C. Same discipline across the shift family below.
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int(kai_intf(_a) << kai_intf(_b)); ",
+            "; KaiValue *_r = kai_int((int64_t)((uint64_t) kai_intf(_a) << (kai_intf(_b) & 63))); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_shl: expected 2 args */"
         }
       } else if callee == "bit_shr" {
         # Arithmetic shift: signed `>>` preserves the sign bit. The
-        # spec'd contrast with `bit_ushr` rests on `kai_intf(_a)` staying
+        # contrast with `bit_ushr` rests on `kai_intf(_a)` staying
         # `int64_t`.
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int(kai_intf(_a) >> kai_intf(_b)); ",
+            "; KaiValue *_r = kai_int(kai_intf(_a) >> (kai_intf(_b) & 63)); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_shr: expected 2 args */"
@@ -2545,7 +2548,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int((int64_t)(((uint64_t) kai_intf(_a)) >> kai_intf(_b))); ",
+            "; KaiValue *_r = kai_int((int64_t)(((uint64_t) kai_intf(_a)) >> (kai_intf(_b) & 63))); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_ushr: expected 2 args */"
@@ -2567,7 +2570,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_bool(((kai_intf(_a) >> kai_intf(_b)) & 1) != 0); ",
+            "; KaiValue *_r = kai_bool(((kai_intf(_a) >> (kai_intf(_b) & 63)) & 1) != 0); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_test: expected 2 args */"
@@ -2577,7 +2580,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int(kai_intf(_a) | ((int64_t)1 << kai_intf(_b))); ",
+            "; KaiValue *_r = kai_int(kai_intf(_a) | (int64_t)((uint64_t)1 << (kai_intf(_b) & 63))); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_set: expected 2 args */"
@@ -2587,7 +2590,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int(kai_intf(_a) & ~((int64_t)1 << kai_intf(_b))); ",
+            "; KaiValue *_r = kai_int(kai_intf(_a) & ~(int64_t)((uint64_t)1 << (kai_intf(_b) & 63))); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_clear: expected 2 args */"
@@ -2597,7 +2600,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
             "; KaiValue *_b = ", emit_expr(src, b, cx),
-            "; KaiValue *_r = kai_int(kai_intf(_a) ^ ((int64_t)1 << kai_intf(_b))); ",
+            "; KaiValue *_r = kai_int(kai_intf(_a) ^ (int64_t)((uint64_t)1 << (kai_intf(_b) & 63))); ",
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_toggle: expected 2 args */"
@@ -6839,28 +6842,19 @@ fn unbox_boxed_scalar(boxed: String, opt_ty: Option[Ty]) : String {
   }
 }
 
-# Issue #90 — unroll `b ^ n` into `n` repeated multiplications.
-# Caller has already gated `n` to `[0, 64]` and `base_c` is a pure
-# raw C expression (literal / EVar / pure raw arith). For `n == 0`
-# the result is `1` (matches `kai_op_pow_int`). For `n == 1`,
-# emit just `(base_c)`. For `n >= 2`, emit `((base_c)*(base_c)*…)`
-# with `n` factors. Squaring would emit fewer factors but produces
-# the same constant-folded code under any optimizer; the linear
-# form keeps the emitted IR easy to grep for in regression tests.
-
-# Issue #90 — unroll `b ^ n` into `n` repeated multiplications.
-# Caller has already gated `n` to `[0, 64]` and `base_c` is a pure
-# raw C expression (literal / EVar / pure raw arith). For `n == 0`
-# the result is `1` (matches `kai_op_pow_int`). For `n == 1`,
-# emit just `(base_c)`. For `n >= 2`, emit `((base_c)*(base_c)*…)`
-# with `n` factors. Squaring would emit fewer factors but produces
-# the same constant-folded code under any optimizer; the linear
-# form keeps the emitted IR easy to grep for in regression tests.
+# Unroll `b ^ n` into `n` repeated multiplications. Caller has already
+# gated `n` to `[0, 64]` and `base_c` is a pure raw C expression
+# (literal / EVar / pure raw arith), so duplication is safe. Only the
+# non-fixed-width Int shape reaches here. The factors multiply in
+# `uint64_t` and cast back so an overflowing power wraps (defined C)
+# like the sibling `*`. Squaring would emit fewer factors but produces
+# the same constant-folded code under any optimizer; the linear form
+# keeps the emitted IR easy to grep for in regression tests.
 fn emit_pow_unroll(base_c: String, n: Int) : String {
   match n {
     0 -> "1LL"
     1 -> cat3("(", base_c, ")")
-    _ -> cat3("(", emit_pow_unroll_loop(base_c, n, ""), ")")
+    _ -> cat3("((int64_t)(", emit_pow_unroll_loop(base_c, n, ""), "))")
   }
 }
 
@@ -6868,12 +6862,12 @@ fn emit_pow_unroll_loop(base_c: String, k: Int, acc: String) : String {
   match k {
     0 -> acc
     1 -> {
-      if acc == "" { cat3("(", base_c, ")") }
-      else { concat_all([acc, " * (", base_c, ")"]) }
+      if acc == "" { cat3("(uint64_t)(", base_c, ")") }
+      else { concat_all([acc, " * (uint64_t)(", base_c, ")"]) }
     }
     _ -> {
-      let next = if acc == "" { cat3("(", base_c, ")") }
-                 else { concat_all([acc, " * (", base_c, ")"]) }
+      let next = if acc == "" { cat3("(uint64_t)(", base_c, ")") }
+                 else { concat_all([acc, " * (uint64_t)(", base_c, ")"]) }
       emit_pow_unroll_loop(base_c, k - 1, next)
     }
   }
@@ -6939,7 +6933,17 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
       }
     EUnop(op, inner) ->
       if op == "-" {
-        cat3("(-", emit_expr_raw(src, inner, cx), ")")
+        # Integer negation wraps (`-Int.MIN` is `Int.MIN`): compute in
+        # the unsigned width and cast back, like the wrapping binops.
+        # Real keeps the plain form.
+        if ty_opt_is_int(x.ty) or ty_opt_is_fixed_width(x.ty) {
+          let st = raw_signed_c_type(x.ty)
+          let ut = raw_unsigned_c_type(x.ty)
+          concat_all(["((", st, ")(0 - (", ut, ")(",
+                      emit_expr_raw(src, inner, cx), ")))"])
+        } else {
+          cat3("(-", emit_expr_raw(src, inner, cx), ")")
+        }
       } else if op == "not" {
         cat3("(!", emit_expr_raw(src, inner, cx), ")")
       } else {
