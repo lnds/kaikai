@@ -24,6 +24,20 @@ The honesty claims are all met for emitted user programs:
 - **Tier 1 #3 "mandatory TCO"** — honest for emitted programs (C
   backend; see the TCO section below for the bootstrap-chain and LLVM
   caveats that survive).
+- **RC-corruption detection covers BOTH backends** (2026-08-06). The
+  directed `rc-detector` gate (ASAN + no-cell-pool + strict ledger) runs
+  per RC-path PR on both backends; the full golden corpus (320 fixtures,
+  `examples/perceus` + `examples/effects`) is additionally censused on
+  the **native** backend — the default users run — under ASAN +
+  no-cell-pool with the runtime cc-compiled so ASAN instruments it
+  (`tools/rc-native-census.sh`, daily cron `rc-native-census.yml`).
+  First census: **zero RC corruption on native** across the corpus; the
+  only sanitizer hit is arithmetic UB (#1639, native mirror of #1637),
+  and the C backend's live nested-reuse UAF (#1636) does **not**
+  reproduce on native. Coverage caveat: the LLVM-emitted program object
+  is not ASAN-instrumented — detection rides the instrumented runtime
+  ops plus the malloc/free interceptors, so an emitted-code stale *read*
+  that never crosses the runtime can still hide.
 
 > **v1 status (2026-06-17):** the block below is the **2026-06-07 LLVM-text
 > backend** snapshot (`--emit=llvm`, a flag that no longer exists). That
