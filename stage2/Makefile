@@ -8409,11 +8409,13 @@ test-issue-978-spawn-parent-handled-effect: $(TARGET) build
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_978_spawn_parent_handled_effect.kai > build/iss978.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss978.c -o build/iss978 $(LDLIBS_M); \
-	rc=0; ./build/iss978 > build/iss978.out 2>&1 || rc=$$?; \
-	[ $$rc -eq 1 ] || { echo "issue-978 FAIL (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss978.out; exit 1; }; \
+	rc=0; ./build/iss978 > build/iss978.out 2> build/iss978.err || rc=$$?; \
+	[ $$rc -eq 1 ] || { echo "issue-978 FAIL (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss978.out build/iss978.err; exit 1; }; \
 	diff -q ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out > /dev/null \
+	  || { echo "issue-978 DIFF (stdout)"; diff ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out; exit 1; }; \
+	grep -q "kai: effect not handled in fiber: Note" build/iss978.err \
 	  && echo "issue-978 OK (spawned fiber's parent-handled effect reports clean diagnostic, not a segfault)" \
-	  || { echo "issue-978 DIFF"; diff ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out; exit 1; }
+	  || { echo "issue-978 FAIL (diagnostic missing on stderr)"; cat build/iss978.err; exit 1; }
 
 # Issue #1051 — a fiber spawned inside a nursery performs a BUILTIN effect with
 # a stdlib default block (`Log`, `Env`) whose handler is installed in the PARENT
@@ -8589,11 +8591,13 @@ test-issue-997-spawn-cell-fiber-local: $(TARGET) build
 	done; \
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/issue_997_spawn_cell_runtime_floor.kai > build/iss997rf.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss997rf.c -o build/iss997rf $(LDLIBS_M); \
-	rc=0; ./build/iss997rf > build/iss997rf.out 2>&1 || rc=$$?; \
-	[ $$rc -eq 1 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss997rf.out; exit 1; }; \
+	rc=0; ./build/iss997rf > build/iss997rf.out 2> build/iss997rf.err || rc=$$?; \
+	[ $$rc -eq 1 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss997rf.out build/iss997rf.err; exit 1; }; \
 	diff -q ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out > /dev/null \
+	  || { echo "issue-997 DIFF runtime_floor (stdout)"; diff ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out; exit 1; }; \
+	grep -q "kai: capability not reachable in this fiber: counter" build/iss997rf.err \
 	  && echo "issue-997 OK runtime_floor (unreachable cell reports clean diagnostic, not a segfault)" \
-	  || { echo "issue-997 DIFF runtime_floor"; diff ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out; exit 1; }; \
+	  || { echo "issue-997 FAIL runtime_floor (diagnostic missing on stderr)"; cat build/iss997rf.err; exit 1; }; \
 	for name in issue_997_spawn_inner_cell_ok issue_997_spawn_no_cell_ok issue_997_spawn_shadowed_cell_ok; do \
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
