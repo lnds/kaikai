@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.108.2 (2026-08-07)
+
+### Fixed
+
+- **kir**: keep and/or short-circuiting on the native backend
+
 ## v0.108.1 (2026-08-07)
 
 ### Fixed
