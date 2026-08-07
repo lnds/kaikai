@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.108.1 (2026-08-07)
+
+### Fixed
+
+- **native**: fold the backend tag into the core-object cache key (closes #1641) (#1649)
+- **tools**: stop rc-detector claiming both backends after a C-only run (#1651)
+- **perceus**: gate move-on-every-use sets on the global max-path, not per arm (#1653)
+- **perceus**: keep RC-string prim results in stage 1's Perceus scope (#1650)
+- **runtime**: stop dropping signals delivered before Signal.await parks (#1652)
+- **emit**: make the full Int operator family defined-wrapping on both backends (#1644)
+- **perceus**: keep the live inner cell in shared-donor nested reuse (#1642)
+- **runtime**: stop RC diagnostic modes corrupting the heap on small variant blocks (#1638)
+
 ## v0.108.0 (2026-08-05)
 
 ### Added
