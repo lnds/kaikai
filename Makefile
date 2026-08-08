@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -187,8 +187,8 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
+tier0: selfhost test-kai-namespace demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
 
 # kaic1 must reject every `examples/negative/stage1_rejections/*.kai`
 # with the diagnostic its `.kaic1.err.expected` pins. Bootstrap-only
@@ -213,12 +213,34 @@ test-rboxed-prim-scope: kaic1 kaic2
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	./stage2/kaic2 --path stdlib --backend=c examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
-	grep -q 'kai_op_ne_v(kai_internal_dup(kai_ntag)' $$tmp/s2.c \
+	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag)' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
-	if grep -q 'kai_op_ne_v(kai_ntag,' $$tmp/s2.c; then \
+	if grep -q 'kai_op_ne_v(kaiv_ntag,' $$tmp/s2.c; then \
 	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
+
+# C-emission namespace gate. User identifiers ride their own namespaces
+# (`kaiu_` fns, `kaiv_` locals), so every `kai_*` token in kaic2-emitted C
+# must be a name runtime.h itself contains. A binder that leaks into `kai_*`
+# with a runtime helper's name breaks the selfhost cc build; this catches
+# the rest of the class — any leak, colliding or not — over the compiler's
+# own thousands of binders. The reverse check keeps future runtime helpers
+# out of the user namespaces, so no waived case can silently reopen.
+# String literals are stripped first: the compiler's own strings name the
+# kai_* symbols it emits, which would read as false leaks.
+test-kai-namespace: kaic2
+	@set -e; \
+	tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; \
+	( cd stage2 && ./kaic2 main.kai ) > $$tmp/self.c; \
+	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/self.c \
+	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/emitted.txt; \
+	tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
+	leaks=$$(comm -23 $$tmp/emitted.txt $$tmp/runtime.txt); \
+	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: user-derived identifiers emitted into the runtime kai_ namespace:"; echo "$$leaks"; exit 1; }; \
+	rev=$$(tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^(kaiu_|kaiv_)' | sort -u); \
+	[ -z "$$rev" ] || { echo "test-kai-namespace FAIL: runtime.h names symbols inside the user namespaces:"; echo "$$rev"; exit 1; }; \
+	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_"
 
 # A header-only edit must rebuild every artifact that embeds it, and must not
 # rebuild the ones that do not. Both directions are invisible to CI, which
