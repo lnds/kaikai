@@ -30,26 +30,22 @@
 #
 # The dumper is structural and exhaustive over Expr/Pattern/TypeExpr/
 # Decl — no catch-all arm — so it discriminates far more than a token
-# diff. But it is a PROXY, not a structural equality on the AST type,
-# and three slots are dropped by the dumper itself:
-#
-#   * `TyRefine(base, _)`  — the where-predicate is not printed, so a
-#     rewrite confined to a refinement predicate is invisible to (c).
-#     Property (d) is the net that covers that region (it is how
-#     #1603 shows up).
-#   * `DDoc(_, _, inner, ...)` — the `#[doc]` text is not printed, so
-#     corruption of a doc string is invisible to (c).
-#   * `ELambda` prints only each param's NAME, not its annotation.
+# diff. It dumps the PRE-LOWERING AST (before `surface_lower_decls`),
+# so parse-time surface fidelity is inside its view: tparam bounds,
+# block-lambda spellings, contract clauses, refinement predicates,
+# `#[doc]` text and lambda param annotations all print, and losing any
+# of them in the writer is a (c) failure. (The dumper once dropped the
+# last three and dumped post-lowering decls; both holes let a writer
+# lose a form invisibly, which is how a tparam bound could vanish with
+# every property green.)
 #
 # Comments are not in the AST at all, so (c) cannot see a comment being
-# re-attached to the wrong element (#1597) directly — it sees it only
+# re-attached to the wrong element directly — it sees it only
 # when the move also perturbs structure. That is a real limit of any
 # AST-level check and is why (c) does not retire the golden fixtures:
 # goldens remain the only net over comment placement and layout.
-#
-# Widening the dumper to close the three slots above would strengthen
-# this gate; it is deliberately NOT done here, because changing --ast
-# output is a change to a debugging surface other tests read.
+# Consumers of `--ast` outside this harness are exit-0 smokes and
+# positive `grep -q` marker checks, so widening the dump is safe.
 #
 # ---------------------------------------------------------------
 # Exception list
