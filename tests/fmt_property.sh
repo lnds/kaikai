@@ -9,16 +9,31 @@
 # that emits an internal binder name, passes both nets and still
 # corrupts the user's file — silently, in place.
 #
-# For every source in the corpus this gate asserts four properties:
+# For every source in the corpus this gate asserts five properties:
 #
 #   (a) exit 0        — fmt does not refuse the file
 #   (b) re-parse      — fmt's output is still valid kaikai
 #   (c) AST equality  — parse(fmt(src)) == parse(src), modulo positions
 #   (d) idempotency   — fmt(fmt(x)) == fmt(x)
+#   (e) spelling      — fmt prints no identifier the source does not
+#                       contain
 #
 # (b) is what catches a writer emitting internal syntax; (c) is what
 # catches a writer that produces parseable but DIFFERENT code; (d) is
 # what catches a writer with no fixed point.
+#
+# (e) is the net over the parser itself: (c) compares two parse trees,
+# so a parser that DESUGARS a form in place (tuple sugar to `Pair {
+# fst: .. }`, a map literal to `map.from(..)`) fools it — both sides
+# carry the lowered shape and the author's spelling is already gone.
+# Every parse-time rewrite of that kind synthesizes identifiers the
+# author never wrote (`Pair`, `fst`, `map`, a `__gensym__`), and the
+# writer then prints them. (e) word-diffs fmt's output against the
+# source: any identifier fmt emits that the source nowhere contains
+# fails the file. A new sugar lowered in the parser without a surface
+# wrapper therefore fails (e) on its first fixture — it cannot land
+# silently; it either carries a wrapper or a KNOWN_SYNTH entry citing
+# an open issue.
 #
 # ---------------------------------------------------------------
 # What (c) actually compares — and what it does not
@@ -97,6 +112,57 @@ KNOWN_AST="
 
 # (d) idempotency — no fixed point in one pass.
 KNOWN_IDEMPOTENT="
+"
+
+# (e) spelling — fmt prints identifiers the source does not contain
+# (a parse-time desugar with no surface wrapper). One entry per file,
+# each tagged with the open issue for its sugar family.
+KNOWN_SYNTH="
+# refs #1683 — multi-arg match / case-block desugar
+examples/effects/m7d_27_multi_arg_match.kai
+examples/match/multi_arg_basic.kai
+examples/perceus/native_dead_donor_reuse_995.kai
+examples/perceus/native_shared_reuse_corruption_995.kai
+examples/sugars/case_block_multi_arg.kai
+examples/sugars/case_block_recursive_list.kai
+examples/sugars/case_block_single_arg.kai
+examples/sugars/case_block_with_guard.kai
+examples/tco/param_shadow_rebind.kai
+examples/unions/issue_430_multiclause_upcast_first_arm_narrower.kai
+# refs #1684 — map/set literal lowering
+examples/stdlib/map_set_eq_order.kai
+examples/sugars/coll_literal_map.kai
+examples/sugars/coll_literal_set.kai
+examples/sugars/coll_literal_spread.kai
+# refs #1685 — Ref sugar lowering
+examples/sugars/loop/issue_285_ref_in_until.kai
+examples/sugars/loop/issue_285_ref_in_while.kai
+examples/sugars/ref_amp_make.kai
+examples/sugars/ref_deref_field.kai
+examples/sugars/ref_field_assign.kai
+examples/sugars/ref_sugar_basic.kai
+examples/sugars/ref_sugar_cross_fn.kai
+examples/sugars/ref_sugar_mixed_with_var.kai
+# refs #1686 — record spread/positional sentinel fields
+examples/records/spread_all_overridden.kai
+examples/records/spread_basic.kai
+examples/records/spread_no_override.kai
+examples/records/spread_type_mismatch.kai
+examples/sugars/positional_record_arity.kai
+examples/sugars/positional_record_basic.kai
+# refs #1687 — placeholder / pipe gensyms
+examples/stdlib/list_pipeline.kai
+examples/sugars/m7d_21_pipe_placeholder_basic.kai
+examples/sugars/m7d_21_pipe_placeholder_evaluates_once.kai
+examples/sugars/point_free_method_not_found_neg.kai
+examples/sugars/point_free_method_ufcs.kai
+# refs #1688 — BigInt literal lowering
+examples/numeric/bigint_literal.kai
+# refs #1689 — row holes
+examples/sugars/effect_holes_json_basic.kai
+examples/sugars/row_hole_basic.kai
+# refs #1690 — arm-narrowing guard desugar
+examples/sugars/m12_6_match_arm_narrow.kai
 "
 
 if [ ! -x "$KAIC2" ]; then
@@ -400,6 +466,30 @@ check_one() {
   fi
   if in_list "$rel" "$KNOWN_IDEMPOTENT"; then
     echo "  STALE $rel — listed in KNOWN_IDEMPOTENT but (d) now passes; remove the entry" >> "$failures"
+    printf 'S' >> "$results"
+    rm -f "$p1" "$p2"
+    return 0
+  fi
+
+  # (e) spelling fidelity: every identifier fmt printed must occur
+  # somewhere in the source text. A miss means the parser rewrote a
+  # surface form and the writer printed the lowered shape.
+  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$p1" | sort -u > "$b.wf"
+  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$abs" | sort -u > "$b.ws"
+  synth="$(comm -23 "$b.wf" "$b.ws")"
+  if [ -n "$synth" ]; then
+    if in_list "$rel" "$KNOWN_SYNTH"; then
+      printf 'E' >> "$results"
+    else
+      { echo "  FAIL $rel — (e) fmt printed identifiers the source never spells:"
+        echo "$synth" | head -10 | sed 's/^/      /'; } >> "$failures"
+      printf 'F' >> "$results"
+    fi
+    rm -f "$p1" "$p2"
+    return 0
+  fi
+  if in_list "$rel" "$KNOWN_SYNTH"; then
+    echo "  STALE $rel — listed in KNOWN_SYNTH but (e) now passes; remove the entry" >> "$failures"
     printf 'S' >> "$results"
     rm -f "$p1" "$p2"
     return 0
