@@ -749,8 +749,10 @@ test-modules-uom-privacy: $(TARGET) build
 # one category (values / const attribution / types / effects /
 # protocols / pub-signature leak) exercised across every reference
 # position; the positive directory asserts pub symbols keep working
-# in all of them. Same harness contract as test-modules-uom-privacy.
-PRIVM_POS_DIRS := privacy_matrix_positive
+# in all of them, and the tyvars directory asserts a habitant named
+# like a signature-bound type variable never captures its references.
+# Same harness contract as test-modules-uom-privacy.
+PRIVM_POS_DIRS := privacy_matrix_positive privacy_matrix_tyvars
 PRIVM_NEG_DIRS := privacy_matrix_values privacy_matrix_const privacy_matrix_types privacy_matrix_effects privacy_matrix_protocols privacy_matrix_leak
 test-modules-privacy-matrix: $(TARGET) build
 	@set -e; \
