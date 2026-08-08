@@ -88,6 +88,23 @@ parses as `f(a + b)`, and `xs | g | h` parses as `(xs | g) | h`.
 Comparisons are NON-ASSOCIATIVE: `a < b < c` is a syntax error
 (use `a < b and b < c`).
 
+With named stages that grouping is invisible. With LAMBDA stages it
+decides scope: a lambda stage does NOT open a scope for the stages
+that follow it, so the next lambda is its SIBLING, not its body.
+
+```kaikai-neg
+fn grid() : [[Int]] = [0..2] | (r) => [0..2] | (c) => r * 10 + c
+#                                                     ^ cannot find `r`
+```
+
+`(c) => …` is a stage of the OUTER pipe, so `r` was never in scope.
+Parenthesise to nest the inner pipe inside the outer lambda:
+
+```kaikai-snippet
+[0..2] | (r) => ([0..2] | (c) => r * 10 + c)
+# [[0, 1, 2], [10, 11, 12], [20, 21, 22]]
+```
+
 ## NOT IN KAIKAI
 
 - `|>` from F# meaning the same thing — close but in F# it is
