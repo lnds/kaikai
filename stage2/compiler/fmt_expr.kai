@@ -491,6 +491,108 @@ fn fmt_surface(sf: SurfaceForm, e: Expr, s: FmtSt) : FmtSt = match sf {
     }
   }
   SfContract(_, _, _) -> panic("kai fmt: contract clauses outside a fn body")
+  SfLamBlock(lam, trailing) -> fmt_lam_block(lam, trailing, s)
+}
+
+# A lambda the author wrote as a block: `{ body }`, `{ params -> body }`,
+# or `{ pat -> body }` (the destructuring form, recovered from its
+# synthetic single-arm match). Prints on one line when the source kept
+# the body on the `{`'s own line; expands otherwise. A zero-arity block
+# in plain expression position keeps its `->` — without it the braces
+# re-parse as an ordinary block, not a lambda.
+fn fmt_lam_block(lam: Expr, trailing: Bool, s: FmtSt) : FmtSt = match lam.kind {
+  ELambda(params, body) -> match lam_block_wrap_arm(params, body) {
+    # The head parses back only when it opens with `(`: a tuple prints
+    # element-wise, anything else prints paren-grouped (`(Some(n))`).
+    Some(Arm(pat, _, abody)) -> {
+      let s1 = fmt_emit(s, "{ (")
+      let s2 = match lam_block_tuple_pats(pat) {
+        Some(sub_pats) -> fmt_lam_block_tuple(sub_pats, s1)
+        None           -> fmt_pat(pat, s1)
+      }
+      let s3 = fmt_emit(s2, ") ->")
+      fmt_lam_block_body(abody, lam.line, s3)
+    }
+    None -> match params {
+      [] -> {
+        let s1 = if trailing { fmt_emit(s, "{") } else { fmt_emit(s, "{ ->") }
+        fmt_lam_block_body(body, lam.line, s1)
+      }
+      _  -> {
+        let names = map(params, (pm) => pm.pname)
+        let s1 = fmt_emit(s, concat_all(["{ ", string_join(names, ", "), " ->"]))
+        fmt_lam_block_body(body, lam.line, s1)
+      }
+    }
+  }
+  _ -> fmt_expr(lam, s)
+}
+
+# The synthetic shape `finish_block_lambda` builds for `{ pat -> body }`:
+# a fresh position-keyed binder matched by a single irrefutable arm.
+fn lam_block_wrap_arm(params: [Param], body: Expr) : Option[Arm] = match params {
+  [pm] -> match body.kind {
+    EMatch(scrut, arms) -> match arms {
+      [Arm(pat, None, abody)] -> match scrut.kind {
+        EVar(n) ->
+          if n == pm.pname and n == lam_pat_binder_name(pat.line, pat.col) {
+            Some(Arm(pat, None, abody))
+          } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+# A block-lambda wrap pattern always came from `( ... )`, i.e. the
+# tuple sugar — a Pair/Triple/Quad variant-record with positional
+# fields. Recover the element patterns so the head prints as the
+# tuple the grammar accepts.
+fn lam_block_tuple_pats(pat: Pattern) : Option[[Pattern]] = match pat.pkind {
+  PVariantRecord(name, fields) ->
+    if name == "Pair" or name == "Triple" or name == "Quad" {
+      Some(map(fields, (f) => match f { PField(_, sub, _) -> sub }))
+    } else { None }
+  _ -> None
+}
+
+fn fmt_lam_block_tuple(pats: [Pattern], s: FmtSt) : FmtSt = match pats {
+  [] -> s
+  [p] -> fmt_pat(p, s)
+  [p, ...rest] -> fmt_lam_block_tuple(rest, fmt_emit(fmt_pat(p, s), ", "))
+}
+
+# Body of a block lambda, after the `{` (and optional `params ->`)
+# prefix. One line only when the whole body sat on the `{`'s source
+# line — a single tail expression or a single statement.
+fn fmt_lam_block_body(body: Expr, headline: Int, s: FmtSt) : FmtSt = match body.kind {
+  EBlock(stmts, tail) -> match stmts {
+    [] -> match tail {
+      Some(t) ->
+        if t.line == headline {
+          fmt_emit(fmt_expr(t, fmt_emit(s, " ")), " }")
+        } else { fmt_lam_block_expand(stmts, tail, s) }
+      None -> fmt_emit(s, " }")
+    }
+    [st] -> match tail {
+      None ->
+        if stmt_line(st) == headline {
+          fmt_emit(fmt_stmt(st, fmt_emit(s, " ")), " }")
+        } else { fmt_lam_block_expand(stmts, tail, s) }
+      Some(_) -> fmt_lam_block_expand(stmts, tail, s)
+    }
+    _ -> fmt_lam_block_expand(stmts, tail, s)
+  }
+  _ -> fmt_emit(fmt_expr(body, fmt_emit(s, " ")), " }")
+}
+
+fn fmt_lam_block_expand(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
+  let s1 = fmt_indent_in(fmt_newline(s))
+  let s2 = fmt_block_inner(stmts, tail, s1)
+  fmt_emit(fmt_indent_out(s2), "}")
 }
 
 # Atomic-or-paren wrapper: if `e` would print as a non-atomic
@@ -531,18 +633,60 @@ pub fn expr_is_atomic(e: Expr) : Bool {
     ERecordLit(_, _) -> true
     EList(_) -> true
     EBlock(_, _) -> true
-    ERange(_, _, _) -> 
+    ERange(_, _, _) ->
     # `[lo..hi]` form prints as a self-bounded literal, no paren needed.
     true
+    # A block lambda prints as its own `{ ... }` delimiters.
+    ESurface(sf) -> match sf { SfLamBlock(_, _) -> true  _ -> false }
     _ -> false
   }
 }
 
 pub fn fmt_call(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt {
-  let s1 = fmt_expr_atom(callee, s)
-  let s2 = fmt_emit(s1, "(")
-  let s3 = fmt_call_args(call_args, s2)
-  fmt_emit(s3, ")")
+  let n_trail = fmt_count_trailing(call_args, 0)
+  if n_trail == 0 {
+    let s1 = fmt_expr_atom(callee, s)
+    let s2 = fmt_emit(s1, "(")
+    let s3 = fmt_call_args(call_args, s2)
+    fmt_emit(s3, ")")
+  } else {
+    let n_lead = list_length(call_args) - n_trail
+    let s1 = fmt_expr_atom(callee, s)
+    let s2 = if n_lead == 0 { s1 } else {
+      let a = fmt_emit(s1, "(")
+      let b = fmt_call_args(fmt_args_take(call_args, n_lead), a)
+      fmt_emit(b, ")")
+    }
+    fmt_trailing_blocks(fmt_args_drop(call_args, n_lead), s2)
+  }
+}
+
+# Length of the suffix of args that were written as trailing blocks
+# (`f(a) { ... } { ... }`); at most two by the grammar. A run counter:
+# an interior block arg (`f({ x -> x }, y)`) resets it.
+fn fmt_count_trailing(args: [Expr], run: Int) : Int = match args {
+  [] -> run
+  [a, ...rest] -> fmt_count_trailing(rest, match a.kind {
+    ESurface(sf) -> match sf { SfLamBlock(_, true) -> run + 1  _ -> 0 }
+    _ -> 0
+  })
+}
+
+fn fmt_args_take(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { [] } else { match args {
+    [] -> []
+    [a, ...rest] -> [a, ...fmt_args_take(rest, n - 1)]
+  } }
+
+fn fmt_args_drop(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { args } else { match args {
+    [] -> []
+    [_, ...rest] -> fmt_args_drop(rest, n - 1)
+  } }
+
+fn fmt_trailing_blocks(blocks: [Expr], s: FmtSt) : FmtSt = match blocks {
+  [] -> s
+  [b, ...rest] -> fmt_trailing_blocks(rest, fmt_expr(b, fmt_emit(s, " ")))
 }
 
 # The surface literal a call node stands for, when the call is one the
@@ -645,6 +789,7 @@ fn fmt_stmt_head_expr(e: Expr, s: FmtSt) : FmtSt {
 fn fmt_head_is_record_lit(e: Expr) : Bool = match e.kind {
   ERecordLit(_, _)   -> true
   EBlock(_, _)       -> true
+  ESurface(sf)       -> match sf { SfLamBlock(_, _) -> true  _ -> false }
   EField(obj, _)     -> fmt_head_is_record_lit(obj)
   EIndex(obj, _)     -> fmt_head_is_record_lit(obj)
   ECall(callee, _)   -> fmt_head_is_record_lit(callee)
