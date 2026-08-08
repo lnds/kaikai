@@ -362,6 +362,38 @@ fn main() : Unit / Stdout = Stdout.print("#{imin(3, 8)}")
 Rust-style `///` / `//!` doc comments do not exist — `#[doc]` is the
 only form.
 
+## Map over HashMap when the result is compared
+
+Both are associative containers, and the naming maps onto languages
+where `Map` IS a hash map — so the default carried in from elsewhere is
+usually the wrong one here. The property that decides is not speed:
+
+- **`Map` / `Set` are AVL-backed.** They iterate in key order and
+  compare structurally, so two equal maps behave the same wherever
+  they came from. Reach for them when the result is compared,
+  printed, hashed, or serialised.
+- **`HashMap` / `HashSet` are hash tables.** `O(1)`-average access,
+  and they ride `Mutable`. Reach for them when a hot loop needs
+  lookups and nothing downstream depends on order.
+
+`.to_map()` freezes a `HashMap` once the fast build is done and the
+deterministic result is what escapes.
+
+```kaikai
+import collections.map
+
+fn main() : Unit / Stdout = {
+  let a = %{ "one": 1, "fish": 4, "two": 1 }
+  let b = %{ "two": 1, "fish": 4, "one": 1 }
+  Stdout.print("#{a == b}")           # true — insertion order does not matter
+  Stdout.print("#{map.keys(a)}")      # [fish, one, two] — ascending, always
+}
+```
+
+Returning an association from a public function: `Map` when the
+caller looks values up, sorted `[Pair[k, v]]` when the caller compares
+the whole result against an expectation.
+
 ## False friends — you might write X, in kaikai write Z
 
 These are the reaches an agent makes from another language. Each
