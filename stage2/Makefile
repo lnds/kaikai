@@ -4844,9 +4844,9 @@ test-unbox-phase2: $(TARGET) build
 	@grep -F -q 'int64_t kair_n = 42LL' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c \
 	  || { echo "unbox FAIL r8_let_in_interp (kair_n not unboxed — desugar_interp regressed?)"; exit 1; }
-	@if grep -F -q 'KaiValue *kai_n = kai_int(42LL)' \
+	@if grep -F -q 'KaiValue *kaiv_n = kai_int(42LL)' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
-	  echo "unbox FAIL r8_let_in_interp (boxed kai_n re-appeared; obsolete demote returned)"; exit 1; \
+	  echo "unbox FAIL r8_let_in_interp (boxed kaiv_n re-appeared; obsolete demote returned)"; exit 1; \
 	fi
 	@# Issue #90 — `^` (integer power) and integer division on raw
 	@# operands must inline. The C emit unrolls `b ^ n` into
@@ -7492,7 +7492,7 @@ test-shape-fusion-1200: $(TARGET) build
 	  || { echo "shape-fusion-1200 FAIL (kaic2 errored)"; exit 1; }; \
 	grep -q 'kai___pimpl_Sequence_Chain_foldl' build/s2-$$name.c \
 	  || { echo "shape-fusion-1200 FAIL (impl foldl not called — pipe did not dispatch)"; exit 1; }; \
-	if grep 'kai_build(100LL' build/s2-$$name.c | grep -q 'kai___pimpl_Sequence_Chain_map('; then \
+	if grep 'kaiu_build(100LL' build/s2-$$name.c | grep -q 'kaiu___pimpl_Sequence_Chain_map('; then \
 	  echo "shape-fusion-1200 FAIL (mapped chain materialised — not fused)"; exit 1; fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -7835,7 +7835,7 @@ test-perceus-1069-projection-reuse: $(TARGET) build
 	diff -q $$exp build/s2-1069proj-n.out > /dev/null \
 	  || { echo "perceus-1069-projection-reuse FAIL (native output diff — original corrupted)"; diff $$exp build/s2-1069proj-n.out; exit 1; }; \
 	./$(TARGET) --path ../stdlib $$src > build/s2-1069proj.c; \
-	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kai_e\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
+	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kaiv_e\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
 	echo "$$body" | grep -q "kai_variant_u" \
 	  || { echo "perceus-1069-projection-reuse FAIL (grow_kind not found in emitted C)"; exit 1; }; \
 	if echo "$$body" | grep -qE "kai_variant_reuse_at|kai_reuse_or_alloc_variant"; then \
