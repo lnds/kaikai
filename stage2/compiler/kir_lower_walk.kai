@@ -2437,7 +2437,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> match ls_fresh_label(st) { LSLabel(dead, st1) ->
     ls_seal(st1, KUnreachable(KNoPos), dead) }
   [Arm(p, opt_guard, body), ...rest] -> match ls_fresh_label(st) { LSLabel(next_fail, st0) ->
-    match guard_emit_pat_test(p, scrv, next_fail, st0) {
+    match guard_emit_pat_test(p, scrv, next_fail, arm_reuses(body, st0), st0) {
       LMArm(st_body, _) -> {
         # The arm's binder may shadow-rename an outer name; that rename is
         # scoped to THIS arm's guard + body. Snapshot before binding so the
@@ -2485,7 +2485,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 # pattern (always matches) just branches to its fresh body — its mismatch
 # edge is dead, so `fail_lbl` stays live for the guard / the next arm.
 fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
-                       st: LowerSt) : LMArm / Console =
+                       reuse_arm: Bool, st: LowerSt) : LMArm / Console =
   match p.pkind {
     PLit(lit) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
       let st2 = guard_lit_test(lit, scrv, body_lbl, fail_lbl, st1)
@@ -2505,19 +2505,22 @@ fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
     } }
     # An as-pattern emits the inner pattern's test (the binder is bound after,
     # by `bind_default_pattern`); `a @ A` tests the `A` tag, `a @ _` passes.
-    PAs(_, inner) -> guard_emit_pat_test(inner, scrv, fail_lbl, st)
+    PAs(_, inner) -> guard_emit_pat_test(inner, scrv, fail_lbl, reuse_arm, st)
     # Non-discriminating: always matches — branch straight to a fresh body.
     PWild        -> guard_pat_passthrough(p, fail_lbl, st)
     PBind(_)     -> guard_pat_passthrough(p, fail_lbl, st)
     PNarrow(_, _) -> guard_pat_passthrough(p, fail_lbl, st)
     PHole(_)     -> guard_pat_passthrough(p, fail_lbl, st)
-    # PList / PRecord guarded arms are not yet covered by the linear chain
-    # (their test machinery owns its own fail label, which does not compose
-    # with the chain's `fail_lbl` without a block-reopen hazard). Trap loud
-    # rather than miscompile — the families this lane closes (Int/Real binder
-    # guards, variant guards) do not hit this; if one appears, it surfaces
-    # here instead of silently diverging (lane discipline).
-    PList(_, _) -> { eprint("kir: guarded list-pattern arm not yet lowered"); guard_pat_passthrough(p, fail_lbl, st) }
+    # A list arm reuses the list-match cell walk, which takes the caller's
+    # fail label directly. It binds head/tail/rest as it tests (the same
+    # borrow-then-dup discipline as the unguarded chain: `lower_arm_rc`
+    # dups every alias binder after the test passes).
+    PList(pats, opt_rest) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
+      let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, reuse_arm, st1)
+      LMArm(reopen(st2, body_lbl), fail_lbl)
+    } }
+    # A guarded record arm is not routed here in practice; keep the trap
+    # loud so a future route change surfaces instead of miscompiling.
     PRecord(_)  -> { eprint("kir: guarded record-pattern arm not yet lowered"); guard_pat_passthrough(p, fail_lbl, st) }
     _ -> guard_pat_passthrough(p, fail_lbl, st)
   }
