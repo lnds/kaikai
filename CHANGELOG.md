@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.109.2 (2026-08-08)
+
+### Fixed
+
+- **compiler**: box handler-clause scalar captures; lower guarded list arms (#1663)
+- **stdlib**: compare Map and Set by contents; close four kai info gaps (#1662)
+
 ## v0.109.1 (2026-08-07)
 
 ### Fixed
