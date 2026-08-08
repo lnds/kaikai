@@ -2649,6 +2649,45 @@ fn cache_hex_to_unit_body(buf: String, pos: Int) : Option[CacheUnitBodyPos] {
   }
 }
 
+# ---- KindHab (for DKind) ---------------------------------------------------
+
+fn cache_kindhab_to_hex(h: KindHab) : String = match h {
+  HabNone          -> cache_byte_to_hex(0)
+  HabIntro(w)      -> concat_all([cache_byte_to_hex(1), cache_string_to_hex(w)])
+  HabDomain(d)     -> concat_all([cache_byte_to_hex(2), cache_string_to_hex(d)])
+  HabClosed(w, ss) -> concat_all([cache_byte_to_hex(3), cache_string_to_hex(w),
+                                  cache_string_list_to_hex(ss)])
+}
+
+type CacheKindHabPos = CKHP(KindHab, Int)
+
+fn cache_hex_to_kindhab(buf: String, pos: Int) : Option[CacheKindHabPos] {
+  match cache_hex_byte_at(buf, pos) {
+    None -> None
+    Some(0) -> Some(CKHP(HabNone, pos + 1))
+    Some(1) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(cs) -> match cs { CSP(w, p2) -> Some(CKHP(HabIntro(w), p2)) }
+    }
+    Some(2) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(cs) -> match cs { CSP(d, p2) -> Some(CKHP(HabDomain(d), p2)) }
+    }
+    Some(3) -> match cache_hex_to_string(buf, pos + 1) {
+      None -> None
+      Some(cs) -> match cs { CSP(w, p2) ->
+        match cache_hex_to_string_list(buf, p2) {
+          None -> None
+          Some(csl) -> match csl { CSLP(ss, p3) ->
+            Some(CKHP(HabClosed(w, ss), p3))
+          }
+        }
+      }
+    }
+    Some(_) -> None
+  }
+}
+
 # ---- Decl ------------------------------------------------------------------
 
 fn cache_decl_to_hex(d: Decl) : String = match d {
@@ -2751,12 +2790,11 @@ fn cache_decl_to_hex(d: Decl) : String = match d {
       cache_int_to_hex(l), cache_int_to_hex(c)
     ])
   }
-  # Issue #681: doc wrappers are stripped by `doc_strip_all` in the
-  # core loaders BEFORE any decl stream reaches the serializer, so
-  # these arms are unreachable — the .kab format stays doc-free and
-  # the cache format version does not bump. Panic loudly if a future
-  # caller serialises an unstripped stream.
-  DDoc(_, _, _, _, _) -> panic("cache_decl_to_hex: DDoc must be stripped before caching (issue #681)")
+  # Doc wrappers are stripped by `doc_strip_all` on every load path
+  # before a decl stream reaches the serializer, so the .kab format
+  # stays doc-free. Panic loudly if a caller serialises an unstripped
+  # stream.
+  DDoc(_, _, _, _, _) -> panic("cache_decl_to_hex: DDoc must be stripped before caching")
   # The root file keeps its module doc in the stream (`doc_strip_collect`)
   # so the typer can lift it into `TypedProgram.module_doc`, and the typed
   # cut hashes that stream to key the root's blob. Only imported/core
@@ -2765,9 +2803,25 @@ fn cache_decl_to_hex(d: Decl) : String = match d {
     concat_all([cache_byte_to_hex(11), cache_string_to_hex(raw),
                  cache_string_to_hex(text), cache_int_to_hex(line),
                  cache_int_to_hex(col)])
-  DTheory(_, _, _, _) -> panic("cache_decl_to_hex: DTheory must be stripped before caching")
-  DKind(_, _, _, _, _, _, _) -> panic("cache_decl_to_hex: DKind must be stripped before caching")
-  DUseKind(_, _, _) -> panic("cache_decl_to_hex: DUseKind must be stripped before caching")
+  # Kind-catalog decls are stripped from the merged stream only after
+  # kind resolution; the parse-level module cache serialises straight
+  # after parse, so they must round-trip — a blob restored without them
+  # would lose the module's kind registrations on a warm hit.
+  DTheory(name, props, l, c) -> concat_all([
+    cache_byte_to_hex(19), cache_string_to_hex(name),
+    cache_string_list_to_hex(props),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DKind(is_pub, name, thy, over, hab, l, c) -> concat_all([
+    cache_byte_to_hex(20), cache_bool_to_hex(is_pub), cache_string_to_hex(name),
+    cache_string_to_hex(thy), cache_string_to_hex(over),
+    cache_kindhab_to_hex(hab),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
+  DUseKind(name, l, c) -> concat_all([
+    cache_byte_to_hex(21), cache_string_to_hex(name),
+    cache_int_to_hex(l), cache_int_to_hex(c)
+  ])
 }
 
 fn cache_hex_to_decl(buf: String, pos: Int) : Option[CacheDeclPos] {
@@ -2845,7 +2899,96 @@ fn cache_hex_to_decl_body(buf: String, pos: Int,
     cache_hex_to_dexterntype(buf, pos)
   } else if tag == 18 {
     cache_hex_to_dconstructor(buf, pos)
+  } else if tag == 19 {
+    cache_hex_to_dtheory(buf, pos)
+  } else if tag == 20 {
+    cache_hex_to_dkind(buf, pos)
+  } else if tag == 21 {
+    match cache_hex_to_string(buf, pos) {
+      None -> None
+      Some(csp) -> match csp { CSP(n, p1) ->
+        match cache_hex_to_int(buf, p1) {
+          None -> None
+          Some(cl) -> match cl { CIP(ln, p2) ->
+            match cache_hex_to_int(buf, p2) {
+              None -> None
+              Some(cc) -> match cc { CIP(cn, p3) ->
+                Some(CDP(DUseKind(n, ln, cn), p3))
+              }
+            }
+          }
+        }
+      }
+    }
   } else { None }
+}
+
+fn cache_hex_to_dtheory(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_string(buf, pos) {
+    None -> None
+    Some(csp) -> match csp { CSP(name, p1) ->
+      match cache_hex_to_string_list(buf, p1) {
+        None -> None
+        Some(csl) -> match csl { CSLP(props, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cl) -> match cl { CIP(ln, p3) ->
+              match cache_hex_to_int(buf, p3) {
+                None -> None
+                Some(cc) -> match cc { CIP(cn, p4) ->
+                  Some(CDP(DTheory(name, props, ln, cn), p4))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dkind(buf: String, pos: Int) : Option[CacheDeclPos] {
+  match cache_hex_to_bool(buf, pos) {
+    None -> None
+    Some(cbp) -> match cbp { CBP(is_pub, p1) ->
+      match cache_hex_to_string(buf, p1) {
+        None -> None
+        Some(cn) -> match cn { CSP(name, p2) ->
+          match cache_hex_to_string(buf, p2) {
+            None -> None
+            Some(ct) -> match ct { CSP(thy, p3) ->
+              match cache_hex_to_string(buf, p3) {
+                None -> None
+                Some(co) -> match co { CSP(over, p4) ->
+                  cache_hex_to_dkind_tail(buf, p4, is_pub, name, thy, over)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cache_hex_to_dkind_tail(buf: String, pos: Int, is_pub: Bool, name: String,
+                           thy: String, over: String) : Option[CacheDeclPos] {
+  match cache_hex_to_kindhab(buf, pos) {
+    None -> None
+    Some(ckh) -> match ckh { CKHP(hab, p1) ->
+      match cache_hex_to_int(buf, p1) {
+        None -> None
+        Some(cl) -> match cl { CIP(ln, p2) ->
+          match cache_hex_to_int(buf, p2) {
+            None -> None
+            Some(cc) -> match cc { CIP(cn, p3) ->
+              Some(CDP(DKind(is_pub, name, thy, over, hab, ln, cn), p3))
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 # Deserialise a `DExternType`. Layout mirrors `cache_decl_to_hex`'s
