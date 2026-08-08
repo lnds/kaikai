@@ -1702,18 +1702,18 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	    || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
 	done; \
 	for fn in sum_to count_down reps joins nested; do \
-	  grep -q "kai_$${fn}__clause" build/issue_1179_var_slot_loops.c \
+	  grep -q "kaiu_$${fn}__clause" build/issue_1179_var_slot_loops.c \
 	    && { echo "issue_1179 FAIL ($$fn still carries a State clause)"; exit 1; } || true; \
 	done; \
-	grep -q "kai_each_sum__clause" build/issue_1179_each_closure_state.c \
+	grep -q "kaiu_each_sum__clause" build/issue_1179_each_closure_state.c \
 	  || { echo "issue_1179 FAIL (each_sum lost its State clauses)"; exit 1; }; \
 	for cell in acc_int acc_real flag post; do \
 	  grep -q "kair_$${cell}__slot" build/issue_1179_cell_register.c \
 	    || { echo "issue_1179 FAIL ($$cell not promoted to a raw cell)"; exit 1; }; \
-	  grep -q "kai_$${cell}__slot = kai_core_array_make" build/issue_1179_cell_register.c \
+	  grep -q "kaiv_$${cell}__slot = kai_core_array_make" build/issue_1179_cell_register.c \
 	    && { echo "issue_1179 FAIL ($$cell still an array slot)"; exit 1; } || true; \
 	done; \
-	grep -q "kai_s_txt__slot = kai_core_array_make" build/issue_1179_cell_register.c \
+	grep -q "kaiv_s_txt__slot = kai_core_array_make" build/issue_1179_cell_register.c \
 	  || { echo "issue_1179 FAIL (String var lost its array slot)"; exit 1; }; \
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
 	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
@@ -1748,7 +1748,7 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	  || { echo "$$f FAIL (arith m := n*2+1 not promoted to raw i64)"; exit 1; }; \
 	awk '/^fn callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
 	  || { echo "$$f FAIL (callinit m := twice(n) wrongly promoted — call init must keep the slot)"; exit 1; }; \
-	grep -q "kai_acc__slot = kai_core_array_make" build/$$f.c \
+	grep -q "kaiv_acc__slot = kai_core_array_make" build/$$f.c \
 	  || { echo "$$f FAIL (String var lost its array slot)"; exit 1; }; \
 	echo "issue-1214-nonliteral-init OK (pure non-literal scalar inits promoted; call + String inits keep the slot)"
 
@@ -2934,8 +2934,8 @@ test-effects: $(TARGET) build
 	    && grep -q "KaiHandlerId handler_id;" build/s2-$$name.c \
 	    && grep -q "KaiValue \*(\*tick)(EvCounter \*self, KaiCont \*k);" build/s2-$$name.c \
 	    && grep -q "KaiValue \*(\*get)(EvCounter \*self, KaiCont \*k);"  build/s2-$$name.c \
-	    && grep -q "KaiValue \*(\*hello)(EvGreeter \*self, KaiValue \*kai_name, KaiCont \*k);" build/s2-$$name.c \
-	    && grep -q "KaiValue \*(\*bye)(EvGreeter \*self, KaiValue \*kai_name, KaiValue \*kai_count, KaiCont \*k);" build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*hello)(EvGreeter \*self, KaiValue \*kaiv_name, KaiCont \*k);" build/s2-$$name.c \
+	    && grep -q "KaiValue \*(\*bye)(EvGreeter \*self, KaiValue \*kaiv_name, KaiValue \*kaiv_count, KaiCont \*k);" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (struct shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -2961,8 +2961,8 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "_ev.tick = &_kai_main__clause_" build/s2-$$name.c \
-	    && grep -q "_ev.get = &_kai_main__clause_" build/s2-$$name.c \
+	  grep -q "_ev.tick = &_kaiu_main__clause_" build/s2-$$name.c \
+	    && grep -q "_ev.get = &_kaiu_main__clause_" build/s2-$$name.c \
 	    && grep -q "kai_evidence_lookup_node(\"Counter\")" build/s2-$$name.c \
 	    && grep -q "_ev_op->tick(_ev_op, &_k)" build/s2-$$name.c \
 	    && grep -q "_ev_op->get(_ev_op, &_k)"  build/s2-$$name.c \
@@ -4583,8 +4583,8 @@ test-m4c: $(TARGET) build
 	  && grep -q "kaiu_run_with__mono__String__Int" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
 	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }
-	@grep -q "_kai_process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
-	  && grep -q "_kai_process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
+	@grep -q "_kaiu_process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
+	  && grep -q "_kaiu_process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
 	@grep -q "= kaiu_run_with__mono__Int__Int(" build/s2-m4c_run_with.c \
@@ -4772,13 +4772,13 @@ test-unbox-phase2: $(TARGET) build
 	@# Without this grep the byte-id lies.
 	@grep -F -q 'int64_t _r = 0' build/perceus-unbox_phase2_match_scalar.c \
 	  || { echo "unbox FAIL match_scalar (match result not raw — _r not int64_t)"; exit 1; }
-	@if grep -E 'kaiu_area\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	@if grep -E 'kaiu_area\(KaiValue \*kaiv_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
 	  echo "unbox FAIL match_scalar (boxed _r accumulator survived in area)"; exit 1; \
 	fi
 	@# divergence: a `_ -> panic(...)` catch-all arm must NOT block raw
 	@# promotion — `sides` lowers `_r` raw and the panic arm emits the
 	@# call + break with no `_r =` (the common native-backend shape).
-	@if grep -E 'kaiu_sides\(KaiValue \*kai_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
+	@if grep -E 'kaiu_sides\(KaiValue \*kaiv_s\) \{[^}]*_r = kai_unit\(\)' build/perceus-unbox_phase2_match_scalar.c; then \
 	  echo "unbox FAIL match_scalar (panic catch-all blocked raw promotion in sides)"; exit 1; \
 	fi
 	@# Tongariki Real-unboxing — arith fixture. The chain must lower
@@ -4844,9 +4844,9 @@ test-unbox-phase2: $(TARGET) build
 	@grep -F -q 'int64_t kair_n = 42LL' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c \
 	  || { echo "unbox FAIL r8_let_in_interp (kair_n not unboxed — desugar_interp regressed?)"; exit 1; }
-	@if grep -F -q 'KaiValue *kai_n = kai_int(42LL)' \
+	@if grep -F -q 'KaiValue *kaiv_n = kai_int(42LL)' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
-	  echo "unbox FAIL r8_let_in_interp (boxed kai_n re-appeared; obsolete demote returned)"; exit 1; \
+	  echo "unbox FAIL r8_let_in_interp (boxed kaiv_n re-appeared; obsolete demote returned)"; exit 1; \
 	fi
 	@# Issue #90 — `^` (integer power) and integer division on raw
 	@# operands must inline. The C emit unrolls `b ^ n` into
@@ -7494,7 +7494,7 @@ test-shape-fusion-1200: $(TARGET) build
 	  || { echo "shape-fusion-1200 FAIL (kaic2 errored)"; exit 1; }; \
 	grep -q 'kai___pimpl_Sequence_Chain_foldl' build/s2-$$name.c \
 	  || { echo "shape-fusion-1200 FAIL (impl foldl not called — pipe did not dispatch)"; exit 1; }; \
-	if grep 'kai_build(100LL' build/s2-$$name.c | grep -q 'kai___pimpl_Sequence_Chain_map('; then \
+	if grep 'kaiu_build(100LL' build/s2-$$name.c | grep -q 'kaiu___pimpl_Sequence_Chain_map('; then \
 	  echo "shape-fusion-1200 FAIL (mapped chain materialised — not fused)"; exit 1; fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -7837,7 +7837,7 @@ test-perceus-1069-projection-reuse: $(TARGET) build
 	diff -q $$exp build/s2-1069proj-n.out > /dev/null \
 	  || { echo "perceus-1069-projection-reuse FAIL (native output diff — original corrupted)"; diff $$exp build/s2-1069proj-n.out; exit 1; }; \
 	./$(TARGET) --path ../stdlib $$src > build/s2-1069proj.c; \
-	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kai_e\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
+	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kaiv_e\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
 	echo "$$body" | grep -q "kai_variant_u" \
 	  || { echo "perceus-1069-projection-reuse FAIL (grow_kind not found in emitted C)"; exit 1; }; \
 	if echo "$$body" | grep -qE "kai_variant_reuse_at|kai_reuse_or_alloc_variant"; then \
@@ -9781,7 +9781,7 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu "root pub fn"        "kaiu_main__badge"             "main.c"; \
 	assert_tu "root private fn"    "kaiu_helper"                  "__root__.c"; \
 	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
-	assert_tu "root lambda"        "_kai_lam_main_19_14"         "__root__.c"; \
+	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kaiu_widget__label"           "widget.c"; \
 	assert_tu "cross-module spec"  "kaiu_widget__wrap__mono__Int" "__root__.c"; \
 	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
