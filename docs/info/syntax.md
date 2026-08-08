@@ -622,8 +622,19 @@ mixing them is a type error; convert explicitly with `int_to_int32` /
 (`+ - * / %`) wraps two's-complement in the width; `/`/`%` are signed for
 `Int32`, unsigned for `UInt32`/`UInt64`, and trap on a zero divisor.
 Comparisons are signed/unsigned per width, and `Show` / `Eq` / `Ord` /
-`Hash` work on each. `Int128` reaches ~38 digits (i64 maxes at ~19), so a
-literal above 2^63 is written `…i128` and round-trips exactly. The suffix
+`Hash` work on each. The ranges decide which width a value needs:
+
+| type | range |
+| --- | --- |
+| `Int32` | −2^31 … 2^31−1 |
+| `UInt32` | 0 … 2^32−1 |
+| `Int` | −2^63 … 2^63−1 |
+| `UInt64` | 0 … 2^64−1 |
+| `Int128` | −2^127 … 2^127−1 (~38 digits) |
+
+So a SIGNED literal above 2^63−1 is written `…i128`; an unsigned one up
+to 2^64−1 takes `…u64`, which holds it exactly without reaching for
+`Int128`. The suffix
 attaches to a decimal/hex/bin literal with no intervening space
 (`0xFFi32`, `0b1010u8`); `42i` without a width stays a complex
 literal, and there is no `i64` suffix (`Int` is already 64-bit — a
