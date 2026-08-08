@@ -4,9 +4,10 @@ lowerings, after `kai fmt` / `kai migrate` have printed and before
 resolution.
 
 The parser preserves what the author wrote — `ESurface` wrappers,
-`SAssign` writes, anonymous rest-binder spellings, impl-site tparams —
-so the writer can reproduce it verbatim. Everything downstream of this
-pass sees only the lowered shapes it always saw:
+`TySurface` / `PSurface` wrappers, `SAssign` writes, anonymous
+rest-binder spellings, impl-site tparams — so the writer can reproduce
+it verbatim. Everything downstream of this pass sees only the lowered
+shapes it always saw:
 
   - `SfContract(reqs, enss, body)`  -> contract asserts in the body
     (`wrap_with_contracts`, elision included).
@@ -20,9 +21,17 @@ pass sees only the lowered shapes it always saw:
   - `DFn` tparams                   -> protocol bounds stripped; the
     parser stores them raw so the writer can print the signature.
   - `SfLamBlock(lam, _)`            -> the plain lambda.
+  - `SfTuple(elems)`                -> `Pair`/`Triple`/`Quad` record
+    literal; `PsTuple` -> the variant-record pattern; `TsTuple` ->
+    `Pair[..]`/`Triple[..]`/`Quad[..]`.
+
+The type walk visits every `TypeExpr` position a declaration can
+carry — signatures, type bodies, effect/protocol ops, annotations,
+row-label arguments — because a tuple type can appear in any of them.
 
 The driver runs `surface_lower_decls` once, on the flat post-import
-decl list; no `ESurface` / `SAssign` survives it.
+decl list; no `ESurface` / `TySurface` / `PSurface` / `SAssign`
+survives it.
 """)]
 
 import compiler.util
@@ -36,17 +45,26 @@ pub fn surface_lower_decls(ds: [Decl]) : [Decl] = map(ds, (d) => sfl_decl(d))
 
 fn sfl_decl(d: Decl) : Decl = match d {
   DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo) ->
-    DFn(is_pub, name, map(tps, tp_strip_bounds), ps, ret, row,
-        sfl_fn_body(body, ps, name), l, c, mo)
+    DFn(is_pub, name, map(tps, tp_strip_bounds), sfl_params(ps),
+        sfl_ty_opt(ret), sfl_row(row), sfl_fn_body(body, ps, name), l, c, mo)
   DImpl(pn, pargs, tgt, ms, l, c, impl_tps) ->
-    DImpl(pn, pargs, tgt, sfl_impl_methods(impl_tps, ms), l, c, impl_tps)
+    DImpl(pn, map(pargs, (x) => sfl_ty(x)), sfl_ty(tgt),
+          sfl_impl_methods(impl_tps, ms), l, c, impl_tps)
+  DType(is_pub, name, tps, body, l, c, mo, slots) ->
+    DType(is_pub, name, tps, sfl_type_body(body), l, c, mo, slots)
   DTest(label, body, l, c)      -> DTest(label, sfl_expr(body), l, c)
   DBench(label, body, l, c)     -> DBench(label, sfl_expr(body), l, c)
-  DCheck(label, ps, body, l, c) -> DCheck(label, ps, sfl_expr(body), l, c)
+  DCheck(label, ps, body, l, c) -> DCheck(label, sfl_params(ps), sfl_expr(body), l, c)
   DConst(is_pub, name, ty, body, mo, l, c) ->
-    DConst(is_pub, name, ty, sfl_expr(body), mo, l, c)
+    DConst(is_pub, name, sfl_ty(ty), sfl_expr(body), mo, l, c)
   DEffect(is_pub, name, tps, ops, default_opt, l, c, mo) ->
-    DEffect(is_pub, name, tps, ops, sfl_default(default_opt), l, c, mo)
+    DEffect(is_pub, name, tps, map(ops, (op) => sfl_effect_op(op)),
+            sfl_default(default_opt), l, c, mo)
+  DProtocol(is_pub, name, tps, ops, l, c) ->
+    DProtocol(is_pub, name, tps, map(ops, (op) => sfl_proto_op(op)), l, c)
+  DAxiom(ec, ov, name, sym, tps, ps, ret, row, l, c) ->
+    DAxiom(ec, ov, name, sym, tps, sfl_params(ps), sfl_ty(ret), sfl_row(row), l, c)
+  DExternType(name, body, l, c) -> DExternType(name, sfl_extern_body(body), l, c)
   DDerive(names, inner, l, c)   -> DDerive(names, sfl_decl(inner), l, c)
   DUnstable(inner, l, c)        -> DUnstable(sfl_decl(inner), l, c)
   DConstructor(inner, l, c)     -> DConstructor(sfl_decl(inner), l, c)
@@ -66,6 +84,7 @@ fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kin
                           body.line, body.col)
     SfEnsure(_, _) -> sfl_expr(body)
     SfLamBlock(_, _) -> sfl_expr(body)
+    SfTuple(_) -> sfl_expr(body)
   }
   _ -> sfl_expr(body)
 }
@@ -86,8 +105,7 @@ fn sfl_impl_method(stripped: [String], m: Decl) : Decl = match sfl_decl(m) {
 fn sfl_default(o: Option[DefaultBlock]) : Option[DefaultBlock] = match o {
   None -> None
   Some(DBlk(cs, ret, l, c)) ->
-    Some(DBlk(map(cs, (cl) => prc_map_clause_exprs(cl, (x) => sfl_expr(x))),
-              prc_map_opt_return_exprs(ret, (x) => sfl_expr(x)), l, c))
+    Some(DBlk(map(cs, (cl) => sfl_hclause(cl)), sfl_hreturn_opt(ret), l, c))
 }
 
 fn sfl_expr(e: Expr) : Expr = match e.kind {
@@ -95,13 +113,24 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
     SfEnsure(value, pred) -> sfl_ensure(sfl_expr(value), sfl_expr(pred), e.line, e.col)
     SfContract(_, _, _) -> panic("surface_lower: contract clauses outside a fn body")
     SfLamBlock(lam, _) -> sfl_expr(lam)
+    SfTuple(elems) ->
+      mk_expr(ERecordLit(sfl_tuple_name(list_length(elems)),
+                         build_tuple_field_inits(map(elems, (x) => sfl_expr(x)), 0, [])),
+              e.line, e.col)
   }
   # EMatch and EBlock carry patterns / statement shapes the generic
-  # child-mapper does not rewrite, so they recurse here.
+  # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
+  # carry type annotations it does not reach. They recurse here.
   EMatch(scrut, arms) ->
     sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => sfl_arm(a))))
   EBlock(stmts, tail) ->
     sfl_rebuild(e, EBlock(map(stmts, (st) => sfl_stmt(st)), sfl_opt(tail)))
+  ELambda(ps, body) -> sfl_rebuild(e, ELambda(sfl_params(ps), sfl_expr(body)))
+  EHandle(body, eff, tyargs, init, alias, cs, ret) ->
+    sfl_rebuild(e, EHandle(sfl_expr(body), eff, map(tyargs, (x) => sfl_ty(x)),
+                           sfl_opt(init), alias, map(cs, (cl) => sfl_hclause(cl)),
+                           sfl_hreturn_opt(ret)))
+  EVariantsOf(t, names) -> sfl_rebuild(e, EVariantsOf(sfl_ty(t), names))
   _ -> sfl_rebuild(e, prc_map_expr_kind(e.kind, (x) => sfl_expr(x)))
 }
 
@@ -130,11 +159,11 @@ fn sfl_stmt(st: Stmt) : Stmt = match st {
     let setter = mk_expr(EField(sfl_expr(lhs), "set"), l, c)
     SExprStmt(mk_expr(ECall(setter, [sfl_expr(v)]), l, c))
   }
-  SLet(pat, ty, e)            -> SLet(sfl_pat(pat), ty, sfl_expr(e))
+  SLet(pat, ty, e)            -> SLet(sfl_pat(pat), sfl_ty_opt(ty), sfl_expr(e))
   SAssert(e, msg)             -> SAssert(sfl_expr(e), sfl_opt(msg))
   SExprStmt(e)                -> SExprStmt(sfl_expr(e))
   SIndexAssign(b, i, v, l, c) -> SIndexAssign(sfl_expr(b), sfl_expr(i), sfl_expr(v), l, c)
-  SVar(n, ty, e, l, c)        -> SVar(n, ty, sfl_expr(e), l, c)
+  SVar(n, ty, e, l, c)        -> SVar(n, sfl_ty_opt(ty), sfl_expr(e), l, c)
   SUse(_, _, _)               -> st
 }
 
@@ -142,7 +171,22 @@ fn sfl_arm(a: Arm) : Arm = match a {
   Arm(pat, guard, body) -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
 }
 
+fn sfl_hclause(cl: HClause) : HClause = match cl {
+  HC(n, ps, body, l, c) -> HC(n, sfl_params(ps), sfl_expr(body), l, c)
+}
+
+fn sfl_hreturn_opt(o: Option[HReturn]) : Option[HReturn] = match o {
+  None -> None
+  Some(HR(n, body, l, c)) -> Some(HR(n, sfl_expr(body), l, c))
+}
+
 fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
+  PSurface(ps) -> match ps {
+    PsTuple(pats) ->
+      mk_pat(PVariantRecord(sfl_tuple_name(list_length(pats)),
+                            build_tuple_pfields(map(pats, (x) => sfl_pat(x)), 0, [])),
+             p.line, p.col)
+  }
   PList(subs, rest) ->
     mk_pat(PList(map(subs, (x) => sfl_pat(x)), sfl_rest(rest, p.line, p.col)),
            p.line, p.col)
@@ -152,6 +196,7 @@ fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
     mk_pat(PVariantRecord(n, map(fs, (f) => sfl_pfield(f))), p.line, p.col)
   PRecord(fs) -> mk_pat(PRecord(map(fs, (f) => sfl_pfield(f))), p.line, p.col)
   PAs(n, sub) -> mk_pat(PAs(n, sfl_pat(sub)), p.line, p.col)
+  PNarrow(n, ty) -> mk_pat(PNarrow(n, sfl_ty(ty)), p.line, p.col)
   _ -> p
 }
 
@@ -169,4 +214,76 @@ fn sfl_rest(rest: Option[String], line: Int, col: Int) : Option[String] = match 
                        int_to_string(col), "__"]))
     } else { rest }
   None -> None
+}
+
+# ---- type walk ------------------------------------------------------
+
+fn sfl_ty(t: TypeExpr) : TypeExpr = match t.tkind {
+  TySurface(ts) -> match ts {
+    TsTuple(tys) ->
+      mk_ty(TyName(sfl_tuple_name(list_length(tys)), map(tys, (x) => sfl_ty(x))),
+            t.line, t.col)
+  }
+  TyName(n, tys)    -> mk_ty(TyName(n, map(tys, (x) => sfl_ty(x))), t.line, t.col)
+  TyList(inner)     -> mk_ty(TyList(sfl_ty(inner)), t.line, t.col)
+  TyFn(ps, ret, row) ->
+    mk_ty(TyFn(map(ps, (x) => sfl_ty(x)), sfl_ty(ret), sfl_row(row)), t.line, t.col)
+  TyDim(base, u)    -> mk_ty(TyDim(sfl_ty(base), u), t.line, t.col)
+  TyRefine(base, pred) -> mk_ty(TyRefine(sfl_ty(base), sfl_expr(pred)), t.line, t.col)
+  TyRow(row)        -> mk_ty(TyRow(sfl_row(row)), t.line, t.col)
+}
+
+fn sfl_ty_opt(o: Option[TypeExpr]) : Option[TypeExpr] = match o {
+  None -> None
+  Some(t) -> Some(sfl_ty(t))
+}
+
+fn sfl_row(r: RowExpr) : RowExpr = match r {
+  REmpty -> REmpty
+  RClosed(labels) -> RClosed(map(labels, (rl) => sfl_row_label(rl)))
+  ROpen(tail, labels) -> ROpen(tail, map(labels, (rl) => sfl_row_label(rl)))
+}
+
+fn sfl_row_label(rl: RowLabel) : RowLabel = match rl {
+  RL(n, tys) -> RL(n, map(tys, (x) => sfl_ty(x)))
+}
+
+fn sfl_params(ps: [Param]) : [Param] = map(ps, (pm) => sfl_param(pm))
+
+fn sfl_param(pm: Param) : Param =
+  Param { pname: pm.pname, ptype: sfl_ty_opt(pm.ptype), pline: pm.pline,
+          pcol: pm.pcol, pborrow: pm.pborrow }
+
+fn sfl_type_body(b: TypeBody) : TypeBody = match b {
+  TBAlias(t)     -> TBAlias(sfl_ty(t))
+  TBRecord(fs)   -> TBRecord(map(fs, (f) => sfl_field_decl(f)))
+  TBSum(vs)      -> TBSum(map(vs, (v) => sfl_variant(v)))
+  TBEffectAlias(_) -> b
+}
+
+fn sfl_field_decl(f: FieldDecl) : FieldDecl = match f {
+  FD(is_pub, n, t, attrs) -> FD(is_pub, n, sfl_ty(t), attrs)
+}
+
+fn sfl_variant(v: Variant) : Variant = match v {
+  Var(n, tys) -> Var(n, map(tys, (x) => sfl_ty(x)))
+}
+
+fn sfl_extern_body(b: ExternTypeBody) : ExternTypeBody = match b {
+  ETStruct(fs) -> ETStruct(map(fs, (f) => sfl_field_decl(f)))
+  ETOpaque     -> b
+}
+
+fn sfl_effect_op(op: EffectOp) : EffectOp = match op {
+  EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
+}
+
+fn sfl_proto_op(op: ProtoOp) : ProtoOp = match op {
+  POp(n, tps, ps, ret, l, c) -> POp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
+}
+
+# Parse rejects tuple arities outside 2..4, so the lookup cannot miss.
+fn sfl_tuple_name(n: Int) : String = match tuple_type_for_arity(n) {
+  Some(name) -> name
+  None -> panic("surface_lower: tuple arity outside 2..4 survived the parser")
 }
