@@ -951,7 +951,7 @@ tier1-backend-parity:
 	@bash tools/parity-preserve-native.sh
 	@TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh
 
-# Tier 2: daily / nightly. ~10-20 min. Runs once a day on `main` HEAD,
+# Tier 2: daily / nightly — the slowest tier. Runs once a day on `main` HEAD,
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
 #
