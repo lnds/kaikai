@@ -90,6 +90,7 @@ fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kin
     SfEnsure(_, _) -> sfl_expr(body)
     SfLamBlock(_, _) -> sfl_expr(body)
     SfTuple(_) -> sfl_expr(body)
+    SfHandleInit(_) -> sfl_expr(body)
   }
   _ -> sfl_expr(body)
 }
@@ -122,6 +123,7 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
       mk_expr(ERecordLit(sfl_tuple_name(list_length(elems)),
                          build_tuple_field_inits(map(elems, (x) => sfl_expr(x)), 0, [])),
               e.line, e.col)
+    SfHandleInit(init) -> sfl_expr(init)
   }
   # EMatch and EBlock carry patterns / statement shapes the generic
   # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
@@ -172,8 +174,37 @@ fn sfl_stmt(st: Stmt) : Stmt = match st {
   SUse(_, _, _)               -> st
 }
 
+# A `PsRefine` narrowing dissolves at the arm, where the user guard is
+# in reach: `name : Base where pred` becomes `PBind(name)` plus a guard
+# `{ let self = name; pred }`, welded ahead of any user guard with `and`
+# so a violated refinement short-circuits before the user predicate.
 fn sfl_arm(a: Arm) : Arm = match a {
-  Arm(pat, guard, body) -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+  Arm(pat, guard, body) -> match pat.pkind {
+    PSurface(ps) -> match ps {
+      PsRefine(name, ty) ->
+        Arm(mk_pat(PBind(name), pat.line, pat.col),
+            Some(sfl_weld_guard(sfl_refine_guard(name, ty, pat.line, pat.col),
+                                sfl_opt(guard))),
+            sfl_expr(body))
+      _ -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+    }
+    _ -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+  }
+}
+
+fn sfl_refine_guard(name: String, ty: TypeExpr, line: Int, col: Int) : Expr =
+  match ty.tkind {
+    TyRefine(_, pred) -> {
+      let self_let = SLet(mk_pat(PBind("self"), line, col), None,
+                          mk_expr(EVar(name), line, col))
+      mk_expr(EBlock([self_let], Some(sfl_expr(pred))), line, col)
+    }
+    _ -> panic("surface_lower: PsRefine without a refinement type")
+  }
+
+fn sfl_weld_guard(narrow: Expr, user: Option[Expr]) : Expr = match user {
+  None -> narrow
+  Some(u) -> mk_expr(EBinop("and", narrow, u), narrow.line, narrow.col)
 }
 
 fn sfl_hclause(cl: HClause) : HClause = match cl {
@@ -191,6 +222,10 @@ fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
       mk_pat(PVariantRecord(sfl_tuple_name(list_length(pats)),
                             build_tuple_pfields(map(pats, (x) => sfl_pat(x)), 0, [])),
              p.line, p.col)
+    PsQualified(_, sub) -> sfl_pat(sub)
+    PsAs(n, sub) -> mk_pat(PAs(n, sfl_pat(sub)), p.line, p.col)
+    # Only legal as an arm's top-level pattern; sfl_arm dissolves it.
+    PsRefine(_, _) -> panic("surface_lower: PsRefine outside a match arm")
   }
   PList(subs, rest) ->
     mk_pat(PList(map(subs, (x) => sfl_pat(x)), sfl_rest(rest, p.line, p.col)),
@@ -228,6 +263,7 @@ fn sfl_ty(t: TypeExpr) : TypeExpr = match t.tkind {
     TsTuple(tys) ->
       mk_ty(TyName(sfl_tuple_name(list_length(tys)), map(tys, (x) => sfl_ty(x))),
             t.line, t.col)
+    TsUnitSpan(_, inner) -> sfl_ty(inner)
   }
   TyName(n, tys)    -> mk_ty(TyName(n, map(tys, (x) => sfl_ty(x))), t.line, t.col)
   TyList(inner)     -> mk_ty(TyList(sfl_ty(inner)), t.line, t.col)
