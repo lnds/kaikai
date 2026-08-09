@@ -88,10 +88,15 @@ files are leaves by nature, so reachability from the entry point
 plays no part in whether they run; a file already in the entry's
 import graph runs once, through the entry binary.
 
-A file outside the import graph that declares `test` blocks but is
-not named `*_test.kai` cannot safely run as a root, so the driver
-warns, naming the file. A package with no test blocks anywhere also
-warns instead of passing silently.
+`kai check` and `kai bench` discover the same files: one convention
+serves all three keywords, so a `*_test.kai` need not be split per
+keyword to be found.
+
+A file outside the import graph that declares blocks but is not
+named `*_test.kai` cannot safely run as a root, so the driver warns,
+naming the file. A package with no blocks of the kind being run also
+warns instead of passing silently — `0/0 checks passed` no longer
+stands in for "found nothing to run".
 
 ## The `tests/` directory
 
