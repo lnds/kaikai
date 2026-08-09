@@ -140,8 +140,6 @@ KNOWN_SYNTH="
 # (f) runs, so a family fix that clears (e) exposes any remaining (f)
 # debt immediately.
 KNOWN_DROP="
-# refs #1694 — unknown attributes dropped from the AST, erased by fmt
-examples/attributes/attr_unknown_ignored.kai
 "
 
 if [ ! -x "$KAIC2" ]; then
