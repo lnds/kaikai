@@ -22,6 +22,24 @@ End-of-month clamping: `add_months` clamps the day to the last
 valid day of the target month (2026-01-31 + 1 month = 2026-02-28;
 2024-01-31 + 1 month = 2024-02-29). Clamping is lossy on purpose —
 `add_months(add_months(d, 1), -1)` may not return `d`.
+
+Periods:
+  - `Period` is a calendar quantity — years, months and days kept
+    apart, because how many days a month is worth depends on which
+    month. `period_days` / `period_months` / `period_years` build
+    one, and periods add and subtract exactly.
+  - `shift(d, p)` applies one, years and months first, then days.
+    The order is fixed: applying the parts separately, in another
+    order, lands elsewhere whenever the month step clamps.
+  - `shift_exact` returns `None` instead of clamping, for callers
+    that would rather fail than land on a day they did not ask for.
+  - `between(a, b)` gives the calendar distance (`1 month 1 day`)
+    and `diff_days` the exact one (`29`). Both are true; the
+    difference between two dates has no single form.
+
+`Period` is not `time.Duration`. A duration is exact elapsed time
+and has no months; a period has no fixed length and needs a base
+date. Neither converts to the other.
 """)]
 
 import time
@@ -127,16 +145,30 @@ pub fn from_epoch_days(n: Int) : Date = {
 #[doc("""
 Shift by `n` civil days (negative goes backwards). Total: every
 input maps to a valid date.
+
+The single-unit form. `shift(d, period)` takes years, months and
+days at once and is what new code should reach for; this stays as
+the primitive it is built on.
 """)]
 pub fn add_days(d: Date, n: Int) : Date = from_epoch_days(to_epoch_days(d) + n)
 
-#[doc("Signed distance `a - b` in days. Zero iff `eq(a, b)`.")]
+#[doc("""
+Signed distance `a - b` in days. Zero iff `eq(a, b)`.
+
+The scalar answer, exact and unique. `between` gives the calendar
+answer (`1 month 1 day`); the two disagree because the difference
+between two dates has no single form.
+""")]
 pub fn diff_days(a: Date, b: Date) : Int = to_epoch_days(a) - to_epoch_days(b)
 
 #[doc("""
 Shift by `n` calendar months, clamping the day to the last valid
 day of the target month (see the module header for the rule and
 its deliberate non-reversibility).
+
+The single-unit form. Prefer `shift(d, period)` for new code: a
+period applies years, months and days in one step with a fixed
+order, and `shift_exact` reports the clamp instead of hiding it.
 """)]
 pub fn add_months(d: Date, n: Int) : Date = {
   let months0 = d.year * 12 + (d.month - 1) + n
@@ -144,6 +176,118 @@ pub fn add_months(d: Date, n: Int) : Date = {
   let m = date_floor_mod(months0, 12) + 1
   let dim = days_in_month(y, m)
   Date { year: y, month: m, day: if d.day > dim { dim } else { d.day } }
+}
+
+# ---- Periods ------------------------------------------------------
+#
+# A period is a calendar quantity, not an elapsed time: one month has
+# no fixed length, so a period never converts to seconds without a
+# base date. `time.Duration` is the exact counterpart and the two do
+# not mix; the boundary is deliberate.
+#
+# Periods add componentwise — associative, commutative, invertible.
+# APPLYING one to a date is none of those, because the month step
+# clamps. That asymmetry is why `shift` and `between` are functions
+# with a stated convention rather than an algebra on dates.
+
+#[doc("""
+A calendar quantity: years, months and days held apart because they
+convert into each other only against a base date.
+
+Add and subtract periods freely — that arithmetic is exact. Applying
+one to a date is what clamps.
+""")]
+pub type Period = { years: Int, months: Int, days: Int }
+
+#[doc("A period of `n` days.")]
+pub fn period_days(n: Int) : Period = Period { years: 0, months: 0, days: n }
+
+#[doc("A period of `n` months.")]
+pub fn period_months(n: Int) : Period = Period { years: 0, months: n, days: 0 }
+
+#[doc("A period of `n` years.")]
+pub fn period_years(n: Int) : Period = Period { years: n, months: 0, days: 0 }
+
+#[doc("The empty period; the neutral element of period addition.")]
+pub fn period_zero() : Period = Period { years: 0, months: 0, days: 0 }
+
+impl Add for Period {
+  fn add(self: Period, rhs: Period) : Period =
+    Period { years: self.years + rhs.years,
+             months: self.months + rhs.months,
+             days: self.days + rhs.days }
+}
+
+impl Sub for Period {
+  fn sub(self: Period, rhs: Period) : Period =
+    Period { years: self.years - rhs.years,
+             months: self.months - rhs.months,
+             days: self.days - rhs.days }
+}
+
+impl Eq for Period {
+  fn eq(a: Period, b: Period) : Bool =
+    a.years == b.years and a.months == b.months and a.days == b.days
+}
+
+#[doc("""
+Carries months into years (13 months becomes 1 year 1 month). Days
+are left alone: how many of them a month is worth depends on which
+month, so the two never merge.
+""")]
+pub fn period_normalise(p: Period) : Period = {
+  let total = p.years * 12 + p.months
+  Period { years: total / 12, months: total % 12, days: p.days }
+}
+
+#[doc("""
+Applies a period to a date: years and months first, then days.
+
+The order is load-bearing. Applying the parts in another order lands
+elsewhere whenever the month step clamps — from 2026-01-30, a month
+then a day reaches 2026-03-01, while a day then a month reaches
+2026-02-28.
+""")]
+pub fn shift(d: Date, p: Period) : Date =
+  add_days(add_months(d, p.years * 12 + p.months), p.days)
+
+#[doc("""
+True when `shift` would clamp: the day-of-month does not exist in
+the month the year/month step lands on.
+""")]
+pub fn shift_clamps(d: Date, p: Period) : Bool = {
+  let stepped = add_months(d, p.years * 12 + p.months)
+  stepped.day != d.day
+}
+
+#[doc("""
+`shift`, but `None` where it would clamp — for callers that would
+rather fail than silently land on a different day than they asked
+for.
+""")]
+pub fn shift_exact(d: Date, p: Period) : Option[Date] =
+  if shift_clamps(d, p) { None } else { Some(shift(d, p)) }
+
+impl Add[Period] for Date {
+  fn add(self: Date, rhs: Period) : Date = shift(self, rhs)
+}
+
+#[doc("""
+The calendar distance from `a` to `b`: whole months first, then the
+days left over. A month counts as whole when `b`'s day-of-month is
+at least `a`'s.
+
+The answer is one of several. From 2026-01-31 to 2026-03-01 this
+returns `1 month 1 day`, while `diff_days` returns 29; both are
+true, and neither reconstructs the other without a base date. Reach
+for `diff_days` when an exact count is what matters.
+""")]
+pub fn between(a: Date, b: Date) : Period = {
+  let months_raw = (b.year - a.year) * 12 + (b.month - a.month)
+  let months = if b.day < a.day { months_raw - 1 } else { months_raw }
+  let stepped = add_months(a, months)
+  period_normalise(Period { years: 0, months: months,
+                            days: diff_days(b, stepped) })
 }
 
 # ---- Comparison ---------------------------------------------------
