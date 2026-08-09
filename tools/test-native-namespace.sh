@@ -70,26 +70,34 @@ KAI_NATIVE_CGLEVEL=0 "$KAIC2" --emit=native --path "$ROOT/stdlib" "$work/probe.k
 obj="$work/probe.o"
 [ -f "$obj" ] || { echo "test-native-namespace FAIL — no object emitted at $obj"; exit 1; }
 
-# Strip the Mach-O leading underscore so both sides compare in C-source
-# spelling. `$tlv$init` / `.buf` suffixes are linker-minted decorations of
-# a runtime symbol, not separate names — trim them to their base.
-# The user namespaces (`kaiu_`/`kaiv_`, bare or leading-underscored) are the
-# CORRECT destination, so they are excluded before the diff — what remains is
-# the runtime namespace proper, where nothing user-derived may appear.
-nm -a "$obj" | awk '{print $NF}' | sed 's/^_//' \
+# `$tlv$init` / `.buf` suffixes are linker-minted decorations of a runtime
+# symbol, not separate names — trim them to their base.
+#
+# Mach-O prefixes every C symbol with an underscore, ELF does not, so the
+# same source name reads `__kai_x` on macOS and `_kai_x` on Linux. Strip that
+# ONE platform underscore only when what remains still starts with `_kai` /
+# `kai` — a blind `s/^_//` would eat the source underscore of `_kai_x` on
+# ELF, turning it into `kai_x` and reporting a leak that is not there.
+# The user namespaces (`_kaiu_`/`_kaiv_`) are the CORRECT destination, so they
+# drop out here; what remains is the runtime namespace proper, where nothing
+# user-derived may appear.
+# Both sides are then compared with any single leading underscore dropped, so
+# the Mach-O `_kai_main` and the source's `kai_main` are one name.
+nm -a "$obj" | awk '{print $NF}' \
+  | sed 's/^__kai/_kai/; s/^_kaiu_/kaiu_/; s/^_kaiv_/kaiv_/' \
   | sed 's/\$tlv\$init$//; s/\.[A-Za-z0-9_]*$//' \
-  | grep -E '^_?kai' | grep -vE '^_?kai[uv]_' | sort -u > "$work/emitted.txt"
+  | grep -E '^_?kai' | grep -vE '^kai[uv]_' | sed 's/^_//' | sort -u > "$work/emitted.txt"
 
 { tr -c 'A-Za-z0-9_' '\n' < "$ROOT/stage2/runtime.h"
   tr -c 'A-Za-z0-9_' '\n' < "$ROOT/stage0/runtime_llvm.c"
-} | grep -E '^_?kai' | grep -vE '^_?kai[uv]_' | sort -u > "$work/runtime.txt"
+} | grep -E '^_?kai' | grep -vE '^_?kai[uv]_' | sed 's/^_//' | sort -u > "$work/runtime.txt"
 
 # `_kai_default_ev_<eff>` / `_kai_default_node_<eff>` carry an effect NAME,
 # so they are user-derived, but both backends mint the identical spelling and
 # the runtime defines neither — moving them alone would break C/native byte
 # identity without closing a collision. Waived by shape, never by symbol: a
 # NEW family cannot hide behind the waiver.
-grep -vE '^_kai_default_(ev|node)_' "$work/emitted.txt" > "$work/checked.txt"
+grep -vE '^kai_default_(ev|node)_' "$work/emitted.txt" > "$work/checked.txt"
 
 leaks="$(comm -23 "$work/checked.txt" "$work/runtime.txt")"
 if [ -n "$leaks" ]; then
