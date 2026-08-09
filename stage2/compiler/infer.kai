@@ -12381,11 +12381,11 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     let lty_now = apply_ty(rr.st.sub, rl.ty)
     let rty_now = apply_ty(rr.st.sub, rr.ty)
     if binop_should_dispatch_proto(lty_now, rty_now) {
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else if ty_is_real_head(lty_now) and ty_is_real_head(rty_now) {
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else {
       # `T % T` over a same-width fixed integer keeps the primitive fast
       # path (`+`/`-`/`*`-style width wrap); everything else unifies with
@@ -12413,12 +12413,12 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
         # carries the combined unit.
         synth_binop_proto_dim_mul(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
       } else {
-        synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+        synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
       }
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
       # heterogeneous prim<->nonprim or cross-nonprim
       # routing, gated on impl-existence in the snapshot.
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else {
       # multiplication and division of dimensioned values
       # combine units rather than requiring equality. The operand-type
@@ -12450,10 +12450,10 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
         let what = string_concat("arithmetic operator '", string_concat(op, "'"))
         st_unify(rr.st, rl.ty, rr.ty, what, line, col)
       } else { rr.st }
-      synth_binop_proto(st_d, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(st_d, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
       # heterogeneous routing.
-      synth_binop_proto(rr.st, op, rl.expr, rr.expr, line, col)
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
     } else {
       # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
       # checks the unit equality automatically.
@@ -12652,14 +12652,71 @@ fn binop_proto_method(op: String) : String {
   else { "div" }
 }
 
-fn synth_binop_proto(st: InferState, op: String, le: Expr, re: Expr,
+fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
+                      re: Expr, rt: Ty,
                       line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
+  let st_h = binop_check_against_impl(st, op, lt, rt, line, col)
   let dispatcher = inf_proto_dispatcher_name(binop_proto_method(op))
   let callee = mk_expr(EVar(dispatcher), line, col)
-  synth_call(st, callee, [le, re], line, col)
+  synth_call(st_h, callee, [le, re], line, col)
 }
+
+# The dispatcher's signature is generic over `Self`, so unifying against
+# it accepts any operand sharing the impl's head name and lets a wrong
+# habitant through. Re-run the ordinary call unification against the
+# selected impl's own concrete signature — the check a direct call to
+# that fn would get. Dispatch stays keyed on head names (O(1)); only the
+# winner is re-checked.
+fn binop_check_against_impl(st: InferState, op: String, lt0: Ty, rt0: Ty,
+                            line: Int, col: Int) : InferState / Console + File + Mutable {
+  let proto = binop_proto_name(op)
+  let method = binop_proto_method(op)
+  let lt = apply_ty(st.sub, lt0)
+  let rt = apply_ty(st.sub, rt0)
+  match binop_impl_sym(st.proto_impls, proto, method, lt, rt, st.sub) {
+    None -> st
+    Some(sym) -> match ty_env_lookup(st.env, sym) {
+      None -> st
+      Some(sc) -> {
+        let inst = st_instantiate(st, sc)
+        # The notes cite the operator the user wrote, not the impl's
+        # mangled symbol, which is never spelled in source.
+        let callee = mk_expr(EVar(op), line, col)
+        let rv = st_fresh_ty(inst.st)
+        let fr = subst_fresh_row(rv.st.sub)
+        let st2 = st_set_sub(rv.st, fr.subst)
+        let expected = TyFnT([lt, rt], rv.ty,
+                             Row { labels: [], tail: Some(fr.id), display_alias: None })
+        st_unify_call(st2, callee, inst.ty, [lt, rt], expected, line, col)
+      }
+    }
+  }
+}
+
+# The mangled symbol of the impl the operator dispatches to, matching
+# `binop_pick_proto_dispatch`'s receiver/mirror order.
+fn binop_impl_sym(impls: [ProtoImplReg], proto: String, method: String,
+                  lt: Ty, rt: Ty, sub: Subst) : Option[String] =
+  match binop_pick_proto_dispatch(impls, proto, method, lt, rt, sub) {
+    None -> None
+    Some(BPC(recv, want)) -> impl_sym_for(impls, proto, method, recv, want)
+  }
+
+fn impl_sym_for(impls: [ProtoImplReg], proto: String, op: String,
+                recv: String, want: [String]) : Option[String] =
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(p, t, o, sym, ans, _) ->
+        if p == proto and t == recv and o == op and arg_names_match(ans, recv, want) {
+          Some(sym)
+        } else {
+          impl_sym_for(rest, proto, op, recv, want)
+        }
+    }
+  }
 
 # both operands share a concrete TyCon head and at least one carries
 # a unit decoration — the shapes where protocol dispatch would
@@ -12687,7 +12744,9 @@ fn synth_binop_proto_dim_mul(st: InferState, op: String,
   let combined = if op == "*" { UMul(ls.dim, rs.dim) }
                  else { UMul(ls.dim, UInv(rs.dim)) }
   let s1 = st_check_atomic_unit(st, op, combined, line, col)
-  let inf = synth_binop_proto(s1, op, le, re, line, col)
+  # The units are the combined-unit rule's business, already checked
+  # above; the impl sees the bare carriers.
+  let inf = synth_binop_proto(s1, op, le, ls.base, re, rs.base, line, col)
   let base = (ty_split_dim(inf.ty, inf.st.sub)).base
   let ty = dim_collapse(base, unit_canon(combined))
   mk_inferred(inf.st, ty, with_ty(inf.expr, ty))
