@@ -187,8 +187,8 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
+tier0: selfhost test-kai-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
 
 # kaic1 must reject every `examples/negative/stage1_rejections/*.kai`
 # with the diagnostic its `.kaic1.err.expected` pins. Bootstrap-only
@@ -241,6 +241,11 @@ test-kai-namespace: kaic2
 	rev=$$(tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^(kaiu_|kaiv_)' | sort -u); \
 	[ -z "$$rev" ] || { echo "test-kai-namespace FAIL: runtime.h names symbols inside the user namespaces:"; echo "$$rev"; exit 1; }; \
 	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_"
+
+# A root file whose basename is not a C identifier still mints valid symbols.
+# Both backends, since the name reaches C emission and KIR lowering alike.
+test-module-name-ident: kaic2
+	@./tools/test-module-name-ident.sh
 
 # A header-only edit must rebuild every artifact that embeds it, and must not
 # rebuild the ones that do not. Both directions are invisible to CI, which
