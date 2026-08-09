@@ -15,6 +15,7 @@ import compiler.kinds
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.ast_map
 import compiler.parse
 import compiler.fmt_writer
 import compiler.fmt_refine
@@ -254,15 +255,43 @@ pub fn fmt_row(row: RowExpr, s: FmtSt) : FmtSt {
     ROpen(tail, labels) -> {
       let s1 = fmt_emit(s, " / ")
       if list_is_empty(labels) {
-        fmt_emit(s1, tail)
+        fmt_emit(s1, fmt_row_tail(tail))
       } else {
         let s2 = fmt_row_labels(labels, s1)
         let s3 = fmt_emit(s2, " + ")
-        fmt_emit(s3, tail)
+        fmt_emit(s3, fmt_row_tail(tail))
       }
     }
   }
 }
+
+# A row-hole tail is stored as a positioned placeholder minted by the
+# parser (`__rowhole__anon_L_C` for `?`, `__rowhole_<name>_L_C` for
+# `?name`); the author's spelling is embedded, so print it back.
+fn fmt_row_tail(tail: String) : String =
+  if string_length(tail) < 10 or string_slice(tail, 0, 10) != "__rowhole_" { tail }
+  else {
+    let inner = string_slice(tail, 10, string_length(tail) - 10)
+    match frt_drop_pos_suffix(inner) {
+      "_anon" -> "?"
+      name    -> string_concat("?", name)
+    }
+  }
+
+# Strip the trailing `_<line>_<col>` the parser appended.
+fn frt_drop_pos_suffix(s: String) : String =
+  match frt_last_underscore(s, string_length(s) - 1) {
+    None -> s
+    Some(p_col) -> match frt_last_underscore(s, p_col - 1) {
+      None -> s
+      Some(p_line) -> string_slice(s, 0, p_line)
+    }
+  }
+
+fn frt_last_underscore(s: String, from: Int) : Option[Int] =
+  if from < 0 { None }
+  else if char_at_or_zero(s, from) == '_' { Some(from) }
+  else { frt_last_underscore(s, from - 1) }
 
 pub fn fmt_row_labels(ls: [RowLabel], s: FmtSt) : FmtSt {
   match ls {
@@ -367,11 +396,11 @@ fn fmt_row_bare(row: RowExpr, s: FmtSt) : FmtSt {
     RClosed(labels) -> fmt_row_labels(labels, s)
     ROpen(tail, labels) ->
       if list_is_empty(labels) {
-        fmt_emit(s, tail)
+        fmt_emit(s, fmt_row_tail(tail))
       } else {
         let s1 = fmt_row_labels(labels, s)
         let s2 = fmt_emit(s1, " + ")
-        fmt_emit(s2, tail)
+        fmt_emit(s2, fmt_row_tail(tail))
       }
   }
 }
@@ -431,14 +460,25 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
       let s1 = fmt_expr_atom(inner, s0)
       fmt_emit(s1, "!")
     }
-    ECall(callee, call_args) -> match fmt_call_literal(callee, call_args) {
-      Some(lit) -> fmt_emit(s0, lit)
-      None      -> fmt_call(callee, call_args, s0)
+    ECall(callee, call_args) -> match fmt_pipe_under(callee, call_args) {
+      Some(PU(lhs, rhs)) -> {
+        let s1 = fmt_expr(lhs, s0)
+        let s2 = fmt_emit(s1, " |> ")
+        fmt_expr(rhs, s2)
+      }
+      None -> match fmt_call_literal(callee, call_args) {
+        Some(lit) -> fmt_emit(s0, lit)
+        None      -> fmt_call(callee, call_args, s0)
+      }
     }
-    EField(obj, fld) -> {
-      let s1 = fmt_expr_atom(obj, s0)
-      let s2 = fmt_emit(s1, ".")
-      fmt_emit(s2, fld)
+    # `.fld` point-free: the placeholder and the access share one dot.
+    EField(obj, fld) -> match obj.kind {
+      EPlaceholder -> fmt_emit(fmt_emit(s0, "."), fld)
+      _ -> {
+        let s1 = fmt_expr_atom(obj, s0)
+        let s2 = fmt_emit(s1, ".")
+        fmt_emit(s2, fld)
+      }
     }
     EIndex(obj, idx) -> {
       let s1 = fmt_expr_atom(obj, s0)
@@ -457,7 +497,10 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     }
     EIf(c, then_e, else_opt) -> fmt_if(c, then_e, else_opt, s0)
     EMatch(scrut, arms) -> fmt_match(scrut, arms, s0)
-    ELambda(params, body) -> fmt_lambda(params, body, s0)
+    ELambda(params, body) -> match fmt_placeholder_body(params, body) {
+      Some(pf_body) -> fmt_expr(pf_body, s0)
+      None          -> fmt_lambda(params, body, s0)
+    }
     ERecordLit(name, fields) -> fmt_record_lit(name, fields, s0)
     EList(elems) -> fmt_list(elems, s0)
     ERange(lo, hi, step) -> fmt_range(lo, hi, step, s0)
@@ -520,6 +563,101 @@ fn fmt_surface(sf: SurfaceForm, e: Expr, s: FmtSt) : FmtSt = match sf {
     fmt_emit(s2, ")")
   }
   SfHandleInit(_) -> panic("kai fmt: initially clause outside a handler")
+  SfBigIntLit(digits) -> fmt_emit(s, string_concat(digits, "n"))
+  SfRefMake(inner) -> fmt_expr_atom(inner, fmt_emit(s, "&"))
+  SfDeref(target) -> fmt_expr(target, fmt_emit(s, "@"))
+  SfMultiMatch(scruts, arms) -> {
+    let s1 = fmt_emit(s, "match ")
+    let s2 = fmt_scrut_list(scruts, s1)
+    let s3 = fmt_emit(s2, " {")
+    let s4 = fmt_indent_in(fmt_newline(s3))
+    let s5 = fmt_mmarms(arms, "if", false, s4)
+    fmt_emit(fmt_indent_out(s5), "}")
+  }
+  SfCaseBlock(arms) -> {
+    let s1 = fmt_emit(s, "{")
+    let s2 = fmt_indent_in(fmt_newline(s1))
+    let s3 = fmt_mmarms(arms, "when", true, s2)
+    fmt_emit(fmt_indent_out(s3), "}")
+  }
+  SfMapLit(spread, flat) -> {
+    let s1 = fmt_emit(s, "%{")
+    match spread {
+      None -> match flat {
+        [] -> fmt_emit(s1, "}")
+        _  -> fmt_emit(fmt_map_entries(flat, fmt_emit(s1, " ")), " }")
+      }
+      Some(base) -> {
+        let s2 = fmt_emit(s1, " ...")
+        let s3 = fmt_expr(base, s2)
+        match flat {
+          [] -> fmt_emit(s3, " }")
+          _  -> fmt_emit(fmt_map_entries(flat, fmt_emit(s3, ", ")), " }")
+        }
+      }
+    }
+  }
+  SfSetLit(spread, elems) -> {
+    let s1 = fmt_emit(s, "%[")
+    match spread {
+      None -> match elems {
+        [] -> fmt_emit(s1, "]")
+        _  -> fmt_emit(fmt_call_args(elems, fmt_emit(s1, " ")), " ]")
+      }
+      Some(base) -> {
+        let s2 = fmt_emit(s1, " ...")
+        let s3 = fmt_expr(base, s2)
+        match elems {
+          [] -> fmt_emit(s3, " ]")
+          _  -> fmt_emit(fmt_call_args(elems, fmt_emit(s3, ", ")), " ]")
+        }
+      }
+    }
+  }
+}
+
+fn fmt_scrut_list(es: [Expr], s: FmtSt) : FmtSt = match es {
+  [] -> s
+  [e] -> fmt_stmt_head_expr(e, s)
+  [e, ...rest] -> fmt_scrut_list(rest, fmt_emit(fmt_stmt_head_expr(e, s), ", "))
+}
+
+# Multi-pattern arms; the guard keyword differs by form (`if` in a
+# multi-scrutinee match, `when` in a case-block) and a case-block arm
+# opens with the `case` keyword.
+fn fmt_mmarms(arms: [MMArm], guard_kw: String, case_led: Bool, s: FmtSt) : FmtSt =
+  match arms {
+    [] -> s
+    [a, ...rest] ->
+      fmt_mmarms(rest, guard_kw, case_led,
+                 fmt_newline(fmt_mmarm(a, guard_kw, case_led, s)))
+  }
+
+fn fmt_mmarm(a: MMArm, guard_kw: String, case_led: Bool, s: FmtSt) : FmtSt = match a {
+  MMArm(pats, guard, body) -> {
+    let s1 = if case_led { fmt_emit(s, "case ") } else { s }
+    let s2 = fmt_pat_list(pats, s1)
+    let s3 = match guard {
+      None -> s2
+      Some(g) -> fmt_expr(g, fmt_emit(s2, string_concat_all([" ", guard_kw, " "])))
+    }
+    let s4 = fmt_emit(s3, " -> ")
+    fmt_expr(body, s4)
+  }
+}
+
+# `k1: v1, k2: v2` from the flattened `[k1, v1, k2, v2, ...]` list.
+fn fmt_map_entries(flat: [Expr], s: FmtSt) : FmtSt = match flat {
+  [] -> s
+  [k, v] -> fmt_map_entry(k, v, s)
+  [k, v, ...rest] -> fmt_map_entries(rest, fmt_emit(fmt_map_entry(k, v, s), ", "))
+  _ -> panic("kai fmt: map literal with an odd entry list")
+}
+
+fn fmt_map_entry(k: Expr, v: Expr, s: FmtSt) : FmtSt {
+  let s1 = fmt_expr(k, s)
+  let s2 = fmt_emit(s1, ": ")
+  fmt_expr(v, s2)
 }
 
 # A lambda the author wrote as a block: `{ body }`, `{ params -> body }`,
@@ -651,6 +789,54 @@ pub fn expr_is_atomic(e: Expr) : Bool {
     ESurface(sf) -> match sf { SfLamBlock(_, _) -> true  _ -> false }
     _ -> false
   }
+}
+
+# The pipe-placeholder desugar (`lhs |> f(_, y)` into
+# `((__pipe) => f(__pipe, y))(lhs)`) and the point-free argument
+# desugar (`f(. < 3)` into `f((__pl) => __pl < 3)`) both mint a fixed
+# reserved binder, so the writer restores the author's spelling by
+# structure: the parser is the only producer of those binders.
+type PipeUnder = PU(Expr, Expr)
+
+fn fmt_pipe_under(callee: Expr, call_args: [Expr]) : Option[PipeUnder] =
+  match callee.kind {
+    ELambda(params, body) -> match params {
+      [prm] ->
+        if prm.pname == "__pipe" {
+          match call_args {
+            [lhs] -> Some(PU(lhs, fmt_subst_var(body, "__pipe", EUnder)))
+            _     -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+
+fn fmt_placeholder_body(params: [Param], body: Expr) : Option[Expr] =
+  match params {
+    [prm] ->
+      if prm.pname == "__pl" { Some(fmt_subst_var(body, "__pl", EPlaceholder)) }
+      else { None }
+    _ -> None
+  }
+
+fn fmt_subst_var(e: Expr, name: String, to: ExprKind) : Expr = match e.kind {
+  EVar(v) ->
+    if v == name { Expr { kind: to, line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+    else { e }
+  # A nested lambda re-binding the same name shadows it; stop there.
+  ELambda(ps, _) ->
+    if fsv_binds(ps, name) { e }
+    else { Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+                  line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+  _ -> Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+              line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn fsv_binds(ps: [Param], name: String) : Bool = match ps {
+  [] -> false
+  [prm, ...rest] -> prm.pname == name or fsv_binds(rest, name)
 }
 
 pub fn fmt_call(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt {
@@ -932,13 +1118,23 @@ pub fn fmt_record_fields(fs: [FieldInit], s: FmtSt) : FmtSt {
   }
 }
 
+# Sentinel field names print their surface forms back: `...src` for the
+# spread slot, the bare value for a positional field, the bare name for
+# a pun.
 pub fn fmt_record_field(f: FieldInit, s: FmtSt) : FmtSt {
   match f {
-    FI(name, e) -> {
-      let s1 = fmt_emit(s, name)
-      let s2 = fmt_emit(s1, ": ")
-      fmt_expr(e, s2)
-    }
+    FI(name, e) ->
+      if is_spread_field_marker(name) {
+        fmt_expr(e, fmt_emit(s, "..."))
+      } else if is_pos_field_marker(name) {
+        fmt_expr(e, s)
+      } else if is_pun_field_marker(name) {
+        fmt_emit(s, pun_field_name(name))
+      } else {
+        let s1 = fmt_emit(s, name)
+        let s2 = fmt_emit(s1, ": ")
+        fmt_expr(e, s2)
+      }
   }
 }
 
