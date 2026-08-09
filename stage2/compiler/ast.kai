@@ -263,6 +263,22 @@ pub type SurfaceForm
   # `(init)` parenthesised form. Wraps the init expression in the
   # `EHandle` state slot; legal nowhere else.
   | SfHandleInit(Expr)
+  # A BigInt literal `123n`; the digit string, exactly as written.
+  | SfBigIntLit(String)
+  # A map literal `%{ ... }`: optional `...base` spread, then the
+  # entries as a flattened `[k1, v1, k2, v2, ...]` list (even length).
+  | SfMapLit(Option[Expr], [Expr])
+  # A set literal `%[ ... ]`: optional `...base` spread, then elements.
+  | SfSetLit(Option[Expr], [Expr])
+  # A reference take `&x`.
+  | SfRefMake(Expr)
+  # A dereference `@r` / `@r.field…`; the payload is the target path.
+  | SfDeref(Expr)
+  # A multi-scrutinee match `match e1, e2 { p1, p2 -> body ... }`.
+  | SfMultiMatch([Expr], [MMArm])
+  # A `case`-block fn body: `{ case p (when g)? -> body ... }`. The
+  # scrutinees are the owning fn's params, supplied at lowering.
+  | SfCaseBlock([MMArm])
 
 # Surface forms in type position, wrapped by `TySurface`. Same
 # discipline as `SurfaceForm`: exhaustive matches force a printer arm
@@ -277,6 +293,10 @@ pub type TypeSurface
 
 # Surface forms in pattern position, wrapped by `PSurface`. Same
 # discipline as `SurfaceForm`.
+# One arm of a multi-scrutinee match or a `case`-block: N patterns
+# (N == scrutinee count), an optional guard, and the body.
+pub type MMArm = MMArm([Pattern], Option[Expr], Expr)
+
 pub type PatSurface
   # An n-tuple pattern `(a, b[, c[, d]])`; arity 2..4.
   = PsTuple([Pattern])
@@ -334,6 +354,47 @@ pub fn surface_children(sf: SurfaceForm) : [Expr] = match sf {
   SfLamBlock(lam, _)           -> [lam]
   SfTuple(elems)               -> elems
   SfHandleInit(init)           -> [init]
+  SfBigIntLit(_)               -> []
+  SfMapLit(spread, flat)       -> match spread {
+    Some(b) -> [b, ...flat]
+    None    -> flat
+  }
+  SfSetLit(spread, elems)      -> match spread {
+    Some(b) -> [b, ...elems]
+    None    -> elems
+  }
+  SfRefMake(e)                 -> [e]
+  SfDeref(target)              -> [target]
+  SfMultiMatch(scruts, arms)   -> list_append(scruts, mmarms_children(arms))
+  SfCaseBlock(arms)            -> mmarms_children(arms)
+}
+
+fn mmarms_children(arms: [MMArm]) : [Expr] = match arms {
+  [] -> []
+  [MMArm(_, guard, body), ...rest] -> match guard {
+    Some(g) -> [g, body, ...mmarms_children(rest)]
+    None    -> [body, ...mmarms_children(rest)]
+  }
+}
+
+# Re-thread a flat child stream back through the arm list, consuming
+# one expr per present guard and one per body.
+fn mmarms_rebuild(arms: [MMArm], xs: [Expr]) : [MMArm] = match arms {
+  [] -> []
+  [MMArm(pats, guard, _), ...rest] -> match guard {
+    Some(_) -> match xs {
+      [g, b, ...more] -> [MMArm(pats, Some(g), b), ...mmarms_rebuild(rest, more)]
+      _ -> panic("surface_rebuild: child list does not match the form")
+    }
+    None -> match xs {
+      [b, ...more] -> [MMArm(pats, None, b), ...mmarms_rebuild(rest, more)]
+      _ -> panic("surface_rebuild: child list does not match the form")
+    }
+  }
+}
+
+fn mmarm_map(a: MMArm, f: (Expr) -> Expr) : MMArm = match a {
+  MMArm(pats, guard, body) -> MMArm(pats, sf_opt_map(guard, f), f(body))
 }
 
 #[doc("Rebuild a surface form from a transformed child list in `surface_children` order.")]
@@ -357,6 +418,34 @@ pub fn surface_rebuild(sf: SurfaceForm, xs: [Expr]) : SurfaceForm = match sf {
     [init, ..._] -> SfHandleInit(init)
     _            -> panic("surface_rebuild: child list does not match the form")
   }
+  SfBigIntLit(_) -> sf
+  SfMapLit(spread, _) -> match spread {
+    Some(_) -> match xs {
+      [b, ...rest] -> SfMapLit(Some(b), rest)
+      _            -> panic("surface_rebuild: child list does not match the form")
+    }
+    None -> SfMapLit(None, xs)
+  }
+  SfSetLit(spread, _) -> match spread {
+    Some(_) -> match xs {
+      [b, ...rest] -> SfSetLit(Some(b), rest)
+      _            -> panic("surface_rebuild: child list does not match the form")
+    }
+    None -> SfSetLit(None, xs)
+  }
+  SfRefMake(_) -> match xs {
+    [e, ..._] -> SfRefMake(e)
+    _         -> panic("surface_rebuild: child list does not match the form")
+  }
+  SfDeref(_) -> match xs {
+    [target, ..._] -> SfDeref(target)
+    _              -> panic("surface_rebuild: child list does not match the form")
+  }
+  SfMultiMatch(scruts, arms) -> {
+    let n = list_length(scruts)
+    SfMultiMatch(sf_take(xs, n), mmarms_rebuild(arms, sf_drop(xs, n)))
+  }
+  SfCaseBlock(arms) -> SfCaseBlock(mmarms_rebuild(arms, xs))
 }
 
 # Pure `f` only (kaic1 cannot compile a row-generic fn); an effectful
@@ -368,6 +457,18 @@ pub fn surface_map(sf: SurfaceForm, f: (Expr) -> Expr) : SurfaceForm = match sf 
   SfLamBlock(lam, trailing)    -> SfLamBlock(f(lam), trailing)
   SfTuple(elems)               -> SfTuple(map(elems, f))
   SfHandleInit(init)           -> SfHandleInit(f(init))
+  SfBigIntLit(_)               -> sf
+  SfMapLit(spread, flat)       -> SfMapLit(sf_opt_map(spread, f), map(flat, f))
+  SfSetLit(spread, elems)      -> SfSetLit(sf_opt_map(spread, f), map(elems, f))
+  SfRefMake(e)                 -> SfRefMake(f(e))
+  SfDeref(target)              -> SfDeref(f(target))
+  SfMultiMatch(scruts, arms)   -> SfMultiMatch(map(scruts, f), map(arms, (a) => mmarm_map(a, f)))
+  SfCaseBlock(arms)            -> SfCaseBlock(map(arms, (a) => mmarm_map(a, f)))
+}
+
+fn sf_opt_map(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = match o {
+  None -> None
+  Some(e) -> Some(f(e))
 }
 
 fn sf_take(xs: [Expr], n: Int) : [Expr] =
@@ -1054,6 +1155,17 @@ pub fn pos_field_marker(i: Int) : String =
 pub fn spread_field_marker() : String = "__spread__"
 
 pub fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
+
+# Pun shorthand marker: `{ x, y }` parses as `FI("__pun__x", EVar x)`
+# so the writer can restore the shorthand; `surface_lower_decls`
+# normalises it back to the plain field name before any other pass.
+pub fn pun_field_marker(name: String) : String = string_concat("__pun__", name)
+
+pub fn is_pun_field_marker(s: String) : Bool =
+  string_length(s) > 7 and string_slice(s, 0, 7) == "__pun__"
+
+pub fn pun_field_name(s: String) : String =
+  string_slice(s, 7, string_length(s) - 7)
 
 pub fn is_pos_field_marker(s: String) : Bool {
   let n = string_length(s)

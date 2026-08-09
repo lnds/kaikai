@@ -131,49 +131,6 @@ KNOWN_IDEMPOTENT="
 # (a parse-time desugar with no surface wrapper). One entry per file,
 # each tagged with the open issue for its sugar family.
 KNOWN_SYNTH="
-# refs #1683 — multi-arg match / case-block desugar
-examples/effects/m7d_27_multi_arg_match.kai
-examples/match/multi_arg_basic.kai
-examples/perceus/native_dead_donor_reuse_995.kai
-examples/perceus/native_shared_reuse_corruption_995.kai
-examples/sugars/case_block_multi_arg.kai
-examples/sugars/case_block_recursive_list.kai
-examples/sugars/case_block_single_arg.kai
-examples/sugars/case_block_with_guard.kai
-examples/tco/param_shadow_rebind.kai
-examples/unions/issue_430_multiclause_upcast_first_arm_narrower.kai
-# refs #1684 — map/set literal lowering
-examples/stdlib/map_set_eq_order.kai
-examples/sugars/coll_literal_map.kai
-examples/sugars/coll_literal_set.kai
-examples/sugars/coll_literal_spread.kai
-# refs #1685 — Ref sugar lowering
-examples/sugars/loop/issue_285_ref_in_until.kai
-examples/sugars/loop/issue_285_ref_in_while.kai
-examples/sugars/ref_amp_make.kai
-examples/sugars/ref_deref_field.kai
-examples/sugars/ref_field_assign.kai
-examples/sugars/ref_sugar_basic.kai
-examples/sugars/ref_sugar_cross_fn.kai
-examples/sugars/ref_sugar_mixed_with_var.kai
-# refs #1686 — record spread/positional sentinel fields
-examples/records/spread_all_overridden.kai
-examples/records/spread_basic.kai
-examples/records/spread_no_override.kai
-examples/records/spread_type_mismatch.kai
-examples/sugars/positional_record_arity.kai
-examples/sugars/positional_record_basic.kai
-# refs #1687 — placeholder / pipe gensyms
-examples/stdlib/list_pipeline.kai
-examples/sugars/m7d_21_pipe_placeholder_basic.kai
-examples/sugars/m7d_21_pipe_placeholder_evaluates_once.kai
-examples/sugars/point_free_method_not_found_neg.kai
-examples/sugars/point_free_method_ufcs.kai
-# refs #1688 — BigInt literal lowering
-examples/numeric/bigint_literal.kai
-# refs #1689 — row holes
-examples/sugars/effect_holes_json_basic.kai
-examples/sugars/row_hole_basic.kai
 "
 
 # (f) retention — fmt drops occurrences of identifiers the source
@@ -183,10 +140,6 @@ examples/sugars/row_hole_basic.kai
 # (f) runs, so a family fix that clears (e) exposes any remaining (f)
 # debt immediately.
 KNOWN_DROP="
-# refs #1683 — case/when erased by the case-block desugar
-examples/match/range_pattern_clause_block.kai
-examples/sugars/case_block_non_exhaustive.kai
-examples/unions/issue_430_multiclause_single_arg.kai
 # refs #1694 — unknown attributes dropped from the AST, erased by fmt
 examples/attributes/attr_unknown_ignored.kai
 "
@@ -264,7 +217,8 @@ strip_pos() {
   sed -e 's/ @[0-9][0-9]*:[0-9][0-9]*//g' \
       -e 's/declared at line [0-9][0-9]*, col [0-9][0-9]*/declared at line L, col C/g' \
       -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*__/__\1_L_C__/g' \
-      -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*_\([0-9][0-9]*\)__/__\1_L_C_\2__/g' "$1"
+      -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*_\([0-9][0-9]*\)__/__\1_L_C_\2__/g' \
+      -e 's/__rowhole_\([A-Za-z_]*\)_[0-9][0-9]*_[0-9][0-9]*/__rowhole_\1_L_C/g' "$1"
 }
 
 # Nearest directory at or above $1 carrying a manifest (template

@@ -1347,22 +1347,12 @@ fn parse_unary(p: Parser) : PExpr / Console {
     let r = parse_unary(p_advance(p))
     match r.r {
       None -> err_e(r.p)
-      Some(e) -> {
-        let eff = mk_expr(EVar("Mutable"), t.line, t.col)
-        let maker = mk_expr(EField(eff, "ref_make"), t.line, t.col)
-        ok_e(r.p, mk_expr(ECall(maker, [e]), t.line, t.col))
-      }
+      Some(e) -> ok_e(r.p, mk_expr(ESurface(SfRefMake(e)), t.line, t.col))
     }
   } else if tk_is(t.kind, TkAt) {
     # `@r` / `@r.field…` dereferences a first-class `Ref[T]` (OCaml `!r`
-    # / C `*p`). A bare `@ident` lowers to the sentinel `ident.__deref()`
-    # — a reserved name the user cannot spell — so the cell-read lowering
-    # can tell a `@`-deref from a literal `ident.get()`: `@cell` is
-    # rejected (a cell reads naked), while `@ref` rewrites to
-    # `ref.get()` and the alias rewrite maps it to `Mutable.ref_get`.
-    # A dotted `@r.field` cannot be a cell (cells are simple bindings),
-    # so it skips the sentinel and lowers straight to `r.field.get()`,
-    # which the typer's `try_ref_sugar_op` maps to `Mutable.ref_get`.
+    # / C `*p`). The target path is preserved; `surface_lower` picks the
+    # deref lowering by its shape.
     let p1 = p_advance(p)
     let id = p_peek(p1)
     if not tk_is(id.kind, TkIdent) {
@@ -1374,11 +1364,7 @@ fn parse_unary(p: Parser) : PExpr / Console {
       let pr = parse_deref_path(p2, cap)
       match pr.r {
         None -> err_e(pr.p)
-        Some(target) -> {
-          let sentinel = match target.kind { EVar(_) -> "__deref" _ -> "get" }
-          let getter = mk_expr(EField(target, sentinel), t.line, t.col)
-          ok_e(pr.p, mk_expr(ECall(getter, []), t.line, t.col))
-        }
+        Some(target) -> ok_e(pr.p, mk_expr(ESurface(SfDeref(target)), t.line, t.col))
       }
     }
   } else {
@@ -1817,19 +1803,14 @@ fn parse_primary(p: Parser) : PExpr / Console {
       let digits = string_slice(span, 0, string_length(span) - 1)
       ok_e(p_advance(p), mk_expr(EDecimalLit(digits), t.line, t.col))
     }
-    # `<int>n` desugars at parse time to `bigint.from_literal("<digits>")`.
-    # The span covers digits + trailing `n`; strip the `n` and pass the
-    # digit string through untouched so arbitrary-precision values fold
-    # exactly — never via an i64 that would wrap. The resolver rewrites
-    # the `EField(EVar("bigint"), "from_literal")` callee to an EModCall
-    # once the `bigint` module is imported (`import math.bigint`).
+    # `<int>n` — a BigInt literal. The span covers digits + trailing
+    # `n`; the digit string is kept as written and `surface_lower`
+    # expands it to `bigint.from_literal("<digits>")` so arbitrary-
+    # precision values fold exactly — never via an i64 that would wrap.
     TkBigInt -> {
       let span = tok_source(p.src, t)
       let digits = string_slice(span, 0, string_length(span) - 1)
-      let s_e = mk_expr(EStr(string_concat(string_concat("\"", digits), "\""), false), t.line, t.col)
-      let mod_var = mk_expr(EVar("bigint"), t.line, t.col)
-      let callee = mk_expr(EField(mod_var, "from_literal"), t.line, t.col)
-      ok_e(p_advance(p), mk_expr(ECall(callee, [s_e]), t.line, t.col))
+      ok_e(p_advance(p), mk_expr(ESurface(SfBigIntLit(digits)), t.line, t.col))
     }
     # `<digits>i` desugars at parse time to
     # `complex.mk(0.0, <digits>)`. Span covers digits + trailing `i`;
@@ -2806,13 +2787,14 @@ fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
       }
     }
     # Record-literal punning. `{ x, y }` desugars to
-    # `{ x: x, y: y }`. Symmetric with the pattern form already
+    # `{ x: x, y: y }`, with the shorthand kept in a pun marker so the
+    # writer restores it. Symmetric with the pattern form already
     # parsed by `parse_record_pattern_fields` (PField is_shorthand).
     # Mixed forms (`{ x, y: other }`) compose because the punning
     # decision is per-field.
     else if p_at(p1, TkComma) or p_at(p1, TkRbrace) {
       let val = mk_expr(EVar(fname), tk.line, tk.col)
-      let acc1 = [FI(fname, val), ...acc]
+      let acc1 = [FI(pun_field_marker(fname), val), ...acc]
       if p_at(p1, TkComma) {
         parse_record_fields_loop(p_skip_newlines(p_advance(p1)), acc1, type_name, tname)
       } else {
@@ -3150,13 +3132,11 @@ fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr / Console {
 # `{`/`[` it opens a literal, while infix `a % b` (modulo) is consumed
 # by `parse_mul_rest` before reaching primary. The delimiter (brace vs
 # bracket) discriminates map from set with no ambiguity, empties
-# included. No new AST node: like `<int>n -> bigint.from_int`, the
-# literal lowers here into the pure L1 calls `map.from`/`set.from`/
-# `map.empty`/`set.empty` (no spread) or chained `map.put`/`set.insert`
-# (spread base first). The callee is `EField(EVar(mod), fn)` so the
-# qualified-call resolver rewrites it to an `EModCall`, as the numeric
-# literal sugars do. The single-spread-first rule is enforced at the
-# parse site, mirroring the record-spread loop.
+# included. The literal is preserved as `SfMapLit`/`SfSetLit`;
+# `surface_lower` expands it into the pure L1 calls `map.from`/
+# `set.from`/`map.empty`/`set.empty` (no spread) or chained `map.put`/
+# `set.insert` (spread base first). The single-spread-first rule is
+# enforced at the parse site, mirroring the record-spread loop.
 
 # A parsed map entry: key and value expressions.
 type MapEntry = ME(Expr, Expr)
@@ -3166,14 +3146,6 @@ type PEntry = { p: Parser, r: Option[MapEntry] }
 
 fn ok_entry(p: Parser, e: MapEntry) : PEntry = PEntry { p: p, r: Some(e) }
 fn err_entry(p: Parser) : PEntry = PEntry { p: p, r: None }
-
-# `EField(EVar(mod), fn)`: the unresolved qualified callee the
-# qualified-call resolver rewrites into an `EModCall`.
-fn coll_callee(mod: String, fn_name: String, line: Int, col: Int) : Expr =
-  mk_expr(EField(mk_expr(EVar(mod), line, col), fn_name), line, col)
-
-fn coll_call(mod: String, fn_name: String, args: [Expr], line: Int, col: Int) : Expr =
-  mk_expr(ECall(coll_callee(mod, fn_name, line, col), args), line, col)
 
 # Entry from `parse_primary` on `TkPercent`. The token after `%`
 # selects map (`{`) or set (`[`); anything else is not a literal.
@@ -3189,18 +3161,24 @@ fn parse_collection_lit(p: Parser, t: Token) : PExpr / Console {
   }
 }
 
-# `%{}` -> map.empty(); `%{ k: v }` -> map.from([Pair]);
-# `%{ ...base, k: v }` -> map.put chain over base.
+fn mk_map_lit(spread: Option[Expr], entries: [MapEntry], t: Token) : Expr =
+  mk_expr(ESurface(SfMapLit(spread, entries_flatten(entries, []))), t.line, t.col)
+
+fn entries_flatten(entries: [MapEntry], acc: [Expr]) : [Expr] = match entries {
+  [] -> list_reverse(acc)
+  [ME(k, v), ...rest] -> entries_flatten(rest, [v, k, ...acc])
+}
+
 fn parse_map_lit(p: Parser, t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_e(p_advance(p0), coll_call("map", "empty", [], t.line, t.col))
+    ok_e(p_advance(p0), mk_map_lit(None, [], t))
   } else if p_at(p0, TkEllipsis) {
     let r = parse_expr(p_skip_newlines(p_advance(p0)))
     match r.r {
       None -> err_e(r.p)
-      Some(base) -> map_after_spread(r.p, base, t)
+      Some(base) -> map_after_spread(r.p, base, [], t)
     }
   } else {
     parse_map_entries(p0, [], t)
@@ -3222,13 +3200,13 @@ fn parse_map_entries(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
 fn map_entries_sep(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
 
   if p_at(p, TkRbrace) {
-    ok_e(p_advance(p), map_from_entries(list_reverse(acc), t))
+    ok_e(p_advance(p), mk_map_lit(None, list_reverse(acc), t))
   } else if not p_at(p, TkComma) {
     err_e(p_error_here(p, "expected `,` or `}` in map literal"))
   } else {
     let p1 = p_skip_newlines(p_advance(p))
     if p_at(p1, TkRbrace) {
-      ok_e(p_advance(p1), map_from_entries(list_reverse(acc), t))
+      ok_e(p_advance(p1), mk_map_lit(None, list_reverse(acc), t))
     } else if p_at(p1, TkEllipsis) {
       err_e(p_error_here(p1,
         "map literal admits a single `...` spread, and it must come first"))
@@ -3260,19 +3238,18 @@ fn parse_map_entry(p: Parser, t: Token) : PEntry / Console {
   }
 }
 
-# Override chain after `%{ ...base }`: each later `key: value` becomes
-# an outer `map.put`, so a key repeated from the base wins.
-fn map_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
+# Entries after `%{ ...base }`; overrides accumulate in source order.
+fn map_after_spread(p: Parser, base: Expr, acc: [MapEntry], t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_e(p_advance(p0), base)
+    ok_e(p_advance(p0), mk_map_lit(Some(base), list_reverse(acc), t))
   } else if not p_at(p0, TkComma) {
     err_e(p_error_here(p0, "expected `,` or `}` after `...` source in map literal"))
   } else {
     let p1 = p_skip_newlines(p_advance(p0))
     if p_at(p1, TkRbrace) {
-      ok_e(p_advance(p1), base)
+      ok_e(p_advance(p1), mk_map_lit(Some(base), list_reverse(acc), t))
     } else if p_at(p1, TkEllipsis) {
       err_e(p_error_here(p1,
         "map literal admits a single `...` spread; remove the second one"))
@@ -3280,37 +3257,27 @@ fn map_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
       let r = parse_map_entry(p1, t)
       match r.r {
         None -> err_e(r.p)
-        Some(entry) -> map_after_spread(r.p, map_put(base, entry, t), t)
+        Some(entry) -> map_after_spread(r.p, base, [entry, ...acc], t)
       }
     }
   }
 }
 
-fn map_put(base: Expr, entry: MapEntry, t: Token) : Expr = match entry {
-  ME(k, v) -> coll_call("map", "put", [base, k, v], t.line, t.col)
-}
-
-fn map_from_entries(entries: [MapEntry], t: Token) : Expr =
-  coll_call("map", "from",
-            [mk_expr(EList(map(entries, (e) => pair_elem(e, t))), t.line, t.col)],
-            t.line, t.col)
-
-fn pair_elem(entry: MapEntry, t: Token) : ListElem = match entry {
-  ME(k, v) -> ElPlain(mk_expr(ERecordLit("Pair", [FI("fst", k), FI("snd", v)]), t.line, t.col))
-}
-
 # `%[]` -> set.empty(); `%[ e ]` -> set.from([e]);
 # `%[ ...base, e ]` -> set.insert chain over base.
+fn mk_set_lit(spread: Option[Expr], elems: [Expr], t: Token) : Expr =
+  mk_expr(ESurface(SfSetLit(spread, elems)), t.line, t.col)
+
 fn parse_set_lit(p: Parser, t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbracket) {
-    ok_e(p_advance(p0), coll_call("set", "empty", [], t.line, t.col))
+    ok_e(p_advance(p0), mk_set_lit(None, [], t))
   } else if p_at(p0, TkEllipsis) {
     let r = parse_expr(p_skip_newlines(p_advance(p0)))
     match r.r {
       None -> err_e(r.p)
-      Some(base) -> set_after_spread(r.p, base, t)
+      Some(base) -> set_after_spread(r.p, base, [], t)
     }
   } else {
     parse_set_elems(p0, [], t)
@@ -3331,13 +3298,13 @@ fn parse_set_elems(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
 fn set_elems_sep(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
 
   if p_at(p, TkRbracket) {
-    ok_e(p_advance(p), set_from_elems(list_reverse(acc), t))
+    ok_e(p_advance(p), mk_set_lit(None, list_reverse(acc), t))
   } else if not p_at(p, TkComma) {
     err_e(p_error_here(p, "expected `,` or `]` in set literal"))
   } else {
     let p1 = p_skip_newlines(p_advance(p))
     if p_at(p1, TkRbracket) {
-      ok_e(p_advance(p1), set_from_elems(list_reverse(acc), t))
+      ok_e(p_advance(p1), mk_set_lit(None, list_reverse(acc), t))
     } else if p_at(p1, TkEllipsis) {
       err_e(p_error_here(p1,
         "set literal admits a single `...` spread, and it must come first"))
@@ -3365,17 +3332,17 @@ fn parse_set_elem(p: Parser, t: Token) : PExpr / Console {
   }
 }
 
-fn set_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
+fn set_after_spread(p: Parser, base: Expr, acc: [Expr], t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbracket) {
-    ok_e(p_advance(p0), base)
+    ok_e(p_advance(p0), mk_set_lit(Some(base), list_reverse(acc), t))
   } else if not p_at(p0, TkComma) {
     err_e(p_error_here(p0, "expected `,` or `]` after `...` source in set literal"))
   } else {
     let p1 = p_skip_newlines(p_advance(p0))
     if p_at(p1, TkRbracket) {
-      ok_e(p_advance(p1), base)
+      ok_e(p_advance(p1), mk_set_lit(Some(base), list_reverse(acc), t))
     } else if p_at(p1, TkEllipsis) {
       err_e(p_error_here(p1,
         "set literal admits a single `...` spread; remove the second one"))
@@ -3383,19 +3350,11 @@ fn set_after_spread(p: Parser, base: Expr, t: Token) : PExpr / Console {
       let r = parse_set_elem(p1, t)
       match r.r {
         None -> err_e(r.p)
-        Some(e) -> set_after_spread(r.p, set_insert(base, e, t), t)
+        Some(e) -> set_after_spread(r.p, base, [e, ...acc], t)
       }
     }
   }
 }
-
-fn set_insert(base: Expr, e: Expr, t: Token) : Expr =
-  coll_call("set", "insert", [base, e], t.line, t.col)
-
-fn set_from_elems(elems: [Expr], t: Token) : Expr =
-  coll_call("set", "from",
-            [mk_expr(EList(map(elems, (e) => ElPlain(e))), t.line, t.col)],
-            t.line, t.col)
 
 # ====================================================================
 # block, if, match
@@ -3801,23 +3760,14 @@ fn parse_more_scruts(p: Parser, acc: [Expr]) : PScruts / Console {
   }
 }
 
-# A multi-scrutinee arm carries N patterns (where N == number of
-# scrutinees). Mirrors `Arm` but with a list of patterns
-# instead of a single one. Lives only in the parser; the desugar
-# rewrites every MArm into nested standard `Arm`s before the AST
-# leaves the parser.
-type MArm = MArm([Pattern], Option[Expr], Expr)
-
 # Parse arms where each arm has N patterns separated by commas,
 # optional guard, `->`, body. Stops at `}`.
-fn parse_multi_match_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Token) : PExpr / Console {
+fn parse_multi_match_arms(p: Parser, acc: [MMArm], scruts: [Expr], n: Int, t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines_and_semis(p)
   if p_at(p0, TkRbrace) {
     let p1 = p_advance(p0)
-    let arms_in_order = list_reverse(acc)
-    let desugared = desugar_multi_match(scruts, arms_in_order, t.line, t.col)
-    ok_e(p1, desugared)
+    ok_e(p1, mk_expr(ESurface(SfMultiMatch(scruts, list_reverse(acc))), t.line, t.col))
   } else {
     let ra = parse_multi_arm(p0, n)
     match ra.r {
@@ -3830,10 +3780,10 @@ fn parse_multi_match_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Tok
 # Parse N comma-separated patterns followed by optional guard,
 # `->`, body. The arity must match `n` (scrutinee count); mismatched
 # arities are a parse error.
-type PMArm = { p: Parser, r: Option[MArm] }
+type PMArm = { p: Parser, r: Option[MMArm] }
 
 fn err_marm(p: Parser) : PMArm = PMArm { p: p, r: None }
-fn ok_marm(p: Parser, m: MArm) : PMArm = PMArm { p: p, r: Some(m) }
+fn ok_marm(p: Parser, m: MMArm) : PMArm = PMArm { p: p, r: Some(m) }
 
 fn parse_multi_arm(p: Parser, n: Int) : PMArm / Console {
 
@@ -3863,7 +3813,7 @@ fn parse_multi_arm(p: Parser, n: Int) : PMArm / Console {
         let rb = parse_expr(p3)
         match rb.r {
           None -> err_marm(rb.p)
-          Some(body) -> ok_marm(rb.p, MArm(pats, guard_opt_r.r, body))
+          Some(body) -> ok_marm(rb.p, MMArm(pats, guard_opt_r.r, body))
         }
       }
     }
@@ -3920,7 +3870,8 @@ fn parse_n_patterns(p: Parser, n: Int, acc: [Pattern]) : PPatN / Console {
 # Exprs, so the duplication does not cost runtime evaluation, only
 # emitted-code size. For typical demo arities (N=2, K=3) the blow-up
 # is bounded.
-fn desugar_multi_match(scruts: [Expr], arms: [MArm], line: Int, col: Int) : Expr {
+#[doc("Expand a multi-scrutinee arm list into the nested single-match chain; invoked by `surface_lower`.")]
+pub fn desugar_multi_match(scruts: [Expr], arms: [MMArm], line: Int, col: Int) : Expr {
   let stmts = build_scrut_lets(scruts, 0, [])
   let scrut_vars = make_scrut_var_exprs(scruts, 0, line, col)
   let body = build_multi_match_chain(scrut_vars, arms, line, col)
@@ -3962,7 +3913,7 @@ fn scrut_var_name(i: Int) : String =
 # computed once but referenced twice (the AST is shared structurally
 # since `Expr` values are immutable). When `arms` is empty, returns
 # a panic via an abort-style trap.
-fn build_multi_match_chain(scrut_vars: [Expr], arms: [MArm], line: Int, col: Int) : Expr {
+fn build_multi_match_chain(scrut_vars: [Expr], arms: [MMArm], line: Int, col: Int) : Expr {
   match arms {
     [] -> non_exhaustive_trap(line, col)
     [head, ...rest] -> {
@@ -3972,12 +3923,12 @@ fn build_multi_match_chain(scrut_vars: [Expr], arms: [MArm], line: Int, col: Int
   }
 }
 
-# Lower one MArm into the nested-EMatch chain it stands for,
+# Lower one MMArm into the nested-EMatch chain it stands for,
 # wiring the failing-pattern branch to `fall`. The guard, when present,
 # is attached to the innermost arm (last column).
-fn build_one_marm(scrut_vars: [Expr], arm: MArm, fall: Expr, line: Int, col: Int) : Expr {
+fn build_one_marm(scrut_vars: [Expr], arm: MMArm, fall: Expr, line: Int, col: Int) : Expr {
   match arm {
-    MArm(pats, guard, body) -> build_marm_columns(scrut_vars, pats, guard, body, fall, line, col)
+    MMArm(pats, guard, body) -> build_marm_columns(scrut_vars, pats, guard, body, fall, line, col)
   }
 }
 
@@ -6349,98 +6300,19 @@ fn parse_clause_block(p: Parser, params: [Param], t: Token) : PExpr / Console {
     # Zero-arg fn with case-arms: there's nothing to discriminate
     # on. Reject explicitly so the diagnostic points at the keyword.
     err_e(p_error_here(p, "case-block requires at least one parameter to discriminate on"))
-  } else if n == 1 {
-    let scrut = make_param_scrut(list_head(params))
-    parse_case_arms(p, [], scrut, t)
   } else if n > 4 {
     # The multi-arg match cap also bounds the desugared tuple here;
     # raising it requires re-evaluating the nested-match blowup as in
     # `parse_match`.
     err_e(p_error_here(p, "case-block supports up to 4 parameters"))
   } else {
-    let scruts = make_param_scruts(params, [])
-    parse_case_multi_arms(p, [], scruts, n, t)
-  }
-}
-
-fn list_head(xs: [Param]) : Param {
-  match xs {
-    [] -> Param { pname: "_", ptype: None, pline: 0, pcol: 0, pborrow: false }
-    [h, ..._] -> h
-  }
-}
-
-fn make_param_scrut(pm: Param) : Expr =
-  mk_expr(EVar(pm.pname), pm.pline, pm.pcol)
-
-fn make_param_scruts(params: [Param], acc: [Expr]) : [Expr] {
-  match params {
-    [] -> list_reverse(acc)
-    [pm, ...rest] -> make_param_scruts(rest, [make_param_scrut(pm), ...acc])
-  }
-}
-
-# Arm collector for the 1-arg case-block. Mirrors
-# `parse_match_arms` but expects each arm to be led by `case`. Stops
-# at `}`. Errors point at the offending token when neither `case`
-# nor `}` appears next.
-fn parse_case_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr / Console {
-
-  let p0 = p_skip_newlines_and_semis(p)
-  if p_at(p0, TkRbrace) {
-    if list_is_empty(acc) {
-      err_e(p_error_here(p0, "case-block must have at least one `case` arm"))
-    } else {
-      ok_e(p_advance(p0), mk_expr(EMatch(scrut, list_reverse(acc)), t.line, t.col))
-    }
-  } else if not p_at(p0, TkCase) {
-    err_e(p_error_here(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
-  } else {
-    let p1 = p_skip_newlines(p_advance(p0))
-    let ra = parse_case_arm_tail(p1)
-    match ra.r {
-      None -> err_e(ra.p)
-      Some(arm) -> parse_case_arms(ra.p, [arm, ...acc], scrut, t)
-    }
-  }
-}
-
-# Parse the tail of a `case` arm — pattern, optional
-# `when` guard, `->`, body. The leading `case` keyword has already
-# been consumed by the caller.
-fn parse_case_arm_tail(p: Parser) : PArm / Console {
-
-  let rp = parse_pattern(p)
-  match rp.r {
-    None -> err_a(rp.p)
-    Some(pat) -> {
-      let p1 = p_skip_newlines(rp.p)
-      let guard_opt_r =
-        if p_at(p1, TkWhen) {
-          let prev_atl = p1.allow_trailing_lambda
-          let pg = p_with_trailing_lambda(p_advance(p1), false)
-          let rg = parse_expr(pg)
-          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
-          match rg.r {
-            None -> PExpr { p: rg_p, r: None }
-            Some(g) -> PExpr { p: rg_p, r: Some(g) }
-          }
-        } else {
-          PExpr { p: p1, r: None }
-        }
-      match guard_opt_r.r {
-        None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
-          parse_arm_body(guard_opt_r.p, pat, None)
-        }
-        Some(_) -> parse_arm_body(guard_opt_r.p, pat, guard_opt_r.r)
-      }
-    }
+    parse_case_multi_arms(p, [], n, t)
   }
 }
 
 # Arm collector for N-arg case-block. Mirrors
 # `parse_multi_match_arms`. Each arm is `case p1, ..., pN (when g)? -> body`.
-fn parse_case_multi_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Token) : PExpr / Console {
+fn parse_case_multi_arms(p: Parser, acc: [MMArm], n: Int, t: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines_and_semis(p)
   if p_at(p0, TkRbrace) {
@@ -6448,9 +6320,7 @@ fn parse_case_multi_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Toke
       err_e(p_error_here(p0, "case-block must have at least one `case` arm"))
     } else {
       let p1 = p_advance(p0)
-      let arms_in_order = list_reverse(acc)
-      let desugared = desugar_multi_match(scruts, arms_in_order, t.line, t.col)
-      ok_e(p1, desugared)
+      ok_e(p1, mk_expr(ESurface(SfCaseBlock(list_reverse(acc))), t.line, t.col))
     }
   } else if not p_at(p0, TkCase) {
     err_e(p_error_here(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
@@ -6459,7 +6329,7 @@ fn parse_case_multi_arms(p: Parser, acc: [MArm], scruts: [Expr], n: Int, t: Toke
     let ra = parse_case_multi_arm(p1, n)
     match ra.r {
       None -> err_e(ra.p)
-      Some(arm) -> parse_case_multi_arms(ra.p, [arm, ...acc], scruts, n, t)
+      Some(arm) -> parse_case_multi_arms(ra.p, [arm, ...acc], n, t)
     }
   }
 }
@@ -6495,7 +6365,7 @@ fn parse_case_multi_arm(p: Parser, n: Int) : PMArm / Console {
         let rb = parse_expr(p3)
         match rb.r {
           None -> err_marm(rb.p)
-          Some(body) -> ok_marm(rb.p, MArm(pats, guard_opt_r.r, body))
+          Some(body) -> ok_marm(rb.p, MMArm(pats, guard_opt_r.r, body))
         }
       }
     }

@@ -91,9 +91,40 @@ fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kin
     SfLamBlock(_, _) -> sfl_expr(body)
     SfTuple(_) -> sfl_expr(body)
     SfHandleInit(_) -> sfl_expr(body)
+    SfBigIntLit(_) -> sfl_expr(body)
+    SfMapLit(_, _) -> sfl_expr(body)
+    SfSetLit(_, _) -> sfl_expr(body)
+    SfRefMake(_) -> sfl_expr(body)
+    SfDeref(_) -> sfl_expr(body)
+    SfMultiMatch(_, _) -> sfl_expr(body)
+    # `case`-arms discriminate on the owning fn's params: one param
+    # lowers to a plain match, several to the multi-match chain.
+    SfCaseBlock(arms) -> {
+      let low = map(arms, (a) => sfl_mmarm(a))
+      match ps {
+        [pm] -> mk_expr(EMatch(sfl_param_var(pm), map(low, (a) => sfl_mmarm_to_arm(a))),
+                        body.line, body.col)
+        _    -> desugar_multi_match(map(ps, (pm) => sfl_param_var(pm)), low,
+                                    body.line, body.col)
+      }
+    }
   }
   _ -> sfl_expr(body)
 }
+
+fn sfl_mmarm(a: MMArm) : MMArm = match a {
+  MMArm(pats, guard, body) ->
+    MMArm(map(pats, (x) => sfl_pat(x)), sfl_opt(guard), sfl_expr(body))
+}
+
+fn sfl_mmarm_to_arm(a: MMArm) : Arm = match a {
+  MMArm(pats, guard, body) -> match pats {
+    [p] -> Arm(p, guard, body)
+    _   -> panic("surface_lower: case-block arm arity does not match the params")
+  }
+}
+
+fn sfl_param_var(pm: Param) : Expr = mk_expr(EVar(pm.pname), pm.pline, pm.pcol)
 
 # Prepend the impl-level tparams to each method's own tparams. Bounds
 # are stripped: the pipeline uses these strings as plain ident keys.
@@ -124,6 +155,25 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
                          build_tuple_field_inits(map(elems, (x) => sfl_expr(x)), 0, [])),
               e.line, e.col)
     SfHandleInit(init) -> sfl_expr(init)
+    SfBigIntLit(digits) -> sfl_bigint(digits, e.line, e.col)
+    SfRefMake(inner) ->
+      sfl_coll_call("Mutable", "ref_make", [sfl_expr(inner)], e.line, e.col)
+    # A bare `@ident` lowers to the sentinel `ident.__deref()` — a
+    # reserved name the user cannot spell — so the cell-read lowering
+    # can tell a `@`-deref from a literal `ident.get()`. A dotted
+    # `@r.field` cannot be a cell, so it lowers straight to `.get()`.
+    SfDeref(target) -> {
+      let tgt = sfl_expr(target)
+      let sentinel = match tgt.kind { EVar(_) -> "__deref" _ -> "get" }
+      mk_expr(ECall(mk_expr(EField(tgt, sentinel), e.line, e.col), []), e.line, e.col)
+    }
+    SfMultiMatch(scruts, arms) ->
+      desugar_multi_match(map(scruts, (x) => sfl_expr(x)),
+                          map(arms, (a) => sfl_mmarm(a)), e.line, e.col)
+    # Only legal as a fn body; sfl_fn_body dissolves it there.
+    SfCaseBlock(_) -> panic("surface_lower: case-block outside a fn body")
+    SfMapLit(spread, flat) -> sfl_map_lit(sfl_spread(spread), sfl_pairs(flat), e.line, e.col)
+    SfSetLit(spread, elems) -> sfl_set_lit(sfl_spread(spread), map(elems, (x) => sfl_expr(x)), e.line, e.col)
   }
   # EMatch and EBlock carry patterns / statement shapes the generic
   # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
@@ -138,7 +188,17 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
                            sfl_opt(init), alias, map(cs, (cl) => sfl_hclause(cl)),
                            sfl_hreturn_opt(ret)))
   EVariantsOf(t, names) -> sfl_rebuild(e, EVariantsOf(sfl_ty(t), names))
+  # Pun markers normalise to the plain field name; the spread and
+  # positional sentinels stay for the record desugar downstream.
+  ERecordLit(name, fields) ->
+    sfl_rebuild(e, ERecordLit(name, map(fields, (f) => sfl_field_init(f))))
   _ -> sfl_rebuild(e, prc_map_expr_kind(e.kind, (x) => sfl_expr(x)))
+}
+
+fn sfl_field_init(f: FieldInit) : FieldInit = match f {
+  FI(n, v) ->
+    if is_pun_field_marker(n) { FI(pun_field_name(n), sfl_expr(v)) }
+    else { FI(n, sfl_expr(v)) }
 }
 
 fn sfl_rebuild(e: Expr, k: ExprKind) : Expr =
@@ -159,6 +219,75 @@ fn sfl_ensure(value: Expr, pred: Expr, line: Int, col: Int) : Expr {
   let if_expr = mk_expr(EIf(pred, some_call,
                             Some(mk_expr(EVar("None"), line, col))), line, col)
   mk_expr(EBlock([self_let], Some(if_expr)), line, col)
+}
+
+# `123n` expansion: `bigint.from_literal("123")`. The callee is
+# `EField(EVar("bigint"), ..)` so the qualified-call resolver rewrites
+# it to an `EModCall` once the module is imported, as the numeric
+# literal sugars do.
+fn sfl_bigint(digits: String, line: Int, col: Int) : Expr {
+  let s_e = mk_expr(EStr(concat_all(["\"", digits, "\""]), false), line, col)
+  sfl_coll_call("bigint", "from_literal", [s_e], line, col)
+}
+
+# `EField(EVar(mod), fn)`: the unresolved qualified callee the
+# qualified-call resolver rewrites into an `EModCall`.
+fn sfl_coll_call(mod: String, fn_name: String, args: [Expr], line: Int, col: Int) : Expr {
+  let callee = mk_expr(EField(mk_expr(EVar(mod), line, col), fn_name), line, col)
+  mk_expr(ECall(callee, args), line, col)
+}
+
+fn sfl_spread(o: Option[Expr]) : Option[Expr] = match o {
+  None -> None
+  Some(b) -> Some(sfl_expr(b))
+}
+
+# Re-pair a map literal's flattened `[k1, v1, ...]` children.
+fn sfl_pairs(flat: [Expr]) : [Expr] = map(flat, (x) => sfl_expr(x))
+
+# `%{}` -> map.empty(); `%{ k: v }` -> map.from([Pair]); with a spread,
+# a `map.put` chain over the base so a repeated key's override wins.
+fn sfl_map_lit(spread: Option[Expr], flat: [Expr], line: Int, col: Int) : Expr =
+  match spread {
+    None -> match flat {
+      [] -> sfl_coll_call("map", "empty", [], line, col)
+      _  -> sfl_coll_call("map", "from",
+              [mk_expr(EList(sfl_pair_elems(flat, [])), line, col)], line, col)
+    }
+    Some(base) -> sfl_map_puts(base, flat, line, col)
+  }
+
+fn sfl_pair_elems(flat: [Expr], acc: [ListElem]) : [ListElem] = match flat {
+  [] -> list_reverse(acc)
+  [k, v, ...rest] ->
+    sfl_pair_elems(rest, [ElPlain(mk_expr(ERecordLit("Pair", [FI("fst", k), FI("snd", v)]),
+                                          k.line, k.col)), ...acc])
+  _ -> panic("surface_lower: map literal with an odd entry list")
+}
+
+fn sfl_map_puts(base: Expr, flat: [Expr], line: Int, col: Int) : Expr = match flat {
+  [] -> base
+  [k, v, ...rest] ->
+    sfl_map_puts(sfl_coll_call("map", "put", [base, k, v], line, col), rest, line, col)
+  _ -> panic("surface_lower: map literal with an odd entry list")
+}
+
+# `%[]` -> set.empty(); `%[ e ]` -> set.from([e]); with a spread, a
+# `set.insert` chain over the base.
+fn sfl_set_lit(spread: Option[Expr], elems: [Expr], line: Int, col: Int) : Expr =
+  match spread {
+    None -> match elems {
+      [] -> sfl_coll_call("set", "empty", [], line, col)
+      _  -> sfl_coll_call("set", "from",
+              [mk_expr(EList(map(elems, (e) => ElPlain(e))), line, col)], line, col)
+    }
+    Some(base) -> sfl_set_inserts(base, elems, line, col)
+  }
+
+fn sfl_set_inserts(base: Expr, elems: [Expr], line: Int, col: Int) : Expr = match elems {
+  [] -> base
+  [e, ...rest] ->
+    sfl_set_inserts(sfl_coll_call("set", "insert", [base, e], line, col), rest, line, col)
 }
 
 fn sfl_stmt(st: Stmt) : Stmt = match st {
