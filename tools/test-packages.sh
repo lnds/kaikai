@@ -216,6 +216,9 @@ run_check_script "edition_ahead"      "edition_ahead/check.sh"
 # warns about test blocks its build cannot see.
 run_check_script "orphan_test_discovery" "orphan_test_discovery/check.sh"
 
+# The same discovery arms `kai check` and `kai bench`.
+run_check_script "orphan_check_bench_discovery" "orphan_check_bench_discovery/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart

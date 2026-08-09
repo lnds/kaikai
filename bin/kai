@@ -1162,9 +1162,16 @@ EOF
 
 usage_bench() {
   cat <<EOF
-usage: kai bench [--iters N] <file.kai>
+usage: kai bench [--iters N] [<spec>]
 
 Compile a kaikai source with --bench enabled and run the bench binary.
+<spec> follows the same rules as \`kai build\` (a .kai file, '.', a
+'./<sub>' sub-package, or omitted for the cwd package). In package
+mode every '*_test.kai' file the package owns also runs, whether or
+not anything imports it — the same discovery \`kai test\` does. A file
+declaring bench blocks the build cannot see raises a warning naming
+it, as does a package with no bench blocks at all.
+
 The compiler emits a main that runs every 'bench "..." { ... }' block
 under clock_gettime(CLOCK_MONOTONIC). For each block the runner does
 KAI_BENCH_WARMUP untimed iterations followed by KAI_BENCH_ITERS timed
@@ -1190,10 +1197,18 @@ EOF
 
 usage_check() {
   cat <<EOF
-usage: kai check <file.kai>
+usage: kai check [<spec>]
 
 Compile a kaikai source with --prop-check enabled and run the
-property-check binary. The compiler emits a main that runs every
+property-check binary. <spec> follows the same rules as \`kai build\`
+(a .kai file, '.', a './<sub>' sub-package, or omitted for the cwd
+package). In package mode every '*_test.kai' file the package owns
+also runs, whether or not anything imports it — the same discovery
+\`kai test\` does. A file declaring check blocks the build cannot see
+raises a warning naming it, as does a package with no check blocks
+at all.
+
+The compiler emits a main that runs every
 'check "..." [with p: T, ...] { body }' block KAI_CHECK_ITERS times
 (default 100), generating fresh random values for the with-clause
 params on each iteration via the runtime arbitrary[T] helpers.
@@ -2504,8 +2519,77 @@ package_source_files() {
   done
 }
 
-declares_test_blocks() {
-  grep -qE '^[[:space:]]*test[[:space:]]+"' "$1" 2>/dev/null
+declares_blocks() {
+  grep -qE "^[[:space:]]*$2[[:space:]]+\"" "$1" 2>/dev/null
+}
+
+# Package-wide block discovery, shared by `kai test`, `kai check` and
+# `kai bench`. The entry build only reaches modules in its import
+# graph, and files holding test/check/bench blocks are leaves by
+# nature — nothing imports them — so every unreachable *_test.kai in
+# the package is compiled and run as its own runner binary. One
+# convention serves all three keywords rather than three parallel
+# name patterns, so a file need not be split per keyword to be found.
+#
+# A file outside the graph that declares blocks but is not named
+# *_test.kai cannot safely run as a root (it may not compile
+# standalone), so it warns instead of silently vanishing. A package
+# declaring no blocks of this kind anywhere warns too, rather than
+# passing silently over an empty suite.
+#
+# $1 root, $2 entry, $3 keyword, $4 compiler flag, $5 backend, $6
+# backend origin, $7 status so far, $8 whether the entry side already
+# found blocks; the rest is forwarded to the compiler. The status
+# comes back as the exit code, not on stdout — the runner binaries
+# own stdout.
+run_package_blocks() {
+  pkg_root="$1"; src="$2"; kind="$3"; kind_flag="$4"
+  backend="$5"; backend_origin="$6"; agg_status="$7"; found="$8"
+  shift 8
+  pkg_root_abs="$(cd "$pkg_root" && pwd)"
+  src_abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+  entry_rel="${src_abs#"$pkg_root_abs"/}"
+  reachable="|$(reachable_module_files "$pkg_root_abs" "$entry_rel" | tr '\n' '|')"
+  tmp="$(mktemp -d)"
+  for rel in $(package_source_files "$pkg_root_abs"); do
+    has_blocks=""
+    if declares_blocks "$pkg_root_abs/$rel" "$kind"; then
+      has_blocks=1
+      found=1
+    fi
+    case "$reachable" in *"|$rel|"*) continue ;; esac
+    [ -n "$has_blocks" ] || continue
+    case "$rel" in
+      *_test.kai)
+        printf '== kai %s %s\n' "$kind" "$rel" >&2
+        obin="$tmp/$(printf '%s' "${rel%.kai}" | tr '/' '_')-r"
+        # shellcheck disable=SC2086
+        compile_to_binary --backend "$backend" --backend-origin "$backend_origin" \
+          "$pkg_root_abs/$rel" "$tmp" "$obin" "$kind" "$kind_flag" "$@"
+        "$obin" || agg_status=$?
+        ;;
+      *)
+        printf 'kai: warning: %s declares %s blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package %s runs include it\n' "$rel" "$kind" "$kind" >&2
+        ;;
+    esac
+  done
+  rm -rf "$tmp"
+  [ -n "$found" ] ||
+    printf 'kai: warning: no %s blocks found in this package\n' "$kind" >&2
+  return "$agg_status"
+}
+
+# The package root a spec resolves to, empty when the spec is not
+# manifest-governed (an explicit file argument, or the manifest-less
+# legacy heuristic) — that is what arms package-wide discovery.
+package_root_of_spec() {
+  case "${1:-}" in
+    "") [ -f kai.toml ] && printf '.' ;;
+    .)  [ -f kai.toml ] && printf '.' ;;
+    ./*) sub="${1#./}"; sub="${sub%/}"
+         [ -f "$sub/kai.toml" ] && printf '%s' "$sub" ;;
+  esac
+  return 0
 }
 
 cmd_test() {
@@ -2535,10 +2619,6 @@ cmd_test() {
   backend="${resolved_be%% *}"; backend_origin="${resolved_be#* }"
   rec_backend_flag=""
   [ -n "$backend_cli" ] && rec_backend_flag="--backend $backend_cli"
-  # pkg_root is set only when the spec resolved through a manifest —
-  # that is what arms package-wide test discovery below. An explicit
-  # file argument (and the manifest-less legacy heuristic) runs just
-  # the file the user named, as before.
   pkg_root=""
   case "${1:-}" in
     "./..."|"...") shift
@@ -2547,16 +2627,12 @@ cmd_test() {
         return $? ;;
     "") src="$(resolve_package_spec "")"
         [ -n "$src" ] || die "missing input file (see 'kai test --help')"
-        [ -f kai.toml ] && pkg_root="." ;;
+        pkg_root="$(package_root_of_spec "")" ;;
     .|./*)
         spec="$1"
         src="$(resolve_package_spec "$1")"; shift
         [ -n "$src" ] || die "missing input file (see 'kai test --help')"
-        case "$spec" in
-          .) [ -f kai.toml ] && pkg_root="." ;;
-          *) sub="${spec#./}"; sub="${sub%/}"
-             [ -f "$sub/kai.toml" ] && pkg_root="$sub" ;;
-        esac ;;
+        pkg_root="$(package_root_of_spec "$spec")" ;;
     *)  src="$1"; shift ;;
   esac
   tmp="$(mktemp -d)"
@@ -2589,44 +2665,13 @@ cmd_test() {
     done
   fi
 
-  # Package-wide test discovery. The entry build only reaches modules
-  # in its import graph, and test files are leaves by nature — nothing
-  # imports them — so every unreachable *_test.kai in the package runs
-  # as its own test binary. A non-test-named file declaring test
-  # blocks outside the graph cannot safely run as a root (it may not
-  # compile standalone), so it warns instead of silently vanishing.
   if [ -n "$pkg_root" ]; then
-    pkg_root_abs="$(cd "$pkg_root" && pwd)"
-    src_abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
-    entry_rel="${src_abs#"$pkg_root_abs"/}"
-    reachable="|$(reachable_module_files "$pkg_root_abs" "$entry_rel" | tr '\n' '|')"
-    for rel in $(package_source_files "$pkg_root_abs"); do
-      has_tests=""
-      if declares_test_blocks "$pkg_root_abs/$rel"; then
-        has_tests=1
-        pkg_has_tests=1
-      fi
-      case "$reachable" in *"|$rel|"*) continue ;; esac
-      case "$rel" in
-        *_test.kai)
-          printf '== kai test %s\n' "$rel" >&2
-          obin="$tmp/$(printf '%s' "${rel%.kai}" | tr '/' '_')-t"
-          # shellcheck disable=SC2086
-          compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$pkg_root_abs/$rel" "$tmp" "$obin" "test" --test $extra_flags
-          "$obin" || agg_status=$?
-          ;;
-        *)
-          if [ -n "$has_tests" ]; then
-            printf 'kai: warning: %s declares test blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package test runs include it\n' "$rel" >&2
-          fi
-          ;;
-      esac
-    done
-    if [ -z "$pkg_has_tests" ]; then
-      printf 'kai: warning: no test blocks found in this package\n' >&2
-    fi
+    # shellcheck disable=SC2086
+    run_package_blocks "$pkg_root" "$src" "test" "--test" \
+      "$backend" "$backend_origin" "$agg_status" "$pkg_has_tests" $extra_flags ||
+      agg_status=$?
   fi
-  return $agg_status
+  return "$agg_status"
 }
 
 cmd_bench() {
@@ -2646,12 +2691,16 @@ cmd_bench() {
       *) break ;;
     esac
   done
+  pkg_root=""
   case "${1:-}" in
     "") src="$(resolve_package_spec "")"
-        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')"
+        pkg_root="$(package_root_of_spec "")" ;;
     .|./*)
+        spec="$1"
         src="$(resolve_package_spec "$1")"; shift
-        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')"
+        pkg_root="$(package_root_of_spec "$spec")" ;;
     *)  src="$1"; shift ;;
   esac
   if [ -n "$iters_override" ]; then
@@ -2666,21 +2715,33 @@ cmd_bench() {
   resolved_be="$(resolve_backend "$backend_cli")"
   backend="${resolved_be%% *}"; backend_origin="${resolved_be#* }"
   compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "bench" --bench
-  if [ -n "$iters_override" ]; then
-    KAI_BENCH_ITERS="$iters_override" "$bin"
-  else
-    "$bin"
+  agg_status=0
+  # Exported rather than prefixed so the discovered runners below
+  # honour --iters too.
+  [ -n "$iters_override" ] && export KAI_BENCH_ITERS="$iters_override"
+  "$bin" || agg_status=$?
+  if [ -n "$pkg_root" ]; then
+    entry_has=""
+    declares_blocks "$src" "bench" && entry_has=1
+    run_package_blocks "$pkg_root" "$src" "bench" "--bench" \
+      "$backend" "$backend_origin" "$agg_status" "$entry_has" ||
+      agg_status=$?
   fi
+  return "$agg_status"
 }
 
 cmd_check() {
+  pkg_root=""
   case "${1:-}" in
     -h|--help) usage_check; return 0 ;;
     "") src="$(resolve_package_spec "")"
-        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')"
+        pkg_root="$(package_root_of_spec "")" ;;
     .|./*)
+        spec="$1"
         src="$(resolve_package_spec "$1")"; shift
-        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')"
+        pkg_root="$(package_root_of_spec "$spec")" ;;
     *)  src="$1"; shift ;;
   esac
   tmp="$(mktemp -d)"
@@ -2694,7 +2755,16 @@ cmd_check() {
   # native by default; check is the one dev-loop subcommand that still
   # requires `cc`.
   compile_to_binary --backend c --backend-origin explicit "$src" "$tmp" "$bin" "check" --prop-check
-  "$bin"
+  agg_status=0
+  "$bin" || agg_status=$?
+  if [ -n "$pkg_root" ]; then
+    entry_has=""
+    declares_blocks "$src" "check" && entry_has=1
+    run_package_blocks "$pkg_root" "$src" "check" "--prop-check" \
+      c explicit "$agg_status" "$entry_has" ||
+      agg_status=$?
+  fi
+  return "$agg_status"
 }
 
 # kai typecheck — front-end only. Runs the same lex / parse / resolve /
