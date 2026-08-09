@@ -219,6 +219,10 @@ run_check_script "orphan_test_discovery" "orphan_test_discovery/check.sh"
 # The same discovery arms `kai check` and `kai bench`.
 run_check_script "orphan_check_bench_discovery" "orphan_check_bench_discovery/check.sh"
 
+# A package with no entry point still runs its tests: discovery does
+# not need an entry, so a library is not locked out of package mode.
+run_check_script "library_test_discovery" "library_test_discovery/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
