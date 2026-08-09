@@ -2298,9 +2298,11 @@ fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
   if dup_init {
     err_e(p_error(p4, t, "a handler takes either `(init)` or `initially { }`, not both"))
   } else {
+    # The clause spelling rides a surface wrapper so the writer can
+    # reproduce `initially { }` instead of guessing from the init's shape.
     let eff_init = match init_cl {
-      Some(HC(_, _, ib, _, _)) -> Some(ib)
-      None                     -> init_r.r
+      Some(HC(_, _, ib, il, ic)) -> Some(mk_expr(ESurface(SfHandleInit(ib)), il, ic))
+      None                       -> init_r.r
     }
     let handle_e = mk_expr(
       EHandle(body, eff_name, eff_tyargs, eff_init, alias,
@@ -4086,46 +4088,40 @@ fn parse_arm(p: Parser) : PArm / Console {
         } else {
           PExpr { p: p1, r: None }
         }
-      let combined_guard = combine_guards(nr.guard, guard_opt_r.r)
       match guard_opt_r.r {
         None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
-          parse_arm_body(guard_opt_r.p, pat_eff, combined_guard)
+          parse_arm_body(guard_opt_r.p, pat_eff, None)
         }
-        Some(_) -> parse_arm_body(guard_opt_r.p, pat_eff, combined_guard)
+        Some(g) -> parse_arm_body(guard_opt_r.p, pat_eff, Some(g))
       }
     }
   }
 }
 
 # Parser state after consuming an optional `: Type`
-# refinement-narrowing suffix on a match arm pattern. `guard` holds
-# the synthesised predicate (or None when no suffix was present).
-# `new_pat` overrides the original pattern when the suffix lowers to
-# a `PNarrow` instead of a guard. `None` means leave the caller's
-# pattern unchanged.
-type ArmRefine = { p: Parser, guard: Option[Expr], new_pat: Option[Pattern] }
+# refinement-narrowing suffix on a match arm pattern. `new_pat`
+# overrides the original pattern (`PsRefine` for an inline refinement,
+# `PNarrow` for an alias / union-component name). `None` means leave
+# the caller's pattern unchanged.
+type ArmRefine = { p: Parser, new_pat: Option[Pattern] }
 
 fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
 
-  if not p_at(p, TkColon) { ArmRefine { p: p, guard: None, new_pat: None } }
+  if not p_at(p, TkColon) { ArmRefine { p: p, new_pat: None } }
   else { match pat.pkind {
     PBind(name) -> {
       let p1 = p_skip_newlines(p_advance(p))
       let rt = parse_type(p1)
       match rt.r {
-        None -> ArmRefine { p: rt.p, guard: None, new_pat: None }
+        None -> ArmRefine { p: rt.p, new_pat: None }
         Some(ty) -> match ty.tkind {
-          TyRefine(_, pred) -> {
-            # Lower to `{ let self = <name>; pred }`. The let binding
-            # makes the user-side `self` reference inside the predicate
-            # resolve to the bound match variable. Same desugar as
-            # `ensure(value) where pred`.
-            let var_e = mk_expr(EVar(name), pat.line, pat.col)
-            let self_let = SLet(mk_pat(PBind("self"), pat.line, pat.col),
-                                None, var_e)
-            let block = mk_expr(EBlock([self_let], Some(pred)),
-                                 pat.line, pat.col)
-            ArmRefine { p: rt.p, guard: Some(block), new_pat: None }
+          TyRefine(_, _) -> {
+            # Keep the author's `: Base where pred` spelling; lowering
+            # turns it into a guard over the bound name (same desugar as
+            # `ensure(value) where pred`), welded with any user guard.
+            ArmRefine { p: rt.p,
+                        new_pat: Some(mk_pat(PSurface(PsRefine(name, ty)),
+                                             pat.line, pat.col)) }
           }
           # `name : TyName(t, ...)`. Parser cannot tell whether `t` is
           # a refinement-type alias or a union-component nominal type,
@@ -4139,13 +4135,12 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
           # component.
           TyName(_, _) -> ArmRefine {
             p: rt.p,
-            guard: None,
             new_pat: Some(mk_pat(PNarrow(name, ty), pat.line, pat.col))
           }
           _ -> ArmRefine {
             p: p_error(rt.p, p_peek(p),
                        "match-arm narrowing `: Type` requires either an inline `Int where ...` or a refinement-type alias name"),
-            guard: None, new_pat: None
+            new_pat: None
           }
         }
       }
@@ -4153,23 +4148,9 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
     _ -> ArmRefine {
       p: p_error(p, p_peek(p),
                  "match-arm narrowing `: Type` only applies to a binding pattern (a bare name)"),
-      guard: None, new_pat: None
+      new_pat: None
     }
   } }
-}
-
-# Combine two optional guards with `and`. When either
-# side is None, return the other; when both are present, build
-# `narrow_guard and user_guard` so a violated refinement
-# short-circuits before the user predicate runs.
-fn combine_guards(narrow: Option[Expr], user: Option[Expr]) : Option[Expr] {
-  match narrow {
-    None -> user
-    Some(n) -> match user {
-      None -> Some(n)
-      Some(u) -> Some(mk_expr(EBinop("and", n, u), n.line, n.col))
-    }
-  }
 }
 
 fn parse_arm_body(p: Parser, pat: Pattern, guard: Option[Expr]) : PArm / Console {
@@ -4441,15 +4422,19 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
   let name = tok_source(p.src, t)
   let p1 = p_advance(p)
   # Qualified variant pattern `mod.Ctor[(subs)|{fields}]`.
-  # Lowercase head + `.UpperIdent` is a qualifier; drop it and let
-  # the trailing UpperIdent flow through the existing variant
-  # arms. Module-table validation happens at runtime in
+  # Lowercase head + `.UpperIdent` is a qualifier; keep the spelling in
+  # a surface wrapper and let the trailing UpperIdent flow through the
+  # existing variant arms. Module-table validation happens at runtime in
   # rqc_kind for expressions; for patterns the qualifier is purely
-  # disambiguation surface so dropping it is sound — the typer
+  # disambiguation surface, so lowering dissolves it — the typer
   # narrows the variant's parent type from the scrutinee anyway.
   if (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and tk_is(p_peek1(p1).kind, TkIdent) and is_upper_ident(p1.src, p_peek1(p1)) {
     let nt = p_peek1(p1)
-    parse_ident_pattern(p_advance(p1), nt)
+    let r = parse_ident_pattern(p_advance(p1), nt)
+    match r.r {
+      None -> r
+      Some(sub) -> ok_p(r.p, mk_pat(PSurface(PsQualified(name, sub)), t.line, t.col))
+    }
   } else if is_upper_ident(p.src, t) and p_at(p1, TkLparen) {
     # Variant with positional sub-patterns.
     let p2 = p_skip_newlines(p_advance(p1))
@@ -4473,11 +4458,17 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
     # even nested as-patterns compose. The legacy `name @ pattern`
     # spelling is still accepted; `@` now primarily means deref, and the
     # as-binding reads more naturally as `as` ("bind `name` as …").
+    let spelled_as = p_at(p1, TkAs)
     let p2 = p_skip_newlines(p_advance(p1))
     let r = parse_pattern(p2)
     match r.r {
       None -> err_p(r.p)
-      Some(sub) -> ok_p(r.p, mk_pat(PAs(name, sub), t.line, t.col))
+      Some(sub) ->
+        if spelled_as {
+          ok_p(r.p, mk_pat(PSurface(PsAs(name, sub)), t.line, t.col))
+        } else {
+          ok_p(r.p, mk_pat(PAs(name, sub), t.line, t.col))
+        }
     }
   } else {
     ok_p(p1, mk_pat(PBind(name), t.line, t.col))
@@ -4946,20 +4937,32 @@ fn ty_args_habitant(pr: PTy, t: Token) : PTy / Console = match pr.r {
 # (`Matrix[t]<m, n>`). Two or more habitants ride a single `UDims`;
 # a lone habitant stays bare so every pre-list annotation is
 # byte-identical.
-fn parse_habitant_slot(p: Parser, base: TypeExpr, t: Token) : PTy / Console =
-  parse_habitant_list(p_skip_newlines(p_advance(p)), [], base, t)
+fn parse_habitant_slot(p: Parser, base: TypeExpr, t: Token) : PTy / Console {
+  let lt = p_peek(p)
+  parse_habitant_list(p_skip_newlines(p_advance(p)), [], base, t,
+                      lt.start + lt.length)
+}
 
-fn parse_habitant_list(p: Parser, acc: [UnitExprT], base: TypeExpr, t: Token) : PTy / Console {
+# The author's spelling of the `<...>` interior (qualifiers, introducer
+# words, spacing) is not recoverable from the resolved `UnitExprT`, so
+# the closing `>` slices it out of the source and a `TsUnitSpan` wrapper
+# carries it for the writer.
+fn parse_habitant_list(p: Parser, acc: [UnitExprT], base: TypeExpr, t: Token,
+                       span_start: Int) : PTy / Console {
   let ru = parse_unit_expr(p)
   match ru.r {
     None -> err_t(ru.p)
     Some(u) -> {
       let p1 = p_skip_newlines(ru.p)
       if p_at(p1, TkComma) {
-        parse_habitant_list(p_skip_newlines(p_advance(p1)), [u, ...acc], base, t)
+        parse_habitant_list(p_skip_newlines(p_advance(p1)), [u, ...acc], base, t,
+                            span_start)
       } else if p_at(p1, TkGt) {
+        let gt = p_peek(p1)
+        let raw = string_slice(p1.src, span_start, gt.start - span_start)
         let hab = match acc { [] -> u  _ -> UDims(list_reverse([u, ...acc])) }
-        ok_t(p_advance(p1), mk_ty(TyDim(base, hab), t.line, t.col))
+        let dim = mk_ty(TyDim(base, hab), t.line, t.col)
+        ok_t(p_advance(p1), mk_ty(TySurface(TsUnitSpan(raw, dim)), t.line, t.col))
       } else {
         err_t(p_error_here(p1, "expected `>` to close the habitant annotation"))
       }
@@ -5549,6 +5552,7 @@ fn type_surface(t: TypeExpr) : String {
     TyRow(row) -> row_surface(row)
     TySurface(ts) -> match ts {
       TsTuple(tys) -> concat_all(["(", type_args_surface(tys), ")"])
+      TsUnitSpan(_, inner) -> type_surface(inner)
     }
   }
 }
