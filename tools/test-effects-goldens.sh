@@ -128,9 +128,11 @@ check_contract() {
   pin="$(kai_corpus_pinned_threads "$f")" || pin=""
   rc=0
   # $driver word-splits on purpose: it carries optional args (--sig …).
-  run_with_timeout env ${pin:+KAI_THREADS="$pin"} $driver "$bin" >"$out" 2>"$tmp/${slug}.err" </dev/null || rc=$?
+  run_with_timeout env ${pin:+KAI_THREADS="$pin"} KAI_TRACE_PARK=1 $driver "$bin" \
+    >"$out" 2>"$tmp/${slug}.err" </dev/null || rc=$?
   if [ "$rc" != "$want_rc" ]; then
-    tail -5 "$tmp/${slug}.err" > "$detail"
+    # Deep enough to carry the whole park/wake ring the deadlock banner dumps.
+    tail -80 "$tmp/${slug}.err" > "$detail"
     echo "$f — exit status $rc (want $want_rc); stderr tail:"
     return 0
   fi
