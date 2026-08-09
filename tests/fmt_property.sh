@@ -9,7 +9,7 @@
 # that emits an internal binder name, passes both nets and still
 # corrupts the user's file — silently, in place.
 #
-# For every source in the corpus this gate asserts five properties:
+# For every source in the corpus this gate asserts six properties:
 #
 #   (a) exit 0        — fmt does not refuse the file
 #   (b) re-parse      — fmt's output is still valid kaikai
@@ -17,6 +17,8 @@
 #   (d) idempotency   — fmt(fmt(x)) == fmt(x)
 #   (e) spelling      — fmt prints no identifier the source does not
 #                       contain
+#   (f) retention     — fmt drops no occurrence of any identifier the
+#                       source contains
 #
 # (b) is what catches a writer emitting internal syntax; (c) is what
 # catches a writer that produces parseable but DIFFERENT code; (d) is
@@ -34,6 +36,17 @@
 # wrapper therefore fails (e) on its first fixture — it cannot land
 # silently; it either carries a wrapper or a KNOWN_SYNTH entry citing
 # an open issue.
+#
+# (f) is (e)'s mirror, and closes its blind spot: a rewrite that only
+# DROPS or FUSES spelling (a `mod.` pattern qualifier discarded, an
+# `initially { }` clause reprinted as `(init)`, an attribute erased)
+# synthesizes nothing, so (e) cannot see it — and neither can (c),
+# because both sides of that comparison already carry the lowered
+# shape. Sets are also too weak here: a dropped qualifier usually
+# survives elsewhere in the file (its own `import`), so (f) compares
+# MULTISETS — for every identifier, fmt's output must contain at least
+# as many occurrences as the source. Growth is (e)'s business; loss is
+# (f)'s.
 #
 # ---------------------------------------------------------------
 # What (c) actually compares — and what it does not
@@ -161,8 +174,21 @@ examples/numeric/bigint_literal.kai
 # refs #1689 — row holes
 examples/sugars/effect_holes_json_basic.kai
 examples/sugars/row_hole_basic.kai
-# refs #1690 — arm-narrowing guard desugar
-examples/sugars/m12_6_match_arm_narrow.kai
+"
+
+# (f) retention — fmt drops occurrences of identifiers the source
+# contains (a parse-time rewrite that discards or fuses spelling).
+# Same discipline as KNOWN_SYNTH: one entry per file, each tagged with
+# the open issue for its family. A file excused from (e) returns before
+# (f) runs, so a family fix that clears (e) exposes any remaining (f)
+# debt immediately.
+KNOWN_DROP="
+# refs #1683 — case/when erased by the case-block desugar
+examples/match/range_pattern_clause_block.kai
+examples/sugars/case_block_non_exhaustive.kai
+examples/unions/issue_430_multiclause_single_arg.kai
+# refs #1694 — unknown attributes dropped from the AST, erased by fmt
+examples/attributes/attr_unknown_ignored.kai
 "
 
 if [ ! -x "$KAIC2" ]; then
@@ -474,8 +500,10 @@ check_one() {
   # (e) spelling fidelity: every identifier fmt printed must occur
   # somewhere in the source text. A miss means the parser rewrote a
   # surface form and the writer printed the lowered shape.
-  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$p1" | sort -u > "$b.wf"
-  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$abs" | sort -u > "$b.ws"
+  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$p1" | sort > "$b.wfa"
+  grep -o '[A-Za-z_][A-Za-z0-9_]*' "$abs" | sort > "$b.wsa"
+  sort -u "$b.wfa" > "$b.wf"
+  sort -u "$b.wsa" > "$b.ws"
   synth="$(comm -23 "$b.wf" "$b.ws")"
   if [ -n "$synth" ]; then
     if in_list "$rel" "$KNOWN_SYNTH"; then
@@ -490,6 +518,29 @@ check_one() {
   fi
   if in_list "$rel" "$KNOWN_SYNTH"; then
     echo "  STALE $rel — listed in KNOWN_SYNTH but (e) now passes; remove the entry" >> "$failures"
+    printf 'S' >> "$results"
+    rm -f "$p1" "$p2"
+    return 0
+  fi
+
+  # (f) retention: no identifier may occur fewer times in fmt's output
+  # than in the source. `comm` over the sorted-with-duplicates lists is
+  # a multiset difference, so a spelling the writer dropped is caught
+  # even when other occurrences of the same word survive elsewhere.
+  dropped="$(comm -13 "$b.wfa" "$b.wsa" | sort | uniq -c | sort -rn)"
+  if [ -n "$dropped" ]; then
+    if in_list "$rel" "$KNOWN_DROP"; then
+      printf 'E' >> "$results"
+    else
+      { echo "  FAIL $rel — (f) fmt dropped identifier occurrences the source contains (count word):"
+        echo "$dropped" | head -10 | sed 's/^/      /'; } >> "$failures"
+      printf 'F' >> "$results"
+    fi
+    rm -f "$p1" "$p2"
+    return 0
+  fi
+  if in_list "$rel" "$KNOWN_DROP"; then
+    echo "  STALE $rel — listed in KNOWN_DROP but (f) now passes; remove the entry" >> "$failures"
     printf 'S' >> "$results"
     rm -f "$p1" "$p2"
     return 0
