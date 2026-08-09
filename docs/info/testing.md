@@ -92,6 +92,13 @@ import graph runs once, through the entry binary.
 serves all three keywords, so a `*_test.kai` need not be split per
 keyword to be found.
 
+A package with no entry point — a library — runs its tests the same
+way. Since reachability plays no part, an entry is not needed to
+find them: `kai test`, `kai test .` and each package `./...` visits
+run the suite, and only the entry binary is skipped. `kai build` and
+`kai run` still require an entry, having nothing to build without
+one.
+
 A file outside the import graph that declares blocks but is not
 named `*_test.kai` cannot safely run as a root, so the driver warns,
 naming the file. A package with no blocks of the kind being run also

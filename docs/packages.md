@@ -254,9 +254,12 @@ about the package boundary it is crossing.
 `kai test ./...` walks the cwd subtree and runs `kai test` once
 per `kai.toml`. Packages are visited in `find`'s default order
 (lexicographic per level); aggregate exit code is the OR of every
-sub-run, so CI fails the moment any package's tests do. Packages
-without an entry file are skipped silently with a `SKIP <pkg>`
-line on stderr; the run continues.
+sub-run, so CI fails the moment any package's tests do. A package
+with no entry file is visited like any other when it owns
+`*_test.kai` files — a library's suite is discovered from the files
+it owns, not from an entry graph. Only a package with neither an
+entry nor tests is skipped, with a `SKIP <pkg>` line on stderr; the
+run continues.
 
 ### Fixtures
 

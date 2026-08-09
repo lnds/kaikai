@@ -2099,6 +2099,12 @@ compile_to_binary() {
 # `main.kai`). The function dies with a clear diagnostic when an
 # explicit `entry = "..."` points at a file that does not exist.
 #
+# A third argument of `optional-entry` turns that death into an empty
+# result: the block runners (test/check/bench) discover the files
+# they run without help from the entry graph, so a package that ships
+# no binary still has blocks to run. Build/run keep dying — a library
+# has nothing to build.
+#
 # Emits nothing (returning success) when the spec is empty AND no
 # manifest exists AND the legacy single-`.kai`-file heuristic does
 # not fire — callers detect this with `[ -n "$src" ]` and surface
@@ -2109,6 +2115,8 @@ resolve_package_spec() {
   # (e.g. `kai fmt`) do not announce "building". Defaults to "building"
   # for build/run/test/check/bench, which all compile.
   action="${2:-building}"
+  entry_optional=""
+  [ "${3:-}" = "optional-entry" ] && entry_optional=1
   case "$spec" in
     ""|".")
       target_dir="$(pwd)"
@@ -2117,6 +2125,7 @@ resolve_package_spec() {
         entry_rel="$(manifest_entry_field "$manifest_dir_inf")"
         entry_path="$manifest_dir_inf/$entry_rel"
         if [ ! -f "$entry_path" ]; then
+          [ -n "$entry_optional" ] && return 0
           die "kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
         fi
         pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
@@ -2141,6 +2150,7 @@ resolve_package_spec() {
       entry_rel="$(manifest_entry_field "$sub_path")"
       entry_path="$sub_path/$entry_rel"
       if [ ! -f "$entry_path" ]; then
+        [ -n "$entry_optional" ] && return 0
         die "$sub_path/kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
       fi
       pkg_name_inf="$(manifest_package_name "$sub_path")"
@@ -2402,6 +2412,10 @@ cmd_run() {
 # `find`'s default order (lexicographic per level), keeping output
 # stable across runs. Directories without a kai.toml are skipped
 # silently — they are not separately buildable.
+#
+# A package with no entry file is visited too: a library's suite is
+# discovered from the files it owns, not from an entry graph. Only a
+# package that has neither an entry nor any *_test.kai is skipped.
 run_tests_recursively() {
   extra_flags="$1"
   cwd_abs="$(pwd)"
@@ -2432,8 +2446,8 @@ run_tests_recursively() {
     fi
     entry_rel="$(manifest_entry_field "$pkg_dir")"
     entry_path="$pkg_dir/$entry_rel"
-    if [ ! -f "$entry_path" ]; then
-      printf '== kai test SKIP %s (no %s)\n' "$label" "$entry_rel" >&2
+    if [ ! -f "$entry_path" ] && [ -z "$(package_test_files "$pkg_dir")" ]; then
+      printf '== kai test SKIP %s (no %s, no *_test.kai)\n' "$label" "$entry_rel" >&2
       continue
     fi
     printf '== kai test %s\n' "$label" >&2
@@ -2523,6 +2537,20 @@ declares_blocks() {
   grep -qE "^[[:space:]]*$2[[:space:]]+\"" "$1" 2>/dev/null
 }
 
+# The *_test.kai files package $1 owns, plus any tests/ sibling — the
+# files a run would have to compile if the package had no entry. Used
+# to tell an entry-less library (has a suite) from an entry-less
+# directory that is simply not runnable.
+package_test_files() {
+  for rel in $(package_source_files "$1"); do
+    case "$rel" in *_test.kai) printf '%s\n' "$rel" ;; esac
+  done
+  for tf in "$1"/tests/*.kai; do
+    [ -f "$tf" ] && printf '%s\n' "$tf"
+  done
+  return 0
+}
+
 # Package-wide block discovery, shared by `kai test`, `kai check` and
 # `kai bench`. The entry build only reaches modules in its import
 # graph, and files holding test/check/bench blocks are leaves by
@@ -2537,19 +2565,27 @@ declares_blocks() {
 # declaring no blocks of this kind anywhere warns too, rather than
 # passing silently over an empty suite.
 #
-# $1 root, $2 entry, $3 keyword, $4 compiler flag, $5 backend, $6
-# backend origin, $7 status so far, $8 whether the entry side already
-# found blocks; the rest is forwarded to the compiler. The status
-# comes back as the exit code, not on stdout — the runner binaries
-# own stdout.
+# An empty entry ($2) means the package ships no binary — a library.
+# Nothing is reachable then, so every *_test.kai it owns runs as a
+# root, which is what the reachable case does for them anyway.
+#
+# $1 root, $2 entry (may be empty), $3 keyword, $4 compiler flag, $5
+# backend, $6 backend origin, $7 status so far, $8 whether the entry
+# side already found blocks; the rest is forwarded to the compiler.
+# The status comes back as the exit code, not on stdout — the runner
+# binaries own stdout.
 run_package_blocks() {
   pkg_root="$1"; src="$2"; kind="$3"; kind_flag="$4"
   backend="$5"; backend_origin="$6"; agg_status="$7"; found="$8"
   shift 8
   pkg_root_abs="$(cd "$pkg_root" && pwd)"
-  src_abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
-  entry_rel="${src_abs#"$pkg_root_abs"/}"
-  reachable="|$(reachable_module_files "$pkg_root_abs" "$entry_rel" | tr '\n' '|')"
+  if [ -n "$src" ]; then
+    src_abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+    entry_rel="${src_abs#"$pkg_root_abs"/}"
+    reachable="|$(reachable_module_files "$pkg_root_abs" "$entry_rel" | tr '\n' '|')"
+  else
+    reachable="|"
+  fi
   tmp="$(mktemp -d)"
   for rel in $(package_source_files "$pkg_root_abs"); do
     has_blocks=""
@@ -2625,21 +2661,34 @@ cmd_test() {
         # shellcheck disable=SC2086
         run_tests_recursively "$rec_backend_flag $extra_flags"
         return $? ;;
-    "") src="$(resolve_package_spec "")"
-        [ -n "$src" ] || die "missing input file (see 'kai test --help')"
-        pkg_root="$(package_root_of_spec "")" ;;
+    "") src="$(resolve_package_spec "" "building" "optional-entry")"
+        pkg_root="$(package_root_of_spec "")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai test --help')" ;;
     .|./*)
         spec="$1"
-        src="$(resolve_package_spec "$1")"; shift
-        [ -n "$src" ] || die "missing input file (see 'kai test --help')"
-        pkg_root="$(package_root_of_spec "$spec")" ;;
+        src="$(resolve_package_spec "$1" "building" "optional-entry")"; shift
+        pkg_root="$(package_root_of_spec "$spec")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai test --help')" ;;
     *)  src="$1"; shift ;;
   esac
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  bin="$tmp/$(basename "$src" .kai)-t"
-  # shellcheck disable=SC2086
-  compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "test" --test $extra_flags
+  agg_status=0
+  pkg_has_tests=""
+  # A library package resolves no entry: there is no entry binary to
+  # build or run, and the tests/ sibling hangs off the package root
+  # instead of the entry's directory.
+  if [ -n "$src" ]; then
+    bin="$tmp/$(basename "$src" .kai)-t"
+    # shellcheck disable=SC2086
+    compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "test" --test $extra_flags
+    entry_dir="$(dirname "$src")"
+    "$bin" || agg_status=$?
+  else
+    entry_dir="$pkg_root"
+  fi
 
   # Tests-dir auto-discovery: when the resolved entry sits next to a
   # `tests/` sibling directory containing `*.kai` files (the
@@ -2648,11 +2697,7 @@ cmd_test() {
   # in those files resolve to the package's own modules via sibling
   # resolution. The aggregate exit code is the OR of every run, so
   # any failing test file fails `kai test .` overall.
-  entry_dir="$(dirname "$src")"
   tests_dir="$entry_dir/tests"
-  agg_status=0
-  "$bin" || agg_status=$?
-  pkg_has_tests=""
   if [ -d "$tests_dir" ]; then
     for tf in "$tests_dir"/*.kai; do
       [ -f "$tf" ] || continue
@@ -2693,14 +2738,16 @@ cmd_bench() {
   done
   pkg_root=""
   case "${1:-}" in
-    "") src="$(resolve_package_spec "")"
-        [ -n "$src" ] || die "missing input file (see 'kai bench --help')"
-        pkg_root="$(package_root_of_spec "")" ;;
+    "") src="$(resolve_package_spec "" "building" "optional-entry")"
+        pkg_root="$(package_root_of_spec "")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai bench --help')" ;;
     .|./*)
         spec="$1"
-        src="$(resolve_package_spec "$1")"; shift
-        [ -n "$src" ] || die "missing input file (see 'kai bench --help')"
-        pkg_root="$(package_root_of_spec "$spec")" ;;
+        src="$(resolve_package_spec "$1" "building" "optional-entry")"; shift
+        pkg_root="$(package_root_of_spec "$spec")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai bench --help')" ;;
     *)  src="$1"; shift ;;
   esac
   if [ -n "$iters_override" ]; then
@@ -2711,18 +2758,20 @@ cmd_bench() {
   fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  bin="$tmp/$(basename "$src" .kai)-b"
   resolved_be="$(resolve_backend "$backend_cli")"
   backend="${resolved_be%% *}"; backend_origin="${resolved_be#* }"
-  compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "bench" --bench
   agg_status=0
+  entry_has=""
   # Exported rather than prefixed so the discovered runners below
   # honour --iters too.
   [ -n "$iters_override" ] && export KAI_BENCH_ITERS="$iters_override"
-  "$bin" || agg_status=$?
-  if [ -n "$pkg_root" ]; then
-    entry_has=""
+  if [ -n "$src" ]; then
+    bin="$tmp/$(basename "$src" .kai)-b"
+    compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "bench" --bench
+    "$bin" || agg_status=$?
     declares_blocks "$src" "bench" && entry_has=1
+  fi
+  if [ -n "$pkg_root" ]; then
     run_package_blocks "$pkg_root" "$src" "bench" "--bench" \
       "$backend" "$backend_origin" "$agg_status" "$entry_has" ||
       agg_status=$?
@@ -2734,19 +2783,20 @@ cmd_check() {
   pkg_root=""
   case "${1:-}" in
     -h|--help) usage_check; return 0 ;;
-    "") src="$(resolve_package_spec "")"
-        [ -n "$src" ] || die "missing input file (see 'kai check --help')"
-        pkg_root="$(package_root_of_spec "")" ;;
+    "") src="$(resolve_package_spec "" "building" "optional-entry")"
+        pkg_root="$(package_root_of_spec "")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai check --help')" ;;
     .|./*)
         spec="$1"
-        src="$(resolve_package_spec "$1")"; shift
-        [ -n "$src" ] || die "missing input file (see 'kai check --help')"
-        pkg_root="$(package_root_of_spec "$spec")" ;;
+        src="$(resolve_package_spec "$1" "building" "optional-entry")"; shift
+        pkg_root="$(package_root_of_spec "$spec")"
+        [ -n "$src" ] || [ -n "$pkg_root" ] ||
+          die "missing input file (see 'kai check --help')" ;;
     *)  src="$1"; shift ;;
   esac
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  bin="$tmp/$(basename "$src" .kai)-c"
   # `kai check` stays on the C backend explicitly: the native check
   # runner is not built yet. A check block's `with`-clause params are
   # generated and shrunk by the runtime, which needs the parametrised
@@ -2754,12 +2804,15 @@ cmd_check() {
   # `lower_runner_loop` test/bench path skips DCheck). test/bench are
   # native by default; check is the one dev-loop subcommand that still
   # requires `cc`.
-  compile_to_binary --backend c --backend-origin explicit "$src" "$tmp" "$bin" "check" --prop-check
   agg_status=0
-  "$bin" || agg_status=$?
-  if [ -n "$pkg_root" ]; then
-    entry_has=""
+  entry_has=""
+  if [ -n "$src" ]; then
+    bin="$tmp/$(basename "$src" .kai)-c"
+    compile_to_binary --backend c --backend-origin explicit "$src" "$tmp" "$bin" "check" --prop-check
+    "$bin" || agg_status=$?
     declares_blocks "$src" "check" && entry_has=1
+  fi
+  if [ -n "$pkg_root" ]; then
     run_package_blocks "$pkg_root" "$src" "check" "--prop-check" \
       c explicit "$agg_status" "$entry_has" ||
       agg_status=$?
