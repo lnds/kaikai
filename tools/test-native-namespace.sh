@@ -70,6 +70,12 @@ KAI_NATIVE_CGLEVEL=0 "$KAIC2" --emit=native --path "$ROOT/stdlib" "$work/probe.k
 obj="$work/probe.o"
 [ -f "$obj" ] || { echo "test-native-namespace FAIL — no object emitted at $obj"; exit 1; }
 
+# `--defined-only` keeps just the symbols this object DEFINES — the only ones
+# that can collide at link. `nm -a` on ELF also lists debug/file entries,
+# among them the LLVM module name (`kai_native`, a compiler constant, not a
+# user identifier), which Mach-O never reports: a plain `-a` reads as a leak
+# on Linux and green on macOS.
+#
 # `$tlv$init` / `.buf` suffixes are linker-minted decorations of a runtime
 # symbol, not separate names — trim them to their base.
 #
@@ -83,7 +89,7 @@ obj="$work/probe.o"
 # user-derived may appear.
 # Both sides are then compared with any single leading underscore dropped, so
 # the Mach-O `_kai_main` and the source's `kai_main` are one name.
-nm -a "$obj" | awk '{print $NF}' \
+nm --defined-only "$obj" | awk '{print $NF}' \
   | sed 's/^__kai/_kai/; s/^_kaiu_/kaiu_/; s/^_kaiv_/kaiv_/' \
   | sed 's/\$tlv\$init$//; s/\.[A-Za-z0-9_]*$//' \
   | grep -E '^_?kai' | grep -vE '^kai[uv]_' | sed 's/^_//' | sort -u > "$work/emitted.txt"
