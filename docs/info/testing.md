@@ -79,6 +79,20 @@ reports median and MAD.
 `kai test ./...` walks every `kai.toml` under cwd and runs each
 package's tests.
 
+## `*_test.kai` files
+
+In package mode (`kai test`, `kai test .`, `kai test ./<sub>`, and
+each package `./...` visits), every `*_test.kai` file the package
+owns runs as its own test binary — nothing needs to import it. Test
+files are leaves by nature, so reachability from the entry point
+plays no part in whether they run; a file already in the entry's
+import graph runs once, through the entry binary.
+
+A file outside the import graph that declares `test` blocks but is
+not named `*_test.kai` cannot safely run as a root, so the driver
+warns, naming the file. A package with no test blocks anywhere also
+warns instead of passing silently.
+
 ## The `tests/` directory
 
 When a package (a directory with `kai.toml`) carries a sibling
