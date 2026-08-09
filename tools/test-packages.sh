@@ -212,6 +212,10 @@ run_check_script "unknown_dep_form"   "unknown_dep_form/check.sh"
 # An edition newer than the compiler implements warns but still builds.
 run_check_script "edition_ahead"      "edition_ahead/check.sh"
 
+# Package-mode `kai test` runs *_test.kai files nothing imports and
+# warns about test blocks its build cannot see.
+run_check_script "orphan_test_discovery" "orphan_test_discovery/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
