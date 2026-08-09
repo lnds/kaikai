@@ -2325,6 +2325,7 @@ test-signal-trap-asan: $(TARGET) build
 	        ../tests/sigharness.c -o build/$$name-asan.harness; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+	  KAI_TRACE_PARK=1 \
 	    ./build/$$name-asan.harness ./build/$$name-asan-c \
 	    > build/$$name-asan.out 2> build/$$name-asan.err; \
 	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
@@ -2333,7 +2334,9 @@ test-signal-trap-asan: $(TARGET) build
 	  fi; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
 	    && echo "signal-trap-asan OK $$name" \
-	    || { echo "signal-trap-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	    || { echo "signal-trap-asan DIFF $$name"; \
+	         diff ../examples/effects/$$name.out.expected build/$$name-asan.out; \
+	         echo "--- stderr (KAI_TRACE_PARK) ---"; cat build/$$name-asan.err; exit 1; }; \
 	done
 
 # Issue #141 — ASAN+UBSan sibling for the Log default-handler
@@ -3851,7 +3854,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
 	  $(CC) $(CFLAGS) ../tests/sigharness.c -o build/s2-$$name.harness $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (harness compile failed)"; exit 1; }; \
-	  ./build/s2-$$name.harness ./build/s2-$$name > build/s2-$$name.out 2>&1; \
+	  KAI_TRACE_PARK=1 ./build/s2-$$name.harness ./build/s2-$$name > build/s2-$$name.out 2>&1; \
 	  rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "effects FAIL $$name (harness rc=$$rc — expected 0 for clean SIGINT shutdown)"; \
