@@ -3539,6 +3539,42 @@ static _Atomic int kai_blocked_fiber_count = 0;
 static _Atomic int kai_deadlock_reported = 0;
 #endif
 
+/* Park/wake trace for the deadlock banner. `kai_blocked_fiber_count` has a
+ * single decrement site (the PARKED branch of kai_sched_remote_unpark) while
+ * kai_reactor_parked_count has eight, so a fiber promoted off a reactor
+ * structure but flipped READY before the handback reaches it leaves the pair
+ * skewed — parked_count 0 with blocked_fiber_count > 0, which is exactly what
+ * the banner reports. The ring records the transitions the banner cannot
+ * reconstruct: enabled only when KAI_TRACE_PARK is set, so a normal run pays
+ * one predictable load per event and no formatting. */
+#define KAI_PARK_TRACE_CAP 64
+
+typedef struct {
+    const KaiFiber *fiber;
+    const char     *event;
+    int             thread;
+    int             state;
+    int             wake_pending;
+    int             reactor_fired;
+    int             blocked_count;
+    int             parked_count;
+} KaiParkTraceEntry;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int       kai_park_trace_on;
+extern KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+extern _Atomic unsigned  kai_park_trace_seq;
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int       kai_park_trace_on = -1;
+KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+_Atomic unsigned  kai_park_trace_seq = 0;
+#  endif
+#else
+static _Atomic int       kai_park_trace_on = -1;
+static KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+static _Atomic unsigned  kai_park_trace_seq = 0;
+#endif
+
 /* F2 — reactor park reasons stamped into KaiFiber.pending_park. Zero is
  * "not a reactor park" (calloc-cleared), so a spawned or mailbox-parked
  * fiber never looks pending. `kai_sched_commit_park` dispatches on these
@@ -13760,6 +13796,59 @@ static int        kai_reactor_ready_n = 0;
 static int        kai_reactor_ready_cap = 0;
 #endif
 
+/* Record one park/wake transition. `event` must be a string literal — the ring
+ * stores the pointer, not a copy. Entries are claimed with an atomic counter
+ * and written unsynchronised: a torn entry costs one garbled trace line, which
+ * is the right trade against perturbing the very timing under investigation. */
+static void kai_park_trace(const KaiFiber *f, const char *event) {
+    int on = atomic_load(&kai_park_trace_on);
+    if (on < 0) {
+        on = getenv("KAI_TRACE_PARK") ? 1 : 0;
+        atomic_store(&kai_park_trace_on, on);
+    }
+    if (!on) return;
+    unsigned slot = atomic_fetch_add(&kai_park_trace_seq, 1) % KAI_PARK_TRACE_CAP;
+    KaiParkTraceEntry *e = &kai_park_trace_ring[slot];
+    e->fiber         = f;
+    e->event         = event;
+    e->thread        = kai_thread_id;
+    e->state         = f ? f->state : -1;
+    e->wake_pending  = f ? f->wake_pending : -1;
+    e->reactor_fired = f ? f->reactor_fired : -1;
+    e->blocked_count = atomic_load(&kai_blocked_fiber_count);
+    e->parked_count  = kai_reactor_parked_count;
+}
+
+static const char *kai_fiber_state_name(int state) {
+    switch (state) {
+        case KAI_FIBER_READY:     return "READY";
+        case KAI_FIBER_RUNNING:   return "RUNNING";
+        case KAI_FIBER_PARKED:    return "PARKED";
+        case KAI_FIBER_DONE:      return "DONE";
+        case KAI_FIBER_CANCELLED: return "CANCELLED";
+        default:                  return "?";
+    }
+}
+
+/* Dump the park/wake ring oldest-first, for the deadlock banner. Silent when
+ * the trace is off, so the banner is unchanged on a normal run. */
+static void kai_park_trace_dump(void) {
+    if (atomic_load(&kai_park_trace_on) <= 0) return;
+    unsigned total = atomic_load(&kai_park_trace_seq);
+    unsigned shown = total < KAI_PARK_TRACE_CAP ? total : KAI_PARK_TRACE_CAP;
+    fprintf(stderr, "kai: park trace (%u events, last %u):\n", total, shown);
+    for (unsigned i = 0; i < shown; i++) {
+        const KaiParkTraceEntry *e =
+            &kai_park_trace_ring[(total - shown + i) % KAI_PARK_TRACE_CAP];
+        fprintf(stderr,
+                "  fiber=%p %-19s tid=%d state=%s wake_pending=%d "
+                "reactor_fired=%d blocked=%d parked=%d\n",
+                (const void *) e->fiber, e->event ? e->event : "?", e->thread,
+                kai_fiber_state_name(e->state), e->wake_pending,
+                e->reactor_fired, e->blocked_count, e->parked_count);
+    }
+}
+
 /* A drain readied `f`. At N=1 unpark inline (F1 behaviour, byte-identical
  * scheduling order). At N>1 defer into the batch — the reactor holds
  * `kai_reactor_mu` here and must not take a slot lock until it releases it. */
@@ -14081,6 +14170,7 @@ static int kai_reactor_signal_try_wake(void) {
     f->reactor_wait_status = kai_reactor_signal_pending;
     kai_reactor_signal_pending = 0;
     kai_reactor_parked_count--;
+    kai_park_trace(f, "signal-try-wake");
     kai_reactor_mark_ready(f);
     return 1;
 }
@@ -14808,6 +14898,7 @@ static void kai_sched_commit_park(KaiFiber *f) {
         } else {
             f->state = KAI_FIBER_PARKED;
             atomic_fetch_add(&kai_blocked_fiber_count, 1);
+            kai_park_trace(f, "park-slot");
         }
         kai_fiber_slot_unlock_at(home);
         return;
@@ -14836,12 +14927,14 @@ static void kai_sched_commit_park(KaiFiber *f) {
         if (s->steal_tail) s->steal_tail->sched_next = f;
         else               s->steal_head = f;
         s->steal_tail = f;
+        kai_park_trace(f, cancel_abort ? "commit-abort-cancel" : "commit-abort-wake");
         kai_fiber_slot_unlock_at(home);
         kai_reactor_unlock();
         return;
     }
     f->state = KAI_FIBER_PARKED;
     atomic_fetch_add(&kai_blocked_fiber_count, 1);
+    kai_park_trace(f, "park-reactor");
     /* Publish PARKED under the slot lock so wakers (which classify state
      * under that lock) never read a torn transition; the reactor insert
      * below still happens under kai_reactor_mu, and a wake that flips us
@@ -15162,17 +15255,20 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
         s->steal_tail = target;
         kai_fiber_slot_unlock_at(home);
         atomic_fetch_sub(&kai_blocked_fiber_count, 1);
+        kai_park_trace(target, "unpark-parked");
     } else if (target->state == KAI_FIBER_DONE ||
                target->state == KAI_FIBER_CANCELLED) {
         /* Terminal: nothing to wake, and the struct may be about to be
          * reclaimed — do not write a permit into it. */
         kai_fiber_slot_unlock_at(home);
+        kai_park_trace(target, "unpark-terminal");
     } else {
         /* RUNNING (pre-commit window) or READY (already waking): record a
          * permit. The next park commit consumes it and the site re-checks
          * its predicate, so a stale permit costs one spurious resume. */
         target->wake_pending++;
         kai_fiber_slot_unlock_at(home);
+        kai_park_trace(target, "unpark-permit");
     }
     kai_sched_wake_thread(home);
 }
@@ -15243,6 +15339,7 @@ static void kai_sched_check_deadlock(void) {
     fprintf(stderr,
         "kai: all workers idle with fibers parked (%d parked) — deadlock\n",
         atomic_load(&kai_blocked_fiber_count));
+    kai_park_trace_dump();
     exit(1);
 }
 
@@ -15408,7 +15505,8 @@ static void kai_sched_park(void) {
          * leave a dangling reactor link behind — the double-insert that
          * corrupts the wheel's list structure. */
         if (was_reactor && !current->reactor_fired) {
-            kai_reactor_detach_fiber(current);
+            if (kai_reactor_detach_fiber(current))
+                kai_park_trace(current, "self-detach");
         }
         kai_check_cancel_yield_point();
         return;
