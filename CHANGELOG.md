@@ -84,6 +84,32 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.110.0 (2026-08-09)
+
+### Added
+
+- **stdlib**: add Period, the calendar counterpart to Duration (#1703)
+
+### Fixed
+
+- **perceus**: scan match scrutinees when clearing a borrow-move param (#1714)
+- **typer**: check the kind habitant when an operator selects an impl (#1711)
+- **emit**: mint native user-derived symbols into the kaiu_ namespace (#1710)
+- **emit**: fold the runner mode into the native-modular cache key (#1713)
+- **typer**: qualify interp-lifted habitants and coin literals to the param carrier (#1709)
+- **compiler**: sanitise the module name derived from a file basename (#1708)
+- **cli**: discover orphan *_test.kai in package-mode check and bench (#1707)
+- **fmt**: retain unknown attributes via a DAttr surface wrapper (#1705)
+- **cli**: run orphan *_test.kai files in package-mode kai test (#1702)
+- **fmt**: preserve the eight desugar families and empty KNOWN_SYNTH (#1697)
+- **fmt**: preserve dropped spellings via surface wrappers and a retention gate (#1696)
+- **fmt**: preserve tuple sugar via per-position surface wrappers and a spelling gate (#1693)
+- **emit**: route local binders through the kaiv_ namespace (#1680)
+- **compiler**: serialise kind catalog decls in the module cache codec (#1692)
+- **fmt**: preserve tparam bounds and block-lambda sugar through the writer (#1676)
+- **compiler**: keep signature-bound type variables out of privacy resolution (#1672)
+- **stdlib**: encode Show for Char output as UTF-8 (#1671)
+
 ## v0.109.2 (2026-08-08)
 
 ### Fixed
