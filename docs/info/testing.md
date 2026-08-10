@@ -36,6 +36,16 @@ test "double doubles" {
 fn main() : Int = 0
 ```
 
+### Effects in test bodies
+
+A `test` / `bench` / `check` body has no effect row and cannot
+declare one. It absorbs what a program entry may carry: the
+default-handled builtin effects (`Stdout`, `File`, `Clock`, …) plus
+the compiler-synthesised `Ffi` capability — so a test can call an
+`extern "C"` fn or a `/ Ffi` wrapper directly. A user-declared
+effect has no handler at the runner's entry; handle it inside the
+body (`handle { ... } with MyEff { ... }`).
+
 ## Property checks
 
 ```kaikai
