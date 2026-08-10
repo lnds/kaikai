@@ -419,6 +419,8 @@ backend). The gap is the intermediate list, one allocation per call.
 of spreads, anywhere in the literal (`[...xs, 3, 4]`, `[...a, ...b]`),
 and mirrors the `[head, ...tail]` destructuring pattern. Reach for
 `++` when genuinely concatenating two lists, which is what it is for.
+`kai lint` flags the literal-on-the-left form as
+`list_concat_literal_to_spread`.
 
 ## False friends — you might write X, in kaikai write Z
 

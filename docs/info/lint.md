@@ -189,6 +189,34 @@ fn main() : Int = 0
 `let x = e ... body`. A destructuring pattern, a guard, or more than one
 arm means the match does real work and is left alone.
 
+### list_concat_literal_to_spread
+
+A list literal on the left of `++` builds an intermediate list and then
+concatenates it; the spread form emits the cons directly:
+
+```kaikai
+fn cons_front(t: [Int]) : [Int] = [1] ++ t
+#                                 ^^^^^^^^ list_concat_literal_to_spread: write [1, ...t]
+
+fn main() : Int = 0
+```
+
+`[h] ++ t` is `[h, ...t]` and `[a, b] ++ t` is `[a, b, ...t]` — the same
+list, minus the intermediate allocation, and the gap widens with the
+literal's length (`kai info idiomatic` §Spread over `++` has the
+numbers). The lint fires on any **non-empty** list literal on the left,
+whatever the right operand.
+
+It does not fire on genuine concatenation (`xs ++ ys`) or a computed
+left operand (`f(x) ++ t`) — concatenating two list values is what `++`
+is for. Two literal-adjacent shapes are also deliberately out:
+
+- `[] ++ xs` is just `xs` — the runtime shares the right operand, so
+  there is no allocation to save; the fix is dropping the concat, not
+  a spread.
+- `xs ++ [y]` (an append) — no spelling avoids copying `xs`, so the
+  lint has no better form to point at.
+
 ### dead_code_unused_priv
 
 A private root-file function whose name appears nowhere in the file is
@@ -283,6 +311,7 @@ equivalent, the rule stays silent.
 
 Today's rules: `discard_pure_value`, `point_free_nudge`,
 `and_then_to_map_nudge`, `match_option_to_combinator`, `redundant_if_bool`,
-`redundant_match_catchall`, `dead_code_unused_priv`,
-`effect_over_declared`, `effect_ffi_without_extern`. More land over time
-as new equivalences earn their place.
+`redundant_match_catchall`, `list_concat_literal_to_spread`,
+`dead_code_unused_priv`, `effect_over_declared`,
+`effect_ffi_without_extern`. More land over time as new equivalences
+earn their place.
