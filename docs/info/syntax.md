@@ -552,6 +552,35 @@ place — multiple spreads, any position. See the
 `Map` and `Set` have their own literals (`%{ }` / `%[ ]`) — see the
 [Collections section](#collections).
 
+### String and char escapes
+
+Both `"..."` and `'c'` accept exactly these, and **nothing else**:
+
+| Escape | Meaning |
+| --- | --- |
+| `\n` `\t` `\r` | newline, tab, carriage return |
+| `\0` | NUL — never consumes following digits, so `"\012"` is NUL, `1`, `2` |
+| `\\` `\"` `\'` | backslash, double quote, single quote |
+| `\xHH` | **exactly** two hex digits — one raw BYTE |
+| `\u{H..H}` | 1–6 hex digits — a codepoint, UTF-8 encoded |
+
+`\xHH` names a byte and `\u{...}` names a codepoint: `"\xE9"` is the
+single byte 0xE9 (not valid UTF-8 on its own), while `"\u{E9}"` is the
+two bytes 0xC3 0xA9 that encode `é`. In a char literal both name the
+scalar directly, so `'\u{2603}'` is U+2603 and `'\x41'` is `'A'`.
+
+Anything else is a compile error, including the C escapes kaikai does
+NOT have: octal (`\101`), `\a`, `\b`, `\f`, `\v`, `\?`, and
+variable-width `\xH...`. Write the byte as `\xHH` instead — `\a` is
+`\x07`, `\b` is `\x08`, `\v` is `\x0B`, `\f` is `\x0C`. An unknown
+escape is never silently reduced to the escaped character.
+
+`\u{...}` rejects UTF-16 surrogates (`\u{D800}`–`\u{DFFF}`) and
+anything above `\u{10FFFF}` at compile time.
+
+A string carries its length, so an embedded NUL is a byte like any
+other: `"a\0b"` has length 3.
+
 ### Multi-line strings (`"""`)
 
 `"""..."""` is a string literal that spans lines and interpolates
@@ -1174,6 +1203,23 @@ These look plausible but DO NOT EXIST. Do not write them.
 
 ```kaikai-neg
 fn main() : Int = (\x -> x + 1)(5)            # Haskell lambda
+```
+
+```kaikai-neg
+fn main() : String = "\101"                   # no octal escapes
+```
+
+```kaikai-neg
+fn main() : String = "\a\b\f\v\?"             # no \a \b \f \v \?
+                                              # (write \x07 \x08 …)
+```
+
+```kaikai-neg
+fn main() : String = "\x4"                    # \x is EXACTLY 2 digits
+```
+
+```kaikai-neg
+fn main() : String = "\u1b"                   # \u needs braces: \u{1b}
 ```
 
 ```kaikai-neg

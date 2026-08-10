@@ -1,0 +1,312 @@
+# compiler/escapes.kai — The escape table for string and char literals.
+#
+# One table, shared by every literal path: string bodies, char
+# literals, triple-quoted bodies and interpolation pieces. Splitting it
+# is how `'\x41'` came to mean `x` while `"\x41"` meant `A`.
+#
+# kaikai accepts exactly:
+#
+#   \n \t \r \0 \\ \" \'
+#   \xHH      exactly two hex digits, one raw BYTE
+#   \u{H..H}  1..6 hex digits, a codepoint encoded as UTF-8
+#
+# Everything else is a compile error. C99's octal, `\a \b \f \v \?`
+# and variable-width `\xH...` are deliberately absent: they used to be
+# accepted only because the C backend spliced the source span into
+# `kai_str("...")` and let the C compiler decode it.
+#
+# `\xHH` yields a byte and `\u{...}` yields a codepoint — `"\xE9"` is a
+# lone 0xE9 (not valid UTF-8 on its own) while `"\u{E9}"` is the two
+# bytes 0xC3 0xA9.
+
+import compiler.chars
+
+# ====================================================================
+# outcome
+# ====================================================================
+
+# Decoding either yields bytes and the offset just past the escape, or
+# a message plus the offset OF THE BACKSLASH so the caret lands on the
+# escape rather than on the opening quote.
+pub type EscStep = EscOk(String, Int) | EscBad(String, Int)
+
+fn esc_max_cp() : Int = 1114111
+fn esc_surrogate_lo() : Int = 55296
+fn esc_surrogate_hi() : Int = 57343
+fn esc_max_u_digits() : Int = 6
+
+# ====================================================================
+# small helpers
+# ====================================================================
+
+fn esc_hex_val(c: Char) : Int {
+  if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
+  else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
+  else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
+  else { 0 - 1 }
+}
+
+fn esc_char_str(c: Char) : String = int_to_byte_string(char_to_int(c))
+
+fn esc_hex_digit(d: Int) : String =
+  if d < 10 { int_to_string(d) } else { esc_hex_letter(d) }
+
+fn esc_hex_letter(d: Int) : String {
+  if d == 10 { "A" } else if d == 11 { "B" } else if d == 12 { "C" }
+  else if d == 13 { "D" } else if d == 14 { "E" } else { "F" }
+}
+
+fn esc_hex_render(v: Int) : String =
+  if v < 16 { esc_hex_digit(v) }
+  else { string_concat(esc_hex_render(v / 16), esc_hex_digit(v % 16)) }
+
+# ====================================================================
+# the simple-escape table
+# ====================================================================
+#
+# The ONE place a simple escape maps to its value. Both the byte
+# decoder and the scalar (char-literal) decoder read it, so they cannot
+# drift apart. `-1` means "not a simple escape".
+
+fn esc_simple_val(c: Char) : Int {
+  if c == 'n' { 10 }
+  else if c == 't' { 9 }
+  else if c == 'r' { 13 }
+  else if c == '0' { 0 }
+  else if c == '\\' { 92 }
+  else if c == '"' { 34 }
+  else if c == '\'' { 39 }
+  else { 0 - 1 }
+}
+
+# The retired C escapes, each with the spelling that replaces it.
+fn esc_retired_hint(c: Char) : String {
+  if c == 'a' { "\\x07" }
+  else if c == 'b' { "\\x08" }
+  else if c == 'f' { "\\x0C" }
+  else if c == 'v' { "\\x0B" }
+  else { "" }
+}
+
+# ====================================================================
+# UTF-8 encoding
+# ====================================================================
+
+#[doc("Encode a Unicode scalar value as UTF-8 bytes.")]
+pub fn esc_utf8_encode(cp: Int) : String {
+  if cp < 128 { int_to_byte_string(cp) }
+  else if cp < 2048 { esc_utf8_two(cp) }
+  else if cp < 65536 { esc_utf8_three(cp) }
+  else { esc_utf8_four(cp) }
+}
+
+fn esc_utf8_two(cp: Int) : String =
+  string_concat(int_to_byte_string(192 + cp / 64),
+                int_to_byte_string(128 + cp % 64))
+
+fn esc_utf8_three(cp: Int) : String =
+  concat_all([int_to_byte_string(224 + cp / 4096),
+              int_to_byte_string(128 + (cp / 64) % 64),
+              int_to_byte_string(128 + cp % 64)])
+
+fn esc_utf8_four(cp: Int) : String =
+  concat_all([int_to_byte_string(240 + cp / 262144),
+              int_to_byte_string(128 + (cp / 4096) % 64),
+              int_to_byte_string(128 + (cp / 64) % 64),
+              int_to_byte_string(128 + cp % 64)])
+
+# ====================================================================
+# \u{...}
+# ====================================================================
+
+# A scanned `\u{...}` payload: the value plus the offset past the `}`,
+# or a message when the form or the range is wrong.
+type UScan = UOk(Int, Int) | UBad(String)
+
+fn esc_u_range_check(acc: Int, next: Int) : UScan {
+  if acc > esc_max_cp() {
+    UBad(concat_all(["codepoint '\\u{", esc_hex_render(acc),
+                     "}' is above the maximum U+10FFFF"]))
+  }
+  else if acc >= esc_surrogate_lo() and acc <= esc_surrogate_hi() {
+    UBad(concat_all(["codepoint '\\u{", esc_hex_render(acc),
+                     "}' is a UTF-16 surrogate and cannot be encoded as UTF-8"]))
+  }
+  else { UOk(acc, next) }
+}
+
+fn esc_u_digit_step(c: Char, acc: Int, digits: Int) : UScan {
+  if digits >= esc_max_u_digits() {
+    UBad("too many hex digits in '\\u{...}' escape: expected 1 to 6")
+  }
+  else {
+    let v = esc_hex_val(c)
+    if v < 0 {
+      UBad(concat_all(["invalid hex digit '", esc_char_str(c),
+                       "' in '\\u{...}' escape"]))
+    }
+    else { UOk(acc * 16 + v, 0) }
+  }
+}
+
+fn esc_scan_u_digits(s: String, i: Int, n: Int, acc: Int, digits: Int) : UScan {
+  if i >= n { UBad("unterminated '\\u{...}' escape: missing '}'") }
+  else {
+    match char_at(s, i) {
+      None -> UBad("unterminated '\\u{...}' escape: missing '}'")
+      Some(c) -> esc_u_at(s, i, n, acc, digits, c)
+    }
+  }
+}
+
+fn esc_u_at(s: String, i: Int, n: Int, acc: Int, digits: Int, c: Char) : UScan {
+  if c == '}' { esc_u_close(acc, i + 1, digits) }
+  else {
+    match esc_u_digit_step(c, acc, digits) {
+      UBad(m) -> UBad(m)
+      UOk(acc2, _) -> esc_scan_u_digits(s, i + 1, n, acc2, digits + 1)
+    }
+  }
+}
+
+fn esc_u_close(acc: Int, next: Int, digits: Int) : UScan =
+  if digits == 0 { UBad("empty '\\u{}' escape: expected 1 to 6 hex digits") }
+  else { esc_u_range_check(acc, next) }
+
+# `i` sits just past the `u`.
+fn esc_scan_u(s: String, i: Int, n: Int) : UScan {
+  match char_at(s, i) {
+    Some(c) ->
+      if c == '{' { esc_scan_u_digits(s, i + 1, n, 0, 0) }
+      else { UBad("incomplete '\\u' escape: write '\\u{...}'") }
+    None -> UBad("incomplete '\\u' escape: write '\\u{...}'")
+  }
+}
+
+# ====================================================================
+# \xHH — exactly two hex digits
+# ====================================================================
+#
+# Unlike C, where `\xH...` consumes greedily and `"\x41" ++ "2"`
+# differs from `"\x412"`.
+
+type XScan = XOk(Int) | XBad(String)
+
+fn esc_scan_x(s: String, i: Int, n: Int) : XScan {
+  if i + 1 >= n { XBad("incomplete '\\x' escape: expected exactly two hex digits") }
+  else { esc_scan_x_pair(char_at(s, i), char_at(s, i + 1)) }
+}
+
+fn esc_scan_x_pair(a: Option[Char], b: Option[Char]) : XScan {
+  match a {
+    None -> XBad("incomplete '\\x' escape: expected exactly two hex digits")
+    Some(c1) -> match b {
+      None -> XBad("incomplete '\\x' escape: expected exactly two hex digits")
+      Some(c2) -> esc_scan_x_vals(esc_hex_val(c1), esc_hex_val(c2))
+    }
+  }
+}
+
+fn esc_scan_x_vals(v1: Int, v2: Int) : XScan =
+  if v1 < 0 or v2 < 0 { XBad("invalid '\\x' escape: expected exactly two hex digits") }
+  else { XOk(v1 * 16 + v2) }
+
+# ====================================================================
+# rejection messages for everything outside the table
+# ====================================================================
+
+fn esc_reject_msg(c: Char) : String {
+  if c >= '1' and c <= '7' {
+    "octal escapes are not supported; write the byte as '\\xHH'"
+  }
+  else if c == '?' { "escape '\\?' is not supported; write '?'" }
+  else if esc_retired_hint(c) != "" {
+    concat_all(["escape '\\", esc_char_str(c), "' is not supported; write '",
+                esc_retired_hint(c), "'"])
+  }
+  else {
+    concat_all(["unknown escape sequence '\\", esc_char_str(c),
+                "'; write '\\\\", esc_char_str(c), "' for a literal backslash"])
+  }
+}
+
+# ====================================================================
+# byte decode — string literals
+# ====================================================================
+
+#[doc("Decode one escape sequence to bytes. `bs` is the backslash offset; `i` sits just past it.")]
+pub fn esc_decode_at(s: String, bs: Int, i: Int, n: Int) : EscStep {
+  match char_at(s, i) {
+    None -> EscBad("trailing '\\' with no escape character", bs)
+    Some(c) -> esc_decode_kind(s, bs, i, n, c)
+  }
+}
+
+fn esc_decode_kind(s: String, bs: Int, i: Int, n: Int, c: Char) : EscStep {
+  let simple = esc_simple_val(c)
+  if simple >= 0 { EscOk(int_to_byte_string(simple), i + 1) }
+  else if c == 'x' {
+    match esc_scan_x(s, i + 1, n) {
+      XOk(v) -> EscOk(int_to_byte_string(v), i + 3)
+      XBad(m) -> EscBad(m, bs)
+    }
+  }
+  else if c == 'u' {
+    match esc_scan_u(s, i + 1, n) {
+      UOk(cp, next) -> EscOk(esc_utf8_encode(cp), next)
+      UBad(m) -> EscBad(m, bs)
+    }
+  }
+  else { EscBad(esc_reject_msg(c), bs) }
+}
+
+fn esc_decode_loop(s: String, i: Int, n: Int, acc: String) : EscStep {
+  if i >= n { EscOk(acc, i) }
+  else {
+    match char_at(s, i) {
+      None -> EscOk(acc, i)
+      Some(c) ->
+        if c == '\\' { esc_decode_escape(s, i, n, acc) }
+        else { esc_decode_loop(s, i + 1, n, append_char(acc, c)) }
+    }
+  }
+}
+
+fn esc_decode_escape(s: String, i: Int, n: Int, acc: String) : EscStep {
+  match esc_decode_at(s, i, i + 1, n) {
+    EscOk(bytes, next) -> esc_decode_loop(s, next, n, string_concat(acc, bytes))
+    EscBad(msg, at) -> EscBad(msg, at)
+  }
+}
+
+#[doc("Decode every escape in `s[start..end)`, yielding the literal bytes.")]
+pub fn esc_decode_body(s: String, start: Int, end: Int) : EscStep =
+  esc_decode_loop(s, start, end, "")
+
+# ====================================================================
+# scalar decode — char literals
+# ====================================================================
+#
+# Same table, different output: a char literal names the scalar value
+# directly, so `'\u{2603}'` is U+2603 rather than its three UTF-8 bytes.
+# The lexer has already rejected anything outside the table.
+
+#[doc("Decode the escape at `i` (just past the backslash) to a scalar value.")]
+pub fn esc_decode_scalar_at(s: String, i: Int, n: Int) : Option[Int] {
+  match char_at(s, i) {
+    None -> None
+    Some(c) -> esc_scalar_kind(s, i, n, c)
+  }
+}
+
+fn esc_scalar_kind(s: String, i: Int, n: Int, c: Char) : Option[Int] {
+  let simple = esc_simple_val(c)
+  if simple >= 0 { Some(simple) }
+  else if c == 'x' {
+    match esc_scan_x(s, i + 1, n) { XOk(v) -> Some(v)  XBad(_) -> None }
+  }
+  else if c == 'u' {
+    match esc_scan_u(s, i + 1, n) { UOk(cp, _) -> Some(cp)  UBad(_) -> None }
+  }
+  else { None }
+}
