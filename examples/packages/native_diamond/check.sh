@@ -118,4 +118,26 @@ got="$(printf '%s\n' "$out" | grep -v '^kai' || true)"
 n="$(grep -c 'shimpkg.bare' "$TMP/app/kai.lock" 2>/dev/null || echo 0)"
 [ "$n" = "1" ] || note "expected 1 shimpkg entry in kai.lock, got $n"
 
+# The acceptance shape of `kai install github.com/owner/app`: install
+# from a git source whose transitive git dependencies bottom out in a
+# [native] package. Clone, resolve, compile the shim, link, install —
+# into an isolated prefix, from a cold cache, no CFLAGS, no Makefile.
+mkdir -p "$TMP/src-app"
+cp "$TMP/app/kai.toml" "$TMP/app/main.kai" "$TMP/src-app/"
+mkrepo app
+HOME_DIR="$TMP/home"
+mkdir -p "$HOME_DIR/bin"
+set +e
+( cd "$TMP" && KAIKAI_HOME="$HOME_DIR" KAIKAI_CACHE="$TMP/cache-install" \
+    "$KAI" install "$TMP/app.bare@v0.1.0" ) >"$TMP/.iout" 2>"$TMP/.ierr"
+status=$?
+set -e
+[ "$status" -eq 0 ] || { note "kai install from git exited $status"; cat "$TMP/.ierr" >&2; }
+if [ -x "$HOME_DIR/bin/diamond_app" ]; then
+  got="$("$HOME_DIR/bin/diamond_app")"
+  [ "$got" = "17" ] || note "installed diamond_app printed '$got', want 17"
+else
+  note "kai install from git left no binary in $HOME_DIR/bin"
+fi
+
 exit "$fail"
