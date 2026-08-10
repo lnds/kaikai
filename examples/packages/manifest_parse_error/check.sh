@@ -6,7 +6,7 @@
 #   1. exit non-zero
 #   2. print a one-line diagnostic mentioning kai.toml + parse error
 #
-# Without this the parse failure is silently masked and `kai install`
+# Without this the parse failure is silently masked and `kai fetch`
 # pretends the manifest has no deps, exits 0, and downstream
 # `kai run` / `kai build` fail with a less-obvious error elsewhere.
 

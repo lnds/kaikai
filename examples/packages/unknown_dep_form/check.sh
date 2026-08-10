@@ -28,7 +28,7 @@ TOML
 
 set +e
 ( cd "$TMP" && KAIKAI_CACHE_ROOT="$TMP/cache" \
-    "$ROOT/bin/kai" install >"$TMP/stdout" 2>"$TMP/stderr" )
+    "$ROOT/bin/kai" fetch >"$TMP/stdout" 2>"$TMP/stderr" )
 status=$?
 set -e
 
