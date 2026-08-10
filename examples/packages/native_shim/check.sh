@@ -39,8 +39,8 @@ kai_in() {
 # 1. The library runs its own tests against its own shim.
 kai_in "$DIR/lib_term" "$KAI" test .
 [ "$status" -eq 0 ] || { note "kai test inside lib_term exited $status"; cat "$TMP/.err" >&2; }
-grep -q "1/1 tests passed" "$TMP/.out" "$TMP/.err" 2>/dev/null \
-  || note "lib_term tests did not report 1/1 passed"
+grep -q "2/2 tests passed" "$TMP/.out" "$TMP/.err" 2>/dev/null \
+  || note "lib_term tests did not report 2/2 passed"
 
 # 2. The consumer's tests link the dep's shim too.
 cp -R "$DIR/app" "$TMP/app_t"
