@@ -92,6 +92,7 @@ import compiler.diag
 import compiler.util
 import compiler.impl_index
 import compiler.modules
+import compiler.proto_scope
 import compiler.infer
 import compiler.layout_derive
 import compiler.layout_validate
@@ -153,8 +154,8 @@ fn strip_law_loop(decls: [Decl], acc: [Decl], laws: [ProtoLaw],
                   axioms: [AxiomImpl]) : StrippedLaws = match decls {
   [] -> SL(list_reverse(acc), LR(list_reverse(laws), list_reverse(axioms)))
   [d, ...rest] -> match d {
-    DProtoLaws(thy, DProtocol(a, name, b, c, l, cc), _, _) ->
-      strip_law_loop(rest, [DProtocol(a, name, b, c, l, cc), ...acc],
+    DProtoLaws(thy, DProtocol(a, name, b, c, l, cc, mo), _, _) ->
+      strip_law_loop(rest, [DProtocol(a, name, b, c, l, cc, mo), ...acc],
                      [PL(name, thy), ...laws], axioms)
     DImplAxiom(thy, DImpl(pname, pa, target, ms, l, cc, tps), _, _) ->
       strip_law_loop(rest, [DImpl(pname, pa, target, ms, l, cc, tps), ...acc],
@@ -421,111 +422,52 @@ fn arg_names_mangle(args: [String]) : String = match args {
 #[doc("kaikai name of the polymorphic dispatcher DFn for protocol op `op` (`__proto_<op>`).")]
 pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 
-# A protocol's home module, keyed by name. Built once from the merged
-# decl stream's home-anchor analysis; `collect_proto_decls` consults it
-# instead of inferring the home from the running `cur_mod`.
-type ProtoHome = PH(String, Option[String])
-
-# The home module of each DProtocol, recovered with the SAME back-
-# propagating home-anchor analysis `validate_pub_access` uses. A bare
-# forward stream (the legacy approach) mis-tags any DProtocol that
-# precedes the first anchored DFn of its file: a user protocol declared
-# before `fn main` inherits the last core's module instead of the
-# root file's, and every core protocol shifts to the preceding
-# module. `imports_home_anchors` assigns one home per decl in source
-# order with the back-propagation that fixes both.
-fn proto_homes_from_decls(ds: [Decl], target_mod: String) : [ProtoHome] = {
-  let homes = imports_home_anchors(ds, target_mod, target_mod, [])
-  proto_homes_zip(ds, homes, target_mod, [])
-}
-
-fn proto_homes_zip(ds: [Decl], homes: [HomeAnchor], target_mod: String,
-                   acc: [ProtoHome]) : [ProtoHome] = match ds {
-  [] -> acc
-  [d, ...rest] -> match homes {
-    [] -> acc
-    [h, ...hrest] -> {
-      let acc1 = proto_home_record(d, ha_home(h), target_mod, acc)
-      proto_homes_zip(rest, hrest, target_mod, acc1)
-    }
-  }
-}
-
-# Record a `(proto_name, home)` for `d` when it is (or wraps) a
-# DProtocol. `home == target_mod` canonicalises to `None`, matching the
-# rest of the root file's untagged decls.
-fn proto_home_record(d: Decl, home: String, target_mod: String,
-                     acc: [ProtoHome]) : [ProtoHome] = match d {
-  DProtocol(_, name, _, _, _, _) -> {
-    let mo = if home == target_mod { None } else { Some(home) }
-    [PH(name, mo), ...acc]
-  }
-  DDerive(_, inner, _, _)  -> proto_home_record(inner, home, target_mod, acc)
-  DUnstable(inner, _, _)   -> proto_home_record(inner, home, target_mod, acc)
-  DProtoLaws(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
-  DImplAxiom(_, inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
-  DConstructor(inner, _, _) -> proto_home_record(inner, home, target_mod, acc)
-  _ -> acc
-}
-
-fn proto_home_lookup(homes: [ProtoHome], name: String) : Option[String] = match homes {
-  [] -> None
-  [PH(n, mo), ...rest] -> if n == name { mo } else { proto_home_lookup(rest, name) }
-}
+# A decl's home canonicalised the way the registry stores it: the
+# root file's module name becomes `None`, matching the rest of the
+# root file's untagged decls.
+fn proto_mo_of(home: String, target_mod: String) : Option[String] =
+  if home == target_mod { None } else { Some(home) }
 
 # Register every DProtocol decl the program declares. The op list
 # becomes the universe of "names that look like ordinary fn calls but
-# really need protocol dispatch".
-#
-# Issue #597 boundary tagging: each registered DProtocol records its
-# home module. DProtocol carries no `module_origin` field of its own (v1
-# of #510 only added the field to DFn), so the home is recovered up
-# front via `proto_homes_from_decls` (the back-propagating home-anchor
-# analysis) and looked up by name here. The `origins` table feeds
-# `make_dispatcher_fn` so each synthesised dispatcher inherits the
-# originating module's tag, AND the #962 directional-visibility cut,
-# which needs a user protocol's origin to be exactly `None`.
-fn collect_proto_decls(ds: [Decl], reg: ProtocolReg,
-                        target_mod: String) : ProtocolReg {
-  collect_proto_decls_h(ds, reg, proto_homes_from_decls(ds, target_mod))
-}
-
-fn collect_proto_decls_h(ds: [Decl], reg: ProtocolReg,
-                          homes: [ProtoHome]) : ProtocolReg {
+# really need protocol dispatch". Each entry carries its declaring
+# module's `module_origin` stamp so two same-named protocols never
+# share one identity.
+fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
-      DProtocol(_, name, tparams, ops, _, _) -> {
-        let proto_mo = proto_home_lookup(homes, name)
+      DProtocol(is_pub, name, tparams, ops, _, _, mo) -> {
         let reg1 = ProtocolReg {
           ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-          tparams: [PTPR(name, tparams), ...reg.tparams],
-          origins: [PrOR(name, proto_mo), ...reg.origins],
+          tparams: [PTPR(name, tparams, mo), ...reg.tparams],
+          origins: [PrOR(name, mo, is_pub), ...reg.origins],
           impl_index: reg.impl_index
         }
-        collect_proto_decls_h(rest, register_proto_ops(reg1, name, ops), homes)
+        collect_proto_decls(rest, register_proto_ops(reg1, name, mo, ops))
       }
       DDerive(_, inner, _, _) ->
-        collect_proto_decls_h([inner, ...rest], reg, homes)
+        collect_proto_decls([inner, ...rest], reg)
       DUnstable(inner, _, _) ->
-        collect_proto_decls_h([inner, ...rest], reg, homes)
+        collect_proto_decls([inner, ...rest], reg)
       DProtoLaws(_, inner, _, _) ->
-        collect_proto_decls_h([inner, ...rest], reg, homes)
+        collect_proto_decls([inner, ...rest], reg)
       DImplAxiom(_, inner, _, _) ->
-        collect_proto_decls_h([inner, ...rest], reg, homes)
+        collect_proto_decls([inner, ...rest], reg)
       DConstructor(inner, _, _) ->
-        collect_proto_decls_h([inner, ...rest], reg, homes)
-      _ -> collect_proto_decls_h(rest, reg, homes)
+        collect_proto_decls([inner, ...rest], reg)
+      _ -> collect_proto_decls(rest, reg)
     }
   }
 }
 
-fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : ProtocolReg {
+fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
+                      ops: [ProtoOp]) : ProtocolReg {
   match ops {
     [] -> reg
     [op, ...rest] -> match op {
       POp(opname, _, params, ret, line, col) -> {
-        let entry = POR(proto, opname, params, ret, line, col)
+        let entry = POR(proto, opname, params, ret, line, col, mo)
         let names1 =
           if list_has(reg.op_names, opname) { reg.op_names }
           else { [opname, ...reg.op_names] }
@@ -537,21 +479,8 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, ops: [ProtoOp]) : Protoco
           origins: reg.origins,
           impl_index: reg.impl_index
         }
-        register_proto_ops(reg1, proto, rest)
+        register_proto_ops(reg1, proto, mo, rest)
       }
-    }
-  }
-}
-
-# Issue #597: lookup a protocol's home module in the registry. Returns
-# `None` for root-file protocols (so the synthesised dispatcher stays
-# `mo = None`, matching the rest of the root file's untagged decls) or
-# `Some(mod)` for protocols imported from a core / module.
-fn proto_origin_lookup(origins: [ProtoOriginReg], proto: String) : Option[String] {
-  match origins {
-    [] -> None
-    [h, ...rest] -> match h {
-      PrOR(p, mo) -> if p == proto { mo } else { proto_origin_lookup(rest, proto) }
     }
   }
 }
@@ -564,7 +493,7 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _) ->
         if name == target { Some(op) } else { proto_op_lookup_loop(rest, target) }
     }
   }
@@ -587,7 +516,7 @@ fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _) ->
         if name == target { [op, ...proto_ops_lookup_all_loop(rest, target)] }
         else { proto_ops_lookup_all_loop(rest, target) }
     }
@@ -601,7 +530,7 @@ fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DProtocol(_, name, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
+      DProtocol(_, name, _, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
       DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DUnstable(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
       DProtoLaws(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
@@ -636,33 +565,47 @@ fn proto_builtin_type_names() : [String] =
   ["Int", "Real", "Bool", "Char", "String", "Unit",
    "List", "Option", "Result"]
 
-# Validate: the orphan rule (protocol or target type must be local)
-# and single-impl-per-(P,T) coherence. Reports each violation on
+# Validate: the orphan rule (protocol or target type must be local),
+# single-impl-per-(P,T) coherence, and that the impl's protocol name
+# resolves to a protocol its module can see. Reports each violation on
 # stderr and returns the count of reported errors.
-fn validate_impls(ds: [Decl], df: DiagFiles,
-                  proto_names: [String], local_types: [String]) : Int / Console {
-
-  validate_impls_loop(ds, df, proto_names, local_types, [], 0)
+fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
+                  origins: [ProtoOriginReg], proto_names: [String],
+                  local_types: [String], target_mod: String) : Int / Console {
+  validate_impls_loop(ds, homes, df, origins, proto_names, local_types,
+                      target_mod, [], 0)
 }
 
-fn validate_impls_loop(ds: [Decl], df: DiagFiles,
-                       proto_names: [String], local_types: [String],
+fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
+                       origins: [ProtoOriginReg], proto_names: [String],
+                       local_types: [String], target_mod: String,
                        seen: [String], errs: Int) : Int / Console {
   match ds {
     [] -> errs
-    [d, ...rest] -> match d {
+    [d, ...rest] -> match homes {
+      [] -> errs
+      [h, ...hrest] -> match d {
       DImpl(pname, proto_args, target, _, line, col, _) -> {
         let file = decl_diag_file(d, df)
         let tname = proto_type_name(target)
+        let from = proto_mo_of(ha_home(h), target_mod)
+        let res = proto_scope_resolve(origins, pname, from)
         # Issue #180: duplicate-impl key includes the proto-arg names so
         # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
         # coexist. Legacy `impl P for T` (proto_args == []) maps to the
-        # homogeneous default `[T]` for keying.
+        # homogeneous default `[T]` for keying. The resolved protocol's
+        # home leads the key: two modules implementing their own `P`
+        # for same-named types are not duplicates.
         let arg_names = match proto_args {
           [] -> [tname]
           _  -> map(proto_args, proto_type_name)
         }
-        let key = concat_all([pname, "/", tname, "[", arg_names_mangle(arg_names), "]"])
+        let mo_key = match res {
+          PRHome(Some(m)) -> m
+          _ -> ""
+        }
+        let key = concat_all([mo_key, "!", pname, "/", tname, "[",
+                              arg_names_mangle(arg_names), "]"])
         let proto_local = list_has(proto_names, pname)
         let type_local = list_has(local_types, tname) or
                          list_has(proto_builtin_type_names(), tname)
@@ -682,29 +625,44 @@ fn validate_impls_loop(ds: [Decl], df: DiagFiles,
               "` already exists in this compilation unit"]))
             errs1 + 1
           } else { errs1 }
-        let proto_ok =
-          if list_has(proto_names, pname) { true }
-          else {
+        let errs3 = match res {
+          PRHome(_) -> errs2
+          PRPrivate(m) -> {
+            eprint(concat_all([
+              file, ":", int_to_string(line), ":", int_to_string(col),
+              ": error: protocol `", pname, "` is declared in module `", m,
+              "` but is not `pub`"]))
+            errs2 + 1
+          }
+          PRUnknown -> {
             eprint(concat_all([
               file, ":", int_to_string(line), ":", int_to_string(col),
               ": error: unknown protocol `", pname, "` in `impl`"]))
-            false
+            errs2 + 1
           }
-        let errs3 = if proto_ok { errs2 } else { errs2 + 1 }
+        }
         let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, df, proto_names, local_types, seen1, errs3)
+        validate_impls_loop(rest, hrest, df, origins, proto_names,
+                            local_types, target_mod, seen1, errs3)
       }
       DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], df, proto_names, local_types, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+                            local_types, target_mod, seen, errs)
       DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], df, proto_names, local_types, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+                            local_types, target_mod, seen, errs)
       DProtoLaws(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], df, proto_names, local_types, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+                            local_types, target_mod, seen, errs)
       DImplAxiom(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], df, proto_names, local_types, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+                            local_types, target_mod, seen, errs)
       DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], df, proto_names, local_types, seen, errs)
-      _ -> validate_impls_loop(rest, df, proto_names, local_types, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+                            local_types, target_mod, seen, errs)
+      _ -> validate_impls_loop(rest, hrest, df, origins, proto_names,
+                               local_types, target_mod, seen, errs)
+      }
     }
   }
 }
@@ -741,29 +699,45 @@ fn validate_impls_loop(ds: [Decl], df: DiagFiles,
 # Unknown protocol names are silently skipped — `validate_impls_loop`
 # above already reports those.
 
-fn validate_impl_methods(ds: [Decl], df: DiagFiles,
-                         reg: ProtocolReg) : Int / Console {
-  validate_impl_methods_loop(ds, df, reg, 0)
+fn validate_impl_methods(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
+                         reg: ProtocolReg, target_mod: String) : Int / Console {
+  validate_impl_methods_loop(ds, homes, df, reg, target_mod, 0)
 }
 
-fn validate_impl_methods_loop(ds: [Decl], df: DiagFiles,
-                              reg: ProtocolReg, errs: Int) : Int / Console {
+fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
+                              reg: ProtocolReg, target_mod: String,
+                              errs: Int) : Int / Console {
   match ds {
     [] -> errs
-    [d, ...rest] -> match d {
+    [d, ...rest] -> match homes {
+      [] -> errs
+      [h, ...hrest] -> match d {
       DImpl(pname, proto_args, target, methods, line, col, _) -> {
         let file = decl_diag_file(d, df)
         let tname = proto_type_name(target)
-        let proto_ops = proto_ops_for(reg.ops, pname, [])
+        # The impl checks against the protocol its own module resolves
+        # `pname` to — never a same-named protocol of an unrelated
+        # module. Unresolved names were already reported by
+        # `validate_impls`; skip them here.
+        let from = proto_mo_of(ha_home(h), target_mod)
+        let res = proto_scope_resolve(reg.origins, pname, from)
+        let proto_ops = match res {
+          PRHome(ph) -> proto_scope_ops(reg.ops, pname, ph)
+          _ -> []
+        }
         if proto_ops == [] {
-          validate_impl_methods_loop(rest, df, reg, errs)
+          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, errs)
         } else {
           # Protocol tparams substitute against the impl's bracket
           # arguments. Legacy `impl P for T` (`proto_args == []`) is
           # treated as the homogeneous default: every protocol tparam
           # collapses to the target head. Heterogeneous
           # `impl P[Real, Int] for T` aligns positionally.
-          let proto_tps = proto_tparams_for(reg.tparams, pname)
+          let ph = match res {
+            PRHome(p) -> p
+            _ -> None
+          }
+          let proto_tps = proto_scope_tparams(reg.tparams, pname, ph)
           let arg_heads = match proto_args {
             [] -> []
             _  -> map(proto_args, proto_type_name)
@@ -774,35 +748,21 @@ fn validate_impl_methods_loop(ds: [Decl], df: DiagFiles,
                                          file, line, col, errs)
           let e2 = check_impl_methods(methods, proto_ops, pname, tname, target,
                                        proto_tps, arg_heads, file, e1)
-          validate_impl_methods_loop(rest, df, reg, e2)
+          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, e2)
         }
       }
       DDerive(_, inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], df, reg, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, errs)
       DUnstable(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], df, reg, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, errs)
       DProtoLaws(_, inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], df, reg, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, errs)
       DImplAxiom(_, inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], df, reg, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, errs)
       DConstructor(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], df, reg, errs)
-      _ -> validate_impl_methods_loop(rest, df, reg, errs)
-    }
-  }
-}
-
-# All protocol ops for `pname`, returned in declaration order (the
-# registry stores them reversed; we flip back here so error messages
-# follow source order).
-fn proto_ops_for(ops: [ProtoOpReg], pname: String,
-                 acc: [ProtoOpReg]) : [ProtoOpReg] {
-  match ops {
-    [] -> acc
-    [op, ...rest] -> match op {
-      POR(p, _, _, _, _, _) ->
-        if p == pname { proto_ops_for(rest, pname, [op, ...acc]) }
-        else { proto_ops_for(rest, pname, acc) }
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, errs)
+      _ -> validate_impl_methods_loop(rest, hrest, df, reg, target_mod, errs)
+      }
     }
   }
 }
@@ -811,18 +771,19 @@ fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
+      POR(_, name, _, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
     }
   }
 }
 
-# Look up the protocol's tparam names (the `[a]` in `protocol Add[a]`).
-# Returns `[]` for monomorphic protocols.
+# Look up the protocol's tparam names (the `[a]` in `protocol Add[a]`)
+# by bare name — first match wins. Rewrite-path callers have no module
+# context; validation resolves the home and uses `proto_scope_tparams`.
 fn proto_tparams_for(tps: [ProtoTPReg], pname: String) : [String] {
   match tps {
     [] -> []
     [t, ...rest] -> match t {
-      PTPR(p, names) ->
+      PTPR(p, names, _) ->
         if p == pname { names } else { proto_tparams_for(rest, pname) }
     }
   }
@@ -837,7 +798,7 @@ fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
   match proto_ops {
     [] -> errs
     [op, ...rest] -> match op {
-      POR(_, opname, _, _, _, _) -> {
+      POR(_, opname, _, _, _, _, _) -> {
         let errs1 =
           if impl_has_method(methods, opname) { errs }
           else {
@@ -889,7 +850,7 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
             errs + 1
           }
           Some(op) -> match op {
-            POR(_, _, proto_params, proto_ret, _, _) -> {
+            POR(_, _, proto_params, proto_ret, _, _, _) -> {
               let pa = list_length(params)
               let pp = list_length(proto_params)
               let e_ar =
@@ -925,7 +886,7 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _) ->
         if name == target { Some(op) } else { find_proto_op(rest, target) }
     }
   }
@@ -1199,26 +1160,24 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
 # core's basename so a cache loader can partition post-cascade
 # decls back into their original core/user segments.
 fn generate_dispatchers(reg: ProtocolReg) : [Decl] =
-  generate_dispatchers_loop(reg.ops, reg.origins,
-                            op_arities_from_ops(reg.ops), [])
+  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), [])
 
-fn generate_dispatchers_loop(ops: [ProtoOpReg], origins: [ProtoOriginReg],
-                                arities: [OpAr], acc: [Decl]) : [Decl] {
+fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
+                                acc: [Decl]) : [Decl] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(pname, opname, params, ret, line, col) -> {
+      POR(pname, opname, params, ret, line, col, mo) -> {
         # Dedup by the arity-resolved dispatcher NAME, not the bare op
         # name: an arity-ambiguous op (`f/1` + `f/2`) yields two
         # distinct dispatcher names, so both survive; same-arity
         # collisions still collapse to one shared dispatcher.
         let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
         let already = dispatcher_named_in_acc(acc, disp)
-        if already { generate_dispatchers_loop(rest, origins, arities, acc) }
+        if already { generate_dispatchers_loop(rest, arities, acc) }
         else {
-          let mo = proto_origin_lookup(origins, pname)
           let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, origins, arities, [stub, ...acc])
+          generate_dispatchers_loop(rest, arities, [stub, ...acc])
         }
       }
     }
@@ -1512,7 +1471,7 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DProtocol(_, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DProtocol(_, _, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
       DImpl(_, _, _, _, _, _, _)     -> strip_protocols_loop(rest, acc)
       DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
       _ -> strip_protocols_loop(rest, [d, ...acc])
@@ -3440,20 +3399,24 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
   let expanded = expand_derives(decls)
-  # Step 2 — coherence: orphan + duplicate-impl validation.
+  # Step 2 — collect every protocol op into the registry, each entry
+  # tagged with its declaring module's home. The same home-anchor
+  # stream also scopes the impl validations below, so it is computed
+  # once here.
+  let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
+  let reg0 = collect_proto_decls(expanded, proto_reg_empty())
+  # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
+  # validation. Needs `reg0.origins` to resolve each impl's protocol
+  # name from its own module.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let coh_errs = validate_impls(expanded, df, proto_names, local_types)
-  # Step 3 — collect every protocol op into the registry.
-  # Issue #597 boundary tagging: each DProtocol's home module is
-  # recorded in `reg.origins` via the back-propagating home-anchor
-  # analysis (DProtocol carries no `mo` field of its own).
-  let reg0 = collect_proto_decls(expanded, proto_reg_empty(), target_mod)
+  let coh_errs = validate_impls(expanded, homes, df, reg0.origins,
+                                proto_names, local_types, target_mod)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
-  # head-name signature mismatch). Runs after the registry is built so
-  # impl methods can be cross-referenced against POR entries.
-  let impl_errs = validate_impl_methods(expanded, df, reg0)
+  # head-name signature mismatch), resolved against the protocol the
+  # impl's own module sees — never a same-named one elsewhere.
+  let impl_errs = validate_impl_methods(expanded, homes, df, reg0, target_mod)
   let errs = pre_errs + derive_errs + coh_errs + impl_errs
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
   # name) and record the (P, T) -> impl_fn entry in the registry.
@@ -3487,7 +3450,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # / core) may only be rewritten against ops whose protocol is
   # itself core-origin; a root-file decl (user) sees every op. This is
   # the cut that keeps a once-typed core independent of any user file.
-  let core_op_arities = core_origin_op_arities(lower_res.reg.ops, lower_res.reg.origins)
+  let core_op_arities = core_origin_op_arities(lower_res.reg.ops)
   # Per-module shadow guard: collect each top-level fn with its home
   # module so a core helper (`complex::add`) shadows the bare op
   # only inside its own module, never in the user's file.
@@ -3562,7 +3525,7 @@ pub fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, params, _, _, _) ->
+      POR(_, name, params, _, _, _, _) ->
         [OpAr(name, list_length(params)), ...op_arities_from_ops(rest)]
     }
   }
@@ -3577,13 +3540,13 @@ pub fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
 # provider — so legitimate polymorphic dispatch (a core body calls a
 # core op, the user supplies the impl) is untouched: the core op's
 # protocol is still core-origin and survives the filter.
-fn core_origin_op_arities(ops: [ProtoOpReg], origins: [ProtoOriginReg]) : [OpAr] {
+fn core_origin_op_arities(ops: [ProtoOpReg]) : [OpAr] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(proto, name, params, _, _, _) -> match proto_origin_lookup(origins, proto) {
-        None -> core_origin_op_arities(rest, origins)
-        Some(_) -> [OpAr(name, list_length(params)), ...core_origin_op_arities(rest, origins)]
+      POR(_, name, params, _, _, _, mo) -> match mo {
+        None -> core_origin_op_arities(rest)
+        Some(_) -> [OpAr(name, list_length(params)), ...core_origin_op_arities(rest)]
       }
     }
   }
@@ -5252,7 +5215,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, params, ret_te, _, _) ->
+      POR(pname, _, params, ret_te, _, _, _) ->
         # Arity guard: skip a candidate whose arity differs from the
         # call (an arity-ambiguous name reaches both protocols' POR).
         if list_length(params) != list_length(args_) {
@@ -5330,7 +5293,7 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, params, ret, _, _) -> {
+      POR(pname, _, params, ret, _, _, _) -> {
         # Arity guard: a name declared by two protocols at different
         # arities (`P { f(x) }` + `Q { f(a, b) }`) yields one POR per
         # protocol here. Only the candidate whose arity matches the
@@ -5563,7 +5526,7 @@ fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args
 fn proto_has_tparams(tps: [ProtoTPReg], pname: String) : Bool = match tps {
   [] -> false
   [t, ...rest] -> match t {
-    PTPR(p, params) ->
+    PTPR(p, params, _) ->
       if p == pname {
         match params { [] -> false _ -> true }
       } else {
@@ -5714,7 +5677,7 @@ fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
   match proto_op_lookup(reg, opname) {
     None -> None
     Some(po) -> match po {
-      POR(pname, _, _, _, _, _) -> find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname)
+      POR(pname, _, _, _, _, _, _) -> find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname)
     }
   }
 }
@@ -5736,7 +5699,7 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, _, _, _, _) ->
+      POR(pname, _, _, _, _, _, _) ->
         match find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname) {
           Some(fn_name) -> Some(ImplHit(pname, fn_name))
           None -> find_impl_any_proto_loop(rest, reg, opname, tname)
@@ -5749,7 +5712,7 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
 fn first_proto_of_op(reg: ProtocolReg, opname: String) : String {
   match proto_ops_lookup_all(reg, opname) {
     [] -> "?"
-    [po, ..._rest] -> match po { POR(pn, _, _, _, _, _) -> pn }
+    [po, ..._rest] -> match po { POR(pn, _, _, _, _, _, _) -> pn }
   }
 }
 
