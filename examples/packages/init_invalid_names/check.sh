@@ -4,7 +4,8 @@
 # A bad name must:
 #   1. exit non-zero
 #   2. NOT create kai.toml
-#   3. emit a message naming the grammar
+#   3. emit a message naming the grammar — except a '-'-leading
+#      argument, which the driver rejects first as an unknown flag
 # A good name must succeed and write kai.toml as before.
 
 set -eu
@@ -55,8 +56,12 @@ for name in $BAD_NAMES; do
     continue
   fi
 
-  if ! grep -q "invalid package name" "$TMP/.stderr"; then
-    echo "init_invalid_names: FAIL — '$name' rejected but stderr lacks the grammar hint" >&2
+  case "$name" in
+    -*) want="unknown flag" ;;
+    *)  want="invalid package name" ;;
+  esac
+  if ! grep -q "$want" "$TMP/.stderr"; then
+    echo "init_invalid_names: FAIL — '$name' rejected but stderr lacks '$want'" >&2
     cat "$TMP/.stderr" >&2
     fail=1
     continue
