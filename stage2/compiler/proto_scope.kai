@@ -1,0 +1,91 @@
+# compiler/proto_scope.kai — module scoping for protocol names.
+#
+# `protocol P` is not a package-global name. The registry collects
+# every protocol over the flattened decl stream of every module, so
+# consulting it by name alone lets whichever protocol was declared
+# first answer for the whole package — including inside a module that
+# declares its own `P` and never imports the first one. With two
+# same-named protocols of different signatures, an impl would be
+# validated against a contract its module cannot even see.
+#
+# Resolution mirrors `ta_scope` (transparent aliases): a module sees
+# its own protocols first, then the exported ones of other modules.
+# Root-file protocols are visible package-wide, like every other
+# root declaration.
+
+import compiler.util
+import compiler.ast
+import compiler.fnreg
+
+#[doc("Resolution of a protocol name from one module's viewpoint: the home of the protocol it binds to, a private foreign declaration (its module named for diagnostics), or no declaration at all.")]
+pub type ProtoRes = PRHome(Option[String]) | PRPrivate(String) | PRUnknown
+
+#[doc("Resolve protocol `pname` as seen from the module whose home is `from` (`None` = root file): its own declaration first, else the first-declared visible foreign one (`pub` or root-file).")]
+pub fn proto_scope_resolve(origins: [ProtoOriginReg], pname: String,
+                           from: Option[String]) : ProtoRes =
+  match psc_own(origins, pname, from) {
+    Some(mo) -> PRHome(mo)
+    None -> match psc_foreign(list_reverse(origins), pname) {
+      Some(mo) -> PRHome(mo)
+      None -> match psc_any(origins, pname) {
+        Some(m) -> PRPrivate(m)
+        None    -> PRUnknown
+      }
+    }
+  }
+
+fn psc_own(origins: [ProtoOriginReg], pname: String,
+           from: Option[String]) : Option[Option[String]] = match origins {
+  [] -> None
+  [PrOR(n, mo, _), ...rest] ->
+    if n == pname and mo_eq(mo, from) { Some(mo) }
+    else { psc_own(rest, pname, from) }
+}
+
+# `origins` arrives reversed (the registry prepends), so the caller
+# passes it re-reversed: the first visible match is the first-declared.
+# No own-home exclusion is needed — the own pass already failed, so no
+# entry carries the consumer's home.
+fn psc_foreign(origins: [ProtoOriginReg],
+               pname: String) : Option[Option[String]] = match origins {
+  [] -> None
+  [PrOR(n, mo, is_pub), ...rest] -> {
+    let visible = is_pub or mo_eq(mo, None)
+    if n == pname and visible { Some(mo) }
+    else { psc_foreign(rest, pname) }
+  }
+}
+
+# Reached only when every candidate is a private non-root foreign
+# declaration; any match names a module for the diagnostic.
+fn psc_any(origins: [ProtoOriginReg], pname: String) : Option[String] =
+  match origins {
+    [] -> None
+    [PrOR(n, mo, _), ...rest] ->
+      if n == pname { mo } else { psc_any(rest, pname) }
+  }
+
+#[doc("The ops of the protocol named `pname` whose home is exactly `home`, in declaration order.")]
+pub fn proto_scope_ops(ops: [ProtoOpReg], pname: String,
+                       home: Option[String]) : [ProtoOpReg] =
+  psc_ops_loop(ops, pname, home, [])
+
+fn psc_ops_loop(ops: [ProtoOpReg], pname: String, home: Option[String],
+                acc: [ProtoOpReg]) : [ProtoOpReg] = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    POR(p, _, _, _, _, _, mo) ->
+      if p == pname and mo_eq(mo, home) {
+        psc_ops_loop(rest, pname, home, [op, ...acc])
+      } else { psc_ops_loop(rest, pname, home, acc) }
+  }
+}
+
+#[doc("The tparam names of the protocol named `pname` whose home is exactly `home`; `[]` for monomorphic protocols.")]
+pub fn proto_scope_tparams(tps: [ProtoTPReg], pname: String,
+                           home: Option[String]) : [String] = match tps {
+  [] -> []
+  [PTPR(p, names, mo), ...rest] ->
+    if p == pname and mo_eq(mo, home) { names }
+    else { proto_scope_tparams(rest, pname, home) }
+}
