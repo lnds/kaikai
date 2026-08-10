@@ -45,6 +45,7 @@
 # compiler.protos, and compiler.emit_shared (the backend-shared layer).
 
 import compiler.ast
+import compiler.diag_file
 import compiler.kinds
 import compiler.home_tu
 import compiler.loop_lower
@@ -11562,18 +11563,19 @@ fn row_of_expr_with_tparams(re: RowExpr, binds: [TPBind]) : Row {
 #              effect aliases. Cycles are still rejected for both.
 #   line/col — source position for diagnostics.
 #[doc("b #1b — closed effect aliases (Doc A §*Open questions* #5). An effect alias `type Io = Console + Stdin + Env + File` is a name that expands to a fixed label set in row…")]
-pub fn collect_alias_cands(decls: [Decl]) : [AliasCand] {
+pub fn collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] {
   match decls {
     [] -> []
     [d, ...rest] -> match decl_transparent_inner(d) {
-      Some(inner) -> collect_alias_cands([inner, ...rest])
+      Some(inner) -> collect_alias_cands([inner, ...rest], df)
       None -> {
+        let f = decl_diag_file(d, df)
         let here = match d {
           DType(_, name, _, body, line, col, _, _) -> match body {
-            TBEffectAlias(labels) -> [AC(name, labels, true, line, col)]
+            TBEffectAlias(labels) -> [AC(name, labels, true, line, col, f)]
             TBAlias(ty) -> match ty.tkind {
               TyName(n, targs) ->
-                if targs == [] { [AC(name, [n], false, line, col)] }
+                if targs == [] { [AC(name, [n], false, line, col, f)] }
                 else { [] }
               _ -> []
             }
@@ -11581,7 +11583,7 @@ pub fn collect_alias_cands(decls: [Decl]) : [AliasCand] {
           }
           _ -> []
         }
-        list_append(here, collect_alias_cands(rest))
+        list_append(here, collect_alias_cands(rest, df))
       }
     }
   }
@@ -11591,7 +11593,7 @@ fn cand_names_of(cands: [AliasCand]) : [String] {
   match cands {
     [] -> []
     [c, ...rest] -> match c {
-      AC(n, _, _, _, _) -> [n, ...cand_names_of(rest)]
+      AC(n, _, _, _, _, _) -> [n, ...cand_names_of(rest)]
     }
   }
 }
@@ -11600,7 +11602,7 @@ fn find_alias_cand(cands: [AliasCand], name: String) : Option[AliasCand] {
   match cands {
     [] -> None
     [c, ...rest] -> match c {
-      AC(n, _, _, _, _) -> if n == name { Some(c) } else { find_alias_cand(rest, name) }
+      AC(n, _, _, _, _, _) -> if n == name { Some(c) } else { find_alias_cand(rest, name) }
     }
   }
 }
@@ -11647,7 +11649,18 @@ fn cand_pos(cands: [AliasCand], name: String) : AliasPos {
   match find_alias_cand(cands, name) {
     None -> AliasPos { line: 0, col: 0 }
     Some(c) -> match c {
-      AC(_, _, _, ln, co) -> AliasPos { line: ln, col: co }
+      AC(_, _, _, ln, co, _) -> AliasPos { line: ln, col: co }
+    }
+  }
+}
+
+# The file that declared the alias; `fallback` covers a name with no
+# candidate, where there is no decl to attribute to.
+fn cand_file_of(cands: [AliasCand], name: String, fallback: String) : String {
+  match find_alias_cand(cands, name) {
+    None -> fallback
+    Some(c) -> match c {
+      AC(_, _, _, _, _, f) -> f
     }
   }
 }
@@ -11661,7 +11674,7 @@ fn resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
     AsFail -> AliasResolveOne { st: st, r: None }
     AsActive -> {
       let pos = cand_pos(cands, name)
-      diag_error(file, pos.line, pos.col,
+      diag_error(cand_file_of(cands, name, file), pos.line, pos.col,
         string_concat("cyclic effect alias: ", name))
       diag_note("an alias can only expand to declared effects, not back to itself")
       diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
@@ -11675,10 +11688,10 @@ fn resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
       match find_alias_cand(cands, name) {
         None -> AliasResolveOne { st: st, r: None }
         Some(c) -> match c {
-          AC(_, raw, explicit, line, col) -> {
+          AC(_, raw, explicit, line, col, cand_file) -> {
             let entries1 = alias_set_status(st.entries, name, AsActive)
             let st1 = AliasResolveState { entries: entries1, errs: st.errs }
-            let r = resolve_alias_labels(raw, cands, cand_ns, eff_names, file,
+            let r = resolve_alias_labels(raw, cands, cand_ns, eff_names, cand_file,
                                          name, explicit, line, col, st1, [])
             match r.r {
               None -> {
@@ -11756,7 +11769,7 @@ fn resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
       # alias: skip registering an alias entry for it so a row label
       # resolves to the effect. This is the row-level counterpart of
       # `resolve_alias_labels`' effect-vs-alias check on the body.
-      AC(name, _, _, _, _) ->
+      AC(name, _, _, _, _, _) ->
         if list_has(eff_names, name) {
           resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, st, rest, acc)
         } else {
