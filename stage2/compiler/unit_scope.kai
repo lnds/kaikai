@@ -1,0 +1,197 @@
+#[doc("""
+compiler.unit_scope — module scoping for unit habitant declarations.
+
+A `unit` declaration is not a package-global name. The site table
+records every habitant declaration with its home module, `pub` flag
+and resolved kind, so resolution can prefer a module's own
+declaration over an imported exported one, and so two same-kind
+habitants of the same name declared in different modules become
+distinct atoms instead of silently unifying.
+
+Aliases (`unit x = ...`) expand by bare name after resolution, so an
+alias site captures any Measure-kind use of its name: collision
+checks count alias sites alongside Measure atoms.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+
+#[doc("One per-module slice of the declaration stream: module name plus its decls.")]
+pub type UnitSeg = USeg(String, [Decl])
+
+#[doc("One habitant declaration site: home module, name, `pub` flag, resolved kind, and whether it is an alias declaration.")]
+pub type UnitSite = USite(String, String, Bool, String, Bool)
+
+#[doc("The home module of a site.")]
+pub fn usite_home(s: UnitSite) : String = match s { USite(h, _, _, _, _) -> h }
+
+#[doc("The declared habitant name of a site.")]
+pub fn usite_name(s: UnitSite) : String = match s { USite(_, n, _, _, _) -> n }
+
+#[doc("The resolved kind of a site's declaration.")]
+pub fn usite_kind(s: UnitSite) : String = match s { USite(_, _, _, k, _) -> k }
+
+#[doc("The kind an introducer word declares habitants into; `Measure` when it is not a registered introducer.")]
+pub fn unit_intro_kind(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) {
+    Some(k) -> k
+    None -> measure_kind_name()
+  }
+
+#[doc("Collect every habitant declaration site of the given per-module segments, in stream order.")]
+pub fn unit_sites(segs: [UnitSeg], reg: KindReg) : [UnitSite] =
+  list_reverse(us_segs(segs, reg, []))
+
+fn us_segs(segs: [UnitSeg], reg: KindReg, acc: [UnitSite]) : [UnitSite] =
+  match segs {
+    [] -> acc
+    [USeg(m, ds), ...rest] -> us_segs(rest, reg, us_decls(ds, m, reg, acc))
+  }
+
+fn us_decls(ds: [Decl], home: String, reg: KindReg,
+      acc: [UnitSite]) : [UnitSite] = match ds {
+  [] -> acc
+  [d, ...rest] -> us_decls(rest, home, reg, us_decl(d, home, reg, acc))
+}
+
+fn us_decl(d: Decl, home: String, reg: KindReg,
+      acc: [UnitSite]) : [UnitSite] = match d {
+  DUnit(p, name, ub, intro, _, _) -> {
+    let is_alias = match ub { UBAlias(_) -> true _ -> false }
+    [USite(home, name, p, unit_intro_kind(reg, intro), is_alias), ...acc]
+  }
+  DDerive(_, inner, _, _)    -> us_decl(inner, home, reg, acc)
+  DUnstable(inner, _, _)     -> us_decl(inner, home, reg, acc)
+  DProtoLaws(_, inner, _, _) -> us_decl(inner, home, reg, acc)
+  DImplAxiom(_, inner, _, _) -> us_decl(inner, home, reg, acc)
+  DConstructor(inner, _, _)  -> us_decl(inner, home, reg, acc)
+  DDoc(_, _, inner, _, _)    -> us_decl(inner, home, reg, acc)
+  DAttr(_, inner, _, _)      -> us_decl(inner, home, reg, acc)
+  _ -> acc
+}
+
+#[doc("Every site declaring `name`, in stream order.")]
+pub fn unit_sites_for(sites: [UnitSite], name: String) : [UnitSite] =
+  list_reverse(usf_loop(sites, name, []))
+
+fn usf_loop(sites: [UnitSite], name: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] ->
+      usf_loop(rest, name, if usite_name(s) == name { [s, ...acc] } else { acc })
+  }
+
+#[doc("The distinct home modules of the given sites, in first-seen order.")]
+pub fn unit_sites_homes(sites: [UnitSite]) : [String] =
+  list_reverse(ush_loop(sites, []))
+
+fn ush_loop(sites: [UnitSite], acc: [String]) : [String] = match sites {
+  [] -> acc
+  [s, ...rest] ->
+    ush_loop(rest, if list_has(acc, usite_home(s)) { acc }
+                   else { [usite_home(s), ...acc] })
+}
+
+#[doc("The sites among `sites` whose home is `home`.")]
+pub fn unit_sites_own(sites: [UnitSite], home: String) : [UnitSite] =
+  list_reverse(uso_loop(sites, home, []))
+
+fn uso_loop(sites: [UnitSite], home: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] ->
+      uso_loop(rest, home, if usite_home(s) == home { [s, ...acc] } else { acc })
+  }
+
+#[doc("The exported sites among `sites` living outside `home`.")]
+pub fn unit_sites_pub_foreign(sites: [UnitSite], home: String) : [UnitSite] =
+  list_reverse(usp_loop(sites, home, []))
+
+fn usp_loop(sites: [UnitSite], home: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] -> {
+      let keep = match s { USite(h, _, p, _, _) -> p and not (h == home) }
+      usp_loop(rest, home, if keep { [s, ...acc] } else { acc })
+    }
+  }
+
+#[doc("The distinct kinds of the non-alias sites, in first-seen order.")]
+pub fn unit_sites_kinds(sites: [UnitSite]) : [String] =
+  list_reverse(usk_loop(sites, []))
+
+fn usk_loop(sites: [UnitSite], acc: [String]) : [String] = match sites {
+  [] -> acc
+  [s, ...rest] -> match s {
+    USite(_, _, _, k, is_alias) ->
+      usk_loop(rest, if is_alias or list_has(acc, k) { acc } else { [k, ...acc] })
+  }
+}
+
+#[doc("True when every site is an alias declaration.")]
+pub fn unit_sites_all_alias(sites: [UnitSite]) : Bool = match sites {
+  [] -> true
+  [s, ...rest] -> match s {
+    USite(_, _, _, _, is_alias) -> is_alias and unit_sites_all_alias(rest)
+  }
+}
+
+#[doc("True when any site is an alias declaration.")]
+pub fn unit_sites_any_alias(sites: [UnitSite]) : Bool = match sites {
+  [] -> false
+  [s, ...rest] -> match s {
+    USite(_, _, _, _, is_alias) -> is_alias or unit_sites_any_alias(rest)
+  }
+}
+
+#[doc("""
+True when `name` is declared at kind `kind` by two or more modules,
+counting alias sites for `Measure` (an alias expands by bare name, so
+it can capture a Measure atom of its name). A true result is what
+makes resolution spell the atom with its home module.
+""")]
+pub fn unit_name_multi_at(sites_for_name: [UnitSite], kind: String) : Bool =
+  list_length(unit_sites_homes(unma_matching(sites_for_name, kind, []))) >= 2
+
+fn unma_matching(sites: [UnitSite], kind: String,
+      acc: [UnitSite]) : [UnitSite] = match sites {
+  [] -> acc
+  [s, ...rest] -> match s {
+    USite(_, _, _, k, is_alias) -> {
+      let hit = if is_alias { kind == measure_kind_name() } else { k == kind }
+      unma_matching(rest, kind, if hit { [s, ...acc] } else { acc })
+    }
+  }
+}
+
+#[doc("The non-alias sites declaring at kind `kind`.")]
+pub fn unit_sites_of_kind(sites: [UnitSite], kind: String) : [UnitSite] =
+  match sites {
+    [] -> []
+    [s, ...rest] -> match s {
+      USite(_, _, _, k, is_alias) ->
+        if not is_alias and k == kind { [s, ...unit_sites_of_kind(rest, kind)] }
+        else { unit_sites_of_kind(rest, kind) }
+    }
+  }
+
+#[doc("The atom spelling for a resolution at `home`: module-qualified when the name is contested across modules, unchanged otherwise.")]
+pub fn unit_spell(sym: String, home: String, multi: Bool) : String =
+  if multi { mod_qualify_sym(home, sym) } else { sym }
+
+#[doc("Result of taking the next declaration site for a name off the site queue.")]
+pub type UnitPop = UPop(Option[UnitSite], [UnitSite])
+
+#[doc("Pop the first site named `name`: the site plus the remaining queue; None when the queue has none.")]
+pub fn unit_sites_pop(queue: [UnitSite], name: String) : UnitPop =
+  usq_loop(queue, name, [])
+
+fn usq_loop(queue: [UnitSite], name: String, seen: [UnitSite]) : UnitPop =
+  match queue {
+    [] -> UPop(None, list_reverse(seen))
+    [s, ...rest] ->
+      if usite_name(s) == name {
+        UPop(Some(s), list_append(list_reverse(seen), rest))
+      } else { usq_loop(rest, name, [s, ...seen]) }
+  }
