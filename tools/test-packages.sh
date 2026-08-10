@@ -242,9 +242,13 @@ run_positive "build_module_qualified" "build_module_qualified" "build_module_qua
 
 # git-source dep chains (rendered manifests): direct dep and a
 # transitive chain. SKIP when the manifest was not rendered, matching
-# the git-fixture fail-open policy above.
+# the git-fixture fail-open policy above. A silent warm-up build runs
+# first: on a cold resolver `kai run` interleaves the kai-pkg fetch
+# preamble into the captured output (lines the `^kai:` filter does not
+# cover), so the golden diff must see a warm lock.
 run_rendered() {
   if [ -f "$PKG_DIR/$2/kai.toml" ]; then
+    (cd "$PKG_DIR/$2" && "$KAI" run . >/dev/null 2>&1) || true
     run_positive "$1" "$2" "$3"
   else
     skip "$1" "manifest not rendered (render-fixtures.sh unavailable?)"
