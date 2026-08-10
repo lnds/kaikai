@@ -85,6 +85,26 @@ done
 [ ! -e "$prefix/bin/stale-toolchain-file" ] \
   || note "a bin/ file absent from the ledger survived the wipe"
 
+# --- install and upgrade must agree on the prefix ---------------------
+# The ledger only protects binaries if both commands read the same
+# directory. `kai upgrade` uses $ROOT (the wrapper's grandparent), so an
+# installed layout must resolve there even when $KAIKAI_HOME points
+# elsewhere — otherwise the ledger sits in one prefix and the upgrade
+# wipes another.
+probe="$TMP/prefix-probe.sh"
+sed -n '/^install_prefix() {/,/^}/p' "$ROOT/bin/kai" > "$probe"
+if [ ! -s "$probe" ]; then
+  note "could not extract install_prefix from bin/kai"
+else
+  echo 'install_prefix' >> "$probe"
+  mkdir -p "$TMP/installed/libexec/kaikai"
+  : > "$TMP/installed/libexec/kaikai/kaic2"
+  chmod +x "$TMP/installed/libexec/kaikai/kaic2"
+  got="$(ROOT="$TMP/installed" KAIKAI_HOME="$TMP/somewhere-else" sh "$probe")"
+  [ "$got" = "$TMP/installed" ] \
+    || note "installed prefix resolved to '$got', not the wrapper's own root"
+fi
+
 # --- a name the new toolchain claims does not shadow it ---------------
 prefix2="$TMP/prefix2"
 mkdir -p "$prefix2/bin"
