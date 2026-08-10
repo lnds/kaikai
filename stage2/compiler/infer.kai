@@ -79,7 +79,7 @@ fn inf_cand_names_of(cands: [AliasCand]) : [String] {
   match cands {
     [] -> []
     [c, ...rest] -> match c {
-      AC(n, _, _, _, _) -> [n, ...inf_cand_names_of(rest)]
+      AC(n, _, _, _, _, _) -> [n, ...inf_cand_names_of(rest)]
     }
   }
 }
@@ -89,22 +89,34 @@ fn inf_cand_pos(cands: [AliasCand], name: String) : AliasPos {
   match inf_find_alias_cand(cands, name) {
     None -> AliasPos { line: 0, col: 0 }
     Some(c) -> match c {
-      AC(_, _, _, ln, co) -> AliasPos { line: ln, col: co }
+      AC(_, _, _, ln, co, _) -> AliasPos { line: ln, col: co }
+    }
+  }
+}
+
+# The file that declared the alias; `fallback` covers a name with no
+# candidate, where there is no decl to attribute to.
+fn inf_cand_file_of(cands: [AliasCand], name: String, fallback: String) : String {
+  match inf_find_alias_cand(cands, name) {
+    None -> fallback
+    Some(c) -> match c {
+      AC(_, _, _, _, _, f) -> f
     }
   }
 }
 
 
-fn inf_collect_alias_cands(decls: [Decl]) : [AliasCand] {
+fn inf_collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] {
   match decls {
     [] -> []
     [d, ...rest] -> {
+      let f = decl_diag_file(d, df)
       let here = match d {
         DType(_, name, _, body, line, col, _, _) -> match body {
-          TBEffectAlias(labels) -> [AC(name, labels, true, line, col)]
+          TBEffectAlias(labels) -> [AC(name, labels, true, line, col, f)]
           TBAlias(ty) -> match ty.tkind {
             TyName(n, targs) ->
-              if targs == [] { [AC(name, [n], false, line, col)] }
+              if targs == [] { [AC(name, [n], false, line, col, f)] }
               else { [] }
             _ -> []
           }
@@ -112,7 +124,7 @@ fn inf_collect_alias_cands(decls: [Decl]) : [AliasCand] {
         }
         _ -> []
       }
-      list_append(here, inf_collect_alias_cands(rest))
+      list_append(here, inf_collect_alias_cands(rest, df))
     }
   }
 }
@@ -218,7 +230,7 @@ fn inf_find_alias_cand(cands: [AliasCand], name: String) : Option[AliasCand] {
   match cands {
     [] -> None
     [c, ...rest] -> match c {
-      AC(n, _, _, _, _) -> if n == name { Some(c) } else { inf_find_alias_cand(rest, name) }
+      AC(n, _, _, _, _, _) -> if n == name { Some(c) } else { inf_find_alias_cand(rest, name) }
     }
   }
 }
@@ -685,7 +697,7 @@ fn inf_resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
     AsFail -> AliasResolveOne { st: st, r: None }
     AsActive -> {
       let pos = inf_cand_pos(cands, name)
-      diag_error(file, pos.line, pos.col,
+      diag_error(inf_cand_file_of(cands, name, file), pos.line, pos.col,
         string_concat("cyclic effect alias: ", name))
       diag_note("an alias can only expand to declared effects, not back to itself")
       diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
@@ -699,10 +711,10 @@ fn inf_resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
       match inf_find_alias_cand(cands, name) {
         None -> AliasResolveOne { st: st, r: None }
         Some(c) -> match c {
-          AC(_, raw, explicit, line, col) -> {
+          AC(_, raw, explicit, line, col, cand_file) -> {
             let entries1 = inf_alias_set_status(st.entries, name, AsActive)
             let st1 = AliasResolveState { entries: entries1, errs: st.errs }
-            let r = inf_resolve_alias_labels(raw, cands, cand_ns, eff_names, file,
+            let r = inf_resolve_alias_labels(raw, cands, cand_ns, eff_names, cand_file,
                                          name, explicit, line, col, st1, [])
             match r.r {
               None -> {
@@ -744,7 +756,7 @@ fn inf_resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
       # A name declared as a first-class `effect` is an effect, not an
       # alias: skip registering an alias entry for it so a row label
       # resolves to the effect.
-      AC(name, _, _, _, _) ->
+      AC(name, _, _, _, _, _) ->
         if list_has(eff_names, name) {
           inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, st, rest, acc)
         } else {
@@ -1677,8 +1689,10 @@ pub type HandleFrame = HF(String, [String], [String], Int, Int)
 pub type FieldDeclWithHome = FDH(FieldDecl, Option[String])
 
 
+# The trailing file is the source of the decl that introduced the
+# alias, carried so a diagnostic names it rather than the root path.
 #[doc("infer: `AliasCand` — typer/effect support type.")]
-pub type AliasCand = AC(String, [String], Bool, Int, Int)
+pub type AliasCand = AC(String, [String], Bool, Int, Int, String)
 
 # AliasResult: a candidate that resolved to a flat label list.
 
@@ -4091,13 +4105,13 @@ fn row_kind_slots_of(table: [RowKindEntry], name: String) : [Int] = match table 
 # `tpbind_id_of` — an unbound row var has no slot to thread through. The
 # fix the user wants is to declare the row var: `type Q[t, e] = ...`.
 #[doc("infer: `validate_nominal_row_vars_decls` — typer entry point invoked by the driver.")]
-pub fn validate_nominal_row_vars_decls(decls: [Decl], file: String) : Int / Console + File =
-  validate_nominal_row_vars_loop(decls, file, 0)
+pub fn validate_nominal_row_vars_decls(decls: [Decl], df: DiagFiles) : Int / Console + File =
+  validate_nominal_row_vars_loop(decls, df, 0)
 
-fn validate_nominal_row_vars_loop(decls: [Decl], file: String, errs: Int) : Int / Console + File {
+fn validate_nominal_row_vars_loop(decls: [Decl], df: DiagFiles, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
-    [d, ...rest] -> validate_nominal_row_vars_loop(rest, file, errs + validate_nominal_row_vars_decl(d, file))
+    [d, ...rest] -> validate_nominal_row_vars_loop(rest, df, errs + validate_nominal_row_vars_decl(d, decl_diag_file(d, df)))
   }
 }
 
@@ -4438,8 +4452,7 @@ fn find_other_claim(claims: [VariantClaim], vname: String, parent: String) : Opt
 # claims. Returns the count of D2 errors (0 means clean). Plumbed
 # into `compile_source` next to `pred_errs` and `var_use_errs`.
 #[doc("infer: `validate_union_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_union_collisions_decls(ds: [Decl], file: String,
-                                     module_table: [ModuleEntry]) : Int / Console + File {
+pub fn validate_union_collisions_decls(ds: [Decl], df: DiagFiles) : Int / Console + File {
 
   let top_names = collect_top_type_names(ds)
   # D2 only governs root-file unions. `target_mod` is the root file's
@@ -4447,7 +4460,7 @@ pub fn validate_union_collisions_decls(ds: [Decl], file: String,
   # whose origin differs belongs to a core/imported module and must
   # not participate — a user union reusing a core type's variant name
   # is ctor overloading resolved at use sites, not a collision.
-  let target_mod = module_name_of_path(file)
+  let target_mod = module_name_of_path(df_root(df))
   # pre-seed the claim table with the builtin variant
   # constructors registered by `add_builtin_variant_sigs` (Result.Ok,
   # Result.Err, Option.Some, Option.None). A user `pub type T = Ok(...)`
@@ -4457,7 +4470,7 @@ pub fn validate_union_collisions_decls(ds: [Decl], file: String,
   # collision here gives a precise diagnostic at the user's DType
   # instead of a cascade of unrelated type-mismatch errors pointing at
   # nonexistent line numbers in the user file.
-  validate_union_collisions_loop(ds, top_names, file, module_table, target_mod, 0,
+  validate_union_collisions_loop(ds, top_names, df, target_mod, 0,
                                    builtin_variant_claims())
 }
 
@@ -4468,25 +4481,6 @@ fn is_root_decl_origin(origin: Option[String], target_mod: String) : Bool =
     None    -> true
     Some(m) -> m == target_mod
   }
-
-# locate the source file that exports `type_name`. Walks
-# the module table built by `expand_imports`; the entry's `origin`
-# field is the absolute path on disk. Falls back to the root file when
-# no module exports the type (top-level user decl in the entry file
-# itself). Returns the resolved path so diagnostics for a colliding
-# DType point at the file that declared it, not at the root file
-# whose line numbers don't match.
-fn resolve_decl_file(type_name: String, root_file: String,
-                       mt: [ModuleEntry]) : String {
-  match mt {
-    [] -> root_file
-    [me, ...rest] -> match me {
-      ME(_, exports, origin, _) ->
-        if list_has(exports, type_name) { origin }
-        else { resolve_decl_file(type_name, root_file, rest) }
-    }
-  }
-}
 
 # builtin variant constructors that share a top-level
 # namespace with user-declared variants. Mirrors the entries injected
@@ -4502,7 +4496,7 @@ fn builtin_variant_claims() : [VariantClaim] {
 }
 
 fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
-                                    file: String, mt: [ModuleEntry],
+                                    df: DiagFiles,
                                     target_mod: String, errs: Int,
                                     claims: [VariantClaim]) : Int / Console + File {
 
@@ -4519,17 +4513,17 @@ fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
         if is_root_decl_origin(origin, target_mod) {
           match body {
             TBSum(vs) -> {
-              let decl_file = resolve_decl_file(parent, file, mt)
+              let decl_file = decl_diag_file(d, df)
               let r = check_variants_for_collision(vs, parent, line, col,
                                                       top_names, claims, decl_file, errs)
-              validate_union_collisions_loop(rest, top_names, file, mt, target_mod, r.errs, r.claims)
+              validate_union_collisions_loop(rest, top_names, df, target_mod, r.errs, r.claims)
             }
-            _ -> validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
+            _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
           }
         } else {
-          validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
+          validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
         }
-      _ -> validate_union_collisions_loop(rest, top_names, file, mt, target_mod, errs, claims)
+      _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
     }
   }
 }
@@ -4792,12 +4786,12 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
 }
 
 #[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type.")]
-pub fn validate_constructor_uniqueness_decls(decls: [Decl], file: String) : Int / Console + File {
+pub fn validate_constructor_uniqueness_decls(decls: [Decl], df: DiagFiles) : Int / Console + File {
 
-  validate_constructor_uniqueness_loop(decls, file, [], 0)
+  validate_constructor_uniqueness_loop(decls, df, [], 0)
 }
 
-fn validate_constructor_uniqueness_loop(remaining: [Decl], file: String,
+fn validate_constructor_uniqueness_loop(remaining: [Decl], df: DiagFiles,
                                         claims: [TypeNameClaim],
                                         errs: Int) : Int / Console + File {
   match remaining {
@@ -4805,13 +4799,13 @@ fn validate_constructor_uniqueness_loop(remaining: [Decl], file: String,
     [d, ...rest] -> match constructor_decl_type(d) {
       Some(TNC(tname, line, col)) -> match find_type_name_claim(claims, tname) {
         Some(prev) -> {
-          report_dup_constructor(file, tname, line, col, prev)
-          validate_constructor_uniqueness_loop(rest, file, claims, errs + 1)
+          report_dup_constructor(decl_diag_file(d, df), tname, line, col, prev)
+          validate_constructor_uniqueness_loop(rest, df, claims, errs + 1)
         }
-        None -> validate_constructor_uniqueness_loop(rest, file,
+        None -> validate_constructor_uniqueness_loop(rest, df,
                                                      [TNC(tname, line, col), ...claims], errs)
       }
-      None -> validate_constructor_uniqueness_loop(rest, file, claims, errs)
+      None -> validate_constructor_uniqueness_loop(rest, df, claims, errs)
     }
   }
 }
@@ -19536,17 +19530,29 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
 #     in `validate_unit_refs_decl` itself.
 #[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver.")]
 pub fn validate_unit_refs_decls(decls: [Decl], scope: UnitScope,
-                              file: String) : Int / Console + File =
-  validate_unit_refs_decls_loop(decls, scope, file, 0)
+                              df: DiagFiles) : Int / Console + File =
+  validate_unit_refs_decls_loop(decls, scope, df, 0)
 
 fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitScope,
-                                    file: String, errs: Int) : Int / Console + File {
+                                    df: DiagFiles, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
     [d, ...rest] -> {
-      let e1 = errs + validate_unit_refs_decl(d, scope, file)
-      validate_unit_refs_decls_loop(rest, scope, file, e1)
+      let e1 = errs + validate_unit_refs_decl(d, scope, decl_diag_file(d, df))
+      validate_unit_refs_decls_loop(rest, scope, df, e1)
     }
+  }
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitScope,
+                                  file: String, errs: Int) : Int / Console + File {
+  match decls {
+    [] -> errs
+    [d, ...rest] ->
+      validate_unit_refs_sub_decls(rest, scope, file,
+                                     errs + validate_unit_refs_decl(d, scope, file))
   }
 }
 
@@ -19582,7 +19588,7 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
     validate_unit_refs_expr(body, scope, file)
   DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
   DImpl(_, _, _, sub_decls, _, _, _) ->
-    validate_unit_refs_decls_loop(sub_decls, scope, file, 0)
+    validate_unit_refs_sub_decls(sub_decls, scope, file, 0)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DProtoLaws(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
@@ -20141,13 +20147,22 @@ fn is_builtin_unit_symbol(_s: String) : Bool = false
 # downstream unification failure.
 
 #[doc("infer: validate `Shape`-tparam application formation across the decl stream; returns the error count.")]
-pub fn validate_shape_refs_decls(decls: [Decl], file: String) : Int / Console + File =
-  validate_shape_refs_loop(decls, file, 0)
+pub fn validate_shape_refs_decls(decls: [Decl], df: DiagFiles) : Int / Console + File =
+  validate_shape_refs_loop(decls, df, 0)
 
-fn validate_shape_refs_loop(decls: [Decl], file: String, errs: Int) : Int / Console + File =
+fn validate_shape_refs_loop(decls: [Decl], df: DiagFiles, errs: Int) : Int / Console + File =
   match decls {
     [] -> errs
-    [d, ...rest] -> validate_shape_refs_loop(rest, file, errs + validate_shape_refs_decl(d, file))
+    [d, ...rest] -> validate_shape_refs_loop(rest, df, errs + validate_shape_refs_decl(d, decl_diag_file(d, df)))
+  }
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn validate_shape_refs_sub_decls(decls: [Decl], file: String, errs: Int) : Int / Console + File =
+  match decls {
+    [] -> errs
+    [d, ...rest] ->
+      validate_shape_refs_sub_decls(rest, file, errs + validate_shape_refs_decl(d, file))
   }
 
 fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = match d {
@@ -20164,7 +20179,7 @@ fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = matc
     validate_shape_refs_protoops(ops, shapes, file, 0)
   }
   DEffect(_, _, _, ops, _, _, _, _) -> validate_shape_refs_eops(ops, [], file, 0)
-  DImpl(_, _, _, sub_decls, _, _, _) -> validate_shape_refs_loop(sub_decls, file, 0)
+  DImpl(_, _, _, sub_decls, _, _, _) -> validate_shape_refs_sub_decls(sub_decls, file, 0)
   DDerive(_, inner, _, _) -> validate_shape_refs_decl(inner, file)
   DUnstable(inner, _, _) -> validate_shape_refs_decl(inner, file)
   DProtoLaws(_, inner, _, _) -> validate_shape_refs_decl(inner, file)
@@ -20473,7 +20488,7 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let alias_src_decls = if list_length(all_program_decls) > 0 {
     all_program_decls
   } else { decls_a }
-  let alias_cands = inf_collect_alias_cands(alias_src_decls)
+  let alias_cands = inf_collect_alias_cands(alias_src_decls, diag_files_flat(file))
   let eff_names_for_alias = collect_effect_names(alias_src_decls)
   let alias_res = inf_resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff_here = inf_collect_op_to_eff(decls_a)

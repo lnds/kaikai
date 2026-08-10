@@ -4635,6 +4635,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let module_table = list_append(
               list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _) -> mt }),
               [target_me])
+            # The pre-typer passes walk one flat stream holding every
+            # imported module's decls, so a diagnostic takes its file
+            # from the decl it is walking, not from the root path.
+            let diag_ctx = diag_files(module_files(module_table, []), path)
             # Run rqc on the core decls with the same module table
             # the main file uses, so `list.foo` calls inside a core
             # file reach the EField->EModCall rewrite (otherwise the
@@ -4667,10 +4671,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let core_decls_l = surface_lower_decls(core_decls)
             let qualtype_errs = qtchk_decls(core_decls_l, module_table) +
                                 qtchk_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name)
-            let qt_core = qualtype_decls(core_decls_l, module_table, path)
-            let qt_expanded = qualtype_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name, path)
-            let qualified_core = rqc_decls(qt_core, module_table, path)
-            let qualified_decls = rqc_segmented(seg_marks, qt_expanded, mod_scopes, module_table, target_mod_name, path)
+            let qt_core = qualtype_decls(core_decls_l, module_table, diag_ctx)
+            let qt_expanded = qualtype_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name, diag_ctx)
+            let qualified_core = rqc_decls(qt_core, module_table, diag_ctx)
+            let qualified_decls = rqc_segmented(seg_marks, qt_expanded, mod_scopes, module_table, target_mod_name, diag_ctx)
             # Emit warnings for consumed `#unstable` exports the user
             # hasn't opted into. Runs over the user
             # decls only (cores are part of the stdlib and the
@@ -4678,7 +4682,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # decls today; including the core here keeps the
             # behaviour consistent if that ever changes).
             unstable_check_decls(qualified_decls, module_table,
-                                  package_name, unstable_optins, path)
+                                  package_name, unstable_optins, diag_ctx)
             # Mangle non-`pub` core DType names
             # (`crypto.hash::SplitN`, `regexp::NB_FragR`, etc.) so
             # the variant-table lookup cannot collide with a
@@ -4732,7 +4736,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 pa_import_segs(import_seg_marks, imports_decls, target_mod_name),
                 [PSeg(target_mod_name, root_only_decls)]))
             let pub_access_errs = if fn_builtin_shadow_errs > 0 { 0 } else {
-              validate_pub_access(pa_segs, fn_bounds, target_mod_name, path)
+              validate_pub_access(pa_segs, fn_bounds, target_mod_name, diag_ctx)
             }
             # Reject two `type T = ...` with the same name in the
             # root file, and the reserved builtin type names. A name
@@ -4796,13 +4800,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # decls are stripped; the typer's unit formation and
             # unify_dim dispatch on the theory of each habitant's kind.
             let kind_theories = atomic_kind_theories(merged_kr)
-            let unit_ref_errs = validate_unit_refs_decls(merged_kr, unit_scope(kind_ctx), path)
+            let unit_ref_errs = validate_unit_refs_decls(merged_kr, unit_scope(kind_ctx), diag_ctx)
             # Habitant-declaration rules: closed-set atoms are
             # engine-known, closed kinds admit no habitant decls, and
             # measure payloads land only on measure-carrying kinds.
-            let hab_decl_errs = validate_habitant_decls(merged_kr, kind_reg, path)
+            let hab_decl_errs = validate_habitant_decls(merged_kr, kind_reg, diag_ctx)
             # Shape-application formation: arity-1, no composition.
-            let shape_ref_errs = validate_shape_refs_decls(merged_kr, path)
+            let shape_ref_errs = validate_shape_refs_decls(merged_kr, diag_ctx)
             let merged_no_laws = strip_kind_decls(merged_kr)
             # Autogenerate `Functorial` property-checks for each lawful
             # Shape-protocol impl, injected only when the mode runs
@@ -4820,22 +4824,22 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # callees resolve. Errors accumulate; the count is folded
             # into the exit code further below.
             let pred_errs = validate_contract_predicates_decls(
-              merged, path)
+              merged, diag_ctx)
             # A nominal `pub type` whose ctor field uses an effect-row
             # variable it never declares panics the scheme builder; catch
             # it here with an unbound-row-var diagnostic.
-            let nominal_row_errs = validate_nominal_row_vars_decls(merged, path)
+            let nominal_row_errs = validate_nominal_row_vars_decls(merged, diag_ctx)
             # Collision check on `type T = A | B` declarations. Walks
             # every TBSum and reports any variant
             # name claimed implicitly by two different parents (with
             # neither parent pre-declaring the variant as its own
             # `type`). The counter folds into the exit-code aggregator
             # below. See `validate_union_collisions_decls`.
-            let union_collision_errs = validate_union_collisions_decls(merged, path, module_table)
+            let union_collision_errs = validate_union_collisions_decls(merged, diag_ctx)
             # At most one `#[constructor]` per constructed type. A second
             # marked fn returning the same type is rejected — arity/type
             # overloading is out (Tier 1 #3).
-            let constructor_uniq_errs = validate_constructor_uniqueness_decls(merged, path)
+            let constructor_uniq_errs = validate_constructor_uniqueness_decls(merged, diag_ctx)
             # Closed effect aliases. Resolve every
             # `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
@@ -4849,7 +4853,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let injected = inject_builtin_effects(merged)
             let declared_effs = collect_effect_names(injected)
             let eff_names_for_alias = declared_effs
-            let alias_cands = collect_alias_cands(injected)
+            let alias_cands = collect_alias_cands(injected, diag_ctx)
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
             let raw_decls_post_eff = expand_aliases_in_decls(injected, alias_res.aliases)
             # Expand transparent type aliases. `type Foo = T`
@@ -4882,14 +4886,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # duplicate diagnostics.
             let raw_decls_pre_pos = resolve_kinds_decls(raw_decls_pre_pos0, kind_reg)
             let post_alias_unit_errs = if unit_ref_errs == 0 {
-              validate_unit_refs_decls(raw_decls_pre_pos, unit_scope(kind_ctx), path)
+              validate_unit_refs_decls(raw_decls_pre_pos, unit_scope(kind_ctx), diag_ctx)
             } else { 0 }
             # Refinement-type enforcement at the downcast sites
             # (annotated binding, refined param, refined return), now
             # that every refinement is the inline `TyRefine` form: a
             # closed value refuting the predicate is a compile error;
             # a dynamic value gets a structured runtime check.
-            let renf_static_errs = report_refinement_statics(raw_decls_pre_pos, path)
+            let renf_static_errs = report_refinement_statics(raw_decls_pre_pos, diag_ctx)
             let raw_decls_enforced = enforce_refinements_decls(raw_decls_pre_pos)
             # Rewrite `T { v1, v2 }` (parser tags fields with
             # `__pos_<i>__` sentinels) into `T { f1: v1, f2: v2 }`
@@ -4898,7 +4902,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # sentinel field name. Reports unknown-record + arity
             # diagnostics; on errs > 0 we short-circuit before
             # invariants downstream can panic on the still-tagged AST.
-            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, path)
+            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, diag_ctx)
             let raw_decls_with_regions = pos_rec.decls
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
@@ -4917,7 +4921,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # byte-identical for non-region code; the escape policy is
             # deep-copy-out at emit, not compile-time rejection, so this
             # rewrite emits no diagnostics. Lexical — no resolved binders.
-            let region_rw = rewrite_regions_decls(raw_decls_with_regions, path)
+            let region_rw = rewrite_regions_decls(raw_decls_with_regions, diag_ctx)
             let raw_decls = region_rw.decls
             let region_marks = region_rw.regions
             # Pre-resolve desugar of `a[i]` and `a[i] := v` into the
@@ -4936,7 +4940,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # call by the time `desugar_var_decls` decides stack-slot
             # specialisation. Short-circuit on error so downstream passes
             # never see a dangling cap read.
-            let cell_low = lower_cell_reads_decls(indexed_decls, path)
+            let cell_low = lower_cell_reads_decls(indexed_decls, diag_ctx)
             if cell_low.errs > 0 { cell_low.errs } else {
             # Loop lowering (both backends): dissolve literal `while`/
             # `until`/`repeat` combinator calls into loop intrinsics so the
@@ -4962,7 +4966,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # top-level fns + a registry the post-inference rewrite
             # consumes. The registry-driven dispatch resolution runs
             # later, after `infer_program` populates `Expr.ty`.
-            let lowered = lower_protocols(post_use_decls, path, target_mod_name)
+            let lowered = lower_protocols(post_use_decls, diag_ctx, target_mod_name)
             # Lift `#{x}` interp parts into
             # `string_concat_all([..., show(x), ...])` so the typer +
             # protocol-call rewrite see them. Conditional on `Show`
@@ -5009,7 +5013,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `let counter = ...` inside `#{...}` correctly shadows.
             # Idempotent on the rest of the tree: already-lowered
             # `counter.get()` is recognised as legitimate, not re-lowered.
-            let interp_cell = relower_cell_reads_decls(interp_decls_pre0, path)
+            let interp_cell = relower_cell_reads_decls(interp_decls_pre0, diag_ctx)
             let interp_decls_pre = interp_cell.decls
             # `lower_protocols`'s `rename_proto_calls_decls` ran before
             # string interpolations were lifted, so any
@@ -5040,7 +5044,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # nursery scope; the resulting `[BrandRec]` is the
             # registry the typer reads for sibling-nursery
             # brand-mismatch detection.
-            let nursery_rw = rewrite_nursery_caps_decls(interp_decls, path)
+            let nursery_rw = rewrite_nursery_caps_decls(interp_decls, diag_ctx)
             let all_decls = nursery_rw.decls
             let brand_registry = nursery_rw.brands
             let brand_calls = nursery_rw.calls
@@ -5051,7 +5055,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # (`n.await(f)` / `n.cancel(f)` / `n.select(fs)`) where
             # `f`'s brand differs from the surrounding scope's.
             let nursery_brand_errs = check_nursery_brand_mismatch_decls(
-              all_decls, path, brand_calls, brand_registry)
+              all_decls, diag_ctx, brand_calls, brand_registry)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if doc_errs > 0 { doc_errs }
