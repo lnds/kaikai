@@ -11004,18 +11004,62 @@ fn lift_interp_string(span: String, body_start: Int, body_end: Int,
 
   let parts = iscan_collect(span, body_end,
                              IScan { parts: [], lit_start: body_start, i: body_start })
-  let part_exprs = map(parts, (p: IPart) => interp_part_to_expr(p, op_names, op_arities, mt, file, line, col))
+  # `body_start` chars of the literal's opening delimiter sit before the body.
+  let part_exprs = interp_parts_to_exprs(parts, InterpPos { line: line, col: col + body_start },
+                                          op_names, op_arities, mt, file, line, col)
   ECall(mk_expr(EVar("string_concat_all"), line, col),
         [mk_expr(EList(map(part_exprs, (e: Expr) => ElPlain(e))), line, col)])
 }
 
-fn interp_part_to_expr(p: IPart, op_names: [String], op_arities: [OpAr],
+# Where a part begins in the real source.
+type InterpPos = { line: Int, col: Int }
+
+# Advance a position over `s`, which a triple-quoted literal may spread
+# across several lines; a newline resets the column rather than extending it.
+fn interp_pos_advance(p: InterpPos, s: String, i: Int) : InterpPos {
+  if i >= string_length(s) { p }
+  else {
+    let nxt = match char_at(s, i) {
+      Some('\n') -> InterpPos { line: p.line + 1, col: 1 }
+      _          -> InterpPos { line: p.line, col: p.col + 1 }
+    }
+    interp_pos_advance(nxt, s, i + 1)
+  }
+}
+
+# Walk the parts in source order so each interpolated expression is rebased
+# onto the position it really occupies. A literal advances by its own text;
+# an interpolation advances by its body plus the `#{` and `}` around it.
+fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos,
+                          op_names: [String], op_arities: [OpAr],
+                          mt: [ModuleEntry], file: String,
+                          line: Int, col: Int) : [Expr] / Console + File {
+  match parts {
+    [] -> []
+    [p, ...rest] -> {
+      let e = interp_part_to_expr(p, pos, op_names, op_arities, mt, file, line, col)
+      let next = match p {
+        IpLit(piece, _) -> interp_pos_advance(pos, piece, 0)
+        # `#{` before the body, `}` after it.
+        IpExp(src) -> {
+          let after = interp_pos_advance(InterpPos { line: pos.line, col: pos.col + 2 }, src, 0)
+          InterpPos { line: after.line, col: after.col + 1 }
+        }
+      }
+      [e, ...interp_parts_to_exprs(rest, next, op_names, op_arities, mt, file, line, col)]
+    }
+  }
+}
+
+fn interp_part_to_expr(p: IPart, pos: InterpPos, op_names: [String], op_arities: [OpAr],
                         mt: [ModuleEntry], file: String,
                         line: Int, col: Int) : Expr / Console + File {
 
   match p {
     IpLit(_, raw_quoted) -> mk_expr(EStr(raw_quoted, false), line, col)
     IpExp(expr_src) -> {
+      # The body starts past the `#{` that opens it.
+      let body = InterpPos { line: pos.line, col: pos.col + 2 }
       let inner = match parse_interp_expr(expr_src) {
         # Issue #217: run the qualified-call resolver on the
         # freshly-parsed sub-expression before recursing into the
@@ -11032,8 +11076,9 @@ fn interp_part_to_expr(p: IPart, op_names: [String], op_arities: [OpAr],
         # on the post-interp-desugar decl stream so the surfaced
         # references go through the same arity-aware, scope-aware
         # rewrite the rest of the program got.
-        Some(e) -> desugar_interp_expr(rqc_expr(surface_lower_expr(e), [], mt, file),
-                                         op_names, op_arities, mt, file)
+        Some(e) -> desugar_interp_expr(
+                     rqc_expr(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)), [], mt, file),
+                     op_names, op_arities, mt, file)
         None    -> mk_expr(EStr("\"\"", false), line, col)
       }
       # The post-rename dispatcher name (`__proto_show`) bypasses the
