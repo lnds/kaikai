@@ -93,6 +93,9 @@ _Static_assert(offsetof(KaiValue, as) == 8, "native emitter layout: slot array a
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
+/* String literals carry an explicit length so an embedded NUL is a byte
+ * like any other; `kaix_str` would `strlen` and truncate there. */
+KaiValue *kaix_str_n(const char *s, int64_t n) { return kai_str_from_bytes(s, (size_t) n); }
 KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
 /* Box a `setjmp` i32 return (0 = body path, !=0 = longjmp landing) as a
  * BOOL the native walk's `KSetjmp` register feeds the boxed `condbr` —

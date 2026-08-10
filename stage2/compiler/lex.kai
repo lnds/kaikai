@@ -56,6 +56,7 @@
 # → no pub.
 
 import compiler.chars
+import compiler.escapes
 
 # ====================================================================
 # token kinds + tokens
@@ -689,7 +690,11 @@ fn lex_skip_inner_string(l: Lexer) : StrResult {
           let l1 = lex_advance(l)
           match lex_peek(l1) {
             None -> StrErr(l1, "unterminated string inside interpolation")
-            Some(_) -> lex_skip_inner_string(lex_advance(l1))
+            Some(_) ->
+              match esc_decode_at(l.src, l.pos, l1.pos, string_length(l.src)) {
+                EscBad(msg, _) -> StrErr(l, msg)
+                EscOk(_, next) -> lex_skip_inner_string(lex_advance_n(l1, next - l1.pos))
+              }
           }
         }
         _ -> lex_skip_inner_string(lex_advance(l))
@@ -706,7 +711,14 @@ fn lex_string_body(l: Lexer, triple: Bool) : StrResult {
         let l1 = lex_advance(l)
         match lex_peek(l1) {
           None -> StrErr(l1, "unterminated string")
-          Some(_) -> lex_string_body(lex_advance(l1), triple)
+          Some(_) ->
+            match esc_decode_at(l.src, l.pos, l1.pos, string_length(l.src)) {
+              # Keep scanning to the closing quote so the cursor
+              # resynchronises; a bad escape must not also produce a
+              # cascade of "unterminated string" noise.
+              EscBad(msg, _) -> lex_string_err_at(l, msg, triple)
+              EscOk(_, next) -> lex_string_body(lex_advance_n(l1, next - l1.pos), triple)
+            }
         }
       } else if c == '#' and lex_peek2_is(l, '{') {
         let l1 = lex_advance(lex_advance(l))
@@ -729,6 +741,39 @@ fn lex_string_body(l: Lexer, triple: Bool) : StrResult {
           lex_string_body(lex_advance(l), triple)
         }
       }
+    }
+  }
+}
+
+# Report `msg` but hand back the cursor past the closing quote, so one
+# bad escape yields one diagnostic instead of a cascade.
+fn lex_string_err_at(l: Lexer, msg: String, triple: Bool) : StrResult {
+  match lex_string_skip_to_close(lex_advance(l), triple) {
+    StrOk(l2) -> StrErr(l2, msg)
+    StrErr(l2, _) -> StrErr(l2, msg)
+  }
+}
+
+# Scan to the closing quote WITHOUT validating escapes — recovery only.
+fn lex_string_skip_to_close(l: Lexer, triple: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string")
+          Some(_) -> lex_string_skip_to_close(lex_advance(l1), triple)
+        }
+      } else if triple {
+        if c == '"' and lex_peek2_is(l, '"') and lex_peek3_is(l, '"') {
+          StrOk(lex_advance(lex_advance(lex_advance(l))))
+        } else { lex_string_skip_to_close(lex_advance(l), triple) }
+      } else if c == '\n' {
+        StrErr(l, "unterminated string")
+      } else if c == '"' {
+        StrOk(lex_advance(l))
+      } else { lex_string_skip_to_close(lex_advance(l), triple) }
     }
   }
 }
@@ -802,17 +847,6 @@ fn lex_regex_body(l: Lexer, in_class: Bool) : StrResult {
 # char literals
 # ====================================================================
 
-fn lex_char_skip_u_escape(l: Lexer) : Lexer {
-  # We're past `\u`; consume `{HHHH}`.
-  match lex_peek(l) {
-    None -> l
-    Some(c) -> {
-      if c == '}' { lex_advance(l) }
-      else { lex_char_skip_u_escape(lex_advance(l)) }
-    }
-  }
-}
-
 # Issue #744: consume the UTF-8 continuation bytes (0b10xxxxxx, i.e.
 # byte value in [128, 191]) that follow a multi-byte lead byte already
 # consumed. So `'á'` (0xC3 0xA1) advances past both bytes here; the
@@ -838,33 +872,43 @@ fn lex_char(l: Lexer) : LexStep {
     None -> Step(l1, tok(TkError("unterminated char literal"),
                          sl, sc, start, l1.pos))
     Some(c) -> {
-      let l2 =
-        if c == '\\' {
-          let la = lex_advance(l1)
-          match lex_peek(la) {
-            None -> la
-            Some(e) -> {
-              if e == 'u' and lex_peek2_is(la, '{') {
-                lex_char_skip_u_escape(lex_advance(lex_advance(la)))
-              } else {
-                lex_advance(la)
-              }
-            }
+      match lex_char_scan_body(l1, c) {
+        StrErr(le, msg) -> Step(le, tok(TkError(msg), sl, sc, start, le.pos))
+        StrOk(l2) ->
+          if lex_peek_is(l2, '\'') {
+            Step(lex_advance(l2), tok(TkChar, sl, sc, start, l2.pos + 1))
+          } else {
+            Step(l2, tok(TkError("unterminated char literal"),
+                         sl, sc, start, l2.pos))
           }
-        } else {
-          # Lead byte of a (possibly multi-byte) UTF-8 codepoint.
-          # Consume the lead byte, then any continuation bytes, so a
-          # multi-byte char literal like 'á' or '▸' is scanned as one
-          # codepoint (issue #744). `decode_char` decodes the value.
-          lex_skip_utf8_continuation(lex_advance(l1))
-        }
-      if lex_peek_is(l2, '\'') {
-        Step(lex_advance(l2), tok(TkChar, sl, sc, start, l2.pos + 1))
-      } else {
-        Step(l2, tok(TkError("unterminated char literal"),
-                     sl, sc, start, l2.pos))
       }
     }
+  }
+}
+
+# Scan the body of a char literal, positioned at its first char. An
+# escape goes through the shared table; a bare codepoint consumes its
+# UTF-8 continuation bytes so `'á'` scans as one char (issue #744).
+fn lex_char_scan_body(l1: Lexer, c: Char) : StrResult {
+  if c == '\\' {
+    match esc_decode_at(l1.src, l1.pos, l1.pos + 1, string_length(l1.src)) {
+      # Skip to the closing quote so a bad escape yields one diagnostic
+      # rather than a cascade from the leftover cursor.
+      EscBad(msg, _) -> StrErr(lex_char_skip_to_quote(l1), msg)
+      EscOk(_, next) -> StrOk(lex_advance_n(l1, next - l1.pos))
+    }
+  } else {
+    StrOk(lex_skip_utf8_continuation(lex_advance(l1)))
+  }
+}
+
+fn lex_char_skip_to_quote(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) ->
+      if c == '\'' { lex_advance(l) }
+      else if c == '\n' { l }
+      else { lex_char_skip_to_quote(lex_advance(l)) }
   }
 }
 
