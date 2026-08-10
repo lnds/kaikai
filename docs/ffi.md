@@ -284,7 +284,7 @@ The shim approach works but has real costs:
   declarations.
 - **Consumers must thread non-kaikai assets through their build**.
   The package manager v1 (#405) ships `lib/` files cleanly via
-  `kai install` but does not automate C source. Documenting the
+  `kai fetch` but does not automate C source. Documenting the
   shim build as part of the package's README is the current
   pattern (see uira's README).
 - **Future bindings** (SDL2, GLFW, libcurl, …) will hit the same

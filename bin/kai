@@ -934,7 +934,13 @@ Commands:
   watch [<spec>]                Recompile + run on every save (live demo).
   init  <name>                  Create a kai.toml manifest in the cwd.
   add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
-  install                       Resolve dependencies (git fetch + lock).
+  fetch                         Resolve dependencies (git fetch + lock).
+  install [<spec>] [--force]    Build a package and install its binary
+                                into \$KAIKAI_HOME/bin. <spec> is '.' or
+                                a git source; --list shows what is
+                                installed. With no <spec> it still
+                                resolves dependencies (deprecated —
+                                use 'kai fetch').
   update [<name>]               Re-fetch deps; refresh kai.lock.
   upgrade                       Self-update the compiler to the latest
                                 release (curl|sh installs). Defers to
@@ -3147,15 +3153,20 @@ EOF
   "$KAIPKG_BIN" init "$@"
 }
 
-cmd_install() {
+cmd_fetch() {
   case "${1:-}" in
     -h|--help)
       cat <<EOF
-usage: kai install
+usage: kai fetch
 
-Read kai.toml in the current directory (or the nearest ancestor)
-and resolve dependencies. v1: local-path deps are reported as
-resolved; git deps are deferred to a follow-up release.
+Read kai.toml in the current directory (or the nearest ancestor),
+resolve dependencies, and write kai.lock. Git sources are cloned
+into the package cache; local-path deps resolve through the
+manifest.
+
+'kai run' and 'kai build' fetch automatically when the lockfile is
+missing or stale, so this is only needed to prefetch (CI) or to
+regenerate a lockfile without building.
 EOF
       return 0 ;;
   esac
@@ -3167,6 +3178,236 @@ EOF
   cache_root="$(resolve_cache_root)"
   mkdir -p "$cache_root"
   ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" install )
+}
+
+# ---- kai install — build a package and install its binary ------------------
+#
+# Target is $KAIKAI_HOME/bin, the directory the curl|sh installer put on
+# PATH and where `kai upgrade` replaces the toolchain. Sharing it with the
+# toolchain costs two guards: reserved names (below) and an upgrade that
+# preserves what this command wrote (see install_manifest_path).
+
+# Install prefix. $KAIKAI_HOME wins so a caller can target a prefix other
+# than the running wrapper's; otherwise fall back to $ROOT, which is the
+# wrapper's grandparent and therefore the prefix kai was invoked from.
+install_prefix() {
+  if [ -n "${KAIKAI_HOME:-}" ]; then
+    printf '%s' "$KAIKAI_HOME"
+  else
+    printf '%s' "$ROOT"
+  fi
+}
+
+# Ledger of user-installed binaries, the `.crates.toml` analogue. Read by
+# `kai upgrade` to know what not to evict and by `kai install --list`.
+install_manifest_path() {
+  printf '%s/.kai-installed' "$(install_prefix)"
+}
+
+# Names a user package may not claim: the toolchain's own binaries.
+#
+# Derived, never listed literally, so a binary added to a future release
+# is reserved the day it ships. Two sources, because neither alone covers
+# both layouts:
+#   - an installed prefix: whatever is in its bin/ and libexec/kaikai/
+#   - a dev checkout: the `cp … "$STAGE/bin|libexec/kaikai/…"` lines in
+#     scripts/build-release.sh, which is what builds the tarball
+reserved_bin_names() {
+  prefix="$(install_prefix)"
+  manifest="$(install_manifest_path)"
+  {
+    [ -d "$prefix/bin" ] && ls -1 "$prefix/bin" 2>/dev/null
+    [ -d "$prefix/libexec/kaikai" ] && ls -1 "$prefix/libexec/kaikai" 2>/dev/null
+    if [ -f "$ROOT/scripts/build-release.sh" ]; then
+      sed -n -E 's#.*"\$STAGE/(bin|libexec/kaikai)/([A-Za-z0-9._-]+)".*#\2#p' \
+        "$ROOT/scripts/build-release.sh" 2>/dev/null
+    fi
+  } 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$' | sort -u \
+    | while IFS= read -r n; do
+        # A name already in the ledger is ours to overwrite, not reserved.
+        if [ -f "$manifest" ] && grep -q "^$n	" "$manifest" 2>/dev/null; then
+          continue
+        fi
+        printf '%s\n' "$n"
+      done
+}
+
+install_is_reserved() {
+  reserved_bin_names | grep -qx "$1"
+}
+
+# Append/replace `<name>\t<source>\t<ref>` in the ledger.
+install_manifest_record() {
+  imr_name="$1"; imr_source="$2"; imr_ref="$3"
+  manifest="$(install_manifest_path)"
+  mkdir -p "$(dirname "$manifest")"
+  tmp_manifest="$manifest.tmp.$$"
+  if [ -f "$manifest" ]; then
+    grep -v "^$imr_name	" "$manifest" > "$tmp_manifest" 2>/dev/null || :
+  else
+    : > "$tmp_manifest"
+  fi
+  printf '%s\t%s\t%s\n' "$imr_name" "$imr_source" "$imr_ref" >> "$tmp_manifest"
+  LC_ALL=C sort -o "$tmp_manifest" "$tmp_manifest"
+  mv -f "$tmp_manifest" "$manifest"
+}
+
+install_list() {
+  manifest="$(install_manifest_path)"
+  if [ ! -s "$manifest" ]; then
+    echo "kai: no packages installed" >&2
+    return 0
+  fi
+  while IFS="$(printf '\t')" read -r n src ref; do
+    [ -n "$n" ] || continue
+    printf '%s\t%s@%s\n' "$n" "$src" "$ref"
+  done < "$manifest"
+}
+
+# Build the package rooted at $1 and install its binary. The binary name
+# comes from the manifest's `name`, never from the source URL.
+install_from_dir() {
+  ifd_dir="$1"; ifd_source="$2"; ifd_ref="$3"; ifd_force="$4"
+
+  [ -f "$ifd_dir/kai.toml" ] \
+    || die "$ifd_dir has no kai.toml — not a kaikai package"
+
+  ifd_name="$(manifest_package_name "$ifd_dir")"
+  [ -n "$ifd_name" ] \
+    || die "$ifd_dir/kai.toml has no 'name' — cannot derive a binary name"
+
+  # A library has no entry point (#1718): say so here rather than letting
+  # the build fail at link time with an unrelated diagnostic.
+  ifd_entry_rel="$(manifest_entry_field "$ifd_dir")"
+  if [ ! -f "$ifd_dir/$ifd_entry_rel" ]; then
+    echo "kai: error: package '$ifd_name' has no entry point ($ifd_entry_rel not found)" >&2
+    echo "  a library has no binary to install; only packages with an entry point can be installed" >&2
+    exit 1
+  fi
+
+  if install_is_reserved "$ifd_name"; then
+    echo "kai: error: refusing to install '$ifd_name': the name is reserved by the kaikai toolchain" >&2
+    echo "  installing it would overwrite part of the toolchain in $(install_prefix)/bin" >&2
+    exit 1
+  fi
+
+  ifd_bindir="$(install_prefix)/bin"
+  ifd_dest="$ifd_bindir/$ifd_name"
+  if [ -e "$ifd_dest" ] && [ -z "$ifd_force" ]; then
+    echo "kai: error: binary '$ifd_name' already exists at $ifd_dest" >&2
+    echo "  pass --force to replace it" >&2
+    exit 1
+  fi
+
+  mkdir -p "$ifd_bindir"
+  ifd_tmp="$ifd_dest.tmp.$$"
+  echo "kai: installing '$ifd_name' from $ifd_dir" >&2
+  if ! ( cd "$ifd_dir" && "$0" build . -o "$ifd_tmp" ) >&2; then
+    rm -f "$ifd_tmp"
+    die "failed to build package '$ifd_name'"
+  fi
+  # Rename into place so a concurrent PATH lookup never sees a half-written
+  # binary, and so a failed build leaves the previous one intact.
+  mv -f "$ifd_tmp" "$ifd_dest"
+  install_manifest_record "$ifd_name" "$ifd_source" "$ifd_ref"
+  echo "kai: installed '$ifd_name' to $ifd_dest" >&2
+}
+
+cmd_install() {
+  ci_force=""
+  ci_spec=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+usage: kai install [<spec>] [--force]
+       kai install --list
+
+Build a package and install its binary into \$KAIKAI_HOME/bin
+(default ~/.kaikai/bin), the directory the installer already put on
+your PATH.
+
+Specs:
+  .                             the package in the current directory
+  github.com/owner/repo         a git source, at its default branch
+  github.com/owner/repo@v1.2.0  a git source, at a tag/branch/SHA
+
+The binary is named after the manifest's \`name\`, not the source URL,
+so 'kai install github.com/owner/thing' yields 'thing'.
+
+Options:
+  --force     replace an already-installed binary of the same name
+  --list      print what this prefix has installed, then exit
+
+Names shipped by the kaikai toolchain are refused. To resolve a
+package's dependencies without installing anything, use 'kai fetch'.
+EOF
+        return 0 ;;
+      --list) install_list; return 0 ;;
+      --force|-f) ci_force=1; shift ;;
+      -*) die "unknown flag for 'kai install': $1" ;;
+      *)
+        [ -z "$ci_spec" ] || die "only one spec supported (see 'kai install --help')"
+        ci_spec="$1"; shift ;;
+    esac
+  done
+
+  # No spec: dependency resolution, for one more release. `kai install`
+  # meant `npm install` before it meant `cargo install`; keeping the old
+  # behaviour here is what makes the rename additive within the edition.
+  if [ -z "$ci_spec" ]; then
+    echo "kai: warning: 'kai install' with no argument resolves dependencies; that is now 'kai fetch'." >&2
+    echo "  'kai install <spec>' installs a package's binary. The no-argument form changes at the next edition." >&2
+    cmd_fetch
+    return $?
+  fi
+
+  # Split the `@<ref>` suffix first: a path spec can itself contain '@',
+  # and a git source that is a filesystem path (bare repo, test fixture)
+  # would otherwise be mistaken for a directory to build in place.
+  case "$ci_spec" in
+    *@*) ci_source="${ci_spec%@*}"; ci_ref="${ci_spec##*@}" ;;
+    *)   ci_source="$ci_spec"; ci_ref="" ;;
+  esac
+
+  # A spec that names an existing directory is built where it is; only a
+  # bare source with no ref can be one, since a ref implies a clone.
+  install_dir=""
+  if [ -z "$ci_ref" ] && [ -d "$ci_source" ]; then
+    install_dir="$(cd -- "$ci_source" && pwd)"
+  fi
+
+  case "$ci_spec" in
+    .|./*|../*)
+      [ -n "$install_dir" ] || die "$ci_spec is not a directory"
+      ;;
+  esac
+
+  if [ -n "$install_dir" ]; then
+    install_from_dir "$install_dir" "$install_dir" "local" "$ci_force"
+  else
+    [ -n "$ci_ref" ] || ci_ref="main"
+    clone_dir="$(mktemp -d "${TMPDIR:-/tmp}/kaikai-install.XXXXXX")" \
+      || die "cannot create a temporary directory"
+    trap 'rm -rf "$clone_dir"' EXIT INT TERM
+    echo "kai: fetching $ci_source@$ci_ref" >&2
+    if ! git clone --depth 1 --branch "$ci_ref" \
+           "$(install_git_url "$ci_source")" "$clone_dir/src" >/dev/null 2>&1; then
+      die "failed to clone $ci_source at ref '$ci_ref'"
+    fi
+    install_from_dir "$clone_dir/src" "$ci_source" "$ci_ref" "$ci_force"
+    rm -rf "$clone_dir"
+    trap - EXIT INT TERM
+  fi
+}
+
+# Bare host/owner/repo gets https://; anything already a URL or an
+# absolute path passes through. Mirrors kai-pkg's `git_url`.
+install_git_url() {
+  case "$1" in
+    /*|git@*|ssh://*|https://*|http://*|file://*) printf '%s' "$1" ;;
+    *) printf 'https://%s' "$1" ;;
+  esac
 }
 
 cmd_add() {
@@ -4185,12 +4426,40 @@ EOF
   [ -x "$top/bin/kai" ] || die "tarball missing bin/kai"
 
   # Swap contents in place. Replace bin/libexec/share wholesale so a
-  # removed file from the old version does not linger.
+  # removed file from the old version does not linger — but bin/ is
+  # shared with `kai install`, so user binaries are carried across the
+  # wipe. The ledger, not the directory listing, is what says which
+  # ones are the user's.
+  upgrade_stash="$tmp/stash-bin"
+  mkdir -p "$upgrade_stash"
+  upgrade_ledger="$prefix/.kai-installed"
+  if [ -f "$upgrade_ledger" ]; then
+    while IFS="$(printf '\t')" read -r stash_name _ _; do
+      [ -n "$stash_name" ] || continue
+      if [ -e "$prefix/bin/$stash_name" ]; then
+        cp -p "$prefix/bin/$stash_name" "$upgrade_stash/$stash_name" 2>/dev/null || :
+      fi
+    done < "$upgrade_ledger"
+  fi
+
   for d in bin libexec share; do
     if [ -d "$top/$d" ]; then
       rm -rf "$prefix/$d"
       (cd "$top" && tar -cf - "$d") | (cd "$prefix" && tar -xf -)
     fi
+  done
+
+  # Restore user binaries the new toolchain does not itself provide. A
+  # name that has since become a toolchain binary is dropped rather than
+  # shadowing it; the ledger entry stays so `--list` still reports it.
+  for stashed in "$upgrade_stash"/*; do
+    [ -e "$stashed" ] || continue
+    stash_name="$(basename "$stashed")"
+    if [ -e "$prefix/bin/$stash_name" ]; then
+      echo "kai: warning: installed binary '$stash_name' is now shipped by the toolchain; keeping the toolchain's" >&2
+      continue
+    fi
+    cp -p "$stashed" "$prefix/bin/$stash_name" 2>/dev/null || :
   done
   for f in README.md LICENSE; do
     [ -f "$top/$f" ] && cp "$top/$f" "$prefix/$f"
@@ -4212,6 +4481,7 @@ case "${1:-}" in
   migrate)   shift; cmd_migrate "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
   init)      shift; cmd_init    "$@" ;;
+  fetch)     shift; cmd_fetch   "$@" ;;
   install)   shift; cmd_install "$@" ;;
   add)       shift; cmd_add     "$@" ;;
   update)    shift; cmd_update  "$@" ;;

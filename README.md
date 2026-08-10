@@ -206,7 +206,7 @@ Declare dependencies in a `kai.toml` next to your source:
 ```sh
 kai init myapp                      # writes kai.toml
 # edit kai.toml to add dependencies
-kai install                         # resolve them
+kai fetch                           # resolve them
 kai run src/main.kai                # auto-injects --path for local-path deps
 ```
 
