@@ -394,6 +394,32 @@ Returning an association from a public function: `Map` when the
 caller looks values up, sorted `[Pair[k, v]]` when the caller compares
 the whole result against an expectation.
 
+## Spread over `++` when prepending an element
+
+Both build the same list, so this is not a correctness rule — it is
+that one of them allocates and the other does not:
+
+```kaikai
+fn prepend(h: Int, t: [Int]) : [Int] =
+  [h, ...t]            # prefer: emits the cons directly
+
+fn prepend_concat(h: Int, t: [Int]) : [Int] =
+  [h] ++ t             # builds a one-element list, then concatenates
+
+fn main() : Unit / Stdout = {
+  Stdout.print("#{prepend(1, [2, 3]) == prepend_concat(1, [2, 3])}")
+}
+```
+
+Measured on 3M iterations over an 8-element tail, native backend:
+`[h] ++ t` runs at 1.33x the time of `[h, ...t]` (1.4x on the C
+backend). The gap is the intermediate list, one allocation per call.
+
+`...` is the list spread in expression position — it takes any number
+of spreads, anywhere in the literal (`[...xs, 3, 4]`, `[...a, ...b]`),
+and mirrors the `[head, ...tail]` destructuring pattern. Reach for
+`++` when genuinely concatenating two lists, which is what it is for.
+
 ## False friends — you might write X, in kaikai write Z
 
 These are the reaches an agent makes from another language. Each

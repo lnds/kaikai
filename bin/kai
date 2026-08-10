@@ -747,6 +747,198 @@ manifest_path_flags() {
   done
 }
 
+# Parse the `[native]` table of a package manifest: vendored C shim
+# sources, include dirs for compiling them, and system libraries.
+# Emits `<kind>\t<value>` lines (kind: src|inc|lib), values verbatim
+# (paths relative to the declaring package). Values must be string
+# arrays; single- and multi-line arrays both parse. Same naive-TOML
+# awk contract as the other manifest readers here.
+manifest_native_entries() {
+  mne_dir="$1"
+  [ -n "$mne_dir" ] && [ -f "$mne_dir/kai.toml" ] || return 0
+  awk '
+    /^[[:space:]]*\[native\][[:space:]]*$/ { insec = 1; next }
+    /^[[:space:]]*\[/                      { insec = 0 }
+    insec {
+      line = $0
+      sub(/^[[:space:]]*#.*/, "", line)
+      blob = blob " " line
+    }
+    END {
+      emit("sources", "src"); emit("include", "inc"); emit("libs", "lib")
+    }
+    function emit(key, kind,   s, i) {
+      s = blob
+      if (match(s, key "[[:space:]]*=[[:space:]]*\\[") == 0) return
+      s = substr(s, RSTART + RLENGTH)
+      i = index(s, "]")
+      if (i == 0) return
+      s = substr(s, 1, i - 1)
+      while (match(s, /"[^"]*"/)) {
+        print kind "\t" substr(s, RSTART + 1, RLENGTH - 2)
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }
+  ' "$mne_dir/kai.toml"
+}
+
+# Collect the native declarations of the root package plus every
+# resolved dep: `<pkg>\t<kind>\t<value>` lines. Each package root
+# emits a `dir` line first; src/inc values absolutise against the
+# declaring package's own root so the cache layout never leaks to
+# consumers. Dep roots come from `kai-pkg paths` — the same resolution
+# the `--path` flags use, so the lockfile's per-source dedup (MVS)
+# collapses a diamond to one entry and a shim never links twice.
+collect_native_deps() {
+  cnd_dir="$1"
+  [ -n "$cnd_dir" ] && [ -f "$cnd_dir/kai.toml" ] || return 0
+  {
+    cnd_root_name="$(manifest_package_name "$cnd_dir")"
+    collect_native_pkg "${cnd_root_name:-.}" "$cnd_dir"
+    if grep -q '^\[dependencies\]' "$cnd_dir/kai.toml" 2>/dev/null; then
+      ensure_kaipkg
+      cnd_cache_root="$(resolve_cache_root)"
+      ( cd "$cnd_dir" && KAIKAI_CACHE_ROOT="$cnd_cache_root" "$KAIPKG_BIN" paths 2>/dev/null ) \
+        | while IFS="$(printf '\t')" read -r cnd_name cnd_path; do
+            [ -n "$cnd_path" ] || continue
+            case "$cnd_path" in
+              /*) cnd_abs="$cnd_path" ;;
+              *)  cnd_abs="$(cd "$cnd_dir" && cd "$cnd_path" 2>/dev/null && pwd)" ;;
+            esac
+            [ -n "$cnd_abs" ] && collect_native_pkg "$cnd_name" "$cnd_abs"
+          done
+    fi
+  } | awk -F'\t' '!seen[$2 "\t" $3]++'
+}
+
+# One package's `dir` line plus its native entries, absolutised.
+collect_native_pkg() {
+  cnp_name="$1"; cnp_dir="$2"
+  printf '%s\tdir\t%s\n' "$cnp_name" "$cnp_dir"
+  manifest_native_entries "$cnp_dir" | while IFS="$(printf '\t')" read -r cnp_kind cnp_val; do
+    case "$cnp_kind" in
+      lib) printf '%s\t%s\t%s\n' "$cnp_name" lib "$cnp_val" ;;
+      src|inc)
+        case "$cnp_val" in
+          /*) cnp_abs="$cnp_val" ;;
+          *)  cnp_abs="$cnp_dir/$cnp_val" ;;
+        esac
+        printf '%s\t%s\t%s\n' "$cnp_name" "$cnp_kind" "$cnp_abs" ;;
+    esac
+  done
+}
+
+# Cache root for compiled native-dep shim objects. Content keying
+# (compiler + flags + arch + source + headers) makes it shared across
+# projects: one compile per (shim, toolchain), the `cargo` build-cache
+# model rather than a per-package artifact — the object depends on the
+# consumer's toolchain, so it cannot live in the sha-keyed package cache.
+resolve_native_dep_cache_dir() {
+  if [ -n "${KAI_NATIVE_DEP_CACHE_DIR:-}" ]; then
+    printf '%s' "$KAI_NATIVE_DEP_CACHE_DIR"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/nativedep' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/nativedep' "$HOME" ;;
+    *)      printf '%s/.cache/kai/nativedep' "$HOME" ;;
+  esac
+}
+
+# Compile every declared native source to a `.o`, one object path per
+# line. Cached by content hash; a hasher-less host compiles into $1
+# uncached. The declaring package's include dirs ride each compile
+# AFTER $CFLAGS_COMPILE, so a user -I/-D in CFLAGS wins (the escape
+# hatch keeps precedence). Reads $native_dep_info.
+native_dep_objects() {
+  ndo_tmp="$1"
+  [ -n "$native_dep_info" ] || return 0
+  ndo_hasher="$(modular_hasher || true)"
+  ndo_cache=""
+  if [ -n "$ndo_hasher" ]; then
+    ndo_cache="$(resolve_native_dep_cache_dir)"
+    mkdir -p "$ndo_cache" 2>/dev/null || ndo_cache=""
+  fi
+  ndo_i=0
+  printf '%s\n' "$native_dep_info" | while IFS="$(printf '\t')" read -r ndo_pkg ndo_kind ndo_src; do
+    [ "$ndo_kind" = "src" ] || continue
+    ndo_i=$((ndo_i + 1))
+    ndo_incs="$(printf '%s\n' "$native_dep_info" \
+      | awk -F'\t' -v p="$ndo_pkg" '$1 == p && $2 == "inc" { printf "-I %s ", $3 }')"
+    ndo_obj=""
+    if [ -n "$ndo_cache" ]; then
+      # Key folds the headers the shim can see, so an upstream header
+      # edit re-keys; paths stay out, so the same content hits from any
+      # checkout or cache sha.
+      ndo_key="$( {
+        printf '%s\n%s\n%s\n' "$CC" "$CFLAGS_COMPILE" "$(uname -sm)"
+        cat "$ndo_src"
+        printf '%s\n' "$native_dep_info" \
+          | awk -F'\t' -v p="$ndo_pkg" '$1 == p && $2 == "inc" { print $3 }' \
+          | while IFS= read -r ndo_d; do
+              [ -d "$ndo_d" ] && find "$ndo_d" -maxdepth 3 -name '*.h' -type f 2>/dev/null \
+                | LC_ALL=C sort | while IFS= read -r ndo_h; do cat "$ndo_h"; done
+            done
+      } | $ndo_hasher | awk '{print $1}' )"
+      ndo_obj="$ndo_cache/$ndo_key.o"
+      if [ ! -f "$ndo_obj" ]; then
+        # shellcheck disable=SC2086
+        $CC $CFLAGS_COMPILE $ndo_incs -c "$ndo_src" -o "$ndo_obj.$$" \
+          && mv "$ndo_obj.$$" "$ndo_obj" \
+          || { rm -f "$ndo_obj.$$" 2>/dev/null
+               echo "kai: error: failed to compile native source $ndo_src (package '$ndo_pkg')" >&2
+               exit 1; }
+      fi
+    else
+      ndo_obj="$ndo_tmp/nativedep-$ndo_i.o"
+      # shellcheck disable=SC2086
+      $CC $CFLAGS_COMPILE $ndo_incs -c "$ndo_src" -o "$ndo_obj" \
+        || { echo "kai: error: failed to compile native source $ndo_src (package '$ndo_pkg')" >&2
+             exit 1; }
+    fi
+    printf '%s\n' "$ndo_obj"
+  done
+}
+
+# `-l` flags for every declared system library. Reads $native_dep_info.
+native_lib_flags() {
+  [ -n "$native_dep_info" ] || return 0
+  printf '%s\n' "$native_dep_info" \
+    | awk -F'\t' '$2 == "lib" && !seen[$3]++ { printf "-l%s ", $3 }'
+}
+
+# After a failed executable link: name the [native]-shaped causes the
+# user can act on. Undefined symbols with a dep shipping undeclared
+# `.c` is the missing-contract case; a declared system lib may simply
+# be absent on this machine. Reads $native_dep_info; stderr only.
+native_link_hint() {
+  [ -n "$native_dep_info" ] || return 0
+  if [ "${KAI_NATIVE_DEPS:-1}" = "0" ]; then
+    if printf '%s\n' "$native_dep_info" | awk -F'\t' '$2 == "src" { found = 1 } END { exit !found }'; then
+      echo "kai: note: KAI_NATIVE_DEPS=0 disabled the [native] sources this package's dependency graph declares — undefined symbols at link are expected unless CFLAGS supplies them." >&2
+    fi
+    return 0
+  fi
+  printf '%s\n' "$native_dep_info" | awk -F'\t' '$2 == "lib" && !seen[$3]++ { print $1 "\t" $3 }' \
+    | while IFS="$(printf '\t')" read -r nlh_pkg nlh_lib; do
+        [ -n "$nlh_lib" ] || continue
+        echo "kai: note: package '$nlh_pkg' requires system library '$nlh_lib' (-l$nlh_lib); if the linker could not find it, install it on this machine." >&2
+      done
+  printf '%s\n' "$native_dep_info" | awk -F'\t' '$2 == "dir" { print $1 "\t" $3 }' \
+    | while IFS="$(printf '\t')" read -r nlh_pkg nlh_dir; do
+        [ -n "$nlh_dir" ] && [ -d "$nlh_dir" ] || continue
+        if ! printf '%s\n' "$native_dep_info" | awk -F'\t' -v p="$nlh_pkg" '$1 == p && $2 == "src" { found = 1 } END { exit !found }'; then
+          nlh_c="$(find "$nlh_dir" -maxdepth 3 -name '*.c' -type f 2>/dev/null | head -1)"
+          if [ -n "$nlh_c" ]; then
+            echo "kai: note: dependency '$nlh_pkg' ships C sources (e.g. ${nlh_c#"$nlh_dir"/}) not declared in its kai.toml [native] table — undefined symbols at link usually mean that contract is missing. See docs/packages.md." >&2
+          fi
+        fi
+      done
+}
+
 # Issue #603: known editions accepted by the compiler. Kept in sync
 # with stage2/compiler.kai's known_editions(). Adding an edition
 # means flipping both lists.
@@ -1553,6 +1745,43 @@ compile_to_binary() {
     pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
     unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
   fi
+  # Native dependency contract: packages declare vendored C shim
+  # sources and system libs in [native]; resolution carries them to
+  # every link line below, on both backends. Collected even when
+  # KAI_NATIVE_DEPS=0 so the post-link-failure hint stays informed.
+  native_dep_info=""
+  native_objs=""
+  native_libflags=""
+  if [ -n "$manifest_dir" ]; then
+    native_dep_info="$(collect_native_deps "$manifest_dir")"
+  fi
+  # Every backend links through $CC. Failing here, before any compile,
+  # turns the unintelligible late failure into one sentence — naming
+  # the packages whose shims are the reason a C compiler is required.
+  if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "kai: error: no C compiler found ('$CC' is not on PATH); kai needs one to link binaries." >&2
+    printf '%s\n' "$native_dep_info" | awk -F'\t' '$2 == "src" && !seen[$1]++ { print $1 }' \
+      | while IFS= read -r ndc_pkg; do
+          [ -n "$ndc_pkg" ] || continue
+          echo "kai: error: package '$ndc_pkg' ships native C sources that must be compiled with it." >&2
+        done
+    echo "kai: hint: install one (macOS: xcode-select --install; Debian/Ubuntu: apt install build-essential), then retry." >&2
+    exit 2
+  fi
+  if [ -n "$native_dep_info" ] && [ "${KAI_NATIVE_DEPS:-1}" != "0" ]; then
+    ndv_missing="$(printf '%s\n' "$native_dep_info" \
+      | awk -F'\t' '$2 == "src" { print $1 "\t" $3 }' \
+      | while IFS="$(printf '\t')" read -r ndv_pkg ndv_src; do
+          [ -f "$ndv_src" ] || printf "kai: error: package '%s' declares native source %s, but it does not exist\n" "$ndv_pkg" "$ndv_src"
+        done)"
+    if [ -n "$ndv_missing" ]; then
+      printf '%s\n' "$ndv_missing" >&2
+      exit 1
+    fi
+    native_dep_objects "$tmp" > "$tmp/nativedep.objs" || exit 1
+    native_objs="$(tr '\n' ' ' < "$tmp/nativedep.objs")"
+    native_libflags="$(native_lib_flags)"
+  fi
   # User-file incremental cache: the typed per-module blobs the rebuild
   # cut restores instead of re-inferring. On by default inside a package
   # (a kai.toml above the entry), where the multi-module edit loop pays
@@ -1678,9 +1907,11 @@ compile_to_binary() {
       nm_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$nm_owner_defs")"
       # shellcheck disable=SC2086
       if [ -n "$nm_rt_obj" ]; then
-        $CC $CFLAGS $nm_ldstack $nm_gc $nm_objs "$nm_rt_obj" -o "$out" -lm -ldl || die "native-modular link failed"
+        $CC $CFLAGS $nm_ldstack $nm_gc $nm_objs $native_objs "$nm_rt_obj" -o "$out" -lm -ldl $native_libflags \
+          || { native_link_hint; die "native-modular link failed"; }
       else
-        $CC $CFLAGS $nm_owner_defs $nm_ldstack $nm_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl || die "native-modular link failed"
+        $CC $CFLAGS $nm_owner_defs $nm_ldstack $nm_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nm_objs $native_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl $native_libflags \
+          || { native_link_hint; die "native-modular link failed"; }
       fi
       return 0
     fi
@@ -1828,15 +2059,18 @@ compile_to_binary() {
       wp_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_LLVM_C" "$wp_owner_defs")"
       # shellcheck disable=SC2086
       if [ -n "$wp_rt_obj" ]; then
-        $CC $CFLAGS $nat_gc $nat_objs "$wp_rt_obj" -o "$out" -lm -ldl
+        $CC $CFLAGS $nat_gc $nat_objs $native_objs "$wp_rt_obj" -o "$out" -lm -ldl $native_libflags \
+          || { native_link_hint; die "native link failed"; }
       else
         # No object cache (hasher-less host): compile runtime_llvm.c inline as
         # the owner. $KAI_RUNTIME_OWNER_OPT (-O0) keeps the scheduler sound (#1234).
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $wp_owner_defs $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs $native_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl $native_libflags \
+          || { native_link_hint; die "native link failed"; }
       fi
     else
       # shellcheck disable=SC2086
-      $CC $CFLAGS $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl
+      $CC $CFLAGS $nat_gc -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" $nat_objs $native_objs "$RUNTIME_LLVM_C" -o "$out" -lm -ldl $native_libflags \
+        || { native_link_hint; die "native link failed"; }
     fi
     # --debug DWARF (#500): the native object carries the .debug_* sections.
     # On ELF (Linux) the linker copies them straight into the executable, so
@@ -1983,18 +2217,18 @@ compile_to_binary() {
       mod_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
       mod_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_OWNER_C" "$mod_owner_defs")"
       if [ -n "$mod_rt_obj" ]; then
-        $CC $CFLAGS $mod_ldstack "$moddir"/*.o "$mod_rt_obj" -o "$out" -lm \
-          || die "modular link failed"
+        $CC $CFLAGS $mod_ldstack "$moddir"/*.o $native_objs "$mod_rt_obj" -o "$out" -lm $native_libflags \
+          || { native_link_hint; die "modular link failed"; }
       else
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $mod_owner_defs $mod_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$moddir"/*.o "$RUNTIME_OWNER_C" -o "$out" -lm \
-          || die "modular link failed"
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $mod_owner_defs $mod_ldstack -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$moddir"/*.o $native_objs "$RUNTIME_OWNER_C" -o "$out" -lm $native_libflags \
+          || { native_link_hint; die "modular link failed"; }
       fi
     else
       # Hasher-less host: no runtime object cache and no RUNTIME_OWNER_C, so a
       # program module is the owner (legacy single-owner-module link). Sound
       # under gcc; the clang residual this split closes needs the owner object.
-      $CC $CFLAGS $mod_ldstack "$moddir"/*.o -o "$out" -lm \
-        || die "modular link failed"
+      $CC $CFLAGS $mod_ldstack "$moddir"/*.o $native_objs -o "$out" -lm $native_libflags \
+        || { native_link_hint; die "modular link failed"; }
     fi
   else
     # shellcheck disable=SC2086
@@ -2051,7 +2285,8 @@ compile_to_binary() {
     # -O1+ with KAI_THREADS>1 — is the residual this split closes, which such
     # a minimal host does not hit by construction.
     if [ -z "$RUNTIME_OWNER_C" ]; then
-      $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" -o "$out" -lm
+      $CC $CFLAGS -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$cfile" $native_objs -o "$out" -lm $native_libflags \
+        || { native_link_hint; die "C backend link failed"; }
     else
       prog_obj="$tmp/out.o"
       $CC $CFLAGS_COMPILE -DKAI_SEPARATE_COMPILATION=1 -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$prog_obj" \
@@ -2068,11 +2303,12 @@ compile_to_binary() {
       c_owner_defs="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
       c_rt_obj="$(resolve_native_modular_runtime_obj "$RUNTIME_OWNER_C" "$c_owner_defs")"
       if [ -n "$c_rt_obj" ]; then
-        $CC $CFLAGS -I "$cincl" "$prog_obj" "$c_rt_obj" -o "$out" -lm || die "C backend link failed"
+        $CC $CFLAGS -I "$cincl" "$prog_obj" $native_objs "$c_rt_obj" -o "$out" -lm $native_libflags \
+          || { native_link_hint; die "C backend link failed"; }
       else
         # No object cache (hasher-less host): compile the owner inline at -O0.
-        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" "$RUNTIME_OWNER_C" -o "$out" -lm \
-          || die "C backend link failed"
+        $CC $CFLAGS $KAI_RUNTIME_OWNER_OPT $c_owner_defs -I "$cincl" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$prog_obj" $native_objs "$RUNTIME_OWNER_C" -o "$out" -lm $native_libflags \
+          || { native_link_hint; die "C backend link failed"; }
       fi
     fi
   fi

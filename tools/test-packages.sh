@@ -231,6 +231,16 @@ run_check_script "install_binary"      "install_binary/check.sh"
 # its wholesale replacement of bin/libexec/share.
 run_check_script "upgrade_preserves_installed" "upgrade_preserves_installed/check.sh"
 
+# [native] manifest table: a dep's vendored C shim reaches every verb
+# through dependency resolution — build/run/test/install, plus the
+# missing-cc and undeclared-shim diagnostics and the reversion switch.
+run_positive     "native_shim"    "native_shim/app" "native_shim/app/main.out.expected"
+run_check_script "native_shim_verbs" "native_shim/check.sh"
+
+# A/B → C diamond: the shared shim package resolves once, compiles
+# once, links once — no duplicate symbols.
+run_check_script "native_diamond" "native_diamond/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
@@ -264,6 +274,7 @@ run_parity  "parity-same_name_shadow"   "same_name_shadowing"
 run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
 run_parity  "parity-auto_install"       "auto_install"
 run_parity  "parity-git_tag_alias"      "git_tag_alias"
+run_parity  "parity-native_shim"        "native_shim/app"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then
