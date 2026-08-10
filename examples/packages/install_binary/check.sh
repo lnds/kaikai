@@ -140,6 +140,15 @@ for name in $shipped; do
   expect_refused "$name" "reserved"
 done
 
+# A manifest `name` becomes a path under the prefix's bin/. `kai init`
+# enforces the grammar, but a hand-written manifest has not been through
+# it, and a name carrying '/' or '..' would write outside the prefix.
+for bad in "../../../../tmp/kai-traversal-probe" "sub/dir" "Capital" "9leading"; do
+  expect_refused "$bad" "not installable"
+done
+[ ! -e "/tmp/kai-traversal-probe" ] \
+  || note "a package name escaped the prefix and wrote to /tmp"
+
 # --- 7. a library has no binary to install ----------------------------
 mkdir -p "$TMP/lib"
 cat > "$TMP/lib/kai.toml" <<'EOF'
