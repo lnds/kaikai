@@ -1,0 +1,142 @@
+# compiler/ta_scope.kai — module scoping for transparent type aliases.
+#
+# `type Step = ...` is not a package-global name. The transparent-alias
+# table is collected over the flattened decl stream of every module, so
+# expanding a decl against the whole table lets whichever alias was
+# declared first rewrite `Step` everywhere — including inside a module
+# that declares its own `Step` and never imports the first one.
+#
+# Each decl expands against the aliases its own module may see: the ones
+# it declares itself, plus the `pub` ones of other modules. That is the
+# rule `pa_decide` (compiler.pub_access) already applies to references;
+# here it decides which alias a use site resolves to rather than whether
+# the use is legal. Records and sums already scope this way through the
+# typer's `module_origin` disambiguation — aliases had no equivalent.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.emit_c
+
+# A decl's home is its own `module_origin` when it carries one; the
+# streaming reset covers the shapes that have no such field.
+# `tag_target_decls_module_origin` stamps every root-file `DType` with
+# the target's name but leaves root fns untagged, so both must land on
+# `target` for a root alias to stay visible to the fns beside it.
+fn tas_decl_home(d: Decl, cur: String, target: String) : String = match d {
+  DType(_, _, _, _, _, _, mo, _) -> match mo {
+    Some(m) -> m
+    None    -> target
+  }
+  _ -> decl_home_hint_reset(d, cur, target)
+}
+
+# `ta_lookup` takes the first match, so a module's own aliases lead the
+# filtered table: a local `type T` shadows an imported `pub type T`
+# rather than losing to whichever module was flattened first. This is
+# the shadowing records and sums already get from the typer's
+# `module_origin` resolution.
+#
+# `nominal` names the module's own records and sums. They are not
+# aliases, so they never enter the table, but they own the name inside
+# their module all the same — an imported alias must not expand a use
+# that resolves to one of them.
+fn tas_filter(table: [TAEntry], home: String, nominal: [String]) : [TAEntry] =
+  list_append(tas_take(table, home, nominal, true, []),
+              tas_take(table, home, nominal, false, []))
+
+fn tas_imported_ok(e: TAEntry, home: String, nominal: [String]) : Bool = {
+  let visible = ta_visible_from(e, home)
+  let foreign = not ta_home_matches(e, home)
+  let shadowed = list_has(nominal, ta_entry_name(e))
+  visible and foreign and not shadowed
+}
+
+fn tas_take(table: [TAEntry], home: String, nominal: [String], own: Bool,
+      acc: [TAEntry]) : [TAEntry] = match table {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> {
+    let keep = if own { ta_home_matches(e, home) }
+               else { tas_imported_ok(e, home, nominal) }
+    tas_take(rest, home, nominal, own, if keep { [e, ...acc] } else { acc })
+  }
+}
+
+# Every nominal (record / sum) type name each module declares, so an
+# imported alias cannot expand over one. Keyed by home the same way the
+# alias table is.
+type TasNominal = TN(String, String)
+
+fn tas_nominals(decls: [Decl], cur: String, target: String,
+      acc: [TasNominal]) : [TasNominal] = match decls {
+  [] -> acc
+  [d, ...rest] -> {
+    let home = tas_decl_home(d, cur, target)
+    tas_nominals(rest, home, target, tas_nominal_of(d, home, acc))
+  }
+}
+
+fn tas_nominal_of(d: Decl, home: String, acc: [TasNominal]) : [TasNominal] =
+  match d {
+    DType(_, name, _, body, _, _, _, _) -> match body {
+      TBRecord(_) -> [TN(home, name), ...acc]
+      TBSum(_)    -> [TN(home, name), ...acc]
+      _ -> acc
+    }
+    DDerive(_, inner, _, _)    -> tas_nominal_of(inner, home, acc)
+    DUnstable(inner, _, _)     -> tas_nominal_of(inner, home, acc)
+    DProtoLaws(_, inner, _, _) -> tas_nominal_of(inner, home, acc)
+    DImplAxiom(_, inner, _, _) -> tas_nominal_of(inner, home, acc)
+    DConstructor(inner, _, _)  -> tas_nominal_of(inner, home, acc)
+    DDoc(_, _, inner, _, _)    -> tas_nominal_of(inner, home, acc)
+    DAttr(_, inner, _, _)      -> tas_nominal_of(inner, home, acc)
+    _ -> acc
+  }
+
+fn tas_nominals_of_home(ns: [TasNominal], home: String,
+      acc: [String]) : [String] = match ns {
+  [] -> acc
+  [tn, ...rest] -> match tn {
+    TN(h, n) ->
+      tas_nominals_of_home(rest, home, if h == home { [n, ...acc] } else { acc })
+  }
+}
+
+# The filtered table for one home, memoised across the decls of a run of
+# same-home decls — the stream arrives grouped by module, so a single
+# slot removes the rescan without a map.
+type TasCache = TC(String, [TAEntry], Bool)
+
+fn tas_table_for(table: [TAEntry], home: String, nominal: [TasNominal],
+      cache: TasCache) : TasCache = match cache {
+  TC(chome, _, valid) ->
+    if valid and chome == home { cache }
+    else {
+      TC(home, tas_filter(table, home, tas_nominals_of_home(nominal, home, [])), true)
+    }
+}
+
+fn tas_cached_table(cache: TasCache) : [TAEntry] = match cache {
+  TC(_, t, _) -> t
+}
+
+#[doc("Expand transparent type aliases in every decl, resolving each against the aliases its own module may see rather than the whole package. `target` is the root file's module name, the home of every decl the root declares.")]
+pub fn ta_scope_expand_decls(decls: [Decl], table: [TAEntry],
+      aliases: [AliasResult], fuel: Int, target: String) : [Decl] = {
+  let nominal = tas_nominals(decls, target, target, [])
+  tas_loop(decls, table, aliases, fuel, target, target, nominal,
+           TC("", [], false), [])
+}
+
+fn tas_loop(decls: [Decl], table: [TAEntry], aliases: [AliasResult],
+      fuel: Int, cur: String, target: String, nominal: [TasNominal],
+      cache: TasCache, acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = tas_decl_home(d, cur, target)
+    let cache1 = tas_table_for(table, home, nominal, cache)
+    let d1 = ta_expand_one(d, tas_cached_table(cache1), aliases, fuel)
+    tas_loop(rest, table, aliases, fuel, home, target, nominal, cache1,
+             [d1, ...acc])
+  }
+}
