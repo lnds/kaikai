@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.111.0 (2026-08-10)
+
+### Added
+
+- **cli**: install a package's binary with `kai install <spec>` (#1728)
+
+### Fixed
+
+- **lex**: reject unknown escapes and add \u{...} (#1731)
+- **typer**: scope transparent type aliases to the module that declares them (#1730)
+- **diagnostics**: attribute pre-typer diagnostics to the declaring file (#1729)
+- **modules**: scope import aliases to the file that writes them (#1727)
+- **typer**: read the record table through annotation wrappers (#1725)
+- **typer**: anchor interpolated-expression diagnostics at the real source position (#1722)
+- **cli**: run package-mode tests when the package has no entry point (#1721)
+
 ## v0.110.0 (2026-08-09)
 
 ### Added
