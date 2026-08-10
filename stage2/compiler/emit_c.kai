@@ -11946,15 +11946,15 @@ pub fn expand_aliases_in_decls(decls: [Decl], aliases: [AliasResult]) : [Decl] {
 #              `type Predicate[T] = (T) -> Bool`); empty for
 #              `type Age = Int`
 #   body     — the right-hand TypeExpr
-
-# `TAEntry` records one transparent alias.
-#   name     — the alias type name (e.g. "Age")
-#   tparams  — declared type parameter names (e.g. ["T"] for
-#              `type Predicate[T] = (T) -> Bool`); empty for
-#              `type Age = Int`
-#   body     — the right-hand TypeExpr
-#[doc("A transparent type-alias entry: alias name, type params, and the right-hand TypeExpr it expands to.")]
-pub type TAEntry = TAE(String, [String], TypeExpr)
+#   home     — the owning module's surface name, "" for the root file
+#   is_pub   — whether the alias is exported
+#
+# An alias name is not package-global: `ta_scope` filters this table to
+# the entries one module may see before any expansion runs, so two
+# modules may each declare `type Step` without either capturing the
+# other's uses.
+#[doc("A transparent type-alias entry: alias name, type params, the right-hand TypeExpr it expands to, its home module, and whether it is `pub`.")]
+pub type TAEntry = TAE(String, [String], TypeExpr, String, Bool)
 
 #[doc("Emit-layer entry point collect_transparent_aliases")]
 pub fn collect_transparent_aliases(decls: [Decl], eff_names: [String]) : [TAEntry] =
@@ -11975,17 +11975,22 @@ fn collect_transparent_aliases_loop(decls: [Decl], eff_names: [String],
   }
 }
 
+fn ta_home_of(mo: Option[String]) : String = match mo {
+  Some(m) -> m
+  None    -> ""
+}
+
 fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
   match decl_transparent_inner(d) {
     Some(inner) -> transparent_alias_of_decl(inner, eff_names)
     None -> match d {
-      DType(_, name, tparams, body, _, _, _, _) -> match body {
+      DType(is_pub, name, tparams, body, _, _, mo, _) -> match body {
         TBAlias(t) -> match t.tkind {
           # Single-name body that resolves to an effect: skip. Effect
           # aliasing is the legacy semantics of TBAlias single-name
           # form, threaded by `resolve_alias_cands` + the row pass.
           TyName(n, []) -> if list_has(eff_names, n) { None }
-                           else { Some(TAE(name, tparams, t)) }
+                           else { Some(TAE(name, tparams, t, ta_home_of(mo), is_pub)) }
           # Refinement aliases (`type Pos = Int where p`) expand to
           # their inline form `TyRefine(Int, p)` at every use site.
           # `synthesize_refine_pred_fns` + `lower_pattern_narrow_decls`
@@ -11993,7 +11998,7 @@ fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
           # synthesised `__ref_pred_X` fn survives and the per-pattern
           # narrow lowering has resolved the alias name against the
           # raw decl list.
-          _ -> Some(TAE(name, tparams, t))
+          _ -> Some(TAE(name, tparams, t, ta_home_of(mo), is_pub))
         }
         _ -> None
       }
@@ -12002,11 +12007,26 @@ fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
   }
 }
 
+#[doc("Whether a module whose home is `home` resolves uses of this alias to this entry: its own aliases, plus the exported ones of other modules. An entry with no home belongs to the root file, which the whole package sees.")]
+pub fn ta_visible_from(e: TAEntry, home: String) : Bool = match e {
+  TAE(_, _, _, e_home, e_pub) -> e_home == home or e_pub or e_home == ""
+}
+
+#[doc("Whether this alias is declared by the module whose home is `home`.")]
+pub fn ta_home_matches(e: TAEntry, home: String) : Bool = match e {
+  TAE(_, _, _, e_home, _) -> e_home == home
+}
+
+#[doc("The alias name this entry binds.")]
+pub fn ta_entry_name(e: TAEntry) : String = match e {
+  TAE(n, _, _, _, _) -> n
+}
+
 fn ta_lookup(table: [TAEntry], name: String) : Option[TAEntry] {
   match table {
     [] -> None
     [e, ...rest] -> match e {
-      TAE(n, _, _) -> if n == name { Some(e) } else { ta_lookup(rest, name) }
+      TAE(n, _, _, _, _) -> if n == name { Some(e) } else { ta_lookup(rest, name) }
     }
   }
 }
@@ -12226,7 +12246,7 @@ fn expand_ta_te(te: TypeExpr, table: [TAEntry], aliases: [AliasResult], fuel: In
     TyName(name, targs) -> {
       let targs1 = expand_ta_te_list(targs, table, aliases, fuel)
       match ta_lookup(table, name) {
-        Some(TAE(_, tparams, body)) -> {
+        Some(TAE(_, tparams, body, _, _)) -> {
           let subst = build_tp_subst(tparams, targs1)
           let inst = apply_tp_subst_te(body, subst)
           # Re-walk the instantiated body so a chain `type A = B; type B = Int`
@@ -12320,6 +12340,13 @@ pub fn expand_ta_decls(decls: [Decl], table: [TAEntry], aliases: [AliasResult]) 
   let fuel = list_length(table) + 1
   expand_ta_decls_loop(decls, table, aliases, fuel)
 }
+
+#[doc("The fuel bound an alias-expansion run uses for the given table.")]
+pub fn ta_fuel_for(table: [TAEntry]) : Int = list_length(table) + 1
+
+#[doc("Expand transparent aliases in one decl against an already module-scoped table.")]
+pub fn ta_expand_one(d: Decl, table: [TAEntry], aliases: [AliasResult],
+      fuel: Int) : Decl = expand_ta_decl(d, table, aliases, fuel)
 
 fn expand_ta_decls_loop(decls: [Decl], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Decl] {
   match decls {
