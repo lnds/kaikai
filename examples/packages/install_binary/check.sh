@@ -44,144 +44,100 @@ fn main() : Unit / Stdout = {
 EOF
 }
 
+# Run kai with this fixture's prefix, capturing streams and exit status.
+# `status` is the exit code; stdout/stderr land in $TMP/.out and $TMP/.err.
+# The `set +e` dance lives here so the assertions below read as assertions.
+kai_in() {
+  ki_dir="$1"; shift
+  set +e
+  ( cd "$ki_dir" && KAIKAI_HOME="$HOME_DIR" "$KAI" "$@" ) \
+    >"$TMP/.out" 2>"$TMP/.err"
+  status=$?
+  set -e
+}
+
+expect_ok()   { [ "$status" -eq 0 ] || { note "$1 exited $status"; cat "$TMP/.err" >&2; }; }
+expect_fail() { [ "$status" -ne 0 ] || note "$1"; }
+expect_err()  { grep -qF -- "$1" "$TMP/.err" || note "$2"; }
+
+# The installed binary exists and prints what its source said it would.
+expect_prints() {
+  if [ ! -x "$HOME_DIR/bin/$1" ]; then
+    note "expected $HOME_DIR/bin/$1 to exist and be executable"
+    return
+  fi
+  ep_got="$("$HOME_DIR/bin/$1" 2>/dev/null || true)"
+  [ "$ep_got" = "$2" ] || note "'$1' printed '$ep_got', expected '$2'"
+}
+
+# Installing a package named $1 must be refused, with $2 in the message.
+expect_refused() {
+  mkpkg "$TMP/refused" "$1" "pwned"
+  kai_in "$TMP/refused" install . --force
+  expect_fail "installing '$1' succeeded; expected refusal"
+  expect_err "$2" "refusal for '$1' does not mention '$2'"
+}
+
 # --- 1. install from a local path -------------------------------------
 mkpkg "$TMP/src-dir-name" "pepito" "hello from pepito"
-set +e
-( cd "$TMP/src-dir-name" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-if [ "$status" -ne 0 ]; then
-  note "install from local path exited $status"
-  cat "$TMP/.err" >&2
-fi
-if [ ! -x "$HOME_DIR/bin/pepito" ]; then
-  note "expected $HOME_DIR/bin/pepito to exist and be executable"
-  ls -la "$HOME_DIR/bin" >&2
-else
-  got="$("$HOME_DIR/bin/pepito" 2>/dev/null || true)"
-  [ "$got" = "hello from pepito" ] \
-    || note "installed binary printed '$got', expected 'hello from pepito'"
-fi
+kai_in "$TMP/src-dir-name" install .
+expect_ok "install from a local path"
+expect_prints "pepito" "hello from pepito"
 # The binary is named from the manifest, never from the directory.
 [ ! -e "$HOME_DIR/bin/src-dir-name" ] \
   || note "binary was named after the directory, not the manifest"
 
 # --- 2. reinstall without --force is refused --------------------------
-set +e
-( cd "$TMP/src-dir-name" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -ne 0 ] || note "reinstall without --force succeeded; expected refusal"
-grep -q -- "--force" "$TMP/.err" \
-  || note "refusal did not mention --force"
+kai_in "$TMP/src-dir-name" install .
+expect_fail "reinstall without --force succeeded; expected refusal"
+expect_err "--force" "refusal did not mention --force"
 # The already-installed binary must survive a refused reinstall.
 [ -x "$HOME_DIR/bin/pepito" ] || note "refused reinstall removed the existing binary"
 
 # --- 3. reinstall with --force replaces -------------------------------
 mkpkg "$TMP/src-dir-name" "pepito" "second version"
-set +e
-( cd "$TMP/src-dir-name" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . --force ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-if [ "$status" -ne 0 ]; then
-  note "install --force exited $status"
-  cat "$TMP/.err" >&2
-else
-  got="$("$HOME_DIR/bin/pepito" 2>/dev/null || true)"
-  [ "$got" = "second version" ] \
-    || note "--force left the old binary (printed '$got')"
-fi
+kai_in "$TMP/src-dir-name" install . --force
+expect_ok "install --force"
+expect_prints "pepito" "second version"
 
 # --- 4. --list reports the installed package --------------------------
-set +e
-KAIKAI_HOME="$HOME_DIR" "$KAI" install --list >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -eq 0 ] || note "install --list exited $status"
+kai_in "$TMP" install --list
+expect_ok "install --list"
 grep -q "pepito" "$TMP/.out" || note "--list did not report pepito"
 
 # --- 5. install from a git source, bare and with @<ref> ---------------
-# A local bare repo stands in for a remote: `kai install` clones by URL,
-# and a filesystem path is a URL git accepts, so the code path is the
-# same one a github.com source takes.
+# A local repo stands in for a remote: `kai install` clones by URL, and a
+# filesystem path is a URL git accepts, so this is the same code path a
+# github.com source takes.
 GITSRC="$TMP/gitsrc"
 mkpkg "$GITSRC" "fulanito" "hello from fulanito"
 ( cd "$GITSRC" && git init -q -b main . \
   && git config user.email t@example.com && git config user.name t \
   && git add -A && git commit -qm init && git tag v1.0.0 ) >/dev/null 2>&1
 
-set +e
-KAIKAI_HOME="$HOME_DIR" "$KAI" install "$GITSRC" >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-if [ "$status" -ne 0 ]; then
-  note "install from a git source exited $status"
-  cat "$TMP/.err" >&2
-elif [ ! -x "$HOME_DIR/bin/fulanito" ]; then
-  note "git-source install did not produce bin/fulanito"
-else
-  got="$("$HOME_DIR/bin/fulanito" 2>/dev/null || true)"
-  [ "$got" = "hello from fulanito" ] \
-    || note "git-installed binary printed '$got'"
-fi
+kai_in "$TMP" install "$GITSRC"
+expect_ok "install from a git source"
+expect_prints "fulanito" "hello from fulanito"
 
 # The @<ref> form pins a tag. --force because the bare form just installed it.
-set +e
-KAIKAI_HOME="$HOME_DIR" "$KAI" install "$GITSRC@v1.0.0" --force \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-if [ "$status" -ne 0 ]; then
-  note "install with @<ref> exited $status"
-  cat "$TMP/.err" >&2
-fi
-KAIKAI_HOME="$HOME_DIR" "$KAI" install --list 2>/dev/null | grep -q "v1.0.0" \
-  || note "--list did not record the pinned ref"
+kai_in "$TMP" install "$GITSRC@v1.0.0" --force
+expect_ok "install with @<ref>"
+kai_in "$TMP" install --list
+grep -q "v1.0.0" "$TMP/.out" || note "--list did not record the pinned ref"
 
 # A ref that does not exist must fail rather than silently take the default.
-set +e
-KAIKAI_HOME="$HOME_DIR" "$KAI" install "$GITSRC@v9.9.9" --force \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -ne 0 ] || note "install at a nonexistent ref succeeded"
+kai_in "$TMP" install "$GITSRC@v9.9.9" --force
+expect_fail "install at a nonexistent ref succeeded"
 
-# --- 6. a toolchain name is refused -----------------------------------
-# The reserved set is derived from what the prefix and the release ship,
-# so `kai` is reserved whether or not this temp prefix has a bin/kai.
-for reserved in kai kaic2 kai-pkg; do
-  mkpkg "$TMP/evil" "$reserved" "pwned"
-  set +e
-  ( cd "$TMP/evil" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . --force ) \
-    >"$TMP/.out" 2>"$TMP/.err"
-  status=$?
-  set -e
-  if [ "$status" -eq 0 ]; then
-    note "installing reserved name '$reserved' succeeded"
-    continue
-  fi
-  grep -q "reserved" "$TMP/.err" \
-    || note "refusal for '$reserved' does not say the name is reserved"
-done
-
+# --- 6. toolchain names are refused -----------------------------------
 # The set is derived, not listed: every binary the release script copies
-# into the tarball's bin/ or libexec/kaikai/ must appear in it. A binary
-# added to a future release is then reserved without editing bin/kai.
+# into the tarball's bin/ or libexec/kaikai/ must be refused, so a binary
+# added to a future release is reserved without editing bin/kai.
 shipped="$(sed -n -E 's#.*"\$STAGE/(bin|libexec/kaikai)/([A-Za-z0-9._-]+)".*#\2#p' \
   "$ROOT/scripts/build-release.sh" | sort -u)"
 [ -n "$shipped" ] || note "derived no binary names from scripts/build-release.sh"
 for name in $shipped; do
-  mkpkg "$TMP/derived" "$name" "pwned"
-  set +e
-  ( cd "$TMP/derived" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . --force ) \
-    >"$TMP/.out" 2>"$TMP/.err"
-  status=$?
-  set -e
-  [ "$status" -ne 0 ] \
-    || note "'$name' is shipped by the release but was not reserved"
+  expect_refused "$name" "reserved"
 done
 
 # --- 7. a library has no binary to install ----------------------------
@@ -195,40 +151,23 @@ EOF
 cat > "$TMP/lib/helper.kai" <<'EOF'
 pub fn twice(n: Int) : Int = n * 2
 EOF
-set +e
-( cd "$TMP/lib" && KAIKAI_HOME="$HOME_DIR" "$KAI" install . ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -ne 0 ] || note "installing a library succeeded; expected refusal"
-grep -q "entry point" "$TMP/.err" \
-  || note "library refusal does not mention the missing entry point"
+kai_in "$TMP/lib" install .
+expect_fail "installing a library succeeded; expected refusal"
+expect_err "entry point" "library refusal does not mention the missing entry point"
 [ ! -e "$HOME_DIR/bin/libonly" ] || note "library install left a binary behind"
 
 # --- 8. the no-argument form still resolves deps, deprecated ----------
 mkpkg "$TMP/deps-pkg" "depspkg" "deps"
-set +e
-( cd "$TMP/deps-pkg" && KAIKAI_HOME="$HOME_DIR" "$KAI" install ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -eq 0 ] || note "no-argument 'kai install' exited $status"
-grep -q "kai fetch" "$TMP/.err" \
-  || note "no-argument form did not point at 'kai fetch'"
-[ -f "$TMP/deps-pkg/kai.lock" ] \
-  || note "no-argument form did not write kai.lock"
-# It must not have installed anything.
-[ ! -e "$HOME_DIR/bin/depspkg" ] \
-  || note "no-argument form installed a binary"
+kai_in "$TMP/deps-pkg" install
+expect_ok "no-argument 'kai install'"
+expect_err "kai fetch" "no-argument form did not point at 'kai fetch'"
+[ -f "$TMP/deps-pkg/kai.lock" ] || note "no-argument form did not write kai.lock"
+[ ! -e "$HOME_DIR/bin/depspkg" ] || note "no-argument form installed a binary"
 
 # `kai fetch` is the same resolution under its own name.
 rm -f "$TMP/deps-pkg/kai.lock"
-set +e
-( cd "$TMP/deps-pkg" && KAIKAI_HOME="$HOME_DIR" "$KAI" fetch ) \
-  >"$TMP/.out" 2>"$TMP/.err"
-status=$?
-set -e
-[ "$status" -eq 0 ] || note "'kai fetch' exited $status"
+kai_in "$TMP/deps-pkg" fetch
+expect_ok "'kai fetch'"
 [ -f "$TMP/deps-pkg/kai.lock" ] || note "'kai fetch' did not write kai.lock"
 
 [ "$fail" -eq 0 ] || exit 1
