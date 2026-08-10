@@ -15,11 +15,26 @@ what it imports from other packages and what it exports.
 ```text
 kai init <name>                   # create a kai.toml in cwd
 kai add <source>[@<ref>]          # add a dep
-kai install                       # resolve + lock
+kai fetch                         # resolve + lock
+kai install <spec> [--force]      # build a package, install its binary
+kai install --list                # what this prefix has installed
 kai update [<name>]               # refresh deps
 kai show                          # dump parsed manifest
 kai migrate [<file>] [--write]    # migrate source across an edition bump
 ```
+
+`kai install <spec>` is the `cargo install` / `go install`
+analogue: it builds the package and drops its binary in
+`$KAIKAI_HOME/bin` (default `~/.kaikai/bin`), already on `PATH`.
+The `<spec>` is `.` for the cwd's package or a git source with an
+optional `@<ref>`; the binary is named from the manifest's `name`,
+not the URL. Replacing an installed binary needs `--force`, names
+the toolchain ships are refused, and a library — having no entry
+point — is turned away rather than failing at link time.
+
+`kai install` with no argument still resolves dependencies, the
+behaviour that is now `kai fetch`, and warns that it does. That
+form changes meaning at the next edition boundary.
 
 ## Manifest
 
@@ -43,7 +58,7 @@ Dependency forms:
   through the manifest directly, not locked.
 
 An unrecognised dependency table (neither `path` nor `source`/`ref`)
-is a manifest error: `kai install` reports it and exits non-zero
+is a manifest error: `kai fetch` reports it and exits non-zero
 rather than locking zero entries.
 
 ## Migrating across an edition

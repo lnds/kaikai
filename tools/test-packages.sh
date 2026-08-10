@@ -223,6 +223,14 @@ run_check_script "orphan_check_bench_discovery" "orphan_check_bench_discovery/ch
 # not need an entry, so a library is not locked out of package mode.
 run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 
+# `kai install <spec>` builds a package and installs its binary; the
+# toolchain's own names are refused and a library is turned away.
+run_check_script "install_binary"      "install_binary/check.sh"
+
+# The shared bin/ means `kai upgrade` must carry user binaries across
+# its wholesale replacement of bin/libexec/share.
+run_check_script "upgrade_preserves_installed" "upgrade_preserves_installed/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart

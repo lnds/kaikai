@@ -146,6 +146,18 @@ assembled from one list rather than reconstructed from git.
   contextual, so a user effect may still declare an op called
   `finally`.
 
+- **`kai install` with no argument** (issue #1724). The command now
+  installs a package's binary, the `cargo install` / `go install`
+  meaning; dependency resolution, which is what it used to do, is
+  `kai fetch`. The argument form is additive — it was an error before
+  — and the no-argument form still resolves dependencies within
+  Hanga Roa, printing a deprecation notice. At the Orongo cut it
+  becomes "install the cwd package", matching both precedents.
+  Migration is mechanical but not source-level: a script or CI job
+  running bare `kai install` to prefetch dependencies changes to
+  `kai fetch`. `kai migrate` does not cover it — the affected text is
+  in shell scripts and workflow files, not in `.kai` source.
+
 ## Edition selection in user packages
 
 A `kai.toml` declares which edition its source compiles against:

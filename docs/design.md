@@ -194,7 +194,7 @@ arguments:
   - Fits LLVM (CPS over segmented stacks) and the LLM-friendly / easy-to-learn principles.
 - **Core tooling**: single `kai` binary with subcommands (Go/Rust/Zig style).
   - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`, `kai bench`, `kai check`.
-  - **Shipped (Hanga Roa)**: `kai lsp` (Language Server Protocol — universal editor support; v1 → v3 via issue #447, v0.75.0 → v0.79.0), `kai init` / `kai add` / `kai install` / `kai update` / `kai show` (package manager v1, issue #405).
+  - **Shipped (Hanga Roa)**: `kai lsp` (Language Server Protocol — universal editor support; v1 → v3 via issue #447, v0.75.0 → v0.79.0), `kai init` / `kai add` / `kai fetch` / `kai install` / `kai update` / `kai show` (package manager v1, issue #405).
   - Long-term: `kai new` (project scaffolding), `kai doc`, registry abstraction.
   - **Out of scope (permanently)**: `kai repl`. Removed from v1.0 per #406 and not planned for v1.x or v2. See `docs/decisions/repl-removal-2026-05-09.md` for the rationale. The `kai run` + `kai watch` workflow replaces the REPL use case.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.

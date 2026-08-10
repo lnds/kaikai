@@ -3,9 +3,9 @@
 > **v1 status (2026-05-09):** the v1 surface in this document is
 > live (issue #405). Manifest parsing, lockfile, cache, git-based
 > resolution with transitive deps + minimum-version selection,
-> and the full `kai init` / `add` / `install` / `update` /
-> `show` command surface ship together. Out-of-scope items are
-> listed at the end and pinned to follow-up issues.
+> and the full `kai init` / `add` / `fetch` / `install` /
+> `update` / `show` command surface ship together. Out-of-scope
+> items are listed at the end and pinned to follow-up issues.
 
 kaikai uses a Go-style package manager: a `kai.toml` manifest
 declares dependencies, the driver resolves them on demand, and
@@ -75,7 +75,7 @@ traversal in the cache layout. `kai init` rejects names that
 fall outside this grammar with a non-zero exit and leaves
 `kai.toml` untouched (issue #419).
 
-### `kai install`
+### `kai fetch`
 
 Reads `kai.toml` from the current directory (or the nearest
 ancestor) and resolves dependencies. Local-path deps are reported
@@ -87,17 +87,83 @@ with a populated cache prints `cached <name>` instead of
 `fetching`.
 
 ```sh
-$ kai install
+$ kai fetch
 kai-pkg: resolving 2 dependency(ies)
   resolved local: greet -> ../lib_greet
   fetching manutara (github.com/lnds/manutara @ v0.1.0)
 kai-pkg: wrote kai.lock with 1 entry(ies)
 ```
 
-`kai run` and `kai build` auto-run `kai install` when they
-detect a manifest with git deps but no `kai.lock` (or when a
-pinned cache directory has gone missing). Users do not need to
-run `install` manually before the first `run`.
+`kai run` and `kai build` fetch automatically when they detect a
+manifest with git deps but no `kai.lock` (or when a pinned cache
+directory has gone missing). Users do not need to run `fetch`
+manually before the first `run`; it exists for prefetching in CI
+and for regenerating a lockfile without building.
+
+> This capability was called `kai install` before the name was
+> given to binary installation. `kai install` with no argument
+> still resolves dependencies and prints a deprecation notice; it
+> changes meaning at the next edition boundary.
+
+### `kai install [<spec>]`
+
+Builds a package and installs its binary into `$KAIKAI_HOME/bin`
+(default `~/.kaikai/bin`) — the directory the `curl | sh`
+installer already put on `PATH`. The Rust and Go analogues are
+`cargo install` and `go install`.
+
+```sh
+$ kai install .                                # the cwd's package
+$ kai install github.com/lnds/pepito           # a git source
+$ kai install github.com/lnds/pepito@v1.2.0    # pinned to a ref
+$ kai install --list                           # what is installed
+```
+
+The binary is named after the manifest's `name`, not the source
+URL, so `kai install github.com/lnds/pepito` yields `pepito`. The
+`@<ref>` suffix is the same form `kai add` parses and accepts a
+tag, branch, or SHA; without it a git source resolves to `main`.
+
+Overwriting an installed binary requires `--force`, matching
+Cargo. Without it a second install of the same name exits
+non-zero and leaves the existing binary in place, so a
+half-finished build never replaces a working command.
+
+Two guards exist because this directory is shared with the
+toolchain, which is not true of `~/.cargo/bin`:
+
+- **Reserved names.** A package whose `name` collides with a
+  toolchain binary (`kai`, `kaic2`, `kai-pkg`, `kai-lsp`, and
+  anything else the prefix ships) is refused rather than silently
+  renamed. The set is derived by listing the prefix's `bin/` and
+  `libexec/kaikai/`, so a binary added to a future release is
+  reserved the day it ships instead of when someone remembers to
+  update a list.
+- **`kai upgrade` preserves installed binaries.** The upgrade
+  replaces `bin/`, `libexec/` and `share/` wholesale so a file
+  dropped by the new release does not linger. Binaries recorded in
+  the install ledger are carried across that wipe; a name the new
+  toolchain has since claimed is not restored, and the conflict is
+  reported.
+
+A library has no entry point, so there is nothing to install: the
+command says so directly rather than failing at link time.
+
+```
+$ kai install .
+kai: error: package 'mylib' has no entry point (main.kai not found)
+  a library has no binary to install; only packages with an entry
+  point can be installed
+```
+
+#### The install ledger
+
+`$KAIKAI_HOME/.kai-installed` records one tab-separated
+`<name>\t<source>\t<ref>` line per installed binary — the
+analogue of Cargo's `.crates.toml`. It is what `--list` reads,
+what `kai upgrade` consults to know which binaries are the
+user's, and what makes a name in `bin/` distinguishable from a
+toolchain file. A future `kai uninstall` reads the same file.
 
 ### `kai add <source>[@<ref>]`
 
@@ -138,7 +204,7 @@ diagnostic of the form `kai-pkg: kai.toml: parse error` to stderr
 and exits with status 2. The manifest is never silently treated
 as empty — a broken manifest is a hard error, not a fallback into
 "no dependencies", because masking the parse failure leads CI
-scripts to believe `kai install` succeeded and proceed to a
+scripts to believe `kai fetch` succeeded and proceed to a
 downstream `kai run` / `kai build` that fails with a less obvious
 error elsewhere (issue #420).
 
@@ -149,8 +215,8 @@ for a `kai.toml`. If found, the driver:
 
 1. Reads both manifest and `kai.lock`.
 2. If git deps are declared but the lock is missing or any
-   pinned cache directory has gone missing, runs `kai install`
-   first (transparent auto-install).
+   pinned cache directory has gone missing, resolves them
+   first (transparent auto-fetch).
 3. Invokes `kai-pkg paths` to emit one `<name>\t<abs-path>` line
    per local-path dep AND every entry in the lockfile (so
    transitive git deps are included automatically).
@@ -360,14 +426,18 @@ double-digit if you care). A full semver parser is a follow-up.
 
 ## Reference fixtures
 
-Four fixtures live under `examples/packages/`:
+Fixtures live under `examples/packages/` and run via
+`tools/test-packages.sh` (`make test-packages`). The ones worth
+knowing by name:
 
 | Fixture | Demonstrates |
 |---|---|
 | `local_path/` | `{ path = "..." }` override; relative path resolved against the manifest dir. |
 | `simple_dep/` | Single git-source dependency cloned to cache, SHA pinned in lock. |
 | `transitive/` | `util` depends on `greet`; both fetched, lockfile contains both, transitive `--path` injection works. |
-| `lockfile_reproducibility/` | Two clean `kai install` runs from the same manifest produce byte-identical `kai.lock`. |
+| `lockfile_reproducibility/` | Two clean `kai fetch` runs from the same manifest produce byte-identical `kai.lock`. |
+| `install_binary/` | `kai install <spec>` from a local path and a git source, `@<ref>` pinning, `--force`, `--list`, and the two refusals (reserved name, library with no entry point). |
+| `upgrade_preserves_installed/` | `kai upgrade` replaces the toolchain without evicting binaries `kai install` put in the shared `bin/`. |
 
 Git-based fixtures depend on bare repos generated by
 `tests/fixtures/git-fixtures/setup.sh`; manifest paths render
@@ -390,7 +460,7 @@ bin/kai run examples/packages/transitive/main.kai
 - **HTTP-based sources** beyond git (raw archives, etc.).
 - **Workspace mode** (multi-package monorepos with shared lock).
 - **Build-time scripts** / generated code.
-- **Pre-`kai install` SHA-256 of the cloned tree** for tamper
+- **Pre-`kai fetch` SHA-256 of the cloned tree** for tamper
   detection — the git SHA already pins the content, but a
   post-clone hash would catch local cache corruption.
 - **Semver-aware ref comparison**. Current MVS is lexicographic
@@ -470,7 +540,7 @@ kai run main.kai                                    # auto-resolves
 ```
 
 `kai run` and `kai build` walk up from the entry file looking for
-`kai.toml`. When found, they read `kai.lock` (running `kai install`
+`kai.toml`. When found, they read `kai.lock` (resolving deps
 first if it is missing or stale) and inject every cached
 dependency's `lib/` directory into the compile path.
 
