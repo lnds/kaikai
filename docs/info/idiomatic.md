@@ -400,8 +400,15 @@ Both build the same list, so this is not a correctness rule — it is
 that one of them allocates and the other does not:
 
 ```kaikai
-let a = [h, ...t]      # prefer: emits the cons directly
-let b = [h] ++ t       # builds a one-element list, then concatenates
+fn prepend(h: Int, t: [Int]) : [Int] =
+  [h, ...t]            # prefer: emits the cons directly
+
+fn prepend_concat(h: Int, t: [Int]) : [Int] =
+  [h] ++ t             # builds a one-element list, then concatenates
+
+fn main() : Unit / Stdout = {
+  Stdout.print("#{prepend(1, [2, 3]) == prepend_concat(1, [2, 3])}")
+}
 ```
 
 Measured on 3M iterations over an 8-element tail, native backend:
