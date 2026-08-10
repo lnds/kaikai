@@ -39,13 +39,78 @@ Three forms are accepted for a dependency value:
    workspace-style development before publishing.
 
 Top-level keys recognised by the v1 parser:
-`name`, `version`, `[dependencies]`. Any other top-level keys are
-ignored (forwards-compatible with future extensions).
+`name`, `version`, `[dependencies]`, `[native]`. Any other top-level
+keys are ignored (forwards-compatible with future extensions).
 
 The manifest is parsed by `stdlib/encoding/toml.kai` (a hand-
 written subset decoder; see the module header for the supported
 subset). The driver shells out to `tools/kai-pkg` (a
 kaikai-compiled CLI) for everything that touches the manifest.
+
+## Native dependencies (`[native]`)
+
+A package that binds C ships the binding as part of its dependency
+contract, so a consumer never wires a shim in by hand:
+
+```toml
+[native]
+sources = ["c/terevaka_term.c"]   # vendored C, relative to this package
+include = ["c"]                   # -I dirs for compiling those sources
+libs = ["sqlite3"]                # system libraries, -l<name> at link
+```
+
+The table lives in the layer that resolves dependencies, *below*
+every verb: `kai build`, `run`, `test`, and `install` all honour it,
+including a library running its own tests against its own shim.
+Declarations propagate transitively — the consumer names the package,
+and the toolchain knows where the files are because it put them there.
+Paths stay relative to the declaring package, so the cache layout
+never leaks into a consumer's build.
+
+**`sources` vs `libs` are different problems, kept apart.** A vendored
+source always works: the `.c` travels with the package and compiles on
+the consumer's machine. A system library may be absent there through
+nobody's fault; when a link fails, the driver names the package and
+the library so the failure is actionable (`kai: note: package 'kohau'
+requires system library 'sqlite3'`).
+
+**One compile per shim.** Sources compile to objects cached by content
+(compiler, flags, target arch, source text, and the headers under the
+declaring package's `include` dirs). Two consumers with the same
+toolchain share one compile; a toolchain or header change re-keys. The
+cache extends the *build* cache (`nativedep/` beside the modular object
+caches), not the sha-keyed package cache — the object depends on the
+consumer's toolchain, which the package cache must not.
+
+**Diamond dedup.** Native entries are keyed by resolved package, and
+the lockfile already resolves one entry per source. When A and B both
+depend on the same shim-binding package, its shim compiles and links
+exactly once.
+
+**Scope: declarative only.** `sources`, `include`, and `libs` — no
+build scripts, no arbitrary compile flags. A build script is code
+running on the consumer's machine at install time (attack surface, a
+reproducibility hole), and free-form flags turn the manifest into a
+build system. Shim sources must be self-contained C99 compiling with
+default flags; a binding that needs detection or codegen is out of
+scope for the manifest.
+
+**Precedence.** `CFLAGS` stays the escape hatch and wins: shim
+compiles put `$CFLAGS`-derived flags before the package's own `-I`
+dirs, and a `.c` passed on `CFLAGS` still rides the link line as
+before. `KAI_NATIVE_DEPS=0` disables the whole channel, restoring the
+pre-`[native]` behaviour for A/B comparison.
+
+**Diagnostics.** A machine without a C compiler fails before anything
+compiles, with one sentence naming the packages whose shims require
+one. A link that fails while a resolved dependency ships `.c` files
+its manifest does not declare gets a note naming the package and the
+missing `[native]` contract.
+
+Both backends receive the declarations: the shim objects and `-l`
+flags join every link line (C and native alike). The `[native]` table
+is an additive `kai.toml` schema change — per `docs/editions.md`,
+additions are non-breaking, so no edition bump is involved.
 
 ## Driver commands
 
