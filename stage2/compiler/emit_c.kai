@@ -63,6 +63,8 @@ import compiler.refinements
 import compiler.infer
 import compiler.fnreg
 import compiler.modules
+import compiler.const_scope_table
+import compiler.const_scope_walk
 import compiler.native_prims
 import compiler.unbox
 import compiler.perceus
@@ -10835,35 +10837,67 @@ fn proto_dispatch_tag() : String = "__kai_proto_dispatch__"
 fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : Expr =
   mk_expr(ETodo(concat_all([proto_dispatch_tag_prefix(), pname, ":", opname])), line, col)
 
+# Everything the re-parsed body of a `#{...}` span must inherit from
+# its environment. The lift parses that span long after the whole-
+# program passes ran, so each table a pass consumed has to reach the
+# sub-tree through this record: the reading decl's segmented module
+# table (import aliases are per file) rides in `cs.mt`, the const
+# collision context is keyed by the decl's home. Growing the inherited
+# environment means growing this record, not another parameter thread.
+type InterpCtx = { op_names: [String], op_arities: [OpAr],
+                   file: String, cs: CSCtx }
+
 #[doc("Emit-layer entry point desugar_interp_decls")]
-pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [Decl] / Console + File {
+pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr],
+      global_mt: [ModuleEntry], scopes: [ModScope], coll: [CSEntry],
+      target: String, file: String) : [Decl] / Console + File {
 
   if not list_has(op_names, "show") { ds }
-  else { map(ds, (d) => desugar_interp_decl(d, op_names, op_arities, mt, file)) }
+  else { desugar_interp_decls_loop(ds, op_names, op_arities, global_mt, scopes,
+                                   coll, target, file, target, []) }
 }
 
-fn desugar_interp_decl(d: Decl, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Decl / Console + File {
+fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
+      global_mt: [ModuleEntry], scopes: [ModScope], coll: [CSEntry],
+      target: String, file: String, cur: String, acc: [Decl]) : [Decl] / Console + File {
+
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let home = cs_reader_home(d, cur, target)
+      let seg = if home == target { "" } else { home }
+      let cx = InterpCtx { op_names: op_names, op_arities: op_arities, file: file,
+                           cs: CSCtx { coll: coll, home: home, target: target,
+                                       free: false,
+                                       mt: ms_table(scopes, seg, global_mt) } }
+      desugar_interp_decls_loop(rest, op_names, op_arities, global_mt, scopes,
+                                coll, target, file, home,
+                                [desugar_interp_decl(d, cx), ...acc])
+    }
+  }
+}
+
+fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
 
   match d {
     DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, op_names, op_arities, mt, file), l, c, mo)
+      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, cx), l, c, mo)
     DTest(desc, body, l, c) ->
-      DTest(desc, desugar_interp_expr(body, op_names, op_arities, mt, file), l, c)
+      DTest(desc, desugar_interp_expr(body, cx), l, c)
     DBench(desc, body, l, c) ->
-      DBench(desc, desugar_interp_expr(body, op_names, op_arities, mt, file), l, c)
+      DBench(desc, desugar_interp_expr(body, cx), l, c)
     DCheck(desc, ps, body, l, c) ->
-      DCheck(desc, ps, desugar_interp_expr(body, op_names, op_arities, mt, file), l, c)
+      DCheck(desc, ps, desugar_interp_expr(body, cx), l, c)
     _ -> d
   }
 }
 
-fn desugar_interp_expr(e: Expr, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Expr / Console + File =
+fn desugar_interp_expr(e: Expr, cx: InterpCtx) : Expr / Console + File =
 
-  Expr { kind: desugar_interp_kind(e.kind, op_names, op_arities, mt, file, e.line, e.col),
+  Expr { kind: desugar_interp_kind(e.kind, cx, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn desugar_interp_kind(k: ExprKind, op_names: [String], op_arities: [OpAr],
-                        mt: [ModuleEntry], file: String,
+fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
                         line: Int, col: Int) : ExprKind / Console + File {
 
   match k {
@@ -10883,23 +10917,23 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String], op_arities: [OpAr],
       let body_start = if is_triple { 3 } else { 1 }
       let body_end = if is_triple { n - 3 } else { n - 1 }
       if has_interp(span, body_start, body_end) {
-        lift_interp_string(span, body_start, body_end, op_names, op_arities, mt, file, line, col)
+        lift_interp_string(span, body_start, body_end, cx, line, col)
       } else { k }
     }
     ECall(c, args_) -> match c.kind {
       EField(receiver, op_name) ->
-        if list_has(op_names, op_name) {
+        if list_has(cx.op_names, op_name) {
           let new_callee = mk_expr(EVar(proto_dispatcher_name(op_name)),
                                     c.line, c.col)
-          let new_recv   = desugar_interp_expr(receiver, op_names, op_arities, mt, file)
-          let new_args   = map(args_, (a) => desugar_interp_expr(a, op_names, op_arities, mt, file))
+          let new_recv   = desugar_interp_expr(receiver, cx)
+          let new_args   = map(args_, (a) => desugar_interp_expr(a, cx))
           ECall(new_callee, [new_recv, ...new_args])
         } else {
-          ECall(desugar_interp_expr(c, op_names, op_arities, mt, file),
-                map(args_, (a) => desugar_interp_expr(a, op_names, op_arities, mt, file)))
+          ECall(desugar_interp_expr(c, cx),
+                map(args_, (a) => desugar_interp_expr(a, cx)))
         }
-      _ -> ECall(desugar_interp_expr(c, op_names, op_arities, mt, file),
-                  map(args_, (a) => desugar_interp_expr(a, op_names, op_arities, mt, file)))
+      _ -> ECall(desugar_interp_expr(c, cx),
+                  map(args_, (a) => desugar_interp_expr(a, cx)))
     }
     # Inlined from `map_expr_kind` for issue #528 (effect-row propagation
     # blocked by stage 1's lack of row polymorphism on function-param types).
@@ -10920,143 +10954,136 @@ fn desugar_interp_kind(k: ExprKind, op_names: [String], op_arities: [OpAr],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, map(args_, (a) => desugar_interp_expr(a, op_names, op_arities, mt, file)))
+      EIntrinsic(name, map(args_, (a) => desugar_interp_expr(a, cx)))
     ESurface(sf) ->
-      ESurface(surface_rebuild(sf, map(surface_children(sf), (a) => desugar_interp_expr(a, op_names, op_arities, mt, file))))
-    EField(base, name)   -> EField(desugar_interp_expr(base, op_names, op_arities, mt, file), name)
-    EIndex(a, b)         -> EIndex(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                    desugar_interp_expr(b, op_names, op_arities, mt, file))
-    EBinop(op, a, b)     -> EBinop(op, desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                        desugar_interp_expr(b, op_names, op_arities, mt, file))
-    EUnop(op, x)         -> EUnop(op, desugar_interp_expr(x, op_names, op_arities, mt, file))
-    EIf(c, t_, eo)       -> EIf(desugar_interp_expr(c, op_names, op_arities, mt, file),
-                                  desugar_interp_expr(t_, op_names, op_arities, mt, file),
-                                  desugar_interp_expr_opt(eo, op_names, op_arities, mt, file))
-    EMatch(scr, arms)    -> EMatch(desugar_interp_expr(scr, op_names, op_arities, mt, file),
-                                     desugar_interp_arms(arms, op_names, op_arities, mt, file))
-    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, op_names, op_arities, mt, file))
-    ERecordLit(name, fs) -> ERecordLit(name, desugar_interp_fields_init(fs, op_names, op_arities, mt, file))
-    EList(els)           -> EList(desugar_interp_list_elems(els, op_names, op_arities, mt, file))
-    ERange(a, b, opt_step) -> ERange(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                       desugar_interp_expr(b, op_names, op_arities, mt, file),
-                                       desugar_interp_expr_opt(opt_step, op_names, op_arities, mt, file))
-    EBlock(stmts, tail)  -> EBlock(desugar_interp_stmts(stmts, op_names, op_arities, mt, file),
-                                     desugar_interp_expr_opt(tail, op_names, op_arities, mt, file))
-    EPipe(a, b)          -> EPipe(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                    desugar_interp_expr(b, op_names, op_arities, mt, file))
-    EMapPipe(a, b)       -> EMapPipe(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                       desugar_interp_expr(b, op_names, op_arities, mt, file))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                            desugar_interp_expr(b, op_names, op_arities, mt, file))
-    EFilterPipe(a, b)    -> EFilterPipe(desugar_interp_expr(a, op_names, op_arities, mt, file),
-                                           desugar_interp_expr(b, op_names, op_arities, mt, file))
+      ESurface(surface_rebuild(sf, map(surface_children(sf), (a) => desugar_interp_expr(a, cx))))
+    EField(base, name)   -> EField(desugar_interp_expr(base, cx), name)
+    EIndex(a, b)         -> EIndex(desugar_interp_expr(a, cx),
+                                    desugar_interp_expr(b, cx))
+    EBinop(op, a, b)     -> EBinop(op, desugar_interp_expr(a, cx),
+                                        desugar_interp_expr(b, cx))
+    EUnop(op, x)         -> EUnop(op, desugar_interp_expr(x, cx))
+    EIf(c, t_, eo)       -> EIf(desugar_interp_expr(c, cx),
+                                  desugar_interp_expr(t_, cx),
+                                  desugar_interp_expr_opt(eo, cx))
+    EMatch(scr, arms)    -> EMatch(desugar_interp_expr(scr, cx),
+                                     desugar_interp_arms(arms, cx))
+    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, cx))
+    ERecordLit(name, fs) -> ERecordLit(name, desugar_interp_fields_init(fs, cx))
+    EList(els)           -> EList(desugar_interp_list_elems(els, cx))
+    ERange(a, b, opt_step) -> ERange(desugar_interp_expr(a, cx),
+                                       desugar_interp_expr(b, cx),
+                                       desugar_interp_expr_opt(opt_step, cx))
+    EBlock(stmts, tail)  -> EBlock(desugar_interp_stmts(stmts, cx),
+                                     desugar_interp_expr_opt(tail, cx))
+    EPipe(a, b)          -> EPipe(desugar_interp_expr(a, cx),
+                                    desugar_interp_expr(b, cx))
+    EMapPipe(a, b)       -> EMapPipe(desugar_interp_expr(a, cx),
+                                       desugar_interp_expr(b, cx))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(desugar_interp_expr(a, cx),
+                                            desugar_interp_expr(b, cx))
+    EFilterPipe(a, b)    -> EFilterPipe(desugar_interp_expr(a, cx),
+                                           desugar_interp_expr(b, cx))
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_interp_expr(body, op_names, op_arities, mt, file), eff_name, eff_tyargs,
-              desugar_interp_expr_opt(init_opt, op_names, op_arities, mt, file), alias_opt,
-              desugar_interp_hclauses(clauses, op_names, op_arities, mt, file),
-              desugar_interp_hreturn_opt(ret_opt, op_names, op_arities, mt, file))
-    ELitUnit(inner, u)   -> ELitUnit(desugar_interp_expr(inner, op_names, op_arities, mt, file), u)
-    EBang(inner)         -> EBang(desugar_interp_expr(inner, op_names, op_arities, mt, file))
+      EHandle(desugar_interp_expr(body, cx), eff_name, eff_tyargs,
+              desugar_interp_expr_opt(init_opt, cx), alias_opt,
+              desugar_interp_hclauses(clauses, cx),
+              desugar_interp_hreturn_opt(ret_opt, cx))
+    ELitUnit(inner, u)   -> ELitUnit(desugar_interp_expr(inner, cx), u)
+    EBang(inner)         -> EBang(desugar_interp_expr(inner, cx))
   }
 }
 
 # Issue #528 helpers for `desugar_interp_kind` — direct walkers that
 # replace the `map_expr_kind` HOF call. Stage 1 cannot parse row
 # polymorphism on function-param types.
-
-# Issue #528 helpers for `desugar_interp_kind` — direct walkers that
-# replace the `map_expr_kind` HOF call. Stage 1 cannot parse row
-# polymorphism on function-param types.
-fn desugar_interp_expr_opt(opt: Option[Expr], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Option[Expr] / Console + File = match opt {
+fn desugar_interp_expr_opt(opt: Option[Expr], cx: InterpCtx) : Option[Expr] / Console + File = match opt {
   None    -> None
-  Some(x) -> Some(desugar_interp_expr(x, op_names, op_arities, mt, file))
+  Some(x) -> Some(desugar_interp_expr(x, cx))
 }
 
-fn desugar_interp_arms(arms: [Arm], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [Arm] / Console + File = match arms {
+fn desugar_interp_arms(arms: [Arm], cx: InterpCtx) : [Arm] / Console + File = match arms {
   []           -> []
-  [h, ...rest] -> [desugar_interp_arm(h, op_names, op_arities, mt, file),
-                   ...desugar_interp_arms(rest, op_names, op_arities, mt, file)]
+  [h, ...rest] -> [desugar_interp_arm(h, cx), ...desugar_interp_arms(rest, cx)]
 }
 
-fn desugar_interp_arm(a: Arm, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Arm / Console + File = match a {
+fn desugar_interp_arm(a: Arm, cx: InterpCtx) : Arm / Console + File = match a {
   Arm(pat, guard_opt, body) ->
     Arm(pat,
-        desugar_interp_expr_opt(guard_opt, op_names, op_arities, mt, file),
-        desugar_interp_expr(body, op_names, op_arities, mt, file))
+        desugar_interp_expr_opt(guard_opt, cx),
+        desugar_interp_expr(body, cx))
 }
 
-fn desugar_interp_fields_init(fs: [FieldInit], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [FieldInit] / Console + File = match fs {
+fn desugar_interp_fields_init(fs: [FieldInit], cx: InterpCtx) : [FieldInit] / Console + File = match fs {
   []           -> []
-  [h, ...rest] -> [desugar_interp_field_init(h, op_names, op_arities, mt, file),
-                   ...desugar_interp_fields_init(rest, op_names, op_arities, mt, file)]
+  [h, ...rest] -> [desugar_interp_field_init(h, cx),
+                   ...desugar_interp_fields_init(rest, cx)]
 }
 
-fn desugar_interp_field_init(fi: FieldInit, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : FieldInit / Console + File = match fi {
-  FI(name, e) -> FI(name, desugar_interp_expr(e, op_names, op_arities, mt, file))
+fn desugar_interp_field_init(fi: FieldInit, cx: InterpCtx) : FieldInit / Console + File = match fi {
+  FI(name, e) -> FI(name, desugar_interp_expr(e, cx))
 }
 
-fn desugar_interp_list_elems(els: [ListElem], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [ListElem] / Console + File = match els {
+fn desugar_interp_list_elems(els: [ListElem], cx: InterpCtx) : [ListElem] / Console + File = match els {
   []           -> []
-  [h, ...rest] -> [desugar_interp_list_elem(h, op_names, op_arities, mt, file),
-                   ...desugar_interp_list_elems(rest, op_names, op_arities, mt, file)]
+  [h, ...rest] -> [desugar_interp_list_elem(h, cx),
+                   ...desugar_interp_list_elems(rest, cx)]
 }
 
-fn desugar_interp_list_elem(el: ListElem, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : ListElem / Console + File = match el {
-  ElPlain(e)  -> ElPlain(desugar_interp_expr(e, op_names, op_arities, mt, file))
-  ElSpread(e) -> ElSpread(desugar_interp_expr(e, op_names, op_arities, mt, file))
+fn desugar_interp_list_elem(el: ListElem, cx: InterpCtx) : ListElem / Console + File = match el {
+  ElPlain(e)  -> ElPlain(desugar_interp_expr(e, cx))
+  ElSpread(e) -> ElSpread(desugar_interp_expr(e, cx))
 }
 
-fn desugar_interp_stmts(ss: [Stmt], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [Stmt] / Console + File = match ss {
+fn desugar_interp_stmts(ss: [Stmt], cx: InterpCtx) : [Stmt] / Console + File = match ss {
   []           -> []
-  [h, ...rest] -> [desugar_interp_stmt(h, op_names, op_arities, mt, file),
-                   ...desugar_interp_stmts(rest, op_names, op_arities, mt, file)]
+  [h, ...rest] -> [desugar_interp_stmt(h, cx), ...desugar_interp_stmts(rest, cx)]
 }
 
-fn desugar_interp_stmt(s: Stmt, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Stmt / Console + File = match s {
-  SLet(p, ann, rhs) -> SLet(p, ann, desugar_interp_expr(rhs, op_names, op_arities, mt, file))
-  SAssert(e, msg_opt) -> SAssert(desugar_interp_expr(e, op_names, op_arities, mt, file),
-                                  desugar_interp_expr_opt(msg_opt, op_names, op_arities, mt, file))
-  SExprStmt(e) -> SExprStmt(desugar_interp_expr(e, op_names, op_arities, mt, file))
+fn desugar_interp_stmt(s: Stmt, cx: InterpCtx) : Stmt / Console + File = match s {
+  SLet(p, ann, rhs) -> SLet(p, ann, desugar_interp_expr(rhs, cx))
+  SAssert(e, msg_opt) -> SAssert(desugar_interp_expr(e, cx),
+                                  desugar_interp_expr_opt(msg_opt, cx))
+  SExprStmt(e) -> SExprStmt(desugar_interp_expr(e, cx))
   SIndexAssign(arr, idx, rhs, ln, cl) ->
-    SIndexAssign(desugar_interp_expr(arr, op_names, op_arities, mt, file),
-                  desugar_interp_expr(idx, op_names, op_arities, mt, file),
-                  desugar_interp_expr(rhs, op_names, op_arities, mt, file), ln, cl)
+    SIndexAssign(desugar_interp_expr(arr, cx),
+                  desugar_interp_expr(idx, cx),
+                  desugar_interp_expr(rhs, cx), ln, cl)
   SAssign(lhs, rhs, ln, cl) ->
-    SAssign(desugar_interp_expr(lhs, op_names, op_arities, mt, file),
-             desugar_interp_expr(rhs, op_names, op_arities, mt, file), ln, cl)
-  SVar(name, ann, rhs, ln, cl) -> SVar(name, ann, desugar_interp_expr(rhs, op_names, op_arities, mt, file), ln, cl)
+    SAssign(desugar_interp_expr(lhs, cx),
+             desugar_interp_expr(rhs, cx), ln, cl)
+  SVar(name, ann, rhs, ln, cl) -> SVar(name, ann, desugar_interp_expr(rhs, cx), ln, cl)
   SUse(_, _, _) -> s
 }
 
-fn desugar_interp_hclauses(cs: [HClause], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : [HClause] / Console + File = match cs {
+fn desugar_interp_hclauses(cs: [HClause], cx: InterpCtx) : [HClause] / Console + File = match cs {
   []           -> []
-  [h, ...rest] -> [desugar_interp_hclause(h, op_names, op_arities, mt, file),
-                   ...desugar_interp_hclauses(rest, op_names, op_arities, mt, file)]
+  [h, ...rest] -> [desugar_interp_hclause(h, cx),
+                   ...desugar_interp_hclauses(rest, cx)]
 }
 
-fn desugar_interp_hclause(c: HClause, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : HClause / Console + File = match c {
+fn desugar_interp_hclause(c: HClause, cx: InterpCtx) : HClause / Console + File = match c {
   HC(op_name, ps, body, ln, cl) ->
-    HC(op_name, ps, desugar_interp_expr(body, op_names, op_arities, mt, file), ln, cl)
+    HC(op_name, ps, desugar_interp_expr(body, cx), ln, cl)
 }
 
-fn desugar_interp_hreturn_opt(opt: Option[HReturn], op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : Option[HReturn] / Console + File = match opt {
+fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HReturn] / Console + File = match opt {
   None    -> None
-  Some(r) -> Some(desugar_interp_hreturn(r, op_names, op_arities, mt, file))
+  Some(r) -> Some(desugar_interp_hreturn(r, cx))
 }
 
-fn desugar_interp_hreturn(r: HReturn, op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String) : HReturn / Console + File = match r {
-  HR(name, body, ln, cl) -> HR(name, desugar_interp_expr(body, op_names, op_arities, mt, file), ln, cl)
+fn desugar_interp_hreturn(r: HReturn, cx: InterpCtx) : HReturn / Console + File = match r {
+  HR(name, body, ln, cl) -> HR(name, desugar_interp_expr(body, cx), ln, cl)
 }
 
 fn lift_interp_string(span: String, body_start: Int, body_end: Int,
-                       op_names: [String], op_arities: [OpAr], mt: [ModuleEntry], file: String,
-                       line: Int, col: Int) : ExprKind / Console + File {
+                       cx: InterpCtx, line: Int, col: Int) : ExprKind / Console + File {
 
   let parts = iscan_collect(span, body_end,
                              IScan { parts: [], lit_start: body_start, i: body_start })
   # `body_start` chars of the literal's opening delimiter sit before the body.
   let part_exprs = interp_parts_to_exprs(parts, InterpPos { line: line, col: col + body_start },
-                                          op_names, op_arities, mt, file, line, col)
+                                          cx, line, col)
   ECall(mk_expr(EVar("string_concat_all"), line, col),
         [mk_expr(EList(map(part_exprs, (e: Expr) => ElPlain(e))), line, col)])
 }
@@ -11080,14 +11107,12 @@ fn interp_pos_advance(p: InterpPos, s: String, i: Int) : InterpPos {
 # Walk the parts in source order so each interpolated expression is rebased
 # onto the position it really occupies. A literal advances by its own text;
 # an interpolation advances by its body plus the `#{` and `}` around it.
-fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos,
-                          op_names: [String], op_arities: [OpAr],
-                          mt: [ModuleEntry], file: String,
+fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos, cx: InterpCtx,
                           line: Int, col: Int) : [Expr] / Console + File {
   match parts {
     [] -> []
     [p, ...rest] -> {
-      let e = interp_part_to_expr(p, pos, op_names, op_arities, mt, file, line, col)
+      let e = interp_part_to_expr(p, pos, cx, line, col)
       let next = match p {
         IpLit(piece, _) -> interp_pos_advance(pos, piece, 0)
         # `#{` before the body, `}` after it.
@@ -11096,13 +11121,12 @@ fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos,
           InterpPos { line: after.line, col: after.col + 1 }
         }
       }
-      [e, ...interp_parts_to_exprs(rest, next, op_names, op_arities, mt, file, line, col)]
+      [e, ...interp_parts_to_exprs(rest, next, cx, line, col)]
     }
   }
 }
 
-fn interp_part_to_expr(p: IPart, pos: InterpPos, op_names: [String], op_arities: [OpAr],
-                        mt: [ModuleEntry], file: String,
+fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
                         line: Int, col: Int) : Expr / Console + File {
 
   match p {
@@ -11116,7 +11140,15 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, op_names: [String], op_arities:
         # interp desugar. Without this step `list.sum(xs)` and other
         # `mod.fn(args)` shapes inside `#{...}` skip the rewrite the
         # rest of the program goes through and surface to the typer
-        # as an unresolved EField on a module-name EVar.
+        # as an unresolved EField on a module-name EVar. The table is
+        # the reading decl's segmented one, so a per-file import
+        # alias resolves here just as it does outside the span.
+        #
+        # `cs_expr` keys a qualified read of a colliding pub const
+        # before rqc can collapse its uppercase form to a bare EVar
+        # (the variant-ctor rule). Free reads are left alone (`free`
+        # off): the driver re-runs the full const_scope pass over the
+        # lifted stream, where lexical scope is tracked.
         #
         # Issue #443: the protocol-call rewriter that turns
         # `EVar("eq")` into `EVar("__proto_eq")` runs inside
@@ -11127,8 +11159,10 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, op_names: [String], op_arities:
         # references go through the same arity-aware, scope-aware
         # rewrite the rest of the program got.
         Some(e) -> desugar_interp_expr(
-                     rqc_expr(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)), [], mt, file),
-                     op_names, op_arities, mt, file)
+                     rqc_expr(cs_expr(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)),
+                                      [], cx.cs),
+                              [], cx.cs.mt, cx.file),
+                     cx)
         None    -> mk_expr(EStr("\"\"", false), line, col)
       }
       # The post-rename dispatcher name (`__proto_show`) bypasses the

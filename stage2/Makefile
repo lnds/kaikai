@@ -547,7 +547,7 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope pub_unit_scope const_home_scope
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope pub_unit_scope const_home_scope interp_const_scope
 QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign pub_unit_bare_ambiguous pub_unit_cross_module
 
 test-modules-qualified: $(TARGET) build
