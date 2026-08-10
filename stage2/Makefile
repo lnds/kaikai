@@ -547,7 +547,7 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed
 QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative
 
 test-modules-qualified: $(TARGET) build
@@ -1074,7 +1074,7 @@ test-numeric-bigint-native: $(TARGET) build
 # test-numeric-decimal-rational-native.
 test-numeric-decimal-rational: $(TARGET) build
 	@set -e; \
-	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators; do \
+	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators import_alias_clash; do \
 	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	./build/$$f-c > build/$$f.out; \
@@ -1088,7 +1088,7 @@ test-numeric-decimal-rational: $(TARGET) build
 # invoked from the tier1-native workflow.
 test-numeric-decimal-rational-native: $(TARGET) build
 	@set -e; \
-	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators; do \
+	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators import_alias_clash; do \
 	KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
 	|| { echo "decimal-rational $$f FAIL (native build errored)"; cat build/$$f-nat.err; exit 1; }; \
 	./build/$$f-nat > build/$$f-nat.out; \

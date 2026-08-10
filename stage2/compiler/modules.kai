@@ -312,10 +312,69 @@ pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = ma
 }
 
 
+# Find an already-registered entry by the file it was loaded from.
+# A file reached twice under two surface names owns one set of
+# exports; the second importer re-keys those exports under its own
+# binding rather than re-reading the file.
+pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(_, _, origin, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
+    }
+  }
+}
+
+# The import bindings one file wrote, keyed by the module that wrote
+# them. An import alias is scoped to its file: two files may bind the
+# same module under different names, and neither name is visible in
+# the other. The empty module name owns the root file's imports.
+#
+# A scope entry is keyed by the name its file wrote, which under an
+# alias is not the name the module's decls were tagged with. Only these
+# per-file entries may carry an alias — the global table stays keyed by
+# tagged names, or `me_emit_name` could not tell the two apart.
+pub type ModScope = MScope(String, [ModuleEntry])
+
+# The qualifier table a decl from `home` resolves through: that
+# module's own imports, else the global table. The fallback carries
+# the names every file sees without importing them (auto-loaded core
+# modules), which no per-file import list records.
+#
+# Alias entries come first, so a written name resolves to the file its
+# own module meant. They keep that file's origin path, which is what
+# lets `me_emit_name` recover the name codegen minted symbols under.
+pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [ModuleEntry] =
+  match scopes {
+    [] -> global
+    [MScope(m, mt), ...rest] ->
+      if m == home { list_append(mt, global) } else { ms_table(rest, home, global) }
+  }
+
+
 fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
   Some(c) -> c >= 'A' and c <= 'Z'
   None    -> false
 }
+
+# The module name an EModCall must carry: the one the module's decls
+# were tagged with, which is what codegen keys symbols by. A file
+# reached under an alias appears in the table more than once, sharing
+# an origin path; the tagged name is the one on the entry the resolver
+# registered globally, which per-file alias entries are prepended to.
+# Scanning from the end finds it regardless of how many aliases name
+# the same file.
+fn me_emit_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String =
+  match me {
+    ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
+  }
+
+fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
+  match mt {
+    [] -> acc
+    [ME(n, _, o, _), ...rest] ->
+      me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
+  }
 
 fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
   ME(_, exports, _, _) ->
@@ -1284,7 +1343,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
             if name_starts_upper(fname) and me_has_export(me, fname) {
               EVar(fname)
             } else { match me_lookup_export(me, fname) {
-              Some(actual) -> EModCall(name, actual)
+              Some(actual) -> EModCall(me_emit_name(mt, me, name), actual)
               None -> {
                 # Imported module, missing export.
                 # Emit specific error before falling back to EField
@@ -1733,6 +1792,61 @@ pub type CoreSegment = PSeg(String, [Decl])
 # validator can slice the stream back into per-module segments. An
 # empty module name marks decls that belong to the root file.
 pub type ImportSeg = ISeg(String, Int)
+
+# Segment-aware variants of the qualifier passes. The flat decl stream
+# mixes modules, and a qualifier only means what the file that wrote it
+# declared, so each segment resolves under its own module's imports
+# instead of one shared table.
+pub fn rqc_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String, file: String)
+      : [Decl] / Console + File = match segs {
+  # Past the marks lie the root file's own decls, which resolve
+  # through the root scope (recorded under "").
+  [] -> rqc_decls(decls, ms_table(scopes, "", global), file)
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let mt = ms_table(scopes, home, global)
+    list_append(rqc_decls(seg_take(decls, n), mt, file),
+                rqc_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, file))
+  }
+}
+
+pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String, file: String)
+      : [Decl] / Console + File = match segs {
+  [] -> qualtype_decls(decls, ms_table(scopes, "", global), file)
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let mt = ms_table(scopes, home, global)
+    list_append(qualtype_decls(seg_take(decls, n), mt, file),
+                qualtype_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, file))
+  }
+}
+
+pub fn qtchk_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String) : Int = match segs {
+  [] -> qtchk_decls(decls, ms_table(scopes, "", global))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let mt = ms_table(scopes, home, global)
+    qtchk_decls(seg_take(decls, n), mt) +
+      qtchk_segmented(rest, seg_drop(decls, n), scopes, global, target_mod)
+  }
+}
+
+fn seg_take(ds: [Decl], n: Int) : [Decl] =
+  if n <= 0 { [] }
+  else { match ds {
+    [] -> []
+    [d, ...rest] -> [d, ...seg_take(rest, n - 1)]
+  } }
+
+fn seg_drop(ds: [Decl], n: Int) : [Decl] =
+  if n <= 0 { ds }
+  else { match ds {
+    [] -> []
+    [_, ...rest] -> seg_drop(rest, n - 1)
+  } }
 
 # When a DFn carries `mo = Some(m)`, switch the running home to
 # `m`. When it carries `mo = None` (root-file decl after the
