@@ -90,6 +90,7 @@ import compiler.diag_file
 import compiler.kinds
 import compiler.diag
 import compiler.util
+import compiler.fnreg
 import compiler.impl_index
 import compiler.modules
 import compiler.proto_scope
@@ -354,7 +355,7 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 
 fn proto_reg_empty() : ProtocolReg =
   ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
-                impl_index: impl_index_empty() }
+                dkeys: [], impl_index: impl_index_empty() }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -442,6 +443,7 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
           ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
           tparams: [PTPR(name, tparams, mo), ...reg.tparams],
           origins: [PrOR(name, mo, is_pub), ...reg.origins],
+          dkeys: reg.dkeys,
           impl_index: reg.impl_index
         }
         collect_proto_decls(rest, register_proto_ops(reg1, name, mo, ops))
@@ -477,6 +479,7 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
           op_names: names1,
           tparams: reg.tparams,
           origins: reg.origins,
+          dkeys: reg.dkeys,
           impl_index: reg.impl_index
         }
         register_proto_ops(reg1, proto, mo, rest)
@@ -772,19 +775,6 @@ fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
     [] -> acc
     [op, ...rest] -> match op {
       POR(_, name, _, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
-    }
-  }
-}
-
-# Look up the protocol's tparam names (the `[a]` in `protocol Add[a]`)
-# by bare name — first match wins. Rewrite-path callers have no module
-# context; validation resolves the home and uses `proto_scope_tparams`.
-fn proto_tparams_for(tps: [ProtoTPReg], pname: String) : [String] {
-  match tps {
-    [] -> []
-    [t, ...rest] -> match t {
-      PTPR(p, names, _) ->
-        if p == pname { names } else { proto_tparams_for(rest, pname) }
     }
   }
 }
@@ -1088,7 +1078,8 @@ fn tparam_subst(n: String, tps: [String], heads: [String],
 # (b) record (P, T) -> impl_fn_name in the registry. The fn body is
 # the impl's original body verbatim; we only rename the function and
 # leave the typer to do its work on the result.
-fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
+fn lower_impls(ds: [Decl], reg: ProtocolReg, target_mod: String,
+               acc_fns: [Decl]) : LowerImplsRes {
   match ds {
     [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
     [d, ...rest] -> match d {
@@ -1100,24 +1091,48 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
           [] -> []
           _  -> map(proto_args, proto_type_name)
         }
-        let r = lower_impl_methods(pname, tname, arg_names, methods, reg, acc_fns)
-        lower_impls(rest, r.reg, r.fns)
+        # The impl's dispatch key: resolve `pname` from the impl's own
+        # module, then spell it. Unresolved protocols keep the bare
+        # name — `validate_impls` has already reported them.
+        let from = impl_home_of(methods, target_mod)
+        let key = match proto_scope_resolve(reg.origins, pname, from) {
+          PRHome(ph) -> proto_key_of(reg.dkeys, pname, ph)
+          _ -> pname
+        }
+        let r = lower_impl_methods(key, tname, arg_names, methods, reg, acc_fns)
+        lower_impls(rest, r.reg, target_mod, r.fns)
       }
-      DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
-      DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
-      DProtoLaws(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
-      DImplAxiom(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
-      DConstructor(inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
-      _ -> lower_impls(rest, reg, acc_fns)
+      DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, target_mod, acc_fns)
+      DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, target_mod, acc_fns)
+      DProtoLaws(_, inner, _, _) -> lower_impls([inner, ...rest], reg, target_mod, acc_fns)
+      DImplAxiom(_, inner, _, _) -> lower_impls([inner, ...rest], reg, target_mod, acc_fns)
+      DConstructor(inner, _, _) -> lower_impls([inner, ...rest], reg, target_mod, acc_fns)
+      _ -> lower_impls(rest, reg, target_mod, acc_fns)
     }
   }
 }
 
+# The module an impl block lives in, read off its first method's
+# origin stamp (the cascade tags every method with the enclosing
+# module). Root-file impls carry no stamp, or the root's own name.
+fn impl_home_of(methods: [Decl], target_mod: String) : Option[String] =
+  match methods {
+    [] -> None
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+        Some(m) -> if m == target_mod { None } else { Some(m) }
+        None    -> None
+      }
+      _ -> impl_home_of(rest, target_mod)
+    }
+  }
+
 type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
 
 # `acc_fns` accumulates in reverse; the caller list_reverses on
-# return.
-fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
+# return. `pkey` is the impl's protocol dispatch key, not necessarily
+# the surface name — mangling and the PIR entry both carry it.
+fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
                       methods: [Decl],
                       reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match methods {
@@ -1128,21 +1143,22 @@ fn lower_impl_methods(pname: String, tname: String, arg_names: [String],
         # the mangled name. The default-Self form keeps the legacy
         # mangling so `impl Add for Complex` and `impl Add[Complex] for
         # Complex` produce the same impl-fn name.
-        let mangled = proto_impl_mangled_with_args(pname, tname, op_name, arg_names)
+        let mangled = proto_impl_mangled_with_args(pkey, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
         let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
-        let entry = PIR(pname, tname, op_name, mangled, arg_names, ret_head)
+        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head)
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
           op_names: reg.op_names,
           tparams: reg.tparams,
           origins: reg.origins,
+          dkeys: reg.dkeys,
           impl_index: reg.impl_index
         }
-        lower_impl_methods(pname, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(pkey, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
-      _ -> lower_impl_methods(pname, tname, arg_names, rest, reg, acc_fns)
+      _ -> lower_impl_methods(pkey, tname, arg_names, rest, reg, acc_fns)
     }
   }
 }
@@ -3373,9 +3389,10 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
 #[doc("Result of pass A: the decl stream with impls lowered, the threaded ProtocolReg, and an error count.")]
 pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int }
 
-#[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls.")]
+#[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls. `cores` names the stdlib core modules, whose protocols keep their bare dispatch identity.")]
 pub fn lower_protocols(decls: [Decl], df: DiagFiles,
-                     target_mod: String) : LoweredProtocols / Console {
+                     target_mod: String,
+                     cores: [String]) : LoweredProtocols / Console {
 
   # Step 0 — m12.8.x: validate `#derive(Eq/Hash)` on sum types: every
   # variant field's head type must already have an impl reachable in
@@ -3404,7 +3421,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # stream also scopes the impl validations below, so it is computed
   # once here.
   let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
-  let reg0 = collect_proto_decls(expanded, proto_reg_empty())
+  let reg0 = reg_with_dkeys(collect_proto_decls(expanded, proto_reg_empty()), cores)
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
@@ -3420,7 +3437,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   let errs = pre_errs + derive_errs + coh_errs + impl_errs
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
   # name) and record the (P, T) -> impl_fn entry in the registry.
-  let lower_res = lower_impls(expanded, reg0, [])
+  let lower_res = lower_impls(expanded, reg0, target_mod, [])
   # Step 5 — synthesise one dispatcher fn per protocol op so the
   # typer can resolve the call as ordinary polymorphic dispatch; the
   # post-inference rewrite redirects each reachable call to the
@@ -3470,7 +3487,14 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
 fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins,
+                dkeys: reg.dkeys,
                 impl_index: build_impl_index(reg.impls) }
+
+fn reg_with_dkeys(reg: ProtocolReg, cores: [String]) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins,
+                dkeys: proto_dispatch_keys(reg.origins, cores),
+                impl_index: reg.impl_index }
 
 # m12.8 + resolver-arity: pre-resolve renaming pass. Walks every DFn /
 # DTest body and rewrites every `EVar(name)` whose name is a known
@@ -4184,23 +4208,27 @@ pub fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg,
 #[doc("Per-decl hook of pass B; the N2 monomorph lane imports this to rewrite during monomorphisation.")]
 pub fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg,
                                  local_arities: [OpAr]) : Decl {
+  # The decl's own module scopes which protocols its calls may
+  # dispatch against (`proto_visible_from`); tests and benches are
+  # root-file constructs and see everything.
   match d {
     DFn(pub_, n, tps, ps, ret, row, body, l, c, mo) ->
       DFn(pub_, n, tps, ps, ret, row,
-          resolve_protocol_calls_expr(body, reg, local_arities), l, c, mo)
+          resolve_protocol_calls_expr(body, reg, local_arities, mo), l, c, mo)
     DTest(desc, body, l, c) ->
-      DTest(desc, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
+      DTest(desc, resolve_protocol_calls_expr(body, reg, local_arities, None), l, c)
     DBench(desc, body, l, c) ->
-      DBench(desc, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
+      DBench(desc, resolve_protocol_calls_expr(body, reg, local_arities, None), l, c)
     DCheck(desc, ps, body, l, c) ->
-      DCheck(desc, ps, resolve_protocol_calls_expr(body, reg, local_arities), l, c)
+      DCheck(desc, ps, resolve_protocol_calls_expr(body, reg, local_arities, None), l, c)
     _ -> d
   }
 }
 
 fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg,
-                                 local_arities: [OpAr]) : Expr {
-  let new_kind = resolve_protocol_calls_kind(e.kind, reg, local_arities,
+                                 local_arities: [OpAr],
+                                 cm: Option[String]) : Expr {
+  let new_kind = resolve_protocol_calls_kind(e.kind, reg, local_arities, cm,
                                                e.ty, e.line, e.col)
   # Issue #180: a `Real + Complex` binop was typed by the generic
   # dispatcher as `Self` (the LHS head, Real) — wrong, the heterogeneous
@@ -4257,6 +4285,7 @@ fn impl_ret_head_by_sym(impls: [ProtoImplReg], sym: String) : String {
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
                                 local_arities: [OpAr],
+                                cm: Option[String],
                                 ret_ty: Option[Ty],
                                 line: Int, col: Int) : ExprKind {
   match k {
@@ -4266,14 +4295,14 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     # other kinds recurse purely structurally — there is no scope
     # bookkeeping at this stage.
     ECall(callee, args_) -> {
-      let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg, local_arities))
-      let new_callee = resolve_protocol_calls_expr(callee, reg, local_arities)
+      let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg, local_arities, cm))
+      let new_callee = resolve_protocol_calls_expr(callee, reg, local_arities, cm)
       # Issue #180: pass the call's inferred return type so dispatchers
       # whose only Self informant is the return position (e.g.
       # `from(x) : Self` against a `let x : T = from(...)` annotation)
       # can resolve `Self` from that pin.
       let rewritten = try_rewrite_proto_call_with_ret(new_callee, new_args,
-                                                       reg, local_arities, ret_ty)
+                                                       reg, local_arities, cm, ret_ty)
       match rewritten {
         Some(rk) -> rk
         None     -> ECall(new_callee, new_args)
@@ -4286,11 +4315,11 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     # structural types (no custom impl — the common case, e.g. the
     # compiler's own Expr/Stmt) keep the builtin EBinop unchanged.
     EBinop(op, l, r) -> {
-      let nl = resolve_protocol_calls_expr(l, reg, local_arities)
-      let nr = resolve_protocol_calls_expr(r, reg, local_arities)
+      let nl = resolve_protocol_calls_expr(l, reg, local_arities, cm)
+      let nr = resolve_protocol_calls_expr(r, reg, local_arities, cm)
       prc_rewrite_cmp_binop(op, nl, nr, reg)
     }
-    _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, local_arities))
+    _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, local_arities, cm))
   }
 }
 
@@ -4410,15 +4439,17 @@ pub fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
   match ds {
     [] -> errs
     [d, ...rest] -> {
+      # The decl's module scopes which protocols may clear its
+      # residual dispatcher calls, mirroring the rewrite.
       let e1 = match d {
-        DFn(_, _, _, _, _, _, body, _, _, _) ->
-          validate_resolved_expr(body, reg, file, errs)
+        DFn(_, _, _, _, _, _, body, _, _, mo) ->
+          validate_resolved_expr(body, reg, mo, file, errs)
         DTest(_, body, _, _) ->
-          validate_resolved_expr(body, reg, file, errs)
+          validate_resolved_expr(body, reg, None, file, errs)
         DBench(_, body, _, _) ->
-          validate_resolved_expr(body, reg, file, errs)
+          validate_resolved_expr(body, reg, None, file, errs)
         DCheck(_, _, body, _, _) ->
-          validate_resolved_expr(body, reg, file, errs)
+          validate_resolved_expr(body, reg, None, file, errs)
         _ -> errs
       }
       validate_resolved_decls(rest, reg, file, e1)
@@ -4426,38 +4457,38 @@ pub fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
   }
 }
 
-fn validate_resolved_expr(e: Expr, reg: ProtocolReg, file: String,
+fn validate_resolved_expr(e: Expr, reg: ProtocolReg, cm: Option[String], file: String,
                            errs: Int) : Int / Console + File {
 
 
-  let e1 = validate_proto_call_at(e, reg, file, errs)
-  validate_resolved_kind(e.kind, reg, file, e1)
+  let e1 = validate_proto_call_at(e, reg, cm, file, errs)
+  validate_resolved_kind(e.kind, reg, cm, file, e1)
 }
 
-fn validate_resolved_opt(o: Option[Expr], reg: ProtocolReg, file: String,
+fn validate_resolved_opt(o: Option[Expr], reg: ProtocolReg, cm: Option[String], file: String,
                           errs: Int) : Int / Console + File {
 
 
   match o {
-    Some(e) -> validate_resolved_expr(e, reg, file, errs)
+    Some(e) -> validate_resolved_expr(e, reg, cm, file, errs)
     None    -> errs
   }
 }
 
-fn validate_resolved_exprs(es: [Expr], reg: ProtocolReg, file: String,
+fn validate_resolved_exprs(es: [Expr], reg: ProtocolReg, cm: Option[String], file: String,
                             errs: Int) : Int / Console + File {
 
 
   match es {
     [] -> errs
     [e, ...rest] -> {
-      let e1 = validate_resolved_expr(e, reg, file, errs)
-      validate_resolved_exprs(rest, reg, file, e1)
+      let e1 = validate_resolved_expr(e, reg, cm, file, errs)
+      validate_resolved_exprs(rest, reg, cm, file, e1)
     }
   }
 }
 
-fn validate_resolved_arms(arms: [Arm], reg: ProtocolReg, file: String,
+fn validate_resolved_arms(arms: [Arm], reg: ProtocolReg, cm: Option[String], file: String,
                            errs: Int) : Int / Console + File {
 
 
@@ -4465,15 +4496,15 @@ fn validate_resolved_arms(arms: [Arm], reg: ProtocolReg, file: String,
     [] -> errs
     [a, ...rest] -> match a {
       Arm(_, g, b) -> {
-        let e1 = validate_resolved_opt(g, reg, file, errs)
-        let e2 = validate_resolved_expr(b, reg, file, e1)
-        validate_resolved_arms(rest, reg, file, e2)
+        let e1 = validate_resolved_opt(g, reg, cm, file, errs)
+        let e2 = validate_resolved_expr(b, reg, cm, file, e1)
+        validate_resolved_arms(rest, reg, cm, file, e2)
       }
     }
   }
 }
 
-fn validate_resolved_stmts(ss: [Stmt], reg: ProtocolReg, file: String,
+fn validate_resolved_stmts(ss: [Stmt], reg: ProtocolReg, cm: Option[String], file: String,
                             errs: Int) : Int / Console + File {
 
 
@@ -4481,31 +4512,31 @@ fn validate_resolved_stmts(ss: [Stmt], reg: ProtocolReg, file: String,
     [] -> errs
     [s, ...rest] -> {
       let e1 = match s {
-        SLet(_, _, rhs) -> validate_resolved_expr(rhs, reg, file, errs)
+        SLet(_, _, rhs) -> validate_resolved_expr(rhs, reg, cm, file, errs)
         SAssert(c, m) -> {
-          let x = validate_resolved_expr(c, reg, file, errs)
-          validate_resolved_opt(m, reg, file, x)
+          let x = validate_resolved_expr(c, reg, cm, file, errs)
+          validate_resolved_opt(m, reg, cm, file, x)
         }
-        SExprStmt(x) -> validate_resolved_expr(x, reg, file, errs)
+        SExprStmt(x) -> validate_resolved_expr(x, reg, cm, file, errs)
         SIndexAssign(b, i, v, _, _) -> {
-          let x = validate_resolved_expr(b, reg, file, errs)
-          let y = validate_resolved_expr(i, reg, file, x)
-          validate_resolved_expr(v, reg, file, y)
+          let x = validate_resolved_expr(b, reg, cm, file, errs)
+          let y = validate_resolved_expr(i, reg, cm, file, x)
+          validate_resolved_expr(v, reg, cm, file, y)
         }
         SAssign(b, v, _, _) -> {
-          let x = validate_resolved_expr(b, reg, file, errs)
-          validate_resolved_expr(v, reg, file, x)
+          let x = validate_resolved_expr(b, reg, cm, file, errs)
+          validate_resolved_expr(v, reg, cm, file, x)
         }
-        SVar(_, _, rhs, _, _) -> validate_resolved_expr(rhs, reg, file, errs)
+        SVar(_, _, rhs, _, _) -> validate_resolved_expr(rhs, reg, cm, file, errs)
         # m7e §25: SUse has no expression to validate.
         SUse(_, _, _) -> errs
       }
-      validate_resolved_stmts(rest, reg, file, e1)
+      validate_resolved_stmts(rest, reg, cm, file, e1)
     }
   }
 }
 
-fn validate_resolved_clauses(cs: [HClause], reg: ProtocolReg,
+fn validate_resolved_clauses(cs: [HClause], reg: ProtocolReg, cm: Option[String],
                               file: String, errs: Int) : Int / Console + File {
 
 
@@ -4513,24 +4544,24 @@ fn validate_resolved_clauses(cs: [HClause], reg: ProtocolReg,
     [] -> errs
     [c, ...rest] -> match c {
       HC(_, _, b, _, _) -> {
-        let e1 = validate_resolved_expr(b, reg, file, errs)
-        validate_resolved_clauses(rest, reg, file, e1)
+        let e1 = validate_resolved_expr(b, reg, cm, file, errs)
+        validate_resolved_clauses(rest, reg, cm, file, e1)
       }
     }
   }
 }
 
-fn validate_resolved_opt_return(o: Option[HReturn], reg: ProtocolReg,
+fn validate_resolved_opt_return(o: Option[HReturn], reg: ProtocolReg, cm: Option[String],
                                  file: String, errs: Int) : Int / Console + File {
 
 
   match o {
-    Some(r) -> match r { HR(_, b, _, _) -> validate_resolved_expr(b, reg, file, errs) }
+    Some(r) -> match r { HR(_, b, _, _) -> validate_resolved_expr(b, reg, cm, file, errs) }
     None -> errs
   }
 }
 
-fn validate_resolved_fields(fs: [FieldInit], reg: ProtocolReg,
+fn validate_resolved_fields(fs: [FieldInit], reg: ProtocolReg, cm: Option[String],
                              file: String, errs: Int) : Int / Console + File {
 
 
@@ -4538,14 +4569,14 @@ fn validate_resolved_fields(fs: [FieldInit], reg: ProtocolReg,
     [] -> errs
     [f, ...rest] -> match f {
       FI(_, v) -> {
-        let e1 = validate_resolved_expr(v, reg, file, errs)
-        validate_resolved_fields(rest, reg, file, e1)
+        let e1 = validate_resolved_expr(v, reg, cm, file, errs)
+        validate_resolved_fields(rest, reg, cm, file, e1)
       }
     }
   }
 }
 
-fn validate_resolved_list_elems(els: [ListElem], reg: ProtocolReg,
+fn validate_resolved_list_elems(els: [ListElem], reg: ProtocolReg, cm: Option[String],
                                  file: String, errs: Int) : Int / Console + File {
 
 
@@ -4553,83 +4584,83 @@ fn validate_resolved_list_elems(els: [ListElem], reg: ProtocolReg,
     [] -> errs
     [el, ...rest] -> {
       let e1 = match el {
-        ElPlain(x)  -> validate_resolved_expr(x, reg, file, errs)
-        ElSpread(x) -> validate_resolved_expr(x, reg, file, errs)
+        ElPlain(x)  -> validate_resolved_expr(x, reg, cm, file, errs)
+        ElSpread(x) -> validate_resolved_expr(x, reg, cm, file, errs)
       }
-      validate_resolved_list_elems(rest, reg, file, e1)
+      validate_resolved_list_elems(rest, reg, cm, file, e1)
     }
   }
 }
 
-fn validate_resolved_kind(k: ExprKind, reg: ProtocolReg, file: String,
+fn validate_resolved_kind(k: ExprKind, reg: ProtocolReg, cm: Option[String], file: String,
                            errs: Int) : Int / Console + File {
 
 
   match k {
     ECall(c, args_) -> {
-      let e1 = validate_resolved_expr(c, reg, file, errs)
-      validate_resolved_exprs(args_, reg, file, e1)
+      let e1 = validate_resolved_expr(c, reg, cm, file, errs)
+      validate_resolved_exprs(args_, reg, cm, file, e1)
     }
     EBlock(ss, t) -> {
-      let e1 = validate_resolved_stmts(ss, reg, file, errs)
-      validate_resolved_opt(t, reg, file, e1)
+      let e1 = validate_resolved_stmts(ss, reg, cm, file, errs)
+      validate_resolved_opt(t, reg, cm, file, e1)
     }
     EIf(c, t_, eo) -> {
-      let e1 = validate_resolved_expr(c, reg, file, errs)
-      let e2 = validate_resolved_expr(t_, reg, file, e1)
-      validate_resolved_opt(eo, reg, file, e2)
+      let e1 = validate_resolved_expr(c, reg, cm, file, errs)
+      let e2 = validate_resolved_expr(t_, reg, cm, file, e1)
+      validate_resolved_opt(eo, reg, cm, file, e2)
     }
     EBinop(_, a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
-    EUnop(_, x) -> validate_resolved_expr(x, reg, file, errs)
+    EUnop(_, x) -> validate_resolved_expr(x, reg, cm, file, errs)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let e1 = validate_resolved_expr(body, reg, file, errs)
-      let e2 = validate_resolved_opt(init_opt, reg, file, e1)
-      let e3 = validate_resolved_clauses(clauses, reg, file, e2)
-      validate_resolved_opt_return(ret_opt, reg, file, e3)
+      let e1 = validate_resolved_expr(body, reg, cm, file, errs)
+      let e2 = validate_resolved_opt(init_opt, reg, cm, file, e1)
+      let e3 = validate_resolved_clauses(clauses, reg, cm, file, e2)
+      validate_resolved_opt_return(ret_opt, reg, cm, file, e3)
     }
-    ELambda(_, b) -> validate_resolved_expr(b, reg, file, errs)
+    ELambda(_, b) -> validate_resolved_expr(b, reg, cm, file, errs)
     EMatch(scr, arms) -> {
-      let e1 = validate_resolved_expr(scr, reg, file, errs)
-      validate_resolved_arms(arms, reg, file, e1)
+      let e1 = validate_resolved_expr(scr, reg, cm, file, errs)
+      validate_resolved_arms(arms, reg, cm, file, e1)
     }
     EPipe(a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
     EMapPipe(a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
     EFlatMapPipe(a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
     EFilterPipe(a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
-    EField(base, _) -> validate_resolved_expr(base, reg, file, errs)
+    EField(base, _) -> validate_resolved_expr(base, reg, cm, file, errs)
     EIndex(a, b) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      validate_resolved_expr(b, reg, file, e1)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      validate_resolved_expr(b, reg, cm, file, e1)
     }
-    ERecordLit(_, fields) -> validate_resolved_fields(fields, reg, file, errs)
-    EList(elems) -> validate_resolved_list_elems(elems, reg, file, errs)
+    ERecordLit(_, fields) -> validate_resolved_fields(fields, reg, cm, file, errs)
+    EList(elems) -> validate_resolved_list_elems(elems, reg, cm, file, errs)
     ERange(a, b, opt_step) -> {
-      let e1 = validate_resolved_expr(a, reg, file, errs)
-      let e2 = validate_resolved_expr(b, reg, file, e1)
-      validate_resolved_opt(opt_step, reg, file, e2)
+      let e1 = validate_resolved_expr(a, reg, cm, file, errs)
+      let e2 = validate_resolved_expr(b, reg, cm, file, e1)
+      validate_resolved_opt(opt_step, reg, cm, file, e2)
     }
-    EBang(inner) -> validate_resolved_expr(inner, reg, file, errs)
-    ELitUnit(inner, _) -> validate_resolved_expr(inner, reg, file, errs)
+    EBang(inner) -> validate_resolved_expr(inner, reg, cm, file, errs)
+    ELitUnit(inner, _) -> validate_resolved_expr(inner, reg, cm, file, errs)
     _ -> errs
   }
 }
 
-fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
+fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: String,
                            errs: Int) : Int / Console + File {
 
 
@@ -4653,7 +4684,7 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, file: String,
                 # `opname` clears the call (the bare name carries no
                 # protocol, so `Ring.add` and `Add.add` are both valid
                 # targets for `add`).
-                Some(tname) -> match find_impl_any_proto(reg, opname, tname) {
+                Some(tname) -> match find_impl_any_proto(reg, opname, tname, cm) {
                   Some(_) -> errs
                   None -> {
                     let pname = first_proto_of_op(reg, opname)
@@ -5160,8 +5191,9 @@ fn ty_strip_refine(t: Ty) : Ty = match t {
 fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
                                      reg: ProtocolReg,
                                      local_arities: [OpAr],
+                                     cm: Option[String],
                                      ret_ty: Option[Ty]) : Option[ExprKind] {
-  match try_rewrite_proto_call(callee, args_, reg, local_arities) {
+  match try_rewrite_proto_call(callee, args_, reg, local_arities, cm) {
     Some(rk) -> Some(rk)
     None -> {
       # Last-ditch: recover Self from the return type's Self position.
@@ -5189,8 +5221,8 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
               match args_head_names(args_) {
                 None -> None
                 Some(_) ->
-                  try_rewrite_ret_candidates(proto_ops_lookup_all(reg, opname),
-                                             callee, args_, reg, opname, ty)
+                  try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
+                                             callee, args_, reg, cm, opname, ty)
               }
             }
           }
@@ -5211,15 +5243,21 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
 # the prior behaviour.
 fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
                                args_: [Expr], reg: ProtocolReg,
+                               cm: Option[String],
                                opname: String, ret_ty: Ty) : Option[ExprKind] {
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, params, ret_te, _, _, _) ->
+      POR(pname, _, params, ret_te, _, _, pmo) ->
         # Arity guard: skip a candidate whose arity differs from the
         # call (an arity-ambiguous name reaches both protocols' POR).
         if list_length(params) != list_length(args_) {
-          try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
+          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
+        }
+        # A protocol the calling module cannot see is not a dispatch
+        # candidate for its bare calls.
+        else if not proto_visible_from(reg.origins, pname, pmo, cm) {
+          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         }
         # Only ops whose Self is informed SOLELY by the return position
         # are dispatched here. When Self also appears in a parameter
@@ -5229,19 +5267,20 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         # with no `impl Show`) onto an unrelated impl whose head happens
         # to equal the concrete return head (`String`).
         else if not proto_op_self_only_in_return(params, ret_te,
-                       proto_shape_carriers(reg.tparams, pname)) {
-          try_rewrite_ret_candidates(rest, callee, args_, reg, opname, ret_ty)
+                       proto_shape_carriers_at(reg.tparams, pname, pmo)) {
+          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         } else {
+          let pkey = proto_key_of(reg.dkeys, pname, pmo)
           match self_head_in_ret(ret_te, ret_ty) {
-            None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
+            None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                opname, ret_ty)
             Some(self_name) ->
-              match find_impl_by_recv(impl_pool(reg, pname, self_name), pname, opname, self_name) {
+              match find_impl_by_recv(impl_pool(reg, pkey, self_name), pkey, opname, self_name) {
                 Some(impl_fn) -> {
                   let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
                   Some(ECall(new_callee, args_))
                 }
-                None -> try_rewrite_ret_candidates(rest, callee, args_, reg,
+                None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                    opname, ret_ty)
               }
           }
@@ -5252,7 +5291,8 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
 
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg,
-                            local_arities: [OpAr]) : Option[ExprKind] {
+                            local_arities: [OpAr],
+                            cm: Option[String]) : Option[ExprKind] {
   match callee.kind {
     EVar(name) -> {
       let opname = strip_proto_dispatcher_prefix(name)
@@ -5272,8 +5312,11 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
         # name, the bare-name call site carries no protocol — only the
         # receiver type disambiguates. Iterate every protocol declaring
         # this op and pick the first that has an impl for the receiver.
-        try_rewrite_proto_candidates(proto_ops_lookup_all(reg, opname),
-                                     callee, args_, reg, opname)
+        # The caller's own protocol ranks first: with a contested name,
+        # a module's bare call binds its own declaration, exactly as
+        # `proto_scope` resolves the name for impl validation.
+        try_rewrite_proto_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
+                                     callee, args_, reg, cm, opname)
       }
     }
     _ -> None
@@ -5289,33 +5332,40 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
 # kept for the polymorphic / no-impl paths).
 fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
                                  args_: [Expr], reg: ProtocolReg,
+                                 cm: Option[String],
                                  opname: String) : Option[ExprKind] {
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, params, ret, _, _, _) -> {
+      POR(pname, _, params, ret, _, _, pmo) -> {
         # Arity guard: a name declared by two protocols at different
         # arities (`P { f(x) }` + `Q { f(a, b) }`) yields one POR per
         # protocol here. Only the candidate whose arity matches the
         # call can be the target — skipping the rest is what stops a
         # 1-arg call landing on the 2-arg impl.
         if list_length(params) != list_length(args_) {
-          try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
+          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
+        }
+        # A protocol the calling module cannot see is not a dispatch
+        # candidate for its bare calls.
+        else if not proto_visible_from(reg.origins, pname, pmo, cm) {
+          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
         }
         # When Self (or the protocol's `Shape` carrier) appears only in
         # the op's return position (e.g. `from(x: a) : Self`), the args
         # carry no dispatch information — defer to the caller-provided
         # ret_ty (the `_with_ret` wrapper).
         else if proto_op_self_only_in_return(params, ret,
-                  proto_shape_carriers(reg.tparams, pname)) {
-          try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
+                  proto_shape_carriers_at(reg.tparams, pname, pmo)) {
+          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
         } else {
-          match find_proto_impl_for_args(reg, pname, opname, args_) {
+          match find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
+                                         pname, pmo, opname, args_) {
             Some(impl_fn) -> {
               let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
               Some(ECall(new_callee, args_))
             }
-            None -> try_rewrite_proto_candidates(rest, callee, args_, reg, opname)
+            None -> try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
           }
         }
       }
@@ -5338,13 +5388,22 @@ fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
 # The surface names of a protocol's `Shape`-kind tparams — the dispatch
 # carriers whose applied form `s[A]` a call resolves against, mirroring
 # how `Self` informs an ordinary protocol's dispatch.
-fn proto_shape_carriers(tps: [ProtoTPReg], pname: String) : [String] =
-  shape_carrier_names(proto_tparams_for(tps, pname), [])
+# Home-exact by design: two same-named protocols may declare
+# different tparam lists, so a dispatch candidate reads its own,
+# never the first-registered homonym's.
+fn proto_shape_carriers_at(tps: [ProtoTPReg], pname: String,
+                           pmo: Option[String]) : [String] =
+  shape_carrier_names(proto_scope_tparams(tps, pname, pmo), [])
 
 # True when a protocol quantifies over a `Shape` carrier — dispatch is
 # single on the container, so a two-arg op is not heterogeneous.
-fn proto_is_shape_carrier(tps: [ProtoTPReg], pname: String) : Bool =
-  match proto_shape_carriers(tps, pname) { [] -> false _ -> true }
+fn proto_is_shape_carrier_at(tps: [ProtoTPReg], pname: String,
+                             pmo: Option[String]) : Bool =
+  match proto_shape_carriers_at(tps, pname, pmo) { [] -> false _ -> true }
+
+fn proto_has_tparams_at(tps: [ProtoTPReg], pname: String,
+                        pmo: Option[String]) : Bool =
+  match proto_scope_tparams(tps, pname, pmo) { [] -> false _ -> true }
 
 fn shape_carrier_names(names: [String], acc: [String]) : [String] = match names {
   [] -> list_reverse(acc)
@@ -5426,17 +5485,20 @@ fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
   if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, pname, recv) }
   else { reg.impls }
 
-fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
+# `pkey` keys the impl table; `(pname, pmo)` identify the protocol's
+# own tparam list — a contested name must not read a homonym's.
+fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
+                             pmo: Option[String], opname: String,
                              args_: [Expr]) : Option[String] {
   # A `Shape`-carrier protocol dispatches single, on the container arg;
   # its ops carry ordinary function parameters (`map(xs, f)`) whose types
   # have no dispatch head. Read the head from the first container-typed
   # argument and ignore the rest, so a function arg does not veto the
   # lookup the way `args_head_names` (all-or-nothing) would.
-  if proto_is_shape_carrier(reg.tparams, pname) {
+  if proto_is_shape_carrier_at(reg.tparams, pname, pmo) {
     match first_container_head(args_) {
       None -> None
-      Some(a) -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
+      Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   } else {
   let names = args_head_names(args_)
@@ -5444,39 +5506,39 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pname: String, opname: String,
     None -> None
     Some(ns) -> match ns {
       [] -> None
-      [a] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
+      [a] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
       [a, b] -> {
         # A `Shape` carrier is the single dispatch container, NOT a
         # heterogeneous proto-arg — its ops (`map(xs, f)`) take an
         # ordinary function as the second parameter, so dispatch stays
         # single on the container `a`.
-        let proto_takes_args = proto_has_tparams(reg.tparams, pname) and
-                               not proto_is_shape_carrier(reg.tparams, pname)
+        let proto_takes_args = proto_has_tparams_at(reg.tparams, pname, pmo) and
+                               not proto_is_shape_carrier_at(reg.tparams, pname, pmo)
         if not proto_takes_args {
           # Single-dispatch op whose second parameter is part of the
           # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
           # homogeneous (recv=a) lookup applies; the second arg is
           # not a proto-arg.
-          find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
+          find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
         } else {
           # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
           #          `impl Add[Real] for Complex` for Complex + Real.
           # Pass 1b: homogeneous (recv=a) — covers `impl Add for
           #          Complex` for Complex + Complex.
-          match find_impl_with_args(impl_pool(reg, pname, a), pname, opname, a, [b]) {
+          match find_impl_with_args(impl_pool(reg, pkey, a), pkey, opname, a, [b]) {
             Some(fn_name) -> Some(fn_name)
             None -> {
-              match find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a) {
+              match find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a) {
                 Some(fn_name) ->
                   if a == b { Some(fn_name) }
-                  else { find_impl_with_args(impl_pool(reg, pname, b), pname, opname, b, [a]) }
-                None -> find_impl_with_args(impl_pool(reg, pname, b), pname, opname, b, [a])
+                  else { find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a]) }
+                None -> find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a])
               }
             }
           }
         }
       }
-      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pname, a), pname, opname, a)
+      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   }
   }
@@ -5518,21 +5580,6 @@ fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args
   [] -> true
   [a] -> a == recv
   _ -> false
-}
-
-# Issue #180: returns true when the protocol declared one or more
-# `[A]` type parameters. `protocol Add[a]` returns true; `protocol
-# Numeric` returns false.
-fn proto_has_tparams(tps: [ProtoTPReg], pname: String) : Bool = match tps {
-  [] -> false
-  [t, ...rest] -> match t {
-    PTPR(p, params, _) ->
-      if p == pname {
-        match params { [] -> false _ -> true }
-      } else {
-        proto_has_tparams(rest, pname)
-      }
-  }
 }
 
 fn args_head_names(args_: [Expr]) : Option[[String]] = match args_ {
@@ -5587,6 +5634,36 @@ fn find_impl_by_recv(impls: [ProtoImplReg], pname: String, opname: String,
 # Strip the `__proto_` dispatcher prefix the rename pass attaches.
 # Names without the prefix pass through unchanged (so tests that
 # bypass renaming still resolve).
+# Stable partition: candidates homed in the calling module first,
+# everyone else in their existing order. Only reorders when the
+# caller's module itself declares the op's protocol.
+fn proto_cands_own_first(cands: [ProtoOpReg],
+                         cm: Option[String]) : [ProtoOpReg] = match cm {
+  None -> cands
+  Some(_) ->
+    list_append(pcof_matching(cands, cm), pcof_rest(cands, cm))
+}
+
+fn pcof_matching(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
+  match cands {
+    [] -> []
+    [po, ...rest] -> match po {
+      POR(_, _, _, _, _, _, pmo) ->
+        if mo_eq(pmo, cm) { [po, ...pcof_matching(rest, cm)] }
+        else { pcof_matching(rest, cm) }
+    }
+  }
+
+fn pcof_rest(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
+  match cands {
+    [] -> []
+    [po, ...rest] -> match po {
+      POR(_, _, _, _, _, _, pmo) ->
+        if mo_eq(pmo, cm) { pcof_rest(rest, cm) }
+        else { [po, ...pcof_rest(rest, cm)] }
+    }
+  }
+
 fn strip_proto_dispatcher_prefix(name: String) : String {
   let pfx = "__proto_"
   let n_pfx = string_length(pfx)
@@ -5677,33 +5754,44 @@ fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
   match proto_op_lookup(reg, opname) {
     None -> None
     Some(po) -> match po {
-      POR(pname, _, _, _, _, _, _) -> find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname)
+      POR(pname, _, _, _, _, _, pmo) -> {
+        let pkey = proto_key_of(reg.dkeys, pname, pmo)
+        find_impl_for(impl_pool(reg, pkey, tname), pkey, tname, opname)
+      }
     }
   }
 }
 
 # Collision-aware: `opname` may be declared by several protocols
 # (`add` by `Add[a]` and a user `Ring`). Returns an impl when ANY
-# declaring protocol has one for `tname`, so the post-rewrite
-# validator does not fix the protocol to the wrong one and flag a
-# spurious "no impl". Returns the owning protocol name alongside.
+# declaring protocol VISIBLE from `cm` has one for `tname`, so the
+# post-rewrite validator does not fix the protocol to the wrong one
+# and flag a spurious "no impl". Returns the owning protocol name
+# alongside.
 fn find_impl_any_proto(reg: ProtocolReg, opname: String,
-                        tname: String) : Option[ImplHit] =
-  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, tname)
+                        tname: String, cm: Option[String]) : Option[ImplHit] =
+  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, tname, cm)
 
 #[doc("A resolved impl hit: the owning protocol and the impl fn symbol.")]
 pub type ImplHit = ImplHit(String, String)
 
 fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
-                             opname: String, tname: String) : Option[ImplHit] {
+                             opname: String, tname: String,
+                             cm: Option[String]) : Option[ImplHit] {
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, _, _, _, _, _) ->
-        match find_impl_for(impl_pool(reg, pname, tname), pname, tname, opname) {
-          Some(fn_name) -> Some(ImplHit(pname, fn_name))
-          None -> find_impl_any_proto_loop(rest, reg, opname, tname)
+      POR(pname, _, _, _, _, _, pmo) -> {
+        if not proto_visible_from(reg.origins, pname, pmo, cm) {
+          find_impl_any_proto_loop(rest, reg, opname, tname, cm)
+        } else {
+          let pkey = proto_key_of(reg.dkeys, pname, pmo)
+          match find_impl_for(impl_pool(reg, pkey, tname), pkey, tname, opname) {
+            Some(fn_name) -> Some(ImplHit(pname, fn_name))
+            None -> find_impl_any_proto_loop(rest, reg, opname, tname, cm)
+          }
         }
+      }
     }
   }
 }
