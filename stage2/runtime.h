@@ -18282,17 +18282,12 @@ static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
 static void *kai_llvm_const_null(void *ptr_t) {
     return (void *) LLVMConstNull((LLVMTypeRef) ptr_t);
 }
-/* An `i8*` to a private global string constant. Two callers, two shapes:
- *  - a constructor / record-field NAME (a bare identifier, no quotes) —
- *    used as the `const char *name` a runtime ctor takes;
- *  - a `KStrV` source SPAN (quote-wrapped, with `\n`/`\t`/`\"`/`\\`/`\r`
- *    escapes) — the literal a `kaix_str(...)` boxes.
- * `kai_llvm_build_global_string` takes the bare form verbatim;
- * `kai_llvm_build_string_span` strips the outer quotes and decodes the
- * escapes (the C-direct oracle leans on the C compiler to do this for
- * `kai_str("...")`; we replicate that decode here, since the in-process
- * path has no intermediate C compiler). The builder must be positioned
- * in a block; the global is module-level + private. */
+/* An `i8*` to a private global string constant. Both entry points store
+ * their bytes verbatim: the caller decodes. `kai_llvm_build_global_string`
+ * takes a NUL-terminated name; `kai_llvm_build_string_span` honours the
+ * KaiValue's length, so a literal carrying an embedded NUL survives.
+ * The builder must be positioned in a block; the global is module-level
+ * + private. */
 static void *kai_llvm_build_global_string(void *b, KaiValue *s) {
     /* A module-level private `[N x i8] c"..."` constant, NOT a builder
      * instruction. `LLVMBuildGlobalStringPtr` inserts a GEP into the
