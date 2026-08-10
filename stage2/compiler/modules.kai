@@ -53,6 +53,7 @@
 import compiler.util
 import compiler.diag
 import compiler.ast
+import compiler.diag_file
 import compiler.lex
 import compiler.parse
 
@@ -308,6 +309,14 @@ pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = ma
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
     ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
+  }
+}
+
+#[doc("Project the module table onto the (module, file) pairs diagnostic attribution needs.")]
+pub fn module_files(mes: [ModuleEntry], acc: [ModFile]) : [ModFile] = match mes {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(name, _, origin, _) -> module_files(rest, [MF(name, origin), ...acc])
   }
 }
 
@@ -867,7 +876,7 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   DImpl(name, proto_args, ty, sub_decls, l, c, tps) ->
     DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
           qualtype_te(ty, mt, file),
-          qualtype_decls(sub_decls, mt, file), l, c, tps)
+          qualtype_sub_decls(sub_decls, mt, file), l, c, tps)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, qualtype_decl(inner, mt, file), l, c)
   DUnstable(inner, l, c) ->
@@ -911,10 +920,17 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   DKind(p, n, th, ov, intro, l, c) -> DKind(p, n, th, ov, intro, l, c)
 }
 
-pub fn qualtype_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+pub fn qualtype_decls(decls: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Decl] / Console + File = match decls {
 
   [] -> []
-  [d, ...rest] -> [qualtype_decl(d, mt, file), ...qualtype_decls(rest, mt, file)]
+  [d, ...rest] -> [qualtype_decl(d, mt, decl_diag_file(d, df)), ...qualtype_decls(rest, mt, df)]
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn qualtype_sub_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+  [] -> []
+  [d, ...rest] -> [qualtype_decl(d, mt, file), ...qualtype_sub_decls(rest, mt, file)]
 }
 
 # Validation pass: counts how many qualified type heads
@@ -1041,10 +1057,17 @@ pub fn qtchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
   [d, ...rest] -> qtchk_decl(d, mt) + qtchk_decls(rest, mt)
 }
 
-pub fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+pub fn rqc_decls(decls: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Decl] / Console + File = match decls {
 
   [] -> []
-  [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_decls(rest, mt, file)]
+  [d, ...rest] -> [rqc_decl(d, mt, decl_diag_file(d, df)), ...rqc_decls(rest, mt, df)]
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn rqc_sub_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+  [] -> []
+  [d, ...rest] -> [rqc_decl(d, mt, file), ...rqc_sub_decls(rest, mt, file)]
 }
 
 # Walk every Decl body's EModCall sites and emit a
@@ -1067,12 +1090,24 @@ pub fn rqc_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Cons
 # `<mod>.<fname>` pair and the opt-in instruction. The diagnostic
 # is non-fatal; downstream codegen proceeds as usual.
 pub fn unstable_check_decls(ds: [Decl], mt: [ModuleEntry],
-                          pkg: String, optins: [String], file: String)
+                          pkg: String, optins: [String], df: DiagFiles)
+                          : Unit / Console + File = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    unstable_check_decl(d, mt, pkg, optins, decl_diag_file(d, df))
+    unstable_check_decls(rest, mt, pkg, optins, df)
+  }
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn unstable_check_sub_decls(ds: [Decl], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String)
                           : Unit / Console + File = match ds {
   [] -> ()
   [d, ...rest] -> {
     unstable_check_decl(d, mt, pkg, optins, file)
-    unstable_check_decls(rest, mt, pkg, optins, file)
+    unstable_check_sub_decls(rest, mt, pkg, optins, file)
   }
 }
 
@@ -1082,7 +1117,7 @@ fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
   DTest(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
   DBench(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
   DCheck(_, _, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
-  DImpl(_, _, _, subs, _, _, _) -> unstable_check_decls(subs, mt, pkg, optins, file)
+  DImpl(_, _, _, subs, _, _, _) -> unstable_check_sub_decls(subs, mt, pkg, optins, file)
   DDerive(_, inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
   DUnstable(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
   DProtoLaws(_, inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
@@ -1266,7 +1301,7 @@ fn rqc_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = 
   DCheck(n, ps, body, l, c) ->
     DCheck(n, ps, rqc_expr(body, fn_param_names(ps), mt, file), l, c)
   DImpl(name, proto_args, ty, sub_decls, l, c, tps) ->
-    DImpl(name, proto_args, ty, rqc_decls(sub_decls, mt, file), l, c, tps)
+    DImpl(name, proto_args, ty, rqc_sub_decls(sub_decls, mt, file), l, c, tps)
   DDerive(ps, inner, l, c) ->
     DDerive(ps, rqc_decl(inner, mt, file), l, c)
   DUnstable(inner, l, c) ->
@@ -1798,28 +1833,28 @@ pub type ImportSeg = ISeg(String, Int)
 # declared, so each segment resolves under its own module's imports
 # instead of one shared table.
 pub fn rqc_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
-      global: [ModuleEntry], target_mod: String, file: String)
+      global: [ModuleEntry], target_mod: String, df: DiagFiles)
       : [Decl] / Console + File = match segs {
   # Past the marks lie the root file's own decls, which resolve
   # through the root scope (recorded under "").
-  [] -> rqc_decls(decls, ms_table(scopes, "", global), file)
+  [] -> rqc_decls(decls, ms_table(scopes, "", global), df)
   [ISeg(mod_name, n), ...rest] -> {
     let home = if mod_name == "" { target_mod } else { mod_name }
     let mt = ms_table(scopes, home, global)
-    list_append(rqc_decls(seg_take(decls, n), mt, file),
-                rqc_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, file))
+    list_append(rqc_decls(seg_take(decls, n), mt, df),
+                rqc_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, df))
   }
 }
 
 pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
-      global: [ModuleEntry], target_mod: String, file: String)
+      global: [ModuleEntry], target_mod: String, df: DiagFiles)
       : [Decl] / Console + File = match segs {
-  [] -> qualtype_decls(decls, ms_table(scopes, "", global), file)
+  [] -> qualtype_decls(decls, ms_table(scopes, "", global), df)
   [ISeg(mod_name, n), ...rest] -> {
     let home = if mod_name == "" { target_mod } else { mod_name }
     let mt = ms_table(scopes, home, global)
-    list_append(qualtype_decls(seg_take(decls, n), mt, file),
-                qualtype_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, file))
+    list_append(qualtype_decls(seg_take(decls, n), mt, df),
+                qualtype_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, df))
   }
 }
 
