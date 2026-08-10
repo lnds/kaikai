@@ -93,6 +93,12 @@ Vector2 get_mouse_position(void) { ... }
 
 Build with the shim on `CFLAGS`: `CFLAGS="shim.c" kai build --backend=c app.kai`.
 
+In a package, declare the shim in `kai.toml` instead — a `[native]`
+table (`sources`/`include`/`libs`) travels with the dependency, so
+consumers build with plain `kai build` and no `CFLAGS` (see
+`kai info packages`). The `kai_ffi.h` struct pattern above still
+rides `CFLAGS`; `[native]` sources must be self-contained C.
+
 > Struct-by-value works on **both backends**. The C-direct backend
 > (`--backend=c`) lets the C compiler own the ABI; the native (libLLVM)
 > backend classifies each aggregate in the emitter and coerces it to the

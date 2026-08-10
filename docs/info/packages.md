@@ -61,6 +61,26 @@ An unrecognised dependency table (neither `path` nor `source`/`ref`)
 is a manifest error: `kai fetch` reports it and exits non-zero
 rather than locking zero entries.
 
+## Native sources (`[native]`)
+
+A package binding C declares its shim in the manifest; consumers
+never pass it by hand:
+
+```text
+[native]
+sources = ["c/term_shim.c"]   # vendored C, relative to this package
+include = ["c"]               # -I dirs for compiling those sources
+libs = ["sqlite3"]            # system libraries, -l<name> at link
+```
+
+Honoured by every verb (`build`/`run`/`test`/`install`), on both
+backends, transitively: if A and B depend on the same shim-binding
+package, the shim compiles and links once. Sources are vendored and
+always work; `libs` name system libraries that must exist on the
+consumer's machine. Declarative only — no build scripts, no free-form
+flags. `CFLAGS` keeps precedence as the escape hatch;
+`KAI_NATIVE_DEPS=0` disables the channel.
+
 ## Migrating across an edition
 
 An edition bump can change the language surface (renames, signature
