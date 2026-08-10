@@ -319,14 +319,50 @@ fn eff_mo_fallback(effs: [Decl], name: String, found: Option[String]) : Option[S
 # Find a const decl's literal body by name in the emit catalogue.
 # None when `name` is not a top-level const (then it is a fn /
 # variant / local and `emit_ident_value` falls through as before).
-fn const_body_of(consts: [Decl], name: String) : Option[Expr] = match consts {
+# A root const (no module_origin) wins over a same-named module
+# const: a bare read reaching emit belongs to the root — module
+# reads of a colliding name arrive as `EModCall` (const_scope).
+fn const_body_of(consts: [Decl], name: String) : Option[Expr] =
+  match const_body_of_root(consts, name) {
+    Some(b) -> Some(b)
+    None    -> const_body_of_first(consts, name)
+  }
+
+fn const_body_of_root(consts: [Decl], name: String) : Option[Expr] = match consts {
+  [] -> None
+  [d, ...rest] -> match d {
+    DConst(_, cn, _, body, mo, _, _) -> match mo {
+      None -> if cn == name { Some(body) } else { const_body_of_root(rest, name) }
+      Some(_) -> const_body_of_root(rest, name)
+    }
+    _ -> const_body_of_root(rest, name)
+  }
+}
+
+fn const_body_of_first(consts: [Decl], name: String) : Option[Expr] = match consts {
   [] -> None
   [d, ...rest] -> match d {
     DConst(_, cn, _, body, _, _, _) ->
-      if cn == name { Some(body) } else { const_body_of(rest, name) }
-    _ -> const_body_of(rest, name)
+      if cn == name { Some(body) } else { const_body_of_first(rest, name) }
+    _ -> const_body_of_first(rest, name)
   }
 }
+
+# The body of `<mod>`'s own const `name`; None when that module
+# declares no such const (then the qualified read falls back to the
+# name-only pick).
+fn const_body_of_home(consts: [Decl], mod: String, name: String) : Option[Expr] =
+  match consts {
+    [] -> None
+    [d, ...rest] -> match d {
+      DConst(_, cn, _, body, mo, _, _) -> match mo {
+        Some(m) -> if cn == name and m == mod { Some(body) }
+                   else { const_body_of_home(rest, mod, name) }
+        None -> const_body_of_home(rest, mod, name)
+      }
+      _ -> const_body_of_home(rest, mod, name)
+    }
+  }
 
 # True when a block at (line, col) is a recorded `region { }`.
 fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
@@ -7503,12 +7539,17 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       # A qualified const reads as its literal, exactly like the bare
       # `EVar` path — there is no function behind the name, so minting
       # a thunk symbol would leave an undefined reference at link time.
-      None -> match const_body_of(cx.consts, fname) {
+      # The declaring module's body first: two modules may export the
+      # same const name.
+      None -> match const_body_of_home(cx.consts, mod, fname) {
+        Some(body) -> emit_expr(src, body, cx)
+        None -> match const_body_of(cx.consts, fname) {
         Some(body) -> emit_expr(src, body, cx)
         None -> match efn_resolve(cx.fns, fname) {
           Some(EFn(_, ar, _, _)) ->
             cat5("kai_closure(&", c_user_thunk_sym(c_sym(fname, Some(mod))), ", ", int_to_string(ar), ", 0, NULL)")
           None -> c_local(fname)
+        }
         }
       }
     }
