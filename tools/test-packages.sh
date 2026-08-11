@@ -231,6 +231,34 @@ run_check_script "install_binary"      "install_binary/check.sh"
 # its wholesale replacement of bin/libexec/share.
 run_check_script "upgrade_preserves_installed" "upgrade_preserves_installed/check.sh"
 
+# `kai build` package layouts: root entry point, src/ entry override,
+# nested sub-package with its own manifest, module-qualified sibling
+# imports.
+run_positive "build_hello"            "build_hello"            "build_hello/main.out.expected"
+run_positive "build_entry_override"   "build_entry_override"   "build_entry_override/main.out.expected"
+run_positive "build_sub_package"      "build_sub_package"      "build_sub_package/main.out.expected"
+run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
+run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
+
+# git-source dep chains (rendered manifests): direct dep and a
+# transitive chain. SKIP when the manifest was not rendered, matching
+# the git-fixture fail-open policy above. A silent warm-up build runs
+# first: on a cold resolver `kai run` interleaves the kai-pkg fetch
+# preamble into the captured output (lines the `^kai:` filter does not
+# cover), so the golden diff must see a warm lock.
+run_rendered() {
+  if [ -f "$PKG_DIR/$2/kai.toml" ]; then
+    (cd "$PKG_DIR/$2" && "$KAI" run . >/dev/null 2>&1) || true
+    run_positive "$1" "$2" "$3"
+  else
+    skip "$1" "manifest not rendered (render-fixtures.sh unavailable?)"
+  fi
+}
+run_rendered "simple_dep"             "simple_dep"             "simple_dep/main.out.expected"
+# transitive's golden run is excluded: kai-pkg OOMs re-resolving a
+# transitive chain from an existing lockfile on Linux (#1762). Its
+# run_parity entry below still covers it where native kaic2 exists.
+
 # [native] manifest table: a dep's vendored C shim reaches every verb
 # through dependency resolution — build/run/test/install, plus the
 # missing-cc and undeclared-shim diagnostics and the reversion switch.
@@ -275,6 +303,8 @@ run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
 run_parity  "parity-auto_install"       "auto_install"
 run_parity  "parity-git_tag_alias"      "git_tag_alias"
 run_parity  "parity-native_shim"        "native_shim/app"
+run_parity  "parity-simple_dep"         "simple_dep"
+run_parity  "parity-transitive"         "transitive"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then

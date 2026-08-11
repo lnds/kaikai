@@ -5,8 +5,8 @@
 # defect BOTH backends share is invisible to it: they agree, parity is
 # green, and nothing compares the program's actual output against the
 # fixture's golden. This harness closes that gap for examples/effects:
-# every flat fixture with a golden is built under TARGET_BACKEND, run,
-# and its stdout must match the golden byte for byte.
+# every fixture with a golden (any depth) is built under TARGET_BACKEND,
+# run, and its stdout must match the golden byte for byte.
 #
 # A fixture's contract is declared by sidecars next to its source:
 #   <name>.out.expected         stdout golden, exit status 0 (the default)
@@ -221,7 +221,7 @@ fi
 export -f process_one check_contract run_with_timeout report_fail kai_corpus_pinned_threads
 export tmp results failures SKIPS KAI TARGET_BACKEND TIMEOUT_CMD RUN_TIMEOUT SIGHARNESS_BIN
 
-for g in "$FIXDIR"/*.out.expected "$FIXDIR"/*.out.sorted.expected; do
+find "$FIXDIR" -name '*.out.expected' -o -name '*.out.sorted.expected' | while read -r g; do
   src="${g%.out.expected}"; src="${src%.out.sorted.expected}.kai"
   [ -f "$src" ] && echo "$src"
 done | sort -u > "$tmp/fixtures"
