@@ -2666,6 +2666,13 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           }
           _ -> "kai_unit() /* __perceus_apply_borrow: expected closure + args */"
         }
+      } else if callee == "__perceus_borrow" {
+        # RC-transparent marker, never a runtime function: emit the inner
+        # value instead of minting an undeclared C identifier.
+        match args_e {
+          [a] -> emit_expr(src, a, cx)
+          _   -> "kai_unit() /* __perceus_borrow: expected 1 arg */"
+        }
       } else if callee == "__perceus_owned_borrow" {
         # issue #1130 rule 1 — normally `emit_call_expr` intercepts a call
         # whose ARG is `__perceus_owned_borrow(g)` and emits the closure +
@@ -2854,6 +2861,14 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
   }
 }
 
+# A `__perceus_*` marker reaching the closure-apply fallback is an RC
+# intrinsic that leaked past every consumer; the apply would mint an
+# undeclared C identifier and hand cc broken code. Abort instead.
+fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
+  if string_starts_with_q(callee, "__perceus_") {
+    panic(cat2("emit_c: perceus intrinsic leaked to closure apply: ", callee))
+  } else { () }
+
 # Shared by emit_pipe_expr's EVar / EModCall branches. Same lookup
 # chain as emit_named_call_lookup but parameterised on a pre-built
 # args string (the pipe LHS is already the first argument).
@@ -2918,10 +2933,13 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
       }
       None -> match efn_resolve(cx.fns, callee) {
         Some(EFn(_, _, mo, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
-        None -> concat_all([
-          "kai_apply(", c_local(callee), ", ", int_to_string(arity),
-          ", (KaiValue *[]){", args_all, "})"
-        ])
+        None -> {
+          emit_guard_no_intrinsic_mint(callee)
+          concat_all([
+            "kai_apply(", c_local(callee), ", ", int_to_string(arity),
+            ", (KaiValue *[]){", args_all, "})"
+          ])
+        }
       }
     }
   } }
@@ -2967,10 +2985,13 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
       }
       None -> match efn_resolve(cx.fns, callee) {
         Some(EFn(_, _, mo, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
-        None -> concat_all([
-          "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
-          ", (KaiValue *[]){", call_args, "})"
-        ])
+        None -> {
+          emit_guard_no_intrinsic_mint(callee)
+          concat_all([
+            "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
+            ", (KaiValue *[]){", call_args, "})"
+          ])
+        }
       }
     }
     }
@@ -5087,7 +5108,11 @@ fn pat_lit_raw(p: Pattern) : String {
 # present, `default:` panics with "non-exhaustive match".
 fn emit_match_switch(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
-  let raw = emit_expr_raw(src, scrut, cx)
+  # A `__perceus_borrow` wrap is transparent here: a raw scalar carries
+  # no RC, so the borrow marker only needs stripping (the boxed paths
+  # instead use it to skip the exit decref).
+  let scr = match match_borrow_inner(scrut) { Some(inner) -> inner  None -> scrut }
+  let raw = emit_expr_raw(src, scr, cx)
   let cty = raw_c_type(scrut.ty)
   concat_all([
     "({ ", cty, " _scr = ", raw, "; KaiValue *_r = kai_unit(); switch (_scr) {\n",
