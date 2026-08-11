@@ -15,10 +15,7 @@
 #   (b) Negative: <fix>/main.err.expected. Build must FAIL and every
 #       non-empty golden line must appear as a substring of stderr.
 #
-# edition_cache_invalidation/check.sh is NOT run: it asserts the
-# retired KAI_PRELUDE_CACHE_DIR partition layout and fails against
-# the current cache. It stays excluded until rewritten against the
-# cache layers the driver actually uses.
+#   (c) Script: <fix>/check.sh. Run it; a zero exit passes.
 
 set -eu
 
@@ -76,12 +73,23 @@ run_negative() {
   fi
 }
 
+run_check() {
+  name="$1"
+  out="$(sh "$ED_DIR/$name/check.sh" 2>&1)" || {
+    err "$name"
+    echo "$out" | sed 's/^/    /' >&2
+    return
+  }
+  ok "$name"
+}
+
 printf '== edition harness ==\n'
 
 run_positive "edition_hanga_roa_pipe"
 run_positive "edition_tongariki_pipe"
 run_positive "edition_missing_field"
 run_negative "edition_unknown_error"
+run_check "edition_cache_invalidation"
 
 printf '== summary: %d ok, %d fail ==\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
