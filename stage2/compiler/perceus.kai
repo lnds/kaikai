@@ -1229,7 +1229,27 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Boo
   EList(els)      -> pcs_consuming_elems(nm, els, cmap)
   EPipe(a, b)     -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
   EBang(x)        -> pcs_uses_only_consuming_slots(nm, x, cmap)
-  # Remaining forms impose no constraint. No `_` arm — a new ExprKind
+  # Positions with real sub-expressions scan them instead of imposing no
+  # constraint — a read the collector sees must never be invisible here.
+  # Interp reads take a dup and never a consuming slot; lexical presence
+  # is the pure stand-in for the collector's parsed view.
+  EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple) == 0
+  ERange(a, b, opt)   -> pcs_uses_only_consuming_slots(nm, a, cmap) and
+                          pcs_uses_only_consuming_slots(nm, b, cmap) and
+                          (match opt { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) })
+  # Intrinsics incref their args internally — no arg slot ever consumes.
+  EIntrinsic(_, xs)   -> not pcs_name_in_exprs(nm, xs)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
+    pcs_uses_only_consuming_slots(nm, body, cmap) and
+    (match init_opt { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) }) and
+    pcs_consuming_clauses(nm, clauses, cmap) and
+    (match ret_opt { None -> true Some(hr) -> match hr { HR(_, b2, _, _) -> pcs_uses_only_consuming_slots(nm, b2, cmap) } })
+  ELitUnit(x, _)      -> pcs_uses_only_consuming_slots(nm, x, cmap)
+  EMapPipe(a, b)      -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
+  EFlatMapPipe(a, b)  -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
+  EFilterPipe(a, b)   -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
+  ESurface(sf)        -> not pcs_name_in_exprs(nm, surface_children(sf))
+  # Read-free leaves impose no constraint. No `_` arm — a new ExprKind
   # variant must be classified here before it compiles.
   EInt(_, _)          -> true
   EReal(_, _)         -> true
@@ -1238,24 +1258,23 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Boo
   EDecimalLit(_)      -> true
   EBool(_)            -> true
   EChar(_)            -> true
-  EStr(_, _)          -> true
   EUnit               -> true
   EVar(_)             -> true
   EUnder              -> true
   EPlaceholder        -> true
-  ERange(_, _, _)     -> true
-  EMapPipe(_, _)      -> true
-  EFlatMapPipe(_, _)  -> true
-  EFilterPipe(_, _)   -> true
   EHole(_)            -> true
   ETodo(_)            -> true
   EExternBody(_)      -> true
-  EHandle(_, _, _, _, _, _, _) -> true
-  ELitUnit(_, _)      -> true
   EVariantsOf(_, _)   -> true
   EModCall(_, _)      -> true
-  EIntrinsic(_, _)    -> true
-  ESurface(_)         -> true
+}
+
+fn pcs_consuming_clauses(nm: String, cs: [HClause], cmap: [ConsumeEntry]) : Bool = match cs {
+  []           -> true
+  [h, ...rest] -> match h {
+    HC(_, _, body, _, _) ->
+      pcs_uses_only_consuming_slots(nm, body, cmap) and pcs_consuming_clauses(nm, rest, cmap)
+  }
 }
 
 fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
@@ -1285,10 +1304,17 @@ fn pcs_consuming_stmts(nm: String, stmts: [Stmt], cmap: [ConsumeEntry]) : Bool =
       SLet(_, _, e)       -> pcs_uses_only_consuming_slots(nm, e, cmap)
       SVar(_, _, e, _, _) -> pcs_uses_only_consuming_slots(nm, e, cmap)
       SExprStmt(e)        -> pcs_uses_only_consuming_slots(nm, e, cmap)
-      SAssert(_, _)             -> true
-      SIndexAssign(_, _, _, _, _) -> true
-      SAssign(_, _, _, _)       -> true
-      SUse(_, _, _)             -> true
+      # The condition always evaluates — same reasoning as SExprStmt.
+      # The message only evaluates on the failing path, so a read there
+      # never consumes on the success path: presence blocks the move.
+      SAssert(c, opt_m)   -> pcs_uses_only_consuming_slots(nm, c, cmap) and
+                              (match opt_m { None -> true Some(m) -> not pcs_name_in_expr(nm, m) })
+      SIndexAssign(b, i, v, _, _) -> pcs_uses_only_consuming_slots(nm, b, cmap) and
+                                      pcs_uses_only_consuming_slots(nm, i, cmap) and
+                                      pcs_uses_only_consuming_slots(nm, v, cmap)
+      SAssign(b, v, _, _) -> pcs_uses_only_consuming_slots(nm, b, cmap) and
+                              pcs_uses_only_consuming_slots(nm, v, cmap)
+      SUse(_, _, _)       -> true
     }
     here and pcs_consuming_stmts(nm, rest, cmap)
   }
@@ -1351,9 +1377,27 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
   EList(els)      -> pcs_lu_consuming_elems(nm, ll, lc, els, cmap)
   EPipe(a, b)     -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
   EBang(x)        -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
-  # Remaining forms impose no constraint (a read there is not the
-  # last-use move point). No `_` arm — a new ExprKind variant must be
-  # classified here before it compiles.
+  # A last-use field/index read is paired by emit with a receiver decref
+  # (the perceus-move / emit pair): the projection's base position is a
+  # consuming read at the ABI level, so it stays unconstrained.
+  EField(_, _)        -> true
+  EIndex(_, _)        -> true
+  # Handler clauses reload captures through an env dup per invocation, so
+  # a clause read is balanced regardless of the move decision.
+  EHandle(_, _, _, _, _, _, _) -> true
+  # Intrinsics incref their args internally: a last use moved into one
+  # leaks the transferred ref.
+  EIntrinsic(_, xs)   -> not pcs_pos_in_exprs(ll, lc, xs)
+  ERange(a, b, opt)   -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and
+                          pcs_last_use_consuming(nm, ll, lc, b, cmap) and
+                          (match opt { None -> true Some(e) -> pcs_last_use_consuming(nm, ll, lc, e, cmap) })
+  ELitUnit(x, _)      -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
+  EMapPipe(a, b)      -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
+  EFlatMapPipe(a, b)  -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
+  EFilterPipe(a, b)   -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
+  ESurface(sf)        -> not pcs_pos_in_exprs(ll, lc, surface_children(sf))
+  # Remaining forms hold no read position. No `_` arm — a new ExprKind
+  # variant must be classified here before it compiles.
   EInt(_, _)          -> true
   EReal(_, _)         -> true
   EFixed(_, _)        -> true
@@ -1366,21 +1410,11 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
   EVar(_)             -> true
   EUnder              -> true
   EPlaceholder        -> true
-  EField(_, _)        -> true
-  EIndex(_, _)        -> true
-  ERange(_, _, _)     -> true
-  EMapPipe(_, _)      -> true
-  EFlatMapPipe(_, _)  -> true
-  EFilterPipe(_, _)   -> true
   EHole(_)            -> true
   ETodo(_)            -> true
   EExternBody(_)      -> true
-  EHandle(_, _, _, _, _, _, _) -> true
-  ELitUnit(_, _)      -> true
   EVariantsOf(_, _)   -> true
   EModCall(_, _)      -> true
-  EIntrinsic(_, _)    -> true
-  ESurface(_)         -> true
 }
 
 fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
@@ -1402,7 +1436,12 @@ fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [In
 fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: [ConsumeEntry]) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
-    Arm(_, _, b) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and pcs_lu_consuming_arms(nm, ll, lc, rest, cmap)
+    # A guard can evaluate and its arm still not be chosen — the next arm
+    # re-reads the scrutinee's slots, so a last use consumed inside a
+    # guard is never move-safe, whatever slot it lands in.
+    Arm(_, opt_g, b) ->
+      (match opt_g { None -> true Some(g) -> not pcs_pos_in_expr(ll, lc, g) }) and
+      pcs_last_use_consuming(nm, ll, lc, b, cmap) and pcs_lu_consuming_arms(nm, ll, lc, rest, cmap)
   }
 }
 
@@ -1413,10 +1452,17 @@ fn pcs_lu_consuming_stmts(nm: String, ll: Int, lc: Int, stmts: [Stmt], cmap: [Co
       SLet(_, _, e)       -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
       SVar(_, _, e, _, _) -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
       SExprStmt(e)        -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
-      SAssert(_, _)             -> true
-      SIndexAssign(_, _, _, _, _) -> true
-      SAssign(_, _, _, _)       -> true
-      SUse(_, _, _)             -> true
+      # The condition always evaluates — same reasoning as SExprStmt. The
+      # message runs only on the failing (aborting) path: a last use there
+      # never transfers on the success path, so it must not move.
+      SAssert(c, opt_m)   -> pcs_last_use_consuming(nm, ll, lc, c, cmap) and
+                              (match opt_m { None -> true Some(m) -> not pcs_pos_in_expr(ll, lc, m) })
+      SIndexAssign(b, i, v, _, _) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and
+                                      pcs_last_use_consuming(nm, ll, lc, i, cmap) and
+                                      pcs_last_use_consuming(nm, ll, lc, v, cmap)
+      SAssign(b, v, _, _) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and
+                              pcs_last_use_consuming(nm, ll, lc, v, cmap)
+      SUse(_, _, _)       -> true
     }
     here and pcs_lu_consuming_stmts(nm, ll, lc, rest, cmap)
   }
@@ -3252,7 +3298,11 @@ fn pcs_max_paths_b_expr(nm: String, e: Expr, bmap: [BorrowEntry]) : Int =
 
 fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: [BorrowEntry]) : Int = match k {
   EVar(uname)         -> if uname == nm { 1 } else { 0 }
-  EStr(_, _)          -> 0
+  # The use collector parses `#{...}` bodies and sees their reads; this
+  # counter must never see fewer. The lexical count over-approximates
+  # (field names, lambda params count too) — over-counting only makes
+  # callers more conservative, under-counting un-guards a move.
+  EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple)
   ECall(f, xs)        -> {
     # Discount args that land in a borrowed slot of the callee: those uses
     # of `nm` are borrows, not consumers, and do not count.
@@ -3307,6 +3357,40 @@ fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: [BorrowEntry]) : Int = ma
   EExternBody(_)      -> 0
   EVariantsOf(_, _)   -> 0
   EModCall(_, _)      -> 0
+}
+
+# Identifier tokens equal to `nm` inside the `#{...}` parts of a string
+# span. Pure (tokenize, no parse), so the pure counting engines can stay
+# effect-free while agreeing with the collector's parsed view.
+fn pcs_interp_ident_count(nm: String, span: String, is_triple: Bool) : Int = {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  if not has_interp(span, body_start, body_end) { 0 }
+  else {
+    let parts = iscan_collect(span, body_end,
+                              IScan { parts: [], lit_start: body_start, i: body_start })
+    pcs_iic_parts(nm, parts, 0)
+  }
+}
+
+fn pcs_iic_parts(nm: String, parts: [IPart], acc: Int) : Int = match parts {
+  []           -> acc
+  [p, ...rest] -> match p {
+    IpLit(_, _) -> pcs_iic_parts(nm, rest, acc)
+    IpExp(esrc) -> pcs_iic_parts(nm, rest, acc + pcs_iic_toks(nm, esrc, tokenize(esrc), 0))
+  }
+}
+
+fn pcs_iic_toks(nm: String, esrc: String, toks: [Token], acc: Int) : Int = match toks {
+  []           -> acc
+  [t, ...rest] -> {
+    let hit = match t.kind {
+      TkIdent -> if string_slice(esrc, t.start, t.length) == nm { 1 } else { 0 }
+      _       -> 0
+    }
+    pcs_iic_toks(nm, esrc, rest, acc + hit)
+  }
 }
 
 # Walk args, charging 0 for any arg whose index is a borrowed slot of the
@@ -3403,139 +3487,6 @@ fn pcs_max_paths_b_clauses(nm: String, cs: [HClause], bmap: [BorrowEntry]) : Int
 fn pcs_max_paths_b_ret_opt(nm: String, opt: Option[HReturn], bmap: [BorrowEntry]) : Int = match opt {
   None    -> 0
   Some(hr) -> match hr { HR(_, body, _, _) -> pcs_max_paths_b_expr(nm, body, bmap) }
-}
-
-fn pcs_max_paths_in_kind_UNUSED(nm: String, e: Expr) : Int =
-  pcs_max_paths_in_kind(nm, e.kind)
-
-fn pcs_max_paths_in_kind(nm: String, k: ExprKind) : Int = match k {
-  EVar(uname)         -> if uname == nm { 1 } else { 0 }
-  EStr(_, _)          -> 0   # interpolated reads handled by §4b path;
-                              # branch-aware analysis applies to non-
-                              # interpolation reads only.
-  ECall(f, xs)        -> pcs_max_paths_in_expr(nm, f) + pcs_max_paths_seq(nm, xs)
-  EIntrinsic(_, xs)   -> pcs_max_paths_seq(nm, xs)
-  ESurface(sf)   -> pcs_max_paths_seq(nm, surface_children(sf))
-  EField(x, _)        -> pcs_max_paths_in_expr(nm, x)
-  EIndex(a, b)        -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EBinop(_, a, b)     -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EUnop(_, x)         -> pcs_max_paths_in_expr(nm, x)
-  EIf(c, t, opt_e)    -> pcs_max_paths_in_expr(nm, c) +
-                          pcs_max_paths_alt2(nm, t, opt_e)
-  EMatch(s, arms)     -> pcs_max_paths_in_expr(nm, s) +
-                          pcs_max_paths_in_arms(nm, arms, 0)
-  ELambda(_, _)       -> 0
-  ERecordLit(_, fis)  -> pcs_max_paths_in_field_inits(nm, fis)
-  EList(els)          -> pcs_max_paths_in_list_elems(nm, els)
-  ERange(a, b, opt)   -> pcs_max_paths_in_expr(nm, a) +
-                          pcs_max_paths_in_expr(nm, b) +
-                          pcs_max_paths_opt(nm, opt)
-  EBlock(stmts, tail) -> pcs_max_paths_in_block(nm, stmts, tail)
-  EPipe(a, b)         -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EMapPipe(a, b)      -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EFlatMapPipe(a, b)  -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EFilterPipe(a, b)   -> pcs_max_paths_in_expr(nm, a) + pcs_max_paths_in_expr(nm, b)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-    # Handler clauses are alternatives — only one clause fires per op
-    # invocation — but a single body can fire multiple ops, so the
-    # body-vs-clauses relationship is sum, not alt. Conservative
-    # fallback: treat as sum.
-    let bp = pcs_max_paths_in_expr(nm, body)
-    let ip = pcs_max_paths_opt(nm, init_opt)
-    let cp = pcs_max_paths_in_clauses(nm, clauses)
-    let rp = pcs_max_paths_in_ret_opt(nm, ret_opt)
-    bp + ip + cp + rp
-  }
-  EBang(inner)        -> pcs_max_paths_in_expr(nm, inner)
-  ELitUnit(inner, _)  -> pcs_max_paths_in_expr(nm, inner)
-  _                   -> 0
-}
-
-fn pcs_max_paths_seq(nm: String, es: [Expr]) : Int = match es {
-  []           -> 0
-  [h, ...rest] -> pcs_max_paths_in_expr(nm, h) + pcs_max_paths_seq(nm, rest)
-}
-
-fn pcs_max_paths_alt2(nm: String, t: Expr, opt_e: Option[Expr]) : Int = {
-  let tp = pcs_max_paths_in_expr(nm, t)
-  let ep = match opt_e {
-    None    -> 0
-    Some(e) -> pcs_max_paths_in_expr(nm, e)
-  }
-  if tp > ep { tp } else { ep }
-}
-
-fn pcs_max_paths_in_arms(nm: String, arms: [Arm], best: Int) : Int = match arms {
-  [] -> best
-  [a, ...rest] -> match a {
-    Arm(pat, opt_g, body) -> {
-      let gp = match opt_g {
-        None    -> 0
-        Some(g) -> pcs_max_paths_in_expr(nm, g)
-      }
-      let bp = pcs_max_paths_in_expr(nm, body)
-      let armp = gp + bp
-      let nb = if armp > best { armp } else { best }
-      pcs_max_paths_in_arms(nm, rest, nb)
-    }
-  }
-}
-
-fn pcs_max_paths_in_field_inits(nm: String, fis: [FieldInit]) : Int = match fis {
-  []           -> 0
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_max_paths_in_expr(nm, e) + pcs_max_paths_in_field_inits(nm, rest)
-  }
-}
-
-fn pcs_max_paths_in_list_elems(nm: String, els: [ListElem]) : Int = match els {
-  []           -> 0
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_max_paths_in_expr(nm, inner) + pcs_max_paths_in_list_elems(nm, rest)
-  }
-}
-
-fn pcs_max_paths_opt(nm: String, opt: Option[Expr]) : Int = match opt {
-  None    -> 0
-  Some(e) -> pcs_max_paths_in_expr(nm, e)
-}
-
-fn pcs_max_paths_in_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Int =
-  pcs_max_paths_in_stmts(nm, stmts) + pcs_max_paths_opt(nm, tail)
-
-fn pcs_max_paths_in_stmts(nm: String, stmts: [Stmt]) : Int = match stmts {
-  []           -> 0
-  [h, ...rest] -> pcs_max_paths_in_stmt(nm, h) + pcs_max_paths_in_stmts(nm, rest)
-}
-
-fn pcs_max_paths_in_stmt(nm: String, s: Stmt) : Int = match s {
-  SLet(_, _, e)                  -> pcs_max_paths_in_expr(nm, e)
-  SVar(_, _, e, _, _)            -> pcs_max_paths_in_expr(nm, e)
-  SAssert(e, opt_m)              -> pcs_max_paths_in_expr(nm, e) +
-                                     pcs_max_paths_opt(nm, opt_m)
-  SExprStmt(e)                   -> pcs_max_paths_in_expr(nm, e)
-  SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_in_expr(nm, a) +
-                                     pcs_max_paths_in_expr(nm, b) +
-                                     pcs_max_paths_in_expr(nm, c)
-  SAssign(a, c, _, _)            -> pcs_max_paths_in_expr(nm, a) +
-                                     pcs_max_paths_in_expr(nm, c)
-  SUse(_, _, _)                  -> 0
-}
-
-fn pcs_max_paths_in_clauses(nm: String, cs: [HClause]) : Int = match cs {
-  []           -> 0
-  [h, ...rest] -> match h {
-    HC(_, _, body, _, _) ->
-      pcs_max_paths_in_expr(nm, body) + pcs_max_paths_in_clauses(nm, rest)
-  }
-}
-
-fn pcs_max_paths_in_ret_opt(nm: String, opt: Option[HReturn]) : Int = match opt {
-  None    -> 0
-  Some(hr) -> match hr {
-    HR(_, body, _, _) -> pcs_max_paths_in_expr(nm, body)
-  }
 }
 
 # Compute the branch-aware skip-set for a fn body: every top-level
@@ -3731,12 +3682,53 @@ fn pcs_pos_in_kind(ll: Int, lc: Int, k: ExprKind) : Bool = match k {
   EList(els)          -> pcs_pos_in_elems(ll, lc, els)
   EBang(x)            -> pcs_pos_in_expr(ll, lc, x)
   ELitUnit(x, _)      -> pcs_pos_in_expr(ll, lc, x)
-  _ -> false
+  ERange(a, b, opt)   -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b) or
+                         (match opt { None -> false Some(e) -> pcs_pos_in_expr(ll, lc, e) })
+  EPipe(a, b)         -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  EMapPipe(a, b)      -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  EFlatMapPipe(a, b)  -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  EFilterPipe(a, b)   -> pcs_pos_in_expr(ll, lc, a) or pcs_pos_in_expr(ll, lc, b)
+  EIntrinsic(_, xs)   -> pcs_pos_in_exprs(ll, lc, xs)
+  ESurface(sf)        -> pcs_pos_in_exprs(ll, lc, surface_children(sf))
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
+    pcs_pos_in_expr(ll, lc, body) or
+    (match init_opt { None -> false Some(e) -> pcs_pos_in_expr(ll, lc, e) }) or
+    pcs_pos_in_clauses(ll, lc, clauses) or
+    (match ret_opt { None -> false Some(hr) -> match hr { HR(_, b2, _, _) -> pcs_pos_in_expr(ll, lc, b2) } })
+  # A lambda body is a different frame: its reads are in_lam and never a
+  # last-use candidate, so its positions stay invisible on purpose.
+  ELambda(_, _)       -> false
+  # Position-free leaves. No `_` arm — a new ExprKind variant must be
+  # classified here before it compiles.
+  EInt(_, _)          -> false
+  EReal(_, _)         -> false
+  EFixed(_, _)        -> false
+  EIntLit(_)          -> false
+  EDecimalLit(_)      -> false
+  EBool(_)            -> false
+  EChar(_)            -> false
+  EStr(_, _)          -> false
+  EUnit               -> false
+  EVar(_)             -> false
+  EUnder              -> false
+  EPlaceholder        -> false
+  EHole(_)            -> false
+  ETodo(_)            -> false
+  EExternBody(_)      -> false
+  EVariantsOf(_, _)   -> false
+  EModCall(_, _)      -> false
 }
 
 fn pcs_pos_in_arms(ll: Int, lc: Int, arms: [Arm]) : Bool = match arms {
   []           -> false
-  [Arm(_, _, b), ...rest] -> pcs_pos_in_expr(ll, lc, b) or pcs_pos_in_arms(ll, lc, rest)
+  [Arm(_, opt_g, b), ...rest] ->
+    (match opt_g { None -> false Some(g) -> pcs_pos_in_expr(ll, lc, g) }) or
+    pcs_pos_in_expr(ll, lc, b) or pcs_pos_in_arms(ll, lc, rest)
+}
+
+fn pcs_pos_in_clauses(ll: Int, lc: Int, cs: [HClause]) : Bool = match cs {
+  []           -> false
+  [HC(_, _, body, _, _), ...rest] -> pcs_pos_in_expr(ll, lc, body) or pcs_pos_in_clauses(ll, lc, rest)
 }
 
 fn pcs_pos_in_stmts(ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
@@ -3746,7 +3738,12 @@ fn pcs_pos_in_stmts(ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
       SLet(_, _, e)       -> pcs_pos_in_expr(ll, lc, e)
       SVar(_, _, e, _, _) -> pcs_pos_in_expr(ll, lc, e)
       SExprStmt(e)        -> pcs_pos_in_expr(ll, lc, e)
-      _ -> false
+      SAssert(c, opt_m)   -> pcs_pos_in_expr(ll, lc, c) or
+                              (match opt_m { None -> false Some(m) -> pcs_pos_in_expr(ll, lc, m) })
+      SIndexAssign(b, i, v, _, _) -> pcs_pos_in_expr(ll, lc, b) or pcs_pos_in_expr(ll, lc, i) or
+                                      pcs_pos_in_expr(ll, lc, v)
+      SAssign(b, v, _, _) -> pcs_pos_in_expr(ll, lc, b) or pcs_pos_in_expr(ll, lc, v)
+      SUse(_, _, _)       -> false
     }
     here or pcs_pos_in_stmts(ll, lc, rest)
   }
