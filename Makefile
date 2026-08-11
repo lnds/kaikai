@@ -1001,6 +1001,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
 	@$(MAKE) -C stage2 test-perceus-1758-cond-exit-drop-asan
 	@echo "tier1-asan OK — issue #1758 fixture passes under ASAN+UBSan (borrow-move-last param read in a base-arm if condition)"
+	@$(MAKE) -C stage2 test-perceus-1765-binop-base-tail-asan
+	@echo "tier1-asan OK — issue #1765 fixture passes under ASAN+UBSan (borrow-move-last param read under a base-arm binop tail)"
 	@$(MAKE) -C stage2 test-perceus-1302-tcrec-goto-drops-asan
 	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
 	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
