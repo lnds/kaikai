@@ -9,8 +9,8 @@ Run with:
 
     python3 examples/lsp/hover_basic.lsp.py
 
-Exit code 0 = pass; non-zero = failure with a diff against the
-expected response. These tests are **not** wired into tier1 — they
-require `python3` plus a running build of `kai-lsp`. Run them
-locally when touching `tools/kai-lsp/` or the `--library-mode`
-surface in `stage2/compiler.kai`.
+Exit code 0 = pass; exit 2 = `kai-lsp` binary missing (build it
+first); any other non-zero = failure with a diff against the
+expected response. The drivers need `python3` (stdlib only) plus a
+built `tools/kai-lsp/kai-lsp`. `make test-lsp` builds the binary and
+runs all drivers; it is part of tier1.
