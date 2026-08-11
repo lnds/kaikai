@@ -7,8 +7,14 @@ five stdlib protocols (`Show`, `Eq`, `Ord`, `Hash`, `Serialize`) defined
 in `stdlib/protocols.kai`. The compiler resolves dispatch at the AST
 level (between inference and monomorphisation), so each statically-typed
 call site emits a direct `__pimpl_<P>_<T>_<op>` call on both backends
-(C and LLVM). See `docs/lane-experience-m12.8.md` for the implementation
-retrospective and v1 limitations.
+(C and LLVM). A protocol's dispatch identity belongs to the module that
+declares it: when two modules declare the same protocol name, each
+non-core declaration mangles and keys its impls module-qualified
+(`__pimpl_<mod>__<P>_<T>_<op>`), a bare call ranks the calling module's
+own protocol first, and only protocols visible to the calling module
+(own, `pub`, or root-declared) are dispatch candidates. See
+`docs/lane-experience-m12.8.md` for the implementation retrospective and
+v1 limitations.
 
 Single-dispatch ad-hoc polymorphism via explicit `protocol` declarations
 and `impl` blocks. Modeled on Clojure protocols, Elixir protocols, Go

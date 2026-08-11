@@ -72,6 +72,7 @@ import compiler.util
 import compiler.infer
 import compiler.infer_index
 import compiler.protos
+import compiler.proto_scope
 
 # ==================================================================
 # Leak-report value types (pub: main's `report_mono_leaks` reads them).
@@ -985,13 +986,15 @@ fn check_fn_bounds(tuples: [MonoTuple], fn_bounds: [FnBoundsRec],
     [t, ...rest] -> match t {
       MT(mo, name, tys, _) -> match lookup_fn_bounds(fn_bounds, name, mo) {
         None -> check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc)
-        Some(ftbs) -> {
-          let loc = match inst_loc_for(insts, name, tys) {
-            LC(0, 0) -> decl_loc_of(polys, name)
-            lc       -> lc
+        Some(fbr) -> match fbr {
+          FBR(_, fmo, ftbs) -> {
+            let loc = match inst_loc_for(insts, name, tys) {
+              LC(0, 0) -> decl_loc_of(polys, name)
+              lc       -> lc
+            }
+            let acc1 = check_tuple_bounds(ftbs, tys, name, fmo, reg, loc, acc)
+            check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc1)
           }
-          let acc1 = check_tuple_bounds(ftbs, tys, name, reg, loc, acc)
-          check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc1)
         }
       }
     }
@@ -1011,12 +1014,12 @@ fn decl_loc_of(polys: [PolyFn], name: String) : LineCol =
 # own fn, so it matches the target-keyed record; a qualified tuple
 # (`Some(m)`) must name the same module. This keeps a same-named module
 # fn from picking up the root fn's bounds.
-fn lookup_fn_bounds(fbs: [FnBoundsRec], name: String, mo: Option[String]) : Option[[FnTPBound]] {
+fn lookup_fn_bounds(fbs: [FnBoundsRec], name: String, mo: Option[String]) : Option[FnBoundsRec] {
   match fbs {
     [] -> None
     [f, ...rest] -> match f {
-      FBR(n, fmo, ftbs) ->
-        if n == name and mo_matches(fmo, mo) { Some(ftbs) }
+      FBR(n, fmo, _) ->
+        if n == name and mo_matches(fmo, mo) { Some(f) }
         else { lookup_fn_bounds(rest, name, mo) }
     }
   }
@@ -1044,6 +1047,7 @@ fn inst_loc_for(insts: [ResolvedCS], name: String, tys: [Ty]) : LineCol {
 type LineCol = LC(Int, Int)
 
 fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
+                      fmo: Option[String],
                       reg: ProtocolReg, loc: LineCol,
                       acc: [BoundViolation]) : [BoundViolation] {
   match ftbs {
@@ -1054,29 +1058,30 @@ fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
           None -> acc
           Some(ty) -> match ty_head_name(ty) {
             None -> acc
-            Some(head) -> check_protos_for_head(protos, head, name, ty, reg, loc, acc)
+            Some(head) -> check_protos_for_head(protos, head, name, fmo, ty, reg, loc, acc)
           }
         }
-        check_tuple_bounds(rest, tys, name, reg, loc, acc1)
+        check_tuple_bounds(rest, tys, name, fmo, reg, loc, acc1)
       }
     }
   }
 }
 
 fn check_protos_for_head(protos: [String], head: String, fname: String,
+                         fmo: Option[String],
                          ty: Ty, reg: ProtocolReg, loc: LineCol,
                          acc: [BoundViolation]) : [BoundViolation] {
   match protos {
     [] -> acc
     [p, ...rest] -> {
-      let acc1 = if head_satisfies_proto(reg, p, head) { acc }
+      let acc1 = if head_satisfies_proto(reg, p, fmo, head) { acc }
                  else {
                    let msg = concat_all(["type `", mono_ty_to_string(ty),
                      "` does not satisfy the bound `", p,
                      "` on a type parameter of `", fname, "`"])
                    match loc { LC(l, c) -> [BV(msg, l, c), ...acc] }
                  }
-      check_protos_for_head(rest, head, fname, ty, reg, loc, acc1)
+      check_protos_for_head(rest, head, fname, fmo, ty, reg, loc, acc1)
     }
   }
 }
@@ -1085,8 +1090,16 @@ fn check_protos_for_head(protos: [String], head: String, fname: String,
 # synthesised impl (both land in `reg.impls` via `expand_derives`
 # + `lower_impls`), or a structural builtin (Int/Real/... for
 # Eq/Show/Ord/Hash). Same trio the derive validator trusts.
-fn head_satisfies_proto(reg: ProtocolReg, proto: String, head: String) : Bool =
-  prc_reg_has_impl(reg, proto, head) or derive_builtin_impl(proto, head)
+# The bound's name resolves from the declaring fn's module, so a
+# contested protocol name checks against its own impl table.
+fn head_satisfies_proto(reg: ProtocolReg, proto: String,
+                        fmo: Option[String], head: String) : Bool {
+  let pkey = match proto_scope_resolve(reg.origins, proto, fmo) {
+    PRHome(ph) -> proto_key_of(reg.dkeys, proto, ph)
+    _ -> proto
+  }
+  prc_reg_has_impl(reg, pkey, head) or derive_builtin_impl(proto, head)
+}
 
 fn ty_at(tys: [Ty], idx: Int) : Option[Ty] {
   match tys {
