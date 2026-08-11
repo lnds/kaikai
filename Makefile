@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -141,11 +141,10 @@ test-import-qualified-record: kaic2
 	  echo "$$case OK"; \
 	done
 
-# m12.8 Phase 3 — Core demo gate. Delegates to stage2's
-# `test-demos-core` which builds each demo under examples/portfolio/
-# and examples/usd_to_eur/ on both backends, redirects stdin from the
-# `.in` fixture when present, and diffs against `.out.expected`. The
-# top-level alias matches the name Eric proposed in the m12.8 review.
+# Core demo gate. Delegates to stage2's `test-demos-core` which builds
+# each demo under examples/portfolio/ and examples/usd_to_eur/ with the
+# C backend, redirects stdin from the `.in` fixture when present, and
+# diffs against `.out.expected`.
 demos-verify: kaic2
 	$(MAKE) -C stage2 test-demos-core
 
@@ -187,7 +186,7 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
 	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
 
 # The native half of the namespace gate lives in stage2 (it needs $(TARGET));
@@ -373,7 +372,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
+tier1: test demos-no-regression test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -423,7 +422,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
+	$(MAKE) test-fmt test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-editions test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
 tier1-shard-2: kaic2
@@ -529,6 +528,12 @@ test-canonical-aliases:
 # Pure shell, no compiler — runs fast, gates a source property.
 test-runtime-global-audit:
 	@./tools/runtime-global-audit.sh --self-test
+
+# Structural coverage guard: every test-* target and fixture directory
+# must be reachable from a tier — a defined-but-never-run gate reads as
+# coverage while its corpus rots. Pure text, no compiler.
+test-wiring-audit:
+	@./tools/audit-test-wiring.sh
 
 # The other half of the KAI_HOT_ONLY soundness argument. gen-runtime-bc.sh
 # proves no function IN the hot bitcode reaches swapcontext; this proves no
@@ -849,6 +854,11 @@ test-independence-oracle: kaic2
 test-packages: kaic2
 	@tools/test-packages.sh
 
+# Edition-selection surface: per-edition behaviour, repo-EDITION
+# fallback, unknown-edition diagnostic.
+test-editions: kaic2
+	@tools/test-editions.sh
+
 # Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
 # with `-fsanitize=address,undefined` and runs each binary; fails on
 # any sanitizer diagnostic or if the demos baseline regresses under
@@ -972,6 +982,10 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
 	@$(MAKE) -C stage2 test-perceus-1758-cond-exit-drop-asan
 	@echo "tier1-asan OK — issue #1758 fixture passes under ASAN+UBSan (borrow-move-last param read in a base-arm if condition)"
+	@$(MAKE) -C stage2 test-perceus-1302-tcrec-goto-drops-asan
+	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
+	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
+	@echo "tier1-asan OK — issue #1635 fixture passes under ASAN+UBSan (goto move-set name collision, no stale-cell read)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
