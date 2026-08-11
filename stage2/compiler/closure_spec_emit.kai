@@ -17,16 +17,25 @@ type ShadowNA = { names: [String], vals: [Expr] }
 # `n(..., f)` calls onto this same spec so a self-recursive higher-order
 # (`foldl_loop`) becomes a self-recursive spec — TRMC then re-forms the
 # loop instead of a fresh one-iteration wrapper per recursion site.
-# The spec's `(name, line, col)` mangle is globally unique, so it needs
-# no module tag — emitting it with `mo = None` (bare symbol) keeps the
-# name in step with the bare `EVar` its call sites retarget to, whether
+# The callee's module rides inside the spec NAME (see `cspec_name`), but
+# the spec itself is emitted with `mo = None` (bare symbol) so the name
+# stays in step with the bare `EVar` its call sites retarget to, whether
 # the original callee was `mod.f` or a bare `f`.
-pub fn emit_cspec(r: CSpecReq) : Decl =
+#
+# A module callee's body is qualified BEFORE beta-reduction: its bare
+# calls resolved own-module-first inside the module, but the spec is a
+# root decl where a bare `empty()` resolves globally and can land on a
+# same-named fn from another module. Qualifying pre-beta keeps the
+# inlined closure's own body out of the walk — its bare calls belong to
+# the root file, not the callee's module.
+pub fn emit_cspec(r: CSpecReq, all: [Decl]) : Decl =
   match r {
     CSReq(callee, idx, ca, _, _) -> match callee {
-      DFn(p, n, tp, ps, rt, _, body, dl, dc, _) -> {
-        let sname = cspec_name(n, closure_disc(ca))
-        let beta = beta_apply_all(body, param_name_at(ps, idx), ca)
+      DFn(p, n, tp, ps, rt, _, body, dl, dc, mo) -> {
+        let sname = cspec_name(mo, n, closure_disc(ca))
+        let fname = param_name_at(ps, idx)
+        let body0 = qualify_own_calls(body, [n, fname], mo, all)
+        let beta = beta_apply_all(body0, fname, ca)
         let body1 = retarget_self(beta, n, idx, sname)
         let ps1 = drop_param_at(ps, idx)
         # Only pure closures reach here (classify_closure gate), so the
@@ -41,6 +50,40 @@ pub fn emit_cspec(r: CSpecReq) : Decl =
       _ -> callee
     }
   }
+
+# Qualify a module callee body's bare calls onto their home module, so
+# they keep resolving to the module's own fns once the body lives in a
+# root-emitted spec. Only calls to a fn the module declares are touched;
+# `keep` (the callee's own name, for `retarget_self` to fold, and the
+# functional param, for beta-reduction to apply) stays bare. Callee
+# position only: these bodies never pass a sibling module fn as a value.
+fn qualify_own_calls(e: Expr, keep: [String], mo: Option[String], all: [Decl]) : Expr =
+  match mo {
+    None    -> e
+    Some(m) -> qualify_walk(e, keep, m, module_fn_names(all, m))
+  }
+
+fn module_fn_names(ds: [Decl], m: String) : [String] =
+  match ds {
+    [] -> []
+    [d, ...rest] ->
+      if mo_is(cs_decl_mo(d), m) { [cs_decl_name(d), ...module_fn_names(rest, m)] }
+      else { module_fn_names(rest, m) }
+  }
+
+fn qualify_walk(e: Expr, keep: [String], m: String, mnames: [String]) : Expr = {
+  let e1 = remap(e, map_expr_kind(e.kind, (k) => qualify_walk(k, keep, m, mnames)))
+  match e1.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(n) ->
+        if not list_has(keep, n) and list_has(mnames, n) {
+          remap(e1, ECall(remap(callee, EModCall(m, n)), args_))
+        } else { e1 }
+      _ -> e1
+    }
+    _ -> e1
+  }
+}
 
 # Retarget a body's own recursive `n(args)` (arity matching the original,
 # with the closure re-substituted at `idx`) onto `sname` with the
