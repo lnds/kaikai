@@ -5953,8 +5953,16 @@ static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
         FILE *fp = fopen(pbuf, "rb");
+        struct stat st;
         if (!fp) {
             KaiValue *msg = kai_str("read_file: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
+             * reports the htree EOF sentinel (~2^63), so reject before
+             * sizing the buffer. */
+            fclose(fp);
+            KaiValue *msg = kai_str("read_file: is a directory");
             r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
         } else if (fseek(fp, 0, SEEK_END) != 0) {
             fclose(fp);
@@ -6274,8 +6282,16 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
         FILE *fp = fopen(pbuf, "rb");
+        struct stat st;
         if (!fp) {
             KaiValue *msg = kai_str("file_read_bytes: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
+             * reports the htree EOF sentinel (~2^63), so reject before
+             * sizing the buffer. */
+            fclose(fp);
+            KaiValue *msg = kai_str("file_read_bytes: is a directory");
             r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
         } else if (fseek(fp, 0, SEEK_END) != 0) {
             fclose(fp);
