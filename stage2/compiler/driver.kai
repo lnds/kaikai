@@ -3932,7 +3932,7 @@ fn lib_run_probe(tm: TypedModule, raw_decls: [Decl], p: LibProbe) : String {
         # DType / DConst survive — the typer drops DType and reshapes
         # DConst into DAttribPure(DFn), neither of which carries the
         # parser-visible identity.
-        let syms = lib_collect_symbols(raw_decls)
+        let syms = lib_collect_symbols(raw_decls, module_name_of_path(tm.tm_file))
         concat_all([head,
           ", \"symbols\": [", join_with(syms, ", "), "]",
           "}"])
@@ -3950,36 +3950,62 @@ fn lib_run_probe(tm: TypedModule, raw_decls: [Decl], p: LibProbe) : String {
 fn lib_run_probes(tm: TypedModule, raw_decls: [Decl], ps: [LibProbe]) : [String] =
   map(ps, (p) => lib_run_probe(tm, raw_decls, p))
 
-# documentSymbol. Walk the typed-module decls and emit a JSON entry
-# per top-level decl authored in the root
-# file. Module origin filters out preloaded core / stdlib decls
-# — the editor only wants the user's own declarations in the
-# outline panel.
-fn lib_collect_symbols(ds: [Decl]) : [String] =
-  list_reverse(lib_collect_symbols_loop(ds, []))
+# documentSymbol. Walk the raw decls and emit a JSON entry per
+# top-level decl authored in the root file — the editor only wants
+# the user's own declarations in the outline panel. Root membership
+# follows the origin stamps where the decl kind carries one; kinds
+# without an origin slot (DUnit, DTest, DBench) attribute to the
+# walk's running anchor, mirroring partition_by_homes_walk: they
+# live in the same physical file as the surrounding stamped decls.
+fn lib_collect_symbols(ds: [Decl], root_mod: String) : [String] =
+  list_reverse(lib_collect_symbols_loop(ds, root_mod, false, []))
 
-fn lib_collect_symbols_loop(ds: [Decl], acc: [String]) : [String] {
+fn lib_collect_symbols_loop(ds: [Decl], root_mod: String, in_root: Bool,
+                            acc: [String]) : [String] {
   match ds {
     []           -> acc
-    [d, ...rest] -> match lib_decl_to_symbol(d) {
-      None    -> lib_collect_symbols_loop(rest, acc)
-      Some(s) -> lib_collect_symbols_loop(rest, [s, ...acc])
+    [d, ...rest] -> {
+      let root1 = lib_symbol_in_root(d, root_mod, in_root)
+      match lib_decl_to_symbol(d, root1) {
+        None    -> lib_collect_symbols_loop(rest, root_mod, root1, acc)
+        Some(s) -> lib_collect_symbols_loop(rest, root_mod, root1, [s, ...acc])
+      }
     }
   }
 }
 
-fn lib_decl_to_symbol(d: Decl) : Option[String] {
+# The root file's own pub DFns and DTypes carry `Some(<root basename>)`
+# (tag_target_decl), so root membership is canon_mo-style: untagged or
+# tagged with the root's own name.
+fn lib_origin_is_root(mo: Option[String], root_mod: String) : Bool =
+  match mo { None -> true  Some(m) -> m == root_mod }
+
+fn lib_symbol_in_root(d: Decl, root_mod: String, in_root: Bool) : Bool {
   match d {
-    DFn(_, n, _, _, _, _, _, line, col, origin) ->
-      if is_root_origin(origin) and is_user_pos(line, col) {
-        Some(lib_symbol_json("Function", n, line, col))
-      } else { None }
+    DFn(_, _, _, _, _, _, _, _, _, mo)   -> lib_origin_is_root(mo, root_mod)
+    DEffect(_, _, _, _, _, _, _, mo)     -> lib_origin_is_root(mo, root_mod)
+    DProtocol(_, _, _, _, _, _, mo)      -> lib_origin_is_root(mo, root_mod)
+    DConst(_, _, _, _, mo, _, _)         -> lib_origin_is_root(mo, root_mod)
+    DType(_, _, _, _, _, _, mo, _)       ->
+      match mo { Some(m) -> m == root_mod  None -> in_root }
+    DDerive(_, inner, _, _)              -> lib_symbol_in_root(inner, root_mod, in_root)
+    DUnstable(inner, _, _)               -> lib_symbol_in_root(inner, root_mod, in_root)
+    DProtoLaws(_, inner, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DImplAxiom(_, inner, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DConstructor(inner, _, _)            -> lib_symbol_in_root(inner, root_mod, in_root)
+    _ -> in_root
+  }
+}
+
+fn lib_decl_to_symbol(d: Decl, in_root: Bool) : Option[String] {
+  if not in_root { None }
+  else { match d {
+    DFn(_, n, _, _, _, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Function", n, line, col)) } else { None }
     DConst(_, n, _, _, _, line, col) ->
       if is_user_pos(line, col) { Some(lib_symbol_json("Constant", n, line, col)) } else { None }
-    DType(_, n, _, _, line, col, origin, _) ->
-      if is_root_origin(origin) and is_user_pos(line, col) {
-        Some(lib_symbol_json("Class", n, line, col))
-      } else { None }
+    DType(_, n, _, _, line, col, _, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Class", n, line, col)) } else { None }
     DEffect(_, n, _, _, _, line, col, _) ->
       if is_user_pos(line, col) { Some(lib_symbol_json("Interface", n, line, col)) } else { None }
     DProtocol(_, n, _, _, line, col, _) ->
@@ -3990,13 +4016,13 @@ fn lib_decl_to_symbol(d: Decl) : Option[String] {
       if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
     DBench(name, _, line, col) ->
       if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
-    DDerive(_, inner, _, _) -> lib_decl_to_symbol(inner)
-    DUnstable(inner, _, _)  -> lib_decl_to_symbol(inner)
-    DProtoLaws(_, inner, _, _)  -> lib_decl_to_symbol(inner)
-    DImplAxiom(_, inner, _, _)  -> lib_decl_to_symbol(inner)
-    DConstructor(inner, _, _)  -> lib_decl_to_symbol(inner)
+    DDerive(_, inner, _, _) -> lib_decl_to_symbol(inner, in_root)
+    DUnstable(inner, _, _)  -> lib_decl_to_symbol(inner, in_root)
+    DProtoLaws(_, inner, _, _)  -> lib_decl_to_symbol(inner, in_root)
+    DImplAxiom(_, inner, _, _)  -> lib_decl_to_symbol(inner, in_root)
+    DConstructor(inner, _, _)  -> lib_decl_to_symbol(inner, in_root)
     _ -> None
-  }
+  } }
 }
 
 # Compiler-injected decls (builtin effects, root core, anonymous
