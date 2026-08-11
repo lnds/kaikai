@@ -84,6 +84,33 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.112.0 (2026-08-11)
+
+### Added
+
+- **lint**: flag a list literal left of ++ as list_concat_literal_to_spread (#1746)
+- **pkg**: declare a package's native C sources in kai.toml [native] (#1745)
+
+### Fixed
+
+- **perceus**: make the move gates scan every position the use collector sees (#1772)
+- **typer**: key protocol dispatch identity by the declaring module (#1748)
+- **compiler**: scope the symbols probe to root-authored decls; wire LSP drivers into tier1 (#1767)
+- **runtime**: reject directories in read_file and file_read_bytes (#1764)
+- **perceus**: gate borrow-move-last on consuming reads in if-conditions and guards (#1763)
+- **compiler**: key closure specs by module and qualify spec bodies (#1757)
+- **cli**: reject unknown flags in every subcommand instead of eating them (#1755)
+- **typer**: inherit const scoping in interp-lifted sub-trees (#1747)
+- **typer**: unify pipe stage params with the element before the container (#1754)
+- **typer**: grant test/bench/check bodies the Ffi capability the entry may declare (#1753)
+- **typer**: scope const reads to the module that declares them (#1740)
+- **typer**: scope unit habitant names to the module that declares them (#1736)
+- **typer**: validate impls against the protocol their module declares (#1738)
+
+### Changed
+
+- **perceus**: enumerate ExprKind exhaustively in ownership walkers (#1769)
+
 ## v0.111.0 (2026-08-10)
 
 ### Added
