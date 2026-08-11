@@ -1417,7 +1417,7 @@ fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
         LUAt(_, _, _) ->
           if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and
              pcs_max_paths_b_expr(nm, body, bmap) == 1 and
-             pcs_nm_absent_from_nonrec_tails(self_name, nm, body) {
+             pcs_nm_absent_from_nonrec_tails(self_name, nm, body, bmap) {
             [nm, ...more]
           } else { more }
         _ -> more
@@ -1434,27 +1434,34 @@ fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
 # a consuming call) takes a ref while the exit wrap still drops `nm` on
 # that path, two releases of one. Statements ahead of a re-threading
 # tail stay allowed: they are the discounted prefix of the re-thread.
-fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr) : Bool / Console =
-  pcs_nmant_kind(self_name, nm, e.kind)
+fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr, bmap: [BorrowEntry]) : Bool / Console =
+  pcs_nmant_kind(self_name, nm, e.kind, bmap)
 
-fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind) : Bool / Console = match k {
+fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind, bmap: [BorrowEntry]) : Bool / Console = match k {
   ECall(f, _) -> match f.kind {
     EVar(c)        -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
     EModCall(_, c) -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
     _              -> not pcs_name_in_expr_k(nm, k)
   }
-  EIf(_, t, opt_e) ->
-    pcs_nm_absent_from_nonrec_tails(self_name, nm, t) and
-    (match opt_e { None -> true Some(e2) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, e2) })
+  # The condition evaluates on EVERY path through the if, including the
+  # base ones: a CONSUMING read of `nm` there spends the ref the exit
+  # wrap still drops. A borrow-discounted read (a borrowed callee slot,
+  # e.g. the vec-length probe a Vec match desugars to) keeps no ref and
+  # stays allowed — the max-path count with `bmap` charges only real
+  # consumers.
+  EIf(c, t, opt_e) ->
+    pcs_max_paths_b_expr(nm, c, bmap) == 0 and
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) and
+    (match opt_e { None -> true Some(e2) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, e2, bmap) })
   # The scrutinee is part of the tail: `match consume(nm) { ... }` in a base
   # tail spends the ref the exit wrap still drops.
   EMatch(s, arms) -> not pcs_name_in_expr(nm, s) and
-                      pcs_nmant_arms(self_name, nm, arms)
+                      pcs_nmant_arms(self_name, nm, arms, bmap)
   EBlock(stmts, opt_tail) -> match opt_tail {
     None    -> not pcs_name_in_stmts(nm, stmts)
     Some(t) ->
-      if ppd_has_self_call(t, self_name) { pcs_nm_absent_from_nonrec_tails(self_name, nm, t) }
-      else { not pcs_name_in_stmts(nm, stmts) and pcs_nm_absent_from_nonrec_tails(self_name, nm, t) }
+      if ppd_has_self_call(t, self_name) { pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) }
+      else { not pcs_name_in_stmts(nm, stmts) and pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) }
   }
   _ -> not pcs_name_in_expr_k(nm, k)
 }
@@ -1464,10 +1471,13 @@ fn pcs_name_in_stmts(nm: String, stmts: [Stmt]) : Bool / Console = {
   pcs_uses_has_name(us, nm)
 }
 
-fn pcs_nmant_arms(self_name: String, nm: String, arms: [Arm]) : Bool / Console = match arms {
+# A guard evaluates before its arm is chosen — a consuming read of `nm`
+# there lands on base paths too; borrow-discounted reads stay allowed.
+fn pcs_nmant_arms(self_name: String, nm: String, arms: [Arm], bmap: [BorrowEntry]) : Bool / Console = match arms {
   []           -> true
-  [Arm(_, _, b), ...rest] ->
-    pcs_nm_absent_from_nonrec_tails(self_name, nm, b) and pcs_nmant_arms(self_name, nm, rest)
+  [Arm(_, opt_g, b), ...rest] ->
+    (match opt_g { None -> true Some(g) -> pcs_max_paths_b_expr(nm, g, bmap) == 0 }) and
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, b, bmap) and pcs_nmant_arms(self_name, nm, rest, bmap)
 }
 
 fn pcs_name_in_expr_k(nm: String, k: ExprKind) : Bool / Console = {

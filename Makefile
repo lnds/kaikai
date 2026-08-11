@@ -970,6 +970,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1464 fixture passes under ASAN+UBSan (raw Int128 op family, boxed div/mod, fresh box per boxed border)"
 	@$(MAKE) -C stage2 test-issue-1331-borrowed-op-arg-asan
 	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
+	@$(MAKE) -C stage2 test-perceus-1758-cond-exit-drop-asan
+	@echo "tier1-asan OK — issue #1758 fixture passes under ASAN+UBSan (borrow-move-last param read in a base-arm if condition)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
