@@ -2343,7 +2343,7 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
       # the counted-owner scrutinee gate (pcs_scr_owned) plus the
       # runtime rc==1 guard establish that together.
       if flat_ok and shape_ok {
-        pcs_try_reuse_variant(body, list_length(ps))
+        pcs_try_reuse_variant(body, list_length(ps), prc_pat_binders(pat, []))
       } else { body }
     }
     # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
@@ -2351,7 +2351,7 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
     # enforced inside `pcs_try_reuse_record`).
     PRecord(pfs) ->
       if pcs_shape_matches(scr_ty, body.ty) {
-        pcs_try_reuse_record(body, list_length(pfs))
+        pcs_try_reuse_record(body, list_length(pfs), prc_pat_binders(pat, []))
       } else { body }
     _ -> body
   }
@@ -2406,7 +2406,7 @@ fn pcs_try_reuse_cons(body: Expr) : Expr {
   }
 }
 
-fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
+fn pcs_try_reuse_variant(body: Expr, expected_arity: Int, binders: [String]) : Expr {
   match body.kind {
     ECall(callee, cargs) -> match callee.kind {
       EVar(cname) ->
@@ -2418,7 +2418,8 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
         # combined with the typer-aware shape match it is sound.
         if list_length(cargs) == expected_arity and pcs_name_is_ctor(cname) {
           pcs_mk_call("__perceus_reuse_variant",
-                      [pcs_mk_scr(body.line, body.col), body],
+                      [pcs_mk_scr(body.line, body.col),
+                       pcs_reuse_rebuild(body, callee, pcs_reuse_strip_dups(cargs, binders))],
                       body.line, body.col)
         } else { body }
       # The resolver qualifies a user constructor to its declaring
@@ -2431,7 +2432,8 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
       EModCall(_mod, cname) ->
         if list_length(cargs) == expected_arity and pcs_name_is_ctor(cname) {
           pcs_mk_call("__perceus_reuse_variant",
-                      [pcs_mk_scr(body.line, body.col), body],
+                      [pcs_mk_scr(body.line, body.col),
+                       pcs_reuse_rebuild(body, callee, pcs_reuse_strip_dups(cargs, binders))],
                       body.line, body.col)
         } else { body }
       _ -> body
@@ -2439,6 +2441,10 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int) : Expr {
     _ -> body
   }
 }
+
+fn pcs_reuse_rebuild(body: Expr, callee: Expr, cargs: [Expr]) : Expr =
+  Expr { kind: ECall(callee, cargs),
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
 fn pcs_name_is_ctor(nm: String) : Bool {
   match char_at(nm, 0) {
@@ -2478,15 +2484,147 @@ fn pcs_all_flat_subs(ps: [Pattern]) : Bool =
     [p, ...rest] -> if pcs_sub_is_flat(p) { pcs_all_flat_subs(rest) } else { false }
   }
 
-fn pcs_try_reuse_record(body: Expr, expected_n: Int) : Expr {
+fn pcs_try_reuse_record(body: Expr, expected_n: Int, binders: [String]) : Expr {
   match body.kind {
-    ERecordLit(_rec_name, fis) ->
+    ERecordLit(rec_name, fis) ->
       if list_length(fis) == expected_n {
+        let body2 = Expr { kind: ERecordLit(rec_name, pcs_strip_dup_fields(fis, binders)),
+                           line: body.line, col: body.col, ty: body.ty, mode: body.mode }
         pcs_mk_call("__perceus_reuse_record",
-                    [pcs_mk_scr(body.line, body.col), body],
+                    [pcs_mk_scr(body.line, body.col), body2],
                     body.line, body.col)
       } else { body }
     _ -> body
+  }
+}
+
+# ---- sentinel arg normalisation: restore move-at-last-use ---------------
+#
+# The reuse paths consume exactly ONE incoming reference per rebuild slot
+# and no arm-exit payer runs after a sentinel body, so a pattern binder
+# whose every rebuild read is a `__perceus_dup` wrap (the cross-arm
+# name-collision shape: `last_use_for` sees a sibling arm's read of the
+# same name and marks both non-last) leaves its extraction reference
+# unpaid — one leaked cell per reuse, both backends. Unwrapping the LAST
+# top-level dup hands that reference to its slot: the raw last-use move
+# the accounting already balances. Conservative: the unwrap fires only
+# when the binder appears NOWHERE outside top-level dup wraps (no raw
+# read to double-consume, no call-nested read whose C argument evaluation
+# order is unspecified).
+
+fn pcs_reuse_strip_dups(es: [Expr], binders: [String]) : [Expr] = match binders {
+  []           -> es
+  [b, ...rest] -> pcs_reuse_strip_dups(pcs_strip_one_binder(es, b), rest)
+}
+
+fn pcs_strip_one_binder(es: [Expr], b: String) : [Expr] = {
+  let top = pcs_top_dup_count(es, b)
+  if top >= 1 and not pcs_occurs_outside_top_dups(es, b) {
+    pcs_unwrap_nth_dup(es, b, top)
+  } else { es }
+}
+
+fn pcs_top_dup_count(es: [Expr], b: String) : Int = match es {
+  []           -> 0
+  [e, ...rest] -> (if pcs_is_dup_read(e, b) { 1 } else { 0 }) + pcs_top_dup_count(rest, b)
+}
+
+fn pcs_is_dup_read(e: Expr, b: String) : Bool = match e.kind {
+  ECall(f, xs) -> match f.kind {
+    EVar(fname) ->
+      if fname == "__perceus_dup" {
+        match xs { [inner] -> match inner.kind { EVar(u) -> u == b _ -> false } _ -> false }
+      } else { false }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn pcs_occurs_outside_top_dups(es: [Expr], b: String) : Bool = match es {
+  []           -> false
+  [e, ...rest] ->
+    if pcs_is_dup_read(e, b) { pcs_occurs_outside_top_dups(rest, b) }
+    else if pcs_var_occurs(e, b) { true }
+    else { pcs_occurs_outside_top_dups(rest, b) }
+}
+
+# Any appearance of `b`: reads at any depth, shadowed rebinds included,
+# interpolation spans by substring. Over-approximates on purpose — a true
+# verdict only forfeits the unwrap.
+fn pcs_var_occurs(e: Expr, b: String) : Bool = match e.kind {
+  EVar(u)            -> u == b
+  EStr(span, _)      -> string_contains(span, b)
+  ECall(f, xs)       -> pcs_var_occurs(f, b) or pcs_var_occurs_list(xs, b)
+  EIntrinsic(_, xs)  -> pcs_var_occurs_list(xs, b)
+  EField(x, _)       -> pcs_var_occurs(x, b)
+  EIndex(x, i)       -> pcs_var_occurs(x, b) or pcs_var_occurs(i, b)
+  EBinop(_, l, r)    -> pcs_var_occurs(l, b) or pcs_var_occurs(r, b)
+  EUnop(_, x)        -> pcs_var_occurs(x, b)
+  EIf(c, t, eo)      -> pcs_var_occurs(c, b) or pcs_var_occurs(t, b) or pcs_var_occurs_opt(eo, b)
+  ELambda(_, lb)     -> pcs_var_occurs(lb, b)
+  ERecordLit(_, fs)  -> pcs_var_occurs_fields(fs, b)
+  EList(els)         -> pcs_var_occurs_elems(els, b)
+  ERange(l, r, so)   -> pcs_var_occurs(l, b) or pcs_var_occurs(r, b) or pcs_var_occurs_opt(so, b)
+  ELitUnit(x, _)     -> pcs_var_occurs(x, b)
+  EBang(x)           -> pcs_var_occurs(x, b)
+  EInt(_, _)         -> false
+  EReal(_, _)        -> false
+  EIntLit(_)         -> false
+  EDecimalLit(_)     -> false
+  EFixed(_, _)       -> false
+  EBool(_)           -> false
+  EChar(_)           -> false
+  EUnit              -> false
+  EUnder             -> false
+  EModCall(_, _)     -> false
+  _                  -> true
+}
+
+fn pcs_var_occurs_list(es: [Expr], b: String) : Bool = match es {
+  []           -> false
+  [e, ...rest] -> pcs_var_occurs(e, b) or pcs_var_occurs_list(rest, b)
+}
+
+fn pcs_var_occurs_opt(oe: Option[Expr], b: String) : Bool = match oe {
+  None    -> false
+  Some(e) -> pcs_var_occurs(e, b)
+}
+
+fn pcs_var_occurs_fields(fs: [FieldInit], b: String) : Bool = match fs {
+  []            -> false
+  [fi, ...rest] -> match fi { FI(_, v) -> pcs_var_occurs(v, b) or pcs_var_occurs_fields(rest, b) }
+}
+
+fn pcs_var_occurs_elems(els: [ListElem], b: String) : Bool = match els {
+  []            -> false
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> pcs_var_occurs(e, b) or pcs_var_occurs_elems(rest, b)
+    ElSpread(e) -> pcs_var_occurs(e, b) or pcs_var_occurs_elems(rest, b)
+  }
+}
+
+fn pcs_unwrap_nth_dup(es: [Expr], b: String, n: Int) : [Expr] = match es {
+  []           -> []
+  [e, ...rest] ->
+    if pcs_is_dup_read(e, b) {
+      if n == 1 { [pcs_dup_inner_read(e), ...rest] }
+      else { [e, ...pcs_unwrap_nth_dup(rest, b, n - 1)] }
+    } else { [e, ...pcs_unwrap_nth_dup(rest, b, n)] }
+}
+
+fn pcs_dup_inner_read(e: Expr) : Expr = match e.kind {
+  ECall(_, xs) -> match xs { [inner] -> inner _ -> e }
+  _            -> e
+}
+
+fn pcs_strip_dup_fields(fis: [FieldInit], binders: [String]) : [FieldInit] =
+  pcs_zip_fields(fis, pcs_reuse_strip_dups(map(fis, (fi) => match fi { FI(_, v) -> v }), binders))
+
+fn pcs_zip_fields(fis: [FieldInit], vals: [Expr]) : [FieldInit] = match fis {
+  []            -> []
+  [fi, ...frest] -> match vals {
+    [v, ...vrest] -> match fi { FI(n, _) -> [FI(n, v), ...pcs_zip_fields(frest, vrest)] }
+    []            -> []
   }
 }
 

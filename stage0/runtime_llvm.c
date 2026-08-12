@@ -701,8 +701,9 @@ KaiValue *kaix_check_unique(KaiValue *scr) {
  * argument layout as `kai_record` / `kai_variant`, with the consumed
  * scrutinee as the leading parameter. */
 KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n,
-                                     KaiValue **fields, const char **names) {
-  return kai_reuse_or_alloc_record(scr, n, fields, names);
+                                     KaiValue **fields, const char **names,
+                                     uint64_t kept_mask) {
+  return kai_reuse_or_alloc_record(scr, n, fields, names, kept_mask);
 }
 KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
                                       const char *name, int n, KaiValue **args) {
