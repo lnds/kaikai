@@ -22,6 +22,7 @@ over-release (a double-free).
 """)]
 
 import compiler.ast
+import compiler.expr_positions
 import compiler.util
 import compiler.fnreg
 import compiler.modules
@@ -124,45 +125,29 @@ pub fn tcl_consumes(e: Expr, nm: String) : Bool = tcl_scan(e, nm, false)
 # `every_read` false = Perceus consume scan (dup wraps are transparent
 # reads, interp spans only count when they interpolate). true = capture
 # scan under a lambda: any appearance keeps the entry conservatively.
-fn tcl_scan(e: Expr, nm: String, every_read: Bool) : Bool =
-  tcl_scan_kind(e.kind, nm, every_read)
-
-fn tcl_scan_kind(k: ExprKind, nm: String, ev: Bool) : Bool = match k {
-  EVar(n)          -> n == nm
-  ECall(f, xs)     -> tcl_scan_call(f, xs, nm, ev)
-  EField(b, _)     -> tcl_scan(b, nm, ev)
-  EIndex(a, b)     -> tcl_scan2(a, b, nm, ev)
-  EBinop(_, a, b)  -> tcl_scan2(a, b, nm, ev)
-  EUnop(_, x)      -> tcl_scan(x, nm, ev)
-  EIf(c, t, oe)    -> tcl_scan2(c, t, nm, ev) or tcl_scan_opt(oe, nm, ev)
-  EMatch(s, arms)  -> tcl_scan(s, nm, ev) or tcl_scan_arms(arms, nm, ev)
-  ELambda(_, body) -> tcl_scan(body, nm, true)
-  ERecordLit(_, fs) -> tcl_scan_fields(fs, nm, ev)
-  EList(els)       -> tcl_scan_elems(els, nm, ev)
-  ERange(a, b, os) -> tcl_scan2(a, b, nm, ev) or tcl_scan_opt(os, nm, ev)
-  EBlock(ss, ot)   -> tcl_scan_stmts(ss, nm, ev) or tcl_scan_opt(ot, nm, ev)
-  EPipe(a, b)         -> tcl_scan2(a, b, nm, ev)
-  EMapPipe(a, b)      -> tcl_scan2(a, b, nm, ev)
-  EFlatMapPipe(a, b)  -> tcl_scan2(a, b, nm, ev)
-  EFilterPipe(a, b)   -> tcl_scan2(a, b, nm, ev)
-  EBang(x)         -> tcl_scan(x, nm, ev)
-  EHandle(body, _, _, oi, _, cls, oret) ->
-    tcl_scan(body, nm, ev) or tcl_scan_opt(oi, nm, ev) or tcl_scan_clauses(cls, nm, ev) or tcl_scan_hret(oret, nm, ev)
-  ELitUnit(x, _)   -> tcl_scan(x, nm, ev)
-  EIntrinsic(_, xs) -> tcl_scan_list(xs, nm, ev)
-  ESurface(sf) -> tcl_scan_list(surface_children(sf), nm, ev)
-  EStr(span, _)    -> tcl_scan_span(span, nm, ev)
-  _ -> false
+# The descend rides `xp_positions`; a lambda body flips to the capture
+# scan at its `XLam` role.
+fn tcl_scan(e: Expr, nm: String, every_read: Bool) : Bool = match e.kind {
+  EVar(n)       -> n == nm
+  ECall(f, xs)  -> tcl_scan_call(f, xs, nm, every_read)
+  EStr(span, _) -> tcl_scan_span(span, nm, every_read)
+  _             -> tcl_scan_ps(xp_positions(e), nm, every_read)
 }
 
-fn tcl_scan2(a: Expr, b: Expr, nm: String, ev: Bool) : Bool =
-  tcl_scan(a, nm, ev) or tcl_scan(b, nm, ev)
+fn tcl_scan_ps(ps: [XPos], nm: String, ev: Bool) : Bool = match ps {
+  [] -> false
+  [XP(r, c), ...rest] ->
+    tcl_scan(c, nm, match r { XLam -> true _ -> ev }) or tcl_scan_ps(rest, nm, ev)
+}
 
 # A dup wrap is a transparent read on the consume scan; a bare callee
 # read of the binder (a closure held in a local) consumes like any EVar.
+# A guard-fail drop is also transparent: it runs only on a guard's falsy
+# edge, which never shares a path with the body's goto — filtering its
+# binder here would starve the success-path goto release.
 fn tcl_scan_call(f: Expr, xs: [Expr], nm: String, ev: Bool) : Bool = match f.kind {
   EVar(cn) ->
-    if cn == "__perceus_dup" and not ev { false }
+    if (cn == "__perceus_dup" or cn == "__perceus_guard_drop") and not ev { false }
     else { cn == nm or tcl_scan_list(xs, nm, ev) }
   _ -> tcl_scan(f, nm, ev) or tcl_scan_list(xs, nm, ev)
 }
@@ -171,59 +156,9 @@ fn tcl_scan_span(span: String, nm: String, ev: Bool) : Bool =
   if ev or has_interp(span, 0, string_length(span)) { tcl_span_mentions(span, nm) }
   else { false }
 
-fn tcl_scan_opt(o: Option[Expr], nm: String, ev: Bool) : Bool = match o {
-  Some(x) -> tcl_scan(x, nm, ev)
-  None    -> false
-}
-
 fn tcl_scan_list(xs: [Expr], nm: String, ev: Bool) : Bool = match xs {
   [] -> false
   [x, ...rest] -> tcl_scan(x, nm, ev) or tcl_scan_list(rest, nm, ev)
-}
-
-fn tcl_scan_arms(arms: [Arm], nm: String, ev: Bool) : Bool = match arms {
-  [] -> false
-  [Arm(_, og, body), ...rest] ->
-    tcl_scan_opt(og, nm, ev) or tcl_scan(body, nm, ev) or tcl_scan_arms(rest, nm, ev)
-}
-
-fn tcl_scan_fields(fs: [FieldInit], nm: String, ev: Bool) : Bool = match fs {
-  [] -> false
-  [FI(_, x), ...rest] -> tcl_scan(x, nm, ev) or tcl_scan_fields(rest, nm, ev)
-}
-
-fn tcl_scan_elems(els: [ListElem], nm: String, ev: Bool) : Bool = match els {
-  [] -> false
-  [el, ...rest] -> {
-    let inner = match el { ElPlain(x) -> x ElSpread(x) -> x }
-    tcl_scan(inner, nm, ev) or tcl_scan_elems(rest, nm, ev)
-  }
-}
-
-fn tcl_scan_stmts(ss: [Stmt], nm: String, ev: Bool) : Bool = match ss {
-  [] -> false
-  [s, ...rest] -> tcl_scan_stmt(s, nm, ev) or tcl_scan_stmts(rest, nm, ev)
-}
-
-fn tcl_scan_stmt(s: Stmt, nm: String, ev: Bool) : Bool = match s {
-  SLet(_, _, rhs)             -> tcl_scan(rhs, nm, ev)
-  SAssert(c, om)              -> tcl_scan(c, nm, ev) or tcl_scan_opt(om, nm, ev)
-  SExprStmt(x)                -> tcl_scan(x, nm, ev)
-  SIndexAssign(a, i, v, _, _) -> tcl_scan(a, nm, ev) or tcl_scan(i, nm, ev) or tcl_scan(v, nm, ev)
-  SAssign(a, v, _, _) -> tcl_scan(a, nm, ev) or tcl_scan(v, nm, ev)
-  SVar(_, _, init, _, _)      -> tcl_scan(init, nm, ev)
-  SUse(_, _, _)               -> false
-}
-
-fn tcl_scan_clauses(cls: [HClause], nm: String, ev: Bool) : Bool = match cls {
-  [] -> false
-  [HC(_, _, body, _, _), ...rest] ->
-    tcl_scan(body, nm, ev) or tcl_scan_clauses(rest, nm, ev)
-}
-
-fn tcl_scan_hret(o: Option[HReturn], nm: String, ev: Bool) : Bool = match o {
-  Some(HR(_, b, _, _)) -> tcl_scan(b, nm, ev)
-  None -> false
 }
 
 # An interpolation span is raw source; a substring hit is the

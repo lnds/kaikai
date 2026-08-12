@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -186,7 +186,7 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
 	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
 
 # The native half of the namespace gate lives in stage2 (it needs $(TARGET));
@@ -534,6 +534,12 @@ test-runtime-global-audit:
 # coverage while its corpus rots. Pure text, no compiler.
 test-wiring-audit:
 	@./tools/audit-test-wiring.sh
+
+# Ownership walkers descend through expr_positions.kai instead of
+# enumerating ExprKind by hand; the baseline is the ratcheted list of
+# walkers not yet migrated. Pure text, no compiler.
+test-perceus-position-audit:
+	@./tools/perceus-position-audit.sh
 
 # The other half of the KAI_HOT_ONLY soundness argument. gen-runtime-bc.sh
 # proves no function IN the hot bitcode reaches swapcontext; this proves no
@@ -1005,6 +1011,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1765 fixture passes under ASAN+UBSan (borrow-move-last param read under a base-arm binop tail)"
 	@$(MAKE) -C stage2 test-perceus-1768-move-gate-positions-asan
 	@echo "tier1-asan OK — issue #1768 fixtures pass under ASAN+UBSan (assert/guard/projection/handler-clause/interp read positions vs move gates)"
+	@$(MAKE) -C stage2 test-perceus-1770-arm-birth-leak-asan
+	@echo "tier1-asan OK — issue #1770/#1774 fixtures pass under ASAN+UBSan (arm-binder birth refs paid on goto-tail leaves and guard-fail edges, no over-release)"
 	@$(MAKE) -C stage2 test-perceus-1302-tcrec-goto-drops-asan
 	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
 	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
