@@ -2958,13 +2958,31 @@ fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Exp
 fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
     let pos = kpos_of(x)
-    let st_gc = emit_reuse_gc_increfs(donor, reuse_gc_uses(cargs, st0.reuse_gc), pos, st0)
+    # Capture the arm's slot plan and uses BEFORE the args lower: a nested
+    # match inside a rebuild arg re-sets `rnested`/`reuse_gc` per inner arm
+    # and nothing restores them for the rest of this arm, so reading them
+    # after `lower_exprs` settles against the WRONG pattern's plan (an
+    # inner arm's slot 0 projected out of the outer donor — over-release).
+    let plan = st0.rnested
+    let uses = reuse_gc_uses(cargs, st0.reuse_gc)
+    let st_gc = emit_reuse_gc_increfs(donor, uses, pos, st0)
     match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) -> {
       let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
       match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
         match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
           let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
-          let st_ub = match bind_op(st_fork, KConReuse(RkVariantMove, donor, cn, ls_variant_tag(st_fork, cn), typed_inits(avs, cn, st_fork)), pos) { LRes(ru, st_u2) ->
+          # The move overwrite pays no old slot; a donor child the rebuild
+          # does not re-embed (wildcard / unused binder) still carries the
+          # donor's claim and must be dropped by projection before the
+          # overwrite. Only the FLAT slot plan settles here — the rotation
+          # plan's slots are the nested dual's business.
+          let st_paid = match plan {
+            RNI(_oar, nslot, _nin, directs, _grands) ->
+              if nslot == 0 - 1 { rn_flat_unique_drops(directs, donor, uses, pos, st_fork) }
+              else { st_fork }
+            RNInone -> st_fork
+          }
+          let st_ub = match bind_op(st_paid, KConReuse(RkVariantMove, donor, cn, ls_variant_tag(st_paid, cn), typed_inits(avs, cn, st_paid)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) }
           let st_sb = match bind_op(st_ub, KCon(cn, ls_variant_tag(st_ub, cn), ls_ctor_mask(st_ub, cn), typed_inits(avs, cn, st_ub), st_ub.in_region), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
