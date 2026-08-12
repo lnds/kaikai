@@ -6068,7 +6068,8 @@ static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
 
 static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
                                            int n, KaiValue **fields,
-                                           const char **names) {
+                                           const char **names,
+                                           uint64_t kept_mask) {
     if (_scr != NULL && _scr->tag == KAI_RECORD &&
         _scr->as.rec.n_fields == n && kai_check_unique(_scr)) {
         /* Decref the existing field values then overwrite. The
@@ -6078,11 +6079,21 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
          * rebuilds (parsers thread the same record shape), so
          * overwriting is idempotent in the common case. */
         for (int i = 0; i < n; ++i) {
-            /* Aliasing guard (see kai_reuse_or_alloc_variant). */
+            /* Aliasing guard (see kai_reuse_or_alloc_variant): skip
+             * the old-slot decref when old == new, EXCEPT where
+             * kept_mask marks the incoming value as a plain binder
+             * read (a kept child re-embedded in place). A binder read
+             * carries its own reference, so the donor's claim on the
+             * old child is still owed — the skip would leak it once
+             * per reuse. The mask never marks call results, the shape
+             * whose consumed-and-recycled pointer the guard protects. */
             KaiValue *old_f = _scr->as.rec.fields[i];
             _scr->as.rec.fields[i] = fields[i];
             _scr->as.rec.names[i]  = names[i];
-            if (old_f != fields[i]) kai_decref(old_f);
+            if (old_f != fields[i] ||
+                (i < 64 && (kept_mask & ((uint64_t)1 << i)))) {
+                kai_decref(old_f);
+            }
         }
         kai_rc_count_reuse();
         return kai_incref(_scr);
@@ -6095,8 +6106,9 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
 static KaiValue *kai_reuse_or_alloc_record_h(KaiValue *_scr,
                                              int n, KaiValue **fields,
                                              const char **names,
+                                             uint64_t kept_mask,
                                              int32_t head_tag) {
-    KaiValue *v = kai_reuse_or_alloc_record(_scr, n, fields, names);
+    KaiValue *v = kai_reuse_or_alloc_record(_scr, n, fields, names, kept_mask);
     v->as.rec.head_type_tag = head_tag;
     return v;
 }
