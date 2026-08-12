@@ -5001,6 +5001,101 @@ fn rv_old_slot_drops(subs: [Pattern], tys: [TypeExpr], i: Int, enums: [String]) 
   }
 }
 
+# The kept-child claim a recognised variant rebuild owes when it fires.
+# The generic reuse arm extracts each pointer binder WITH incref; a rebuild
+# arg that re-embeds the binder in ITS OWN slot then hits the runtime alias
+# guard (old == new skips the old-slot decref, correct for `Some(f(e))`
+# where `f` consumed the binder's ref) and the donor's claim on that child
+# is never paid — one leaked ref per reuse. Emits the compensating decrefs,
+# guarded at the call site on the donor's pre-rebuild uniqueness (`_rq`):
+# the shared fallback fresh-allocs and the match-exit cascade pays there.
+# Empty when no slot re-embeds diagonally or the reuse can never fire.
+fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
+  if cx.in_region { "" }
+  else { match pat.pkind {
+    PVariant(pcname, subs) -> match body.kind {
+      ECall(scallee, sargs) -> match scallee.kind {
+        EVar(sname) ->
+          if sname == "__perceus_reuse_variant" {
+            match sargs {
+              [_scr_arg, ctor] -> match reuse_ctor_name(ctor) {
+                Some(bcname) -> match ctor.kind {
+                  ECall(_cf, cargs) -> match evar_payload_tys(cx.variants, pcname) {
+                    Some(ptys) ->
+                      if reuse_fire_iff_unique(bcname, ptys, cx) {
+                        reuse_kept_drops(subs, cargs, ptys, 0, cx)
+                      } else { "" }
+                    None -> ""
+                  }
+                  _ -> ""
+                }
+                None -> ""
+              }
+              _ -> ""
+            }
+          } else { "" }
+        _ -> ""
+      }
+      _ -> ""
+    }
+    _ -> ""
+  } }
+
+# True iff the emitted rebuild's runtime reuse fires EXACTLY when the donor
+# is unique, making `kai_check_unique` the complete fire predicate. The
+# typed path (`kai_variant_reuse_at`) always qualifies: the arm's tag test
+# and the recogniser's arity match pin its other gates. The all-boxed path
+# (`kai_reuse_or_alloc_variant`) additionally requires the DONOR's slot
+# mask to be 0 — a primitive-slotted donor never fires there, so nothing
+# needs paying.
+fn reuse_fire_iff_unique(bcname: String, ptys: [TypeExpr], cx: EmitCtx) : Bool = {
+  let has_prim = match evar_payload_tys(cx.variants, bcname) {
+    Some(bts) -> variant_has_primitive_slot(bts, cx.enums)
+    None      -> false
+  }
+  if has_prim { true } else { variant_slot_mask(ptys, cx.enums) == 0 }
+}
+
+# One `kai_decref` per pointer binder re-embedded in its own slot: the
+# rebuild arg at index i is a bare read (or a `__perceus_dup`) of the
+# pattern binder bound at the same index. Cross-slot moves are excluded —
+# the runtime pays those (old != new decrefs the old child).
+fn reuse_kept_drops(subs: [Pattern], cargs: [Expr], ptys: [TypeExpr], i: Int,
+                    cx: EmitCtx) : String = match subs {
+  [] -> ""
+  [sp, ...srest] -> {
+    let crest = match cargs {
+      [_, ...cr] -> cr
+      []         -> []
+    }
+    let k = match list_nth_ty(ptys, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+    let here = match sp.pkind {
+      PBind(nm) ->
+        if k == 0 and not name_is_unused(nm) and reuse_carg_reads(cargs, nm) {
+          concat_all(["kai_decref(", c_local(nm), "); "])
+        } else { "" }
+      _ -> ""
+    }
+    cat2(here, reuse_kept_drops(srest, crest, ptys, i + 1, cx))
+  }
+}
+
+# The head of `cargs` is a bare `EVar(nm)` or a `__perceus_dup(nm)` wrap.
+fn reuse_carg_reads(cargs: [Expr], nm: String) : Bool = match cargs {
+  [c, ..._] -> match c.kind {
+    EVar(u) -> u == nm
+    ECall(df, dargs) -> match df.kind {
+      EVar(dn) ->
+        if dn == "__perceus_dup" {
+          match dargs { [inner] -> match inner.kind { EVar(u) -> u == nm _ -> false } _ -> false }
+        } else { false }
+      _ -> false
+    }
+    _ -> false
+  }
+  [] -> false
+}
+
 # A ctor under a live region never reuses a cell in place — it bump-allocates
 # fresh so the arena frees it wholesale. So the reuse-arm dual-path (whose
 # fallback branch would fresh-alloc on the RC heap and reintroduce per-node
@@ -5064,7 +5159,22 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], cx: EmitCtx) :
             # The ledger carries them down to the goto site, which
             # emits the skipped releases just before the jump.
             let body_c = emit_expr(src, body, tcp_arm_body_cx(arm_cx, scr_alias, pat, body, cx))
-            concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+            # A reuse-variant rebuild that keeps a child in its own slot
+            # (`MErr(e, ys) -> MVal(e + 1, ys)`) leaves the donor's claim
+            # on that child unpaid when the reuse fires: the binder was
+            # extracted WITH incref, and the runtime alias guard skips the
+            # old-slot decref precisely because old == new. Capture the
+            # donor's uniqueness BEFORE the rebuild mutates it and pay the
+            # skipped claim after; the shared fallback stays balanced (the
+            # match-exit cascade pays the donor's claims there).
+            let pay = reuse_kept_pay(pat, body, cx)
+            if pay == "" {
+              concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+            } else {
+              concat_all(["    if (", pt, ") { ", binds,
+                          "int _rq = kai_check_unique(_scr); _r = ", body_c,
+                          "; if (_rq) { ", pay, "} break; }\n"])
+            }
           }
           }
           }
