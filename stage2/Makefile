@@ -6554,10 +6554,11 @@ REUSE_FLOOR_1781_FIXTURES := reuse_zero_use_elide_1781 reuse_wild_slot_children_
 # `BErr(_) -> BVal([7])` leaks it identically), so their ledger budget only
 # holds where kai_reuse_or_alloc_variant / kai_variant_reuse_at pay.
 BRANCH_PAY_1780_FIXTURES_NATIVE := shortcircuit_guard_move_1780 shortcircuit_arg_move_1780 guard_consume_zero_use_1780
+LET_SC_1785_FIXTURES := let_shortcircuit_tail_1785 let_shortcircuit_stmt_1785
 
 test-perceus-1770-arm-birth-leak: $(TARGET) build
 	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES); do \
+	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES) $(LET_SC_1785_FIXTURES); do \
 	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl.c \
 	    || { echo "perceus-1770-arm-birth-leak FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1770abl.c -o build/s2-1770abl $(LDLIBS_M); \
@@ -6574,11 +6575,11 @@ test-perceus-1770-arm-birth-leak: $(TARGET) build
 	      || { echo "perceus-1770-arm-birth-leak FAIL ($$name: reuse_in_place=$$reused, expected >= 1500)"; exit 1; };; \
 	  esac; \
 	done; \
-	echo "perceus-1770-arm-birth-leak OK (13 fixtures, ledger bounded, reuse floor held)"
+	echo "perceus-1770-arm-birth-leak OK (15 fixtures, ledger bounded, reuse floor held)"
 
 test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
 	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES); do \
+	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES) $(LET_SC_1785_FIXTURES); do \
 	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl-asan.c \
 	    || { echo "perceus-1770-arm-birth-leak-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -6598,7 +6599,7 @@ test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
 
 test-perceus-1770-arm-birth-leak-native: $(TARGET) build
 	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES_NATIVE); do \
+	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES_NATIVE) $(LET_SC_1785_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1770abl-n 2> build/s2-1770abl-n.err \
 	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: native build errored)"; cat build/s2-1770abl-n.err; exit 1; }; \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1770abl-n > build/s2-1770abl-n.out 2> build/s2-1770abl-n.rc \
@@ -6609,7 +6610,7 @@ test-perceus-1770-arm-birth-leak-native: $(TARGET) build
 	  [ -n "$$leaked" ] && [ "$$leaked" -lt 2000 ] \
 	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: leaked=$$leaked, per-iteration birth leak)"; exit 1; }; \
 	done; \
-	echo "perceus-1770-arm-birth-leak-native OK (11 fixtures, ledger bounded)"
+	echo "perceus-1770-arm-birth-leak-native OK (13 fixtures, ledger bounded)"
 
 # Issue #1765 — an owned param consumed by an `==` under a BINOP tail
 # in a non-recursive arm and re-threaded through the self-call in a

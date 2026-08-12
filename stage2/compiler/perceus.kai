@@ -1937,12 +1937,15 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # body rewrite runs with an EMPTY param scope (issue #703) — no
         # boxed param to dup/drop, no borrow, no arm-move analysis.
         let uses = pcs_collect_uses_expr(body, [], false, [])
-        let new_body0 = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
+        # Boxed locals whose single read a short circuit may skip take
+        # the same force-dup + exit-drop treatment as the mixed path.
+        let branchy_lets = pcs_branchy_let_binders(body, name, uses, [])
+        let new_body0 = pcs_rewrite_expr(body, [], uses, false, [], branchy_lets, bmap, [])
         # A boxed local whose last read sits in the tail needs the same
         # post-tail release as the mixed path — this body shape is where
         # every read of a multi-use local can land in a borrowed slot and
         # orphan the birth ref.
-        let new_body = ptd_tail_exit_drops(new_body0, name, uses, [],
+        let new_body = ptd_tail_exit_drops(new_body0, name, uses, [], branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
         let reused_body = pcs_recognise_reuse_expr(arm_dropped)
@@ -2073,7 +2076,12 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # which re-derive from the rewritten arm (a dup'd-only binder
         # plants).
         let branchy_arms = pcs_branchy_arm_binders(body, name, uses, rewrite_skip_set, [])
-        let force_all = pcs_list_union(branchy_single, branchy_arms)
+        # Block-let binders in the same shape: forced to dup too, paid by
+        # the block-exit collector (statement reads) or the post-tail
+        # pass (tail reads).
+        let branchy_lets = pcs_branchy_let_binders(body, name, uses,
+                                                   pcs_list_union(rewrite_skip_set, pnames))
+        let force_all = pcs_list_union(pcs_list_union(branchy_single, branchy_arms), branchy_lets)
         let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, force_all, bmap, move_last_set)
         let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         # The block-exit collector below declines a binding whose last read
@@ -2082,6 +2090,7 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # borrowed positions gate the self-call arg hoist: a hoisted temp in
         # a borrowed slot would lose the argument's ownership marking.
         let new_body = ptd_tail_exit_drops(new_body1, name, uses, move_last_set,
+                                           branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
         # Plant the branch-local drop for each `owned_moves` param in the arms
@@ -2828,7 +2837,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
       # there; an exit-drop on top of the move would double-free, so the
       # move-last set is excluded.
       let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
-                                                         opt_tail, move_last_set, [])
+                                                         opt_tail, move_last_set, force_set, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
     EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
@@ -4912,6 +4921,134 @@ fn pcs_bab_leaves_arms(arms: [Arm], fn_name: String) : Bool = match arms {
   [Arm(_, _, b), ...rest] -> pcs_bab_all_leaves_self(b, fn_name) and pcs_bab_leaves_arms(rest, fn_name)
 }
 
+# Block-let binders in the arm-binder shape above: the binding's single
+# consuming read sits behind a short-circuit edge of its remaining
+# block, so the raw last-use transfer leaks the birth ref on every
+# skipped evaluation. Forced to dup instead; the block-exit collector
+# pays a statement-position read and the post-tail pass pays a
+# tail-position read. Declines: a tail read whose tail hosts a
+# self-call (the per-path planter cannot guarantee a payer there), and
+# any name bound more than once in the fn — the payers key on the
+# name, so a homonym binding could collect a drop it does not own.
+fn pcs_branchy_let_binders(body: Expr, fn_name: String, uses: [Use],
+                           skip: [String]) : [String] =
+  pcs_blb_expr(body, body, fn_name, uses, skip, [])
+
+fn pcs_blb_expr(e: Expr, body: Expr, fn_name: String, uses: [Use],
+                skip: [String], acc: [String]) : [String] = {
+  let acc1 = match e.kind {
+    EBlock(ss, ot) -> pcs_blb_scan(ss, ot, body, fn_name, uses, skip, acc)
+    _              -> acc
+  }
+  pcs_blb_ps(xp_positions(e), body, fn_name, uses, skip, acc1)
+}
+
+fn pcs_blb_ps(ps: [XPos], body: Expr, fn_name: String, uses: [Use],
+              skip: [String], acc: [String]) : [String] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> {
+    let acc1 = if xrole_inline(r) { pcs_blb_expr(c, body, fn_name, uses, skip, acc) }
+               else { acc }
+    pcs_blb_ps(rest, body, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_blb_scan(ss: [Stmt], ot: Option[Expr], body: Expr, fn_name: String,
+                uses: [Use], skip: [String], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> {
+    let acc1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) ->
+          if pcs_blb_qualifies(nm, pat, rhs, rest, ot, body, fn_name, uses, skip) {
+            [nm, ...acc]
+          } else { acc }
+        _ -> acc
+      }
+      _ -> acc
+    }
+    pcs_blb_scan(rest, ot, body, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_blb_qualifies(nm: String, pat: Pattern, rhs: Expr, rest: [Stmt],
+                     ot: Option[Expr], body: Expr, fn_name: String,
+                     uses: [Use], skip: [String]) : Bool =
+  if name_is_unused_binder(nm) or list_has(skip, nm) { false }
+  else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
+  else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
+  else if pcs_uses_have_in_lam(uses, nm) { false }
+  else if pcs_blb_bind_count(nm, body, 0) != 1 { false }
+  else {
+    match pcs_read_roles(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col), false) {
+      PRR(a, brc, blocked) ->
+        if a != 0 or brc != 1 or blocked { false }
+        else { pcs_blb_payer_ok(nm, ot, fn_name) }
+    }
+  }
+
+fn pcs_blb_payer_ok(nm: String, ot: Option[Expr], fn_name: String) : Bool = match ot {
+  None    -> true
+  Some(t) -> match pcs_read_roles(nm, t, false) {
+    PRR(_, tb, _) -> tb == 0 or not ppd_has_self_call(t, fn_name)
+  }
+}
+
+# How many times `nm` is bound anywhere in `e`: let/var binders,
+# destructuring and arm patterns, lambda and handler-clause params.
+fn pcs_blb_bind_count(nm: String, e: Expr, acc: Int) : Int = {
+  let local = match e.kind {
+    EBlock(ss, _)   -> pcs_blb_bc_stmts(nm, ss, 0)
+    EMatch(_, arms) -> pcs_blb_bc_arms(nm, arms, 0)
+    ELambda(ps, _)  -> pcs_blb_bc_params(nm, ps, 0)
+    EHandle(_, _, _, _, oalias, cls, oret) -> {
+      let a0 = match oalias { Some(al) -> if al == nm { 1 } else { 0 } None -> 0 }
+      let a1 = pcs_blb_bc_clauses(nm, cls, a0)
+      match oret { Some(HR(rb, _, _, _)) -> if rb == nm { a1 + 1 } else { a1 } None -> a1 }
+    }
+    _ -> 0
+  }
+  pcs_blb_bc_ps(nm, xp_positions(e), acc + local)
+}
+
+fn pcs_blb_bc_ps(nm: String, ps: [XPos], acc: Int) : Int = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> pcs_blb_bc_ps(nm, rest, pcs_blb_bind_count(nm, c, acc))
+}
+
+fn pcs_blb_bc_stmts(nm: String, ss: [Stmt], acc: Int) : Int = match ss {
+  []           -> acc
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(p, _, _)        -> pcs_blb_bc_name(nm, prc_pat_binders(p, []), 0)
+      SVar(vn, _, _, _, _) -> if vn == nm { 1 } else { 0 }
+      _                    -> 0
+    }
+    pcs_blb_bc_stmts(nm, rest, acc + here)
+  }
+}
+
+fn pcs_blb_bc_arms(nm: String, arms: [Arm], acc: Int) : Int = match arms {
+  []                        -> acc
+  [Arm(p, _, _), ...rest] ->
+    pcs_blb_bc_arms(nm, rest, acc + pcs_blb_bc_name(nm, prc_pat_binders(p, []), 0))
+}
+
+fn pcs_blb_bc_params(nm: String, ps: [Param], acc: Int) : Int = match ps {
+  []           -> acc
+  [p, ...rest] -> pcs_blb_bc_params(nm, rest, if p.pname == nm { acc + 1 } else { acc })
+}
+
+fn pcs_blb_bc_clauses(nm: String, cls: [HClause], acc: Int) : Int = match cls {
+  []                            -> acc
+  [HC(_, ps, _, _, _), ...rest] -> pcs_blb_bc_clauses(nm, rest, pcs_blb_bc_params(nm, ps, acc))
+}
+
+fn pcs_blb_bc_name(nm: String, bound: [String], acc: Int) : Int = match bound {
+  []           -> acc
+  [b, ...rest] -> pcs_blb_bc_name(nm, rest, if b == nm { acc + 1 } else { acc })
+}
+
 # Issue #297 (partial) — block-scope let-binding exit drops.
 #
 # For each `SLet(PBind(name), _, rhs)` introduced by this block,
@@ -4935,6 +5072,7 @@ fn pcs_bab_leaves_arms(arms: [Arm], fn_name: String) : Bool = match arms {
 fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
                                      uses: [Use], opt_tail: Option[Expr],
                                      move_last_set: [String],
+                                     force_set: [String],
                                      acc: [Stmt]) : [Stmt] / Console {
 
   match stmts {
@@ -4953,7 +5091,9 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
               match last_use_for(nm, uses) {
                 LUBlocked(_) -> [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
                 LUAt(_, _, _) ->
-                  if pcs_count_non_lam_uses(nm, uses, 0) >= 2 {
+                  # A force-set name dups on every read, single reads
+                  # included, so the birth ref always needs the drop.
+                  if pcs_count_non_lam_uses(nm, uses, 0) >= 2 or list_has(force_set, nm) {
                     [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
                   } else { acc }
                 _ -> acc
@@ -4964,7 +5104,7 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
         }
         _ -> acc
       }
-      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, move_last_set, acc1)
+      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, move_last_set, force_set, acc1)
     }
   }
 }

@@ -27,36 +27,37 @@ import compiler.infer
 import compiler.perceus_plant_drop
 
 pub fn ptd_tail_exit_drops(e: Expr, self_name: String, uses: [Use],
-                           move_last_set: [String], self_bpos: [Int]) : Expr =
-  ptd_expr(e, self_name, uses, move_last_set, self_bpos, [])
+                           move_last_set: [String], forced: [String],
+                           self_bpos: [Int]) : Expr =
+  ptd_expr(e, self_name, uses, move_last_set, forced, self_bpos, [])
 
 # `scope` carries the binder names an enclosing block or lambda already owns.
 # A shadowed name is left alone: its reads cannot be attributed to this
 # block's binding, so a drop here could release a ref it does not own.
 fn ptd_expr(e: Expr, self_name: String, uses: [Use], mls: [String],
-            sbp: [Int], scope: [String]) : Expr =
-  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, sbp, scope),
+            forced: [String], sbp: [Int], scope: [String]) : Expr =
+  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, forced, sbp, scope),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn ptd_kind(k: ExprKind, self_name: String, uses: [Use], mls: [String],
-            sbp: [Int], scope: [String]) : ExprKind = match k {
-  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, sbp, scope)
+            forced: [String], sbp: [Int], scope: [String]) : ExprKind = match k {
+  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, forced, sbp, scope)
   ELambda(ps, b) -> {
     let inner = list_append(scope, map(ps, (p) => p.pname))
-    ELambda(ps, ptd_expr(b, self_name, uses, mls, sbp, inner))
+    ELambda(ps, ptd_expr(b, self_name, uses, mls, forced, sbp, inner))
   }
-  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, sbp, scope))
+  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, forced, sbp, scope))
 }
 
 fn ptd_block(stmts: [Stmt], opt_tail: Option[Expr], self_name: String,
-             uses: [Use], mls: [String], sbp: [Int], scope: [String]) : ExprKind {
+             uses: [Use], mls: [String], forced: [String], sbp: [Int], scope: [String]) : ExprKind {
   let inner  = list_append(scope, ptd_let_binders(stmts, []))
-  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, sbp, inner))
+  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, forced, sbp, inner))
   match opt_tail {
     None    -> EBlock(stmts1, None)
     Some(t) -> {
-      let t1 = ptd_expr(t, self_name, uses, mls, sbp, inner)
-      let orphans = ptd_orphans(stmts, uses, mls, scope, [])
+      let t1 = ptd_expr(t, self_name, uses, mls, forced, sbp, inner)
+      let orphans = ptd_orphans(stmts, uses, mls, forced, scope, [])
       if ppd_has_self_call(t, self_name) { ptd_selfcall_tail(stmts1, t1, self_name, orphans, sbp) }
       else { ptd_wrap(stmts1, t1, orphans) }
     }
@@ -92,12 +93,13 @@ fn ptd_wrap(stmts: [Stmt], tail: Expr, names: [String]) : ExprKind = match names
 }
 
 # A binding needs the post-tail drop when it took a dup per read (the
-# last-use test `pcs_collect_block_let_exit_drops` uses), does not release
-# its birth ref by moving at its last use, and carries no drop already —
-# which for a block-local is exactly the tail-position case the other pass
-# declines.
-fn ptd_orphans(stmts: [Stmt], uses: [Use], mls: [String], scope: [String],
-               acc: [String]) : [String] = match stmts {
+# last-use test `pcs_collect_block_let_exit_drops` uses, plus the
+# force-dup'd names whose single read dups too), does not release its
+# birth ref by moving at its last use, and carries no drop already —
+# which for a block-local is exactly the tail-position case the other
+# pass declines.
+fn ptd_orphans(stmts: [Stmt], uses: [Use], mls: [String], forced: [String],
+               scope: [String], acc: [String]) : [String] = match stmts {
   []           -> list_reverse(acc)
   [s, ...rest] -> {
     let acc1 = match s {
@@ -107,20 +109,23 @@ fn ptd_orphans(stmts: [Stmt], uses: [Use], mls: [String], scope: [String],
         MUnboxed -> acc
         _        -> match pat.pkind {
           PBind(nm) ->
-            if ptd_needs_drop(nm, stmts, uses, mls, scope) { [nm, ...acc] } else { acc }
+            if ptd_needs_drop(nm, stmts, uses, mls, forced, scope) { [nm, ...acc] } else { acc }
           _ -> acc
         }
       }
       _ -> acc
     }
-    ptd_orphans(rest, uses, mls, scope, acc1)
+    ptd_orphans(rest, uses, mls, forced, scope, acc1)
   }
 }
 
 fn ptd_needs_drop(nm: String, stmts: [Stmt], uses: [Use], mls: [String],
-                  scope: [String]) : Bool =
+                  forced: [String], scope: [String]) : Bool =
   if list_has(mls, nm) or list_has(scope, nm) or ptd_has_drop(nm, stmts) { false }
-  else { ptd_read_in_lambda(nm, uses) or ptd_plain_reads(nm, uses, 0) >= 2 }
+  else {
+    ptd_read_in_lambda(nm, uses) or ptd_plain_reads(nm, uses, 0) >= 2 or
+    list_has(forced, nm)
+  }
 
 # A read from inside a lambda is a closure capture: it blocks the last-use
 # transfer, so every read dups and the birth ref needs releasing. Two or more
@@ -178,8 +183,8 @@ fn ptd_let_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
 }
 
 fn ptd_stmt(s: Stmt, self_name: String, uses: [Use], mls: [String],
-            sbp: [Int], scope: [String]) : Stmt = match s {
-  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, sbp, scope))
-  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, sbp, scope))
+            forced: [String], sbp: [Int], scope: [String]) : Stmt = match s {
+  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, forced, sbp, scope))
+  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, forced, sbp, scope))
   _               -> s
 }
