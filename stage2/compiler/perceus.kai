@@ -4873,24 +4873,30 @@ fn pcs_bab_qualifies(nm: String, og: Option[Expr], b: Expr, fn_name: String,
   if name_is_unused_binder(nm) or list_has(skip, nm) { false }
   else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
   else if pcs_uses_have_in_lam(uses, nm) { false }
-  else if not pcs_bab_payer_covers(b, fn_name) { false }
   else {
     let g_roles = match og {
       None    -> PRR(0, 0, false)
       Some(g) -> pcs_read_roles(nm, g, false)
     }
-    match pcs_rr_merge(g_roles, pcs_read_roles(nm, b, false)) {
-      PRR(a, brc, blocked) -> a == 0 and brc == 1 and not blocked
+    let b_roles = pcs_read_roles(nm, b, false)
+    match pcs_rr_merge(g_roles, b_roles) {
+      PRR(a, brc, blocked) ->
+        if a != 0 or brc != 1 or blocked { false }
+        # A guard read pays through the guard-fail drop plus the
+        # zero-use body drop — machinery every body shape carries. A
+        # body read is paid by the distributed drop, which reaches
+        # every path only when each tail leaf is a self-call; the
+        # non-goto wrap placement over-releases the native lowering's
+        # alias-bound pattern binders, so those arms keep the raw move.
+        else {
+          match b_roles {
+            PRR(_, bb, _) ->
+              if bb == 0 { true }
+              else { pcs_is_self_tail_call(b, fn_name) and pcs_bab_all_leaves_self(b, fn_name) }
+          }
+        }
     }
   }
-
-# The arm-drop payer reaches every path only when the body is either
-# free of self-tail-calls (the `__pcs_arm_ret` wrap runs on all paths)
-# or ALL its tail leaves are self-calls (the distribution covers each
-# goto). A mixed body would leave the value leaves unpaid.
-fn pcs_bab_payer_covers(b: Expr, fn_name: String) : Bool =
-  if pcs_is_self_tail_call(b, fn_name) { pcs_bab_all_leaves_self(b, fn_name) }
-  else { true }
 
 fn pcs_bab_all_leaves_self(e: Expr, fn_name: String) : Bool = match e.kind {
   EIf(_, t, oe)   -> pcs_bab_all_leaves_self(t, fn_name) and
@@ -5093,7 +5099,7 @@ fn pcs_peel_ret_wrap(body: Expr) : Expr = match body.kind {
 # drop lands post-body (TCO-safe: a self-tail arm gets the drop distributed
 # into its dead leaves; RBLeaf's ctor tail is wrapped). Walks only the peeled
 # top-level match — the same narrow shape `pcs_owned_scope_move_params` gated.
-fn pcs_inject_param_branch_drops(body: Expr, params: [String], fn_name: String) : Expr =
+fn pcs_inject_param_branch_drops(body: Expr, params: [String], fn_name: String) : Expr / Console =
   match params {
     []           -> body
     [_, ..._]    -> match pcs_peel_ret_wrap(body).kind {
@@ -5105,7 +5111,7 @@ fn pcs_inject_param_branch_drops(body: Expr, params: [String], fn_name: String) 
     }
   }
 
-fn pcs_param_drop_arms(arms: [Arm], params: [String], fn_name: String) : [Arm] = match arms {
+fn pcs_param_drop_arms(arms: [Arm], params: [String], fn_name: String) : [Arm] / Console = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
@@ -5528,11 +5534,6 @@ fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr,
             [pcs_make_drop_stmt(nm, ln, cl), ...acc]
           } else if arm_count >= 2 {
             [pcs_make_drop_stmt(nm, ln, cl), ...acc]
-          } else if arm_count == 1 and not pcs_has_bare_read(nm, body) {
-            # The sole read kept its dup (a forced branch-position read,
-            # or a cross-scope name collision that defeated the move):
-            # nothing transfers the birth ref, so this drop pays it.
-            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
           } else if arm_count == 0 and not name_is_unused_binder(nm) {
             # A zero-use binder still took its bind-incref (only `_`-named
             # binders are elided by the emitters), and with no read to
@@ -5719,7 +5720,7 @@ fn pcs_body_is_block_with_tail(body: Expr) : Bool {
 #     `EBlock([SLet(__pcs_arm_ret, body), ...drops], Some(EVar(__pcs_arm_ret)))`.
 #     The body executes first (with its bindings live), the drops run
 #     before the wrapped block returns the saved value.
-fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
+fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr / Console {
   match body.kind {
     EBlock(stmts, opt_tail) ->
       Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
@@ -5764,11 +5765,11 @@ fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
 # so the self-call stays in tail position (TCO preserved). Only self-tail-
 # call leaves are touched; a normal-return leaf is left to the surrounding
 # exit-drop machinery.
-fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr =
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr / Console =
   Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
-fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String) : ExprKind {
+fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String) : ExprKind / Console {
   match k {
     EIf(c, t, opt_e) ->
       EIf(c, pcs_distribute_dead_drops(t, drops, fn_name),
@@ -5791,7 +5792,7 @@ fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, d
   }
 }
 
-fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] = match arms {
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] / Console = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) ->
@@ -5800,19 +5801,22 @@ fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] = match arms
   }
 }
 
-# Drops whose binder no read of the leaf can pay. A bare read anywhere
-# in the leaf disqualifies the drop: either it consumes on every path
-# (the drop would double-free) or only on some (`f(if c { [s, ...a] }
-# else { a })` — no static placement is right for both edges, so the
-# skipped edge keeps its historic leak rather than risk an over-release).
-# A leaf whose reads all kept their dup pays nothing itself, so the
-# drop lands before its goto.
-fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] = match drops {
+# Drops whose binder the leaf never mentions — only those may take the
+# pre-goto drop. The drop runs BEFORE the leaf's argument evaluation, so
+# any read after it is release-then-read: sound in the C emit only by
+# evaluation-order luck, and a use-after-free on the native lowering. A
+# leaf that mentions the binder pays through its own reads instead: a
+# bare read consumes on its path, and a dup'd-only leaf is released by
+# the goto ledger AFTER the reads (dup wraps are transparent to its
+# consume scan). The mixed-consumption shape (`f(if c { [s, ...a] }
+# else { a })`) keeps its historic skipped-edge leak — no static
+# placement is right for both of its edges.
+fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] / Console = match drops {
   [] -> []
   [d, ...rest] -> {
     let tl = pcs_drops_dead_in(rest, leaf)
     match pcs_drop_stmt_name(d) {
-      Some(nm) -> if pcs_has_bare_read(nm, leaf) { tl } else { [d, ...tl] }
+      Some(nm) -> if pcs_name_in_expr(nm, leaf) { tl } else { [d, ...tl] }
       None     -> tl
     }
   }

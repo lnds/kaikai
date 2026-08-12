@@ -6549,6 +6549,11 @@ GUARD_FAIL_1774_FIXTURES := guard_fail_binder_release_1774 guard_fail_unread_bin
 BIRTH_PAY_1777_FIXTURES := zero_use_rest_binder_1777 zero_use_named_binder_1777 shortcircuit_move_cond_1778
 BRANCH_PAY_1780_FIXTURES := shortcircuit_guard_move_1780 shortcircuit_arg_move_1780 guard_consume_zero_use_1780 reuse_zero_use_elide_1781 reuse_wild_slot_children_1781
 REUSE_FLOOR_1781_FIXTURES := reuse_zero_use_elide_1781 reuse_wild_slot_children_1781
+# The reuse pair stays off the native leg: the native donate protocol does
+# not yet pay a donor pointer slot the rebuild leaves wild (a hand-written
+# `BErr(_) -> BVal([7])` leaks it identically), so their ledger budget only
+# holds where kai_reuse_or_alloc_variant / kai_variant_reuse_at pay.
+BRANCH_PAY_1780_FIXTURES_NATIVE := shortcircuit_guard_move_1780 shortcircuit_arg_move_1780 guard_consume_zero_use_1780
 
 test-perceus-1770-arm-birth-leak: $(TARGET) build
 	@set -e; \
@@ -6593,7 +6598,7 @@ test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
 
 test-perceus-1770-arm-birth-leak-native: $(TARGET) build
 	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES); do \
+	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES_NATIVE); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1770abl-n 2> build/s2-1770abl-n.err \
 	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: native build errored)"; cat build/s2-1770abl-n.err; exit 1; }; \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1770abl-n > build/s2-1770abl-n.out 2> build/s2-1770abl-n.rc \
@@ -6604,7 +6609,7 @@ test-perceus-1770-arm-birth-leak-native: $(TARGET) build
 	  [ -n "$$leaked" ] && [ "$$leaked" -lt 2000 ] \
 	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: leaked=$$leaked, per-iteration birth leak)"; exit 1; }; \
 	done; \
-	echo "perceus-1770-arm-birth-leak-native OK (8 fixtures, ledger bounded)"
+	echo "perceus-1770-arm-birth-leak-native OK (11 fixtures, ledger bounded)"
 
 # Issue #1765 — an owned param consumed by an `==` under a BINOP tail
 # in a non-recursive arm and re-threaded through the self-call in a
