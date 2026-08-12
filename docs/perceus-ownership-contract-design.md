@@ -64,15 +64,29 @@ Perceus is a load-bearing claim of the language, and the margin is thin:
 rb-tree at N=1M runs C 0.25s, Koka 0.25s, kaikai-c 0.40s, kaikai-native
 0.48s; instructions retired are ~2.49G (C) against ~6.27G (native).
 
-**That margin is currently unguarded.** `rc-budget` runs the RC trace over
-the whole compiler and greps only `leaked=`; `reuse_in_place` appears in
-the same log and is discarded. The `>= 1500` floors in `stage2/Makefile`
-are per-fixture, not global. Worse, `emit_c` injects
-`kai_rc_reuse_total++` as C text while native calls the runtime helper —
-the two counts do not travel the same path even when they agree.
+Fixture-level reuse *is* guarded, on every PR: five `reuse_in_place >= 1500`
+floors run under tier1 across the C, ASAN and native legs
+(`test-perceus-1770-arm-birth-leak`, `-1784-variant-rebuild`,
+`-1786-record-rebuild`, and the `-882` / `-995` / `-nested-reuse` family).
+Each compiles a fixture from `examples/perceus/`, runs it under
+`KAI_TRACE_RC=1`, and fails if reuse drops below the floor.
 
-A refactor that degrades global reuse passes CI green today. Stage 0
-exists to close that hole before anything else moves.
+What no gate covers is **aggregate** reuse — the compiler compiling
+itself. `rc-budget` runs exactly that trace but greps only `leaked=`,
+discarding `reuse_in_place` from the same log, and it sits in `daily`
+rather than tier1.
+
+The distinction matters here because fixtures are tens of lines pinning
+shapes that already had a bug, while stages 1 and 2 rewrite ownership
+derivation for the whole pass. Every fixture can stay green while reuse
+degrades across the compiler's ~120k lines.
+
+A second gap compounds it: `emit_c` injects `kai_rc_reuse_total++` as C
+text while native calls the runtime helper, so the two counts do not
+travel the same path even when they agree.
+
+Stage 0 closes the aggregate hole and unifies the counter. It extends the
+fixture gates rather than replacing them.
 
 ## Stages
 
