@@ -212,11 +212,14 @@ Tier 2 boundary (no demo a user would try in a tutorial hits them).
   Lambda-body lets are still on the brute-force path — a per-lambda-body
   counter is the follow-up.
 
-Two caller-side sources that used to sit here are **closed**. An effect-op
+Three sources that used to sit here are **closed**. An effect-op
 argument now reaches its handler as an owned reference and is released on the
-handler side, so nothing an op is called with is orphaned; and a block-local
+handler side, so nothing an op is called with is orphaned; a block-local
 whose only read sits in the block's tail gets its exit drop after the tail
-value is bound, the one position the block-exit pass cannot reach. Both were
+value is bound, the one position the block-exit pass cannot reach; and the
+string-intern table no longer pins data-derived strings (number renders,
+paths, dir entries) immortal — interning is literal-only, so unique-value
+interpolation runs with a flat ledger. The first two were
 unbounded on spawn-heavy code: each pinned fiber wrapper keeps a 64 KiB stack
 mmap alive for the life of the process.
 
