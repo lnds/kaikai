@@ -1044,65 +1044,35 @@ fn pcs_consumed_positions(pnames: [String], body: Expr, i: Int) : [Int] = match 
 
 # A param p is CONSUMED iff it appears as a deconstructing match scrutinee
 # (arm binds a child = ownership taken) OR in a ctor/record/list slot (stored).
-# A field-read-only param (regexp nb_*) is NOT consumed.
-fn pcs_param_consumes(p: String, body: Expr) : Bool = pcs_consumes_kind(p, body.kind)
+# A field-read-only param (regexp nb_*) is NOT consumed. Only the storing
+# forms keep explicit arms; everything else descends through the table's
+# inline positions (a deferred `XLam`/`XCl` body runs elsewhere and cannot
+# witness a consuming use of the caller's ref — the closure capture is
+# RC'd separately, matching the lambda rule the analysis always had).
+fn pcs_param_consumes(p: String, body: Expr) : Bool = pcs_consumes_expr(p, body)
 
-fn pcs_consumes_kind(p: String, k: ExprKind) : Bool = match k {
+fn pcs_consumes_expr(p: String, e: Expr) : Bool = match e.kind {
   EMatch(s, arms) -> {
-    let scr_consumes = match s.kind {
-      EVar(nm) -> nm == p and pcs_arms_bind_children(arms)
-      _        -> pcs_consumes_kind(p, s.kind)
+    let scr = match s.kind { EVar(nm) -> nm == p and pcs_arms_bind_children(arms) _ -> false }
+    scr or pcs_consumes_ps(p, xp_positions(e))
+  }
+  ECall(f, xs) -> {
+    let is_ctor = match f.kind {
+      EVar(c)        -> pcs_name_is_ctor(c)
+      EModCall(_, c) -> pcs_name_is_ctor(c)
+      _              -> false
     }
-    scr_consumes or pcs_consumes_arms(p, arms)
+    (is_ctor and pcs_any_bare_var(p, xs)) or pcs_consumes_ps(p, xp_positions(e))
   }
-  ECall(f, xs) -> match f.kind {
-    EVar(c)        -> if pcs_name_is_ctor(c) { pcs_any_bare_var(p, xs) or pcs_consumes_seq(p, xs) }
-                      else { pcs_consumes_kind(p, f.kind) or pcs_consumes_seq(p, xs) }
-    EModCall(_, c) -> if pcs_name_is_ctor(c) { pcs_any_bare_var(p, xs) or pcs_consumes_seq(p, xs) }
-                      else { pcs_consumes_seq(p, xs) }
-    _              -> pcs_consumes_kind(p, f.kind) or pcs_consumes_seq(p, xs)
-  }
-  ERecordLit(_, fis) -> pcs_consumes_fields(p, fis)
-  EList(els)         -> pcs_consumes_elems(p, els)
-  EIf(c, t, opt_e)   -> pcs_consumes_kind(p, c.kind) or pcs_consumes_kind(p, t.kind) or
-                         (match opt_e { None -> false Some(e2) -> pcs_consumes_kind(p, e2.kind) })
-  EBlock(stmts, tail)-> pcs_consumes_stmts(p, stmts) or
-                         (match tail { None -> false Some(e) -> pcs_consumes_kind(p, e.kind) })
-  EBinop(_, a, b)    -> pcs_consumes_kind(p, a.kind) or pcs_consumes_kind(p, b.kind)
-  EUnop(_, x)        -> pcs_consumes_kind(p, x.kind)
-  EField(x, _)       -> match x.kind { EVar(_) -> false _ -> pcs_consumes_kind(p, x.kind) }
-  EIndex(a, b)       -> (match a.kind { EVar(_) -> false _ -> pcs_consumes_kind(p, a.kind) }) or
-                         pcs_consumes_kind(p, b.kind)
-  EPipe(a, b)        -> pcs_consumes_kind(p, a.kind) or pcs_consumes_kind(p, b.kind)
-  EBang(x)           -> pcs_consumes_kind(p, x.kind)
-  # Remaining forms are treated as non-consuming. No `_` arm — a new
-  # ExprKind variant must be classified here before it compiles.
-  EInt(_, _)          -> false
-  EReal(_, _)         -> false
-  EFixed(_, _)        -> false
-  EIntLit(_)          -> false
-  EDecimalLit(_)      -> false
-  EBool(_)            -> false
-  EChar(_)            -> false
-  EStr(_, _)          -> false
-  EUnit               -> false
-  EVar(_)             -> false
-  EUnder              -> false
-  EPlaceholder        -> false
-  ELambda(_, _)       -> false
-  ERange(_, _, _)     -> false
-  EMapPipe(_, _)      -> false
-  EFlatMapPipe(_, _)  -> false
-  EFilterPipe(_, _)   -> false
-  EHole(_)            -> false
-  ETodo(_)            -> false
-  EExternBody(_)      -> false
-  EHandle(_, _, _, _, _, _, _) -> false
-  ELitUnit(_, _)      -> false
-  EVariantsOf(_, _)   -> false
-  EModCall(_, _)      -> false
-  EIntrinsic(_, _)    -> false
-  ESurface(_)         -> false
+  ERecordLit(_, fis) -> pcs_fields_bare_var(p, fis) or pcs_consumes_ps(p, xp_positions(e))
+  EList(els)         -> pcs_elems_bare_var(p, els) or pcs_consumes_ps(p, xp_positions(e))
+  _                  -> pcs_consumes_ps(p, xp_positions(e))
+}
+
+fn pcs_consumes_ps(p: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (xrole_inline(r) and pcs_consumes_expr(p, c)) or pcs_consumes_ps(p, rest)
 }
 
 fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
@@ -1112,54 +1082,29 @@ fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
   }
 }
 
-fn pcs_consumes_arms(p: String, arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [a, ...rest] -> match a {
-    Arm(_, opt_g, b) ->
-      (match opt_g { None -> false Some(g) -> pcs_consumes_kind(p, g.kind) }) or
-      pcs_consumes_kind(p, b.kind) or pcs_consumes_arms(p, rest)
-  }
-}
-
-fn pcs_consumes_seq(p: String, xs: [Expr]) : Bool = match xs {
-  []           -> false
-  [h, ...rest] -> pcs_consumes_kind(p, h.kind) or pcs_consumes_seq(p, rest)
-}
-
 fn pcs_any_bare_var(p: String, xs: [Expr]) : Bool = match xs {
   []           -> false
   [h, ...rest] -> (match h.kind { EVar(nm) -> nm == p _ -> false }) or pcs_any_bare_var(p, rest)
 }
 
-fn pcs_consumes_fields(p: String, fis: [FieldInit]) : Bool = match fis {
+fn pcs_fields_bare_var(p: String, fis: [FieldInit]) : Bool = match fis {
   []           -> false
   [h, ...rest] -> match h {
-    FI(_, e) -> (match e.kind { EVar(nm) -> nm == p _ -> pcs_consumes_kind(p, e.kind) }) or
-                pcs_consumes_fields(p, rest)
+    FI(_, e) -> (match e.kind { EVar(nm) -> nm == p _ -> false }) or
+                pcs_fields_bare_var(p, rest)
   }
 }
 
-fn pcs_consumes_elems(p: String, els: [ListElem]) : Bool = match els {
+# A spread `[...p]` copies out of p without taking the cell — only a
+# plain element slot stores the ref.
+fn pcs_elems_bare_var(p: String, els: [ListElem]) : Bool = match els {
   []           -> false
   [h, ...rest] -> {
     let here = match h {
-      ElPlain(e)  -> match e.kind { EVar(nm) -> nm == p _ -> pcs_consumes_kind(p, e.kind) }
-      ElSpread(e) -> pcs_consumes_kind(p, e.kind)
+      ElPlain(e)  -> match e.kind { EVar(nm) -> nm == p _ -> false }
+      ElSpread(_) -> false
     }
-    here or pcs_consumes_elems(p, rest)
-  }
-}
-
-fn pcs_consumes_stmts(p: String, stmts: [Stmt]) : Bool = match stmts {
-  []           -> false
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e)       -> pcs_consumes_kind(p, e.kind)
-      SVar(_, _, e, _, _) -> pcs_consumes_kind(p, e.kind)
-      SExprStmt(e)        -> pcs_consumes_kind(p, e.kind)
-      _                   -> false
-    }
-    here or pcs_consumes_stmts(p, rest)
+    here or pcs_elems_bare_var(p, rest)
   }
 }
 
@@ -4510,35 +4455,16 @@ fn pcs_consumers_linear_stmt(nm: String, s: Stmt) : Bool = match s {
 }
 
 # Returns `true` if every execution path through `body` consumes
-# `nm` exactly once on a non-lambda read. Composition rules:
-#   - leaf EVar(nm) → true
-#   - sequential composition (Block/Call/Binop/...) → any sub-position
-#     consumes
-#   - EIf with both branches → both branches must consume
-#   - EIf without else → cannot prove consume (the missing-else path
-#     leaves the binding alive)
-#   - EMatch → every arm body must consume (the scrutinee path is
-#     a sequence: scrutinee evaluated, then arm body)
-#   - ELambda → false (closure capture is RC'd separately)
-#   - leaves (EInt, EBool, ...) → false
-fn pcs_consumed_on_every_path(nm: String, e: Expr) : Bool =
-  pcs_consumed_kind(nm, e.kind)
-
-fn pcs_consumed_kind(nm: String, k: ExprKind) : Bool = match k {
-  EVar(uname)         -> uname == nm
-  EStr(_, _)          -> false  # interpolated reads go through §4b path
-  ECall(f, xs)        -> pcs_consumed_on_every_path(nm, f) or
-                          pcs_consumed_any(nm, xs)
-  EIntrinsic(_, xs)   -> pcs_consumed_any(nm, xs)
-  ESurface(sf)   -> pcs_consumed_any(nm, surface_children(sf))
-  EField(x, _)        -> pcs_consumed_on_every_path(nm, x)
-  EIndex(a, b)        -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EBinop(_, a, b)     -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EUnop(_, x)         -> pcs_consumed_on_every_path(nm, x)
-  EIf(c, t, opt_e)    -> {
-    # consumed if cond consumes, OR both branches consume.
+# `nm` exactly once on a non-lambda read. Only a position that runs
+# whenever its parent runs (`XAll`) can witness consumption: a branch
+# position (`XBr` — if/match alternatives, a short-circuited `and`/`or`
+# RHS) or an assert message (`XMsg`) may never evaluate, and deferred
+# bodies (`XLam`/`XCl`) run elsewhere. `EIf`/`EMatch` keep explicit
+# arms because their branch positions are alternatives of each other —
+# all must consume — which the flat position list cannot express.
+fn pcs_consumed_on_every_path(nm: String, e: Expr) : Bool = match e.kind {
+  EVar(uname)      -> uname == nm
+  EIf(c, t, opt_e) -> {
     if pcs_consumed_on_every_path(nm, c) { true }
     else {
       match opt_e {
@@ -4548,39 +4474,18 @@ fn pcs_consumed_kind(nm: String, k: ExprKind) : Bool = match k {
       }
     }
   }
-  EMatch(s, arms)     -> {
+  EMatch(s, arms)  -> {
     if pcs_consumed_on_every_path(nm, s) { true }
     else { pcs_consumed_all_arms(nm, arms) }
   }
-  ELambda(_, _)       -> false
-  ERecordLit(_, fis)  -> pcs_consumed_any_field(nm, fis)
-  EList(els)          -> pcs_consumed_any_elem(nm, els)
-  ERange(a, b, opt)   -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b) or
-                          pcs_consumed_opt(nm, opt)
-  EBlock(stmts, tail) -> pcs_consumed_in_block(nm, stmts, tail)
-  EPipe(a, b)         -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EMapPipe(a, b)      -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EFlatMapPipe(a, b)  -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EFilterPipe(a, b)   -> pcs_consumed_on_every_path(nm, a) or
-                          pcs_consumed_on_every_path(nm, b)
-  EHandle(body, _, _, init_opt, _, _, _) -> {
-    # Conservative: only count the body and init expression. Handler
-    # clause bodies execute on op invocation; we can't prove they
-    # always fire.
-    pcs_consumed_on_every_path(nm, body) or pcs_consumed_opt(nm, init_opt)
-  }
-  EBang(inner)        -> pcs_consumed_on_every_path(nm, inner)
-  ELitUnit(inner, _)  -> pcs_consumed_on_every_path(nm, inner)
-  _                   -> false
+  _                -> pcs_consumed_ps(nm, xp_positions(e))
 }
 
-fn pcs_consumed_any(nm: String, es: [Expr]) : Bool = match es {
-  []           -> false
-  [h, ...rest] -> pcs_consumed_on_every_path(nm, h) or pcs_consumed_any(nm, rest)
+fn pcs_consumed_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (match r { XAll -> pcs_consumed_on_every_path(nm, c) _ -> false }) or
+    pcs_consumed_ps(nm, rest)
 }
 
 fn pcs_consumed_all_arms(nm: String, arms: [Arm]) : Bool = match arms {
@@ -4590,50 +4495,6 @@ fn pcs_consumed_all_arms(nm: String, arms: [Arm]) : Bool = match arms {
     Arm(_, _, body) ->
       pcs_consumed_on_every_path(nm, body) and pcs_consumed_all_arms(nm, rest)
   }
-}
-
-fn pcs_consumed_any_field(nm: String, fis: [FieldInit]) : Bool = match fis {
-  []           -> false
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_consumed_on_every_path(nm, e) or pcs_consumed_any_field(nm, rest)
-  }
-}
-
-fn pcs_consumed_any_elem(nm: String, els: [ListElem]) : Bool = match els {
-  []           -> false
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_consumed_on_every_path(nm, inner) or pcs_consumed_any_elem(nm, rest)
-  }
-}
-
-fn pcs_consumed_opt(nm: String, opt: Option[Expr]) : Bool = match opt {
-  None    -> false
-  Some(e) -> pcs_consumed_on_every_path(nm, e)
-}
-
-fn pcs_consumed_in_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
-  if pcs_consumed_in_stmts(nm, stmts) { true }
-  else { pcs_consumed_opt(nm, tail) }
-}
-
-fn pcs_consumed_in_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
-  []           -> false
-  [h, ...rest] -> pcs_consumed_in_stmt(nm, h) or pcs_consumed_in_stmts(nm, rest)
-}
-
-fn pcs_consumed_in_stmt(nm: String, s: Stmt) : Bool = match s {
-  SLet(_, _, e)                  -> pcs_consumed_on_every_path(nm, e)
-  SVar(_, _, e, _, _)            -> pcs_consumed_on_every_path(nm, e)
-  SAssert(e, opt_m)              -> pcs_consumed_on_every_path(nm, e) or
-                                     pcs_consumed_opt(nm, opt_m)
-  SExprStmt(e)                   -> pcs_consumed_on_every_path(nm, e)
-  SIndexAssign(a, b, c, _, _)    -> pcs_consumed_on_every_path(nm, a) or
-                                     pcs_consumed_on_every_path(nm, b) or
-                                     pcs_consumed_on_every_path(nm, c)
-  SAssign(a, c, _, _)            -> pcs_consumed_on_every_path(nm, a) or
-                                     pcs_consumed_on_every_path(nm, c)
-  SUse(_, _, _)                  -> false
 }
 
 # ---- m5.x §4b: rewrite EVar reads inside EStr interpolation bodies ----
@@ -5504,6 +5365,12 @@ fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr,
           if in_lam {
             [pcs_make_drop_stmt(nm, ln, cl), ...acc]
           } else if arm_count >= 2 {
+            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
+          } else if arm_count == 0 and not name_is_unused_binder(nm) {
+            # A zero-use binder still took its bind-incref (only `_`-named
+            # binders are elided by the emitters), and with no read to
+            # transfer the ref this drop is its only payer — the tcrec goto
+            # ledger sees the drop as a consume and will not pay it again.
             [pcs_make_drop_stmt(nm, ln, cl), ...acc]
           } else { acc }
         }
