@@ -4958,12 +4958,13 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
  * Two-stage lookup (open-addressed, 1024 buckets):
  *   1. Pointer match — hits 100% of compiler-emitted literal calls
  *      because identical literals share a single .rodata entry.
- *   2. Content match (≤ 64 bytes) — backstop for cstr's that arrive
- *      via stack buffers (`int_to_string`, `kai_cat2(...)`) and
- *      happen to repeat content.
+ *   2. Content match (≤ 64 bytes) — backstop for a repeated literal
+ *      whose .rodata pointer differs across translation units.
  *
- * Misses (long strings, full table, transient content unique per
- * call) fall through to `kai_str_from_bytes` unchanged.
+ * Misses (long strings, full table) fall through to
+ * `kai_str_from_bytes` unchanged. Data-derived content must NOT come
+ * through here — every distinct string inserted is pinned immortal, so
+ * unbounded content grows the table without bound (use `kai_str_dyn`).
  *
  * Cached values carry `rc = INT32_MAX` so `kai_incref` / `kai_decref`
  * short-circuit; `kai_free_value` is never reached. */
@@ -5070,6 +5071,14 @@ static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
     }
     /* Table full — fall back to non-cached. */
     return kai_str_from_bytes(cstr, len);
+}
+
+/* For data-derived C strings (number renders, paths, dir entries).
+ * `kai_str` interns and pins its result immortal, which is only sound
+ * for program-bounded literals — unbounded content would grow the
+ * intern table one immortal cell per distinct value. */
+static KaiValue *kai_str_dyn(const char *cstr) {
+    return kai_str_from_bytes(cstr, strlen(cstr));
 }
 
 static KaiValue *kai_nil(void) { return &kai_singleton_nil; }
@@ -7295,20 +7304,20 @@ static KaiValue *kai_to_string(KaiValue *v) {
      * as the decoded integer before touching the header. */
     if (kai_is_value(v)) {
         snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
-        return kai_str(buf);
+        return kai_str_dyn(buf);
     }
     switch ((KaiTag) v->tag) {
         case KAI_UNIT: return kai_str("()");
         case KAI_BOOL: return kai_str(v->as.b ? "true" : "false");
         case KAI_INT:
             snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_REAL:
             snprintf(buf, sizeof(buf), "%g", v->as.r);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_CHAR:
             snprintf(buf, sizeof(buf), "%c", (char) v->as.c);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_STR:    return kai_incref(v);
         case KAI_NIL:    return kai_str("[]");
         case KAI_CONS:   return kai_list_to_string(v);
@@ -7367,19 +7376,19 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_FOREIGN: return kai_str("<foreign>");
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_INT32:
             snprintf(buf, sizeof(buf), "%d", (int) v->as.i32);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_UINT32:
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u32);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_UINT64:
             snprintf(buf, sizeof(buf), "%llu", (unsigned long long) v->as.u64);
-            return kai_str(buf);
+            return kai_str_dyn(buf);
         case KAI_INT128: {
             char i128buf[44];
-            return kai_str(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
+            return kai_str_dyn(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
         }
     }
     return kai_str("?");
@@ -7659,7 +7668,7 @@ static KaiValue *kai_core_exit(KaiValue *code) {
 static KaiValue *kai_core_int_to_string(KaiValue *v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
-    KaiValue *r = kai_str(buf);
+    KaiValue *r = kai_str_dyn(buf);
     kai_decref(v);
     return r;
 }
@@ -7667,7 +7676,7 @@ static KaiValue *kai_core_int_to_string(KaiValue *v) {
 static KaiValue *kai_core_real_to_string(KaiValue *v) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", v->as.r);
-    KaiValue *r = kai_str(buf);
+    KaiValue *r = kai_str_dyn(buf);
     kai_decref(v);
     return r;
 }
@@ -7711,7 +7720,7 @@ static KaiValue *kai_core_int_to_byte(KaiValue *v) {
     if (n < 0 || n > 255) {
         char buf[64];
         snprintf(buf, sizeof(buf), "int_to_byte: %lld is out of 0..255", (long long) n);
-        KaiValue *err = kai_str(buf);
+        KaiValue *err = kai_str_dyn(buf);
         return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = err}});
     }
     KaiValue *ok_payload = kai_byte((uint8_t) n);
@@ -7763,7 +7772,7 @@ static KaiValue *kai_core_byte_to_string(KaiValue *v) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
     kai_decref(v);
-    return kai_str(buf);
+    return kai_str_dyn(buf);
 }
 
 /* Fixed-width integer Show prims (numeric lane A). Each consumes its
@@ -7773,25 +7782,25 @@ static KaiValue *kai_core_int32_to_string(KaiValue *v) {
     int32_t n = (v && kai_is_ptr(v) && v->tag == KAI_INT32) ? v->as.i32 : 0;
     if (v) kai_decref(v);
     char buf[16]; snprintf(buf, sizeof(buf), "%d", (int) n);
-    return kai_str(buf);
+    return kai_str_dyn(buf);
 }
 static KaiValue *kai_core_uint32_to_string(KaiValue *v) {
     uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32 : 0;
     if (v) kai_decref(v);
     char buf[16]; snprintf(buf, sizeof(buf), "%u", (unsigned) n);
-    return kai_str(buf);
+    return kai_str_dyn(buf);
 }
 static KaiValue *kai_core_uint64_to_string(KaiValue *v) {
     uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64 : 0;
     if (v) kai_decref(v);
     char buf[24]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long) n);
-    return kai_str(buf);
+    return kai_str_dyn(buf);
 }
 static KaiValue *kai_core_int128_to_string(KaiValue *v) {
     __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0;
     if (v) kai_decref(v);
     char buf[44];
-    return kai_str(kai_i128_to_decimal(n, buf, sizeof(buf)));
+    return kai_str_dyn(kai_i128_to_decimal(n, buf, sizeof(buf)));
 }
 
 /* Fixed-width conversions. `int_to_*` truncates the 64-bit Int into the
@@ -8814,7 +8823,7 @@ static KaiValue *kai_core_abspath(KaiValue *path) {
     if (realpath(pbuf, resolved) == NULL) {
         return path;
     }
-    return kai_str(resolved);
+    return kai_str_dyn(resolved);
 }
 
 /* ---------- core: mailbox runtime (m8 #7) ---------- */
@@ -9500,7 +9509,7 @@ static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
             closedir(d);
             for (size_t i = n; i > 0;) {
                 --i;
-                acc = kai_cons(kai_str(names[i]), acc);
+                acc = kai_cons(kai_str_dyn(names[i]), acc);
                 free(names[i]);
             }
             free(names);
@@ -16725,7 +16734,7 @@ static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
                     char buf[256];
                     snprintf(buf, sizeof(buf), "Trapped: %s",
                              self->trap_msg ? self->trap_msg : "runtime trap");
-                    kai_deliver_to_mailbox(peer->mailbox, kai_str(buf));
+                    kai_deliver_to_mailbox(peer->mailbox, kai_str_dyn(buf));
                 } else {
                     const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
                     kai_deliver_to_mailbox(peer->mailbox, kai_str(txt));
