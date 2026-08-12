@@ -40,6 +40,17 @@ Baseline, both backends:
 | signatures taking `[Use]` / `[BorrowEntry]` / `[ConsumeEntry]` | 14 | 1 |
 | `__perceus_*` sentinel sites | 64 | 33 |
 
+Those counts read worse than the leak actually is, and the scope matters
+for stage 2. All fourteen `emit_c` signatures belong to `tcrec_*` /
+`trmc_*` — the tail-call machinery — and only 7 of its 64 sentinel sites
+sit in that zone. `emit_c` takes no `[BorrowEntry]` or `[ConsumeEntry]`
+at all, so the Ownership Signature never reaches a backend.
+
+The remaining 57 sentinel sites are ordinary emission, where matching
+`__perceus_dup` in the tree *is* the intended transcription rather than a
+leak. **The re-derivation to close is TCO reading raw `[Use]`, not a
+backend-wide contamination.**
+
 Seven modules outside Perceus take `[Use]`: `emit_c`, `emit_shared`,
 `fnreg`, `kir_lower_walk`, `infer`, `unbox`, `rawsafe`.
 
