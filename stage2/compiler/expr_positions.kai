@@ -1,0 +1,158 @@
+#[doc("""
+The single description of `ExprKind`'s sub-expression positions.
+
+Read-side dual of `ast_map.kai`: where `prc_map_expr_kind` rebuilds a
+node from mapped children, `xp_positions` enumerates the children with
+the ROLE each occupies, flattening the `Stmt` / `Arm` / `HClause` /
+`ListElem` / `FieldInit` substructure so a scan never touches those
+shapes directly. Ownership walkers consult this enumeration instead of
+replicating it: a walker keeps explicit arms only for the variants it
+genuinely treats specially and descends through `xp_positions` for the
+rest. A new `ExprKind` variant is then a compile error HERE, once, and
+every table-driven walker inherits the decision — two walkers can no
+longer disagree about which positions exist.
+
+Roles say when a child runs relative to its parent:
+
+- `XAll` — evaluated whenever the parent is, on every path (call args,
+  binop operands, if-conditions, match scrutinees, block stmts + tail).
+- `XBr`  — evaluated on some paths only (if branches, match guards and
+  arm bodies, the right operand of short-circuiting `and` / `or`).
+- `XLam` — a lambda body: deferred to call time, closure boundary.
+- `XCl`  — a handler clause or `return(x)` body: runs on effect
+  dispatch, not where the `handle` is evaluated.
+- `XMsg` — an assert message: evaluated only on the aborting path.
+
+Positions this table cannot carry, by construction:
+
+- `EStr` interpolation reads live in the raw source span, not in child
+  `Expr` nodes; a name scan that cares must handle `EStr` itself.
+- Pattern binders are not expressions; scope-tracking walkers still own
+  their binder bookkeeping.
+""")]
+
+import compiler.ast
+
+#[doc("When a child position runs relative to its parent. See the module doc for the role vocabulary.")]
+pub type XRole = XAll | XBr | XLam | XCl | XMsg
+
+#[doc("One child position: the role it occupies and the sub-expression in it.")]
+pub type XPos = XP(XRole, Expr)
+
+#[doc("True for positions evaluated in place when the parent evaluates (on every or some path): `XAll`, `XBr`, `XMsg`. False for the deferred bodies `XLam` / `XCl`.")]
+pub fn xrole_inline(r: XRole) : Bool = match r {
+  XAll -> true
+  XBr  -> true
+  XMsg -> true
+  XLam -> false
+  XCl  -> false
+}
+
+#[doc("""
+Every direct sub-expression of `e` with its role, in source order.
+The one exhaustive enumeration of `ExprKind`'s positions — walkers
+descend through this list instead of matching the variants themselves.
+""")]
+pub fn xp_positions(e: Expr) : [XPos] = match e.kind {
+  # Leaves: literals, names, markers — no sub-expression positions.
+  EInt(_, _)        -> []
+  EReal(_, _)       -> []
+  EFixed(_, _)      -> []
+  EIntLit(_)        -> []
+  EDecimalLit(_)    -> []
+  EBool(_)          -> []
+  EChar(_)          -> []
+  EStr(_, _)        -> []
+  EUnit             -> []
+  EVar(_)           -> []
+  EUnder            -> []
+  EPlaceholder      -> []
+  EHole(_)          -> []
+  ETodo(_)          -> []
+  EExternBody(_)    -> []
+  EVariantsOf(_, _) -> []
+  EModCall(_, _)    -> []
+
+  ECall(f, xs)       -> [XP(XAll, f), ...xp_all(xs)]
+  EField(b, _)       -> [XP(XAll, b)]
+  EIndex(a, b)       -> [XP(XAll, a), XP(XAll, b)]
+  # `and` / `or` short-circuit: the right operand runs on some paths only.
+  EBinop(op, a, b)   ->
+    if op == "and" or op == "or" { [XP(XAll, a), XP(XBr, b)] }
+    else { [XP(XAll, a), XP(XAll, b)] }
+  EUnop(_, x)        -> [XP(XAll, x)]
+  EIf(c, t, oe)      -> [XP(XAll, c), XP(XBr, t), ...xp_opt(XBr, oe)]
+  EMatch(s, arms)    -> [XP(XAll, s), ...xp_arms(arms)]
+  ELambda(_, b)      -> [XP(XLam, b)]
+  ERecordLit(_, fs)  -> xp_fields(fs)
+  EList(els)         -> xp_elems(els)
+  ERange(a, b, os)   -> [XP(XAll, a), XP(XAll, b), ...xp_opt(XAll, os)]
+  EBlock(ss, ot)     -> list_append(xp_stmts(ss), xp_opt(XAll, ot))
+  EPipe(a, b)        -> [XP(XAll, a), XP(XAll, b)]
+  EMapPipe(a, b)     -> [XP(XAll, a), XP(XAll, b)]
+  EFlatMapPipe(a, b) -> [XP(XAll, a), XP(XAll, b)]
+  EFilterPipe(a, b)  -> [XP(XAll, a), XP(XAll, b)]
+  EBang(x)           -> [XP(XAll, x)]
+  EHandle(body, _, _, oi, _, cls, oret) ->
+    list_append([...xp_opt(XAll, oi), XP(XAll, body), ...xp_clauses(cls)],
+                xp_hret(oret))
+  ELitUnit(x, _)     -> [XP(XAll, x)]
+  EIntrinsic(_, xs)  -> xp_all(xs)
+  ESurface(sf)       -> xp_all(surface_children(sf))
+}
+
+fn xp_all(xs: [Expr]) : [XPos] = match xs {
+  []           -> []
+  [h, ...rest] -> [XP(XAll, h), ...xp_all(rest)]
+}
+
+fn xp_opt(r: XRole, o: Option[Expr]) : [XPos] = match o {
+  None    -> []
+  Some(x) -> [XP(r, x)]
+}
+
+# A guard runs only if the pattern matched; a body only if the guard
+# also passed. Both are branch positions of the match.
+fn xp_arms(arms: [Arm]) : [XPos] = match arms {
+  []           -> []
+  [Arm(_, og, b), ...rest] ->
+    list_append([...xp_opt(XBr, og), XP(XBr, b)], xp_arms(rest))
+}
+
+fn xp_stmts(ss: [Stmt]) : [XPos] = match ss {
+  []           -> []
+  [s, ...rest] -> list_append(xp_stmt(s), xp_stmts(rest))
+}
+
+fn xp_stmt(s: Stmt) : [XPos] = match s {
+  SLet(_, _, rhs)             -> [XP(XAll, rhs)]
+  SVar(_, _, init, _, _)      -> [XP(XAll, init)]
+  SExprStmt(x)                -> [XP(XAll, x)]
+  SAssert(c, om)              -> [XP(XAll, c), ...xp_opt(XMsg, om)]
+  SIndexAssign(a, i, v, _, _) -> [XP(XAll, a), XP(XAll, i), XP(XAll, v)]
+  SAssign(a, v, _, _)         -> [XP(XAll, a), XP(XAll, v)]
+  SUse(_, _, _)               -> []
+}
+
+fn xp_fields(fs: [FieldInit]) : [XPos] = match fs {
+  []                  -> []
+  [FI(_, x), ...rest] -> [XP(XAll, x), ...xp_fields(rest)]
+}
+
+fn xp_elems(els: [ListElem]) : [XPos] = match els {
+  []           -> []
+  [el, ...rest] -> {
+    let inner = match el { ElPlain(x) -> x ElSpread(x) -> x }
+    [XP(XAll, inner), ...xp_elems(rest)]
+  }
+}
+
+fn xp_clauses(cls: [HClause]) : [XPos] = match cls {
+  []           -> []
+  [HC(_, _, b, _, _), ...rest] -> [XP(XCl, b), ...xp_clauses(rest)]
+}
+
+fn xp_hret(o: Option[HReturn]) : [XPos] = match o {
+  None                 -> []
+  Some(HR(_, b, _, _)) -> [XP(XCl, b)]
+}
