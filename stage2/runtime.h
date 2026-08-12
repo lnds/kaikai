@@ -6351,7 +6351,23 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
                                                                             uint32_t mask, KaiVarSlot *slots) {
     if (_scr != NULL && !kai_is_value(_scr) && _scr->tag == KAI_VARIANT &&
         _scr->var_n_args == n && kai_check_unique(_scr)) {
-        for (int i = 0; i < n; ++i) kai_var_slots(_scr)[i] = slots[i];
+        /* A donor pointer slot the rebuild does not re-embed still holds
+         * the cell's claim on the old child; pay it here or it leaks
+         * (the wildcard-slot rebuild `MErr(_, _) -> MVal(99, [1])`). An
+         * aliased slot is a kept child moved in place — its bookkeeping
+         * already balanced, same guard as kai_reuse_or_alloc_variant.
+         * Slot-kind decode mirrors kai_free_variant_spine: mask 0 means
+         * all-pointer, else 2 bits per slot. */
+        uint32_t donor_mask = kai_slot_mask_of(_scr->variant_tag);
+        for (int i = 0; i < n; ++i) {
+            KaiValue *old_ptr = NULL;
+            if (donor_mask == 0 || kai_var_slot_kind(donor_mask, i) == KAI_VAR_SLOT_PTR) {
+                old_ptr = kai_var_slots(_scr)[i].ptr;
+                if (!kai_is_ptr(old_ptr)) old_ptr = NULL;
+            }
+            kai_var_slots(_scr)[i] = slots[i];
+            if (old_ptr != NULL && old_ptr != slots[i].ptr) kai_decref(old_ptr);
+        }
         _scr->variant_tag = tag;
         kai_slotmask_register(_scr->variant_tag, mask);
         kai_rc_count_reuse();
