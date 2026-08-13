@@ -1156,71 +1156,33 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Boo
         pcs_consuming_args(nm, xs, consumed, is_ctor, 0, cmap)
     }
   }
-  ELambda(_, _) -> false   # nm captured under a lambda = not move-safe
   EMatch(s, arms) -> {
     let s_ok = match s.kind { EVar(_) -> true _ -> pcs_uses_only_consuming_slots(nm, s, cmap) }
     s_ok and pcs_consuming_arms(nm, arms, cmap)
   }
-  EIf(c, t, opt_e) -> pcs_uses_only_consuming_slots(nm, c, cmap) and
-                       pcs_uses_only_consuming_slots(nm, t, cmap) and
-                       (match opt_e { None -> true Some(e2) -> pcs_uses_only_consuming_slots(nm, e2, cmap) })
-  EBlock(stmts, tail) -> pcs_consuming_stmts(nm, stmts, cmap) and
-                          (match tail { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) })
-  EBinop(_, a, b) -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
-  EUnop(_, x)     -> pcs_uses_only_consuming_slots(nm, x, cmap)
   EField(x, _)    -> match x.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, x, cmap) }
   EIndex(a, b)    -> (match a.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, a, cmap) }) and
                       pcs_uses_only_consuming_slots(nm, b, cmap)
-  ERecordLit(_, fis) -> pcs_consuming_fields(nm, fis, cmap)
-  EList(els)      -> pcs_consuming_elems(nm, els, cmap)
-  EPipe(a, b)     -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
-  EBang(x)        -> pcs_uses_only_consuming_slots(nm, x, cmap)
-  # Positions with real sub-expressions scan them instead of imposing no
-  # constraint — a read the collector sees must never be invisible here.
   # Interp reads take a dup and never a consuming slot; lexical presence
   # is the pure stand-in for the collector's parsed view.
   EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple) == 0
-  ERange(a, b, opt)   -> pcs_uses_only_consuming_slots(nm, a, cmap) and
-                          pcs_uses_only_consuming_slots(nm, b, cmap) and
-                          (match opt { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) })
   # Intrinsics incref their args internally — no arg slot ever consumes.
   EIntrinsic(_, xs)   -> not pcs_name_in_exprs(nm, xs)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
-    pcs_uses_only_consuming_slots(nm, body, cmap) and
-    (match init_opt { None -> true Some(e) -> pcs_uses_only_consuming_slots(nm, e, cmap) }) and
-    pcs_consuming_clauses(nm, clauses, cmap) and
-    (match ret_opt { None -> true Some(hr) -> match hr { HR(_, b2, _, _) -> pcs_uses_only_consuming_slots(nm, b2, cmap) } })
-  ELitUnit(x, _)      -> pcs_uses_only_consuming_slots(nm, x, cmap)
-  EMapPipe(a, b)      -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
-  EFlatMapPipe(a, b)  -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
-  EFilterPipe(a, b)   -> pcs_uses_only_consuming_slots(nm, a, cmap) and pcs_uses_only_consuming_slots(nm, b, cmap)
   ESurface(sf)        -> not pcs_name_in_exprs(nm, surface_children(sf))
-  # Read-free leaves impose no constraint. No `_` arm — a new ExprKind
-  # variant must be classified here before it compiles.
-  EInt(_, _)          -> true
-  EReal(_, _)         -> true
-  EFixed(_, _)        -> true
-  EIntLit(_)          -> true
-  EDecimalLit(_)      -> true
-  EBool(_)            -> true
-  EChar(_)            -> true
-  EUnit               -> true
-  EVar(_)             -> true
-  EUnder              -> true
-  EPlaceholder        -> true
-  EHole(_)            -> true
-  ETodo(_)            -> true
-  EExternBody(_)      -> true
-  EVariantsOf(_, _)   -> true
-  EModCall(_, _)      -> true
+  # Everything else scans its positions: a lambda capture is never
+  # move-safe, an assert message blocks on mere presence (it only runs
+  # on the aborting path), and the remaining roles apply the slot check.
+  _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap)
 }
 
-fn pcs_consuming_clauses(nm: String, cs: [HClause], cmap: [ConsumeEntry]) : Bool = match cs {
-  []           -> true
-  [h, ...rest] -> match h {
-    HC(_, _, body, _, _) ->
-      pcs_uses_only_consuming_slots(nm, body, cmap) and pcs_consuming_clauses(nm, rest, cmap)
-  }
+fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: [ConsumeEntry]) : Bool = match ps {
+  []                  -> true
+  [XP(r, c), ...rest] ->
+    (match r {
+      XLam -> false
+      XMsg -> not pcs_name_in_expr(nm, c)
+      _    -> pcs_uses_only_consuming_slots(nm, c, cmap)
+    }) and pcs_consuming_slots_ps(nm, rest, cmap)
 }
 
 fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
@@ -1240,44 +1202,6 @@ fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: [ConsumeEntry]) : Bool = ma
     Arm(_, opt_g, b) ->
       (match opt_g { None -> true Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap) }) and
       pcs_uses_only_consuming_slots(nm, b, cmap) and pcs_consuming_arms(nm, rest, cmap)
-  }
-}
-
-fn pcs_consuming_stmts(nm: String, stmts: [Stmt], cmap: [ConsumeEntry]) : Bool = match stmts {
-  []           -> true
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e)       -> pcs_uses_only_consuming_slots(nm, e, cmap)
-      SVar(_, _, e, _, _) -> pcs_uses_only_consuming_slots(nm, e, cmap)
-      SExprStmt(e)        -> pcs_uses_only_consuming_slots(nm, e, cmap)
-      # The condition always evaluates — same reasoning as SExprStmt.
-      # The message only evaluates on the failing path, so a read there
-      # never consumes on the success path: presence blocks the move.
-      SAssert(c, opt_m)   -> pcs_uses_only_consuming_slots(nm, c, cmap) and
-                              (match opt_m { None -> true Some(m) -> not pcs_name_in_expr(nm, m) })
-      SIndexAssign(b, i, v, _, _) -> pcs_uses_only_consuming_slots(nm, b, cmap) and
-                                      pcs_uses_only_consuming_slots(nm, i, cmap) and
-                                      pcs_uses_only_consuming_slots(nm, v, cmap)
-      SAssign(b, v, _, _) -> pcs_uses_only_consuming_slots(nm, b, cmap) and
-                              pcs_uses_only_consuming_slots(nm, v, cmap)
-      SUse(_, _, _)       -> true
-    }
-    here and pcs_consuming_stmts(nm, rest, cmap)
-  }
-}
-
-fn pcs_consuming_fields(nm: String, fis: [FieldInit], cmap: [ConsumeEntry]) : Bool = match fis {
-  []           -> true
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_uses_only_consuming_slots(nm, e, cmap) and pcs_consuming_fields(nm, rest, cmap)
-  }
-}
-
-fn pcs_consuming_elems(nm: String, els: [ListElem], cmap: [ConsumeEntry]) : Bool = match els {
-  []           -> true
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_uses_only_consuming_slots(nm, inner, cmap) and pcs_consuming_elems(nm, rest, cmap)
   }
 }
 
@@ -1310,19 +1234,7 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
       pcs_lu_consuming_kind(nm, ll, lc, f.kind, cmap) and
         pcs_lu_consuming_args(nm, ll, lc, xs, consumed, is_ctor, 0, cmap)
     }
-  ELambda(_, _) -> false
   EMatch(s, arms) -> pcs_lu_consuming_kind(nm, ll, lc, s.kind, cmap) and pcs_lu_consuming_arms(nm, ll, lc, arms, cmap)
-  EIf(c, t, opt_e) -> pcs_last_use_consuming(nm, ll, lc, c, cmap) and
-                       pcs_last_use_consuming(nm, ll, lc, t, cmap) and
-                       (match opt_e { None -> true Some(e2) -> pcs_last_use_consuming(nm, ll, lc, e2, cmap) })
-  EBlock(stmts, tail) -> pcs_lu_consuming_stmts(nm, ll, lc, stmts, cmap) and
-                          (match tail { None -> true Some(e) -> pcs_last_use_consuming(nm, ll, lc, e, cmap) })
-  EBinop(_, a, b) -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
-  EUnop(_, x)     -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
-  ERecordLit(_, fis) -> pcs_lu_consuming_fields(nm, ll, lc, fis, cmap)
-  EList(els)      -> pcs_lu_consuming_elems(nm, ll, lc, els, cmap)
-  EPipe(a, b)     -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
-  EBang(x)        -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
   # A last-use field/index read is paired by emit with a receiver decref
   # (the perceus-move / emit pair): the projection's base position is a
   # consuming read at the ABI level, so it stays unconstrained.
@@ -1334,33 +1246,21 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
   # Intrinsics incref their args internally: a last use moved into one
   # leaks the transferred ref.
   EIntrinsic(_, xs)   -> not pcs_pos_in_exprs(ll, lc, xs)
-  ERange(a, b, opt)   -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and
-                          pcs_last_use_consuming(nm, ll, lc, b, cmap) and
-                          (match opt { None -> true Some(e) -> pcs_last_use_consuming(nm, ll, lc, e, cmap) })
-  ELitUnit(x, _)      -> pcs_last_use_consuming(nm, ll, lc, x, cmap)
-  EMapPipe(a, b)      -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
-  EFlatMapPipe(a, b)  -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
-  EFilterPipe(a, b)   -> pcs_last_use_consuming(nm, ll, lc, a, cmap) and pcs_last_use_consuming(nm, ll, lc, b, cmap)
   ESurface(sf)        -> not pcs_pos_in_exprs(ll, lc, surface_children(sf))
-  # Remaining forms hold no read position. No `_` arm — a new ExprKind
-  # variant must be classified here before it compiles.
-  EInt(_, _)          -> true
-  EReal(_, _)         -> true
-  EFixed(_, _)        -> true
-  EIntLit(_)          -> true
-  EDecimalLit(_)      -> true
-  EBool(_)            -> true
-  EChar(_)            -> true
-  EStr(_, _)          -> true
-  EUnit               -> true
-  EVar(_)             -> true
-  EUnder              -> true
-  EPlaceholder        -> true
-  EHole(_)            -> true
-  ETodo(_)            -> true
-  EExternBody(_)      -> true
-  EVariantsOf(_, _)   -> true
-  EModCall(_, _)      -> true
+  # Everything else scans its positions: a last use under a lambda is
+  # never move-safe, one in an assert message runs only on the aborting
+  # path (blocks on position presence), and the rest apply the check.
+  _ -> pcs_lu_consuming_ps(nm, ll, lc, xp_positions_kind(k), cmap)
+}
+
+fn pcs_lu_consuming_ps(nm: String, ll: Int, lc: Int, ps: [XPos], cmap: [ConsumeEntry]) : Bool = match ps {
+  []                  -> true
+  [XP(r, c), ...rest] ->
+    (match r {
+      XLam -> false
+      XMsg -> not pcs_pos_in_expr(ll, lc, c)
+      _    -> pcs_last_use_consuming(nm, ll, lc, c, cmap)
+    }) and pcs_lu_consuming_ps(nm, ll, lc, rest, cmap)
 }
 
 fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
@@ -1388,42 +1288,6 @@ fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: [Consu
     Arm(_, opt_g, b) ->
       (match opt_g { None -> true Some(g) -> not pcs_pos_in_expr(ll, lc, g) }) and
       pcs_last_use_consuming(nm, ll, lc, b, cmap) and pcs_lu_consuming_arms(nm, ll, lc, rest, cmap)
-  }
-}
-
-fn pcs_lu_consuming_stmts(nm: String, ll: Int, lc: Int, stmts: [Stmt], cmap: [ConsumeEntry]) : Bool = match stmts {
-  []           -> true
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e)       -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
-      SVar(_, _, e, _, _) -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
-      SExprStmt(e)        -> pcs_last_use_consuming(nm, ll, lc, e, cmap)
-      # The condition always evaluates — same reasoning as SExprStmt. The
-      # message runs only on the failing (aborting) path: a last use there
-      # never transfers on the success path, so it must not move.
-      SAssert(c, opt_m)   -> pcs_last_use_consuming(nm, ll, lc, c, cmap) and
-                              (match opt_m { None -> true Some(m) -> not pcs_pos_in_expr(ll, lc, m) })
-      SIndexAssign(b, i, v, _, _) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and
-                                      pcs_last_use_consuming(nm, ll, lc, i, cmap) and
-                                      pcs_last_use_consuming(nm, ll, lc, v, cmap)
-      SAssign(b, v, _, _) -> pcs_last_use_consuming(nm, ll, lc, b, cmap) and
-                              pcs_last_use_consuming(nm, ll, lc, v, cmap)
-      SUse(_, _, _)       -> true
-    }
-    here and pcs_lu_consuming_stmts(nm, ll, lc, rest, cmap)
-  }
-}
-
-fn pcs_lu_consuming_fields(nm: String, ll: Int, lc: Int, fis: [FieldInit], cmap: [ConsumeEntry]) : Bool = match fis {
-  []           -> true
-  [FI(_, e), ...rest] -> pcs_last_use_consuming(nm, ll, lc, e, cmap) and pcs_lu_consuming_fields(nm, ll, lc, rest, cmap)
-}
-
-fn pcs_lu_consuming_elems(nm: String, ll: Int, lc: Int, els: [ListElem], cmap: [ConsumeEntry]) : Bool = match els {
-  []           -> true
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_last_use_consuming(nm, ll, lc, inner, cmap) and pcs_lu_consuming_elems(nm, ll, lc, rest, cmap)
   }
 }
 
@@ -3823,74 +3687,14 @@ fn pcs_collect_arm_skip_kind(self_name: String, tl: Bool, k: ExprKind, bmap: [Bo
       pcs_list_union(pcs_collect_arm_skip_binders(self_name, false, s, bmap, cmap, borrowed),
                      pcs_collect_arm_skip_arms(self_name, tl, arms, bmap, cmap, borrowed))
     }
-  ECall(f, xs) ->
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, f, bmap, cmap, borrowed),
-                   pcs_collect_arm_skip_seq(self_name, tl, xs, bmap, cmap, borrowed))
-  EIf(c, t, opt_e) ->
+  _ -> pcs_collect_arm_skip_ps(self_name, tl, xp_positions_kind(k), bmap, cmap, borrowed)
+}
+
+fn pcs_collect_arm_skip_ps(self_name: String, tl: Bool, ps: [XPos], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match ps {
+  []                  -> []
+  [XP(_, c), ...rest] ->
     pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap, borrowed),
-      pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, t, bmap, cmap, borrowed),
-                     match opt_e { None -> [] Some(e2) -> pcs_collect_arm_skip_binders(self_name, tl, e2, bmap, cmap, borrowed) }))
-  EBlock(stmts, tail) ->
-    pcs_list_union(pcs_collect_arm_skip_stmts(self_name, tl, stmts, bmap, cmap, borrowed),
-                   match tail { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed) })
-  EBinop(_, a, b)    -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  EUnop(_, x)        -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap, borrowed)
-  EField(x, _)       -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap, borrowed)
-  EIndex(a, b)       -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  ELambda(_, body)   -> pcs_collect_arm_skip_binders(self_name, tl, body, bmap, cmap, borrowed)
-  ERecordLit(_, fis) -> pcs_collect_arm_skip_field_inits(self_name, tl, fis, bmap, cmap, borrowed)
-  EList(els)         -> pcs_collect_arm_skip_list_elems(self_name, tl, els, bmap, cmap, borrowed)
-  ERange(a, b, opt)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed),
-                          pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed),
-                            match opt { None -> [] Some(e) -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed) }))
-  EPipe(a, b)        -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  EMapPipe(a, b)     -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  EFlatMapPipe(a, b) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  EFilterPipe(a, b)  -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed), pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed))
-  EBang(x)           -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap, borrowed)
-  ELitUnit(x, _)     -> pcs_collect_arm_skip_binders(self_name, tl, x, bmap, cmap, borrowed)
-  _ -> []
-}
-
-fn pcs_collect_arm_skip_seq(self_name: String, tl: Bool, es: [Expr], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match es {
-  []           -> []
-  [h, ...rest] -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, h, bmap, cmap, borrowed),
-                                 pcs_collect_arm_skip_seq(self_name, tl, rest, bmap, cmap, borrowed))
-}
-
-fn pcs_collect_arm_skip_stmts(self_name: String, tl: Bool, stmts: [Stmt], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match stmts {
-  []           -> []
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e)               -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed)
-      SVar(_, _, e, _, _)         -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed)
-      SExprStmt(e)                -> pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed)
-      SAssert(e, opt_m)           -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed),
-                                       match opt_m { None -> [] Some(m) -> pcs_collect_arm_skip_binders(self_name, tl, m, bmap, cmap, borrowed) })
-      SIndexAssign(a, b, c, _, _) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, a, bmap, cmap, borrowed),
-                                       pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, b, bmap, cmap, borrowed),
-                                                      pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap, borrowed)))
-      _                           -> []
-    }
-    pcs_list_union(here, pcs_collect_arm_skip_stmts(self_name, tl, rest, bmap, cmap, borrowed))
-  }
-}
-
-fn pcs_collect_arm_skip_field_inits(self_name: String, tl: Bool, fis: [FieldInit], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match fis {
-  []           -> []
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, e, bmap, cmap, borrowed),
-                               pcs_collect_arm_skip_field_inits(self_name, tl, rest, bmap, cmap, borrowed))
-  }
-}
-
-fn pcs_collect_arm_skip_list_elems(self_name: String, tl: Bool, els: [ListElem], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match els {
-  []           -> []
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, inner, bmap, cmap, borrowed),
-                   pcs_collect_arm_skip_list_elems(self_name, tl, rest, bmap, cmap, borrowed))
-  }
+                   pcs_collect_arm_skip_ps(self_name, tl, rest, bmap, cmap, borrowed))
 }
 
 fn pcs_collect_arm_skip_arms(self_name: String, tl: Bool, arms: [Arm], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match arms {
