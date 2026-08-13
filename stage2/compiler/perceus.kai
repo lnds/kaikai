@@ -1748,31 +1748,21 @@ fn pcs_inspected_kind(nm: String, k: ExprKind) : Bool = match k {
     scr_inspect and pcs_inspected_arms(nm, arms)
   }
   EVar(uname)         -> uname != nm   # a bare read NOT as scrutinee = owned use
-  ECall(f, xs)        -> pcs_inspected(nm, f) and pcs_inspected_list(nm, xs)
-  EIntrinsic(_, xs)   -> pcs_inspected_list(nm, xs)
-  ESurface(sf)   -> pcs_inspected_list(nm, surface_children(sf))
   EField(x, _)        -> pcs_name_absent(nm, x)   # field read of nm = owned
   EIndex(a, b)        -> pcs_name_absent(nm, a) and pcs_name_only_inspected(nm, b)
-  EBinop(_, a, b)     -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
-  EUnop(_, x)         -> pcs_name_only_inspected(nm, x)
-  EIf(c, t, oe)       -> pcs_name_only_inspected(nm, c) and
-                          pcs_name_only_inspected(nm, t) and
-                          pcs_inspected_opt(nm, oe)
+  # Blocks scan only SLet / SExprStmt statements; the remaining
+  # statement forms are ignored by this analysis.
   EBlock(stmts, tail) -> pcs_inspected_block(nm, stmts, tail)
   ELambda(_, b)       -> pcs_name_absent(nm, b)   # capture = owned
-  ERecordLit(_, fis)  -> pcs_inspected_fields(nm, fis)
-  EList(els)          -> pcs_inspected_elems(nm, els)
-  ERange(a, b, oe)    -> pcs_name_only_inspected(nm, a) and
-                          pcs_name_only_inspected(nm, b) and pcs_inspected_opt(nm, oe)
-  EPipe(a, b)         -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
-  EMapPipe(a, b)      -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
-  EFlatMapPipe(a, b)  -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
-  EFilterPipe(a, b)   -> pcs_name_only_inspected(nm, a) and pcs_name_only_inspected(nm, b)
-  EBang(x)            -> pcs_name_only_inspected(nm, x)
-  ELitUnit(x, _)      -> pcs_name_only_inspected(nm, x)
+  EList(els)          -> pcs_inspected_elems(nm, els)   # spread tail owns
   EStr(_, _)          -> false   # interpolation reads are owned (conservative)
   EHandle(_, _, _, _, _, _, _) -> false   # conservative: handlers are owned
-  _                   -> true    # leaves never reference nm
+  _ -> pcs_inspected_ps(nm, xp_positions_kind(k))
+}
+
+fn pcs_inspected_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> true
+  [XP(_, c), ...rest] -> pcs_name_only_inspected(nm, c) and pcs_inspected_ps(nm, rest)
 }
 
 # An arm escapes nothing iff none of its pattern's binders are read in
@@ -1806,13 +1796,6 @@ fn pcs_no_binder_used(binders: [String], e: Expr) : Bool = match binders {
 # pcs_max_paths_in_expr, which counts reads of `nm` purely.
 fn pcs_name_absent(nm: String, e: Expr) : Bool =
   pcs_max_paths_in_expr(nm, e) == 0
-
-fn pcs_inspected(nm: String, e: Expr) : Bool = pcs_name_only_inspected(nm, e)
-
-fn pcs_inspected_list(nm: String, es: [Expr]) : Bool = match es {
-  []           -> true
-  [e, ...rest] -> if pcs_name_only_inspected(nm, e) { pcs_inspected_list(nm, rest) } else { false }
-}
 
 fn pcs_inspected_opt(nm: String, oe: Option[Expr]) : Bool = match oe {
   None    -> true
@@ -1849,13 +1832,6 @@ fn pcs_name_absent_stmt(nm: String, s: Stmt) : Bool = match s {
   SLet(_, _, rhs) -> pcs_name_absent(nm, rhs)
   SExprStmt(e)    -> pcs_name_absent(nm, e)
   _               -> true
-}
-
-fn pcs_inspected_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
-  []           -> true
-  [f, ...rest] -> match f {
-    FI(_, v) -> if pcs_name_only_inspected(nm, v) { pcs_inspected_fields(nm, rest) } else { false }
-  }
 }
 
 fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
@@ -3271,53 +3247,23 @@ fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: [BorrowEntry]) : Int = ma
     let positions = pcs_borrow_lookup(bmap, key)
     pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
   }
-  EIntrinsic(_, xs)   -> pcs_max_paths_b_seq(nm, xs, bmap)
-  ESurface(sf)   -> pcs_max_paths_b_seq(nm, surface_children(sf), bmap)
-  EField(x, _)        -> pcs_max_paths_b_expr(nm, x, bmap)
-  EIndex(a, b)        -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EBinop(_, a, b)     -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EUnop(_, x)         -> pcs_max_paths_b_expr(nm, x, bmap)
+  # Branch positions are alternatives of each other — the count takes
+  # the MAX across them — which the flat position list cannot express;
+  # both keep explicit arms.
   EIf(c, t, opt_e)    -> pcs_max_paths_b_expr(nm, c, bmap) +
                           pcs_max_paths_b_alt2(nm, t, opt_e, bmap)
   EMatch(s, arms)     -> pcs_max_paths_b_expr(nm, s, bmap) +
                           pcs_max_paths_b_arms(nm, arms, 0, bmap)
-  ELambda(_, _)       -> 0
-  ERecordLit(_, fis)  -> pcs_max_paths_b_field_inits(nm, fis, bmap)
-  EList(els)          -> pcs_max_paths_b_list_elems(nm, els, bmap)
-  ERange(a, b, opt)   -> pcs_max_paths_b_expr(nm, a, bmap) +
-                          pcs_max_paths_b_expr(nm, b, bmap) +
-                          pcs_max_paths_b_opt(nm, opt, bmap)
-  EBlock(stmts, tail) -> pcs_max_paths_b_block(nm, stmts, tail, bmap)
-  EPipe(a, b)         -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EMapPipe(a, b)      -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EFlatMapPipe(a, b)  -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EFilterPipe(a, b)   -> pcs_max_paths_b_expr(nm, a, bmap) + pcs_max_paths_b_expr(nm, b, bmap)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-    let bp = pcs_max_paths_b_expr(nm, body, bmap)
-    let ip = pcs_max_paths_b_opt(nm, init_opt, bmap)
-    let cp = pcs_max_paths_b_clauses(nm, clauses, bmap)
-    let rp = pcs_max_paths_b_ret_opt(nm, ret_opt, bmap)
-    bp + ip + cp + rp
-  }
-  EBang(inner)        -> pcs_max_paths_b_expr(nm, inner, bmap)
-  ELitUnit(inner, _)  -> pcs_max_paths_b_expr(nm, inner, bmap)
-  # Forms that can hold no name read. No `_` arm — a new ExprKind
-  # variant must be classified here before it compiles.
-  EInt(_, _)          -> 0
-  EReal(_, _)         -> 0
-  EFixed(_, _)        -> 0
-  EIntLit(_)          -> 0
-  EDecimalLit(_)      -> 0
-  EBool(_)            -> 0
-  EChar(_)            -> 0
-  EUnit               -> 0
-  EUnder              -> 0
-  EPlaceholder        -> 0
-  EHole(_)            -> 0
-  ETodo(_)            -> 0
-  EExternBody(_)      -> 0
-  EVariantsOf(_, _)   -> 0
-  EModCall(_, _)      -> 0
+  # Everything else sums its inline positions; a lambda body contributes
+  # 0 (closure captures are RC'd separately).
+  _ -> pcs_max_paths_b_ps(nm, xp_positions_kind(k), bmap)
+}
+
+fn pcs_max_paths_b_ps(nm: String, ps: [XPos], bmap: [BorrowEntry]) : Int = match ps {
+  []                  -> 0
+  [XP(r, c), ...rest] ->
+    (match r { XLam -> 0 _ -> pcs_max_paths_b_expr(nm, c, bmap) }) +
+    pcs_max_paths_b_ps(nm, rest, bmap)
 }
 
 # Identifier tokens equal to `nm` inside the `#{...}` parts of a string
@@ -3371,11 +3317,6 @@ fn pcs_max_paths_b_args(nm: String, es: [Expr], positions: [Int], i: Int, bmap: 
   }
 }
 
-fn pcs_max_paths_b_seq(nm: String, es: [Expr], bmap: [BorrowEntry]) : Int = match es {
-  []           -> 0
-  [h, ...rest] -> pcs_max_paths_b_expr(nm, h, bmap) + pcs_max_paths_b_seq(nm, rest, bmap)
-}
-
 fn pcs_max_paths_b_alt2(nm: String, t: Expr, opt_e: Option[Expr], bmap: [BorrowEntry]) : Int = {
   let tp = pcs_max_paths_b_expr(nm, t, bmap)
   let ep = match opt_e { None -> 0 Some(e) -> pcs_max_paths_b_expr(nm, e, bmap) }
@@ -3393,61 +3334,6 @@ fn pcs_max_paths_b_arms(nm: String, arms: [Arm], best: Int, bmap: [BorrowEntry])
       pcs_max_paths_b_arms(nm, rest, nb, bmap)
     }
   }
-}
-
-fn pcs_max_paths_b_field_inits(nm: String, fis: [FieldInit], bmap: [BorrowEntry]) : Int = match fis {
-  []           -> 0
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_max_paths_b_expr(nm, e, bmap) + pcs_max_paths_b_field_inits(nm, rest, bmap)
-  }
-}
-
-fn pcs_max_paths_b_list_elems(nm: String, els: [ListElem], bmap: [BorrowEntry]) : Int = match els {
-  []           -> 0
-  [h, ...rest] -> {
-    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
-    pcs_max_paths_b_expr(nm, inner, bmap) + pcs_max_paths_b_list_elems(nm, rest, bmap)
-  }
-}
-
-fn pcs_max_paths_b_opt(nm: String, opt: Option[Expr], bmap: [BorrowEntry]) : Int = match opt {
-  None    -> 0
-  Some(e) -> pcs_max_paths_b_expr(nm, e, bmap)
-}
-
-fn pcs_max_paths_b_block(nm: String, stmts: [Stmt], tail: Option[Expr], bmap: [BorrowEntry]) : Int =
-  pcs_max_paths_b_stmts(nm, stmts, bmap) + pcs_max_paths_b_opt(nm, tail, bmap)
-
-fn pcs_max_paths_b_stmts(nm: String, stmts: [Stmt], bmap: [BorrowEntry]) : Int = match stmts {
-  []           -> 0
-  [h, ...rest] -> pcs_max_paths_b_stmt(nm, h, bmap) + pcs_max_paths_b_stmts(nm, rest, bmap)
-}
-
-fn pcs_max_paths_b_stmt(nm: String, s: Stmt, bmap: [BorrowEntry]) : Int = match s {
-  SLet(_, _, e)                  -> pcs_max_paths_b_expr(nm, e, bmap)
-  SVar(_, _, e, _, _)            -> pcs_max_paths_b_expr(nm, e, bmap)
-  SAssert(e, opt_m)              -> pcs_max_paths_b_expr(nm, e, bmap) +
-                                     pcs_max_paths_b_opt(nm, opt_m, bmap)
-  SExprStmt(e)                   -> pcs_max_paths_b_expr(nm, e, bmap)
-  SIndexAssign(a, b, c, _, _)    -> pcs_max_paths_b_expr(nm, a, bmap) +
-                                     pcs_max_paths_b_expr(nm, b, bmap) +
-                                     pcs_max_paths_b_expr(nm, c, bmap)
-  SAssign(a, c, _, _)            -> pcs_max_paths_b_expr(nm, a, bmap) +
-                                     pcs_max_paths_b_expr(nm, c, bmap)
-  SUse(_, _, _)                  -> 0
-}
-
-fn pcs_max_paths_b_clauses(nm: String, cs: [HClause], bmap: [BorrowEntry]) : Int = match cs {
-  []           -> 0
-  [h, ...rest] -> match h {
-    HC(_, _, body, _, _) ->
-      pcs_max_paths_b_expr(nm, body, bmap) + pcs_max_paths_b_clauses(nm, rest, bmap)
-  }
-}
-
-fn pcs_max_paths_b_ret_opt(nm: String, opt: Option[HReturn], bmap: [BorrowEntry]) : Int = match opt {
-  None    -> 0
-  Some(hr) -> match hr { HR(_, body, _, _) -> pcs_max_paths_b_expr(nm, body, bmap) }
 }
 
 # Compute the branch-aware skip-set for a fn body: every top-level
@@ -4246,12 +4132,6 @@ fn pcs_consumers_linear_kind(nm: String, k: ExprKind) : Bool = match k {
     }
     a_ok and pcs_all_consumers_linear(nm, b)
   }
-  EBinop(_, a, b)     -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b)
-  EUnop(_, x)         -> pcs_all_consumers_linear(nm, x)
-  EIf(c, t, opt_e)    -> pcs_all_consumers_linear(nm, c) and
-                          pcs_all_consumers_linear(nm, t) and
-                          pcs_consumers_linear_opt(nm, opt_e)
   EMatch(s, arms)     -> {
     # The scrutinee is consumed by `match` (kai_decref at end of
     # the match block). A bare EVar(nm) as scrutinee is therefore
@@ -4263,30 +4143,17 @@ fn pcs_consumers_linear_kind(nm: String, k: ExprKind) : Bool = match k {
     }
     s_ok and pcs_consumers_linear_arms(nm, arms)
   }
-  ELambda(_, _)       -> true    # closure capture is handled separately
-  ERecordLit(_, fis)  -> pcs_consumers_linear_fields(nm, fis)
-  EList(els)          -> pcs_consumers_linear_elems(nm, els)
-  ERange(a, b, opt)   -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b) and
-                          pcs_consumers_linear_opt(nm, opt)
-  EBlock(stmts, tail) -> pcs_consumers_linear_block(nm, stmts, tail)
-  EPipe(a, b)         -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b)
-  EMapPipe(a, b)      -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b)
-  EFlatMapPipe(a, b)  -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b)
-  EFilterPipe(a, b)   -> pcs_all_consumers_linear(nm, a) and
-                          pcs_all_consumers_linear(nm, b)
-  EHandle(body, _, _, init_opt, _, _, _) ->
-    pcs_all_consumers_linear(nm, body) and
-    pcs_consumers_linear_opt(nm, init_opt)
-  EBang(inner)        -> pcs_all_consumers_linear(nm, inner)
-  ELitUnit(inner, _)  -> pcs_all_consumers_linear(nm, inner)
-  EModCall(_, _)      -> true    # mod calls go through user fns
-                                  # post-resolve; treated as linear
-  _                   -> true    # leaves (EInt, EBool, ELambda, ...)
-                                  # don't reference nm
+  EList(els)          -> pcs_consumers_linear_elems(nm, els)   # spread tail increfs
+  # Everything else checks its inline positions; deferred bodies
+  # (lambda closures, handler clauses) are handled separately.
+  _ -> pcs_consumers_linear_ps(nm, xp_positions_kind(k))
+}
+
+fn pcs_consumers_linear_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> true
+  [XP(r, c), ...rest] ->
+    (not xrole_inline(r) or pcs_all_consumers_linear(nm, c)) and
+    pcs_consumers_linear_ps(nm, rest)
 }
 
 # Check whether a call expression `f(xs...)` with `nm` possibly
@@ -4397,11 +4264,6 @@ fn pcs_is_runtime_primitive(nm: String) : Bool = {
   nm == "__perceus_reuse_variant"
 }
 
-fn pcs_consumers_linear_opt(nm: String, opt: Option[Expr]) : Bool = match opt {
-  None    -> true
-  Some(e) -> pcs_all_consumers_linear(nm, e)
-}
-
 fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
@@ -4413,16 +4275,6 @@ fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
       gp and pcs_all_consumers_linear(nm, body) and
       pcs_consumers_linear_arms(nm, rest)
     }
-  }
-}
-
-fn pcs_consumers_linear_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
-  []           -> true
-  [h, ...rest] -> match h {
-    # Record field init: the field consumes the value (record owns slot).
-    # So a bare `EVar(nm)` as the field value IS linear.
-    FI(_, e) -> pcs_all_consumers_linear(nm, e) and
-                pcs_consumers_linear_fields(nm, rest)
   }
 }
 
@@ -4443,30 +4295,6 @@ fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
     }
     h_ok and pcs_consumers_linear_elems(nm, rest)
   }
-}
-
-fn pcs_consumers_linear_block(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool = {
-  pcs_consumers_linear_stmts(nm, stmts) and pcs_consumers_linear_opt(nm, tail)
-}
-
-fn pcs_consumers_linear_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
-  []           -> true
-  [h, ...rest] -> pcs_consumers_linear_stmt(nm, h) and
-                   pcs_consumers_linear_stmts(nm, rest)
-}
-
-fn pcs_consumers_linear_stmt(nm: String, s: Stmt) : Bool = match s {
-  SLet(_, _, e)                  -> pcs_all_consumers_linear(nm, e)
-  SVar(_, _, e, _, _)            -> pcs_all_consumers_linear(nm, e)
-  SAssert(e, opt_m)              -> pcs_all_consumers_linear(nm, e) and
-                                     pcs_consumers_linear_opt(nm, opt_m)
-  SExprStmt(e)                   -> pcs_all_consumers_linear(nm, e)
-  SIndexAssign(a, b, c, _, _)    -> pcs_all_consumers_linear(nm, a) and
-                                     pcs_all_consumers_linear(nm, b) and
-                                     pcs_all_consumers_linear(nm, c)
-  SAssign(a, c, _, _)            -> pcs_all_consumers_linear(nm, a) and
-                                     pcs_all_consumers_linear(nm, c)
-  SUse(_, _, _)                  -> true
 }
 
 # Returns `true` if every execution path through `body` consumes
