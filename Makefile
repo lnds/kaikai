@@ -1017,6 +1017,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1784 fixtures pass under ASAN+UBSan (diagonal kept child + wildcard donor slot on recognised variant rebuilds)"
 	@$(MAKE) -C stage2 test-perceus-1786-record-rebuild-asan
 	@echo "tier1-asan OK — issue #1786/#1787 fixtures pass under ASAN+UBSan (record same-field kept mask, sentinel dup unwrap, nested-flat fresh path)"
+	@$(MAKE) -C stage2 test-perceus-1791-arm-use-scope-asan
+	@echo "tier1-asan OK — issue #1791 fixture passes under ASAN+UBSan (per-arm use scope for colliding pattern binders, no over-release)"
 	@$(MAKE) -C stage2 test-perceus-1302-tcrec-goto-drops-asan
 	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
 	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
