@@ -171,7 +171,7 @@ Stage 0 PRELUDE builtins (`string_concat`, `string_length`,
 `string_slice`, `string_split`, `string_contains`, `list_length`,
 `list_reverse`, `char_at`, `char_to_int`, `int_to_char`, …) are
 *below* the user-facing language and were never part of the m14
-migration; see `docs/m14-bootstrap-audit.md` Risk 5.
+migration.
 
 ## Bootstrap layering
 
@@ -674,11 +674,9 @@ Once this doc is reviewed and pinned:
    `char.is_digit`, …) **landed under m14** (#203, closed
    2026-05-04) across six PRs. See the *Migration status*
    table above for the per-module summary, and
-   `docs/m14-bootstrap-audit.md` for the audit that reframed
-   the milestone away from a bootstrap-split into a direct
-   single-tree migration. See `docs/stage2-design.md` §m6 for
-   the m6.1/m6.2 split and `docs/m6.2-design.md` for the
-   qualified-call design.
+   the audit that reframed the milestone away from a
+   bootstrap-split into a direct single-tree migration. See
+   `docs/stage2-design.md` §m6 for the qualified-call design.
 3. Land one stage-2 module end-to-end (candidate: `time`) as the
    template for the rest. Drives whatever compiler plumbing the
    effect requires and validates the `Clock` handler contract before
