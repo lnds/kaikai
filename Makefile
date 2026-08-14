@@ -1023,6 +1023,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
 	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
 	@echo "tier1-asan OK — issue #1635 fixture passes under ASAN+UBSan (goto move-set name collision, no stale-cell read)"
+	@$(MAKE) -C stage2 test-perceus-1801-capability-param-asan
+	@echo "tier1-asan OK — issue #1801 fixtures pass under ASAN+UBSan (capability params carry no RC traffic, evidence node never dropped)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,

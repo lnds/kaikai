@@ -335,7 +335,8 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   # the whole pass: rebuilding them per decl is quadratic in the fn count.
   let fn_names = pcs_efn_names(fns)
   let prim_bmap = pcs_prim_only_bmap(bmap)
-  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, fn_names, prim_bmap))
+  let cap_tys = pcs_cap_type_names(decls)
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, fn_names, prim_bmap, cap_tys))
 }
 
 # `extern "C" fn` names whose return type is an opaque handle.
@@ -421,6 +422,44 @@ fn pcs_user_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
   [d, ...rest] -> match d {
     DFn(_, name, _, _, _, _, _, _, _, _) -> pcs_user_fn_names(rest, [name, ...acc])
     _                                    -> pcs_user_fn_names(rest, acc)
+  }
+}
+
+# Effect names usable as capability-parameter types. A parameter declared
+# with one of these carries evidence — a pointer into the handler's frame
+# with NO refcount header — so it must never enter the Perceus scope: any
+# dup/drop derived for it corrupts the caller's stack. A name also declared
+# as a type is excluded: there the annotation resolves to the value type,
+# which is ordinary RC'd data.
+fn pcs_cap_type_names(decls: [Decl]) : [String] =
+  pcs_strs_minus(pcs_effect_decl_names(decls, []), pcs_type_decl_names(decls, []))
+
+fn pcs_effect_decl_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DEffect(_, name, _, _, _, _, _, _) -> pcs_effect_decl_names(rest, [name, ...acc])
+    _                                  -> pcs_effect_decl_names(rest, acc)
+  }
+}
+
+fn pcs_type_decl_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DType(_, name, _, _, _, _, _, _) -> pcs_type_decl_names(rest, [name, ...acc])
+    _                                -> pcs_type_decl_names(rest, acc)
+  }
+}
+
+fn pcs_cap_param_names(params: [Param], cap_tys: [String]) : [String] = match params {
+  []           -> []
+  [p, ...rest] -> match p.ptype {
+    Some(t) -> match t.tkind {
+      TyName(n, _) ->
+        if list_has(cap_tys, n) { [p.pname, ...pcs_cap_param_names(rest, cap_tys)] }
+        else { pcs_cap_param_names(rest, cap_tys) }
+      _ -> pcs_cap_param_names(rest, cap_tys)
+    }
+    None -> pcs_cap_param_names(rest, cap_tys)
   }
 }
 
@@ -594,7 +633,7 @@ fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
 
 # Back-compat: tests call the 2-arg form with no borrow map.
 fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console =
-  perceus_decl_b(d, fns, [], [], [], pcs_efn_names(fns), [])
+  perceus_decl_b(d, fns, [], [], [], pcs_efn_names(fns), [], [])
 
 # A match scrutinee is borrowed when it is the bare read of a borrowed
 # param (`match p { ... }`, `p` in `borrowed`) or already wrapped in
@@ -1710,7 +1749,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
 }
 
 fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry], opaque_ret_fns: [String],
-                  fn_names: [String], prim_bmap: [BorrowEntry]) : Decl / Console {
+                  fn_names: [String], prim_bmap: [BorrowEntry], cap_tys: [String]) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -1777,8 +1816,12 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry]
         # leaked). The RAW params carry no rc and must NOT be dup'd/dropped
         # (#709 corruption), so they join the skip-set and are excluded
         # from the unused-param drops below — exactly like a borrowed param.
-        let raw_pnames = prc_raw_param_names(fns, name, mo, params)
-        let pnames = map(params, (p) => p.pname)
+        # Capability params carry evidence, not RC'd data: out of the scope
+        # (no use is a dup/move candidate) AND into the raw set (no unused-
+        # param drop) — the same no-rc treatment as an unboxed scalar.
+        let cap_pnames = pcs_cap_param_names(params, cap_tys)
+        let raw_pnames = pcs_list_union(prc_raw_param_names(fns, name, mo, params), cap_pnames)
+        let pnames = pcs_strs_minus(map(params, (p) => p.pname), cap_pnames)
         let uses = pcs_collect_uses_expr(body, pnames, false, [])
         # Borrow inference (Koka). A borrowed param is inspect-only:
         # the body reads it WITHOUT dup (so it must be in the skip-set,
