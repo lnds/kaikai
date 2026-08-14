@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.112.1 (2026-08-14)
+
+### Fixed
+
+- **perceus**: scope the use table per arm for colliding pattern binders (#1796)
+- **emit**: declare the raw binder alias in if-chain match arms (#1795)
+- **perceus**: pay kept-child claims on record rebuilds and unpaid dup refs on reuse sentinels (#1793)
+- **perceus**: pay diagonally-kept children and wildcard donor slots on recognised variant rebuilds (#1788)
+- **runtime**: stop pinning data-derived strings in the intern table (#1790)
+- **perceus**: pay a let binder's short-circuited single read (#1785) (#1789)
+- **perceus**: pay short-circuited single reads and elide zero-use binders (#1782)
+- **perceus**: drive consume walkers from the position table (#1779)
+- **perceus**: pay arm-binder birth refs on goto-tail leaves and failing guards (#1776)
+- **emit**: strip the borrow wrap on raw match scrutinees (#1773)
+
+### Changed
+
+- **perceus**: migrate the consume-slot gates and arm-skip collector to the position table (#1799)
+- **perceus**: migrate the pure counters and linearity gates to the position table (#1798)
+- **perceus**: route the use collector and nonrec-tail gate through the position table (#1797)
+
 ## v0.112.0 (2026-08-11)
 
 ### Added
