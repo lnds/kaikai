@@ -351,8 +351,7 @@ in.
      with the legacy unqualified form. Fixtures live under
      `examples/modules-qualified/{basic, alias, selective,
      local_shadow, two_modules, record_projection}/`.
-     Full design + decisions in `docs/m6.2-design.md`. v2
-     (universal prefixed minting `kai_<module>__<name>` and
+     v2 (universal prefixed minting `kai_<module>__<name>` and
      diagnostic for two-modules-export-same-name) is a follow-up
      lane.
 7. **m7 — Effects + handlers** (split in two sub-milestones —
