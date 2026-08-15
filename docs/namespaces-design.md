@@ -546,13 +546,61 @@ forms are migrated. Homing must be complete before any tag is assigned.
    different homes — the exact collision case degrades to the ambiguous
    one. That fallback must be removed in this step, not left to survive
    the refactor.
-6. Module identity from path, and the removal of the last-loaded-alias
-   mapping described in §6. Scheduled explicitly: step 1 adds the slot
-   but leaves this resolution untouched.
-7. The unified resolver: opened names, ambiguity as a use-site error.
-8. Qualified surface for the classes that lack it, with `kai info`
-   updated in the same change — the qualified forms are surface, and
-   `kai info` is authoritative for surface in this repo.
+6. Impls and protocol dispatchers. The impl table keys on the
+   protocol's home but on the target type's bare name, so two modules
+   each declaring their own same-named type and implementing the same
+   protocol for it collide — reported as a spurious "duplicate impl".
+   The dispatcher symbol carries no home at all, so two protocols
+   sharing an operation name mint one dispatcher between them. Both
+   keys gain the type's home, matching the mangled form in §5.
+
+   This reaches users through `#[derive]` rather than through
+   hand-written impls: a package deriving `Eq` for its own `Entry` and
+   another doing the same is a routine composition, and it is the shape
+   this defect has been reported in. The types themselves already scope
+   correctly — only the synthesised impl collides — so the failure looks
+   like a naming problem and gets paid for with a rename.
+7. The remaining bare-keyed tables, which share one shape: a registry
+   built on the spelling alone, first entry winning. None of them
+   diagnoses anything today.
+
+   - **Extern types.** Two `extern "C" type Color` with incompatible C
+     layouts (three bytes against sixteen) both compile; the first wins
+     and any use of the second unpacks with the wrong layout.
+   - **Kind names.** Two `kind Metric` over different theories coexist
+     silently, so a type's unification algebra depends on which module
+     was reached first.
+   - **Habitant introducers.** Two kinds registering the same
+     introducer word are accepted. This is the one class §3 cannot
+     resolve at the use site — an introducer *is* the declaration
+     syntax, so the duplicate must be rejected outright.
+   - **Protocol laws and impl axioms.** `PL(name, thy)` and
+     `AI(pname, head, thy)` drop the module that is bound right there
+     in the pattern, so a law exemption declared in one module silently
+     exempts an unrelated impl in another.
+   - **`#[constructor]`.** Two modules with their own type and their own
+     constructor attribute produce a spurious "already has a
+     `#[constructor]`".
+   - **`use kind`.** Habitants opened per module, keyed globally.
+
+8. Module identity from path, and the removal of the last-loaded-alias
+   mapping described in §6. Two defects belong here rather than to the
+   resolver: an alias that shadows an imported module emits a duplicate
+   C symbol (`redefinition of kaiu_<mod>__<fn>`), and a selective import
+   naming a symbol the module does not export compiles in silence, so a
+   typo in an import list is never reported.
+9. The unified resolver: opened names, ambiguity as a use-site error.
+10. Qualified surface for the classes that lack it, with `kai info`
+    updated in the same change — the qualified forms are surface, and
+    `kai info` is authoritative for surface in this repo. Three
+    positions reject a qualifier today: handler heads (`with m.E`),
+    effect operations (`m.E.op`), and `impl` (`impl m.P for T`).
+
+**Every class in §2 is claimed by a step above.** That correspondence is
+the point: the failure this document exists to correct was an
+enumeration that covered the classes someone had complained about and
+left the rest to wait for their own bug report. A step list ordered by
+observed pain would repeat it.
 
 **Quality bar during migration.** These lanes touch existing monoliths at
 hundreds of sites. The differential bar applies to new files a lane
