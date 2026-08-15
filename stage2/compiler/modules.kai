@@ -54,6 +54,7 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.diag_file
+import compiler.expr_positions
 import compiler.lex
 import compiler.parse
 
@@ -408,7 +409,7 @@ pub fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
     let acc1 = pat_binders_list(subs, acc)
     match opt_rest { Some(n) -> [n, ...acc1] None -> acc1 }
   }
-  PVariant(_, subs)        -> pat_binders_list(subs, acc)
+  PVariant(_, _, subs)     -> pat_binders_list(subs, acc)
   PVariantRecord(_, fs)    -> pat_binders_pfields(fs, acc)
   PRecord(fs)              -> pat_binders_pfields(fs, acc)
   PHole(_)                 -> acc
@@ -784,8 +785,8 @@ fn qualtype_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Conso
 
   PNarrow(name, te) ->
     Pattern { pkind: PNarrow(name, qualtype_te(te, mt, file)), line: pat.line, col: pat.col }
-  PVariant(name, subs) ->
-    Pattern { pkind: PVariant(name, qualtype_pat_list(subs, mt, file)),
+  PVariant(home, name, subs) ->
+    Pattern { pkind: PVariant(home, name, qualtype_pat_list(subs, mt, file)),
                line: pat.line, col: pat.col }
   PVariantRecord(name, fs) ->
     Pattern { pkind: PVariantRecord(name, qualtype_pfields(fs, mt, file)),
@@ -1375,15 +1376,11 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
             # actual export `list_take` when the bare form is not
             # exported. EModCall carries the real name for codegen.
             #
-            # When `fname` starts with an uppercase
-            # letter and the module exports it, treat the qualifier
-            # as a variant-constructor disambiguator. Variant ctors
-            # are auto-declared globally, so `mod.Ctor`
-            # collapses back to a bare `EVar(Ctor)` after the
-            # qualifier validates. The same rewrite applies to
-            # qualified ctor pattern shape parsed below.
+            # A qualified constructor keeps its module: `mod.Ctor`
+            # becomes `EModCall(mod, Ctor)`, never a bare `EVar`, so
+            # the qualifier the user wrote survives to the typer.
             if name_starts_upper(fname) and me_has_export(me, fname) {
-              EVar(fname)
+              EModCall(me_emit_name(mt, me, name), fname)
             } else { match me_lookup_export(me, fname) {
               Some(actual) -> EModCall(me_emit_name(mt, me, name), actual)
               None -> {
@@ -1535,8 +1532,71 @@ fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry], file: String) : Arm / Co
       Some(g) -> Some(rqc_expr(g, inner, mt, file))
       None -> None
     }
-    Arm(pat, guard1, rqc_expr(body, inner, mt, file))
+    Arm(rqc_pat(pat, mt, file), guard1, rqc_expr(body, inner, mt, file))
   }
+}
+
+# A qualified variant pattern is validated like a qualified ctor
+# expression: the module must be imported and must export the ctor.
+# The home slot is rewritten to the module's tagged name so it keys
+# the same way `EModCall` does.
+fn rqc_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + File = match pat.pkind {
+
+  PVariant(home, name, subs) -> {
+    let home1 = match home {
+      Some(q) -> rqc_pat_qualifier(q, name, mt, file, pat.line, pat.col)
+      None -> None
+    }
+    Pattern { pkind: PVariant(home1, name, rqc_pat_list(subs, mt, file)),
+              line: pat.line, col: pat.col }
+  }
+  PVariantRecord(name, fs) ->
+    Pattern { pkind: PVariantRecord(name, rqc_pfields(fs, mt, file)),
+              line: pat.line, col: pat.col }
+  PRecord(fs) ->
+    Pattern { pkind: PRecord(rqc_pfields(fs, mt, file)), line: pat.line, col: pat.col }
+  PList(subs, rest) ->
+    Pattern { pkind: PList(rqc_pat_list(subs, mt, file), rest),
+              line: pat.line, col: pat.col }
+  PAs(name, inner) ->
+    Pattern { pkind: PAs(name, rqc_pat(inner, mt, file)), line: pat.line, col: pat.col }
+  _ -> pat
+}
+
+fn pat_qualifier_ok(q: String, ctor: String, mt: [ModuleEntry]) : Bool = match mt_lookup(mt, q) {
+  Some(me) -> me_has_export(me, ctor)
+  None -> false
+}
+
+fn rqc_pat_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, line: Int, col: Int) : Option[String] / Console + File =
+
+  match mt_lookup(mt, q) {
+    Some(me) ->
+      if me_has_export(me, ctor) {
+        Some(me_emit_name(mt, me, q))
+      } else {
+        let exports = match me { ME(_, exs, _, _) -> exs }
+        let _ = rqc_diag_missing_export(q, ctor, exports, file, line, col)
+        Some(q)
+      }
+    None -> {
+      diag_error(file, line, col, concat_all(["cannot find module `", q, "`"]))
+      diag_help(concat_all(["import `", q, "` before qualifying `", ctor, "` with it"]))
+      Some(q)
+    }
+  }
+
+fn rqc_pat_list(ps: [Pattern], mt: [ModuleEntry], file: String) : [Pattern] / Console + File = match ps {
+
+  [] -> []
+  [p, ...rest] -> [rqc_pat(p, mt, file), ...rqc_pat_list(rest, mt, file)]
+}
+
+fn rqc_pfields(fs: [PField], mt: [ModuleEntry], file: String) : [PField] / Console + File = match fs {
+
+  [] -> []
+  [PField(n, sub, short), ...rest] ->
+    [PField(n, rqc_pat(sub, mt, file), short), ...rqc_pfields(rest, mt, file)]
 }
 
 fn rqc_hclauses(cs: [HClause], locals: [String], mt: [ModuleEntry], file: String) : [HClause] / Console + File =
@@ -1584,7 +1644,7 @@ fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], file: String) : RqcStm
     # only become visible to subsequent stmts.
     let e1 = rqc_expr(e, locals, mt, file)
     let inner = pat_binders(pat, locals)
-    RqcStmtR { s: SLet(pat, ty_opt, e1), bound: inner }
+    RqcStmtR { s: SLet(rqc_pat(pat, mt, file), ty_opt, e1), bound: inner }
   }
   SAssert(e, opt_msg) -> {
     let e1 = rqc_expr(e, locals, mt, file)
@@ -1862,6 +1922,90 @@ pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
     let mt = ms_table(scopes, home, global)
     list_append(qualtype_decls(seg_take(decls, n), mt, df),
                 qualtype_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, df))
+  }
+}
+
+# Only `EMatch` arms and `EBlock` lets carry patterns after lowering;
+# every other position descends through `xp_positions`.
+#[doc("Count qualified variant patterns whose module is not imported or does not export the constructor, so the exit code reflects the diagnostics `rqc_pat` emits.")]
+pub fn pqchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
+  [] -> 0
+  [d, ...rest] -> pqchk_decl(d, mt) + pqchk_decls(rest, mt)
+}
+
+fn pqchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> pqchk_expr(body, mt)
+  DTest(_, body, _, _, _)              -> pqchk_expr(body, mt)
+  DBench(_, body, _, _, _)             -> pqchk_expr(body, mt)
+  DCheck(_, _, body, _, _, _)          -> pqchk_expr(body, mt)
+  DImpl(_, _, _, subs, _, _, _)        -> pqchk_decls(subs, mt)
+  DDerive(_, inner, _, _)              -> pqchk_decl(inner, mt)
+  DUnstable(inner, _, _)               -> pqchk_decl(inner, mt)
+  DProtoLaws(_, inner, _, _, _)        -> pqchk_decl(inner, mt)
+  DImplAxiom(_, inner, _, _, _)        -> pqchk_decl(inner, mt)
+  DConstructor(inner, _, _)            -> pqchk_decl(inner, mt)
+  _ -> 0
+}
+
+fn pqchk_expr(e: Expr, mt: [ModuleEntry]) : Int = {
+  let own = match e.kind {
+    EMatch(_, arms)  -> pqchk_arms(arms, mt)
+    EBlock(stmts, _) -> pqchk_stmts(stmts, mt)
+    _ -> 0
+  }
+  own + pqchk_positions(xp_positions(e), mt)
+}
+
+fn pqchk_positions(ps: [XPos], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [XP(_, e), ...rest] -> pqchk_expr(e, mt) + pqchk_positions(rest, mt)
+}
+
+fn pqchk_arms(arms: [Arm], mt: [ModuleEntry]) : Int = match arms {
+  [] -> 0
+  [Arm(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_arms(rest, mt)
+}
+
+fn pqchk_stmts(stmts: [Stmt], mt: [ModuleEntry]) : Int = match stmts {
+  [] -> 0
+  [SLet(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_stmts(rest, mt)
+  [_, ...rest] -> pqchk_stmts(rest, mt)
+}
+
+fn pqchk_pat(pat: Pattern, mt: [ModuleEntry]) : Int = match pat.pkind {
+  PVariant(home, name, subs) -> {
+    let bad = match home {
+      Some(q) -> if pat_qualifier_ok(q, name, mt) { 0 } else { 1 }
+      None -> 0
+    }
+    bad + pqchk_pats(subs, mt)
+  }
+  PVariantRecord(_, fs) -> pqchk_pfields(fs, mt)
+  PRecord(fs)           -> pqchk_pfields(fs, mt)
+  PList(subs, _)        -> pqchk_pats(subs, mt)
+  PAs(_, inner)         -> pqchk_pat(inner, mt)
+  _ -> 0
+}
+
+fn pqchk_pats(ps: [Pattern], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [p, ...rest] -> pqchk_pat(p, mt) + pqchk_pats(rest, mt)
+}
+
+fn pqchk_pfields(fs: [PField], mt: [ModuleEntry]) : Int = match fs {
+  [] -> 0
+  [PField(_, sub, _), ...rest] -> pqchk_pat(sub, mt) + pqchk_pfields(rest, mt)
+}
+
+#[doc("`pqchk_decls` over an import-segmented stream, each segment against its own module table.")]
+pub fn pqchk_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String) : Int = match segs {
+  [] -> pqchk_decls(decls, ms_table(scopes, "", global))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let mt = ms_table(scopes, home, global)
+    pqchk_decls(seg_take(decls, n), mt) +
+      pqchk_segmented(rest, seg_drop(decls, n), scopes, global, target_mod)
   }
 }
 
