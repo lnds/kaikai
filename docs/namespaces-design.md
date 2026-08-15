@@ -603,11 +603,30 @@ left the rest to wait for their own bug report. A step list ordered by
 observed pain would repeat it.
 
 **Quality bar during migration.** These lanes touch existing monoliths at
-hundreds of sites. The differential bar applies to new files a lane
-authors; a mechanical arity migration through an existing F-grade file
-neither raises nor lowers its obligation, and must not grow it. Lanes
-should not be blocked on scoring a file they are only threading a field
-through.
+hundreds of sites, and threading a field through one does not improve
+it. That is not licence to leave them as found.
+
+Each lane records `make test-km-ledger` before and after, and reports
+the delta in its PR. The baseline when this began: the compiler at
+F (52.5) over 90k lines, with `infer.kai` at F−− (30.5) over 14k,
+`emit_c.kai` at F−− (32.8), `protos.kai` at F−− (39.8), and four
+corrective scope passes alive.
+
+Two obligations follow. A lane must not make its files worse — an arity
+migration that grows a monolith without cause is a regression the ledger
+will show. And where a lane is already rewriting a region of one of
+these files, it is expected to leave that region better: extract the
+helper, split the walker, drop the branch the new keying makes dead.
+Paying down structure while passing through is the only way these files
+improve at all, because nobody schedules a lane whose sole purpose is to
+split `infer.kai`.
+
+The corrective passes are the sharpest measure here. `ta_scope`,
+`unit_scope`, `proto_scope` and `const_scope` exist only because tables
+were keyed on the spelling and had to be filtered afterwards. Keying at
+construction makes each one dead code, so the count going from four to
+zero is the structural result this refactor is for — more than any
+individual grade.
 
 **Cost at compile time.** Comparing a pair instead of a string, in tables
 that are already linear scans, does not change complexity. The compile-time

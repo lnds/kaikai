@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -626,6 +626,12 @@ test-namespace-matrix:
 # `native` measures the other backend.
 test-namespace-matrix-status:
 	@./tests/namespace_matrix_status.sh
+
+# Structural debt: km score on the compiler and on the files the name
+# resolution refactor threads through, plus how many corrective scope
+# passes survive. Run before and after a lane; the PR reports the delta.
+test-km-ledger:
+	@./tests/km_ledger.sh
 
 # bench v1.x (issues #40 + #437) — smoke for `kai bench`. Builds +
 # runs the `examples/stdlib/bench_basic.kai` and
