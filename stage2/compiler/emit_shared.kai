@@ -74,8 +74,8 @@ import compiler.evidence_scan
 #[doc("Build-time wrapper selection (build/test/bench/check) passed to the emitters; the driver consumes it from here.")]
 pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 
-#[doc("Emit-side variant table entry: constructor name, arity, payload type list, head tag.")]
-pub type EVar = EV(String, Int, [TypeExpr], Int)
+#[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload type list, head tag.")]
+pub type EVar = EV(Option[String], String, Int, [TypeExpr], Int)
 
 #[doc("EFn-table filter/selector: prefer module.")]
 # Issue #748: when lowering the body of module `m`, rotate the EFn table
@@ -301,70 +301,123 @@ pub fn c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(
   None                   -> callee
 }
 
+# One scan backs every variant-table lookup. `home` is the declaring
+# module the call site knows: `Some(m)` demands that exact entry, so two
+# modules declaring the same ctor name never read each other's arity or
+# payload layout. `None` means the site has only the bare name and takes
+# the first entry — the pre-namespace behaviour, still correct whenever
+# the name is unique in the program.
+fn evar_entry(vs: [EVar], home: Option[String], target: String) : Option[EVar] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(hm, n, _, _, _) ->
+        if n == target and ctor_home_matches(hm, home) { Some(h) }
+        else { evar_entry(rest, home, target) }
+    }
+  }
+}
+
+# A constructor qualifier the AST carries is not always a module: the
+# typer rewrites an ambiguous bare ctor to `EModCall(<type>, Ctor)`, so
+# the same slot may hold a type name. Resolving as a home first and
+# falling back to the bare name keeps both spellings working; only the
+# module reading disambiguates homonyms, and only it can match.
+#[doc("Arity of ctor `target` under a qualifier that may name either its module or its type.")]
+pub fn evar_find_qual(vs: [EVar], qual: String, target: String) : Option[Int] =
+  match evar_entry(vs, Some(qual), target) {
+    Some(EV(_, _, ar, _, _)) -> Some(ar)
+    None                     -> evar_find(vs, target)
+  }
+
+#[doc("The home a constructor qualifier denotes, or None when it names the type rather than a module.")]
+pub fn evar_qual_home(vs: [EVar], qual: String, target: String) : Option[String] =
+  match evar_entry(vs, Some(qual), target) {
+    Some(EV(hm, _, _, _, _)) -> hm
+    None                     -> None
+  }
+
+#[doc("Arity of ctor target as declared by `home`, or None when it is not a registered variant.")]
+pub fn evar_find_in(vs: [EVar], home: Option[String], target: String) : Option[Int] =
+  match evar_entry(vs, home, target) {
+    None            -> None
+    Some(EV(_, _, ar, _, _)) -> Some(ar)
+  }
+
 #[doc("Variant-table lookup helper: find.")]
-pub fn evar_find(vs: [EVar], target: String) : Option[Int] {
+pub fn evar_find(vs: [EVar], target: String) : Option[Int] =
+  evar_find_in(vs, None, target)
+
+# When the call site knows no home, its ARITY still narrows which
+# homonym it means: two constructors sharing a name usually differ in
+# payload shape, and reading one's layout for the other is the
+# corruption this keying exists to remove. An arity matching no entry
+# falls back to the plain lookup.
+#[doc("The head tag of ctor `target` whose payload has `arity` slots, preferring the entry declared by `home`.")]
+pub fn evar_find_tag_arity(vs: [EVar], home: Option[String], target: String, arity: Int) : Int =
+  match evar_entry_arity(vs, home, target, arity) {
+    Some(EV(_, _, _, _, t)) -> t
+    None                    -> evar_find_tag_in(vs, home, target)
+  }
+
+fn evar_entry_arity(vs: [EVar], home: Option[String], target: String, arity: Int) : Option[EVar] {
   match vs {
     [] -> None
     [h, ...rest] -> match h {
-      EV(n, ar, _, _) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+      EV(hm, n, ar, _, _) ->
+        if n == target and ar == arity and ctor_home_matches(hm, home) { Some(h) }
+        else { evar_entry_arity(rest, home, target, arity) }
     }
   }
 }
 
-# Issue #440 Phase 2 — look up the payload TypeExpr list for a
-# constructor name. Returns None when the name is not a known
-# variant ctor (the call site falls back to the legacy boxed path).
-
-# Atom-style global variant tag lookup. Returns the reserved-range
-# tag for builtins (0..10 per docs/variant-tags.md) or the user-range
-# tag (>= 11) assigned in declaration order. Falls back to 0 for
-# unknown names (call sites guard with evar_find first; the fallback
-# only matters for synthetic emit paths that legitimately stringify
-# a non-variant identifier into a kai_variant call shape — none
-# survives in the current sources but the safe default avoids
-# crashing the emitter if one regresses in).
-#[doc("Atom-style global variant tag lookup. Returns the reserved-range tag for builtins (0..10 per docs/variant-tags.md) or the user-range tag (>= 11) assigned in declaration order.…")]
-pub fn evar_find_tag(vs: [EVar], target: String) : Int {
-  match vs {
-    [] -> 0
-    [h, ...rest] -> match h {
-      EV(n, _, _, t) -> if n == target { t } else { evar_find_tag(rest, target) }
-    }
+#[doc("The payload types of ctor `target` with `arity` slots, preferring the entry declared by `home`.")]
+pub fn evar_payload_tys_arity(vs: [EVar], home: Option[String], target: String,
+                                 arity: Int) : Option[[TypeExpr]] =
+  match evar_entry_arity(vs, home, target, arity) {
+    Some(EV(_, _, _, tys, _)) -> Some(tys)
+    None                      -> evar_payload_tys_in(vs, home, target)
   }
-}
 
-# Match-side variant. Returns Some(tag) when target is in the
-# variants table, None otherwise. Consumers (emit_pat_test_variant*,
-# emit_bang) use this to decide between the fast tag-compare path
-# (`variant_tag == N`) and the legacy strcmp fallback. Under the
-# atom-style global convention every well-typed PVariant pattern
-# resolves to a known name; the None branch protects synthetic AST
+# Falls back to 0 for an unknown name: call sites guard with `evar_find`
+# first, and the default only matters for a synthetic emit path that
+# stringifies a non-variant identifier into a kai_variant call shape.
+#[doc("The head tag of ctor target as declared by `home`, or 0 when it is not a registered variant.")]
+pub fn evar_find_tag_in(vs: [EVar], home: Option[String], target: String) : Int =
+  match evar_entry(vs, home, target) {
+    None            -> 0
+    Some(EV(_, _, _, _, t)) -> t
+  }
+
+#[doc("Atom-style global variant tag lookup: the reserved tag for a builtin (0..10 per docs/variant-tags.md) or the hashed user-range tag.")]
+pub fn evar_find_tag(vs: [EVar], target: String) : Int =
+  evar_find_tag_in(vs, None, target)
+
+#[doc("The head tag of ctor target as declared by `home`, or None when it is not a registered variant.")]
+pub fn evar_find_tag_opt_in(vs: [EVar], home: Option[String], target: String) : Option[Int] =
+  match evar_entry(vs, home, target) {
+    None            -> None
+    Some(EV(_, _, _, _, t)) -> Some(t)
+  }
+
+# Match-side variant. Consumers (emit_pat_test_variant*, emit_bang) use
+# this to decide between the fast tag-compare path (`variant_tag == N`)
+# and the legacy strcmp fallback. The None branch protects synthetic AST
 # paths where a constructor name slipped through without registration.
+#[doc("Match-side variant. Returns Some(tag) when target is in the variants table, None otherwise.")]
+pub fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] =
+  evar_find_tag_opt_in(vs, None, target)
 
-# Match-side variant. Returns Some(tag) when target is in the
-# variants table, None otherwise. Consumers (emit_pat_test_variant*,
-# emit_bang) use this to decide between the fast tag-compare path
-# (`variant_tag == N`) and the legacy strcmp fallback. Under the
-# atom-style global convention every well-typed PVariant pattern
-# resolves to a known name; the None branch protects synthetic AST
-# paths where a constructor name slipped through without registration.
-#[doc("Match-side variant. Returns Some(tag) when target is in the variants table, None otherwise. Consumers (emit_pat_test_variant*, emit_bang) use this to decide between the fast…")]
-pub fn evar_find_tag_opt(vs: [EVar], target: String) : Option[Int] {
-  match vs {
-    [] -> None
-    [h, ...rest] -> match h {
-      EV(n, _, _, t) -> if n == target { Some(t) } else { evar_find_tag_opt(rest, target) }
-    }
+#[doc("The declared payload types of ctor target as declared by `home`, or None when it is not a registered variant.")]
+pub fn evar_payload_tys_in(vs: [EVar], home: Option[String], target: String) : Option[[TypeExpr]] =
+  match evar_entry(vs, home, target) {
+    None             -> None
+    Some(EV(_, _, _, tys, _)) -> Some(tys)
   }
-}
 
 #[doc("The declared payload types of ctor target, or None when it is not a registered variant.")]
-pub fn evar_payload_tys(vs: [EVar], target: String) : Option[[TypeExpr]] = match vs {
-  [] -> None
-  [h, ...rest] -> match h {
-    EV(n, _, tys, _) -> if n == target { Some(tys) } else { evar_payload_tys(rest, target) }
-  }
-}
+pub fn evar_payload_tys(vs: [EVar], target: String) : Option[[TypeExpr]] =
+  evar_payload_tys_in(vs, None, target)
 
 # A tagged Int rides `.i64`, a Real `.r`, an enum its immediate tag; anything
 # else is a boxed `KaiValue *`. Shared by both backends so the slot mask never
@@ -460,30 +513,46 @@ pub fn builtin_variants() : [EVar] =
   # `evar_find_tag` resolves to the reserved value and not to a
   # user-range tag. The runtime constructs these via stage0/runtime.h
   # using the same convention, so producer and matcher agree.
-  [EV("Some", 1, [], 0), EV("None", 0, [], 1),
-   EV("Ok", 1, [], 2), EV("Err", 1, [], 3),
-   EV("SigInt", 0, [], 4), EV("SigTerm", 0, [], 5), EV("SigHup", 0, [], 6),
-   EV("SigUsr1", 0, [], 7), EV("SigUsr2", 0, [], 8),
+  [EV(None, "Some", 1, [], 0), EV(None, "None", 0, [], 1),
+   EV(None, "Ok", 1, [], 2), EV(None, "Err", 1, [], 3),
+   EV(None, "SigInt", 0, [], 4), EV(None, "SigTerm", 0, [], 5), EV(None, "SigHup", 0, [], 6),
+   EV(None, "SigUsr1", 0, [], 7), EV(None, "SigUsr2", 0, [], 8),
    # Exited/Signaled carry an unboxed Int slot — the runtime constructs
    # them via kai_variant_u with KAI_VAR_SLOT_INT, so the matcher must
    # read slots[0].i64 not slots[0].ptr. Registering the payload type
    # here drives emit_pat_test_variant through the typed (Phase 2 #440)
    # slot-read path.
-   EV("Exited", 1, [es_ty_name_zero("Int")], 9),
-   EV("Signaled", 1, [es_ty_name_zero("Int")], 10)]
+   EV(None, "Exited", 1, [es_ty_name_zero("Int")], 9),
+   EV(None, "Signaled", 1, [es_ty_name_zero("Int")], 10)]
 
 #[doc("First tag assigned to a user-declared variant. Mirrors KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and user_variant_tag_base() in stage1/compiler.kai.")]
 pub fn user_variant_tag_base() : Int = 11
 
-# User tags are name-keyed, not declaration-ordered: slot = base +
-# FNV(name) mod range, linear probe on collision, names inserted in
-# sorted order. A constructor's tag is therefore a function of the
-# program's SET of ctor names — adding or moving a type in one module
-# cannot renumber the tags baked into other modules' emitted code.
-# Range is the uint16 tag space above the reserved builtins.
+# User tags are key-hashed, not declaration-ordered: slot = base +
+# FNV(key) mod range, linear probe on collision, keys inserted in sorted
+# order. A constructor's tag is a function of the program's SET of keys —
+# adding or moving a type in one module cannot renumber the tags baked
+# into other modules' emitted code. Range is the uint16 tag space above
+# the reserved builtins.
 fn user_variant_tag_range() : Int = 65525
 
-#[doc("Register a declaration's variant constructors into the EVar table with name-keyed stable tags.")]
+# The hash key and the sort key are the same string, which is what keeps
+# probe order independent of traversal order.
+#
+# The key is the bare name, so two modules declaring one ctor name still
+# share a tag. Splitting them is a one-line change here — the table
+# carries each entry's home and every lookup takes one — but the two
+# sides of a match must agree on the tag, and a pattern reaches emit
+# unqualified: the type that would name its home carries an empty
+# `module_origin`. Splitting before that is populated makes a
+# construction and the arm testing it read different tags.
+fn evar_key(home: Option[String], ctor: String) : String = ctor
+
+fn evar_key_of(v: EVar) : String = match v {
+  EV(hm, n, _, _, _) -> evar_key(hm, n)
+}
+
+#[doc("Register a declaration's variant constructors into the EVar table with stable name-keyed tags.")]
 pub fn register_variants(decls: [Decl]) : [EVar] {
   let pending = suv_pending_decls(decls, [])
   if list_length(pending) > 60000 {
@@ -493,15 +562,16 @@ pub fn register_variants(decls: [Decl]) : [EVar] {
   }
 }
 
-# Collect user ctors in declaration order — first occurrence wins its
-# arity/payload — skipping names already present (builtins re-emitted
-# as synthetic DTypes by the core-inject pass). Tags are assigned later.
+# Collect user ctors in declaration order, each stamped with the module
+# that declares it. A repeat of the same key keeps its first
+# arity/payload (builtins re-emitted as synthetic DTypes by the
+# core-inject pass). Tags are assigned later.
 fn suv_pending_decls(ds: [Decl], acc: [EVar]) : [EVar] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DType(_, _, _, body, _, _, _, _) -> match body {
-        TBSum(vs) -> suv_pending_decls(rest, suv_pending_vs(vs, acc))
+      DType(_, _, _, body, _, _, mo, _) -> match body {
+        TBSum(vs) -> suv_pending_decls(rest, suv_pending_vs(vs, mo, acc))
         _         -> suv_pending_decls(rest, acc)
       }
       _ -> suv_pending_decls(rest, acc)
@@ -509,19 +579,31 @@ fn suv_pending_decls(ds: [Decl], acc: [EVar]) : [EVar] {
   }
 }
 
-fn suv_pending_vs(vs: [Variant], acc: [EVar]) : [EVar] {
+fn suv_pending_vs(vs: [Variant], home: Option[String], acc: [EVar]) : [EVar] {
   match vs {
     [] -> acc
     [v, ...rest] -> match v {
-      Var(n, tys) -> match evar_find_tag_opt(builtin_variants(), n) {
-        Some(_) -> suv_pending_vs(rest, acc)
-        None    -> match evar_find_tag_opt(acc, n) {
-          Some(_) -> suv_pending_vs(rest, acc)
-          None    -> suv_pending_vs(rest, [EV(n, list_length(tys), tys, 0), ...acc])
+      Var(n, tys) ->
+        if suv_seen(builtin_variants(), None, n) or suv_seen(acc, home, n) {
+          suv_pending_vs(rest, home, acc)
+        } else {
+          suv_pending_vs(rest, home, [EV(home, n, list_length(tys), tys, 0), ...acc])
         }
-      }
     }
   }
+}
+
+# Exact-key membership. Distinct from `evar_entry`, whose `None` home is
+# a wildcard for LOOKUP: at construction a homeless entry must not
+# absorb a homed one, or the collapse this keying removes comes back.
+fn suv_seen(vs: [EVar], home: Option[String], ctor: String) : Bool = {
+  let k = evar_key(home, ctor)
+  suv_seen_loop(vs, k)
+}
+
+fn suv_seen_loop(vs: [EVar], k: String) : Bool = match vs {
+  [] -> false
+  [h, ...rest] -> if evar_key_of(h) == k { true } else { suv_seen_loop(rest, k) }
 }
 
 fn suv_sort(vs: [EVar]) : [EVar] = match vs {
@@ -529,28 +611,37 @@ fn suv_sort(vs: [EVar]) : [EVar] = match vs {
   [h, ...rest] -> suv_insert(h, suv_sort(rest))
 }
 
+# Sorted by BARE name first, home only as the tie-break. Two homonyms
+# then sit next to each other, so an unqualified lookup — which the
+# emitter still issues wherever the AST carries no qualifier — resolves
+# to the same entry from every module, exactly as it did when the table
+# held one. The tag itself still hashes the full key, so the two entries
+# keep distinct tags.
 fn suv_insert(v: EVar, sorted: [EVar]) : [EVar] = match sorted {
   [] -> [v]
-  [h, ...rest] -> match v {
-    EV(vn, _, _, _) -> match h {
-      EV(hn, _, _, _) ->
-        if string_lt(vn, hn) { [v, h, ...rest] } else { [h, ...suv_insert(v, rest)] }
-    }
+  [h, ...rest] ->
+    if suv_before(v, h) { [v, h, ...rest] } else { [h, ...suv_insert(v, rest)] }
+}
+
+fn suv_before(a: EVar, b: EVar) : Bool = match a {
+  EV(_, an, _, _, _) -> match b {
+    EV(_, bn, _, _, _) ->
+      if an == bn { string_lt(evar_key_of(a), evar_key_of(b)) } else { string_lt(an, bn) }
   }
 }
 
 fn suv_assign(vs: [EVar], used: [Int], acc: [EVar]) : [EVar] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
-    EV(n, ar, tys, _) -> {
-      let t = suv_slot(n, used)
-      suv_assign(rest, [t, ...used], [EV(n, ar, tys, t), ...acc])
+    EV(hm, n, ar, tys, _) -> {
+      let t = suv_slot(evar_key(hm, n), used)
+      suv_assign(rest, [t, ...used], [EV(hm, n, ar, tys, t), ...acc])
     }
   }
 }
 
-fn suv_slot(name: String, used: [Int]) : Int {
-  let h = string_hash(name)
+fn suv_slot(key: String, used: [Int]) : Int {
+  let h = string_hash(key)
   let n = user_variant_tag_range()
   suv_probe(user_variant_tag_base() + ((h % n) + n) % n, used)
 }
@@ -1752,7 +1843,7 @@ pub fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
 pub fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
 
 #[doc("Variant-table lookup helper: name.")]
-pub fn evar_name(v: EVar) : String = match v { EV(n, _, _, _) -> n }
+pub fn evar_name(v: EVar) : String = match v { EV(_, n, _, _, _) -> n }
 
 #[doc("Module-const names from the decl list, for the global-name set so a captured const is materialised inline, not listed as a closure capture.")]
 pub fn const_names(decls: [Decl]) : [String] = match decls {
@@ -2367,8 +2458,8 @@ pub fn collect_variant_to_head(variants: [EVar], decls: [Decl]) : [Int] =
 fn collect_v2h_pairs(vs: [EVar], decls: [Decl], acc: [Int]) : [Int] {
   match vs {
     [] -> list_reverse(acc)
-    [EV(name, _, _, tag), ...rest] ->
-      collect_v2h_pairs(rest, decls, [variant_head_tag_for(name, decls), tag, ...acc])
+    [EV(hm, name, _, _, tag), ...rest] ->
+      collect_v2h_pairs(rest, decls, [variant_head_tag_for_in(hm, name, decls), tag, ...acc])
   }
 }
 
@@ -2549,21 +2640,31 @@ pub fn enum_names_has(enums: [String], name: String) : Bool {
 # sub-spine, which the RC pass over-frees.
 #[doc("Head tag for the sum type owning constructor `ctor`, or -1 if no user sum declares it.")]
 pub fn user_ctor_type_head_tag(ctor: String, decls: [Decl]) : Int =
-  match ctor_owner_sum(ctor, decls) {
+  user_ctor_type_head_tag_in(None, ctor, decls)
+
+#[doc("Head tag of the sum type declaring `ctor` in module `home`, or -1 when no such sum exists.")]
+pub fn user_ctor_type_head_tag_in(home: Option[String], ctor: String, decls: [Decl]) : Int =
+  match ctor_owner_sum_in(home, ctor, decls) {
     Some(dn) -> user_type_head_tag(dn, decls)
     None     -> 0 - 1
   }
 
 #[doc("Name of the sum type declaring constructor `ctor`, or None.")]
-pub fn ctor_owner_sum(ctor: String, ds: [Decl]) : Option[String] {
+pub fn ctor_owner_sum(ctor: String, ds: [Decl]) : Option[String] =
+  ctor_owner_sum_in(None, ctor, ds)
+
+#[doc("Name of the sum type declaring `ctor` in module `home`, or None. A `None` home takes the first declarer, as before homes existed.")]
+pub fn ctor_owner_sum_in(home: Option[String], ctor: String, ds: [Decl]) : Option[String] {
   match ds {
     [] -> None
     [d, ...rest] -> match d {
-      DType(_, dn, _, body, _, _, _, _) -> match body {
-        TBSum(vs) -> if ctor_in_variants(ctor, vs) { Some(dn) } else { ctor_owner_sum(ctor, rest) }
-        _         -> ctor_owner_sum(ctor, rest)
+      DType(_, dn, _, body, _, _, mo, _) -> match body {
+        TBSum(vs) ->
+          if ctor_in_variants(ctor, vs) and ctor_home_matches(mo, home) { Some(dn) }
+          else { ctor_owner_sum_in(home, ctor, rest) }
+        _ -> ctor_owner_sum_in(home, ctor, rest)
       }
-      _ -> ctor_owner_sum(ctor, rest)
+      _ -> ctor_owner_sum_in(home, ctor, rest)
     }
   }
 }
@@ -2577,7 +2678,11 @@ pub fn ctor_in_variants(ctor: String, vs: [Variant]) : Bool {
 }
 
 #[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to dense user head tags via user_ctor_type_head_tag.")]
-pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
+pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int =
+  variant_head_tag_for_in(None, name, decls)
+
+#[doc("Head tag of the sum declaring `name` in module `home`; builtins keep their reserved ids.")]
+pub fn variant_head_tag_for_in(home: Option[String], name: String, decls: [Decl]) : Int {
   if name == "Some" { 16 }
   else if name == "None" { 16 }
   else if name == "Ok" { 17 }
@@ -2589,7 +2694,7 @@ pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int {
   else if name == "SigUsr2" { 18 }
   else if name == "Exited" { 19 }
   else if name == "Signaled" { 19 }
-  else { user_ctor_type_head_tag(name, decls) }
+  else { user_ctor_type_head_tag_in(home, name, decls) }
 }
 
 # m7e §24: build a RowExpr from the body-performed labels collected
