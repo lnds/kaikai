@@ -3014,6 +3014,13 @@ fn ty_mod_key(mod: String, fname: String) : String =
 fn ty_env_add_qualified(env: TyEnv, mod: String, name: String, sc: TyScheme) : TyEnv =
   ty_env_add(env, ty_mod_key(mod, name), sc)
 
+# Constructor key that separates two modules declaring the same type
+# and variant name. `ty_mod_key(tname, cname)` alone cannot: its left
+# side is the TYPE, so `a::Color::Red` and `b::Color::Red` would both
+# spell `Color::Red`.
+fn ty_ctor_home_key(home: String, tname: String, cname: String) : String =
+  string_concat(home, string_concat("::", ty_mod_key(tname, cname)))
+
 # Bucket key for the name index: the segment after the FINAL `::`, or
 # the whole name when it has none. Applied identically on insert and on
 # query so an entry registered under `<mod>::<fname>` and a bare-name
@@ -4203,8 +4210,12 @@ fn names_excluding(xs: [String], drop: [String]) : [String] {
 
 fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
   match d {
-    DType(_, tname, tparams, body, _, _, _, _) -> match body {
-      TBSum(vs) -> add_variants_loop(env, tname, tparams, vs, top_names)
+    DType(is_pub, tname, tparams, body, _, _, mo, _) -> match body {
+      # A private type's constructors are unreachable from another
+      # module, so they get no home key: they can neither be named
+      # through a qualifier nor make a bare name ambiguous elsewhere.
+      TBSum(vs) -> add_variants_loop(env, if is_pub { mo } else { None },
+                                        tname, tparams, vs, top_names)
       _ -> env
     }
     _ -> env
@@ -4224,7 +4235,8 @@ fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
 # payload-bearing variant `Foo(Int)` still needs its constructor
 # scheme even if `Foo` is also a type, since pattern matching there
 # goes through the variant-as-callable path.
-fn add_variants_loop(env: TyEnv, tname: String, tparams: [String],
+fn add_variants_loop(env: TyEnv, home: Option[String],
+                       tname: String, tparams: [String],
                        vs: [Variant], top_names: [String]) : TyEnv {
   match vs {
     [] -> env
@@ -4235,7 +4247,7 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String],
           _  -> false
         }
         if shadows {
-          add_variants_loop(env, tname, tparams, rest, top_names)
+          add_variants_loop(env, home, tname, tparams, rest, top_names)
         } else {
           let sc = scheme_of_variant(tname, tparams, v)
           # Ctor overloading at use sites: always
@@ -4250,12 +4262,19 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String],
           # bare collisions still prepend (legacy behavior); the
           # cross-module case is handled by the qualified key.
           let env_q = ty_env_add(env, ty_mod_key(tname, cname), sc)
-          let env2 = if bare_is_core_builtin_variant(env_q, cname) {
-            env_q
-          } else {
-            ty_env_add(env_q, cname, sc)
+          # The type-qualified key alone conflates two modules declaring
+          # the same type and variant name; the home-qualified key
+          # separates them without disturbing either resolution path.
+          let env_h = match home {
+            Some(m) -> ty_env_add(env_q, ty_ctor_home_key(m, tname, cname), sc)
+            None    -> env_q
           }
-          add_variants_loop(env2, tname, tparams, rest, top_names)
+          let env2 = if bare_is_core_builtin_variant(env_h, cname) {
+            env_h
+          } else {
+            ty_env_add(env_h, cname, sc)
+          }
+          add_variants_loop(env2, home, tname, tparams, rest, top_names)
         }
       }
     }
@@ -4411,9 +4430,9 @@ fn union_parents_of_loop(unions: [UnionInfo], child: String, acc: [String]) : [S
 #   - `A | A` (same parent claiming `A` twice) is D6 idempotence,
 #     not D2 — `normalize_union` collapses the duplicate, no error.
 
-type VariantClaim = VC(String, String, Int, Int)
-#                       ^vname  ^parent ^line ^col   (line/col of the
-#                                                     claiming TBSum)
+type VariantClaim = VC(String, String, String, Int, Int)
+#                       ^vname  ^home   ^parent ^line ^col   (line/col of
+#                                                     the claiming TBSum)
 
 # Names of every top-level `DType` in the program. Record /
 # alias / effect-alias names count: pre-declaring `type Foo = { ... }`
@@ -4434,16 +4453,19 @@ fn collect_top_type_names_loop(ds: [Decl], acc: [String]) : [String] {
   }
 }
 
-# Find the first claim of `vname` whose parent differs from `parent`.
-# Same-parent claims are not collisions (D6 idempotence; the union
-# normalises to a singleton).
-fn find_other_claim(claims: [VariantClaim], vname: String, parent: String) : Option[VariantClaim] {
+# Find the first claim of `vname` from the same home whose parent
+# differs from `parent`. Same-parent claims are not collisions (D6
+# idempotence; the union normalises to a singleton). Two homes each
+# claiming the name is not a collision either — that is ctor
+# overloading, resolved at the use site.
+fn find_other_claim(claims: [VariantClaim], vname: String,
+                       home: String, parent: String) : Option[VariantClaim] {
   match claims {
     [] -> None
     [c, ...rest] -> match c {
-      VC(n, p, _, _) -> {
-        if n == vname and p != parent { Some(c) }
-        else { find_other_claim(rest, vname, parent) }
+      VC(n, h, p, _, _) -> {
+        if n == vname and h == home and p != parent { Some(c) }
+        else { find_other_claim(rest, vname, home, parent) }
       }
     }
   }
@@ -4475,12 +4497,13 @@ pub fn validate_union_collisions_decls(ds: [Decl], df: DiagFiles) : Int / Consol
                                    builtin_variant_claims())
 }
 
-# A decl's `module_origin` marks it as belonging to the root file when
-# it is unstamped (`None`) or stamped with the root module's own name.
-fn is_root_decl_origin(origin: Option[String], target_mod: String) : Bool =
+# The home a decl's claims are scoped to. Root-file decls (unstamped, or
+# stamped with the root module's own name) share the empty home with the
+# builtin claims, so a root union shadowing `Result.Ok` is still caught.
+fn decl_claim_home(origin: Option[String], target_mod: String) : String =
   match origin {
-    None    -> true
-    Some(m) -> m == target_mod
+    None    -> ""
+    Some(m) -> if m == target_mod { "" } else { m }
   }
 
 # builtin variant constructors that share a top-level
@@ -4489,10 +4512,10 @@ fn is_root_decl_origin(origin: Option[String], target_mod: String) : Bool =
 # are short and stable.
 fn builtin_variant_claims() : [VariantClaim] {
   [
-    VC("Some", "Option", 0, 0),
-    VC("None", "Option", 0, 0),
-    VC("Ok",   "Result", 0, 0),
-    VC("Err",  "Result", 0, 0)
+    VC("Some", "", "Option", 0, 0),
+    VC("None", "", "Option", 0, 0),
+    VC("Ok",   "", "Result", 0, 0),
+    VC("Err",  "", "Result", 0, 0)
   ]
 }
 
@@ -4504,26 +4527,20 @@ fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      # Only root-file unions seed and test claims. A `type` from the
-      # core/imported modules sharing a variant name with a user union
-      # is ctor overloading resolved at use sites, not a D2 collision —
-      # registering its variants would reject a valid program (e.g.
-      # user `type Status = Exited(Int) | Signaled(Int)` vs core
-      # `os.Exit = Exited(Int) | Signaled(Int)`).
-      DType(_, parent, _, body, line, col, origin, _) ->
-        if is_root_decl_origin(origin, target_mod) {
-          match body {
-            TBSum(vs) -> {
-              let decl_file = decl_diag_file(d, df)
-              let r = check_variants_for_collision(vs, parent, line, col,
-                                                      top_names, claims, decl_file, errs)
-              validate_union_collisions_loop(rest, top_names, df, target_mod, r.errs, r.claims)
-            }
-            _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
-          }
-        } else {
-          validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
+      # Claims are scoped to the declaring home, so an imported module's
+      # union participates without colliding with the root's: two homes
+      # claiming one variant name is ctor overloading resolved at the
+      # use site, not D2. Within one home the check is unchanged.
+      DType(_, parent, _, body, line, col, origin, _) -> match body {
+        TBSum(vs) -> {
+          let decl_file = decl_diag_file(d, df)
+          let home = decl_claim_home(origin, target_mod)
+          let r = check_variants_for_collision(vs, home, parent, line, col,
+                                                  top_names, claims, decl_file, errs)
+          validate_union_collisions_loop(rest, top_names, df, target_mod, r.errs, r.claims)
         }
+        _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
+      }
       _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
     }
   }
@@ -4531,7 +4548,8 @@ fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
 
 type CollisionResult = { errs: Int, claims: [VariantClaim] }
 
-fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: Int,
+fn check_variants_for_collision(vs: [Variant], home: String, parent: String,
+                                  line: Int, col: Int,
                                   top_names: [String], claims: [VariantClaim],
                                   decl_file: String, errs: Int) : CollisionResult / Console + File {
 
@@ -4542,10 +4560,10 @@ fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: I
         if list_has(top_names, vname) {
           # `vname` is pre-declared as a top-level type. The TBSum
           # references it; no implicit declaration, no D2.
-          check_variants_for_collision(rest, parent, line, col,
+          check_variants_for_collision(rest, home, parent, line, col,
                                           top_names, claims, decl_file, errs)
         } else {
-          match find_other_claim(claims, vname, parent) {
+          match find_other_claim(claims, vname, home, parent) {
             Some(prev) -> {
               # claims pre-seeded by
               # `builtin_variant_claims` carry sentinel line/col 0;
@@ -4562,23 +4580,23 @@ fn check_variants_for_collision(vs: [Variant], parent: String, line: Int, col: I
               # genuinely bare unannotated use). The D2 same-file
               # user-vs-user collision still fires.
               match prev {
-                VC(_, _, 0, 0) ->
+                VC(_, _, _, 0, 0) ->
                   # Builtin collision — registration is safe because
                   # `add_variants_loop` keeps the core bare entry
                   # and only adds the user variant under its qualified
                   # key. Continue without bumping err count.
-                  check_variants_for_collision(rest, parent, line, col,
+                  check_variants_for_collision(rest, home, parent, line, col,
                                                   top_names, claims, decl_file, errs)
                 _ -> {
                   report_d2_collision(decl_file, vname, parent, line, col, prev)
-                  check_variants_for_collision(rest, parent, line, col,
+                  check_variants_for_collision(rest, home, parent, line, col,
                                                   top_names, claims, decl_file, errs + 1)
                 }
               }
             }
             None -> {
-              let nc = VC(vname, parent, line, col)
-              check_variants_for_collision(rest, parent, line, col,
+              let nc = VC(vname, home, parent, line, col)
+              check_variants_for_collision(rest, home, parent, line, col,
                                               top_names, [nc, ...claims], decl_file, errs)
             }
           }
@@ -4613,7 +4631,7 @@ fn report_builtin_collision(file: String, vname: String, parent: String,
 fn report_d2_collision(file: String, vname: String, parent: String,
                         line: Int, col: Int, prev: VariantClaim) : Unit / Console + File {
   match prev {
-    VC(_, prev_parent, prev_line, prev_col) -> {
+    VC(_, _, prev_parent, prev_line, prev_col) -> {
       let msg = concat_all(["type '", vname,
                             "' is declared by both 'type ",
                             prev_parent,
@@ -8322,7 +8340,11 @@ type InferState = { file: String, env: TyEnv, core_len: Int, sub: Subst, recs: [
                     # escapes the clause and is rejected. Set on clause entry,
                     # cleared inside lambdas (where `resume` is an ordinary
                     # identifier), restored by `st_restore_entries`.
-                    in_clause: Bool }
+                    in_clause: Bool,
+                    # module the decl under inference belongs to; "" for
+                    # the root file. A constructor this home declares is
+                    # never ambiguous at a use site inside it.
+                    home: String }
 
 #[doc("infer: `OpEffArity` — driver-facing type.")]
 pub type OpEffArity = OEA(String, Int)
@@ -8435,7 +8457,7 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, core_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], op_payload_labels: [], op_res: [], in_clause: false }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], op_payload_labels: [], op_res: [], in_clause: false, home: "" }
 
 fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
@@ -8443,7 +8465,7 @@ fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
-               proto_impls: pis, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               proto_impls: pis, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_set_sums(st: InferState, ss: [SumInfo]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
@@ -8451,28 +8473,28 @@ fn st_set_sums(st: InferState, ss: [SumInfo]) : InferState =
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
-               proto_impls: st.proto_impls, sums: ss, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               proto_impls: st.proto_impls, sums: ss, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # push a Diagnostic onto the InferState accumulator.
 # Used by the T1, T2, T4, T5 emit sites in parallel with their stderr
@@ -8482,7 +8504,7 @@ fn st_push_diag(st: InferState, d: Diagnostic) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: [d, ...st.diags], deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: [d, ...st.diags], deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # record one op-call resolution. Read-only side data for the #820
 # evidence analysis: the effect the typer chose, every effect that
@@ -8497,7 +8519,7 @@ fn st_record_op_res(st: InferState, op: String, chosen: String,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: [opr, ...st.op_res], in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: [opr, ...st.op_res], in_clause: st.in_clause, home: st.home }
 }
 
 # every effect declaring `op`, deduped — the by-name ambiguity set.
@@ -8533,7 +8555,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+                 ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
   }
 }
 
@@ -8747,7 +8769,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # push/pop the alias stack as we enter/leave a handle's body.
 # a freshly-pushed alias starts taggable; descending into a
@@ -8761,7 +8783,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff, true), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -8771,7 +8793,7 @@ fn st_pop_alias(st: InferState) : InferState {
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
                    clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+                   ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
   }
 }
 
@@ -8781,15 +8803,28 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: rb, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # mark whether the current scope is a handler op-clause body.
+fn st_set_home(st: InferState, mo: Option[String]) : InferState =
+  st_set_home_str(st, match mo { None -> "" Some(m) -> m })
+
+fn st_set_home_str(st: InferState, h: String) : InferState =
+  InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff,
+               proto_impls: st.proto_impls, sums: st.sums, diags: st.diags,
+               deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels,
+               op_res: st.op_res, in_clause: st.in_clause, home: h }
+
 fn st_set_in_clause(st: InferState, b: Bool) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: b }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: b, home: st.home }
 
 # stash/clear/restore the enclosing function's declared
 # return type for `e!` propagation. Set by `infer_decl` before walking
@@ -8800,7 +8835,7 @@ fn st_set_ret_ty(st: InferState, rt: Option[Ty]) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: rt, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # register a deferred field-access constraint (see
 # `DeferredField`). Pushed by `synth_field` when the receiver type is
@@ -8810,7 +8845,7 @@ fn st_push_deferred_field(st: InferState, df: DeferredField) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: [df, ...st.deferred_fields], op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: [df, ...st.deferred_fields], op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # record an op call's effect name + live row-arg tyvar ids
 # BEFORE `st_add_label`'s dedup can drop the label. Only parametric ops
@@ -8822,7 +8857,7 @@ fn st_push_op_payload_vars(st: InferState, eff: String, ids: [Int]) : InferState
                        recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                        row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                        clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: [OPV(eff, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause }
+                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: [OPV(eff, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause, home: st.home }
   }
 
 #[doc("infer: `lookup_alias` — typer entry point invoked by the driver.")]
@@ -8861,21 +8896,21 @@ fn st_disable_alias_tag(st: InferState) : InferState =
                row: st.row, eff_uses: st.eff_uses,
                aliases: aliases_disable_tag(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 # lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -9468,7 +9503,7 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     deferred_fields: inner.deferred_fields,
     op_payload_labels: inner.op_payload_labels,
     op_res: inner.op_res,
-    in_clause: outer.in_clause
+    in_clause: outer.in_clause, home: outer.home
   }
 
 # ---- parameter typing ----
@@ -9765,7 +9800,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     EModCall(m, fname) -> {
       let scheme_opt = match ty_env_lookup_qualified(st.env, m, fname) {
         Some(sc) -> Some(sc)
-        None     -> ty_env_lookup(st.env, fname)
+        None     -> match ty_env_lookup_ctor_in_home(st.env, m, fname) {
+          Some(sc) -> Some(sc)
+          None     -> ty_env_lookup(st.env, fname)
+        }
       }
       match scheme_opt {
         Some(sc) -> {
@@ -13956,7 +13994,7 @@ fn st_restore_deferred_fields(st: InferState, dfs: [DeferredField]) : InferState
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: dfs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: dfs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
 fn fuse_row_strict(sub: Subst, stage: Expr) : Bool =
   match pipe_fusion_fn_row(apply_ty(sub, fuse_expr_ty(stage))) {
@@ -14088,7 +14126,7 @@ fn st_drop_label(st: InferState, eff: String) : InferState {
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: row1, eff_uses: uses1, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause }
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 }
 
 fn drop_labels_named(row: [Label], eff: String) : [Label] {
@@ -16573,6 +16611,55 @@ fn ty_env_qualified_parents_loop(es: [TyEntry], cname: String, acc: [String]) : 
   }
 }
 
+# The scheme of a constructor `cname` declared by module `home`, on any
+# of that module's types. A qualified use names the module, not the
+# type, so the type is what this scans over.
+fn ty_env_lookup_ctor_in_home(env: TyEnv, home: String, cname: String) : Option[TyScheme] =
+  ty_env_lookup_ctor_in_home_loop(idx_chain(env.index, ty_bucket_key(cname)),
+                                     string_concat("::", cname),
+                                     string_concat(home, "::"))
+
+fn ty_env_lookup_ctor_in_home_loop(es: [TyEntry], suffix: String,
+                                      home_prefix: String) : Option[TyScheme] {
+  match es {
+    [] -> None
+    [e, ...rest] -> match ty_entry_extract_mod(e.name, suffix) {
+      None -> ty_env_lookup_ctor_in_home_loop(rest, suffix, home_prefix)
+      Some(qual) -> if inf_string_starts_with_q(qual, home_prefix) { Some(e.scheme) }
+                    else { ty_env_lookup_ctor_in_home_loop(rest, suffix, home_prefix) }
+    }
+  }
+}
+
+# The distinct modules declaring a constructor named `cname`, read off
+# the `<home>::<Type>::<cname>` keys. A module that declares the name on
+# two of its own types counts once — the ambiguity this answers is
+# between modules, and a same-module collision is D2's.
+fn ty_env_ctor_homes(env: TyEnv, cname: String) : [String] =
+  ty_env_ctor_homes_loop(idx_chain(env.index, ty_bucket_key(cname)),
+                            string_concat("::", cname), [])
+
+fn ty_env_ctor_homes_loop(es: [TyEntry], suffix: String, acc: [String]) : [String] {
+  match es {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> match ty_entry_extract_mod(e.name, suffix) {
+      None -> ty_env_ctor_homes_loop(rest, suffix, acc)
+      Some(qual) -> match ctor_home_of_qualifier(qual) {
+        None    -> ty_env_ctor_homes_loop(rest, suffix, acc)
+        Some(h) -> if list_has(acc, h) { ty_env_ctor_homes_loop(rest, suffix, acc) }
+                   else { ty_env_ctor_homes_loop(rest, suffix, [h, ...acc]) }
+      }
+    }
+  }
+}
+
+# `<home>::<Type>` yields `Some(home)`; a bare `<Type>` yields `None`,
+# which is what keeps the type-qualified keys out of the home count.
+fn ctor_home_of_qualifier(qual: String) : Option[String] {
+  let i = ty_last_sep(qual, string_length(qual) - 1)
+  if i < 0 { None } else { Some(string_slice(qual, 0, i)) }
+}
+
 # emit a diagnostic when a bare ctor name is
 # genuinely ambiguous (its bare slot is occupied by a core builtin
 # Result/Option ctor AND at least one user type registers a qualified
@@ -16583,6 +16670,12 @@ fn ty_env_qualified_parents_loop(es: [TyEntry], cname: String, acc: [String]) : 
 fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
                                    line: Int, col: Int) : InferState / Console + File {
 
+  # A constructor the use site's own module declares wins outright, so
+  # only foreign homes can make the bare spelling ambiguous.
+  let homes = names_excluding(ty_env_ctor_homes(st.env, cname), [st.home])
+  if list_length(homes) > 1 {
+    report_ctor_home_ambiguity(st, cname, homes, line, col)
+  } else {
   match ty_env_lookup(st.env, cname) {
     None -> st
     Some(bare_sc) -> match extract_return_tycon(bare_sc) {
@@ -16608,7 +16701,32 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
         } else { st }
     }
   }
+  }
 }
+
+# The cross-module bare use: two imported modules each declare `cname`,
+# so the bare spelling names both and the user must qualify.
+fn report_ctor_home_ambiguity(st: InferState, cname: String, homes: [String],
+                                 line: Int, col: Int) : InferState / Console + File {
+
+  diag_error(st.file, line, col,
+    concat_all(["ambiguous constructor '", cname,
+                "' — it is exported by multiple modules"]))
+  diag_note(concat_all(["candidates: ", format_ctor_home_candidates(cname, homes)]))
+  diag_help(concat_all(["qualify the constructor, e.g. `",
+                        ctor_home_first(homes), ".", cname, "(...)`"]))
+  st_bump_err(st)
+}
+
+fn ctor_home_first(homes: [String]) : String =
+  match homes {
+    []        -> ""
+    [h, ..._] -> h
+  }
+
+# Render `pa.Tok, pb.Tok` for the cross-module ambiguity note.
+fn format_ctor_home_candidates(cname: String, homes: [String]) : String =
+  format_ctor_candidates_loop(cname, homes, "")
 
 # Helper: list the qualified parents of `cname` registered in `env`
 # that are NOT the Result/Option core. Each parent appears at most
@@ -18384,7 +18502,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # install the protocol impl table snapshot so
       # `synth_binop` can decide whether a (prim, nonprim) /
       # (nonprim, nonprim cross) pair routes to a registered impl.
-      let st_init1 = st_set_proto_impls(st_init0, proto_impls)
+      let st_init1 = st_set_proto_impls(st_set_home(st_init0, mo), proto_impls)
       # Install the sum-type registry so `synth_binop` can decide
       # structural-vs-dispatch for `==` / `<` over compound types.
       let st_init = st_set_sums(st_init1, sums)
@@ -18639,7 +18757,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
   let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                 op_eff_arities, type_aliases, op_to_eff,
                                                 kind_theories)
-  let st_init1 = st_set_proto_impls(st_init0, proto_impls)
+  let st_init1 = st_set_proto_impls(st_set_home(st_init0, decl_home_module(d)), proto_impls)
   let st_init = st_set_sums(st_init1, sums)
   let added = add_infer_params_with_binds(st_init, ps, [], [])
   let rb = synth(added.st, body)
@@ -18683,7 +18801,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
   let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                 op_eff_arities, type_aliases, op_to_eff,
                                                 kind_theories)
-  let st_init1 = st_set_proto_impls(st_init0, proto_impls)
+  let st_init1 = st_set_proto_impls(st_set_home(st_init0, mo), proto_impls)
   let st_init = st_set_sums(st_init1, sums)
   let rr = synth_let_rhs_or_mint(st_init, cbody, cte, line, col)
   let minted = maybe_mint_literal(rr.st, rr.expr, rr.ty,
