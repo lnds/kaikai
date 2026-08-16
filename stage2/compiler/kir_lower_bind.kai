@@ -45,7 +45,7 @@ import compiler.fnreg
 # to bind. `PVariant` reads positional slots (`KProj scrv idx`);
 # `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
 pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, cn, subs)        -> bind_sub_binders(cn, subs, scrv, 0, body, st)
+  PVariant(hm, cn, subs)       -> bind_sub_binders(kcr_of_pat(hm, cn), subs, scrv, 0, body, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, body, st)
   # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
   # whole scrutinee to `name`, then bind the inner pattern's own sub-binders.
@@ -54,10 +54,16 @@ pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : Lo
   _                         -> st
 }
 
-fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match subs {
+fn bind_sub_binders(c: KCtorRef, subs: [Pattern], scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match subs {
   [] -> st
-  [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, body, bind_slot_pattern(cn, sp, scrv, idx, body, st))
+  [sp, ...rest] -> bind_sub_binders(c, rest, scrv, idx + 1, body, bind_slot_pattern(c, sp, scrv, idx, body, st))
 }
+
+#[doc("A constructor as the slot readers need it: the name plus the module that declares it.")]
+pub type KCtorRef = KCR(Option[String], String)
+
+#[doc("The ctor a variant pattern names, home included.")]
+pub fn kcr_of_pat(home: Option[String], cn: String) : KCtorRef = KCR(home, cn)
 
 # The runtime kind of ctor `cn`'s slot `idx`, classified with the IDENTICAL
 # `variant_slot_kind(te, st.enums)` call the construction path uses
@@ -79,15 +85,17 @@ fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body: Exp
 # (`bind_slot_op`), never a static literal test. A static kind on either
 # side reads the other writer's cells wrong (the rc-detector and
 # os_process parity catches, one per direction).
-pub fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
-  if evar_find_tag(st.vs, cn) < user_variant_tag_base() { 0 - 1 }
-  else { match evar_payload_tys(st.vs, cn) {
+pub fn slot_kind_of(st: LowerSt, c: KCtorRef, idx: Int) : Int = match c {
+  KCR(home, cn) ->
+  if evar_find_tag_in(st.vs, home, cn) < user_variant_tag_base() { 0 - 1 }
+  else { match evar_payload_tys_in(st.vs, home, cn) {
     Some(tys) -> match variant_nth_ty(tys, idx) {
                    Some(te) -> variant_slot_kind(te, st.enums)
                    None     -> 0
                  }
     None      -> 0
   } }
+}
 
 # The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at. Only a
 # kind-1 Int slot can go raw (`SInt64`): the unbox pass seeds Int binders
@@ -105,8 +113,8 @@ pub fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
 # a boxed pointer, the self-compile SIGSEGV. A kind-2 Real / kind-3 enum binder
 # stays `SBoxed`: its `KProj` re-boxes at the border, so the register always
 # holds a `KaiValue *`.
-pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, line: Int, col: Int) : KSlot / Console =
-  match slot_kind_of(st, cn, idx) {
+pub fn bind_slot_kslot(st: LowerSt, c: KCtorRef, idx: Int, nm: String, line: Int, col: Int) : KSlot / Console =
+  match slot_kind_of(st, c, idx) {
     1 -> if raw_arm_binder_at(st.raw_binders, nm, line, col) { SInt64 } else { SBoxed }
     _ -> SBoxed
   }
@@ -123,8 +131,8 @@ pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 # load + minimal re-box, no mask lookup); only the mixed-writer sentinel
 # keeps the mask-consulting `KProj`. The read op always matches the ctor's
 # write layout (all via `variant_slot_kind(te, st.enums)`).
-pub fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
-  match slot_kind_of(st, cn, idx) {
+pub fn bind_slot_op(st: LowerSt, c: KCtorRef, idx: Int, scrv: KVal) : KOp =
+  match slot_kind_of(st, c, idx) {
     0 -> KProjBorrow(scrv, idx)
     1 -> KProjKind(scrv, idx, 1)
     2 -> KProjKind(scrv, idx, 2)
@@ -148,16 +156,16 @@ pub fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
 # name, so it stays a no-op. The payload-bearing case projects the slot and
 # recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
 # direct sub-binders), the SAME shared bind recursion the record path uses.
-fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
+fn bind_slot_pattern(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
   # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
   # every other slot stays the mask-consulting `KProj`. The read op matches the
   # ctor's write layout (both via `variant_slot_kind(te, st.enums)`), so no tagged
   # pointer is ever read raw nor vice versa.
-  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, sp.line, sp.col), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
-  PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, body, st)
-  PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, body, st)
-  PVariant(_, _, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, body, st) }
-  PVariantRecord(_, _) -> bind_nested_slot(cn, sp, scrv, idx, body, st)
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, c, idx, name, sp.line, sp.col), bind_slot_op(st, c, idx, scrv), KAt(sp.line, sp.col)))
+  PRecord(_)           -> bind_nested_slot(c, sp, scrv, idx, body, st)
+  PAs(name, _)         -> bind_nested_as(c, sp, name, scrv, idx, body, st)
+  PVariant(_, _, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(c, sp, scrv, idx, body, st) }
+  PVariantRecord(_, _) -> bind_nested_slot(c, sp, scrv, idx, body, st)
   _                    -> st
 }
 
@@ -175,14 +183,14 @@ fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
 # variant / record slot is always a kind-0 boxed pointer, so `bind_slot_op`
 # reads it as a direct `.ptr` borrow (the same hot child read the balance
 # rotations perform) rather than the mask-consulting `KProj`.
-fn bind_nested_slot(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
+fn bind_nested_slot(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, c, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
     bind_pattern_fields_any(sp, sub, body, st1) }
 
 # An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
 # the inner pattern against the SAME projected value.
-fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
+fn bind_nested_as(c: KCtorRef, sp: Pattern, name: String, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, c, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
     bind_pattern_fields_any(as_inner(sp), sub, body, st2)
   } }
@@ -195,7 +203,7 @@ fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, b
 # here arrives only from a context whose tag is settled (the let-bind of a
 # single-ctor type, an as-pattern inner), so its direct subs bind.
 pub fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, cn, subs)        -> bind_sub_binders(cn, subs, v, 0, body, st)
+  PVariant(hm, cn, subs)       -> bind_sub_binders(kcr_of_pat(hm, cn), subs, v, 0, body, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, v, body, st)
   PRecord(fields)           -> bind_record_subfields(fields, v, body, st)
   _                         -> st
