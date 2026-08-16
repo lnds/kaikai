@@ -94,6 +94,7 @@ import compiler.util
 import compiler.fnreg
 import compiler.impl_index
 import compiler.modules
+import compiler.type_scope
 import compiler.proto_scope
 import compiler.infer
 import compiler.layout_derive
@@ -363,7 +364,33 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 
 fn proto_reg_empty() : ProtocolReg =
   ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
-                dkeys: [], impl_index: impl_index_empty() }
+                dkeys: [], impl_index: impl_index_empty(), tys: [], cores: [] }
+
+# One field-update helper per mutated field. A record literal spelling
+# every field is what let a new field silently keep its stale value at
+# one of these sites; each setter names exactly what it changes.
+fn reg_with_ops(reg: ProtocolReg, ops: [ProtoOpReg],
+                op_names: [String]) : ProtocolReg =
+  ProtocolReg { ops: ops, impls: reg.impls, op_names: op_names,
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: reg.impl_index, tys: reg.tys, cores: reg.cores }
+
+fn reg_with_proto(reg: ProtocolReg, tparams: [ProtoTPReg],
+                  origins: [ProtoOriginReg]) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: tparams, origins: origins, dkeys: reg.dkeys,
+                impl_index: reg.impl_index, tys: reg.tys, cores: reg.cores }
+
+fn reg_with_impls(reg: ProtocolReg, impls: [ProtoImplReg]) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: reg.impl_index, tys: reg.tys, cores: reg.cores }
+
+fn reg_with_types(reg: ProtocolReg, tys: [TypeOriginReg],
+                  cores: [String]) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: reg.impl_index, tys: tys, cores: cores }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -437,6 +464,16 @@ pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 fn proto_mo_of(home: String, target_mod: String) : Option[String] =
   if home == target_mod { None } else { Some(home) }
 
+# The dispatch spelling of an impl's target type, resolved from the
+# impl's own module: an impl implements for the type its module sees,
+# and two modules' same-named types are two targets, not one.
+fn impl_target_spell(reg: ProtocolReg, tname: String,
+                     from: Option[String]) : String =
+  match type_scope_home(reg.tys, tname, from) {
+    Some(th) -> type_dispatch_spell(reg.tys, reg.cores, tname, th)
+    None     -> tname
+  }
+
 # Register every DProtocol decl the program declares. The op list
 # becomes the universe of "names that look like ordinary fn calls but
 # really need protocol dispatch". Each entry carries its declaring
@@ -447,13 +484,8 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
     [] -> reg
     [d, ...rest] -> match d {
       DProtocol(is_pub, name, tparams, ops, _, _, mo) -> {
-        let reg1 = ProtocolReg {
-          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-          tparams: [PTPR(name, tparams, mo), ...reg.tparams],
-          origins: [PrOR(name, mo, is_pub), ...reg.origins],
-          dkeys: reg.dkeys,
-          impl_index: reg.impl_index
-        }
+        let reg1 = reg_with_proto(reg, [PTPR(name, tparams, mo), ...reg.tparams],
+                                  [PrOR(name, mo, is_pub), ...reg.origins])
         collect_proto_decls(rest, register_proto_ops(reg1, name, mo, ops))
       }
       DDerive(_, inner, _, _) ->
@@ -481,15 +513,7 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
         let names1 =
           if list_has(reg.op_names, opname) { reg.op_names }
           else { [opname, ...reg.op_names] }
-        let reg1 = ProtocolReg {
-          ops: [entry, ...reg.ops],
-          impls: reg.impls,
-          op_names: names1,
-          tparams: reg.tparams,
-          origins: reg.origins,
-          dkeys: reg.dkeys,
-          impl_index: reg.impl_index
-        }
+        let reg1 = reg_with_ops(reg, [entry, ...reg.ops], names1)
         register_proto_ops(reg1, proto, mo, rest)
       }
     }
@@ -581,14 +605,14 @@ fn proto_builtin_type_names() : [String] =
 # resolves to a protocol its module can see. Reports each violation on
 # stderr and returns the count of reported errors.
 fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                  origins: [ProtoOriginReg], proto_names: [String],
+                  reg: ProtocolReg, proto_names: [String],
                   local_types: [String], target_mod: String) : Int / Console {
-  validate_impls_loop(ds, homes, df, origins, proto_names, local_types,
+  validate_impls_loop(ds, homes, df, reg, proto_names, local_types,
                       target_mod, [], 0)
 }
 
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                       origins: [ProtoOriginReg], proto_names: [String],
+                       reg: ProtocolReg, proto_names: [String],
                        local_types: [String], target_mod: String,
                        seen: [String], errs: Int) : Int / Console {
   match ds {
@@ -600,13 +624,14 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         let file = decl_diag_file(d, df)
         let tname = proto_type_name(target)
         let from = proto_mo_of(ha_home(h), target_mod)
-        let res = proto_scope_resolve(origins, pname, from)
-        # Issue #180: duplicate-impl key includes the proto-arg names so
-        # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
-        # coexist. Legacy `impl P for T` (proto_args == []) maps to the
-        # homogeneous default `[T]` for keying. The resolved protocol's
-        # home leads the key: two modules implementing their own `P`
-        # for same-named types are not duplicates.
+        let res = proto_scope_resolve(reg.origins, pname, from)
+        # The key includes the proto-arg names so `impl Add[Real] for
+        # Complex` and `impl Add[Complex] for Complex` coexist. Legacy
+        # `impl P for T` (proto_args == []) maps to the homogeneous
+        # default `[T]`. Both homes lead the key — the protocol's and
+        # the target type's — so two modules implementing their own `P`
+        # for their own `T` are not duplicates, while the same pair
+        # declared twice in one home still is.
         let arg_names = match proto_args {
           [] -> [tname]
           _  -> map(proto_args, proto_type_name)
@@ -615,7 +640,8 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           PRHome(Some(m)) -> m
           _ -> ""
         }
-        let key = concat_all([mo_key, "!", pname, "/", tname, "[",
+        let key = concat_all([mo_key, "!", pname, "/",
+                              impl_target_spell(reg, tname, from), "[",
                               arg_names_mangle(arg_names), "]"])
         let proto_local = list_has(proto_names, pname)
         let type_local = list_has(local_types, tname) or
@@ -653,25 +679,25 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           }
         }
         let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, hrest, df, origins, proto_names,
+        validate_impls_loop(rest, hrest, df, reg, proto_names,
                             local_types, target_mod, seen1, errs3)
       }
       DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
-      _ -> validate_impls_loop(rest, hrest, df, origins, proto_names,
+      _ -> validate_impls_loop(rest, hrest, df, reg, proto_names,
                                local_types, target_mod, seen, errs)
       }
     }
@@ -1106,7 +1132,10 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
           PRHome(ph) -> proto_key_of(reg.dkeys, pname, ph)
           _ -> pname
         }
-        let r = lower_impl_methods(key, tname, arg_names, methods, reg, acc_fns)
+        # The target's spelling carries its home for the same reason the
+        # protocol's does: `__pimpl_<P>_<T>_<op>` is one symbol space.
+        let tkey = impl_target_spell(reg, tname, from)
+        let r = lower_impl_methods(key, tkey, arg_names, methods, reg, acc_fns)
         lower_impls(rest, r.reg, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, acc_fns)
@@ -1151,15 +1180,7 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo)
         let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
         let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head)
-        let reg1 = ProtocolReg {
-          ops: reg.ops,
-          impls: [entry, ...reg.impls],
-          op_names: reg.op_names,
-          tparams: reg.tparams,
-          origins: reg.origins,
-          dkeys: reg.dkeys,
-          impl_index: reg.impl_index
-        }
+        let reg1 = reg_with_impls(reg, [entry, ...reg.impls])
         lower_impl_methods(pkey, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
       _ -> lower_impl_methods(pkey, tname, arg_names, rest, reg, acc_fns)
@@ -1184,6 +1205,14 @@ fn generate_dispatchers(reg: ProtocolReg) : [Decl] =
 
 fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
                                 acc: [Decl]) : [Decl] {
+  generate_dispatchers_at(ops, ops, arities, acc)
+}
+
+# `all` is the whole op table; the walk consults it to tell whether the
+# op name it is minting a stub for is declared by more than one
+# protocol at this arity.
+fn generate_dispatchers_at(ops: [ProtoOpReg], all: [ProtoOpReg],
+                           arities: [OpAr], acc: [Decl]) : [Decl] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
@@ -1194,15 +1223,35 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
         # collisions still collapse to one shared dispatcher.
         let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
         let already = dispatcher_named_in_acc(acc, disp)
-        if already { generate_dispatchers_loop(rest, arities, acc) }
+        if already { generate_dispatchers_at(rest, all, arities, acc) }
         else {
-          let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, arities, [stub, ...acc])
+          # A shared stub must not carry one protocol's concrete
+          # receiver type: the other protocol's calls would be rejected
+          # against it before the post-inference rewrite can pick the
+          # right impl by receiver. Generalising the shared stub is the
+          # same move `Self` already gets — the stub is a typed
+          # placeholder, never the dispatch decision.
+          let shared = op_declared_by_two_protocols(all, opname, pname,
+                                                    list_length(params))
+          let stub = make_dispatcher_fn(pname, opname, disp, params, ret,
+                                        line, col, mo, shared)
+          generate_dispatchers_at(rest, all, arities, [stub, ...acc])
         }
       }
     }
   }
 }
+
+# True when another protocol declares `opname` at the same arity — the
+# case where one stub stands in for two contracts.
+fn op_declared_by_two_protocols(ops: [ProtoOpReg], opname: String,
+                                pname: String, arity: Int) : Bool =
+  match ops {
+    [] -> false
+    [POR(p, o, ps, _, _, _, _), ...rest] ->
+      if o == opname and p != pname and list_length(ps) == arity { true }
+      else { op_declared_by_two_protocols(rest, opname, pname, arity) }
+  }
 
 fn dispatcher_named_in_acc(ds: [Decl], want: String) : Bool {
   match ds {
@@ -1221,13 +1270,31 @@ fn dispatcher_named_in_acc(ds: [Decl], want: String) : Bool {
 # by the protocol's true op name.
 fn make_dispatcher_fn(pname: String, opname: String, disp_name: String,
                        params: [Param], ret: TypeExpr, line: Int, col: Int,
-                       mo: Option[String]) : Decl {
-  let new_params = map(params, dispatcher_substitute_self_param)
-  let new_ret = substitute_self_in_type(ret)
+                       mo: Option[String], shared: Bool) : Decl {
+  let subst = if shared { generalise_dispatch_param }
+              else { dispatcher_substitute_self_param }
+  let new_params = map(params, subst)
+  let new_ret = if shared { generalise_dispatch_type(ret) }
+                else { substitute_self_in_type(ret) }
   let body = make_dispatcher_body(pname, opname, new_ret, line, col)
   DFn(true, disp_name, [], new_params, Some(new_ret),
       REmpty, body, line, col, mo)
 }
+
+# A shared stub's nominal heads become fresh type variables, so the
+# stub constrains nothing and every declaring protocol's calls reach
+# the rewrite. Structure below a head is dropped for the same reason:
+# it is one protocol's contract, not the shared placeholder's.
+fn generalise_dispatch_param(p: Param) : Param = match p.ptype {
+  None -> p
+  Some(te) -> Param { pname: p.pname, ptype: Some(generalise_dispatch_type(te)),
+                      pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+}
+
+fn generalise_dispatch_type(te: TypeExpr) : TypeExpr =
+  TypeExpr { tkind: TyName(concat_all(["proto_shared_", int_to_string(te.line),
+                                       "_", int_to_string(te.col)]), []),
+             line: te.line, col: te.col }
 
 # Synthesises an `ETodo` body tagged `__kai_proto_dispatch__:<P>:<op>`.
 # The typer keeps treating the dispatcher as a regular polymorphic fn
@@ -1466,7 +1533,13 @@ fn expand_derives_loop(ds: [Decl], acc: [Decl]) : [Decl] {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> {
-        let derived = derive_impls_for(names, inner)
+        # The synthesised methods are minted without a home; stamping
+        # the wrapped type's here is what keeps two modules deriving the
+        # same protocol for their own same-named type apart. Every
+        # derive path mints through this one point, so the stamp lands
+        # once instead of threading a home through each `derive_*_impl`.
+        let derived = map(derive_impls_for(names, inner),
+                          (di) => stamp_impl_home(di, decl_type_home(inner)))
         expand_derives_loop(rest, list_append([inner, ...list_reverse(derived)], acc))
       }
       DUnstable(inner, _, _) ->
@@ -1506,6 +1579,28 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # the protocol's own ops on the inner fields, so the fields' types
 # must already implement the same protocol — checked transitively
 # by the typer / resolver after lowering.
+# The home of a derived impl is the home of the type it was derived
+# for; the methods carry it so `impl_home_of` reads the same module a
+# hand-written impl in that file would.
+fn decl_type_home(d: Decl) : Option[String] = match d {
+  DType(_, _, _, _, _, _, mo, _) -> mo
+  DDoc(_, _, inner, _, _)        -> decl_type_home(inner)
+  DAttr(_, inner, _, _)          -> decl_type_home(inner)
+  _ -> None
+}
+
+fn stamp_impl_home(d: Decl, mo: Option[String]) : Decl = match d {
+  DImpl(p, pargs, target, ms, l, c, tps) ->
+    DImpl(p, pargs, target, map(ms, (m) => stamp_fn_home(m, mo)), l, c, tps)
+  _ -> d
+}
+
+fn stamp_fn_home(d: Decl, mo: Option[String]) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo)
+  _ -> d
+}
+
 fn derive_impls_for(names: [String], dt: Decl) : [Decl] {
   match dt {
     DType(_, tname, _, body, line, col, _, _) ->
@@ -3425,13 +3520,17 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # stream also scopes the impl validations below, so it is computed
   # once here.
   let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
-  let reg0 = reg_with_dkeys(collect_proto_decls(expanded, proto_reg_empty()), cores)
+  # The impl key scopes its target type the way it scopes the protocol,
+  # so the type origins travel with the registry from here on.
+  let tys = collect_type_origins(expanded, target_mod)
+  let reg_t = reg_with_types(proto_reg_empty(), tys, cores)
+  let reg0 = reg_with_dkeys(collect_proto_decls(expanded, reg_t), cores)
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let coh_errs = validate_impls(expanded, homes, df, reg0.origins,
+  let coh_errs = validate_impls(expanded, homes, df, reg0,
                                 proto_names, local_types, target_mod)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
@@ -3490,15 +3589,15 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
 # every subsequent lookup.
 fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-                tparams: reg.tparams, origins: reg.origins,
-                dkeys: reg.dkeys,
-                impl_index: build_impl_index(reg.impls) }
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: build_impl_index(reg.impls),
+                tys: reg.tys, cores: reg.cores }
 
 fn reg_with_dkeys(reg: ProtocolReg, cores: [String]) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins,
                 dkeys: proto_dispatch_keys(reg.origins, cores),
-                impl_index: reg.impl_index }
+                impl_index: reg.impl_index, tys: reg.tys, cores: reg.cores }
 
 # m12.8 + resolver-arity: pre-resolve renaming pass. Walks every DFn /
 # DTest body and rewrites every `EVar(name)` whose name is a known
@@ -4682,7 +4781,7 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
             [] -> errs
             [self_arg, ..._rest_args] -> match self_arg.ty {
               None -> errs
-              Some(ty) -> match ty_head_name(ty) {
+              Some(ty) -> match reg_ty_head_name(reg, ty) {
                 None -> errs
                 # Collision-aware: an impl under ANY protocol declaring
                 # `opname` clears the call (the bare name carries no
@@ -5084,10 +5183,11 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
 # Returns None when the shapes do not align (the inferred return is
 # still a tyvar, or a structural mismatch the unifier would have
 # already rejected).
-fn self_head_in_ret(declared: TypeExpr, inferred: Ty) : Option[String] {
+fn self_head_in_ret(reg: ProtocolReg, declared: TypeExpr,
+                    inferred: Ty) : Option[String] {
   let n = te_self_count(declared)
-  if n == 0 { ty_head_name(inferred) }
-  else if n == 1 { align_self_head(declared, inferred) }
+  if n == 0 { reg_ty_head_name(reg, inferred) }
+  else if n == 1 { align_self_head(reg, declared, inferred) }
   else { None }
 }
 
@@ -5120,19 +5220,20 @@ fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
 # the same constructor at every step (the typer already unified them),
 # so the walk pairs children positionally and recurses until it lands
 # on the `Self` leaf.
-fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[String] {
+fn align_self_head(reg: ProtocolReg, declared: TypeExpr,
+                   inferred: Ty) : Option[String] {
   match declared.tkind {
     TyName(name, targs) ->
-      if name == "Self" { ty_head_name(inferred) }
-      else { align_self_in_args(targs, ty_con_args(inferred)) }
+      if name == "Self" { reg_ty_head_name(reg, inferred) }
+      else { align_self_in_args(reg, targs, ty_con_args(inferred)) }
     TyList(inner) -> {
       match inferred {
-        TyListT(elem) -> align_self_head(inner, elem)
+        TyListT(elem) -> align_self_head(reg, inner, elem)
         _             -> None
       }
     }
-    TyDim(base, _)    -> align_self_head(base, ty_strip_dim(inferred))
-    TyRefine(base, _) -> align_self_head(base, ty_strip_refine(inferred))
+    TyDim(base, _)    -> align_self_head(reg, base, ty_strip_dim(inferred))
+    TyRefine(base, _) -> align_self_head(reg, base, ty_strip_refine(inferred))
     TyFn(_, _, _)     -> None
     # issue #772: a compound row is never a `Self`-bearing position.
     TyRow(_)          -> None
@@ -5142,15 +5243,16 @@ fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[String] {
 
 # Walk paired declared/inferred argument lists; the one carrying `Self`
 # (guaranteed unique by the `te_self_count == 1` gate) yields the head.
-fn align_self_in_args(decls: [TypeExpr], infs: [Ty]) : Option[String] {
+fn align_self_in_args(reg: ProtocolReg, decls: [TypeExpr],
+                      infs: [Ty]) : Option[String] {
   match decls {
     [] -> None
     [d, ...drest] -> {
       match infs {
         []           -> None
         [i, ...irest] ->
-          if te_self_count(d) == 1 { align_self_head(d, i) }
-          else { align_self_in_args(drest, irest) }
+          if te_self_count(d) == 1 { align_self_head(reg, d, i) }
+          else { align_self_in_args(reg, drest, irest) }
       }
     }
   }
@@ -5222,7 +5324,7 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
               # candidate against its own return-derived Self type.
               # Decline while any argument's type is still unresolved
               # (no head) — dispatching then would be premature.
-              match args_head_names(args_) {
+              match args_head_names(reg, args_) {
                 None -> None
                 Some(_) ->
                   try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
@@ -5275,7 +5377,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
           try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         } else {
           let pkey = proto_key_of(reg.dkeys, pname, pmo)
-          match self_head_in_ret(ret_te, ret_ty) {
+          match self_head_in_ret(reg, ret_te, ret_ty) {
             None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                opname, ret_ty)
             Some(self_name) ->
@@ -5485,6 +5587,22 @@ fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
 # `(proto, recv)` bucket when the index is built, else the whole table.
 # Every `find_impl_*` filter keys on `t == recv`, so the bucket holds
 # exactly the entries the linear scan would not skip, in the same order.
+# The impl key spells a contested target type with its home, so the
+# lookup head must be spelled the same way. `TyCon` already carries the
+# home the typer resolved; every other head is a builtin with no home.
+fn reg_ty_head_name(reg: ProtocolReg, t: Ty) : Option[String] =
+  match ty_head_name(t) {
+    None    -> None
+    Some(n) -> Some(type_dispatch_spell(reg.tys, reg.cores, n, ty_head_home(t)))
+  }
+
+fn ty_head_home(t: Ty) : Option[String] = match t {
+  TyCon(mo, _, _)    -> mo
+  TyDimT(base, _)    -> ty_head_home(base)
+  TyRefineT(base, _) -> ty_head_home(base)
+  _ -> None
+}
+
 fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
   if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, pname, recv) }
   else { reg.impls }
@@ -5500,12 +5618,12 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
   # argument and ignore the rest, so a function arg does not veto the
   # lookup the way `args_head_names` (all-or-nothing) would.
   if proto_is_shape_carrier_at(reg.tparams, pname, pmo) {
-    match first_container_head(args_) {
+    match first_container_head(reg, args_) {
       None -> None
       Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   } else {
-  let names = args_head_names(args_)
+  let names = args_head_names(reg, args_)
   match names {
     None -> None
     Some(ns) -> match ns {
@@ -5551,16 +5669,17 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
 # The head name of the first argument that carries a concrete type
 # constructor (a container), skipping function-typed and unresolved
 # args. This is the dispatch receiver for a `Shape`-carrier op.
-fn first_container_head(args_: [Expr]) : Option[String] = match args_ {
-  [] -> None
-  [e, ...rest] -> match e.ty {
-    Some(ty) -> match ty_head_name(ty) {
-      Some(n) -> Some(n)
-      None    -> first_container_head(rest)
+fn first_container_head(reg: ProtocolReg, args_: [Expr]) : Option[String] =
+  match args_ {
+    [] -> None
+    [e, ...rest] -> match e.ty {
+      Some(ty) -> match reg_ty_head_name(reg, ty) {
+        Some(n) -> Some(n)
+        None    -> first_container_head(reg, rest)
+      }
+      None -> first_container_head(reg, rest)
     }
-    None -> first_container_head(rest)
   }
-}
 
 # Find the impl entry whose `arg_names` is empty (legacy default) or
 # is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
@@ -5586,19 +5705,20 @@ fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args
   _ -> false
 }
 
-fn args_head_names(args_: [Expr]) : Option[[String]] = match args_ {
-  [] -> Some([])
-  [e, ...rest] -> match e.ty {
-    None -> None
-    Some(ty) -> match ty_head_name(ty) {
+fn args_head_names(reg: ProtocolReg, args_: [Expr]) : Option[[String]] =
+  match args_ {
+    [] -> Some([])
+    [e, ...rest] -> match e.ty {
       None -> None
-      Some(n) -> match args_head_names(rest) {
+      Some(ty) -> match reg_ty_head_name(reg, ty) {
         None -> None
-        Some(ns) -> Some([n, ...ns])
+        Some(n) -> match args_head_names(reg, rest) {
+          None -> None
+          Some(ns) -> Some([n, ...ns])
+        }
       }
     }
   }
-}
 
 fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
                         recv: String, args: [String]) : Option[String] {

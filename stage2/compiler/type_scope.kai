@@ -1,0 +1,121 @@
+# compiler/type_scope.kai — module scoping for nominal type names in
+# protocol dispatch.
+#
+# `type T` is not a package-global name, but the impl table keys on the
+# bare spelling: two modules each declaring their own `T` and
+# implementing the same protocol for it collapse onto one key, reported
+# as a spurious duplicate. The types themselves already scope correctly
+# through the typer's `module_origin` disambiguation — only the impl
+# key and the mangled symbol lost the home.
+#
+# This mirrors `proto_scope`: a module sees its own types first, then
+# the exported ones of other modules; root-file types are visible
+# package-wide.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+
+#[doc("Every nominal type the decl stream declares, paired with its home and visibility, in declaration order.")]
+pub fn collect_type_origins(ds: [Decl], target_mod: String) : [TypeOriginReg] =
+  tsc_collect(ds, target_mod, target_mod, [])
+
+fn tsc_collect(ds: [Decl], cur: String, target: String,
+               acc: [TypeOriginReg]) : [TypeOriginReg] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = tsc_decl_home(d, cur, target)
+    tsc_collect(rest, home, target, tsc_entry_of(d, home, target, acc))
+  }
+}
+
+# A decl's home is its own `module_origin` when it carries one; the
+# streaming reset covers the shapes that have no such field.
+fn tsc_decl_home(d: Decl, cur: String, target: String) : String = match d {
+  DType(_, _, _, _, _, _, mo, _) -> match mo { Some(m) -> m  None -> target }
+  _ -> decl_home_hint_reset(d, cur, target)
+}
+
+fn tsc_entry_of(d: Decl, home: String, target: String,
+                acc: [TypeOriginReg]) : [TypeOriginReg] = match d {
+  DType(is_pub, name, _, _, _, _, _, _) ->
+    [TyOR(name, tsc_mo_of(home, target), is_pub), ...acc]
+  DDerive(_, inner, _, _)       -> tsc_entry_of(inner, home, target, acc)
+  DUnstable(inner, _, _)        -> tsc_entry_of(inner, home, target, acc)
+  DProtoLaws(_, inner, _, _, _) -> tsc_entry_of(inner, home, target, acc)
+  DImplAxiom(_, inner, _, _, _) -> tsc_entry_of(inner, home, target, acc)
+  DConstructor(inner, _, _)     -> tsc_entry_of(inner, home, target, acc)
+  DDoc(_, _, inner, _, _)       -> tsc_entry_of(inner, home, target, acc)
+  DAttr(_, inner, _, _)         -> tsc_entry_of(inner, home, target, acc)
+  _ -> acc
+}
+
+# The root file's own module name is stored as `None`, matching how the
+# rest of the registries spell a root-file home.
+fn tsc_mo_of(home: String, target: String) : Option[String] =
+  if home == target { None } else { Some(home) }
+
+#[doc("The home of the type `tname` as seen from the module whose home is `from` (`None` = root file): its own declaration first, else the first-declared visible foreign one.")]
+pub fn type_scope_home(origins: [TypeOriginReg], tname: String,
+                       from: Option[String]) : Option[Option[String]] =
+  match tsc_own(origins, tname, from) {
+    Some(mo) -> Some(mo)
+    None     -> tsc_foreign(origins, tname)
+  }
+
+fn tsc_own(origins: [TypeOriginReg], tname: String,
+           from: Option[String]) : Option[Option[String]] = match origins {
+  [] -> None
+  [TyOR(n, mo, _), ...rest] ->
+    if n == tname and mo_eq(mo, from) { Some(mo) }
+    else { tsc_own(rest, tname, from) }
+}
+
+# Declaration order is the visibility order: the first `pub` or
+# root-file declaration answers, matching `proto_scope`'s foreign pass.
+fn tsc_foreign(origins: [TypeOriginReg],
+               tname: String) : Option[Option[String]] = match origins {
+  [] -> None
+  [TyOR(n, mo, is_pub), ...rest] ->
+    if n == tname and (is_pub or mo_eq(mo, None)) { Some(mo) }
+    else { tsc_foreign(rest, tname) }
+}
+
+# Dispatch identity, the `psc_spell` rule applied to the impl target.
+# A contested name (declared by two or more homes) spells each
+# declaration with its home so impl keys and mangled symbols stay
+# distinct. Two exceptions keep the bare spelling: the root file (no
+# module to qualify with) and stdlib cores (both backends key stdlib
+# types by their fixed bare-name ids).
+#[doc("The dispatch spelling of type `tname` homed at `home`: `<home>__<T>` when the name is contested and the home is a non-core module, the bare name otherwise.")]
+pub fn type_dispatch_spell(origins: [TypeOriginReg], cores: [String],
+                           tname: String, home: Option[String]) : String =
+  match home {
+    None -> tname
+    Some(m) ->
+      if tsc_contested(origins, tname) and not list_has(cores, m) {
+        concat_all([m, "__", tname])
+      } else { tname }
+  }
+
+# Contested = at least two distinct homes declare the name.
+fn tsc_contested(origins: [TypeOriginReg], tname: String) : Bool =
+  match tsc_first_home(origins, tname) {
+    None    -> false
+    Some(h) -> tsc_other_home(origins, tname, h)
+  }
+
+fn tsc_first_home(origins: [TypeOriginReg],
+                  tname: String) : Option[Option[String]] = match origins {
+  [] -> None
+  [TyOR(n, mo, _), ...rest] ->
+    if n == tname { Some(mo) } else { tsc_first_home(rest, tname) }
+}
+
+fn tsc_other_home(origins: [TypeOriginReg], tname: String,
+                  h: Option[String]) : Bool = match origins {
+  [] -> false
+  [TyOR(n, mo, _), ...rest] ->
+    if n == tname and not mo_eq(mo, h) { true }
+    else { tsc_other_home(rest, tname, h) }
+}
