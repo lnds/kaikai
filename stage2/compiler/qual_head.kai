@@ -1,0 +1,170 @@
+#[doc("""
+Qualified habitant names in head position: `with m.E`, `impl m.P`.
+
+The parser folds the qualifier into the spelling (`"m.E"`) exactly as
+it does for `mod.Type`. This pass validates the qualifier against the
+file's import table and rewrites the node back to the bare name, so
+every downstream consumer sees the shape an unqualified head produces
+and the qualifier stays a parse-time disambiguator.
+
+The rewrite is pure and total — a bad qualifier still yields the bare
+name — and the counting pass is what reports it and fails the build.
+
+Effect operations (`m.E.op`) need no arm here: they parse as a nested
+field chain whose leading segment is a module, and the module rewrite
+resolves them along with every other `m.f`.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.modules
+import compiler.util
+
+#[doc("Strip a validated module qualifier from every habitant head in these decls.")]
+pub fn qh_decls(decls: [Decl], mt: [ModuleEntry]) : [Decl] = match decls {
+  [] -> []
+  [d, ...rest] -> [qh_decl(d, mt), ...qh_decls(rest, mt)]
+}
+
+#[doc("Resolve each import segment's heads under its own file's qualifier table.")]
+pub fn qh_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String) : [Decl] = match segs {
+  [] -> qh_decls(decls, ms_table(scopes, "", global))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let mt = ms_table(scopes, home, global)
+    list_append(qh_decls(seg_take(decls, n), mt),
+                qh_segmented(rest, seg_drop(decls, n), scopes, global, target_mod))
+  }
+}
+
+#[doc("Report every habitant head whose qualifier names no import or no export, and count them so the exit code reflects the diagnostics.")]
+pub fn qhchk_decls(decls: [Decl], mt: [ModuleEntry], df: DiagFiles) : Int / Console + File = match decls {
+  [] -> 0
+  [d, ...rest] -> {
+    let here = qhchk_decl(d, mt, decl_diag_file(d, df))
+    here + qhchk_decls(rest, mt, df)
+  }
+}
+
+#[doc("Segment-aware counterpart of `qhchk_decls`.")]
+pub fn qhchk_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String, df: DiagFiles) : Int / Console + File = match segs {
+  [] -> qhchk_decls(decls, ms_table(scopes, "", global), df)
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    let here = qhchk_decls(seg_take(decls, n), ms_table(scopes, home, global), df)
+    here + qhchk_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, df)
+  }
+}
+
+# `Bool` distinguishes "no such module" from "module lacks the name",
+# which the two diagnostics word differently.
+type QhRes = QhOk(String) | QhBad(String, String, Bool, [String])
+
+fn qh_resolve(name: String, mt: [ModuleEntry]) : QhRes = match split_dotted_qualifier(name) {
+  None -> QhOk(name)
+  Some(QSplit(mod, bare)) -> match mt_lookup(mt, mod) {
+    None -> QhBad(mod, bare, false, [])
+    Some(me) ->
+      if me_has_export(me, bare) { QhOk(bare) }
+      else { QhBad(mod, bare, true, me_exports(me)) }
+  }
+}
+
+fn me_exports(me: ModuleEntry) : [String] = match me { ME(_, exs, _, _) -> exs }
+
+fn qh_name(name: String, mt: [ModuleEntry]) : String = match qh_resolve(name, mt) {
+  QhOk(bare) -> bare
+  QhBad(_, bare, _, _) -> bare
+}
+
+fn qh_report(name: String, kind: String, mt: [ModuleEntry], file: String,
+             line: Int, col: Int) : Int / Console + File = match qh_resolve(name, mt) {
+  QhOk(_) -> 0
+  QhBad(mod, bare, known, exports) -> {
+    if known {
+      diag_error(file, line, col,
+        concat_all(["module '", mod, "' does not export ", kind, " '", bare,
+                    "'; available exports: ", qh_join(exports)]))
+    } else {
+      diag_error(file, line, col,
+        concat_all(["unknown module qualifier '", mod, "' in qualified ", kind,
+                    " '", mod, ".", bare, "'"]))
+    }
+    1
+  }
+}
+
+fn qh_join(xs: [String]) : String = match xs {
+  [] -> "(none)"
+  [x] -> x
+  [x, ...rest] -> concat_all([x, ", ", qh_join(rest)])
+}
+
+fn qh_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
+  DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, name, tps, ps, ret, row, qh_expr(body, mt), l, c, mo)
+  DImpl(pname, pargs, target, methods, l, c, itps) ->
+    DImpl(qh_name(pname, mt), pargs, target, qh_sub_decls(methods, mt), l, c, itps)
+  DTest(desc, body, l, c, mo) -> DTest(desc, qh_expr(body, mt), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, qh_expr(body, mt), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, qh_expr(body, mt), l, c, mo)
+  DDerive(protos, inner, l, c) -> DDerive(protos, qh_decl(inner, mt), l, c)
+  _ -> d
+}
+
+fn qh_sub_decls(ds: [Decl], mt: [ModuleEntry]) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [qh_decl(d, mt), ...qh_sub_decls(rest, mt)]
+}
+
+fn qh_expr(e: Expr, mt: [ModuleEntry]) : Expr = match e.kind {
+  EHandle(body, eff, tyargs, init, alias, clauses, ret) -> {
+    let head = EHandle(body, qh_name(eff, mt), tyargs, init, alias, clauses, ret)
+    Expr { kind: prc_map_expr_kind(head, (x) => qh_expr(x, mt)),
+           line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+  }
+  _ -> Expr { kind: prc_map_expr_kind(e.kind, (x) => qh_expr(x, mt)),
+              line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn qhchk_decl(d: Decl, mt: [ModuleEntry], file: String) : Int / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> qhchk_expr(body, mt, file)
+  DImpl(pname, _, _, methods, l, c, _) -> {
+    let here = qh_report(pname, "protocol", mt, file, l, c)
+    here + qhchk_sub_decls(methods, mt, file)
+  }
+  DTest(_, body, _, _, _) -> qhchk_expr(body, mt, file)
+  DBench(_, body, _, _, _) -> qhchk_expr(body, mt, file)
+  DCheck(_, _, body, _, _, _) -> qhchk_expr(body, mt, file)
+  DDerive(_, inner, _, _) -> qhchk_decl(inner, mt, file)
+  _ -> 0
+}
+
+fn qhchk_sub_decls(ds: [Decl], mt: [ModuleEntry], file: String) : Int / Console + File = match ds {
+  [] -> 0
+  [d, ...rest] -> {
+    let here = qhchk_decl(d, mt, file)
+    here + qhchk_sub_decls(rest, mt, file)
+  }
+}
+
+fn qhchk_expr(e: Expr, mt: [ModuleEntry], file: String) : Int / Console + File = match e.kind {
+  EHandle(_, eff, _, _, _, _, _) -> {
+    let here = qh_report(eff, "effect", mt, file, e.line, e.col)
+    here + qhchk_positions(xp_positions(e), mt, file)
+  }
+  _ -> qhchk_positions(xp_positions(e), mt, file)
+}
+
+fn qhchk_positions(ps: [XPos], mt: [ModuleEntry], file: String) : Int / Console + File = match ps {
+  [] -> 0
+  [XP(_, child), ...rest] -> {
+    let here = qhchk_expr(child, mt, file)
+    here + qhchk_positions(rest, mt, file)
+  }
+}
