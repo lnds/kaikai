@@ -5937,15 +5937,19 @@ fn fv_stmts(ss: [Stmt], own: [String], globals: [String], acc: [String]) : [Stri
   r.acc
 }
 
-fn handle_captures_at(cls: [ClauseInfo], hline: Int, hcol: Int) : [String] {
+# A handle is identified by `(enc_fn, line, col)`, never by position
+# alone: two modules share a position, and so do two specialisations of
+# one generic fn. Keying this union on position alone merged unrelated
+# handles' captures into one env struct.
+fn handle_captures_at(cls: [ClauseInfo], enc: String, hline: Int, hcol: Int) : [String] {
   match cls {
     [] -> []
     [c, ...rest] -> match c {
-      CI(line, col, _, _, _, _, _, _, caps) ->
-        if line == hline and col == hcol {
-          merge_string_set(caps, handle_captures_at(rest, hline, hcol))
+      CI(line, col, _, _, _, _, _, enc_fn, caps) ->
+        if line == hline and col == hcol and enc_fn == enc {
+          merge_string_set(caps, handle_captures_at(rest, enc, hline, hcol))
         } else {
-          handle_captures_at(rest, hline, hcol)
+          handle_captures_at(rest, enc, hline, hcol)
         }
     }
   }
@@ -5982,32 +5986,9 @@ fn merge_string_set(a: [String], b: [String]) : [String] {
 # (enc_fn, line, col) triple as the clause-fn names; both ends mint
 # matching identifiers off the matching `ClauseInfo` so the cast in
 # the clause prologue resolves to the same type the install site
-# allocated. `enc_fn` is the post-monomorph fn / lambda symbol.
+# allocated.
 fn handle_env_struct_name(enc_fn: String, line: Int, col: Int) : String =
-  concat_all([
-    "_kaiu_", enc_fn, "__env_",
-    int_to_string(line), "_", int_to_string(col)
-  ])
-
-# Lookup the enc_fn stamped on any clause of this handle (all clauses
-# of one handle share the same enc_fn). Returns "" when no matching
-# clause is in the table — the same defensive fallback used by
-# `lookup_clause_enc_fn`.
-
-# Lookup the enc_fn stamped on any clause of this handle (all clauses
-# of one handle share the same enc_fn). Returns "" when no matching
-# clause is in the table — the same defensive fallback used by
-# `lookup_clause_enc_fn`.
-fn handle_enc_fn_at(cls: [ClauseInfo], hline: Int, hcol: Int) : String {
-  match cls {
-    [] -> ""
-    [c, ...rest] -> match c {
-      CI(line, col, _, _, _, _, _, enc_fn, _) ->
-        if line == hline and col == hcol { enc_fn }
-        else { handle_enc_fn_at(rest, hline, hcol) }
-    }
-  }
-}
+  handler_scoped_sym("env", enc_fn, line, col)
 
 fn collect_op_to_eff(decls: [Decl]) : [OpToEff] {
   match decls {
@@ -6186,7 +6167,7 @@ fn emit_clause_sig(c: ClauseInfo, effs: [Decl]) : String {
         _  -> cat2(", ", join_with(map(op_args, (pm) => cat2("KaiValue *", c_local(pm.pname))), ", "))
       }
       concat_all([
-        "static KaiValue *", clause_fn_name(enc_fn, line, col, op_name),
+        "static KaiValue *", user_clause_sym(enc_fn, line, col, op_name),
         "(", ev_name(eff, eff_mo(effs, eff)), " *self", arg_str, ", KaiCont *k)"
       ])
     }
@@ -6235,7 +6216,7 @@ fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
         if list_has(seen, key) {
           emit_handle_env_typedefs_loop(rest, seen)
         } else {
-          let caps = handle_captures_at(cs, line, col)
+          let caps = handle_captures_at(cs, enc_fn, line, col)
           let decl = match caps {
             [] -> ""
             _ -> emit_handle_env_typedef(key, caps)
@@ -6282,19 +6263,11 @@ fn clause_state_prologue(stateful: Bool, caps: [String]) : String =
   concat_all(map(live_state_aliases(stateful, caps),
                  (nm) => "    KaiValue *#{c_local(nm)} = self->state;\n"))
 
-# Stable C symbol for a handler's `finally` thunk. Same
-# (enc_fn, line, col) triple the clause-fn and env-struct names use.
-fn handle_cleanup_sym(enc_fn: String, line: Int, col: Int) : String =
-  concat_all([
-    "_kaiu_", enc_fn, "__finally_",
-    int_to_string(line), "_", int_to_string(col)
-  ])
-
 # Signature of the `finally` thunk. Emitted `static`; modular linkage
 # strips the keyword from definition and prototype alike. Returns the
 # block's value, which the runtime drops.
 fn emit_cleanup_sig(enc_fn: String, line: Int, col: Int) : String =
-  concat_all(["static KaiValue *", handle_cleanup_sym(enc_fn, line, col), "(void *_self)"])
+  concat_all(["static KaiValue *", user_cleanup_sym(enc_fn, line, col), "(void *_self)"])
 
 # `finally` compiles to a `void(void *)` thunk instead of an op clause:
 # it takes no args, resumes nothing, and returns nothing. The `void *`
@@ -6315,7 +6288,7 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
         emit_cleanup_sig(enc_fn, line, col), " {\n",
         self_bind,
         clause_state_prologue(stateful, caps),
-        emit_clause_env_prologue(cx.cls, line, col, enc_fn, caps),
+        emit_clause_env_prologue(enc_fn, line, col, caps),
         "    return ", body_c, ";\n",
         "}\n\n"
       ])
@@ -6343,7 +6316,7 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
       let stateful_locals = live_state_aliases(stateful, caps)
       let body_lcs = list_append(list_append(list_append(cx.lcs, ["self", "k"]), stateful_locals), caps)
       let body_c = emit_expr_in_clause(src, body, emit_ctx_with_lcs(cx, body_lcs), stateful)
-      let env_prologue = emit_clause_env_prologue(cx.cls, line, col, enc_fn, caps)
+      let env_prologue = emit_clause_env_prologue(enc_fn, line, col, caps)
       concat_all([
         emit_clause_sig(c, cx.effs), " {\n",
         "    (void) self; (void) k;\n",
@@ -6397,8 +6370,8 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
 # dangling pointer (the manifestation of "Perceus needs to incref
 # captures at install / decref at pop" — solved here at clause
 # entry, where it composes with perceus's per-clause analysis).
-fn emit_clause_env_prologue(cls: [ClauseInfo], line: Int, col: Int,
-                             enc_fn: String, caps: [String]) : String {
+fn emit_clause_env_prologue(enc_fn: String, line: Int, col: Int,
+                             caps: [String]) : String {
   match caps {
     [] -> ""
     _ -> {
@@ -8060,15 +8033,19 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
                cx: EmitCtx) : String / Console {
 
   let body_c = emit_expr(src, body, cx)
-  let assigns = emit_clause_assignments(eff_name, clauses, hline, hcol, cx.cls)
+  # The install site's own enclosing fn IS the handle's enc_fn — the
+  # collector stamped `cur_enc_fn` on every clause it recorded here — so
+  # the clause symbols resolve without a position lookup that would match
+  # a homonymous handle in another module.
+  let enc = cx.cur_enc_fn
+  let assigns = emit_clause_assignments(eff_name, clauses, enc, hline, hcol)
   # R9: gather every name any clause body of this handle captures
   # from the surrounding scope. Filtered against `lcs` so a name that
   # is *not* in scope at the install site (e.g. a top-level fn that
   # `fv_expr` already excluded via `globals` — defensive) does not
   # produce an undefined assign.
-  let env_caps = list_filter_in(handle_captures_at(cx.cls, hline, hcol), cx.lcs)
-  let env_enc_fn = handle_enc_fn_at(cx.cls, hline, hcol)
-  let env_alloc = emit_handle_env_alloc(env_caps, env_enc_fn, hline, hcol)
+  let env_caps = list_filter_in(handle_captures_at(cx.cls, enc, hline, hcol), cx.lcs)
+  let env_alloc = emit_handle_env_alloc(env_caps, enc, hline, hcol)
   let env_assign = emit_handle_env_ev_assign(env_caps)
   # An `as`-bound capability is exposed two ways inside the handle prologue:
   # `kaiv_alias_<a>_id` (the `_ev.handler_id`) backs the by-id dispatch a
@@ -8130,8 +8107,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
   # `cleanup_done` makes the pair idempotent when both fire.
   let fin_c = match find_hclause(clauses, "finally") {
     Some(_) -> {
-      # Keyed on the HANDLE's position, like every other clause symbol.
-      let thunk = handle_cleanup_sym(handle_enc_fn_at(cx.cls, hline, hcol), hline, hcol)
+      let thunk = user_cleanup_sym(enc, hline, hcol)
       Cleanup {
         arm: concat_all(["kai_evidence_set_cleanup(&_node, &", thunk, ", (void *) &_ev); "]),
         run: concat_all(["kai_evidence_run_cleanup(&_node); "])
@@ -8250,24 +8226,12 @@ fn emit_handle_env_ev_assign(caps: [String]) : String {
   }
 }
 
-# m4c #4: install code mints `_ev.<op> = &<clause_sym>;` where
-# `<clause_sym>` must match the C function emitted for the clause
-# body. Both ends now mint via `clause_fn_name(enc_fn, ...)`. The
-# enc_fn lives in the matching `ClauseInfo` (stamped at collect time
-# — see `lc_record_clauses`); we look it up by (hline, hcol, op_name).
-# The lookup returns "" when the matching CI is missing, which is a
-# defensive fallback — collect always records one CI per HClause.
-
-# m4c #4: install code mints `_ev.<op> = &<clause_sym>;` where
-# `<clause_sym>` must match the C function emitted for the clause
-# body. Both ends now mint via `clause_fn_name(enc_fn, ...)`. The
-# enc_fn lives in the matching `ClauseInfo` (stamped at collect time
-# — see `lc_record_clauses`); we look it up by (hline, hcol, op_name).
-# The lookup returns "" when the matching CI is missing, which is a
-# defensive fallback — collect always records one CI per HClause.
+# Install code mints `_ev.<op> = &<clause_sym>;`, which must name the C
+# function emitted for the clause body. Both ends mint via
+# `user_clause_sym(enc, ...)` off the SAME enclosing fn: the collector
+# stamps it on each `ClauseInfo`, and the install site passes its own.
 fn emit_clause_assignments(eff_name: String, cs: [HClause],
-                           hline: Int, hcol: Int,
-                           cls: [ClauseInfo]) : String {
+                           enc: String, hline: Int, hcol: Int) : String {
   match cs {
     [] -> ""
     [c, ...rest] -> match c {
@@ -8275,15 +8239,12 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
         # `finally` is not an op: it has no `Ev` slot and is wired to the
         # evidence node instead.
         if is_lifecycle_clause(op_name, cps) {
-          emit_clause_assignments(eff_name, rest, hline, hcol, cls)
+          emit_clause_assignments(eff_name, rest, enc, hline, hcol)
         } else {
-        {
-          let enc_fn = lookup_clause_enc_fn(cls, hline, hcol, op_name)
           concat_all([
-            "_ev.", op_name, " = &", clause_fn_name(enc_fn, hline, hcol, op_name), "; ",
-            emit_clause_assignments(eff_name, rest, hline, hcol, cls)
+            "_ev.", op_name, " = &", user_clause_sym(enc, hline, hcol, op_name), "; ",
+            emit_clause_assignments(eff_name, rest, enc, hline, hcol)
           ])
-        }
         }
     }
   }
@@ -9610,8 +9571,7 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, const_
 #      when test_mode is on) ----
 
 fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
-                cx: EmitCtx,
-                target_origin: Option[String], test_line: Int, test_col: Int) : String / Console {
+                cx: EmitCtx, target_origin: Option[String], test_enc: String) : String / Console {
 
   # desc_span is the raw source of the description including its quotes,
   # so it's already a valid C string literal. We wrap the body in
@@ -9623,10 +9583,9 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
   # rather than a sibling core's clashing export. Mirrors the rotate
   # `emit_fn_body` already does for DFn bodies.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  # enc_fn matches the `__test__<line>_<col>` key the collector stamped
-  # on this test's lambdas, so `find_lam` resolves them (a test body's
-  # lambda otherwise looked up under the wrong enc_fn → "non-callable").
-  let test_enc = concat_all(["__test__", int_to_string(test_line), "_", int_to_string(test_col)])
+  # `test_enc` is the runner symbol the collector stamped on this test's
+  # lambdas, so `find_lam` resolves them (a test body's lambda otherwise
+  # looked up under the wrong enc_fn → "non-callable").
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
@@ -9654,7 +9613,8 @@ fn emit_one_test(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DTest(desc_span, body, tl, tc, _) -> emit_test_fn(src, id, desc_span, body, cx, target_origin, tl, tc)
+      DTest(desc_span, body, tl, tc, mo) ->
+        emit_test_fn(src, id, desc_span, body, cx, target_origin, runner_enc_fn("test", mo, tl, tc))
       _ -> ""
     }
   }
@@ -9709,14 +9669,10 @@ fn test_call_list(n: Int, i: Int) : String {
 # panic the process, since timing aborted code is meaningless.
 
 fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
-                 cx: EmitCtx,
-                 target_origin: Option[String], bench_line: Int, bench_col: Int) : String / Console {
+                 cx: EmitCtx, target_origin: Option[String], bench_enc: String) : String / Console {
 
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  # enc_fn matches the collector's `__bench__<line>_<col>` so lambdas
-  # inside a bench body resolve in `find_lam`.
-  let bench_enc = concat_all(["__bench__", int_to_string(bench_line), "_", int_to_string(bench_col)])
   let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
@@ -9753,7 +9709,8 @@ fn emit_one_bench(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DBench(desc_span, body, bl, bc, _) -> emit_bench_fn(src, id, desc_span, body, cx, target_origin, bl, bc)
+      DBench(desc_span, body, bl, bc, mo) ->
+        emit_bench_fn(src, id, desc_span, body, cx, target_origin, runner_enc_fn("bench", mo, bl, bc))
       _ -> ""
     }
   }
@@ -10060,15 +10017,11 @@ fn emit_check_param_inits_assign(params: [Param]) : String {
 }
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
-                 cx: EmitCtx,
-                 target_origin: Option[String], check_line: Int, check_col: Int) : String / Console {
+                 cx: EmitCtx, target_origin: Option[String], check_enc: String) : String / Console {
 
   let lcs2 = list_append(check_param_names(params), cx.lcs)
   # Issue #335: same file-local rotate as emit_test_fn.
   let body_fns = fns_prefer_module(cx.fns, target_origin)
-  # enc_fn matches the collector's `__check__<line>_<col>` so lambdas
-  # inside a check body resolve in `find_lam`.
-  let check_enc = concat_all(["__check__", int_to_string(check_line), "_", int_to_string(check_col)])
   let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, enums: cx.enums, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend }
   let body_c = emit_expr(src, body, body_cx)
@@ -10125,7 +10078,8 @@ fn emit_one_check(src: String, cx: EmitCtx,
 
   match id_d {
     DWI(id, d) -> match d {
-      DCheck(desc_span, ps, body, cl, cc, _) -> emit_check_fn(src, id, desc_span, ps, body, cx, target_origin, cl, cc)
+      DCheck(desc_span, ps, body, cl, cc, mo) ->
+        emit_check_fn(src, id, desc_span, ps, body, cx, target_origin, runner_enc_fn("check", mo, cl, cc))
       _ -> ""
     }
   }

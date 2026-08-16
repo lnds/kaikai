@@ -22,9 +22,11 @@ CORPUS="$ROOT/examples/namespace-collisions"
 BACKEND="${1:-c}"
 
 if [ "$BACKEND" = "native" ]; then
-  RUN() { ( cd "$1" && KAI_BACKEND=native kai run main.kai 2>"$2" ); }
+  RUN() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" run main.kai 2>"$2" ); }
+  RUN_TEST() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" test main.kai 2>"$2" ); }
 else
   RUN() { ( cd "$1" && "$ROOT/bin/kai" run main.kai --backend=c 2>"$2" ); }
+  RUN_TEST() { ( cd "$1" && "$ROOT/bin/kai" test main.kai --backend=c 2>"$2" ); }
 fi
 
 err="$(mktemp)"
@@ -36,9 +38,18 @@ trap 'rm -f "$err"' EXIT
 # The target is what counts here, so `.out` wins when both are present —
 # such a fixture reads as failing until the defect is actually fixed,
 # which is the point.
+#
+# `main.test.expected` names a fixture whose defect only shows under
+# `kai test` — a collision between two blocks that are not reachable from
+# `main` at all. It is matched as a substring of the run's tail, so the
+# per-test lines above the summary do not have to be spelled out.
 fixture_passes() {
   d="$CORPUS/$1"
-  if [ -f "$d/main.out.expected" ]; then
+  if [ -f "$d/main.test.expected" ]; then
+    # `kai test` reports on stderr.
+    RUN_TEST "$d" "$err" > /dev/null 2>&1 || true
+    grep -qF "$(cat "$d/main.test.expected")" "$err"
+  elif [ -f "$d/main.out.expected" ]; then
     [ "$(RUN "$d" /dev/null)" = "$(cat "$d/main.out.expected")" ]
   elif [ -f "$d/main.err.expected" ]; then
     RUN "$d" "$err" > /dev/null 2>&1 || true

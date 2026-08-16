@@ -204,6 +204,17 @@ pub fn c_sym(name: String, mo: Option[String]) : String = match mo {
   Some(m) -> string_concat(m, string_concat("__", name))
 }
 
+# A `test` / `bench` / `check` block has no name to derive a symbol from,
+# so its runner is keyed on the declaring module plus its source position:
+# position alone collides across modules, and the collision silently fuses
+# two blocks' lifted lambdas into one. The symbol doubles as the enclosing
+# fn of everything lifted out of the block's body (lambdas, clauses), so
+# the collector and both backends must mint it here rather than each
+# rebuilding the string.
+#[doc("The runner symbol for a `test`/`bench`/`check` block, keyed on its module and source position.")]
+pub fn runner_enc_fn(kind: String, mo: Option[String], line: Int, col: Int) : String =
+  concat_all(["__", kind, "__", c_sym(concat_all([int_to_string(line), "_", int_to_string(col)]), mo)])
+
 # A user fn's own C symbol lives in the `kaiu_` namespace so it can be
 # named after any runtime helper without redeclaring it. `c_sym` stays the
 # unprefixed key every internal table is keyed by (purity, reuse-donation,
@@ -236,21 +247,32 @@ pub fn c_user_entry_label(csym: String) : String =
 pub fn user_boxed_adapter_sym(csym: String) : String =
   string_concat("_kaiu_", string_concat(csym, "__boxed"))
 
-# Handler-scoped symbols key on the handle's source position and, for a
-# clause, the op name — a user identifier. The native backend emits KIR
-# syms verbatim as LLVM symbols, so these three mint into `_kaiu_`; the
-# C backend reaches the same namespace through `clause_fn_name`.
-#[doc("The install-site symbol for a handler at a source position.")]
-pub fn user_handler_sym(line: Int, col: Int) : String =
-  concat_all(["_kaiu_handler_", int_to_string(line), "_", int_to_string(col)])
+# Handler-scoped symbols key on the ENCLOSING FN plus the handle's source
+# position and, for a clause, the op name. The enclosing fn is part of the
+# key, not decoration: a source position is not an identity — two modules
+# both have a line 2 column 1, and two monomorph specialisations of one
+# source fn share a position exactly — so a position-only symbol collides
+# and the linker silently keeps one definition. `enc_fn` is the
+# post-monomorph, module-mangled symbol of the containing fn / lambda /
+# test, which discriminates both shapes at once. Every site minting one of
+# these — install, clause body, cleanup, env struct, on either backend —
+# feeds the SAME `enc_fn`, read from `ClauseInfo.enc_fn` or `LowerSt.enc_fn`.
+#[doc("The `_kaiu_<enc_fn>__<what>_<L>_<C>` symbol shared by every handler-scoped emission.")]
+pub fn handler_scoped_sym(what: String, enc_fn: String, line: Int, col: Int) : String =
+  concat_all(["_kaiu_", enc_fn, "__", what, "_",
+              int_to_string(line), "_", int_to_string(col)])
 
-#[doc("The clause-thunk symbol for a handler op clause at a source position.")]
-pub fn user_clause_sym(line: Int, col: Int, op: String) : String =
-  concat_all(["_kaiu_clause_", int_to_string(line), "_", int_to_string(col), "_", op])
+#[doc("The install-site symbol for a handler in `enc_fn` at a source position.")]
+pub fn user_handler_sym(enc_fn: String, line: Int, col: Int) : String =
+  handler_scoped_sym("handler", enc_fn, line, col)
 
-#[doc("The cleanup-thunk symbol for a handler's `finally { }`, keyed on the handle's position.")]
-pub fn user_cleanup_sym(line: Int, col: Int) : String =
-  concat_all(["_kaiu_finally_", int_to_string(line), "_", int_to_string(col)])
+#[doc("The clause-thunk symbol for a handler op clause in `enc_fn` at a source position.")]
+pub fn user_clause_sym(enc_fn: String, line: Int, col: Int, op: String) : String =
+  concat_all([handler_scoped_sym("clause", enc_fn, line, col), "_", op])
+
+#[doc("The cleanup-thunk symbol for a handler's `finally { }` in `enc_fn`, keyed on the handle's position.")]
+pub fn user_cleanup_sym(enc_fn: String, line: Int, col: Int) : String =
+  handler_scoped_sym("finally", enc_fn, line, col)
 
 # A user-derived local binder (fn/lambda/clause param, `let`/`var`,
 # match binder, closure capture, handler alias or state name) gets its
@@ -1736,6 +1758,17 @@ pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
                 clauses: st.clauses, globals: st.globals,
                 cur_enc_fn: name, local_scope: st.local_scope }
 
+# Walk a test / bench / check body under its runner symbol, restoring the
+# surrounding enclosing fn and lexical scope on the way out.
+fn collect_runner_body(body: Expr, locals: [String], enc: String,
+                       st: LamCollect) : LamCollect / Console {
+  let outer = st.cur_enc_fn
+  let outer_locals = st.local_scope
+  let st1 = enter_enc_fn(lc_set_locals(st, locals), enc)
+  let st2 = collect_expr(body, st1)
+  lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+}
+
 #[doc("AST collector walking decl.")]
 pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
 
@@ -1753,41 +1786,15 @@ pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
       lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
     }
     DType(_, _, _, _, _, _, _, _) -> st
-    DTest(_, body, line, col, _) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      # m4c #4: the synthesised name has to match the prefix
-      # `emit_test_fn` will use so install code emitted inside a test
-      # body's `EHandle` and the corresponding clause's top-level C
-      # function agree on a single C symbol.
-      let test_enc = concat_all([
-        "__test__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = enter_enc_fn(lc_set_locals(st, []), test_enc)
-      let st2 = collect_expr(body, st1)
-      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
-    }
-    DBench(_, body, line, col, _) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      let bench_enc = concat_all([
-        "__bench__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = enter_enc_fn(lc_set_locals(st, []), bench_enc)
-      let st2 = collect_expr(body, st1)
-      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
-    }
-    DCheck(_, ps, body, line, col, _) -> {
-      let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      let check_enc = concat_all([
-        "__check__", int_to_string(line), "_", int_to_string(col)
-      ])
-      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
-                              check_enc)
-      let st2 = collect_expr(body, st1)
-      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
-    }
+    # The runner symbol the backends will emit is also the enclosing-fn
+    # key for everything lifted out of the block's body, so the collector
+    # mints it from the same `runner_enc_fn` both backends call.
+    DTest(_, body, line, col, mo) ->
+      collect_runner_body(body, [], runner_enc_fn("test", mo, line, col), st)
+    DBench(_, body, line, col, mo) ->
+      collect_runner_body(body, [], runner_enc_fn("bench", mo, line, col), st)
+    DCheck(_, ps, body, line, col, mo) ->
+      collect_runner_body(body, params_to_names(ps), runner_enc_fn("check", mo, line, col), st)
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
@@ -1917,19 +1924,6 @@ pub fn op_args_only(params: [Param]) : [Param] {
   }
 }
 
-# The enclosing fn name is part of the key, not decoration: two
-# specialisations of one source fn (`foo__mono__Int` vs `foo__mono__String`)
-# hold clauses at the SAME source position, so a position-only symbol makes
-# them collide and the link fails. The install site
-# (`emit_clause_assignments`) and the clause-body emit site must mint it
-# identically, both fed from `ClauseInfo.enc_fn`.
-#[doc("The C symbol for a handler op clause, keyed on the enclosing fn, the source position, and the op name.")]
-pub fn clause_fn_name(enc_fn: String, line: Int, col: Int, op: String) : String =
-  concat_all([
-    "_kaiu_", enc_fn, "__clause_",
-    int_to_string(line), "_", int_to_string(col), "_", op
-  ])
-
 #[doc("The success-side variant constructor a postfix-! expression unwraps.")]
 pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
   match opt_ty {
@@ -1954,24 +1948,6 @@ pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
 # `_ev.state` after the handler-id and op-fn-ptr assignments. The
 # clause body emitter exposes that slot inside clauses as `state` /
 # `log` aliases of `self->state`.
-
-# m4c #4: locate the enclosing fn name stamped on a clause at collect
-# time. Keyed on the install triple (line, col, op_name). Defensive
-# fallback to "" when nothing matches — collect should always record
-# a CI per HClause, but if a clause sneaks through pre-collect rewrites
-# the fallback emits the unprefixed legacy name (which is what the
-# corresponding clause-body would also emit, so the link still works).
-#[doc("c #4: locate the enclosing fn name stamped on a clause at collect time. Keyed on the install triple (line, col, op_name). Defensive fallback to '' when nothing matches —…")]
-pub fn lookup_clause_enc_fn(cs: [ClauseInfo], hline: Int, hcol: Int, op_name: String) : String {
-  match cs {
-    [] -> ""
-    [c, ...rest] -> match c {
-      CI(line, col, _, op, _, _, _, enc_fn, _) ->
-        if line == hline and col == hcol and op == op_name { enc_fn }
-        else { lookup_clause_enc_fn(rest, hline, hcol, op_name) }
-    }
-  }
-}
 
 # Issue #403: cheap structural test for `ECall(EVar("__perceus_drop"), _)`.
 # `__perceus_drop` lowers to `kai_internal_drop`, which decrefs and returns
