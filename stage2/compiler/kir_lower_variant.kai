@@ -104,7 +104,7 @@ fn any_field_discriminating(fields: [PField]) : Bool = match fields {
 # (`KProj`) instead of named fields is the only difference from `rec_emit_tests`.
 pub fn var_emit_subtests(p: Pattern, scrv: KVal, body_lbl: String,
                          fail_lbl: String, st: LowerSt) : LowerSt / Console = match p.pkind {
-  PVariant(_, cn, subs) -> reopen(var_emit_slot_tests(cn, subs, scrv, 0, body_lbl, fail_lbl, st), body_lbl)
+  PVariant(hm, cn, subs) -> reopen(var_emit_slot_tests(kcr_of_pat(hm, cn), subs, scrv, 0, body_lbl, fail_lbl, st), body_lbl)
   PAs(_, inner)     -> var_emit_subtests(inner, scrv, body_lbl, fail_lbl, st)
   _                 -> reopen(ls_seal(st, KBr(body_lbl, KNoPos), body_lbl), body_lbl)
 }
@@ -117,14 +117,14 @@ pub fn var_emit_subtests(p: Pattern, scrv: KVal, body_lbl: String,
 # discriminating arm, so at least one test was emitted before). `cn` is the
 # enclosing (already tag-matched) ctor, so each slot test reads its slot at
 # the ctor's static kind instead of the mask-consulting generic projection.
-pub fn var_emit_slot_tests(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body_lbl: String,
+pub fn var_emit_slot_tests(c: KCtorRef, subs: [Pattern], scrv: KVal, idx: Int, body_lbl: String,
                        fail_lbl: String, st: LowerSt) : LowerSt / Console = match subs {
   [] -> ls_seal(st, KBr(body_lbl, KNoPos), body_lbl)
   [sp, ...rest] ->
     if psub_is_discriminating(sp) {
-      var_emit_one_test(cn, sp, scrv, idx, rest, body_lbl, fail_lbl, st)
+      var_emit_one_test(c, sp, scrv, idx, rest, body_lbl, fail_lbl, st)
     } else {
-      var_emit_slot_tests(cn, rest, scrv, idx + 1, body_lbl, fail_lbl, st)
+      var_emit_slot_tests(c, rest, scrv, idx + 1, body_lbl, fail_lbl, st)
     }
 }
 
@@ -133,14 +133,14 @@ pub fn var_emit_slot_tests(cn: String, subs: [Pattern], scrv: KVal, idx: Int, bo
 # success path is `body_lbl` directly. The slot value is read at its static
 # kind (`bind_slot_op`: a kind-0 pointer slot is a direct `.ptr` borrow), so
 # a failing test leaks no ref; the immortal Bool result needs no drop.
-fn var_emit_one_test(cn: String, sp: Pattern, scrv: KVal, idx: Int, rest: [Pattern], body_lbl: String,
+fn var_emit_one_test(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, rest: [Pattern], body_lbl: String,
                      fail_lbl: String, st: LowerSt) : LowerSt / Console =
   if any_discriminating(rest) {
     match ls_fresh_label(st) { LSLabel(cont, st1) -> {
-      let st2 = var_seal_test(cn, sp, scrv, idx, cont, fail_lbl, st1)
-      var_emit_slot_tests(cn, rest, scrv, idx + 1, body_lbl, fail_lbl, reopen(st2, cont))
+      let st2 = var_seal_test(c, sp, scrv, idx, cont, fail_lbl, st1)
+      var_emit_slot_tests(c, rest, scrv, idx + 1, body_lbl, fail_lbl, reopen(st2, cont))
     } }
-  } else { var_seal_test(cn, sp, scrv, idx, body_lbl, fail_lbl, st) }
+  } else { var_seal_test(c, sp, scrv, idx, body_lbl, fail_lbl, st) }
 
 # `condbr <test> ? ok_lbl : fail_lbl` for slot `idx`'s sub-pattern. A
 # LITERAL slot reads the slot and compares with the non-consuming
@@ -151,11 +151,11 @@ fn var_emit_one_test(cn: String, sp: Pattern, scrv: KVal, idx: Int, rest: [Patte
 # the payload's own discriminating sub-slots (the nested-variant-test path,
 # mirror of the oracle's recursive `emit_pat_test`). An as-pattern tests its
 # inner sub-pattern.
-fn var_seal_test(cn: String, sp: Pattern, scrv: KVal, idx: Int, ok_lbl: String,
+fn var_seal_test(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, ok_lbl: String,
                  fail_lbl: String, st: LowerSt) : LowerSt / Console = match sp.pkind {
-  PLit(lit)           -> var_seal_eq(cn, idx, var_lit_atom(lit), scrv, ok_lbl, fail_lbl, sp, st)
-  PVariant(_, scn, subs) -> var_seal_variant(cn, idx, scn, subs, scrv, ok_lbl, fail_lbl, sp, st)
-  PAs(_, inner)       -> var_seal_test(cn, inner, scrv, idx, ok_lbl, fail_lbl, st)
+  PLit(lit)           -> var_seal_eq(c, idx, var_lit_atom(lit), scrv, ok_lbl, fail_lbl, sp, st)
+  PVariant(shm, scn, subs) -> var_seal_variant(c, idx, kcr_of_pat(shm, scn), subs, scrv, ok_lbl, fail_lbl, sp, st)
+  PAs(_, inner)       -> var_seal_test(c, inner, scrv, idx, ok_lbl, fail_lbl, st)
   # A list slot must be lowered by the walk's `emit_arm_subtests_and_binds`
   # (length test + binds interleaved via `lm_emit_cells`), which diverts the
   # whole arm BEFORE this per-slot path. Reaching here means a list slot the
@@ -183,15 +183,15 @@ fn var_seal_list_unsupported(sp: Pattern, ok_lbl: String, st: LowerSt) : LowerSt
 # the slot at its static kind (`bind_slot_op` — a pointer slot is a direct
 # `.ptr` borrow), then tests the projected value's tag and payload
 # (`var_seal_ctor_of`).
-fn var_seal_variant(cn: String, idx: Int, scn: String, subs: [Pattern], scrv: KVal, ok_lbl: String,
+fn var_seal_variant(c: KCtorRef, idx: Int, sc: KCtorRef, subs: [Pattern], scrv: KVal, ok_lbl: String,
                     fail_lbl: String, sp: Pattern, st: LowerSt) : LowerSt / Console =
-  if slot_kind_of(st, cn, idx) == 3 and nullary_pat_subs(subs) {
+  if slot_kind_of(st, c, idx) == 3 and nullary_pat_subs(subs) {
     match bind_op_slot(st, KProj(scrv, idx), SInt64, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
-      match bind_op_slot(st1, KPrim("i==", [sv, KIntV(ls_variant_tag(st1, scn))]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+      match bind_op_slot(st1, KPrim("i==", [sv, KIntV(kcr_variant_tag(st1, sc))]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
         ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
   } else {
-    match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
-      var_seal_ctor_of(scn, subs, sv, ok_lbl, fail_lbl, sp, st1) }
+    match bind_op(st, bind_slot_op(st, c, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+      var_seal_ctor_of(sc, subs, sv, ok_lbl, fail_lbl, sp, st1) }
   }
 
 # A nullary sub-ctor pattern (no payload sub-patterns) — the enum-slot
@@ -212,14 +212,14 @@ fn nullary_pat_subs(subs: [Pattern]) : Bool = match subs {
 # — the whole arm fails as a unit, exactly the oracle's `&&` conjunction.
 # Callers that test only the tag drop the payload's discriminants and match
 # every sibling ctor sharing the tag — the nested-nullary-in-cons-arm miscompile.
-pub fn var_seal_ctor_of(cn: String, subs: [Pattern], sv: KVal, ok_lbl: String,
+pub fn var_seal_ctor_of(c: KCtorRef, subs: [Pattern], sv: KVal, ok_lbl: String,
                         fail_lbl: String, sp: Pattern, st: LowerSt) : LowerSt / Console =
   if any_discriminating(subs) {
     match ls_fresh_label(st) { LSLabel(sub_lbl, st1) -> {
-      let st2 = var_seal_tag_of(sv, cn, sub_lbl, fail_lbl, sp, st1)
-      var_emit_slot_tests(cn, subs, sv, 0, ok_lbl, fail_lbl, reopen(st2, sub_lbl))
+      let st2 = var_seal_tag_of(sv, c, sub_lbl, fail_lbl, sp, st1)
+      var_emit_slot_tests(c, subs, sv, 0, ok_lbl, fail_lbl, reopen(st2, sub_lbl))
     } }
-  } else { var_seal_tag_of(sv, cn, ok_lbl, fail_lbl, sp, st) }
+  } else { var_seal_tag_of(sv, c, ok_lbl, fail_lbl, sp, st) }
 
 # A literal slot's test. A kind-1 Int slot reads its raw `.i64` word and
 # compares with an inline `i==` (one load + one icmp — no mask consult, no
@@ -228,15 +228,15 @@ pub fn var_seal_ctor_of(cn: String, subs: [Pattern], sv: KVal, ok_lbl: String,
 # non-consuming `kai_eq_raw` never releases (a leak per test). Every other
 # kind reads the slot at its static op and compares with the non-consuming
 # boxed `kai_eq_raw` (mirror of the literal/record paths).
-fn var_seal_eq(cn: String, idx: Int, lit: KVal, scrv: KVal, ok_lbl: String, fail_lbl: String,
+fn var_seal_eq(c: KCtorRef, idx: Int, lit: KVal, scrv: KVal, ok_lbl: String, fail_lbl: String,
                sp: Pattern, st: LowerSt) : LowerSt / Console = {
-  let k = slot_kind_of(st, cn, idx)
+  let k = slot_kind_of(st, c, idx)
   if k == 1 and var_lit_is_int(lit) {
     var_seal_raw_eq(idx, "i==", SInt64, lit, scrv, ok_lbl, fail_lbl, sp, st)
   } else if k == 2 and var_lit_is_real(lit) {
     var_seal_raw_eq(idx, "f==", SReal, lit, scrv, ok_lbl, fail_lbl, sp, st)
   } else {
-    match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+    match bind_op(st, bind_slot_op(st, c, idx, scrv), KAt(sp.line, sp.col)) { LRes(sv, st1) ->
       match bind_op(st1, KPrim("kai_eq_raw", [sv, lit]), KAt(sp.line, sp.col)) { LRes(cond, st2) ->
         ls_seal(st2, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) } }
   }
@@ -257,9 +257,14 @@ fn var_lit_is_real(lit: KVal) : Bool = match lit { KRealV(_) -> true _ -> false 
 # already-projected value `sv`. The ctor tag is materialised as a `KIntV`
 # the native prim reads as the i32 operand of the mixed
 # `kaix_tag_eq(ptr, i32) -> ptr` shim.
-pub fn var_seal_tag_of(sv: KVal, cname: String, ok_lbl: String, fail_lbl: String,
+#[doc("The variant tag of a `KCtorRef`, resolved through its declaring module.")]
+pub fn kcr_variant_tag(st: LowerSt, c: KCtorRef) : Int = match c {
+  KCR(home, cn) -> ls_variant_tag_in(st, home, cn)
+}
+
+pub fn var_seal_tag_of(sv: KVal, c: KCtorRef, ok_lbl: String, fail_lbl: String,
                        sp: Pattern, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, KPrim("kai_tag_eq", [sv, KIntV(ls_variant_tag(st, cname))]),
+  match bind_op(st, KPrim("kai_tag_eq", [sv, KIntV(kcr_variant_tag(st, c))]),
                 KAt(sp.line, sp.col)) { LRes(cond, st1) ->
     ls_seal(st1, KCondBr(cond, ok_lbl, fail_lbl, KAt(sp.line, sp.col)), fail_lbl) }
 
@@ -314,6 +319,6 @@ fn vls_scan(subs: [Pattern], idx: Int, found: Option[VListSlot]) : Option[VListS
 # variant pattern; its ctor name resolves the slot kind. The walk feeds
 # the result to `lm_emit_cells` as the list cursor.
 pub fn var_proj_slot(scrv: KVal, idx: Int, sp: Pattern, st: LowerSt) : LRes / Console = match sp.pkind {
-  PVariant(_, cn, _) -> bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col))
+  PVariant(hm, cn, _) -> bind_op(st, bind_slot_op(st, kcr_of_pat(hm, cn), idx, scrv), KAt(sp.line, sp.col))
   _               -> bind_op(st, KProj(scrv, idx), KAt(sp.line, sp.col))
 }

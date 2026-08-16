@@ -486,20 +486,10 @@ fn ctor_int_slots_of(tys: [TypeExpr]) : [Bool] =
 pub fn build_ctor_int_slots(decls: [Decl]) : [CtorIntSlots] = {
   let vs = register_variants(decls)
   map(vs, (ev) => match ev {
-    EV(n, _, tys, tag) ->
-      if tag < user_variant_tag_base() { CIS(n, map(tys, (_te) => false)) }
-      else { CIS(n, ctor_int_slots_of(tys)) }
+    EV(hm, n, _, tys, tag) ->
+      if tag < user_variant_tag_base() { CIS(hm, n, map(tys, (_te) => false)) }
+      else { CIS(hm, n, ctor_int_slots_of(tys)) }
   })
-}
-
-# Lookup: the kind-1 Int-slot flags for a ctor, or None if unregistered.
-pub fn ctor_int_slots_lookup(m: [CtorIntSlots], target: String) : Option[[Bool]] = {
-  match m {
-    [] -> None
-    [h, ...rest] -> match h {
-      CIS(n, flags) -> if n == target { Some(flags) } else { ctor_int_slots_lookup(rest, target) }
-    }
-  }
 }
 
 #[doc("An ambiguous EFn-resolution entry: the callee name plus the candidate module origins that conflict.")]
@@ -651,14 +641,36 @@ fn collect_reuse_ctors_decl(d: Decl, acc: [String]) : [String] = match d {
 # Pull the ctor name out of a `__perceus_reuse_variant`'s second arg,
 # which is `ECall(EVar(ctor) | EModCall(_, ctor), _)`. None for any
 # other shape.
-fn reuse_ctor_name(ctor: Expr) : Option[String] = match ctor.kind {
+fn reuse_ctor_name(ctor: Expr) : Option[String] = match reuse_ctor_home_name(ctor) {
+  Some(RCN(_, cname)) -> Some(cname)
+  None                -> None
+}
+
+# The rebuild's constructor with the module it names, so a reuse arm can
+# check that the pattern and the rebuild mean the SAME ctor. Reusing the
+# donor cell across two homonyms would write one module's layout into the
+# other's cell.
+type ReuseCtorName = RCN(Option[String], String)
+
+fn reuse_ctor_home_name(ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
   ECall(cf, _) -> match cf.kind {
-    EVar(cname)        -> Some(cname)
-    EModCall(_, cname) -> Some(cname)
-    _                  -> None
+    EVar(cname)          -> Some(RCN(None, cname))
+    EModCall(m, cname)   -> Some(RCN(Some(m), cname))
+    # `m` may name the type rather than the module; `reuse_same_ctor`
+    # treats a qualifier that matches no home as unqualified.
+    _                    -> None
   }
   _ -> None
 }
+
+# Two ctor references denote the same constructor when the names match and
+# the homes do not contradict — an unqualified reference names whatever
+# the pattern already pinned.
+fn reuse_same_ctor(phome: Option[String], pname: String, b: ReuseCtorName) : Bool =
+  match b {
+    RCN(bhome, bname) ->
+      bname == pname and (ctor_home_matches(bhome, phome) or ctor_home_matches(phome, bhome))
+  }
 
 fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
   # Detect the reuse-variant call shape at this node, then recurse via
@@ -1741,8 +1753,17 @@ fn emit_call_args_slots(src: String, args_e: [Expr], cx: EmitCtx) : String / Con
 fn arg_str_as_slot(arg_str: String) : String =
   string_concat("{.ptr = ", string_concat(arg_str, "}"))
 
-fn emit_variant_call(name: String, n_args: Int, slot_out: String, cx: EmitCtx) : String {
-  let tag_str = int_to_string(evar_find_tag(cx.variants, name))
+# The home a constructor QUALIFIER denotes, or None when it denotes no
+# module. `m.Ctor` names a module, and the pattern form carries the same
+# spelling, so both sides of a match agree. The typer also rewrites an
+# ambiguous bare ctor to `EModCall(<type>, Ctor)`; that names the type,
+# has no pattern counterpart, and so denotes no home.
+fn ctor_qual_home(cx: EmitCtx, qual: String, ctor: String) : Option[String] =
+  evar_qual_home(cx.variants, qual, ctor)
+
+fn emit_variant_call(home: Option[String], name: String, n_args: Int,
+                        slot_out: String, cx: EmitCtx) : String {
+  let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n_args))
   if n_args == 0 {
     concat_all(["kai_variant_u(", tag_str, ", \"", name, "\", 0, 0, NULL)"])
   } else {
@@ -2043,13 +2064,13 @@ fn emit_variant_slot_init_list(src: String, args_e: [Expr], tys: [TypeExpr],
 # at least one primitive payload slot, emit `kai_variant_u` with a
 # typed slot literal and a populated mask. Otherwise return None so
 # the caller falls back to the legacy `kai_variant` path.
-fn emit_variant_call_typed(name: String, args_e: [Expr], tys: [TypeExpr],
-                           src: String, cx: EmitCtx) : Option[String] / Console {
+fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
+                           tys: [TypeExpr], src: String, cx: EmitCtx) : Option[String] / Console {
   if variant_has_primitive_slot(tys, cx.enums) {
     let n = list_length(args_e)
     let mask = variant_slot_mask(tys, cx.enums)
     let slot_inits = emit_variant_slot_init_list(src, args_e, tys, cx)
-    let tag_str = int_to_string(evar_find_tag(cx.variants, name))
+    let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n))
     # Outside a region, a primitive-slot ctor goes through the inlined
     # `kai_variant_u_fast(tag, n, slots)`: alloc + slot stores only. Its
     # tag→name/mask is registered once at startup (kai_register_payload_
@@ -2812,8 +2833,8 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         # at least one primitive payload slot, emit the typed
         # `kai_variant_u` path. Falls back to the legacy boxed
         # `emit_named_call_lookup` shape otherwise.
-        match evar_payload_tys(cx.variants, callee) {
-          Some(tys) -> match emit_variant_call_typed(callee, args_e, tys, src, cx) {
+        match evar_payload_tys_arity(cx.variants, None, callee, list_length(args_e)) {
+          Some(tys) -> match emit_variant_call_typed(None, callee, args_e, tys, src, cx) {
             Some(s) -> s
             None    -> emit_named_call_lookup(src, callee, args_e, call_args, cx)
           }
@@ -2842,14 +2863,16 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
     # path uses elsewhere — otherwise nested unboxed sub-ctors and
     # the outer boxed ctor would disagree on slot layout and reads
     # like `slots[0].i64` would return garbage from a boxed pointer.
-    EModCall(mod, fname) -> match evar_find(cx.variants, fname) {
-      Some(_) -> match evar_payload_tys(cx.variants, fname) {
-        Some(tys) -> match emit_variant_call_typed(fname, args_e, tys, src, cx) {
+    EModCall(mod, fname) -> match evar_find_qual(cx.variants, mod, fname) {
+      Some(_) -> {
+        let chome = ctor_qual_home(cx, mod, fname)
+        match evar_payload_tys_in(cx.variants, chome, fname) {
+        Some(tys) -> match emit_variant_call_typed(chome, fname, args_e, tys, src, cx) {
           Some(s) -> s
-          None    -> emit_variant_call(fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
+          None    -> emit_variant_call(chome, fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
         }
-        None -> emit_variant_call(fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
-      }
+        None -> emit_variant_call(chome, fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
+      } }
       None    -> emit_user_call(c_sym(fname, Some(mod)), call_args, cx)
     }
     _ -> {
@@ -2926,7 +2949,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
       let rest_slots = emit_call_args_slots(src, args_e, cx)
       let lhs_slot = arg_str_as_slot(lhs_c)
       let slots_all = if list_length(args_e) == 0 { lhs_slot } else { cat3(lhs_slot, ", ", rest_slots) }
-      emit_variant_call(callee, arity, slots_all, cx)
+      emit_variant_call(None, callee, arity, slots_all, cx)
     }
     None -> match core_find(cx.core, callee) {
       Some(ep) -> match ep {
@@ -2969,7 +2992,7 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
     # boxed-args shape via emit_call_args_slots so the runtime sees a
     # uniform `kai_variant_u` call (issue #688 dropped the legacy
     # `kai_variant`).
-    Some(_) -> emit_variant_call(callee, list_length(args_e),
+    Some(_) -> emit_variant_call(None, callee, list_length(args_e),
                                  emit_call_args_slots(src, args_e, cx),
                                  cx)
     # KIR Lane 1: a raw core prim (in-process libLLVM C-API) is
@@ -3389,7 +3412,7 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, cx: EmitCtx) : String /
     PRange(_, _) -> "1"
     PLit(e) -> concat_all(["kai_op_eq(", scr, ", ", emit_expr(src,e, cx), ")"])
     PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, cx)
-    PVariant(_, name, subs) -> emit_pat_test_variant(src, name, subs, scr, cx)
+    PVariant(hm, name, subs) -> emit_pat_test_variant(src, hm, name, subs, scr, cx)
     PVariantRecord(name, fields) -> emit_pat_test_variant_record(src, name, fields, scr, cx)
     PRecord(fields) -> emit_pat_test_record(src, fields, scr, cx)
     PHole(_) -> "1"
@@ -3461,8 +3484,28 @@ fn list_nth(xs: [Pattern], i: Int) : Pattern {
 # `strcmp(scr->as.var.variant_name, "Name") == 0` (synthetic fallback).
 # Used by emit_pat_test_variant, emit_pat_test_variant_record, and
 # emit_bang to keep the three sites in sync.
-fn emit_variant_tag_test(scr: String, name: String, variants: [EVar]) : String {
-  match evar_find_tag_opt(variants, name) {
+# `known` is None only for a name the table never registered, which is
+# where the strcmp fallback belongs.
+fn emit_tag_test_at(scr: String, name: String, tag: Int, known: Option[Int]) : String =
+  match known {
+    Some(_) -> concat_all([
+      scr, "->tag == KAI_VARIANT && ",
+      scr, "->variant_tag == ", int_to_string(tag)
+    ])
+    None -> concat_all([
+      scr, "->tag == KAI_VARIANT && strcmp(kai_variant_name_of(",
+      scr, "->variant_tag), \"", name, "\") == 0"
+    ])
+  }
+
+fn emit_variant_tag_test_arity(scr: String, home: Option[String], name: String,
+                                  arity: Int, variants: [EVar]) : String =
+  emit_tag_test_at(scr, name, evar_find_tag_arity(variants, home, name, arity),
+                      evar_find_tag_opt_in(variants, home, name))
+
+fn emit_variant_tag_test(scr: String, home: Option[String], name: String,
+                            variants: [EVar]) : String {
+  match evar_find_tag_opt_in(variants, home, name) {
     Some(t) -> concat_all([
       scr, "->tag == KAI_VARIANT && ",
       scr, "->variant_tag == ", int_to_string(t)
@@ -3474,15 +3517,15 @@ fn emit_variant_tag_test(scr: String, name: String, variants: [EVar]) : String {
   }
 }
 
-fn emit_pat_test_variant(src: String, name: String, subs: [Pattern],
-                         scr: String, cx: EmitCtx) : String / Console {
+fn emit_pat_test_variant(src: String, home: Option[String], name: String,
+                         subs: [Pattern], scr: String, cx: EmitCtx) : String / Console {
 
-  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, name, cx.variants)])
-  # Issue #440 Phase 2 — look up the variant's payload Types so the
-  # sub-pattern test reads each slot with the right kind. Unknown
-  # ctor (e.g. nullary builtin / non-sum match) falls back to all
-  # pointer slots.
-  let tys = match evar_payload_tys(cx.variants, name) {
+  let base = concat_all(["(", scr, " && ",
+                         emit_variant_tag_test_arity(scr, home, name, list_length(subs), cx.variants)])
+  # The payload types decide each slot's read kind, so they must come
+  # from the ctor the pattern actually names: a homonym in another
+  # module can declare a pointer where this one declares an Int.
+  let tys = match evar_payload_tys_arity(cx.variants, home, name, list_length(subs)) {
     Some(ts) -> ts
     None     -> []
   }
@@ -3643,7 +3686,7 @@ fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr
   # then read record fields via kai_op_field on the scrutinee itself
   # because the emit side stores records directly in variants.
   # Issue #688 — atom-style global tag dispatch via emit_variant_tag_test.
-  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, name, cx.variants)])
+  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, None, name, cx.variants)])
   cat3(base, emit_pat_test_record_fields(src, fields, scr, cx), ")")
 }
 
@@ -3692,8 +3735,8 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
     PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, cx)
     # Issue #440 Phase 2 — pipe the ctor name through so the variant
     # bind helper can read each slot with the right kind.
-    PVariant(_, vname, subs) -> {
-      let tys = match evar_payload_tys(cx.variants, vname) {
+    PVariant(hm, vname, subs) -> {
+      let tys = match evar_payload_tys_in(cx.variants, hm, vname) {
         Some(ts) -> ts
         None     -> []
       }
@@ -3757,8 +3800,8 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
 # by construction (one collector, no per-route rescan). Recurses into
 # nested PVariant sub-patterns (rb-tree balance rotation shape).
 fn pat_kind1_binders(pat: Pattern, cx: EmitCtx, acc: [String]) : [String] = match pat.pkind {
-  PVariant(_, ctor, subs) -> {
-    let tys = match evar_payload_tys(cx.variants, ctor) { Some(t) -> t None -> [] }
+  PVariant(hm, ctor, subs) -> {
+    let tys = match evar_payload_tys_in(cx.variants, hm, ctor) { Some(t) -> t None -> [] }
     pat_kind1_binders_subs(subs, tys, 0, cx, acc)
   }
   # A list pattern's fixed sub-patterns can themselves be PVariants with
@@ -4266,7 +4309,7 @@ fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse
   if not trmc_body_has_step(body) { None }
   else {
     match pat.pkind {
-      PVariant(_, cname, subs) -> match evar_payload_tys(cx.variants, cname) {
+      PVariant(hm, cname, subs) -> match evar_payload_tys_in(cx.variants, hm, cname) {
         Some(tys) ->
           if list_length(tys) == list_length(subs) {
             let ptr_binders = arm_ptr_binders(subs, tys, 0, cx.enums)
@@ -4471,7 +4514,7 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int,
   }
 }
 
-type ReuseVariantArm = ReuseVariantArm([Pattern], String, [Expr], [TypeExpr])
+type ReuseVariantArm = ReuseVariantArm([Pattern], Option[String], String, [Expr], [TypeExpr])
 
 # Detect a 1:1 variant reuse arm. The arm body, post-perceus, is the
 # sentinel `__perceus_reuse_variant(_scr, C(args))`. We match the
@@ -4482,19 +4525,20 @@ type ReuseVariantArm = ReuseVariantArm([Pattern], String, [Expr], [TypeExpr])
 # directly, and emit_match_arm receives that tail as `body`).
 fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] {
   match pat.pkind {
-    PVariant(_, pcname, subs) -> match body.kind {
+    PVariant(phome, pcname, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
         EVar(sname) ->
           if sname == "__perceus_reuse_variant" {
             match sargs {
-              [_scr_arg, ctor] -> match reuse_ctor_name(ctor) {
-                Some(bcname) -> match ctor.kind {
+              [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
+                Some(bctor) -> match ctor.kind {
                   ECall(_cf, cargs) ->
-                    if pcname == bcname and list_length(subs) == list_length(cargs) {
-                      match evar_payload_tys(cx.variants, bcname) {
+                    if reuse_same_ctor(phome, pcname, bctor) and
+                       list_length(subs) == list_length(cargs) {
+                      match evar_payload_tys_in(cx.variants, phome, pcname) {
                         Some(tys) ->
                           if list_length(tys) == list_length(subs) {
-                            Some(ReuseVariantArm(subs, bcname, cargs, tys))
+                            Some(ReuseVariantArm(subs, phome, pcname, cargs, tys))
                           } else { None }
                         None -> None
                       }
@@ -4598,7 +4642,7 @@ fn rv_count_uses_elem(nm: String, el: ListElem) : Int = match el {
 fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVariantArm,
                                 cx: EmitCtx) : String / Console {
   match rva {
-    ReuseVariantArm(subs, cname, cargs, tys) -> {
+    ReuseVariantArm(subs, chome, cname, cargs, tys) -> {
       # i64-inline (Lane B): the reuse-variant binds (rv_slot_binds) emit
       # kind-1 Int slots as raw `kair_<nm>`. The body's new-temp / fresh-slot
       # / overwrite emits must see those names in cx.kind1_raw so EVar reads
@@ -4610,7 +4654,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
                                            list_append(cx.kind1_raw, k1))
       let n = list_length(subs)
       let mask = variant_slot_mask(tys, cx.enums)
-      let tag_str = int_to_string(evar_find_tag(cx.variants, cname))
+      let tag_str = int_to_string(evar_find_tag_in(cx.variants, chome, cname))
       # Non-bijective rebuild: a new ctor slot is a NESTED ctor that embeds a
       # pointer child of `_scr` (the rb-tree rotation / gap3 shape:
       # `Node(Node(lll,...), lk, Node(lr,...))`). Borrow-binding such children
@@ -4821,8 +4865,8 @@ fn rv_slot_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int, borrow: 
 # (move vs dup+drop) is emitted by `rv_inner_decision`.
 fn rv_nested_binds(sp: Pattern, inner: String, cx: EmitCtx) : String {
   match sp.pkind {
-    PVariant(_, vname, isubs) -> {
-      let itys = match evar_payload_tys(cx.variants, vname) { Some(ts) -> ts None -> [] }
+    PVariant(hm, vname, isubs) -> {
+      let itys = match evar_payload_tys_in(cx.variants, hm, vname) { Some(ts) -> ts None -> [] }
       rv_nested_binds_loop(isubs, itys, inner, 0, cx)
     }
     _ -> ""
@@ -4859,8 +4903,8 @@ fn rv_nested_binds_loop(isubs: [Pattern], itys: [TypeExpr], inner: String,
 # inner cell is dropped (Koka `kk_..._dup(kx); ...; decref(_pat_1)`).
 fn rv_inner_decision(sp: Pattern, inner: String, cx: EmitCtx) : String {
   match sp.pkind {
-    PVariant(_, vname, isubs) -> {
-      let itys = match evar_payload_tys(cx.variants, vname) { Some(ts) -> ts None -> [] }
+    PVariant(hm, vname, isubs) -> {
+      let itys = match evar_payload_tys_in(cx.variants, hm, vname) { Some(ts) -> ts None -> [] }
       let dups = rv_nested_dups_loop(isubs, itys, 0, cx)
       concat_all([
         "KaiReuse _ru_inner; KaiReuse _ru_tmp; (void) _ru_tmp; ",
@@ -4877,8 +4921,8 @@ fn rv_inner_decision(sp: Pattern, inner: String, cx: EmitCtx) : String {
 # ref for the fresh rebuild instead of dropping the inner.
 fn rv_shared_grand_dups(sp: Pattern, cx: EmitCtx) : String {
   match sp.pkind {
-    PVariant(_, vname, isubs) -> {
-      let itys = match evar_payload_tys(cx.variants, vname) { Some(ts) -> ts None -> [] }
+    PVariant(hm, vname, isubs) -> {
+      let itys = match evar_payload_tys_in(cx.variants, hm, vname) { Some(ts) -> ts None -> [] }
       rv_nested_dups_loop(isubs, itys, 0, cx)
     }
     _ -> ""
@@ -5043,16 +5087,16 @@ fn rv_old_slot_drops(subs: [Pattern], tys: [TypeExpr], i: Int, enums: [String]) 
 fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
   if cx.in_region { "" }
   else { match pat.pkind {
-    PVariant(_, pcname, subs) -> match body.kind {
+    PVariant(phome, pcname, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
         EVar(sname) ->
           if sname == "__perceus_reuse_variant" {
             match sargs {
-              [_scr_arg, ctor] -> match reuse_ctor_name(ctor) {
-                Some(bcname) -> match ctor.kind {
-                  ECall(_cf, cargs) -> match evar_payload_tys(cx.variants, pcname) {
+              [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
+                Some(bctor) -> match ctor.kind {
+                  ECall(_cf, cargs) -> match evar_payload_tys_in(cx.variants, phome, pcname) {
                     Some(ptys) ->
-                      if reuse_fire_iff_unique(bcname, ptys, cx) {
+                      if reuse_fire_iff_unique(bctor, ptys, cx) {
                         reuse_kept_drops(subs, cargs, ptys, 0, cx)
                       } else { "" }
                     None -> ""
@@ -5078,8 +5122,18 @@ fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
 # (`kai_reuse_or_alloc_variant`) additionally requires the DONOR's slot
 # mask to be 0 — a primitive-slotted donor never fires there, so nothing
 # needs paying.
-fn reuse_fire_iff_unique(bcname: String, ptys: [TypeExpr], cx: EmitCtx) : Bool = {
-  let has_prim = match evar_payload_tys(cx.variants, bcname) {
+# The rebuild's qualifier is a module when the user wrote `m.Ctor` and the
+# declaring TYPE when the typer disambiguated a bare ctor, so it resolves
+# through the same tolerant path a construction site uses. Demanding it as
+# a home drops the payload for the type-qualified spelling, and with it
+# the kept-child payment the rebuild owes.
+fn rcn_payload_tys(b: ReuseCtorName, cx: EmitCtx) : Option[[TypeExpr]] = match b {
+  RCN(None, bname)       -> evar_payload_tys(cx.variants, bname)
+  RCN(Some(q), bname)    -> evar_payload_tys_in(cx.variants, ctor_qual_home(cx, q, bname), bname)
+}
+
+fn reuse_fire_iff_unique(bctor: ReuseCtorName, ptys: [TypeExpr], cx: EmitCtx) : Bool = {
+  let has_prim = match rcn_payload_tys(bctor, cx) {
     Some(bts) -> variant_has_primitive_slot(bts, cx.enums)
     None      -> false
   }
@@ -7700,9 +7754,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # variant ctor, emit the variant value directly (nullary only;
     # non-nullary as a value is not supported, mirroring the EVar
     # value-position constraint).
-    EModCall(mod, fname) -> match evar_find(cx.variants, fname) {
+    EModCall(mod, fname) -> match evar_find_qual(cx.variants, mod, fname) {
       Some(ar) -> if ar == 0 {
-        emit_variant_call(fname, 0, "", cx)
+        emit_variant_call(ctor_qual_home(cx, mod, fname), fname, 0, "", cx)
       } else {
         cat3("kai_unit() /* non-nullary ctor as value not supported: ", string_concat(mod, string_concat(".", fname)), " */")
       }
@@ -7983,7 +8037,7 @@ fn emit_bang(src: String, inner: Expr, cx: EmitCtx) : String / Console {
   match success {
     Some(name) -> concat_all([
       "({ KaiValue *_b = ", inner_c, "; ",
-      "if (!(_b && ", emit_variant_tag_test("_b", name, cx.variants), ")) return _b; ",
+      "if (!(_b && ", emit_variant_tag_test("_b", None, name, cx.variants), ")) return _b; ",
       "kai_var_slots(_b)[0].ptr; })"
     ])
     None -> concat_all([
@@ -10153,13 +10207,11 @@ fn has_main_decl(decls: [Decl]) : Bool {
 fn emit_payload_ctor_rows(variants: [EVar], enums: [String]) : String = match variants {
   []           -> ""
   [v, ...rest] -> match v {
-    # EV(name, arity, payload_tys, tag) — the tag is the FOURTH field, not
-    # the second (that is the arity). Reading the second as the tag stamped
-    # the mask under the wrong tag, leaving the real tag's mask at the
-    # default 0 (all-pointer) — the generic drop walker then treated an
-    # enum/int slot as a pointer and decref'd garbage. The in-place reuse
-    # arm's own kai_slotmask_register masked the bug until it was removed.
-    EV(nm, _, tys, tag) ->
+    # The tag is the LAST field, not the arity that precedes it: reading
+    # the arity as the tag stamps the mask under the wrong tag and leaves
+    # the real tag's mask all-pointer, so the drop walker decrefs an
+    # int/enum slot as if it were a pointer.
+    EV(_, nm, _, tys, tag) ->
       if variant_has_primitive_slot(tys, enums) {
         concat_all([
           "{", int_to_string(tag), ", \"", nm, "\", ",
@@ -10230,7 +10282,7 @@ fn emit_proto_runtime_tables(decls: [Decl], variants: [EVar], fns: [EFn], enums:
 fn filter_primitive_slot_ctors(variants: [EVar], enums: [String]) : [EVar] = match variants {
   []           -> []
   [v, ...rest] -> match v {
-    EV(_, _, tys, _) ->
+    EV(_, _, _, tys, _) ->
       if variant_has_primitive_slot(tys, enums) {
         [v, ...filter_primitive_slot_ctors(rest, enums)]
       } else { filter_primitive_slot_ctors(rest, enums) }
@@ -10538,7 +10590,7 @@ fn emit_shim_arg_list_masked(pts: [Ty], mask: [Bool], i: Int) : String {
 # baseline by the seed count.
 fn emit_nullary_enum_seed(variants: [EVar]) : String = match variants {
   [] -> ""
-  [EV(nm, ar, _, tag), ...rest] ->
+  [EV(_, nm, ar, _, tag), ...rest] ->
     if ar == 0 and tag >= user_variant_tag_base() {
       concat_all([
         "    kai_variant_u(", int_to_string(tag), ", \"", nm, "\", 0, 0, NULL);\n",
@@ -13075,13 +13127,16 @@ fn mangle_one_segment(decls: [Decl], entries: [PrivTyEntry],
 
 fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
   match d {
-    DType(is_pub, name, tps, body, l, c, _, slots) -> {
+    # The home survives the rename: the variant table keys on it, so
+    # dropping it here would give this module's constructors the tag and
+    # payload layout of whichever module declares the name first.
+    DType(is_pub, name, tps, body, l, c, mo, slots) -> {
       let name1 = match priv_ty_lookup(entries, home_mod, name) {
         Some(m) -> m
         None    -> name
       }
       DType(is_pub, name1, tps,
-            mangle_typebody(body, entries, home_mod), l, c, None, slots)
+            mangle_typebody(body, entries, home_mod), l, c, mo, slots)
     }
     DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
       DFn(p, n, tps, mangle_params(ps, entries, home_mod),
