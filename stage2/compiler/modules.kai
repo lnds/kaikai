@@ -139,10 +139,7 @@ pub fn last_slash(s: String, i: Int) : Int {
 }
 
 # The name is minted verbatim into C symbols (`kaiu_<mod>__<fn>`), so
-# every non-identifier character maps to `_`. Distinct basenames can
-# sanitise to the same name (`foo.input.kai` / `foo_input.kai`); such a
-# clash resolves exactly like a literal name clash: the root file's
-# entry shadows any same-named module.
+# every non-identifier character maps to `_`.
 #[doc("The module name a file contributes: its basename, `.kai` suffix removed, non-identifier characters mapped to `_` (`foo.input.kai` -> `foo_input`).")]
 pub fn module_name_of_path(path: String) : String {
   let total = string_length(path)
@@ -154,6 +151,14 @@ pub fn module_name_of_path(path: String) : String {
   } else { base }
   ident_sanitize(stem, 0, string_length(stem), "")
 }
+
+# A module's identity is its package-relative path, so `a/util.kai` and
+# `b/util.kai` are distinct homes rather than one contested `util`. The
+# home is a function of the path alone: neither the alias an importer
+# wrote nor the order the imports were reached can change it.
+#[doc("The home a dotted import path names: its segments joined by `_`, non-identifier characters mapped to `_` (`x.util` -> `x_util`).")]
+pub fn module_home_of_import(mod_path: String) : String =
+  ident_sanitize(mod_path, 0, string_length(mod_path), "")
 
 fn ident_sanitize(s: String, i: Int, n: Int, acc: String) : String {
   if i >= n { acc }
@@ -343,9 +348,9 @@ pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
 # the other. The empty module name owns the root file's imports.
 #
 # A scope entry is keyed by the name its file wrote, which under an
-# alias is not the name the module's decls were tagged with. Only these
-# per-file entries may carry an alias — the global table stays keyed by
-# tagged names, or `me_emit_name` could not tell the two apart.
+# alias is not the module's home. Only these per-file entries may carry
+# an alias — the global table stays keyed by home, or `me_home_name`
+# could not tell the two apart.
 pub type ModScope = MScope(String, [ModuleEntry])
 
 # The qualifier table a decl from `home` resolves through: that
@@ -355,7 +360,7 @@ pub type ModScope = MScope(String, [ModuleEntry])
 #
 # Alias entries come first, so a written name resolves to the file its
 # own module meant. They keep that file's origin path, which is what
-# lets `me_emit_name` recover the name codegen minted symbols under.
+# lets `me_home_name` recover the home codegen minted symbols under.
 pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [ModuleEntry] =
   match scopes {
     [] -> global
@@ -363,23 +368,66 @@ pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [Modu
       if m == home { list_append(mt, global) } else { ms_table(rest, home, global) }
   }
 
+# The bindings `owner` has written so far. A binding conflict is scoped
+# to one file, so the check reads this list and never the global table.
+fn ms_bindings(scopes: [ModScope], owner: String) : [ModuleEntry] = match scopes {
+  [] -> []
+  [MScope(m, mt), ...rest] -> if m == owner { mt } else { ms_bindings(rest, owner) }
+}
+
+#[doc("Report an import binding that shadows a different module already bound to the same name in this file. Returns 1 when it fires.")]
+pub fn report_import_shadow(scopes: [ModScope], owner: String, written: String,
+                            origin: String, file: String, line: Int, col: Int)
+                            : Int / Console + File =
+  match mt_lookup(ms_bindings(scopes, owner), written) {
+    None -> 0
+    Some(prev) -> match prev {
+      ME(_, _, prev_origin, _) ->
+        if prev_origin == origin { 0 }
+        else {
+          let _ = diag_error(file, line, col,
+            concat_all(["import binds '", written,
+                        "' to '", origin,
+                        "', which would shadow the '", written,
+                        "' already bound to '", prev_origin,
+                        "' in this file; rename one binding with `as`"]))
+          1
+        }
+    }
+  }
+
+#[doc("Report every name a selective import lists that the module does not export. Returns the count reported.")]
+pub fn report_selective_missing(names: [String], me: ModuleEntry, mod_path: String,
+                                file: String, line: Int, col: Int)
+                                : Int / Console + File = match names {
+  [] -> 0
+  [n, ...rest] -> {
+    let here = if me_has_export(me, n) { 0 }
+      else {
+        let exports = match me { ME(_, exs, _, _) -> exs }
+        let _ = diag_error(file, line, col,
+          concat_all(["module '", mod_path, "' does not export '", n,
+                      "'; available exports: ", mods_join_with(exports, ", ")]))
+        1
+      }
+    here + report_selective_missing(rest, me, mod_path, file, line, col)
+  }
+}
 
 fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
   Some(c) -> c >= 'A' and c <= 'Z'
   None    -> false
 }
 
-# The module name an EModCall must carry: the one the module's decls
-# were tagged with, which is what codegen keys symbols by. A file
-# reached under an alias appears in the table more than once, sharing
-# an origin path; the tagged name is the one on the entry the resolver
-# registered globally, which per-file alias entries are prepended to.
-# Scanning from the end finds it regardless of how many aliases name
-# the same file.
-fn me_emit_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String =
-  match me {
-    ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
-  }
+# The module name an EModCall must carry: the home codegen keys symbols
+# by. A file reached under an alias appears in the table twice sharing
+# an origin path — once under the alias in its importer's scope, once
+# under its home in the global table, which the scope entries are
+# prepended to. The global entry is the last one for that origin, so
+# scanning to the end lands on the home whatever the aliases spelled.
+fn me_home_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String = match me {
+  ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
+}
 
 fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
   match mt {
@@ -388,10 +436,10 @@ fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : Str
       me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
   }
 
-#[doc("The tagged module name behind a written qualifier: the name codegen keys symbols by, recovering the global tag when `written` is a per-file alias. `written` itself when the table has no such entry.")]
+#[doc("The home behind a written qualifier: the module name codegen keys symbols by, recovering it when `written` is a per-file alias. `written` itself when the table has no such entry.")]
 pub fn mt_tagged_name(mt: [ModuleEntry], written: String) : String =
   match mt_lookup(mt, written) {
-    Some(me) -> me_emit_name(mt, me, written)
+    Some(me) -> me_home_name(mt, me, written)
     None     -> written
   }
 
@@ -1402,9 +1450,9 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
             # becomes `EModCall(mod, Ctor)`, never a bare `EVar`, so
             # the qualifier the user wrote survives to the typer.
             if name_starts_upper(fname) and me_has_export(me, fname) {
-              EModCall(me_emit_name(mt, me, name), fname)
+              EModCall(me_home_name(mt, me, name), fname)
             } else { match me_lookup_export(me, fname) {
-              Some(actual) -> EModCall(me_emit_name(mt, me, name), actual)
+              Some(actual) -> EModCall(me_home_name(mt, me, name), actual)
               None -> {
                 # Imported module, missing export.
                 # Emit specific error before falling back to EField
@@ -1605,7 +1653,7 @@ fn rqc_pat_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, l
   match mt_lookup(mt, q) {
     Some(me) ->
       if me_has_export(me, ctor) {
-        Some(me_emit_name(mt, me, q))
+        Some(me_home_name(mt, me, q))
       } else {
         let exports = match me { ME(_, exs, _, _) -> exs }
         let _ = rqc_diag_missing_export(q, ctor, exports, file, line, col)

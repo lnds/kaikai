@@ -1037,6 +1037,21 @@ fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
 fn rs_bind_in(rs: ResolveState, owner: String, entry: ModuleEntry) : ResolveState =
   ResolveState { visited: rs.visited, in_progress: rs.in_progress, decls: rs.decls, segs: rs.segs, modules: rs.modules, scopes: scopes_bind(rs.scopes, owner, entry), errs: rs.errs, dep_memo: rs.dep_memo }
 
+# Bind one import into its file's scope, after the two checks the
+# binding itself makes possible: that the name is not already bound to
+# a different file, and that a selective list names only real exports.
+fn rs_bind_import(rs: ResolveState, owner: String, owner_file: String, entry: ModuleEntry,
+                  selective: [String], mod_path: String, line: Int, col: Int)
+                  : ResolveState / Console + File = match entry {
+  ME(written, _, origin, _) -> {
+    let shadow_errs = report_import_shadow(rs.scopes, owner, written, origin, owner_file, line, col)
+    let missing_errs = report_selective_missing(selective, entry, mod_path, owner_file, line, col)
+    let errs = shadow_errs + missing_errs
+    let rs1 = if errs > 0 { rs_bump_errs_by(rs, errs) } else { rs }
+    rs_bind_in(rs1, owner, entry)
+  }
+}
+
 fn scopes_bind(scopes: [ModScope], owner: String, entry: ModuleEntry) : [ModScope] = match scopes {
   [] -> [MScope(owner, [entry])]
   [MScope(m, mt), ...rest] ->
@@ -1204,8 +1219,11 @@ fn uc_resolve_decls(cache_res: UcLookup, abs_path: String, src: String,
     }
   }
 
-fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cores: [ModuleEntry], owner: String, cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
+fn resolve_module(base_dir: String, mod_path: String, import_name: String, selective: [String], search_paths: [String], cores: [ModuleEntry], owner: String, owner_file: String, line: Int, col: Int, cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
 
+  # Identity comes from the path, the binding from the spelling: an
+  # alias renames the module for one file without renaming its symbols.
+  let home = module_home_of_import(mod_path)
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
     CF(raw_path, opt_src) -> {
@@ -1250,7 +1268,8 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
             None -> rs
             Some(me) -> match me {
               ME(_, exports, origin, unstable) ->
-                rs_bind_in(rs, owner, ME(import_name, exports, origin, unstable))
+                rs_bind_import(rs, owner, owner_file, ME(import_name, exports, origin, unstable),
+                               selective, mod_path, line, col)
             }
           }
         }
@@ -1290,10 +1309,10 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                 Some(ucd) -> match ucd { UCDcls(decls, doc_errs) -> {
                   let rs_doc = if doc_errs > 0 { rs_bump_errs_by(rs_memo, doc_errs) } else { rs_memo }
                   # The loaded file owns the imports it declares. Its
-                  # segment in the flat stream is keyed by the name this
-                  # importer bound it under, so the scope is keyed the
-                  # same way for the per-segment lookup to match.
-                  let rs2 = process_imports(base_dir, decls, search_paths, cores, import_name, cache_on, rs_doc)
+                  # segment in the flat stream is keyed by its home, so
+                  # the scope is keyed the same way for the per-segment
+                  # lookup to match.
+                  let rs2 = process_imports(base_dir, decls, search_paths, cores, home, abs_path, cache_on, rs_doc)
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
                   # imported module's decls join the global stream.
@@ -1304,22 +1323,26 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   # symbols for the same kaikai name.
                   let mod_errs = validate_module_same_module_collisions(kept, abs_path)
                   let rs2b = if mod_errs > 0 { rs_bump_errs_by(rs2, mod_errs) } else { rs2 }
-                  # Tag every DFn coming from this module with
-                  # `module_origin = Some(import_name)` so the codegen
-                  # mints `kai_<import_name>__<name>`. Done before the
-                  # global concat so transitive imports carry their own
-                  # surface name through to emission. When the caller
-                  # passes `import_name == ""`, we still concat decls
-                  # but leave them with their parser-supplied None.
+                  # Tag every DFn coming from this module with its home
+                  # so the codegen mints `kai_<home>__<name>`. The home
+                  # is the module's package-relative path, never the
+                  # alias this importer wrote, so a file reached under
+                  # two spellings emits one set of symbols. When the
+                  # caller passes `import_name == ""`, we still concat
+                  # decls but leave them with their parser-supplied None.
                   let tagged = if import_name == "" { kept }
-                               else { tag_decls_module_origin(kept, import_name) }
-                  let rs3 = rs_append_decls(rs2b, import_name, tagged)
+                               else { tag_decls_module_origin(kept, home) }
+                  let rs3 = rs_append_decls(rs2b, home, tagged)
                   if import_name == "" { rs3 }
                   else {
                     let exports = collect_pub_exports(kept, [])
                     let unstable_exports = collect_unstable_exports(kept, [])
-                    let entry = ME(import_name, exports, abs_path, unstable_exports)
-                    rs_bind_in(rs_add_module(rs3, entry), owner, entry)
+                    # The global table is keyed by home; the importer's
+                    # own spelling is a per-file binding onto it.
+                    let entry = ME(home, exports, abs_path, unstable_exports)
+                    let bound = ME(import_name, exports, abs_path, unstable_exports)
+                    rs_bind_import(rs_add_module(rs3, entry), owner, owner_file, bound,
+                                   selective, mod_path, line, col)
                   }
                 } }
               }
@@ -1334,23 +1357,25 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
 
 # `owner` is the module whose file these decls came from ("" for the
 # root file) — every binding an import introduces is recorded against
-# it, so the qualifier tables stay per-file.
-fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], cores: [ModuleEntry], owner: String, cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
+# it, so the qualifier tables stay per-file. `owner_file` is that file's
+# path, which the per-import diagnostics carry their caret from.
+fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], cores: [ModuleEntry], owner: String, owner_file: String, cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
 
 
   match decls {
     [] -> rs
     [d, ...rest] -> {
       let rs1 = match d {
-        DImport(ik, _, _) -> match ik {
+        DImport(ik, l, c) -> match ik {
           # surface name = last segment of dotted path.
-          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), search_paths, cores, owner, cache_on, rs)
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), [], search_paths, cores, owner, owner_file, l, c, cache_on, rs)
           # surface name = alias.
-          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, search_paths, cores, owner, cache_on, rs)
+          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, [], search_paths, cores, owner, owner_file, l, c, cache_on, rs)
           # surface name = last segment (selective imports keep the
           # prefix surface binding, same as IkPath; the named-list
-          # affects unqualified scope, not the qualified surface).
-          IkSelective(p, _) -> resolve_module(base_dir, p, last_segment(p), search_paths, cores, owner, cache_on, rs)
+          # affects unqualified scope, not the qualified surface) and
+          # every name it lists must be one the module exports.
+          IkSelective(p, ns) -> resolve_module(base_dir, p, last_segment(p), ns, search_paths, cores, owner, owner_file, l, c, cache_on, rs)
           # Import holes are not module loads — they are
           # diagnostic-only. The symbol-index pass runs separately
           # after process_imports completes.
@@ -1358,7 +1383,7 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
         }
         _ -> rs
       }
-      process_imports(base_dir, rest, search_paths, cores, owner, cache_on, rs1)
+      process_imports(base_dir, rest, search_paths, cores, owner, owner_file, cache_on, rs1)
     }
   }
 }
@@ -1426,7 +1451,7 @@ fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl],
   # caller supplies the core table separately.
   let cores = canon_module_origins(core_mods)
   let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], decls: [], segs: [], modules: [], scopes: [], errs: 0, dep_memo: uc_memo_empty() }
-  let rs1 = process_imports(base_dir, root_decls, search_paths, cores, "", cache_on, rs0)
+  let rs1 = process_imports(base_dir, root_decls, search_paths, cores, "", root_path, cache_on, rs0)
   let imports = rs1.decls
   let n_imports = list_length(imports)
   let all_decls = list_append(imports, non_import_decls(root_decls))
