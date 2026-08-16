@@ -6,6 +6,11 @@
 #   2. fmt(expected.kai) == expected.kai   (idempotency)
 # Plus a roundtrip sanity check on all formattable examples — the
 # formatted output must re-parse without errors.
+#
+# examples/fmt/width/ rides the same two checks. Those goldens record
+# what the writer does to hand-wrapped code TODAY, so a change in
+# layout policy shows up here as a reviewable diff; the numbers behind
+# them are gated by tests/fmt_width.sh.
 
 set -eu
 
@@ -22,7 +27,7 @@ pass=0
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-for input in "$ROOT"/examples/fmt/*.input.kai; do
+for input in "$ROOT"/examples/fmt/*.input.kai "$ROOT"/examples/fmt/width/*.input.kai; do
   name=$(basename "$input" .input.kai)
   expected="${input%.input.kai}.expected.kai"
   if [ ! -f "$expected" ]; then
