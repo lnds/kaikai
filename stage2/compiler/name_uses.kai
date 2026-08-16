@@ -1,0 +1,145 @@
+# compiler/name_uses.kai — where the root file names a contested name.
+#
+# The syntactic position selects the class: an annotation names a type,
+# an effect row names an effect, a `<>` slot names a kind. A position
+# that decides the class needs nothing from the user (§3), so the scan
+# only has to report the names whose home is still contested once the
+# class is fixed.
+#
+# Scoped to the root file's own declarations: a module's internal uses
+# resolve against its own home and are never ambiguous to its author.
+
+import compiler.util
+import compiler.ast
+import compiler.expr_positions
+import compiler.name_table
+
+#[doc("One contested reference: `NUse(class, name, line, col)`.")]
+pub type NUse = NUse(NCls, String, Int, Int)
+
+#[doc("Every reference in the root file's declarations to a name contested in its class. `t` is the whole-program table; `target` the root module.")]
+pub fn nu_scan(decls: [Decl], t: [NEnt], target: String) : [NUse] =
+  list_reverse(nu_decls(decls, t, target, []))
+
+fn nu_decls(ds: [Decl], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match ds {
+    [] -> acc
+    [d, ...rest] -> nu_decls(rest, t, target, nu_decl(d, t, target, acc))
+  }
+
+# Only root-authored decls are scanned; an imported decl's uses belong
+# to its own home, where they resolve.
+fn nu_decl(d: Decl, t: [NEnt], target: String, acc: [NUse]) : [NUse] = match d {
+  DFn(_, _, _, ps, ret, row, body, _, _, mo) -> match mo {
+    Some(_) -> acc
+    None    -> nu_expr(body, t, target,
+                 nu_row(row, t, target, nu_ret(ret, t, target, nu_params(ps, t, target, acc))))
+  }
+  DConst(_, _, ty, body, mo, _, _) -> match mo {
+    Some(_) -> acc
+    None    -> nu_expr(body, t, target, nu_ty(ty, t, target, acc))
+  }
+  DDerive(_, inner, _, _)       -> nu_decl(inner, t, target, acc)
+  DUnstable(inner, _, _)        -> nu_decl(inner, t, target, acc)
+  DProtoLaws(_, inner, _, _, _) -> nu_decl(inner, t, target, acc)
+  DImplAxiom(_, inner, _, _, _) -> nu_decl(inner, t, target, acc)
+  DConstructor(inner, _, _)     -> nu_decl(inner, t, target, acc)
+  DDoc(_, _, inner, _, _)       -> nu_decl(inner, t, target, acc)
+  DAttr(_, inner, _, _)         -> nu_decl(inner, t, target, acc)
+  _ -> acc
+}
+
+fn nu_params(ps: [Param], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match ps {
+    [] -> acc
+    [p, ...rest] -> nu_params(rest, t, target, nu_ret(p.ptype, t, target, acc))
+  }
+
+fn nu_ret(r: Option[TypeExpr], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match r {
+    None     -> acc
+    Some(ty) -> nu_ty(ty, t, target, acc)
+  }
+
+fn nu_ty(ty: TypeExpr, t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match ty.tkind {
+    TyName(n, targs) ->
+      nu_ty_list(targs, t, target, nu_hit(NCType, n, ty.line, ty.col, t, target, acc))
+    TyList(inner)      -> nu_ty(inner, t, target, acc)
+    TyFn(ps, r, row)   -> nu_row(row, t, target, nu_ty(r, t, target, nu_ty_list(ps, t, target, acc)))
+    TyDim(base, _)     -> nu_ty(base, t, target, acc)
+    TyRefine(base, _)  -> nu_ty(base, t, target, acc)
+    _ -> acc
+  }
+
+fn nu_ty_list(tys: [TypeExpr], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match tys {
+    [] -> acc
+    [ty, ...rest] -> nu_ty_list(rest, t, target, nu_ty(ty, t, target, acc))
+  }
+
+fn nu_row(r: RowExpr, t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match r {
+    REmpty         -> acc
+    RClosed(ls)    -> nu_labels(ls, t, target, acc)
+    ROpen(_, ls)   -> nu_labels(ls, t, target, acc)
+  }
+
+fn nu_labels(ls: [RowLabel], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match ls {
+    [] -> acc
+    [RL(n, targs), ...rest] ->
+      nu_labels(rest, t, target,
+                nu_ty_list(targs, t, target, nu_row_hit(n, targs, t, target, acc)))
+  }
+
+# A row label carries no position of its own; borrow the first type
+# argument's, falling back to the declaration site the caller reports.
+fn nu_row_hit(n: String, targs: [TypeExpr], t: [NEnt], target: String,
+      acc: [NUse]) : [NUse] = match targs {
+  []          -> nu_hit(NCEffect, n, 0, 0, t, target, acc)
+  [a, ..._]   -> nu_hit(NCEffect, n, a.line, a.col, t, target, acc)
+}
+
+# The value classes a bare name may denote. Which one it is comes from
+# the table, not from the spelling: a name declared as a constructor is
+# reported as one, a constant as one. A name in neither class is a
+# function, already covered by its own reporter.
+fn nu_expr(e: Expr, t: [NEnt], target: String, acc: [NUse]) : [NUse] = {
+  let here = match e.kind {
+    EVar(n)     -> nu_value_hit(n, e.line, e.col, t, target, acc)
+    ECall(c, _) -> match c.kind {
+      EVar(n) -> nu_value_hit(n, c.line, c.col, t, target, acc)
+      _       -> acc
+    }
+    _ -> acc
+  }
+  nu_positions(xp_positions(e), t, target, here)
+}
+
+fn nu_positions(ps: [XPos], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+  match ps {
+    [] -> acc
+    [XP(_, child), ...rest] -> nu_positions(rest, t, target, nu_expr(child, t, target, acc))
+  }
+
+fn nu_value_hit(name: String, line: Int, col: Int, t: [NEnt],
+      target: String, acc: [NUse]) : [NUse] =
+  if list_length(nt_homes(t, NCCtor, name)) > 0 {
+    nu_hit(NCCtor, name, line, col, t, target, acc)
+  } else {
+    nu_hit(NCConst, name, line, col, t, target, acc)
+  }
+
+fn nu_hit(cls: NCls, name: String, line: Int, col: Int, t: [NEnt],
+      target: String, acc: [NUse]) : [NUse] =
+  if list_length(nt_contested(t, cls, name, target)) == 0 { acc }
+  else if nu_seen(acc, cls, name) { acc }
+  else { [NUse(cls, name, line, col), ...acc] }
+
+fn nu_seen(acc: [NUse], cls: NCls, name: String) : Bool = match acc {
+  [] -> false
+  [NUse(c, n, _, _), ...rest] ->
+    if n == name and ncls_word(c) == ncls_word(cls) { true }
+    else { nu_seen(rest, cls, name) }
+}
