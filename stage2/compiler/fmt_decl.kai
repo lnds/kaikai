@@ -13,6 +13,7 @@ import compiler.chars
 import compiler.ast
 import compiler.parse
 import compiler.fmt_writer
+import compiler.fmt_names
 import compiler.fmt_anchor
 import compiler.fmt_expr
 import compiler.fmt_effect
@@ -35,91 +36,36 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       fmt_protocol_decl(is_pub, name, tparams, ops, s)
     DImpl(pname, proto_args, target_ty, methods, _, _, impl_tps) ->
       fmt_impl_decl(pname, proto_args, target_ty, methods, impl_tps, s)
-    # `#[derive(P, ...)] <inner_type_decl>` — emit the annotation on
-    # its own line, then the wrapped decl. Issue #608: the short
-    # `#derive(...)` form was deprecated; only `#[derive(...)]` is
-    # accepted by the parser.
-    DDerive(names, inner, _, _) -> {
-      let s1 = fmt_emit(s, string_concat_all(["#[derive(", string_join(names, ", "), ")]"]))
-      let s2 = fmt_newline(s1)
-      fmt_decl(inner, s2)
-    }
-    # `#[unstable]` attribute wrapping a `pub fn / pub type / pub const`.
-    DUnstable(inner, _, _) -> {
-      let s1 = fmt_emit(s, "#[unstable]")
-      let s2 = fmt_newline(s1)
-      fmt_decl(inner, s2)
-    }
-    # `#[constructor]` attribute wrapping a `pub fn`.
-    DConstructor(inner, _, _) -> {
-      let s1 = fmt_emit(s, "#[constructor]")
-      let s2 = fmt_newline(s1)
-      fmt_decl(inner, s2)
-    }
+    # `#[derive(P, ...)] <inner_type_decl>`. Only the bracketed spelling
+    # is accepted by the parser.
+    DDerive(names, inner, _, _) ->
+      fmt_attr_wrapped(string_concat_all(["#[derive(", string_join(names, ", "), ")]"]), inner, s)
+    DUnstable(inner, _, _) -> fmt_attr_wrapped("#[unstable]", inner, s)
+    DConstructor(inner, _, _) -> fmt_attr_wrapped("#[constructor]", inner, s)
     # A theory-bound protocol: the clause is spelled `: Theory` in the
     # head (`protocol P[s: Shape] : Functorial { ... }`).
-    DProtoLaws(thy, inner, _, _, _) -> match inner {
-      DProtocol(is_pub, name, tparams, ops, _, _, _) ->
-        fmt_protocol_decl_thy(is_pub, name, tparams, thy, ops, s)
-      _ -> fmt_decl(inner, s)
-    }
+    DProtoLaws(thy, inner, _, _, _) -> fmt_proto_laws(thy, inner, s)
     # `impl { } axiom <Theory>` — format the impl then the clause.
     DImplAxiom(thy, inner, _, _, _) -> fmt_emit(fmt_decl(inner, s), concat_all([" axiom ", thy]))
-    # `#[doc("...")]` wrapping a documented declaration (issue #681).
-    # The raw byte span is re-emitted verbatim — no re-quoting, no
-    # auto-wrapping — so `kai fmt` is byte-identical on doc attributes.
-    DDoc(raw, _, inner, _, _) -> {
-      let s1 = fmt_emit(s, raw)
-      let s2 = fmt_newline(s1)
-      fmt_decl(inner, s2)
-    }
-    # Unknown attribute (`#[deprecated]`, `#[cfg(...)]`, custom) —
-    # verbatim byte span, same discipline as DDoc.
-    DAttr(raw, inner, _, _) -> {
-      let s1 = fmt_emit(s, raw)
-      let s2 = fmt_newline(s1)
-      fmt_decl(inner, s2)
-    }
+    # `#[doc("...")]` and any unknown attribute (`#[deprecated]`,
+    # `#[cfg(...)]`, custom) re-emit their raw byte span verbatim — no
+    # re-quoting, no auto-wrapping — so `kai fmt` is byte-identical on
+    # attribute text it does not understand.
+    DDoc(raw, _, inner, _, _) -> fmt_attr_wrapped(raw, inner, s)
+    DAttr(raw, inner, _, _) -> fmt_attr_wrapped(raw, inner, s)
     # Module-position `#[doc(...)]` — verbatim, stands alone (the
     # program walker adds the blank line separating decls).
     DModuleDoc(raw, _, _, _) ->
       fmt_emit(s, raw)
     # `[pub] intro NAME [= unit_expr | = measure]` — a habitant decl.
-    DUnit(is_pub, name, body, intro, _, _, _) -> {
-      let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
-      let s2 = fmt_emit(s1, string_concat(intro, " "))
-      let s3 = fmt_emit(s2, name)
-      match body {
-        UBNone      -> s3
-        UBAlias(u)  -> {
-          let a = fmt_emit(s3, " = ")
-          fmt_emit(a, fmt_unit_expr_str(u))
-        }
-        UBMeasure(m) -> {
-          let a = fmt_emit(s3, " = ")
-          fmt_emit(a, m)
-        }
-      }
-    }
+    DUnit(is_pub, name, body, intro, _, _, _) -> fmt_unit_decl(is_pub, name, body, intro, s)
     # `use Effect` at file scope — m7e §25.
     DUse(eff_name, _, _) ->
       fmt_emit(s, string_concat("use ", eff_name))
     DUseKind(kind_name, _, _) ->
       fmt_emit(s, concat_all(["use kind ", kind_name]))
     # `extern "C" type Name = { fields }` struct, or `extern "C" opaque Name`.
-    DExternType(name, body, _, _, _) -> match body {
-      ETStruct(fields) -> {
-        let a = fmt_emit(s, "extern \"C\" type ")
-        let b = fmt_emit(a, name)
-        let c = fmt_emit(b, " = { ")
-        let d2 = fmt_field_decls(fields, c)
-        fmt_emit(d2, " }")
-      }
-      ETOpaque -> {
-        let a = fmt_emit(s, "extern \"C\" opaque ")
-        fmt_emit(a, name)
-      }
-    }
+    DExternType(name, body, _, _, _) -> fmt_extern_type_decl(name, body, s)
     # `[pub] axiom name[tparams](params) : T / row` (m12.7) or
     # `extern "C" [pub] fn name[...](...) : T / Ffi` when extern_c.
     # When c_sym_over is non-empty, the override sits between the
@@ -133,35 +79,69 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     DConst(is_pub, name, ty, body, _, _, _) -> fmt_const_decl(is_pub, name, ty, body, s)
     # `theory Name = { p1, p2, ... }` / `theory Name = builtin` — the
     # kind-catalog theory decl.
-    DTheory(name, props, _, _, _) -> {
-      let a = fmt_emit(s, "theory ")
-      let b = fmt_emit(a, name)
-      if theory_props_builtin(props) { fmt_emit(b, " = builtin") }
-      else {
-        let c = fmt_emit(b, " = { ")
-        let d2 = fmt_emit(c, string_join(props, ", "))
-        fmt_emit(d2, " }")
-      }
-    }
+    DTheory(name, props, _, _, _) -> fmt_theory_decl(name, props, s)
     # `[pub] kind Name : Theory [over Domain] [with <habitant-form>]` —
     # the kind-catalog kind decl. A kind whose habitants are derived
     # (`kind Shape : ConstructorApp`) has no `with` clause.
-    DKind(is_pub, name, thy, over, hab, _, _, _) -> {
-      let a = if is_pub { fmt_emit(s, "pub ") } else { s }
-      let b = fmt_emit(a, "kind ")
-      let c = fmt_emit(b, name)
-      let d2 = fmt_emit(c, " : ")
-      let e = fmt_emit(d2, thy)
-      let f = if over == "" { e } else { fmt_emit(fmt_emit(e, " over "), over) }
-      match hab {
-        HabNone -> f
-        HabIntro(w) -> fmt_emit(fmt_emit(f, " with "), w)
-        HabDomain(dom) -> fmt_emit(fmt_emit(f, " with "), dom)
-        HabClosed(w, atoms) -> {
-          let g = fmt_emit(fmt_emit(f, " with "), w)
-          fmt_emit(g, concat_all([" { ", string_join(atoms, " "), " }"]))
-        }
-      }
+    DKind(is_pub, name, thy, over, hab, _, _, _) -> fmt_kind_decl(is_pub, name, thy, over, hab, s)
+  }
+}
+
+# An attribute line above the declaration it wraps.
+fn fmt_attr_wrapped(raw: String, inner: Decl, s: FmtSt) : FmtSt {
+  let s1 = fmt_emit(s, raw)
+  let s2 = fmt_newline(s1)
+  fmt_decl(inner, s2)
+}
+
+fn fmt_proto_laws(thy: String, inner: Decl, s: FmtSt) : FmtSt = match inner {
+  DProtocol(is_pub, name, tparams, ops, _, _, _) ->
+    fmt_protocol_decl_thy(is_pub, name, tparams, thy, ops, s)
+  _ -> fmt_decl(inner, s)
+}
+
+fn fmt_unit_decl(is_pub: Bool, name: String, body: UnitBody, intro: String, s: FmtSt) : FmtSt {
+  let s1 = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let s2 = fmt_emit(s1, string_concat(intro, " "))
+  let s3 = fmt_emit(s2, name)
+  match body {
+    UBNone       -> s3
+    UBAlias(u)   -> fmt_emit(fmt_emit(s3, " = "), fmt_unit_expr_str(u))
+    UBMeasure(m) -> fmt_emit(fmt_emit(s3, " = "), m)
+  }
+}
+
+fn fmt_extern_type_decl(name: String, body: ExternTypeBody, s: FmtSt) : FmtSt = match body {
+  ETStruct(fields) -> {
+    let a = fmt_emit(s, "extern \"C\" type ")
+    let b = fmt_emit(a, name)
+    let c = fmt_emit(b, " = { ")
+    fmt_emit(fmt_field_decls(fields, c), " }")
+  }
+  ETOpaque -> fmt_emit(fmt_emit(s, "extern \"C\" opaque "), name)
+}
+
+fn fmt_theory_decl(name: String, props: [String], s: FmtSt) : FmtSt {
+  let b = fmt_emit(fmt_emit(s, "theory "), name)
+  if theory_props_builtin(props) { fmt_emit(b, " = builtin") }
+  else {
+    let c = fmt_emit(b, " = { ")
+    fmt_emit(fmt_emit(c, string_join(props, ", ")), " }")
+  }
+}
+
+fn fmt_kind_decl(is_pub: Bool, name: String, thy: String, over: String, hab: KindHab, s: FmtSt) : FmtSt {
+  let a = if is_pub { fmt_emit(s, "pub ") } else { s }
+  let c = fmt_emit(fmt_emit(a, "kind "), name)
+  let e = fmt_emit(fmt_emit(c, " : "), thy)
+  let f = if over == "" { e } else { fmt_emit(fmt_emit(e, " over "), over) }
+  match hab {
+    HabNone        -> f
+    HabIntro(w)    -> fmt_emit(fmt_emit(f, " with "), w)
+    HabDomain(dom) -> fmt_emit(fmt_emit(f, " with "), dom)
+    HabClosed(w, atoms) -> {
+      let g = fmt_emit(fmt_emit(f, " with "), w)
+      fmt_emit(g, concat_all([" { ", string_join(atoms, " "), " }"]))
     }
   }
 }

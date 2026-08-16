@@ -1,0 +1,213 @@
+# compiler/fmt_shape.kai — the questions `kai fmt` asks about a node
+# before it picks a layout.
+#
+# Every entry here is a pure query over the AST: does this expression
+# print as an atom, does it start with a `{`, how many trailing block
+# lambdas does an argument list end in, which source line does a
+# statement sit on. The writer branches on the answers; nothing here
+# emits, so nothing here belongs in the mutually-recursive walker
+# (compiler/fmt_expr.kai) that does.
+#
+# The walker's recursion cycle survives the split because no query
+# calls back into it. That is also why a width model's own queries —
+# does this subtree fit, how wide is it flat — belong here rather than
+# beside the emitters.
+
+import compiler.util
+import compiler.ast
+import compiler.ast_map
+import compiler.parse
+
+#[doc("The literal suffix that reproduces an `EFixed` node's width type.")]
+pub fn fmt_fixed_suffix(ty: Ty) : String = match ty {
+  TyByte   -> "u8"
+  TyInt32  -> "i32"
+  TyUInt32 -> "u32"
+  TyUInt64 -> "u64"
+  _        -> "i128"
+}
+
+#[doc("True when the expression prints as a self-delimiting form, so an enclosing operator needs no parentheses around it.")]
+pub fn expr_is_atomic(e: Expr) : Bool {
+  match e.kind {
+    EInt(_, _)  -> true
+    EReal(_, _) -> true
+    EIntLit(_) -> true
+    EDecimalLit(_) -> true
+    EFixed(_, _) -> true
+    EBool(_) -> true
+    EChar(_) -> true
+    EStr(_, _) -> true
+    EUnit -> true
+    EVar(_) -> true
+    EUnder -> true
+    EPlaceholder -> true
+    EHole(_) -> true
+    ETodo(_) -> true
+    EExternBody(_) -> true
+    ECall(_, _) -> true
+    EField(_, _) -> true
+    EModCall(_, _) -> true
+    EIndex(_, _) -> true
+    ERecordLit(_, _) -> true
+    EList(_) -> true
+    EBlock(_, _) -> true
+    ERange(_, _, _) ->
+    # `[lo..hi]` form prints as a self-bounded literal, no paren needed.
+    true
+    # A block lambda prints as its own `{ ... }` delimiters.
+    ESurface(sf) -> match sf { SfLamBlock(_, _) -> true  _ -> false }
+    _ -> false
+  }
+}
+
+# Postfix and infix forms inherit the answer from their leftmost
+# operand; everything else opens with its own token and is safe.
+#[doc("Leftmost-constituent descent: true when the expression prints starting with a `Name {` record literal.")]
+pub fn fmt_head_is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _)   -> true
+  EBlock(_, _)       -> true
+  ESurface(sf)       -> match sf { SfLamBlock(_, _) -> true  _ -> false }
+  EField(obj, _)     -> fmt_head_is_record_lit(obj)
+  EIndex(obj, _)     -> fmt_head_is_record_lit(obj)
+  ECall(callee, _)   -> fmt_head_is_record_lit(callee)
+  EBang(inner)       -> fmt_head_is_record_lit(inner)
+  EBinop(_, l, _)    -> fmt_head_is_record_lit(l)
+  EPipe(l, _)        -> fmt_head_is_record_lit(l)
+  EMapPipe(l, _)     -> fmt_head_is_record_lit(l)
+  EFlatMapPipe(l, _) -> fmt_head_is_record_lit(l)
+  EFilterPipe(l, _)  -> fmt_head_is_record_lit(l)
+  ELitUnit(inner, _) -> fmt_head_is_record_lit(inner)
+  _ -> false
+}
+
+#[doc("The arm behind a `{ pat -> body }` block lambda: the synthetic position-keyed binder matched by a single irrefutable arm, or None for a lambda the author wrote in full.")]
+pub fn lam_block_wrap_arm(params: [Param], body: Expr) : Option[Arm] = match params {
+  [pm] -> match body.kind {
+    EMatch(scrut, arms) -> match arms {
+      [Arm(pat, None, abody)] -> match scrut.kind {
+        EVar(n) ->
+          if n == pm.pname and n == lam_pat_binder_name(pat.line, pat.col) {
+            Some(Arm(pat, None, abody))
+          } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+# The pipe-placeholder desugar (`lhs |> f(_, y)` into
+# `((__pipe) => f(__pipe, y))(lhs)`) and the point-free argument
+# desugar (`f(. < 3)` into `f((__pl) => __pl < 3)`) both mint a fixed
+# reserved binder, so the writer restores the author's spelling by
+# structure: the parser is the only producer of those binders.
+#[doc("The body of a point-free section with its `__pl` binder restored to `.`, or None when the lambda is the author's own.")]
+pub fn fmt_placeholder_body(params: [Param], body: Expr) : Option[Expr] =
+  match params {
+    [prm] ->
+      if prm.pname == "__pl" { Some(fmt_subst_var(body, "__pl", EPlaceholder)) }
+      else { None }
+    _ -> None
+  }
+
+#[doc("Replace every free occurrence of the variable `name` in `e` with the expression kind `to`.")]
+pub fn fmt_subst_var(e: Expr, name: String, to: ExprKind) : Expr = match e.kind {
+  EVar(v) ->
+    if v == name { Expr { kind: to, line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+    else { e }
+  # A nested lambda re-binding the same name shadows it; stop there.
+  ELambda(ps, _) ->
+    if fsv_binds(ps, name) { e }
+    else { Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+                  line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+  _ -> Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+              line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn fsv_binds(ps: [Param], name: String) : Bool = match ps {
+  [] -> false
+  [prm, ...rest] -> prm.pname == name or fsv_binds(rest, name)
+}
+
+# A run counter: an interior block arg (`f({ x -> x }, y)`) resets it.
+#[doc("Length of the suffix of `args` written as trailing blocks (`f(a) { .. } { .. }`), at most two by the grammar.")]
+pub fn fmt_count_trailing(args: [Expr], run: Int) : Int = match args {
+  [] -> run
+  [a, ...rest] -> fmt_count_trailing(rest, match a.kind {
+    ESurface(sf) -> match sf { SfLamBlock(_, true) -> run + 1  _ -> 0 }
+    _ -> 0
+  })
+}
+
+#[doc("The first `n` arguments, or all of them when `n` exceeds the list.")]
+pub fn fmt_args_take(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { [] } else { match args {
+    [] -> []
+    [a, ...rest] -> [a, ...fmt_args_take(rest, n - 1)]
+  } }
+
+#[doc("The arguments after the first `n`.")]
+pub fn fmt_args_drop(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { args } else { match args {
+    [] -> []
+    [_, ...rest] -> fmt_args_drop(rest, n - 1)
+  } }
+
+# Both spellings fill one AST slot; the clause form arrives wrapped in
+# `SfHandleInit`, which is what tells them apart.
+#[doc("The body of a handler's `initially { }` clause, or None when the state was written as `(init)` or omitted.")]
+pub fn handle_init_clause(init_opt: Option[Expr]) : Option[Expr] = match init_opt {
+  None -> None
+  Some(ie) -> match ie.kind {
+    ESurface(sf) -> match sf {
+      SfHandleInit(inner) -> Some(inner)
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Mirror of the typer's shape rule: the lifecycle form carries no
+# params, while an op clause always has at least `resume`.
+#[doc("True for a handler's `initially`/`finally` clause, as opposed to an operation clause.")]
+pub fn fmt_is_lifecycle_clause(name: String, params: [Param]) : Bool =
+  if name == "finally" or name == "initially" {
+    match params { [] -> true _ -> false }
+  } else { false }
+
+#[doc("The source line a statement sits on.")]
+pub fn stmt_line(st: Stmt) : Int {
+  match st {
+    SLet(p, _, _) -> p.line
+    SAssert(e, _) -> e.line
+    SExprStmt(e) -> e.line
+    SIndexAssign(_, _, _, line, _) -> line
+    SAssign(_, _, line, _) -> line
+    SVar(_, _, _, line, _) -> line
+    SUse(_, line, _) -> line
+  }
+}
+
+# Same shape as `decls_trailing_limit` — see that comment for the
+# rationale. For the last stmt, callers pass `last_limit`:
+#   > 0   = the line of the next AST anchor after the block (e.g.
+#            the tail expression's line). Lets multi-line trailings
+#            on the last stmt drain inline.
+#   == 0  = no anchor known (block has no tail). Falls back to
+#            `stmt_line(st) + 1` — single-line trailings still
+#            drain, multi-line trailings on the last stmt of a
+#            tail-less block stay full-line-demoted.
+#[doc("Exclusive upper source line for draining a statement's trailing comment: the next statement's line, or `last_limit` for the last one.")]
+pub fn stmts_trailing_limit(st: Stmt, rest: [Stmt], last_limit: Int) : Int {
+  match rest {
+    [] -> if last_limit > 0 {
+      last_limit
+    } else {
+      stmt_line(st) + 1
+    }
+    [next, ..._tail] -> stmt_line(next)
+  }
+}

@@ -131,11 +131,35 @@ Measured at 100 columns, `kai fmt` today:
 |---|---|---|---|---|
 | `examples/fmt/width` | 18 | 14 | 195 | 2 |
 | `stdlib` | 74 | 263 | 1734 | 88 |
-| `stage2/compiler` | 158 | 4990 | 2207 | 631 |
+| `stage2/compiler` | 160 | 4996 | 2207 | 641 |
 
 The compiler row is the one to sit with: `kai fmt` rewrites its own
 sources in place, and doing so would leave ~5,000 lines past the
 budget, the worst of them 2,207 columns wide.
+
+## Where the width model goes
+
+`compiler/fmt_writer.kai` is the text substrate (the threaded `FmtSt`,
+indentation, comment draining). `compiler/fmt_expr.kai` is the
+mutually-recursive walker — expression, pattern, type, statement, row —
+which kaikai's ban on import cycles keeps in one module;
+`fmt_decl`/`fmt_effect`/`fmt_anchor` sit above it, and
+`compiler/fmt_shape.kai`, `compiler/fmt_names.kai` and
+`compiler/fmt_refine.kai` below.
+
+`fmt_shape.kai` is the one to extend. It holds the queries the writer
+asks about a node before it picks a layout — is this atomic, does it
+open with a `{`, how many trailing lambdas — and nothing in it calls
+back into the walker. "Does this subtree fit in the remaining width"
+and "how wide is it printed flat" are the same kind of question, so
+they belong there, where they can be read and tested without the
+emitters around them.
+
+`FmtSt` currently tracks `at_line_start` but not a column. A width
+model needs the column, and the writer's purely functional shape (state
+threaded, no IO) means a group can be rendered speculatively into a
+scratch `FmtSt` and measured — the flat/broken decision does not have
+to be a full Wadler document tree on day one.
 
 ## What the rewrite has to reach
 
