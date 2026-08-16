@@ -1,0 +1,195 @@
+#[doc("""
+compiler.home_dup — declaration registries keyed by `(home, name)`.
+
+Four registries were built on the spelling alone, first entry winning:
+extern types, kind names, habitant introducers, and `#[constructor]`
+claims. Keyed bare, such a registry either loses a declaration silently
+(the first `extern "C" type Color` wins and the second unpacks with the
+wrong C layout) or rejects a legitimate one (two modules each with
+their own type and its own constructor).
+
+Keying at construction splits the two. Two declarations from DIFFERENT
+modules are distinct entries; the constructor registry simply stops
+colliding. The other three have no use site a qualifier could reach —
+an extern type names one C layout, a kind's theory is the unification
+ALGEBRA of the types it classifies, and an introducer IS the syntax
+that declares habitants — so for them the cross-module duplicate is
+itself the defect, and it is reported rather than resolved.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.diag
+import compiler.diag_file
+
+# One declaration's identity: home module, spelling, position.
+pub type HomedDecl = HD(Option[String], String, Int, Int)
+
+#[doc("The home module of a homed declaration; `None` for the root file.")]
+pub fn hd_home(h: HomedDecl) : Option[String] = match h { HD(m, _, _, _) -> m }
+
+#[doc("The spelling of a homed declaration.")]
+pub fn hd_name(h: HomedDecl) : String = match h { HD(_, n, _, _) -> n }
+
+#[doc("The source line of a homed declaration.")]
+pub fn hd_line(h: HomedDecl) : Int = match h { HD(_, _, l, _) -> l }
+
+#[doc("The source column of a homed declaration.")]
+pub fn hd_col(h: HomedDecl) : Int = match h { HD(_, _, _, c) -> c }
+
+#[doc("True when two homes are the same module. Unlike a lookup match, a homeless entry answers only another homeless one — a duplicate key must be exact.")]
+pub fn home_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { None -> false  Some(y) -> x == y }
+}
+
+#[doc("The entry in `tbl` under `name` declared by the same module, if any.")]
+pub fn homed_find(tbl: [HomedDecl], home: Option[String],
+                  name: String) : Option[HomedDecl] = match tbl {
+  [] -> None
+  [h, ...rest] ->
+    if hd_name(h) == name and home_eq(hd_home(h), home) { Some(h) }
+    else { homed_find(rest, home, name) }
+}
+
+#[doc("The entry in `tbl` under `name` declared by any module, same or not.")]
+pub fn homed_find_any(tbl: [HomedDecl], name: String) : Option[HomedDecl] =
+  match tbl {
+    [] -> None
+    [h, ...rest] -> if hd_name(h) == name { Some(h) } else { homed_find_any(rest, name) }
+  }
+
+#[doc("A home rendered for a diagnostic: the module name, or the root file when the decl has none.")]
+pub fn home_display(m: Option[String]) : String = match m {
+  Some(x) -> x
+  None    -> "the root file"
+}
+
+#[doc("The file a decl with this home was written in; the root file when the module table has no entry.")]
+pub fn home_diag_file(df: DiagFiles, m: Option[String]) : String = match m {
+  None    -> df_root(df)
+  Some(x) -> module_file_or(x, df_mods(df), df_root(df))
+}
+
+# Anchor at the second declaration, cite the first, name both homes so
+# the reader sees which two modules to reconcile.
+fn report_conflict(df: DiagFiles, msg: String, help: String,
+                   second: HomedDecl, first: HomedDecl) : Unit / Console + File {
+  diag_error(home_diag_file(df, hd_home(second)),
+             hd_line(second), hd_col(second), msg)
+  diag_note(concat_all(["declared by ", home_display(hd_home(first)), ", ",
+                        home_display(hd_home(second)), "; first at ",
+                        home_diag_file(df, hd_home(first)), ":",
+                        int_to_string(hd_line(first)), ":",
+                        int_to_string(hd_col(first))]))
+  diag_help(help)
+}
+
+# ====================================================================
+# Extern types — one name, one C layout.
+# ====================================================================
+
+#[doc("Reject two `extern \"C\" type` declarations sharing a name. The name denotes a C layout the boundary classifier unpacks against, so a second declaration under the same spelling has no reading that keeps both correct.")]
+pub fn validate_extern_type_homes(decls: [Decl], df: DiagFiles) : Int / Console + File =
+  extern_home_loop(decls, df, [], 0)
+
+fn extern_home_loop(decls: [Decl], df: DiagFiles, seen: [HomedDecl],
+                    errs: Int) : Int / Console + File = match decls {
+  [] -> errs
+  [d, ...rest] -> match decl_extern_type(d) {
+    None -> extern_home_loop(rest, df, seen, errs)
+    Some(e) -> match homed_find_any(seen, hd_name(e)) {
+      Some(prev) -> {
+        report_conflict(df,
+          concat_all(["conflicting declarations of extern type `",
+                      hd_name(e), "`"]),
+          "an extern type names one C layout; keep one declaration and import it",
+          e, prev)
+        extern_home_loop(rest, df, seen, errs + 1)
+      }
+      None -> extern_home_loop(rest, df, [e, ...seen], errs)
+    }
+  }
+}
+
+fn decl_extern_type(d: Decl) : Option[HomedDecl] = match d {
+  DExternType(name, _, l, c, mo) -> Some(HD(mo, name, l, c))
+  DDoc(_, _, inner, _, _)        -> decl_extern_type(inner)
+  DAttr(_, inner, _, _)          -> decl_extern_type(inner)
+  _                              -> None
+}
+
+# ====================================================================
+# Kinds and their introducers — one name, one algebra.
+# ====================================================================
+
+#[doc("Reject two `kind` declarations sharing a name, and two kinds registering the same habitant introducer. A kind names the unification algebra of the types it classifies and an introducer is habitant-declaration syntax; neither has a use site a qualifier reaches.")]
+pub fn validate_kind_homes(decls: [Decl], df: DiagFiles) : Int / Console + File =
+  kind_home_loop(decls, df, [], [], 0)
+
+fn kind_home_loop(decls: [Decl], df: DiagFiles, kinds: [HomedDecl],
+                  intros: [HomedDecl], errs: Int) : Int / Console + File = match decls {
+  [] -> errs
+  [d, ...rest] -> match decl_kind(d) {
+    None -> kind_home_loop(rest, df, kinds, intros, errs)
+    Some(KD(k, intro)) -> {
+      let ke = kind_dup_errs(df, kinds, k)
+      let ie = intro_dup_errs(df, intros, intro)
+      kind_home_loop(rest, df, [k, ...kinds], kind_intro_seen(intros, intro),
+                     errs + ke + ie)
+    }
+  }
+}
+
+# A kind's declaration paired with the introducer word it registers;
+# the introducer is absent for a derived or value-domain habitant form.
+type KindDecl = KD(HomedDecl, Option[HomedDecl])
+
+fn kind_dup_errs(df: DiagFiles, kinds: [HomedDecl],
+                 k: HomedDecl) : Int / Console + File =
+  match homed_find_any(kinds, hd_name(k)) {
+    None -> 0
+    Some(prev) -> {
+      report_conflict(df,
+        concat_all(["kind `", hd_name(k), "` is declared in more than one module"]),
+        "a kind names one unification algebra; keep one declaration and import it",
+        k, prev)
+      1
+    }
+  }
+
+fn intro_dup_errs(df: DiagFiles, intros: [HomedDecl],
+                  intro: Option[HomedDecl]) : Int / Console + File = match intro {
+  None -> 0
+  Some(i) -> match homed_find_any(intros, hd_name(i)) {
+    None -> 0
+    Some(prev) -> {
+      report_conflict(df,
+        concat_all(["introducer `", hd_name(i),
+                    "` is registered by more than one kind"]),
+        "an introducer word is habitant-declaration syntax and admits no qualifier; give one kind a different word",
+        i, prev)
+      1
+    }
+  }
+}
+
+fn kind_intro_seen(intros: [HomedDecl], intro: Option[HomedDecl]) : [HomedDecl] =
+  match intro {
+    None    -> intros
+    Some(i) -> [i, ...intros]
+  }
+
+fn decl_kind(d: Decl) : Option[KindDecl] = match d {
+  DKind(_, name, _, _, hab, l, c, mo) ->
+    Some(KD(HD(mo, name, l, c), kind_intro_decl(hab, l, c, mo)))
+  DDoc(_, _, inner, _, _) -> decl_kind(inner)
+  DAttr(_, inner, _, _)   -> decl_kind(inner)
+  _                       -> None
+}
+
+fn kind_intro_decl(hab: KindHab, l: Int, c: Int,
+                   mo: Option[String]) : Option[HomedDecl] {
+  let word = kind_hab_intro(hab)
+  if string_length(word) == 0 { None } else { Some(HD(mo, word, l, c)) }
+}
