@@ -236,25 +236,29 @@ When two imports declare the same name, qualify the use — the
 qualifier names the module the declaration comes from:
 
 ```kaikai
-import ea
+import trace
+import protocols
 
 type Box = { n: Int }
 
-impl ea.Render for Box { fn render(x: Box) : String = "boxed" }
+impl protocols.Show for Box { fn show(x: Box) : String = "boxed" }
 #    ^ protocol in an `impl` head
 
-fn emit() : Unit / Emit = ea.Emit.put("hi")
-#                           ^ effect operation
+fn emit() : Unit / Trace = trace.Trace.log("hi")
+#                            ^ effect operation
 
 fn main() : Unit / Stdout =
-  handle { emit() } with ea.Emit { put(s, resume) -> resume(Stdout.print(s)) }
-#                            ^ effect in a handler head
+  handle { emit() } with trace.Trace {
+#                          ^ effect in a handler head
+    log(msg, resume) -> resume(Stdout.print(msg))
+    checkpoint(name, resume) -> resume(())
+  }
 ```
 
 A qualifier is accepted on types, variant constructors (in expression
 and pattern position), functions, constants, protocols in an `impl`
 head, effects in a `handle … with` head, and effect operations. It is
-only a disambiguator: `ea.Emit.put` and `Emit.put` name the same
+only a disambiguator: `trace.Trace.log` and `Trace.log` name the same
 operation whenever the bare name is unambiguous.
 
 ## Tests
