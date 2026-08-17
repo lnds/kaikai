@@ -146,8 +146,20 @@ elif [ "$count" -eq 0 ]; then
   # the oracle does the same, so both must run in the same directory).
   SAMPLE="$(mktemp -d)/sc_probe.kai"
   printf 'fn main() : Unit / Console = println("kaikai self-host")\n' > "$SAMPLE"
-  nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ncrc=$?
-  oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)"; ocrc=$?
+  # `x="$(cmd)"; rc=$?` dies under `set -e` before the diagnostic below
+  # can run: a crashing compiler takes the whole gate with it and the job
+  # reports a bare exit code. Guard each capture so a non-zero status is
+  # data, not a fatal error, and a signal death names its signal.
+  nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ncrc=$?
+  ncrc="${ncrc:-0}"
+  if [ "$ncrc" -gt 128 ]; then
+    echo "::error::native-selfhost-gate FAIL — the native-built compiler died on signal $((ncrc - 128)) compiling the sample program."
+    echo "  The binary links and runs \`--version\`, so this is the front-end,"
+    echo "  not startup. Sample: $SAMPLE"
+    rm -f "$BIN"; exit 1
+  fi
+  oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ocrc=$?
+  ocrc="${ocrc:-0}"
   # The trivial sample derives nothing, so the `#[derive(Layout)]` impl
   # builder never runs. Re-run the SAME native binary over a Layout-deriving
   # program so that codegen lowers under the native backend, and assert
@@ -157,8 +169,14 @@ elif [ "$count" -eq 0 ]; then
   LAYOUT="$ROOT/examples/sugars/kinds_layout_derive.kai"
   lnc=""; loc=""; lncrc=0; locrc=0
   if [ -f "$LAYOUT" ]; then
-    lnc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)"; lncrc=$?
-    loc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)"; locrc=$?
+    lnc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || lncrc=$?
+    lncrc="${lncrc:-0}"
+    if [ "$lncrc" -gt 128 ]; then
+      echo "::error::native-selfhost-gate FAIL — the native-built compiler died on signal $((lncrc - 128)) compiling $LAYOUT."
+      rm -f "$BIN"; exit 1
+    fi
+    loc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || locrc=$?
+    locrc="${locrc:-0}"
   fi
   rm -f "$BIN"
   if [ "$ncrc" -ne 0 ]; then
