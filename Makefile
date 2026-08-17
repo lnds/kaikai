@@ -1105,8 +1105,11 @@ tier1-backend-parity:
 # its 30-min budget — every scheduled run was silently `cancelled` at the
 # timeout, producing no diagnostic at all. Keep the daily under its budget
 # so it actually completes; the two heavy gates keep their per-PR coverage.
-daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget"
+# `selfhost` is here rather than on the PR path: the native half of the
+# byte-identity gate already runs per-PR in tier1-native, and the C half
+# costs two whole compiler generations for a check nothing gates on.
+daily: tier1 selfhost stress-fixtures coverage-probe rc-budget test-binserialize-budget
+	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC
