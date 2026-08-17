@@ -282,7 +282,7 @@ distinguishes it within that home.
 |---|---|
 | function | `kai_<home>__<name>` |
 | user function | `kaiu_<home>__<name>` |
-| variant tag | **dense index**, assigned deterministically |
+| variant tag | hash of `(home, ctor)`, linear probe — see below |
 | variant table entry | keyed `(home, ctor)`, carrying arity + payload |
 | impl method | `__pimpl_<home_P>__<P>_<home_T>__<T>_<op>` |
 | protocol dispatcher | `__proto_<home_P>__<P>_<op>` |
@@ -392,7 +392,8 @@ changes meaning.
   warning is not available for these** — the current behaviour is memory
   corruption, and corruption cannot be kept for an edition as a
   compatibility measure.
-- Per-home variant tags replacing hashed tags.
+- Per-home variant tags: the hash key becomes `(home, ctor)`, the
+  hashing scheme itself is kept (§5).
 - Evidence labels keyed by home.
 - New qualified syntax for effect ops, units and kinds — pure addition.
 

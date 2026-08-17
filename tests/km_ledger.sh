@@ -35,7 +35,7 @@ printf '%-24s %-14s %s\n' "compiler (all)" "$(score_of stage2/compiler)" "$(loc_
 # The files the refactor threads through. A new one joins this list when
 # a step starts touching it.
 for f in ast.kai surface_lower.kai modules.kai emit_shared.kai infer.kai \
-         perceus.kai emit_c.kai protos.kai; do
+         perceus.kai emit_c.kai protos.kai kir_lower_walk.kai tycon_home.kai; do
   [ -f "stage2/compiler/$f" ] || continue
   printf '%-24s %-14s %s\n' "$f" "$(score_of "stage2/compiler/$f")" "$(loc_of "stage2/compiler/$f")"
 done

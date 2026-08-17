@@ -1035,7 +1035,10 @@ fn lower_modcall_value(modn: String, name: String, pos: KPos, st: LowerSt) : LRe
   match kir_const_body_home(st.consts, modn, name) {
     Some(body) -> lower_expr(body, st)
     None ->
-      if kir_name_is_ctor(name) { bind_op(st, KCon(name, ls_variant_tag(st, name), 0, [], false), pos) }
+      if kir_name_is_ctor(name) {
+        let hm = evar_qual_home(st.vs, modn, name)
+        bind_op(st, KCon(name, ls_variant_tag_arity(st, hm, name, 0), 0, [], false), pos)
+      }
       else { match kir_const_body(st.consts, name) {
         Some(body) -> lower_expr(body, st)
         None -> match ls_fn_value_qualified(st, modn, name) {
@@ -2704,7 +2707,9 @@ fn lower_init_opt(init_opt: Option[Expr], st: LowerSt) : LResOpt / Console = mat
 fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match f.kind {
   EVar(callee) -> lower_named_call(x, callee, cargs, st)
   EModCall(modn, name) ->
-    if kir_name_is_ctor(name) { lower_ctor_call(x, name, cargs, st) }
+    if kir_name_is_ctor(name) {
+      lower_ctor_call(x, evar_qual_home(st.vs, modn, name), name, cargs, st)
+    }
     # A cross-module `extern "C" fn` (`myffi.abs`) resolves to its mangled
     # wrapper `kai_myffi__abs`, not the bare `myffi__abs` — the wrapper calls
     # the bare extern `abs`, so the two must not share a symbol.
@@ -2751,6 +2756,16 @@ fn lower_named_call(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes 
     None                 -> lower_named_call_kind(x, callee, cargs, st)
   }
 
+
+# An unqualified constructor takes its home from the type it builds, not
+# from the module the call is written in: the same module can match two
+# same-named constructors whose types come from different homes, so the
+# use site cannot tell them apart.
+fn ctor_home_of_expr_ty(x: Expr) : Option[String] = match x.ty {
+  Some(TyCon(mo, _, _)) -> mo
+  _                     -> None
+}
+
 # Dispatch a non-effect-op bare call by its `CalleeKind`.
 fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match classify_callee(callee) {
@@ -2785,7 +2800,7 @@ fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : 
     # transparently to the inner value; the enclosing call site emits the
     # post-call KDrop (`ob_drop_after`).
     CkOwnedBorrow -> lower_borrow_through(cargs, st)
-    CkCtor      -> lower_ctor_call(x, callee, cargs, st)
+    CkCtor      -> lower_ctor_call(x, ctor_home_of_expr_ty(x), callee, cargs, st)
     # A bare callee that resolves to a top-level fn is a direct call; one
     # that does not is a LOCAL binder holding a function value (a param /
     # let-bound closure like `dec` in `dec(buf, pos)`) → call it through
@@ -3323,16 +3338,18 @@ fn lower_reuse_record(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / 
 # else boxed. Mirror of `lower_tcrec_args` for the ctor-arg ABI: the slot init
 # `SIInt64`/`SIBoxed` matches the arg's lowered repr, so the emitter never
 # re-boxes a raw scalar just to store it raw again (the rb-tree hot-path box).
-fn lower_ctor_call(x: Expr, name: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let tys = match evar_payload_tys(st.vs, name) { Some(t) -> t None -> [] }
-  match lower_ctor_args(cargs, name, tys, st, []) { LCtorInits(inits, st1) ->
-    bind_op(st1, KCon(name, ls_variant_tag(st1, name), ls_ctor_mask(st1, name), inits, st1.in_region), kpos_of(x)) }
+fn lower_ctor_call(x: Expr, home: Option[String], name: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let ar = list_length(cargs)
+  let tys = match evar_payload_tys_arity(st.vs, home, name, ar) { Some(t) -> t None -> [] }
+  match lower_ctor_args(cargs, home, name, tys, st, []) { LCtorInits(inits, st1) ->
+    bind_op(st1, KCon(name, ls_variant_tag_arity(st1, home, name, ar),
+                      ls_ctor_mask_arity(st1, home, name, ar), inits, st1.in_region), kpos_of(x)) }
 }
 
 # Per-slot ctor-arg lowering result: the slot inits + threaded state.
 type LCtorInits = LCtorInits([KSlotInit], LowerSt)
 
-fn lower_ctor_args(cargs: [Expr], name: String, tys: [TypeExpr], st: LowerSt, acc: [KSlotInit]) : LCtorInits / Console =
+fn lower_ctor_args(cargs: [Expr], home: Option[String], name: String, tys: [TypeExpr], st: LowerSt, acc: [KSlotInit]) : LCtorInits / Console =
   match cargs {
     [] -> LCtorInits(acc, st)
     [e, ...rest] -> {
@@ -3340,26 +3357,26 @@ fn lower_ctor_args(cargs: [Expr], name: String, tys: [TypeExpr], st: LowerSt, ac
         [_, ...r] -> r
         [] -> []
       }
-      let k = lower_ctor_slot_kind(st, name, tys)
+      let k = lower_ctor_slot_kind(st, home, name, tys)
       # A user-ctor kind-1 Int slot lowers RAW; a kind-2 Real / kind-3 enum
       # slot lowers boxed but is WRAPPED at its kind so the emitter stores the
       # raw f64 bits / immediate tag word; builtins + boxed slots stay boxed.
       if k == 1 {
         match lower_expr_raw_at(e, SInt64, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIInt64(v)])) }
+          lower_ctor_args(rest, home, name, trest, st1, list_append(acc, [SIInt64(v)])) }
       } else if k == 2 {
         match lower_expr(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIReal(v)])) }
+          lower_ctor_args(rest, home, name, trest, st1, list_append(acc, [SIReal(v)])) }
       } else if k == 3 {
         # Literal-ctor peephole (the C `{.i64 = tag}` mirror): a bare nullary
         # user-ctor arg (`Red`) contributes its tag as an immediate — no
         # singleton load + tag re-read. Anything else lowers boxed and the
         # emitter takes the tag at the border (`kaix_take_enum`).
         match lower_enum_slot_arg(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIEnum(v)])) }
+          lower_ctor_args(rest, home, name, trest, st1, list_append(acc, [SIEnum(v)])) }
       } else {
         match lower_expr(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, name, trest, st1, list_append(acc, [SIBoxed(v)])) }
+          lower_ctor_args(rest, home, name, trest, st1, list_append(acc, [SIBoxed(v)])) }
       }
     }
   }
@@ -3367,8 +3384,8 @@ fn lower_ctor_args(cargs: [Expr], name: String, tys: [TypeExpr], st: LowerSt, ac
 # The slot kind of the head slot of `tys` for a USER ctor; builtins classify
 # 0 (boxed — the runtime owns their slot layout). Same resolver as
 # `slot_kind_of` / `ls_ctor_mask` (`variant_slot_kind` over `st.enums`).
-fn lower_ctor_slot_kind(st: LowerSt, name: String, tys: [TypeExpr]) : Int =
-  if evar_find_tag(st.vs, name) < user_variant_tag_base() { 0 }
+fn lower_ctor_slot_kind(st: LowerSt, home: Option[String], name: String, tys: [TypeExpr]) : Int =
+  if evar_find_tag_arity(st.vs, home, name, list_length(tys)) < user_variant_tag_base() { 0 }
   else { match tys {
     [t, ..._] -> variant_slot_kind(t, st.enums)
     []        -> 0
