@@ -62,24 +62,39 @@ while IFS=$'\t' read -r class shape position polarity target; do
     fixtures=$((fixtures + 1))
   done
 
-  # Depth where the corpus has shown a defect: one example says the
-  # shape reproduces once, which is how a class comes to look covered
-  # while its variants go untested. Measured on the payload cell —
-  # record-vs-scalar and list-vs-scalar segfault, bool-vs-string does
-  # not, so a single fixture could have declared the cell green.
+  # Two fixtures per cell is the default, not an opt-in. One example says
+  # the shape reproduces once, which is exactly how a cell comes to look
+  # covered while its variants go untested: `module/named-like-type` was
+  # green on a fixture declaring both names in one file, while the same
+  # shape across two modules failed. The single fixture is always the
+  # benign one, because the benign one is what you reach for first.
+  #
+  # A cell that genuinely admits one arrangement says so in the polarity
+  # column as `shallow: <reason>` — the same discipline `N/A: <reason>`
+  # already uses. Depth is what you get by default; being exempt is what
+  # you have to argue for.
   #
   # The ceiling is not decoration: past five, a cell is being tested by
   # accumulation rather than by design, and the extras belong in their
   # own cells.
-  if [ "$polarity" = "deep" ]; then
-    if [ "$n_here" -lt 2 ]; then
-      echo "  THIN   $class / $shape / $position — marked deep, has $n_here fixture(s), needs 2"
-      thin=$((thin + 1))
-    elif [ "$n_here" -gt 5 ]; then
-      echo "  FAT    $class / $shape / $position — $n_here fixtures; past 5, split the cell"
-      thin=$((thin + 1))
-    fi
-  fi
+  case "$polarity" in
+    shallow:*)
+      reason="${polarity#shallow:}"
+      if [ -z "$(echo "$reason" | tr -d ' ')" ]; then
+        echo "  EMPTY  $class / $shape / $position — shallow without a reason"
+        thin=$((thin + 1))
+      fi
+      ;;
+    *)
+      if [ "$n_here" -lt 2 ]; then
+        echo "  THIN   $class / $shape / $position — $n_here fixture(s), needs 2 (or 'shallow: <reason>')"
+        thin=$((thin + 1))
+      elif [ "$n_here" -gt 5 ]; then
+        echo "  FAT    $class / $shape / $position — $n_here fixtures; past 5, split the cell"
+        thin=$((thin + 1))
+      fi
+      ;;
+  esac
 done < "$MATRIX"
 
 # Reverse direction: fixtures nothing claims.
@@ -99,7 +114,31 @@ done
 covered=$((rows - todo - na))
 echo "namespace_matrix: $rows rows, $covered covered ($fixtures fixtures), $na not applicable, $todo uncovered, $missing dangling, $unclaimed unclaimed, $thin thin"
 
-if [ "$todo" -gt 0 ] || [ "$missing" -gt 0 ] || [ "$unclaimed" -gt 0 ] || [ "$thin" -gt 0 ]; then
+# Structural errors are absolute: a row naming a fixture that is not there,
+# a fixture no row claims, a cell with neither fixture nor reason. None of
+# these is debt to pay down — they mean the matrix and the corpus disagree
+# right now.
+if [ "$todo" -gt 0 ] || [ "$missing" -gt 0 ] || [ "$unclaimed" -gt 0 ]; then
   echo "namespace_matrix: the matrix and the corpus disagree — add the fixture, write the reason, or claim the orphan"
   exit 1
+fi
+
+# Thinness is a backlog, so it ratchets instead of blocking: the count may
+# not grow, and every cell deepened lowers the ceiling for good. A hard
+# failure on the whole backlog would just get the gate switched off.
+thin_baseline_file="tests/namespace_matrix_thin_baseline.txt"
+thin_baseline=0
+[ -f "$thin_baseline_file" ] && thin_baseline=$(cat "$thin_baseline_file")
+
+if [ "$thin" -gt "$thin_baseline" ]; then
+  echo "namespace_matrix FAIL — thin cells $thin > baseline $thin_baseline"
+  echo "fix path: give the new cell a second fixture exercising a DIFFERENT"
+  echo "          arrangement (the homonym in another module, or against"
+  echo "          the stdlib), or mark it 'shallow: <reason>'."
+  exit 1
+fi
+
+if [ "$thin" -lt "$thin_baseline" ]; then
+  echo "namespace_matrix OK (improved) — thin $thin < baseline $thin_baseline"
+  echo "  suggest: echo $thin > $thin_baseline_file"
 fi
