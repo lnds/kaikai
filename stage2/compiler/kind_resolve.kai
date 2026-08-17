@@ -23,6 +23,7 @@ the candidate count.
 
 import compiler.util
 import compiler.ast
+import compiler.home_dup
 import compiler.kinds
 import compiler.kind_theory
 import compiler.diag
@@ -30,19 +31,22 @@ import compiler.unit_walk
 import compiler.unit_scope
 
 # Resolution context for one file: which kinds each atomic habitant
-# symbol inhabits, the kinds opened by `use kind`, the alias names
+# symbol inhabits, the kinds opened by `use kind` (each keyed by the
+# module that wrote the open — `use kind` is file scope, so one
+# module's open must not resolve another module's bare habitant), the
+# alias names
 # (left bare here for the later alias-expansion pass to resolve), the
 # (kind, theory) pairs the unit formation check dispatches on, the
 # value-domain (form-b) kinds as `KI(domain, kind)`, the closed-set
 # kinds, and the per-module habitant declaration sites.
-pub type KindCtx = KCtx([SymKinds], [String], [String], [KindTheory], [KindIntro], [ClosedKind], [HabSlots], [UnitSite])
+pub type KindCtx = KCtx([SymKinds], [HomedDecl], [String], [KindTheory], [KindIntro], [ClosedKind], [HabSlots], [UnitSite])
 
 # The set of kinds a single habitant symbol inhabits.
 pub type SymKinds = SK(String, [String])
 #                      sym     kinds
 
 fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _, _, _, _, _) -> s }
-fn kc_uses(c: KindCtx) : [String] = match c { KCtx(_, u, _, _, _, _, _, _) -> u }
+fn kc_uses(c: KindCtx) : [HomedDecl] = match c { KCtx(_, u, _, _, _, _, _, _) -> u }
 fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _, _, _, _, _) -> a }
 fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m, _, _, _, _) -> m }
 fn kc_doms(c: KindCtx) : [KindIntro] = match c { KCtx(_, _, _, _, ds, _, _, _) -> ds }
@@ -157,10 +161,10 @@ fn closed_atom_syms(atoms: [String], kind: String, acc: [SymKinds]) : [SymKinds]
   [a, ...rest] -> closed_atom_syms(rest, kind, sym_kinds_add(acc, a, kind))
 }
 
-fn bkc_uses(decls: [Decl], acc: [String]) : [String] = match decls {
+fn bkc_uses(decls: [Decl], acc: [HomedDecl]) : [HomedDecl] = match decls {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
-    DUseKind(k, _, _) -> bkc_uses(rest, [k, ...acc])
+    DUseKind(k, l, c, mo) -> bkc_uses(rest, [HD(mo, k, l, c), ...acc])
     _ -> bkc_uses(rest, acc)
   }
 }
@@ -192,17 +196,29 @@ fn skl_loop(xs: [SymKinds], sym: String) : [String] = match xs {
   [e, ...rest] -> match e { SK(s, ks) -> if s == sym { ks } else { skl_loop(rest, sym) } }
 }
 
-# The single `use kind` open for `sym`: the used kind that `sym` also
-# inhabits, if exactly one such kind exists. Returns None otherwise.
-fn used_kind_for(c: KindCtx, candidates: [String]) : Option[String] =
-  ukf_loop(kc_uses(c), candidates, None)
+# The single `use kind` open for `sym` as seen from `home`: the used
+# kind that `sym` also inhabits, if exactly one such kind exists and
+# the open was written by the resolving module. Returns None otherwise.
+fn used_kind_for(c: KindCtx, home: String, candidates: [String]) : Option[String] =
+  ukf_loop(kc_uses(c), home, candidates, None)
 
-fn ukf_loop(uses: [String], candidates: [String], found: Option[String]) : Option[String] = match uses {
+fn ukf_loop(uses: [HomedDecl], home: String, candidates: [String],
+            found: Option[String]) : Option[String] = match uses {
   [] -> found
   [u, ...rest] ->
-    if list_has(candidates, u) {
-      match found { None -> ukf_loop(rest, candidates, Some(u)) Some(_) -> None }
-    } else { ukf_loop(rest, candidates, found) }
+    if list_has(candidates, hd_name(u)) and use_kind_visible_at(u, home) {
+      match found {
+        None -> ukf_loop(rest, home, candidates, Some(hd_name(u)))
+        Some(k) -> if k == hd_name(u) { ukf_loop(rest, home, candidates, found) } else { None }
+      }
+    } else { ukf_loop(rest, home, candidates, found) }
+}
+
+# An open resolves for the module that wrote it. The empty home is the
+# root file, whose decls carry no module origin.
+fn use_kind_visible_at(u: HomedDecl, home: String) : Bool = match hd_home(u) {
+  None    -> home == ""
+  Some(m) -> m == home
 }
 
 # Result of resolving one bare symbol: the qualified rewrite, an error
@@ -229,7 +245,7 @@ pub fn resolve_sym_from(c: KindCtx, locals: [String], sym: String,
   } else {
     match rs_module_scoped(c, sym, home) {
       Some(r) -> r
-      None -> rs_unscoped(c, sym)
+      None -> rs_unscoped(c, sym, home)
     }
   }
 }
@@ -239,21 +255,22 @@ pub fn resolve_sym_from(c: KindCtx, locals: [String], sym: String,
 # habitant (`<3>`, `<"tag">`) resolves by its literal's domain against
 # the form-b (`with Int` / `with String`) kinds; a symbol resolves by
 # name against the declared-habitant map.
-fn rs_unscoped(c: KindCtx, sym: String) : SymRes =
+fn rs_unscoped(c: KindCtx, sym: String, home: String) : SymRes =
   if list_has(kc_aliases(c), sym) { SRok(sym) }
   else {
     let dom = unit_sym_value_domain(sym)
     let candidates =
       if dom == "" { sym_kinds_lookup(c, sym) } else { domain_kinds_lookup(c, dom) }
-    pick_candidate(c, sym, candidates)
+    pick_candidate(c, sym, home, candidates)
   }
 
 # The precedence over a candidate-kind list: unique wins, `use kind`
 # breaks a tie, anything else is ambiguous.
-fn pick_candidate(c: KindCtx, sym: String, candidates: [String]) : SymRes = match candidates {
+fn pick_candidate(c: KindCtx, sym: String, home: String,
+                  candidates: [String]) : SymRes = match candidates {
   [] -> SRunknown
   [only] -> SRok(kind_qualify_nondefault(only, sym))
-  _ -> match used_kind_for(c, candidates) {
+  _ -> match used_kind_for(c, home, candidates) {
     Some(k) -> SRok(kind_qualify_nondefault(k, sym))
     None -> SRambig(candidates)
   }
@@ -288,7 +305,7 @@ fn rs_pick_at(c: KindCtx, sym: String, at_home: String, chosen: [UnitSite],
   if unit_sites_all_alias(chosen) {
     SRok(unit_spell(sym, at_home, unit_name_multi_at(all_sites, measure_kind_name())))
   } else {
-    match pick_candidate(c, sym, unit_sites_kinds(chosen)) {
+    match pick_candidate(c, sym, at_home, unit_sites_kinds(chosen)) {
       SRok(_) -> rs_pick_kind_at(c, sym, at_home, chosen, all_sites)
       r -> r
     }
@@ -296,16 +313,16 @@ fn rs_pick_at(c: KindCtx, sym: String, at_home: String, chosen: [UnitSite],
 
 fn rs_pick_kind_at(c: KindCtx, sym: String, at_home: String,
       chosen: [UnitSite], all_sites: [UnitSite]) : SymRes = {
-  let k = rs_chosen_kind(c, unit_sites_kinds(chosen))
+  let k = rs_chosen_kind(c, at_home, unit_sites_kinds(chosen))
   SRok(kind_qualify_nondefault(k,
     unit_spell(sym, at_home, unit_name_multi_at(all_sites, k))))
 }
 
 # The kind pick_candidate already accepted: unique, or the `use kind`
 # tie-break.
-fn rs_chosen_kind(c: KindCtx, kinds: [String]) : String = match kinds {
+fn rs_chosen_kind(c: KindCtx, home: String, kinds: [String]) : String = match kinds {
   [only] -> only
-  _ -> match used_kind_for(c, kinds) {
+  _ -> match used_kind_for(c, home, kinds) {
     Some(k) -> k
     None -> measure_kind_name()
   }
@@ -324,17 +341,17 @@ fn rs_foreign(c: KindCtx, sym: String, sites: [UnitSite],
     _ ->
       if unit_sites_any_alias(vis) { SRambigMod(homes) }
       else {
-        match pick_candidate(c, sym, unit_sites_kinds(vis)) {
-          SRok(_) -> rs_foreign_kind(c, sym, vis, sites)
+        match pick_candidate(c, sym, home, unit_sites_kinds(vis)) {
+          SRok(_) -> rs_foreign_kind(c, sym, home, vis, sites)
           r -> r
         }
       }
   }
 }
 
-fn rs_foreign_kind(c: KindCtx, sym: String, vis: [UnitSite],
+fn rs_foreign_kind(c: KindCtx, sym: String, home: String, vis: [UnitSite],
       sites: [UnitSite]) : SymRes = {
-  let k = rs_chosen_kind(c, unit_sites_kinds(vis))
+  let k = rs_chosen_kind(c, home, unit_sites_kinds(vis))
   let khomes = unit_sites_homes(unit_sites_of_kind(vis, k))
   match khomes {
     [f] -> SRok(kind_qualify_nondefault(k,
@@ -570,7 +587,7 @@ fn skd_loop(decls: [Decl], acc: [Decl]) : [Decl] = match decls {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DKind(_, _, _, _, _, _, _, _) -> skd_loop(rest, acc)
-    DUseKind(_, _, _) -> skd_loop(rest, acc)
+    DUseKind(_, _, _, _) -> skd_loop(rest, acc)
     _ -> skd_loop(rest, [d, ...acc])
   }
 }
