@@ -232,6 +232,35 @@ never a module. `import ?name` is the dependency hole: the resolver
 searches packages for a symbol named `name` (`kai info holes`); a
 bare `import ?` is rejected.
 
+When two imports declare the same name, qualify the use — the
+qualifier names the module the declaration comes from:
+
+```kaikai
+import trace
+import protocols
+
+type Box = { n: Int }
+
+impl protocols.Show for Box { fn show(x: Box) : String = "boxed" }
+#    ^ protocol in an `impl` head
+
+fn emit() : Unit / Trace = trace.Trace.log("hi")
+#                            ^ effect operation
+
+fn main() : Unit / Stdout =
+  handle { emit() } with trace.Trace {
+#                          ^ effect in a handler head
+    log(msg, resume) -> resume(Stdout.print(msg))
+    checkpoint(name, resume) -> resume(())
+  }
+```
+
+A qualifier is accepted on types, variant constructors (in expression
+and pattern position), functions, constants, protocols in an `impl`
+head, effects in a `handle … with` head, and effect operations. It is
+only a disambiguator: `trace.Trace.log` and `Trace.log` name the same
+operation whenever the bare name is unambiguous.
+
 ## Tests
 
 ```kaikai
