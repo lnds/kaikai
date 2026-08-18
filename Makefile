@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures
 
 all: kaic1 kaic2 bin/kai
 
@@ -186,8 +186,16 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope
+tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files
 	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope"
+
+# tier0 minus the selfhost. The selfhost is two whole compiler generations
+# and dominates tier0's wall clock; the remaining gates are seconds. CI runs
+# the two as separate jobs so a broken gate reports in a couple of minutes
+# instead of waiting behind the selfhost, and the two run concurrently
+# rather than in series. Locally `tier0` stays the single pre-commit gate.
+tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files
+	@echo "tier0-gates OK — every tier0 gate except the selfhost"
 
 # The native half of the namespace gate lives in stage2 (it needs $(TARGET));
 # SKIPs without libLLVM, so a C-only tier0 run stays green.
@@ -413,7 +421,7 @@ tier1: test demos-no-regression test-fmt test-fmt-width test-fmt-selfhost test-f
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
 #     test-canonical-aliases, test-info, test-doc,
 #     test-upgrade-resolver, test-release-platforms, test-cli-flags }
-# equals exactly the prerequisites of `tier1` (the three light slices union
+# equals exactly the prerequisites of `tier1` (the four light slices union
 # to TEST_LIGHT_TARGETS, proven by the round-robin partition in
 # stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
 tier1-shard-1: kaic2
@@ -426,13 +434,12 @@ tier1-shard-1: kaic2
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/lsp/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
 tier1-shard-2: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=3
-	@echo "tier1-shard-2 OK — light slice 1/3"
+	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=4
+	@echo "tier1-shard-2 OK — light slice 1/4"
 
 tier1-shard-3: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=3
-	$(MAKE) test-fmt-property
-	@echo "tier1-shard-3 OK — light slice 2/3 + fmt meaning-preservation"
+	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=4
+	@echo "tier1-shard-3 OK — light slice 2/4"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
 # compiler, and a PR touching stage2/compiler/** misses the warm cache by
@@ -442,14 +449,19 @@ tier1-shard-4: kaic2
 	@echo "tier1-shard-4 OK — whole-compiler c-modular link"
 
 tier1-shard-5: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=3
-	@echo "tier1-shard-5 OK — light slice 3/3"
+	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=4
+	@echo "tier1-shard-5 OK — light slice 3/4"
 
 # Split out of shard-4 so CI can gate and time it on its own; it shares
-# shard-4's object cache but is a separate job.
+# shard-4's object cache but is a separate job. Carries the fourth light
+# slice and fmt-property: both gates together stay well inside the budget
+# the whole-compiler shards set, and neither belongs on an already-full
+# slice.
 tier1-shard-6: kaic2
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	@echo "tier1-shard-6 OK — #1131 modular-escape gate"
+	$(MAKE) -C stage2 test-light-shard SHARD=4 SHARDS=4
+	$(MAKE) test-fmt-property
+	@echo "tier1-shard-6 OK — #1131 modular-escape gate + light slice 4/4 + fmt meaning-preservation"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -629,8 +641,10 @@ test-fmt-property: kaic2
 
 # Coverage of the namespace collision corpus is a checked property, not
 # a judgement call: every cell of the matrix names a fixture that exists
-# or carries a written reason, and every fixture on disk is claimed by a
-# row. Needs no compiler, so it runs standalone.
+# or carries a written reason, every fixture on disk is claimed by a
+# row, and every row's `axes` column — the list the stage2 corpus
+# targets read their fixtures from — names a harness with its golden on
+# disk. Needs no compiler, so it runs standalone.
 test-namespace-matrix:
 	@./tests/namespace_matrix.sh
 
@@ -648,6 +662,21 @@ test-namespace-matrix-status:
 # passes survive. Run before and after a lane; the PR reports the delta.
 test-km-ledger:
 	@./tests/km_ledger.sh
+
+# The design->matrix class contract: every name class docs/namespaces-design.md
+# enumerates has rows in the matrix, with the mapping visible in the gate.
+test-namespace-classes:
+	@./tests/namespace_matrix_classes.sh
+
+# Corrective scope passes may only disappear (baseline in
+# tools/corrective-pass-baseline.txt); a new one fails the build.
+test-corrective-ratchet:
+	@./tools/corrective-pass-ratchet.sh
+
+# Every NEW compiler/stdlib file on the branch meets the differential
+# quality floor. Binds where `km` exists; CI skips with a note.
+test-km-new-files:
+	@./tools/km-new-files-gate.sh
 
 # bench v1.x (issues #40 + #437) — smoke for `kai bench`. Builds +
 # runs the `examples/stdlib/bench_basic.kai` and
@@ -1093,8 +1122,11 @@ tier1-backend-parity:
 # its 30-min budget — every scheduled run was silently `cancelled` at the
 # timeout, producing no diagnostic at all. Keep the daily under its budget
 # so it actually completes; the two heavy gates keep their per-PR coverage.
-daily: tier1 stress-fixtures coverage-probe rc-budget test-binserialize-budget
-	@echo "daily OK — tier1 + stress fixtures + coverage probe + RC budget + BinSerialize budget"
+# `selfhost` is here rather than on the PR path: the native half of the
+# byte-identity gate already runs per-PR in tier1-native, and the C half
+# costs two whole compiler generations for a check nothing gates on.
+daily: tier1 selfhost stress-fixtures coverage-probe rc-budget test-binserialize-budget
+	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC

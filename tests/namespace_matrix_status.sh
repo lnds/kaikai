@@ -70,7 +70,7 @@ fail=0
 na=0
 declare -a FAILED=()
 
-while IFS=$'\t' read -r class shape position polarity target; do
+while IFS=$'\t' read -r class shape position polarity target _axes; do
   case "$class" in ''|'#'*) continue ;; esac
   case "$target" in N/A:*) na=$((na + 1)); continue ;; esac
 
