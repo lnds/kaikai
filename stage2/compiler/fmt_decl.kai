@@ -15,6 +15,7 @@ import compiler.parse
 import compiler.fmt_writer
 import compiler.fmt_names
 import compiler.fmt_anchor
+import compiler.fmt_layout
 import compiler.fmt_expr
 import compiler.fmt_effect
 
@@ -23,8 +24,8 @@ import compiler.fmt_effect
 pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
   match d {
     DImport(ik, _, _) -> fmt_import(ik, s)
-    DFn(is_pub, name, tparams, params, ret, row, body, _, _, _) ->
-      fmt_fn(is_pub, name, tparams, params, ret, row, body, s)
+    DFn(is_pub, name, tparams, params, ret, row, body, line, _, _) ->
+      fmt_fn(is_pub, name, tparams, params, ret, row, body, line, s)
     DType(is_pub, name, tparams, body, line, _, _, slots) ->
       fmt_type_decl(is_pub, name, tparams, body, slots, line, s)
     DTest(label, body, _, _, _) -> fmt_test(label, body, s)
@@ -70,8 +71,8 @@ pub fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
     # `extern "C" [pub] fn name[...](...) : T / Ffi` when extern_c.
     # When c_sym_over is non-empty, the override sits between the
     # ABI string and `pub` / `fn` per issue #261.
-    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, _, _) ->
-      fmt_axiom_decl(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, s)
+    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, line, _) ->
+      fmt_axiom_decl(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, line, s)
     # Issue #269: dedicated fmt arm matching the parser surface.
     # Round-trips `[pub] const NAME : T = body`. The body is emitted
     # via `fmt_expr` (the same printer used by `let pat = expr`
@@ -153,9 +154,7 @@ pub fn fmt_const_decl(is_pub: Bool, name: String, ty: TypeExpr, body: Expr, s: F
   let s3 = fmt_emit(s2, name)
   let s4 = fmt_emit(s3, " : ")
   let s5 = fmt_type(ty, s4)
-  let s6 = fmt_emit(s5, " = ")
-  let s7 = fmt_expr(body, s6)
-  fmt_newline(s7)
+  fmt_newline(fmt_assign_body(body, fmt_emit(s5, " =")))
 }
 
 # m12.7: `[pub] axiom name[tparams](params) : T / row` or
@@ -163,7 +162,7 @@ pub fn fmt_const_decl(is_pub: Bool, name: String, ty: TypeExpr, body: Expr, s: F
 # when extern_c is true. Issue #260 introduced the extern shape;
 # issue #261 added the `("real_symbol")` override placed immediately
 # after the ABI literal (no space, no newline).
-pub fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: String, tparams: [String], params: [Param], ret_ty: TypeExpr, row: RowExpr, s: FmtSt) : FmtSt {
+pub fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: String, tparams: [String], params: [Param], ret_ty: TypeExpr, row: RowExpr, line: Int, s: FmtSt) : FmtSt {
   let s_pre = if extern_c {
     let a = fmt_emit(s, "extern \"C\"")
     let b = if string_length(c_sym_over) > 0 {
@@ -175,11 +174,7 @@ pub fn fmt_axiom_decl(is_pub: Bool, extern_c: Bool, name: String, c_sym_over: St
   let s_kw  = fmt_emit(s_pub, if extern_c { "fn " } else { "axiom " })
   let s_n   = fmt_emit(s_kw, name)
   let s_tp  = fmt_tparams(tparams, s_n)
-  let s_op  = fmt_emit(s_tp, "(")
-  let s_ps  = fmt_params(params, s_op)
-  let s_cp  = fmt_emit(s_ps, ") : ")
-  let s_rt  = fmt_type(ret_ty, s_cp)
-  fmt_row(row, s_rt)
+  fmt_param_seq(params, line, s_tp, (t) => fmt_row(row, fmt_type(ret_ty, fmt_emit(t, " : "))))
 }
 
 # m12.8: `impl[tparams] Pname[proto_args] for Target { methods... }`.
@@ -226,7 +221,10 @@ pub fn fmt_import(ik: ImportKind, s: FmtSt) : FmtSt {
   }
 }
 
-pub fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: Option[TypeExpr], row: RowExpr, body: Expr, s: FmtSt) : FmtSt {
+# The signature's parameter list counts the return type, the row and
+# the body's opening token (` =` / ` {`) toward its line, then the body
+# continues past that token.
+pub fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], ret: Option[TypeExpr], row: RowExpr, body: Expr, line: Int, s: FmtSt) : FmtSt {
   let s1 = if is_pub {
     fmt_emit(s, "pub ")
   } else {
@@ -235,35 +233,22 @@ pub fn fmt_fn(is_pub: Bool, name: String, tparams: [String], params: [Param], re
   let s2 = fmt_emit(s1, "fn ")
   let s3 = fmt_emit(s2, name)
   let s4 = fmt_tparams(tparams, s3)
-  let s5 = fmt_emit(s4, "(")
-  let s6 = fmt_params(params, s5)
-  let s7 = fmt_emit(s6, ")")
-  let s8 = match ret {
-    None -> s7
-    Some(t) -> {
-      let a = fmt_emit(s7, " : ")
-      fmt_type(t, a)
-    }
-  }
-  let s9 = fmt_row(row, s8)
+  let opener = fmt_fn_opener(body)
+  let s9 = fmt_param_seq(params, line, s4, (t) => fmt_emit(fmt_row(row, fmt_fn_ret(ret, t)), opener))
   match body.kind {
     ESurface(sf) -> match sf {
       SfContract(reqs, enss, inner) -> fmt_fn_contracts(reqs, enss, inner, s9)
-      SfEnsure(_, _) -> fmt_fn_body(body, s9)
-      SfLamBlock(_, _) -> fmt_fn_body(body, s9)
-      SfTuple(_) -> fmt_fn_body(body, s9)
-      SfHandleInit(_) -> fmt_fn_body(body, s9)
-      SfBigIntLit(_) -> fmt_fn_body(body, s9)
-      SfMapLit(_, _) -> fmt_fn_body(body, s9)
-      SfSetLit(_, _) -> fmt_fn_body(body, s9)
-      SfRefMake(_) -> fmt_fn_body(body, s9)
-      SfDeref(_) -> fmt_fn_body(body, s9)
-      SfMultiMatch(_, _) -> fmt_fn_body(body, s9)
       # A case-block prints as the body's own braces, never `= { ... }`.
       SfCaseBlock(_) -> fmt_expr(body, fmt_emit(s9, " "))
+      _ -> fmt_fn_body_rest(body, s9)
     }
-    _ -> fmt_fn_body(body, s9)
+    _ -> fmt_fn_body_rest(body, s9)
   }
+}
+
+fn fmt_fn_ret(ret: Option[TypeExpr], s: FmtSt) : FmtSt = match ret {
+  None -> s
+  Some(t) -> fmt_type(t, fmt_emit(s, " : "))
 }
 
 # Contract clauses in signature position. Before an `= expr` body they
@@ -321,24 +306,15 @@ fn fmt_fn_body_at_margin(body: Expr, s: FmtSt) : FmtSt = match body.kind {
 }
 
 
-# Function body: prefer `= expr` when the body is a single non-block
-# expression (literal, var, simple call, etc.); use `{ ... }` block
-# form when the body is an EBlock or contains multi-line constructs.
-pub fn fmt_fn_body(body: Expr, s: FmtSt) : FmtSt {
-  match body.kind {
-    EBlock(stmts, tail) -> {
-      let s1 = fmt_emit(s, " {")
-      let s2 = fmt_newline(s1)
-      let s3 = fmt_indent_in(s2)
-      let s4 = fmt_block_inner(stmts, tail, s3)
-      let s5 = fmt_indent_out(s4)
-      fmt_emit(s5, "}")
-    }
-    _ -> {
-      let s1 = fmt_emit(s, " = ")
-      fmt_expr(body, s1)
-    }
-  }
+# Function body: `= expr` for a single expression, `{ ... }` for a
+# block. The `= expr` form hangs the expression below the signature
+# when it does not fit beside it.
+pub fn fmt_fn_body(body: Expr, s: FmtSt) : FmtSt = fmt_fn_body_rest(body, fmt_emit(s, fmt_fn_opener(body)))
+
+# The body after its opening token is out.
+fn fmt_fn_body_rest(body: Expr, s: FmtSt) : FmtSt = match body.kind {
+  EBlock(stmts, tail) -> fmt_block_rest(stmts, tail, s)
+  _ -> fmt_assign_body(body, s)
 }
 
 # ---- type decls -----------------------------------------------------
@@ -358,19 +334,7 @@ pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBo
       let a = fmt_emit(s4, " = ")
       fmt_type(t, a)
     }
-    # A record whose fields carry comments cannot render on one line —
-    # a comment swallows the rest of its line — so it expands to one
-    # field per line, each keeping the comments that documented it.
-    TBRecord(fields) -> {
-      let el = scan_elem_lines(s4.toks, line)
-      if elem_lines_commented(fields, el, s4.cmts, 0) {
-        fmt_record_expanded(fields, el, s4)
-      } else {
-        let a = fmt_emit(s4, " = { ")
-        let b = fmt_field_decls(fields, a)
-        fmt_emit(b, " }")
-      }
-    }
+    TBRecord(fields) -> fmt_record_body(fields, line, s4)
     TBSum(variants) -> fmt_sum_variants(variants, scan_elem_lines(s4.toks, line), s4)
     TBEffectAlias(labels) -> {
       let a = fmt_emit(s4, " = ")
@@ -417,6 +381,25 @@ fn cmt_within_elem(cmts: [Cmt], line: Int) : Bool = match cmts {
   [] -> false
   [Cmt(cl, _, _, _), ..._rest] -> (line > 0) and (cl <= line)
 }
+
+# A record expands to one field per line when a field carries a
+# comment (a comment swallows the rest of its line), when the author
+# wrote it that way, or when the one-line form does not fit.
+fn fmt_record_body(fields: [FieldDecl], line: Int, s: FmtSt) : FmtSt {
+  let el = scan_elem_lines(s.toks, line)
+  if elem_lines_commented(fields, el, s.cmts, 0) or elem_lines_broken(el, list_length(fields), line) {
+    fmt_record_expanded(fields, el, s)
+  } else {
+    match fmt_try_flat(s, (t) => fmt_record_flat(fields, t)) {
+      Some(r) -> r
+      None -> fmt_record_expanded(fields, el, s)
+    }
+  }
+}
+
+fn fmt_record_flat(fields: [FieldDecl], s: FmtSt) : FmtSt =
+  if list_is_empty(fields) { fmt_emit(s, " = {}") }
+  else { fmt_emit(fmt_field_decls(fields, fmt_emit(s, " = { ")), " }") }
 
 # `= {` / one field per line / `}`, each field keeping the comments
 # that documented it. Trailing comma is omitted on the last field,

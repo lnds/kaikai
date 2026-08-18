@@ -592,12 +592,12 @@ test-fmt: kaic2
 	@./tests/fmt_fixtures.sh
 
 # `kai fmt` line-width gate. The golden suite pins bytes and the
-# property harness pins meaning; neither can see that the writer emits
-# a 137-column line because it has no width model at all. This measures
-# two numbers over examples/fmt/width/ — over-budget lines the writer
-# could have broken, and lines it removed from hand-wrapped source —
-# and ratchets both against tools/fmt-width-baseline.txt. Runs in
-# ~1 s: 18 fixtures, one fmt each.
+# property harness pins meaning; neither can see whether the writer
+# keeps lines inside the budget. This measures two numbers over
+# examples/fmt/width/ — over-budget lines the writer could have broken,
+# and lines it removed from hand-wrapped source — and requires both at
+# zero, pinned in tools/fmt-width-baseline.txt. Runs in ~1 s: 18
+# fixtures, one fmt each.
 test-fmt-width: kaic2
 	@./tests/fmt_width.sh
 
