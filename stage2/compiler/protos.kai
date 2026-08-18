@@ -95,6 +95,8 @@ import compiler.fnreg
 import compiler.impl_index
 import compiler.modules
 import compiler.proto_scope
+import compiler.name_table
+import compiler.name_report
 import compiler.infer
 import compiler.layout_derive
 import compiler.layout_validate
@@ -168,7 +170,7 @@ fn strip_law_loop(decls: [Decl], acc: [Decl], laws: [ProtoLaw],
                      [PL(mo, name, thy), ...laws], axioms)
     DImplAxiom(thy, DImpl(pname, pa, target, ms, l, cc, tps), _, _, amo) ->
       strip_law_loop(rest, [DImpl(pname, pa, target, ms, l, cc, tps), ...acc],
-                     laws, [AI(amo, pname, proto_type_name(target), thy), ...axioms])
+                     laws, [AI(amo, dotted_bare(pname), proto_type_name(target), thy), ...axioms])
     _ -> strip_law_loop(rest, [d, ...acc], laws, axioms)
   }
 }
@@ -363,7 +365,7 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 
 fn proto_reg_empty() : ProtocolReg =
   ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
-                dkeys: [], impl_index: impl_index_empty() }
+                dkeys: [], impl_index: impl_index_empty(), cores: [], imports: [] }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -452,7 +454,8 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
           tparams: [PTPR(name, tparams, mo), ...reg.tparams],
           origins: [PrOR(name, mo, is_pub), ...reg.origins],
           dkeys: reg.dkeys,
-          impl_index: reg.impl_index
+          impl_index: reg.impl_index,
+          cores: reg.cores, imports: reg.imports
         }
         collect_proto_decls(rest, register_proto_ops(reg1, name, mo, ops))
       }
@@ -488,7 +491,8 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
           tparams: reg.tparams,
           origins: reg.origins,
           dkeys: reg.dkeys,
-          impl_index: reg.impl_index
+          impl_index: reg.impl_index,
+          cores: reg.cores, imports: reg.imports
         }
         register_proto_ops(reg1, proto, mo, rest)
       }
@@ -581,26 +585,27 @@ fn proto_builtin_type_names() : [String] =
 # resolves to a protocol its module can see. Reports each violation on
 # stderr and returns the count of reported errors.
 fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                  origins: [ProtoOriginReg], proto_names: [String],
-                  local_types: [String], target_mod: String) : Int / Console {
-  validate_impls_loop(ds, homes, df, origins, proto_names, local_types,
+                  reg: ProtocolReg, proto_names: [String],
+                  local_types: [String], target_mod: String) : Int / Console + File {
+  validate_impls_loop(ds, homes, df, reg, proto_names, local_types,
                       target_mod, [], 0)
 }
 
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                       origins: [ProtoOriginReg], proto_names: [String],
+                       reg: ProtocolReg, proto_names: [String],
                        local_types: [String], target_mod: String,
-                       seen: [String], errs: Int) : Int / Console {
+                       seen: [String], errs: Int) : Int / Console + File {
   match ds {
     [] -> errs
     [d, ...rest] -> match homes {
       [] -> errs
       [h, ...hrest] -> match d {
-      DImpl(pname, proto_args, target, _, line, col, _) -> {
+      DImpl(pspell, proto_args, target, _, line, col, _) -> {
         let file = decl_diag_file(d, df)
         let tname = proto_type_name(target)
+        let pname = dotted_bare(pspell)
         let from = proto_mo_of(ha_home(h), target_mod)
-        let res = proto_scope_resolve(origins, pname, from)
+        let res = proto_scope_resolve(reg, pspell, from)
         # Issue #180: duplicate-impl key includes the proto-arg names so
         # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
         # coexist. Legacy `impl P for T` (proto_args == []) maps to the
@@ -651,31 +656,42 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
               ": error: unknown protocol `", pname, "` in `impl`"]))
             errs2 + 1
           }
+          PRAmbiguous(cands) -> {
+            nr_error_ambiguous(file, line, col, NCProtocol, pname,
+                               map(cands, (c) => proto_home_name(c, target_mod)), "")
+            errs2 + 1
+          }
         }
         let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, hrest, df, origins, proto_names,
+        validate_impls_loop(rest, hrest, df, reg, proto_names,
                             local_types, target_mod, seen1, errs3)
       }
       DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
       DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, origins, proto_names,
+        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
                             local_types, target_mod, seen, errs)
-      _ -> validate_impls_loop(rest, hrest, df, origins, proto_names,
+      _ -> validate_impls_loop(rest, hrest, df, reg, proto_names,
                                local_types, target_mod, seen, errs)
       }
     }
   }
+}
+
+# A registry home as a diagnostic names it: the root file by its module name.
+fn proto_home_name(mo: Option[String], target_mod: String) : String = match mo {
+  Some(m) -> m
+  None    -> target_mod
 }
 
 # Issue #535 — impl method validation against protocol declaration.
@@ -723,15 +739,16 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
     [d, ...rest] -> match homes {
       [] -> errs
       [h, ...hrest] -> match d {
-      DImpl(pname, proto_args, target, methods, line, col, _) -> {
+      DImpl(pspell, proto_args, target, methods, line, col, _) -> {
         let file = decl_diag_file(d, df)
         let tname = proto_type_name(target)
+        let pname = dotted_bare(pspell)
         # The impl checks against the protocol its own module resolves
         # `pname` to — never a same-named protocol of an unrelated
         # module. Unresolved names were already reported by
         # `validate_impls`; skip them here.
         let from = proto_mo_of(ha_home(h), target_mod)
-        let res = proto_scope_resolve(reg.origins, pname, from)
+        let res = proto_scope_resolve(reg, pspell, from)
         let proto_ops = match res {
           PRHome(ph) -> proto_scope_ops(reg.ops, pname, ph)
           _ -> []
@@ -1090,19 +1107,20 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match ds {
     [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
     [d, ...rest] -> match d {
-      DImpl(pname, proto_args, target, methods, _, _, _) -> {
+      DImpl(pspell, proto_args, target, methods, _, _, _) -> {
         let tname = proto_type_name(target)
+        let pname = dotted_bare(pspell)
         # Issue #180: derive the per-impl proto-arg name list. Empty
         # input list = legacy form, treated as `Ai = Self` (= [tname]).
         let arg_names = match proto_args {
           [] -> []
           _  -> map(proto_args, proto_type_name)
         }
-        # The impl's dispatch key: resolve `pname` from the impl's own
+        # The impl's dispatch key: resolve the head from the impl's own
         # module, then spell it. Unresolved protocols keep the bare
         # name — `validate_impls` has already reported them.
         let from = impl_home_of(methods)
-        let key = match proto_scope_resolve(reg.origins, pname, from) {
+        let key = match proto_scope_resolve(reg, pspell, from) {
           PRHome(ph) -> proto_key_of(reg.dkeys, pname, ph)
           _ -> pname
         }
@@ -1158,7 +1176,8 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
           tparams: reg.tparams,
           origins: reg.origins,
           dkeys: reg.dkeys,
-          impl_index: reg.impl_index
+          impl_index: reg.impl_index,
+          cores: reg.cores, imports: reg.imports
         }
         lower_impl_methods(pkey, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
       }
@@ -1305,10 +1324,11 @@ fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
     [d, ...rest] -> match d {
       DImpl(pname, _, target, _, _, _, _) ->
         collect_future_impl_keys(rest,
-          [concat_all([pname, "/", proto_type_name(target)]), ...acc])
+          [concat_all([dotted_bare(pname), "/", proto_type_name(target)]), ...acc])
       DDerive(names, inner, _, _) -> {
         let acc1 = match inner {
-          DType(_, tname, _, _, _, _, _, _) -> add_future_impl_keys(names, tname, acc)
+          DType(_, tname, _, _, _, _, _, _) ->
+            add_future_impl_keys(map(names, dotted_bare), tname, acc)
           _ -> acc
         }
         collect_future_impl_keys(rest, acc1)
@@ -1359,8 +1379,8 @@ fn validate_derives_loop(ds: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, line, col) -> {
         let file = decl_diag_file(d, df)
-        let errs1 = validate_derive_decl(names, inner, file, future_impls,
-                                          line, col, errs)
+        let errs1 = validate_derive_decl(map(names, dotted_bare), inner, file,
+                                          future_impls, line, col, errs)
         validate_derives_loop(rest, df, future_impls, errs1)
       }
       DUnstable(inner, _, _) ->
@@ -1459,25 +1479,29 @@ fn validate_derive_variant_args(pname: String, tname: String, vname: String,
 # DType followed by one synthetic DImpl per derived protocol.
 # DProtocol and ordinary DImpl decls pass through unchanged so the
 # next pass can collect them.
-fn expand_derives(ds: [Decl]) : [Decl] = expand_derives_loop(ds, [])
+fn expand_derives(ds: [Decl], target_mod: String) : [Decl] =
+  expand_derives_loop(ds, target_mod, [])
 
-fn expand_derives_loop(ds: [Decl], acc: [Decl]) : [Decl] {
+fn expand_derives_loop(ds: [Decl], target_mod: String, acc: [Decl]) : [Decl] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DDerive(names, inner, _, _) -> {
-        let derived = derive_impls_for(names, inner)
-        expand_derives_loop(rest, list_append([inner, ...list_reverse(derived)], acc))
+      DDerive(names, inner, l, c) -> {
+        let home = decl_type_home(inner, target_mod)
+        let derived = map(derive_impls_for(names, inner),
+                          (dd) => stamp_derived_home(dd, home, l, c))
+        expand_derives_loop(rest, target_mod,
+                            list_append([inner, ...list_reverse(derived)], acc))
       }
       DUnstable(inner, _, _) ->
-        expand_derives_loop([inner, ...rest], acc)
+        expand_derives_loop([inner, ...rest], target_mod, acc)
       # Preserve the wrapper: the `#[constructor]` registry is collected
       # in the typer, so unwrapping here (as DUnstable does) would lose
       # it. The inner is a plain fn — no derives to expand.
-      DProtoLaws(_, _, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
-      DImplAxiom(_, _, _, _, _) -> expand_derives_loop(rest, [d, ...acc])
-      DConstructor(_, _, _) -> expand_derives_loop(rest, [d, ...acc])
-      _ -> expand_derives_loop(rest, [d, ...acc])
+      DProtoLaws(_, _, _, _, _) -> expand_derives_loop(rest, target_mod, [d, ...acc])
+      DImplAxiom(_, _, _, _, _) -> expand_derives_loop(rest, target_mod, [d, ...acc])
+      DConstructor(_, _, _) -> expand_derives_loop(rest, target_mod, [d, ...acc])
+      _ -> expand_derives_loop(rest, target_mod, [d, ...acc])
     }
   }
 }
@@ -1514,16 +1538,46 @@ fn derive_impls_for(names: [String], dt: Decl) : [Decl] {
   }
 }
 
+# The bare name picks the generator; the impl keeps the spelling as
+# written (`m.P`) so it resolves against that module's protocol.
 fn derive_impls_loop(names: [String], tname: String, body: TypeBody,
                       line: Int, col: Int, acc: [Decl]) : [Decl] {
   match names {
     [] -> list_reverse(acc)
-    [pname, ...rest] -> {
-      let ds = derive_impl_for_protocol(pname, tname, body, line, col)
+    [pspell, ...rest] -> {
+      let ds = map(derive_impl_for_protocol(dotted_bare(pspell), tname, body, line, col),
+                   (dd) => impl_with_pname(dd, pspell))
       derive_impls_loop(rest, tname, body, line, col,
                         list_append(list_reverse(ds), acc))
     }
   }
+}
+
+fn impl_with_pname(d: Decl, pspell: String) : Decl = match d {
+  DImpl(_, pargs, target, ms, l, c, tps) -> DImpl(pspell, pargs, target, ms, l, c, tps)
+  _ -> d
+}
+
+# Everything a derive synthesises — the impl's methods and any
+# top-level shim — belongs to the module declaring the type, exactly
+# as if written there by hand. The impl itself sits at the attribute,
+# where a diagnostic about it points.
+fn stamp_derived_home(d: Decl, mo: Option[String], al: Int, ac: Int) : Decl = match d {
+  DImpl(p, pargs, target, ms, _, _, tps) ->
+    DImpl(p, pargs, target, map(ms, (m) => stamp_derived_home(m, mo, al, ac)), al, ac, tps)
+  DFn(p, n, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, n, tps, ps, ret, row, body, l, c, mo)
+  _ -> d
+}
+
+# Root-file types are stamped with the target module; root fns are
+# not. The synthesised fns follow the fn convention.
+fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
+  DType(_, _, _, _, _, _, mo, _) -> match mo {
+    Some(m) -> proto_mo_of(m, target_mod)
+    None    -> None
+  }
+  _ -> None
 }
 
 # Synthesise zero or more decls for `#derive(P) type T = ...`. v1
@@ -2776,14 +2830,14 @@ fn collect_binser_providers(decls: [Decl], acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pname, _, target, _, _, _, _) ->
-        if pname == "BinSerialize" {
+        if dotted_bare(pname) == "BinSerialize" {
           collect_binser_providers(rest, [proto_type_name(target), ...acc])
         } else {
           collect_binser_providers(rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _) ->
-          if list_has(names, "BinSerialize") {
+          if list_has(map(names, dotted_bare), "BinSerialize") {
             collect_binser_providers(rest, [tname, ...acc])
           } else {
             collect_binser_providers(rest, acc)
@@ -2811,7 +2865,7 @@ fn validate_derive_binser_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _) ->
-          if list_has(names, "BinSerialize") {
+          if list_has(map(names, dotted_bare), "BinSerialize") {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_binser_body(file, tname, body,
                                                      providers, line, col, errs)
@@ -2944,7 +2998,7 @@ fn validate_derive_layout_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _) ->
-          if list_has(names, "Layout") {
+          if list_has(map(names, dotted_bare), "Layout") {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_layout_body(file, tname, body,
                                                      line, col, errs)
@@ -3033,7 +3087,7 @@ fn validate_derive_json_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _) ->
-          if list_has(names, "Json") {
+          if list_has(map(names, dotted_bare), "Json") {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_json_body(file, tname, body, line, col, errs)
             validate_derive_json_loop(rest, df, errs1)
@@ -3245,14 +3299,14 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pname, _, target, _, _, _, _) ->
-        if pname == "Ord" {
+        if dotted_bare(pname) == "Ord" {
           collect_ord_providers(rest, [proto_type_name(target), ...acc])
         } else {
           collect_ord_providers(rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _) ->
-          if list_has(names, "Ord") {
+          if list_has(map(names, dotted_bare), "Ord") {
             collect_ord_providers(rest, [tname, ...acc])
           } else {
             collect_ord_providers(rest, acc)
@@ -3280,7 +3334,7 @@ fn validate_derive_ord_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _) ->
-          if list_has(names, "Ord") {
+          if list_has(map(names, dotted_bare), "Ord") {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_ord_body(file, tname, body, providers,
                                                   line, col, errs)
@@ -3393,10 +3447,10 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
 #[doc("Result of pass A: the decl stream with impls lowered, the threaded ProtocolReg, and an error count.")]
 pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int }
 
-#[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls. `cores` names the stdlib core modules, whose protocols keep their bare dispatch identity.")]
+#[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls. `cores` names the stdlib core modules, whose protocols keep their bare dispatch identity; `imports` is each file's direct import list, the scope a bare protocol head resolves through.")]
 pub fn lower_protocols(decls: [Decl], df: DiagFiles,
-                     target_mod: String,
-                     cores: [String]) : LoweredProtocols / Console {
+                     target_mod: String, cores: [String],
+                     imports: [ModImports]) : LoweredProtocols / Console + File {
 
   # Step 0 — m12.8.x: validate `#derive(Eq/Hash)` on sum types: every
   # variant field's head type must already have an impl reachable in
@@ -3419,19 +3473,19 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
                     validate_derive_json(decls, df)
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
-  let expanded = expand_derives(decls)
+  let expanded = expand_derives(decls, target_mod)
   # Step 2 — collect every protocol op into the registry, each entry
   # tagged with its declaring module's home. The same home-anchor
   # stream also scopes the impl validations below, so it is computed
   # once here.
   let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
-  let reg0 = reg_with_dkeys(collect_proto_decls(expanded, proto_reg_empty()), cores)
+  let reg0 = reg_with_scope(collect_proto_decls(expanded, proto_reg_empty()), cores, imports)
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
   let proto_names = collect_proto_names(expanded, [])
   let local_types = collect_local_type_names(expanded, [])
-  let coh_errs = validate_impls(expanded, homes, df, reg0.origins,
+  let coh_errs = validate_impls(expanded, homes, df, reg0,
                                 proto_names, local_types, target_mod)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
@@ -3492,13 +3546,15 @@ fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins,
                 dkeys: reg.dkeys,
-                impl_index: build_impl_index(reg.impls) }
+                impl_index: build_impl_index(reg.impls), cores: reg.cores,
+                imports: reg.imports }
 
-fn reg_with_dkeys(reg: ProtocolReg, cores: [String]) : ProtocolReg =
+fn reg_with_scope(reg: ProtocolReg, cores: [String],
+                  imports: [ModImports]) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins,
                 dkeys: proto_dispatch_keys(reg.origins, cores),
-                impl_index: reg.impl_index }
+                impl_index: reg.impl_index, cores: cores, imports: imports }
 
 # m12.8 + resolver-arity: pre-resolve renaming pass. Walks every DFn /
 # DTest body and rewrites every `EVar(name)` whose name is a known

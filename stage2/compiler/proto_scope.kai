@@ -8,31 +8,65 @@
 # same-named protocols of different signatures, an impl would be
 # validated against a contract its module cannot even see.
 #
-# Resolution mirrors `ta_scope` (transparent aliases): a module sees
-# its own protocols first, then the exported ones of other modules.
-# Root-file protocols are visible package-wide, like every other
-# root declaration.
+# Resolution follows the name ladder. An explicit qualifier (`m.P`)
+# selects that module's declaration. A bare name tries, in order: the
+# module's own declaration; the `pub` declarations of the modules its
+# file imports, plus root-file declarations (visible package-wide);
+# the stdlib cores (the implicit prelude); finally any visible foreign
+# declaration. The first rung with a candidate answers — one candidate
+# resolves, two or more are an ambiguity, never a first-declared
+# choice. A core sees only other cores: user code never reaches into
+# the stdlib's dispatch.
 
 import compiler.util
 import compiler.ast
 import compiler.fnreg
+import compiler.modules
 
-#[doc("Resolution of a protocol name from one module's viewpoint: the home of the protocol it binds to, a private foreign declaration (its module named for diagnostics), or no declaration at all.")]
+#[doc("Resolution of a protocol name from one module's viewpoint: the home of the protocol it binds to, a private foreign declaration (its module named for diagnostics), no declaration at all, or several visible candidates (their homes, `None` = root file).")]
 pub type ProtoRes = PRHome(Option[String]) | PRPrivate(String) | PRUnknown
+                  | PRAmbiguous([Option[String]])
 
-#[doc("Resolve protocol `pname` as seen from the module whose home is `from` (`None` = root file): its own declaration first, else the first-declared visible foreign one (`pub` or root-file).")]
-pub fn proto_scope_resolve(origins: [ProtoOriginReg], pname: String,
+#[doc("Resolve protocol `pname` (bare or `m.P`) as seen from the module whose home is `from` (`None` = root file), through the registry's origins, cores and per-file imports.")]
+pub fn proto_scope_resolve(reg: ProtocolReg, pname: String,
                            from: Option[String]) : ProtoRes =
-  match psc_own(origins, pname, from) {
-    Some(mo) -> PRHome(mo)
-    None -> match psc_foreign(list_reverse(origins), pname) {
+  match split_dotted_qualifier(pname) {
+    Some(q) -> match q { QSplit(m, bare) -> psc_qualified(reg.origins, bare, m, from) }
+    None -> match psc_own(reg.origins, pname, from) {
       Some(mo) -> PRHome(mo)
-      None -> match psc_any(origins, pname) {
-        Some(m) -> PRPrivate(m)
-        None    -> PRUnknown
-      }
+      None -> psc_rungs(reg, pname, from,
+                        [PscImported(psc_imports_of(reg.imports, from)), PscCores, PscAny])
     }
   }
+
+# The three foreign rungs, tried in order.
+type PscRung = PscImported([String]) | PscCores | PscAny
+
+fn psc_rungs(reg: ProtocolReg, pname: String, from: Option[String],
+             rungs: [PscRung]) : ProtoRes = match rungs {
+  [] -> match psc_any(reg.origins, pname) {
+    Some(m) -> PRPrivate(m)
+    None    -> PRUnknown
+  }
+  [rung, ...rest] ->
+    match psc_candidates(list_reverse(reg.origins), reg.cores, rung, pname, from, []) {
+      [mo]  -> PRHome(mo)
+      []    -> psc_rungs(reg, pname, from, rest)
+      homes -> PRAmbiguous(list_reverse(homes))
+    }
+}
+
+fn psc_imports_of(imports: [ModImports], from: Option[String]) : [String] =
+  match imports {
+    [] -> []
+    [MImp(owner, names), ...rest] ->
+      if owner == psc_owner_name(from) { names } else { psc_imports_of(rest, from) }
+  }
+
+fn psc_owner_name(from: Option[String]) : String = match from {
+  None -> ""
+  Some(m) -> m
+}
 
 fn psc_own(origins: [ProtoOriginReg], pname: String,
            from: Option[String]) : Option[Option[String]] = match origins {
@@ -42,18 +76,59 @@ fn psc_own(origins: [ProtoOriginReg], pname: String,
     else { psc_own(rest, pname, from) }
 }
 
-# `origins` arrives reversed (the registry prepends), so the caller
-# passes it re-reversed: the first visible match is the first-declared.
-# No own-home exclusion is needed — the own pass already failed, so no
-# entry carries the consumer's home.
-fn psc_foreign(origins: [ProtoOriginReg],
-               pname: String) : Option[Option[String]] = match origins {
-  [] -> None
-  [PrOR(n, mo, is_pub), ...rest] -> {
-    let visible = is_pub or mo_eq(mo, None)
-    if n == pname and visible { Some(mo) }
-    else { psc_foreign(rest, pname) }
+# The qualifier is validated against the import table before this
+# runs, so a missing declaration here is a protocol the module does
+# not declare at all.
+fn psc_qualified(origins: [ProtoOriginReg], bare: String, m: String,
+                 from: Option[String]) : ProtoRes = match origins {
+  [] -> PRUnknown
+  [PrOR(n, mo, is_pub), ...rest] ->
+    if n == bare and mo_eq(mo, Some(m)) {
+      if is_pub or mo_eq(mo, from) { PRHome(mo) } else { PRPrivate(m) }
+    } else { psc_qualified(rest, bare, m, from) }
+}
+
+# Every visible foreign home declaring `pname` on this rung,
+# deduplicated, in declaration order (`origins` arrives re-reversed).
+# The own home was already ruled out.
+fn psc_candidates(origins: [ProtoOriginReg], cores: [String], rung: PscRung,
+                  pname: String, from: Option[String],
+                  acc: [Option[String]]) : [Option[String]] =
+  match origins {
+    [] -> acc
+    [PrOR(n, mo, is_pub), ...rest] -> {
+      let visible = (is_pub or mo_eq(mo, None)) and
+                    psc_tier_ok(cores, from, mo) and psc_on_rung(cores, rung, mo)
+      if n == pname and visible and not psc_has_home(acc, mo) {
+        psc_candidates(rest, cores, rung, pname, from, [mo, ...acc])
+      } else { psc_candidates(rest, cores, rung, pname, from, acc) }
+    }
   }
+
+fn psc_on_rung(cores: [String], rung: PscRung, mo: Option[String]) : Bool =
+  match rung {
+    PscImported(names) -> match mo {
+      None    -> true
+      Some(m) -> list_has(names, m)
+    }
+    PscCores -> psc_is_core(cores, mo)
+    PscAny   -> true
+  }
+
+fn psc_tier_ok(cores: [String], from: Option[String], mo: Option[String]) : Bool =
+  match from {
+    None -> true
+    Some(f) -> if list_has(cores, f) { psc_is_core(cores, mo) } else { true }
+  }
+
+fn psc_is_core(cores: [String], mo: Option[String]) : Bool = match mo {
+  None -> false
+  Some(m) -> list_has(cores, m)
+}
+
+fn psc_has_home(homes: [Option[String]], mo: Option[String]) : Bool = match homes {
+  [] -> false
+  [h, ...rest] -> if mo_eq(h, mo) { true } else { psc_has_home(rest, mo) }
 }
 
 # Reached only when every candidate is a private non-root foreign
