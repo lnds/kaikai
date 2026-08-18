@@ -442,9 +442,14 @@ tier1-shard-1: kaic2
 	$(MAKE) test-fmt test-fmt-width test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stdlib-modules test-independence-oracle test-packages test-editions test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/lsp/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
 
+# The C-only axes of the namespace-collision corpus ride the lightest
+# slice, and the matrix gate runs again right after so it reads their
+# ratchet status (tests/namespace_matrix.sh refuses green over a red axis).
 tier1-shard-2: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=4
-	@echo "tier1-shard-2 OK — light slice 1/4"
+	$(MAKE) -C stage2 test-namespace-collisions-c-axes
+	$(MAKE) test-namespace-matrix
+	@echo "tier1-shard-2 OK — light slice 1/4 + namespace-collision corpus (C axes) under ratchet"
 
 tier1-shard-3: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=4
@@ -997,6 +1002,7 @@ tier1-asan: kaic2 test-arena
 	echo "tier1-asan OK — $$got/$$expected demos pass under ASAN+UBSan, no sanitizer diagnostics"
 	@$(MAKE) -C stage2 test-mn-sigaltstack-asan
 	@echo "tier1-asan OK — sigaltstack fixture passes under ASAN+UBSan at KAI_THREADS=1/2/8/16 (alternate-stack ownership gate)"
+	@$(MAKE) -C stage2 test-namespace-collisions-asan
 	@$(MAKE) -C stage2 test-trace-asan
 	@echo "tier1-asan OK — trace fixtures pass under ASAN+UBSan (R10/R11 regression gate)"
 	@$(MAKE) -C stage2 test-runtime-shadow-asan

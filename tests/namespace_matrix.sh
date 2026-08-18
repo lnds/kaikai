@@ -31,6 +31,13 @@ axis_golden() {
   esac
 }
 
+# Thin cells are a backlog of over a hundred rows; listing them drowns the
+# structural errors, so the detail goes to a file and only the count is
+# printed here.
+THIN_DETAIL="$ROOT/stage2/build/namespace-matrix-thin.txt"
+mkdir -p "$(dirname "$THIN_DETAIL")"
+: > "$THIN_DETAIL"
+
 rows=0
 todo=0
 missing=0
@@ -128,10 +135,10 @@ while IFS=$'\t' read -r class shape position polarity target axes; do
       ;;
     *)
       if [ "$n_here" -lt 2 ]; then
-        echo "  THIN   $class / $shape / $position — $n_here fixture(s), needs 2 (or 'shallow: <reason>')"
+        echo "  THIN   $class / $shape / $position — $n_here fixture(s), needs 2 (or 'shallow: <reason>')" >> "$THIN_DETAIL"
         thin=$((thin + 1))
       elif [ "$n_here" -gt 5 ]; then
-        echo "  FAT    $class / $shape / $position — $n_here fixtures; past 5, split the cell"
+        echo "  FAT    $class / $shape / $position — $n_here fixtures; past 5, split the cell" >> "$THIN_DETAIL"
         thin=$((thin + 1))
       fi
       ;;
@@ -153,7 +160,7 @@ for d in "$CORPUS"/*/; do
 done
 
 covered=$((rows - todo - na))
-echo "namespace_matrix: $rows rows, $covered covered ($fixtures fixtures), $na not applicable, $todo uncovered, $missing dangling, $unclaimed unclaimed, $badaxis axis errors, $thin thin"
+echo "namespace_matrix: $rows rows, $covered covered ($fixtures fixtures), $na not applicable, $todo uncovered, $missing dangling, $unclaimed unclaimed, $badaxis axis errors, $thin thin (detail: ${THIN_DETAIL#$ROOT/})"
 
 # Structural errors are absolute: a row naming a fixture that is not there,
 # a fixture no row claims, a cell with neither fixture nor reason. None of
@@ -182,4 +189,29 @@ fi
 if [ "$thin" -lt "$thin_baseline" ]; then
   echo "namespace_matrix OK (improved) — thin $thin < baseline $thin_baseline"
   echo "  suggest: echo $thin > $thin_baseline_file"
+fi
+
+# Counting is not running. The axis targets leave a status per axis
+# (tools/nscol-ratchet.sh: `<axis> <failing> <baseline>`); a matrix whose
+# executors are red above their baseline does not get to report green.
+# Where no executor has run yet (tier0 runs before the corpus), the
+# coupling is reported, not enforced — the ratchet fails in its own job.
+red=0
+seen=0
+for st in "$ROOT"/stage2/build/nscol-*.status; do
+  [ -f "$st" ] || continue
+  read -r axis failing _ < "$st"
+  seen=$((seen + 1))
+  allowed=$(grep -E "^$axis:" "$ROOT/tools/nscol-baseline.txt" | head -1 | cut -d: -f2 | tr -d ' ')
+  if [ "$failing" -gt "${allowed:-0}" ]; then
+    echo "namespace_matrix FAIL — axis '$axis' has $failing failing fixtures, baseline ${allowed:-0} (see stage2/build/nscol-$axis.fail)"
+    red=$((red + 1))
+  fi
+done
+if [ "$seen" -eq 0 ]; then
+  echo "namespace_matrix: no axis has run here yet (executor ratchet not consulted)"
+elif [ "$red" -gt 0 ]; then
+  exit 1
+else
+  echo "namespace_matrix: $seen axis status(es) at or under baseline"
 fi
