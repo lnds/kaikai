@@ -11,8 +11,9 @@
 # A cell counts as passing only when EVERY fixture it names passes, so a
 # deep cell is not carried by its easiest variant.
 #
-# Backend defaults to C; pass `native` to measure the other one, since a
-# fix verified on one proves nothing about the other.
+# Backend defaults to whole-program C; pass `native` or `modular`
+# (separate compilation, `KAI_MODULAR=1`) to measure the others, since a
+# fix verified on one proves nothing about the rest.
 
 set -eu
 
@@ -21,15 +22,23 @@ MATRIX="$ROOT/tests/namespace_matrix.tsv"
 CORPUS="$ROOT/examples/namespace-collisions"
 BACKEND="${1:-c}"
 
-if [ "$BACKEND" = "native" ]; then
-  RUN() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" run main.kai 2>"$2" ); }
-  RUN_TEST() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" test main.kai 2>"$2" ); }
-  RUN_CHECK() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" check main.kai 2>&1 ); }
-else
-  RUN() { ( cd "$1" && "$ROOT/bin/kai" run main.kai --backend=c 2>"$2" ); }
-  RUN_TEST() { ( cd "$1" && "$ROOT/bin/kai" test main.kai --backend=c 2>"$2" ); }
-  RUN_CHECK() { ( cd "$1" && "$ROOT/bin/kai" check main.kai --backend=c 2>&1 ); }
-fi
+case "$BACKEND" in
+  native)
+    RUN() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" run main.kai 2>"$2" ); }
+    RUN_TEST() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" test main.kai 2>"$2" ); }
+    RUN_CHECK() { ( cd "$1" && KAI_BACKEND=native "$ROOT/bin/kai" check main.kai 2>&1 ); }
+    ;;
+  modular)
+    RUN() { ( cd "$1" && KAI_MODULAR=1 "$ROOT/bin/kai" run --backend=c main.kai 2>"$2" ); }
+    RUN_TEST() { ( cd "$1" && KAI_MODULAR=1 "$ROOT/bin/kai" test --backend=c main.kai 2>"$2" ); }
+    RUN_CHECK() { ( cd "$1" && KAI_MODULAR=1 "$ROOT/bin/kai" check --backend=c main.kai 2>&1 ); }
+    ;;
+  *)
+    RUN() { ( cd "$1" && KAI_MODULAR=0 "$ROOT/bin/kai" run --backend=c main.kai 2>"$2" ); }
+    RUN_TEST() { ( cd "$1" && KAI_MODULAR=0 "$ROOT/bin/kai" test --backend=c main.kai 2>"$2" ); }
+    RUN_CHECK() { ( cd "$1" && KAI_MODULAR=0 "$ROOT/bin/kai" check --backend=c main.kai 2>&1 ); }
+    ;;
+esac
 
 err="$(mktemp)"
 trap 'rm -f "$err"' EXIT
