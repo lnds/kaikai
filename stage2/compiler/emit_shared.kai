@@ -329,15 +329,51 @@ pub fn c_sym_of_callee(fns: [EFn], callee: String) : String = match efn_resolve(
 # payload layout. `None` means the site has only the bare name and takes
 # the first entry — the pre-namespace behaviour, still correct whenever
 # the name is unique in the program.
-fn evar_entry(vs: [EVar], home: Option[String], target: String) : Option[EVar] {
+# Resolution ladder over a name's entries, one scan: an exact (name, home)
+# match wins immediately; failing that, the name's single entry answers
+# whatever its home; a homeless entry answers a homed request (builtins and
+# root-file types register without a home). Two or more homed entries with
+# no exact match are a real ambiguity — first-entry-wins here is how one
+# homonym's cells got stamped with the other's slot layout, so the table
+# refuses to guess.
+fn evar_entry(vs: [EVar], home: Option[String], target: String) : Option[EVar] =
+  evar_resolve(vs, home, target, 0 - 1, None, None, "", 0)
+
+# `arity` of -1 accepts every entry of the name; a real arity narrows the
+# candidate set BEFORE the ladder runs, so two homonyms of different arity
+# never even count as an ambiguity.
+fn evar_resolve(vs: [EVar], home: Option[String], target: String, arity: Int,
+                homeless: Option[EVar], homed: Option[EVar],
+                seen_homes: String, n: Int) : Option[EVar] =
   match vs {
-    [] -> None
+    [] ->
+      if n == 0 { None }
+      else if n == 1 { match homed { Some(_) -> homed None -> homeless } }
+      else { match homeless {
+        Some(_) -> homeless
+        None -> panic(concat_all(["ambiguous constructor '", target,
+                   "': declared by modules [", seen_homes,
+                   "] and the use site names no home — qualify the construction or the pattern"]))
+      } }
     [h, ...rest] -> match h {
-      EV(hm, n, _, _, _) ->
-        if n == target and ctor_home_matches(hm, home) { Some(h) }
-        else { evar_entry(rest, home, target) }
+      EV(hm, nm, ar, _, _) ->
+        if nm != target or (arity >= 0 and ar != arity) {
+          evar_resolve(rest, home, target, arity, homeless, homed, seen_homes, n)
+        }
+        else if evar_home_eq(hm, home) { Some(h) }
+        else { match hm {
+          None -> evar_resolve(rest, home, target, arity, Some(h), homed, seen_homes, n + 1)
+          Some(m) -> evar_resolve(rest, home, target, arity, homeless,
+                       match homed { Some(_) -> homed None -> Some(h) },
+                       if seen_homes == "" { m } else { concat_all([seen_homes, ", ", m]) },
+                       n + 1)
+        } }
     }
   }
+
+fn evar_home_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { None -> false Some(y) -> x == y }
 }
 
 # A constructor qualifier the AST carries is not always a module: the
@@ -382,16 +418,8 @@ pub fn evar_find_tag_arity(vs: [EVar], home: Option[String], target: String, ari
     None                    -> evar_find_tag_in(vs, home, target)
   }
 
-fn evar_entry_arity(vs: [EVar], home: Option[String], target: String, arity: Int) : Option[EVar] {
-  match vs {
-    [] -> None
-    [h, ...rest] -> match h {
-      EV(hm, n, ar, _, _) ->
-        if n == target and ar == arity and ctor_home_matches(hm, home) { Some(h) }
-        else { evar_entry_arity(rest, home, target, arity) }
-    }
-  }
-}
+fn evar_entry_arity(vs: [EVar], home: Option[String], target: String, arity: Int) : Option[EVar] =
+  evar_resolve(vs, home, target, arity, None, None, "", 0)
 
 # The list returned here is walked in lockstep with the call site's
 # arguments, so a payload of a DIFFERENT arity is worse than none: the
@@ -422,6 +450,13 @@ pub fn evar_find_tag_in(vs: [EVar], home: Option[String], target: String) : Int 
 #[doc("Atom-style global variant tag lookup: the reserved tag for a builtin (0..10 per docs/variant-tags.md) or the hashed user-range tag.")]
 pub fn evar_find_tag(vs: [EVar], target: String) : Int =
   evar_find_tag_in(vs, None, target)
+
+#[doc("The head tag of ctor target with `arity` slots, preferring the entry declared by `home`, or None when unregistered.")]
+pub fn evar_find_tag_opt_arity(vs: [EVar], home: Option[String], target: String, arity: Int) : Option[Int] =
+  match evar_entry_arity(vs, home, target, arity) {
+    None            -> None
+    Some(EV(_, _, _, _, t)) -> Some(t)
+  }
 
 #[doc("The head tag of ctor target as declared by `home`, or None when it is not a registered variant.")]
 pub fn evar_find_tag_opt_in(vs: [EVar], home: Option[String], target: String) : Option[Int] =
