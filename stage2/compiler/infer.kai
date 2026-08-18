@@ -24,6 +24,7 @@ import compiler.refinements
 import compiler.parse
 import compiler.resolve
 import compiler.modules
+import compiler.type_scope
 import compiler.loop_lower
 import compiler.desugar
 import compiler.doc_attr
@@ -5667,10 +5668,16 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
 
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
                     top_names: [String]) : EnvWithArities =
-  add_decls_loop_rk(env, ar_acc, ds, top_names, compute_row_kind_slots(ds))
+  add_decls_loop_rk(env, ar_acc, ds, top_names, compute_row_kind_slots(ds),
+                    collect_type_origins(ds, ""))
 
+# `homes` is the whole program's type-origin table: a signature's
+# nominal types are stamped with the home its declaring module sees,
+# so a call in another module reads the type's identity, not only its
+# name. Left bare when the name resolves to nothing from there.
 fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
-                    top_names: [String], rk_table: [RowKindEntry]) : EnvWithArities {
+                    top_names: [String], rk_table: [RowKindEntry],
+                    homes: [TypeOriginReg]) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -5686,7 +5693,8 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # key first and falls back to bare only for core-only
         # schemes registered by `add_core_sigs`.
         DFn(_, fname, _, _, _, _, _, _, _, mo) -> match fn_scheme_of_decl_rk(d, rk_table) {
-          Some(sc) -> {
+          Some(sc0) -> {
+            let sc = scheme_stamp_homes(sc0, homes, mo)
             let env1 = ty_env_add(env, fname, sc)
             let env2 = match mo {
               Some(m) -> ty_env_add_qualified(env1, m, fname, sc)
@@ -5726,7 +5734,7 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # the same dual registration `DFn` uses, so cross-module const
         # reads (`real.real_pi`) resolve through the qualified env.
         DConst(_, cname, cte, _, mo, _, _) -> {
-          let csc = mono(resolve_ty_with_binds(cte, [], []))
+          let csc = mono(stamp_ty_homes(homes, mo, resolve_ty_with_binds(cte, [], [])))
           let env1 = ty_env_add(env, cname, csc)
           let env2 = match mo {
             Some(m) -> ty_env_add_qualified(env1, m, cname, csc)
@@ -5738,22 +5746,27 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # as a bare `DFn` would be, then record its `type -> (home, fn)`
         # binding so `try_constructor_call` can desugar `Type(args)`.
         DProtoLaws(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DImplAxiom(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DConstructor(inner, cl, cc) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table)
+      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table, homes)
     }
   }
+}
+
+fn scheme_stamp_homes(sc: TyScheme, homes: [TypeOriginReg],
+                      from: Option[String]) : TyScheme = match sc {
+  Scheme(tv, rv, uv, ks, body) -> Scheme(tv, rv, uv, ks, stamp_ty_homes(homes, from, body))
 }
 
 # Record a `#[constructor]` binding on the env. The inner `DFn`'s
@@ -6022,7 +6035,8 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String]) : BuiltEnv =
   build_ty_env_inherited_rk(seed, inherited, decls, unions, top_names,
-                            compute_row_kind_slots(decls))
+                            compute_row_kind_slots(decls),
+                            collect_type_origins(decls, ""))
 
 # As `build_ty_env_inherited` but with an explicit row-kind table. The
 # per-module typer fold passes the table computed over the FULL program
@@ -6031,7 +6045,8 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
 # against stdlib's `Stream`).
 fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
-                            top_names: [String], rk_table: [RowKindEntry]) : BuiltEnv {
+                            top_names: [String], rk_table: [RowKindEntry],
+                            homes: [TypeOriginReg]) : BuiltEnv {
   # `inherited.ty_entries` are newer than the seed (prepended at head).
   # Prepend them onto BOTH the seed entries and the seed index in one
   # pass, sharing each entry exactly as `ty_env_add` does -- never
@@ -6046,7 +6061,7 @@ fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
     }
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
-  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table)
+  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table, homes)
   BuiltEnv { env: r.env, core_len: seed.core_len,
              op_eff_arities: r.arities }
 }
@@ -20607,7 +20622,8 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   } else { decls_a }
   let rk_table = compute_row_kind_slots(rk_src_decls)
   let built = build_ty_env_inherited_rk(seed, inherited, decls_a,
-                                       unions_all, top_names, rk_table)
+                                       unions_all, top_names, rk_table,
+                                       collect_type_origins(rk_src_decls, ""))
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
   # rebuild the type-alias resolution table here so

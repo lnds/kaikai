@@ -1,16 +1,13 @@
-# compiler/type_scope.kai — module scoping for nominal type names in
-# protocol dispatch.
+# compiler/type_scope.kai — module scoping for nominal type names.
 #
-# `type T` is not a package-global name, but the impl table keys on the
-# bare spelling: two modules each declaring their own `T` and
-# implementing the same protocol for it collapse onto one key, reported
-# as a spurious duplicate. The types themselves already scope correctly
-# through the typer's `module_origin` disambiguation — only the impl
-# key and the mangled symbol lost the home.
-#
-# This mirrors `proto_scope`: a module sees its own types first, then
-# the exported ones of other modules; root-file types are visible
-# package-wide.
+# `type T` is not a package-global name: two modules may each declare
+# their own `T`. A `TyCon` built at scheme time carries no home, and
+# the impl table keyed on the bare spelling, so both `T`s collapsed
+# onto one type identity and one impl key. This module is the one
+# rule for recovering a type's home from a consuming module's
+# viewpoint, and the one spelling that keeps contested names apart in
+# dispatch: own declaration first, else the single visible foreign
+# one, else unresolved.
 
 import compiler.util
 import compiler.ast
@@ -38,8 +35,11 @@ fn tsc_decl_home(d: Decl, cur: String, target: String) : String = match d {
 
 fn tsc_entry_of(d: Decl, home: String, target: String,
                 acc: [TypeOriginReg]) : [TypeOriginReg] = match d {
-  DType(is_pub, name, _, _, _, _, _, _) ->
-    [TyOR(name, tsc_mo_of(home, target), is_pub), ...acc]
+  DType(is_pub, name, _, body, _, _, _, _) -> match body {
+    TBAlias(_)       -> acc
+    TBEffectAlias(_) -> acc
+    _ -> [TyOR(name, tsc_mo_of(home, target), is_pub), ...acc]
+  }
   DDerive(_, inner, _, _)       -> tsc_entry_of(inner, home, target, acc)
   DUnstable(inner, _, _)        -> tsc_entry_of(inner, home, target, acc)
   DProtoLaws(_, inner, _, _, _) -> tsc_entry_of(inner, home, target, acc)
@@ -55,12 +55,12 @@ fn tsc_entry_of(d: Decl, home: String, target: String,
 fn tsc_mo_of(home: String, target: String) : Option[String] =
   if home == target { None } else { Some(home) }
 
-#[doc("The home of the type `tname` as seen from the module whose home is `from` (`None` = root file): its own declaration first, else the first-declared visible foreign one.")]
+#[doc("The home of type `tname` as seen from the module `from` (`None` = root file): its own declaration, else the single visible foreign one; `None` when unresolved or contested.")]
 pub fn type_scope_home(origins: [TypeOriginReg], tname: String,
                        from: Option[String]) : Option[Option[String]] =
   match tsc_own(origins, tname, from) {
     Some(mo) -> Some(mo)
-    None     -> tsc_foreign(origins, tname)
+    None     -> tsc_foreign(origins, tname, from, None)
   }
 
 fn tsc_own(origins: [TypeOriginReg], tname: String,
@@ -71,15 +71,45 @@ fn tsc_own(origins: [TypeOriginReg], tname: String,
     else { tsc_own(rest, tname, from) }
 }
 
-# Declaration order is the visibility order: the first `pub` or
-# root-file declaration answers, matching `proto_scope`'s foreign pass.
-fn tsc_foreign(origins: [TypeOriginReg],
-               tname: String) : Option[Option[String]] = match origins {
-  [] -> None
-  [TyOR(n, mo, is_pub), ...rest] ->
-    if n == tname and (is_pub or mo_eq(mo, None)) { Some(mo) }
-    else { tsc_foreign(rest, tname) }
-}
+# A foreign declaration is visible when it is `pub` or root-file. One
+# visible home answers; a second settles the name as contested, which
+# resolves to nothing — guessing here would silently pick a type.
+fn tsc_foreign(origins: [TypeOriginReg], tname: String, from: Option[String],
+               found: Option[Option[String]]) : Option[Option[String]] =
+  match origins {
+    [] -> found
+    [TyOR(n, mo, is_pub), ...rest] ->
+      if n == tname and not mo_eq(mo, from) and (is_pub or mo_eq(mo, None)) {
+        match found {
+          None    -> tsc_foreign(rest, tname, from, Some(mo))
+          Some(f) -> if mo_eq(f, mo) { tsc_foreign(rest, tname, from, found) }
+                     else { None }
+        }
+      } else { tsc_foreign(rest, tname, from, found) }
+  }
+
+#[doc("Stamp every homeless `TyCon` in `t` with the home `from` resolves its name to; a `TyCon` that already carries a home is left alone.")]
+pub fn stamp_ty_homes(origins: [TypeOriginReg], from: Option[String], t: Ty) : Ty =
+  match t {
+    TyCon(mo, nm, tas) -> {
+      let tas2 = map(tas, (a) => stamp_ty_homes(origins, from, a))
+      match mo {
+        Some(_) -> TyCon(mo, nm, tas2)
+        None    -> match type_scope_home(origins, nm, from) {
+          Some(h) -> TyCon(h, nm, tas2)
+          None    -> TyCon(None, nm, tas2)
+        }
+      }
+    }
+    TyListT(inner)      -> TyListT(stamp_ty_homes(origins, from, inner))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => stamp_ty_homes(origins, from, p)),
+                                 stamp_ty_homes(origins, from, ret), row)
+    TyDimT(base, u)     -> TyDimT(stamp_ty_homes(origins, from, base), u)
+    TyRefineT(base, p)  -> TyRefineT(stamp_ty_homes(origins, from, base), p)
+    TyUnion(parts)      -> TyUnion(map(parts, (p) => stamp_ty_homes(origins, from, p)))
+    TyShapeApp(sv, arg) -> TyShapeApp(sv, stamp_ty_homes(origins, from, arg))
+    _ -> t
+  }
 
 # Dispatch identity, the `psc_spell` rule applied to the impl target.
 # A contested name (declared by two or more homes) spells each

@@ -4420,7 +4420,7 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     EBinop(op, l, r) -> {
       let nl = resolve_protocol_calls_expr(l, reg, local_arities, cm)
       let nr = resolve_protocol_calls_expr(r, reg, local_arities, cm)
-      prc_rewrite_cmp_binop(op, nl, nr, reg)
+      prc_rewrite_cmp_binop(op, nl, nr, reg, cm)
     }
     _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, local_arities, cm))
   }
@@ -4431,9 +4431,10 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
 # `<`/`>`/`<=`/`>=` → Ord.cmp reduced to Bool against 0. Any other op,
 # or an operand type with no custom impl, is left as the structural
 # builtin EBinop (which lowers to kai_op_eq_v / direct compare).
-fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprKind {
+fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg,
+                         cm: Option[String]) : ExprKind {
   if op == "==" or op == "!=" {
-    match prc_cmp_custom_head(reg, "Eq", l.ty) {
+    match prc_cmp_custom_head(reg, "Eq", l.ty, cm) {
       None -> EBinop(op, l, r)
       Some(head) -> {
         let mangled = concat_all(["__pimpl_Eq_", head, "_eq"])
@@ -4447,7 +4448,7 @@ fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprK
       }
     }
   } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
-    match prc_cmp_custom_head(reg, "Ord", l.ty) {
+    match prc_cmp_custom_head(reg, "Ord", l.ty, cm) {
       None -> EBinop(op, l, r)
       Some(head) -> {
         let mangled = concat_all(["__pimpl_Ord_", head, "_cmp"])
@@ -4474,23 +4475,18 @@ fn prc_mk_ty(k: ExprKind, line: Int, col: Int, ty: Option[Ty]) : Expr =
 # v1 checks the root type only; a contained field with a custom impl
 # is a documented follow-up (the compiler's own comparisons are all
 # fully structural, so root-only suffices for self-host correctness).
-fn prc_cmp_custom_head(reg: ProtocolReg, proto: String, ty: Option[Ty]) : Option[String] {
+fn prc_cmp_custom_head(reg: ProtocolReg, proto: String, ty: Option[Ty],
+                       cm: Option[String]) : Option[String] {
   match ty {
     None -> None
-    Some(t) -> match prc_ty_head_name(t) {
-      None -> None
-      Some(head) ->
-        if prc_reg_has_impl(reg, proto, head) { Some(head) } else { None }
+    Some(t) -> match t {
+      TyCon(_, _, _) -> match reg_ty_head_name(reg, t, cm) {
+        None -> None
+        Some(head) ->
+          if prc_reg_has_impl(reg, proto, head) { Some(head) } else { None }
+      }
+      _ -> None
     }
-  }
-}
-
-# Root head name of a Ty, for impl-table lookup. Only nominal TyCon
-# heads can carry a user impl; everything else returns None.
-fn prc_ty_head_name(t: Ty) : Option[String] {
-  match t {
-    TyCon(_, name, _) -> Some(name)
-    _ -> None
   }
 }
 
@@ -4781,14 +4777,24 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
             [] -> errs
             [self_arg, ..._rest_args] -> match self_arg.ty {
               None -> errs
-              Some(ty) -> match reg_ty_head_name(reg, ty) {
+              Some(ty) -> match reg_ty_head_name(reg, ty, cm) {
                 None -> errs
                 # Collision-aware: an impl under ANY protocol declaring
                 # `opname` clears the call (the bare name carries no
                 # protocol, so `Ring.add` and `Add.add` are both valid
                 # targets for `add`).
                 Some(tname) -> match find_impl_any_proto(reg, opname, tname, cm) {
-                  Some(_) -> errs
+                  Some(_) -> {
+                    let amb = proto_ambiguous_cands(reg, proto_ops_lookup_all(reg, opname),
+                                                    args_, cm)
+                    if list_length(amb) > 1 {
+                      diag_error(file, e.line, e.col,
+                        concat_all(["ambiguous protocol operation `", opname,
+                                    "` — it is exported by multiple modules: ",
+                                    join_with(amb, ", ")]))
+                      errs + 1
+                    } else { errs }
+                  }
                   None -> {
                     let pname = first_proto_of_op(reg, opname)
                     diag_error(file, e.line, e.col,
@@ -5183,11 +5189,11 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
 # Returns None when the shapes do not align (the inferred return is
 # still a tyvar, or a structural mismatch the unifier would have
 # already rejected).
-fn self_head_in_ret(reg: ProtocolReg, declared: TypeExpr,
+fn self_head_in_ret(reg: ProtocolReg, cm: Option[String], declared: TypeExpr,
                     inferred: Ty) : Option[String] {
   let n = te_self_count(declared)
-  if n == 0 { reg_ty_head_name(reg, inferred) }
-  else if n == 1 { align_self_head(reg, declared, inferred) }
+  if n == 0 { reg_ty_head_name(reg, inferred, cm) }
+  else if n == 1 { align_self_head(reg, cm, declared, inferred) }
   else { None }
 }
 
@@ -5220,20 +5226,20 @@ fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
 # the same constructor at every step (the typer already unified them),
 # so the walk pairs children positionally and recurses until it lands
 # on the `Self` leaf.
-fn align_self_head(reg: ProtocolReg, declared: TypeExpr,
+fn align_self_head(reg: ProtocolReg, cm: Option[String], declared: TypeExpr,
                    inferred: Ty) : Option[String] {
   match declared.tkind {
     TyName(name, targs) ->
-      if name == "Self" { reg_ty_head_name(reg, inferred) }
-      else { align_self_in_args(reg, targs, ty_con_args(inferred)) }
+      if name == "Self" { reg_ty_head_name(reg, inferred, cm) }
+      else { align_self_in_args(reg, cm, targs, ty_con_args(inferred)) }
     TyList(inner) -> {
       match inferred {
-        TyListT(elem) -> align_self_head(reg, inner, elem)
+        TyListT(elem) -> align_self_head(reg, cm, inner, elem)
         _             -> None
       }
     }
-    TyDim(base, _)    -> align_self_head(reg, base, ty_strip_dim(inferred))
-    TyRefine(base, _) -> align_self_head(reg, base, ty_strip_refine(inferred))
+    TyDim(base, _)    -> align_self_head(reg, cm, base, ty_strip_dim(inferred))
+    TyRefine(base, _) -> align_self_head(reg, cm, base, ty_strip_refine(inferred))
     TyFn(_, _, _)     -> None
     # issue #772: a compound row is never a `Self`-bearing position.
     TyRow(_)          -> None
@@ -5243,7 +5249,7 @@ fn align_self_head(reg: ProtocolReg, declared: TypeExpr,
 
 # Walk paired declared/inferred argument lists; the one carrying `Self`
 # (guaranteed unique by the `te_self_count == 1` gate) yields the head.
-fn align_self_in_args(reg: ProtocolReg, decls: [TypeExpr],
+fn align_self_in_args(reg: ProtocolReg, cm: Option[String], decls: [TypeExpr],
                       infs: [Ty]) : Option[String] {
   match decls {
     [] -> None
@@ -5251,8 +5257,8 @@ fn align_self_in_args(reg: ProtocolReg, decls: [TypeExpr],
       match infs {
         []           -> None
         [i, ...irest] ->
-          if te_self_count(d) == 1 { align_self_head(reg, d, i) }
-          else { align_self_in_args(reg, drest, irest) }
+          if te_self_count(d) == 1 { align_self_head(reg, cm, d, i) }
+          else { align_self_in_args(reg, cm, drest, irest) }
       }
     }
   }
@@ -5324,7 +5330,7 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
               # candidate against its own return-derived Self type.
               # Decline while any argument's type is still unresolved
               # (no head) — dispatching then would be premature.
-              match args_head_names(reg, args_) {
+              match args_head_names(reg, args_, cm) {
                 None -> None
                 Some(_) ->
                   try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
@@ -5377,7 +5383,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
           try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         } else {
           let pkey = proto_key_of(reg.dkeys, pname, pmo)
-          match self_head_in_ret(reg, ret_te, ret_ty) {
+          match self_head_in_ret(reg, cm, ret_te, ret_ty) {
             None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                opname, ret_ty)
             Some(self_name) ->
@@ -5421,12 +5427,82 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
         # The caller's own protocol ranks first: with a contested name,
         # a module's bare call binds its own declaration, exactly as
         # `proto_scope` resolves the name for impl validation.
-        try_rewrite_proto_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
-                                     callee, args_, reg, cm, opname)
+        let cands = proto_ops_lookup_all(reg, opname)
+        # Two protocols on the same rung of the ladder both answering
+        # the receiver is an ambiguity, not a first-wins: the call is
+        # left on the dispatcher for the validator to report.
+        if list_length(proto_ambiguous_cands(reg, cands, args_, cm)) > 1 { None }
+        else {
+          try_rewrite_proto_candidates(proto_cands_own_first(cands, cm),
+                                       callee, args_, reg, cm, opname)
+        }
       }
     }
     _ -> None
   }
+}
+
+# The distinct protocols on the nearest rung of the ladder (own module,
+# then imported, then core) that declare `opname` at the call's arity,
+# are visible from `cm`, and hold an impl for the receiver — spelled
+# `<home>.<P>` for the diagnostic. More than one is an ambiguity.
+fn proto_ambiguous_cands(reg: ProtocolReg, cands: [ProtoOpReg],
+                         args_: [Expr], cm: Option[String]) : [String] = {
+  let hits = pac_hits(reg, cands, args_, cm, [])
+  let r = pac_best_rung(hits, 3)
+  if r == 3 { [] } else { pac_names_on(hits, r, []) }
+}
+
+# `(rung, spelling)` per candidate protocol with an impl for the receiver.
+type ProtoAmbHit = PAH(Int, String)
+
+fn pac_hits(reg: ProtocolReg, cands: [ProtoOpReg], args_: [Expr],
+            cm: Option[String], acc: [ProtoAmbHit]) : [ProtoAmbHit] =
+  match cands {
+    [] -> acc
+    [POR(pname, opname, params, ret, _, _, pmo), ...rest] -> {
+      let carriers = proto_shape_carriers_at(reg.tparams, pname, pmo)
+      let eligible = list_length(params) == list_length(args_) and
+                     proto_visible_from(reg.origins, pname, pmo, cm) and
+                     not proto_op_self_only_in_return(params, ret, carriers)
+      let hit = if not eligible { None } else {
+        find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
+                                 pname, pmo, opname, args_, cm)
+      }
+      match hit {
+        None    -> pac_hits(reg, rest, args_, cm, acc)
+        Some(_) -> {
+          let spelling = match pmo { Some(m) -> concat_all([m, ".", pname])  None -> pname }
+          pac_hits(reg, rest, args_, cm, pac_add(acc, PAH(pac_rung(reg, pmo, cm), spelling)))
+        }
+      }
+    }
+  }
+
+fn pac_add(acc: [ProtoAmbHit], h: ProtoAmbHit) : [ProtoAmbHit] =
+  match h { PAH(_, sp) ->
+    if list_any(acc, (a) => match a { PAH(_, s2) -> s2 == sp }) { acc }
+    else { list_append(acc, [h]) }
+  }
+
+# 0 = the caller's own module, 1 = another user module or the root
+# file, 2 = a stdlib core.
+fn pac_rung(reg: ProtocolReg, pmo: Option[String], cm: Option[String]) : Int =
+  if mo_eq(pmo, cm) { 0 }
+  else { match pmo {
+    Some(m) -> if list_has(reg.cores, m) { 2 } else { 1 }
+    None    -> 1
+  } }
+
+fn pac_best_rung(hits: [ProtoAmbHit], best: Int) : Int = match hits {
+  [] -> best
+  [PAH(r, _), ...rest] -> pac_best_rung(rest, if r < best { r } else { best })
+}
+
+fn pac_names_on(hits: [ProtoAmbHit], r: Int, acc: [String]) : [String] = match hits {
+  [] -> list_reverse(acc)
+  [PAH(hr, sp), ...rest] ->
+    pac_names_on(rest, r, if hr == r { [sp, ...acc] } else { acc })
 }
 
 # Issue #546: try each protocol declaring `opname` in registry order,
@@ -5466,7 +5542,7 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
           try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
         } else {
           match find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
-                                         pname, pmo, opname, args_) {
+                                         pname, pmo, opname, args_, cm) {
             Some(impl_fn) -> {
               let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
               Some(ECall(new_callee, args_))
@@ -5483,8 +5559,12 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
 # contains `Self` (nor the protocol's `Shape` carrier), i.e. dispatch
 # is informed only by the return type. Such ops can only be dispatched
 # via the surrounding expected type (typed-hole error otherwise).
+# An op naming `Self` in no parameter but in its return. An op that
+# names `Self` nowhere (`calc(self: Int) : Int`) has a concrete
+# receiver and dispatches on its arguments like any other.
 fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
                                 carriers: [String]) : Bool {
+  te_mentions_self_or_carrier(ret, carriers) and
   not list_any(params, (p) => match p.ptype {
     Some(te) -> te_mentions_self_or_carrier(te, carriers)
     None -> false
@@ -5588,12 +5668,24 @@ fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
 # Every `find_impl_*` filter keys on `t == recv`, so the bucket holds
 # exactly the entries the linear scan would not skip, in the same order.
 # The impl key spells a contested target type with its home, so the
-# lookup head must be spelled the same way. `TyCon` already carries the
-# home the typer resolved; every other head is a builtin with no home.
-fn reg_ty_head_name(reg: ProtocolReg, t: Ty) : Option[String] =
+# lookup head must be spelled the same way. A `TyCon` stamped by the
+# typer names its home; a homeless one is resolved the way the calling
+# module `cm` reads the name, and stays bare when that resolves to
+# nothing. Every other head is a builtin with no home.
+fn reg_ty_head_name(reg: ProtocolReg, t: Ty, cm: Option[String]) : Option[String] =
   match ty_head_name(t) {
     None    -> None
-    Some(n) -> Some(type_dispatch_spell(reg.tys, reg.cores, n, ty_head_home(t)))
+    Some(n) -> Some(type_dispatch_spell(reg.tys, reg.cores, n, head_home_from(reg, t, n, cm)))
+  }
+
+fn head_home_from(reg: ProtocolReg, t: Ty, n: String,
+                  cm: Option[String]) : Option[String] =
+  match ty_head_home(t) {
+    Some(m) -> Some(m)
+    None    -> match type_scope_home(reg.tys, n, cm) {
+      Some(h) -> h
+      None    -> None
+    }
   }
 
 fn ty_head_home(t: Ty) : Option[String] = match t {
@@ -5611,19 +5703,19 @@ fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
 # own tparam list — a contested name must not read a homonym's.
 fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
                              pmo: Option[String], opname: String,
-                             args_: [Expr]) : Option[String] {
+                             args_: [Expr], cm: Option[String]) : Option[String] {
   # A `Shape`-carrier protocol dispatches single, on the container arg;
   # its ops carry ordinary function parameters (`map(xs, f)`) whose types
   # have no dispatch head. Read the head from the first container-typed
   # argument and ignore the rest, so a function arg does not veto the
   # lookup the way `args_head_names` (all-or-nothing) would.
   if proto_is_shape_carrier_at(reg.tparams, pname, pmo) {
-    match first_container_head(reg, args_) {
+    match first_container_head(reg, args_, cm) {
       None -> None
       Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   } else {
-  let names = args_head_names(reg, args_)
+  let names = args_head_names(reg, args_, cm)
   match names {
     None -> None
     Some(ns) -> match ns {
@@ -5669,15 +5761,16 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
 # The head name of the first argument that carries a concrete type
 # constructor (a container), skipping function-typed and unresolved
 # args. This is the dispatch receiver for a `Shape`-carrier op.
-fn first_container_head(reg: ProtocolReg, args_: [Expr]) : Option[String] =
+fn first_container_head(reg: ProtocolReg, args_: [Expr],
+                        cm: Option[String]) : Option[String] =
   match args_ {
     [] -> None
     [e, ...rest] -> match e.ty {
-      Some(ty) -> match reg_ty_head_name(reg, ty) {
+      Some(ty) -> match reg_ty_head_name(reg, ty, cm) {
         Some(n) -> Some(n)
-        None    -> first_container_head(reg, rest)
+        None    -> first_container_head(reg, rest, cm)
       }
-      None -> first_container_head(reg, rest)
+      None -> first_container_head(reg, rest, cm)
     }
   }
 
@@ -5705,14 +5798,15 @@ fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args
   _ -> false
 }
 
-fn args_head_names(reg: ProtocolReg, args_: [Expr]) : Option[[String]] =
+fn args_head_names(reg: ProtocolReg, args_: [Expr],
+                   cm: Option[String]) : Option[[String]] =
   match args_ {
     [] -> Some([])
     [e, ...rest] -> match e.ty {
       None -> None
-      Some(ty) -> match reg_ty_head_name(reg, ty) {
+      Some(ty) -> match reg_ty_head_name(reg, ty, cm) {
         None -> None
-        Some(n) -> match args_head_names(reg, rest) {
+        Some(n) -> match args_head_names(reg, rest, cm) {
           None -> None
           Some(ns) -> Some([n, ...ns])
         }
