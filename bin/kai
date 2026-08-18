@@ -1119,7 +1119,8 @@ Commands:
   lint  [<spec>] [--json]       Clippy-style linter over the typed AST;
                                 flags suspect-but-valid code. Warnings
                                 only — never blocks a build.
-  fmt   [<spec>] [--check]      Pretty-print kaikai source canonically.
+  fmt   [<spec>] [--check]      Pretty-print kaikai source canonically
+                                (--width N sets the line width).
   migrate [<file>] [--write]    Rewrite source across an edition bump
                                 (dry-run by default; --write applies).
   watch [<spec>]                Recompile + run on every save (live demo).
@@ -1532,12 +1533,16 @@ EOF
 
 usage_fmt() {
   cat <<EOF
-usage: kai fmt <file.kai>            # rewrite file in place
-       kai fmt --check <file.kai>    # exit 0 if formatted, 1 if not
-       kai fmt --stdin               # read stdin -> formatted to stdout
+usage: kai fmt [--width N] <file.kai>            # rewrite file in place
+       kai fmt [--width N] --check <file.kai>    # exit 0 if formatted, 1 if not
+       kai fmt [--width N] --stdin               # read stdin -> formatted to stdout
 
 Pretty-print kaikai source canonically. The formatter is gofmt-style:
-no options, single output, idempotent.
+one output, idempotent, and it lays code out against a line width:
+a construct that fits on its line stays there, one that does not
+breaks at its own points (after \`=\`, one argument per line, one
+pipe stage per line), and a line break the author already wrote at
+one of those points is kept.
 
 Scope: the full language surface — effects, handlers, protocols,
 impls, units, dim types, refinements, axioms, generic fn / type
@@ -1545,6 +1550,8 @@ parameters, var, and parametric effect rows all format. A file is
 refused only when it does not parse.
 
 Options:
+  --width N    Line width in columns. Defaults to the \`width\` key of
+               the package's kai.toml \`[fmt]\` table, else 100.
   --check      Do not modify the file. Exit 0 if already formatted; 1
                otherwise. Print the formatted output to stdout when
                different.
@@ -3132,6 +3139,31 @@ cmd_lint() {
   fi
 }
 
+# The line width `kai fmt` lays a file out against: the --width flag
+# when given, else the `width` key of the `[fmt]` table in the nearest
+# kai.toml above the file, else the formatter's default (100). Same
+# naive-TOML awk contract as the other manifest readers.
+fmt_width_for() {
+  fw_dir="$1"; fw_flag="$2"
+  if [ -n "$fw_flag" ]; then printf '%s' "$fw_flag"; return 0; fi
+  fw_manifest="$(find_manifest_dir "$fw_dir")"
+  fw_width=""
+  if [ -n "$fw_manifest" ] && [ -f "$fw_manifest/kai.toml" ]; then
+    fw_width="$(awk '
+      /^[[:space:]]*\[fmt\][[:space:]]*$/ { insec = 1; next }
+      /^[[:space:]]*\[/                   { insec = 0 }
+      insec && /^[[:space:]]*width[[:space:]]*=[[:space:]]*[0-9]+/ {
+        n = $0
+        sub(/^[^=]*=[[:space:]]*/, "", n)
+        sub(/[^0-9].*/, "", n)
+        print n
+        exit
+      }
+    ' "$fw_manifest/kai.toml")"
+  fi
+  printf '%s' "${fw_width:-100}"
+}
+
 # kai fmt — pretty-print kaikai source canonically.
 #
 # Three input modes:
@@ -3146,17 +3178,23 @@ cmd_lint() {
 # subcommand. fmt runs at the source-text level and never resolves
 # names, so the core-stdlib auto-load is irrelevant here.
 cmd_fmt() {
-  src=""; mode_check=""; stdin_mode=""
+  src=""; mode_check=""; stdin_mode=""; width=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage_fmt; return 0 ;;
       --check)   mode_check=1; shift ;;
       --stdin)   stdin_mode=1; shift ;;
+      --width)   [ $# -ge 2 ] || die "--width requires a column count"
+                 width="$2"; shift 2 ;;
+      --width=*) width="${1#--width=}"; shift ;;
       -*)        die "unknown flag: $1 (see 'kai fmt --help')" ;;
       *)         [ -z "$src" ] || die "only one input file supported"
                  src="$1"; shift ;;
     esac
   done
+  case "$width" in
+    ""|*[!0-9]*) [ -z "$width" ] || die "--width takes a positive integer, got '$width'" ;;
+  esac
   ensure_built
 
   if [ -n "$stdin_mode" ]; then
@@ -3164,7 +3202,8 @@ cmd_fmt() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT INT TERM
     cat > "$tmp/in.kai"
-    "$KAIC2" --fmt "$tmp/in.kai"
+    # A manifest below the working directory sets the width for stdin.
+    "$KAIC2" --fmt-width "$(fmt_width_for "$PWD" "$width")" --fmt "$tmp/in.kai"
     return $?
   fi
 
@@ -3181,15 +3220,16 @@ cmd_fmt() {
   fi
   [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
   [ -f "$src" ] || die_file_not_found "$src" "fmt"
+  width="$(fmt_width_for "$(dirname "$src")" "$width")"
 
   if [ -n "$mode_check" ]; then
-    "$KAIC2" --fmt-check "$src"
+    "$KAIC2" --fmt-width "$width" --fmt-check "$src"
     return $?
   fi
 
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT INT TERM
-  if "$KAIC2" --fmt "$src" > "$tmp/out.kai"; then
+  if "$KAIC2" --fmt-width "$width" --fmt "$src" > "$tmp/out.kai"; then
     # Only write back when the formatted text differs (avoids touching
     # the file mtime on a no-op).
     if ! cmp -s "$src" "$tmp/out.kai"; then

@@ -1,0 +1,262 @@
+# compiler/fmt_layout.kai — the width model behind `kai fmt`.
+#
+# The writer emits text directly, so a layout is decided before its
+# text exists: each decision renders the candidate into a probe state,
+# measures it, and keeps the render when it fits. Three shapes cover
+# every construct the walker breaks — a body hanging off `=` / `->`, a
+# delimited sequence, and an operator chain. Each takes the author's
+# own line breaks as a signal: a break the source already has is kept,
+# a line that fits is joined, a line that does not is broken at the
+# shape's own points. Nothing here walks the AST: the walker passes
+# emitters, and the only source fact read here is where a token sits.
+
+import compiler.util
+import compiler.lex
+import compiler.ast
+import compiler.fmt_writer
+import compiler.fmt_shape
+import compiler.fmt_chain
+
+# ---- source lines -----------------------------------------------------
+
+# An opening parenthesis is skipped: the writer adds and drops
+# parentheses by precedence, so an expression written `(not x) and y`
+# and printed `not x and y` must read as the same author break.
+#[doc("Column of the first token on each source line, parentheses aside, indexed by line (0 for a line without tokens).")]
+pub fn fmt_line_starts(toks: [Token]) : Array[Int] =
+  fmt_starts_fill(toks, array_make(fmt_last_line(toks, 0) + 2, 0))
+
+fn fmt_last_line(toks: [Token], acc: Int) : Int = match toks {
+  [] -> acc
+  [t, ...rest] -> fmt_last_line(rest, if t.line > acc { t.line } else { acc })
+}
+
+fn fmt_starts_fill(toks: [Token], a: Array[Int]) : Array[Int] / Mutable = match toks {
+  [] -> a
+  [t, ...rest] ->
+    if fmt_tok_is_layout(t.kind) or (array_get(a, t.line) > 0) { fmt_starts_fill(rest, a) }
+    else { fmt_starts_fill(rest, array_set(a, t.line, t.col)) }
+}
+
+fn fmt_tok_is_layout(k: TokKind) : Bool = match k {
+  TkNewline -> true
+  TkEof -> true
+  TkLparen -> true
+  _ -> false
+}
+
+#[doc("True when the token at (line, col) opens its source line: the author broke the line right before it.")]
+pub fn fmt_starts_line(s: FmtSt, line: Int, col: Int) : Bool =
+  ((line > 0) and (line < array_length(s.starts))) and (array_get(s.starts, line) == col)
+
+#[doc("True when the expression's first token opens its source line.")]
+pub fn fmt_expr_starts_line(s: FmtSt, e: Expr) : Bool {
+  let head = fmt_leftmost(e)
+  fmt_starts_line(s, head.line, head.col)
+}
+
+#[doc("True when the author broke an operator chain: some operator, or the operand after it, opens a source line.")]
+pub fn fmt_chain_broken(s: FmtSt, links: [ChainOp]) : Bool = match links {
+  [] -> false
+  [ChainOp(_, line, col, rhs), ...rest] ->
+    (fmt_starts_line(s, line, col) or fmt_expr_starts_line(s, rhs)) or fmt_chain_broken(s, rest)
+}
+
+# ---- probes -----------------------------------------------------------
+
+#[doc("Render `emit` from `s` when the result stays on the current line inside the width; None otherwise.")]
+pub fn fmt_try_flat(s: FmtSt, emit: (FmtSt) -> FmtSt) : Option[FmtSt] {
+  let r = emit(fmt_probe_begin(s))
+  if (r.row == 0) and (r.col <= r.width) { Some(fmt_probe_end(r, s)) } else { None }
+}
+
+#[doc("True when the first line of `emit` rendered from `s` stays inside the width.")]
+pub fn fmt_head_fits(s: FmtSt, emit: (FmtSt) -> FmtSt) : Bool {
+  let r = emit(fmt_probe_begin(s))
+  (if r.row == 0 { r.col } else { r.head_col }) <= r.width
+}
+
+# `flat` then `tail`, when `flat` stays on the line and the first line
+# of `tail` still fits after it; `otherwise` when either fails. The
+# tail may break inside itself (a trailing block's body), which is why
+# it is measured by its head alone.
+fn fmt_flat_then(s: FmtSt, flat: (FmtSt) -> FmtSt, tail: (FmtSt) -> FmtSt, otherwise: (FmtSt) -> FmtSt) : FmtSt =
+  match fmt_try_flat(s, flat) {
+    Some(r) -> if fmt_head_fits(r, tail) { tail(r) } else { otherwise(s) }
+    None -> otherwise(s)
+  }
+
+# ---- hanging body -----------------------------------------------------
+
+# Preference order: the head line when the body fits there; its own
+# line when it fits there whole; the head line when the body must
+# break anyway and its first line still fits; its own line otherwise.
+#[doc("A body after `=` / `->`: on the head line when it fits, on its own indented line otherwise; a break the author wrote (`broken`) is kept.")]
+pub fn fmt_hang(s: FmtSt, broken: Bool, body: (FmtSt) -> FmtSt) : FmtSt =
+  if broken { fmt_hang_below(s, body) }
+  else {
+    match fmt_try_flat(s, (t) => body(fmt_emit(t, " "))) {
+      Some(r) -> r
+      None -> match fmt_try_flat(fmt_indent_in(fmt_newline(s)), body) {
+        Some(r) -> fmt_indent_out(r)
+        None ->
+          if fmt_head_fits(s, (t) => body(fmt_emit(t, " "))) { body(fmt_emit(s, " ")) }
+          else { fmt_hang_below(s, body) }
+      }
+    }
+  }
+
+fn fmt_hang_below(s: FmtSt, body: (FmtSt) -> FmtSt) : FmtSt =
+  fmt_indent_out(body(fmt_indent_in(fmt_newline(s))))
+
+# ---- delimited sequences ----------------------------------------------
+
+#[doc("One element of a delimited sequence: the source line it opens on and its emitter.")]
+pub type SeqItem = SeqItem(Int, (FmtSt) -> FmtSt)
+
+#[doc("How a sequence prints: its delimiters, whether the flat form pads inside them (`{ a }` vs `(a)`), whether broken items pack into rows (`fill`), and whether a block-like last item may hug the opener.")]
+pub type SeqStyle = { open: String, close: String, pad: Bool, fill: Bool, hug: Bool }
+
+#[doc("A delimited sequence: flat when it fits and the author kept it on one line, else one item per line (rows when `fill`) with the closer on its own line; `tail` is what follows the closer on the same line and counts toward the fit.")]
+pub fn fmt_seq(s: FmtSt, st: SeqStyle, open_line: Int, items: [SeqItem], tail: (FmtSt) -> FmtSt) : FmtSt =
+  match items {
+    [] -> tail(fmt_emit(fmt_emit(s, st.open), st.close))
+    _ ->
+      if seq_author_broke(open_line, items) { seq_expanded(s, st, items, tail) }
+      else {
+        fmt_flat_then(s, (t) => seq_flat(t, st, items), tail,
+                      (t) => if st.hug { seq_hugged(t, st, items, tail) } else { seq_expanded(t, st, items, tail) })
+      }
+  }
+
+# The author broke the sequence when any item opens below everything
+# before it. A synthetic item can carry an earlier position (the pipe
+# placeholder's binder sits at its pipe's left operand), so the bar
+# only ever rises.
+fn seq_author_broke(prev_line: Int, items: [SeqItem]) : Bool = match items {
+  [] -> false
+  [SeqItem(line, _), ...rest] ->
+    (line > prev_line) or seq_author_broke(if line > prev_line { line } else { prev_line }, rest)
+}
+
+fn seq_flat(s: FmtSt, st: SeqStyle, items: [SeqItem]) : FmtSt {
+  let inner = if st.pad { " " } else { "" }
+  let s1 = fmt_emit(fmt_emit(s, st.open), inner)
+  let s2 = seq_flat_items(s1, items)
+  fmt_emit(fmt_emit(s2, inner), st.close)
+}
+
+fn seq_flat_items(s: FmtSt, items: [SeqItem]) : FmtSt = match items {
+  [] -> s
+  [SeqItem(_, emit)] -> emit(s)
+  [SeqItem(_, emit), ...rest] -> seq_flat_items(fmt_emit(emit(s), ", "), rest)
+}
+
+# `open a, b, LAST close`: the leading items flat on the opener's line,
+# the last item breaking inside its own delimiters. Taken only when the
+# leading items fit flat and the hugged first line fits.
+fn seq_hugged(s: FmtSt, st: SeqStyle, items: [SeqItem], tail: (FmtSt) -> FmtSt) : FmtSt {
+  let lead = (t) => seq_flat_items(fmt_emit(t, st.open), seq_init(items))
+  let last = seq_last(items)
+  let sep = match items { [_] -> ""  _ -> ", " }
+  let hug = (t) => tail(fmt_emit(last(fmt_emit(lead(t), sep)), st.close))
+  match fmt_try_flat(s, lead) {
+    None -> seq_expanded(s, st, items, tail)
+    Some(_) -> if fmt_head_fits(s, hug) { hug(s) } else { seq_expanded(s, st, items, tail) }
+  }
+}
+
+fn seq_init(items: [SeqItem]) : [SeqItem] = match items {
+  [] -> []
+  [_] -> []
+  [it, ...rest] -> [it, ...seq_init(rest)]
+}
+
+fn seq_last(items: [SeqItem]) : (FmtSt) -> FmtSt = match items {
+  [] -> (t) => t
+  [SeqItem(_, emit)] -> emit
+  [_, ...rest] -> seq_last(rest)
+}
+
+fn seq_expanded(s: FmtSt, st: SeqStyle, items: [SeqItem], tail: (FmtSt) -> FmtSt) : FmtSt {
+  let s1 = fmt_indent_in(fmt_newline(fmt_emit(s, st.open)))
+  let s2 = if st.fill { seq_rows(s1, items, 0) } else { seq_lines(s1, items) }
+  tail(fmt_emit(fmt_newline(fmt_indent_out(s2)), st.close))
+}
+
+# One item per line; a trailing comment on an item's line stays with it.
+fn seq_lines(s: FmtSt, items: [SeqItem]) : FmtSt = match items {
+  [] -> s
+  [SeqItem(line, emit)] -> fmt_drain_trailing_on_line(emit(s), line)
+  [SeqItem(line, emit), ...rest] ->
+    seq_lines(fmt_newline(fmt_drain_trailing_on_line(fmt_emit(fmt_reserved(s, 1, emit), ","), line)), rest)
+}
+
+# Items packed into rows: a row breaks where the author broke it or
+# where the next item would not fit. `high` is the highest line seen,
+# the same rising bar `seq_author_broke` uses.
+fn seq_rows(s: FmtSt, items: [SeqItem], high: Int) : FmtSt = match items {
+  [] -> s
+  [SeqItem(line, emit)] -> fmt_drain_trailing_on_line(emit(s), line)
+  [SeqItem(line, emit), ...rest] -> {
+    let s1 = fmt_drain_trailing_on_line(fmt_emit(fmt_reserved(s, 1, emit), ","), line)
+    let high1 = if line > high { line } else { high }
+    seq_rows(seq_row_gap(s1, high1, rest), rest, high1)
+  }
+}
+
+# The gap after a comma: a space when the next item (with its own
+# comma) fits on the row and the author kept it there, else a newline.
+fn seq_row_gap(s: FmtSt, high: Int, rest: [SeqItem]) : FmtSt = match rest {
+  [] -> s
+  [SeqItem(next_line, emit), ...more] ->
+    if next_line > high { fmt_newline(s) }
+    else {
+      let after = match more { [] -> "" _ -> "," }
+      match fmt_try_flat(s, (t) => fmt_emit(emit(fmt_emit(t, " ")), after)) {
+        Some(_) -> fmt_emit(s, " ")
+        None -> fmt_newline(s)
+      }
+    }
+}
+
+# ---- operator chains --------------------------------------------------
+
+#[doc("One link of an operator chain: the operator's text, the source line its operand opens on, and the operand's emitter.")]
+pub type ChainLink = Link(String, Int, (FmtSt) -> FmtSt)
+
+#[doc("An operator chain: flat when it fits and the author kept it so, else one operand per line — operator leading each continuation line (or trailing the previous one when `leading` is false), continuation one level in; `tail` follows the last operand on its line.")]
+pub fn fmt_chain(s: FmtSt, first: (FmtSt) -> FmtSt, links: [ChainLink], leading: Bool, broken: Bool, tail: (FmtSt) -> FmtSt) : FmtSt =
+  if broken { chain_expanded(s, first, links, leading, tail) }
+  else { fmt_flat_then(s, (t) => chain_flat(first(t), links), tail, (t) => chain_expanded(t, first, links, leading, tail)) }
+
+fn chain_flat(s: FmtSt, links: [ChainLink]) : FmtSt = match links {
+  [] -> s
+  [Link(op, _, rhs), ...rest] -> chain_flat(rhs(fmt_emit(s, concat_all([" ", op, " "]))), rest)
+}
+
+fn chain_expanded(s: FmtSt, first: (FmtSt) -> FmtSt, links: [ChainLink], leading: Bool, tail: (FmtSt) -> FmtSt) : FmtSt {
+  let head = match links {
+    [Link(op, _, _), ..._rest] -> if leading { first(s) } else { fmt_reserved(s, string_length(op) + 1, first) }
+    [] -> first(s)
+  }
+  let s1 = fmt_indent_in(head)
+  let s2 = chain_lines(s1, links, leading)
+  tail(fmt_indent_out(s2))
+}
+
+# Comments above an operand come out above its line, before the
+# operator that leads it.
+fn chain_lines(s: FmtSt, links: [ChainLink], leading: Bool) : FmtSt = match links {
+  [] -> s
+  [Link(op, line, rhs), ...rest] -> {
+    let s1 = if leading { fmt_emit(fmt_drain_before(fmt_newline(s), line), string_concat(op, " ")) }
+             else { fmt_drain_before(fmt_newline(fmt_emit(s, string_concat(" ", op))), line) }
+    let s2 = match rest {
+      [] -> rhs(s1)
+      [Link(next_op, _, _), ..._more] ->
+        if leading { rhs(s1) } else { fmt_reserved(s1, string_length(next_op) + 1, rhs) }
+    }
+    chain_lines(s2, rest, leading)
+  }
+}

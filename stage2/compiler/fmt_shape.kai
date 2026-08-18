@@ -9,9 +9,9 @@
 # (compiler/fmt_expr.kai) that does.
 #
 # The walker's recursion cycle survives the split because no query
-# calls back into it. That is also why a width model's own queries —
-# does this subtree fit, how wide is it flat — belong here rather than
-# beside the emitters.
+# calls back into it. The width model (compiler/fmt_layout.kai) asks
+# its shape questions here too: where an expression starts, whether it
+# opens a block, whether a list packs into rows.
 
 import compiler.util
 import compiler.ast
@@ -27,19 +27,29 @@ pub fn fmt_fixed_suffix(ty: Ty) : String = match ty {
   _        -> "i128"
 }
 
+#[doc("True when the expression is a single literal or name: the kind of element a broken list packs into rows.")]
+pub fn fmt_is_scalar(e: Expr) : Bool = match e.kind {
+  EInt(_, _) -> true
+  EReal(_, _) -> true
+  EIntLit(_) -> true
+  EDecimalLit(_) -> true
+  EFixed(_, _) -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  EStr(_, _) -> true
+  EUnit -> true
+  EVar(_) -> true
+  ELitUnit(inner, _) -> fmt_is_scalar(inner)
+  ESurface(sf) -> match sf { SfBigIntLit(_) -> true  _ -> false }
+  _ -> false
+}
+
+# A unit-suffixed literal is not self-delimiting: `3<m>` keeps its
+# parentheses as an operand.
 #[doc("True when the expression prints as a self-delimiting form, so an enclosing operator needs no parentheses around it.")]
 pub fn expr_is_atomic(e: Expr) : Bool {
   match e.kind {
-    EInt(_, _)  -> true
-    EReal(_, _) -> true
-    EIntLit(_) -> true
-    EDecimalLit(_) -> true
-    EFixed(_, _) -> true
-    EBool(_) -> true
-    EChar(_) -> true
-    EStr(_, _) -> true
-    EUnit -> true
-    EVar(_) -> true
+    ELitUnit(_, _) -> false
     EUnder -> true
     EPlaceholder -> true
     EHole(_) -> true
@@ -57,7 +67,7 @@ pub fn expr_is_atomic(e: Expr) : Bool {
     true
     # A block lambda prints as its own `{ ... }` delimiters.
     ESurface(sf) -> match sf { SfLamBlock(_, _) -> true  _ -> false }
-    _ -> false
+    _ -> fmt_is_scalar(e)
   }
 }
 
@@ -132,6 +142,61 @@ fn fsv_binds(ps: [Param], name: String) : Bool = match ps {
   [prm, ...rest] -> prm.pname == name or fsv_binds(rest, name)
 }
 
+# ---- width-model queries ---------------------------------------------
+
+# Anything that opens a delimiter and lays its contents out below it.
+#[doc("True when the expression prints as its own block — a literal, block or clause form that breaks inside its delimiters — so it may hug an enclosing call's parenthesis.")]
+pub fn fmt_is_block_like(e: Expr) : Bool = match e.kind {
+  EList(_) -> true
+  ERecordLit(_, _) -> true
+  EBlock(_, _) -> true
+  EMatch(_, _) -> true
+  EIf(_, _, _) -> true
+  EHandle(_, _, _, _, _, _, _) -> true
+  ELambda(_, body) -> match body.kind { EBlock(_, _) -> true  _ -> false }
+  ESurface(sf) -> match sf {
+    SfLamBlock(_, _) -> true
+    SfMapLit(_, _) -> true
+    SfSetLit(_, _) -> true
+    SfCaseBlock(_) -> true
+    SfMultiMatch(_, _) -> true
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("True when every expression is a single literal or name.")]
+pub fn fmt_all_scalar(es: [Expr]) : Bool = match es {
+  [] -> true
+  [x, ...rest] -> fmt_is_scalar(x) and fmt_all_scalar(rest)
+}
+
+#[doc("True when every list element is a plain literal or name; a spread is not.")]
+pub fn fmt_all_scalar_elems(elems: [ListElem]) : Bool = match elems {
+  [] -> true
+  [ElPlain(x), ...rest] -> fmt_is_scalar(x) and fmt_all_scalar_elems(rest)
+  [ElSpread(_), ..._rest] -> false
+}
+
+#[doc("True when the last expression of the list is block-like.")]
+pub fn fmt_last_is_block_like(es: [Expr]) : Bool = match es {
+  [] -> false
+  [x] -> fmt_is_block_like(x)
+  [_, ...rest] -> fmt_last_is_block_like(rest)
+}
+
+# Contract clauses and case-blocks bring their own opener.
+#[doc("The token that opens a function body on the signature line: ` {` for a block, ` =` for an expression, nothing for a form that opens itself.")]
+pub fn fmt_fn_opener(body: Expr) : String = match body.kind {
+  EBlock(_, _) -> " {"
+  ESurface(sf) -> match sf {
+    SfContract(_, _, _) -> ""
+    SfCaseBlock(_) -> ""
+    _ -> " ="
+  }
+  _ -> " ="
+}
+
 # A run counter: an interior block arg (`f({ x -> x }, y)`) resets it.
 #[doc("Length of the suffix of `args` written as trailing blocks (`f(a) { .. } { .. }`), at most two by the grammar.")]
 pub fn fmt_count_trailing(args: [Expr], run: Int) : Int = match args {
@@ -177,37 +242,3 @@ pub fn fmt_is_lifecycle_clause(name: String, params: [Param]) : Bool =
   if name == "finally" or name == "initially" {
     match params { [] -> true _ -> false }
   } else { false }
-
-#[doc("The source line a statement sits on.")]
-pub fn stmt_line(st: Stmt) : Int {
-  match st {
-    SLet(p, _, _) -> p.line
-    SAssert(e, _) -> e.line
-    SExprStmt(e) -> e.line
-    SIndexAssign(_, _, _, line, _) -> line
-    SAssign(_, _, line, _) -> line
-    SVar(_, _, _, line, _) -> line
-    SUse(_, line, _) -> line
-  }
-}
-
-# Same shape as `decls_trailing_limit` — see that comment for the
-# rationale. For the last stmt, callers pass `last_limit`:
-#   > 0   = the line of the next AST anchor after the block (e.g.
-#            the tail expression's line). Lets multi-line trailings
-#            on the last stmt drain inline.
-#   == 0  = no anchor known (block has no tail). Falls back to
-#            `stmt_line(st) + 1` — single-line trailings still
-#            drain, multi-line trailings on the last stmt of a
-#            tail-less block stay full-line-demoted.
-#[doc("Exclusive upper source line for draining a statement's trailing comment: the next statement's line, or `last_limit` for the last one.")]
-pub fn stmts_trailing_limit(st: Stmt, rest: [Stmt], last_limit: Int) : Int {
-  match rest {
-    [] -> if last_limit > 0 {
-      last_limit
-    } else {
-      stmt_line(st) + 1
-    }
-    [next, ..._tail] -> stmt_line(next)
-  }
-}

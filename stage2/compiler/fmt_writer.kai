@@ -1,21 +1,15 @@
-# compiler/fmt_writer.kai — `kai fmt` text plumbing (issue #781).
+# compiler/fmt_writer.kai — `kai fmt` text plumbing.
 #
 # The formatter's substrate: the `Cmt` source-comment record, the
 # threaded `FmtSt` writer, the comment-interleaving (drain) machinery,
 # low-level char escaping, and `collect_comments` (the input-side
 # re-scan that recovers the line comments the lexer discards). No
-# formatter walks AST here. The split under #781 extracted this leaf
-# out of the 1.4k-LOC fmt.kai monolith.
+# formatter walks AST here.
 #
 # The comment scanner lives with the writer rather than in its own
 # module on purpose: its character classifiers are inherently branchy,
 # and folding them in beside the many trivial writer primitives keeps
-# the substrate one cohesive A-grade module (a scanner-only module's
-# average cognitive complexity lands over the differential bar).
-#
-# Cross-module surface (pub): Cmt, FmtSt, the emit/newline/indent
-# primitives, the drain helpers, `char_to_escaped`, `collect_comments`.
-# The scan helpers and the FmtSt-record constructors stay private.
+# the substrate one cohesive A-grade module.
 
 import compiler.util
 import compiler.chars
@@ -41,9 +35,49 @@ pub type Cmt
 # consulted to recover the source line of AST nodes that carry none
 # (sum variants, record fields) so their trailing comments anchor to
 # the right element.
-pub type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool, toks: [Token] }
+#
+# The width model rides the same record: `col` is the current column,
+# `width` the line budget, `starts` the column of the first token on
+# each source line (the author's own breaks). A speculative render is
+# a `probe`: `row` counts the newlines it emitted and `head_col` the
+# column its first line ended on; once a probe has broken a line or
+# run past the width, every further push is a no-op, so a failed probe
+# costs only its first line.
+pub type FmtSt = { out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool, toks: [Token],
+                   col: Int, width: Int, starts: Array[Int], probe: Bool, row: Int, head_col: Int }
 
-pub fn fmt_init(cmts: [Cmt], toks: [Token]) : FmtSt = FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true, toks: toks }
+pub fn fmt_init(cmts: [Cmt], toks: [Token], starts: Array[Int], width: Int) : FmtSt =
+  FmtSt { out: [], cmts: cmts, indent: 0, at_line_start: true, toks: toks,
+          col: 0, width: width, starts: starts, probe: false, row: 0, head_col: 0 }
+
+# One record rebuild for every field update below; the layout fields
+# ride along untouched.
+fn fmt_with(s: FmtSt, out: [String], cmts: [Cmt], indent: Int, at_line_start: Bool, col: Int) : FmtSt =
+  FmtSt { out: out, cmts: cmts, indent: indent, at_line_start: at_line_start, toks: s.toks,
+          col: col, width: s.width, starts: s.starts, probe: s.probe, row: s.row, head_col: s.head_col }
+
+fn fmt_with_cmts(s: FmtSt, cmts: [Cmt]) : FmtSt = fmt_with(s, s.out, cmts, s.indent, s.at_line_start, s.col)
+
+#[doc("Render `emit` with `n` columns held back for what the caller will put after it on the same line (a comma, a trailing operator).")]
+pub fn fmt_reserved(s: FmtSt, n: Int, emit: (FmtSt) -> FmtSt) : FmtSt =
+  fmt_with_width(emit(fmt_with_width(s, s.width - n)), s.width)
+
+fn fmt_with_width(s: FmtSt, width: Int) : FmtSt =
+  FmtSt { out: s.out, cmts: s.cmts, indent: s.indent, at_line_start: s.at_line_start, toks: s.toks,
+          col: s.col, width: width, starts: s.starts, probe: s.probe, row: s.row, head_col: s.head_col }
+
+#[doc("True while a speculative render has already broken a line or run past the width: nothing it emits from here on can change the verdict.")]
+pub fn fmt_probe_dead(s: FmtSt) : Bool = s.probe and ((s.row > 0) or (s.col > s.width))
+
+#[doc("Enter a speculative render from `s`: same text position, fresh line and head counters.")]
+pub fn fmt_probe_begin(s: FmtSt) : FmtSt =
+  FmtSt { out: s.out, cmts: s.cmts, indent: s.indent, at_line_start: s.at_line_start, toks: s.toks,
+          col: s.col, width: s.width, starts: s.starts, probe: true, row: 0, head_col: 0 }
+
+#[doc("Keep a speculative render that stayed on its line: `r` with the probe counters of the state `s` it started from.")]
+pub fn fmt_probe_end(r: FmtSt, s: FmtSt) : FmtSt =
+  FmtSt { out: r.out, cmts: r.cmts, indent: r.indent, at_line_start: r.at_line_start, toks: r.toks,
+          col: r.col, width: r.width, starts: r.starts, probe: s.probe, row: s.row, head_col: s.head_col }
 
 pub fn fmt_finish(s: FmtSt) : String {
   # The accumulator ends with one trailing newline (every decl
@@ -76,8 +110,23 @@ fn fmt_indent_str(s: FmtSt) : String = spaces(s.indent * 2)
 
 # Push a raw chunk into the output. Caller is responsible for
 # indentation handling — most call sites should go through
-# `fmt_emit` / `fmt_newline`.
-fn fmt_push(s: FmtSt, chunk: String) : FmtSt = FmtSt { out: [chunk, ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: false, toks: s.toks }
+# `fmt_emit` / `fmt_newline`. A dead probe drops the chunk.
+fn fmt_push(s: FmtSt, chunk: String) : FmtSt =
+  if fmt_probe_dead(s) { s }
+  else { fmt_with(s, [chunk, ...s.out], s.cmts, s.indent, false, fmt_col_after(chunk, s.col)) }
+
+# Column after `chunk`: a chunk holding newlines (a triple-quoted
+# string, a raw attribute) restarts the count at its last one.
+fn fmt_col_after(chunk: String, col: Int) : Int = fmt_col_scan(chunk, string_length(chunk) - 1, 0, col)
+
+fn fmt_col_scan(chunk: String, i: Int, seen: Int, col: Int) : Int =
+  if i < 0 { col + seen }
+  else {
+    match char_at(chunk, i) {
+      Some(c) -> if c == '\n' { seen } else { fmt_col_scan(chunk, i - 1, seen + 1, col) }
+      None -> col + seen
+    }
+  }
 
 # Emit `chunk`, prepending the current indent if we are at line start.
 pub fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
@@ -88,7 +137,10 @@ pub fn fmt_emit(s: FmtSt, chunk: String) : FmtSt {
   }
 }
 
-pub fn fmt_newline(s: FmtSt) : FmtSt = FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true, toks: s.toks }
+pub fn fmt_newline(s: FmtSt) : FmtSt =
+  FmtSt { out: ["\n", ...s.out], cmts: s.cmts, indent: s.indent, at_line_start: true, toks: s.toks,
+          col: 0, width: s.width, starts: s.starts, probe: s.probe, row: s.row + 1,
+          head_col: if s.row == 0 { s.col } else { s.head_col } }
 
 # Position the writer at column 1 without emitting a blank line: a
 # no-op when already at line start, one newline otherwise.
@@ -102,9 +154,9 @@ pub fn fmt_blank_line(s: FmtSt) : FmtSt {
   }
 }
 
-pub fn fmt_indent_in(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent + 1, at_line_start: s.at_line_start, toks: s.toks }
+pub fn fmt_indent_in(s: FmtSt) : FmtSt = fmt_with(s, s.out, s.cmts, s.indent + 1, s.at_line_start, s.col)
 
-pub fn fmt_indent_out(s: FmtSt) : FmtSt = FmtSt { out: s.out, cmts: s.cmts, indent: s.indent - 1, at_line_start: s.at_line_start, toks: s.toks }
+pub fn fmt_indent_out(s: FmtSt) : FmtSt = fmt_with(s, s.out, s.cmts, s.indent - 1, s.at_line_start, s.col)
 
 # Emit one full-line comment (`# text` + newline) at the current
 # indent. The writer is assumed already at line start.
@@ -127,6 +179,12 @@ fn drain_blank_between(s: FmtSt, prev: Int, cl: Int) : FmtSt {
   if (prev > 0) and (cl > (prev + 1)) { fmt_newline(s) } else { s }
 }
 
+#[doc("True when a not-yet-emitted comment sits above source line `line`.")]
+pub fn fmt_comment_pending_before(s: FmtSt, line: Int) : Bool = match s.cmts {
+  [] -> false
+  [Cmt(cl, _, _, _), ..._rest] -> cl < line
+}
+
 # Drain every comment whose source line is < `target_line`, emitting
 # each as a full-line comment at the current indent. Used before
 # emitting an AST node at line `target_line`. `prev` is the line of
@@ -145,7 +203,7 @@ fn fmt_drain_before_loop(s: FmtSt, target_line: Int, prev: Int) : FmtSt {
       } else {
         let s1 = fmt_ensure_newline(s)
         let s2 = drain_blank_between(s1, prev, cl)
-        let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
+        let s3 = fmt_with_cmts(s2, rest)
         let s4 = fmt_emit_comment_line(s3, text)
         fmt_drain_before_loop(s4, target_line, cl)
       }
@@ -162,7 +220,7 @@ fn fmt_drain_rest_loop(s: FmtSt, prev: Int) : FmtSt {
     [Cmt(cl, _, text, _), ...rest] -> {
       let s1 = fmt_ensure_newline(s)
       let s2 = drain_blank_between(s1, prev, cl)
-      let s3 = FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
+      let s3 = fmt_with_cmts(s2, rest)
       let s4 = fmt_emit_comment_line(s3, text)
       fmt_drain_rest_loop(s4, cl)
     }
@@ -205,7 +263,7 @@ pub fn fmt_drain_trailing_after(s: FmtSt, limit: Int) : FmtSt {
       if is_tr and ((limit == 0) or (cl < limit)) {
         let s1 = fmt_emit(s, "  #")
         let s2 = fmt_emit(s1, text)
-        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
+        fmt_with_cmts(s2, rest)
       } else {
         s
       }
@@ -227,7 +285,7 @@ pub fn fmt_drain_trailing_on_line(s: FmtSt, line: Int) : FmtSt {
       if (is_tr and (line > 0)) and (cl == line) {
         let s1 = fmt_emit(s, "  #")
         let s2 = fmt_emit(s1, text)
-        FmtSt { out: s2.out, cmts: rest, indent: s2.indent, at_line_start: s2.at_line_start, toks: s2.toks }
+        fmt_with_cmts(s2, rest)
       } else {
         s
       }

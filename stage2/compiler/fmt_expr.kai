@@ -1,14 +1,14 @@
 # compiler/fmt_expr.kai — expression / pattern / type / statement
-# pretty-printer for `kai fmt` (issue #781 split).
+# pretty-printer for `kai fmt`.
 #
 # This module is the mutually-recursive core, and only that. kaikai
-# forbids import cycles (modules.kai #538), so the expression, pattern,
-# type, statement, row, parameter, tparam and handle walkers — which
-# all call back into one another — must share one module. Everything
-# that does NOT close the cycle has been moved out to keep this module
-# to the emitters alone: shape queries to compiler/fmt_shape.kai, name
-# decoding to compiler/fmt_names.kai, desugar recovery to
-# compiler/fmt_refine.kai.
+# forbids import cycles, so the expression, pattern, type, statement,
+# row, parameter, tparam and handle walkers — which all call back into
+# one another — must share one module. Everything that does NOT close
+# the cycle lives outside it: shape queries in compiler/fmt_shape.kai,
+# precedence and chains in compiler/fmt_chain.kai, the width model in
+# compiler/fmt_layout.kai, name decoding in compiler/fmt_names.kai,
+# desugar recovery in compiler/fmt_refine.kai.
 #
 # It still owns the signature fragments (`fmt_params`, `fmt_tparams`,
 # `fmt_row`), which fmt_decl and fmt_effect reuse: they emit, so they
@@ -26,6 +26,8 @@ import compiler.fmt_writer
 import compiler.fmt_names
 import compiler.fmt_shape
 import compiler.fmt_refine
+import compiler.fmt_chain
+import compiler.fmt_layout
 
 # m7b #11: `handle { body } with Eff[tyargs](init) as alias { clauses }`.
 # Each of `[tyargs]`, `(init)`, `as alias` is optional; the parser
@@ -106,9 +108,9 @@ fn fmt_type_arg_list(ty_args: [TypeExpr], s: FmtSt) : FmtSt =
 pub fn fmt_hclauses(cs: [HClause], s: FmtSt) : FmtSt = match cs {
   []           -> s
   [c, ...rest] -> {
-    let s1 = fmt_hclause(c, s)
-    let s2 = fmt_newline(s1)
-    fmt_hclauses(rest, s2)
+    let s1 = fmt_hclause(c, fmt_drain_before(s, hclause_line(c)))
+    let s2 = fmt_drain_trailing_after(s1, hclause_trailing_limit(c, rest))
+    fmt_hclauses(rest, fmt_newline(s2))
   }
 }
 
@@ -128,20 +130,26 @@ pub fn fmt_hclause(c: HClause, s: FmtSt) : FmtSt = match c {
       let s1 = fmt_emit(s, op_name)
       let s2 = fmt_emit(s1, "(")
       let s3 = fmt_params(params, s2)
-      let s4 = fmt_emit(s3, ") -> ")
-      fmt_expr(body, s4)
+      fmt_arrow_body(body, fmt_emit(s3, ") ->"))
     }
+}
+
+# `-> body` and `= body` share one shape: the body hangs off the arrow.
+# A comment between the arrow and the body forces the hang, so the
+# comment lands on its own line above the body.
+fn fmt_arrow_body(body: Expr, s: FmtSt) : FmtSt {
+  let head = fmt_leftmost(body)
+  let broken = fmt_starts_line(s, head.line, head.col) or fmt_comment_pending_before(s, head.line)
+  fmt_hang(s, broken, (t) => fmt_expr(body, t))
 }
 
 # `return(pname) -> body` — optional clause at the end of a handler
 # (or default { }) block. Same body-rendering convention as fmt_hclause.
 pub fn fmt_hreturn(r: HReturn, s: FmtSt) : FmtSt = match r {
-  HR(pname, body, _, _) -> {
-    let s1 = fmt_emit(s, "return(")
+  HR(pname, body, line, _) -> {
+    let s1 = fmt_emit(fmt_drain_before(s, line), "return(")
     let s2 = fmt_emit(s1, pname)
-    let s3 = fmt_emit(s2, ") -> ")
-    let s4 = fmt_expr(body, s3)
-    fmt_newline(s4)
+    fmt_newline(fmt_arrow_body(body, fmt_emit(s2, ") ->")))
   }
 }
 
@@ -153,6 +161,13 @@ pub fn fmt_tparams(tparams: [String], s: FmtSt) : FmtSt {
     let decoded = map(tparams, (t) => fmt_tparam_decode(t))
     fmt_emit(s, string_concat_all(["[", string_join(decoded, ", "), "]"]))
   }
+}
+
+# `(p1, p2)` as a signature's parameter list: flat when it fits with
+# what follows on the line, one parameter per line otherwise.
+pub fn fmt_param_seq(params: [Param], open_line: Int, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt {
+  let style = SeqStyle { open: "(", close: ")", pad: false, fill: false, hug: false }
+  fmt_seq(s, style, open_line, map(params, (p) => SeqItem(p.pline, (t) => fmt_param(p, t))), tail)
 }
 
 pub fn fmt_params(params: [Param], s: FmtSt) : FmtSt {
@@ -326,16 +341,12 @@ fn fmt_hole(opt: Option[String], s: FmtSt) : FmtSt = match opt {
 # A call node prints as a call only when it is one: the pipe-placeholder
 # desugar and the literal desugars (`3i`, `~r/../`) reach the writer as
 # calls and must print back as what the author wrote.
-fn fmt_call_form(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt =
+fn fmt_call_form(e: Expr, callee: Expr, call_args: [Expr], s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt =
   match fmt_pipe_under(callee, call_args) {
-    Some(PU(lhs, rhs)) -> {
-      let s1 = fmt_expr(lhs, s)
-      let s2 = fmt_emit(s1, " |> ")
-      fmt_expr(rhs, s2)
-    }
+    Some(_) -> fmt_pipes(e, s, tail)
     None -> match fmt_call_literal(callee, call_args) {
-      Some(lit) -> fmt_emit(s, lit)
-      None      -> fmt_call(callee, call_args, s)
+      Some(lit) -> tail(fmt_emit(s, lit))
+      None      -> tail(fmt_call(callee, call_args, e.line, s))
     }
   }
 
@@ -357,8 +368,28 @@ fn fmt_lambda_form(params: [Param], body: Expr, s: FmtSt) : FmtSt =
     None          -> fmt_lambda(params, body, s)
   }
 
-pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
-  let s0 = fmt_drain_before(s, e.line)
+pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt = fmt_expr_then(e, s, (t) => t)
+
+# `tail` is what follows the expression on its line (` {` after an
+# `if` condition, a signature's return type): a chain-headed expression
+# counts it when deciding whether it fits. A dead probe has its verdict
+# already, so the walk stops here.
+pub fn fmt_expr_then(e: Expr, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt =
+  if fmt_probe_dead(s) { s }
+  else {
+    let s0 = fmt_drain_before(s, fmt_leftmost(e).line)
+    match e.kind {
+      EBinop(op, l, r) -> fmt_binop(op, l, r, e, s0, tail)
+      EPipe(_, _) -> fmt_pipes(e, s0, tail)
+      EMapPipe(_, _) -> fmt_pipes(e, s0, tail)
+      EFlatMapPipe(_, _) -> fmt_pipes(e, s0, tail)
+      EFilterPipe(_, _) -> fmt_pipes(e, s0, tail)
+      ECall(callee, call_args) -> fmt_call_form(e, callee, call_args, s0, tail)
+      _ -> tail(fmt_expr_plain(e, s0))
+    }
+  }
+
+fn fmt_expr_plain(e: Expr, s0: FmtSt) : FmtSt {
   match e.kind {
     EInt(v, raw) -> fmt_emit(s0, int_lit_text(v, raw))
     EReal(_, raw) -> fmt_emit(s0, raw)
@@ -382,7 +413,7 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
       let s1 = fmt_expr_atom(inner, s0)
       fmt_emit(s1, "!")
     }
-    ECall(callee, call_args) -> fmt_call_form(callee, call_args, s0)
+    ECall(callee, call_args) -> fmt_call_form(e, callee, call_args, s0, (t) => t)
     EField(obj, fld) -> fmt_field(obj, fld, s0)
     EIndex(obj, idx) -> {
       let s1 = fmt_expr_atom(obj, s0)
@@ -390,7 +421,7 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
       let s3 = fmt_expr(idx, s2)
       fmt_emit(s3, "]")
     }
-    EBinop(op, l, r) -> fmt_binop(op, l, r, s0)
+    EBinop(op, l, r) -> fmt_binop(op, l, r, e, s0, (t) => t)
     EUnop(op, inner) -> {
       let s1 = if op == "not" {
         fmt_emit(s0, "not ")
@@ -402,14 +433,14 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     EIf(c, then_e, else_opt) -> fmt_if(c, then_e, else_opt, s0)
     EMatch(scrut, arms) -> fmt_match(scrut, arms, s0)
     ELambda(params, body) -> fmt_lambda_form(params, body, s0)
-    ERecordLit(name, fields) -> fmt_record_lit(name, fields, s0)
-    EList(elems) -> fmt_list(elems, s0)
+    ERecordLit(name, fields) -> fmt_record_lit(name, fields, e.line, s0)
+    EList(elems) -> fmt_list(elems, e.line, s0)
     ERange(lo, hi, step) -> fmt_range(lo, hi, step, s0)
     EBlock(stmts, tail) -> fmt_block(stmts, tail, s0)
-    EPipe(l, r) -> fmt_pipe(l, r, s0)
-    EMapPipe(l, r) -> fmt_map_pipe(l, r, s0)
-    EFlatMapPipe(l, r) -> fmt_flat_map_pipe(l, r, s0)
-    EFilterPipe(l, r) -> fmt_filter_pipe(l, r, s0)
+    EPipe(_, _) -> fmt_pipes(e, s0, (t) => t)
+    EMapPipe(_, _) -> fmt_pipes(e, s0, (t) => t)
+    EFlatMapPipe(_, _) -> fmt_pipes(e, s0, (t) => t)
+    EFilterPipe(_, _) -> fmt_pipes(e, s0, (t) => t)
     # m12.5: `100<USD>`, `2.5<m>` — numeric literal with unit annotation.
     ELitUnit(inner, u) -> {
       let s1 = fmt_expr_atom(inner, s0)
@@ -438,7 +469,7 @@ pub fn fmt_expr(e: Expr, s: FmtSt) : FmtSt {
     EModCall(m, fname) -> fmt_emit(s0, string_concat_all([m, ".", fname]))
     EIntrinsic(name, args_) -> fmt_call(
       Expr { kind: EVar(string_concat("$", name)), line: e.line, col: e.col, ty: None, mode: MUnknown },
-      args_, s0)
+      args_, e.line, s0)
     ESurface(sf) -> fmt_surface(sf, e, s0)
   }
 }
@@ -450,19 +481,14 @@ fn fmt_surface(sf: SurfaceForm, e: Expr, s: FmtSt) : FmtSt = match sf {
   SfEnsure(value, pred) -> fmt_ensure(value, pred, e, s)
   SfContract(_, _, _) -> panic("kai fmt: contract clauses outside a fn body")
   SfLamBlock(lam, trailing) -> fmt_lam_block(lam, trailing, s)
-  SfTuple(elems) -> {
-    let s1 = fmt_emit(s, "(")
-    let s2 = fmt_call_args(elems, s1)
-    fmt_emit(s2, ")")
-  }
+  SfTuple(elems) -> fmt_expr_seq("(", ")", false, false, elems, e.line, s)
   SfHandleInit(_) -> panic("kai fmt: initially clause outside a handler")
   SfBigIntLit(digits) -> fmt_emit(s, string_concat(digits, "n"))
   SfRefMake(inner) -> fmt_expr_atom(inner, fmt_emit(s, "&"))
   SfDeref(target) -> fmt_expr(target, fmt_emit(s, "@"))
   SfMultiMatch(scruts, arms) -> {
     let s1 = fmt_emit(s, "match ")
-    let s2 = fmt_scrut_list(scruts, s1)
-    let s3 = fmt_emit(s2, " {")
+    let s3 = fmt_scrut_list(scruts, s1)
     let s4 = fmt_indent_in(fmt_newline(s3))
     let s5 = fmt_mmarms(arms, "if", false, s4)
     fmt_emit(fmt_indent_out(s5), "}")
@@ -473,8 +499,8 @@ fn fmt_surface(sf: SurfaceForm, e: Expr, s: FmtSt) : FmtSt = match sf {
     let s3 = fmt_mmarms(arms, "when", true, s2)
     fmt_emit(fmt_indent_out(s3), "}")
   }
-  SfMapLit(spread, flat)  -> fmt_spread_lit("%{", "}", spread, flat, fmt_map_entries, s)
-  SfSetLit(spread, elems) -> fmt_spread_lit("%[", "]", spread, elems, fmt_call_args, s)
+  SfMapLit(spread, flat)  -> fmt_spread_lit("%{", "}", spread, flat, fmt_map_entries, e, s)
+  SfSetLit(spread, elems) -> fmt_spread_lit("%[", "]", spread, elems, fmt_expr_items, e, s)
 }
 
 # `ensure(v) where <pred>` — the predicate carries the same receiver
@@ -494,28 +520,20 @@ fn fmt_ensure(value: Expr, pred: Expr, e: Expr, s: FmtSt) : FmtSt {
 # printer differ, so both spellings share this emitter — the empty form
 # closes tight (`%{}`), every other form pads inside its delimiters.
 fn fmt_spread_lit(open: String, close: String, spread: Option[Expr], elems: [Expr],
-                  emit_elems: ([Expr], FmtSt) -> FmtSt, s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, open)
-  let s2 = match spread {
-    None       -> s1
-    Some(base) -> fmt_expr(base, fmt_emit(s1, " ..."))
+                  items: ([Expr]) -> [SeqItem], e: Expr, s: FmtSt) : FmtSt {
+  let head = match spread {
+    None -> []
+    Some(base) -> [SeqItem(base.line, (t) => fmt_expr(base, fmt_emit(t, "...")))]
   }
-  let padded = string_concat(" ", close)
-  if list_is_empty(elems) {
-    match spread {
-      None    -> fmt_emit(s2, close)
-      Some(_) -> fmt_emit(s2, padded)
-    }
-  } else {
-    let sep = match spread { None -> " "  Some(_) -> ", " }
-    fmt_emit(emit_elems(elems, fmt_emit(s2, sep)), padded)
-  }
+  let style = SeqStyle { open: open, close: close, pad: true, fill: false, hug: false }
+  fmt_seq(s, style, e.line, list_append(head, items(elems)), (t) => t)
 }
 
+# The scrutinees of a multi-match, closed by the ` {` of the arm block.
 fn fmt_scrut_list(es: [Expr], s: FmtSt) : FmtSt = match es {
-  [] -> s
-  [e] -> fmt_stmt_head_expr(e, s)
-  [e, ...rest] -> fmt_scrut_list(rest, fmt_emit(fmt_stmt_head_expr(e, s), ", "))
+  [] -> fmt_emit(s, " {")
+  [e] -> fmt_head_expr(e, s, (t) => fmt_emit(t, " {"))
+  [e, ...rest] -> fmt_scrut_list(rest, fmt_head_expr(e, s, (t) => fmt_emit(t, ", ")))
 }
 
 # Multi-pattern arms; the guard keyword differs by form (`if` in a
@@ -531,23 +549,37 @@ fn fmt_mmarms(arms: [MMArm], guard_kw: String, case_led: Bool, s: FmtSt) : FmtSt
 
 fn fmt_mmarm(a: MMArm, guard_kw: String, case_led: Bool, s: FmtSt) : FmtSt = match a {
   MMArm(pats, guard, body) -> {
-    let s1 = if case_led { fmt_emit(s, "case ") } else { s }
+    let s0 = match pats {
+      [p, ..._more] -> fmt_drain_before(s, p.line)
+      [] -> s
+    }
+    let s1 = if case_led { fmt_emit(s0, "case ") } else { s0 }
     let s2 = fmt_pat_list(pats, s1)
     let s3 = match guard {
       None -> s2
       Some(g) -> fmt_expr(g, fmt_emit(s2, string_concat_all([" ", guard_kw, " "])))
     }
-    let s4 = fmt_emit(s3, " -> ")
-    fmt_expr(body, s4)
+    fmt_arrow_body(body, fmt_emit(s3, " ->"))
   }
 }
 
 # `k1: v1, k2: v2` from the flattened `[k1, v1, k2, v2, ...]` list.
-fn fmt_map_entries(flat: [Expr], s: FmtSt) : FmtSt = match flat {
-  [] -> s
-  [k, v] -> fmt_map_entry(k, v, s)
-  [k, v, ...rest] -> fmt_map_entries(rest, fmt_emit(fmt_map_entry(k, v, s), ", "))
+fn fmt_map_entries(flat: [Expr]) : [SeqItem] = match flat {
+  [] -> []
+  [k, v, ...rest] -> [SeqItem(k.line, (t) => fmt_map_entry(k, v, t)), ...fmt_map_entries(rest)]
   _ -> panic("kai fmt: map literal with an odd entry list")
+}
+
+fn fmt_expr_items(es: [Expr]) : [SeqItem] = map(es, (x) => SeqItem(fmt_leftmost(x).line, (t) => fmt_expr(x, t)))
+
+# A delimited expression list; `fill` packs scalar rows, `hug` lets a
+# block-like last element open on the head line.
+fn fmt_expr_seq(open: String, close: String, fill: Bool, hug: Bool, es: [Expr], open_line: Int, s: FmtSt) : FmtSt =
+  fmt_expr_seq_then(open, close, fill, hug, es, open_line, s, (t) => t)
+
+fn fmt_expr_seq_then(open: String, close: String, fill: Bool, hug: Bool, es: [Expr], open_line: Int, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt {
+  let style = SeqStyle { open: open, close: close, pad: false, fill: fill and fmt_all_scalar(es), hug: hug and fmt_last_is_block_like(es) }
+  fmt_seq(s, style, open_line, fmt_expr_items(es), tail)
 }
 
 fn fmt_map_entry(k: Expr, v: Expr, s: FmtSt) : FmtSt {
@@ -603,22 +635,30 @@ fn fmt_lam_block_body(body: Expr, headline: Int, s: FmtSt) : FmtSt = match body.
     }
     _ -> fmt_lam_block_expand(stmts, tail, s)
   }
-  _ -> fmt_emit(fmt_expr(body, fmt_emit(s, " ")), " }")
+  _ -> fmt_lam_block_inline(s, (t) => fmt_expr(body, t), (t) => fmt_lam_block_expand([], Some(body), t))
 }
 
+# ` body }` on the head line when it fits there, the expanded form
+# otherwise.
+fn fmt_lam_block_inline(s: FmtSt, body: (FmtSt) -> FmtSt, expand: (FmtSt) -> FmtSt) : FmtSt =
+  match fmt_try_flat(s, (t) => fmt_emit(body(fmt_emit(t, " ")), " }")) {
+    Some(r) -> r
+    None -> expand(s)
+  }
+
 # An empty body closes on the head line; a lone tail expression stays
-# inline only if the author wrote it there.
+# inline only if the author wrote it there and it fits.
 fn fmt_lam_block_tail(tail: Option[Expr], headline: Int, s: FmtSt) : FmtSt = match tail {
   None -> fmt_emit(s, " }")
   Some(t) ->
     if t.line == headline {
-      fmt_emit(fmt_expr(t, fmt_emit(s, " ")), " }")
+      fmt_lam_block_inline(s, (u) => fmt_expr(t, u), (u) => fmt_lam_block_expand([], tail, u))
     } else { fmt_lam_block_expand([], tail, s) }
 }
 
 fn fmt_lam_block_one(st: Stmt, stmts: [Stmt], headline: Int, s: FmtSt) : FmtSt =
   if stmt_line(st) == headline {
-    fmt_emit(fmt_stmt(st, fmt_emit(s, " ")), " }")
+    fmt_lam_block_inline(s, (u) => fmt_stmt(st, u), (u) => fmt_lam_block_expand(stmts, None, u))
   } else { fmt_lam_block_expand(stmts, None, s) }
 
 fn fmt_lam_block_expand(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
@@ -641,39 +681,18 @@ pub fn fmt_expr_atom(e: Expr, s: FmtSt) : FmtSt {
   }
 }
 
-type PipeUnder = PU(Expr, Expr)
-
-fn fmt_pipe_under(callee: Expr, call_args: [Expr]) : Option[PipeUnder] =
-  match callee.kind {
-    ELambda(params, body) -> match params {
-      [prm] ->
-        if prm.pname == "__pipe" {
-          match call_args {
-            [lhs] -> Some(PU(lhs, fmt_subst_var(body, "__pipe", EUnder)))
-            _     -> None
-          }
-        } else { None }
-      _ -> None
-    }
-    _ -> None
-  }
-
-pub fn fmt_call(callee: Expr, call_args: [Expr], s: FmtSt) : FmtSt {
+# `callee(args) { trailing blocks }`; the argument list breaks one per
+# line when it does not fit, a block-like last argument hugging the
+# parenthesis instead. `open_line` is the source line of the `(`.
+pub fn fmt_call(callee: Expr, call_args: [Expr], open_line: Int, s: FmtSt) : FmtSt {
   let n_trail = fmt_count_trailing(call_args, 0)
-  if n_trail == 0 {
-    let s1 = fmt_expr_atom(callee, s)
-    let s2 = fmt_emit(s1, "(")
-    let s3 = fmt_call_args(call_args, s2)
-    fmt_emit(s3, ")")
-  } else {
-    let n_lead = list_length(call_args) - n_trail
-    let s1 = fmt_expr_atom(callee, s)
-    let s2 = if n_lead == 0 { s1 } else {
-      let a = fmt_emit(s1, "(")
-      let b = fmt_call_args(fmt_args_take(call_args, n_lead), a)
-      fmt_emit(b, ")")
-    }
-    fmt_trailing_blocks(fmt_args_drop(call_args, n_lead), s2)
+  let n_lead = list_length(call_args) - n_trail
+  let blocks = fmt_args_drop(call_args, n_lead)
+  let s1 = fmt_expr_atom(callee, s)
+  if (n_trail > 0) and (n_lead == 0) { fmt_trailing_blocks(blocks, s1) }
+  else {
+    fmt_expr_seq_then("(", ")", false, true, fmt_args_take(call_args, n_lead), open_line, s1,
+                      (t) => fmt_trailing_blocks(blocks, t))
   }
 }
 
@@ -682,63 +701,74 @@ fn fmt_trailing_blocks(blocks: [Expr], s: FmtSt) : FmtSt = match blocks {
   [b, ...rest] -> fmt_trailing_blocks(rest, fmt_expr(b, fmt_emit(s, " ")))
 }
 
-pub fn fmt_call_args(call_args: [Expr], s: FmtSt) : FmtSt {
-  match call_args {
-    [] -> s
-    [a] -> fmt_expr(a, s)
-    [a, ...rest] -> {
-      let s1 = fmt_expr(a, s)
-      let s2 = fmt_emit(s1, ", ")
-      fmt_call_args(rest, s2)
+# A binary node prints as the chain it heads: `a + b + c` on one line
+# when it fits, one operand per line otherwise, parenthesising only the
+# operands the precedence ladder requires.
+pub fn fmt_binop(op: String, l: Expr, r: Expr, e: Expr, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt =
+  match binop_chain(op, l, r, e.line, e.col) {
+    Chain(first, links) -> {
+      let head_op = match links {
+        [ChainOp(o, _, _, _), ..._rest] -> o
+        [] -> op
+      }
+      let lead = (t) => fmt_operand(first, head_op, false, t)
+      let rest = map(links, (lk) => match lk {
+        ChainOp(o, _, _, rhs) -> Link(o, fmt_leftmost(rhs).line, (t) => fmt_operand(rhs, o, true, t))
+      })
+      fmt_chain(s, lead, rest, not chain_trails(links), fmt_chain_broken(s, links), tail)
     }
   }
+
+# An operand that is itself a binary node takes parentheses only when
+# the ladder demands them; any other non-atomic form keeps its own.
+fn fmt_operand(x: Expr, parent_op: String, is_right: Bool, s: FmtSt) : FmtSt = match x.kind {
+  EBinop(child_op, _, _) ->
+    if binop_operand_needs_parens(parent_op, child_op, is_right) { fmt_paren(x, s) }
+    else { fmt_expr(x, s) }
+  _ -> fmt_expr_atom(x, s)
 }
 
-pub fn fmt_binop(op: String, l: Expr, r: Expr, s: FmtSt) : FmtSt {
-  let s1 = fmt_expr_atom(l, s)
-  let s2 = fmt_emit(s1, " ")
-  let s3 = fmt_emit(s2, op)
-  let s4 = fmt_emit(s3, " ")
-  fmt_expr_atom(r, s4)
-}
+fn fmt_paren(x: Expr, s: FmtSt) : FmtSt = fmt_emit(fmt_expr(x, fmt_emit(s, "(")), ")")
 
 pub fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt {
   let s1 = fmt_emit(s, "if ")
   let s2 = fmt_stmt_head_expr(c, s1)
-  let s3 = fmt_emit(s2, " ")
-  let s4 = fmt_brace_body(then_e, s3)
+  let s4 = fmt_brace_rest(then_e, s2)
   match else_opt {
     None -> s4
     Some(e) -> {
       let s5 = fmt_emit(s4, " else ")
       match e.kind {
         EIf(_, _, _) -> fmt_expr(e, s5)
-        _ -> fmt_brace_body(e, s5)
+        _ -> fmt_brace_rest(e, fmt_emit(s5, "{"))
       }
     }
   }
 }
 
-# An if-condition / match-scrutinee whose leftmost constituent is a
-# record literal keeps delimiting parentheses: without them the
-# literal's `{` is read as the start of the `if` / `match` block.
-fn fmt_stmt_head_expr(e: Expr, s: FmtSt) : FmtSt {
+# An if-condition / match-scrutinee, followed by its ` {`. One whose
+# leftmost constituent is a record literal keeps delimiting
+# parentheses: without them the literal's `{` is read as the start of
+# the `if` / `match` block. The brace rides the fit of a chain head.
+fn fmt_stmt_head_expr(e: Expr, s: FmtSt) : FmtSt = fmt_head_expr(e, s, (t) => fmt_emit(t, " {"))
+
+fn fmt_head_expr(e: Expr, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt {
   if fmt_head_is_record_lit(e) {
     let s1 = fmt_emit(s, "(")
     let s2 = fmt_expr(e, s1)
-    fmt_emit(s2, ")")
+    tail(fmt_emit(s2, ")"))
   } else {
-    fmt_expr(e, s)
+    fmt_expr_then(e, s, tail)
   }
 }
 
-# Wrap a non-block expression in `{ ... }`; pass-through if already a
-# block.
-pub fn fmt_brace_body(e: Expr, s: FmtSt) : FmtSt {
+# The rest of a `{ ... }` body after its opening brace has been
+# emitted: a block's statements below it, any other expression inline.
+pub fn fmt_brace_rest(e: Expr, s: FmtSt) : FmtSt {
   match e.kind {
-    EBlock(_, _) -> fmt_expr(e, s)
+    EBlock(stmts, tail) -> fmt_block_rest(stmts, tail, s)
     _ -> {
-      let s1 = fmt_emit(s, "{ ")
+      let s1 = fmt_emit(s, " ")
       let s2 = fmt_expr(e, s1)
       fmt_emit(s2, " }")
     }
@@ -747,8 +777,7 @@ pub fn fmt_brace_body(e: Expr, s: FmtSt) : FmtSt {
 
 pub fn fmt_match(scrut: Expr, arms: [Arm], s: FmtSt) : FmtSt {
   let s1 = fmt_emit(s, "match ")
-  let s2 = fmt_stmt_head_expr(scrut, s1)
-  let s3 = fmt_emit(s2, " {")
+  let s3 = fmt_stmt_head_expr(scrut, s1)
   let s4 = fmt_newline(s3)
   let s5 = fmt_indent_in(s4)
   let s6 = fmt_arms(arms, s5)
@@ -760,12 +789,13 @@ pub fn fmt_arms(arms: [Arm], s: FmtSt) : FmtSt {
   match arms {
     [] -> s
     [a, ...rest] -> {
-      let s1 = fmt_arm(a, s)
-      let s2 = fmt_newline(s1)
-      fmt_arms(rest, s2)
+      let s1 = fmt_arm(a, fmt_drain_before(s, arm_line(a)))
+      let s2 = fmt_drain_trailing_after(s1, arm_trailing_limit(a, rest))
+      fmt_arms(rest, fmt_newline(s2))
     }
   }
 }
+
 
 pub fn fmt_arm(a: Arm, s: FmtSt) : FmtSt {
   match a {
@@ -778,8 +808,7 @@ pub fn fmt_arm(a: Arm, s: FmtSt) : FmtSt {
           fmt_expr(g, a1)
         }
       }
-      let s3 = fmt_emit(s2, " -> ")
-      fmt_expr(body, s3)
+      fmt_arrow_body(body, fmt_emit(s2, " ->"))
     }
   }
 }
@@ -831,23 +860,10 @@ pub fn fmt_lambda_param(p: Param, s: FmtSt) : FmtSt {
   }
 }
 
-pub fn fmt_record_lit(name: String, fields: [FieldInit], s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, name)
-  let s2 = fmt_emit(s1, " { ")
-  let s3 = fmt_record_fields(fields, s2)
-  fmt_emit(s3, " }")
-}
-
-pub fn fmt_record_fields(fs: [FieldInit], s: FmtSt) : FmtSt {
-  match fs {
-    [] -> s
-    [f] -> fmt_record_field(f, s)
-    [f, ...rest] -> {
-      let s1 = fmt_record_field(f, s)
-      let s2 = fmt_emit(s1, ", ")
-      fmt_record_fields(rest, s2)
-    }
-  }
+pub fn fmt_record_lit(name: String, fields: [FieldInit], open_line: Int, s: FmtSt) : FmtSt {
+  let style = SeqStyle { open: string_concat(name, " {"), close: "}", pad: true, fill: false, hug: false }
+  let items = map(fields, (f) => match f { FI(_, x) -> SeqItem(fmt_leftmost(x).line, (t) => fmt_record_field(f, t)) })
+  fmt_seq(s, style, open_line, items, (t) => t)
 }
 
 # Sentinel field names print their surface forms back: `...src` for the
@@ -873,32 +889,13 @@ fn fmt_field_init(name: String, e: Expr, s: FmtSt) : FmtSt =
     fmt_expr(e, s2)
   }
 
-pub fn fmt_list(elems: [ListElem], s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, "[")
-  let s2 = fmt_list_elems(elems, s1)
-  fmt_emit(s2, "]")
-}
-
-pub fn fmt_list_elems(es: [ListElem], s: FmtSt) : FmtSt {
-  match es {
-    [] -> s
-    [e] -> fmt_list_elem(e, s)
-    [e, ...rest] -> {
-      let s1 = fmt_list_elem(e, s)
-      let s2 = fmt_emit(s1, ", ")
-      fmt_list_elems(rest, s2)
-    }
-  }
-}
-
-pub fn fmt_list_elem(e: ListElem, s: FmtSt) : FmtSt {
-  match e {
-    ElPlain(x) -> fmt_expr(x, s)
-    ElSpread(x) -> {
-      let s1 = fmt_emit(s, "...")
-      fmt_expr(x, s1)
-    }
-  }
+pub fn fmt_list(elems: [ListElem], open_line: Int, s: FmtSt) : FmtSt {
+  let style = SeqStyle { open: "[", close: "]", pad: false, fill: fmt_all_scalar_elems(elems), hug: false }
+  let items = map(elems, (el) => match el {
+    ElPlain(x) -> SeqItem(fmt_leftmost(x).line, (t) => fmt_expr(x, t))
+    ElSpread(x) -> SeqItem(x.line, (t) => fmt_expr(x, fmt_emit(t, "...")))
+  })
+  fmt_seq(s, style, open_line, items, (t) => t)
 }
 
 pub fn fmt_range(lo: Expr, hi: Expr, step: Option[Expr], s: FmtSt) : FmtSt {
@@ -918,9 +915,12 @@ pub fn fmt_range(lo: Expr, hi: Expr, step: Option[Expr], s: FmtSt) : FmtSt {
   fmt_emit(s4, "]")
 }
 
-pub fn fmt_block(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, "{")
-  let s2 = fmt_newline(s1)
+pub fn fmt_block(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt =
+  fmt_block_rest(stmts, tail, fmt_emit(s, "{"))
+
+# The statements and closing brace of a block whose `{` is already out.
+pub fn fmt_block_rest(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
+  let s2 = fmt_newline(s)
   let s3 = fmt_indent_in(s2)
   let s4 = fmt_block_inner(stmts, tail, s3)
   let s5 = fmt_indent_out(s4)
@@ -937,9 +937,9 @@ pub fn fmt_block_inner(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
     None -> s1
     Some(e) -> {
       let s2 = fmt_ensure_newline(s1)
-      let s3 = fmt_drain_before(s2, e.line)
+      let s3 = fmt_drain_before(s2, fmt_leftmost(e).line)
       let s4 = fmt_expr(e, s3)
-      let s5 = fmt_drain_trailing_after(s4, e.line + 1)
+      let s5 = fmt_drain_trailing_after(s4, fmt_leftmost(e).line + 1)
       fmt_ensure_newline(s5)
     }
   }
@@ -948,7 +948,7 @@ pub fn fmt_block_inner(stmts: [Stmt], tail: Option[Expr], s: FmtSt) : FmtSt {
 pub fn fmt_stmts(stmts: [Stmt], s: FmtSt, last_limit: Int) : FmtSt {
   match stmts {
     [] -> s
-    [st, ...rest] -> {
+    [st, ...rest] -> if fmt_probe_dead(s) { s } else {
       let s1 = fmt_drain_before(s, stmt_line(st))
       let s2 = fmt_stmt(st, s1)
       let s2a = fmt_drain_trailing_after(s2, stmts_trailing_limit(st, rest, last_limit))
@@ -970,8 +970,7 @@ pub fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
           fmt_type(t, a)
         }
       }
-      let s4 = fmt_emit(s3, " = ")
-      fmt_expr(e, s4)
+      fmt_assign_body(e, fmt_emit(s3, " ="))
     }
     SAssert(e, _) -> {
       let s1 = fmt_emit(s, "assert ")
@@ -984,15 +983,13 @@ pub fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
       let s1 = fmt_expr(base, s)
       let s2 = fmt_emit(s1, "[")
       let s3 = fmt_expr(idx, s2)
-      let s4 = fmt_emit(s3, "] := ")
-      fmt_expr(val, s4)
+      fmt_assign_body(val, fmt_emit(s3, "] :="))
     }
     # Scalar / field write `lhs := v` — surface form of the `.set`
     # call, printed as written.
     SAssign(lhs, val, _, _) -> {
       let s1 = fmt_expr(lhs, s)
-      let s2 = fmt_emit(s1, " := ")
-      fmt_expr(val, s2)
+      fmt_assign_body(val, fmt_emit(s1, " :="))
     }
     # m7b #5: local mutable cell `var name [: T] = init`.
     SVar(name, ty_opt, rhs, _, _) -> {
@@ -1005,13 +1002,15 @@ pub fn fmt_stmt(st: Stmt, s: FmtSt) : FmtSt {
           fmt_type(t, a)
         }
       }
-      let s4 = fmt_emit(s3, " := ")
-      fmt_expr(rhs, s4)
+      fmt_assign_body(rhs, fmt_emit(s3, " :="))
     }
     # m7e §25: `use Effect` at block scope.
     SUse(eff_name, _, _) -> fmt_emit(s, string_concat("use ", eff_name))
   }
 }
+
+# The right-hand side of a binding hangs off its `=` / `:=`.
+pub fn fmt_assign_body(e: Expr, s: FmtSt) : FmtSt = fmt_arrow_body(e, s)
 
 # ---- patterns -------------------------------------------------------
 
@@ -1144,54 +1143,15 @@ pub fn fmt_pfield(pf: PField, s: FmtSt) : FmtSt {
 
 # ---- pipes ----------------------------------------------------------
 
-pub fn fmt_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
-  # `|>` is left-associative — `a |> b |> c` parses as
-  # `EPipe(EPipe(a, b), c)`, so a left-leaning EPipe needs no parens.
-  let s1 = match l.kind {
-    EPipe(_, _) -> fmt_expr(l, s)
-    _ -> fmt_expr_atom(l, s)
+# A pipe node prints as the chain it heads: `xs |> f | g` on one line
+# when it fits, one stage per line — operator leading — otherwise. The
+# four pipes are left-associative at one level, so a pipe to the left
+# needs no parentheses; every other stage prints as an atom.
+fn fmt_pipes(e: Expr, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt = match pipe_chain(e) {
+  Chain(first, links) -> {
+    let rest = map(links, (lk) => match lk {
+      ChainOp(o, _, _, rhs) -> Link(o, fmt_leftmost(rhs).line, (t) => fmt_expr_atom(rhs, t))
+    })
+    fmt_chain(s, (t) => fmt_expr_atom(first, t), rest, true, fmt_chain_broken(s, links), tail)
   }
-  let s2 = fmt_emit(s1, " |> ")
-  fmt_expr_atom(r, s2)
-}
-
-# issue #201: `|` and `||` mirror `|>`'s left-leaning shape so a
-# left-EMapPipe nested inside an outer EMapPipe (or EFlatMapPipe)
-# stays paren-free. Parentheses around any *other* shape on the
-# left keep the formatter idempotent against future grammar changes.
-pub fn fmt_map_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
-  let s1 = match l.kind {
-    EPipe(_, _) -> fmt_expr(l, s)
-    EMapPipe(_, _) -> fmt_expr(l, s)
-    EFlatMapPipe(_, _) -> fmt_expr(l, s)
-    EFilterPipe(_, _) -> fmt_expr(l, s)
-    _ -> fmt_expr_atom(l, s)
-  }
-  let s2 = fmt_emit(s1, " | ")
-  fmt_expr_atom(r, s2)
-}
-
-pub fn fmt_flat_map_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
-  let s1 = match l.kind {
-    EPipe(_, _) -> fmt_expr(l, s)
-    EMapPipe(_, _) -> fmt_expr(l, s)
-    EFlatMapPipe(_, _) -> fmt_expr(l, s)
-    EFilterPipe(_, _) -> fmt_expr(l, s)
-    _ -> fmt_expr_atom(l, s)
-  }
-  let s2 = fmt_emit(s1, " || ")
-  fmt_expr_atom(r, s2)
-}
-
-# issue #412: filter-pipe `|?` mirrors the same left-leaning shape.
-pub fn fmt_filter_pipe(l: Expr, r: Expr, s: FmtSt) : FmtSt {
-  let s1 = match l.kind {
-    EPipe(_, _) -> fmt_expr(l, s)
-    EMapPipe(_, _) -> fmt_expr(l, s)
-    EFlatMapPipe(_, _) -> fmt_expr(l, s)
-    EFilterPipe(_, _) -> fmt_expr(l, s)
-    _ -> fmt_expr_atom(l, s)
-  }
-  let s2 = fmt_emit(s1, " |? ")
-  fmt_expr_atom(r, s2)
 }

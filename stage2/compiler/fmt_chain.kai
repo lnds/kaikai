@@ -1,0 +1,204 @@
+# compiler/fmt_chain.kai — operator precedence and chain shapes for
+# `kai fmt`.
+#
+# The parser's precedence ladder, read back: which binary operand needs
+# parentheses, how a nest of same-level operators flattens into the
+# chain the writer lays out one operand per line, and where such an
+# expression starts in the source. Pure queries over the AST; nothing
+# here emits.
+
+import compiler.util
+import compiler.ast
+import compiler.fmt_shape
+import compiler.fmt_refine
+
+# The ladder, tightest last. `-` and `%` share their levels but never
+# lead a continuation line (both can open an expression).
+#[doc("Binding level of a binary operator, higher binds tighter; 0 for an operator the ladder does not know.")]
+pub fn binop_prec(op: String) : Int =
+  if op == "or" { 1 }
+  else if op == "and" { 2 }
+  else if binop_is_cmp(op) { 3 }
+  else if op == "++" { 4 }
+  else if (op == "+") or (op == "-") { 5 }
+  else if ((op == "*") or (op == "/")) or (op == "%") { 6 }
+  else if op == "^" { 7 }
+  else { 0 }
+
+fn binop_is_cmp(op: String) : Bool =
+  (((op == "==") or (op == "!=")) or ((op == "<") or (op == ">"))) or ((op == "<=") or (op == ">="))
+
+fn binop_right_assoc(op: String) : Bool = (op == "++") or (op == "^")
+
+#[doc("True when a `child` operator's expression must be parenthesised as the left or right operand of `parent`.")]
+pub fn binop_operand_needs_parens(parent: String, child: String, is_right: Bool) : Bool {
+  let pp = binop_prec(parent)
+  let cp = binop_prec(child)
+  if (pp == 0) or (cp == 0) { true }
+  else if cp != pp { cp < pp }
+  else if binop_is_cmp(parent) { true }
+  else if binop_right_assoc(parent) { not is_right }
+  else { is_right }
+}
+
+#[doc("An operator chain flattened from a nest of same-level operators: the first operand and each following (operator, operand) link.")]
+pub type Chain = Chain(Expr, [ChainOp])
+
+#[doc("One link of a chain: the operator's text, its source position, and its right operand.")]
+pub type ChainOp = ChainOp(String, Int, Int, Expr)
+
+# Same level and same associativity flatten; a comparison never chains.
+fn binop_same_level(op: String, other: String) : Bool =
+  ((binop_prec(op) == binop_prec(other)) and (not binop_is_cmp(op))) and (binop_right_assoc(op) == binop_right_assoc(other))
+
+#[doc("The chain a binary node heads: a left-associative nest flattens down its left spine, a right-associative one down its right spine.")]
+pub fn binop_chain(op: String, l: Expr, r: Expr, line: Int, col: Int) : Chain =
+  if binop_right_assoc(op) { Chain(l, binop_right_spine(op, r, line, col)) }
+  else {
+    match binop_left_spine(op, l) {
+      Chain(first, links) -> Chain(first, list_append(links, [ChainOp(op, line, col, r)]))
+    }
+  }
+
+fn binop_left_spine(op: String, l: Expr) : Chain = match l.kind {
+  EBinop(op2, l2, r2) ->
+    if binop_same_level(op, op2) {
+      match binop_left_spine(op2, l2) {
+        Chain(first, links) -> Chain(first, list_append(links, [ChainOp(op2, l.line, l.col, r2)]))
+      }
+    } else { Chain(l, []) }
+  _ -> Chain(l, [])
+}
+
+fn binop_right_spine(op: String, r: Expr, line: Int, col: Int) : [ChainOp] = match r.kind {
+  EBinop(op2, l2, r2) ->
+    if binop_same_level(op, op2) { [ChainOp(op, line, col, l2), ...binop_right_spine(op2, r2, r.line, r.col)] }
+    else { [ChainOp(op, line, col, r)] }
+  _ -> [ChainOp(op, line, col, r)]
+}
+
+#[doc("True when a chain holding `-` or `%` must trail its operators: neither may open a continuation line.")]
+pub fn chain_trails(links: [ChainOp]) : Bool = match links {
+  [] -> false
+  [ChainOp(op, _, _, _), ...rest] -> ((op == "-") or (op == "%")) or chain_trails(rest)
+}
+
+# The four pipes share one level and one associativity; the placeholder
+# desugar (`lhs |> f(_, y)`) reaches the writer as a call and joins the
+# spine like any other stage.
+#[doc("The pipe chain a pipe node heads, flattened down its left spine; the operand of each link is the stage as the author wrote it.")]
+pub fn pipe_chain(e: Expr) : Chain = match e.kind {
+  EPipe(l, r) -> pipe_extend(l, "|>", e, r)
+  EMapPipe(l, r) -> pipe_extend(l, "|", e, r)
+  EFlatMapPipe(l, r) -> pipe_extend(l, "||", e, r)
+  EFilterPipe(l, r) -> pipe_extend(l, "|?", e, r)
+  ECall(callee, call_args) -> match fmt_pipe_under(callee, call_args) {
+    Some(PU(lhs, rhs)) -> pipe_extend(lhs, "|>", e, rhs)
+    None -> Chain(e, [])
+  }
+  _ -> Chain(e, [])
+}
+
+fn pipe_extend(l: Expr, op: String, at: Expr, r: Expr) : Chain = match pipe_chain(l) {
+  Chain(first, links) -> Chain(first, list_append(links, [ChainOp(op, at.line, at.col, r)]))
+}
+
+# ---- expression heads --------------------------------------------------
+
+# Postfix and infix nodes are positioned at their operator token; the
+# author's line break sits before the leftmost operand instead.
+#[doc("The node whose position is the expression's first source token.")]
+pub fn fmt_leftmost(e: Expr) : Expr = match e.kind {
+  ECall(callee, call_args) -> match fmt_pipe_under(callee, call_args) {
+    Some(PU(lhs, _)) -> fmt_leftmost(lhs)
+    None -> match fmt_call_literal(callee, call_args) {
+      Some(_) -> e
+      None -> fmt_leftmost(callee)
+    }
+  }
+  EField(obj, _) -> match obj.kind { EPlaceholder -> e  _ -> fmt_leftmost(obj) }
+  EIndex(obj, _) -> fmt_leftmost(obj)
+  EBang(inner) -> fmt_leftmost(inner)
+  EBinop(_, l, _) -> fmt_leftmost(l)
+  EPipe(l, _) -> fmt_leftmost(l)
+  EMapPipe(l, _) -> fmt_leftmost(l)
+  EFlatMapPipe(l, _) -> fmt_leftmost(l)
+  EFilterPipe(l, _) -> fmt_leftmost(l)
+  ELitUnit(inner, _) -> fmt_leftmost(inner)
+  _ -> e
+}
+
+#[doc("The two sides of a `lhs |> f(_, y)` placeholder pipe recovered from its call desugar, or None for an ordinary call.")]
+pub type PipeUnder = PU(Expr, Expr)
+
+#[doc("Recover a placeholder pipe from the call the parser desugared it to.")]
+pub fn fmt_pipe_under(callee: Expr, call_args: [Expr]) : Option[PipeUnder] =
+  match callee.kind {
+    ELambda(params, body) -> match params {
+      [prm] ->
+        if prm.pname == "__pipe" {
+          match call_args {
+            [lhs] -> Some(PU(lhs, fmt_subst_var(body, "__pipe", EUnder)))
+            _     -> None
+          }
+        } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+
+#[doc("The source line a statement sits on.")]
+pub fn stmt_line(st: Stmt) : Int {
+  match st {
+    SLet(p, _, _) -> p.line
+    SAssert(e, _) -> fmt_leftmost(e).line
+    SExprStmt(e) -> fmt_leftmost(e).line
+    SIndexAssign(_, _, _, line, _) -> line
+    SAssign(_, _, line, _) -> line
+    SVar(_, _, _, line, _) -> line
+    SUse(_, line, _) -> line
+  }
+}
+
+# Same shape as `decls_trailing_limit` — see that comment for the
+# rationale. For the last stmt, callers pass `last_limit`:
+#   > 0   = the line of the next AST anchor after the block (e.g.
+#            the tail expression's line). Lets multi-line trailings
+#            on the last stmt drain inline.
+#   == 0  = no anchor known (block has no tail). Falls back to
+#            `stmt_line(st) + 1` — single-line trailings still
+#            drain, multi-line trailings on the last stmt of a
+#            tail-less block stay full-line-demoted.
+#[doc("Exclusive upper source line for draining a statement's trailing comment: the next statement's line, or `last_limit` for the last one.")]
+pub fn stmts_trailing_limit(st: Stmt, rest: [Stmt], last_limit: Int) : Int {
+  match rest {
+    [] -> if last_limit > 0 {
+      last_limit
+    } else {
+      stmt_line(st) + 1
+    }
+    [next, ..._tail] -> stmt_line(next)
+  }
+}
+
+# ---- arms and clauses -------------------------------------------------
+
+#[doc("The source line a match arm opens on.")]
+pub fn arm_line(a: Arm) : Int = match a { Arm(pat, _, _) -> pat.line }
+
+# A trailing comment belongs to the arm until the next arm opens; for
+# the last arm, until the line below its body's head.
+#[doc("Exclusive upper source line for draining a match arm's trailing comment.")]
+pub fn arm_trailing_limit(a: Arm, rest: [Arm]) : Int = match rest {
+  [next, ..._more] -> arm_line(next)
+  [] -> match a { Arm(_, _, body) -> fmt_leftmost(body).line + 1 }
+}
+
+#[doc("The source line a handler clause opens on.")]
+pub fn hclause_line(c: HClause) : Int = match c { HC(_, _, _, line, _) -> line }
+
+#[doc("Exclusive upper source line for draining a handler clause's trailing comment: the next clause's line, or the line below the last clause's body head.")]
+pub fn hclause_trailing_limit(c: HClause, rest: [HClause]) : Int = match rest {
+  [next, ..._more] -> hclause_line(next)
+  [] -> match c { HC(_, _, body, _, _) -> fmt_leftmost(body).line + 1 }
+}

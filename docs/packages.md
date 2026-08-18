@@ -39,8 +39,19 @@ Three forms are accepted for a dependency value:
    workspace-style development before publishing.
 
 Top-level keys recognised by the v1 parser:
-`name`, `version`, `[dependencies]`, `[native]`. Any other top-level
-keys are ignored (forwards-compatible with future extensions).
+`name`, `version`, `[dependencies]`, `[native]`, `[fmt]`. Any other
+top-level keys are ignored (forwards-compatible with future
+extensions).
+
+`[fmt]` holds the formatter's settings for the package. Its one key
+today is `width`, the line width `kai fmt` lays every file under the
+manifest out against (`docs/fmt-width.md`); `kai fmt --width N`
+overrides it for one run, and 100 applies when neither is given:
+
+```toml
+[fmt]
+width = 80
+```
 
 The manifest is parsed by `stdlib/encoding/toml.kai` (a hand-
 written subset decoder; see the module header for the supported

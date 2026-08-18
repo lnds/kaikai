@@ -7,8 +7,8 @@
 # Plus a roundtrip sanity check on all formattable examples — the
 # formatted output must re-parse without errors.
 #
-# examples/fmt/width/ rides the same two checks. Those goldens record
-# what the writer does to hand-wrapped code TODAY, so a change in
+# examples/fmt/width/ rides the same two checks: the width corpus's
+# goldens pin the layout the width model produces, and a change in
 # layout policy shows up here as a reviewable diff; the numbers behind
 # them are gated by tests/fmt_width.sh.
 
