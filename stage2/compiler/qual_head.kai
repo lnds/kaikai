@@ -1,11 +1,13 @@
 #[doc("""
-Qualified habitant names in head position: `with m.E`, `impl m.P`.
+Qualified habitant names in head position: `with m.E`, `impl m.P`,
+`#[derive(m.P)]`.
 
 The parser folds the qualifier into the spelling (`"m.E"`) exactly as
 it does for `mod.Type`. This pass validates the qualifier against the
-file's import table and rewrites the node back to the bare name, so
-every downstream consumer sees the shape an unqualified head produces
-and the qualifier stays a parse-time disambiguator.
+file's import table. A handler head is rewritten back to the bare name.
+A protocol head keeps its qualifier, canonicalised from the written
+alias to the module's tagged name (`alias.P` -> `home.P`), so the
+protocol lowering resolves the impl against exactly that module.
 
 The rewrite is pure and total — a bad qualifier still yields the bare
 name — and the counting pass is what reports it and fails the build.
@@ -82,6 +84,18 @@ fn qh_name(name: String, mt: [ModuleEntry]) : String = match qh_resolve(name, mt
   QhBad(_, bare, _, _) -> bare
 }
 
+# A protocol head keeps a valid qualifier, spelled with the tagged
+# module name; an invalid one falls back to the bare name.
+fn qh_proto_name(name: String, mt: [ModuleEntry]) : String = match split_dotted_qualifier(name) {
+  None -> name
+  Some(q) -> match q {
+    QSplit(mod, bare) -> match qh_resolve(name, mt) {
+      QhOk(_) -> concat_all([mt_tagged_name(mt, mod), ".", bare])
+      QhBad(_, _, _, _) -> bare
+    }
+  }
+}
+
 fn qh_report(name: String, kind: String, mt: [ModuleEntry], file: String,
              line: Int, col: Int) : Int / Console + File = match qh_resolve(name, mt) {
   QhOk(_) -> 0
@@ -109,11 +123,12 @@ fn qh_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
   DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo) ->
     DFn(is_pub, name, tps, ps, ret, row, qh_expr(body, mt), l, c, mo)
   DImpl(pname, pargs, target, methods, l, c, itps) ->
-    DImpl(qh_name(pname, mt), pargs, target, qh_sub_decls(methods, mt), l, c, itps)
+    DImpl(qh_proto_name(pname, mt), pargs, target, qh_sub_decls(methods, mt), l, c, itps)
   DTest(desc, body, l, c, mo) -> DTest(desc, qh_expr(body, mt), l, c, mo)
   DBench(desc, body, l, c, mo) -> DBench(desc, qh_expr(body, mt), l, c, mo)
   DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, qh_expr(body, mt), l, c, mo)
-  DDerive(protos, inner, l, c) -> DDerive(protos, qh_decl(inner, mt), l, c)
+  DDerive(protos, inner, l, c) ->
+    DDerive(map(protos, (n) => qh_proto_name(n, mt)), qh_decl(inner, mt), l, c)
   _ -> d
 }
 
@@ -141,8 +156,15 @@ fn qhchk_decl(d: Decl, mt: [ModuleEntry], file: String) : Int / Console + File =
   DTest(_, body, _, _, _) -> qhchk_expr(body, mt, file)
   DBench(_, body, _, _, _) -> qhchk_expr(body, mt, file)
   DCheck(_, _, body, _, _, _) -> qhchk_expr(body, mt, file)
-  DDerive(_, inner, _, _) -> qhchk_decl(inner, mt, file)
+  DDerive(protos, inner, l, c) ->
+    qhchk_names(protos, mt, file, l, c) + qhchk_decl(inner, mt, file)
   _ -> 0
+}
+
+fn qhchk_names(names: [String], mt: [ModuleEntry], file: String,
+               l: Int, c: Int) : Int / Console + File = match names {
+  [] -> 0
+  [n, ...rest] -> qh_report(n, "protocol", mt, file, l, c) + qhchk_names(rest, mt, file, l, c)
 }
 
 fn qhchk_sub_decls(ds: [Decl], mt: [ModuleEntry], file: String) : Int / Console + File = match ds {

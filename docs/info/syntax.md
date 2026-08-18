@@ -257,9 +257,11 @@ fn main() : Unit / Stdout =
 
 A qualifier is accepted on types, variant constructors (in expression
 and pattern position), functions, constants, protocols in an `impl`
-head, effects in a `handle … with` head, and effect operations. It is
-only a disambiguator: `trace.Trace.log` and `Trace.log` name the same
-operation whenever the bare name is unambiguous.
+head and in `#[derive(...)]`, effects in a `handle … with` head, and
+effect operations. It is only a disambiguator: `trace.Trace.log` and
+`Trace.log` name the same operation whenever the bare name is
+unambiguous. A bare protocol in an `impl` head or a `#[derive]` that
+two imports export is an error naming both candidates.
 
 ## Tests
 

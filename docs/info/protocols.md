@@ -70,6 +70,10 @@ Derivable: Show, Eq, Ord, Hash, BinSerialize (partial — see
 `docs/binserialize-collections-design.md`), Layout (records of
 `U<N><be|le>` fields — `kai info kinds`), Json.
 
+A derived protocol may be module-qualified — `#[derive(pa.Show)]` —
+which selects that module's protocol when two imports export the same
+name; a bare name exported by two imports is an error naming both.
+
 `#[derive(Json)]` binds a record to the JSON DOM: it generates
 `to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
 Result[T, JsonError]` entry point.
