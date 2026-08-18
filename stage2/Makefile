@@ -194,7 +194,7 @@ STACK :=
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
 .PHONY: test-issue-1331-op-arg-release-asan test-issue-1331-borrowed-op-arg-asan
 .PHONY: test-mn-sigaltstack-asan
-.PHONY: all clean core-cache-warm test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native
+.PHONY: all clean core-cache-warm test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native
 all: $(TARGET)
 
 $(KAIC1):
@@ -10885,9 +10885,10 @@ rc-detector:
 #
 # The fixture lists are not written here: they come from the `axes`
 # column of tests/namespace_matrix.tsv, so a fixture the matrix counts is
-# a fixture these targets run. Every loop runs the whole list and reports
-# every failure before exiting non-zero — one red fixture must not hide
-# the ninety behind it.
+# a fixture these targets run. Every loop runs the whole list into
+# build/nscol-<axis>.log and the tail hands the log to
+# tools/nscol-ratchet.sh: failures above the axis's count in
+# tools/nscol-baseline.txt are a regression, fewer lower the baseline.
 #
 # Positive axes diff stdout against `main.out.expected`; negative axes
 # must fail to compile with the first line of `main.err.expected` as a
@@ -10896,6 +10897,7 @@ rc-detector:
 # mismatch where the real fault is an ambiguous name), and a bare
 # exit-code check would pass on that.
 NSCOL_AXIS = ../tests/namespace_matrix_axes.sh
+NSCOL_RATCHET = ../tools/nscol-ratchet.sh
 NSCOL_DIRS = $(shell $(NSCOL_AXIS) c)
 NSCOL_NATIVE_DIRS = $(shell $(NSCOL_AXIS) native)
 NSCOL_NEG_DIRS = $(shell $(NSCOL_AXIS) neg)
@@ -10908,72 +10910,72 @@ NSCOL_TESTSYM_DIRS = $(shell $(NSCOL_AXIS) testsym)
 NSCOL_CHECK_DIRS = $(shell $(NSCOL_AXIS) check)
 
 test-namespace-collisions: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.out.expected; \
 	  if ! ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/nscol-$$d.c 2> build/nscol-$$d.err; then \
-	    echo "namespace-collisions FAIL $$d (kaic2)"; head -3 build/nscol-$$d.err; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions FAIL $$d (kaic2)"; head -3 build/nscol-$$d.err; continue; fi; \
 	  if ! $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/nscol-$$d.c -o build/nscol-$$d-c $(LDLIBS_M); then \
-	    echo "namespace-collisions FAIL $$d (cc)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions FAIL $$d (cc)"; continue; fi; \
 	  if ! ./build/nscol-$$d-c > build/nscol-$$d-c.out; then \
-	    echo "namespace-collisions FAIL $$d (run C)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions FAIL $$d (run C)"; continue; fi; \
 	  if ! diff -q $$exp build/nscol-$$d-c.out > /dev/null; then \
-	    echo "namespace-collisions DIFF $$d (C vs golden)"; diff $$exp build/nscol-$$d-c.out; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions DIFF $$d (C vs golden)"; diff $$exp build/nscol-$$d-c.out; continue; fi; \
 	  echo "namespace-collisions OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-c.log 2>&1; \
+	$(NSCOL_RATCHET) c build/nscol-c.log
 
 test-namespace-collisions-neg: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_NEG_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.err.expected; \
 	  if ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > /dev/null 2> build/nscol-neg-$$d.err; then \
-	    echo "namespace-collisions-neg FAIL $$d (expected error, got success)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-neg FAIL $$d (expected error, got success)"; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-neg-$$d.err; then \
 	    echo "namespace-collisions-neg FAIL $$d (substring '$$needle' not in stderr)"; \
-	    head -5 build/nscol-neg-$$d.err; fail=$$((fail+1)); continue; fi; \
+	    head -5 build/nscol-neg-$$d.err; continue; fi; \
 	  echo "namespace-collisions-neg OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-neg: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-neg.log 2>&1; \
+	$(NSCOL_RATCHET) neg build/nscol-neg.log
 
 # Native backend. A fix verified only on C proves nothing here: the
 # clause/handler symbol carries the enclosing function on the C path
 # and not on the KIR path, so the two backends diverge on exactly the
 # class this corpus covers.
 test-namespace-collisions-native: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_NATIVE_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.out.expected; \
 	  if ! KAI_BACKEND=native ../bin/kai build $$src -o build/nscol-$$d-n 2> build/nscol-$$d-n.err; then \
-	    echo "namespace-collisions-native FAIL $$d (native build)"; head -3 build/nscol-$$d-n.err; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-native FAIL $$d (native build)"; head -3 build/nscol-$$d-n.err; continue; fi; \
 	  if ! ./build/nscol-$$d-n > build/nscol-$$d-n.out; then \
-	    echo "namespace-collisions-native FAIL $$d (run native)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-native FAIL $$d (run native)"; continue; fi; \
 	  if ! diff -q $$exp build/nscol-$$d-n.out > /dev/null; then \
-	    echo "namespace-collisions-native DIFF $$d (native vs golden)"; diff $$exp build/nscol-$$d-n.out; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-native DIFF $$d (native vs golden)"; diff $$exp build/nscol-$$d-n.out; continue; fi; \
 	  echo "namespace-collisions-native OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-native: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-native.log 2>&1; \
+	$(NSCOL_RATCHET) native build/nscol-native.log
 
 # The negatives on the native backend: a diagnostic the C path emits and
 # the KIR path skips (or vice versa) is a silent acceptance on one of them.
 test-namespace-collisions-neg-native: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_NEG_NATIVE_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.err.expected; \
 	  if KAI_BACKEND=native ../bin/kai build $$src -o build/nscol-neg-$$d-n > /dev/null 2> build/nscol-neg-$$d-n.err; then \
-	    echo "namespace-collisions-neg-native FAIL $$d (expected error, got success)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-neg-native FAIL $$d (expected error, got success)"; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-neg-$$d-n.err; then \
 	    echo "namespace-collisions-neg-native FAIL $$d (substring '$$needle' not in stderr)"; \
-	    head -5 build/nscol-neg-$$d-n.err; fail=$$((fail+1)); continue; fi; \
+	    head -5 build/nscol-neg-$$d-n.err; continue; fi; \
 	  echo "namespace-collisions-neg-native OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-neg-native: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-neg-native.log 2>&1; \
+	$(NSCOL_RATCHET) neg-native build/nscol-neg-native.log
 
 # Separate compilation (`--emit=c-modular`): one translation unit per
 # module, linked afterwards. Whatever the whole-program emit resolves by
@@ -10983,95 +10985,95 @@ test-namespace-collisions-neg-native: $(TARGET) build
 # only here. `KAI_MODULAR=1` forces the split even when the core cache
 # is cold.
 test-namespace-collisions-modular: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_MODULAR_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.out.expected; \
 	  if ! KAI_MODULAR=1 ../bin/kai build --backend=c $$src -o build/nscol-$$d-m 2> build/nscol-$$d-m.err; then \
-	    echo "namespace-collisions-modular FAIL $$d (modular build)"; head -3 build/nscol-$$d-m.err; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-modular FAIL $$d (modular build)"; head -3 build/nscol-$$d-m.err; continue; fi; \
 	  if ! ./build/nscol-$$d-m > build/nscol-$$d-m.out; then \
-	    echo "namespace-collisions-modular FAIL $$d (run)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-modular FAIL $$d (run)"; continue; fi; \
 	  if ! diff -q $$exp build/nscol-$$d-m.out > /dev/null; then \
-	    echo "namespace-collisions-modular DIFF $$d (modular vs golden)"; diff $$exp build/nscol-$$d-m.out; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-modular DIFF $$d (modular vs golden)"; diff $$exp build/nscol-$$d-m.out; continue; fi; \
 	  echo "namespace-collisions-modular OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-modular: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-modular.log 2>&1; \
+	$(NSCOL_RATCHET) modular build/nscol-modular.log
 
 # The negatives under separate compilation. A per-TU emit can accept
 # what the single TU rejects (two prototypes that only clash side by
 # side), so the diagnostic has to come from the compiler, not from `cc`.
 test-namespace-collisions-neg-modular: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_NEG_MODULAR_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.err.expected; \
 	  if KAI_MODULAR=1 ../bin/kai build --backend=c $$src -o build/nscol-neg-$$d-m > /dev/null 2> build/nscol-neg-$$d-m.err; then \
-	    echo "namespace-collisions-neg-modular FAIL $$d (expected error, got success)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-neg-modular FAIL $$d (expected error, got success)"; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-neg-$$d-m.err; then \
 	    echo "namespace-collisions-neg-modular FAIL $$d (substring '$$needle' not in stderr)"; \
-	    head -5 build/nscol-neg-$$d-m.err; fail=$$((fail+1)); continue; fi; \
+	    head -5 build/nscol-neg-$$d-m.err; continue; fi; \
 	  echo "namespace-collisions-neg-modular OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-neg-modular: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-neg-modular.log 2>&1; \
+	$(NSCOL_RATCHET) neg-modular build/nscol-neg-modular.log
 
 # ASAN over the memory-corruption members of the corpus: a homonymous
 # constructor makes one module read a slot the other emitted with a
 # different payload type. A clean run on macOS proves nothing about the
 # Linux leak check, so this target gates on sanitizer diagnostics only.
 test-namespace-collisions-asan: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_ASAN_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  if ! ./$(TARGET) --path ../stdlib $$src > build/nscol-asan-$$d.c 2> build/nscol-asan-$$d.cerr; then \
-	    echo "namespace-collisions-asan FAIL $$d (kaic2)"; head -3 build/nscol-asan-$$d.cerr; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-asan FAIL $$d (kaic2)"; head -3 build/nscol-asan-$$d.cerr; continue; fi; \
 	  if ! $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/nscol-asan-$$d.c -o build/nscol-asan-$$d; then \
-	    echo "namespace-collisions-asan FAIL $$d (cc)"; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-asan FAIL $$d (cc)"; continue; fi; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    ./build/nscol-asan-$$d > build/nscol-asan-$$d.out 2> build/nscol-asan-$$d.err || true; \
 	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/nscol-asan-$$d.err; then \
 	    echo "namespace-collisions-asan FAIL $$d — sanitizer diagnostic:"; \
-	    cat build/nscol-asan-$$d.err; fail=$$((fail+1)); continue; fi; \
+	    cat build/nscol-asan-$$d.err; continue; fi; \
 	  echo "namespace-collisions-asan OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-asan: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-asan.log 2>&1; \
+	$(NSCOL_RATCHET) asan build/nscol-asan.log
 
 # `kai test` path: two tests at the same line:col in different modules
 # mint the same enclosing-function name, so lambdas lifted out of their
 # bodies collide as duplicate C symbols.
 test-namespace-collisions-testsym: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_TESTSYM_DIRS); do \
 	  exp=../examples/namespace-collisions/$$d/main.test.expected; \
-	  if ! ../bin/kai test ../examples/namespace-collisions/$$d/main.kai > build/nscol-test-$$d.out 2>&1; then \
-	    echo "namespace-collisions-testsym FAIL $$d (kai test errored)"; cat build/nscol-test-$$d.out; fail=$$((fail+1)); continue; fi; \
+	  if ! ../bin/kai test --backend=c ../examples/namespace-collisions/$$d/main.kai > build/nscol-test-$$d.out 2>&1; then \
+	    echo "namespace-collisions-testsym FAIL $$d (kai test errored)"; cat build/nscol-test-$$d.out; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-test-$$d.out; then \
 	    echo "namespace-collisions-testsym FAIL $$d (substring '$$needle' not in output)"; \
-	    cat build/nscol-test-$$d.out; fail=$$((fail+1)); continue; fi; \
+	    cat build/nscol-test-$$d.out; continue; fi; \
 	  echo "namespace-collisions-testsym OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-testsym: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-testsym.log 2>&1; \
+	$(NSCOL_RATCHET) testsym build/nscol-testsym.log
 
 # `kai check` path: protocol law checks are generated per impl, and an
 # `axiom` exemption declared in one module must not silence the
 # homonymous protocol's impl in another.
 test-namespace-collisions-check: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_CHECK_DIRS); do \
 	  exp=../examples/namespace-collisions/$$d/main.check.expected; \
 	  if ! ../bin/kai check ../examples/namespace-collisions/$$d/main.kai > build/nscol-check-$$d.out 2>&1; then \
-	    echo "namespace-collisions-check FAIL $$d (kai check errored)"; cat build/nscol-check-$$d.out; fail=$$((fail+1)); continue; fi; \
+	    echo "namespace-collisions-check FAIL $$d (kai check errored)"; cat build/nscol-check-$$d.out; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-check-$$d.out; then \
 	    echo "namespace-collisions-check FAIL $$d (substring '$$needle' not in output)"; \
-	    cat build/nscol-check-$$d.out; fail=$$((fail+1)); continue; fi; \
+	    cat build/nscol-check-$$d.out; continue; fi; \
 	  echo "namespace-collisions-check OK $$d"; \
-	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-check: $$fail failing fixture(s)"; exit 1; }
+	done ) > build/nscol-check.log 2>&1; \
+	$(NSCOL_RATCHET) check build/nscol-check.log
 
 # Diagnostic quality. A message that merely EXISTS is not enough: an
 # ambiguity report has to name the contested symbol, list every
@@ -11081,7 +11083,7 @@ test-namespace-collisions-check: $(TARGET) build
 # emitted diagnostic must contain. The program may compile (today's
 # ambiguity is a warning); what is asserted is the message.
 test-namespace-collisions-diag: $(TARGET) build
-	@fail=0; \
+	@( \
 	for d in $(NSCOL_DIAG_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/DIAG.expected; \
@@ -11093,10 +11095,24 @@ test-namespace-collisions-diag: $(TARGET) build
 	      echo "namespace-collisions-diag FAIL $$d — diagnostic lacks: $$needle"; \
 	      missing=1; }; \
 	  done < $$exp; \
-	  if [ "$$missing" -ne 0 ]; then head -5 build/nscol-diag-$$d.err; fail=$$((fail+1)); continue; fi; \
+	  if [ "$$missing" -ne 0 ]; then head -5 build/nscol-diag-$$d.err; continue; fi; \
 	  echo "namespace-collisions-diag OK $$d"; \
+	done ) > build/nscol-diag.log 2>&1; \
+	$(NSCOL_RATCHET) diag build/nscol-diag.log
+
+# The C-only axes, gated together in one tier1 shard (no libLLVM there);
+# native/neg-native ride tier1-native and asan rides tier1-asan. Every
+# axis runs even when an earlier one is red, so one regression cannot
+# hide another.
+test-namespace-collisions-c-axes: $(TARGET) build
+	@rc=0; \
+	for t in test-namespace-collisions test-namespace-collisions-neg \
+	         test-namespace-collisions-modular test-namespace-collisions-neg-modular \
+	         test-namespace-collisions-diag test-namespace-collisions-testsym \
+	         test-namespace-collisions-check; do \
+	  $(MAKE) $$t || rc=1; \
 	done; \
-	[ $$fail -eq 0 ] || { echo "namespace-collisions-diag: $$fail failing fixture(s)"; exit 1; }
+	exit $$rc
 
 clean:
 	rm -rf build $(TARGET)
