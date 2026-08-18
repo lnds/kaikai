@@ -14,132 +14,181 @@ import compiler.ast
 import compiler.expr_positions
 import compiler.name_table
 
-#[doc("One contested reference: `NUse(class, name, line, col)`.")]
-pub type NUse = NUse(NCls, String, Int, Int)
+#[doc("One contested reference: `NUse(class, name, line, col, op)`. `op` is the operation a protocol was reached through, else empty.")]
+pub type NUse = NUse(NCls, String, Int, Int, String)
 
-#[doc("Every reference in the root file's declarations to a name contested in its class. `t` is the whole-program table; `target` the root module.")]
-pub fn nu_scan(decls: [Decl], t: [NEnt], target: String) : [NUse] =
-  list_reverse(nu_decls(decls, t, target, []))
+#[doc("A protocol dispatcher name paired with its protocol: `NDisp(\"__proto_op\", op, protocol)`. The lowering leaves the dispatcher where the source named the operation.")]
+pub type NDisp = NDisp(String, String, String)
 
-fn nu_decls(ds: [Decl], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+#[doc("Every reference in the root file's declarations to a name contested in its class. `t` is the whole-program table; `target` the root module; `ds` the protocol dispatchers.")]
+pub fn nu_scan(decls: [Decl], t: [NEnt], target: String, ds: [NDisp]) : [NUse] =
+  list_reverse(nu_decls(decls, NuCx { t: t, target: target, ds: ds }, []))
+
+#[doc("The contested constant references of the root file. Scanned before module scoping keys them: a keyed read no longer shows its bare spelling.")]
+pub fn nu_scan_consts(decls: [Decl], target: String) : [NUse] =
+  nu_scan(decls, nt_only(nt_collect(decls, target), NCConst), target, [])
+
+#[doc("The dispatchers of a lowered protocol registry.")]
+pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, [])
+
+fn nu_disp_build(ops: [ProtoOpReg], acc: [NDisp]) : [NDisp] = match ops {
+  [] -> acc
+  [POR(proto, op, _, _, _, _, _), ...rest] ->
+    nu_disp_build(rest, [NDisp(concat_all(["__proto_", op]), op, proto), ...acc])
+}
+
+#[doc("`a` followed by the uses of `b` not already reported in `a`.")]
+pub fn nu_merge(a: [NUse], b: [NUse]) : [NUse] = match b {
+  [] -> a
+  [NUse(c, n, l, col, op), ...rest] ->
+    if nu_seen(a, c, n) { nu_merge(a, rest) }
+    else { nu_merge(list_append(a, [NUse(c, n, l, col, op)]), rest) }
+}
+
+# The scan's fixed inputs: the table, the root module, the dispatchers.
+type NuCx = { t: [NEnt], target: String, ds: [NDisp] }
+
+fn nu_decls(ds: [Decl], cx: NuCx, acc: [NUse]) : [NUse] =
   match ds {
     [] -> acc
-    [d, ...rest] -> nu_decls(rest, t, target, nu_decl(d, t, target, acc))
+    [d, ...rest] -> nu_decls(rest, cx, nu_decl(d, cx, acc))
   }
 
 # Only root-authored decls are scanned; an imported decl's uses belong
 # to its own home, where they resolve.
-fn nu_decl(d: Decl, t: [NEnt], target: String, acc: [NUse]) : [NUse] = match d {
+fn nu_decl(d: Decl, cx: NuCx, acc: [NUse]) : [NUse] = match d {
   DFn(_, _, _, ps, ret, row, body, _, _, mo) -> match mo {
     Some(_) -> acc
-    None    -> nu_expr(body, t, target,
-                 nu_row(row, t, target, nu_ret(ret, t, target, nu_params(ps, t, target, acc))))
+    None    -> nu_expr(body, cx,
+                 nu_row(row, cx, nu_ret(ret, cx, nu_params(ps, cx, acc))))
   }
   DConst(_, _, ty, body, mo, _, _) -> match mo {
     Some(_) -> acc
-    None    -> nu_expr(body, t, target, nu_ty(ty, t, target, acc))
+    None    -> nu_expr(body, cx, nu_ty(ty, cx, acc))
   }
-  DDerive(_, inner, _, _)       -> nu_decl(inner, t, target, acc)
-  DUnstable(inner, _, _)        -> nu_decl(inner, t, target, acc)
-  DProtoLaws(_, inner, _, _, _) -> nu_decl(inner, t, target, acc)
-  DImplAxiom(_, inner, _, _, _) -> nu_decl(inner, t, target, acc)
-  DConstructor(inner, _, _)     -> nu_decl(inner, t, target, acc)
-  DDoc(_, _, inner, _, _)       -> nu_decl(inner, t, target, acc)
-  DAttr(_, inner, _, _)         -> nu_decl(inner, t, target, acc)
+  DDerive(_, inner, _, _)       -> nu_decl(inner, cx, acc)
+  DUnstable(inner, _, _)        -> nu_decl(inner, cx, acc)
+  DProtoLaws(_, inner, _, _, _) -> nu_decl(inner, cx, acc)
+  DImplAxiom(_, inner, _, _, _) -> nu_decl(inner, cx, acc)
+  DConstructor(inner, _, _)     -> nu_decl(inner, cx, acc)
+  DDoc(_, _, inner, _, _)       -> nu_decl(inner, cx, acc)
+  DAttr(_, inner, _, _)         -> nu_decl(inner, cx, acc)
   _ -> acc
 }
 
-fn nu_params(ps: [Param], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_params(ps: [Param], cx: NuCx, acc: [NUse]) : [NUse] =
   match ps {
     [] -> acc
-    [p, ...rest] -> nu_params(rest, t, target, nu_ret(p.ptype, t, target, acc))
+    [p, ...rest] -> nu_params(rest, cx, nu_ret(p.ptype, cx, acc))
   }
 
-fn nu_ret(r: Option[TypeExpr], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_ret(r: Option[TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
   match r {
     None     -> acc
-    Some(ty) -> nu_ty(ty, t, target, acc)
+    Some(ty) -> nu_ty(ty, cx, acc)
   }
 
-fn nu_ty(ty: TypeExpr, t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_ty(ty: TypeExpr, cx: NuCx, acc: [NUse]) : [NUse] =
   match ty.tkind {
     TyName(n, targs) ->
-      nu_ty_list(targs, t, target, nu_hit(NCType, n, ty.line, ty.col, t, target, acc))
-    TyList(inner)      -> nu_ty(inner, t, target, acc)
-    TyFn(ps, r, row)   -> nu_row(row, t, target, nu_ty(r, t, target, nu_ty_list(ps, t, target, acc)))
-    TyDim(base, _)     -> nu_ty(base, t, target, acc)
-    TyRefine(base, _)  -> nu_ty(base, t, target, acc)
+      nu_ty_list(targs, cx, nu_hit(NCType, n, ty.line, ty.col, cx, acc))
+    TyList(inner)      -> nu_ty(inner, cx, acc)
+    TyFn(ps, r, row)   -> nu_row(row, cx, nu_ty(r, cx, nu_ty_list(ps, cx, acc)))
+    TyDim(base, _)     -> nu_ty(base, cx, acc)
+    TyRefine(base, _)  -> nu_ty(base, cx, acc)
     _ -> acc
   }
 
-fn nu_ty_list(tys: [TypeExpr], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_ty_list(tys: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
   match tys {
     [] -> acc
-    [ty, ...rest] -> nu_ty_list(rest, t, target, nu_ty(ty, t, target, acc))
+    [ty, ...rest] -> nu_ty_list(rest, cx, nu_ty(ty, cx, acc))
   }
 
-fn nu_row(r: RowExpr, t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_row(r: RowExpr, cx: NuCx, acc: [NUse]) : [NUse] =
   match r {
     REmpty         -> acc
-    RClosed(ls)    -> nu_labels(ls, t, target, acc)
-    ROpen(_, ls)   -> nu_labels(ls, t, target, acc)
+    RClosed(ls)    -> nu_labels(ls, cx, acc)
+    ROpen(_, ls)   -> nu_labels(ls, cx, acc)
   }
 
-fn nu_labels(ls: [RowLabel], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_labels(ls: [RowLabel], cx: NuCx, acc: [NUse]) : [NUse] =
   match ls {
     [] -> acc
     [RL(n, targs), ...rest] ->
-      nu_labels(rest, t, target,
-                nu_ty_list(targs, t, target, nu_row_hit(n, targs, t, target, acc)))
+      nu_labels(rest, cx,
+                nu_ty_list(targs, cx, nu_row_hit(n, targs, cx, acc)))
   }
 
 # A row label carries no position of its own; borrow the first type
 # argument's, falling back to the declaration site the caller reports.
-fn nu_row_hit(n: String, targs: [TypeExpr], t: [NEnt], target: String,
-      acc: [NUse]) : [NUse] = match targs {
-  []          -> nu_hit(NCEffect, n, 0, 0, t, target, acc)
-  [a, ..._]   -> nu_hit(NCEffect, n, a.line, a.col, t, target, acc)
+fn nu_row_hit(n: String, targs: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] = match targs {
+  []          -> nu_hit(NCEffect, n, 0, 0, cx, acc)
+  [a, ..._]   -> nu_hit(NCEffect, n, a.line, a.col, cx, acc)
 }
 
 # The value classes a bare name may denote. Which one it is comes from
 # the table, not from the spelling: a name declared as a constructor is
-# reported as one, a constant as one. A name in neither class is a
-# function, already covered by its own reporter.
-fn nu_expr(e: Expr, t: [NEnt], target: String, acc: [NUse]) : [NUse] = {
+# reported as one, a constant as one, a protocol dispatcher as its
+# protocol. A name in none of these is a function, already covered by
+# its own reporter.
+fn nu_expr(e: Expr, cx: NuCx, acc: [NUse]) : [NUse] = {
   let here = match e.kind {
-    EVar(n)     -> nu_value_hit(n, e.line, e.col, t, target, acc)
+    EVar(n)     -> nu_name_hit(n, e.line, e.col, cx, acc)
     ECall(c, _) -> match c.kind {
-      EVar(n) -> nu_value_hit(n, c.line, c.col, t, target, acc)
+      EVar(n) -> nu_name_hit(n, c.line, c.col, cx, acc)
       _       -> acc
     }
     _ -> acc
   }
-  nu_positions(xp_positions(e), t, target, here)
+  nu_positions(xp_positions(e), cx, here)
 }
 
-fn nu_positions(ps: [XPos], t: [NEnt], target: String, acc: [NUse]) : [NUse] =
+fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
   match ps {
     [] -> acc
-    [XP(_, child), ...rest] -> nu_positions(rest, t, target, nu_expr(child, t, target, acc))
+    [XP(_, child), ...rest] -> nu_positions(rest, cx, nu_expr(child, cx, acc))
   }
 
-fn nu_value_hit(name: String, line: Int, col: Int, t: [NEnt],
-      target: String, acc: [NUse]) : [NUse] =
-  if list_length(nt_homes(t, NCCtor, name)) > 0 {
-    nu_hit(NCCtor, name, line, col, t, target, acc)
-  } else {
-    nu_hit(NCConst, name, line, col, t, target, acc)
+fn nu_name_hit(name: String, line: Int, col: Int, cx: NuCx, acc: [NUse]) : [NUse] =
+  match nu_disp_find(cx.ds, name) {
+    Some(NDisp(_, op, proto)) -> nu_hit_op(NCProtocol, proto, line, col, op, cx, acc)
+    None ->
+      if list_length(nt_homes(cx.t, NCCtor, name)) > 0 {
+        nu_hit(NCCtor, name, line, col, cx, acc)
+      } else {
+        nu_hit(NCConst, name, line, col, cx, acc)
+      }
   }
 
-fn nu_hit(cls: NCls, name: String, line: Int, col: Int, t: [NEnt],
-      target: String, acc: [NUse]) : [NUse] =
-  if list_length(nt_contested(t, cls, name, target)) == 0 { acc }
+# Dispatchers all start with `__`; anything else skips the list.
+fn nu_disp_find(ds: [NDisp], name: String) : Option[NDisp] =
+  if nu_internal(name) { nu_disp_loop(ds, name) } else { None }
+
+fn nu_internal(name: String) : Bool = match char_at(name, 0) {
+  Some(c0) -> c0 == '_' and match char_at(name, 1) { Some(c1) -> c1 == '_'  None -> false }
+  None -> false
+}
+
+fn nu_disp_loop(ds: [NDisp], name: String) : Option[NDisp] = match ds {
+  [] -> None
+  [d, ...rest] -> match d {
+    NDisp(dn, _, _) -> if dn == name { Some(d) } else { nu_disp_loop(rest, name) }
+  }
+}
+
+fn nu_hit(cls: NCls, name: String, line: Int, col: Int, cx: NuCx, acc: [NUse]) : [NUse] =
+  nu_hit_op(cls, name, line, col, "", cx, acc)
+
+fn nu_hit_op(cls: NCls, name: String, line: Int, col: Int, op: String,
+      cx: NuCx, acc: [NUse]) : [NUse] =
+  if list_length(nt_contested(cx.t, cls, name, cx.target)) == 0 { acc }
   else if nu_seen(acc, cls, name) { acc }
-  else { [NUse(cls, name, line, col), ...acc] }
+  else { [NUse(cls, name, line, col, op), ...acc] }
 
 fn nu_seen(acc: [NUse], cls: NCls, name: String) : Bool = match acc {
   [] -> false
-  [NUse(c, n, _, _), ...rest] ->
+  [NUse(c, n, _, _, _), ...rest] ->
     if n == name and ncls_word(c) == ncls_word(cls) { true }
     else { nu_seen(rest, cls, name) }
 }
