@@ -19,6 +19,7 @@ import compiler.ast
 import compiler.ast_map
 import compiler.diag
 import compiler.diag_file
+import compiler.home_dup
 import compiler.expr_positions
 import compiler.modules
 import compiler.util
@@ -167,4 +168,69 @@ fn qhchk_positions(ps: [XPos], mt: [ModuleEntry], file: String) : Int / Console 
     let here = qhchk_expr(child, mt, file)
     here + qhchk_positions(rest, mt, file)
   }
+}
+
+# ====================================================================
+# Qualified handle heads, remembered for emission.
+# ====================================================================
+#
+# The rewrite above leaves every head bare, which is what the typer
+# wants; the emitter, though, keys evidence on the effect's home, and a
+# bare `Emit` in a file importing two modules that both declare one
+# cannot recover which was meant. The qualifier is recorded here, by the
+# enclosing declaration's home and the handle's position, before it is
+# stripped.
+
+#[doc("A handle whose head was written qualified: the enclosing declaration's home, the handle's position, and the home the qualifier names.")]
+pub type HandleHome = HH(Option[String], Int, Int, String)
+
+#[doc("The home a qualified handle head at (`mo`, line, col) selected, if that head was qualified.")]
+pub fn hh_lookup(t: [HandleHome], mo: Option[String], line: Int, col: Int) : Option[String] = match t {
+  [] -> None
+  [HH(m, l, c, home), ...rest] ->
+    if l == line and c == col and home_eq(m, mo) { Some(home) }
+    else { hh_lookup(rest, mo, line, col) }
+}
+
+#[doc("Every qualified handle head in these decls, resolved under one qualifier table.")]
+pub fn hh_decls(decls: [Decl], mt: [ModuleEntry]) : [HandleHome] = match decls {
+  [] -> []
+  [d, ...rest] -> list_append(hh_decl(d, mt), hh_decls(rest, mt))
+}
+
+#[doc("Segment-aware counterpart of `hh_decls`.")]
+pub fn hh_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String) : [HandleHome] = match segs {
+  [] -> hh_decls(decls, ms_table(scopes, "", global))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    list_append(hh_decls(seg_take(decls, n), ms_table(scopes, home, global)),
+                hh_segmented(rest, seg_drop(decls, n), scopes, global, target_mod))
+  }
+}
+
+fn hh_decl(d: Decl, mt: [ModuleEntry]) : [HandleHome] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, mo) -> hh_expr(body, mo, mt)
+  DImpl(_, _, _, methods, _, _, _) -> hh_decls(methods, mt)
+  DTest(_, body, _, _, mo) -> hh_expr(body, mo, mt)
+  DBench(_, body, _, _, mo) -> hh_expr(body, mo, mt)
+  DCheck(_, _, body, _, _, mo) -> hh_expr(body, mo, mt)
+  DDerive(_, inner, _, _) -> hh_decl(inner, mt)
+  _ -> []
+}
+
+fn hh_expr(e: Expr, mo: Option[String], mt: [ModuleEntry]) : [HandleHome] = {
+  let below = hh_positions(xp_positions(e), mo, mt)
+  match e.kind {
+    EHandle(_, eff, _, _, _, _, _) -> match split_dotted_qualifier(eff) {
+      Some(QSplit(mod, _)) -> [HH(mo, e.line, e.col, mt_tagged_name(mt, mod)), ...below]
+      None -> below
+    }
+    _ -> below
+  }
+}
+
+fn hh_positions(ps: [XPos], mo: Option[String], mt: [ModuleEntry]) : [HandleHome] = match ps {
+  [] -> []
+  [XP(_, child), ...rest] -> list_append(hh_expr(child, mo, mt), hh_positions(rest, mo, mt))
 }
