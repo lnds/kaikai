@@ -118,7 +118,7 @@ fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # top-level (non-import) decls. Selective imports do NOT pre-filter
 # this list — concat semantics still bring every public decl
 # into the unqualified scope, so the qualified surface mirrors that.
-pub type ModuleEntry = ME(String, [String], String, [String])
+pub type ModuleEntry = ME(String, [String], String, [String], String)
 
 # Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
 # returns "." (current dir).
@@ -156,9 +156,30 @@ pub fn module_name_of_path(path: String) : String {
 # `b/util.kai` are distinct homes rather than one contested `util`. The
 # home is a function of the path alone: neither the alias an importer
 # wrote nor the order the imports were reached can change it.
-#[doc("The home a dotted import path names: its segments joined by `_`, non-identifier characters mapped to `_` (`x.util` -> `x_util`).")]
+#
+# The encoding is injective: `_` in a segment becomes `_1` and the
+# segment separator `_0`, so `a.b` and `a_b` cannot mint one home, and
+# no home ever contains `__` — which keeps `<home>__<name>` injective
+# too. Import segments are identifiers, so nothing else needs escaping.
+#[doc("The home a dotted import path names: `x.util` -> `x_0util`, `a_b` -> `a_1b`; injective, so distinct paths never share a home.")]
 pub fn module_home_of_import(mod_path: String) : String =
-  ident_sanitize(mod_path, 0, string_length(mod_path), "")
+  home_encode(mod_path, 0, string_length(mod_path), "")
+
+fn home_encode(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> {
+        let piece = if c == '.' { "_0" }
+          else if c == '_' { "_1" }
+          else if ch_is_alnum(c) { int_to_byte_string(char_to_int(c)) }
+          else { "_" }
+        home_encode(s, i + 1, n, string_concat(acc, piece))
+      }
+      None -> acc
+    }
+  }
+}
 
 fn ident_sanitize(s: String, i: Int, n: Int, acc: String) : String {
   if i >= n { acc }
@@ -292,21 +313,21 @@ pub fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+      ME(mn, _, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
     }
   }
 }
 
 #[doc("True when the module exports `fn_name` at its top level.")]
 pub fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, exports, _, _) -> list_has(exports, fn_name)
+  ME(_, exports, _, _, _) -> list_has(exports, fn_name)
 }
 
 # Returns true when `fn_name` is in the module's unstable
 # export list. Callers use this from EField -> EModCall rewriting to
 # decide whether to emit the unstable-consumer warning.
 fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
+  ME(_, _, _, unstable, _) -> list_has(unstable, fn_name)
 }
 
 # Collect the absolute origin path of every ModuleEntry
@@ -316,7 +337,7 @@ fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
 pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
+    ME(_, _, origin, _, _) -> collect_module_origins(rest, [origin, ...acc])
   }
 }
 
@@ -324,7 +345,7 @@ pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = ma
 pub fn module_files(mes: [ModuleEntry], acc: [ModFile]) : [ModFile] = match mes {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(name, _, origin, _) -> module_files(rest, [MF(name, origin), ...acc])
+    ME(name, _, origin, _, _) -> module_files(rest, [MF(name, origin), ...acc])
   }
 }
 
@@ -337,7 +358,7 @@ pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(_, _, origin, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
+      ME(_, _, origin, _, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
     }
   }
 }
@@ -348,9 +369,8 @@ pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
 # the other. The empty module name owns the root file's imports.
 #
 # A scope entry is keyed by the name its file wrote, which under an
-# alias is not the module's home. Only these per-file entries may carry
-# an alias — the global table stays keyed by home, or `me_home_name`
-# could not tell the two apart.
+# alias is not the module's home; the entry carries the home alongside,
+# so nothing has to be recovered from the table's order.
 pub type ModScope = MScope(String, [ModuleEntry])
 
 # The qualifier table a decl from `home` resolves through: that
@@ -359,8 +379,7 @@ pub type ModScope = MScope(String, [ModuleEntry])
 # modules), which no per-file import list records.
 #
 # Alias entries come first, so a written name resolves to the file its
-# own module meant. They keep that file's origin path, which is what
-# lets `me_home_name` recover the home codegen minted symbols under.
+# own module meant.
 pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [ModuleEntry] =
   match scopes {
     [] -> global
@@ -382,7 +401,7 @@ pub fn report_import_shadow(scopes: [ModScope], owner: String, written: String,
   match mt_lookup(ms_bindings(scopes, owner), written) {
     None -> 0
     Some(prev) -> match prev {
-      ME(_, _, prev_origin, _) ->
+      ME(_, _, prev_origin, _, _) ->
         if prev_origin == origin { 0 }
         else {
           let _ = diag_error(file, line, col,
@@ -404,7 +423,7 @@ pub fn report_selective_missing(names: [String], me: ModuleEntry, mod_path: Stri
   [n, ...rest] -> {
     let here = if me_has_export(me, n) { 0 }
       else {
-        let exports = match me { ME(_, exs, _, _) -> exs }
+        let exports = match me { ME(_, exs, _, _, _) -> exs }
         let _ = diag_error(file, line, col,
           concat_all(["module '", mod_path, "' does not export '", n,
                       "'; available exports: ", mods_join_with(exports, ", ")]))
@@ -420,31 +439,18 @@ fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
 }
 
 # The module name an EModCall must carry: the home codegen keys symbols
-# by. A file reached under an alias appears in the table twice sharing
-# an origin path — once under the alias in its importer's scope, once
-# under its home in the global table, which the scope entries are
-# prepended to. The global entry is the last one for that origin, so
-# scanning to the end lands on the home whatever the aliases spelled.
-fn me_home_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String = match me {
-  ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
-}
-
-fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
-  match mt {
-    [] -> acc
-    [ME(n, _, o, _), ...rest] ->
-      me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
-  }
+# by, which under an alias is not the name the importer wrote.
+fn me_home(me: ModuleEntry) : String = match me { ME(_, _, _, _, home) -> home }
 
 #[doc("The home behind a written qualifier: the module name codegen keys symbols by, recovering it when `written` is a per-file alias. `written` itself when the table has no such entry.")]
 pub fn mt_tagged_name(mt: [ModuleEntry], written: String) : String =
   match mt_lookup(mt, written) {
-    Some(me) -> me_home_name(mt, me, written)
+    Some(me) -> me_home(me)
     None     -> written
   }
 
 fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
-  ME(_, exports, _, _) ->
+  ME(_, exports, _, _, _) ->
     if list_has(exports, fname) { Some(fname) } else { None }
 }
 
@@ -554,7 +560,7 @@ fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Conso
             if me_has_export(me, ty) {
               TypeExpr { tkind: TyName(ty, targs1), line: te.line, col: te.col }
             } else {
-              let exports = match me { ME(_, exs, _, _) -> exs }
+              let exports = match me { ME(_, exs, _, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, te.line, te.col)
               TypeExpr { tkind: TyName("__qualtype_bad__", []), line: te.line, col: te.col }
             }
@@ -692,7 +698,7 @@ fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int
             if me_has_export(me, ty) {
               ERecordLit(ty, fs1)
             } else {
-              let exports = match me { ME(_, exs, _, _) -> exs }
+              let exports = match me { ME(_, exs, _, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
               ERecordLit("__qualtype_bad__", fs1)
             }
@@ -1450,16 +1456,16 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], file: String) : ExprKi
             # becomes `EModCall(mod, Ctor)`, never a bare `EVar`, so
             # the qualifier the user wrote survives to the typer.
             if name_starts_upper(fname) and me_has_export(me, fname) {
-              EModCall(me_home_name(mt, me, name), fname)
+              EModCall(me_home(me), fname)
             } else { match me_lookup_export(me, fname) {
-              Some(actual) -> EModCall(me_home_name(mt, me, name), actual)
+              Some(actual) -> EModCall(me_home(me), actual)
               None -> {
                 # Imported module, missing export.
                 # Emit specific error before falling back to EField
                 # (which the typer treats as a record-field
                 # projection on TyAny — produces a generic but
                 # non-fatal cascade).
-                let exports = match me { ME(_, exs, _, _) -> exs }
+                let exports = match me { ME(_, exs, _, _, _) -> exs }
                 let _ = rqc_diag_missing_export(name, fname, exports, file, e.line, e.col)
                 EField(rqc_expr(base, locals, mt, file), fname)
               }
@@ -1653,9 +1659,9 @@ fn rqc_pat_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, l
   match mt_lookup(mt, q) {
     Some(me) ->
       if me_has_export(me, ctor) {
-        Some(me_home_name(mt, me, q))
+        Some(me_home(me))
       } else {
-        let exports = match me { ME(_, exs, _, _) -> exs }
+        let exports = match me { ME(_, exs, _, _, _) -> exs }
         let _ = rqc_diag_missing_export(q, ctor, exports, file, line, col)
         Some(q)
       }
